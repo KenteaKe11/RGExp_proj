@@ -14,7 +14,19 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, Subset
+
+# torch chỉ cần cho Dataset/DataLoader (train & infer). Import mềm để các script
+# không cần GPU — prepare_splits, e2e local — chạy được trên máy chưa cài torch.
+try:
+    from torch.utils.data import DataLoader, Dataset, Subset
+    _HAS_TORCH = True
+except ImportError:                                  # pragma: no cover
+    _HAS_TORCH = False
+    Dataset = object                                 # type: ignore[assignment]
+    DataLoader = Subset = None                       # type: ignore[assignment]
+
+_NO_TORCH_MSG = ("Cần torch cho bước này (Dataset/DataLoader). "
+                 "Cài bằng: pip install -r src/requirements.txt")
 
 from .config import BATCH, DATA, PATHS, TRAIN_CFG
 from .sampling import (
@@ -138,6 +150,7 @@ def build_lora_frames(data, verbose: bool = True):
 # ---- Dataset / collate -------------------------------------------------------
 class CXRLoraDataset(Dataset):
     def __init__(self, df: pd.DataFrame):
+        assert _HAS_TORCH, _NO_TORCH_MSG
         self.df = df.reset_index(drop=True)
 
     def __len__(self):
@@ -178,6 +191,7 @@ def make_epoch_permutation(labels: np.ndarray, epoch: int) -> list:
 
 
 def make_train_loader(dataset, indices, collate_fn):
+    assert _HAS_TORCH, _NO_TORCH_MSG
     num_workers = TRAIN_CFG.NUM_WORKERS
     kwargs = dict(
         batch_size=BATCH.TRAIN_BATCH_SIZE,
@@ -193,6 +207,7 @@ def make_train_loader(dataset, indices, collate_fn):
 
 
 def make_val_loader(df_val, collate_fn):
+    assert _HAS_TORCH, _NO_TORCH_MSG
     return DataLoader(
         CXRLoraDataset(df_val),
         batch_size=BATCH.TRAIN_BATCH_SIZE, shuffle=False, collate_fn=collate_fn,

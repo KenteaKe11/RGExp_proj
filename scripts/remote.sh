@@ -34,6 +34,7 @@ RDIR="${RGEXP_REMOTE_DIR:-~/RGExp_proj}"
 RPY="${RGEXP_REMOTE_PYTHON:-python3}"
 PUSH_PATHS="${RGEXP_PUSH_PATHS:-src scripts setup.sh pyproject.toml README.md rgexp.conf.example}"
 PULL_PATHS="${RGEXP_PULL_PATHS:-outputs}"
+DATA_PATHS="${RGEXP_DATA_PATHS:-origins splits images}"
 TUNNELS="${RGEXP_TUNNEL_PORTS:-8888:localhost:8888}"
 
 KEY="${KEY/#\~/$HOME}"           # ~ -> $HOME (ssh -i không tự expand)
@@ -127,7 +128,7 @@ remote.sh — điều khiển máy ảo chạy job theo $CONF
   shell         Mở shell tương tác trên máy ảo
   push          Đẩy code lên $RDIR (mặc định: $PUSH_PATHS)
   push-conf     Đẩy rgexp.conf lên máy ảo (chmod 600, IMAGE_ROOT đổi theo máy ảo)
-  push-data     Đẩy origins/ + splits/ lên máy ảo (hỏi xác nhận, dữ liệu lớn)
+  push-data     Đẩy dữ liệu ($DATA_PATHS) lên máy ảo (hỏi xác nhận; RGEXP_YES=1 để bỏ qua)
   pull          Kéo kết quả về (mặc định: $PULL_PATHS)
   setup         Chạy setup.sh trên máy ảo (tạo .venv + cài deps + marker guard)
   mark          Tạo file marker RGEXP_VM_MARKER trên máy ảo (bật allowlist cứng)
@@ -138,7 +139,7 @@ remote.sh — điều khiển máy ảo chạy job theo $CONF
   logs [file]   tail -f log mới nhất trong $RDIR/logs/
   gpu           watch nvidia-smi trên máy ảo
   tunnel        Port-forward: $TUNNELS
-  smoke         Chạy scripts/smoke_test.py trên server
+  smoke         Chạy scripts/smoke_test.py trên máy ảo
 
 Ví dụ:
   bash scripts/remote.sh check
@@ -243,11 +244,19 @@ cmd_push_conf() {
 
 cmd_push_data() {
     require_host
-    local sz; sz=$(du -sh "$ROOT/origins" "$ROOT/splits" 2>/dev/null | awk '{s=$1; print s}' | paste -sd'+' -)
-    info "sắp đẩy origins/ + splits/ ($sz) lên $TARGET:$RDIR"
-    read -r -p "Xác nhận? [y/N] " a; [ "$a" = "y" ] || die "huỷ."
-    ( cd "$ROOT" && sync_up origins splits )
-    ok "push-data xong"
+    local present=""
+    for p in $DATA_PATHS; do [ -d "$ROOT/$p" ] && present="$present $p"; done
+    [ -n "$present" ] || die "không có thư mục dữ liệu nào trong: $DATA_PATHS"
+
+    local mb; mb=$(cd "$ROOT" && du -sm $present 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    info "sắp đẩy$present (${mb} MB) lên $TARGET:$RDIR"
+    if [ "${RGEXP_YES:-0}" = "1" ]; then
+        info "RGEXP_YES=1 — bỏ qua xác nhận"
+    else
+        read -r -p "Xác nhận? [y/N] " a; [ "$a" = "y" ] || die "huỷ."
+    fi
+    ( cd "$ROOT" && sync_up $present )
+    ok "push-data xong (${mb} MB)"
 }
 
 cmd_pull() {

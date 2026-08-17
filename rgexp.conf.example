@@ -49,9 +49,10 @@ RGEXP_REMOTE_IMAGE_ROOT=
 # Port-forward cho `remote.sh tunnel` (nhiều cặp cách nhau bởi dấu cách).
 RGEXP_TUNNEL_PORTS="8888:localhost:8888 6006:localhost:6006"
 
-# Thư mục đồng bộ lên/xuống (remote.sh push / pull).
+# Thư mục đồng bộ lên/xuống (remote.sh push / pull / push-data).
 RGEXP_PUSH_PATHS="src scripts setup.sh pyproject.toml README.md rgexp.conf.example"
 RGEXP_PULL_PATHS="outputs"
+RGEXP_DATA_PATHS="origins splits images"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

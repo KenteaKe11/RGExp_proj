@@ -13,8 +13,8 @@ checkpoints/
 logs/
 wandb/
 
-# Dữ liệu PhysioNet credentialed — cấm redistribute.
-origins/*.csv
-origins/*.npz
-splits/*.csv
-splits/*.npz
+# Dữ liệu (PhysioNet credentialed — cấm redistribute) và dữ liệu mô phỏng
+# sinh bởi scripts/make_mock_data.py. Không commit thứ nào trong này.
+origins/
+splits/
+images/

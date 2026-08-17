@@ -18,7 +18,8 @@ thành package `rgexp`, chạy **local trong máy ảo Ubuntu 24.04 + virtualenv
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Bản đồ module, luồng gọi, ba quyết định thiết kế, nội dung checkpoint |
 | [`docs/CONFIG.md`](docs/CONFIG.md) | `rgexp.conf`: ba nhóm biến, thứ tự ưu tiên, path dữ liệu & ảnh |
 | [`docs/GUARD.md`](docs/GUARD.md) | Execution guard: bằng chứng ảo hoá, điều kiện chặn, cách chẩn đoán |
-| [`docs/SHELL-FLOW.md`](docs/SHELL-FLOW.md) | Hai file `.sh` gọi gì, chạm file nào, tư duy quy trình |
+| [`docs/E2E.md`](docs/E2E.md) | Dữ liệu mô phỏng + chạy thử trọn đường ống, đọc bảng thời gian tìm tắc nghẽn |
+| [`docs/SHELL-FLOW.md`](docs/SHELL-FLOW.md) | Ba file `.sh` gọi gì, chạm file nào, tư duy quy trình |
 
 README này chỉ giữ phần tổng quan + hướng dẫn chạy.
 
@@ -34,6 +35,8 @@ RGExp_proj/
 │                         data sampling guard generate train infer evaluate pipeline
 ├── scripts/
 │   ├── remote.sh         SSH / sync / chạy job trên máy ảo (chạy ở máy thật)
+│   ├── e2e.sh            chạy thử trọn đường ống bằng dữ liệu mô phỏng
+│   ├── make_mock_data.py sinh dữ liệu giả đúng schema (dùng trước khi có data thật)
 │   ├── smoke_test.py     kiểm tra offline: hostguard + config + guard + sampling
 │   ├── prepare_splits.py tạo/kiểm tra split (không cần GPU, không cần ảnh)
 │   ├── train.py          fine-tune LoRA
@@ -47,7 +50,7 @@ RGExp_proj/
 ## Cài đặt (trong máy ảo)
 
 ```bash
-wsl                              # Mở máy ảo
+git clone <repo> && cd RGExp_proj
 bash setup.sh                    # guard -> .venv -> deps -> pip install -e . -> rgexp.conf
 source .venv/bin/activate
 $EDITOR rgexp.conf               # điền HF_TOKEN (+ WANDB_API_KEY hoặc RGEXP_WANDB=0)
@@ -57,10 +60,22 @@ python scripts/smoke_test.py     # phải PASSED trước khi làm gì tiếp
 `HF_TOKEN` phải thuộc account đã accept license của `google/gemma-3-4b-it`.
 `setup.sh` refuse chạy nếu không phát hiện được máy ảo — đó là chủ ý.
 
+### Chưa có dữ liệu thật?
+
+```bash
+python scripts/make_mock_data.py --n 40    # sinh origins/ + images/ giả
+bash scripts/e2e.sh local                  # smoke -> mock -> split -> check ảnh
+bash scripts/e2e.sh remote                 # push -> chạy trên máy ảo -> pull, có bảng thời gian
+bash scripts/e2e.sh clean                  # dọn sạch trước khi nạp dữ liệu thật
+```
+
+Chi tiết: [`docs/E2E.md`](docs/E2E.md).
+
 Dữ liệu cần có trước khi train:
 
 ```
-Coming soon
+origins/clean_dataset.csv   origins/labels.npz   origins/metadata.json
+<RGEXP_IMAGE_ROOT>/files/p10/...                 # ảnh JPG, mặc định <repo>/images
 ```
 
 ## Chạy

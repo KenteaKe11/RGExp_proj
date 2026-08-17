@@ -1,6 +1,6 @@
-# Hai file `.sh` — chuyện gì xảy ra khi gọi
+# Các file `.sh` — chuyện gì xảy ra khi gọi
 
-Repo có đúng hai script shell, và chúng chạy ở **hai máy khác nhau**:
+Repo có ba script shell. Hai script cốt lõi chạy ở **hai máy khác nhau**:
 
 ```
         MÁY THẬT (của bạn)                    MÁY ẢO (Ubuntu 24.04)
@@ -14,6 +14,10 @@ Repo có đúng hai script shell, và chúng chạy ở **hai máy khác nhau**:
 Bất biến của toàn bộ thiết kế: **`remote.sh` không bao giờ `import rgexp`**. Nó
 chỉ mở socket SSH và copy file. Mọi dòng python đều chạy phía bên kia, nơi
 `hostguard` đã xác nhận là máy ảo.
+
+Script thứ ba, `scripts/e2e.sh`, là **kịch bản** chạy thử trọn đường ống bằng dữ
+liệu mô phỏng. Nó không tự ssh: mọi thao tác mạng đều uỷ quyền cho `remote.sh`,
+nên bất biến trên vẫn giữ nguyên. Xem `E2E.md`.
 
 ---
 
