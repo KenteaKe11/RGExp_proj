@@ -1,0 +1,31 @@
+# pip install -r src/requirements.txt && pip uninstall -y torchao
+#
+# torchao: một số base image ship 0.10.0, thấp hơn mức tối thiểu peft yêu cầu
+# cho torchao-dispatch check. Pipeline không dùng torchao ở đâu cả -> gỡ hẳn.
+# Triệu chứng nếu không gỡ: ImportError từ peft/tuners/lora/torchao.py khi gọi
+# get_peft_model().
+
+torch>=2.4.0
+torchvision>=0.19.0
+
+transformers>=4.50.0
+peft>=0.11.0
+bitsandbytes>=0.43.0
+accelerate>=0.30.0
+huggingface_hub>=0.25.0
+sentencepiece
+protobuf
+
+wandb
+pynvml
+
+numpy
+pandas
+Pillow
+
+langdetect
+
+nltk>=3.8
+rouge-score>=0.1.2
+bert-score>=0.3.13
+sacrebleu>=2.3

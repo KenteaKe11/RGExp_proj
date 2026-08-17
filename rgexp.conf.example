@@ -1,0 +1,123 @@
+# ==============================================================================
+# RGExp — file config DUY NHẤT của dự án.
+#
+#   cp rgexp.conf.example rgexp.conf   &&   $EDITOR rgexp.conf
+#
+# Cùng lúc là:
+#   - shell config  : `source rgexp.conf` (scripts/remote.sh dùng trực tiếp)
+#   - python config : src/rgexp/config.py nạp file này vào os.environ
+#
+# Cú pháp phải hợp lệ với bash: KEY=value, KHÔNG khoảng trắng quanh '=',
+# có dấu cách hoặc '~' trong value thì bọc "nháy kép".
+#
+# rgexp.conf nằm trong .gitignore — KHÔNG commit (chứa token).
+# ==============================================================================
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. MÁY ẢO CHẠY JOB (Ubuntu 24.04)
+#    Toàn bộ pipeline chạy trong máy ảo / container / server từ xa.
+#    Dùng bởi scripts/remote.sh — xem `bash scripts/remote.sh help`.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Địa chỉ + tài khoản SSH của máy ảo. Bỏ trống nếu bạn ngồi thẳng trong máy ảo
+# (khi đó không cần remote.sh, chỉ cần chạy scripts/*.py ở trong đó).
+RGEXP_SSH_HOST=
+RGEXP_SSH_USER=ubuntu
+RGEXP_SSH_PORT=22
+
+# Private key. Bỏ trống -> dùng ssh-agent / default key của hệ thống.
+RGEXP_SSH_KEY="~/.ssh/id_ed25519"
+
+# Tên alias sinh ra bởi `remote.sh ssh-config` (ghi vào ~/.ssh/config).
+RGEXP_SSH_ALIAS=rgexp-vm
+
+# Tuỳ chọn ssh thô, nối thêm vào mọi lệnh. Ví dụ đi qua bastion:
+#   RGEXP_SSH_OPTS="-J jump@bastion.example.com"
+RGEXP_SSH_OPTS=
+
+# Thư mục dự án TRONG MÁY ẢO (remote.sh push/pull/run đều neo vào đây).
+RGEXP_REMOTE_DIR="~/RGExp_proj"   # trong nháy: giữ '~' cho shell PHÍA MÁY ẢO expand
+
+# Python dùng để tạo venv trong máy ảo (Ubuntu 24.04 -> python3.12).
+RGEXP_REMOTE_PYTHON=python3
+
+# Thư mục ảnh TRONG MÁY ẢO (remote.sh push-conf ghi giá trị này thành
+# RGEXP_IMAGE_ROOT ở bản conf phía máy ảo).
+RGEXP_REMOTE_IMAGE_ROOT=
+
+# Port-forward cho `remote.sh tunnel` (nhiều cặp cách nhau bởi dấu cách).
+RGEXP_TUNNEL_PORTS="8888:localhost:8888 6006:localhost:6006"
+
+# Thư mục đồng bộ lên/xuống (remote.sh push / pull).
+RGEXP_PUSH_PATHS="src scripts setup.sh pyproject.toml README.md rgexp.conf.example"
+RGEXP_PULL_PATHS="outputs"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1b. EXECUTION GUARD — chặn pipeline chạy trên máy thật
+#     Thực thi bởi src/rgexp/hostguard.py, chạy ngay khi `import rgexp`.
+#     Không thấy hypervisor / container / phiên SSH nào -> os._exit(78) tức thì,
+#     trước khi torch kịp cấp phát RAM hay mở CUDA context.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# enforce (mặc định) = kill | report = chỉ in cảnh báo | off = tắt hẳn
+RGEXP_GUARD=enforce
+
+# Hostname bị cấm tuyệt đối (glob, cách nhau bởi dấu cách; không phân biệt hoa
+# thường). So khớp với socket.gethostname() CỦA MÁY ĐANG CHẠY CODE — không phải
+# tên thiết bị hiển thị ở đâu đó. Lấy giá trị đúng bằng một trong các cách:
+#     hostname                            (Linux/macOS/Git-Bash)
+#     $env:COMPUTERNAME                   (PowerShell)
+#     python -c "import socket;print(socket.gethostname())"
+#     bash scripts/remote.sh whoami       (in luôn dòng conf để dán vào đây)
+# LƯU Ý: hostname trong WSL/VM khác tên máy Windows — chặn tên Windows không có
+# tác dụng với process chạy trong WSL.
+RGEXP_DENY_HOSTNAMES=
+
+# File bắt buộc phải tồn tại thì mới cho chạy (setup.sh tạo khi cài trong máy
+# ảo). Bỏ trống = bỏ qua check này; điền "~/.rgexp-vm" để bật allowlist cứng.
+RGEXP_VM_MARKER=
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. TOKEN / API
+#    Đây là phần bí mật — đừng share file này, đừng commit.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Hugging Face: account của token phải đã accept license google/gemma-3-4b-it.
+HF_TOKEN=
+RGEXP_HF_REPO_ID=RGExp123/gemma3-4b-it-test_lora_gpu_t4
+RGEXP_HF_HUB=1          # 0 -> không push/resume checkpoint qua Hub
+
+# Weights & Biases. RGEXP_WANDB=0 để tắt hẳn (khi đó WANDB_API_KEY bỏ trống được).
+WANDB_API_KEY=
+RGEXP_WANDB=1
+RGEXP_WANDB_PROJECT=mimic-cxr-gemma3-lora
+RGEXP_WANDB_RUN_NAME=
+
+# PhysioNet — credentialed access cho MIMIC-CXR (dùng khi tải ảnh gốc).
+# LƯU Ý: PhysioNet Credentialed Health Data License 1.5.0 cấm redistribute và
+# re-identify. Không đẩy ảnh lên Hub public, không commit vào git.
+PHYSIONET_USERNAME=
+PHYSIONET_PASSWORD=
+PHYSIONET_MIMIC_CXR_JPG_URL=https://physionet.org/files/mimic-cxr-jpg/2.1.0/
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. PATH DỮ LIỆU (mặc định neo vào repo root — chỉ điền khi đặt chỗ khác)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Thư mục gốc chứa ảnh JPG, join với cột img_rel (files/p10/p10000032/...).
+# Mặc định: <repo>/images
+RGEXP_IMAGE_ROOT=
+
+# <repo>/origins : clean_dataset.csv, labels.npz, metadata.json
+# RGEXP_HELPER_DIR=
+# <repo>/splits  : {train,val,test}_split.csv + *_labels.npz
+# RGEXP_SPLIT_DIR=
+# <repo>/outputs : gemma_reports.csv, metrics_*
+# RGEXP_OUTPUT_DIR=
+# <repo>/checkpoints : staging/ archive/ from_hub/
+# RGEXP_CKPT_DIR=
+# RGEXP_PROJECT_ROOT=
