@@ -8,6 +8,8 @@ Secret lấy từ biến môi trường — `rgexp.conf` đã được `config.p
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 
 from .config import HF_HUB, WANDB_CFG
 
@@ -97,12 +99,38 @@ def ensure_hub_repo(token: str) -> None:
 
 
 def push_to_hub_dir(local_dir: str, path_in_repo: str, commit_message: str,
-                    token: str) -> None:
-    """Push local_dir vào <repo>/<path_in_repo>. 'last' là nguồn resume duy nhất."""
+                    token: str, retries: int = 2) -> bool:
+    """
+    Push local_dir vào <repo>/<path_in_repo>. 'last' là nguồn resume duy nhất.
+
+    Luôn in ra kết quả: im lặng là kẻ thù của debug — "không thấy gì trên Hub"
+    phải phân biệt được với "Hub đang tắt" và "push lỗi mạng".
+
+    Lỗi mạng KHÔNG giết run: state vẫn nằm ở staging, lần save sau push lại.
+    """
     if not HF_HUB.ENABLED:
-        return
+        print(f"[hub] BỎ QUA '{path_in_repo}' — HF_HUB.ENABLED=False "
+              f"(dữ liệu mock hoặc RGEXP_HF_HUB=0 hoặc --no-hub)")
+        return False
+
     from huggingface_hub import upload_folder
 
-    upload_folder(repo_id=HF_HUB.REPO_ID, folder_path=local_dir,
-                  path_in_repo=path_in_repo, token=token,
-                  commit_message=commit_message)
+    n_files = sum(1 for _ in Path(local_dir).rglob("*") if _.is_file())
+    mb = sum(f.stat().st_size for f in Path(local_dir).rglob("*") if f.is_file()) / 1e6
+
+    for attempt in range(1, retries + 1):
+        t0 = time.time()
+        try:
+            upload_folder(repo_id=HF_HUB.REPO_ID, folder_path=local_dir,
+                          path_in_repo=path_in_repo, token=token,
+                          commit_message=commit_message)
+            print(f"[hub] OK {HF_HUB.REPO_ID}/{path_in_repo} "
+                  f"({n_files} file, {mb:.1f} MB, {time.time() - t0:.1f}s)")
+            return True
+        except Exception as e:
+            print(f"[hub] LỖI push '{path_in_repo}' lần {attempt}/{retries}: "
+                  f"{type(e).__name__}: {e}")
+
+    print(f"[hub] BỎ QUA sau {retries} lần thử — checkpoint vẫn ở {local_dir}, "
+          f"lần save sau sẽ push lại.")
+    return False

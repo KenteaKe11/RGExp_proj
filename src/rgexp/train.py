@@ -35,7 +35,7 @@ import torch
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 
-from .config import BATCH, DATA, PATHS, TRAIN_CFG
+from .config import BATCH, DATA, HF_HUB, PATHS, TRAIN_CFG
 from .data import (
     CXRLoraDataset,
     make_epoch_permutation,
@@ -96,6 +96,9 @@ def run_training(model, processor, text_tokenizer, device, collate_fn,
 
     print(f"[steps] {steps_per_epoch} step/epoch | {samples_per_step} samples/step "
           f"| n_train={len(train_ds)}")
+    print(f"[ckpt] lưu mỗi {TRAIN_CFG.SAVE_EVERY_N_STEPS} step "
+          f"-> {PATHS.CKPT_STAGING_DIR} | push Hub: "
+          f"{'ON (' + HF_HUB.REPO_ID + ')' if HF_HUB.ENABLED else 'OFF'}")
 
     assert total_steps > start_step, (
         f"Đã train đủ {start_step}/{total_steps} step. Tăng MAX_STEPS/NUM_EPOCHS, "
@@ -212,6 +215,18 @@ def run_training(model, processor, text_tokenizer, device, collate_fn,
         global_step += 1
 
         elapsed = time.time() - start_time
+        done = global_step - start_step
+        next_save = (TRAIN_CFG.SAVE_EVERY_N_STEPS
+                     - global_step % TRAIN_CFG.SAVE_EVERY_N_STEPS
+                     if TRAIN_CFG.SAVE_EVERY_N_STEPS else None)
+        # In MỖI step: không có dòng này thì khi tắt W&B là mù hoàn toàn.
+        print(f"[step {global_step}/{total_steps}] loss={accum_loss:.4f} "
+              f"lr={scheduler.get_last_lr()[0]:.2e} gnorm={float(grad_norm):.2f} "
+              f"| {elapsed / max(done, 1):.1f}s/step "
+              f"| epoch {epoch} sample {sample_cursor}/{len(train_ds)}"
+              + (f" | save sau {next_save} step" if next_save else ""),
+              flush=True)
+
         wandb_log({
             "train/loss":           accum_loss,
             "train/lr":             scheduler.get_last_lr()[0],
@@ -228,6 +243,7 @@ def run_training(model, processor, text_tokenizer, device, collate_fn,
             wandb_log({"val/loss": run_val_loss()}, step=global_step)
 
         if TRAIN_CFG.SAVE_EVERY_N_STEPS and global_step % TRAIN_CFG.SAVE_EVERY_N_STEPS == 0:
+            print(f"[ckpt] lưu step {global_step} -> {PATHS.CKPT_STAGING_DIR}", flush=True)
             save_checkpoint(PATHS.CKPT_STAGING_DIR, global_step, sample_cursor, epoch)
             n_saves += 1
 
