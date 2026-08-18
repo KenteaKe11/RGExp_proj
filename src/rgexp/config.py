@@ -157,7 +157,7 @@ QUANT = SimpleNamespace(
 # cũng có q_proj/k_proj/v_proj -> list tên trần sẽ dính cả vision tower. Dùng
 # regex có negative-lookahead để neo vào decoder (regex phải là string, không
 # phải list, thì PEFT mới hiểu là pattern).
-_DECODER_LINEAR = "q_proj|k_proj|v_proj|o_proj"
+_DECODER_LINEAR = "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
 _EXCLUDE        = ("vision_tower", "multi_modal_projector", "lm_head")
 
 _LORA_R = 8
