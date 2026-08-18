@@ -29,6 +29,11 @@ RGEXP_SSH_PORT=22
 # Private key. Bỏ trống -> dùng ssh-agent / default key của hệ thống.
 RGEXP_SSH_KEY="~/.ssh/id_ed25519"
 
+# Mật khẩu SSH — chỉ khi nhà cung cấp phát password thay vì key. Cần `sshpass`
+# để khỏi bị hỏi ở mỗi bước; tốt nhất chạy `bash scripts/remote.sh keysetup`
+# một lần để chuyển sang key rồi xoá dòng này.
+RGEXP_SSH_PASS=
+
 # Tên alias sinh ra bởi `remote.sh ssh-config` (ghi vào ~/.ssh/config).
 RGEXP_SSH_ALIAS=rgexp-vm
 

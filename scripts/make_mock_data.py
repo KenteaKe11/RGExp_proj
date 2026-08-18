@@ -5,7 +5,7 @@ Sinh bộ dữ liệu MÔ PHỎNG nhỏ, đúng schema của dữ liệu thật.
 Mục đích: chạy thử toàn bộ đường ống (push -> từng module -> pull) trước khi có
 dữ liệu MIMIC-CXR thật. Không có gì ở đây là dữ liệu y tế thật.
 
-    python scripts/make_mock_data.py                 # 40 mẫu, ảnh 224x224
+    python scripts/make_mock_data.py                 # 200 mẫu, ảnh 224x224
     python scripts/make_mock_data.py --n 200         # nặng hơn để đo băng thông
     python scripts/make_mock_data.py --force         # ghi đè nếu đã có
 
@@ -93,7 +93,7 @@ def main():
     root_default = Path(__file__).resolve().parents[1]
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=40, help="Số mẫu (mặc định 40).")
+    ap.add_argument("--n", type=int, default=200, help="Số mẫu (mặc định 40).")
     ap.add_argument("--root", default=str(root_default), help="Repo root.")
     ap.add_argument("--image-root", default=None,
                     help="Mặc định <root>/images (khớp RGEXP_IMAGE_ROOT mặc định).")

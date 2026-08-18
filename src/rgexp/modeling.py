@@ -160,9 +160,18 @@ def apply_lora(model, resume_dir: str | None = None):
         return model
 
     if QUANT.ENABLED:
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=LORA.USE_GRADIENT_CHECKPOINTING
-        )
+        # use_reentrant phải truyền tường minh: PyTorch 2.9 sẽ raise nếu thiếu.
+        # PEFT cũ không có tham số gradient_checkpointing_kwargs -> fallback.
+        try:
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=LORA.USE_GRADIENT_CHECKPOINTING,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+        except TypeError:
+            model = prepare_model_for_kbit_training(
+                model, use_gradient_checkpointing=LORA.USE_GRADIENT_CHECKPOINTING
+            )
 
     if resume_dir:
         model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)

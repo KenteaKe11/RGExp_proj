@@ -138,3 +138,5 @@ hoặc [`docs/SHELL-FLOW.md`](docs/SHELL-FLOW.md).
 | `Đã train đủ N/N step` | checkpoint trên Hub đã hoàn tất — tăng `--max-steps`/`--epochs` hoặc `--no-resume` |
 | `ImportError ... peft/tuners/lora/torchao.py` | chưa `pip uninstall -y torchao` (setup.sh làm sẵn) |
 | Process chết im, exit 137 | VRAM watchdog kill ở ngưỡng `VRAM_KILL_PCT` — giảm `BATCH.TRAIN_BATCH_SIZE` |
+| `[config] Dữ liệu đang là MOCK ... tự TẮT push/resume HF Hub` | đúng như vậy: chặn checkpoint giả lẫn vào Hub. `RGEXP_ALLOW_MOCK_PUSH=1` để ghi đè |
+| `Train split đổi kích thước (A -> B)` | checkpoint trên Hub train ở kích thước split khác (thường là checkpoint mock) — dùng `--no-resume` hoặc xoá `last/` |

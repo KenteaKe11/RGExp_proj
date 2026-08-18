@@ -143,15 +143,34 @@ run_remote() {
     fi
     $RS config | head -6
 
-    step "kiểm tra SSH + GPU"              $RS check
-    step "sinh dữ liệu mock ($N_MOCK mẫu)" make_mock
-    local mb; mb=$(data_size)
-    echo "[e2e] dữ liệu mock: ${mb} MB (origins + images)"
+    step "kiểm tra SSH + GPU" $RS check
+
+    # Sinh mock ở đâu? Ưu tiên máy đang gõ để test luôn luồng push-data. Máy
+    # thiếu numpy/pandas/Pillow (WSL mới toanh chẳng hạn) thì sinh thẳng trên
+    # máy ảo — đánh đổi: không đo được tốc độ push dữ liệu.
+    local mock_local=0
+    "$PY" -c "import numpy, pandas, PIL" >/dev/null 2>&1 && mock_local=1
+
+    local mb=0
+    if [ "$mock_local" = "1" ]; then
+        step "sinh dữ liệu mock ($N_MOCK mẫu)" make_mock
+        mb=$(data_size)
+        echo "[e2e] dữ liệu mock: ${mb} MB (origins + images)"
+    else
+        echo "${c_err}[e2e] máy này thiếu numpy/pandas/Pillow -> sẽ sinh mock TRÊN máy ảo," >&2
+        echo "      bỏ qua phép đo push-data.${c_off}" >&2
+    fi
 
     step "push code"        $RS push
     step "push rgexp.conf"  $RS push-conf
     [ "$DO_SETUP" = "1" ] && step "setup venv trên máy ảo" $RS setup
-    step "push dữ liệu mock (${mb} MB)" env RGEXP_YES=1 bash "$ROOT/scripts/remote.sh" push-data
+
+    if [ "$mock_local" = "1" ]; then
+        step "push dữ liệu mock (${mb} MB)" env RGEXP_YES=1 bash "$ROOT/scripts/remote.sh" push-data
+    else
+        step "sinh dữ liệu mock trên máy ảo" $RS run \
+            "python scripts/make_mock_data.py --n $N_MOCK --force"
+    fi
 
     step "smoke_test trên máy ảo" $RS run "python scripts/smoke_test.py"
     step "prepare_splits trên máy ảo" \

@@ -37,16 +37,30 @@ PULL_PATHS="${RGEXP_PULL_PATHS:-outputs}"
 DATA_PATHS="${RGEXP_DATA_PATHS:-origins splits images}"
 TUNNELS="${RGEXP_TUNNEL_PORTS:-8888:localhost:8888}"
 
+PASS="${RGEXP_SSH_PASS:-}"       # chỉ dùng khi nhà cung cấp phát password
 KEY="${KEY/#\~/$HOME}"           # ~ -> $HOME (ssh -i không tự expand)
 TARGET="$USER_@$HOST"
+
+# sshpass: bọc ssh để khỏi gõ mật khẩu ở MỖI bước. Không có sshpass thì ssh vẫn
+# chạy, chỉ là sẽ hỏi mật khẩu từng lần -> nên chạy `remote.sh keysetup` một lần.
+have_sshpass() { command -v sshpass >/dev/null 2>&1; }
+use_pass() { [ -n "$PASS" ] && [ ! -f "$KEY" ] && have_sshpass; }
 
 warn() { printf '\033[33m[remote] %s\033[0m\n' "$*" >&2; }
 
 require_host() {
-    [ -n "$HOST" ] || die "RGEXP_SSH_HOST đang trống trong $CONF — điền host của Cloud GPU trước."
+    [ -n "$HOST" ] || die "RGEXP_SSH_HOST đang trống trong $CONF — điền host của máy ảo trước."
     if [ -n "$KEY" ] && [ ! -f "$KEY" ]; then
-        warn "không thấy private key $KEY — sẽ thử ssh-agent / default key."
-        KEY=""
+        if [ -n "$PASS" ]; then
+            KEY=""      # chưa có key -> dùng password
+        else
+            warn "không thấy private key $KEY — sẽ thử ssh-agent / default key."
+            KEY=""
+        fi
+    fi
+    if [ -n "$PASS" ] && [ -z "$KEY" ] && ! have_sshpass; then
+        warn "có RGEXP_SSH_PASS nhưng thiếu 'sshpass' — ssh sẽ hỏi mật khẩu mỗi bước."
+        warn "cài: sudo apt install sshpass   (hoặc chạy: remote.sh keysetup)"
     fi
 }
 
@@ -61,13 +75,21 @@ ssh_args() {
 do_ssh() {                       # do_ssh <lệnh chạy trên remote>
     require_host
     mapfile -t A < <(ssh_args)
-    ssh "${A[@]}" "$TARGET" "$@"
+    if use_pass; then
+        sshpass -p "$PASS" ssh "${A[@]}" "$TARGET" "$@"
+    else
+        ssh "${A[@]}" "$TARGET" "$@"
+    fi
 }
 
 do_ssh_tty() {
     require_host
     mapfile -t A < <(ssh_args)
-    ssh -t "${A[@]}" "$TARGET" "$@"
+    if use_pass; then
+        sshpass -p "$PASS" ssh -t "${A[@]}" "$TARGET" "$@"
+    else
+        ssh -t "${A[@]}" "$TARGET" "$@"
+    fi
 }
 
 # Lệnh chạy trong venv của dự án trên remote.
@@ -80,9 +102,10 @@ remote_venv_cmd() {
 have_rsync() { command -v rsync >/dev/null 2>&1; }
 
 rsync_ssh_opt() {
-    local o="ssh -p $PORT"
-    [ -n "$KEY" ] && o="$o -i $KEY"
+    local o="ssh -p $PORT -o StrictHostKeyChecking=accept-new"
+    [ -n "$KEY" ] && [ -f "$KEY" ] && o="$o -i $KEY"
     [ -n "$EXTRA" ] && o="$o $EXTRA"
+    use_pass && o="sshpass -p $PASS $o"
     printf '%s' "$o"
 }
 
@@ -134,6 +157,7 @@ remote.sh — điều khiển máy ảo chạy job theo $CONF
   mark          Tạo file marker RGEXP_VM_MARKER trên máy ảo (bật allowlist cứng)
   guard         In chẩn đoán execution guard của máy ảo
   whoami        In hostname máy đang gõ + hostname máy ảo, kèm dòng conf gợi ý
+  keysetup      Tạo SSH key (nếu chưa có) + copy lên máy ảo -> hết phải gõ mật khẩu
   run "<cmd>"   Chạy 1 lệnh trong venv của dự án trên máy ảo
   bg  "<cmd>"   Như run nhưng nohup chạy nền, log vào $RDIR/logs/
   logs [file]   tail -f log mới nhất trong $RDIR/logs/
@@ -158,6 +182,7 @@ file        : $CONF
 ── 1. Cloud GPU ──
   ssh       : $USER_@${HOST:-"(CHƯA SET)"}:$PORT
   key       : ${KEY:-"(ssh-agent/default)"}
+  auth      : $([ -n "$PASS" ] && [ ! -f "$KEY" ] && echo "password$(have_sshpass && echo ' (sshpass)' || echo ' (SẼ HỎI mỗi lần — cài sshpass)')" || echo "key")
   ssh_opts  : ${EXTRA:-"(không)"}
   remote_dir: $RDIR
   python    : $RPY
@@ -331,6 +356,33 @@ cmd_whoami() {
     echo "cách chạy 'hostname' ngay trên máy bạn muốn chặn."
 }
 
+cmd_keysetup() {
+    require_host
+    local key="${RGEXP_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+    key="${key/#\~/$HOME}"
+
+    if [ ! -f "$key" ]; then
+        info "tạo key mới: $key"
+        mkdir -p "$(dirname "$key")"
+        ssh-keygen -t ed25519 -N "" -f "$key" -C "rgexp@$(hostname)" >/dev/null
+    fi
+
+    local pub; pub="$(cat "$key.pub")"
+    info "copy public key lên $TARGET"
+    if [ -n "$PASS" ] && have_sshpass; then
+        sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=accept-new \
+            "$TARGET" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+             grep -qxF '$pub' ~/.ssh/authorized_keys 2>/dev/null || \
+             echo '$pub' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys"
+    else
+        ssh -p "$PORT" -o StrictHostKeyChecking=accept-new "$TARGET" \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+             grep -qxF '$pub' ~/.ssh/authorized_keys 2>/dev/null || \
+             echo '$pub' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys"
+    fi
+    ok "xong. Đặt trong $CONF:  RGEXP_SSH_KEY=\"$key\"  (và có thể xoá RGEXP_SSH_PASS)"
+}
+
 cmd_mark() {
     local m="${RGEXP_VM_MARKER:-}"
     [ -n "$m" ] || die "RGEXP_VM_MARKER đang trống trong $CONF — điền vd \"~/.rgexp-vm\" trước."
@@ -363,5 +415,6 @@ case "${1:-help}" in
     mark)        cmd_mark ;;
     guard)       cmd_guard ;;
     whoami)      cmd_whoami ;;
+    keysetup)    cmd_keysetup ;;
     *)           die "lệnh không hợp lệ: $1 (xem: bash scripts/remote.sh help)" ;;
 esac

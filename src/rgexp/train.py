@@ -169,6 +169,13 @@ def run_training(model, processor, text_tokenizer, device, collate_fn,
     epoch_perm = make_epoch_permutation(labels_train, epoch)
     train_iter = iter(make_train_loader(train_ds, epoch_perm[sample_cursor:], collate_fn))
 
+    # gradient checkpointing không đi cùng KV-cache; tắt tường minh thay vì để
+    # transformers cảnh báo rồi tự tắt. Bật lại sau khi train xong cho generate.
+    _cfg = getattr(model, "config", None)
+    _prev_use_cache = getattr(_cfg, "use_cache", None)
+    if _cfg is not None:
+        _cfg.use_cache = False
+
     model.train()
     optimizer.zero_grad()
     start_time = time.time()
@@ -241,6 +248,9 @@ def run_training(model, processor, text_tokenizer, device, collate_fn,
     save_checkpoint(PATHS.CKPT_STAGING_DIR, global_step, sample_cursor, epoch)
     push_to_hub_dir(PATHS.CKPT_STAGING_DIR, "last",
                     f"final | step {global_step} | epoch {epoch}", hf_token)
+
+    if _cfg is not None and _prev_use_cache is not None:
+        _cfg.use_cache = _prev_use_cache
 
     print(f"[train] xong tại step {global_step}/{total_steps} | epoch {epoch} | "
           f"sample {sample_cursor}/{len(train_ds)}")

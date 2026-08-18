@@ -357,6 +357,31 @@ EVAL_CFG = SimpleNamespace(
 )
 
 
+# ---- 3.16 Phát hiện dữ liệu mô phỏng ----------------------------------------
+def _detect_mock_data() -> bool:
+    """origins/metadata.json do make_mock_data.py sinh ra có cờ "mock": true."""
+    meta = Path(PATHS.METADATA_JSON)
+    if not meta.exists():
+        return False
+    try:
+        import json
+        return bool(json.loads(meta.read_text(encoding="utf-8")).get("mock"))
+    except Exception:
+        return False
+
+
+DATA_IS_MOCK = _detect_mock_data()
+
+# Adapter train trên dữ liệu giả mà push lên `last/` của Hub là một cái bẫy:
+# lần train thật sau đó sẽ resume từ nó. Chặn mặc định, mở bằng
+# RGEXP_ALLOW_MOCK_PUSH=1 nếu thật sự muốn.
+if DATA_IS_MOCK and HF_HUB.ENABLED and not _flag("RGEXP_ALLOW_MOCK_PUSH", "0"):
+    HF_HUB.ENABLED = False
+    print("\033[33m[config] Dữ liệu đang là MOCK (origins/metadata.json: mock=true) "
+          "-> tự TẮT push/resume HF Hub để checkpoint giả không lẫn vào repo thật.\n"
+          "         Ghi đè bằng RGEXP_ALLOW_MOCK_PUSH=1.\033[0m")
+
+
 def ensure_dirs() -> None:
     """Tạo mọi thư mục ghi được. Không đụng vào origins/ và splits/ (input)."""
     for d in (PATHS.OUTPUT_DIR, PATHS.CKPT_STAGING_DIR,
@@ -375,6 +400,7 @@ def describe() -> str:
         f"splits={PATHS.SPLIT_DIR}\n"
         f"outputs={PATHS.OUTPUT_DIR}\n"
         f"model={MODEL.MODEL_ID} | 4bit={QUANT.ENABLED} | lora={LORA.ENABLED}\n"
+        f"data={'MOCK' if DATA_IS_MOCK else 'thật'} | "
         f"hub={HF_HUB.REPO_ID if HF_HUB.ENABLED else 'off'} | "
         f"wandb={WANDB_CFG.PROJECT if WANDB_CFG.ENABLED else 'off'}"
     )

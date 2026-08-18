@@ -87,6 +87,18 @@ nên luôn thấy được đã đi tới đâu và mất bao lâu.
 | `train` lặp lại vẫn chậm | cache HF không được giữ giữa các lần chạy — kiểm tra `~/.cache/huggingface` trên máy ảo |
 | `pull` nhanh nhưng thiếu file | job chưa chạy tới bước ghi, xem `remote.sh logs` |
 
+## Chốt an toàn: checkpoint mock không lẫn vào Hub
+
+Adapter train trên dữ liệu giả mà push lên `<repo>/last/` là một cái bẫy: lần
+train thật sau đó sẽ **resume từ nó**. Nên khi `origins/metadata.json` có cờ
+`"mock": true`, `config.py` tự đặt `HF_HUB.ENABLED = False` và in cảnh báo —
+không push, không resume. Mở lại bằng `RGEXP_ALLOW_MOCK_PUSH=1` nếu thật sự cần.
+
+Nếu lỡ push checkpoint mock lên Hub rồi: xoá thư mục `last/` trong repo Hub, hoặc
+train thật với `--no-resume`. (Có một lớp chặn nữa: `train_state.json` lưu
+`n_train`, nên resume từ checkpoint mock vào dữ liệu thật sẽ fail assert
+"Train split đổi kích thước" thay vì âm thầm train sai.)
+
 ## Dọn trước khi nạp dữ liệu thật
 
 ```bash
