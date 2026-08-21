@@ -61,7 +61,7 @@ sweep:
   # lora | qlora | dora | qdora
   variant: dora
   # LoRA/QLoRA: 16 hoặc 32.  DoRA/QDoRA: 8 hoặc 16.
-  rank: 16
+  rank: 8
 
 # Bảng tra: tên model + module vision loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
 #
@@ -147,7 +147,7 @@ run:
 
   # §4.1.2 — max_seq_len tự tính: 2^ceil(log2(prompt + img_token + delta)).
   # null = tự tính. Đặt số cụ thể để ép.
-  max_seq_len: 600
+  max_seq_len: 1024
   seq_delta: 128            # chỗ chừa cho target (guard chặn ở 110 token)
 
   lr: 1.0e-4                # §3.2 lr_max
