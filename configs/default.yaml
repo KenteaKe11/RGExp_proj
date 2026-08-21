@@ -108,9 +108,18 @@ run:
     image_zip: img_dir.zip
     # Thư mục giải nén ảnh. Giải nén MỘT LẦN rồi đánh dấu; lần chạy sau bỏ qua.
     image_cache: ./data/images
-    # Tiền tố bên trong zip nếu ảnh không nằm ở gốc (vd "img_dir").
-    # null = tự dò sau khi giải nén.
+    # ── Khớp đường dẫn ảnh ───────────────────────────────────────────────────
+    # Cả hai để null = TỰ DÒ: sau khi giải nén, code lấy vài img_rel thật trong
+    # CSV rồi thử mọi tổ hợp (lớp bọc trong zip) × (số đoạn đầu img_rel cần bỏ)
+    # cho tới khi mọi mẫu tồn tại trên đĩa. Chỉ đặt tay khi tự dò báo lỗi.
+    #
+    #   image_subdir     lớp bọc bên trong zip, vd "img_dir"
+    #   image_rel_strip  số đoạn ĐẦU của img_rel phải bỏ đi, vd 1 khi CSV ghi
+    #                    "files/p10/..." mà trên đĩa chỉ có "p10/...".
+    #                    Key img_rel gốc KHÔNG bị sửa — split và labels.npz vẫn
+    #                    chiếu theo giá trị nguyên bản.
     image_subdir: null
+    image_rel_strip: null
     image_column: img_rel
 
   out_dir: ./outputs

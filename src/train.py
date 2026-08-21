@@ -111,10 +111,10 @@ def main(argv=None):
         log("hub", f"repo sẵn sàng: {r.hub_repo}")
 
     # ── Dữ liệu ──────────────────────────────────────────────────────────────
-    df, npz_path, image_root = fetch_sources(cfg, log)
+    df, npz_path, img_paths = fetch_sources(cfg, log)
     log("data", f"tổng mẫu: {len(df)}")
     keys = load_or_make_splits(df, cfg, log)
-    df_train, df_val, df_test = build_frames(df, keys, image_root, cfg, log)
+    df_train, df_val, df_test = build_frames(df, keys, img_paths, cfg, log)
     df_train, base_order = rare_first_order(df_train, npz_path, cfg, log)
     if r.n_train_samples:
         df_train = df_train.iloc[:r.n_train_samples].reset_index(drop=True)

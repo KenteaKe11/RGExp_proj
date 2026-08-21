@@ -44,7 +44,7 @@ def ensure_images(cfg, log):
             info = json.load(f)
         log("img", f"dùng cache: {cache} ({info.get('n_files')} file, "
                    f"giải nén {info.get('when')})")
-        return _resolve_root(cache, d.image_subdir, log)
+        return cache
 
     zip_path = _download(cfg, d.image_zip, log,
                          label=f"{d.image_zip} (lớn, lần đầu sẽ lâu)")
@@ -65,35 +65,115 @@ def ensure_images(cfg, log):
         json.dump({"zip": d.image_zip, "n_files": n,
                    "when": datetime.now().isoformat(timespec="seconds")}, f)
     log("img", f"✓ giải nén {n} file")
-    return _resolve_root(cache, d.image_subdir, log)
-
-
-def _resolve_root(cache, subdir, log):
-    """Tìm thư mục gốc thật của ảnh.
-
-    Zip thường có một lớp bọc (img_dir/...). Nếu không khai báo image_subdir
-    thì dò: cache chỉ chứa đúng một thư mục con -> đi xuống lớp đó.
-    """
-    if subdir:
-        root = os.path.join(cache, subdir)
-        if not os.path.isdir(root):
-            raise FileNotFoundError(f"image_subdir không tồn tại: {root}")
-        return root
-
-    entries = [e for e in os.listdir(cache) if not e.startswith(".")]
-    dirs = [e for e in entries if os.path.isdir(os.path.join(cache, e))]
-    if len(dirs) == 1 and len(entries) == 1:
-        log("img", f"tự dò lớp bọc: {dirs[0]}/")
-        return os.path.join(cache, dirs[0])
     return cache
 
 
+# ══════════════════════ Khớp đường dẫn CSV ↔ cây thư mục ═════════════════════
+# Hai lệch pha hay gặp giữa `img_rel` trong CSV và cây thư mục sau khi giải nén:
+#   (a) zip có lớp bọc      -> ảnh thật nằm ở  <cache>/img_dir/p10/...
+#   (b) CSV có tiền tố thừa -> img_rel là      files/p10/...   (không có 'files')
+# Cả hai cùng lúc là trường hợp của repo hiện tại. Thay vì bắt người dùng đoán
+# `image_subdir`, ta dò một lần bằng vài mẫu thật rồi khoá lại phép biến đổi.
+
+def _norm_rel(rel):
+    """Chuẩn hoá tách đoạn: '\\' -> '/', bỏ './' và '/' đầu chuỗi."""
+    rel = str(rel).strip().replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel.lstrip("/")
+
+
+class ImagePaths:
+    """Phép biến đổi img_rel -> đường dẫn tuyệt đối, đã kiểm chứng trên đĩa.
+
+    `strip` = số đoạn đầu của img_rel bị bỏ đi. Key gốc KHÔNG bị sửa: split và
+    labels.npz vẫn chiếu theo img_rel nguyên bản.
+    """
+
+    def __init__(self, root, strip=0):
+        self.root, self.strip = root, strip
+
+    def to_abs(self, rel):
+        parts = _norm_rel(rel).split("/")[self.strip:]
+        return os.path.join(self.root, *parts)
+
+    def __fspath__(self):
+        return self.root
+
+    def __str__(self):
+        return self.root if not self.strip else f"{self.root} (bỏ {self.strip} đoạn đầu img_rel)"
+
+
+def _candidate_roots(cache, subdir, log):
+    """Các thư mục có thể là gốc ảnh, nông trước sâu sau.
+
+    Khai báo image_subdir -> chỉ dùng đúng nó. Không khai báo -> lấy cache, các
+    thư mục con cấp 1, và cấp 2 của những thư mục "nhỏ" (≤8 mục: dấu hiệu của
+    lớp bọc chứ không phải lớp dữ liệu như p10/, p11/...).
+    """
+    if subdir:
+        root = os.path.join(cache, *_norm_rel(subdir).split("/"))
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"image_subdir không tồn tại: {root}")
+        return [root]
+
+    def children(path):
+        try:
+            entries = [e for e in os.listdir(path) if not e.startswith(".")]
+        except OSError:
+            return []
+        if len(entries) > 8:
+            return []
+        return [os.path.join(path, e) for e in entries
+                if os.path.isdir(os.path.join(path, e))]
+
+    roots = [cache]
+    for lvl1 in children(cache):
+        roots.append(lvl1)
+        roots.extend(children(lvl1))
+    return roots
+
+
+def _align_paths(cache, subdir, samples, log):
+    """Dò (root, strip) sao cho MỌI mẫu trong `samples` tồn tại trên đĩa.
+
+    Duyệt strip từ nhỏ đến lớn: ưu tiên phương án ít cắt xén img_rel nhất.
+    """
+    samples = [_norm_rel(s) for s in samples if str(s).strip()]
+    if not samples:
+        raise ValueError("Không có mẫu img_rel nào để dò đường dẫn")
+    roots = _candidate_roots(cache, subdir, log)
+    max_strip = min(len(s.split("/")) for s in samples) - 1
+
+    for strip in range(max_strip + 1):
+        for root in roots:
+            p = ImagePaths(root, strip)
+            if all(os.path.exists(p.to_abs(s)) for s in samples):
+                rel_root = os.path.relpath(root, cache)
+                log("img", f"khớp đường dẫn: root={'<cache>' if rel_root == '.' else rel_root}"
+                           f" | bỏ {strip} đoạn đầu img_rel"
+                           + (f" ('{'/'.join(samples[0].split('/')[:strip])}/')"
+                              if strip else "")
+                           + f" | kiểm {len(samples)} mẫu OK")
+                return p
+
+    tried = ", ".join(os.path.relpath(r, cache) for r in roots[:6])
+    raise FileNotFoundError(
+        f"Không khớp được img_rel với cây thư mục ảnh.\n"
+        f"  cache      = {cache}\n"
+        f"  nội dung   = {sorted(os.listdir(cache))[:8]}\n"
+        f"  img_rel[0] = {samples[0]}\n"
+        f"  đã thử root: {tried}  × bỏ 0..{max_strip} đoạn đầu\n"
+        f"  Đặt run.data.image_subdir (lớp bọc trong zip) và/hoặc\n"
+        f"  run.data.image_rel_strip (số đoạn đầu img_rel cần bỏ) cho khớp.")
+
+
 def fetch_sources(cfg, log):
-    """Trả về (df, labels_path, image_root)."""
+    """Trả về (df, labels_path, ImagePaths)."""
     d = cfg.data
     csv_path = _download(cfg, d.meta_csv, log)
     npz_path = _download(cfg, d.labels_npz, log)
-    image_root = ensure_images(cfg, log)
+    cache = ensure_images(cfg, log)
 
     df = pd.read_csv(csv_path)
     log("data", f"CSV {len(df)} dòng | cột: {list(df.columns)[:8]}")
@@ -101,17 +181,28 @@ def fetch_sources(cfg, log):
     key_col = d.image_column
     assert key_col in df.columns, \
         f"Thiếu cột '{key_col}'. Có: {list(df.columns)}"
-    # Kiểm tra ảnh đầu tiên tồn tại — sai image_root thì hỏng ngay ở đây, rẻ
-    # hơn nhiều so với phát hiện bên trong DataLoader worker.
-    sample = os.path.join(image_root, str(df[key_col].iloc[0]))
-    if not os.path.exists(sample):
-        raise FileNotFoundError(
-            f"Không thấy ảnh mẫu: {sample}\n"
-            f"  image_root = {image_root}\n"
-            f"  nội dung   = {os.listdir(image_root)[:5]}\n"
-            f"  Đặt run.data.image_subdir cho khớp lớp thư mục trong zip.")
-    log("img", f"✓ image_root = {image_root}")
-    return df, npz_path, image_root
+
+    # Dò bằng nhiều mẫu (mỗi mẫu một chỗ trong bảng) để tránh khớp nhờ may mắn.
+    n = len(df)
+    idx = sorted({0, n // 3, 2 * n // 3, n - 1})
+    samples = [str(df[key_col].iloc[i]) for i in idx]
+
+    strip = getattr(d, "image_rel_strip", None)
+    if strip is not None:                      # ép cứng: bỏ qua bước dò
+        roots = _candidate_roots(cache, d.image_subdir, log)
+        paths = ImagePaths(roots[0], int(strip))
+        missing = [s for s in samples if not os.path.exists(paths.to_abs(s))]
+        if missing:
+            raise FileNotFoundError(
+                f"image_rel_strip={strip} + image_subdir={d.image_subdir} không "
+                f"khớp. Không thấy: {paths.to_abs(missing[0])}")
+        log("img", f"đường dẫn ép cứng: root={paths.root} | bỏ {strip} đoạn")
+    else:
+        paths = _align_paths(cache, d.image_subdir, samples, log)
+
+    log("img", f"✓ image_root = {paths}")
+    log("img", f"  vd: {samples[0]} -> {paths.to_abs(samples[0])}")
+    return df, npz_path, paths
 
 
 def _split_paths(directory):
@@ -182,9 +273,12 @@ def load_or_make_splits(df, cfg, log):
     return keys
 
 
-def build_frames(df, keys, image_root, cfg, log):
+def build_frames(df, keys, image_paths, cfg, log):
     d, r, f = cfg.data, cfg.run, cfg.fixed
     key_col = d.image_column
+    # Nhận cả str (tương thích ngược) lẫn ImagePaths.
+    if not isinstance(image_paths, ImagePaths):
+        image_paths = ImagePaths(str(image_paths), 0)
 
     df = df[df[f.target_column].notna()]
     df = df[df[f.target_column].astype(str).str.strip() != ""].reset_index(drop=True)
@@ -198,8 +292,7 @@ def build_frames(df, keys, image_root, cfg, log):
             log("split", f"CẢNH BÁO [{name}]: bỏ {len(keys[name])-len(found)} "
                          f"key không có trong CSV hiện tại")
         out = by_key.loc[found].reset_index(drop=True).copy()
-        out["img_abs_path"] = out[key_col].apply(
-            lambda x: os.path.join(image_root, x))
+        out["img_abs_path"] = out[key_col].apply(image_paths.to_abs)
         return out
 
     tr, va, te = take("train"), take("val"), take("test")
