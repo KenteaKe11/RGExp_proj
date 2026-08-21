@@ -544,6 +544,8 @@ So sánh giữa các ô: xem §5.
 | **Máy thuê** — sweep chết khi đóng laptop | chạy ngoài tmux, ssh đứt → SIGHUP | `tmux new -s sweep` rồi chạy lại (§9.2) |
 | **Máy thuê** — hết dung lượng khi giải nén ảnh | volume 100GB nhưng cache ở `/root` | trỏ `remote.image_cache` vào volume |
 | `or_mask_function ... require torch>=2.6` | transformers ≥4.53 + torch 2.5.x của image | `pip install "transformers>=4.50,<4.53"` (setup.sh bước 5b tự làm), hoặc nâng torch lên 2.6 |
+| `sm_120 is not compatible with the current PyTorch installation` | GPU Blackwell (5090) + torch cu121 | `pip install -U torch torchvision --index-url .../cu128` + `bitsandbytes>=0.46` (setup.sh bước 4 tự làm) |
+| `no kernel image is available for execution` | cùng nguyên nhân trên, nhưng lỗi nổ muộn hơn | như trên |
 | `no such option: --root-user-action` | pip < 22.1 | setup.sh tự dò cờ; nếu vẫn gặp thì `pip install -U pip` |
 | **Máy thuê** — `/usr/bin/env: 'bash\r': No such file or directory` | file .sh bị commit kèm CR (Windows) | `sed -i 's/\r$//' scripts/*.sh`; sửa hẳn bằng `.gitattributes` + `git add --renormalize .` |
 
@@ -681,11 +683,19 @@ Hai cửa phải qua, kiểm ngay ở `docker_bootstrap.sh` bước 1 và `setup
 **Cửa 1 — bf16.** Dự án khoá `compute_dtype: bfloat16` (§4.1.3). GPU không có
 bf16 thì dừng ngay, không có nhánh fp16.
 
-| GPU | sm | bf16 |
-|---|---|---|
-| H100 / A100 / L40S / L4 / RTX 3090 / 4090 / 3070 | sm80+ | ✓ |
-| **V100** | sm70 | ✗ dừng |
-| **T4** | sm75 | ✗ dừng |
+| GPU | sm | bf16 | torch tối thiểu |
+|---|---|---|---|
+| RTX 3070 / 3090 / 4090 / A100 / L4 / L40S | sm80–89 | ✓ | cu121 |
+| H100 | sm90 | ✓ | cu124 |
+| **RTX 5090 / 5080** | sm120 | ✓ | **cu128** — bản cu121 của image không có kernel sm120 |
+| **V100** | sm70 | ✗ dừng | — |
+| **T4** | sm75 | ✗ dừng | — |
+
+GPU quá mới là cửa thứ ba, ít ai ngờ tới: torch *import được* nhưng kernel chỉ
+build sẵn cho một tập kiến trúc. Nạp model lên GPU ngoài tập đó chỉ hiện một
+`UserWarning` rồi vỡ sau đó bằng lỗi khó hiểu. `setup.sh` bước 4 so
+`torch.cuda.get_device_capability()` với `torch.cuda.get_arch_list()` và tự nâng
+torch đúng bản khi lệch (`RGEXP_NO_TORCH_UPGRADE=1` để tự làm tay).
 
 **Cửa 2 — VRAM.** Gemma3-4b ở bf16 tốn ~8.6GB **chỉ riêng weight**, chưa kể
 optimizer state, activation và KV cache.

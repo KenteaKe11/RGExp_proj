@@ -67,12 +67,27 @@ echo "✓ Python $PYVER"
 # Bản torch phải khớp CUDA runtime; sai bản là nguồn lỗi khó chẩn đoán nhất
 # (import được nhưng torch.cuda.is_available() trả False).
 CUDA_TAG="cu121"
-# torch đã cài rồi thì chính nó là nguồn tin đúng nhất — nvidia-smi trong
-# container thường không in dòng "CUDA Version" (chỉ driver host mới có).
+
+# GPU mới cần wheel mới: kernel của torch được build sẵn cho một tập kiến trúc
+# cố định. Blackwell (sm120: RTX 5090/5080) chỉ có trong bản cu128; torch cu121
+# build tới sm90 nên nạp lên 5090 là "no kernel image available".
+# -> Chọn tag theo compute capability của GPU TRƯỚC, torch hiện có tính sau.
+GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
+case "$GPU_SM" in
+    12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;   # Blackwell trở lên
+    90)          CUDA_TAG="cu124"; MIN_TAG="cu124" ;;   # Hopper
+    8*)          CUDA_TAG="cu121"; MIN_TAG="" ;;        # Ampere / Ada
+    *)           MIN_TAG="" ;;
+esac
+if [ -n "$GPU_SM" ]; then echo "✓ GPU sm$GPU_SM${MIN_TAG:+ -> cần torch $MIN_TAG trở lên}"; fi
+
 TORCH_CUDA=$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || echo "")
-if [ -n "$TORCH_CUDA" ]; then
+if [ -n "$TORCH_CUDA" ] && [ -z "$MIN_TAG" ]; then
     CUDA_TAG="cu$(printf '%s' "$TORCH_CUDA" | tr -d '.')"
     echo "✓ torch có sẵn, CUDA $TORCH_CUDA -> $CUDA_TAG (bỏ qua dò nvidia-smi)"
+elif [ -n "$TORCH_CUDA" ]; then
+    echo "✓ torch có sẵn (CUDA $TORCH_CUDA) — sẽ kiểm có kernel cho sm$GPU_SM không"
 elif command -v nvidia-smi >/dev/null 2>&1; then
     CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' | head -1 || echo "")
     if [ -n "$CUDA_VER" ]; then echo "✓ nvidia-smi: CUDA $CUDA_VER"; fi
@@ -133,6 +148,43 @@ pipi --upgrade pip setuptools wheel
 # Ở container thuê, torch đã có sẵn và khớp CUDA của máy -> KHÔNG đụng vào.
 if "$PYBIN" -c "import torch" 2>/dev/null; then
     echo "✓ torch đã có: $("$PYBIN" -c 'import torch; print(torch.__version__)')"
+
+    # torch "import được" KHÔNG có nghĩa là chạy được trên GPU này. Kernel được
+    # biên dịch sẵn cho một tập kiến trúc; GPU ngoài tập đó chỉ hiện một
+    # UserWarning lúc khởi tạo rồi vỡ sau đó bằng lỗi khó hiểu. Kiểm thẳng.
+    ARCH=$("$PYBIN" - <<'PYEOF'
+import torch
+try:
+    cap = torch.cuda.get_device_capability(0)
+except Exception as e:
+    print(f"unknown {e}"); raise SystemExit
+sm = f"sm_{cap[0]}{cap[1]}"
+print("ok" if sm in torch.cuda.get_arch_list() else sm)
+PYEOF
+)
+    case "$ARCH" in
+        ok)       echo "✓ torch có kernel cho GPU này" ;;
+        unknown*) echo "⚠ không kiểm được arch list ($ARCH)" ;;
+        *)
+            echo "✗ torch hiện tại KHÔNG có kernel cho $ARCH."
+            echo "  Hỗ trợ: $("$PYBIN" -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))')"
+            if [ "${RGEXP_NO_TORCH_UPGRADE:-0}" = "1" ]; then
+                echo "  RGEXP_NO_TORCH_UPGRADE=1 -> không tự nâng. Chạy tay:"
+                echo "      pip install -U torch torchvision --index-url https://download.pytorch.org/whl/$CUDA_TAG"
+                exit 1
+            fi
+            echo "→ nâng torch lên bản $CUDA_TAG (~2.5GB, vài phút)..."
+            pipi --upgrade torch torchvision \
+                --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+            echo "✓ torch: $("$PYBIN" -c 'import torch; print(torch.__version__)')"
+            # bitsandbytes cũng build kernel theo kiến trúc — bản cũ không có
+            # sm120, và QLoRA/QDoRA (nửa bảng §3.2) phụ thuộc hẳn vào nó.
+            case "$ARCH" in
+                sm_1[0-9][0-9]) echo "→ nâng bitsandbytes cho $ARCH..."
+                                pipi --upgrade "bitsandbytes>=0.46" ;;
+            esac
+            ;;
+    esac
 elif [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     echo "⚠ Image không có torch — cài bản $CUDA_TAG (khác thường với ảnh pytorch/*)"
     pipi torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
