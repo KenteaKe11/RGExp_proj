@@ -60,10 +60,17 @@ if [ -n "$HERE" ] && [ -f "$HERE/configs/default.yaml" ]; then
     # shellcheck disable=SC1091
     source "$HERE/scripts/_env.sh"
     WORKDIR="${RM_WORKDIR:-$HERE}"
-    if [ "$HERE" != "$WORKDIR" ] && [ ! -d "$WORKDIR" ]; then
-        echo "→ chuyển repo sang volume: $WORKDIR"
-        mkdir -p "$(dirname "$WORKDIR")"
-        cp -a "$HERE" "$WORKDIR"
+    if [ "$HERE" != "$WORKDIR" ]; then
+        if [ ! -d "$WORKDIR" ]; then
+            echo "→ chuyển repo sang volume: $WORKDIR"
+            mkdir -p "$(dirname "$WORKDIR")"
+            cp -a "$HERE" "$WORKDIR"
+        else
+            # Thư mục đích đã có sẵn — có thể là bản cũ/thiếu file từ lần trước.
+            # Im lặng cd vào đó là cách hỏng khó chẩn đoán nhất, nên nói rõ.
+            echo "⚠ '$WORKDIR' đã tồn tại — dùng bản đang có, KHÔNG ghi đè bằng '$HERE'."
+            echo "  Muốn thay hẳn:  rm -rf '$WORKDIR' && bash '$HERE/scripts/docker_bootstrap.sh'"
+        fi
     fi
 else
     WORKDIR="${WORKDIR:-/workspace/RGExp_proj}"
@@ -78,7 +85,20 @@ else
     fi
 fi
 cd "$WORKDIR"
-echo "✓ repo: $WORKDIR"
+
+# Kiểm đủ file NGAY, trước khi tốn thêm phút GPU nào cho setup.
+LACK=""
+for f in requirements.txt configs/default.yaml src/train.py src/config.py scripts/setup.sh; do
+    [ -f "$WORKDIR/$f" ] || LACK="$LACK $f"
+done
+[ -z "$LACK" ] || die "Repo ở '$WORKDIR' thiếu file:$LACK
+  Đang có: $(ls -A "$WORKDIR" | tr '\n' ' ')
+  Kéo lại bản đủ:
+      git -C '$WORKDIR' fetch origin && git -C '$WORKDIR' reset --hard origin/main
+  Hoặc clone mới:
+      rm -rf '$WORKDIR' && git clone https://github.com/<user>/RGExp_proj '$WORKDIR'"
+
+echo "✓ repo: $WORKDIR ($(git -C "$WORKDIR" rev-parse --short HEAD 2>/dev/null || echo 'không phải git'))"
 
 # shellcheck disable=SC1091
 source "$WORKDIR/scripts/_env.sh"

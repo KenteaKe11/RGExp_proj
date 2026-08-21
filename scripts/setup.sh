@@ -67,14 +67,21 @@ echo "✓ Python $PYVER"
 # Bản torch phải khớp CUDA runtime; sai bản là nguồn lỗi khó chẩn đoán nhất
 # (import được nhưng torch.cuda.is_available() trả False).
 CUDA_TAG="cu121"
-if command -v nvidia-smi >/dev/null 2>&1; then
+# torch đã cài rồi thì chính nó là nguồn tin đúng nhất — nvidia-smi trong
+# container thường không in dòng "CUDA Version" (chỉ driver host mới có).
+TORCH_CUDA=$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || echo "")
+if [ -n "$TORCH_CUDA" ]; then
+    CUDA_TAG="cu$(printf '%s' "$TORCH_CUDA" | tr -d '.')"
+    echo "✓ torch có sẵn, CUDA $TORCH_CUDA -> $CUDA_TAG (bỏ qua dò nvidia-smi)"
+elif command -v nvidia-smi >/dev/null 2>&1; then
     CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' | head -1 || echo "")
-    echo "✓ nvidia-smi: CUDA $CUDA_VER"
+    if [ -n "$CUDA_VER" ]; then echo "✓ nvidia-smi: CUDA $CUDA_VER"; fi
     case "$CUDA_VER" in
         12.8*|12.9*|13.*) CUDA_TAG="cu128" ;;
         12.4*|12.5*|12.6*|12.7*) CUDA_TAG="cu124" ;;
         12.*) CUDA_TAG="cu121" ;;
         11.8*) CUDA_TAG="cu118" ;;
+        "") echo "⚠ nvidia-smi không in CUDA Version — dùng $CUDA_TAG" ;;
         *) echo "⚠ CUDA $CUDA_VER lạ — thử cu121" ;;
     esac
 else
@@ -99,8 +106,17 @@ echo "✓ python: $PYBIN"
 # Một số image đánh dấu môi trường là "externally managed" (PEP 668) và pip
 # từ chối cài. Ở container dùng-một-lần thì cứ ép; không có gì để hỏng.
 pipi() {
-    "$PYBIN" -m pip install -q "$@" || \
-    "$PYBIN" -m pip install -q --break-system-packages "$@"
+    local out rc
+    out=$("$PYBIN" -m pip install -q --root-user-action=ignore "$@" 2>&1); rc=$?
+    if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "externally-managed-environment"; then
+        # PEP 668: container dùng-một-lần thì cứ ép, không có gì để hỏng.
+        "$PYBIN" -m pip install -q --root-user-action=ignore --break-system-packages "$@"
+        return $?
+    fi
+    # Lỗi khác (thiếu file, sai tên gói, mất mạng) thì IN RA rồi dừng — retry
+    # mù chỉ làm thông báo lặp hai lần và giấu mất nguyên nhân thật.
+    [ $rc -eq 0 ] || printf '%s\n' "$out" >&2
+    return $rc
 }
 pipi --upgrade pip setuptools wheel
 
@@ -117,6 +133,29 @@ else
 fi
 
 # ── 5. requirements ──────────────────────────────────────────────────────────
+# Bản repo copy tay lên máy thuê rất hay bị thiếu file (upload dở, clone nhầm
+# nhánh, thư mục cũ còn sót). Kiểm ở đây để báo đúng bệnh, thay vì để pip in
+# "Could not open requirements file" rồi bỏ mặc.
+MISSING_FILES=""
+for f in requirements.txt configs/default.yaml src/train.py src/config.py; do
+    [ -f "$f" ] || MISSING_FILES="$MISSING_FILES $f"
+done
+if [ -n "$MISSING_FILES" ]; then
+    echo "✗ Repo ở '$ROOT' thiếu file:$MISSING_FILES"
+    echo
+    echo "  Đang có:"
+    ls -A "$ROOT" | sed 's/^/    /'
+    echo
+    if [ -d "$ROOT/.git" ]; then
+        echo "  Đây là git repo — kéo lại bản đủ:"
+        echo "      git -C '$ROOT' fetch origin && git -C '$ROOT' reset --hard origin/main"
+    else
+        echo "  Không phải git repo (copy tay?). Clone lại cho chắc:"
+        echo "      rm -rf '$ROOT' && git clone https://github.com/<user>/RGExp_proj '$ROOT'"
+    fi
+    exit 1
+fi
+
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
