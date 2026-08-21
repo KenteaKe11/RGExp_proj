@@ -1,20 +1,8 @@
-# Config chứa token — KHÔNG commit. Chỉ commit rgexp.conf.example.
-rgexp.conf
-.env
-
 .venv/
 __pycache__/
-*.py[cod]
-*.egg-info/
-_to_delete/
-
+*.pyc
 outputs/
-checkpoints/
+ckpt/
 logs/
-wandb/
-
-# Dữ liệu (PhysioNet credentialed — cấm redistribute) và dữ liệu mô phỏng
-# sinh bởi scripts/make_mock_data.py. Không commit thứ nào trong này.
-origins/
-splits/
-images/
+.DS_Store
+data/

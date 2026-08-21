@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MIMIC-CXR VLM fine-tuning — dependencies
+#
+# torch KHÔNG nằm ở đây: bản torch phụ thuộc CUDA của máy bạn. setup.sh cài
+# torch riêng theo CUDA dò được (cu121 / cu124 / cu128). Cài torch từ file này
+# sẽ kéo bản CPU-only hoặc sai CUDA.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core
+transformers>=4.50.0
+accelerate>=0.34.0
+peft>=0.13.0
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# Lượng tử hóa 4-bit — chỉ dùng khi VRAM < 22GB (preset qlora)
+bitsandbytes>=0.43.0
+
+# Dữ liệu / IO
+huggingface_hub>=0.25.0
+datasets>=2.20.0
+pandas>=2.0.0
+numpy>=1.26.0
+pillow>=10.0.0
+pyyaml>=6.0
+
+# Metrics §1.5
+nltk>=3.8
+rouge-score>=0.1.2
+sacrebleu>=2.3
+bert-score>=0.3.13
+
+# Guard §2 — check 1 (ngôn ngữ)
+langdetect>=1.0.9
+
+# Theo dõi
+wandb>=0.17.0
+psutil>=5.9.0
+tqdm>=4.66.0

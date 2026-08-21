@@ -1,0 +1,163 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# MIMIC-CXR VLM — cấu hình mặc định
+#
+#   fixed  — khoá theo Sweep-Strategy §1. Sửa thì phải ghi vào sweep log.
+#   sweep  — ô đang chạy trong bảng §3.2 (biến thể × rank × model).
+#   run    — tự do chỉnh theo phần cứng.
+#
+# Dữ liệu lấy hết từ Hugging Face Hub, không phụ thuộc Kaggle.
+# Ghi đè: --set sweep.variant=qdora --set sweep.rank=8
+# ═════════════════════════════════════════════════════════════════════════════
+
+fixed:
+  # §1.1 Split cố định theo key (img_rel), không theo vị trí hàng
+  n_val: 2000
+  n_test: 3000
+  seed: 42
+
+  # §1.3 + §4.1 — ảnh nguồn 512² đồng bộ.
+  # Kích thước ĐƯA VÀO MODEL không còn đặt ở đây: mỗi model một vision tower
+  # khác nhau nên khai riêng ở `models.<tên>.image_size` bên dưới.
+  image_size_src: 512
+  resize_filter: bicubic     # chỉ dùng khi model đó có resize
+  antialias: true
+  pad_side_train: left      # target nằm cuối -> logits_to_keep cắt được
+  pad_side_infer: right     # token sinh ra nối tiếp liền mạch
+
+  # §1.4 Target train 100% là y_gt, tránh y_aug kém chất lượng
+  target_column: text_gt
+
+  # §1.6 CE chuẩn + label smoothing
+  label_smoothing: 0.1
+
+  # §3.2 alpha = 2r kể cả khi lượng tử hóa (theo thực hành công nghiệp;
+  # paper 2405.09673 gợi ý 0.5r cho QLoRA — nếu thử thì ghi vào sweep log).
+  alpha_ratio: 2
+  lora_dropout: 0.05
+  lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+  compute_dtype: bfloat16   # §4.1.3 — cần sm80+
+  trainable_dtype: float32  # master weight adapter, tránh Adam eps underflow
+  adam_eps: 1.0e-6
+  quant_type: nf4
+  double_quant: true
+
+  # §2 Guard inference — 7 check, chạy hết cả 7, retry tối đa 3
+  max_retries: 3
+  max_consec_word_repeat: 2
+  max_ngram_repeat_ratio: 0.25
+  min_clean_char_ratio: 0.85
+  max_total_tokens: 110
+  min_findings_tokens: 12
+  temp_decay: 0.7
+  min_temp: 0.05
+  rep_decay: 0.9
+  min_rep_penalty: 1.05
+
+# ─────────────────────── Ô đang chạy trong bảng §3.2 ─────────────────────────
+sweep:
+  # gemma3 | qwen25vl  (§3.2: ưu tiên Gemma3 trước)
+  model: gemma3
+  # lora | qlora | dora | qdora
+  variant: dora
+  # LoRA/QLoRA: 16 hoặc 32.  DoRA/QDoRA: 8 hoặc 16.
+  rank: 16
+
+# Bảng tra: tên model + module vision loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
+#
+#   image_size       số  = resize ảnh về size² trước khi vào processor
+#                    null = giữ nguyên kích thước gốc, để processor tự lo
+#   processor_kwargs tham số đẩy thẳng vào AutoProcessor.from_pretrained
+models:
+  gemma3:
+    model_id: google/gemma-3-4b-it
+    exclude: [vision_tower, multi_modal_projector, lm_head]
+    # SigLIP của Gemma 3 chạy ở 896² CỐ ĐỊNH (bảng position embedding 4096 vị
+    # trí). Cỡ khác -> phải nội suy pos-emb -> vision tower ra ngoài chế độ nó
+    # quen. Nên resize 512 -> 896 bằng BICUBIC (§4.1.1). 256 image token.
+    image_size: 896
+    processor_kwargs: {}
+  qwen25vl:
+    model_id: Qwen/Qwen2.5-VL-3B-Instruct
+    exclude: [visual, lm_head]
+    # ViT của Qwen2.5-VL là NaViT + 2D-RoPE: độ phân giải ĐỘNG, không có cỡ
+    # pretrain cố định để bám. Phóng 512 -> 896 chỉ là nội suy pixel (không
+    # thêm thông tin) mà tốn ~3x image token. Nên đưa thẳng ảnh gốc 512²;
+    # smart_resize làm tròn về bội 28 -> 504² -> (504/28)² = 324 image token.
+    image_size: null
+    processor_kwargs:
+      min_pixels: 3136        # 56²  — sàn mặc định, chặn việc phóng to ngược
+      max_pixels: 262144      # 512² — trần, chặn ảnh nguồn to hơn dự kiến
+
+run:
+  mode: both                # train | test | both  (both = train xong chạy test)
+  # false = chạy thật. true = dừng sau STAGE 0 (2 step) để kiểm cấu hình.
+  dry_run: false
+
+  # ── Nguồn dữ liệu: một repo HF duy nhất ───────────────────────────────────
+  # RGExp123/MIMIC_CXR_cleaned/
+  #   ├── csv_helper/   clean_dataset.csv, labels.npz
+  #   ├── split_ref/    split_meta.json, train|val|test_split.csv
+  #   └── img_dir.zip   ảnh, tổ chức thư mục chuẩn MIMIC-CXR
+  data:
+    repo: RGExp123/MIMIC_CXR_cleaned
+    repo_type: dataset
+    meta_csv: csv_helper/clean_dataset.csv
+    labels_npz: csv_helper/labels.npz
+    split_dir: split_ref          # trống -> tự sinh split mới
+    image_zip: img_dir.zip
+    # Thư mục giải nén ảnh. Giải nén MỘT LẦN rồi đánh dấu; lần chạy sau bỏ qua.
+    image_cache: ./data/images
+    # Tiền tố bên trong zip nếu ảnh không nằm ở gốc (vd "img_dir").
+    # null = tự dò sau khi giải nén.
+    image_subdir: null
+    image_column: img_rel
+
+  out_dir: ./outputs
+  ckpt_dir: ./ckpt
+  hub_repo: null            # null -> tự đặt theo model+variant+rank
+  hub_private: true
+  push_to_hub: true
+  resume: true
+
+  use_wandb: true
+  wandb_project: mimic-cxr-vlm-sweep
+  wandb_run: null           # null -> tự đặt theo ô sweep
+
+  n_train_samples: null     # null = full train split (~152_917)
+  n_test_samples: 200       # §1.1 — sinh 200 mẫu có metrics để theo dõi hội tụ
+  num_epochs: 2             # §4.1.4
+  max_steps: null
+
+  # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 (§3.2) ──────
+  #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
+  train_bs: null
+  grad_accum: null
+  infer_bs: null
+  grad_ckpt: null
+
+  # §4.1.2 — max_seq_len tự tính: 2^ceil(log2(prompt + img_token + delta)).
+  # null = tự tính. Đặt số cụ thể để ép.
+  max_seq_len: null
+  seq_delta: 128            # chỗ chừa cho target (guard chặn ở 110 token)
+
+  lr: 1.0e-4                # §3.2 lr_max
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_grad_norm: 1.0
+
+  eval_every: 200
+  eval_max_batches: 16
+  save_every: 200
+  push_every_n_saves: 2
+  log_every_sec: 60.0
+
+  max_new_tokens: 150
+  min_new_tokens: 12
+  temperature: 0.3
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.2
+  no_repeat_ngram: 3
+
+  use_bertscore: true       # §1.5 optional; chạy 2 lượt (raw + post)

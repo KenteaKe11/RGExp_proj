@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# ═════════════════════════════════════════════════════════════════════════════
+# run_local.sh — chạy MỘT ô sweep trên GPU cục bộ
+#
+#   bash scripts/run_local.sh                          # STAGE 0 rồi dừng
+#   bash scripts/run_local.sh --no-dry-run             # train thật
+#   bash scripts/run_local.sh --variant qlora --rank 32 --no-dry-run
+#   bash scripts/run_local.sh --model qwen25vl --variant lora --rank 16
+#   bash scripts/run_local.sh --mode test              # chỉ chấm điểm ckpt
+#
+# Mọi tham số được chuyển thẳng cho src.train. Xem `--help` để biết đủ.
+# ═════════════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+VENV="${VENV_DIR:-$ROOT/.venv}"
+
+if [ ! -d "$VENV" ]; then
+    echo "✗ Chưa có venv. Chạy trước:  bash scripts/setup.sh"
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "✗ Thiếu HF_TOKEN. gemma-3 là gated repo, phải có token đã được cấp quyền."
+    echo "    export HF_TOKEN=hf_xxxxxxxx"
+    exit 1
+fi
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "⚠ Không có WANDB_API_KEY — bỏ qua tracking (vẫn train bình thường)"
+fi
+
+# Giảm phân mảnh VRAM khi batch dài ngắn khác nhau (padding=longest).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export TOKENIZERS_PARALLELISM=false
+
+# src.train tự ghi hai file log vào outputs/<tag>/logs/:
+#   run_<ts>.log      text có timestamp + traceback đầy đủ khi crash
+#   events_<ts>.jsonl sự kiện có cấu trúc (step/loss/vram) để phân tích lại
+# latest.log / latest.jsonl luôn trỏ tới lần chạy mới nhất.
+#
+# console.log ở đây là bản sao stdout — giữ lại vì nó bắt được cả những thứ in
+# ra TRƯỚC khi logger kịp mở (lỗi import, CUDA không khởi tạo được).
+mkdir -p logs
+CONSOLE="logs/console_$(date +%Y%m%d_%H%M%S).log"
+echo "═══ console: $CONSOLE ═══"
+echo "═══ log chi tiết: outputs/<tag>/logs/latest.log ═══"
+echo
+
+# stdbuf -oL: ép line-buffered để log hiện ngay, không đợi tiến trình kết thúc.
+set -o pipefail
+stdbuf -oL -eL python -m src.train "$@" 2>&1 | tee "$CONSOLE"
+RC=${PIPESTATUS[0]}
+
+if [ "$RC" -ne 0 ]; then
+    echo
+    echo "✗ thoát với mã $RC"
+    echo "  console : $CONSOLE"
+    LATEST=$(ls -td outputs/*/logs 2>/dev/null | head -1)
+    [ -n "$LATEST" ] && echo "  chi tiết: $LATEST/latest.log"
+fi
+exit "$RC"
