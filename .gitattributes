@@ -1,0 +1,10 @@
+# Kho lam viec tren Windows nhung CHAY tren Linux (may thue / container Docker).
+# Khong co dong `eol=lf`, script .sh bi checkout kem CR va bao loi rat kho hieu:
+#     /usr/bin/env: 'bash\r': No such file or directory
+* text=auto
+
+*.sh text eol=lf
+
+# Them file nay lan dau thi chay MOT LAN de git ghi lai cac blob da lo co CR:
+#     git add --renormalize .
+#     git commit -m "normalize line endings"

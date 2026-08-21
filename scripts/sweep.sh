@@ -19,6 +19,11 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/_env.sh"
+
+# Chế độ container: out_dir nằm trên volume (§9), không phải ./outputs.
+OUTBASE="$RGEXP_OUTBASE"
 
 # §3.2 — thứ tự ƯU TIÊN: bốn cột in đậm (DoRA/QDoRA) trước, rồi LoRA/QLoRA.
 # Chạy hết mất nhiều ngày; ô nào xong là có metrics của ô đó, không phải chờ
@@ -38,6 +43,7 @@ N_TOTAL=0
 for m in $MODELS; do for c in $CELLS; do N_TOTAL=$((N_TOTAL+1)); done; done
 
 echo "═══ SWEEP §3.2 ═══"
+rgexp_banner
 echo "Model : $MODELS"
 echo "Ô     : $CELLS"
 echo "Tổng  : $N_TOTAL ô | mode=$MODE (both = train xong chạy luôn test)"
@@ -56,7 +62,7 @@ for cell in $CELLS; do
 
     # Ô đã có metrics -> bỏ qua. Cho phép dừng giữa chừng rồi chạy lại tiếp
     # mà không mất công tính lại ô đã xong.
-    if [ -f "outputs/$tag/metrics.json" ] && [ "${SWEEP_FORCE:-0}" != "1" ]; then
+    if [ -f "$OUTBASE/$tag/metrics.json" ] && [ "${SWEEP_FORCE:-0}" != "1" ]; then
         echo "⊘ [$IDX/$N_TOTAL] $tag — đã có metrics, bỏ qua (SWEEP_FORCE=1 để chạy lại)"
         RESULTS+=("⊘ $tag  (bỏ qua, đã có)")
         continue
@@ -70,7 +76,7 @@ for cell in $CELLS; do
             --rank "$rank" --mode "$MODE" "$@"; then
         MIN=$(( ($(date +%s) - T0) / 60 ))
         # Xác nhận ô thật sự sinh metrics, không chỉ thoát mã 0.
-        if [ -f "outputs/$tag/metrics.json" ]; then
+        if [ -f "$OUTBASE/$tag/metrics.json" ]; then
             RESULTS+=("✓ $tag  (${MIN}m)")
         else
             RESULTS+=("◐ $tag  (${MIN}m, KHÔNG có metrics.json — dry_run?)")
@@ -79,7 +85,7 @@ for cell in $CELLS; do
         RC=$?
         MIN=$(( ($(date +%s) - T0) / 60 ))
         RESULTS+=("✗ $tag  (${MIN}m, mã lỗi $RC)")
-        echo "⚠ $tag hỏng — đi tiếp ô sau (log: outputs/$tag/logs/latest.log)"
+        echo "⚠ $tag hỏng — đi tiếp ô sau (log: $OUTBASE/$tag/logs/latest.log)"
     fi
     echo
 done
@@ -90,11 +96,9 @@ printf '  %s\n' "${RESULTS[@]}"
 echo
 
 # ── Gom kết quả ──────────────────────────────────────────────────────────────
-if compgen -G "outputs/*/metrics.json" > /dev/null; then
+if compgen -G "$OUTBASE/*/metrics.json" > /dev/null; then
     echo "═══ GOM KẾT QUẢ ═══"
-    # shellcheck disable=SC1091
-    source "${VENV_DIR:-$ROOT/.venv}/bin/activate"
-    python -m src.report
+    rgexp_activate_py && "$PYBIN" -m src.report --out-dir "$OUTBASE"
 else
     echo "⊘ Chưa ô nào có metrics.json — bỏ qua bước gom."
     echo "  (dry-run không sinh metrics; chạy lại với --no-dry-run)"

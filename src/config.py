@@ -8,9 +8,101 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 from types import SimpleNamespace
 
 import yaml
+
+# ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
+# Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
+# `fixed`/`sweep`, nên một ô chạy trên máy thuê so sánh được với ô chạy cục bộ.
+REMOTE_DEFAULTS = dict(
+    enabled="auto", volume="/workspace", workdir=None,
+    hf_home=None, torch_home=None, image_cache=None,
+    out_dir=None, ckpt_dir=None, use_venv=False, tmux_session="sweep",
+    ssh_host=None, ssh_port=None, ssh_user="root", ports={},
+)
+_FALSEY = ("0", "false", "no", "off")
+
+
+def remote_is_on(enabled="auto"):
+    """RGEXP_REMOTE (env) > remote.enabled (yaml) > tự dò /.dockerenv."""
+    env = os.environ.get("RGEXP_REMOTE", "").strip().lower()
+    if env:
+        return env not in _FALSEY
+    e = str(enabled).strip().lower()
+    if e in ("on", "true", "1", "yes"):
+        return True
+    if e in _FALSEY:
+        return False
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def read_remote(path):
+    """Đọc RIÊNG khối `remote`, không đụng phần còn lại của config.
+
+    Tách ra vì phải gọi được rất sớm (xem bootstrap_remote_env) và phải chịu
+    được config thiếu/hỏng — lúc đó cứ coi như không bật remote.
+    """
+    try:
+        with open(path) as fh:
+            raw = yaml.safe_load(fh) or {}
+    except Exception:
+        raw = {}
+    r = dict(REMOTE_DEFAULTS)
+    r.update(raw.get("remote") or {})
+    r["active"] = remote_is_on(r.get("enabled", "auto"))
+    return SimpleNamespace(**r)
+
+
+def _argv_config_path(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--config="):
+            return a.split("=", 1)[1]
+    return os.environ.get("RGEXP_CONFIG", "configs/default.yaml")
+
+
+def bootstrap_remote_env(path=None):
+    """Export HF_HOME/TORCH_HOME TRƯỚC khi huggingface_hub kịp import.
+
+    `huggingface_hub` đọc HF_HOME đúng một lần lúc import; đặt muộn hơn là vô
+    tác dụng và ~9GB weight sẽ rơi vào $HOME của container — mất sạch sau
+    Restart. `src/train.py` import `.config` trước `.data` nên hàm này chạy kịp.
+    scripts/_env.sh cũng export sẵn hai biến này; đây là lớp dự phòng cho ai
+    chạy thẳng `python -m src.train`.
+    """
+    rm = read_remote(path or _argv_config_path())
+    if not rm.active:
+        return rm
+    for var, val in (("HF_HOME", rm.hf_home), ("TORCH_HOME", rm.torch_home)):
+        if not val or os.environ.get(var):
+            continue
+        try:
+            os.makedirs(val, exist_ok=True)
+            os.environ[var] = val
+        except OSError as e:      # volume chưa mount / không có quyền
+            print(f"⚠ remote: không tạo được {var}={val} ({e}) — dùng mặc định")
+    return rm
+
+
+REMOTE = bootstrap_remote_env()
+
+
+def _apply_remote(rm, run, explicit):
+    """Chuyển out_dir / ckpt_dir / image_cache sang volume lớn.
+
+    `explicit` là các khoá người dùng đã tự đặt bằng --set: đặt tay thì thắng,
+    remote không giành lại.
+    """
+    for key, val in (("out_dir", rm.out_dir), ("ckpt_dir", rm.ckpt_dir)):
+        if val and f"run.{key}" not in explicit:
+            run[key] = val
+    if rm.image_cache and "run.data.image_cache" not in explicit:
+        run["data"]["image_cache"] = rm.image_cache
+
 
 # ─────────────────────────── Preset theo VRAM ────────────────────────────────
 # Mọi preset giữ effective_batch = train_bs × grad_accum = 32 (§3.2).
@@ -102,6 +194,12 @@ def load_config(path="configs/default.yaml", overrides=None):
     preset = pick_preset(hw.vram_gb)
     fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
 
+    # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
+    # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
+    rm = read_remote(path)
+    if rm.active:
+        _apply_remote(rm, run, {ov.split("=", 1)[0] for ov in (overrides or [])})
+
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
     if sweep["variant"] not in VARIANTS:
         raise ValueError(f"variant lạ: {sweep['variant']} "
@@ -153,7 +251,7 @@ def load_config(path="configs/default.yaml", overrides=None):
         run=SimpleNamespace(**run),
         data=SimpleNamespace(**run["data"]),
         sweep=SimpleNamespace(**sweep, tag=tag),
-        hw=hw, preset=preset,
+        hw=hw, preset=preset, remote=rm,
     )
     for d in (cfg.run.out_dir, cfg.run.ckpt_dir):
         os.makedirs(d, exist_ok=True)
@@ -226,3 +324,10 @@ if __name__ == "__main__":
           f"{c.run.num_epochs} epoch")
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
     print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run}")
+    if c.remote.active:
+        print(f"Remote  : BẬT (§9) | venv={'có' if c.remote.use_venv else 'không'}"
+              f" | tmux={c.remote.tmux_session}")
+        print(f"Cache   : HF_HOME={os.environ.get('HF_HOME', '(mặc định)')} | "
+              f"ảnh={c.data.image_cache} | ckpt={c.run.ckpt_dir}")
+    else:
+        print("Remote  : tắt (chạy cục bộ — option 1)")

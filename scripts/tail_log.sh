@@ -9,24 +9,29 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/_env.sh"
+
+# Chế độ container (§9): log nằm cùng out_dir trên volume.
+OUTBASE="$RGEXP_OUTBASE"
 
 if [ "${1:-}" = "--errors" ]; then
     echo "═══ WARN / ERROR mọi ô ═══"
-    grep -h -E "^\S+ (WARN|ERROR)" outputs/*/logs/run_*.log 2>/dev/null || \
+    grep -h -E "^\S+ (WARN|ERROR)" "$OUTBASE"/*/logs/run_*.log 2>/dev/null || \
         echo "(chưa có)"
     exit 0
 fi
 
 TAG="${1:-}"
 if [ -z "$TAG" ]; then
-    LOG=$(ls -t outputs/*/logs/run_*.log 2>/dev/null | head -1 || true)
+    LOG=$(ls -t "$OUTBASE"/*/logs/run_*.log 2>/dev/null | head -1 || true)
 else
-    LOG="outputs/$TAG/logs/latest.log"
+    LOG="$OUTBASE/$TAG/logs/latest.log"
 fi
 
 if [ -z "${LOG:-}" ] || [ ! -e "$LOG" ]; then
     echo "✗ Không thấy log. Các ô hiện có:"
-    ls -d outputs/*/ 2>/dev/null || echo "  (chưa có ô nào)"
+    ls -d "$OUTBASE"/*/ 2>/dev/null || echo "  (chưa có ô nào)"
     exit 1
 fi
 echo "═══ $LOG ═══"

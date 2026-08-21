@@ -1,12 +1,26 @@
 # MIMIC-CXR VLM — Fine-tuning theo Sweep-Strategy
 
 Sinh báo cáo X-quang ngực (Findings / Impression) từ ảnh, bằng cách fine-tune
-VLM với LoRA và các biến thể. Chạy trên GPU cục bộ (Ampere trở lên), dữ liệu
-lấy hết từ Hugging Face Hub.
+VLM với LoRA và các biến thể. Chạy trên GPU Ampere trở lên — cục bộ hoặc máy
+thuê theo giờ (§9) — dữ liệu lấy hết từ Hugging Face Hub.
 
 ---
 
 ## 0. Chạy nhanh
+
+Hai cách chạy, **cùng một code và cùng một config**; chỉ khác chỗ để file và
+cách giữ phiên. Không có tham số training nào đổi, nên kết quả hai bên so sánh
+được với nhau.
+
+| | Option 1 — GPU cục bộ | Option 2 — GPU thuê theo giờ (§9) |
+|---|---|---|
+| Python | venv trong repo | python của image (đã có sẵn torch) |
+| Cache HF | `$HOME/.cache` | volume, vd `/workspace/.cache` |
+| outputs / ckpt | `./outputs`, `./ckpt` | volume, vd `/workspace/outputs` |
+| Giữ phiên | không cần | **tmux bắt buộc** — ssh đứt là mất phiên |
+| Bật bằng | mặc định | `remote.enabled` trong config, hoặc `RGEXP_REMOTE=1` |
+
+### 0.1. Option 1 — GPU cục bộ
 
 ```bash
 bash scripts/setup.sh                      # dựng venv, cài deps (~10 phút)
@@ -22,6 +36,13 @@ bash scripts/sweep.sh                      # CHẠY THẬT cả bảng §3.2 the
 bash scripts/collect.sh                    # gom kết quả bất cứ lúc nào
 ```
 
+> ⚠ **Hai token thật đang nằm trong file này.** Nếu repo được push công khai
+> thì chúng đã lộ — nên thu hồi và cấp lại ở
+> [HF settings](https://huggingface.co/settings/tokens) và
+> [W&B settings](https://wandb.ai/settings), rồi thay bằng `hf_xxxxxxxx` /
+> `xxxxxxxx` ở đây và chỉ export ở terminal. Cùng lý do, `remote.ssh_host` /
+> `ssh_port` (§9.2) để `null` chứ không điền IP máy đang thuê.
+
 `sweep.sh` chạy thật ngay (config để `dry_run: false`), tuần tự theo thứ tự ưu
 tiên §3.2, và **bỏ qua ô đã có `metrics.json`** — dừng giữa chừng rồi chạy lại
 là nó đi tiếp từ ô còn thiếu.
@@ -32,6 +53,28 @@ là nó đi tiếp từ ô còn thiếu.
 Luôn chạy STAGE 0 trước. Nó nạp model, chạy đúng 2 step, in VRAM đỉnh và
 `s/step`, rồi dừng. Mất khoảng 5 phút và cho biết cấu hình có vừa GPU không —
 rẻ hơn nhiều so với phát hiện OOM sau 3 tiếng train.
+
+### 0.2. Option 2 — GPU thuê theo giờ (Docker)
+
+Sau khi thuê xong, dashboard cho bạn `<HOST>`, `<PORT_SSH>` và mật khẩu root.
+Chi tiết ở §9; bản rút gọn:
+
+```bash
+ssh -p <PORT_SSH> root@<HOST>              # mật khẩu lấy trong dashboard
+
+export HF_TOKEN=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                # BẮT BUỘC: gemma-3 là gated repo
+export WANDB_API_KEY=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  
+
+git clone <repo-url> /workspace/RGExp_proj && cd /workspace/RGExp_proj
+bash scripts/docker_bootstrap.sh           # kiểm GPU → setup → STAGE 0 → sweep trong tmux
+```
+
+`docker_bootstrap.sh` làm hết một lượt và **dừng ngay ở bước 1 nếu GPU không
+có bf16** — trước khi tải 30GB dữ liệu về một cái máy không dùng được.
+
+Không thấy `/.dockerenv` (một số nhà cung cấp chạy trong VM) thì ép bằng
+`RGEXP_REMOTE=1`. Muốn tự chạy từng bước thì mọi script vẫn dùng như option 1;
+chúng tự đọc khối `remote:` trong `configs/default.yaml`.
 
 ---
 
@@ -378,9 +421,11 @@ và dừng ở step 40 thì con số đó không nói lên điều gì.
 ```
 mimic_cxr_vlm/
 ├── requirements.txt          # deps, KHÔNG gồm torch
-├── configs/default.yaml      # fixed / sweep / models / run
+├── .gitattributes            # ép .sh checkout dạng LF — CRLF là script chết trên Linux
+├── configs/default.yaml      # fixed / sweep / models / run / remote (§9)
 ├── src/
 │   ├── config.py             # nạp YAML, dò GPU, giải quyết ô sweep, seq_len 2^k
+│   │                         #   + khối remote §9 (cache/outputs trên volume)
 │   ├── data.py               # tải HF Hub, split §1.1, rare-first
 │   ├── model.py              # nạp model, adapter, collate, forward_loss §1.6
 │   ├── guard.py              # 7 check §2
@@ -389,12 +434,18 @@ mimic_cxr_vlm/
 │   ├── logging_utils.py      # log text + events JSONL §6
 │   └── report.py             # gom các ô → metrics table + gen_text §5
 └── scripts/
+    ├── _env.sh               # chọn môi trường: venv cục bộ hay python container (§9)
     ├── setup.sh              # venv + torch theo CUDA + deps
     ├── run_local.sh          # chạy 1 ô sweep
     ├── sweep.sh              # chạy nhiều ô tuần tự, tự gom cuối
     ├── collect.sh            # gom kết quả bất cứ lúc nào
-    └── tail_log.sh           # theo dõi log run đang chạy
+    ├── tail_log.sh           # theo dõi log run đang chạy
+    └── docker_bootstrap.sh   # §9 — một lệnh dựng cả máy thuê rồi chạy sweep
 ```
+
+Mọi script `.sh` đều `source scripts/_env.sh` ở đầu. Đó là chỗ duy nhất quyết
+định "đang chạy option 1 hay option 2", nên thêm script mới chỉ cần source nó
+là tự có cả hai chế độ.
 
 ### Pipeline
 
@@ -487,6 +538,12 @@ So sánh giữa các ô: xem §5.
 | Guard pass rate rất thấp | model chưa học format | bình thường ở đầu train; theo dõi `n_guard_passed_raw` tăng dần |
 | `collect.sh` báo không thấy ô nào | các ô chạy dry-run | dry-run không sinh `metrics.json`; chạy lại `--no-dry-run --mode both` |
 | `gen_text: không có ảnh chung` | các ô dùng `n_test_samples` khác nhau | đặt cùng một `run.n_test_samples` cho cả sweep |
+| **Máy thuê** — `Chưa có venv` | `_env.sh` tưởng đang chạy cục bộ | `RGEXP_REMOTE=1 bash scripts/...` (§9.2) |
+| **Máy thuê** — setup tải lại torch 2.5GB | venv mới cô lập mất torch của image | đặt `remote.use_venv: false`, xoá `.venv` |
+| **Máy thuê** — Restart xong mất hết model đã tải | cache nằm ở lớp ghi container | `HF_HOME` phải trỏ vào volume (§9.3) |
+| **Máy thuê** — sweep chết khi đóng laptop | chạy ngoài tmux, ssh đứt → SIGHUP | `tmux new -s sweep` rồi chạy lại (§9.2) |
+| **Máy thuê** — hết dung lượng khi giải nén ảnh | volume 100GB nhưng cache ở `/root` | trỏ `remote.image_cache` vào volume |
+| **Máy thuê** — `/usr/bin/env: 'bash\r': No such file or directory` | file .sh bị commit kèm CR (Windows) | `sed -i 's/\r$//' scripts/*.sh`; sửa hẳn bằng `.gitattributes` + `git add --renormalize .` |
 
 **Khi có lỗi, đọc theo thứ tự này:**
 
@@ -500,3 +557,183 @@ tail -30 logs/console_*.log | tail -30       # 4. lỗi trước khi logger mở
 
 Bước 4 chỉ cần khi `outputs/<tag>/logs/` trống — nghĩa là chết trước cả lúc
 `L.setup()` chạy, thường là lỗi import hoặc CUDA không khởi tạo được.
+
+Ở option 2, thay `outputs/` bằng `remote.out_dir` (mặc định `/workspace/outputs`).
+`tail_log.sh` và `collect.sh` tự trỏ đúng chỗ.
+
+---
+
+## 9. Chạy trên GPU thuê theo giờ (Docker)
+
+Option 2. Máy thuê khác máy cục bộ ở bốn điểm, và cả bốn đều có thể làm hỏng
+một lần chạy dài:
+
+| | Máy thuê | Hệ quả nếu bỏ qua |
+|---|---|---|
+| torch đã có sẵn trong image | dựng venv là cô lập mất nó | tải lại 2.5GB, dễ sai bản CUDA |
+| `$HOME` nằm trên lớp ghi container | Restart là mất | tải lại model 9GB + giải nén lại ảnh |
+| ssh là sợi dây duy nhất | đứt → SIGHUP → chết tiến trình | mất nhiều giờ GPU đã trả tiền |
+| Instance sẽ bị xoá | không có gì tự sao lưu | mất toàn bộ checkpoint và metrics |
+
+Khối `remote:` trong `configs/default.yaml` xử lý ba điểm đầu; điểm thứ tư là
+việc của bạn (§9.5).
+
+### 9.1. Bật / tắt
+
+```yaml
+remote:
+  enabled: auto        # auto | on | off
+```
+
+`auto` bật khi thấy `/.dockerenv` (hoặc `/run/.containerenv`). Vài nhà cung cấp
+chạy trong VM chứ không phải container thật — lúc đó không có file này, ép bằng:
+
+```bash
+export RGEXP_REMOTE=1       # 0 để ép tắt
+```
+
+Kiểm tra đang ở chế độ nào, không cần nạp model:
+
+```bash
+python -m src.config        # dòng "Remote :" ở cuối
+```
+
+Bật hay tắt **không đổi một tham số training nào** — chỉ đổi chỗ để file và
+cách chạy python. Ô `gemma3-dora-r16` chạy trên máy thuê so sánh trực tiếp
+được với ô cùng tên chạy ở nhà.
+
+### 9.2. Kết nối và giữ phiên
+
+Dashboard cho bạn `SSH Cmd`, `Username`, `Password` và bảng port đã map.
+
+```bash
+ssh -p <PORT_SSH> root@<HOST>
+```
+
+**Đặt biến ở máy bạn, đừng commit vào repo** — repo public là lộ máy đang thuê:
+
+```bash
+export RGEXP_SSH_HOST=<HOST>
+export RGEXP_SSH_PORT=<PORT_SSH>
+```
+
+`remote.ssh_host` / `ssh_port` trong config để `null` chính là vì vậy. Chúng chỉ
+dùng để in gợi ý lệnh `rsync`, không có thì in `<HOST>`.
+
+Vào máy rồi, **luôn chạy trong tmux**:
+
+```bash
+tmux new -s sweep                    # tạo phiên
+bash scripts/sweep.sh                # chạy trong đó
+# Ctrl-b rồi d  -> thoát ra, tiến trình vẫn chạy
+tmux attach -t sweep                 # ssh vào lại, xem tiếp
+```
+
+`run_local.sh` cảnh báo và chờ 5 giây nếu phát hiện đang chạy ngoài tmux trên
+máy thuê. Bỏ qua bằng `RGEXP_NO_TMUX_WARN=1` (dùng khi gọi từ script khác).
+
+Ba port trong dashboard: **Jupyter** (8888) tiện xem ảnh và loss curve;
+**File Browser** (5335) tải file lẻ về mà không cần scp; **PORT-8999** để trống
+cho tensorboard hoặc http server tuỳ ý.
+
+### 9.3. Chỗ để file — phần quan trọng nhất
+
+Container thuê có hai vùng đĩa rất khác nhau:
+
+| Vùng | Ví dụ | Sống sót qua Restart? |
+|---|---|---|
+| Lớp ghi của container | `/root`, `/tmp` | **Không** |
+| Volume gắn kèm | `/workspace` (100GB) | Có |
+
+Mặc định `HF_HOME` là `$HOME/.cache/huggingface` — tức là vùng **mất**. Khối
+`remote:` dời hết sang volume:
+
+```yaml
+remote:
+  volume:      /workspace
+  workdir:     /workspace/RGExp_proj
+  hf_home:     /workspace/.cache/huggingface   # -> HF_HOME
+  torch_home:  /workspace/.cache/torch
+  image_cache: /workspace/data/images          # ghi đè run.data.image_cache
+  out_dir:     /workspace/outputs              # ghi đè run.out_dir
+  ckpt_dir:    /workspace/ckpt
+```
+
+`HF_HOME` phải được export **trước khi python khởi động**: `huggingface_hub` đọc
+biến này đúng một lần lúc import, đặt muộn hơn là vô tác dụng. `scripts/_env.sh`
+export sẵn; `src/config.py::bootstrap_remote_env` là lớp dự phòng cho ai chạy
+thẳng `python -m src.train`.
+
+Volume tên khác (`/data`, `/mnt/vol`...) thì sửa đúng một chỗ: `remote.volume`
+và các đường dẫn con. Đặt tay bằng `--set` thì **`--set` thắng** — remote không
+giành lại.
+
+Ước lượng dung lượng: model gemma-3-4b ~9GB, `img_dir.zip` + ảnh giải nén vài
+chục GB, checkpoint mỗi ô ~31M (chỉ adapter, không phải cả model). 100GB đủ
+cho cả sweep nếu cache nằm đúng chỗ.
+
+### 9.4. Chọn đúng loại GPU
+
+Hai cửa phải qua, kiểm ngay ở `docker_bootstrap.sh` bước 1 và `setup.sh` bước 8:
+
+**Cửa 1 — bf16.** Dự án khoá `compute_dtype: bfloat16` (§4.1.3). GPU không có
+bf16 thì dừng ngay, không có nhánh fp16.
+
+| GPU | sm | bf16 |
+|---|---|---|
+| H100 / A100 / L40S / L4 / RTX 3090 / 4090 / 3070 | sm80+ | ✓ |
+| **V100** | sm70 | ✗ dừng |
+| **T4** | sm75 | ✗ dừng |
+
+**Cửa 2 — VRAM.** Gemma3-4b ở bf16 tốn ~8.6GB **chỉ riêng weight**, chưa kể
+optimizer state, activation và KV cache.
+
+| VRAM | Ví dụ | Chạy được gì |
+|---|---|---|
+| ≥38GB | A100, L40S | tất cả biến thể, batch 4×8 |
+| 22–24GB | 3090, 4090 | tất cả, batch 2×16 + grad_ckpt |
+| 12–16GB | L4, 4080 | ưu tiên `qlora` / `qdora` |
+| ≤8GB | **RTX 3070**, 3060Ti | **chỉ** `--variant qlora` hoặc `qdora` (NF4 ~2.5GB) — bf16 không lượng tử hoá sẽ OOM ngay STAGE 0 |
+
+Máy 8GB chạy được nhưng chậm và chỉ hai cột lượng tử hoá; muốn phủ cả bảng §3.2
+thì cần ≥22GB. Cứ chạy STAGE 0 (`--dry-run`) trước — 5 phút và ~vài trăm đồng
+tiền GPU để biết chắc, thay vì OOM sau 3 tiếng.
+
+```bash
+bash scripts/run_local.sh --variant qdora --rank 8 --dry-run   # thử ô nhẹ nhất
+```
+
+### 9.5. Kéo kết quả về TRƯỚC KHI xoá instance
+
+Nút **Xoá** xoá cả volume. Ba lớp bảo vệ, theo thứ tự tin cậy:
+
+1. **HF Hub** — `run.push_to_hub: true` đẩy adapter lên `run.hub_repo` sau mỗi
+   `push_every_n_saves` lần save. Đây là bản sao duy nhất không nằm trên máy
+   thuê. Kiểm tra repo trên Hub có file trước khi bấm Xoá.
+2. **rsync về máy bạn** — metrics và reports.csv thì Hub không giữ:
+
+   ```bash
+   rsync -avz -e "ssh -p <PORT_SSH>" \
+      root@<HOST>:/workspace/outputs/ ./outputs/
+   rsync -avz -e "ssh -p <PORT_SSH>" \
+      root@<HOST>:/workspace/ckpt/ ./ckpt/
+   ```
+
+3. **File Browser** (port 5335) — tải nhanh một hai file lẻ qua trình duyệt.
+
+Gom bảng so sánh ngay trên máy thuê trước khi kéo về cũng được — nhẹ hơn nhiều
+so với kéo cả `outputs/`:
+
+```bash
+bash scripts/collect.sh              # sinh outputs/_summary/ (§5)
+```
+
+### 9.6. Tiết kiệm tiền
+
+- Chạy `--dry-run` trước mọi ô mới. STAGE 0 mất 5 phút; OOM ở giờ thứ 3 mất 3 giờ.
+- `SWEEP_CELLS="qdora:8 qdora:16"` để chỉ chạy các ô cần, thay vì cả 8 ô.
+- `sweep.sh` **bỏ qua ô đã có `metrics.json`** — xoá instance rồi thuê lại, chỉ
+  cần rsync `outputs/` lên máy mới là nó đi tiếp từ ô còn thiếu.
+- `run.resume: true` + checkpoint trên Hub: một ô đang train dở cũng nối lại
+  được trên máy khác, miễn `n_train` và `seed` không đổi.
+- Xong việc thì **Xoá**, đừng chỉ đóng ssh — máy vẫn tính tiền theo giờ.

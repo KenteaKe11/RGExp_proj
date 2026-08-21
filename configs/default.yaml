@@ -170,3 +170,65 @@ run:
   no_repeat_ngram: 3
 
   use_bertscore: true       # §1.5 optional; chạy 2 lượt (raw + post)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OPTION 2 — chạy trên GPU THUÊ THEO GIỜ (container Docker)   §0.2 / §9
+#
+# Option 1 (mặc định) là GPU cục bộ: venv trong repo, cache ở $HOME.
+# Option 2 là container thuê (vd pytorch/pytorch:latest): torch ĐÃ có sẵn trong
+# python hệ thống, $HOME nhỏ và mất khi Restart, ssh đứt là mất session.
+#
+# Khối này chỉ đổi CHỖ ĐỂ FILE và CÁCH CHẠY — không đổi bất kỳ tham số training
+# nào ở `fixed`/`sweep`, nên kết quả hai option so sánh được với nhau.
+# ═════════════════════════════════════════════════════════════════════════════
+remote:
+  # auto = bật khi thấy /.dockerenv hoặc RGEXP_REMOTE=1  |  on / off = ép cứng
+  enabled: auto
+
+  # ── Chỗ để file: đặt hết trên volume dung lượng lớn ───────────────────────
+  # Container thuê thường gắn một volume (vd 100GB) ở /workspace; lớp ghi của
+  # container thì nhỏ và mất khi Restart. gemma-3-4b ~9GB + img_dir.zip vài
+  # chục GB — để cache ở mặc định $HOME/.cache là hết chỗ hoặc phải tải lại.
+  volume: /workspace
+  workdir: /workspace/RGExp_proj          # nơi clone repo
+  hf_home: /workspace/.cache/huggingface  # -> HF_HOME (model + dataset đã tải)
+  torch_home: /workspace/.cache/torch     # -> TORCH_HOME
+  # Ghi đè run.data.image_cache khi remote BẬT (ảnh giải nén, vài chục GB).
+  # null = giữ nguyên giá trị ở run.data.image_cache.
+  image_cache: /workspace/data/images
+  # out_dir / ckpt_dir cũng chuyển sang volume.
+  # null = giữ nguyên ./outputs, ./ckpt như option 1.
+  out_dir: /workspace/outputs
+  ckpt_dir: /workspace/ckpt
+
+  # ── Python ────────────────────────────────────────────────────────────────
+  # false = KHÔNG dựng venv. Ảnh pytorch/* đã có sẵn torch khớp CUDA của máy;
+  # dựng venv mới sẽ cô lập mất bản torch đó, setup.sh phải tải lại ~2.5GB và
+  # dễ lấy sai bản CUDA. Chỉ đặt true nếu ảnh gốc KHÔNG có torch.
+  use_venv: false
+
+  # ── Session ───────────────────────────────────────────────────────────────
+  # Train một ô mất nhiều giờ. ssh đứt (wifi, máy sleep, hết phiên) là SIGHUP
+  # giết tiến trình -> luôn chạy trong tmux; ssh vào lại thì `tmux attach`.
+  tmux_session: sweep
+
+  # ── Thông tin instance ────────────────────────────────────────────────────
+  # KHÔNG commit giá trị thật (repo public = lộ máy đang thuê). Đặt qua biến
+  # môi trường ở MÁY CỦA BẠN, không phải trong file này:
+  #     export RGEXP_SSH_HOST=<HOST>   RGEXP_SSH_PORT=<PORT_SSH>
+  ssh_host: null            # vd: <HOST>       (lấy trong dashboard khi thuê)
+  ssh_port: null            # vd: <PORT_SSH>
+  ssh_user: root
+  # Port BÊN TRONG container; dashboard map ra <HOST>:<PORT_*> tương ứng.
+  ports:
+    jupyter: 8888
+    filebrowser: 5335
+    extra: 8999             # để trống cho tensorboard / http tuỳ ý
+
+  # ── Ghi chú phần cứng: HAI cửa phải qua ───────────────────────────────────
+  # 1) bf16 (§4.1.3) -> chỉ Ampere trở lên (sm80+): A100 / H100 / L40S / L4 /
+  #    RTX 3090 / 4090 / 3070...  V100 (sm70) và T4 (sm75) KHÔNG có bf16,
+  #    setup.sh và detect_hardware() dừng ngay ở bước kiểm GPU.
+  # 2) VRAM -> Gemma3-4b ở bf16 tốn ~8.6GB CHỈ RIÊNG weight, chưa kể optimizer
+  #    và activation. Máy ≤12GB (vd RTX 3070 8GB) chỉ chạy nổi nhánh lượng tử
+  #    hoá: --variant qlora hoặc qdora (NF4, ~2.5GB weight). Bảng đầy đủ ở §9.4.

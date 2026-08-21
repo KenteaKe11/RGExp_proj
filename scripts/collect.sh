@@ -19,5 +19,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
-source "${VENV_DIR:-$ROOT/.venv}/bin/activate"
-python -m src.report "$@"
+source "$ROOT/scripts/_env.sh"
+rgexp_activate_py || exit 1
+
+# Chế độ container (§9): outputs nằm trên volume, không phải ./outputs.
+case " $* " in
+    *" --out-dir "*) : ;;                       # người dùng tự chỉ định
+    *) set -- "$@" --out-dir "$RGEXP_OUTBASE" ;;
+esac
+"$PYBIN" -m src.report "$@"
