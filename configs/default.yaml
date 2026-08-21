@@ -155,9 +155,9 @@ run:
   warmup_steps: 50
   max_grad_norm: 1.0
 
-  eval_every: 200
+  eval_every: 5
   eval_max_batches: 16
-  save_every: 200
+  save_every: 5
   push_every_n_saves: 2
   log_every_sec: 60.0
 

@@ -50,9 +50,24 @@ echo "Tổng  : $N_TOTAL ô | mode=$MODE (both = train xong chạy luôn test)"
 echo "Args  : $*"
 echo
 
+# ── Preflight ────────────────────────────────────────────────────────────────
+# Một sweep có thể chạy nhiều ngày. Kiểm môi trường MỘT LẦN ở đây (~3 giây) để
+# không phải xem 8 ô lần lượt chết cùng một lỗi import.
+if rgexp_activate_py; then
+    if ! "$PYBIN" -c "import numpy, pandas, yaml, torch, transformers, peft" 2>/dev/null; then
+        echo "✗ Môi trường python thiếu dependency — sweep sẽ hỏng mọi ô."
+        "$PYBIN" -c "import numpy, pandas, yaml, torch, transformers, peft" 2>&1 | tail -3
+        echo "  python: $PYBIN"
+        echo "  Chạy:   bash scripts/setup.sh     (rồi đọc kỹ bước 5 và 8)"
+        exit 1
+    fi
+    echo "✓ preflight: dependency đủ"
+fi
+
 declare -a RESULTS=()
 START=$(date +%s)
 IDX=0
+FAST_FAILS=0
 for MODEL in $MODELS; do
 for cell in $CELLS; do
     variant="${cell%%:*}"
@@ -83,9 +98,26 @@ for cell in $CELLS; do
         fi
     else
         RC=$?
-        MIN=$(( ($(date +%s) - T0) / 60 ))
+        SEC=$(( $(date +%s) - T0 ))
+        MIN=$(( SEC / 60 ))
         RESULTS+=("✗ $tag  (${MIN}m, mã lỗi $RC)")
         echo "⚠ $tag hỏng — đi tiếp ô sau (log: $OUTBASE/$tag/logs/latest.log)"
+        # Hỏng trong dưới 90 giây thì gần như chắc chắn là lỗi môi trường/config
+        # chứ không phải lỗi của riêng ô đó (OOM, hội tụ...). Hai ô liên tiếp
+        # như vậy là dừng: chạy tiếp 6 ô nữa chỉ tốn thời gian và tiền GPU.
+        if [ "$SEC" -lt 90 ]; then
+            FAST_FAILS=$((FAST_FAILS + 1))
+        else
+            FAST_FAILS=0
+        fi
+        if [ "$FAST_FAILS" -ge 2 ]; then
+            echo
+            echo "✗ Hai ô liên tiếp hỏng trong dưới 90 giây — đây là lỗi chung,"
+            echo "  không phải lỗi của từng ô. DỪNG sweep để khỏi phí GPU."
+            echo "  Đọc:  tail -40 $OUTBASE/$tag/logs/latest.log"
+            echo "  Bỏ qua kiểm tra này: SWEEP_NO_FAILFAST=1"
+            [ "${SWEEP_NO_FAILFAST:-0}" = "1" ] || break 2
+        fi
     fi
     echo
 done

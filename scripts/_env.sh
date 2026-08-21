@@ -108,6 +108,15 @@ if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     mkdir -p "${HF_HOME:-/tmp/hf}" "${TORCH_HOME:-/tmp/torch}" 2>/dev/null || true
 fi
 
+# Container thường không đặt locale -> ssh vào thấy tiếng Việt và khung ═══ bị
+# hiện thành dấu "_". C.UTF-8 có sẵn trong mọi image Debian/Ubuntu.
+if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
+    if [ -z "${LANG:-}" ] || [ "${LANG:-}" = "C" ] || [ "${LANG:-}" = "POSIX" ]; then
+        export LANG=C.UTF-8
+    fi
+    export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+fi
+
 # out_dir dùng chung cho các script shell (log, metrics.json nằm ở đây).
 RGEXP_OUTBASE="outputs"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ] && [ -n "$RM_OUT_DIR" ]; then

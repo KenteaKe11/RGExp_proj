@@ -103,14 +103,23 @@ fi
 rgexp_activate_py allow-missing
 echo "✓ python: $PYBIN"
 
-# Một số image đánh dấu môi trường là "externally managed" (PEP 668) và pip
-# từ chối cài. Ở container dùng-một-lần thì cứ ép; không có gì để hỏng.
+# Dò cờ pip MỘT LẦN thay vì giả định. `--root-user-action` chỉ có từ pip 22.1;
+# image nào còn pip 22.0 (Ubuntu 22.04) mà truyền cờ này là chết ngay lệnh đầu,
+# requirements không bao giờ được cài, và mọi thứ sau đó hỏng theo.
+PIP_FLAGS=""
+if "$PYBIN" -m pip install --root-user-action=ignore --help >/dev/null 2>&1; then
+    PIP_FLAGS="--root-user-action=ignore"
+fi
+echo "✓ pip: $("$PYBIN" -m pip --version 2>&1 | cut -d' ' -f1-2)${PIP_FLAGS:+ (im lặng cảnh báo root)}"
+
 pipi() {
     local out rc
-    out=$("$PYBIN" -m pip install -q --root-user-action=ignore "$@" 2>&1); rc=$?
+    # shellcheck disable=SC2086
+    out=$("$PYBIN" -m pip install -q $PIP_FLAGS "$@" 2>&1); rc=$?
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "externally-managed-environment"; then
         # PEP 668: container dùng-một-lần thì cứ ép, không có gì để hỏng.
-        "$PYBIN" -m pip install -q --root-user-action=ignore --break-system-packages "$@"
+        # shellcheck disable=SC2086
+        "$PYBIN" -m pip install -q $PIP_FLAGS --break-system-packages "$@"
         return $?
     fi
     # Lỗi khác (thiếu file, sai tên gói, mất mạng) thì IN RA rồi dừng — retry
@@ -186,10 +195,29 @@ PYEOF
 # ngay phút đầu rẻ hơn nhiều so với biết sau khi đã tải 30GB dữ liệu.
 "$PYBIN" - <<'PYEOF'
 import os
+import sys
+
 import torch
 if not torch.cuda.is_available():
     print("✗ torch KHÔNG thấy GPU. Kiểm tra driver / bản CUDA của torch.")
     raise SystemExit(1)
+# Kiểm luôn các gói mà src/train.py import ở dòng đầu. setup "chạy xong" mà
+# thiếu numpy thì mọi ô sweep sau đó chết ngay dòng import — 8 ô hỏng trong 0
+# phút, log toàn traceback giống nhau, rất khó lần ra là do setup.
+missing = []
+for mod in ("numpy", "pandas", "yaml", "transformers", "peft", "huggingface_hub"):
+    try:
+        __import__(mod)
+    except ImportError:
+        missing.append(mod)
+if missing:
+    print(f"✗ Thiếu module: {', '.join(missing)}")
+    print(f"  python đang dùng: {sys.executable}")
+    print("  requirements.txt chưa cài xong. Chạy lại và ĐỌC lỗi pip ở bước 5:")
+    print(f"      {sys.executable} -m pip install -r requirements.txt")
+    raise SystemExit(1)
+print("✓ deps: numpy, pandas, yaml, transformers, peft, huggingface_hub")
+
 p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f}GB | sm{sm[0]}{sm[1]}")
