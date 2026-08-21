@@ -147,7 +147,7 @@ run:
 
   # §4.1.2 — max_seq_len tự tính: 2^ceil(log2(prompt + img_token + delta)).
   # null = tự tính. Đặt số cụ thể để ép.
-  max_seq_len: null
+  max_seq_len: 600
   seq_delta: 128            # chỗ chừa cho target (guard chặn ở 110 token)
 
   lr: 1.0e-4                # §3.2 lr_max
