@@ -7,6 +7,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Core
+# CHÚ Ý cặp transformers <-> torch: từ 4.53, transformers dùng
+# `or_mask_function` cho mask ảnh của Gemma 3 và đòi torch >= 2.6. Ảnh
+# pytorch/* trên máy thuê thường đứng ở torch 2.5.x -> setup.sh tự ghim
+# transformers < 4.53 trong trường hợp đó (bước 5b).
 transformers>=4.50.0
 accelerate>=0.34.0
 peft>=0.13.0

@@ -168,6 +168,29 @@ fi
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
+# ── 5b. Ghép transformers với torch của image ────────────────────────────────
+# transformers >= 4.53 dùng `or_mask_function` cho mask ảnh của Gemma 3, và cái
+# đó đòi torch >= 2.6. Ảnh pytorch/* thường đứng ở torch 2.5.x, mà
+# requirements.txt chỉ ghi `transformers>=4.50` nên pip kéo bản mới nhất ->
+# STAGE 0 chết với "require torch>=2.6".
+#
+# Hạ transformers rẻ hơn nhiều so với nâng torch (vài chục MB so với ~2.5GB) và
+# giữ được bản torch vốn đã khớp CUDA của máy. 4.50-4.52 vẫn đủ cho cả Gemma 3
+# lẫn Qwen2.5-VL.
+TV=$("$PYBIN" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || echo "0")
+if "$PYBIN" -c "
+import sys
+v = tuple(int(x) for x in '$TV'.split('.')[:2])
+sys.exit(0 if v < (2, 6) else 1)
+" 2>/dev/null; then
+    TFV=$("$PYBIN" -c 'import transformers; print(transformers.__version__)' 2>/dev/null || echo "0")
+    echo "→ torch $TV < 2.6 -> ghim transformers < 4.53 (đang có $TFV)"
+    pipi "transformers>=4.50,<4.53"
+    echo "✓ transformers: $("$PYBIN" -c 'import transformers; print(transformers.__version__)')"
+    echo "  (muốn dùng transformers mới nhất thì nâng torch:"
+    echo "     pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124)"
+fi
+
 # ── 6. flash-attn (tùy chọn) ─────────────────────────────────────────────────
 # Build lâu (5-15 phút) và fail tuỳ CUDA/torch. Không có cũng chạy được: code
 # tự rơi về sdpa, vốn cũng dùng kernel hợp nhất trên GPU.
