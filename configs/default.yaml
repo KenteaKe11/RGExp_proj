@@ -136,7 +136,7 @@ run:
   n_train_samples: null     # null = full train split (~152_917)
   n_test_samples: 200       # §1.1 — sinh 200 mẫu có metrics để theo dõi hội tụ
   num_epochs: 1             # §4.1.4
-  max_steps: 120            
+  max_steps: 100           
 
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 (§3.2) ──────
   #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
