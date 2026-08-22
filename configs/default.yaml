@@ -133,10 +133,10 @@ run:
   wandb_project: mimic-cxr-vlm-sweep
   wandb_run: null           # null -> tự đặt theo ô sweep
 
-  n_train_samples: 3840     # null = full train split (~152_917)
+  n_train_samples: null     # null = full train split (~152_917)
   n_test_samples: 200       # §1.1 — sinh 200 mẫu có metrics để theo dõi hội tụ
-  num_epochs: 2             # §4.1.4
-  max_steps: null           # 64 mẫu/step -> 120 step là 7680 mẫu  -> 2 epoch với 3840 mẫu/epoch
+  num_epochs: 1             # §4.1.4
+  max_steps: 120            
 
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 (§3.2) ──────
   #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
