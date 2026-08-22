@@ -140,8 +140,8 @@ run:
 
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 (§3.2) ──────
   #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
-  train_bs: 16
-  grad_accum: 4
+  train_bs: 8
+  grad_accum: 8
   infer_bs: 4
   grad_ckpt: null
 
