@@ -90,7 +90,7 @@ models:
       max_pixels: 262144      # 512² — trần, chặn ảnh nguồn to hơn dự kiến
 
 run:
-  mode: both                # train | test | both  (both = train xong chạy test)
+  mode: train                # train | test | both  (both = train xong chạy test)
   # false = chạy thật. true = dừng sau STAGE 0 (2 step) để kiểm cấu hình.
   dry_run: false
 
@@ -133,15 +133,15 @@ run:
   wandb_project: mimic-cxr-vlm-sweep
   wandb_run: null           # null -> tự đặt theo ô sweep
 
-  n_train_samples: null    # null = full train split (~152_917)
+  n_train_samples: 3840     # null = full train split (~152_917)
   n_test_samples: 200       # §1.1 — sinh 200 mẫu có metrics để theo dõi hội tụ
-  num_epochs: 1             # §4.1.4
-  max_steps: 801
+  num_epochs: 2             # §4.1.4
+  max_steps: null           # 64 mẫu/step -> 120 step là 7680 mẫu  -> 2 epoch với 3840 mẫu/epoch
 
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 (§3.2) ──────
   #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
-  train_bs: 4
-  grad_accum: 16
+  train_bs: 8
+  grad_accum: 8
   infer_bs: 4
   grad_ckpt: null
 
@@ -152,12 +152,12 @@ run:
 
   lr: 1.0e-4                # §3.2 lr_max
   weight_decay: 0.01
-  warmup_steps: 200
+  warmup_steps: 10
   max_grad_norm: 1.0
 
-  eval_every: 100
+  eval_every: 15
   eval_max_batches: 20
-  save_every: 100
+  save_every: 15
   push_every_n_saves: 2
   log_every_sec: 100.0
 
