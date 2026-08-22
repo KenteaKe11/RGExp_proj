@@ -426,6 +426,33 @@ def main(argv=None):
     if hasattr(model.config, "text_config"):
         model.config.text_config.use_cache = True
 
+    # ── Gỡ bộ máy dành cho TRAIN trước khi generate ──────────────────────────
+    # grad-checkpointing cài một forward hook lên embedding gọi
+    # `output.requires_grad_(True)` (enable_input_require_grads, §1.6). Hook đó
+    # vô hại khi train, nhưng transformers compile forward bằng torch.compile
+    # trong generate() với static cache của Gemma 3 — và dynamo KHÔNG trace
+    # được `Tensor.requires_grad_`:
+    #
+    #     torch._dynamo.exc.Unsupported: Tensor.requires_grad_
+    #
+    # Lỗi nổ ở giữa khâu infer, sau khi train đã xong — mất cả tiếng GPU cho
+    # một ô rồi không có metrics. Ở đây không cần gradient nữa (@torch.no_grad),
+    # nên gỡ hẳn cả hai thứ thay vì tắt dynamo toàn cục.
+    for obj in (model, getattr(model, "base_model", None)):
+        if obj is None:
+            continue
+        for meth in ("gradient_checkpointing_disable", "disable_input_require_grads"):
+            try:
+                getattr(obj, meth)()
+            except Exception:
+                pass
+    # Lớp chắn thứ hai: bảo generate() đừng compile. Bản transformers cũ không
+    # có cờ này nên phải hasattr.
+    gcfg = getattr(model, "generation_config", None)
+    if gcfg is not None and hasattr(gcfg, "disable_compile"):
+        gcfg.disable_compile = True
+    log("infer", "gỡ grad-ckpt + require-grad hook, tắt compile cho generate")
+
     @torch.no_grad()
     def generate_batch(paths, temperature=None, rep_penalty=None):
         tokenizer.padding_side = f.pad_side_infer
