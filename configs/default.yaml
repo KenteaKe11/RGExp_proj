@@ -129,6 +129,11 @@ run:
   push_to_hub: true
   resume: true
 
+  # Ô đã có eval (metrics.json + reports.csv ở out_dir, hoặc eval/ trên Hub) và
+  # eval đó khớp step của ckpt -> bỏ qua khâu infer, trả 0 để sweep sang ô kế.
+  # true = ép chấm lại dù đã có.
+  force_eval: false
+
   use_wandb: true
   wandb_project: mimic-cxr-vlm-sweep
   wandb_run: null           # null -> tự đặt theo ô sweep

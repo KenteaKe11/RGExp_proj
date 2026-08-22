@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -104,6 +105,13 @@ def main(argv=None):
         if use_wandb:
             import wandb
             wandb.log(payload)
+
+    def wfinish():
+        """Đóng run wandb ở MỌI lối thoát sớm — bỏ sót là run treo 'running'
+        trên dashboard và ô sau không gắn được vào đúng run."""
+        if use_wandb:
+            import wandb
+            wandb.finish()
 
     if r.push_to_hub and not r.dry_run:
         create_repo(repo_id=r.hub_repo, token=hf_token, private=r.hub_private,
@@ -309,14 +317,17 @@ def main(argv=None):
 
     assert resume_dir or not run_test or run_train, \
         f"mode='test' nhưng không có checkpoint ({src})"
+    train_done = False
     if resume_dir:
         with open(os.path.join(resume_dir, "train_state.json")) as fh:
             st = json.load(fh)
         # base_order phụ thuộc n_train + seed; lệch là cursor vô nghĩa.
         assert st["n_train"] == len(df_train) and st["seed"] == f.seed, \
             f"Split/seed đổi (n_train {st['n_train']} vs {len(df_train)})"
-        assert st["step"] < total_steps or not run_train, \
-            f"Đã train đủ {st['step']}/{total_steps} — dùng --mode test"
+        # last/ đã chạy đủ total_steps KHÔNG phải lỗi: ô này chỉ còn thiếu
+        # khâu eval. Xử lý ở khối "Đã train đủ" bên dưới, không assert —
+        # một ô sweep không được phép làm hỏng cả bảng vì lý do này.
+        train_done = st["step"] >= total_steps
         from safetensors.torch import load_file
         ad = os.path.join(resume_dir, "adapter_model.safetensors")
         set_peft_model_state_dict(
@@ -336,9 +347,88 @@ def main(argv=None):
         train_loader = make_loader(
             df_train, collate, cfg,
             order=epoch_order(base_order, epoch, r.num_epochs)[cursor:])
-        log("resume", f"{src} | tiếp step {step}/{total_steps} ep {epoch}")
+        log("resume", f"{src} | {'ĐỦ' if train_done else 'tiếp'} "
+                      f"step {step}/{total_steps} ep {epoch}")
     else:
         log("resume", f"train từ đầu — {src}")
+
+    # ── Ô đã có sẵn eval chưa? ───────────────────────────────────────────────
+    def find_eval():
+        """Trả về (nguồn, train_step của eval) hoặc (None, None).
+
+        Local trước; máy thuê dựng lại từ đầu thì outputs/ rỗng nhưng `eval/`
+        trên Hub vẫn còn — kéo về out_dir luôn để src.report gom được mà không
+        tốn thêm giờ GPU. Cùng cơ chế với resume ckpt ở trên.
+        """
+        mj = os.path.join(r.out_dir, "metrics.json")
+        if os.path.exists(mj) and os.path.exists(
+                os.path.join(r.out_dir, "reports.csv")):
+            try:
+                with open(mj) as fh:
+                    return "local", json.load(fh).get("meta", {}).get("train_step")
+            except Exception as e:
+                warn("eval", f"metrics.json local hỏng ({e}) — coi như chưa có")
+        if not r.push_to_hub:
+            return None, None
+        try:
+            root = snapshot_download(
+                repo_id=r.hub_repo, token=hf_token,
+                local_dir=os.path.join(r.ckpt_dir, "from_hub"),
+                allow_patterns=["eval/*"])
+        except Exception as e:
+            log("eval", f"không tải được eval/ từ Hub ({e})")
+            return None, None
+        d = os.path.join(root, "eval")
+        mj = os.path.join(d, "metrics.json")
+        if not os.path.exists(mj):
+            return None, None
+        try:
+            with open(mj) as fh:
+                st_eval = json.load(fh).get("meta", {}).get("train_step")
+        except Exception as e:
+            warn("eval", f"metrics.json trên Hub hỏng ({e}) — coi như chưa có")
+            return None, None
+        # Chỉ copy file mức trên cùng: eval/ còn có logs/ của lần chạy trước,
+        # không được đè lên log lần này.
+        os.makedirs(r.out_dir, exist_ok=True)
+        for name in os.listdir(d):
+            s = os.path.join(d, name)
+            if os.path.isfile(s):
+                shutil.copy2(s, os.path.join(r.out_dir, name))
+        log("eval", f"kéo eval/ từ Hub về {r.out_dir}")
+        return "Hub eval/", st_eval
+
+    # ── Đã train đủ: KHÔNG chết, chuyển sang khâu eval ───────────────────────
+    if train_done and run_train:
+        log("train", f"đã đủ {step}/{total_steps} step — bỏ qua train, "
+                     f"chuyển sang khâu eval")
+        event("train_skip", reason="da_du_step", step=step,
+              total_steps=total_steps)
+        run_train = False
+        if not run_test:
+            # mode='train' thì eval không phải việc của lần chạy này.
+            log("done", f"mode={r.mode} và ô đã train xong — không còn việc")
+            event("run_end_reason", reason="train_done_mode_train", step=step)
+            wfinish()
+            return 0
+
+    # Không train lần này -> eval sẵn có (và khớp step) là đủ, nhường GPU cho ô
+    # sau. Nếu vừa train xong thì trọng số đã đổi, luôn phải chấm lại.
+    if not run_train and run_test:
+        eval_src, eval_step = find_eval()
+        stale = eval_src and eval_step is not None and eval_step < step
+        if eval_src and not stale and not getattr(r, "force_eval", False):
+            log("done", f"ô {cfg.sweep.tag} đã có eval ({eval_src}) @ step "
+                        f"{eval_step if eval_step is not None else '?'} "
+                        f"— bỏ qua infer, sang ô sweep kế "
+                        f"(--set run.force_eval=true để ép chấm lại)")
+            event("run_end_reason", reason="eval_exists", source=eval_src,
+                  eval_step=eval_step, step=step)
+            wfinish()
+            return 0
+        if stale:
+            log("eval", f"eval cũ @ step {eval_step} < ckpt step {step} "
+                        f"— chấm lại")
 
     t0, n_saves = time.time(), 0
     if run_train:
@@ -411,14 +501,13 @@ def main(argv=None):
         log("train", f"xong {step} step | val_loss={evaluate():.4f} | "
                      f"{(time.time()-t0)/60:.1f} phút")
     else:
-        log("train", f"BỎ QUA train (mode={r.mode}) — adapter ở step {step}")
+        log("train", f"BỎ QUA train ({'đã đủ step' if train_done else f'mode={r.mode}'})"
+                     f" — adapter ở step {step}")
 
     # ── Infer + guard (§2) ───────────────────────────────────────────────────
     if not run_test:
         log("infer", f"BỎ QUA infer (mode={r.mode})")
-        if use_wandb:
-            import wandb
-            wandb.finish()
+        wfinish()
         return 0
 
     model.eval()
