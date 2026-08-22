@@ -453,6 +453,23 @@ def main(argv=None):
         gcfg.disable_compile = True
     log("infer", "gỡ grad-ckpt + require-grad hook, tắt compile cho generate")
 
+    # ── Lớp chắn dtype trước generate ────────────────────────────────────────
+    # KV-cache tĩnh của Gemma 3 được cấp phát theo config._pre_quantization_dtype
+    # (= bf16 khi load 4-bit), KHÔNG theo dtype thật của activation. Nếu còn sót
+    # param fp32 trong base (bản peft/transformers khác tự upcast, vd
+    # prepare_model_for_kbit_training) thì q_proj trả fp32 trong khi k,v đọc ra
+    # từ cache là bf16 -> SDPA nổ "Expected query, key, and value to have the
+    # same dtype". Infer chạy @torch.no_grad nên master weight fp32 không còn
+    # tác dụng: ép hết về compute_dtype.
+    # CHÚ Ý: chỉ ép parameter, KHÔNG động vào buffer — inv_freq của rotary phải
+    # giữ fp32, hạ xuống bf16 là hỏng position encoding.
+    stale = [p for p in model.parameters() if p.dtype == torch.float32]
+    if stale:
+        for p in stale:
+            p.data = p.data.to(f.compute_dtype)
+        log("infer", f"ép {len(stale)} param fp32 -> {f.compute_dtype} trước "
+                     f"generate (đồng bộ dtype với KV-cache)")
+
     @torch.no_grad()
     def generate_batch(paths, temperature=None, rep_penalty=None):
         tokenizer.padding_side = f.pad_side_infer

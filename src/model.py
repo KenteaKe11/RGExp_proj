@@ -68,7 +68,7 @@ def find_image_token_id(processor):
 
 def build_model(cfg, hf_token, log):
     from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
 
     f, r = cfg.fixed, cfg.run
 
@@ -136,15 +136,25 @@ def build_model(cfg, hf_token, log):
     assert not leaked, f"lora_exclude thủng: {leaked[:3]}"
     log("lora", f"{len(matched)} linear | đầu: {matched[0]}")
 
-    if r.quant:
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=r.grad_ckpt)
-    else:
-        # Không dùng prepare_model_for_kbit_training ở nhánh bf16: nó upcast
-        # mọi param non-quantized sang fp32, gồm embed_tokens 262144×2560
-        # (+2.7GB) mà ta không cần.
-        for p in model.parameters():
-            p.requires_grad_(False)
+    # KHÔNG dùng prepare_model_for_kbit_training ở CẢ HAI nhánh. Nó upcast MỌI
+    # param không phải Params4bit sang fp32: embed_tokens 262144×2560 (+2.7GB),
+    # toàn bộ RMSNorm, vision tower, lm_head.
+    #
+    # Ở nhánh bf16 đó chỉ là phí VRAM. Ở nhánh quant nó còn HỎNG khâu infer:
+    # activation chạy fp32 -> q_proj trả fp32, trong khi generate() của Gemma 3
+    # cấp phát KV-cache tĩnh (HybridCache) theo config._pre_quantization_dtype
+    # = bf16 (transformers/generation/utils.py, _get_cache). Kết quả:
+    #     q fp32 | k,v bf16 -> RuntimeError: Expected query, key, and value to
+    #     have the same dtype  (sdpa_attention_forward)
+    # Train KHÔNG lộ lỗi này vì lúc đó use_cache=False: q,k,v đều fp32 nên
+    # SDPA thấy đồng nhất. Lỗi chỉ nổ ở generate() — tức sau khi đã đốt hết
+    # thời gian GPU của cả ô sweep. Dính cả qlora lẫn qdora.
+    #
+    # Hai việc thật sự cần của prepare_* thì ta đã tự làm: freeze base (ngay
+    # dưới) và grad-ckpt + enable_input_require_grads (khối r.grad_ckpt sau).
+    # Master weight fp32 cho adapter vẫn giữ (khối ngay sau get_peft_model).
+    for p in model.parameters():
+        p.requires_grad_(False)
 
     lora_kwargs = dict(
         r=f.lora_r, lora_alpha=f.lora_alpha, lora_dropout=f.lora_dropout,
