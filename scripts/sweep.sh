@@ -5,6 +5,7 @@
 #   bash scripts/sweep.sh                     # CHẠY THẬT, tuần tự theo ưu tiên
 #   bash scripts/sweep.sh --set run.dry_run=true      # chỉ kiểm cấu hình
 #   SWEEP_CELLS="dora:16 qdora:16" bash scripts/sweep.sh
+#   SWEEP_CELLS="vera:256 vera:512 vera:1024" bash scripts/sweep.sh  # riêng VeRA
 #   SWEEP_MODEL=qwen25vl bash scripts/sweep.sh
 #   SWEEP_ALL_MODELS=1 bash scripts/sweep.sh  # gemma3 xong rồi tới qwen25vl
 #
@@ -25,10 +26,12 @@ source "$ROOT/scripts/_env.sh"
 # Chế độ container: out_dir nằm trên volume (§9), không phải ./outputs.
 OUTBASE="$RGEXP_OUTBASE"
 
-# §3.2 — thứ tự ƯU TIÊN: bốn cột in đậm (DoRA/QDoRA) trước, rồi LoRA/QLoRA.
+# §3.2 — thứ tự ƯU TIÊN: bốn cột in đậm (DoRA/QDoRA) trước, rồi LoRA/QLoRA,
+# cuối cùng VeRA theo rank tăng dần 256 -> 512 -> 1024 (VeRA chỉ học 2 vector
+# scale mỗi layer nên rank phải cao; không có nhánh 4-bit).
 # Chạy hết mất nhiều ngày; ô nào xong là có metrics của ô đó, không phải chờ
 # cả sweep.
-DEFAULT_CELLS="dora:16 dora:8 qdora:16 qdora:8 lora:16 lora:32 qlora:16 qlora:32"
+DEFAULT_CELLS="dora:16 dora:8 qdora:16 qdora:8 lora:16 lora:32 qlora:16 qlora:32 vera:256 vera:512 vera:1024"
 CELLS="${SWEEP_CELLS:-$DEFAULT_CELLS}"
 MODE="${SWEEP_MODE:-both}"
 

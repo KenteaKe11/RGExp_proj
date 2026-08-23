@@ -14,6 +14,8 @@ import re
 
 import numpy as np
 
+from .config import adapter_desc
+
 
 def _setup_nltk():
     import nltk
@@ -122,8 +124,9 @@ def run_metrics(res_df, tokenizer, cfg, step, log):
             "image_size": cfg.fixed.image_size_model,
             "sweep_cell": cfg.sweep.tag,
             "variant": cfg.sweep.variant,
-            "lora": (f"{cfg.sweep.variant} r{cfg.fixed.lora_r} "
-                     f"a{cfg.fixed.lora_alpha}"),
+            # VeRA không có alpha -> adapter_desc in d_initial thay vì "a512".
+            "adapter": adapter_desc(cfg.fixed, cfg.sweep),
+            "lora": adapter_desc(cfg.fixed, cfg.sweep),   # tên cũ, giữ tương thích
             "max_seq_len": cfg.run.max_seq_len,
         },
     }

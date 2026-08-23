@@ -36,6 +36,17 @@ fixed:
   lora_dropout: 0.05
   lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
+  # ── VeRA — chỉ có tác dụng khi sweep.variant=vera ─────────────────────────
+  # VeRA KHÔNG có alpha: A, B là hai ma trận ngẫu nhiên ĐÓNG BĂNG dùng chung
+  # cho mọi layer, mỗi layer chỉ học hai vector scale. Vai trò của alpha do
+  # d_initial (giá trị khởi tạo lambda_d) đảm nhiệm.
+  # Bốn giá trị dưới ĐÚNG BẰNG mặc định của peft.VeraConfig — viết ra để chúng
+  # nằm trong config snapshot; sửa thì ghi vào sweep log.
+  vera_dropout: 0.0
+  vera_d_initial: 0.1          # khởi tạo lambda_d
+  vera_projection_prng_key: 0  # seed sinh A, B
+  vera_save_projection: true   # ghi A, B vào ckpt (~84MB ở r1024) để tái lập
+
   compute_dtype: bfloat16   # §4.1.3 — cần sm80+
   trainable_dtype: float32  # master weight adapter, tránh Adam eps underflow
   adam_eps: 1.0e-6
@@ -58,9 +69,11 @@ fixed:
 sweep:
   # gemma3 | qwen25vl  (§3.2: ưu tiên Gemma3 trước)
   model: gemma3
-  # lora | qlora | dora | qdora
+  # lora | qlora | dora | qdora | vera
   variant: dora
   # LoRA/QLoRA: 16 hoặc 32.  DoRA/QDoRA: 8 hoặc 16.
+  # VeRA: 256 -> 512 -> 1024 (chỉ học 2 vector scale/layer nên cần rank cao;
+  # không có nhánh 4-bit vì peft chưa có VeRA cho Linear4bit).
   rank: 8
 
 # Bảng tra: tên model + module vision loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.

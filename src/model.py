@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from .config import adapter_desc
+
 # §1.2 — prompt cố định.
 PROMPT_TEXT = (
     "Write a chest radiograph report from the image. Output only the report, "
@@ -64,6 +66,89 @@ def find_image_token_id(processor):
         if isinstance(tid, int) and tid >= 0:
             return tid
     return None
+
+
+def build_vera_config(f, target_re, matched, model, log):
+    """VeraConfig cho nhánh --variant vera (§3.2).
+
+    Khác LoRA ở ba điểm phải nhớ khi đọc kết quả:
+
+    1) A, B là ma trận NGẪU NHIÊN ĐÓNG BĂNG dùng CHUNG cho mọi layer. peft cấp
+       phát đúng MỘT cặp cỡ (r × max_in_features) và (max_out_features × r)
+       rồi cắt lát cho từng layer, nên target có shape khác nhau vẫn chạy.
+       Với Gemma3-4b max_in = max_out = 10240 (mlp): r=1024 -> 2 × 10240 × 1024
+       × 4B ≈ 84MB fp32 nằm thường trú trên GPU (r=256 -> ~21MB).
+    2) KHÔNG có alpha. Chỗ của alpha là `d_initial` (giá trị khởi tạo lambda_d,
+       mặc định 0.1) — paper khuyến nghị hạ xuống khi rank lớn nếu loss dựng
+       ngược; ở đây giữ mặc định.
+    3) Trainable chỉ là lambda_d (r) + lambda_b (out_features) mỗi layer, cỡ
+       ~1M param cho cả model ở r=1024 — ít hơn LoRA r16 hàng chục lần. Đó
+       chính là lý do rank sweep của VeRA nằm ở 256/512/1024.
+
+    `save_projection=True` (mặc định) ghi cả A, B vào checkpoint: nặng thêm
+    ~84MB ở r1024, đổi lại resume trên máy khác kiểm chứng được. Lưu ý peft chỉ
+    GHI chứ không NẠP lại hai ma trận này (xem restore_vera_projection) — nên
+    để False là mất luôn khả năng phát hiện lệch RNG.
+    """
+    from peft import VeraConfig
+
+    # Ma trận chung được cắt lát theo layer, nên r LỚN HƠN chiều nhỏ nhất của
+    # một số projection (vd k_proj out=1024) vẫn hợp lệ. Chỉ cảnh báo khi r
+    # vượt chiều LỚN NHẤT — lúc đó phần rank thừa là dư thật.
+    mods = dict(model.named_modules())
+    dims = []
+    for name in matched:
+        mod = mods.get(name)
+        dims += [getattr(mod, "in_features", 0) or 0,
+                 getattr(mod, "out_features", 0) or 0]
+    if dims and f.lora_r > max(dims):
+        log("vera", f"⚠ r={f.lora_r} > chiều lớn nhất trong target "
+                    f"({max(dims)}) — phần rank vượt quá là dư.")
+
+    log("vera", f"r={f.lora_r} | d_initial={f.vera_d_initial} | "
+                f"dropout={f.vera_dropout} | "
+                f"save_projection={f.vera_save_projection} | "
+                f"prng_key={f.vera_projection_prng_key}")
+    if dims:
+        mb = 2 * max(dims) * f.lora_r * 4 / 1024**2
+        log("vera", f"A,B dùng chung ≈ {mb:.0f}MB fp32 "
+                    f"(r{f.lora_r} × {max(dims)}, đóng băng)")
+    return VeraConfig(
+        r=f.lora_r, target_modules=target_re, vera_dropout=f.vera_dropout,
+        d_initial=f.vera_d_initial,
+        projection_prng_key=f.vera_projection_prng_key,
+        save_projection=f.vera_save_projection,
+        bias="none", task_type="CAUSAL_LM")
+
+
+def restore_vera_projection(model, adapter_sd, log, warn, adapter="default"):
+    """Ép A, B trong ckpt vào model khi resume ô VeRA.
+
+    `set_peft_model_state_dict` KHÔNG nạp vera_A/vera_B: nó chỉ kiểm tra hai
+    khoá có mặt rồi thôi (hai khoá đó nằm trong `unexpected_keys`), còn ma trận
+    thật được sinh lại từ `projection_prng_key` lúc khởi tạo. Trên cùng một máy
+    thì trùng nhau nên không ai để ý. Resume từ Hub sang máy/bản torch khác mà
+    RNG lệch thì lambda đã học được gắn lên một cặp A,B KHÁC — adapter thành vô
+    nghĩa và KHÔNG có lỗi nào nổ ra. Nên ở đây so, lệch thì chép đè.
+    """
+    for name in ("vera_A", "vera_B"):
+        saved = adapter_sd.get(f"base_model.{name}")
+        live = getattr(getattr(model, "base_model", None), name, None)
+        if saved is None or live is None or adapter not in live:
+            warn("vera", f"resume: ckpt không có {name} — giữ ma trận sinh từ "
+                         f"prng_key (chỉ đúng nếu cùng máy/bản torch).")
+            continue
+        cur = live[adapter]
+        if tuple(saved.shape) != tuple(cur.shape):
+            raise RuntimeError(
+                f"{name} trong ckpt {tuple(saved.shape)} khác model "
+                f"{tuple(cur.shape)} — ckpt này của rank/model khác.")
+        if torch.allclose(saved.to(cur.device, cur.dtype), cur, atol=1e-5):
+            log("vera", f"resume: {name} khớp ma trận sinh lại ✓")
+        else:
+            cur.copy_(saved.to(cur.device, cur.dtype))
+            warn("vera", f"resume: {name} sinh lại KHÁC ckpt (RNG máy này "
+                         f"lệch) — đã chép ma trận trong ckpt đè lên.")
 
 
 def build_model(cfg, hf_token, log):
@@ -156,37 +241,43 @@ def build_model(cfg, hf_token, log):
     for p in model.parameters():
         p.requires_grad_(False)
 
-    lora_kwargs = dict(
-        r=f.lora_r, lora_alpha=f.lora_alpha, lora_dropout=f.lora_dropout,
-        bias="none", task_type="CAUSAL_LM", target_modules=target_re,
-        use_dora=f.use_dora)
-    if f.use_dora and r.quant:
-        # QDoRA: DoRA phải dequantize từng base layer để tính chuẩn cột ->
-        # đỉnh VRAM cao lúc khởi tạo. ephemeral_gpu_offload đẩy bước đó qua CPU.
-        try:
-            from peft import LoraRuntimeConfig
-            lora_kwargs["runtime_config"] = LoraRuntimeConfig(
-                ephemeral_gpu_offload=True)
-            log("lora", "QDoRA: ephemeral_gpu_offload BẬT (dequantize qua CPU)")
-        except ImportError:
-            log("lora", "peft không có LoraRuntimeConfig — QDoRA init trên GPU")
+    if f.tuner == "vera":
+        peft_cfg = build_vera_config(f, target_re, matched, model, log)
+    else:
+        lora_kwargs = dict(
+            r=f.lora_r, lora_alpha=f.lora_alpha, lora_dropout=f.lora_dropout,
+            bias="none", task_type="CAUSAL_LM", target_modules=target_re,
+            use_dora=f.use_dora)
+        if f.use_dora and r.quant:
+            # QDoRA: DoRA phải dequantize từng base layer để tính chuẩn cột ->
+            # đỉnh VRAM cao lúc khởi tạo. ephemeral_gpu_offload đẩy bước đó qua
+            # CPU.
+            try:
+                from peft import LoraRuntimeConfig
+                lora_kwargs["runtime_config"] = LoraRuntimeConfig(
+                    ephemeral_gpu_offload=True)
+                log("lora",
+                    "QDoRA: ephemeral_gpu_offload BẬT (dequantize qua CPU)")
+            except ImportError:
+                log("lora",
+                    "peft không có LoraRuntimeConfig — QDoRA init trên GPU")
+        peft_cfg = LoraConfig(**lora_kwargs)
 
     try:
-        model = get_peft_model(model, LoraConfig(**lora_kwargs))
+        model = get_peft_model(model, peft_cfg)
     except torch.cuda.OutOfMemoryError:
         raise RuntimeError(
             "OOM khi khởi tạo adapter. DoRA/QDoRA tốn hơn LoRA vì phải "
-            "dequantize base weight. Thử --variant lora, hoặc nâng peft lên "
-            "bản có ephemeral_gpu_offload.")
+            "dequantize base weight; VeRA r cao tốn cho ma trận chung. "
+            "Thử --variant lora, hoặc nâng peft lên bản có "
+            "ephemeral_gpu_offload.")
 
     # Master weight fp32 chỉ cho param trainable — Adam eps 1e-6 underflow ở bf16.
     for n, p in model.named_parameters():
         if p.requires_grad and p.dtype != f.trainable_dtype:
             p.data = p.data.to(f.trainable_dtype)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    variant = ("qdora" if (f.use_dora and r.quant) else "dora" if f.use_dora
-               else "qlora" if r.quant else "lora")
-    log("lora", f"✓ {variant} r{f.lora_r} a{f.lora_alpha} | "
+    log("lora", f"✓ {adapter_desc(f, cfg.sweep)} | "
                 f"trainable {n_tr:,} (~{n_tr*4/1024**2:.0f}MB fp32)")
 
     if r.grad_ckpt:

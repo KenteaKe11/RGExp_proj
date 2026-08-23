@@ -115,13 +115,38 @@ PRESETS = [
     (0, "GPU <22GB", 1, 32, 1, True),
 ]
 
-# §3.2 — bảng biến thể. quant: nền 4-bit NF4. dora: phân rã magnitude/direction.
+# §3.2 — bảng biến thể.
+#   tuner  họ adapter: "lora" (gồm cả DoRA) hay "vera"
+#   quant  nền 4-bit NF4
+#   dora   phân rã magnitude/direction (chỉ có nghĩa khi tuner="lora")
+#
+# VeRA (arxiv 2310.11454): A và B là hai ma trận NGẪU NHIÊN ĐÓNG BĂNG dùng
+# CHUNG cho mọi layer; mỗi layer chỉ học hai vector scale (lambda_d cỡ r,
+# lambda_b cỡ out_features). Cùng rank, trainable ít hơn LoRA hàng chục lần,
+# nên rank phải cao hơn hẳn mới đủ sức biểu diễn -> sweep 256 -> 512 -> 1024
+# (paper dùng rank cỡ trăm–nghìn cho LLM), không phải 8-32 như LoRA/DoRA.
+#
+# KHÔNG có nhánh "qvera": peft chưa có lớp VeRA cho Linear4bit (bitsandbytes);
+# nạp base NF4 rồi gắn VeRA sẽ nổ ở _create_new_module.
 VARIANTS = {
-    "lora": dict(quant=False, dora=False, ranks=(16, 32)),
-    "qlora": dict(quant=True, dora=False, ranks=(16, 32)),
-    "dora": dict(quant=False, dora=True, ranks=(8, 16)),
-    "qdora": dict(quant=True, dora=True, ranks=(8, 16)),
+    "lora": dict(tuner="lora", quant=False, dora=False, ranks=(16, 32)),
+    "qlora": dict(tuner="lora", quant=True, dora=False, ranks=(16, 32)),
+    "dora": dict(tuner="lora", quant=False, dora=True, ranks=(8, 16)),
+    "qdora": dict(tuner="lora", quant=True, dora=True, ranks=(8, 16)),
+    "vera": dict(tuner="vera", quant=False, dora=False, ranks=(256, 512, 1024)),
 }
+
+
+def adapter_desc(f, sweep=None):
+    """Một dòng mô tả adapter, dùng chung cho log / metrics / print.
+
+    LoRA-họ có alpha; VeRA không có alpha mà có d_initial (giá trị khởi tạo
+    của lambda_d) — in nhầm 'a512' cho VeRA là gây hiểu sai khi đọc lại log.
+    """
+    name = sweep.variant if sweep is not None else f.tuner
+    if f.tuner == "vera":
+        return f"{name} r{f.lora_r} d_init {f.vera_d_initial}"
+    return f"{name} r{f.lora_r} a{f.lora_alpha}"
 
 
 def detect_hardware():
@@ -193,12 +218,13 @@ def load_config(path="configs/default.yaml", overrides=None):
     hw = detect_hardware()
     preset = pick_preset(hw.vram_gb)
     fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
+    explicit = {ov.split("=", 1)[0] for ov in (overrides or [])}
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
     rm = read_remote(path)
     if rm.active:
-        _apply_remote(rm, run, {ov.split("=", 1)[0] for ov in (overrides or [])})
+        _apply_remote(rm, run, explicit)
 
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
     if sweep["variant"] not in VARIANTS:
@@ -222,7 +248,21 @@ def load_config(path="configs/default.yaml", overrides=None):
     fixed["processor_kwargs"] = dict(mdl.get("processor_kwargs") or {})
     fixed["lora_r"] = sweep["rank"]
     fixed["lora_alpha"] = sweep["rank"] * fixed["alpha_ratio"]
+    fixed["tuner"] = v["tuner"]
     fixed["use_dora"] = v["dora"]
+    # VeRA: các khoá dưới đây để trống trong yaml = mặc định của peft.VeraConfig
+    # ("các cái khác default"). setdefault để config cũ vẫn nạp được.
+    fixed.setdefault("vera_dropout", 0.0)
+    fixed.setdefault("vera_d_initial", 0.1)
+    fixed.setdefault("vera_projection_prng_key", 0)
+    fixed.setdefault("vera_save_projection", True)
+    # peft chưa có lớp VeRA cho Linear4bit. Biến thể đã quyết định run.quant,
+    # nhưng `--set run.quant=true` thì phải BÁO chứ không im lặng nuốt: người
+    # gõ nó đang tưởng có nhánh 4-bit cho VeRA.
+    if v["tuner"] == "vera" and "run.quant" in explicit and run.get("quant"):
+        raise ValueError("VeRA không chạy trên base 4-bit (peft chưa hỗ trợ "
+                         "Linear4bit) — không có nhánh 'qvera'. Bỏ "
+                         "--set run.quant=true, hoặc dùng qlora/qdora.")
     run["quant"] = v["quant"]
 
     tag = f"{sweep['model']}-{sweep['variant']}-r{sweep['rank']}"
@@ -316,8 +356,7 @@ if __name__ == "__main__":
           f"sm{c.hw.sm[0]}{c.hw.sm[1]} | {c.hw.n_gpu} GPU")
     print(f"Preset  : {c.preset['name']}")
     print(f"Model   : {c.fixed.model_id} | attn={c.fixed.attn_impl}")
-    print(f"Adapter : {'DoRA' if c.fixed.use_dora else 'LoRA'} "
-          f"r{c.fixed.lora_r} a{c.fixed.lora_alpha} | quant={c.run.quant}")
+    print(f"Adapter : {adapter_desc(c.fixed, c.sweep)} | quant={c.run.quant}")
     print(f"Ảnh     : {image_desc(c.fixed)}")
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
           f"{c.run.train_bs * c.run.grad_accum} mẫu/step | "

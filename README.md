@@ -227,18 +227,43 @@ Chuẩn hoá header chịu được lỗi decoder: `Findings::`, `Impimpression:
 
 ---
 
-## 3. LoRA
+## 3. Adapter (LoRA · DoRA · VeRA)
 
 ### 3.1. Cơ sở thiết kế
 
 | Tham số | Căn cứ | Chọn |
 |---|---|---|
-| Rank | rank-stabilization paper: 8–64, cân bằng ở 16–32 | 16 / 32 (LoRA), 8 / 16 (DoRA) |
+| Rank | rank-stabilization paper: 8–64, cân bằng ở 16–32 | 16 / 32 (LoRA), 8 / 16 (DoRA), 256 / 512 / 1024 (VeRA) |
 | Alpha | arxiv 2405.09673: `a=2r` phổ biến; `0.5r`/`0.25r` tốt hơn khi lượng tử hóa | `a = 2r` kể cả QLoRA (theo thực hành công nghiệp) |
 | Biến thể | arxiv 2402.09353: DoRA vượt LoRA ở rank thấp (+22.4% @r4, +37.2% @r8); trên VLM lượng tử hóa, DoRA > LoRA 0.7% | ưu tiên DoRA |
+| VeRA | arxiv 2310.11454: A, B ngẫu nhiên **đóng băng, dùng chung mọi layer**; chỉ học 2 vector scale/layer → trainable ít hơn LoRA ~10× ở cùng chất lượng, nhưng phải bù bằng rank cao | rank 256 → 512 → 1024, các tham số khác để mặc định peft |
 
 Muốn thử `alpha = 0.5r` cho nhánh quantized: `--set fixed.alpha_ratio=0.5` và
 **ghi vào sweep log** vì đó là sai lệch có chủ đích.
+
+**VeRA khác LoRA ở ba chỗ dễ đọc nhầm:**
+
+1. **Không có alpha.** Vai trò đó là `d_initial` (khởi tạo `lambda_d`, mặc định
+   `0.1`). `fixed.alpha_ratio` không ảnh hưởng ô VeRA — log và `metrics.json`
+   in `d_init 0.1` thay vì `a512` cho đúng.
+2. **Rank không so sánh trực tiếp được với LoRA.** VeRA r256 vẫn ít trainable
+   hơn LoRA r16 nhiều lần; cột `vera-r*` đứng riêng trong bảng, không xếp cạnh
+   `lora-r*` như hai giá trị cùng thang.
+3. **Không có nhánh 4-bit.** `peft` chưa có lớp VeRA cho `Linear4bit`, nên
+   không có `qvera`; `--variant vera --set run.quant=true` bị chặn ngay trong
+   `load_config` thay vì nổ sau khi đã tải xong ~9GB weight.
+
+Hai ma trận dùng chung được cấp phát theo chiều LỚN NHẤT trong tập target
+(Gemma3-4b: 10240 của MLP), nên ở `r=1024` chúng chiếm ~84MB fp32 thường trú và
+được ghi vào checkpoint (`vera_save_projection: true`).
+
+**Cạm bẫy khi resume:** `peft` ghi `vera_A`/`vera_B` vào checkpoint nhưng khi
+nạp lại thì **không** dùng đến — nó chỉ kiểm tra hai khoá có mặt, còn ma trận
+thật được sinh lại từ `vera_projection_prng_key`. Cùng máy thì trùng nên không
+ai nhận ra; resume từ Hub sang máy/bản torch khác mà RNG lệch thì `lambda` đã
+học được gắn lên một cặp A, B **khác** — adapter thành vô nghĩa và không có lỗi
+nào nổ ra. `src/model.py::restore_vera_projection` so hai bản lúc resume, lệch
+thì chép ma trận trong checkpoint đè lên và ghi cảnh báo vào log.
 
 ### 3.2. Bảng sweep
 
@@ -251,11 +276,21 @@ Muốn thử `alpha = 0.5r` cho nhánh quantized: `--set fixed.alpha_ratio=0.5` 
 
 Bốn cột in đậm là ưu tiên; Gemma3 trước.
 
+VeRA đứng bảng riêng vì thang rank khác hẳn (và không có nhánh 4-bit):
+
+|  | VeRA r256 | VeRA r512 | VeRA r1024 |
+|---|---|---|---|
+| Gemma3-4b-it | | | |
+| Qwen2.5-VL-3b | | | |
+
+`src.report` gom cả hai bảng vào cùng một `metrics_table.md` (11 cột).
+
 Chạy một ô:
 
 ```bash
 bash scripts/run_local.sh --variant dora --rank 16 --mode both --no-dry-run
 bash scripts/run_local.sh --model qwen25vl --variant qlora --rank 32 --mode both --no-dry-run
+bash scripts/run_local.sh --variant vera --rank 256 --mode both --no-dry-run
 ```
 
 Chạy cả bảng, tuần tự (mặc định `--mode both` nên mỗi ô thu đủ metrics test):
@@ -263,6 +298,7 @@ Chạy cả bảng, tuần tự (mặc định `--mode both` nên mỗi ô thu �
 ```bash
 bash scripts/sweep.sh --no-dry-run
 SWEEP_CELLS="dora:16 qdora:16" bash scripts/sweep.sh --no-dry-run
+SWEEP_CELLS="vera:256 vera:512 vera:1024" bash scripts/sweep.sh --no-dry-run
 SWEEP_MODEL=qwen25vl bash scripts/sweep.sh --no-dry-run
 SWEEP_MODE=train bash scripts/sweep.sh --no-dry-run   # tách khâu test ra sau
 ```
@@ -305,7 +341,8 @@ lệnh hạ.
 3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm75 (T4) vì Gemma 3 được
    train ở bf16 và fp16 sẽ tràn số ngay micro-batch đầu.
 4. **2 epoch** qua train set.
-5. Sweep: `LoRA [16,32]`, `QLoRA [16,32]`, `DoRA [8,16]`, `QDoRA [8,16]`.
+5. Sweep: `LoRA [16,32]`, `QLoRA [16,32]`, `DoRA [8,16]`, `QDoRA [8,16]`,
+   `VeRA [256,512,1024]` (chạy cuối, không có biến thể 4-bit).
 
 ---
 
@@ -530,6 +567,9 @@ So sánh giữa các ô: xem §5.
 | `sm75 không hỗ trợ bf16` | GPU T4 | dự án này cần Ampere trở lên |
 | OOM ở STAGE 0 | batch quá lớn | `--set run.train_bs=1 --set run.grad_accum=32`, rồi `run.grad_ckpt=true`, rồi `--variant qlora` |
 | OOM khi khởi tạo QDoRA | DoRA dequantize base weight | nâng `peft` (cần `LoraRuntimeConfig`), hoặc `--variant qlora` |
+| OOM ở ô `vera:1024` nhưng `vera:256` chạy được | activation `(B, T, r)` của adapter tăng tuyến tính theo `r` | `--set run.grad_ckpt=true`, rồi hạ `train_bs` (giữ `effective_batch=32`) |
+| `VeRA không chạy trên base 4-bit` | `--variant vera` + `run.quant=true` | bỏ `--set run.quant=true`; muốn 4-bit thì dùng `qlora`/`qdora` |
+| `vera` báo `Target module ... not supported` | `peft` quá cũ | `pip install -U 'peft>=0.13'` |
 | `401 gated repo` | token chưa được cấp quyền gemma-3 | xin quyền tại trang model trên HF |
 | `Không thấy ảnh mẫu` | lớp thư mục trong zip khác dự kiến | đặt `--set run.data.image_subdir=<tên>` |
 | Giải nén lại mỗi lần chạy | marker bị xoá | kiểm tra `data/images/.unzip_done` |
@@ -707,6 +747,11 @@ optimizer state, activation và KV cache.
 | 22–24GB | 3090, 4090 | tất cả, batch 2×16 + grad_ckpt |
 | 12–16GB | L4, 4080 | ưu tiên `qlora` / `qdora` |
 | ≤8GB | **RTX 3070**, 3060Ti | **chỉ** `--variant qlora` hoặc `qdora` (NF4 ~2.5GB) — bf16 không lượng tử hoá sẽ OOM ngay STAGE 0 |
+
+`vera` nằm cùng nhóm với `lora` / `dora`: base bf16 không lượng tử hoá, nên máy
+≤12GB không chạy được ô VeRA nào — và không có `qvera` để lùi về. Ở `r=1024`,
+activation `(B, T, 1024)` của adapter cộng thêm nữa; bật `run.grad_ckpt` nếu
+STAGE 0 báo VRAM đỉnh sát trần.
 
 Máy 8GB chạy được nhưng chậm và chỉ hai cột lượng tử hoá; muốn phủ cả bảng §3.2
 thì cần ≥22GB. Cứ chạy STAGE 0 (`--dry-run`) trước — 5 phút và ~vài trăm đồng

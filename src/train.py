@@ -22,10 +22,10 @@ from .data import (build_frames, epoch_order, fetch_sources, load_or_make_splits
                    rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
 from .metrics import run_metrics
-from .config import image_desc, resolve_seq_len
+from .config import adapter_desc, image_desc, resolve_seq_len
 from .model import (build_collate, build_model, build_prompt, count_image_tokens,
-                    forward_loss, load_image, make_loader, to_device,
-                    wrap_images)
+                    forward_loss, load_image, make_loader,
+                    restore_vera_projection, to_device, wrap_images)
 
 DEVICE = torch.device("cuda:0")
 
@@ -67,8 +67,8 @@ def main(argv=None):
     log("gpu", f"{cfg.hw.name} | {cfg.hw.vram_gb:.0f}GB | "
                f"sm{cfg.hw.sm[0]}{cfg.hw.sm[1]} | {cfg.hw.n_gpu} GPU")
     log("sweep", f"ô = {cfg.sweep.tag} | {f.model_id}")
-    log("cfg", f"preset={cfg.preset['name']} quant={r.quant} "
-               f"dora={f.use_dora} ckpt={r.grad_ckpt} | batch "
+    log("cfg", f"preset={cfg.preset['name']} adapter={adapter_desc(f, cfg.sweep)} "
+               f"quant={r.quant} ckpt={r.grad_ckpt} | batch "
                f"{r.train_bs}×{r.grad_accum}={r.train_bs*r.grad_accum} mẫu/step "
                f"| {r.num_epochs} epoch | mode={r.mode} dry_run={r.dry_run}")
     log("cfg", f"ảnh {image_desc(f)}")
@@ -91,7 +91,11 @@ def main(argv=None):
         import wandb
         os.environ["WANDB_SILENT"] = "true"
         wandb.init(project=r.wandb_project, name=r.wandb_run, config={
-            "model": f.model_id, "variant": cfg.sweep.variant, "r": f.lora_r, "alpha": f.lora_alpha, "quant": r.quant,
+            "model": f.model_id, "variant": cfg.sweep.variant,
+            "tuner": f.tuner, "r": f.lora_r,
+            "alpha": None if f.tuner == "vera" else f.lora_alpha,
+            "d_initial": f.vera_d_initial if f.tuner == "vera" else None,
+            "quant": r.quant,
             "gpu": cfg.hw.name, "preset": cfg.preset["name"],
             "attn": f.attn_impl,
             "image_size": f.image_size_model or f.image_size_src,
@@ -267,7 +271,18 @@ def main(argv=None):
         os.makedirs(d, exist_ok=True)
         # get_peft_model_state_dict: chỉ adapter (~31M). model.state_dict()
         # sẽ ghi cả 4.3B param mỗi lần save.
-        model.save_pretrained(d, state_dict=get_peft_model_state_dict(model))
+        #
+        # VeRA là ngoại lệ: save_pretrained() LỌC LẠI state_dict một lần nữa,
+        # mà lần lọc đầu đã cắt hậu tố adapter_name khỏi khoá
+        # ("base_model.vera_A.default" -> "base_model.vera_A"). Lần lọc thứ hai
+        # tìm khoá có hậu tố, không thấy, và nổ:
+        #     ValueError: Model was initialised to not save vera_A and vera_B
+        #     but config now specifies to save projection!
+        # Nên với VeRA để save_pretrained tự lọc (nó cũng chỉ ghi phần adapter).
+        if f.tuner == "vera":
+            model.save_pretrained(d)
+        else:
+            model.save_pretrained(d, state_dict=get_peft_model_state_dict(model))
         torch.save({"optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "torch_rng": torch.get_rng_state()},
@@ -277,8 +292,15 @@ def main(argv=None):
                        "total_steps": total_steps, "n_train": len(df_train),
                        "seed": f.seed, "gpu": cfg.hw.name,
                        "samples_per_step": r.train_bs * r.grad_accum,
-                       "model": f.model_id, "lora_r": f.lora_r,
-                       "lora_alpha": f.lora_alpha, "use_dora": f.use_dora,
+                       "model": f.model_id, "tuner": f.tuner,
+                       "lora_r": f.lora_r,
+                       # VeRA không dùng alpha (chỗ đó là d_initial); ghi cả
+                       # hai để đọc lại train_state.json không phải đoán.
+                       "lora_alpha": (None if f.tuner == "vera"
+                                      else f.lora_alpha),
+                       "vera_d_initial": (f.vera_d_initial
+                                          if f.tuner == "vera" else None),
+                       "use_dora": f.use_dora,
                        "quant": r.quant,
                        "image_size": f.image_size_model or f.image_size_src,
                        "variant": cfg.sweep.variant}, fh,
@@ -330,10 +352,14 @@ def main(argv=None):
         train_done = st["step"] >= total_steps
         from safetensors.torch import load_file
         ad = os.path.join(resume_dir, "adapter_model.safetensors")
-        set_peft_model_state_dict(
-            model, load_file(ad) if os.path.exists(ad)
-            else torch.load(os.path.join(resume_dir, "adapter_model.bin"),
-                            map_location="cpu"))
+        adapter_sd = (load_file(ad) if os.path.exists(ad)
+                      else torch.load(
+                          os.path.join(resume_dir, "adapter_model.bin"),
+                          map_location="cpu"))
+        set_peft_model_state_dict(model, adapter_sd)
+        if f.tuner == "vera":
+            # peft bỏ qua vera_A/vera_B khi nạp — xem docstring hàm này.
+            restore_vera_projection(model, adapter_sd, log, warn)
         op = os.path.join(resume_dir, "optimizer.pt")
         if os.path.exists(op):
             ck = torch.load(op, map_location="cpu")

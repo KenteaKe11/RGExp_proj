@@ -22,7 +22,10 @@ import pandas as pd
 
 # Thứ tự cột trong bảng §3.2. Cột in đậm trong tài liệu = ưu tiên.
 SWEEP_COLUMNS = ["lora-r32", "lora-r16", "qlora-r32", "qlora-r16",
-                 "dora-r16", "dora-r8", "qdora-r16", "qdora-r8"]
+                 "dora-r16", "dora-r8", "qdora-r16", "qdora-r8",
+                 # VeRA: rank cao hơn hẳn vì mỗi layer chỉ học 2 vector scale
+                 # (ma trận A, B ngẫu nhiên đóng băng, dùng chung).
+                 "vera-r256", "vera-r512", "vera-r1024"]
 MODEL_ROWS = ["gemma3", "qwen25vl"]
 
 # Metric chính hiển thị trong bảng tóm tắt; metrics_full.csv giữ đủ tất cả.
