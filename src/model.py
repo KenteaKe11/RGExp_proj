@@ -151,6 +151,49 @@ def restore_vera_projection(model, adapter_sd, log, warn, adapter="default"):
                          f"lệch) — đã chép ma trận trong ckpt đè lên.")
 
 
+def align_vera_projection_dtype(model):
+    """Ép vera_A/vera_B (buffer, đóng băng, dùng chung) CÙNG dtype với lambda_d.
+
+    peft/tuners/vera/layer.py::forward:
+
+        x = x.to(lambda_d.dtype)
+        result = result + lambda_b * F.linear(
+            lambda_d * F.linear(dropout(x), sliced_A), sliced_B)
+
+    `sliced_A/B` cắt ra từ vera_A/vera_B — hai thứ này là BUFFER chứ không phải
+    parameter, nên mọi vòng lặp kiểu `for p in model.parameters(): p.data.to(...)`
+    đều bỏ sót chúng. Đổi dtype của lambda mà quên A/B là:
+
+        RuntimeError: expected mat1 and mat2 to have the same dtype,
+                      but got: c10::BFloat16 != float
+
+    A/B nằm trong MỘT BufferDict dùng chung cho mọi layer (layer chỉ giữ tham
+    chiếu), nên sửa ở gốc là cả 238 layer cùng đổi. Trả về danh sách mô tả các
+    thay đổi đã làm (rỗng = vốn đã khớp, hoặc không phải nhánh VeRA).
+    """
+    target = None
+    for n, p in model.named_parameters():
+        if "vera_lambda_d" in n:
+            target = p.dtype
+            break
+    if target is None:                      # không phải VeRA -> không có gì để làm
+        return []
+
+    changed, seen = [], set()
+    for mod in model.modules():
+        for name in ("vera_A", "vera_B"):
+            bd = getattr(mod, name, None)
+            if bd is None or id(bd) in seen or not hasattr(bd, "keys"):
+                continue
+            seen.add(id(bd))
+            for key in list(bd.keys()):
+                t = bd[key]
+                if t.dtype != target:
+                    bd[key] = t.to(target)
+                    changed.append(f"{name}[{key}] {t.dtype} -> {target}")
+    return changed
+
+
 def build_model(cfg, hf_token, log):
     from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model

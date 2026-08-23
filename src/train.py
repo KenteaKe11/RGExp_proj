@@ -23,9 +23,10 @@ from .data import (build_frames, epoch_order, fetch_sources, load_or_make_splits
 from .guard import build_validator, normalize_headers, sanity_check
 from .metrics import run_metrics
 from .config import adapter_desc, image_desc, resolve_seq_len
-from .model import (build_collate, build_model, build_prompt, count_image_tokens,
-                    forward_loss, load_image, make_loader,
-                    restore_vera_projection, to_device, wrap_images)
+from .model import (align_vera_projection_dtype, build_collate, build_model,
+                    build_prompt, count_image_tokens, forward_loss, load_image,
+                    make_loader, restore_vera_projection, to_device,
+                    wrap_images)
 
 DEVICE = torch.device("cuda:0")
 
@@ -576,14 +577,42 @@ def main(argv=None):
     # từ cache là bf16 -> SDPA nổ "Expected query, key, and value to have the
     # same dtype". Infer chạy @torch.no_grad nên master weight fp32 không còn
     # tác dụng: ép hết về compute_dtype.
-    # CHÚ Ý: chỉ ép parameter, KHÔNG động vào buffer — inv_freq của rotary phải
-    # giữ fp32, hạ xuống bf16 là hỏng position encoding.
-    stale = [p for p in model.parameters() if p.dtype == torch.float32]
+    #
+    # CHÚ Ý 1: chỉ ép parameter, KHÔNG động vào buffer — inv_freq của rotary phải
+    #   giữ fp32, hạ xuống bf16 là hỏng position encoding.
+    # CHÚ Ý 2: KHÔNG ép param của ADAPTER (lora_*/vera_*). Lớp adapter của peft
+    #   tự đưa x về dtype của trọng số adapter rồi mới trả kết quả về
+    #   previous_dtype, nên adapter ở fp32 KHÔNG làm lệch dtype đi vào KV-cache.
+    #   Ngược lại, hạ vera_lambda_d/lambda_b xuống bf16 trong khi ma trận chung
+    #   vera_A/vera_B là BUFFER (vòng lặp trên bỏ qua, vẫn fp32) thì
+    #   peft/tuners/vera/layer.py::forward làm:
+    #       x = x.to(lambda_d.dtype)                      -> bf16
+    #       F.linear(dropout(x), sliced_A)                -> bf16 @ fp32
+    #   và nổ ngay ở q_proj layer 0:
+    #       RuntimeError: expected mat1 and mat2 to have the same dtype,
+    #                     but got: c10::BFloat16 != float
+    #   — sau khi train đã xong, mất cả tiếng GPU. LoRA/DoRA cũng cùng dạng
+    #   (lora_A/B là param nên tự đồng bộ, nhưng để nguyên fp32 vẫn đúng).
+    adapter_tags = ("lora_", "vera_", "loha_", "lokr_", "adalora_", "dora_")
+    is_adapter = lambda n: any(t in n for t in adapter_tags)   # noqa: E731
+    stale = [(n, p) for n, p in model.named_parameters()
+             if p.dtype == torch.float32 and not is_adapter(n)]
     if stale:
-        for p in stale:
+        for _, p in stale:
             p.data = p.data.to(f.compute_dtype)
-        log("infer", f"ép {len(stale)} param fp32 -> {f.compute_dtype} trước "
-                     f"generate (đồng bộ dtype với KV-cache)")
+        log("infer", f"ép {len(stale)} param base fp32 -> {f.compute_dtype} "
+                     f"trước generate (đồng bộ dtype với KV-cache)")
+    kept = [n for n, p in model.named_parameters()
+            if p.dtype == torch.float32 and is_adapter(n)]
+    if kept:
+        log("infer", f"giữ {len(kept)} param adapter ở fp32 (peft tự cast "
+                     f"trong forward, vd {kept[0]})")
+
+    # Chốt chặn: dù dtype của lambda có bị đổi ở đâu đó, ma trận chung A/B của
+    # VeRA phải CÙNG dtype với lambda_d thì F.linear mới chạy.
+    aligned = align_vera_projection_dtype(model)
+    for msg in aligned:
+        warn("vera", f"đồng bộ dtype trước generate: {msg}")
 
     @torch.no_grad()
     def generate_batch(paths, temperature=None, rep_penalty=None):
