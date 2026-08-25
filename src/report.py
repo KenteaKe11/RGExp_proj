@@ -1,13 +1,15 @@
-"""Gom kết quả các ô sweep thành bảng so sánh.
+"""Gom kết quả các ô sweep Phase 1 thành bảng so sánh.
 
 Đọc outputs/<tag>/metrics.json và outputs/<tag>/reports.csv của mọi ô đã chạy,
 xuất ra:
 
   outputs/_summary/metrics_full.csv     mọi metric × mọi ô (dạng dài)
-  outputs/_summary/metrics_table.md     bảng §3.2 (model × biến thể)
+  outputs/_summary/metrics_table.md     bảng biến thể × n_block
+  outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ (so ngang
+                                        ba biến thể ở cùng ngân sách)
   outputs/_summary/gen_text.csv         gen_text side-by-side theo img_rel
   outputs/_summary/gen_text.md          bản dễ đọc, N mẫu đầu
-  outputs/_summary/guard_impact.md      raw vs post cho từng ô
+  outputs/_summary/run_health.md        tiến trình / tốc độ / VRAM / lỗi
 
 Chạy:  python -m src.report            (hoặc bash scripts/collect.sh)
 """
@@ -20,25 +22,31 @@ import os
 
 import pandas as pd
 
-# Thứ tự cột trong bảng §3.2. Cột in đậm trong tài liệu = ưu tiên.
-SWEEP_COLUMNS = ["lora-r32", "lora-r16", "qlora-r32", "qlora-r16",
-                 "dora-r16", "dora-r8", "qdora-r16", "qdora-r8",
-                 # VeRA: rank cao hơn hẳn vì mỗi layer chỉ học 2 vector scale
-                 # (ma trận A, B ngẫu nhiên đóng băng, dùng chung).
-                 "vera-r256", "vera-r512", "vera-r1024"]
-MODEL_ROWS = ["gemma3", "qwen25vl"]
+# Dải n_block của từng biến thể (khớp src/config.py SWEEP_BLOCKS).
+SWEEP_BLOCKS = {
+    "brm": (10, 15, 20, 25, 30, 35, 40, 45),
+    "mbrf": (2, 3, 4, 5, 6, 7, 8, 9),
+    "gslf": (1, 2, 3, 4, 5, 6),
+}
+VARIANT_ROWS = ["brm", "mbrf", "gslf"]
 
 # Metric chính hiển thị trong bảng tóm tắt; metrics_full.csv giữ đủ tất cả.
-HEADLINE = ["corpus_bleu", "bleu_1", "bleu_4", "rouge1_f1", "rouge2_f1",
-            "rougeL_f1", "bertscore_f1"]
+HEADLINE = ["corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
+            "rouge1_f1", "rouge2_f1", "rougeL_f1",
+            "bertscore_precision", "bertscore_recall", "bertscore_f1"]
+# Policy đang TẮT -> bảng chấm trên raw_output.
+DEFAULT_BLOCK = "raw"
 
 
 def parse_tag(tag):
-    """gemma3-dora-r16 -> ('gemma3', 'dora', 16)"""
+    """gemma3-brm-n20 -> ('gemma3', 'brm', 20)"""
     parts = tag.split("-")
-    if len(parts) < 3 or not parts[-1].startswith("r"):
+    if len(parts) < 3 or not parts[-1].startswith("n"):
         return None
-    return parts[0], "-".join(parts[1:-1]), int(parts[-1][1:])
+    try:
+        return parts[0], "-".join(parts[1:-1]), int(parts[-1][1:])
+    except ValueError:
+        return None
 
 
 def collect_cells(out_dir):
@@ -49,13 +57,13 @@ def collect_cells(out_dir):
         parsed = parse_tag(tag)
         if parsed is None:
             continue
-        model, variant, rank = parsed
+        model, variant, n_block = parsed
         with open(mpath) as f:
             m = json.load(f)
         rpath = os.path.join(os.path.dirname(mpath), "reports.csv")
         cells.append({
-            "tag": tag, "model": model, "variant": variant, "rank": rank,
-            "metrics": m,
+            "tag": tag, "model": model, "variant": variant,
+            "n_block": n_block, "metrics": m,
             "reports": rpath if os.path.exists(rpath) else None,
         })
     return cells
@@ -73,53 +81,99 @@ def build_metrics_full(cells):
     for c in cells:
         m = c["metrics"]
         meta = m.get("meta", {})
+        base = {"tag": c["tag"], "model": c["model"], "variant": c["variant"],
+                "n_block": c["n_block"], "n_samples": meta.get("n_samples"),
+                "train_step": meta.get("train_step"), "gpu": meta.get("gpu"),
+                "total_params": _total_params(c),
+                "max_seq_len": meta.get("max_seq_len")}
         for block in ("raw", "post_policy", "delta_post_minus_raw"):
             for k, v in m.get(block, {}).items():
-                rows.append({
-                    "tag": c["tag"], "model": c["model"],
-                    "variant": c["variant"], "rank": c["rank"],
-                    "block": block, "metric": k, "value": v,
-                    "n_samples": meta.get("n_samples"),
-                    "train_step": meta.get("train_step"),
-                    "gpu": meta.get("gpu"),
-                    "max_seq_len": meta.get("max_seq_len"),
-                })
+                rows.append({**base, "block": block, "metric": k, "value": v})
         for k, v in meta.items():
             if isinstance(v, (int, float)):
-                rows.append({
-                    "tag": c["tag"], "model": c["model"],
-                    "variant": c["variant"], "rank": c["rank"],
-                    "block": "meta", "metric": k, "value": v,
-                    "n_samples": meta.get("n_samples"),
-                    "train_step": meta.get("train_step"),
-                    "gpu": meta.get("gpu"),
-                    "max_seq_len": meta.get("max_seq_len"),
-                })
+                rows.append({**base, "block": "meta", "metric": k, "value": v})
     return pd.DataFrame(rows)
 
 
+def _total_params(cell):
+    """Tổng tham số trainable của ô — để vẽ metric theo ngân sách tham số."""
+    try:
+        from .router import estimate_params
+    except ImportError:                     # chạy report ngoài package
+        return None
+    meta = cell["metrics"].get("meta", {})
+    return estimate_params(cell["variant"], cell["n_block"],
+                           int(meta.get("n_expert", 4)))["total"]
+
+
 # ─────────────────────────── metrics_table.md ────────────────────────────────
-def build_metrics_table(cells, block="post_policy"):
-    """Bảng §3.2: hàng = model, cột = biến thể-rank, ô = các metric chính."""
-    lut = {(c["model"], f"{c['variant']}-r{c['rank']}"): c["metrics"]
-           for c in cells}
+def build_metrics_table(cells, block=DEFAULT_BLOCK):
+    """Hàng = biến thể, cột = n_block, ô = giá trị metric."""
+    lut = {(c["variant"], c["n_block"]): c["metrics"] for c in cells}
     lines = []
     for metric in HEADLINE:
-        # Bỏ qua metric không ô nào có (vd bertscore khi use_bertscore=false)
         if not any(metric in m.get(block, {}) for m in lut.values()):
             continue
         lines.append(f"\n### {metric}  ({block})\n")
-        lines.append("|  | " + " | ".join(SWEEP_COLUMNS) + " |")
-        lines.append("|---|" + "---|" * len(SWEEP_COLUMNS))
-        for model in MODEL_ROWS:
-            cells_txt = []
-            for col in SWEEP_COLUMNS:
-                m = lut.get((model, col))
+        widest = max(len(v) for v in SWEEP_BLOCKS.values())
+        lines.append("| biến thể | " + " | ".join(
+            f"n{i+1}" for i in range(widest)) + " |")
+        lines.append("|---|" + "---|" * widest)
+        for variant in VARIANT_ROWS:
+            txt = []
+            for n in SWEEP_BLOCKS[variant]:
+                m = lut.get((variant, n))
                 v = m.get(block, {}).get(metric) if m else None
-                cells_txt.append(f"{v:.4f}" if isinstance(v, (int, float))
-                                 else "—")
-            lines.append(f"| {model} | " + " | ".join(cells_txt) + " |")
+                txt.append(f"n{n}: {v:.4f}" if isinstance(v, (int, float))
+                           else f"n{n}: —")
+            txt += ["—"] * (widest - len(txt))
+            lines.append(f"| {variant} | " + " | ".join(txt) + " |")
     return "\n".join(lines)
+
+
+# ─────────────────────────── param_curve.md ──────────────────────────────────
+def build_param_curve(cells, block=DEFAULT_BLOCK,
+                      metrics=("corpus_bleu", "rougeL_f1", "bertscore_f1")):
+    """Metric theo TỔNG THAM SỐ — câu hỏi thật của Phase 1.
+
+    Bảng metrics_table so theo n_block, nhưng n_block của ba biến thể không
+    cùng giá (1 GSLF ≈ 7 BRM). Bảng này xếp mọi ô theo tham số nên đọc được
+    "cùng ngân sách 70M thì kiến trúc nào cho điểm cao hơn".
+    """
+    rows = sorted(cells, key=lambda c: (_total_params(c) or 0))
+    head = ["| ô | tham số | " + " | ".join(metrics) + " | 7-check pass |",
+            "|---|---|" + "---|" * (len(metrics) + 1)]
+    for c in rows:
+        m = c["metrics"]
+        meta = m.get("meta", {})
+        vals = []
+        for k in metrics:
+            v = m.get(block, {}).get(k)
+            vals.append(f"{v:.4f}" if isinstance(v, (int, float)) else "—")
+        p = _total_params(c)
+        n, ok = meta.get("n_samples") or 0, meta.get("n_guard_passed_raw")
+        head.append(f"| {c['tag']} | {p/1e6:.1f}M | " + " | ".join(vals)
+                    + f" | {ok if ok is not None else '—'}"
+                    + (f"/{n}" if n else "") + " |")
+    return "\n".join(head)
+
+
+def build_expert_share(cells):
+    """Router có dùng đủ E expert không, hay đã sập về một cái?"""
+    lines = ["| ô | E | top-k | tỉ lệ chọn từng expert | max |",
+             "|---|---|---|---|---|"]
+    for c in sorted(cells, key=lambda x: x["tag"]):
+        meta = c["metrics"].get("meta", {})
+        share = meta.get("expert_share")
+        if not share:
+            continue
+        lines.append(
+            f"| {c['tag']} | {meta.get('n_expert', '—')} | "
+            f"{meta.get('top_k', '—')} | "
+            + " ".join(f"{v:.2f}" for v in share)
+            + f" | {meta.get('expert_share_max', max(share)):.2f} |")
+    return "\n".join(lines) if len(lines) > 2 else \
+        "_Chưa ô nào ghi expert_share (chạy lại phần infer để có)._"
 
 
 # ────────────────────────────── gen_text ─────────────────────────────────────
@@ -176,25 +230,30 @@ def build_gen_text(cells, key_col="img_rel", limit_md=20):
     return out, "\n".join(md), None
 
 
-# ────────────────────────────── guard impact ─────────────────────────────────
+# ────────────────────────────── guard / policy ───────────────────────────────
 def build_guard_impact(cells):
-    """Raw vs post cho từng ô — đo ảnh hưởng thật của 7-check (§2)."""
-    lines = ["| ô | n | guard pass raw | guard pass post | mẫu bị đổi | "
-             "lần thử TB | ΔBLEU | ΔROUGE-L |",
-             "|---|---|---|---|---|---|---|---|"]
+    """Tỉ lệ qua 7-check của từng ô.
+
+    Policy đang TẮT nên 7-check chỉ ĐO chứ không sửa: cột "pass raw" là tỉ lệ
+    output tự nó đã đúng khuôn. Khi bật lại policy, hai cột post/Δ mới có số.
+    """
+    lines = ["| ô | n | 7-check pass (raw) | policy | mẫu bị đổi | "
+             "pass (post) | ΔBLEU |",
+             "|---|---|---|---|---|---|---|"]
     for c in sorted(cells, key=lambda x: x["tag"]):
         m, meta = c["metrics"], c["metrics"].get("meta", {})
         d = m.get("delta_post_minus_raw", {})
         n = meta.get("n_samples", 0) or 0
         pr, pp = meta.get("n_guard_passed_raw"), meta.get("n_guard_passed_post")
+        on = meta.get("use_policy")
+        dbleu = d.get("corpus_bleu")
         lines.append(
             f"| {c['tag']} | {n} | "
             f"{pr}{f' ({pr/n*100:.0f}%)' if pr is not None and n else ''} | "
-            f"{pp}{f' ({pp/n*100:.0f}%)' if pp is not None and n else ''} | "
-            f"{meta.get('n_changed_by_guard', '—')} | "
-            f"{meta.get('avg_attempts', float('nan')):.2f} | "
-            f"{d.get('corpus_bleu', float('nan')):+.4f} | "
-            f"{d.get('rougeL_f1', float('nan')):+.4f} |")
+            f"{'BẬT' if on else 'tắt'} | "
+            f"{meta.get('n_changed_by_policy', '—')} | "
+            f"{pp if pp is not None else '—'} | "
+            f"{f'{dbleu:+.4f}' if isinstance(dbleu, (int, float)) else '—'} |")
     return "\n".join(lines)
 
 
@@ -284,21 +343,31 @@ def main(argv=None):
     full.to_csv(p, index=False)
     print(f"✓ {p}  ({len(full)} hàng)")
 
-    # 2. bảng §3.2
-    tbl = ("# Bảng sweep §3.2\n\n"
-           f"Nguồn: `{args.out_dir}/*/metrics.json`\n"
-           + build_metrics_table(cells, "post_policy")
-           + "\n\n---\n"
-           + build_metrics_table(cells, "raw"))
+    # 2. bảng biến thể × n_block
+    tbl = ("# Bảng sweep Phase 1 — Recombinator × n_block\n\n"
+           f"Nguồn: `{args.out_dir}/*/metrics.json` | chấm trên `raw_output` "
+           f"(policy tắt)\n"
+           + build_metrics_table(cells, DEFAULT_BLOCK))
+    if any("post_policy" in c["metrics"] for c in cells):
+        tbl += "\n\n---\n" + build_metrics_table(cells, "post_policy")
     p = os.path.join(summary, "metrics_table.md")
     with open(p, "w") as f:
         f.write(tbl)
     print(f"✓ {p}")
 
-    # 3. guard impact
+    # 3. metric theo ngân sách tham số + phân bố expert
+    p = os.path.join(summary, "param_curve.md")
+    with open(p, "w") as f:
+        f.write("# Metric theo tổng tham số\n\n"
+                + build_param_curve(cells)
+                + "\n\n# Phân bố expert (router có dùng đủ E không)\n\n"
+                + build_expert_share(cells) + "\n")
+    print(f"✓ {p}")
+
+    # 4. guard / policy
     p = os.path.join(summary, "guard_impact.md")
     with open(p, "w") as f:
-        f.write("# Ảnh hưởng của guard 7-check (§2)\n\n"
+        f.write("# 7-check (§2) — đang ở chế độ ĐO, không sửa\n\n"
                 + build_guard_impact(cells) + "\n")
     print(f"✓ {p}")
 
@@ -323,8 +392,12 @@ def main(argv=None):
         print(f"✓ {p}")
 
     # In nhanh bảng chính ra terminal
-    print("\n" + build_metrics_table(cells, "post_policy"))
-    print("\n\n# Guard impact\n")
+    print("\n" + build_metrics_table(cells, DEFAULT_BLOCK))
+    print("\n\n# Theo tổng tham số\n")
+    print(build_param_curve(cells))
+    print("\n\n# Phân bố expert\n")
+    print(build_expert_share(cells))
+    print("\n\n# 7-check\n")
     print(build_guard_impact(cells))
     print("\n\n# Sức khoẻ run\n")
     print(build_run_health(args.out_dir, cells))

@@ -7,8 +7,8 @@
 #
 #   bash scripts/run_local.sh                          # STAGE 0 rồi dừng
 #   bash scripts/run_local.sh --no-dry-run             # train thật
-#   bash scripts/run_local.sh --variant qlora --rank 32 --no-dry-run
-#   bash scripts/run_local.sh --model qwen25vl --variant lora --rank 16
+#   bash scripts/run_local.sh --variant gslf --n-block 3 --no-dry-run
+#   bash scripts/run_local.sh --variant mbrf --n-block 4 --mode both
 #   bash scripts/run_local.sh --mode test              # chỉ chấm điểm ckpt
 #
 # Mọi tham số được chuyển thẳng cho src.train. Xem `--help` để biết đủ.

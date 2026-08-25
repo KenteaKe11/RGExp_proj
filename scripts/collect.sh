@@ -9,10 +9,12 @@
 #
 # Sinh ra outputs/_summary/:
 #   metrics_full.csv    mọi metric × mọi ô (dạng dài, để pivot)
-#   metrics_table.md    bảng §3.2 (model × biến thể), raw và post
+#   metrics_table.md    bảng biến thể × n_block
+#   param_curve.md      mọi ô xếp theo TỔNG THAM SỐ + phân bố expert
 #   gen_text.csv        gen_text side-by-side theo img_rel
 #   gen_text.md         N mẫu đầu, dễ đọc
-#   guard_impact.md     raw vs post, pass rate, số lần thử
+#   guard_impact.md     tỉ lệ qua 7-check từng ô (policy đang tắt)
+#   run_health.md       step cuối, s/step, VRAM đỉnh, warn/error
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 

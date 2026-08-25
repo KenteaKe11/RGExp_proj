@@ -2,6 +2,10 @@
 
 `python -m src.config` in ra cấu hình đã giải quyết mà không nạp model —
 dùng để kiểm tra trước khi chạy thật.
+
+PHASE 1 của sweep (xem README §3): adapter đã CHỐT là QDoRA r8, số expert và
+top-k cố định (4 / 2). Biến duy nhất còn quét là cặp (biến thể Recombinator,
+số block) — vì vậy `sweep` ở đây chỉ còn hai trường: `variant` và `n_block`.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import sys
 from types import SimpleNamespace
 
 import yaml
+
+from .router import BLOCK_RATIO, VARIANTS as ROUTER_VARIANTS, estimate_params
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
 # Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
@@ -105,48 +111,46 @@ def _apply_remote(rm, run, explicit):
 
 
 # ─────────────────────────── Preset theo VRAM ────────────────────────────────
-# Mọi preset giữ effective_batch = train_bs × grad_accum = 32 (§3.2).
-# Thận trọng; STAGE 0 in VRAM đỉnh để bạn nới ra nếu còn dư.
+# Mọi preset giữ effective_batch = train_bs × grad_accum = 32.
+# STAGE 0 in VRAM đỉnh để bạn nới ra nếu còn dư.
+#
+# Thấp hơn preset của sweep adapter cũ MỘT BẬC: MoE giữ E bản delta cùng lúc và
+# QDoRA phải dequantize base weight trong forward, nên đỉnh VRAM cao hơn LoRA
+# thường ở cùng batch.
 PRESETS = [
     # (VRAM tối thiểu, tên, train_bs, grad_accum, infer_bs, grad_ckpt)
-    (70, "A100-80 / H100", 8, 4, 8, False),
-    (38, "A100-40 / L40S", 4, 8, 4, False),
+    (70, "A100-80 / H100", 8, 4, 8, True),
+    (38, "A100-40 / L40S", 4, 8, 4, True),
     (22, "RTX 3090/4090", 2, 16, 2, True),
     (0, "GPU <22GB", 1, 32, 1, True),
 ]
 
-# §3.2 — bảng biến thể.
-#   tuner  họ adapter: "lora" (gồm cả DoRA) hay "vera"
-#   quant  nền 4-bit NF4
-#   dora   phân rã magnitude/direction (chỉ có nghĩa khi tuner="lora")
-#
-# VeRA (arxiv 2310.11454): A và B là hai ma trận NGẪU NHIÊN ĐÓNG BĂNG dùng
-# CHUNG cho mọi layer; mỗi layer chỉ học hai vector scale (lambda_d cỡ r,
-# lambda_b cỡ out_features). Cùng rank, trainable ít hơn LoRA hàng chục lần,
-# nên rank phải cao hơn hẳn mới đủ sức biểu diễn -> sweep 256 -> 512 -> 1024
-# (paper dùng rank cỡ trăm–nghìn cho LLM), không phải 8-32 như LoRA/DoRA.
-#
-# KHÔNG có nhánh "qvera": peft chưa có lớp VeRA cho Linear4bit (bitsandbytes);
-# nạp base NF4 rồi gắn VeRA sẽ nổ ở _create_new_module.
-VARIANTS = {
-    "lora": dict(tuner="lora", quant=False, dora=False, ranks=(16, 32)),
-    "qlora": dict(tuner="lora", quant=True, dora=False, ranks=(16, 32)),
-    "dora": dict(tuner="lora", quant=False, dora=True, ranks=(8, 16)),
-    "qdora": dict(tuner="lora", quant=True, dora=True, ranks=(8, 16)),
-    "vera": dict(tuner="vera", quant=False, dora=False, ranks=(256, 512, 1024)),
+# ── Ô sweep Phase 1: biến thể Recombinator × số block ────────────────────────
+# n_block của mỗi biến thể được chọn sao cho TỔNG THAM SỐ của ba biến thể phủ
+# cùng một dải (~67M → ~72M) — có thế mới so được "cùng ngân sách tham số thì
+# kiến trúc nào hơn". Tỉ lệ giá một block: 1 GSLF ≈ 7 BRM ≈ 1.4 MBRF.
+SWEEP_BLOCKS = {
+    "brm": (10, 15, 20, 25, 30, 35, 40, 45),
+    "mbrf": (2, 3, 4, 5, 6, 7, 8, 9),
+    "gslf": (1, 2, 3, 4, 5, 6),
 }
+assert set(SWEEP_BLOCKS) == set(ROUTER_VARIANTS), "lệch danh sách biến thể"
+
+
+def variant_desc(cfg):
+    """Một dòng mô tả ô sweep, dùng chung cho log / metrics / print."""
+    s, f = cfg.sweep, cfg.fixed
+    est = estimate_params(s.variant, s.n_block, f.n_expert)
+    return (f"{s.variant}×{s.n_block} block "
+            f"(1 block ≈ {BLOCK_RATIO[s.variant]:.0f} BRM) | "
+            f"router {est['router'] / 1e6:.2f}M + "
+            f"{f.n_expert} expert QDoRA r{f.lora_r} top-{f.top_k} "
+            f"≈ {est['total'] / 1e6:.1f}M")
 
 
 def adapter_desc(f, sweep=None):
-    """Một dòng mô tả adapter, dùng chung cho log / metrics / print.
-
-    LoRA-họ có alpha; VeRA không có alpha mà có d_initial (giá trị khởi tạo
-    của lambda_d) — in nhầm 'a512' cho VeRA là gây hiểu sai khi đọc lại log.
-    """
-    name = sweep.variant if sweep is not None else f.tuner
-    if f.tuner == "vera":
-        return f"{name} r{f.lora_r} d_init {f.vera_d_initial}"
-    return f"{name} r{f.lora_r} a{f.lora_alpha}"
+    """Adapter đã CHỐT ở Phase này — giữ hàm để log/metrics gọi được như cũ."""
+    return f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E top-{f.top_k}"
 
 
 def detect_hardware():
@@ -200,7 +204,7 @@ def image_desc(f):
 
 
 def _deep_set(d, dotted, value):
-    """--set sweep.rank=8  ->  d['sweep']['rank'] = 8"""
+    """--set sweep.n_block=20  ->  d['sweep']['n_block'] = 20"""
     keys = dotted.split(".")
     for k in keys[:-1]:
         d = d.setdefault(k, {})
@@ -227,14 +231,18 @@ def load_config(path="configs/default.yaml", overrides=None):
         _apply_remote(rm, run, explicit)
 
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
-    if sweep["variant"] not in VARIANTS:
+    if sweep["variant"] not in SWEEP_BLOCKS:
         raise ValueError(f"variant lạ: {sweep['variant']} "
-                         f"(chọn: {list(VARIANTS)})")
-    v = VARIANTS[sweep["variant"]]
-    if sweep["rank"] not in v["ranks"]:
-        raise ValueError(
-            f"§3.2: {sweep['variant']} chỉ sweep rank {v['ranks']}, "
-            f"nhận {sweep['rank']}. Muốn rank khác thì ghi vào sweep log.")
+                         f"(chọn: {list(SWEEP_BLOCKS)})")
+    n_block = int(sweep["n_block"])
+    if n_block not in SWEEP_BLOCKS[sweep["variant"]]:
+        # Không chặn: dải block là gợi ý để ba biến thể so được với nhau, không
+        # phải luật. Nhưng phải BÁO, vì ô ngoài bảng sẽ không có ô đối chứng
+        # cùng ngân sách tham số ở hai biến thể kia.
+        print(f"⚠ sweep: {sweep['variant']}-n{n_block} nằm ngoài bảng "
+              f"{SWEEP_BLOCKS[sweep['variant']]} — ô này không có đối chứng "
+              f"cùng lượng tham số ở biến thể khác.")
+    sweep["n_block"] = n_block
     if sweep["model"] not in raw["models"]:
         raise ValueError(f"model lạ: {sweep['model']}")
 
@@ -246,26 +254,16 @@ def load_config(path="configs/default.yaml", overrides=None):
     # thẳng ảnh gốc. image_size = null -> không resize, processor tự lo.
     fixed["image_size_model"] = mdl.get("image_size")
     fixed["processor_kwargs"] = dict(mdl.get("processor_kwargs") or {})
-    fixed["lora_r"] = sweep["rank"]
-    fixed["lora_alpha"] = sweep["rank"] * fixed["alpha_ratio"]
-    fixed["tuner"] = v["tuner"]
-    fixed["use_dora"] = v["dora"]
-    # VeRA: các khoá dưới đây để trống trong yaml = mặc định của peft.VeraConfig
-    # ("các cái khác default"). setdefault để config cũ vẫn nạp được.
-    fixed.setdefault("vera_dropout", 0.0)
-    fixed.setdefault("vera_d_initial", 0.1)
-    fixed.setdefault("vera_projection_prng_key", 0)
-    fixed.setdefault("vera_save_projection", True)
-    # peft chưa có lớp VeRA cho Linear4bit. Biến thể đã quyết định run.quant,
-    # nhưng `--set run.quant=true` thì phải BÁO chứ không im lặng nuốt: người
-    # gõ nó đang tưởng có nhánh 4-bit cho VeRA.
-    if v["tuner"] == "vera" and "run.quant" in explicit and run.get("quant"):
-        raise ValueError("VeRA không chạy trên base 4-bit (peft chưa hỗ trợ "
-                         "Linear4bit) — không có nhánh 'qvera'. Bỏ "
-                         "--set run.quant=true, hoặc dùng qlora/qdora.")
-    run["quant"] = v["quant"]
+    # d_enc thật lấy từ config của model lúc build (hidden_size); giá trị ở đây
+    # chỉ để in bảng tham số trước khi nạp weight.
+    fixed["d_enc"] = int(mdl.get("hidden_size", 2560))
+    fixed["lora_alpha"] = fixed["lora_r"] * fixed["alpha_ratio"]
+    # Adapter đã chốt: QDoRA = LoRA + DoRA + base NF4. Không còn nhánh nào khác
+    # trong Phase này, nên khoá cứng thay vì để config đổi ngầm.
+    fixed["use_dora"] = True
+    run["quant"] = True
 
-    tag = f"{sweep['model']}-{sweep['variant']}-r{sweep['rank']}"
+    tag = f"{sweep['model']}-{sweep['variant']}-n{n_block}"
     if run.get("hub_repo") is None:
         run["hub_repo"] = f"RGExp123/mimic-cxr-{tag}"
     if run.get("wandb_run") is None:
@@ -293,9 +291,37 @@ def load_config(path="configs/default.yaml", overrides=None):
         sweep=SimpleNamespace(**sweep, tag=tag),
         hw=hw, preset=preset, remote=rm,
     )
+    _check_phases(cfg)
     for d in (cfg.run.out_dir, cfg.run.ckpt_dir):
         os.makedirs(d, exist_ok=True)
     return cfg
+
+
+def _check_phases(cfg):
+    """§1.7 — lịch hai phase phải chia hết cho effective batch.
+
+    Lệch một chút thì DataLoader drop_last cắt mất phần dư và số mẫu thật sự
+    dùng khác con số ghi trong tài liệu — im lặng nhưng làm hỏng tính so sánh
+    giữa các ô.
+    """
+    r = cfg.run
+    eff = r.train_bs * r.grad_accum
+    for name in ("phase1_samples", "phase2_samples"):
+        n = getattr(r, name)
+        if n % eff:
+            print(f"⚠ {name}={n} không chia hết cho effective batch {eff} "
+                  f"-> dùng {n // eff * eff} mẫu ({n // eff} step)")
+    if r.phase1_samples // eff < 1 or r.phase2_samples // eff < 1:
+        raise ValueError(
+            f"effective batch {eff} lớn hơn số mẫu của một phase "
+            f"({r.phase1_samples}/{r.phase2_samples}) — không đủ một step.")
+
+
+def phase_steps(cfg, phase):
+    """Số optimizer step của một phase, suy từ số mẫu (§1.7)."""
+    r = cfg.run
+    n = r.phase1_samples if phase == 1 else r.phase2_samples
+    return n // (r.train_bs * r.grad_accum)
 
 
 def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
@@ -317,15 +343,17 @@ def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
 
 def build_argparser():
     ap = argparse.ArgumentParser(
-        description="MIMIC-CXR VLM fine-tuning sweep (§3.2)")
+        description="MIMIC-CXR MoE-LoRA — sweep Phase 1 (Recombinator × n_block)")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--set", dest="overrides", action="append", default=[],
                     metavar="KEY=VALUE",
-                    help="Ghi đè config, vd: --set sweep.rank=8")
+                    help="Ghi đè config, vd: --set run.phase1_samples=3200")
     ap.add_argument("--model", choices=["gemma3", "qwen25vl"])
-    ap.add_argument("--variant", choices=list(VARIANTS))
-    ap.add_argument("--rank", type=int)
+    ap.add_argument("--variant", choices=list(SWEEP_BLOCKS))
+    ap.add_argument("--n-block", type=int, dest="n_block")
     ap.add_argument("--mode", choices=["train", "test", "both"])
+    ap.add_argument("--phase", type=int, choices=[1, 2],
+                    help="Chạy riêng một phase (mặc định: cả hai, nối tiếp)")
     # dry_run mặc định false trong config (chạy thật). Hai cờ này để ép:
     ap.add_argument("--dry-run", action="store_true",
                     help="Dừng sau STAGE 0 (2 step) để kiểm cấu hình")
@@ -338,7 +366,8 @@ def config_from_args(argv=None):
     args = build_argparser().parse_args(argv)
     ov = list(args.overrides)
     for name, key in (("model", "sweep.model"), ("variant", "sweep.variant"),
-                      ("rank", "sweep.rank"), ("mode", "run.mode")):
+                      ("n_block", "sweep.n_block"), ("mode", "run.mode"),
+                      ("phase", "run.only_phase")):
         val = getattr(args, name)
         if val is not None:
             ov.append(f"{key}={val}")
@@ -351,18 +380,26 @@ def config_from_args(argv=None):
 
 if __name__ == "__main__":
     c = config_from_args()
+    est = estimate_params(c.sweep.variant, c.sweep.n_block, c.fixed.n_expert)
     print(f"Ô sweep : {c.sweep.tag}")
     print(f"GPU     : {c.hw.name} | {c.hw.vram_gb:.0f}GB | "
           f"sm{c.hw.sm[0]}{c.hw.sm[1]} | {c.hw.n_gpu} GPU")
     print(f"Preset  : {c.preset['name']}")
     print(f"Model   : {c.fixed.model_id} | attn={c.fixed.attn_impl}")
-    print(f"Adapter : {adapter_desc(c.fixed, c.sweep)} | quant={c.run.quant}")
+    print(f"Router  : {variant_desc(c)}")
+    print(f"          router {est['router']:,} + expert {est['experts']:,} "
+          f"= {est['total']:,} param trainable")
+    print(f"Adapter : {adapter_desc(c.fixed)} | quant={c.run.quant}")
     print(f"Ảnh     : {image_desc(c.fixed)}")
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
-          f"{c.run.train_bs * c.run.grad_accum} mẫu/step | "
-          f"{c.run.num_epochs} epoch")
+          f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
+    print(f"Phase 1 : {c.run.phase1_samples} mẫu = {phase_steps(c, 1)} step "
+          f"| loss = Focal")
+    print(f"Phase 2 : {c.run.phase2_samples} mẫu = {phase_steps(c, 2)} step "
+          f"| loss = CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
-    print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run}")
+    print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run} | "
+          f"policy={'BẬT' if c.run.use_policy else 'TẮT (chấm raw_output)'}")
     if c.remote.active:
         print(f"Remote  : BẬT (§9) | venv={'có' if c.remote.use_venv else 'không'}"
               f" | tmux={c.remote.tmux_session}")

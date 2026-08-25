@@ -1,4 +1,28 @@
-"""Nạp model (Gemma 3 / Qwen2.5-VL), gắn adapter, collate, loss."""
+"""Nạp Gemma 3, gắn E expert QDoRA, nối nhánh router, collate, CE loss.
+
+Đường đi của MỘT batch (khớp sơ đồ "Thiết kế chung"):
+
+    ảnh + prompt ──► [embed_tokens ⊕ vision_tower ⊕ projector] ──► [N, 2560]
+                                    │                                  │
+                                    │                            RouterBridge
+                                    │                    (Stem→Recombinator→…)
+                                    │                                  │
+                                    │                       gate [B, E] ──┐
+                                    ▼                                     │
+                            Gemma decoder ◄── expert QDoRA trộn theo gate ─┘
+                                    │
+                                  CE loss
+
+Chỗ móc nối là một `forward_pre_hook` đặt trên KHỐI DECODER TEXT. Vì sao chọn
+chỗ này chứ không tự dựng inputs_embeds:
+
+  * đúng thứ transformers sẽ đưa vào decoder — kể cả phần ghép ảnh vào chuỗi,
+    thứ mà mỗi bản transformers lại làm khác một chút;
+  * gate được đặt TRƯỚC khi layer đầu tiên chạy, nên mọi Linear đã có trọng số
+    expert đúng của batch;
+  * `model(**batch)` và `model.generate(**inputs)` gọi y như cũ — không có
+    nhánh riêng cho lúc train và lúc sinh.
+"""
 from __future__ import annotations
 
 import gc
@@ -9,7 +33,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from .config import adapter_desc
+from . import moe
+from .config import adapter_desc, variant_desc
+from .router import RouterNet
 
 # §1.2 — prompt cố định.
 PROMPT_TEXT = (
@@ -37,10 +63,6 @@ def load_image(path, size=None, filter_name="bicubic", antialias=True):
 
     size=896 (Gemma 3): SigLIP có bảng position embedding cố định 4096 vị trí,
     lệch cỡ là phải nội suy pos-emb -> chạy ngoài chế độ pretrain.
-
-    Pillow: Image.resize với BICUBIC/LANCZOS đã có anti-aliasing khi thu nhỏ.
-    Khi PHÓNG TO (512 -> 896) anti-aliasing không đổi kết quả — cờ giữ lại cho
-    minh bạch với tài liệu và để đổi hướng resize sau này không phải sửa code.
     """
     with Image.open(path) as im:
         img = im.convert("RGB")
@@ -50,11 +72,7 @@ def load_image(path, size=None, filter_name="bicubic", antialias=True):
 
 
 def find_image_token_id(processor):
-    """id của token ảnh (<image_soft_token> ở Gemma, <|image_pad|> ở Qwen).
-
-    Tên thuộc tính khác nhau giữa các bản transformers và giữa hai họ model
-    nên dò lần lượt; None = không tra được (caller phải có đường lùi).
-    """
+    """id của token ảnh (<image_soft_token> ở Gemma, <|image_pad|> ở Qwen)."""
     for obj in (processor, getattr(processor, "tokenizer", None)):
         for attr in ("image_token_id", "image_token_index"):
             tid = getattr(obj, attr, None)
@@ -68,140 +86,142 @@ def find_image_token_id(processor):
     return None
 
 
-def build_vera_config(f, target_re, matched, model, log):
-    """VeraConfig cho nhánh --variant vera (§3.2).
+# ══════════════════════ móc router vào giữa encoder/decoder ══════════════════
+class StopAfterRouter(Exception):
+    """Tín hiệu dừng forward ngay trước decoder (Phase 1 không cần decoder)."""
 
-    Khác LoRA ở ba điểm phải nhớ khi đọc kết quả:
 
-    1) A, B là ma trận NGẪU NHIÊN ĐÓNG BĂNG dùng CHUNG cho mọi layer. peft cấp
-       phát đúng MỘT cặp cỡ (r × max_in_features) và (max_out_features × r)
-       rồi cắt lát cho từng layer, nên target có shape khác nhau vẫn chạy.
-       Với Gemma3-4b max_in = max_out = 10240 (mlp): r=1024 -> 2 × 10240 × 1024
-       × 4B ≈ 84MB fp32 nằm thường trú trên GPU (r=256 -> ~21MB).
-    2) KHÔNG có alpha. Chỗ của alpha là `d_initial` (giá trị khởi tạo lambda_d,
-       mặc định 0.1) — paper khuyến nghị hạ xuống khi rank lớn nếu loss dựng
-       ngược; ở đây giữ mặc định.
-    3) Trainable chỉ là lambda_d (r) + lambda_b (out_features) mỗi layer, cỡ
-       ~1M param cho cả model ở r=1024 — ít hơn LoRA r16 hàng chục lần. Đó
-       chính là lý do rank sweep của VeRA nằm ở 256/512/1024.
+class RouterBridge:
+    """Giữ router + trạng thái của batch hiện tại, và cái hook nối hai bên.
 
-    `save_projection=True` (mặc định) ghi cả A, B vào checkpoint: nặng thêm
-    ~84MB ở r1024, đổi lại resume trên máy khác kiểm chứng được. Lưu ý peft chỉ
-    GHI chứ không NẠP lại hai ma trận này (xem restore_vera_projection) — nên
-    để False là mất luôn khả năng phát hiện lệch RNG.
+    Ba chế độ:
+      "off"     bỏ qua hoàn toàn — decoder chạy như base 4-bit thuần.
+      "capture" lấy [N, 2560] rồi NÉM StopAfterRouter: dùng ở Phase 1, tiết
+                kiệm toàn bộ phần decoder (chiếm >90% thời gian một step).
+      "route"   chạy router, đặt gate, để forward chảy tiếp vào decoder.
     """
-    from peft import VeraConfig
 
-    # Ma trận chung được cắt lát theo layer, nên r LỚN HƠN chiều nhỏ nhất của
-    # một số projection (vd k_proj out=1024) vẫn hợp lệ. Chỉ cảnh báo khi r
-    # vượt chiều LỚN NHẤT — lúc đó phần rank thừa là dư thật.
-    mods = dict(model.named_modules())
-    dims = []
-    for name in matched:
-        mod = mods.get(name)
-        dims += [getattr(mod, "in_features", 0) or 0,
-                 getattr(mod, "out_features", 0) or 0]
-    if dims and f.lora_r > max(dims):
-        log("vera", f"⚠ r={f.lora_r} > chiều lớn nhất trong target "
-                    f"({max(dims)}) — phần rank vượt quá là dư.")
+    def __init__(self, router, log=None):
+        self.router = router
+        self.log = log
+        self.mode = "off"
+        self.mask = None          # [B, N] 1 = prompt/ảnh, 0 = target/padding
+        self.hidden = None        # chỉ dùng ở chế độ "capture"
+        self.out = None           # (sup_logits, gate, aux, stats) ở "route"
+        self.handle = None
+        self.n_calls = 0
 
-    log("vera", f"r={f.lora_r} | d_initial={f.vera_d_initial} | "
-                f"dropout={f.vera_dropout} | "
-                f"save_projection={f.vera_save_projection} | "
-                f"prng_key={f.vera_projection_prng_key}")
-    if dims:
-        mb = 2 * max(dims) * f.lora_r * 4 / 1024**2
-        log("vera", f"A,B dùng chung ≈ {mb:.0f}MB fp32 "
-                    f"(r{f.lora_r} × {max(dims)}, đóng băng)")
-    return VeraConfig(
-        r=f.lora_r, target_modules=target_re, vera_dropout=f.vera_dropout,
-        d_initial=f.vera_d_initial,
-        projection_prng_key=f.vera_projection_prng_key,
-        save_projection=f.vera_save_projection,
-        bias="none", task_type="CAUSAL_LM")
+    # ── vòng đời một batch ──────────────────────────────────────────────────
+    def begin(self, mode, mask=None):
+        self.mode, self.mask, self.hidden, self.out = mode, mask, None, None
+        moe.CTX.clear()
 
+    def end(self):
+        self.mode, self.mask, self.hidden = "off", None, None
+        moe.CTX.clear()
 
-def restore_vera_projection(model, adapter_sd, log, warn, adapter="default"):
-    """Ép A, B trong ckpt vào model khi resume ô VeRA.
+    # ── hook ────────────────────────────────────────────────────────────────
+    def attach(self, decoder):
+        self.handle = decoder.register_forward_pre_hook(self._hook,
+                                                        with_kwargs=True)
+        return self.handle
 
-    `set_peft_model_state_dict` KHÔNG nạp vera_A/vera_B: nó chỉ kiểm tra hai
-    khoá có mặt rồi thôi (hai khoá đó nằm trong `unexpected_keys`), còn ma trận
-    thật được sinh lại từ `projection_prng_key` lúc khởi tạo. Trên cùng một máy
-    thì trùng nhau nên không ai để ý. Resume từ Hub sang máy/bản torch khác mà
-    RNG lệch thì lambda đã học được gắn lên một cặp A,B KHÁC — adapter thành vô
-    nghĩa và KHÔNG có lỗi nào nổ ra. Nên ở đây so, lệch thì chép đè.
-    """
-    for name in ("vera_A", "vera_B"):
-        saved = adapter_sd.get(f"base_model.{name}")
-        live = getattr(getattr(model, "base_model", None), name, None)
-        if saved is None or live is None or adapter not in live:
-            warn("vera", f"resume: ckpt không có {name} — giữ ma trận sinh từ "
-                         f"prng_key (chỉ đúng nếu cùng máy/bản torch).")
-            continue
-        cur = live[adapter]
-        if tuple(saved.shape) != tuple(cur.shape):
+    def _hook(self, module, args, kwargs):
+        if self.mode == "off":
+            return None
+        hidden = kwargs.get("inputs_embeds")
+        if hidden is None:
+            # Bản transformers nào đó gọi bằng positional -> dò tensor 3 chiều.
+            hidden = next((a for a in args
+                           if torch.is_tensor(a) and a.dim() == 3
+                           and a.is_floating_point()), None)
+        if hidden is None:
             raise RuntimeError(
-                f"{name} trong ckpt {tuple(saved.shape)} khác model "
-                f"{tuple(cur.shape)} — ckpt này của rank/model khác.")
-        if torch.allclose(saved.to(cur.device, cur.dtype), cur, atol=1e-5):
-            log("vera", f"resume: {name} khớp ma trận sinh lại ✓")
-        else:
-            cur.copy_(saved.to(cur.device, cur.dtype))
-            warn("vera", f"resume: {name} sinh lại KHÁC ckpt (RNG máy này "
-                         f"lệch) — đã chép ma trận trong ckpt đè lên.")
+                "Không lấy được inputs_embeds ở đầu decoder. Bản transformers "
+                "này gọi decoder theo cách khác — sửa RouterBridge._hook.")
+
+        if self.mode == "capture":
+            self.hidden = hidden.detach()
+            raise StopAfterRouter
+
+        # "route": lúc generate, chỉ prefill (T > 1) mới tính lại gate; các
+        # bước decode sau chỉ có 1 token mới và PHẢI dùng đúng gate đã chọn cho
+        # câu đó, nếu không mỗi token lại rơi vào một expert khác.
+        if hidden.shape[1] > 1 or moe.CTX.weights is None:
+            self.run(hidden.detach())
+        return None
+
+    def run(self, hidden):
+        mask = self.mask
+        if mask is not None and mask.shape[1] != hidden.shape[1]:
+            raise RuntimeError(
+                f"router_mask dài {mask.shape[1]} nhưng chuỗi dài "
+                f"{hidden.shape[1]} — quên cắt mask khi cắt chuỗi?")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            sup_logits, gate, aux, stats = self.router(hidden, mask)
+        self.out = (sup_logits.float(), gate, aux, stats)
+        moe.CTX.set(gate)
+        self.n_calls += 1
+        return self.out
 
 
-def align_vera_projection_dtype(model):
-    """Ép vera_A/vera_B (buffer, đóng băng, dùng chung) CÙNG dtype với lambda_d.
+def find_text_decoder(model, log=None):
+    """Khối nhận inputs_embeds [B, N, 2560] và chạy các layer decoder.
 
-    peft/tuners/vera/layer.py::forward:
-
-        x = x.to(lambda_d.dtype)
-        result = result + lambda_b * F.linear(
-            lambda_d * F.linear(dropout(x), sliced_A), sliced_B)
-
-    `sliced_A/B` cắt ra từ vera_A/vera_B — hai thứ này là BUFFER chứ không phải
-    parameter, nên mọi vòng lặp kiểu `for p in model.parameters(): p.data.to(...)`
-    đều bỏ sót chúng. Đổi dtype của lambda mà quên A/B là:
-
-        RuntimeError: expected mat1 and mat2 to have the same dtype,
-                      but got: c10::BFloat16 != float
-
-    A/B nằm trong MỘT BufferDict dùng chung cho mọi layer (layer chỉ giữ tham
-    chiếu), nên sửa ở gốc là cả 238 layer cùng đổi. Trả về danh sách mô tả các
-    thay đổi đã làm (rỗng = vốn đã khớp, hoặc không phải nhánh VeRA).
+    Vị trí của nó đổi theo bản transformers (Gemma3ForConditionalGeneration ->
+    .model.language_model, hoặc .language_model.model ở bản cũ), nên dò theo
+    ĐẶC ĐIỂM thay vì theo đường dẫn: module có `.layers` là ModuleList và tên
+    lớp kết thúc bằng TextModel/Model, ưu tiên cái nằm dưới `language_model`.
     """
-    target = None
-    for n, p in model.named_parameters():
-        if "vera_lambda_d" in n:
-            target = p.dtype
-            break
-    if target is None:                      # không phải VeRA -> không có gì để làm
-        return []
+    import torch.nn as nn
 
-    changed, seen = [], set()
-    for mod in model.modules():
-        for name in ("vera_A", "vera_B"):
-            bd = getattr(mod, name, None)
-            if bd is None or id(bd) in seen or not hasattr(bd, "keys"):
-                continue
-            seen.add(id(bd))
-            for key in list(bd.keys()):
-                t = bd[key]
-                if t.dtype != target:
-                    bd[key] = t.to(target)
-                    changed.append(f"{name}[{key}] {t.dtype} -> {target}")
-    return changed
+    best = None
+    for name, mod in model.named_modules():
+        layers = getattr(mod, "layers", None)
+        if not isinstance(layers, nn.ModuleList) or len(layers) == 0:
+            continue
+        if "vision" in name.lower() or "vision" in type(mod).__name__.lower():
+            continue
+        score = (2 if "language_model" in name else 0) + \
+                (1 if type(mod).__name__.endswith("TextModel") else 0)
+        if best is None or score > best[0]:
+            best = (score, name, mod)
+    if best is None:
+        raise RuntimeError("Không tìm thấy khối decoder text trong model.")
+    if log:
+        log("router", f"hook đặt tại {best[1]} ({type(best[2]).__name__}, "
+                      f"{len(best[2].layers)} layer)")
+    return best[2]
 
 
+@torch.no_grad()
+def encode_only(model, bridge, batch):
+    """Chạy embed + vision tower rồi DỪNG, trả [B, N, 2560].
+
+    Dùng ở Phase 1 và ở STAGE 0. Cắt bằng exception nghe thô, nhưng nó cho
+    đúng thứ decoder sẽ nhận mà không phải chép lại logic ghép ảnh của
+    transformers — chép lại là chỗ lệch âm thầm giữa các bản.
+    """
+    batch = {k: v for k, v in batch.items() if k != "labels"}
+    bridge.begin("capture")
+    try:
+        model(**batch, use_cache=False)
+        raise RuntimeError("forward chạy hết mà không dừng ở decoder — "
+                           "hook chưa gắn?")
+    except StopAfterRouter:
+        hidden = bridge.hidden
+    finally:
+        bridge.end()
+    return hidden
+
+
+# ═══════════════════════════════ dựng model ══════════════════════════════════
 def build_model(cfg, hf_token, log):
     from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model
 
     f, r = cfg.fixed, cfg.run
 
-    # Processor RIÊNG theo model: kwargs lấy từ models.<tên>.processor_kwargs
-    # (vd Qwen: min_pixels/max_pixels để khoá vùng phân giải động).
     proc_kwargs = dict(getattr(f, "processor_kwargs", None) or {})
     processor = AutoProcessor.from_pretrained(f.model_id, token=hf_token,
                                               **proc_kwargs)
@@ -211,8 +231,6 @@ def build_model(cfg, hf_token, log):
         # token thay vì 256. Nguyên nhân OOM số 1 trên GPU nhỏ.
         if hasattr(ip, "do_pan_and_scan"):
             ip.do_pan_and_scan = False
-        # min/max_pixels đôi khi chỉ vào tới processor mà không xuống
-        # image_processor tuỳ bản transformers -> set tay cho chắc.
         for k, v in proc_kwargs.items():
             if hasattr(ip, k):
                 setattr(ip, k, v)
@@ -224,15 +242,12 @@ def build_model(cfg, hf_token, log):
                    f"{shown}")
     tokenizer = processor.tokenizer
 
-    quant_cfg = None
-    if r.quant:
-        quant_cfg = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type=f.quant_type,
-            bnb_4bit_compute_dtype=f.compute_dtype,
-            bnb_4bit_use_double_quant=f.double_quant)
+    # QDoRA: base LUÔN 4-bit ở Phase này (run.quant khoá cứng trong config).
+    quant_cfg = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type=f.quant_type,
+        bnb_4bit_compute_dtype=f.compute_dtype,
+        bnb_4bit_use_double_quant=f.double_quant)
 
-    # Lớp model khác nhau giữa Gemma 3 và Qwen2.5-VL; AutoModelForCausalLM
-    # không phủ hết VLM nên chọn tường minh theo model_id.
     if "gemma-3" in f.model_id:
         from transformers import Gemma3ForConditionalGeneration as Cls
     elif "Qwen2.5-VL" in f.model_id:
@@ -240,7 +255,7 @@ def build_model(cfg, hf_token, log):
     else:
         Cls = AutoModelForCausalLM
 
-    log("model", f"nạp {f.model_id} bf16{' + NF4' if r.quant else ''}...")
+    log("model", f"nạp {f.model_id} bf16 + NF4...")
     model = Cls.from_pretrained(
         f.model_id, torch_dtype=f.compute_dtype, quantization_config=quant_cfg,
         attn_implementation=f.attn_impl, low_cpu_mem_usage=True,
@@ -255,91 +270,102 @@ def build_model(cfg, hf_token, log):
     n_param = sum(p.numel() for p in model.parameters())
     log("model", f"✓ {n_param/1e9:.2f}B param | attn={f.attn_impl}")
 
-    # ── Adapter vào ALL_LINEAR của decoder (§3.2) ────────────────────────────
+    # ── Expert QDoRA vào ALL_LINEAR của decoder ─────────────────────────────
     ex = "".join(f"(?!.*{x})" for x in f.lora_exclude)
     target_re = "^" + ex + r".*\.(" + "|".join(f.lora_targets) + ")$"
     matched = [n for n, _ in model.named_modules() if re.fullmatch(target_re, n)]
     assert matched, f"Regex không khớp module nào: {target_re}"
     leaked = [n for n in matched if any(x in n for x in f.lora_exclude)]
     assert not leaked, f"lora_exclude thủng: {leaked[:3]}"
-    log("lora", f"{len(matched)} linear | đầu: {matched[0]}")
+    log("lora", f"{len(matched)} linear/expert | đầu: {matched[0]}")
 
-    # KHÔNG dùng prepare_model_for_kbit_training ở CẢ HAI nhánh. Nó upcast MỌI
-    # param không phải Params4bit sang fp32: embed_tokens 262144×2560 (+2.7GB),
-    # toàn bộ RMSNorm, vision tower, lm_head.
-    #
-    # Ở nhánh bf16 đó chỉ là phí VRAM. Ở nhánh quant nó còn HỎNG khâu infer:
-    # activation chạy fp32 -> q_proj trả fp32, trong khi generate() của Gemma 3
-    # cấp phát KV-cache tĩnh (HybridCache) theo config._pre_quantization_dtype
-    # = bf16 (transformers/generation/utils.py, _get_cache). Kết quả:
-    #     q fp32 | k,v bf16 -> RuntimeError: Expected query, key, and value to
-    #     have the same dtype  (sdpa_attention_forward)
-    # Train KHÔNG lộ lỗi này vì lúc đó use_cache=False: q,k,v đều fp32 nên
-    # SDPA thấy đồng nhất. Lỗi chỉ nổ ở generate() — tức sau khi đã đốt hết
-    # thời gian GPU của cả ô sweep. Dính cả qlora lẫn qdora.
-    #
-    # Hai việc thật sự cần của prepare_* thì ta đã tự làm: freeze base (ngay
-    # dưới) và grad-ckpt + enable_input_require_grads (khối r.grad_ckpt sau).
-    # Master weight fp32 cho adapter vẫn giữ (khối ngay sau get_peft_model).
+    # KHÔNG dùng prepare_model_for_kbit_training: nó upcast MỌI param không
+    # phải Params4bit sang fp32 (embed_tokens 262144×2560 = +2.7GB, mọi
+    # RMSNorm, vision tower, lm_head). Ở nhánh 4-bit nó còn HỎNG khâu infer:
+    # activation fp32 -> q_proj trả fp32, trong khi generate() cấp phát KV-cache
+    # tĩnh theo config._pre_quantization_dtype = bf16 ->
+    #     RuntimeError: Expected query, key, and value to have the same dtype
+    # Lỗi chỉ nổ ở generate(), tức sau khi đã đốt hết giờ GPU của ô sweep.
+    # Hai việc thật sự cần thì ta tự làm: freeze base (ngay dưới) và grad-ckpt.
     for p in model.parameters():
         p.requires_grad_(False)
 
-    if f.tuner == "vera":
-        peft_cfg = build_vera_config(f, target_re, matched, model, log)
-    else:
-        lora_kwargs = dict(
-            r=f.lora_r, lora_alpha=f.lora_alpha, lora_dropout=f.lora_dropout,
-            bias="none", task_type="CAUSAL_LM", target_modules=target_re,
-            use_dora=f.use_dora)
-        if f.use_dora and r.quant:
-            # QDoRA: DoRA phải dequantize từng base layer để tính chuẩn cột ->
-            # đỉnh VRAM cao lúc khởi tạo. ephemeral_gpu_offload đẩy bước đó qua
-            # CPU.
-            try:
-                from peft import LoraRuntimeConfig
-                lora_kwargs["runtime_config"] = LoraRuntimeConfig(
-                    ephemeral_gpu_offload=True)
-                log("lora",
-                    "QDoRA: ephemeral_gpu_offload BẬT (dequantize qua CPU)")
-            except ImportError:
-                log("lora",
-                    "peft không có LoraRuntimeConfig — QDoRA init trên GPU")
-        peft_cfg = LoraConfig(**lora_kwargs)
+    lora_kwargs = dict(
+        r=f.lora_r, lora_alpha=f.lora_alpha, lora_dropout=f.lora_dropout,
+        bias="none", task_type="CAUSAL_LM", target_modules=target_re,
+        use_dora=True)
+    try:
+        from peft import LoraRuntimeConfig
+        lora_kwargs["runtime_config"] = LoraRuntimeConfig(
+            ephemeral_gpu_offload=True)
+        log("lora", "QDoRA: ephemeral_gpu_offload BẬT (dequantize qua CPU)")
+    except ImportError:
+        log("lora", "peft không có LoraRuntimeConfig — QDoRA init trên GPU")
+    peft_cfg = LoraConfig(**lora_kwargs)
 
     try:
-        model = get_peft_model(model, peft_cfg)
+        model = get_peft_model(model, peft_cfg,
+                               adapter_name=moe.expert_names(1)[0])
+        expert_ids = moe.attach_experts(model, peft_cfg, f.n_expert, log)
     except torch.cuda.OutOfMemoryError:
         raise RuntimeError(
-            "OOM khi khởi tạo adapter. DoRA/QDoRA tốn hơn LoRA vì phải "
-            "dequantize base weight; VeRA r cao tốn cho ma trận chung. "
-            "Thử --variant lora, hoặc nâng peft lên bản có "
-            "ephemeral_gpu_offload.")
+            f"OOM khi khởi tạo {f.n_expert} expert QDoRA. DoRA phải dequantize "
+            f"từng base weight để lấy chuẩn cột, và việc đó lặp lại cho mỗi "
+            f"expert. Hạ fixed.n_expert, hoặc nâng peft lên bản có "
+            f"ephemeral_gpu_offload.")
 
     # Master weight fp32 chỉ cho param trainable — Adam eps 1e-6 underflow ở bf16.
     for n, p in model.named_parameters():
         if p.requires_grad and p.dtype != f.trainable_dtype:
             p.data = p.data.to(f.trainable_dtype)
-    n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log("lora", f"✓ {adapter_desc(f, cfg.sweep)} | "
-                f"trainable {n_tr:,} (~{n_tr*4/1024**2:.0f}MB fp32)")
+
+    # ── Nhánh router ────────────────────────────────────────────────────────
+    d_enc = int(getattr(getattr(model.config, "text_config", model.config),
+                        "hidden_size", f.d_enc))
+    if d_enc != f.d_enc:
+        log("router", f"hidden_size thật = {d_enc} (config ghi {f.d_enc}) "
+                      f"— dùng giá trị thật")
+    router = RouterNet(cfg.sweep.variant, cfg.sweep.n_block, f.n_expert,
+                       f.top_k, d_enc=d_enc).to("cuda", f.trainable_dtype)
+    bridge = RouterBridge(router, log)
+    bridge.attach(find_text_decoder(model, log))
+
+    n_router = sum(p.numel() for p in router.parameters())
+    n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log("router", variant_desc(cfg))
+    for k, v in router.param_table().items():
+        if not k.startswith("_"):
+            log("router", f"    {k:<28} {v:>12,}")
+    log("lora", f"✓ {adapter_desc(f)} | trainable expert {n_expert_p:,} "
+                f"+ router {n_router:,} = {n_expert_p + n_router:,} "
+                f"(~{(n_expert_p + n_router) * 4 / 1024**2:.0f}MB fp32)")
 
     if r.grad_ckpt:
         # use_reentrant=False đúng trên GPU (trên XLA nó gọi getattr(torch,"xla")
-        # và nổ AttributeError).
+        # và nổ AttributeError). Cũng là bản DUY NHẤT cho gradient chảy ngược
+        # về tensor gate — thứ được "bắt" từ ngoài chứ không truyền vào như
+        # tham số của khối được checkpoint.
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
-        log("model", "grad-checkpoint BẬT")
+        log("model", "grad-checkpoint BẬT (use_reentrant=False)")
 
     gc.collect()
     torch.cuda.empty_cache()
-    return processor, tokenizer, model
+    return processor, tokenizer, model, router, bridge, expert_ids
 
 
+# ═══════════════════════════════ dữ liệu ═════════════════════════════════════
 class CXRDataset(Dataset):
+    """Trả (ảnh, text đích, nhãn 14 aspect)."""
+
     def __init__(self, frame, cfg):
         self.df = frame.reset_index(drop=True)
         self.f = cfg.fixed
+        self.y = None
+        if "y14" in self.df.columns:
+            import numpy as np
+            self.y = np.stack(self.df["y14"].to_numpy())
 
     def __len__(self):
         return len(self.df)
@@ -348,7 +374,8 @@ class CXRDataset(Dataset):
         row = self.df.iloc[i]
         img = load_image(row["img_abs_path"], self.f.image_size_model,
                          self.f.resize_filter, self.f.antialias)
-        return img, str(row[self.f.target_column]).strip()
+        y = self.y[i] if self.y is not None else None
+        return img, str(row[self.f.target_column]).strip(), y
 
 
 def build_prompt(processor):
@@ -369,13 +396,13 @@ def build_collate(processor, tokenizer, cfg, prompt_str, log=None):
     warned = []
 
     def collate(batch):
-        images, targets = zip(*batch)
+        images, targets, ys = zip(*batch)
         tokenizer.padding_side = f.pad_side_train
         sfx = [t + tokenizer.eos_token for t in targets]
         lens = [len(tokenizer.encode(s, add_special_tokens=False)) for s in sfx]
         # padding=True (longest): GPU chạy eager nên shape động là lợi thế —
-        # batch ngắn tính nhanh hơn. (Trên XLA thì ngược lại: mỗi shape mới là
-        # một lần compile 30-90s.)
+        # batch ngắn tính nhanh hơn. Router che padding bằng router_mask nên
+        # kết quả KHÔNG phụ thuộc chuỗi được đệm tới đâu.
         inp = processor(text=[prompt_str + s for s in sfx],
                         images=wrap_images(images, f.model_id),
                         padding=True, return_tensors="pt")
@@ -385,20 +412,33 @@ def build_collate(processor, tokenizer, cfg, prompt_str, log=None):
             lb[i, :max(width - L, 0)] = -100
         lb[lb == tokenizer.pad_token_id] = -100
         inp["labels"] = lb
+
+        # router_mask: router CHỈ được nhìn prompt + ảnh. Nếu cho nó thấy cả
+        # y_gt thì lúc train nó đọc được đáp án, còn lúc infer thì không —
+        # gate sẽ học một tín hiệu không tồn tại ở thời điểm dùng thật.
+        rm = inp["attention_mask"].clone()
+        for i, L in enumerate(lens):
+            if L:
+                rm[i, width - L:] = 0
+        inp["router_mask"] = rm
+        if ys[0] is not None:
+            import numpy as np
+            inp["sup_labels"] = torch.from_numpy(
+                np.stack(ys)).long()
+
         # Cắt phần ĐẦU (prompt) nếu vượt trần; target ở cuối nên không mất label.
         if r.max_seq_len and inp["input_ids"].shape[-1] > r.max_seq_len:
             ids = inp["input_ids"]
-            # Nhưng KHÔNG được cắt vào khối image token: số placeholder phải
-            # khớp đúng số image feature, lệch một token là model nổ
-            # ("Image features and image tokens do not match"). Qwen sinh
-            # nhiều image token hơn Gemma (324 vs 256) nên rủi ro này thật.
+            # KHÔNG được cắt vào khối image token: số placeholder phải khớp
+            # đúng số image feature, lệch một token là model nổ ("Image
+            # features and image tokens do not match").
             safe = True
             if img_tok is not None:
                 cut = ids[:, :-r.max_seq_len]
                 safe = not bool((cut == img_tok).any())
             if safe:
                 for k in ("input_ids", "attention_mask", "labels",
-                          "token_type_ids"):
+                          "token_type_ids", "router_mask"):
                     if k in inp and inp[k].dim() == 2:
                         inp[k] = inp[k][:, -r.max_seq_len:]
             elif not warned:
@@ -406,8 +446,7 @@ def build_collate(processor, tokenizer, cfg, prompt_str, log=None):
                 if log:
                     log("seq", f"⚠ chuỗi {ids.shape[-1]} > max_seq_len "
                                f"{r.max_seq_len} nhưng cắt sẽ ăn vào image "
-                               f"token -> BỎ QUA cắt (chuỗi chạy full). Nâng "
-                               f"run.seq_delta hoặc ép run.max_seq_len.")
+                               f"token -> BỎ QUA cắt (chuỗi chạy full).")
         return inp
 
     return collate
@@ -426,7 +465,15 @@ def to_device(batch, device):
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def forward_loss(model, batch, label_smoothing, chunk=256):
+def split_batch(batch):
+    """Tách phần model ăn được ra khỏi phần chỉ router/loss dùng."""
+    extra = {k: batch[k] for k in ("router_mask", "sup_labels") if k in batch}
+    core = {k: v for k, v in batch.items()
+            if k not in ("router_mask", "sup_labels")}
+    return core, extra
+
+
+def ce_loss(model, batch, label_smoothing, chunk=256):
     """§1.6 — CE chuẩn + label smoothing 0.1.
 
     logits_to_keep: vocab Gemma 262k, logits cả chuỗi với T=1024 đã ~1GB và
@@ -469,7 +516,6 @@ def count_image_tokens(processor, prompt_str, sample_path, cfg):
     ids = out["input_ids"]
     tok_id = find_image_token_id(processor)
     if tok_id is None:
-        # Không đọc được id -> suy ngược: tổng token trừ token văn bản thuần.
         n_text = len(processor.tokenizer.encode(prompt_str,
                                                 add_special_tokens=False))
         return max(int(ids.shape[-1]) - n_text, 0), int(ids.shape[-1])

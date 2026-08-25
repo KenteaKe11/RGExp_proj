@@ -301,47 +301,79 @@ def build_frames(df, keys, image_paths, cfg, log):
     return tr, va, te
 
 
-def rare_first_order(df_train, npz_path, cfg, log):
-    """§1.1 — 14 bệnh × 4 aspect.
-
-    Độ hiếm của mẫu = tần suất của ô (bệnh, aspect) hiếm nhất mà nó chứa. Mẫu
-    chứa ô hiếm nhất được xáo ngẫu nhiên rồi đẩy lên đầu tập train, để mô hình
-    gặp nhãn hiếm ngay từ những step đầu.
-    """
-    key_col = cfg.data.image_column
+def _label_index(npz_path):
     npz = np.load(npz_path, allow_pickle=True)
     y_gt = npz["y_gt"].astype(int)
     class_names, disease = list(npz["class_names"]), list(npz["disease_labels"])
-    assert y_gt.shape[1] == 14 and len(class_names) == 4, (y_gt.shape, class_names)
+    assert y_gt.shape[1] == 14 and len(class_names) == 4, \
+        (y_gt.shape, class_names)
     index = pd.Series(np.arange(len(npz["img_rel"])),
                       index=pd.Index(npz["img_rel"]))
+    return y_gt, index, class_names, disease
 
-    pos = df_train[key_col].map(index)
+
+def attach_labels(frame, npz_path, cfg, log, name=""):
+    """Gắn cột `y14` (14 chỉ số aspect 0..3) — đầu vào của Focal loss (§1.7a).
+
+    Dòng không tra được nhãn bị LOẠI, không phải gán 0: gán 0 là bịa ra "không
+    có bệnh" và Focal loss sẽ học chính chỗ bịa đó.
+    """
+    key_col = cfg.data.image_column
+    y_gt, index, _, _ = _label_index(npz_path)
+    pos = frame[key_col].map(index)
     keep = pos.notna().to_numpy()
     if not keep.all():
-        log("rare", f"loại {int((~keep).sum())} dòng train không có nhãn thô")
-        df_train = df_train[keep].reset_index(drop=True)
+        log("label", f"[{name}] loại {int((~keep).sum())}/{len(frame)} dòng "
+                     f"không có trong labels.npz")
+        frame = frame[keep].reset_index(drop=True)
     y = y_gt[pos[keep].to_numpy().astype(int)]
+    frame = frame.copy()
+    frame["y14"] = list(y)
+    return frame, y
 
-    cell_freq = np.stack([[(y[:, c] == a).mean() for a in range(4)]
-                          for c in range(14)])
+
+def cell_frequency(y, npz_path, log):
+    """Tần suất từng ô (bệnh, aspect) trong TRAIN — nguồn của α = 1/√f."""
+    _, _, class_names, disease = _label_index(npz_path)
+    freq = np.stack([[(y[:, c] == a).mean() for a in range(4)]
+                     for c in range(14)])
+    log("label", f"aspect: {class_names}")
+    log("label", "5 ô hiếm nhất (α = 1/√f sẽ nặng nhất ở đây):")
+    flat = np.dstack(np.unravel_index(np.argsort(freq, axis=None),
+                                      freq.shape))[0]
+    for c, a in flat[:5]:
+        log("label", f"    {disease[c]:<28} / {class_names[a]:<10} : "
+                     f"{freq[c, a]*100:.3f}%")
+    return freq
+
+
+def rare_first_order(df_train, cell_freq, cfg, log):
+    """§1.1 — xáo nhãn hiếm lên đầu tập train.
+
+    Độ hiếm của mẫu = tần suất của ô (bệnh, aspect) hiếm nhất mà nó chứa. Mẫu
+    chứa ô hiếm nhất được xáo ngẫu nhiên rồi đẩy lên đầu, để hai phase (chỉ
+    dùng 5% + 5% đầu tập) gặp nhãn hiếm ngay chứ không phải chờ hết epoch.
+    """
+    y = np.stack(df_train["y14"].to_numpy())
     rarity = cell_freq[np.arange(14)[None, :], y].min(axis=1)
     rng = np.random.RandomState(cfg.fixed.seed)
     order = np.lexsort((rng.permutation(len(rarity)), rarity))  # tie ngẫu nhiên
-
-    log("rare", "5 ô hiếm nhất:")
-    flat = np.dstack(np.unravel_index(np.argsort(cell_freq, axis=None),
-                                      cell_freq.shape))[0]
-    for c, a in flat[:5]:
-        log("rare", f"    {disease[c]:<28} / {class_names[a]:<10} : "
-                    f"{cell_freq[c, a]*100:.3f}%")
     log("rare", f"rarity đầu={rarity[order[0]]*100:.3f}% "
                 f"cuối={rarity[order[-1]]*100:.3f}%")
-    return df_train, order
+    return order
 
 
-def epoch_order(base_order, epoch, num_epochs):
-    """Trượt tuần tự: mỗi epoch quay vòng thứ tự rare-first sang chu kì mới."""
-    n = len(base_order)
-    shift = (epoch * max(n // max(num_epochs, 1), 1)) % n
-    return np.roll(base_order, -shift)
+def phase_slice(order, cfg, phase):
+    """§1.7 — Phase 1 lấy 5% đầu, Phase 2 lấy 5% KẾ TIẾP.
+
+    Hai phase KHÔNG được dùng chung mẫu: Phase 2 huấn luyện decoder trên chính
+    những mẫu mà nhánh supervised đã học thuộc thì val_loss của nó không còn
+    nói lên điều gì.
+    """
+    r = cfg.run
+    eff = r.train_bs * r.grad_accum
+    n1 = r.phase1_samples // eff * eff
+    n2 = r.phase2_samples // eff * eff
+    if n1 + n2 > len(order):
+        raise ValueError(f"cần {n1 + n2} mẫu train nhưng chỉ có {len(order)}")
+    return order[:n1] if phase == 1 else order[n1:n1 + n2]

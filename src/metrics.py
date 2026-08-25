@@ -1,8 +1,9 @@
 """§1.5 — BLEU, ROUGE, BERTScore (optional).
 
-Chấm ĐÚNG MỘT hàm compute_metrics() trên hai bộ hypothesis (raw và
-post-policy) với cùng tập reference, rồi lấy delta = post − raw. Nhờ vậy đo
-được ảnh hưởng thật của guard 7-check, thay vì chỉ biết điểm cuối cùng.
+Ở Phase sweep này POLICY ĐANG TẮT (`run.use_policy: false`): mô hình sinh đúng
+một lần, không retry, nên bảng kết quả chấm trên `raw_output` — đúng cột
+"raw_outp" trong tài liệu sweep. Khối `post_policy` và `delta_post_minus_raw`
+chỉ xuất hiện khi bật lại policy.
 
 Tất cả là metric TỔNG THỂ trên corpus — không sinh cột metric per-row.
 """
@@ -14,7 +15,7 @@ import re
 
 import numpy as np
 
-from .config import adapter_desc
+from .config import adapter_desc, variant_desc
 
 
 def _setup_nltk():
@@ -79,8 +80,8 @@ def compute_metrics(refs, refs_tok, hyps, tag, tokenizer, use_bertscore,
     return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
 
 
-def run_metrics(res_df, tokenizer, cfg, step, log):
-    """Chấm 2 lượt trên cùng reference, ghi metrics.json, trả về dict."""
+def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
+    """Chấm raw_output (và post-policy nếu policy bật), ghi metrics.json."""
     _setup_nltk()
     from nltk.tokenize import word_tokenize
     import torch
@@ -88,57 +89,66 @@ def run_metrics(res_df, tokenizer, cfg, step, log):
     eval_df = res_df[res_df["reference"].astype(str).str.strip() != ""]
     eval_df = eval_df.reset_index(drop=True)
     refs = eval_df["reference"].apply(_norm).tolist()
-    hyps_post = eval_df["generated"].apply(_norm).tolist()
     hyps_raw = eval_df["raw_output"].apply(_norm).tolist()
+    hyps_post = eval_df["generated"].apply(_norm).tolist()
     refs_tok = [word_tokenize(r.lower()) for r in refs]
     n_diff = int(sum(a != b for a, b in zip(hyps_raw, hyps_post)))
-    log("eval", f"{len(refs)} mẫu | guard đổi {n_diff} mẫu")
+    log("eval", f"{len(refs)} mẫu | policy đổi {n_diff} mẫu")
 
     dev = torch.device("cuda:0")
     m_raw = compute_metrics(refs, refs_tok, hyps_raw, "raw", tokenizer,
                             cfg.run.use_bertscore, dev, log)
-    m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,
-                             cfg.run.use_bertscore, dev, log)
-    delta = {k: round(m_post[k] - m_raw[k], 4)
-             for k in m_post if isinstance(m_post[k], float)}
     ref_len = float(np.mean([len(tokenizer.encode(r, add_special_tokens=False))
                              for r in refs]))
 
-    metrics = {
-        "raw": m_raw,
-        "post_policy": m_post,
-        "delta_post_minus_raw": delta,
-        "meta": {
-            "n_samples": len(refs),
-            "n_changed_by_guard": n_diff,
-            "mean_ref_tokens": round(ref_len, 4),
-            "length_ratio_raw": round(m_raw["mean_gen_tokens"] / ref_len, 4),
-            "length_ratio_post": round(m_post["mean_gen_tokens"] / ref_len, 4),
-            "n_guard_passed_raw": int(eval_df["raw_guard_passed"].sum()),
-            "n_guard_passed_post": int(eval_df["guard_passed"].sum()),
-            "avg_attempts": float(eval_df["attempts"].mean()),
-            "train_step": step,
-            "model": cfg.fixed.model_id,
-            "gpu": cfg.hw.name,
-            "preset": cfg.preset["name"],
-            "image_size": cfg.fixed.image_size_model,
-            "sweep_cell": cfg.sweep.tag,
-            "variant": cfg.sweep.variant,
-            # VeRA không có alpha -> adapter_desc in d_initial thay vì "a512".
-            "adapter": adapter_desc(cfg.fixed, cfg.sweep),
-            "lora": adapter_desc(cfg.fixed, cfg.sweep),   # tên cũ, giữ tương thích
-            "max_seq_len": cfg.run.max_seq_len,
-        },
+    metrics = {"raw": m_raw}
+    meta = {
+        "n_samples": len(refs),
+        "mean_ref_tokens": round(ref_len, 4),
+        "length_ratio_raw": round(m_raw["mean_gen_tokens"] / ref_len, 4),
+        "n_guard_passed_raw": int(eval_df["raw_guard_passed"].sum()),
+        "use_policy": bool(cfg.run.use_policy),
+        "n_changed_by_policy": n_diff,
+        "train_step": step,
+        "model": cfg.fixed.model_id,
+        "gpu": cfg.hw.name,
+        "preset": cfg.preset["name"],
+        "image_size": cfg.fixed.image_size_model,
+        "sweep_cell": cfg.sweep.tag,
+        "variant": cfg.sweep.variant,
+        "n_block": cfg.sweep.n_block,
+        "n_expert": cfg.fixed.n_expert,
+        "top_k": cfg.fixed.top_k,
+        "architecture": variant_desc(cfg),
+        "adapter": adapter_desc(cfg.fixed),
+        "max_seq_len": cfg.run.max_seq_len,
     }
+    if expert_share:
+        meta["expert_share"] = [round(float(v), 4) for v in expert_share]
+        # Aux loss ép router chia đều: lệch xa 1/E nghĩa là w_aux quá nhỏ,
+        # hoặc router đã sập về "luôn chọn cùng một expert".
+        meta["expert_share_max"] = round(float(max(expert_share)), 4)
+    if cfg.run.use_policy:
+        m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,
+                                 cfg.run.use_bertscore, dev, log)
+        metrics["post_policy"] = m_post
+        metrics["delta_post_minus_raw"] = {
+            k: round(m_post[k] - m_raw[k], 4)
+            for k in m_post if isinstance(m_post[k], float)}
+        meta.update(length_ratio_post=round(
+            m_post["mean_gen_tokens"] / ref_len, 4),
+            n_guard_passed_post=int(eval_df["guard_passed"].sum()),
+            avg_attempts=float(eval_df["attempts"].mean()))
+    metrics["meta"] = meta
+
     out = os.path.join(cfg.run.out_dir, "metrics.json")
     with open(out, "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2), flush=True)
 
-    log("eval", "── delta (post − raw) ──")
-    for k in ("corpus_bleu", "bleu_1", "bleu_4", "rouge1_f1", "rougeL_f1",
-              "bertscore_f1"):
-        if k in delta:
-            log("eval", f"    {k:<20} {m_raw[k]:>8.4f} -> {m_post[k]:>8.4f}  "
-                        f"({delta[k]:+.4f})")
+    log("eval", f"── {cfg.sweep.tag} (raw_output) ──")
+    for k in ("corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
+              "rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1"):
+        if k in m_raw:
+            log("eval", f"    {k:<20} {m_raw[k]:>8.4f}")
     return metrics

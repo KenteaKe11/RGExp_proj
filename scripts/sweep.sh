@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# sweep.sh — chạy tuần tự các ô bảng §3.2, mỗi ô thu FULL metrics test + gen_text
+# sweep.sh — chạy tuần tự các ô Phase 1 (biến thể Recombinator × n_block),
+#            mỗi ô thu FULL metrics test + gen_text
 #
 #   bash scripts/sweep.sh                     # CHẠY THẬT, tuần tự theo ưu tiên
 #   bash scripts/sweep.sh --set run.dry_run=true      # chỉ kiểm cấu hình
-#   SWEEP_CELLS="dora:16 qdora:16" bash scripts/sweep.sh
-#   SWEEP_CELLS="vera:256 vera:512 vera:1024" bash scripts/sweep.sh  # riêng VeRA
-#   SWEEP_MODEL=qwen25vl bash scripts/sweep.sh
-#   SWEEP_ALL_MODELS=1 bash scripts/sweep.sh  # gemma3 xong rồi tới qwen25vl
+#   SWEEP_CELLS="brm:20 gslf:3" bash scripts/sweep.sh      # chỉ vài ô
+#   SWEEP_MODE=train bash scripts/sweep.sh                 # tách khâu test
+#   SWEEP_FORCE=1 bash scripts/sweep.sh                    # chạy lại ô đã xong
 #
 # Mặc định --mode both: mỗi ô train xong chạy luôn infer + metrics, nên
 # outputs/<tag>/ có đủ reports.csv và metrics.json để so sánh. Đặt
@@ -26,26 +26,25 @@ source "$ROOT/scripts/_env.sh"
 # Chế độ container: out_dir nằm trên volume (§9), không phải ./outputs.
 OUTBASE="$RGEXP_OUTBASE"
 
-# §3.2 — thứ tự ƯU TIÊN: bốn cột in đậm (DoRA/QDoRA) trước, rồi LoRA/QLoRA,
-# cuối cùng VeRA theo rank tăng dần 256 -> 512 -> 1024 (VeRA chỉ học 2 vector
-# scale mỗi layer nên rank phải cao; không có nhánh 4-bit).
-# Chạy hết mất nhiều ngày; ô nào xong là có metrics của ô đó, không phải chờ
-# cả sweep.
-DEFAULT_CELLS="dora:16 dora:8 qdora:16 qdora:8 lora:16 lora:32 qlora:16 qlora:32 vera:256 vera:512 vera:1024"
+# Thứ tự ƯU TIÊN: quét TRƯỚC ba ô nhỏ nhất của cả ba biến thể (cùng ~67M
+# tham số) để sớm biết kiến trúc nào hơn, RỒI mới tăng n_block. Chạy hết 22 ô
+# mất nhiều ngày; xếp thế này thì dừng giữa chừng vẫn có câu trả lời.
+DEFAULT_CELLS="\
+brm:10 mbrf:2 gslf:1 \
+brm:20 mbrf:4 gslf:2 \
+brm:30 mbrf:6 gslf:3 \
+brm:40 mbrf:8 gslf:4 \
+brm:15 mbrf:3 gslf:5 \
+brm:25 mbrf:5 gslf:6 \
+brm:35 mbrf:7 brm:45 mbrf:9"
 CELLS="${SWEEP_CELLS:-$DEFAULT_CELLS}"
 MODE="${SWEEP_MODE:-both}"
-
-# §3.2: "ưu tiên Gemma3-4b-it trước". SWEEP_ALL_MODELS=1 để chạy nối tiếp.
-if [ "${SWEEP_ALL_MODELS:-0}" = "1" ]; then
-    MODELS="gemma3 qwen25vl"
-else
-    MODELS="${SWEEP_MODEL:-gemma3}"
-fi
+MODELS="${SWEEP_MODEL:-gemma3}"
 
 N_TOTAL=0
 for m in $MODELS; do for c in $CELLS; do N_TOTAL=$((N_TOTAL+1)); done; done
 
-echo "═══ SWEEP §3.2 ═══"
+echo "═══ SWEEP PHASE 1 — Recombinator × n_block ═══"
 rgexp_banner
 echo "Model : $MODELS"
 echo "Ô     : $CELLS"
@@ -74,8 +73,8 @@ FAST_FAILS=0
 for MODEL in $MODELS; do
 for cell in $CELLS; do
     variant="${cell%%:*}"
-    rank="${cell##*:}"
-    tag="$MODEL-$variant-r$rank"
+    nblock="${cell##*:}"
+    tag="$MODEL-$variant-n$nblock"
     IDX=$((IDX+1))
 
     # Ô đã có metrics -> bỏ qua. Cho phép dừng giữa chừng rồi chạy lại tiếp
@@ -91,7 +90,7 @@ for cell in $CELLS; do
     echo "───────────────────────────────────────────────────────────"
     T0=$(date +%s)
     if bash scripts/run_local.sh --model "$MODEL" --variant "$variant" \
-            --rank "$rank" --mode "$MODE" "$@"; then
+            --n-block "$nblock" --mode "$MODE" "$@"; then
         MIN=$(( ($(date +%s) - T0) / 60 ))
         # Xác nhận ô thật sự sinh metrics, không chỉ thoát mã 0.
         if [ -f "$OUTBASE/$tag/metrics.json" ]; then
