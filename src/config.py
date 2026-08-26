@@ -122,7 +122,10 @@ PRESETS = [
     (70, "A100-80 / H100", 8, 4, 8, True),
     (38, "A100-40 / L40S", 4, 8, 4, True),
     (22, "RTX 3090/4090", 2, 16, 2, True),
-    (0, "GPU <22GB", 1, 32, 1, True),
+    # 16GB (4070 Ti Super / 4080 / L4): base NF4 ~2.5GB + dequantize base weight
+    # trong forward + E bản delta lúc backward -> chỉ vừa đúng train_bs=1.
+    (14, "16GB (4070 Ti S / 4080 / L4)", 1, 32, 1, True),
+    (0, "GPU <14GB — chật", 1, 32, 1, True),
 ]
 
 # ── Ô sweep Phase 1: biến thể Recombinator × số block (§2) ───────────────────
@@ -185,6 +188,11 @@ def pick_attn_impl():
 def pick_preset(vram_gb):
     for min_vram, name, bs, accum, ibs, ckpt in PRESETS:
         if vram_gb >= min_vram:
+            if vram_gb < 12:
+                print(f"⚠ Chỉ {vram_gb:.1f}GB VRAM — dưới sàn thực tế của QDoRA "
+                      f"4 expert. Nếu OOM ở STAGE 0 thì không có preset nào cứu "
+                      f"được, phải hạ fixed.n_expert (mất ý nghĩa sweep) hoặc "
+                      f"đổi GPU.")
             return dict(name=name, train_bs=bs, grad_accum=accum,
                         infer_bs=ibs, grad_ckpt=ckpt)
     raise RuntimeError("Không khớp preset nào")

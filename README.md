@@ -419,7 +419,8 @@ tính lại phép nhân ma trận base.
 | ≥70GB | A100-80, H100 | 8 × 4 | bật |
 | ≥38GB | A100-40, L40S | 4 × 8 | bật |
 | ≥22GB | RTX 3090/4090 | 2 × 16 | bật |
-| <22GB | — | 1 × 32 | bật |
+| 14–22GB | 4070 Ti Super, 4080, L4 | 1 × 32 | bật |
+| <14GB | — | 1 × 32 | bật |
 
 Thấp hơn sweep adapter cũ một bậc và **luôn bật grad-checkpoint**: MoE giữ E
 bản delta cùng lúc khi backward. `use_reentrant=False` là bắt buộc — đó là bản
@@ -725,6 +726,8 @@ So sánh giữa các ô: xem §5.
 | `or_mask_function ... require torch>=2.6` | transformers ≥4.53 + torch 2.5.x của image | `pip install "transformers>=4.50,<4.53"` (setup.sh bước 5b tự làm), hoặc nâng torch lên 2.6 |
 | `sm_120 is not compatible with the current PyTorch installation` | GPU Blackwell (5090) + torch cu121 | `pip install -U torch torchvision --index-url .../cu128` + `bitsandbytes>=0.46` (setup.sh bước 4 tự làm) |
 | `no kernel image is available for execution` | cùng nguyên nhân trên, nhưng lỗi nổ muộn hơn | như trên |
+| `torch hiện tại KHÔNG có kernel cho sm_89` ở setup bước 4 | bản cũ so chuỗi `sm_89` với `get_arch_list()`; Ada chạy bằng cubin `sm_86` | đã sửa: so theo tương thích nhị phân. Gặp lại thì `RGEXP_NO_TORCH_UPGRADE=1` để chặn tải 2.5GB vô ích |
+| OOM ngay micro-batch đầu trên card 16GB | `configs/default.yaml` ghim `train_bs` số cứng → preset VRAM bị bỏ qua | để `train_bs`/`grad_accum`/`infer_bs` = `null` (mặc định hiện tại) |
 | `torch._dynamo.exc.Unsupported: Tensor.requires_grad_` ở khâu infer | hook của grad-checkpointing còn sống khi `generate()` bị torch.compile | đã vá trong `src/train.py`: gỡ hook + `disable_compile` trước khi sinh. Bản cũ: `export TORCHDYNAMO_DISABLE=1` |
 | `no such option: --root-user-action` | pip < 22.1 | setup.sh tự dò cờ; nếu vẫn gặp thì `pip install -U pip` |
 | **Máy thuê** — `/usr/bin/env: 'bash\r': No such file or directory` | file .sh bị commit kèm CR (Windows) | `sed -i 's/\r$//' scripts/*.sh`; sửa hẳn bằng `.gitattributes` + `git add --renormalize .` |
@@ -865,7 +868,8 @@ bf16 thì dừng ngay, không có nhánh fp16.
 
 | GPU | sm | bf16 | torch tối thiểu |
 |---|---|---|---|
-| RTX 3070 / 3090 / 4090 / A100 / L4 / L40S | sm80–89 | ✓ | cu121 |
+| RTX 3070 / 3090 / A100 | sm80–86 | ✓ | cu121 |
+| RTX 4070 Ti S / 4080 / 4090 / L4 / L40S | sm89 | ✓ | cu121 chạy được; setup.sh chọn **cu124** để có torch ≥ 2.6 |
 | H100 | sm90 | ✓ | cu124 |
 | **RTX 5090 / 5080** | sm120 | ✓ | **cu128** — bản cu121 của image không có kernel sm120 |
 | **V100** | sm70 | ✗ dừng | — |
@@ -876,6 +880,11 @@ build sẵn cho một tập kiến trúc. Nạp model lên GPU ngoài tập đó
 `UserWarning` rồi vỡ sau đó bằng lỗi khó hiểu. `setup.sh` bước 4 so
 `torch.cuda.get_device_capability()` với `torch.cuda.get_arch_list()` và tự nâng
 torch đúng bản khi lệch (`RGEXP_NO_TORCH_UPGRADE=1` để tự làm tay).
+
+Phép so đó theo **tương thích nhị phân**, không phải so chuỗi: CUDA bảo đảm
+cubin `sm_Xy` chạy trên mọi thiết bị `sm_Xz` với `z ≥ y`. Không wheel torch nào
+build riêng `sm_89` (Ada dùng cubin `sm_86`), nên so chuỗi thẳng sẽ báo nhầm
+4070 Ti Super / 4090 / L40S là "thiếu kernel" rồi tải lại ~2.5GB torch y hệt.
 
 **Cửa 2 — VRAM.** Gemma3-4b ở bf16 tốn ~8.6GB **chỉ riêng weight**, chưa kể
 optimizer state, activation và KV cache.
@@ -888,7 +897,7 @@ số 2.5GB làm chuẩn.
 |---|---|---|
 | ≥38GB | A100, L40S | batch 4×8, cả ô `gslf-n6` nặng nhất |
 | 22–24GB | 3090, 4090 | batch 2×16 |
-| 12–16GB | L4, 4080 | batch 1×32, chạy được nhưng chậm |
+| 12–16GB | L4, 4080, **4070 Ti Super** | batch 1×32, chạy được nhưng chậm |
 | ≤8GB | RTX 3070, 3060Ti | không đủ — hạ `fixed.n_expert` xuống 2 thì mất luôn ý nghĩa của sweep |
 
 Chênh lệch VRAM giữa các ô sweep là **nhỏ**: cả bảng chỉ dao động 67M → 72M

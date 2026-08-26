@@ -130,9 +130,16 @@ VENV="${VENV_DIR:-$RGEXP_ROOT/.venv}"
 # $1 = "allow-missing" -> không lỗi khi chưa có venv (setup.sh sẽ tự tạo)
 rgexp_activate_py() {
     if [ "$USE_VENV" = "1" ]; then
-        if [ -d "$VENV" ]; then
+        # Windows (Git Bash / terminal VSCode) đặt script kích hoạt ở
+        # .venv/Scripts, không phải .venv/bin. Thiếu nhánh này thì venv coi như
+        # không tồn tại: PYBIN rơi về python hệ thống, mọi thứ vừa cài không
+        # thấy đâu, và lỗi hiện ra tận dòng import của src/train.py.
+        if [ -f "$VENV/bin/activate" ]; then
             # shellcheck disable=SC1091
             source "$VENV/bin/activate"
+        elif [ -f "$VENV/Scripts/activate" ]; then
+            # shellcheck disable=SC1091
+            source "$VENV/Scripts/activate"
         elif [ "${1:-}" != "allow-missing" ]; then
             echo "✗ Chưa có venv ($VENV). Chạy trước:  bash scripts/setup.sh"
             echo "  (đang ở container thuê? đặt RGEXP_REMOTE=1 để dùng python của image)"

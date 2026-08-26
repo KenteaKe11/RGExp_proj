@@ -53,8 +53,14 @@ fi
 
 # ── 1. Kiểm tra Python ≥ 3.10 ────────────────────────────────────────────────
 if ! command -v "$PY" >/dev/null 2>&1; then
-    echo "✗ Không thấy '$PY'. Đặt PYTHON_BIN=/duong/dan/python3 rồi chạy lại."
-    exit 1
+    # Trên Windows (Git Bash) chỉ có `python`, không có `python3`. Thử trước
+    # khi bỏ cuộc — bắt người dùng đặt PYTHON_BIN cho việc này là vô cớ.
+    if [ -z "${PYTHON_BIN:-}" ] && command -v python >/dev/null 2>&1; then
+        PY=python
+    else
+        echo "✗ Không thấy '$PY'. Đặt PYTHON_BIN=/duong/dan/python3 rồi chạy lại."
+        exit 1
+    fi
 fi
 PYVER=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 if [ "$(printf '%s\n3.10\n' "$PYVER" | sort -V | head -1)" != "3.10" ]; then
@@ -77,7 +83,13 @@ GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
 case "$GPU_SM" in
     12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;   # Blackwell trở lên
     90)          CUDA_TAG="cu124"; MIN_TAG="cu124" ;;   # Hopper
-    8*)          CUDA_TAG="cu121"; MIN_TAG="" ;;        # Ampere / Ada
+    # Ada (4070 Ti Super / 4080 / 4090 / L4 / L40S) = sm89. KHÔNG wheel nào
+    # build riêng sm_89: torch bỏ qua nó vì cubin sm_86 chạy được trên sm_89
+    # (cùng major, minor thấp hơn -> tương thích nhị phân). cu121 chạy được,
+    # nhưng cu124 là bản thấp nhất còn ra torch >= 2.6 — mốc mà transformers
+    # >= 4.53 đòi cho mask ảnh Gemma 3, nên khỏi phải ghim ngược ở bước 5b.
+    89)          CUDA_TAG="cu124"; MIN_TAG="" ;;
+    8*)          CUDA_TAG="cu121"; MIN_TAG="" ;;        # Ampere
     *)           MIN_TAG="" ;;
 esac
 if [ -n "$GPU_SM" ]; then echo "✓ GPU sm$GPU_SM${MIN_TAG:+ -> cần torch $MIN_TAG trở lên}"; fi
@@ -152,18 +164,32 @@ if "$PYBIN" -c "import torch" 2>/dev/null; then
     # torch "import được" KHÔNG có nghĩa là chạy được trên GPU này. Kernel được
     # biên dịch sẵn cho một tập kiến trúc; GPU ngoài tập đó chỉ hiện một
     # UserWarning lúc khởi tạo rồi vỡ sau đó bằng lỗi khó hiểu. Kiểm thẳng.
+    # So khớp phải theo TƯƠNG THÍCH NHỊ PHÂN chứ không phải so chuỗi. CUDA bảo
+    # đảm cubin sm_Xy chạy trên mọi thiết bị sm_Xz với z >= y (cùng major,
+    # minor thấp hơn). Không wheel nào build sm_89, nên so chuỗi thẳng sẽ báo
+    # nhầm mọi card Ada là "thiếu kernel" rồi tải lại ~2.5GB torch y hệt —
+    # lần chạy sau vẫn báo nhầm đúng như thế.
     ARCH=$("$PYBIN" - <<'PYEOF'
+import re
+
 import torch
 try:
-    cap = torch.cuda.get_device_capability(0)
+    major, minor = torch.cuda.get_device_capability(0)
 except Exception as e:
     print(f"unknown {e}"); raise SystemExit
-sm = f"sm_{cap[0]}{cap[1]}"
-print("ok" if sm in torch.cuda.get_arch_list() else sm)
+best = None
+for a in torch.cuda.get_arch_list():
+    m = re.match(r"sm_(\d+?)(\d)[a-z]*$", a)
+    if not m:
+        continue
+    amaj, amin = int(m.group(1)), int(m.group(2))
+    if amaj == major and amin <= minor and (best is None or amin > best):
+        best = amin
+print(f"ok sm_{major}{best}" if best is not None else f"sm_{major}{minor}")
 PYEOF
 )
     case "$ARCH" in
-        ok)       echo "✓ torch có kernel cho GPU này" ;;
+        ok*)      echo "✓ torch có kernel cho GPU này (cubin ${ARCH#ok })" ;;
         unknown*) echo "⚠ không kiểm được arch list ($ARCH)" ;;
         *)
             echo "✗ torch hiện tại KHÔNG có kernel cho $ARCH."
