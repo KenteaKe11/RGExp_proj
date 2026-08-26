@@ -5,7 +5,7 @@
 
 CE nằm ở src/model.py (dính chặt với chuyện cắt logits của decoder), Aux nằm ở
 src/router.py (dính chặt với gate). File này giữ phần supervised: bảng α theo
-tần suất và Focal loss.
+tần suất (nghịch đảo căn bậc 8) và Focal loss.
 """
 from __future__ import annotations
 
@@ -16,25 +16,30 @@ import torch.nn.functional as F
 EPS = 1e-6
 
 
-def isrf_alpha(cell_freq, normalize="row", eps=EPS):
-    """α_ij = 1/√(f_ij + ε) — nghịch đảo CĂN BẬC HAI tần suất (§1.6).
+def inv_freq_alpha(cell_freq, normalize="row", power=0.125, eps=EPS):
+    """α_ij = 1/(f_ij + ε)^(1/8) — nghịch đảo CĂN BẬC 8 tần suất (§1.6).
 
     `cell_freq` [14, 4]: tỉ lệ xuất hiện của (bệnh i, aspect j) trong TRAIN.
 
-    Vì sao căn bậc hai chứ không phải nghịch đảo thẳng: ô hiếm nhất trong tập
-    này cỡ 0.01% -> 1/f = 10_000 lần trọng số, một mẫu hiếm sẽ nuốt trọn
-    gradient của cả batch. Căn bậc hai kéo tỉ lệ đó về ~100 lần: vẫn ưu tiên rõ
-    rệt, nhưng không lật ngược bài toán.
+    Vì sao căn bậc 8 chứ không phải căn bậc hai (bản cũ). Ô hiếm nhất của bảng
+    này cỡ 1e-6: 1/f cho nó cả triệu lần trọng số, mà 1/√f vẫn còn ~1_000 lần
+    — một nhúm mẫu hiếm nuốt trọn gradient của cả batch và loss nhảy loạn theo
+    việc batch có trúng ô đó hay không. Mũ 1/8 kéo dải α về ~5.0 lần: thứ tự
+    ưu tiên giữ nguyên (ô hiếm vẫn nặng hơn ô phổ biến), nhưng không ô nào một
+    mình lấn át.
+
+    `power` là số mũ dưới mẫu: 0.125 = căn bậc 8 (mặc định §1.6),
+    0.5 = căn bậc hai (hành vi cũ), 1.0 = nghịch đảo thẳng.
 
     normalize:
       "row"    Σ_j f_ij·α_ij = 1 cho từng bệnh — kỳ vọng α trên dữ liệu thật
                bằng 1, nên độ lớn Focal loss so sánh được với CE. MẶC ĐỊNH.
       "global" chuẩn hoá một lần trên cả bảng (giữ chênh lệch giữa các bệnh).
-      "none"   để nguyên 1/√f — đọc log thấy loss vài chục là bình thường.
+      "none"   để nguyên 1/f^p — với p=1/8 thì α nằm gọn trong ~[1, 5].
     """
     f = np.asarray(cell_freq, dtype=np.float64)
     assert f.shape == (14, 4), f"cell_freq phải là [14, 4], nhận {f.shape}"
-    a = 1.0 / np.sqrt(f + eps)
+    a = 1.0 / np.power(f + eps, float(power))
     if normalize == "row":
         denom = (f * a).sum(axis=1, keepdims=True)
         a = a / np.clip(denom, eps, None)
@@ -50,7 +55,7 @@ def focal_loss(logits, target, alpha, gamma=2.0):
 
     logits [B, 14, 4] — chưa softmax
     target [B, 14]     — chỉ số aspect đúng (0..3); giá trị < 0 = bỏ qua ô đó
-    alpha  [14, 4]     — bảng ISRF, cùng device
+    alpha  [14, 4]     — bảng α theo tần suất, cùng device
 
         FL = −α_{i,y} · (1 − p_{i,y})^γ · log p_{i,y}
 

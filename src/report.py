@@ -6,7 +6,7 @@ xuất ra:
   outputs/_summary/metrics_full.csv     mọi metric × mọi ô (dạng dài)
   outputs/_summary/metrics_table.md     bảng biến thể × n_block
   outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ (so ngang
-                                        ba biến thể ở cùng ngân sách)
+                                        hai biến thể ở cùng ngân sách)
   outputs/_summary/gen_text.csv         gen_text side-by-side theo img_rel
   outputs/_summary/gen_text.md          bản dễ đọc, N mẫu đầu
   outputs/_summary/run_health.md        tiến trình / tốc độ / VRAM / lỗi
@@ -24,11 +24,10 @@ import pandas as pd
 
 # Dải n_block của từng biến thể (khớp src/config.py SWEEP_BLOCKS).
 SWEEP_BLOCKS = {
-    "brm": (10, 15, 20, 25, 30, 35, 40, 45),
-    "mbrf": (2, 3, 4, 5, 6, 7, 8, 9),
+    "brm": (10, 20, 30, 40, 50, 60),
     "gslf": (1, 2, 3, 4, 5, 6),
 }
-VARIANT_ROWS = ["brm", "mbrf", "gslf"]
+VARIANT_ROWS = ["brm", "gslf"]
 
 # Metric chính hiển thị trong bảng tóm tắt; metrics_full.csv giữ đủ tất cả.
 HEADLINE = ["corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",

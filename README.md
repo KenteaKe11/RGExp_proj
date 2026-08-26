@@ -185,12 +185,15 @@ Tất cả là metric **tổng thể trên corpus** — không sinh cột metric
 | Thành phần | Dùng ở | Công thức |
 |---|---|---|
 | `CE` | Phase 2 | CrossEntropy + `label_smoothing = 0.1` (tổng khối lượng các lớp SAI là 0.1, nhãn không còn one-hot) |
-| `Focal` | Phase 1 + 2 | `−α_{i,y}·(1−p)^2·log p` trên 14 bệnh × 4 aspect, `α_{ij} = 1/√(f_ij+ε)` lấy từ tần suất TRAIN |
+| `Focal` | Phase 1 + 2 | `−α_{i,y}·(1−p)^2·log p` trên 14 bệnh × 4 aspect, `α_{ij} = 1/(f_ij+ε)^(1/8)` lấy từ tần suất TRAIN |
 | `Aux` | Phase 2 | load-balancing kiểu Switch: `E·Σ_e f_e·P_e`, tối thiểu = 1.0 khi mọi expert nhận đều tải |
 
-**Vì sao căn bậc hai chứ không phải `1/f`.** Ô hiếm nhất cỡ 0.01%: `1/f` cho
-nó trọng số gấp 10 000 lần ô phổ biến — một mẫu hiếm sẽ nuốt trọn gradient của
-cả batch. `1/√f` kéo về ~100 lần: vẫn ưu tiên rõ, không lật ngược bài toán.
+**Vì sao căn bậc 8 chứ không phải `1/f` hay `1/√f`.** Ô hiếm nhất cỡ `1e-6`:
+`1/f` cho nó trọng số gấp cả triệu lần ô phổ biến, `1/√f` vẫn còn **~1000 lần**
+— một nhúm mẫu hiếm nuốt trọn gradient của cả batch và loss nhảy loạn theo việc
+batch có trúng ô đó hay không. Mũ `1/8` kéo dải α xuống **~5.0 lần**: thứ tự ưu
+tiên giữ nguyên (ô hiếm vẫn nặng hơn), nhưng không ô nào một mình lấn át. Số mũ
+nằm ở `run.focal_alpha_pow` (0.125 mặc định; 0.5 = hành vi cũ).
 Bảng α còn được chuẩn hoá theo hàng (`Σ_j f_ij·α_ij = 1`) để độ lớn Focal so
 sánh được với CE — đổi bằng `run.focal_alpha_normalize`.
 
@@ -210,7 +213,7 @@ trên `max(len(target)) + 1` vị trí cuối.
 | | Mẫu | Cái gì chạy | Loss |
 |---|---|---|---|
 | **Phase 1** | 6400 đầu (≈5% train) | CHỈ nhánh router — decoder bị cắt ngay sau embedding | `Focal` |
-| **Phase 2** | 6400 kế tiếp | router + 4 expert + decoder | `CE + 0.5·Focal + 0.03·Aux` |
+| **Phase 2** | 6400 kế tiếp | router + 4 expert + decoder | `CE + 0.4·Focal + 0.05·Aux` |
 
 Hai phase dùng **hai lát mẫu khác nhau**: Phase 2 mà học lại chính những mẫu
 nhánh supervised đã thuộc thì `val_loss` của nó không còn nói lên điều gì. Cả
@@ -303,15 +306,16 @@ không — gate sẽ học một tín hiệu không tồn tại ở thời đi�
 decode. Bước decode chỉ có 1 token mới; tính lại là mỗi token rơi vào một expert
 khác.
 
-### 3.2. Ba biến thể Recombinator (ô sweep)
+### 3.2. Các biến thể Recombinator
 
 Mọi Linear đều **không bias**, pre-norm + residual, RMSNorm — giống nhau ở cả
-ba để so sánh là công bằng.
+ba để so sánh là công bằng. **Sweep (§3.3) chỉ quét `brm` và `gslf`**; `mbrf`
+vẫn còn trong `src/router.py` và chạy tay được, nhưng không có ô nào.
 
 | Ký hiệu | Cấu tạo một block | Param/block | Quy đổi |
 |---|---|---|---|
 | **brm** | RMSNorm → 512→128 → GeLU → 128→512 → GeLU (+skip) | 131 584 | 1× |
-| **mbrf** | RMSNorm → **MQAttn** (8 head, 1 KV) → RMSNorm → 512→64→512 bottleneck FFN | 656 384 | ≈5× |
+| **mbrf** | RMSNorm → **MQAttn** (8 head, 1 KV) → RMSNorm → 512→64→512 bottleneck FFN *(ngoài sweep)* | 656 384 | ≈5× |
 | **gslf** | RMSNorm → **GQAttn** (8 head, 2 KV) → RMSNorm → Linear 512→512 (+skip) | 918 528 | ≈7× |
 
 `brm` không có attention: token **không** trộn với nhau, mỗi vị trí được nắn
@@ -334,19 +338,18 @@ số trong tài liệu thiết kế — chạy sau mỗi lần sửa kiến trú
 ### 3.3. Bảng sweep
 
 `effective_batch = 32`, `E = 4`, `top-k = 2`, QDoRA r8 α16 — tất cả cố định.
-`n_block` của ba biến thể được chọn để phủ **cùng một dải tham số** (~67M →
-~72M): có thế mới trả lời được "cùng ngân sách thì kiến trúc nào hơn".
+`n_block` của hai biến thể được chọn để phủ **chung một dải tham số** (phần
+chồng nhau ~67M → ~72M): có thế mới trả lời được "cùng ngân sách thì kiến trúc
+nào hơn". 6 × 2 = **12 ô**.
 
-| ô | tổng param | | ô | tổng param | | ô | tổng param |
-|---|---|---|---|---|---|---|---|
-| brm-n10 | 67.6M | | mbrf-n2 | 67.6M | | gslf-n1 | 67.2M |
-| brm-n15 | 68.3M | | mbrf-n3 | 68.3M | | gslf-n2 | 68.1M |
-| brm-n20 | 68.9M | | mbrf-n4 | 68.9M | | gslf-n3 | 69.0M |
-| brm-n25 | 69.6M | | mbrf-n5 | 69.6M | | gslf-n4 | 70.0M |
-| brm-n30 | 70.2M | | mbrf-n6 | 70.2M | | gslf-n5 | 70.9M |
-| brm-n35 | 70.9M | | mbrf-n7 | 70.9M | | gslf-n6 | 71.8M |
-| brm-n40 | 71.5M | | mbrf-n8 | 71.5M | | | |
-| brm-n45 | 72.2M | | mbrf-n9 | 72.2M | | | |
+| ô | tổng param | | ô | tổng param |
+|---|---|---|---|---|
+| brm-n10 | 67.6M | | gslf-n1 | 67.2M |
+| brm-n20 | 68.9M | | gslf-n2 | 68.1M |
+| brm-n30 | 70.2M | | gslf-n3 | 69.0M |
+| brm-n40 | 71.5M | | gslf-n4 | 70.0M |
+| brm-n50 | 72.9M | | gslf-n5 | 70.9M |
+| brm-n60 | 74.2M | | gslf-n6 | 71.8M |
 
 Kết quả điền vào `outputs/_summary/` (§5): `metrics_table.md` xếp theo
 `n_block`, `param_curve.md` xếp theo **tổng tham số** — bảng thứ hai mới là
@@ -357,18 +360,18 @@ Chạy một ô:
 ```bash
 bash scripts/run_local.sh --variant brm  --n-block 20 --mode both --no-dry-run
 bash scripts/run_local.sh --variant gslf --n-block 3  --mode both --no-dry-run
-bash scripts/run_local.sh --variant mbrf --n-block 4  --phase 1 --no-dry-run
+bash scripts/run_local.sh --variant mbrf --n-block 4  --phase 1 --no-dry-run  # ngoài sweep
 ```
 
 Chạy cả bảng, tuần tự:
 
 ```bash
 bash scripts/sweep.sh --no-dry-run
-SWEEP_CELLS="brm:10 mbrf:2 gslf:1" bash scripts/sweep.sh --no-dry-run
+SWEEP_CELLS="brm:10 gslf:1" bash scripts/sweep.sh --no-dry-run
 SWEEP_MODE=train bash scripts/sweep.sh --no-dry-run   # tách khâu test ra sau
 ```
 
-Thứ tự mặc định quét **ba ô nhỏ nhất của cả ba biến thể trước** (cùng ~67M),
+Thứ tự mặc định quét **hai ô nhỏ nhất của cả hai biến thể trước** (cùng ~67M),
 rồi mới tăng `n_block`. Dừng giữa chừng vẫn có câu trả lời sơ bộ về kiến trúc.
 
 Mỗi ô có `out_dir` và `ckpt_dir` riêng (`<model>-<variant>-n<n_block>`), nên
@@ -440,7 +443,7 @@ lệnh hạ.
 3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm75 (T4).
 4. **Hai phase, 6400 + 6400 mẫu** (§1.7). Không tính theo epoch nữa: một ô
    sweep là một lượng mẫu cố định, không phải một vòng qua tập train.
-5. Thứ tự ô: ba biến thể ở ngân sách nhỏ nhất trước, rồi tăng dần `n_block`.
+5. Thứ tự ô: hai biến thể ở ngân sách nhỏ nhất trước, rồi tăng dần `n_block`.
 
 Sau Phase 1 (chốt được cặp variant-n_block tốt nhất) mới sang Phase 2 của
 chiến lược: quét `E` và tỉ lệ `E/k`.
@@ -574,7 +577,7 @@ mimic_cxr_vlm/
 │   │                         #   in bảng tham số và đối chiếu tài liệu
 │   ├── moe.py                # ★ trộn E expert QDoRA theo gate, cache dequantize,
 │   │                         #   đường tắt lúc infer, lưu/nạp expert
-│   ├── losses.py             # ★ α = 1/√f (ISRF) + Focal loss §1.6
+│   ├── losses.py             # ★ α = 1/f^(1/8) + Focal loss §1.6
 │   ├── config.py             # nạp YAML, dò GPU, giải quyết ô sweep, seq_len 2^k
 │   │                         #   + khối remote §9 (cache/outputs trên volume)
 │   ├── data.py               # tải HF Hub, split §1.1, rare-first, lát 2 phase
@@ -611,7 +614,7 @@ build_frames           chiếu key → hàng, assert không rò rỉ train/val/t
       ↓
 attach_labels          gắn y14 (14 aspect) cho train/val/test, loại dòng thiếu nhãn
       ↓
-cell_frequency         tần suất 14×4 trên TRAIN → α = 1/√f cho Focal
+cell_frequency         tần suất 14×4 trên TRAIN → α = 1/f^(1/8) cho Focal
       ↓
 rare_first_order       xếp mẫu hiếm lên đầu → phase_slice cắt 2 lát 6400
       ↓
@@ -623,7 +626,7 @@ STAGE 0                2 step thử: VRAM đỉnh, s/step, ETA, Σ|grad| router 
       ↓
 PHASE 1                encode → router → Focal      (decoder KHÔNG chạy)
       ↓
-PHASE 2                router → gate → decoder → CE + 0.5·Focal + 0.03·Aux
+PHASE 2                router → gate → decoder → CE + 0.4·Focal + 0.05·Aux
       ↓
 freeze_scales          tính sẵn m/‖V+ΔV‖ cho infer (150 bước decode × 238 layer)
       ↓
@@ -926,7 +929,7 @@ bash scripts/collect.sh              # sinh outputs/_summary/ (§5)
 ### 9.6. Tiết kiệm tiền
 
 - Chạy `--dry-run` trước mọi ô mới. STAGE 0 mất 5 phút; OOM ở giờ thứ 3 mất 3 giờ.
-- `SWEEP_CELLS="brm:10 mbrf:2 gslf:1"` để chỉ chạy các ô cần, thay vì cả 22 ô.
+- `SWEEP_CELLS="brm:10 gslf:1"` để chỉ chạy các ô cần, thay vì cả 12 ô.
 - `sweep.sh` **bỏ qua ô đã có `metrics.json`** — xoá instance rồi thuê lại, chỉ
   cần rsync `outputs/` lên máy mới là nó đi tiếp từ ô còn thiếu.
 - `run.resume: true` + checkpoint trên Hub: một ô đang train dở cũng nối lại

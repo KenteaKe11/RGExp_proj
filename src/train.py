@@ -32,7 +32,7 @@ from .config import (adapter_desc, config_from_args, image_desc, phase_steps,
 from .data import (attach_labels, build_frames, cell_frequency, fetch_sources,
                    load_or_make_splits, phase_slice, rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
-from .losses import focal_loss, isrf_alpha, supervised_stats
+from .losses import focal_loss, inv_freq_alpha, supervised_stats
 from .metrics import run_metrics
 from .model import (build_collate, build_model, build_prompt, ce_loss,
                     count_image_tokens, encode_only, load_image, make_loader,
@@ -119,6 +119,7 @@ def main(argv=None):
             "lr": r.lr, "lr_router": r.lr_router,
             "label_smoothing": f.label_smoothing,
             "w_sup": r.w_sup, "w_aux": r.w_aux, "focal_gamma": r.focal_gamma,
+            "focal_alpha_pow": r.focal_alpha_pow,
             "use_policy": r.use_policy,
         })
         log("wandb", wandb.run.url)
@@ -147,8 +148,9 @@ def main(argv=None):
     df_val, _ = attach_labels(df_val, npz_path, cfg, log, "val")
     df_test, _ = attach_labels(df_test, npz_path, cfg, log, "test")
     cell_freq = cell_frequency(y_train, npz_path, log)
-    alpha = isrf_alpha(cell_freq, r.focal_alpha_normalize).to(DEVICE)
-    log("label", f"α ISRF ({r.focal_alpha_normalize}): "
+    alpha = inv_freq_alpha(cell_freq, r.focal_alpha_normalize,
+                           r.focal_alpha_pow).to(DEVICE)
+    log("label", f"α = 1/f^{r.focal_alpha_pow} ({r.focal_alpha_normalize}): "
                  f"min={alpha.min():.3f} max={alpha.max():.3f} "
                  f"tỉ lệ max/min={float(alpha.max()/alpha.min()):.1f}×")
     base_order = rare_first_order(df_train, cell_freq, cfg, log)

@@ -125,16 +125,18 @@ PRESETS = [
     (0, "GPU <22GB", 1, 32, 1, True),
 ]
 
-# ── Ô sweep Phase 1: biến thể Recombinator × số block ────────────────────────
-# n_block của mỗi biến thể được chọn sao cho TỔNG THAM SỐ của ba biến thể phủ
-# cùng một dải (~67M → ~72M) — có thế mới so được "cùng ngân sách tham số thì
-# kiến trúc nào hơn". Tỉ lệ giá một block: 1 GSLF ≈ 7 BRM ≈ 1.4 MBRF.
+# ── Ô sweep Phase 1: biến thể Recombinator × số block (§2) ───────────────────
+# Sweep chỉ còn HAI biến thể: BRM (baseline không attention) và GSLF. MBRF vẫn
+# nằm trong src/router.py và chạy tay được (--variant mbrf --n-block 4), nhưng
+# không còn ô nào trong bảng mặc định.
+# Tỉ lệ giá một block: 1 GSLF ≈ 7 BRM. brm 10→60 phủ 67.6M→74.2M, gslf 1→6 phủ
+# 67.2M→71.8M — phần chồng nhau (~67M → ~72M) là chỗ so "cùng ngân sách tham
+# số thì kiến trúc nào hơn".
 SWEEP_BLOCKS = {
-    "brm": (10, 15, 20, 25, 30, 35, 40, 45),
-    "mbrf": (2, 3, 4, 5, 6, 7, 8, 9),
+    "brm": (10, 20, 30, 40, 50, 60),
     "gslf": (1, 2, 3, 4, 5, 6),
 }
-assert set(SWEEP_BLOCKS) == set(ROUTER_VARIANTS), "lệch danh sách biến thể"
+assert set(SWEEP_BLOCKS) <= set(ROUTER_VARIANTS), "biến thể sweep lạ với router"
 
 
 def variant_desc(cfg):
@@ -224,6 +226,10 @@ def load_config(path="configs/default.yaml", overrides=None):
     fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
     explicit = {ov.split("=", 1)[0] for ov in (overrides or [])}
 
+    # §1.6 — số mũ của bảng α (0.125 = nghịch đảo căn bậc 8). Đặt default ở đây
+    # để config cũ (chưa có khoá này) không chết giữa chừng vì AttributeError.
+    run.setdefault("focal_alpha_pow", 0.125)
+
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
     rm = read_remote(path)
@@ -231,17 +237,17 @@ def load_config(path="configs/default.yaml", overrides=None):
         _apply_remote(rm, run, explicit)
 
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
-    if sweep["variant"] not in SWEEP_BLOCKS:
+    if sweep["variant"] not in ROUTER_VARIANTS:
         raise ValueError(f"variant lạ: {sweep['variant']} "
-                         f"(chọn: {list(SWEEP_BLOCKS)})")
+                         f"(chọn: {list(ROUTER_VARIANTS)})")
     n_block = int(sweep["n_block"])
-    if n_block not in SWEEP_BLOCKS[sweep["variant"]]:
-        # Không chặn: dải block là gợi ý để ba biến thể so được với nhau, không
-        # phải luật. Nhưng phải BÁO, vì ô ngoài bảng sẽ không có ô đối chứng
-        # cùng ngân sách tham số ở hai biến thể kia.
+    if n_block not in SWEEP_BLOCKS.get(sweep["variant"], ()):
+        # Không chặn: dải block là gợi ý để hai biến thể so được với nhau, không
+        # phải luật — và mbrf thì cố tình nằm ngoài sweep. Nhưng phải BÁO, vì ô
+        # ngoài bảng không có ô đối chứng cùng ngân sách tham số ở biến thể kia.
         print(f"⚠ sweep: {sweep['variant']}-n{n_block} nằm ngoài bảng "
-              f"{SWEEP_BLOCKS[sweep['variant']]} — ô này không có đối chứng "
-              f"cùng lượng tham số ở biến thể khác.")
+              f"{SWEEP_BLOCKS.get(sweep['variant']) or '(biến thể ngoài sweep)'}"
+              f" — ô này không có đối chứng cùng lượng tham số ở biến thể khác.")
     sweep["n_block"] = n_block
     if sweep["model"] not in raw["models"]:
         raise ValueError(f"model lạ: {sweep['model']}")
@@ -349,7 +355,7 @@ def build_argparser():
                     metavar="KEY=VALUE",
                     help="Ghi đè config, vd: --set run.phase1_samples=3200")
     ap.add_argument("--model", choices=["gemma3", "qwen25vl"])
-    ap.add_argument("--variant", choices=list(SWEEP_BLOCKS))
+    ap.add_argument("--variant", choices=list(ROUTER_VARIANTS))
     ap.add_argument("--n-block", type=int, dest="n_block")
     ap.add_argument("--mode", choices=["train", "test", "both"])
     ap.add_argument("--phase", type=int, choices=[1, 2],
@@ -394,7 +400,7 @@ if __name__ == "__main__":
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
           f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
     print(f"Phase 1 : {c.run.phase1_samples} mẫu = {phase_steps(c, 1)} step "
-          f"| loss = Focal")
+          f"| loss = Focal (α = 1/f^{c.run.focal_alpha_pow})")
     print(f"Phase 2 : {c.run.phase2_samples} mẫu = {phase_steps(c, 2)} step "
           f"| loss = CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")

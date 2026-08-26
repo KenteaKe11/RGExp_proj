@@ -26,17 +26,17 @@ source "$ROOT/scripts/_env.sh"
 # Chế độ container: out_dir nằm trên volume (§9), không phải ./outputs.
 OUTBASE="$RGEXP_OUTBASE"
 
-# Thứ tự ƯU TIÊN: quét TRƯỚC ba ô nhỏ nhất của cả ba biến thể (cùng ~67M
-# tham số) để sớm biết kiến trúc nào hơn, RỒI mới tăng n_block. Chạy hết 22 ô
+# §2 — sweep còn HAI biến thể: brm [10 20 30 40 50 60] × gslf [1..6] = 12 ô.
+# Thứ tự ƯU TIÊN: quét TRƯỚC hai ô nhỏ nhất của cả hai biến thể (cùng ~67M
+# tham số) để sớm biết kiến trúc nào hơn, RỒI mới tăng n_block. Chạy hết 12 ô
 # mất nhiều ngày; xếp thế này thì dừng giữa chừng vẫn có câu trả lời.
 DEFAULT_CELLS="\
-brm:10 mbrf:2 gslf:1 \
-brm:20 mbrf:4 gslf:2 \
-brm:30 mbrf:6 gslf:3 \
-brm:40 mbrf:8 gslf:4 \
-brm:15 mbrf:3 gslf:5 \
-brm:25 mbrf:5 gslf:6 \
-brm:35 mbrf:7 brm:45 mbrf:9"
+brm:10 gslf:1 \
+brm:20 gslf:2 \
+brm:30 gslf:3 \
+brm:40 gslf:4 \
+brm:50 gslf:5 \
+brm:60 gslf:6"
 CELLS="${SWEEP_CELLS:-$DEFAULT_CELLS}"
 MODE="${SWEEP_MODE:-both}"
 MODELS="${SWEEP_MODEL:-gemma3}"

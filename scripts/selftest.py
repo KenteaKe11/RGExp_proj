@@ -21,7 +21,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.losses import focal_loss, isrf_alpha           # noqa: E402
+from src.losses import focal_loss, inv_freq_alpha       # noqa: E402
 from src.router import RouterNet, _selftest             # noqa: E402
 
 FAIL = []
@@ -116,10 +116,10 @@ def test_moe_math():
 
 
 def test_focal():
-    print("\n[5] Focal loss + α ISRF")
+    print("\n[5] Focal loss + α = 1/f^(1/8)")
     freq = torch.rand(14, 4).numpy()
     freq = freq / freq.sum(axis=1, keepdims=True)
-    a = isrf_alpha(freq, "row")
+    a = inv_freq_alpha(freq, "row")
     check("α [14,4]", tuple(a.shape) == (14, 4))
     exp = (torch.tensor(freq, dtype=torch.float32) * a).sum(dim=1)
     check("Σ f·α = 1 mỗi bệnh (chuẩn hoá row)",

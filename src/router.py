@@ -381,8 +381,9 @@ def _selftest():
 
     print("\nTổng tham số theo ô sweep (E=4 expert QDoRA r8 ≈ 15.9M/expert):")
     print(f"{'ô':<16}{'router':>12}{'expert':>14}{'tổng':>12}")
-    for variant, blocks in (("brm", (10, 15, 20, 25, 30, 35, 40, 45)),
-                            ("mbrf", (2, 3, 4, 5, 6, 7, 8, 9)),
+    # Bảng sweep §2 (brm × gslf). mbrf giữ lại trong VARIANTS để chạy tay,
+    # nên vẫn đếm param ở trên nhưng không còn ô nào ở đây.
+    for variant, blocks in (("brm", (10, 20, 30, 40, 50, 60)),
                             ("gslf", (1, 2, 3, 4, 5, 6))):
         for n in blocks:
             e = estimate_params(variant, n, 4)
