@@ -156,9 +156,9 @@ run:
   # micro-batch đầu. Muốn ép cho MỘT lần chạy thì dùng
   #     --set run.train_bs=2 --set run.grad_accum=16
   # chứ đừng sửa lại file này — máy khác lại phải sửa ngược.
-  train_bs: null
-  grad_accum: null
-  infer_bs: null
+  train_bs: 4
+  grad_accum: 16
+  infer_bs: 4
   grad_ckpt: null
 
   # §4.1.2 — N = prompt + ảnh + target + padding. null = tự tính về lũy thừa 2.
