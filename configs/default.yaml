@@ -161,8 +161,8 @@ run:
   grad_ckpt: null
 
   # §4.1.2 — N = prompt + ảnh + target + padding. null = tự tính về lũy thừa 2.
-  max_seq_len: 896
-  seq_delta: 128            # chỗ chừa cho target (guard chặn ở 110 token)
+  max_seq_len: 512
+  seq_delta: 0            # chỗ chừa cho target (guard chặn ở 110 token)
 
   # ── Loss & optim ─────────────────────────────────────────────────────────
   lr: 1.0e-4                # expert QDoRA (nắn model đã pretrain)
