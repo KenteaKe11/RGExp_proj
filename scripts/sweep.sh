@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# sweep.sh — chạy tuần tự các ô Phase 1 (biến thể Recombinator × n_block),
+# sweep.sh — chạy tuần tự 4 ô Phase 1 (Recombinator g-brmf, n_block 1→4),
 #            mỗi ô thu FULL metrics test + gen_text
 #
-#   bash scripts/sweep.sh                     # CHẠY THẬT, tuần tự theo ưu tiên
+#   bash scripts/sweep.sh                     # CHẠY THẬT, n=1 rồi 2, 3, 4
 #   bash scripts/sweep.sh --set run.dry_run=true      # chỉ kiểm cấu hình
-#   SWEEP_CELLS="brm:20 gslf:3" bash scripts/sweep.sh      # chỉ vài ô
+#   SWEEP_CELLS="g-brmf:1 g-brmf:3" bash scripts/sweep.sh   # chỉ vài ô
 #   SWEEP_MODE=train bash scripts/sweep.sh                 # tách khâu test
 #   SWEEP_FORCE=1 bash scripts/sweep.sh                    # chạy lại ô đã xong
 #
@@ -26,17 +26,10 @@ source "$ROOT/scripts/_env.sh"
 # Chế độ container: out_dir nằm trên volume (§9), không phải ./outputs.
 OUTBASE="$RGEXP_OUTBASE"
 
-# §2 — sweep còn HAI biến thể: brm [10 20 30 40 50 60] × gslf [1..6] = 12 ô.
-# Thứ tự ƯU TIÊN: quét TRƯỚC hai ô nhỏ nhất của cả hai biến thể (cùng ~67M
-# tham số) để sớm biết kiến trúc nào hơn, RỒI mới tăng n_block. Chạy hết 12 ô
-# mất nhiều ngày; xếp thế này thì dừng giữa chừng vẫn có câu trả lời.
-DEFAULT_CELLS="\
-brm:10 gslf:1 \
-brm:20 gslf:2 \
-brm:30 gslf:3 \
-brm:40 gslf:4 \
-brm:50 gslf:5 \
-brm:60 gslf:6"
+# §2 — chỉ còn MỘT biến thể (g-brmf), sweep là 4 ô: n_block 1 → 4.
+# Thứ tự tăng dần: ô rẻ nhất chạy trước, nên dừng giữa chừng vẫn đọc được xu
+# hướng "thêm block thì điểm đi lên hay đã bão hoà".
+DEFAULT_CELLS="g-brmf:1 g-brmf:2 g-brmf:3 g-brmf:4"
 CELLS="${SWEEP_CELLS:-$DEFAULT_CELLS}"
 MODE="${SWEEP_MODE:-both}"
 MODELS="${SWEEP_MODEL:-gemma3}"
@@ -44,7 +37,7 @@ MODELS="${SWEEP_MODEL:-gemma3}"
 N_TOTAL=0
 for m in $MODELS; do for c in $CELLS; do N_TOTAL=$((N_TOTAL+1)); done; done
 
-echo "═══ SWEEP PHASE 1 — Recombinator × n_block ═══"
+echo "═══ SWEEP PHASE 1 — Recombinator g-brmf × n_block (1→4) ═══"
 rgexp_banner
 echo "Model : $MODELS"
 echo "Ô     : $CELLS"

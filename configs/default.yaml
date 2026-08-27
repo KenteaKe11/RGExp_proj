@@ -2,13 +2,13 @@
 # MIMIC-CXR MoE-LoRA — cấu hình mặc định (SWEEP PHASE 1)
 #
 #   fixed  — khoá theo tài liệu thiết kế. Sửa thì phải ghi vào sweep log.
-#   sweep  — ô đang chạy: (biến thể Recombinator) × (số block).
+#   sweep  — ô đang chạy: số block của Recombinator g-brmf (n = 1..4).
 #   run    — tự do chỉnh theo phần cứng.
 #
 # Adapter đã CHỐT: QDoRA r8. Số expert (4) và top-k (2) cũng cố định ở Phase
 # này — chúng là đối tượng của Phase 2, không phải Phase 1.
 #
-# Ghi đè: --variant gslf --n-block 3   hoặc   --set run.phase1_samples=3200
+# Ghi đè: --n-block 3   hoặc   --set run.phase1_samples=3200
 # ═════════════════════════════════════════════════════════════════════════════
 
 fixed:
@@ -71,16 +71,14 @@ fixed:
 # ─────────────────────────── Ô đang chạy ─────────────────────────────────────
 sweep:
   model: gemma3
-  # §2 — sweep chỉ còn HAI biến thể: brm × gslf. mbrf vẫn nằm trong router và
-  # chạy tay được (--variant mbrf), nhưng không còn ô nào trong bảng.
-  # brm  Bottleneck ResMLP                131_584 param/block
-  # gslf GQAttn + Skip-Linear FFN         918_528 param/block  (≈ 7 brm)
-  # mbrf MQAttn + Bottleneck-ResMLP FFN   656_384 param/block  (NGOÀI sweep)
-  variant: brm
-  # Dải đang quét (§2.1 / §2.2) — chồng nhau ở khoảng ~67M → ~72M:
-  #   brm  10 20 30 40 50 60     67.6M → 74.2M
-  #   gslf  1  2  3  4  5  6     67.2M → 71.8M
-  n_block: 20
+  # §2 — Recombinator chỉ còn MỘT biến thể, giữ trường này để tag ô và đường
+  # ống report không phải đổi khi sau này thêm biến thể mới.
+  # g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
+  #         852_992 param/block
+  variant: g-brmf
+  # Dải đang quét (§2.1): n_block 1 → 4, tổng tham số trainable (E=4 expert)
+  #   n1 ≈ 67.1M   n2 ≈ 68.0M   n3 ≈ 68.8M   n4 ≈ 69.7M
+  n_block: 1
 
 # Bảng tra: tên model + module loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
 models:

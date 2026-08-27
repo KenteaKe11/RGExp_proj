@@ -12,16 +12,15 @@ encoder/decoder giữ nguyên và đóng băng, còn expert là adapter QDoRA r8
                                           Supervised head        Route head
                                           vec(14×4) → Focal      vec(E) → top-k
 
-Ba biến thể Recombinator (ô sweep Phase 1):
+Recombinator chỉ còn MỘT biến thể (ô sweep Phase 1 giờ chỉ quét số block):
 
-    brm   Bottleneck ResMLP                    131_584 param/block
-    mbrf  MQAttn + Bottleneck-ResMLP FFN       656_384 param/block
-    gslf  GQAttn + Skip-Linear FFN             918_528 param/block
+    g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
+            852_992 param/block
 
 `python -m src.router` in bảng tham số và ĐỐI CHIẾU với con số trong tài liệu
 thiết kế — chạy được không cần GPU, dùng để kiểm sau mỗi lần sửa kiến trúc.
 
-Quy ước chung, cố ý giữ giống nhau ở cả ba biến thể để so sánh là công bằng:
+Quy ước chung của nhánh router:
   * mọi Linear KHÔNG bias (bảng tham số trong tài liệu tính theo cách này),
   * pre-norm + residual,
   * RMSNorm (không LayerNorm): không có mean-centering, rẻ hơn và khớp với
@@ -74,8 +73,8 @@ class GroupedAttention(nn.Module):
     """Self/cross attention với n_group KV-head dùng chung cho n_head Q-head.
 
     n_group = n_head  -> MHA
-    n_group = 1       -> MQA  (biến thể MBRF)
-    1 < n_group < n_head -> GQA (biến thể GSLF: 2 | Separation: 4)
+    n_group = 1       -> MQA
+    1 < n_group < n_head -> GQA (G-BRMF: 4 | Separation: 4)
 
     KV-head được nhân bản (repeat_interleave) lên đủ n_head trước khi vào SDPA.
     Nhân bản KHÔNG thêm tham số — tiết kiệm nằm ở W_K, W_V nhỏ đi n_head/n_group
@@ -112,40 +111,24 @@ class GroupedAttention(nn.Module):
         return self.o_proj(o)
 
 
-# ═══════════════════════════ 3 biến thể Recombinator ═════════════════════════
-class BRMBlock(nn.Module):
-    """Bottleneck ResMLP — 131_584 param.
+# ════════════════════════════ Biến thể Recombinator ══════════════════════════
+class GBRMFBlock(nn.Module):
+    """G-BRMF — Grouped-Query Attn + Bottleneck-ResMLP FFN — 852_992 param.
 
-    RMSNorm → 512→128 → GeLU → 128→512 → GeLU, cộng residual.
-    Không có attention: token KHÔNG trộn với nhau, mỗi vị trí được "nắn" độc
-    lập. Đây là baseline rẻ nhất; nếu nó thắng thì việc trộn token ở tầng
-    router là thừa (Gemma encoder đã trộn rồi).
+        x → RMSNorm → GQAttn (8 head / 4 KV-group) ──(+skip)──►
+          → RMSNorm → 512→64 → GeLU → 64→512 → GeLU ──(+skip)──►
+
+    Attention trộn token với 4 KV-head (cùng số group với Separation), FFN
+    thắt cổ chai 512→64→512 nên phần lớn tham số nằm ở attention.
+
+    Đây là biến thể DUY NHẤT còn lại: sweep Phase 1 chỉ quét số block n = 1..4.
     """
-    PARAMS = 131_584
+    PARAMS = 852_992
 
-    def __init__(self, dim=D_MODEL, hidden=128):
-        super().__init__()
-        self.norm = RMSNorm(dim)
-        self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x, mask=None):
-        h = self.norm(x)
-        h = F.gelu(self.fc2(F.gelu(self.fc1(h))))
-        return x + h
-
-
-class MBRFBlock(nn.Module):
-    """Multi-Query Attn + Bottleneck-ResMLP FFN — 656_384 param (= 5 BRM).
-
-    Attention trộn token (1 KV-head), FFN thắt cổ chai 512→64→512.
-    """
-    PARAMS = 656_384
-
-    def __init__(self, dim=D_MODEL, n_head=8, hidden=64):
+    def __init__(self, dim=D_MODEL, n_head=8, n_group=4, hidden=64):
         super().__init__()
         self.norm1 = RMSNorm(dim)
-        self.attn = GroupedAttention(dim, n_head=n_head, n_group=1)
+        self.attn = GroupedAttention(dim, n_head=n_head, n_group=n_group)
         self.norm2 = RMSNorm(dim)
         self.fc1 = nn.Linear(dim, hidden, bias=False)
         self.fc2 = nn.Linear(hidden, dim, bias=False)
@@ -157,30 +140,11 @@ class MBRFBlock(nn.Module):
         return x + h
 
 
-class GSLFBlock(nn.Module):
-    """Grouped-Query Attn + Skip-Linear FFN — 918_528 param (= 7 BRM).
-
-    Attention 2 KV-head (nhiều hơn MBRF), FFN chỉ một Linear 512→512 giữ
-    nguyên chiều (không thắt cổ chai).
-    """
-    PARAMS = 918_528
-
-    def __init__(self, dim=D_MODEL, n_head=8, n_group=2):
-        super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = GroupedAttention(dim, n_head=n_head, n_group=n_group)
-        self.norm2 = RMSNorm(dim)
-        self.fc = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.norm1(x), mask=mask)
-        return x + F.gelu(self.fc(self.norm2(x)))
-
-
-VARIANTS = {"brm": BRMBlock, "mbrf": MBRFBlock, "gslf": GSLFBlock}
-# Quy đổi "giá" một block sang đơn vị BRM — dùng để ghép các ô sweep có cùng
-# lượng tham số (1 GSLF ≈ 7 BRM, 1 MBRF ≈ 5 BRM).
-BLOCK_RATIO = {k: v.PARAMS / BRMBlock.PARAMS for k, v in VARIANTS.items()}
+# Chỉ còn một biến thể. Giữ nguyên dict (và trường `variant` trong config/tag)
+# để đường ống — CLI, tên thư mục ô, resume checkpoint, bảng report — không
+# phải đổi, và để thêm biến thể mới sau này chỉ là thêm một dòng ở đây.
+VARIANT = "g-brmf"
+VARIANTS = {VARIANT: GBRMFBlock}
 
 
 # ══════════════════════════════ các tầng còn lại ═════════════════════════════
@@ -356,7 +320,7 @@ def estimate_params(variant, n_block, n_expert, expert_params=15_910_912):
 
 def _selftest():
     """Đối chiếu tham số THẬT (đếm từ module) với bảng trong tài liệu."""
-    expect_block = {"brm": 131_584, "mbrf": 656_384, "gslf": 918_528}
+    expect_block = {"g-brmf": 852_992}
     print(f"{'khối':<34}{'đếm được':>12}{'tài liệu':>12}  ")
     ok = True
     for name, cls in VARIANTS.items():
@@ -381,12 +345,10 @@ def _selftest():
 
     print("\nTổng tham số theo ô sweep (E=4 expert QDoRA r8 ≈ 15.9M/expert):")
     print(f"{'ô':<16}{'router':>12}{'expert':>14}{'tổng':>12}")
-    # Bảng sweep §2 (brm × gslf). mbrf giữ lại trong VARIANTS để chạy tay,
-    # nên vẫn đếm param ở trên nhưng không còn ô nào ở đây.
-    for variant, blocks in (("brm", (10, 20, 30, 40, 50, 60)),
-                            ("gslf", (1, 2, 3, 4, 5, 6))):
+    # Bảng sweep §2 — một biến thể, n_block 1..4.
+    for variant, blocks in ((VARIANT, (1, 2, 3, 4, 5)),):
         for n in blocks:
-            e = estimate_params(variant, n, 4)
+            e = estimate_params(variant, n, 5)
             print(f"{variant + '-n' + str(n):<16}{e['router']:>12,}"
                   f"{e['experts']:>14,}{e['total'] / 1e6:>11.1f}M")
     print("\n" + ("✓ khớp tài liệu" if ok else "✗ LỆCH tài liệu — xem lại"))

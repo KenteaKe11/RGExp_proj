@@ -22,7 +22,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.losses import focal_loss, inv_freq_alpha       # noqa: E402
-from src.router import RouterNet, _selftest             # noqa: E402
+from src.router import VARIANT, RouterNet, _selftest    # noqa: E402
 
 FAIL = []
 
@@ -37,7 +37,7 @@ def test_router():
     print("\n[2] router forward")
     torch.manual_seed(0)
     B, N, E, K = 3, 40, 4, 2
-    net = RouterNet("mbrf", 2, E, K, d_enc=2560).eval()
+    net = RouterNet(VARIANT, 2, E, K, d_enc=2560).eval()
     x = torch.randn(B, N, 2560)
     mask = torch.ones(B, N)
     mask[:, 30:] = 0                       # 10 token cuối = target/padding

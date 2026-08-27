@@ -5,8 +5,8 @@ xuất ra:
 
   outputs/_summary/metrics_full.csv     mọi metric × mọi ô (dạng dài)
   outputs/_summary/metrics_table.md     bảng biến thể × n_block
-  outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ (so ngang
-                                        hai biến thể ở cùng ngân sách)
+  outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ (đọc được
+                                        thêm block có đáng tiền không)
   outputs/_summary/gen_text.csv         gen_text side-by-side theo img_rel
   outputs/_summary/gen_text.md          bản dễ đọc, N mẫu đầu
   outputs/_summary/run_health.md        tiến trình / tốc độ / VRAM / lỗi
@@ -23,11 +23,12 @@ import os
 import pandas as pd
 
 # Dải n_block của từng biến thể (khớp src/config.py SWEEP_BLOCKS).
+# Phase 1 chỉ còn một biến thể — bảng vì thế có đúng một hàng, nhưng giữ
+# nguyên cấu trúc dict/list để thêm biến thể sau chỉ là thêm một dòng.
 SWEEP_BLOCKS = {
-    "brm": (10, 20, 30, 40, 50, 60),
-    "gslf": (1, 2, 3, 4, 5, 6),
+    "g-brmf": (1, 2, 3, 4),
 }
-VARIANT_ROWS = ["brm", "gslf"]
+VARIANT_ROWS = ["g-brmf"]
 
 # Metric chính hiển thị trong bảng tóm tắt; metrics_full.csv giữ đủ tất cả.
 HEADLINE = ["corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
@@ -38,7 +39,11 @@ DEFAULT_BLOCK = "raw"
 
 
 def parse_tag(tag):
-    """gemma3-brm-n20 -> ('gemma3', 'brm', 20)"""
+    """gemma3-g-brmf-n2 -> ('gemma3', 'g-brmf', 2)
+
+    Tên biến thể có thể chứa dấu '-' (g-brmf), nên phần giữa được ghép lại từ
+    mọi đoạn giữa model và 'n<số>' chứ không phải lấy đúng một đoạn.
+    """
     parts = tag.split("-")
     if len(parts) < 3 or not parts[-1].startswith("n"):
         return None
@@ -135,9 +140,9 @@ def build_param_curve(cells, block=DEFAULT_BLOCK,
                       metrics=("corpus_bleu", "rougeL_f1", "bertscore_f1")):
     """Metric theo TỔNG THAM SỐ — câu hỏi thật của Phase 1.
 
-    Bảng metrics_table so theo n_block, nhưng n_block của ba biến thể không
-    cùng giá (1 GSLF ≈ 7 BRM). Bảng này xếp mọi ô theo tham số nên đọc được
-    "cùng ngân sách 70M thì kiến trúc nào cho điểm cao hơn".
+    Bảng metrics_table so theo n_block; bảng này xếp mọi ô theo tổng tham số
+    nên đọc thẳng được "thêm ~0.85M tham số một block thì điểm lên bao nhiêu,
+    và bão hoà từ đâu".
     """
     rows = sorted(cells, key=lambda c: (_total_params(c) or 0))
     head = ["| ô | tham số | " + " | ".join(metrics) + " | 7-check pass |",

@@ -1,6 +1,6 @@
 """Entrypoint: STAGE 0 -> Phase 1 (supervised) -> Phase 2 (MoE) -> infer.
 
-Chạy:  python -m src.train --config configs/default.yaml --variant brm --n-block 20
+Chạy:  python -m src.train --config configs/default.yaml --n-block 2
 
 Lịch train (§1.7):
 

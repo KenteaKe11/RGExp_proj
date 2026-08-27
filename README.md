@@ -4,8 +4,8 @@ Sinh báo cáo X-quang ngực (Findings / Impression) từ ảnh. Gemma3-4b-it �
 băng ở NF4; phần học được gồm **một nhánh router tự thiết kế** và **4 expert
 QDoRA r8** gắn vào decoder, chọn bằng gate top-2.
 
-**Adapter đã chốt: QDoRA r8.** Sweep của Phase 1 chỉ còn một biến: cặp
-(*biến thể Recombinator*, *số block*) — xem §3.
+**Adapter đã chốt: QDoRA r8. Recombinator đã chốt: `g-brmf`.** Sweep của
+Phase 1 vì thế chỉ còn ĐÚNG MỘT biến: *số block* `n = 1..4` — xem §3.
 
 Chạy trên GPU Ampere trở lên — cục bộ hoặc máy thuê theo giờ (§9) — dữ liệu lấy
 hết từ Hugging Face Hub.
@@ -285,7 +285,7 @@ Chuẩn hoá header chịu được lỗi decoder: `Findings::`, `Impimpression:
       ▼                                     │ gate [B, 4]
    Stem  [N, 2560] → [N, 512]               │
       ▼                                     │
-   Recombinator × n   (3 biến thể ← ô sweep)│
+   Recombinator × n   (g-brmf, n = 1..4 ← ô sweep)│
       ▼                                     │
    Separation  attention pooling → [2, 512] │
       ├── vector 0 → Supervised head → 14×4 → Focal
@@ -306,21 +306,28 @@ không — gate sẽ học một tín hiệu không tồn tại ở thời đi�
 decode. Bước decode chỉ có 1 token mới; tính lại là mỗi token rơi vào một expert
 khác.
 
-### 3.2. Các biến thể Recombinator
+### 3.2. Block Recombinator (`g-brmf`)
 
-Mọi Linear đều **không bias**, pre-norm + residual, RMSNorm — giống nhau ở cả
-ba để so sánh là công bằng. **Sweep (§3.3) chỉ quét `brm` và `gslf`**; `mbrf`
-vẫn còn trong `src/router.py` và chạy tay được, nhưng không có ô nào.
+Chỉ còn **một** biến thể. Mọi Linear đều **không bias**, pre-norm + residual,
+RMSNorm (không LayerNorm — không mean-centering, rẻ hơn, khớp chuẩn hoá Gemma
+đang dùng).
 
-| Ký hiệu | Cấu tạo một block | Param/block | Quy đổi |
-|---|---|---|---|
-| **brm** | RMSNorm → 512→128 → GeLU → 128→512 → GeLU (+skip) | 131 584 | 1× |
-| **mbrf** | RMSNorm → **MQAttn** (8 head, 1 KV) → RMSNorm → 512→64→512 bottleneck FFN *(ngoài sweep)* | 656 384 | ≈5× |
-| **gslf** | RMSNorm → **GQAttn** (8 head, 2 KV) → RMSNorm → Linear 512→512 (+skip) | 918 528 | ≈7× |
+| Ký hiệu | Cấu tạo một block | Param/block |
+|---|---|---|
+| **g-brmf** | RMSNorm → **GQAttn** (8 head / 4 KV-group) → *+skip* → RMSNorm → 512→64 → GeLU → 64→512 → GeLU → *+skip* | 852 992 |
 
-`brm` không có attention: token **không** trộn với nhau, mỗi vị trí được nắn
-độc lập. Đó là baseline có ý nghĩa — nếu nó thắng thì việc trộn token ở tầng
-router là thừa, vì Gemma encoder đã trộn rồi.
+Chi tiết một block:
+
+```
+x ─┬─ RMSNorm → GQAttn (8 head, 4 KV-group) ─┐
+   └──────────────── skip ───────────────────⊕─┬─ RMSNorm → 512→64 → GeLU
+                                               │           → 64→512 → GeLU ─┐
+                                               └──────── skip ──────────────⊕─► out
+```
+
+Phân bổ tham số trong block: attention 786 432 (q/o 512×512, k/v 512×256 —
+4 KV-head dùng chung cho 8 Q-head), FFN thắt cổ chai 65 536, hai RMSNorm 1 024.
+Attention trộn token; FFN chỉ nắn từng vị trí, cố ý để rẻ.
 
 Các tầng còn lại cố định:
 
@@ -337,42 +344,43 @@ số trong tài liệu thiết kế — chạy sau mỗi lần sửa kiến trú
 
 ### 3.3. Bảng sweep
 
-`effective_batch = 32`, `E = 4`, `top-k = 2`, QDoRA r8 α16 — tất cả cố định.
-`n_block` của hai biến thể được chọn để phủ **chung một dải tham số** (phần
-chồng nhau ~67M → ~72M): có thế mới trả lời được "cùng ngân sách thì kiến trúc
-nào hơn". 6 × 2 = **12 ô**.
+`effective_batch = 32`, `E = 4`, `top-k = 2`, QDoRA r8 α16, biến thể `g-brmf`
+— tất cả cố định. Chỉ `n_block` thay đổi: **4 ô**, `n = 1 → 4`. Câu hỏi của
+Phase 1 vì thế gọn lại thành "chồng thêm block Recombinator có đáng không, và
+bão hoà từ đâu".
 
-| ô | tổng param | | ô | tổng param |
-|---|---|---|---|---|
-| brm-n10 | 67.6M | | gslf-n1 | 67.2M |
-| brm-n20 | 68.9M | | gslf-n2 | 68.1M |
-| brm-n30 | 70.2M | | gslf-n3 | 69.0M |
-| brm-n40 | 71.5M | | gslf-n4 | 70.0M |
-| brm-n50 | 72.9M | | gslf-n5 | 70.9M |
-| brm-n60 | 74.2M | | gslf-n6 | 71.8M |
+| ô | router | tổng param trainable |
+|---|---|---|
+| g-brmf-n1 | 3.49M | 67.1M |
+| g-brmf-n2 | 4.35M | 68.0M |
+| g-brmf-n3 | 5.20M | 68.8M |
+| g-brmf-n4 | 6.05M | 69.7M |
+
+(Mỗi block thêm 852 992 tham số; phần còn lại — Stem, Separation, 2 head,
+4 expert QDoRA — không đổi giữa các ô.)
 
 Kết quả điền vào `outputs/_summary/` (§5): `metrics_table.md` xếp theo
-`n_block`, `param_curve.md` xếp theo **tổng tham số** — bảng thứ hai mới là
-bảng trả lời câu hỏi của Phase 1.
+`n_block`, `param_curve.md` xếp theo **tổng tham số** — bảng thứ hai đọc thẳng
+được "thêm ~0.85M tham số thì điểm lên bao nhiêu".
 
 Chạy một ô:
 
 ```bash
-bash scripts/run_local.sh --variant brm  --n-block 20 --mode both --no-dry-run
-bash scripts/run_local.sh --variant gslf --n-block 3  --mode both --no-dry-run
-bash scripts/run_local.sh --variant mbrf --n-block 4  --phase 1 --no-dry-run  # ngoài sweep
+bash scripts/run_local.sh --n-block 1 --mode both --no-dry-run
+bash scripts/run_local.sh --n-block 4 --mode both --no-dry-run
+bash scripts/run_local.sh --n-block 8 --phase 1 --no-dry-run   # ngoài bảng, vẫn chạy được
 ```
 
 Chạy cả bảng, tuần tự:
 
 ```bash
 bash scripts/sweep.sh --no-dry-run
-SWEEP_CELLS="brm:10 gslf:1" bash scripts/sweep.sh --no-dry-run
+SWEEP_CELLS="g-brmf:1 g-brmf:3" bash scripts/sweep.sh --no-dry-run
 SWEEP_MODE=train bash scripts/sweep.sh --no-dry-run   # tách khâu test ra sau
 ```
 
-Thứ tự mặc định quét **hai ô nhỏ nhất của cả hai biến thể trước** (cùng ~67M),
-rồi mới tăng `n_block`. Dừng giữa chừng vẫn có câu trả lời sơ bộ về kiến trúc.
+Thứ tự mặc định là **n tăng dần**, ô rẻ nhất trước. Dừng giữa chừng vẫn đọc
+được xu hướng.
 
 Mỗi ô có `out_dir` và `ckpt_dir` riêng (`<model>-<variant>-n<n_block>`), nên
 chạy lại một ô không đè ô khác. Một ô hỏng không dừng cả sweep — nó ghi vào
@@ -444,14 +452,14 @@ lệnh hạ.
 3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm75 (T4).
 4. **Hai phase, 6400 + 6400 mẫu** (§1.7). Không tính theo epoch nữa: một ô
    sweep là một lượng mẫu cố định, không phải một vòng qua tập train.
-5. Thứ tự ô: hai biến thể ở ngân sách nhỏ nhất trước, rồi tăng dần `n_block`.
+5. Thứ tự ô: `n_block` tăng dần, ô rẻ nhất trước.
 
-Sau Phase 1 (chốt được cặp variant-n_block tốt nhất) mới sang Phase 2 của
-chiến lược: quét `E` và tỉ lệ `E/k`.
+Sau Phase 1 (chốt được `n_block` tốt nhất) mới sang Phase 2 của chiến lược:
+quét `E` và tỉ lệ `E/k`.
 
 ---
 
-## 5. Thu thập kết quả từng biến thể
+## 5. Thu thập kết quả từng ô
 
 Mỗi ô sweep chạy `--mode both` nên sau khi xong đã có sẵn:
 
@@ -514,7 +522,7 @@ console ở `logs/`:
 
 ```bash
 bash scripts/tail_log.sh                    # theo dõi ô mới nhất
-bash scripts/tail_log.sh gemma3-brm-n20    # ô cụ thể
+bash scripts/tail_log.sh gemma3-g-brmf-n2   # ô cụ thể
 bash scripts/tail_log.sh --errors           # chỉ WARN/ERROR mọi ô
 ```
 
@@ -550,7 +558,7 @@ khỏi đồ thị — ô sweep vẫn chạy trơn tru và cho ra những con s�
 ```python
 from src.report import load_events
 ev = load_events("outputs")                      # mọi ô
-ev = load_events("outputs", "gemma3-brm-n20")   # một ô
+ev = load_events("outputs", "gemma3-g-brmf-n2")  # một ô
 
 steps = ev[ev.kind == "train_step"]
 steps.plot(x="step", y="loss")                   # loss curve
@@ -573,7 +581,7 @@ mimic_cxr_vlm/
 ├── .gitattributes            # ép .sh checkout dạng LF — CRLF là script chết trên Linux
 ├── configs/default.yaml      # fixed / sweep / models / run / remote (§9)
 ├── src/
-│   ├── router.py             # ★ nhánh router: Stem, 3 biến thể Recombinator,
+│   ├── router.py             # ★ nhánh router: Stem, block Recombinator g-brmf,
 │   │                         #   Separation, 2 head, aux loss. `python -m src.router`
 │   │                         #   in bảng tham số và đối chiếu tài liệu
 │   ├── moe.py                # ★ trộn E expert QDoRA theo gate, cache dequantize,
@@ -786,7 +794,7 @@ python -m src.config        # dòng "Remote :" ở cuối
 ```
 
 Bật hay tắt **không đổi một tham số training nào** — chỉ đổi chỗ để file và
-cách chạy python. Ô `gemma3-brm-n20` chạy trên máy thuê so sánh trực tiếp
+cách chạy python. Ô `gemma3-g-brmf-n2` chạy trên máy thuê so sánh trực tiếp
 được với ô cùng tên chạy ở nhà.
 
 ### 9.2. Kết nối và giữ phiên
@@ -895,19 +903,19 @@ số 2.5GB làm chuẩn.
 
 | VRAM | Ví dụ | Chạy được gì |
 |---|---|---|
-| ≥38GB | A100, L40S | batch 4×8, cả ô `gslf-n6` nặng nhất |
+| ≥38GB | A100, L40S | batch 4×8, cả ô `g-brmf-n4` nặng nhất |
 | 22–24GB | 3090, 4090 | batch 2×16 |
 | 12–16GB | L4, 4080, **4070 Ti Super** | batch 1×32, chạy được nhưng chậm |
 | ≤8GB | RTX 3070, 3060Ti | không đủ — hạ `fixed.n_expert` xuống 2 thì mất luôn ý nghĩa của sweep |
 
-Chênh lệch VRAM giữa các ô sweep là **nhỏ**: cả bảng chỉ dao động 67M → 72M
+Chênh lệch VRAM giữa các ô sweep là **nhỏ**: cả bảng chỉ dao động 67M → 70M
 tham số trainable, trong khi phần chiếm chỗ chính (base 4-bit + activation của
 decoder + E bản delta) không đổi. Ô nào chạy được thì gần như cả bảng chạy
 được.
 
 ```bash
-bash scripts/run_local.sh --variant brm --n-block 10 --dry-run   # ô nhẹ nhất
-bash scripts/run_local.sh --variant gslf --n-block 6 --dry-run   # ô nặng nhất
+bash scripts/run_local.sh --n-block 1 --dry-run   # ô nhẹ nhất
+bash scripts/run_local.sh --n-block 4 --dry-run   # ô nặng nhất
 ```
 
 ### 9.5. Kéo kết quả về TRƯỚC KHI xoá instance
@@ -938,7 +946,7 @@ bash scripts/collect.sh              # sinh outputs/_summary/ (§5)
 ### 9.6. Tiết kiệm tiền
 
 - Chạy `--dry-run` trước mọi ô mới. STAGE 0 mất 5 phút; OOM ở giờ thứ 3 mất 3 giờ.
-- `SWEEP_CELLS="brm:10 gslf:1"` để chỉ chạy các ô cần, thay vì cả 12 ô.
+- `SWEEP_CELLS="g-brmf:1 g-brmf:3"` để chỉ chạy các ô cần, thay vì cả 4 ô.
 - `sweep.sh` **bỏ qua ô đã có `metrics.json`** — xoá instance rồi thuê lại, chỉ
   cần rsync `outputs/` lên máy mới là nó đi tiếp từ ô còn thiếu.
 - `run.resume: true` + checkpoint trên Hub: một ô đang train dở cũng nối lại

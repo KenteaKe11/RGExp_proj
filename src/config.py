@@ -4,8 +4,10 @@
 dùng để kiểm tra trước khi chạy thật.
 
 PHASE 1 của sweep (xem README §3): adapter đã CHỐT là QDoRA r8, số expert và
-top-k cố định (4 / 2). Biến duy nhất còn quét là cặp (biến thể Recombinator,
-số block) — vì vậy `sweep` ở đây chỉ còn hai trường: `variant` và `n_block`.
+top-k cố định (4 / 2). Recombinator cũng chỉ còn MỘT biến thể (`g-brmf`), nên
+biến duy nhất còn quét là số block: n = 1..4. Trường `variant` vẫn nằm trong
+config và trong tag của ô — giữ để đường ống không phải đổi khi thêm biến thể
+mới, chứ Phase này nó chỉ có một giá trị.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from types import SimpleNamespace
 
 import yaml
 
-from .router import BLOCK_RATIO, VARIANTS as ROUTER_VARIANTS, estimate_params
+from .router import VARIANT, VARIANTS as ROUTER_VARIANTS, estimate_params
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
 # Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
@@ -128,16 +130,13 @@ PRESETS = [
     (0, "GPU <14GB — chật", 1, 32, 1, True),
 ]
 
-# ── Ô sweep Phase 1: biến thể Recombinator × số block (§2) ───────────────────
-# Sweep chỉ còn HAI biến thể: BRM (baseline không attention) và GSLF. MBRF vẫn
-# nằm trong src/router.py và chạy tay được (--variant mbrf --n-block 4), nhưng
-# không còn ô nào trong bảng mặc định.
-# Tỉ lệ giá một block: 1 GSLF ≈ 7 BRM. brm 10→60 phủ 67.6M→74.2M, gslf 1→6 phủ
-# 67.2M→71.8M — phần chồng nhau (~67M → ~72M) là chỗ so "cùng ngân sách tham
-# số thì kiến trúc nào hơn".
+# ── Ô sweep Phase 1: số block của Recombinator g-brmf (§2) ──────────────────
+# Một biến thể duy nhất (852_992 param/block), quét n_block 1→4:
+#   n1 ≈ 67.1M   n2 ≈ 68.0M   n3 ≈ 68.8M   n4 ≈ 69.7M   (tổng trainable, E=4)
+# Câu hỏi của Phase 1 vì thế gọn lại: thêm block Recombinator có đáng không,
+# và bão hoà ở đâu.
 SWEEP_BLOCKS = {
-    "brm": (10, 20, 30, 40, 50, 60),
-    "gslf": (1, 2, 3, 4, 5, 6),
+    VARIANT: (1, 2, 3, 4),
 }
 assert set(SWEEP_BLOCKS) <= set(ROUTER_VARIANTS), "biến thể sweep lạ với router"
 
@@ -147,7 +146,7 @@ def variant_desc(cfg):
     s, f = cfg.sweep, cfg.fixed
     est = estimate_params(s.variant, s.n_block, f.n_expert)
     return (f"{s.variant}×{s.n_block} block "
-            f"(1 block ≈ {BLOCK_RATIO[s.variant]:.0f} BRM) | "
+            f"({ROUTER_VARIANTS[s.variant].PARAMS:,} param/block) | "
             f"router {est['router'] / 1e6:.2f}M + "
             f"{f.n_expert} expert QDoRA r{f.lora_r} top-{f.top_k} "
             f"≈ {est['total'] / 1e6:.1f}M")
@@ -245,17 +244,20 @@ def load_config(path="configs/default.yaml", overrides=None):
         _apply_remote(rm, run, explicit)
 
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
+    # Chấp nhận cả "G-BRMF" lẫn "g-brmf": tên biến thể chỉ có một cách viết
+    # chuẩn (thường), nhưng gõ hoa thì không nên là lỗi cấu hình.
+    sweep["variant"] = str(sweep["variant"]).strip().lower()
     if sweep["variant"] not in ROUTER_VARIANTS:
         raise ValueError(f"variant lạ: {sweep['variant']} "
                          f"(chọn: {list(ROUTER_VARIANTS)})")
     n_block = int(sweep["n_block"])
     if n_block not in SWEEP_BLOCKS.get(sweep["variant"], ()):
-        # Không chặn: dải block là gợi ý để hai biến thể so được với nhau, không
-        # phải luật — và mbrf thì cố tình nằm ngoài sweep. Nhưng phải BÁO, vì ô
-        # ngoài bảng không có ô đối chứng cùng ngân sách tham số ở biến thể kia.
+        # Không chặn: dải block là bảng của sweep, không phải luật — chạy tay
+        # một ô ngoài bảng (n8 chẳng hạn) vẫn hợp lệ. Nhưng phải BÁO, vì ô đó
+        # không nằm trong bảng so sánh mà src.report dựng.
         print(f"⚠ sweep: {sweep['variant']}-n{n_block} nằm ngoài bảng "
               f"{SWEEP_BLOCKS.get(sweep['variant']) or '(biến thể ngoài sweep)'}"
-              f" — ô này không có đối chứng cùng lượng tham số ở biến thể khác.")
+              f" — ô này sẽ không có cột trong bảng tổng kết.")
     sweep["n_block"] = n_block
     if sweep["model"] not in raw["models"]:
         raise ValueError(f"model lạ: {sweep['model']}")
@@ -357,13 +359,15 @@ def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
 
 def build_argparser():
     ap = argparse.ArgumentParser(
-        description="MIMIC-CXR MoE-LoRA — sweep Phase 1 (Recombinator × n_block)")
+        description="MIMIC-CXR MoE-LoRA — sweep Phase 1 (số block Recombinator)")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--set", dest="overrides", action="append", default=[],
                     metavar="KEY=VALUE",
                     help="Ghi đè config, vd: --set run.phase1_samples=3200")
     ap.add_argument("--model", choices=["gemma3", "qwen25vl"])
-    ap.add_argument("--variant", choices=list(ROUTER_VARIANTS))
+    # type=str.lower: --variant G-BRMF cũng nhận, khỏi phải nhớ cách viết.
+    ap.add_argument("--variant", type=str.lower, choices=list(ROUTER_VARIANTS),
+                    default=None)
     ap.add_argument("--n-block", type=int, dest="n_block")
     ap.add_argument("--mode", choices=["train", "test", "both"])
     ap.add_argument("--phase", type=int, choices=[1, 2],
