@@ -32,7 +32,7 @@ import sys
 
 REPO     = "https://github.com/KenteaKe11/RGExp_proj"
 BRANCH   = "main"
-DRY_RUN  = False          # True = dừng sau STAGE 0 (2 step) để kiểm cấu hình
+DRY_RUN  = False          # True = dừng sau STAGE 0 (2 step MỖI phase 1 và 2)
 EXTRA    = []             # vd: ["--mode", "train"]  hoặc ["--set", "run.eval_max_batches=10"]
 
 WORK = "/kaggle/working"          # còn lại sau session (giới hạn ~20GB)
@@ -153,6 +153,8 @@ print(f"\n═══ thoát mã {rc} | log: {WORK}/outputs/<tag>/logs/latest.log 
 #    snapshot_download về và train tiếp đúng step. Phiên đầu tốn thêm ~1h chỉ
 #    để tải model + giải nén ảnh — bình thường.
 #
-# Chạy thử trước khi đốt phiên:  đặt DRY_RUN = True (dừng sau STAGE 0, in
-# tốc độ mẫu/s + VRAM đỉnh + ETA thật của phase). Luôn làm bước này trước.
+# Chạy thử trước khi đốt phiên:  đặt DRY_RUN = True. STAGE 0 thử 2 step cho
+# CẢ HAI phase và in mẫu/s + VRAM đỉnh + ETA của từng phase rồi tổng. Phase 1
+# qua mà phase 2 OOM là kịch bản hay gặp nhất trên 16GB — đó chính là lý do
+# STAGE 0 không dừng ở phase 1. Luôn làm bước này trước.
 # ═════════════════════════════════════════════════════════════════════════════

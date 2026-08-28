@@ -428,10 +428,11 @@ def build_argparser():
     ap.add_argument("--n-block", type=int, dest="n_block")
     ap.add_argument("--mode", choices=["train", "test", "both"])
     ap.add_argument("--phase", type=int, choices=[1, 2],
-                    help="Chạy riêng một phase (mặc định: cả hai, nối tiếp)")
+                    help="Chạy riêng một phase (mặc định: cả hai, nối tiếp). "
+                         "Cũng thu hẹp STAGE 0 về đúng phase đó.")
     # dry_run mặc định false trong config (chạy thật). Hai cờ này để ép:
     ap.add_argument("--dry-run", action="store_true",
-                    help="Dừng sau STAGE 0 (2 step) để kiểm cấu hình")
+                    help="Dừng sau STAGE 0 (2 step MỖI phase) để kiểm cấu hình")
     ap.add_argument("--no-dry-run", action="store_true",
                     help="Ép chạy thật (ghi đè config)")
     return ap

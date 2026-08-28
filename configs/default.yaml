@@ -106,7 +106,9 @@ models:
 
 run:
   mode: both                 # train | test | both  (both = train xong chạy test)
-  # false = chạy thật. true = dừng sau STAGE 0 (2 step) để kiểm cấu hình.
+  # false = chạy thật. true = dừng sau STAGE 0. STAGE 0 thử 2 step cho MỖI
+  # phase sắp chạy (cả 1 và 2, hoặc đúng phase chọn bằng --phase / only_phase)
+  # — phase 2 mới là phase giữ E bản delta + moment expert, tức phase OOM.
   dry_run: false
   # null = chạy phase 1 rồi phase 2. Đặt 1 hoặc 2 để chạy riêng một phase.
   only_phase: null

@@ -1,4 +1,8 @@
-"""Entrypoint: STAGE 0 -> Phase 1 (supervised) -> Phase 2 (MoE) -> infer.
+"""Entrypoint: STAGE 0 (thử TỪNG phase) -> Phase 1 -> Phase 2 -> infer.
+
+STAGE 0 chạy 2 step thử cho MỖI phase sắp chạy (mặc định cả 1 và 2, hoặc đúng
+phase đã chọn bằng --phase). `--dry-run` dừng ngay sau đó: đủ để biết cả hai
+phase có vừa VRAM không và cả lịch train mất bao lâu, trước khi tốn giờ GPU.
 
 Chạy:  python -m src.train --config configs/default.yaml --n-block 2
 
@@ -237,97 +241,142 @@ def main(argv=None):
         stats.update({"ce": float(ce), "sup": float(sup), "aux": float(aux)})
         return loss, stats
 
-    # ── STAGE 0: 2 step thử cho ĐÚNG phase sắp chạy ─────────────────────────
+    # ── STAGE 0: 2 step thử cho MỖI phase sắp chạy ──────────────────────────
+    # Chạy cho TỪNG phase chứ không chỉ phase 1. Hai phase là hai đồ thị khác
+    # hẳn nhau: phase 1 cắt decoder ngay sau embedding (rẻ, không đụng expert,
+    # optimizer chỉ giữ moment của router); phase 2 chạy cả decoder + E bản
+    # delta QDoRA + moment cho toàn bộ expert. Thử mỗi phase 1 rồi kết luận
+    # "chạy được" là kiểm đúng nửa rẻ tiền — nửa còn lại mới là nửa OOM.
+    phases_s0 = [only_phase] if only_phase else [1, 2]
     log("S0", "═" * 60)
-    s0_phase = only_phase or 1
-    _dl = make_loader(df_train.iloc[:r.train_bs * 4], collate, cfg)
-    _it = iter(_dl)
-    _b = to_device(next(_it), DEVICE)
-    log("S0", "shape: " + " ".join(f"{k}{tuple(v.shape)}" for k, v in _b.items()))
-    log("S0", f"label_token={int((_b['labels'] != -100).sum())} | "
-              f"router thấy {int(_b['router_mask'].sum())}/"
-              f"{_b['router_mask'].numel()} token")
-    _opt = make_optimizer(s0_phase)
-    _params = router_params + (expert_params if s0_phase == 2 else [])
-    s0_ok = False
-    try:
-        model.train()
-        router.train()
-        _opt.zero_grad(set_to_none=True)
-        torch.cuda.reset_peak_memory_stats()
-        step_fn = phase1_loss if s0_phase == 1 else phase2_loss
-        t = time.time()
-        _loss, _st = step_fn(_b)
-        lv = float(_loss)
-        log("S0", f"forward  {time.time()-t:5.2f}s loss={lv:.4f} | "
-                  f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in _st.items() if k != 'expert_share'} }")
-        t = time.time()
-        _loss.backward()
-        bridge.end()
-        log("S0", f"backward {time.time()-t:5.2f}s")
-        gn = float(torch.nn.utils.clip_grad_norm_(_params, r.max_grad_norm))
-        # Gradient KHÔNG chảy về router ở phase 2 nghĩa là gate đã bị tách khỏi
-        # đồ thị — ô sweep sẽ chạy trơn tru và cho kết quả vô nghĩa. Bắt ở đây.
-        g_router = sum(float(p.grad.abs().sum()) for p in router_params
-                       if p.grad is not None)
-        log("S0", f"grad_norm={gn:.3f} | Σ|grad| router = {g_router:.3e}")
-        assert g_router > 0, ("router không nhận gradient — kiểm RouterBridge "
-                             "và moe.CTX")
-        _opt.step()
-        _opt.zero_grad(set_to_none=True)
+    log("S0", f"thử {len(phases_s0)} phase: {phases_s0}")
+    # Một loader dùng lại cho mọi phase: iter() cho iterator mới mỗi lần, và
+    # worker process không phải dựng lại.
+    _s0_dl = make_loader(df_train.iloc[:r.train_bs * 4], collate, cfg)
 
-        t = time.time()
-        _b2 = to_device(next(_it), DEVICE)
-        _l2, _ = step_fn(_b2)
-        _l2.backward()
-        bridge.end()
-        torch.nn.utils.clip_grad_norm_(_params, r.max_grad_norm)
-        _opt.step()
-        _opt.zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
-        t2 = time.time() - t
-        sps = r.train_bs / t2
-        peak = torch.cuda.max_memory_allocated(0) / 1024**3
-        n_step = phase_steps(cfg, s0_phase)
-        log("S0", f"✓✓ CHẠY ĐƯỢC (phase {s0_phase}) | step2 {t2:.2f}s = "
-                  f"{sps:.2f} mẫu/s | 1 step ({r.train_bs*r.grad_accum} mẫu) ≈ "
-                  f"{t2*r.grad_accum:.1f}s")
-        log("S0", f"   phase {s0_phase}: {n_step} step ≈ "
-                  f"{t2*r.grad_accum*n_step/3600:.2f}h")
-        log("S0", f"   VRAM đỉnh {peak:.1f}/{cfg.hw.vram_gb:.0f}GB "
-                  f"({peak/cfg.hw.vram_gb*100:.0f}%)")
+    def stage0(phase, first):
+        """2 step thử của MỘT phase. Trả về (ok, giây/micro-step, VRAM đỉnh)."""
+        it = iter(_s0_dl)
+        b = to_device(next(it), DEVICE)
+        if first:
+            log("S0", "shape: " + " ".join(f"{k}{tuple(v.shape)}"
+                                           for k, v in b.items()))
+            log("S0", f"label_token={int((b['labels'] != -100).sum())} | "
+                      f"router thấy {int(b['router_mask'].sum())}/"
+                      f"{b['router_mask'].numel()} token")
+        what = ("chỉ router, decoder bị cắt" if phase == 1 else
+                f"router + {f.n_expert} expert QDoRA + decoder")
+        log("S0", f"── phase {phase} | loss = "
+                  f"{'focal' if phase == 1 else 'ce+sup+aux'} | {what}")
+        opt = make_optimizer(phase)
+        params = router_params + (expert_params if phase == 2 else [])
+        step_fn = phase1_loss if phase == 1 else phase2_loss
+        ok, t2, peak = False, None, None
+        try:
+            model.train()
+            router.train()
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.reset_peak_memory_stats()
+            t = time.time()
+            loss, st = step_fn(b)
+            lv = float(loss)
+            log("S0", f"   forward  {time.time()-t:5.2f}s loss={lv:.4f} | "
+                      f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.items() if k != 'expert_share'} }")
+            t = time.time()
+            loss.backward()
+            bridge.end()
+            log("S0", f"   backward {time.time()-t:5.2f}s")
+            gn = float(torch.nn.utils.clip_grad_norm_(params, r.max_grad_norm))
+            # Gradient KHÔNG chảy về router ở phase 2 nghĩa là gate đã bị tách
+            # khỏi đồ thị — chạy trơn tru và cho kết quả vô nghĩa. Bắt ở đây.
+            g_router = sum(float(p.grad.abs().sum()) for p in router_params
+                           if p.grad is not None)
+            log("S0", f"   grad_norm={gn:.3f} | Σ|grad| router = {g_router:.3e}")
+            assert g_router > 0, ("router không nhận gradient — kiểm "
+                                  "RouterBridge và moe.CTX")
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+            t = time.time()
+            b2 = to_device(next(it), DEVICE)
+            l2, _ = step_fn(b2)
+            l2.backward()
+            bridge.end()
+            torch.nn.utils.clip_grad_norm_(params, r.max_grad_norm)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            t2 = time.time() - t
+            peak = torch.cuda.max_memory_allocated(0) / 1024**3
+            n_step = phase_steps(cfg, phase)
+            log("S0", f"   ✓ phase {phase} CHẠY ĐƯỢC | step2 {t2:.2f}s = "
+                      f"{r.train_bs/t2:.2f} mẫu/s | 1 step "
+                      f"({r.train_bs*r.grad_accum} mẫu) ≈ {t2*r.grad_accum:.1f}s")
+            log("S0", f"   {n_step} step ≈ {t2*r.grad_accum*n_step/3600:.2f}h "
+                      f"| VRAM đỉnh {peak:.1f}/{cfg.hw.vram_gb:.0f}GB "
+                      f"({peak/cfg.hw.vram_gb*100:.0f}%)")
+            ok = True
+            event("stage0", ok=True, phase=phase, step2_sec=round(t2, 3),
+                  samples_per_sec=round(r.train_bs / t2, 3),
+                  peak_vram_gb=round(peak, 2),
+                  vram_pct=round(peak / cfg.hw.vram_gb * 100, 1),
+                  est_hours=round(t2 * r.grad_accum * n_step / 3600, 2),
+                  loss_step1=round(lv, 4), grad_router=g_router)
+            del b, b2, loss, l2
+        except torch.cuda.OutOfMemoryError as e:
+            L.error("S0", f"phase {phase} OOM: {str(e)[:200]}", e)
+            event("stage0", ok=False, phase=phase, reason="oom")
+            log("S0", f"   Hạ: --set run.train_bs={max(r.train_bs//2,1)} "
+                      f"--set run.grad_accum={r.grad_accum*2}")
+            if phase == 2:
+                log("S0", "   Phase 2 OOM mà phase 1 qua là bình thường: chỉ "
+                          "phase 2 mới giữ E bản delta + moment của expert. Hạ "
+                          "fixed.n_expert hoặc fixed.top_k, đừng hạ batch nữa "
+                          "nếu đã bs=1.")
+        except Exception as e:
+            L.error("S0", f"phase {phase} {type(e).__name__}: {str(e)[:300]}", e)
+            event("stage0", ok=False, phase=phase, reason=type(e).__name__)
+        finally:
+            bridge.end()
+            opt.zero_grad(set_to_none=True)
+            del opt
+            gc.collect()
+            torch.cuda.empty_cache()
+        return ok, t2, peak
+
+    s0 = {}
+    for _i, _ph in enumerate(phases_s0):
+        s0[_ph] = stage0(_ph, first=(_i == 0))
+    s0_ok = all(v[0] for v in s0.values())
+    if s0_ok:
+        hours = sum(v[1] * r.grad_accum * phase_steps(cfg, ph) / 3600
+                    for ph, v in s0.items())
+        peak = max(v[2] for v in s0.values())
+        log("S0", f"✓✓ {len(phases_s0)}/{len(phases_s0)} phase qua | tổng lịch "
+                  f"train ≈ {hours:.2f}h | VRAM đỉnh cao nhất {peak:.1f}/"
+                  f"{cfg.hw.vram_gb:.0f}GB ({peak/cfg.hw.vram_gb*100:.0f}%)")
         if peak < cfg.hw.vram_gb * 0.6:
             log("S0", f"   → còn dư: thử --set run.train_bs={r.train_bs*2} "
                       f"--set run.grad_accum={max(r.grad_accum//2,1)}")
-        s0_ok = True
-        event("stage0", ok=True, phase=s0_phase, step2_sec=round(t2, 3),
-              samples_per_sec=round(sps, 3), peak_vram_gb=round(peak, 2),
-              vram_pct=round(peak / cfg.hw.vram_gb * 100, 1),
-              loss_step1=round(lv, 4), grad_router=g_router)
-        del _b, _b2, _loss, _l2
-    except torch.cuda.OutOfMemoryError as e:
-        L.error("S0", f"OOM: {str(e)[:200]}", e)
-        event("stage0", ok=False, reason="oom")
-        log("S0", f"   Hạ: --set run.train_bs={max(r.train_bs//2,1)} "
-                  f"--set run.grad_accum={r.grad_accum*2}")
-        log("S0", "   Nếu đã bs=1: hạ fixed.n_expert (mỗi expert là một bản "
-                  "delta phải giữ trong bộ nhớ khi backward)")
-    except Exception as e:
-        L.error("S0", f"{type(e).__name__}: {str(e)[:300]}", e)
-        event("stage0", ok=False, reason=type(e).__name__)
-    finally:
-        bridge.end()
-        _opt.zero_grad(set_to_none=True)
-        del _opt
-        gc.collect()
-        torch.cuda.empty_cache()
+        event("stage0_all", ok=True, phases=phases_s0,
+              est_total_hours=round(hours, 2), peak_vram_gb=round(peak, 2))
+    else:
+        bad = [ph for ph, v in s0.items() if not v[0]]
+        log("S0", f"✗ phase KHÔNG qua: {bad}")
+        event("stage0_all", ok=False, phases=phases_s0, failed=bad)
+    del _s0_dl
+    gc.collect()
+    torch.cuda.empty_cache()
     log("S0", "═" * 60)
 
     if r.dry_run:
-        log("S0", f"DRY_RUN — dừng. s0_ok={s0_ok}. Chạy thật: thêm --no-dry-run")
+        log("S0", f"DRY_RUN — dừng sau khi thử phase {phases_s0}. "
+                  f"s0_ok={s0_ok}. Chạy thật: thêm --no-dry-run")
         wfinish()
         return 0 if s0_ok else 1
-    assert s0_ok, "STAGE 0 không qua — sửa cấu hình trước khi train"
+    assert s0_ok, ("STAGE 0 không qua ở phase "
+                   f"{[ph for ph, v in s0.items() if not v[0]]} — sửa cấu "
+                   f"hình trước khi train")
 
     # ══════════════════════════ checkpoint ═══════════════════════════════════
     def save_checkpoint(state, optimizer, scheduler, tag="last", push=True,
