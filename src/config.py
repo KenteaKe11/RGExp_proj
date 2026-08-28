@@ -136,7 +136,7 @@ PRESETS = [
 # Câu hỏi của Phase 1 vì thế gọn lại: thêm block Recombinator có đáng không,
 # và bão hoà ở đâu.
 SWEEP_BLOCKS = {
-    VARIANT: (1, 2, 3, 4),
+    VARIANT: (1, 2, 3, 4, 12),
 }
 assert set(SWEEP_BLOCKS) <= set(ROUTER_VARIANTS), "biến thể sweep lạ với router"
 
@@ -157,7 +157,7 @@ def adapter_desc(f, sweep=None):
     return f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E top-{f.top_k}"
 
 
-def detect_hardware():
+def detect_hardware(require_bf16=True):
     import torch
 
     if not torch.cuda.is_available():
@@ -167,11 +167,21 @@ def detect_hardware():
     hw = SimpleNamespace(name=p.name, vram_gb=p.total_memory / 1024**3, sm=sm,
                          has_bf16=sm[0] >= 8,
                          n_gpu=torch.cuda.device_count())
-    # §4.1.3 yêu cầu bf16. sm75 (T4) không có -> fp16 tràn số với Gemma 3 ngay
-    # micro-batch đầu. Đó là nhánh riêng, không dùng project này.
+    # §4.1.3 yêu cầu bf16. sm60 (P100) / sm70 (V100) / sm75 (T4) không có.
+    # Mặc định CHẶN: fp16 có dải số hẹp hơn nhiều và Gemma 3 dễ tràn (inf/NaN)
+    # ở activation. Muốn chạy trên GPU đời cũ thì phải khai báo RÕ trong config
+    #     fixed.require_bf16: false
+    #     fixed.compute_dtype: float16
+    # để không ai vô tình train fp16 rồi tưởng kết quả so được với các ô bf16.
     if not hw.has_bf16:
-        raise RuntimeError(
-            f"GPU sm{sm[0]}{sm[1]} không hỗ trợ bf16. Cần Ampere trở lên (sm80+).")
+        if require_bf16:
+            raise RuntimeError(
+                f"GPU sm{sm[0]}{sm[1]} không hỗ trợ bf16. Cần Ampere trở lên "
+                f"(sm80+), hoặc đặt fixed.require_bf16=false + "
+                f"fixed.compute_dtype=float16 nếu chấp nhận rủi ro tràn số.")
+        print(f"⚠ GPU sm{sm[0]}{sm[1]} KHÔNG có bf16 — chạy fp16 theo yêu cầu "
+              f"config. Loss = NaN/inf ở vài step đầu là dấu hiệu tràn số, "
+              f"không phải lỗi cấu hình.")
     return hw
 
 
@@ -228,7 +238,7 @@ def load_config(path="configs/default.yaml", overrides=None):
             raise ValueError(f"--set cần dạng khoa=gia_tri, nhận: {ov!r}")
         _deep_set(raw, *ov.split("=", 1))
 
-    hw = detect_hardware()
+    hw = detect_hardware(bool(raw["fixed"].get("require_bf16", True)))
     preset = pick_preset(hw.vram_gb)
     fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
     explicit = {ov.split("=", 1)[0] for ov in (overrides or [])}
@@ -236,6 +246,13 @@ def load_config(path="configs/default.yaml", overrides=None):
     # §1.6 — số mũ của bảng α (0.125 = nghịch đảo căn bậc 8). Đặt default ở đây
     # để config cũ (chưa có khoá này) không chết giữa chừng vì AttributeError.
     run.setdefault("focal_alpha_pow", 0.125)
+    # Dừng sớm + giữ ckpt tốt nhất — config cũ chưa có hai khoá này.
+    run.setdefault("early_stop_patience", 0)      # 0 = tắt
+    run.setdefault("early_stop_min_delta", 0.0)
+    run.setdefault("early_stop_phases", [2])
+    run.setdefault("save_best", False)
+    run.setdefault("num_workers", 4)
+    fixed.setdefault("require_bf16", True)
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
@@ -313,6 +330,42 @@ def load_config(path="configs/default.yaml", overrides=None):
     return cfg
 
 
+def resolve_phase_samples(cfg, n_train, log=print):
+    """`phase*_samples: null` -> tự chia tập train làm hai lát (1 epoch).
+
+    Gọi SAU khi df_train đã dựng xong (chỉ lúc đó mới biết số mẫu thật). Cắt
+    tròn theo effective batch vì DataLoader drop_last=True: phần dư không tạo
+    ra step nào, để nguyên thì con số ghi trong log khác số mẫu thật sự dùng.
+
+    Chia đôi chứ không cho cả hai phase = cả tập: phase_slice giữ luật hai lát
+    RỜI NHAU, nên "1 epoch" ở đây = mỗi mẫu được thấy đúng một lần trên toàn
+    bộ lịch train (nửa đầu rare-first cho Phase 1, nửa sau cho Phase 2).
+    """
+    r = cfg.run
+    eff = r.train_bs * r.grad_accum
+    a1 = r.phase1_samples is None
+    a2 = r.phase2_samples is None
+    if not (a1 or a2):
+        _check_phases(cfg)
+        return
+    usable = n_train // eff * eff
+    if usable < 2 * eff:
+        raise ValueError(f"train chỉ {n_train} mẫu, không đủ 2 step "
+                         f"(effective batch {eff}).")
+    if a1 and a2:
+        n1 = (usable // 2) // eff * eff
+        r.phase1_samples, r.phase2_samples = n1, usable - n1
+    elif a1:
+        r.phase1_samples = usable - r.phase2_samples // eff * eff
+    else:
+        r.phase2_samples = usable - r.phase1_samples // eff * eff
+    log("cfg", f"lịch 1 epoch: train {n_train} mẫu -> dùng {usable} "
+               f"(bội của {eff}) = phase1 {r.phase1_samples} + phase2 "
+               f"{r.phase2_samples} | {phase_steps(cfg, 1)} + "
+               f"{phase_steps(cfg, 2)} step")
+    _check_phases(cfg)
+
+
 def _check_phases(cfg):
     """§1.7 — lịch hai phase phải chia hết cho effective batch.
 
@@ -322,6 +375,8 @@ def _check_phases(cfg):
     """
     r = cfg.run
     eff = r.train_bs * r.grad_accum
+    if r.phase1_samples is None or r.phase2_samples is None:
+        return          # chưa biết số mẫu train — resolve_phase_samples lo
     for name in ("phase1_samples", "phase2_samples"):
         n = getattr(r, name)
         if n % eff:
@@ -337,6 +392,8 @@ def phase_steps(cfg, phase):
     """Số optimizer step của một phase, suy từ số mẫu (§1.7)."""
     r = cfg.run
     n = r.phase1_samples if phase == 1 else r.phase2_samples
+    if n is None:
+        return None     # `null` trong config — chờ resolve_phase_samples
     return n // (r.train_bs * r.grad_accum)
 
 
@@ -411,10 +468,20 @@ if __name__ == "__main__":
     print(f"Ảnh     : {image_desc(c.fixed)}")
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
           f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
-    print(f"Phase 1 : {c.run.phase1_samples} mẫu = {phase_steps(c, 1)} step "
+    def _sched(ph):
+        n, st = (c.run.phase1_samples if ph == 1 else c.run.phase2_samples), \
+            phase_steps(c, ph)
+        return (f"{n} mẫu = {st} step" if n is not None else
+                "auto — chia đôi tập train khi biết số mẫu (1 epoch)")
+    print(f"Phase 1 : {_sched(1)} "
           f"| loss = Focal (α = 1/f^{c.run.focal_alpha_pow})")
-    print(f"Phase 2 : {c.run.phase2_samples} mẫu = {phase_steps(c, 2)} step "
-          f"| loss = CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
+    print(f"Phase 2 : {_sched(2)} "
+          f"| loss = 1·CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
+    es = c.run.early_stop_patience
+    print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
+          f"batch) | ckpt mỗi {c.run.save_every} step | dừng sớm: "
+          + (f"{es} val liên tiếp không cải thiện, phase "
+             f"{c.run.early_stop_phases}" if es else "tắt"))
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
     print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run} | "
           f"policy={'BẬT' if c.run.use_policy else 'TẮT (chấm raw_output)'}")

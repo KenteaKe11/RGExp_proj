@@ -456,8 +456,12 @@ def make_loader(frame, collate, cfg, order=None, bs=None, shuffle=False):
     ds = CXRDataset(frame, cfg)
     if order is not None:
         ds = Subset(ds, list(order))
+    # num_workers là tham số HẠ TẦNG: 4 hợp với máy 8+ core; Kaggle/Colab chỉ
+    # có 2-4 vCPU nên hạ xuống 2 để worker không giành CPU với tiến trình chính.
+    nw = int(getattr(cfg.run, "num_workers", 4))
     return DataLoader(ds, batch_size=bs or cfg.run.train_bs, shuffle=shuffle,
-                      collate_fn=collate, num_workers=4, pin_memory=True,
+                      collate_fn=collate, num_workers=nw,
+                      pin_memory=True, persistent_workers=nw > 0,
                       drop_last=True)
 
 

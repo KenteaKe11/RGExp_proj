@@ -28,7 +28,7 @@ import torch
 from . import logging_utils as L
 from . import moe
 from .config import (adapter_desc, config_from_args, image_desc, phase_steps,
-                     resolve_seq_len, variant_desc)
+                     resolve_phase_samples, resolve_seq_len, variant_desc)
 from .data import (attach_labels, build_frames, cell_frequency, fetch_sources,
                    load_or_make_splits, phase_slice, rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
@@ -81,9 +81,16 @@ def main(argv=None):
                f"ckpt={r.grad_ckpt} | batch {r.train_bs}×{r.grad_accum}"
                f"={r.train_bs*r.grad_accum} mẫu/step | mode={r.mode} "
                f"dry_run={r.dry_run}")
-    log("cfg", f"phase1 {r.phase1_samples} mẫu = {phase_steps(cfg, 1)} step | "
-               f"phase2 {r.phase2_samples} mẫu = {phase_steps(cfg, 2)} step | "
-               f"chạy phase: {only_phase or '1 rồi 2'}")
+    _sched = ("phase1/phase2 = auto (chia đôi tập train — 1 epoch)"
+              if r.phase1_samples is None or r.phase2_samples is None else
+              f"phase1 {r.phase1_samples} mẫu = {phase_steps(cfg, 1)} step | "
+              f"phase2 {r.phase2_samples} mẫu = {phase_steps(cfg, 2)} step")
+    log("cfg", f"{_sched} | chạy phase: {only_phase or '1 rồi 2'}")
+    log("cfg", f"loss phase 2 = 1·CE + {r.w_sup}·Focal + {r.w_aux}·Aux | "
+               f"val mỗi {r.eval_every} step | ckpt mỗi {r.save_every} step | "
+               + (f"dừng sớm sau {r.early_stop_patience} val không cải thiện "
+                  f"(phase {r.early_stop_phases})"
+                  if r.early_stop_patience else "dừng sớm: TẮT"))
     log("cfg", f"kiến trúc: {variant_desc(cfg)}")
     log("cfg", f"ảnh {image_desc(f)}")
     if not r.use_policy:
@@ -153,6 +160,8 @@ def main(argv=None):
     log("label", f"α = 1/f^{r.focal_alpha_pow} ({r.focal_alpha_normalize}): "
                  f"min={alpha.min():.3f} max={alpha.max():.3f} "
                  f"tỉ lệ max/min={float(alpha.max()/alpha.min()):.1f}×")
+    # `phase*_samples: null` -> chia đôi tập train ở ĐÂY (giờ mới biết số mẫu).
+    resolve_phase_samples(cfg, len(df_train), log)
     base_order = rare_first_order(df_train, cell_freq, cfg, log)
     order1 = phase_slice(base_order, cfg, 1)
     order2 = phase_slice(base_order, cfg, 2)
@@ -321,17 +330,24 @@ def main(argv=None):
     assert s0_ok, "STAGE 0 không qua — sửa cấu hình trước khi train"
 
     # ══════════════════════════ checkpoint ═══════════════════════════════════
-    def save_checkpoint(state, optimizer, scheduler, tag="last", push=True):
-        """Lưu đủ để resume: router + E expert + optimizer/scheduler + con trỏ."""
+    def save_checkpoint(state, optimizer, scheduler, tag="last", push=True,
+                        with_optimizer=True):
+        """Lưu đủ để resume: router + E expert + optimizer/scheduler + con trỏ.
+
+        `with_optimizer=False` cho bản "best": nó chỉ dùng để LẤY LẠI trọng số
+        tốt nhất sau khi dừng sớm, không dùng để train tiếp — mà optimizer của
+        AdamW nặng gấp đôi trọng số (2 moment fp32 cho ~267M param trainable).
+        """
         d = os.path.join(r.ckpt_dir, tag)
         os.makedirs(d, exist_ok=True)
         torch.save({"router": router.state_dict(),
                     "experts": moe.expert_state_dict(model, expert_ids)},
                    os.path.join(d, "weights.pt"))
-        torch.save({"optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "torch_rng": torch.get_rng_state()},
-                   os.path.join(d, "optimizer.pt"))
+        if with_optimizer:
+            torch.save({"optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "torch_rng": torch.get_rng_state()},
+                       os.path.join(d, "optimizer.pt"))
         meta = dict(state, total_steps={1: phase_steps(cfg, 1),
                                         2: phase_steps(cfg, 2)},
                     n_train=len(df_train), seed=f.seed, gpu=cfg.hw.name,
@@ -389,7 +405,8 @@ def main(argv=None):
     assert resume_dir or not run_test or run_train, \
         f"mode='test' nhưng không có checkpoint ({src})"
 
-    state = {"phase": only_phase or 1, "step": 0, "cursor": 0, "done": False}
+    state = {"phase": only_phase or 1, "step": 0, "cursor": 0, "done": False,
+             "es_best": None, "es_bad": 0}
     opt_state = None
     if resume_dir:
         with open(os.path.join(resume_dir, "train_state.json")) as fh:
@@ -402,7 +419,8 @@ def main(argv=None):
              f"{cfg.sweep.tag} — router có shape khác, không nạp được")
         load_weights(resume_dir)
         state = {"phase": st["phase"], "step": st["step"],
-                 "cursor": st["cursor"], "done": st.get("done", False)}
+                 "cursor": st["cursor"], "done": st.get("done", False),
+                 "es_best": st.get("es_best"), "es_bad": st.get("es_bad", 0)}
         op = os.path.join(resume_dir, "optimizer.pt")
         opt_state = torch.load(op, map_location="cpu") if os.path.exists(op) \
             else None
@@ -500,6 +518,13 @@ def main(argv=None):
         if step >= total:
             log("train", f"phase {phase}: đã đủ {step}/{total} step — bỏ qua")
             return
+        # Bộ đếm dừng sớm: tiếp tục đếm nếu resume ĐÚNG phase cũ, reset khi
+        # bước sang phase mới (val_loss của hai phase là hai đại lượng khác
+        # nhau — Focal ở P1, CE+sup+aux ở P2 — so với nhau là vô nghĩa).
+        same = state["phase"] == phase
+        es_best = state.get("es_best") if same else None
+        es_bad = state.get("es_bad", 0) if same else 0
+        es_on = bool(r.early_stop_patience) and phase in (r.early_stop_phases or [])
         params = router_params + (expert_params if phase == 2 else [])
         optimizer = make_optimizer(phase)
         scheduler = get_linear_schedule_with_warmup(
@@ -551,7 +576,8 @@ def main(argv=None):
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
-            state.update(phase=phase, step=step, cursor=cursor)
+            state.update(phase=phase, step=step, cursor=cursor,
+                         es_best=es_best, es_bad=es_bad)
 
             step_sec = time.time() - tstep
             wlog({f"p{phase}/loss": running, f"p{phase}/grad_norm": gnorm,
@@ -575,19 +601,49 @@ def main(argv=None):
                     f"| {step_sec:.1f}s/step "
                     f"| ETA {(total-step)*el/step/3600:.2f}h "
                     f"| vram {torch.cuda.memory_allocated(0)/1024**3:.1f}GB")
+            stop_early = False
             if r.eval_every and step % r.eval_every == 0:
                 vl, vacc = evaluate(phase)
                 wlog({f"p{phase}/val_loss": vl,
                       f"p{phase}/val_sup_acc_nonblank": vacc,
                       f"p{phase}/step": step})
+                # NaN không bao giờ nhỏ hơn best -> tính là KHÔNG cải thiện.
+                # Ba lần val ra NaN liên tiếp thì dừng là đúng: fp16 đã tràn.
+                better = es_best is None or vl < es_best - r.early_stop_min_delta
+                if es_on and better:
+                    es_best, es_bad = vl, 0
+                elif es_on:
+                    es_bad += 1
+                state.update(es_best=es_best, es_bad=es_bad)
                 log("val", f"P{phase} step {step} loss={vl:.4f} "
-                           f"sup_acc_nb={vacc:.4f}")
+                           f"sup_acc_nb={vacc:.4f}"
+                           + ("" if not es_on else
+                              (f" | ✓ tốt nhất" if better else
+                               f" | không cải thiện {es_bad}/"
+                               f"{r.early_stop_patience} "
+                               f"(tốt nhất {es_best:.4f})")))
                 event("eval", phase=phase, step=step, val_loss=round(vl, 5),
-                      val_sup_acc_nonblank=round(vacc, 5))
+                      val_sup_acc_nonblank=round(vacc, 5),
+                      es_best=(None if es_best is None else round(es_best, 5)),
+                      es_bad=es_bad)
+                if es_on and better and r.save_best:
+                    save_checkpoint(state, optimizer, scheduler, "best",
+                                    push=False, with_optimizer=False)
+                stop_early = es_on and es_bad >= r.early_stop_patience
             if r.save_every and step % r.save_every == 0:
                 n_saves += 1
                 save_checkpoint(state, optimizer, scheduler, "last",
                                 push=(n_saves % r.push_every_n_saves == 0))
+            if stop_early:
+                log("train", f"DỪNG SỚM phase {phase} @ step {step}/{total}: "
+                             f"{r.early_stop_patience} lần val liên tiếp không "
+                             f"cải thiện (val_loss tốt nhất {es_best:.4f})"
+                             + (f" — trọng số tốt nhất ở {r.ckpt_dir}/best/"
+                                if r.save_best else ""))
+                event("early_stop", phase=phase, step=step, total=total,
+                      best_val_loss=round(es_best, 5),
+                      patience=r.early_stop_patience)
+                break
             if step % 50 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -612,7 +668,9 @@ def main(argv=None):
                 continue
             run_phase(ph, order1 if ph == 1 else order2)
             if ph == 1 and not only_phase:
-                state.update(phase=2, step=0, cursor=0)
+                # es_best/es_bad phải reset: val_loss của P1 (Focal) và P2
+                # (CE+sup+aux) là hai thang đo khác nhau.
+                state.update(phase=2, step=0, cursor=0, es_best=None, es_bad=0)
     else:
         log("train", f"BỎ QUA train (mode={r.mode})")
 

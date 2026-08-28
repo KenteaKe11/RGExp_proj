@@ -31,12 +31,13 @@ fixed:
   # SAI là 0.1 (nhãn không còn one-hot), lớp đúng giữ 0.9.
   label_smoothing: 0.1
 
-  # ── MoE: cố định ở Phase 1 ────────────────────────────────────────────────
-  # Chỉ tiêu khi chọn: ít tham số nhất có thể (chạy nhanh, thử được nhiều ô)
-  # mà VẪN còn tính thưa của MoE. 4 expert / top-2 là điểm nhỏ nhất thoả cả
-  # hai: mỗi mẫu bỏ qua đúng một nửa số expert.
-  n_expert: 4
-  top_k: 2
+  # ── MoE: cấu hình CHỐT (hết sweep) ───────────────────────────────────────
+  # 16 expert, mỗi mẫu dùng 6 -> bỏ qua 10/16 expert. Sparsity chỉ tiết kiệm
+  # tính toán khi CẢ BATCH cùng bỏ qua một expert (xem src/moe.py::CTX.active);
+  # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
+  # tế xấp xỉ 16 bản delta/step, KHÔNG phải 6.
+  n_expert: 16
+  top_k: 6
 
   # ── Adapter (đã chốt: QDoRA r8) ──────────────────────────────────────────
   lora_r: 8
@@ -76,9 +77,10 @@ sweep:
   # g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
   #         852_992 param/block
   variant: g-brmf
-  # Dải đang quét (§2.1): n_block 1 → 4, tổng tham số trainable (E=4 expert)
-  #   n1 ≈ 67.1M   n2 ≈ 68.0M   n3 ≈ 68.8M   n4 ≈ 69.7M
-  n_block: 1
+  # CHỐT: 12 block (hết sweep). Router = 1.58M stem + 12×0.85M block +
+  # 0.79M separation + 0.15M sup_head + 0.13M route_head ≈ 12.9M;
+  # cộng 16 expert QDoRA r8 (~15.9M/expert) ≈ 267M param trainable.
+  n_block: 12
 
 # Bảng tra: tên model + module loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
 models:
@@ -140,11 +142,13 @@ run:
   wandb_run: null           # null -> tự đặt theo ô sweep
 
   # ── Lịch hai phase (§1.7) ────────────────────────────────────────────────
-  # 6400 mẫu ≈ 5% train, lấy từ ĐẦU thứ tự rare-first (nhãn hiếm lên trước).
-  # Hai phase dùng hai lát KHÁC nhau: phase 2 học lại chính mẫu phase 1 đã
-  # thuộc thì val_loss không còn nói lên điều gì.
-  phase1_samples: 6400      # chỉ nhánh supervised — loss = Focal
-  phase2_samples: 6400      # router + expert + decoder — loss = CE+sup+aux
+  # null = TỰ CHIA: lấy TRỌN tập train (≈151k − n_val − n_test) rồi cắt đôi
+  # theo thứ tự rare-first, phase 1 nửa đầu, phase 2 nửa sau. Mỗi mẫu được
+  # thấy đúng MỘT lần trên cả lịch train = 1 epoch. Hai lát vẫn KHÔNG trùng
+  # nhau: phase 2 học lại mẫu phase 1 đã thuộc thì val_loss hết ý nghĩa.
+  # Ghi số cứng (vd 6400) sẽ vô hiệu hoá việc tự chia.
+  phase1_samples: null      # chỉ nhánh supervised — loss = Focal
+  phase2_samples: null      # router + expert + decoder — loss = CE+sup+aux
   n_test_samples: 200       # §1.1 — 200 mẫu sinh text có metrics
 
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 ─────────────
@@ -157,6 +161,7 @@ run:
   grad_accum: 8
   infer_bs: 8
   grad_ckpt: null
+  num_workers: 4            # DataLoader worker — hạ xuống 2 trên máy ít vCPU
 
   # §4.1.2 — N = prompt + ảnh + target + padding. null = tự tính về lũy thừa 2.
   max_seq_len: 896
@@ -168,9 +173,9 @@ run:
   weight_decay: 0.01
   warmup_steps: 10
   max_grad_norm: 1.0
-  # §1.7b — Total_Loss = CE + 0.4·Focal + 0.05·Aux
-  w_sup: 0.4                # hệ số Focal (supervised) trong Phase 2
-  w_aux: 0.05               # hệ số load-balancing (aux)
+  # §1.7b — Total_Loss = 1·CE + 0.5·Focal + 0.07·Aux  (tỉ lệ CHỐT)
+  w_sup: 0.5                # hệ số Focal (supervised) trong Phase 2
+  w_aux: 0.07               # hệ số load-balancing (aux)
   focal_gamma: 2.0          # "lực phạt mũ 2"
   # §1.6 — α_ij = 1/(f_ij + ε)^p. p = 0.125 (nghịch đảo căn bậc 8) kéo dải α
   # từ ~1000× (p = 0.5, bản cũ) xuống ~5×: ô hiếm vẫn nặng hơn ô phổ biến
@@ -179,11 +184,21 @@ run:
   # row | global | none — xem docstring src/losses.py::inv_freq_alpha
   focal_alpha_normalize: row
 
-  eval_every: 15
+  eval_every: 10
   eval_max_batches: 20
+
+  # ── Dừng sớm ─────────────────────────────────────────────────────────────
+  # 3 lần val LIÊN TIẾP không cải thiện val_loss -> dừng phase, lưu ckpt, đi
+  # tiếp (Phase 2 dừng sớm = sang thẳng infer).
+  early_stop_patience: 3
+  early_stop_min_delta: 0.0   # cải thiện phải > ngưỡng này mới tính
+  early_stop_phases: [2]      # [] = tắt | [2] = chỉ Phase 2 | [1, 2] = cả hai
+  # Giữ bản ckpt tại val TỐT NHẤT (chỉ trọng số, không optimizer, không push).
+  # Dừng sớm mà không có bản này thì ckpt cuối là bản đã tệ đi 3 lần val.
+  save_best: true
   # Một checkpoint ≈ 256MB trọng số + ~512MB optimizer (AdamW giữ 2 moment cho
   # ~64M param expert ở fp32). save_every nhỏ hơn 50 là ghi đĩa nhiều hơn train.
-  save_every: 15
+  save_every: 10           # = eval_every -> mỗi lần val là một lần ckpt
   push_every_n_saves: 2
   # false = KHÔNG đẩy optimizer.pt lên Hub (vẫn giữ bản cục bộ để resume).
   hub_include_optimizer: false
