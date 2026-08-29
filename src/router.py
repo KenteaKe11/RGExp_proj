@@ -244,6 +244,63 @@ class RouterNet(nn.Module):
         self.sup_head = SupervisedHead(dim)
         self.route_head = RouteHead(n_expert, dim)
 
+    # ── freeze cho Phase 2 / "Phase Router" ─────────────────────────────────
+    def trunk_layers(self):
+        """Trunk = phần DÙNG CHUNG cho cả hai head, xếp theo thứ tự sâu dần.
+
+        Stem được tính là layer đầu tiên: nó là phép chiếu 2560→512 cộng một
+        lần trộn, tức đúng cái vai "layer thấp học đặc trưng chung" mà việc
+        đóng băng nhắm tới. Separation/route_head KHÔNG nằm trong trunk —
+        chúng là phần riêng của từng head và Phase 2 phải học tiếp.
+        """
+        return [("stem", self.stem)] + \
+               [(f"blocks.{i}", b) for i, b in enumerate(self.blocks)]
+
+    def set_freeze(self, n_trunk=0, sup_head=False):
+        """Đóng băng `n_trunk` layer đầu của trunk (+ tuỳ chọn sup_head).
+
+        Gọi với (0, False) để MỞ lại toàn bộ — nên hàm này an toàn khi gọi
+        nhiều lần, và Phase 1 chỉ việc gọi lại với 0 thay vì phải nhớ trạng
+        thái cũ. Đây là lý do nó reset requires_grad=True cho mọi param trước.
+
+        Vì sao Phase 2 (Phase Router) đóng băng:
+          * `sup_head` đã được Focal của Phase 1 train tới nơi trên đúng nhãn
+            14×4. Ở Phase 2 nó chỉ còn đóng vai một cái THƯỚC cố định: loss
+            w_sup·Focal vẫn chảy ngược qua Separation về trunk và giữ cho bản
+            tóm tắt không trôi khỏi ngữ nghĩa bệnh học, nhưng bản thân cái
+            thước thì không được tự nắn cho vừa.
+          * n layer đầu của trunk giữ nguyên đặc trưng thấp đã học ở Phase 1,
+            để gradient CE (rất khác Focal) không kéo cả trunk đi ngay từ đáy.
+
+        Luôn chừa ÍT NHẤT một layer trunk train được: đóng băng trọn trunk thì
+        `n_block` — biến duy nhất của sweep — không còn ảnh hưởng gì tới Phase
+        2, và cả bảng so sánh mất nghĩa. Xin nhiều hơn thì bị cắt về mức đó và
+        `clamped` trong kết quả trả về sẽ khác `asked`.
+        """
+        trunk = self.trunk_layers()
+        asked = max(int(n_trunk), 0)
+        n = min(asked, len(trunk) - 1)
+
+        for p in self.parameters():
+            p.requires_grad_(True)
+
+        frozen_names = []
+        for name, mod in trunk[:n]:
+            for p in mod.parameters():
+                p.requires_grad_(False)
+            frozen_names.append(name)
+        if sup_head:
+            for p in self.sup_head.parameters():
+                p.requires_grad_(False)
+            frozen_names.append("sup_head")
+
+        n_frozen = sum(p.numel() for p in self.parameters()
+                       if not p.requires_grad)
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"asked": asked, "clamped": n, "n_trunk_total": len(trunk),
+                "frozen": frozen_names, "n_frozen_param": n_frozen,
+                "n_trainable_param": n_train}
+
     # ── thống kê tham số (đối chiếu bảng trong tài liệu) ────────────────────
     def param_table(self):
         def n(m):

@@ -227,10 +227,43 @@ def main(argv=None):
 
     from torch.optim import AdamW
 
-    router_params = [p for p in router.parameters() if p.requires_grad]
     expert_params = [p for p in model.parameters() if p.requires_grad]
+    _freeze_logged = set()
 
-    def make_optimizer(phase):
+    def apply_phase_freeze(phase):
+        """Đặt requires_grad của nhánh router cho ĐÚNG phase, trả param train.
+
+        Phải gọi TRƯỚC make_optimizer: AdamW chụp danh sách param một lần lúc
+        dựng, nên một param bị đóng băng sau đó vẫn nằm trong param_group (chỉ
+        là không có grad) và vẫn ăn 2 moment fp32 — im lặng và tốn VRAM.
+
+        Gọi được nhiều lần: `RouterNet.set_freeze` mở lại toàn bộ trước khi
+        đóng, nên STAGE 0 thử phase 1 rồi phase 2 rồi run_phase(1) không để
+        lại trạng thái thừa của lần trước.
+        """
+        n = int(getattr(r, "p2_freeze_trunk", 0) or 0) if phase == 2 else 0
+        sup = bool(getattr(r, "p2_freeze_sup_head", False)) if phase == 2 else False
+        info = router.set_freeze(n, sup)
+        if phase not in _freeze_logged:
+            _freeze_logged.add(phase)
+            if info["frozen"]:
+                log("freeze", f"phase {phase}: đóng băng {info['frozen']} "
+                              f"= {info['n_frozen_param']:,} param | "
+                              f"router còn {info['n_trainable_param']:,} "
+                              f"trainable")
+            else:
+                log("freeze", f"phase {phase}: train TRỌN nhánh router "
+                              f"({info['n_trainable_param']:,} param)")
+            if info["clamped"] < info["asked"]:
+                warn("freeze", f"p2_freeze_trunk={info['asked']} nhưng trunk "
+                               f"chỉ có {info['n_trunk_total']} layer "
+                               f"(stem + {info['n_trunk_total'] - 1} block) — "
+                               f"cắt xuống {info['clamped']} để còn ít nhất "
+                               f"MỘT block train được, nếu không thì n_block "
+                               f"không còn ảnh hưởng gì tới Phase 2.")
+        return [p for p in router.parameters() if p.requires_grad]
+
+    def make_optimizer(phase, router_params):
         """Phase 1 chỉ có router; Phase 2 thêm expert với lr riêng.
 
         Hai lr khác nhau vì hai thứ khác hẳn nhau: router là mạng train từ số
@@ -301,7 +334,8 @@ def main(argv=None):
                 f"router + {f.n_expert} expert QDoRA + decoder")
         log("S0", f"── phase {phase} | loss = "
                   f"{'focal' if phase == 1 else 'ce+sup+aux'} | {what}")
-        opt = make_optimizer(phase)
+        router_params = apply_phase_freeze(phase)
+        opt = make_optimizer(phase, router_params)
         params = router_params + (expert_params if phase == 2 else [])
         step_fn = phase1_loss if phase == 1 else phase2_loss
         ok, t2, peak = False, None, None
@@ -754,8 +788,9 @@ def main(argv=None):
         # `best_val` là val tốt nhất TỪNG THẤY, dùng cho save_best. Tách khỏi
         # `es_best` vì từ đây hai thứ đó không còn là một (xem ngay dưới).
         best_val = es_best
+        router_params = apply_phase_freeze(phase)
         params = router_params + (expert_params if phase == 2 else [])
-        optimizer = make_optimizer(phase)
+        optimizer = make_optimizer(phase, router_params)
         # Dựng lịch TRƯỚC optimizer.load_state_dict(): nó chụp base_lrs từ
         # param_groups, mà load_state_dict ghi đè "lr" bằng LR CUỐI của lần
         # chạy trước (một điểm giữa dốc cosine).
@@ -781,7 +816,17 @@ def main(argv=None):
             return out
 
         if opt_state is not None and same and samples > 0:
-            optimizer.load_state_dict(opt_state["optimizer"])
+            try:
+                optimizer.load_state_dict(opt_state["optimizer"])
+            except ValueError as e:
+                # Số param trong group đổi so với lúc ghi ckpt — gần như luôn
+                # là do bật/tắt p2_freeze_*. Moment cũ không còn ghép được vào
+                # danh sách param mới; reset chúng là mất một chút đà, KHÔNG
+                # mất tiến độ (con trỏ mẫu + trọng số đã nạp ở apply_state).
+                warn("resume", f"optimizer.pt không khớp danh sách param "
+                               f"({e}) — nhiều khả năng p2_freeze_trunk / "
+                               f"p2_freeze_sup_head đã đổi kể từ ckpt này. "
+                               f"Moment AdamW reset, train tiếp bình thường.")
             torch.set_rng_state(opt_state["torch_rng"].cpu().to(torch.uint8))
             log("resume", f"phase {phase}: khôi phục optimizer + RNG (lịch LR "
                           f"là hàm của số mẫu — không cần tua)")

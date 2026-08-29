@@ -2,7 +2,7 @@
 
     python scripts/selftest.py
 
-Sáu thứ được kiểm:
+Bảy thứ được kiểm:
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
@@ -12,6 +12,8 @@ Sáu thứ được kiểm:
      biên cycle KHÔNG đổi khi đổi effective batch;
   6. cộng trung bình trọng số (SWA): running mean đúng bằng trung bình số học,
      không dùng chung bộ nhớ với tensor gốc, bàn giao qua state_dict giữ nguyên.
+  7. freeze của Phase 2 ("Phase Router"): đúng module bị đóng băng, phần còn
+     lại vẫn nhận gradient, và mở lại được về nguyên trạng.
 
 Cái KHÔNG kiểm được ở đây (phải có GPU + weight thật): peft add_adapter, hook
 vào decoder Gemma, generate(). STAGE 0 trong src/train.py lo phần đó.
@@ -269,6 +271,62 @@ def test_swa():
         check("shape đổi giữa hai snapshot -> nổ RuntimeError", True)
 
 
+def test_freeze():
+    """[8] freeze Phase 2: đóng đúng chỗ, chừa đúng chỗ, mở lại được."""
+    print("\n[8] freeze Phase 2 (sup_head + n layer đầu trunk)")
+
+    def groups(net, want_grad):
+        return sorted({n.split(".")[0] +
+                       ("." + n.split(".")[1] if n.startswith("blocks") else "")
+                       for n, p in net.named_parameters()
+                       if p.requires_grad is want_grad})
+
+    net = RouterNet(VARIANT, 4, 4, 2)
+    n_full = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+    info = net.set_freeze(4, True)
+    check("freeze(4) = stem + 3 block đầu + sup_head",
+          groups(net, False) == ["blocks.0", "blocks.1", "blocks.2",
+                                 "stem", "sup_head"],
+          str(groups(net, False)))
+    check("chừa lại block cuối + separation + route_head",
+          groups(net, True) == ["blocks.3", "route_head", "separation"],
+          str(groups(net, True)))
+    check("đếm param khớp", info["n_frozen_param"] + info["n_trainable_param"]
+          == n_full, f"{info['n_frozen_param']:,} + "
+                     f"{info['n_trainable_param']:,} = {n_full:,}")
+
+    # Gradient: phần đóng băng KHÔNG được có .grad, phần còn lại PHẢI có.
+    sup, gate, aux, _ = net(torch.randn(2, 16, 2560), torch.ones(2, 16))
+    (sup.pow(2).mean() + gate.sum() + aux).backward()
+    check("phần đóng băng không nhận gradient",
+          all(p.grad is None for n, p in net.named_parameters()
+              if not p.requires_grad))
+    check("phần còn lại nhận gradient (gate vẫn nối về route_head)",
+          all(p.grad is not None for n, p in net.named_parameters()
+              if p.requires_grad))
+
+    # Mở lại: set_freeze phải là hàm THUẦN của tham số, không tích trạng thái.
+    net.set_freeze(0, False)
+    check("set_freeze(0, False) mở lại trọn nhánh",
+          sum(p.numel() for p in net.parameters() if p.requires_grad) == n_full)
+
+    # Trunk ngắn hơn số xin: cắt xuống, luôn chừa ≥1 block train được.
+    small = RouterNet(VARIANT, 1, 4, 2)
+    info = small.set_freeze(4, True)
+    check("n_block=1: xin 4 -> cắt còn 1 (chỉ stem)",
+          info["clamped"] == 1 and info["frozen"] == ["stem", "sup_head"],
+          f"asked={info['asked']} clamped={info['clamped']}")
+    check("n_block=1: block duy nhất VẪN train được",
+          "blocks.0" in groups(small, True), str(groups(small, True)))
+
+    # Tắt hẳn = không đóng băng gì.
+    off = RouterNet(VARIANT, 2, 4, 2)
+    info = off.set_freeze(0, False)
+    check("p2_freeze_trunk=0 + sup_head=false -> không đóng băng gì",
+          info["frozen"] == [] and info["n_frozen_param"] == 0)
+
+
 if __name__ == "__main__":
     print("[1] bảng tham số vs tài liệu")
     if _selftest() != 0:
@@ -278,5 +336,6 @@ if __name__ == "__main__":
     test_focal()
     test_schedule()
     test_swa()
+    test_freeze()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

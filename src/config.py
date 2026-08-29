@@ -251,6 +251,10 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("early_stop_min_delta", 0.0)
     run.setdefault("early_stop_phases", [2])
     run.setdefault("save_best", False)
+    # Phase 2 đóng băng sup_head + n layer đầu của trunk router (mặc định TẮT
+    # để config cũ giữ nguyên hành vi; configs/default.yaml bật 4 + true).
+    run.setdefault("p2_freeze_trunk", 0)
+    run.setdefault("p2_freeze_sup_head", False)
     run.setdefault("num_workers", 4)
     # Ckpt đếm theo lần val (không theo step): bs đổi thì step đổi, lần val
     # thì không. `save_every` cũ (đếm step) vẫn đọc được để config cũ chạy tiếp.
@@ -560,6 +564,16 @@ if __name__ == "__main__":
           f"| loss = Focal (α = 1/f^{c.run.focal_alpha_pow})")
     print(f"Phase 2 : {_sched(2)} "
           f"| loss = 1·CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
+    _fz = []
+    if c.run.p2_freeze_trunk:
+        _n = min(int(c.run.p2_freeze_trunk), c.sweep.n_block)   # stem + block
+        _fz.append(f"{_n} layer đầu trunk"
+                   + (f" (xin {c.run.p2_freeze_trunk}, trunk chỉ có "
+                      f"{c.sweep.n_block + 1})"
+                      if _n < int(c.run.p2_freeze_trunk) else ""))
+    if c.run.p2_freeze_sup_head:
+        _fz.append("sup_head")
+    print(f"          freeze ở Phase 2: {' + '.join(_fz) if _fz else 'không'}")
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
           f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}×"

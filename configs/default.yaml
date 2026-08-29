@@ -228,6 +228,24 @@ run:
   # row | global | none — xem docstring src/losses.py::inv_freq_alpha
   focal_alpha_normalize: row
 
+  # ── Phase 2 ("Phase Router"): đóng băng một phần nhánh router ────────────
+  # Phase 1 đã train TRỌN nhánh router bằng Focal trên nhãn 14×4. Vào Phase 2,
+  # loss đổi hẳn bản chất (CE trên token) và gradient của nó đủ mạnh để kéo cả
+  # trunk đi mất phần đã học. Hai chốt chặn:
+  #
+  #   p2_freeze_trunk: N   đóng băng N layer ĐẦU của trunk, đếm theo thứ tự
+  #     [stem, blocks.0, blocks.1, ...]. 4 = stem + 3 block đầu. Luôn chừa ít
+  #     nhất MỘT block train được — đóng băng trọn trunk thì `n_block` (biến
+  #     duy nhất của sweep §3) không còn ảnh hưởng gì tới Phase 2. Ô n_block
+  #     nhỏ hơn tự bị cắt xuống, có cảnh báo trong log. 0 = tắt.
+  #   p2_freeze_sup_head: true   sup_head thành cái THƯỚC cố định. w_sup·Focal
+  #     vẫn chảy ngược qua Separation về trunk (giữ bản tóm tắt bám ngữ nghĩa
+  #     bệnh học), nhưng cái thước không tự nắn cho vừa số đo nữa.
+  #
+  # Cả hai chỉ có tác dụng ở Phase 2; Phase 1 luôn train trọn nhánh router.
+  p2_freeze_trunk: 4
+  p2_freeze_sup_head: true
+
   eval_every: 10
   eval_max_batches: 20
 

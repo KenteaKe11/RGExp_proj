@@ -226,6 +226,30 @@ decoder lẫn `lm_head` 262k chiều.
 `--phase 1` / `--phase 2` để chạy riêng một phase; mặc định chạy nối tiếp và
 checkpoint ghi rõ đang ở phase nào.
 
+**Phase 2 đóng băng một phần nhánh router.** Phase 1 đã train TRỌN nhánh router
+bằng `Focal` trên nhãn 14×4; vào Phase 2 loss đổi hẳn bản chất (`CE` trên
+token) và đủ mạnh để kéo cả trunk đi mất phần đã học. Hai khoá trong
+`configs/default.yaml`:
+
+| Khoá | Mặc định | Đóng băng cái gì |
+|---|---|---|
+| `run.p2_freeze_trunk` | `4` | `4` layer ĐẦU của trunk, đếm theo `[stem, blocks.0, blocks.1, …]` — tức `stem` + 3 block đầu |
+| `run.p2_freeze_sup_head` | `true` | `sup_head` |
+
+`sup_head` bị đóng băng vẫn nằm trong loss: `w_sup·Focal` tiếp tục chảy ngược
+qua `Separation` về trunk và giữ bản tóm tắt bám ngữ nghĩa bệnh học — chỉ là
+cái **thước** thì không được tự nắn cho vừa số đo nữa.
+
+Luôn còn ít nhất **một** block trunk train được: đóng băng trọn trunk thì
+`n_block` — biến duy nhất của sweep §3 — không còn ảnh hưởng gì tới Phase 2, và
+cả bảng so sánh mất nghĩa. Ô có `n_block` nhỏ hơn số xin sẽ bị cắt xuống, kèm
+cảnh báo trong log. Đặt `p2_freeze_trunk: 0` + `p2_freeze_sup_head: false` để
+quay lại hành vi cũ (train trọn nhánh router ở cả hai phase).
+
+Đổi hai khoá này giữa chừng làm `optimizer.pt` cũ không khớp danh sách param;
+resume vẫn chạy tiếp đúng con trỏ mẫu, chỉ reset moment AdamW và ghi một dòng
+cảnh báo.
+
 ### 1.8. Lịch LR: cosine warm restarts + cộng trung bình trọng số
 
 `src/optim.py`. Trong **mỗi** phase, LR bật lên đỉnh rồi cosine xuống đáy trong
