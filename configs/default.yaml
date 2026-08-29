@@ -173,8 +173,50 @@ run:
   lr: 1.0e-4                # expert QDoRA (nắn model đã pretrain)
   lr_router: 3.0e-4         # router (mạng train từ số 0 -> cần lớn hơn)
   weight_decay: 0.01
-  warmup_steps: 10
   max_grad_norm: 1.0
+
+  # ── Lịch LR: cosine warm restarts (SGDR) + cộng trung bình trọng số ──────
+  # MỌI mốc ở đây đếm bằng MẪU, không bằng step. Lý do: step = mẫu /
+  # (train_bs × grad_accum), mà batch mỗi máy một khác — cycle dài "100 step"
+  # thì máy A100 (8×8) và máy 4080 (1×32) restart ở hai chỗ khác nhau trong
+  # dữ liệu, và checkpoint bàn giao giữa hai máy sẽ có đường LR gãy khúc.
+  #
+  # Một cycle: LR bật lên đỉnh (lr_router / lr) rồi cosine xuống đáy trong
+  # đúng `cycle_samples` mẫu, rồi bật lại. Cuối mỗi cycle — lúc chạm đáy —
+  # trọng số được chụp và cộng trung bình đều (SWA).
+  #
+  # Chọn cycle_samples thế nào: đủ dài để LR đi trọn một vòng có ý nghĩa,
+  # đủ ngắn để một phase có ≥4-5 cycle (dưới 3 snapshot thì trung bình gần
+  # như vô tác dụng). Phase auto ≈ 75k mẫu -> 6400 cho ~12 cycle.
+  # Nên là bội của effective batch (32 hoặc 64) để biên cycle rơi đúng ranh
+  # giới step; lệch thì chỉ có cảnh báo, không chặn.
+  cycle_samples: 1600
+  # null = MỘT cycle duy nhất (thành cosine thường có warmup, không restart).
+  # Đây là cách tắt restart mà không phải nuôi nhánh code thứ hai.
+
+  warmup_samples: 320       # CHỈ cycle đầu — các restart sau bật thẳng lên đỉnh
+  warmup_steps: 10          # bản cũ, chỉ dùng khi warmup_samples = null
+  min_lr_ratio: 0.0         # đáy cosine = ratio × lr. 0 = chạm đáy hẳn (SGDR gốc)
+  cycle_lr_decay: 1.0       # đỉnh của cycle c = lr × decay^c. 1.0 = không giảm
+
+  # ── SWA: cộng trung bình trọng số các snapshot đáy ────────────────────────
+  # Trung bình ĐỀU (running mean, fp32, giữ trên CPU — một bản duy nhất, bộ
+  # nhớ không tăng theo số cycle). Không cần pass cập nhật BatchNorm như SWA
+  # kinh điển: model chỉ có LayerNorm/RMSNorm, không lớp nào giữ thống kê
+  # chạy theo batch.
+  #
+  # Mỗi phase có bộ trung bình RIÊNG và reset khi sang phase mới: Phase 1 chỉ
+  # train router với loss Focal, Phase 2 train cả expert với CE+sup+aux — hai
+  # quỹ đạo khác nhau, trộn trung bình là vô nghĩa.
+  #
+  # Hết phase, bản trung bình được đem đi val và so với bản cuối:
+  #   auto   -> val_loss thấp hơn thì thắng (mặc định — hỏi rồi mới lấy)
+  #   always -> luôn dùng bản trung bình, không hỏi
+  #   never  -> vẫn gom snapshot và ghi vào ckpt nhưng không bao giờ áp
+  swa: true
+  swa_use: always
+  # Dừng sớm GIỮA cycle thì snapshot cuối KHÔNG được chụp: lúc đó trọng số
+  # đang ở giữa dốc (LR cao), cho vào trung bình là kéo nó ra khỏi vùng đáy.
   # §1.7b — Total_Loss = 1·CE + 0.5·Focal + 0.07·Aux  (tỉ lệ CHỐT)
   w_sup: 0.5                # hệ số Focal (supervised) trong Phase 2
   w_aux: 0.07               # hệ số load-balancing (aux)
@@ -194,16 +236,35 @@ run:
   # tiếp (Phase 2 dừng sớm = sang thẳng infer).
   early_stop_patience: 3
   early_stop_min_delta: 0.0   # cải thiện phải > ngưỡng này mới tính
-  early_stop_phases: [2]      # [] = tắt | [2] = chỉ Phase 2 | [1, 2] = cả hai
+  early_stop_phases: []      # [] = tắt | [2] = chỉ Phase 2 | [1, 2] = cả hai
   # Giữ bản ckpt tại val TỐT NHẤT (chỉ trọng số, không optimizer, không push).
   # Dừng sớm mà không có bản này thì ckpt cuối là bản đã tệ đi 3 lần val.
   save_best: true
-  # Một checkpoint ≈ 256MB trọng số + ~512MB optimizer (AdamW giữ 2 moment cho
-  # ~64M param expert ở fp32). save_every nhỏ hơn 50 là ghi đĩa nhiều hơn train.
-  save_every: 10           # = eval_every -> mỗi lần val là một lần ckpt
+  # ── Checkpoint: đếm theo LẦN VAL, không theo step ────────────────────────
+  # 2 val = 1 ckpt. Một checkpoint ≈ 1.07GB trọng số + ~2.1GB optimizer (AdamW
+  # giữ 2 moment fp32 cho ~267M param trainable).
+  save_every_n_vals: 2
+  # Chỉ dùng khi hub_sync = false. Bật hub_sync thì MỌI lần save đều push, vì
+  # lúc đó Hub là bản gốc chung của các máy — push thưa = máy khác đọc bản cũ.
   push_every_n_saves: 2
-  # false = KHÔNG đẩy optimizer.pt lên Hub (vẫn giữ bản cục bộ để resume).
-  hub_include_optimizer: false
+
+  # ── Đồng bộ NHIỀU MÁY qua Hub ────────────────────────────────────────────
+  # true = trước mỗi lần val, đọc last/train_state.json trên Hub (vài KB) và
+  # so tiến độ (done, phase, samples — KHÔNG so step, vì step phụ thuộc batch
+  # của từng máy):
+  #   ta đi trước / bằng  -> được quyền ghi, ckpt push đè lên Hub
+  #   Hub đi trước ta     -> BỎ tiến độ cục bộ, tải ckpt Hub về, nạp rồi chạy
+  #                          tiếp từ đó (không hỏi, ngay lập tức)
+  # Một máy chạy một mình vẫn dùng được: nó luôn là bản mới nhất.
+  hub_sync: true
+  # true = đẩy CẢ optimizer.pt lên Hub (~2.1GB/lần). Tốn băng thông nhưng máy
+  # nhận bàn giao mới có moment AdamW để chạy tiếp; false thì mỗi lần đổi máy
+  # là momentum + LR reset về 0.
+  hub_include_optimizer: true
+  # true = đẩy cả swa.pt (bộ cộng dồn SWA, ~cỡ weights.pt) lên Hub. Bỏ nó lại
+  # thì máy nhận bàn giao giữa phase bắt đầu trung bình từ 0 và bản trung bình
+  # cuối cùng chỉ gom được vài cycle cuối.
+  hub_include_swa: true
   log_every_sec: 60.0
 
   # ── Infer ────────────────────────────────────────────────────────────────

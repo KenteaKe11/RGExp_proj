@@ -226,6 +226,76 @@ decoder lẫn `lm_head` 262k chiều.
 `--phase 1` / `--phase 2` để chạy riêng một phase; mặc định chạy nối tiếp và
 checkpoint ghi rõ đang ở phase nào.
 
+### 1.8. Lịch LR: cosine warm restarts + cộng trung bình trọng số
+
+`src/optim.py`. Trong **mỗi** phase, LR bật lên đỉnh rồi cosine xuống đáy trong
+đúng `run.cycle_samples` **mẫu**, rồi bật lại. Cuối mỗi cycle — lúc chạm đáy —
+trọng số được chụp lại và cộng trung bình **đều** (SWA).
+
+```
+lr
+ ▲   ╭─╮        ╭╮         ╭╮         ╭╮
+ │  ╱   ╲       │╲         │╲         │╲
+ │ ╱     ╲      │ ╲        │ ╲        │ ╲
+ │╱       ╲_    │  ╲_      │  ╲_      │  ╲_
+ └──────────────┴──────────┴──────────┴──────────▶ mẫu
+   warmup  cycle 0      cycle 1    cycle 2    cycle 3
+   (640)   ↑6400        ↑12800     ↑19200     ↑25600
+           snapshot     snapshot   snapshot   snapshot
+                        └──────── trung bình đều ────────┘
+```
+
+**Vì sao mọi mốc đếm bằng MẪU, không bằng step.** `step = mẫu / (train_bs ×
+grad_accum)`, mà batch mỗi máy một khác (§preset). Cycle dài "100 step" thì máy
+A100 (8×8 = 64 mẫu/step) và máy 4080 (1×32) restart ở **hai chỗ khác nhau trong
+dữ liệu**, và một checkpoint bàn giao giữa hai máy (§hub_sync) sẽ có đường LR
+gãy khúc. Dài "6400 mẫu" thì biên cycle nằm đúng một chỗ trên mọi máy. Đây là
+cùng một lý do với `progress_key` — xem `src/train.py`.
+
+Hệ quả: LR là **hàm thuần** của số mẫu đã đi qua, nên resume không cần lưu
+scheduler state và không cần tua `scheduler.step()` n lần — chỉ cần
+`set_samples(samples)`.
+
+**Vì sao trung bình chỉ lấy ở đáy.** Ở đáy LR, trọng số nằm yên trong một lòng
+chảo của hàm loss; mỗi lần restart nó bị đẩy sang lòng chảo khác. Trung bình
+của các điểm cùng nằm trong đáy cho một điểm ở vùng phẳng hơn — đó là toàn bộ ý
+của SWA. Trung bình các điểm **giữa** cycle (LR còn cao, trọng số đang bay giữa
+hai lòng chảo) thì vô nghĩa: điểm trung bình không nằm trong lòng chảo nào cả.
+Nên **dừng sớm giữa cycle thì KHÔNG chụp thêm snapshot** — bản trung bình giữ
+đúng những gì đã gom được ở các đáy trước đó.
+
+Không cần pass cập nhật BatchNorm như SWA kinh điển: model chỉ có
+LayerNorm/RMSNorm, không lớp nào giữ thống kê chạy theo batch.
+
+**Mỗi phase một bộ trung bình riêng**, reset khi sang phase mới: Phase 1 chỉ
+train router với `Focal`, Phase 2 train cả expert với `CE+sup+aux` — hai quỹ đạo
+khác nhau, trộn trung bình là vô nghĩa. Phase 1 cũng chỉ chụp router (expert
+không đổi trong phase đó, chép lại chỉ tốn ~1GB cho một phép gán y nguyên).
+
+**Hết phase, bản trung bình phải THẮNG mới được dùng** (`swa_use: auto`): nó
+được đem đi val và so `val_loss` với bản cuối. SWA gần như luôn tốt hơn khi lịch
+đủ dài, nhưng với phase ngắn (2-3 cycle) hoặc khi dừng sớm thì snapshot đầu tiên
+còn kém hẳn và kéo trung bình xuống — nên hỏi rồi mới lấy. `always` để không
+hỏi, `never` để vẫn gom vào ckpt nhưng không bao giờ áp.
+
+| Khoá | Mặc định | Ý nghĩa |
+|---|---|---|
+| `cycle_samples` | 6400 | độ dài một cycle, tính bằng mẫu. `null` = một cycle duy nhất (thành cosine thường, không restart) |
+| `warmup_samples` | 640 | **chỉ** cycle đầu; các restart sau bật thẳng lên đỉnh (SGDR gốc) |
+| `min_lr_ratio` | 0.0 | đáy cosine = ratio × lr |
+| `cycle_lr_decay` | 1.0 | đỉnh của cycle c = lr × decay^c. 1.0 = mọi cycle bật lại đúng LR gốc |
+| `swa` | true | bật/tắt việc gom trung bình |
+| `swa_use` | `auto` | `auto` \| `always` \| `never` — xem trên |
+| `hub_include_swa` | true | đẩy cả `swa.pt` lên Hub để máy nhận bàn giao không phải trung bình lại từ 0 |
+
+Chọn `cycle_samples`: đủ dài để LR đi trọn một vòng có ý nghĩa, đủ ngắn để một
+phase có ≥4-5 cycle (dưới 3 snapshot thì trung bình gần như vô tác dụng). Phase
+auto ≈ 75k mẫu → 6400 cho ~12 cycle. Nên là **bội của effective batch** (32 hoặc
+64) để biên cycle rơi đúng ranh giới step; lệch thì chỉ có cảnh báo, không chặn,
+và snapshot lệch tối đa một step.
+
+`python -m src.config` in ra số cycle của từng phase trước khi chạy thật.
+
 ---
 
 ## 2. Cấu hình chung cho Infer (7 checks)
@@ -587,6 +657,8 @@ mimic_cxr_vlm/
 │   ├── moe.py                # ★ trộn E expert QDoRA theo gate, cache dequantize,
 │   │                         #   đường tắt lúc infer, lưu/nạp expert
 │   ├── losses.py             # ★ α = 1/f^(1/8) + Focal loss §1.6
+│   ├── optim.py              # ★ lịch LR cosine warm restarts đếm bằng MẪU
+│   │                         #   + cộng trung bình trọng số (SWA) §1.8
 │   ├── config.py             # nạp YAML, dò GPU, giải quyết ô sweep, seq_len 2^k
 │   │                         #   + khối remote §9 (cache/outputs trên volume)
 │   ├── data.py               # tải HF Hub, split §1.1, rare-first, lát 2 phase
@@ -598,7 +670,8 @@ mimic_cxr_vlm/
 │   ├── logging_utils.py      # log text + events JSONL §6
 │   └── report.py             # gom các ô → metrics table + param curve §5
 └── scripts/
-    ├── selftest.py           # ★ kiểm router + công thức MoE, KHÔNG cần GPU
+    ├── selftest.py           # ★ kiểm router + công thức MoE + lịch LR + SWA,
+    │                         #   KHÔNG cần GPU
     ├── _env.sh               # chọn môi trường: venv cục bộ hay python container (§9)
     ├── setup.sh              # venv + torch theo CUDA + deps
     ├── run_local.sh          # chạy 1 ô sweep
@@ -655,8 +728,9 @@ src.report             gom mọi ô → metrics_table.md, param_curve.md, gen_te
 | File | Nội dung |
 |---|---|
 | `weights.pt` | `router.state_dict()` + state dict của **cả 4 expert** (`get_peft_model_state_dict` mỗi adapter, ~64M — **không** phải `model.state_dict()` 4.3B) |
-| `optimizer.pt` | optimizer + scheduler + RNG. **Không** đẩy lên Hub (`hub_include_optimizer: false`): AdamW giữ 2 moment fp32 cho 64M param → ~512MB mỗi lần save |
-| `train_state.json` | `phase`, `step`, `cursor`, `done`, `n_train`, `seed`, `variant`, `n_block`, `n_expert`, `top_k` |
+| `optimizer.pt` | optimizer + RNG. **Không** còn scheduler state: lịch LR là hàm thuần của số mẫu (§1.8), dựng lại từ `samples` là đủ và đúng trên mọi máy — bản cũ phải lưu rồi lại cố tình bỏ qua nó lúc resume vì nó đếm bằng step của máy đã ghi ckpt |
+| `swa.pt` | bộ cộng dồn SWA (§1.8): bản trung bình fp32 + số snapshot + mốc mẫu. Đi riêng vì nó là **trọng số**, không phải moment; máy nhận bàn giao giữa phase cần nó để không trung bình lại từ 0 (`hub_include_swa: true`) |
+| `train_state.json` | `phase`, `samples`, `epoch`, `step`, `done`, `n_train`, `seed`, `variant`, `n_block`, `n_expert`, `top_k`, `swa_n`, `swa_marks`, `cycle_samples` |
 
 Resume ưu tiên checkpoint cục bộ, sau đó kéo `last/` từ Hub. Ba assert chặn
 cứng: `n_train` và `seed` (thứ tự rare-first phụ thuộc cả hai, lệch thì `cursor`

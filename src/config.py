@@ -252,6 +252,13 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("early_stop_phases", [2])
     run.setdefault("save_best", False)
     run.setdefault("num_workers", 4)
+    # Ckpt đếm theo lần val (không theo step): bs đổi thì step đổi, lần val
+    # thì không. `save_every` cũ (đếm step) vẫn đọc được để config cũ chạy tiếp.
+    if "save_every_n_vals" not in run:
+        old_every = run.get("save_every")
+        run["save_every_n_vals"] = (max(round(old_every / max(run.get(
+            "eval_every", 1), 1)), 1) if old_every else 1)
+    run.setdefault("hub_sync", False)
     fixed.setdefault("require_bf16", True)
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
@@ -310,6 +317,50 @@ def load_config(path="configs/default.yaml", overrides=None):
         if run.get(key) is None:
             run[key] = preset[key]
 
+    # ── Lịch LR: cosine warm restarts + SWA (src/optim.py) ──────────────────
+    # Đặt SAU khối preset vì mọi kiểm tra ở đây đều so với effective batch, mà
+    # train_bs/grad_accum có thể còn là null cho tới dòng trên.
+    run.setdefault("cycle_samples", 6400)
+    run.setdefault("min_lr_ratio", 0.0)
+    run.setdefault("cycle_lr_decay", 1.0)
+    run.setdefault("swa", True)
+    run.setdefault("swa_use", "auto")
+    run.setdefault("hub_include_swa", True)
+    eff = run["train_bs"] * run["grad_accum"]
+    if run.get("warmup_samples") is None:
+        # Config cũ chỉ có warmup_steps. Quy ra mẫu để nó thôi phụ thuộc batch
+        # — nhưng quy bằng eff của CHÍNH MÁY NÀY, nên hai máy khác batch đọc
+        # cùng config cũ vẫn ra hai độ dài warmup khác nhau. Ghi thẳng
+        # warmup_samples trong config để hết chuyện đó.
+        run["warmup_samples"] = int(run.get("warmup_steps", 10)) * eff
+        print(f"⚠ run.warmup_samples chưa đặt — suy từ warmup_steps="
+              f"{run.get('warmup_steps', 10)} × {eff} mẫu/step = "
+              f"{run['warmup_samples']} mẫu (con số này PHỤ THUỘC batch của "
+              f"máy này; đặt run.warmup_samples để cố định)")
+    if run["swa_use"] not in ("auto", "always", "never"):
+        raise ValueError(f"run.swa_use lạ: {run['swa_use']!r} "
+                         f"(auto | always | never)")
+    cs = run["cycle_samples"]
+    if cs is not None and int(cs) > 0:
+        cs = int(cs)
+        if cs < eff:
+            raise ValueError(
+                f"cycle_samples={cs} nhỏ hơn effective batch {eff}: một cycle "
+                f"không đủ một optimizer step, LR sẽ nhảy cả chu kỳ trong một "
+                f"lần cập nhật và SWA không bắt được biên nào.")
+        if cs % eff:
+            print(f"⚠ cycle_samples={cs} không chia hết cho effective batch "
+                  f"{eff} — biên cycle rơi vào giữa một step, snapshot SWA "
+                  f"lệch tối đa {eff} mẫu. Dùng bội của {eff} (vd "
+                  f"{max(round(cs / eff), 1) * eff}) nếu muốn khớp chính xác.")
+        if run["warmup_samples"] >= cs:
+            raise ValueError(
+                f"warmup_samples={run['warmup_samples']} >= cycle_samples="
+                f"{cs}: cycle đầu không còn đoạn cosine nào.")
+        run["cycle_samples"] = cs
+    else:
+        run["cycle_samples"] = None    # một cycle duy nhất = cosine, không restart
+
     import torch
     dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32,
                  "float16": torch.float16}
@@ -363,6 +414,7 @@ def resolve_phase_samples(cfg, n_train, log=print):
                f"(bội của {eff}) = phase1 {r.phase1_samples} + phase2 "
                f"{r.phase2_samples} | {phase_steps(cfg, 1)} + "
                f"{phase_steps(cfg, 2)} step")
+    log("cfg", cycles_desc(cfg))
     _check_phases(cfg)
 
 
@@ -386,6 +438,36 @@ def _check_phases(cfg):
         raise ValueError(
             f"effective batch {eff} lớn hơn số mẫu của một phase "
             f"({r.phase1_samples}/{r.phase2_samples}) — không đủ một step.")
+
+
+def cycles_desc(cfg):
+    """Một dòng: mỗi phase được chia thành bao nhiêu cycle cosine restart.
+
+    Cycle đếm bằng MẪU nên số này giống hệt nhau trên mọi máy — đó là điểm của
+    việc không đếm bằng step (xem docstring src/optim.py).
+    """
+    r = cfg.run
+    cs = r.cycle_samples
+    if not r.swa and not cs:
+        return "lịch LR: một cycle cosine + warmup, SWA tắt"
+    parts = []
+    for ph in (1, 2):
+        n = r.phase1_samples if ph == 1 else r.phase2_samples
+        if n is None:
+            parts.append(f"P{ph} chờ số mẫu")
+            continue
+        if not cs:
+            parts.append(f"P{ph} 1 cycle")
+            continue
+        full, tail = divmod(n, cs)
+        parts.append(f"P{ph} {full + (1 if tail else 0)} cycle"
+                     + (f" (cycle cuối chỉ {tail} mẫu)" if tail else ""))
+    return ("lịch LR: cosine warm restarts, cycle = "
+            + (f"{cs} mẫu" if cs else "cả phase")
+            + f" | warmup {r.warmup_samples} mẫu (cycle đầu) | "
+            + " + ".join(parts)
+            + (f" | SWA: gom snapshot cuối mỗi cycle, chốt bằng val "
+               f"(swa_use={r.swa_use})" if r.swa else " | SWA TẮT"))
 
 
 def phase_steps(cfg, phase):
@@ -478,6 +560,11 @@ if __name__ == "__main__":
           f"| loss = Focal (α = 1/f^{c.run.focal_alpha_pow})")
     print(f"Phase 2 : {_sched(2)} "
           f"| loss = 1·CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
+    print(f"LR      : {cycles_desc(c)}")
+    print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
+          f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}×"
+          + (f" | đỉnh ×{c.run.cycle_lr_decay} mỗi cycle"
+             if c.run.cycle_lr_decay != 1.0 else ""))
     es = c.run.early_stop_patience
     print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
           f"batch) | ckpt mỗi {c.run.save_every} step | dừng sớm: "
