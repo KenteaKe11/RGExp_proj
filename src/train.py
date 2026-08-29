@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import shutil
 import sys
@@ -122,7 +123,8 @@ def main(argv=None):
               f"phase2 {r.phase2_samples} mẫu = {phase_steps(cfg, 2)} step")
     log("cfg", f"{_sched} | chạy phase: {only_phase or '1 rồi 2'}")
     log("cfg", f"loss phase 2 = 1·CE + {r.w_sup}·Focal + {r.w_aux}·Aux | "
-               f"val mỗi {r.eval_every} step | ckpt mỗi {r.save_every} step | "
+               f"val mỗi {r.eval_every} step | ckpt mỗi "
+               f"{r.save_every_n_vals} lần val | "
                + (f"dừng sớm sau {r.early_stop_patience} val không cải thiện "
                   f"(phase {r.early_stop_phases})"
                   if r.early_stop_patience else "dừng sớm: TẮT"))
@@ -323,6 +325,13 @@ def main(argv=None):
             g_router = sum(float(p.grad.abs().sum()) for p in router_params
                            if p.grad is not None)
             log("S0", f"   grad_norm={gn:.3f} | Σ|grad| router = {g_router:.3e}")
+            # Hai lỗi KHÁC HẲN nhau, phải báo khác nhau: `g_router > 0` là
+            # False cả khi g_router = nan, và thông điệp "không nhận gradient"
+            # sẽ đẩy người đọc đi soi wiring trong khi thủ phạm là tràn số.
+            assert math.isfinite(g_router), (
+                f"Σ|grad| router = {g_router} — TRÀN SỐ, không phải lỗi wiring. "
+                f"Trên GPU không có bf16 (sm<80), fp16 tràn ở activation của "
+                f"Gemma 3 quanh layer 5: đặt fixed.compute_dtype=float32.")
             assert g_router > 0, ("router không nhận gradient — kiểm "
                                   "RouterBridge và moe.CTX")
             opt.step()
@@ -742,6 +751,9 @@ def main(argv=None):
         es_best = state.get("es_best") if same else None
         es_bad = state.get("es_bad", 0) if same else 0
         es_on = bool(r.early_stop_patience) and phase in (r.early_stop_phases or [])
+        # `best_val` là val tốt nhất TỪNG THẤY, dùng cho save_best. Tách khỏi
+        # `es_best` vì từ đây hai thứ đó không còn là một (xem ngay dưới).
+        best_val = es_best
         params = router_params + (expert_params if phase == 2 else [])
         optimizer = make_optimizer(phase)
         # Dựng lịch TRƯỚC optimizer.load_state_dict(): nó chụp base_lrs từ
@@ -785,6 +797,25 @@ def main(argv=None):
                       f"{sched.cycle_index(samples)}/{sched.n_cycles - 1} "
                       f"tại lr ×{sched.multiplier(samples):.4f}")
 
+        # ── Dừng sớm phải đổi ĐƠN VỊ khi có warm restart ────────────────────
+        # Ngay sau mỗi restart, LR nhảy về đỉnh và val_loss LEO LÊN vài lần val
+        # liền. Đó là cơ chế của SGDR, không phải model xấu đi. Đếm patience
+        # theo từng lần val thì với eval_every=10 và cycle 200 step, ba lần val
+        # đầu sau restart đầu tiên đã đủ bắn nhầm — phase chết ngay khi lịch LR
+        # mới bắt đầu làm việc.
+        # Nên khi có >1 cycle: điểm của một cycle = val TỐT NHẤT trong cycle
+        # đó, và chỉ so ở biên cycle. patience đếm bằng CYCLE.
+        # Khi chỉ có 1 cycle (cycle_samples=null, không restart) thì val_loss
+        # đi xuống đều — giữ nguyên cách đếm theo từng lần val như cũ.
+        es_per_cycle = es_on and sched.n_cycles > 1
+        cyc_best = None                  # val tốt nhất trong cycle đang chạy
+        if es_on:
+            log("val", f"P{phase} dừng sớm: patience {r.early_stop_patience} "
+                       + (f"CYCLE (val tốt nhất mỗi cycle, so ở biên) — "
+                          f"{sched.n_cycles} cycle cả phase"
+                          if es_per_cycle else
+                          "lần val liên tiếp (không có restart)"))
+
         # idx = vị trí trong lát mẫu của phase; epoch = số vòng đã đi hết lát.
         idx = samples % len(order)
         loader = make_loader(df_train, collate, cfg, order=order[idx:])
@@ -805,6 +836,9 @@ def main(argv=None):
             # Mốc mẫu ở ĐẦU step: LR của một step là LR tại chỗ dữ liệu của
             # step đó bắt đầu (bản cũ: scheduler.step() sau optimizer.step()).
             step_start = samples
+            # Khởi tạo ở đây chứ không ngay trước khối val: khối biên cycle
+            # (chạy sớm hơn trong thân vòng) cũng có quyền bật cờ này.
+            stop_early = False
             running, agg = 0.0, {}
             for _ in range(r.grad_accum):
                 try:
@@ -841,13 +875,32 @@ def main(argv=None):
             # trên mọi cấu hình batch. Cycle CUỐI không vào đây (chỉ số bị
             # kẹp) — nó được chụp ở khối kết thúc phase bên dưới.
             cyc = sched.cycle_index(step_start)
-            if r.swa and sched.cycle_index(samples) > cyc:
+            crossed = sched.cycle_index(samples) > cyc
+            if r.swa and crossed:
                 swa.add(snapshot(), mark=samples)
                 log("swa", f"P{phase} hết cycle {cyc} @ mẫu {samples} "
                            f"(lr ×{sched.multiplier(step_start):.4f}) -> "
                            f"snapshot {swa.n}")
                 event("swa_snapshot", phase=phase, cycle=cyc, step=step,
                       samples=samples, n=swa.n)
+            # Chốt điểm của cycle vừa xong. cyc_best is None = cycle này chưa
+            # có lần val nào (cycle ngắn hơn eval_every) -> không tính, không
+            # phạt: một cycle không đo được thì không nói lên điều gì.
+            if es_per_cycle and crossed and cyc_best is not None:
+                if es_best is None or cyc_best < es_best - r.early_stop_min_delta:
+                    es_best, es_bad, mark = cyc_best, 0, "✓ tốt nhất"
+                else:
+                    es_bad += 1
+                    mark = (f"không cải thiện {es_bad}/"
+                            f"{r.early_stop_patience} cycle")
+                log("val", f"P{phase} chốt cycle {cyc} @ mẫu {samples}: val "
+                           f"tốt nhất trong cycle = {cyc_best:.4f} | {mark} "
+                           f"(tốt nhất từ trước {es_best:.4f})")
+                event("cycle_score", phase=phase, cycle=cyc, samples=samples,
+                      cycle_best=round(cyc_best, 5), es_best=round(es_best, 5),
+                      es_bad=es_bad)
+                stop_early = es_bad >= r.early_stop_patience
+                cyc_best = None
             state.update(phase=phase, samples=samples, epoch=epoch, step=step,
                          es_best=es_best, es_bad=es_bad)
 
@@ -883,7 +936,6 @@ def main(argv=None):
                     f"cyc={sched.cycle_index(step_start)}/{sched.n_cycles - 1} "
                     f"| {step_sec:.1f}s/step | ETA {eta:.2f}h "
                     f"| vram {torch.cuda.memory_allocated(0)/1024**3:.1f}GB")
-            stop_early = False
             if r.eval_every and step % r.eval_every == 0:
                 # Nhịp val vẫn đếm theo STEP, có chủ ý: một step là một lần
                 # cập nhật trọng số và tốn thời gian tương đương nhau trên mọi
@@ -896,28 +948,42 @@ def main(argv=None):
                       f"p{phase}/step": step, f"p{phase}/samples": samples})
                 # NaN không bao giờ nhỏ hơn best -> tính là KHÔNG cải thiện.
                 # Ba lần val ra NaN liên tiếp thì dừng là đúng: fp16 đã tràn.
-                better = es_best is None or vl < es_best - r.early_stop_min_delta
-                if es_on and better:
-                    es_best, es_bad = vl, 0
+                better = (best_val is None
+                          or vl < best_val - r.early_stop_min_delta)
+                if better:
+                    best_val = vl
+                if es_per_cycle:
+                    # Chỉ GOM, chưa phán xét: điểm được chốt ở biên cycle.
+                    cyc_best = vl if cyc_best is None else min(cyc_best, vl)
                 elif es_on:
-                    es_bad += 1
+                    if better:
+                        es_best, es_bad = vl, 0
+                    else:
+                        es_bad += 1
                 state.update(es_best=es_best, es_bad=es_bad)
                 log("val", f"P{phase} mẫu {samples} (step {step}) "
                            f"loss={vl:.4f} sup_acc_nb={vacc:.4f}"
+                           + (" | ✓ tốt nhất" if better else "")
                            + ("" if not es_on else
-                              (" | ✓ tốt nhất" if better else
-                               f" | không cải thiện {es_bad}/"
-                               f"{r.early_stop_patience} "
-                               f"(tốt nhất {es_best:.4f})")))
+                              (f" | cycle {sched.cycle_index(step_start)}: "
+                               f"đang giữ {cyc_best:.4f}" if es_per_cycle else
+                               ("" if better else
+                                f" | không cải thiện {es_bad}/"
+                                f"{r.early_stop_patience} "
+                                f"(tốt nhất {es_best:.4f})"))))
                 event("eval", phase=phase, step=step, samples=samples,
                       epoch=epoch, val_loss=round(vl, 5),
                       val_sup_acc_nonblank=round(vacc, 5),
+                      cycle=sched.cycle_index(step_start),
+                      cycle_best=(None if cyc_best is None
+                                  else round(cyc_best, 5)),
                       es_best=(None if es_best is None else round(es_best, 5)),
                       es_bad=es_bad)
                 if es_on and better and r.save_best:
                     save_checkpoint(state, optimizer, swa, "best",
                                     push=False, with_optimizer=False)
-                stop_early = es_on and es_bad >= r.early_stop_patience
+                if es_on and not es_per_cycle:
+                    stop_early = es_bad >= r.early_stop_patience
 
                 # ── Ai được quyền ghi? Hỏi Hub TRƯỚC khi save ───────────────
                 # Đi sau -> nhả quyền ghi ngay lập tức, thoát ra ngoài để nạp
@@ -933,14 +999,16 @@ def main(argv=None):
                               n_saves % r.push_every_n_saves == 0))
             if stop_early:
                 log("train", f"DỪNG SỚM phase {phase} @ mẫu {samples}/"
-                             f"{total_samples}: {r.early_stop_patience} lần val "
-                             f"liên tiếp không cải thiện (val_loss tốt nhất "
-                             f"{es_best:.4f})"
+                             f"{total_samples}: {r.early_stop_patience} "
+                             + ("cycle" if es_per_cycle else "lần val")
+                             + f" liên tiếp không cải thiện (val_loss tốt nhất "
+                               f"{es_best:.4f})"
                              + (f" — trọng số tốt nhất ở {r.ckpt_dir}/best/"
                                 if r.save_best else ""))
                 event("early_stop", phase=phase, step=step, samples=samples,
                       total_samples=total_samples,
                       best_val_loss=round(es_best, 5),
+                      unit=("cycle" if es_per_cycle else "val"),
                       patience=r.early_stop_patience)
                 break
             if step % 50 == 0:

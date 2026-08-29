@@ -232,8 +232,15 @@ run:
   eval_max_batches: 20
 
   # ── Dừng sớm ─────────────────────────────────────────────────────────────
-  # 3 lần val LIÊN TIẾP không cải thiện val_loss -> dừng phase, lưu ckpt, đi
-  # tiếp (Phase 2 dừng sớm = sang thẳng infer).
+  # ĐƠN VỊ của patience phụ thuộc lịch LR (§1.8):
+  #   nhiều cycle (cycle_samples đặt) -> patience đếm bằng CYCLE. Điểm của một
+  #     cycle = val TỐT NHẤT trong cycle đó, chỉ so ở biên cycle.
+  #   một cycle (cycle_samples: null) -> patience đếm bằng LẦN VAL, như cũ.
+  # Vì sao phải đổi: ngay sau mỗi restart, LR nhảy về đỉnh và val_loss leo lên
+  # suốt phần lớn cycle — đó là cơ chế của SGDR, không phải model xấu đi. Đếm
+  # theo từng lần val thì với eval_every=10 và cycle 200 step, phase chết ngay
+  # sau restart ĐẦU TIÊN, đúng lúc lịch LR mới bắt đầu làm việc.
+  # 3 = dừng sau 3 cycle liên tiếp không có cycle nào tốt hơn.
   early_stop_patience: 3
   early_stop_min_delta: 0.0   # cải thiện phải > ngưỡng này mới tính
   early_stop_phases: []      # [] = tắt | [2] = chỉ Phase 2 | [1, 2] = cả hai

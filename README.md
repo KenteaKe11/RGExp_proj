@@ -267,6 +267,16 @@ Nên **dừng sớm giữa cycle thì KHÔNG chụp thêm snapshot** — bản t
 Không cần pass cập nhật BatchNorm như SWA kinh điển: model chỉ có
 LayerNorm/RMSNorm, không lớp nào giữ thống kê chạy theo batch.
 
+**Dừng sớm phải đổi đơn vị.** Ngay sau mỗi restart, LR về đỉnh và `val_loss`
+leo lên suốt phần lớn cycle. Đếm patience theo từng lần val thì phase chết ngay
+sau restart đầu tiên — đúng lúc lịch LR mới bắt đầu làm việc. Nên khi có >1
+cycle, **patience đếm bằng cycle**: điểm của một cycle là `val_loss` tốt nhất
+trong cycle đó, và chỉ so ở biên cycle. Cycle không có lần val nào (ngắn hơn
+`eval_every`) thì không được chấm và cũng không bị phạt. Khi `cycle_samples:
+null` (một cycle, không restart) thì giữ nguyên cách đếm theo lần val như cũ.
+`save_best` vẫn chấm theo TỪNG lần val — nó là chuyện khác, không liên quan
+dừng sớm.
+
 **Mỗi phase một bộ trung bình riêng**, reset khi sang phase mới: Phase 1 chỉ
 train router với `Focal`, Phase 2 train cả expert với `CE+sup+aux` — hai quỹ đạo
 khác nhau, trộn trung bình là vô nghĩa. Phase 1 cũng chỉ chụp router (expert

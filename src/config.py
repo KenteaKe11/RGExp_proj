@@ -567,7 +567,7 @@ if __name__ == "__main__":
              if c.run.cycle_lr_decay != 1.0 else ""))
     es = c.run.early_stop_patience
     print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
-          f"batch) | ckpt mỗi {c.run.save_every} step | dừng sớm: "
+          f"batch) | ckpt mỗi {c.run.save_every_n_vals} lần val | dừng sớm: "
           + (f"{es} val liên tiếp không cải thiện, phase "
              f"{c.run.early_stop_phases}" if es else "tắt"))
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
