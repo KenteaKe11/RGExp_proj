@@ -325,14 +325,19 @@ def build_model(cfg, hf_token, log):
     if d_enc != f.d_enc:
         log("router", f"hidden_size thật = {d_enc} (config ghi {f.d_enc}) "
                       f"— dùng giá trị thật")
+    route_noise = float(getattr(f, "route_noise", 0.0) or 0.0)
     router = RouterNet(cfg.sweep.variant, cfg.sweep.n_block, f.n_expert,
-                       f.top_k, d_enc=d_enc).to("cuda", f.trainable_dtype)
+                       f.top_k, d_enc=d_enc,
+                       route_noise=route_noise).to("cuda", f.trainable_dtype)
     bridge = RouterBridge(router, log)
     bridge.attach(find_text_decoder(model, log))
 
     n_router = sum(p.numel() for p in router.parameters())
     n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log("router", variant_desc(cfg))
+    log("router", f"    route_noise σ={route_noise:g} "
+                  + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
+                     else "— TẮT, top-k tất định"))
     for k, v in router.param_table().items():
         if not k.startswith("_"):
             log("router", f"    {k:<28} {v:>12,}")

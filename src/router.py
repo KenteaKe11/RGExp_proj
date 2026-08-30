@@ -228,21 +228,44 @@ class RouterNet(nn.Module):
     Nhân trực tiếp vào delta của từng expert trong decoder (xem src/moe.py),
     nên gradient của CE chảy ngược về đây — router học từ chất lượng text sinh
     ra, không chỉ từ nhãn supervised.
+
+    `route_noise` > 0 bật nhiễu Gumbel trên route logit khi TRAINING (xem
+    `gumbel_like`): top-k trở thành lấy mẫu k expert không lặp từ phân phối
+    của router thay vì lấy k đứa điểm cao nhất. Đây là regularizer riêng cho
+    tuyến đường — nó chống đúng cái kiểu overfit mà w_aux không chạm tới:
+    aux chỉ ép TỔNG tải chia đều giữa các expert, nó hoàn toàn hài lòng khi
+    router học thuộc "mẫu này luôn đi expert 3" miễn là các expert đều bận.
+    Nhiễu thì đánh vào từng mẫu: một mẫu ở gần biên quyết định sẽ đi các
+    tuyến khác nhau qua từng epoch, nên expert không kịp học thuộc mẫu và
+    gate không kịp bão hoà về one-hot. eval/infer TẮT hẳn (self.training),
+    nên số đo và text sinh ra vẫn tất định.
     """
 
     def __init__(self, variant, n_block, n_expert, top_k, dim=D_MODEL,
-                 d_enc=D_ENC):
+                 d_enc=D_ENC, route_noise=0.0):
         super().__init__()
         assert variant in VARIANTS, f"variant lạ: {variant} (có: {list(VARIANTS)})"
         assert 1 <= top_k <= n_expert
+        assert route_noise >= 0, f"route_noise phải >= 0, nhận {route_noise}"
         self.variant, self.n_block = variant, n_block
         self.n_expert, self.top_k = n_expert, top_k
+        self.route_noise = float(route_noise)
         self.stem = Stem(d_enc, dim)
         self.blocks = nn.ModuleList(
             [VARIANTS[variant](dim) for _ in range(n_block)])
         self.separation = SeparationProjector(dim)
         self.sup_head = SupervisedHead(dim)
         self.route_head = RouteHead(n_expert, dim)
+
+    # ── nhiễu Gumbel trên route logit ───────────────────────────────────────
+    def set_route_noise(self, scale):
+        """Đổi cường độ nhiễu giữa chừng (anneal). Trả về giá trị cũ.
+
+        Tách ra thành hàm để lịch giảm nhiễu — nếu sau này muốn — nằm ở
+        train.py chứ không phải nhét thêm một biến `step` vào forward.
+        """
+        old, self.route_noise = self.route_noise, max(float(scale), 0.0)
+        return old
 
     # ── freeze cho Phase 2 / "Phase Router" ─────────────────────────────────
     def trunk_layers(self):
@@ -325,7 +348,15 @@ class RouterNet(nn.Module):
         sup_logits = self.sup_head(pooled[:, 0])        # [B, 14, 4]
         route_logits = self.route_head(pooled[:, 1]).float()   # [B, E]
 
-        prob = F.softmax(route_logits, dim=-1)
+        # Nhiễu Gumbel — CHỈ khi training (xem gumbel_like). Cộng vào logit
+        # TRƯỚC softmax, nên nó chi phối cả ba thứ dưới đây: expert nào được
+        # chọn, trọng số gate của chúng, và aux load-balance. Cố ý: phạt đúng
+        # cái phân phối mà router thật sự dùng để định tuyến.
+        noisy = route_logits
+        if self.training and self.route_noise > 0:
+            noisy = route_logits + self.route_noise * gumbel_like(route_logits)
+
+        prob = F.softmax(noisy, dim=-1)
         topv, topi = torch.topk(prob, self.top_k, dim=-1)
         # Chuẩn hoá lại trong top-k: tổng trọng số = 1 để độ lớn delta không
         # phụ thuộc router "tự tin" hay không. k = E thì trùng softmax đầy đủ.
@@ -338,11 +369,42 @@ class RouterNet(nn.Module):
             counts.scatter_add_(0, topi.reshape(-1),
                                 torch.ones_like(topi.reshape(-1),
                                                 dtype=counts.dtype))
+            # route_entropy đo trên logit SẠCH, không phải logit đã nhiễu:
+            # nó là thước "router có đang sụp về một expert không", và thước
+            # đó phải so được giữa các ô có route_noise khác nhau (kể cả = 0)
+            # và giữa train với eval. expert_share / gate_max thì ngược lại —
+            # chúng ghi lại cái ĐÃ XẢY RA, nên tính từ phân phối có nhiễu.
+            clean = (prob if noisy is route_logits
+                     else F.softmax(route_logits, dim=-1))
             stats = {"expert_share": (counts / counts.sum()).tolist(),
                      "gate_max": float(topv[:, 0].mean()),
                      "route_entropy": float(
-                         -(prob * prob.clamp_min(1e-9).log()).sum(-1).mean())}
+                         -(clean * clean.clamp_min(1e-9).log()).sum(-1).mean())}
         return sup_logits, gate, aux, stats
+
+
+def gumbel_like(x, eps=1e-9):
+    """Gumbel(0,1) i.i.d. cùng shape/dtype/device với x.
+
+    G = -log(-log(U)), U ~ Uniform(0,1). Dùng `clamp_min` hai lần vì U = 0
+    hoặc U = 1 (rand trả về [0,1)) đều cho ±inf, và một cái inf trong logit
+    là top-k khoá cứng vào một expert cho tới hết batch.
+
+    Vì sao Gumbel chứ không phải Gauss: top-k của (logit + Gumbel) đúng bằng
+    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Nghĩa
+    là router không chọn "k đứa điểm cao nhất" mà bốc theo đúng phân phối nó
+    tin, nên expert xếp thứ 7 vẫn thỉnh thoảng được chạy và được nhận
+    gradient, thay vì chết vĩnh viễn vì thua 0.01 logit ở step đầu. Đó chính
+    là chỗ chống overfit: router không kịp khoá cứng một tuyến đường.
+
+    Lưu ý về cường độ: hệ số nhân σ trước G tương đương chia logit cho σ, tức
+    NGHỊCH với nhiệt độ. σ = 1.0 là lấy mẫu đúng chuẩn; σ nhỏ → gần top-k
+    xác định; σ lớn → gần như chọn ngẫu nhiên đều.
+    """
+    u = torch.rand_like(x).clamp_min(eps)
+    # Ngoặc ở đây KHÔNG thừa: `-torch.log(u).clamp_min(eps)` sẽ clamp trước
+    # rồi mới đổi dấu, ra một số ÂM và log của nó là NaN.
+    return -torch.log((-torch.log(u)).clamp_min(eps))
 
 
 def load_balance_loss(prob, topi, n_expert):

@@ -264,6 +264,17 @@ def load_config(path="configs/default.yaml", overrides=None):
             "eval_every", 1), 1)), 1) if old_every else 1)
     run.setdefault("hub_sync", False)
     fixed.setdefault("require_bf16", True)
+    # Nhiễu Gumbel trên route logit (chống overfit tuyến đường). Default 0.0
+    # để config cũ giữ nguyên hành vi cũ — bật bằng fixed.route_noise.
+    fixed.setdefault("route_noise", 0.0)
+    fixed["route_noise"] = float(fixed["route_noise"])
+    if fixed["route_noise"] < 0:
+        raise ValueError(f"fixed.route_noise phải >= 0, nhận "
+                         f"{fixed['route_noise']}")
+    if fixed["route_noise"] > 2.0:
+        print(f"⚠ route_noise={fixed['route_noise']:g} rất lớn — σ ≳ 2 thì "
+              f"top-k gần như bốc ngẫu nhiên đều, gate hết mang thông tin. "
+              f"Dải hợp lý: 0.3–1.0 (1.0 = lấy mẫu đúng chuẩn Gumbel-top-k).")
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.

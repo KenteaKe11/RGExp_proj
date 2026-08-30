@@ -39,6 +39,15 @@ fixed:
   n_expert: 16
   top_k: 6
 
+  # Nhiễu Gumbel cộng vào route logit khi TRAINING (src/router.py::gumbel_like).
+  # top-k(logit + σ·Gumbel) = lấy mẫu 6 expert KHÔNG LẶP từ softmax(logit),
+  # nên expert xếp thứ 7 vẫn thỉnh thoảng được chạy thay vì chết vĩnh viễn vì
+  # thua 0.01 logit ở step đầu. Chống đúng cái w_aux không chạm tới: aux chỉ
+  # ép tổng tải chia đều, nó vẫn hài lòng khi router học thuộc "mẫu này luôn
+  # đi expert 3". eval/infer TẮT hẳn -> số đo và text sinh ra vẫn tất định.
+  # 0.0 = tắt. Dải hợp lý 0.3–1.0; 1.0 là lấy mẫu đúng chuẩn.
+  route_noise: 0.5
+
   # ── Adapter (đã chốt: QDoRA r8) ──────────────────────────────────────────
   lora_r: 8
   alpha_ratio: 2            # alpha = 2r = 16

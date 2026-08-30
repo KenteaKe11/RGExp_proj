@@ -70,6 +70,80 @@ def test_router():
           f"lệch tối đa {float((sup-sup2).abs().max()):.2e}")
 
 
+def test_route_noise():
+    """[9] nhiễu Gumbel: chỉ khi training, không phá bất biến của gate."""
+    print("\n[9] nhiễu Gumbel trên route logit")
+    torch.manual_seed(0)
+    B, N, E, K = 64, 24, 8, 3
+    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+
+    off = RouterNet(VARIANT, 2, E, K, d_enc=2560)
+    check("mặc định route_noise = 0 (config cũ không đổi hành vi)",
+          off.route_noise == 0.0)
+    off.train()
+    with torch.no_grad():
+        g1, g2 = off(x, mask)[1], off(x, mask)[1]
+    check("noise=0 + train mode -> vẫn tất định",
+          torch.equal(g1, g2))
+
+    on = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=1.0)
+    on.load_state_dict(off.state_dict())        # cùng trọng số để so được
+
+    on.eval()
+    with torch.no_grad():
+        ge1 = on(x, mask)[1]
+        ge2, st_e = on(x, mask)[1], on(x, mask)[3]
+    check("eval mode -> nhiễu TẮT, gate tất định", torch.equal(ge1, ge2))
+    check("eval mode -> khớp đúng router không nhiễu",
+          torch.equal(ge1, g1))
+
+    on.train()
+    with torch.no_grad():
+        _, gt1, _, st_t = on(x, mask)
+        gt2 = on(x, mask)[1]
+    check("train mode -> hai lần chạy cho gate KHÁC nhau",
+          not torch.equal(gt1, gt2))
+    check("có nhiễu: vẫn đúng top-k phần tử khác 0",
+          int((gt1 > 0).sum(dim=-1).max()) == K
+          and int((gt1 > 0).sum(dim=-1).min()) == K)
+    check("có nhiễu: Σ gate vẫn = 1",
+          torch.allclose(gt1.sum(-1), torch.ones(B), atol=1e-5))
+    check("route_entropy đo trên logit SẠCH -> train == eval",
+          abs(st_t["route_entropy"] - st_e["route_entropy"]) < 1e-5,
+          f"train={st_t['route_entropy']:.5f} eval={st_e['route_entropy']:.5f}")
+
+    # Điểm chính: nhiễu phải ĐỔI ĐƯỢC tuyến đường, không chỉ đổi trọng số.
+    sel_clean = set(map(tuple, (g1 > 0).nonzero().tolist()))
+    sel_noisy = set(map(tuple, (gt1 > 0).nonzero().tolist()))
+    check("σ=1.0 đổi được expert được chọn (không chỉ trọng số)",
+          sel_clean != sel_noisy,
+          f"{len(sel_clean - sel_noisy)}/{len(sel_clean)} lựa chọn đổi")
+
+    # Không có expert nào chết: với σ=1.0, gộp nhiều batch thì mọi expert
+    # phải được sờ tới ít nhất một lần — đó là cả lý do bật nhiễu.
+    seen = torch.zeros(E, dtype=torch.bool)
+    with torch.no_grad():
+        for _ in range(5):
+            seen |= (on(x, mask)[1] > 0).any(dim=0)
+    check("σ=1.0: mọi expert đều có lúc được chọn",
+          bool(seen.all()), f"{int(seen.sum())}/{E}")
+
+    # Gradient vẫn nối về route_head qua nhánh có nhiễu (nhiễu là hằng số
+    # cộng vào, không cắt đồ thị).
+    on.zero_grad()
+    sup, gate, aux, _ = on(x[:4], mask[:4])
+    (gate.sum() + aux).backward()
+    check("có nhiễu: route_head vẫn nhận gradient",
+          all(p.grad is not None and float(p.grad.abs().sum()) > 0
+              for p in on.route_head.parameters()))
+
+    on.set_route_noise(0.0)
+    on.train()
+    with torch.no_grad():
+        check("set_route_noise(0) tắt được nhiễu giữa chừng",
+              torch.equal(on(x, mask)[1], g1))
+
+
 def test_moe_math():
     """Mô phỏng đúng phép trộn của src/moe.py bằng lớp DoRA giả.
 
@@ -337,5 +411,6 @@ if __name__ == "__main__":
     test_schedule()
     test_swa()
     test_freeze()
+    test_route_noise()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

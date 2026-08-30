@@ -119,6 +119,7 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         "n_block": cfg.sweep.n_block,
         "n_expert": cfg.fixed.n_expert,
         "top_k": cfg.fixed.top_k,
+        "route_noise": float(getattr(cfg.fixed, "route_noise", 0.0) or 0.0),
         "architecture": variant_desc(cfg),
         "adapter": adapter_desc(cfg.fixed),
         "max_seq_len": cfg.run.max_seq_len,

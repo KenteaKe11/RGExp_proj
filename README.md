@@ -188,6 +188,9 @@ Tất cả là metric **tổng thể trên corpus** — không sinh cột metric
 | `Focal` | Phase 1 + 2 | `−α_{i,y}·(1−p)^2·log p` trên 14 bệnh × 4 aspect, `α_{ij} = 1/(f_ij+ε)^(1/8)` lấy từ tần suất TRAIN |
 | `Aux` | Phase 2 | load-balancing kiểu Switch: `E·Σ_e f_e·P_e`, tối thiểu = 1.0 khi mọi expert nhận đều tải |
 
+Aux quản tải ở mức *quần thể*; chuyện router học thuộc tuyến đường của
+*từng mẫu* thì nhiễu Gumbel trên route logit mới chạm tới — xem §3.5.
+
 **Vì sao căn bậc 8 chứ không phải `1/f` hay `1/√f`.** Ô hiếm nhất cỡ `1e-6`:
 `1/f` cho nó trọng số gấp cả triệu lần ô phổ biến, `1/√f` vẫn còn **~1000 lần**
 — một nhúm mẫu hiếm nuốt trọn gradient của cả batch và loss nhảy loạn theo việc
@@ -541,6 +544,79 @@ không truyền vào như tham số của khối được checkpoint.
 
 STAGE 0 in VRAM đỉnh; dưới 60% thì nó gợi ý lệnh tăng batch, OOM thì gợi ý
 lệnh hạ.
+
+### 3.5. Nhiễu Gumbel trên route logit
+
+Route head rất dễ **tự tin sớm**. Nó chỉ có 131k tham số, nhìn một vector 512
+chiều, và tín hiệu duy nhất dạy nó là CE của Phase 2 — mà CE thì luôn thưởng
+cho tuyến đường *đang* tốt. Sau vài trăm step, một expert thắng 0.01 logit ở
+step đầu đã ăn hết gradient của cả nhóm mẫu đó, các expert còn lại không bao
+giờ được chạy trên nhóm ấy nữa nên không bao giờ khá lên. Router khoá cứng
+`mẫu → expert`, và cái nó khoá là *mẫu train cụ thể*, không phải đặc trưng bệnh
+học — đúng định nghĩa overfit, chỉ là overfit ở tầng định tuyến.
+
+**`w_aux` không chạm tới chuyện này.** Load-balancing chỉ ép TỔNG tải chia đều
+giữa 16 expert. Nó hoàn toàn hài lòng với một router đã học thuộc "mẫu #4127
+luôn đi expert 3" — miễn là gộp cả batch thì expert nào cũng bận. Aux quản mức
+*quần thể*, chỗ hỏng nằm ở mức *từng mẫu*.
+
+Nên trong lúc training, cộng nhiễu Gumbel vào route logit trước softmax:
+
+```
+noisy = route_logits + σ · G,      G = −log(−log U),  U ~ Uniform(0,1)
+prob  = softmax(noisy)  →  top-k  →  gate  →  aux
+```
+
+**Vì sao Gumbel chứ không phải Gauss.** Đây không phải "làm nhoè cho chắc":
+`top-k(logit + G)` đúng bằng **lấy mẫu k expert không lặp từ `softmax(logit)`**
+— trick Gumbel-top-k, một đẳng thức chứ không phải xấp xỉ. Nghĩa là router
+không còn chọn "6 đứa điểm cao nhất" mà **bốc theo đúng phân phối nó tin**.
+Expert xếp thứ 7 với xác suất 4% thì được chạy đúng 4% số mẫu — đủ để nhận
+gradient và sống, không đủ để phá tuyến đường chính. Nhiễu Gauss cũng làm nhoè
+được, nhưng cường độ của nó không có nghĩa gì cụ thể; σ của Gumbel thì đọc
+được thẳng ra hành vi.
+
+| σ | Router làm gì |
+|---|---|
+| `0.0` | top-k tất định — hành vi cũ, tắt hẳn |
+| `0.3` | gần tất định, chỉ đảo tuyến ở các mẫu sát biên quyết định |
+| **`0.5`** | **mặc định** — biên mềm, thứ hạng đầu bảng vẫn giữ |
+| `1.0` | lấy mẫu đúng chuẩn Gumbel-top-k |
+| `> 2` | gần như bốc ngẫu nhiên đều, gate hết mang thông tin (config sẽ cảnh báo) |
+
+**Không đưa vào sweep.** σ không phải câu hỏi nghiên cứu ở đây, nó là một
+regularizer có sẵn dải hợp lý. Mặc định `0.5` đủ để kéo route ra khỏi trạng
+thái tự tin sớm; thêm một trục sweep chỉ làm bảng so sánh nở gấp đôi để trả
+lời một câu không ai hỏi. Muốn tắt cho một ô thì `--set fixed.route_noise=0`.
+
+**Cái gì vẫn tất định.** Nhiễu gác sau `self.training`, mà `src/train.py` gọi
+`router.eval()` ở cả val lẫn infer — nên **mọi số đo và mọi câu text sinh ra
+đều không có nhiễu**. Chạy lại một checkpoint hai lần cho ra đúng một kết quả.
+Nhiễu chỉ tồn tại trong forward của bước train.
+
+Ba chi tiết đủ để gây nhầm nếu sửa tiếp:
+
+1. **Nhiễu chi phối cả ba thứ**: expert nào được chọn, trọng số gate của
+   chúng, và `aux`. Cố ý — thứ bị phạt phải đúng là phân phối router thật sự
+   dùng để định tuyến. Cho top-k ăn logit nhiễu còn gate ăn logit sạch thì
+   lựa chọn và trọng số nói hai chuyện khác nhau.
+2. **`route_entropy` trong log đo trên logit SẠCH.** Nó là thước "router có
+   đang sập về một expert không", và thước đó phải so được giữa các ô có σ
+   khác nhau, cũng như giữa train và eval. Ngược lại `expert_share` và
+   `gate_max` ghi lại cái ĐÃ XẢY RA nên tính từ phân phối có nhiễu.
+3. **Chỉ Phase 2 chịu ảnh hưởng thật.** Phase 1 không dùng `gate` và không
+   đưa `aux` vào loss, nên route head chưa có gradient nào — nhiễu chạy ở đó
+   nhưng vô hại.
+
+Một cái bẫy đã dính một lần, ghi lại để khỏi dính lại: trong `gumbel_like`,
+`-torch.log(-torch.log(u).clamp_min(eps))` **parse thành clamp trước rồi mới
+đổi dấu** → `log` của một số âm → NaN toàn bộ gate. Phải là
+`-torch.log((-torch.log(u)).clamp_min(eps))`. Check `[9]` của
+`scripts/selftest.py` bắt đúng chỗ này.
+
+Khoá config `fixed.route_noise` — `src/router.py::gumbel_like`,
+`RouterNet.forward`, `RouterNet.set_route_noise` (đổi σ giữa chừng nếu
+sau này muốn anneal)
 
 ---
 
