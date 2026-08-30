@@ -218,8 +218,8 @@ run:
   # Dừng sớm GIỮA cycle thì snapshot cuối KHÔNG được chụp: lúc đó trọng số
   # đang ở giữa dốc (LR cao), cho vào trung bình là kéo nó ra khỏi vùng đáy.
   # §1.7b — Total_Loss = 1·CE + 0.5·Focal + 0.07·Aux  (tỉ lệ CHỐT)
-  w_sup: 0.5                # hệ số Focal (supervised) trong Phase 2
-  w_aux: 0.07               # hệ số load-balancing (aux)
+  w_sup: 0.4                # hệ số Focal (supervised) trong Phase 2
+  w_aux: 0.08               # hệ số load-balancing (aux)
   focal_gamma: 2.0          # "lực phạt mũ 2"
   # §1.6 — α_ij = 1/(f_ij + ε)^p. p = 0.125 (nghịch đảo căn bậc 8) kéo dải α
   # từ ~1000× (p = 0.5, bản cũ) xuống ~5×: ô hiếm vẫn nặng hơn ô phổ biến
@@ -243,7 +243,7 @@ run:
   #     bệnh học), nhưng cái thước không tự nắn cho vừa số đo nữa.
   #
   # Cả hai chỉ có tác dụng ở Phase 2; Phase 1 luôn train trọn nhánh router.
-  p2_freeze_trunk: 4
+  p2_freeze_trunk: 3
   p2_freeze_sup_head: true
 
   eval_every: 10
