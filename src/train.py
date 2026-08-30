@@ -144,6 +144,9 @@ def main(argv=None):
                f"{f.route_noise:g}")
     log("cfg", f"val mỗi {r.eval_every} step ({r.eval_max_batches} batch) | "
                f"ckpt mỗi {r.save_every_n_vals} lần val | dừng sớm: KHÔNG")
+    log("cfg", f"cắt gradient: chuẩn TOÀN CỤC (router + expert chung một "
+               f"vector) ở {r.max_grad_norm:g} — giữ nguyên hướng, chỉ chặn "
+               f"độ dài")
     log("cfg", f"kiến trúc: {variant_desc(cfg)}")
     log("cfg", cycles_desc(cfg))
     log("cfg", f"ảnh {image_desc(f)}")
@@ -841,6 +844,26 @@ def main(argv=None):
                     if isinstance(v, float):
                         agg[k] = agg.get(k, 0.0) + v / r.grad_accum
                 del batch, loss
+            # ── Cắt gradient theo CHUẨN TOÀN CỤC, giữ nguyên HƯỚNG ─────
+            # `all_params` là MỘT danh sách gộp router + expert, nên
+            # clip_grad_norm_ tính một chuẩn L2 duy nhất trên toàn bộ vector
+            # gradient và nhân TẤT CẢ với cùng một hệ số. Đó là điểm chính:
+            # hướng của bước đi không đổi, chỉ độ dài bị chặn ở 1.0.
+            #
+            # Cắt RIÊNG từng nhóm (hoặc từng tensor) thì mỗi nhóm bị co một
+            # hệ số khác nhau — vector tổng quay sang một hướng KHÁC hướng
+            # gradient thật, và tỉ lệ đóng góp giữa router với expert bị đổi
+            # âm thầm theo từng step. Ở đây điều đó đặc biệt tệ: hai nhóm đã
+            # có hai lr khác nhau (3e-4 và 1e-4), thêm một hệ số co riêng nữa
+            # là không còn biết mình đang tối ưu cái gì.
+            #
+            # Vì sao cần chặn: router train TỪ SỐ 0 nên vài trăm step đầu
+            # gradient của nó lớn hơn hẳn expert; cộng thêm ASL với γ⁻=4 có
+            # thể cho gradient nhọn ở những ô dương bị đoán sai. Một bước dài
+            # bất thường ở giai đoạn đó đủ để đẩy trọng số ra vùng NaN và cả
+            # phiên train coi như bỏ. `gnorm` được ghi vào log MỖI step —
+            # nó thường xuyên đụng trần 1.0 ở đầu train là bình thường; nó
+            # nhảy lên 1e3+ rồi loss thành NaN là dấu hiệu tràn số (§8).
             gnorm = float(torch.nn.utils.clip_grad_norm_(all_params,
                                                          r.max_grad_norm))
             lr_now = sched.set_samples(step_start)[0]

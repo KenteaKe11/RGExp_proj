@@ -3,7 +3,7 @@
 #
 # Dán TOÀN BỘ file này vào MỘT cell của một notebook Kaggle KHÁC với notebook
 # đang train, rồi Run.
-#   Settings → Accelerator = GPU (P100 hoặc T4)   |   Internet = ON
+#   Settings → Accelerator = GPU T4 x2   |   Internet = ON
 #   Add-ons → Secrets      = HF_TOKEN (bắt buộc)
 #
 # Script này KHÔNG TRAIN GÌ CẢ. Nó:
@@ -29,7 +29,7 @@
 #
 # ── Chạy lại được, và vì sao đó là điều kiện sống còn ────────────────────────
 # Phiên Kaggle tối đa ~12h. Trọn test là 3000 ảnh × (1 lần generate + 5
-# forward), P100 rơi vào cỡ 12-20 giây/ảnh -> 10-17h, tức 2 phiên. Lúc khởi
+# forward), T4 rơi vào cỡ 12-20 giây/ảnh -> 10-17h, tức 2 phiên. Lúc khởi
 # động, script đọc danh sách file đã có trên dataset repo và BỎ QUA những ảnh
 # đó, nên phiên sau chạy tiếp chứ không làm lại. reports.csv cũng được dựng
 # lại từ chính các bản ghi cũ (báo cáo sinh ra nằm sẵn trong đó) — không phải
@@ -105,7 +105,8 @@ cfg["run"]["hub_sync"] = False      # không tranh chấp tiến độ với phi
 cfg["run"]["use_wandb"] = False
 cfg["run"]["infer_bs"] = 1          # mỗi ảnh một gate riêng, không batch được
 
-# sm60 (P100) không có bf16. Trên T4 (sm75) cũng vậy.
+# T4 (sm75) không có bf16 — cần sm80+. Probe chỉ chạy forward nên fp16 an
+# toàn hơn lúc train, nhưng vẫn giữ trainable_dtype=fp32 cho router/adapter.
 if _sm[0] < 8:
     cfg["fixed"]["require_bf16"] = False
     cfg["fixed"]["compute_dtype"] = "float16"

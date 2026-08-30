@@ -329,6 +329,17 @@ label.
   (adapter nắn model đã pretrain). Cả hai group cùng sống từ step đầu — không
   còn phase nào chỉ có một nửa.
 - **Không GradScaler**: bf16 có dynamic range của fp32, không cần loss scaling.
+- **Cắt gradient: chuẩn TOÀN CỤC ở `max_grad_norm = 1.0`.** Router và expert
+  nằm trong **một** danh sách gộp khi gọi `clip_grad_norm_`, nên nó tính một
+  chuẩn L2 duy nhất trên toàn bộ vector gradient và nhân tất cả với **cùng
+  một** hệ số: hướng của bước đi giữ nguyên, chỉ độ dài bị chặn. Cắt riêng
+  từng nhóm thì mỗi nhóm co một hệ số khác nhau, vector tổng quay sang hướng
+  khác hướng gradient thật, và tỉ lệ đóng góp router/expert đổi âm thầm theo
+  từng step — đặc biệt tệ ở đây vì hai nhóm đã có hai lr khác nhau. Cần chặn
+  vì router train từ số 0 (gradient vài trăm step đầu lớn hơn hẳn expert) và
+  ASL với γ⁻ = 4 cho gradient nhọn ở những ô dương bị đoán sai; một bước dài
+  bất thường lúc đó đủ đẩy trọng số vào NaN và mất cả phiên. `gnorm` in ra
+  **mỗi step**: đụng trần 1.0 liên tục ở đầu train là bình thường.
 - **`w_sup = 0.2`.** ASL ở đây không phải một mục tiêu song song ngang hàng với
   CE mà là một cái **neo ngữ nghĩa**: nó giữ cho bản tóm tắt mà Separation
   dựng ra bám vào ngữ nghĩa bệnh học thay vì trôi thành một vector chỉ phục vụ
@@ -962,7 +973,7 @@ và những ảnh đó bị bỏ qua, nên phiên Kaggle 12h đứt giữa chừ
 chạy tiếp. `reports.csv` cũng dựng lại được từ chính các bản ghi cũ (báo cáo
 sinh ra nằm sẵn trong đó) thay vì generate lại chỉ để có metrics.
 
-**Chi phí.** Trọn test = 3000 ảnh × (1 lần generate + 5 forward). P100 rơi vào
+**Chi phí.** Trọn test = 3000 ảnh × (1 lần generate + 5 forward). T4 rơi vào
 cỡ 12–20 giây/ảnh → 10–17h, tức 2 phiên Kaggle. `infer_bs` bị ép về 1: mỗi ảnh
 cần 5 gate khác nhau mà `CTX` chỉ giữ một gate cho cả batch. Thử nhanh thì
 `probe_n_images: 20`.
@@ -1174,8 +1185,9 @@ RGExp_proj/
     ├── sweep.sh              # chạy nhiều ô tuần tự, tự gom cuối
     ├── collect.sh            # gom kết quả bất cứ lúc nào
     ├── tail_log.sh           # theo dõi log run đang chạy
-    ├── kaggle_p100.py        # cell Kaggle P100 (sm60, fp16)
-    ├── kaggle_t4x2.py        # cell Kaggle T4×2 (sm75, fp32)
+    ├── kaggle_t4x2.py        # ★ cell Kaggle DUY NHẤT: T4×2 (sm75, fp32).
+    │                         #   Không có bản P100 — ảnh Kaggle build PyTorch
+    │                         #   cho sm70+, P100 là sm60 nên fail ngay
     ├── kaggle_probe.py       # cell Kaggle cho mode=probe (§3.7)
     └── docker_bootstrap.sh   # §9 — một lệnh dựng cả máy thuê rồi chạy
 ```
@@ -1326,6 +1338,8 @@ So sánh giữa các ô: xem §5.
 | Train không bao giờ tự dừng | đúng thiết kế (§1.7) | Ctrl-C để dừng và lưu ckpt; chấm điểm bằng phiên `--mode test` riêng |
 | `không suy được aspect 'uncertain' từ class_names=...` | tên aspect trong `labels.npz` không khớp bảng từ khoá | sửa `_ROLE_WORDS` trong `src/losses.py` cho khớp bộ nhãn — ĐỪNG đoán thứ tự, gán nhầm uncertain thành negative là lỗi im lặng |
 | `sup_recall` đứng ở 0 nhưng `sup_acc` cao | model đoán "âm" cho mọi ô | bình thường ở vài trăm step đầu; kéo dài thì hạ `asl_gamma_neg` hoặc nâng `w_sup` |
+| `gnorm` bám sát 1.0 ở mọi step | gradient thật lớn hơn trần | bình thường lúc đầu (router train từ số 0). Vẫn thế sau vài nghìn step thì hạ `lr_router` chứ đừng nâng `max_grad_norm` |
+| `gnorm` nhảy lên 1e3+ rồi loss = NaN | tràn số, không phải chuyện cắt gradient | fp16 trên sm75 tràn ở activation Gemma 3 — dùng `compute_dtype: float32` |
 | ckpt cũ: `size mismatch for sup_head.fc2.weight` | ckpt của bản Focal (head 14×4 = 56 chiều) | head giờ là 14 chiều — không nạp đè được, dùng `ckpt_dir`/`hub_repo` mới |
 | `peft` báo `Target module ... not supported` | `peft` quá cũ | `pip install -U 'peft>=0.14'` |
 | `401 gated repo` | token chưa được cấp quyền gemma-3 | xin quyền tại trang model trên HF |

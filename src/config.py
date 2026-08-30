@@ -289,6 +289,21 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("hub_include_optimizer", True)
     fixed.setdefault("require_bf16", True)
 
+    # Cắt gradient theo CHUẨN TOÀN CỤC. 1.0 là giá trị chốt — xem docstring
+    # tại chỗ gọi clip_grad_norm_ trong src/train.py.
+    run.setdefault("max_grad_norm", 1.0)
+    run["max_grad_norm"] = float(run["max_grad_norm"])
+    if run["max_grad_norm"] <= 0:
+        raise ValueError(
+            f"run.max_grad_norm phải > 0, nhận {run['max_grad_norm']}. Muốn "
+            f"TẮT cắt gradient thì đặt một số rất lớn (vd 1e9) — để 0 thì "
+            f"clip_grad_norm_ nhân mọi gradient với 0 và không có gì học "
+            f"được, im lặng.")
+    if run["max_grad_norm"] > 10:
+        print(f"⚠ max_grad_norm={run['max_grad_norm']:g} — gần như không cắt "
+              f"gì. Router train từ số 0 và ASL có thể cho gradient rất lớn ở "
+              f"vài trăm step đầu; 1.0 là giá trị chốt.")
+
     for _k in ("asl_gamma_pos", "asl_gamma_neg", "asl_clip", "uncertain_soft"):
         run[_k] = float(run[_k])
     if not 0.0 <= run["asl_clip"] < 0.5:
@@ -569,7 +584,8 @@ if __name__ == "__main__":
           f"| Gumbel σ={c.fixed.route_noise:g}")
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
-          f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}×")
+          f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}× | clip chuẩn "
+          f"toàn cục {c.run.max_grad_norm:g}")
     print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
           f"batch) | ckpt mỗi {c.run.save_every_n_vals} lần val | dừng sớm: "
           f"KHÔNG (chạy tới khi dừng tay)")
