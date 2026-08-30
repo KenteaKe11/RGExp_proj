@@ -10,9 +10,9 @@ encoder/decoder giữ nguyên và đóng băng, còn expert là adapter QDoRA r8
                                                     ┌─────────┴─────────┐
                                               [1, 512]              [1, 512]
                                           Supervised head        Route head
-                                          vec(14×4) → Focal      vec(E) → top-k
+                                          vec(14) → ASL          vec(E) → top-k
 
-Recombinator chỉ còn MỘT biến thể (ô sweep Phase 1 giờ chỉ quét số block):
+Recombinator chỉ còn MỘT biến thể (ô sweep giờ chỉ quét số block):
 
     g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
             852_992 param/block
@@ -25,6 +25,21 @@ Quy ước chung của nhánh router:
   * pre-norm + residual,
   * RMSNorm (không LayerNorm): không có mean-centering, rẻ hơn và khớp với
     chuẩn hoá mà chính Gemma dùng.
+
+CÂN BẰNG TẢI KHÔNG DÙNG AUX LOSS (kiểu DeepSeek-V3). Không còn số hạng
+`w_aux · Aux` trong Total_Loss. Thay vào đó mỗi expert có một BIAS b_e chỉ
+tham gia vào việc CHỌN top-k, không tham gia vào trọng số gate, và không học
+bằng gradient — sau mỗi optimizer step nó được nắn bằng một quy tắc:
+
+    expert bị chọn nhiều hơn mức trung bình  ->  b_e giảm  (khó được chọn hơn)
+    expert bị chọn ít hơn                    ->  b_e tăng
+
+Lý do bỏ aux: aux loss là một lực KÉO NGƯỢC gradient chính. Nó bắt router
+"chia đều" ngay cả khi việc chia đều làm CE tệ đi, và mọi giá trị w_aux đều
+là một đánh đổi giữa cân bằng và chất lượng. Bias thì nằm NGOÀI đồ thị
+autograd: nó chỉnh cửa vào của từng expert mà không thêm một chữ nào vào
+loss, nên chất lượng và cân bằng không còn phải tranh nhau một hệ số.
+Xem `RouterNet.update_bias`.
 """
 from __future__ import annotations
 
@@ -37,7 +52,11 @@ import torch.nn.functional as F
 D_MODEL = 512          # chiều làm việc của cả nhánh router
 D_ENC = 2560           # chiều hidden của Gemma3-4b (đầu ra encoder)
 N_DISEASE = 14         # §1.4 — 14 finding
-N_ASPECT = 4           # §1.4 — 4 chẩn đoán/finding
+# 4 aspect (blank/positive/negative/uncertain) của CheXbert vẫn là hình dạng
+# NHÃN GỐC trong labels.npz, nhưng sup_head KHÔNG còn đoán chúng: nhãn được
+# gập về một trục nhị phân có mask trước khi vào loss (src/losses.py). Hằng
+# số giữ lại vì probe vẫn chiếu Δlogit lên 4 tên aspect đó.
+N_ASPECT = 4
 N_QUERY = 2            # Separation tách thành 2 vector: supervised + route
 
 
@@ -120,8 +139,6 @@ class GBRMFBlock(nn.Module):
 
     Attention trộn token với 4 KV-head (cùng số group với Separation), FFN
     thắt cổ chai 512→64→512 nên phần lớn tham số nằm ở attention.
-
-    Đây là biến thể DUY NHẤT còn lại: sweep Phase 1 chỉ quét số block n = 1..4.
     """
     PARAMS = 852_992
 
@@ -192,16 +209,23 @@ class SeparationProjector(nn.Module):
 
 
 class SupervisedHead(nn.Module):
-    """[512] → vec(14×4) — 145_408 param. Softmax theo trục aspect."""
-    PARAMS = 145_408
+    """[512] → vec(14) — 134_656 param. MỘT logit mỗi finding, sigmoid.
+
+    Trước đây head này ra 14×4 và softmax theo trục aspect — nó đoán báo cáo
+    NÓI GÌ về từng bệnh (kể cả "không nhắc tới"). Giờ nó đoán đúng câu cần
+    hỏi: bệnh này CÓ hay KHÔNG. Nhãn 4 aspect được gập về một trục nhị phân
+    có mask ở src/losses.py, nên đây là bài toán multi-label 14 chiều và loss
+    là ASL trên sigmoid, không phải softmax.
+    """
+    PARAMS = 134_656
 
     def __init__(self, dim=D_MODEL, hidden=256):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, N_DISEASE * N_ASPECT, bias=False)
+        self.fc2 = nn.Linear(hidden, N_DISEASE, bias=False)
 
     def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x))).view(-1, N_DISEASE, N_ASPECT)
+        return self.fc2(F.gelu(self.fc1(x)))
 
 
 class RouteHead(nn.Module):
@@ -222,34 +246,46 @@ class RouteHead(nn.Module):
 
 # ═══════════════════════════════ nhánh hoàn chỉnh ════════════════════════════
 class RouterNet(nn.Module):
-    """Cả nhánh router. Trả về (sup_logits, gate_weight, aux_loss, stats).
+    """Cả nhánh router. Trả về (sup_logits [B,14], gate_weight, stats).
 
     gate_weight [B, E] là vector THƯA: chỉ top-k phần tử khác 0, tổng = 1.
     Nhân trực tiếp vào delta của từng expert trong decoder (xem src/moe.py),
     nên gradient của CE chảy ngược về đây — router học từ chất lượng text sinh
     ra, không chỉ từ nhãn supervised.
 
-    `route_noise` > 0 bật nhiễu Gumbel trên route logit khi TRAINING (xem
-    `gumbel_like`): top-k trở thành lấy mẫu k expert không lặp từ phân phối
-    của router thay vì lấy k đứa điểm cao nhất. Đây là regularizer riêng cho
-    tuyến đường — nó chống đúng cái kiểu overfit mà w_aux không chạm tới:
-    aux chỉ ép TỔNG tải chia đều giữa các expert, nó hoàn toàn hài lòng khi
-    router học thuộc "mẫu này luôn đi expert 3" miễn là các expert đều bận.
-    Nhiễu thì đánh vào từng mẫu: một mẫu ở gần biên quyết định sẽ đi các
-    tuyến khác nhau qua từng epoch, nên expert không kịp học thuộc mẫu và
-    gate không kịp bão hoà về one-hot. eval/infer TẮT hẳn (self.training),
-    nên số đo và text sinh ra vẫn tất định.
+    Ba đường đi tách bạch của cùng một route_logit:
+
+      1. GIÁ TRỊ gate  = softmax(route_logit) SẠCH, lấy ở top-k rồi chuẩn hoá
+         lại cho tổng = 1. Đây là đường duy nhất có gradient. Nhiễu và bias
+         KHÔNG được đụng vào nó: gate là "router tin expert này bao nhiêu",
+         mà nhiễu/bias là chuyện điều phối, không phải chuyện niềm tin.
+
+      2. CHỌN top-k     = route_logit + σ·Gumbel (chỉ khi training) + bias.
+         Đây là chỗ duy nhất nhiễu và bias có tác dụng, và cả hai đều nằm
+         ngoài đồ thị autograd (topk vốn không có gradient theo chỉ số).
+
+      3. CẬP NHẬT bias  = đếm tải thật rồi nắn sau mỗi optimizer step, bằng
+         quy tắc chứ không bằng gradient (xem `update_bias`).
+
+    `route_noise` (σ) bật nhiễu Gumbel: top-k của (logit + Gumbel) đúng bằng
+    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Nó
+    chống overfit TUYẾN ĐƯỜNG: một mẫu ở gần biên quyết định sẽ đi các tuyến
+    khác nhau qua từng epoch, nên expert không kịp học thuộc mẫu và gate không
+    kịp bão hoà về one-hot. σ = 1.0 là lấy mẫu đúng chuẩn (mặc định).
+    eval/infer TẮT hẳn (self.training), nên số đo và text sinh ra tất định.
     """
 
     def __init__(self, variant, n_block, n_expert, top_k, dim=D_MODEL,
-                 d_enc=D_ENC, route_noise=0.0):
+                 d_enc=D_ENC, route_noise=1.0, bias_gamma=1e-3):
         super().__init__()
         assert variant in VARIANTS, f"variant lạ: {variant} (có: {list(VARIANTS)})"
         assert 1 <= top_k <= n_expert
         assert route_noise >= 0, f"route_noise phải >= 0, nhận {route_noise}"
+        assert bias_gamma >= 0, f"bias_gamma phải >= 0, nhận {bias_gamma}"
         self.variant, self.n_block = variant, n_block
         self.n_expert, self.top_k = n_expert, top_k
         self.route_noise = float(route_noise)
+        self.bias_gamma = float(bias_gamma)
         self.stem = Stem(d_enc, dim)
         self.blocks = nn.ModuleList(
             [VARIANTS[variant](dim) for _ in range(n_block)])
@@ -257,72 +293,66 @@ class RouterNet(nn.Module):
         self.sup_head = SupervisedHead(dim)
         self.route_head = RouteHead(n_expert, dim)
 
+        # ── Bias cân bằng tải (aux-free) ────────────────────────────────────
+        # BUFFER, không phải Parameter: nó không được optimizer đụng vào và
+        # không có gradient. Nhưng vẫn phải nằm trong state_dict — bỏ nó ra
+        # khỏi checkpoint thì resume xong router mất toàn bộ điều phối đã học
+        # và vài nghìn step đầu lại dồn tải như lúc mới khởi tạo.
+        self.register_buffer("expert_bias", torch.zeros(n_expert))
+        # Bộ đếm tải giữa hai lần cập nhật. persistent=False: nó chỉ sống
+        # trong đúng một optimizer step, lưu vào ckpt là lưu rác.
+        self.register_buffer("load_count", torch.zeros(n_expert),
+                             persistent=False)
+        self.register_buffer("load_tokens", torch.zeros(()), persistent=False)
+
     # ── nhiễu Gumbel trên route logit ───────────────────────────────────────
     def set_route_noise(self, scale):
-        """Đổi cường độ nhiễu giữa chừng (anneal). Trả về giá trị cũ.
-
-        Tách ra thành hàm để lịch giảm nhiễu — nếu sau này muốn — nằm ở
-        train.py chứ không phải nhét thêm một biến `step` vào forward.
-        """
+        """Đổi cường độ nhiễu giữa chừng (anneal). Trả về giá trị cũ."""
         old, self.route_noise = self.route_noise, max(float(scale), 0.0)
         return old
 
-    # ── freeze cho Phase 2 / "Phase Router" ─────────────────────────────────
-    def trunk_layers(self):
-        """Trunk = phần DÙNG CHUNG cho cả hai head, xếp theo thứ tự sâu dần.
+    # ── cập nhật bias cân bằng tải (không gradient) ─────────────────────────
+    @torch.no_grad()
+    def update_bias(self):
+        """Nắn bias theo tải đã đếm được. Gọi MỘT lần sau mỗi optimizer step.
 
-        Stem được tính là layer đầu tiên: nó là phép chiếu 2560→512 cộng một
-        lần trộn, tức đúng cái vai "layer thấp học đặc trưng chung" mà việc
-        đóng băng nhắm tới. Separation/route_head KHÔNG nằm trong trunk —
-        chúng là phần riêng của từng head và Phase 2 phải học tiếp.
+        Quy tắc (DeepSeek-V3, "auxiliary-loss-free load balancing"):
+
+            c_e     = số mẫu đã chọn expert e kể từ lần cập nhật trước
+            c̄      = trung bình = Σc_e / E
+            b_e    += γ · sign(c̄ − c_e)
+
+        Dùng `sign` chứ không dùng độ lệch: bias là một cái NÚM CỬA, không
+        phải một cái lò xo. Lấy độ lệch thì một batch lệch nặng sẽ đẩy bias
+        đi rất xa trong một bước và router dao động qua lại; sign cho mỗi
+        bước đúng γ nên nó bò từ từ về điểm cân bằng và ở lại đó.
+
+        Trừ trung bình sau mỗi lần cập nhật: chỉ HIỆU giữa các b_e mới có ý
+        nghĩa (top-k không đổi khi cộng cùng một hằng số vào tất cả), nên ghim
+        trung bình về 0 để bias không trôi dần ra vô cực và làm mất thang đo
+        khi so với route_logit.
+
+        Trả về (bias_span, load_cv) để train.py ghi log, hoặc None khi chưa
+        đếm được mẫu nào (eval, hoặc gọi hai lần liên tiếp).
         """
-        return [("stem", self.stem)] + \
-               [(f"blocks.{i}", b) for i, b in enumerate(self.blocks)]
+        total = float(self.load_tokens)
+        if self.bias_gamma <= 0 or total <= 0:
+            return None
+        c = self.load_count
+        mean = c.sum() / self.n_expert
+        self.expert_bias.add_(self.bias_gamma * torch.sign(mean - c))
+        self.expert_bias.sub_(self.expert_bias.mean())
+        span = float(self.expert_bias.max() - self.expert_bias.min())
+        cv = float(c.std(unbiased=False) / mean.clamp_min(1e-9))
+        self.load_count.zero_()
+        self.load_tokens.zero_()
+        return span, cv
 
-    def set_freeze(self, n_trunk=0, sup_head=False):
-        """Đóng băng `n_trunk` layer đầu của trunk (+ tuỳ chọn sup_head).
-
-        Gọi với (0, False) để MỞ lại toàn bộ — nên hàm này an toàn khi gọi
-        nhiều lần, và Phase 1 chỉ việc gọi lại với 0 thay vì phải nhớ trạng
-        thái cũ. Đây là lý do nó reset requires_grad=True cho mọi param trước.
-
-        Vì sao Phase 2 (Phase Router) đóng băng:
-          * `sup_head` đã được Focal của Phase 1 train tới nơi trên đúng nhãn
-            14×4. Ở Phase 2 nó chỉ còn đóng vai một cái THƯỚC cố định: loss
-            w_sup·Focal vẫn chảy ngược qua Separation về trunk và giữ cho bản
-            tóm tắt không trôi khỏi ngữ nghĩa bệnh học, nhưng bản thân cái
-            thước thì không được tự nắn cho vừa.
-          * n layer đầu của trunk giữ nguyên đặc trưng thấp đã học ở Phase 1,
-            để gradient CE (rất khác Focal) không kéo cả trunk đi ngay từ đáy.
-
-        Luôn chừa ÍT NHẤT một layer trunk train được: đóng băng trọn trunk thì
-        `n_block` — biến duy nhất của sweep — không còn ảnh hưởng gì tới Phase
-        2, và cả bảng so sánh mất nghĩa. Xin nhiều hơn thì bị cắt về mức đó và
-        `clamped` trong kết quả trả về sẽ khác `asked`.
-        """
-        trunk = self.trunk_layers()
-        asked = max(int(n_trunk), 0)
-        n = min(asked, len(trunk) - 1)
-
-        for p in self.parameters():
-            p.requires_grad_(True)
-
-        frozen_names = []
-        for name, mod in trunk[:n]:
-            for p in mod.parameters():
-                p.requires_grad_(False)
-            frozen_names.append(name)
-        if sup_head:
-            for p in self.sup_head.parameters():
-                p.requires_grad_(False)
-            frozen_names.append("sup_head")
-
-        n_frozen = sum(p.numel() for p in self.parameters()
-                       if not p.requires_grad)
-        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {"asked": asked, "clamped": n, "n_trunk_total": len(trunk),
-                "frozen": frozen_names, "n_frozen_param": n_frozen,
-                "n_trainable_param": n_train}
+    @torch.no_grad()
+    def reset_bias(self):
+        self.expert_bias.zero_()
+        self.load_count.zero_()
+        self.load_tokens.zero_()
 
     # ── thống kê tham số (đối chiếu bảng trong tài liệu) ────────────────────
     def param_table(self):
@@ -345,42 +375,48 @@ class RouterNet(nn.Module):
         for blk in self.blocks:
             h = blk(h, mask=mask)
         pooled = self.separation(h, mask=mask)          # [B, 2, 512]
-        sup_logits = self.sup_head(pooled[:, 0])        # [B, 14, 4]
+        sup_logits = self.sup_head(pooled[:, 0])        # [B, 14]
         route_logits = self.route_head(pooled[:, 1]).float()   # [B, E]
 
-        # Nhiễu Gumbel — CHỈ khi training (xem gumbel_like). Cộng vào logit
-        # TRƯỚC softmax, nên nó chi phối cả ba thứ dưới đây: expert nào được
-        # chọn, trọng số gate của chúng, và aux load-balance. Cố ý: phạt đúng
-        # cái phân phối mà router thật sự dùng để định tuyến.
-        noisy = route_logits
-        if self.training and self.route_noise > 0:
-            noisy = route_logits + self.route_noise * gumbel_like(route_logits)
+        # (1) GIÁ TRỊ gate: softmax SẠCH — đường duy nhất có gradient.
+        prob = F.softmax(route_logits, dim=-1)
 
-        prob = F.softmax(noisy, dim=-1)
-        topv, topi = torch.topk(prob, self.top_k, dim=-1)
+        # (2) CHỌN top-k: logit + nhiễu (train) + bias cân bằng tải. Cả hai
+        # số hạng này chỉ đổi CỬA VÀO của expert, không đổi trọng số trộn.
+        score = route_logits
+        if self.training and self.route_noise > 0:
+            score = score + self.route_noise * gumbel_like(route_logits)
+        score = score + self.expert_bias.to(score.dtype)
+        topi = torch.topk(score, self.top_k, dim=-1).indices
+
+        topv = prob.gather(-1, topi)
         # Chuẩn hoá lại trong top-k: tổng trọng số = 1 để độ lớn delta không
         # phụ thuộc router "tự tin" hay không. k = E thì trùng softmax đầy đủ.
         topv = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         gate = torch.zeros_like(prob).scatter(-1, topi, topv)
 
-        aux = load_balance_loss(prob, topi, self.n_expert)
         with torch.no_grad():
-            counts = torch.zeros(self.n_expert, device=prob.device)
+            counts = torch.zeros(self.n_expert, device=prob.device,
+                                 dtype=prob.dtype)
             counts.scatter_add_(0, topi.reshape(-1),
                                 torch.ones_like(topi.reshape(-1),
                                                 dtype=counts.dtype))
-            # route_entropy đo trên logit SẠCH, không phải logit đã nhiễu:
-            # nó là thước "router có đang sụp về một expert không", và thước
-            # đó phải so được giữa các ô có route_noise khác nhau (kể cả = 0)
-            # và giữa train với eval. expert_share / gate_max thì ngược lại —
-            # chúng ghi lại cái ĐÃ XẢY RA, nên tính từ phân phối có nhiễu.
-            clean = (prob if noisy is route_logits
-                     else F.softmax(route_logits, dim=-1))
-            stats = {"expert_share": (counts / counts.sum()).tolist(),
-                     "gate_max": float(topv[:, 0].mean()),
-                     "route_entropy": float(
-                         -(clean * clean.clamp_min(1e-9).log()).sum(-1).mean())}
-        return sup_logits, gate, aux, stats
+            # (3) Ghi tải để `update_bias` nắn sau optimizer step. Cộng dồn
+            # qua cả grad_accum micro-batch: bias phải phản ứng với tải của
+            # MỘT lần cập nhật trọng số, không phải của một micro-batch.
+            if self.training and self.bias_gamma > 0:
+                self.load_count.add_(counts.to(self.load_count.dtype))
+                self.load_tokens.add_(float(prob.shape[0]))
+            stats = {
+                "expert_share": (counts / counts.sum().clamp_min(1)).tolist(),
+                "gate_max": float(topv.max(dim=-1).values.mean()),
+                "route_entropy": float(
+                    -(prob * prob.clamp_min(1e-9).log()).sum(-1).mean()),
+                "balance": float(load_balance_stat(prob, topi, self.n_expert)),
+                "bias_span": float(self.expert_bias.max()
+                                   - self.expert_bias.min()),
+            }
+        return sup_logits, gate, stats
 
 
 def gumbel_like(x, eps=1e-9):
@@ -393,13 +429,13 @@ def gumbel_like(x, eps=1e-9):
     Vì sao Gumbel chứ không phải Gauss: top-k của (logit + Gumbel) đúng bằng
     LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Nghĩa
     là router không chọn "k đứa điểm cao nhất" mà bốc theo đúng phân phối nó
-    tin, nên expert xếp thứ 7 vẫn thỉnh thoảng được chạy và được nhận
-    gradient, thay vì chết vĩnh viễn vì thua 0.01 logit ở step đầu. Đó chính
-    là chỗ chống overfit: router không kịp khoá cứng một tuyến đường.
+    tin, nên expert xếp thứ 5 vẫn thỉnh thoảng được chạy và được nhận
+    gradient, thay vì chết vĩnh viễn vì thua 0.01 logit ở step đầu.
 
     Lưu ý về cường độ: hệ số nhân σ trước G tương đương chia logit cho σ, tức
-    NGHỊCH với nhiệt độ. σ = 1.0 là lấy mẫu đúng chuẩn; σ nhỏ → gần top-k
-    xác định; σ lớn → gần như chọn ngẫu nhiên đều.
+    NGHỊCH với nhiệt độ. σ = 1.0 là lấy mẫu ĐÚNG CHUẨN — đây là giá trị mặc
+    định phổ thông và là giá trị project này dùng; σ nhỏ → gần top-k xác
+    định; σ lớn → gần như chọn ngẫu nhiên đều.
     """
     u = torch.rand_like(x).clamp_min(eps)
     # Ngoặc ở đây KHÔNG thừa: `-torch.log(u).clamp_min(eps)` sẽ clamp trước
@@ -407,15 +443,20 @@ def gumbel_like(x, eps=1e-9):
     return -torch.log((-torch.log(u)).clamp_min(eps))
 
 
-def load_balance_loss(prob, topi, n_expert):
-    """Aux loss kiểu Switch-Transformer: E · Σ_e f_e · P_e.
+@torch.no_grad()
+def load_balance_stat(prob, topi, n_expert):
+    """CHỈ SỐ cân bằng tải kiểu Switch-Transformer: E · Σ_e f_e · P_e.
 
-    f_e = tỉ lệ MẪU thật sự chọn expert e (rời rạc, không có gradient)
-    P_e = xác suất TRUNG BÌNH router gán cho e (có gradient)
+    ĐÂY KHÔNG CÒN LÀ LOSS. Không có gradient, không nằm trong Total_Loss —
+    cân bằng tải giờ do bias của router lo (xem `RouterNet.update_bias`).
+    Giữ lại đúng công thức cũ vì nó là cái THƯỚC quen thuộc và so được với
+    các lần chạy trước:
 
-    Tích của hai đại lượng bị cực tiểu hoá khi cả hai đều = 1/E, tức mọi expert
-    nhận đều tải. Giá trị tại điểm cân bằng hoàn hảo = 1.0 — nên đọc log thấy
-    aux ≈ 1.0 là ĐÚNG, aux ≫ 1 là router đang dồn hết vào vài expert.
+        f_e = tỉ lệ MẪU thật sự chọn expert e
+        P_e = xác suất TRUNG BÌNH router gán cho e
+
+    = 1.0 khi mọi expert nhận đều tải, ≫ 1 khi router dồn vào vài expert.
+    Đọc log thấy `balance` bò về 1.0 nghĩa là bias đang làm việc.
     """
     B = prob.shape[0]
     f = torch.zeros(n_expert, device=prob.device, dtype=prob.dtype)
@@ -424,7 +465,7 @@ def load_balance_loss(prob, topi, n_expert):
                               dtype=prob.dtype))
     f = f / max(B * topi.shape[-1], 1)
     P = prob.mean(dim=0)
-    return n_expert * torch.sum(f.detach() * P)
+    return n_expert * torch.sum(f * P)
 
 
 # ═════════════════════════ dự toán tham số (không cần GPU) ═══════════════════
@@ -455,21 +496,38 @@ def _selftest():
         got = sum(p.numel() for p in mod.parameters())
         ok &= got == exp
         print(f"{label:<34}{got:>12,}{exp:>12,}  {'✓' if got == exp else '✗'}")
-    for E in (4,):
+    for E in (12,):
         got = sum(p.numel() for p in RouteHead(E).parameters())
         exp = 131_072 + 256 * E
         ok &= got == exp
         print(f"{f'Route head (E={E})':<34}{got:>12,}{exp:>12,}"
               f"  {'✓' if got == exp else '✗'}")
 
-    print("\nTổng tham số theo ô sweep (E=4 expert QDoRA r8 ≈ 15.9M/expert):")
+    print("\nTổng tham số theo ô sweep (E=12 expert QDoRA r8 ≈ 15.9M/expert):")
     print(f"{'ô':<16}{'router':>12}{'expert':>14}{'tổng':>12}")
-    # Bảng sweep §2 — một biến thể, n_block 1..4.
-    for variant, blocks in ((VARIANT, (1, 2, 3, 4, 5)),):
+    for variant, blocks in ((VARIANT, (1, 2, 3, 4, 12)),):
         for n in blocks:
-            e = estimate_params(variant, n, 5)
+            e = estimate_params(variant, n, 12)
             print(f"{variant + '-n' + str(n):<16}{e['router']:>12,}"
                   f"{e['experts']:>14,}{e['total'] / 1e6:>11.1f}M")
+
+    # Bias cân bằng tải: một vòng cập nhật phải kéo expert quá tải xuống.
+    net = RouterNet(VARIANT, 1, 12, 4, bias_gamma=0.01)
+    net.train()
+    net.load_count[3] = 100.0
+    net.load_tokens += 100.0
+    net.update_bias()
+    bias_ok = float(net.expert_bias[3]) < float(net.expert_bias[0])
+    ok &= bias_ok
+    print(f"\nbias aux-free: expert quá tải bị hạ bias  "
+          f"{'✓' if bias_ok else '✗'} "
+          f"(b[3]={float(net.expert_bias[3]):+.4f} vs "
+          f"b[0]={float(net.expert_bias[0]):+.4f})")
+    mean_ok = abs(float(net.expert_bias.mean())) < 1e-6
+    ok &= mean_ok
+    print(f"bias trung bình ghim về 0                  "
+          f"{'✓' if mean_ok else '✗'}")
+
     print("\n" + ("✓ khớp tài liệu" if ok else "✗ LỆCH tài liệu — xem lại"))
     return 0 if ok else 1
 

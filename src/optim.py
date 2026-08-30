@@ -2,27 +2,33 @@
 
 Hai thứ trong file này đi cùng nhau, không phải hai tính năng rời:
 
-  * `CosineRestartSchedule` đưa LR về ĐÁY vài lần trong một phase thay vì đúng
-    một lần ở cuối. Mỗi lần chạm đáy, trọng số nằm yên trong MỘT lòng chảo của
-    hàm loss; mỗi lần restart, LR bật lại lên đỉnh và đẩy trọng số sang lòng
-    chảo khác.
+  * `CosineRestartSchedule` đưa LR về ĐÁY vài lần trong một lịch train thay vì
+    đúng một lần ở cuối. Mỗi lần chạm đáy, trọng số nằm yên trong MỘT lòng
+    chảo của hàm loss; mỗi lần restart, LR bật lại lên đỉnh và đẩy trọng số
+    sang lòng chảo khác.
   * `WeightAverager` gom đúng những điểm đáy đó rồi cộng trung bình ĐỀU. Trung
     bình của các điểm cùng nằm trong đáy cho một điểm nằm ở vùng phẳng hơn của
     loss — đó là toàn bộ lý do của SWA. Trung bình các điểm GIỮA cycle (LR còn
     cao, trọng số đang bay giữa hai lòng chảo) thì vô nghĩa: điểm trung bình
     không nằm trong lòng chảo nào cả. Nên averager CHỈ được cho ăn ở biên cycle.
 
-Vì sao cycle đếm bằng MẪU chứ không bằng step (xem `progress_key` trong
-src/train.py cho cùng lý do): step = samples / (train_bs × grad_accum), mà batch
-mỗi máy một khác. Nếu cycle dài "100 step" thì máy A100 (8×8 = 64 mẫu/step) và
-máy 4080 (1×32 = 32 mẫu/step) restart ở HAI CHỖ KHÁC NHAU trong dữ liệu, và một
-checkpoint bàn giao giữa hai máy sẽ có đường LR gãy khúc. Dài "6400 mẫu" thì
-biên cycle nằm đúng một chỗ trên mọi máy.
+LỊCH TRAIN KHÔNG CÓ ĐÍCH. Từ khi bỏ hai phase và bỏ trần số mẫu, không còn
+`total_samples` nào để chia cosine cho vừa: train chạy tuần tự hết tập train
+thì nâng epoch rồi chạy tiếp, cho tới khi người dùng dừng tay. Nên lịch ở đây
+là một chuỗi cycle DÀI BẰNG NHAU lặp vô hạn — mỗi cycle đúng `cycle_samples`
+mẫu, bật lên đỉnh rồi cosine xuống đáy, rồi lại bật. Không có "cycle cuối
+ngắn hơn", không có ngày kết thúc; dừng ở đâu thì bộ trung bình SWA đã gom
+được ngần ấy đáy.
+
+Vì sao cycle đếm bằng MẪU chứ không bằng step: step = samples / (train_bs ×
+grad_accum), mà batch mỗi máy một khác. Nếu cycle dài "100 step" thì máy A100
+(8×8 = 64 mẫu/step) và máy 4080 (1×32 = 32 mẫu/step) restart ở HAI CHỖ KHÁC
+NHAU trong dữ liệu, và một checkpoint bàn giao giữa hai máy sẽ có đường LR
+gãy khúc. Dài "1600 mẫu" thì biên cycle nằm đúng một chỗ trên mọi máy.
 
 Hệ quả dễ chịu: LR là HÀM THUẦN của số mẫu đã đi qua, nên resume không cần lưu
 scheduler state và không cần tua `scheduler.step()` n lần — chỉ cần
-`set_samples(samples)`. Đây là chỗ bản cũ (`get_linear_schedule_with_warmup` +
-vòng tua) dễ sai nhất khi đổi máy.
+`set_samples(samples)`.
 """
 from __future__ import annotations
 
@@ -32,37 +38,36 @@ import torch
 
 
 class CosineRestartSchedule:
-    """Warmup (chỉ cycle đầu) -> cosine -> restart, mọi mốc tính bằng MẪU.
+    """Warmup (chỉ cycle đầu) -> cosine -> restart, LẶP VÔ HẠN, tính bằng MẪU.
 
-    Đường LR của một cycle c, với p = số mẫu đã đi trong cycle đó:
+    Đường LR của cycle c, với p = số mẫu đã đi trong cycle đó:
 
-        lr = min_lr_ratio + (peak_c - min_lr_ratio) · ½(1 + cos(π · p/len_c))
+        lr = min_lr_ratio + (peak_c - min_lr_ratio) · ½(1 + cos(π · p/len))
 
     `peak_c = cycle_lr_decay ** c` (mặc định 1.0 = mọi cycle bật lại đúng LR
-    gốc, đúng SGDR nguyên bản).
+    gốc, đúng SGDR nguyên bản). Với lịch vô hạn, cycle_lr_decay < 1 nghĩa là
+    LR tiến về 0 và train tự chết dần — đó gần như không bao giờ là ý muốn,
+    nên mặc định phải là 1.0.
 
-    Cycle cuối có thể NGẮN hơn nếu total_samples không chia hết cho
-    cycle_samples: lúc đó len_c = phần dư, tức là nó vẫn anneal TRỌN xuống đáy
-    đúng lúc phase kết thúc. Nếu để nguyên độ dài đầy đủ thì phase dừng giữa
-    dốc, trọng số cuối cùng nằm ở LR cao và không có snapshot đáy nào để gom —
-    hỏng đúng cái mà SWA cần.
+    `samples` truyền vào là SỐ MẪU TÍCH LUỸ từ lúc train từ số 0, không reset
+    theo epoch: cycle phải cắt ngang ranh giới epoch một cách liền mạch.
     """
 
-    def __init__(self, optimizer, *, total_samples, cycle_samples=None,
-                 warmup_samples=0, min_lr_ratio=0.0, cycle_lr_decay=1.0):
+    def __init__(self, optimizer, *, cycle_samples, warmup_samples=0,
+                 min_lr_ratio=0.0, cycle_lr_decay=1.0):
         self.optimizer = optimizer
         # base_lrs phải chụp NGAY LÚC NÀY, trước optimizer.load_state_dict():
         # load_state_dict ghi đè param_groups["lr"] bằng LR CUỐI CÙNG đã dùng
         # của lần chạy trước (một giá trị nằm đâu đó giữa dốc cosine). Lấy
         # base sau đó là lấy nhầm, và mọi cycle sau sẽ thấp dần một cách âm thầm.
         self.base_lrs = [g["lr"] for g in optimizer.param_groups]
-        self.total_samples = max(int(total_samples), 1)
-        # null / <=0 / lớn hơn cả phase = MỘT cycle duy nhất: thành cosine
-        # thường có warmup, không restart. Đây là cách tắt restart mà không
-        # phải nuôi một nhánh code thứ hai.
         cs = int(cycle_samples or 0)
-        self.cycle_samples = min(cs, self.total_samples) if cs > 0 \
-            else self.total_samples
+        if cs <= 0:
+            raise ValueError(
+                "cycle_samples phải > 0: lịch train không còn tổng số mẫu để "
+                "suy ra độ dài một cycle, nên nó phải được ghi thẳng trong "
+                "config (run.cycle_samples).")
+        self.cycle_samples = cs
         self.warmup_samples = max(int(warmup_samples), 0)
         self.min_lr_ratio = float(min_lr_ratio)
         self.cycle_lr_decay = float(cycle_lr_decay)
@@ -71,29 +76,29 @@ class CosineRestartSchedule:
                 f"warmup_samples={self.warmup_samples} nuốt trọn cycle đầu "
                 f"({self.cycle_samples} mẫu) — cycle đầu sẽ không có đoạn "
                 f"cosine nào. Hạ warmup_samples hoặc nâng cycle_samples.")
-        self.n_cycles = -(-self.total_samples // self.cycle_samples)
         self._last_lr = list(self.base_lrs)
         self.set_samples(0)
 
     # ── hình học của lịch ────────────────────────────────────────────────────
     def cycle_index(self, samples):
         """Cycle thứ mấy tại mốc `samples`. Dùng để BẮT biên cho SWA."""
-        s = min(max(int(samples), 0), self.total_samples)
-        return min(s // self.cycle_samples, self.n_cycles - 1)
+        return max(int(samples), 0) // self.cycle_samples
 
     def cycle_span(self, c):
-        """(mẫu bắt đầu, độ dài) của cycle c — cycle cuối có thể ngắn hơn."""
-        start = c * self.cycle_samples
-        return start, max(min(self.cycle_samples,
-                              self.total_samples - start), 1)
+        """(mẫu bắt đầu, độ dài) của cycle c. Mọi cycle dài bằng nhau."""
+        return c * self.cycle_samples, self.cycle_samples
 
-    def bounds(self):
-        """Mốc mẫu KẾT THÚC của từng cycle — chỗ chụp snapshot cho SWA."""
-        return [min((c + 1) * self.cycle_samples, self.total_samples)
-                for c in range(self.n_cycles)]
+    def next_bound(self, samples):
+        """Mốc mẫu KẾT THÚC của cycle đang chạy — chỗ chụp snapshot SWA."""
+        return (self.cycle_index(samples) + 1) * self.cycle_samples
+
+    def bounds(self, n=6, samples=0):
+        """Vài mốc biên cycle sắp tới, để in log cho dễ hình dung."""
+        c0 = self.cycle_index(samples)
+        return [(c0 + i + 1) * self.cycle_samples for i in range(max(n, 1))]
 
     def multiplier(self, samples):
-        s = min(max(float(samples), 0.0), float(self.total_samples))
+        s = max(float(samples), 0.0)
         c = self.cycle_index(s)
         start, length = self.cycle_span(c)
         p = s - start
@@ -125,19 +130,15 @@ class CosineRestartSchedule:
         return list(self._last_lr)
 
     def describe(self, eff):
-        full = self.total_samples // self.cycle_samples
-        tail = self.total_samples - full * self.cycle_samples
-        s = (f"cosine warm restarts: {self.n_cycles} cycle × "
-             f"{self.cycle_samples} mẫu ({self.cycle_samples / eff:.0f} step "
-             f"ở batch {eff})")
-        if tail:
-            s += f" | cycle cuối chỉ {tail} mẫu (anneal trọn phần dư)"
+        s = (f"cosine warm restarts VÔ HẠN: mỗi cycle {self.cycle_samples} "
+             f"mẫu ({self.cycle_samples / eff:.0f} step ở batch {eff})")
         s += (f" | warmup {self.warmup_samples} mẫu (cycle đầu)"
               if self.warmup_samples else " | không warmup")
         if self.min_lr_ratio:
             s += f" | đáy = {self.min_lr_ratio:.3g}×lr"
         if self.cycle_lr_decay != 1.0:
-            s += f" | đỉnh ×{self.cycle_lr_decay} mỗi cycle"
+            s += (f" | ⚠ đỉnh ×{self.cycle_lr_decay} mỗi cycle — lịch vô hạn "
+                  f"sẽ tắt dần LR về 0")
         return s
 
 

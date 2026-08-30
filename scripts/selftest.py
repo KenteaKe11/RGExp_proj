@@ -2,18 +2,21 @@
 
     python scripts/selftest.py
 
-Bảy thứ được kiểm:
+Tám thứ được kiểm:
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
   4. công thức trộn MoE: gate one-hot phải cho ra ĐÚNG kết quả của một expert
      đơn lẻ — tức lớp MoE không tự thêm sai lệch nào;
-  5. lịch LR cosine warm restarts: hình dạng đường LR, và — quan trọng nhất —
-     biên cycle KHÔNG đổi khi đổi effective batch;
-  6. cộng trung bình trọng số (SWA): running mean đúng bằng trung bình số học,
-     không dùng chung bộ nhớ với tensor gốc, bàn giao qua state_dict giữ nguyên.
-  7. freeze của Phase 2 ("Phase Router"): đúng module bị đóng băng, phần còn
-     lại vẫn nhận gradient, và mở lại được về nguyên trạng.
+  5. ASL trên 14 finding: gập nhãn theo TÊN aspect, mask blank, soft label
+     uncertain, ngưỡng âm tính cắt gradient, và bất đối xứng γ⁺/γ⁻;
+  6. lịch LR cosine warm restarts VÔ HẠN: hình dạng đường LR, và — quan trọng
+     nhất — biên cycle KHÔNG đổi khi đổi effective batch;
+  7. cộng trung bình trọng số (SWA): running mean đúng bằng trung bình số học,
+     không dùng chung bộ nhớ với tensor gốc, bàn giao qua state_dict giữ nguyên;
+  8. cân bằng tải KHÔNG dùng aux loss: bias chỉ chạm vào việc CHỌN expert, cập
+     nhật đúng chiều, ghim trung bình về 0, và đi theo checkpoint;
+  9. nhiễu Gumbel trên route logit + các phép tính thuần của probe.
 
 Cái KHÔNG kiểm được ở đây (phải có GPU + weight thật): peft add_adapter, hook
 vào decoder Gemma, generate(). STAGE 0 trong src/train.py lo phần đó.
@@ -27,7 +30,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.losses import focal_loss, inv_freq_alpha       # noqa: E402
+from src.losses import (asl_loss, aspect_roles,          # noqa: E402
+                        binary_target_table, supervised_stats, to_binary)
 from src.optim import (CosineRestartSchedule,           # noqa: E402
                        WeightAverager)
 from src.router import VARIANT, RouterNet, _selftest    # noqa: E402
@@ -44,25 +48,28 @@ def check(name, cond, detail=""):
 def test_router():
     print("\n[2] router forward")
     torch.manual_seed(0)
-    B, N, E, K = 3, 40, 4, 2
+    B, N, E, K = 3, 40, 12, 4
     net = RouterNet(VARIANT, 2, E, K, d_enc=2560).eval()
     x = torch.randn(B, N, 2560)
     mask = torch.ones(B, N)
     mask[:, 30:] = 0                       # 10 token cuối = target/padding
     with torch.no_grad():
-        sup, gate, aux, st = net(x, mask)
-    check("sup_logits [B,14,4]", tuple(sup.shape) == (B, 14, 4), str(tuple(sup.shape)))
+        sup, gate, st = net(x, mask)
+    check("forward trả 3 phần tử (không còn aux)", True)
+    check("sup_logits [B,14] — một logit mỗi finding, KHÔNG phải 14×4",
+          tuple(sup.shape) == (B, 14), str(tuple(sup.shape)))
     check("gate [B,E]", tuple(gate.shape) == (B, E))
     check("gate thưa đúng top-k", int((gate > 0).sum(dim=-1).max()) == K)
     check("Σ gate = 1", torch.allclose(gate.sum(-1), torch.ones(B), atol=1e-5))
-    check("aux quanh 1.0 khi chưa train", 0.5 < float(aux) < 2.5,
-          f"aux={float(aux):.3f}")
+    check("balance quanh 1.0 khi chưa train", 0.3 < st["balance"] < 3.0,
+          f"balance={st['balance']:.3f}")
+    check("bias khởi tạo = 0 -> bias_span = 0", st["bias_span"] == 0.0)
 
     print("\n[3] mask che được token target")
     x2 = x.clone()
     x2[:, 30:] = torch.randn(B, 10, 2560) * 5      # đổi hẳn phần bị che
     with torch.no_grad():
-        sup2, gate2, _, _ = net(x2, mask)
+        sup2, gate2, _ = net(x2, mask)
     check("đổi token bị che -> gate KHÔNG đổi",
           torch.allclose(gate, gate2, atol=1e-4))
     check("đổi token bị che -> sup_logits KHÔNG đổi",
@@ -74,17 +81,16 @@ def test_route_noise():
     """[9] nhiễu Gumbel: chỉ khi training, không phá bất biến của gate."""
     print("\n[9] nhiễu Gumbel trên route logit")
     torch.manual_seed(0)
-    B, N, E, K = 64, 24, 8, 3
+    B, N, E, K = 64, 24, 12, 4
     x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
 
-    off = RouterNet(VARIANT, 2, E, K, d_enc=2560)
-    check("mặc định route_noise = 0 (config cũ không đổi hành vi)",
-          off.route_noise == 0.0)
+    off = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=0.0)
+    check("mặc định của lớp là σ = 1.0 (chuẩn Gumbel-top-k)",
+          RouterNet(VARIANT, 1, E, K, d_enc=2560).route_noise == 1.0)
     off.train()
     with torch.no_grad():
         g1, g2 = off(x, mask)[1], off(x, mask)[1]
-    check("noise=0 + train mode -> vẫn tất định",
-          torch.equal(g1, g2))
+    check("noise=0 + train mode -> vẫn tất định", torch.equal(g1, g2))
 
     on = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=1.0)
     on.load_state_dict(off.state_dict())        # cùng trọng số để so được
@@ -92,14 +98,13 @@ def test_route_noise():
     on.eval()
     with torch.no_grad():
         ge1 = on(x, mask)[1]
-        ge2, st_e = on(x, mask)[1], on(x, mask)[3]
+        ge2, st_e = on(x, mask)[1], on(x, mask)[2]
     check("eval mode -> nhiễu TẮT, gate tất định", torch.equal(ge1, ge2))
-    check("eval mode -> khớp đúng router không nhiễu",
-          torch.equal(ge1, g1))
+    check("eval mode -> khớp đúng router không nhiễu", torch.equal(ge1, g1))
 
     on.train()
     with torch.no_grad():
-        _, gt1, _, st_t = on(x, mask)
+        _, gt1, st_t = on(x, mask)
         gt2 = on(x, mask)[1]
     check("train mode -> hai lần chạy cho gate KHÁC nhau",
           not torch.equal(gt1, gt2))
@@ -128,11 +133,11 @@ def test_route_noise():
     check("σ=1.0: mọi expert đều có lúc được chọn",
           bool(seen.all()), f"{int(seen.sum())}/{E}")
 
-    # Gradient vẫn nối về route_head qua nhánh có nhiễu (nhiễu là hằng số
-    # cộng vào, không cắt đồ thị).
+    # Gradient vẫn nối về route_head qua GIÁ TRỊ gate (nhiễu chỉ nằm ở nhánh
+    # CHỌN, vốn không có gradient — nên nó không cắt đường nào cả).
     on.zero_grad()
-    sup, gate, aux, _ = on(x[:4], mask[:4])
-    (gate.sum() + aux).backward()
+    sup, gate, _ = on(x[:4], mask[:4])
+    gate.sum().backward()
     check("có nhiễu: route_head vẫn nhận gradient",
           all(p.grad is not None and float(p.grad.abs().sum()) > 0
               for p in on.route_head.parameters()))
@@ -197,31 +202,166 @@ def test_moe_math():
           and torch.allclose(out[2:], (base + delta(3))[2:], atol=1e-6))
 
 
-def test_focal():
-    print("\n[5] Focal loss + α = 1/f^(1/8)")
-    freq = torch.rand(14, 4).numpy()
-    freq = freq / freq.sum(axis=1, keepdims=True)
-    a = inv_freq_alpha(freq, "row")
-    check("α [14,4]", tuple(a.shape) == (14, 4))
-    exp = (torch.tensor(freq, dtype=torch.float32) * a).sum(dim=1)
-    check("Σ f·α = 1 mỗi bệnh (chuẩn hoá row)",
-          torch.allclose(exp, torch.ones(14), atol=1e-4))
-    check("ô hiếm nặng hơn ô phổ biến",
-          bool((a.flatten()[torch.tensor(freq).flatten().argmin()]
-                > a.flatten()[torch.tensor(freq).flatten().argmax()])))
+def test_asl():
+    print("\n[5] ASL trên 14 finding (gập nhãn + bất đối xứng)")
+    NAMES = ["Blank", "Positive", "Negative", "Uncertain"]
 
-    logits = torch.zeros(3, 14, 4)
-    tgt = torch.zeros(3, 14, dtype=torch.long)
-    l_unsure = float(focal_loss(logits, tgt, a))
-    logits_sure = torch.zeros(3, 14, 4)
-    logits_sure[:, :, 0] = 10.0
-    l_sure = float(focal_loss(logits_sure, tgt, a))
-    check("đoán đúng chắc chắn -> loss ≈ 0", l_sure < 1e-3,
-          f"{l_sure:.2e} vs {l_unsure:.3f} khi đoán bừa")
-    tgt_ign = tgt.clone()
-    tgt_ign[:, :7] = -1
-    check("nhãn < 0 bị bỏ qua",
-          float(focal_loss(logits, tgt_ign, a)) > 0)
+    # ── gập nhãn: khớp theo TÊN, không theo vị trí ──────────────────────────
+    r = aspect_roles(NAMES)
+    check("aspect_roles đọc đúng 4 vai", r == {"blank": 0, "positive": 1,
+                                               "negative": 2, "uncertain": 3},
+          str(r))
+    shuffled = ["uncertain", "NEGATIVE", "blank", "Positive"]
+    r2 = aspect_roles(shuffled)
+    check("đảo thứ tự tên -> vẫn đúng vai (không hardcode 0..3)",
+          r2 == {"uncertain": 0, "negative": 1, "blank": 2, "positive": 3},
+          str(r2))
+    for bad in (["a", "b", "c", "d"], ["Blank", "Positive", "Negative"],
+                ["Blank", "Blank", "Negative", "Uncertain"]):
+        try:
+            aspect_roles(bad)
+            check(f"class_names lạ {bad} -> phải nổ", False)
+        except ValueError:
+            check(f"class_names lạ ({bad[0]}...) -> nổ ValueError", True)
+
+    tgt_lut, valid_lut = binary_target_table(NAMES, 0.7)
+    got = [float(tgt_lut[r[k]]) for k in ("positive", "negative", "uncertain")]
+    check("positive=1.0  negative=0.0  uncertain=0.7",
+          all(abs(a - b) < 1e-6 for a, b in zip(got, [1.0, 0.0, 0.7])),
+          str([round(v, 3) for v in got]))
+    check("blank là ô DUY NHẤT bị MASK",
+          [bool(v) for v in valid_lut] == [False, True, True, True],
+          str(valid_lut.tolist()))
+
+    y = torch.tensor([[0, 1, 2, 3, -1]])          # blank, pos, neg, unc, thiếu
+    t, m = to_binary(y, (tgt_lut, valid_lut))
+    check("to_binary: target = [_, 1, 0, .7, _]",
+          [round(float(v), 3) for v in t[0][1:4]] == [1.0, 0.0, 0.7])
+    check("to_binary: mask bỏ cả blank LẪN nhãn thiếu (y < 0)",
+          [bool(v) for v in m[0]] == [False, True, True, True, False],
+          str(m[0].tolist()))
+
+    # ── mask thật sự cắt gradient, và mẫu số là số ô CÓ NHÃN ───────────────
+    torch.manual_seed(0)
+    B, D = 8, 14
+    logits = torch.randn(B, D, requires_grad=True)
+    target = torch.zeros(B, D)
+    target[:, :3] = 1.0
+    mask = torch.ones(B, D, dtype=torch.bool)
+    mask[:, 7:] = False                            # 7 ô cuối = blank
+    l1 = asl_loss(logits, target, mask)
+    l1.backward()
+    g = logits.grad.clone()
+    check("ô bị MASK không nhận gradient",
+          float(g[:, 7:].abs().sum()) == 0.0,
+          f"Σ|grad| ô mask = {float(g[:, 7:].abs().sum()):.3e}")
+    check("ô có nhãn thì có gradient", float(g[:, :7].abs().sum()) > 0)
+
+    lg2 = logits.detach().clone()
+    lg2[:, 7:] += 100.0                            # đổi hẳn phần bị mask
+    check("đổi logit ở ô MASK -> loss KHÔNG đổi",
+          abs(float(asl_loss(lg2, target, mask)) - float(l1)) < 1e-6)
+
+    half = torch.zeros(B, D, dtype=torch.bool)
+    half[:, :7] = True
+    check("mẫu số = số ô có nhãn (không phải B×14)",
+          abs(float(asl_loss(logits.detach(), target, half)) - float(l1)) < 1e-9)
+
+    # ── ngưỡng âm tính: dưới m thì hết gradient HẲN, không phải nhỏ dần ────
+    CLIP = 0.02
+    p_under = torch.tensor([[0.005]])              # âm, đã dưới ngưỡng
+    lo = torch.log(p_under / (1 - p_under)).requires_grad_(True)
+    t0 = torch.zeros(1, 1)
+    m1 = torch.ones(1, 1, dtype=torch.bool)
+    loss_under = asl_loss(lo, t0, m1, clip=CLIP)
+    loss_under.backward()
+    check("ô âm với p < m: loss = 0 và gradient = 0 (ngưỡng âm tính)",
+          float(loss_under) == 0.0 and float(lo.grad.abs().sum()) == 0.0,
+          f"loss={float(loss_under):.3e}")
+    p_over = torch.tensor([[0.10]])                # âm, còn trên ngưỡng
+    lo2 = torch.log(p_over / (1 - p_over)).requires_grad_(True)
+    l_over = asl_loss(lo2, t0, m1, clip=CLIP)
+    l_over.backward()
+    check("ô âm với p > m: vẫn còn loss và gradient",
+          float(l_over) > 0 and float(lo2.grad.abs().sum()) > 0)
+    check("m = 0 (tắt ngưỡng) thì ô p<m kia lại có loss",
+          float(asl_loss(lo.detach(), t0, m1, clip=0.0)) > 0)
+
+    # ── bất đối xứng: γ⁻ dập ô âm dễ, γ⁺ = 0 giữ nguyên ô dương dễ ─────────
+    def one(p, y, **kw):
+        lg = torch.log(torch.tensor([[p]]) / (1 - torch.tensor([[p]])))
+        return float(asl_loss(lg, torch.tensor([[y]]), m1, **kw))
+
+    import math
+    easy_pos = one(0.9, 1.0)
+    check("γ⁺ = 0 -> ô dương dễ vẫn là BCE nguyên vẹn (không bị dập)",
+          abs(easy_pos + math.log(0.9)) < 1e-5, f"{easy_pos:.5f} vs "
+          f"{-math.log(0.9):.5f}")
+    easy_neg_bce = -math.log(1 - 0.10 + CLIP)
+    easy_neg = one(0.10, 0.0)
+    check("γ⁻ = 4 -> ô âm dễ bị dập mạnh so với BCE",
+          easy_neg < easy_neg_bce * 0.05,
+          f"asl={easy_neg:.5f} vs bce={easy_neg_bce:.5f}")
+    check("cùng mức 'dễ' như nhau: ô dương giữ trọng số lớn hơn ô âm rất nhiều",
+          one(0.9, 1.0) > one(0.1, 0.0) * 50)
+    # Ô đoán SAI phải nặng hơn ô đoán đúng cùng phía vài bậc — đó là điều
+    # kiện để γ⁻ = 4 không biến thành "bỏ qua luôn nhánh âm".
+    check("đoán sai bị phạt nặng hơn đoán đúng hàng chục lần, cả hai phía",
+          one(0.02, 1.0) > 20 * one(0.9, 1.0)
+          and one(0.98, 0.0) > 20 * one(0.1, 0.0),
+          f"pos: {one(0.02, 1.0):.2f} vs {one(0.9, 1.0):.4f} | "
+          f"neg: {one(0.98, 0.0):.2f} vs {one(0.1, 0.0):.5f}")
+
+    # ── soft label 0.7: cả hai nhánh cùng sống, cực tiểu BÁM nhãn đã khai ──
+    # Đây là chỗ bản này cố tình khác code gốc của ASL: gốc gộp hai nhánh vào
+    # một trọng số (1−pt)^γ, và với y=0.7 thì cực tiểu trôi lên ~0.9 — tức
+    # con số viết trong config không phải con số model học. Tính trọng số
+    # riêng từng nhánh (đúng công thức (5) của bài báo) kéo nó về ~0.75.
+    grid = [i / 200 for i in range(1, 200)]
+    arg = min(grid, key=lambda p: one(p, 0.7))
+    check("uncertain (y=0.7): cực tiểu nằm trong [0.70, 0.80], không trôi lên 0.9",
+          0.70 <= arg <= 0.80, f"argmin = {arg:.3f}")
+    losses = {p: one(p, 0.7) for p in (0.3, 0.5, 0.7, 0.9)}
+    check("uncertain nghiêng về DƯƠNG: p=0.9 rẻ hơn p=0.3",
+          losses[0.9] < losses[0.3],
+          f"p0.9={losses[0.9]:.4f} p0.3={losses[0.3]:.4f}")
+    check("y=1.0 thì cực tiểu ở p -> 1 (soft label không rò sang nhãn cứng)",
+          min(grid, key=lambda p: one(p, 1.0)) > 0.98)
+
+    # ── khớp bản gốc Ridnik từng con số ────────────────────────────────────
+    def ref(logits, y, gp=0.0, gn=4.0, clip=0.02, eps=1e-8):
+        p = torch.sigmoid(logits)
+        xs_neg = (1 - p + clip).clamp(max=1)
+        lp = y * torch.log(p.clamp(min=eps))
+        ln = (1 - y) * torch.log(xs_neg.clamp(min=eps))
+        pt = p * y + xs_neg * (1 - y)
+        w = torch.pow(1 - pt, gp * y + gn * (1 - y))
+        return -((lp + ln) * w)
+
+    lg = torch.randn(5, 14)
+    yy = torch.randint(0, 2, (5, 14)).float()
+    mine = float(asl_loss(lg, yy, torch.ones(5, 14, dtype=torch.bool)))
+    theirs = float(ref(lg, yy).mean())
+    # Với nhãn CỨNG hai cách viết phải cho ra con số hệt nhau — một nhánh
+    # luôn tắt nên không có chỗ nào để lệch. Chỉ soft label mới tách chúng ra.
+    check("nhãn cứng: khớp ĐÚNG code AsymmetricLoss bản gốc",
+          abs(mine - theirs) < 1e-6, f"{mine:.6f} vs {theirs:.6f}")
+    soft = torch.full((5, 14), 0.7)
+    check("soft label: cố tình KHÁC code gốc (gốc dập nhánh âm thêm lần nữa)",
+          abs(float(asl_loss(lg, soft, torch.ones(5, 14, dtype=torch.bool)))
+              - float(ref(lg, soft).mean())) > 1e-3)
+
+    # ── supervised_stats: recall là con số headline ────────────────────────
+    lg = torch.tensor([[5.0, -5.0, 5.0, -5.0]])
+    tg = torch.tensor([[1.0, 0.0, 0.0, 1.0]])
+    mk = torch.ones(1, 4, dtype=torch.bool)
+    st = supervised_stats(lg, tg, mk)
+    check("supervised_stats: acc/recall/precision đúng",
+          st["sup_acc"] == 0.5 and st["sup_recall"] == 0.5
+          and st["sup_precision"] == 0.5, str(st))
+    st2 = supervised_stats(lg, tg, torch.tensor([[True, True, False, False]]))
+    check("supervised_stats chỉ đếm ô có nhãn",
+          st2["sup_n_valid"] == 2 and st2["sup_acc"] == 1.0, str(st2))
 
 
 class _FakeOpt:
@@ -232,25 +372,28 @@ class _FakeOpt:
 
 
 def test_schedule():
-    print("\n[6] lịch LR cosine warm restarts (đếm bằng MẪU)")
-    TOTAL, CYC, WARM = 19200, 6400, 640
-    s = CosineRestartSchedule(_FakeOpt([3e-4, 1e-4]), total_samples=TOTAL,
-                              cycle_samples=CYC, warmup_samples=WARM)
-    check("3 cycle, biên ở [6400, 12800, 19200]",
-          s.n_cycles == 3 and s.bounds() == [6400, 12800, 19200],
-          str(s.bounds()))
+    print("\n[6] lịch LR cosine warm restarts VÔ HẠN (đếm bằng MẪU)")
+    CYC, WARM = 6400, 640
+    s = CosineRestartSchedule(_FakeOpt([3e-4, 1e-4]), cycle_samples=CYC,
+                              warmup_samples=WARM)
+    check("biên 5 cycle đầu ở [6400 .. 32000]",
+          s.bounds(5) == [6400, 12800, 19200, 25600, 32000], str(s.bounds(5)))
     check("warmup: 0 -> nửa -> đỉnh",
           s.multiplier(0) == 0.0 and abs(s.multiplier(WARM // 2) - .5) < 1e-12
           and abs(s.multiplier(WARM) - 1.0) < 1e-12)
     check("restart bật lại ĐÚNG đỉnh ở mọi biên",
-          all(abs(s.multiplier(b) - 1.0) < 1e-12 for b in (6400, 12800)))
-    check("chạm đáy đúng cuối phase", abs(s.multiplier(TOTAL)) < 1e-12)
+          all(abs(s.multiplier(b) - 1.0) < 1e-12
+              for b in (6400, 12800, 64000, 640000)))
+    check("chạm đáy ở cuối MỖI cycle",
+          all(abs(s.multiplier(b - 1e-9)) < 1e-9
+              for b in (6400, 12800, 64000)))
     check("giữa cycle = nửa đỉnh (cosine)",
           abs(s.multiplier(6400 + CYC // 2) - .5) < 1e-12)
+    check("lịch không có đích: cycle thứ 1000 vẫn đúng hình dạng",
+          abs(s.multiplier(1000 * CYC + CYC // 2) - .5) < 1e-12)
 
     o = _FakeOpt([3e-4, 1e-4])
-    s2 = CosineRestartSchedule(o, total_samples=TOTAL, cycle_samples=CYC,
-                               warmup_samples=WARM)
+    s2 = CosineRestartSchedule(o, cycle_samples=CYC, warmup_samples=WARM)
     s2.set_samples(6400 + CYC // 2)
     check("hai param group cùng nhân một hệ số",
           abs(o.param_groups[0]["lr"] - 1.5e-4) < 1e-12
@@ -258,46 +401,47 @@ def test_schedule():
           str([g["lr"] for g in o.param_groups]))
 
     # ĐÂY là lý do cycle đếm bằng mẫu chứ không bằng step.
+    RUN = 19200
     curves, snaps = [], []
     for eff in (8, 32, 64):
-        sc = CosineRestartSchedule(_FakeOpt([3e-4]), total_samples=TOTAL,
-                                   cycle_samples=CYC, warmup_samples=WARM)
+        sc = CosineRestartSchedule(_FakeOpt([3e-4]), cycle_samples=CYC,
+                                   warmup_samples=WARM)
         marks, n = [], 0
-        while n < TOTAL:
+        while n < RUN:
             st = n
             n += eff
             if sc.cycle_index(n) > sc.cycle_index(st):
                 marks.append(n)
         curves.append([round(sc.multiplier(x), 9)
-                       for x in range(0, TOTAL + 1, 64)])
+                       for x in range(0, RUN + 1, 64)])
         snaps.append(marks)
     check("đổi effective batch (8/32/64) KHÔNG đổi đường LR",
           curves[0] == curves[1] == curves[2])
     check("đổi effective batch KHÔNG đổi biên cycle",
-          snaps[0] == snaps[1] == snaps[2] == [6400, 12800], str(snaps))
+          snaps[0] == snaps[1] == snaps[2] == [6400, 12800, 19200], str(snaps))
 
-    s3 = CosineRestartSchedule(_FakeOpt([1.0]), total_samples=15000,
-                               cycle_samples=6400, warmup_samples=640)
-    check("đuôi lẻ (2200 mẫu) vẫn anneal TRỌN xuống đáy",
-          s3.bounds() == [6400, 12800, 15000]
-          and abs(s3.multiplier(15000)) < 1e-12, str(s3.bounds()))
-
-    a = CosineRestartSchedule(_FakeOpt([3e-4]), total_samples=TOTAL,
-                              cycle_samples=CYC, warmup_samples=WARM)
-    for x in range(0, TOTAL, 64):
+    a = CosineRestartSchedule(_FakeOpt([3e-4]), cycle_samples=CYC,
+                              warmup_samples=WARM)
+    for x in range(0, RUN, 64):
         a.set_samples(x)
-    b = CosineRestartSchedule(_FakeOpt([3e-4]), total_samples=TOTAL,
-                              cycle_samples=CYC, warmup_samples=WARM)
-    b.set_samples(TOTAL - 64)
+    b = CosineRestartSchedule(_FakeOpt([3e-4]), cycle_samples=CYC,
+                              warmup_samples=WARM)
+    b.set_samples(RUN - 64)
     check("resume = dựng lại từ số mẫu (không cần scheduler state)",
           a.get_last_lr() == b.get_last_lr())
 
     try:
-        CosineRestartSchedule(_FakeOpt([1.0]), total_samples=TOTAL,
-                              cycle_samples=500, warmup_samples=640)
+        CosineRestartSchedule(_FakeOpt([1.0]), cycle_samples=500,
+                              warmup_samples=640)
         check("warmup nuốt trọn cycle -> phải nổ", False)
     except ValueError:
         check("warmup nuốt trọn cycle -> nổ ValueError", True)
+    try:
+        CosineRestartSchedule(_FakeOpt([1.0]), cycle_samples=0)
+        check("cycle_samples=0 -> phải nổ", False)
+    except ValueError:
+        check("cycle_samples=0 -> nổ ValueError (không còn tổng để suy ra)",
+              True)
 
 
 def test_swa():
@@ -345,65 +489,93 @@ def test_swa():
         check("shape đổi giữa hai snapshot -> nổ RuntimeError", True)
 
 
-def test_freeze():
-    """[8] freeze Phase 2: đóng đúng chỗ, chừa đúng chỗ, mở lại được."""
-    print("\n[8] freeze Phase 2 (sup_head + n layer đầu trunk)")
+def test_bias():
+    """[8] cân bằng tải aux-free: bias chỉ chạm vào việc CHỌN expert."""
+    print("\n[8] cân bằng tải bằng bias (không aux loss)")
+    torch.manual_seed(0)
+    B, N, E, K = 32, 16, 12, 4
+    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+    net = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=0.0,
+                    bias_gamma=0.05)
 
-    def groups(net, want_grad):
-        return sorted({n.split(".")[0] +
-                       ("." + n.split(".")[1] if n.startswith("blocks") else "")
-                       for n, p in net.named_parameters()
-                       if p.requires_grad is want_grad})
+    check("expert_bias nằm trong state_dict (đi theo checkpoint)",
+          "expert_bias" in net.state_dict())
+    check("bộ đếm tải KHÔNG nằm trong state_dict (rác giữa hai step)",
+          "load_count" not in net.state_dict()
+          and "load_tokens" not in net.state_dict())
 
-    net = RouterNet(VARIANT, 4, 4, 2)
-    n_full = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    # (1) bias KHÔNG được đổi GIÁ TRỊ gate khi tập expert được chọn không đổi.
+    net.eval()
+    with torch.no_grad():
+        g0 = net(x, mask)[1]
+    with torch.no_grad():
+        net.expert_bias.add_(torch.zeros(E))     # bias = 0, không đổi gì
+        g0b = net(x, mask)[1]
+    check("bias = 0 -> gate y nguyên", torch.equal(g0, g0b))
 
-    info = net.set_freeze(4, True)
-    check("freeze(4) = stem + 3 block đầu + sup_head",
-          groups(net, False) == ["blocks.0", "blocks.1", "blocks.2",
-                                 "stem", "sup_head"],
-          str(groups(net, False)))
-    check("chừa lại block cuối + separation + route_head",
-          groups(net, True) == ["blocks.3", "route_head", "separation"],
-          str(groups(net, True)))
-    check("đếm param khớp", info["n_frozen_param"] + info["n_trainable_param"]
-          == n_full, f"{info['n_frozen_param']:,} + "
-                     f"{info['n_trainable_param']:,} = {n_full:,}")
+    # (2) cập nhật đúng CHIỀU: expert quá tải bị hạ, expert đói được nâng.
+    net.train()
+    with torch.no_grad():
+        net.load_count.zero_()
+        net.load_tokens.zero_()
+        net.load_count[0] = 100.0            # expert 0 ôm hết
+        net.load_tokens += 100.0
+    span, cv = net.update_bias()
+    check("expert quá tải -> bias giảm", float(net.expert_bias[0]) < 0,
+          f"b[0]={float(net.expert_bias[0]):+.4f}")
+    check("expert đói -> bias tăng", float(net.expert_bias[1]) > 0)
+    check("trung bình bias ghim về 0 (chỉ HIỆU mới có nghĩa)",
+          abs(float(net.expert_bias.mean())) < 1e-6)
+    check("update_bias trả (span, CV tải)", span > 0 and cv > 0,
+          f"span={span:.4f} cv={cv:.3f}")
+    check("bộ đếm được xoá sau khi cập nhật",
+          float(net.load_tokens) == 0.0 and float(net.load_count.sum()) == 0.0)
+    check("gọi lại khi chưa đếm gì -> None (không nắn bias bằng số rác)",
+          net.update_bias() is None)
 
-    # Gradient: phần đóng băng KHÔNG được có .grad, phần còn lại PHẢI có.
-    sup, gate, aux, _ = net(torch.randn(2, 16, 2560), torch.ones(2, 16))
-    (sup.pow(2).mean() + gate.sum() + aux).backward()
-    check("phần đóng băng không nhận gradient",
-          all(p.grad is None for n, p in net.named_parameters()
-              if not p.requires_grad))
-    check("phần còn lại nhận gradient (gate vẫn nối về route_head)",
-          all(p.grad is not None for n, p in net.named_parameters()
-              if p.requires_grad))
+    # (3) bias ĐỔI ĐƯỢC lựa chọn: đủ lớn thì expert bị phạt phải rời top-k.
+    net.eval()
+    with torch.no_grad():
+        base = net(x, mask)[1]
+        hot = int((base > 0).float().sum(dim=0).argmax())
+        net.expert_bias.zero_()
+        net.expert_bias[hot] = -50.0
+        after = net(x, mask)[1]
+    check("bias rất âm -> expert đó bị đẩy khỏi top-k",
+          float((after[:, hot] > 0).sum()) == 0
+          and float((base[:, hot] > 0).sum()) > 0)
+    check("bị đẩy ra rồi thì Σ gate vẫn = 1 (chuẩn hoá lại trong top-k)",
+          torch.allclose(after.sum(-1), torch.ones(B), atol=1e-5))
 
-    # Mở lại: set_freeze phải là hàm THUẦN của tham số, không tích trạng thái.
-    net.set_freeze(0, False)
-    check("set_freeze(0, False) mở lại trọn nhánh",
-          sum(p.numel() for p in net.parameters() if p.requires_grad) == n_full)
+    # (4) eval KHÔNG được đếm tải — nếu không thì val cũng nắn bias.
+    with torch.no_grad():
+        net.expert_bias.zero_()
+        net.load_count.zero_()
+        net.load_tokens.zero_()
+        net.eval()
+        net(x, mask)
+    check("eval mode -> không đếm tải, không nắn bias",
+          float(net.load_tokens) == 0.0)
 
-    # Trunk ngắn hơn số xin: cắt xuống, luôn chừa ≥1 block train được.
-    small = RouterNet(VARIANT, 1, 4, 2)
-    info = small.set_freeze(4, True)
-    check("n_block=1: xin 4 -> cắt còn 1 (chỉ stem)",
-          info["clamped"] == 1 and info["frozen"] == ["stem", "sup_head"],
-          f"asked={info['asked']} clamped={info['clamped']}")
-    check("n_block=1: block duy nhất VẪN train được",
-          "blocks.0" in groups(small, True), str(groups(small, True)))
+    # (5) γ = 0 -> tắt hẳn.
+    off = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=0.0)
+    off.train()
+    with torch.no_grad():
+        off(x, mask)
+    check("bias_gamma=0 -> không đếm, không cập nhật",
+          float(off.load_tokens) == 0.0 and off.update_bias() is None)
 
-    # Tắt hẳn = không đóng băng gì.
-    off = RouterNet(VARIANT, 2, 4, 2)
-    info = off.set_freeze(0, False)
-    check("p2_freeze_trunk=0 + sup_head=false -> không đóng băng gì",
-          info["frozen"] == [] and info["n_frozen_param"] == 0)
+    # (6) bias sống sót qua load_state_dict (đây là chỗ nó vào checkpoint).
+    heir = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=0.05)
+    net.expert_bias[:] = torch.arange(E, dtype=torch.float32) - (E - 1) / 2
+    heir.load_state_dict(net.state_dict())
+    check("bias đi theo state_dict qua bàn giao máy",
+          torch.equal(heir.expert_bias, net.expert_bias))
 
 
 def test_probe():
-    """[10] Phase 3: force_gate + các phép tính thuần của probe."""
-    print("\n[10] probe chuyên môn expert (Phase 3)")
+    """[10] mode=probe: force_gate + các phép tính thuần của probe."""
+    print("\n[10] probe chuyên môn expert (mode=probe)")
     import json
     import tempfile
 
@@ -528,10 +700,10 @@ if __name__ == "__main__":
         FAIL.append("bảng tham số")
     test_router()
     test_moe_math()
-    test_focal()
+    test_asl()
     test_schedule()
     test_swa()
-    test_freeze()
+    test_bias()
     test_route_noise()
     test_probe()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))

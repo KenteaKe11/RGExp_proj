@@ -11,7 +11,7 @@
                                     ▼                                     │
                             Gemma decoder ◄── expert QDoRA trộn theo gate ─┘
                                     │
-                                  CE loss
+                        CE + w_sup·ASL (một phase multi-task)
 
 Chỗ móc nối là một `forward_pre_hook` đặt trên KHỐI DECODER TEXT. Vì sao chọn
 chỗ này chứ không tự dựng inputs_embeds:
@@ -88,7 +88,7 @@ def find_image_token_id(processor):
 
 # ══════════════════════ móc router vào giữa encoder/decoder ══════════════════
 class StopAfterRouter(Exception):
-    """Tín hiệu dừng forward ngay trước decoder (Phase 1 không cần decoder)."""
+    """Tín hiệu dừng forward ngay trước decoder (chế độ "capture")."""
 
 
 class RouterBridge:
@@ -96,8 +96,10 @@ class RouterBridge:
 
     Ba chế độ:
       "off"     bỏ qua hoàn toàn — decoder chạy như base 4-bit thuần.
-      "capture" lấy [N, 2560] rồi NÉM StopAfterRouter: dùng ở Phase 1, tiết
-                kiệm toàn bộ phần decoder (chiếm >90% thời gian một step).
+      "capture" lấy [N, 2560] rồi NÉM StopAfterRouter, bỏ qua toàn bộ
+                decoder. Lịch train multi-task KHÔNG dùng chế độ này (mọi
+                step đều chạy decoder); nó còn lại cho `encode_only`, dùng
+                khi cần đúng thứ decoder sẽ nhận mà không muốn chạy decoder.
       "route"   chạy router, đặt gate, để forward chảy tiếp vào decoder.
     """
 
@@ -107,8 +109,8 @@ class RouterBridge:
         self.mode = "off"
         self.mask = None          # [B, N] 1 = prompt/ảnh, 0 = target/padding
         self.hidden = None        # chỉ dùng ở chế độ "capture"
-        self.out = None           # (sup_logits, gate, aux, stats) ở "route"
-        # Ép gate đi vào MoE (chỉ Phase 3 / src/probe.py dùng). `self.out` vẫn
+        self.out = None           # (sup_logits, gate, stats) ở "route"
+        # Ép gate đi vào MoE (chỉ mode=probe / src/probe.py dùng). `self.out` vẫn
         # giữ gate THẬT router tính ra — ép cái đi vào expert, không ép cái
         # router nghĩ — nên một forward vừa bật được đúng một expert vừa cho
         # biết router đã chọn những expert nào.
@@ -165,8 +167,10 @@ class RouterBridge:
                 f"router_mask dài {mask.shape[1]} nhưng chuỗi dài "
                 f"{hidden.shape[1]} — quên cắt mask khi cắt chuỗi?")
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            sup_logits, gate, aux, stats = self.router(hidden, mask)
-        self.out = (sup_logits.float(), gate, aux, stats)
+            sup_logits, gate, stats = self.router(hidden, mask)
+        # 3 phần tử, KHÔNG còn aux: cân bằng tải do bias của router lo, nằm
+        # ngoài loss (xem src/router.py::RouterNet.update_bias).
+        self.out = (sup_logits.float(), gate, stats)
         if self.force_gate is not None:
             if self.force_gate.shape != gate.shape:
                 raise RuntimeError(
@@ -212,7 +216,7 @@ def find_text_decoder(model, log=None):
 def encode_only(model, bridge, batch):
     """Chạy embed + vision tower rồi DỪNG, trả [B, N, 2560].
 
-    Dùng ở Phase 1 và ở STAGE 0. Cắt bằng exception nghe thô, nhưng nó cho
+    Cắt bằng exception nghe thô, nhưng nó cho
     đúng thứ decoder sẽ nhận mà không phải chép lại logic ghép ảnh của
     transformers — chép lại là chỗ lệch âm thầm giữa các bản.
     """
@@ -256,7 +260,7 @@ def build_model(cfg, hf_token, log):
                    f"{shown}")
     tokenizer = processor.tokenizer
 
-    # QDoRA: base LUÔN 4-bit ở Phase này (run.quant khoá cứng trong config).
+    # QDoRA: base LUÔN 4-bit (run.quant khoá cứng trong config).
     quant_cfg = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type=f.quant_type,
         bnb_4bit_compute_dtype=f.compute_dtype,
@@ -339,10 +343,11 @@ def build_model(cfg, hf_token, log):
     if d_enc != f.d_enc:
         log("router", f"hidden_size thật = {d_enc} (config ghi {f.d_enc}) "
                       f"— dùng giá trị thật")
-    route_noise = float(getattr(f, "route_noise", 0.0) or 0.0)
+    route_noise = float(getattr(f, "route_noise", 1.0) or 0.0)
+    bias_gamma = float(getattr(f, "bias_gamma", 1e-3) or 0.0)
     router = RouterNet(cfg.sweep.variant, cfg.sweep.n_block, f.n_expert,
-                       f.top_k, d_enc=d_enc,
-                       route_noise=route_noise).to("cuda", f.trainable_dtype)
+                       f.top_k, d_enc=d_enc, route_noise=route_noise,
+                       bias_gamma=bias_gamma).to("cuda", f.trainable_dtype)
     bridge = RouterBridge(router, log)
     bridge.attach(find_text_decoder(model, log))
 
@@ -352,6 +357,9 @@ def build_model(cfg, hf_token, log):
     log("router", f"    route_noise σ={route_noise:g} "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
                      else "— TẮT, top-k tất định"))
+    log("router", f"    bias_gamma γ={bias_gamma:g} "
+                  + ("(cân bằng tải aux-free, cập nhật mỗi optimizer step)"
+                     if bias_gamma > 0 else "— TẮT, không có gì cân bằng tải"))
     for k, v in router.param_table().items():
         if not k.startswith("_"):
             log("router", f"    {k:<28} {v:>12,}")

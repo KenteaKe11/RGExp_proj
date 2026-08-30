@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# sweep.sh — chạy tuần tự 4 ô Phase 1 (Recombinator g-brmf, n_block 1→4),
+# sweep.sh — chạy tuần tự các ô sweep (Recombinator g-brmf × n_block),
 #            mỗi ô thu FULL metrics test + gen_text
 #
-#   bash scripts/sweep.sh                     # CHẠY THẬT, n=1 rồi 2, 3, 4
-#   bash scripts/sweep.sh --set run.dry_run=true      # chỉ kiểm cấu hình
-#   SWEEP_CELLS="g-brmf:1 g-brmf:3" bash scripts/sweep.sh   # chỉ vài ô
-#   SWEEP_MODE=train bash scripts/sweep.sh                 # tách khâu test
+#   SWEEP_MODE=test bash scripts/sweep.sh                  # CHẤM mọi ô đã train
+#   SWEEP_CELLS="g-brmf:1 g-brmf:3" bash scripts/sweep.sh  # chỉ vài ô
+#   bash scripts/sweep.sh --set run.dry_run=true           # chỉ kiểm cấu hình
 #   SWEEP_FORCE=1 bash scripts/sweep.sh                    # chạy lại ô đã xong
 #
-# Mặc định --mode both: mỗi ô train xong chạy luôn infer + metrics, nên
-# outputs/<tag>/ có đủ reports.csv và metrics.json để so sánh. Đặt
-# SWEEP_MODE=train nếu muốn tách khâu test sang session khác.
+# ⚠ LỊCH TRAIN KHÔNG CÓ ĐÍCH. Từ khi gộp một phase multi-task, `--mode train`
+# (và `both`) chạy tới khi bị dừng tay — nên sweep với mode đó sẽ ĐỨNG LẠI ở
+# ô đầu tiên cho tới khi bạn Ctrl-C. Cách dùng đúng bây giờ:
+#     1. train từng ô một, mỗi ô một phiên (run_local.sh --mode train);
+#     2. rồi SWEEP_MODE=test bash scripts/sweep.sh để chấm cả bảng một lượt.
+# Trước khi chấm, đối chiếu `samples` trong ckpt/<tag>/last/train_state.json:
+# hai ô dừng ở hai chỗ khác nhau trong dữ liệu thì BLEU của chúng không so
+# được với nhau.
 #
 # Một ô hỏng KHÔNG dừng cả sweep — ghi vào bảng tổng kết rồi đi tiếp.
 # Cuối cùng tự gom kết quả bằng src.report.
@@ -37,11 +41,11 @@ MODELS="${SWEEP_MODEL:-gemma3}"
 N_TOTAL=0
 for m in $MODELS; do for c in $CELLS; do N_TOTAL=$((N_TOTAL+1)); done; done
 
-echo "═══ SWEEP PHASE 1 — Recombinator g-brmf × n_block (1→4) ═══"
+echo "═══ SWEEP — Recombinator g-brmf × n_block ═══"
 rgexp_banner
 echo "Model : $MODELS"
 echo "Ô     : $CELLS"
-echo "Tổng  : $N_TOTAL ô | mode=$MODE (both = train xong chạy luôn test)"
+echo "Tổng  : $N_TOTAL ô | mode=$MODE (train/both = chạy tới khi Ctrl-C)"
 echo "Args  : $*"
 echo
 

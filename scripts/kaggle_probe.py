@@ -1,5 +1,5 @@
 # ═════════════════════════════════════════════════════════════════════════════
-# RGExp — Phase 3: PROBE CHUYÊN MÔN EXPERT (chạy SONG SONG với phiên train)
+# RGExp — PROBE CHUYÊN MÔN EXPERT (chạy SONG SONG với phiên train)
 #
 # Dán TOÀN BỘ file này vào MỘT cell của một notebook Kaggle KHÁC với notebook
 # đang train, rồi Run.
@@ -11,10 +11,10 @@
 #      số cuối.
 #   2. Sinh báo cáo cho từng ảnh của TRỌN tập test (gate thật, đúng như
 #      mode=test) -> reports.csv + metrics.json như mọi ô sweep khác.
-#   3. Với mỗi ảnh, chạy thêm 1 forward nền (không expert) + 6 forward bật
-#      lần lượt TỪNG expert trong top-6, rồi ghi lại: bản đồ không gian
+#   3. Với mỗi ảnh, chạy thêm 1 forward nền (không expert) + 4 forward bật
+#      lần lượt TỪNG expert trong top-4, rồi ghi lại: bản đồ không gian
 #      16×16, vector 14 bệnh + 4 aspect, top-10 token unembedding.
-#   4. Xong 6 expert của một ảnh là ghi ngay một bản ghi JSON (key_id =
+#   4. Xong 4 expert của một ảnh là ghi ngay một bản ghi JSON (key_id =
 #      img_rel) và CommitScheduler đẩy lên dataset repo <hub_repo>-probe.
 #
 # ── Vì sao chạy song song được, và song song với cái gì ─────────────────────
@@ -22,14 +22,14 @@
 # push eval của train, không đụng vào cùng đường dẫn nào trên repo model —
 # bản ghi probe nằm ở một repo dataset riêng. Nên hai phiên không giẫm nhau.
 #
-# Hệ quả cần biết: mỗi lần chạy lại, script lấy bản MỚI NHẤT trên Hub. Chạy
-# probe khi train mới xong Phase 1 thì đo được một model chưa học xong — số
-# vẫn hợp lệ nhưng là ảnh chụp của thời điểm đó. Bản ghi có `train_samples` và
-# `swa_n` để biết nó chụp lúc nào; muốn ảnh cuối cùng thì đợi train xong.
+# Hệ quả cần biết: mỗi lần chạy lại, script lấy bản MỚI NHẤT trên Hub. Lịch
+# train không có đích nên KHÔNG có "đợi train xong" — mọi bản probe đều là một
+# ảnh chụp của một thời điểm. Bản ghi có `train_samples`, `train_epoch` và
+# `swa_n` để biết nó chụp lúc nào; muốn so hai lần probe thì so ba số đó.
 #
 # ── Chạy lại được, và vì sao đó là điều kiện sống còn ────────────────────────
-# Phiên Kaggle tối đa ~12h. Trọn test là 3000 ảnh × (1 lần generate + 7
-# forward), P100 rơi vào cỡ 15-25 giây/ảnh -> 12-20h, tức 2 phiên. Lúc khởi
+# Phiên Kaggle tối đa ~12h. Trọn test là 3000 ảnh × (1 lần generate + 5
+# forward), P100 rơi vào cỡ 12-20 giây/ảnh -> 10-17h, tức 2 phiên. Lúc khởi
 # động, script đọc danh sách file đã có trên dataset repo và BỎ QUA những ảnh
 # đó, nên phiên sau chạy tiếp chứ không làm lại. reports.csv cũng được dựng
 # lại từ chính các bản ghi cũ (báo cáo sinh ra nằm sẵn trong đó) — không phải
@@ -67,7 +67,7 @@ try:
 except ImportError:
     pass
 assert os.environ.get("HF_TOKEN"), (
-    "Thiếu HF_TOKEN. Phase 3 vừa ĐỌC checkpoint trên Hub vừa GHI bản ghi probe "
+    "Thiếu HF_TOKEN. Probe vừa ĐỌC checkpoint trên Hub vừa GHI bản ghi probe "
     "lên dataset repo, nên token phải có quyền write.")
 
 # ── 2. Thư viện ──────────────────────────────────────────────────────────────
@@ -98,10 +98,9 @@ cfg["run"]["probe_n_images"] = N_IMAGES
 if PROBE_REPO:
     cfg["run"]["probe_repo"] = PROBE_REPO
 
-# Phase 3 KHÔNG train -> không ghi gì lên repo checkpoint. push_to_hub vẫn
+# Probe KHÔNG train -> không ghi gì lên repo checkpoint. push_to_hub vẫn
 # phải BẬT: nó là công tắc duy nhất cho phép đọc last/ về từ Hub.
 cfg["run"]["push_to_hub"] = True
-cfg["run"]["resume"] = True
 cfg["run"]["hub_sync"] = False      # không tranh chấp tiến độ với phiên train
 cfg["run"]["use_wandb"] = False
 cfg["run"]["infer_bs"] = 1          # mỗi ảnh một gate riêng, không batch được
@@ -172,13 +171,13 @@ print(f"\n═══ thoát mã {rc} | log: {WORK}/outputs/<tag>/logs/latest.log 
 #   import json, glob, numpy as np
 #   d = snapshot_download("<hub_repo>-probe", repo_type="dataset")
 #   recs = [json.load(open(p)) for p in glob.glob(f"{d}/records/*.json")]
-#   M = np.zeros((16, 14)); C = np.zeros(16)
+#   M = np.zeros((12, 14)); C = np.zeros(12)
 #   for rec in recs:
 #       for it in rec["experts"]:
 #           M[it["expert"]] += it["disease"]; C[it["expert"]] += 1
-#   M /= np.maximum(C, 1)[:, None]        # 16 expert × 14 bệnh
+#   M /= np.maximum(C, 1)[:, None]        # 12 expert × 14 bệnh
 #
-# Hàng nào của M cũng gần giống nhau = các expert KHÔNG phân hoá, top-6 chỉ là
-# 6 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự chia
+# Hàng nào của M cũng gần giống nhau = các expert KHÔNG phân hoá, top-4 chỉ là
+# 4 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự chia
 # việc, và cột nào nổi lên cho biết expert đó nhận phần nào của bài toán.
 # ═════════════════════════════════════════════════════════════════════════════

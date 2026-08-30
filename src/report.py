@@ -1,4 +1,4 @@
-"""Gom kết quả các ô sweep Phase 1 thành bảng so sánh.
+"""Gom kết quả các ô sweep thành bảng so sánh.
 
 Đọc outputs/<tag>/metrics.json và outputs/<tag>/reports.csv của mọi ô đã chạy,
 xuất ra:
@@ -23,7 +23,7 @@ import os
 import pandas as pd
 
 # Dải n_block của từng biến thể (khớp src/config.py SWEEP_BLOCKS).
-# Phase 1 chỉ còn một biến thể — bảng vì thế có đúng một hàng, nhưng giữ
+# Chỉ còn một biến thể Recombinator — bảng vì thế có đúng một hàng, nhưng giữ
 # nguyên cấu trúc dict/list để thêm biến thể sau chỉ là thêm một dòng.
 SWEEP_BLOCKS = {
     "g-brmf": (1, 2, 3, 4),
@@ -107,7 +107,7 @@ def _total_params(cell):
         return None
     meta = cell["metrics"].get("meta", {})
     return estimate_params(cell["variant"], cell["n_block"],
-                           int(meta.get("n_expert", 4)))["total"]
+                           int(meta.get("n_expert", 12)))["total"]
 
 
 # ─────────────────────────── metrics_table.md ────────────────────────────────
@@ -138,7 +138,7 @@ def build_metrics_table(cells, block=DEFAULT_BLOCK):
 # ─────────────────────────── param_curve.md ──────────────────────────────────
 def build_param_curve(cells, block=DEFAULT_BLOCK,
                       metrics=("corpus_bleu", "rougeL_f1", "bertscore_f1")):
-    """Metric theo TỔNG THAM SỐ — câu hỏi thật của Phase 1.
+    """Metric theo TỔNG THAM SỐ — câu hỏi thật của sweep.
 
     Bảng metrics_table so theo n_block; bảng này xếp mọi ô theo tổng tham số
     nên đọc thẳng được "thêm ~0.85M tham số một block thì điểm lên bao nhiêu,
@@ -348,7 +348,7 @@ def main(argv=None):
     print(f"✓ {p}  ({len(full)} hàng)")
 
     # 2. bảng biến thể × n_block
-    tbl = ("# Bảng sweep Phase 1 — Recombinator × n_block\n\n"
+    tbl = ("# Bảng sweep — Recombinator × n_block\n\n"
            f"Nguồn: `{args.out_dir}/*/metrics.json` | chấm trên `raw_output` "
            f"(policy tắt)\n"
            + build_metrics_table(cells, DEFAULT_BLOCK))

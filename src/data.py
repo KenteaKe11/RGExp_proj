@@ -313,16 +313,21 @@ def _label_index(npz_path):
 
 
 def label_names(npz_path):
-    """(14 tên bệnh, 4 tên aspect) — Phase 3 chiếu Δlogit lên đúng các tên này."""
+    """(14 tên bệnh, 4 tên aspect) — probe chiếu Δlogit lên đúng các tên này."""
     _, _, class_names, disease = _label_index(npz_path)
     return list(disease), list(class_names)
 
 
 def attach_labels(frame, npz_path, cfg, log, name=""):
-    """Gắn cột `y14` (14 chỉ số aspect 0..3) — đầu vào của Focal loss (§1.7a).
+    """Gắn cột `y14` (14 chỉ số aspect 0..3) — nhãn thô của nhánh supervised.
+
+    Giữ nguyên 4 aspect ở đây, KHÔNG gập sẵn về trục nhị phân: việc gập
+    (positive→1, negative→0, uncertain→0.7, blank→MASK) nằm gọn ở
+    src/losses.py::binary_target_table, nơi quy ước y tế đọc được một chỗ.
+    probe cũng cần 4 tên aspect nguyên bản.
 
     Dòng không tra được nhãn bị LOẠI, không phải gán 0: gán 0 là bịa ra "không
-    có bệnh" và Focal loss sẽ học chính chỗ bịa đó.
+    có bệnh" và loss sẽ học chính chỗ bịa đó.
     """
     key_col = cfg.data.image_column
     y_gt, index, _, _ = _label_index(npz_path)
@@ -339,12 +344,17 @@ def attach_labels(frame, npz_path, cfg, log, name=""):
 
 
 def cell_frequency(y, npz_path, log):
-    """Tần suất từng ô (bệnh, aspect) trong TRAIN — nguồn của α = 1/√f."""
+    """Tần suất từng ô (bệnh, aspect) trong TRAIN.
+
+    Không còn dùng để dựng bảng α (ASL không có α — γ⁻ lo phần mất cân bằng).
+    Vẫn cần cho `rare_first_order` và cho dòng log "còn bao nhiêu % ô có nhãn
+    sau khi MASK blank".
+    """
     _, _, class_names, disease = _label_index(npz_path)
     freq = np.stack([[(y[:, c] == a).mean() for a in range(4)]
                      for c in range(14)])
     log("label", f"aspect: {class_names}")
-    log("label", "5 ô hiếm nhất (α = 1/√f sẽ nặng nhất ở đây):")
+    log("label", "5 ô hiếm nhất (α sẽ nặng nhất ở đây):")
     flat = np.dstack(np.unravel_index(np.argsort(freq, axis=None),
                                       freq.shape))[0]
     for c, a in flat[:5]:
@@ -357,29 +367,24 @@ def rare_first_order(df_train, cell_freq, cfg, log):
     """§1.1 — xáo nhãn hiếm lên đầu tập train.
 
     Độ hiếm của mẫu = tần suất của ô (bệnh, aspect) hiếm nhất mà nó chứa. Mẫu
-    chứa ô hiếm nhất được xáo ngẫu nhiên rồi đẩy lên đầu, để hai phase (chỉ
-    dùng 5% + 5% đầu tập) gặp nhãn hiếm ngay chứ không phải chờ hết epoch.
+    chứa ô hiếm nhất được xáo ngẫu nhiên rồi đẩy lên đầu.
+
+    Vì sao vẫn giữ thứ tự này khi lịch train đã đi TRỌN tập train (không còn
+    lát 5% + 5% của bản hai phase): phiên train có thể bị cắt bất cứ lúc nào
+    (Kaggle 12h, máy thuê hết giờ, Ctrl-C). Rare-first bảo đảm những nhãn hiếm
+    — thứ mà một epoch xáo ngẫu nhiên sẽ rải đều tới tận cuối — đã được nhìn
+    thấy ngay trong vài giờ đầu, nên một checkpoint dừng giữa epoch 0 vẫn là
+    một checkpoint có ích.
+
+    Thứ tự này CỐ ĐỊNH theo seed và dùng lại y nguyên ở mọi epoch: con trỏ
+    tiến độ (số mẫu tích luỹ) mới suy ra được đúng vị trí trong tập train khi
+    resume, kể cả trên máy có batch khác.
     """
     y = np.stack(df_train["y14"].to_numpy())
     rarity = cell_freq[np.arange(14)[None, :], y].min(axis=1)
     rng = np.random.RandomState(cfg.fixed.seed)
     order = np.lexsort((rng.permutation(len(rarity)), rarity))  # tie ngẫu nhiên
     log("rare", f"rarity đầu={rarity[order[0]]*100:.3f}% "
-                f"cuối={rarity[order[-1]]*100:.3f}%")
+                f"cuối={rarity[order[-1]]*100:.3f}% | {len(order)} mẫu, thứ tự "
+                f"cố định theo seed {cfg.fixed.seed} và dùng lại mỗi epoch")
     return order
-
-
-def phase_slice(order, cfg, phase):
-    """§1.7 — Phase 1 lấy 5% đầu, Phase 2 lấy 5% KẾ TIẾP.
-
-    Hai phase KHÔNG được dùng chung mẫu: Phase 2 huấn luyện decoder trên chính
-    những mẫu mà nhánh supervised đã học thuộc thì val_loss của nó không còn
-    nói lên điều gì.
-    """
-    r = cfg.run
-    eff = r.train_bs * r.grad_accum
-    n1 = r.phase1_samples // eff * eff
-    n2 = r.phase2_samples // eff * eff
-    if n1 + n2 > len(order):
-        raise ValueError(f"cần {n1 + n2} mẫu train nhưng chỉ có {len(order)}")
-    return order[:n1] if phase == 1 else order[n1:n1 + n2]

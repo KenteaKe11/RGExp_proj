@@ -1,19 +1,19 @@
-"""Phase 3 — probe chuyên môn của từng expert (`run.mode = "probe"`).
+"""Probe chuyên môn của từng expert (`run.mode = "probe"`).
 
-Phase 1 và Phase 2 TRAIN. Phase 3 không train gì cả: nó lấy một checkpoint đã
-xong và hỏi một câu khác hẳn — **mỗi expert trong 16 cái kia thực ra đã học
-được cái gì?** Bảng sweep chỉ trả lời "kiến trúc nào cho BLEU cao hơn"; nó
-không nói expert 7 chuyên về tràn dịch màng phổi hay chỉ là một bản sao mờ của
-expert 3. Không trả lời được câu đó thì MoE chỉ là một cách tiêu tham số.
+Mode này KHÔNG train gì cả: nó lấy một checkpoint đã chạy và hỏi một câu khác
+hẳn — **mỗi expert trong 12 cái kia thực ra đã học được cái gì?** Bảng sweep
+chỉ trả lời "kiến trúc nào cho BLEU cao hơn"; nó không nói expert 7 chuyên về
+tràn dịch màng phổi hay chỉ là một bản sao mờ của expert 3. Không trả lời được
+câu đó thì MoE chỉ là một cách tiêu tham số.
 
-Với MỖI ảnh của tập test, Phase 3 làm ba việc:
+Với MỖI ảnh của tập test, probe làm ba việc:
 
   1. Sinh báo cáo MỘT lần với gate thật (đúng như `mode=test` vẫn làm) — đây
      là kết quả để chấm metrics, không dính gì tới probe.
   2. Một forward NỀN với gate = 0 (không expert nào chạy) — mốc để trừ.
-  3. Sáu forward nữa, mỗi lần bật ĐÚNG MỘT trong 6 expert mà router đã chọn,
-     với trọng số 1.0. Hiệu số so với nền chính là **dấu vân tay** của expert
-     đó trên đúng ảnh này.
+  3. K forward nữa (K = top_k = 4), mỗi lần bật ĐÚNG MỘT trong K expert mà
+     router đã chọn, với trọng số 1.0. Hiệu số so với nền chính là **dấu vân
+     tay** của expert đó trên đúng ảnh này.
 
 Ba thứ đọc ra từ mỗi dấu vân tay:
 
@@ -21,8 +21,8 @@ Ba thứ đọc ra từ mỗi dấu vân tay:
     patch của SigLIP. Chồng lên ảnh X-quang thì thấy expert đổi biểu diễn ở
     VÙNG NÀO của phổi.
   * **Vector 14 bệnh + vector 4 aspect** — Δlogit trên đúng những dòng
-    unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp 6
-    expert lại được ma trận 6×14 và 6×4: đây là "bảng chuyên môn" đọc được
+    unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp K
+    expert lại được ma trận K×14 và K×4: đây là "bảng chuyên môn" đọc được
     bằng mắt.
   * **Top-10 token unembedding** — 10 token mà expert đẩy logit lên mạnh nhất
     trên toàn vocab 262k. Không giới hạn trong danh sách bệnh, nên nó bắt được
@@ -299,7 +299,7 @@ def reports_from_records(local_dir, key_col):
 def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
               disease_names, aspect_names, img_token_id, hf_token,
               train_state, log, warn, event):
-    """Sinh báo cáo + probe 6 expert cho từng ảnh, đẩy lên Hub theo luồng.
+    """Sinh báo cáo + probe top-k expert cho từng ảnh, đẩy lên Hub theo luồng.
 
     Trả về DataFrame kiểu reports.csv (gồm cả những dòng dựng lại từ bản ghi
     cũ) để `src/train.py` chấm metrics như mọi mode khác.
@@ -331,7 +331,7 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
     empty = [disease_names[i] for i, g in enumerate(dis_ids) if not g]
     if empty:
         warn("probe", f"không tokenize được tên bệnh {empty} — cột tương ứng "
-                      f"trong ma trận 6×14 sẽ luôn = 0")
+                      f"trong ma trận K×14 sẽ luôn = 0")
     W = unembedding(model)                 # [V, D], Gemma buộc chung với embed
     log("probe", f"unembedding {tuple(W.shape)} | {len(disease_names)} bệnh × "
                  f"{len(aspect_names)} aspect | top-{r.probe_top_tokens} token")
@@ -354,7 +354,7 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
                         logits_to_keep=1)
             h = out.hidden_states[-1][0].detach()
             gate = bridge.out[1][0].detach().float() if bridge.out else None
-            stats = bridge.out[3] if bridge.out else {}
+            stats = bridge.out[2] if bridge.out else {}
         finally:
             bridge.end()
         del out
@@ -435,7 +435,7 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             "sweep_cell": cfg.sweep.tag,
             "model": f.model_id,
             "n_expert": E, "top_k": K,
-            "train_phase": train_state.get("phase"),
+            "train_epoch": train_state.get("epoch"),
             "train_samples": train_state.get("samples"),
             "swa_n": train_state.get("swa_n"),
             "weights": train_state.get("weights_src"),

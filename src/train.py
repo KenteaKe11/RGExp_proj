@@ -1,26 +1,38 @@
-"""Entrypoint: STAGE 0 (thử TỪNG phase) -> Phase 1 -> Phase 2 -> infer.
+"""Entrypoint: STAGE 0 (2 step thử) -> train multi-task -> infer.
 
-STAGE 0 chạy 2 step thử cho MỖI phase sắp chạy (mặc định cả 1 và 2, hoặc đúng
-phase đã chọn bằng --phase). `--dry-run` dừng ngay sau đó: đủ để biết cả hai
-phase có vừa VRAM không và cả lịch train mất bao lâu, trước khi tốn giờ GPU.
+Chạy:  python -m src.train --config configs/default.yaml --n-block 12
 
-Chạy:  python -m src.train --config configs/default.yaml --n-block 2
+MỘT PHASE DUY NHẤT (multi-task). Không còn "phase 1 chỉ router bằng Focal" rồi
+"phase 2 thêm decoder bằng CE". Ngay từ step đầu:
 
-Lịch train (§1.7):
+    Total_Loss = 1·CE + w_sup·ASL            (w_sup = 0.2)
 
-  Phase 1  5% mẫu train đầu   loss = Focal(α = 1/√f, γ = 2)
-           CHỈ nhánh router chạy — decoder bị cắt ngay sau embedding, nên một
-           step rẻ hơn Phase 2 khoảng một bậc.
+Router, 12 expert QDoRA và decoder cùng chạy trong MỘT forward và cùng nhận
+gradient. Gate nằm trong đồ thị autograd (src/moe.py), nên CE dạy router chọn
+expert, còn ASL giữ cho bản tóm tắt của router bám ngữ nghĩa bệnh học. Hai
+tín hiệu đó đến CÙNG LÚC thay vì nối tiếp — đó là toàn bộ ý nghĩa của việc
+gộp phase: bản cũ dạy router bằng nhánh supervised xong mới cho nó gặp CE, và
+mọi thứ nhánh đó dạy được đều có nguy cơ bị CE kéo đi ở phase sau.
 
-  Phase 2  5% mẫu train kế    loss = CE + w_sup·Focal + w_aux·Aux
-           Router + E expert QDoRA + decoder cùng chạy. Gate nằm trong đồ thị
-           autograd, nên CE cũng dạy router chọn expert.
+Nhánh supervised dùng ASL (Asymmetric Loss) trên MỘT trục nhị phân 14 finding
+— không còn softmax 4 aspect, không còn Focal. Nhãn uncertain thành soft
+label 0.7, nhãn blank bị MASK hẳn khỏi loss. Xem src/losses.py.
 
-Lịch LR (src/optim.py): cosine warm restarts, mỗi cycle CỐ ĐỊNH
+KHÔNG CÒN AUX LOSS. Cân bằng tải giữa các expert do bias của router lo, cập
+nhật bằng quy tắc sau mỗi optimizer step (`router.update_bias()`), nằm ngoài
+đồ thị autograd. Xem src/router.py.
+
+LỊCH TRAIN KHÔNG CÓ ĐÍCH. Vòng train đi tuần tự qua tập train theo thứ tự
+rare-first; hết tập thì `epoch` += 1 và đi lại từ đầu đúng thứ tự đó, mãi mãi.
+Không có trần số mẫu, không có dừng sớm. Dừng bằng Ctrl-C (được bắt: lưu
+checkpoint rồi mới sang khâu infer nếu mode=both) hoặc bằng việc phiên máy
+hết giờ. Lần chạy sau LUÔN resume từ checkpoint đi xa nhất (cục bộ hoặc Hub).
+
+Lịch LR (src/optim.py): cosine warm restarts lặp VÔ HẠN, mỗi cycle cố định
 `run.cycle_samples` MẪU (không phải step — batch mỗi máy một khác). Cuối mỗi
-cycle, lúc LR chạm đáy, trọng số router (+ expert ở Phase 2) được chụp lại và
-cộng trung bình đều — SWA. Hết phase, bản trung bình được đem đi val: thắng thì
-nó thành trọng số chính thức của phase, thua thì giữ bản cuối.
+cycle, lúc LR chạm đáy, trọng số được chụp lại và cộng trung bình đều — SWA.
+Bản trung bình đi vào swa.pt và là thứ được dùng để chấm metrics (mode=test)
+và để probe (mode=probe).
 """
 from __future__ import annotations
 
@@ -40,18 +52,16 @@ from . import logging_utils as L
 from . import moe
 from . import probe as probe_mod
 from .config import (adapter_desc, config_from_args, cycles_desc, image_desc,
-                     phase_steps, resolve_phase_samples, resolve_seq_len,
-                     variant_desc)
+                     resolve_seq_len, variant_desc)
 from .data import (attach_labels, build_frames, cell_frequency, fetch_sources,
-                   label_names, load_or_make_splits, phase_slice,
-                   rare_first_order)
+                   label_names, load_or_make_splits, rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
-from .losses import focal_loss, inv_freq_alpha, supervised_stats
+from .losses import (asl_loss, binary_target_table, supervised_stats,
+                     to_binary)
 from .metrics import run_metrics
 from .model import (build_collate, build_model, build_prompt, ce_loss,
-                    count_image_tokens, encode_only, find_image_token_id,
-                    load_image, make_loader, split_batch, to_device,
-                    wrap_images)
+                    count_image_tokens, find_image_token_id, load_image,
+                    make_loader, split_batch, to_device, wrap_images)
 from .optim import CosineRestartSchedule, WeightAverager
 
 DEVICE = torch.device("cuda:0")
@@ -63,8 +73,8 @@ log, warn, event = L.log, L.warn, L.event
 class Superseded(Exception):
     """Bản trên Hub đã đi trước tiến độ của máy này.
 
-    Ném từ giữa vòng train để thoát ra chỗ điều phối phase, nạp lại checkpoint
-    của Hub rồi chạy tiếp từ đó. Không phải lỗi — là bàn giao.
+    Ném từ giữa vòng train để thoát ra chỗ điều phối, nạp lại checkpoint của
+    Hub rồi chạy tiếp từ đó. Không phải lỗi — là bàn giao.
     """
 
     def __init__(self, remote):
@@ -73,14 +83,14 @@ class Superseded(Exception):
 
 
 def progress_key(st):
-    """Khoá so tiến độ giữa các máy — KHÔNG dùng step.
+    """Khoá so tiến độ giữa các máy — SỐ MẪU TÍCH LUỸ, không dùng step.
 
     step = samples / (train_bs × grad_accum), mà batch mỗi máy một khác: máy
     P100 chạy 1×64 và máy A100 chạy 8×8 ở CÙNG một chỗ trong dữ liệu sẽ có số
-    step khác nhau. Số mẫu đã đi qua thì không phụ thuộc phần cứng.
+    step khác nhau. Số mẫu đã đi qua thì không phụ thuộc phần cứng, và vì lịch
+    train không reset theo epoch nên nó tăng đơn điệu suốt đời ô sweep.
     """
-    return (1 if st.get("done") else 0, int(st.get("phase", 1)),
-            int(st.get("samples", 0)))
+    return int(st.get("samples", 0))
 
 
 class RateLimiter:
@@ -106,14 +116,13 @@ def vram(tag, total_gb):
 def main(argv=None):
     cfg = config_from_args(argv)
     f, r = cfg.fixed, cfg.run
-    # Phase 3 = mode "probe" (src/probe.py): KHÔNG train, nạp trung bình SWA
-    # từ Hub, sinh báo cáo rồi bật lần lượt từng expert trong top-k để đo
-    # chuyên môn. Nó vẫn đi qua đúng khâu infer + metrics của mode "test", nên
-    # nằm trong run_test chứ không phải một nhánh song song.
+    # mode "probe" (src/probe.py): KHÔNG train, nạp trung bình SWA từ Hub,
+    # sinh báo cáo rồi bật lần lượt từng expert trong top-k để đo chuyên môn.
+    # Nó vẫn đi qua đúng khâu infer + metrics của mode "test", nên nằm trong
+    # run_test chứ không phải một nhánh song song.
     is_probe = r.mode == "probe"
     run_train = r.mode in ("train", "both")
     run_test = r.mode in ("test", "both", "probe")
-    only_phase = getattr(r, "only_phase", None)
 
     L.setup(os.path.join(r.out_dir, "logs"), run_id=cfg.sweep.tag)
     L.snapshot_config(cfg)
@@ -125,23 +134,25 @@ def main(argv=None):
                f"ckpt={r.grad_ckpt} | batch {r.train_bs}×{r.grad_accum}"
                f"={r.train_bs*r.grad_accum} mẫu/step | mode={r.mode} "
                f"dry_run={r.dry_run}")
-    _sched = ("phase1/phase2 = auto (chia đôi tập train — 1 epoch)"
-              if r.phase1_samples is None or r.phase2_samples is None else
-              f"phase1 {r.phase1_samples} mẫu = {phase_steps(cfg, 1)} step | "
-              f"phase2 {r.phase2_samples} mẫu = {phase_steps(cfg, 2)} step")
-    log("cfg", f"{_sched} | chạy phase: {only_phase or '1 rồi 2'}")
-    log("cfg", f"loss phase 2 = 1·CE + {r.w_sup}·Focal + {r.w_aux}·Aux | "
-               f"val mỗi {r.eval_every} step | ckpt mỗi "
-               f"{r.save_every_n_vals} lần val | "
-               + (f"dừng sớm sau {r.early_stop_patience} val không cải thiện "
-                  f"(phase {r.early_stop_phases})"
-                  if r.early_stop_patience else "dừng sớm: TẮT"))
+    log("cfg", "lịch train: MỘT phase multi-task, KHÔNG có đích — chạy tuần "
+               "tự tập train, hết thì epoch += 1 và chạy tiếp; dừng bằng "
+               "Ctrl-C hoặc hết giờ máy, lần sau LUÔN resume")
+    log("cfg", f"loss = 1·CE + {r.w_sup}·ASL (KHÔNG có aux) | ASL γ+="
+               f"{r.asl_gamma_pos:g} γ-={r.asl_gamma_neg:g} ngưỡng âm "
+               f"m={r.asl_clip:g} | uncertain={r.uncertain_soft:g}, blank=MASK "
+               f"| cân bằng tải bias γ={f.bias_gamma:g} | Gumbel σ="
+               f"{f.route_noise:g}")
+    log("cfg", f"val mỗi {r.eval_every} step ({r.eval_max_batches} batch) | "
+               f"ckpt mỗi {r.save_every_n_vals} lần val | dừng sớm: KHÔNG")
     log("cfg", f"kiến trúc: {variant_desc(cfg)}")
     log("cfg", cycles_desc(cfg))
     log("cfg", f"ảnh {image_desc(f)}")
     if not r.use_policy:
         log("cfg", "policy TẮT — infer sinh 1 lần, không retry; metrics chấm "
                    "trên raw_output (đúng cột 'raw_outp' của bảng sweep)")
+    if r.mode == "both":
+        log("cfg", "mode=both: train chạy tới khi bị dừng tay (Ctrl-C được "
+                   "bắt, ckpt được lưu) rồi mới sang infer")
     if cfg.hw.n_gpu > 1:
         warn("cfg", f"có {cfg.hw.n_gpu} GPU nhưng script dùng 1. Multi-GPU: "
                     f"torchrun --nproc_per_node={cfg.hw.n_gpu} + DDP.")
@@ -171,8 +182,11 @@ def main(argv=None):
             "effective_batch": r.train_bs * r.grad_accum,
             "lr": r.lr, "lr_router": r.lr_router,
             "label_smoothing": f.label_smoothing,
-            "w_sup": r.w_sup, "w_aux": r.w_aux, "focal_gamma": r.focal_gamma,
-            "focal_alpha_pow": r.focal_alpha_pow,
+            "w_sup": r.w_sup, "asl_gamma_pos": r.asl_gamma_pos,
+            "asl_gamma_neg": r.asl_gamma_neg, "asl_clip": r.asl_clip,
+            "uncertain_soft": r.uncertain_soft,
+            "route_noise": f.route_noise, "bias_gamma": f.bias_gamma,
+            "cycle_samples": r.cycle_samples,
             "use_policy": r.use_policy,
         })
         log("wandb", wandb.run.url)
@@ -202,21 +216,29 @@ def main(argv=None):
     df_test, _ = attach_labels(df_test, npz_path, cfg, log, "test")
     cell_freq = cell_frequency(y_train, npz_path, log)
     disease_names, aspect_names = label_names(npz_path)
-    alpha = inv_freq_alpha(cell_freq, r.focal_alpha_normalize,
-                           r.focal_alpha_pow).to(DEVICE)
-    log("label", f"α = 1/f^{r.focal_alpha_pow} ({r.focal_alpha_normalize}): "
-                 f"min={alpha.min():.3f} max={alpha.max():.3f} "
-                 f"tỉ lệ max/min={float(alpha.max()/alpha.min()):.1f}×")
-    # `phase*_samples: null` -> chia đôi tập train ở ĐÂY (giờ mới biết số mẫu).
-    resolve_phase_samples(cfg, len(df_train), log)
-    base_order = rare_first_order(df_train, cell_freq, cfg, log)
-    order1 = phase_slice(base_order, cfg, 1)
-    order2 = phase_slice(base_order, cfg, 2)
+    # Bảng gập nhãn 4 aspect -> một trục nhị phân có mask. Suy TỪ TÊN trong
+    # labels.npz, không hardcode thứ tự — xem losses.aspect_roles.
+    _tgt, _valid = binary_target_table(aspect_names, r.uncertain_soft)
+    sup_table = (_tgt.to(DEVICE), _valid.to(DEVICE))
+    log("label", "gập nhãn -> trục nhị phân: "
+                 + " | ".join(f"{n}={'MASK' if not bool(v) else f'{float(t):g}'}"
+                              for n, t, v in zip(aspect_names, _tgt, _valid)))
+    _kept = float((cell_freq[:, [i for i, v in enumerate(_valid) if v]]).sum()
+                  / max(cell_freq.sum(), 1e-9))
+    log("label", f"còn {_kept*100:.1f}% số ô (bệnh, mẫu) có nhãn sau khi MASK "
+                 f"blank — mẫu số của ASL là các ô này, không phải cả 14")
+    # Thứ tự train: TRỌN tập, rare-first, cố định theo seed và dùng lại y
+    # nguyên ở mọi epoch (xem docstring rare_first_order).
+    order = rare_first_order(df_train, cell_freq, cfg, log)
+    n_train = len(order)
     df_infer = (df_test.iloc[:r.n_test_samples].reset_index(drop=True)
                 if r.n_test_samples else df_test)
-    log("data", f"train={len(df_train)} (phase1 {len(order1)} + phase2 "
-                f"{len(order2)}) val={len(df_val)} test={len(df_test)} "
-                f"infer={len(df_infer)}")
+    eff = r.train_bs * r.grad_accum
+    steps_per_epoch = n_train // eff
+    log("data", f"train={n_train} val={len(df_val)} test={len(df_test)} "
+                f"infer={len(df_infer)} | 1 epoch ≈ {steps_per_epoch} step ở "
+                f"batch {eff} | 1 cycle LR = {r.cycle_samples} mẫu = "
+                f"{n_train / max(r.cycle_samples, 1):.1f} cycle/epoch")
 
     # ── Model ────────────────────────────────────────────────────────────────
     processor, tokenizer, model, router, bridge, expert_ids = build_model(
@@ -237,69 +259,27 @@ def main(argv=None):
     from torch.optim import AdamW
 
     expert_params = [p for p in model.parameters() if p.requires_grad]
-    _freeze_logged = set()
+    router_params = [p for p in router.parameters() if p.requires_grad]
 
-    def apply_phase_freeze(phase):
-        """Đặt requires_grad của nhánh router cho ĐÚNG phase, trả param train.
+    def make_optimizer():
+        """Hai param group với hai lr khác nhau, vì hai thứ khác hẳn nhau:
+        router là mạng train từ số 0 (cần lr lớn), expert là adapter nắn một
+        model đã pretrain (lr nhỏ). Cả hai cùng train từ step đầu — không còn
+        phase nào chỉ có một nửa."""
+        return AdamW([{"params": router_params, "lr": r.lr_router},
+                      {"params": expert_params, "lr": r.lr}],
+                     weight_decay=r.weight_decay, eps=f.adam_eps)
 
-        Phải gọi TRƯỚC make_optimizer: AdamW chụp danh sách param một lần lúc
-        dựng, nên một param bị đóng băng sau đó vẫn nằm trong param_group (chỉ
-        là không có grad) và vẫn ăn 2 moment fp32 — im lặng và tốn VRAM.
+    all_params = router_params + expert_params
 
-        Gọi được nhiều lần: `RouterNet.set_freeze` mở lại toàn bộ trước khi
-        đóng, nên STAGE 0 thử phase 1 rồi phase 2 rồi run_phase(1) không để
-        lại trạng thái thừa của lần trước.
+    # ── Bước tính loss, dùng chung cho STAGE 0 / train / eval ───────────────
+    def train_loss(batch):
+        """Total_Loss = CE + w_sup·ASL, một forward duy nhất.
+
+        KHÔNG gọi bridge.end() ở đây — gate phải còn sống tới hết backward
+        (gradient-checkpointing chạy lại forward trong backward và cần đúng
+        tensor gate của step này). Chỗ gọi end() là ngay SAU loss.backward().
         """
-        n = int(getattr(r, "p2_freeze_trunk", 0) or 0) if phase == 2 else 0
-        sup = bool(getattr(r, "p2_freeze_sup_head", False)) if phase == 2 else False
-        info = router.set_freeze(n, sup)
-        if phase not in _freeze_logged:
-            _freeze_logged.add(phase)
-            if info["frozen"]:
-                log("freeze", f"phase {phase}: đóng băng {info['frozen']} "
-                              f"= {info['n_frozen_param']:,} param | "
-                              f"router còn {info['n_trainable_param']:,} "
-                              f"trainable")
-            else:
-                log("freeze", f"phase {phase}: train TRỌN nhánh router "
-                              f"({info['n_trainable_param']:,} param)")
-            if info["clamped"] < info["asked"]:
-                warn("freeze", f"p2_freeze_trunk={info['asked']} nhưng trunk "
-                               f"chỉ có {info['n_trunk_total']} layer "
-                               f"(stem + {info['n_trunk_total'] - 1} block) — "
-                               f"cắt xuống {info['clamped']} để còn ít nhất "
-                               f"MỘT block train được, nếu không thì n_block "
-                               f"không còn ảnh hưởng gì tới Phase 2.")
-        return [p for p in router.parameters() if p.requires_grad]
-
-    def make_optimizer(phase, router_params):
-        """Phase 1 chỉ có router; Phase 2 thêm expert với lr riêng.
-
-        Hai lr khác nhau vì hai thứ khác hẳn nhau: router là mạng train từ số
-        0 (cần lr lớn), expert là adapter nắn một model đã pretrain (lr nhỏ).
-        """
-        groups = [{"params": router_params, "lr": r.lr_router}]
-        if phase == 2:
-            groups.append({"params": expert_params, "lr": r.lr})
-        return AdamW(groups, weight_decay=r.weight_decay, eps=f.adam_eps)
-
-    # ── các bước tính loss, dùng chung cho STAGE 0 / train / eval ────────────
-    def phase1_loss(batch):
-        """Chỉ router: encode (no_grad) -> Focal. Decoder KHÔNG chạy."""
-        core, extra = split_batch(batch)
-        hidden = encode_only(model, bridge, core)
-        bridge.begin("route", mask=extra["router_mask"])
-        sup_logits, gate, aux, stats = bridge.run(hidden)
-        bridge.end()
-        loss = focal_loss(sup_logits, extra["sup_labels"], alpha,
-                          r.focal_gamma)
-        stats.update(supervised_stats(sup_logits, extra["sup_labels"]))
-        stats["aux"] = float(aux)
-        return loss, stats
-
-    def phase2_loss(batch):
-        """CE + w_sup·Focal + w_aux·Aux. KHÔNG gọi bridge.end() ở đây —
-        gate phải còn sống tới hết backward (xem run_phase)."""
         core, extra = split_batch(batch)
         bridge.begin("route", mask=extra["router_mask"])
         ce = ce_loss(model, core, f.label_smoothing)
@@ -309,46 +289,36 @@ def main(argv=None):
             raise RuntimeError(
                 "hook router không chạy trong forward — decoder nhận input_ids "
                 "thay vì inputs_embeds, hoặc find_text_decoder trỏ sai chỗ.")
-        sup_logits, gate, aux, stats = bridge.out
-        sup = focal_loss(sup_logits, extra["sup_labels"], alpha, r.focal_gamma)
-        loss = ce + r.w_sup * sup + r.w_aux * aux
-        stats.update(supervised_stats(sup_logits, extra["sup_labels"]))
-        stats.update({"ce": float(ce), "sup": float(sup), "aux": float(aux)})
+        sup_logits, gate, stats = bridge.out
+        sup_target, sup_mask = to_binary(extra["sup_labels"], sup_table)
+        sup = asl_loss(sup_logits, sup_target, sup_mask,
+                       gamma_pos=r.asl_gamma_pos, gamma_neg=r.asl_gamma_neg,
+                       clip=r.asl_clip)
+        loss = ce + r.w_sup * sup
+        stats.update(supervised_stats(sup_logits, sup_target, sup_mask))
+        stats.update({"ce": float(ce), "sup": float(sup)})
         return loss, stats
 
-    # ── STAGE 0: 2 step thử cho MỖI phase sắp chạy ──────────────────────────
-    # Chạy cho TỪNG phase chứ không chỉ phase 1. Hai phase là hai đồ thị khác
-    # hẳn nhau: phase 1 cắt decoder ngay sau embedding (rẻ, không đụng expert,
-    # optimizer chỉ giữ moment của router); phase 2 chạy cả decoder + E bản
-    # delta QDoRA + moment cho toàn bộ expert. Thử mỗi phase 1 rồi kết luận
-    # "chạy được" là kiểm đúng nửa rẻ tiền — nửa còn lại mới là nửa OOM.
-    phases_s0 = [] if is_probe else ([only_phase] if only_phase else [1, 2])
+    # ── STAGE 0: 2 step thử ─────────────────────────────────────────────────
+    # Một phase nên chỉ còn MỘT lần thử — nhưng nó là lần thử của đúng cái đồ
+    # thị nặng nhất: decoder + E bản delta QDoRA + moment AdamW cho cả router
+    # lẫn expert. Không còn "nửa rẻ tiền" nào để qua được một cách giả tạo.
     log("S0", "═" * 60)
-    log("S0", f"thử {len(phases_s0)} phase: {phases_s0}" if phases_s0 else
-              "Phase 3 (mode=probe) không train — bỏ qua STAGE 0")
-    # Một loader dùng lại cho mọi phase: iter() cho iterator mới mỗi lần, và
-    # worker process không phải dựng lại.
-    _s0_dl = (make_loader(df_train.iloc[:r.train_bs * 4], collate, cfg)
-              if phases_s0 else None)
+    _s0_dl = None if is_probe else make_loader(
+        df_train.iloc[:r.train_bs * 4], collate, cfg)
 
-    def stage0(phase, first):
-        """2 step thử của MỘT phase. Trả về (ok, giây/micro-step, VRAM đỉnh)."""
+    def stage0():
+        """2 step thử. Trả về (ok, giây/micro-step, VRAM đỉnh)."""
         it = iter(_s0_dl)
         b = to_device(next(it), DEVICE)
-        if first:
-            log("S0", "shape: " + " ".join(f"{k}{tuple(v.shape)}"
-                                           for k, v in b.items()))
-            log("S0", f"label_token={int((b['labels'] != -100).sum())} | "
-                      f"router thấy {int(b['router_mask'].sum())}/"
-                      f"{b['router_mask'].numel()} token")
-        what = ("chỉ router, decoder bị cắt" if phase == 1 else
-                f"router + {f.n_expert} expert QDoRA + decoder")
-        log("S0", f"── phase {phase} | loss = "
-                  f"{'focal' if phase == 1 else 'ce+sup+aux'} | {what}")
-        router_params = apply_phase_freeze(phase)
-        opt = make_optimizer(phase, router_params)
-        params = router_params + (expert_params if phase == 2 else [])
-        step_fn = phase1_loss if phase == 1 else phase2_loss
+        log("S0", "shape: " + " ".join(f"{k}{tuple(v.shape)}"
+                                       for k, v in b.items()))
+        log("S0", f"label_token={int((b['labels'] != -100).sum())} | "
+                  f"router thấy {int(b['router_mask'].sum())}/"
+                  f"{b['router_mask'].numel()} token")
+        log("S0", f"── multi-task | loss = ce + {r.w_sup}·asl | router + "
+                  f"{f.n_expert} expert QDoRA + decoder")
+        opt = make_optimizer()
         ok, t2, peak = False, None, None
         try:
             model.train()
@@ -356,7 +326,7 @@ def main(argv=None):
             opt.zero_grad(set_to_none=True)
             torch.cuda.reset_peak_memory_stats()
             t = time.time()
-            loss, st = step_fn(b)
+            loss, st = train_loss(b)
             lv = float(loss)
             log("S0", f"   forward  {time.time()-t:5.2f}s loss={lv:.4f} | "
                       f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.items() if k != 'expert_share'} }")
@@ -364,9 +334,10 @@ def main(argv=None):
             loss.backward()
             bridge.end()
             log("S0", f"   backward {time.time()-t:5.2f}s")
-            gn = float(torch.nn.utils.clip_grad_norm_(params, r.max_grad_norm))
-            # Gradient KHÔNG chảy về router ở phase 2 nghĩa là gate đã bị tách
-            # khỏi đồ thị — chạy trơn tru và cho kết quả vô nghĩa. Bắt ở đây.
+            gn = float(torch.nn.utils.clip_grad_norm_(all_params,
+                                                      r.max_grad_norm))
+            # Gradient KHÔNG chảy về router nghĩa là gate đã bị tách khỏi đồ
+            # thị — chạy trơn tru và cho kết quả vô nghĩa. Bắt ở đây.
             g_router = sum(float(p.grad.abs().sum()) for p in router_params
                            if p.grad is not None)
             log("S0", f"   grad_norm={gn:.3f} | Σ|grad| router = {g_router:.3e}")
@@ -381,167 +352,152 @@ def main(argv=None):
                                   "RouterBridge và moe.CTX")
             opt.step()
             opt.zero_grad(set_to_none=True)
+            upd = router.update_bias()
+            if upd:
+                log("S0", f"   bias cân bằng tải cập nhật được: span="
+                          f"{upd[0]:.4f} | CV tải={upd[1]:.3f}")
+            elif f.bias_gamma > 0:
+                warn("S0", "update_bias() không đếm được tải nào — router có "
+                           "đang ở chế độ train không?")
 
             t = time.time()
             b2 = to_device(next(it), DEVICE)
-            l2, _ = step_fn(b2)
+            l2, _ = train_loss(b2)
             l2.backward()
             bridge.end()
-            torch.nn.utils.clip_grad_norm_(params, r.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(all_params, r.max_grad_norm)
             opt.step()
             opt.zero_grad(set_to_none=True)
+            router.update_bias()
             torch.cuda.synchronize()
             t2 = time.time() - t
             peak = torch.cuda.max_memory_allocated(0) / 1024**3
-            n_step = phase_steps(cfg, phase)
-            log("S0", f"   ✓ phase {phase} CHẠY ĐƯỢC | step2 {t2:.2f}s = "
+            log("S0", f"   ✓ CHẠY ĐƯỢC | step2 {t2:.2f}s = "
                       f"{r.train_bs/t2:.2f} mẫu/s | 1 step "
-                      f"({r.train_bs*r.grad_accum} mẫu) ≈ {t2*r.grad_accum:.1f}s")
-            log("S0", f"   {n_step} step ≈ {t2*r.grad_accum*n_step/3600:.2f}h "
-                      f"| VRAM đỉnh {peak:.1f}/{cfg.hw.vram_gb:.0f}GB "
+                      f"({eff} mẫu) ≈ {t2*r.grad_accum:.1f}s")
+            log("S0", f"   1 epoch ({steps_per_epoch} step) ≈ "
+                      f"{t2*r.grad_accum*steps_per_epoch/3600:.2f}h | "
+                      f"1 cycle LR ({r.cycle_samples} mẫu) ≈ "
+                      f"{t2*r.cycle_samples/r.train_bs/3600:.2f}h")
+            log("S0", f"   VRAM đỉnh {peak:.1f}/{cfg.hw.vram_gb:.0f}GB "
                       f"({peak/cfg.hw.vram_gb*100:.0f}%)")
+            if peak < cfg.hw.vram_gb * 0.6:
+                log("S0", f"   → còn dư: thử --set run.train_bs={r.train_bs*2} "
+                          f"--set run.grad_accum={max(r.grad_accum//2,1)}")
             ok = True
-            event("stage0", ok=True, phase=phase, step2_sec=round(t2, 3),
+            event("stage0", ok=True, step2_sec=round(t2, 3),
                   samples_per_sec=round(r.train_bs / t2, 3),
                   peak_vram_gb=round(peak, 2),
                   vram_pct=round(peak / cfg.hw.vram_gb * 100, 1),
-                  est_hours=round(t2 * r.grad_accum * n_step / 3600, 2),
+                  epoch_hours=round(t2 * r.grad_accum * steps_per_epoch / 3600, 2),
                   loss_step1=round(lv, 4), grad_router=g_router)
             del b, b2, loss, l2
         except torch.cuda.OutOfMemoryError as e:
-            L.error("S0", f"phase {phase} OOM: {str(e)[:200]}", e)
-            event("stage0", ok=False, phase=phase, reason="oom")
+            L.error("S0", f"OOM: {str(e)[:200]}", e)
+            event("stage0", ok=False, reason="oom")
             log("S0", f"   Hạ: --set run.train_bs={max(r.train_bs//2,1)} "
                       f"--set run.grad_accum={r.grad_accum*2}")
-            if phase == 2:
-                log("S0", "   Phase 2 OOM mà phase 1 qua là bình thường: chỉ "
-                          "phase 2 mới giữ E bản delta + moment của expert. Hạ "
-                          "fixed.n_expert hoặc fixed.top_k, đừng hạ batch nữa "
-                          "nếu đã bs=1.")
+            log("S0", "   Đã bs=1 mà vẫn OOM: hạ fixed.n_expert (mỗi expert là "
+                      "một bản delta QDoRA phải giữ cùng lúc) — hạ top_k KHÔNG "
+                      "cứu được, sparsity chỉ tiết kiệm khi CẢ BATCH cùng bỏ "
+                      "qua một expert.")
         except Exception as e:
-            L.error("S0", f"phase {phase} {type(e).__name__}: {str(e)[:300]}", e)
-            event("stage0", ok=False, phase=phase, reason=type(e).__name__)
+            L.error("S0", f"{type(e).__name__}: {str(e)[:300]}", e)
+            event("stage0", ok=False, reason=type(e).__name__)
         finally:
             bridge.end()
             opt.zero_grad(set_to_none=True)
             del opt
+            router.reset_bias()      # 2 step thử không được để lại bias
             gc.collect()
             torch.cuda.empty_cache()
         return ok, t2, peak
 
-    s0 = {}
-    for _i, _ph in enumerate(phases_s0):
-        s0[_ph] = stage0(_ph, first=(_i == 0))
-    s0_ok = all(v[0] for v in s0.values())
-    if not s0:
-        pass                       # probe: không có phase nào để tổng kết
-    elif s0_ok:
-        hours = sum(v[1] * r.grad_accum * phase_steps(cfg, ph) / 3600
-                    for ph, v in s0.items())
-        peak = max(v[2] for v in s0.values())
-        log("S0", f"✓✓ {len(phases_s0)}/{len(phases_s0)} phase qua | tổng lịch "
-                  f"train ≈ {hours:.2f}h | VRAM đỉnh cao nhất {peak:.1f}/"
-                  f"{cfg.hw.vram_gb:.0f}GB ({peak/cfg.hw.vram_gb*100:.0f}%)")
-        if peak < cfg.hw.vram_gb * 0.6:
-            log("S0", f"   → còn dư: thử --set run.train_bs={r.train_bs*2} "
-                      f"--set run.grad_accum={max(r.grad_accum//2,1)}")
-        event("stage0_all", ok=True, phases=phases_s0,
-              est_total_hours=round(hours, 2), peak_vram_gb=round(peak, 2))
+    if is_probe:
+        log("S0", "mode=probe không train — bỏ qua STAGE 0")
+        s0_ok = True
     else:
-        bad = [ph for ph, v in s0.items() if not v[0]]
-        log("S0", f"✗ phase KHÔNG qua: {bad}")
-        event("stage0_all", ok=False, phases=phases_s0, failed=bad)
-    del _s0_dl
+        s0_ok = stage0()[0]
+    # Gán None chứ không `del`: `stage0` là closure đọc biến này, và xoá hẳn
+    # binding thì một lần gọi lại (sau này, khi sửa code) sẽ nổ NameError ở
+    # chỗ khó lần ra.
+    _s0_dl = None
     gc.collect()
     torch.cuda.empty_cache()
     log("S0", "═" * 60)
 
     if r.dry_run:
-        log("S0", f"DRY_RUN — dừng sau khi thử phase {phases_s0}. "
-                  f"s0_ok={s0_ok}. Chạy thật: thêm --no-dry-run")
+        log("S0", f"DRY_RUN — dừng sau STAGE 0. s0_ok={s0_ok}. "
+                  f"Chạy thật: thêm --no-dry-run")
         wfinish()
         return 0 if s0_ok else 1
-    assert s0_ok, ("STAGE 0 không qua ở phase "
-                   f"{[ph for ph, v in s0.items() if not v[0]]} — sửa cấu "
-                   f"hình trước khi train")
+    assert s0_ok, "STAGE 0 không qua — sửa cấu hình trước khi train"
 
     # ══════════════════════════ checkpoint ═══════════════════════════════════
     def save_checkpoint(state, optimizer, swa=None, tag="last", push=True,
                         with_optimizer=True):
-        """Lưu đủ để resume: router + E expert + optimizer + SWA + con trỏ.
+        """Lưu đủ để resume: router (kèm bias) + E expert + optimizer + SWA.
 
         `with_optimizer=False` cho bản "best": nó chỉ dùng để LẤY LẠI trọng số
-        tốt nhất sau khi dừng sớm, không dùng để train tiếp — mà optimizer của
-        AdamW nặng gấp đôi trọng số (2 moment fp32 cho ~267M param trainable).
+        tốt nhất, không dùng để train tiếp — mà optimizer của AdamW nặng gấp
+        đôi trọng số (2 moment fp32 cho ~203M param trainable).
 
-        KHÔNG còn `scheduler.state_dict()`: lịch LR mới là hàm THUẦN của số mẫu
+        KHÔNG có `scheduler.state_dict()`: lịch LR là hàm THUẦN của số mẫu
         (src/optim.py), dựng lại từ `state["samples"]` là đủ và đúng trên mọi
-        máy. Bản cũ phải lưu rồi lại cố tình bỏ qua nó lúc resume vì nó đếm
-        bằng step của máy đã ghi ckpt — một chỗ chỉ chực sai.
+        máy. `expert_bias` đi theo router.state_dict() — nó là buffer, và bỏ
+        nó ra khỏi ckpt thì resume xong router mất toàn bộ điều phối đã học.
         """
         d = os.path.join(r.ckpt_dir, tag)
         os.makedirs(d, exist_ok=True)
         torch.save({"router": router.state_dict(),
                     "experts": moe.expert_state_dict(model, expert_ids)},
                    os.path.join(d, "weights.pt"))
-        if with_optimizer:
+        if with_optimizer and optimizer is not None:
             torch.save({"optimizer": optimizer.state_dict(),
                         "torch_rng": torch.get_rng_state()},
                        os.path.join(d, "optimizer.pt"))
-            # Bộ cộng dồn SWA đi RIÊNG: nó là trọng số (fp32, ~cỡ weights.pt),
-            # không phải moment, và máy nhận bàn giao cần nó để trung bình
-            # không bị đếm lại từ 0 giữa phase.
-            swa_p = os.path.join(d, "swa.pt")
-            if swa is not None and swa.n:
-                torch.save(swa.state_dict(), swa_p)
-            elif os.path.exists(swa_p):
-                os.remove(swa_p)     # phase mới: bản cũ là của phase trước
-        # total_samples/samples_per_step là số ĐỌC ĐƯỢC trên mọi máy; step chỉ
-        # còn là số dẫn xuất (samples // samples_per_step) để tiện đọc log.
-        meta = dict(state, total_samples={1: r.phase1_samples,
-                                          2: r.phase2_samples},
-                    n_train=len(df_train), seed=f.seed, gpu=cfg.hw.name,
-                    samples_per_step=r.train_bs * r.grad_accum,
-                    train_bs=r.train_bs, grad_accum=r.grad_accum,
-                    saved_at=time.time(),
+        # Bộ cộng dồn SWA đi RIÊNG và KHÔNG phụ thuộc `with_optimizer`: nó là
+        # trọng số (fp32, ~cỡ weights.pt), không phải moment, và máy nhận bàn
+        # giao cần nó để trung bình không bị đếm lại từ 0. Bản lưu lúc Ctrl-C
+        # cũng phải có nó — mất swa.pt là mất mọi snapshot đáy đã gom.
+        if swa is not None and swa.n:
+            torch.save(swa.state_dict(), os.path.join(d, "swa.pt"))
+        # samples/epoch/samples_per_step là số ĐỌC ĐƯỢC trên mọi máy; step chỉ
+        # còn là số dẫn xuất để tiện đọc log.
+        meta = dict(state, n_train=n_train, seed=f.seed, gpu=cfg.hw.name,
+                    samples_per_step=eff, train_bs=r.train_bs,
+                    grad_accum=r.grad_accum, saved_at=time.time(),
                     swa_n=(swa.n if swa is not None else 0),
                     swa_marks=(list(swa.marks) if swa is not None else []),
-                    cycle_samples=r.cycle_samples,
+                    cycle_samples=r.cycle_samples, w_sup=r.w_sup,
+                    asl_gamma_pos=r.asl_gamma_pos,
+                    asl_gamma_neg=r.asl_gamma_neg, asl_clip=r.asl_clip,
+                    uncertain_soft=r.uncertain_soft,
+                    bias_gamma=f.bias_gamma, route_noise=f.route_noise,
                     model=f.model_id, variant=cfg.sweep.variant,
                     n_block=cfg.sweep.n_block, n_expert=f.n_expert,
                     top_k=f.top_k, lora_r=f.lora_r, lora_alpha=f.lora_alpha,
                     image_size=f.image_size_model or f.image_size_src)
         with open(os.path.join(d, "train_state.json"), "w") as fh:
             json.dump(meta, fh, indent=2)
-        log("save", f"{tag} @ phase {state['phase']} mẫu {state['samples']} "
-                    f"(epoch {state['epoch']}, step {state['step']})")
+        log("save", f"{tag} @ mẫu {state['samples']} (epoch {state['epoch']} "
+                    f"idx {state['epoch_samples']}, step {state['step']})")
         event("checkpoint", tag=tag, path=d, **state)
         if r.push_to_hub and push:
             try:
-                # optimizer.pt nặng gấp đôi trọng số (2 moment của AdamW cho
-                # ~64M param expert). Nó chỉ cần để resume TRÊN CHÍNH MÁY NÀY;
-                # đẩy lên Hub mỗi lần save là vài GB băng thông cho một thứ
-                # gần như không ai tải về. swa.pt thì khác: bỏ nó lại là máy
-                # nhận bàn giao bắt đầu trung bình từ 0 giữa chừng phase, và
-                # bản trung bình cuối cùng chỉ còn gom được vài cycle cuối.
                 skip = ([] if r.hub_include_optimizer else ["optimizer.pt"]) \
                     + ([] if r.hub_include_swa else ["swa.pt"])
                 upload_folder(repo_id=r.hub_repo, folder_path=d,
                               path_in_repo=tag, token=hf_token,
                               ignore_patterns=(skip or None),
-                              commit_message=f"{tag} @ phase {state['phase']} "
-                                             f"mẫu {state['samples']}")
+                              commit_message=f"{tag} @ mẫu {state['samples']} "
+                                             f"(epoch {state['epoch']})")
                 log("hub", f"đã push {tag}/")
             except Exception as e:
                 warn("hub", f"push thất bại ({e}) — ckpt vẫn ở {d}")
 
     def set_weights(w, quiet=False):
-        """Nạp một payload {"router": ..., "experts": ...} vào model đang sống.
-
-        Thiếu khoá "experts" là hợp lệ: snapshot của Phase 1 chỉ có router
-        (Phase 1 không train expert, chép lại chúng chỉ tốn ~1GB cho một phép
-        gán y nguyên).
-        """
+        """Nạp một payload {"router": ..., "experts": ...} vào model đang sống."""
         router.load_state_dict(w["router"])
         router.to(DEVICE, f.trainable_dtype)
         if "experts" in w:
@@ -552,26 +508,31 @@ def main(argv=None):
         set_weights(torch.load(os.path.join(directory, "weights.pt"),
                                map_location="cpu"))
 
-    # ── Trạng thái: ĐẾM THEO MẪU, không theo step ───────────────────────────
-    # `samples` = số mẫu của phase này đã đi qua. Đó là đại lượng DUY NHẤT so
-    # được giữa các máy: step = samples // (train_bs × grad_accum) nên đổi
-    # batch là đổi step, còn số mẫu thì không. `epoch`/`idx` suy ra từ samples
-    # và độ dài lát mẫu của phase.
-    state = {"phase": only_phase or 1, "samples": 0, "epoch": 0, "step": 0,
-             "done": False, "es_best": None, "es_bad": 0}
+    # ── Trạng thái: ĐẾM THEO MẪU ────────────────────────────────────────────
+    # samples        số mẫu TÍCH LUỸ từ lúc train từ số 0, không reset theo
+    #                epoch — lịch LR và so tiến độ giữa các máy đều đọc số này.
+    # epoch          số vòng đã đi hết tập train.
+    # epoch_samples  vị trí trong tập train của epoch đang chạy = chỉ số bắt
+    #                đầu trong `order` khi resume.
+    state = {"samples": 0, "epoch": 0, "epoch_samples": 0, "step": 0,
+             "best_val": None}
     opt_state = None
-    # Bộ cộng dồn SWA đọc từ checkpoint: chỉ dùng lại khi resume ĐÚNG phase cũ
-    # (run_phase kiểm) — trung bình của Phase 1 (chỉ router, loss Focal) không
-    # được phép chảy sang Phase 2.
     swa_state = None
 
     def check_compat(st):
-        assert st["n_train"] == len(df_train) and st["seed"] == f.seed, \
-            f"Split/seed đổi (n_train {st['n_train']} vs {len(df_train)})"
+        assert st["n_train"] == n_train and st["seed"] == f.seed, \
+            f"Split/seed đổi (n_train {st['n_train']} vs {n_train})"
         assert st["variant"] == cfg.sweep.variant and \
             st["n_block"] == cfg.sweep.n_block, \
             (f"ckpt của ô {st['variant']}-n{st['n_block']}, đang chạy "
              f"{cfg.sweep.tag} — router có shape khác, không nạp được")
+        if st.get("n_expert") not in (None, f.n_expert) or \
+                st.get("top_k") not in (None, f.top_k):
+            raise AssertionError(
+                f"ckpt là {st.get('n_expert')}E top-{st.get('top_k')}, đang "
+                f"chạy {f.n_expert}E top-{f.top_k} — route_head và số bản "
+                f"expert đều khác shape, không nạp được. Đổi n_expert/top_k "
+                f"nghĩa là một ô sweep MỚI: dùng ckpt_dir/hub_repo khác.")
 
     def read_state(directory):
         try:
@@ -585,12 +546,12 @@ def main(argv=None):
         nonlocal opt_state, swa_state
         check_compat(st)
         load_weights(directory)
-        # ckpt cũ chỉ có `cursor` (cũng là số mẫu trong phase) — đọc được luôn.
-        state.update(phase=st["phase"],
-                     samples=int(st.get("samples", st.get("cursor", 0))),
+        samples = int(st.get("samples", 0))
+        state.update(samples=samples,
                      epoch=int(st.get("epoch", 0)),
-                     done=st.get("done", False),
-                     es_best=st.get("es_best"), es_bad=st.get("es_bad", 0))
+                     epoch_samples=int(st.get("epoch_samples", 0)),
+                     step=int(st.get("step", samples // eff)),
+                     best_val=st.get("best_val"))
         op = os.path.join(directory, "optimizer.pt")
         opt_state = (torch.load(op, map_location="cpu")
                      if os.path.exists(op) else None)
@@ -606,11 +567,9 @@ def main(argv=None):
                           f"gom (mốc mẫu {swa_state.get('marks')})")
         elif int(st.get("swa_n", 0)) and r.swa:
             warn("resume", f"ckpt ghi swa_n={st.get('swa_n')} nhưng không có "
-                           f"swa.pt — trung bình bắt đầu lại từ 0 ở phase này. "
-                           f"Bật run.hub_include_swa=true nếu đây là bản kéo "
-                           f"từ Hub.")
+                           f"swa.pt — trung bình bắt đầu lại từ 0. Bật "
+                           f"run.hub_include_swa=true nếu đây là bản kéo từ Hub.")
         sps = st.get("samples_per_step")
-        eff = r.train_bs * r.grad_accum
         if sps and sps != eff:
             log("resume", f"ckpt ghi ở batch {sps} mẫu/step, máy này {eff} "
                           f"mẫu/step — con trỏ theo MẪU nên vẫn khớp; step chỉ "
@@ -651,31 +610,30 @@ def main(argv=None):
     def adopt_hub(st):
         """Hub đi trước -> bỏ tiến độ cục bộ, chạy tiếp từ bản của Hub."""
         old = dict(state)
-        log("sync", f"Hub đi trước (phase {st.get('phase')} mẫu "
-                    f"{st.get('samples', st.get('cursor'))} trên {st.get('gpu')}) "
-                    f"> ta (phase {old['phase']} mẫu {old['samples']}) — tải về "
-                    f"và chạy tiếp từ đó")
+        log("sync", f"Hub đi trước (mẫu {st.get('samples')} epoch "
+                    f"{st.get('epoch')} trên {st.get('gpu')}) > ta (mẫu "
+                    f"{old['samples']} epoch {old['epoch']}) — tải về và chạy "
+                    f"tiếp từ đó")
         apply_state(st, hub_pull_last())
-        event("hub_adopt", from_phase=old["phase"], from_samples=old["samples"],
-              to_phase=state["phase"], to_samples=state["samples"],
-              remote_gpu=st.get("gpu"))
+        event("hub_adopt", from_samples=old["samples"],
+              to_samples=state["samples"], remote_gpu=st.get("gpu"))
 
-    # ── Resume: lấy bản ĐI XA NHẤT giữa local và Hub ─────────────────────────
-    # Bản cục bộ KHÔNG mặc nhiên thắng nữa: máy này có thể vừa bật lại sau khi
-    # một máy khác đã chạy thêm vài nghìn mẫu và push lên Hub.
-    resume_dir, src = None, "RESUME=False"
+    # ── Resume: LUÔN, lấy bản ĐI XA NHẤT giữa local và Hub ───────────────────
+    # Không còn cờ `run.resume`. Bản cục bộ KHÔNG mặc nhiên thắng: máy này có
+    # thể vừa bật lại sau khi một máy khác đã chạy thêm vài nghìn mẫu và push.
+    resume_dir, src = None, "chưa có checkpoint nào — train từ số 0"
     if is_probe:
-        # Phase 3 chạy SONG SONG với một phiên train ở máy khác, nên bản cục
-        # bộ ở đây (nếu có) gần như luôn cũ hơn. Luôn kéo last/ của Hub.
+        # Probe chạy SONG SONG với một phiên train ở máy khác, nên bản cục bộ
+        # ở đây (nếu có) gần như luôn cũ hơn. Luôn kéo last/ của Hub.
         try:
             resume_dir = hub_pull_last()
         except Exception as e:
             raise RuntimeError(
                 f"mode=probe cần checkpoint ở {r.hub_repo}/last nhưng không "
-                f"tải được ({type(e).__name__}: {e}). Phase 3 không train, nên "
+                f"tải được ({type(e).__name__}: {e}). Probe không train, nên "
                 f"không có gì để probe khi phiên train chưa push lần nào.") from e
-        src = "Hub last/ (Phase 3 luôn lấy bản Hub)"
-    elif r.resume:
+        src = "Hub last/ (probe luôn lấy bản Hub)"
+    else:
         local = os.path.join(r.ckpt_dir, "last")
         local_st = read_state(local)
         remote_st = hub_state() if r.push_to_hub else None
@@ -688,34 +646,16 @@ def main(argv=None):
             resume_dir, src = local, "local"
         elif remote_st:
             resume_dir, src = hub_pull_last(), "Hub last/"
-        else:
-            src = "chưa có checkpoint nào"
 
-    assert resume_dir or not run_test or run_train, \
-        f"mode='test' nhưng không có checkpoint ({src})"
+    assert resume_dir or run_train, \
+        f"mode={r.mode} không train nhưng cũng không có checkpoint ({src})"
 
     if resume_dir:
         apply_state(read_state(resume_dir), resume_dir)
-        log("resume", f"{src} | phase {state['phase']} mẫu {state['samples']} "
-                      f"epoch {state['epoch']} done={state['done']}")
+        log("resume", f"{src} | mẫu {state['samples']} epoch {state['epoch']} "
+                      f"idx {state['epoch_samples']} step {state['step']}")
     else:
-        log("resume", f"train từ đầu — {src}")
-
-    # Phase 3 chấm trên bản TRUNG BÌNH SWA, không phải trọng số cuối. Bản cuối
-    # là một điểm ngẫu nhiên trên quỹ đạo SGD; trung bình của các đáy cycle mới
-    # là thứ đem đi val ở cuối mỗi phase, tức thứ đại diện cho ô sweep này.
-    weights_src = "weights.pt (trọng số cuối)"
-    if is_probe:
-        n_swa = int((swa_state or {}).get("n", 0))
-        if n_swa >= 1:
-            set_weights(swa_state["avg"], quiet=True)
-            weights_src = f"swa.pt (trung bình {n_swa} snapshot)"
-            log("probe", f"nạp {weights_src} — mốc mẫu "
-                         f"{swa_state.get('marks')}")
-        else:
-            warn("probe", "last/ trên Hub không có swa.pt — chấm trên trọng số "
-                          "cuối. Bật run.hub_include_swa=true ở PHIÊN TRAIN thì "
-                          "phiên probe sau mới có bản trung bình để dùng.")
+        log("resume", src)
     if r.hub_sync and r.push_to_hub:
         log("sync", "hub_sync BẬT — mỗi lần val sẽ hỏi Hub; chỉ máy đi xa nhất "
                     "mới được ghi, máy đi sau tự nạp bản của Hub rồi chạy tiếp")
@@ -758,14 +698,6 @@ def main(argv=None):
         log("eval", f"kéo eval/ từ Hub về {r.out_dir}")
         return "Hub eval/", st_eval
 
-    if state["done"] and run_train:
-        log("train", "checkpoint đã chạy hết lịch train — chuyển sang eval")
-        event("train_skip", reason="da_du_step")
-        run_train = False
-        if not run_test:
-            log("done", f"mode={r.mode} và ô đã train xong — không còn việc")
-            wfinish()
-            return 0
     if not run_train and run_test and not is_probe:
         eval_src, eval_step = find_eval()
         if eval_src and not r.force_eval:
@@ -779,164 +711,127 @@ def main(argv=None):
     val_loader = make_loader(df_val, collate, cfg)
 
     @torch.no_grad()
-    def evaluate(phase):
+    def evaluate():
         model.eval()
-        router.eval()
-        tot, cnt = 0.0, 0
-        acc = 0.0
+        router.eval()          # eval TẮT Gumbel và KHÔNG đếm tải cho bias
+        tot, cnt, rec = 0.0, 0, 0.0
         for i, b in enumerate(val_loader):
             if i >= r.eval_max_batches:
                 break
-            loss, st = (phase1_loss if phase == 1 else phase2_loss)(
-                to_device(b, DEVICE))
+            loss, st = train_loss(to_device(b, DEVICE))
             bridge.end()
             tot += float(loss)
-            acc += st.get("sup_acc_nonblank", 0.0)
+            # Headline của nhánh supervised là RECALL, không phải accuracy:
+            # sau khi MASK blank thì ô dương vẫn là thiểu số, và bỏ sót mới
+            # là cái sai đắt tiền trên phim ngực.
+            rec += st.get("sup_recall", 0.0)
             cnt += 1
         model.train()
         router.train()
         gc.collect()
         torch.cuda.empty_cache()
         return (tot / cnt if cnt else float("nan"),
-                acc / cnt if cnt else float("nan"))
+                rec / cnt if cnt else float("nan"))
 
-    def run_phase(phase, order):
-        """Train một phase. Con trỏ tiến độ là SỐ MẪU, không phải step.
+    def snapshot():
+        """Bản SAO (CPU) của trọng số đang train — không phải tham chiếu.
 
-        step chỉ còn là số dẫn xuất (samples // effective_batch) — nó vào log
-        và vào nhịp val, nhưng KHÔNG được lưu làm tiến độ: đổi batch là đổi
-        step, mà checkpoint phải đọc được trên máy khác batch. Lịch LR và biên
-        cycle SWA cũng đọc THẲNG số mẫu (src/optim.py), không qua step.
+        router.state_dict() trả về tensor DÙNG CHUNG bộ nhớ với param: giữ
+        nguyên rồi nạp bản trung bình đè lên là bản "sao lưu" cũng bị ghi đè
+        theo, và không còn đường lùi.
         """
-        eff = r.train_bs * r.grad_accum
-        total_samples = r.phase1_samples if phase == 1 else r.phase2_samples
-        same = state["phase"] == phase
-        samples = state["samples"] if same else 0
-        epoch = state["epoch"] if same else 0
-        total = -(-total_samples // eff)          # làm tròn LÊN
-        step = samples // eff
-        if samples >= total_samples:
-            log("train", f"phase {phase}: đã đủ {samples}/{total_samples} mẫu "
-                         f"— bỏ qua")
-            return
-        # Bộ đếm dừng sớm: tiếp tục đếm nếu resume ĐÚNG phase cũ, reset khi
-        # bước sang phase mới (val_loss của hai phase là hai đại lượng khác
-        # nhau — Focal ở P1, CE+sup+aux ở P2 — so với nhau là vô nghĩa).
-        es_best = state.get("es_best") if same else None
-        es_bad = state.get("es_bad", 0) if same else 0
-        es_on = bool(r.early_stop_patience) and phase in (r.early_stop_phases or [])
-        # `best_val` là val tốt nhất TỪNG THẤY, dùng cho save_best. Tách khỏi
-        # `es_best` vì từ đây hai thứ đó không còn là một (xem ngay dưới).
-        best_val = es_best
-        router_params = apply_phase_freeze(phase)
-        params = router_params + (expert_params if phase == 2 else [])
-        optimizer = make_optimizer(phase, router_params)
+        return {"router": {k: v.detach().to("cpu").clone()
+                           for k, v in router.state_dict().items()},
+                "experts": {k: v.detach().to("cpu").clone() for k, v in
+                            moe.expert_state_dict(model, expert_ids).items()}}
+
+    # Hai tham chiếu "sống" để nhánh bắt Ctrl-C ở ngoài lưu được đúng bộ
+    # optimizer và bộ cộng dồn SWA mà vòng train đang dùng.
+    swa_live = WeightAverager()
+    opt_live = None
+
+    def run_training():
+        """Vòng train VÔ HẠN. Thoát bằng Ctrl-C hoặc Superseded (bàn giao).
+
+        Con trỏ tiến độ là SỐ MẪU TÍCH LUỸ. step chỉ là số dẫn xuất (samples //
+        effective_batch) — nó vào log và vào nhịp val, nhưng KHÔNG được lưu làm
+        tiến độ: đổi batch là đổi step, mà checkpoint phải đọc được trên máy
+        khác batch.
+        """
+        nonlocal swa_live, opt_live
+        samples = state["samples"]
+        epoch = state["epoch"]
+        epoch_samples = min(state["epoch_samples"], n_train)
+        step = state["step"]
+        best_val = state.get("best_val")
+
+        optimizer = make_optimizer()
         # Dựng lịch TRƯỚC optimizer.load_state_dict(): nó chụp base_lrs từ
         # param_groups, mà load_state_dict ghi đè "lr" bằng LR CUỐI của lần
         # chạy trước (một điểm giữa dốc cosine).
         sched = CosineRestartSchedule(
-            optimizer, total_samples=total_samples,
-            cycle_samples=r.cycle_samples, warmup_samples=r.warmup_samples,
-            min_lr_ratio=r.min_lr_ratio, cycle_lr_decay=r.cycle_lr_decay)
+            optimizer, cycle_samples=r.cycle_samples,
+            warmup_samples=r.warmup_samples, min_lr_ratio=r.min_lr_ratio,
+            cycle_lr_decay=r.cycle_lr_decay)
         swa = WeightAverager()
-
-        def snapshot():
-            """Bản SAO (CPU) của trọng số đang train — không phải tham chiếu.
-
-            router.state_dict() trả về tensor DÙNG CHUNG bộ nhớ với param:
-            giữ nguyên rồi nạp bản trung bình đè lên là bản "sao lưu" cũng bị
-            ghi đè theo, và không còn đường lùi nếu SWA thua.
-            """
-            out = {"router": {k: v.detach().to("cpu").clone()
-                              for k, v in router.state_dict().items()}}
-            if phase == 2:
-                out["experts"] = {
-                    k: v.detach().to("cpu").clone() for k, v in
-                    moe.expert_state_dict(model, expert_ids).items()}
-            return out
-
-        if opt_state is not None and same and samples > 0:
+        swa_live, opt_live = swa, optimizer
+        if opt_state is not None and samples > 0:
             try:
                 optimizer.load_state_dict(opt_state["optimizer"])
             except ValueError as e:
-                # Số param trong group đổi so với lúc ghi ckpt — gần như luôn
-                # là do bật/tắt p2_freeze_*. Moment cũ không còn ghép được vào
-                # danh sách param mới; reset chúng là mất một chút đà, KHÔNG
-                # mất tiến độ (con trỏ mẫu + trọng số đã nạp ở apply_state).
                 warn("resume", f"optimizer.pt không khớp danh sách param "
-                               f"({e}) — nhiều khả năng p2_freeze_trunk / "
-                               f"p2_freeze_sup_head đã đổi kể từ ckpt này. "
-                               f"Moment AdamW reset, train tiếp bình thường.")
+                               f"({e}) — moment AdamW reset, train tiếp bình "
+                               f"thường.")
             torch.set_rng_state(opt_state["torch_rng"].cpu().to(torch.uint8))
-            log("resume", f"phase {phase}: khôi phục optimizer + RNG (lịch LR "
-                          f"là hàm của số mẫu — không cần tua)")
-        if r.swa and swa_state is not None and same and samples > 0:
+            log("resume", "khôi phục optimizer + RNG (lịch LR là hàm của số "
+                          "mẫu — không cần tua)")
+        if r.swa and swa_state is not None:
             swa.load_state_dict(swa_state)
         sched.set_samples(samples)
-        log("lr", f"P{phase} {sched.describe(eff)}")
-        log("lr", f"P{phase} biên cycle (mẫu): {sched.bounds()}"
-                  + (f" | SWA gom {len(sched.bounds())} snapshot"
-                     if r.swa else " | SWA TẮT"))
+        log("lr", sched.describe(eff))
+        log("lr", f"biên cycle sắp tới (mẫu): "
+                  f"{sched.bounds(5, samples)}"
+                  + (" | SWA gom snapshot ở mỗi mốc" if r.swa else
+                     " | SWA TẮT"))
         if samples > 0:
-            log("lr", f"P{phase} vào lại giữa cycle "
-                      f"{sched.cycle_index(samples)}/{sched.n_cycles - 1} "
-                      f"tại lr ×{sched.multiplier(samples):.4f}")
+            log("lr", f"vào lại giữa cycle {sched.cycle_index(samples)} tại "
+                      f"lr ×{sched.multiplier(samples):.4f}")
 
-        # ── Dừng sớm phải đổi ĐƠN VỊ khi có warm restart ────────────────────
-        # Ngay sau mỗi restart, LR nhảy về đỉnh và val_loss LEO LÊN vài lần val
-        # liền. Đó là cơ chế của SGDR, không phải model xấu đi. Đếm patience
-        # theo từng lần val thì với eval_every=10 và cycle 200 step, ba lần val
-        # đầu sau restart đầu tiên đã đủ bắn nhầm — phase chết ngay khi lịch LR
-        # mới bắt đầu làm việc.
-        # Nên khi có >1 cycle: điểm của một cycle = val TỐT NHẤT trong cycle
-        # đó, và chỉ so ở biên cycle. patience đếm bằng CYCLE.
-        # Khi chỉ có 1 cycle (cycle_samples=null, không restart) thì val_loss
-        # đi xuống đều — giữ nguyên cách đếm theo từng lần val như cũ.
-        es_per_cycle = es_on and sched.n_cycles > 1
-        cyc_best = None                  # val tốt nhất trong cycle đang chạy
-        if es_on:
-            log("val", f"P{phase} dừng sớm: patience {r.early_stop_patience} "
-                       + (f"CYCLE (val tốt nhất mỗi cycle, so ở biên) — "
-                          f"{sched.n_cycles} cycle cả phase"
-                          if es_per_cycle else
-                          "lần val liên tiếp (không có restart)"))
-
-        # idx = vị trí trong lát mẫu của phase; epoch = số vòng đã đi hết lát.
-        idx = samples % len(order)
-        loader = make_loader(df_train, collate, cfg, order=order[idx:])
+        loader = make_loader(df_train, collate, cfg,
+                             order=order[epoch_samples:])
         it = iter(loader)
-        step_fn = phase1_loss if phase == 1 else phase2_loss
-        loss_name = "focal" if phase == 1 else "ce+sup+aux"
         model.train()
         router.train()
         optimizer.zero_grad(set_to_none=True)
         limiter = RateLimiter(r.log_every_sec)
         t0, n_vals, n_saves, steps_run = time.time(), 0, 0, 0
-        log("train", f"── PHASE {phase} ── {total_samples} mẫu ({len(order)} "
-                     f"trong lát) | loss = {loss_name} | bắt đầu ở mẫu "
-                     f"{samples} (epoch {epoch} idx {idx}, step {step}/{total})")
+        log("train", f"── TRAIN (vô hạn) ── bắt đầu ở mẫu {samples} "
+                     f"(epoch {epoch}, idx {epoch_samples}/{n_train}, "
+                     f"step {step}) | loss = ce + {r.w_sup}·asl")
 
-        while samples < total_samples:
+        while True:
             tstep = time.time()
             # Mốc mẫu ở ĐẦU step: LR của một step là LR tại chỗ dữ liệu của
-            # step đó bắt đầu (bản cũ: scheduler.step() sau optimizer.step()).
+            # step đó bắt đầu.
             step_start = samples
-            # Khởi tạo ở đây chứ không ngay trước khối val: khối biên cycle
-            # (chạy sớm hơn trong thân vòng) cũng có quyền bật cờ này.
-            stop_early = False
             running, agg = 0.0, {}
             for _ in range(r.grad_accum):
                 try:
                     batch = next(it)
                 except StopIteration:
-                    # Phase chỉ dùng đúng lát mẫu của nó (§1.7): hết lát thì
-                    # sang epoch mới của CHÍNH lát đó, KHÔNG lấn sang lát kia.
+                    # Hết tập train -> nâng epoch và đi lại từ đầu ĐÚNG thứ tự
+                    # rare-first đó. `samples` KHÔNG reset: nó là con trỏ tích
+                    # luỹ của cả đời ô sweep, và lịch LR đọc thẳng nó.
                     epoch += 1
+                    epoch_samples = 0
                     it = iter(make_loader(df_train, collate, cfg, order=order))
                     batch = next(it)
-                    log("data", f"phase {phase}: hết lát mẫu — epoch {epoch}")
+                    log("data", f"hết tập train — epoch {epoch} (mẫu tích luỹ "
+                                f"{samples})")
+                    event("epoch", epoch=epoch, samples=samples, step=step)
                 samples += r.train_bs
-                loss, st = step_fn(to_device(batch, DEVICE))
+                epoch_samples += r.train_bs
+                loss, st = train_loss(to_device(batch, DEVICE))
                 (loss / r.grad_accum).backward()
                 # SAU backward: gradient-checkpointing chạy lại forward trong
                 # backward và cần đúng tensor gate của step này.
@@ -946,129 +841,90 @@ def main(argv=None):
                     if isinstance(v, float):
                         agg[k] = agg.get(k, 0.0) + v / r.grad_accum
                 del batch, loss
-            gnorm = float(torch.nn.utils.clip_grad_norm_(params,
+            gnorm = float(torch.nn.utils.clip_grad_norm_(all_params,
                                                          r.max_grad_norm))
             lr_now = sched.set_samples(step_start)[0]
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            # Cân bằng tải: nắn bias theo tải đã đếm được trong CẢ grad_accum
+            # micro-batch của step này. Đây là chỗ duy nhất thay cho aux loss.
+            upd = router.update_bias()
+            if upd:
+                agg["bias_span"], agg["load_cv"] = upd
             step += 1
             steps_run += 1
+
             # ── Biên cycle: LR vừa chạm đáy -> chụp cho bộ trung bình ───────
             # Bắt bằng "chỉ số cycle vừa tăng" chứ không bằng "samples % cycle
             # == 0": effective batch không nhất thiết chia hết cycle_samples,
             # nên có máy sẽ nhảy qua đúng mốc. Cách này lệch tối đa một step
-            # trên mọi cấu hình batch. Cycle CUỐI không vào đây (chỉ số bị
-            # kẹp) — nó được chụp ở khối kết thúc phase bên dưới.
+            # trên mọi cấu hình batch.
             cyc = sched.cycle_index(step_start)
-            crossed = sched.cycle_index(samples) > cyc
-            if r.swa and crossed:
+            if r.swa and sched.cycle_index(samples) > cyc:
                 swa.add(snapshot(), mark=samples)
-                log("swa", f"P{phase} hết cycle {cyc} @ mẫu {samples} "
+                log("swa", f"hết cycle {cyc} @ mẫu {samples} "
                            f"(lr ×{sched.multiplier(step_start):.4f}) -> "
                            f"snapshot {swa.n}")
-                event("swa_snapshot", phase=phase, cycle=cyc, step=step,
-                      samples=samples, n=swa.n)
-            # Chốt điểm của cycle vừa xong. cyc_best is None = cycle này chưa
-            # có lần val nào (cycle ngắn hơn eval_every) -> không tính, không
-            # phạt: một cycle không đo được thì không nói lên điều gì.
-            if es_per_cycle and crossed and cyc_best is not None:
-                if es_best is None or cyc_best < es_best - r.early_stop_min_delta:
-                    es_best, es_bad, mark = cyc_best, 0, "✓ tốt nhất"
-                else:
-                    es_bad += 1
-                    mark = (f"không cải thiện {es_bad}/"
-                            f"{r.early_stop_patience} cycle")
-                log("val", f"P{phase} chốt cycle {cyc} @ mẫu {samples}: val "
-                           f"tốt nhất trong cycle = {cyc_best:.4f} | {mark} "
-                           f"(tốt nhất từ trước {es_best:.4f})")
-                event("cycle_score", phase=phase, cycle=cyc, samples=samples,
-                      cycle_best=round(cyc_best, 5), es_best=round(es_best, 5),
-                      es_bad=es_bad)
-                stop_early = es_bad >= r.early_stop_patience
-                cyc_best = None
-            state.update(phase=phase, samples=samples, epoch=epoch, step=step,
-                         es_best=es_best, es_bad=es_bad)
+                event("swa_snapshot", cycle=cyc, step=step, samples=samples,
+                      n=swa.n)
+            state.update(samples=samples, epoch=epoch,
+                         epoch_samples=epoch_samples, step=step,
+                         best_val=best_val)
 
             step_sec = time.time() - tstep
-            wlog({f"p{phase}/loss": running, f"p{phase}/grad_norm": gnorm,
-                  f"p{phase}/step": step, f"p{phase}/samples": samples,
-                  f"p{phase}/epoch": epoch, "phase": phase,
-                  f"p{phase}/lr": lr_now,
-                  f"p{phase}/cycle": sched.cycle_index(step_start),
-                  f"p{phase}/swa_n": swa.n,
-                  f"p{phase}/step_sec": step_sec,
-                  **{f"p{phase}/{k}": v for k, v in agg.items()}})
-            event("train_step", phase=phase, step=step, samples=samples,
-                  epoch=epoch, loss=round(running, 5),
-                  grad_norm=round(gnorm, 4),
-                  lr=lr_now, cycle=sched.cycle_index(step_start),
-                  step_sec=round(step_sec, 3),
+            wlog({"train/loss": running, "train/grad_norm": gnorm,
+                  "train/step": step, "train/samples": samples,
+                  "train/epoch": epoch, "train/lr": lr_now,
+                  "train/cycle": cyc, "train/swa_n": swa.n,
+                  "train/step_sec": step_sec,
+                  **{f"train/{k}": v for k, v in agg.items()}})
+            event("train_step", step=step, samples=samples, epoch=epoch,
+                  loss=round(running, 5), grad_norm=round(gnorm, 4),
+                  lr=lr_now, cycle=cyc, step_sec=round(step_sec, 3),
                   vram_gb=round(torch.cuda.memory_allocated(0) / 1024**3, 2),
                   **{k: round(v, 5) for k, v in agg.items()})
-            if limiter.ready(force=(step <= 3 or samples >= total_samples)):
-                el = time.time() - t0
+            if limiter.ready(force=step <= 3):
                 extra = " ".join(f"{k}={agg[k]:.3f}" for k in
-                                 ("ce", "sup", "aux", "sup_acc_nonblank")
-                                 if k in agg)
-                # ETA tính trên số step CỦA LẦN CHẠY NÀY: sau resume thì
-                # `step` đã lớn sẵn, chia cho nó sẽ ra ETA lạc quan giả tạo.
-                eta = (total - step) * el / max(steps_run, 1) / 3600
+                                 ("ce", "sup", "balance", "bias_span",
+                                  "sup_recall") if k in agg)
+                # Không có ETA tới đích: lịch train không có đích. Hai con số
+                # thay thế, cả hai đều đọc được: phiên này đã chạy bao lâu và
+                # còn bao lâu nữa hết epoch hiện tại.
+                el = (time.time() - t0) / 3600
+                left = (n_train - epoch_samples) / max(r.train_bs, 1) \
+                    * (step_sec / max(r.grad_accum, 1)) / 3600
                 log("train",
-                    f"P{phase} {samples}/{total_samples} mẫu "
-                    f"(epoch {epoch} | step {step}/{total}) "
-                    f"loss={running:.4f} {extra} "
-                    f"gnorm={gnorm:.3f} lr={lr_now:.2e} "
-                    f"cyc={sched.cycle_index(step_start)}/{sched.n_cycles - 1} "
-                    f"| {step_sec:.1f}s/step | ETA {eta:.2f}h "
+                    f"mẫu {samples} (epoch {epoch} {epoch_samples}/{n_train} "
+                    f"| step {step}) loss={running:.4f} {extra} "
+                    f"gnorm={gnorm:.3f} lr={lr_now:.2e} cyc={cyc} "
+                    f"| {step_sec:.1f}s/step | phiên {el:.2f}h / {steps_run} "
+                    f"step | hết epoch sau ~{left:.2f}h "
                     f"| vram {torch.cuda.memory_allocated(0)/1024**3:.1f}GB")
             if r.eval_every and step % r.eval_every == 0:
                 # Nhịp val vẫn đếm theo STEP, có chủ ý: một step là một lần
                 # cập nhật trọng số và tốn thời gian tương đương nhau trên mọi
-                # máy, nên "10 step" là nhịp đo giống nhau ở khắp nơi. Chỉ
-                # CHECKPOINT mới phải đếm theo mẫu, vì nó đi qua máy khác.
+                # máy. Chỉ CHECKPOINT mới phải đếm theo mẫu, vì nó đi qua máy
+                # khác.
                 n_vals += 1
-                vl, vacc = evaluate(phase)
-                wlog({f"p{phase}/val_loss": vl,
-                      f"p{phase}/val_sup_acc_nonblank": vacc,
-                      f"p{phase}/step": step, f"p{phase}/samples": samples})
-                # NaN không bao giờ nhỏ hơn best -> tính là KHÔNG cải thiện.
-                # Ba lần val ra NaN liên tiếp thì dừng là đúng: fp16 đã tràn.
-                better = (best_val is None
-                          or vl < best_val - r.early_stop_min_delta)
+                vl, vrec = evaluate()
+                wlog({"val/loss": vl, "val/sup_recall": vrec,
+                      "train/step": step, "train/samples": samples})
+                better = best_val is None or vl < best_val
                 if better:
                     best_val = vl
-                if es_per_cycle:
-                    # Chỉ GOM, chưa phán xét: điểm được chốt ở biên cycle.
-                    cyc_best = vl if cyc_best is None else min(cyc_best, vl)
-                elif es_on:
-                    if better:
-                        es_best, es_bad = vl, 0
-                    else:
-                        es_bad += 1
-                state.update(es_best=es_best, es_bad=es_bad)
-                log("val", f"P{phase} mẫu {samples} (step {step}) "
-                           f"loss={vl:.4f} sup_acc_nb={vacc:.4f}"
-                           + (" | ✓ tốt nhất" if better else "")
-                           + ("" if not es_on else
-                              (f" | cycle {sched.cycle_index(step_start)}: "
-                               f"đang giữ {cyc_best:.4f}" if es_per_cycle else
-                               ("" if better else
-                                f" | không cải thiện {es_bad}/"
-                                f"{r.early_stop_patience} "
-                                f"(tốt nhất {es_best:.4f})"))))
-                event("eval", phase=phase, step=step, samples=samples,
-                      epoch=epoch, val_loss=round(vl, 5),
-                      val_sup_acc_nonblank=round(vacc, 5),
-                      cycle=sched.cycle_index(step_start),
-                      cycle_best=(None if cyc_best is None
-                                  else round(cyc_best, 5)),
-                      es_best=(None if es_best is None else round(es_best, 5)),
-                      es_bad=es_bad)
-                if es_on and better and r.save_best:
+                state["best_val"] = best_val
+                log("val", f"mẫu {samples} (step {step}) loss={vl:.4f} "
+                           f"sup_recall={vrec:.4f}"
+                           + (" | ✓ tốt nhất" if better else
+                              f" (tốt nhất {best_val:.4f})"))
+                event("eval", step=step, samples=samples, epoch=epoch,
+                      val_loss=round(vl, 5),
+                      val_sup_recall=round(vrec, 5), cycle=cyc,
+                      best_val=(None if best_val is None
+                                else round(best_val, 5)))
+                if better and r.save_best:
                     save_checkpoint(state, optimizer, swa, "best",
                                     push=False, with_optimizer=False)
-                if es_on and not es_per_cycle:
-                    stop_early = es_bad >= r.early_stop_patience
 
                 # ── Ai được quyền ghi? Hỏi Hub TRƯỚC khi save ───────────────
                 # Đi sau -> nhả quyền ghi ngay lập tức, thoát ra ngoài để nạp
@@ -1082,116 +938,46 @@ def main(argv=None):
                         state, optimizer, swa, "last",
                         push=(True if r.hub_sync else
                               n_saves % r.push_every_n_saves == 0))
-            if stop_early:
-                log("train", f"DỪNG SỚM phase {phase} @ mẫu {samples}/"
-                             f"{total_samples}: {r.early_stop_patience} "
-                             + ("cycle" if es_per_cycle else "lần val")
-                             + f" liên tiếp không cải thiện (val_loss tốt nhất "
-                               f"{es_best:.4f})"
-                             + (f" — trọng số tốt nhất ở {r.ckpt_dir}/best/"
-                                if r.save_best else ""))
-                event("early_stop", phase=phase, step=step, samples=samples,
-                      total_samples=total_samples,
-                      best_val_loss=round(es_best, 5),
-                      unit=("cycle" if es_per_cycle else "val"),
-                      patience=r.early_stop_patience)
-                break
             if step % 50 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Cycle cuối chỉ chụp khi phase ĐI HẾT lịch: dừng sớm thì trọng số
-        # đang nằm giữa dốc (LR còn cao), cho vào bộ trung bình là kéo bản
-        # trung bình ra khỏi vùng đáy mà 11 snapshot kia đã gom được.
-        if r.swa and samples >= total_samples:
-            swa.add(snapshot(), mark=samples)
-            log("swa", f"P{phase} snapshot cuối phase @ mẫu {samples} "
-                       f"-> tổng {swa.n}")
-        elif r.swa and swa.n:
-            log("swa", f"P{phase} dừng giữa cycle "
-                       f"{sched.cycle_index(samples)} — không chụp thêm, "
-                       f"trung bình vẫn là {swa.n} snapshot đáy")
-
-        vl, vacc = evaluate(phase)
-        # ── Bản trung bình có thắng bản cuối không? ─────────────────────────
-        # Hỏi bằng val chứ không tin sẵn: SWA gần như luôn tốt hơn khi lịch đủ
-        # dài, nhưng với phase ngắn (2-3 cycle) hoặc khi dừng sớm thì snapshot
-        # đầu tiên còn kém hẳn và kéo trung bình xuống. So rồi mới lấy.
-        if r.swa and swa.ready() and r.swa_use != "never":
-            live = snapshot()
-            set_weights(swa.payload(), quiet=True)
-            vl_swa, vacc_swa = evaluate(phase)
-            better = vl_swa < vl
-            take = (r.swa_use == "always") or better
-            log("swa", f"P{phase} trung bình {swa.n} snapshot (mốc "
-                       f"{swa.marks}) | val {vl_swa:.4f} vs bản cuối {vl:.4f}"
-                       f" | sup_acc_nb {vacc_swa:.4f} vs {vacc:.4f} -> "
-                       + ("DÙNG bản trung bình" if take else "GIỮ bản cuối")
-                       + (" (swa_use=always, không hỏi val)"
-                          if r.swa_use == "always" and not better else ""))
-            event("swa_final", phase=phase, n_snapshots=swa.n,
-                  marks=list(swa.marks), val_loss_swa=round(vl_swa, 5),
-                  val_loss_last=round(vl, 5), val_acc_swa=round(vacc_swa, 5),
-                  val_acc_last=round(vacc, 5), taken=bool(take),
-                  swa_use=r.swa_use)
-            wlog({f"p{phase}/val_loss_swa": vl_swa,
-                  f"p{phase}/val_loss_last": vl,
-                  f"p{phase}/swa_taken": int(take)})
-            if take:
-                vl, vacc = vl_swa, vacc_swa
-            else:
-                set_weights(live, quiet=True)
-            del live
-        elif r.swa and swa.n == 1:
-            log("swa", f"P{phase} chỉ có 1 snapshot — trung bình của một điểm "
-                       f"là chính nó, bỏ qua")
-
-        log("train", f"PHASE {phase} xong {samples} mẫu / {step} step (epoch "
-                     f"{epoch}) | val={vl:.4f} sup_acc_nb={vacc:.4f} "
-                     f"| {(time.time()-t0)/60:.1f} phút")
-        state["done"] = (phase == 2) or (only_phase == phase)
-        # swa=None: bộ cộng dồn của phase này đã tiêu thụ xong (trọng số trong
-        # ckpt CHÍNH LÀ kết quả). Giữ lại swa.pt là để phase sau resume nhầm.
-        save_checkpoint(state, optimizer, None, "last", push=True)
-        # Phase sau bắt đầu từ mẫu 0 của lát riêng nó.
-        state.update(samples=0, epoch=0, step=0)
-        del optimizer, sched, swa
-        gc.collect()
-        torch.cuda.empty_cache()
-
+    interrupted = False
     if run_train:
-        # Vòng ngoài chịu được BÀN GIAO: run_phase ném Superseded khi thấy Hub
-        # đi trước; ở đây nạp bản của Hub rồi dựng lại lịch phase từ trạng thái
-        # mới. Mỗi lần bàn giao cách nhau ít nhất một quãng val (eval_every
-        # step) nên không có vòng lặp chặt.
+        # Vòng ngoài chịu được BÀN GIAO: run_training ném Superseded khi thấy
+        # Hub đi trước; ở đây nạp bản của Hub rồi vào lại vòng train từ trạng
+        # thái mới. Mỗi lần bàn giao cách nhau ít nhất một quãng val nên không
+        # có vòng lặp chặt.
         n_adopt = 0
         while True:
             try:
-                for ph in ([only_phase] if only_phase else [1, 2]):
-                    if state["phase"] > ph:
-                        log("train", f"phase {ph}: checkpoint đã ở phase "
-                                     f"{state['phase']} — bỏ qua")
-                        continue
-                    run_phase(ph, order1 if ph == 1 else order2)
-                    if ph == 1 and not only_phase:
-                        # es_best/es_bad phải reset: val_loss của P1 (Focal) và
-                        # P2 (CE+sup+aux) là hai thang đo khác nhau.
-                        state.update(phase=2, samples=0, epoch=0, step=0,
-                                     es_best=None, es_bad=0)
-                break
+                run_training()
             except Superseded as e:
                 n_adopt += 1
                 adopt_hub(e.remote)
-                if state["done"]:
-                    log("train", "bản trên Hub đã chạy hết lịch train — máy này "
-                                 "không còn gì để train, chuyển sang eval")
-                    break
                 if n_adopt >= 3:
                     warn("sync", f"đã nhận bàn giao {n_adopt} lần — máy này "
                                  f"liên tục chậm hơn máy khác. Nó vẫn chạy "
                                  f"đúng, chỉ là gần như không đóng góp step "
                                  f"nào; cân nhắc tắt bớt hoặc đặt "
                                  f"run.hub_sync=false cho máy nhanh nhất.")
+                continue
+            except KeyboardInterrupt:
+                # Ctrl-C là CÁCH DỪNG CHÍNH THỨC của lịch train vô hạn, không
+                # phải sự cố: lưu checkpoint tại đúng chỗ đang đứng rồi đi
+                # tiếp sang khâu infer (nếu mode=both).
+                interrupted = True
+                log("train", f"Ctrl-C @ mẫu {state['samples']} (epoch "
+                             f"{state['epoch']}) — lưu checkpoint rồi dừng")
+                try:
+                    save_checkpoint(state, opt_live, swa_live, "last",
+                                    push=r.push_to_hub,
+                                    with_optimizer=opt_live is not None)
+                except Exception as e:
+                    warn("train", f"không lưu được ckpt lúc dừng ({e})")
+                event("interrupted", samples=state["samples"],
+                      epoch=state["epoch"], step=state["step"])
+            break
     else:
         log("train", f"BỎ QUA train (mode={r.mode})")
 
@@ -1200,6 +986,43 @@ def main(argv=None):
         log("infer", f"BỎ QUA infer (mode={r.mode})")
         wfinish()
         return 0
+    if run_train and not interrupted:
+        log("infer", "train thoát mà không qua Ctrl-C — vẫn chạy infer trên "
+                     "trọng số hiện tại")
+
+    # ── Trọng số đem đi chấm: bản trung bình SWA nếu có ─────────────────────
+    # Trọng số cuối là MỘT ĐIỂM ngẫu nhiên trên quỹ đạo SGD, có thể đang ở
+    # giữa dốc của một cycle. Trung bình các đáy cycle mới là thứ đại diện cho
+    # ô sweep này.
+    weights_src = "weights.pt (trọng số cuối)"
+    swa_payload = (swa_live.payload() if swa_live.ready()
+                   else (swa_state or {}).get("avg"))
+    swa_n = swa_live.n if swa_live.ready() else int((swa_state or {}).get("n", 0))
+    if r.swa and swa_payload and swa_n >= 2 and r.swa_use != "never":
+        if r.swa_use == "always":
+            set_weights(swa_payload, quiet=True)
+            weights_src = f"swa (trung bình {swa_n} snapshot)"
+            log("swa", f"dùng bản trung bình {swa_n} snapshot để chấm "
+                       f"(swa_use=always, không hỏi val)")
+        else:                            # auto: hỏi val rồi mới lấy
+            live = snapshot()
+            vl_last, _ = evaluate()
+            set_weights(swa_payload, quiet=True)
+            vl_swa, _ = evaluate()
+            if vl_swa < vl_last:
+                weights_src = f"swa (trung bình {swa_n} snapshot)"
+                log("swa", f"trung bình {swa_n} snapshot val {vl_swa:.4f} < "
+                           f"bản cuối {vl_last:.4f} -> DÙNG bản trung bình")
+            else:
+                set_weights(live, quiet=True)
+                log("swa", f"trung bình {swa_n} snapshot val {vl_swa:.4f} ≥ "
+                           f"bản cuối {vl_last:.4f} -> GIỮ bản cuối")
+            del live
+    elif is_probe and swa_n < 2:
+        warn("probe", "last/ trên Hub không có swa.pt (hoặc mới 1 snapshot) — "
+                      "chấm trên trọng số cuối. Bật run.hub_include_swa=true ở "
+                      "PHIÊN TRAIN thì phiên probe sau mới có bản trung bình.")
+    log("infer", f"trọng số đem chấm: {weights_src}")
 
     model.eval()
     router.eval()
@@ -1260,7 +1083,7 @@ def main(argv=None):
                 repetition_penalty=rep_penalty or r.repetition_penalty,
                 no_repeat_ngram_size=r.no_repeat_ngram, num_beams=1,
                 use_cache=True)
-            share = (bridge.out[3]["expert_share"] if bridge.out else None)
+            share = (bridge.out[2]["expert_share"] if bridge.out else None)
         finally:
             bridge.end()
         texts = [normalize_headers(s.strip()) for s in
@@ -1269,7 +1092,7 @@ def main(argv=None):
         return texts, share
 
     def generate_records(paths):
-        """policy TẮT (mặc định Phase này): sinh MỘT lần, không retry.
+        """policy TẮT (mặc định): sinh MỘT lần, không retry.
 
         Vẫn chạy 7-check để GHI LẠI pass/fail — biết tỉ lệ vi phạm của từng ô
         sweep là thông tin, còn sửa văn phong là việc của train chứ không phải
@@ -1304,7 +1127,7 @@ def main(argv=None):
 
     out_csv = os.path.join(r.out_dir, "reports.csv")
     if is_probe:
-        # infer_bs > 1 KHÔNG dùng được ở đây: mỗi ảnh cần 7 forward với gate
+        # infer_bs > 1 KHÔNG dùng được ở đây: mỗi ảnh cần K+1 forward với gate
         # riêng, mà CTX là một gate cho cả batch. Ép về 1 và nói rõ.
         if r.infer_bs != 1:
             log("probe", f"infer_bs={r.infer_bs} -> 1 (mỗi ảnh một gate riêng)")
@@ -1314,8 +1137,7 @@ def main(argv=None):
             collate=collate, df=df_infer, generate_records=generate_records,
             disease_names=disease_names, aspect_names=aspect_names,
             img_token_id=find_image_token_id(processor), hf_token=hf_token,
-            train_state=dict(state, swa_n=int((swa_state or {}).get("n", 0)),
-                             weights_src=weights_src),
+            train_state=dict(state, swa_n=swa_n, weights_src=weights_src),
             log=log, warn=warn, event=event)
         expert_share = None
     else:
@@ -1359,9 +1181,8 @@ def main(argv=None):
     metrics = run_metrics(res_df, tokenizer, cfg, state["step"], log,
                           expert_share=expert_share)
     if r.push_to_hub:
-        # Phase 3 đẩy vào repo PROBE (dataset), KHÔNG vào eval/ của repo
-        # checkpoint: phiên train đang chạy song song cũng ghi eval/ ở đó, và
-        # hai bên chấm trên hai tập test khác cỡ với hai bộ trọng số khác nhau.
+        # Probe đẩy vào repo PROBE (dataset), KHÔNG vào eval/ của repo
+        # checkpoint: phiên train đang chạy song song cũng ghi eval/ ở đó.
         repo, kind, where = ((r.probe_repo, "dataset", "eval/ (repo probe)")
                              if is_probe else (r.hub_repo, "model", "eval/"))
         try:
@@ -1394,7 +1215,10 @@ def _guarded_main(argv=None):
         event("run_end", rc=rc, minutes=round(L.elapsed() / 60, 2))
         return rc
     except KeyboardInterrupt:
-        L.warn("run", "bị ngắt bởi người dùng (Ctrl-C)")
+        # Ctrl-C TRONG vòng train đã được bắt ở trong main() (lưu ckpt rồi đi
+        # tiếp sang infer). Rơi tới đây nghĩa là Ctrl-C ở khâu khác — nạp
+        # model, tải dữ liệu, infer — nơi không có gì để lưu.
+        L.warn("run", "bị ngắt bởi người dùng (Ctrl-C) ngoài vòng train")
         event("run_end", rc=130, reason="KeyboardInterrupt")
         return 130
     except BaseException as e:   # BaseException để tóm cả SystemExit

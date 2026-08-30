@@ -119,15 +119,22 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         "n_block": cfg.sweep.n_block,
         "n_expert": cfg.fixed.n_expert,
         "top_k": cfg.fixed.top_k,
-        "route_noise": float(getattr(cfg.fixed, "route_noise", 0.0) or 0.0),
+        "route_noise": float(getattr(cfg.fixed, "route_noise", 1.0) or 0.0),
+        "bias_gamma": float(getattr(cfg.fixed, "bias_gamma", 0.0) or 0.0),
+        "w_sup": float(cfg.run.w_sup),
+        "asl_gamma_pos": float(getattr(cfg.run, "asl_gamma_pos", 0.0)),
+        "asl_gamma_neg": float(getattr(cfg.run, "asl_gamma_neg", 4.0)),
+        "asl_clip": float(getattr(cfg.run, "asl_clip", 0.02)),
+        "uncertain_soft": float(getattr(cfg.run, "uncertain_soft", 0.7)),
         "architecture": variant_desc(cfg),
         "adapter": adapter_desc(cfg.fixed),
         "max_seq_len": cfg.run.max_seq_len,
     }
     if expert_share:
         meta["expert_share"] = [round(float(v), 4) for v in expert_share]
-        # Aux loss ép router chia đều: lệch xa 1/E nghĩa là w_aux quá nhỏ,
-        # hoặc router đã sập về "luôn chọn cùng một expert".
+        # Không còn aux loss: cân bằng tải do bias của router lo (γ =
+        # fixed.bias_gamma). Lệch xa 1/E nghĩa là γ quá nhỏ so với dải route
+        # logit, hoặc router đã sập về "luôn chọn cùng một expert".
         meta["expert_share_max"] = round(float(max(expert_share)), 4)
     if cfg.run.use_policy:
         m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,

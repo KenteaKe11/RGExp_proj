@@ -18,8 +18,8 @@ QDoRA (dequantize base, chuẩn cột, detach ||V+ΔV||) giữ nguyên bản g�
 chép tay lại — chép tay là chỗ dễ sai âm thầm nhất.
 
 CHI PHÍ, nói thẳng: sparsity của top-k CHỈ tiết kiệm khi cả batch cùng bỏ qua
-một expert. Với E=4, k=2, batch 8 thì hầu như expert nào cũng có người chọn ->
-mỗi forward vẫn tính đủ 4 delta. Cái đắt nhất là dequantize base weight của
+một expert. Với E=12, k=4, batch 8 thì hầu như expert nào cũng có người chọn ->
+mỗi forward vẫn tính đủ 12 delta. Cái đắt nhất là dequantize base weight của
 QDoRA: ở đây nó được nhớ tạm trong đúng vòng lặp của một layer (xem
 `_dq_cached`) nên chỉ chạy 1 lần/layer thay vì E lần.
 """
@@ -126,7 +126,7 @@ def _moe_forward(self, x, *args, **kwargs):
     result = self.base_layer(x, *args, **kwargs)
     w = CTX.weights
     if w is None or not CTX.enabled or self.disable_adapters:
-        # Chưa có gate (Phase 1, hoặc warm-up) -> decoder chạy như base thuần.
+        # Chưa có gate (bridge ở chế độ "off") -> decoder chạy như base thuần.
         return result
 
     if w.shape[0] != x.shape[0]:
@@ -149,7 +149,7 @@ def _moe_forward(self, x, *args, **kwargs):
     try:
         for e, name in enumerate(names):
             # Không mẫu nào trong batch chọn expert này -> bỏ hẳn (đây là chỗ
-            # DUY NHẤT top-k tiết kiệm được tính toán thật; với E=4/k=2 và
+            # DUY NHẤT top-k tiết kiệm được tính toán thật; với E=12/k=4 và
             # batch ≥ 4 thì hiếm khi xảy ra).
             if not active[e]:
                 continue
@@ -203,7 +203,7 @@ def attach_experts(model, base_cfg, n_expert, log):
                                f"không phủ hết target?")
         if not mod.lora_magnitude_vector:
             raise RuntimeError("layer không có lora_magnitude_vector — "
-                               "use_dora=False? Phase này cố định QDoRA.")
+                               "use_dora=False? Project này cố định QDoRA.")
         # `_dora_delta` tái dùng base_result đã tính, tức KHÔNG áp dropout lên
         # x. Đúng khi dropout là Identity (fixed.lora_dropout = 0.0). Khác 0 mà
         # cứ chạy thì regularization biến mất trong im lặng.
@@ -280,7 +280,7 @@ def unfreeze_scales(model):
 
 # ═══════════════════════════ lưu / nạp expert ════════════════════════════════
 def expert_state_dict(model, names):
-    """Chỉ phần adapter của E expert (~64M param), không phải 4.3B base."""
+    """Chỉ phần adapter của E expert (~191M param ở E=12), không phải 4.3B base."""
     from peft import get_peft_model_state_dict
 
     out = {}

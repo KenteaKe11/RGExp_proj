@@ -3,11 +3,15 @@
 `python -m src.config` in ra cấu hình đã giải quyết mà không nạp model —
 dùng để kiểm tra trước khi chạy thật.
 
-PHASE 1 của sweep (xem README §3): adapter đã CHỐT là QDoRA r8, số expert và
-top-k cố định (4 / 2). Recombinator cũng chỉ còn MỘT biến thể (`g-brmf`), nên
-biến duy nhất còn quét là số block: n = 1..4. Trường `variant` vẫn nằm trong
-config và trong tag của ô — giữ để đường ống không phải đổi khi thêm biến thể
-mới, chứ Phase này nó chỉ có một giá trị.
+Adapter đã CHỐT là QDoRA r8; MoE chốt 12 expert / top-4; Recombinator chỉ còn
+MỘT biến thể (`g-brmf`), nên biến duy nhất còn quét là số block. Trường
+`variant` vẫn nằm trong config và trong tag của ô — giữ để đường ống không
+phải đổi khi thêm biến thể mới.
+
+Lịch train là MỘT phase multi-task duy nhất và KHÔNG có đích (xem
+configs/default.yaml, khối `run`): không còn phase1_samples/phase2_samples,
+không còn only_phase, không còn dừng sớm. Vì thế file này cũng không còn hàm
+nào chia lịch — chỉ còn kiểm tra lịch LR (cycle_samples) cho hợp lệ.
 """
 from __future__ import annotations
 
@@ -118,7 +122,8 @@ def _apply_remote(rm, run, explicit):
 #
 # Thấp hơn preset của sweep adapter cũ MỘT BẬC: MoE giữ E bản delta cùng lúc và
 # QDoRA phải dequantize base weight trong forward, nên đỉnh VRAM cao hơn LoRA
-# thường ở cùng batch.
+# thường ở cùng batch. Từ khi gộp một phase multi-task, MỌI step đều là step
+# "nặng" (router + expert + decoder) — không còn phase 1 rẻ tiền để làm đệm.
 PRESETS = [
     # (VRAM tối thiểu, tên, train_bs, grad_accum, infer_bs, grad_ckpt)
     (70, "A100-80 / H100", 8, 4, 8, True),
@@ -130,11 +135,9 @@ PRESETS = [
     (0, "GPU <14GB — chật", 1, 32, 1, True),
 ]
 
-# ── Ô sweep Phase 1: số block của Recombinator g-brmf (§2) ──────────────────
-# Một biến thể duy nhất (852_992 param/block), quét n_block 1→4:
-#   n1 ≈ 67.1M   n2 ≈ 68.0M   n3 ≈ 68.8M   n4 ≈ 69.7M   (tổng trainable, E=4)
-# Câu hỏi của Phase 1 vì thế gọn lại: thêm block Recombinator có đáng không,
-# và bão hoà ở đâu.
+# ── Ô sweep: số block của Recombinator g-brmf (§2) ──────────────────────────
+# Một biến thể duy nhất (852_992 param/block). Bảng so sánh dựng trên các ô
+# nằm trong danh sách này; chạy ô ngoài bảng vẫn được, chỉ có cảnh báo.
 SWEEP_BLOCKS = {
     VARIANT: (1, 2, 3, 4, 12),
 }
@@ -153,7 +156,7 @@ def variant_desc(cfg):
 
 
 def adapter_desc(f, sweep=None):
-    """Adapter đã CHỐT ở Phase này — giữ hàm để log/metrics gọi được như cũ."""
+    """Adapter đã CHỐT — giữ hàm để log/metrics gọi được như cũ."""
     return f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E top-{f.top_k}"
 
 
@@ -199,9 +202,9 @@ def pick_preset(vram_gb):
         if vram_gb >= min_vram:
             if vram_gb < 12:
                 print(f"⚠ Chỉ {vram_gb:.1f}GB VRAM — dưới sàn thực tế của QDoRA "
-                      f"4 expert. Nếu OOM ở STAGE 0 thì không có preset nào cứu "
-                      f"được, phải hạ fixed.n_expert (mất ý nghĩa sweep) hoặc "
-                      f"đổi GPU.")
+                      f"12 expert. Nếu OOM ở STAGE 0 thì không có preset nào "
+                      f"cứu được, phải hạ fixed.n_expert (mất tính so sánh) "
+                      f"hoặc đổi GPU.")
             return dict(name=name, train_bs=bs, grad_accum=accum,
                         infer_bs=ibs, grad_ckpt=ckpt)
     raise RuntimeError("Không khớp preset nào")
@@ -230,6 +233,27 @@ def _deep_set(d, dotted, value):
     d[keys[-1]] = yaml.safe_load(value)   # tự ép int/float/bool/null
 
 
+# Khoá của bản HAI PHASE cũ. Không còn ý nghĩa gì trong lịch một phase; để
+# nguyên trong config thì người đọc tưởng nó vẫn có tác dụng, nên báo rõ.
+_DEAD_KEYS = {
+    "phase1_samples": "lịch train không còn trần số mẫu",
+    "phase2_samples": "lịch train không còn trần số mẫu",
+    "only_phase": "chỉ còn MỘT phase multi-task",
+    "p2_freeze_trunk": "không còn phase 2 để đóng băng trunk",
+    "p2_freeze_sup_head": "không còn phase 2 để đóng băng sup_head",
+    "w_aux": "aux loss đã bỏ — cân bằng tải do fixed.bias_gamma lo",
+    "focal_gamma": "nhánh supervised dùng ASL, không còn Focal (run.asl_*)",
+    "focal_alpha_pow": "ASL không có bảng α theo tần suất — γ⁻ lo phần đó",
+    "focal_alpha_normalize": "ASL không có bảng α theo tần suất",
+    "early_stop_patience": "lịch train không có đích, không có dừng sớm",
+    "early_stop_min_delta": "lịch train không có đích, không có dừng sớm",
+    "early_stop_phases": "lịch train không có đích, không có dừng sớm",
+    "resume": "LUÔN resume nếu có checkpoint",
+    "save_every": "ckpt đếm theo lần val (save_every_n_vals)",
+    "warmup_steps": "warmup đếm bằng mẫu (warmup_samples)",
+}
+
+
 def load_config(path="configs/default.yaml", overrides=None):
     with open(path) as fh:
         raw = yaml.safe_load(fh)
@@ -243,31 +267,50 @@ def load_config(path="configs/default.yaml", overrides=None):
     fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
     explicit = {ov.split("=", 1)[0] for ov in (overrides or [])}
 
-    # §1.6 — số mũ của bảng α (0.125 = nghịch đảo căn bậc 8). Đặt default ở đây
-    # để config cũ (chưa có khoá này) không chết giữa chừng vì AttributeError.
-    run.setdefault("focal_alpha_pow", 0.125)
-    # Dừng sớm + giữ ckpt tốt nhất — config cũ chưa có hai khoá này.
-    run.setdefault("early_stop_patience", 0)      # 0 = tắt
-    run.setdefault("early_stop_min_delta", 0.0)
-    run.setdefault("early_stop_phases", [2])
-    run.setdefault("save_best", False)
-    # Phase 2 đóng băng sup_head + n layer đầu của trunk router (mặc định TẮT
-    # để config cũ giữ nguyên hành vi; configs/default.yaml bật 4 + true).
-    run.setdefault("p2_freeze_trunk", 0)
-    run.setdefault("p2_freeze_sup_head", False)
+    # Khoá chết của bản hai phase: BỎ QUA nhưng nói rõ, đừng để im lặng.
+    for key, why in _DEAD_KEYS.items():
+        for block, name in ((fixed, "fixed"), (run, "run")):
+            if key in block:
+                block.pop(key)
+                print(f"⚠ config: bỏ qua {name}.{key} — {why}")
+
+    # §1.7 — Total_Loss = 1·CE + w_sup·ASL. Không còn số hạng aux.
+    run.setdefault("w_sup", 0.2)
+    # §1.6 — ASL (Ridnik et al. 2021) trên 14 finding. γ giữ ĐÚNG default của
+    # bản gốc; chỉ ngưỡng âm tính đi theo chuẩn đọc phim (xem yaml).
+    run.setdefault("asl_gamma_pos", 0.0)
+    run.setdefault("asl_gamma_neg", 4.0)
+    run.setdefault("asl_clip", 0.02)
+    run.setdefault("uncertain_soft", 0.7)
+    run.setdefault("save_best", True)
+    run.setdefault("save_every_n_vals", 2)
     run.setdefault("num_workers", 4)
-    # Ckpt đếm theo lần val (không theo step): bs đổi thì step đổi, lần val
-    # thì không. `save_every` cũ (đếm step) vẫn đọc được để config cũ chạy tiếp.
-    if "save_every_n_vals" not in run:
-        old_every = run.get("save_every")
-        run["save_every_n_vals"] = (max(round(old_every / max(run.get(
-            "eval_every", 1), 1)), 1) if old_every else 1)
     run.setdefault("hub_sync", False)
+    run.setdefault("hub_include_optimizer", True)
     fixed.setdefault("require_bf16", True)
 
-    # ── Phase 3 (mode="probe"): khảo sát chuyên môn expert ────────────────────
-    # Mặc định đặt ở đây chứ không chỉ trong yaml, để config cũ (chưa có khối
-    # `probe`) chạy được mode mới mà không phải sửa file.
+    for _k in ("asl_gamma_pos", "asl_gamma_neg", "asl_clip", "uncertain_soft"):
+        run[_k] = float(run[_k])
+    if not 0.0 <= run["asl_clip"] < 0.5:
+        raise ValueError(f"run.asl_clip phải trong [0, 0.5), nhận "
+                         f"{run['asl_clip']}. Đây là NGƯỠNG ÂM TÍNH: xác suất "
+                         f"mà dưới đó một ô âm coi như đã đúng và hết "
+                         f"gradient.")
+    if run["asl_clip"] > 0.05:
+        print(f"⚠ asl_clip={run['asl_clip']:g} > 0.05 (default của ASL) — "
+              f"nghĩa là tha cho model ở mức bỏ sót cao hơn cả ngưỡng của một "
+              f"bài báo thị giác máy tính phổ thông, chưa nói tới chuẩn đọc "
+              f"phim (BI-RADS 3: ≤ 0.02).")
+    if not 0.0 <= run["uncertain_soft"] <= 1.0:
+        raise ValueError(f"run.uncertain_soft phải trong [0, 1], nhận "
+                         f"{run['uncertain_soft']} (1 = dương, 0 = âm)")
+    if run["asl_gamma_pos"] > run["asl_gamma_neg"]:
+        print(f"⚠ asl_gamma_pos={run['asl_gamma_pos']:g} > asl_gamma_neg="
+              f"{run['asl_gamma_neg']:g} — ASL đang bị lật ngược: nó sẽ dập "
+              f"gradient của ô DƯƠNG và giữ ô âm, tức phạt nhẹ chuyện bỏ sót "
+              f"bệnh. Default là 0 và 4.")
+
+    # ── mode="probe": khảo sát chuyên môn expert ─────────────────────────────
     run.setdefault("probe_repo", None)        # null -> "<hub_repo>-probe"
     run.setdefault("probe_commit_every", 1.0)   # phút, CommitScheduler
     run.setdefault("probe_top_tokens", 10)
@@ -275,15 +318,15 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("probe_flush_every", 20)   # ảnh, ghi lại reports.csv
     run.setdefault("probe_n_images", None)    # null = TRỌN tập test
     if str(run.get("mode", "both")) == "probe":
-        # Phase 3 không train và không được bỏ qua infer vì "ô này đã có eval":
+        # Probe không train và không được bỏ qua infer vì "ô này đã có eval":
         # eval cũ là của mode=test, không có bản ghi probe nào.
         run["force_eval"] = True
         # n_test_samples là trần của mode=test (200 mẫu để chấm metrics nhanh).
-        # Phase 3 chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
+        # Probe chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
         run["n_test_samples"] = run.get("probe_n_images") or 0
-    # Nhiễu Gumbel trên route logit (chống overfit tuyến đường). Default 0.0
-    # để config cũ giữ nguyên hành vi cũ — bật bằng fixed.route_noise.
-    fixed.setdefault("route_noise", 0.0)
+
+    # Nhiễu Gumbel trên route logit khi CHỌN top-k. 1.0 = lấy mẫu đúng chuẩn.
+    fixed.setdefault("route_noise", 1.0)
     fixed["route_noise"] = float(fixed["route_noise"])
     if fixed["route_noise"] < 0:
         raise ValueError(f"fixed.route_noise phải >= 0, nhận "
@@ -291,7 +334,18 @@ def load_config(path="configs/default.yaml", overrides=None):
     if fixed["route_noise"] > 2.0:
         print(f"⚠ route_noise={fixed['route_noise']:g} rất lớn — σ ≳ 2 thì "
               f"top-k gần như bốc ngẫu nhiên đều, gate hết mang thông tin. "
-              f"Dải hợp lý: 0.3–1.0 (1.0 = lấy mẫu đúng chuẩn Gumbel-top-k).")
+              f"Chuẩn phổ thông là 1.0 (lấy mẫu đúng Gumbel-top-k).")
+
+    # Cân bằng tải aux-free: γ của quy tắc cập nhật bias (DeepSeek-V3).
+    fixed.setdefault("bias_gamma", 1.0e-3)
+    fixed["bias_gamma"] = float(fixed["bias_gamma"])
+    if fixed["bias_gamma"] < 0:
+        raise ValueError(f"fixed.bias_gamma phải >= 0, nhận "
+                         f"{fixed['bias_gamma']}")
+    if fixed["bias_gamma"] == 0:
+        print("⚠ bias_gamma=0 — TẮT cân bằng tải. Không còn aux loss thì cũng "
+              "không còn gì giữ router khỏi dồn hết vào vài expert; chỉ dùng "
+              "khi cố ý đo hiện tượng đó.")
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
@@ -300,8 +354,6 @@ def load_config(path="configs/default.yaml", overrides=None):
         _apply_remote(rm, run, explicit)
 
     # ── Giải quyết ô sweep ───────────────────────────────────────────────────
-    # Chấp nhận cả "G-BRMF" lẫn "g-brmf": tên biến thể chỉ có một cách viết
-    # chuẩn (thường), nhưng gõ hoa thì không nên là lỗi cấu hình.
     sweep["variant"] = str(sweep["variant"]).strip().lower()
     if sweep["variant"] not in ROUTER_VARIANTS:
         raise ValueError(f"variant lạ: {sweep['variant']} "
@@ -330,10 +382,12 @@ def load_config(path="configs/default.yaml", overrides=None):
     # chỉ để in bảng tham số trước khi nạp weight.
     fixed["d_enc"] = int(mdl.get("hidden_size", 2560))
     fixed["lora_alpha"] = fixed["lora_r"] * fixed["alpha_ratio"]
-    # Adapter đã chốt: QDoRA = LoRA + DoRA + base NF4. Không còn nhánh nào khác
-    # trong Phase này, nên khoá cứng thay vì để config đổi ngầm.
+    # Adapter đã chốt: QDoRA = LoRA + DoRA + base NF4.
     fixed["use_dora"] = True
     run["quant"] = True
+    if not 1 <= int(fixed["top_k"]) <= int(fixed["n_expert"]):
+        raise ValueError(f"top_k={fixed['top_k']} phải nằm trong "
+                         f"[1, n_expert={fixed['n_expert']}]")
 
     tag = f"{sweep['model']}-{sweep['variant']}-n{n_block}"
     if run.get("hub_repo") is None:
@@ -354,49 +408,45 @@ def load_config(path="configs/default.yaml", overrides=None):
         if run.get(key) is None:
             run[key] = preset[key]
 
-    # ── Lịch LR: cosine warm restarts + SWA (src/optim.py) ──────────────────
+    # ── Lịch LR: cosine warm restarts VÔ HẠN (src/optim.py) ────────────────
     # Đặt SAU khối preset vì mọi kiểm tra ở đây đều so với effective batch, mà
     # train_bs/grad_accum có thể còn là null cho tới dòng trên.
-    run.setdefault("cycle_samples", 6400)
+    run.setdefault("cycle_samples", 1600)
+    run.setdefault("warmup_samples", 320)
     run.setdefault("min_lr_ratio", 0.0)
     run.setdefault("cycle_lr_decay", 1.0)
     run.setdefault("swa", True)
-    run.setdefault("swa_use", "auto")
+    run.setdefault("swa_use", "always")
     run.setdefault("hub_include_swa", True)
     eff = run["train_bs"] * run["grad_accum"]
-    if run.get("warmup_samples") is None:
-        # Config cũ chỉ có warmup_steps. Quy ra mẫu để nó thôi phụ thuộc batch
-        # — nhưng quy bằng eff của CHÍNH MÁY NÀY, nên hai máy khác batch đọc
-        # cùng config cũ vẫn ra hai độ dài warmup khác nhau. Ghi thẳng
-        # warmup_samples trong config để hết chuyện đó.
-        run["warmup_samples"] = int(run.get("warmup_steps", 10)) * eff
-        print(f"⚠ run.warmup_samples chưa đặt — suy từ warmup_steps="
-              f"{run.get('warmup_steps', 10)} × {eff} mẫu/step = "
-              f"{run['warmup_samples']} mẫu (con số này PHỤ THUỘC batch của "
-              f"máy này; đặt run.warmup_samples để cố định)")
     if run["swa_use"] not in ("auto", "always", "never"):
         raise ValueError(f"run.swa_use lạ: {run['swa_use']!r} "
                          f"(auto | always | never)")
-    cs = run["cycle_samples"]
-    if cs is not None and int(cs) > 0:
-        cs = int(cs)
-        if cs < eff:
-            raise ValueError(
-                f"cycle_samples={cs} nhỏ hơn effective batch {eff}: một cycle "
-                f"không đủ một optimizer step, LR sẽ nhảy cả chu kỳ trong một "
-                f"lần cập nhật và SWA không bắt được biên nào.")
-        if cs % eff:
-            print(f"⚠ cycle_samples={cs} không chia hết cho effective batch "
-                  f"{eff} — biên cycle rơi vào giữa một step, snapshot SWA "
-                  f"lệch tối đa {eff} mẫu. Dùng bội của {eff} (vd "
-                  f"{max(round(cs / eff), 1) * eff}) nếu muốn khớp chính xác.")
-        if run["warmup_samples"] >= cs:
-            raise ValueError(
-                f"warmup_samples={run['warmup_samples']} >= cycle_samples="
-                f"{cs}: cycle đầu không còn đoạn cosine nào.")
-        run["cycle_samples"] = cs
-    else:
-        run["cycle_samples"] = None    # một cycle duy nhất = cosine, không restart
+    cs = int(run["cycle_samples"] or 0)
+    if cs <= 0:
+        raise ValueError(
+            "run.cycle_samples phải > 0. Lịch train không có đích nên không "
+            "còn tổng số mẫu nào để suy ra độ dài một cycle — nó phải được "
+            "ghi thẳng trong config.")
+    if cs < eff:
+        raise ValueError(
+            f"cycle_samples={cs} nhỏ hơn effective batch {eff}: một cycle "
+            f"không đủ một optimizer step, LR sẽ nhảy cả chu kỳ trong một "
+            f"lần cập nhật và SWA không bắt được biên nào.")
+    if cs % eff:
+        print(f"⚠ cycle_samples={cs} không chia hết cho effective batch "
+              f"{eff} — biên cycle rơi vào giữa một step, snapshot SWA "
+              f"lệch tối đa {eff} mẫu. Dùng bội của {eff} (vd "
+              f"{max(round(cs / eff), 1) * eff}) nếu muốn khớp chính xác.")
+    if int(run["warmup_samples"]) >= cs:
+        raise ValueError(
+            f"warmup_samples={run['warmup_samples']} >= cycle_samples={cs}: "
+            f"cycle đầu không còn đoạn cosine nào.")
+    run["cycle_samples"] = cs
+    if float(run["cycle_lr_decay"]) != 1.0:
+        print(f"⚠ cycle_lr_decay={run['cycle_lr_decay']} với lịch VÔ HẠN: "
+              f"đỉnh LR tắt dần về 0 và train sẽ tự chết. Giữ 1.0 trừ khi "
+              f"bạn cố ý muốn thế.")
 
     import torch
     dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32,
@@ -412,108 +462,30 @@ def load_config(path="configs/default.yaml", overrides=None):
         sweep=SimpleNamespace(**sweep, tag=tag),
         hw=hw, preset=preset, remote=rm,
     )
-    _check_phases(cfg)
     for d in (cfg.run.out_dir, cfg.run.ckpt_dir):
         os.makedirs(d, exist_ok=True)
     return cfg
 
 
-def resolve_phase_samples(cfg, n_train, log=print):
-    """`phase*_samples: null` -> tự chia tập train làm hai lát (1 epoch).
-
-    Gọi SAU khi df_train đã dựng xong (chỉ lúc đó mới biết số mẫu thật). Cắt
-    tròn theo effective batch vì DataLoader drop_last=True: phần dư không tạo
-    ra step nào, để nguyên thì con số ghi trong log khác số mẫu thật sự dùng.
-
-    Chia đôi chứ không cho cả hai phase = cả tập: phase_slice giữ luật hai lát
-    RỜI NHAU, nên "1 epoch" ở đây = mỗi mẫu được thấy đúng một lần trên toàn
-    bộ lịch train (nửa đầu rare-first cho Phase 1, nửa sau cho Phase 2).
-    """
-    r = cfg.run
-    eff = r.train_bs * r.grad_accum
-    a1 = r.phase1_samples is None
-    a2 = r.phase2_samples is None
-    if not (a1 or a2):
-        _check_phases(cfg)
-        return
-    usable = n_train // eff * eff
-    if usable < 2 * eff:
-        raise ValueError(f"train chỉ {n_train} mẫu, không đủ 2 step "
-                         f"(effective batch {eff}).")
-    if a1 and a2:
-        n1 = (usable // 2) // eff * eff
-        r.phase1_samples, r.phase2_samples = n1, usable - n1
-    elif a1:
-        r.phase1_samples = usable - r.phase2_samples // eff * eff
-    else:
-        r.phase2_samples = usable - r.phase1_samples // eff * eff
-    log("cfg", f"lịch 1 epoch: train {n_train} mẫu -> dùng {usable} "
-               f"(bội của {eff}) = phase1 {r.phase1_samples} + phase2 "
-               f"{r.phase2_samples} | {phase_steps(cfg, 1)} + "
-               f"{phase_steps(cfg, 2)} step")
-    log("cfg", cycles_desc(cfg))
-    _check_phases(cfg)
-
-
-def _check_phases(cfg):
-    """§1.7 — lịch hai phase phải chia hết cho effective batch.
-
-    Lệch một chút thì DataLoader drop_last cắt mất phần dư và số mẫu thật sự
-    dùng khác con số ghi trong tài liệu — im lặng nhưng làm hỏng tính so sánh
-    giữa các ô.
-    """
-    r = cfg.run
-    eff = r.train_bs * r.grad_accum
-    if r.phase1_samples is None or r.phase2_samples is None:
-        return          # chưa biết số mẫu train — resolve_phase_samples lo
-    for name in ("phase1_samples", "phase2_samples"):
-        n = getattr(r, name)
-        if n % eff:
-            print(f"⚠ {name}={n} không chia hết cho effective batch {eff} "
-                  f"-> dùng {n // eff * eff} mẫu ({n // eff} step)")
-    if r.phase1_samples // eff < 1 or r.phase2_samples // eff < 1:
-        raise ValueError(
-            f"effective batch {eff} lớn hơn số mẫu của một phase "
-            f"({r.phase1_samples}/{r.phase2_samples}) — không đủ một step.")
-
-
 def cycles_desc(cfg):
-    """Một dòng: mỗi phase được chia thành bao nhiêu cycle cosine restart.
-
-    Cycle đếm bằng MẪU nên số này giống hệt nhau trên mọi máy — đó là điểm của
-    việc không đếm bằng step (xem docstring src/optim.py).
-    """
+    """Một dòng mô tả lịch LR. Không còn "bao nhiêu cycle cả phase": lịch
+    train không có đích, cycle cứ lặp cho tới khi người dùng dừng tay."""
     r = cfg.run
-    cs = r.cycle_samples
-    if not r.swa and not cs:
-        return "lịch LR: một cycle cosine + warmup, SWA tắt"
-    parts = []
-    for ph in (1, 2):
-        n = r.phase1_samples if ph == 1 else r.phase2_samples
-        if n is None:
-            parts.append(f"P{ph} chờ số mẫu")
-            continue
-        if not cs:
-            parts.append(f"P{ph} 1 cycle")
-            continue
-        full, tail = divmod(n, cs)
-        parts.append(f"P{ph} {full + (1 if tail else 0)} cycle"
-                     + (f" (cycle cuối chỉ {tail} mẫu)" if tail else ""))
-    return ("lịch LR: cosine warm restarts, cycle = "
-            + (f"{cs} mẫu" if cs else "cả phase")
-            + f" | warmup {r.warmup_samples} mẫu (cycle đầu) | "
-            + " + ".join(parts)
-            + (f" | SWA: gom snapshot cuối mỗi cycle, chốt bằng val "
-               f"(swa_use={r.swa_use})" if r.swa else " | SWA TẮT"))
+    eff = r.train_bs * r.grad_accum
+    s = (f"lịch LR: cosine warm restarts VÔ HẠN | cycle = {r.cycle_samples} "
+         f"mẫu ({r.cycle_samples // eff} step ở batch {eff}) | warmup "
+         f"{r.warmup_samples} mẫu (chỉ cycle đầu)")
+    if r.min_lr_ratio:
+        s += f" | đáy = {r.min_lr_ratio:g}×lr"
+    s += (f" | SWA: gom snapshot ở đáy MỖI cycle (swa_use={r.swa_use})"
+          if r.swa else " | SWA TẮT")
+    return s
 
 
-def phase_steps(cfg, phase):
-    """Số optimizer step của một phase, suy từ số mẫu (§1.7)."""
-    r = cfg.run
-    n = r.phase1_samples if phase == 1 else r.phase2_samples
-    if n is None:
-        return None     # `null` trong config — chờ resolve_phase_samples
-    return n // (r.train_bs * r.grad_accum)
+def epoch_desc(cfg, n_train, samples):
+    """`samples` tích luỹ -> đọc thành (epoch thứ mấy, đang ở đâu trong epoch)."""
+    n = max(int(n_train), 1)
+    return int(samples) // n, int(samples) % n
 
 
 def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
@@ -535,26 +507,23 @@ def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
 
 def build_argparser():
     ap = argparse.ArgumentParser(
-        description="MIMIC-CXR MoE-LoRA — sweep Phase 1 (số block Recombinator)")
+        description="MIMIC-CXR MoE-LoRA — một phase multi-task, lịch vô hạn")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--set", dest="overrides", action="append", default=[],
                     metavar="KEY=VALUE",
-                    help="Ghi đè config, vd: --set run.phase1_samples=3200")
+                    help="Ghi đè config, vd: --set run.cycle_samples=3200")
     ap.add_argument("--model", choices=["gemma3", "qwen25vl"])
     # type=str.lower: --variant G-BRMF cũng nhận, khỏi phải nhớ cách viết.
     ap.add_argument("--variant", type=str.lower, choices=list(ROUTER_VARIANTS),
                     default=None)
     ap.add_argument("--n-block", type=int, dest="n_block")
     ap.add_argument("--mode", choices=["train", "test", "both", "probe"],
-                    help="probe = Phase 3: không train, nạp SWA từ Hub, sinh "
-                         "báo cáo rồi bật lần lượt từng expert trong top-k để "
-                         "đo chuyên môn (xem src/probe.py).")
-    ap.add_argument("--phase", type=int, choices=[1, 2],
-                    help="Chạy riêng một phase (mặc định: cả hai, nối tiếp). "
-                         "Cũng thu hẹp STAGE 0 về đúng phase đó.")
+                    help="probe = không train, nạp SWA từ Hub, sinh báo cáo "
+                         "rồi bật lần lượt từng expert trong top-k để đo "
+                         "chuyên môn (xem src/probe.py).")
     # dry_run mặc định false trong config (chạy thật). Hai cờ này để ép:
     ap.add_argument("--dry-run", action="store_true",
-                    help="Dừng sau STAGE 0 (2 step MỖI phase) để kiểm cấu hình")
+                    help="Dừng sau STAGE 0 (2 step thử) để kiểm cấu hình")
     ap.add_argument("--no-dry-run", action="store_true",
                     help="Ép chạy thật (ghi đè config)")
     return ap
@@ -564,8 +533,7 @@ def config_from_args(argv=None):
     args = build_argparser().parse_args(argv)
     ov = list(args.overrides)
     for name, key in (("model", "sweep.model"), ("variant", "sweep.variant"),
-                      ("n_block", "sweep.n_block"), ("mode", "run.mode"),
-                      ("phase", "run.only_phase")):
+                      ("n_block", "sweep.n_block"), ("mode", "run.mode")):
         val = getattr(args, name)
         if val is not None:
             ov.append(f"{key}={val}")
@@ -591,35 +559,20 @@ if __name__ == "__main__":
     print(f"Ảnh     : {image_desc(c.fixed)}")
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
           f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
-    def _sched(ph):
-        n, st = (c.run.phase1_samples if ph == 1 else c.run.phase2_samples), \
-            phase_steps(c, ph)
-        return (f"{n} mẫu = {st} step" if n is not None else
-                "auto — chia đôi tập train khi biết số mẫu (1 epoch)")
-    print(f"Phase 1 : {_sched(1)} "
-          f"| loss = Focal (α = 1/f^{c.run.focal_alpha_pow})")
-    print(f"Phase 2 : {_sched(2)} "
-          f"| loss = 1·CE + {c.run.w_sup}·Focal + {c.run.w_aux}·Aux")
-    _fz = []
-    if c.run.p2_freeze_trunk:
-        _n = min(int(c.run.p2_freeze_trunk), c.sweep.n_block)   # stem + block
-        _fz.append(f"{_n} layer đầu trunk"
-                   + (f" (xin {c.run.p2_freeze_trunk}, trunk chỉ có "
-                      f"{c.sweep.n_block + 1})"
-                      if _n < int(c.run.p2_freeze_trunk) else ""))
-    if c.run.p2_freeze_sup_head:
-        _fz.append("sup_head")
-    print(f"          freeze ở Phase 2: {' + '.join(_fz) if _fz else 'không'}")
+    print("Lịch    : MỘT phase multi-task, KHÔNG có đích — chạy tuần tự tập "
+          "train, hết thì epoch += 1 và chạy tiếp")
+    print(f"Loss    : 1·CE + {c.run.w_sup}·ASL | KHÔNG có aux")
+    print(f"          ASL γ+={c.run.asl_gamma_pos:g} γ-={c.run.asl_gamma_neg:g}"
+          f" | ngưỡng âm m={c.run.asl_clip:g} (BI-RADS 3)"
+          f" | uncertain={c.run.uncertain_soft:g}, blank=MASK")
+    print(f"Cân bằng: bias aux-free γ={c.fixed.bias_gamma:g} "
+          f"| Gumbel σ={c.fixed.route_noise:g}")
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
-          f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}×"
-          + (f" | đỉnh ×{c.run.cycle_lr_decay} mỗi cycle"
-             if c.run.cycle_lr_decay != 1.0 else ""))
-    es = c.run.early_stop_patience
+          f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}×")
     print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
           f"batch) | ckpt mỗi {c.run.save_every_n_vals} lần val | dừng sớm: "
-          + (f"{es} val liên tiếp không cải thiện, phase "
-             f"{c.run.early_stop_phases}" if es else "tắt"))
+          f"KHÔNG (chạy tới khi dừng tay)")
     print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
     print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run} | "
           f"policy={'BẬT' if c.run.use_policy else 'TẮT (chấm raw_output)'}")
