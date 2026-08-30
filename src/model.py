@@ -108,16 +108,23 @@ class RouterBridge:
         self.mask = None          # [B, N] 1 = prompt/ảnh, 0 = target/padding
         self.hidden = None        # chỉ dùng ở chế độ "capture"
         self.out = None           # (sup_logits, gate, aux, stats) ở "route"
+        # Ép gate đi vào MoE (chỉ Phase 3 / src/probe.py dùng). `self.out` vẫn
+        # giữ gate THẬT router tính ra — ép cái đi vào expert, không ép cái
+        # router nghĩ — nên một forward vừa bật được đúng một expert vừa cho
+        # biết router đã chọn những expert nào.
+        self.force_gate = None
         self.handle = None
         self.n_calls = 0
 
     # ── vòng đời một batch ──────────────────────────────────────────────────
     def begin(self, mode, mask=None):
         self.mode, self.mask, self.hidden, self.out = mode, mask, None, None
+        self.force_gate = None
         moe.CTX.clear()
 
     def end(self):
         self.mode, self.mask, self.hidden = "off", None, None
+        self.force_gate = None
         moe.CTX.clear()
 
     # ── hook ────────────────────────────────────────────────────────────────
@@ -160,7 +167,14 @@ class RouterBridge:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             sup_logits, gate, aux, stats = self.router(hidden, mask)
         self.out = (sup_logits.float(), gate, aux, stats)
-        moe.CTX.set(gate)
+        if self.force_gate is not None:
+            if self.force_gate.shape != gate.shape:
+                raise RuntimeError(
+                    f"force_gate {tuple(self.force_gate.shape)} không khớp gate "
+                    f"{tuple(gate.shape)}")
+            moe.CTX.set(self.force_gate)
+        else:
+            moe.CTX.set(gate)
         self.n_calls += 1
         return self.out
 

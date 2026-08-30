@@ -38,17 +38,20 @@ import torch
 
 from . import logging_utils as L
 from . import moe
+from . import probe as probe_mod
 from .config import (adapter_desc, config_from_args, cycles_desc, image_desc,
                      phase_steps, resolve_phase_samples, resolve_seq_len,
                      variant_desc)
 from .data import (attach_labels, build_frames, cell_frequency, fetch_sources,
-                   load_or_make_splits, phase_slice, rare_first_order)
+                   label_names, load_or_make_splits, phase_slice,
+                   rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
 from .losses import focal_loss, inv_freq_alpha, supervised_stats
 from .metrics import run_metrics
 from .model import (build_collate, build_model, build_prompt, ce_loss,
-                    count_image_tokens, encode_only, load_image, make_loader,
-                    split_batch, to_device, wrap_images)
+                    count_image_tokens, encode_only, find_image_token_id,
+                    load_image, make_loader, split_batch, to_device,
+                    wrap_images)
 from .optim import CosineRestartSchedule, WeightAverager
 
 DEVICE = torch.device("cuda:0")
@@ -103,8 +106,13 @@ def vram(tag, total_gb):
 def main(argv=None):
     cfg = config_from_args(argv)
     f, r = cfg.fixed, cfg.run
+    # Phase 3 = mode "probe" (src/probe.py): KHÔNG train, nạp trung bình SWA
+    # từ Hub, sinh báo cáo rồi bật lần lượt từng expert trong top-k để đo
+    # chuyên môn. Nó vẫn đi qua đúng khâu infer + metrics của mode "test", nên
+    # nằm trong run_test chứ không phải một nhánh song song.
+    is_probe = r.mode == "probe"
     run_train = r.mode in ("train", "both")
-    run_test = r.mode in ("test", "both")
+    run_test = r.mode in ("test", "both", "probe")
     only_phase = getattr(r, "only_phase", None)
 
     L.setup(os.path.join(r.out_dir, "logs"), run_id=cfg.sweep.tag)
@@ -193,6 +201,7 @@ def main(argv=None):
     df_val, _ = attach_labels(df_val, npz_path, cfg, log, "val")
     df_test, _ = attach_labels(df_test, npz_path, cfg, log, "test")
     cell_freq = cell_frequency(y_train, npz_path, log)
+    disease_names, aspect_names = label_names(npz_path)
     alpha = inv_freq_alpha(cell_freq, r.focal_alpha_normalize,
                            r.focal_alpha_pow).to(DEVICE)
     log("label", f"α = 1/f^{r.focal_alpha_pow} ({r.focal_alpha_normalize}): "
@@ -313,12 +322,14 @@ def main(argv=None):
     # optimizer chỉ giữ moment của router); phase 2 chạy cả decoder + E bản
     # delta QDoRA + moment cho toàn bộ expert. Thử mỗi phase 1 rồi kết luận
     # "chạy được" là kiểm đúng nửa rẻ tiền — nửa còn lại mới là nửa OOM.
-    phases_s0 = [only_phase] if only_phase else [1, 2]
+    phases_s0 = [] if is_probe else ([only_phase] if only_phase else [1, 2])
     log("S0", "═" * 60)
-    log("S0", f"thử {len(phases_s0)} phase: {phases_s0}")
+    log("S0", f"thử {len(phases_s0)} phase: {phases_s0}" if phases_s0 else
+              "Phase 3 (mode=probe) không train — bỏ qua STAGE 0")
     # Một loader dùng lại cho mọi phase: iter() cho iterator mới mỗi lần, và
     # worker process không phải dựng lại.
-    _s0_dl = make_loader(df_train.iloc[:r.train_bs * 4], collate, cfg)
+    _s0_dl = (make_loader(df_train.iloc[:r.train_bs * 4], collate, cfg)
+              if phases_s0 else None)
 
     def stage0(phase, first):
         """2 step thử của MỘT phase. Trả về (ok, giây/micro-step, VRAM đỉnh)."""
@@ -422,7 +433,9 @@ def main(argv=None):
     for _i, _ph in enumerate(phases_s0):
         s0[_ph] = stage0(_ph, first=(_i == 0))
     s0_ok = all(v[0] for v in s0.values())
-    if s0_ok:
+    if not s0:
+        pass                       # probe: không có phase nào để tổng kết
+    elif s0_ok:
         hours = sum(v[1] * r.grad_accum * phase_steps(cfg, ph) / 3600
                     for ph, v in s0.items())
         peak = max(v[2] for v in s0.values())
@@ -651,7 +664,18 @@ def main(argv=None):
     # Bản cục bộ KHÔNG mặc nhiên thắng nữa: máy này có thể vừa bật lại sau khi
     # một máy khác đã chạy thêm vài nghìn mẫu và push lên Hub.
     resume_dir, src = None, "RESUME=False"
-    if r.resume:
+    if is_probe:
+        # Phase 3 chạy SONG SONG với một phiên train ở máy khác, nên bản cục
+        # bộ ở đây (nếu có) gần như luôn cũ hơn. Luôn kéo last/ của Hub.
+        try:
+            resume_dir = hub_pull_last()
+        except Exception as e:
+            raise RuntimeError(
+                f"mode=probe cần checkpoint ở {r.hub_repo}/last nhưng không "
+                f"tải được ({type(e).__name__}: {e}). Phase 3 không train, nên "
+                f"không có gì để probe khi phiên train chưa push lần nào.") from e
+        src = "Hub last/ (Phase 3 luôn lấy bản Hub)"
+    elif r.resume:
         local = os.path.join(r.ckpt_dir, "last")
         local_st = read_state(local)
         remote_st = hub_state() if r.push_to_hub else None
@@ -676,6 +700,22 @@ def main(argv=None):
                       f"epoch {state['epoch']} done={state['done']}")
     else:
         log("resume", f"train từ đầu — {src}")
+
+    # Phase 3 chấm trên bản TRUNG BÌNH SWA, không phải trọng số cuối. Bản cuối
+    # là một điểm ngẫu nhiên trên quỹ đạo SGD; trung bình của các đáy cycle mới
+    # là thứ đem đi val ở cuối mỗi phase, tức thứ đại diện cho ô sweep này.
+    weights_src = "weights.pt (trọng số cuối)"
+    if is_probe:
+        n_swa = int((swa_state or {}).get("n", 0))
+        if n_swa >= 1:
+            set_weights(swa_state["avg"], quiet=True)
+            weights_src = f"swa.pt (trung bình {n_swa} snapshot)"
+            log("probe", f"nạp {weights_src} — mốc mẫu "
+                         f"{swa_state.get('marks')}")
+        else:
+            warn("probe", "last/ trên Hub không có swa.pt — chấm trên trọng số "
+                          "cuối. Bật run.hub_include_swa=true ở PHIÊN TRAIN thì "
+                          "phiên probe sau mới có bản trung bình để dùng.")
     if r.hub_sync and r.push_to_hub:
         log("sync", "hub_sync BẬT — mỗi lần val sẽ hỏi Hub; chỉ máy đi xa nhất "
                     "mới được ghi, máy đi sau tự nạp bản của Hub rồi chạy tiếp")
@@ -726,7 +766,7 @@ def main(argv=None):
             log("done", f"mode={r.mode} và ô đã train xong — không còn việc")
             wfinish()
             return 0
-    if not run_train and run_test:
+    if not run_train and run_test and not is_probe:
         eval_src, eval_step = find_eval()
         if eval_src and not r.force_eval:
             log("done", f"ô {cfg.sweep.tag} đã có eval ({eval_src}) — bỏ qua "
@@ -1263,28 +1303,48 @@ def main(argv=None):
         return recs, share
 
     out_csv = os.path.join(r.out_dir, "reports.csv")
-    infer_log = RateLimiter(r.log_every_sec)
-    tinf = time.time()
-    log("infer", f"sinh {len(df_infer)} báo cáo | policy="
-                 f"{'BẬT' if r.use_policy else 'TẮT'}")
-    results, shares = [], []
-    for i in range(0, len(df_infer), r.infer_bs):
-        chunk = df_infer.iloc[i:i + r.infer_bs]
-        recs, share = generate_records(chunk["img_abs_path"].tolist())
-        if share:
-            shares.append(share)
-        for (_, row), rec in zip(chunk.iterrows(), recs):
-            results.append({cfg.data.image_column: row[cfg.data.image_column],
-                            "reference": str(row[f.target_column]).strip(),
-                            **rec})
-        pd.DataFrame(results).to_csv(out_csv, index=False)
-        if infer_log.ready(force=(i == 0)):
-            rate = len(results) / max(time.time() - tinf, 1e-9)
-            log("infer", f"{len(results)}/{len(df_infer)} | {rate:.2f} mẫu/s "
-                         f"| ETA {(len(df_infer)-len(results))/max(rate,1e-9)/60:.0f}m")
-    res_df = pd.DataFrame(results)
-    expert_share = (np.mean(np.array(shares), axis=0).tolist() if shares
-                    else None)
+    if is_probe:
+        # infer_bs > 1 KHÔNG dùng được ở đây: mỗi ảnh cần 7 forward với gate
+        # riêng, mà CTX là một gate cho cả batch. Ép về 1 và nói rõ.
+        if r.infer_bs != 1:
+            log("probe", f"infer_bs={r.infer_bs} -> 1 (mỗi ảnh một gate riêng)")
+            r.infer_bs = 1
+        res_df = probe_mod.run_probe(
+            cfg=cfg, model=model, bridge=bridge, tokenizer=tokenizer,
+            collate=collate, df=df_infer, generate_records=generate_records,
+            disease_names=disease_names, aspect_names=aspect_names,
+            img_token_id=find_image_token_id(processor), hf_token=hf_token,
+            train_state=dict(state, swa_n=int((swa_state or {}).get("n", 0)),
+                             weights_src=weights_src),
+            log=log, warn=warn, event=event)
+        expert_share = None
+    else:
+        infer_log = RateLimiter(r.log_every_sec)
+        tinf = time.time()
+        log("infer", f"sinh {len(df_infer)} báo cáo | policy="
+                     f"{'BẬT' if r.use_policy else 'TẮT'}")
+        results, shares = [], []
+        for i in range(0, len(df_infer), r.infer_bs):
+            chunk = df_infer.iloc[i:i + r.infer_bs]
+            recs, share = generate_records(chunk["img_abs_path"].tolist())
+            if share:
+                shares.append(share)
+            for (_, row), rec in zip(chunk.iterrows(), recs):
+                results.append({cfg.data.image_column: row[cfg.data.image_column],
+                                "reference": str(row[f.target_column]).strip(),
+                                **rec})
+            pd.DataFrame(results).to_csv(out_csv, index=False)
+            if infer_log.ready(force=(i == 0)):
+                rate = len(results) / max(time.time() - tinf, 1e-9)
+                log("infer", f"{len(results)}/{len(df_infer)} | {rate:.2f} mẫu/s "
+                             f"| ETA {(len(df_infer)-len(results))/max(rate,1e-9)/60:.0f}m")
+        res_df = pd.DataFrame(results)
+        expert_share = (np.mean(np.array(shares), axis=0).tolist() if shares
+                        else None)
+    if not len(res_df):
+        warn("infer", "không có bản ghi nào — bỏ qua metrics")
+        wfinish()
+        return 0
     log("infer", f"XONG {len(res_df)} | 7-check pass "
                  f"{int(res_df.raw_guard_passed.sum())}/{len(res_df)}")
     if expert_share:
@@ -1299,11 +1359,18 @@ def main(argv=None):
     metrics = run_metrics(res_df, tokenizer, cfg, state["step"], log,
                           expert_share=expert_share)
     if r.push_to_hub:
+        # Phase 3 đẩy vào repo PROBE (dataset), KHÔNG vào eval/ của repo
+        # checkpoint: phiên train đang chạy song song cũng ghi eval/ ở đó, và
+        # hai bên chấm trên hai tập test khác cỡ với hai bộ trọng số khác nhau.
+        repo, kind, where = ((r.probe_repo, "dataset", "eval/ (repo probe)")
+                             if is_probe else (r.hub_repo, "model", "eval/"))
         try:
-            upload_folder(repo_id=r.hub_repo, folder_path=r.out_dir,
-                          path_in_repo="eval", token=hf_token,
+            upload_folder(repo_id=repo, repo_type=kind,
+                          folder_path=r.out_dir, path_in_repo="eval",
+                          token=hf_token,
+                          ignore_patterns=["probe_records/*", "logs/*"],
                           commit_message=f"eval @ {cfg.sweep.tag}")
-            log("hub", "đã push eval/")
+            log("hub", f"đã push {where} -> {repo}")
         except Exception as e:
             warn("hub", f"push kết quả thất bại ({e})")
     if use_wandb:

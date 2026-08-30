@@ -401,6 +401,127 @@ def test_freeze():
           info["frozen"] == [] and info["n_frozen_param"] == 0)
 
 
+def test_probe():
+    """[10] Phase 3: force_gate + các phép tính thuần của probe."""
+    print("\n[10] probe chuyên môn expert (Phase 3)")
+    import json
+    import tempfile
+
+    from src import moe                                     # noqa: E402
+    from src.model import RouterBridge                      # noqa: E402
+    from src.probe import (HubStream, grid_shape,           # noqa: E402
+                           name_row_ids, pack_map,
+                           reports_from_records, rows_mean, safe_name,
+                           top_tokens)
+
+    check("grid_shape(256) = 16×16", grid_shape(256) == (16, 16))
+    check("grid_shape(250) = None (không vuông -> bỏ bản đồ)",
+          grid_shape(250) is None and grid_shape(0) is None)
+    check("safe_name giữ được tính phân biệt của khoá",
+          safe_name("p10/s5/a.jpg") != safe_name("p10/s6/a.jpg")
+          and "/" not in safe_name("p10/s5/a.jpg"))
+
+    vals, mx = pack_map([1.0, 2.0, 4.0, 0.0])
+    check("pack_map chuẩn hoá theo max của chính nó",
+          vals == [0.25, 0.5, 1.0, 0.0] and mx == 4.0, f"{vals} max={mx}")
+    check("pack_map chịu được bản đồ toàn 0 (không chia 0)",
+          pack_map([0.0, 0.0]) == ([0.0, 0.0], 0.0))
+
+    d = torch.tensor([0.0, 5.0, 1.0, 3.0])
+    check("rows_mean lấy trung bình trong nhóm token",
+          rows_mean(d, [[1, 3], [0], []]) == [4.0, 0.0, 0.0])
+
+    class FakeTok:
+        def encode(self, s, add_special_tokens=False):
+            return [len(s)] if s.strip() else []
+
+        def decode(self, ids):
+            return f"<{ids[0]}>"
+
+    ids = name_row_ids(FakeTok(), ["Edema", "Pleural Effusion"])
+    check("name_row_ids thử cả dạng có/không khoảng trắng đầu",
+          all(len(g) >= 1 for g in ids), str(ids))
+    tt = top_tokens(torch.tensor([0.1, 9.0, 0.2]), FakeTok(), k=2)
+    check("top_tokens xếp giảm dần và decode được",
+          [x["id"] for x in tt] == [1, 2] and tt[0]["dlogit"] == 9.0, str(tt))
+
+    with tempfile.TemporaryDirectory() as td:
+        for i, key in enumerate(["a/b.jpg", "c/d.jpg"]):
+            with open(os.path.join(td, f"r{i}.json"), "w") as fh:
+                json.dump({"key_id": key,
+                           "report": {"generated": f"txt{i}",
+                                      "raw_guard_passed": True}}, fh)
+        with open(os.path.join(td, "broken.json"), "w") as fh:
+            fh.write("{ khong phai json")
+        rows = reports_from_records(td, "img_rel")
+    check("reports_from_records dựng lại được reports.csv từ bản ghi",
+          len(rows) == 2 and rows[0]["img_rel"] == "a/b.jpg"
+          and rows[0]["generated"] == "txt0", str(rows))
+    check("bản ghi hỏng bị bỏ qua chứ không làm chết cả phiên", len(rows) == 2)
+
+    # ── HubStream không có Hub: vẫn ghi được, vẫn biết đã làm tới đâu ───────
+    with tempfile.TemporaryDirectory() as td:
+        st = HubStream(None, None, os.path.join(td, "rec"), log=None,
+                       warn=lambda *a: None)
+        check("không có repo/token -> không dựng scheduler, không nổ",
+              st.sched is None and st.done_ids() == set())
+        st.write("k1", {"key_id": "a/b.jpg"})
+        check("write() rồi done_ids() thấy ngay -> chạy lại bỏ qua được",
+              st.done_ids() == {"k1"})
+        check("không để lại file .tmp (ghi tạm rồi mới đổi tên)",
+              not any(f.endswith(".tmp") for f in os.listdir(st.dir)),
+              str(os.listdir(st.dir)))
+        st.close()
+
+    # ── force_gate: ép cái đi vào MoE, KHÔNG ép cái router nghĩ ──────────────
+    torch.manual_seed(0)
+    E, K, B = 8, 3, 2
+    net = RouterNet(VARIANT, 1, E, K, d_enc=2560).eval()
+    br = RouterBridge(net)
+    hidden, mask = torch.randn(B, 12, 2560), torch.ones(B, 12)
+
+    br.begin("route", mask=mask)
+    with torch.no_grad():
+        real = br.run(hidden)[1]
+    check("không force -> CTX nhận đúng gate của router",
+          torch.equal(moe.CTX.weights, real))
+
+    forced = torch.zeros(B, E)
+    forced[:, 5] = 1.0
+    br.begin("route", mask=mask)
+    br.force_gate = forced
+    with torch.no_grad():
+        out_gate = br.run(hidden)[1]
+    check("force_gate -> CTX nhận gate BỊ ÉP",
+          torch.equal(moe.CTX.weights, forced))
+    check("force_gate -> bridge.out vẫn giữ gate THẬT (biết router chọn ai)",
+          torch.equal(out_gate, real))
+    check("CTX.active chỉ còn đúng expert bị ép",
+          [i for i, v in enumerate(moe.CTX.active) if v] == [5],
+          str([i for i, v in enumerate(moe.CTX.active) if v]))
+
+    br.begin("route", mask=mask)
+    br.force_gate = torch.zeros(B, E)
+    with torch.no_grad():
+        br.run(hidden)
+    check("gate toàn 0 = forward NỀN, không expert nào chạy",
+          not any(moe.CTX.active))
+
+    br.begin("route", mask=mask)
+    br.force_gate = torch.zeros(B + 1, E)
+    try:
+        with torch.no_grad():
+            br.run(hidden)
+        ok = False
+    except RuntimeError:
+        ok = True
+    check("force_gate sai batch -> nổ RuntimeError chứ không lệch âm thầm", ok)
+
+    br.end()
+    check("end() xoá force_gate (không rò sang batch sau)",
+          br.force_gate is None and moe.CTX.weights is None)
+
+
 if __name__ == "__main__":
     print("[1] bảng tham số vs tài liệu")
     if _selftest() != 0:
@@ -412,5 +533,6 @@ if __name__ == "__main__":
     test_swa()
     test_freeze()
     test_route_noise()
+    test_probe()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

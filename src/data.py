@@ -312,6 +312,12 @@ def _label_index(npz_path):
     return y_gt, index, class_names, disease
 
 
+def label_names(npz_path):
+    """(14 tên bệnh, 4 tên aspect) — Phase 3 chiếu Δlogit lên đúng các tên này."""
+    _, _, class_names, disease = _label_index(npz_path)
+    return list(disease), list(class_names)
+
+
 def attach_labels(frame, npz_path, cfg, log, name=""):
     """Gắn cột `y14` (14 chỉ số aspect 0..3) — đầu vào của Focal loss (§1.7a).
 

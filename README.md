@@ -213,6 +213,10 @@ trên `max(len(target)) + 1` vị trí cuối.
 
 ### 1.7. Lịch train hai phase
 
+Hai phase dưới đây là toàn bộ phần TRAIN. Có thêm một chế độ thứ ba
+(`mode: probe`) không train mà chỉ khảo sát chuyên môn của từng expert
+trên checkpoint đã xong — xem §3.6.
+
 | | Mẫu | Cái gì chạy | Loss |
 |---|---|---|---|
 | **Phase 1** | 6400 đầu (≈5% train) | CHỈ nhánh router — decoder bị cắt ngay sau embedding | `Focal` |
@@ -617,6 +621,122 @@ Một cái bẫy đã dính một lần, ghi lại để khỏi dính lại: tro
 Khoá config `fixed.route_noise` — `src/router.py::gumbel_like`,
 `RouterNet.forward`, `RouterNet.set_route_noise` (đổi σ giữa chừng nếu
 sau này muốn anneal)
+
+### 3.6. Phase 3 — probe chuyên môn expert (`mode: probe`)
+
+Bảng sweep trả lời "kiến trúc nào cho BLEU cao hơn". Nó **không** trả lời câu
+đắt hơn nhiều: 16 expert kia có thật sự chia việc không, hay 6 cái được chọn
+mỗi lần chỉ là 6 bản sao mờ của nhau? Không trả lời được thì MoE chỉ là một
+cách tiêu tham số. Phase 3 sinh ra để trả lời đúng câu đó.
+
+Nó **không train gì cả**. Nó lấy một checkpoint đã xong rồi, với mỗi ảnh test:
+
+| Bước | Gate | Được gì |
+|---|---|---|
+| 1. Sinh báo cáo | gate thật của router | `reports.csv` + `metrics.json` như mọi ô |
+| 2. Forward nền | **0** — không expert nào chạy | mốc `h_base` để trừ |
+| 3. Sáu forward | one-hot từng expert trong top-6, **trọng số 1.0** | dấu vân tay của từng expert |
+
+Hiệu `Δh = h_e − h_base` là toàn bộ ảnh hưởng của expert e trên đúng ảnh này.
+Ba thứ đọc ra từ nó:
+
+- **Bản đồ không gian 16×16** — ‖Δh‖ tại từng image token, reshape về lưới
+  patch của SigLIP. Chồng lên ảnh X-quang thì thấy expert đổi biểu diễn ở
+  **vùng nào** của phổi.
+- **Vector 14 bệnh + vector 4 aspect** — Δlogit trên đúng những dòng
+  unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp 6
+  expert lại được ma trận **6×14** và **6×4** — bảng chuyên môn đọc được bằng
+  mắt.
+- **Top-10 token unembedding** — 10 token expert đẩy logit lên mạnh nhất trên
+  toàn vocab 262k. Không bị giam trong danh sách bệnh, nên nó bắt được cả
+  những chuyên môn mình không nghĩ tới trước (`bilateral`, `stable`,
+  `compared`).
+
+**Vì sao KHÔNG có ma trận 14×4.** Nhãn là 14 bệnh × 4 aspect nên phản xạ đầu
+tiên là đòi một ma trận 14×4 cho mỗi expert. Logit-lens không sinh ra được nó:
+cái đọc được là Δlogit trên từng DÒNG unembedding, mà tên bệnh và tên aspect
+là hai nhóm dòng rời nhau. Ghép lại chỉ có thể là `M[d,a] = u[d] + v[a]` —
+một ma trận **hạng 1** đội lốt 14×4, mọi hàng giống hệt nhau sai khác một hằng
+số. Nó không thêm một bit thông tin nào so với hai vector rời, chỉ khiến người
+đọc tưởng có tương tác bệnh×aspect. Muốn tương tác thật thì phải có nhãn
+per-token (biết vị trí nào trong báo cáo đang nói về aspect nào) — dữ liệu này
+không có. Nên 14 và 4 để riêng.
+
+**Hai quyết định khác cần biết trước khi đọc số:**
+
+1. **Teacher-forcing, không generate lại.** Forward probe cho ăn prompt + ảnh
+   + đúng báo cáo tham chiếu, y hệt một step train. Lúc generate, chuỗi chỉ có
+   prompt nên đúng MỘT vị trí dự đoán được gì đó, mà đọc unembedding ở một vị
+   trí là đọc nhiễu. Teacher-forcing cho ~100 vị trí để lấy trung bình, và vẫn
+   chỉ tốn ĐÚNG một forward — rẻ hơn generate khoảng 150 lần. Gate vẫn là gate
+   thật: `router_mask` che target nên router chỉ nhìn prompt + ảnh, đúng thứ
+   nó nhìn lúc infer.
+2. **Bật expert với trọng số 1.0, không phải `g_e`.** Câu hỏi là "expert này
+   *là gì*", không phải "expert này đóng góp bao nhiêu vào mẫu này". `g_e`
+   thật vẫn nằm trong mỗi bản ghi, muốn quy đổi thì nhân sau.
+
+**Trọng số đem ra chấm là trung bình SWA của `last/` trên Hub**, không phải
+trọng số cuối. Bản cuối là một điểm ngẫu nhiên trên quỹ đạo SGD; trung bình
+các đáy cycle mới là thứ được đem đi val ở cuối mỗi phase, tức thứ đại diện cho
+ô sweep. Phiên train phải để `run.hub_include_swa: true` (mặc định đã bật),
+nếu không thì `swa.pt` không có trên Hub và probe cảnh báo rồi lùi về
+`weights.pt`.
+
+**Cơ chế ép gate.** `RouterBridge.force_gate` thay cái đi vào MoE nhưng KHÔNG
+thay cái router nghĩ: `bridge.out` vẫn giữ gate thật, nên chỉ một forward nền
+là đã biết router chọn 6 expert nào, không phải chạy thêm lượt nào để hỏi.
+Gate toàn 0 khiến `CTX.active` rỗng và mọi expert bị bỏ qua — đó chính là
+forward nền, không cần một đường code riêng.
+
+**Chạy song song với phiên train.** Phiên train GHI checkpoint lên Hub, phiên
+probe chỉ ĐỌC. Bản ghi probe nằm ở một dataset repo riêng (`<hub_repo>-probe`)
+và `metrics.json` của probe cũng đẩy vào đó, không giẫm lên `eval/` của phiên
+train — hai bên chấm trên hai tập test khác cỡ với hai bộ trọng số khác nhau,
+trộn vào một chỗ là hỏng cả hai. `hub_sync` tắt để probe không tranh chấp tiến
+độ.
+
+**Đẩy lên Hub và chạy lại được.** Xong 6 expert của một ảnh là ghi ngay một
+file JSON; `CommitScheduler` gom và commit mỗi `probe_commit_every` phút (mặc
+định 1). Đúng nghĩa "xong ảnh nào có ngay ảnh đó", nhưng 3000 commit riêng lẻ
+thì HF chặn giữa chừng và lịch sử repo không đọc được. `key_id` là `img_rel`
+nguyên bản — cùng khoá mà split và `labels.npz` dùng, nên nối lại với nhãn
+không cần bảng tra. Lúc khởi động, danh sách file đã có trên repo được đọc về
+và những ảnh đó bị bỏ qua, nên phiên Kaggle 12h đứt giữa chừng thì phiên sau
+chạy tiếp. `reports.csv` cũng dựng lại được từ chính các bản ghi cũ (báo cáo
+sinh ra nằm sẵn trong đó) thay vì generate lại chỉ để có metrics.
+
+**Chi phí.** Trọn test = 3000 ảnh × (1 lần generate + 7 forward). P100 rơi vào
+cỡ 15–25 giây/ảnh → 12–20h, tức 2 phiên Kaggle. `infer_bs` bị ép về 1: mỗi ảnh
+cần 7 gate khác nhau mà `CTX` chỉ giữ một gate cho cả batch. Thử nhanh thì
+`probe_n_images: 20`.
+
+```bash
+python -m src.train --config configs/default.yaml --mode probe
+```
+Trên Kaggle: dán `scripts/kaggle_probe.py` vào một notebook KHÁC với notebook
+đang train.
+
+**Đọc kết quả.** Một ảnh lẻ không nói gì; chuyên môn chỉ hiện ra khi gộp cả
+tập:
+
+```python
+from huggingface_hub import snapshot_download
+import json, glob, numpy as np
+d = snapshot_download("<hub_repo>-probe", repo_type="dataset")
+recs = [json.load(open(p)) for p in glob.glob(f"{d}/records/*.json")]
+M, C = np.zeros((16, 14)), np.zeros(16)
+for rec in recs:
+    for it in rec["experts"]:
+        M[it["expert"]] += it["disease"]; C[it["expert"]] += 1
+M /= np.maximum(C, 1)[:, None]        # 16 expert × 14 bệnh
+```
+
+Hàng nào của `M` cũng gần giống nhau = các expert **không phân hoá**, top-6
+chỉ là 6 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự
+chia việc, và cột nào nổi lên cho biết expert đó nhận phần nào của bài toán.
+
+`run.mode: probe` | `src/probe.py` | `scripts/kaggle_probe.py` |
+`src/model.py::RouterBridge.force_gate`
 
 ---
 

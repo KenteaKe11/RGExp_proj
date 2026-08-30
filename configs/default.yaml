@@ -162,6 +162,18 @@ run:
   phase2_samples: null      # router + expert + decoder — loss = CE+sup+aux
   n_test_samples: 200       # §1.1 — 200 mẫu sinh text có metrics
 
+  # ── Phase 3: probe chuyên môn expert (mode: probe) — xem §3.6 ─────────────
+  # KHÔNG train. Nạp trung bình SWA từ last/ trên Hub, sinh báo cáo cho từng
+  # ảnh test, rồi bật lần lượt từng expert trong top-6 (trọng số 1.0) để đo:
+  # bản đồ không gian 16×16, vector 14 bệnh + 4 aspect, top-10 token
+  # unembedding. Mỗi ảnh xong là một bản ghi JSON, key_id = img_rel.
+  probe_repo: null          # null -> "<hub_repo>-probe" (repo_type=dataset)
+  probe_n_images: null      # null = TRỌN tập test (n_test_samples bị bỏ qua)
+  probe_commit_every: 1.0   # phút — CommitScheduler gom bao lâu thì commit
+  probe_top_tokens: 10
+  probe_log_every: 20       # ảnh
+  probe_flush_every: 20     # ảnh — ghi lại reports.csv
+
   # ── Batch: null = tự chọn theo VRAM, giữ effective_batch = 32 ─────────────
   #   ≥70GB → 8×4  |  ≥38GB → 4×8  |  ≥22GB → 2×16  |  <22GB → 1×32
   # Ghi số cứng ở đây là VÔ HIỆU HOÁ preset: config.py chỉ thay khi thấy
@@ -226,9 +238,9 @@ run:
   swa_use: always
   # Dừng sớm GIỮA cycle thì snapshot cuối KHÔNG được chụp: lúc đó trọng số
   # đang ở giữa dốc (LR cao), cho vào trung bình là kéo nó ra khỏi vùng đáy.
-  # §1.7b — Total_Loss = 1·CE + 0.5·Focal + 0.07·Aux  (tỉ lệ CHỐT)
+  # §1.7b — Total_Loss = 1·CE + 0.4·Focal + 0.1·Aux  (tỉ lệ CHỐT)
   w_sup: 0.4                # hệ số Focal (supervised) trong Phase 2
-  w_aux: 0.08               # hệ số load-balancing (aux)
+  w_aux: 0.1                # hệ số load-balancing (aux)
   focal_gamma: 2.0          # "lực phạt mũ 2"
   # §1.6 — α_ij = 1/(f_ij + ε)^p. p = 0.125 (nghịch đảo căn bậc 8) kéo dải α
   # từ ~1000× (p = 0.5, bản cũ) xuống ~5×: ô hiếm vẫn nặng hơn ô phổ biến

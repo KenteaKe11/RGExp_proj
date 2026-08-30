@@ -264,6 +264,23 @@ def load_config(path="configs/default.yaml", overrides=None):
             "eval_every", 1), 1)), 1) if old_every else 1)
     run.setdefault("hub_sync", False)
     fixed.setdefault("require_bf16", True)
+
+    # ── Phase 3 (mode="probe"): khảo sát chuyên môn expert ────────────────────
+    # Mặc định đặt ở đây chứ không chỉ trong yaml, để config cũ (chưa có khối
+    # `probe`) chạy được mode mới mà không phải sửa file.
+    run.setdefault("probe_repo", None)        # null -> "<hub_repo>-probe"
+    run.setdefault("probe_commit_every", 1.0)   # phút, CommitScheduler
+    run.setdefault("probe_top_tokens", 10)
+    run.setdefault("probe_log_every", 20)     # ảnh
+    run.setdefault("probe_flush_every", 20)   # ảnh, ghi lại reports.csv
+    run.setdefault("probe_n_images", None)    # null = TRỌN tập test
+    if str(run.get("mode", "both")) == "probe":
+        # Phase 3 không train và không được bỏ qua infer vì "ô này đã có eval":
+        # eval cũ là của mode=test, không có bản ghi probe nào.
+        run["force_eval"] = True
+        # n_test_samples là trần của mode=test (200 mẫu để chấm metrics nhanh).
+        # Phase 3 chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
+        run["n_test_samples"] = run.get("probe_n_images") or 0
     # Nhiễu Gumbel trên route logit (chống overfit tuyến đường). Default 0.0
     # để config cũ giữ nguyên hành vi cũ — bật bằng fixed.route_noise.
     fixed.setdefault("route_noise", 0.0)
@@ -321,6 +338,11 @@ def load_config(path="configs/default.yaml", overrides=None):
     tag = f"{sweep['model']}-{sweep['variant']}-n{n_block}"
     if run.get("hub_repo") is None:
         run["hub_repo"] = f"RGExp123/mimic-cxr-{tag}"
+    # Bản ghi probe là DATASET, không phải model: để chung repo với checkpoint
+    # thì `list_repo_files` phải lọc lẫn giữa weights.pt và vài nghìn json, và
+    # ai tải ckpt cũng kéo theo cả đống bản ghi. Mặc định tách hẳn một repo.
+    if run.get("probe_repo") is None:
+        run["probe_repo"] = f"{run['hub_repo']}-probe"
     if run.get("wandb_run") is None:
         run["wandb_run"] = tag
     # Mỗi ô sweep có thư mục riêng: chạy song song/nối tiếp không đè checkpoint.
@@ -523,7 +545,10 @@ def build_argparser():
     ap.add_argument("--variant", type=str.lower, choices=list(ROUTER_VARIANTS),
                     default=None)
     ap.add_argument("--n-block", type=int, dest="n_block")
-    ap.add_argument("--mode", choices=["train", "test", "both"])
+    ap.add_argument("--mode", choices=["train", "test", "both", "probe"],
+                    help="probe = Phase 3: không train, nạp SWA từ Hub, sinh "
+                         "báo cáo rồi bật lần lượt từng expert trong top-k để "
+                         "đo chuyên môn (xem src/probe.py).")
     ap.add_argument("--phase", type=int, choices=[1, 2],
                     help="Chạy riêng một phase (mặc định: cả hai, nối tiếp). "
                          "Cũng thu hẹp STAGE 0 về đúng phase đó.")
