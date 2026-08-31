@@ -37,6 +37,22 @@ from . import moe
 from .config import adapter_desc, variant_desc
 from .router import RouterNet
 
+_BF16_OK = None
+
+
+def bf16_ok():
+    """GPU có bf16 THẬT (sm80+) hay không. Hỏi một lần rồi nhớ.
+
+    Quan trọng vì `torch.cuda.is_bf16_supported()` trả True cả trên T4 (sm75)
+    — ở đó bf16 là đường mô phỏng, chậm và không phải cái ta muốn ép router
+    chui qua.
+    """
+    global _BF16_OK
+    if _BF16_OK is None:
+        _BF16_OK = bool(torch.cuda.is_available()
+                        and torch.cuda.get_device_capability(0)[0] >= 8)
+    return _BF16_OK
+
 # §1.2 — prompt cố định.
 PROMPT_TEXT = (
     "Write a chest radiograph report from the image. Output only the report, "
@@ -166,8 +182,17 @@ class RouterBridge:
             raise RuntimeError(
                 f"router_mask dài {mask.shape[1]} nhưng chuỗi dài "
                 f"{hidden.shape[1]} — quên cắt mask khi cắt chuỗi?")
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            sup_logits, gate, stats = self.router(hidden, mask)
+        # bf16 CHỈ khi GPU có thật. Trên T4 (sm75) hai lựa chọn còn lại đều
+        # tệ: autocast bf16 là đường mô phỏng, còn autocast fp16 thì
+        # `_attn_bias` trong router dùng finfo(fp16).min = -65504 làm mask —
+        # cộng vào logit attention rồi softmax là ra NaN. Router chỉ vài chục
+        # MB param nên chạy thẳng fp32 vừa rẻ vừa không có bẫy nào.
+        if bf16_ok():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                sup_logits, gate, stats = self.router(hidden, mask)
+        else:
+            p_dtype = next(self.router.parameters()).dtype
+            sup_logits, gate, stats = self.router(hidden.to(p_dtype), mask)
         # 3 phần tử, KHÔNG còn aux: cân bằng tải do bias của router lo, nằm
         # ngoài loss (xem src/router.py::RouterNet.update_bias).
         self.out = (sup_logits.float(), gate, stats)

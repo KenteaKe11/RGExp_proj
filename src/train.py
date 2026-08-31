@@ -1110,6 +1110,57 @@ def main(argv=None):
         log("infer", f"ép {len(stale)} param base fp32 -> {f.compute_dtype}")
     moe.freeze_scales(model, log)
 
+    # ── Chặn "device-side assert triggered" ở torch.multinomial ──────────────
+    # multinomial trên CUDA KHÔNG kiểm tra đầu vào trên host: một hàng xác
+    # suất có NaN không cho RuntimeError mà cho device-side assert, và vì
+    # kernel chạy bất đồng bộ nên traceback trỏ vào một dòng ngẫu nhiên sau đó.
+    # Kết quả là lỗi hiện ra ở `next_tokens = torch.multinomial(...)` dù chỗ
+    # hỏng nằm trước đó vài trăm kernel. Hai nguồn hỏng, cách sửa khác hẳn:
+    #   1. logits có NaN/+Inf  -> tràn số (fp16) hoặc trọng số adapter hỏng;
+    #   2. token id ≥ vocab    -> processor/tokenizer lệch với bảng nhúng.
+    # Kiểm cả hai NGAY TẠI CHỖ để log nói đúng cái nào, thay vì đoán.
+    from transformers import LogitsProcessor, LogitsProcessorList
+
+    class _FiniteScores(LogitsProcessor):
+        """Dọn NaN/+Inf khỏi logits trước khi lấy mẫu, và ghi lại là đã dọn."""
+
+        def __init__(self, max_warn=3):
+            self.hits, self.max_warn = 0, max_warn
+
+        def __call__(self, input_ids, scores):
+            # −inf là HỢP LỆ: top_k/top_p/no_repeat_ngram dùng nó để loại
+            # token. Chỉ NaN và +inf mới là hỏng thật.
+            bad = torch.isnan(scores) | (scores == float("inf"))
+            if bool(bad.any()):
+                self.hits += 1
+                if self.hits <= self.max_warn:
+                    ok = scores[torch.isfinite(scores)]
+                    warn("infer",
+                         f"logits có {float(bad.float().mean()):.1%} phần tử "
+                         f"NaN/+Inf ở bước {int(input_ids.shape[-1])} "
+                         f"(|max| của phần lành = "
+                         f"{float(ok.abs().max()) if ok.numel() else 0.0:.1f}). "
+                         f"compute_dtype={f.compute_dtype} — fp16 tràn số là "
+                         f"nguyên nhân hay gặp nhất. Đã thay bằng -max để "
+                         f"multinomial không nổ device-side assert; TEXT SINH "
+                         f"RA Ở BƯỚC NÀY KHÔNG ĐÁNG TIN.")
+                lo = torch.finfo(scores.dtype).min
+                scores = torch.nan_to_num(scores, nan=lo,
+                                          posinf=torch.finfo(scores.dtype).max / 4,
+                                          neginf=lo)
+            dead = ~torch.isfinite(scores).any(dim=-1)
+            if bool(dead.any()):
+                self.hits += 1
+                if self.hits <= self.max_warn:
+                    warn("infer", "một hàng logits bị lọc sạch (toàn -inf) — "
+                                  "dùng phân phối đều cho bước này")
+                scores = scores.masked_fill(dead[:, None], 0.0)
+            return scores
+
+    finite_guard = _FiniteScores()
+    n_emb = int(model.get_input_embeddings().weight.shape[0])
+    _preflight = []
+
     @torch.no_grad()
     def generate_batch(paths, temperature=None, rep_penalty=None):
         tokenizer.padding_side = f.pad_side_infer
@@ -1120,6 +1171,18 @@ def main(argv=None):
                            padding=True, return_tensors="pt")
         inputs = to_device(inputs, DEVICE)
         in_len = inputs["input_ids"].shape[-1]
+        if not _preflight:
+            _preflight.append(1)
+            mx = int(inputs["input_ids"].max())
+            if mx >= n_emb:
+                raise RuntimeError(
+                    f"token id lớn nhất {mx} ≥ {n_emb} dòng của bảng nhúng. "
+                    f"embed_tokens sẽ tra ngoài phạm vi -> CUDA device-side "
+                    f"assert ('srcIndex < srcSelectDimSize'), và lỗi sẽ hiện "
+                    f"ra ở một dòng khác hẳn. Processor và model không cùng "
+                    f"một bản checkpoint.")
+            log("infer", f"preflight: id token lớn nhất {mx} < {n_emb} | "
+                         f"chuỗi vào {in_len} token")
         # Lúc infer KHÔNG có target trong chuỗi, nên router_mask = attention
         # mask: router thấy đúng thứ nó thấy lúc train (prompt + ảnh).
         bridge.begin("route", mask=inputs["attention_mask"])
@@ -1131,7 +1194,8 @@ def main(argv=None):
                 top_k=r.top_k,
                 repetition_penalty=rep_penalty or r.repetition_penalty,
                 no_repeat_ngram_size=r.no_repeat_ngram, num_beams=1,
-                use_cache=True)
+                use_cache=True,
+                logits_processor=LogitsProcessorList([finite_guard]))
             share = (bridge.out[2]["expert_share"] if bridge.out else None)
         finally:
             bridge.end()

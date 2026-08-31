@@ -137,13 +137,24 @@ def _moe_forward(self, x, *args, **kwargs):
 
     # Clone theo khuyến cáo của bitsandbytes: backward qua view của kết quả
     # 4-bit có thể hỏng.
-    result = result.clone()
+    base_out = result.clone()
     names = self._moe_names
     lora_dtype = self.lora_A[names[0]].weight.dtype
-    out_dtype = result.dtype
+    out_dtype = base_out.dtype
     xa = x.to(lora_dtype) if x.dtype != lora_dtype else x
     fast = getattr(self, "_moe_scale", None) is not None
 
+    # `base_result` truyền cho DoRA phải là ĐẦU RA GỐC của base layer, KHÔNG
+    # phải bộ cộng dồn. Trước đây hai thứ đó là cùng một biến `result`, nên
+    # expert thứ hai trở đi nhận đầu vào đã bị expert trước cộng vào:
+    #     out = Π_e (1 + g_e·(s_e − 1))·base + ...
+    # thay vì đúng công thức trong docstring:
+    #     out = (1 + Σ_e g_e·(s_e − 1))·base + ...
+    # Chênh lệch là bậc hai theo (s − 1) cho MỘT layer, nhưng nó nhân dồn qua
+    # 238 layer. Ở bf16 (dải ±3e38) chỉ là lệch số; ở fp16 (dải ±65504) nó đủ
+    # để hidden state tràn -> inf -> NaN ở lm_head -> torch.multinomial nổ
+    # "device-side assert triggered" giữa generate().
+    acc = base_out
     active = CTX.active
     _DQ["key"], _DQ["w"] = id(self.get_base_layer()), None
     try:
@@ -153,13 +164,13 @@ def _moe_forward(self, x, *args, **kwargs):
             # batch ≥ 4 thì hiếm khi xảy ra).
             if not active[e]:
                 continue
-            delta = (_fast_delta(self, name, xa, result) if fast
-                     else _dora_delta(self, name, xa, result))
+            delta = (_fast_delta(self, name, xa, base_out) if fast
+                     else _dora_delta(self, name, xa, base_out))
             gv = w[:, e].to(delta.dtype).view(-1, *([1] * (delta.dim() - 1)))
-            result = result + (gv * delta).to(out_dtype)
+            acc = acc + (gv * delta).to(out_dtype)
     finally:
         _DQ["key"], _DQ["w"] = None, None
-    return result
+    return acc
 
 
 # ═════════════════════════════ dựng & vá model ═══════════════════════════════
