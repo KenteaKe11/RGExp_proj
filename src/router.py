@@ -40,6 +40,37 @@ là một đánh đổi giữa cân bằng và chất lượng. Bias thì nằm 
 autograd: nó chỉnh cửa vào của từng expert mà không thêm một chữ nào vào
 loss, nên chất lượng và cân bằng không còn phải tranh nhau một hệ số.
 Xem `RouterNet.update_bias`.
+
+LỊCH DECAY CHO σ VÀ γ TRONG n STEP ĐẦU. Hai hằng số điều phối ở trên đều
+được nội suy theo hàm MŨ từ một giá trị ĐẦU lớn về giá trị CUỐI nhỏ trong
+`decay_steps` step đầu tiên, rồi giữ nguyên:
+
+    γ(t) = γ_start · (γ_end / γ_start)^(t/n)      t = step, n = decay_steps
+    σ(t) = σ_start · (σ_end / σ_start)^(t/n)
+
+Lý do cho γ: γ = 1e-3 là giá trị đúng cho trạng thái ỔN ĐỊNH, nhưng ở vài
+trăm step đầu nó quá chậm. Route head khởi tạo ngẫu nhiên, và một cú Gumbel
+đủ lớn có thể đẩy CÙNG một expert vào top-k liên tiếp vài chục step; expert
+đó nhận hết gradient, khá lên thật, rồi route_logit của nó tách hẳn khỏi
+nhóm. Với γ = 1e-3 thì bias cần ~2000 step mới bò được một khoảng bằng dải
+route_logit — quá muộn, router đã sập rồi. γ_start = 1.0 nghĩa là bias nắn
+NGAY trong một step: expert nào vừa ăn quá phần của nó thì step sau gần như
+chắc chắn bị đẩy ra khỏi top-k. Cửa vào bị ép mở đều cho tới khi mọi expert
+đều có ít nhất vài chục step gradient, sau đó γ tụt về 1e-3 và cơ chế trở
+lại đúng vai trò cân bằng nhẹ của DeepSeek-V3.
+
+Lý do cho σ: nhiễu Gumbel cần THẬT ở đầu (không có nó thì tuyến đường bị
+khoá từ step 1) và cần TẮT ở cuối (khi expert đã phân hoá, đảo tuyến chỉ còn
+là nhiễu vào delta của decoder). Đây là anneal khám phá → khai thác quen
+thuộc, viết trên cùng một đường cong mũ với γ.
+
+Dùng thang MŨ chứ không tuyến tính vì tỉ lệ đầu/cuối là 1000×: trên thang
+tuyến tính thì 90% quãng đường nằm ở vùng γ > 0.1 (vô dụng vì đã bão hoà) và
+vùng thật sự đáng quan tâm 1e-2 → 1e-3 bị nén vào 1% cuối. Thang mũ chia đều
+theo BẬC: γ qua 0.1 ở t = n/3, qua 0.01 ở t = 2n/3.
+
+`*_start = None` -> TẮT lịch, dùng thẳng giá trị cuối từ step 0 (hành vi cũ).
+Xem `decay_value` và `RouterNet.set_decay_step`.
 """
 from __future__ import annotations
 
@@ -244,6 +275,47 @@ class RouteHead(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
+def decay_value(start, end, n_steps, step):
+    """Nội suy MŨ từ `start` về `end` trong `n_steps` step đầu, sau đó `end`.
+
+        t = clamp(step, 0, n) / n
+        v = start · (end / start)^t          (start, end > 0)
+
+    `start is None` hoặc `n_steps <= 0` -> trả thẳng `end`: đó là công tắc
+    tắt lịch, và cũng là đường mà mọi code cũ (không biết đến lịch) đi qua.
+
+    Một trong hai đầu bằng 0 thì thang log không định nghĩa được — rơi về nội
+    suy TUYẾN TÍNH. Trường hợp này chỉ xảy ra khi ai đó cố ý tắt hẳn nhiễu
+    (σ_end = 0), và tuyến tính là hành vi duy nhất hợp lý ở đó.
+    """
+    if start is None or n_steps <= 0:
+        return float(end)
+    t = min(max(float(step), 0.0), float(n_steps)) / float(n_steps)
+    start, end = float(start), float(end)
+    if start > 0.0 and end > 0.0:
+        return start * (end / start) ** t
+    return start + (end - start) * t
+
+
+def decay_desc(gamma_start, gamma_end, noise_start, noise_end, n_steps):
+    """Một dòng mô tả lịch decay, để log.
+
+    Hàm MODULE chứ không chỉ là method: train.py in dòng cấu hình TRƯỚC khi
+    build_model() nạp 4B tham số Gemma xuống GPU, nên lúc đó chưa có instance
+    RouterNet nào để hỏi — mà đó lại đúng là lúc người đọc log cần thấy lịch,
+    để Ctrl-C được ngay nếu đặt sai thay vì sau 3 phút nạp weight.
+    """
+    if n_steps <= 0 or (gamma_start is None and noise_start is None):
+        return f"lịch decay TẮT — γ={gamma_end:g} σ={noise_end:g} cố định"
+
+    def one(name, a, b):
+        return f"{name} {b:g} cố định" if a is None else f"{name} {a:g}→{b:g}"
+
+    return (one("γ", gamma_start, gamma_end) + " | "
+            + one("σ", noise_start, noise_end)
+            + f" | mũ, {int(n_steps)} step đầu")
+
+
 # ═══════════════════════════════ nhánh hoàn chỉnh ════════════════════════════
 class RouterNet(nn.Module):
     """Cả nhánh router. Trả về (sup_logits [B,14], gate_weight, stats).
@@ -276,16 +348,38 @@ class RouterNet(nn.Module):
     """
 
     def __init__(self, variant, n_block, n_expert, top_k, dim=D_MODEL,
-                 d_enc=D_ENC, route_noise=1.0, bias_gamma=1e-3):
+                 d_enc=D_ENC, route_noise=1.0, bias_gamma=1e-3,
+                 route_noise_start=None, bias_gamma_start=None,
+                 decay_steps=0):
         super().__init__()
         assert variant in VARIANTS, f"variant lạ: {variant} (có: {list(VARIANTS)})"
         assert 1 <= top_k <= n_expert
         assert route_noise >= 0, f"route_noise phải >= 0, nhận {route_noise}"
         assert bias_gamma >= 0, f"bias_gamma phải >= 0, nhận {bias_gamma}"
+        assert decay_steps >= 0, f"decay_steps phải >= 0, nhận {decay_steps}"
+        assert route_noise_start is None or route_noise_start >= 0, (
+            f"route_noise_start phải >= 0, nhận {route_noise_start}")
+        assert bias_gamma_start is None or bias_gamma_start >= 0, (
+            f"bias_gamma_start phải >= 0, nhận {bias_gamma_start}")
         self.variant, self.n_block = variant, n_block
         self.n_expert, self.top_k = n_expert, top_k
-        self.route_noise = float(route_noise)
-        self.bias_gamma = float(bias_gamma)
+
+        # ── Lịch decay của σ và γ (xem docstring module + `decay_value`) ────
+        # `route_noise` / `bias_gamma` truyền vào là giá trị CUỐI (sau warmup).
+        # `*_start = None` nghĩa là không có lịch: giá trị cuối dùng từ step 0.
+        self.route_noise_end = float(route_noise)
+        self.bias_gamma_end = float(bias_gamma)
+        self.route_noise_start = (None if route_noise_start is None
+                                  else float(route_noise_start))
+        self.bias_gamma_start = (None if bias_gamma_start is None
+                                 else float(bias_gamma_start))
+        self.decay_steps = int(decay_steps)
+        self.decay_step = 0
+        # Giá trị ĐANG dùng của step hiện tại. Vẫn đúng hai cái tên cũ, nên
+        # forward/update_bias/log/selftest không phải biết là có lịch hay không
+        # — chúng đọc "σ và γ bây giờ là bao nhiêu", đúng như trước.
+        self.route_noise = self.bias_gamma = 0.0
+        self.set_decay_step(0)
         self.stem = Stem(d_enc, dim)
         self.blocks = nn.ModuleList(
             [VARIANTS[variant](dim) for _ in range(n_block)])
@@ -307,9 +401,43 @@ class RouterNet(nn.Module):
 
     # ── nhiễu Gumbel trên route logit ───────────────────────────────────────
     def set_route_noise(self, scale):
-        """Đổi cường độ nhiễu giữa chừng (anneal). Trả về giá trị cũ."""
+        """Đặt TAY cường độ nhiễu. Trả về giá trị cũ.
+
+        Lưu ý: nếu lịch decay đang bật (`route_noise_start` khác None) thì
+        `set_decay_step` ở đầu step sau sẽ ghi đè giá trị đặt tay này. Muốn
+        chốt cứng một σ thì để `route_noise_start = None`.
+        """
         old, self.route_noise = self.route_noise, max(float(scale), 0.0)
         return old
+
+    # ── lịch decay σ và γ trong n step đầu ──────────────────────────────────
+    def set_decay_step(self, step):
+        """Đặt con trỏ lịch -> tính lại σ và γ cho step này. Trả về (γ, σ).
+
+        Gọi MỘT lần ở ĐẦU mỗi optimizer step, trước forward: σ đi thẳng vào
+        chỗ chọn top-k của micro-batch đầu tiên, còn γ được `update_bias()`
+        dùng ở cuối chính step đó.
+
+        Con trỏ là `step` toàn cục của train.py chứ không phải một bộ đếm nội
+        bộ, có chủ ý: resume từ checkpoint phải vào lại ĐÚNG chỗ trên đường
+        cong. Một bộ đếm nội bộ thì hoặc phải nằm trong state_dict (làm hỏng
+        mọi checkpoint cũ vì thêm khoá lạ), hoặc reset về 0 mỗi lần resume và
+        warmup lại từ đầu — cả hai đều tệ hơn.
+        """
+        self.decay_step = max(int(step), 0)
+        self.bias_gamma = decay_value(self.bias_gamma_start,
+                                      self.bias_gamma_end,
+                                      self.decay_steps, self.decay_step)
+        self.route_noise = decay_value(self.route_noise_start,
+                                       self.route_noise_end,
+                                       self.decay_steps, self.decay_step)
+        return self.bias_gamma, self.route_noise
+
+    def decay_desc(self):
+        """Một dòng mô tả lịch của CHÍNH instance này (dùng ở model.py)."""
+        return decay_desc(self.bias_gamma_start, self.bias_gamma_end,
+                          self.route_noise_start, self.route_noise_end,
+                          self.decay_steps)
 
     # ── cập nhật bias cân bằng tải (không gradient) ─────────────────────────
     @torch.no_grad()
@@ -527,6 +655,19 @@ def _selftest():
     ok &= mean_ok
     print(f"bias trung bình ghim về 0                  "
           f"{'✓' if mean_ok else '✗'}")
+
+    # Lịch decay: γ đi từ 1.0 về 1e-3 theo BẬC (mũ), không phải tuyến tính.
+    sch = RouterNet(VARIANT, 1, 12, 4, route_noise=1e-3, bias_gamma=1e-3,
+                    route_noise_start=1.0, bias_gamma_start=1.0,
+                    decay_steps=900)
+    pts = [(t, sch.set_decay_step(t)[0]) for t in (0, 300, 600, 900, 5000)]
+    want = (1.0, 0.1, 0.01, 1e-3, 1e-3)
+    dec_ok = all(abs(g - w) < 1e-6 * max(w, 1e-3) + 1e-9
+                 for (_, g), w in zip(pts, want))
+    ok &= dec_ok
+    print(f"lịch decay mũ 1→1e-3 qua đúng từng bậc     "
+          f"{'✓' if dec_ok else '✗'} "
+          + " ".join(f"t={t}:{g:.4g}" for t, g in pts))
 
     print("\n" + ("✓ khớp tài liệu" if ok else "✗ LỆCH tài liệu — xem lại"))
     return 0 if ok else 1

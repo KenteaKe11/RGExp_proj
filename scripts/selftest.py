@@ -34,7 +34,8 @@ from src.losses import (asl_loss, aspect_roles,          # noqa: E402
                         binary_target_table, supervised_stats, to_binary)
 from src.optim import (CosineRestartSchedule,           # noqa: E402
                        WeightAverager)
-from src.router import VARIANT, RouterNet, _selftest    # noqa: E402
+from src.router import (VARIANT, RouterNet, _selftest,  # noqa: E402
+                        decay_desc, decay_value)
 
 FAIL = []
 
@@ -573,6 +574,120 @@ def test_bias():
           torch.equal(heir.expert_bias, net.expert_bias))
 
 
+def test_decay():
+    """[11] lịch decay mũ của γ (bias) và σ (Gumbel) trong n step đầu."""
+    print("\n[11] lịch decay σ và γ (chống collapse sớm)")
+    torch.manual_seed(0)
+    B, N, E, K = 64, 16, 12, 4
+    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+
+    # ── (1) toán thuần: đường cong phải chia đều theo BẬC, không tuyến tính ──
+    n = 900
+    got = [decay_value(1.0, 1e-3, n, t) for t in (0, 300, 450, 600, 900)]
+    check("mũ 1→1e-3: qua 0.1 ở n/3, 0.01 ở 2n/3, chạm đáy ở n",
+          all(abs(g - w) < 1e-9 for g, w in
+              zip(got, (1.0, 0.1, 10 ** -1.5, 0.01, 1e-3))),
+          " ".join(f"{g:.5g}" for g in got))
+    check("qua n rồi thì kẹp ở giá trị cuối (không đi tiếp xuống 0)",
+          decay_value(1.0, 1e-3, n, 10 ** 6) == 1e-3
+          and decay_value(1.0, 1e-3, n, -5) == 1.0)
+    check("start=None hoặc n=0 -> trả thẳng giá trị cuối (lịch TẮT)",
+          decay_value(None, 1e-3, n, 0) == 1e-3
+          and decay_value(1.0, 1e-3, 0, 0) == 1e-3)
+    check("một đầu = 0 -> rơi về tuyến tính, không NaN",
+          abs(decay_value(1.0, 0.0, 100, 50) - 0.5) < 1e-12)
+    check("decay_desc đọc được cả khi lịch tắt",
+          "TẮT" in decay_desc(None, 1e-3, None, 1.0, 0)
+          and "→" in decay_desc(1.0, 1e-3, 1.0, 1e-3, 1000))
+
+    # ── (2) set_decay_step nắn ĐÚNG hai giá trị mà forward/update_bias đọc ───
+    net = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1e-3,
+                    bias_gamma=1e-3, route_noise_start=1.0,
+                    bias_gamma_start=1.0, decay_steps=n)
+    check("step 0 -> σ và γ đều ở giá trị ĐẦU",
+          net.route_noise == 1.0 and net.bias_gamma == 1.0,
+          f"σ={net.route_noise:g} γ={net.bias_gamma:g}")
+    g_mid, s_mid = net.set_decay_step(n // 2)
+    check("set_decay_step trả về đúng (γ, σ) đang dùng",
+          g_mid == net.bias_gamma and s_mid == net.route_noise)
+    net.set_decay_step(n)
+    check("hết warmup -> σ, γ về giá trị CUỐI",
+          net.route_noise == 1e-3 and net.bias_gamma == 1e-3)
+
+    # Hàm THUẦN của step: đây là điều kiện để resume vào lại đúng chỗ trên
+    # đường cong thay vì warmup lại từ đầu.
+    twin = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1e-3,
+                     bias_gamma=1e-3, route_noise_start=1.0,
+                     bias_gamma_start=1.0, decay_steps=n)
+    check("resume: cùng step -> cùng (γ, σ), không phụ thuộc lịch sử",
+          twin.set_decay_step(n // 2) == (g_mid, s_mid))
+
+    # ── (3) lịch KHÔNG được thêm khoá vào state_dict (ckpt cũ vẫn nạp được) ─
+    plain = RouterNet(VARIANT, 1, E, K, d_enc=2560)
+    check("lịch không thêm khoá lạ vào state_dict",
+          set(net.state_dict()) == set(plain.state_dict()))
+    net.set_decay_step(0)
+    plain.load_state_dict(net.state_dict())
+    check("ckpt của router CÓ lịch nạp được vào router KHÔNG lịch",
+          torch.equal(plain.expert_bias, net.expert_bias))
+    check("nạp state_dict KHÔNG kéo theo lịch (lịch là config, không phải "
+          "trọng số)", plain.bias_gamma_start is None
+          and plain.decay_steps == 0)
+
+    # ── (4) γ đầu = 1.0 phải nắn bias ĐỦ MẠNH để đảo được top-k trong 1 step ─
+    net.set_decay_step(0)
+    net.train()
+    with torch.no_grad():
+        net.expert_bias.zero_()
+        net.load_count.zero_()
+        net.load_tokens.zero_()
+        net.load_count[5] = 200.0            # expert 5 ôm hết
+        net.load_tokens += 200.0
+    span_hot, _ = net.update_bias()
+    check("γ=1.0 -> một step đủ tạo khe bias cỡ đơn vị (dải route_logit ~±2)",
+          span_hot >= 1.0, f"span={span_hot:.3f}")
+    check("γ=1.0 -> expert quá tải bị hạ hẳn 1 bậc so với phần còn lại",
+          float(net.expert_bias[5]) < float(net.expert_bias[0]) - 1.0,
+          f"b[5]={float(net.expert_bias[5]):+.3f} "
+          f"b[0]={float(net.expert_bias[0]):+.3f}")
+    # Cùng tình huống với γ cuối: bias gần như không nhúc nhích. Đây chính là
+    # lý do phải có lịch — γ=1e-3 chỉ đúng cho trạng thái đã ổn định.
+    slow = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=1e-3)
+    slow.train()
+    with torch.no_grad():
+        slow.load_count[5] = 200.0
+        slow.load_tokens += 200.0
+    span_slow, _ = slow.update_bias()
+    check("γ=1e-3 -> cùng tình huống chỉ nắn được 1/1000 khe đó",
+          span_slow < span_hot / 500, f"{span_slow:.5f} vs {span_hot:.3f}")
+
+    # ── (5) σ giảm thì tuyến đường thôi đảo (khám phá -> khai thác) ──────────
+    net.eval()
+    with torch.no_grad():
+        net.expert_bias.zero_()
+        clean = (net(x, mask)[1] > 0)        # top-k tất định, không nhiễu
+    net.train()
+
+    def churn(step):
+        net.set_decay_step(step)
+        with torch.no_grad():
+            sel = (net(x, mask)[1] > 0)
+        return float((sel != clean).float().sum()) / B
+
+    c0, c_end = churn(0), churn(n)
+    check("σ=1.0 ở step 0 -> tuyến đường đảo nhiều (expert thứ 5 còn cửa)",
+          c0 > 0.5, f"{c0:.2f} lựa chọn đổi / mẫu")
+    check("σ=1e-3 sau warmup -> gần như tất định, bám top-k sạch",
+          c_end < 0.05 and c_end < c0 / 10, f"{c_end:.3f} vs {c0:.2f}")
+
+    # ── (6) tắt lịch = đúng hành vi cũ ──────────────────────────────────────
+    old = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1.0,
+                    bias_gamma=1e-3)
+    vals = {old.set_decay_step(t) for t in (0, 10, 10 ** 6)}
+    check("không có lịch -> σ, γ là HẰNG ở mọi step (hành vi trước đây)",
+          vals == {(1e-3, 1.0)}, str(vals))
+
+
 def test_probe():
     """[10] mode=probe: force_gate + các phép tính thuần của probe."""
     print("\n[10] probe chuyên môn expert (mode=probe)")
@@ -705,6 +820,7 @@ if __name__ == "__main__":
     test_swa()
     test_bias()
     test_route_noise()
+    test_decay()
     test_probe()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

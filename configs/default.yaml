@@ -57,7 +57,9 @@ fixed:
   # σ = 1.0 là LẤY MẪU ĐÚNG CHUẨN — mặc định phổ thông của Gumbel-top-k, và
   # là giá trị project này dùng. σ nhỏ hơn -> gần top-k xác định; lớn hơn ->
   # gần như bốc ngẫu nhiên đều. eval/infer TẮT hẳn -> số đo tất định.
-  route_noise: 1.0
+  # ĐÂY LÀ GIÁ TRỊ SAU WARMUP (xem decay_warmup_steps bên dưới): σ đi từ
+  # route_noise_start xuống giá trị này trong n step đầu rồi giữ nguyên.
+  route_noise: 0.001
 
   # ── Cân bằng tải KHÔNG dùng aux loss (DeepSeek-V3) ───────────────────────
   # Mỗi expert có một bias b_e cộng vào điểm CHỌN top-k (không cộng vào trọng
@@ -68,7 +70,39 @@ fixed:
   # 0.001 là mặc định của DeepSeek-V3 và hợp với dải logit của route_head ở
   # đây (~±2). 0 = tắt hẳn cơ chế cân bằng (chỉ dùng để đo xem nó có tác dụng
   # gì không — router sẽ sập về vài expert trong vòng vài trăm step).
+  # GIÁ TRỊ SAU WARMUP — xem decay_warmup_steps.
   bias_gamma: 0.001
+
+  # ── Lịch decay MŨ của σ và γ trong n step ĐẦU ────────────────────────────
+  # Vấn đề mà lịch này giải: γ = 1e-3 là giá trị đúng cho trạng thái ỔN ĐỊNH,
+  # nhưng ở vài trăm step đầu nó quá chậm. Route head khởi tạo ngẫu nhiên, và
+  # một cú Gumbel đủ lớn có thể đẩy CÙNG một expert vào top-k liên tiếp vài
+  # chục step; expert đó ăn hết gradient, khá lên thật, rồi route_logit của nó
+  # tách hẳn khỏi nhóm — router sập trước khi bias kịp bò tới (γ=1e-3 cần
+  # ~2000 step mới đi được một khoảng bằng dải route_logit).
+  #
+  #   γ(t) = γ_start · (γ_end/γ_start)^(t/n)      t = step, n = warmup steps
+  #   σ(t) = σ_start · (σ_end/σ_start)^(t/n)
+  #
+  # γ_start = 1.0 nghĩa là bias nắn NGAY trong một step: expert vừa ăn quá
+  # phần của nó thì step sau gần như chắc chắn bị đẩy khỏi top-k. Cửa vào bị
+  # ép mở đều cho tới khi mọi expert đều có gradient, rồi γ tụt về 1e-3 và cơ
+  # chế trở lại vai trò cân bằng nhẹ của DeepSeek-V3.
+  # σ_start = 1.0 -> lấy mẫu ĐÚNG CHUẨN Gumbel-top-k lúc đầu (tuyến đường còn
+  # đảo được), σ_end = 1e-3 -> gần tất định về cuối, khi expert đã phân hoá và
+  # đảo tuyến chỉ còn là nhiễu vào delta của decoder.
+  #
+  # Thang MŨ chứ không tuyến tính vì tỉ lệ đầu/cuối là 1000×: tuyến tính thì
+  # 90% quãng đường nằm ở vùng đã bão hoà (γ > 0.1) và vùng đáng quan tâm
+  # 1e-2 → 1e-3 bị nén vào 1% cuối. Mũ chia đều theo BẬC: qua 0.1 ở t = n/3,
+  # qua 0.01 ở t = 2n/3.
+  #
+  # null = TẮT lịch cho đại lượng đó (dùng thẳng giá trị cuối từ step 0 — đúng
+  # hành vi trước khi có lịch này). decay_warmup_steps: 0 = tắt cả hai.
+  # Con trỏ là `step` toàn cục, nên resume vào lại đúng chỗ trên đường cong.
+  bias_gamma_start: 1.0
+  route_noise_start: 1.0
+  decay_warmup_steps: 1000
 
   # ── Adapter (đã chốt: QDoRA r8) ──────────────────────────────────────────
   lora_r: 8

@@ -121,6 +121,16 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         "top_k": cfg.fixed.top_k,
         "route_noise": float(getattr(cfg.fixed, "route_noise", 1.0) or 0.0),
         "bias_gamma": float(getattr(cfg.fixed, "bias_gamma", 0.0) or 0.0),
+        # Lịch decay: hai ô sweep cùng γ cuối nhưng khác γ đầu là hai lần chạy
+        # KHÁC nhau — không ghi lại thì bảng sweep không giải thích nổi vì sao.
+        "bias_gamma_start": (None if getattr(cfg.fixed, "bias_gamma_start",
+                                             None) is None
+                             else float(cfg.fixed.bias_gamma_start)),
+        "route_noise_start": (None if getattr(cfg.fixed, "route_noise_start",
+                                              None) is None
+                              else float(cfg.fixed.route_noise_start)),
+        "decay_warmup_steps": int(getattr(cfg.fixed, "decay_warmup_steps", 0)
+                                  or 0),
         "w_sup": float(cfg.run.w_sup),
         "asl_gamma_pos": float(getattr(cfg.run, "asl_gamma_pos", 0.0)),
         "asl_gamma_neg": float(getattr(cfg.run, "asl_gamma_neg", 4.0)),

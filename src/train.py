@@ -63,6 +63,7 @@ from .model import (build_collate, build_model, build_prompt, ce_loss,
                     count_image_tokens, find_image_token_id, load_image,
                     make_loader, split_batch, to_device, wrap_images)
 from .optim import CosineRestartSchedule, WeightAverager
+from .router import decay_desc
 
 DEVICE = torch.device("cuda:0")
 
@@ -141,7 +142,13 @@ def main(argv=None):
                f"{r.asl_gamma_pos:g} γ-={r.asl_gamma_neg:g} ngưỡng âm "
                f"m={r.asl_clip:g} | uncertain={r.uncertain_soft:g}, blank=MASK "
                f"| cân bằng tải bias γ={f.bias_gamma:g} | Gumbel σ="
-               f"{f.route_noise:g}")
+               f"{f.route_noise:g} (cả hai là giá trị SAU warmup)")
+    _decay = decay_desc(getattr(f, "bias_gamma_start", None), f.bias_gamma,
+                        getattr(f, "route_noise_start", None), f.route_noise,
+                        int(getattr(f, "decay_warmup_steps", 0) or 0))
+    log("cfg", f"lịch decay router: {_decay} — γ lớn ở đầu để bias kịp nắn "
+               f"trước khi một cú Gumbel may mắn khoá cứng top-k; σ lớn ở đầu "
+               f"để tuyến đường còn đảo được")
     log("cfg", f"val mỗi {r.eval_every} step ({r.eval_max_batches} batch) | "
                f"ckpt mỗi {r.save_every_n_vals} lần val | dừng sớm: KHÔNG")
     log("cfg", f"cắt gradient: chuẩn TOÀN CỤC (router + expert chung một "
@@ -189,6 +196,9 @@ def main(argv=None):
             "asl_gamma_neg": r.asl_gamma_neg, "asl_clip": r.asl_clip,
             "uncertain_soft": r.uncertain_soft,
             "route_noise": f.route_noise, "bias_gamma": f.bias_gamma,
+            "route_noise_start": getattr(f, "route_noise_start", None),
+            "bias_gamma_start": getattr(f, "bias_gamma_start", None),
+            "decay_warmup_steps": getattr(f, "decay_warmup_steps", 0),
             "cycle_samples": r.cycle_samples,
             "use_policy": r.use_policy,
         })
@@ -477,6 +487,9 @@ def main(argv=None):
                     asl_gamma_neg=r.asl_gamma_neg, asl_clip=r.asl_clip,
                     uncertain_soft=r.uncertain_soft,
                     bias_gamma=f.bias_gamma, route_noise=f.route_noise,
+                    bias_gamma_start=getattr(f, "bias_gamma_start", None),
+                    route_noise_start=getattr(f, "route_noise_start", None),
+                    decay_warmup_steps=getattr(f, "decay_warmup_steps", 0),
                     model=f.model_id, variant=cfg.sweep.variant,
                     n_block=cfg.sweep.n_block, n_expert=f.n_expert,
                     top_k=f.top_k, lora_r=f.lora_r, lora_alpha=f.lora_alpha,
@@ -817,6 +830,12 @@ def main(argv=None):
             # Mốc mẫu ở ĐẦU step: LR của một step là LR tại chỗ dữ liệu của
             # step đó bắt đầu.
             step_start = samples
+            # Lịch decay của router: σ (Gumbel) và γ (bias) cho ĐÚNG step này.
+            # Phải đặt TRƯỚC vòng grad_accum — σ đi vào chỗ chọn top-k ngay ở
+            # micro-batch đầu tiên, còn γ được `update_bias()` ở cuối step
+            # dùng. Con trỏ là `step` toàn cục nên resume vào lại đúng chỗ
+            # trên đường cong thay vì warmup lại từ đầu.
+            gam_now, sig_now = router.set_decay_step(step)
             running, agg = 0.0, {}
             for _ in range(r.grad_accum):
                 try:
@@ -900,16 +919,23 @@ def main(argv=None):
                   "train/epoch": epoch, "train/lr": lr_now,
                   "train/cycle": cyc, "train/swa_n": swa.n,
                   "train/step_sec": step_sec,
+                  "train/bias_gamma": gam_now, "train/route_noise": sig_now,
                   **{f"train/{k}": v for k, v in agg.items()}})
             event("train_step", step=step, samples=samples, epoch=epoch,
                   loss=round(running, 5), grad_norm=round(gnorm, 4),
                   lr=lr_now, cycle=cyc, step_sec=round(step_sec, 3),
+                  bias_gamma=gam_now, route_noise=sig_now,
                   vram_gb=round(torch.cuda.memory_allocated(0) / 1024**3, 2),
                   **{k: round(v, 5) for k, v in agg.items()})
             if limiter.ready(force=step <= 3):
                 extra = " ".join(f"{k}={agg[k]:.3f}" for k in
                                  ("ce", "sup", "balance", "bias_span",
                                   "sup_recall") if k in agg)
+                # Còn trong warmup thì γ/σ đổi mỗi step và là biến số quan
+                # trọng nhất để đọc `balance`/`bias_span` — in kèm. Hết warmup
+                # thì chúng là hằng, in nữa chỉ tốn chỗ.
+                if router.decay_steps and step <= router.decay_steps:
+                    extra += f" γ={gam_now:.3g} σ={sig_now:.3g}"
                 # Không có ETA tới đích: lịch train không có đích. Hai con số
                 # thay thế, cả hai đều đọc được: phiên này đã chạy bao lâu và
                 # còn bao lâu nữa hết epoch hiện tại.

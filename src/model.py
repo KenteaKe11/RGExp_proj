@@ -345,21 +345,30 @@ def build_model(cfg, hf_token, log):
                       f"— dùng giá trị thật")
     route_noise = float(getattr(f, "route_noise", 1.0) or 0.0)
     bias_gamma = float(getattr(f, "bias_gamma", 1e-3) or 0.0)
+    # Giá trị ĐẦU của lịch decay (None = không có lịch cho đại lượng đó). Đọc
+    # bằng getattr để config cũ — không có ba khoá này — vẫn dựng được model.
+    ns = getattr(f, "route_noise_start", None)
+    gs = getattr(f, "bias_gamma_start", None)
+    decay_steps = int(getattr(f, "decay_warmup_steps", 0) or 0)
     router = RouterNet(cfg.sweep.variant, cfg.sweep.n_block, f.n_expert,
                        f.top_k, d_enc=d_enc, route_noise=route_noise,
-                       bias_gamma=bias_gamma).to("cuda", f.trainable_dtype)
+                       bias_gamma=bias_gamma,
+                       route_noise_start=(None if ns is None else float(ns)),
+                       bias_gamma_start=(None if gs is None else float(gs)),
+                       decay_steps=decay_steps).to("cuda", f.trainable_dtype)
     bridge = RouterBridge(router, log)
     bridge.attach(find_text_decoder(model, log))
 
     n_router = sum(p.numel() for p in router.parameters())
     n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log("router", variant_desc(cfg))
-    log("router", f"    route_noise σ={route_noise:g} "
+    log("router", f"    route_noise σ={route_noise:g} (sau warmup) "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
                      else "— TẮT, top-k tất định"))
-    log("router", f"    bias_gamma γ={bias_gamma:g} "
+    log("router", f"    bias_gamma γ={bias_gamma:g} (sau warmup) "
                   + ("(cân bằng tải aux-free, cập nhật mỗi optimizer step)"
                      if bias_gamma > 0 else "— TẮT, không có gì cân bằng tải"))
+    log("router", f"    {router.decay_desc()}")
     for k, v in router.param_table().items():
         if not k.startswith("_"):
             log("router", f"    {k:<28} {v:>12,}")

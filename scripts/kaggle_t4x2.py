@@ -142,8 +142,13 @@ ASL_CLIP      = None      # 0.02 — NGƯỠNG ÂM TÍNH (BI-RADS 3). Dưới m�
                           #        một ô âm hết gradient hẳn.
 ASL_GAMMA_NEG = None      # 4.0  — focus nhánh âm (default chuẩn của ASL)
 UNCERTAIN_SOFT= None      # 0.7  — soft label cho aspect uncertain
-BIAS_GAMMA    = None      # 1e-3 — tốc độ nắn bias cân bằng tải (aux-free)
-ROUTE_NOISE   = None      # 1.0  — σ Gumbel, chuẩn của Gumbel-top-k
+BIAS_GAMMA    = None      # 1e-3 — γ SAU warmup, tốc độ nắn bias (aux-free)
+ROUTE_NOISE   = None      # 1e-3 — σ Gumbel SAU warmup
+# Lịch decay mũ của γ và σ trong n step đầu (chống collapse sớm — xem §3.6).
+# null/None ở *_START = tắt lịch cho đại lượng đó; DECAY_STEPS=0 = tắt cả hai.
+BIAS_GAMMA_ST = None      # 1.0  — γ ở step 0
+ROUTE_NOISE_ST = None     # 1.0  — σ ở step 0
+DECAY_STEPS   = None      # 1000 — số step của giai đoạn decay
 
 # ── Hub (là đường sống của việc nối phiên trên Kaggle) ───────────────────────
 HUB_SYNC      = False     # True chỉ khi CÓ máy khác chạy song song cùng ô.
@@ -491,7 +496,10 @@ for _key, _val, _where in (("w_sup", W_SUP, "run"),
                            ("asl_gamma_neg", ASL_GAMMA_NEG, "run"),
                            ("uncertain_soft", UNCERTAIN_SOFT, "run"),
                            ("bias_gamma", BIAS_GAMMA, "fixed"),
-                           ("route_noise", ROUTE_NOISE, "fixed")):
+                           ("route_noise", ROUTE_NOISE, "fixed"),
+                           ("bias_gamma_start", BIAS_GAMMA_ST, "fixed"),
+                           ("route_noise_start", ROUTE_NOISE_ST, "fixed"),
+                           ("decay_warmup_steps", DECAY_STEPS, "fixed")):
     if _val is not None:
         print(f"→ ghi đè {_where}.{_key} = {_val} "
               f"(default repo: {cfg[_where].get(_key)})")
@@ -513,6 +521,11 @@ print(f"  loss      1·CE + {cfg['run']['w_sup']}·ASL | γ+={cfg['run']['asl_ga
 print(f"  router    bias γ={cfg['fixed']['bias_gamma']} (cân bằng tải aux-free)"
       f" | Gumbel σ={cfg['fixed']['route_noise']}"
       f" | clip chuẩn toàn cục {MAX_GRAD_NORM}")
+print(f"  decay     γ {cfg['fixed'].get('bias_gamma_start')}"
+      f"→{cfg['fixed']['bias_gamma']}"
+      f" | σ {cfg['fixed'].get('route_noise_start')}"
+      f"→{cfg['fixed']['route_noise']}"
+      f" | mũ, {cfg['fixed'].get('decay_warmup_steps')} step đầu")
 
 warns = []
 sess_samples = 11 * 3600 * SAMPLES_PER_S

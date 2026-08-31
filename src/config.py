@@ -362,6 +362,34 @@ def load_config(path="configs/default.yaml", overrides=None):
               "không còn gì giữ router khỏi dồn hết vào vài expert; chỉ dùng "
               "khi cố ý đo hiện tượng đó.")
 
+    # ── Lịch decay MŨ của σ và γ trong n step ĐẦU (§3.5/§3.6) ───────────────
+    # `bias_gamma` / `route_noise` ở trên là giá trị CUỐI (sau warmup);
+    # `*_start` là giá trị ở step 0. `*_start: null` -> tắt lịch cho đại lượng
+    # đó. `decay_warmup_steps: 0` -> tắt lịch cho cả hai.
+    fixed.setdefault("decay_warmup_steps", 1000)
+    fixed["decay_warmup_steps"] = int(fixed["decay_warmup_steps"])
+    if fixed["decay_warmup_steps"] < 0:
+        raise ValueError(f"fixed.decay_warmup_steps phải >= 0, nhận "
+                         f"{fixed['decay_warmup_steps']}")
+    for _k in ("bias_gamma_start", "route_noise_start"):
+        fixed.setdefault(_k, None)
+        if fixed[_k] is not None:
+            fixed[_k] = float(fixed[_k])
+            if fixed[_k] < 0:
+                raise ValueError(f"fixed.{_k} phải >= 0 hoặc null, nhận "
+                                 f"{fixed[_k]}")
+    _has_start = (fixed["bias_gamma_start"] is not None
+                  or fixed["route_noise_start"] is not None)
+    if _has_start and fixed["decay_warmup_steps"] == 0:
+        print("⚠ có *_start nhưng decay_warmup_steps=0 — lịch decay KHÔNG "
+              "chạy, σ/γ dùng thẳng giá trị cuối từ step 0.")
+    if (fixed["bias_gamma_start"] is not None
+            and fixed["bias_gamma_start"] < fixed["bias_gamma"]):
+        print(f"⚠ bias_gamma_start={fixed['bias_gamma_start']:g} < "
+              f"bias_gamma={fixed['bias_gamma']:g} — lịch đang chạy NGƯỢC "
+              f"(γ tăng dần). Ý đồ của lịch là γ lớn lúc đầu để bias nắn kịp "
+              f"trước khi router kịp sập, rồi mới nhỏ dần.")
+
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
     rm = read_remote(path)
@@ -580,8 +608,18 @@ if __name__ == "__main__":
     print(f"          ASL γ+={c.run.asl_gamma_pos:g} γ-={c.run.asl_gamma_neg:g}"
           f" | ngưỡng âm m={c.run.asl_clip:g} (BI-RADS 3)"
           f" | uncertain={c.run.uncertain_soft:g}, blank=MASK")
+    _n = int(getattr(c.fixed, "decay_warmup_steps", 0) or 0)
+    _gs = getattr(c.fixed, "bias_gamma_start", None)
+    _ss = getattr(c.fixed, "route_noise_start", None)
+    _sched = ("" if _n <= 0 or (_gs is None and _ss is None) else
+              " | decay mũ "
+              + (f"γ {_gs:g}→{c.fixed.bias_gamma:g} "
+                 if _gs is not None else "")
+              + (f"σ {_ss:g}→{c.fixed.route_noise:g} "
+                 if _ss is not None else "")
+              + f"trong {_n} step đầu")
     print(f"Cân bằng: bias aux-free γ={c.fixed.bias_gamma:g} "
-          f"| Gumbel σ={c.fixed.route_noise:g}")
+          f"| Gumbel σ={c.fixed.route_noise:g}{_sched}")
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
           f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}× | clip chuẩn "

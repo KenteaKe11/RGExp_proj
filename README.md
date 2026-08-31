@@ -631,7 +631,8 @@ số trong tài liệu thiết kế — chạy sau mỗi lần sửa kiến trú
 ### 3.3. Bảng sweep
 
 `E = 12`, `top-k = 4`, QDoRA r8 α16, biến thể `g-brmf`, `w_sup = 0.2`,
-ASL (γ⁺ 0 / γ⁻ 4 / m 0.02), Gumbel `σ = 1.0`, `bias_gamma = 1e-3` — tất cả
+ASL (γ⁺ 0 / γ⁻ 4 / m 0.02), Gumbel `σ` và `bias_gamma` đi theo cùng một lịch
+decay mũ `1.0 → 1e-3` trong 1000 step đầu (§3.5b) — tất cả
 cố định. Chỉ `n_block` thay
 đổi. Câu hỏi vì thế gọn lại thành "chồng thêm block Recombinator có đáng
 không, và bão hoà từ đâu".
@@ -791,17 +792,20 @@ cụ thể; σ của Gumbel thì đọc được thẳng ra hành vi.
 | σ | Router làm gì |
 |---|---|
 | `0.0` | top-k tất định — tắt hẳn |
+| `0.001` | **`fixed.route_noise` — giá trị SAU warmup**; thực tế là tất định, chỉ còn phá thế hoà khi hai logit bằng nhau tới 3 chữ số |
 | `0.3` | gần tất định, chỉ đảo tuyến ở các mẫu sát biên quyết định |
-| **`1.0`** | **mặc định** — lấy mẫu ĐÚNG CHUẨN Gumbel-top-k, giá trị phổ thông của trick này |
+| **`1.0`** | **`fixed.route_noise_start` — giá trị ở step 0**; lấy mẫu ĐÚNG CHUẨN Gumbel-top-k |
 | `> 2` | gần như bốc ngẫu nhiên đều, gate hết mang thông tin (config sẽ cảnh báo) |
 
 σ = 1.0 là giá trị "không có tham số tự do": nó là chính phép lấy mẫu, không
-phải một mức nhiễu ai đó chọn. Mọi σ khác 1 đều là một quyết định phải giải
-thích được — nhỏ hơn thì lấy mẫu lệch về phía top-k xác định, lớn hơn thì lệch
-về phía đều. Không có lý do cụ thể thì để 1.0.
+phải một mức nhiễu ai đó chọn. Đó là lý do nó là điểm ĐẦU của lịch — giai đoạn
+router chưa biết gì và cần bốc đúng theo phân phối nó tin. Điểm CUỐI thì ngược
+lại: khi expert đã phân hoá, đảo tuyến không còn là khám phá mà chỉ là nhiễu
+vào delta của decoder, nên σ tụt về 1e-3. Xem §3.5b.
 
 **Không đưa vào sweep.** σ không phải câu hỏi nghiên cứu ở đây, nó là một
-regularizer có giá trị chuẩn. Muốn tắt cho một ô thì `--set fixed.route_noise=0`.
+regularizer có lịch chuẩn. Muốn tắt hẳn cho một ô thì
+`--set fixed.route_noise=0 --set fixed.route_noise_start=null`.
 
 **Cái gì vẫn tất định.** Nhiễu gác sau `self.training`, mà `src/train.py` gọi
 `router.eval()` ở cả val lẫn infer — nên **mọi số đo và mọi câu text sinh ra
@@ -818,8 +822,88 @@ Một cái bẫy đã dính một lần, ghi lại để khỏi dính lại: tro
 `-torch.log((-torch.log(u)).clamp_min(eps))`. Check `[9]` của
 `scripts/selftest.py` bắt đúng chỗ này.
 
-Khoá config `fixed.route_noise` — `src/router.py::gumbel_like`,
-`RouterNet.forward`, `RouterNet.set_route_noise`
+Khoá config `fixed.route_noise`, `fixed.route_noise_start` —
+`src/router.py::gumbel_like`, `RouterNet.forward`,
+`RouterNet.set_route_noise`, `RouterNet.set_decay_step`
+
+### 3.5b. Lịch decay của σ và γ trong n step đầu
+
+Hai hằng số điều phối ở §3.5 và §3.6 có một điểm chung khó chịu: **giá trị
+đúng cho trạng thái ổn định là giá trị sai cho vài trăm step đầu.**
+
+Chuyện xảy ra ở đầu train, theo đúng thứ tự:
+
+1. `route_head` khởi tạo ngẫu nhiên → 12 logit gần như bằng nhau.
+2. σ = 1.0 nghĩa là nhiễu Gumbel **lớn hơn hẳn** khoảng cách giữa các logit.
+   Với 12 expert, phần đuôi của Gumbel thỉnh thoảng cho một cú +3, +4 — đủ để
+   **cùng một expert** lọt top-k vài chục step liên tiếp chỉ vì may.
+3. Expert đó nhận gradient của cả nhóm mẫu ấy và **khá lên thật**. CE thưởng
+   cho tuyến đường đang tốt, nên `route_logit` của nó tách hẳn khỏi nhóm.
+4. Từ đây nó không cần may nữa. Router sập.
+
+Cơ chế đáng lẽ chặn được bước 3 là bias (§3.6), nhưng với `γ = 1e-3` thì bias
+cần **~2000 step** mới bò được một khoảng bằng dải `route_logit` (~±2) — nó
+đến nơi sau khi mọi chuyện đã xong. `γ = 1e-3` không sai; nó chỉ là giá trị
+của một cơ chế **cân bằng nhẹ ở trạng thái đã ổn định**, không phải của một
+cơ chế **cứu hoả**.
+
+Lời giải: cho cả hai hằng số một lịch **mũ** trong `n` step đầu.
+
+```
+γ(t) = γ_start · (γ_end/γ_start)^(t/n)     γ: 1.0  → 1e-3
+σ(t) = σ_start · (σ_end/σ_start)^(t/n)     σ: 1.0  → 1e-3
+                                           n = fixed.decay_warmup_steps (1000)
+```
+
+| | step 0 | n/3 | 2n/3 | ≥ n |
+|---|---|---|---|---|
+| γ | 1.0 | 0.1 | 0.01 | 1e-3 |
+| σ | 1.0 | 0.1 | 0.01 | 1e-3 |
+
+**γ = 1.0 ở step 0 nghĩa là gì.** Bias nắn **ngay trong một step**: expert vừa
+ăn quá phần trung bình thì `b_e` tụt đúng 1.0, và dải `route_logit` chỉ ~±2 —
+nên step sau nó gần như chắc chắn bị đẩy khỏi top-k. Đây không còn là "cân
+bằng", đây là **luân phiên cưỡng bức**: cửa vào bị ép mở đều cho tới khi mọi
+expert đều có vài chục step gradient. Bước 3 ở trên không kịp xảy ra. Khi γ đã
+tụt xuống 1e-2, expert nào thắng là thắng bằng chất lượng chứ không bằng vài
+cú Gumbel may mắn ở step đầu.
+
+**σ đi cùng chiều, vì lý do khác.** Nhiễu cần THẬT ở đầu — không có nó thì
+tuyến đường bị khoá ngay từ step 1 và §3.5 không còn nghĩa gì. Nhưng ở cuối,
+khi expert đã phân hoá, đảo tuyến không còn là khám phá: nó chỉ làm nhoè delta
+mà decoder nhận. Đây là anneal khám phá → khai thác quen thuộc, viết trên cùng
+một đường cong với γ.
+
+**Vì sao thang MŨ chứ không tuyến tính.** Tỉ lệ đầu/cuối là 1000×. Trên thang
+tuyến tính, 90% quãng đường nằm trong vùng `γ > 0.1` — vùng đã bão hoà, thêm
+γ không đổi gì nữa vì bias đã đủ mạnh để đảo top-k từ lâu — còn vùng thật sự
+đáng quan tâm, `1e-2 → 1e-3`, bị nén vào 1% cuối. Thang mũ chia đều theo
+**bậc**: mỗi 1/3 quãng đường là một lần chia 10.
+
+**Con trỏ là `step` toàn cục, không phải bộ đếm nội bộ.** `set_decay_step` là
+hàm **thuần** của `step`, nên resume từ checkpoint vào lại đúng chỗ trên đường
+cong thay vì warmup lại từ đầu. Một bộ đếm nội bộ thì hoặc phải nằm trong
+`state_dict` — thêm một khoá lạ, làm hỏng mọi checkpoint cũ — hoặc reset về 0
+mỗi lần resume. Lịch là **config**, không phải trọng số: nó không đi theo
+`weights.pt`, và một checkpoint train có lịch nạp được vào một router không
+lịch (và ngược lại).
+
+**Tắt lịch.** `fixed.bias_gamma_start: null` / `fixed.route_noise_start: null`
+tắt riêng từng đại lượng; `fixed.decay_warmup_steps: 0` tắt cả hai. Tắt hết =
+đúng hành vi trước khi có mục này.
+
+**Đọc log.** Trong lúc còn warmup, dòng `train` in kèm `γ=... σ=...`; cả hai
+cũng vào `train_step` của JSONL và vào wandb (`train/bias_gamma`,
+`train/route_noise`) — vẽ `balance` cùng `γ` là cách nhanh nhất để thấy lịch
+có làm việc không. Dấu hiệu tốt: `balance` bám sát 1.0 suốt warmup rồi **nhích
+lên một chút** khi γ tụt xuống 1e-3 (router bắt đầu được phép có sở thích);
+dấu hiệu xấu: `balance` vọt lên 3-4 ngay sau khi hết warmup — nghĩa là n quá
+ngắn, expert chưa kịp phân hoá đã bị thả.
+
+Khoá config `fixed.bias_gamma_start`, `fixed.route_noise_start`,
+`fixed.decay_warmup_steps` — `src/router.py::decay_value`,
+`RouterNet.set_decay_step`, `decay_desc`; check `[11]` của
+`scripts/selftest.py`
 
 ### 3.6. Cân bằng tải KHÔNG dùng aux loss
 
@@ -840,7 +924,7 @@ không nằm trong loss, không có gradient. Sau mỗi optimizer step:
 ```
 c_e  = số mẫu đã chọn expert e trong step vừa rồi (gộp cả grad_accum)
 c̄   = Σc_e / E
-b_e += γ · sign(c̄ − c_e)         γ = fixed.bias_gamma (mặc định 1e-3)
+b_e += γ(t) · sign(c̄ − c_e)      γ(t): 1.0 → fixed.bias_gamma, xem §3.5b
 b   -= mean(b)                     ghim trung bình về 0
 ```
 
@@ -883,7 +967,8 @@ của tập train.
 `route_logits`. `balance` dao động mạnh quanh 1.0 = γ quá lớn. `bias_gamma: 0`
 tắt hẳn cơ chế — chỉ dùng khi cố ý muốn đo xem router sập nhanh thế nào.
 
-`fixed.bias_gamma` — `src/router.py::RouterNet.update_bias`,
+`fixed.bias_gamma` (giá trị SAU warmup — γ ở step 0 là
+`fixed.bias_gamma_start`, xem §3.5b) — `src/router.py::RouterNet.update_bias`,
 `load_balance_stat`
 
 ### 3.7. Probe chuyên môn expert (`mode: probe`)
@@ -1253,7 +1338,7 @@ src.report             gom mọi ô → metrics_table.md, param_curve.md, gen_te
 | `weights.pt` | `router.state_dict()` (**gồm cả `expert_bias`** — §3.6) + state dict của **cả 12 expert** (`get_peft_model_state_dict` mỗi adapter, ~191M — **không** phải `model.state_dict()` 4.3B) |
 | `optimizer.pt` | optimizer + RNG. **Không** có scheduler state: lịch LR là hàm thuần của số mẫu (§1.8), dựng lại từ `samples` là đủ và đúng trên mọi máy |
 | `swa.pt` | bộ cộng dồn SWA (§1.8): bản trung bình fp32 + số snapshot + mốc mẫu. Đi riêng vì nó là **trọng số**, không phải moment; và nó được ghi cả khi lưu lúc Ctrl-C (`with_optimizer=False` không ảnh hưởng nó) |
-| `train_state.json` | `samples`, `epoch`, `epoch_samples`, `step`, `best_val`, `n_train`, `seed`, `variant`, `n_block`, `n_expert`, `top_k`, `w_sup`, `asl_gamma_pos/neg`, `asl_clip`, `uncertain_soft`, `bias_gamma`, `route_noise`, `swa_n`, `swa_marks`, `cycle_samples` |
+| `train_state.json` | `samples`, `epoch`, `epoch_samples`, `step`, `best_val`, `n_train`, `seed`, `variant`, `n_block`, `n_expert`, `top_k`, `w_sup`, `asl_gamma_pos/neg`, `asl_clip`, `uncertain_soft`, `bias_gamma`, `route_noise`, `bias_gamma_start`, `route_noise_start`, `decay_warmup_steps`, `swa_n`, `swa_marks`, `cycle_samples` |
 
 **Resume là mặc định, không phải một tuỳ chọn.** Không còn khoá `run.resume`.
 Mỗi lần chạy, script đọc `train_state.json` ở cả hai chỗ — `ckpt/<tag>/last/`
@@ -1335,6 +1420,8 @@ So sánh giữa các ô: xem §5.
 | `ckpt là NE top-K, đang chạy ...` | đổi `n_expert`/`top_k` trên ckpt cũ | đó là một ô sweep MỚI: đặt `hub_repo`/`ckpt_dir` khác, đừng nạp đè |
 | `⚠ config: bỏ qua run.phase1_samples` (và tương tự) | config còn khoá của bản hai phase | vô hại, script bỏ qua. Xoá khoá đó khỏi YAML cho sạch |
 | `balance` đứng ở 3-4, `bias_span` phình mãi | `fixed.bias_gamma` quá nhỏ | nâng lên 3e-3 hoặc 5e-3 và xem log vài trăm step (§3.6) |
+| `balance` vọt lên 3-4 NGAY SAU khi hết warmup | `decay_warmup_steps` quá ngắn — expert chưa kịp phân hoá đã bị thả | nâng `fixed.decay_warmup_steps` lên 2000-3000 (§3.5b) |
+| `expert_share` gần như one-hot từ vài chục step đầu | lịch decay bị tắt (`*_start: null` hoặc `decay_warmup_steps: 0`) | kiểm dòng log `cfg: lịch decay router: ...` ở đầu phiên (§3.5b) |
 | Train không bao giờ tự dừng | đúng thiết kế (§1.7) | Ctrl-C để dừng và lưu ckpt; chấm điểm bằng phiên `--mode test` riêng |
 | `không suy được aspect 'uncertain' từ class_names=...` | tên aspect trong `labels.npz` không khớp bảng từ khoá | sửa `_ROLE_WORDS` trong `src/losses.py` cho khớp bộ nhãn — ĐỪNG đoán thứ tự, gán nhầm uncertain thành negative là lỗi im lặng |
 | `sup_recall` đứng ở 0 nhưng `sup_acc` cao | model đoán "âm" cho mọi ô | bình thường ở vài trăm step đầu; kéo dài thì hạ `asl_gamma_neg` hoặc nâng `w_sup` |
