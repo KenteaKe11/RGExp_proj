@@ -1,7 +1,7 @@
 {
- "generated_at": "2026-09-01T06:40:28+00:00",
+ "generated_at": "2026-09-01T07:20:20+00:00",
  "source": "hf://datasets/RGExp123/mimic-cxr-gemma3-g-brmf-n12-probe/records",
- "n_records": 33,
+ "n_records": 143,
  "n_expert": 12,
  "top_k": 4,
  "grid": [
@@ -16,25 +16,25 @@
    "gemma3-g-brmf-n12"
   ],
   "weights": [
-   "swa (trung bình 46 snapshot)"
+   "swa (trung bình 50 snapshot)"
   ]
  },
  "train_samples": [
-  14752,
-  14752
+  16000,
+  16000
  ],
  "n_profiled": 4,
  "headline": {
-  "clone_index": -0.2229,
-  "clone_index_max": 0.4316,
+  "clone_index": -0.2451,
+  "clone_index_max": 0.4812,
   "clone_index_over": 4,
   "balance": 0.5579,
   "balance_over": 12,
   "usage_cv": 1.4142,
-  "route_entropy": 0.907480606060606,
-  "gate_max": 0.7386033333333333,
+  "route_entropy": 0.9276517482517481,
+  "gate_max": 0.7436697902097902,
   "level": "thấp",
-  "verdict": "⚠ 8/12 expert bị LOẠI khỏi mọi bảng dưới (chưa từng được router chọn trong bất kỳ snapshot nào: e0, e1, e3, e4, e6, e7, e8, e9). Các số trên chỉ nói về 4 expert còn lại — xem mục 'Expert không tham gia'. Các expert phân hoá RÕ (cosine lệch trung bình -0.22): mỗi expert kéo hồ sơ bệnh về một hướng khác nhau. Đây là dấu hiệu MoE đang thật sự chia việc. Nhưng router chia việc LỆCH (balance 0.56, đều tuyệt đối = 1.00): một phần expert hiếm khi được gọi, xem cột 'lượt chọn'."
+  "verdict": "⚠ 8/12 expert bị LOẠI khỏi mọi bảng dưới (chưa từng được router chọn trong bất kỳ snapshot nào: e0, e1, e3, e4, e6, e7, e8, e9). Các số trên chỉ nói về 4 expert còn lại — xem mục 'Expert không tham gia'. Các expert phân hoá RÕ (cosine lệch trung bình -0.25): mỗi expert kéo hồ sơ bệnh về một hướng khác nhau. Đây là dấu hiệu MoE đang thật sự chia việc. Nhưng router chia việc LỆCH (balance 0.56, đều tuyệt đối = 1.00): một phần expert hiếm khi được gọi, xem cột 'lượt chọn'."
  },
  "absent_experts": [
   {
@@ -130,92 +130,92 @@
   {
    "expert": 2,
    "in_summary": true,
-   "n_chosen": 33,
-   "n_disease": 33,
+   "n_chosen": 143,
+   "n_disease": 143,
    "usage": 1.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0171,
-   "delta_norm": 119.92175,
+   "gate_mean_when_chosen": 0.02671,
+   "delta_norm": 129.91215,
    "top_disease": [
     [
      "Consolidation",
-     1.4707338346753827
+     1.4823689035157979
     ],
     [
      "Fracture",
-     1.0975716362162762
+     1.152660594074629
     ],
     [
      "Pneumothorax",
-     1.005395147408626
+     0.9505818641665683
     ]
    ],
    "top_aspect": [
     [
      "uncertain",
-     1.2788720567970633
+     1.319891751350737
     ]
    ],
    "top_tokens": [
     {
      "token": " sueños",
-     "n_images": 24,
-     "dlogit_mean": 12.4697
+     "n_images": 108,
+     "dlogit_mean": 13.90778
     },
     {
      "token": "<unused1381>",
-     "n_images": 26,
-     "dlogit_mean": 12.0625
+     "n_images": 113,
+     "dlogit_mean": 13.01967
     },
     {
      "token": " puterea",
-     "n_images": 19,
-     "dlogit_mean": 10.46023
+     "n_images": 97,
+     "dlogit_mean": 12.96809
     },
     {
      "token": " felicidad",
-     "n_images": 16,
-     "dlogit_mean": 8.72159
-    },
-    {
-     "token": "ቖ",
-     "n_images": 13,
-     "dlogit_mean": 6.92424
-    },
-    {
-     "token": " Mereka",
-     "n_images": 14,
-     "dlogit_mean": 6.92045
+     "n_images": 91,
+     "dlogit_mean": 11.71941
     },
     {
      "token": "<unused1571>",
-     "n_images": 15,
-     "dlogit_mean": 6.76515
+     "n_images": 87,
+     "dlogit_mean": 9.86451
+    },
+    {
+     "token": "ቖ",
+     "n_images": 64,
+     "dlogit_mean": 8.12762
     },
     {
      "token": "<unused1426>",
-     "n_images": 14,
-     "dlogit_mean": 6.1553
+     "n_images": 74,
+     "dlogit_mean": 8.06993
+    },
+    {
+     "token": " Mereka",
+     "n_images": 66,
+     "dlogit_mean": 8.03278
     },
     {
      "token": " sanciones",
-     "n_images": 10,
-     "dlogit_mean": 5.8447
+     "n_images": 39,
+     "dlogit_mean": 5.42832
     },
     {
-     "token": "醀",
-     "n_images": 12,
-     "dlogit_mean": 5.4375
+     "token": " luchar",
+     "n_images": 37,
+     "dlogit_mean": 5.1368
     },
     {
-     "token": " enemigos",
-     "n_images": 10,
-     "dlogit_mean": 4.88636
+     "token": " ljudi",
+     "n_images": 34,
+     "dlogit_mean": 4.67308
     },
     {
-     "token": " República",
-     "n_images": 9,
-     "dlogit_mean": 4.30492
+     "token": "䔋",
+     "n_images": 42,
+     "dlogit_mean": 4.6097
     }
    ]
   },
@@ -248,100 +248,96 @@
   {
    "expert": 5,
    "in_summary": true,
-   "n_chosen": 33,
-   "n_disease": 33,
+   "n_chosen": 143,
+   "n_disease": 143,
    "usage": 1.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.07949,
-   "delta_norm": 118.00866,
+   "gate_mean_when_chosen": 0.10234,
+   "delta_norm": 128.19763,
    "top_disease": [
     [
      "Pleural Effusion",
-     1.464061747425609
+     1.4452828722572142
     ],
     [
      "Pleural Other",
-     1.4323653616827372
+     1.3890018031163605
     ],
     [
      "Edema",
-     1.2553954017618447
+     1.1011055600325568
     ]
    ],
    "top_aspect": [
     [
      "positive",
-     1.3055152464862043
+     0.980886415892158
     ],
     [
      "negative",
-     1.1912861170036
-    ],
-    [
-     "blank",
-     0.42317437788738144
+     0.8231635165493716
     ]
    ],
    "top_tokens": [
     {
      "token": "<unused1381>",
-     "n_images": 31,
-     "dlogit_mean": 14.71023
-    },
-    {
-     "token": "<unused1571>",
-     "n_images": 25,
-     "dlogit_mean": 11.37689
+     "n_images": 121,
+     "dlogit_mean": 14.00787
     },
     {
      "token": " puterea",
-     "n_images": 19,
-     "dlogit_mean": 10.42992
+     "n_images": 98,
+     "dlogit_mean": 12.99432
+    },
+    {
+     "token": "<unused1571>",
+     "n_images": 107,
+     "dlogit_mean": 12.15603
     },
     {
      "token": " sueños",
-     "n_images": 19,
-     "dlogit_mean": 10.0947
+     "n_images": 88,
+     "dlogit_mean": 11.40603
     },
     {
      "token": " felicidad",
-     "n_images": 18,
-     "dlogit_mean": 9.55492
+     "n_images": 88,
+     "dlogit_mean": 11.25918
     },
     {
      "token": "<unused1426>",
-     "n_images": 17,
-     "dlogit_mean": 7.39773
-    },
-    {
-     "token": " sanciones",
-     "n_images": 11,
-     "dlogit_mean": 6.37311
+     "n_images": 91,
+     "dlogit_mean": 10.02928
     },
     {
      "token": "avacako",
-     "n_images": 12,
-     "dlogit_mean": 5.97917
+     "n_images": 70,
+     "dlogit_mean": 8.73733
     },
     {
      "token": "Imputted",
-     "n_images": 11,
-     "dlogit_mean": 5.23864
+     "n_images": 61,
+     "dlogit_mean": 7.02885
     },
     {
-     "token": " Mereka",
-     "n_images": 10,
-     "dlogit_mean": 4.96591
+     "token": " sanciones",
+     "n_images": 43,
+     "dlogit_mean": 5.89336
     },
     {
-     "token": " enemigos",
-     "n_images": 9,
-     "dlogit_mean": 4.39205
+     "token": " luchar",
+     "n_images": 38,
+     "dlogit_mean": 5.24913
     },
     {
-     "token": "<unused1380>",
-     "n_images": 9,
-     "dlogit_mean": 4.22348
+     "token": " ljudi",
+     "n_images": 35,
+     "dlogit_mean": 4.83304
+    },
+    {
+     "token": "ቖ",
+     "n_images": 36,
+     "dlogit_mean": 4.53365
     }
    ]
   },
@@ -400,174 +396,174 @@
   {
    "expert": 10,
    "in_summary": true,
-   "n_chosen": 33,
-   "n_disease": 33,
+   "n_chosen": 143,
+   "n_disease": 143,
    "usage": 1.0,
    "top1_share": 1.0,
-   "gate_mean_when_chosen": 0.7386,
-   "delta_norm": 122.30583,
+   "gate_mean_when_chosen": 0.74367,
+   "delta_norm": 131.94548,
    "top_disease": [],
    "top_aspect": [],
    "top_tokens": [
     {
      "token": "<unused1381>",
-     "n_images": 33,
-     "dlogit_mean": 16.63258
+     "n_images": 131,
+     "dlogit_mean": 15.93663
     },
     {
      "token": "<unused1571>",
-     "n_images": 26,
-     "dlogit_mean": 12.61932
+     "n_images": 119,
+     "dlogit_mean": 14.15559
     },
     {
      "token": " puterea",
-     "n_images": 16,
-     "dlogit_mean": 9.29735
+     "n_images": 90,
+     "dlogit_mean": 12.41302
     },
     {
      "token": "<unused1426>",
-     "n_images": 20,
-     "dlogit_mean": 9.21591
+     "n_images": 98,
+     "dlogit_mean": 11.25044
     },
     {
      "token": " sueños",
-     "n_images": 15,
-     "dlogit_mean": 8.39015
+     "n_images": 73,
+     "dlogit_mean": 9.8208
     },
     {
      "token": " felicidad",
-     "n_images": 14,
-     "dlogit_mean": 7.74242
+     "n_images": 68,
+     "dlogit_mean": 9.11451
     },
     {
      "token": "Imputted",
-     "n_images": 13,
-     "dlogit_mean": 6.81629
-    },
-    {
-     "token": "<unused1380>",
-     "n_images": 12,
-     "dlogit_mean": 6.0
+     "n_images": 71,
+     "dlogit_mean": 8.63942
     },
     {
      "token": "avacako",
-     "n_images": 11,
-     "dlogit_mean": 5.8428
+     "n_images": 56,
+     "dlogit_mean": 7.43007
     },
     {
-     "token": " sanciones",
-     "n_images": 9,
-     "dlogit_mean": 5.38258
+     "token": "<unused1380>",
+     "n_images": 46,
+     "dlogit_mean": 5.57343
     },
     {
      "token": "<unused1442>",
-     "n_images": 12,
-     "dlogit_mean": 5.25379
+     "n_images": 47,
+     "dlogit_mean": 5.22159
     },
     {
-     "token": "<unused1362>",
-     "n_images": 12,
-     "dlogit_mean": 5.10985
+     "token": "intFragmentation",
+     "n_images": 40,
+     "dlogit_mean": 4.47684
+    },
+    {
+     "token": " sanciones",
+     "n_images": 31,
+     "dlogit_mean": 4.43094
     }
    ]
   },
   {
    "expert": 11,
    "in_summary": true,
-   "n_chosen": 33,
-   "n_disease": 33,
+   "n_chosen": 143,
+   "n_disease": 143,
    "usage": 1.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.1648,
-   "delta_norm": 118.19296,
+   "gate_mean_when_chosen": 0.12728,
+   "delta_norm": 127.16373,
    "top_disease": [
     [
      "No Finding",
-     1.11835181898426
+     1.3713872889385046
     ],
     [
      "Lung Opacity",
-     1.0298588073226083
+     1.3008629268084022
     ],
     [
-     "Support Devices",
-     0.8635730536142772
+     "Lung Lesion",
+     1.1265311012926251
     ]
    ],
    "top_aspect": [
     [
      "blank",
-     1.358225273966893
+     1.4775252749889776
     ],
     [
      "negative",
-     0.5640982974077027
+     1.0875649375430156
     ],
     [
-     "uncertain",
-     0.3818580338064281
+     "positive",
+     0.7762950935153016
     ]
    ],
    "top_tokens": [
     {
+     "token": " puterea",
+     "n_images": 96,
+     "dlogit_mean": 12.50131
+    },
+    {
      "token": "<unused1381>",
-     "n_images": 27,
-     "dlogit_mean": 12.4053
+     "n_images": 112,
+     "dlogit_mean": 12.44187
     },
     {
      "token": " sueños",
-     "n_images": 21,
-     "dlogit_mean": 10.89205
+     "n_images": 98,
+     "dlogit_mean": 12.40385
     },
     {
      "token": " felicidad",
-     "n_images": 19,
-     "dlogit_mean": 9.88258
-    },
-    {
-     "token": " puterea",
-     "n_images": 18,
-     "dlogit_mean": 9.82576
+     "n_images": 95,
+     "dlogit_mean": 11.89073
     },
     {
      "token": "<unused1571>",
-     "n_images": 21,
-     "dlogit_mean": 9.54167
+     "n_images": 91,
+     "dlogit_mean": 9.97727
     },
     {
      "token": "<unused1426>",
-     "n_images": 16,
-     "dlogit_mean": 6.81818
+     "n_images": 77,
+     "dlogit_mean": 8.14991
     },
     {
      "token": "ቖ",
-     "n_images": 12,
-     "dlogit_mean": 6.17614
-    },
-    {
-     "token": " sanciones",
-     "n_images": 9,
-     "dlogit_mean": 5.19318
+     "n_images": 58,
+     "dlogit_mean": 7.15909
     },
     {
      "token": " Mereka",
-     "n_images": 10,
-     "dlogit_mean": 4.95833
+     "n_images": 57,
+     "dlogit_mean": 6.67177
     },
     {
-     "token": " enemigos",
-     "n_images": 9,
-     "dlogit_mean": 4.3447
+     "token": "Imputted",
+     "n_images": 50,
+     "dlogit_mean": 5.57605
     },
     {
-     "token": " luchar",
-     "n_images": 7,
-     "dlogit_mean": 4.14015
+     "token": " ljudi",
+     "n_images": 39,
+     "dlogit_mean": 5.18313
     },
     {
-     "token": "<unused1380>",
-     "n_images": 9,
-     "dlogit_mean": 4.08902
+     "token": " sanciones",
+     "n_images": 36,
+     "dlogit_mean": 4.90428
+    },
+    {
+     "token": "avacako",
+     "n_images": 39,
+     "dlogit_mean": 4.8514
     }
    ]
   }
