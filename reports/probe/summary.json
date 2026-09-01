@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-09-01T06:05:18+00:00",
+ "generated_at": "2026-09-01T06:40:28+00:00",
  "source": "hf://datasets/RGExp123/mimic-cxr-gemma3-g-brmf-n12-probe/records",
  "n_records": 33,
  "n_expert": 12,
@@ -23,16 +23,61 @@
   14752,
   14752
  ],
+ "n_profiled": 4,
  "headline": {
-  "clone_index": 0.0304,
-  "clone_index_max": 1.0,
+  "clone_index": -0.2229,
+  "clone_index_max": 0.4316,
+  "clone_index_over": 4,
   "balance": 0.5579,
+  "balance_over": 12,
   "usage_cv": 1.4142,
   "route_entropy": 0.907480606060606,
   "gate_max": 0.7386033333333333,
   "level": "thấp",
-  "verdict": "Các expert phân hoá RÕ (cosine lệch trung bình 0.03): mỗi expert kéo hồ sơ bệnh về một hướng khác nhau. Đây là dấu hiệu MoE đang thật sự chia việc. Nhưng router chia việc LỆCH (balance 0.56, đều tuyệt đối = 1.00): một phần expert hiếm khi được gọi, xem cột 'lượt chọn'."
+  "verdict": "⚠ 8/12 expert bị LOẠI khỏi mọi bảng dưới (chưa từng được router chọn trong bất kỳ snapshot nào: e0, e1, e3, e4, e6, e7, e8, e9). Các số trên chỉ nói về 4 expert còn lại — xem mục 'Expert không tham gia'. Các expert phân hoá RÕ (cosine lệch trung bình -0.22): mỗi expert kéo hồ sơ bệnh về một hướng khác nhau. Đây là dấu hiệu MoE đang thật sự chia việc. Nhưng router chia việc LỆCH (balance 0.56, đều tuyệt đối = 1.00): một phần expert hiếm khi được gọi, xem cột 'lượt chọn'."
  },
+ "absent_experts": [
+  {
+   "expert": 0,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 1,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 3,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 4,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 6,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 7,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 8,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  },
+  {
+   "expert": 9,
+   "reason": "router_never_picked",
+   "n_chosen": 0
+  }
+ ],
  "disease_labels": [
   "No Finding",
   "Enlarged Cardiomediastinum",
@@ -58,90 +103,57 @@
  "experts": [
   {
    "expert": 0,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 1,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 2,
+   "in_summary": true,
    "n_chosen": 33,
+   "n_disease": 33,
    "usage": 1.0,
    "top1_share": 0.0,
    "gate_mean_when_chosen": 0.0171,
    "delta_norm": 119.92175,
-   "top_disease": [],
+   "top_disease": [
+    [
+     "Consolidation",
+     1.4707338346753827
+    ],
+    [
+     "Fracture",
+     1.0975716362162762
+    ],
+    [
+     "Pneumothorax",
+     1.005395147408626
+    ]
+   ],
    "top_aspect": [
     [
-     "blank",
-     1.2865524705441667
+     "uncertain",
+     1.2788720567970633
     ]
    ],
    "top_tokens": [
@@ -209,90 +221,65 @@
   },
   {
    "expert": 3,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 4,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 5,
+   "in_summary": true,
    "n_chosen": 33,
+   "n_disease": 33,
    "usage": 1.0,
    "top1_share": 0.0,
    "gate_mean_when_chosen": 0.07949,
    "delta_norm": 118.00866,
-   "top_disease": [],
+   "top_disease": [
+    [
+     "Pleural Effusion",
+     1.464061747425609
+    ],
+    [
+     "Pleural Other",
+     1.4323653616827372
+    ],
+    [
+     "Edema",
+     1.2553954017618447
+    ]
+   ],
    "top_aspect": [
     [
+     "positive",
+     1.3055152464862043
+    ],
+    [
+     "negative",
+     1.1912861170036
+    ],
+    [
      "blank",
-     1.4520097909818144
+     0.42317437788738144
     ]
    ],
    "top_tokens": [
@@ -360,166 +347,67 @@
   },
   {
    "expert": 6,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 7,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 8,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 9,
+   "in_summary": false,
    "n_chosen": 0,
+   "n_disease": 0,
    "usage": 0.0,
    "top1_share": 0.0,
-   "gate_mean_when_chosen": 0.0,
-   "delta_norm": 0.0,
-   "top_disease": [
-    [
-     "Lung Opacity",
-     0.7068183707288561
-    ],
-    [
-     "Lung Lesion",
-     0.7067601859844834
-    ],
-    [
-     "Pneumothorax",
-     0.7065307933740993
-    ]
-   ],
-   "top_aspect": [
-    [
-     "negative",
-     0.706650839820805
-    ],
-    [
-     "positive",
-     0.7060802457029272
-    ],
-    [
-     "uncertain",
-     0.6768217568808037
-    ]
-   ],
+   "gate_mean_when_chosen": null,
+   "delta_norm": null,
+   "top_disease": [],
+   "top_aspect": [],
    "top_tokens": []
   },
   {
    "expert": 10,
+   "in_summary": true,
    "n_chosen": 33,
+   "n_disease": 33,
    "usage": 1.0,
    "top1_share": 1.0,
    "gate_mean_when_chosen": 0.7386,
    "delta_norm": 122.30583,
    "top_disease": [],
-   "top_aspect": [
-    [
-     "blank",
-     1.3697507947309482
-    ]
-   ],
+   "top_aspect": [],
    "top_tokens": [
     {
      "token": "<unused1381>",
@@ -585,16 +473,39 @@
   },
   {
    "expert": 11,
+   "in_summary": true,
    "n_chosen": 33,
+   "n_disease": 33,
    "usage": 1.0,
    "top1_share": 0.0,
    "gate_mean_when_chosen": 0.1648,
    "delta_norm": 118.19296,
-   "top_disease": [],
+   "top_disease": [
+    [
+     "No Finding",
+     1.11835181898426
+    ],
+    [
+     "Lung Opacity",
+     1.0298588073226083
+    ],
+    [
+     "Support Devices",
+     0.8635730536142772
+    ]
+   ],
    "top_aspect": [
     [
      "blank",
-     1.5401564960547338
+     1.358225273966893
+    ],
+    [
+     "negative",
+     0.5640982974077027
+    ],
+    [
+     "uncertain",
+     0.3818580338064281
     ]
    ],
    "top_tokens": [
