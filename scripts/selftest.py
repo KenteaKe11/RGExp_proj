@@ -2,7 +2,7 @@
 
     python scripts/selftest.py
 
-Tám thứ được kiểm:
+Mười thứ được kiểm:
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
@@ -16,7 +16,10 @@ Tám thứ được kiểm:
      không dùng chung bộ nhớ với tensor gốc, bàn giao qua state_dict giữ nguyên;
   8. cân bằng tải KHÔNG dùng aux loss: bias chỉ chạm vào việc CHỌN expert, cập
      nhật đúng chiều, ghim trung bình về 0, và đi theo checkpoint;
-  9. nhiễu Gumbel trên route logit + các phép tính thuần của probe.
+  9. nhiễu Gumbel trên route logit + các phép tính thuần của probe;
+ 10. gộp bản ghi probe (scripts/probe_summary.py): route_share trên đủ E
+     expert, hồ sơ VÔ ĐIỀU KIỆN từ bản ghi `full` (expert router chưa
+     từng chọn vẫn phải có hàng), và cosine phát hiện được bản sao.
 
 Cái KHÔNG kiểm được ở đây (phải có GPU + weight thật): peft add_adapter, hook
 vào decoder Gemma, generate(). STAGE 0 trong src/train.py lo phần đó.
@@ -809,6 +812,130 @@ def test_probe():
           br.force_gate is None and moe.CTX.weights is None)
 
 
+def test_probe_summary():
+    """[11] gộp bản ghi probe: route_share, hồ sơ vô điều kiện, cosine."""
+    print("\n[11] gộp bản ghi probe (scripts/probe_summary.py)")
+    import importlib.util
+    import math
+
+    import numpy as np
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "probe_summary", os.path.join(here, "probe_summary.py"))
+    ps = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ps)
+
+    # ── phân loại bản ghi: bản ghi cũ không có `probe_mode` vẫn xếp được ────
+    check("probe_mode='full' đọc thẳng",
+          ps.record_mode({"probe_mode": "full"}) == "full")
+    check("bản ghi v1 có đủ E expert -> suy ra là 'full'",
+          ps.record_mode({"n_expert": 3, "experts": [{}, {}, {}]}) == "full")
+    check("bản ghi v1 chỉ có top-k -> 'topk'",
+          ps.record_mode({"n_expert": 8, "experts": [{}, {}]}) == "topk")
+
+    # ── mean_by: thiếu hẳn dữ liệu ra NaN chứ không phải 0 ──────────────────
+    m = ps.mean_by(np.array([[6.0, 4.0], [0.0, 0.0]]), np.array([2.0, 0.0]))
+    check("mean_by chia đúng mẫu số riêng; hàng không có dữ liệu -> NaN",
+          m[0].tolist() == [3.0, 2.0] and bool(np.isnan(m[1]).all()), str(m))
+
+    # ── entropy_stats: 'không có dữ liệu' KHÁC 'chia đều hoàn hảo' ──────────
+    b, eff = ps.entropy_stats(np.ones(12) / 12, 12)
+    check("phân phối đều -> balance 1.00, effective = E",
+          abs(b - 1.0) < 1e-9 and abs(eff - 12) < 1e-6, f"{b:.4f} {eff:.4f}")
+    _b2, eff2 = ps.entropy_stats(np.array([0.5, 0.5] + [0.0] * 10), 12)
+    check("dồn hết vào 2 expert -> effective_experts ≈ 2",
+          abs(eff2 - 2) < 1e-6, f"{eff2:.4f}")
+    b3, eff3 = ps.entropy_stats(np.full(12, np.nan), 12)
+    check("không có route_prob -> NaN, KHÔNG in ra 'router chia đều'",
+          math.isnan(b3) and math.isnan(eff3), f"{b3} {eff3}")
+
+    # ── zscore theo CỘT, hàng NaN không được kéo mặt bằng ───────────────────
+    Z = ps.zscore(np.array([[1.0, 10.0], [3.0, 30.0], [np.nan, np.nan]]))
+    check("zscore chuẩn theo cột, hàng NaN vẫn NaN và không vào mean/std",
+          abs(Z[0][0] + 1) < 1e-9 and abs(Z[1][0] - 1) < 1e-9
+          and bool(np.isnan(Z[2]).all()), str(Z))
+
+    # ── cosine sau khi trừ mặt bằng chung: bản sao phải lộ ra ───────────────
+    M = np.array([[5.0, 1.0, 0.0], [5.0, 1.0, 0.0],
+                  [1.0, 5.0, 0.0], [0.0, 0.0, 6.0]])
+    sim, _ci, cimax = ps.cosine_matrix(M, np.ones(4, bool))
+    check("hai hàng trùng nhau -> cosine 1.00 và là cặp lớn nhất",
+          abs(sim[0][1] - 1.0) < 1e-9 and abs(cimax - 1.0) < 1e-9,
+          f"{sim[0][1]:.4f} max={cimax:.4f}")
+    sim2, _c, _m = ps.cosine_matrix(M, np.array([True, True, False, False]))
+    check("expert ngoài mặt nạ không lọt vào ma trận tương đồng",
+          bool(np.isnan(sim2[2]).all()) and bool(np.isnan(sim2[:, 3]).all()))
+
+    # ── gộp end-to-end ─────────────────────────────────────────────────────
+    # 3 expert, top_k = 2, e2 KHÔNG BAO GIỜ được router chọn. Bản ghi `full`
+    # bật cả 3 -> e2 vẫn phải có hồ sơ; đó chính là lý do tồn tại của chế độ
+    # full. Hồ sơ của e0/e1 phải lấy từ bản ghi `full` mà THÔI, không trộn
+    # thêm bản ghi `topk` (hai đại lượng khác nhau: vô điều kiện vs có điều
+    # kiện).
+    DIS = {0: [1.0, 0.0], 1: [0.0, 1.0], 2: [2.0, 2.0]}
+
+    def mk(mode, chosen):
+        prob = [0.5, 0.45, 0.05]
+        gate = [0.0, 0.0, 0.0]
+        for e in chosen:
+            gate[e] = 1.0 / len(chosen)
+        who = [0, 1, 2] if mode == "full" else list(chosen)
+        return {
+            "schema_version": 2, "probe_mode": mode,
+            "n_expert": 3, "top_k": 2,
+            "disease_labels": ["A", "B"], "aspect_labels": [],
+            "field_labels": {"grammar": ["is", "the"]},
+            "field_titles": {"grammar": "Ngữ pháp"},
+            "router": {"gate": gate, "prob": prob, "chosen": list(chosen),
+                       "entropy": 1.0, "gate_max": 0.5},
+            "experts": [{"expert": e, "gate": gate[e], "prob": prob[e],
+                         "in_topk": e in chosen, "delta_norm": 1.0 + e,
+                         "disease": DIS[e], "aspect": [],
+                         "fields": {"grammar": [float(e), 1.0]},
+                         "top_tokens": [{"id": e, "token": f"t{e}",
+                                         "dlogit": 1.0}]}
+                        for e in who],
+        }
+
+    recs = [mk("full", (0, 1)), mk("full", (1, 0))] + [mk("topk", (0, 1))] * 3
+    a = ps.aggregate(recs)
+    check("nguồn hồ sơ là bản ghi `full` khi có, không phải `topk`",
+          a["profile_source"] == "full" and a["n_full"] == 2
+          and a["n_topk"] == 3, str(a["profile_source"]))
+    check("expert router CHƯA TỪNG chọn vẫn có hồ sơ nhờ bản ghi full",
+          a["n_profiled"] == 3 and a["n_disease"][2] == 2 and not a["absent"],
+          f"profiled={a['n_profiled']} absent={a['absent']}")
+    check("e2 vẫn bị đánh dấu là expert chết (chưa từng lọt top-k)",
+          a["dead_experts"] == [2] and a["usage"][2] == 0.0)
+    check("hồ sơ CHỈ lấy từ 2 bản ghi full, không cộng thêm 3 bản ghi topk",
+          a["n_prof"][0] == 2, str(a["n_prof"]))
+    check("route_share là softmax dày trên đủ E expert, tổng = 1",
+          abs(float(np.nansum(a["route_share"])) - 1.0) < 1e-6
+          and abs(a["route_share"][2] - 0.05) < 1e-6, str(a["route_share"]))
+    check("usage vẫn đếm trên MỌI bản ghi (5), không chỉ bản ghi full",
+          a["n_chosen"][0] == 5 and a["n_records"] == 5, str(a["n_chosen"]))
+    check("bảng nhiệt gồm cả nhóm token ngoài danh sách bệnh",
+          a["fields"]["grammar"].shape == (3, 2)
+          and len(a["global_cols"]) == 4, str(a["global_cols"]))
+
+    # ── rơi về `topk` khi không có bản ghi full nào ─────────────────────────
+    old = [mk("topk", (0, 1))] * 4
+    for r in old:                       # mô phỏng bản ghi v1: không có prob
+        r["router"] = {k: v for k, v in r["router"].items() if k != "prob"}
+    b = ps.aggregate(old)
+    check("không có bản ghi full -> rơi về topk và ĐÓNG DẤU cảnh báo",
+          b["profile_source"] == "topk" and "⚠" in ps.source_caveat(b))
+    check("khi đó e2 bị loại khỏi bảng, lý do router_never_picked",
+          b["n_profiled"] == 2
+          and [x["reason"] for x in b["absent"]] == ["router_never_picked"],
+          str(b["absent"]))
+    check("thiếu route_prob -> effective_experts là NaN, không phải E",
+          math.isnan(b["effective_experts"]), str(b["effective_experts"]))
+    check("verdict/JSON không nổ khi mọi chỉ số router đều NaN",
+          isinstance(ps.verdict(b)[1], str) and len(ps.verdict(b)[1]) > 40)
+
+
 if __name__ == "__main__":
     print("[1] bảng tham số vs tài liệu")
     if _selftest() != 0:
@@ -822,5 +949,6 @@ if __name__ == "__main__":
     test_route_noise()
     test_decay()
     test_probe()
+    test_probe_summary()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

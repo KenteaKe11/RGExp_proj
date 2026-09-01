@@ -341,8 +341,12 @@ def main(argv=None):
             t = time.time()
             loss, st = train_loss(b)
             lv = float(loss)
-            log("S0", f"   forward  {time.time()-t:5.2f}s loss={lv:.4f} | "
-                      f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.items() if k != 'expert_share'} }")
+            # expert_share / route_prob là vector E phần tử — in ra đây thì
+            # dòng log dài gấp ba mà không đọc được gì; chúng nằm ở event log.
+            shown = {k: (round(v, 4) if isinstance(v, float) else v)
+                     for k, v in st.items()
+                     if k not in ("expert_share", "route_prob")}
+            log("S0", f"   forward  {time.time()-t:5.2f}s loss={lv:.4f} | {shown}")
             t = time.time()
             loss.backward()
             bridge.end()

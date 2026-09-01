@@ -537,6 +537,14 @@ class RouterNet(nn.Module):
                 self.load_tokens.add_(float(prob.shape[0]))
             stats = {
                 "expert_share": (counts / counts.sum().clamp_min(1)).tolist(),
+                # Softmax ĐẦY ĐỦ trên E expert, TRƯỚC khi cắt top-k. `gate` ở
+                # trên đã bị top-k làm rỗng E-k ô, nên nó KHÔNG trả lời được
+                # câu "router tin expert nào bao nhiêu" — một expert không lọt
+                # top-k vẫn có thể được router cho 0.08 xác suất, và đó là số
+                # đo duy nhất tồn tại cho expert chưa bao giờ được chọn.
+                # mode=probe ghi vector này vào từng bản ghi để summary có tỉ
+                # lệ đóng góp trung bình của ĐỦ E expert trên n mẫu.
+                "route_prob": prob.mean(0).tolist(),
                 "gate_max": float(topv.max(dim=-1).values.mean()),
                 "route_entropy": float(
                     -(prob * prob.clamp_min(1e-9).log()).sum(-1).mean()),

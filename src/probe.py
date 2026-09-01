@@ -11,11 +11,21 @@ Với MỖI ảnh của tập test, probe làm ba việc:
   1. Sinh báo cáo MỘT lần với gate thật (đúng như `mode=test` vẫn làm) — đây
      là kết quả để chấm metrics, không dính gì tới probe.
   2. Một forward NỀN với gate = 0 (không expert nào chạy) — mốc để trừ.
-  3. K forward nữa (K = top_k = 4), mỗi lần bật ĐÚNG MỘT trong K expert mà
-     router đã chọn, với trọng số 1.0. Hiệu số so với nền chính là **dấu vân
-     tay** của expert đó trên đúng ảnh này.
+  3. Thêm một loạt forward, mỗi lần bật ĐÚNG MỘT expert với trọng số 1.0.
+     Hiệu số so với nền chính là **dấu vân tay** của expert đó trên đúng ảnh
+     này. Bật bao nhiêu expert thì tuỳ `run.probe_full_n`:
 
-Ba thứ đọc ra từ mỗi dấu vân tay:
+       * `probe_full_n` ảnh ĐẦU của tập test -> bật ĐỦ E expert (E = 12), kể
+         cả những expert router không chọn. Đây là hồ sơ **vô điều kiện**: mọi
+         expert được đo trên đúng cùng một tập ảnh nên so trực tiếp được, và
+         expert chưa bao giờ được router gọi vẫn có hồ sơ.
+       * các ảnh còn lại -> chỉ bật K expert router đã chọn (K = top_k = 4),
+         như trước. Rẻ hơn, và vẫn đủ để thống kê router trên trọn tập test.
+
+     Ảnh nào thuộc nhóm nào lấy theo THỨ TỰ GỐC của tập test, nên phiên sau
+     resume vẫn ra đúng tập ảnh đó. Bản ghi tự khai bằng `probe_mode`.
+
+Bốn thứ đọc ra từ mỗi dấu vân tay:
 
   * **Bản đồ không gian 16×16** — ‖Δh‖ tại từng image token, reshape về lưới
     patch của SigLIP. Chồng lên ảnh X-quang thì thấy expert đổi biểu diễn ở
@@ -24,10 +34,17 @@ Ba thứ đọc ra từ mỗi dấu vân tay:
     unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp K
     expert lại được ma trận K×14 và K×4: đây là "bảng chuyên môn" đọc được
     bằng mắt.
+  * **Năm nhóm token toàn cục** (`PROBE_FIELDS`) — cùng phép đo Δlogit nhưng
+    trên các nhóm từ ngoài danh sách bệnh: giải phẫu & vị trí, mức độ & độ
+    chắc chắn, ngữ cảnh thời gian & so sánh, ngữ pháp & cấu trúc báo cáo,
+    thiết bị hỗ trợ. Một expert có thể không chuyên bệnh nào mà chuyên phần
+    KHÁC của bài báo cáo — chỗ viết "Findings:", chỗ viết "stable compared to
+    prior", chỗ đặt tên vùng phổi. Không có những cột này thì expert như vậy
+    hiện ra là "không nổi trội", một kết luận sai do thước đo thiếu ô.
+
   * **Top-10 token unembedding** — 10 token mà expert đẩy logit lên mạnh nhất
-    trên toàn vocab 262k. Không giới hạn trong danh sách bệnh, nên nó bắt được
-    cả những chuyên môn mình không nghĩ tới trước ("bilateral", "stable",
-    "compared").
+    trên toàn vocab 262k. Không giới hạn trong danh sách nào, nên nó bắt được
+    cả những chuyên môn mà cả năm nhóm trên đều không nghĩ tới.
 
 ═══ Hai quyết định thiết kế cần biết trước khi đọc số ═══
 
@@ -84,6 +101,55 @@ import torch
 
 RECORD_DIR = "records"          # đường dẫn trong dataset repo
 
+# Bản ghi v1 chỉ có top-k expert và hai vector bệnh/aspect; v2 có ĐỦ E expert
+# (khi `probe_mode == "full"`), vector `prob` dày của router, và 5 nhóm token
+# `fields`. `scripts/probe_summary.py` đọc được cả hai và tách rõ trong báo cáo
+# — nên KHÔNG được xoá số này khi đổi schema lần sau, chỉ tăng nó lên.
+SCHEMA_VERSION = 2
+
+# ═══════════════════ 5 nhóm token khảo sát ngoài danh sách bệnh ══════════════
+#
+# 14 finding của CheXbert trả lời "expert này thiên về BỆNH nào". Nhưng một
+# expert hoàn toàn có thể không chuyên bệnh nào cả mà chuyên phần khác của bài
+# báo cáo: chỗ viết "Findings:", chỗ viết "stable compared to prior", chỗ đặt
+# tên vùng phổi, chỗ mô tả ống thông. Không đo những cột đó thì expert như vậy
+# hiện ra là "không nổi trội" — một kết luận SAI, chỉ vì thước đo không có ô
+# nào cho nó.
+#
+# Mỗi tên trong danh sách -> một tập dòng unembedding (name_row_ids) -> một
+# cột trong bảng nhiệt. Chọn tên theo hai tiêu chí: (1) xuất hiện thật trong
+# báo cáo X-quang ngực, (2) phân biệt được với nhau — thêm ba từ đồng nghĩa
+# của cùng một khái niệm chỉ làm bảng rộng ra chứ không thêm thông tin.
+PROBE_FIELDS = {
+    "anatomy": ("Giải phẫu & vị trí", [
+        "lung", "lungs", "pleural", "cardiac", "mediastinal", "hilar",
+        "diaphragm", "costophrenic", "apex", "base", "lobe",
+        "left", "right", "bilateral", "upper", "lower", "retrocardiac",
+        "airspace",
+    ]),
+    "degree": ("Mức độ & độ chắc chắn", [
+        "mild", "moderate", "severe", "minimal", "small", "large", "trace",
+        "extensive", "focal", "diffuse", "patchy",
+        "likely", "possible", "probable", "suspected", "questionable",
+        "definite", "no", "without", "unremarkable",
+    ]),
+    "temporal": ("Ngữ cảnh thời gian & so sánh", [
+        "stable", "unchanged", "new", "increased", "decreased", "improved",
+        "worsened", "resolved", "persistent", "prior", "previous",
+        "compared", "comparison", "since", "interval", "again",
+    ]),
+    "grammar": ("Ngữ pháp & cấu trúc báo cáo", [
+        "Findings", "Impression", "is", "are", "was", "were", "there",
+        "the", "of", "and", "with", "seen", "noted", "demonstrates",
+        "shows", "evidence", "normal", "otherwise", ".", ":",
+    ]),
+    "device": ("Thiết bị hỗ trợ", [
+        "tube", "catheter", "line", "pacemaker", "sternotomy", "wire",
+        "port", "PICC", "endotracheal", "tracheostomy", "drain", "clip",
+        "valve", "leads",
+    ]),
+}
+
 
 # ═══════════════════════════ tiện ích thuần (test được) ══════════════════════
 def grid_shape(n_patch):
@@ -121,6 +187,23 @@ def name_row_ids(tokenizer, names):
                 pass
         out.append(sorted(ids))
     return out
+
+
+def field_row_ids(tokenizer, fields=None):
+    """{nhóm: (tên hiển thị, [tên])} -> {nhóm: [[token id]]} + danh sách tên hụt.
+
+    Tách riêng khỏi `name_row_ids` chỉ để gom phần cảnh báo: một tên không
+    tokenize được sẽ cho cột hằng 0 trong bảng nhiệt, mà 0 ở đó trông y hệt
+    "expert không đẩy từ này lên" — hai chuyện khác hẳn nhau. Trả tên hụt ra
+    ngoài để `run_probe` in cảnh báo MỘT lần thay vì để người đọc bảng tự đoán.
+    """
+    fields = PROBE_FIELDS if fields is None else fields
+    ids, missing = {}, []
+    for key, (_title, names) in fields.items():
+        groups = name_row_ids(tokenizer, names)
+        ids[key] = groups
+        missing += [f"{key}/{names[i]}" for i, g in enumerate(groups) if not g]
+    return ids, missing
 
 
 def rows_mean(dlogit, id_groups):
@@ -325,13 +408,46 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
     event("probe_start", n_total=len(df), n_done=len(df) - len(todo),
           n_todo=len(todo), repo=r.probe_repo)
 
-    # Dòng unembedding của 14 tên bệnh + 4 tên aspect. Tính MỘT lần.
+    # Dòng unembedding của 14 tên bệnh + 4 tên aspect + 5 nhóm token toàn cục.
+    # Tính MỘT lần.
     dis_ids = name_row_ids(tokenizer, disease_names)
     asp_ids = name_row_ids(tokenizer, aspect_names)
+    fld_ids, fld_missing = field_row_ids(tokenizer)
     empty = [disease_names[i] for i, g in enumerate(dis_ids) if not g]
     if empty:
         warn("probe", f"không tokenize được tên bệnh {empty} — cột tương ứng "
                       f"trong ma trận K×14 sẽ luôn = 0")
+    if fld_missing:
+        warn("probe", f"không tokenize được {len(fld_missing)} tên nhóm "
+                      f"({', '.join(fld_missing[:8])}"
+                      f"{' …' if len(fld_missing) > 8 else ''}) — cột tương "
+                      f"ứng trong bảng nhiệt sẽ luôn = 0")
+
+    # ── ảnh nào chạy ĐỦ E expert ────────────────────────────────────────────
+    # `probe_full_n` ảnh ĐẦU của tập test (theo thứ tự gốc của `df`, KHÔNG
+    # theo `todo`) chạy 1 + E forward: mọi expert đều bị bật một lần, kể cả
+    # cái router không chọn. Lấy theo df gốc để phiên sau resume vẫn ra đúng
+    # tập ảnh đó — lấy theo `todo` thì mỗi lần chạy lại tập full lại trượt đi.
+    #
+    # Vì sao cần: bảng "expert × nhãn" tính trên các ảnh mà expert ĐƯỢC CHỌN là
+    # một đại lượng CÓ ĐIỀU KIỆN — nó trộn "expert này học được gì" với "router
+    # gọi nó vào lúc nào", và expert chưa bao giờ được chọn thì không có hàng
+    # nào cả. Ép chạy đủ E trên cùng một tập ảnh cho ta hồ sơ VÔ ĐIỀU KIỆN:
+    # mọi expert đo trên đúng cùng những ảnh đó, so được trực tiếp với nhau.
+    #
+    # Giá: 1 + E forward/ảnh thay vì 1 + K (E=12, K=4 -> 13 so với 5). Nên nó
+    # giới hạn ở N ảnh, phần còn lại của tập test vẫn chạy top-k để metrics
+    # báo cáo phủ trọn tập.
+    full_n = r.probe_full_n
+    if full_n is None:
+        full_keys = set(df[key_col].astype(str))
+    else:
+        full_keys = set(df[key_col].astype(str).iloc[:max(int(full_n), 0)])
+    n_full_todo = int(todo[key_col].astype(str).isin(full_keys).sum())
+    log("probe", f"chạy đủ {E} expert trên {len(full_keys)} ảnh "
+                 f"({n_full_todo} cái còn phải làm, {1+E} forward/ảnh); "
+                 f"{len(df) - len(full_keys)} ảnh còn lại chạy top-{K} "
+                 f"({1+K} forward/ảnh)")
     W = unembedding(model)                 # [V, D], Gemma buộc chung với embed
     log("probe", f"unembedding {tuple(W.shape)} | {len(disease_names)} bệnh × "
                  f"{len(aspect_names)} aspect | top-{r.probe_top_tokens} token")
@@ -401,17 +517,26 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
                                "RouterBridge không được gọi")
         chosen = [int(e) for e in torch.argsort(gate, descending=True).tolist()
                   if float(gate[e]) > 0][:K]
+        # softmax ĐẦY ĐỦ trên E expert, trước khi cắt top-k (src/router.py).
+        # `gate` đã bị top-k làm rỗng E-k ô nên không đọc được "router tin
+        # expert nào bao nhiêu"; `prob` thì có số cho cả expert không được chọn.
+        prob = [round(float(v), 6) for v in (stats.get("route_prob") or [])]
 
-        # ── (3) bật lần lượt TỪNG expert trong top-k, trọng số 1.0 ───────────
+        # ── (3) bật lần lượt TỪNG expert, trọng số 1.0 ───────────────────────
+        full = str(key) in full_keys
+        targets = list(range(E)) if full else chosen
         experts = []
-        for e in chosen:
+        for e in targets:
             oh = torch.zeros(1, E, device=dev, dtype=torch.float32)
             oh[0, e] = 1.0
             h_e, _, _ = forward_with(core_fwd, mask, oh)
             dh = (h_e - h_base).float()                     # [N, D]
             del h_e
 
-            item = {"expert": e, "gate": round(float(gate[e]), 5)}
+            item = {"expert": e,
+                    "gate": round(float(gate[e]), 5),   # 0 nếu không lọt top-k
+                    "prob": prob[e] if e < len(prob) else None,
+                    "in_topk": bool(e in chosen)}
             if img.numel() and grid is not None:
                 sp = dh[img].norm(dim=-1)
                 vals, mx = pack_map(sp.cpu().numpy())
@@ -423,6 +548,8 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             item.update(
                 disease=[round(v, 5) for v in rows_mean(dlogit, dis_ids)],
                 aspect=[round(v, 5) for v in rows_mean(dlogit, asp_ids)],
+                fields={g: [round(v, 5) for v in rows_mean(dlogit, ids)]
+                        for g, ids in fld_ids.items()},
                 top_tokens=top_tokens(dlogit, tokenizer, r.probe_top_tokens),
                 delta_norm=round(float(dh_rep.norm()), 5))
             experts.append(item)
@@ -432,6 +559,12 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         report = {"reference": str(row[f.target_column]).strip(), **rec}
         record = {
             "key_id": str(key),
+            "schema_version": SCHEMA_VERSION,
+            # "full" = đã bật đủ E expert trên ảnh này -> hồ sơ VÔ ĐIỀU KIỆN,
+            # so trực tiếp được giữa các expert. "topk" = chỉ có expert router
+            # đã chọn -> chỉ dùng được cho thống kê router. summary tách hai
+            # loại này ra, KHÔNG trộn vào cùng một trung bình.
+            "probe_mode": "full" if full else "topk",
             "sweep_cell": cfg.sweep.tag,
             "model": f.model_id,
             "n_expert": E, "top_k": K,
@@ -442,7 +575,11 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             "grid": list(grid) if grid else None,
             "disease_labels": list(disease_names),
             "aspect_labels": list(aspect_names),
+            "field_labels": {g: list(names)
+                             for g, (_t, names) in PROBE_FIELDS.items()},
+            "field_titles": {g: t for g, (t, _n) in PROBE_FIELDS.items()},
             "router": {"gate": [round(float(v), 5) for v in gate.tolist()],
+                       "prob": prob,
                        "chosen": chosen,
                        "entropy": round(float(stats.get("route_entropy", 0)), 5),
                        "gate_max": round(float(stats.get("gate_max", 0)), 5)},

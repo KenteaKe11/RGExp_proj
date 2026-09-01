@@ -44,6 +44,10 @@ import sys
 REPO     = "https://github.com/KenteaKe11/RGExp_proj"
 BRANCH   = "main"
 N_IMAGES = None           # None = trọn tập test | số = chỉ probe N ảnh đầu
+# Số ảnh ĐẦU chạy đủ n_expert expert (1+12 forward) thay vì chỉ top-k (1+4).
+# Chỉ nhóm này cho hồ sơ vô điều kiện — mọi expert đo trên cùng một tập ảnh,
+# kể cả expert router chưa từng chọn. None = mọi ảnh (chậm ~2.6×), 0 = tắt.
+FULL_N   = 300
 PROBE_REPO = None         # None = "<hub_repo>-probe" | "user/ten-repo" để tự đặt
 EXTRA    = []             # vd: ["--set", "run.probe_commit_every=5"]
 
@@ -95,6 +99,7 @@ cfg = yaml.safe_load(open("configs/default.yaml", encoding="utf-8"))
 
 cfg["run"]["mode"] = "probe"
 cfg["run"]["probe_n_images"] = N_IMAGES
+cfg["run"]["probe_full_n"] = FULL_N
 if PROBE_REPO:
     cfg["run"]["probe_repo"] = PROBE_REPO
 
@@ -130,6 +135,8 @@ with open(CONFIG, "w", encoding="utf-8") as fh:
 print(f"✓ {CONFIG}: mode=probe | {cfg['fixed']['n_expert']}E top-"
       f"{cfg['fixed']['top_k']} | {cfg['sweep']['n_block']} block | "
       f"{'trọn test' if N_IMAGES is None else str(N_IMAGES) + ' ảnh'} | "
+      f"đủ {cfg['fixed']['n_expert']} expert trên "
+      f"{'mọi ảnh' if FULL_N is None else str(FULL_N) + ' ảnh đầu'} | "
       f"commit mỗi {cfg['run']['probe_commit_every']*60:.0f}s")
 
 # ── 5. Env ───────────────────────────────────────────────────────────────────

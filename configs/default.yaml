@@ -222,6 +222,12 @@ run:
   # unembedding. Mỗi ảnh xong là một bản ghi JSON, key_id = img_rel.
   probe_repo: null          # null -> "<hub_repo>-probe" (repo_type=dataset)
   probe_n_images: null      # null = TRỌN tập test (n_test_samples bị bỏ qua)
+  # Số ảnh ĐẦU của tập test chạy ĐỦ n_expert expert (1+12 forward) thay vì
+  # chỉ top-k (1+4 forward). Chỉ nhóm này cho hồ sơ VÔ ĐIỀU KIỆN — mọi
+  # expert đo trên cùng một tập ảnh, kể cả expert router chưa từng chọn —
+  # nên bảng chuyên môn và ma trận cosine trong reports/probe/ dựng trên nó.
+  #   0    tắt, quay về hành vi cũ · null  MỌI ảnh chạy đủ 12 (chậm ~2.6×)
+  probe_full_n: 300
   probe_commit_every: 1.0   # phút — CommitScheduler gom bao lâu thì commit
   probe_top_tokens: 10
   probe_log_every: 20       # ảnh
@@ -235,7 +241,7 @@ run:
   #     --set run.train_bs=2 --set run.grad_accum=16
   train_bs: 8
   grad_accum: 4
-  infer_bs: 8
+  infer_bs: 16
   grad_ckpt: null
   num_workers: 4            # DataLoader worker — hạ xuống 2 trên máy ít vCPU
 
@@ -285,7 +291,7 @@ run:
   # always -> luôn dùng bản trung bình khi eval
   # auto   -> so val với trọng số cuối, thấp hơn thì mới lấy
   # never  -> vẫn gom snapshot và ghi vào ckpt nhưng không bao giờ áp
-  swa_use: auto
+  swa_use: never
 
   # §1.7 — Total_Loss = 1·CE + 0.2·ASL   (tỉ lệ CHỐT, không còn số hạng Aux)
   w_sup: 0.2                # hệ số nhánh supervised

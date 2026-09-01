@@ -985,18 +985,45 @@ Nó **không train gì cả**. Nó lấy một checkpoint rồi, với mỗi ả
 |---|---|---|
 | 1. Sinh báo cáo | gate thật của router | `reports.csv` + `metrics.json` như mọi ô |
 | 2. Forward nền | **0** — không expert nào chạy | mốc `h_base` để trừ |
-| 3. Bốn forward | one-hot từng expert trong top-4, **trọng số 1.0** | dấu vân tay của từng expert |
+| 3. E hoặc K forward | one-hot **từng** expert, **trọng số 1.0** | dấu vân tay của từng expert |
+
+Bước 3 chạy bao nhiêu forward là tuỳ `run.probe_full_n` (mặc định 300):
+
+| Nhóm ảnh | Bật những expert nào | Forward/ảnh | Hồ sơ thu được |
+|---|---|---|---|
+| `probe_full_n` ảnh **đầu** của tập test | **đủ 12**, kể cả expert router không chọn | 1 + 12 | **vô điều kiện** — mọi expert đo trên cùng một tập ảnh nên so trực tiếp được; expert chưa bao giờ được gọi vẫn có hàng |
+| các ảnh còn lại | 4 expert router đã chọn | 1 + 4 | **có điều kiện** — chỉ dùng cho thống kê router |
+
+Phân nhóm theo **thứ tự gốc** của tập test, nên phiên Kaggle sau resume vẫn ra
+đúng tập ảnh đó. Bản ghi tự khai bằng `probe_mode: full | topk`.
+
+Vì sao phải có nhóm `full`: trung bình "trên những ảnh router đã chọn expert
+này" trộn hai thứ vào một con số — expert học được gì, và router gọi nó lúc
+nào. Hai expert khác nhau ở đó có thể chỉ vì chúng được gọi trên hai loại ảnh
+khác nhau. Tệ hơn: expert router chưa bao giờ chọn thì không có hàng nào cả,
+đúng cái expert đáng ngờ nhất lại là cái duy nhất không đo được. `probe_full_n`
+mua lại điều đó với giá 2.6× thời gian trên N ảnh.
 
 Hiệu `Δh = h_e − h_base` là toàn bộ ảnh hưởng của expert e trên đúng ảnh này.
-Ba thứ đọc ra từ nó:
+Bốn thứ đọc ra từ nó:
 
 - **Bản đồ không gian 16×16** — ‖Δh‖ tại từng image token, reshape về lưới
   patch của SigLIP. Chồng lên ảnh X-quang thì thấy expert đổi biểu diễn ở
   **vùng nào** của phổi.
 - **Vector 14 bệnh + vector 4 aspect** — Δlogit trên đúng những dòng
-  unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp 4
-  expert lại được ma trận **4×14** và **4×4** — bảng chuyên môn đọc được bằng
-  mắt.
+  unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp cả 12
+  expert lại được ma trận **12×14** và **12×4** — bảng chuyên môn đọc được
+  bằng mắt.
+- **Năm nhóm token toàn cục** (`PROBE_FIELDS` trong `src/probe.py`) — cùng
+  phép đo, nhưng trên các trục **ngoài** danh sách chẩn đoán: giải phẫu & vị
+  trí (`lung`, `pleural`, `left`, `base`…), mức độ & độ chắc chắn (`mild`,
+  `likely`, `no`, `unremarkable`…), ngữ cảnh thời gian & so sánh (`stable`,
+  `new`, `compared`, `interval`…), ngữ pháp & cấu trúc báo cáo (`Findings`,
+  `Impression`, `is`, `the`, `.`…), thiết bị hỗ trợ (`tube`, `catheter`,
+  `pacemaker`…). Một expert hoàn toàn có thể không chuyên bệnh nào mà chuyên
+  đúng chỗ viết `Findings:` hay chỗ viết `stable compared to prior`. Không đo
+  những cột đó thì expert như vậy hiện ra là "không nổi trội" — một kết luận
+  **sai**, chỉ vì thước đo không có ô nào cho nó.
 - **Top-10 token unembedding** — 10 token expert đẩy logit lên mạnh nhất trên
   toàn vocab 262k. Không bị giam trong danh sách bệnh, nên nó bắt được cả
   những chuyên môn mình không nghĩ tới trước (`bilateral`, `stable`,
@@ -1122,19 +1149,29 @@ thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, c�
 
 | File | Là gì |
 |---|---|
-| `index.html` | một file tự chứa: kết luận, KPI, mục "Expert không tham gia", bảng router chọn ai, heatmap expert×bệnh và expert×aspect, ma trận tương đồng, và một thẻ cho mỗi expert có mặt (bản đồ 16×16 + top token) |
+| `index.html` | một file tự chứa: kết luận, KPI, mục "Expert không tham gia", bảng "router phân bổ cho ai" (route_share + % lọt top-k cho đủ 12), **bảy** heatmap (bệnh, aspect, 5 nhóm token), ba ma trận tương đồng (toàn bộ nhãn / chỉ bệnh / bản đồ không gian), và một thẻ cho mỗi expert (bản đồ 16×16 + top token) |
 | `SUMMARY.md` | bản đọc thẳng trên GitHub; bản đồ 16×16 vẽ bằng ký tự khối |
 | `summary.json` | cùng số liệu, dạng máy đọc |
-| `expert_*.csv` | ma trận thô: usage, disease mean/z, aspect mean/z, similarity, cooccurrence, top token, spatial |
+| `expert_*.csv` | ma trận thô: router (route_share/usage/redundancy/độ chuyên biệt), disease mean/z, aspect mean/z, **từng nhóm token** mean/z, ma trận z toàn cục, ba ma trận similarity, cooccurrence, top token, spatial |
 
-**Ba con số đọc trước:**
+**Bốn con số đọc trước:**
 
-- `clone_index` — cosine trung bình giữa hồ sơ bệnh của từng cặp expert **sau
-  khi trừ hồ sơ trung bình của cả nhóm**. Trừ trung bình là bắt buộc: expert
-  nào cũng đẩy logit của mọi tên bệnh lên (chúng cùng sống trong miền X-quang)
-  nên cosine thô luôn ~0.9 và không phân biệt được gì — cái đáng đo là phần
-  LỆCH so với mặt bằng chung. ~1 = các expert là bản sao; ~0 = mỗi expert kéo
-  về một hướng riêng.
+- `route_share` — trung bình `softmax(route_logit)` trên n mẫu, cho **đủ 12**
+  expert. Tính TRƯỚC khi cắt top-k, nên expert không bao giờ lọt top-k vẫn có
+  số (`gate` thì đã bị top-k làm rỗng 8/12 ô và không trả lời được câu này).
+  Chia đều tuyệt đối = 1/12 = 8.3%. Đọc kèm `effective_experts` = `exp(H)` —
+  số expert **hiệu dụng**: 12 expert mà ra 3.2 nghĩa là router thực chất chỉ
+  đang dùng khoảng ba cái.
+- `clone_index` — cosine trung bình giữa hồ sơ **z-score** của từng cặp expert,
+  trên **toàn bộ** cột (14 bệnh + 4 aspect + 5 nhóm token ≈ 106 nhãn), sau khi
+  trừ hồ sơ trung bình của cả nhóm. Trừ trung bình là bắt buộc: expert nào cũng
+  đẩy logit của mọi tên bệnh lên (chúng cùng sống trong miền X-quang) nên
+  cosine thô luôn ~0.9 và không phân biệt được gì. Ghép **z-score** chứ không
+  ghép giá trị thô cũng là bắt buộc: Δlogit của `the` lớn hơn của `Atelectasis`
+  cả bậc, ghép thô thì con số này thực chất chỉ là cosine của nhóm ngữ pháp.
+  ~1 = các expert là bản sao; ~0 = mỗi expert kéo về một hướng riêng.
+  `clone_index_disease` giữ lại phép đo cũ (chỉ 14 tên bệnh) để so: lệch nhiều
+  giữa hai số nghĩa là các expert chia việc theo một trục **khác** trục bệnh.
 - `balance` — entropy chuẩn hoá của tần suất router chọn từng expert
   (`H / log E`). 1.00 = chia đều; thấp = vài expert ăn hết lượt chọn và phần
   còn lại là tham số chết. Đây chính là §3.6 nhìn từ phía kết quả.
@@ -1153,18 +1190,36 @@ nên khác biệt thật bị nén phẳng, và pha loãng `clone_index` về 0 
 điều này được thi hành bằng NaN chứ không phải 0: NaN không cộng vào đâu được
 nên mọi chỗ dùng phải xử lý tường minh.
 
-Ngoại lệ có chủ ý: `balance` và `usage_cv` vẫn tính trên **đủ E** expert. Chúng
-đo router chia việc thế nào, mà "expert này chưa từng được chọn" chính là dữ
-kiện quan trọng nhất của câu đó — loại nó ra là tự xoá bằng chứng. Mỗi con số
-đều ghi rõ mẫu số của nó (`clone_index_over`, `balance_over` trong
-`summary.json`), và `expert_usage.csv` giữ đủ E hàng với cột `active`, kèm
-`expert_absent.csv` liệt kê ai bị loại vì lý do gì.
+Ngoại lệ có chủ ý: `balance`, `usage_cv` và `route_share` vẫn tính trên **đủ E**
+expert. Chúng đo router chia việc thế nào, mà "expert này chưa từng được chọn"
+chính là dữ kiện quan trọng nhất của câu đó — loại nó ra là tự xoá bằng chứng.
+Mỗi con số đều ghi rõ mẫu số của nó (`clone_index_over_experts`,
+`clone_index_over_labels`, `balance_over` trong `summary.json`), và
+`expert_router.csv` giữ đủ E hàng với cột `active`, kèm `expert_absent.csv`
+liệt kê ai bị loại vì lý do gì.
 
-Heatmap chuẩn hoá **theo cột** (z-score giữa các expert cho từng bệnh), không
-theo hàng: mặt bằng logit của từng tên bệnh chênh nhau cả bậc — tên hiếm trong
-vocab luôn có Δlogit bé hơn. Chuẩn theo cột thì ô đỏ mới đọc được đúng một
-nghĩa: "expert này đẩy bệnh đó mạnh **hơn các expert khác**", đúng định nghĩa
-của chuyên môn hoá.
+**Hai loại bản ghi không được trộn.** Mọi bảng chuyên môn (bệnh, aspect, 5 nhóm
+token, cosine, bản đồ, top token) dựng trên bản ghi `full`; bản ghi `topk` chỉ
+đóng góp vào phần thống kê router (tần suất chọn, gate, đồng xuất hiện) — là
+chỗ chúng đúng nghĩa. Không có bản ghi `full` nào (dữ liệu cũ, hoặc
+`probe_full_n: 0`) thì script rơi về `topk` và **đóng dấu cảnh báo** lên đầu
+báo cáo: số vẫn hiện ra nhưng người đọc phải biết mình đang đọc một đại lượng
+có điều kiện. `summary.json` ghi rõ `profile_source` và `n_profile_records`.
+
+**Vài chỉ số nữa trong bảng:** `redundancy` (cosine với expert giống nó nhất,
+kèm tên expert đó — ai là bản sao của ai), `spec_std` / độ chuyên biệt (độ lệch
+chuẩn hàng z: hàng phẳng = bám mặt bằng ở mọi nhãn, tức không chuyên gì cả),
+`gate_effect_corr` (tương quan giữa `route_share` và ‖Δh‖ — router có ưu tiên
+đúng expert làm nhiều việc không; ~0 hoặc âm nghĩa là trọng số nó gán không
+liên quan tới lượng công thật), `clone_index_spatial` (các expert có nhìn cùng
+một vùng phổi không — cao ở đây mà thấp ở bảng nhãn = nhìn cùng chỗ nhưng rút
+ra kết luận khác nhau).
+
+Heatmap chuẩn hoá **theo cột** (z-score giữa các expert cho từng nhãn), không
+theo hàng: mặt bằng logit của từng tên chênh nhau cả bậc — tên hiếm trong vocab
+luôn có Δlogit bé hơn. Chuẩn theo cột thì ô đỏ mới đọc được đúng một nghĩa:
+"expert này đẩy nhãn đó mạnh **hơn các expert khác**", đúng định nghĩa của
+chuyên môn hoá.
 
 **Output không chứa một chữ nào của báo cáo.** Bản ghi probe có cả
 `report.reference` (báo cáo thật của MIMIC-CXR) lẫn `key_id`, mà `key_id` chính

@@ -332,6 +332,14 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("probe_log_every", 20)     # ảnh
     run.setdefault("probe_flush_every", 20)   # ảnh, ghi lại reports.csv
     run.setdefault("probe_n_images", None)    # null = TRỌN tập test
+    # Số ảnh ĐẦU của tập test được probe với ĐỦ n_expert expert (1+E forward)
+    # thay vì chỉ top-k (1+K forward). Chỉ những ảnh này cho hồ sơ vô điều
+    # kiện — bảng chuyên môn và cosine trong báo cáo dựng trên chúng.
+    #   300  mặc định: đủ để trung bình hết nhiễu, probe không chậm gấp 2.6×
+    #        trên trọn tập.
+    #   0    tắt hẳn, quay về hành vi cũ (chỉ top-k, không có hồ sơ vô điều kiện)
+    #   null MỌI ảnh chạy đủ E expert — chính xác nhất, chậm nhất.
+    run.setdefault("probe_full_n", 300)
     if str(run.get("mode", "both")) == "probe":
         # Probe không train và không được bỏ qua infer vì "ô này đã có eval":
         # eval cũ là của mode=test, không có bản ghi probe nào.
