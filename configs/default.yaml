@@ -285,7 +285,7 @@ run:
   # always -> luôn dùng bản trung bình khi eval
   # auto   -> so val với trọng số cuối, thấp hơn thì mới lấy
   # never  -> vẫn gom snapshot và ghi vào ckpt nhưng không bao giờ áp
-  swa_use: always
+  swa_use: auto
 
   # §1.7 — Total_Loss = 1·CE + 0.2·ASL   (tỉ lệ CHỐT, không còn số hạng Aux)
   w_sup: 0.2                # hệ số nhánh supervised
