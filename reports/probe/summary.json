@@ -1,0 +1,664 @@
+{
+ "generated_at": "2026-09-01T06:05:18+00:00",
+ "source": "hf://datasets/RGExp123/mimic-cxr-gemma3-g-brmf-n12-probe/records",
+ "n_records": 33,
+ "n_expert": 12,
+ "top_k": 4,
+ "grid": [
+  1,
+  1
+ ],
+ "meta": {
+  "model": [
+   "google/gemma-3-4b-it"
+  ],
+  "sweep_cell": [
+   "gemma3-g-brmf-n12"
+  ],
+  "weights": [
+   "swa (trung bình 46 snapshot)"
+  ]
+ },
+ "train_samples": [
+  14752,
+  14752
+ ],
+ "headline": {
+  "clone_index": 0.0304,
+  "clone_index_max": 1.0,
+  "balance": 0.5579,
+  "usage_cv": 1.4142,
+  "route_entropy": 0.907480606060606,
+  "gate_max": 0.7386033333333333,
+  "level": "thấp",
+  "verdict": "Các expert phân hoá RÕ (cosine lệch trung bình 0.03): mỗi expert kéo hồ sơ bệnh về một hướng khác nhau. Đây là dấu hiệu MoE đang thật sự chia việc. Nhưng router chia việc LỆCH (balance 0.56, đều tuyệt đối = 1.00): một phần expert hiếm khi được gọi, xem cột 'lượt chọn'."
+ },
+ "disease_labels": [
+  "No Finding",
+  "Enlarged Cardiomediastinum",
+  "Cardiomegaly",
+  "Lung Opacity",
+  "Lung Lesion",
+  "Edema",
+  "Consolidation",
+  "Pneumonia",
+  "Atelectasis",
+  "Pneumothorax",
+  "Pleural Effusion",
+  "Pleural Other",
+  "Fracture",
+  "Support Devices"
+ ],
+ "aspect_labels": [
+  "positive",
+  "negative",
+  "uncertain",
+  "blank"
+ ],
+ "experts": [
+  {
+   "expert": 0,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 1,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 2,
+   "n_chosen": 33,
+   "usage": 1.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0171,
+   "delta_norm": 119.92175,
+   "top_disease": [],
+   "top_aspect": [
+    [
+     "blank",
+     1.2865524705441667
+    ]
+   ],
+   "top_tokens": [
+    {
+     "token": " sueños",
+     "n_images": 24,
+     "dlogit_mean": 12.4697
+    },
+    {
+     "token": "<unused1381>",
+     "n_images": 26,
+     "dlogit_mean": 12.0625
+    },
+    {
+     "token": " puterea",
+     "n_images": 19,
+     "dlogit_mean": 10.46023
+    },
+    {
+     "token": " felicidad",
+     "n_images": 16,
+     "dlogit_mean": 8.72159
+    },
+    {
+     "token": "ቖ",
+     "n_images": 13,
+     "dlogit_mean": 6.92424
+    },
+    {
+     "token": " Mereka",
+     "n_images": 14,
+     "dlogit_mean": 6.92045
+    },
+    {
+     "token": "<unused1571>",
+     "n_images": 15,
+     "dlogit_mean": 6.76515
+    },
+    {
+     "token": "<unused1426>",
+     "n_images": 14,
+     "dlogit_mean": 6.1553
+    },
+    {
+     "token": " sanciones",
+     "n_images": 10,
+     "dlogit_mean": 5.8447
+    },
+    {
+     "token": "醀",
+     "n_images": 12,
+     "dlogit_mean": 5.4375
+    },
+    {
+     "token": " enemigos",
+     "n_images": 10,
+     "dlogit_mean": 4.88636
+    },
+    {
+     "token": " República",
+     "n_images": 9,
+     "dlogit_mean": 4.30492
+    }
+   ]
+  },
+  {
+   "expert": 3,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 4,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 5,
+   "n_chosen": 33,
+   "usage": 1.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.07949,
+   "delta_norm": 118.00866,
+   "top_disease": [],
+   "top_aspect": [
+    [
+     "blank",
+     1.4520097909818144
+    ]
+   ],
+   "top_tokens": [
+    {
+     "token": "<unused1381>",
+     "n_images": 31,
+     "dlogit_mean": 14.71023
+    },
+    {
+     "token": "<unused1571>",
+     "n_images": 25,
+     "dlogit_mean": 11.37689
+    },
+    {
+     "token": " puterea",
+     "n_images": 19,
+     "dlogit_mean": 10.42992
+    },
+    {
+     "token": " sueños",
+     "n_images": 19,
+     "dlogit_mean": 10.0947
+    },
+    {
+     "token": " felicidad",
+     "n_images": 18,
+     "dlogit_mean": 9.55492
+    },
+    {
+     "token": "<unused1426>",
+     "n_images": 17,
+     "dlogit_mean": 7.39773
+    },
+    {
+     "token": " sanciones",
+     "n_images": 11,
+     "dlogit_mean": 6.37311
+    },
+    {
+     "token": "avacako",
+     "n_images": 12,
+     "dlogit_mean": 5.97917
+    },
+    {
+     "token": "Imputted",
+     "n_images": 11,
+     "dlogit_mean": 5.23864
+    },
+    {
+     "token": " Mereka",
+     "n_images": 10,
+     "dlogit_mean": 4.96591
+    },
+    {
+     "token": " enemigos",
+     "n_images": 9,
+     "dlogit_mean": 4.39205
+    },
+    {
+     "token": "<unused1380>",
+     "n_images": 9,
+     "dlogit_mean": 4.22348
+    }
+   ]
+  },
+  {
+   "expert": 6,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 7,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 8,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 9,
+   "n_chosen": 0,
+   "usage": 0.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.0,
+   "delta_norm": 0.0,
+   "top_disease": [
+    [
+     "Lung Opacity",
+     0.7068183707288561
+    ],
+    [
+     "Lung Lesion",
+     0.7067601859844834
+    ],
+    [
+     "Pneumothorax",
+     0.7065307933740993
+    ]
+   ],
+   "top_aspect": [
+    [
+     "negative",
+     0.706650839820805
+    ],
+    [
+     "positive",
+     0.7060802457029272
+    ],
+    [
+     "uncertain",
+     0.6768217568808037
+    ]
+   ],
+   "top_tokens": []
+  },
+  {
+   "expert": 10,
+   "n_chosen": 33,
+   "usage": 1.0,
+   "top1_share": 1.0,
+   "gate_mean_when_chosen": 0.7386,
+   "delta_norm": 122.30583,
+   "top_disease": [],
+   "top_aspect": [
+    [
+     "blank",
+     1.3697507947309482
+    ]
+   ],
+   "top_tokens": [
+    {
+     "token": "<unused1381>",
+     "n_images": 33,
+     "dlogit_mean": 16.63258
+    },
+    {
+     "token": "<unused1571>",
+     "n_images": 26,
+     "dlogit_mean": 12.61932
+    },
+    {
+     "token": " puterea",
+     "n_images": 16,
+     "dlogit_mean": 9.29735
+    },
+    {
+     "token": "<unused1426>",
+     "n_images": 20,
+     "dlogit_mean": 9.21591
+    },
+    {
+     "token": " sueños",
+     "n_images": 15,
+     "dlogit_mean": 8.39015
+    },
+    {
+     "token": " felicidad",
+     "n_images": 14,
+     "dlogit_mean": 7.74242
+    },
+    {
+     "token": "Imputted",
+     "n_images": 13,
+     "dlogit_mean": 6.81629
+    },
+    {
+     "token": "<unused1380>",
+     "n_images": 12,
+     "dlogit_mean": 6.0
+    },
+    {
+     "token": "avacako",
+     "n_images": 11,
+     "dlogit_mean": 5.8428
+    },
+    {
+     "token": " sanciones",
+     "n_images": 9,
+     "dlogit_mean": 5.38258
+    },
+    {
+     "token": "<unused1442>",
+     "n_images": 12,
+     "dlogit_mean": 5.25379
+    },
+    {
+     "token": "<unused1362>",
+     "n_images": 12,
+     "dlogit_mean": 5.10985
+    }
+   ]
+  },
+  {
+   "expert": 11,
+   "n_chosen": 33,
+   "usage": 1.0,
+   "top1_share": 0.0,
+   "gate_mean_when_chosen": 0.1648,
+   "delta_norm": 118.19296,
+   "top_disease": [],
+   "top_aspect": [
+    [
+     "blank",
+     1.5401564960547338
+    ]
+   ],
+   "top_tokens": [
+    {
+     "token": "<unused1381>",
+     "n_images": 27,
+     "dlogit_mean": 12.4053
+    },
+    {
+     "token": " sueños",
+     "n_images": 21,
+     "dlogit_mean": 10.89205
+    },
+    {
+     "token": " felicidad",
+     "n_images": 19,
+     "dlogit_mean": 9.88258
+    },
+    {
+     "token": " puterea",
+     "n_images": 18,
+     "dlogit_mean": 9.82576
+    },
+    {
+     "token": "<unused1571>",
+     "n_images": 21,
+     "dlogit_mean": 9.54167
+    },
+    {
+     "token": "<unused1426>",
+     "n_images": 16,
+     "dlogit_mean": 6.81818
+    },
+    {
+     "token": "ቖ",
+     "n_images": 12,
+     "dlogit_mean": 6.17614
+    },
+    {
+     "token": " sanciones",
+     "n_images": 9,
+     "dlogit_mean": 5.19318
+    },
+    {
+     "token": " Mereka",
+     "n_images": 10,
+     "dlogit_mean": 4.95833
+    },
+    {
+     "token": " enemigos",
+     "n_images": 9,
+     "dlogit_mean": 4.3447
+    },
+    {
+     "token": " luchar",
+     "n_images": 7,
+     "dlogit_mean": 4.14015
+    },
+    {
+     "token": "<unused1380>",
+     "n_images": 9,
+     "dlogit_mean": 4.08902
+    }
+   ]
+  }
+ ]
+}
