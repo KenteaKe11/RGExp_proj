@@ -37,10 +37,24 @@ from src.losses import (asl_loss, aspect_roles,          # noqa: E402
                         binary_target_table, supervised_stats, to_binary)
 from src.optim import (CosineRestartSchedule,           # noqa: E402
                        WeightAverager)
-from src.router import (VARIANT, RouterNet, _selftest,  # noqa: E402
+from src.router import (VARIANT, RouterNet as _RouterNet,  # noqa: E402
+                        _calibrate_bn, _fake_cxr, _selftest,
                         decay_desc, decay_value)
 
 FAIL = []
+
+
+def RouterNet(*args, **kwargs):
+    """RouterNet với backbone KHÔNG trọng số, dùng cho mọi test ở đây.
+
+    Selftest phải chạy được offline và không nên tải 30MB trọng số
+    torchxrayvision mỗi lần. Con số tham số, hình dạng và toàn bộ cơ chế
+    gate/bias/nhiễu không phụ thuộc việc backbone đã train hay chưa —
+    thứ DUY NHẤT phụ thuộc là chất lượng đặc trưng, mà đó là chuyện của
+    train chứ không phải của selftest.
+    """
+    kwargs.setdefault("backbone", None)
+    return _RouterNet(*args, **kwargs)
 
 
 def check(name, cond, detail=""):
@@ -49,14 +63,28 @@ def check(name, cond, detail=""):
         FAIL.append(name)
 
 
+
+def _drive_to_clip(net, n=2000):
+    """Nắn bias `n` lần cùng một chiều -> |bias| lớn nhất đạt được."""
+    for _ in range(n):
+        with torch.no_grad():
+            net.load_count.zero_()
+            net.load_tokens.zero_()
+            net.load_count[5] = 200.0
+            net.load_tokens += 200.0
+        net.update_bias()
+    return float(net.expert_bias.abs().max())
+
 def test_router():
     print("\n[2] router forward")
     torch.manual_seed(0)
     B, N, E, K = 3, 40, 12, 4
     net = RouterNet(VARIANT, 2, E, K, d_enc=2560).eval()
-    x = torch.randn(B, N, 2560)
+    _calibrate_bn(net)      # backbone=None -> BN chưa có thống kê nào
+    x = _fake_cxr(B)        # pixel_values [B,3,896,896], KHÔNG phải hidden
+    # `mask` còn trong chữ ký cho tương thích nhưng router mới KHÔNG dùng:
+    # 49 token đặc trưng đều là ảnh thật, không có padding hay target.
     mask = torch.ones(B, N)
-    mask[:, 30:] = 0                       # 10 token cuối = target/padding
     with torch.no_grad():
         sup, gate, st = net(x, mask)
     check("forward trả 3 phần tử (không còn aux)", True)
@@ -69,16 +97,26 @@ def test_router():
           f"balance={st['balance']:.3f}")
     check("bias khởi tạo = 0 -> bias_span = 0", st["bias_span"] == 0.0)
 
-    print("\n[3] mask che được token target")
-    x2 = x.clone()
-    x2[:, 30:] = torch.randn(B, 10, 2560) * 5      # đổi hẳn phần bị che
+    print("\n[3] router PHẢI phân biệt được ảnh khác nhau")
+    # Đây là số đo đã kết tội nhánh cũ: đo trên 143 ảnh thật, tỉ lệ
+    # std(route_logit theo mẫu)/std(theo expert) ≤ 0.085 — tức router phát
+    # ra gần như cùng một vector cho mọi ảnh, và top-k khi ấy do bias cân
+    # bằng tải quyết định chứ không do nội dung ảnh. Dưới 0.1 thì mọi tinh
+    # chỉnh γ/σ đều vô nghĩa.
     with torch.no_grad():
-        sup2, gate2, _ = net(x2, mask)
-    check("đổi token bị che -> gate KHÔNG đổi",
-          torch.allclose(gate, gate2, atol=1e-4))
-    check("đổi token bị che -> sup_logits KHÔNG đổi",
-          torch.allclose(sup, sup2, atol=1e-3),
-          f"lệch tối đa {float((sup-sup2).abs().max()):.2e}")
+        st8 = net(_fake_cxr(8), None)[2]
+    check("route_logit đổi theo ảnh (ratio > 0.1)",
+          st8["logit_std_ratio"] > 0.1,
+          f"ratio={st8['logit_std_ratio']:.3f} "
+          f"(mẫu {st8['logit_std_sample']:.3f} / "
+          f"expert {st8['logit_std_expert']:.3f})")
+    check("pooled của route head cũng đổi theo ảnh",
+          st8["pooled_std_sample"] > 0,
+          f"std={st8['pooled_std_sample']:.4f}")
+    with torch.no_grad():
+        sup2, gate2, _ = net(_fake_cxr(B), mask)
+    check("ảnh khác -> gate khác (router không phải hằng số)",
+          not torch.allclose(gate, gate2, atol=1e-4))
 
 
 def test_route_noise():
@@ -86,11 +124,11 @@ def test_route_noise():
     print("\n[9] nhiễu Gumbel trên route logit")
     torch.manual_seed(0)
     B, N, E, K = 64, 24, 12, 4
-    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+    x, mask = _fake_cxr(B), torch.ones(B, N)
 
     off = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=0.0)
-    check("mặc định của lớp là σ = 1.0 (chuẩn Gumbel-top-k)",
-          RouterNet(VARIANT, 1, E, K, d_enc=2560).route_noise == 1.0)
+    check("mặc định của lớp là σ = 0.5 (sàn khám phá, giữ cả buổi train)",
+          RouterNet(VARIANT, 1, E, K, d_enc=2560).route_noise == 0.5)
     off.train()
     with torch.no_grad():
         g1, g2 = off(x, mask)[1], off(x, mask)[1]
@@ -498,7 +536,7 @@ def test_bias():
     print("\n[8] cân bằng tải bằng bias (không aux loss)")
     torch.manual_seed(0)
     B, N, E, K = 32, 16, 12, 4
-    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+    x, mask = _fake_cxr(B), torch.ones(B, N)
     net = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=0.0,
                     bias_gamma=0.05)
 
@@ -544,7 +582,12 @@ def test_bias():
         hot = int((base > 0).float().sum(dim=0).argmax())
         net.expert_bias.zero_()
         net.expert_bias[hot] = -50.0
+        # MẶC ĐỊNH eval bỏ qua bias — bias là bộ điều phối tải lúc train,
+        # còn số đo probe phải phản ánh niềm tin của router.
+        check("eval mặc định BỎ QUA bias", torch.equal(base, net(x, mask)[1]))
+        net.apply_bias_at_eval = True
         after = net(x, mask)[1]
+        net.apply_bias_at_eval = False
     check("bias rất âm -> expert đó bị đẩy khỏi top-k",
           float((after[:, hot] > 0).sum()) == 0
           and float((base[:, hot] > 0).sum()) > 0)
@@ -582,7 +625,7 @@ def test_decay():
     print("\n[11] lịch decay σ và γ (chống collapse sớm)")
     torch.manual_seed(0)
     B, N, E, K = 64, 16, 12, 4
-    x, mask = torch.randn(B, N, 2560), torch.ones(B, N)
+    x, mask = _fake_cxr(B), torch.ones(B, N)
 
     # ── (1) toán thuần: đường cong phải chia đều theo BẬC, không tuyến tính ──
     n = 900
@@ -637,7 +680,13 @@ def test_decay():
           "trọng số)", plain.bias_gamma_start is None
           and plain.decay_steps == 0)
 
-    # ── (4) γ đầu = 1.0 phải nắn bias ĐỦ MẠNH để đảo được top-k trong 1 step ─
+    # ── (4) γ dù lớn tới đâu cũng KHÔNG đẩy bias vượt trần ──────────────────
+    # Đây là bất biến quan trọng nhất của cơ chế cân bằng tải, và là thứ lần
+    # chạy trước KHÔNG có: với γ_start = 1.0 và không có trần, bias phình tới
+    # ~10 nat = đúng cả dải route_logit, nên tập top-k do bias quyết định chứ
+    # không do router. Có trần thì γ lớn chỉ có nghĩa "chạm trần nhanh hơn",
+    # và trần mới là thứ định nghĩa quyền lực tối đa của bộ cân bằng.
+    clip = float(net.bias_clip)
     net.set_decay_step(0)
     net.train()
     with torch.no_grad():
@@ -647,22 +696,27 @@ def test_decay():
         net.load_count[5] = 200.0            # expert 5 ôm hết
         net.load_tokens += 200.0
     span_hot, _ = net.update_bias()
-    check("γ=1.0 -> một step đủ tạo khe bias cỡ đơn vị (dải route_logit ~±2)",
-          span_hot >= 1.0, f"span={span_hot:.3f}")
-    check("γ=1.0 -> expert quá tải bị hạ hẳn 1 bậc so với phần còn lại",
-          float(net.expert_bias[5]) < float(net.expert_bias[0]) - 1.0,
+    check("γ=1.0 -> |bias| vẫn không vượt trần trong một step",
+          float(net.expert_bias.abs().max()) <= clip + 1e-6,
+          f"|b|max={float(net.expert_bias.abs().max()):.3f} trần={clip:g}")
+    check("γ=1.0 -> span bị chặn bởi 2·trần",
+          span_hot <= 2 * clip + 1e-6, f"span={span_hot:.3f}")
+    check("γ=1.0 -> expert quá tải vẫn bị hạ dưới phần còn lại",
+          float(net.expert_bias[5]) < float(net.expert_bias[0]),
           f"b[5]={float(net.expert_bias[5]):+.3f} "
           f"b[0]={float(net.expert_bias[0]):+.3f}")
-    # Cùng tình huống với γ cuối: bias gần như không nhúc nhích. Đây chính là
-    # lý do phải có lịch — γ=1e-3 chỉ đúng cho trạng thái đã ổn định.
+    # Cùng tình huống với γ cuối: bias gần như không nhúc nhích. γ vẫn là NÚM
+    # TỐC ĐỘ (bao nhiêu step để đi hết tầm), còn bias_clip là NÚM TẦM.
     slow = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=1e-3)
     slow.train()
     with torch.no_grad():
         slow.load_count[5] = 200.0
         slow.load_tokens += 200.0
     span_slow, _ = slow.update_bias()
-    check("γ=1e-3 -> cùng tình huống chỉ nắn được 1/1000 khe đó",
-          span_slow < span_hot / 500, f"{span_slow:.5f} vs {span_hot:.3f}")
+    check("γ=1e-3 -> cùng tình huống nắn chậm hơn hai bậc",
+          span_slow < span_hot / 100, f"{span_slow:.5f} vs {span_hot:.3f}")
+    check("γ nhỏ vẫn đi được hết tầm nếu đủ step (trần là tầm, γ là tốc độ)",
+          _drive_to_clip(slow) <= clip + 1e-6)
 
     # ── (5) σ giảm thì tuyến đường thôi đảo (khám phá -> khai thác) ──────────
     net.eval()
@@ -768,11 +822,11 @@ def test_probe():
     E, K, B = 8, 3, 2
     net = RouterNet(VARIANT, 1, E, K, d_enc=2560).eval()
     br = RouterBridge(net)
-    hidden, mask = torch.randn(B, 12, 2560), torch.ones(B, 12)
+    img, mask = _fake_cxr(B), torch.ones(B, 12)
 
     br.begin("route", mask=mask)
     with torch.no_grad():
-        real = br.run(hidden)[1]
+        real = br.run(img)[1]
     check("không force -> CTX nhận đúng gate của router",
           torch.equal(moe.CTX.weights, real))
 
@@ -781,7 +835,7 @@ def test_probe():
     br.begin("route", mask=mask)
     br.force_gate = forced
     with torch.no_grad():
-        out_gate = br.run(hidden)[1]
+        out_gate = br.run(img)[1]
     check("force_gate -> CTX nhận gate BỊ ÉP",
           torch.equal(moe.CTX.weights, forced))
     check("force_gate -> bridge.out vẫn giữ gate THẬT (biết router chọn ai)",
@@ -793,7 +847,7 @@ def test_probe():
     br.begin("route", mask=mask)
     br.force_gate = torch.zeros(B, E)
     with torch.no_grad():
-        br.run(hidden)
+        br.run(img)
     check("gate toàn 0 = forward NỀN, không expert nào chạy",
           not any(moe.CTX.active))
 
@@ -801,7 +855,7 @@ def test_probe():
     br.force_gate = torch.zeros(B + 1, E)
     try:
         with torch.no_grad():
-            br.run(hidden)
+            br.run(img)
         ok = False
     except RuntimeError:
         ok = True

@@ -461,7 +461,8 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         thay cái đi vào MoE, không thay cái router nghĩ. Nhờ vậy một lần
         forward nền cũng đủ để biết router chọn 6 expert nào.
         """
-        bridge.begin("route", mask=mask)
+        bridge.begin("route", mask=mask,
+                     pixels=core_fwd.get("pixel_values"))
         bridge.force_gate = gate_vec
         try:
             # logits_to_keep=1: vocab 262k × ~1000 vị trí là ~1GB logits mà ta

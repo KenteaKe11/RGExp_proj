@@ -47,8 +47,8 @@ fixed:
   # tính toán khi CẢ BATCH cùng bỏ qua một expert (xem src/moe.py::CTX.active);
   # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
   # tế xấp xỉ 12 bản delta/step, KHÔNG phải 4.
-  n_expert: 12
-  top_k: 4
+  n_expert: 8
+  top_k: 3
 
   # Nhiễu Gumbel cộng vào route logit khi CHỌN top-k, chỉ lúc TRAINING
   # (src/router.py::gumbel_like). top-k(logit + σ·Gumbel) = lấy mẫu 4 expert
@@ -59,7 +59,7 @@ fixed:
   # gần như bốc ngẫu nhiên đều. eval/infer TẮT hẳn -> số đo tất định.
   # ĐÂY LÀ GIÁ TRỊ SAU WARMUP (xem decay_warmup_steps bên dưới): σ đi từ
   # route_noise_start xuống giá trị này trong n step đầu rồi giữ nguyên.
-  route_noise: 0.001
+  route_noise: 0.5
 
   # ── Cân bằng tải KHÔNG dùng aux loss (DeepSeek-V3) ───────────────────────
   # Mỗi expert có một bias b_e cộng vào điểm CHỌN top-k (không cộng vào trọng
@@ -72,6 +72,33 @@ fixed:
   # gì không — router sẽ sập về vài expert trong vòng vài trăm step).
   # GIÁ TRỊ SAU WARMUP — xem decay_warmup_steps.
   bias_gamma: 0.001
+
+  # TRẦN của bias — MỚI, và là thứ thiếu ở lần chạy trước. Quy tắc sign ở
+  # trên không có điểm dừng: nó đẩy bias tới BẤT KỲ độ lớn nào cần để cân
+  # bằng tải. Lần trước bias phình tới ~10 nat = đúng cả dải route_logit,
+  # nên tập top-k do bias quyết định chứ không do router, và gate (softmax
+  # SẠCH lấy ở tập ấy) thành gần one-hot: 'top-4' trên giấy, top-1 thật.
+  # 0.5 cho bias đủ sức lật hạng 4 ↔ hạng 5, không đủ lật hạng 4 ↔ hạng 10.
+  # Đọc `bias_sat` trong log: >0 kéo dài = router thật sự chỉ tin vài
+  # expert, và câu trả lời KHÔNG phải là nới trần.
+  bias_clip: 0.5
+
+  # ── Backbone ảnh của router ──────────────────────────────────────────────
+  # DenseNet-121 pretrain trên chính X-quang ngực (torchxrayvision). Router
+  # đọc THẲNG pixel_values thay vì hidden state của Gemma — xem docstring
+  # src/router.py để biết vì sao đường cũ không phân biệt được ảnh.
+  # null = dựng kiến trúc với trọng số ngẫu nhiên: CHỈ để selftest offline,
+  # train thật ở chế độ này là vứt bỏ toàn bộ lợi thế pretrain.
+  # Lựa chọn khác: densenet121-res224-chex, -nih, -all (xem xrv.models).
+  router_backbone: densenet121-res224-mimic_ch
+  # Cỡ vào của backbone. Bản res224 có thống kê BN gắn với đúng cỡ này —
+  # đưa 896 vào thì lưới ra 28×28 và mọi thang đo lệch.
+  router_img_size: 224
+  # Cộng bias vào điểm chọn khi eval/infer? MẶC ĐỊNH KHÔNG: bias là bộ
+  # điều phối tải lúc train, còn số đo probe và text sinh ra phải phản ánh
+  # NIỀM TIN của router. Lần chạy trước để bật (ngầm) nên bản ghi probe có
+  # top-k không khớp `prob` mà không có cách nào đọc ra lý do.
+  router_bias_at_eval: false
 
   # ── Lịch decay MŨ của σ và γ trong n step ĐẦU ────────────────────────────
   # Vấn đề mà lịch này giải: γ = 1e-3 là giá trị đúng cho trạng thái ỔN ĐỊNH,
@@ -100,7 +127,7 @@ fixed:
   # null = TẮT lịch cho đại lượng đó (dùng thẳng giá trị cuối từ step 0 — đúng
   # hành vi trước khi có lịch này). decay_warmup_steps: 0 = tắt cả hai.
   # Con trỏ là `step` toàn cục, nên resume vào lại đúng chỗ trên đường cong.
-  bias_gamma_start: 1.0
+  bias_gamma_start: null
   route_noise_start: 1.0
   decay_warmup_steps: 1000
 
@@ -139,13 +166,15 @@ sweep:
   model: gemma3
   # §2 — Recombinator chỉ còn MỘT biến thể, giữ trường này để tag ô và đường
   # ống report không phải đổi khi sau này thêm biến thể mới.
-  # g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
-  #         852_992 param/block
-  variant: g-brmf
-  # CHỐT: 12 block. Router = 1.58M stem + 12×0.85M block + 0.79M separation +
-  # 0.13M sup_head + 0.13M route_head ≈ 12.9M; cộng 12 expert QDoRA r8
-  # (~15.9M/expert) ≈ 203M param trainable.
-  n_block: 12
+  # dn121-mqa  MQA (8 head / 1 KV-group) + FFN 512→1024→512
+  #            1_639_424 param/block, chạy trên 49 token đặc trưng ảnh
+  variant: dn121-mqa
+  # CHỐT: 4 block. Chuỗi vào chỉ 49 token (lưới 7×7 của backbone) nên 12
+  # block là thừa — nhánh cũ cần nhiều block vì nó phải trộn ~1000 token
+  # hỗn hợp text+ảnh. Router = 6.95M backbone (1.42M đóng băng) + 0.55M
+  # proj/pos + 4×1.64M MQA + 0.59M separation + 0.13M sup_head + 0.13M
+  # route_head ≈ 14.9M (13.5M trainable); cộng 12 expert QDoRA r8 ≈ 204M.
+  n_block: 4
 
 # Bảng tra: tên model + module loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
 models:
@@ -287,14 +316,14 @@ run:
   # sweep. Nó được ghi vào swa.pt mỗi lần lưu checkpoint và dùng ở:
   #   mode=test   -> chấm metrics trên bản trung bình (swa_use != never)
   #   mode=probe  -> luôn nạp bản trung bình từ Hub
-  swa: true
+  swa: false
   # always -> luôn dùng bản trung bình khi eval
   # auto   -> so val với trọng số cuối, thấp hơn thì mới lấy
   # never  -> vẫn gom snapshot và ghi vào ckpt nhưng không bao giờ áp
   swa_use: never
 
   # §1.7 — Total_Loss = 1·CE + 0.2·ASL   (tỉ lệ CHỐT, không còn số hạng Aux)
-  w_sup: 0.2                # hệ số nhánh supervised
+  w_sup: 0.4                # hệ số nhánh supervised
 
   # ── ASL: Asymmetric Loss trên 14 finding (§1.6) ──────────────────────────
   # Nhánh supervised KHÔNG còn softmax 4 aspect + Focal. Nhãn 4 aspect của

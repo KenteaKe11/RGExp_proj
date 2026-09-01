@@ -1,76 +1,98 @@
-"""Nhánh Router (§Kiến trúc) — Stem → Recombinator → Separation → 2 head.
+"""Nhánh Router (§Kiến trúc) — CXR backbone → MQA → Separation → 2 head.
 
-Toàn bộ nhánh này là phần DUY NHẤT được thiết kế tay trong project; Gemma
-encoder/decoder giữ nguyên và đóng băng, còn expert là adapter QDoRA r8.
+THAY HOÀN TOÀN nhánh cũ (Stem 2560→512 → Recombinator g-brmf → Separation).
+Nhánh cũ đọc hidden state CUỐI của Gemma; đo trên 143 ảnh cho thấy nó phát ra
+gần như CÙNG MỘT route_logit cho mọi ảnh:
 
-    [N, 2560]  ──Stem──►  [N, 512]  ──Recombinator × n──►  [N, 512]
-                                                              │
-                                              Separation (attention pooling)
-                                                              │
-                                                    ┌─────────┴─────────┐
-                                              [1, 512]              [1, 512]
-                                          Supervised head        Route head
-                                          vec(14) → ASL          vec(E) → top-k
+    143/143 ảnh chọn y hệt một tập 4 expert, argmax không đổi lần nào
+    => std(route_logit theo mẫu) / std(theo expert) ≤ 0.085
 
-Recombinator chỉ còn MỘT biến thể (ô sweep giờ chỉ quét số block):
+Router không phân biệt được ảnh thì cân bằng tải chỉ còn một cách: bias phải
+trườn qua đúng dải route_logit (~10 nat) để lần lượt đẩy từng nhóm 4 expert
+vào cửa — tức top-k trở thành round-robin theo thời gian, không phải định
+tuyến theo nội dung. Đó là lỗi kiến trúc, không phải lỗi tham số.
 
-    g-brmf  GQAttn (8 head / 4 KV-group) + Bottleneck-ResMLP FFN
-            852_992 param/block
+Nhánh mới bỏ hẳn đường hidden state và đọc THẲNG ẢNH:
 
-`python -m src.router` in bảng tham số và ĐỐI CHIẾU với con số trong tài liệu
-thiết kế — chạy được không cần GPU, dùng để kiểm sau mỗi lần sửa kiến trúc.
+    pixel_values [B,3,896,896]  (chuẩn hoá Gemma, dải [-1,1])
+        │  gộp kênh → xám, resize 224, ×1024  (đúng quy ước torchxrayvision)
+        ▼
+    DenseNet-121 pretrain CXR  ──► [B, 1024, 7, 7]
+        stem+block1+block2 ĐÓNG BĂNG | block3+block4 học tiếp
+        │  1×1 conv 1024→512  ("lớp out")  + pos embedding
+        ▼
+    49 token × 512  ──MQA × n_block──►  49 token × 512
+        │  Separation: 2 query học được, cross-attn MQA
+        ▼
+      ┌────────────┴────────────┐
+    [1,512]                  [1,512]
+    Supervised head           Route head
+    vec(14) → ASL             vec(E) → top-k
 
-Quy ước chung của nhánh router:
-  * mọi Linear KHÔNG bias (bảng tham số trong tài liệu tính theo cách này),
-  * pre-norm + residual,
-  * RMSNorm (không LayerNorm): không có mean-centering, rẻ hơn và khớp với
-    chuẩn hoá mà chính Gemma dùng.
+Vì sao đọc thẳng ảnh thay vì hidden state của Gemma:
 
-CÂN BẰNG TẢI KHÔNG DÙNG AUX LOSS (kiểu DeepSeek-V3). Không còn số hạng
-`w_aux · Aux` trong Total_Loss. Thay vào đó mỗi expert có một BIAS b_e chỉ
-tham gia vào việc CHỌN top-k, không tham gia vào trọng số gate, và không học
-bằng gradient — sau mỗi optimizer step nó được nắn bằng một quy tắc:
+  * prompt là HẰNG SỐ (§1.2) — tín hiệu theo mẫu DUY NHẤT trong chuỗi vào là
+    256 image token. Đi vòng qua 34 layer decoder của Gemma để lấy lại thông
+    tin ảnh là đường dài nhất tới cùng một đích, và là đường mà tín hiệu bị
+    pha loãng nhất.
+  * hidden state cuối của một LM đã được tối ưu để dự đoán TOKEN KẾ TIẾP, ở
+    đây gần như luôn là văn phong báo cáo. Đặc trưng phân biệt bệnh không có
+    lý do gì phải sống sót tới đó.
+  * DenseNet-121 của torchxrayvision pretrain trên chính MIMIC-CXR/CheXpert:
+    nó VÀO ĐỜI đã phân biệt được tràn dịch với xẹp phổi. Router không phải học
+    thị giác từ đầu bằng 25k mẫu.
+  * Nhánh này không còn phụ thuộc forward của Gemma, nên gate tính được TRƯỚC
+    khi decoder chạy. Hook trong RouterBridge giữ nguyên (để giữ đúng ngữ
+    nghĩa lúc generate: chỉ prefill mới tính lại gate).
+
+BATCHNORM ĐÓNG BĂNG TOÀN BỘ. Backbone là DenseNet nên có BatchNorm — khác hẳn
+nhánh cũ vốn chỉ có RMSNorm. Mọi BN ở đây bị ghim vĩnh viễn ở chế độ eval
+(`CXRBackbone.train` ghi đè), kể cả trong hai block đang học. Ba lý do, cái
+nào cũng đủ để làm một mình:
+
+  * BN ở chế độ train khiến output của MỘT ảnh phụ thuộc các ảnh khác cùng
+    micro-batch. Với router thì đó là thảm hoạ: gate của cùng một ảnh đổi theo
+    việc nó nằm cạnh ai, và train khác hẳn eval.
+  * micro-batch ở đây là 4 ảnh — thống kê BN trên 4 mẫu là nhiễu thuần tuý.
+  * SWA (src/optim.py) trung bình mọi buffer float. Running stats của BN mà
+    trôi thì bản trung bình là một thống kê không thuộc về bất kỳ checkpoint
+    nào. Ghim BN lại thì running stats bất biến và phép trung bình vô hại —
+    đúng như giả định "chỉ có LayerNorm/RMSNorm" mà WeightAverager đang ghi.
+
+Tham số học được (affine weight/bias) của BN trong block3/block4 VẪN học bình
+thường; chỉ running_mean/var là đứng yên.
+
+CÂN BẰNG TẢI KHÔNG DÙNG AUX LOSS (kiểu DeepSeek-V3). Mỗi expert có một bias
+b_e chỉ tham gia CHỌN top-k, không tham gia trọng số gate, không học bằng
+gradient — sau mỗi optimizer step nó được nắn bằng quy tắc:
 
     expert bị chọn nhiều hơn mức trung bình  ->  b_e giảm  (khó được chọn hơn)
     expert bị chọn ít hơn                    ->  b_e tăng
 
-Lý do bỏ aux: aux loss là một lực KÉO NGƯỢC gradient chính. Nó bắt router
-"chia đều" ngay cả khi việc chia đều làm CE tệ đi, và mọi giá trị w_aux đều
-là một đánh đổi giữa cân bằng và chất lượng. Bias thì nằm NGOÀI đồ thị
-autograd: nó chỉnh cửa vào của từng expert mà không thêm một chữ nào vào
-loss, nên chất lượng và cân bằng không còn phải tranh nhau một hệ số.
-Xem `RouterNet.update_bias`.
+`bias_clip` LÀ MỚI VÀ LÀ BẮT BUỘC. Lần chạy trước không có nó: γ_start = 1.0
+cho bias nhảy 2 nat mỗi step, và nó phình tới ~10 nat — bằng đúng toàn bộ dải
+route_logit. Lúc đó tập top-k do bias quyết định chứ không do router, và vì
+`gate` lấy softmax SẠCH ở tập ấy nên gate thành gần one-hot (0.994 / 0.004 /
+0.002 / 0.0004): "top-4" trên giấy, top-1 trên thực tế, và 3 expert còn lại
+gần như không nhận gradient. Bias phải là NÚM CHỈNH BIÊN, không phải biến
+quyết định — clamp ±0.5 cho nó đủ sức lật hạng 4 ↔ hạng 5, không đủ sức lật
+hạng 4 ↔ hạng 10. Xem `RouterNet.update_bias`.
 
-LỊCH DECAY CHO σ VÀ γ TRONG n STEP ĐẦU. Hai hằng số điều phối ở trên đều
-được nội suy theo hàm MŨ từ một giá trị ĐẦU lớn về giá trị CUỐI nhỏ trong
-`decay_steps` step đầu tiên, rồi giữ nguyên:
+LỊCH DECAY CHO σ VÀ γ. Giữ nguyên cơ chế (nội suy MŨ từ giá trị đầu về giá
+trị cuối trong `decay_steps` step đầu), nhưng đổi hẳn cách dùng:
 
-    γ(t) = γ_start · (γ_end / γ_start)^(t/n)      t = step, n = decay_steps
-    σ(t) = σ_start · (σ_end / σ_start)^(t/n)
+  * γ_start = 1.0 là thứ đã phá lần chạy trước. Với `bias_clip` thì γ lớn chỉ
+    làm bias đập vào trần nhanh hơn — vô nghĩa. Mặc định mới: TẮT lịch cho γ
+    (`bias_gamma_start = None`), dùng thẳng γ = 1e-3 từ step 0.
+  * σ thì NGƯỢC LẠI: nó là cơ chế khám phá DUY NHẤT còn per-sample (bias là
+    toàn cục, dịch đều mọi mẫu trong batch). σ tụt về 1e-3 nghĩa là tuyến
+    đường đóng băng. Mặc định mới: 1.0 → 0.5, và không bao giờ xuống dưới
+    ~0.3.
 
-Lý do cho γ: γ = 1e-3 là giá trị đúng cho trạng thái ỔN ĐỊNH, nhưng ở vài
-trăm step đầu nó quá chậm. Route head khởi tạo ngẫu nhiên, và một cú Gumbel
-đủ lớn có thể đẩy CÙNG một expert vào top-k liên tiếp vài chục step; expert
-đó nhận hết gradient, khá lên thật, rồi route_logit của nó tách hẳn khỏi
-nhóm. Với γ = 1e-3 thì bias cần ~2000 step mới bò được một khoảng bằng dải
-route_logit — quá muộn, router đã sập rồi. γ_start = 1.0 nghĩa là bias nắn
-NGAY trong một step: expert nào vừa ăn quá phần của nó thì step sau gần như
-chắc chắn bị đẩy ra khỏi top-k. Cửa vào bị ép mở đều cho tới khi mọi expert
-đều có ít nhất vài chục step gradient, sau đó γ tụt về 1e-3 và cơ chế trở
-lại đúng vai trò cân bằng nhẹ của DeepSeek-V3.
+Bất đẳng thức cần giữ suốt buổi train:  bias_span ≪ σ ≲ std(route_logit).
 
-Lý do cho σ: nhiễu Gumbel cần THẬT ở đầu (không có nó thì tuyến đường bị
-khoá từ step 1) và cần TẮT ở cuối (khi expert đã phân hoá, đảo tuyến chỉ còn
-là nhiễu vào delta của decoder). Đây là anneal khám phá → khai thác quen
-thuộc, viết trên cùng một đường cong mũ với γ.
-
-Dùng thang MŨ chứ không tuyến tính vì tỉ lệ đầu/cuối là 1000×: trên thang
-tuyến tính thì 90% quãng đường nằm ở vùng γ > 0.1 (vô dụng vì đã bão hoà) và
-vùng thật sự đáng quan tâm 1e-2 → 1e-3 bị nén vào 1% cuối. Thang mũ chia đều
-theo BẬC: γ qua 0.1 ở t = n/3, qua 0.01 ở t = 2n/3.
-
-`*_start = None` -> TẮT lịch, dùng thẳng giá trị cuối từ step 0 (hành vi cũ).
-Xem `decay_value` và `RouterNet.set_decay_step`.
+`python -m src.router` in bảng tham số và chạy selftest — không cần GPU,
+không cần mạng (backbone dựng với trọng số ngẫu nhiên khi `weights=None`).
 """
 from __future__ import annotations
 
@@ -81,14 +103,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 D_MODEL = 512          # chiều làm việc của cả nhánh router
-D_ENC = 2560           # chiều hidden của Gemma3-4b (đầu ra encoder)
+D_BACKBONE = 1024      # số kênh ra của DenseNet-121 features
+GRID = 7               # 224 / 32 — lưới đặc trưng của backbone
+N_TOKEN = GRID * GRID   # 49 token vào MQA
+IMG_SIZE = 224         # cỡ vào của backbone res224
 N_DISEASE = 14         # §1.4 — 14 finding
-# 4 aspect (blank/positive/negative/uncertain) của CheXbert vẫn là hình dạng
-# NHÃN GỐC trong labels.npz, nhưng sup_head KHÔNG còn đoán chúng: nhãn được
-# gập về một trục nhị phân có mask trước khi vào loss (src/losses.py). Hằng
-# số giữ lại vì probe vẫn chiếu Δlogit lên 4 tên aspect đó.
+# 4 aspect của CheXbert vẫn là hình dạng NHÃN GỐC trong labels.npz, nhưng
+# sup_head KHÔNG đoán chúng: nhãn được gập về một trục nhị phân có mask trước
+# khi vào loss (src/losses.py). Hằng số giữ lại vì probe vẫn chiếu Δlogit lên
+# 4 tên aspect đó.
 N_ASPECT = 4
 N_QUERY = 2            # Separation tách thành 2 vector: supervised + route
+
+# Trọng số backbone mặc định — DenseNet-121 pretrain trên MIMIC-CXR.
+# `None` = dựng kiến trúc với trọng số ngẫu nhiên (chỉ dùng cho selftest
+# offline; train thật mà rơi vào nhánh này thì mất sạch lợi thế pretrain, nên
+# `RouterNet` cảnh báo to khi weights=None).
+CXR_WEIGHTS = "densenet121-res224-mimic_ch"
+
+# "3 tầng gần input nhất" của DenseNet = stem + denseblock1 + denseblock2
+# (kèm transition của chúng). Đây là vùng học cạnh/texture — thứ chuyển từ
+# ảnh tự nhiên sang X-quang gần như không cần sửa. block3/block4 mới là chỗ
+# đặc trưng trở nên đặc thù bệnh lý, nên hai cái đó học tiếp.
+FROZEN_STAGES = ("conv0", "norm0", "relu0", "pool0",
+                 "denseblock1", "transition1", "denseblock2", "transition2")
 
 
 # ══════════════════════════════ khối cơ bản ══════════════════════════════════
@@ -106,32 +144,20 @@ class RMSNorm(nn.Module):
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return (x * self.weight.float()).to(dtype)
 
-
-def _attn_bias(mask, dtype):
-    """[B, N] 1=giữ, 0=bỏ  ->  bias [B, 1, 1, N] cộng vào logit attention.
-
-    Dùng bias (-inf ở chỗ bỏ) thay vì bool mask: SDPA nhận cả hai, nhưng bias
-    cho phép cộng dồn nhiều loại mask sau này mà không phải đổi kiểu.
-    """
-    if mask is None:
-        return None
-    neg = torch.finfo(dtype).min
-    return (1.0 - mask[:, None, None, :].to(dtype)) * neg
-
-
 class GroupedAttention(nn.Module):
     """Self/cross attention với n_group KV-head dùng chung cho n_head Q-head.
 
+    n_group = 1       -> MQA  (mặc định của nhánh này)
     n_group = n_head  -> MHA
-    n_group = 1       -> MQA
-    1 < n_group < n_head -> GQA (G-BRMF: 4 | Separation: 4)
+    1 < n_group < n_head -> GQA
 
     KV-head được nhân bản (repeat_interleave) lên đủ n_head trước khi vào SDPA.
     Nhân bản KHÔNG thêm tham số — tiết kiệm nằm ở W_K, W_V nhỏ đi n_head/n_group
-    lần, đúng như bảng tham số trong tài liệu.
+    lần. Với chuỗi 49 token thì MQA gần như không mất gì so với MHA: bottleneck
+    ở đây là chiều kênh, không phải băng thông KV cache.
     """
 
-    def __init__(self, dim=D_MODEL, n_head=8, n_group=8):
+    def __init__(self, dim=D_MODEL, n_head=8, n_group=1):
         super().__init__()
         assert dim % n_head == 0 and n_head % n_group == 0
         self.n_head, self.n_group = n_head, n_group
@@ -143,7 +169,11 @@ class GroupedAttention(nn.Module):
         self.v_proj = nn.Linear(dim, kv_dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x, kv=None, mask=None):
+    @staticmethod
+    def n_params(dim=D_MODEL, n_head=8, n_group=1):
+        return 2 * dim * dim + 2 * dim * (n_group * (dim // n_head))
+
+    def forward(self, x, kv=None):
         kv = x if kv is None else kv
         B, Tq, _ = x.shape
         Tk = kv.shape[1]
@@ -153,27 +183,27 @@ class GroupedAttention(nn.Module):
         if self.rep > 1:
             k = k.repeat_interleave(self.rep, dim=1)
             v = v.repeat_interleave(self.rep, dim=1)
-        # is_causal=False: router nhìn TOÀN BỘ prompt+ảnh cùng lúc (nó không
-        # sinh token, chỉ tóm tắt). Che padding/target bằng bias.
-        o = F.scaled_dot_product_attention(q, k, v,
-                                           attn_mask=_attn_bias(mask, q.dtype))
+        # KHÔNG có mask: 49 token đặc trưng đều là ảnh thật, không có padding,
+        # không có nhân quả. Đây là điểm khác nhánh cũ (phải che target/pad).
+        o = F.scaled_dot_product_attention(q, k, v)
         o = o.transpose(1, 2).reshape(B, Tq, -1)
         return self.o_proj(o)
 
 
-# ════════════════════════════ Biến thể Recombinator ══════════════════════════
-class GBRMFBlock(nn.Module):
-    """G-BRMF — Grouped-Query Attn + Bottleneck-ResMLP FFN — 852_992 param.
+class MQABlock(nn.Module):
+    """MQA (8 head / 1 KV-group) + FFN 512→1024→512 — 1_639_424 param.
 
-        x → RMSNorm → GQAttn (8 head / 4 KV-group) ──(+skip)──►
-          → RMSNorm → 512→64 → GeLU → 64→512 → GeLU ──(+skip)──►
+        x → RMSNorm → MQA ──(+skip)──►
+          → RMSNorm → 512→1024 → GeLU → 1024→512 ──(+skip)──►
 
-    Attention trộn token với 4 KV-head (cùng số group với Separation), FFN
-    thắt cổ chai 512→64→512 nên phần lớn tham số nằm ở attention.
+    Khác block cũ (g-brmf) ở hai chỗ: KV chỉ còn 1 group thay vì 4, và FFN
+    KHÔNG còn thắt cổ chai 512→64. Cổ chai 64 chiều hợp lý khi đầu vào là
+    ~1000 token hidden state đã rất giàu; ở đây đầu vào chỉ 49 token nên phần
+    trộn kênh phải gánh nhiều hơn.
     """
-    PARAMS = 852_992
+    PARAMS = 1_639_424
 
-    def __init__(self, dim=D_MODEL, n_head=8, n_group=4, hidden=64):
+    def __init__(self, dim=D_MODEL, n_head=8, n_group=1, hidden=1024):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = GroupedAttention(dim, n_head=n_head, n_group=n_group)
@@ -181,72 +211,157 @@ class GBRMFBlock(nn.Module):
         self.fc1 = nn.Linear(dim, hidden, bias=False)
         self.fc2 = nn.Linear(hidden, dim, bias=False)
 
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.norm1(x), mask=mask)
-        h = self.norm2(x)
-        h = F.gelu(self.fc2(F.gelu(self.fc1(h))))
-        return x + h
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        return x + self.fc2(F.gelu(self.fc1(self.norm2(x))))
 
 
-# Chỉ còn một biến thể. Giữ nguyên dict (và trường `variant` trong config/tag)
-# để đường ống — CLI, tên thư mục ô, resume checkpoint, bảng report — không
-# phải đổi, và để thêm biến thể mới sau này chỉ là thêm một dòng ở đây.
-VARIANT = "g-brmf"
-VARIANTS = {VARIANT: GBRMFBlock}
+# Giữ nguyên dict (và trường `variant` trong config/tag) để đường ống — CLI,
+# tên thư mục ô, resume checkpoint, bảng report — không phải đổi, và để thêm
+# biến thể mới sau này chỉ là thêm một dòng ở đây.
+VARIANT = "dn121-mqa"
+VARIANTS = {VARIANT: MQABlock}
+
+
+# ══════════════════════════════ backbone ảnh ═════════════════════════════════
+class CXRBackbone(nn.Module):
+    """DenseNet-121 pretrain X-quang ngực → [B, 1024, 7, 7].
+
+    Nhận THẲNG `pixel_values` mà processor của Gemma đã tạo, nên không có
+    đường ống ảnh thứ hai nào phải bảo trì và không tốn thêm một lần decode
+    JPEG. Ba phép biến đổi để khớp quy ước torchxrayvision:
+
+      1. gộp 3 kênh RGB → 1 kênh xám. Ảnh MIMIC vốn là xám được nhân bản ra 3
+         kênh, nên phép trung bình lấy lại đúng bản gốc, không mất gì.
+      2. resize 896 → 224 (bilinear + antialias). Backbone là bản res224;
+         đưa 896 vào thì lưới ra 28×28 và mọi thống kê BN lệch thang.
+      3. ×1024. Gemma chuẩn hoá về [-1, 1] (mean .5 / std .5), xrv chuẩn hoá
+         về [-1024, 1024] — đúng cùng một phép affine, chỉ khác hệ số. Sai
+         bước này thì BN đầu tiên nhận đầu vào lệch 3 bậc và đặc trưng
+         pretrain thành vô dụng.
+    """
+
+    def __init__(self, weights=CXR_WEIGHTS, frozen=FROZEN_STAGES,
+                 img_size=IMG_SIZE, log=None):
+        super().__init__()
+        self.features = _build_densenet_features(weights, log=log)
+        self.img_size = int(img_size)
+        self.frozen = tuple(frozen)
+        for name in self.frozen:
+            mod = getattr(self.features, name, None)
+            if mod is None:
+                raise RuntimeError(
+                    f"backbone không có tầng '{name}' — danh sách đóng băng "
+                    f"không khớp kiến trúc (có: "
+                    f"{[n for n, _ in self.features.named_children()]})")
+            mod.requires_grad_(False)
+        self.train(False)
+
+    def train(self, mode=True):
+        """Ghim MỌI BatchNorm ở eval, kể cả khi cả model đang train.
+
+        Xem phần BATCHNORM ĐÓNG BĂNG trong docstring module: đây không phải
+        tối ưu vi mô mà là điều kiện để gate của một ảnh không phụ thuộc các
+        ảnh khác trong micro-batch, và để SWA còn hợp lệ.
+        """
+        super().train(mode)
+        for m in self.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
+        return self
+
+    def n_frozen(self):
+        return sum(p.numel() for p in self.parameters() if not p.requires_grad)
+
+    def forward(self, pixel_values):
+        x = pixel_values
+        if x.dim() != 4:
+            raise RuntimeError(
+                f"router cần pixel_values [B,C,H,W], nhận {tuple(x.shape)}. "
+                f"Nhánh router giờ đọc ẢNH, không đọc hidden state nữa — "
+                f"RouterBridge phải truyền pixels vào begin().")
+        x = x.float()
+        if x.shape[1] > 1:
+            x = x.mean(dim=1, keepdim=True)
+        if x.shape[-1] != self.img_size or x.shape[-2] != self.img_size:
+            x = F.interpolate(x, size=(self.img_size, self.img_size),
+                              mode="bilinear", align_corners=False,
+                              antialias=True)
+        h = self.features(x * 1024.0)
+        return F.relu(h, inplace=True)
+
+
+def _build_densenet_features(weights, log=None):
+    """`nn.Sequential` features của DenseNet-121, ưu tiên trọng số CXR.
+
+    weights=None -> torchvision densenet121 chưa train. CHỈ dùng cho selftest
+    offline: cả giá trị của nhánh này nằm ở chỗ backbone đã biết đọc X-quang
+    từ trước, dựng ngẫu nhiên là quay lại đúng bài toán cũ (học thị giác từ
+    25k mẫu) chỉ khác kiến trúc.
+    """
+    if weights:
+        try:
+            import torchxrayvision as xrv
+        except ImportError as e:
+            raise ImportError(
+                "cần torchxrayvision cho backbone CXR pretrain — "
+                "`pip install torchxrayvision` (đã thêm vào requirements.txt). "
+                "Muốn chạy offline không trọng số thì đặt "
+                "fixed.router_backbone: null.") from e
+        net = xrv.models.DenseNet(weights=weights)
+        if log:
+            log("router", f"backbone: torchxrayvision {weights} "
+                          f"({sum(p.numel() for p in net.features.parameters())/1e6:.2f}M)")
+        return net.features
+    from torchvision.models import densenet121
+    if log:
+        log("router", "⚠ backbone DenseNet-121 KHÔNG có trọng số pretrain "
+                      "(router_backbone=null) — chỉ hợp lệ cho selftest")
+    feats = densenet121(weights=None).features
+    # torchvision dựng conv0 cho ảnh RGB; bản xrv nhận 1 kênh. Đổi lại cho
+    # khớp để hai đường (có/không trọng số) giống nhau đến từng tham số —
+    # nếu không thì selftest đếm ra một con số còn lúc train thật ra con số
+    # khác, và bảng §5 sai 6_272 param mà không ai biết vì sao.
+    feats.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3,
+                            bias=False)
+    return feats
 
 
 # ══════════════════════════════ các tầng còn lại ═════════════════════════════
-class Stem(nn.Module):
-    """[N, 2560] → [N, 512] — 1_575_936 param.
-
-    Hai lần (norm → linear → GeLU): lần đầu hạ chiều, lần sau trộn lại trong
-    không gian 512 để Recombinator không phải nhận thẳng phép chiếu thô.
-    """
-    PARAMS = 1_575_936
-
-    def __init__(self, d_in=D_ENC, dim=D_MODEL):
-        super().__init__()
-        self.norm1 = RMSNorm(d_in)
-        self.proj = nn.Linear(d_in, dim, bias=False)
-        self.norm2 = RMSNorm(dim)
-        self.fc = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x):
-        h = F.gelu(self.proj(self.norm1(x)))
-        return F.gelu(self.fc(self.norm2(h)))
-
-
 class SeparationProjector(nn.Module):
-    """Attention pooling (Q-Former) [N, 512] → [2, 512] — 787_968 param.
+    """Attention pooling (Q-Former) [B, 49, 512] → [B, 2, 512] — 591_360 param.
 
-    2 learnable query hút thông tin từ toàn chuỗi qua GQA (8 head / 4 group),
-    cộng skip từ chính query rồi RMSNorm, sau đó tách đôi:
+    2 learnable query hút thông tin từ 49 token qua MQA, cộng skip từ chính
+    query rồi RMSNorm, sau đó tách đôi:
         vector 0 → Supervised head
         vector 1 → Route head
     Pooling bằng attention thay vì mean-pool: hai nhánh cần hai bản tóm tắt
-    KHÁC nhau của cùng chuỗi (bệnh gì / nên gọi expert nào).
+    KHÁC nhau của cùng một ảnh (bệnh gì / nên gọi expert nào). Mean-pool ép
+    chúng dùng chung một bản.
     """
-    PARAMS = 787_968
+    PARAMS = 591_360
 
-    def __init__(self, dim=D_MODEL, n_head=8, n_group=4, n_query=N_QUERY):
+    def __init__(self, dim=D_MODEL, n_head=8, n_group=1, n_query=N_QUERY):
         super().__init__()
         self.query = nn.Parameter(torch.randn(n_query, dim) * 0.02)
         self.attn = GroupedAttention(dim, n_head=n_head, n_group=n_group)
         self.norm = RMSNorm(dim)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         q = self.query.unsqueeze(0).expand(x.shape[0], -1, -1).to(x.dtype)
-        return self.norm(q + self.attn(q, kv=x, mask=mask))
+        return self.norm(q + self.attn(q, kv=x))
 
 
 class SupervisedHead(nn.Module):
     """[512] → vec(14) — 134_656 param. MỘT logit mỗi finding, sigmoid.
 
-    Trước đây head này ra 14×4 và softmax theo trục aspect — nó đoán báo cáo
-    NÓI GÌ về từng bệnh (kể cả "không nhắc tới"). Giờ nó đoán đúng câu cần
-    hỏi: bệnh này CÓ hay KHÔNG. Nhãn 4 aspect được gập về một trục nhị phân
-    có mask ở src/losses.py, nên đây là bài toán multi-label 14 chiều và loss
-    là ASL trên sigmoid, không phải softmax.
+    Nhãn 4 aspect được gập về một trục nhị phân có mask ở src/losses.py, nên
+    đây là bài toán multi-label 14 chiều và loss là ASL trên sigmoid.
+
+    Head này giờ ngồi thẳng trên đặc trưng ảnh thay vì trên hidden state của
+    một LM — đúng hình dạng của bài toán nó phải giải (phân loại ảnh), và nó
+    trở thành tín hiệu giám sát TRỰC TIẾP cho backbone + MQA, tức là cho chính
+    biểu diễn mà route head dùng.
     """
     PARAMS = 134_656
 
@@ -285,8 +400,7 @@ def decay_value(start, end, n_steps, step):
     tắt lịch, và cũng là đường mà mọi code cũ (không biết đến lịch) đi qua.
 
     Một trong hai đầu bằng 0 thì thang log không định nghĩa được — rơi về nội
-    suy TUYẾN TÍNH. Trường hợp này chỉ xảy ra khi ai đó cố ý tắt hẳn nhiễu
-    (σ_end = 0), và tuyến tính là hành vi duy nhất hợp lý ở đó.
+    suy TUYẾN TÍNH.
     """
     if start is None or n_steps <= 0:
         return float(end)
@@ -302,8 +416,7 @@ def decay_desc(gamma_start, gamma_end, noise_start, noise_end, n_steps):
 
     Hàm MODULE chứ không chỉ là method: train.py in dòng cấu hình TRƯỚC khi
     build_model() nạp 4B tham số Gemma xuống GPU, nên lúc đó chưa có instance
-    RouterNet nào để hỏi — mà đó lại đúng là lúc người đọc log cần thấy lịch,
-    để Ctrl-C được ngay nếu đặt sai thay vì sau 3 phút nạp weight.
+    RouterNet nào để hỏi — mà đó lại đúng là lúc người đọc log cần thấy lịch.
     """
     if n_steps <= 0 or (gamma_start is None and noise_start is None):
         return f"lịch decay TẮT — γ={gamma_end:g} σ={noise_end:g} cố định"
@@ -320,6 +433,8 @@ def decay_desc(gamma_start, gamma_end, noise_start, noise_end, n_steps):
 class RouterNet(nn.Module):
     """Cả nhánh router. Trả về (sup_logits [B,14], gate_weight, stats).
 
+    forward nhận `pixel_values` [B, 3, H, W] — KHÔNG còn nhận hidden state.
+
     gate_weight [B, E] là vector THƯA: chỉ top-k phần tử khác 0, tổng = 1.
     Nhân trực tiếp vào delta của từng expert trong decoder (xem src/moe.py),
     nên gradient của CE chảy ngược về đây — router học từ chất lượng text sinh
@@ -328,45 +443,47 @@ class RouterNet(nn.Module):
     Ba đường đi tách bạch của cùng một route_logit:
 
       1. GIÁ TRỊ gate  = softmax(route_logit) SẠCH, lấy ở top-k rồi chuẩn hoá
-         lại cho tổng = 1. Đây là đường duy nhất có gradient. Nhiễu và bias
-         KHÔNG được đụng vào nó: gate là "router tin expert này bao nhiêu",
-         mà nhiễu/bias là chuyện điều phối, không phải chuyện niềm tin.
+         lại cho tổng = 1. Đây là đường duy nhất có gradient.
 
-      2. CHỌN top-k     = route_logit + σ·Gumbel (chỉ khi training) + bias.
-         Đây là chỗ duy nhất nhiễu và bias có tác dụng, và cả hai đều nằm
-         ngoài đồ thị autograd (topk vốn không có gradient theo chỉ số).
+      2. CHỌN top-k     = route_logit + σ·Gumbel (chỉ khi training)
+                          + clamp(bias, ±bias_clip)  (chỉ khi training).
+         Cả hai nằm ngoài đồ thị autograd. KHÁC bản cũ ở hai điểm: bias bị
+         CHẶN TRẦN, và bias TẮT khi eval/infer — xem `apply_bias_at_eval`.
 
       3. CẬP NHẬT bias  = đếm tải thật rồi nắn sau mỗi optimizer step, bằng
          quy tắc chứ không bằng gradient (xem `update_bias`).
 
     `route_noise` (σ) bật nhiễu Gumbel: top-k của (logit + Gumbel) đúng bằng
-    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Nó
-    chống overfit TUYẾN ĐƯỜNG: một mẫu ở gần biên quyết định sẽ đi các tuyến
-    khác nhau qua từng epoch, nên expert không kịp học thuộc mẫu và gate không
-    kịp bão hoà về one-hot. σ = 1.0 là lấy mẫu đúng chuẩn (mặc định).
-    eval/infer TẮT hẳn (self.training), nên số đo và text sinh ra tất định.
+    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Đây là
+    cơ chế khám phá DUY NHẤT còn per-sample, nên nó phải sống suốt buổi train
+    (σ_end ≥ ~0.3), không được tắt về 0 như bản cũ.
     """
 
     def __init__(self, variant, n_block, n_expert, top_k, dim=D_MODEL,
-                 d_enc=D_ENC, route_noise=1.0, bias_gamma=1e-3,
+                 d_enc=None, route_noise=0.5, bias_gamma=1e-3,
                  route_noise_start=None, bias_gamma_start=None,
-                 decay_steps=0):
+                 decay_steps=0, bias_clip=0.5, backbone=CXR_WEIGHTS,
+                 img_size=IMG_SIZE, apply_bias_at_eval=False, log=None):
         super().__init__()
         assert variant in VARIANTS, f"variant lạ: {variant} (có: {list(VARIANTS)})"
         assert 1 <= top_k <= n_expert
         assert route_noise >= 0, f"route_noise phải >= 0, nhận {route_noise}"
         assert bias_gamma >= 0, f"bias_gamma phải >= 0, nhận {bias_gamma}"
+        assert bias_clip >= 0, f"bias_clip phải >= 0, nhận {bias_clip}"
         assert decay_steps >= 0, f"decay_steps phải >= 0, nhận {decay_steps}"
         assert route_noise_start is None or route_noise_start >= 0, (
             f"route_noise_start phải >= 0, nhận {route_noise_start}")
         assert bias_gamma_start is None or bias_gamma_start >= 0, (
             f"bias_gamma_start phải >= 0, nhận {bias_gamma_start}")
+        # `d_enc` không còn dùng (router không đọc hidden state của Gemma nữa)
+        # nhưng vẫn nhận để mọi chỗ gọi cũ — model.py, selftest — không phải
+        # đổi cùng lúc với đợt thay kiến trúc này.
         self.variant, self.n_block = variant, n_block
         self.n_expert, self.top_k = n_expert, top_k
+        self.bias_clip = float(bias_clip)
+        self.apply_bias_at_eval = bool(apply_bias_at_eval)
 
-        # ── Lịch decay của σ và γ (xem docstring module + `decay_value`) ────
-        # `route_noise` / `bias_gamma` truyền vào là giá trị CUỐI (sau warmup).
-        # `*_start = None` nghĩa là không có lịch: giá trị cuối dùng từ step 0.
+        # ── Lịch decay của σ và γ ───────────────────────────────────────────
         self.route_noise_end = float(route_noise)
         self.bias_gamma_end = float(bias_gamma)
         self.route_noise_start = (None if route_noise_start is None
@@ -375,12 +492,18 @@ class RouterNet(nn.Module):
                                  else float(bias_gamma_start))
         self.decay_steps = int(decay_steps)
         self.decay_step = 0
-        # Giá trị ĐANG dùng của step hiện tại. Vẫn đúng hai cái tên cũ, nên
-        # forward/update_bias/log/selftest không phải biết là có lịch hay không
-        # — chúng đọc "σ và γ bây giờ là bao nhiêu", đúng như trước.
         self.route_noise = self.bias_gamma = 0.0
         self.set_decay_step(0)
-        self.stem = Stem(d_enc, dim)
+
+        # ── Thân nhánh ──────────────────────────────────────────────────────
+        self.backbone = CXRBackbone(backbone, img_size=img_size, log=log)
+        # "lớp out": 1×1 conv gộp 1024 kênh DenseNet về 512 chiều làm việc.
+        # Conv thay vì Linear chỉ để khỏi permute hai lần — toán học y hệt.
+        self.proj = nn.Conv2d(D_BACKBONE, dim, kernel_size=1, bias=False)
+        # Vị trí là thông tin THẬT ở đây (đáy phổi trái ≠ đỉnh phổi phải), mà
+        # attention thì hoán vị bất biến. 49 vị trí nên nhúng học thẳng, không
+        # cần sin/cos hay RoPE.
+        self.pos = nn.Parameter(torch.randn(N_TOKEN, dim) * 0.02)
         self.blocks = nn.ModuleList(
             [VARIANTS[variant](dim) for _ in range(n_block)])
         self.separation = SeparationProjector(dim)
@@ -388,13 +511,12 @@ class RouterNet(nn.Module):
         self.route_head = RouteHead(n_expert, dim)
 
         # ── Bias cân bằng tải (aux-free) ────────────────────────────────────
-        # BUFFER, không phải Parameter: nó không được optimizer đụng vào và
-        # không có gradient. Nhưng vẫn phải nằm trong state_dict — bỏ nó ra
-        # khỏi checkpoint thì resume xong router mất toàn bộ điều phối đã học
-        # và vài nghìn step đầu lại dồn tải như lúc mới khởi tạo.
+        # BUFFER, không phải Parameter: optimizer không đụng, không gradient.
+        # Nhưng vẫn nằm trong state_dict — bỏ nó khỏi checkpoint thì resume
+        # xong router mất toàn bộ điều phối đã học.
         self.register_buffer("expert_bias", torch.zeros(n_expert))
-        # Bộ đếm tải giữa hai lần cập nhật. persistent=False: nó chỉ sống
-        # trong đúng một optimizer step, lưu vào ckpt là lưu rác.
+        # Bộ đếm tải giữa hai lần cập nhật. persistent=False: chỉ sống trong
+        # đúng một optimizer step, lưu vào ckpt là lưu rác.
         self.register_buffer("load_count", torch.zeros(n_expert),
                              persistent=False)
         self.register_buffer("load_tokens", torch.zeros(()), persistent=False)
@@ -403,9 +525,8 @@ class RouterNet(nn.Module):
     def set_route_noise(self, scale):
         """Đặt TAY cường độ nhiễu. Trả về giá trị cũ.
 
-        Lưu ý: nếu lịch decay đang bật (`route_noise_start` khác None) thì
-        `set_decay_step` ở đầu step sau sẽ ghi đè giá trị đặt tay này. Muốn
-        chốt cứng một σ thì để `route_noise_start = None`.
+        Nếu lịch decay đang bật thì `set_decay_step` ở đầu step sau sẽ ghi đè
+        giá trị đặt tay này.
         """
         old, self.route_noise = self.route_noise, max(float(scale), 0.0)
         return old
@@ -414,15 +535,9 @@ class RouterNet(nn.Module):
     def set_decay_step(self, step):
         """Đặt con trỏ lịch -> tính lại σ và γ cho step này. Trả về (γ, σ).
 
-        Gọi MỘT lần ở ĐẦU mỗi optimizer step, trước forward: σ đi thẳng vào
-        chỗ chọn top-k của micro-batch đầu tiên, còn γ được `update_bias()`
-        dùng ở cuối chính step đó.
-
-        Con trỏ là `step` toàn cục của train.py chứ không phải một bộ đếm nội
-        bộ, có chủ ý: resume từ checkpoint phải vào lại ĐÚNG chỗ trên đường
-        cong. Một bộ đếm nội bộ thì hoặc phải nằm trong state_dict (làm hỏng
-        mọi checkpoint cũ vì thêm khoá lạ), hoặc reset về 0 mỗi lần resume và
-        warmup lại từ đầu — cả hai đều tệ hơn.
+        Gọi MỘT lần ở ĐẦU mỗi optimizer step, trước forward. Con trỏ là `step`
+        toàn cục của train.py chứ không phải bộ đếm nội bộ, có chủ ý: resume
+        từ checkpoint phải vào lại ĐÚNG chỗ trên đường cong.
         """
         self.decay_step = max(int(step), 0)
         self.bias_gamma = decay_value(self.bias_gamma_start,
@@ -444,21 +559,24 @@ class RouterNet(nn.Module):
     def update_bias(self):
         """Nắn bias theo tải đã đếm được. Gọi MỘT lần sau mỗi optimizer step.
 
-        Quy tắc (DeepSeek-V3, "auxiliary-loss-free load balancing"):
-
             c_e     = số mẫu đã chọn expert e kể từ lần cập nhật trước
             c̄      = trung bình = Σc_e / E
             b_e    += γ · sign(c̄ − c_e)
+            b_e     = clamp(b_e − mean(b), ±bias_clip)
 
         Dùng `sign` chứ không dùng độ lệch: bias là một cái NÚM CỬA, không
-        phải một cái lò xo. Lấy độ lệch thì một batch lệch nặng sẽ đẩy bias
-        đi rất xa trong một bước và router dao động qua lại; sign cho mỗi
-        bước đúng γ nên nó bò từ từ về điểm cân bằng và ở lại đó.
+        phải một cái lò xo.
 
-        Trừ trung bình sau mỗi lần cập nhật: chỉ HIỆU giữa các b_e mới có ý
-        nghĩa (top-k không đổi khi cộng cùng một hằng số vào tất cả), nên ghim
-        trung bình về 0 để bias không trôi dần ra vô cực và làm mất thang đo
-        khi so với route_logit.
+        Trừ trung bình: chỉ HIỆU giữa các b_e mới có nghĩa (top-k không đổi
+        khi cộng cùng một hằng số), nên ghim trung bình về 0 để bias không
+        trôi ra vô cực.
+
+        CLAMP là chỗ khác bản cũ. Không có nó, quy tắc trên sẽ đẩy bias tới
+        bất kỳ độ lớn nào cần để cân bằng tải — kể cả khi độ lớn ấy vượt cả
+        dải route_logit và biến top-k thành round-robin. Có trần thì khi tải
+        vẫn lệch dù bias đã chạm trần, thông điệp là "router thật sự chỉ tin
+        vài expert" chứ không phải "hãy ép nó chọn đều" — đọc `bias_sat` trong
+        stats để biết chuyện đó đang xảy ra.
 
         Trả về (bias_span, load_cv) để train.py ghi log, hoặc None khi chưa
         đếm được mẫu nào (eval, hoặc gọi hai lần liên tiếp).
@@ -470,6 +588,8 @@ class RouterNet(nn.Module):
         mean = c.sum() / self.n_expert
         self.expert_bias.add_(self.bias_gamma * torch.sign(mean - c))
         self.expert_bias.sub_(self.expert_bias.mean())
+        if self.bias_clip > 0:
+            self.expert_bias.clamp_(-self.bias_clip, self.bias_clip)
         span = float(self.expert_bias.max() - self.expert_bias.min())
         cv = float(c.std(unbiased=False) / mean.clamp_min(1e-9))
         self.load_count.zero_()
@@ -487,34 +607,49 @@ class RouterNet(nn.Module):
         def n(m):
             return sum(p.numel() for p in m.parameters())
         blocks = n(self.blocks)
+        frozen = self.backbone.n_frozen()
         return {
-            "stem": n(self.stem),
-            f"recombinator/{self.variant}×{self.n_block}": blocks,
+            f"backbone/{'cxr-densenet121'}": n(self.backbone),
+            "  ├ đóng băng": frozen,
+            "  └ học tiếp": n(self.backbone) - frozen,
+            "proj 1024→512 + pos": n(self.proj) + self.pos.numel(),
+            f"mqa×{self.n_block}": blocks,
             "separation": n(self.separation),
             "supervised_head": n(self.sup_head),
             "route_head": n(self.route_head),
             "TOTAL": n(self),
+            "TOTAL trainable": sum(p.numel() for p in self.parameters()
+                                   if p.requires_grad),
             "_per_block": blocks // max(self.n_block, 1),
         }
 
-    def forward(self, hidden, mask=None):
-        """hidden [B, N, 2560] (đã detach), mask [B, N] 1=prompt/ảnh."""
-        h = self.stem(hidden)
+    def forward(self, pixel_values, mask=None):
+        """pixel_values [B, 3, H, W] — ảnh đã qua processor của Gemma.
+
+        `mask` giữ lại trong chữ ký cho tương thích với RouterBridge cũ nhưng
+        KHÔNG dùng: 49 token đặc trưng đều là ảnh thật, không có padding và
+        không có target nào phải che. Che prompt/target là chuyện của nhánh
+        cũ, vốn đọc chuỗi hỗn hợp text+ảnh.
+        """
+        h = self.backbone(pixel_values)                  # [B, 1024, 7, 7]
+        h = self.proj(h)                                 # [B, 512, 7, 7]
+        tok = h.flatten(2).transpose(1, 2)               # [B, 49, 512]
+        tok = tok + self.pos.to(tok.dtype)
         for blk in self.blocks:
-            h = blk(h, mask=mask)
-        pooled = self.separation(h, mask=mask)          # [B, 2, 512]
-        sup_logits = self.sup_head(pooled[:, 0])        # [B, 14]
+            tok = blk(tok)
+        pooled = self.separation(tok)                    # [B, 2, 512]
+        sup_logits = self.sup_head(pooled[:, 0])         # [B, 14]
         route_logits = self.route_head(pooled[:, 1]).float()   # [B, E]
 
         # (1) GIÁ TRỊ gate: softmax SẠCH — đường duy nhất có gradient.
         prob = F.softmax(route_logits, dim=-1)
 
-        # (2) CHỌN top-k: logit + nhiễu (train) + bias cân bằng tải. Cả hai
-        # số hạng này chỉ đổi CỬA VÀO của expert, không đổi trọng số trộn.
+        # (2) CHỌN top-k: logit + nhiễu (train) + bias đã chặn trần.
         score = route_logits
         if self.training and self.route_noise > 0:
             score = score + self.route_noise * gumbel_like(route_logits)
-        score = score + self.expert_bias.to(score.dtype)
+        if self.training or self.apply_bias_at_eval:
+            score = score + self.expert_bias.to(score.dtype)
         topi = torch.topk(score, self.top_k, dim=-1).indices
 
         topv = prob.gather(-1, topi)
@@ -530,20 +665,26 @@ class RouterNet(nn.Module):
                                 torch.ones_like(topi.reshape(-1),
                                                 dtype=counts.dtype))
             # (3) Ghi tải để `update_bias` nắn sau optimizer step. Cộng dồn
-            # qua cả grad_accum micro-batch: bias phải phản ứng với tải của
-            # MỘT lần cập nhật trọng số, không phải của một micro-batch.
+            # qua cả grad_accum micro-batch.
             if self.training and self.bias_gamma > 0:
                 self.load_count.add_(counts.to(self.load_count.dtype))
                 self.load_tokens.add_(float(prob.shape[0]))
+            B = route_logits.shape[0]
+            # ── Số đo chẩn đoán quan trọng nhất của nhánh này ───────────────
+            # `logit_std_sample` = route_logit đổi bao nhiêu GIỮA CÁC ẢNH;
+            # `logit_std_expert` = đổi bao nhiêu giữa các expert.
+            # Tỉ lệ hai cái là câu trả lời cho "router có nhìn ảnh không".
+            # Nhánh cũ đo được ≤ 0.085 (tức là không). Dưới 0.1 nghĩa là mọi
+            # tinh chỉnh γ/σ đều vô nghĩa — phải sửa chỗ khác.
+            # `pooled_std_sample` tách được lỗi: nếu nó cũng ≈ 0 thì thủ phạm
+            # là backbone/MQA chứ không phải route head.
+            std_s = float(route_logits.std(0).mean()) if B > 1 else 0.0
+            std_e = float(route_logits.std(-1).mean())
             stats = {
                 "expert_share": (counts / counts.sum().clamp_min(1)).tolist(),
-                # Softmax ĐẦY ĐỦ trên E expert, TRƯỚC khi cắt top-k. `gate` ở
-                # trên đã bị top-k làm rỗng E-k ô, nên nó KHÔNG trả lời được
-                # câu "router tin expert nào bao nhiêu" — một expert không lọt
-                # top-k vẫn có thể được router cho 0.08 xác suất, và đó là số
-                # đo duy nhất tồn tại cho expert chưa bao giờ được chọn.
-                # mode=probe ghi vector này vào từng bản ghi để summary có tỉ
-                # lệ đóng góp trung bình của ĐỦ E expert trên n mẫu.
+                # Softmax ĐẦY ĐỦ trên E expert, TRƯỚC khi cắt top-k. `gate`
+                # đã bị top-k làm rỗng E-k ô nên nó KHÔNG trả lời được câu
+                # "router tin expert nào bao nhiêu".
                 "route_prob": prob.mean(0).tolist(),
                 "gate_max": float(topv.max(dim=-1).values.mean()),
                 "route_entropy": float(
@@ -551,6 +692,17 @@ class RouterNet(nn.Module):
                 "balance": float(load_balance_stat(prob, topi, self.n_expert)),
                 "bias_span": float(self.expert_bias.max()
                                    - self.expert_bias.min()),
+                # tỉ lệ expert đang dính trần bias — >0 kéo dài nghĩa là cân
+                # bằng tải đang bị router chống lại, đừng nới trần, hãy hỏi vì
+                # sao router chỉ tin vài expert.
+                "bias_sat": (float((self.expert_bias.abs()
+                                    >= self.bias_clip - 1e-9).float().mean())
+                             if self.bias_clip > 0 else 0.0),
+                "logit_std_sample": std_s,
+                "logit_std_expert": std_e,
+                "logit_std_ratio": (std_s / std_e) if std_e > 1e-9 else 0.0,
+                "pooled_std_sample": (float(pooled[:, 1].std(0).mean())
+                                      if B > 1 else 0.0),
             }
         return sup_logits, gate, stats
 
@@ -559,23 +711,20 @@ def gumbel_like(x, eps=1e-9):
     """Gumbel(0,1) i.i.d. cùng shape/dtype/device với x.
 
     G = -log(-log(U)), U ~ Uniform(0,1). Dùng `clamp_min` hai lần vì U = 0
-    hoặc U = 1 (rand trả về [0,1)) đều cho ±inf, và một cái inf trong logit
-    là top-k khoá cứng vào một expert cho tới hết batch.
+    hoặc U = 1 đều cho ±inf, và một cái inf trong logit là top-k khoá cứng vào
+    một expert cho tới hết batch.
 
     Vì sao Gumbel chứ không phải Gauss: top-k của (logit + Gumbel) đúng bằng
-    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Nghĩa
-    là router không chọn "k đứa điểm cao nhất" mà bốc theo đúng phân phối nó
-    tin, nên expert xếp thứ 5 vẫn thỉnh thoảng được chạy và được nhận
-    gradient, thay vì chết vĩnh viễn vì thua 0.01 logit ở step đầu.
+    LẤY MẪU k expert không lặp từ softmax(logit) — trick Gumbel-top-k. Router
+    không chọn "k đứa điểm cao nhất" mà bốc theo đúng phân phối nó tin, nên
+    expert xếp thứ 5 vẫn thỉnh thoảng được chạy và được nhận gradient.
 
-    Lưu ý về cường độ: hệ số nhân σ trước G tương đương chia logit cho σ, tức
-    NGHỊCH với nhiệt độ. σ = 1.0 là lấy mẫu ĐÚNG CHUẨN — đây là giá trị mặc
-    định phổ thông và là giá trị project này dùng; σ nhỏ → gần top-k xác
-    định; σ lớn → gần như chọn ngẫu nhiên đều.
+    Hệ số nhân σ trước G tương đương chia logit cho σ, tức NGHỊCH với nhiệt
+    độ. σ = 1.0 là lấy mẫu ĐÚNG CHUẨN; σ nhỏ → gần top-k xác định.
     """
     u = torch.rand_like(x).clamp_min(eps)
-    # Ngoặc ở đây KHÔNG thừa: `-torch.log(u).clamp_min(eps)` sẽ clamp trước
-    # rồi mới đổi dấu, ra một số ÂM và log của nó là NaN.
+    # Ngoặc KHÔNG thừa: `-torch.log(u).clamp_min(eps)` clamp trước rồi mới
+    # đổi dấu, ra số ÂM và log của nó là NaN.
     return -torch.log((-torch.log(u)).clamp_min(eps))
 
 
@@ -583,16 +732,14 @@ def gumbel_like(x, eps=1e-9):
 def load_balance_stat(prob, topi, n_expert):
     """CHỈ SỐ cân bằng tải kiểu Switch-Transformer: E · Σ_e f_e · P_e.
 
-    ĐÂY KHÔNG CÒN LÀ LOSS. Không có gradient, không nằm trong Total_Loss —
-    cân bằng tải giờ do bias của router lo (xem `RouterNet.update_bias`).
-    Giữ lại đúng công thức cũ vì nó là cái THƯỚC quen thuộc và so được với
-    các lần chạy trước:
+    ĐÂY KHÔNG PHẢI LOSS. Không gradient, không nằm trong Total_Loss — cân bằng
+    tải do bias của router lo. Giữ đúng công thức cũ vì nó là cái THƯỚC quen
+    thuộc và so được với các lần chạy trước:
 
         f_e = tỉ lệ MẪU thật sự chọn expert e
         P_e = xác suất TRUNG BÌNH router gán cho e
 
     = 1.0 khi mọi expert nhận đều tải, ≫ 1 khi router dồn vào vài expert.
-    Đọc log thấy `balance` bò về 1.0 nghĩa là bias đang làm việc.
     """
     B = prob.shape[0]
     f = torch.zeros(n_expert, device=prob.device, dtype=prob.dtype)
@@ -605,77 +752,223 @@ def load_balance_stat(prob, topi, n_expert):
 
 
 # ═════════════════════════ dự toán tham số (không cần GPU) ═══════════════════
+# DenseNet-121 features: 6_947_584 param, trong đó stem+block1+block2 (đóng
+# băng) 1_423_360 và block3+block4 (học tiếp) 5_524_224. Hằng số hoá để
+# `estimate_params` chạy được mà không phải dựng backbone (nó được gọi trong
+# config.py TRƯỚC khi có torch/torchxrayvision trong tay).
+BACKBONE_PARAMS = 6_947_584
+BACKBONE_FROZEN = 1_423_360
+PROJ_PARAMS = D_BACKBONE * D_MODEL + N_TOKEN * D_MODEL      # 1×1 conv + pos
+
+
 def estimate_params(variant, n_block, n_expert, expert_params=15_910_912):
-    """Bảng §5 — tổng tham số TRAINABLE của một ô sweep."""
-    router = (Stem.PARAMS + VARIANTS[variant].PARAMS * n_block
-              + SeparationProjector.PARAMS + SupervisedHead.PARAMS
-              + RouteHead.n_params(n_expert))
-    return {"router": router, "experts": expert_params * n_expert,
-            "total": router + expert_params * n_expert}
+    """Bảng §5 — tổng tham số của một ô sweep.
+
+    `router` là TỔNG (kể cả backbone đóng băng); `router_trainable` là phần
+    optimizer thật sự cầm.
+    """
+    body = (PROJ_PARAMS + VARIANTS[variant].PARAMS * n_block
+            + SeparationProjector.PARAMS + SupervisedHead.PARAMS
+            + RouteHead.n_params(n_expert))
+    router = BACKBONE_PARAMS + body
+    return {"router": router,
+            "router_trainable": router - BACKBONE_FROZEN,
+            "experts": expert_params * n_expert,
+            "total": router - BACKBONE_FROZEN + expert_params * n_expert}
+
+
+def _fake_cxr(n, size=896):
+    """n "ảnh" giả TRƠN, dải [-1,1] — đúng hình dạng pixel_values của Gemma.
+
+    Nhiễu 7×7 phóng lên bằng nội suy song tuyến: ảnh y tế là tín hiệu tần số
+    thấp, và chỉ có tín hiệu tần số thấp mới sống sót qua phép resize 896→224
+    của backbone. Dùng nhiễu trắng ở đây là tự tạo ra một tập ảnh mà SAU khi
+    resize thì gần như giống hệt nhau — mọi phép đo "router có phân biệt được
+    ảnh không" sẽ trượt vì cái test, không phải vì cái model.
+    """
+    low = torch.randn(n, 1, 7, 7)
+    img = F.interpolate(low, size=(size, size), mode="bilinear",
+                        align_corners=False)
+    return img.clamp(-3, 3).div(3).expand(n, 3, size, size).contiguous()
+
+
+def _calibrate_bn(net, n_batch=5, bs=16):
+    """Nạp thống kê BN bằng vài batch ảnh giả — CHỈ dùng khi backbone=None.
+
+    Trọng số ngẫu nhiên đi kèm running_mean=0 / running_var=1, mà BN ở chế độ
+    eval thì lấy đúng hai con số đó: nó thành phép affine gần như đồng nhất,
+    và qua 121 lớp DenseNet nối chồng thì activation phình lên |mean| ≈ 45,
+    max ≈ 800. Ở thang đó RMSNorm phía sau nuốt gần hết khác biệt giữa các ảnh
+    và mọi phép đo phân biệt đều vô nghĩa — trượt vì cái test chứ không phải
+    vì kiến trúc.
+
+    Trọng số xrv thật thì đi kèm running stats thật, nên hàm này KHÔNG chạy ở
+    đường train. Nó tồn tại để selftest offline nói được điều gì đó đúng.
+    """
+    bns = [m for m in net.backbone.modules()
+           if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    for m in bns:
+        m.train()
+        m.momentum = None          # trung bình cộng dồn, không EMA
+    with torch.no_grad():
+        for _ in range(n_batch):
+            net.backbone(_fake_cxr(bs))
+    for m in bns:
+        m.eval()
+    return net
 
 
 def _selftest():
-    """Đối chiếu tham số THẬT (đếm từ module) với bảng trong tài liệu."""
-    expect_block = {"g-brmf": 852_992}
-    print(f"{'khối':<34}{'đếm được':>12}{'tài liệu':>12}  ")
+    """Đối chiếu tham số THẬT (đếm từ module) với bảng trong tài liệu.
+
+    Chạy offline: backbone dựng bằng torchvision không trọng số, nên không cần
+    mạng. Con số tham số không đổi theo việc có trọng số hay không.
+    """
+    torch.manual_seed(0)
+    E, K, NB = 12, 4, 4
     ok = True
-    for name, cls in VARIANTS.items():
-        got = sum(p.numel() for p in cls().parameters())
-        ok &= got == expect_block[name]
-        print(f"{'Recombinator/' + name:<34}{got:>12,}{expect_block[name]:>12,}"
-              f"  {'✓' if got == expect_block[name] else '✗'}")
-    for label, mod, exp in (("Stem", Stem(), Stem.PARAMS),
-                            ("Separation", SeparationProjector(),
-                             SeparationProjector.PARAMS),
-                            ("Supervised head", SupervisedHead(),
-                             SupervisedHead.PARAMS)):
-        got = sum(p.numel() for p in mod.parameters())
-        ok &= got == exp
-        print(f"{label:<34}{got:>12,}{exp:>12,}  {'✓' if got == exp else '✗'}")
-    for E in (12,):
-        got = sum(p.numel() for p in RouteHead(E).parameters())
-        exp = 131_072 + 256 * E
-        ok &= got == exp
-        print(f"{f'Route head (E={E})':<34}{got:>12,}{exp:>12,}"
-              f"  {'✓' if got == exp else '✗'}")
 
-    print("\nTổng tham số theo ô sweep (E=12 expert QDoRA r8 ≈ 15.9M/expert):")
-    print(f"{'ô':<16}{'router':>12}{'expert':>14}{'tổng':>12}")
-    for variant, blocks in ((VARIANT, (1, 2, 3, 4, 12)),):
-        for n in blocks:
-            e = estimate_params(variant, n, 12)
-            print(f"{variant + '-n' + str(n):<16}{e['router']:>12,}"
-                  f"{e['experts']:>14,}{e['total'] / 1e6:>11.1f}M")
+    def check(name, cond, extra=""):
+        nonlocal ok
+        ok &= bool(cond)
+        print(f"{name:<52}{'✓' if cond else '✗'} {extra}")
 
-    # Bias cân bằng tải: một vòng cập nhật phải kéo expert quá tải xuống.
-    net = RouterNet(VARIANT, 1, 12, 4, bias_gamma=0.01)
+    print(f"{'khối':<40}{'đếm được':>12}{'tài liệu':>12}  ")
+    got = sum(p.numel() for p in MQABlock().parameters())
+    check_row = f"{'MQA block':<40}{got:>12,}{MQABlock.PARAMS:>12,}"
+    print(check_row + f"  {'✓' if got == MQABlock.PARAMS else '✗'}")
+    ok &= got == MQABlock.PARAMS
+    got = sum(p.numel() for p in SeparationProjector().parameters())
+    print(f"{'Separation (MQA 2 query)':<40}{got:>12,}"
+          f"{SeparationProjector.PARAMS:>12,}"
+          f"  {'✓' if got == SeparationProjector.PARAMS else '✗'}")
+    ok &= got == SeparationProjector.PARAMS
+    got = sum(p.numel() for p in SupervisedHead().parameters())
+    print(f"{'Supervised head':<40}{got:>12,}{SupervisedHead.PARAMS:>12,}"
+          f"  {'✓' if got == SupervisedHead.PARAMS else '✗'}")
+    ok &= got == SupervisedHead.PARAMS
+
+    net = RouterNet(VARIANT, NB, E, K, backbone=None, route_noise=0.0)
+    print()
+    for k, v in net.param_table().items():
+        if not k.startswith("_"):
+            print(f"  {k:<38}{v:>12,}")
+    est = estimate_params(VARIANT, NB, E)
+    check("estimate_params khớp module thật",
+          est["router"] == sum(p.numel() for p in net.parameters()),
+          f"({est['router']:,} vs "
+          f"{sum(p.numel() for p in net.parameters()):,})")
+    check("phần đóng băng khớp hằng số",
+          net.backbone.n_frozen() == BACKBONE_FROZEN,
+          f"({net.backbone.n_frozen():,})")
+
+    # ── hình dạng + đường đi ────────────────────────────────────────────────
+    # Ảnh thử là nhiễu TẦN SỐ THẤP (7×7 phóng lên 896) chứ không phải nhiễu
+    # trắng: X-quang là ảnh trơn, còn nhiễu trắng thì phép resize 896→224 bình
+    # quân hoá gần hết và mọi "ảnh" hoá ra giống nhau — test sẽ trượt vì lý do
+    # của chính nó chứ không phải vì kiến trúc.
+    x = _fake_cxr(8)
+    net.eval()
+    _calibrate_bn(net)          # backbone=None -> BN chưa có thống kê nào
+    sup, gate, st = net(x)
+    check("forward nhận pixel_values [B,3,896,896]",
+          sup.shape == (8, N_DISEASE) and gate.shape == (8, E))
+    check("gate thưa đúng top-k, tổng = 1",
+          int((gate > 0).sum(-1).float().mean()) == K
+          and torch.allclose(gate.sum(-1), torch.ones(8), atol=1e-5))
+    check("stats có số đo chẩn đoán mới",
+          {"logit_std_ratio", "pooled_std_sample", "bias_sat"} <= set(st))
+
+    # ── router PHẢI phân biệt được ảnh khác nhau ────────────────────────────
+    # Đây là số đo mà nhánh cũ trượt (≤0.085). Với ảnh ngẫu nhiên thì đây chỉ
+    # là chặn TRÊN — ảnh X-quang thật giống nhau hơn nhiễu nhiều — nhưng nếu
+    # trượt ở đây thì kiến trúc hỏng, không cần bàn tới dữ liệu thật.
+    check("route_logit đổi theo ảnh (ratio > 0.1)",
+          st["logit_std_ratio"] > 0.1,
+          f"ratio={st['logit_std_ratio']:.3f} "
+          f"(sample {st['logit_std_sample']:.3f} / "
+          f"expert {st['logit_std_expert']:.3f})")
+
+    # ── BatchNorm phải đứng yên kể cả khi .train() ──────────────────────────
     net.train()
-    net.load_count[3] = 100.0
-    net.load_tokens += 100.0
-    net.update_bias()
-    bias_ok = float(net.expert_bias[3]) < float(net.expert_bias[0])
-    ok &= bias_ok
-    print(f"\nbias aux-free: expert quá tải bị hạ bias  "
-          f"{'✓' if bias_ok else '✗'} "
-          f"(b[3]={float(net.expert_bias[3]):+.4f} vs "
-          f"b[0]={float(net.expert_bias[0]):+.4f})")
-    mean_ok = abs(float(net.expert_bias.mean())) < 1e-6
-    ok &= mean_ok
-    print(f"bias trung bình ghim về 0                  "
-          f"{'✓' if mean_ok else '✗'}")
+    bns = [m for m in net.backbone.modules()
+           if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    check("mọi BatchNorm bị ghim eval khi net.train()",
+          len(bns) > 0 and all(not m.training for m in bns),
+          f"({len(bns)} lớp BN)")
+    before = [m.running_mean.clone() for m in bns[:5]]
+    net(_fake_cxr(2))
+    check("running stats KHÔNG đổi sau forward lúc train",
+          all(torch.equal(a, m.running_mean) for a, m in zip(before, bns[:5])))
 
-    # Lịch decay: γ đi từ 1.0 về 1e-3 theo BẬC (mũ), không phải tuyến tính.
-    sch = RouterNet(VARIANT, 1, 12, 4, route_noise=1e-3, bias_gamma=1e-3,
-                    route_noise_start=1.0, bias_gamma_start=1.0,
-                    decay_steps=900)
+    # ── train/eval cho cùng một gate khi σ = 0 ──────────────────────────────
+    net.eval()
+    g1 = net(x)[1]
+    net.train()
+    net.set_route_noise(0.0)
+    g2 = net(x)[1]
+    check("σ=0 -> gate train == gate eval (không có BN làm lệch)",
+          torch.allclose(g1, g2, atol=1e-5))
+
+    # ── đóng băng đúng chỗ ──────────────────────────────────────────────────
+    frozen_named = [n for n, p in net.backbone.named_parameters()
+                    if not p.requires_grad]
+    check("chỉ stem/block1/block2 bị đóng băng",
+          all(any(s in n for s in FROZEN_STAGES) for n in frozen_named)
+          and any("denseblock3" in n for n, p in
+                  net.backbone.named_parameters() if p.requires_grad))
+
+    # ── bias: quy tắc + trần ────────────────────────────────────────────────
+    b = RouterNet(VARIANT, 1, E, K, backbone=None, bias_gamma=0.01,
+                  bias_clip=0.5)
+    b.train()
+    b.load_count[3] = 100.0
+    b.load_tokens += 100.0
+    b.update_bias()
+    check("bias: expert quá tải bị hạ",
+          float(b.expert_bias[3]) < float(b.expert_bias[0]),
+          f"(b3={float(b.expert_bias[3]):+.4f} b0={float(b.expert_bias[0]):+.4f})")
+    check("bias: trung bình ghim về 0", abs(float(b.expert_bias.mean())) < 1e-6)
+    for _ in range(500):                      # ép nó chạy hết cỡ
+        b.load_count[3] = 100.0
+        b.load_tokens += 100.0
+        b.update_bias()
+    check("bias: KHÔNG vượt trần dù nắn 500 lần",
+          float(b.expert_bias.abs().max()) <= 0.5 + 1e-6,
+          f"(|b|max={float(b.expert_bias.abs().max()):.4f}, "
+          f"span={float(b.expert_bias.max()-b.expert_bias.min()):.4f})")
+
+    # ── bias TẮT khi eval ───────────────────────────────────────────────────
+    xb = _fake_cxr(4)
+    b.eval()
+    b.reset_bias()
+    g_nobias = b(xb)[1]
+    # Bias to hết cỡ ở hai expert: nếu eval có cộng bias thì tập chọn phải đổi.
+    b.expert_bias[:] = torch.linspace(-0.5, 0.5, E)
+    check("apply_bias_at_eval=False -> eval BỎ QUA bias",
+          torch.equal(g_nobias, b(xb)[1]))
+    b.apply_bias_at_eval = True
+    check("apply_bias_at_eval=True  -> eval CÓ cộng bias",
+          not torch.equal(g_nobias, b(xb)[1]))
+
+    # ── lịch decay ──────────────────────────────────────────────────────────
+    sch = RouterNet(VARIANT, 1, E, K, backbone=None, route_noise=1e-3,
+                    bias_gamma=1e-3, route_noise_start=1.0,
+                    bias_gamma_start=1.0, decay_steps=900)
     pts = [(t, sch.set_decay_step(t)[0]) for t in (0, 300, 600, 900, 5000)]
     want = (1.0, 0.1, 0.01, 1e-3, 1e-3)
-    dec_ok = all(abs(g - w) < 1e-6 * max(w, 1e-3) + 1e-9
-                 for (_, g), w in zip(pts, want))
-    ok &= dec_ok
-    print(f"lịch decay mũ 1→1e-3 qua đúng từng bậc     "
-          f"{'✓' if dec_ok else '✗'} "
-          + " ".join(f"t={t}:{g:.4g}" for t, g in pts))
+    check("lịch decay mũ 1→1e-3 qua đúng từng bậc",
+          all(abs(g - w) < 1e-6 * max(w, 1e-3) + 1e-9
+              for (_, g), w in zip(pts, want)),
+          " ".join(f"t={t}:{g:.4g}" for t, g in pts))
+
+    print("\nTổng tham số theo ô sweep (E=12 expert QDoRA r8 ≈ 15.9M/expert):")
+    print(f"{'ô':<16}{'router':>12}{'router train':>14}{'expert':>14}{'tổng':>12}")
+    for n in (1, 2, 4, 8, 12):
+        e = estimate_params(VARIANT, n, 12)
+        print(f"{VARIANT + '-n' + str(n):<16}{e['router']:>12,}"
+              f"{e['router_trainable']:>14,}{e['experts']:>14,}"
+              f"{e['total'] / 1e6:>11.1f}M")
 
     print("\n" + ("✓ khớp tài liệu" if ok else "✗ LỆCH tài liệu — xem lại"))
     return 0 if ok else 1

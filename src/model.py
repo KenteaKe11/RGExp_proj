@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from . import moe
 from .config import adapter_desc, variant_desc
-from .router import RouterNet
+from .router import CXR_WEIGHTS, RouterNet
 
 _BF16_OK = None
 
@@ -125,6 +125,11 @@ class RouterBridge:
         self.mode = "off"
         self.mask = None          # [B, N] 1 = prompt/ảnh, 0 = target/padding
         self.hidden = None        # chỉ dùng ở chế độ "capture"
+        # Đầu vào THẬT của router kể từ đợt thay kiến trúc: ảnh, không
+        # phải hidden state của Gemma (xem src/router.py). Nhận ở begin()
+        # chứ không móc ra từ hook, vì ở đầu decoder thì pixel_values đã
+        # bị nuốt vào inputs_embeds từ lâu.
+        self.pixels = None        # [B, 3, H, W]
         self.out = None           # (sup_logits, gate, stats) ở "route"
         # Ép gate đi vào MoE (chỉ mode=probe / src/probe.py dùng). `self.out` vẫn
         # giữ gate THẬT router tính ra — ép cái đi vào expert, không ép cái
@@ -135,13 +140,15 @@ class RouterBridge:
         self.n_calls = 0
 
     # ── vòng đời một batch ──────────────────────────────────────────────────
-    def begin(self, mode, mask=None):
+    def begin(self, mode, mask=None, pixels=None):
         self.mode, self.mask, self.hidden, self.out = mode, mask, None, None
+        self.pixels = pixels
         self.force_gate = None
         moe.CTX.clear()
 
     def end(self):
         self.mode, self.mask, self.hidden = "off", None, None
+        self.pixels = None
         self.force_gate = None
         moe.CTX.clear()
 
@@ -173,15 +180,22 @@ class RouterBridge:
         # bước decode sau chỉ có 1 token mới và PHẢI dùng đúng gate đã chọn cho
         # câu đó, nếu không mỗi token lại rơi vào một expert khác.
         if hidden.shape[1] > 1 or moe.CTX.weights is None:
-            self.run(hidden.detach())
+            self.run()
         return None
 
-    def run(self, hidden):
-        mask = self.mask
-        if mask is not None and mask.shape[1] != hidden.shape[1]:
+    def run(self, pixels=None):
+        """Chạy router trên ẢNH của batch hiện tại, đặt gate vào moe.CTX.
+
+        `pixels` để trống -> lấy cái begin() đã nhận. Truyền tay chỉ dùng
+        trong selftest.
+        """
+        px = self.pixels if pixels is None else pixels
+        if px is None:
             raise RuntimeError(
-                f"router_mask dài {mask.shape[1]} nhưng chuỗi dài "
-                f"{hidden.shape[1]} — quên cắt mask khi cắt chuỗi?")
+                "router cần pixel_values nhưng begin() không nhận được. "
+                "Nhánh router đọc ẢNH chứ không đọc hidden state của Gemma "
+                "nữa (xem src/router.py) — sửa chỗ gọi thành "
+                "bridge.begin('route', mask=..., pixels=core['pixel_values']).")
         # bf16 CHỈ khi GPU có thật. Trên T4 (sm75) hai lựa chọn còn lại đều
         # tệ: autocast bf16 là đường mô phỏng, còn autocast fp16 thì
         # `_attn_bias` trong router dùng finfo(fp16).min = -65504 làm mask —
@@ -189,10 +203,10 @@ class RouterBridge:
         # MB param nên chạy thẳng fp32 vừa rẻ vừa không có bẫy nào.
         if bf16_ok():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                sup_logits, gate, stats = self.router(hidden, mask)
+                sup_logits, gate, stats = self.router(px)
         else:
             p_dtype = next(self.router.parameters()).dtype
-            sup_logits, gate, stats = self.router(hidden.to(p_dtype), mask)
+            sup_logits, gate, stats = self.router(px.to(p_dtype))
         # 3 phần tử, KHÔNG còn aux: cân bằng tải do bias của router lo, nằm
         # ngoài loss (xem src/router.py::RouterNet.update_bias).
         self.out = (sup_logits.float(), gate, stats)
@@ -380,7 +394,13 @@ def build_model(cfg, hf_token, log):
                        bias_gamma=bias_gamma,
                        route_noise_start=(None if ns is None else float(ns)),
                        bias_gamma_start=(None if gs is None else float(gs)),
-                       decay_steps=decay_steps).to("cuda", f.trainable_dtype)
+                       decay_steps=decay_steps,
+                       bias_clip=float(getattr(f, "bias_clip", 0.5) or 0.0),
+                       backbone=getattr(f, "router_backbone", CXR_WEIGHTS),
+                       img_size=int(getattr(f, "router_img_size", 224)),
+                       apply_bias_at_eval=bool(
+                           getattr(f, "router_bias_at_eval", False)),
+                       log=log).to("cuda", f.trainable_dtype)
     bridge = RouterBridge(router, log)
     bridge.attach(find_text_decoder(model, log))
 

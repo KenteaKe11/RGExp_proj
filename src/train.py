@@ -294,7 +294,8 @@ def main(argv=None):
         tensor gate của step này). Chỗ gọi end() là ngay SAU loss.backward().
         """
         core, extra = split_batch(batch)
-        bridge.begin("route", mask=extra["router_mask"])
+        bridge.begin("route", mask=extra["router_mask"],
+                     pixels=core.get("pixel_values"))
         ce = ce_loss(model, core, f.label_smoothing)
         if bridge.out is None:
             # Hook không chạy = expert bị bỏ qua và cả nhánh router thành đồ
@@ -1229,7 +1230,8 @@ def main(argv=None):
                          f"chuỗi vào {in_len} token")
         # Lúc infer KHÔNG có target trong chuỗi, nên router_mask = attention
         # mask: router thấy đúng thứ nó thấy lúc train (prompt + ảnh).
-        bridge.begin("route", mask=inputs["attention_mask"])
+        bridge.begin("route", mask=inputs["attention_mask"],
+                     pixels=inputs.get("pixel_values"))
         try:
             out = model.generate(
                 **inputs, max_new_tokens=r.max_new_tokens,
