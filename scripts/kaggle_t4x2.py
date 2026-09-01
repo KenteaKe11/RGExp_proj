@@ -132,6 +132,11 @@ EVAL_EVERY    = 10        # step giữa hai lần val
 EVAL_BATCHES  = 10
 SAVE_EVERY_N_VALS = 1     # 1 lần val = 1 ckpt. Tăng lên nếu push Hub quá chậm.
 SAVE_BEST     = True      # giữ riêng bản ckpt tại val tốt nhất (không push).
+HUB_KEEP_REVISIONS = 7    # giữ tối đa 7 revision trên repo ckpt; tới bản thứ 8
+                          # thì gộp lịch sử còn 1 commit. HF tính quota theo
+                          # MỌI blob LFS trong lịch sử, nên ghi đè last/ không
+                          # trả lại byte nào — không gộp thì repo phình tới
+                          # hạn mức và push bị từ chối. 0 = tắt.
                           # KHÔNG còn dừng sớm — lịch train không có đích thì
                           # "không cải thiện 3 lần" không kết thúc được gì.
 
@@ -489,6 +494,7 @@ cfg["run"]["hub_sync"] = HUB_SYNC
 cfg["run"]["hub_include_optimizer"] = HUB_INCLUDE_OPTIMIZER
 cfg["run"]["hub_include_swa"] = HUB_INCLUDE_SWA
 cfg["run"]["push_every_n_saves"] = PUSH_EVERY_N_SAVES
+cfg["run"]["hub_keep_revisions"] = HUB_KEEP_REVISIONS
 
 # ── 4c. Logic training (chỉ ghi đè khi khác None) ───────────────────────────
 for _key, _val, _where in (("w_sup", W_SUP, "run"),
@@ -570,7 +576,9 @@ print(f"  ckpt      mỗi {SAVE_EVERY_N_VALS} lần val = "
       f"{SAVE_EVERY_N_VALS*EVAL_EVERY*eff} mẫu ≈ "
       f"{hours(SAVE_EVERY_N_VALS*EVAL_EVERY*eff):.1f}h"
       f" | Hub: optimizer={HUB_INCLUDE_OPTIMIZER} swa={HUB_INCLUDE_SWA} "
-      f"sync={HUB_SYNC}")
+      f"sync={HUB_SYNC} "
+      + (f"| giữ {HUB_KEEP_REVISIONS} revision rồi gộp lịch sử"
+         if HUB_KEEP_REVISIONS else "| lịch sử Hub để nguyên"))
 if not HUB_INCLUDE_SWA and SWA:
     warns.append("HUB_INCLUDE_SWA=False: mỗi phiên Kaggle mới sẽ bắt đầu cộng "
                  "trung bình lại từ 0. Trên Kaggle (phiên nào cũng đứt) điều "

@@ -173,7 +173,7 @@ def main(argv=None):
     # ── Token + tracking ─────────────────────────────────────────────────────
     hf_token = os.environ.get("HF_TOKEN", "")
     assert hf_token, "Thiếu HF_TOKEN (gemma-3 là gated repo). export HF_TOKEN=..."
-    from huggingface_hub import (create_repo, hf_hub_download, login,
+    from huggingface_hub import (HfApi, create_repo, hf_hub_download, login,
                                  snapshot_download, upload_folder)
     login(token=hf_token, add_to_git_credential=False)
 
@@ -446,6 +446,44 @@ def main(argv=None):
         return 0 if s0_ok else 1
     assert s0_ok, "STAGE 0 không qua — sửa cấu hình trước khi train"
 
+    # ═══════════════════ dọn lịch sử ckpt trên Hub (quota) ═══════════════════
+    # HF tính dung lượng theo TOÀN BỘ blob LFS còn trong lịch sử repo, không
+    # phải theo cây file ở HEAD. Mỗi lần push last/ là ~2.4GB blob MỚI được giữ
+    # lại vĩnh viễn; ghi đè hay xoá file ở commit sau KHÔNG trả lại byte nào.
+    # Chỉ viết lại lịch sử mới thực sự thu hồi.
+    #
+    # API của Hub không có "xoá đúng revision cũ nhất": super_squash_history
+    # gộp CẢ nhánh thành MỘT commit. Nên quy tắc ở đây là giữ tối đa
+    # `run.hub_keep_revisions` revision — tới bản thứ N+1 thì gộp toàn bộ lịch
+    # sử còn một commit. Nội dung ở HEAD (last/, best/, eval/) giữ NGUYÊN: mất
+    # lịch sử, không mất checkpoint. Đây là hành vi phá huỷ và không hoàn tác
+    # được, nên nó chỉ chạy khi khoá cấu hình đó > 0.
+    _hub_api = HfApi(token=hf_token)
+
+    def hub_trim_history():
+        keep = int(getattr(r, "hub_keep_revisions", 0) or 0)
+        if keep <= 0 or not r.push_to_hub or r.dry_run:
+            return
+        try:
+            n = len(_hub_api.list_repo_commits(repo_id=r.hub_repo))
+        except Exception as e:
+            warn("hub", f"không đọc được lịch sử commit "
+                        f"({type(e).__name__}) — bỏ qua bước dọn quota")
+            return
+        if n <= keep:
+            return
+        try:
+            _hub_api.super_squash_history(
+                repo_id=r.hub_repo, branch="main",
+                commit_message=f"squash: {n} revision -> 1 (giữ HEAD, "
+                               f"thu hồi blob LFS cũ)")
+            log("hub", f"lịch sử {n} revision > {keep} -> đã gộp còn 1 commit "
+                       f"(HEAD nguyên vẹn, blob cũ được thu hồi)")
+            event("hub_squash", revisions=n, keep=keep)
+        except Exception as e:
+            warn("hub", f"gộp lịch sử thất bại ({e}) — ckpt vẫn nguyên nhưng "
+                        f"quota HF chưa được thu hồi")
+
     # ══════════════════════════ checkpoint ═══════════════════════════════════
     def save_checkpoint(state, optimizer, swa=None, tag="last", push=True,
                         with_optimizer=True):
@@ -511,6 +549,8 @@ def main(argv=None):
                 log("hub", f"đã push {tag}/")
             except Exception as e:
                 warn("hub", f"push thất bại ({e}) — ckpt vẫn ở {d}")
+            else:
+                hub_trim_history()
 
     def set_weights(w, quiet=False):
         """Nạp một payload {"router": ..., "experts": ...} vào model đang sống."""
@@ -1307,6 +1347,11 @@ def main(argv=None):
             log("hub", f"đã push {where} -> {repo}")
         except Exception as e:
             warn("hub", f"push kết quả thất bại ({e})")
+        else:
+            # eval/ cũng nằm trong repo checkpoint -> commit của nó cũng ăn
+            # quota; probe ghi sang repo khác nên không dọn ở đây.
+            if not is_probe:
+                hub_trim_history()
     if use_wandb:
         import wandb
         wandb.log({f"eval/{g}/{k}": v for g in metrics

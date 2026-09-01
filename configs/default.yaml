@@ -351,6 +351,19 @@ run:
   # thì máy nhận bàn giao bắt đầu trung bình từ 0 và bản trung bình cuối cùng
   # chỉ gom được vài cycle cuối.
   hub_include_swa: true
+
+  # ── Quota HF: giữ tối đa N revision trên repo checkpoint ─────────────────
+  # HF đếm dung lượng theo TOÀN BỘ blob LFS còn trong lịch sử repo, không phải
+  # theo cây file ở HEAD. Mỗi lần push last/ là ~2.4GB blob mới nằm lại vĩnh
+  # viễn: ghi đè hay xoá ở commit sau không trả lại byte nào. Sau vài chục lần
+  # save là repo phình tới hạn mức và mọi push tiếp theo bị từ chối.
+  #
+  # Hub KHÔNG có API xoá riêng revision cũ nhất — chỉ có gộp cả nhánh. Nên:
+  # đếm revision sau mỗi lần push, tới bản thứ N+1 thì gộp toàn bộ lịch sử
+  # còn MỘT commit. Nội dung ở HEAD (last/ best/ eval/) giữ nguyên, resume và
+  # bàn giao giữa các máy không đổi; chỉ mất khả năng xem lại commit cũ.
+  # Thao tác này KHÔNG hoàn tác được. Đặt 0 (hoặc null) để tắt hẳn.
+  hub_keep_revisions: 7
   log_every_sec: 60.0
 
   # ── Infer ────────────────────────────────────────────────────────────────

@@ -495,6 +495,7 @@ trên trọng số thật). Nó được nạp khi CHẤM:
 | `swa` | true | bật/tắt việc gom trung bình |
 | `swa_use` | `always` | xem bảng trên |
 | `hub_include_swa` | true | đẩy cả `swa.pt` lên Hub để máy nhận bàn giao không phải trung bình lại từ 0 |
+| `hub_keep_revisions` | 7 | giữ tối đa 7 revision trên repo ckpt; tới bản thứ 8 thì gộp lịch sử còn 1 commit để thu hồi quota HF. 0 = tắt |
 
 Chọn `cycle_samples`: đủ dài để LR đi trọn một vòng có ý nghĩa, đủ ngắn để
 **một phiên máy gom được vài snapshot**. Đó là tiêu chí đã thay cho "một phase
@@ -1088,8 +1089,75 @@ Hàng nào của `M` cũng gần giống nhau = các expert **không phân hoá*
 chỉ là 4 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự
 chia việc, và cột nào nổi lên cho biết expert đó nhận phần nào của bài toán.
 
+> Không cần tự viết đoạn gộp trên: `scripts/probe_summary.py` (§3.8) làm
+> sẵn, và xuất ra bảng + heatmap đọc được bằng mắt.
+
 `run.mode: probe` | `src/probe.py` | `scripts/kaggle_probe.py` |
 `src/model.py::RouterBridge.force_gate`
+
+---
+
+### 3.8. Gộp bản ghi probe thành báo cáo đọc được (`scripts/probe_summary.py`)
+
+§3.7 để lại vài nghìn file JSON trên một dataset repo. Một bản ghi lẻ không nói
+lên điều gì — nhiễu của một ảnh lớn hơn hiệu ứng cần đo — nên phải gộp cả tập
+rồi mới đọc. Script này làm đúng việc đó và **chạy trên CPU máy cá nhân**:
+không import torch, chỉ cần `numpy` + `huggingface_hub` (thêm `pyyaml` để tự dò
+tên repo).
+
+```bash
+python scripts/probe_summary.py                        # tự dò repo từ config
+python scripts/probe_summary.py --repo user/abc-probe  # chỉ định tay
+python scripts/probe_summary.py --local-dir outputs/<tag>/probe_records
+python scripts/probe_summary.py --limit 200            # thử nhanh
+```
+
+Repo mặc định suy ra đúng như `src/config.py`: `run.probe_repo` → `run.hub_repo`
++ `-probe` → tên theo tag. Ép bằng `--repo` hoặc `$RGEXP_PROBE_REPO`. Token lấy
+từ `$HF_TOKEN`; `snapshot_download` cache lại nên lần chạy sau chỉ tải phần mới.
+
+Ra `reports/probe/` và **ghi đè** mỗi lần chạy, không tạo bản theo timestamp:
+thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, còn "so hai thời
+điểm" là việc của `git diff`.
+
+| File | Là gì |
+|---|---|
+| `index.html` | một file tự chứa: kết luận, 4 KPI, bảng router chọn ai, heatmap expert×bệnh và expert×aspect, ma trận tương đồng E×E, và E thẻ expert kèm bản đồ 16×16 + top token |
+| `SUMMARY.md` | bản đọc thẳng trên GitHub; bản đồ 16×16 vẽ bằng ký tự khối |
+| `summary.json` | cùng số liệu, dạng máy đọc |
+| `expert_*.csv` | ma trận thô: usage, disease mean/z, aspect mean/z, similarity, cooccurrence, top token, spatial |
+
+**Ba con số đọc trước:**
+
+- `clone_index` — cosine trung bình giữa hồ sơ bệnh của từng cặp expert **sau
+  khi trừ hồ sơ trung bình của cả nhóm**. Trừ trung bình là bắt buộc: expert
+  nào cũng đẩy logit của mọi tên bệnh lên (chúng cùng sống trong miền X-quang)
+  nên cosine thô luôn ~0.9 và không phân biệt được gì — cái đáng đo là phần
+  LỆCH so với mặt bằng chung. ~1 = các expert là bản sao; ~0 = mỗi expert kéo
+  về một hướng riêng.
+- `balance` — entropy chuẩn hoá của tần suất router chọn từng expert
+  (`H / log E`). 1.00 = chia đều; thấp = vài expert ăn hết lượt chọn và phần
+  còn lại là tham số chết. Đây chính là §3.6 nhìn từ phía kết quả.
+- `gate_max` so với `1/top_k` — hai số gần bằng nhau nghĩa là router chia đều
+  trọng số cho k expert được chọn, tức đang **trung bình cộng chứ chưa định
+  tuyến**.
+
+Heatmap chuẩn hoá **theo cột** (z-score giữa các expert cho từng bệnh), không
+theo hàng: mặt bằng logit của từng tên bệnh chênh nhau cả bậc — tên hiếm trong
+vocab luôn có Δlogit bé hơn. Chuẩn theo cột thì ô đỏ mới đọc được đúng một
+nghĩa: "expert này đẩy bệnh đó mạnh **hơn các expert khác**", đúng định nghĩa
+của chuyên môn hoá.
+
+**Output không chứa một chữ nào của báo cáo.** Bản ghi probe có cả
+`report.reference` (báo cáo thật của MIMIC-CXR) lẫn `key_id`, mà `key_id` chính
+là `p10/p10000032/s5041.../…` — tức định danh nghiên cứu. `reports/probe/` được
+thiết kế để **đẩy lên GitHub**, nên script chỉ xuất số liệu đã gộp trên toàn
+tập: không text báo cáo, không `key_id`, không thống kê theo từng ảnh. Cần xem
+từng ảnh thì đọc thẳng bản ghi trên Hub (repo private). Top token thì được giữ,
+vì đó là token của **unembedding** — thuộc về model chứ không thuộc về bệnh
+nhân nào.
+
+`scripts/probe_summary.py` | ra `reports/probe/` (commit được)
 
 ---
 
@@ -1274,6 +1342,8 @@ RGExp_proj/
     │                         #   Không có bản P100 — ảnh Kaggle build PyTorch
     │                         #   cho sm70+, P100 là sm60 nên fail ngay
     ├── kaggle_probe.py       # cell Kaggle cho mode=probe (§3.7)
+    ├── probe_summary.py      # ★ gộp bản ghi probe trên Hub -> reports/probe/
+    │                         #   (HTML + md + csv). CPU, không cần torch (§3.8)
     └── docker_bootstrap.sh   # §9 — một lệnh dựng cả máy thuê rồi chạy
 ```
 
@@ -1366,6 +1436,23 @@ Bốn assert chặn cứng khi nạp (`check_compat`):
 Nhận bàn giao 3 lần liên tiếp thì có cảnh báo: máy này liên tục chậm hơn máy
 khác nên gần như không đóng góp step nào.
 
+**Quota HF (`hub_keep_revisions: 7`).** HF đếm dung lượng theo **mọi blob LFS
+còn trong lịch sử repo**, không phải theo cây file ở HEAD. Mỗi lần push `last/`
+là ~2.4GB blob mới nằm lại vĩnh viễn: ghi đè hay xoá ở commit sau không trả lại
+byte nào, nên sau vài chục lần save là repo chạm hạn mức và push bị từ chối
+giữa phiên train.
+
+Hub **không có** API xoá riêng revision cũ nhất — chỉ có gộp cả nhánh. Nên sau
+mỗi lần push, train đếm số revision; tới bản thứ `hub_keep_revisions + 1` thì
+gọi `super_squash_history` gộp toàn bộ lịch sử còn **một** commit. Nội dung ở
+HEAD (`last/`, `best/`, `eval/`) giữ nguyên — resume và bàn giao giữa các máy
+không đổi, chỉ mất khả năng xem lại commit cũ. Hệ quả: lịch sử dao động trong
+khoảng 1→7 revision chứ không đứng yên ở đúng 7, và thao tác gộp **không hoàn
+tác được**. Đặt `hub_keep_revisions: 0` để tắt hẳn.
+
+Gộp thất bại (mất mạng, máy khác đang push cùng lúc) chỉ ghi `warn` — ckpt vẫn
+nguyên, lần push sau thử lại.
+
 Mở một session riêng với `--mode test` để chấm điểm checkpoint hiện tại trong
 khi session train vẫn đang chạy.
 
@@ -1399,6 +1486,10 @@ outputs/<tag>/
 │                     meta có expert_share — router dùng đủ 12 expert hay không
 └── splits/           train|val|test_split.csv + split_meta.json
 ```
+
+Riêng `reports/probe/` (§3.8) nằm NGOÀI `outputs/` và không bị `.gitignore`:
+nó chỉ chứa số liệu đã gộp, không có text báo cáo hay `key_id`, nên commit
+được cùng repo.
 
 So sánh giữa các ô: xem §5.
 

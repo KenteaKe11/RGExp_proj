@@ -461,6 +461,16 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("swa", True)
     run.setdefault("swa_use", "always")
     run.setdefault("hub_include_swa", True)
+    # Số revision tối đa được giữ trên repo checkpoint. HF tính quota theo mọi
+    # blob LFS còn trong lịch sử, nên ghi đè last/ KHÔNG giải phóng gì; tới
+    # revision thứ N+1, train.py gộp lịch sử còn một commit (HEAD giữ nguyên).
+    # 0 / null = tắt hẳn, lịch sử để nguyên và quota cứ thế tăng.
+    run.setdefault("hub_keep_revisions", 7)
+    run["hub_keep_revisions"] = int(run["hub_keep_revisions"] or 0)
+    if run["hub_keep_revisions"] < 0:
+        raise ValueError(
+            f"run.hub_keep_revisions phải >= 0, nhận "
+            f"{run['hub_keep_revisions']}. 0 = không bao giờ gộp lịch sử.")
     eff = run["train_bs"] * run["grad_accum"]
     if run["swa_use"] not in ("auto", "always", "never"):
         raise ValueError(f"run.swa_use lạ: {run['swa_use']!r} "
@@ -627,7 +637,9 @@ if __name__ == "__main__":
     print(f"Val     : mỗi {c.run.eval_every} step ({c.run.eval_max_batches} "
           f"batch) | ckpt mỗi {c.run.save_every_n_vals} lần val | dừng sớm: "
           f"KHÔNG (chạy tới khi dừng tay)")
-    print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo}")
+    _keep = c.run.hub_keep_revisions
+    print(f"Output  : {c.run.out_dir} | hub={c.run.hub_repo} | lịch sử Hub: "
+          + (f"giữ {_keep} revision rồi gộp" if _keep else "để nguyên"))
     print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run} | "
           f"policy={'BẬT' if c.run.use_policy else 'TẮT (chấm raw_output)'}")
     if c.remote.active:
