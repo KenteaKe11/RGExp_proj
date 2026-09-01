@@ -239,9 +239,9 @@ run:
   # null. Trên card 16GB (4070 Ti Super / 4080) train_bs=8 chết OOM ngay
   # micro-batch đầu. Muốn ép cho MỘT lần chạy thì dùng
   #     --set run.train_bs=2 --set run.grad_accum=16
-  train_bs: 8
+  train_bs: 4
   grad_accum: 4
-  infer_bs: 16
+  infer_bs: 4
   grad_ckpt: null
   num_workers: 4            # DataLoader worker — hạ xuống 2 trên máy ít vCPU
 
