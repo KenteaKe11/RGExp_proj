@@ -62,6 +62,30 @@ không phải định tuyến).
 
 Ba số này KHÔNG thay cho metrics; chúng trả lời câu "MoE có hoạt động như MoE
 không", còn BLEU/BERTScore vẫn nằm ở `src/report.py`.
+
+═══ Expert vắng mặt được ĐỂ RIÊNG, không gộp ═══
+
+Một expert có thể không xuất hiện trong bất kỳ snapshot nào — router chưa bao
+giờ chọn nó, hoặc có chọn nhưng bản ghi không kèm vector bệnh. Nó KHÔNG được
+đưa vào bảng tổng hợp nào cả, mà liệt kê riêng ở mục "Expert không tham gia"
+kèm lý do.
+
+Lý do không phải là gọn mắt. Cho một expert vắng mặt vào với tư cách một hàng
+0 thì:
+
+  * trung bình cột bị kéo về 0 -> z-score của MỌI expert khác dịch lên, ai
+    cũng trông "chuyên môn" hơn thực tế;
+  * std cột phình ra -> mọi z co lại, khác biệt thật bị nén phẳng;
+  * vector 0 có cosine 0 với tất cả -> `clone_index` bị pha loãng về 0, đọc ra
+    thành "các expert phân hoá rõ" trong khi thực ra chỉ là thiếu dữ liệu.
+
+Tức là một hàng rỗng làm sai đúng con số mà bảng sinh ra để trả lời. Trong code
+điều này được thi hành bằng NaN (`mean_by`) chứ không phải 0: NaN không cộng
+vào đâu được, nên mọi chỗ dùng nó buộc phải xử lý tường minh.
+
+NGOẠI LỆ có chủ ý: `balance` và `usage_cv` vẫn tính trên ĐỦ E expert. Chúng đo
+router chia việc thế nào, mà "expert này chưa từng được chọn" chính là dữ kiện
+quan trọng nhất của câu đó — loại nó ra là tự xoá bằng chứng.
 """
 from __future__ import annotations
 
@@ -194,6 +218,13 @@ def aggregate(recs):
     sp_sum = np.zeros((E, nS)) if nS else None
     spmax_sum = np.zeros(E)
     spl2_sum = np.zeros(E)
+    # Mẫu số RIÊNG cho từng đại lượng, không dùng chung n_chosen: một expert có
+    # thể được chọn 900 lần mà chỉ 900 lần đó có `disease` (bản ghi cũ thiếu
+    # trường, hoặc grid không vuông nên không có `spatial`). Chia tất cả cho
+    # n_chosen là lặng lẽ kéo trung bình về 0 theo tỉ lệ phần thiếu.
+    n_dis = np.zeros(E)
+    n_asp = np.zeros(E)
+    n_sp = np.zeros(E)
     cooc = np.zeros((E, E))                # đồng xuất hiện trong cùng top-k
     tok = [defaultdict(lambda: [0, 0.0, ""]) for _ in range(E)]
 
@@ -236,14 +267,17 @@ def aggregate(recs):
             d = it.get("disease")
             if d and len(d) == nD:
                 dis_sum[e] += np.asarray(d, dtype=np.float64)
+                n_dis[e] += 1
             a = it.get("aspect")
             if a and len(a) == nA:
                 asp_sum[e] += np.asarray(a, dtype=np.float64)
+                n_asp[e] += 1
             sp = it.get("spatial")
             if sp_sum is not None and sp and len(sp) == nS:
                 sp_sum[e] += np.asarray(sp, dtype=np.float64)
-            spmax_sum[e] += float(it.get("spatial_max") or 0.0)
-            spl2_sum[e] += float(it.get("spatial_l2") or 0.0)
+                spmax_sum[e] += float(it.get("spatial_max") or 0.0)
+                spl2_sum[e] += float(it.get("spatial_l2") or 0.0)
+                n_sp[e] += 1
             for t in it.get("top_tokens") or []:
                 slot = tok[e][int(t.get("id", -1))]
                 slot[0] += 1
@@ -251,7 +285,7 @@ def aggregate(recs):
                 slot[2] = str(t.get("token", ""))
 
     n = len(recs) - n_lab_mismatch
-    den = np.maximum(n_chosen, 1)[:, None]
+    profile = n_dis > 0          # có hồ sơ bệnh -> vào được mọi bảng tổng hợp
     out = {
         "n_records": n,
         "n_label_mismatch": n_lab_mismatch,
@@ -261,21 +295,65 @@ def aggregate(recs):
         "meta": {k: sorted(v) for k, v in meta.items()},
         "train_samples": (min(samples), max(samples)) if samples else None,
         "n_chosen": n_chosen, "n_top1": n_top1,
+        "n_disease": n_dis, "n_aspect": n_asp, "n_spatial": n_sp,
+        "profile": profile,
         "usage": n_chosen / max(n, 1),
-        "gate_mean_when_chosen": gate_sum / np.maximum(n_chosen, 1),
+        "gate_mean_when_chosen": mean_by(gate_sum, n_chosen),
         "gate_mean_all": gate_all / max(n, 1),
-        "disease": dis_sum / den,
-        "aspect": asp_sum / den if nA else np.zeros((E, 0)),
-        "delta_norm": dnorm_sum / np.maximum(n_chosen, 1),
-        "spatial": (sp_sum / den) if sp_sum is not None else None,
-        "spatial_max": spmax_sum / np.maximum(n_chosen, 1),
-        "spatial_l2": spl2_sum / np.maximum(n_chosen, 1),
+        "disease": mean_by(dis_sum, n_dis),
+        "aspect": mean_by(asp_sum, n_asp) if nA else np.zeros((E, 0)),
+        "delta_norm": mean_by(dnorm_sum, n_chosen),
+        "spatial": mean_by(sp_sum, n_sp) if sp_sum is not None else None,
+        "spatial_max": mean_by(spmax_sum, n_sp),
+        "spatial_l2": mean_by(spl2_sum, n_sp),
         "cooccurrence": cooc,
         "route_entropy": float(np.mean(ent)) if ent else None,
         "gate_max": float(np.mean(gmax)) if gmax else None,
         "tokens": tok,
     }
+    out["absent"] = absent_reasons(out)
     out.update(derive(out))
+    return out
+
+
+def mean_by(total, count):
+    """Chia tổng cho ĐÚNG số lần đại lượng đó có mặt; thiếu hẳn thì NaN.
+
+    NaN chứ không phải 0. Số 0 trông như một phép đo ("expert này không đẩy
+    bệnh nào lên") và sẽ trôi thẳng vào trung bình cột, vào z-score, vào
+    cosine — làm lệch mọi expert khác. NaN thì không cộng vào đâu được, buộc
+    mọi chỗ dùng nó phải xử lý tường minh: expert đó bị LOẠI khỏi bảng và
+    được liệt kê riêng.
+    """
+    cnt = np.asarray(count, dtype=np.float64)
+    if total.ndim == 2:
+        cnt = cnt[:, None]
+    out = np.full(total.shape, np.nan, dtype=np.float64)
+    return np.divide(total, cnt, out=out, where=cnt > 0)
+
+
+def absent_reasons(a):
+    """Expert nào không vào được bảng tổng hợp, và vì sao.
+
+    Hai lý do khác hẳn nhau nên KHÔNG gộp làm một dòng:
+
+      * `router_never_picked` — không một snapshot nào chọn expert này. Đây là
+        phát hiện về ROUTER (tham số chết / cân bằng tải hỏng), không phải về
+        expert. Nó cũng là lý do duy nhất mà `balance` phải giữ nguyên mẫu số
+        E: bỏ expert này ra khỏi entropy là tự xoá đúng bằng chứng đó.
+      * `no_profile` — có được chọn nhưng bản ghi không kèm vector bệnh (bản
+        ghi cũ hơn schema, hoặc lỗi ghi). Đây là lỗ hổng DỮ LIỆU: expert vẫn
+        chạy thật, chỉ là ta không đọc được nó.
+    """
+    out = []
+    for e in range(a["n_expert"]):
+        if a["n_disease"][e] > 0:
+            continue
+        out.append({
+            "expert": e,
+            "reason": "router_never_picked" if a["n_chosen"][e] == 0 else "no_profile",
+            "n_chosen": int(a["n_chosen"][e]),
+        })
     return out
 
 
@@ -286,24 +364,55 @@ def zscore(M):
     bậc (tên hiếm gặp trong vocab luôn có Δlogit bé hơn). Chuẩn theo cột thì ô
     đỏ đọc được đúng một nghĩa: "expert này đẩy bệnh này mạnh HƠN các expert
     khác", đó mới là định nghĩa của chuyên môn hoá.
+
+    Hàng NaN (expert không góp mặt trong bản ghi nào) bị loại khỏi mean/std rồi
+    trả về NaN: để nó tham gia là tự thêm một điểm giả vào mặt bằng mà mọi
+    expert khác đang được đo so với.
     """
     if M.size == 0:
         return M
-    mu = M.mean(axis=0, keepdims=True)
-    sd = M.std(axis=0, keepdims=True)
-    return np.divide(M - mu, sd, out=np.zeros_like(M), where=sd > 1e-12)
+    ok = ~np.isnan(M).any(axis=1)
+    out = np.full(M.shape, np.nan)
+    if not ok.any():
+        return out
+    sub = M[ok]
+    mu = sub.mean(axis=0, keepdims=True)
+    sd = sub.std(axis=0, keepdims=True)
+    out[ok] = np.divide(sub - mu, sd, out=np.zeros_like(sub), where=sd > 1e-12)
+    return out
 
 
 def derive(a):
-    """Ba chỉ số tổng và các ma trận dẫn xuất (z-score, cosine, top bệnh)."""
+    """Ba chỉ số tổng và các ma trận dẫn xuất — CHỈ trên expert có góp mặt.
+
+    `profile` là mặt nạ những expert thật sự xuất hiện trong ít nhất một bản
+    ghi. Mọi thứ ở đây (z-score, cosine, clone_index) đều tính trong nhóm đó và
+    trả NaN cho phần còn lại. Trộn một expert vắng mặt vào không phải là "thêm
+    một hàng rỗng cho đủ": nó dịch trung bình cột, bóp std, kéo cosine của mọi
+    cặp khác — tức là làm sai chính con số mà bảng này sinh ra để trả lời.
+
+    NGOẠI LỆ có chủ ý: `balance` và `usage_cv` vẫn tính trên ĐỦ E expert. Chúng
+    đo router chia việc thế nào, mà "expert này chưa từng được chọn" chính là
+    dữ kiện quan trọng nhất của câu đó — bỏ nó ra là tự làm đẹp số liệu.
+    """
     E = a["n_expert"]
+    ok = a["profile"]
     D = a["disease"]
     Z = zscore(D)
-    C = D - D.mean(axis=0, keepdims=True)          # trừ mặt bằng chung
-    norm = np.linalg.norm(C, axis=1, keepdims=True)
-    Cn = np.divide(C, norm, out=np.zeros_like(C), where=norm > 1e-12)
-    sim = Cn @ Cn.T
-    off = sim[~np.eye(E, dtype=bool)]
+
+    sim = np.full((E, E), np.nan)
+    ci = ci_max = 0.0
+    if ok.sum() >= 2:
+        sub = D[ok]
+        C = sub - sub.mean(axis=0, keepdims=True)      # trừ mặt bằng chung
+        norm = np.linalg.norm(C, axis=1, keepdims=True)
+        Cn = np.divide(C, norm, out=np.zeros_like(C), where=norm > 1e-12)
+        S = Cn @ Cn.T
+        idx = np.nonzero(ok)[0]
+        sim[np.ix_(idx, idx)] = S
+        off = S[~np.eye(len(idx), dtype=bool)]
+        ci, ci_max = float(off.mean()), float(off.max())
+
     p = a["n_chosen"] / max(a["n_chosen"].sum(), 1)
     nz = p[p > 0]
     balance = float(-(nz * np.log(nz)).sum() / math.log(E)) if E > 1 else 1.0
@@ -311,8 +420,9 @@ def derive(a):
         "disease_z": Z,
         "aspect_z": zscore(a["aspect"]),
         "similarity": sim,
-        "clone_index": float(off.mean()) if off.size else 0.0,
-        "clone_index_max": float(off.max()) if off.size else 0.0,
+        "n_profiled": int(ok.sum()),
+        "clone_index": ci,
+        "clone_index_max": ci_max,
         "balance": balance,
         "usage_cv": float(p.std() / p.mean()) if p.mean() > 0 else 0.0,
     }
@@ -334,9 +444,16 @@ def top_tokens(a, e, k=12):
 
 
 def top_labels(vec, names, k=3, floor=0.35):
-    """Tên của k giá trị z lớn nhất, bỏ những cái quá gần mặt bằng chung."""
-    idx = np.argsort(-vec)[:k]
-    return [(names[i], float(vec[i])) for i in idx if vec[i] > floor]
+    """Tên của k giá trị z lớn nhất, bỏ những cái quá gần mặt bằng chung.
+
+    Vector toàn NaN = expert không có hồ sơ; trả rỗng để mọi chỗ hiển thị ra
+    "—" thay vì bịa một chuyên môn từ dữ liệu không tồn tại.
+    """
+    if vec.size == 0 or np.isnan(vec).all():
+        return []
+    idx = np.argsort(-np.nan_to_num(vec, nan=-np.inf))[:k]
+    return [(names[i], float(vec[i])) for i in idx
+            if not np.isnan(vec[i]) and vec[i] > floor]
 
 
 # ═════════════════════════════════ diễn giải ═════════════════════════════════
@@ -349,9 +466,16 @@ def verdict(a):
     thấy số sát ngưỡng thì đọc ma trận, đừng đọc câu chữ.
     """
     ci, bal, E, K = a["clone_index"], a["balance"], a["n_expert"], a["top_k"]
+    P = a["n_profiled"]
+    if P < 2:
+        return "không đủ dữ liệu", (
+            f"Chỉ {P}/{E} expert có mặt trong dữ liệu probe — không so được cặp "
+            f"nào, nên clone_index không có nghĩa. Xem mục 'Expert không tham "
+            f"gia' để biết vì sao, và chạy lại probe cho đủ tập trước khi đọc "
+            f"bảng chuyên môn.")
     if ci > 0.70:
         lvl, msg = "cao", (
-            f"Hồ sơ bệnh của {E} expert gần như trùng nhau (cosine lệch trung "
+            f"Hồ sơ bệnh của {P} expert gần như trùng nhau (cosine lệch trung "
             f"bình {ci:.2f}). Top-{K} đang lấy về {K} bản sao mờ của cùng một "
             f"hàm — phần lớn tham số expert là thừa. Đáng thử: tăng hệ số "
             f"separation loss, hoặc giảm n_expert.")
@@ -375,6 +499,20 @@ def verdict(a):
         msg += (f" Gate max trung bình {a['gate_max']:.3f} ≈ 1/top_k "
                 f"({1/K:.3f}): router gần như chia đều trọng số cho {K} expert "
                 f"được chọn, tức là đang trung bình cộng chứ chưa định tuyến.")
+    if a["absent"]:
+        never = [x["expert"] for x in a["absent"]
+                 if x["reason"] == "router_never_picked"]
+        nodata = [x["expert"] for x in a["absent"] if x["reason"] == "no_profile"]
+        parts = []
+        if never:
+            parts.append("chưa từng được router chọn trong bất kỳ snapshot nào: "
+                         + ", ".join(f"e{e}" for e in never))
+        if nodata:
+            parts.append("được chọn nhưng bản ghi không có vector bệnh: "
+                         + ", ".join(f"e{e}" for e in nodata))
+        msg = (f"⚠ {E - P}/{E} expert bị LOẠI khỏi mọi bảng dưới ("
+               + "; ".join(parts) + f"). Các số trên chỉ nói về {P} expert còn "
+               f"lại — xem mục 'Expert không tham gia'. ") + msg
     return lvl, msg
 
 
@@ -386,51 +524,81 @@ def write_csv(path, header, rows):
         w.writerows(rows)
 
 
+def isnan(v):
+    return v is None or (isinstance(v, float) and math.isnan(v)) or (
+        isinstance(v, np.floating) and math.isnan(float(v)))
+
+
+def num(v, nd=5):
+    """Số cho CSV; NaN -> ô rỗng chứ không phải 0 (0 là một phép đo, rỗng thì không)."""
+    return "" if isnan(v) else round(float(v), nd)
+
+
+def jnum(v, nd=5):
+    """Số cho JSON; NaN -> null (JSON không có NaN hợp lệ, và 0 thì sai nghĩa)."""
+    return None if isnan(v) else round(float(v), nd)
+
+
 def dump_csvs(a, out):
     E = a["n_expert"]
+    live = [e for e in range(E) if a["profile"][e]]
     dn, an = a["disease_labels"], a["aspect_labels"]
 
+    # usage giữ ĐỦ E hàng, có cột `active`: đây là bảng về router, và hàng
+    # n_chosen = 0 chính là thông tin cần thấy.
     write_csv(os.path.join(out, "expert_usage.csv"),
-              ["expert", "n_chosen", "usage", "n_top1", "top1_share",
-               "gate_mean_when_chosen", "gate_mean_all", "delta_norm",
-               "spatial_max", "spatial_l2"],
-              [[e, int(a["n_chosen"][e]), round(a["usage"][e], 5),
-                int(a["n_top1"][e]), round(a["n_top1"][e] / max(a["n_records"], 1), 5),
-                round(a["gate_mean_when_chosen"][e], 5),
-                round(a["gate_mean_all"][e], 5), round(a["delta_norm"][e], 5),
-                round(a["spatial_max"][e], 5), round(a["spatial_l2"][e], 5)]
+              ["expert", "active", "n_chosen", "usage", "n_top1", "top1_share",
+               "n_disease", "n_spatial", "gate_mean_when_chosen", "gate_mean_all",
+               "delta_norm", "spatial_max", "spatial_l2"],
+              [[e, int(bool(a["profile"][e])), int(a["n_chosen"][e]),
+                num(a["usage"][e]), int(a["n_top1"][e]),
+                num(a["n_top1"][e] / max(a["n_records"], 1)),
+                int(a["n_disease"][e]), int(a["n_spatial"][e]),
+                num(a["gate_mean_when_chosen"][e]), num(a["gate_mean_all"][e]),
+                num(a["delta_norm"][e]), num(a["spatial_max"][e]),
+                num(a["spatial_l2"][e])]
                for e in range(E)])
 
+    write_csv(os.path.join(out, "expert_absent.csv"),
+              ["expert", "reason", "n_chosen", "giải thích"],
+              [[x["expert"], x["reason"], x["n_chosen"],
+                "không snapshot nào chọn expert này"
+                if x["reason"] == "router_never_picked"
+                else "được chọn nhưng bản ghi không kèm vector bệnh"]
+               for x in a["absent"]])
+
+    # Các ma trận chuyên môn chỉ chứa expert có góp mặt. Một hàng rỗng hay
+    # hàng 0 ở đây sẽ bị mọi công cụ đọc CSV coi là số thật.
     for name, M, cols in (("expert_disease_mean", a["disease"], dn),
                           ("expert_disease_z", a["disease_z"], dn),
                           ("expert_aspect_mean", a["aspect"], an),
                           ("expert_aspect_z", a["aspect_z"], an)):
         if M.size:
             write_csv(os.path.join(out, name + ".csv"), ["expert"] + list(cols),
-                      [[e] + [round(float(v), 5) for v in M[e]] for e in range(E)])
+                      [[e] + [num(v) for v in M[e]] for e in live])
 
     write_csv(os.path.join(out, "expert_similarity.csv"),
-              ["expert"] + [f"e{j}" for j in range(E)],
-              [[e] + [round(float(v), 4) for v in a["similarity"][e]]
-               for e in range(E)])
+              ["expert"] + [f"e{j}" for j in live],
+              [[e] + [num(a["similarity"][e][j], 4) for j in live] for e in live])
 
+    # Đồng xuất hiện là số đếm thô của router -> giữ đủ E×E.
     write_csv(os.path.join(out, "expert_cooccurrence.csv"),
               ["expert"] + [f"e{j}" for j in range(E)],
               [[e] + [int(v) for v in a["cooccurrence"][e]] for e in range(E)])
 
     rows = []
-    for e in range(E):
+    for e in live:
         for rank, (txt, cnt, mean, freq) in enumerate(top_tokens(a, e, 25), 1):
-            rows.append([e, rank, txt, cnt, round(freq, 4), round(mean, 5)])
+            rows.append([e, rank, txt, cnt, num(freq, 4), num(mean)])
     write_csv(os.path.join(out, "expert_top_tokens.csv"),
               ["expert", "rank", "token", "n_images", "freq", "dlogit_mean"], rows)
 
     if a["spatial"] is not None:
         h, w = a["grid"]
+        sp = [e for e in live if a["n_spatial"][e] > 0]
         write_csv(os.path.join(out, "expert_spatial_mean.csv"),
                   ["expert"] + [f"r{i}c{j}" for i in range(h) for j in range(w)],
-                  [[e] + [round(float(v), 4) for v in a["spatial"][e]]
-                   for e in range(E)])
+                  [[e] + [num(v, 4) for v in a["spatial"][e]] for e in sp])
 
 
 def dump_json(a, out, source):
@@ -444,22 +612,30 @@ def dump_json(a, out, source):
         "grid": a["grid"],
         "meta": a["meta"],
         "train_samples": a["train_samples"],
+        # clone_index/gate_max nói về n_profiled expert; balance nói về đủ E.
+        # Ghi cả hai mẫu số ra đây để người đọc JSON không phải đoán.
+        "n_profiled": a["n_profiled"],
         "headline": {"clone_index": round(a["clone_index"], 4),
                      "clone_index_max": round(a["clone_index_max"], 4),
+                     "clone_index_over": a["n_profiled"],
                      "balance": round(a["balance"], 4),
+                     "balance_over": E,
                      "usage_cv": round(a["usage_cv"], 4),
                      "route_entropy": a["route_entropy"],
                      "gate_max": a["gate_max"],
                      "level": lvl, "verdict": msg},
+        "absent_experts": a["absent"],
         "disease_labels": a["disease_labels"],
         "aspect_labels": a["aspect_labels"],
         "experts": [
             {"expert": e,
+             "in_summary": bool(a["profile"][e]),
              "n_chosen": int(a["n_chosen"][e]),
-             "usage": round(float(a["usage"][e]), 5),
-             "top1_share": round(float(a["n_top1"][e] / max(a["n_records"], 1)), 5),
-             "gate_mean_when_chosen": round(float(a["gate_mean_when_chosen"][e]), 5),
-             "delta_norm": round(float(a["delta_norm"][e]), 5),
+             "n_disease": int(a["n_disease"][e]),
+             "usage": jnum(a["usage"][e]),
+             "top1_share": jnum(a["n_top1"][e] / max(a["n_records"], 1)),
+             "gate_mean_when_chosen": jnum(a["gate_mean_when_chosen"][e]),
+             "delta_norm": jnum(a["delta_norm"][e]),
              "top_disease": top_labels(a["disease_z"][e], a["disease_labels"]),
              "top_aspect": (top_labels(a["aspect_z"][e], a["aspect_labels"])
                             if a["aspect"].size else []),
@@ -483,6 +659,11 @@ def heat_char(z):
     return BLOCKS[min(int(z / 0.75) + 1, len(BLOCKS) - 1)]
 
 
+def fmt(v, nd=2, dash="—"):
+    """Số để in ra bảng; NaN -> gạch ngang, không phải 0.00."""
+    return dash if isnan(v) else f"{float(v):.{nd}f}"
+
+
 def md_table(header, rows):
     out = ["| " + " | ".join(header) + " |",
            "|" + "|".join("---" for _ in header) + "|"]
@@ -492,6 +673,8 @@ def md_table(header, rows):
 
 def dump_md(a, out, source):
     E = a["n_expert"]
+    live = [e for e in range(E) if a["profile"][e]]
+    P = a["n_profiled"]
     lvl, msg = verdict(a)
     dn = a["disease_labels"]
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -501,11 +684,13 @@ def dump_md(a, out, source):
          "## Kết luận", "", f"**Mức trùng lặp: {lvl}.** {msg}", "",
          md_table(["chỉ số", "giá trị", "nghĩa"], [
              ["clone_index", f"{a['clone_index']:.3f}",
-              "cosine lệch trung bình giữa các cặp expert — 1 = bản sao, 0 = riêng biệt"],
+              f"cosine lệch trung bình giữa các cặp trong {P} expert có mặt — "
+              f"1 = bản sao, 0 = riêng biệt"],
              ["clone_index_max", f"{a['clone_index_max']:.3f}",
               "cặp giống nhau nhất"],
              ["balance", f"{a['balance']:.3f}",
-              "entropy chuẩn hoá của tần suất chọn — 1 = router chia đều"],
+              f"entropy chuẩn hoá của tần suất chọn trên ĐỦ {E} expert — "
+              f"1 = router chia đều"],
              ["usage_cv", f"{a['usage_cv']:.3f}",
               "hệ số biến thiên của tần suất chọn — 0 = chia đều"],
              ["route_entropy", f"{a['route_entropy']:.3f}" if a["route_entropy"] is not None else "—",
@@ -521,6 +706,8 @@ def dump_md(a, out, source):
               ["ô sweep", ", ".join(meta.get("sweep_cell", [])) or "—"],
               ["trọng số", ", ".join(meta.get("weights", [])) or "—"],
               ["n_expert × top_k", f"{E} × {a['top_k']}"],
+              ["expert vào bảng tổng hợp", f"{P}/{E}"
+               + (f" ({E-P} bị loại, xem mục dưới)" if P < E else "")],
               ["train_samples", (f"{a['train_samples'][0]:,} … {a['train_samples'][1]:,}"
                                  if a["train_samples"] else "—")],
               ["lưới patch", "×".join(map(str, a["grid"])) if a["grid"] else "—"],
@@ -530,35 +717,58 @@ def dump_md(a, out, source):
           "nhau (probe chạy song song với train). Khoảng `train_samples` rộng "
           "nghĩa là bảng dưới trộn nhiều phiên bản checkpoint.", ""]
 
+    if a["absent"]:
+        L += [f"## Expert không tham gia ({E - P}/{E}) — ĐỂ RIÊNG, không gộp", "",
+              "Những expert dưới đây bị loại khỏi mọi bảng chuyên môn phía sau "
+              "(ma trận bệnh/aspect, cosine, top token, bản đồ). Gộp chúng vào "
+              "với tư cách một hàng 0 sẽ dịch trung bình cột, bóp std và kéo "
+              "cosine của mọi cặp còn lại — tức là làm sai chính con số cần đọc.", "",
+              md_table(["expert", "lý do", "lượt được chọn", "nghĩa là"],
+                       [[f"e{x['expert']}",
+                         f"`{x['reason']}`", f"{x['n_chosen']:,}",
+                         "không snapshot nào chọn expert này — tham số chết, "
+                         "hoặc bias cân bằng tải (§3.6) chưa kéo nó vào"
+                         if x["reason"] == "router_never_picked" else
+                         "có chạy thật nhưng bản ghi không kèm vector bệnh — "
+                         "lỗ hổng DỮ LIỆU, không phải kết luận về expert"]
+                        for x in a["absent"]]), "",
+              "`balance` và `usage_cv` ở trên vẫn tính trên đủ "
+              f"{E} expert: \"chưa từng được chọn\" chính là dữ kiện quan trọng "
+              "nhất của câu hỏi cân bằng tải, bỏ ra là tự làm đẹp số liệu.", ""]
+
     L += ["## Router chọn ai", "",
-          md_table(["expert", "lượt chọn", "% ảnh", "top-1", "gate TB",
+          f"Đủ {E} expert. Hàng có `✗` không vào bảng tổng hợp (xem mục trên).", "",
+          md_table(["expert", "vào bảng", "lượt chọn", "% ảnh", "top-1", "gate TB",
                     "‖Δh‖ TB", "chuyên môn (z > 0.35)"],
-                   [[f"e{e}", f"{int(a['n_chosen'][e]):,}",
+                   [[f"e{e}", "✓" if a["profile"][e] else "✗",
+                     f"{int(a['n_chosen'][e]):,}",
                      f"{100*a['usage'][e]:.1f}%",
                      f"{100*a['n_top1'][e]/max(a['n_records'],1):.1f}%",
-                     f"{a['gate_mean_when_chosen'][e]:.3f}",
-                     f"{a['delta_norm'][e]:.2f}",
+                     fmt(a["gate_mean_when_chosen"][e], 3),
+                     fmt(a["delta_norm"][e], 2),
                      ", ".join(f"{n} ({z:+.1f})"
                                for n, z in top_labels(a["disease_z"][e], dn)) or "—"]
                     for e in range(E)]), ""]
 
     L += ["## Ma trận expert × bệnh (z-score theo cột)", "",
-          "Đậm = expert này đẩy bệnh đó mạnh hơn mặt bằng các expert khác. "
-          "`·` = bằng hoặc dưới mặt bằng. Số thô ở `expert_disease_mean.csv`.", "",
+          f"Chỉ {P} expert có mặt trong dữ liệu. Đậm = expert này đẩy bệnh đó "
+          "mạnh hơn mặt bằng các expert khác. `·` = bằng hoặc dưới mặt bằng. "
+          "Số thô ở `expert_disease_mean.csv`.", "",
           md_table(["exp"] + list(dn),
                    [[f"e{e}"] + [f"{heat_char(a['disease_z'][e][j])}{a['disease_z'][e][j]:+.1f}"
-                                 for j in range(len(dn))] for e in range(E)]), ""]
+                                 for j in range(len(dn))] for e in live]), ""]
 
     if a["aspect"].size:
         an = a["aspect_labels"]
+        asp = [e for e in live if a["n_aspect"][e] > 0]
         L += ["## Ma trận expert × aspect (z-score theo cột)", "",
               md_table(["exp"] + list(an),
                        [[f"e{e}"] + [f"{heat_char(a['aspect_z'][e][j])}{a['aspect_z'][e][j]:+.1f}"
-                                     for j in range(len(an))] for e in range(E)]), ""]
+                                     for j in range(len(an))] for e in asp]), ""]
 
     L += ["## Cặp expert giống nhau nhất", ""]
     pairs = sorted(((float(a["similarity"][i][j]), i, j)
-                    for i in range(E) for j in range(i + 1, E)), reverse=True)
+                    for i in live for j in live if i < j), reverse=True)
     L += [md_table(["cặp", "cosine lệch", "đọc là"],
                    [[f"e{i} ↔ e{j}", f"{s:+.3f}",
                      "gần như trùng" if s > 0.7 else
@@ -569,27 +779,28 @@ def dump_md(a, out, source):
     L += ["## Token mỗi expert đẩy lên mạnh nhất", "",
           "Xếp theo tổng Δlogit trên cả tập, nên token xuất hiện đều đặn thắng "
           "token bùng lên ở một ảnh. `n` = số ảnh mà token lọt top của expert.", ""]
-    for e in range(E):
+    for e in live:
         toks = ", ".join(f"`{t.strip() or '␣'}`(n={c})" for t, c, _, _ in top_tokens(a, e, 10))
         L += [f"- **e{e}** — {toks or '—'}"]
     L += [""]
 
-    if a["spatial"] is not None:
+    sp = [e for e in live if a["n_spatial"][e] > 0] if a["spatial"] is not None else []
+    if sp:
         h, w = a["grid"]
         L += [f"## Bản đồ không gian trung bình ({h}×{w})", "",
               "‖Δh‖ tại từng image token, trung bình trên mọi ảnh mà expert được "
               "chọn, chuẩn hoá về [0,1] theo chính nó. Đây là câu hỏi *nhìn ĐÂU*, "
               "không phải *mạnh cỡ nào* (độ mạnh ở cột ‖Δh‖ phía trên).", "",
               "```"]
-        maps = []
-        for e in range(E):
+        maps = {}
+        for e in sp:
             m = a["spatial"][e].reshape(h, w)
             mx = m.max() or 1.0
-            maps.append([[BLOCKS[min(int(v / mx * (len(BLOCKS) - 1) + 0.5),
-                                     len(BLOCKS) - 1)] for v in row] for row in m])
+            maps[e] = [[BLOCKS[min(int(v / mx * (len(BLOCKS) - 1) + 0.5),
+                                   len(BLOCKS) - 1)] for v in row] for row in m]
         per_row = 4
-        for start in range(0, E, per_row):
-            grp = list(range(start, min(start + per_row, E)))
+        for start in range(0, len(sp), per_row):
+            grp = sp[start:start + per_row]
             L += ["   ".join(f"e{e}".ljust(w * 2) for e in grp)]
             for i in range(h):
                 L += ["   ".join("".join(c * 2 for c in maps[e][i]) for e in grp)]
@@ -625,6 +836,10 @@ p.sub{color:var(--mut);margin:0 0 6px;font-size:13.5px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
       padding:16px 18px;margin:14px 0}
 .verdict{border-left:3px solid var(--acc)}
+.absent{border-left:3px solid var(--neg)}
+.absent ul{margin:0 0 10px;padding-left:18px;font-size:13.5px}
+.absent li+li{margin-top:4px}
+tr.off td{opacity:.45}
 .kpis{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}
 .kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;
      padding:11px 15px;min-width:132px}
@@ -709,6 +924,8 @@ def seq_class(v):
 
 def dump_html(a, out, source):
     E, K = a["n_expert"], a["top_k"]
+    NP = a["n_profiled"]
+    live = [e for e in range(E) if a["profile"][e]]
     dn, an = a["disease_labels"], a["aspect_labels"]
     lvl, msg = verdict(a)
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -716,7 +933,8 @@ def dump_html(a, out, source):
     P = []
 
     P.append(f"<h1>Probe chuyên môn expert</h1>")
-    P.append(f"<p class=sub>{a['n_records']:,} ảnh · {E} expert · top-{K} · "
+    P.append(f"<p class=sub>{a['n_records']:,} ảnh · {NP}/{E} expert có mặt · "
+             f"top-{K} · "
              f"{esc(', '.join(meta.get('sweep_cell', [])) or 'ô sweep không rõ')} · "
              f"sinh lúc {ts}</p>")
     P.append(f"<p class=sub>Nguồn: <code>{esc(source)}</code> · "
@@ -726,45 +944,74 @@ def dump_html(a, out, source):
 
     P.append(f"<div class='card verdict'><b>Mức trùng lặp: {lvl}.</b> {esc(msg)}</div>")
 
-    kpi = [("clone_index", f"{a['clone_index']:.2f}", "1 = bản sao · 0 = riêng biệt"),
-           ("balance", f"{a['balance']:.2f}", "1 = router chia đều lượt"),
-           ("gate_max", f"{a['gate_max']:.2f}" if a["gate_max"] is not None else "—",
-            f"1/top_k = {1/max(K,1):.2f}"),
-           ("route_entropy", f"{a['route_entropy']:.2f}" if a["route_entropy"] is not None else "—",
+    kpi = [("clone_index", fmt(a["clone_index"]),
+            f"trên {NP} expert có mặt · 1 = bản sao"),
+           ("balance", fmt(a["balance"]), f"trên đủ {E} expert · 1 = chia đều"),
+           ("gate_max", fmt(a["gate_max"]), f"1/top_k = {1/max(K,1):.2f}"),
+           ("route_entropy", fmt(a["route_entropy"]),
             f"tối đa = ln {E} = {math.log(E):.2f}" if E > 1 else "—")]
+    if a["absent"]:
+        kpi.append((f"{E - NP} expert vắng", "⚠", "bị loại khỏi bảng dưới"))
     P.append("<div class=kpis>" + "".join(
         f"<div class=kpi><b>{v}</b><span>{esc(k)}<br>{esc(h)}</span></div>"
         for k, v, h in kpi) + "</div>")
 
+    # ── expert không tham gia ────────────────────────────────────────────────
+    if a["absent"]:
+        items = []
+        for x in a["absent"]:
+            why = ("không snapshot nào chọn expert này — tham số chết, hoặc "
+                   "bias cân bằng tải chưa kéo nó vào"
+                   if x["reason"] == "router_never_picked" else
+                   f"được chọn {x['n_chosen']:,} lần nhưng bản ghi không kèm "
+                   f"vector bệnh — lỗ hổng DỮ LIỆU, không phải kết luận về expert")
+            items.append(f"<li><b>e{x['expert']}</b> · <code>{x['reason']}</code>"
+                         f" — {esc(why)}</li>")
+        P.append(
+            f"<h2>Expert không tham gia ({E - NP}/{E})</h2>"
+            "<p class=note>Để RIÊNG, không gộp vào bất kỳ bảng nào phía dưới. "
+            "Cho một expert vắng mặt vào với tư cách hàng 0 sẽ dịch trung bình "
+            "cột, bóp std và kéo cosine của mọi cặp còn lại — tức là làm sai "
+            "chính con số cần đọc.</p>"
+            f"<div class='card absent'><ul>{''.join(items)}</ul>"
+            f"<p class=note style='margin-bottom:0'><code>balance</code> và "
+            f"<code>usage_cv</code> vẫn tính trên đủ {E} expert: \"chưa từng "
+            f"được chọn\" chính là dữ kiện quan trọng nhất của câu hỏi cân bằng "
+            f"tải, bỏ ra là tự làm đẹp số liệu.</p></div>")
+
     # ── router chọn ai ───────────────────────────────────────────────────────
     P.append("<h2>Router chọn ai</h2>")
-    P.append("<p class=note>Thanh = tỉ lệ ảnh mà expert lọt top-k. "
-             "Chia đều tuyệt đối thì mọi thanh dài bằng nhau và bằng "
-             f"top_k/n_expert = {K/max(E,1)*100:.0f}%.</p>")
+    P.append(f"<p class=note>Đủ {E} expert; hàng mờ là expert không vào bảng "
+             "tổng hợp. Thanh = tỉ lệ ảnh mà expert lọt top-k. Chia đều tuyệt "
+             f"đối thì mọi thanh dài bằng nhau và bằng top_k/n_expert = "
+             f"{K/max(E,1)*100:.0f}%.</p>")
     rows = []
     mx = max(a["usage"].max(), 1e-9)
     for e in range(E):
         w = 128 * a["usage"][e] / mx
+        ok = bool(a["profile"][e])
         rows.append(
-            f"<tr><td>e{e}</td>"
+            f"<tr{'' if ok else ' class=off'}><td>e{e}</td>"
+            f"<td>{'✓' if ok else '✗'}</td>"
             f"<td style='text-align:left'><span class=bar style='width:{w:.0f}px'></span>"
             f"{100*a['usage'][e]:.1f}%</td>"
             f"<td>{int(a['n_chosen'][e]):,}</td>"
             f"<td>{100*a['n_top1'][e]/max(a['n_records'],1):.1f}%</td>"
-            f"<td>{a['gate_mean_when_chosen'][e]:.3f}</td>"
-            f"<td>{a['delta_norm'][e]:.2f}</td>"
+            f"<td>{fmt(a['gate_mean_when_chosen'][e], 3)}</td>"
+            f"<td>{fmt(a['delta_norm'][e])}</td>"
             f"<td style='text-align:left'>"
             + esc(", ".join(f"{n} ({z:+.1f})" for n, z in top_labels(a["disease_z"][e], dn)) or "—")
             + "</td></tr>")
-    P.append("<div class=scroll><table><tr><th>expert</th><th>% ảnh được chọn</th>"
+    P.append("<div class=scroll><table><tr><th>expert</th><th>vào bảng</th>"
+             "<th>% ảnh được chọn</th>"
              "<th>lượt</th><th>là top-1</th><th>gate TB</th><th>‖Δh‖ TB</th>"
              "<th>chuyên môn (z&gt;0.35)</th></tr>" + "".join(rows) + "</table></div>")
 
     # ── heatmap expert × bệnh / aspect ───────────────────────────────────────
-    def heat(M, names, title, note):
+    def heat(M, names, title, note, idx):
         head = "".join(f"<th class=rot><div>{esc(n)}</div></th>" for n in names)
         body = []
-        for e in range(E):
+        for e in idx:
             cells = "".join(
                 f"<td class=h style='background:{col_div(M[e][j])}' "
                 f"title='{esc(names[j])} · z={M[e][j]:+.2f}'>{M[e][j]:+.1f}</td>"
@@ -774,15 +1021,17 @@ def dump_html(a, out, source):
                 f"<div class=scroll><table class=hm><tr><th>exp</th>{head}</tr>"
                 + "".join(body) + "</table></div>")
 
-    if len(dn):
+    if len(dn) and live:
         P.append(heat(a["disease_z"], dn, "Expert × bệnh",
-                      "z-score theo CỘT: đỏ = expert này đẩy bệnh đó mạnh hơn "
+                      f"Chỉ {NP} expert có mặt trong dữ liệu. z-score theo CỘT: "
+                      "đỏ = expert này đẩy bệnh đó mạnh hơn "
                       "mặt bằng các expert khác, xanh = yếu hơn. Chuẩn theo cột "
                       "vì mặt bằng logit của từng tên bệnh chênh nhau cả bậc. "
-                      "Số thô: <code>expert_disease_mean.csv</code>."))
-    if len(an):
+                      "Số thô: <code>expert_disease_mean.csv</code>.", live))
+    asp = [e for e in live if a["n_aspect"][e] > 0]
+    if len(an) and asp:
         P.append(heat(a["aspect_z"], an, "Expert × aspect",
-                      "Cùng cách đọc, trên 4 tên aspect."))
+                      f"Cùng cách đọc, trên {len(an)} tên aspect.", asp))
 
     # ── ma trận tương đồng ───────────────────────────────────────────────────
     P.append("<h2>Expert giống nhau tới đâu</h2>")
@@ -790,12 +1039,12 @@ def dump_html(a, out, source):
              "hồ sơ trung bình của cả nhóm. Không trừ thì mọi cặp đều ~0.9 (các "
              "expert cùng sống trong miền X-quang) và ma trận vô nghĩa. "
              "+1 = trùng hướng, 0 = độc lập, −1 = đối lập.</p>")
-    head = "".join(f"<th>e{j}</th>" for j in range(E))
+    head = "".join(f"<th>e{j}</th>" for j in live)
     sim = a["similarity"]
     body = []
-    for i in range(E):
+    for i in live:
         cells = []
-        for j in range(E):
+        for j in live:
             if i == j:
                 cells.append("<td class=h style='background:transparent'>—</td>")
                 continue
@@ -814,11 +1063,12 @@ def dump_html(a, out, source):
              "(chuẩn hoá theo chính nó — câu hỏi là <i>nhìn ĐÂU</i>). "
              "Token = unembedding mà expert đẩy lên mạnh nhất trên cả tập.</p>")
     cards = []
-    for e in range(E):
+    for e in live:
         c = [f"<div class=ex><h3>Expert {e}</h3>",
              f"<div class=m>{100*a['usage'][e]:.1f}% số ảnh · gate TB "
-             f"{a['gate_mean_when_chosen'][e]:.3f} · ‖Δh‖ {a['delta_norm'][e]:.2f}</div>"]
-        if a["spatial"] is not None:
+             f"{fmt(a['gate_mean_when_chosen'][e], 3)} · "
+             f"‖Δh‖ {fmt(a['delta_norm'][e])}</div>"]
+        if a["spatial"] is not None and a["n_spatial"][e] > 0:
             h, w = a["grid"]
             m = a["spatial"][e]
             mx = m.max() or 1.0
@@ -902,11 +1152,17 @@ def main(argv=None):
     if not args.no_html:
         dump_html(a, args.out, source)
 
+    if a["absent"] and not args.quiet:
+        for x in a["absent"]:
+            print(f"⚠ e{x['expert']} KHÔNG vào bảng tổng hợp ({x['reason']}, "
+                  f"được chọn {x['n_chosen']:,} lần) — để riêng ở mục "
+                  f"'Expert không tham gia'")
+
     if not args.quiet:
         lvl, _ = verdict(a)
-        print(f"✓ {a['n_records']:,} bản ghi | {a['n_expert']} expert top-"
-              f"{a['top_k']} | clone_index {a['clone_index']:.3f} ({lvl}) | "
-              f"balance {a['balance']:.3f}")
+        print(f"✓ {a['n_records']:,} bản ghi | {a['n_profiled']}/{a['n_expert']} "
+              f"expert có mặt, top-{a['top_k']} | clone_index "
+              f"{a['clone_index']:.3f} ({lvl}) | balance {a['balance']:.3f}")
         print(f"✓ ghi đè {os.path.relpath(args.out, ROOT)}/ : "
               f"{'index.html, ' if not args.no_html else ''}SUMMARY.md, "
               f"summary.json, {len(glob.glob(os.path.join(args.out, '*.csv')))} CSV")

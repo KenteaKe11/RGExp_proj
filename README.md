@@ -1122,7 +1122,7 @@ thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, c�
 
 | File | Là gì |
 |---|---|
-| `index.html` | một file tự chứa: kết luận, 4 KPI, bảng router chọn ai, heatmap expert×bệnh và expert×aspect, ma trận tương đồng E×E, và E thẻ expert kèm bản đồ 16×16 + top token |
+| `index.html` | một file tự chứa: kết luận, KPI, mục "Expert không tham gia", bảng router chọn ai, heatmap expert×bệnh và expert×aspect, ma trận tương đồng, và một thẻ cho mỗi expert có mặt (bản đồ 16×16 + top token) |
 | `SUMMARY.md` | bản đọc thẳng trên GitHub; bản đồ 16×16 vẽ bằng ký tự khối |
 | `summary.json` | cùng số liệu, dạng máy đọc |
 | `expert_*.csv` | ma trận thô: usage, disease mean/z, aspect mean/z, similarity, cooccurrence, top token, spatial |
@@ -1141,6 +1141,24 @@ thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, c�
 - `gate_max` so với `1/top_k` — hai số gần bằng nhau nghĩa là router chia đều
   trọng số cho k expert được chọn, tức đang **trung bình cộng chứ chưa định
   tuyến**.
+
+**Expert vắng mặt được để RIÊNG, không gộp.** Nếu qua tất cả snapshot mà một
+expert không thu được thông số nào — router chưa từng chọn nó
+(`router_never_picked`), hoặc có chọn nhưng bản ghi không kèm vector bệnh
+(`no_profile`) — thì nó bị **loại khỏi mọi bảng tổng hợp** và liệt kê riêng ở
+mục "Expert không tham gia" kèm lý do. Cho nó vào với tư cách một hàng 0 sẽ:
+kéo trung bình cột về 0 nên z-score của **mọi** expert khác dịch lên, phình std
+nên khác biệt thật bị nén phẳng, và pha loãng `clone_index` về 0 — đọc ra thành
+"các expert phân hoá rõ" trong khi thực ra chỉ là thiếu dữ liệu. Trong code
+điều này được thi hành bằng NaN chứ không phải 0: NaN không cộng vào đâu được
+nên mọi chỗ dùng phải xử lý tường minh.
+
+Ngoại lệ có chủ ý: `balance` và `usage_cv` vẫn tính trên **đủ E** expert. Chúng
+đo router chia việc thế nào, mà "expert này chưa từng được chọn" chính là dữ
+kiện quan trọng nhất của câu đó — loại nó ra là tự xoá bằng chứng. Mỗi con số
+đều ghi rõ mẫu số của nó (`clone_index_over`, `balance_over` trong
+`summary.json`), và `expert_usage.csv` giữ đủ E hàng với cột `active`, kèm
+`expert_absent.csv` liệt kê ai bị loại vì lý do gì.
 
 Heatmap chuẩn hoá **theo cột** (z-score giữa các expert cho từng bệnh), không
 theo hàng: mặt bằng logit của từng tên bệnh chênh nhau cả bậc — tên hiếm trong
