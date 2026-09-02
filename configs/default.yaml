@@ -47,7 +47,7 @@ fixed:
   # tính toán khi CẢ BATCH cùng bỏ qua một expert (xem src/moe.py::CTX.active);
   # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
   # tế xấp xỉ 12 bản delta/step, KHÔNG phải 4.
-  n_expert: 8
+  n_expert: 6
   top_k: 3
 
   # Nhiễu Gumbel cộng vào route logit khi CHỌN top-k, chỉ lúc TRAINING
@@ -71,7 +71,7 @@ fixed:
   # đây (~±2). 0 = tắt hẳn cơ chế cân bằng (chỉ dùng để đo xem nó có tác dụng
   # gì không — router sẽ sập về vài expert trong vòng vài trăm step).
   # GIÁ TRỊ SAU WARMUP — xem decay_warmup_steps.
-  bias_gamma: 0.02
+  bias_gamma: 0.01
 
   # TRẦN của bias — MỚI, và là thứ thiếu ở lần chạy trước. Quy tắc sign ở
   # trên không có điểm dừng: nó đẩy bias tới BẤT KỲ độ lớn nào cần để cân
@@ -81,7 +81,7 @@ fixed:
   # 0.5 cho bias đủ sức lật hạng 4 ↔ hạng 5, không đủ lật hạng 4 ↔ hạng 10.
   # Đọc `bias_sat` trong log: >0 kéo dài = router thật sự chỉ tin vài
   # expert, và câu trả lời KHÔNG phải là nới trần.
-  bias_clip: 0.5
+  bias_clip: 1.0
 
   # ── Backbone ảnh của router ──────────────────────────────────────────────
   # DenseNet-121 pretrain trên chính X-quang ngực (torchxrayvision). Router
@@ -269,7 +269,7 @@ run:
   # micro-batch đầu. Muốn ép cho MỘT lần chạy thì dùng
   #     --set run.train_bs=2 --set run.grad_accum=16
   train_bs: 8
-  grad_accum: 4
+  grad_accum: 8
   infer_bs: 8
   grad_ckpt: null
   num_workers: 4            # DataLoader worker — hạ xuống 2 trên máy ít vCPU
@@ -323,7 +323,7 @@ run:
   swa_use: never
 
   # §1.7 — Total_Loss = 1·CE + 0.2·ASL   (tỉ lệ CHỐT, không còn số hạng Aux)
-  w_sup: 0.4                # hệ số nhánh supervised
+  w_sup: 0.5                # hệ số nhánh supervised
 
   # ── ASL: Asymmetric Loss trên 14 finding (§1.6) ──────────────────────────
   # Nhánh supervised KHÔNG còn softmax 4 aspect + Focal. Nhãn 4 aspect của

@@ -46,7 +46,7 @@ Bốn thứ đọc ra từ mỗi dấu vân tay:
     trên toàn vocab 262k. Không giới hạn trong danh sách nào, nên nó bắt được
     cả những chuyên môn mà cả năm nhóm trên đều không nghĩ tới.
 
-═══ Hai quyết định thiết kế cần biết trước khi đọc số ═══
+═══ Ba quyết định thiết kế cần biết trước khi đọc số ═══
 
 **1. Teacher-forcing, không generate lại.** Forward probe cho ăn prompt + ảnh
 + ĐÚNG báo cáo tham chiếu, y hệt một step train. Lý do: lúc generate, chuỗi
@@ -59,6 +59,16 @@ nhìn prompt + ảnh, đúng thứ nó nhìn lúc infer.
 **2. Bật expert với trọng số 1.0, không phải g_e của router.** Đo "expert này
 là gì", không phải "expert này đóng góp bao nhiêu vào mẫu này". Trọng số thật
 vẫn được ghi trong `gate` của từng bản ghi, muốn quy đổi lại thì nhân sau.
+
+**3. Định tuyến TẤT ĐỊNH: σ = 0 và bias KHÔNG cộng vào điểm chọn.** Nhiễu
+Gumbel và `expert_bias` là hai cơ chế của lúc TRAIN — một cái để expert hạng 5
+thỉnh thoảng còn được chạy, một cái để ép tải chia đều. Ở probe cả hai chỉ làm
+hỏng phép đo: σ khiến `chosen` của cùng một ảnh đổi giữa hai lần chạy, còn bias
+khiến `chosen` lệch khỏi `prob` mà đọc bản ghi không ra được lý do. `run_probe`
+ép tắt cả hai NGAY TỪ ĐẦU, không dựa vào mặc định của config, nên top-k ghi
+trong bản ghi là thuần cái fine-tuning học được. Bản thân `expert_bias` trong
+checkpoint không bị xoá — chỉ là không dùng; mỗi bản ghi tự khai bằng
+`router.route_noise = 0` và `router.bias_applied = false`.
 
 ═══ Vì sao KHÔNG có ma trận 14×4 ═══
 
@@ -396,6 +406,35 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
     key_col = cfg.data.image_column
     E, K = f.n_expert, f.top_k
 
+    # ── Định tuyến TẤT ĐỊNH: tắt cứng nhiễu Gumbel và bias cân bằng tải ─────
+    # Cả hai là công cụ của lúc TRAIN, không phải của phép đo:
+    #
+    #   * σ·Gumbel tồn tại để expert xếp hạng 5 thỉnh thoảng vẫn được chạy và
+    #     nhận gradient. Ở probe nó chỉ làm tập top-k đổi giữa hai lần chạy
+    #     CÙNG một ảnh — `chosen`/`gate` trong bản ghi hết tái lập, mà bản ghi
+    #     lại là thứ duy nhất còn lại sau phiên Kaggle.
+    #   * expert_bias là cái núm ép tải chia đều. Để nó cộng vào điểm chọn thì
+    #     `chosen` không còn là "router tin expert nào" mà là "router tin +
+    #     lịch sử tải lúc train", và nó lệch hẳn khỏi `prob` — đúng cái lỗi
+    #     lần chạy trước mắc phải mà không đọc ra được lý do.
+    #
+    # `router.eval()` ở src/train.py đã tắt cả hai theo mặc định
+    # (`router_bias_at_eval: false`), nhưng probe KHÔNG dựa vào mặc định đó:
+    # một config bật `router_bias_at_eval` lên là toàn bộ 3000 bản ghi im lặng
+    # đo sai. Ép ở đây để mode=probe luôn đọc thuần cái fine-tuning học được.
+    router = bridge.router
+    router.eval()
+    router.set_route_noise(0.0)
+    bias_was = bool(router.apply_bias_at_eval)
+    router.apply_bias_at_eval = False
+    bias_span = float(router.expert_bias.max() - router.expert_bias.min())
+    log("probe", f"định tuyến tất định: σ=0, bias KHÔNG cộng vào điểm chọn "
+                 f"(bias_span={bias_span:.4f} của checkpoint vẫn giữ nguyên "
+                 f"trong trọng số, chỉ không dùng)")
+    if bias_was:
+        warn("probe", "config bật router_bias_at_eval=true — probe BỎ QUA nó "
+                      "để `chosen` khớp với `prob`")
+
     local = os.path.join(r.out_dir, "probe_records")
     stream = HubStream(r.probe_repo, hf_token, local,
                        every_min=float(r.probe_commit_every),
@@ -582,6 +621,10 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             "router": {"gate": [round(float(v), 5) for v in gate.tolist()],
                        "prob": prob,
                        "chosen": chosen,
+                       # Bằng chứng trong CHÍNH bản ghi rằng top-k này là tất
+                       # định: không nhiễu Gumbel, không bias cân bằng tải.
+                       "route_noise": 0.0,
+                       "bias_applied": False,
                        "entropy": round(float(stats.get("route_entropy", 0)), 5),
                        "gate_max": round(float(stats.get("gate_max", 0)), 5)},
             "report": report,
