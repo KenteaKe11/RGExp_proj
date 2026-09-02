@@ -71,7 +71,7 @@ fixed:
   # đây (~±2). 0 = tắt hẳn cơ chế cân bằng (chỉ dùng để đo xem nó có tác dụng
   # gì không — router sẽ sập về vài expert trong vòng vài trăm step).
   # GIÁ TRỊ SAU WARMUP — xem decay_warmup_steps.
-  bias_gamma: 0.01
+  bias_gamma: 0.1
 
   # TRẦN của bias — MỚI, và là thứ thiếu ở lần chạy trước. Quy tắc sign ở
   # trên không có điểm dừng: nó đẩy bias tới BẤT KỲ độ lớn nào cần để cân
@@ -81,7 +81,7 @@ fixed:
   # 0.5 cho bias đủ sức lật hạng 4 ↔ hạng 5, không đủ lật hạng 4 ↔ hạng 10.
   # Đọc `bias_sat` trong log: >0 kéo dài = router thật sự chỉ tin vài
   # expert, và câu trả lời KHÔNG phải là nới trần.
-  bias_clip: 1.0
+  bias_clip: 2.0
 
   # ── Backbone ảnh của router ──────────────────────────────────────────────
   # DenseNet-121 pretrain trên chính X-quang ngực (torchxrayvision). Router
