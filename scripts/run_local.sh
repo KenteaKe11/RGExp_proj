@@ -12,6 +12,11 @@
 #   bash scripts/run_local.sh --mode test              # chỉ chấm điểm ckpt
 #
 # Mọi tham số được chuyển thẳng cho src.train. Xem `--help` để biết đủ.
+#
+# RGEXP_TRAIN_CONFIG=configs/v100_32g.yaml  -> chèn `--config` vào TRƯỚC mọi
+# tham số, nên `--config` gõ tay vẫn thắng (argparse lấy lần xuất hiện cuối).
+# Nhờ đó sweep.sh và docker_bootstrap.sh dùng được profile khác mà không phải
+# sửa gì trong chúng.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -57,6 +62,17 @@ CONSOLE="logs/console_$(date +%Y%m%d_%H%M%S).log"
 # chỗ để khỏi đi tìm log ở ./outputs rồi tưởng là chưa chạy.
 OUTBASE="$RGEXP_OUTBASE"
 
+# Profile config (nếu có). Mảng để đường dẫn có dấu cách không bị tách.
+CFG_ARGS=()
+if [ -n "${RGEXP_TRAIN_CONFIG:-}" ]; then
+    if [ ! -f "$RGEXP_TRAIN_CONFIG" ]; then
+        echo "✗ RGEXP_TRAIN_CONFIG=$RGEXP_TRAIN_CONFIG — không thấy file."
+        exit 1
+    fi
+    CFG_ARGS=(--config "$RGEXP_TRAIN_CONFIG")
+    echo "⚙ config: $RGEXP_TRAIN_CONFIG"
+fi
+
 rgexp_banner
 echo "═══ console: $CONSOLE ═══"
 echo "═══ log chi tiết: $OUTBASE/<tag>/logs/latest.log ═══"
@@ -64,7 +80,7 @@ echo
 
 # stdbuf -oL: ép line-buffered để log hiện ngay, không đợi tiến trình kết thúc.
 set -o pipefail
-stdbuf -oL -eL "$PYBIN" -m src.train "$@" 2>&1 | tee "$CONSOLE"
+stdbuf -oL -eL "$PYBIN" -m src.train "${CFG_ARGS[@]}" "$@" 2>&1 | tee "$CONSOLE"
 RC=${PIPESTATUS[0]}
 
 if [ "$RC" -ne 0 ]; then

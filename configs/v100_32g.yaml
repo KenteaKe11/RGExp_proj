@@ -1,0 +1,92 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# PROFILE: 1× Tesla V100-SXM2 32GB (sm70) — GPU thuê theo giờ
+#
+#   python -m src.train --config configs/v100_32g.yaml --dry-run
+#   bash scripts/run_v100.sh --dry-run          # y hệt, kèm mở cổng sm70
+#
+# File này KHÔNG chép lại default.yaml. `extends:` gộp SÂU nó lên trên bản
+# mặc định, nên ở đây chỉ có đúng những khoá mà PHẦN CỨNG bắt phải đổi. Mọi
+# tham số training (n_expert, top_k, lr, loss, lịch Gumbel, guard...) giữ
+# nguyên -> lần chạy trên V100 vẫn so sánh được với lần chạy trên A100 và
+# vẫn bàn giao checkpoint qua Hub được cho nhau.
+#
+# ── VÌ SAO fp32 CHỨ KHÔNG PHẢI fp16 ─────────────────────────────────────────
+# V100 là sm70: KHÔNG có bf16 (cần sm80+). Còn lại hai lựa chọn, và chỉ một
+# cái chạy được:
+#
+#   fp16  ✗  Gemma 3 được Google train bằng bf16 và biên độ activation của nó
+#            leo đều qua từng layer — đo bằng hook trên T4:
+#              layer0 12400 → 12936 → 14456 → 19936 → 24992 → layer4 51072
+#            trần fp16 là 65504, nên nó tràn ở layer 5. Expert đầu tiên mãi
+#            layer 6 mới có mặt: đây KHÔNG phải lỗi MoE, không sửa được bằng
+#            cách chỉnh w_aux/route_noise, và biểu hiện là loss = NaN ngay
+#            STAGE 0 (src/train.py bắt bằng assert Σ|grad| router hữu hạn).
+#
+#   fp32  ✓  Dải số 3e38, không có gì để tràn. Đã chạy thật trên T4 sm75:
+#            ce=8.8844, grad_norm=11.973. V100 là cùng một đường, chỉ nhanh
+#            hơn: 15.7 TFLOPS fp32 và 900GB/s HBM2 so với 8.1 TFLOPS và
+#            320GB/s của T4.
+#
+# Điều đó có nghĩa là 640 tensor core của V100 (fp16-only, 125 TFLOPS) NẰM
+# KHÔNG. Không có cách nào lấy lại: autocast fp16 cũng cho ra activation fp16
+# ở chính những layer đang vượt 65504. Đây là cái giá của sm70, không phải
+# chỗ để tối ưu thêm.
+#
+# ── TỐC ĐỘ & TIỀN — ĐỌC TRƯỚC KHI THUÊ DÀI ──────────────────────────────────
+# Mốc đo thật trên T4 fp32: 0.04-0.06 mẫu/s. V100 fp32 kỳ vọng ~2-3× →
+# 0.10-0.15 mẫu/s (STAGE 0 sẽ in con số THẬT của máy bạn — tin nó, đừng tin
+# dòng này). Ở 0.12 mẫu/s:
+#
+#     1 giờ  ≈ 430 mẫu          1 cycle LR (1600 mẫu) ≈ 3.7h
+#     1 epoch = 153.000 mẫu ≈ 354 giờ ≈ 15 ngày chạy liên tục
+#
+# Ở 8.500đ/giờ thì một epoch ≈ 3 triệu đồng. Card Ampere (3090/4090/L40S)
+# chạy bf16 nhanh hơn 4-8× ở cùng batch, nên nếu giá thuê của chúng dưới 4×
+# giá này thì mỗi mẫu học được RẺ HƠN trên card Ampere. V100 đáng tiền khi:
+#   * chỉ cần một phiên chấm điểm (mode: test) hoặc probe — forward-only;
+#   * cần 32GB VRAM giá rẻ;
+#   * hoặc chỉ muốn nối thêm vài giờ train vào checkpoint đang có (hub_sync
+#     lo phần đồng bộ, xem run.hub_sync trong default.yaml).
+#
+# ── flash-attn: ĐỪNG CÀI ────────────────────────────────────────────────────
+# FA2 chỉ có kernel cho sm80+ và chỉ nhận fp16/bf16. src/config.py tự chọn
+# sdpa khi thấy sm<80 hoặc fp32, nên INSTALL_FLASH_ATTN=1 ở đây chỉ tốn 15
+# phút build rồi không bao giờ được dùng.
+#
+# ── torch: phải là bản CÓ kernel sm70 ───────────────────────────────────────
+# PyTorch bỏ Volta khỏi các bản dựng CUDA 12.8+ (từ 2.11). Bản cu126 là mốc
+# cuối còn sm70 — scripts/setup.sh đã ghim cu126 khi thấy sm70, nhưng nếu bạn
+# tự cài tay thì nhớ:  --index-url https://download.pytorch.org/whl/cu126
+# Dấu hiệu sai bản: "no kernel image is available for execution on the device".
+# bitsandbytes NF4 thì chạy từ sm60 trở lên, V100 không vướng gì.
+# ═════════════════════════════════════════════════════════════════════════════
+extends: default.yaml
+
+fixed:
+  # Khai báo RÕ là đang chạy ngoài đường bf16 — để không ai đọc metrics của
+  # lần chạy này rồi tưởng nó cùng điều kiện với các ô sm80+.
+  require_bf16: false
+  compute_dtype: float32
+  trainable_dtype: float32     # vốn đã là fp32; ghi lại cho khỏi phải tra
+
+run:
+  # 32GB thật ≈ 16GB "bf16-tương đương" (fp32 ăn gấp đôi). T4 16GB fp32 chạy
+  # được train_bs=1 ở đỉnh 9.1GB, nên 2 là chỗ an toàn để bắt đầu và 4 là
+  # thứ ĐÁNG THỬ bằng dry-run trước khi cam kết cả phiên:
+  #     bash scripts/run_v100.sh --dry-run --set run.train_bs=4 \
+  #                                        --set run.grad_accum=8
+  # Giữ effective batch = 32 như mọi preset khác; đổi nó là đổi bài toán tối
+  # ưu chứ không phải đổi hạ tầng.
+  # Dùng lại profile này cho T4 16GB (sm75) thì PHẢI hạ xuống 1 × 32 — 16GB
+  # fp32 chỉ vừa đúng một mẫu (đỉnh 9.1GB); scripts/kaggle_t4x2.py đã đặt sẵn.
+  train_bs: 2
+  grad_accum: 16
+  infer_bs: 2
+  grad_ckpt: true
+
+  # Lịch LR đếm bằng MẪU nên nó không phụ thuộc batch — nhưng độ dài cycle
+  # thì nên vừa một phiên thuê. 1600 mẫu ≈ 3.7h ở 0.12 mẫu/s: một phiên 12h
+  # đi trọn ~3 vòng, và dừng máy ở gần đáy cosine cho trọng số cuối "yên"
+  # hơn (từ khi bỏ SWA thì đó là cách duy nhất còn lại để chọn điểm dừng).
+  cycle_samples: 1600
+  warmup_samples: 256          # 16% cycle, bội của effective batch 32

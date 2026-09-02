@@ -58,6 +58,53 @@ def remote_is_on(enabled="auto"):
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
+def _deep_merge(base, over):
+    """Gộp `over` VÀO `base` theo chiều sâu; dict thì đệ quy, còn lại thì đè."""
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def read_yaml(path):
+    """Đọc một file config, theo `extends:` lên config cha nếu có.
+
+    Một file profile (vd configs/v100_32g.yaml) chỉ ghi ĐÚNG những khoá nó
+    đổi, dòng đầu là:
+
+        extends: default.yaml     # tương đối với chính file đó
+
+    rồi được gộp SÂU lên trên default.yaml. Chép cả 430 dòng ra file thứ hai
+    là cách chắc chắn nhất để hai file lệch nhau sau vài lần sửa: khoá mới
+    thêm ở default sẽ không bao giờ tới được profile, và không ai nhận ra.
+
+    encoding="utf-8" là BẮT BUỘC, không phải trang trí: config có tiếng Việt,
+    và trên Windows `open()` mặc định là cp1252 -> UnicodeDecodeError ngay
+    dòng đầu.
+    """
+    return _read_yaml_chain(os.path.abspath(path), [])
+
+
+def _read_yaml_chain(path, seen):
+    if path in seen:
+        raise ValueError("`extends:` tạo vòng lặp: "
+                         + " -> ".join(seen + [path]))
+    with open(path, encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh) or {}
+    parent = raw.pop("extends", None)
+    if not parent:
+        return raw
+    ppath = (parent if os.path.isabs(parent)
+             else os.path.join(os.path.dirname(path), parent))
+    ppath = os.path.abspath(ppath)
+    if not os.path.exists(ppath):
+        raise FileNotFoundError(
+            f"{path}: extends: {parent!r} -> không thấy {ppath}")
+    return _deep_merge(_read_yaml_chain(ppath, seen + [path]), raw)
+
+
 def read_remote(path):
     """Đọc RIÊNG khối `remote`, không đụng phần còn lại của config.
 
@@ -65,8 +112,7 @@ def read_remote(path):
     được config thiếu/hỏng — lúc đó cứ coi như không bật remote.
     """
     try:
-        with open(path) as fh:
-            raw = yaml.safe_load(fh) or {}
+        raw = read_yaml(path)
     except Exception:
         raw = {}
     r = dict(REMOTE_DEFAULTS)
@@ -164,7 +210,7 @@ def adapter_desc(f, arch=None):
             f"top-{f.top_k} (thuần top-k, không expert hứng)")
 
 
-def detect_hardware(require_bf16=True):
+def detect_hardware(require_bf16=True, compute_dtype="bfloat16"):
     import torch
 
     if not torch.cuda.is_available():
@@ -184,16 +230,37 @@ def detect_hardware(require_bf16=True):
         if require_bf16:
             raise RuntimeError(
                 f"GPU sm{sm[0]}{sm[1]} không hỗ trợ bf16. Cần Ampere trở lên "
-                f"(sm80+), hoặc đặt fixed.require_bf16=false + "
-                f"fixed.compute_dtype=float16 nếu chấp nhận rủi ro tràn số.")
-        print(f"⚠ GPU sm{sm[0]}{sm[1]} KHÔNG có bf16 — chạy fp16 theo yêu cầu "
-              f"config. Loss = NaN/inf ở vài step đầu là dấu hiệu tràn số, "
-              f"không phải lỗi cấu hình.")
+                f"(sm80+), HOẶC chạy fp32 bằng profile có sẵn:\n"
+                f"    bash scripts/run_v100.sh --dry-run\n"
+                f"    python -m src.train --config configs/v100_32g.yaml\n"
+                f"(V100 sm70 / T4 sm75 — xem README §0.3.)")
+        dt = str(compute_dtype)
+        if "float32" in dt:
+            print(f"✓ GPU sm{sm[0]}{sm[1]} không có bf16 -> chạy fp32. Chậm "
+                  f"hơn bf16 khoảng 2-3× nhưng KHÔNG tràn số, và số học rộng "
+                  f"hơn bf16 nên checkpoint vẫn bàn giao được với máy sm80+.")
+        elif "float16" in dt:
+            print(f"⚠ GPU sm{sm[0]}{sm[1]} KHÔNG có bf16 và bạn chọn fp16. "
+                  f"Gemma 3 tràn activation quanh layer 5 (đo được: 51072 ở "
+                  f"layer 4, trần fp16 là 65504) -> loss NaN/inf ngay STAGE 0. "
+                  f"Dùng compute_dtype=float32 thay vì đi tìm lỗi wiring.")
     return hw
 
 
-def pick_attn_impl():
-    """flash_attention_2 > sdpa. Cả hai đều dùng kernel hợp nhất trên GPU."""
+def pick_attn_impl(sm=None, compute_dtype=None):
+    """flash_attention_2 > sdpa. Cả hai đều dùng kernel hợp nhất trên GPU.
+
+    HAI cửa loại FA2, và cả hai đều nổ MUỘN (lúc forward, không phải lúc nạp
+    model) nếu để lọt:
+      * kernel FA2 chỉ build cho sm80+  -> V100 (sm70) / T4 (sm75) không có;
+      * FA2 chỉ nhận fp16/bf16          -> mọi lần chạy fp32 đều loại.
+    sdpa không mất gì đáng kể ở đây: nó cũng là kernel hợp nhất, chỉ là chọn
+    backend mem-efficient/math thay vì flash.
+    """
+    if sm is not None and sm[0] < 8:
+        return "sdpa"
+    if compute_dtype is not None and "float32" in str(compute_dtype):
+        return "sdpa"
     try:
         import flash_attn  # noqa: F401
         return "flash_attention_2"
@@ -201,14 +268,27 @@ def pick_attn_impl():
         return "sdpa"
 
 
-def pick_preset(vram_gb):
+def pick_preset(vram_gb, compute_dtype=None):
+    """Chọn batch theo VRAM. fp32 thì VRAM hiệu dụng chỉ còn MỘT NỬA.
+
+    Bảng PRESETS đo trên đường bf16. Ở fp32 mọi activation, mọi bản base
+    weight vừa dequantize và mọi bản delta của expert đều rộng gấp đôi, nên
+    một V100 32GB chạy fp32 xếp cùng bậc với một card 16GB chạy bf16 — chia
+    đôi rồi mới tra bảng, thay vì để STAGE 0 phát hiện bằng một cú OOM.
+    """
+    fp32 = compute_dtype is not None and "float32" in str(compute_dtype)
+    eff_gb = vram_gb / 2 if fp32 else vram_gb
     for min_vram, name, bs, accum, ibs, ckpt in PRESETS:
-        if vram_gb >= min_vram:
-            if vram_gb < 12:
-                print(f"⚠ Chỉ {vram_gb:.1f}GB VRAM — dưới sàn thực tế của QDoRA "
-                      f"12 expert. Nếu OOM ở STAGE 0 thì không có preset nào "
-                      f"cứu được, phải hạ fixed.n_expert (mất tính so sánh) "
-                      f"hoặc đổi GPU.")
+        if eff_gb >= min_vram:
+            if eff_gb < 12:
+                print(f"⚠ VRAM hiệu dụng {eff_gb:.1f}GB"
+                      + (f" ({vram_gb:.1f}GB thật, fp32 ăn gấp đôi)" if fp32
+                         else "")
+                      + f" — dưới sàn thực tế của QDoRA 12 expert. Nếu OOM ở "
+                        f"STAGE 0 thì không có preset nào cứu được, phải hạ "
+                        f"fixed.n_expert (mất tính so sánh) hoặc đổi GPU.")
+            if fp32:
+                name = f"{name} · fp32 ({vram_gb:.0f}GB thật)"
             return dict(name=name, train_bs=bs, grad_accum=accum,
                         infer_bs=ibs, grad_ckpt=ckpt)
     raise RuntimeError("Không khớp preset nào")
@@ -282,15 +362,20 @@ _DEAD_KEYS = {
 
 
 def load_config(path="configs/default.yaml", overrides=None):
-    with open(path) as fh:
-        raw = yaml.safe_load(fh)
+    raw = read_yaml(path)
     for ov in overrides or []:
         if "=" not in ov:
             raise ValueError(f"--set cần dạng khoa=gia_tri, nhận: {ov!r}")
         _deep_set(raw, *ov.split("=", 1))
 
-    hw = detect_hardware(bool(raw["fixed"].get("require_bf16", True)))
-    preset = pick_preset(hw.vram_gb)
+    # dtype phải đọc TRƯỚC khi dò phần cứng: cùng một GPU sm70, fp32 là
+    # đường chạy được còn fp16 là đường tràn số, và thông báo phải nói đúng
+    # cái đang xảy ra. Lúc này nó vẫn là CHUỖI ("float32"), map sang
+    # torch.dtype mãi tới cuối hàm.
+    _dtype_name = str(raw["fixed"].get("compute_dtype", "bfloat16"))
+    hw = detect_hardware(bool(raw["fixed"].get("require_bf16", True)),
+                         _dtype_name)
+    preset = pick_preset(hw.vram_gb, _dtype_name)
     # Khối `sweep` cũ (model + variant + n_block) đổi tên thành `arch` và chỉ
     # còn `model`. Đọc được cả hai để config cũ không nổ ngay ở dòng đầu —
     # nhưng variant/n_block trong đó sẽ rơi vào _DEAD_KEYS và bị báo.
@@ -562,7 +647,7 @@ def load_config(path="configs/default.yaml", overrides=None):
                  "float16": torch.float16}
     fixed["compute_dtype"] = dtype_map[fixed["compute_dtype"]]
     fixed["trainable_dtype"] = dtype_map[fixed["trainable_dtype"]]
-    fixed["attn_impl"] = pick_attn_impl()
+    fixed["attn_impl"] = pick_attn_impl(hw.sm, _dtype_name)
 
     cfg = SimpleNamespace(
         fixed=SimpleNamespace(**fixed),

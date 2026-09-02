@@ -1098,8 +1098,13 @@ def main(argv=None):
     # key, and value to have the same dtype". Adapter thì GIỮ fp32: lớp LoRA
     # tự cast x và trả kết quả về dtype cũ.
     is_adapter = lambda n: "lora_" in n or "dora_" in n     # noqa: E731
-    stale = [(n, p) for n, p in model.named_parameters()
-             if p.dtype == torch.float32 and not is_adapter(n)]
+    # Khi CHÍNH compute_dtype là fp32 (đường sm<80, configs/v100_32g.yaml) thì
+    # không có gì "sót" cả: mọi param base vốn đã đúng dtype. Không lọc ở đây
+    # thì log báo "ép 500 param base fp32 -> torch.float32" — một dòng vô
+    # nghĩa nhưng đủ để người đọc đi tìm một lỗi không tồn tại.
+    stale = [] if f.compute_dtype == torch.float32 else [
+        (n, p) for n, p in model.named_parameters()
+        if p.dtype == torch.float32 and not is_adapter(n)]
     for _, p in stale:
         p.data = p.data.to(f.compute_dtype)
     if stale:

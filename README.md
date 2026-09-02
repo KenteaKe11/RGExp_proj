@@ -82,7 +82,9 @@ python -m src.config          # cấu hình đã giải quyết (cần GPU)
 ## 0. Chạy nhanh
 
 Hai cách chạy, **cùng một code và cùng một config**; chỉ khác chỗ để file và
-cách giữ phiên.
+cách giữ phiên. Cả hai đều cần GPU **sm80+** (bf16). Card không có bf16 —
+V100 (sm70), T4 (sm75) — đi qua profile fp32 ở [§0.3](#03-gpu-không-có-bf16-v100-32gb--t4--profile-fp32),
+dùng chung được với cả hai cột dưới.
 
 | | Option 1 — GPU cục bộ | Option 2 — GPU thuê theo giờ ([§9](#9-chạy-trên-gpu-thuê-theo-giờ-docker)) |
 |---|---|---|
@@ -135,6 +137,54 @@ python -m src.train --mode train --no-dry-run
 Kiểm GPU **trước** khi tải 30GB dữ liệu: `python -m src.config` dừng ngay ở
 `detect_hardware()` nếu GPU không có bf16. Không thấy `/.dockerenv` thì ép
 bằng `RGEXP_REMOTE=1`. Chi tiết: [§9](#9-chạy-trên-gpu-thuê-theo-giờ-docker).
+
+### 0.3. GPU không có bf16 (V100 32GB / T4) — profile fp32
+
+```bash
+RGEXP_ALLOW_NO_BF16=1 bash scripts/setup.sh    # mở cửa kiểm sm80+ trong setup
+bash scripts/run_v100.sh --dry-run             # STAGE 0 với configs/v100_32g.yaml
+bash scripts/run_v100.sh --mode train --no-dry-run
+```
+
+`configs/v100_32g.yaml` **không chép lại** `default.yaml`: nó `extends:` bản
+mặc định và chỉ ghi đè đúng những khoá phần cứng bắt phải đổi (`compute_dtype`,
+`require_bf16`, batch, độ dài cycle). Mọi tham số training giữ nguyên, nên lần
+chạy trên V100 **so sánh được** với lần chạy trên A100 và hai máy vẫn bàn giao
+checkpoint qua Hub cho nhau được.
+
+**Vì sao fp32 chứ không phải fp16.** sm70/sm75 không có bf16, và fp16 thì
+Gemma 3 tràn: biên độ activation đo bằng hook trên T4 leo `12400 → 12936 →
+14456 → 19936 → 24992 → 51072` qua layer 0-4, trần fp16 là **65504** nên nó
+vỡ ở layer 5 — trước cả expert đầu tiên (layer 6). Triệu chứng là `loss = NaN`
+ngay STAGE 0, và **không** phải lỗi MoE/router: chỉnh `w_aux`, `route_noise`
+hay `n_expert` đều không cứu được. fp32 có dải 3e38, không có gì để tràn — đây
+là đường đã chạy thật trên T4 (`ce=8.8844`, `grad_norm=11.973`).
+
+**Cái giá.** fp32 bỏ không toàn bộ tensor core của V100 (chúng chỉ làm fp16),
+và mọi tensor rộng gấp đôi bf16 — nên `pick_preset()` chia đôi VRAM trước khi
+tra bảng: 32GB thật xếp cùng bậc với card 16GB chạy bf16, batch mặc định là
+`2 × 16`. Tốc độ kỳ vọng 0.10-0.15 mẫu/s (T4 fp32 đo được 0.04-0.06), tức
+1/5 - 1/8 một card Ampere chạy bf16. **STAGE 0 in số thật của máy bạn — quyết
+định thuê dài hay không sau khi đọc nó, không phải trước.**
+
+| | V100 32GB (sm70) | T4 16GB (sm75) | Ampere+ (sm80+) |
+|---|---|---|---|
+| dtype | fp32 | fp32 | bf16 |
+| config | `configs/v100_32g.yaml` | `scripts/kaggle_t4x2.py` | `configs/default.yaml` |
+| batch | `2 × 16` | `1 × 32` | theo preset VRAM |
+| attn | sdpa (FA2 cần sm80+) | sdpa | sdpa / flash-attn |
+| wheel torch | **cu126** — bản cuối còn kernel sm70 | ảnh Kaggle | cu121/cu124/cu128 |
+
+`setup.sh` tự ghim `cu126` khi thấy sm70: PyTorch bỏ Volta khỏi các bản dựng
+CUDA 12.8+ (từ 2.11), nạp bản đó lên V100 là `no kernel image is available`.
+bitsandbytes NF4 thì chạy từ sm60 trở lên nên V100 không vướng.
+
+Chạy trên máy thuê: `RGEXP_ALLOW_NO_BF16=1 bash scripts/docker_bootstrap.sh`
+tự chuyển cả STAGE 0 lẫn sweep sang profile này.
+
+**Chỗ V100 đáng tiền nhất** không phải train dài (một epoch ≈ 350 giờ) mà là
+một phiên `--mode test` / `--mode probe` (forward-only, 32GB VRAM rẻ), hoặc
+nối thêm vài giờ train vào checkpoint đang có — `hub_sync` lo phần đồng bộ.
 
 ---
 
@@ -600,8 +650,9 @@ router chưa từng chọn.
    token). Nhánh router thu cùng `pixel_values` đó về lại 512².
 2. **`max_seq_len = 896`** (ép cứng trong config) **+ 256 token router = 1152**
    vị trí thật trong decoder. Padding dùng `longest`.
-3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm75 (T4) trừ khi khai báo rõ
-   `fixed.require_bf16: false` + `compute_dtype: float16`.
+3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm70/sm75 (V100/T4); đường
+   đi vòng là profile fp32 `configs/v100_32g.yaml` ([§0.3](#03-gpu-không-có-bf16-v100-32gb--t4--profile-fp32)),
+   **không phải** `compute_dtype: float16` — fp16 tràn ở layer 5.
 4. **STAGE 0**: 2 step thử của đúng đồ thị thật. In `mẫu/s`, VRAM đỉnh, thời
    gian một epoch và một cycle LR. `--dry-run` dừng ở đây.
 5. **Train**: một phase multi-task, chạy tới khi bị dừng tay. Ckpt mỗi
@@ -695,7 +746,9 @@ steps.plot(x="step", y="loss")
 ```
 RGExp_proj/
 ├── requirements.txt          # deps, KHÔNG gồm torch
-├── configs/default.yaml      # fixed / arch / models / run / remote
+├── configs/
+│   ├── default.yaml          # fixed / arch / models / run / remote
+│   └── v100_32g.yaml         # ★ profile fp32 cho sm<80 (`extends: default.yaml`)
 ├── src/
 │   ├── router.py             # ★ Feat-Extractor + QFormer + 2 head + MLP Proj.
 │   │                         #   `python -m src.router` = bảng tham số + selftest
@@ -714,6 +767,7 @@ RGExp_proj/
 │   └── report.py             # gom các lần chạy
 └── scripts/
     ├── selftest.py           # ★ router + prefix + MoE + ASL + aux + lịch LR
+    ├── run_v100.sh           # ★ run_local.sh + profile fp32 (V100/T4)
     ├── kaggle_t4x2.py        # ★ cell Kaggle T4×2 (sm75, fp32)
     ├── kaggle_probe.py       # cell Kaggle cho mode=probe
     └── probe_summary.py      # ★ gộp bản ghi probe -> reports/probe/
@@ -814,7 +868,9 @@ phát hiện bên trong DataLoader worker.
 | Triệu chứng | Nguyên nhân | Cách xử lý |
 |---|---|---|
 | `torch.cuda.is_available()` = False | bản torch sai CUDA | `rm -rf .venv && bash scripts/setup.sh` |
-| `sm75 không hỗ trợ bf16` | GPU T4 | cần Ampere trở lên, hoặc khai `require_bf16: false` + `compute_dtype: float32` |
+| `sm70/sm75 không hỗ trợ bf16` | V100 / T4 | Ampere trở lên, hoặc profile fp32: `bash scripts/run_v100.sh` ([§0.3](#03-gpu-không-có-bf16-v100-32gb--t4--profile-fp32)) |
+| `no kernel image is available` trên V100 | wheel torch dựng cho CUDA 12.8+ đã bỏ Volta | cài lại: `pip install -U torch torchvision --index-url https://download.pytorch.org/whl/cu126` |
+| `loss = NaN` / `Σ|grad| router = nan` ngay STAGE 0 trên sm<80 | đang chạy fp16 — Gemma 3 tràn ở layer 5 | `--config configs/v100_32g.yaml` (fp32). Đừng đi soi router/MoE |
 | OOM ở STAGE 0 | batch quá lớn | `--set run.train_bs=1 --set run.grad_accum=32`, rồi hạ `fixed.n_expert`. Hạ `top_k` **không** cứu được ([§3.3](#33-moe-lora-hoạt-động-thế-nào)) |
 | OOM khi khởi tạo expert QDoRA | DoRA dequantize base weight, lặp cho MỖI expert | nâng `peft` (cần `LoraRuntimeConfig`), hoặc hạ `fixed.n_expert` |
 | `router không nhận gradient` ở STAGE 0 | gate bị tách khỏi đồ thị | kiểm `RouterBridge` + `moe.CTX`; đừng chạy tiếp |
@@ -865,6 +921,10 @@ Bước 4 chỉ cần khi `outputs/<tag>/logs/` trống — nghĩa là chết tr
 
 Khối `remote:` trong `configs/default.yaml` chỉ đổi **chỗ để file** và **cách
 chạy** — không đổi tham số training nào, nên kết quả hai option so sánh được.
+
+**GPU thuê không có bf16?** `RGEXP_ALLOW_NO_BF16=1` mở cửa kiểm phần cứng ở
+cả `docker_bootstrap.sh` lẫn `setup.sh`, và bootstrap tự chuyển sang
+`configs/v100_32g.yaml` ([§0.3](#03-gpu-không-có-bf16-v100-32gb--t4--profile-fp32)).
 
 **Bật / tắt.** `RGEXP_REMOTE` (env) > `remote.enabled` (yaml) > tự dò
 `/.dockerenv`. `src/config.py` đọc khối này **rất sớm** để export

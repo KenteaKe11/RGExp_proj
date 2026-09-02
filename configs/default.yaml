@@ -112,7 +112,10 @@ fixed:
   # trainable, vừa với VRAM của một T4.
   lora_targets: [q_proj, k_proj, v_proj, o_proj]
 
-  compute_dtype: bfloat16   # §4.1.3 — cần sm80+
+  # §4.1.3 — cần sm80+. GPU không có bf16 (V100 sm70 / T4 sm75) KHÔNG đổi
+  # khoá này thành float16 (Gemma 3 tràn ở layer 5) mà chạy hẳn profile fp32:
+  #     bash scripts/run_v100.sh --dry-run     # = --config configs/v100_32g.yaml
+  compute_dtype: bfloat16
   trainable_dtype: float32  # master weight adapter + router
   adam_eps: 1.0e-6
   quant_type: nf4
@@ -423,8 +426,10 @@ remote:
     extra: 8999
 
   # ── Ghi chú phần cứng: HAI cửa phải qua ───────────────────────────────────
-  # 1) bf16 -> chỉ Ampere trở lên (sm80+). V100/T4 không có, dừng ngay ở
-  #    detect_hardware().
+  # 1) bf16 -> chỉ Ampere trở lên (sm80+). V100/T4 không có: detect_hardware()
+  #    dừng ngay, TRỪ KHI chạy profile fp32 configs/v100_32g.yaml (chậm hơn
+  #    2-3× nhưng không tràn số — xem README §0.3). Trên card sm70 nhớ wheel
+  #    torch cu126: bản dựng CUDA 12.8+ đã bỏ kernel Volta.
   # 2) VRAM -> base NF4 ~2.5GB, nhưng QDoRA phải dequantize từng base weight
   #    trong forward và MoE giữ E bản delta cùng lúc. 16GB là sàn thực tế cho
   #    train_bs=1; 24GB trở lên mới thoải mái.

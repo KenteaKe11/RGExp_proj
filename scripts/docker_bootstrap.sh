@@ -16,6 +16,8 @@
 # Biến điều khiển:
 #   REPO_URL=...        repo git để clone (mặc định: origin của bản đang có)
 #   BRANCH=main
+#   RGEXP_ALLOW_NO_BF16=1   chấp nhận GPU sm70/sm75 (V100/T4) và chạy đường
+#                       fp32 — script tự chuyển sang configs/v100_32g.yaml
 #   SKIP_SWEEP=1        chỉ dựng môi trường + STAGE 0, không chạy sweep
 #   SWEEP_ARGS="..."    cờ đẩy thẳng cho sweep.sh, vd "--set run.num_epochs=1"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -41,12 +43,25 @@ MAJOR="${CAP%%.*}"
 case "$MAJOR" in
     ''|*[!0-9]*) echo "⚠ không đọc được compute capability — setup.sh sẽ kiểm bằng torch" ;;
     *)  if [ "$MAJOR" -lt 8 ]; then
-            die "GPU compute capability $CAP KHÔNG có bf16.
-  Dự án khoá bf16 (§4.1.3) nên cần Ampere trở lên: A100 / L40S / L4 / 3090 / 4090 / H100.
-  V100 = sm70, T4 = sm75 — cả hai đều dừng ở đây.
-  Xoá instance này và thuê lại đúng loại; đừng tải dữ liệu về máy này."
-        fi
-        echo "✓ compute capability $CAP (bf16 OK)" ;;
+            case "$(printf '%s' "${RGEXP_ALLOW_NO_BF16:-0}" | tr 'A-Z' 'a-z')" in
+                0|""|false|no|off)
+                    die "GPU compute capability $CAP KHÔNG có bf16.
+  Config mặc định khoá bf16 (§4.1.3) nên cần Ampere trở lên: A100 / L40S / L4 / 3090 / 4090 / H100.
+  V100 = sm70, T4 = sm75.
+  CÓ đường chạy cho hai card đó: fp32, chậm hơn ~2-3× (README §0.3). Bật bằng:
+      RGEXP_ALLOW_NO_BF16=1 bash scripts/docker_bootstrap.sh
+  Còn nếu bấm nhầm loại máy thì xoá instance NGAY, đừng tải dữ liệu về nó." ;;
+            esac
+            export RGEXP_ALLOW_NO_BF16=1
+            # Profile fp32: đặt ở đây thì cả STAGE 0 (bước 5) lẫn sweep (bước
+            # 6) đều dùng nó, vì run_local.sh đọc biến này (không script nào
+            # phải truyền --config qua tay).
+            export RGEXP_TRAIN_CONFIG="${RGEXP_TRAIN_CONFIG:-configs/v100_32g.yaml}"
+            echo "⚠ compute capability $CAP — không có bf16."
+            echo "  -> đi đường fp32 với $RGEXP_TRAIN_CONFIG (README §0.3)."
+        else
+            echo "✓ compute capability $CAP (bf16 OK)"
+        fi ;;
 esac
 
 # ── 2. Repo trên volume ──────────────────────────────────────────────────────

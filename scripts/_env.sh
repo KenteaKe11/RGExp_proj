@@ -24,6 +24,23 @@
 RGEXP_ROOT="${RGEXP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 RGEXP_CONFIG="${RGEXP_CONFIG:-$RGEXP_ROOT/configs/default.yaml}"
 
+# Config profile (vd configs/v100_32g.yaml) chỉ ghi những khoá nó đổi và trỏ
+# về cha bằng `extends:` — khối `remote:` nằm ở default.yaml. Đi ngược lên
+# tối đa 5 bậc để lấy đúng file CÓ khối đó; không có thì giữ nguyên và các
+# giá trị mặc định bên dưới sẽ được dùng (khớp REMOTE_DEFAULTS của python).
+_rgexp_hop=0
+while [ -f "$RGEXP_CONFIG" ] && [ "$_rgexp_hop" -lt 5 ] \
+      && ! grep -q '^remote:' "$RGEXP_CONFIG"; do
+    _rgexp_parent=$(sed -n 's/^extends:[[:space:]]*//p' "$RGEXP_CONFIG" \
+                    | head -1 | tr -d '"'"'"'' | sed 's/[[:space:]]*#.*$//')
+    [ -n "$_rgexp_parent" ] || break
+    case "$_rgexp_parent" in
+        /*) RGEXP_CONFIG="$_rgexp_parent" ;;
+        *)  RGEXP_CONFIG="$(dirname "$RGEXP_CONFIG")/$_rgexp_parent" ;;
+    esac
+    _rgexp_hop=$((_rgexp_hop + 1))
+done
+
 # ── Đọc khối remote: ─────────────────────────────────────────────────────────
 # Chỉ lấy các khoá ở mức thụt 2 space ngay dưới `remote:`; dừng khi gặp khoá
 # top-level kế tiếp. Bỏ comment, bỏ nháy, null -> rỗng.

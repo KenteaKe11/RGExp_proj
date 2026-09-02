@@ -5,6 +5,7 @@
 # Chạy MỘT LẦN sau khi giải nén:
 #     bash scripts/setup.sh                    # option 1: GPU cục bộ (venv)
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # option 2: container GPU thuê
+#     RGEXP_ALLOW_NO_BF16=1 bash scripts/setup.sh   # option 3: V100/T4, fp32
 #
 # Option 2 tự bật khi thấy /.dockerenv (§9). Khác biệt: KHÔNG dựng venv và
 # KHÔNG cài đè torch — ảnh pytorch/* đã có bản torch khớp CUDA của máy; dựng
@@ -90,9 +91,15 @@ case "$GPU_SM" in
     # >= 4.53 đòi cho mask ảnh Gemma 3, nên khỏi phải ghim ngược ở bước 5b.
     89)          CUDA_TAG="cu124"; MIN_TAG="" ;;
     8*)          CUDA_TAG="cu121"; MIN_TAG="" ;;        # Ampere
+    # Volta (V100) = sm70. Ở đây ràng buộc đi NGƯỢC chiều mọi dòng trên: không
+    # phải "cần bản đủ mới" mà là "không được quá mới". PyTorch bỏ Volta khỏi
+    # các bản dựng CUDA 12.8+ (từ 2.11), nên cu128/cu13x nạp lên V100 sẽ báo
+    # "no kernel image is available". cu126 là mốc CUỐI còn cubin sm70, và vẫn
+    # đủ mới cho torch >= 2.6 mà transformers >= 4.53 đòi.
+    70)          CUDA_TAG="cu126"; MIN_TAG="cu126" ;;
     *)           MIN_TAG="" ;;
 esac
-if [ -n "$GPU_SM" ]; then echo "✓ GPU sm$GPU_SM${MIN_TAG:+ -> cần torch $MIN_TAG trở lên}"; fi
+if [ -n "$GPU_SM" ]; then echo "✓ GPU sm$GPU_SM${MIN_TAG:+ -> wheel torch $MIN_TAG}"; fi
 
 TORCH_CUDA=$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || echo "")
 if [ -n "$TORCH_CUDA" ] && [ -z "$MIN_TAG" ]; then
@@ -272,7 +279,10 @@ fi
 # ── 6. flash-attn (tùy chọn) ─────────────────────────────────────────────────
 # Build lâu (5-15 phút) và fail tuỳ CUDA/torch. Không có cũng chạy được: code
 # tự rơi về sdpa, vốn cũng dùng kernel hợp nhất trên GPU.
-if [ "${INSTALL_FLASH_ATTN:-0}" = "1" ]; then
+if [ "${INSTALL_FLASH_ATTN:-0}" = "1" ] && [ -n "$GPU_SM" ] && [ "$GPU_SM" -lt 80 ] 2>/dev/null; then
+    echo "⊘ bỏ qua flash-attn: sm$GPU_SM không có kernel FA2 (cần sm80+) và"
+    echo "  FA2 cũng không nhận fp32. src/config.py sẽ tự chọn sdpa."
+elif [ "${INSTALL_FLASH_ATTN:-0}" = "1" ]; then
     echo "→ build flash-attn (5-15 phút)..."
     pipi flash-attn --no-build-isolation || \
         echo "⚠ flash-attn fail — sẽ dùng sdpa"
@@ -323,11 +333,25 @@ p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f}GB | sm{sm[0]}{sm[1]}")
 if sm[0] < 8:
-    print(f"✗ sm{sm[0]}{sm[1]} không có bf16. Dự án này cần Ampere trở lên (sm80+).")
-    if os.environ.get("RGEXP_REMOTE_ACTIVE") == "1":
-        print("  Đang thuê máy: XOÁ instance này và thuê lại A100 / L40S / L4 /")
-        print("  3090 / 4090 / H100. V100 (sm70) và T4 (sm75) đều không chạy được.")
-    raise SystemExit(1)
+    # Mặc định vẫn CHẶN: bảng chọn GPU của chỗ cho thuê rất dễ bấm nhầm, và
+    # biết mình thuê nhầm ở phút đầu rẻ hơn nhiều so với biết sau 30GB dữ
+    # liệu. Nhưng sm70/sm75 KHÔNG còn là ngõ cụt: có đường fp32 đã kiểm
+    # chứng, và ai cố ý chọn nó thì khai báo bằng biến môi trường.
+    if os.environ.get("RGEXP_ALLOW_NO_BF16", "0").lower() not in ("0", "", "false", "no", "off"):
+        print(f"⚠ sm{sm[0]}{sm[1]} không có bf16 — đi đường fp32 "
+              f"(RGEXP_ALLOW_NO_BF16=1).")
+        print("  PHẢI chạy bằng profile fp32, không phải config mặc định:")
+        print("      bash scripts/run_v100.sh --dry-run        # V100 32GB")
+        print("      python -m src.train --config configs/v100_32g.yaml --dry-run")
+        print("  fp16 trên GPU này tràn số ở layer 5 của Gemma 3 (loss = NaN")
+        print("  ngay STAGE 0) — fp32 là lựa chọn duy nhất chạy được.")
+    else:
+        print(f"✗ sm{sm[0]}{sm[1]} không có bf16. Config mặc định cần Ampere trở lên (sm80+).")
+        print("  Nhanh nhất: thuê lại A100 / L40S / L4 / 3090 / 4090 / H100.")
+        print("  Muốn dùng chính card này (V100 sm70 / T4 sm75) thì có đường")
+        print("  fp32 — chậm hơn ~2-3× nhưng chạy được, xem README §0.3:")
+        print("      RGEXP_ALLOW_NO_BF16=1 bash scripts/setup.sh")
+        raise SystemExit(1)
 PYEOF
 
 echo
