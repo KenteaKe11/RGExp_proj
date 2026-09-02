@@ -225,7 +225,7 @@ run:
 
   out_dir: ./outputs
   ckpt_dir: ./ckpt
-  hub_repo: null            # null -> tự đặt theo model+variant+n_block
+  hub_repo: MoE-LoRA            # null -> tự đặt theo model+variant+n_block
   hub_private: true
   push_to_hub: true
   force_eval: false
