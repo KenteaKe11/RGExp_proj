@@ -18,15 +18,22 @@
 #    là điều mình muốn: phiên bị cắt sau ~11h, phiên sau resume từ Hub và đi
 #    tiếp, không có mốc nào để lỡ. `resume` không còn là khoá config — nó là
 #    hành vi mặc định.
-# 3. LOSS = 1·CE + 0.2·ASL. Nhánh supervised là Asymmetric Loss trên 14
-#    finding NHỊ PHÂN (uncertain = soft 0.7, blank = MASK), ngưỡng âm tính
-#    m = 0.02 theo BI-RADS 3. Không còn Focal, không còn bảng α.
-# 4. KHÔNG CÒN AUX LOSS. Cân bằng tải bằng bias của router, cập nhật bằng quy
-#    tắc sau mỗi optimizer step (DeepSeek-V3), ngoài đồ thị autograd.
+# 3. LOSS = 1·CE + 0.5·ASL + 0.05·Aux. Nhánh supervised là Asymmetric Loss
+#    trên 14 finding NHỊ PHÂN (uncertain = soft, blank = MASK), ngưỡng âm
+#    tính m = 0.02 theo BI-RADS 3. Không còn Focal, không còn bảng α.
+# 4. AUX LOSS QUAY LẠI và THAY HẲN cơ chế bias aux-free. Cân bằng tải =
+#    E·Σ f_e·P_e (Switch-Transformer), một số hạng trong loss. Không còn
+#    bias b_e, không còn trần tải mỗi micro-batch, không còn expert hứng.
+# 5. ROUTER ĐỔI KIẾN TRÚC: ConvNeXt-Tiny (ImageNet, đóng băng stem+3 stage)
+#    -> proj 256 -> downsample/flatten -> MLP -> 2 head. Không còn
+#    DenseNet-CXR, không còn MQA, không còn Separation, KHÔNG CÒN SWEEP
+#    (khối `sweep:` trong yaml đổi tên thành `arch:`, chỉ giữ `model`).
 #
-# Mọi khoá của bản cũ (phase*_samples, early_stop_*, w_aux, focal_*, resume)
-# nếu còn sót trong yaml thì src/config.py in "⚠ config: bỏ qua ..." rồi đi
-# tiếp — không nổ, nhưng cũng không có tác dụng gì.
+# Mọi khoá của bản cũ (phase*_samples, early_stop_*, focal_*, resume,
+# bias_gamma*, bias_clip, capacity_factor, n_shared, shared_weight,
+# decay_warmup_steps, variant, n_block) nếu còn sót trong yaml thì
+# src/config.py in "⚠ config: bỏ qua ..." rồi đi tiếp — không nổ, nhưng cũng
+# không có tác dụng gì.
 #
 # ── SỰ THẬT VỀ THỜI GIAN — ĐỌC TRƯỚC KHI ĐỔI GÌ KHÁC ─────────────────────────
 # Mốc đo thật trên T4 fp32: ~0.04-0.06 mẫu/s. Một phiên Kaggle 11h ≈ 1600-2400
@@ -142,18 +149,21 @@ HUB_KEEP_REVISIONS = 7    # giữ tối đa 7 revision trên repo ckpt; tới b�
 
 # ── Logic training (default đã đúng — chỉ đổi khi đang làm thí nghiệm) ───────
 # None = giữ nguyên giá trị trong configs/default.yaml của repo.
-W_SUP         = None      # 0.2  — hệ số ASL trong Total_Loss
+W_SUP         = None      # 0.5  — hệ số ASL trong Total_Loss
+W_AUX         = None      # 0.05 — hệ số Aux (cân bằng tải, Switch: E·Σf·P).
+                          #        Sàn của Aux là 1.0, nên số hạng này cộng
+                          #        một nền ≈w_aux vào loss kể cả khi cân bằng
+                          #        hoàn hảo — đọc `balance` trong log.
 ASL_CLIP      = None      # 0.02 — NGƯỠNG ÂM TÍNH (BI-RADS 3). Dưới mức này
                           #        một ô âm hết gradient hẳn.
 ASL_GAMMA_NEG = None      # 4.0  — focus nhánh âm (default chuẩn của ASL)
 UNCERTAIN_SOFT= None      # 0.7  — soft label cho aspect uncertain
-BIAS_GAMMA    = None      # 1e-3 — γ SAU warmup, tốc độ nắn bias (aux-free)
-ROUTE_NOISE   = None      # 1e-3 — σ Gumbel SAU warmup
-# Lịch decay mũ của γ và σ trong n step đầu (chống collapse sớm — xem §3.6).
-# null/None ở *_START = tắt lịch cho đại lượng đó; DECAY_STEPS=0 = tắt cả hai.
-BIAS_GAMMA_ST = None      # 1.0  — γ ở step 0
-ROUTE_NOISE_ST = None     # 1.0  — σ ở step 0
-DECAY_STEPS   = None      # 1000 — số step của giai đoạn decay
+ROUTE_NOISE   = None      # 0.5  — σ Gumbel SAU warmup. KHÔNG để 0: từ khi
+                          #        bỏ bias, đây là cơ chế khám phá duy nhất.
+# Lịch decay mũ của σ, đếm bằng MẪU (không phải step — step phụ thuộc batch).
+# None ở ROUTE_NOISE_ST = tắt lịch; DECAY_SAMPLES=0 cũng tắt.
+ROUTE_NOISE_ST = None     # 1.0  — σ ở mẫu 0
+DECAY_SAMPLES = None      # 3200 — số MẪU của giai đoạn decay σ
 
 # ── Hub (là đường sống của việc nối phiên trên Kaggle) ───────────────────────
 HUB_SYNC      = False     # True chỉ khi CÓ máy khác chạy song song cùng ô.
@@ -356,7 +366,9 @@ _MARKS = [
     ("src/optim.py", None, "lịch LR cosine restarts + SWA"),
     ("src/optim.py", "cycle_samples", "lịch LR VÔ HẠN (không còn total_samples)"),
     ("src/losses.py", "def asl_loss", "ASL thay cho Focal"),
-    ("src/router.py", "expert_bias", "cân bằng tải aux-free (bỏ aux loss)"),
+    ("src/router.py", "convnext", "router ConvNeXt-256 (bỏ DenseNet+MQA)"),
+    ("src/losses.py", "def aux_loss", "cân bằng tải bằng aux loss (bỏ bias)"),
+    ("src/optim.py", "đầu MỌI cycle", "warmup ở đầu mọi cycle LR"),
     ("src/train.py", "epoch_samples", "một phase multi-task, lịch không có đích"),
 ]
 _bad = []
@@ -370,7 +382,7 @@ for _f, _needle, _what in _MARKS:
 assert not _bad, (
     "Repo đang ở bản CŨ:\n  - " + "\n  - ".join(_bad) +
     "\nPush bản mới lên GitHub rồi chạy lại (SKIP_GIT=False để fetch).")
-print("✓ repo đúng bản: ASL + bias aux-free + lịch vô hạn")
+print("✓ repo đúng bản: router ConvNeXt-256 + aux loss + lịch vô hạn")
 
 # ── 3b. Vá / khôi phục debug hook ────────────────────────────────────────────
 MODEL_PY = f"{ROOT}/src/model.py"
@@ -498,14 +510,13 @@ cfg["run"]["hub_keep_revisions"] = HUB_KEEP_REVISIONS
 
 # ── 4c. Logic training (chỉ ghi đè khi khác None) ───────────────────────────
 for _key, _val, _where in (("w_sup", W_SUP, "run"),
+                           ("w_aux", W_AUX, "run"),
                            ("asl_clip", ASL_CLIP, "run"),
                            ("asl_gamma_neg", ASL_GAMMA_NEG, "run"),
                            ("uncertain_soft", UNCERTAIN_SOFT, "run"),
-                           ("bias_gamma", BIAS_GAMMA, "fixed"),
                            ("route_noise", ROUTE_NOISE, "fixed"),
-                           ("bias_gamma_start", BIAS_GAMMA_ST, "fixed"),
                            ("route_noise_start", ROUTE_NOISE_ST, "fixed"),
-                           ("decay_warmup_steps", DECAY_STEPS, "fixed")):
+                           ("decay_warmup_samples", DECAY_SAMPLES, "fixed")):
     if _val is not None:
         print(f"→ ghi đè {_where}.{_key} = {_val} "
               f"(default repo: {cfg[_where].get(_key)})")
@@ -520,18 +531,19 @@ with open(CONFIG, "w", encoding="utf-8") as fh:
 print(f"\n✓ {CONFIG}")
 print(f"  dtype     {cfg['fixed']['compute_dtype']} | batch {TRAIN_BS}×{GRAD_ACCUM}"
       f" = effective {eff} | {cfg['fixed']['n_expert']}E top-{cfg['fixed']['top_k']}"
-      f" | {cfg['sweep']['variant']}×{cfg['sweep']['n_block']}")
-print(f"  loss      1·CE + {cfg['run']['w_sup']}·ASL | γ+={cfg['run']['asl_gamma_pos']}"
+      f" | {cfg['arch']['model']}-cnx256")
+print(f"  loss      1·CE + {cfg['run']['w_sup']}·ASL + {cfg['run']['w_aux']}·Aux"
+      f" | γ+={cfg['run']['asl_gamma_pos']}"
       f" γ-={cfg['run']['asl_gamma_neg']} | ngưỡng âm m={cfg['run']['asl_clip']}"
       f" (BI-RADS 3) | uncertain={cfg['run']['uncertain_soft']}, blank=MASK")
-print(f"  router    bias γ={cfg['fixed']['bias_gamma']} (cân bằng tải aux-free)"
-      f" | Gumbel σ={cfg['fixed']['route_noise']}"
+print(f"  router    convnext_tiny {cfg['fixed']['router_backbone']}, ảnh "
+      f"{cfg['fixed']['router_img_size']}², đóng băng features[0:"
+      f"{cfg['fixed']['router_frozen_upto']}] | cân bằng tải = aux loss "
+      f"w={cfg['run']['w_aux']} (không còn bias/trần tải/expert hứng)"
       f" | clip chuẩn toàn cục {MAX_GRAD_NORM}")
-print(f"  decay     γ {cfg['fixed'].get('bias_gamma_start')}"
-      f"→{cfg['fixed']['bias_gamma']}"
-      f" | σ {cfg['fixed'].get('route_noise_start')}"
+print(f"  decay     σ {cfg['fixed'].get('route_noise_start')}"
       f"→{cfg['fixed']['route_noise']}"
-      f" | mũ, {cfg['fixed'].get('decay_warmup_steps')} step đầu")
+      f" | mũ, {cfg['fixed'].get('decay_warmup_samples')} MẪU đầu")
 
 warns = []
 sess_samples = 11 * 3600 * SAMPLES_PER_S
@@ -616,7 +628,7 @@ print(f"→ CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 env = {**os.environ, "PYTHONPATH": ROOT}
 
 # ── 5b. PREFLIGHT: cấu hình đã giải quyết có đúng ý không? ──────────────────
-# `python -m src.config` nạp yaml, dò GPU, giải quyết ô sweep rồi IN RA — và
+# `python -m src.config` nạp yaml, dò GPU, giải quyết cấu hình rồi IN RA — và
 # in cả "⚠ config: bỏ qua <khoá chết>" nếu cell này ghi nhầm một khoá của bản
 # cũ. ~20s, rẻ hơn nhiều so với phát hiện sau khi đã nạp 9GB model.
 if PREFLIGHT:
@@ -689,15 +701,21 @@ print(f"log: {OUT_DIR}/<tag>/logs/latest.log")
 #    snapshot 1`. Bản trung bình chỉ được ÁP khi chạy MODE="test"/"probe",
 #    KHÔNG áp giữa lúc train.
 #
-# c) BỐN CON SỐ ĐÁNG NHÌN MỖI STEP.
+# c) NĂM CON SỐ ĐÁNG NHÌN MỖI STEP.
 #      ce          CE trên token báo cáo. Đây là thứ quyết định chất lượng text.
-#      sup         ASL trên 14 finding. Neo ngữ nghĩa, hệ số 0.2.
+#      sup         ASL trên 14 finding. Neo ngữ nghĩa, hệ số 0.5.
+#      aux         = balance (cùng một số). Xem dòng dưới.
 #      sup_recall  ĐỘ NHẠY của nhánh supervised — con số headline, KHÔNG phải
 #                  accuracy: sau khi MASK blank thì ô dương vẫn là thiểu số,
 #                  model đoán "âm" hết vẫn có acc cao mà bỏ sót sạch bệnh.
-#      balance     = 1.0 là 12 expert chia đều tải. Bò về 1.0 nghĩa là cơ chế
-#                  bias aux-free đang làm việc; đứng ở 3-4 kèm bias_span phình
-#                  mãi nghĩa là bias_gamma quá nhỏ so với dải route logit.
+#      balance     = L_aux. SÀN là 1.0 (E expert chia đều tải VÀ router gán
+#                  xác suất đều). Bò về 1.0 nghĩa là số hạng aux đang làm
+#                  việc. Đứng ở 3-4 nghĩa là router đã dồn niềm tin vào vài
+#                  expert và w_aux quá nhỏ so với áp lực của CE.
+#                  CẨN THẬN MỘT BẪY: `balance` = 1.0 ở vài trăm step đầu
+#                  KHÔNG chứng minh tải đang đều — khi P còn gần đều thì
+#                  công thức cho 1.0 bất kể tải lệch tới đâu. Đọc kèm
+#                  `expert_share` trong event log ở giai đoạn đó.
 #    Cộng thêm gnorm (xem ghi chú d).
 #
 # d) gnorm DÍNH TRẦN 1.0 LÚC ĐẦU LÀ BÌNH THƯỜNG. Cắt gradient ở đây là cắt

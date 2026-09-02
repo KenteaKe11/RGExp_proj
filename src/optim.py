@@ -38,16 +38,39 @@ import torch
 
 
 class CosineRestartSchedule:
-    """Warmup (chỉ cycle đầu) -> cosine -> restart, LẶP VÔ HẠN, tính bằng MẪU.
+    """Warmup -> cosine -> restart, LẶP VÔ HẠN, tính bằng MẪU.
 
-    Đường LR của cycle c, với p = số mẫu đã đi trong cycle đó:
+    Đường LR của cycle c, với p = số mẫu đã đi trong cycle đó và w =
+    warmup_samples:
 
-        lr = min_lr_ratio + (peak_c - min_lr_ratio) · ½(1 + cos(π · p/len))
+        p < w :  lr = peak_c · p/w                          (warmup tuyến tính)
+        p ≥ w :  lr = min_lr_ratio
+                    + (peak_c − min_lr_ratio) · ½(1 + cos(π·(p−w)/(len−w)))
 
     `peak_c = cycle_lr_decay ** c` (mặc định 1.0 = mọi cycle bật lại đúng LR
     gốc, đúng SGDR nguyên bản). Với lịch vô hạn, cycle_lr_decay < 1 nghĩa là
     LR tiến về 0 và train tự chết dần — đó gần như không bao giờ là ý muốn,
     nên mặc định phải là 1.0.
+
+    WARMUP Ở ĐẦU **MỌI** CYCLE, không chỉ cycle đầu — đổi so với bản trước,
+    và đây là thay đổi cố ý. SGDR nguyên bản bật thẳng lên đỉnh ở mỗi restart
+    với lý lẽ "trọng số đã ở vùng hợp lý, moment AdamW còn nguyên, cú restart
+    không gây spike như lúc khởi động". Lý lẽ đó không còn đúng ở đây vì hai
+    chuyện:
+
+      * Cuối mỗi cycle LR chạm ĐÁY (min_lr_ratio = 0), nên moment bậc hai của
+        AdamW đã co lại theo một chuỗi bước rất nhỏ. Nhảy thẳng từ 0 lên
+        3e-4 ở đúng step sau đó là một bước đi dài trên một ước lượng phương
+        sai đã lỗi thời — đúng cơ chế sinh spike gradient, chỉ khác là nó xảy
+        ra ở giữa buổi train chứ không ở đầu.
+      * Ô này bàn giao giữa các máy qua Hub (run.hub_sync) và resume rất
+        thường xuyên. Một lần resume rơi ngay sau biên cycle mà moment lại
+        vừa reset (thiếu optimizer.pt) là gặp cả hai chuyện cùng lúc.
+
+    Cái giá phải trả, nói thẳng: mỗi cycle mất `warmup_samples` mẫu ở vùng LR
+    thấp, tức phần cosine ngắn đi. Với cycle 3200 mẫu và warmup 256 thì đó là
+    8% mỗi cycle. Đổi lại là không có step nào bắt đầu bằng một cú nhảy LR
+    thẳng đứng.
 
     `samples` truyền vào là SỐ MẪU TÍCH LUỸ từ lúc train từ số 0, không reset
     theo epoch: cycle phải cắt ngang ranh giới epoch một cách liền mạch.
@@ -73,9 +96,16 @@ class CosineRestartSchedule:
         self.cycle_lr_decay = float(cycle_lr_decay)
         if self.warmup_samples >= self.cycle_samples:
             raise ValueError(
-                f"warmup_samples={self.warmup_samples} nuốt trọn cycle đầu "
-                f"({self.cycle_samples} mẫu) — cycle đầu sẽ không có đoạn "
-                f"cosine nào. Hạ warmup_samples hoặc nâng cycle_samples.")
+                f"warmup_samples={self.warmup_samples} nuốt trọn MỘT cycle "
+                f"({self.cycle_samples} mẫu) — sẽ không có đoạn cosine nào ở "
+                f"bất kỳ cycle nào (warmup giờ chạy ở đầu MỌI cycle). Hạ "
+                f"warmup_samples hoặc nâng cycle_samples.")
+        if self.warmup_samples > self.cycle_samples * 0.25:
+            print(f"⚠ warmup_samples={self.warmup_samples} > 25% của cycle "
+                  f"({self.cycle_samples}) — warmup chạy ở đầu MỌI cycle, nên "
+                  f"phần cosine chỉ còn "
+                  f"{100*(1-self.warmup_samples/self.cycle_samples):.0f}% mỗi "
+                  f"vòng.")
         self._last_lr = list(self.base_lrs)
         self.set_samples(0)
 
@@ -103,12 +133,10 @@ class CosineRestartSchedule:
         start, length = self.cycle_span(c)
         p = s - start
         peak = self.cycle_lr_decay ** c
-        # Warmup CHỈ ở cycle đầu (SGDR gốc): các restart sau bật thẳng lên đỉnh.
-        # Bản thân cú restart không gây spike gradient như lúc khởi động, vì
-        # trọng số đã ở vùng hợp lý và moment của AdamW vẫn còn nguyên.
-        if c == 0 and self.warmup_samples and p < self.warmup_samples:
-            return peak * (p / self.warmup_samples)
-        w = self.warmup_samples if c == 0 else 0.0
+        # Warmup ở đầu MỌI cycle, không chỉ cycle đầu — xem docstring lớp.
+        w = float(self.warmup_samples)
+        if w and p < w:
+            return peak * (p / w)
         frac = min(max((p - w) / max(length - w, 1e-9), 0.0), 1.0)
         cos = 0.5 * (1.0 + math.cos(math.pi * frac))
         return self.min_lr_ratio + (peak - self.min_lr_ratio) * cos
@@ -132,7 +160,8 @@ class CosineRestartSchedule:
     def describe(self, eff):
         s = (f"cosine warm restarts VÔ HẠN: mỗi cycle {self.cycle_samples} "
              f"mẫu ({self.cycle_samples / eff:.0f} step ở batch {eff})")
-        s += (f" | warmup {self.warmup_samples} mẫu (cycle đầu)"
+        s += (f" | warmup {self.warmup_samples} mẫu ở đầu MỌI cycle "
+              f"({100*self.warmup_samples/self.cycle_samples:.0f}% cycle)"
               if self.warmup_samples else " | không warmup")
         if self.min_lr_ratio:
             s += f" | đáy = {self.min_lr_ratio:.3g}×lr"

@@ -10,12 +10,13 @@ Mười thứ được kiểm:
      đơn lẻ — tức lớp MoE không tự thêm sai lệch nào;
   5. ASL trên 14 finding: gập nhãn theo TÊN aspect, mask blank, soft label
      uncertain, ngưỡng âm tính cắt gradient, và bất đối xứng γ⁺/γ⁻;
-  6. lịch LR cosine warm restarts VÔ HẠN: hình dạng đường LR, và — quan trọng
-     nhất — biên cycle KHÔNG đổi khi đổi effective batch;
+  6. lịch LR cosine warm restarts VÔ HẠN: hình dạng đường LR (warmup ở đầu
+     MỌI cycle), và — quan trọng nhất — biên cycle KHÔNG đổi khi đổi
+     effective batch;
   7. cộng trung bình trọng số (SWA): running mean đúng bằng trung bình số học,
      không dùng chung bộ nhớ với tensor gốc, bàn giao qua state_dict giữ nguyên;
-  8. cân bằng tải KHÔNG dùng aux loss: bias chỉ chạm vào việc CHỌN expert, cập
-     nhật đúng chiều, ghim trung bình về 0, và đi theo checkpoint;
+  8. cân bằng tải bằng MỘT số hạng aux (Switch): giá trị, biên, hướng
+     gradient, và hai tính chất dễ đọc sai của nó;
   9. nhiễu Gumbel trên route logit + các phép tính thuần của probe;
  10. gộp bản ghi probe (scripts/probe_summary.py): route_share trên đủ E
      expert, hồ sơ VÔ ĐIỀU KIỆN từ bản ghi `full` (expert router chưa
@@ -33,13 +34,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.losses import (asl_loss, aspect_roles,          # noqa: E402
+from src.losses import (asl_loss, aspect_roles, aux_loss,    # noqa: E402
                         binary_target_table, supervised_stats, to_binary)
 from src.optim import (CosineRestartSchedule,           # noqa: E402
                        WeightAverager)
-from src.router import (VARIANT, RouterNet as _RouterNet,  # noqa: E402
-                        _calibrate_bn, _fake_cxr, _selftest,
-                        decay_desc, decay_value)
+from src.router import (D_MODEL, RouterNet as _RouterNet,   # noqa: E402
+                        _fake_cxr, _selftest, decay_desc, decay_value)
 
 FAIL = []
 
@@ -47,11 +47,14 @@ FAIL = []
 def RouterNet(*args, **kwargs):
     """RouterNet với backbone KHÔNG trọng số, dùng cho mọi test ở đây.
 
-    Selftest phải chạy được offline và không nên tải 30MB trọng số
-    torchxrayvision mỗi lần. Con số tham số, hình dạng và toàn bộ cơ chế
-    gate/bias/nhiễu không phụ thuộc việc backbone đã train hay chưa —
-    thứ DUY NHẤT phụ thuộc là chất lượng đặc trưng, mà đó là chuyện của
-    train chứ không phải của selftest.
+    Selftest phải chạy được offline và không nên tải ~110MB trọng số
+    ConvNeXt mỗi lần. Con số tham số, hình dạng và toàn bộ cơ chế gate/aux/
+    nhiễu không phụ thuộc việc backbone đã train hay chưa — thứ DUY NHẤT
+    phụ thuộc là chất lượng đặc trưng, mà đó là chuyện của train chứ không
+    phải của selftest.
+
+    ConvNeXt chỉ có LayerNorm nên KHÔNG cần nạp thống kê BN như bản DenseNet
+    trước (`_calibrate_bn` đã bị bỏ cùng backbone cũ).
     """
     kwargs.setdefault("backbone", None)
     return _RouterNet(*args, **kwargs)
@@ -64,45 +67,37 @@ def check(name, cond, detail=""):
 
 
 
-def _drive_to_clip(net, n=2000):
-    """Nắn bias `n` lần cùng một chiều -> |bias| lớn nhất đạt được."""
-    for _ in range(n):
-        with torch.no_grad():
-            net.load_count.zero_()
-            net.load_tokens.zero_()
-            net.load_count[5] = 200.0
-            net.load_tokens += 200.0
-        net.update_bias()
-    return float(net.expert_bias.abs().max())
-
 def test_router():
     print("\n[2] router forward")
     torch.manual_seed(0)
     B, N, E, K = 3, 40, 12, 4
-    net = RouterNet(VARIANT, 2, E, K, d_enc=2560).eval()
-    _calibrate_bn(net)      # backbone=None -> BN chưa có thống kê nào
+    net = RouterNet(E, K).eval()
     x = _fake_cxr(B)        # pixel_values [B,3,896,896], KHÔNG phải hidden
-    # `mask` còn trong chữ ký cho tương thích nhưng router mới KHÔNG dùng:
-    # 49 token đặc trưng đều là ảnh thật, không có padding hay target.
+    # `mask` còn trong chữ ký cho tương thích nhưng router KHÔNG dùng: nhánh
+    # này đọc ảnh, không đọc chuỗi hỗn hợp text+ảnh.
     mask = torch.ones(B, N)
     with torch.no_grad():
         sup, gate, st = net(x, mask)
-    check("forward trả 3 phần tử (không còn aux)", True)
+    check("forward trả (sup_logits, gate, stats)", True)
     check("sup_logits [B,14] — một logit mỗi finding, KHÔNG phải 14×4",
           tuple(sup.shape) == (B, 14), str(tuple(sup.shape)))
     check("gate [B,E]", tuple(gate.shape) == (B, E))
     check("gate thưa đúng top-k", int((gate > 0).sum(dim=-1).max()) == K)
     check("Σ gate = 1", torch.allclose(gate.sum(-1), torch.ones(B), atol=1e-5))
-    check("balance quanh 1.0 khi chưa train", 0.3 < st["balance"] < 3.0,
-          f"balance={st['balance']:.3f}")
-    check("bias khởi tạo = 0 -> bias_span = 0", st["bias_span"] == 0.0)
+    check("balance (= L_aux) có SÀN 1.0", st["balance"] >= 1.0 - 1e-6,
+          f"balance={st['balance']:.4f}")
+    check("stats KHÔNG còn khoá của cơ chế bias/trần tải cũ",
+          not ({"bias_span", "bias_sat", "capacity", "overflow", "spill",
+                "shared_gate"} & set(st)))
+    check("aux_loss là tensor có gradient, nằm trong stats",
+          torch.is_tensor(st.get("aux_loss")))
 
     print("\n[3] router PHẢI phân biệt được ảnh khác nhau")
-    # Đây là số đo đã kết tội nhánh cũ: đo trên 143 ảnh thật, tỉ lệ
-    # std(route_logit theo mẫu)/std(theo expert) ≤ 0.085 — tức router phát
-    # ra gần như cùng một vector cho mọi ảnh, và top-k khi ấy do bias cân
-    # bằng tải quyết định chứ không do nội dung ảnh. Dưới 0.1 thì mọi tinh
-    # chỉnh γ/σ đều vô nghĩa.
+    # Đây là số đo đã kết tội nhánh đọc hidden state của Gemma: đo trên 143
+    # ảnh thật, tỉ lệ std(route_logit theo mẫu)/std(theo expert) ≤ 0.085 —
+    # tức router phát ra gần như cùng một vector cho mọi ảnh, và top-k khi
+    # ấy do cân bằng tải quyết định chứ không do nội dung ảnh. Dưới 0.1 thì
+    # mọi tinh chỉnh σ/w_aux đều vô nghĩa.
     with torch.no_grad():
         st8 = net(_fake_cxr(8), None)[2]
     check("route_logit đổi theo ảnh (ratio > 0.1)",
@@ -110,9 +105,10 @@ def test_router():
           f"ratio={st8['logit_std_ratio']:.3f} "
           f"(mẫu {st8['logit_std_sample']:.3f} / "
           f"expert {st8['logit_std_expert']:.3f})")
-    check("pooled của route head cũng đổi theo ảnh",
-          st8["pooled_std_sample"] > 0,
-          f"std={st8['pooled_std_sample']:.4f}")
+    check("vector 1024 chiều của trunk cũng đổi theo ảnh (tách được lỗi: "
+          "nó ≈0 thì thủ phạm là backbone/trunk, không phải route_head)",
+          st8["trunk_std_sample"] > 0,
+          f"std={st8['trunk_std_sample']:.4f}")
     with torch.no_grad():
         sup2, gate2, _ = net(_fake_cxr(B), mask)
     check("ảnh khác -> gate khác (router không phải hằng số)",
@@ -123,18 +119,21 @@ def test_route_noise():
     """[9] nhiễu Gumbel: chỉ khi training, không phá bất biến của gate."""
     print("\n[9] nhiễu Gumbel trên route logit")
     torch.manual_seed(0)
-    B, N, E, K = 64, 24, 12, 4
-    x, mask = _fake_cxr(B), torch.ones(B, N)
+    # B nhỏ và ảnh dựng thẳng ở 512 (cỡ backbone thật sự dùng): ConvNeXt-T
+    # ở 512² tốn ~23 GFLOPs/ảnh trên CPU, gấp ~16× DenseNet-121 res224 của
+    # bản trước. B=64 ở đây từng làm selftest bị OOM-kill.
+    B, N, E, K = 12, 24, 12, 4
+    x, mask = _fake_cxr(B, size=512), torch.ones(B, N)
 
-    off = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=0.0)
+    off = RouterNet(E, K, route_noise=0.0)
     check("mặc định của lớp là σ = 0.5 (sàn khám phá, giữ cả buổi train)",
-          RouterNet(VARIANT, 1, E, K, d_enc=2560).route_noise == 0.5)
+          RouterNet(E, K).route_noise == 0.5)
     off.train()
     with torch.no_grad():
         g1, g2 = off(x, mask)[1], off(x, mask)[1]
     check("noise=0 + train mode -> vẫn tất định", torch.equal(g1, g2))
 
-    on = RouterNet(VARIANT, 2, E, K, d_enc=2560, route_noise=1.0)
+    on = RouterNet(E, K, route_noise=1.0)
     on.load_state_dict(off.state_dict())        # cùng trọng số để so được
 
     on.eval()
@@ -170,8 +169,8 @@ def test_route_noise():
     # phải được sờ tới ít nhất một lần — đó là cả lý do bật nhiễu.
     seen = torch.zeros(E, dtype=torch.bool)
     with torch.no_grad():
-        for _ in range(5):
-            seen |= (on(x, mask)[1] > 0).any(dim=0)
+        for _ in range(20):
+            seen |= (on(x[:4], mask[:4])[1] > 0).any(dim=0)
     check("σ=1.0: mọi expert đều có lúc được chọn",
           bool(seen.all()), f"{int(seen.sum())}/{E}")
 
@@ -423,20 +422,32 @@ def test_schedule():
     check("warmup: 0 -> nửa -> đỉnh",
           s.multiplier(0) == 0.0 and abs(s.multiplier(WARM // 2) - .5) < 1e-12
           and abs(s.multiplier(WARM) - 1.0) < 1e-12)
-    check("restart bật lại ĐÚNG đỉnh ở mọi biên",
-          all(abs(s.multiplier(b) - 1.0) < 1e-12
+    # ĐỔI so với bản trước: warmup chạy ở đầu MỌI cycle, nên mỗi biên bắt
+    # đầu lại từ 0 rồi leo lên đỉnh sau WARM mẫu — chứ không bật thẳng lên
+    # đỉnh. Lý do: cuối cycle LR chạm đáy nên moment bậc hai của AdamW đã co
+    # theo chuỗi bước rất nhỏ; nhảy thẳng lên đỉnh ngay sau đó là bước dài
+    # trên một ước lượng phương sai lỗi thời. Xem src/optim.py.
+    check("MỌI biên cycle bắt đầu lại từ 0 (warmup, không bật thẳng đỉnh)",
+          all(abs(s.multiplier(b)) < 1e-12
               for b in (6400, 12800, 64000, 640000)))
+    check("MỌI cycle leo tới đỉnh sau đúng WARM mẫu",
+          all(abs(s.multiplier(b + WARM) - 1.0) < 1e-12
+              for b in (0, 6400, 12800, 64000, 640000)))
     check("chạm đáy ở cuối MỖI cycle",
           all(abs(s.multiplier(b - 1e-9)) < 1e-9
               for b in (6400, 12800, 64000)))
-    check("giữa cycle = nửa đỉnh (cosine)",
-          abs(s.multiplier(6400 + CYC // 2) - .5) < 1e-12)
+    # Giữa đoạn COSINE (sau warmup) = nửa đỉnh. Mốc là w + (len−w)/2, không
+    # còn là len/2 — warmup đã ăn mất WARM mẫu đầu mỗi cycle.
+    _mid = WARM + (CYC - WARM) // 2
+    check("giữa đoạn cosine = nửa đỉnh",
+          abs(s.multiplier(6400 + _mid) - .5) < 1e-12,
+          f"mốc = warmup {WARM} + (cycle−warmup)/2")
     check("lịch không có đích: cycle thứ 1000 vẫn đúng hình dạng",
-          abs(s.multiplier(1000 * CYC + CYC // 2) - .5) < 1e-12)
+          abs(s.multiplier(1000 * CYC + _mid) - .5) < 1e-12)
 
     o = _FakeOpt([3e-4, 1e-4])
     s2 = CosineRestartSchedule(o, cycle_samples=CYC, warmup_samples=WARM)
-    s2.set_samples(6400 + CYC // 2)
+    s2.set_samples(6400 + WARM + (CYC - WARM) // 2)
     check("hai param group cùng nhân một hệ số",
           abs(o.param_groups[0]["lr"] - 1.5e-4) < 1e-12
           and abs(o.param_groups[1]["lr"] - .5e-4) < 1e-12,
@@ -477,7 +488,11 @@ def test_schedule():
                               warmup_samples=640)
         check("warmup nuốt trọn cycle -> phải nổ", False)
     except ValueError:
-        check("warmup nuốt trọn cycle -> nổ ValueError", True)
+        check("warmup nuốt trọn MỘT cycle -> nổ ValueError", True)
+    check("warmup=0 -> cosine thuần, biên bật thẳng lên đỉnh (SGDR gốc)",
+          all(abs(CosineRestartSchedule(_FakeOpt([1.0]), cycle_samples=CYC,
+                                        warmup_samples=0).multiplier(b) - 1.0)
+              < 1e-12 for b in (0, CYC, 5 * CYC)))
     try:
         CosineRestartSchedule(_FakeOpt([1.0]), cycle_samples=0)
         check("cycle_samples=0 -> phải nổ", False)
@@ -531,103 +546,111 @@ def test_swa():
         check("shape đổi giữa hai snapshot -> nổ RuntimeError", True)
 
 
-def test_bias():
-    """[8] cân bằng tải aux-free: bias chỉ chạm vào việc CHỌN expert."""
-    print("\n[8] cân bằng tải bằng bias (không aux loss)")
+def test_aux():
+    """[8] cân bằng tải bằng MỘT số hạng aux (Switch-Transformer)."""
+    print("\n[8] cân bằng tải bằng aux loss (không còn bias)")
     torch.manual_seed(0)
-    B, N, E, K = 32, 16, 12, 4
-    x, mask = _fake_cxr(B), torch.ones(B, N)
-    net = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=0.0,
-                    bias_gamma=0.05)
+    B, N, E, K = 12, 16, 12, 4
+    x, mask = _fake_cxr(B, size=512), torch.ones(B, N)
 
-    check("expert_bias nằm trong state_dict (đi theo checkpoint)",
-          "expert_bias" in net.state_dict())
-    check("bộ đếm tải KHÔNG nằm trong state_dict (rác giữa hai step)",
-          "load_count" not in net.state_dict()
-          and "load_tokens" not in net.state_dict())
+    # ── (1) toán thuần của aux_loss ─────────────────────────────────────────
+    # Cả f lẫn P đều đều -> L_aux = 1.0 (sàn).
+    prob = torch.full((B, E), 1.0 / E, requires_grad=True)
+    topi = torch.stack([torch.randperm(E)[:K] for _ in range(B)])
+    check("f đều + P đều -> L_aux = 1.0 (sàn của công thức)",
+          abs(float(aux_loss(prob, topi, E)) - 1.0) < 1e-5,
+          f"{float(aux_loss(prob, topi, E)):.6f}")
 
-    # (1) bias KHÔNG được đổi GIÁ TRỊ gate khi tập expert được chọn không đổi.
+    # P đều nhưng f dồn hết vào K expert -> VẪN 1.0. Đây là tính chất dễ đọc
+    # sai nhất của số hạng này: nó không phạt tải lệch khi router còn chưa
+    # có niềm tin nào. Đó là lý do σ (Gumbel) phải sống, aux không thay được.
+    hot = torch.arange(K).unsqueeze(0).expand(B, K)
+    check("P đều nhưng tải dồn vào K expert -> vẫn 1.0 (KHÔNG phạt)",
+          abs(float(aux_loss(prob, hot, E)) - 1.0) < 1e-5,
+          "aux chỉ cắn khi router bắt đầu TỰ TIN sai chỗ")
+
+    # P one-hot ở expert 0 và top-k cũng luôn lấy expert 0 -> E/K.
+    p1 = torch.zeros(B, E)
+    p1[:, 0] = 1.0
+    check("P dồn expert 0 + expert 0 luôn ở top-k -> L_aux = E/K",
+          abs(float(aux_loss(p1, hot, E)) - E / K) < 1e-5,
+          f"{float(aux_loss(p1, hot, E)):.4f} vs {E/K:.4f}")
+
+    # Cực đại thật sự: K = 1, P one-hot, mọi mẫu cùng một expert -> E.
+    one = torch.zeros(B, 1, dtype=torch.long)
+    check("k=1, P one-hot, cả batch một expert -> L_aux = E (cực đại)",
+          abs(float(aux_loss(p1, one, E)) - E) < 1e-5,
+          f"{float(aux_loss(p1, one, E)):.4f}")
+
+    # ── (2) gradient CHỈ chảy qua P, không qua f ────────────────────────────
+    # `f` là phép ĐẾM trên topi — hàm bậc thang, và topi còn đến từ một
+    # top-k CÓ NHIỄU. Nó phải bị detach hẳn, nếu không gradient đi vào một
+    # đại lượng không có đạo hàm nghĩa lý gì.
+    pg = torch.full((B, E), 1.0 / E, requires_grad=True)
+    ti = hot.clone().float().requires_grad_(True)
+    aux_loss(pg, hot, E).backward()
+    check("gradient chảy về prob", pg.grad is not None
+          and float(pg.grad.abs().sum()) > 0)
+    check("f (đếm trên topi) bị detach — không tạo nhánh gradient nào",
+          ti.grad is None)
+
+    # Hướng gradient: expert TẢI CAO phải có đạo hàm theo P lớn hơn, tức bị
+    # softmax đẩy xuống trước.
+    pg2 = torch.full((B, E), 1.0 / E, requires_grad=True)
+    aux_loss(pg2, hot, E).backward()
+    g = pg2.grad.mean(0)
+    check("expert bị chọn nhiều -> ∂L/∂P lớn hơn (bị đẩy xuống trước)",
+          float(g[:K].min()) > float(g[K:].max()),
+          f"tải cao {float(g[0]):.4f} > tải 0 {float(g[-1]):.4f}")
+
+    # ── (3) router KHÔNG còn buffer trạng thái nào của cơ chế cũ ────────────
+    net = RouterNet(E, K, route_noise=0.0)
+    keys = set(net.state_dict())
+    check("state_dict KHÔNG còn expert_bias/load_count/load_tokens",
+          not ({"expert_bias", "load_count", "load_tokens"} & keys))
+    check("router không còn method của cơ chế bias",
+          not any(hasattr(net, m) for m in
+                  ("update_bias", "reset_bias", "capacity", "capacity_desc")))
+    check("router không còn thuộc tính n_shared/capacity_factor/bias_clip",
+          not any(hasattr(net, a) for a in
+                  ("n_shared", "n_route", "shared_weight", "capacity_factor",
+                   "bias_clip", "apply_bias_at_eval")))
+
+    # ── (4) gate của một ảnh KHÔNG phụ thuộc ảnh cùng batch ─────────────────
+    # Bản trước không có bất biến này khi train: trần tải và bias đều làm
+    # gate phụ thuộc cả batch. Giờ top-k thuần nên nó đúng ở MỌI chế độ.
     net.eval()
     with torch.no_grad():
-        g0 = net(x, mask)[1]
-    with torch.no_grad():
-        net.expert_bias.add_(torch.zeros(E))     # bias = 0, không đổi gì
-        g0b = net(x, mask)[1]
-    check("bias = 0 -> gate y nguyên", torch.equal(g0, g0b))
-
-    # (2) cập nhật đúng CHIỀU: expert quá tải bị hạ, expert đói được nâng.
+        g_all = net(x, mask)[1]
+        g_one = net(x[:1], mask[:1])[1]
+        g_rev = net(x[:3].flip(0), mask[:3])[1]
+    check("eval: cùng ảnh, batch 12/1/3-đảo -> cùng một gate",
+          torch.allclose(g_all[0], g_one[0], atol=1e-5)
+          and torch.allclose(g_all[2], g_rev[0], atol=1e-5))
     net.train()
     with torch.no_grad():
-        net.load_count.zero_()
-        net.load_tokens.zero_()
-        net.load_count[0] = 100.0            # expert 0 ôm hết
-        net.load_tokens += 100.0
-    span, cv = net.update_bias()
-    check("expert quá tải -> bias giảm", float(net.expert_bias[0]) < 0,
-          f"b[0]={float(net.expert_bias[0]):+.4f}")
-    check("expert đói -> bias tăng", float(net.expert_bias[1]) > 0)
-    check("trung bình bias ghim về 0 (chỉ HIỆU mới có nghĩa)",
-          abs(float(net.expert_bias.mean())) < 1e-6)
-    check("update_bias trả (span, CV tải)", span > 0 and cv > 0,
-          f"span={span:.4f} cv={cv:.3f}")
-    check("bộ đếm được xoá sau khi cập nhật",
-          float(net.load_tokens) == 0.0 and float(net.load_count.sum()) == 0.0)
-    check("gọi lại khi chưa đếm gì -> None (không nắn bias bằng số rác)",
-          net.update_bias() is None)
+        gt_all = net(x, mask)[1]
+        gt_one = net(x[:1], mask[:1])[1]
+    check("train (σ=0): cũng vậy — không có cơ chế nào nhìn cả batch nữa",
+          torch.allclose(gt_all[0], gt_one[0], atol=1e-5))
 
-    # (3) bias ĐỔI ĐƯỢC lựa chọn: đủ lớn thì expert bị phạt phải rời top-k.
-    net.eval()
+    # ── (5) `balance` trong stats == đúng L_aux ─────────────────────────────
     with torch.no_grad():
-        base = net(x, mask)[1]
-        hot = int((base > 0).float().sum(dim=0).argmax())
-        net.expert_bias.zero_()
-        net.expert_bias[hot] = -50.0
-        # MẶC ĐỊNH eval bỏ qua bias — bias là bộ điều phối tải lúc train,
-        # còn số đo probe phải phản ánh niềm tin của router.
-        check("eval mặc định BỎ QUA bias", torch.equal(base, net(x, mask)[1]))
-        net.apply_bias_at_eval = True
-        after = net(x, mask)[1]
-        net.apply_bias_at_eval = False
-    check("bias rất âm -> expert đó bị đẩy khỏi top-k",
-          float((after[:, hot] > 0).sum()) == 0
-          and float((base[:, hot] > 0).sum()) > 0)
-    check("bị đẩy ra rồi thì Σ gate vẫn = 1 (chuẩn hoá lại trong top-k)",
-          torch.allclose(after.sum(-1), torch.ones(B), atol=1e-5))
-
-    # (4) eval KHÔNG được đếm tải — nếu không thì val cũng nắn bias.
-    with torch.no_grad():
-        net.expert_bias.zero_()
-        net.load_count.zero_()
-        net.load_tokens.zero_()
-        net.eval()
-        net(x, mask)
-    check("eval mode -> không đếm tải, không nắn bias",
-          float(net.load_tokens) == 0.0)
-
-    # (5) γ = 0 -> tắt hẳn.
-    off = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=0.0)
-    off.train()
-    with torch.no_grad():
-        off(x, mask)
-    check("bias_gamma=0 -> không đếm, không cập nhật",
-          float(off.load_tokens) == 0.0 and off.update_bias() is None)
-
-    # (6) bias sống sót qua load_state_dict (đây là chỗ nó vào checkpoint).
-    heir = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=0.05)
-    net.expert_bias[:] = torch.arange(E, dtype=torch.float32) - (E - 1) / 2
-    heir.load_state_dict(net.state_dict())
-    check("bias đi theo state_dict qua bàn giao máy",
-          torch.equal(heir.expert_bias, net.expert_bias))
+        st = net(x, mask)[2]
+    check("stats['balance'] == float(stats['aux_loss'])",
+          abs(st["balance"] - float(st["aux_loss"].detach())) < 1e-9)
+    check("đúng K expert khác 0 trên mọi mẫu (top-k thuần)",
+          abs(st["gate_k"] - K) < 1e-6, f"gate_k={st['gate_k']:.2f}")
 
 
 def test_decay():
-    """[11] lịch decay mũ của γ (bias) và σ (Gumbel) trong n step đầu."""
-    print("\n[11] lịch decay σ và γ (chống collapse sớm)")
+    """[11] lịch decay mũ của σ (Gumbel), đếm bằng MẪU."""
+    print("\n[11] lịch decay σ (khám phá -> khai thác), đếm bằng MẪU")
     torch.manual_seed(0)
-    B, N, E, K = 64, 16, 12, 4
-    x, mask = _fake_cxr(B), torch.ones(B, N)
+    B, N, E, K = 12, 16, 12, 4
+    x, mask = _fake_cxr(B, size=512), torch.ones(B, N)
 
-    # ── (1) toán thuần: đường cong phải chia đều theo BẬC, không tuyến tính ──
+    # ── (1) toán thuần: đường cong chia đều theo BẬC, không tuyến tính ──────
     n = 900
     got = [decay_value(1.0, 1e-3, n, t) for t in (0, 300, 450, 600, 900)]
     check("mũ 1→1e-3: qua 0.1 ở n/3, 0.01 ở 2n/3, chạm đáy ở n",
@@ -643,106 +666,79 @@ def test_decay():
     check("một đầu = 0 -> rơi về tuyến tính, không NaN",
           abs(decay_value(1.0, 0.0, 100, 50) - 0.5) < 1e-12)
     check("decay_desc đọc được cả khi lịch tắt",
-          "TẮT" in decay_desc(None, 1e-3, None, 1.0, 0)
-          and "→" in decay_desc(1.0, 1e-3, 1.0, 1e-3, 1000))
+          "TẮT" in decay_desc(None, 0.5, 0)
+          and "MẪU" in decay_desc(1.0, 0.5, 3200))
 
-    # ── (2) set_decay_step nắn ĐÚNG hai giá trị mà forward/update_bias đọc ───
-    net = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1e-3,
-                    bias_gamma=1e-3, route_noise_start=1.0,
-                    bias_gamma_start=1.0, decay_steps=n)
-    check("step 0 -> σ và γ đều ở giá trị ĐẦU",
-          net.route_noise == 1.0 and net.bias_gamma == 1.0,
-          f"σ={net.route_noise:g} γ={net.bias_gamma:g}")
-    g_mid, s_mid = net.set_decay_step(n // 2)
-    check("set_decay_step trả về đúng (γ, σ) đang dùng",
-          g_mid == net.bias_gamma and s_mid == net.route_noise)
-    net.set_decay_step(n)
-    check("hết warmup -> σ, γ về giá trị CUỐI",
-          net.route_noise == 1e-3 and net.bias_gamma == 1e-3)
+    # ── (2) lịch CHỐT của đợt này: σ 1.0 → 0.5 trong 3200 MẪU ───────────────
+    NS = 3200
+    net = RouterNet(E, K, route_noise=0.5, route_noise_start=1.0,
+                    decay_samples=NS)
+    check("mẫu 0 -> σ ở giá trị ĐẦU (1.0)", net.route_noise == 1.0,
+          f"σ={net.route_noise:g}")
+    s_mid = net.set_decay_samples(NS // 2)
+    check("set_decay_samples trả về đúng σ đang dùng",
+          s_mid == net.route_noise and abs(s_mid - 0.5 ** 0.5) < 1e-9,
+          f"σ(1600)={s_mid:.5f} = √0.5")
+    net.set_decay_samples(NS)
+    check("hết warmup -> σ về giá trị CUỐI (0.5)", net.route_noise == 0.5)
+    net.set_decay_samples(10 ** 7)
+    check("sau đó σ giữ nguyên 0.5, không đi tiếp về 0",
+          net.route_noise == 0.5)
 
-    # Hàm THUẦN của step: đây là điều kiện để resume vào lại đúng chỗ trên
-    # đường cong thay vì warmup lại từ đầu.
-    twin = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1e-3,
-                     bias_gamma=1e-3, route_noise_start=1.0,
-                     bias_gamma_start=1.0, decay_steps=n)
-    check("resume: cùng step -> cùng (γ, σ), không phụ thuộc lịch sử",
-          twin.set_decay_step(n // 2) == (g_mid, s_mid))
+    # Hàm THUẦN của số MẪU: đây là điều kiện để resume — và để bàn giao giữa
+    # hai máy khác batch — vào lại đúng chỗ trên đường cong. Bản trước đếm
+    # bằng step, nên máy 8×8 và máy 1×32 ở cùng một mốc dữ liệu lại đọc hai
+    # giá trị σ khác nhau.
+    twin = RouterNet(E, K, route_noise=0.5, route_noise_start=1.0,
+                     decay_samples=NS)
+    check("resume: cùng số MẪU -> cùng σ, không phụ thuộc lịch sử",
+          twin.set_decay_samples(NS // 2) == s_mid)
+    check("hai máy khác batch, cùng mốc mẫu -> cùng σ",
+          {RouterNet(E, K, route_noise=0.5, route_noise_start=1.0,
+                     decay_samples=NS).set_decay_samples(1600)
+           for _ in range(3)} == {s_mid})
 
-    # ── (3) lịch KHÔNG được thêm khoá vào state_dict (ckpt cũ vẫn nạp được) ─
-    plain = RouterNet(VARIANT, 1, E, K, d_enc=2560)
+    # ── (3) lịch KHÔNG được thêm khoá vào state_dict ────────────────────────
+    plain = RouterNet(E, K)
     check("lịch không thêm khoá lạ vào state_dict",
           set(net.state_dict()) == set(plain.state_dict()))
-    net.set_decay_step(0)
     plain.load_state_dict(net.state_dict())
-    check("ckpt của router CÓ lịch nạp được vào router KHÔNG lịch",
-          torch.equal(plain.expert_bias, net.expert_bias))
     check("nạp state_dict KHÔNG kéo theo lịch (lịch là config, không phải "
-          "trọng số)", plain.bias_gamma_start is None
-          and plain.decay_steps == 0)
+          "trọng số)", plain.route_noise_start is None
+          and plain.decay_samples == 0)
 
-    # ── (4) γ dù lớn tới đâu cũng KHÔNG đẩy bias vượt trần ──────────────────
-    # Đây là bất biến quan trọng nhất của cơ chế cân bằng tải, và là thứ lần
-    # chạy trước KHÔNG có: với γ_start = 1.0 và không có trần, bias phình tới
-    # ~10 nat = đúng cả dải route_logit, nên tập top-k do bias quyết định chứ
-    # không do router. Có trần thì γ lớn chỉ có nghĩa "chạm trần nhanh hơn",
-    # và trần mới là thứ định nghĩa quyền lực tối đa của bộ cân bằng.
-    clip = float(net.bias_clip)
-    net.set_decay_step(0)
-    net.train()
-    with torch.no_grad():
-        net.expert_bias.zero_()
-        net.load_count.zero_()
-        net.load_tokens.zero_()
-        net.load_count[5] = 200.0            # expert 5 ôm hết
-        net.load_tokens += 200.0
-    span_hot, _ = net.update_bias()
-    check("γ=1.0 -> |bias| vẫn không vượt trần trong một step",
-          float(net.expert_bias.abs().max()) <= clip + 1e-6,
-          f"|b|max={float(net.expert_bias.abs().max()):.3f} trần={clip:g}")
-    check("γ=1.0 -> span bị chặn bởi 2·trần",
-          span_hot <= 2 * clip + 1e-6, f"span={span_hot:.3f}")
-    check("γ=1.0 -> expert quá tải vẫn bị hạ dưới phần còn lại",
-          float(net.expert_bias[5]) < float(net.expert_bias[0]),
-          f"b[5]={float(net.expert_bias[5]):+.3f} "
-          f"b[0]={float(net.expert_bias[0]):+.3f}")
-    # Cùng tình huống với γ cuối: bias gần như không nhúc nhích. γ vẫn là NÚM
-    # TỐC ĐỘ (bao nhiêu step để đi hết tầm), còn bias_clip là NÚM TẦM.
-    slow = RouterNet(VARIANT, 1, E, K, d_enc=2560, bias_gamma=1e-3)
-    slow.train()
-    with torch.no_grad():
-        slow.load_count[5] = 200.0
-        slow.load_tokens += 200.0
-    span_slow, _ = slow.update_bias()
-    check("γ=1e-3 -> cùng tình huống nắn chậm hơn hai bậc",
-          span_slow < span_hot / 100, f"{span_slow:.5f} vs {span_hot:.3f}")
-    check("γ nhỏ vẫn đi được hết tầm nếu đủ step (trần là tầm, γ là tốc độ)",
-          _drive_to_clip(slow) <= clip + 1e-6)
-
-    # ── (5) σ giảm thì tuyến đường thôi đảo (khám phá -> khai thác) ──────────
+    # ── (4) σ giảm thì tuyến đường thôi đảo (khám phá -> khai thác) ─────────
     net.eval()
     with torch.no_grad():
-        net.expert_bias.zero_()
         clean = (net(x, mask)[1] > 0)        # top-k tất định, không nhiễu
     net.train()
 
-    def churn(step):
-        net.set_decay_step(step)
+    def churn(samples):
+        net.set_decay_samples(samples)
         with torch.no_grad():
             sel = (net(x, mask)[1] > 0)
         return float((sel != clean).float().sum()) / B
 
-    c0, c_end = churn(0), churn(n)
-    check("σ=1.0 ở step 0 -> tuyến đường đảo nhiều (expert thứ 5 còn cửa)",
+    c0, c_end = churn(0), churn(NS)
+    check("σ=1.0 ở mẫu 0 -> tuyến đường đảo nhiều (expert hạng k+1 còn cửa)",
           c0 > 0.5, f"{c0:.2f} lựa chọn đổi / mẫu")
-    check("σ=1e-3 sau warmup -> gần như tất định, bám top-k sạch",
-          c_end < 0.05 and c_end < c0 / 10, f"{c_end:.3f} vs {c0:.2f}")
+    check("σ=0.5 sau warmup -> đảo ÍT HƠN nhưng KHÔNG tắt (còn khám phá)",
+          0.0 < c_end < c0, f"{c_end:.3f} vs {c0:.2f}")
 
-    # ── (6) tắt lịch = đúng hành vi cũ ──────────────────────────────────────
-    old = RouterNet(VARIANT, 1, E, K, d_enc=2560, route_noise=1.0,
-                    bias_gamma=1e-3)
-    vals = {old.set_decay_step(t) for t in (0, 10, 10 ** 6)}
-    check("không có lịch -> σ, γ là HẰNG ở mọi step (hành vi trước đây)",
-          vals == {(1e-3, 1.0)}, str(vals))
+    # Điểm quan trọng của đợt này: σ_end = 0.5 chứ không phải 0. Từ khi bỏ
+    # bias, Gumbel là cơ chế khám phá DUY NHẤT — tắt nó là đóng băng tuyến
+    # đường, và aux loss không sửa được (nó chỉ nắn qua P_e).
+    seen = torch.zeros(E, dtype=torch.bool)
+    with torch.no_grad():
+        for _ in range(20):
+            seen |= (net(x[:4], mask[:4])[1] > 0).any(dim=0)
+    check("σ=0.5: mọi expert vẫn có lúc được chọn (không expert nào chết)",
+          bool(seen.all()), f"{int(seen.sum())}/{E}")
+
+    # ── (5) tắt lịch = σ hằng từ mẫu 0 ─────────────────────────────────────
+    off = RouterNet(E, K, route_noise=1.0)
+    vals = {off.set_decay_samples(t) for t in (0, 10, 10 ** 6)}
+    check("không có lịch -> σ là HẰNG ở mọi mốc mẫu", vals == {1.0}, str(vals))
 
 
 def test_probe():
@@ -820,7 +816,7 @@ def test_probe():
     # ── force_gate: ép cái đi vào MoE, KHÔNG ép cái router nghĩ ──────────────
     torch.manual_seed(0)
     E, K, B = 8, 3, 2
-    net = RouterNet(VARIANT, 1, E, K, d_enc=2560).eval()
+    net = RouterNet(E, K).eval()
     br = RouterBridge(net)
     img, mask = _fake_cxr(B), torch.ones(B, 12)
 
@@ -999,7 +995,7 @@ if __name__ == "__main__":
     test_asl()
     test_schedule()
     test_swa()
-    test_bias()
+    test_aux()
     test_route_noise()
     test_decay()
     test_probe()

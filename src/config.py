@@ -1,12 +1,19 @@
-"""Nạp config, dò phần cứng, giải quyết ô sweep.
+"""Nạp config, dò phần cứng, giải quyết cấu hình một lần chạy.
 
 `python -m src.config` in ra cấu hình đã giải quyết mà không nạp model —
 dùng để kiểm tra trước khi chạy thật.
 
-Adapter đã CHỐT là QDoRA r8; MoE chốt 12 expert / top-4; Recombinator chỉ còn
-MỘT biến thể (`g-brmf`), nên biến duy nhất còn quét là số block. Trường
-`variant` vẫn nằm trong config và trong tag của ô — giữ để đường ống không
-phải đổi khi thêm biến thể mới.
+KHÔNG CÒN SWEEP. Trước đây file này giải quyết một "ô sweep" = (model,
+variant Recombinator, số block MQA), và `SWEEP_BLOCKS` là bảng các ô hợp lệ.
+Kiến trúc router giờ đã chốt hẳn — ConvNeXt-Tiny + downsample/flatten, không
+có siêu tham số kiến trúc nào để quét (xem src/router.py) — nên khối `sweep`
+trong YAML đổi tên thành `arch` và chỉ còn giữ đúng một trường: `model`.
+`arch.tag` vẫn là thứ đặt tên thư mục outputs/ckpt và repo Hub, để nhiều lần
+chạy khác model không đè lên nhau.
+
+Adapter đã CHỐT là QDoRA r8. MoE: E expert / top-k, thuần top-k, không còn
+expert hứng và không còn trần tải; cân bằng tải là MỘT số hạng aux trong
+Total_Loss (run.w_aux).
 
 Lịch train là MỘT phase multi-task duy nhất và KHÔNG có đích (xem
 configs/default.yaml, khối `run`): không còn phase1_samples/phase2_samples,
@@ -23,7 +30,8 @@ from types import SimpleNamespace
 
 import yaml
 
-from .router import VARIANT, VARIANTS as ROUTER_VARIANTS, estimate_params
+from .router import (CONVNEXT_WEIGHTS, D_MODEL, FROZEN_UPTO, IMG_SIZE,
+                     STRIDE, arch_desc, decay_desc, estimate_params)
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
 # Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
@@ -135,34 +143,25 @@ PRESETS = [
     (0, "GPU <14GB — chật", 1, 32, 1, True),
 ]
 
-# ── Ô sweep: số block của Recombinator g-brmf (§2) ──────────────────────────
-# Một biến thể duy nhất (852_992 param/block). Bảng so sánh dựng trên các ô
-# nằm trong danh sách này; chạy ô ngoài bảng vẫn được, chỉ có cảnh báo.
-SWEEP_BLOCKS = {
-    VARIANT: (1, 2, 3, 4, 12),
-}
-assert set(SWEEP_BLOCKS) <= set(ROUTER_VARIANTS), "biến thể sweep lạ với router"
+# Tên kiến trúc, đi vào `arch.tag` -> tên thư mục outputs/ckpt và repo Hub.
+# Không còn siêu tham số kiến trúc nào để quét, nên đây là hằng số chứ không
+# phải một trường trong YAML.
+ARCH_NAME = f"cnx{D_MODEL}"
 
 
-def variant_desc(cfg):
-    """Một dòng mô tả ô sweep, dùng chung cho log / metrics / print."""
-    s, f = cfg.sweep, cfg.fixed
-    est = estimate_params(s.variant, s.n_block, f.n_expert)
-    return (f"{s.variant}×{s.n_block} block "
-            f"({ROUTER_VARIANTS[s.variant].PARAMS:,} param/block) | "
-            f"router {est['router'] / 1e6:.2f}M + "
-            f"{f.n_expert} expert QDoRA r{f.lora_r} "
-            f"(top-{f.top_k} trên {f.n_expert - getattr(f, 'n_shared', 0)}"
-            + (f" + {f.n_shared} hứng" if getattr(f, "n_shared", 0) else "")
-            + ") "
-            f"≈ {est['total'] / 1e6:.1f}M")
+def arch_summary(cfg):
+    """Một dòng mô tả kiến trúc, dùng chung cho log / metrics / print."""
+    f = cfg.fixed
+    est = estimate_params(f.n_expert)
+    return (arch_desc(f.n_expert, f.top_k)
+            + f" + {f.n_expert} expert QDoRA r{f.lora_r} "
+              f"≈ {est['total'] / 1e6:.1f}M trainable")
 
 
-def adapter_desc(f, sweep=None):
+def adapter_desc(f, arch=None):
     """Adapter đã CHỐT — giữ hàm để log/metrics gọi được như cũ."""
-    _ns = getattr(f, "n_shared", 0)
     return (f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E "
-            f"top-{f.top_k}" + (f" + {_ns} hứng" if _ns else ""))
+            f"top-{f.top_k} (thuần top-k, không expert hứng)")
 
 
 def detect_hardware(require_bf16=True):
@@ -231,7 +230,7 @@ def image_desc(f):
 
 
 def _deep_set(d, dotted, value):
-    """--set sweep.n_block=20  ->  d['sweep']['n_block'] = 20"""
+    """--set run.train_bs=2  ->  d['run']['train_bs'] = 2"""
     keys = dotted.split(".")
     for k in keys[:-1]:
         d = d.setdefault(k, {})
@@ -246,7 +245,6 @@ _DEAD_KEYS = {
     "only_phase": "chỉ còn MỘT phase multi-task",
     "p2_freeze_trunk": "không còn phase 2 để đóng băng trunk",
     "p2_freeze_sup_head": "không còn phase 2 để đóng băng sup_head",
-    "w_aux": "aux loss đã bỏ — cân bằng tải do fixed.bias_gamma lo",
     "focal_gamma": "nhánh supervised dùng ASL, không còn Focal (run.asl_*)",
     "focal_alpha_pow": "ASL không có bảng α theo tần suất — γ⁻ lo phần đó",
     "focal_alpha_normalize": "ASL không có bảng α theo tần suất",
@@ -256,6 +254,23 @@ _DEAD_KEYS = {
     "resume": "LUÔN resume nếu có checkpoint",
     "save_every": "ckpt đếm theo lần val (save_every_n_vals)",
     "warmup_steps": "warmup đếm bằng mẫu (warmup_samples)",
+    # ── Khoá của bản CÂN BẰNG TẢI AUX-FREE (bias + trần tải + expert hứng) ──
+    # Cả ba cơ chế đã bị thay bằng ĐÚNG một số hạng aux trong Total_Loss
+    # (run.w_aux). Để nguyên trong config thì người đọc tưởng chúng còn tác
+    # dụng, mà cái nguy hơn: `n_shared` cũ đổi VAI của những expert cuối.
+    "bias_gamma": "cân bằng tải giờ là số hạng aux trong loss (run.w_aux)",
+    "bias_gamma_start": "không còn bias để nắn, nên không còn lịch cho γ",
+    "bias_clip": "không còn bias để chặn trần",
+    "router_bias_at_eval": "không còn bias nào để cộng vào điểm chọn",
+    "capacity_factor": "không còn trần tải mỗi micro-batch — top-k thuần",
+    "n_shared": "không còn expert HỨNG — cả E expert đều được định tuyến",
+    "shared_weight": "không còn expert hứng thì không có suất cố định nào",
+    "decay_warmup_steps": ("lịch decay của σ đếm bằng MẪU "
+                           "(fixed.decay_warmup_samples)"),
+    # ── Khoá của bản CÓ SWEEP ───────────────────────────────────────────────
+    "variant": "kiến trúc router đã chốt, không còn biến thể để quét",
+    "n_block": "không còn stack MQA — router đi thẳng downsample+flatten",
+    "d_enc": "router đọc ảnh, không đọc hidden state của Gemma",
 }
 
 
@@ -269,18 +284,26 @@ def load_config(path="configs/default.yaml", overrides=None):
 
     hw = detect_hardware(bool(raw["fixed"].get("require_bf16", True)))
     preset = pick_preset(hw.vram_gb)
-    fixed, sweep, run = raw["fixed"], raw["sweep"], raw["run"]
+    # Khối `sweep` cũ (model + variant + n_block) đổi tên thành `arch` và chỉ
+    # còn `model`. Đọc được cả hai để config cũ không nổ ngay ở dòng đầu —
+    # nhưng variant/n_block trong đó sẽ rơi vào _DEAD_KEYS và bị báo.
+    if "arch" not in raw and "sweep" in raw:
+        raw["arch"] = raw.pop("sweep")
+        print("⚠ config: khối `sweep:` đã đổi tên thành `arch:` — không còn "
+              "sweep nào để quét (kiến trúc router đã chốt).")
+    fixed, arch, run = raw["fixed"], raw["arch"], raw["run"]
     explicit = {ov.split("=", 1)[0] for ov in (overrides or [])}
 
-    # Khoá chết của bản hai phase: BỎ QUA nhưng nói rõ, đừng để im lặng.
+    # Khoá chết của các bản trước: BỎ QUA nhưng nói rõ, đừng để im lặng.
     for key, why in _DEAD_KEYS.items():
-        for block, name in ((fixed, "fixed"), (run, "run")):
+        for block, name in ((fixed, "fixed"), (arch, "arch"), (run, "run")):
             if key in block:
                 block.pop(key)
                 print(f"⚠ config: bỏ qua {name}.{key} — {why}")
 
-    # §1.7 — Total_Loss = 1·CE + w_sup·ASL. Không còn số hạng aux.
-    run.setdefault("w_sup", 0.2)
+    # §1.7 — Total_Loss = 1·CE + w_sup·ASL + w_aux·Aux.
+    run.setdefault("w_sup", 0.5)
+    run.setdefault("w_aux", 0.05)
     # §1.6 — ASL (Ridnik et al. 2021) trên 14 finding. γ giữ ĐÚNG default của
     # bản gốc; chỉ ngưỡng âm tính đi theo chuẩn đọc phim (xem yaml).
     run.setdefault("asl_gamma_pos", 0.0)
@@ -353,87 +376,102 @@ def load_config(path="configs/default.yaml", overrides=None):
         # Probe chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
         run["n_test_samples"] = run.get("probe_n_images") or 0
 
-    # Nhiễu Gumbel trên route logit khi CHỌN top-k. 1.0 = lấy mẫu đúng chuẩn.
-    fixed.setdefault("route_noise", 1.0)
+    # ── w_aux: hệ số của số hạng cân bằng tải (Switch-Transformer) ──────────
+    # L_aux = E·Σ f_e·P_e ≥ 1, = 1 khi cân bằng hoàn hảo (src/losses.py).
+    # Nó THAY HẲN cơ chế bias aux-free của bản trước: không còn núm nào cộng
+    # vào điểm chọn top-k, nên `chosen` lúc probe và top-k lúc train là cùng
+    # một hàm của route_logit.
+    run["w_aux"] = float(run["w_aux"])
+    if run["w_aux"] < 0:
+        raise ValueError(f"run.w_aux phải >= 0, nhận {run['w_aux']}")
+    if run["w_aux"] == 0:
+        print("⚠ w_aux=0 — TẮT cân bằng tải. Không còn bias, không còn trần "
+              "tải, nên không còn gì giữ router khỏi dồn hết vào vài expert; "
+              "chỉ dùng khi cố ý đo hiện tượng đó.")
+    if run["w_aux"] > 0.5:
+        print(f"⚠ w_aux={run['w_aux']:g} rất lớn — L_aux có sàn 1.0 nên nó "
+              f"cộng thẳng {run['w_aux']:g} vào Total_Loss, và ở mức này nó "
+              f"lấn át CE. Chuẩn phổ thông là 0.01–0.05.")
+    run["w_sup"] = float(run["w_sup"])
+    if run["w_sup"] < 0:
+        raise ValueError(f"run.w_sup phải >= 0, nhận {run['w_sup']}")
+
+    # ── Nhiễu Gumbel trên route logit khi CHỌN top-k ────────────────────────
+    # σ = 1.0 là lấy mẫu ĐÚNG CHUẨN Gumbel-top-k. Giá trị ở đây là σ SAU
+    # warmup (xem decay_warmup_samples ngay dưới).
+    fixed.setdefault("route_noise", 0.5)
     fixed["route_noise"] = float(fixed["route_noise"])
     if fixed["route_noise"] < 0:
         raise ValueError(f"fixed.route_noise phải >= 0, nhận "
                          f"{fixed['route_noise']}")
     if fixed["route_noise"] > 2.0:
         print(f"⚠ route_noise={fixed['route_noise']:g} rất lớn — σ ≳ 2 thì "
-              f"top-k gần như bốc ngẫu nhiên đều, gate hết mang thông tin. "
-              f"Chuẩn phổ thông là 1.0 (lấy mẫu đúng Gumbel-top-k).")
+              f"top-k gần như bốc ngẫu nhiên đều, gate hết mang thông tin.")
+    if fixed["route_noise"] == 0:
+        print("⚠ route_noise=0 sau warmup — top-k thành tất định hoàn toàn. "
+              "Từ khi bỏ bias, Gumbel là cơ chế KHÁM PHÁ DUY NHẤT còn lại: "
+              "expert xếp thứ k+1 sẽ không bao giờ được chạy nữa, và aux "
+              "loss không sửa được điều đó (nó chỉ nắn qua P_e).")
 
-    # Cân bằng tải aux-free: γ của quy tắc cập nhật bias (DeepSeek-V3).
-    fixed.setdefault("bias_gamma", 1.0e-3)
-    fixed["bias_gamma"] = float(fixed["bias_gamma"])
-    if fixed["bias_gamma"] < 0:
-        raise ValueError(f"fixed.bias_gamma phải >= 0, nhận "
-                         f"{fixed['bias_gamma']}")
-    if fixed["bias_gamma"] == 0:
-        print("⚠ bias_gamma=0 — TẮT cân bằng tải. Không còn aux loss thì cũng "
-              "không còn gì giữ router khỏi dồn hết vào vài expert; chỉ dùng "
-              "khi cố ý đo hiện tượng đó.")
+    # ── Lịch decay MŨ của σ trong n MẪU đầu ─────────────────────────────────
+    # `route_noise` ở trên là giá trị CUỐI; `route_noise_start` là giá trị ở
+    # mẫu 0. `route_noise_start: null` hoặc `decay_warmup_samples: 0` -> tắt
+    # lịch, dùng thẳng giá trị cuối.
+    #
+    # ĐẾM BẰNG MẪU, không bằng step — đổi so với bản trước, cùng lý do đã
+    # buộc lịch LR đếm bằng mẫu: step phụ thuộc train_bs × grad_accum của
+    # từng máy, còn mẫu thì không.
+    fixed.setdefault("decay_warmup_samples", 3200)
+    fixed["decay_warmup_samples"] = int(fixed["decay_warmup_samples"])
+    if fixed["decay_warmup_samples"] < 0:
+        raise ValueError(f"fixed.decay_warmup_samples phải >= 0, nhận "
+                         f"{fixed['decay_warmup_samples']}")
+    fixed.setdefault("route_noise_start", None)
+    if fixed["route_noise_start"] is not None:
+        fixed["route_noise_start"] = float(fixed["route_noise_start"])
+        if fixed["route_noise_start"] < 0:
+            raise ValueError(f"fixed.route_noise_start phải >= 0 hoặc null, "
+                             f"nhận {fixed['route_noise_start']}")
+    if (fixed["route_noise_start"] is not None
+            and fixed["decay_warmup_samples"] == 0):
+        print("⚠ có route_noise_start nhưng decay_warmup_samples=0 — lịch "
+              "decay KHÔNG chạy, σ dùng thẳng giá trị cuối từ mẫu 0.")
+    if (fixed["route_noise_start"] is not None
+            and fixed["route_noise_start"] < fixed["route_noise"]):
+        print(f"⚠ route_noise_start={fixed['route_noise_start']:g} < "
+              f"route_noise={fixed['route_noise']:g} — lịch chạy NGƯỢC (σ "
+              f"tăng dần). Ý đồ là σ lớn lúc đầu để tuyến đường còn đảo "
+              f"được, rồi mới siết lại.")
 
-    # ── Lịch decay MŨ của σ và γ trong n step ĐẦU (§3.5/§3.6) ───────────────
-    # `bias_gamma` / `route_noise` ở trên là giá trị CUỐI (sau warmup);
-    # `*_start` là giá trị ở step 0. `*_start: null` -> tắt lịch cho đại lượng
-    # đó. `decay_warmup_steps: 0` -> tắt lịch cho cả hai.
-    fixed.setdefault("decay_warmup_steps", 1000)
-    fixed["decay_warmup_steps"] = int(fixed["decay_warmup_steps"])
-    if fixed["decay_warmup_steps"] < 0:
-        raise ValueError(f"fixed.decay_warmup_steps phải >= 0, nhận "
-                         f"{fixed['decay_warmup_steps']}")
-    for _k in ("bias_gamma_start", "route_noise_start"):
-        fixed.setdefault(_k, None)
-        if fixed[_k] is not None:
-            fixed[_k] = float(fixed[_k])
-            if fixed[_k] < 0:
-                raise ValueError(f"fixed.{_k} phải >= 0 hoặc null, nhận "
-                                 f"{fixed[_k]}")
-    _has_start = (fixed["bias_gamma_start"] is not None
-                  or fixed["route_noise_start"] is not None)
-    if _has_start and fixed["decay_warmup_steps"] == 0:
-        print("⚠ có *_start nhưng decay_warmup_steps=0 — lịch decay KHÔNG "
-              "chạy, σ/γ dùng thẳng giá trị cuối từ step 0.")
-    if (fixed["bias_gamma_start"] is not None
-            and fixed["bias_gamma_start"] < fixed["bias_gamma"]):
-        print(f"⚠ bias_gamma_start={fixed['bias_gamma_start']:g} < "
-              f"bias_gamma={fixed['bias_gamma']:g} — lịch đang chạy NGƯỢC "
-              f"(γ tăng dần). Ý đồ của lịch là γ lớn lúc đầu để bias nắn kịp "
-              f"trước khi router kịp sập, rồi mới nhỏ dần.")
-
-    # ── Trần tải mỗi expert + expert HỨNG (§src/router.py) ──────────────────
-    # capacity = ceil(capacity_factor · B · top_k / R), B = micro-batch,
-    # R = n_expert − n_shared. Phần vượt trần KHÔNG bị vứt: nó chảy sang
-    # n_shared expert cuối, chia đều. 0 = tắt trần.
-    fixed.setdefault("capacity_factor", 1.25)
-    fixed["capacity_factor"] = float(fixed["capacity_factor"])
-    if fixed["capacity_factor"] < 0:
-        raise ValueError(f"fixed.capacity_factor phải >= 0 (0 = tắt trần "
-                         f"tải), nhận {fixed['capacity_factor']}")
-    if 0 < fixed["capacity_factor"] < 1.0:
-        print(f"⚠ capacity_factor={fixed['capacity_factor']:g} < 1 — trần "
-              f"CHẶT HƠN mức phân bố đều, nên kể cả router cân bằng hoàn hảo "
-              f"vẫn luôn có phần chảy sang expert hứng.")
-
-    fixed.setdefault("n_shared", 2)
-    fixed["n_shared"] = int(fixed["n_shared"])
-    if not 0 <= fixed["n_shared"] < int(fixed["n_expert"]):
-        raise ValueError(f"fixed.n_shared={fixed['n_shared']} phải nằm trong "
-                         f"[0, n_expert={fixed['n_expert']})")
-    if fixed["n_shared"] == 0 and fixed["capacity_factor"] > 0:
-        print("⚠ n_shared=0 nhưng trần tải đang bật — không có expert hứng "
-              "thì phần vượt trần bị DROP và chia lại cho các expert còn "
-              "giữ, chứ không chảy đi đâu cả.")
-    # null = n_shared/(top_k + n_shared): mỗi expert hứng nặng đúng bằng một
-    # expert định tuyến trung bình.
-    fixed.setdefault("shared_weight", None)
-    if fixed["shared_weight"] is not None:
-        fixed["shared_weight"] = float(fixed["shared_weight"])
-        if not 0.0 <= fixed["shared_weight"] < 1.0:
-            raise ValueError(f"fixed.shared_weight phải nằm trong [0, 1) "
-                             f"hoặc null, nhận {fixed['shared_weight']}")
+    # ── Backbone router: ConvNeXt-Tiny, và HÌNH HỌC BỊ BUỘC ─────────────────
+    # (router_img_size / 32)² PHẢI bằng D_MODEL — xem docstring src/router.py.
+    fixed.setdefault("router_backbone", CONVNEXT_WEIGHTS)
+    fixed.setdefault("router_img_size", IMG_SIZE)
+    fixed["router_img_size"] = int(fixed["router_img_size"])
+    _grid = fixed["router_img_size"] // STRIDE
+    if _grid * _grid != D_MODEL:
+        raise ValueError(
+            f"fixed.router_img_size={fixed['router_img_size']} cho lưới "
+            f"{_grid}×{_grid} = {_grid*_grid} token, nhưng chiều làm việc của "
+            f"router là {D_MODEL}. Khối downsample cần một ma trận VUÔNG "
+            f"(kênh × token), nên (router_img_size/{STRIDE})² phải bằng "
+            f"{D_MODEL} -> router_img_size = "
+            f"{int(round(D_MODEL ** 0.5)) * STRIDE}.")
+    if not fixed["router_backbone"]:
+        print("⚠ router_backbone=null — ConvNeXt dựng với TRỌNG SỐ NGẪU "
+              "NHIÊN. Chỉ hợp lệ cho selftest offline; train thật ở chế độ "
+              "này là vứt bỏ toàn bộ lợi thế pretrain.")
+    fixed.setdefault("router_frozen_upto", FROZEN_UPTO)
+    fixed["router_frozen_upto"] = int(fixed["router_frozen_upto"])
+    if not 0 <= fixed["router_frozen_upto"] <= 8:
+        raise ValueError(f"fixed.router_frozen_upto phải trong [0, 8] "
+                         f"(ConvNeXt features có 8 phần tử), nhận "
+                         f"{fixed['router_frozen_upto']}")
+    if fixed["router_frozen_upto"] < 7:
+        print(f"⚠ router_frozen_upto={fixed['router_frozen_upto']} < 7 — mở "
+              f"thêm cả stage3 (9 block, 10.8M param) trở xuống. Phần "
+              f"trainable của router gần gấp đôi, và 25k mẫu khó nắn lại "
+              f"vùng đặc trưng trung gian mà không quên pretrain.")
 
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
@@ -441,24 +479,12 @@ def load_config(path="configs/default.yaml", overrides=None):
     if rm.active:
         _apply_remote(rm, run, explicit)
 
-    # ── Giải quyết ô sweep ───────────────────────────────────────────────────
-    sweep["variant"] = str(sweep["variant"]).strip().lower()
-    if sweep["variant"] not in ROUTER_VARIANTS:
-        raise ValueError(f"variant lạ: {sweep['variant']} "
-                         f"(chọn: {list(ROUTER_VARIANTS)})")
-    n_block = int(sweep["n_block"])
-    if n_block not in SWEEP_BLOCKS.get(sweep["variant"], ()):
-        # Không chặn: dải block là bảng của sweep, không phải luật — chạy tay
-        # một ô ngoài bảng (n8 chẳng hạn) vẫn hợp lệ. Nhưng phải BÁO, vì ô đó
-        # không nằm trong bảng so sánh mà src.report dựng.
-        print(f"⚠ sweep: {sweep['variant']}-n{n_block} nằm ngoài bảng "
-              f"{SWEEP_BLOCKS.get(sweep['variant']) or '(biến thể ngoài sweep)'}"
-              f" — ô này sẽ không có cột trong bảng tổng kết.")
-    sweep["n_block"] = n_block
-    if sweep["model"] not in raw["models"]:
-        raise ValueError(f"model lạ: {sweep['model']}")
+    # ── Giải quyết cấu hình một lần chạy ────────────────────────────────────
+    if arch["model"] not in raw["models"]:
+        raise ValueError(f"model lạ: {arch['model']} "
+                         f"(chọn: {list(raw['models'])})")
 
-    mdl = raw["models"][sweep["model"]]
+    mdl = raw["models"][arch["model"]]
     fixed["model_id"] = mdl["model_id"]
     fixed["lora_exclude"] = mdl["exclude"]
     # §4.1.1 — mỗi model MỘT processor riêng. Gemma 3 buộc 896² (SigLIP có
@@ -466,21 +492,17 @@ def load_config(path="configs/default.yaml", overrides=None):
     # thẳng ảnh gốc. image_size = null -> không resize, processor tự lo.
     fixed["image_size_model"] = mdl.get("image_size")
     fixed["processor_kwargs"] = dict(mdl.get("processor_kwargs") or {})
-    # d_enc thật lấy từ config của model lúc build (hidden_size); giá trị ở đây
-    # chỉ để in bảng tham số trước khi nạp weight.
-    fixed["d_enc"] = int(mdl.get("hidden_size", 2560))
     fixed["lora_alpha"] = fixed["lora_r"] * fixed["alpha_ratio"]
     # Adapter đã chốt: QDoRA = LoRA + DoRA + base NF4.
     fixed["use_dora"] = True
     run["quant"] = True
-    _n_route = int(fixed["n_expert"]) - int(fixed["n_shared"])
-    if not 1 <= int(fixed["top_k"]) <= _n_route:
+    if not 1 <= int(fixed["top_k"]) <= int(fixed["n_expert"]):
         raise ValueError(
-            f"top_k={fixed['top_k']} phải nằm trong [1, n_expert − n_shared "
-            f"= {_n_route}] — {fixed['n_shared']} expert CUỐI là expert hứng, "
-            f"không tham gia top-k (xem src/router.py).")
+            f"top_k={fixed['top_k']} phải nằm trong [1, n_expert="
+            f"{fixed['n_expert']}] — top-k thuần trên CẢ E expert, không còn "
+            f"expert hứng nào bị loại khỏi vòng chọn (xem src/router.py).")
 
-    tag = f"{sweep['model']}-{sweep['variant']}-n{n_block}"
+    tag = f"{arch['model']}-{ARCH_NAME}"
     if run.get("hub_repo") is None:
         run["hub_repo"] = f"RGExp123/mimic-cxr-{tag}"
     # Bản ghi probe là DATASET, không phải model: để chung repo với checkpoint
@@ -490,7 +512,7 @@ def load_config(path="configs/default.yaml", overrides=None):
         run["probe_repo"] = f"{run['hub_repo']}-probe"
     if run.get("wandb_run") is None:
         run["wandb_run"] = tag
-    # Mỗi ô sweep có thư mục riêng: chạy song song/nối tiếp không đè checkpoint.
+    # Mỗi lần chạy có thư mục riêng theo tag: đổi model không đè checkpoint.
     run["out_dir"] = os.path.join(run["out_dir"], tag)
     run["ckpt_dir"] = os.path.join(run["ckpt_dir"], tag)
 
@@ -560,7 +582,7 @@ def load_config(path="configs/default.yaml", overrides=None):
         fixed=SimpleNamespace(**fixed),
         run=SimpleNamespace(**run),
         data=SimpleNamespace(**run["data"]),
-        sweep=SimpleNamespace(**sweep, tag=tag),
+        arch=SimpleNamespace(**arch, tag=tag),
         hw=hw, preset=preset, remote=rm,
     )
     for d in (cfg.run.out_dir, cfg.run.ckpt_dir):
@@ -575,7 +597,7 @@ def cycles_desc(cfg):
     eff = r.train_bs * r.grad_accum
     s = (f"lịch LR: cosine warm restarts VÔ HẠN | cycle = {r.cycle_samples} "
          f"mẫu ({r.cycle_samples // eff} step ở batch {eff}) | warmup "
-         f"{r.warmup_samples} mẫu (chỉ cycle đầu)")
+         f"{r.warmup_samples} mẫu ở đầu MỌI cycle")
     if r.min_lr_ratio:
         s += f" | đáy = {r.min_lr_ratio:g}×lr"
     s += (f" | SWA: gom snapshot ở đáy MỖI cycle (swa_use={r.swa_use})"
@@ -614,10 +636,10 @@ def build_argparser():
                     metavar="KEY=VALUE",
                     help="Ghi đè config, vd: --set run.cycle_samples=3200")
     ap.add_argument("--model", choices=["gemma3", "qwen25vl"])
-    # type=str.lower: --variant G-BRMF cũng nhận, khỏi phải nhớ cách viết.
-    ap.add_argument("--variant", type=str.lower, choices=list(ROUTER_VARIANTS),
-                    default=None)
-    ap.add_argument("--n-block", type=int, dest="n_block")
+    # `--variant` / `--n-block` đã BỎ: kiến trúc router chốt hẳn, không còn
+    # siêu tham số nào để quét. Gọi kèm hai cờ đó thì argparse báo lỗi ngay
+    # thay vì im lặng bỏ qua — đúng ý, vì script cũ gọi chúng sẽ chạy MỘT
+    # kiến trúc khác hẳn với cùng dòng lệnh.
     ap.add_argument("--mode", choices=["train", "test", "both", "probe"],
                     help="probe = không train, nạp SWA từ Hub, sinh báo cáo "
                          "rồi bật lần lượt từng expert trong top-k để đo "
@@ -633,8 +655,7 @@ def build_argparser():
 def config_from_args(argv=None):
     args = build_argparser().parse_args(argv)
     ov = list(args.overrides)
-    for name, key in (("model", "sweep.model"), ("variant", "sweep.variant"),
-                      ("n_block", "sweep.n_block"), ("mode", "run.mode")):
+    for name, key in (("model", "arch.model"), ("mode", "run.mode")):
         val = getattr(args, name)
         if val is not None:
             ov.append(f"{key}={val}")
@@ -647,49 +668,37 @@ def config_from_args(argv=None):
 
 if __name__ == "__main__":
     c = config_from_args()
-    est = estimate_params(c.sweep.variant, c.sweep.n_block, c.fixed.n_expert)
-    print(f"Ô sweep : {c.sweep.tag}")
+    est = estimate_params(c.fixed.n_expert)
+    print(f"Lần chạy: {c.arch.tag}")
     print(f"GPU     : {c.hw.name} | {c.hw.vram_gb:.0f}GB | "
           f"sm{c.hw.sm[0]}{c.hw.sm[1]} | {c.hw.n_gpu} GPU")
     print(f"Preset  : {c.preset['name']}")
     print(f"Model   : {c.fixed.model_id} | attn={c.fixed.attn_impl}")
-    print(f"Router  : {variant_desc(c)}")
-    print(f"          router {est['router']:,} + expert {est['experts']:,} "
-          f"= {est['total']:,} param trainable")
+    print(f"Router  : {arch_summary(c)}")
+    _bb = (f"convnext_tiny {c.fixed.router_backbone}"
+           if c.fixed.router_backbone else "convnext_tiny NGẪU NHIÊN")
+    _g = c.fixed.router_img_size // STRIDE
+    print(f"          backbone {_bb} | ảnh {c.fixed.router_img_size}² -> "
+          f"lưới {_g}×{_g} = {_g*_g} token × {D_MODEL} chiều | đóng băng "
+          f"features[0:{c.fixed.router_frozen_upto}]")
+    print(f"          router {est['router']:,} tổng, "
+          f"{est['router_trainable']:,} trainable + expert "
+          f"{est['experts']:,} = {est['total']:,} param trainable")
     print(f"Adapter : {adapter_desc(c.fixed)} | quant={c.run.quant}")
     print(f"Ảnh     : {image_desc(c.fixed)}")
     print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
           f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
     print("Lịch    : MỘT phase multi-task, KHÔNG có đích — chạy tuần tự tập "
           "train, hết thì epoch += 1 và chạy tiếp")
-    print(f"Loss    : 1·CE + {c.run.w_sup}·ASL | KHÔNG có aux")
+    print(f"Loss    : 1·CE + {c.run.w_sup}·ASL + {c.run.w_aux}·Aux")
     print(f"          ASL γ+={c.run.asl_gamma_pos:g} γ-={c.run.asl_gamma_neg:g}"
           f" | ngưỡng âm m={c.run.asl_clip:g} (BI-RADS 3)"
           f" | uncertain={c.run.uncertain_soft:g}, blank=MASK")
-    _n = int(getattr(c.fixed, "decay_warmup_steps", 0) or 0)
-    _gs = getattr(c.fixed, "bias_gamma_start", None)
-    _ss = getattr(c.fixed, "route_noise_start", None)
-    _sched = ("" if _n <= 0 or (_gs is None and _ss is None) else
-              " | decay mũ "
-              + (f"γ {_gs:g}→{c.fixed.bias_gamma:g} "
-                 if _gs is not None else "")
-              + (f"σ {_ss:g}→{c.fixed.route_noise:g} "
-                 if _ss is not None else "")
-              + f"trong {_n} step đầu")
-    print(f"Cân bằng: bias aux-free γ={c.fixed.bias_gamma:g} "
-          f"| Gumbel σ={c.fixed.route_noise:g}{_sched}")
-    _ns = int(getattr(c.fixed, "n_shared", 0) or 0)
-    _cf = float(getattr(c.fixed, "capacity_factor", 0.0) or 0.0)
-    _R = c.fixed.n_expert - _ns
-    _cap = (math.ceil(_cf * c.run.train_bs * c.fixed.top_k / _R) if _cf > 0
-            else 0)
-    print(f"Trần tải: "
-          + (f"{_cf:g}× mức đều -> {_cap} mẫu/expert mỗi micro-batch "
-             f"(B={c.run.train_bs}, R={_R}), chỉ khi train"
-             if _cf > 0 else "TẮT")
-          + (f" | {_ns} expert hứng (index {_R}..{c.fixed.n_expert - 1}), "
-             f"phần vượt trần chảy vào đây"
-             if _ns else " | KHÔNG có expert hứng"))
+    print(f"Cân bằng: aux loss w={c.run.w_aux:g} (Switch: E·Σf·P, sàn 1.0) — "
+          f"KHÔNG còn bias, trần tải hay expert hứng")
+    _sig = decay_desc(getattr(c.fixed, "route_noise_start", None),
+                      c.fixed.route_noise, c.fixed.decay_warmup_samples)
+    print(f"Gumbel  : {_sig}")
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
           f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}× | clip chuẩn "

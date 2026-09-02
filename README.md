@@ -1,27 +1,35 @@
 # MIMIC-CXR — Med MoE-LoRA
 
 Sinh báo cáo X-quang ngực (Findings / Impression) từ ảnh. Gemma3-4b-it đóng
-băng ở NF4; phần học được gồm **một nhánh router tự thiết kế** và **12 expert
-QDoRA r8** gắn vào decoder, chọn bằng gate top-4.
+băng ở NF4; phần học được gồm **một nhánh router đọc thẳng ảnh** và **24 expert
+QDoRA r8** gắn vào decoder, chọn bằng gate top-6.
 
-**Adapter đã chốt: QDoRA r8. Recombinator đã chốt: `g-brmf`. MoE đã chốt:
-12 expert / top-4.** Sweep vì thế chỉ còn ĐÚNG MỘT biến: *số block*
-`n` — xem §3.
+**Mọi thứ đã chốt, KHÔNG CÒN SWEEP.** Adapter: QDoRA r8. MoE: 24 expert /
+top-6, top-k thuần. Router: ConvNeXt-Tiny → 256 chiều → downsample/flatten →
+MLP → 2 head. Không còn biến kiến trúc nào để quét, nên khối `sweep:` trong
+config đổi tên thành `arch:` và chỉ giữ lại `model`.
 
-Bốn điều quyết định cách đọc phần còn lại của tài liệu này:
+Năm điều quyết định cách đọc phần còn lại của tài liệu này:
 
-1. **MỘT phase multi-task.** Không còn "phase 1 dạy router bằng nhãn bệnh
-   rồi phase 2 mới thả decoder ra". Ngay từ step đầu, router + 12 expert +
+1. **Router đọc ẢNH, không đọc hidden state của Gemma.** ConvNeXt-Tiny
+   (ImageNet) đóng băng stem + 3 stage đầu, stage4 học tiếp → 1×1 conv về
+   **256** chiều → coi ma trận [256 kênh × 256 token] như một ảnh 1 kênh
+   256×256 → 4 bậc conv stride-2 → flatten 4096 → 2048 → 1024 → hai Linear
+   cuối. Không còn DenseNet-CXR, không còn stack MQA, không còn Separation
+   (§3).
+2. **MỘT phase multi-task.** Không còn "phase 1 dạy router bằng nhãn bệnh rồi
+   phase 2 mới thả decoder ra". Ngay từ step đầu, router + 24 expert +
    decoder cùng chạy trong một forward và cùng nhận gradient của
-   `Total_Loss = 1·CE + 0.2·ASL` (§1.7).
-2. **Nhánh supervised là ASL, không phải Focal.** 14 finding trên MỘT trục
-   nhị phân: `uncertain` thành soft label `0.7`, `blank` bị **MASK** hẳn khỏi
-   loss. Ngưỡng âm tính của ASL lấy theo BI-RADS 3 (`m = 0.02`) chứ không
-   theo default `0.05` của bài báo gốc (§1.4, §1.6).
-3. **Không có aux loss.** Cân bằng tải giữa các expert do một **bias** của
-   router lo, cập nhật bằng quy tắc sau mỗi optimizer step và nằm hoàn toàn
-   ngoài đồ thị autograd — kiểu DeepSeek-V3 (§3.6).
-4. **Lịch train không có đích.** Không có trần số mẫu, không có dừng sớm.
+   `Total_Loss = 1·CE + 0.5·ASL + 0.05·Aux` (§1.7).
+3. **Nhánh supervised là ASL, không phải Focal.** 14 finding trên MỘT trục
+   nhị phân: `uncertain` thành soft label, `blank` bị **MASK** hẳn khỏi loss.
+   Ngưỡng âm tính của ASL lấy theo BI-RADS 3 (`m = 0.02`) chứ không theo
+   default `0.05` của bài báo gốc (§1.4, §1.6).
+4. **Cân bằng tải là MỘT số hạng aux trong loss.** `Aux = E·Σ f_e·P_e`
+   (Switch-Transformer). Nó **thay hẳn** cơ chế aux-free của bản trước: không
+   còn bias `b_e`, không còn trần tải mỗi micro-batch, không còn expert hứng
+   (§3.5).
+5. **Lịch train không có đích.** Không có trần số mẫu, không có dừng sớm.
    Vòng train đi tuần tự hết tập train rồi nâng `epoch` và đi tiếp, mãi mãi,
    cho tới khi người dùng dừng tay. Mọi lần chạy sau đều **tự resume** từ
    checkpoint đi xa nhất (§7).
@@ -30,8 +38,9 @@ Chạy trên GPU Ampere trở lên — cục bộ hoặc máy thuê theo giờ (
 hết từ Hugging Face Hub.
 
 ```bash
-python -m src.router          # in bảng tham số, đối chiếu tài liệu thiết kế
-python scripts/selftest.py    # kiểm router + MoE + bias cân bằng tải (không cần GPU)
+python -m src.router          # in bảng tham số + selftest kiến trúc (không cần GPU)
+python scripts/selftest.py    # kiểm router + MoE + ASL + aux + lịch LR + SWA
+python -m src.config          # in cấu hình đã giải quyết (cần GPU)
 ```
 
 ---
@@ -61,11 +70,16 @@ export WANDB_API_KEY=wandb_v1_KBEHp1tc8lYfpsTSU7YDlVTH0r5_6BezCS30xvPRgEBGrTTMHa
 
 # configs/default.yaml đã trỏ sẵn sang RGExp123/MIMIC_CXR_cleaned
 
-bash scripts/run_local.sh --dry-run        # kiểm cấu hình: 2 step rồi dừng
-bash scripts/run_local.sh --mode train --no-dry-run   # TRAIN — chạy tới khi Ctrl-C
-bash scripts/run_local.sh --mode test  --no-dry-run   # chấm checkpoint hiện có
-bash scripts/collect.sh                    # gom kết quả bất cứ lúc nào
+python -m src.config                       # in cấu hình đã giải quyết, không nạp model
+python -m src.train --dry-run              # kiểm cấu hình: STAGE 0 (2 step) rồi dừng
+python -m src.train --mode train --no-dry-run   # TRAIN — chạy tới khi Ctrl-C
+python -m src.train --mode test  --no-dry-run   # chấm checkpoint hiện có
+python -m src.report                       # gom kết quả bất cứ lúc nào
 ```
+
+> `--variant` và `--n-block` đã **bỏ**: không còn kiến trúc nào để quét. Gọi
+> kèm hai cờ đó thì argparse báo lỗi ngay thay vì im lặng chạy một kiến trúc
+> khác với cái dòng lệnh nói.
 
 > ⚠ **Hai token thật đang nằm trong file này.** Nếu repo được push công khai
 > thì chúng đã lộ — nên thu hồi và cấp lại ở
@@ -74,20 +88,16 @@ bash scripts/collect.sh                    # gom kết quả bất cứ lúc nà
 > `xxxxxxxx` ở đây và chỉ export ở terminal. Cùng lý do, `remote.ssh_host` /
 > `ssh_port` (§9.2) để `null` chứ không điền IP máy đang thuê.
 
-`sweep.sh` chạy thật ngay (config để `dry_run: false`), tuần tự theo thứ tự ưu
-tiên §3.3, và **bỏ qua ô đã có `metrics.json`** — dừng giữa chừng rồi chạy lại
-là nó đi tiếp từ ô còn thiếu.
+`setup.sh` dò CUDA qua `nvidia-smi` và cài đúng bản torch + **torchvision**
+(cu118/cu121/cu124/cu128). Cả hai **không** nằm trong `requirements.txt` — cài
+từ đó sẽ kéo bản CPU-only. torchvision là bắt buộc từ đợt này: backbone của
+router là `torchvision.models.convnext_tiny`.
 
-> ⚠ Từ khi lịch train không có đích (§1.7), `sweep.sh` với `SWEEP_MODE=train`
-> **không tự sang ô tiếp theo**: ô đầu tiên chạy tới khi bị dừng tay. Quét cả
-> bảng thì train từng ô một, rồi chạy `SWEEP_MODE=test bash scripts/sweep.sh`
-> để chấm hết một lượt.
-
-`setup.sh` dò CUDA qua `nvidia-smi` và cài đúng bản torch (cu118/cu121/cu124/cu128).
-`torch` **không** nằm trong `requirements.txt` — cài từ đó sẽ kéo bản CPU-only.
+Lần chạy đầu tiên cần **mạng** để tải trọng số ConvNeXt-Tiny (~110MB) về
+`TORCH_HOME`; các lần sau đọc cache.
 
 Luôn chạy STAGE 0 trước. Nó nạp model, chạy đúng 2 step của đồ thị thật
-(router + 12 expert + decoder), in VRAM đỉnh, `mẫu/s`, thời gian một epoch và
+(router + 24 expert + decoder), in VRAM đỉnh, `mẫu/s`, thời gian một epoch và
 một cycle LR, rồi dừng. Mất khoảng 5 phút và cho biết cấu hình có vừa GPU
 không — rẻ hơn nhiều so với phát hiện OOM sau 3 tiếng train.
 
@@ -103,11 +113,13 @@ export HF_TOKEN=hf_xxxxxxxx                # BẮT BUỘC
 export WANDB_API_KEY=xxxxxxxx              # tùy chọn
 
 git clone <repo-url> /workspace/RGExp_proj && cd /workspace/RGExp_proj
-bash scripts/docker_bootstrap.sh           # kiểm GPU → setup → STAGE 0 → sweep trong tmux
+bash scripts/setup.sh                       # dựng môi trường, cài deps
+tmux new -s train                          # BẮT BUỘC: ssh đứt là SIGHUP
+python -m src.train --mode train --no-dry-run
 ```
 
-`docker_bootstrap.sh` làm hết một lượt và **dừng ngay ở bước 1 nếu GPU không
-có bf16** — trước khi tải 30GB dữ liệu về một cái máy không dùng được.
+Kiểm GPU **trước** khi tải 30GB dữ liệu về một cái máy không dùng được:
+`python -m src.config` dừng ngay ở `detect_hardware()` nếu GPU không có bf16.
 
 Không thấy `/.dockerenv` (một số nhà cung cấp chạy trong VM) thì ép bằng
 `RGEXP_REMOTE=1`. Muốn tự chạy từng bước thì mọi script vẫn dùng như option 1;
@@ -129,7 +141,7 @@ Split cố định theo **key** (`img_rel`), không theo vị trí hàng: CSV ng
 thứ tự hay thêm bớt dòng thì split vẫn chiếu đúng mẫu cũ.
 
 Nguồn split theo thứ tự ưu tiên: `split_ref/` trên Hub → thư mục cục bộ → sinh
-mới. Repo đã có sẵn `split_ref/` nên mọi ô sweep dùng chung đúng một split —
+mới. Repo đã có sẵn `split_ref/` nên mọi lần chạy dùng chung đúng một split —
 điều kiện để so sánh giữa các biến thể có nghĩa. Nếu `split_meta.json` ghi seed
 khác `fixed.seed`, script cảnh báo.
 
@@ -166,9 +178,17 @@ dài, không hội thoại, không khuyến nghị, hedge có điều kiện.
 | | |
 |---|---|
 | Ảnh nguồn | 512×512 (đã resize đồng bộ trong dataset) |
-| Đưa vào Gemma 3 | 896×896, BICUBIC + anti-aliasing (§4.1.1) → 256 image token |
+| Đưa vào Gemma 3 | 896×896, BICUBIC + anti-aliasing (§4) → 256 image token |
 | Đưa vào Qwen2.5-VL | **512×512 nguyên bản**, processor tự làm tròn → 504² → 324 image token |
+| Đưa vào **nhánh router** | **512×512** — thu `pixel_values` 896² về lại 512 (bilinear + antialias) rồi chuẩn hoá ImageNet |
 | Padding | trái khi train, phải khi infer |
+
+*Nhánh router* không dùng cỡ của model nền. Nó đọc thẳng `pixel_values` mà
+processor đã tạo (nên không có đường ống ảnh thứ hai để bảo trì, cũng không
+tốn thêm một lần decode JPEG) rồi thu về 512² — đúng cỡ ảnh **nguồn**, tức
+quay lại gần đúng số pixel thật thay vì làm việc trên bản đã nội suy lên 896.
+512 không phải lựa chọn tự do: ConvNeXt có tổng stride 32 nên 512 cho lưới
+16×16 = 256 token, đúng bằng 256 chiều làm việc — xem §3.2.
 
 **Mỗi model một processor riêng** — khai trong `configs/default.yaml` ở
 `models.<tên>.image_size` (số = resize về size², `null` = giữ nguyên gốc) và
@@ -228,12 +248,12 @@ và sai hoàn toàn.
 BLEU (1–4 + corpus), ROUGE (1/2/L), BERTScore (optional).
 
 **Policy đang TẮT** (`run.use_policy: false`), nên `metrics.json` chỉ có khối
-`raw` — chấm trên `raw_output`, đúng cột *"raw_outp"* của bảng sweep. 7-check
+`raw` — chấm trên `raw_output`, đúng cột *"raw_outp"* của bảng metrics. 7-check
 (§2) vẫn chạy nhưng chỉ để **ghi lại** tỉ lệ vi phạm, không sinh lại. Bật
 `use_policy: true` thì `post_policy` và `delta_post_minus_raw` xuất hiện trở
 lại.
 
-Lý do tắt: sweep so **kiến trúc**, không so hậu xử lý. Vòng retry thêm một
+Lý do tắt: bảng metrics so **model**, không so hậu xử lý. Vòng retry thêm một
 nguồn nhiễu (mỗi ô retry một số lần khác nhau) và làm mỗi ô chậm thêm 20–40%.
 
 Tất cả là metric **tổng thể trên corpus** — không sinh cột metric per-row.
@@ -247,20 +267,35 @@ chấm. Chạy nó bất cứ lúc nào để biết checkpoint hiện tại đa
 ### 1.6. Loss
 
 ```
-Total_Loss = 1·CE + 0.2·ASL
+Total_Loss = 1·CE + 0.5·ASL + 0.05·Aux
 ```
 
-| Thành phần | Công thức |
-|---|---|
-| `CE` | CrossEntropy trên token báo cáo + `label_smoothing = 0.1` (tổng khối lượng các lớp SAI là 0.1, nhãn không còn one-hot) |
-| `ASL` | Asymmetric Loss trên 14 finding nhị phân (§1.4), γ⁺ = 0, γ⁻ = 4, ngưỡng âm tính m = 0.02 |
+| Thành phần | Công thức | Hệ số |
+|---|---|---|
+| `CE` | CrossEntropy trên token báo cáo + `label_smoothing = 0.1` (tổng khối lượng các lớp SAI là 0.1, nhãn không còn one-hot) | 1 |
+| `ASL` | Asymmetric Loss trên 14 finding nhị phân (§1.4), γ⁺ = 0, γ⁻ = 4, ngưỡng âm tính m = 0.02 | `run.w_sup` = 0.5 |
+| `Aux` | `E·Σ_e f_e·P_e` — cân bằng tải giữa E expert, kiểu Switch-Transformer (§3.5) | `run.w_aux` = 0.05 |
 
-**Không còn số hạng `Aux`.** Cân bằng tải giữa các expert đã chuyển sang cơ
-chế bias không-gradient của router (§3.6). Cái mất đi không chỉ là một số hạng
-trong công thức: aux loss là một **lực kéo ngược** gradient chính — nó bắt
-router chia đều ngay cả khi việc chia đều làm CE tệ đi, nên mọi giá trị `w_aux`
-đều là một cuộc mặc cả giữa cân bằng và chất lượng. Bias không nằm trong loss
-nên hai thứ đó không còn phải tranh nhau một hệ số.
+**Số hạng `Aux` quay lại và nó thay hẳn cơ chế bias.** Bản trước cân bằng tải
+"aux-free" kiểu DeepSeek-V3: một bias `b_e` cộng vào điểm chọn top-k, cập nhật
+bằng quy tắc `sign` ngoài đồ thị autograd, kèm **trần tải** mỗi micro-batch và
+**2 expert hứng** để đổ phần tràn. Ba cơ chế cùng nắn một đại lượng, và khi tải
+vẫn lệch thì không có cách nào đọc ra cái nào đang thắng; bias còn làm `chosen`
+lúc probe lệch khỏi `prob` mà không giải thích được. Giờ chỉ còn một cơ chế,
+một việc — chi tiết ở §3.5.
+
+**Hai điều phải biết để đọc đúng con số `Aux`:**
+
+1. **Nó có SÀN 1.0.** `Σf = ΣP = 1`, nên theo Cauchy-Schwarz `Aux ≥ 1`, bằng 1
+   đúng khi cả hai vector đều đều. Với `w_aux = 0.05` thì số hạng này cộng một
+   **nền ≈ 0.05** vào `Total_Loss` kể cả lúc cân bằng hoàn hảo. Đừng đọc nó
+   như "loss chưa hội tụ": đọc `balance` trong log (= chính `Aux`) và so với
+   1.0.
+2. **Khi `P` còn gần đều thì `Aux = 1.0` bất kể tải lệch tới đâu.** Nếu
+   `P_e = 1/E` cho mọi `e` thì `Σ f_e·P_e = 1/E · Σf_e = 1/E`, và `Aux = 1.0`
+   dù cả batch dồn vào một expert. Số hạng này chỉ cắn khi router **bắt đầu tự
+   tin sai chỗ**. Đó là lý do `σ` (Gumbel, §3.4) không được về 0 — aux loss
+   không thay được cơ chế khám phá, nó chỉ nắn qua `P_e`.
 
 #### ASL thay cho Focal
 
@@ -340,10 +375,21 @@ label.
   ASL với γ⁻ = 4 cho gradient nhọn ở những ô dương bị đoán sai; một bước dài
   bất thường lúc đó đủ đẩy trọng số vào NaN và mất cả phiên. `gnorm` in ra
   **mỗi step**: đụng trần 1.0 liên tục ở đầu train là bình thường.
-- **`w_sup = 0.2`.** ASL ở đây không phải một mục tiêu song song ngang hàng với
-  CE mà là một cái **neo ngữ nghĩa**: nó giữ cho bản tóm tắt mà Separation
-  dựng ra bám vào ngữ nghĩa bệnh học thay vì trôi thành một vector chỉ phục vụ
-  việc định tuyến. Neo thì không cần nặng.
+- **`w_sup = 0.5`** (nâng từ 0.2). ASL vẫn là một cái **neo ngữ nghĩa**: nó
+  giữ cho biểu diễn của router bám vào ngữ nghĩa bệnh học thay vì trôi thành
+  một vector chỉ phục vụ việc định tuyến. Nhưng từ đợt này, sup_head và
+  route_head **dùng chung toàn bộ trunk** (Separation đã bỏ — §3.2): ASL nắn
+  đúng cái vector 1024 chiều mà route_head đọc, không còn nắn một bản tóm tắt
+  song song. Neo tác dụng trực tiếp hơn thì đáng nặng hơn.
+  Mặt khác của cùng một chuyện: hai nhiệm vụ giờ không còn chỗ nào để tách
+  biểu diễn. `sup_recall` lên tốt mà `logit_std_ratio` vẫn thấp là dấu hiệu
+  trunk đã bị ASL chiếm — câu trả lời là **hạ `w_sup`**, không phải dựng lại
+  Separation.
+- **`w_aux = 0.05`.** Dải chuẩn của Switch/GShard là 0.01–0.05. Ở đây `f_e`
+  đếm theo **mẫu** (một ảnh có một gate cho cả chuỗi), nên một micro-batch
+  `train_bs = 8`, `k = 6` chỉ có 48 cặp cho 24 expert — `f_e` rất thô. Vì thế
+  số hạng này phải nắn **xu hướng** qua nhiều step, không phải sửa từng batch,
+  và hệ số phải nhỏ.
 - **Con số đáng nhìn trong log là `sup_recall`, không phải `sup_acc`.** Sau khi
   MASK `blank`, ô dương vẫn là thiểu số, nên một model đoán "âm" cho tất cả
   vẫn có accuracy cao mà bỏ sót sạch bệnh. `val` cũng lấy recall làm headline.
@@ -357,12 +403,12 @@ trên `max(len(target)) + 1` vị trí cuối.
 ### 1.7. Lịch train: một phase multi-task, không có đích
 
 Có thêm hai chế độ không train: `mode: test` (chấm điểm checkpoint hiện tại)
-và `mode: probe` (khảo sát chuyên môn của từng expert — §3.7).
+và `mode: probe` (khảo sát chuyên môn của từng expert — §3.6).
 
 | | |
 |---|---|
-| Cái gì chạy | router + 12 expert QDoRA + decoder, cùng một forward |
-| Loss | `CE + 0.2·ASL` (§1.6) |
+| Cái gì chạy | router + 24 expert QDoRA + decoder, cùng một forward |
+| Loss | `CE + 0.5·ASL + 0.05·Aux` (§1.6) |
 | Dữ liệu | TRỌN tập train, tuần tự theo thứ tự rare-first |
 | Hết tập train | `epoch += 1`, đi lại từ đầu đúng thứ tự đó |
 | Dừng | Ctrl-C, hoặc phiên máy hết giờ. Không có trần mẫu, không có dừng sớm |
@@ -380,8 +426,8 @@ danh sách param khi đổi cấu hình freeze, `val_loss` của hai phase là h
 
 Cho hai tín hiệu đến **cùng lúc** thì không có gì để giữ lại, và cả ba thứ trên
 biến mất: không còn freeze, không còn ranh giới phase trong checkpoint, không
-còn hai thang đo. `ASL` với hệ số 0.2 trở thành một neo chạy song song suốt
-đời ô sweep thay vì một giai đoạn.
+còn hai thang đo. `ASL` với hệ số 0.5 trở thành một neo chạy song song suốt
+đời lần chạy thay vì một giai đoạn.
 
 Cái mất: mỗi step giờ đều là step "nặng" (chạy trọn decoder). Bản cũ có phase 1
 rẻ hơn khoảng một bậc vì nó cắt forward bằng `StopAfterRouter` ngay sau
@@ -389,17 +435,17 @@ embedding. Đổi lại, STAGE 0 giờ chỉ còn một lần thử và lần th
 đồ thị thật — không còn cảnh "phase 1 qua, phase 2 OOM sau ba tiếng".
 
 **Vì sao bỏ trần số mẫu.** Con số "6400 mẫu mỗi phase" sinh ra từ nhu cầu có
-một điểm KẾT THÚC để so sánh các ô sweep với nhau. Trên thực tế không phiên
+một điểm KẾT THÚC để so sánh các cấu hình với nhau. Trên thực tế không phiên
 train nào chạy tới đích đó trong một lần: Kaggle cắt sau ~12h, máy thuê tính
 tiền theo giờ. Cái thật sự xảy ra luôn là "chạy được bao nhiêu thì chạy, lưu
 lại, phiên sau đi tiếp". Lịch train giờ mô tả đúng điều đó thay vì giả vờ có
 một đích rồi luôn dừng trước khi tới.
 
-Hệ quả cần chấp nhận: **so sánh giữa các ô sweep là trách nhiệm của người
-chạy**, không phải của config. Muốn so `n_block=2` với `n_block=4` cho công
-bằng thì phải cho hai ô đi qua xấp xỉ cùng một số mẫu rồi mới chấm — con số đó
-đọc thẳng ở `train_state.json` (`samples`) và ở `meta.train_step` trong
-`metrics.json`.
+Hệ quả cần chấp nhận: **so sánh giữa hai lần chạy là trách nhiệm của người
+chạy**, không phải của config. Muốn so hai cấu hình (khác `n_expert`, khác
+`w_aux`) cho công bằng thì phải cho chúng đi qua xấp xỉ cùng một số mẫu rồi mới
+chấm — con số đó đọc thẳng ở `train_state.json` (`samples`) và ở
+`meta.train_step` trong `metrics.json`.
 
 **Con trỏ tiến độ.** Ba số, ghi trong `train_state.json`:
 
@@ -432,11 +478,32 @@ lr
  │ ╱     ╲      │ ╲        │ ╲        │ ╲
  │╱       ╲_    │  ╲_      │  ╲_      │  ╲_
  └──────────────┴──────────┴──────────┴──────────▶ mẫu tích luỹ
-   warmup  cycle 0      cycle 1    cycle 2    cycle 3
-   (320)   ↑1600        ↑3200      ↑4800      ↑6400
-           snapshot     snapshot   snapshot   snapshot
-                        └──────── trung bình đều ────────┘
+   w cycle 0     w cycle 1   w cycle 2   w cycle 3
+     ↑3200         ↑6400       ↑9600       ↑12800
+     snapshot      snapshot    snapshot    snapshot
+                   └──────── trung bình đều ────────┘
+
+   w = warmup 256 mẫu, chạy ở ĐẦU MỌI cycle (không chỉ cycle đầu)
 ```
+
+**Warmup ở đầu MỌI cycle** — đổi so với bản trước, và là thay đổi cố ý. SGDR
+nguyên bản bật thẳng lên đỉnh ở mỗi restart, với lý lẽ *"trọng số đã ở vùng
+hợp lý, moment AdamW vẫn còn nguyên, cú restart không gây spike như lúc khởi
+động"*. Lý lẽ đó không còn đúng ở đây vì hai chuyện:
+
+* Cuối mỗi cycle LR **chạm đáy** (`min_lr_ratio = 0`), nên moment bậc hai của
+  AdamW đã co lại theo một chuỗi bước rất nhỏ. Nhảy thẳng từ 0 lên `3e-4` ở
+  đúng step sau đó là một bước đi dài trên một ước lượng phương sai đã lỗi
+  thời — đúng cơ chế sinh spike gradient, chỉ khác là nó xảy ra ở giữa buổi
+  train chứ không ở đầu.
+* Lần chạy này bàn giao giữa các máy qua Hub (`run.hub_sync`) và resume rất
+  thường xuyên. Một lần resume rơi ngay sau biên cycle mà moment lại vừa reset
+  (thiếu `optimizer.pt`) là gặp cả hai chuyện cùng lúc.
+
+Cái giá, nói thẳng: mỗi cycle mất `warmup_samples` mẫu ở vùng LR thấp, tức
+phần cosine ngắn đi. Với cycle 3200 và warmup 256 thì đó là **8% mỗi cycle**.
+Đổi lại là không có step nào bắt đầu bằng một cú nhảy LR thẳng đứng.
+`warmup_samples: 0` quay về SGDR gốc.
 
 Không còn "cycle cuối ngắn hơn để anneal trọn phần dư": không có phần dư, vì
 không có tổng. Mọi cycle dài đúng bằng nhau và `cycle_samples` **bắt buộc phải
@@ -463,10 +530,14 @@ Nên averager chỉ được cho ăn ở biên cycle, và biên cycle được b
 cycle vừa tăng" chứ không bằng `samples % cycle == 0` (effective batch không
 nhất thiết chia hết cycle_samples, có máy sẽ nhảy qua đúng mốc).
 
-Không cần pass cập nhật BatchNorm như SWA kinh điển: model chỉ có
-LayerNorm/RMSNorm, không lớp nào giữ thống kê chạy theo batch.
+Không cần pass cập nhật BatchNorm như SWA kinh điển: cả router
+(ConvNeXt + RMSNorm) lẫn adapter chỉ có LayerNorm/RMSNorm — không lớp nào giữ
+thống kê chạy theo batch. Đây là **một trong những lý do** đổi backbone từ
+DenseNet (BatchNorm) sang ConvNeXt: bản trước phải ghim mọi lớp BN ở `eval`
+vĩnh viễn và kèm theo là một đoạn dài giải thích vì sao phép trung bình vẫn
+hợp lệ; giờ tính chất đó là tự nhiên, không phải được canh giữ.
 
-**Một bộ trung bình duy nhất, chạy suốt đời ô sweep.** Bản cũ có hai bộ, reset
+**Một bộ trung bình duy nhất, chạy suốt đời lần chạy.** Bản cũ có hai bộ, reset
 khi sang phase — vì hai phase là hai quỹ đạo khác nhau. Giờ chỉ còn một quỹ
 đạo, nên cũng chỉ còn một bộ. Nó được ghi vào `swa.pt` mỗi lần lưu checkpoint
 (kể cả lần lưu lúc Ctrl-C) và nhận bàn giao qua Hub.
@@ -488,8 +559,8 @@ trên trọng số thật). Nó được nạp khi CHẤM:
 
 | Khoá | Mặc định | Ý nghĩa |
 |---|---|---|
-| `cycle_samples` | 1600 | độ dài một cycle, tính bằng mẫu. **Bắt buộc > 0** |
-| `warmup_samples` | 320 | **chỉ** cycle đầu; các restart sau bật thẳng lên đỉnh (SGDR gốc) |
+| `cycle_samples` | 3200 | độ dài một cycle, tính bằng mẫu. **Bắt buộc > 0** |
+| `warmup_samples` | 256 | warmup tuyến tính ở đầu **MỌI** cycle. `0` = SGDR gốc (bật thẳng lên đỉnh). Vượt 25% cycle thì config cảnh báo |
 | `min_lr_ratio` | 0.0 | đáy cosine = ratio × lr |
 | `cycle_lr_decay` | 1.0 | đỉnh của cycle c = lr × decay^c. Với lịch vô hạn, < 1 nghĩa là LR tắt dần về 0 và train tự chết — config cảnh báo |
 | `swa` | true | bật/tắt việc gom trung bình |
@@ -551,32 +622,51 @@ Chuẩn hoá header chịu được lỗi decoder: `Findings::`, `Impimpression:
 
 ---
 
-## 3. Kiến trúc và bảng sweep
+## 3. Kiến trúc
 
 ### 3.1. Đường đi của một batch
 
 ```
-ảnh 896² + prompt
-      │
-      ▼
- embed_tokens ⊕ vision_tower ⊕ multi_modal_projector      (Gemma, đóng băng)
-      │  [N, 2560]        N = prompt + ảnh + target + padding ≤ 1024
-      ├──────────────────────────────► Gemma decoder ──► CE loss
-      │                                     ▲
-      ▼                                     │ gate [B, 12]
-   Stem  [N, 2560] → [N, 512]               │
-      ▼                                     │
-   Recombinator × n   (g-brmf, n ← ô sweep) │
-      ▼                                     │
-   Separation  attention pooling → [2, 512] │
-      ├── vector 0 → Supervised head → 14 (sigmoid) → 0.2·ASL
-      └── vector 1 → Route head → softmax → top-4 ─────────┘
-                                    ▲
-                                    └── + bias cân bằng tải (chỉ để CHỌN, §3.6)
+                        ảnh 512² nguồn
+                              │
+             ┌────────────────┴──────────────────┐
+             │ processor Gemma (phóng lên 896²)  │
+             ▼                                   ▼
+  pixel_values [B,3,896,896]        input_ids (prompt + target)
+             │                                   │
+             │                                   ▼
+             │            embed_tokens ⊕ vision_tower ⊕ projector
+             │                     (Gemma, đóng băng)
+             │                                   │  [N, 2560]
+             │                                   ├──► Gemma decoder ──► CE
+             ▼                                   │         ▲
+   ── NHÁNH ROUTER ─────────────────────         │         │ gate [B,24]
+   [0,1] → chuẩn ImageNet → resize 512           │         │
+             ▼                                   │         │
+   ConvNeXt-Tiny  ──► [B, 768, 16, 16]           │         │
+     features[0:7] ĐÓNG BĂNG                     │         │
+     features[7] (stage4) học tiếp               │         │
+             ▼                                   │         │
+   1×1 conv 768→256  + RMSNorm                   │         │
+             ▼                                   │         │
+   [B, 256 kênh, 256 token] ≡ [B, 1, 256, 256]   │         │
+             ▼                                   │         │
+   4 bậc conv 3×3 stride 2, QuickGELU            │         │
+     1×256×256 → 2×128×128 → 4×64×64             │         │
+              → 8×32×32 → 16×16×16               │         │
+             ▼                                   │         │
+   flatten 4096 → Linear 2048 → QuickGELU        │         │
+                → Linear 1024 → QuickGELU        │         │
+             ▼                                   │         │
+   [B, 1024]  ┬── Linear(1024,14) → 0.5·ASL      │         │
+              └── Linear(1024,24) → softmax ─────┴─ top-6 ─┘
+                              │                        ▲
+                              └── + σ·Gumbel (chỉ train)┘
+                                   0.05·Aux ◄── f_e, P_e
 ```
 
-Cả sơ đồ này chạy trong MỘT forward, mỗi step, từ step đầu tiên. `CE` và
-`ASL` cộng lại thành một loss duy nhất rồi backward một lần.
+Cả sơ đồ này chạy trong MỘT forward, mỗi step, từ step đầu tiên. `CE`, `ASL`
+và `Aux` cộng lại thành một loss duy nhất rồi backward một lần.
 
 Chỗ nối là một `forward_pre_hook` đặt trên khối decoder text
 (`src/model.py::RouterBridge`). Lý do không tự dựng `inputs_embeds`: cách
@@ -584,106 +674,194 @@ transformers ghép ảnh vào chuỗi đổi theo từng bản, còn hook thì l
 thứ decoder sắp ăn. Nhờ vậy `model(**batch)` và `model.generate(**inputs)` gọi
 y hệt như khi chưa có router.
 
-**Router chỉ nhìn prompt + ảnh.** `router_mask` che token target và padding.
-Nếu cho nó thấy `y_gt` thì lúc train nó đọc được đáp án còn lúc infer thì
-không — gate sẽ học một tín hiệu không tồn tại ở thời điểm dùng thật.
+**Router nhận `pixel_values` từ chỗ GỌI, không từ hook.** Ở đầu decoder thì
+`pixel_values` đã bị nuốt vào `inputs_embeds` từ lâu, nên nó được truyền vào
+`bridge.begin("route", pixels=...)` trước forward. `router_mask` vẫn được
+collate dựng (che target + padding) và vẫn đi vào chữ ký `RouterNet.forward`
+cho tương thích, nhưng nhánh này **không dùng nó**: nó đọc ảnh, không đọc
+chuỗi hỗn hợp text+ảnh, nên không có padding hay đáp án nào phải che. Vấn đề
+"router đọc được `y_gt`" biến mất theo kiến trúc chứ không còn phải chặn bằng
+mask.
 
 **Lúc generate, gate tính MỘT LẦN ở prefill** rồi giữ nguyên cho mọi bước
-decode. Bước decode chỉ có 1 token mới; tính lại là mỗi token rơi vào một expert
-khác.
+decode. Bước decode chỉ có 1 token mới; tính lại là mỗi token rơi vào một
+expert khác.
 
-### 3.2. Block Recombinator (`g-brmf`)
+### 3.2. Nhánh router: ConvNeXt → 256 → downsample → 2 head
 
-Chỉ còn **một** biến thể. Mọi Linear đều **không bias**, pre-norm + residual,
-RMSNorm (không LayerNorm — không mean-centering, rẻ hơn, khớp chuẩn hoá Gemma
-đang dùng).
+#### Vì sao 256 là con số xuyên suốt
 
-| Ký hiệu | Cấu tạo một block | Param/block |
-|---|---|---|
-| **g-brmf** | RMSNorm → **GQAttn** (8 head / 4 KV-group) → *+skip* → RMSNorm → 512→64 → GeLU → 64→512 → GeLU → *+skip* | 852 992 |
-
-Chi tiết một block:
+Ba cái 256 trong sơ đồ không phải trùng hợp, chúng **bị buộc vào nhau**:
 
 ```
-x ─┬─ RMSNorm → GQAttn (8 head, 4 KV-group) ─┐
-   └──────────────── skip ───────────────────⊕─┬─ RMSNorm → 512→64 → GeLU
-                                               │           → 64→512 → GeLU ─┐
-                                               └──────── skip ──────────────⊕─► out
+ảnh 512  ──/32 của ConvNeXt──►  lưới 16×16  =  256 token
+proj 768 → 256 chiều làm việc  =  256 kênh
 ```
 
-Phân bổ tham số trong block: attention 786 432 (q/o 512×512, k/v 512×256 —
-4 KV-head dùng chung cho 8 Q-head), FFN thắt cổ chai 65 536, hai RMSNorm 1 024.
-Attention trộn token; FFN chỉ nắn từng vị trí, cố ý để rẻ.
+Tensor ra khỏi thân nhánh vì thế là một ma trận **vuông** 256×256, và chỉ vì nó
+vuông thì khối downsample mới đi được đúng 4 bậc chia đôi để về 16×16×16 =
+4096. Đổi `router_img_size` mà không đổi `D_MODEL` (hoặc ngược lại) là làm hỏng
+chính đẳng thức đó — `config.py` và `RouterNet.__init__` **chặn cứng** bằng
+assert chứ không để nó nổ ở một chỗ khác trong forward.
 
-Các tầng còn lại cố định:
+Ảnh 512 cũng đúng bằng cỡ ảnh **nguồn** (`fixed.image_size_src = 512`):
+processor của Gemma phóng nó lên 896 cho SigLIP, ở đây ta thu về 512 — tức
+router đọc gần đúng số pixel gốc, không nội suy thêm thông tin không có.
 
-| Tầng | Param |
+#### Backbone: ConvNeXt-Tiny, đóng băng stem + 3 stage đầu
+
+`torchvision` xếp ConvNeXt thành `features` gồm 8 phần tử:
+
+| idx | Nội dung | Ra | Param |
+|---|---|---|---|
+| 0 | stem: Conv 4×4 stride 4 + LN | /4, 96 | 4 896 |
+| 1 | stage1: 3 × CNBlock(96) | /4 | 237 888 |
+| 2 | downsample 96→192 | /8 | 74 112 |
+| 3 | stage2: 3 × CNBlock(192) | /8 | 918 144 |
+| 4 | downsample 192→384 | /16 | 295 680 |
+| 5 | stage3: 9 × CNBlock(384) | /16 | 10 817 280 |
+| 6 | downsample 384→768 | /32 | 1 181 184 |
+| 7 | **stage4: 3 × CNBlock(768)** | /32 | **14 289 408** |
+
+`features[0:7]` **đóng băng** (13 529 184 param), `features[7]` **học tiếp**
+(14 289 408). Ranh giới đặt **sau** downsample thứ ba, giống hệt quy ước bản
+DenseNet cũ (transition dẫn vào block học tiếp thì đóng băng cùng phần trước
+nó): phép chiếu 384→768 thuộc về vùng đặc trưng tổng quát, còn 3 CNBlock ở 768
+kênh mới là chỗ đặc trưng trở nên đặc thù bệnh lý.
+
+**Vì sao chỉ mở stage cuối chứ không mở hai.** stage3 có 9 block và 10.8M tham
+số — mở nó ra là gần gấp đôi phần trainable của cả nhánh router, trong khi 25k
+mẫu không đủ để nắn lại vùng đặc trưng trung gian mà không quên mất pretrain.
+`fixed.router_frozen_upto` hạ được xuống, config sẽ cảnh báo.
+
+**Vì sao đổi từ DenseNet-CXR sang ConvNeXt-ImageNet.** Đây là một cuộc **đánh
+đổi có mất mát**, nói thẳng: DenseNet-121 của torchxrayvision pretrain trên
+chính MIMIC-CXR/CheXpert — nó vào đời đã phân biệt được tràn dịch với xẹp
+phổi, còn ConvNeXt-ImageNet thì không. Cái đổi lại:
+
+* **Không còn BatchNorm.** ConvNeXt chỉ dùng LayerNorm, chuẩn hoá **trong** một
+  mẫu. Ba tính chất mà bản trước phải canh giữ bằng code giờ là tự nhiên:
+  gate của một ảnh không phụ thuộc các ảnh cùng micro-batch; `net.train()` và
+  `net.eval()` cho cùng đầu ra khi `σ = 0`; SWA trung bình mọi buffer float mà
+  không gặp running stats nào. Bản trước phải ghi đè `CXRBackbone.train` để
+  ghim mọi BN ở `eval` vĩnh viễn, và selftest offline phải có một hàm
+  `_calibrate_bn` riêng chỉ để nói được điều gì đó đúng.
+* **stage4 học tiếp trên chính dữ liệu này** — 14.3M tham số được nắn bằng CE
+  và ASL trên MIMIC-CXR, tức phần "biết đọc X-quang" được học lại thay vì được
+  cho sẵn.
+* **Kiến trúc phổ thông, dependency phổ thông.** `torchxrayvision` bị bỏ khỏi
+  `requirements.txt`; backbone giờ lấy từ `torchvision` mà setup đã cài.
+
+**Stochastic depth TẮT** (`stochastic_depth_prob=0.0`). Mặc định torchvision
+là 0.1, và nó là một **nguồn ngẫu nhiên theo mẫu chỉ có lúc train**. Với mạng
+phân loại đó là regularization; với router nó nghĩa là cùng một ảnh cho hai
+gate khác nhau ở hai step, và train khác eval một cách không đo được. Tắt
+không đổi tham số nào (stochastic depth không có trọng số) nên trọng số
+pretrain vẫn nạp nguyên vẹn.
+
+**Chuẩn hoá ảnh.** Gemma đưa `pixel_values` về `[-1,1]` (mean = std = 0.5);
+router đảo lại `[0,1]` rồi áp chuẩn ImageNet theo từng kênh — đúng thứ ConvNeXt
+đã thấy lúc pretrain. Bỏ bước này thì LayerNorm đầu tiên nhận đầu vào lệch
+thang và đặc trưng pretrain thành vô dụng. Giữ nguyên **3 kênh**: ảnh MIMIC là
+xám đã nhân bản, và gộp về 1 kênh thì phải sửa stem và vứt 2/3 trọng số của
+lớp đầu tiên.
+
+#### Khối downsample + flatten (thay chỗ của Separation)
+
+```
+[B, 1, 256, 256] → 2×128×128 → 4×64×64 → 8×32×32 → 16×16×16
+                 → flatten 4096
+                 → Linear(4096, 2048) → QuickGELU
+                 → Linear(2048, 1024) → QuickGELU
+                 → ┬ Linear(1024, 14)   sup_head
+                   └ Linear(1024, 24)   route_head
+```
+
+Bốn conv 3×3 stride 2 (padding 1), mỗi bậc nhân đôi số kênh và chia bốn diện
+tích — tức chia **đôi** tổng số phần tử mỗi bậc. Không có norm giữa các bậc:
+đầu vào đã qua RMSNorm, và bốn lớp là quá nông để cần thêm gì.
+
+| Khối | Param |
 |---|---|
-| Stem `[N,2560] → [N,512]` | 1 575 936 |
-| Separation (Q-Former, 2 query, GQA 8 head / 4 group) | 787 968 |
-| Supervised head `512 → 256 → 14` | 134 656 |
-| Route head `512 → 256 → E` | 131 072 + 256·E |
-| `expert_bias` (buffer, E số) | 12 — không phải tham số học được |
-| 12 expert QDoRA r8 (238 linear/expert) | ≈ 15 910 912 mỗi expert |
+| 4 bậc conv downsample | 1 560 |
+| `Linear(4096, 2048)` | 8 390 656 |
+| `Linear(2048, 1024)` | 2 098 176 |
+| `sup_head 1024→14` | 14 350 |
+| `route_head 1024→E` | 1 025·E |
 
-`python -m src.router` in bảng này từ **số đếm thật của module** và so với con
-số trong tài liệu thiết kế — chạy sau mỗi lần sửa kiến trúc.
+Chi phí nằm gần hết ở `Linear(4096, 2048)` — 8.4M trong 10.5M của khối. Bốn
+bậc conv chỉ tốn 1 560 tham số; việc của chúng là đi từ 65 536 số xuống 4 096
+số mà không phải viết một `Linear(65536, 2048)` (134M tham số).
 
-### 3.3. Bảng sweep
+**Cái ma trận 256×256 được xếp thế nào, và tại sao chấp nhận được.**
+`h.flatten(2)` cho `[B, 256 kênh, 256 token]`: **hàng là kênh**, **cột là
+token** theo thứ tự raster của lưới 16×16. Conv 3×3 trên ma trận đó trộn 3 kênh
+liền nhau × 3 token liền nhau. Theo trục **cột** thì "liền nhau" có nghĩa hình
+học thật (hai patch cạnh nhau theo chiều ngang; cách nhau 16 cột là hai patch
+chồng nhau theo chiều dọc). Theo trục **hàng** thì thứ tự kênh vốn **không** có
+nghĩa gì — nhưng thứ tự ấy do chính `proj` (1×1 conv 768→256) sinh ra và `proj`
+là lớp **học được**, nên mạng tự sắp được các kênh cần trộn cạnh nhau.
 
-`E = 12`, `top-k = 4`, QDoRA r8 α16, biến thể `g-brmf`, `w_sup = 0.2`,
-ASL (γ⁺ 0 / γ⁻ 4 / m 0.02), Gumbel `σ` và `bias_gamma` đi theo cùng một lịch
-decay mũ `1.0 → 1e-3` trong 1000 step đầu (§3.5b) — tất cả
-cố định. Chỉ `n_block` thay
-đổi. Câu hỏi vì thế gọn lại thành "chồng thêm block Recombinator có đáng
-không, và bão hoà từ đâu".
+Đây là chỗ yếu nhất của thiết kế và nó được ghi ra để đọc, không phải để giấu.
 
-| ô | router | tổng param trainable |
+**Một trunk, hai Linear cuối.** `sup_head` và `route_head` dùng chung toàn bộ
+downsample + MLP, chỉ tách ở phép chiếu cuối. Đó là thay thế trực tiếp cho
+Separation (2 learnable query hút ra 2 vector khác nhau), và nó đổi bản chất
+của nhánh supervised: ASL giờ nắn **đúng** cái vector 1024 chiều mà `route_head`
+đọc, chứ không nắn một bản tóm tắt song song. Xem thêm ghi chú `w_sup` ở §1.6.
+
+**Khởi tạo Kaiming, không dùng mặc định của PyTorch.** Đây là điều kiện để
+khối này chạy được, không phải một tinh chỉnh. Đường đi có **sáu** phi tuyến
+nối tiếp (4 conv + 2 linear), và QuickGELU quanh 0 xấp xỉ `x/2` — mỗi bậc bóp
+phương sai đi một nửa nếu trọng số chỉ giữ thang. Với `kaiming_uniform(a=√5)`
+mặc định của `nn.Conv2d`/`nn.Linear`, đo được:
+
+| Mốc | rms (init mặc định) | rms (Kaiming gain ReLU) |
 |---|---|---|
-| g-brmf-n1 | 3.49M | 194.4M |
-| g-brmf-n2 | 4.34M | 195.3M |
-| g-brmf-n3 | 5.19M | 196.1M |
-| g-brmf-n4 | 6.04M | 197.0M |
-| g-brmf-n12 | 12.87M | 203.8M |
+| vào khối (sau RMSNorm) | 1.00 | 1.00 |
+| ra khỏi `down` | 0.031 | 0.63 |
+| ra khỏi `mlp` | 0.007 | 0.50 |
+| `std(route_logit)` giữa các expert | 0.016 | 0.26 |
 
-(Mỗi block thêm 852 992 tham số; phần còn lại — Stem, Separation, 2 head,
-12 expert QDoRA — không đổi giữa các ô. `n12` là cấu hình đang chạy mặc định.)
+Ở cột giữa, `route_logit` chỉ dao động ~0.016 — **nhỏ hơn nhiễu Gumbel σ=1.0
+gần trăm lần**: định tuyến ở vài nghìn step đầu là bốc ngẫu nhiên thuần, và
+`logit_std_ratio` không đo được gì vì tử số nằm dưới sai số fp32. Kaiming với
+gain của ReLU (√2) bù đúng phần QuickGELU bóp đi. `python -m src.router` kiểm
+`logit_std_ratio > 0.1` ngay trên backbone **ngẫu nhiên**, nên hồi quy ở chỗ
+này sẽ bị bắt offline.
 
-**So sánh giữa các ô là việc của người chạy.** Lịch train không có đích (§1.7)
-nên hai ô dừng ở hai chỗ khác nhau trong dữ liệu là chuyện bình thường — và so
-BLEU của chúng khi đó là so hai thứ khác nhau. Trước khi chấm, đối chiếu
-`samples` trong `ckpt/<tag>/last/train_state.json` của các ô; lệch nhiều thì
-cho ô đi sau chạy thêm.
+#### Bảng tham số
 
-Kết quả điền vào `outputs/_summary/` (§5): `metrics_table.md` xếp theo
-`n_block`, `param_curve.md` xếp theo **tổng tham số**.
+`E = 24`, `top-k = 6`, QDoRA r8 α16:
 
-Chạy một ô:
+| Khối | Param |
+|---|---|
+| backbone ConvNeXt-Tiny (tổng) | 27 818 592 |
+| ├ đóng băng — stem + stage1..3 | 13 529 184 |
+| └ học tiếp — stage4 | 14 289 408 |
+| `proj 768→256` + RMSNorm | 196 864 |
+| downsample + flatten + MLP | 10 490 392 |
+| `sup_head 1024→14` | 14 350 |
+| `route_head 1024→24` | 24 600 |
+| **router — tổng** | **38 544 798** |
+| **router — trainable** | **25 015 614** |
+| 24 expert QDoRA r8 (238 linear/expert) | 24 × 15 910 912 = 381 861 888 |
+| **tổng trainable** | **406 877 502** |
 
-```bash
-bash scripts/run_local.sh --n-block 1 --mode train --no-dry-run   # train tới khi Ctrl-C
-bash scripts/run_local.sh --n-block 1 --mode test  --no-dry-run   # chấm checkpoint hiện có
-```
+`python -m src.router` in bảng này từ **số đếm thật của module** và so với các
+hằng số trong tài liệu — chạy sau mỗi lần sửa kiến trúc.
 
-Chạy cả bảng, tuần tự:
+`n_expert` là biến duy nhất còn đổi tổng tham số:
 
-```bash
-SWEEP_CELLS="g-brmf:1 g-brmf:3" bash scripts/sweep.sh --no-dry-run
-SWEEP_MODE=test bash scripts/sweep.sh --no-dry-run   # chỉ chấm, không train
-```
+| E | router (trainable) | expert | tổng trainable |
+|---|---|---|---|
+| 8 | 25.00M | 127.3M | 152.3M |
+| 12 | 25.00M | 190.9M | 215.9M |
+| 16 | 25.01M | 254.6M | 279.6M |
+| **24** | **25.02M** | **381.9M** | **406.9M** |
+| 32 | 25.02M | 509.1M | 534.2M |
 
-> ⚠ `sweep.sh` với `SWEEP_MODE=train` giờ **không tự kết thúc** một ô nào: mỗi
-> ô chạy tới khi bị dừng tay. Muốn quét cả bảng thì train từng ô một, hoặc để
-> `SWEEP_MODE=test` sau khi đã có checkpoint cho mọi ô.
-
-Mỗi ô có `out_dir` và `ckpt_dir` riêng (`<model>-<variant>-n<n_block>`), nên
-chạy lại một ô không đè ô khác. Một ô hỏng không dừng cả sweep — nó ghi vào
-bảng tổng kết rồi đi tiếp, và cuối sweep tự gọi `src.report` để gom.
-
-Bảng tổng kết phân biệt ba trạng thái: `✓` (có `metrics.json`), `◐` (thoát mã 0
-nhưng không sinh metrics — thường là còn dry-run), `✗` (lỗi).
-
-### 3.4. MoE-LoRA hoạt động thế nào
+### 3.3. MoE-LoRA hoạt động thế nào
 
 Không chạy decoder E lần. Mỗi Linear của decoder đã có sẵn E bộ
 `(lora_A, lora_B, magnitude)` do peft dựng; `src/moe.py` thay hàm forward của
@@ -702,26 +880,33 @@ detach `‖V+ΔV‖`), nên không có bản chép tay nào để lệch âm th�
 2. `g` one-hot (k=1) cho ra **đúng** kết quả QDoRA một adapter — lớp MoE không
    tự thêm sai lệch. `scripts/selftest.py` kiểm bằng số.
 
+**Gate là top-k THUẦN.** `gate = softmax(route_logit)` lấy ở top-k rồi chuẩn
+hoá cho tổng = 1. Đúng `top_k` ô khác 0 ở **mọi** chế độ, và gate của một ảnh
+**không phụ thuộc ảnh nào khác trong batch** — train, eval, generate đi cùng
+một đường. Bản trước không có bất biến này lúc train: trần tải và bias đều làm
+gate phụ thuộc cả batch, nên cùng một ảnh cho báo cáo khác nhau tuỳ nó rơi vào
+batch nào.
+
 **Chi phí, nói thẳng.** Top-k chỉ tiết kiệm khi *cả batch* cùng bỏ qua một
-expert; với E=12, k=4, batch ≥4 thì hầu như expert nào cũng có người chọn, nên
-mỗi forward vẫn tính đủ 12 delta. Hạ `top_k` KHÔNG cứu được OOM — chỉ hạ
+expert; với E=24, k=6, batch ≥4 thì hầu như expert nào cũng có người chọn, nên
+mỗi forward vẫn tính đủ 24 delta. Hạ `top_k` KHÔNG cứu được OOM — chỉ hạ
 `n_expert` mới cứu được. Cái đắt nhất là QDoRA phải dequantize base weight
 trong forward — ở đây nó được nhớ tạm trong đúng vòng lặp của một layer nên
 chạy 1 lần/layer thay vì E lần. Lúc infer, `moe.freeze_scales()` tính sẵn
 `m/‖V+ΔV‖` (vector vài KB mỗi layer) nên 150 bước decode không phải dequantize
 lại — kết quả giống hệt, chỉ khác thời gian.
 
-**Vì sao 12 expert / top-4 chứ không phải 16 / top-6.** Chi phí VRAM và thời
-gian tỉ lệ với `n_expert` (12 bản delta phải giữ cùng lúc), không với `top_k`.
-Còn `top_k` quyết định mỗi mẫu được trộn từ bao nhiêu nguồn: k càng lớn thì
-gate càng gần một phép trung bình và các expert càng bị ép giống nhau — đúng
-thứ mà probe (§3.7) hay phát hiện ra ở dạng "K bản sao mờ". `12/4` giữ tỉ lệ
-thưa `k/E = 1/3` như `16/6` nhưng rẻ hơn 25% cả về VRAM lẫn thời gian, và mỗi
-mẫu chỉ trộn 4 nguồn nên chuyên môn hoá rõ hơn.
+**Vì sao 24 expert / top-6.** Chi phí VRAM và thời gian tỉ lệ với `n_expert`
+(24 bản delta phải giữ cùng lúc), không với `top_k`. Còn `top_k` quyết định mỗi
+mẫu được trộn từ bao nhiêu nguồn: k càng lớn thì gate càng gần một phép trung
+bình và các expert càng bị ép giống nhau — đúng thứ mà probe (§3.6) hay phát
+hiện ra ở dạng "K bản sao mờ". `24/6` giữ tỉ lệ thưa `k/E = 1/4`, chặt hơn
+`12/4` của bản trước, nên mỗi mẫu trộn ít nguồn hơn so với số expert có sẵn và
+chuyên môn hoá có chỗ để hình thành.
 
-`lora_dropout = 0.0` là **có chủ ý**: lớp DoRA của peft chỉ tái dùng được kết
-quả `base_layer` đã tính khi không có dropout; có dropout thì mỗi expert phải
-tính lại phép nhân ma trận base.
+`lora_dropout = 0.05` giữ nhỏ **có chủ ý**: lớp DoRA của peft chỉ tái dùng được
+kết quả `base_layer` đã tính khi không có dropout; có dropout thì mỗi expert
+phải tính lại phép nhân ma trận base.
 
 **Preset batch theo VRAM** (giữ effective_batch = 32):
 
@@ -738,246 +923,193 @@ tính lại phép nhân ma trận base.
 về tensor gate, thứ được "bắt" từ ngoài chứ không truyền vào như tham số của
 khối được checkpoint.
 
+Một chi phí MỚI cần biết: router giờ chạy ConvNeXt-Tiny ở **512²**, ~23
+GFLOPs/ảnh, thay cho DenseNet-121 ở 224² (~1.4 GFLOPs). Trên GPU nó vẫn nhỏ so
+với decoder Gemma + 24 bản delta QDoRA, nhưng nó không còn miễn phí — và trên
+CPU (selftest offline) nó chậm rõ, nên các test dùng batch nhỏ và dựng ảnh giả
+thẳng ở 512.
+
 STAGE 0 in VRAM đỉnh; dưới 60% thì nó gợi ý lệnh tăng batch, OOM thì gợi ý
 lệnh hạ. Từ khi gộp một phase, STAGE 0 chỉ còn **một** lần thử — nhưng lần thử
 đó là của đúng đồ thị nặng nhất, không còn nửa rẻ tiền nào để qua được một
 cách giả tạo.
 
-### 3.5. Nhiễu Gumbel trên route logit
+### 3.4. Nhiễu Gumbel trên route logit
 
-Route head rất dễ **tự tin sớm**. Nó chỉ có 131k tham số, nhìn một vector 512
-chiều, và tín hiệu chính dạy nó là CE — mà CE thì luôn thưởng cho tuyến đường
-*đang* tốt. Sau vài trăm step, một expert thắng 0.01 logit ở step đầu đã ăn hết
-gradient của cả nhóm mẫu đó, các expert còn lại không bao giờ được chạy trên
-nhóm ấy nữa nên không bao giờ khá lên. Router khoá cứng `mẫu → expert`, và cái
-nó khoá là *mẫu train cụ thể*, không phải đặc trưng bệnh học — đúng định nghĩa
-overfit, chỉ là overfit ở tầng định tuyến.
+Route head rất dễ **tự tin sớm**. Nó chỉ có 24 600 tham số, nhìn một vector
+1024 chiều, và tín hiệu chính dạy nó là CE — mà CE thì luôn thưởng cho tuyến
+đường *đang* tốt. Sau vài trăm step, một expert thắng 0.01 logit ở step đầu đã
+ăn hết gradient của cả nhóm mẫu đó, các expert còn lại không bao giờ được chạy
+trên nhóm ấy nữa nên không bao giờ khá lên. Router khoá cứng `mẫu → expert`,
+và cái nó khoá là *mẫu train cụ thể*, không phải đặc trưng bệnh học — đúng định
+nghĩa overfit, chỉ là overfit ở tầng định tuyến.
 
-**Cân bằng tải không chạm tới chuyện này.** Bias (§3.6) chỉ ép TỔNG tải chia
-đều giữa 12 expert. Nó hoàn toàn hài lòng với một router đã học thuộc "mẫu
-#4127 luôn đi expert 3" — miễn là gộp cả batch thì expert nào cũng bận. Cân
-bằng quản mức *quần thể*, chỗ hỏng nằm ở mức *từng mẫu*.
+**Aux loss không chạm tới chuyện này**, và đây là điểm quan trọng nhất của mục
+này. `Aux` ép TỔNG tải chia đều giữa 24 expert; nó hoàn toàn hài lòng với một
+router đã học thuộc "mẫu #4127 luôn đi expert 3" — miễn là gộp cả batch thì
+expert nào cũng bận. Tệ hơn: khi `P` còn gần đều thì `Aux = 1.0` bất kể tải
+lệch tới đâu (§1.6), nên ở giai đoạn router chưa có niềm tin, số hạng aux gần
+như **không phát ra tín hiệu nào**. Cân bằng quản mức *quần thể*, chỗ hỏng nằm
+ở mức *từng mẫu*.
 
-Nên trong lúc training, cộng nhiễu Gumbel vào **điểm chọn** top-k:
+Từ khi bỏ bias, **Gumbel là cơ chế khám phá DUY NHẤT** còn lại. Đó là lý do
+`σ_end = 0.5` chứ không phải 0.
 
 ```
-score = route_logits + σ·G + bias      G = −log(−log U),  U ~ Uniform(0,1)
-topi  = topk(score, k)                 ← nhiễu và bias CHỈ tác dụng ở đây
-gate  = softmax(route_logits)[topi], chuẩn hoá lại cho Σ = 1
+score = route_logits + σ·G          G = −log(−log U),  U ~ Uniform(0,1)
+topi  = topk(score, k)              ← nhiễu CHỈ tác dụng ở đây
+gate  = softmax(route_logits)[topi], chuẩn hoá lại   ← KHÔNG có nhiễu
 ```
 
-**Ba đường đi tách bạch của cùng một route logit.** Đây là thay đổi so với bản
-cũ, và nó có lý do:
-
-| Đường | Ăn gì | Có gradient? |
+| Đường | Công thức | Gradient? |
 |---|---|---|
-| GIÁ TRỊ gate | `softmax(route_logits)` **sạch** | có — đây là đường duy nhất |
-| CHỌN top-k | `route_logits + σ·Gumbel + bias` | không (topk vốn không có gradient theo chỉ số) |
-| CẬP NHẬT bias | đếm tải thật, quy tắc `sign` | không |
+| GIÁ TRỊ gate | `softmax(route_logits)` sạch, lấy ở top-k, chuẩn hoá lại | **có** — đây là đường duy nhất |
+| CHỌN top-k | `route_logits + σ·Gumbel` (chỉ khi `training`) | không (topk vốn không có gradient theo chỉ số) |
 
-Bản cũ cho gate ăn logit ĐÃ nhiễu, với lý lẽ "phạt đúng cái phân phối router
-thật sự dùng". Lý lẽ đó chỉ đứng vững khi còn aux loss — thứ cần một phân phối
-để phạt. Bỏ aux rồi thì nhiễu trong giá trị gate chỉ còn là nhiễu trong độ lớn
-delta của expert, tức nhiễu thẳng vào forward của decoder, không phục vụ gì.
-Tách ra: nhiễu làm đúng việc của nó (đổi tuyến đường), gate giữ đúng nghĩa của
-nó (router tin expert này bao nhiêu).
+Bản trước có **ba** đường (đường thứ ba là cập nhật bias); giờ còn hai.
 
-**Vì sao Gumbel chứ không phải Gauss.** `top-k(logit + G)` đúng bằng **lấy mẫu
-k expert không lặp từ `softmax(logit)`** — trick Gumbel-top-k, một đẳng thức
-chứ không phải xấp xỉ. Nghĩa là router không còn chọn "4 đứa điểm cao nhất" mà
-**bốc theo đúng phân phối nó tin**. Expert xếp thứ 5 với xác suất 4% thì được
-chạy đúng 4% số mẫu — đủ để nhận gradient và sống, không đủ để phá tuyến đường
-chính. Nhiễu Gauss cũng làm nhoè được, nhưng cường độ của nó không có nghĩa gì
-cụ thể; σ của Gumbel thì đọc được thẳng ra hành vi.
+**Vì sao Gumbel chứ không phải Gauss.** `topk(logit + Gumbel)` đúng bằng **lấy
+mẫu k expert không lặp từ `softmax(logit)`** — trick Gumbel-top-k. Router không
+chọn "k đứa điểm cao nhất" mà **bốc theo đúng phân phối nó tin**, nên expert
+xếp thứ k+1 vẫn thỉnh thoảng được chạy và được nhận gradient. Hệ số `σ` tương
+đương chia logit cho `σ`, tức nghịch với nhiệt độ: `σ = 1.0` là lấy mẫu đúng
+chuẩn, `σ` nhỏ → gần top-k xác định.
 
-| σ | Router làm gì |
-|---|---|
-| `0.0` | top-k tất định — tắt hẳn |
-| `0.001` | **`fixed.route_noise` — giá trị SAU warmup**; thực tế là tất định, chỉ còn phá thế hoà khi hai logit bằng nhau tới 3 chữ số |
-| `0.3` | gần tất định, chỉ đảo tuyến ở các mẫu sát biên quyết định |
-| **`1.0`** | **`fixed.route_noise_start` — giá trị ở step 0**; lấy mẫu ĐÚNG CHUẨN Gumbel-top-k |
-| `> 2` | gần như bốc ngẫu nhiên đều, gate hết mang thông tin (config sẽ cảnh báo) |
+**Vì sao nhiễu KHÔNG vào giá trị gate.** Nhiễu trong giá trị gate chỉ là nhiễu
+trong độ lớn delta mà decoder nhận — một cách làm nhoè forward, không phải một
+cách khám phá. Khám phá là đổi **tập** expert, và tập expert do nhánh CHỌN
+quyết định.
 
-σ = 1.0 là giá trị "không có tham số tự do": nó là chính phép lấy mẫu, không
-phải một mức nhiễu ai đó chọn. Đó là lý do nó là điểm ĐẦU của lịch — giai đoạn
-router chưa biết gì và cần bốc đúng theo phân phối nó tin. Điểm CUỐI thì ngược
-lại: khi expert đã phân hoá, đảo tuyến không còn là khám phá mà chỉ là nhiễu
-vào delta của decoder, nên σ tụt về 1e-3. Xem §3.5b.
+**Eval/infer tắt hẳn.** `router.eval()` → `self.training = False` → không cộng
+nhiễu. Số đo probe và text sinh ra vì thế tất định; `src/probe.py` còn ép
+`set_route_noise(0)` ngay từ đầu thay vì dựa vào mặc định.
 
-**Không đưa vào sweep.** σ không phải câu hỏi nghiên cứu ở đây, nó là một
-regularizer có lịch chuẩn. Muốn tắt hẳn cho một ô thì
-`--set fixed.route_noise=0 --set fixed.route_noise_start=null`.
-
-**Cái gì vẫn tất định.** Nhiễu gác sau `self.training`, mà `src/train.py` gọi
-`router.eval()` ở cả val lẫn infer — nên **mọi số đo và mọi câu text sinh ra
-đều không có nhiễu**. Chạy lại một checkpoint hai lần cho ra đúng một kết quả.
-Nhiễu chỉ tồn tại trong forward của bước train.
-
-`route_entropy` trong log đo trên logit **sạch** — nó là thước "router có đang
-sập về một expert không", và thước đó phải so được giữa các ô có σ khác nhau,
-cũng như giữa train và eval.
-
-Một cái bẫy đã dính một lần, ghi lại để khỏi dính lại: trong `gumbel_like`,
-`-torch.log(-torch.log(u).clamp_min(eps))` **parse thành clamp trước rồi mới
-đổi dấu** → `log` của một số âm → NaN toàn bộ gate. Phải là
-`-torch.log((-torch.log(u)).clamp_min(eps))`. Check `[9]` của
-`scripts/selftest.py` bắt đúng chỗ này.
-
-Khoá config `fixed.route_noise`, `fixed.route_noise_start` —
-`src/router.py::gumbel_like`, `RouterNet.forward`,
-`RouterNet.set_route_noise`, `RouterNet.set_decay_step`
-
-### 3.5b. Lịch decay của σ và γ trong n step đầu
-
-Hai hằng số điều phối ở §3.5 và §3.6 có một điểm chung khó chịu: **giá trị
-đúng cho trạng thái ổn định là giá trị sai cho vài trăm step đầu.**
-
-Chuyện xảy ra ở đầu train, theo đúng thứ tự:
-
-1. `route_head` khởi tạo ngẫu nhiên → 12 logit gần như bằng nhau.
-2. σ = 1.0 nghĩa là nhiễu Gumbel **lớn hơn hẳn** khoảng cách giữa các logit.
-   Với 12 expert, phần đuôi của Gumbel thỉnh thoảng cho một cú +3, +4 — đủ để
-   **cùng một expert** lọt top-k vài chục step liên tiếp chỉ vì may.
-3. Expert đó nhận gradient của cả nhóm mẫu ấy và **khá lên thật**. CE thưởng
-   cho tuyến đường đang tốt, nên `route_logit` của nó tách hẳn khỏi nhóm.
-4. Từ đây nó không cần may nữa. Router sập.
-
-Cơ chế đáng lẽ chặn được bước 3 là bias (§3.6), nhưng với `γ = 1e-3` thì bias
-cần **~2000 step** mới bò được một khoảng bằng dải `route_logit` (~±2) — nó
-đến nơi sau khi mọi chuyện đã xong. `γ = 1e-3` không sai; nó chỉ là giá trị
-của một cơ chế **cân bằng nhẹ ở trạng thái đã ổn định**, không phải của một
-cơ chế **cứu hoả**.
-
-Lời giải: cho cả hai hằng số một lịch **mũ** trong `n` step đầu.
+#### Lịch decay của σ, đếm bằng MẪU
 
 ```
-γ(t) = γ_start · (γ_end/γ_start)^(t/n)     γ: 1.0  → 1e-3
-σ(t) = σ_start · (σ_end/σ_start)^(t/n)     σ: 1.0  → 1e-3
-                                           n = fixed.decay_warmup_steps (1000)
+σ(t) = σ_start · (σ_end/σ_start)^(t/n)
+       σ: 1.0 → 0.5,  n = fixed.decay_warmup_samples = 3200 MẪU
 ```
 
-| | step 0 | n/3 | 2n/3 | ≥ n |
-|---|---|---|---|---|
-| γ | 1.0 | 0.1 | 0.01 | 1e-3 |
-| σ | 1.0 | 0.1 | 0.01 | 1e-3 |
+| | mẫu 0 | 1600 | ≥ 3200 |
+|---|---|---|---|
+| σ | 1.0 | 0.707 | 0.5 |
 
-**γ = 1.0 ở step 0 nghĩa là gì.** Bias nắn **ngay trong một step**: expert vừa
-ăn quá phần trung bình thì `b_e` tụt đúng 1.0, và dải `route_logit` chỉ ~±2 —
-nên step sau nó gần như chắc chắn bị đẩy khỏi top-k. Đây không còn là "cân
-bằng", đây là **luân phiên cưỡng bức**: cửa vào bị ép mở đều cho tới khi mọi
-expert đều có vài chục step gradient. Bước 3 ở trên không kịp xảy ra. Khi γ đã
-tụt xuống 1e-2, expert nào thắng là thắng bằng chất lượng chứ không bằng vài
-cú Gumbel may mắn ở step đầu.
+**Vì sao σ lớn ở đầu.** `route_head` khởi tạo ngẫu nhiên → 24 logit gần như
+bằng nhau, và mọi expert đều đáng thử. `σ = 1.0` là lấy mẫu đúng chuẩn
+Gumbel-top-k: tuyến đường còn đảo được, không expert nào bị loại vì thua 0.01
+logit ở step đầu.
 
-**σ đi cùng chiều, vì lý do khác.** Nhiễu cần THẬT ở đầu — không có nó thì
-tuyến đường bị khoá ngay từ step 1 và §3.5 không còn nghĩa gì. Nhưng ở cuối,
-khi expert đã phân hoá, đảo tuyến không còn là khám phá: nó chỉ làm nhoè delta
-mà decoder nhận. Đây là anneal khám phá → khai thác quen thuộc, viết trên cùng
-một đường cong với γ.
+**Vì sao KHÔNG về 0 mà chỉ về 0.5.** Bản trước cho σ tụt về `1e-3` — đóng băng
+tuyến đường về cuối, với lý lẽ "expert đã phân hoá, đảo tuyến chỉ còn là nhiễu
+vào delta". Lý lẽ đó dựa vào việc còn có bias để điều phối tải. Bỏ bias rồi thì
+σ → 0 nghĩa là **không còn cơ chế nào** đưa expert hạng k+1 vào cửa, và aux
+loss không sửa được (nó chỉ nắn qua `P_e`, mà `P_e` thay đổi thì tập top-k của
+một logit đã phân hoá mạnh vẫn không đổi). `σ = 0.5` là mức giữ được sàn khám
+phá mà vẫn siết lại rõ so với đầu buổi.
 
-**Vì sao thang MŨ chứ không tuyến tính.** Tỉ lệ đầu/cuối là 1000×. Trên thang
-tuyến tính, 90% quãng đường nằm trong vùng `γ > 0.1` — vùng đã bão hoà, thêm
-γ không đổi gì nữa vì bias đã đủ mạnh để đảo top-k từ lâu — còn vùng thật sự
-đáng quan tâm, `1e-2 → 1e-3`, bị nén vào 1% cuối. Thang mũ chia đều theo
-**bậc**: mỗi 1/3 quãng đường là một lần chia 10.
+**Vì sao đếm bằng MẪU chứ không bằng step** — đổi so với bản trước, và vì đúng
+lý do đã buộc lịch LR đếm bằng mẫu (§1.8): `step = mẫu / (train_bs ×
+grad_accum)`, nên "1000 step" là hai quãng dữ liệu khác hẳn nhau trên máy 8×8
+và máy 1×32, còn "3200 mẫu" thì rơi đúng một chỗ trên mọi máy — kể cả khi
+checkpoint được bàn giao giữa hai máy khác batch.
 
-**Con trỏ là `step` toàn cục, không phải bộ đếm nội bộ.** `set_decay_step` là
-hàm **thuần** của `step`, nên resume từ checkpoint vào lại đúng chỗ trên đường
-cong thay vì warmup lại từ đầu. Một bộ đếm nội bộ thì hoặc phải nằm trong
-`state_dict` — thêm một khoá lạ, làm hỏng mọi checkpoint cũ — hoặc reset về 0
-mỗi lần resume. Lịch là **config**, không phải trọng số: nó không đi theo
-`weights.pt`, và một checkpoint train có lịch nạp được vào một router không
-lịch (và ngược lại).
+**Con trỏ là số mẫu tích luỹ, không phải bộ đếm nội bộ.**
+`set_decay_samples(samples)` là hàm **thuần** của `samples`, nên resume vào lại
+đúng chỗ trên đường cong thay vì warmup lại từ đầu. Lịch là **config**, không
+phải trọng số: nó không đi theo `weights.pt`, và một checkpoint train có lịch
+nạp được vào một router không lịch (và ngược lại).
 
-**Tắt lịch.** `fixed.bias_gamma_start: null` / `fixed.route_noise_start: null`
-tắt riêng từng đại lượng; `fixed.decay_warmup_steps: 0` tắt cả hai. Tắt hết =
-đúng hành vi trước khi có mục này.
+**Tắt lịch.** `fixed.route_noise_start: null` hoặc
+`fixed.decay_warmup_samples: 0` → dùng thẳng `route_noise` từ mẫu 0.
 
-**Đọc log.** Trong lúc còn warmup, dòng `train` in kèm `γ=... σ=...`; cả hai
-cũng vào `train_step` của JSONL và vào wandb (`train/bias_gamma`,
-`train/route_noise`) — vẽ `balance` cùng `γ` là cách nhanh nhất để thấy lịch
-có làm việc không. Dấu hiệu tốt: `balance` bám sát 1.0 suốt warmup rồi **nhích
-lên một chút** khi γ tụt xuống 1e-3 (router bắt đầu được phép có sở thích);
-dấu hiệu xấu: `balance` vọt lên 3-4 ngay sau khi hết warmup — nghĩa là n quá
-ngắn, expert chưa kịp phân hoá đã bị thả.
+**Đọc log.** Trong lúc còn warmup, dòng `train` in kèm `σ=...`; nó cũng vào
+`train_step` của JSONL và vào wandb (`train/route_noise`). Vẽ `balance` cùng
+`σ` là cách nhanh nhất để thấy lịch có làm việc không.
 
-Khoá config `fixed.bias_gamma_start`, `fixed.route_noise_start`,
-`fixed.decay_warmup_steps` — `src/router.py::decay_value`,
-`RouterNet.set_decay_step`, `decay_desc`; check `[11]` của
+`fixed.route_noise`, `fixed.route_noise_start`,
+`fixed.decay_warmup_samples` — `src/router.py::gumbel_like`,
+`decay_value`, `RouterNet.set_decay_samples`; check `[9]` và `[11]` của
 `scripts/selftest.py`
 
-### 3.6. Cân bằng tải KHÔNG dùng aux loss
+### 3.5. Cân bằng tải: một số hạng aux
 
-Vấn đề của mọi MoE: router sập về vài expert. Nếu 3 trong 12 expert ôm hết
-tải thì 9 expert còn lại là tham số chết — vẫn tốn VRAM, vẫn tốn thời gian
-khởi tạo, không đóng góp gì.
+Vấn đề của mọi MoE: router sập về vài expert. Nếu 6 trong 24 expert ôm hết tải
+thì 18 expert còn lại là tham số chết — vẫn tốn VRAM, vẫn tốn thời gian khởi
+tạo, không đóng góp gì.
 
-Cách cũ là **aux loss**: cộng `w_aux · E·Σ_e f_e·P_e` vào Total_Loss, tối
-thiểu khi mọi expert nhận đều tải. Nó chạy được, nhưng nó là một lực **kéo
-ngược** gradient chính. Nó bắt router chia đều cả khi việc chia đều làm CE tệ
-đi, nên `w_aux` là một cuộc mặc cả: lớn quá thì chất lượng giảm, nhỏ quá thì
-không cân bằng nổi, và không có giá trị nào đúng cho mọi giai đoạn train.
-
-Cách ở đây (DeepSeek-V3, *auxiliary-loss-free load balancing*): mỗi expert có
-một **bias** `b_e` cộng vào **điểm chọn** top-k — không cộng vào trọng số gate,
-không nằm trong loss, không có gradient. Sau mỗi optimizer step:
+Cách ở đây là cách **thông thường** (Switch-Transformer / GShard): đúng MỘT số
+hạng trong `Total_Loss`.
 
 ```
-c_e  = số mẫu đã chọn expert e trong step vừa rồi (gộp cả grad_accum)
-c̄   = Σc_e / E
-b_e += γ(t) · sign(c̄ − c_e)      γ(t): 1.0 → fixed.bias_gamma, xem §3.5b
-b   -= mean(b)                     ghim trung bình về 0
+L_aux = E · Σ_e f_e · P_e
+
+f_e = tỉ lệ MẪU thật sự chọn expert e = count_e / (B·k)    ← đếm, KHÔNG gradient
+P_e = mean_batch softmax(route_logit)[:, e]                ← CÓ gradient
 ```
 
-Đọc bằng lời: expert bị chọn nhiều hơn mức trung bình thì cửa vào của nó hẹp
-lại; expert bị bỏ đói thì cửa rộng ra. Chất lượng và cân bằng không còn phải
-tranh nhau một hệ số, vì cân bằng không còn nằm trong hàm mục tiêu.
+`Σf = ΣP = 1`, nên `L_aux ≥ 1` và bằng 1 **khi và chỉ khi** cả hai vector đều
+đều `1/E`. Dồn hết vào một expert (k=1, P one-hot) cho `L_aux = E`.
 
-**Vì sao `sign` chứ không phải độ lệch.** Bias là một cái **núm cửa**, không
-phải một cái lò xo. Lấy độ lệch thì một batch lệch nặng đẩy bias đi rất xa
-trong một bước và router dao động qua lại giữa các step. `sign` cho mỗi bước
-đúng γ nên nó bò từ từ về điểm cân bằng rồi ở lại đó.
+**Gradient chỉ chảy qua `P_e`.** `f_e` là phép ĐẾM trên `topi` — hàm bậc thang,
+đạo hàm 0 gần như mọi nơi, và `topi` còn đến từ một top-k **có nhiễu**. Nó bị
+`detach` hẳn và đóng vai **trọng số**: expert đang bị chọn nhiều thì hệ số
+trước `P_e` của nó lớn, nên softmax bị đẩy xuống ở đúng cột đó. Đây là toàn bộ
+cơ chế — không có cái núm nào cộng vào điểm chọn nữa.
 
-**Vì sao ghim trung bình về 0.** Chỉ HIỆU giữa các `b_e` mới có ý nghĩa: cộng
-cùng một hằng số vào tất cả thì top-k không đổi. Không ghim thì bias trôi dần
-ra vô cực và mất thang đo khi so với `route_logits`.
+#### Vì sao quay về aux loss sau khi đã bỏ nó
 
-**Vì sao bias KHÔNG chạm vào giá trị gate.** Nếu nó cộng vào cả trọng số trộn
-thì cân bằng tải sẽ đổi luôn độ lớn delta mà mỗi expert đóng góp — tức là để
-một cơ chế điều phối can thiệp vào forward của decoder. Bias chỉ trả lời "ai
-được vào", `softmax(route_logits)` sạch trả lời "vào rồi thì nặng bao nhiêu".
+Bản trước bỏ aux loss với một lý lẽ đúng: aux là một **lực kéo ngược** gradient
+chính, nó bắt router chia đều cả khi việc chia đều làm CE tệ đi, nên `w_aux` là
+một cuộc mặc cả không có giá trị nào đúng cho mọi giai đoạn. Thay vào đó là ba
+cơ chế ngoài loss: bias `b_e` (quy tắc `sign`, clamp ±0.2), trần tải mỗi
+micro-batch, và 2 expert hứng để đổ phần tràn.
 
-**Bias đi theo checkpoint.** Nó là `register_buffer` nên nằm trong
-`router.state_dict()` và trong `weights.pt`. Bỏ nó ra khỏi ckpt thì mỗi lần
-resume router mất toàn bộ điều phối đã học và vài nghìn step đầu lại dồn tải
-như lúc mới khởi tạo. Bộ ĐẾM tải (`load_count`) thì `persistent=False` — nó chỉ
-sống trong đúng một optimizer step, lưu vào ckpt là lưu rác.
+Điều đã học được từ lần chạy đó:
 
-**Eval không đếm tải.** Bộ đếm chỉ chạy khi `self.training`. Nếu không thì mỗi
-lần val cũng nắn bias, và bias sẽ phản ánh phân phối của tập val chứ không phải
-của tập train.
+1. **Ba cơ chế cùng nắn một đại lượng thì không đọc được cái nào đang thắng.**
+   Log có `balance`, `bias_span`, `bias_sat`, `overflow`, `spill`,
+   `shared_gate` — sáu con số cho một câu hỏi, và khi tải vẫn lệch thì không
+   có cách nào truy ra nguyên nhân.
+2. **Bias làm `chosen` lệch khỏi `prob`.** Bản ghi probe khi đó có top-k không
+   khớp phân phối mà router khai, và không có gì trong bản ghi giải thích được
+   vì sao. Phải thêm cờ `router_bias_at_eval` chỉ để tắt nó lúc đo.
+3. **Trần tải và bias đều làm gate phụ thuộc cả batch.** Chấp nhận được lúc
+   train (coi như regularization), nhưng nó phá mất một bất biến đáng giá:
+   cùng một ảnh, gate phải như nhau bất kể nó nằm cạnh ai.
+4. **Expert hứng cần một suất cố định để bịt lỗ train/eval** — tức thêm một
+   siêu tham số (`shared_weight`) chỉ để sửa hệ quả của một siêu tham số khác.
 
-**Đọc hai con số trong log:**
+Đổi lại, `L_aux` mất đúng một thứ: nó là lực kéo ngược. Với `w_aux = 0.05` thì
+lực đó nhỏ, và cái quan trọng hơn là nó **đọc được**: một con số, một hướng,
+`balance` bò về 1.0 hay không.
+
+#### Ba con số trong log, và một cái bẫy
 
 | Con số | Nghĩa | Muốn thấy |
 |---|---|---|
-| `balance` | `E·Σ_e f_e·P_e` — đúng công thức aux cũ, nhưng giờ chỉ là **thước đo**, không có gradient | bò về `1.0` |
-| `bias_span` | `max(b) − min(b)` | ổn định ở một giá trị nhỏ |
+| `aux` | `L_aux` trước khi nhân `w_aux` | = `balance` |
+| `balance` | cùng một số, giữ tên cũ để so được với các lần chạy trước | bò về `1.0` |
+| `expert_share` | tỉ lệ tải thật của từng expert (event log, không in ra dòng `train`) | gần `1/E = 0.042` |
 
-`balance` đứng ở 3-4 và `bias_span` phình mãi = γ quá nhỏ so với dải
-`route_logits`. `balance` dao động mạnh quanh 1.0 = γ quá lớn. `bias_gamma: 0`
-tắt hẳn cơ chế — chỉ dùng khi cố ý muốn đo xem router sập nhanh thế nào.
+**Cái bẫy:** `balance = 1.0` ở vài trăm step đầu **KHÔNG** chứng minh tải đang
+đều. Khi `P` còn gần đều thì công thức cho 1.0 bất kể `f` lệch tới đâu. Ở giai
+đoạn đó phải đọc `expert_share` trong event log, không đọc `balance`.
 
-`fixed.bias_gamma` (giá trị SAU warmup — γ ở step 0 là
-`fixed.bias_gamma_start`, xem §3.5b) — `src/router.py::RouterNet.update_bias`,
-`load_balance_stat`
+`balance` đứng ở 3–4 và không xuống = router đã dồn niềm tin vào vài expert và
+`w_aux` quá nhỏ so với áp lực của CE → nâng lên `0.1` và xem vài trăm step.
+`w_aux: 0` tắt hẳn cơ chế — chỉ dùng khi cố ý muốn đo xem router sập nhanh thế
+nào.
 
-### 3.7. Probe chuyên môn expert (`mode: probe`)
+`run.w_aux` — `src/losses.py::aux_loss`, gọi từ
+`src/router.py::RouterNet.forward`; check `[8]` của `scripts/selftest.py`
 
-Bảng sweep trả lời "kiến trúc nào cho BLEU cao hơn". Nó **không** trả lời câu
-đắt hơn nhiều: 12 expert kia có thật sự chia việc không, hay 4 cái được chọn
-mỗi lần chỉ là 4 bản sao mờ của nhau? Không trả lời được thì MoE chỉ là một
-cách tiêu tham số.
+### 3.6. Probe chuyên môn expert (`mode: probe`)
+
+`metrics.json` trả lời "cấu hình nào cho BLEU cao hơn". Nó **không** trả lời
+câu đắt hơn nhiều: 24 expert kia có thật sự chia việc không, hay 6 cái được
+chọn mỗi lần chỉ là 6 bản sao mờ của nhau? Không trả lời được thì MoE chỉ là
+một cách tiêu tham số.
 
 Nó **không train gì cả**. Nó lấy một checkpoint rồi, với mỗi ảnh test:
 
@@ -991,8 +1123,8 @@ Bước 3 chạy bao nhiêu forward là tuỳ `run.probe_full_n` (mặc định 
 
 | Nhóm ảnh | Bật những expert nào | Forward/ảnh | Hồ sơ thu được |
 |---|---|---|---|
-| `probe_full_n` ảnh **đầu** của tập test | **đủ 12**, kể cả expert router không chọn | 1 + 12 | **vô điều kiện** — mọi expert đo trên cùng một tập ảnh nên so trực tiếp được; expert chưa bao giờ được gọi vẫn có hàng |
-| các ảnh còn lại | 4 expert router đã chọn | 1 + 4 | **có điều kiện** — chỉ dùng cho thống kê router |
+| `probe_full_n` ảnh **đầu** của tập test | **đủ 24**, kể cả expert router không chọn | 1 + 24 | **vô điều kiện** — mọi expert đo trên cùng một tập ảnh nên so trực tiếp được; expert chưa bao giờ được gọi vẫn có hàng |
+| các ảnh còn lại | 6 expert router đã chọn | 1 + 6 | **có điều kiện** — chỉ dùng cho thống kê router |
 
 Phân nhóm theo **thứ tự gốc** của tập test, nên phiên Kaggle sau resume vẫn ra
 đúng tập ảnh đó. Bản ghi tự khai bằng `probe_mode: full | topk`.
@@ -1002,17 +1134,18 @@ này" trộn hai thứ vào một con số — expert học được gì, và ro
 nào. Hai expert khác nhau ở đó có thể chỉ vì chúng được gọi trên hai loại ảnh
 khác nhau. Tệ hơn: expert router chưa bao giờ chọn thì không có hàng nào cả,
 đúng cái expert đáng ngờ nhất lại là cái duy nhất không đo được. `probe_full_n`
-mua lại điều đó với giá 2.6× thời gian trên N ảnh.
+mua lại điều đó với giá ~3.6× thời gian trên N ảnh.
 
 Hiệu `Δh = h_e − h_base` là toàn bộ ảnh hưởng của expert e trên đúng ảnh này.
 Bốn thứ đọc ra từ nó:
 
 - **Bản đồ không gian 16×16** — ‖Δh‖ tại từng image token, reshape về lưới
-  patch của SigLIP. Chồng lên ảnh X-quang thì thấy expert đổi biểu diễn ở
-  **vùng nào** của phổi.
+  patch của SigLIP (đây là lưới của **Gemma**, không phải lưới 16×16 của
+  ConvNeXt trong nhánh router — hai cái trùng số chỉ là tình cờ). Chồng lên ảnh
+  X-quang thì thấy expert đổi biểu diễn ở **vùng nào** của phổi.
 - **Vector 14 bệnh + vector 4 aspect** — Δlogit trên đúng những dòng
-  unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp cả 12
-  expert lại được ma trận **12×14** và **12×4** — bảng chuyên môn đọc được
+  unembedding ứng với tên 14 finding của CheXbert và 4 tên aspect. Xếp cả 24
+  expert lại được ma trận **24×14** và **24×4** — bảng chuyên môn đọc được
   bằng mắt.
 - **Năm nhóm token toàn cục** (`PROBE_FIELDS` trong `src/probe.py`) — cùng
   phép đo, nhưng trên các trục **ngoài** danh sách chẩn đoán: giải phẫu & vị
@@ -1046,8 +1179,8 @@ không có. Nên 14 và 4 để riêng.
    prompt nên đúng MỘT vị trí dự đoán được gì đó, mà đọc unembedding ở một vị
    trí là đọc nhiễu. Teacher-forcing cho ~100 vị trí để lấy trung bình, và vẫn
    chỉ tốn ĐÚNG một forward — rẻ hơn generate khoảng 150 lần. Gate vẫn là gate
-   thật: `router_mask` che target nên router chỉ nhìn prompt + ảnh, đúng thứ
-   nó nhìn lúc infer.
+   thật, và từ đợt này thì **theo kiến trúc**: router đọc `pixel_values`, nó
+   không nhìn thấy chuỗi token nên không có đường nào để đọc được đáp án.
 2. **Bật expert với trọng số 1.0, không phải `g_e`.** Câu hỏi là "expert này
    *là gì*", không phải "expert này đóng góp bao nhiêu vào mẫu này". `g_e`
    thật vẫn nằm trong mỗi bản ghi, muốn quy đổi thì nhân sau.
@@ -1055,7 +1188,7 @@ không có. Nên 14 và 4 để riêng.
 **Trọng số đem ra chấm là trung bình SWA của `last/` trên Hub**, không phải
 trọng số cuối. Bản cuối là một điểm ngẫu nhiên trên quỹ đạo SGD — với lịch
 train vô hạn thì nó gần như chắc chắn đang nằm giữa dốc của một cycle. Trung
-bình các đáy cycle mới là thứ đại diện cho ô sweep. Phiên train phải để
+bình các đáy cycle mới là thứ đại diện cho lần chạy. Phiên train phải để
 `run.hub_include_swa: true` (mặc định đã bật), nếu không thì `swa.pt` không có
 trên Hub và probe cảnh báo rồi lùi về `weights.pt`.
 
@@ -1065,7 +1198,7 @@ là một ảnh chụp của một thời điểm. Bản ghi có `train_samples`
 
 **Cơ chế ép gate.** `RouterBridge.force_gate` thay cái đi vào MoE nhưng KHÔNG
 thay cái router nghĩ: `bridge.out` vẫn giữ gate thật, nên chỉ một forward nền
-là đã biết router chọn 4 expert nào, không phải chạy thêm lượt nào để hỏi.
+là đã biết router chọn 6 expert nào, không phải chạy thêm lượt nào để hỏi.
 Gate toàn 0 khiến `CTX.active` rỗng và mọi expert bị bỏ qua — đó chính là
 forward nền, không cần một đường code riêng.
 
@@ -1076,7 +1209,7 @@ train — hai bên chấm trên hai tập test khác cỡ với hai bộ trọng
 trộn vào một chỗ là hỏng cả hai. `hub_sync` tắt để probe không tranh chấp tiến
 độ.
 
-**Đẩy lên Hub và chạy lại được.** Xong 4 expert của một ảnh là ghi ngay một
+**Đẩy lên Hub và chạy lại được.** Xong các expert của một ảnh là ghi ngay một
 file JSON; `CommitScheduler` gom và commit mỗi `probe_commit_every` phút (mặc
 định 1). Đúng nghĩa "xong ảnh nào có ngay ảnh đó", nhưng 3000 commit riêng lẻ
 thì HF chặn giữa chừng và lịch sử repo không đọc được. `key_id` là `img_rel`
@@ -1086,10 +1219,10 @@ và những ảnh đó bị bỏ qua, nên phiên Kaggle 12h đứt giữa chừ
 chạy tiếp. `reports.csv` cũng dựng lại được từ chính các bản ghi cũ (báo cáo
 sinh ra nằm sẵn trong đó) thay vì generate lại chỉ để có metrics.
 
-**Chi phí.** Trọn test = 3000 ảnh × (1 lần generate + 5 forward). T4 rơi vào
-cỡ 12–20 giây/ảnh → 10–17h, tức 2 phiên Kaggle. `infer_bs` bị ép về 1: mỗi ảnh
-cần 5 gate khác nhau mà `CTX` chỉ giữ một gate cho cả batch. Thử nhanh thì
-`probe_n_images: 20`.
+**Chi phí.** Trọn test = 3000 ảnh × (1 lần generate + 7 forward cho nhóm
+`topk`, + 25 forward cho nhóm `full`). T4 rơi vào cỡ 15–25 giây/ảnh → 13–21h,
+tức 2 phiên Kaggle. `infer_bs` bị ép về 1: mỗi ảnh cần nhiều gate khác nhau mà
+`CTX` chỉ giữ một gate cho cả batch. Thử nhanh thì `probe_n_images: 20`.
 
 ```bash
 python -m src.train --config configs/default.yaml --mode probe
@@ -1105,18 +1238,18 @@ from huggingface_hub import snapshot_download
 import json, glob, numpy as np
 d = snapshot_download("<hub_repo>-probe", repo_type="dataset")
 recs = [json.load(open(p)) for p in glob.glob(f"{d}/records/*.json")]
-M, C = np.zeros((12, 14)), np.zeros(12)
+M, C = np.zeros((24, 14)), np.zeros(24)
 for rec in recs:
     for it in rec["experts"]:
         M[it["expert"]] += it["disease"]; C[it["expert"]] += 1
-M /= np.maximum(C, 1)[:, None]        # 12 expert × 14 bệnh
+M /= np.maximum(C, 1)[:, None]        # 24 expert × 14 bệnh
 ```
 
-Hàng nào của `M` cũng gần giống nhau = các expert **không phân hoá**, top-4
-chỉ là 4 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự
+Hàng nào của `M` cũng gần giống nhau = các expert **không phân hoá**, top-6
+chỉ là 6 bản sao mờ và số expert đang thừa. Hàng khác nhau rõ = MoE thật sự
 chia việc, và cột nào nổi lên cho biết expert đó nhận phần nào của bài toán.
 
-> Không cần tự viết đoạn gộp trên: `scripts/probe_summary.py` (§3.8) làm
+> Không cần tự viết đoạn gộp trên: `scripts/probe_summary.py` (§3.7) làm
 > sẵn, và xuất ra bảng + heatmap đọc được bằng mắt.
 
 `run.mode: probe` | `src/probe.py` | `scripts/kaggle_probe.py` |
@@ -1124,9 +1257,9 @@ chia việc, và cột nào nổi lên cho biết expert đó nhận phần nào
 
 ---
 
-### 3.8. Gộp bản ghi probe thành báo cáo đọc được (`scripts/probe_summary.py`)
+### 3.7. Gộp bản ghi probe thành báo cáo đọc được (`scripts/probe_summary.py`)
 
-§3.7 để lại vài nghìn file JSON trên một dataset repo. Một bản ghi lẻ không nói
+§3.6 để lại vài nghìn file JSON trên một dataset repo. Một bản ghi lẻ không nói
 lên điều gì — nhiễu của một ảnh lớn hơn hiệu ứng cần đo — nên phải gộp cả tập
 rồi mới đọc. Script này làm đúng việc đó và **chạy trên CPU máy cá nhân**:
 không import torch, chỉ cần `numpy` + `huggingface_hub` (thêm `pyyaml` để tự dò
@@ -1160,7 +1293,7 @@ thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, c�
   expert. Tính TRƯỚC khi cắt top-k, nên expert không bao giờ lọt top-k vẫn có
   số (`gate` thì đã bị top-k làm rỗng 8/12 ô và không trả lời được câu này).
   Chia đều tuyệt đối = 1/12 = 8.3%. Đọc kèm `effective_experts` = `exp(H)` —
-  số expert **hiệu dụng**: 12 expert mà ra 3.2 nghĩa là router thực chất chỉ
+  số expert **hiệu dụng**: 24 expert mà ra 3.2 nghĩa là router thực chất chỉ
   đang dùng khoảng ba cái.
 - `clone_index` — cosine trung bình giữa hồ sơ **z-score** của từng cặp expert,
   trên **toàn bộ** cột (14 bệnh + 4 aspect + 5 nhóm token ≈ 106 nhãn), sau khi
@@ -1174,7 +1307,7 @@ thư mục này là ảnh chụp trạng thái hiện tại của checkpoint, c�
   giữa hai số nghĩa là các expert chia việc theo một trục **khác** trục bệnh.
 - `balance` — entropy chuẩn hoá của tần suất router chọn từng expert
   (`H / log E`). 1.00 = chia đều; thấp = vài expert ăn hết lượt chọn và phần
-  còn lại là tham số chết. Đây chính là §3.6 nhìn từ phía kết quả.
+  còn lại là tham số chết. Đây chính là §3.5 nhìn từ phía kết quả.
 - `gate_max` so với `1/top_k` — hai số gần bằng nhau nghĩa là router chia đều
   trọng số cho k expert được chọn, tức đang **trung bình cộng chứ chưa định
   tuyến**.
@@ -1237,12 +1370,13 @@ nhân nào.
 ## 4. Kịch bản một lần chạy
 
 1. **Input**: resize 512 → 896 bằng BICUBIC (anti-aliasing) — SigLIP cố định
-   896², `pan_and_scan` tắt → 256 image token.
+   896², `pan_and_scan` tắt → 256 image token. Nhánh router thu cùng
+   `pixel_values` đó về lại 512² cho ConvNeXt (§1.3, §3.2).
 2. **`max_seq_len = 896`** (ép cứng trong config). Để `null` thì tự tính
    `2^ceil(log2(prompt + img_token + 128))` sau khi đo số image token thật.
-   Padding dùng `longest` chứ không đệm cứng: router che padding bằng
-   `router_mask` nên kết quả không phụ thuộc chuỗi được đệm tới đâu, mà batch
-   ngắn thì chạy nhanh hơn.
+   Padding dùng `longest` chứ không đệm cứng: kết quả không phụ thuộc chuỗi
+   được đệm tới đâu (router đọc ảnh, không đọc chuỗi), mà batch ngắn thì chạy
+   nhanh hơn.
 3. **bf16** — yêu cầu sm80+. Script chặn cứng GPU sm75 (T4) trừ khi khai báo
    rõ `fixed.require_bf16: false` + `compute_dtype: float16`.
 4. **STAGE 0**: 2 step thử của đúng đồ thị thật. In `mẫu/s`, VRAM đỉnh, thời
@@ -1250,16 +1384,16 @@ nhân nào.
 5. **Train**: một phase multi-task, chạy tới khi bị dừng tay (§1.7). Ckpt mỗi
    `save_every_n_vals` lần val, push lên Hub.
 6. **Chấm điểm** là một phiên riêng: `--mode test` (nạp bản trung bình SWA rồi
-   sinh 200 báo cáo) hoặc `--mode probe` (§3.7).
+   sinh 200 báo cáo) hoặc `--mode probe` (§3.6).
 
 Không còn khái niệm "chạy hết lịch": một lần chạy là một khoảng thời gian, và
 `samples` trong `train_state.json` là thứ nói nó đã đi được bao xa.
 
 ---
 
-## 5. Thu thập kết quả từng ô
+## 5. Thu thập kết quả
 
-Một ô chạy `--mode test` (hoặc `both` rồi Ctrl-C) sinh ra:
+Một lần chạy `--mode test` (hoặc `both` rồi Ctrl-C) sinh ra:
 
 ```
 outputs/<tag>/
@@ -1270,22 +1404,30 @@ outputs/<tag>/
 └── metrics.json    raw / meta   (+ post_policy khi bật lại policy)
 ```
 
-`src.report` gom mọi ô lại thành sáu file trong `outputs/_summary/`:
+`src.report` gom **mọi lần chạy** trong `outputs/` thành sáu file ở
+`outputs/_summary/`. Bảng đổi hình so với bản trước: không còn "biến thể ×
+n_block" vì không còn kiến trúc nào để quét — một **hàng** giờ là một lần chạy,
+một **cột** là một metric. Thứ còn so được giữa hai lần chạy là model nền,
+`n_expert`/`top_k`, `w_aux`, và checkpoint đã đi được bao xa.
 
 | File | Nội dung |
 |---|---|
-| `metrics_full.csv` | **Full metrics**: mọi metric × mọi ô, dạng dài (`tag, model, variant, n_block, total_params, block, metric, value`) |
-| `metrics_table.md` | Bảng biến thể × `n_block` cho từng metric chính |
-| `param_curve.md` | Mọi ô xếp theo **tổng tham số** + phân bố expert — bảng trả lời câu hỏi của sweep |
+| `metrics_full.csv` | **Full metrics**: mọi metric × mọi lần chạy, dạng dài (`tag, model, n_expert, top_k, w_sup, w_aux, total_params, block, metric, value`) |
+| `metrics_table.md` | Bảng lần chạy × metric (kèm cột `E`, `top-k`, `w_aux`) |
+| `param_curve.md` | Mọi lần chạy xếp theo **tổng tham số** + phân bố expert |
 | `gen_text.csv` | **Bảng gen_text** side-by-side: một hàng = một ảnh, cột = `<tag>__generated` / `__raw` / `__guard_passed` / `__attempts` |
-| `gen_text.md` | Bản dễ đọc: N mẫu đầu, reference kèm output của mọi ô |
-| `guard_impact.md` | Tỉ lệ qua 7-check của từng ô (đang ở chế độ ĐO, không sửa) |
+| `gen_text.md` | Bản dễ đọc: N mẫu đầu, reference kèm output của mọi lần chạy |
+| `guard_impact.md` | Tỉ lệ qua 7-check của từng lần chạy (đang ở chế độ ĐO, không sửa) |
 | `run_health.md` | từ JSONL: step cuối, s/step, VRAM đỉnh, warn/error, mã thoát (§6) |
 
 ```bash
-bash scripts/collect.sh                  # gom từ ./outputs
-bash scripts/collect.sh --md-samples 50  # nhiều mẫu gen_text hơn trong .md
+python -m src.report                     # gom từ ./outputs
+python -m src.report --md-samples 50     # nhiều mẫu gen_text hơn trong .md
 ```
+
+Trên trục hoành của `param_curve.md` chỉ còn **một** biến: router là hằng số
+25.0M trainable ở mọi lần chạy, nên tổng tham số đổi đúng theo `n_expert`
+(≈15.9M mỗi expert).
 
 Dạng **dài** (không phải rộng) cho `metrics_full.csv` là có chủ đích: số metric
 thay đổi theo config (BERTScore optional), nên pivot lúc phân tích dễ hơn là
@@ -1295,13 +1437,18 @@ phải xử lý cột thiếu.
 import pandas as pd
 d = pd.read_csv("outputs/_summary/metrics_full.csv")
 d[d.block == "raw"].pivot_table(
-    index=["variant", "n_block", "total_params"], columns="metric",
-    values="value")
+    index=["tag", "n_expert", "top_k", "w_aux", "total_params"],
+    columns="metric", values="value")
 ```
 
-`gen_text.csv` chỉ giữ **ảnh có mặt ở mọi ô**, để so sánh công bằng. Ô nào chạy
-`n_test_samples` nhỏ hơn sẽ thu hẹp giao này — muốn giữ nguyên thì đặt cùng một
-`run.n_test_samples` cho cả sweep.
+`gen_text.csv` chỉ giữ **ảnh có mặt ở mọi lần chạy**, để so sánh công bằng.
+Lần nào chạy `n_test_samples` nhỏ hơn sẽ thu hẹp giao này — muốn giữ nguyên
+thì đặt cùng một `run.n_test_samples`.
+
+**Nhắc lại vì nó là bẫy dễ mắc:** lịch train không có đích (§1.7), nên hai lần
+chạy dừng ở hai chỗ khác nhau trong dữ liệu là bình thường — và so BLEU của
+chúng khi đó là so hai thứ khác nhau. Đối chiếu `samples` trong
+`ckpt/<tag>/last/train_state.json` trước khi đọc bảng.
 
 ---
 
@@ -1319,9 +1466,8 @@ console ở `logs/`:
 `latest.log` và `latest.jsonl` là symlink tới lần chạy mới nhất.
 
 ```bash
-bash scripts/tail_log.sh                    # theo dõi ô mới nhất
-bash scripts/tail_log.sh gemma3-g-brmf-n2   # ô cụ thể
-bash scripts/tail_log.sh --errors           # chỉ WARN/ERROR mọi ô
+tail -f outputs/gemma3-cnx256/logs/latest.log            # theo dõi
+grep -E "WARN|ERROR" outputs/*/logs/latest.log           # chỉ WARN/ERROR
 ```
 
 **Vì sao hai file.** Log text để người đọc, in mỗi `log_every_sec` (mặc định
@@ -1337,9 +1483,9 @@ không đảm bảo.
 | `kind` | Field chính |
 |---|---|
 | `environment` | torch, cuda, gpu, sm, transformers, peft, git_commit |
-| `config` | toàn bộ config đã giải quyết (khác YAML gốc sau preset/sweep) |
+| `config` | toàn bộ config đã giải quyết (khác YAML gốc sau preset) — ghi dưới khoá `arch` / `fixed` / `run` |
 | `stage0` | `ok`, `step2_sec`, `samples_per_sec`, `peak_vram_gb`, `epoch_hours`, `grad_router` |
-| `train_step` | `step`, `samples`, `epoch`, `loss`, `ce`, `sup`, `balance`, `bias_span`, `load_cv`, `sup_recall`, `sup_acc`, `sup_precision`, `sup_n_valid`, `grad_norm`, `lr`, `cycle`, `step_sec`, `vram_gb` |
+| `train_step` | `step`, `samples`, `epoch`, `loss`, `ce`, `sup`, `aux`, `balance`, `gate_max`, `gate_k`, `route_entropy`, `expert_share`, `logit_std_ratio`, `trunk_std_sample`, `sup_recall`, `sup_acc`, `sup_precision`, `sup_n_valid`, `grad_norm`, `lr`, `cycle`, `route_noise`, `step_sec`, `vram_gb` |
 | `eval` | `step`, `samples`, `epoch`, `val_loss`, `val_sup_recall`, `best_val` |
 | `checkpoint` | `tag`, `samples`, `epoch`, `epoch_samples`, `step`, `path` |
 | `epoch` | `epoch`, `samples`, `step` — hết tập train, vòng lại từ đầu |
@@ -1353,14 +1499,14 @@ không đảm bảo.
 
 `grad_router` trong `stage0` là con số cần nhìn đầu tiên: nó > 0 nghĩa là
 gradient của CE thật sự chảy ngược về Route head. Bằng 0 thì gate đã bị tách
-khỏi đồ thị — ô sweep vẫn chạy trơn tru và cho ra những con số vô nghĩa.
+khỏi đồ thị — lần chạy vẫn trơn tru và cho ra những con số vô nghĩa.
 
 Đọc lại để phân tích:
 
 ```python
 from src.report import load_events
-ev = load_events("outputs")                      # mọi ô
-ev = load_events("outputs", "gemma3-g-brmf-n2")  # một ô
+ev = load_events("outputs")                  # mọi lần chạy
+ev = load_events("outputs", "gemma3-cnx256")  # một lần chạy
 
 steps = ev[ev.kind == "train_step"]
 steps.plot(x="step", y="loss")                   # loss curve
@@ -1368,10 +1514,21 @@ steps.nlargest(5, "step_sec")                    # step chậm bất thường
 ev[ev.kind.isin(["warning", "error"])][["cell", "tag", "message"]]
 ```
 
-`collect.sh` sinh thêm `outputs/_summary/run_health.md` — bảng tóm tắt từ
-JSONL: step cuối, s/step trung bình, VRAM đỉnh, số warn/error, mã thoát của
-từng ô. **Nhìn bảng này trước khi đọc metrics**: một ô có BLEU cao nhưng 12 lỗi
-và dừng ở step 40 thì con số đó không nói lên điều gì.
+`python -m src.report` sinh thêm `outputs/_summary/run_health.md` — bảng tóm
+tắt từ JSONL: step cuối, s/step trung bình, VRAM đỉnh, số warn/error, mã thoát
+của từng lần chạy. **Nhìn bảng này trước khi đọc metrics**: một lần chạy có
+BLEU cao nhưng 12 lỗi và dừng ở step 40 thì con số đó không nói lên điều gì.
+
+Hai con số của nhánh router đáng theo dõi trong `train_step`, cả hai đều là
+**chẩn đoán kiến trúc** chứ không phải hiệu năng:
+
+| Con số | Nghĩa | Ngưỡng |
+|---|---|---|
+| `logit_std_ratio` | `std(route_logit theo MẪU) / std(theo EXPERT)` — "router có nhìn ảnh không" | < 0.1 kéo dài = router phát ra gần như cùng một vector cho mọi ảnh; mọi tinh chỉnh `σ`/`w_aux` đều vô nghĩa, phải sửa chỗ khác |
+| `trunk_std_sample` | độ lệch của vector 1024 chiều giữa các ảnh | ≈ 0 thì thủ phạm là backbone/trunk, không phải `route_head` — hai con số này tách được lỗi |
+
+Nhánh đọc hidden state của Gemma ngày trước đo được `logit_std_ratio ≤ 0.085`
+trên 143 ảnh thật, tức **không** phân biệt được ảnh. Đó là lý do nó bị thay.
 
 ---
 
@@ -1381,19 +1538,20 @@ và dừng ở step 40 thì con số đó không nói lên điều gì.
 RGExp_proj/
 ├── requirements.txt          # deps, KHÔNG gồm torch
 ├── .gitattributes            # ép .sh checkout dạng LF — CRLF là script chết trên Linux
-├── configs/default.yaml      # fixed / sweep / models / run / remote (§9)
+├── configs/default.yaml      # fixed / arch / models / run / remote (§9)
 ├── src/
-│   ├── router.py             # ★ nhánh router: Stem, block Recombinator g-brmf,
-│   │                         #   Separation, 2 head, BIAS cân bằng tải aux-free.
-│   │                         #   `python -m src.router` in bảng tham số
+│   ├── router.py             # ★ nhánh router: ConvNeXt-Tiny (đóng băng stem+3
+│   │                         #   stage) → proj 256 → downsample/flatten → MLP
+│   │                         #   → 2 head. `python -m src.router` in bảng tham
+│   │                         #   số + selftest kiến trúc (không cần GPU)
 │   ├── moe.py                # ★ trộn E expert QDoRA theo gate, cache dequantize,
 │   │                         #   đường tắt lúc infer, lưu/nạp expert
 │   ├── losses.py             # ★ gập nhãn 4 aspect -> trục nhị phân có mask
-│   │                         #   + ASL (Asymmetric Loss) §1.4, §1.6
+│   │                         #   + ASL §1.4/§1.6 + aux cân bằng tải §3.5
 │   ├── optim.py              # ★ lịch LR cosine warm restarts VÔ HẠN đếm bằng MẪU
-│   │                         #   + cộng trung bình trọng số (SWA) §1.8
-│   ├── config.py             # nạp YAML, dò GPU, giải quyết ô sweep, seq_len 2^k,
-│   │                         #   báo các khoá chết của bản hai phase + khối remote §9
+│   │                         #   (warmup ở đầu MỌI cycle) + SWA §1.8
+│   ├── config.py             # nạp YAML, dò GPU, giải quyết cấu hình, seq_len 2^k,
+│   │                         #   báo các khoá chết của các bản trước + remote §9
 │   ├── data.py               # tải HF Hub, split §1.1, rare-first (trọn tập train)
 │   ├── model.py              # nạp Gemma + expert, RouterBridge (hook), collate,
 │   │                         #   ce_loss §1.6
@@ -1401,28 +1559,22 @@ RGExp_proj/
 │   ├── metrics.py            # BLEU/ROUGE/BERTScore §1.5
 │   ├── train.py              # entrypoint: STAGE 0 → train (vô hạn) → infer
 │   ├── logging_utils.py      # log text + events JSONL §6
-│   └── report.py             # gom các ô → metrics table + param curve §5
+│   └── report.py             # gom các lần chạy → metrics table + param curve §5
 └── scripts/
-    ├── selftest.py           # ★ kiểm router + MoE + lịch LR + SWA + bias cân
-    │                         #   bằng tải, KHÔNG cần GPU
-    ├── _env.sh               # chọn môi trường: venv cục bộ hay python container (§9)
-    ├── setup.sh              # venv + torch theo CUDA + deps
-    ├── run_local.sh          # chạy 1 ô sweep
-    ├── sweep.sh              # chạy nhiều ô tuần tự, tự gom cuối
-    ├── collect.sh            # gom kết quả bất cứ lúc nào
-    ├── tail_log.sh           # theo dõi log run đang chạy
+    ├── selftest.py           # ★ kiểm router + MoE + ASL + aux + lịch LR + SWA,
+    │                         #   KHÔNG cần GPU, KHÔNG cần mạng
     ├── kaggle_t4x2.py        # ★ cell Kaggle DUY NHẤT: T4×2 (sm75, fp32).
     │                         #   Không có bản P100 — ảnh Kaggle build PyTorch
     │                         #   cho sm70+, P100 là sm60 nên fail ngay
-    ├── kaggle_probe.py       # cell Kaggle cho mode=probe (§3.7)
+    ├── kaggle_probe.py       # cell Kaggle cho mode=probe (§3.6)
     ├── probe_summary.py      # ★ gộp bản ghi probe trên Hub -> reports/probe/
-    │                         #   (HTML + md + csv). CPU, không cần torch (§3.8)
-    └── docker_bootstrap.sh   # §9 — một lệnh dựng cả máy thuê rồi chạy
+    │                         #   (HTML + md + csv). CPU, không cần torch (§3.7)
 ```
 
-Mọi script `.sh` đều `source scripts/_env.sh` ở đầu. Đó là chỗ duy nhất quyết
-định "đang chạy option 1 hay option 2", nên thêm script mới chỉ cần source nó
-là tự có cả hai chế độ.
+Chọn môi trường (option 1 cục bộ / option 2 container) do khối `remote:` trong
+`configs/default.yaml` và biến `RGEXP_REMOTE` quyết định — `src/config.py` đọc
+nó rất sớm để export `HF_HOME`/`TORCH_HOME` trước khi `huggingface_hub` kịp
+import (§9.3).
 
 ### Pipeline
 
@@ -1441,18 +1593,20 @@ binary_target_table    đọc class_names → gập 4 aspect về trục nhị p
       ↓
 rare_first_order       xếp mẫu hiếm lên đầu → thứ tự CỐ ĐỊNH, dùng lại mọi epoch
       ↓
-build_model            Gemma NF4 → 12 expert QDoRA → RouterNet → gắn hook decoder
+build_model            Gemma NF4 → 24 expert QDoRA → RouterNet → gắn hook decoder
       ↓
 resolve_seq_len        đo image token thật → max_seq_len = 2^k
       ↓
-STAGE 0                2 step thử: VRAM đỉnh, mẫu/s, Σ|grad| router,
-                       update_bias chạy được  ── dry_run dừng ở đây
+STAGE 0                2 step thử: VRAM đỉnh, mẫu/s, Σ|grad| router
+                       ── dry_run dừng ở đây
       ↓
 RESUME                 LUÔN: lấy bản đi xa nhất giữa ckpt cục bộ và Hub
       ↓
 ┌─ TRAIN (vô hạn) ───────────────────────────────────────────────────────┐
-│  grad_accum × [ forward router+expert+decoder → CE + 0.2·ASL ]        │
-│  → clip → set_samples(LR) → optimizer.step → router.update_bias()      │
+│  set_decay_samples(σ)                                                  │
+│  grad_accum × [ forward router+expert+decoder                          │
+│                 → CE + 0.5·ASL + 0.05·Aux ]                            │
+│  → clip chuẩn toàn cục → set_samples(LR) → optimizer.step()            │
 │  → biên cycle? chụp snapshot SWA                                       │
 │  → mỗi eval_every step: val, save_best, hỏi Hub, ckpt                  │
 │  → hết tập train? epoch += 1, đi lại từ đầu                            │
@@ -1467,7 +1621,7 @@ generate_records       sinh 1 lần (policy tắt) → 7-check chỉ để GHI L
       ↓
 run_metrics            chấm raw_output → metrics.json
       ↓
-src.report             gom mọi ô → metrics_table.md, param_curve.md, gen_text
+src.report             gom mọi lần chạy → metrics_table.md, param_curve.md
 
 (song song: mọi bước ghi vào outputs/<tag>/logs/run_*.log + events_*.jsonl)
 ```
@@ -1478,25 +1632,28 @@ src.report             gom mọi ô → metrics_table.md, param_curve.md, gen_te
 
 | File | Nội dung |
 |---|---|
-| `weights.pt` | `router.state_dict()` (**gồm cả `expert_bias`** — §3.6) + state dict của **cả 12 expert** (`get_peft_model_state_dict` mỗi adapter, ~191M — **không** phải `model.state_dict()` 4.3B) |
+| `weights.pt` | `router.state_dict()` + state dict của **cả 24 expert** (`get_peft_model_state_dict` mỗi adapter, ~382M — **không** phải `model.state_dict()` 4.3B). Từ khi bỏ cơ chế bias, router **không còn buffer trạng thái nào** ngoài trọng số, nên state_dict của nó là toàn bộ những gì phải bàn giao |
 | `optimizer.pt` | optimizer + RNG. **Không** có scheduler state: lịch LR là hàm thuần của số mẫu (§1.8), dựng lại từ `samples` là đủ và đúng trên mọi máy |
 | `swa.pt` | bộ cộng dồn SWA (§1.8): bản trung bình fp32 + số snapshot + mốc mẫu. Đi riêng vì nó là **trọng số**, không phải moment; và nó được ghi cả khi lưu lúc Ctrl-C (`with_optimizer=False` không ảnh hưởng nó) |
-| `train_state.json` | `samples`, `epoch`, `epoch_samples`, `step`, `best_val`, `n_train`, `seed`, `variant`, `n_block`, `n_expert`, `top_k`, `w_sup`, `asl_gamma_pos/neg`, `asl_clip`, `uncertain_soft`, `bias_gamma`, `route_noise`, `bias_gamma_start`, `route_noise_start`, `decay_warmup_steps`, `swa_n`, `swa_marks`, `cycle_samples` |
+| `train_state.json` | `samples`, `epoch`, `epoch_samples`, `step`, `best_val`, `n_train`, `seed`, `arch`, `n_expert`, `top_k`, `router_backbone`, `router_img_size`, `router_frozen_upto`, `w_sup`, `w_aux`, `asl_gamma_pos/neg`, `asl_clip`, `uncertain_soft`, `route_noise`, `route_noise_start`, `decay_warmup_samples`, `warmup_samples`, `swa_n`, `swa_marks`, `cycle_samples` |
 
 **Resume là mặc định, không phải một tuỳ chọn.** Không còn khoá `run.resume`.
 Mỗi lần chạy, script đọc `train_state.json` ở cả hai chỗ — `ckpt/<tag>/last/`
 cục bộ và `last/` trên Hub — rồi lấy bản có `samples` LỚN HƠN. Bản cục bộ
 không mặc nhiên thắng: máy này có thể vừa bật lại sau khi một máy khác đã chạy
-thêm vài nghìn mẫu và push. Muốn train lại từ số 0 thì **xoá thư mục ckpt của
-ô đó** — cố ý làm cho việc đó phải là một hành động rõ ràng.
+thêm vài nghìn mẫu và push. Muốn train lại từ số 0 thì **xoá thư mục ckpt** —
+cố ý làm cho việc đó phải là một hành động rõ ràng.
 
-Bốn assert chặn cứng khi nạp (`check_compat`):
+Các kiểm tra chặn cứng khi nạp (`check_compat`):
 
 | Kiểm | Vì sao |
 |---|---|
 | `n_train`, `seed` | thứ tự rare-first phụ thuộc cả hai; lệch thì `epoch_samples` trỏ vào một mẫu khác |
-| `variant`, `n_block` | router của ô khác có shape khác — nạp vào là nổ, hoặc tệ hơn là nạp được một phần |
-| `n_expert`, `top_k` | `route_head` và số bản expert đều đổi shape. Đổi hai số này = một ô sweep MỚI, phải dùng `ckpt_dir`/`hub_repo` khác |
+| có khoá `arch` | thiếu nó = checkpoint của **kiến trúc router CŨ** (DenseNet-CXR + MQA + Separation). Shape đổi hoàn toàn, không nạp được — báo rõ thay vì để `load_state_dict` nổ một thông điệp không đọc ra được gì |
+| `arch` khớp | model nền khác thì router và số bản expert đều khác shape |
+| `router_img_size`, `router_frozen_upto` | hình học của router đổi → trọng số không khớp shape |
+| `n_expert`, `top_k` | `route_head` và số bản expert đều đổi shape. Đổi hai số này = một lần chạy MỚI, phải dùng `ckpt_dir`/`hub_repo` khác |
+| `w_aux` (chỉ **cảnh báo**) | shape vẫn khớp nên nạp trơn tru — nhưng phân bố tải đã học dưới một áp lực cân bằng khác, và đó là chỗ dễ đọc sai kết quả nhất |
 
 **Đồng bộ nhiều máy (`hub_sync: true`).** Trước mỗi lần val, đọc
 `last/train_state.json` trên Hub (vài KB) và so `samples`:
@@ -1556,15 +1713,15 @@ outputs/<tag>/
 │                     raw_guard_passed, guard_passed, attempts, fail_reasons,
 │                     final_temperature, final_repetition_penalty
 ├── metrics.json      raw / meta (+ post_policy khi bật policy);
-│                     meta có expert_share — router dùng đủ 12 expert hay không
+│                     meta có expert_share — router dùng đủ 24 expert hay không
 └── splits/           train|val|test_split.csv + split_meta.json
 ```
 
-Riêng `reports/probe/` (§3.8) nằm NGOÀI `outputs/` và không bị `.gitignore`:
+Riêng `reports/probe/` (§3.7) nằm NGOÀI `outputs/` và không bị `.gitignore`:
 nó chỉ chứa số liệu đã gộp, không có text báo cáo hay `key_id`, nên commit
 được cùng repo.
 
-So sánh giữa các ô: xem §5.
+So sánh giữa các lần chạy: xem §5.
 
 ---
 
@@ -1574,24 +1731,29 @@ So sánh giữa các ô: xem §5.
 |---|---|---|
 | `torch.cuda.is_available()` = False | bản torch sai CUDA | `rm -rf .venv && bash scripts/setup.sh` |
 | `sm75 không hỗ trợ bf16` | GPU T4 | dự án này cần Ampere trở lên |
-| OOM ở STAGE 0 | batch quá lớn | `--set run.train_bs=1 --set run.grad_accum=32` (grad_ckpt đã bật sẵn), rồi hạ `fixed.n_expert`. Hạ `top_k` KHÔNG cứu được — xem §3.4 |
+| OOM ở STAGE 0 | batch quá lớn | `--set run.train_bs=1 --set run.grad_accum=32` (grad_ckpt đã bật sẵn), rồi hạ `fixed.n_expert`. Hạ `top_k` KHÔNG cứu được — xem §3.3 |
 | OOM khi khởi tạo expert QDoRA | DoRA dequantize base weight, lặp lại cho MỖI expert | nâng `peft` (cần `LoraRuntimeConfig` → `ephemeral_gpu_offload`), hoặc hạ `fixed.n_expert` |
 | `router không nhận gradient` ở STAGE 0 | gate bị tách khỏi đồ thị | kiểm `RouterBridge` + `moe.CTX`; đừng chạy tiếp, số sẽ vô nghĩa |
 | `hook router không chạy trong forward` | `find_text_decoder` trỏ sai module | xem dòng log `router: hook đặt tại ...`; bản transformers lạ thì sửa `RouterBridge._hook` |
 | `layer không có lora_magnitude_vector` | `use_dora` bị tắt | project cố định QDoRA — không đổi `fixed.use_dora` |
 | `gate có batch N nhưng activation có M` | beam search | `num_beams` phải = 1 |
-| `ckpt của ô X, đang chạy Y` | resume nhầm ô | mỗi ô một `ckpt_dir` riêng; xoá `ckpt/<tag>/last` nếu muốn train lại từ đầu |
-| `ckpt là NE top-K, đang chạy ...` | đổi `n_expert`/`top_k` trên ckpt cũ | đó là một ô sweep MỚI: đặt `hub_repo`/`ckpt_dir` khác, đừng nạp đè |
-| `⚠ config: bỏ qua run.phase1_samples` (và tương tự) | config còn khoá của bản hai phase | vô hại, script bỏ qua. Xoá khoá đó khỏi YAML cho sạch |
-| `balance` đứng ở 3-4, `bias_span` phình mãi | `fixed.bias_gamma` quá nhỏ | nâng lên 3e-3 hoặc 5e-3 và xem log vài trăm step (§3.6) |
-| `balance` vọt lên 3-4 NGAY SAU khi hết warmup | `decay_warmup_steps` quá ngắn — expert chưa kịp phân hoá đã bị thả | nâng `fixed.decay_warmup_steps` lên 2000-3000 (§3.5b) |
-| `expert_share` gần như one-hot từ vài chục step đầu | lịch decay bị tắt (`*_start: null` hoặc `decay_warmup_steps: 0`) | kiểm dòng log `cfg: lịch decay router: ...` ở đầu phiên (§3.5b) |
+| `ckpt không có khoá arch` | ckpt của **kiến trúc router CŨ** (DenseNet + MQA + Separation) | shape router đổi hoàn toàn, không nạp được: dùng `ckpt_dir`/`hub_repo` khác, hoặc xoá thư mục ckpt |
+| `ckpt của X, đang chạy Y` | resume nhầm | mỗi lần chạy một `ckpt_dir` riêng; xoá `ckpt/<tag>/last` nếu muốn train lại từ đầu |
+| `ckpt là NE top-K, đang chạy ...` | đổi `n_expert`/`top_k` trên ckpt cũ | đó là một lần chạy MỚI: đặt `hub_repo`/`ckpt_dir` khác, đừng nạp đè |
+| `ckpt train với router_img_size=X` | đổi hình học router | `router_img_size` bị buộc vào `D_MODEL` (§3.2) — trọng số không khớp shape |
+| `⚠ config: bỏ qua fixed.bias_gamma` (và `bias_clip`, `capacity_factor`, `n_shared`, `shared_weight`, `decay_warmup_steps`, `variant`, `n_block`, `phase1_samples`…) | config còn khoá của các bản trước | vô hại, script bỏ qua và **in ra từng khoá**. Xoá khỏi YAML cho sạch |
+| `balance` đứng ở 3-4 và không xuống | `run.w_aux` quá nhỏ so với áp lực của CE | nâng lên `0.1` và xem log vài trăm step (§3.5) |
+| `balance` = 1.0 nhưng `expert_share` gần one-hot | **không phải lỗi** — khi `P` còn gần đều thì `L_aux` = 1.0 bất kể tải lệch (§1.6) | ở giai đoạn đầu đọc `expert_share` trong event log, đừng đọc `balance` |
+| `expert_share` gần như one-hot và không mở ra | σ đã tắt (`route_noise: 0`) — mất cơ chế khám phá duy nhất | kiểm dòng log `cfg: Gumbel: ...` ở đầu phiên; đặt `fixed.route_noise` ≥ 0.3 (§3.4) |
+| `logit_std_ratio` < 0.1 kéo dài | router không phân biệt được ảnh — **lỗi kiến trúc, không phải tham số** | đọc kèm `trunk_std_sample`: nó cũng ≈0 thì thủ phạm là backbone/trunk. Kiểm `router_backbone` có phải `null` không (§6) |
 | Train không bao giờ tự dừng | đúng thiết kế (§1.7) | Ctrl-C để dừng và lưu ckpt; chấm điểm bằng phiên `--mode test` riêng |
 | `không suy được aspect 'uncertain' từ class_names=...` | tên aspect trong `labels.npz` không khớp bảng từ khoá | sửa `_ROLE_WORDS` trong `src/losses.py` cho khớp bộ nhãn — ĐỪNG đoán thứ tự, gán nhầm uncertain thành negative là lỗi im lặng |
 | `sup_recall` đứng ở 0 nhưng `sup_acc` cao | model đoán "âm" cho mọi ô | bình thường ở vài trăm step đầu; kéo dài thì hạ `asl_gamma_neg` hoặc nâng `w_sup` |
 | `gnorm` bám sát 1.0 ở mọi step | gradient thật lớn hơn trần | bình thường lúc đầu (router train từ số 0). Vẫn thế sau vài nghìn step thì hạ `lr_router` chứ đừng nâng `max_grad_norm` |
 | `gnorm` nhảy lên 1e3+ rồi loss = NaN | tràn số, không phải chuyện cắt gradient | fp16 trên sm75 tràn ở activation Gemma 3 — dùng `compute_dtype: float32` |
-| ckpt cũ: `size mismatch for sup_head.fc2.weight` | ckpt của bản Focal (head 14×4 = 56 chiều) | head giờ là 14 chiều — không nạp đè được, dùng `ckpt_dir`/`hub_repo` mới |
+| ckpt cũ: `size mismatch` / `Missing key(s) backbone.features...` | ckpt của bản DenseNet-CXR + MQA | kiến trúc router đổi hoàn toàn — không nạp đè được, dùng `ckpt_dir`/`hub_repo` mới |
+| `No module named 'torchvision'` | setup chỉ cài torch | backbone router là `torchvision.models.convnext_tiny` — cài cặp torch+torchvision cùng bản CUDA |
+| Lần chạy đầu treo ở `backbone: torchvision convnext_tiny` | đang tải ~110MB trọng số ImageNet | cần mạng ở lần đầu; sau đó đọc cache `TORCH_HOME`. Máy không có mạng: tải trước rồi copy cache vào |
 | `peft` báo `Target module ... not supported` | `peft` quá cũ | `pip install -U 'peft>=0.14'` |
 | `401 gated repo` | token chưa được cấp quyền gemma-3 | xin quyền tại trang model trên HF |
 | `Không thấy ảnh mẫu` | lớp thư mục trong zip khác dự kiến | đặt `--set run.data.image_subdir=<tên>` |
@@ -1599,12 +1761,12 @@ So sánh giữa các ô: xem §5.
 | Loss ≈ 12.4 (= ln 262k) | mask label sai | kiểm tra `label_token` in ở STAGE 0 |
 | VRAM đỉnh < 60% | preset thận trọng | làm theo lệnh STAGE 0 gợi ý |
 | Guard pass rate rất thấp | model chưa học format | bình thường ở đầu train; theo dõi `n_guard_passed_raw` tăng dần |
-| `collect.sh` báo không thấy ô nào | các ô chưa chấm bao giờ | `metrics.json` chỉ sinh ra ở `--mode test`/`probe` (hoặc `both` sau khi Ctrl-C); train thuần không sinh nó |
-| `gen_text: không có ảnh chung` | các ô dùng `n_test_samples` khác nhau | đặt cùng một `run.n_test_samples` cho cả sweep |
-| **Máy thuê** — `Chưa có venv` | `_env.sh` tưởng đang chạy cục bộ | `RGEXP_REMOTE=1 bash scripts/...` (§9.2) |
+| `src.report` báo không thấy lần chạy nào | chưa chấm bao giờ | `metrics.json` chỉ sinh ra ở `--mode test`/`probe` (hoặc `both` sau khi Ctrl-C); train thuần không sinh nó |
+| `gen_text: không có ảnh chung` | các lần chạy dùng `n_test_samples` khác nhau | đặt cùng một `run.n_test_samples` |
+| **Máy thuê** — cache/outputs không vào volume | không dò được là đang ở container | `RGEXP_REMOTE=1 python -m src.train ...` (§9.1) |
 | **Máy thuê** — setup tải lại torch 2.5GB | venv mới cô lập mất torch của image | đặt `remote.use_venv: false`, xoá `.venv` |
 | **Máy thuê** — Restart xong mất hết model đã tải | cache nằm ở lớp ghi container | `HF_HOME` phải trỏ vào volume (§9.3) |
-| **Máy thuê** — sweep chết khi đóng laptop | chạy ngoài tmux, ssh đứt → SIGHUP | `tmux new -s sweep` rồi chạy lại (§9.2) |
+| **Máy thuê** — train chết khi đóng laptop | chạy ngoài tmux, ssh đứt → SIGHUP | `tmux new -s train` rồi chạy lại (§9.2) |
 | **Máy thuê** — hết dung lượng khi giải nén ảnh | volume 100GB nhưng cache ở `/root` | trỏ `remote.image_cache` vào volume |
 | `or_mask_function ... require torch>=2.6` | transformers ≥4.53 + torch 2.5.x của image | `pip install "transformers>=4.50,<4.53"` (setup.sh bước 5b tự làm), hoặc nâng torch lên 2.6 |
 | `sm_120 is not compatible with the current PyTorch installation` | GPU Blackwell (5090) + torch cu121 | `pip install -U torch torchvision --index-url .../cu128` + `bitsandbytes>=0.46` (setup.sh bước 4 tự làm) |
@@ -1618,18 +1780,19 @@ So sánh giữa các ô: xem §5.
 **Khi có lỗi, đọc theo thứ tự này:**
 
 ```bash
-bash scripts/tail_log.sh --errors            # 1. có WARN/ERROR nào không
-tail -50 outputs/<tag>/logs/latest.log       # 2. traceback đầy đủ
+grep -E "WARN|ERROR" outputs/*/logs/latest.log   # 1. có WARN/ERROR nào không
+tail -50 outputs/<tag>/logs/latest.log           # 2. traceback đầy đủ
 python -c "from src.report import load_events; \
   e = load_events('outputs'); print(e[e.kind=='error'].to_string())"   # 3. có cấu trúc
-tail -30 logs/console_*.log | tail -30       # 4. lỗi trước khi logger mở
+tail -30 logs/console_*.log                      # 4. lỗi trước khi logger mở
 ```
 
 Bước 4 chỉ cần khi `outputs/<tag>/logs/` trống — nghĩa là chết trước cả lúc
 `L.setup()` chạy, thường là lỗi import hoặc CUDA không khởi tạo được.
 
-Ở option 2, thay `outputs/` bằng `remote.out_dir` (mặc định `/workspace/outputs`).
-`tail_log.sh` và `collect.sh` tự trỏ đúng chỗ.
+Ở option 2, thay `outputs/` bằng `remote.out_dir` (mặc định
+`/workspace/outputs`) — `src/config.py` tự dời `out_dir`/`ckpt_dir` sang đó khi
+`remote` bật, nên `python -m src.report` cũng đọc đúng chỗ.
 
 ---
 
@@ -1669,7 +1832,7 @@ python -m src.config        # dòng "Remote :" ở cuối
 ```
 
 Bật hay tắt **không đổi một tham số training nào** — chỉ đổi chỗ để file và
-cách chạy python. Ô `gemma3-g-brmf-n2` chạy trên máy thuê so sánh trực tiếp
+cách chạy python. Lần chạy `gemma3-cnx256` trên máy thuê so sánh trực tiếp
 được với ô cùng tên chạy ở nhà.
 
 ### 9.2. Kết nối và giữ phiên
@@ -1693,14 +1856,15 @@ dùng để in gợi ý lệnh `rsync`, không có thì in `<HOST>`.
 Vào máy rồi, **luôn chạy trong tmux**:
 
 ```bash
-tmux new -s sweep                    # tạo phiên
-bash scripts/run_local.sh --mode train --no-dry-run   # chạy trong đó
+tmux new -s train                    # tạo phiên
+python -m src.train --mode train --no-dry-run   # chạy trong đó
 # Ctrl-b rồi d  -> thoát ra, tiến trình vẫn chạy
-tmux attach -t sweep                 # ssh vào lại, xem tiếp
+tmux attach -t train                 # ssh vào lại, xem tiếp
 ```
 
-`run_local.sh` cảnh báo và chờ 5 giây nếu phát hiện đang chạy ngoài tmux trên
-máy thuê. Bỏ qua bằng `RGEXP_NO_TMUX_WARN=1` (dùng khi gọi từ script khác).
+Không có gì tự cảnh báo nếu bạn chạy ngoài tmux trên máy thuê — ssh đứt là
+SIGHUP và mất luôn số giờ GPU đã trả tiền. Đây là lỗi đắt nhất trong danh sách
+này.
 
 Ba port trong dashboard: **Jupyter** (8888) tiện xem ảnh và loss curve;
 **File Browser** (5335) tải file lẻ về mà không cần scp; **PORT-8999** để trống
@@ -1730,9 +1894,11 @@ remote:
 ```
 
 `HF_HOME` phải được export **trước khi python khởi động**: `huggingface_hub` đọc
-biến này đúng một lần lúc import, đặt muộn hơn là vô tác dụng. `scripts/_env.sh`
-export sẵn; `src/config.py::bootstrap_remote_env` là lớp dự phòng cho ai chạy
-thẳng `python -m src.train`.
+biến này đúng một lần lúc import, đặt muộn hơn là vô tác dụng.
+`src/config.py::bootstrap_remote_env` chạy **ở tầng module** — nó export
+`HF_HOME` và `TORCH_HOME` trước khi bất kỳ import nào của `src` kịp kéo
+`huggingface_hub` vào. `TORCH_HOME` từ đợt này cũng quan trọng như `HF_HOME`:
+trọng số ConvNeXt-Tiny (~110MB) nằm ở đó.
 
 Volume tên khác (`/data`, `/mnt/vol`...) thì sửa đúng một chỗ: `remote.volume`
 và các đường dẫn con. Đặt tay bằng `--set` thì **`--set` thắng** — remote không
@@ -1740,13 +1906,13 @@ giành lại.
 
 Ước lượng dung lượng: model gemma-3-4b ~9GB, `img_dir.zip` + ảnh giải nén vài
 chục GB, checkpoint mỗi ô ~31M (chỉ adapter, không phải cả model). 100GB đủ
-cho cả sweep nếu cache nằm đúng chỗ.
+cho mọi lần chạy nếu cache nằm đúng chỗ.
 
 ### 9.4. Chọn đúng loại GPU
 
-Hai cửa phải qua, kiểm ngay ở `docker_bootstrap.sh` bước 1 và `setup.sh` bước 8:
+Hai cửa phải qua, `python -m src.config` kiểm cả hai trước khi tải gì:
 
-**Cửa 1 — bf16.** Dự án khoá `compute_dtype: bfloat16` (§4.1.3). GPU không có
+**Cửa 1 — bf16.** Dự án khoá `compute_dtype: bfloat16` (§4). GPU không có
 bf16 thì dừng ngay, không có nhánh fp16.
 
 | GPU | sm | bf16 | torch tối thiểu |
@@ -1778,19 +1944,23 @@ số 2.5GB làm chuẩn.
 
 | VRAM | Ví dụ | Chạy được gì |
 |---|---|---|
-| ≥38GB | A100, L40S | batch 4×8, cả ô `g-brmf-n4` nặng nhất |
+| ≥38GB | A100, L40S | batch 4×8, thoải mái cho 24 expert |
 | 22–24GB | 3090, 4090 | batch 2×16 |
 | 12–16GB | L4, 4080, **4070 Ti Super** | batch 1×32, chạy được nhưng chậm |
-| ≤8GB | RTX 3070, 3060Ti | không đủ — hạ `fixed.n_expert` xuống 2 thì mất luôn ý nghĩa của sweep |
+| ≤8GB | RTX 3070, 3060Ti | không đủ — hạ `fixed.n_expert` xuống 2 thì mất luôn ý nghĩa của MoE |
 
-Chênh lệch VRAM giữa các ô sweep là **nhỏ**: cả bảng chỉ dao động 67M → 70M
-tham số trainable, trong khi phần chiếm chỗ chính (base 4-bit + activation của
-decoder + E bản delta) không đổi. Ô nào chạy được thì gần như cả bảng chạy
-được.
+Router là **hằng số** 25.0M trainable ở mọi cấu hình, nên biến duy nhất còn
+đổi chỗ chiếm là `n_expert` — và nó đổi *nhiều*: mỗi expert ≈15.9M tham số
+trainable cộng một bản delta phải giữ cùng lúc lúc backward. Hạ `n_expert` là
+cách cứu OOM duy nhất có tác dụng; hạ `top_k` **không** (§3.3).
+
+Chi phí MỚI cần tính vào: router chạy ConvNeXt-Tiny ở **512²** (~23
+GFLOPs/ảnh) thay cho DenseNet-121 ở 224² (~1.4 GFLOPs). Trên GPU nó vẫn nhỏ so
+với decoder + 24 bản delta QDoRA, nhưng nó không còn miễn phí.
 
 ```bash
-bash scripts/run_local.sh --n-block 1 --dry-run   # ô nhẹ nhất
-bash scripts/run_local.sh --n-block 4 --dry-run   # ô nặng nhất
+python -m src.train --dry-run                            # cấu hình mặc định
+python -m src.train --dry-run --set fixed.n_expert=12     # nhẹ hơn một nửa
 ```
 
 ### 9.5. Kéo kết quả về TRƯỚC KHI xoá instance
@@ -1815,18 +1985,18 @@ Gom bảng so sánh ngay trên máy thuê trước khi kéo về cũng được 
 so với kéo cả `outputs/`:
 
 ```bash
-bash scripts/collect.sh              # sinh outputs/_summary/ (§5)
+python -m src.report                 # sinh outputs/_summary/ (§5)
 ```
 
 ### 9.6. Tiết kiệm tiền
 
-- Chạy `--dry-run` trước mọi ô mới. STAGE 0 mất 5 phút; OOM ở giờ thứ 3 mất 3 giờ.
-- `SWEEP_CELLS="g-brmf:1 g-brmf:3"` để chỉ chạy các ô cần, thay vì cả 4 ô.
-- `sweep.sh` **bỏ qua ô đã có `metrics.json`** — xoá instance rồi thuê lại, chỉ
-  cần rsync `outputs/` lên máy mới là nó đi tiếp từ ô còn thiếu.
-- Checkpoint trên Hub: một ô đang train dở nối lại được trên máy khác mà
-  không cần cấu hình gì — resume là mặc định (§7), miễn `n_train`, `seed`,
-  `n_expert`, `top_k` và `n_block` không đổi.
+- Chạy `--dry-run` trước mỗi cấu hình mới. STAGE 0 mất 5 phút; OOM ở giờ thứ 3
+  mất 3 giờ.
+- Lần chạy đầu trên một máy mới cần mạng để tải ConvNeXt-Tiny (~110MB) —
+  trỏ `TORCH_HOME` vào volume (§9.3) thì Restart không phải tải lại.
+- Checkpoint trên Hub: một lần chạy đang train dở nối lại được trên máy khác
+  mà không cần cấu hình gì — resume là mặc định (§7), miễn `n_train`, `seed`,
+  `n_expert`, `top_k` và hình học router không đổi.
 - Lịch train không có đích: máy thuê chỉ cần chạy đúng số giờ bạn muốn trả rồi
   Ctrl-C (nó lưu ckpt + swa.pt rồi mới thoát), không phải chờ tới một mốc nào.
 - Xong việc thì **Xoá**, đừng chỉ đóng ssh — máy vẫn tính tiền theo giờ.

@@ -1,15 +1,25 @@
-"""Phần supervised của loss (§1.4, §1.6) — ASL trên 14 finding.
+"""Hai số hạng ngoài CE của Total_Loss — ASL (supervised) và Aux (cân bằng tải).
 
 Lịch train chỉ còn MỘT phase multi-task:
 
-    L = CE + w_sup · ASL(sup)          (w_sup = 0.2)
+    L = CE + w_sup·ASL(sup) + w_aux·Aux(route)      (w_sup = 0.5, w_aux = 0.05)
 
 CE nằm ở src/model.py (dính chặt với chuyện cắt logits của decoder). File này
-giữ phần supervised: chuyển nhãn 4-aspect của CheXbert thành MỘT trục nhị
-phân có mask, rồi tính Asymmetric Loss trên đó.
+giữ hai phần còn lại:
 
-KHÔNG còn số hạng Aux: cân bằng tải giữa các expert do bias của router lo,
-cập nhật bằng quy tắc ngoài đồ thị autograd (src/router.py::update_bias).
+  * `asl_loss` — nhánh supervised: gập nhãn 4-aspect của CheXbert thành MỘT
+    trục nhị phân có mask, rồi tính Asymmetric Loss trên đó.
+  * `aux_loss` — cân bằng tải giữa E expert, công thức Switch-Transformer.
+    Nó được GỌI TỪ `RouterNet.forward` (chỗ duy nhất có cả `prob` lẫn `topi`)
+    và trả về qua `stats["aux_loss"]`; train.py chỉ nhân hệ số rồi cộng vào.
+
+SỐ HẠNG AUX QUAY LẠI, VÀ NÓ THAY HẲN CƠ CHẾ BIAS. Bản trước cân bằng tải
+"aux-free" kiểu DeepSeek-V3: một bias b_e cộng vào điểm chọn top-k, cập nhật
+bằng quy tắc sign ngoài đồ thị autograd, kèm trần tải mỗi micro-batch và 2
+expert hứng để đổ phần tràn. Ba cơ chế cùng nắn một đại lượng; khi tải vẫn
+lệch thì không có cách nào đọc ra cái nào đang thắng, và bias còn làm `chosen`
+lúc probe lệch khỏi `prob` mà không ai giải thích được. Đợt này quay về đúng
+MỘT số hạng trong loss — xem `aux_loss`.
 
 ──────────────────────────────────────────────────────────────────────────────
 VÌ SAO ĐỔI TỪ FOCAL 4 LỚP SANG ASL NHỊ PHÂN
@@ -206,6 +216,56 @@ def asl_loss(logits, target, mask, gamma_pos=ASL_GAMMA_POS,
 
     loss = -(loss * m)
     return loss.sum() / m.sum().clamp_min(1.0)
+
+
+# ══════════════════ Aux: cân bằng tải giữa E expert (Switch) ═════════════════
+def aux_loss(prob, topi, n_expert):
+    """Load-balancing loss kiểu Switch-Transformer / GShard.
+
+        L_aux = E · Σ_e f_e · P_e
+
+        prob  [B, E]  softmax ĐẦY ĐỦ của route_logit — CÓ gradient
+        topi  [B, k]  chỉ số top-k thật sự được chọn (sau nhiễu Gumbel)
+        f_e           tỉ lệ cặp (mẫu, expert) chọn e = count_e / (B·k)
+        P_e           mean_batch prob[:, e]
+
+    Σf = ΣP = 1, nên theo Cauchy-Schwarz L_aux ≥ 1, và L_aux = 1 KHI VÀ CHỈ
+    KHI cả hai vector đều đều (1/E). Dồn hết vào một expert cho L_aux → E.
+
+    Ba điều cần biết để đọc đúng số này:
+
+    1. **Gradient chỉ chảy qua P_e.** `f_e` là phép ĐẾM trên `topi` — hàm bậc
+       thang, đạo hàm 0 gần như mọi nơi, và `topi` còn đến từ một phép top-k
+       có nhiễu. Nó được `detach` hẳn và đóng vai TRỌNG SỐ: expert đang bị
+       chọn nhiều thì hệ số trước P_e của nó lớn, nên softmax bị đẩy xuống ở
+       đúng cột đó. Đây là toàn bộ cơ chế — không có cái núm nào cộng vào
+       điểm chọn nữa.
+
+    2. **Sàn 1.0 là một hằng số cộng vào Total_Loss.** Với w_aux = 0.05 thì
+       ngay cả lúc cân bằng hoàn hảo, loss vẫn dày thêm ≈ 0.05. Đừng đọc nó
+       như "loss chưa hội tụ"; đọc `balance` trong log (= chính L_aux) và so
+       với 1.0.
+
+    3. **Đếm theo MẪU, không theo token.** Bản gốc Switch tính trên token vì
+       ở đó mỗi token được định tuyến riêng. Ở đây MỘT ẢNH có MỘT gate dùng
+       cho cả chuỗi (§src/moe.py), nên đơn vị tải đúng là mẫu — B·k cặp cho
+       một micro-batch. Hệ quả thực tế: với train_bs = 8 và k = 6 thì một
+       micro-batch chỉ có 48 cặp cho 24 expert, tức `f_e` rất thô. Đó là lý
+       do w_aux nhỏ (0.05): số hạng này phải nắn XU HƯỚNG qua nhiều step,
+       không phải sửa từng batch.
+
+    Trả về tensor 0 chiều (không nhân hệ số) — chỗ gọi nhân `run.w_aux`.
+    """
+    if prob.dim() != 2:
+        raise ValueError(f"prob phải là [B, E], nhận {tuple(prob.shape)}")
+    E = int(n_expert)
+    with torch.no_grad():
+        f = torch.zeros(E, device=prob.device, dtype=prob.dtype)
+        flat = topi.reshape(-1)
+        f.scatter_add_(0, flat, torch.ones_like(flat, dtype=f.dtype))
+        f = f / f.sum().clamp_min(1)
+    P = prob.mean(dim=0)
+    return E * torch.sum(f * P)
 
 
 @torch.no_grad()

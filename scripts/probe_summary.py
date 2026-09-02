@@ -205,8 +205,14 @@ def resolve_repo(cli_repo, config_path):
         return run["probe_repo"]
     hub = run.get("hub_repo")
     if not hub:
-        sw = cfg.get("sweep") or {}
-        tag = f"{sw.get('model')}-{sw.get('variant')}-n{sw.get('n_block')}"
+        # Khối `sweep:` cũ (model + variant + n_block) đổi tên thành `arch:`
+        # và chỉ còn `model` — đọc cả hai để bản ghi của các đợt trước vẫn
+        # suy ra được tên repo.
+        sw = cfg.get("arch") or cfg.get("sweep") or {}
+        if sw.get("variant"):
+            tag = f"{sw.get('model')}-{sw['variant']}-n{sw.get('n_block')}"
+        else:
+            tag = f"{sw.get('model')}-cnx256"
         hub = f"RGExp123/mimic-cxr-{tag}"
     return f"{hub}-probe"
 
@@ -352,9 +358,14 @@ def aggregate(recs):
         if r.get("disease_labels") and r["disease_labels"] != dis_names:
             n_lab_mismatch += 1
             continue
-        for key in ("model", "sweep_cell", "weights"):
+        # `run_tag` là tên mới của `sweep_cell` (không còn sweep). Đọc cả
+        # hai để trộn được bản ghi của đợt cũ với đợt mới.
+        for key in ("model", "weights"):
             if r.get(key):
                 meta[key].add(str(r[key]))
+        _tag = r.get("run_tag") or r.get("sweep_cell")
+        if _tag:
+            meta["run_tag"].add(str(_tag))
         if r.get("train_samples") is not None:
             samples.append(int(r["train_samples"]))
         router = r.get("router") or {}
@@ -756,7 +767,9 @@ def verdict(a):
             f"Hồ sơ của {P} expert gần như trùng nhau (cosine lệch trung bình "
             f"{ci:.2f} trên {len(a['global_cols'])} nhãn). Top-{K} đang lấy về "
             f"{K} bản sao mờ của cùng một hàm — phần lớn tham số expert là "
-            f"thừa. Đáng thử: tăng hệ số separation loss, hoặc giảm n_expert.")
+            f"thừa. Đáng thử: giảm n_expert, nâng w_aux (ép router trải tải "
+            f"rộng hơn nên mỗi expert thấy dữ liệu khác nhau hơn), hoặc giữ "
+            f"σ Gumbel cao lâu hơn.")
     elif ci > 0.30:
         lvl, msg = "vừa", (
             f"Các expert phân hoá MỘT PHẦN (cosine lệch trung bình {ci:.2f} "
@@ -1061,7 +1074,7 @@ def dump_md(a, out, source):
     L += ["## Ảnh chụp này là của lúc nào", "",
           md_table(["trường", "giá trị"], [
               ["model", ", ".join(meta.get("model", [])) or "—"],
-              ["ô sweep", ", ".join(meta.get("sweep_cell", [])) or "—"],
+              ["lần chạy", ", ".join(meta.get("run_tag", [])) or "—"],
               ["trọng số", ", ".join(meta.get("weights", [])) or "—"],
               ["n_expert × top_k", f"{E} × {K}"],
               ["bản ghi `full` (đủ {} expert)".format(E), f"{a['n_full']:,}"],
@@ -1327,7 +1340,7 @@ def dump_html(a, out, source):
     P.append("<h1>Probe chuyên môn expert</h1>")
     P.append(f"<p class=sub>{a['n_records']:,} ảnh · {a['n_full']:,} bản ghi đủ "
              f"{E} expert · {NP}/{E} expert có hồ sơ · top-{K} · "
-             f"{esc(', '.join(meta.get('sweep_cell', [])) or 'ô sweep không rõ')} · "
+             f"{esc(', '.join(meta.get('run_tag', [])) or 'lần chạy không rõ')} · "
              f"sinh lúc {ts}</p>")
     P.append(f"<p class=sub>Nguồn: <code>{esc(source)}</code> · "
              f"trọng số: {esc(', '.join(meta.get('weights', [])) or '—')}"

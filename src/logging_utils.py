@@ -181,7 +181,7 @@ def snapshot_config(cfg):
                                                 list, dict)) else v
                 for k, v in vars(ns).items()}
     event("config",
-          sweep=dump(cfg.sweep), fixed=dump(cfg.fixed), run=dump(cfg.run),
+          arch=dump(cfg.arch), fixed=dump(cfg.fixed), run=dump(cfg.run),
           preset=cfg.preset, hw=dump(cfg.hw))
 
 

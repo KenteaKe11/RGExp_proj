@@ -3,15 +3,19 @@
 Đường đi của MỘT batch (khớp sơ đồ "Thiết kế chung"):
 
     ảnh + prompt ──► [embed_tokens ⊕ vision_tower ⊕ projector] ──► [N, 2560]
-                                    │                                  │
-                                    │                            RouterBridge
-                                    │                    (Stem→Recombinator→…)
+          │                         │                                  │
+          │  pixel_values     RouterBridge hook                        │
+          └──────────────►  (ConvNeXt → 256 → downsample → 2 head)     │
                                     │                                  │
                                     │                       gate [B, E] ──┐
                                     ▼                                     │
                             Gemma decoder ◄── expert QDoRA trộn theo gate ─┘
                                     │
-                        CE + w_sup·ASL (một phase multi-task)
+                    CE + w_sup·ASL + w_aux·Aux (một phase multi-task)
+
+Router đọc THẲNG `pixel_values` — không đi qua hidden state của Gemma. Nó
+được truyền vào `RouterBridge.begin()` từ chỗ gọi, vì ở đầu decoder thì
+pixel_values đã bị nuốt vào inputs_embeds từ lâu.
 
 Chỗ móc nối là một `forward_pre_hook` đặt trên KHỐI DECODER TEXT. Vì sao chọn
 chỗ này chứ không tự dựng inputs_embeds:
@@ -34,8 +38,9 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from . import moe
-from .config import adapter_desc, variant_desc
-from .router import CXR_WEIGHTS, RouterNet
+from .config import adapter_desc, arch_summary
+from .router import (CONVNEXT_WEIGHTS, FROZEN_UPTO, IMG_SIZE, RouterNet,
+                     STRIDE)
 
 _BF16_OK = None
 
@@ -196,19 +201,19 @@ class RouterBridge:
                 "Nhánh router đọc ẢNH chứ không đọc hidden state của Gemma "
                 "nữa (xem src/router.py) — sửa chỗ gọi thành "
                 "bridge.begin('route', mask=..., pixels=core['pixel_values']).")
-        # bf16 CHỈ khi GPU có thật. Trên T4 (sm75) hai lựa chọn còn lại đều
-        # tệ: autocast bf16 là đường mô phỏng, còn autocast fp16 thì
-        # `_attn_bias` trong router dùng finfo(fp16).min = -65504 làm mask —
-        # cộng vào logit attention rồi softmax là ra NaN. Router chỉ vài chục
-        # MB param nên chạy thẳng fp32 vừa rẻ vừa không có bẫy nào.
+        # bf16 CHỈ khi GPU có thật. Trên T4 (sm75) autocast bf16 là đường mô
+        # phỏng (chậm), còn autocast fp16 thì Linear(4096, 2048) trong trunk
+        # dễ tràn ở activation. Router ~39M param (25M trainable) nên chạy
+        # thẳng fp32 vừa rẻ vừa không có bẫy nào.
         if bf16_ok():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 sup_logits, gate, stats = self.router(px)
         else:
             p_dtype = next(self.router.parameters()).dtype
             sup_logits, gate, stats = self.router(px.to(p_dtype))
-        # 3 phần tử, KHÔNG còn aux: cân bằng tải do bias của router lo, nằm
-        # ngoài loss (xem src/router.py::RouterNet.update_bias).
+        # 3 phần tử. Số hạng cân bằng tải KHÔNG là phần tử thứ tư: nó nằm
+        # trong `stats["aux_loss"]` dưới dạng TENSOR có gradient, để chữ ký
+        # của forward không đổi giữa train/eval/probe (xem src/router.py).
         self.out = (sup_logits.float(), gate, stats)
         if self.force_gate is not None:
             if self.force_gate.shape != gate.shape:
@@ -377,51 +382,41 @@ def build_model(cfg, hf_token, log):
             p.data = p.data.to(f.trainable_dtype)
 
     # ── Nhánh router ────────────────────────────────────────────────────────
-    d_enc = int(getattr(getattr(model.config, "text_config", model.config),
-                        "hidden_size", f.d_enc))
-    if d_enc != f.d_enc:
-        log("router", f"hidden_size thật = {d_enc} (config ghi {f.d_enc}) "
-                      f"— dùng giá trị thật")
-    route_noise = float(getattr(f, "route_noise", 1.0) or 0.0)
-    bias_gamma = float(getattr(f, "bias_gamma", 1e-3) or 0.0)
-    # Giá trị ĐẦU của lịch decay (None = không có lịch cho đại lượng đó). Đọc
-    # bằng getattr để config cũ — không có ba khoá này — vẫn dựng được model.
+    # Router KHÔNG đọc hidden state của Gemma nữa, nên không còn `d_enc`:
+    # hidden_size của decoder không liên quan gì tới nhánh này.
+    route_noise = float(getattr(f, "route_noise", 0.5) or 0.0)
+    # Giá trị ĐẦU của lịch decay (None = không có lịch). Đọc bằng getattr để
+    # config thiếu khoá vẫn dựng được model.
     ns = getattr(f, "route_noise_start", None)
-    gs = getattr(f, "bias_gamma_start", None)
-    decay_steps = int(getattr(f, "decay_warmup_steps", 0) or 0)
-    router = RouterNet(cfg.sweep.variant, cfg.sweep.n_block, f.n_expert,
-                       f.top_k, d_enc=d_enc, route_noise=route_noise,
-                       bias_gamma=bias_gamma,
+    decay_samples = int(getattr(f, "decay_warmup_samples", 0) or 0)
+    img_size = int(getattr(f, "router_img_size", IMG_SIZE))
+    router = RouterNet(f.n_expert, f.top_k, route_noise=route_noise,
                        route_noise_start=(None if ns is None else float(ns)),
-                       bias_gamma_start=(None if gs is None else float(gs)),
-                       decay_steps=decay_steps,
-                       bias_clip=float(getattr(f, "bias_clip", 0.5) or 0.0),
-                       capacity_factor=float(
-                           getattr(f, "capacity_factor", 0.0) or 0.0),
-                       n_shared=int(getattr(f, "n_shared", 0) or 0),
-                       shared_weight=getattr(f, "shared_weight", None),
-                       backbone=getattr(f, "router_backbone", CXR_WEIGHTS),
-                       img_size=int(getattr(f, "router_img_size", 224)),
-                       apply_bias_at_eval=bool(
-                           getattr(f, "router_bias_at_eval", False)),
+                       decay_samples=decay_samples,
+                       backbone=getattr(f, "router_backbone",
+                                        CONVNEXT_WEIGHTS),
+                       img_size=img_size,
+                       frozen_upto=int(getattr(f, "router_frozen_upto",
+                                               FROZEN_UPTO)),
                        log=log).to("cuda", f.trainable_dtype)
     bridge = RouterBridge(router, log)
     bridge.attach(find_text_decoder(model, log))
 
     n_router = sum(p.numel() for p in router.parameters())
     n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log("router", variant_desc(cfg))
+    log("router", arch_summary(cfg))
+    log("router", f"    ảnh {img_size}² -> lưới {img_size//STRIDE}×"
+                  f"{img_size//STRIDE} = {(img_size//STRIDE)**2} token × "
+                  f"{router.dim} chiều | đóng băng features[0:"
+                  f"{router.backbone.frozen_upto}]")
     log("router", f"    route_noise σ={route_noise:g} (sau warmup) "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
-                     else "— TẮT, top-k tất định"))
-    log("router", f"    {router.capacity_desc(cfg.run.train_bs)}")
-    log("router", f"    bias_gamma γ={bias_gamma:g} (sau warmup) "
-                  + ("(cân bằng tải aux-free, cập nhật mỗi optimizer step)"
-                     if bias_gamma > 0 else "— TẮT, không có gì cân bằng tải"))
+                     else "— TẮT, top-k tất định, KHÔNG còn cơ chế khám phá"))
     log("router", f"    {router.decay_desc()}")
+    log("router", f"    cân bằng tải: aux loss w={cfg.run.w_aux:g} "
+                  f"(E·Σf·P, sàn 1.0) — không còn bias/trần tải/expert hứng")
     for k, v in router.param_table().items():
-        if not k.startswith("_"):
-            log("router", f"    {k:<28} {v:>12,}")
+        log("router", f"    {k:<30} {v:>12,}")
     log("lora", f"✓ {adapter_desc(f)} | trainable expert {n_expert_p:,} "
                 f"+ router {n_router:,} = {n_expert_p + n_router:,} "
                 f"(~{(n_expert_p + n_router) * 4 / 1024**2:.0f}MB fp32)")

@@ -15,7 +15,7 @@ import re
 
 import numpy as np
 
-from .config import adapter_desc, variant_desc
+from .config import adapter_desc, arch_summary
 
 
 def _setup_nltk():
@@ -114,37 +114,36 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         "gpu": cfg.hw.name,
         "preset": cfg.preset["name"],
         "image_size": cfg.fixed.image_size_model,
-        "sweep_cell": cfg.sweep.tag,
-        "variant": cfg.sweep.variant,
-        "n_block": cfg.sweep.n_block,
+        "run_tag": cfg.arch.tag,
         "n_expert": cfg.fixed.n_expert,
         "top_k": cfg.fixed.top_k,
-        "route_noise": float(getattr(cfg.fixed, "route_noise", 1.0) or 0.0),
-        "bias_gamma": float(getattr(cfg.fixed, "bias_gamma", 0.0) or 0.0),
-        # Lịch decay: hai ô sweep cùng γ cuối nhưng khác γ đầu là hai lần chạy
-        # KHÁC nhau — không ghi lại thì bảng sweep không giải thích nổi vì sao.
-        "bias_gamma_start": (None if getattr(cfg.fixed, "bias_gamma_start",
-                                             None) is None
-                             else float(cfg.fixed.bias_gamma_start)),
+        "router_backbone": cfg.fixed.router_backbone,
+        "router_img_size": int(cfg.fixed.router_img_size),
+        "router_frozen_upto": int(cfg.fixed.router_frozen_upto),
+        "route_noise": float(getattr(cfg.fixed, "route_noise", 0.5) or 0.0),
+        # Lịch decay: hai lần chạy cùng σ cuối nhưng khác σ đầu là hai buổi
+        # train KHÁC nhau — không ghi lại thì bảng metrics không giải thích
+        # nổi vì sao chúng lệch.
         "route_noise_start": (None if getattr(cfg.fixed, "route_noise_start",
                                               None) is None
                               else float(cfg.fixed.route_noise_start)),
-        "decay_warmup_steps": int(getattr(cfg.fixed, "decay_warmup_steps", 0)
-                                  or 0),
+        "decay_warmup_samples": int(getattr(cfg.fixed,
+                                            "decay_warmup_samples", 0) or 0),
         "w_sup": float(cfg.run.w_sup),
+        "w_aux": float(getattr(cfg.run, "w_aux", 0.0)),
         "asl_gamma_pos": float(getattr(cfg.run, "asl_gamma_pos", 0.0)),
         "asl_gamma_neg": float(getattr(cfg.run, "asl_gamma_neg", 4.0)),
         "asl_clip": float(getattr(cfg.run, "asl_clip", 0.02)),
         "uncertain_soft": float(getattr(cfg.run, "uncertain_soft", 0.7)),
-        "architecture": variant_desc(cfg),
+        "architecture": arch_summary(cfg),
         "adapter": adapter_desc(cfg.fixed),
         "max_seq_len": cfg.run.max_seq_len,
     }
     if expert_share:
         meta["expert_share"] = [round(float(v), 4) for v in expert_share]
-        # Không còn aux loss: cân bằng tải do bias của router lo (γ =
-        # fixed.bias_gamma). Lệch xa 1/E nghĩa là γ quá nhỏ so với dải route
-        # logit, hoặc router đã sập về "luôn chọn cùng một expert".
+        # Cân bằng tải do MỘT số hạng aux trong loss lo (run.w_aux). Lệch xa
+        # 1/E nghĩa là w_aux quá nhỏ so với áp lực của CE, hoặc router đã sập
+        # về "luôn chọn cùng một expert" — đọc kèm `balance` trong log train.
         meta["expert_share_max"] = round(float(max(expert_share)), 4)
     if cfg.run.use_policy:
         m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,
@@ -164,7 +163,7 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2), flush=True)
 
-    log("eval", f"── {cfg.sweep.tag} (raw_output) ──")
+    log("eval", f"── {cfg.arch.tag} (raw_output) ──")
     for k in ("corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
               "rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1"):
         if k in m_raw:

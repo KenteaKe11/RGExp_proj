@@ -1,8 +1,8 @@
 """Probe chuyên môn của từng expert (`run.mode = "probe"`).
 
 Mode này KHÔNG train gì cả: nó lấy một checkpoint đã chạy và hỏi một câu khác
-hẳn — **mỗi expert trong 12 cái kia thực ra đã học được cái gì?** Bảng sweep
-chỉ trả lời "kiến trúc nào cho BLEU cao hơn"; nó không nói expert 7 chuyên về
+hẳn — **mỗi expert trong E cái kia thực ra đã học được cái gì?** Bảng metrics
+chỉ trả lời "cấu hình nào cho BLEU cao hơn"; nó không nói expert 7 chuyên về
 tràn dịch màng phổi hay chỉ là một bản sao mờ của expert 3. Không trả lời được
 câu đó thì MoE chỉ là một cách tiêu tham số.
 
@@ -60,15 +60,18 @@ nhìn prompt + ảnh, đúng thứ nó nhìn lúc infer.
 là gì", không phải "expert này đóng góp bao nhiêu vào mẫu này". Trọng số thật
 vẫn được ghi trong `gate` của từng bản ghi, muốn quy đổi lại thì nhân sau.
 
-**3. Định tuyến TẤT ĐỊNH: σ = 0 và bias KHÔNG cộng vào điểm chọn.** Nhiễu
-Gumbel và `expert_bias` là hai cơ chế của lúc TRAIN — một cái để expert hạng 5
-thỉnh thoảng còn được chạy, một cái để ép tải chia đều. Ở probe cả hai chỉ làm
-hỏng phép đo: σ khiến `chosen` của cùng một ảnh đổi giữa hai lần chạy, còn bias
-khiến `chosen` lệch khỏi `prob` mà đọc bản ghi không ra được lý do. `run_probe`
-ép tắt cả hai NGAY TỪ ĐẦU, không dựa vào mặc định của config, nên top-k ghi
-trong bản ghi là thuần cái fine-tuning học được. Bản thân `expert_bias` trong
-checkpoint không bị xoá — chỉ là không dùng; mỗi bản ghi tự khai bằng
-`router.route_noise = 0` và `router.bias_applied = false`.
+**3. Định tuyến TẤT ĐỊNH: σ = 0.** Nhiễu Gumbel là cơ chế của lúc TRAIN —
+nó tồn tại để expert hạng k+1 thỉnh thoảng còn được chạy. Ở probe nó chỉ làm
+hỏng phép đo: `chosen` của cùng một ảnh sẽ đổi giữa hai lần chạy, mà bản ghi
+lại là thứ duy nhất còn lại sau phiên máy. `run_probe` ép σ = 0 NGAY TỪ ĐẦU,
+không dựa vào mặc định của config.
+
+Cơ chế thứ hai từng phải tắt ở đây — `expert_bias` của cân bằng tải aux-free
+— KHÔNG CÒN TỒN TẠI: cân bằng tải giờ là một số hạng aux trong Total_Loss
+(src/losses.py::aux_loss), không có núm nào cộng vào điểm chọn. Hệ quả cho
+người đọc bản ghi: `chosen` LUÔN là top-k của `prob`, không cần đối chiếu
+xem có gì đã lệch hai cái đó. Mỗi bản ghi vẫn tự khai `router.route_noise =
+0` và `router.bias_applied = false` để so được với các đợt ghi cũ.
 
 ═══ Vì sao KHÔNG có ma trận 14×4 ═══
 
@@ -406,34 +409,25 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
     key_col = cfg.data.image_column
     E, K = f.n_expert, f.top_k
 
-    # ── Định tuyến TẤT ĐỊNH: tắt cứng nhiễu Gumbel và bias cân bằng tải ─────
-    # Cả hai là công cụ của lúc TRAIN, không phải của phép đo:
+    # ── Định tuyến TẤT ĐỊNH: tắt cứng nhiễu Gumbel ──────────────────────────
+    # σ·Gumbel là công cụ của lúc TRAIN: nó tồn tại để expert xếp hạng k+1
+    # thỉnh thoảng vẫn được chạy và nhận gradient. Ở probe nó chỉ làm tập
+    # top-k đổi giữa hai lần chạy CÙNG một ảnh — `chosen`/`gate` trong bản ghi
+    # hết tái lập, mà bản ghi lại là thứ duy nhất còn lại sau phiên máy.
     #
-    #   * σ·Gumbel tồn tại để expert xếp hạng 5 thỉnh thoảng vẫn được chạy và
-    #     nhận gradient. Ở probe nó chỉ làm tập top-k đổi giữa hai lần chạy
-    #     CÙNG một ảnh — `chosen`/`gate` trong bản ghi hết tái lập, mà bản ghi
-    #     lại là thứ duy nhất còn lại sau phiên Kaggle.
-    #   * expert_bias là cái núm ép tải chia đều. Để nó cộng vào điểm chọn thì
-    #     `chosen` không còn là "router tin expert nào" mà là "router tin +
-    #     lịch sử tải lúc train", và nó lệch hẳn khỏi `prob` — đúng cái lỗi
-    #     lần chạy trước mắc phải mà không đọc ra được lý do.
+    # `router.eval()` đã tắt σ theo mặc định, nhưng probe KHÔNG dựa vào mặc
+    # định đó: một chỗ nào đó gọi `set_route_noise` trước là toàn bộ vài nghìn
+    # bản ghi im lặng đo sai. Ép ở đây.
     #
-    # `router.eval()` ở src/train.py đã tắt cả hai theo mặc định
-    # (`router_bias_at_eval: false`), nhưng probe KHÔNG dựa vào mặc định đó:
-    # một config bật `router_bias_at_eval` lên là toàn bộ 3000 bản ghi im lặng
-    # đo sai. Ép ở đây để mode=probe luôn đọc thuần cái fine-tuning học được.
+    # Cơ chế thứ hai từng phải tắt (`expert_bias` của cân bằng tải aux-free)
+    # đã bị BỎ HẲN khỏi kiến trúc — cân bằng tải giờ là số hạng aux trong
+    # loss. Không còn gì cộng vào điểm chọn, nên `chosen` luôn = top-k của
+    # `prob`.
     router = bridge.router
     router.eval()
     router.set_route_noise(0.0)
-    bias_was = bool(router.apply_bias_at_eval)
-    router.apply_bias_at_eval = False
-    bias_span = float(router.expert_bias.max() - router.expert_bias.min())
-    log("probe", f"định tuyến tất định: σ=0, bias KHÔNG cộng vào điểm chọn "
-                 f"(bias_span={bias_span:.4f} của checkpoint vẫn giữ nguyên "
-                 f"trong trọng số, chỉ không dùng)")
-    if bias_was:
-        warn("probe", "config bật router_bias_at_eval=true — probe BỎ QUA nó "
-                      "để `chosen` khớp với `prob`")
+    log("probe", "định tuyến tất định: σ=0 | không còn bias cân bằng tải nào "
+                 "để tắt (chosen = top-k của prob, đúng theo định nghĩa)")
 
     local = os.path.join(r.out_dir, "probe_records")
     stream = HubStream(r.probe_repo, hf_token, local,
@@ -555,9 +549,9 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         if gate is None:
             raise RuntimeError("router không chạy trong forward probe — hook "
                                "RouterBridge không được gọi")
-        # MỌI ô khác 0, không cắt ở K: gate giờ gồm top-k expert định
-        # tuyến CỘNG n_shared expert hứng (src/router.py), nên cắt ở K sẽ bỏ
-        # rơi đúng những expert chạy trên mọi ảnh.
+        # MỌI ô khác 0, không cắt cứng ở K. Với top-k thuần thì đúng K ô
+        # khác 0, nhưng đọc theo "ô nào > 0" thì chỗ này không phải sửa lại
+        # nếu sau này gate có thêm thành phần nào khác.
         chosen = [int(e) for e in torch.argsort(gate, descending=True).tolist()
                   if float(gate[e]) > 0]
         # softmax ĐẦY ĐỦ trên E expert, trước khi cắt top-k (src/router.py).
@@ -608,10 +602,9 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             # đã chọn -> chỉ dùng được cho thống kê router. summary tách hai
             # loại này ra, KHÔNG trộn vào cùng một trung bình.
             "probe_mode": "full" if full else "topk",
-            "sweep_cell": cfg.sweep.tag,
+            "run_tag": cfg.arch.tag,
             "model": f.model_id,
             "n_expert": E, "top_k": K,
-            "n_shared": int(getattr(f, "n_shared", 0) or 0),
             "train_epoch": train_state.get("epoch"),
             "train_samples": train_state.get("samples"),
             "swa_n": train_state.get("swa_n"),

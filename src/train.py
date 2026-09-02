@@ -1,26 +1,29 @@
 """Entrypoint: STAGE 0 (2 step thử) -> train multi-task -> infer.
 
-Chạy:  python -m src.train --config configs/default.yaml --n-block 12
+Chạy:  python -m src.train --config configs/default.yaml
 
 MỘT PHASE DUY NHẤT (multi-task). Không còn "phase 1 chỉ router bằng Focal" rồi
 "phase 2 thêm decoder bằng CE". Ngay từ step đầu:
 
-    Total_Loss = 1·CE + w_sup·ASL            (w_sup = 0.2)
+    Total_Loss = 1·CE + w_sup·ASL + w_aux·Aux      (0.5 và 0.05)
 
-Router, 12 expert QDoRA và decoder cùng chạy trong MỘT forward và cùng nhận
+Router, E expert QDoRA và decoder cùng chạy trong MỘT forward và cùng nhận
 gradient. Gate nằm trong đồ thị autograd (src/moe.py), nên CE dạy router chọn
-expert, còn ASL giữ cho bản tóm tắt của router bám ngữ nghĩa bệnh học. Hai
+expert, còn ASL giữ cho biểu diễn của router bám ngữ nghĩa bệnh học. Hai
 tín hiệu đó đến CÙNG LÚC thay vì nối tiếp — đó là toàn bộ ý nghĩa của việc
 gộp phase: bản cũ dạy router bằng nhánh supervised xong mới cho nó gặp CE, và
 mọi thứ nhánh đó dạy được đều có nguy cơ bị CE kéo đi ở phase sau.
 
 Nhánh supervised dùng ASL (Asymmetric Loss) trên MỘT trục nhị phân 14 finding
 — không còn softmax 4 aspect, không còn Focal. Nhãn uncertain thành soft
-label 0.7, nhãn blank bị MASK hẳn khỏi loss. Xem src/losses.py.
+label, nhãn blank bị MASK hẳn khỏi loss. Xem src/losses.py.
 
-KHÔNG CÒN AUX LOSS. Cân bằng tải giữa các expert do bias của router lo, cập
-nhật bằng quy tắc sau mỗi optimizer step (`router.update_bias()`), nằm ngoài
-đồ thị autograd. Xem src/router.py.
+SỐ HẠNG AUX QUAY LẠI, và nó THAY HẲN cơ chế bias aux-free của bản trước
+(bias b_e + trần tải mỗi micro-batch + 2 expert hứng). Cân bằng tải giờ là
+Aux = E·Σ f_e·P_e (Switch-Transformer), tính trong `RouterNet.forward` và
+trả về qua `stats["aux_loss"]`. Sàn của nó là 1.0, nên w_aux·Aux cộng một
+nền ≈0.05 vào Total_Loss ngay cả khi cân bằng hoàn hảo — đọc `balance` trong
+log và so với 1.0, đừng đọc phần đóng góp trong loss.
 
 LỊCH TRAIN KHÔNG CÓ ĐÍCH. Vòng train đi tuần tự qua tập train theo thứ tự
 rare-first; hết tập thì `epoch` += 1 và đi lại từ đầu đúng thứ tự đó, mãi mãi.
@@ -29,7 +32,8 @@ checkpoint rồi mới sang khâu infer nếu mode=both) hoặc bằng việc ph
 hết giờ. Lần chạy sau LUÔN resume từ checkpoint đi xa nhất (cục bộ hoặc Hub).
 
 Lịch LR (src/optim.py): cosine warm restarts lặp VÔ HẠN, mỗi cycle cố định
-`run.cycle_samples` MẪU (không phải step — batch mỗi máy một khác). Cuối mỗi
+`run.cycle_samples` MẪU (không phải step — batch mỗi máy một khác), và có
+warmup tuyến tính ở ĐẦU MỌI CYCLE chứ không chỉ cycle đầu. Cuối mỗi
 cycle, lúc LR chạm đáy, trọng số được chụp lại và cộng trung bình đều — SWA.
 Bản trung bình đi vào swa.pt và là thứ được dùng để chấm metrics (mode=test)
 và để probe (mode=probe).
@@ -51,8 +55,8 @@ import torch
 from . import logging_utils as L
 from . import moe
 from . import probe as probe_mod
-from .config import (adapter_desc, config_from_args, cycles_desc, image_desc,
-                     resolve_seq_len, variant_desc)
+from .config import (adapter_desc, arch_summary, config_from_args,
+                     cycles_desc, image_desc, resolve_seq_len)
 from .data import (attach_labels, build_frames, cell_frequency, fetch_sources,
                    label_names, load_or_make_splits, rare_first_order)
 from .guard import build_validator, normalize_headers, sanity_check
@@ -89,7 +93,7 @@ def progress_key(st):
     step = samples / (train_bs × grad_accum), mà batch mỗi máy một khác: máy
     P100 chạy 1×64 và máy A100 chạy 8×8 ở CÙNG một chỗ trong dữ liệu sẽ có số
     step khác nhau. Số mẫu đã đi qua thì không phụ thuộc phần cứng, và vì lịch
-    train không reset theo epoch nên nó tăng đơn điệu suốt đời ô sweep.
+    train không reset theo epoch nên nó tăng đơn điệu suốt đời lần chạy.
     """
     return int(st.get("samples", 0))
 
@@ -125,12 +129,12 @@ def main(argv=None):
     run_train = r.mode in ("train", "both")
     run_test = r.mode in ("test", "both", "probe")
 
-    L.setup(os.path.join(r.out_dir, "logs"), run_id=cfg.sweep.tag)
+    L.setup(os.path.join(r.out_dir, "logs"), run_id=cfg.arch.tag)
     L.snapshot_config(cfg)
 
     log("gpu", f"{cfg.hw.name} | {cfg.hw.vram_gb:.0f}GB | "
                f"sm{cfg.hw.sm[0]}{cfg.hw.sm[1]} | {cfg.hw.n_gpu} GPU")
-    log("sweep", f"ô = {cfg.sweep.tag} | {f.model_id}")
+    log("run", f"lần chạy = {cfg.arch.tag} | {f.model_id}")
     log("cfg", f"preset={cfg.preset['name']} | {adapter_desc(f)} | "
                f"ckpt={r.grad_ckpt} | batch {r.train_bs}×{r.grad_accum}"
                f"={r.train_bs*r.grad_accum} mẫu/step | mode={r.mode} "
@@ -138,28 +142,28 @@ def main(argv=None):
     log("cfg", "lịch train: MỘT phase multi-task, KHÔNG có đích — chạy tuần "
                "tự tập train, hết thì epoch += 1 và chạy tiếp; dừng bằng "
                "Ctrl-C hoặc hết giờ máy, lần sau LUÔN resume")
-    log("cfg", f"loss = 1·CE + {r.w_sup}·ASL (KHÔNG có aux) | ASL γ+="
+    log("cfg", f"loss = 1·CE + {r.w_sup}·ASL + {r.w_aux}·Aux | ASL γ+="
                f"{r.asl_gamma_pos:g} γ-={r.asl_gamma_neg:g} ngưỡng âm "
-               f"m={r.asl_clip:g} | uncertain={r.uncertain_soft:g}, blank=MASK "
-               f"| cân bằng tải bias γ={f.bias_gamma:g} | Gumbel σ="
-               f"{f.route_noise:g} (cả hai là giá trị SAU warmup)")
-    _decay = decay_desc(getattr(f, "bias_gamma_start", None), f.bias_gamma,
-                        getattr(f, "route_noise_start", None), f.route_noise,
-                        int(getattr(f, "decay_warmup_steps", 0) or 0))
-    log("cfg", f"lịch decay router: {_decay} — γ lớn ở đầu để bias kịp nắn "
-               f"trước khi một cú Gumbel may mắn khoá cứng top-k; σ lớn ở đầu "
-               f"để tuyến đường còn đảo được")
+               f"m={r.asl_clip:g} | uncertain={r.uncertain_soft:g}, blank=MASK")
+    log("cfg", f"cân bằng tải: aux loss w={r.w_aux:g} (Switch E·Σf·P, SÀN "
+               f"1.0 -> nền {r.w_aux:g} trong Total_Loss ngay cả khi cân "
+               f"bằng hoàn hảo; đọc `balance` và so với 1.0). KHÔNG còn "
+               f"bias, trần tải hay expert hứng.")
+    _decay = decay_desc(getattr(f, "route_noise_start", None), f.route_noise,
+                        int(getattr(f, "decay_warmup_samples", 0) or 0))
+    log("cfg", f"Gumbel: {_decay} — σ lớn ở đầu để tuyến đường còn đảo được; "
+               f"từ khi bỏ bias thì đây là cơ chế khám phá DUY NHẤT")
     log("cfg", f"val mỗi {r.eval_every} step ({r.eval_max_batches} batch) | "
                f"ckpt mỗi {r.save_every_n_vals} lần val | dừng sớm: KHÔNG")
     log("cfg", f"cắt gradient: chuẩn TOÀN CỤC (router + expert chung một "
                f"vector) ở {r.max_grad_norm:g} — giữ nguyên hướng, chỉ chặn "
                f"độ dài")
-    log("cfg", f"kiến trúc: {variant_desc(cfg)}")
+    log("cfg", f"kiến trúc: {arch_summary(cfg)}")
     log("cfg", cycles_desc(cfg))
     log("cfg", f"ảnh {image_desc(f)}")
     if not r.use_policy:
         log("cfg", "policy TẮT — infer sinh 1 lần, không retry; metrics chấm "
-                   "trên raw_output (đúng cột 'raw_outp' của bảng sweep)")
+                   "trên raw_output (đúng cột 'raw_outp' của bảng metrics)")
     if r.mode == "both":
         log("cfg", "mode=both: train chạy tới khi bị dừng tay (Ctrl-C được "
                    "bắt, ckpt được lưu) rồi mới sang infer")
@@ -182,10 +186,11 @@ def main(argv=None):
         import wandb
         os.environ["WANDB_SILENT"] = "true"
         wandb.init(project=r.wandb_project, name=r.wandb_run, config={
-            "model": f.model_id, "variant": cfg.sweep.variant,
-            "n_block": cfg.sweep.n_block, "n_expert": f.n_expert,
-            "top_k": f.top_k, "n_shared": getattr(f, "n_shared", 0),
-            "capacity_factor": getattr(f, "capacity_factor", 0.0),
+            "model": f.model_id, "arch": cfg.arch.tag,
+            "n_expert": f.n_expert, "top_k": f.top_k,
+            "router_backbone": f.router_backbone,
+            "router_img_size": f.router_img_size,
+            "router_frozen_upto": f.router_frozen_upto,
             "lora_r": f.lora_r, "lora_alpha": f.lora_alpha,
             "gpu": cfg.hw.name, "preset": cfg.preset["name"],
             "attn": f.attn_impl,
@@ -197,10 +202,11 @@ def main(argv=None):
             "w_sup": r.w_sup, "asl_gamma_pos": r.asl_gamma_pos,
             "asl_gamma_neg": r.asl_gamma_neg, "asl_clip": r.asl_clip,
             "uncertain_soft": r.uncertain_soft,
-            "route_noise": f.route_noise, "bias_gamma": f.bias_gamma,
+            "w_aux": r.w_aux,
+            "route_noise": f.route_noise,
             "route_noise_start": getattr(f, "route_noise_start", None),
-            "bias_gamma_start": getattr(f, "bias_gamma_start", None),
-            "decay_warmup_steps": getattr(f, "decay_warmup_steps", 0),
+            "decay_warmup_samples": getattr(f, "decay_warmup_samples", 0),
+            "warmup_samples": r.warmup_samples,
             "cycle_samples": r.cycle_samples,
             "use_policy": r.use_policy,
         })
@@ -289,7 +295,7 @@ def main(argv=None):
 
     # ── Bước tính loss, dùng chung cho STAGE 0 / train / eval ───────────────
     def train_loss(batch):
-        """Total_Loss = CE + w_sup·ASL, một forward duy nhất.
+        """Total_Loss = CE + w_sup·ASL + w_aux·Aux, một forward duy nhất.
 
         KHÔNG gọi bridge.end() ở đây — gate phải còn sống tới hết backward
         (gradient-checkpointing chạy lại forward trong backward và cần đúng
@@ -310,9 +316,14 @@ def main(argv=None):
         sup = asl_loss(sup_logits, sup_target, sup_mask,
                        gamma_pos=r.asl_gamma_pos, gamma_neg=r.asl_gamma_neg,
                        clip=r.asl_clip)
-        loss = ce + r.w_sup * sup
+        # `aux` là TENSOR (có gradient) mà RouterNet.forward gài vào stats —
+        # POP nó ra trước khi stats đi vào log, vì mọi thứ còn lại trong đó
+        # là float thuần. Xem src/router.py + src/losses.py::aux_loss.
+        aux = stats.pop("aux_loss")
+        loss = ce + r.w_sup * sup + r.w_aux * aux
         stats.update(supervised_stats(sup_logits, sup_target, sup_mask))
-        stats.update({"ce": float(ce), "sup": float(sup)})
+        stats.update({"ce": float(ce), "sup": float(sup),
+                      "aux": float(aux.detach())})
         return loss, stats
 
     # ── STAGE 0: 2 step thử ─────────────────────────────────────────────────
@@ -332,8 +343,9 @@ def main(argv=None):
         log("S0", f"label_token={int((b['labels'] != -100).sum())} | "
                   f"router thấy {int(b['router_mask'].sum())}/"
                   f"{b['router_mask'].numel()} token")
-        log("S0", f"── multi-task | loss = ce + {r.w_sup}·asl | router + "
-                  f"{f.n_expert} expert QDoRA + decoder")
+        log("S0", f"── multi-task | loss = ce + {r.w_sup}·asl + "
+                  f"{r.w_aux}·aux | router + {f.n_expert} expert QDoRA + "
+                  f"decoder")
         opt = make_optimizer()
         ok, t2, peak = False, None, None
         try:
@@ -372,13 +384,6 @@ def main(argv=None):
                                   "RouterBridge và moe.CTX")
             opt.step()
             opt.zero_grad(set_to_none=True)
-            upd = router.update_bias()
-            if upd:
-                log("S0", f"   bias cân bằng tải cập nhật được: span="
-                          f"{upd[0]:.4f} | CV tải={upd[1]:.3f}")
-            elif f.bias_gamma > 0:
-                warn("S0", "update_bias() không đếm được tải nào — router có "
-                           "đang ở chế độ train không?")
 
             t = time.time()
             b2 = to_device(next(it), DEVICE)
@@ -388,7 +393,6 @@ def main(argv=None):
             torch.nn.utils.clip_grad_norm_(all_params, r.max_grad_norm)
             opt.step()
             opt.zero_grad(set_to_none=True)
-            router.update_bias()
             torch.cuda.synchronize()
             t2 = time.time() - t
             peak = torch.cuda.max_memory_allocated(0) / 1024**3
@@ -428,7 +432,6 @@ def main(argv=None):
             bridge.end()
             opt.zero_grad(set_to_none=True)
             del opt
-            router.reset_bias()      # 2 step thử không được để lại bias
             gc.collect()
             torch.cuda.empty_cache()
         return ok, t2, peak
@@ -494,7 +497,7 @@ def main(argv=None):
     # ══════════════════════════ checkpoint ═══════════════════════════════════
     def save_checkpoint(state, optimizer, swa=None, tag="last", push=True,
                         with_optimizer=True):
-        """Lưu đủ để resume: router (kèm bias) + E expert + optimizer + SWA.
+        """Lưu đủ để resume: router + E expert + optimizer + SWA.
 
         `with_optimizer=False` cho bản "best": nó chỉ dùng để LẤY LẠI trọng số
         tốt nhất, không dùng để train tiếp — mà optimizer của AdamW nặng gấp
@@ -502,8 +505,9 @@ def main(argv=None):
 
         KHÔNG có `scheduler.state_dict()`: lịch LR là hàm THUẦN của số mẫu
         (src/optim.py), dựng lại từ `state["samples"]` là đủ và đúng trên mọi
-        máy. `expert_bias` đi theo router.state_dict() — nó là buffer, và bỏ
-        nó ra khỏi ckpt thì resume xong router mất toàn bộ điều phối đã học.
+        máy. Lịch σ của router cũng vậy — `set_decay_samples(samples)`. Từ
+        khi bỏ cơ chế bias, router KHÔNG còn buffer trạng thái nào ngoài
+        trọng số, nên state_dict của nó là toàn bộ những gì phải bàn giao.
         """
         d = os.path.join(r.ckpt_dir, tag)
         os.makedirs(d, exist_ok=True)
@@ -531,14 +535,16 @@ def main(argv=None):
                     asl_gamma_pos=r.asl_gamma_pos,
                     asl_gamma_neg=r.asl_gamma_neg, asl_clip=r.asl_clip,
                     uncertain_soft=r.uncertain_soft,
-                    bias_gamma=f.bias_gamma, route_noise=f.route_noise,
-                    bias_gamma_start=getattr(f, "bias_gamma_start", None),
+                    w_aux=r.w_aux, route_noise=f.route_noise,
                     route_noise_start=getattr(f, "route_noise_start", None),
-                    decay_warmup_steps=getattr(f, "decay_warmup_steps", 0),
-                    model=f.model_id, variant=cfg.sweep.variant,
-                    n_block=cfg.sweep.n_block, n_expert=f.n_expert,
-                    top_k=f.top_k, n_shared=getattr(f, "n_shared", 0),
-                    capacity_factor=getattr(f, "capacity_factor", 0.0),
+                    decay_warmup_samples=getattr(
+                        f, "decay_warmup_samples", 0),
+                    warmup_samples=r.warmup_samples,
+                    model=f.model_id, arch=cfg.arch.tag,
+                    router_backbone=f.router_backbone,
+                    router_img_size=f.router_img_size,
+                    router_frozen_upto=f.router_frozen_upto,
+                    n_expert=f.n_expert, top_k=f.top_k,
                     lora_r=f.lora_r, lora_alpha=f.lora_alpha,
                     image_size=f.image_size_model or f.image_size_src)
         with open(os.path.join(d, "train_state.json"), "w") as fh:
@@ -587,29 +593,37 @@ def main(argv=None):
     def check_compat(st):
         assert st["n_train"] == n_train and st["seed"] == f.seed, \
             f"Split/seed đổi (n_train {st['n_train']} vs {n_train})"
-        assert st["variant"] == cfg.sweep.variant and \
-            st["n_block"] == cfg.sweep.n_block, \
-            (f"ckpt của ô {st['variant']}-n{st['n_block']}, đang chạy "
-             f"{cfg.sweep.tag} — router có shape khác, không nạp được")
+        _ck_arch = st.get("arch")
+        if _ck_arch is None:
+            raise AssertionError(
+                "ckpt không có khoá `arch` — nó là checkpoint của kiến trúc "
+                "router CŨ (DenseNet-CXR + MQA + Separation). Shape của "
+                "router đổi hoàn toàn, không nạp được. Dùng ckpt_dir/hub_repo "
+                "khác, hoặc xoá thư mục ckpt để train lại từ số 0.")
+        assert _ck_arch == cfg.arch.tag, (
+            f"ckpt của {_ck_arch}, đang chạy {cfg.arch.tag} — model nền khác "
+            f"thì router và số bản expert đều khác shape, không nạp được")
+        for _k, _now in (("router_img_size", f.router_img_size),
+                         ("router_frozen_upto", f.router_frozen_upto)):
+            _was = st.get(_k)
+            if _was is not None and int(_was) != int(_now):
+                raise AssertionError(
+                    f"ckpt train với {_k}={_was}, đang chạy {_now} — "
+                    f"hình học của router đổi, trọng số không khớp shape.")
         if st.get("n_expert") not in (None, f.n_expert) or \
                 st.get("top_k") not in (None, f.top_k):
             raise AssertionError(
                 f"ckpt là {st.get('n_expert')}E top-{st.get('top_k')}, đang "
                 f"chạy {f.n_expert}E top-{f.top_k} — route_head và số bản "
                 f"expert đều khác shape, không nạp được. Đổi n_expert/top_k "
-                f"nghĩa là một ô sweep MỚI: dùng ckpt_dir/hub_repo khác.")
-        _ns_ck, _ns_now = st.get("n_shared"), int(getattr(f, "n_shared", 0))
-        if _ns_ck is not None and int(_ns_ck) != _ns_now:
-            # Shape KHỚP (E expert vẫn là E expert) nên torch nạp trơn tru —
-            # đó mới là chỗ nguy: n_shared quyết định expert nào là expert
-            # HỨNG, và đổi nó là đổi vai của những expert cuối giữa chừng.
-            # Trọng số của chúng học từ "phần chung của mọi ảnh" giờ bị dùng
-            # như expert định tuyến, hoặc ngược lại.
-            warn("resume", f"ckpt train với n_shared={_ns_ck}, đang chạy "
-                           f"n_shared={_ns_now} — {abs(int(_ns_ck) - _ns_now)} "
-                           f"expert cuối ĐỔI VAI (hứng <-> định tuyến). Nạp "
-                           f"được nhưng những expert đó đang mang trọng số "
-                           f"học cho việc khác.")
+                f"nghĩa là một lần chạy MỚI: dùng ckpt_dir/hub_repo khác.")
+        # w_aux đổi thì shape vẫn khớp và nạp trơn tru — nhưng nó là một
+        # buổi train khác về bản chất, nên phải BÁO chứ đừng để im lặng.
+        _wa = st.get("w_aux")
+        if _wa is not None and abs(float(_wa) - float(r.w_aux)) > 1e-12:
+            warn("resume", f"ckpt train với w_aux={_wa:g}, đang chạy "
+                           f"w_aux={r.w_aux:g} — nạp được, nhưng phân bố tải "
+                           f"đã học dưới một áp lực cân bằng khác.")
 
     def read_state(directory):
         try:
@@ -778,7 +792,7 @@ def main(argv=None):
     if not run_train and run_test and not is_probe:
         eval_src, eval_step = find_eval()
         if eval_src and not r.force_eval:
-            log("done", f"ô {cfg.sweep.tag} đã có eval ({eval_src}) — bỏ qua "
+            log("done", f"{cfg.arch.tag} đã có eval ({eval_src}) — bỏ qua "
                         f"infer (--set run.force_eval=true để ép chấm lại)")
             event("run_end_reason", reason="eval_exists", source=eval_src)
             wfinish()
@@ -790,7 +804,7 @@ def main(argv=None):
     @torch.no_grad()
     def evaluate():
         model.eval()
-        router.eval()          # eval TẮT Gumbel và KHÔNG đếm tải cho bias
+        router.eval()          # eval TẮT Gumbel -> top-k tất định
         tot, cnt, rec = 0.0, 0, 0.0
         for i, b in enumerate(val_loader):
             if i >= r.eval_max_batches:
@@ -884,19 +898,21 @@ def main(argv=None):
         t0, n_vals, n_saves, steps_run = time.time(), 0, 0, 0
         log("train", f"── TRAIN (vô hạn) ── bắt đầu ở mẫu {samples} "
                      f"(epoch {epoch}, idx {epoch_samples}/{n_train}, "
-                     f"step {step}) | loss = ce + {r.w_sup}·asl")
+                     f"step {step}) | loss = ce + {r.w_sup}·asl + "
+                     f"{r.w_aux}·aux")
 
         while True:
             tstep = time.time()
             # Mốc mẫu ở ĐẦU step: LR của một step là LR tại chỗ dữ liệu của
             # step đó bắt đầu.
             step_start = samples
-            # Lịch decay của router: σ (Gumbel) và γ (bias) cho ĐÚNG step này.
-            # Phải đặt TRƯỚC vòng grad_accum — σ đi vào chỗ chọn top-k ngay ở
-            # micro-batch đầu tiên, còn γ được `update_bias()` ở cuối step
-            # dùng. Con trỏ là `step` toàn cục nên resume vào lại đúng chỗ
-            # trên đường cong thay vì warmup lại từ đầu.
-            gam_now, sig_now = router.set_decay_step(step)
+            # Lịch decay của σ (Gumbel) cho ĐÚNG step này. Phải đặt TRƯỚC
+            # vòng grad_accum — σ đi vào chỗ chọn top-k ngay ở micro-batch
+            # đầu tiên. Con trỏ là SỐ MẪU TÍCH LUỸ (không phải step): nó là
+            # đại lượng duy nhất đọc được như nhau trên mọi máy, nên resume
+            # và bàn giao giữa hai máy khác batch vào lại đúng chỗ trên
+            # đường cong thay vì warmup lại từ đầu.
+            sig_now = router.set_decay_samples(step_start)
             running, agg = 0.0, {}
             for _ in range(r.grad_accum):
                 try:
@@ -904,7 +920,7 @@ def main(argv=None):
                 except StopIteration:
                     # Hết tập train -> nâng epoch và đi lại từ đầu ĐÚNG thứ tự
                     # rare-first đó. `samples` KHÔNG reset: nó là con trỏ tích
-                    # luỹ của cả đời ô sweep, và lịch LR đọc thẳng nó.
+                    # luỹ của cả đời lần chạy, và lịch LR đọc thẳng nó.
                     epoch += 1
                     epoch_samples = 0
                     it = iter(make_loader(df_train, collate, cfg, order=order))
@@ -949,11 +965,9 @@ def main(argv=None):
             lr_now = sched.set_samples(step_start)[0]
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            # Cân bằng tải: nắn bias theo tải đã đếm được trong CẢ grad_accum
-            # micro-batch của step này. Đây là chỗ duy nhất thay cho aux loss.
-            upd = router.update_bias()
-            if upd:
-                agg["bias_span"], agg["load_cv"] = upd
+            # KHÔNG còn `router.update_bias()` ở đây: cân bằng tải đã là một
+            # số hạng trong Total_Loss (w_aux·Aux), nên nó đi qua chính
+            # optimizer.step() ở trên chứ không phải một quy tắc chạy sau.
             step += 1
             steps_run += 1
 
@@ -980,23 +994,23 @@ def main(argv=None):
                   "train/epoch": epoch, "train/lr": lr_now,
                   "train/cycle": cyc, "train/swa_n": swa.n,
                   "train/step_sec": step_sec,
-                  "train/bias_gamma": gam_now, "train/route_noise": sig_now,
+                  "train/route_noise": sig_now,
                   **{f"train/{k}": v for k, v in agg.items()}})
             event("train_step", step=step, samples=samples, epoch=epoch,
                   loss=round(running, 5), grad_norm=round(gnorm, 4),
                   lr=lr_now, cycle=cyc, step_sec=round(step_sec, 3),
-                  bias_gamma=gam_now, route_noise=sig_now,
+                  route_noise=sig_now,
                   vram_gb=round(torch.cuda.memory_allocated(0) / 1024**3, 2),
                   **{k: round(v, 5) for k, v in agg.items()})
             if limiter.ready(force=step <= 3):
                 extra = " ".join(f"{k}={agg[k]:.3f}" for k in
-                                 ("ce", "sup", "balance", "bias_span",
-                                  "spill", "sup_recall") if k in agg)
-                # Còn trong warmup thì γ/σ đổi mỗi step và là biến số quan
-                # trọng nhất để đọc `balance`/`bias_span` — in kèm. Hết warmup
-                # thì chúng là hằng, in nữa chỉ tốn chỗ.
-                if router.decay_steps and step <= router.decay_steps:
-                    extra += f" γ={gam_now:.3g} σ={sig_now:.3g}"
+                                 ("ce", "sup", "aux", "balance", "gate_max",
+                                  "sup_recall") if k in agg)
+                # Còn trong warmup thì σ đổi mỗi step và là biến số quan
+                # trọng nhất để đọc `balance` — in kèm. Hết warmup thì nó là
+                # hằng, in nữa chỉ tốn chỗ.
+                if router.decay_samples and samples <= router.decay_samples:
+                    extra += f" σ={sig_now:.3g}"
                 # Không có ETA tới đích: lịch train không có đích. Hai con số
                 # thay thế, cả hai đều đọc được: phiên này đã chạy bao lâu và
                 # còn bao lâu nữa hết epoch hiện tại.
@@ -1103,7 +1117,7 @@ def main(argv=None):
     # ── Trọng số đem đi chấm: bản trung bình SWA nếu có ─────────────────────
     # Trọng số cuối là MỘT ĐIỂM ngẫu nhiên trên quỹ đạo SGD, có thể đang ở
     # giữa dốc của một cycle. Trung bình các đáy cycle mới là thứ đại diện cho
-    # ô sweep này.
+    # lần chạy này.
     weights_src = "weights.pt (trọng số cuối)"
     swa_payload = (swa_live.payload() if swa_live.ready()
                    else (swa_state or {}).get("avg"))
@@ -1270,7 +1284,7 @@ def main(argv=None):
         """policy TẮT (mặc định): sinh MỘT lần, không retry.
 
         Vẫn chạy 7-check để GHI LẠI pass/fail — biết tỉ lệ vi phạm của từng ô
-        sweep là thông tin, còn sửa văn phong là việc của train chứ không phải
+        đo là thông tin, còn sửa văn phong là việc của train chứ không phải
         của vòng retry.
         """
         texts, share = generate_batch(paths)
@@ -1365,7 +1379,7 @@ def main(argv=None):
                           folder_path=r.out_dir, path_in_repo="eval",
                           token=hf_token,
                           ignore_patterns=["probe_records/*", "logs/*"],
-                          commit_message=f"eval @ {cfg.sweep.tag}")
+                          commit_message=f"eval @ {cfg.arch.tag}")
             log("hub", f"đã push {where} -> {repo}")
         except Exception as e:
             warn("hub", f"push kết quả thất bại ({e})")

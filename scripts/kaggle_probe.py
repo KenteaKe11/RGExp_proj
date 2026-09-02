@@ -133,7 +133,7 @@ CONFIG = "configs/kaggle_probe.yaml"
 with open(CONFIG, "w", encoding="utf-8") as fh:
     yaml.safe_dump(cfg, fh, allow_unicode=True, sort_keys=False)
 print(f"✓ {CONFIG}: mode=probe | {cfg['fixed']['n_expert']}E top-"
-      f"{cfg['fixed']['top_k']} | {cfg['sweep']['n_block']} block | "
+      f"{cfg['fixed']['top_k']} | router cnx256 | "
       f"{'trọn test' if N_IMAGES is None else str(N_IMAGES) + ' ảnh'} | "
       f"đủ {cfg['fixed']['n_expert']} expert trên "
       f"{'mọi ảnh' if FULL_N is None else str(FULL_N) + ' ảnh đầu'} | "

@@ -1,12 +1,18 @@
-"""Gom kết quả các ô sweep thành bảng so sánh.
+"""Gom kết quả các lần chạy thành bảng so sánh.
 
-Đọc outputs/<tag>/metrics.json và outputs/<tag>/reports.csv của mọi ô đã chạy,
-xuất ra:
+KHÔNG CÒN SWEEP. Trước đây file này dựng một bảng "biến thể × n_block" vì mỗi
+ô là một kiến trúc router khác nhau. Kiến trúc đã chốt (xem src/router.py),
+nên cái còn so được là các LẦN CHẠY: khác model nền, khác n_expert/top_k,
+khác w_aux, khác checkpoint. Bảng vì thế đổi hình: một HÀNG là một lần chạy,
+một CỘT là một metric.
 
-  outputs/_summary/metrics_full.csv     mọi metric × mọi ô (dạng dài)
-  outputs/_summary/metrics_table.md     bảng biến thể × n_block
-  outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ (đọc được
-                                        thêm block có đáng tiền không)
+Đọc outputs/<tag>/metrics.json và outputs/<tag>/reports.csv của mọi lần chạy
+đã có, xuất ra:
+
+  outputs/_summary/metrics_full.csv     mọi metric × mọi lần chạy (dạng dài)
+  outputs/_summary/metrics_table.md     bảng lần chạy × metric
+  outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ + phân bố
+                                        expert
   outputs/_summary/gen_text.csv         gen_text side-by-side theo img_rel
   outputs/_summary/gen_text.md          bản dễ đọc, N mẫu đầu
   outputs/_summary/run_health.md        tiến trình / tốc độ / VRAM / lỗi
@@ -22,14 +28,6 @@ import os
 
 import pandas as pd
 
-# Dải n_block của từng biến thể (khớp src/config.py SWEEP_BLOCKS).
-# Chỉ còn một biến thể Recombinator — bảng vì thế có đúng một hàng, nhưng giữ
-# nguyên cấu trúc dict/list để thêm biến thể sau chỉ là thêm một dòng.
-SWEEP_BLOCKS = {
-    "g-brmf": (1, 2, 3, 4),
-}
-VARIANT_ROWS = ["g-brmf"]
-
 # Metric chính hiển thị trong bảng tóm tắt; metrics_full.csv giữ đủ tất cả.
 HEADLINE = ["corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
             "rouge1_f1", "rouge2_f1", "rougeL_f1",
@@ -38,36 +36,24 @@ HEADLINE = ["corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
 DEFAULT_BLOCK = "raw"
 
 
-def parse_tag(tag):
-    """gemma3-g-brmf-n2 -> ('gemma3', 'g-brmf', 2)
-
-    Tên biến thể có thể chứa dấu '-' (g-brmf), nên phần giữa được ghép lại từ
-    mọi đoạn giữa model và 'n<số>' chứ không phải lấy đúng một đoạn.
-    """
-    parts = tag.split("-")
-    if len(parts) < 3 or not parts[-1].startswith("n"):
-        return None
-    try:
-        return parts[0], "-".join(parts[1:-1]), int(parts[-1][1:])
-    except ValueError:
-        return None
-
-
 def collect_cells(out_dir):
-    """Trả về list dict, mỗi dict là một ô đã có metrics.json."""
+    """Trả về list dict, mỗi dict là một lần chạy đã có metrics.json.
+
+    Không parse tag nữa: tag giờ chỉ là "<model>-cnx256", và mọi thứ đáng so
+    (n_expert, top_k, w_aux, backbone) đều nằm sẵn trong `meta` của
+    metrics.json — đọc từ đó chính xác hơn là suy từ tên thư mục.
+    """
     cells = []
     for mpath in sorted(glob.glob(os.path.join(out_dir, "*", "metrics.json"))):
         tag = os.path.basename(os.path.dirname(mpath))
-        parsed = parse_tag(tag)
-        if parsed is None:
-            continue
-        model, variant, n_block = parsed
         with open(mpath) as f:
             m = json.load(f)
+        meta = m.get("meta", {})
         rpath = os.path.join(os.path.dirname(mpath), "reports.csv")
         cells.append({
-            "tag": tag, "model": model, "variant": variant,
-            "n_block": n_block, "metrics": m,
+            "tag": tag,
+            "model": meta.get("model", tag.split("-")[0]),
+            "metrics": m,
             "reports": rpath if os.path.exists(rpath) else None,
         })
     return cells
@@ -75,7 +61,7 @@ def collect_cells(out_dir):
 
 # ─────────────────────────── metrics_full.csv ────────────────────────────────
 def build_metrics_full(cells):
-    """Dạng dài: một hàng = (ô, khối, metric, giá trị).
+    """Dạng dài: một hàng = (lần chạy, khối, metric, giá trị).
 
     Dạng dài chứ không phải rộng vì số metric thay đổi theo config
     (bertscore optional), và pivot lại lúc phân tích thì dễ hơn là phải xử lý
@@ -85,8 +71,10 @@ def build_metrics_full(cells):
     for c in cells:
         m = c["metrics"]
         meta = m.get("meta", {})
-        base = {"tag": c["tag"], "model": c["model"], "variant": c["variant"],
-                "n_block": c["n_block"], "n_samples": meta.get("n_samples"),
+        base = {"tag": c["tag"], "model": c["model"],
+                "n_expert": meta.get("n_expert"), "top_k": meta.get("top_k"),
+                "w_sup": meta.get("w_sup"), "w_aux": meta.get("w_aux"),
+                "n_samples": meta.get("n_samples"),
                 "train_step": meta.get("train_step"), "gpu": meta.get("gpu"),
                 "total_params": _total_params(c),
                 "max_seq_len": meta.get("max_seq_len")}
@@ -100,52 +88,54 @@ def build_metrics_full(cells):
 
 
 def _total_params(cell):
-    """Tổng tham số trainable của ô — để vẽ metric theo ngân sách tham số."""
+    """Tổng tham số trainable — để so metric theo ngân sách tham số.
+
+    Router giờ là hằng số theo kiến trúc; thứ duy nhất còn đổi tổng tham số
+    giữa hai lần chạy là `n_expert`.
+    """
     try:
         from .router import estimate_params
     except ImportError:                     # chạy report ngoài package
         return None
     meta = cell["metrics"].get("meta", {})
-    return estimate_params(cell["variant"], cell["n_block"],
-                           int(meta.get("n_expert", 12)))["total"]
+    return estimate_params(int(meta.get("n_expert", 24)))["total"]
 
 
 # ─────────────────────────── metrics_table.md ────────────────────────────────
 def build_metrics_table(cells, block=DEFAULT_BLOCK):
-    """Hàng = biến thể, cột = n_block, ô = giá trị metric."""
-    lut = {(c["variant"], c["n_block"]): c["metrics"] for c in cells}
-    lines = []
-    for metric in HEADLINE:
-        if not any(metric in m.get(block, {}) for m in lut.values()):
-            continue
-        lines.append(f"\n### {metric}  ({block})\n")
-        widest = max(len(v) for v in SWEEP_BLOCKS.values())
-        lines.append("| biến thể | " + " | ".join(
-            f"n{i+1}" for i in range(widest)) + " |")
-        lines.append("|---|" + "---|" * widest)
-        for variant in VARIANT_ROWS:
-            txt = []
-            for n in SWEEP_BLOCKS[variant]:
-                m = lut.get((variant, n))
-                v = m.get(block, {}).get(metric) if m else None
-                txt.append(f"n{n}: {v:.4f}" if isinstance(v, (int, float))
-                           else f"n{n}: —")
-            txt += ["—"] * (widest - len(txt))
-            lines.append(f"| {variant} | " + " | ".join(txt) + " |")
+    """Hàng = lần chạy, cột = metric."""
+    rows = sorted(cells, key=lambda c: c["tag"])
+    have = [k for k in HEADLINE
+            if any(k in c["metrics"].get(block, {}) for c in rows)]
+    if not rows or not have:
+        return f"\n_Chưa lần chạy nào có khối `{block}`._\n"
+    lines = [f"\n### {block}\n",
+             "| lần chạy | E | top-k | w_aux | " + " | ".join(have) + " |",
+             "|---|---|---|---|" + "---|" * len(have)]
+    for c in rows:
+        meta = c["metrics"].get("meta", {})
+        vals = []
+        for k in have:
+            v = c["metrics"].get(block, {}).get(k)
+            vals.append(f"{v:.4f}" if isinstance(v, (int, float)) else "—")
+        lines.append(f"| {c['tag']} | {meta.get('n_expert', '—')} | "
+                     f"{meta.get('top_k', '—')} | {meta.get('w_aux', '—')} | "
+                     + " | ".join(vals) + " |")
     return "\n".join(lines)
 
 
 # ─────────────────────────── param_curve.md ──────────────────────────────────
 def build_param_curve(cells, block=DEFAULT_BLOCK,
                       metrics=("corpus_bleu", "rougeL_f1", "bertscore_f1")):
-    """Metric theo TỔNG THAM SỐ — câu hỏi thật của sweep.
+    """Metric theo TỔNG THAM SỐ.
 
-    Bảng metrics_table so theo n_block; bảng này xếp mọi ô theo tổng tham số
-    nên đọc thẳng được "thêm ~0.85M tham số một block thì điểm lên bao nhiêu,
-    và bão hoà từ đâu".
+    Bảng này xếp mọi lần chạy theo tổng tham số trainable, nên đọc thẳng được
+    "thêm expert (mỗi cái ~15.9M) thì điểm lên bao nhiêu, và bão hoà từ đâu".
+    Router là hằng số 25.0M trainable ở mọi lần chạy, nên biến số duy nhất
+    trên trục hoành là n_expert.
     """
     rows = sorted(cells, key=lambda c: (_total_params(c) or 0))
-    head = ["| ô | tham số | " + " | ".join(metrics) + " | 7-check pass |",
+    head = ["| lần chạy | tham số | " + " | ".join(metrics) + " | 7-check pass |",
             "|---|---|" + "---|" * (len(metrics) + 1)]
     for c in rows:
         m = c["metrics"]
@@ -164,7 +154,7 @@ def build_param_curve(cells, block=DEFAULT_BLOCK,
 
 def build_expert_share(cells):
     """Router có dùng đủ E expert không, hay đã sập về một cái?"""
-    lines = ["| ô | E | top-k | tỉ lệ chọn từng expert | max |",
+    lines = ["| lần chạy | E | top-k | tỉ lệ chọn từng expert | max |",
              "|---|---|---|---|---|"]
     for c in sorted(cells, key=lambda x: x["tag"]):
         meta = c["metrics"].get("meta", {})
@@ -177,14 +167,14 @@ def build_expert_share(cells):
             + " ".join(f"{v:.2f}" for v in share)
             + f" | {meta.get('expert_share_max', max(share)):.2f} |")
     return "\n".join(lines) if len(lines) > 2 else \
-        "_Chưa ô nào ghi expert_share (chạy lại phần infer để có)._"
+        "_Chưa lần chạy nào ghi expert_share (chạy lại phần infer để có)._"
 
 
 # ────────────────────────────── gen_text ─────────────────────────────────────
 def build_gen_text(cells, key_col="img_rel", limit_md=20):
-    """Bảng gen_text side-by-side: một hàng = một ảnh, cột = mỗi ô sweep.
+    """Bảng gen_text side-by-side: một hàng = một ảnh, cột = mỗi lần chạy.
 
-    Chỉ giữ ảnh có mặt ở MỌI ô, để so sánh là công bằng — ô nào chạy
+    Chỉ giữ ảnh có mặt ở MỌI lần chạy, để so sánh là công bằng — lần nào chạy
     n_test_samples khác sẽ thu hẹp giao này.
     """
     frames = {}
@@ -197,7 +187,7 @@ def build_gen_text(cells, key_col="img_rel", limit_md=20):
         frames[c["tag"]] = df.set_index(key_col)
 
     if not frames:
-        return None, None, "Không ô nào có reports.csv"
+        return None, None, "Không lần chạy nào có reports.csv"
 
     common = None
     for df in frames.values():
@@ -207,7 +197,7 @@ def build_gen_text(cells, key_col="img_rel", limit_md=20):
     if not common:
         return None, None, "Không có ảnh chung giữa các ô"
 
-    # reference lấy từ ô bất kỳ — cùng split nên giống nhau.
+    # reference lấy từ lần chạy bất kỳ — cùng split nên giống nhau.
     first = next(iter(frames.values()))
     out = pd.DataFrame(index=common)
     out.index.name = key_col
@@ -241,7 +231,7 @@ def build_guard_impact(cells):
     Policy đang TẮT nên 7-check chỉ ĐO chứ không sửa: cột "pass raw" là tỉ lệ
     output tự nó đã đúng khuôn. Khi bật lại policy, hai cột post/Δ mới có số.
     """
-    lines = ["| ô | n | 7-check pass (raw) | policy | mẫu bị đổi | "
+    lines = ["| lần chạy | n | 7-check pass (raw) | policy | mẫu bị đổi | "
              "pass (post) | ΔBLEU |",
              "|---|---|---|---|---|---|---|"]
     for c in sorted(cells, key=lambda x: x["tag"]):
@@ -263,7 +253,7 @@ def build_guard_impact(cells):
 
 # ────────────────────────── đọc lại log JSONL ────────────────────────────────
 def load_events(out_dir, tag=None):
-    """Đọc events_*.jsonl của một ô (hoặc mọi ô) thành DataFrame.
+    """Đọc events_*.jsonl của một lần chạy (hoặc mọi lần) thành DataFrame.
 
     Dùng để vẽ loss curve / soi step chậm mà không phải regex ngược từ log text.
     """
@@ -289,14 +279,14 @@ def load_events(out_dir, tag=None):
 def build_run_health(out_dir, cells):
     """Tóm tắt sức khoẻ từng run: tiến trình, tốc độ, VRAM, warn/error.
 
-    Đây là bảng để nhìn trước khi đọc metrics: một ô có BLEU cao nhưng 12 lỗi
+    Đây là bảng để nhìn trước khi đọc metrics: một lần chạy có BLEU cao nhưng 12 lỗi
     và dừng ở step 40 thì con số đó không nói lên điều gì.
     """
     ev = load_events(out_dir)
     if ev.empty:
         return "_Không có events JSONL (run cũ trước khi bật logging?)_"
 
-    lines = ["| ô | step cuối | s/step TB | VRAM đỉnh | warn | error | kết thúc |",
+    lines = ["| lần chạy | step cuối | s/step TB | VRAM đỉnh | warn | error | kết thúc |",
              "|---|---|---|---|---|---|---|"]
     for c in sorted(cells, key=lambda x: x["tag"]):
         e = ev[ev.cell == c["tag"]]
@@ -324,7 +314,8 @@ def build_run_health(out_dir, cells):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Gom kết quả sweep thành bảng")
+    ap = argparse.ArgumentParser(
+        description="Gom kết quả các lần chạy thành bảng")
     ap.add_argument("--out-dir", default="./outputs")
     ap.add_argument("--key-col", default="img_rel")
     ap.add_argument("--md-samples", type=int, default=20,
@@ -333,13 +324,13 @@ def main(argv=None):
 
     cells = collect_cells(args.out_dir)
     if not cells:
-        print(f"✗ Không thấy ô nào trong {args.out_dir}/*/metrics.json")
-        print("  Chạy sweep với --mode both để mỗi ô sinh metrics test.")
+        print(f"✗ Không thấy lần chạy nào trong {args.out_dir}/*/metrics.json")
+        print("  Chạy với --mode both để lần chạy sinh metrics test.")
         return 1
 
     summary = os.path.join(args.out_dir, "_summary")
     os.makedirs(summary, exist_ok=True)
-    print(f"═══ {len(cells)} ô: {', '.join(c['tag'] for c in cells)} ═══\n")
+    print(f"═══ {len(cells)} lần chạy: {', '.join(c['tag'] for c in cells)} ═══\n")
 
     # 1. metrics đầy đủ
     full = build_metrics_full(cells)
@@ -347,8 +338,8 @@ def main(argv=None):
     full.to_csv(p, index=False)
     print(f"✓ {p}  ({len(full)} hàng)")
 
-    # 2. bảng biến thể × n_block
-    tbl = ("# Bảng sweep — Recombinator × n_block\n\n"
+    # 2. bảng lần chạy × metric
+    tbl = ("# Bảng metrics — lần chạy × metric\n\n"
            f"Nguồn: `{args.out_dir}/*/metrics.json` | chấm trên `raw_output` "
            f"(policy tắt)\n"
            + build_metrics_table(cells, DEFAULT_BLOCK))
