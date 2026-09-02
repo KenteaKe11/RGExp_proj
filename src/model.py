@@ -1,31 +1,42 @@
 """Nạp Gemma 3, gắn E expert QDoRA, nối nhánh router, collate, CE loss.
 
-Đường đi của MỘT batch (khớp sơ đồ "Thiết kế chung"):
+Đường đi của MỘT batch:
 
-    ảnh + prompt ──► [embed_tokens ⊕ vision_tower ⊕ projector] ──► [N, 2560]
-          │                         │                                  │
-          │  pixel_values     RouterBridge hook                        │
-          └──────────────►  (ConvNeXt → 256 → downsample → 2 head)     │
-                                    │                                  │
-                                    │                       gate [B, E] ──┐
-                                    ▼                                     │
-                            Gemma decoder ◄── expert QDoRA trộn theo gate ─┘
-                                    │
-                    CE + w_sup·ASL + w_aux·Aux (một phase multi-task)
+    ảnh ──► RouterNet (src/router.py) ──► sup_logits 14 | gate E | prefix 256
+      │                                        │        │           │
+      │                                        │        │           │
+      └─► [embed_tokens ⊕ vision_tower ⊕ projector] ──► [B, N, 2560]
+                                                        │           │
+                    256 vị trí GIỮ CHỖ ở đầu chuỗi ◄────┘ ghi đè ───┘
+                                                        │
+                                            Gemma decoder ◄── expert QDoRA
+                                                        │      trộn theo gate
+                                        CE + w_sup·ASL + w_aux·Aux
+
+HAI THỨ NHÁNH ROUTER CẮM VÀO DECODER, và cả hai đi qua cùng một hook đặt ở
+đầu KHỐI DECODER TEXT:
+
+  * **gate** — trọng số trộn E bản delta QDoRA (src/moe.py). Đặt TRƯỚC khi
+    layer đầu tiên chạy, nên mọi Linear đã có trọng số expert đúng của batch.
+  * **prefix** — 256 token thị giác của router, chiếu lên 2560 chiều.
+
+Cách ghép prefix KHÔNG đụng gì vào transformers. `build_collate` chèn sẵn 256
+vị trí giữ chỗ (token pad) ở ĐẦU `input_ids`, với attention_mask = 1 và
+label = -100. Hook chỉ GHI ĐÈ embedding của đúng 256 vị trí đó — độ dài chuỗi
+không đổi, nên attention mask, position id, KV-cache và `logits_to_keep` vẫn
+do transformers tự dựng, y như khi không có nhánh nào cắm vào. Nếu thay vào
+đó ta nối thêm 256 vị trí ngay tại hook thì mask 4 chiều mà lớp bọc Gemma3
+dựng sẵn (theo độ dài CŨ) sẽ lệch shape — đó là lý do việc chèn nằm ở
+collate chứ không ở hook.
 
 Router đọc THẲNG `pixel_values` — không đi qua hidden state của Gemma. Nó
 được truyền vào `RouterBridge.begin()` từ chỗ gọi, vì ở đầu decoder thì
 pixel_values đã bị nuốt vào inputs_embeds từ lâu.
 
-Chỗ móc nối là một `forward_pre_hook` đặt trên KHỐI DECODER TEXT. Vì sao chọn
-chỗ này chứ không tự dựng inputs_embeds:
-
-  * đúng thứ transformers sẽ đưa vào decoder — kể cả phần ghép ảnh vào chuỗi,
-    thứ mà mỗi bản transformers lại làm khác một chút;
-  * gate được đặt TRƯỚC khi layer đầu tiên chạy, nên mọi Linear đã có trọng số
-    expert đúng của batch;
-  * `model(**batch)` và `model.generate(**inputs)` gọi y như cũ — không có
-    nhánh riêng cho lúc train và lúc sinh.
+Chỗ móc là `forward_pre_hook` trên khối decoder text chứ không phải một
+inputs_embeds tự dựng: đó đúng là thứ transformers sẽ đưa vào decoder — kể cả
+phần ghép ảnh vào chuỗi, thứ mà mỗi bản transformers lại làm khác một chút —
+và `model(**batch)` / `model.generate(**inputs)` gọi y như cũ.
 """
 from __future__ import annotations
 
@@ -39,8 +50,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from . import moe
 from .config import adapter_desc, arch_summary
-from .router import (CONVNEXT_WEIGHTS, FROZEN_UPTO, IMG_SIZE, RouterNet,
-                     STRIDE)
+from .router import D_DECODER, IMG_SIZE, N_BLOCK, N_TOKEN, RouterNet
 
 _BF16_OK = None
 
@@ -124,9 +134,12 @@ class RouterBridge:
       "route"   chạy router, đặt gate, để forward chảy tiếp vào decoder.
     """
 
-    def __init__(self, router, log=None):
+    def __init__(self, router, n_slot=N_TOKEN, log=None):
         self.router = router
         self.log = log
+        # Số vị trí giữ chỗ mà collate chèn ở ĐẦU chuỗi để hook ghi đè bằng
+        # prefix của router. Phải khớp `add_router_slots` ở chỗ gọi.
+        self.n_slot = int(n_slot)
         self.mode = "off"
         self.mask = None          # [B, N] 1 = prompt/ảnh, 0 = target/padding
         self.hidden = None        # chỉ dùng ở chế độ "capture"
@@ -136,6 +149,8 @@ class RouterBridge:
         # bị nuốt vào inputs_embeds từ lâu.
         self.pixels = None        # [B, 3, H, W]
         self.out = None           # (sup_logits, gate, stats) ở "route"
+        # [B, n_slot, 2560] — 256 token router ghi đè vào đầu chuỗi decoder.
+        self.prefix = None
         # Ép gate đi vào MoE (chỉ mode=probe / src/probe.py dùng). `self.out` vẫn
         # giữ gate THẬT router tính ra — ép cái đi vào expert, không ép cái
         # router nghĩ — nên một forward vừa bật được đúng một expert vừa cho
@@ -148,12 +163,14 @@ class RouterBridge:
     def begin(self, mode, mask=None, pixels=None):
         self.mode, self.mask, self.hidden, self.out = mode, mask, None, None
         self.pixels = pixels
+        self.prefix = None
         self.force_gate = None
         moe.CTX.clear()
 
     def end(self):
         self.mode, self.mask, self.hidden = "off", None, None
         self.pixels = None
+        self.prefix = None
         self.force_gate = None
         moe.CTX.clear()
 
@@ -181,12 +198,35 @@ class RouterBridge:
             self.hidden = hidden.detach()
             raise StopAfterRouter
 
-        # "route": lúc generate, chỉ prefill (T > 1) mới tính lại gate; các
-        # bước decode sau chỉ có 1 token mới và PHẢI dùng đúng gate đã chọn cho
-        # câu đó, nếu không mỗi token lại rơi vào một expert khác.
+        # "route": lúc generate, chỉ prefill (T > 1) mới chạy router. Các
+        # bước decode sau chỉ có 1 token mới và PHẢI dùng đúng gate đã chọn
+        # cho câu đó, nếu không mỗi token lại rơi vào một expert khác; prefix
+        # thì đã nằm trong KV-cache từ prefill nên cũng không ghi lại.
         if hidden.shape[1] > 1 or moe.CTX.weights is None:
             self.run()
-        return None
+        if self.prefix is None or hidden.shape[1] <= 1:
+            return None
+
+        n = self.prefix.shape[1]
+        if hidden.shape[1] < n:
+            raise RuntimeError(
+                f"chuỗi vào decoder chỉ có {hidden.shape[1]} vị trí nhưng "
+                f"router cần ghi đè {n} vị trí giữ chỗ ở đầu. Chỗ gọi quên "
+                f"add_router_slots(), hoặc max_seq_len đã cắt mất chúng.")
+        if self.prefix.shape[0] != hidden.shape[0]:
+            raise RuntimeError(
+                f"prefix có batch {self.prefix.shape[0]} nhưng chuỗi có "
+                f"{hidden.shape[0]}. Beam search chưa hỗ trợ (num_beams phải "
+                f"= 1), hoặc router chưa chạy lại cho batch mới.")
+        # GHI ĐÈ, không nối: độ dài chuỗi phải giữ nguyên vì mask 4 chiều đã
+        # được lớp bọc Gemma3 dựng theo độ dài này rồi (xem docstring module).
+        merged = torch.cat([self.prefix.to(hidden.dtype), hidden[:, n:]],
+                           dim=1)
+        if "inputs_embeds" in kwargs:
+            kwargs["inputs_embeds"] = merged
+        else:
+            args = tuple(merged if a is hidden else a for a in args)
+        return args, kwargs
 
     def run(self, pixels=None):
         """Chạy router trên ẢNH của batch hiện tại, đặt gate vào moe.CTX.
@@ -207,13 +247,14 @@ class RouterBridge:
         # thẳng fp32 vừa rẻ vừa không có bẫy nào.
         if bf16_ok():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                sup_logits, gate, stats = self.router(px)
+                sup_logits, gate, prefix, stats = self.router(px)
         else:
             p_dtype = next(self.router.parameters()).dtype
-            sup_logits, gate, stats = self.router(px.to(p_dtype))
-        # 3 phần tử. Số hạng cân bằng tải KHÔNG là phần tử thứ tư: nó nằm
+            sup_logits, gate, prefix, stats = self.router(px.to(p_dtype))
+        # Số hạng cân bằng tải KHÔNG phải một giá trị trả về riêng: nó nằm
         # trong `stats["aux_loss"]` dưới dạng TENSOR có gradient, để chữ ký
         # của forward không đổi giữa train/eval/probe (xem src/router.py).
+        self.prefix = prefix
         self.out = (sup_logits.float(), gate, stats)
         if self.force_gate is not None:
             if self.force_gate.shape != gate.shape:
@@ -382,39 +423,43 @@ def build_model(cfg, hf_token, log):
             p.data = p.data.to(f.trainable_dtype)
 
     # ── Nhánh router ────────────────────────────────────────────────────────
-    # Router KHÔNG đọc hidden state của Gemma nữa, nên không còn `d_enc`:
-    # hidden_size của decoder không liên quan gì tới nhánh này.
+    # Router đọc ẢNH, nên không có `d_enc` nào. `d_dec` chỉ dùng cho MLP Proj
+    # (256 token router -> chiều hidden của decoder) và được ĐỌC TỪ CHÍNH
+    # config của model thay vì hằng số, để đổi model nền là hỏng ngay ở đây
+    # chứ không phải ở một phép cat lệch chiều giữa forward.
     route_noise = float(getattr(f, "route_noise", 0.5) or 0.0)
     # Giá trị ĐẦU của lịch decay (None = không có lịch). Đọc bằng getattr để
     # config thiếu khoá vẫn dựng được model.
     ns = getattr(f, "route_noise_start", None)
     decay_samples = int(getattr(f, "decay_warmup_samples", 0) or 0)
     img_size = int(getattr(f, "router_img_size", IMG_SIZE))
+    d_dec = int(getattr(getattr(model.config, "text_config", model.config),
+                        "hidden_size", D_DECODER))
     router = RouterNet(f.n_expert, f.top_k, route_noise=route_noise,
                        route_noise_start=(None if ns is None else float(ns)),
                        decay_samples=decay_samples,
-                       backbone=getattr(f, "router_backbone",
-                                        CONVNEXT_WEIGHTS),
-                       img_size=img_size,
-                       frozen_upto=int(getattr(f, "router_frozen_upto",
-                                               FROZEN_UPTO)),
+                       img_size=img_size, d_decoder=d_dec,
                        log=log).to("cuda", f.trainable_dtype)
-    bridge = RouterBridge(router, log)
+    bridge = RouterBridge(router, n_slot=router.n_token, log=log)
     bridge.attach(find_text_decoder(model, log))
 
     n_router = sum(p.numel() for p in router.parameters())
     n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log("router", arch_summary(cfg))
-    log("router", f"    ảnh {img_size}² -> lưới {img_size//STRIDE}×"
-                  f"{img_size//STRIDE} = {(img_size//STRIDE)**2} token × "
-                  f"{router.dim} chiều | đóng băng features[0:"
-                  f"{router.backbone.frozen_upto}]")
+    log("router", f"    ảnh {img_size}² -> {N_BLOCK} bậc downsample -> lưới "
+                  f"{router.grid}×{router.grid} = {router.n_token} token × "
+                  f"{router.dim} chiều | train từ số 0, không pretrain")
+    log("router", f"    prefix: {router.n_token} token × {d_dec} chiều ghi đè "
+                  f"{router.n_token} vị trí giữ chỗ ở đầu chuỗi decoder")
     log("router", f"    route_noise σ={route_noise:g} (sau warmup) "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
                      else "— TẮT, top-k tất định, KHÔNG còn cơ chế khám phá"))
     log("router", f"    {router.decay_desc()}")
     log("router", f"    cân bằng tải: aux loss w={cfg.run.w_aux:g} "
                   f"(E·Σf·P, sàn 1.0) — không còn bias/trần tải/expert hứng")
+    log("router", "    BatchNorm: lúc TRAIN gate phụ thuộc bạn cùng "
+                  "micro-batch; eval/probe/generate dùng thống kê chạy nên "
+                  "tất định")
     for k, v in router.param_table().items():
         log("router", f"    {k:<30} {v:>12,}")
     log("lora", f"✓ {adapter_desc(f)} | trainable expert {n_expert_p:,} "
@@ -471,10 +516,64 @@ def wrap_images(images, model_id):
     return list(images) if "Qwen" in model_id else [[im] for im in images]
 
 
-def build_collate(processor, tokenizer, cfg, prompt_str, log=None):
+# Giá trị điền vào n_slot vị trí giữ chỗ, theo từng khoá. Khoá nào không
+# có ở đây thì không được chèn (và sẽ lệch độ dài với input_ids -> nổ ngay
+# trong `add_router_slots`).
+_SLOT_FILL = {"attention_mask": 1, "labels": -100, "token_type_ids": 0,
+              "router_mask": 1}
+
+
+def add_router_slots(inp, n_slot, pad_id):
+    """Chèn `n_slot` vị trí GIỮ CHỖ vào ĐẦU mọi tensor [B, T] của batch.
+
+    Đây là toàn bộ cơ chế đưa 256 token của router vào decoder: chèn chỗ ở
+    đây, ghi đè embedding ở hook (src/model.py::RouterBridge._hook). Chiều
+    dài chuỗi mà transformers thấy là chiều dài CUỐI CÙNG, nên mask 4 chiều,
+    position id và KV-cache đều đúng mà không phải sửa gì trong transformers.
+
+    Điền gì vào đâu, và vì sao:
+      input_ids      pad_id — embedding của nó bị ghi đè hoàn toàn, giá trị
+                     không quan trọng; chọn pad để nếu hook KHÔNG chạy thì
+                     kết quả là "thêm 256 token pad" chứ không phải rác.
+      attention_mask 1 — 256 token này PHẢI được nhìn thấy, kể cả ở hàng đã
+                     bị đệm trái.
+      labels         -100 — không có gì để dự đoán ở đó.
+      token_type_ids 0 — coi như text: mask nhân quả thường. Đặt 1 là khai
+                     chúng thuộc một khối ảnh của Gemma, và lớp bọc Gemma3
+                     sẽ dựng mask hai chiều theo mm_tokens_per_image cho một
+                     khối không tồn tại.
+      router_mask    1 — chỉ để ghi log, router không đọc chuỗi.
+
+    Gọi SAU bước cắt max_seq_len: phép cắt ăn từ ĐẦU chuỗi và sẽ nuốt đúng
+    những vị trí này.
+    """
+    if not n_slot:
+        return inp
+    ids = inp["input_ids"]
+    B, T = ids.shape
+    inp["input_ids"] = torch.cat(
+        [ids.new_full((B, n_slot), int(pad_id)), ids], dim=1)
+    for k, fill in _SLOT_FILL.items():
+        v = inp.get(k)
+        if v is None:
+            continue
+        if v.dim() != 2 or v.shape[1] != T:
+            raise RuntimeError(
+                f"'{k}' có shape {tuple(v.shape)}, không khớp input_ids "
+                f"[{B}, {T}] — không chèn được vị trí giữ chỗ cho router.")
+        inp[k] = torch.cat([v.new_full((B, n_slot), fill), v], dim=1)
+    return inp
+
+
+def build_collate(processor, tokenizer, cfg, prompt_str, log=None,
+                  n_slot=N_TOKEN):
     f, r = cfg.fixed, cfg.run
     img_tok = find_image_token_id(processor)
     warned = []
+    if log:
+        log("seq", f"chuỗi vào decoder = {n_slot} token router + tối đa "
+                   f"{r.max_seq_len} token prompt/ảnh/target = "
+                   f"{n_slot + (r.max_seq_len or 0)}")
 
     def collate(batch):
         images, targets, ys = zip(*batch)
@@ -528,7 +627,9 @@ def build_collate(processor, tokenizer, cfg, prompt_str, log=None):
                     log("seq", f"⚠ chuỗi {ids.shape[-1]} > max_seq_len "
                                f"{r.max_seq_len} nhưng cắt sẽ ăn vào image "
                                f"token -> BỎ QUA cắt (chuỗi chạy full).")
-        return inp
+
+        # SAU cùng: chèn chỗ cho prefix của router (xem `add_router_slots`).
+        return add_router_slots(inp, n_slot, tokenizer.pad_token_id)
 
     return collate
 

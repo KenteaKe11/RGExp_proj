@@ -1,24 +1,15 @@
-"""Lịch LR cosine warm restarts (SGDR) đếm theo MẪU + cộng trung bình trọng số.
+"""Lịch LR cosine warm restarts (SGDR), đếm theo MẪU.
 
-Hai thứ trong file này đi cùng nhau, không phải hai tính năng rời:
+`CosineRestartSchedule` đưa LR về ĐÁY vài lần trong một lịch train thay vì
+đúng một lần ở cuối: mỗi lần chạm đáy, trọng số nằm yên trong MỘT lòng chảo
+của hàm loss; mỗi lần restart, LR bật lại lên đỉnh và đẩy trọng số sang lòng
+chảo khác.
 
-  * `CosineRestartSchedule` đưa LR về ĐÁY vài lần trong một lịch train thay vì
-    đúng một lần ở cuối. Mỗi lần chạm đáy, trọng số nằm yên trong MỘT lòng
-    chảo của hàm loss; mỗi lần restart, LR bật lại lên đỉnh và đẩy trọng số
-    sang lòng chảo khác.
-  * `WeightAverager` gom đúng những điểm đáy đó rồi cộng trung bình ĐỀU. Trung
-    bình của các điểm cùng nằm trong đáy cho một điểm nằm ở vùng phẳng hơn của
-    loss — đó là toàn bộ lý do của SWA. Trung bình các điểm GIỮA cycle (LR còn
-    cao, trọng số đang bay giữa hai lòng chảo) thì vô nghĩa: điểm trung bình
-    không nằm trong lòng chảo nào cả. Nên averager CHỈ được cho ăn ở biên cycle.
-
-LỊCH TRAIN KHÔNG CÓ ĐÍCH. Từ khi bỏ hai phase và bỏ trần số mẫu, không còn
-`total_samples` nào để chia cosine cho vừa: train chạy tuần tự hết tập train
-thì nâng epoch rồi chạy tiếp, cho tới khi người dùng dừng tay. Nên lịch ở đây
-là một chuỗi cycle DÀI BẰNG NHAU lặp vô hạn — mỗi cycle đúng `cycle_samples`
-mẫu, bật lên đỉnh rồi cosine xuống đáy, rồi lại bật. Không có "cycle cuối
-ngắn hơn", không có ngày kết thúc; dừng ở đâu thì bộ trung bình SWA đã gom
-được ngần ấy đáy.
+LỊCH TRAIN KHÔNG CÓ ĐÍCH. Không còn `total_samples` nào để chia cosine cho
+vừa: train chạy tuần tự hết tập train thì nâng epoch rồi chạy tiếp, cho tới
+khi người dùng dừng tay. Nên lịch ở đây là một chuỗi cycle DÀI BẰNG NHAU lặp
+vô hạn — mỗi cycle đúng `cycle_samples` mẫu, bật lên đỉnh rồi cosine xuống
+đáy, rồi lại bật.
 
 Vì sao cycle đếm bằng MẪU chứ không bằng step: step = samples / (train_bs ×
 grad_accum), mà batch mỗi máy một khác. Nếu cycle dài "100 step" thì máy A100
@@ -111,7 +102,7 @@ class CosineRestartSchedule:
 
     # ── hình học của lịch ────────────────────────────────────────────────────
     def cycle_index(self, samples):
-        """Cycle thứ mấy tại mốc `samples`. Dùng để BẮT biên cho SWA."""
+        """Cycle thứ mấy tại mốc `samples`. Dùng để BẮT biên cycle."""
         return max(int(samples), 0) // self.cycle_samples
 
     def cycle_span(self, c):
@@ -119,7 +110,7 @@ class CosineRestartSchedule:
         return c * self.cycle_samples, self.cycle_samples
 
     def next_bound(self, samples):
-        """Mốc mẫu KẾT THÚC của cycle đang chạy — chỗ chụp snapshot SWA."""
+        """Mốc mẫu KẾT THÚC của cycle đang chạy."""
         return (self.cycle_index(samples) + 1) * self.cycle_samples
 
     def bounds(self, n=6, samples=0):
@@ -169,80 +160,3 @@ class CosineRestartSchedule:
             s += (f" | ⚠ đỉnh ×{self.cycle_lr_decay} mỗi cycle — lịch vô hạn "
                   f"sẽ tắt dần LR về 0")
         return s
-
-
-class WeightAverager:
-    """Trung bình ĐỀU (running mean) các snapshot ở đáy LR mỗi cycle — SWA.
-
-    Giữ đúng MỘT bản trung bình, fp32, trên CPU: cộng dồn tại chỗ nên bộ nhớ
-    không tăng theo số cycle, và fp32 để 12 lần cộng dồn không bị bào mòn như
-    khi cộng trong bf16.
-
-    Không cần pass cập nhật BatchNorm như SWA kinh điển: model ở đây chỉ có
-    LayerNorm/RMSNorm, không lớp nào giữ thống kê chạy theo batch.
-
-    Payload là dict LỒNG một tầng: {"router": {...}, "experts": {...}} — đúng
-    hình dạng mà `weights.pt` đang dùng, để nạp lại không phải đổi hình.
-    """
-
-    def __init__(self):
-        self.n = 0
-        self.avg = {}
-        self.marks = []          # mốc mẫu của từng snapshot, để ghi log/meta
-
-    def add(self, payload, mark=None):
-        self.n += 1
-        for section, sd in payload.items():
-            dst = self.avg.setdefault(section, {})
-            for k, v in sd.items():
-                v = v.detach().to("cpu")
-                if not v.is_floating_point():
-                    dst[k] = v.clone()          # buffer int: giữ bản mới nhất
-                    continue
-                v = v.to(torch.float32)
-                if k not in dst:
-                    dst[k] = v.clone()
-                else:
-                    if dst[k].shape != v.shape:
-                        raise RuntimeError(
-                            f"SWA: '{section}/{k}' đổi shape {tuple(dst[k].shape)}"
-                            f" -> {tuple(v.shape)} giữa hai snapshot")
-                    # running mean: avg += (x - avg)/n. Không cộng tổng rồi
-                    # chia ở cuối — tổng của 12 tensor lớn dễ tràn dải fp32
-                    # hơn, và cách này cho phép dừng ở bất kỳ n nào.
-                    dst[k].add_((v - dst[k]) / self.n)
-        if mark is not None:
-            self.marks.append(int(mark))
-        return self.n
-
-    def ready(self, min_n=2):
-        """Dưới 2 snapshot thì "trung bình" chính là trọng số hiện tại."""
-        return self.n >= min_n
-
-    def payload(self):
-        return self.avg
-
-    def reset(self):
-        self.n, self.avg, self.marks = 0, {}, []
-
-    def state_dict(self):
-        """Tensor trả về là THAM CHIẾU SỐNG, không phải bản sao.
-
-        Đúng cho chỗ duy nhất gọi nó: `torch.save(swa.state_dict())` tuần tự
-        hoá ngay tại chỗ, và sao chép ~1GB mỗi lần ghi checkpoint (20 step một
-        lần) chỉ để rồi vứt đi là phí. Muốn giữ lại lâu hơn thì phải tự clone
-        — `add()` sau đó sẽ sửa TẠI CHỖ.
-        """
-        return {"n": self.n, "avg": self.avg, "marks": list(self.marks)}
-
-    def load_state_dict(self, st):
-        """Nhận bàn giao. CLONE để không dùng chung bộ nhớ với nguồn.
-
-        Không clone thì hai averager cùng trỏ vào một tensor: `add()` của cái
-        này sửa luôn bản của cái kia — im lặng và gần như không thể lần ra.
-        """
-        self.n = int(st.get("n", 0))
-        self.avg = {sec: {k: v.detach().clone() for k, v in sd.items()}
-                    for sec, sd in (st.get("avg") or {}).items()}
-        self.marks = list(st.get("marks", []))
-        return self.n

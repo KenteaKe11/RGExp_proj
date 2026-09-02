@@ -7,8 +7,7 @@
 #   Add-ons → Secrets      = HF_TOKEN (bắt buộc)
 #
 # Script này KHÔNG TRAIN GÌ CẢ. Nó:
-#   1. Kéo last/ từ Hub và nạp bản TRUNG BÌNH SWA (swa.pt), không phải trọng
-#      số cuối.
+#   1. Kéo last/ từ Hub và nạp trọng số cuối (weights.pt). Không còn SWA.
 #   2. Sinh báo cáo cho từng ảnh của TRỌN tập test (gate thật, đúng như
 #      mode=test) -> reports.csv + metrics.json như mọi ô sweep khác.
 #   3. Với mỗi ảnh, chạy thêm 1 forward nền (không expert) + 4 forward bật
@@ -24,8 +23,8 @@
 #
 # Hệ quả cần biết: mỗi lần chạy lại, script lấy bản MỚI NHẤT trên Hub. Lịch
 # train không có đích nên KHÔNG có "đợi train xong" — mọi bản probe đều là một
-# ảnh chụp của một thời điểm. Bản ghi có `train_samples`, `train_epoch` và
-# `swa_n` để biết nó chụp lúc nào; muốn so hai lần probe thì so ba số đó.
+# ảnh chụp của một thời điểm. Bản ghi có `train_samples` và `train_epoch` để
+# biết nó chụp lúc nào; muốn so hai lần probe thì so hai số đó.
 #
 # ── Chạy lại được, và vì sao đó là điều kiện sống còn ────────────────────────
 # Phiên Kaggle tối đa ~12h. Trọn test là 3000 ảnh × (1 lần generate + 5
@@ -133,7 +132,7 @@ CONFIG = "configs/kaggle_probe.yaml"
 with open(CONFIG, "w", encoding="utf-8") as fh:
     yaml.safe_dump(cfg, fh, allow_unicode=True, sort_keys=False)
 print(f"✓ {CONFIG}: mode=probe | {cfg['fixed']['n_expert']}E top-"
-      f"{cfg['fixed']['top_k']} | router cnx256 | "
+      f"{cfg['fixed']['top_k']} | router cnnqf1024 | "
       f"{'trọn test' if N_IMAGES is None else str(N_IMAGES) + ' ảnh'} | "
       f"đủ {cfg['fixed']['n_expert']} expert trên "
       f"{'mọi ảnh' if FULL_N is None else str(FULL_N) + ' ảnh đầu'} | "
@@ -158,7 +157,7 @@ print(f"\n═══ thoát mã {rc} | log: {WORK}/outputs/<tag>/logs/latest.log 
 # Dataset repo <hub_repo>-probe, thư mục records/, mỗi ảnh một file JSON:
 #
 #   {"key_id": "p10/p10000032/s50414267/....jpg",
-#    "train_samples": 41600, "swa_n": 6, "weights": "swa.pt (trung bình 6 ...)",
+#    "train_samples": 41600, "weights": "weights.pt (trọng số cuối)",
 #    "grid": [16, 16],
 #    "disease_labels": [...14 tên...], "aspect_labels": [...4 tên...],
 #    "router":  {"gate": [...16...], "chosen": [3, 11, 7, 0, 14, 9], ...},

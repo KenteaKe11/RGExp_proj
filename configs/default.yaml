@@ -5,27 +5,24 @@
 #   arch   — model nền. KHÔNG còn sweep: kiến trúc router đã chốt hẳn.
 #   run    — tự do chỉnh theo phần cứng.
 #
-# BỐN THAY ĐỔI LỚN so với bản trước, đọc trước khi sửa gì:
+# BA THAY ĐỔI LỚN so với bản trước, đọc trước khi sửa gì:
 #
-#   1. ROUTER ĐỔI HẲN KIẾN TRÚC. ConvNeXt-Tiny (ImageNet) đóng băng stem +
-#      3 stage đầu → 1×1 conv về 256 chiều → coi [256 kênh × 256 token] như
-#      một ảnh 1 kênh 256×256 → 4 bậc conv stride-2 (1→2→4→8→16 kênh) →
-#      flatten 4096 → 2048 → 1024 → hai Linear cuối (14 finding | E expert).
-#      KHÔNG còn DenseNet-CXR, không còn stack MQA, không còn Separation.
-#      Không còn siêu tham số kiến trúc nào để quét -> khối `sweep:` cũ đổi
-#      tên thành `arch:` và chỉ giữ lại `model`.
-#   2. CÂN BẰNG TẢI QUAY VỀ AUX LOSS. Bỏ hẳn bias b_e (DeepSeek-V3), trần
-#      tải mỗi micro-batch, và 2 expert HỨNG. Thay bằng ĐÚNG một số hạng
-#      trong Total_Loss:
-#          Total_Loss = 1·CE + 0.5·ASL + 0.05·Aux
-#      với Aux = E·Σ f_e·P_e (Switch-Transformer), sàn 1.0.
-#   3. LỊCH GUMBEL ĐẾM BẰNG MẪU. σ đi 1.0 → 0.5 trong 3200 MẪU đầu (không
-#      phải step — step phụ thuộc batch của từng máy).
-#   4. WARMUP Ở ĐẦU MỌI CYCLE LR, không chỉ cycle đầu.
+#   1. ROUTER ĐỔI HẲN KIẾN TRÚC và nó CẮM THÊM MỘT ĐƯỜNG vào decoder.
+#      Feat-Extractor tự train (5 bậc conv, 1→1024 kênh, 512²→16²) → 256
+#      token × 1024 chiều → self-attn → QFormer 2 query → hai head
+#      (14 finding | E expert). Ngoài gate, 256 token đó còn được chiếu lên
+#      2560 chiều và GHÉP VÀO ĐẦU CHUỖI decoder. Không còn ConvNeXt/DenseNet,
+#      không còn backbone pretrain nào.
+#   2. BỎ HẲN SWA. Trọng số đem đi chấm và đem đi probe là bản CUỐI trong
+#      weights.pt, không còn trung bình snapshot nào.
+#   3. EXPERT CHỈ GẮN VÀO 4 MA TRẬN ATTENTION (q, k, v, o). Không đụng vào
+#      MLP của decoder — một expert còn 4.68M param thay vì 15.9M.
 #
-# Giữ nguyên từ bản trước: MỘT phase multi-task duy nhất; lịch train KHÔNG
-# CÓ ĐÍCH (chạy tuần tự tập train, hết thì epoch += 1, mãi mãi, tới khi
-# Ctrl-C hoặc hết giờ máy); lần chạy sau LUÔN resume nếu có checkpoint.
+# Giữ nguyên từ bản trước: MỘT phase multi-task duy nhất; cân bằng tải bằng
+# ĐÚNG một số hạng aux trong Total_Loss (Switch, sàn 1.0); lịch Gumbel và
+# lịch LR đếm bằng MẪU; lịch train KHÔNG CÓ ĐÍCH (chạy tuần tự tập train,
+# hết thì epoch += 1, mãi mãi, tới khi Ctrl-C hoặc hết giờ máy); lần chạy
+# sau LUÔN resume nếu có checkpoint.
 #
 # Ghi đè:  --set run.cycle_samples=6400   hoặc   --model qwen25vl
 # ═════════════════════════════════════════════════════════════════════════════
@@ -59,8 +56,8 @@ fixed:
   # TOP-K THUẦN trên CẢ 24 expert. Không còn expert HỨNG (n_shared) nào bị
   # loại khỏi vòng chọn, không còn trần tải mỗi micro-batch. Cân bằng tải
   # hoàn toàn do run.w_aux lo.
-  n_expert: 24
-  top_k: 6
+  n_expert: 12
+  top_k: 4
 
   # ── Nhiễu Gumbel khi CHỌN top-k (chỉ lúc TRAINING) ───────────────────────
   # top-k(logit + σ·Gumbel) = lấy mẫu k expert KHÔNG LẶP từ softmax(logit),
@@ -90,25 +87,16 @@ fixed:
   route_noise_start: 1.0
   decay_warmup_samples: 3200
 
-  # ── Backbone ảnh của router ──────────────────────────────────────────────
-  # ConvNeXt-Tiny pretrain ImageNet-1k (torchvision). Router đọc THẲNG
-  # pixel_values của processor Gemma: gộp về dải [0,1], chuẩn hoá ImageNet,
-  # resize 512. Xem docstring src/router.py để biết vì sao đổi từ DenseNet-CXR
-  # sang đây (gọn hơn một nhóm rào chắn BatchNorm, đổi lại mất pretrain đúng
-  # miền — bù bằng việc cho stage4 học tiếp).
-  # null = dựng kiến trúc với trọng số ngẫu nhiên: CHỈ để selftest offline.
-  router_backbone: IMAGENET1K_V1
-  # Cỡ ảnh vào backbone. 512 KHÔNG phải lựa chọn tự do: ConvNeXt có tổng
-  # stride 32, nên 512 cho lưới 16×16 = 256 token — đúng bằng 256 chiều làm
-  # việc, và khối downsample cần một ma trận VUÔNG. config.py chặn cứng nếu
-  # (router_img_size/32)² ≠ 256.
+  # ── Ảnh vào nhánh router ─────────────────────────────────────────────────
+  # Router đọc THẲNG pixel_values của processor Gemma (dải [-1,1]), thu về
+  # 512² rồi trung bình 3 kênh xám về 1. 512 KHÔNG phải lựa chọn tự do:
+  # Feat-Extractor có 5 bậc stride-2, nên 512 cho lưới 16×16 = 256 token —
+  # đúng số token được ghép vào đầu chuỗi decoder. config.py chặn cứng mọi
+  # giá trị khác.
+  #
+  # KHÔNG còn `router_backbone` / `router_frozen_upto`: nhánh này không nạp
+  # trọng số pretrain nào và train hết từ số 0 (xem src/router.py).
   router_img_size: 512
-  # Đóng băng features[0:7] = stem + stage1 + stage2 + stage3 kèm cả ba lớp
-  # downsample (13.5M param); features[7] = stage4 (14.3M) học tiếp.
-  # Hạ số này là mở thêm stage3 (9 block, 10.8M) — phần trainable của router
-  # gần gấp đôi, và 25k mẫu khó nắn lại vùng đặc trưng trung gian mà không
-  # quên pretrain.
-  router_frozen_upto: 7
 
   # ── Adapter (đã chốt: QDoRA r8) ──────────────────────────────────────────
   lora_r: 8
@@ -117,6 +105,11 @@ fixed:
   # KHÔNG có dropout; có dropout thì mỗi expert phải tính LẠI phép nhân ma
   # trận base cho x đã bị drop -> chi phí × số expert. Giữ nhỏ có chủ ý.
   lora_dropout: 0.05
+  # CHỈ 4 ma trận attention. Không đụng gate_proj/up_proj/down_proj: MLP
+  # chiếm hơn 2/3 số tham số adapter (15.9M -> 4.68M mỗi expert khi bỏ chúng)
+  # trong khi chuyên môn hoá theo LOẠI PHIM là việc của attention — chọn
+  # nhìn vào đâu — chứ không phải của MLP. 24 expert × 4.68M = 112M param
+  # trainable, vừa với VRAM của một T4.
   lora_targets: [q_proj, k_proj, v_proj, o_proj]
 
   compute_dtype: bfloat16   # §4.1.3 — cần sm80+
@@ -142,22 +135,22 @@ fixed:
 # ─────────────────────────── Kiến trúc / model nền ───────────────────────────
 # Trước đây khối này tên `sweep:` và có thêm `variant` + `n_block`. Không còn
 # gì để quét: router đã chốt (xem src/router.py), nên chỉ còn model nền.
-# `arch.tag` = "<model>-cnx256" đặt tên outputs/, ckpt/, repo Hub và wandb run.
+# `arch.tag` = "<model>-cnnqf1024" đặt tên outputs/, ckpt/, repo Hub và wandb run.
 arch:
   model: gemma3
 
 # Bảng tra: tên model + module loại khỏi adapter + CẤU HÌNH ẢNH RIÊNG.
-# `hidden_size` đã BỎ: nó từng là d_enc — chiều hidden state của decoder mà
-# Stem cũ đọc vào. Router giờ đọc ẢNH, không đọc hidden state, nên chiều đó
-# không còn liên quan gì tới nhánh router.
+# `hidden_size` không nằm ở đây: chiều hidden của decoder được ĐỌC TỪ chính
+# config của model lúc dựng (src/model.py), vì MLP Proj của router phải chiếu
+# đúng vào nó — ghi tay ở hai chỗ là để chúng lệch nhau.
 models:
   gemma3:
     model_id: google/gemma-3-4b-it
     exclude: [vision_tower, multi_modal_projector, lm_head]
     # SigLIP của Gemma 3 chạy ở 896² CỐ ĐỊNH (bảng position embedding 4096 vị
     # trí). Cỡ khác -> phải nội suy pos-emb. 256 image token.
-    # Router KHÔNG dùng cỡ này: nó thu 896 -> 512 cho ConvNeXt (xem
-    # fixed.router_img_size), tức quay lại gần đúng số pixel của ảnh nguồn.
+    # Router KHÔNG dùng cỡ này: nó thu 896 -> 512 (xem fixed.router_img_size),
+    # tức quay lại gần đúng số pixel của ảnh nguồn.
     image_size: 896
     processor_kwargs: {}
   qwen25vl:
@@ -216,7 +209,7 @@ run:
   n_test_samples: 200       # §1.1 — 200 mẫu sinh text có metrics (mode=test)
 
   # ── Phase probe: khảo sát chuyên môn expert (mode: probe) — xem §3.6 ──────
-  # KHÔNG train. Nạp trung bình SWA từ last/ trên Hub, sinh báo cáo cho từng
+  # KHÔNG train. Nạp last/ trên Hub, sinh báo cáo cho từng
   # ảnh test, rồi bật lần lượt từng expert trong top-k (trọng số 1.0) để đo:
   # bản đồ không gian 16×16 image token của Gemma, vector 14 bệnh + 4 aspect,
   # top-10 token
@@ -256,7 +249,7 @@ run:
   weight_decay: 0.01
   max_grad_norm: 1.0
 
-  # ── Lịch LR: cosine warm restarts (SGDR) + cộng trung bình trọng số ──────
+  # ── Lịch LR: cosine warm restarts (SGDR), đếm bằng MẪU ──────────────────
   # MỌI mốc ở đây đếm bằng MẪU, không bằng step. Lý do: step = mẫu /
   # (train_bs × grad_accum), mà batch mỗi máy một khác — cycle dài "100 step"
   # thì máy A100 (8×8) và máy 4080 (1×32) restart ở hai chỗ khác nhau trong
@@ -264,11 +257,9 @@ run:
   #
   # Lịch train không có đích nên cycle LẶP VÔ HẠN: mỗi cycle đúng
   # `cycle_samples` mẫu, LR bật lên đỉnh rồi cosine xuống đáy, rồi lại bật.
-  # Cuối mỗi cycle — lúc chạm đáy — trọng số được chụp và cộng trung bình đều
-  # (SWA). Dừng ở đâu thì bộ trung bình đã gom được ngần ấy đáy.
   #
   # Chọn cycle_samples thế nào: đủ dài để LR đi trọn một vòng có ý nghĩa, đủ
-  # ngắn để một phiên máy (Kaggle 12h chẳng hạn) gom được vài snapshot. Nên là
+  # ngắn để một phiên máy (Kaggle 12h chẳng hạn) đi qua được vài vòng. Nên là
   # bội của effective batch (32 hoặc 64) để biên cycle rơi đúng ranh giới
   # step; lệch thì chỉ có cảnh báo, không chặn.
   cycle_samples: 3200
@@ -285,25 +276,8 @@ run:
   # tức LR tắt dần về 0 và train tự chết — gần như không bao giờ là ý muốn.
   cycle_lr_decay: 1.0
 
-  # ── SWA: cộng trung bình trọng số các snapshot đáy ────────────────────────
-  # Trung bình ĐỀU (running mean, fp32, giữ trên CPU — một bản duy nhất, bộ
-  # nhớ không tăng theo số cycle). Không cần pass cập nhật BatchNorm như SWA
-  # kinh điển: cả router (ConvNeXt + RMSNorm) lẫn adapter chỉ có
-  # LayerNorm/RMSNorm — không lớp nào giữ thống kê chạy theo batch. Đây là
-  # một trong những lý do đổi backbone từ DenseNet (BatchNorm) sang ConvNeXt.
-  #
-  # Chỉ còn MỘT lịch train nên chỉ còn MỘT bộ trung bình, chạy suốt đời lần
-  # chạy. Nó được ghi vào swa.pt mỗi lần lưu checkpoint và dùng ở:
-  #   mode=test   -> chấm metrics trên bản trung bình (swa_use != never)
-  #   mode=probe  -> luôn nạp bản trung bình từ Hub
-  swa: false
-  # always -> luôn dùng bản trung bình khi eval
-  # auto   -> so val với trọng số cuối, thấp hơn thì mới lấy
-  # never  -> vẫn gom snapshot và ghi vào ckpt nhưng không bao giờ áp
-  swa_use: never
-
-  # ── §1.7 Total_Loss = 1·CE + 0.5·ASL + 0.05·Aux   (tỉ lệ CHỐT) ──────────
-  w_sup: 0.5                # hệ số nhánh supervised (ASL trên 14 finding)
+  # ── §1.7 Total_Loss = 1·CE + 0.3·ASL + 0.05·Aux   (tỉ lệ CHỐT) ──────────
+  w_sup: 0.3                # hệ số nhánh supervised (ASL trên 14 finding)
 
   # Hệ số số hạng CÂN BẰNG TẢI. Aux = E·Σ f_e·P_e (Switch-Transformer):
   #   f_e = tỉ lệ MẪU thật sự chọn expert e   (đếm, KHÔNG gradient)
@@ -352,7 +326,7 @@ run:
   asl_clip: 0.02
   # 1 = dương, 0 = âm. "possible pneumonia" là khẳng định YẾU chứ không phải
   # phủ định, nên nó nằm ở phía dương nhưng nhẹ hơn một ca chắc chắn.
-  uncertain_soft: 0.6
+  uncertain_soft: 0.65
 
   eval_every: 10
   eval_max_batches: 20
@@ -384,10 +358,6 @@ run:
   # nhận bàn giao mới có moment AdamW để chạy tiếp; false thì mỗi lần đổi máy
   # là momentum reset về 0.
   hub_include_optimizer: true
-  # true = đẩy cả swa.pt (bộ cộng dồn SWA, ~cỡ weights.pt) lên Hub. Bỏ nó lại
-  # thì máy nhận bàn giao bắt đầu trung bình từ 0 và bản trung bình cuối cùng
-  # chỉ gom được vài cycle cuối.
-  hub_include_swa: true
 
   # ── Quota HF: giữ tối đa N revision trên repo checkpoint ─────────────────
   # HF đếm dung lượng theo TOÀN BỘ blob LFS còn trong lịch sử repo, không phải

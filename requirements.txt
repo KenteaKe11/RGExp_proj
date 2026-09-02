@@ -7,13 +7,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Core
-# Backbone ảnh của router: ConvNeXt-Tiny pretrain ImageNet, lấy từ
-# torchvision.models. Trọng số tải về lần đầu (~110MB) rồi nằm trong cache
-# TORCH_HOME — cần mạng ở lần chạy đầu.
-#
-# torchvision KHÔNG được ghim ở đây vì cùng lý do với torch: bản của nó phải
-# khớp CUDA và khớp torch, và setup.sh cài cặp torch+torchvision cùng lúc.
-# `torchxrayvision` đã BỎ — backbone DenseNet-CXR không còn được dùng.
+# Nhánh router KHÔNG nạp trọng số ngoài nào nữa: Feat-Extractor là conv
+# thường, train từ số 0 (xem src/router.py). Không cần torchvision.models,
+# không cần `torchxrayvision`, không cần mạng để tải backbone ở lần chạy đầu.
 # CHÚ Ý cặp transformers <-> torch: từ 4.53, transformers dùng
 # `or_mask_function` cho mask ảnh của Gemma 3 và đòi torch >= 2.6. Ảnh
 # pytorch/* trên máy thuê thường đứng ở torch 2.5.x -> setup.sh tự ghim

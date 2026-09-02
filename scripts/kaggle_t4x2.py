@@ -24,10 +24,13 @@
 # 4. AUX LOSS QUAY LẠI và THAY HẲN cơ chế bias aux-free. Cân bằng tải =
 #    E·Σ f_e·P_e (Switch-Transformer), một số hạng trong loss. Không còn
 #    bias b_e, không còn trần tải mỗi micro-batch, không còn expert hứng.
-# 5. ROUTER ĐỔI KIẾN TRÚC: ConvNeXt-Tiny (ImageNet, đóng băng stem+3 stage)
-#    -> proj 256 -> downsample/flatten -> MLP -> 2 head. Không còn
-#    DenseNet-CXR, không còn MQA, không còn Separation, KHÔNG CÒN SWEEP
-#    (khối `sweep:` trong yaml đổi tên thành `arch:`, chỉ giữ `model`).
+# 5. ROUTER ĐỔI KIẾN TRÚC và CẮM THÊM MỘT ĐƯỜNG VÀO DECODER: Feat-Extractor
+#    tự train (5 bậc conv, 512²→16², 1→1024 kênh) -> 256 token × 1024 ->
+#    self-attn -> QFormer 2 query -> 2 head. Ngoài gate, 256 token đó còn
+#    được chiếu lên 2560 chiều và ghép vào ĐẦU chuỗi decoder. Không còn
+#    backbone pretrain nào.
+# 6. BỎ HẲN SWA. Trọng số đem đi chấm là bản CUỐI trong weights.pt.
+# 7. EXPERT chỉ gắn vào 4 ma trận attention (q,k,v,o): 4.68M/expert.
 #
 # Mọi khoá của bản cũ (phase*_samples, early_stop_*, focal_*, resume,
 # bias_gamma*, bias_clip, capacity_factor, n_shared, shared_weight,
@@ -40,25 +43,24 @@
 # mẫu, trong khi MỘT epoch là ~153.000 mẫu → 60-70 phiên cho một vòng dữ liệu.
 #
 # ĐỪNG NGHĨ THEO EPOCH. Câu hỏi đúng cho mỗi phiên là: "phiên này đi thêm được
-# bao nhiêu mẫu, và gom thêm được mấy snapshot SWA?". Con số điều khiển điều
-# đó là CYCLE_SAMPLES — xem khối ngay dưới.
+# bao nhiêu mẫu?". Con số điều khiển nhịp LR là CYCLE_SAMPLES — xem khối dưới.
 #
-# ── CYCLE_SAMPLES: con số quan trọng nhất của cell này ───────────────────────
+# ── CYCLE_SAMPLES ───────────────────────────────────────────────────────────
 # Lịch LR là cosine warm restarts LẶP VÔ HẠN, mỗi cycle dài đúng CYCLE_SAMPLES
-# mẫu. Cuối mỗi cycle (LR chạm đáy) trọng số được chụp và cộng vào bản trung
-# bình SWA — thứ duy nhất được đem đi chấm điểm sau này.
+# mẫu: bật lên đỉnh, cosine xuống đáy, rồi lại bật.
 #
-#   320 mẫu/cycle ở 0.05 mẫu/s ≈ 1.8h/cycle  → ~6 snapshot mỗi phiên 11h
-#   1600 mẫu/cycle              ≈ 8.9h/cycle → ~1 snapshot mỗi phiên
-#   6400 mẫu/cycle              ≈ 36h/cycle  → có phiên KHÔNG gom được cái nào
+#   320 mẫu/cycle ở 0.05 mẫu/s ≈ 1.8h/cycle  → ~6 vòng mỗi phiên 11h
+#   1600 mẫu/cycle              ≈ 8.9h/cycle → ~1 vòng mỗi phiên
+#   6400 mẫu/cycle              ≈ 36h/cycle  → có phiên không đi hết một vòng
 #
-# Cycle dài hơn phiên nghĩa là SWA đứng yên suốt phiên đó. Cell tự cảnh báo.
+# Dừng phiên ở gần ĐÁY một cycle thì trọng số cuối "yên" hơn — từ khi bỏ SWA
+# thì đó là cách duy nhất còn lại để chọn một điểm dừng tốt.
 #
 # ── DỪNG: không có dừng sớm, không có đích ───────────────────────────────────
 # Train chạy tới khi Kaggle cắt phiên. Đó KHÔNG phải sự cố: checkpoint được
 # lưu mỗi SAVE_EVERY_N_VALS lần val và push lên Hub; phiên sau đọc lại và đi
-# tiếp. Muốn CHẤM ĐIỂM thì chạy một phiên riêng với MODE="test" (nó nạp bản
-# trung bình SWA từ Hub rồi sinh 200 báo cáo), hoặc MODE="probe".
+# tiếp. Muốn CHẤM ĐIỂM thì chạy một phiên riêng với MODE="test" (nó nạp
+# last/ từ Hub rồi sinh 200 báo cáo), hoặc MODE="probe".
 #
 # ── BATCH: hiểu đúng cái được và cái mất ─────────────────────────────────────
 # Đổi bs KHÔNG giảm tổng thời gian: bs=2 thì mỗi step nhanh gấp đôi nhưng số
@@ -97,7 +99,7 @@ REPO          = "https://github.com/KenteaKe11/RGExp_proj"
 BRANCH        = "main"
 MODE          = "train"   # "train" = chỉ train (mặc định trên Kaggle: phiên
                           #   nào cũng bị cắt nên không bao giờ tới khâu infer)
-                          # "test"  = không train, nạp SWA từ Hub rồi chấm
+                          # "test"  = không train, nạp last/ từ Hub rồi chấm
                           # "probe" = khảo sát chuyên môn expert
                           # "both"  = train tới khi Ctrl-C rồi mới infer —
                           #   gần như vô dụng trên Kaggle, không có ai Ctrl-C
@@ -112,18 +114,16 @@ GRAD_ACCUM    = 32        # effective = TRAIN_BS × GRAD_ACCUM
 SAMPLES_PER_S = 0.05      # sửa theo mốc dry-run của CHÍNH máy này
 N_TRAIN_EST   = 153000    # cỡ tập train, chỉ để in "một epoch ≈ bao lâu"
 
-# ── Lịch LR: cosine warm restarts VÔ HẠN + SWA (§1.8) ────────────────────────
+# ── Lịch LR: cosine warm restarts VÔ HẠN (§1.8) ─────────────────────────────
 CYCLE_SAMPLES = 320       # BẮT BUỘC > 0. Lịch train không có đích nên không
                           # còn tổng số mẫu nào để suy ra độ dài cycle.
-                          # Đây là con số quyết định một phiên gom mấy snapshot.
+                          # Đây là nhịp của cả buổi train.
 WARMUP_SAMPLES= None      # None = 15% cycle đầu, làm tròn bội của eff
 MIN_LR_RATIO  = 0.0       # đáy cosine = ratio × lr
 CYCLE_LR_DECAY= 1.0       # ⚠ GIỮ 1.0. Đỉnh cycle c = lr × decay^c, mà lịch
                           # này VÔ HẠN: 0.99 nghĩa là sau 500 cycle LR chỉ còn
                           # 0.7% và train tự chết mà không báo gì. Bản hai
                           # phase cũ có đích nên 0.99 vô hại; giờ thì không.
-SWA           = True      # cộng trung bình trọng số các snapshot đáy
-SWA_USE       = "always"  # auto = chỉ dùng nếu val thắng | always | never
 
 # ── Ổn định gradient ─────────────────────────────────────────────────────────
 MAX_GRAD_NORM = 1.0       # Cắt theo CHUẨN TOÀN CỤC: router + expert nằm trong
@@ -170,9 +170,6 @@ HUB_SYNC      = False     # True chỉ khi CÓ máy khác chạy song song cùng
                           # Một máy mà bật thì mỗi lần val đều gọi Hub vô ích.
 HUB_INCLUDE_OPTIMIZER = True   # ~1.6GB/push. Bỏ = mất moment AdamW mỗi lần
                                # đổi phiên.
-HUB_INCLUDE_SWA       = True   # ~0.8GB. Bỏ = bản trung bình đếm lại từ 0 mỗi
-                               # phiên → SWA vô nghĩa trên Kaggle (phiên nào
-                               # cũng đứt).
 PUSH_EVERY_N_SAVES    = 1      # chỉ dùng khi HUB_SYNC = False
 
 # ── Hạ tầng ──────────────────────────────────────────────────────────────────
@@ -363,10 +360,11 @@ sh(["git", "-C", ROOT, "log", "-1", "--oneline"])
 # hoàn toàn khác cái mình nghĩ. Ba dấu vân tay, mỗi cái ứng với một thay đổi
 # lớn — kiểm bằng nội dung file, không bằng ngày commit.
 _MARKS = [
-    ("src/optim.py", None, "lịch LR cosine restarts + SWA"),
+    ("src/optim.py", None, "lịch LR cosine restarts"),
     ("src/optim.py", "cycle_samples", "lịch LR VÔ HẠN (không còn total_samples)"),
     ("src/losses.py", "def asl_loss", "ASL thay cho Focal"),
-    ("src/router.py", "convnext", "router ConvNeXt-256 (bỏ DenseNet+MQA)"),
+    ("src/router.py", "QFormer", "router Feat-Extractor + QFormer + prefix"),
+    ("src/model.py", "add_router_slots", "256 token router ghép vào decoder"),
     ("src/losses.py", "def aux_loss", "cân bằng tải bằng aux loss (bỏ bias)"),
     ("src/optim.py", "đầu MỌI cycle", "warmup ở đầu mọi cycle LR"),
     ("src/train.py", "epoch_samples", "một phase multi-task, lịch không có đích"),
@@ -382,7 +380,7 @@ for _f, _needle, _what in _MARKS:
 assert not _bad, (
     "Repo đang ở bản CŨ:\n  - " + "\n  - ".join(_bad) +
     "\nPush bản mới lên GitHub rồi chạy lại (SKIP_GIT=False để fetch).")
-print("✓ repo đúng bản: router ConvNeXt-256 + aux loss + lịch vô hạn")
+print("✓ repo đúng bản: router CNN+QFormer, prefix 256 token, không SWA")
 
 # ── 3b. Vá / khôi phục debug hook ────────────────────────────────────────────
 MODEL_PY = f"{ROOT}/src/model.py"
@@ -472,9 +470,8 @@ cfg["run"]["data"]["image_cache"] = IMG_CACHE
 
 eff = TRAIN_BS * GRAD_ACCUM
 
-# ── 4a. Lịch LR + SWA ───────────────────────────────────────────────────────
-# Cắt tròn theo effective batch: biên cycle rơi đúng ranh giới step, snapshot
-# SWA không lệch.
+# ── 4a. Lịch LR ─────────────────────────────────────────────────────────────
+# Cắt tròn theo effective batch: biên cycle rơi đúng ranh giới step.
 assert CYCLE_SAMPLES and int(CYCLE_SAMPLES) > 0, (
     "CYCLE_SAMPLES phải > 0. Lịch train không có đích nên không còn tổng số "
     "mẫu nào để suy ra độ dài một cycle — nó phải được ghi thẳng ở đây.")
@@ -493,8 +490,6 @@ cfg["run"]["cycle_samples"] = cyc
 cfg["run"]["warmup_samples"] = warm
 cfg["run"]["min_lr_ratio"] = MIN_LR_RATIO
 cfg["run"]["cycle_lr_decay"] = CYCLE_LR_DECAY
-cfg["run"]["swa"] = bool(SWA)
-cfg["run"]["swa_use"] = SWA_USE
 cfg["run"]["max_grad_norm"] = MAX_GRAD_NORM
 
 # ── 4b. Val / checkpoint / Hub ──────────────────────────────────────────────
@@ -504,7 +499,6 @@ cfg["run"]["save_every_n_vals"] = SAVE_EVERY_N_VALS
 cfg["run"]["save_best"] = SAVE_BEST
 cfg["run"]["hub_sync"] = HUB_SYNC
 cfg["run"]["hub_include_optimizer"] = HUB_INCLUDE_OPTIMIZER
-cfg["run"]["hub_include_swa"] = HUB_INCLUDE_SWA
 cfg["run"]["push_every_n_saves"] = PUSH_EVERY_N_SAVES
 cfg["run"]["hub_keep_revisions"] = HUB_KEEP_REVISIONS
 
@@ -531,16 +525,15 @@ with open(CONFIG, "w", encoding="utf-8") as fh:
 print(f"\n✓ {CONFIG}")
 print(f"  dtype     {cfg['fixed']['compute_dtype']} | batch {TRAIN_BS}×{GRAD_ACCUM}"
       f" = effective {eff} | {cfg['fixed']['n_expert']}E top-{cfg['fixed']['top_k']}"
-      f" | {cfg['arch']['model']}-cnx256")
+      f" | {cfg['arch']['model']}-cnnqf1024")
 print(f"  loss      1·CE + {cfg['run']['w_sup']}·ASL + {cfg['run']['w_aux']}·Aux"
       f" | γ+={cfg['run']['asl_gamma_pos']}"
       f" γ-={cfg['run']['asl_gamma_neg']} | ngưỡng âm m={cfg['run']['asl_clip']}"
       f" (BI-RADS 3) | uncertain={cfg['run']['uncertain_soft']}, blank=MASK")
-print(f"  router    convnext_tiny {cfg['fixed']['router_backbone']}, ảnh "
-      f"{cfg['fixed']['router_img_size']}², đóng băng features[0:"
-      f"{cfg['fixed']['router_frozen_upto']}] | cân bằng tải = aux loss "
-      f"w={cfg['run']['w_aux']} (không còn bias/trần tải/expert hứng)"
-      f" | clip chuẩn toàn cục {MAX_GRAD_NORM}")
+print(f"  router    CNN 5 bậc + QFormer, ảnh "
+      f"{cfg['fixed']['router_img_size']}² -> 256 token × 1024 (train từ số "
+      f"0) | prefix 256 token vào decoder | cân bằng tải = aux loss "
+      f"w={cfg['run']['w_aux']} | clip chuẩn toàn cục {MAX_GRAD_NORM}")
 print(f"  decay     σ {cfg['fixed'].get('route_noise_start')}"
       f"→{cfg['fixed']['route_noise']}"
       f" | mũ, {cfg['fixed'].get('decay_warmup_samples')} MẪU đầu")
@@ -556,13 +549,12 @@ vals_per_cyc = cyc / (EVAL_EVERY * eff)
 cyc_per_session = 11 / max(hours(cyc), 1e-9)
 print(f"  lịch LR   cosine warm restarts VÔ HẠN | cycle {cyc} mẫu "
       f"({cyc//eff} step ≈ {hours(cyc):.1f}h) | warmup {warm} mẫu (cycle đầu)")
-print(f"  SWA       {'BẬT' if SWA else 'TẮT'} (swa_use={SWA_USE}) → "
-      f"~{cyc_per_session:.1f} snapshot mỗi phiên 11h | val "
-      f"{vals_per_cyc:.1f} lần/cycle")
+print(f"            ~{cyc_per_session:.1f} vòng cycle mỗi phiên 11h | val "
+      f"{vals_per_cyc:.1f} lần/cycle | SWA: BỎ HẲN (chấm trên trọng số cuối)")
 if cyc_per_session < 1:
-    warns.append(f"một cycle ≈ {hours(cyc):.1f}h > phiên 11h — có phiên KHÔNG "
-                 f"gom được snapshot nào và SWA đứng yên suốt phiên đó. Hạ "
-                 f"CYCLE_SAMPLES xuống ~{max(int(11*3600*SAMPLES_PER_S/3/eff),1)*eff}.")
+    warns.append(f"một cycle ≈ {hours(cyc):.1f}h > phiên 11h — LR không đi hết "
+                 f"một vòng trong phiên. Hạ CYCLE_SAMPLES xuống "
+                 f"~{max(int(11*3600*SAMPLES_PER_S/3/eff),1)*eff}.")
 if vals_per_cyc < 2:
     warns.append(f"chỉ {vals_per_cyc:.1f} lần val trong một cycle — gần như "
                  f"không nhìn thấy hình dạng của cycle. Hạ EVAL_EVERY xuống "
@@ -587,14 +579,9 @@ if MAX_GRAD_NORM > 10:
 print(f"  ckpt      mỗi {SAVE_EVERY_N_VALS} lần val = "
       f"{SAVE_EVERY_N_VALS*EVAL_EVERY*eff} mẫu ≈ "
       f"{hours(SAVE_EVERY_N_VALS*EVAL_EVERY*eff):.1f}h"
-      f" | Hub: optimizer={HUB_INCLUDE_OPTIMIZER} swa={HUB_INCLUDE_SWA} "
-      f"sync={HUB_SYNC} "
+      f" | Hub: optimizer={HUB_INCLUDE_OPTIMIZER} sync={HUB_SYNC} "
       + (f"| giữ {HUB_KEEP_REVISIONS} revision rồi gộp lịch sử"
          if HUB_KEEP_REVISIONS else "| lịch sử Hub để nguyên"))
-if not HUB_INCLUDE_SWA and SWA:
-    warns.append("HUB_INCLUDE_SWA=False: mỗi phiên Kaggle mới sẽ bắt đầu cộng "
-                 "trung bình lại từ 0. Trên Kaggle (phiên nào cũng đứt) điều "
-                 "đó làm SWA gần như vô nghĩa.")
 for w in warns:
     print(f"⚠ {w}")
 print()
@@ -690,14 +677,13 @@ print(f"log: {OUT_DIR}/<tag>/logs/latest.log")
 #        đổi batch là đổi step.
 #      - NHỊP LƯU đếm bằng LẦN VAL (`save_every_n_vals`), cũng bất biến với
 #        batch, và bám đúng chỗ đã có sẵn một lần đo val_loss.
-#      - LỊCH LR và biên cycle SWA đọc thẳng số mẫu (src/optim.py).
+#      - LỊCH LR và biên cycle đọc thẳng số mẫu (src/optim.py).
 #    Kiểm nhanh sau khi chạy: log `[save] last @ mẫu 640 (epoch 0 idx 640,
 #    step 20)` — có chữ "mẫu", KHÔNG có chữ "phase" là đúng bản mới.
 #
 # b) KIỂM LỊCH LR ĐÃ VÀO CHƯA. Đầu vòng train log phải có hai dòng [lr]:
 #        [lr] cosine warm restarts VÔ HẠN: mỗi cycle 320 mẫu (10 step ở batch 32)
-#        [lr] biên cycle sắp tới (mẫu): [320, 640, ...] | SWA gom snapshot ...
-#    Đến biên cycle sẽ có `[swa] hết cycle 0 @ mẫu 320 (lr ×0.0000) ->
+#        [lr] biên cycle sắp tới (mẫu): [320, 640, ...]
 #    snapshot 1`. Bản trung bình chỉ được ÁP khi chạy MODE="test"/"probe",
 #    KHÔNG áp giữa lúc train.
 #
@@ -735,8 +721,7 @@ print(f"log: {OUT_DIR}/<tag>/logs/latest.log")
 #    (và cycle_samples vẫn giữ nguyên — nó đếm bằng mẫu).
 #
 # f) MAX_RETRY chỉ cứu trong CÙNG một phiên. Hết 12h thì cell chết theo; nối
-#    phiên là việc của push_to_hub + mở lại notebook bằng tay. Muốn SWA sống
-#    qua ranh giới phiên thì HUB_INCLUDE_SWA phải True (swa.pt ~0.8GB).
+#    phiên là việc của push_to_hub + mở lại notebook bằng tay.
 #
 # g) SAVE VERSION CHẠY CONTAINER MỚI: scratch trống, weight + ảnh tải lại từ
 #    đầu (~1h). Tránh bằng cách copy cache ra /kaggle/working → tạo Kaggle

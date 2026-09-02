@@ -39,7 +39,7 @@ DEFAULT_BLOCK = "raw"
 def collect_cells(out_dir):
     """Trả về list dict, mỗi dict là một lần chạy đã có metrics.json.
 
-    Không parse tag nữa: tag giờ chỉ là "<model>-cnx256", và mọi thứ đáng so
+    Không parse tag nữa: tag giờ chỉ là "<model>-cnnqf1024", và mọi thứ đáng so
     (n_expert, top_k, w_aux, backbone) đều nằm sẵn trong `meta` của
     metrics.json — đọc từ đó chính xác hơn là suy từ tên thư mục.
     """

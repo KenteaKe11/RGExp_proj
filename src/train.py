@@ -33,10 +33,12 @@ hết giờ. Lần chạy sau LUÔN resume từ checkpoint đi xa nhất (cục 
 
 Lịch LR (src/optim.py): cosine warm restarts lặp VÔ HẠN, mỗi cycle cố định
 `run.cycle_samples` MẪU (không phải step — batch mỗi máy một khác), và có
-warmup tuyến tính ở ĐẦU MỌI CYCLE chứ không chỉ cycle đầu. Cuối mỗi
-cycle, lúc LR chạm đáy, trọng số được chụp lại và cộng trung bình đều — SWA.
-Bản trung bình đi vào swa.pt và là thứ được dùng để chấm metrics (mode=test)
-và để probe (mode=probe).
+warmup tuyến tính ở ĐẦU MỌI CYCLE chứ không chỉ cycle đầu. KHÔNG còn SWA:
+trọng số đem đi chấm và đem đi probe luôn là bản CUỐI trong weights.pt.
+
+NHÁNH ROUTER CẮM VÀO DECODER Ở HAI CHỖ: gate (trộn expert) và 256 token
+thị giác ghép vào đầu chuỗi. Việc chèn 256 vị trí giữ chỗ nằm ở collate và ở
+`generate_batch` dưới đây — xem src/model.py::add_router_slots.
 """
 from __future__ import annotations
 
@@ -63,10 +65,11 @@ from .guard import build_validator, normalize_headers, sanity_check
 from .losses import (asl_loss, binary_target_table, supervised_stats,
                      to_binary)
 from .metrics import run_metrics
-from .model import (build_collate, build_model, build_prompt, ce_loss,
-                    count_image_tokens, find_image_token_id, load_image,
-                    make_loader, split_batch, to_device, wrap_images)
-from .optim import CosineRestartSchedule, WeightAverager
+from .model import (add_router_slots, build_collate, build_model,
+                    build_prompt, ce_loss, count_image_tokens,
+                    find_image_token_id, load_image, make_loader, split_batch,
+                    to_device, wrap_images)
+from .optim import CosineRestartSchedule
 from .router import decay_desc
 
 DEVICE = torch.device("cuda:0")
@@ -121,7 +124,7 @@ def vram(tag, total_gb):
 def main(argv=None):
     cfg = config_from_args(argv)
     f, r = cfg.fixed, cfg.run
-    # mode "probe" (src/probe.py): KHÔNG train, nạp trung bình SWA từ Hub,
+    # mode "probe" (src/probe.py): KHÔNG train, nạp last/ từ Hub,
     # sinh báo cáo rồi bật lần lượt từng expert trong top-k để đo chuyên môn.
     # Nó vẫn đi qua đúng khâu infer + metrics của mode "test", nên nằm trong
     # run_test chứ không phải một nhánh song song.
@@ -188,9 +191,7 @@ def main(argv=None):
         wandb.init(project=r.wandb_project, name=r.wandb_run, config={
             "model": f.model_id, "arch": cfg.arch.tag,
             "n_expert": f.n_expert, "top_k": f.top_k,
-            "router_backbone": f.router_backbone,
             "router_img_size": f.router_img_size,
-            "router_frozen_upto": f.router_frozen_upto,
             "lora_r": f.lora_r, "lora_alpha": f.lora_alpha,
             "gpu": cfg.hw.name, "preset": cfg.preset["name"],
             "attn": f.attn_impl,
@@ -495,9 +496,9 @@ def main(argv=None):
                         f"quota HF chưa được thu hồi")
 
     # ══════════════════════════ checkpoint ═══════════════════════════════════
-    def save_checkpoint(state, optimizer, swa=None, tag="last", push=True,
+    def save_checkpoint(state, optimizer, tag="last", push=True,
                         with_optimizer=True):
-        """Lưu đủ để resume: router + E expert + optimizer + SWA.
+        """Lưu đủ để resume: router + E expert + optimizer.
 
         `with_optimizer=False` cho bản "best": nó chỉ dùng để LẤY LẠI trọng số
         tốt nhất, không dùng để train tiếp — mà optimizer của AdamW nặng gấp
@@ -518,19 +519,11 @@ def main(argv=None):
             torch.save({"optimizer": optimizer.state_dict(),
                         "torch_rng": torch.get_rng_state()},
                        os.path.join(d, "optimizer.pt"))
-        # Bộ cộng dồn SWA đi RIÊNG và KHÔNG phụ thuộc `with_optimizer`: nó là
-        # trọng số (fp32, ~cỡ weights.pt), không phải moment, và máy nhận bàn
-        # giao cần nó để trung bình không bị đếm lại từ 0. Bản lưu lúc Ctrl-C
-        # cũng phải có nó — mất swa.pt là mất mọi snapshot đáy đã gom.
-        if swa is not None and swa.n:
-            torch.save(swa.state_dict(), os.path.join(d, "swa.pt"))
         # samples/epoch/samples_per_step là số ĐỌC ĐƯỢC trên mọi máy; step chỉ
         # còn là số dẫn xuất để tiện đọc log.
         meta = dict(state, n_train=n_train, seed=f.seed, gpu=cfg.hw.name,
                     samples_per_step=eff, train_bs=r.train_bs,
                     grad_accum=r.grad_accum, saved_at=time.time(),
-                    swa_n=(swa.n if swa is not None else 0),
-                    swa_marks=(list(swa.marks) if swa is not None else []),
                     cycle_samples=r.cycle_samples, w_sup=r.w_sup,
                     asl_gamma_pos=r.asl_gamma_pos,
                     asl_gamma_neg=r.asl_gamma_neg, asl_clip=r.asl_clip,
@@ -541,9 +534,7 @@ def main(argv=None):
                         f, "decay_warmup_samples", 0),
                     warmup_samples=r.warmup_samples,
                     model=f.model_id, arch=cfg.arch.tag,
-                    router_backbone=f.router_backbone,
                     router_img_size=f.router_img_size,
-                    router_frozen_upto=f.router_frozen_upto,
                     n_expert=f.n_expert, top_k=f.top_k,
                     lora_r=f.lora_r, lora_alpha=f.lora_alpha,
                     image_size=f.image_size_model or f.image_size_src)
@@ -554,8 +545,7 @@ def main(argv=None):
         event("checkpoint", tag=tag, path=d, **state)
         if r.push_to_hub and push:
             try:
-                skip = ([] if r.hub_include_optimizer else ["optimizer.pt"]) \
-                    + ([] if r.hub_include_swa else ["swa.pt"])
+                skip = [] if r.hub_include_optimizer else ["optimizer.pt"]
                 upload_folder(repo_id=r.hub_repo, folder_path=d,
                               path_in_repo=tag, token=hf_token,
                               ignore_patterns=(skip or None),
@@ -588,7 +578,6 @@ def main(argv=None):
     state = {"samples": 0, "epoch": 0, "epoch_samples": 0, "step": 0,
              "best_val": None}
     opt_state = None
-    swa_state = None
 
     def check_compat(st):
         assert st["n_train"] == n_train and st["seed"] == f.seed, \
@@ -596,20 +585,19 @@ def main(argv=None):
         _ck_arch = st.get("arch")
         if _ck_arch is None:
             raise AssertionError(
-                "ckpt không có khoá `arch` — nó là checkpoint của kiến trúc "
-                "router CŨ (DenseNet-CXR + MQA + Separation). Shape của "
-                "router đổi hoàn toàn, không nạp được. Dùng ckpt_dir/hub_repo "
-                "khác, hoặc xoá thư mục ckpt để train lại từ số 0.")
+                "ckpt không có khoá `arch` — nó là checkpoint của một kiến "
+                "trúc router CŨ. Shape của router đổi hoàn toàn, không nạp "
+                "được. Dùng ckpt_dir/hub_repo khác, hoặc xoá thư mục ckpt để "
+                "train lại từ số 0.")
         assert _ck_arch == cfg.arch.tag, (
             f"ckpt của {_ck_arch}, đang chạy {cfg.arch.tag} — model nền khác "
             f"thì router và số bản expert đều khác shape, không nạp được")
-        for _k, _now in (("router_img_size", f.router_img_size),
-                         ("router_frozen_upto", f.router_frozen_upto)):
-            _was = st.get(_k)
-            if _was is not None and int(_was) != int(_now):
-                raise AssertionError(
-                    f"ckpt train với {_k}={_was}, đang chạy {_now} — "
-                    f"hình học của router đổi, trọng số không khớp shape.")
+        _was = st.get("router_img_size")
+        if _was is not None and int(_was) != int(f.router_img_size):
+            raise AssertionError(
+                f"ckpt train với router_img_size={_was}, đang chạy "
+                f"{f.router_img_size} — hình học của router đổi, trọng số "
+                f"không khớp shape.")
         if st.get("n_expert") not in (None, f.n_expert) or \
                 st.get("top_k") not in (None, f.top_k):
             raise AssertionError(
@@ -633,8 +621,8 @@ def main(argv=None):
             return None
 
     def apply_state(st, directory):
-        """Nạp trọng số + con trỏ mẫu + optimizer + SWA từ một thư mục ckpt."""
-        nonlocal opt_state, swa_state
+        """Nạp trọng số + con trỏ mẫu + optimizer từ một thư mục ckpt."""
+        nonlocal opt_state
         check_compat(st)
         load_weights(directory)
         samples = int(st.get("samples", 0))
@@ -650,16 +638,6 @@ def main(argv=None):
             warn("resume", "thiếu optimizer.pt — momentum reset. Bật "
                            "run.hub_include_optimizer=true nếu muốn giữ moment "
                            "khi bàn giao giữa các máy.")
-        sp = os.path.join(directory, "swa.pt")
-        swa_state = (torch.load(sp, map_location="cpu")
-                     if os.path.exists(sp) else None)
-        if swa_state is not None:
-            log("resume", f"SWA: nhận lại {swa_state.get('n', 0)} snapshot đã "
-                          f"gom (mốc mẫu {swa_state.get('marks')})")
-        elif int(st.get("swa_n", 0)) and r.swa:
-            warn("resume", f"ckpt ghi swa_n={st.get('swa_n')} nhưng không có "
-                           f"swa.pt — trung bình bắt đầu lại từ 0. Bật "
-                           f"run.hub_include_swa=true nếu đây là bản kéo từ Hub.")
         sps = st.get("samples_per_step")
         if sps and sps != eff:
             log("resume", f"ckpt ghi ở batch {sps} mẫu/step, máy này {eff} "
@@ -824,21 +802,8 @@ def main(argv=None):
         return (tot / cnt if cnt else float("nan"),
                 rec / cnt if cnt else float("nan"))
 
-    def snapshot():
-        """Bản SAO (CPU) của trọng số đang train — không phải tham chiếu.
-
-        router.state_dict() trả về tensor DÙNG CHUNG bộ nhớ với param: giữ
-        nguyên rồi nạp bản trung bình đè lên là bản "sao lưu" cũng bị ghi đè
-        theo, và không còn đường lùi.
-        """
-        return {"router": {k: v.detach().to("cpu").clone()
-                           for k, v in router.state_dict().items()},
-                "experts": {k: v.detach().to("cpu").clone() for k, v in
-                            moe.expert_state_dict(model, expert_ids).items()}}
-
-    # Hai tham chiếu "sống" để nhánh bắt Ctrl-C ở ngoài lưu được đúng bộ
-    # optimizer và bộ cộng dồn SWA mà vòng train đang dùng.
-    swa_live = WeightAverager()
+    # Tham chiếu "sống" để nhánh bắt Ctrl-C ở ngoài lưu được đúng bộ
+    # optimizer mà vòng train đang dùng.
     opt_live = None
 
     def run_training():
@@ -849,7 +814,7 @@ def main(argv=None):
         tiến độ: đổi batch là đổi step, mà checkpoint phải đọc được trên máy
         khác batch.
         """
-        nonlocal swa_live, opt_live
+        nonlocal opt_live
         samples = state["samples"]
         epoch = state["epoch"]
         epoch_samples = min(state["epoch_samples"], n_train)
@@ -864,8 +829,7 @@ def main(argv=None):
             optimizer, cycle_samples=r.cycle_samples,
             warmup_samples=r.warmup_samples, min_lr_ratio=r.min_lr_ratio,
             cycle_lr_decay=r.cycle_lr_decay)
-        swa = WeightAverager()
-        swa_live, opt_live = swa, optimizer
+        opt_live = optimizer
         if opt_state is not None and samples > 0:
             try:
                 optimizer.load_state_dict(opt_state["optimizer"])
@@ -876,14 +840,9 @@ def main(argv=None):
             torch.set_rng_state(opt_state["torch_rng"].cpu().to(torch.uint8))
             log("resume", "khôi phục optimizer + RNG (lịch LR là hàm của số "
                           "mẫu — không cần tua)")
-        if r.swa and swa_state is not None:
-            swa.load_state_dict(swa_state)
         sched.set_samples(samples)
         log("lr", sched.describe(eff))
-        log("lr", f"biên cycle sắp tới (mẫu): "
-                  f"{sched.bounds(5, samples)}"
-                  + (" | SWA gom snapshot ở mỗi mốc" if r.swa else
-                     " | SWA TẮT"))
+        log("lr", f"biên cycle sắp tới (mẫu): {sched.bounds(5, samples)}")
         if samples > 0:
             log("lr", f"vào lại giữa cycle {sched.cycle_index(samples)} tại "
                       f"lr ×{sched.multiplier(samples):.4f}")
@@ -971,19 +930,7 @@ def main(argv=None):
             step += 1
             steps_run += 1
 
-            # ── Biên cycle: LR vừa chạm đáy -> chụp cho bộ trung bình ───────
-            # Bắt bằng "chỉ số cycle vừa tăng" chứ không bằng "samples % cycle
-            # == 0": effective batch không nhất thiết chia hết cycle_samples,
-            # nên có máy sẽ nhảy qua đúng mốc. Cách này lệch tối đa một step
-            # trên mọi cấu hình batch.
             cyc = sched.cycle_index(step_start)
-            if r.swa and sched.cycle_index(samples) > cyc:
-                swa.add(snapshot(), mark=samples)
-                log("swa", f"hết cycle {cyc} @ mẫu {samples} "
-                           f"(lr ×{sched.multiplier(step_start):.4f}) -> "
-                           f"snapshot {swa.n}")
-                event("swa_snapshot", cycle=cyc, step=step, samples=samples,
-                      n=swa.n)
             state.update(samples=samples, epoch=epoch,
                          epoch_samples=epoch_samples, step=step,
                          best_val=best_val)
@@ -992,7 +939,7 @@ def main(argv=None):
             wlog({"train/loss": running, "train/grad_norm": gnorm,
                   "train/step": step, "train/samples": samples,
                   "train/epoch": epoch, "train/lr": lr_now,
-                  "train/cycle": cyc, "train/swa_n": swa.n,
+                  "train/cycle": cyc,
                   "train/step_sec": step_sec,
                   "train/route_noise": sig_now,
                   **{f"train/{k}": v for k, v in agg.items()}})
@@ -1047,7 +994,7 @@ def main(argv=None):
                       best_val=(None if best_val is None
                                 else round(best_val, 5)))
                 if better and r.save_best:
-                    save_checkpoint(state, optimizer, swa, "best",
+                    save_checkpoint(state, optimizer, "best",
                                     push=False, with_optimizer=False)
 
                 # ── Ai được quyền ghi? Hỏi Hub TRƯỚC khi save ───────────────
@@ -1059,7 +1006,7 @@ def main(argv=None):
                 if n_vals % max(r.save_every_n_vals, 1) == 0:
                     n_saves += 1
                     save_checkpoint(
-                        state, optimizer, swa, "last",
+                        state, optimizer, "last",
                         push=(True if r.hub_sync else
                               n_saves % r.push_every_n_saves == 0))
             if step % 50 == 0:
@@ -1094,7 +1041,7 @@ def main(argv=None):
                 log("train", f"Ctrl-C @ mẫu {state['samples']} (epoch "
                              f"{state['epoch']}) — lưu checkpoint rồi dừng")
                 try:
-                    save_checkpoint(state, opt_live, swa_live, "last",
+                    save_checkpoint(state, opt_live, "last",
                                     push=r.push_to_hub,
                                     with_optimizer=opt_live is not None)
                 except Exception as e:
@@ -1114,38 +1061,12 @@ def main(argv=None):
         log("infer", "train thoát mà không qua Ctrl-C — vẫn chạy infer trên "
                      "trọng số hiện tại")
 
-    # ── Trọng số đem đi chấm: bản trung bình SWA nếu có ─────────────────────
-    # Trọng số cuối là MỘT ĐIỂM ngẫu nhiên trên quỹ đạo SGD, có thể đang ở
-    # giữa dốc của một cycle. Trung bình các đáy cycle mới là thứ đại diện cho
-    # lần chạy này.
+    # ── Trọng số đem đi chấm ────────────────────────────────────────────────
+    # Không còn SWA: bản đem đi chấm và đem đi probe là ĐÚNG trọng số cuối
+    # trong weights.pt. Một điểm trên quỹ đạo SGD, có thể đang ở giữa dốc của
+    # một cycle — đọc metrics với ý đó trong đầu, và nếu cần một điểm "yên"
+    # thì dừng train ở gần biên cycle (lúc LR chạm đáy).
     weights_src = "weights.pt (trọng số cuối)"
-    swa_payload = (swa_live.payload() if swa_live.ready()
-                   else (swa_state or {}).get("avg"))
-    swa_n = swa_live.n if swa_live.ready() else int((swa_state or {}).get("n", 0))
-    if r.swa and swa_payload and swa_n >= 2 and r.swa_use != "never":
-        if r.swa_use == "always":
-            set_weights(swa_payload, quiet=True)
-            weights_src = f"swa (trung bình {swa_n} snapshot)"
-            log("swa", f"dùng bản trung bình {swa_n} snapshot để chấm "
-                       f"(swa_use=always, không hỏi val)")
-        else:                            # auto: hỏi val rồi mới lấy
-            live = snapshot()
-            vl_last, _ = evaluate()
-            set_weights(swa_payload, quiet=True)
-            vl_swa, _ = evaluate()
-            if vl_swa < vl_last:
-                weights_src = f"swa (trung bình {swa_n} snapshot)"
-                log("swa", f"trung bình {swa_n} snapshot val {vl_swa:.4f} < "
-                           f"bản cuối {vl_last:.4f} -> DÙNG bản trung bình")
-            else:
-                set_weights(live, quiet=True)
-                log("swa", f"trung bình {swa_n} snapshot val {vl_swa:.4f} ≥ "
-                           f"bản cuối {vl_last:.4f} -> GIỮ bản cuối")
-            del live
-    elif is_probe and swa_n < 2:
-        warn("probe", "last/ trên Hub không có swa.pt (hoặc mới 1 snapshot) — "
-                      "chấm trên trọng số cuối. Bật run.hub_include_swa=true ở "
-                      "PHIÊN TRAIN thì phiên probe sau mới có bản trung bình.")
     log("infer", f"trọng số đem chấm: {weights_src}")
 
     model.eval()
@@ -1244,6 +1165,10 @@ def main(argv=None):
         inputs = processor(text=[prompt_str] * len(paths),
                            images=wrap_images(imgs, f.model_id),
                            padding=True, return_tensors="pt")
+        # Y HỆT lúc train: chèn n_slot vị trí giữ chỗ ở ĐẦU chuỗi để hook ghi
+        # đè bằng prefix của router. Thiếu bước này thì lúc infer decoder
+        # nhận một chuỗi khác hẳn chuỗi nó được train trên đó.
+        add_router_slots(inputs, bridge.n_slot, tokenizer.pad_token_id)
         inputs = to_device(inputs, DEVICE)
         in_len = inputs["input_ids"].shape[-1]
         if not _preflight:
@@ -1326,7 +1251,7 @@ def main(argv=None):
             collate=collate, df=df_infer, generate_records=generate_records,
             disease_names=disease_names, aspect_names=aspect_names,
             img_token_id=find_image_token_id(processor), hf_token=hf_token,
-            train_state=dict(state, swa_n=swa_n, weights_src=weights_src),
+            train_state=dict(state, weights_src=weights_src),
             log=log, warn=warn, event=event)
         expert_share = None
     else:

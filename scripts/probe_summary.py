@@ -30,7 +30,7 @@ Chạy:
 Chạy lại thì GHI ĐÈ đúng thư mục đó — không tạo bản mới theo timestamp. Lý do:
 đây là báo cáo về trạng thái hiện tại của checkpoint, không phải nhật ký; muốn
 so hai thời điểm thì dùng `git diff` trên chính thư mục này, và mỗi bản ghi đã
-có sẵn `train_samples` / `swa_n` để biết nó chụp lúc nào.
+có sẵn `train_samples` để biết nó chụp lúc nào.
 
 ═══ HAI LOẠI BẢN GHI, KHÔNG ĐƯỢC TRỘN ═══
 
@@ -212,7 +212,7 @@ def resolve_repo(cli_repo, config_path):
         if sw.get("variant"):
             tag = f"{sw.get('model')}-{sw['variant']}-n{sw.get('n_block')}"
         else:
-            tag = f"{sw.get('model')}-cnx256"
+            tag = f"{sw.get('model')}-cnnqf1024"
         hub = f"RGExp123/mimic-cxr-{tag}"
     return f"{hub}-probe"
 

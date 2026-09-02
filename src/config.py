@@ -4,8 +4,8 @@
 dùng để kiểm tra trước khi chạy thật.
 
 KHÔNG CÒN SWEEP. Trước đây file này giải quyết một "ô sweep" = (model,
-variant Recombinator, số block MQA), và `SWEEP_BLOCKS` là bảng các ô hợp lệ.
-Kiến trúc router giờ đã chốt hẳn — ConvNeXt-Tiny + downsample/flatten, không
+variant, số block), và `SWEEP_BLOCKS` là bảng các ô hợp lệ.
+Kiến trúc router giờ đã chốt hẳn — Feat-Extractor CNN + QFormer, không
 có siêu tham số kiến trúc nào để quét (xem src/router.py) — nên khối `sweep`
 trong YAML đổi tên thành `arch` và chỉ còn giữ đúng một trường: `model`.
 `arch.tag` vẫn là thứ đặt tên thư mục outputs/ckpt và repo Hub, để nhiều lần
@@ -30,8 +30,8 @@ from types import SimpleNamespace
 
 import yaml
 
-from .router import (CONVNEXT_WEIGHTS, D_MODEL, FROZEN_UPTO, IMG_SIZE,
-                     STRIDE, arch_desc, decay_desc, estimate_params)
+from .router import (D_MODEL, IMG_SIZE, N_BLOCK, N_TOKEN, STRIDE,
+                     arch_desc, decay_desc, estimate_params)
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
 # Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
@@ -146,7 +146,7 @@ PRESETS = [
 # Tên kiến trúc, đi vào `arch.tag` -> tên thư mục outputs/ckpt và repo Hub.
 # Không còn siêu tham số kiến trúc nào để quét, nên đây là hằng số chứ không
 # phải một trường trong YAML.
-ARCH_NAME = f"cnx{D_MODEL}"
+ARCH_NAME = f"cnnqf{D_MODEL}"
 
 
 def arch_summary(cfg):
@@ -269,8 +269,15 @@ _DEAD_KEYS = {
                            "(fixed.decay_warmup_samples)"),
     # ── Khoá của bản CÓ SWEEP ───────────────────────────────────────────────
     "variant": "kiến trúc router đã chốt, không còn biến thể để quét",
-    "n_block": "không còn stack MQA — router đi thẳng downsample+flatten",
+    "n_block": "kiến trúc router đã chốt, không còn số block để quét",
     "d_enc": "router đọc ảnh, không đọc hidden state của Gemma",
+    # ── Khoá của bản có BACKBONE PRETRAIN + SWA ─────────────────────────────
+    "router_backbone": ("nhánh router không nạp trọng số ngoài nào nữa — "
+                        "Feat-Extractor train từ số 0"),
+    "router_frozen_upto": "không còn phần nào bị đóng băng trong nhánh router",
+    "swa": "đã bỏ hẳn SWA — chấm trên trọng số cuối (weights.pt)",
+    "swa_use": "đã bỏ hẳn SWA",
+    "hub_include_swa": "đã bỏ hẳn SWA — không còn swa.pt để đẩy lên Hub",
 }
 
 
@@ -443,36 +450,21 @@ def load_config(path="configs/default.yaml", overrides=None):
               f"tăng dần). Ý đồ là σ lớn lúc đầu để tuyến đường còn đảo "
               f"được, rồi mới siết lại.")
 
-    # ── Backbone router: ConvNeXt-Tiny, và HÌNH HỌC BỊ BUỘC ─────────────────
-    # (router_img_size / 32)² PHẢI bằng D_MODEL — xem docstring src/router.py.
-    fixed.setdefault("router_backbone", CONVNEXT_WEIGHTS)
+    # ── Hình học của router: BỊ BUỘC bởi số bậc downsample ─────────────────
+    # 5 bậc, mỗi bậc chia đôi cạnh và nhân bốn kênh, nên
+    #     cạnh img/2^5 = 16 -> 16×16 = 256 token
+    #     kênh 1 × 4^5      = 1024   = chiều làm việc
+    # Xem docstring src/router.py.
     fixed.setdefault("router_img_size", IMG_SIZE)
     fixed["router_img_size"] = int(fixed["router_img_size"])
     _grid = fixed["router_img_size"] // STRIDE
-    if _grid * _grid != D_MODEL:
+    if _grid * STRIDE != fixed["router_img_size"] or _grid * _grid != N_TOKEN:
         raise ValueError(
             f"fixed.router_img_size={fixed['router_img_size']} cho lưới "
-            f"{_grid}×{_grid} = {_grid*_grid} token, nhưng chiều làm việc của "
-            f"router là {D_MODEL}. Khối downsample cần một ma trận VUÔNG "
-            f"(kênh × token), nên (router_img_size/{STRIDE})² phải bằng "
-            f"{D_MODEL} -> router_img_size = "
-            f"{int(round(D_MODEL ** 0.5)) * STRIDE}.")
-    if not fixed["router_backbone"]:
-        print("⚠ router_backbone=null — ConvNeXt dựng với TRỌNG SỐ NGẪU "
-              "NHIÊN. Chỉ hợp lệ cho selftest offline; train thật ở chế độ "
-              "này là vứt bỏ toàn bộ lợi thế pretrain.")
-    fixed.setdefault("router_frozen_upto", FROZEN_UPTO)
-    fixed["router_frozen_upto"] = int(fixed["router_frozen_upto"])
-    if not 0 <= fixed["router_frozen_upto"] <= 8:
-        raise ValueError(f"fixed.router_frozen_upto phải trong [0, 8] "
-                         f"(ConvNeXt features có 8 phần tử), nhận "
-                         f"{fixed['router_frozen_upto']}")
-    if fixed["router_frozen_upto"] < 7:
-        print(f"⚠ router_frozen_upto={fixed['router_frozen_upto']} < 7 — mở "
-              f"thêm cả stage3 (9 block, 10.8M param) trở xuống. Phần "
-              f"trainable của router gần gấp đôi, và 25k mẫu khó nắn lại "
-              f"vùng đặc trưng trung gian mà không quên pretrain.")
-
+            f"{_grid}×{_grid} = {_grid*_grid} token, nhưng nhánh router được "
+            f"dựng cho {N_TOKEN} token ({N_BLOCK} bậc downsample, tổng stride "
+            f"{STRIDE}). Giá trị hợp lệ duy nhất là "
+            f"{int(round(N_TOKEN ** 0.5)) * STRIDE}.")
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
     rm = read_remote(path)
@@ -528,9 +520,6 @@ def load_config(path="configs/default.yaml", overrides=None):
     run.setdefault("warmup_samples", 320)
     run.setdefault("min_lr_ratio", 0.0)
     run.setdefault("cycle_lr_decay", 1.0)
-    run.setdefault("swa", True)
-    run.setdefault("swa_use", "always")
-    run.setdefault("hub_include_swa", True)
     # Số revision tối đa được giữ trên repo checkpoint. HF tính quota theo mọi
     # blob LFS còn trong lịch sử, nên ghi đè last/ KHÔNG giải phóng gì; tới
     # revision thứ N+1, train.py gộp lịch sử còn một commit (HEAD giữ nguyên).
@@ -542,9 +531,6 @@ def load_config(path="configs/default.yaml", overrides=None):
             f"run.hub_keep_revisions phải >= 0, nhận "
             f"{run['hub_keep_revisions']}. 0 = không bao giờ gộp lịch sử.")
     eff = run["train_bs"] * run["grad_accum"]
-    if run["swa_use"] not in ("auto", "always", "never"):
-        raise ValueError(f"run.swa_use lạ: {run['swa_use']!r} "
-                         f"(auto | always | never)")
     cs = int(run["cycle_samples"] or 0)
     if cs <= 0:
         raise ValueError(
@@ -555,11 +541,11 @@ def load_config(path="configs/default.yaml", overrides=None):
         raise ValueError(
             f"cycle_samples={cs} nhỏ hơn effective batch {eff}: một cycle "
             f"không đủ một optimizer step, LR sẽ nhảy cả chu kỳ trong một "
-            f"lần cập nhật và SWA không bắt được biên nào.")
+            f"lần cập nhật.")
     if cs % eff:
         print(f"⚠ cycle_samples={cs} không chia hết cho effective batch "
-              f"{eff} — biên cycle rơi vào giữa một step, snapshot SWA "
-              f"lệch tối đa {eff} mẫu. Dùng bội của {eff} (vd "
+              f"{eff} — biên cycle rơi vào giữa một step, lệch tối đa {eff} "
+              f"mẫu. Dùng bội của {eff} (vd "
               f"{max(round(cs / eff), 1) * eff}) nếu muốn khớp chính xác.")
     if int(run["warmup_samples"]) >= cs:
         raise ValueError(
@@ -600,8 +586,6 @@ def cycles_desc(cfg):
          f"{r.warmup_samples} mẫu ở đầu MỌI cycle")
     if r.min_lr_ratio:
         s += f" | đáy = {r.min_lr_ratio:g}×lr"
-    s += (f" | SWA: gom snapshot ở đáy MỖI cycle (swa_use={r.swa_use})"
-          if r.swa else " | SWA TẮT")
     return s
 
 
@@ -641,8 +625,8 @@ def build_argparser():
     # thay vì im lặng bỏ qua — đúng ý, vì script cũ gọi chúng sẽ chạy MỘT
     # kiến trúc khác hẳn với cùng dòng lệnh.
     ap.add_argument("--mode", choices=["train", "test", "both", "probe"],
-                    help="probe = không train, nạp SWA từ Hub, sinh báo cáo "
-                         "rồi bật lần lượt từng expert trong top-k để đo "
+                    help="probe = không train, nạp last/ từ Hub, sinh báo "
+                         "cáo rồi bật lần lượt từng expert trong top-k để đo "
                          "chuyên môn (xem src/probe.py).")
     # dry_run mặc định false trong config (chạy thật). Hai cờ này để ép:
     ap.add_argument("--dry-run", action="store_true",
@@ -675,14 +659,11 @@ if __name__ == "__main__":
     print(f"Preset  : {c.preset['name']}")
     print(f"Model   : {c.fixed.model_id} | attn={c.fixed.attn_impl}")
     print(f"Router  : {arch_summary(c)}")
-    _bb = (f"convnext_tiny {c.fixed.router_backbone}"
-           if c.fixed.router_backbone else "convnext_tiny NGẪU NHIÊN")
     _g = c.fixed.router_img_size // STRIDE
-    print(f"          backbone {_bb} | ảnh {c.fixed.router_img_size}² -> "
-          f"lưới {_g}×{_g} = {_g*_g} token × {D_MODEL} chiều | đóng băng "
-          f"features[0:{c.fixed.router_frozen_upto}]")
-    print(f"          router {est['router']:,} tổng, "
-          f"{est['router_trainable']:,} trainable + expert "
+    print(f"          ảnh {c.fixed.router_img_size}² -> {N_BLOCK} bậc -> lưới "
+          f"{_g}×{_g} = {_g*_g} token × {D_MODEL} chiều (train từ số 0) | "
+          f"prefix {N_TOKEN} token vào decoder")
+    print(f"          router {est['router']:,} + expert "
           f"{est['experts']:,} = {est['total']:,} param trainable")
     print(f"Adapter : {adapter_desc(c.fixed)} | quant={c.run.quant}")
     print(f"Ảnh     : {image_desc(c.fixed)}")
