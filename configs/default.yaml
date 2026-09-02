@@ -104,7 +104,7 @@ fixed:
   # 0.05: lớp DoRA của peft chỉ dùng được kết quả base_layer đã tính sẵn khi
   # KHÔNG có dropout; có dropout thì mỗi expert phải tính LẠI phép nhân ma
   # trận base cho x đã bị drop -> chi phí × số expert. Giữ nhỏ có chủ ý.
-  lora_dropout: 0.05
+  lora_dropout: 0.0
   # CHỈ 4 ma trận attention. Không đụng gate_proj/up_proj/down_proj: MLP
   # chiếm hơn 2/3 số tham số adapter (15.9M -> 4.68M mỗi expert khi bỏ chúng)
   # trong khi chuyên môn hoá theo LOẠI PHIM là việc của attention — chọn
