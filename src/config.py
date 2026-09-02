@@ -582,6 +582,18 @@ def load_config(path="configs/default.yaml", overrides=None):
     tag = f"{arch['model']}-{ARCH_NAME}"
     if run.get("hub_repo") is None:
         run["hub_repo"] = f"RGExp123/mimic-cxr-{tag}"
+    # repo_id KHÔNG có namespace là cái bẫy im lặng: `create_repo("X")` vẫn
+    # chạy (server tự gắn namespace của token) nên log báo "repo sẵn sàng",
+    # nhưng upload_folder/hf_hub_download/snapshot_download nhét repo_id thẳng
+    # vào URL -> api/models/X/... -> 404 Repository Not Found. Push hỏng, và
+    # resume-từ-Hub cũng chết lặng. Chặn ngay tại đây.
+    for _k in ("hub_repo", "probe_repo"):
+        _v = run.get(_k)
+        if _v and "/" not in _v:
+            raise ValueError(
+                f"run.{_k}={_v!r} thiếu namespace. Phải là 'owner/name' "
+                f"(vd 'RGExp123/{_v}'), nếu không mọi thao tác Hub trừ "
+                f"create_repo sẽ 404.")
     # Bản ghi probe là DATASET, không phải model: để chung repo với checkpoint
     # thì `list_repo_files` phải lọc lẫn giữa weights.pt và vài nghìn json, và
     # ai tải ckpt cũng kéo theo cả đống bản ghi. Mặc định tách hẳn một repo.

@@ -192,7 +192,7 @@ run:
 
   out_dir: ./outputs
   ckpt_dir: ./ckpt
-  hub_repo: MoE-LoRA            # null -> tự đặt theo arch.tag
+  hub_repo: RGExp123/MoE-LoRA   # PHẢI có namespace owner/name — null -> tự đặt theo arch.tag
   hub_private: true
   push_to_hub: true
   force_eval: false
@@ -302,7 +302,7 @@ run:
   #
   # 0.01–0.05 là dải chuẩn. 0 = tắt hẳn cân bằng tải (router sẽ sập về vài
   # expert trong vài trăm step); >0.5 thì nó lấn át CE.
-  w_aux: 0.05
+  w_aux: 0.1
 
   # ── ASL: Asymmetric Loss trên 14 finding (§1.6) ──────────────────────────
   # Nhánh supervised KHÔNG còn softmax 4 aspect + Focal. Nhãn 4 aspect của
