@@ -475,7 +475,7 @@ remote:
   ckpt_dir: /workspace/ckpt
 
   # false = KHÔNG dựng venv. Ảnh pytorch/* đã có sẵn torch khớp CUDA của máy.
-  use_venv: false
+  use_venv: true
 
   # Train chạy vô hạn tới khi dừng tay. ssh đứt là SIGHUP giết tiến trình -> tmux.
   tmux_session: sweep
