@@ -396,6 +396,10 @@ def build_model(cfg, hf_token, log):
                        bias_gamma_start=(None if gs is None else float(gs)),
                        decay_steps=decay_steps,
                        bias_clip=float(getattr(f, "bias_clip", 0.5) or 0.0),
+                       capacity_factor=float(
+                           getattr(f, "capacity_factor", 0.0) or 0.0),
+                       n_shared=int(getattr(f, "n_shared", 0) or 0),
+                       shared_weight=getattr(f, "shared_weight", None),
                        backbone=getattr(f, "router_backbone", CXR_WEIGHTS),
                        img_size=int(getattr(f, "router_img_size", 224)),
                        apply_bias_at_eval=bool(
@@ -410,6 +414,7 @@ def build_model(cfg, hf_token, log):
     log("router", f"    route_noise σ={route_noise:g} (sau warmup) "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
                      else "— TẮT, top-k tất định"))
+    log("router", f"    {router.capacity_desc(cfg.run.train_bs)}")
     log("router", f"    bias_gamma γ={bias_gamma:g} (sau warmup) "
                   + ("(cân bằng tải aux-free, cập nhật mỗi optimizer step)"
                      if bias_gamma > 0 else "— TẮT, không có gì cân bằng tải"))

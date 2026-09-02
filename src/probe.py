@@ -555,8 +555,11 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         if gate is None:
             raise RuntimeError("router không chạy trong forward probe — hook "
                                "RouterBridge không được gọi")
+        # MỌI ô khác 0, không cắt ở K: gate giờ gồm top-k expert định
+        # tuyến CỘNG n_shared expert hứng (src/router.py), nên cắt ở K sẽ bỏ
+        # rơi đúng những expert chạy trên mọi ảnh.
         chosen = [int(e) for e in torch.argsort(gate, descending=True).tolist()
-                  if float(gate[e]) > 0][:K]
+                  if float(gate[e]) > 0]
         # softmax ĐẦY ĐỦ trên E expert, trước khi cắt top-k (src/router.py).
         # `gate` đã bị top-k làm rỗng E-k ô nên không đọc được "router tin
         # expert nào bao nhiêu"; `prob` thì có số cho cả expert không được chọn.
@@ -608,6 +611,7 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
             "sweep_cell": cfg.sweep.tag,
             "model": f.model_id,
             "n_expert": E, "top_k": K,
+            "n_shared": int(getattr(f, "n_shared", 0) or 0),
             "train_epoch": train_state.get("epoch"),
             "train_samples": train_state.get("samples"),
             "swa_n": train_state.get("swa_n"),

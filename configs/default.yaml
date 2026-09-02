@@ -47,8 +47,48 @@ fixed:
   # tính toán khi CẢ BATCH cùng bỏ qua một expert (xem src/moe.py::CTX.active);
   # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
   # tế xấp xỉ 12 bản delta/step, KHÔNG phải 4.
-  n_expert: 16
-  top_k: 8
+  n_expert: 24
+  top_k: 6
+
+  # ── Trần tải mỗi expert + expert HỨNG ────────────────────────────────────
+  # Bias cân bằng tải bên dưới nắn XU HƯỚNG qua nhiều step; nó không ngăn
+  # được chuyện trong ĐÚNG một micro-batch cả 8 ảnh cùng dồn vào một expert.
+  # Trần tải là chốt cứng cho từng batch:
+  #
+  #     capacity = ceil(capacity_factor · train_bs · top_k / R)
+  #     R = n_expert − n_shared  (số expert thật sự được định tuyến)
+  #
+  # B·k/R là tải TRUNG BÌNH khi phân bố hoàn hảo, nên capacity_factor đọc
+  # thẳng là "cho lệch bao nhiêu lần mức đều": 1.0 = ép đều tuyệt đối, 1.25 =
+  # cho lệch 25%, 0 = TẮT trần. Với E=24, n_shared=2, k=6, train_bs=8: mức
+  # đều là 8·6/22 = 2.18, trần = 3 mẫu/expert mỗi micro-batch.
+  # Micro-batch nhỏ thì trần THÔ: cứ mỗi bậc nguyên là một bước nhảy lớn
+  # tính theo phần trăm. Đó là lý do trần chỉ là chốt CHẶN, còn phần cân
+  # bằng tinh vẫn do bias_gamma lo.
+  # CHỈ áp khi TRAIN — lúc eval/infer mà áp thì gate của một ảnh phụ thuộc
+  # các ảnh cùng batch, tức là báo cáo đổi theo cách gom batch.
+  capacity_factor: 1.25
+
+  # n_shared expert CUỐI (index R..E-1) là expert HỨNG: không tham gia top-k,
+  # không có bias, không có trần. MỌI mẫu luôn dùng chúng với suất gate cố
+  # định, và chúng nhận thêm toàn bộ phần bị trần cắt ra — chia ĐỀU.
+  # Vì sao không drop phần vượt trần, cũng không chia lại cho các expert còn
+  # giữ: chia lại là ép mẫu tin HƠN vào expert mà router đã xếp hạng thấp,
+  # tức cân bằng con số tải bằng cách làm bẩn chính tín hiệu chuyên môn hoá.
+  # Expert hứng được huấn luyện đúng cho việc đó — nhận cái tràn ra từ khắp
+  # nơi, tức học phần CHUNG của mọi ảnh (lý lẽ shared expert của DeepSeek-V3).
+  # 0 = tắt hẳn: phần vượt trần quay về kiểu drop + chuẩn hoá lại.
+  # LƯU Ý: n_shared ăn vào n_expert, không cộng thêm. 24E + n_shared=2 nghĩa
+  # là router định tuyến trên 22 expert; top_k phải ≤ 22.
+  n_shared: 2
+
+  # Tổng suất gate cố định của CẢ NHÓM hứng, ở MỌI chế độ (train lẫn infer).
+  # null = n_shared/(top_k + n_shared) = 2/8 = 0.25: mỗi expert hứng nặng
+  # đúng bằng một expert định tuyến trung bình, không hơn.
+  # Suất này là thứ bịt lỗ train/eval: trần chỉ áp lúc train nên lúc infer
+  # không có gì tràn; expert hứng mà CHỈ sống bằng phần tràn thì lúc sinh báo
+  # cáo nhận gate 0 — train xong rồi vứt 2/24 expert.
+  shared_weight: null
 
   # Nhiễu Gumbel cộng vào route logit khi CHỌN top-k, chỉ lúc TRAINING
   # (src/router.py::gumbel_like). top-k(logit + σ·Gumbel) = lấy mẫu 4 expert
@@ -71,7 +111,7 @@ fixed:
   # đây (~±2). 0 = tắt hẳn cơ chế cân bằng (chỉ dùng để đo xem nó có tác dụng
   # gì không — router sẽ sập về vài expert trong vòng vài trăm step).
   # GIÁ TRỊ SAU WARMUP — xem decay_warmup_steps.
-  bias_gamma: 0.1
+  bias_gamma: 0.001
 
   # TRẦN của bias — MỚI, và là thứ thiếu ở lần chạy trước. Quy tắc sign ở
   # trên không có điểm dừng: nó đẩy bias tới BẤT KỲ độ lớn nào cần để cân
@@ -81,7 +121,7 @@ fixed:
   # 0.5 cho bias đủ sức lật hạng 4 ↔ hạng 5, không đủ lật hạng 4 ↔ hạng 10.
   # Đọc `bias_sat` trong log: >0 kéo dài = router thật sự chỉ tin vài
   # expert, và câu trả lời KHÔNG phải là nới trần.
-  bias_clip: 2.0
+  bias_clip: 0.2
 
   # ── Backbone ảnh của router ──────────────────────────────────────────────
   # DenseNet-121 pretrain trên chính X-quang ngực (torchxrayvision). Router
@@ -128,7 +168,7 @@ fixed:
   # hành vi trước khi có lịch này). decay_warmup_steps: 0 = tắt cả hai.
   # Con trỏ là `step` toàn cục, nên resume vào lại đúng chỗ trên đường cong.
   bias_gamma_start: null
-  route_noise_start: 1.0
+  route_noise_start: 0.75
   decay_warmup_steps: 100
 
   # ── Adapter (đã chốt: QDoRA r8) ──────────────────────────────────────────
@@ -138,7 +178,7 @@ fixed:
   # base_layer đã tính sẵn khi KHÔNG có dropout; có dropout thì mỗi expert
   # phải tính LẠI phép nhân ma trận base cho x đã bị drop -> chi phí × số
   # expert. Regularization đã có label_smoothing + weight_decay lo.
-  lora_dropout: 0.0
+  lora_dropout: 0.05
   lora_targets: [q_proj, k_proj, v_proj, o_proj]
 
   compute_dtype: bfloat16   # §4.1.3 — cần sm80+
@@ -299,8 +339,8 @@ run:
   # ngắn để một phiên máy (Kaggle 12h chẳng hạn) gom được vài snapshot. Nên là
   # bội của effective batch (32 hoặc 64) để biên cycle rơi đúng ranh giới
   # step; lệch thì chỉ có cảnh báo, không chặn.
-  cycle_samples: 320
-  warmup_samples: 96       # CHỈ cycle đầu — các restart sau bật thẳng lên đỉnh
+  cycle_samples: 640
+  warmup_samples: 256       # CHỈ cycle đầu — các restart sau bật thẳng lên đỉnh
   min_lr_ratio: 0.0         # đáy cosine = ratio × lr. 0 = chạm đáy hẳn (SGDR gốc)
   # Lịch vô hạn: giữ 1.0. Nhỏ hơn 1 nghĩa là đỉnh của cycle c = lr × decay^c,
   # tức LR tắt dần về 0 và train tự chết — gần như không bao giờ là ý muốn.
@@ -350,7 +390,7 @@ run:
   asl_clip: 0.02
   # 1 = dương, 0 = âm. "possible pneumonia" là khẳng định YẾU chứ không phải
   # phủ định, nên nó nằm ở phía dương nhưng nhẹ hơn một ca chắc chắn.
-  uncertain_soft: 0.7
+  uncertain_soft: 0.6
 
   eval_every: 10
   eval_max_batches: 20

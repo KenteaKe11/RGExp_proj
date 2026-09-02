@@ -184,7 +184,9 @@ def main(argv=None):
         wandb.init(project=r.wandb_project, name=r.wandb_run, config={
             "model": f.model_id, "variant": cfg.sweep.variant,
             "n_block": cfg.sweep.n_block, "n_expert": f.n_expert,
-            "top_k": f.top_k, "lora_r": f.lora_r, "lora_alpha": f.lora_alpha,
+            "top_k": f.top_k, "n_shared": getattr(f, "n_shared", 0),
+            "capacity_factor": getattr(f, "capacity_factor", 0.0),
+            "lora_r": f.lora_r, "lora_alpha": f.lora_alpha,
             "gpu": cfg.hw.name, "preset": cfg.preset["name"],
             "attn": f.attn_impl,
             "image_size": f.image_size_model or f.image_size_src,
@@ -535,7 +537,9 @@ def main(argv=None):
                     decay_warmup_steps=getattr(f, "decay_warmup_steps", 0),
                     model=f.model_id, variant=cfg.sweep.variant,
                     n_block=cfg.sweep.n_block, n_expert=f.n_expert,
-                    top_k=f.top_k, lora_r=f.lora_r, lora_alpha=f.lora_alpha,
+                    top_k=f.top_k, n_shared=getattr(f, "n_shared", 0),
+                    capacity_factor=getattr(f, "capacity_factor", 0.0),
+                    lora_r=f.lora_r, lora_alpha=f.lora_alpha,
                     image_size=f.image_size_model or f.image_size_src)
         with open(os.path.join(d, "train_state.json"), "w") as fh:
             json.dump(meta, fh, indent=2)
@@ -594,6 +598,18 @@ def main(argv=None):
                 f"chạy {f.n_expert}E top-{f.top_k} — route_head và số bản "
                 f"expert đều khác shape, không nạp được. Đổi n_expert/top_k "
                 f"nghĩa là một ô sweep MỚI: dùng ckpt_dir/hub_repo khác.")
+        _ns_ck, _ns_now = st.get("n_shared"), int(getattr(f, "n_shared", 0))
+        if _ns_ck is not None and int(_ns_ck) != _ns_now:
+            # Shape KHỚP (E expert vẫn là E expert) nên torch nạp trơn tru —
+            # đó mới là chỗ nguy: n_shared quyết định expert nào là expert
+            # HỨNG, và đổi nó là đổi vai của những expert cuối giữa chừng.
+            # Trọng số của chúng học từ "phần chung của mọi ảnh" giờ bị dùng
+            # như expert định tuyến, hoặc ngược lại.
+            warn("resume", f"ckpt train với n_shared={_ns_ck}, đang chạy "
+                           f"n_shared={_ns_now} — {abs(int(_ns_ck) - _ns_now)} "
+                           f"expert cuối ĐỔI VAI (hứng <-> định tuyến). Nạp "
+                           f"được nhưng những expert đó đang mang trọng số "
+                           f"học cho việc khác.")
 
     def read_state(directory):
         try:
@@ -975,7 +991,7 @@ def main(argv=None):
             if limiter.ready(force=step <= 3):
                 extra = " ".join(f"{k}={agg[k]:.3f}" for k in
                                  ("ce", "sup", "balance", "bias_span",
-                                  "sup_recall") if k in agg)
+                                  "spill", "sup_recall") if k in agg)
                 # Còn trong warmup thì γ/σ đổi mỗi step và là biến số quan
                 # trọng nhất để đọc `balance`/`bias_span` — in kèm. Hết warmup
                 # thì chúng là hằng, in nữa chỉ tốn chỗ.

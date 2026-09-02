@@ -151,13 +151,18 @@ def variant_desc(cfg):
     return (f"{s.variant}×{s.n_block} block "
             f"({ROUTER_VARIANTS[s.variant].PARAMS:,} param/block) | "
             f"router {est['router'] / 1e6:.2f}M + "
-            f"{f.n_expert} expert QDoRA r{f.lora_r} top-{f.top_k} "
+            f"{f.n_expert} expert QDoRA r{f.lora_r} "
+            f"(top-{f.top_k} trên {f.n_expert - getattr(f, 'n_shared', 0)}"
+            + (f" + {f.n_shared} hứng" if getattr(f, "n_shared", 0) else "")
+            + ") "
             f"≈ {est['total'] / 1e6:.1f}M")
 
 
 def adapter_desc(f, sweep=None):
     """Adapter đã CHỐT — giữ hàm để log/metrics gọi được như cũ."""
-    return f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E top-{f.top_k}"
+    _ns = getattr(f, "n_shared", 0)
+    return (f"qdora r{f.lora_r} a{f.lora_alpha} × {f.n_expert}E "
+            f"top-{f.top_k}" + (f" + {_ns} hứng" if _ns else ""))
 
 
 def detect_hardware(require_bf16=True):
@@ -398,6 +403,38 @@ def load_config(path="configs/default.yaml", overrides=None):
               f"(γ tăng dần). Ý đồ của lịch là γ lớn lúc đầu để bias nắn kịp "
               f"trước khi router kịp sập, rồi mới nhỏ dần.")
 
+    # ── Trần tải mỗi expert + expert HỨNG (§src/router.py) ──────────────────
+    # capacity = ceil(capacity_factor · B · top_k / R), B = micro-batch,
+    # R = n_expert − n_shared. Phần vượt trần KHÔNG bị vứt: nó chảy sang
+    # n_shared expert cuối, chia đều. 0 = tắt trần.
+    fixed.setdefault("capacity_factor", 1.25)
+    fixed["capacity_factor"] = float(fixed["capacity_factor"])
+    if fixed["capacity_factor"] < 0:
+        raise ValueError(f"fixed.capacity_factor phải >= 0 (0 = tắt trần "
+                         f"tải), nhận {fixed['capacity_factor']}")
+    if 0 < fixed["capacity_factor"] < 1.0:
+        print(f"⚠ capacity_factor={fixed['capacity_factor']:g} < 1 — trần "
+              f"CHẶT HƠN mức phân bố đều, nên kể cả router cân bằng hoàn hảo "
+              f"vẫn luôn có phần chảy sang expert hứng.")
+
+    fixed.setdefault("n_shared", 2)
+    fixed["n_shared"] = int(fixed["n_shared"])
+    if not 0 <= fixed["n_shared"] < int(fixed["n_expert"]):
+        raise ValueError(f"fixed.n_shared={fixed['n_shared']} phải nằm trong "
+                         f"[0, n_expert={fixed['n_expert']})")
+    if fixed["n_shared"] == 0 and fixed["capacity_factor"] > 0:
+        print("⚠ n_shared=0 nhưng trần tải đang bật — không có expert hứng "
+              "thì phần vượt trần bị DROP và chia lại cho các expert còn "
+              "giữ, chứ không chảy đi đâu cả.")
+    # null = n_shared/(top_k + n_shared): mỗi expert hứng nặng đúng bằng một
+    # expert định tuyến trung bình.
+    fixed.setdefault("shared_weight", None)
+    if fixed["shared_weight"] is not None:
+        fixed["shared_weight"] = float(fixed["shared_weight"])
+        if not 0.0 <= fixed["shared_weight"] < 1.0:
+            raise ValueError(f"fixed.shared_weight phải nằm trong [0, 1) "
+                             f"hoặc null, nhận {fixed['shared_weight']}")
+
     # §9 — container GPU thuê: dời cache/outputs/ckpt sang volume lớn. Làm
     # TRƯỚC khi ghép tag vào out_dir để mỗi ô vẫn có thư mục riêng.
     rm = read_remote(path)
@@ -436,9 +473,12 @@ def load_config(path="configs/default.yaml", overrides=None):
     # Adapter đã chốt: QDoRA = LoRA + DoRA + base NF4.
     fixed["use_dora"] = True
     run["quant"] = True
-    if not 1 <= int(fixed["top_k"]) <= int(fixed["n_expert"]):
-        raise ValueError(f"top_k={fixed['top_k']} phải nằm trong "
-                         f"[1, n_expert={fixed['n_expert']}]")
+    _n_route = int(fixed["n_expert"]) - int(fixed["n_shared"])
+    if not 1 <= int(fixed["top_k"]) <= _n_route:
+        raise ValueError(
+            f"top_k={fixed['top_k']} phải nằm trong [1, n_expert − n_shared "
+            f"= {_n_route}] — {fixed['n_shared']} expert CUỐI là expert hứng, "
+            f"không tham gia top-k (xem src/router.py).")
 
     tag = f"{sweep['model']}-{sweep['variant']}-n{n_block}"
     if run.get("hub_repo") is None:
@@ -638,6 +678,18 @@ if __name__ == "__main__":
               + f"trong {_n} step đầu")
     print(f"Cân bằng: bias aux-free γ={c.fixed.bias_gamma:g} "
           f"| Gumbel σ={c.fixed.route_noise:g}{_sched}")
+    _ns = int(getattr(c.fixed, "n_shared", 0) or 0)
+    _cf = float(getattr(c.fixed, "capacity_factor", 0.0) or 0.0)
+    _R = c.fixed.n_expert - _ns
+    _cap = (math.ceil(_cf * c.run.train_bs * c.fixed.top_k / _R) if _cf > 0
+            else 0)
+    print(f"Trần tải: "
+          + (f"{_cf:g}× mức đều -> {_cap} mẫu/expert mỗi micro-batch "
+             f"(B={c.run.train_bs}, R={_R}), chỉ khi train"
+             if _cf > 0 else "TẮT")
+          + (f" | {_ns} expert hứng (index {_R}..{c.fixed.n_expert - 1}), "
+             f"phần vượt trần chảy vào đây"
+             if _ns else " | KHÔNG có expert hứng"))
     print(f"LR      : {cycles_desc(c)}")
     print(f"          lr_router {c.run.lr_router:.1e} | lr_expert "
           f"{c.run.lr:.1e} | đáy = {c.run.min_lr_ratio:.3g}× | clip chuẩn "
