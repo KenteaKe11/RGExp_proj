@@ -47,8 +47,8 @@ fixed:
   # tính toán khi CẢ BATCH cùng bỏ qua một expert (xem src/moe.py::CTX.active);
   # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
   # tế xấp xỉ 12 bản delta/step, KHÔNG phải 4.
-  n_expert: 8
-  top_k: 3
+  n_expert: 12
+  top_k: 6
 
   # Nhiễu Gumbel cộng vào route logit khi CHỌN top-k, chỉ lúc TRAINING
   # (src/router.py::gumbel_like). top-k(logit + σ·Gumbel) = lấy mẫu 4 expert
