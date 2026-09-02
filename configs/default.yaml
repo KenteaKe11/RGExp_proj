@@ -53,11 +53,11 @@ fixed:
   # với batch lớn thì gần như expert nào cũng có người chọn, nên chi phí thực
   # tế xấp xỉ 24 bản delta/step, KHÔNG phải 6.
   #
-  # TOP-K THUẦN trên CẢ 24 expert. Không còn expert HỨNG (n_shared) nào bị
+  # TOP-K THUẦN trên CẢ 12 expert. Không còn expert HỨNG (n_shared) nào bị
   # loại khỏi vòng chọn, không còn trần tải mỗi micro-batch. Cân bằng tải
   # hoàn toàn do run.w_aux lo.
-  n_expert: 12
-  top_k: 4
+  n_expert: 9
+  top_k: 3
 
   # ── Nhiễu Gumbel khi CHỌN top-k (chỉ lúc TRAINING) ───────────────────────
   # top-k(logit + σ·Gumbel) = lấy mẫu k expert KHÔNG LẶP từ softmax(logit),
