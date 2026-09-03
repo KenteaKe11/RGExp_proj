@@ -306,7 +306,7 @@ run:
   #     --set run.train_bs=2 --set run.grad_accum=16
   train_bs: 2
   grad_accum: 32
-  infer_bs: 2
+  infer_bs: 4
   grad_ckpt: null
   num_workers: 4            # DataLoader worker — hạ xuống 2 trên máy ít vCPU
 
