@@ -467,6 +467,22 @@ def load_config(path="configs/default.yaml", overrides=None):
             f"{run['cam_pos_thr']} — vùng 'pos' rỗng, truy vấn finding × state "
             f"ở scripts/probe_summary.py sẽ không bao giờ trả về ô nào")
 
+    # ── Sinh CÓ ĐIỀU KIỆN (src/cam.py::condition_text) ───────────────────────
+    # Bật: mỗi ảnh sinh HAI lượt — lượt trống (raw_output, baseline) và lượt
+    # có hai danh sách present/absent lấy từ chính sup_head của ảnh đó
+    # (cond_output). Gập nhãn dùng ĐÚNG cam_pos_thr/cam_neg_thr ở trên, nên
+    # điều kiện của câu chữ và màu của heatmap luôn kể cùng một chuyện.
+    # Giá: gấp đôi thời gian generate. Tắt bằng cond_enabled: false.
+    run.setdefault("cond_enabled", True)
+    run["cond_enabled"] = bool(run["cond_enabled"])
+    run.setdefault("cond_max_pos", 0)   # 0 = không cắt danh sách
+    run.setdefault("cond_max_neg", 0)
+    for _k in ("cond_max_pos", "cond_max_neg"):
+        run[_k] = int(run[_k])
+        if run[_k] < 0:
+            raise ValueError(f"run.{_k} phải ≥ 0 (0 = giữ đủ danh sách), "
+                             f"nhận {run[_k]}")
+
     # ── mode="probe": khảo sát chuyên môn expert ─────────────────────────────
     run.setdefault("probe_repo", None)        # null -> "<hub_repo>-probe"
     run.setdefault("probe_commit_every", 1.0)   # phút, CommitScheduler
@@ -811,6 +827,12 @@ if __name__ == "__main__":
           + (f"giữ {_keep} revision rồi gộp" if _keep else "để nguyên"))
     print(f"Mode    : {c.run.mode} | dry_run={c.run.dry_run} | "
           f"policy={'BẬT' if c.run.use_policy else 'TẮT (chấm raw_output)'}")
+    print("Điều kiện: "
+          + (f"BẬT — mỗi ảnh sinh 2 lượt (trống -> raw_output, có nhãn "
+             f"pos/neg -> cond_output), ngưỡng {c.run.cam_pos_thr:g}/"
+             f"{c.run.cam_neg_thr:g}, ô 'unc' KHÔNG vào y_pred"
+             if getattr(c.run, "cond_enabled", False)
+             else "tắt — chỉ một lượt sinh, không có cond_output"))
     if c.remote.active:
         print(f"Remote  : BẬT (§9) | venv={'có' if c.remote.use_venv else 'không'}"
               f" | tmux={c.remote.tmux_session}")

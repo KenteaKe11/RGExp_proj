@@ -1169,15 +1169,20 @@ def main(argv=None):
     _pixels = [None]
     cam_grid = (router.grid, router.grid)
     cam_on = bool(r.cam_enabled)
+    cond_on = bool(getattr(r, "cond_enabled", False))
     cam_store = cam_mod.CamStore(
         os.path.join(r.out_dir, "cam.npz"), disease_names, cam_grid,
         meta={"run_tag": cfg.arch.tag, "model": f.model_id,
               "threshold": float(r.cam_threshold),
               "max_class": int(r.cam_max_class),
               "pos_thr": float(r.cam_pos_thr), "neg_thr": float(r.cam_neg_thr),
+              "cond": cond_on,
               "weights": weights_src, "mode": r.mode,
               "train_samples": state.get("samples")}) if cam_on else None
     _cam_warned = []
+    _cond_logged = []
+    _cond_warned = []
+    _pad_warned = []
 
     def cam_batch(pixels):
         """pixel_values → list item Grad-CAM (một cho mỗi ảnh), hoặc [] .
@@ -1201,18 +1206,61 @@ def main(argv=None):
             return []
 
     @torch.no_grad()
-    def generate_batch(paths, temperature=None, rep_penalty=None):
-        tokenizer.padding_side = f.pad_side_infer
-        imgs = [load_image(p, f.image_size_model, f.resize_filter, f.antialias)
-                for p in paths]
-        inputs = processor(text=[prompt_str] * len(paths),
+    def sup_probs(pixels):
+        """pixel_values → [B][14] σ(sup_logit). Đường dự phòng khi CAM tắt.
+
+        Grad-CAM đã trả sẵn đúng bộ xác suất này trong mỗi item (`prob`), nên
+        khi `cam_enabled` bật thì KHÔNG gọi hàm này — gọi là chạy thêm một
+        forward nhánh router cho một con số đã có sẵn trong tay.
+        """
+        if pixels is None:
+            return []
+        logits, _ = router.sup_forward(pixels.float())
+        return [[float(v) for v in row]
+                for row in torch.sigmoid(logits).float().cpu().numpy()]
+
+    @torch.no_grad()
+    def encode(paths, prompts, imgs=None):
+        """(đường dẫn ảnh, prompt cho TỪNG ảnh) → batch đã ở trên DEVICE.
+
+        Tách khỏi `run_generate` vì lượt sinh có điều kiện dùng LẠI đúng
+        những ảnh đã decode (`imgs`) nhưng một bộ prompt khác: mỗi ảnh có
+        danh sách present/absent riêng, nên `text=` phải là một list dài bằng
+        batch chứ không còn là một chuỗi nhân lên.
+        """
+        prompts = list(prompts)
+        if imgs is None:
+            imgs = [load_image(p, f.image_size_model, f.resize_filter,
+                               f.antialias) for p in paths]
+        # ── ĐỆM BÊN NÀO: lượt có điều kiện là chỗ ĐẦU TIÊN prompt lệch nhau ──
+        # Tới trước bản này mọi prompt lúc infer dài BẰNG NHAU (một chuỗi cố
+        # định nhân lên), nên `pad_side_infer` chưa bao giờ có việc để làm và
+        # để "right" là vô hại. Từ khi mỗi ảnh mang danh sách bệnh riêng thì
+        # batch có độ dài lệch thật, và với decoder-only đệm PHẢI ở bên trái:
+        #   • đệm phải -> token sinh ra nối sau ô pad, model phải bước qua một
+        #     vùng trống mà nó chưa từng thấy lúc train;
+        #   • và `out[:, in_len:]` cắt theo ĐỘ DÀI ĐÃ ĐỆM, nên hàng ngắn hơn
+        #     bị cắt mất phần đầu câu — im lặng, không lỗi nào nổ.
+        # Batch đồng đều thì không có ô pad nào, giữ nguyên lựa chọn config.
+        ragged = len(set(prompts)) > 1
+        if ragged and f.pad_side_infer != "left" and not _pad_warned:
+            _pad_warned.append(1)
+            log("infer", f"prompt trong batch dài lệch nhau (lượt có điều "
+                         f"kiện) -> đệm TRÁI cho riêng những batch đó, "
+                         f"pad_side_infer={f.pad_side_infer} vẫn giữ cho lượt "
+                         f"trống")
+        tokenizer.padding_side = "left" if ragged else f.pad_side_infer
+        inputs = processor(text=prompts,
                            images=wrap_images(imgs, f.model_id),
                            padding=True, return_tensors="pt")
         # Y HỆT lúc train: chèn n_slot vị trí giữ chỗ ở ĐẦU chuỗi để hook ghi
         # đè bằng prefix của router. Thiếu bước này thì lúc infer decoder
         # nhận một chuỗi khác hẳn chuỗi nó được train trên đó.
         add_router_slots(inputs, bridge.n_slot, tokenizer.pad_token_id)
-        inputs = to_device(inputs, DEVICE)
+        return to_device(inputs, DEVICE), imgs
+
+    @torch.no_grad()
+    def run_generate(inputs, temperature=None, rep_penalty=None):
         in_len = inputs["input_ids"].shape[-1]
         if not _preflight:
             _preflight.append(1)
@@ -1252,18 +1300,90 @@ def main(argv=None):
                                         skip_special_tokens=True)]
         return texts, share
 
+    def generate_batch(paths, temperature=None, rep_penalty=None,
+                       prompts=None, imgs=None):
+        """Một lượt sinh trọn gói. Vòng retry của policy đi qua đây."""
+        inputs, _ = encode(paths, prompts or [prompt_str] * len(paths), imgs)
+        return run_generate(inputs, temperature, rep_penalty)
+
+    def condition_pass(paths, probs, imgs):
+        """Lượt sinh THỨ HAI: nhãn của chính ảnh đó quay ngược vào prompt.
+
+        MỘT lượt, không lặp. Vòng "sinh -> chấm lại -> sinh tiếp" là một thuật
+        toán khác (và cần một tiêu chí dừng mà ở đây không có); cái đang làm
+        là supervised conditioning: sup_head nói phim có gì, decoder viết
+        theo, hết.
+
+        Gập mềm -> cứng ở `cam_pos_thr`/`cam_neg_thr` — ĐÚNG hai ngưỡng đang
+        tô heatmap. Ô rơi vào giữa (`unc`) không vào y_pred và không vào
+        prompt: model đang lưỡng lự, và chỗ để đọc sự lưỡng lự đó là bản đồ
+        nhiệt + `sup_prob`, không phải một câu khẳng định trong câu lệnh.
+
+        Trả về list dict cột phụ cho từng ảnh (rỗng nếu không có gì để nói).
+        """
+        conds = [cam_mod.condition_labels(pr, disease_names,
+                                          r.cam_pos_thr, r.cam_neg_thr)
+                 for pr in probs]
+        texts_c = [cam_mod.condition_text(c, r.cond_max_pos, r.cond_max_neg)
+                   for c in conds]
+        cols = []
+        for c in conds:
+            cols.append({
+                "y_pred": json.dumps(c["y_pred"]),
+                "cond_pos": json.dumps([n for n, _ in c["pos"]],
+                                       ensure_ascii=False),
+                "cond_neg": json.dumps([n for n, _ in c["neg"]],
+                                       ensure_ascii=False),
+                "cond_unc": json.dumps([n for n, _ in c["unc"]],
+                                       ensure_ascii=False),
+                "n_cond_pos": len(c["pos"]), "n_cond_neg": len(c["neg"]),
+                "n_cond_unc": len(c["unc"])})
+        if not any(texts_c):
+            # Cả batch đều lưỡng lự ở đủ 14 bệnh — không có gì để điều kiện
+            # hoá. Sinh lại một lượt y hệt lượt trống chỉ để tốn thời gian.
+            for col in cols:
+                col["cond_applied"] = False
+            return cols, None
+        if not _cond_logged:
+            _cond_logged.append(1)
+            k = next(i for i, t in enumerate(texts_c) if t)
+            log("cond", "điều kiện hoá BẬT — ví dụ phần thêm vào prompt:\n"
+                        + "    " + texts_c[k].replace("\n", "\n    "))
+        prompts = [build_prompt(processor, t) if t else prompt_str
+                   for t in texts_c]
+        inputs, _ = encode(paths, prompts, imgs)
+        texts, _ = run_generate(inputs)
+        for col, t, txt in zip(cols, texts_c, texts):
+            ok, failed = validate(txt)
+            col.update(cond_applied=bool(t), cond_output=txt,
+                       cond_guard_passed=ok,
+                       cond_fail_reasons=None if ok else str(failed))
+        return cols, texts
+
     def generate_records(paths):
         """policy TẮT (mặc định): sinh MỘT lần, không retry.
 
         Vẫn chạy 7-check để GHI LẠI pass/fail — biết tỉ lệ vi phạm của từng ô
         đo là thông tin, còn sửa văn phong là việc của train chứ không phải
         của vòng retry.
+
+        Với `cond_enabled` (mặc định BẬT) thì mỗi ảnh đi qua hai lượt sinh:
+        lượt TRỐNG ở đây (-> raw_output, là baseline duy nhất để biết điều
+        kiện hoá giúp hay hại), rồi `condition_pass` (-> cond_output).
         """
-        texts, share = generate_batch(paths)
+        # Decode JPEG đúng MỘT lần cho cả hai lượt: ảnh không đổi giữa hai
+        # lượt, chỉ prompt đổi.
+        imgs = [load_image(p, f.image_size_model, f.resize_filter, f.antialias)
+                for p in paths]
+        inputs, _ = encode(paths, [prompt_str] * len(paths), imgs)
+        texts, share = run_generate(inputs)
         # Ngay sau lần generate ĐẦU, trước mọi vòng retry của policy: bản đồ
         # chỉ phụ thuộc ẢNH, và vòng retry gọi lại generate_batch trên MỘT
         # ảnh nên nó sẽ ghi đè `_pixels` bằng một batch cỡ 1.
         cams = cam_batch(_pixels[0])
+        # Cũng phải lấy TRƯỚC vòng retry, và vì cùng một lý do.
+        probs = ([c["prob"] for c in cams] if len(cams) == len(paths)
+                 else (sup_probs(_pixels[0]) if cond_on else []))
         recs = []
         for text in texts:
             ok, failed = validate(text)
@@ -1288,6 +1408,23 @@ def main(argv=None):
                            final_temperature=round(temp, 4),
                            final_repetition_penalty=round(rep, 4))
             recs.append(rec)
+        if cond_on and len(probs) == len(recs):
+            cols, _ = condition_pass(paths, probs, imgs)
+            for rec, pr, col in zip(recs, probs, cols):
+                rec["sup_prob"] = json.dumps([round(float(v), 5) for v in pr])
+                rec.update(col)
+                # Không có lượt điều kiện (hoặc không có gì để điều kiện) thì
+                # cột vẫn phải có mặt và phải đọc được: để trống thì mọi bảng
+                # so raw ↔ cond sẽ lệch hàng và metrics rơi NaN im lặng.
+                rec.setdefault("cond_output", rec["raw_output"])
+                rec.setdefault("cond_guard_passed", rec["raw_guard_passed"])
+                rec.setdefault("cond_fail_reasons", rec["raw_fail_reasons"])
+        elif cond_on:
+            if not _cond_warned:
+                _cond_warned.append(1)
+                warn("cond", f"không lấy được xác suất sup_head cho batch này "
+                             f"({len(probs)} ≠ {len(recs)}) — phiên này chạy "
+                             f"tiếp KHÔNG có cond_output")
         return recs, share, cams
 
     out_csv = os.path.join(r.out_dir, "reports.csv")
@@ -1311,7 +1448,10 @@ def main(argv=None):
         infer_log = RateLimiter(r.log_every_sec)
         tinf = time.time()
         log("infer", f"sinh {len(df_infer)} báo cáo | policy="
-                     f"{'BẬT' if r.use_policy else 'TẮT'}")
+                     f"{'BẬT' if r.use_policy else 'TẮT'} | điều kiện="
+                     + (f"BẬT (2 lượt/ảnh, ngưỡng {r.cam_pos_thr:g}/"
+                        f"{r.cam_neg_thr:g}, 'unc' không vào y_pred)"
+                        if cond_on else "TẮT (1 lượt/ảnh)"))
         results, shares = [], []
         for i in range(0, len(df_infer), r.infer_bs):
             chunk = df_infer.iloc[i:i + r.infer_bs]
@@ -1375,6 +1515,17 @@ def main(argv=None):
         return 0
     log("infer", f"XONG {len(res_df)} | 7-check pass "
                  f"{int(res_df.raw_guard_passed.sum())}/{len(res_df)}")
+    if "cond_output" in res_df.columns:
+        _napp = int(res_df.get("cond_applied", pd.Series(dtype=bool)).sum())
+        _ndif = int((res_df["cond_output"].astype(str)
+                     != res_df["raw_output"].astype(str)).sum())
+        log("cond", f"{_napp}/{len(res_df)} ảnh có nhãn để điều kiện | "
+                    f"{_ndif} báo cáo khác lượt trống | 7-check pass "
+                    f"{int(res_df.cond_guard_passed.sum())}/{len(res_df)} | "
+                    f"TB {res_df.n_cond_pos.mean():.1f} pos, "
+                    f"{res_df.n_cond_neg.mean():.1f} neg, "
+                    f"{res_df.n_cond_unc.mean():.1f} unc (unc bị loại khỏi "
+                    f"y_pred)")
     if expert_share:
         log("moe", "tỉ lệ chọn expert khi infer: "
                    + " ".join(f"E{i}={v:.2f}" for i, v in

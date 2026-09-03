@@ -13,6 +13,7 @@ một CỘT là một metric.
   outputs/_summary/metrics_table.md     bảng lần chạy × metric
   outputs/_summary/param_curve.md       metric theo TỔNG THAM SỐ + phân bố
                                         expert
+  outputs/_summary/cond_impact.md       sinh có điều kiện: Δ so với lượt trống
   outputs/_summary/gen_text.csv         gen_text side-by-side theo img_rel
   outputs/_summary/gen_text.md          bản dễ đọc, N mẫu đầu
   outputs/_summary/run_health.md        tiến trình / tốc độ / VRAM / lỗi
@@ -78,7 +79,8 @@ def build_metrics_full(cells):
                 "train_step": meta.get("train_step"), "gpu": meta.get("gpu"),
                 "total_params": _total_params(c),
                 "max_seq_len": meta.get("max_seq_len")}
-        for block in ("raw", "post_policy", "delta_post_minus_raw"):
+        for block in ("raw", "cond", "delta_cond_minus_raw",
+                      "post_policy", "delta_post_minus_raw"):
             for k, v in m.get(block, {}).items():
                 rows.append({**base, "block": block, "metric": k, "value": v})
         for k, v in meta.items():
@@ -146,7 +148,10 @@ def build_param_curve(cells, block=DEFAULT_BLOCK,
             vals.append(f"{v:.4f}" if isinstance(v, (int, float)) else "—")
         p = _total_params(c)
         n, ok = meta.get("n_samples") or 0, meta.get("n_guard_passed_raw")
-        head.append(f"| {c['tag']} | {p/1e6:.1f}M | " + " | ".join(vals)
+        # p = None khi chạy report NGOÀI package (không import được router):
+        # cột tham số trống, phần còn lại của bảng vẫn phải dựng được.
+        head.append(f"| {c['tag']} | {f'{p/1e6:.1f}M' if p else '—'} | "
+                    + " | ".join(vals)
                     + f" | {ok if ok is not None else '—'}"
                     + (f"/{n}" if n else "") + " |")
     return "\n".join(head)
@@ -205,6 +210,11 @@ def build_gen_text(cells, key_col="img_rel", limit_md=20):
     for tag, df in frames.items():
         sub = df.loc[common]
         out[f"{tag}__generated"] = sub["generated"]
+        if "cond_output" in sub.columns:
+            out[f"{tag}__cond"] = sub["cond_output"]
+            for col in ("cond_pos", "cond_neg"):
+                if col in sub.columns:
+                    out[f"{tag}__{col}"] = sub[col]
         out[f"{tag}__raw"] = sub["raw_output"]
         out[f"{tag}__guard_passed"] = sub["guard_passed"]
         out[f"{tag}__attempts"] = sub["attempts"]
@@ -221,6 +231,15 @@ def build_gen_text(cells, key_col="img_rel", limit_md=20):
             flag = "✓" if gp else "✗"
             md.append(f"**{tag}** — guard {flag}, {at} lần thử\n\n"
                       f"> {out.loc[key, f'{tag}__generated']}\n")
+            if f"{tag}__cond" in out.columns:
+                lbl = " | ".join(
+                    f"{nm} {out.loc[key, f'{tag}__{col}']}"
+                    for col, nm in (("cond_pos", "present"),
+                                    ("cond_neg", "absent"))
+                    if f"{tag}__{col}" in out.columns)
+                md.append(f"**{tag} — có điều kiện**"
+                          + (f" ({lbl})" if lbl else "") + "\n\n"
+                          f"> {out.loc[key, f'{tag}__cond']}\n")
     return out, "\n".join(md), None
 
 
@@ -249,6 +268,37 @@ def build_guard_impact(cells):
             f"{pp if pp is not None else '—'} | "
             f"{f'{dbleu:+.4f}' if isinstance(dbleu, (int, float)) else '—'} |")
     return "\n".join(lines)
+
+
+def build_cond_impact(cells):
+    """Sinh CÓ ĐIỀU KIỆN có kéo điểm lên không, và trên bao nhiêu nhãn.
+
+    Ba cột phải đọc CÙNG nhau. `Δ BLEU` một mình không nói gì: điều kiện hoá
+    trên một ảnh mà sup_head để cả 14 bệnh ở vùng lưỡng lự thì prompt của
+    lượt hai bằng đúng prompt của lượt một, và Δ chỉ còn là nhiễu lấy mẫu.
+    Cột `pos/neg/unc TB` cho biết có thật sự điều kiện hoá cái gì không.
+    """
+    lines = ["| lần chạy | n | ngưỡng pos/neg | pos TB | neg TB | unc TB | "
+             "đổi | ΔBLEU | ΔROUGE-L | ΔBERT-F1 |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for c in sorted(cells, key=lambda x: x["tag"]):
+        m, meta = c["metrics"], c["metrics"].get("meta", {})
+        if "cond" not in m:
+            continue
+        d = m.get("delta_cond_minus_raw", {})
+        g = lambda k: (f"{d[k]:+.4f}" if isinstance(d.get(k), (int, float))    # noqa: E731
+                       else "—")
+        h = lambda k: (f"{meta[k]:.1f}" if isinstance(meta.get(k), (int, float))  # noqa: E731
+                       else "—")
+        lines.append(
+            f"| {c['tag']} | {meta.get('n_samples', '—')} | "
+            f"{meta.get('cond_pos_thr', '—')}/"
+            f"{meta.get('cond_neg_thr', '—')} | "
+            f"{h('mean_cond_pos')} | {h('mean_cond_neg')} | "
+            f"{h('mean_cond_unc')} | {meta.get('n_changed_by_cond', '—')} | "
+            f"{g('corpus_bleu')} | {g('rougeL_f1')} | {g('bertscore_f1')} |")
+    return "\n".join(lines) if len(lines) > 2 else \
+        "_Chưa lần chạy nào có khối `cond` (run.cond_enabled tắt?)._"
 
 
 # ────────────────────────── đọc lại log JSONL ────────────────────────────────
@@ -343,6 +393,11 @@ def main(argv=None):
            f"Nguồn: `{args.out_dir}/*/metrics.json` | chấm trên `raw_output` "
            f"(policy tắt)\n"
            + build_metrics_table(cells, DEFAULT_BLOCK))
+    if any("cond" in c["metrics"] for c in cells):
+        tbl += ("\n\n---\n" + build_metrics_table(cells, "cond")
+                + "\n\n_`cond` = sinh lại sau khi nhãn pos/neg của sup_head "
+                  "vào prompt; ô 'unc' không vào y_pred. Xem "
+                  "`cond_impact.md` cho hiệu số._\n")
     if any("post_policy" in c["metrics"] for c in cells):
         tbl += "\n\n---\n" + build_metrics_table(cells, "post_policy")
     p = os.path.join(summary, "metrics_table.md")
@@ -364,6 +419,13 @@ def main(argv=None):
     with open(p, "w") as f:
         f.write("# 7-check (§2) — đang ở chế độ ĐO, không sửa\n\n"
                 + build_guard_impact(cells) + "\n")
+    print(f"✓ {p}")
+
+    # 4b. sinh có điều kiện
+    p = os.path.join(summary, "cond_impact.md")
+    with open(p, "w") as fh:
+        fh.write("# Sinh CÓ ĐIỀU KIỆN — nhãn sup_head quay ngược prompt"
+                 "\n\n" + build_cond_impact(cells) + "\n")
     print(f"✓ {p}")
 
     # 4. sức khoẻ run (đọc từ events JSONL)
@@ -394,6 +456,8 @@ def main(argv=None):
     print(build_expert_share(cells))
     print("\n\n# 7-check\n")
     print(build_guard_impact(cells))
+    print("\n\n# Sinh có điều kiện\n")
+    print(build_cond_impact(cells))
     print("\n\n# Sức khoẻ run\n")
     print(build_run_health(args.out_dir, cells))
     return 0

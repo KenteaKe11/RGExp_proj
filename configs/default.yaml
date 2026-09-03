@@ -225,6 +225,20 @@ run:
   cam_pos_thr: 0.5     # p ≥ đây -> "pos"
   cam_neg_thr: 0.2     # p ≤ đây -> "neg"; ở giữa -> "unc" (model lưỡng lự)
 
+  # ── Sinh CÓ ĐIỀU KIỆN: nhãn của sup_head quay ngược vào prompt ───────────
+  # Mỗi ảnh sinh HAI lượt:
+  #   1. prompt gốc, model chưa biết gì            -> raw_output (baseline)
+  #   2. prompt + "Present: … / Absent: …" gập từ σ(sup_logit) của CHÍNH ảnh
+  #      đó qua cam_pos_thr/cam_neg_thr             -> cond_output
+  # Ô "unc" (giữa hai ngưỡng) KHÔNG vào y_pred và không vào prompt — model
+  # đang lưỡng lự, và chỗ thể hiện sự lưỡng lự đó là heatmap + sup_prob, chứ
+  # không phải một khẳng định trong câu lệnh. Một lượt điều kiện, không lặp.
+  # Giá: gấp đôi thời gian generate. metrics.json có thêm khối `cond` và
+  # `delta_cond_minus_raw` để đọc thẳng xem điều kiện giúp hay hại.
+  cond_enabled: true
+  cond_max_pos: 0      # 0 = liệt kê đủ; > 0 = cắt danh sách present ở đây
+  cond_max_neg: 0      # 0 = liệt kê đủ; > 0 = cắt danh sách absent ở đây
+
   # ── Phase probe: khảo sát chuyên môn expert (mode: probe) — xem §3.6 ──────
   # KHÔNG train. Nạp last/ trên Hub, sinh báo cáo cho từng
   # ảnh test, rồi bật lần lượt từng expert trong top-k (trọng số 1.0) để đo:

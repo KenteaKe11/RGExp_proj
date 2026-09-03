@@ -504,10 +504,23 @@ class CXRDataset(Dataset):
         return img, str(row[self.f.target_column]).strip(), y
 
 
-def build_prompt(processor):
+def build_prompt(processor, condition=None):
+    """Prompt cố định, cộng thêm phần điều kiện nếu có.
+
+    `condition` là đoạn do `src/cam.py::condition_text` dựng: hai danh sách
+    bệnh present/absent mà nhánh sup_head vừa đọc ra từ CHÍNH ảnh này. Nó đi
+    vào SAU §1.2 chứ không thay §1.2 — khuôn hai section, giới hạn độ dài và
+    các điều cấm phải giữ nguyên, nếu không thì lượt sinh có điều kiện và
+    lượt sinh trống hết so được với nhau (và guard 7-check sẽ trượt vì một lý
+    do chẳng liên quan gì tới điều kiện).
+
+    None hoặc chuỗi rỗng -> đúng prompt gốc, từng token một. Đây là đường mà
+    mọi lần train đi qua; đừng để nó khác đi vì một dấu xuống dòng.
+    """
+    text = PROMPT_TEXT if not condition else f"{PROMPT_TEXT}\n\n{condition}"
     return processor.apply_chat_template(
         [{"role": "user", "content": [{"type": "image"},
-                                      {"type": "text", "text": PROMPT_TEXT}]}],
+                                      {"type": "text", "text": text}]}],
         add_generation_prompt=True, tokenize=False)
 
 

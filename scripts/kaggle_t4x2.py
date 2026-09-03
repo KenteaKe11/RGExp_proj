@@ -158,6 +158,11 @@ ASL_CLIP      = None      # 0.02 — NGƯỠNG ÂM TÍNH (BI-RADS 3). Dưới m�
                           #        một ô âm hết gradient hẳn.
 ASL_GAMMA_NEG = None      # 4.0  — focus nhánh âm (default chuẩn của ASL)
 UNCERTAIN_SOFT= None      # 0.7  — soft label cho aspect uncertain
+COND_ENABLED  = None      # True — sinh CÓ ĐIỀU KIỆN: mỗi ảnh 2 lượt, lượt 2
+                          #        có "Present: …/Absent: …" gập từ sup_head
+                          #        qua cam_pos_thr/cam_neg_thr (ô 'unc' bị
+                          #        loại). Gấp đôi thời gian infer; False =
+                          #        chỉ raw_output như trước.
 ROUTE_NOISE   = None      # 0.5  — σ Gumbel SAU warmup. KHÔNG để 0: từ khi
                           #        bỏ bias, đây là cơ chế khám phá duy nhất.
 # Lịch decay mũ của σ, đếm bằng MẪU (không phải step — step phụ thuộc batch).
@@ -508,6 +513,7 @@ for _key, _val, _where in (("w_sup", W_SUP, "run"),
                            ("asl_clip", ASL_CLIP, "run"),
                            ("asl_gamma_neg", ASL_GAMMA_NEG, "run"),
                            ("uncertain_soft", UNCERTAIN_SOFT, "run"),
+                           ("cond_enabled", COND_ENABLED, "run"),
                            ("route_noise", ROUTE_NOISE, "fixed"),
                            ("route_noise_start", ROUTE_NOISE_ST, "fixed"),
                            ("decay_warmup_samples", DECAY_SAMPLES, "fixed")):

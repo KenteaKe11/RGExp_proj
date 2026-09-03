@@ -273,9 +273,15 @@ gán nhầm `uncertain` thành `negative` là một lỗi im lặng.
 
 BLEU (1–4 + corpus), ROUGE (1/2/L), BERTScore (tuỳ chọn).
 
-**Policy đang TẮT** (`run.use_policy: false`), nên `metrics.json` chỉ có khối
-`raw` — chấm trên `raw_output`. 7-check vẫn chạy nhưng chỉ để **ghi lại** tỉ lệ
+**Policy đang TẮT** (`run.use_policy: false`), nên khối `post_policy` vắng mặt
+và bảng chấm trên `raw_output`. 7-check vẫn chạy nhưng chỉ để **ghi lại** tỉ lệ
 vi phạm. Lý do: bảng metrics so **model**, không so hậu xử lý.
+
+**Sinh có điều kiện đang BẬT** (`run.cond_enabled: true`, [§3.9](#39-sinh-có-điều-kiện-nhãn-quay-ngược-vào-prompt)),
+nên `metrics.json` có thêm khối `cond` (chấm trên `cond_output`) và
+`delta_cond_minus_raw`. Hiệu số mới là thứ đáng đọc: hai khối chạy trên cùng
+trọng số, cùng tập ảnh, khác nhau đúng một thứ — decoder có biết trước 14 nhãn
+hay không.
 
 Vì lịch train không có đích, `--mode test` là một phiên **riêng**: nạp
 `weights.pt` từ checkpoint rồi sinh 200 báo cáo và chấm. Chạy bất cứ lúc nào.
@@ -689,6 +695,7 @@ router 39M tham số. Ra ba chỗ:
 |---|---|
 | `outputs/<tag>/cam.npz` | `m/<key>` bản đồ fp16, `c/<key>` chỉ số bệnh, `p/<key>` xác suất 14 bệnh |
 | `outputs/<tag>/reports.csv` | thêm cột `sup_prob`, `cam_state`, `cam_findings`, `cam_fallback` — chỉ ở `mode: test`; ở `mode: probe` thông tin ấy nằm trong bản ghi JSON |
+| lượt sinh thứ hai ([§3.9](#39-sinh-có-điều-kiện-nhãn-quay-ngược-vào-prompt)) | cùng bộ xác suất đó, gập ở `cam_pos_thr`/`cam_neg_thr`, thành hai danh sách bệnh trong prompt |
 | bản ghi probe (schema **v3**) | khối `cam` — để `probe_summary.py` dựng trang tra cứu chỉ từ Hub |
 
 ```yaml
@@ -741,6 +748,69 @@ Không có `--images-root` thì trang vẫn dựng, chỉ mất phim nền. `--b
 
 ---
 
+### 3.9. Sinh CÓ ĐIỀU KIỆN: nhãn quay ngược vào prompt
+
+Nhánh `sup_head` đọc phim ra 14 xác suất, còn decoder viết báo cáo — và cho
+tới trước bước này, hai việc đó chỉ gặp nhau qua **prefix 256 token** và qua
+gradient lúc train. Lúc infer, decoder không hề được cho biết nhánh giám sát
+vừa đọc ra cái gì. §3.9 nối chỗ đó lại: **một** lượt, không lặp.
+
+```
+ảnh ──> sup_head ──> σ(logit) [14]
+                        │  gập ở cam_pos_thr / cam_neg_thr
+                        ▼
+        p ≥ 0.5 -> "Present: …"   ┐
+        p ≤ 0.2 -> "Absent: …"    ├──> nối vào prompt ──> generate LẦN 2
+        ở giữa  -> BỎ (unc)       ┘                        -> cond_output
+```
+
+Mỗi ảnh đi qua **hai** lượt sinh trên cùng một bộ trọng số:
+
+| Lượt | Prompt | Cột |
+|---|---|---|
+| 1 | §1.2 nguyên bản — decoder chưa biết gì | `raw_output` |
+| 2 | §1.2 **+** hai danh sách bệnh của chính ảnh đó | `cond_output` |
+
+Giữ lượt 1 không phải để cho đủ bộ: nó là **baseline duy nhất**. Hai lượt khác
+nhau đúng một biến — decoder có biết trước nhãn hay không — nên
+`delta_cond_minus_raw` trong `metrics.json` đọc thẳng ra được điều kiện hoá
+kéo điểm lên hay xuống. Giá phải trả là gấp đôi thời gian generate;
+`run.cond_enabled: false` trả về hành vi cũ.
+
+**Ô `unc` bị LOẠI khỏi `y_pred`, không bị gán 0.** `y_pred` chỉ có hai giá trị
+thật (1 = pos, 0 = neg), ô ở giữa để `None` và không xuất hiện trong danh sách
+nào của prompt. Gán nó thành 0 là khai một điều model **chưa hề nói** — "không
+có bệnh này" — rồi bắt decoder viết theo. Sự lưỡng lự đó đã có chỗ của nó:
+bản đồ nhiệt (§3.7) và cột `sup_prob`. Điều kiện hoá chỉ nhận phần model dám
+khẳng định; phần còn lại trả về cho ảnh, và câu cuối của prompt nói đúng như
+vậy ("anything on neither list is undetermined").
+
+Ngưỡng dùng **chung** với heatmap (`cam_pos_thr` / `cam_neg_thr`), không có
+ngưỡng riêng: một ảnh chỉ có một cách đọc, và hai bộ ngưỡng khác nhau thì câu
+chữ và màu của bản đồ sẽ kể hai chuyện khác nhau về cùng một bức phim.
+
+```yaml
+run:
+  cond_enabled: true
+  cond_max_pos: 0      # 0 = liệt kê đủ, > 0 = cắt danh sách present
+  cond_max_neg: 0      # cắt thì cắt phần model tin ÍT nhất (danh sách đã xếp)
+```
+
+Cột thêm vào `reports.csv`: `cond_output`, `cond_guard_passed`,
+`cond_fail_reasons`, `cond_applied`, `y_pred`, `cond_pos`, `cond_neg`,
+`cond_unc`, `n_cond_pos/neg/unc`. Khối thêm vào `metrics.json`: `cond` và
+`delta_cond_minus_raw`. Bảng tổng hợp: `outputs/_summary/cond_impact.md`.
+
+Một chi tiết kỹ thuật, vì nó im lặng: từ đây prompt trong một batch **dài lệch
+nhau**, nên riêng lượt 2 phải đệm **trái**. Đệm phải thì `out[:, in_len:]` cắt
+theo độ dài đã đệm và hàng ngắn hơn mất phần đầu câu — không lỗi nào nổ.
+`src/train.py::encode` tự đổi cho những batch lệch; `run.pad_side_infer` vẫn
+giữ nguyên cho lượt 1 (mọi prompt bằng nhau, không có ô pad nào).
+
+`src/cam.py::condition_labels` / `condition_text`
+
+---
+
 ## 4. Kịch bản một lần chạy
 
 1. **Input**: 512 → 896 BICUBIC cho SigLIP (`pan_and_scan` tắt → 256 image
@@ -765,12 +835,14 @@ Không có khái niệm "chạy hết lịch": một lần chạy là một kho�
 
 ```
 outputs/<tag>/
-├── reports.csv     một hàng / ảnh test (+ sup_prob / cam_state / cam_findings)
+├── reports.csv     một hàng / ảnh test (+ sup_prob / cam_state / cam_findings
+│                  + cond_output / y_pred / cond_pos / cond_neg — §3.9)
 ├── cam.npz         bản đồ Grad-CAM 16×16 theo bệnh, khoá theo img_rel (§3.7)
-└── metrics.json    raw / meta   (+ post_policy khi bật policy)
+└── metrics.json    raw / cond / delta_cond_minus_raw / meta
+                    (+ post_policy khi bật policy)
 ```
 
-`python -m src.report` gom **mọi lần chạy** trong `outputs/` thành sáu file ở
+`python -m src.report` gom **mọi lần chạy** trong `outputs/` thành bảy file ở
 `outputs/_summary/`. Một **hàng** là một lần chạy, một **cột** là một metric.
 
 | File | Nội dung |
@@ -780,6 +852,7 @@ outputs/<tag>/
 | `param_curve.md` | các lần chạy xếp theo tổng tham số |
 | `gen_text.csv` / `.md` | so text sinh ra side-by-side |
 | `guard_impact.md` | tỉ lệ qua 7-check của từng lần chạy |
+| `cond_impact.md` | sinh có điều kiện (§3.9): pos/neg/unc TB và Δ so với lượt trống |
 | `run_health.md` | từ JSONL: step cuối, s/step, VRAM đỉnh, warn/error, mã thoát |
 
 Trên trục hoành của `param_curve.md` chỉ còn **một** biến: router là hằng số
@@ -905,9 +978,11 @@ RESUME               LUÔN: lấy bản đi xa nhất giữa ckpt cục bộ và
       ↓
 freeze_scales        tính sẵn m/‖V+ΔV‖ cho infer
       ↓
-generate_records     sinh 1 lần (policy tắt) → 7-check chỉ để GHI LẠI
-      ↓
-run_metrics          chấm raw_output → metrics.json
+generate_records     lượt 1: prompt trống      → raw_output
+      ↓              7-check chỉ để GHI LẠI (policy tắt)
+condition_pass       sup_head → pos/neg (unc bị loại) → prompt → lượt 2
+      ↓                                              → cond_output
+run_metrics          chấm raw_output + cond_output → metrics.json
 ```
 
 ### Checkpoint & resume

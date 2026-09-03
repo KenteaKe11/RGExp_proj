@@ -1061,9 +1061,9 @@ def test_cam():
 
     import numpy as np
 
-    from src.cam import (CamStore, cam_block, detect_findings,   # noqa: E402
-                         gradcam, load_cam, normalize_map, pack_maps,
-                         state_of)
+    from src.cam import (CamStore, cam_block, condition_labels,  # noqa: E402
+                         condition_text, detect_findings, gradcam, load_cam,
+                         normalize_map, pack_maps, state_of)
 
     # ── phần thuần, không cần forward ───────────────────────────────────────
     check("state_of gập theo HAI ngưỡng, vùng giữa là 'unc'",
@@ -1080,6 +1080,47 @@ def test_cam():
     ids, fb = detect_findings([0.1, 0.3, 0.2], threshold=0.5)
     check("không bệnh nào qua ngưỡng -> vẫn 1 bản đồ + cờ fallback",
           ids == [1] and fb, f"{ids} fallback={fb}")
+
+    # ── nhãn cứng quay ngược vào prompt (sinh có điều kiện) ─────────────────
+    names = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
+             "Effusion"]
+    c = condition_labels([0.91, 0.35, 0.02, 0.60, 0.11], names,
+                         pos_thr=0.5, neg_thr=0.2)
+    check("y_pred chỉ nhận pos=1 / neg=0; ô 'unc' là None, KHÔNG phải 0",
+          c["y_pred"] == [1, None, 0, 1, 0], str(c["y_pred"]))
+    check("ô 'unc' không lọt vào pos hay neg",
+          [n for n, _ in c["unc"]] == ["Cardiomegaly"]
+          and "Cardiomegaly" not in [n for n, _ in c["pos"] + c["neg"]])
+    check("pos xếp p giảm dần, neg xếp p tăng dần (chắc chắn nhất trước)",
+          [n for n, _ in c["pos"]] == ["Atelectasis", "Edema"]
+          and [n for n, _ in c["neg"]] == ["Consolidation", "Effusion"])
+    txt = condition_text(c)
+    check("prompt điều kiện có ĐỦ hai danh sách, không có xác suất trong đó",
+          "Present: Atelectasis, Edema." in txt
+          and "Absent: Consolidation, Effusion." in txt
+          and "0.9" not in txt, txt)
+    check("tên bệnh 'unc' không xuất hiện trong prompt",
+          "Cardiomegaly" not in txt)
+    check("prompt nói rõ phần KHÔNG liệt kê là chưa xác định (không im lặng "
+          "biến 'unc' thành 'neg')", "undetermined" in txt)
+    check("cắt danh sách thì cắt phần model tin ÍT nhất",
+          "Present: Atelectasis." in condition_text(c, max_pos=1))
+    empty = condition_labels([0.3, 0.4], ["a", "b"], 0.5, 0.2)
+    check("lưỡng lự ở mọi bệnh -> không có điều kiện nào, prompt giữ nguyên",
+          condition_text(empty) == "" and empty["y_pred"] == [None, None])
+    allneg = condition_text(condition_labels([0.01, 0.02], ["a", "b"]))
+    check("không bệnh nào dương -> vẫn ra prompt hợp lệ, không nổ",
+          "Present: none" in allneg and "Absent: a, b." in allneg, allneg)
+    check("condition_labels chịu được len(names) < số lớp, không nổ",
+          condition_labels([0.9, 0.9, 0.9], ["a"])["pos"][0][0] in ("a", "#1"))
+    check("dùng ĐÚNG hai ngưỡng của heatmap: state_of và condition_labels "
+          "không bao giờ lệch nhau",
+          all((state_of(v, 0.6, 0.3) == "pos") == (y == 1)
+              and (state_of(v, 0.6, 0.3) == "neg") == (y == 0)
+              for v, y in zip([0.9, 0.45, 0.1],
+                              condition_labels([0.9, 0.45, 0.1],
+                                               ["a", "b", "c"],
+                                               0.6, 0.3)["y_pred"])))
 
     m = normalize_map([[0.0, 2.0], [4.0, 1.0]])
     check("normalize_map chia theo max của chính nó, giữ hình dạng",

@@ -5,6 +5,13 @@ một lần, không retry, nên bảng kết quả chấm trên `raw_output` —
 "raw_outp" trong tài liệu sweep. Khối `post_policy` và `delta_post_minus_raw`
 chỉ xuất hiện khi bật lại policy.
 
+Khi `run.cond_enabled` bật, mỗi ảnh có THÊM một báo cáo `cond_output`: bản
+sinh lại sau khi nhãn pos/neg mà sup_head đọc được từ chính ảnh đó được viết
+vào prompt (src/cam.py::condition_text). Nó được chấm thành khối riêng `cond`,
+kèm `delta_cond_minus_raw` — hiệu số mới là thứ đáng đọc, vì hai khối chạy
+trên CÙNG một bộ trọng số và cùng một tập ảnh, khác nhau đúng một thứ: decoder
+có biết trước 14 nhãn hay không.
+
 Tất cả là metric TỔNG THỂ trên corpus — không sinh cột metric per-row.
 """
 from __future__ import annotations
@@ -102,6 +109,13 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
                              for r in refs]))
 
     metrics = {"raw": m_raw}
+    # ── Lượt sinh CÓ ĐIỀU KIỆN (src/cam.py::condition_text) ──────────────────
+    # `cond_output` là báo cáo sinh lại sau khi nhãn pos/neg của chính ảnh đó
+    # được viết vào prompt. Chấm nó TÁCH khỏi raw và ghi cả hiệu số: câu hỏi
+    # của khối này không phải "điểm bao nhiêu" mà "điều kiện hoá làm điểm đi
+    # lên hay đi xuống", và chỉ có hiệu số mới trả lời được câu đó.
+    has_cond = ("cond_output" in eval_df.columns and
+                eval_df["cond_output"].astype(str).str.strip().ne("").any())
     meta = {
         "n_samples": len(refs),
         "mean_ref_tokens": round(ref_len, 4),
@@ -145,6 +159,34 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         # 1/E nghĩa là w_aux quá nhỏ so với áp lực của CE, hoặc router đã sập
         # về "luôn chọn cùng một expert" — đọc kèm `balance` trong log train.
         meta["expert_share_max"] = round(float(max(expert_share)), 4)
+    if has_cond:
+        hyps_cond = eval_df["cond_output"].apply(_norm).tolist()
+        n_cond_diff = int(sum(a != b for a, b in zip(hyps_raw, hyps_cond)))
+        log("eval", f"điều kiện hoá đổi {n_cond_diff}/{len(refs)} báo cáo")
+        m_cond = compute_metrics(refs, refs_tok, hyps_cond, "cond", tokenizer,
+                                 cfg.run.use_bertscore, dev, log)
+        metrics["cond"] = m_cond
+        metrics["delta_cond_minus_raw"] = {
+            k: round(m_cond[k] - m_raw[k], 4)
+            for k in m_cond if isinstance(m_cond[k], float)}
+        meta.update(
+            cond_enabled=True,
+            cond_pos_thr=float(getattr(cfg.run, "cam_pos_thr", 0.5)),
+            cond_neg_thr=float(getattr(cfg.run, "cam_neg_thr", 0.2)),
+            length_ratio_cond=round(m_cond["mean_gen_tokens"] / ref_len, 4),
+            n_changed_by_cond=n_cond_diff)
+        for col, key in (("cond_guard_passed", "n_guard_passed_cond"),
+                         ("cond_applied", "n_cond_applied")):
+            if col in eval_df.columns:
+                meta[key] = int(eval_df[col].astype(bool).sum())
+        # Bao nhiêu ô thật sự vào y_pred, bao nhiêu ô bị bỏ vì lưỡng lự. Đọc
+        # kèm delta: điều kiện hoá gần như không đổi gì khi mean_cond_unc sát
+        # 14 (model không dám khẳng định gì) là một kết quả, không phải lỗi.
+        for col in ("n_cond_pos", "n_cond_neg", "n_cond_unc"):
+            if col in eval_df.columns:
+                meta[f"mean_{col[2:]}"] = round(float(eval_df[col].mean()), 3)
+    else:
+        meta["cond_enabled"] = bool(getattr(cfg.run, "cond_enabled", False))
     if cfg.run.use_policy:
         m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,
                                  cfg.run.use_bertscore, dev, log)
@@ -163,9 +205,17 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         json.dump(metrics, f, indent=2)
     print(json.dumps(metrics, indent=2), flush=True)
 
+    head = ("corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
+            "rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1")
     log("eval", f"── {cfg.arch.tag} (raw_output) ──")
-    for k in ("corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
-              "rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1"):
+    for k in head:
         if k in m_raw:
             log("eval", f"    {k:<20} {m_raw[k]:>8.4f}")
+    if has_cond:
+        d = metrics["delta_cond_minus_raw"]
+        log("eval", f"── {cfg.arch.tag} (cond_output — Δ so với raw) ──")
+        for k in head:
+            if k in metrics["cond"]:
+                log("eval", f"    {k:<20} {metrics['cond'][k]:>8.4f}"
+                            f"  ({d.get(k, 0):+.4f})")
     return metrics

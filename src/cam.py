@@ -69,6 +69,14 @@ của CheXbert đã bị MASK khỏi loss (src/losses.py) nên model chưa bao g
 dạy để nói "không đề cập". Gọi vùng giữa là "unc" là mô tả đúng cái model
 làm — nó lưỡng lự — chứ không phải khôi phục lại ô uncertain của CheXbert.
 
+═══ Nhãn cứng quay ngược vào prompt ═══
+
+`condition_labels` + `condition_text` gập cùng bộ xác suất đó thành hai danh
+sách tên bệnh (present / absent) rồi nối vào prompt cho một lượt sinh THỨ HAI
+— "gen with supervised condition". Ô `unc` không vào danh sách nào: xem
+docstring của `condition_labels`. Dùng chung `pos_thr`/`neg_thr` với heatmap
+là có chủ ý — một ảnh chỉ có MỘT cách đọc.
+
 ═══ Lưu ở đâu ═══
 
 `CamStore` gom vào bộ nhớ rồi ghi `cam.npz` cạnh `reports.csv`. Mỗi ảnh ba
@@ -124,6 +132,86 @@ def state_of(p, pos_thr=0.5, neg_thr=0.2):
     if p <= neg_thr:
         return "neg"
     return "unc"
+
+
+def condition_labels(prob, names, pos_thr=0.5, neg_thr=0.2):
+    """[14] xác suất → nhãn CỨNG để điều kiện hoá lần sinh thứ hai.
+
+    Đây là bước "feed nhãn soft ngược lại vào model": σ(sup_logit) là một
+    vector mềm, còn thứ decoder đọc được trong prompt là một DANH SÁCH TÊN.
+    Gập từ mềm sang cứng bằng đúng hai ngưỡng đang vẽ heatmap (`state_of`) —
+    dùng ngưỡng khác thì điều kiện của câu chữ và màu của bản đồ nói hai
+    chuyện khác nhau về cùng một ảnh, và không ai đối chiếu được nữa.
+
+    ═══ Ô "unc" bị LOẠI, không bị gán 0 ═══
+
+    `y_pred` chỉ có hai giá trị thật (1 = pos, 0 = neg); ô ở giữa để `None`
+    và KHÔNG xuất hiện trong danh sách nào của prompt. Gán nó thành 0 là
+    khai một điều model chưa hề nói — "không có bệnh này" — rồi bắt decoder
+    viết theo. Đúng ở chỗ đó là: model lưỡng lự, mà lưỡng lự thì đã được thể
+    hiện ở heatmap (bản đồ của ô unc vẫn được vẽ nếu nó qua `cam_threshold`)
+    và ở `sup_prob` trong reports.csv. Điều kiện hoá chỉ nhận phần model dám
+    khẳng định; phần còn lại trả về cho ảnh.
+
+    Thứ tự trong mỗi danh sách là thứ tự CHẮC CHẮN giảm dần: pos xếp theo p
+    giảm, neg xếp theo p tăng. Prompt bị cắt ở đâu thì phần mất đi cũng là
+    phần model tin ít nhất.
+
+    Trả về dict:
+        y_pred  [14] 1 / 0 / None
+        pos     [(tên, p)…]  giảm dần theo p
+        neg     [(tên, p)…]  tăng dần theo p
+        unc     [(tên, p)…]  chỉ để ghi lại, KHÔNG vào prompt
+    """
+    p = np.asarray(prob, dtype=np.float64).reshape(-1)
+    n = min(p.size, len(names))
+    y, pos, neg, unc = [], [], [], []
+    for i in range(int(p.size)):
+        name = str(names[i]) if i < n else f"#{i}"
+        st = state_of(p[i], pos_thr, neg_thr)
+        if st == "pos":
+            y.append(1)
+            pos.append((name, float(p[i])))
+        elif st == "neg":
+            y.append(0)
+            neg.append((name, float(p[i])))
+        else:
+            y.append(None)
+            unc.append((name, float(p[i])))
+    pos.sort(key=lambda t: -t[1])
+    neg.sort(key=lambda t: t[1])
+    unc.sort(key=lambda t: -t[1])
+    return {"y_pred": y, "pos": pos, "neg": neg, "unc": unc}
+
+
+def condition_text(cond, max_pos=0, max_neg=0):
+    """dict của `condition_labels` → đoạn thêm vào prompt (hoặc "" nếu trống).
+
+    Hai danh sách và một câu ràng buộc, hết. Không đưa xác suất vào: con số
+    trong prompt mời decoder viết lại con số ("0.82 probability of ...") — mà
+    xác suất thì đã nằm trong `sup_prob`, đúng chỗ của nó.
+
+    Câu cuối nói rõ về phần KHÔNG được liệt kê. Thiếu nó, model coi hai danh
+    sách là danh sách đóng và im lặng về mọi thứ còn lại — tức là ô unc bị
+    biến thành neg một cách gián tiếp, đúng cái mà `condition_labels` vừa cố
+    tránh.
+
+    `max_pos`/`max_neg` = 0 nghĩa là không cắt. 14 tên bệnh chỉ tốn ~40
+    token, nên mặc định là giữ đủ.
+    """
+    pos = [n for n, _ in cond["pos"]][:max_pos or None]
+    neg = [n for n, _ in cond["neg"]][:max_neg or None]
+    if not pos and not neg:
+        return ""
+    lines = ["An image classifier has already read this radiograph."]
+    lines.append("Present: " + (", ".join(pos) if pos else "none of the "
+                                "findings it screens for") + ".")
+    if neg:
+        lines.append("Absent: " + ", ".join(neg) + ".")
+    lines.append("Write the report consistent with those two lists. Anything "
+                 "on neither list is undetermined - judge it from the image "
+                 "and hedge if it is unclear. Keep the two-section format.")
+    return "\n".join(lines)
 
 
 def detect_findings(prob, threshold=0.5, max_k=6):
