@@ -211,6 +211,20 @@ run:
   # nên checkpoint đọc được trên mọi máy dù batch khác nhau.
   n_test_samples: 200       # §1.1 — 200 mẫu sinh text có metrics (mode=test)
 
+  # ── Grad-CAM nhánh router: "model nhìn ĐÂU khi nó thấy bệnh này" ─────────
+  # Chạy ở CẢ mode infer lẫn mode probe. Mỗi ảnh: 1 forward + n_det backward
+  # trên nhánh router 39M tham số — vài % chi phí của một lần generate. Kết
+  # quả ra `cam.npz` cạnh reports.csv (và nhúng vào bản ghi probe), rồi
+  # `scripts/probe_summary.py --browse` dựng trang tra cứu finding × state.
+  cam_enabled: true
+  cam_threshold: 0.5   # σ(sup_logit) ≥ đây thì bệnh đó "được phát hiện" -> có bản đồ
+  cam_max_class: 6     # trần số bản đồ mỗi ảnh (xếp theo xác suất giảm dần)
+  # Hai ngưỡng của truy vấn finding × state ở summary. Lệch xuống dưới có chủ
+  # ý: ASL với γ⁻ = 4 dìm xác suất ô âm rất sâu, nên p = 0.3 trên bộ này đã là
+  # "model có để ý" chứ không phải "gần âm".
+  cam_pos_thr: 0.5     # p ≥ đây -> "pos"
+  cam_neg_thr: 0.2     # p ≤ đây -> "neg"; ở giữa -> "unc" (model lưỡng lự)
+
   # ── Phase probe: khảo sát chuyên môn expert (mode: probe) — xem §3.6 ──────
   # KHÔNG train. Nạp last/ trên Hub, sinh báo cáo cho từng
   # ảnh test, rồi bật lần lượt từng expert trong top-k (trọng số 1.0) để đo:

@@ -445,6 +445,28 @@ def load_config(path="configs/default.yaml", overrides=None):
               f"gradient của ô DƯƠNG và giữ ô âm, tức phạt nhẹ chuyện bỏ sót "
               f"bệnh. Default là 0 và 4.")
 
+    # ── Grad-CAM của nhánh router (src/cam.py) ───────────────────────────────
+    # Chạy ở CẢ mode infer lẫn mode probe: mỗi ảnh thêm 1 forward + n_det
+    # backward trên nhánh router (~39M tham số), tức vài phần trăm chi phí của
+    # một lần generate 90 từ. Tắt bằng cam_enabled: false nếu chỉ cần metrics.
+    run.setdefault("cam_enabled", True)
+    run.setdefault("cam_threshold", 0.5)   # σ(sup_logit) ≥ đây -> "được phát hiện"
+    run.setdefault("cam_max_class", 6)     # trần số bản đồ mỗi ảnh
+    run.setdefault("cam_pos_thr", 0.5)     # state "pos" (truy vấn ở summary)
+    run.setdefault("cam_neg_thr", 0.2)     # state "neg"; ở giữa là "unc"
+    if not 0.0 <= float(run["cam_threshold"]) <= 1.0:
+        raise ValueError(f"run.cam_threshold phải trong [0, 1], nhận "
+                         f"{run['cam_threshold']} (đây là XÁC SUẤT sau "
+                         f"sigmoid, không phải logit)")
+    if int(run["cam_max_class"]) < 1:
+        raise ValueError(f"run.cam_max_class phải ≥ 1, nhận "
+                         f"{run['cam_max_class']} — 0 bản đồ thì bật CAM làm gì")
+    if float(run["cam_neg_thr"]) > float(run["cam_pos_thr"]):
+        raise ValueError(
+            f"run.cam_neg_thr={run['cam_neg_thr']} > cam_pos_thr="
+            f"{run['cam_pos_thr']} — vùng 'pos' rỗng, truy vấn finding × state "
+            f"ở scripts/probe_summary.py sẽ không bao giờ trả về ô nào")
+
     # ── mode="probe": khảo sát chuyên môn expert ─────────────────────────────
     run.setdefault("probe_repo", None)        # null -> "<hub_repo>-probe"
     run.setdefault("probe_commit_every", 1.0)   # phút, CommitScheduler

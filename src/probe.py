@@ -86,6 +86,26 @@ tương tác bệnh×aspect. Nên ở đây là 14 và 4 để riêng.
 Muốn tương tác thật thì phải có nhãn per-token (biết vị trí nào trong báo cáo
 đang nói về aspect nào) — không có trong dữ liệu này.
 
+═══ Khối `cam`: bản đồ nhiệt của ẢNH, không phải của expert ═══
+
+Từ schema v3 mỗi bản ghi mang thêm một khối `cam` (src/cam.py). Đừng nhầm nó
+với `spatial` của từng expert — hai bản đồ trả lời hai câu khác nhau và được
+tính ở hai chỗ khác nhau của model:
+
+  * `experts[i].spatial` — ‖Δh‖ trên lưới image token của SigLIP khi bật
+    expert i. Câu hỏi: EXPERT NÀY đổi biểu diễn ở vùng nào.
+  * `cam.maps[j]` — Grad-CAM của `sup_head` trên feature map của
+    Feat-Extractor. Câu hỏi: NHÁNH ROUTER nhìn đâu khi nó kết luận bệnh này.
+
+Bản đồ CAM chỉ có cho những bệnh model thật sự phát hiện trong ảnh đó, nên số
+lượng khác nhau giữa các ảnh; `cam.findings` (chỉ số) và `cam.finding_names`
+nói mỗi bản đồ là của bệnh nào. `cam.sup_prob` thì luôn đủ 14 số, và
+`cam.state` là ba trạng thái pos/unc/neg đã gập từ chúng — đó là hai trường mà
+truy vấn trong `scripts/probe_summary.py --browse` chạy trên đó.
+
+Không tốn thêm forward nào: bản đồ được tính trong chính lần generate ở bước
+(1), trước khi vòng probe expert bắt đầu.
+
 ═══ Đẩy lên Hub ═══
 
 `CommitScheduler` của huggingface_hub: mỗi ảnh xong 6 expert là ghi ngay một
@@ -112,13 +132,17 @@ import time
 import numpy as np
 import torch
 
+from . import cam as cam_mod
+
 RECORD_DIR = "records"          # đường dẫn trong dataset repo
 
 # Bản ghi v1 chỉ có top-k expert và hai vector bệnh/aspect; v2 có ĐỦ E expert
 # (khi `probe_mode == "full"`), vector `prob` dày của router, và 5 nhóm token
-# `fields`. `scripts/probe_summary.py` đọc được cả hai và tách rõ trong báo cáo
-# — nên KHÔNG được xoá số này khi đổi schema lần sau, chỉ tăng nó lên.
-SCHEMA_VERSION = 2
+# `fields`; v3 thêm khối `cam` — Grad-CAM của nhánh router cho từng bệnh được
+# phát hiện, cộng xác suất của đủ 14 bệnh (src/cam.py). `scripts/probe_summary.py`
+# đọc được cả ba và tách rõ trong báo cáo — nên KHÔNG được xoá số này khi đổi
+# schema lần sau, chỉ tăng nó lên.
+SCHEMA_VERSION = 3
 
 # ═══════════════════ 5 nhóm token khảo sát ngoài danh sách bệnh ══════════════
 #
@@ -394,7 +418,9 @@ def reports_from_records(local_dir, key_col):
 @torch.no_grad()
 def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
               disease_names, aspect_names, img_token_id, hf_token,
-              train_state, log, warn, event):
+              train_state, log, warn, event,
+              cam_store=None, cam_grid=None, cam_pos_thr=0.5,
+              cam_neg_thr=0.2):
     """Sinh báo cáo + probe top-k expert cho từng ảnh, đẩy lên Hub theo luồng.
 
     Trả về DataFrame kiểu reports.csv (gồm cả những dòng dựng lại từ bản ghi
@@ -517,8 +543,19 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         key = row[key_col]
 
         # ── (1) báo cáo thật, gate thật, generate như mode=test ──────────────
-        recs, _ = generate_records([row["img_abs_path"]])
+        recs, _, cams = generate_records([row["img_abs_path"]])
         rec = recs[0]
+        # Grad-CAM đi kèm lần generate ở trên (src/train.py::generate_records)
+        # nên nó KHÔNG tốn thêm forward nào ở đây. Nhúng vào bản ghi để
+        # `scripts/probe_summary.py` dựng được trang tra cứu chỉ từ những gì
+        # có trên Hub; cam.npz cạnh reports.csv là bản thứ hai, cho ai muốn
+        # đọc bằng numpy.
+        cam = None
+        if cams and cam_grid is not None:
+            cam = cam_mod.cam_block(cams[0], disease_names, cam_grid,
+                                    cam_pos_thr, cam_neg_thr)
+            if cam_store is not None:
+                cam_store.add(safe_name(key), cams[0])
 
         # ── (2) forward nền: teacher-forcing prompt + ảnh + báo cáo tham chiếu
         core, extra = split_batch(to_device(batch, dev))
@@ -624,6 +661,11 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
                        "entropy": round(float(stats.get("route_entropy", 0)), 5),
                        "gate_max": round(float(stats.get("gate_max", 0)), 5)},
             "report": report,
+            # None khi cam_enabled = false hoặc Grad-CAM hỏng. probe_summary
+            # phân biệt được "bản ghi cũ không có trường này" với "có trường
+            # nhưng rỗng" — cả hai đều bị bỏ khỏi trang tra cứu, nhưng chỉ
+            # cái sau mới đáng in cảnh báo.
+            "cam": cam,
             "experts": experts,
         }
         stream.write(safe_name(key), record)
@@ -640,6 +682,8 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
         if n_new % max(int(r.probe_flush_every), 1) == 0:
             pd.DataFrame(rows).to_csv(
                 os.path.join(r.out_dir, "reports.csv"), index=False)
+            if cam_store is not None and len(cam_store):
+                cam_store.save()
 
     stream.close()
     res = pd.DataFrame(rows)

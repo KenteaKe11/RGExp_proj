@@ -644,6 +644,103 @@ router chưa từng chọn.
 
 ---
 
+### 3.7. Grad-CAM: "model nhìn ĐÂU khi nó thấy bệnh này"
+
+Bảng metrics nói báo cáo giống báo cáo thật đến đâu; nó không nói model đọc
+được điều đó **từ chỗ nào** trên phim. Hai model cho cùng một điểm BLEU — một
+cái nhìn góc sườn hoành, một cái nhớ rằng tư thế nằm thường kèm tràn dịch — và
+chỉ bản đồ nhiệt tách được chúng ra.
+
+Bản đồ lấy từ **Feat-Extractor**, tức đường đọc ảnh THỨ HAI của model (đường
+kia là SigLIP của Gemma). Lý do: chỉ đường này có một đầu phân loại để lấy đạo
+hàm — `sup_head` cho ra 14 logit bệnh, mỗi logit là một đại lượng có nghĩa để
+hỏi "logit này tăng khi vùng nào của ảnh tăng".
+
+```
+    pixel_values [B,3,896,896]
+        │  FeatExtractor.conv_map   (resize 512, xám, 5 bậc DownBlock)
+        ▼
+    A = fmap [B, 1024, 16, 16]           ← LỚP MỤC TIÊU
+        │  self-attn → QFormer query-0 → sup_head
+        ▼
+    y = sup_logits [B, 14]
+
+    với mỗi bệnh d ĐƯỢC PHÁT HIỆN trong ảnh:
+        α_k = GAP( ∂y_d / ∂A_k )        M_d = ReLU( Σ_k α_k · A_k )   [16,16]
+```
+
+Lấy đạo hàm ở `fmap` (đầu ra bậc conv cuối) chứ không ở `feat` sau self-attn:
+sau self-attn mỗi token đã trộn cả 256 vị trí, chỉ số token không còn ứng với
+một ô trên phim. Gradient vẫn đi **ngược** qua self-attn và QFormer, nên bản đồ
+phản ánh trọn đường tới logit — chỉ được ĐỌC ở tầng còn giữ trục không gian.
+
+**Chỉ những nhãn được phát hiện.** Bệnh có σ(logit) ≥ `cam_threshold`, nhiều
+nhất `cam_max_class` cái. Grad-CAM của một logit âm sâu vẫn ra một bản đồ trông
+bình thường — nó là hướng tăng của một đại lượng không ai quan tâm — nên xuất
+đủ 14 bản đồ là nhân dữ liệu lên 3× để thêm nhiễu có hình dạng đẹp. Ảnh không
+bệnh nào qua ngưỡng vẫn được **một** bản đồ (bệnh mạnh nhất) kèm cờ `fallback`:
+"model không thấy gì" cũng là một kết luận cần soi được.
+
+Chạy ở **cả hai** `mode: test` và `mode: probe`, trong chính lần generate nên
+không tốn forward nào của decoder — chỉ 1 forward + n_det backward trên nhánh
+router 39M tham số. Ra ba chỗ:
+
+| Nơi | Nội dung |
+|---|---|
+| `outputs/<tag>/cam.npz` | `m/<key>` bản đồ fp16, `c/<key>` chỉ số bệnh, `p/<key>` xác suất 14 bệnh |
+| `outputs/<tag>/reports.csv` | thêm cột `sup_prob`, `cam_state`, `cam_findings`, `cam_fallback` — chỉ ở `mode: test`; ở `mode: probe` thông tin ấy nằm trong bản ghi JSON |
+| bản ghi probe (schema **v3**) | khối `cam` — để `probe_summary.py` dựng trang tra cứu chỉ từ Hub |
+
+```yaml
+run:
+  cam_enabled: true
+  cam_threshold: 0.5   # σ(sup_logit) ≥ đây -> có bản đồ
+  cam_max_class: 6     # trần số bản đồ mỗi ảnh
+  cam_pos_thr: 0.5     # p ≥ đây -> state "pos"
+  cam_neg_thr: 0.2     # p ≤ đây -> "neg"; ở giữa -> "unc"
+```
+
+`src/cam.py`
+
+---
+
+### 3.8. Tra cứu ảnh theo finding × state (`browse.html`)
+
+Bốn file trong `reports/probe/` trả lời câu hỏi về **expert**. Câu còn lại —
+*"cho tôi xem những ảnh model nói có tràn dịch, rồi chỉ chỗ nó nhìn"* — chạy
+trên đúng hai trường mà `src/cam.py` ghi vào mỗi bản ghi:
+
+| Trường | Giá trị |
+|---|---|
+| **finding** | 1 trong 14 tên bệnh CheXbert |
+| **state** | `pos` / `unc` / `neg`, gập từ σ(sup_logit) theo hai ngưỡng |
+
+```bash
+python scripts/probe_summary.py --images-root data/images
+#   -> reports/probe/browse.html   (mở bằng trình duyệt)
+```
+
+Chọn (finding, state) → lưới ảnh khớp → bấm một ảnh → Grad-CAM chồng lên chính
+bức phim, một tab cho mỗi bệnh được phát hiện, kèm thanh chỉnh độ đậm, bảng xác
+suất đủ 14 bệnh và hai bản báo cáo (sinh ra / tham chiếu).
+
+**`state` là trạng thái model NGHĨ, không phải nhãn CheXbert.** Bộ nhãn gốc có
+bốn ô và ô `blank` đã bị MASK khỏi ASL ([§1.6](#16-loss)), nên model chưa bao
+giờ được dạy để nói "không đề cập" — ở đây chỉ có ba trạng thái, và vùng giữa
+`unc` nghĩa là *model lưỡng lự*, không phải *CheXbert ghi uncertain*.
+
+**Đây là file DUY NHẤT trong `reports/probe/` chứa dữ liệu bệnh nhân** (key_id
+là định danh nghiên cứu MIMIC-CXR, cộng ảnh và text báo cáo). Ranh giới đó
+không dựa vào trí nhớ: `dump_browse` tự ghi một `.gitignore` cạnh nó liệt kê
+chính nó. `index.html`, `SUMMARY.md` và các CSV vẫn không chứa gì trong số đó
+và vẫn commit được như thường.
+
+Không có `--images-root` thì trang vẫn dựng, chỉ mất phim nền. `--browse-max`
+(mặc định 300) là trần số ảnh nhúng — mỗi ảnh ~15KB thumbnail + ~8KB bản đồ.
+`--no-browse` để bỏ hẳn.
+
+---
+
 ## 4. Kịch bản một lần chạy
 
 1. **Input**: 512 → 896 BICUBIC cho SigLIP (`pan_and_scan` tắt → 256 image
@@ -668,7 +765,8 @@ Không có khái niệm "chạy hết lịch": một lần chạy là một kho�
 
 ```
 outputs/<tag>/
-├── reports.csv     một hàng / ảnh test
+├── reports.csv     một hàng / ảnh test (+ sup_prob / cam_state / cam_findings)
+├── cam.npz         bản đồ Grad-CAM 16×16 theo bệnh, khoá theo img_rel (§3.7)
 └── metrics.json    raw / meta   (+ post_policy khi bật policy)
 ```
 
@@ -762,6 +860,7 @@ RGExp_proj/
 │   ├── guard.py              # 7 check (đang ở chế độ ĐO)
 │   ├── metrics.py            # BLEU/ROUGE/BERTScore
 │   ├── probe.py              # mode=probe
+│   ├── cam.py                # ★ Grad-CAM nhánh router -> cam.npz + khối `cam`
 │   ├── train.py              # entrypoint: STAGE 0 → train (vô hạn) → infer
 │   ├── logging_utils.py      # log text + events JSONL
 │   └── report.py             # gom các lần chạy
@@ -771,6 +870,7 @@ RGExp_proj/
     ├── kaggle_t4x2.py        # ★ cell Kaggle T4×2 (sm75, fp32)
     ├── kaggle_probe.py       # cell Kaggle cho mode=probe
     └── probe_summary.py      # ★ gộp bản ghi probe -> reports/probe/
+                              #   + browse.html: tra cứu finding × state
 ```
 
 ### Pipeline

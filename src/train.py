@@ -54,6 +54,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from . import cam as cam_mod
 from . import logging_utils as L
 from . import moe
 from . import probe as probe_mod
@@ -1162,6 +1163,43 @@ def main(argv=None):
     n_emb = int(model.get_input_embeddings().weight.shape[0])
     _preflight = []
 
+    # Ô nhớ một phần tử cho pixel_values của batch generate gần nhất. Một
+    # danh sách chứ không phải biến, để closure ghi vào được mà không cần
+    # `nonlocal` xuyên qua hai tầng hàm.
+    _pixels = [None]
+    cam_grid = (router.grid, router.grid)
+    cam_on = bool(r.cam_enabled)
+    cam_store = cam_mod.CamStore(
+        os.path.join(r.out_dir, "cam.npz"), disease_names, cam_grid,
+        meta={"run_tag": cfg.arch.tag, "model": f.model_id,
+              "threshold": float(r.cam_threshold),
+              "max_class": int(r.cam_max_class),
+              "pos_thr": float(r.cam_pos_thr), "neg_thr": float(r.cam_neg_thr),
+              "weights": weights_src, "mode": r.mode,
+              "train_samples": state.get("samples")}) if cam_on else None
+    _cam_warned = []
+
+    def cam_batch(pixels):
+        """pixel_values → list item Grad-CAM (một cho mỗi ảnh), hoặc [] .
+
+        Lỗi ở đây KHÔNG được làm hỏng cả phiên infer: bản đồ nhiệt là phần
+        thêm, còn báo cáo + metrics mới là thứ phiên này tồn tại để sinh ra.
+        Cảnh báo đúng MỘT lần rồi chạy tiếp không CAM — 2000 dòng warning
+        giống hệt nhau chỉ làm mất dòng log thật.
+        """
+        if not cam_on or pixels is None:
+            return []
+        try:
+            return cam_mod.gradcam(router, pixels.float(),
+                                   threshold=r.cam_threshold,
+                                   max_k=r.cam_max_class)
+        except Exception as e:
+            if not _cam_warned:
+                _cam_warned.append(1)
+                warn("cam", f"Grad-CAM hỏng ({type(e).__name__}: {e}) — phiên "
+                            f"này chạy tiếp KHÔNG có cam.npz")
+            return []
+
     @torch.no_grad()
     def generate_batch(paths, temperature=None, rep_penalty=None):
         tokenizer.padding_side = f.pad_side_infer
@@ -1190,6 +1228,10 @@ def main(argv=None):
                          f"chuỗi vào {in_len} token")
         # Lúc infer KHÔNG có target trong chuỗi, nên router_mask = attention
         # mask: router thấy đúng thứ nó thấy lúc train (prompt + ảnh).
+        # Grad-CAM chạy trên ĐÚNG tensor này, không load lại ảnh: một lần
+        # decode JPEG + một lần processor là đủ, và quan trọng hơn — bản đồ
+        # phải mô tả cùng những pixel mà router vừa sinh gate trên đó.
+        _pixels[:] = [inputs.get("pixel_values")]
         bridge.begin("route", mask=inputs["attention_mask"],
                      pixels=inputs.get("pixel_values"))
         try:
@@ -1218,6 +1260,10 @@ def main(argv=None):
         của vòng retry.
         """
         texts, share = generate_batch(paths)
+        # Ngay sau lần generate ĐẦU, trước mọi vòng retry của policy: bản đồ
+        # chỉ phụ thuộc ẢNH, và vòng retry gọi lại generate_batch trên MỘT
+        # ảnh nên nó sẽ ghi đè `_pixels` bằng một batch cỡ 1.
+        cams = cam_batch(_pixels[0])
         recs = []
         for text in texts:
             ok, failed = validate(text)
@@ -1242,7 +1288,7 @@ def main(argv=None):
                            final_temperature=round(temp, 4),
                            final_repetition_penalty=round(rep, 4))
             recs.append(rec)
-        return recs, share
+        return recs, share, cams
 
     out_csv = os.path.join(r.out_dir, "reports.csv")
     if is_probe:
@@ -1257,6 +1303,8 @@ def main(argv=None):
             disease_names=disease_names, aspect_names=aspect_names,
             img_token_id=find_image_token_id(processor), hf_token=hf_token,
             train_state=dict(state, weights_src=weights_src),
+            cam_store=cam_store, cam_grid=cam_grid,
+            cam_pos_thr=r.cam_pos_thr, cam_neg_thr=r.cam_neg_thr,
             log=log, warn=warn, event=event)
         expert_share = None
     else:
@@ -1267,14 +1315,41 @@ def main(argv=None):
         results, shares = [], []
         for i in range(0, len(df_infer), r.infer_bs):
             chunk = df_infer.iloc[i:i + r.infer_bs]
-            recs, share = generate_records(chunk["img_abs_path"].tolist())
+            recs, share, cams = generate_records(
+                chunk["img_abs_path"].tolist())
             if share:
                 shares.append(share)
-            for (_, row), rec in zip(chunk.iterrows(), recs):
-                results.append({cfg.data.image_column: row[cfg.data.image_column],
-                                "reference": str(row[f.target_column]).strip(),
-                                **rec})
+            for j, ((_, row), rec) in enumerate(zip(chunk.iterrows(), recs)):
+                out = {cfg.data.image_column: row[cfg.data.image_column],
+                       "reference": str(row[f.target_column]).strip(), **rec}
+                # ── Grad-CAM ────────────────────────────────────────────────
+                # reports.csv chỉ nhận phần VÔ HƯỚNG: xác suất 14 bệnh, state
+                # đã gập, tên bệnh có bản đồ. Bản thân 14×16×16 số đi vào
+                # cam.npz — nhét một mảng vào ô CSV thì pandas ghi ra chuỗi
+                # `[0.1 0.2 ...]` mà không ai đọc ngược lại được.
+                if j < len(cams):
+                    item = cams[j]
+                    key = probe_mod.safe_name(row[cfg.data.image_column])
+                    cam_store.add(key, item)
+                    prob = [round(float(v), 5) for v in item["prob"]]
+                    out.update(
+                        sup_prob=json.dumps(prob),
+                        cam_state=json.dumps(
+                            [cam_mod.state_of(v, r.cam_pos_thr, r.cam_neg_thr)
+                             for v in prob]),
+                        cam_findings=json.dumps(
+                            [disease_names[d] for d in item["findings"]],
+                            ensure_ascii=False),
+                        cam_fallback=bool(item["fallback"]))
+                results.append(out)
             pd.DataFrame(results).to_csv(out_csv, index=False)
+            # Ghi lại cam.npz theo NHỊP chứ không mỗi batch: `save` nén lại
+            # TRỌN file (npz không có chế độ nối), nên với infer_bs = 2 thì
+            # mỗi ảnh phải trả giá nén cả những ảnh trước nó. Cùng nhịp với
+            # probe_flush_every để chỉ có một con số phải chỉnh.
+            if (cam_store is not None and len(cam_store)
+                    and len(results) % max(int(r.probe_flush_every), 1) == 0):
+                cam_store.save()
             if infer_log.ready(force=(i == 0)):
                 rate = len(results) / max(time.time() - tinf, 1e-9)
                 log("infer", f"{len(results)}/{len(df_infer)} | {rate:.2f} mẫu/s "
@@ -1282,6 +1357,18 @@ def main(argv=None):
         res_df = pd.DataFrame(results)
         expert_share = (np.mean(np.array(shares), axis=0).tolist() if shares
                         else None)
+    if cam_store is not None:
+        path = cam_store.save()
+        if path:
+            log("cam", f"{len(cam_store)} ảnh có Grad-CAM -> "
+                       f"{os.path.relpath(path, r.out_dir)} "
+                       f"(lưới {cam_grid[0]}×{cam_grid[1]}, ngưỡng phát hiện "
+                       f"{r.cam_threshold:g}, tối đa {r.cam_max_class} bệnh"
+                       f"/ảnh)")
+            event("cam_done", n=len(cam_store), path=path)
+        elif cam_on:
+            warn("cam", "bật cam_enabled nhưng không bản đồ nào được sinh — "
+                        "xem dòng warning 'cam' ở trên")
     if not len(res_df):
         warn("infer", "không có bản ghi nào — bỏ qua metrics")
         wfinish()

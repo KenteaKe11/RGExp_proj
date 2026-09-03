@@ -2,7 +2,7 @@
 
     python scripts/selftest.py
 
-Chín thứ được kiểm:
+Mười thứ được kiểm:
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
@@ -19,6 +19,10 @@ Chín thứ được kiểm:
   9. gộp bản ghi probe (scripts/probe_summary.py): route_share trên đủ E
      expert, hồ sơ VÔ ĐIỀU KIỆN từ bản ghi `full` (expert router chưa
      từng chọn vẫn phải có hàng), và cosine phát hiện được bản sao.
+ 10. Grad-CAM của nhánh router (src/cam.py): bản đồ ĐÚNG lưới 16×16, gradient
+     nối được về feature map dù mọi tham số đang requires_grad = False, hai
+     bệnh khác nhau cho hai bản đồ khác nhau, vòng cấu hình
+     cam.npz -> load_cam -> browse.html đi trọn.
 
 Cái KHÔNG kiểm được ở đây (phải có GPU + weight thật): peft add_adapter, hook
 vào decoder Gemma, generate(). STAGE 0 trong src/train.py lo phần đó.
@@ -1049,6 +1053,177 @@ def test_probe_summary():
           isinstance(ps.verdict(b)[1], str) and len(ps.verdict(b)[1]) > 40)
 
 
+def test_cam():
+    """[12] Grad-CAM nhánh router (src/cam.py) + trang tra cứu finding × state."""
+    print("\n[12] Grad-CAM nhánh router (src/cam.py)")
+    import json
+    import tempfile
+
+    import numpy as np
+
+    from src.cam import (CamStore, cam_block, detect_findings,   # noqa: E402
+                         gradcam, load_cam, normalize_map, pack_maps,
+                         state_of)
+
+    # ── phần thuần, không cần forward ───────────────────────────────────────
+    check("state_of gập theo HAI ngưỡng, vùng giữa là 'unc'",
+          [state_of(v) for v in (0.9, 0.35, 0.05)] == ["pos", "unc", "neg"])
+    check("ngưỡng vô nghĩa (neg > pos) nổ ngay, không lặng lẽ ra toàn 'neg'",
+          _raises(lambda: state_of(0.5, pos_thr=0.2, neg_thr=0.6)))
+
+    prob = [0.9, 0.1, 0.7, 0.05, 0.6]
+    ids, fb = detect_findings(prob, threshold=0.5, max_k=6)
+    check("detect_findings xếp giảm dần và cắt ở ngưỡng",
+          ids == [0, 2, 4] and not fb, str(ids))
+    check("max_k là TRẦN, không phải gợi ý",
+          detect_findings(prob, 0.5, 2)[0] == [0, 2])
+    ids, fb = detect_findings([0.1, 0.3, 0.2], threshold=0.5)
+    check("không bệnh nào qua ngưỡng -> vẫn 1 bản đồ + cờ fallback",
+          ids == [1] and fb, f"{ids} fallback={fb}")
+
+    m = normalize_map([[0.0, 2.0], [4.0, 1.0]])
+    check("normalize_map chia theo max của chính nó, giữ hình dạng",
+          m.max() == 1.0 and m.shape == (2, 2) and m[1, 0] == 1.0)
+    check("bản đồ toàn 0 (ReLU cắt sạch) không chia cho 0",
+          float(normalize_map([[0.0, 0.0]]).max()) == 0.0)
+    check("pack_maps làm tròn và trải phẳng đúng thứ tự hàng",
+          pack_maps(np.array([[[0.123456, 0.5], [1.0, 0.0]]]))
+          == [[0.1235, 0.5, 1.0, 0.0]])
+
+    # ── Grad-CAM thật trên một RouterNet nhỏ ────────────────────────────────
+    # n_block=2 -> ảnh 64, lưới 16×16, dim 16: cùng HÌNH HỌC với bản thật
+    # (16×16 token) nhưng chạy trong một phần nghìn thời gian.
+    torch.manual_seed(0)
+    net = RouterNet(4, 2, dim=16, n_block=2, img_size=64, d_decoder=8)
+    net.eval()
+    # Đúng trạng thái của mode infer: KHÔNG tham số nào cần gradient. Đây là
+    # cái bẫy thật của chỗ này — thiếu requires_grad_ trên feature map thì
+    # autograd.grad trả None và bản đồ im lặng thành toàn 0.
+    for prm in net.parameters():
+        prm.requires_grad_(False)
+    px = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():                      # y hệt chỗ gọi ở src/train.py
+        out = gradcam(net, px, threshold=0.0, max_k=3)
+
+    check("một item cho mỗi ảnh trong batch", len(out) == 2)
+    check("xác suất đủ 14 bệnh, nằm trong [0,1]",
+          len(out[0]["prob"]) == 14
+          and all(0.0 <= v <= 1.0 for v in out[0]["prob"]))
+    G = net.grid
+    check(f"bản đồ đúng lưới {G}×{G} của Feat-Extractor",
+          out[0]["maps"].shape == (3, G, G), str(out[0]["maps"].shape))
+    check("bản đồ đã ReLU + chuẩn hoá: mọi giá trị trong [0,1]",
+          float(out[0]["maps"].min()) >= 0.0
+          and float(out[0]["maps"].max()) <= 1.0 + 1e-6)
+    check("gradient THẬT SỰ nối được về feature map (bản đồ không toàn 0)",
+          float(np.abs(out[0]["maps"]).max()) > 0.0,
+          "nếu hỏng: sup_forward quên requires_grad_, hoặc thiếu enable_grad")
+    check("hai bệnh khác nhau cho hai bản đồ khác nhau",
+          float(np.abs(out[0]["maps"][0] - out[0]["maps"][1]).max()) > 1e-6)
+    check("hai ẢNH khác nhau cho hai bản đồ khác nhau",
+          float(np.abs(out[0]["maps"][0] - out[1]["maps"][0]).max()) > 1e-6)
+    check("gradcam KHÔNG để lại requires_grad trên tham số router",
+          not any(p.requires_grad for p in net.parameters()))
+    check("gradcam trả module về đúng chế độ eval như lúc nhận",
+          not net.training)
+    check("class_ids truyền tay thì dùng đúng danh sách đó, không tự dò",
+          gradcam(net, px, class_ids=[3])[0]["findings"] == [3])
+
+    # ── cam.npz đi trọn vòng ────────────────────────────────────────────────
+    names = [f"D{i}" for i in range(14)]
+    with tempfile.TemporaryDirectory() as td:
+        st = CamStore(os.path.join(td, "cam.npz"), names, (G, G),
+                      meta={"threshold": 0.5})
+        st.add("p10__s1__a.jpg", out[0])
+        st.add("p10__s2__b.jpg", out[1])
+        path = st.save()
+        got, labels, grid, meta = load_cam(path)
+        check("cam.npz đọc lại đúng số ảnh, nhãn và lưới",
+              len(got) == 2 and labels == names and grid == [G, G]
+              and meta["threshold"] == 0.5)
+        check("float16 giữ đủ chính xác cho một thang màu 20 mức",
+              float(np.abs(got["p10__s1__a.jpg"]["maps"]
+                           - out[0]["maps"]).max()) < 1e-3)
+        check("chỉ số bệnh của từng bản đồ đi kèm, không phải đoán lại",
+              got["p10__s1__a.jpg"]["findings"] == out[0]["findings"])
+        check("CamStore rỗng thì không ghi file cụt",
+              CamStore(os.path.join(td, "x.npz"), names, (G, G)).save() is None
+              and not os.path.exists(os.path.join(td, "x.npz")))
+
+    # ── khối `cam` của bản ghi probe -> browse.html ─────────────────────────
+    blk = cam_block(out[0], names, (G, G))
+    check("cam_block ghi cả chỉ số lẫn TÊN bệnh (bản ghi tự đọc được)",
+          blk["finding_names"] == [names[d] for d in blk["findings"]])
+    check("cam_block có đủ 14 state, mỗi cái là pos/unc/neg",
+          len(blk["state"]) == 14
+          and set(blk["state"]) <= {"pos", "unc", "neg"})
+    check("số bản đồ khớp số bệnh được phát hiện",
+          len(blk["maps"]) == len(blk["findings"])
+          and len(blk["maps"][0]) == G * G)
+
+    ps = _load_probe_summary()
+    recs = [{"key_id": "p10/s1/a.jpg", "disease_labels": names, "cam": blk,
+             "report": {"generated": "Findings: x", "reference": "Findings: y"}},
+            {"key_id": "p10/s2/b.jpg", "disease_labels": names,
+             "cam": cam_block(out[1], names, (G, G)), "report": {}},
+            {"key_id": "p10/s3/c.jpg", "disease_labels": names}]   # v2, không cam
+    items, stat = ps.collect_browse(recs, limit=10, quiet=True)
+    check("bản ghi schema cũ (không có `cam`) bị bỏ và ĐẾM RIÊNG",
+          len(items) == 2 and stat["n_no_cam"] == 1 and stat["n_cam"] == 2,
+          f"{len(items)} items, n_no_cam={stat['n_no_cam']}")
+    check("--browse-max là trần thật và tự khai đã cắt",
+          ps.collect_browse(recs, limit=1, quiet=True)[1]["truncated"])
+    check("không có --images-root thì vẫn dựng được (chỉ mất phim nền)",
+          items[0]["img"] is None and stat["n_thumb"] == 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = ps.dump_browse(items, stat, td, "test://", quiet=True)
+        html = open(path, encoding="utf-8").read()
+        check("browse.html tự chứa: dữ liệu nhúng thẳng, không fetch gì",
+              "__BROWSE__" in html and "fetch(" not in html
+              and html.count("<script>") == 2)
+        check("cả 14 finding và 3 state đều có trong ô chọn truy vấn",
+              all(f">{n}</option>" in html for n in names)
+              and all(f'value="{x}">{x}<' in html for x in ("pos", "unc", "neg")))
+        gi = os.path.join(td, ".gitignore")
+        check("dump_browse tự rào PHI: ghi .gitignore cho CHÍNH nó",
+              os.path.isfile(gi)
+              and "browse.html" in open(gi, encoding="utf-8").read())
+        check("browse.html mang key_id + text báo cáo (đúng vai của nó)",
+              "p10/s1/a.jpg" in html and "Findings: y" in html)
+
+    # ── ghép đường dẫn ảnh ──────────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "p10", "s1"), exist_ok=True)
+        f = os.path.join(td, "p10", "s1", "a.jpg")
+        open(f, "wb").close()
+        check("ghép được đường dẫn khi img_rel khớp thẳng từ root",
+              ps.resolve_image("p10/s1/a.jpg", [td]) == f)
+        check("tự thử bỏ n đoạn đầu (image_rel_strip mà script không biết)",
+              ps.resolve_image("files/p10/s1/a.jpg", [td]) == f)
+        check("không ghép được thì trả None chứ không đoán bừa",
+              ps.resolve_image("p99/zz/none.jpg", [td]) is None)
+
+
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+def _load_probe_summary():
+    """Nạp scripts/probe_summary.py như một module (nó không nằm trong package)."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "probe_summary", os.path.join(here, "probe_summary.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 if __name__ == "__main__":
     print("[1] bảng tham số vs tài liệu")
     if _selftest() != 0:
@@ -1063,5 +1238,6 @@ if __name__ == "__main__":
     test_prefix()
     test_probe()
     test_probe_summary()
+    test_cam()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

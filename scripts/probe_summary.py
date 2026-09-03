@@ -19,6 +19,9 @@ records/*.json về, gộp lại và xuất ra:
     reports/probe/*.csv             ma trận thô: route / usage / disease /
                                     aspect / từng nhóm token / similarity /
                                     top token / spatial
+    reports/probe/browse.html       tra cứu ảnh theo finding × state rồi chồng
+                                    Grad-CAM lên phim — file DUY NHẤT có PHI,
+                                    tự ghi .gitignore cho chính nó
 
 Chạy:
 
@@ -26,6 +29,8 @@ Chạy:
     python scripts/probe_summary.py --repo user/abc-probe
     python scripts/probe_summary.py --local-dir outputs/<tag>/probe_records
     python scripts/probe_summary.py --limit 200          # thử nhanh
+    python scripts/probe_summary.py --images-root data/images   # browse có phim nền
+    python scripts/probe_summary.py --no-browse          # chỉ phần đẩy được lên git
 
 Chạy lại thì GHI ĐÈ đúng thư mục đó — không tạo bản mới theo timestamp. Lý do:
 đây là báo cáo về trạng thái hiện tại của checkpoint, không phải nhật ký; muốn
@@ -56,6 +61,26 @@ chọn, gate, đồng xuất hiện), là chỗ chúng đúng nghĩa.
 Không có bản ghi `full` nào (dữ liệu cũ, hoặc `run.probe_full_n: 0`) thì
 script rơi về bản ghi `topk` và ĐÓNG DẤU cảnh báo lên đầu mọi bảng — số vẫn
 hiện ra nhưng người đọc phải biết mình đang đọc một đại lượng có điều kiện.
+
+═══ browse.html — truy vấn finding × state, và ngoại lệ PHI ═══
+
+Bốn file kể trên trả lời câu hỏi về EXPERT. Câu hỏi còn lại — "cho tôi xem
+những ảnh mà model nói có tràn dịch, rồi chỉ chỗ nó nhìn" — cần đúng hai
+trường mà `src/cam.py` ghi vào mỗi bản ghi từ schema v3:
+
+    finding   1 trong 14 tên bệnh CheXbert
+    state     pos / unc / neg, gập từ σ(sup_logit) của nhánh router
+
+`browse.html` là giao diện của truy vấn đó: chọn (finding, state) -> lưới ảnh
+khớp -> bấm một ảnh -> Grad-CAM chồng lên chính bức phim, một tab cho mỗi bệnh
+được phát hiện.
+
+Đây là NGOẠI LỆ DUY NHẤT của chính sách ở mục dưới, và nó được rào bằng máy
+chứ không bằng trí nhớ: `dump_browse` ghi kèm một `.gitignore` liệt kê đúng
+`browse.html`. Bốn file còn lại không đổi — vẫn không key_id, không text báo
+cáo, vẫn commit được như thường. Phim nền chỉ xuất hiện khi người chạy tự trỏ
+`--images-root` vào thư mục ảnh của mình; không có cờ đó thì trang vẫn chạy,
+chỉ còn bản đồ nhiệt trên nền trống.
 
 ═══ Vì sao output KHÔNG chứa một chữ nào của báo cáo ═══
 
@@ -1571,6 +1596,463 @@ def dump_html(a, out, source):
         fh.write(doc)
 
 
+
+
+# ═══════════════════ Trang tra cứu finding × state (browse.html) ═════════════
+#
+# Đây là file DUY NHẤT trong thư mục output có chứa key_id, ảnh X-quang và text
+# báo cáo — tức là file duy nhất chứa dữ liệu bệnh nhân. index.html/SUMMARY.md/
+# *.csv vẫn giữ nguyên chính sách "không một chữ nào của báo cáo, không key_id"
+# ở docstring đầu file, vì chúng được thiết kế để đẩy lên GitHub.
+#
+# Ranh giới đó không dựa vào trí nhớ của ai: `dump_browse` tự ghi một
+# `.gitignore` cạnh nó liệt kê chính nó. Ai clone repo về rồi chạy lại script
+# này sẽ sinh ra browse.html trên máy mình, và git vẫn không thấy nó.
+#
+# Truy vấn chạy trên HAI trường, đúng như tên gọi:
+#
+#   finding — 1 trong 14 tên bệnh CheXbert (hoặc "bất kỳ")
+#   state   — pos / unc / neg, GẬP TỪ XÁC SUẤT của sup_head (src/cam.py),
+#             không phải nhãn CheXbert. Model chưa bao giờ được dạy ô "blank"
+#             (nó bị MASK khỏi ASL) nên ở đây chỉ có ba trạng thái.
+#
+# Chọn một ảnh trong lưới kết quả -> khung bên phải chồng Grad-CAM của ảnh đó
+# lên chính bức phim, một tab cho mỗi bệnh được phát hiện.
+
+BROWSE_MAX = 300          # trần số ảnh nhúng vào trang; xem --browse-max
+
+
+def _strip_variants(key):
+    """img_rel -> vài dạng đường dẫn tương đối để thử dưới --images-root.
+
+    `src/data.py` dựng đường dẫn tuyệt đối bằng root + BỎ n đoạn đầu của
+    img_rel, với n được DÒ lúc chạy (image_rel_strip). Script này không có
+    config đó trong tay (và không import src/data.py — file đó kéo theo torch),
+    nên nó thử lần lượt n = 0, 1, 2, 3 rồi mới bỏ cuộc. Rẻ hơn nhiều so với
+    bắt người dùng tự tìm ra con số ấy.
+    """
+    parts = str(key).replace("\\", "/").split("/")
+    return ["/".join(parts[i:]) for i in range(min(4, len(parts)))]
+
+
+def resolve_image(key, roots, index=None):
+    """(key_id, [thư mục gốc]) -> đường dẫn ảnh có thật, hoặc None.
+
+    `index` là bảng tra basename -> path, dựng sẵn bởi `build_image_index` khi
+    không cách nào ghép được đường dẫn. Chỉ dùng làm lối thoát cuối: hai bệnh
+    nhân khác nhau có thể có file trùng tên, nên ghép theo đường dẫn tương đối
+    luôn được thử trước.
+    """
+    for root in roots:
+        for rel in _strip_variants(key):
+            p = os.path.join(root, *rel.split("/"))
+            if os.path.isfile(p):
+                return p
+    if index:
+        return index.get(os.path.basename(str(key).replace("\\", "/")))
+    return None
+
+
+def build_image_index(roots, cap=200000):
+    """Quét một lần: basename -> đường dẫn. Tên trùng thì giữ cái gặp trước.
+
+    Chỉ được gọi khi ghép đường dẫn trực tiếp đã trượt, vì với MIMIC-CXR đủ bộ
+    thì đây là hàng trăm nghìn lần stat.
+    """
+    idx = {}
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if name.lower().endswith((".jpg", ".jpeg", ".png")):
+                    idx.setdefault(name, os.path.join(dirpath, name))
+                    if len(idx) >= cap:
+                        return idx
+    return idx
+
+
+def thumb_uri(path, size=320, quality=82):
+    """Ảnh trên đĩa -> data: URI JPEG đã thu nhỏ. None nếu không đọc được.
+
+    Thu nhỏ chứ không nhúng ảnh gốc: phim MIMIC-CXR là ~2500² và 300 tấm ảnh
+    gốc là hơn 1GB base64 — trình duyệt không mở nổi file đó. 320px vẫn đủ để
+    một bản đồ 16×16 chồng lên trên có nghĩa (mỗi ô CAM = 20px).
+
+    PIL không có thì trả None và trang vẫn dùng được: bản đồ nhiệt hiện ở chế
+    độ không nền, chỉ mất bối cảnh giải phẫu.
+    """
+    try:
+        import base64
+        import io as _io
+
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        im = Image.open(path)
+        im.draft("L", (size * 2, size * 2))     # JPEG: giải mã thẳng ở cỡ nhỏ
+        im = im.convert("L")
+        im.thumbnail((size, size), Image.LANCZOS)
+        buf = _io.BytesIO()
+        im.save(buf, format="JPEG", quality=int(quality), optimize=True)
+        return ("data:image/jpeg;base64,"
+                + base64.b64encode(buf.getvalue()).decode("ascii"))
+    except Exception:
+        return None
+
+
+def collect_browse(recs, limit=BROWSE_MAX, images_root=None, thumb=320,
+                   quiet=False):
+    """Bản ghi probe -> dữ liệu cho browse.html.
+
+    Trả về (list ảnh, dict thống kê). Bản ghi không có khối `cam` (schema v1/
+    v2, hoặc chạy với cam_enabled = false) bị BỎ và đếm riêng — trang này
+    không có gì để hiện cho chúng, và trộn vào thì bộ đếm "n ảnh khớp truy
+    vấn" nói dối.
+    """
+    roots = [r for r in (images_root or "").split(os.pathsep) if r]
+    roots = [os.path.expanduser(r) for r in roots]
+    roots = [r for r in roots if os.path.isdir(r)]
+    stat = {"n_records": len(recs), "n_cam": 0, "n_no_cam": 0,
+            "n_thumb": 0, "n_missing_img": 0, "roots": roots,
+            "labels": [], "truncated": False, "pil": True}
+
+    have = [r for r in recs if isinstance(r.get("cam"), dict)
+            and (r["cam"].get("maps") or r["cam"].get("sup_prob"))]
+    stat["n_cam"] = len(have)
+    stat["n_no_cam"] = len(recs) - len(have)
+    if not have:
+        return [], stat
+    stat["labels"] = list(have[0].get("disease_labels") or [])
+
+    if limit and len(have) > int(limit):
+        stat["truncated"] = True
+        have = have[:int(limit)]
+
+    index, tried_index = None, False
+    out = []
+    for r in have:
+        cam = r["cam"]
+        key = str(r.get("key_id") or "")
+        uri = None
+        if roots:
+            p = resolve_image(key, roots, index)
+            if p is None and not tried_index:
+                # Một lần duy nhất cho cả phiên: nếu ảnh ĐẦU không ghép được
+                # thì gần như chắc chắn cả bộ cũng vậy, và quét cây thư mục
+                # 3000 lần thì trang này không bao giờ dựng xong.
+                tried_index = True
+                if not quiet:
+                    print("→ không ghép được đường dẫn ảnh trực tiếp, quét "
+                          "cây thư mục một lần …", flush=True)
+                index = build_image_index(roots)
+                p = resolve_image(key, roots, index)
+            if p is None:
+                stat["n_missing_img"] += 1
+            else:
+                uri = thumb_uri(p, thumb)
+                if uri is None:
+                    stat["pil"] = False
+                else:
+                    stat["n_thumb"] += 1
+        rep = r.get("report") or {}
+        out.append({
+            "k": key,
+            "p": [round(float(v), 4) for v in (cam.get("sup_prob") or [])],
+            "s": list(cam.get("state") or []),
+            "f": [int(v) for v in (cam.get("findings") or [])],
+            "n": list(cam.get("finding_names") or []),
+            "m": cam.get("maps") or [],
+            "g": list(cam.get("grid") or [0, 0]),
+            "fb": bool(cam.get("fallback")),
+            "img": uri,
+            "gen": str(rep.get("generated") or ""),
+            "ref": str(rep.get("reference") or ""),
+        })
+    return out, stat
+
+
+BROWSE_CSS = """
+.bwarn{border-left:3px solid var(--pos);background:var(--card);border:1px solid
+   var(--line);border-radius:10px;padding:13px 16px;margin:16px 0;font-size:13.5px}
+.bwarn b{color:var(--pos)}
+.qbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:16px 0 6px;
+   background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.qf{display:flex;flex-direction:column;gap:4px}
+.qf label{font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.qf select,.qf input[type=search]{font:inherit;font-size:13.5px;padding:5px 8px;
+   background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
+.qcount{margin-left:auto;color:var(--mut);font-size:13px;padding-bottom:6px}
+.blay{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:18px;
+   align-items:start;margin-top:14px}
+@media (max-width:900px){.blay{grid-template-columns:1fr}}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;
+   max-height:70vh;overflow-y:auto;padding:3px;border:1px solid var(--line);
+   border-radius:10px;background:var(--card)}
+.tile{position:relative;border:1px solid var(--line);border-radius:7px;overflow:hidden;
+   cursor:pointer;background:var(--bg);aspect-ratio:1;padding:0}
+.tile.on{outline:2px solid var(--pos);outline-offset:-2px}
+.tile img,.tile canvas{width:100%;height:100%;display:block;object-fit:cover}
+.tile canvas{position:absolute;inset:0;opacity:.55}
+.tile b{position:absolute;left:0;right:0;bottom:0;font-size:10.5px;font-weight:600;
+   background:rgba(0,0,0,.62);color:#fff;padding:1px 4px;text-align:right;
+   font-variant-numeric:tabular-nums}
+.tile.nop{display:flex;align-items:center;justify-content:center;color:var(--mut);
+   font-size:10px}
+.tile .nomap{position:absolute;top:4px;left:4px;width:7px;height:7px;border-radius:50%;
+   background:transparent;border:1.5px solid rgba(255,255,255,.85);
+   box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+.det{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+.det .key{font-size:12px;color:var(--mut);word-break:break-all;margin-bottom:8px;
+   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.stage{position:relative;width:100%;max-width:420px;margin:0 auto;aspect-ratio:1;
+   background:#000;border-radius:8px;overflow:hidden}
+.stage img,.stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.stage .ph{display:flex;align-items:center;justify-content:center;height:100%;
+   color:var(--mut);font-size:12.5px;text-align:center;padding:0 18px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:11px 0 8px}
+.tabs button{font:inherit;font-size:12.5px;padding:3px 9px;border-radius:20px;
+   border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
+.tabs button.on{background:var(--pos);border-color:var(--pos);color:#fff}
+.slider{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--mut);
+   margin:4px 0 12px}
+.slider input{flex:1}
+.plist{display:grid;grid-template-columns:1fr auto auto;gap:2px 10px;font-size:12.5px;
+   align-items:center}
+.plist .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.plist .vv{font-variant-numeric:tabular-nums;color:var(--mut)}
+.pill{font-size:10.5px;padding:0 6px;border-radius:20px;border:1px solid var(--line);
+   text-align:center;min-width:34px}
+.pill.pos{background:var(--pos);border-color:var(--pos);color:#fff}
+.pill.unc{background:transparent;border-color:var(--warn);color:var(--warn)}
+.pill.neg{color:var(--mut)}
+.rowmap{margin-top:14px;border-top:1px solid var(--line);padding-top:11px}
+.rep{font-size:12.5px;white-space:pre-wrap;color:var(--fg);background:var(--bg);
+   border:1px solid var(--line);border-radius:7px;padding:9px 11px;margin:5px 0 0;
+   max-height:180px;overflow-y:auto}
+.rep h4{margin:0 0 3px;font-size:11.5px;color:var(--mut);text-transform:uppercase;
+   letter-spacing:.04em}
+"""
+
+BROWSE_JS = r"""
+(function(){
+var D=window.__BROWSE__, L=D.labels, G=D.grid, S=["pos","unc","neg"];
+var elF=document.getElementById('qf'), elS=document.getElementById('qs'),
+    elO=document.getElementById('qo'), elC=document.getElementById('qc'),
+    elT=document.getElementById('tiles'), elD=document.getElementById('det'),
+    elA=document.getElementById('qa');
+var cur=null, curMap=0, alpha=0.55;
+
+// Thang màu: trong suốt ở 0 -> vàng -> đỏ. Alpha tăng theo giá trị nên vùng
+// model không nhìn tới để lộ nguyên bức phim bên dưới, thay vì phủ một lớp
+// xanh đậm che mất chính thứ cần đối chiếu.
+function ramp(v){
+  v=Math.max(0,Math.min(1,v));
+  var r,g,b;
+  if(v<0.5){var t=v/0.5; r=60+195*t; g=30+180*t; b=140-60*t;}
+  else{var t=(v-0.5)/0.5; r=255; g=210-160*t; b=80-60*t;}
+  return [r|0,g|0,b|0,Math.round(255*Math.pow(v,0.75))];
+}
+function paint(cv,flat,gw,gh,smooth){
+  var off=document.createElement('canvas'); off.width=gw; off.height=gh;
+  var oc=off.getContext('2d'), im=oc.createImageData(gw,gh);
+  for(var i=0;i<gw*gh;i++){var c=ramp(flat[i]||0);
+    im.data[i*4]=c[0];im.data[i*4+1]=c[1];im.data[i*4+2]=c[2];im.data[i*4+3]=c[3];}
+  oc.putImageData(im,0,0);
+  var w=cv.width=cv.clientWidth||320, h=cv.height=cv.clientHeight||320;
+  var g2=cv.getContext('2d'); g2.clearRect(0,0,w,h);
+  g2.imageSmoothingEnabled=smooth!==false; g2.imageSmoothingQuality='high';
+  g2.drawImage(off,0,0,w,h);
+}
+function match(x){
+  var fi=elF.value, st=elS.value, q=(elA.value||'').trim().toLowerCase();
+  if(q && x.k.toLowerCase().indexOf(q)<0) return false;
+  if(fi==='') return st===''? true : x.s.indexOf(st)>=0;
+  var d=+fi;
+  if(st!=='' && x.s[d]!==st) return false;
+  if(elO.checked && x.f.indexOf(d)<0) return false;
+  return true;
+}
+function sortKey(x){var fi=elF.value; return fi===''?Math.max.apply(null,x.p):x.p[+fi];}
+function render(){
+  var list=D.items.filter(match);
+  list.sort(function(a,b){return sortKey(b)-sortKey(a);});
+  elC.textContent=list.length+' / '+D.items.length+' ảnh';
+  elT.innerHTML='';
+  list.slice(0,600).forEach(function(x){
+    var b=document.createElement('button'); b.className='tile'+(cur===x?' on':'');
+    // Bản đồ trên ô nhỏ phải là bản đồ của ĐÚNG bệnh đang lọc. Ảnh không có
+    // bản đồ cho bệnh đó thì để trống và đánh dấu, chứ KHÔNG rơi về bản đồ
+    // của bệnh khác: hai ô cạnh nhau trông giống nhau mà nói về hai bệnh
+    // khác nhau là cách nhanh nhất để đọc sai cả lưới.
+    var mi=elF.value===''?0:x.f.indexOf(+elF.value);
+    if(x.img){var im=new Image(); im.src=x.img; im.alt=''; b.appendChild(im);
+      if(mi>=0&&x.m[mi]){var cv=document.createElement('canvas');
+        b.appendChild(cv); setTimeout(function(){paint(cv,x.m[mi],G[1],G[0]);},0);}
+      else b.appendChild(mark('bệnh này không lọt ngưỡng phát hiện'));
+    } else { b.className+=' nop'; b.appendChild(document.createTextNode('không có ảnh')); }
+    var tag=document.createElement('b');
+    tag.textContent=(elF.value===''?Math.max.apply(null,x.p):x.p[+elF.value]).toFixed(2);
+    b.appendChild(tag);
+    b.onclick=function(){cur=x;curMap=0;render();detail();};
+    elT.appendChild(b);
+  });
+  if(!list.length) elT.innerHTML='<p class="note" style="padding:14px">'+
+    'Không ảnh nào khớp. Nới ngưỡng state, hoặc bỏ "chỉ ảnh có bản đồ".</p>';
+}
+function detail(){
+  if(!cur){elD.innerHTML='<p class="note">Chọn một ảnh bên trái để xem bản đồ '+
+    'Grad-CAM của nó.</p>';return;}
+  var x=cur, h=[];
+  h.push('<div class="key">'+x.k+'</div>');
+  h.push('<div class="stage" id="stg">'+(x.img
+      ? '<img src="'+x.img+'" alt=""><canvas id="ov"></canvas>'
+      : '<div class="ph">Không tìm thấy file ảnh cho key này.<br>'+
+        'Chạy lại với <code>--images-root</code> trỏ vào thư mục ảnh để xem '+
+        'heatmap chồng lên phim.<canvas id="ov" style="position:static;'+
+        'width:100%;aspect-ratio:1"></canvas></div>')+'</div>');
+  h.push('<div class="tabs">');
+  if(!x.f.length) h.push('<span class="note">không có bản đồ nào</span>');
+  x.f.forEach(function(d,i){h.push('<button data-i="'+i+'"'+(i===curMap?' class="on"':'')
+    +'>'+(x.n[i]||L[d]||('#'+d))+' · '+x.p[d].toFixed(2)+'</button>');});
+  h.push('</div>');
+  if(x.fb) h.push('<p class="note">⚠ Không bệnh nào qua ngưỡng phát hiện — '+
+    'đây là bản đồ của bệnh mạnh nhất, giữ lại để soi được cả ca model cho là '+
+    'bình thường.</p>');
+  h.push('<div class="slider"><span>độ đậm</span>'+
+    '<input type="range" id="op" min="0" max="100" value="'+(alpha*100)+'">'+
+    '<span id="opv">'+Math.round(alpha*100)+'%</span></div>');
+  h.push('<div class="plist">');
+  L.forEach(function(nm,d){
+    h.push('<span class="nm">'+nm+'</span><span class="vv">'+x.p[d].toFixed(3)+
+      '</span><span class="pill '+x.s[d]+'">'+x.s[d]+'</span>');
+  });
+  h.push('</div>');
+  if(x.gen||x.ref){h.push('<div class="rowmap">');
+    if(x.gen)h.push('<h4>báo cáo sinh ra</h4><div class="rep">'+esc(x.gen)+'</div>');
+    if(x.ref)h.push('<h4 style="margin-top:9px">báo cáo tham chiếu</h4><div class="rep">'+
+      esc(x.ref)+'</div>');
+    h.push('</div>');}
+  elD.innerHTML=h.join('');
+  var ov=document.getElementById('ov');
+  if(ov&&x.m[curMap]){ov.style.opacity=alpha;paint(ov,x.m[curMap],G[1],G[0]);}
+  Array.prototype.forEach.call(elD.querySelectorAll('.tabs button'),function(b){
+    b.onclick=function(){curMap=+b.dataset.i;detail();};});
+  var op=document.getElementById('op');
+  if(op)op.oninput=function(){alpha=op.value/100;
+    document.getElementById('opv').textContent=op.value+'%';
+    if(ov)ov.style.opacity=alpha;};
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;');}
+function mark(t){var i=document.createElement('i'); i.className='nomap';
+  i.title=t; return i;}
+[elF,elS,elO,elA].forEach(function(e){e.addEventListener('input',function(){
+  cur=null;render();detail();});});
+addEventListener('resize',function(){if(cur)detail();});
+render();detail();
+})();
+"""
+
+
+def dump_browse(items, stat, out, source, meta=None, quiet=False):
+    """Ghi browse.html + .gitignore cạnh nó. Trả về đường dẫn, hoặc None."""
+    if not items:
+        return None
+    labels = stat["labels"] or [f"#{i}" for i in range(len(items[0]["p"]))]
+    grid = items[0]["g"] or [16, 16]
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    data = {"labels": labels, "grid": grid, "items": items}
+
+    P = ["<h1>Tra cứu ảnh theo finding × state</h1>",
+         f'<p class="sub">{len(items):,} ảnh · lưới CAM '
+         f'{grid[0]}×{grid[1]} · dựng {ts}</p>']
+    P.append(
+        '<div class="bwarn"><b>File này chứa dữ liệu bệnh nhân.</b> key_id là '
+        'định danh nghiên cứu MIMIC-CXR, và trang có cả ảnh X-quang lẫn text '
+        'báo cáo. Nó KHÔNG được đẩy lên GitHub — script đã ghi sẵn một '
+        '<code>.gitignore</code> cạnh nó. <code>index.html</code>, '
+        '<code>SUMMARY.md</code> và các file CSV trong cùng thư mục thì không '
+        'chứa gì trong số đó và vẫn commit được như thường.</div>')
+
+    note = []
+    if stat["n_no_cam"]:
+        note.append(f"{stat['n_no_cam']:,} bản ghi không có khối <code>cam</code> "
+                    f"(schema cũ, hoặc chạy với <code>cam_enabled: false</code>) "
+                    f"— đã bỏ")
+    if stat["truncated"]:
+        note.append(f"chỉ nhúng {len(items):,} ảnh đầu; nới bằng "
+                    f"<code>--browse-max</code>")
+    if not stat["roots"]:
+        note.append("chưa có <code>--images-root</code> nên trang không có phim "
+                    "nền — bản đồ vẫn hiện nhưng không đối chiếu được với giải phẫu")
+    elif stat["n_missing_img"]:
+        note.append(f"{stat['n_missing_img']:,} ảnh không tìm thấy file dưới "
+                    f"<code>--images-root</code>")
+    if stat["roots"] and not stat["pil"]:
+        note.append("thiếu Pillow (<code>pip install Pillow</code>) nên không "
+                    "tạo được thumbnail")
+    if note:
+        P.append('<p class="note">' + " · ".join(note) + "</p>")
+
+    P.append(
+        '<p class="note">'
+        '<b>state</b> ở đây là trạng thái <i>model nghĩ</i>, gập từ σ(sup_logit) '
+        'của nhánh router: <code>pos</code> p ≥ ngưỡng trên, <code>neg</code> '
+        'p ≤ ngưỡng dưới, <code>unc</code> là vùng giữa — chỗ model lưỡng lự. '
+        'Nó KHÔNG phải nhãn CheXbert: bộ nhãn đó có bốn ô và ô '
+        '<code>blank</code> đã bị MASK khỏi ASL, nên model chưa bao giờ được '
+        'dạy để nói "không đề cập".</p>')
+
+    opts_f = '<option value="">— bất kỳ —</option>' + "".join(
+        f'<option value="{i}">{esc(n)}</option>' for i, n in enumerate(labels))
+    P.append(f'''<div class="qbar">
+  <div class="qf"><label for="qf">finding</label>
+    <select id="qf">{opts_f}</select></div>
+  <div class="qf"><label for="qs">state</label>
+    <select id="qs"><option value="">— bất kỳ —</option>
+      <option value="pos">pos</option><option value="unc">unc</option>
+      <option value="neg">neg</option></select></div>
+  <div class="qf"><label for="qa">key_id chứa</label>
+    <input type="search" id="qa" placeholder="p10/…" size="14"></div>
+  <div class="qf"><label>&nbsp;</label>
+    <label style="font-size:13px;text-transform:none;letter-spacing:0;color:var(--fg)">
+      <input type="checkbox" id="qo"> chỉ ảnh CÓ bản đồ cho bệnh này</label></div>
+  <div class="qcount" id="qc"></div>
+</div>''')
+    P.append('<div class="blay"><div id="tiles" class="tiles"></div>'
+             '<div id="det" class="det"></div></div>')
+    P.append(f'<footer>Nguồn: <code>{esc(source)}</code>. '
+             f'Bản đồ là Grad-CAM của <code>sup_head</code> trên feature map '
+             f'bậc conv cuối của Feat-Extractor (src/cam.py), chuẩn hoá theo '
+             f'max của chính nó — đọc "vùng nào", không phải "mạnh cỡ nào"; '
+             f'độ mạnh tuyệt đối nằm ở cột xác suất.</footer>')
+
+    html = (f"<!doctype html><html lang=vi><head><meta charset=utf-8>"
+            f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>Tra cứu CAM — finding × state</title>"
+            f"<style>{CSS}{BROWSE_CSS}</style></head><body><div class=wrap>"
+            + "".join(P) +
+            "</div><script>window.__BROWSE__="
+            + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            + ";</script><script>" + BROWSE_JS + "</script></body></html>")
+
+    path = os.path.join(out, "browse.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    # Hàng rào tự thi hành: file này không bao giờ vào git, kể cả khi người
+    # chạy script quên mất là nó có PHI.
+    with open(os.path.join(out, ".gitignore"), "w", encoding="utf-8") as fh:
+        fh.write("# browse.html có key_id, ảnh X-quang và text báo cáo\n"
+                 "# (xem scripts/probe_summary.py::dump_browse). Các file còn\n"
+                 "# lại trong thư mục này không chứa gì trong số đó.\n"
+                 "browse.html\n")
+    if not quiet:
+        mb = os.path.getsize(path) / 1e6
+        print(f"✓ browse.html: {len(items):,} ảnh, {stat['n_thumb']:,} có phim "
+              f"nền, {mb:.1f}MB (KHÔNG commit — đã ghi .gitignore)")
+    return path
+
+
 # ══════════════════════════════════ vào/ra ═══════════════════════════════════
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -1588,6 +2070,17 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="chỉ đọc N bản ghi đầu (thử nhanh)")
     ap.add_argument("--token", default=None, help="HF token; mặc định $HF_TOKEN")
     ap.add_argument("--no-html", action="store_true")
+    ap.add_argument("--no-browse", action="store_true",
+                    help="đừng dựng browse.html (trang tra cứu finding × state)")
+    ap.add_argument("--images-root", default=os.environ.get("RGEXP_IMAGES_ROOT"),
+                    help="thư mục ảnh X-quang, để browse.html có phim nền dưới "
+                         "heatmap; nhiều thư mục thì ngăn bằng os.pathsep. "
+                         "Mặc định $RGEXP_IMAGES_ROOT")
+    ap.add_argument("--browse-max", type=int, default=BROWSE_MAX,
+                    help=f"trần số ảnh nhúng vào browse.html (mặc định "
+                         f"{BROWSE_MAX}); mỗi ảnh ~15KB thumbnail + ~8KB bản đồ")
+    ap.add_argument("--thumb", type=int, default=320,
+                    help="cạnh dài thumbnail trong browse.html (mặc định 320px)")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1622,6 +2115,14 @@ def main(argv=None):
     dump_md(a, args.out, source)
     if not args.no_html:
         dump_html(a, args.out, source)
+    if not args.no_browse:
+        items, bstat = collect_browse(recs, args.browse_max, args.images_root,
+                                      args.thumb, args.quiet)
+        if items:
+            dump_browse(items, bstat, args.out, source, quiet=args.quiet)
+        elif not args.quiet:
+            print("→ không bản ghi nào có khối `cam` — bỏ qua browse.html. "
+                  "Chạy lại mode=probe với run.cam_enabled: true.")
 
     if a["absent"] and not args.quiet:
         for x in a["absent"]:

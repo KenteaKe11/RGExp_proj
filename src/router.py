@@ -252,7 +252,20 @@ class FeatExtractor(nn.Module):
         self.mlp = SkipMLP(dim, hidden)
         self.dim = dim
 
-    def forward(self, pixel_values):
+    def conv_map(self, pixel_values):
+        """[B,3,H,W] → [B, 1024, 16, 16] — đầu ra 5 bậc DownBlock, CHƯA flatten.
+
+        Tách ra khỏi `forward` vì Grad-CAM (src/cam.py) cần ĐÚNG tensor này:
+        nó là feature map cuối cùng còn giữ TRỤC KHÔNG GIAN thật, chưa bị
+        self-attn trộn giữa các vị trí. Chọn nó làm lớp mục tiêu là quy ước
+        chuẩn của Grad-CAM (lớp conv sâu nhất), và ở đây còn có thêm một lý do
+        riêng: sau `self.attn` mỗi token đã là tổ hợp của cả 256 vị trí, nên
+        "vùng nào của phim" không còn đọc được từ chỉ số token nữa.
+
+        `forward` gọi lại hàm này chứ không nhân đôi code — hai đường phải
+        thấy CÙNG một feature map, nếu không thì bản đồ nhiệt mô tả một mạng
+        khác với mạng đang sinh gate.
+        """
         x = pixel_values
         if x.dim() != 4:
             raise RuntimeError(
@@ -265,11 +278,23 @@ class FeatExtractor(nn.Module):
                               mode="bilinear", align_corners=False,
                               antialias=True)
         x = x.mean(dim=1, keepdim=True)              # [B, 1, S, S]
-        h = self.blocks(x)                           # [B, 1024, 16, 16]
+        return self.blocks(x)                        # [B, 1024, 16, 16]
+
+    def from_map(self, h):
+        """[B, 1024, 16, 16] → [B, 256, 1024]. Nửa sau của `forward`.
+
+        Nhận feature map RỜI thay vì tự tính, để Grad-CAM giữ được tham chiếu
+        tới đúng tensor nó sẽ lấy gradient theo. `torch.autograd.grad` cần
+        CHÍNH node đó trong đồ thị; chạy hai forward riêng thì có hai node
+        khác nhau và gradient không nối được về cái mình đang cầm.
+        """
         t = h.flatten(2).transpose(1, 2)             # [B, 256, 1024]
         t = t + self.attn(t, t, t, need_weights=False)[0]
         t = self.norm(t)
         return self.mlp(t)                           # [B, 256, 1024]
+
+    def forward(self, pixel_values):
+        return self.from_map(self.conv_map(pixel_values))
 
 
 # ══════════════════════════ QFormer 2 query ══════════════════════════════════
@@ -480,6 +505,29 @@ class RouterNet(nn.Module):
             "TOTAL trainable": sum(p.numel() for p in self.parameters()
                                    if p.requires_grad),
         }
+
+    # ── đường riêng cho Grad-CAM ────────────────────────────────────────────
+    def sup_forward(self, pixel_values):
+        """pixel_values → (sup_logits [B,14], fmap [B,1024,16,16]).
+
+        Nhánh NGẮN của forward: chỉ đi tới `sup_head`, bỏ route_head, proj và
+        toàn bộ phần thống kê. Grad-CAM (src/cam.py) cần đúng hai thứ này —
+        logit để lấy đạo hàm, feature map để lấy đạo hàm THEO.
+
+        `fmap` được trả ra ngoài (chứ không giữ trong một thuộc tính) vì
+        `torch.autograd.grad(logit, fmap)` phải cầm CHÍNH node đó. Nó cũng đã
+        `requires_grad_()` sẵn: ở mode infer mọi tham số router đều đang
+        `requires_grad = False`, nên nếu không đánh dấu ở đây thì đồ thị
+        không được dựng và autograd trả về None mà không báo gì.
+
+        Không đụng tới trạng thái train/eval của module: chỗ gọi phải bảo đảm
+        `router.eval()` (BatchNorm dùng thống kê chạy, bản đồ mới tất định).
+        """
+        fmap = self.extractor.conv_map(pixel_values)
+        fmap = fmap.requires_grad_(True) if not fmap.requires_grad else fmap
+        feat = self.extractor.from_map(fmap)              # [B, 256, 1024]
+        q = self.qformer(feat)                            # [B, 2, 1024]
+        return self.sup_head(q[:, 0]).float(), fmap       # [B, 14]
 
     def forward(self, pixel_values, mask=None):
         """pixel_values [B, 3, H, W] — ảnh đã qua processor của Gemma.
