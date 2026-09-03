@@ -221,17 +221,55 @@ run:
   cam_enabled: true
   cam_threshold: 0.5   # σ(sup_logit) ≥ đây thì bệnh đó "được phát hiện" -> có bản đồ
   cam_max_class: 6     # trần số bản đồ mỗi ảnh (xếp theo xác suất giảm dần)
-  # Hai ngưỡng của truy vấn finding × state ở summary. Lệch xuống dưới có chủ
-  # ý: ASL với γ⁻ = 4 dìm xác suất ô âm rất sâu, nên p = 0.3 trên bộ này đã là
-  # "model có để ý" chứ không phải "gần âm".
+  # ĐƯỜNG LÙI. Hai số này chỉ được dùng khi calib_enabled: false — xem khối
+  # "HIỆU CHUẨN" bên dưới. Chúng ở lại đây vì mọi hàm trong src/cam.py vẫn
+  # nhận được số vô hướng, KHÔNG phải vì chúng đúng: với uncertain_soft =
+  # 0.55, đáy hố thế năng của ô uncertain nằm ở p ≈ 0.68 — ngoài hẳn (0.2,
+  # 0.5). Chạy bằng chúng là gán mọi ô uncertain thành "pos".
   cam_pos_thr: 0.5     # p ≥ đây -> "pos"
   cam_neg_thr: 0.2     # p ≤ đây -> "neg"; ở giữa -> "unc" (model lưỡng lự)
+
+  # ── §1.8 HIỆU CHUẨN band uncertain trên tập val (src/calib.py) ───────────
+  # Chạy MỘT LẦN ngay trước infer/probe: quét trọn tập val bằng nhánh ngắn
+  # router.sup_forward (39M tham số, không đụng decoder — vài chục giây),
+  # rồi tìm cho TỪNG bệnh một cặp (lo, hi):
+  #
+  #     tối đa hoá  số ô uncertain rơi vào (lo, hi)
+  #     ràng buộc   LCB_Wilson( P(unc | p ∈ band) ) ≥ max(purity, lift × nền)
+  #
+  # Ô `blank` bị loại khỏi phép đo — nó đã bị MASK khỏi ASL, model chưa bao
+  # giờ được dạy để nói "không đề cập", nên không có cơ sở nào chấm nó.
+  #
+  # Kết quả ra `calib_bands.json` cạnh reports.csv, rồi đi vào CẢ BA chỗ đọc
+  # xác suất: state của heatmap, danh sách present/absent của lượt sinh có
+  # điều kiện, và khối cam của bản ghi probe. Một ảnh -> một cách đọc.
+  #
+  # Band GẮN VỚI CHECKPOINT: train thêm là phân phối p dịch và band cũ hết
+  # hiệu lực. File ghi kèm train_samples; nạp lại mà lệch thì log kêu.
+  calib_enabled: true
+  calib_refit: false        # true = hiệu chuẩn lại dù đã có calib_bands.json
+  calib_purity: 0.60        # sàn tinh khiết TUYỆT ĐỐI trong band
+  calib_lift: 1.5           # sàn TƯƠNG ĐỐI: ≥ 1.5× tỉ lệ nền của uncertain
+  calib_margin: 0.04        # chọn ở sàn+margin, chấm ở sàn (xem src/calib.py)
+  calib_conf: 0.95          # mức tin cậy của cận dưới Wilson (một phía)
+  calib_holdout: 0.5        # tỉ lệ ô giữ lại để CHẤM band; 0 = tắt kiểm định
+  calib_seed: 0
+  calib_min_unc: 200        # bệnh ít ô uncertain hơn -> dùng band GỘP 14 bệnh
+  calib_min_cells: 30       # band mỏng hơn -> vứt (không đủ để nói gì)
+  calib_grid: 1000          # lưới ngưỡng: bước 0.001
+  calib_max_batches: 0      # 0 = quét TRỌN val; đặt số để chạy thử cho nhanh
+  # Trần "band nuốt bao nhiêu phần ô POSITIVE thật". 0 = tắt. Nới band để
+  # phủ uncertain thì luôn ăn vào rìa dưới của ô pos, mà ô pos rơi vào band
+  # là một ca bệnh RÚT KHỎI danh sách "Present:" của prompt. Mặc định tắt:
+  # con số này vẫn được đo và in ở cột `pos→unc` của bảng hiệu chuẩn — nhìn
+  # nó rồi hãy quyết định có siết không (0.15 là mức đáng thử).
+  calib_max_pos_swallow: 0.0
 
   # ── Sinh CÓ ĐIỀU KIỆN: nhãn của sup_head quay ngược vào prompt ───────────
   # Mỗi ảnh sinh HAI lượt:
   #   1. prompt gốc, model chưa biết gì            -> raw_output (baseline)
   #   2. prompt + "Present: … / Absent: …" gập từ σ(sup_logit) của CHÍNH ảnh
-  #      đó qua cam_pos_thr/cam_neg_thr             -> cond_output
+  #      đó qua BAND ĐÃ HIỆU CHUẨN của bệnh đó      -> cond_output
   # Ô "unc" (giữa hai ngưỡng) KHÔNG vào y_pred và không vào prompt — model
   # đang lưỡng lự, và chỗ thể hiện sự lưỡng lự đó là heatmap + sup_prob, chứ
   # không phải một khẳng định trong câu lệnh. Một lượt điều kiện, không lặp.

@@ -425,6 +425,12 @@ def run_probe(*, cfg, model, bridge, tokenizer, collate, df, generate_records,
 
     Trả về DataFrame kiểu reports.csv (gồm cả những dòng dựng lại từ bản ghi
     cũ) để `src/train.py` chấm metrics như mọi mode khác.
+
+    `cam_pos_thr`/`cam_neg_thr` nhận SỐ VÔ HƯỚNG hoặc VECTOR [14]: từ §1.8
+    `src/train.py` chuyền xuống band đã hiệu chuẩn của TỪNG bệnh
+    (`src/calib.py`). Hai giá trị mặc định trong chữ ký chỉ là đường lùi, và
+    với `uncertain_soft = 0.55` chúng KHÔNG chứa hố uncertain (p* ≈ 0.68) —
+    đừng dựa vào chúng.
     """
     import pandas as pd
 

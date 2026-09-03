@@ -2,7 +2,7 @@
 
     python scripts/selftest.py
 
-Mười thứ được kiểm:
+Mười một thứ được kiểm:
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
@@ -19,6 +19,9 @@ Mười thứ được kiểm:
   9. gộp bản ghi probe (scripts/probe_summary.py): route_share trên đủ E
      expert, hồ sơ VÔ ĐIỀU KIỆN từ bản ghi `full` (expert router chưa
      từng chọn vẫn phải có hàng), và cosine phát hiện được bản sao.
+ 11. hiệu chuẩn band uncertain (src/calib.py): bản numpy của ASL trùng bản
+     torch, đáy hố thế năng KHÔNG nằm ở nhãn đã khai, cận dưới Wilson, phép
+     quét tìm lại được dải đã gieo, và ba mức rơi class -> global -> nhị phân.
  10. Grad-CAM của nhánh router (src/cam.py): bản đồ ĐÚNG lưới 16×16, gradient
      nối được về feature map dù mọi tham số đang requires_grad = False, hai
      bệnh khác nhau cho hai bản đồ khác nhau, vòng cấu hình
@@ -1296,6 +1299,173 @@ def test_cam():
         check("offset/cỡ nén trong mục lục giải ra ĐÚNG byte của ảnh gốc", ok)
 
 
+def test_calib():
+    """[12] hiệu chuẩn band uncertain (src/calib.py).
+
+    Sáu thứ, và thứ đầu tiên là quan trọng nhất: bản numpy của ASL trong
+    calib phải TRÙNG bản torch trong losses. Hai bản lệch nhau thì "band
+    tiên nghiệm" đang nói về một hàm loss mà không ai train, và cả chương
+    trình vẫn chạy trơn tru cho ra số.
+    """
+    import json
+    import tempfile
+
+    import numpy as np
+
+    from src import calib as C
+    from src.cam import states_of
+    from src.losses import ASL_CLIP, ASL_GAMMA_NEG, ASL_GAMMA_POS
+
+    print("\n[12] hiệu chuẩn band uncertain")
+
+    # ── (1) numpy mirror ≡ torch ────────────────────────────────────────────
+    worst = 0.0
+    for y in (0.0, 0.55, 0.7, 1.0):
+        for pv in (0.02, 0.1, 0.3, 0.5, 0.68, 0.8, 0.95):
+            lg = torch.tensor([[float(np.log(pv / (1 - pv)))]])
+            tgt = torch.tensor([[float(y)]])
+            msk = torch.ones(1, 1, dtype=torch.bool)
+            a = float(asl_loss(lg, tgt, msk, gamma_pos=ASL_GAMMA_POS,
+                               gamma_neg=ASL_GAMMA_NEG, clip=ASL_CLIP))
+            b = float(C.asl_cell_loss(pv, y, ASL_GAMMA_POS, ASL_GAMMA_NEG,
+                                      ASL_CLIP))
+            worst = max(worst, abs(a - b))
+    check("ASL bản numpy (calib) ≡ bản torch (losses) trên 28 điểm",
+          worst < 1e-5, f"lệch tối đa {worst:.2e}")
+
+    # ── (2) đáy hố KHÔNG nằm ở nhãn đã khai ─────────────────────────────────
+    w55, w70 = C.asl_well(0.55), C.asl_well(0.70)
+    check("y=0.55 -> đáy hố ở ~0.68, KHÔNG phải 0.55 (γ⁻ kéo lệch lên)",
+          0.67 < w55 < 0.69, f"p*={w55:.4f}")
+    check("y=0.70 -> đáy hố trong [0.70, 0.80] (khớp mốc của [5])",
+          0.70 <= w70 <= 0.80, f"p*={w70:.4f}")
+
+    # ── (3) band tiên nghiệm và hai hằng số cũ ──────────────────────────────
+    lo, hi = C.asl_prior_band(0.55)
+    check("band tiên nghiệm chứa đáy hố", lo < w55 < hi,
+          f"({lo:.3f}, {hi:.3f})")
+    check("hai hằng số cũ (0.2, 0.5) KHÔNG chứa đáy hố — đây là lý do §1.8 "
+          "tồn tại", not (0.2 < w55 < 0.5), f"p*={w55:.4f}")
+
+    # ── (4) Wilson ─────────────────────────────────────────────────────────
+    check("LCB < tỉ lệ thô, và 5/5 không ra 1.0",
+          C.wilson_lcb(5, 5) < 1.0 and C.wilson_lcb(60, 100) < 0.6)
+    check("cùng tỉ lệ, n lớn hơn -> LCB chặt hơn",
+          C.wilson_lcb(6, 10) < C.wilson_lcb(60, 100)
+          < C.wilson_lcb(600, 1000))
+    check("n = 0 -> LCB = 0 (không có bằng chứng, không phải 100%)",
+          C.wilson_lcb(0, 0) == 0.0)
+
+    # ── (5) quét tìm lại đúng band đã gieo ──────────────────────────────────
+    rng = np.random.default_rng(0)
+    pu = rng.uniform(0.60, 0.80, 4000)          # uncertain: gieo trong dải hẹp
+    pn = rng.uniform(0.00, 0.62, 4000)          # neg: chạm rìa dưới
+    pp = rng.uniform(0.78, 1.00, 4000)          # pos: chạm rìa trên
+    pcat = np.concatenate([pu, pn, pp])
+    gcat = np.concatenate([np.full(4000, C.UNC), np.full(4000, C.NEG),
+                           np.full(4000, C.POS)])
+    band = C.search_band(pcat, gcat, floor=0.80, z=C.z_for(0.95),
+                         min_cells=30, edges=C._edges(1000))
+    check("tìm lại được dải đã gieo (0.60, 0.80)",
+          band is not None and abs(band["lo"] - 0.60) < 0.03
+          and abs(band["hi"] - 0.80) < 0.03,
+          f"{band}")
+    ev = C.eval_band(band["lo"], band["hi"], pcat, gcat, C.z_for(0.95))
+    check("band trả về ĐẠT sàn purity đã yêu cầu (đo lại độc lập)",
+          ev["purity_lcb"] >= 0.80, f"LCB={ev['purity_lcb']:.3f}")
+    tight = C.search_band(pcat, gcat, floor=0.80, z=C.z_for(0.95),
+                          min_cells=30, edges=C._edges(1000), pos_cap=0.0)
+    wide = C.search_band(pcat, gcat, floor=0.50, z=C.z_for(0.95),
+                         min_cells=30, edges=C._edges(1000))
+    check("hạ sàn -> band rộng ra (ràng buộc thật sự đang ràng buộc)",
+          (wide["hi"] - wide["lo"]) >= (tight["hi"] - tight["lo"]))
+    # Ba nhóm rút từ CÙNG một phân phối: không có vùng nào giàu uncertain
+    # hơn vùng nào. Phép quét phải trả None chứ không được nới sàn.
+    flat = rng.uniform(0.0, 1.0, 9000)
+    gflat = np.concatenate([np.full(3000, C.UNC), np.full(3000, C.NEG),
+                            np.full(3000, C.POS)])
+    check("ba nhóm chồng lấn hoàn toàn -> KHÔNG có band, trả None (không tự "
+          "nới sàn)",
+          C.search_band(flat, gflat, floor=0.60, z=C.z_for(0.95),
+                        min_cells=30, edges=C._edges(1000)) is None)
+
+    # ── (6) fit_bands: ba mức rơi, đúng vai, đi trọn vòng JSON ──────────────
+    N, K = 3000, 4
+    AB, AP, AN, AU = 0, 1, 2, 3
+    aspects = ["Blank", "Positive", "Negative", "Uncertain"]
+    P = np.zeros((N, K))
+    Y = np.zeros((N, K), dtype=int)
+    for c in range(K):
+        # lớp 2: uncertain quá hiếm -> không được cấp band riêng
+        # lớp 3: uncertain trộn đều -> không tách được, phải rơi về nhị phân
+        pr = ([0.40, 0.20, 0.39, 0.01] if c == 2
+              else [0.40, 0.20, 0.25, 0.15])
+        a = rng.choice([AB, AP, AN, AU], size=N, p=pr)
+        Y[:, c] = a
+        col = np.empty(N)
+        m = a == AN
+        col[m] = rng.beta(1.2, 12.0, int(m.sum()))
+        m = a == AP
+        col[m] = rng.beta(12.0, 1.2, int(m.sum()))
+        m = a == AU
+        if c == 3:
+            # uncertain rút từ ĐÚNG hỗn hợp của neg và pos: không có vùng nào
+            # của thang xác suất giàu uncertain hơn tỉ lệ nền, nên không có
+            # band nào đáng tin — phải rơi về quyết định nhị phân.
+            k = int(m.sum())
+            col[m] = np.where(rng.random(k) < 0.5,
+                              rng.beta(1.2, 12.0, k), rng.beta(12.0, 1.2, k))
+        else:
+            col[m] = np.clip(rng.normal(0.68, 0.05, int(m.sum())), .01, .99)
+        m = a == AB
+        col[m] = rng.beta(1.5, 6.0, int(m.sum()))
+        P[:, c] = col
+    names = [f"d{i}" for i in range(K)]
+    b = C.fit_bands(P, Y, aspects, names, uncertain_soft=0.55, grid=400,
+                    min_unc=200, log=None)
+    src = [row["source"] for row in b.rows]
+    check("lớp tách tốt -> band RIÊNG của lớp", src[0] == "class"
+          and src[1] == "class", str(src))
+    check("lớp quá ít ô uncertain -> KHÔNG được band riêng", src[2] != "class",
+          f"n_unc={b.rows[2]['n_unc']}, source={src[2]}")
+    check("lớp uncertain trộn đều -> không gán uncertain (nhị phân)",
+          src[3] == "none" and b.lo[3] == b.hi[3], str(b.rows[3].get("note")))
+    check("ô blank bị LOẠI khỏi phép đo (đã MASK khỏi ASL)",
+          b.meta["n_cells_blank"] > 0
+          and b.meta["n_cells_labelled"] + b.meta["n_cells_blank"] == N * K)
+    check("holdout LCB của lớp được cấp band ≥ sàn của chính nó",
+          all((row["holdout"] or {}).get("purity_lcb", 0) >= row["floor"]
+              for row in b.rows if row["source"] == "class"))
+    pos_v, neg_v = b.vectors()
+    check("vectors() trả (pos_thr = hi, neg_thr = lo) — đúng quy ước state_of",
+          np.allclose(pos_v, b.hi) and np.allclose(neg_v, b.lo))
+    check("lo > hi bị CHẶN ngay lúc dựng Bands",
+          _raises(lambda: C.Bands([0.9, 0.1], [0.2, 0.5], [], {})))
+
+    with tempfile.TemporaryDirectory() as d:
+        fp = b.save(os.path.join(d, "calib_bands.json"))
+        b2 = C.Bands.load(fp)
+        check("JSON đi trọn vòng: band và sổ sách khớp",
+              np.allclose(b2.lo, b.lo) and np.allclose(b2.hi, b.hi)
+              and len(b2.rows) == len(b.rows))
+        raw = json.load(open(fp, encoding="utf-8"))
+        check("JSON ghi TÊN bệnh + nguồn band, không phải chỉ hai con số",
+              all("name" in row and "source" in row
+                  for row in raw["classes"]))
+        b2.meta["train_samples"] = 123
+        stale = []
+        b2.check_stale(456, None, lambda t, m: stale.append(m))
+        check("nạp band của checkpoint KHÁC thì KÊU LÊN", len(stale) == 1)
+
+    # ── (7) cam.states_of index đúng ngưỡng của từng bệnh ──────────────────
+    st = states_of([0.30, 0.30, 0.30, 0.30], [0.9, 0.2, 0.9, 0.9],
+                   [0.5, 0.1, 0.1, 0.35])
+    check("states_of dùng ngưỡng RIÊNG của từng bệnh, không dùng của bệnh 0",
+          st == ["neg", "pos", "unc", "neg"], str(st))
+    check("truyền số vô hướng vẫn chạy y như trước (đường lùi)",
+          states_of([0.1, 0.6, 0.9], 0.5, 0.2) == ["neg", "pos", "pos"])
+
+
 def _raises(fn):
     try:
         fn()
@@ -1330,5 +1500,6 @@ if __name__ == "__main__":
     test_probe()
     test_probe_summary()
     test_cam()
+    test_calib()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

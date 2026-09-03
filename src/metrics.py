@@ -87,6 +87,40 @@ def compute_metrics(refs, refs_tok, hyps, tag, tokenizer, use_bertscore,
     return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
 
 
+def _calib_meta(cfg, fname="calib_bands.json"):
+    """Khối band đã hiệu chuẩn để nhúng vào metrics.json.
+
+    Đọc thẳng file mà src/calib.py vừa ghi thay vì tính lại: hai đường dựng
+    cùng một con số là hai đường để chúng lệch nhau.
+    """
+    path = os.path.join(getattr(cfg.run, "out_dir", "."), fname)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:                                    # noqa: BLE001
+        return {"cond_pos_thr": float(getattr(cfg.run, "cam_pos_thr", 0.5)),
+                "cond_neg_thr": float(getattr(cfg.run, "cam_neg_thr", 0.2)),
+                "cond_band_source": "config (chưa hiệu chuẩn)"}
+    rows = d.get("classes", [])
+    src = {}
+    for row in rows:
+        src[row.get("source", "?")] = src.get(row.get("source", "?"), 0) + 1
+    return {
+        "cond_band_source": "calib_bands.json",
+        "cond_band_created": d.get("meta", {}).get("created"),
+        "cond_band_params": d.get("meta", {}).get("params"),
+        "cond_band_prior": d.get("meta", {}).get("prior"),
+        "cond_band_by_class": {row.get("name"): [row.get("lo"), row.get("hi")]
+                               for row in rows},
+        "cond_band_kinds": src,
+        # Con số TRUNG THỰC của mỗi bệnh: purity đo trên nửa val không tham
+        # gia chọn band. Cột `purity` (in-sample) cố tình KHÔNG vào đây.
+        "cond_band_holdout_lcb": {
+            row.get("name"): (row.get("holdout") or {}).get("purity_lcb")
+            for row in rows},
+    }
+
+
 def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
     """Chấm raw_output (và post-policy nếu policy bật), ghi metrics.json."""
     _setup_nltk()
@@ -169,10 +203,13 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         metrics["delta_cond_minus_raw"] = {
             k: round(m_cond[k] - m_raw[k], 4)
             for k in m_cond if isinstance(m_cond[k], float)}
+        # Ngưỡng gập nhãn KHÔNG còn là hằng số trong config: src/calib.py đo
+        # nó trên val trước khi infer, một cặp cho mỗi bệnh. Chép nguyên khối
+        # đã hiệu chuẩn vào metrics.json — không có nó thì đọc lại một
+        # metrics cũ sáu tháng sau, không ai dựng lại được y_pred từ sup_prob.
         meta.update(
             cond_enabled=True,
-            cond_pos_thr=float(getattr(cfg.run, "cam_pos_thr", 0.5)),
-            cond_neg_thr=float(getattr(cfg.run, "cam_neg_thr", 0.2)),
+            **_calib_meta(cfg),
             length_ratio_cond=round(m_cond["mean_gen_tokens"] / ref_len, 4),
             n_changed_by_cond=n_cond_diff)
         for col, key in (("cond_guard_passed", "n_guard_passed_cond"),

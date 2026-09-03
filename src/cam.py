@@ -62,6 +62,12 @@ vấn finding × state trong `scripts/probe_summary.py` chạy trên đó.
     p ≤ neg_thr              → "neg"
     ở giữa                   → "unc"
 
+Hai ngưỡng đó KHÔNG còn là hằng số trong config. `src/calib.py` đo chúng
+trên tập val trước khi infer, một cặp cho mỗi bệnh, và chỉ cấp band cho bệnh
+nào qua được sàn tinh khiết có cận dưới Wilson; bệnh không qua thì lo = hi và
+ở đó chỉ còn hai trạng thái. Mọi hàm dưới đây vì thế nhận `pos_thr`/`neg_thr`
+là số vô hướng HOẶC vector [14] — xem `_thr_at`.
+
 Đây là trạng thái model NGHĨ, không phải nhãn CheXbert trong labels.npz (bộ
 đó có bốn ô: blank/positive/negative/uncertain). Hai thứ khác nhau và không
 được trộn: `sup_head` được train trên một trục nhị phân có mask, ô `blank`
@@ -115,9 +121,16 @@ def state_of(p, pos_thr=0.5, neg_thr=0.2):
 
     Hai ngưỡng, không phải một, và chúng KHÔNG bắt buộc phải bù nhau: vùng
     giữa là chỗ model lưỡng lự, mà bề rộng của vùng đó là một lựa chọn đọc
-    chứ không phải một hằng số của bài toán. Mặc định 0.5 / 0.2 lệch xuống
-    dưới có chủ ý — ASL với γ⁻ = 4 đẩy xác suất của ô âm xuống rất thấp, nên
-    một p = 0.3 trên bộ này đã là "model có để ý" chứ không phải "gần âm".
+    chứ không phải một hằng số của bài toán.
+
+    Hai giá trị mặc định trong chữ ký (0.5 / 0.2) chỉ còn là ĐƯỜNG LÙI cho
+    `calib_enabled: false`. Từ §1.8 chúng đến từ `src/calib.py`: đo trên tập
+    val, một cặp cho MỖI bệnh, kèm cận dưới Wilson cho độ tinh khiết. Lý do
+    phải đo chứ không đoán: đáy hố thế năng của ô uncertain KHÔNG nằm ở
+    `uncertain_soft` — γ⁻ = 4 dập nhánh âm nên với y = 0.55 cực tiểu của ASL
+    nằm ở p ≈ 0.68, tức NGOÀI HẲN khoảng (0.2, 0.5) mà bản trước gọi là
+    "unc". Chạy bằng hai hằng số cũ là gán mọi ô uncertain thành "pos" rồi
+    đẩy nó vào danh sách "Present:" của prompt, im lặng.
 
     `neg_thr > pos_thr` là cấu hình vô nghĩa (không còn ô nào là "pos") nên
     nó nổ ngay tại đây thay vì lặng lẽ cho ra một bảng toàn "neg".
@@ -132,6 +145,31 @@ def state_of(p, pos_thr=0.5, neg_thr=0.2):
     if p <= neg_thr:
         return "neg"
     return "unc"
+
+
+def _thr_at(thr, i):
+    """Ngưỡng của lớp `i`, chấp nhận cả số vô hướng lẫn vector [14].
+
+    Một hàm nhỏ để mọi chỗ gọi không phải rẽ nhánh: hiệu chuẩn tắt thì
+    `src/calib.py` vẫn trả về một `Bands` gồm hai vector hằng, còn code cũ
+    truyền float thì vẫn chạy y như trước.
+    """
+    a = np.asarray(thr, dtype=np.float64).reshape(-1)
+    if a.size == 0:
+        raise ValueError("ngưỡng rỗng")
+    return float(a[i]) if a.size > 1 else float(a[0])
+
+
+def states_of(prob, pos_thr=0.5, neg_thr=0.2):
+    """[14] xác suất -> [14] state, ngưỡng RIÊNG cho từng bệnh.
+
+    Vòng lặp `state_of` thủ công ở chỗ gọi thì mỗi chỗ tự index lấy ngưỡng —
+    và chỗ nào quên thì cả 14 bệnh dùng chung ngưỡng của bệnh 0 mà không có
+    gì kêu lên. Một hàm, một cách index.
+    """
+    p = np.asarray(prob, dtype=np.float64).reshape(-1)
+    return [state_of(p[i], _thr_at(pos_thr, i), _thr_at(neg_thr, i))
+            for i in range(p.size)]
 
 
 def condition_labels(prob, names, pos_thr=0.5, neg_thr=0.2):
@@ -168,7 +206,7 @@ def condition_labels(prob, names, pos_thr=0.5, neg_thr=0.2):
     y, pos, neg, unc = [], [], [], []
     for i in range(int(p.size)):
         name = str(names[i]) if i < n else f"#{i}"
-        st = state_of(p[i], pos_thr, neg_thr)
+        st = state_of(p[i], _thr_at(pos_thr, i), _thr_at(neg_thr, i))
         if st == "pos":
             y.append(1)
             pos.append((name, float(p[i])))
@@ -339,7 +377,7 @@ def cam_block(item, disease_names, grid, pos_thr=0.5, neg_thr=0.2):
     return {
         "grid": [int(grid[0]), int(grid[1])],
         "sup_prob": prob,
-        "state": [state_of(v, pos_thr, neg_thr) for v in prob],
+        "state": states_of(prob, pos_thr, neg_thr),
         "findings": [int(d) for d in item["findings"]],
         "finding_names": [str(disease_names[d]) if d < len(disease_names)
                           else f"#{d}" for d in item["findings"]],

@@ -54,6 +54,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from . import calib as calib_mod
 from . import cam as cam_mod
 from . import logging_utils as L
 from . import moe
@@ -1170,12 +1171,43 @@ def main(argv=None):
     cam_grid = (router.grid, router.grid)
     cam_on = bool(r.cam_enabled)
     cond_on = bool(getattr(r, "cond_enabled", False))
+
+    # ══ §1.8 — HIỆU CHUẨN band uncertain, TRƯỚC mọi lần sinh ════════════════
+    # Đây là bước củng cố niềm tin vào nhánh supervised: trước khi để
+    # σ(sup_logit) đi vào prompt và vào màu của heatmap, ĐO xem vùng nào của
+    # thang xác suất thật sự là "model lưỡng lự" trên tập val, thay vì nhận
+    # hai hằng số từ config.
+    #
+    # Phải chạy Ở ĐÂY — sau khi trọng số đã nạp xong (band gắn với
+    # checkpoint) và trước `generate_records` đầu tiên. Chạy sau là hai nghìn
+    # ảnh đầu đã gập nhãn bằng ngưỡng khác với phần còn lại.
+    #
+    # Dùng lại `val_loader` chứ không dựng loader mới: cùng một tập, cùng một
+    # collate, và một DataLoader nữa là thêm một bộ worker chỉ để đi qua đúng
+    # những ảnh đó. drop_last của nó bỏ rơi < train_bs ảnh cuối — không đáng
+    # kể trên vài nghìn ảnh, và đổi lại là không có bộ worker thứ hai.
+    bands = calib_mod.prepare_bands(
+        cfg=cfg, router=router, loader=val_loader, device=DEVICE,
+        aspect_names=aspect_names, disease_names=disease_names,
+        log=log, warn=warn, train_samples=state.get("samples"),
+        weights=weights_src)
+    # HAI VECTOR [14] này là thứ duy nhất phần dưới được dùng. Không chỗ nào
+    # dưới đây được đọc lại r.cam_pos_thr/r.cam_neg_thr: hai đường đọc ngưỡng
+    # song song là cách chắc chắn nhất để heatmap và prompt nói hai chuyện
+    # khác nhau về cùng một ảnh.
+    thr_pos, thr_neg = bands.vectors()
     cam_store = cam_mod.CamStore(
         os.path.join(r.out_dir, "cam.npz"), disease_names, cam_grid,
         meta={"run_tag": cfg.arch.tag, "model": f.model_id,
               "threshold": float(r.cam_threshold),
               "max_class": int(r.cam_max_class),
-              "pos_thr": float(r.cam_pos_thr), "neg_thr": float(r.cam_neg_thr),
+              # Band ĐÃ HIỆU CHUẨN, một cặp cho mỗi bệnh — ai đọc cam.npz
+              # về sau phải dựng lại được state từ sup_prob mà không cần
+              # đoán ngưỡng.
+              "pos_thr": [round(float(v), 5) for v in thr_pos],
+              "neg_thr": [round(float(v), 5) for v in thr_neg],
+              "band_source": [row.get("source") for row in bands.rows],
+              "calib": bands.meta.get("created"),
               "cond": cond_on,
               "weights": weights_src, "mode": r.mode,
               "train_samples": state.get("samples")}) if cam_on else None
@@ -1314,15 +1346,16 @@ def main(argv=None):
         là supervised conditioning: sup_head nói phim có gì, decoder viết
         theo, hết.
 
-        Gập mềm -> cứng ở `cam_pos_thr`/`cam_neg_thr` — ĐÚNG hai ngưỡng đang
-        tô heatmap. Ô rơi vào giữa (`unc`) không vào y_pred và không vào
+        Gập mềm -> cứng ở BAND ĐÃ HIỆU CHUẨN của từng bệnh (src/calib.py) —
+        đúng cặp ngưỡng đang tô heatmap. Ô rơi vào giữa (`unc`) không vào
+        y_pred và không vào
         prompt: model đang lưỡng lự, và chỗ để đọc sự lưỡng lự đó là bản đồ
         nhiệt + `sup_prob`, không phải một câu khẳng định trong câu lệnh.
 
         Trả về list dict cột phụ cho từng ảnh (rỗng nếu không có gì để nói).
         """
         conds = [cam_mod.condition_labels(pr, disease_names,
-                                          r.cam_pos_thr, r.cam_neg_thr)
+                                          thr_pos, thr_neg)
                  for pr in probs]
         texts_c = [cam_mod.condition_text(c, r.cond_max_pos, r.cond_max_neg)
                    for c in conds]
@@ -1441,7 +1474,7 @@ def main(argv=None):
             img_token_id=find_image_token_id(processor), hf_token=hf_token,
             train_state=dict(state, weights_src=weights_src),
             cam_store=cam_store, cam_grid=cam_grid,
-            cam_pos_thr=r.cam_pos_thr, cam_neg_thr=r.cam_neg_thr,
+            cam_pos_thr=thr_pos, cam_neg_thr=thr_neg,
             log=log, warn=warn, event=event)
         expert_share = None
     else:
@@ -1449,9 +1482,10 @@ def main(argv=None):
         tinf = time.time()
         log("infer", f"sinh {len(df_infer)} báo cáo | policy="
                      f"{'BẬT' if r.use_policy else 'TẮT'} | điều kiện="
-                     + (f"BẬT (2 lượt/ảnh, ngưỡng {r.cam_pos_thr:g}/"
-                        f"{r.cam_neg_thr:g}, 'unc' không vào y_pred)"
-                        if cond_on else "TẮT (1 lượt/ảnh)"))
+                     + (f"BẬT (2 lượt/ảnh, band hiệu chuẩn theo bệnh — "
+                        f"{sum(1 for x in bands.rows if x.get('source') == 'none')}"
+                        f"/{len(bands)} bệnh chạy nhị phân, 'unc' không vào "
+                        f"y_pred)" if cond_on else "TẮT (1 lượt/ảnh)"))
         results, shares = [], []
         for i in range(0, len(df_infer), r.infer_bs):
             chunk = df_infer.iloc[i:i + r.infer_bs]
@@ -1475,8 +1509,7 @@ def main(argv=None):
                     out.update(
                         sup_prob=json.dumps(prob),
                         cam_state=json.dumps(
-                            [cam_mod.state_of(v, r.cam_pos_thr, r.cam_neg_thr)
-                             for v in prob]),
+                            cam_mod.states_of(prob, thr_pos, thr_neg)),
                         cam_findings=json.dumps(
                             [disease_names[d] for d in item["findings"]],
                             ensure_ascii=False),

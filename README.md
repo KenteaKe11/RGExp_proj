@@ -698,7 +698,7 @@ router 39M tham số. Ra ba chỗ:
 |---|---|
 | `outputs/<tag>/cam.npz` | `m/<key>` bản đồ fp16, `c/<key>` chỉ số bệnh, `p/<key>` xác suất 14 bệnh |
 | `outputs/<tag>/reports.csv` | thêm cột `sup_prob`, `cam_state`, `cam_findings`, `cam_fallback` — chỉ ở `mode: test`; ở `mode: probe` thông tin ấy nằm trong bản ghi JSON |
-| lượt sinh thứ hai ([§3.9](#39-sinh-có-điều-kiện-nhãn-quay-ngược-vào-prompt)) | cùng bộ xác suất đó, gập ở `cam_pos_thr`/`cam_neg_thr`, thành hai danh sách bệnh trong prompt |
+| lượt sinh thứ hai ([§3.9](#39-sinh-có-điều-kiện-nhãn-quay-ngược-vào-prompt)) | cùng bộ xác suất đó, gập ở **band đã hiệu chuẩn** ([§3.10](#310-hiệu-chuẩn-band-uncertain-trước-khi-infer)), thành hai danh sách bệnh trong prompt |
 | bản ghi probe (schema **v3**) | khối `cam` — để `probe_summary.py` dựng trang tra cứu chỉ từ Hub |
 
 ```yaml
@@ -706,9 +706,12 @@ run:
   cam_enabled: true
   cam_threshold: 0.5   # σ(sup_logit) ≥ đây -> có bản đồ
   cam_max_class: 6     # trần số bản đồ mỗi ảnh
-  cam_pos_thr: 0.5     # p ≥ đây -> state "pos"
-  cam_neg_thr: 0.2     # p ≤ đây -> "neg"; ở giữa -> "unc"
+  cam_pos_thr: 0.5     # ĐƯỜNG LÙI — chỉ dùng khi calib_enabled: false
+  cam_neg_thr: 0.2     # xem §3.10: hai số này KHÔNG chứa hố uncertain
 ```
+
+> Hai ngưỡng `cam_*_thr` từ §1.8 chỉ còn là đường lùi. Band thật được **đo**
+> trên tập val trước khi infer, một cặp cho mỗi bệnh — [§3.10](#310-hiệu-chuẩn-band-uncertain-trước-khi-infer).
 
 `src/cam.py`
 
@@ -831,9 +834,12 @@ bản đồ nhiệt (§3.7) và cột `sup_prob`. Điều kiện hoá chỉ nh�
 khẳng định; phần còn lại trả về cho ảnh, và câu cuối của prompt nói đúng như
 vậy ("anything on neither list is undetermined").
 
-Ngưỡng dùng **chung** với heatmap (`cam_pos_thr` / `cam_neg_thr`), không có
+Ngưỡng dùng **chung** với heatmap — cùng một cặp `(lo, hi)` đã hiệu chuẩn của
+bệnh đó ([§3.10](#310-hiệu-chuẩn-band-uncertain-trước-khi-infer)), không có
 ngưỡng riêng: một ảnh chỉ có một cách đọc, và hai bộ ngưỡng khác nhau thì câu
-chữ và màu của bản đồ sẽ kể hai chuyện khác nhau về cùng một bức phim.
+chữ và màu của bản đồ sẽ kể hai chuyện khác nhau về cùng một bức phim. Bệnh nào
+không có band đáng tin thì `lo = hi` và ở đó chỉ còn hai trạng thái — ô `unc`
+biến mất chứ không được gán bừa.
 
 ```yaml
 run:
@@ -854,6 +860,93 @@ theo độ dài đã đệm và hàng ngắn hơn mất phần đầu câu — k
 giữ nguyên cho lượt 1 (mọi prompt bằng nhau, không có ô pad nào).
 
 `src/cam.py::condition_labels` / `condition_text`
+
+---
+
+### 3.10. Hiệu chuẩn band uncertain TRƯỚC khi infer
+
+`src/calib.py` · chạy một lần, ngay sau khi nạp trọng số và trước lần generate
+đầu tiên.
+
+**Vấn đề.** `asl_loss` với γ⁻ = 4 **không** kéo ô uncertain về đúng
+`uncertain_soft`. Nhánh âm bị dập, nên cực tiểu theo `p` của loss một ô lệch
+lên:
+
+| nhãn | đáy hố `p*` |
+|---|---|
+| negative (y = 0) | 0.00 — và loss gần như **phẳng** tới p ≈ 0.4 |
+| `uncertain_soft = 0.55` | **0.680** |
+| `uncertain_soft = 0.70` | 0.751 (khớp mốc mà `selftest` đã chốt) |
+| positive (y = 1) | 1.00 |
+
+Hố uncertain nằm ở **0.68** — ngoài hẳn khoảng `(0.2, 0.5)` mà các bản trước
+gọi là "unc". Chạy bằng hai hằng số đó là gán mọi ô uncertain thành `pos` rồi
+đẩy thẳng vào danh sách `Present:` của prompt, **không một dòng cảnh báo nào**.
+
+**Cách đo.** Quét trọn tập val bằng nhánh ngắn `router.sup_forward` (39M tham
+số, không đụng decoder — vài chục giây), bỏ ô `blank` (đã MASK khỏi ASL, model
+chưa từng được dạy để nói "không đề cập"), rồi với **mỗi bệnh** tìm cặp
+`(lo, hi)`:
+
+```
+tối đa hoá   số ô uncertain rơi vào (lo, hi)              ← độ phủ
+ràng buộc    LCB_Wilson( P(unc | p ∈ band) ) ≥ sàn        ← độ tin
+sàn        = max(calib_purity, calib_lift × tỉ lệ nền của uncertain)
+```
+
+Cận dưới **Wilson** chứ không phải tỉ lệ thô: 5/5 = 100% không phải bằng chứng,
+mà một band hẹp bắt trúng vài ô là đúng thứ phép tối ưu sẽ tìm ra nếu không ai
+chặn (LCB một phía 95% kéo 5/5 xuống 0.649).
+
+**Chọn ở sàn + biên, chấm ở sàn.** Phép "phủ nhiều nhất mà vẫn đạt sàn" luôn
+dừng **đúng trên biên** ràng buộc, nên chấm lại band đó ở cùng một sàn là tung
+đồng xu — đo trên dữ liệu mô phỏng: `calib_margin = 0` làm 7/14 bệnh tách tốt
+vẫn trượt. Nên band được **chọn** ở `sàn + calib_margin` trên nửa A, rồi
+**chấm** ở `sàn` trên nửa B mà phép chọn chưa nhìn thấy. Cột `hold` trong bảng
+là con số nửa B — đó mới là con số trung thực; cột `purity` là in-sample.
+
+**Ba mức rơi, không mức nào im lặng.**
+
+| `source` | nghĩa |
+|---|---|
+| `class` | band riêng của bệnh, đã qua kiểm định holdout |
+| `global` | bệnh có < `calib_min_unc` ô uncertain, hoặc trượt kiểm định → dùng band gộp 14 bệnh, **và band gộp đó vẫn phải đủ sạch trên riêng bệnh này** |
+| `none` | cả band gộp cũng không đạt → `lo = hi = tau_split` (Youden J), bệnh đó quay về quyết định nhị phân |
+
+`none` là một **kết quả**: với checkpoint này, ở bệnh này, `sup_head` không
+tách được uncertain ra khỏi pos/neg đủ sạch để dám gán cứng.
+
+**Giá phải trả, được in ra.** Nới band để phủ uncertain thì luôn ăn vào rìa
+dưới của ô positive — mỗi ô pos rơi vào band là một ca bệnh **rút khỏi**
+`Present:`. Cột `pos→unc` đo đúng chuyện đó; `calib_max_pos_swallow` (mặc định
+tắt) đặt trần cho nó sau khi đã nhìn con số.
+
+```yaml
+run:
+  calib_enabled: true
+  calib_refit: false        # true = hiệu chuẩn lại dù đã có calib_bands.json
+  calib_purity: 0.60        # sàn tinh khiết TUYỆT ĐỐI trong band
+  calib_lift: 1.5           # sàn TƯƠNG ĐỐI: ≥ 1.5× tỉ lệ nền của uncertain
+  calib_margin: 0.04        # chọn ở sàn+margin, chấm ở sàn
+  calib_conf: 0.95          # mức tin cậy của cận dưới Wilson (một phía)
+  calib_holdout: 0.5        # tỉ lệ ô giữ lại để CHẤM band; 0 = tắt kiểm định
+  calib_min_unc: 200        # ít hơn -> dùng band GỘP
+  calib_min_cells: 30
+  calib_grid: 1000          # lưới ngưỡng: bước 0.001
+  calib_max_batches: 0      # 0 = quét TRỌN val
+  calib_max_pos_swallow: 0.0  # trần "band nuốt ô positive"; 0 = tắt
+```
+
+Ra ba chỗ: `outputs/<tag>/calib_bands.json` (band + toàn bộ sổ sách), khối
+`meta` của `cam.npz`, và khối `cond_band_*` của `metrics.json` — không có nó
+thì đọc lại một `metrics.json` sáu tháng sau, không ai dựng lại được `y_pred`
+từ `sup_prob`.
+
+**Band gắn với CHECKPOINT.** Train thêm là phân phối `p` dịch và band cũ hết
+hiệu lực. File ghi kèm `train_samples` + `weights`; nạp lại mà lệch thì log kêu
+lên và bảo chạy `--set run.calib_refit=true`.
+
+`src/calib.py` · `scripts/selftest.py::test_calib`
 
 ---
 
@@ -979,6 +1072,8 @@ RGExp_proj/
 │   ├── guard.py              # 7 check (đang ở chế độ ĐO)
 │   ├── metrics.py            # BLEU/ROUGE/BERTScore
 │   ├── probe.py              # mode=probe
+│   ├── calib.py              # ★ §1.8 đo band uncertain trên val trước infer
+│   │                         #   -> calib_bands.json (ngưỡng theo TỪNG bệnh)
 │   ├── cam.py                # ★ Grad-CAM nhánh router -> cam.npz + khối `cam`
 │   ├── train.py              # entrypoint: STAGE 0 → train (vô hạn) → infer
 │   ├── logging_utils.py      # log text + events JSONL

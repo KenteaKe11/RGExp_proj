@@ -467,6 +467,90 @@ def load_config(path="configs/default.yaml", overrides=None):
             f"{run['cam_pos_thr']} — vùng 'pos' rỗng, truy vấn finding × state "
             f"ở scripts/probe_summary.py sẽ không bao giờ trả về ô nào")
 
+    # ── §1.8 HIỆU CHUẨN band uncertain (src/calib.py) ────────────────────────
+    # Hai khoá cam_*_thr ở trên từ bản này chỉ còn là ĐƯỜNG LÙI. Lý do:
+    # asl_loss với γ⁻ = 4 không kéo ô uncertain về đúng `uncertain_soft` —
+    # với 0.55 thì cực tiểu theo p nằm ở ~0.68, tức NGOÀI HẲN (0.2, 0.5).
+    # Chạy bằng hai hằng số cũ là gán mọi ô uncertain thành "pos" và đẩy nó
+    # vào danh sách "Present:" của prompt, không một dòng cảnh báo nào.
+    #
+    # Bật (mặc định): trước khi infer, quét tập VAL bằng nhánh ngắn
+    # router.sup_forward, rồi tìm cho mỗi bệnh một cặp (lo, hi) phủ nhiều ô
+    # uncertain nhất mà vẫn giữ được P(unc | p ∈ band) ≥ sàn — sàn đo bằng
+    # CẬN DƯỚI WILSON, không phải tỉ lệ thô. Kết quả ra calib_bands.json
+    # cạnh reports.csv và đi vào CAM + lượt sinh có điều kiện + probe.
+    run.setdefault("calib_enabled", True)
+    run["calib_enabled"] = bool(run["calib_enabled"])
+    run.setdefault("calib_refit", False)   # ép hiệu chuẩn lại dù đã có file
+    run["calib_refit"] = bool(run["calib_refit"])
+    # Sàn tinh khiết TUYỆT ĐỐI. 0.60 = "trong band, cứ 10 ô thì ít nhất 6 ô
+    # thật sự là uncertain, với độ tin cậy calib_conf". Đây là ngưỡng để DÁM
+    # GÁN CỨNG, nên nó phải > 0.5: dưới đó thì nhãn gán ra sai nhiều hơn đúng.
+    run.setdefault("calib_purity", 0.60)
+    # Sàn TƯƠNG ĐỐI so với tỉ lệ nền của uncertain ở bệnh đó. Bắt kiểu vô
+    # nghĩa thứ hai: nếu uncertain vốn đã chiếm 45% số ô có nhãn thì một band
+    # purity 50% gần như không hơn đoán mò. Sàn thật = max(hai vế).
+    run.setdefault("calib_lift", 1.5)
+    # Biên an toàn LÚC CHỌN band. Phép "phủ nhiều nhất mà vẫn đạt sàn" luôn
+    # dừng ĐÚNG TRÊN biên, nên chấm lại band đó ở cùng một sàn là tung đồng
+    # xu — đo được: margin = 0 làm 7/14 bệnh tách tốt vẫn trượt. Chọn ở
+    # sàn + margin, chấm ở sàn.
+    run.setdefault("calib_margin", 0.04)
+    run.setdefault("calib_conf", 0.95)      # mức tin cậy của cận dưới Wilson
+    # Tỉ lệ ô val giữ lại để CHẤM band (chưa từng tham gia chọn nó). 0 = tắt
+    # kiểm định — chỉ nên làm khi val quá nhỏ, và khi đó purity in ra là con
+    # số lạc quan của chính phép tối ưu, không phải một lời hứa.
+    run.setdefault("calib_holdout", 0.5)
+    run.setdefault("calib_seed", 0)
+    run.setdefault("calib_min_unc", 200)    # dưới mức này -> dùng band gộp
+    run.setdefault("calib_min_cells", 30)   # band mỏng hơn -> vứt
+    run.setdefault("calib_grid", 1000)      # độ phân giải lưới ngưỡng
+    run.setdefault("calib_max_batches", 0)  # 0 = quét TRỌN tập val
+    # Trần "band nuốt bao nhiêu phần ô POSITIVE thật". 0 = TẮT. Mở rộng band
+    # để phủ uncertain thì luôn ăn vào rìa của ô pos, mà ô pos bị đẩy sang
+    # "unc" là một ca bệnh rút khỏi "Present:". Mặc định tắt: chi phí này
+    # được ĐO và in ra ở cột `pos→unc`; bật trần sau khi đã nhìn con số.
+    run.setdefault("calib_max_pos_swallow", 0.0)
+    for _k in ("calib_purity", "calib_lift", "calib_margin", "calib_conf",
+               "calib_holdout", "calib_max_pos_swallow"):
+        run[_k] = float(run[_k])
+    for _k in ("calib_seed", "calib_min_unc", "calib_min_cells", "calib_grid",
+               "calib_max_batches"):
+        run[_k] = int(run[_k])
+    if not 0.0 < run["calib_purity"] < 1.0:
+        raise ValueError(f"run.calib_purity phải trong (0, 1), nhận "
+                         f"{run['calib_purity']}")
+    if run["calib_purity"] <= 0.5:
+        print(f"⚠ calib_purity={run['calib_purity']:g} ≤ 0.5 — band được cấp "
+              f"phép gán cứng 'uncertain' cho những ô mà PHẦN LỚN không phải "
+              f"uncertain. Đây là nhãn đi thẳng vào prompt, không phải một "
+              f"gợi ý.")
+    if not 0.5 < run["calib_conf"] < 1.0:
+        raise ValueError(f"run.calib_conf phải trong (0.5, 1), nhận "
+                         f"{run['calib_conf']}")
+    if not 0.0 <= run["calib_holdout"] < 1.0:
+        raise ValueError(f"run.calib_holdout phải trong [0, 1), nhận "
+                         f"{run['calib_holdout']} (0 = tắt kiểm định)")
+    if run["calib_holdout"] == 0.0:
+        print("⚠ calib_holdout=0 — band được CHỌN và CHẤM trên cùng một bộ "
+              "ô. Purity in ra sẽ lạc quan vì đó là cực đại của một phép tìm "
+              "trên ~500k cặp ngưỡng, không phải một ước lượng.")
+    if not 0.0 <= run["calib_margin"] < 0.5:
+        raise ValueError(f"run.calib_margin phải trong [0, 0.5), nhận "
+                         f"{run['calib_margin']}")
+    if not 0.0 <= run["calib_max_pos_swallow"] <= 1.0:
+        raise ValueError(f"run.calib_max_pos_swallow phải trong [0, 1], nhận "
+                         f"{run['calib_max_pos_swallow']} (0 = tắt trần)")
+    if run["calib_lift"] < 1.0:
+        print(f"⚠ calib_lift={run['calib_lift']:g} < 1 — sàn tương đối THẤP "
+              f"hơn tỉ lệ nền, tức band có thể tinh khiết kém hơn cả đoán mò "
+              f"theo tần suất.")
+    if run["calib_grid"] < 100:
+        raise ValueError(f"run.calib_grid={run['calib_grid']} quá thô: lưới "
+                         f"ngưỡng bước {1 / run['calib_grid']:.3g} thì hai "
+                         f"band cách nhau vài phần trăm xác suất không phân "
+                         f"biệt được")
+
     # ── Sinh CÓ ĐIỀU KIỆN (src/cam.py::condition_text) ───────────────────────
     # Bật: mỗi ảnh sinh HAI lượt — lượt trống (raw_output, baseline) và lượt
     # có hai danh sách present/absent lấy từ chính sup_head của ảnh đó
@@ -810,6 +894,17 @@ if __name__ == "__main__":
     print(f"          ASL γ+={c.run.asl_gamma_pos:g} γ-={c.run.asl_gamma_neg:g}"
           f" | ngưỡng âm m={c.run.asl_clip:g} (BI-RADS 3)"
           f" | uncertain={c.run.uncertain_soft:g}, blank=MASK")
+    if getattr(c.run, "calib_enabled", True):
+        print(f"Band unc: ĐO trên val trước infer (src/calib.py) — sàn "
+              f"purity max({c.run.calib_purity:g}, "
+              f"{c.run.calib_lift:g}×nền), cận dưới Wilson "
+              f"{c.run.calib_conf:g}, kiểm định trên "
+              f"{c.run.calib_holdout:.0%} ô giữ lại")
+    else:
+        print(f"Band unc: TẮT hiệu chuẩn — dùng hằng số "
+              f"({c.run.cam_neg_thr:g}, {c.run.cam_pos_thr:g}). Với "
+              f"uncertain_soft={c.run.uncertain_soft:g} thì đáy hố ASL nằm "
+              f"NGOÀI khoảng đó.")
     print(f"Cân bằng: aux loss w={c.run.w_aux:g} (Switch: E·Σf·P, sàn 1.0) — "
           f"KHÔNG còn bias, trần tải hay expert hứng")
     _sig = decay_desc(getattr(c.fixed, "route_noise_start", None),
