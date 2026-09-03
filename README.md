@@ -644,7 +644,10 @@ cho hồ sơ **vô điều kiện** — mọi expert đo trên cùng một tập
 router chưa từng chọn.
 
 `scripts/probe_summary.py` gộp các bản ghi trên Hub thành `reports/probe/`
-(HTML + md + csv). Chạy trên CPU, không cần torch.
+— `SUMMARY.md` + `summary.json` ở gốc, số liệu thô trong `csv/`, trang đọc
+bằng mắt trong `html/`. Chạy trên CPU, không cần torch. Đầu mỗi lần chạy nó
+**hỏi một HF token**; bỏ trống thì ghi `hf_token: "none"` và không dựng
+`browse.html` ([§3.8](#38-tra-cứu-ảnh-theo-finding--state-browsehtml)).
 
 `src/probe.py`
 
@@ -713,9 +716,10 @@ run:
 
 ### 3.8. Tra cứu ảnh theo finding × state (`browse.html`)
 
-Bốn file trong `reports/probe/` trả lời câu hỏi về **expert**. Câu còn lại —
-*"cho tôi xem những ảnh model nói có tràn dịch, rồi chỉ chỗ nó nhìn"* — chạy
-trên đúng hai trường mà `src/cam.py` ghi vào mỗi bản ghi:
+Các file trong `reports/probe/csv/` và `html/index.html` trả lời câu hỏi về
+**expert**. Câu còn lại — *"cho tôi xem những ảnh model nói có tràn dịch, rồi
+chỉ chỗ nó nhìn"* — chạy trên đúng hai trường mà `src/cam.py` ghi vào mỗi bản
+ghi:
 
 | Trường | Giá trị |
 |---|---|
@@ -723,8 +727,9 @@ trên đúng hai trường mà `src/cam.py` ghi vào mỗi bản ghi:
 | **state** | `pos` / `unc` / `neg`, gập từ σ(sup_logit) theo hai ngưỡng |
 
 ```bash
-python scripts/probe_summary.py --images-root data/images
-#   -> reports/probe/browse.html   (mở bằng trình duyệt)
+python scripts/probe_summary.py            # hỏi HF token ở đầu phiên
+#   -> reports/probe/html/browse.html
+python scripts/probe_summary.py --serve    # mở trang qua server cục bộ
 ```
 
 Chọn (finding, state) → lưới ảnh khớp → bấm một ảnh → Grad-CAM chồng lên chính
@@ -736,15 +741,56 @@ bốn ô và ô `blank` đã bị MASK khỏi ASL ([§1.6](#16-loss)), nên mode
 giờ được dạy để nói "không đề cập" — ở đây chỉ có ba trạng thái, và vùng giữa
 `unc` nghĩa là *model lưỡng lự*, không phải *CheXbert ghi uncertain*.
 
-**Đây là file DUY NHẤT trong `reports/probe/` chứa dữ liệu bệnh nhân** (key_id
-là định danh nghiên cứu MIMIC-CXR, cộng ảnh và text báo cáo). Ranh giới đó
-không dựa vào trí nhớ: `dump_browse` tự ghi một `.gitignore` cạnh nó liệt kê
-chính nó. `index.html`, `SUMMARY.md` và các CSV vẫn không chứa gì trong số đó
-và vẫn commit được như thường.
+#### Token hỏi lúc chạy, ảnh lấy lúc query
 
-Không có `--images-root` thì trang vẫn dựng, chỉ mất phim nền. `--browse-max`
-(mặc định 300) là trần số ảnh nhúng — mỗi ảnh ~15KB thumbnail + ~8KB bản đồ.
-`--no-browse` để bỏ hẳn.
+Đầu mỗi lần chạy script hỏi một HF token (ẩn khi gõ, không vào history):
+
+* **bỏ trống** → `summary.json` ghi `hf_token: "none"`, `browse.html` **không
+  được dựng**. Mọi thứ còn lại vẫn ra bình thường;
+* **có token nhưng không đọc được repo ảnh** (`run.data.repo`) → cũng khoá, và
+  `browse_locked_reason` nói rõ Hub trả về gì;
+* **token đọc được** → mở khoá.
+
+Token đó chỉ dùng đúng một việc tại chỗ: đọc **central directory** của
+`img_dir.zip` để biết mỗi ảnh nằm ở byte nào. Ba con số ấy — offset của local
+header, cỡ nén, phương pháp nén — là thứ duy nhất đi vào `browse.html`.
+
+Trang **không nhúng một tấm ảnh nào**. Khi người xem bấm (hoặc cuộn) tới một
+ô, trình duyệt bắn một HTTP `Range` request đúng vài chục KB thẳng tới Hub,
+giải nén `deflate-raw` ngay trong tab rồi vẽ ra. Không tải trước, không cache
+xuống đĩa, không đụng tới ảnh nào người xem không nhìn.
+
+Token **không nằm trong file**: người xem tự dán token của họ vào ô trên trang,
+nó sống trong `sessionStorage` của đúng tab đó và mất khi đóng tab. Nghĩa là
+quyền xem ảnh do **Hub** gác, không phải do một file HTML gác — và file này
+không mang bí mật nào.
+
+Phần còn lại có PHI là **text báo cáo**. Mặc định vẫn kèm, và `dump_browse`
+vẫn tự ghi `.gitignore` cạnh nó. `--browse-public` bỏ hai khối text đó, gỡ
+`.gitignore`, và trang commit được.
+
+#### CORS và `--serve`
+
+Mở `browse.html` bằng `file://` thì origin của trang là `"null"` và
+huggingface.co thường từ chối preflight của range request. Khi đó:
+
+```bash
+python scripts/probe_summary.py --serve        # cổng 8765
+```
+
+Một server tĩnh ~60 dòng phục vụ `reports/probe/html/` và mở đúng một endpoint
+`_zip` chuyển tiếp nguyên xi `Range` + `Authorization` lên Hub — cùng origin
+nên hết CORS. Nếu upstream lờ `Range` và trả cả file, proxy **tự cắt** đúng
+khoảng rồi trả `206`: byte 0 cũng là một local header hợp lệ, nên không cắt
+thì trang sẽ hiện **nhầm ảnh** mà không báo gì. Token vẫn do trình duyệt gửi;
+server không đọc, không ghi, không log.
+
+Nút **Kiểm tra** trên trang thử đúng một ảnh và in ra lỗi thật (mã HTTP, CORS,
+thiếu `DecompressionStream`) thay vì để cả lưới im lặng trống.
+
+Không có token thì trang vẫn dựng được từ lần chạy trước và **bản đồ CAM vẫn
+hiện** — chỉ mất phim nền. `--browse-max` (mặc định 300) là trần số ảnh; giờ
+mỗi ảnh chỉ tốn ~8KB bản đồ trong file. `--no-browse` để bỏ hẳn.
 
 ---
 
@@ -943,7 +989,9 @@ RGExp_proj/
     ├── kaggle_t4x2.py        # ★ cell Kaggle T4×2 (sm75, fp32)
     ├── kaggle_probe.py       # cell Kaggle cho mode=probe
     └── probe_summary.py      # ★ gộp bản ghi probe -> reports/probe/
-                              #   + browse.html: tra cứu finding × state
+                              #   csv/ + html/ ; hỏi HF token, không có ->
+                              #   'none' và khoá browse.html
+                              #   --serve: proxy range request cho ảnh onl
 ```
 
 ### Pipeline

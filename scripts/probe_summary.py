@@ -12,16 +12,46 @@ tập:
 Script này chạy trên CPU máy cá nhân (không cần GPU, không import torch), kéo
 records/*.json về, gộp lại và xuất ra:
 
-    reports/probe/index.html        bảng nhiệt + bản đồ 16×16 + top token,
-                                    một file tự chứa, mở bằng trình duyệt
     reports/probe/SUMMARY.md        bản đọc thẳng trên GitHub
     reports/probe/summary.json      số liệu máy đọc (để script khác dùng lại)
-    reports/probe/*.csv             ma trận thô: route / usage / disease /
+    reports/probe/csv/*.csv         ma trận thô: route / usage / disease /
                                     aspect / từng nhóm token / similarity /
                                     top token / spatial
-    reports/probe/browse.html       tra cứu ảnh theo finding × state rồi chồng
-                                    Grad-CAM lên phim — file DUY NHẤT có PHI,
-                                    tự ghi .gitignore cho chính nó
+    reports/probe/html/index.html   bảng nhiệt + bản đồ 16×16 + top token,
+                                    một file tự chứa, mở bằng trình duyệt
+    reports/probe/html/browse.html  tra cứu ảnh theo finding × state rồi chồng
+                                    Grad-CAM lên phim
+
+Hai thư mục con là cố ý: `csv/` là đầu vào của script khác, `html/` là thứ mở
+bằng mắt. Trộn chung thì mỗi lần muốn `git add` phần số liệu lại phải nhớ ra
+file nào là HTML — tách ra thì cả thư mục là một đơn vị.
+
+═══ TOKEN HF, VÀ VÌ SAO browse.html KHÔNG CÒN NHÚNG ẢNH ═══
+
+Đầu mỗi lần chạy, script HỎI một HF token. Bỏ trống thì nó ghi `hf_token:
+"none"` vào summary.json và **không dựng browse.html** — mọi thứ còn lại vẫn
+ra bình thường. Điền một token đọc được repo ảnh (`run.data.repo`) thì browse
+được mở khoá.
+
+Token đó chỉ dùng ĐÚNG MỘT VIỆC tại chỗ: đọc central directory của
+`img_dir.zip` để biết mỗi ảnh nằm ở byte nào. Ba con số ấy (offset, cỡ nén,
+phương pháp nén) là thứ duy nhất đi vào browse.html. Ảnh thì KHÔNG:
+
+  * trang không nhúng thumbnail nào, nên nó nhẹ và không mang ảnh bệnh nhân;
+  * token KHÔNG nằm trong file — người xem tự dán token của họ vào ô trên
+    trang, nó sống trong `sessionStorage` của đúng tab đó;
+  * mỗi ảnh chỉ được tải khi có người thật sự bấm/nhìn tới nó, bằng một HTTP
+    range request đúng vài chục KB thẳng tới Hub. Không tải trước, không cache
+    xuống đĩa.
+
+Nghĩa là quyền xem ảnh do HUB gác, không phải do một file HTML gác. Phần còn
+lại có PHI là text báo cáo — mặc định vẫn kèm và vẫn tự ghi `.gitignore`;
+`--browse-public` bỏ hai khối text đó và trang commit được.
+
+Mở bằng `file://` thì huggingface.co thường chặn CORS (origin "null"). Khi đó:
+`python scripts/probe_summary.py --serve` dựng một server cục bộ phục vụ
+`html/` và chuyển tiếp nguyên xi range request lên Hub — cùng origin, hết CORS.
+Token vẫn do trình duyệt gửi, server không giữ.
 
 Chạy:
 
@@ -29,8 +59,9 @@ Chạy:
     python scripts/probe_summary.py --repo user/abc-probe
     python scripts/probe_summary.py --local-dir outputs/<tag>/probe_records
     python scripts/probe_summary.py --limit 200          # thử nhanh
-    python scripts/probe_summary.py --images-root data/images   # browse có phim nền
-    python scripts/probe_summary.py --no-browse          # chỉ phần đẩy được lên git
+    python scripts/probe_summary.py --no-token-prompt    # CI: coi như 'none'
+    python scripts/probe_summary.py --browse-public      # browse commit được
+    python scripts/probe_summary.py --serve              # mở trang qua proxy
 
 Chạy lại thì GHI ĐÈ đúng thư mục đó — không tạo bản mới theo timestamp. Lý do:
 đây là báo cáo về trạng thái hiện tại của checkpoint, không phải nhật ký; muốn
@@ -260,6 +291,207 @@ def fetch_records_dir(repo, token, revision, quiet=False):
         allow_patterns=[f"{RECORD_DIR}/*.json"], max_workers=8)
     d = os.path.join(root, RECORD_DIR)
     return d if os.path.isdir(d) else root
+
+
+# ══════════════════════ HF token + chỉ mục byte trong img_dir.zip ════════════
+#
+# browse.html KHÔNG còn nhúng ảnh. Nó nhúng đúng ba con số cho mỗi ảnh —
+# offset của local header trong `img_dir.zip`, kích thước nén, và phương pháp
+# nén — rồi để trình duyệt tự `Range:` đúng vài chục KB đó khi người dùng bấm
+# vào ô. Ảnh không được tải trước, không nằm trong file, và không rời khỏi
+# Hub cho tới lúc có người thật sự nhìn nó.
+#
+# Đổi lại, script phải đọc CENTRAL DIRECTORY của zip một lần để biết ba con số
+# ấy. Đó là phần cuối file, `HfFileSystem` seek tới được nên không phải kéo về
+# 17GB — nhưng vẫn là vài chục MB và mất một lúc. Chỉ chạy khi có token.
+#
+# Token thì HỎI ngay đầu phiên và KHÔNG BAO GIỜ ghi vào file nào: người xem
+# dán lại nó trong trình duyệt. Nhờ vậy browse.html không chứa bí mật, và
+# quyền xem ảnh vẫn do Hub gác chứ không do một file HTML gác.
+
+IMAGE_ZIP_DEFAULT = "img_dir.zip"
+TOKEN_NONE = "none"
+
+
+def resolve_image_repo(cli_repo, config_path):
+    """Dataset repo CHỨA ẢNH (run.data.repo), khác repo probe.
+
+    Cùng lý do với `resolve_repo`: đọc thẳng YAML thay vì import src.config,
+    để script vẫn chạy trên máy chỉ có numpy + huggingface_hub.
+    """
+    if cli_repo:
+        return cli_repo
+    env = os.environ.get("RGEXP_IMAGE_REPO")
+    if env:
+        return env
+    try:
+        import yaml
+    except ImportError:
+        return None
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    data = ((cfg.get("run") or {}).get("data") or {})
+    return data.get("repo")
+
+
+def resolve_image_zip(config_path):
+    """Tên file zip ảnh trong repo đó (run.data.image_zip)."""
+    try:
+        import yaml
+    except ImportError:
+        return IMAGE_ZIP_DEFAULT
+    if not os.path.isfile(config_path):
+        return IMAGE_ZIP_DEFAULT
+    with open(config_path, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    data = ((cfg.get("run") or {}).get("data") or {})
+    return data.get("image_zip") or IMAGE_ZIP_DEFAULT
+
+
+def ask_token(cli_token, allow_prompt=True, quiet=False):
+    """Lấy HF token: cờ > $HF_TOKEN > hỏi trên terminal. Trả (token|None, nguồn).
+
+    KHÔNG điền -> trả None và nguồn "none". Cả hai đường ra đều được ghi lại
+    trong summary.json, để sau này đọc báo cáo còn biết vì sao không có browse.
+    `getpass` để token không hiện lên màn hình và không vào ~/.bash_history.
+    """
+    if cli_token:
+        return cli_token, "--token"
+    env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if env:
+        return env, "$HF_TOKEN"
+    if not allow_prompt or not sys.stdin.isatty():
+        return None, TOKEN_NONE
+    import getpass
+    print("")
+    print("┌─ HF API token ────────────────────────────────────────────────┐")
+    print("│ Token có quyền đọc dataset ẢNH sẽ MỞ KHOÁ browse.html —       │")
+    print("│ trang tra cứu finding × state, ảnh tải thẳng từ Hub lúc bấm.  │")
+    print("│ Bỏ trống (Enter) -> ghi 'none', browse KHÔNG được dựng.       │")
+    print("│ Token chỉ dùng tại chỗ để đọc mục lục zip; KHÔNG file nào giữ │")
+    print("│ lại nó — người xem trang sẽ tự dán token trong trình duyệt.   │")
+    print("└───────────────────────────────────────────────────────────────┘")
+    try:
+        tok = getpass.getpass("  HF token (hf_...): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        tok = ""
+    if not tok:
+        if not quiet:
+            print("  → none. browse.html sẽ bị khoá.\n")
+        return None, TOKEN_NONE
+    return tok, "nhập tay"
+
+
+def check_image_access(repo, revision, zip_name, token, quiet=False):
+    """Token này có đọc được repo ảnh không? -> (ok, mô tả, size zip|None).
+
+    Hỏi Hub thật chứ không đoán: repo ảnh là repo GATED/private, và "có token"
+    với "token có quyền" là hai chuyện khác nhau. Thà biết ngay ở đây còn hơn
+    dựng xong trang rồi mới thấy mọi ô ảnh đều 403.
+    """
+    if not repo:
+        return False, "không xác định được repo ảnh (run.data.repo)", None
+    if not token:
+        return False, "không có token", None
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return False, "thiếu huggingface_hub", None
+    try:
+        info = HfApi().repo_info(repo_id=repo, repo_type="dataset",
+                                 revision=revision, files_metadata=True,
+                                 token=token)
+    except Exception as exc:                      # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}".split("\n")[0][:160], None
+    size = None
+    for sib in (info.siblings or []):
+        if sib.rfilename == zip_name:
+            size = getattr(sib, "size", None) or getattr(sib, "lfs", None)
+            if isinstance(size, dict):
+                size = size.get("size")
+            break
+    else:
+        return False, f"repo đọc được nhưng không có {zip_name}", None
+    return True, "ok", size
+
+
+def build_zip_index(repo, revision, zip_name, token, keys, quiet=False):
+    """key_id -> [header_offset, compress_size, method, len(tên)] trong zip.
+
+    Đọc central directory qua HTTP range (HfFileSystem seek được), rồi ghép
+    key_id với tên file trong zip. Ghép theo BASENAME trước cho nhanh, xong
+    mới chọn ứng viên có hậu tố đường dẫn khớp dài nhất — hai bệnh nhân có
+    thể trùng tên file, và ghép nhầm thì trang hiện đúng bản đồ của ca này
+    chồng lên phim của ca khác, tức là sai theo cách khó phát hiện nhất.
+    """
+    import zipfile
+    try:
+        from huggingface_hub import HfFileSystem
+    except ImportError:
+        return {}, "thiếu huggingface_hub"
+    path = f"datasets/{repo}/{zip_name}"
+    if revision:
+        path = f"datasets/{repo}@{revision}/{zip_name}"
+    if not quiet:
+        print(f"→ đọc mục lục {zip_name} (central directory) qua range request "
+              f"— vài chục MB, không kéo cả file …", flush=True)
+    try:
+        fs = HfFileSystem(token=token)
+        fh = fs.open(path, "rb", block_size=4 * 1024 * 1024)
+    except Exception as exc:                      # noqa: BLE001
+        return {}, f"mở zip thất bại: {type(exc).__name__}: {exc}"[:200]
+    by_base = {}
+    try:
+        with fh:
+            zf = zipfile.ZipFile(fh)
+            for info in zf.infolist():
+                nm = info.filename
+                if nm.endswith("/"):
+                    continue
+                by_base.setdefault(nm.rsplit("/", 1)[-1], []).append(
+                    (nm, info.header_offset, info.compress_size,
+                     info.compress_type))
+    except Exception as exc:                      # noqa: BLE001
+        return {}, f"đọc mục lục thất bại: {type(exc).__name__}: {exc}"[:200]
+
+    def score(zip_name_, key):
+        """Số ký tự hậu tố đường dẫn khớp nhau; -1 nếu không khớp gì."""
+        a = zip_name_.replace("\\", "/").lower()
+        best = -1
+        for rel in _strip_variants(key):
+            r = rel.lower()
+            if a == r or a.endswith("/" + r):
+                best = max(best, len(r))
+        return best
+
+    idx, n_amb = {}, 0
+    for key in keys:
+        base = str(key).replace("\\", "/").rsplit("/", 1)[-1]
+        cand = by_base.get(base)
+        if not cand:
+            continue
+        if len(cand) == 1:
+            nm, off, csz, mth = cand[0]
+        else:
+            ranked = sorted(((score(c[0], key), c) for c in cand),
+                            key=lambda t: t[0], reverse=True)
+            if ranked[0][0] < 0:
+                n_amb += 1
+                continue
+            if len(ranked) > 1 and ranked[1][0] == ranked[0][0]:
+                n_amb += 1                        # hoà -> thà không hiện
+                continue
+            nm, off, csz, mth = ranked[0][1]
+        idx[str(key)] = [int(off), int(csz), int(mth), len(nm.encode("utf-8"))]
+    note = f"{len(idx):,}/{len(keys):,} key ghép được"
+    if n_amb:
+        note += f", {n_amb:,} key trùng tên không phân giải được — bỏ"
+    if not quiet:
+        print(f"✓ mục lục zip: {note} (trong {len(by_base):,} tên file)")
+    return idx, note
 
 
 def load_records(directory, limit=None, quiet=False):
@@ -1168,7 +1400,7 @@ def dump_md(a, out, source):
     L += ["## Bảng nhiệt expert × nhãn (z-score theo cột)", "",
           "Đậm = expert này đẩy nhãn đó mạnh hơn mặt bằng các expert khác. "
           "`·` = bằng hoặc dưới mặt bằng. Chuẩn theo CỘT vì mặt bằng logit của "
-          "từng tên chênh nhau cả bậc. Số thô ở các file `expert_*_mean.csv`.",
+          "từng tên chênh nhau cả bậc. Số thô ở các file `csv/expert_*_mean.csv`.",
           ""]
     if len(dn) and live:
         L += heat_md(a["disease_z"], dn, "14 tên bệnh (CheXbert)",
@@ -1231,7 +1463,7 @@ def dump_md(a, out, source):
 
     L += ["---", "",
           "Xem bản có màu: `reports/probe/index.html`. Số liệu máy đọc: "
-          "`summary.json`, `*.csv`.", "",
+          "`summary.json`, `csv/*.csv`.", "",
           "*Không có text báo cáo hay `key_id` nào trong thư mục này — bản ghi "
           "gốc chứa báo cáo MIMIC-CXR (dữ liệu PhysioNet có kiểm soát) nên chỉ "
           "số liệu đã gộp mới được xuất ra đây.*", ""]
@@ -1486,7 +1718,7 @@ def dump_html(a, out, source):
              "vì thước đo thiếu ô. Hồ sơ dựng "
              f"trên {a['n_profile_records']:,} bản ghi "
              f"<code>{a['profile_source']}</code>. Số thô: các file "
-             "<code>expert_*_mean.csv</code>.</p>")
+             "<code>csv/expert_*_mean.csv</code>.</p>")
     if len(dn) and live:
         P.append(heat(a["disease_z"], dn, "14 tên bệnh (CheXbert)",
                       "Câu hỏi kinh điển: expert nào thiên về bệnh nào.", live))
@@ -1600,14 +1832,14 @@ def dump_html(a, out, source):
 
 # ═══════════════════ Trang tra cứu finding × state (browse.html) ═════════════
 #
-# Đây là file DUY NHẤT trong thư mục output có chứa key_id, ảnh X-quang và text
-# báo cáo — tức là file duy nhất chứa dữ liệu bệnh nhân. index.html/SUMMARY.md/
-# *.csv vẫn giữ nguyên chính sách "không một chữ nào của báo cáo, không key_id"
-# ở docstring đầu file, vì chúng được thiết kế để đẩy lên GitHub.
+# Đây là file DUY NHẤT trong thư mục output chạm tới dữ liệu bệnh nhân, và từ
+# bản này nó chỉ còn chạm tới HAI thứ: key_id, và text báo cáo. Ảnh X-quang
+# KHÔNG còn nằm trong file — trang giữ vị trí byte của ảnh trong img_dir.zip
+# rồi để trình duyệt tự lấy từ Hub bằng token của chính người xem.
 #
-# Ranh giới đó không dựa vào trí nhớ của ai: `dump_browse` tự ghi một
-# `.gitignore` cạnh nó liệt kê chính nó. Ai clone repo về rồi chạy lại script
-# này sẽ sinh ra browse.html trên máy mình, và git vẫn không thấy nó.
+# Vì thế `.gitignore` giờ là CÓ ĐIỀU KIỆN: mặc định (còn text báo cáo) vẫn ghi,
+# `--browse-public` bỏ text báo cáo và không ghi nữa. Ai clone repo về rồi chạy
+# lại script này vẫn sinh được browse.html trên máy mình.
 #
 # Truy vấn chạy trên HAI trường, đúng như tên gọi:
 #
@@ -1635,72 +1867,7 @@ def _strip_variants(key):
     return ["/".join(parts[i:]) for i in range(min(4, len(parts)))]
 
 
-def resolve_image(key, roots, index=None):
-    """(key_id, [thư mục gốc]) -> đường dẫn ảnh có thật, hoặc None.
-
-    `index` là bảng tra basename -> path, dựng sẵn bởi `build_image_index` khi
-    không cách nào ghép được đường dẫn. Chỉ dùng làm lối thoát cuối: hai bệnh
-    nhân khác nhau có thể có file trùng tên, nên ghép theo đường dẫn tương đối
-    luôn được thử trước.
-    """
-    for root in roots:
-        for rel in _strip_variants(key):
-            p = os.path.join(root, *rel.split("/"))
-            if os.path.isfile(p):
-                return p
-    if index:
-        return index.get(os.path.basename(str(key).replace("\\", "/")))
-    return None
-
-
-def build_image_index(roots, cap=200000):
-    """Quét một lần: basename -> đường dẫn. Tên trùng thì giữ cái gặp trước.
-
-    Chỉ được gọi khi ghép đường dẫn trực tiếp đã trượt, vì với MIMIC-CXR đủ bộ
-    thì đây là hàng trăm nghìn lần stat.
-    """
-    idx = {}
-    for root in roots:
-        for dirpath, _dirs, files in os.walk(root):
-            for name in files:
-                if name.lower().endswith((".jpg", ".jpeg", ".png")):
-                    idx.setdefault(name, os.path.join(dirpath, name))
-                    if len(idx) >= cap:
-                        return idx
-    return idx
-
-
-def thumb_uri(path, size=320, quality=82):
-    """Ảnh trên đĩa -> data: URI JPEG đã thu nhỏ. None nếu không đọc được.
-
-    Thu nhỏ chứ không nhúng ảnh gốc: phim MIMIC-CXR là ~2500² và 300 tấm ảnh
-    gốc là hơn 1GB base64 — trình duyệt không mở nổi file đó. 320px vẫn đủ để
-    một bản đồ 16×16 chồng lên trên có nghĩa (mỗi ô CAM = 20px).
-
-    PIL không có thì trả None và trang vẫn dùng được: bản đồ nhiệt hiện ở chế
-    độ không nền, chỉ mất bối cảnh giải phẫu.
-    """
-    try:
-        import base64
-        import io as _io
-
-        from PIL import Image
-    except Exception:
-        return None
-    try:
-        im = Image.open(path)
-        im.draft("L", (size * 2, size * 2))     # JPEG: giải mã thẳng ở cỡ nhỏ
-        im = im.convert("L")
-        im.thumbnail((size, size), Image.LANCZOS)
-        buf = _io.BytesIO()
-        im.save(buf, format="JPEG", quality=int(quality), optimize=True)
-        return ("data:image/jpeg;base64,"
-                + base64.b64encode(buf.getvalue()).decode("ascii"))
-    except Exception:
-        return None
-
-
-def collect_browse(recs, limit=BROWSE_MAX, images_root=None, thumb=320,
+def collect_browse(recs, limit=BROWSE_MAX, zindex=None, with_report=True,
                    quiet=False):
     """Bản ghi probe -> dữ liệu cho browse.html.
 
@@ -1708,13 +1875,16 @@ def collect_browse(recs, limit=BROWSE_MAX, images_root=None, thumb=320,
     v2, hoặc chạy với cam_enabled = false) bị BỎ và đếm riêng — trang này
     không có gì để hiện cho chúng, và trộn vào thì bộ đếm "n ảnh khớp truy
     vấn" nói dối.
+
+    KHÔNG còn nhúng thumbnail. Mỗi ảnh chỉ mang theo `z` = vị trí của nó
+    trong `img_dir.zip`; trình duyệt tự lấy đúng vài chục KB đó khi có người
+    bấm vào ô. Ảnh nào không ghép được vào mục lục zip thì `z` = null và ô
+    hiện "không có trong mục lục" — thà trống còn hơn hiện nhầm phim.
     """
-    roots = [r for r in (images_root or "").split(os.pathsep) if r]
-    roots = [os.path.expanduser(r) for r in roots]
-    roots = [r for r in roots if os.path.isdir(r)]
+    zindex = zindex or {}
     stat = {"n_records": len(recs), "n_cam": 0, "n_no_cam": 0,
-            "n_thumb": 0, "n_missing_img": 0, "roots": roots,
-            "labels": [], "truncated": False, "pil": True}
+            "n_indexed": 0, "n_missing_img": 0,
+            "labels": [], "truncated": False}
 
     have = [r for r in recs if isinstance(r.get("cam"), dict)
             and (r["cam"].get("maps") or r["cam"].get("sup_prob"))]
@@ -1728,33 +1898,16 @@ def collect_browse(recs, limit=BROWSE_MAX, images_root=None, thumb=320,
         stat["truncated"] = True
         have = have[:int(limit)]
 
-    index, tried_index = None, False
     out = []
     for r in have:
         cam = r["cam"]
         key = str(r.get("key_id") or "")
-        uri = None
-        if roots:
-            p = resolve_image(key, roots, index)
-            if p is None and not tried_index:
-                # Một lần duy nhất cho cả phiên: nếu ảnh ĐẦU không ghép được
-                # thì gần như chắc chắn cả bộ cũng vậy, và quét cây thư mục
-                # 3000 lần thì trang này không bao giờ dựng xong.
-                tried_index = True
-                if not quiet:
-                    print("→ không ghép được đường dẫn ảnh trực tiếp, quét "
-                          "cây thư mục một lần …", flush=True)
-                index = build_image_index(roots)
-                p = resolve_image(key, roots, index)
-            if p is None:
-                stat["n_missing_img"] += 1
-            else:
-                uri = thumb_uri(p, thumb)
-                if uri is None:
-                    stat["pil"] = False
-                else:
-                    stat["n_thumb"] += 1
-        rep = r.get("report") or {}
+        z = zindex.get(key)
+        if z:
+            stat["n_indexed"] += 1
+        else:
+            stat["n_missing_img"] += 1
+        rep = r.get("report") or {} if with_report else {}
         out.append({
             "k": key,
             "p": [round(float(v), 4) for v in (cam.get("sup_prob") or [])],
@@ -1764,7 +1917,7 @@ def collect_browse(recs, limit=BROWSE_MAX, images_root=None, thumb=320,
             "m": cam.get("maps") or [],
             "g": list(cam.get("grid") or [0, 0]),
             "fb": bool(cam.get("fallback")),
-            "img": uri,
+            "z": z,
             "gen": str(rep.get("generated") or ""),
             "ref": str(rep.get("reference") or ""),
         })
@@ -1831,16 +1984,105 @@ BROWSE_CSS = """
    max-height:180px;overflow-y:auto}
 .rep h4{margin:0 0 3px;font-size:11.5px;color:var(--mut);text-transform:uppercase;
    letter-spacing:.04em}
+.gate{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--warn);
+   border-radius:10px;padding:14px 16px;margin:16px 0}
+.gate.ok{border-left-color:var(--pos)}
+.gate h3{margin:0 0 6px;font-size:14px}
+.gate .row{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:10px}
+.gate input[type=password],.gate input[type=text]{font:inherit;font-size:13px;
+   padding:6px 9px;min-width:280px;flex:1;background:var(--bg);color:var(--fg);
+   border:1px solid var(--line);border-radius:7px;
+   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.gate select{font:inherit;font-size:13px;padding:6px 8px;background:var(--bg);
+   color:var(--fg);border:1px solid var(--line);border-radius:7px}
+.gate button{font:inherit;font-size:13px;padding:6px 13px;border-radius:7px;
+   border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
+.gate button.go{background:var(--pos);border-color:var(--pos);color:#fff}
+.gate .st{font-size:12.5px;color:var(--mut);margin-top:9px;white-space:pre-wrap}
+.gate .st.bad{color:var(--pos)}
+.tile.load{display:flex;align-items:center;justify-content:center}
+.tile.load:after{content:"";width:15px;height:15px;border-radius:50%;
+   border:2px solid var(--line);border-top-color:var(--mut);animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.tile.nofilm{background:#0d0d0d}
+.tile.nofilm canvas{opacity:1}
+.tile .nt{position:absolute;top:0;left:0;right:0;font-size:9px;line-height:1.35;
+   background:rgba(0,0,0,.55);color:#fff;padding:1px 4px;text-align:left;
+   text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 """
 
 BROWSE_JS = r"""
 (function(){
-var D=window.__BROWSE__, L=D.labels, G=D.grid, S=["pos","unc","neg"];
+var D=window.__BROWSE__, L=D.labels, G=D.grid, Z=D.zip, S=["pos","unc","neg"];
 var elF=document.getElementById('qf'), elS=document.getElementById('qs'),
     elO=document.getElementById('qo'), elC=document.getElementById('qc'),
     elT=document.getElementById('tiles'), elD=document.getElementById('det'),
     elA=document.getElementById('qa');
+var gTok=document.getElementById('gtok'), gMode=document.getElementById('gmode'),
+    gGo=document.getElementById('ggo'), gTest=document.getElementById('gtest'),
+    gClr=document.getElementById('gclr'), gSt=document.getElementById('gst'),
+    gBox=document.getElementById('gate');
 var cur=null, curMap=0, alpha=0.55;
+
+// ── Token: chỉ sống trong sessionStorage của TAB này ────────────────────────
+// Không nằm trong file HTML (nên file commit được), không nằm trong
+// localStorage (nên đóng tab là mất). Riêng tab ẩn danh hoặc trình duyệt chặn
+// storage thì rơi về một biến trong bộ nhớ — vẫn dùng được hết phiên.
+var TK='rgexp_hf_token', memTok='';
+function getTok(){try{return sessionStorage.getItem(TK)||memTok;}catch(e){return memTok;}}
+function setTok(v){memTok=v;try{sessionStorage.setItem(TK,v);}catch(e){}}
+function clrTok(){memTok='';try{sessionStorage.removeItem(TK);}catch(e){}}
+
+// ── Nguồn byte ảnh ─────────────────────────────────────────────────────────
+// direct: trình duyệt Range thẳng vào huggingface.co. Nhanh nhất, nhưng mở
+//   file bằng file:// thì origin là "null" và CORS thường chặn.
+// proxy: trang đang được `probe_summary.py --serve` phục vụ; nó có sẵn một
+//   endpoint _zip chuyển tiếp nguyên Range + Authorization. Cùng origin nên
+//   không có CORS nào để chặn.
+function mode(){
+  var m=gMode?gMode.value:'auto';
+  if(m!=='auto') return m;
+  return (location.protocol==='http:'||location.protocol==='https:')?'proxy':'direct';
+}
+function endpoint(){return mode()==='proxy'?'_zip':Z.url;}
+
+var cache=new Map(), inflight=new Map();
+
+function zipFetch(x){
+  if(!x.z) return Promise.reject(new Error('không có trong mục lục zip'));
+  if(cache.has(x.k)) return Promise.resolve(cache.get(x.k));
+  if(inflight.has(x.k)) return inflight.get(x.k);
+  var tok=getTok();
+  if(!tok) return Promise.reject(new Error('chưa có token'));
+  var z=x.z;
+  // Local header dài 30 + len(tên) + len(extra); extra ở local KHÁC extra ở
+  // central directory nên không tính trước được. Xin dư 512 byte rồi đọc
+  // đúng hai trường độ dài trong header — một round-trip thay vì hai.
+  var start=z[0], end=z[0]+30+z[3]+512+z[1]+16;
+  var h={'Range':'bytes='+start+'-'+end,'Authorization':'Bearer '+tok};
+  var p=fetch(endpoint(),{headers:h,cache:'no-store'}).then(function(r){
+    if(r.status!==206&&r.status!==200) throw new Error('HTTP '+r.status+
+      (r.status===401||r.status===403?' — token không có quyền đọc repo ảnh':''));
+    return r.arrayBuffer();
+  }).then(function(buf){
+    var dv=new DataView(buf), u8=new Uint8Array(buf);
+    if(buf.byteLength<30||dv.getUint32(0,true)!==0x04034b50)
+      throw new Error('không phải local header — server có bỏ qua Range?');
+    var n=dv.getUint16(26,true), e=dv.getUint16(28,true), off=30+n+e;
+    var body=u8.subarray(off,off+z[1]);
+    if(body.length<z[1]) throw new Error('thiếu byte (Range bị cắt)');
+    if(z[2]===0) return new Blob([body],{type:'image/jpeg'});
+    if(z[2]!==8) throw new Error('phương pháp nén '+z[2]+' không đọc được');
+    if(typeof DecompressionStream==='undefined')
+      throw new Error('trình duyệt không có DecompressionStream');
+    return new Response(new Blob([body]).stream()
+      .pipeThrough(new DecompressionStream('deflate-raw'))).blob();
+  }).then(function(b){
+    var u=URL.createObjectURL(b); cache.set(x.k,u); inflight.delete(x.k); return u;
+  }).catch(function(err){inflight.delete(x.k); throw err;});
+  inflight.set(x.k,p);
+  return p;
+}
 
 // Thang màu: trong suốt ở 0 -> vàng -> đỏ. Alpha tăng theo giá trị nên vùng
 // model không nhìn tới để lộ nguyên bức phim bên dưới, thay vì phủ một lớp
@@ -1853,6 +2095,9 @@ function ramp(v){
   return [r|0,g|0,b|0,Math.round(255*Math.pow(v,0.75))];
 }
 function paint(cv,flat,gw,gh,smooth){
+  // Một bản ghi thiếu `grid` từng làm createImageData ném lỗi và giết luôn
+  // phần còn lại của detail() — ô không có bản đồ thì để trống, đừng đổ vỡ.
+  if(!cv||!flat||!flat.length||!(gw>0)||!(gh>0)) return;
   var off=document.createElement('canvas'); off.width=gw; off.height=gh;
   var oc=off.getContext('2d'), im=oc.createImageData(gw,gh);
   for(var i=0;i<gw*gh;i++){var c=ramp(flat[i]||0);
@@ -1873,6 +2118,43 @@ function match(x){
   return true;
 }
 function sortKey(x){var fi=elF.value; return fi===''?Math.max.apply(null,x.p):x.p[+fi];}
+
+// Chỉ ô ĐANG NHÌN THẤY mới gọi mạng. 300 ô mà tải hết một lượt là 300 range
+// request cho một cú kéo chuột — quan sát viewport rồi mới lấy đúng cái người
+// dùng đang xem.
+var io=('IntersectionObserver' in window)?new IntersectionObserver(function(es){
+  es.forEach(function(en){if(en.isIntersecting){io.unobserve(en.target);
+    fill(en.target);}});
+},{root:elT,rootMargin:'240px'}):null;
+
+function fill(b){
+  var x=b.__x; if(!x||b.__done) return; b.__done=true;
+  // Bản đồ trên ô nhỏ phải là bản đồ của ĐÚNG bệnh đang lọc. Ảnh không có
+  // bản đồ cho bệnh đó thì để trống và đánh dấu, chứ KHÔNG rơi về bản đồ của
+  // bệnh khác: hai ô cạnh nhau trông giống nhau mà nói về hai bệnh khác nhau
+  // là cách nhanh nhất để đọc sai cả lưới.
+  var mi=elF.value===''?0:x.f.indexOf(+elF.value);
+  function drawMap(){
+    if(mi>=0&&x.m[mi]){var cv=document.createElement('canvas');
+      b.appendChild(cv); setTimeout(function(){paint(cv,x.m[mi],G[1],G[0]);},0);}
+    else b.appendChild(mark('bệnh này không lọt ngưỡng phát hiện'));
+  }
+  // Không có phim nền thì bản đồ vẫn PHẢI hiện: nó là số liệu của lần chạy
+  // này, không phụ thuộc token. Thiếu token chỉ mất bối cảnh giải phẫu.
+  function noFilm(msg){b.classList.add('nofilm');drawMap();note(b,msg);}
+  if(!x.z) return noFilm('không có trong mục lục zip');
+  if(!getTok()) return noFilm('cần token');
+  b.classList.add('load');
+  zipFetch(x).then(function(u){
+    b.classList.remove('load');
+    var im=new Image(); im.src=u; im.alt=''; b.insertBefore(im,b.firstChild);
+    drawMap();
+  }).catch(function(err){b.classList.remove('load');noFilm(err.message);});
+}
+function note(b,msg){
+  var s=document.createElement('u'); s.className='nt';
+  s.textContent=msg; s.title=msg; b.appendChild(s);
+}
 function render(){
   var list=D.items.filter(match);
   list.sort(function(a,b){return sortKey(b)-sortKey(a);});
@@ -1880,21 +2162,13 @@ function render(){
   elT.innerHTML='';
   list.slice(0,600).forEach(function(x){
     var b=document.createElement('button'); b.className='tile'+(cur===x?' on':'');
-    // Bản đồ trên ô nhỏ phải là bản đồ của ĐÚNG bệnh đang lọc. Ảnh không có
-    // bản đồ cho bệnh đó thì để trống và đánh dấu, chứ KHÔNG rơi về bản đồ
-    // của bệnh khác: hai ô cạnh nhau trông giống nhau mà nói về hai bệnh
-    // khác nhau là cách nhanh nhất để đọc sai cả lưới.
-    var mi=elF.value===''?0:x.f.indexOf(+elF.value);
-    if(x.img){var im=new Image(); im.src=x.img; im.alt=''; b.appendChild(im);
-      if(mi>=0&&x.m[mi]){var cv=document.createElement('canvas');
-        b.appendChild(cv); setTimeout(function(){paint(cv,x.m[mi],G[1],G[0]);},0);}
-      else b.appendChild(mark('bệnh này không lọt ngưỡng phát hiện'));
-    } else { b.className+=' nop'; b.appendChild(document.createTextNode('không có ảnh')); }
+    b.__x=x;
     var tag=document.createElement('b');
     tag.textContent=(elF.value===''?Math.max.apply(null,x.p):x.p[+elF.value]).toFixed(2);
     b.appendChild(tag);
     b.onclick=function(){cur=x;curMap=0;render();detail();};
     elT.appendChild(b);
+    if(io) io.observe(b); else fill(b);
   });
   if(!list.length) elT.innerHTML='<p class="note" style="padding:14px">'+
     'Không ảnh nào khớp. Nới ngưỡng state, hoặc bỏ "chỉ ảnh có bản đồ".</p>';
@@ -1903,17 +2177,13 @@ function detail(){
   if(!cur){elD.innerHTML='<p class="note">Chọn một ảnh bên trái để xem bản đồ '+
     'Grad-CAM của nó.</p>';return;}
   var x=cur, h=[];
-  h.push('<div class="key">'+x.k+'</div>');
-  h.push('<div class="stage" id="stg">'+(x.img
-      ? '<img src="'+x.img+'" alt=""><canvas id="ov"></canvas>'
-      : '<div class="ph">Không tìm thấy file ảnh cho key này.<br>'+
-        'Chạy lại với <code>--images-root</code> trỏ vào thư mục ảnh để xem '+
-        'heatmap chồng lên phim.<canvas id="ov" style="position:static;'+
-        'width:100%;aspect-ratio:1"></canvas></div>')+'</div>');
+  h.push('<div class="key">'+esc(x.k)+'</div>');
+  h.push('<div class="stage" id="stg"><canvas id="ov"></canvas>'+
+         '<div class="ph" id="phm">đang lấy ảnh từ Hub …</div></div>');
   h.push('<div class="tabs">');
   if(!x.f.length) h.push('<span class="note">không có bản đồ nào</span>');
   x.f.forEach(function(d,i){h.push('<button data-i="'+i+'"'+(i===curMap?' class="on"':'')
-    +'>'+(x.n[i]||L[d]||('#'+d))+' · '+x.p[d].toFixed(2)+'</button>');});
+    +'>'+esc(x.n[i]||L[d]||('#'+d))+' · '+x.p[d].toFixed(2)+'</button>');});
   h.push('</div>');
   if(x.fb) h.push('<p class="note">⚠ Không bệnh nào qua ngưỡng phát hiện — '+
     'đây là bản đồ của bệnh mạnh nhất, giữ lại để soi được cả ca model cho là '+
@@ -1923,7 +2193,7 @@ function detail(){
     '<span id="opv">'+Math.round(alpha*100)+'%</span></div>');
   h.push('<div class="plist">');
   L.forEach(function(nm,d){
-    h.push('<span class="nm">'+nm+'</span><span class="vv">'+x.p[d].toFixed(3)+
+    h.push('<span class="nm">'+esc(nm)+'</span><span class="vv">'+x.p[d].toFixed(3)+
       '</span><span class="pill '+x.s[d]+'">'+x.s[d]+'</span>');
   });
   h.push('</div>');
@@ -1933,8 +2203,19 @@ function detail(){
       esc(x.ref)+'</div>');
     h.push('</div>');}
   elD.innerHTML=h.join('');
-  var ov=document.getElementById('ov');
+  var ov=document.getElementById('ov'), ph=document.getElementById('phm'),
+      stg=document.getElementById('stg');
   if(ov&&x.m[curMap]){ov.style.opacity=alpha;paint(ov,x.m[curMap],G[1],G[0]);}
+  var want=x;
+  zipFetch(x).then(function(u){
+    if(cur!==want) return;
+    if(ph) ph.remove();
+    var im=new Image(); im.src=u; im.alt=''; stg.insertBefore(im,stg.firstChild);
+  }).catch(function(err){
+    if(cur!==want||!ph) return;
+    ph.innerHTML='Không lấy được ảnh: '+esc(err.message)+
+      '<br><span class="note">bản đồ vẫn hiện, chỉ mất phim nền.</span>';
+  });
   Array.prototype.forEach.call(elD.querySelectorAll('.tabs button'),function(b){
     b.onclick=function(){curMap=+b.dataset.i;detail();};});
   var op=document.getElementById('op');
@@ -1946,33 +2227,113 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/>/g,'&gt;');}
 function mark(t){var i=document.createElement('i'); i.className='nomap';
   i.title=t; return i;}
+
+// ── Cổng token ─────────────────────────────────────────────────────────────
+function say(msg,bad){gSt.textContent=msg;gSt.className='st'+(bad?' bad':'');}
+function gateState(){
+  var has=!!getTok();
+  gBox.className='gate'+(has?' ok':'');
+  gTok.value=has?'••••••••••••••••':'';
+  gGo.textContent=has?'Đổi token':'Mở khoá';
+  gClr.style.display=has?'':'none';
+  gTest.style.display=has?'':'none';
+  if(has) say('Đã có token trong tab này. Ảnh lấy từ Hub khi bạn bấm vào ô — '+
+    'không tải trước, không lưu lại.');
+  else say('Chưa có token. Bản đồ CAM và mọi số liệu vẫn xem được; chỉ phim '+
+    'nền là thiếu.');
+}
+gGo.onclick=function(){
+  var v=(gTok.value||'').trim();
+  if(!v||v.indexOf('•')===0){gTok.type='password';gTok.value='';gTok.focus();
+    say('Dán token rồi bấm lại.');return;}
+  setTok(v);cache.clear();gateState();render();detail();
+};
+gTok.addEventListener('keydown',function(e){if(e.key==='Enter')gGo.click();});
+gClr.onclick=function(){clrTok();cache.forEach(URL.revokeObjectURL);cache.clear();
+  gateState();render();detail();};
+gTest.onclick=function(){
+  var x=null;
+  for(var i=0;i<D.items.length;i++){if(D.items[i].z){x=D.items[i];break;}}
+  if(!x){say('Không key nào có trong mục lục zip — chạy lại summary với token '+
+    'có quyền đọc repo ảnh.',1);return;}
+  say('Đang thử qua '+mode()+' …');
+  cache.delete(x.k);
+  var t0=Date.now();
+  zipFetch(x).then(function(){say('✓ '+mode()+' chạy được ('+
+    (Date.now()-t0)+'ms cho '+(x.z[1]/1024).toFixed(0)+'KB).');})
+    .catch(function(err){say('✗ '+mode()+' thất bại: '+err.message+'\n'+
+      (mode()==='direct'
+        ? 'Mở bằng file:// thì huggingface.co thường chặn CORS. Chạy:\n'+
+          '    python scripts/probe_summary.py --serve\nrồi mở link nó in ra.'
+        : 'Không thấy endpoint _zip — trang này đang được phục vụ bởi một '+
+          'server khác. Đổi "nguồn ảnh" sang "trực tiếp", hoặc dùng --serve.'),1);});
+};
+if(gMode) gMode.onchange=function(){cache.clear();say('Nguồn ảnh: '+mode()+'.');};
+
 [elF,elS,elO,elA].forEach(function(e){e.addEventListener('input',function(){
   cur=null;render();detail();});});
 addEventListener('resize',function(){if(cur)detail();});
-render();detail();
+gateState();render();detail();
 })();
 """
 
 
-def dump_browse(items, stat, out, source, meta=None, quiet=False):
-    """Ghi browse.html + .gitignore cạnh nó. Trả về đường dẫn, hoặc None."""
+def dump_browse(items, stat, out, source, zipmeta, with_report=True, quiet=False):
+    """Ghi browse.html (+ .gitignore nếu còn text báo cáo). Trả đường dẫn|None."""
     if not items:
         return None
     labels = stat["labels"] or [f"#{i}" for i in range(len(items[0]["p"]))]
-    grid = items[0]["g"] or [16, 16]
+    # Bản ghi cũ (trước khi `cam_block` ghi kèm `grid`) trả về [0, 0], và một
+    # canvas 0×0 làm CHẾT cả trang chứ không chỉ hỏng một ô. Suy ngược từ độ
+    # dài bản đồ — nó vốn là một lưới vuông đã trải phẳng.
+    grid = [int(v) for v in (items[0]["g"] or [0, 0])][:2]
+    if len(grid) < 2 or min(grid) <= 0:
+        flat = next((it["m"][0] for it in items if it["m"]), None)
+        side = int(round(len(flat) ** 0.5)) if flat else 0
+        grid = [side, side] if side * side == (len(flat) if flat else -1) else [16, 16]
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    data = {"labels": labels, "grid": grid, "items": items}
+    data = {"labels": labels, "grid": grid, "items": items, "zip": zipmeta}
 
     P = ["<h1>Tra cứu ảnh theo finding × state</h1>",
          f'<p class="sub">{len(items):,} ảnh · lưới CAM '
          f'{grid[0]}×{grid[1]} · dựng {ts}</p>']
-    P.append(
-        '<div class="bwarn"><b>File này chứa dữ liệu bệnh nhân.</b> key_id là '
-        'định danh nghiên cứu MIMIC-CXR, và trang có cả ảnh X-quang lẫn text '
-        'báo cáo. Nó KHÔNG được đẩy lên GitHub — script đã ghi sẵn một '
-        '<code>.gitignore</code> cạnh nó. <code>index.html</code>, '
-        '<code>SUMMARY.md</code> và các file CSV trong cùng thư mục thì không '
-        'chứa gì trong số đó và vẫn commit được như thường.</div>')
+
+    if with_report:
+        P.append(
+            '<div class="bwarn"><b>File này chứa text báo cáo.</b> Ảnh X-quang '
+            'thì KHÔNG nằm trong file (chúng được lấy từ Hub lúc bấm, và Hub '
+            'vẫn gác quyền), nhưng phần <i>báo cáo sinh ra / tham chiếu</i> là '
+            'text bệnh án. Script đã ghi sẵn một <code>.gitignore</code> cạnh '
+            'file. Muốn commit trang này thì chạy lại với '
+            '<code>--browse-public</code>: nó bỏ hẳn hai khối text đó và không '
+            'ghi <code>.gitignore</code> nữa.</div>')
+    else:
+        P.append(
+            '<div class="bwarn ok"><b>Chế độ công khai.</b> Không text báo cáo, '
+            'không ảnh nhúng, không token — file này commit được. Ảnh chỉ hiện '
+            'khi người xem tự dán token HF của họ, và quyền xem do Hub gác.</div>')
+
+    P.append(f"""<div class="gate" id="gate">
+  <h3>Token Hugging Face để xem phim nền</h3>
+  <p class="note" style="margin:0">Ảnh nằm trong
+  <code>{esc(zipmeta.get("repo", ""))}/{esc(zipmeta.get("file", ""))}</code> và
+  được lấy <b>từng tấm một, đúng lúc bạn bấm</b> bằng một HTTP range request —
+  không tải trước, không nhúng vào file này. Token chỉ sống trong tab này
+  (<code>sessionStorage</code>); đóng tab là mất.</p>
+  <div class="row">
+    <input type="password" id="gtok" placeholder="hf_..." autocomplete="off"
+           spellcheck="false">
+    <select id="gmode" title="nguồn byte ảnh">
+      <option value="auto">nguồn: tự động</option>
+      <option value="direct">trực tiếp HF</option>
+      <option value="proxy">qua --serve</option>
+    </select>
+    <button class="go" id="ggo">Mở khoá</button>
+    <button id="gtest">Kiểm tra</button>
+    <button id="gclr">Quên token</button>
+  </div>
+  <div class="st" id="gst"></div>
+</div>""")
 
     note = []
     if stat["n_no_cam"]:
@@ -1982,15 +2343,10 @@ def dump_browse(items, stat, out, source, meta=None, quiet=False):
     if stat["truncated"]:
         note.append(f"chỉ nhúng {len(items):,} ảnh đầu; nới bằng "
                     f"<code>--browse-max</code>")
-    if not stat["roots"]:
-        note.append("chưa có <code>--images-root</code> nên trang không có phim "
-                    "nền — bản đồ vẫn hiện nhưng không đối chiếu được với giải phẫu")
-    elif stat["n_missing_img"]:
-        note.append(f"{stat['n_missing_img']:,} ảnh không tìm thấy file dưới "
-                    f"<code>--images-root</code>")
-    if stat["roots"] and not stat["pil"]:
-        note.append("thiếu Pillow (<code>pip install Pillow</code>) nên không "
-                    "tạo được thumbnail")
+    if stat["n_missing_img"]:
+        note.append(f"{stat['n_missing_img']:,} key không ghép được vào mục lục "
+                    f"<code>{esc(zipmeta.get('file', 'zip'))}</code> — ô của "
+                    f"chúng để trống thay vì hiện nhầm phim")
     if note:
         P.append('<p class="note">' + " · ".join(note) + "</p>")
 
@@ -2005,7 +2361,7 @@ def dump_browse(items, stat, out, source, meta=None, quiet=False):
 
     opts_f = '<option value="">— bất kỳ —</option>' + "".join(
         f'<option value="{i}">{esc(n)}</option>' for i, n in enumerate(labels))
-    P.append(f'''<div class="qbar">
+    P.append(f"""<div class="qbar">
   <div class="qf"><label for="qf">finding</label>
     <select id="qf">{opts_f}</select></div>
   <div class="qf"><label for="qs">state</label>
@@ -2018,10 +2374,12 @@ def dump_browse(items, stat, out, source, meta=None, quiet=False):
     <label style="font-size:13px;text-transform:none;letter-spacing:0;color:var(--fg)">
       <input type="checkbox" id="qo"> chỉ ảnh CÓ bản đồ cho bệnh này</label></div>
   <div class="qcount" id="qc"></div>
-</div>''')
+</div>""")
     P.append('<div class="blay"><div id="tiles" class="tiles"></div>'
              '<div id="det" class="det"></div></div>')
-    P.append(f'<footer>Nguồn: <code>{esc(source)}</code>. '
+    P.append(f'<footer>Nguồn số liệu: <code>{esc(source)}</code> · nguồn ảnh: '
+             f'<code>{esc(zipmeta.get("url", ""))}</code> (range request, '
+             f'{stat["n_indexed"]:,} key có mục lục). '
              f'Bản đồ là Grad-CAM của <code>sup_head</code> trên feature map '
              f'bậc conv cuối của Feat-Extractor (src/cam.py), chuẩn hoá theo '
              f'max của chính nó — đọc "vùng nào", không phải "mạnh cỡ nào"; '
@@ -2036,21 +2394,142 @@ def dump_browse(items, stat, out, source, meta=None, quiet=False):
             + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             + ";</script><script>" + BROWSE_JS + "</script></body></html>")
 
+    os.makedirs(out, exist_ok=True)
     path = os.path.join(out, "browse.html")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html)
-    # Hàng rào tự thi hành: file này không bao giờ vào git, kể cả khi người
-    # chạy script quên mất là nó có PHI.
-    with open(os.path.join(out, ".gitignore"), "w", encoding="utf-8") as fh:
-        fh.write("# browse.html có key_id, ảnh X-quang và text báo cáo\n"
-                 "# (xem scripts/probe_summary.py::dump_browse). Các file còn\n"
-                 "# lại trong thư mục này không chứa gì trong số đó.\n"
-                 "browse.html\n")
+
+    # `--serve` cần biết trỏ range request đi đâu, mà URL đó không nên phải gõ
+    # lại bằng tay. Không có bí mật nào trong file này.
+    with open(os.path.join(out, "browse_meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(zipmeta, fh, ensure_ascii=False, indent=2)
+
+    gi = os.path.join(out, ".gitignore")
+    if with_report:
+        # Hàng rào tự thi hành: file này không bao giờ vào git, kể cả khi người
+        # chạy script quên mất là nó có text bệnh án.
+        with open(gi, "w", encoding="utf-8") as fh:
+            fh.write("# browse.html có key_id và text báo cáo (xem\n"
+                     "# scripts/probe_summary.py::dump_browse). Chạy lại với\n"
+                     "# --browse-public để sinh bản commit được.\n"
+                     "browse.html\n")
+    elif os.path.isfile(gi):
+        os.remove(gi)                     # chế độ public: gỡ hàng rào cũ
+
     if not quiet:
         mb = os.path.getsize(path) / 1e6
-        print(f"✓ browse.html: {len(items):,} ảnh, {stat['n_thumb']:,} có phim "
-              f"nền, {mb:.1f}MB (KHÔNG commit — đã ghi .gitignore)")
+        tail = ("KHÔNG commit — đã ghi .gitignore" if with_report
+                else "commit được — không PHI, không token")
+        print(f"✓ browse.html: {len(items):,} ảnh, {stat['n_indexed']:,} có mục "
+              f"lục zip, {mb:.1f}MB ({tail})")
     return path
+
+
+# ═══════════════ server cục bộ: chuyển tiếp range request tới Hub ════════════
+#
+# Mở browse.html bằng `file://` thì origin của trang là "null", và
+# huggingface.co từ chối preflight của một range request kèm Authorization từ
+# origin đó. Không sửa được ở phía trang. Nên: một server tĩnh 60 dòng phục vụ
+# chính thư mục html/ và mở thêm đúng MỘT endpoint `_zip` chuyển tiếp nguyên
+# xi `Range` + `Authorization` của trình duyệt lên Hub. Cùng origin -> hết CORS.
+#
+# Token vẫn KHÔNG đi qua Python: nó do trình duyệt gửi kèm mỗi request và
+# server này chỉ chuyển tiếp, không đọc, không ghi ra đĩa, không log.
+
+def serve_browse(out_html, port=8765, quiet=False):
+    """Phục vụ out_html/ tại localhost và proxy `_zip` lên Hub."""
+    import http.server
+    import re
+    import urllib.error
+    import urllib.request
+
+    meta_path = os.path.join(out_html, "browse_meta.json")
+    if not os.path.isfile(meta_path):
+        sys.exit(f"✗ Không thấy {meta_path}. Chạy summary (có token) trước.")
+    with open(meta_path, encoding="utf-8") as fh:
+        zipmeta = json.load(fh)
+    target = zipmeta.get("url")
+    if not target:
+        sys.exit("✗ browse_meta.json không có url.")
+
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=out_html, **kw)
+
+        def log_message(self, *a):                # đừng in token/URL vào stdout
+            pass
+
+        def do_GET(self):                          # noqa: N802
+            if self.path.split("?")[0].rstrip("/") not in ("/_zip",):
+                return super().do_GET()
+            # send_error mã hoá latin-1, nên mọi thông điệp ở đây phải ASCII.
+            rng = self.headers.get("Range")
+            auth = self.headers.get("Authorization")
+            if not rng:
+                self.send_error(400, "Range header required")
+                return
+            req = urllib.request.Request(target)
+            req.add_header("Range", rng)
+            if auth:
+                req.add_header("Authorization", auth)
+            req.add_header("User-Agent", "rgexp-probe-summary")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as up:
+                    body = up.read()
+                    status = up.status
+                    crange = up.headers.get("Content-Range")
+                    # Upstream BỎ QUA Range (trả 200 + cả file) là trường hợp
+                    # nguy hiểm nhất: byte 0 cũng là một local header hợp lệ,
+                    # nên trang sẽ hiện NHẦM ẢNH mà không báo gì. Tự cắt lấy
+                    # đúng khoảng đã xin rồi mới trả về.
+                    if status == 200:
+                        m = re.match(r"bytes=(\d+)-(\d*)", rng)
+                        if not m:
+                            self.send_error(400, "bad Range")
+                            return
+                        lo = int(m.group(1))
+                        hi = int(m.group(2)) if m.group(2) else len(body) - 1
+                        total = len(body)
+                        body = body[lo:hi + 1]
+                        status, crange = 206, f"bytes {lo}-{hi}/{total}"
+                    self.send_response(status)
+                    self.send_header("Content-Type",
+                                     up.headers.get("Content-Type")
+                                     or "application/octet-stream")
+                    if crange:
+                        self.send_header("Content-Range", crange)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            except urllib.error.HTTPError as exc:
+                self.send_error(exc.code, f"upstream returned {exc.code}")
+            except Exception as exc:               # noqa: BLE001
+                self.send_error(502, f"upstream error: {type(exc).__name__}")
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), H)
+    if not quiet:
+        print(f"✓ http://127.0.0.1:{port}/browse.html")
+        print(f"  proxy _zip -> {target}")
+        print("  Ctrl-C để dừng. Token do TRÌNH DUYỆT gửi; server không giữ.")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n✓ dừng")
+    return 0
+
+
+def annotate_json(out, extra):
+    """Thêm vài khoá vào summary.json đã ghi. Không có gì bí mật đi vào đây:
+    chỉ TRẠNG THÁI của token ("none" / "có"), không phải token."""
+    path = os.path.join(out, "summary.json")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    doc.update(extra)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=2)
 
 
 # ══════════════════════════════════ vào/ra ═══════════════════════════════════
@@ -2059,7 +2538,7 @@ def main(argv=None):
         description="Gộp bản ghi probe trên HF thành báo cáo HTML/Markdown/CSV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Chạy lại sẽ GHI ĐÈ thư mục --out. Không có text báo cáo nào "
-               "được xuất ra (xem docstring đầu file).")
+               "được xuất ra ngoài browse.html (xem docstring đầu file).")
     ap.add_argument("--repo", help="dataset repo probe; mặc định lấy từ "
                                    "configs/default.yaml hoặc $RGEXP_PROBE_REPO")
     ap.add_argument("--revision", default=None, help="nhánh/commit trên Hub")
@@ -2068,21 +2547,47 @@ def main(argv=None):
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"mặc định {DEFAULT_OUT}")
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--limit", type=int, help="chỉ đọc N bản ghi đầu (thử nhanh)")
-    ap.add_argument("--token", default=None, help="HF token; mặc định $HF_TOKEN")
+    ap.add_argument("--token", default=None,
+                    help="HF token; mặc định $HF_TOKEN, không có thì HỎI trên "
+                         "terminal. Bỏ trống -> ghi 'none' và browse bị khoá")
+    ap.add_argument("--no-token-prompt", action="store_true",
+                    help="đừng hỏi token (CI/cron): không có $HF_TOKEN thì coi "
+                         "như 'none'")
     ap.add_argument("--no-html", action="store_true")
     ap.add_argument("--no-browse", action="store_true",
                     help="đừng dựng browse.html (trang tra cứu finding × state)")
-    ap.add_argument("--images-root", default=os.environ.get("RGEXP_IMAGES_ROOT"),
-                    help="thư mục ảnh X-quang, để browse.html có phim nền dưới "
-                         "heatmap; nhiều thư mục thì ngăn bằng os.pathsep. "
-                         "Mặc định $RGEXP_IMAGES_ROOT")
+    ap.add_argument("--browse-public", action="store_true",
+                    help="browse.html KHÔNG kèm text báo cáo -> commit được "
+                         "(và không ghi .gitignore)")
+    ap.add_argument("--image-repo", default=None,
+                    help="dataset repo chứa ảnh; mặc định run.data.repo trong "
+                         "config hoặc $RGEXP_IMAGE_REPO")
+    ap.add_argument("--image-revision", default=None,
+                    help="nhánh/commit của repo ảnh (mặc định main)")
     ap.add_argument("--browse-max", type=int, default=BROWSE_MAX,
-                    help=f"trần số ảnh nhúng vào browse.html (mặc định "
-                         f"{BROWSE_MAX}); mỗi ảnh ~15KB thumbnail + ~8KB bản đồ")
-    ap.add_argument("--thumb", type=int, default=320,
-                    help="cạnh dài thumbnail trong browse.html (mặc định 320px)")
+                    help=f"trần số ảnh đưa vào browse.html (mặc định "
+                         f"{BROWSE_MAX}); mỗi ảnh ~8KB bản đồ, ảnh KHÔNG nhúng")
+    ap.add_argument("--serve", nargs="?", const=8765, type=int, metavar="PORT",
+                    help="chỉ mở server cục bộ cho <out>/html (mặc định cổng "
+                         "8765) và proxy range request lên Hub — dùng khi mở "
+                         "bằng file:// bị CORS chặn")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
+
+    out_root = args.out
+    out_csv = os.path.join(out_root, "csv")
+    out_html = os.path.join(out_root, "html")
+
+    # `--serve` là một chế độ riêng: không gộp lại gì cả, chỉ phục vụ thứ đã có.
+    if args.serve is not None:
+        return serve_browse(out_html, args.serve, args.quiet)
+
+    # Hỏi token TRƯỚC mọi thứ: nó quyết định cả việc kéo records lẫn việc
+    # browse có được mở khoá hay không, nên hỏi muộn là bắt người dùng ngồi
+    # chờ xong một lượt tải rồi mới biết mình thiếu gì.
+    token, tok_src = ask_token(args.token,
+                               allow_prompt=not args.no_token_prompt,
+                               quiet=args.quiet)
 
     if args.local_dir:
         src_dir, source = args.local_dir, os.path.abspath(args.local_dir)
@@ -2093,7 +2598,6 @@ def main(argv=None):
         if not repo:
             sys.exit("✗ Không xác định được repo probe. Truyền --repo user/ten-repo "
                      "hoặc đặt $RGEXP_PROBE_REPO, hoặc dùng --local-dir.")
-        token = args.token or os.environ.get("HF_TOKEN")
         src_dir = fetch_records_dir(repo, token, args.revision, args.quiet)
         source = f"hf://datasets/{repo}/{RECORD_DIR}"
         if args.revision:
@@ -2109,20 +2613,72 @@ def main(argv=None):
               "ĐIỀU KIỆN (chỉ trên ảnh router đã chọn expert đó). Đặt "
               "run.probe_full_n rồi chạy lại mode=probe.")
 
-    os.makedirs(args.out, exist_ok=True)
-    dump_csvs(a, args.out)
-    dump_json(a, args.out, source)
-    dump_md(a, args.out, source)
+    # ── hai thư mục con: csv/ để máy đọc, html/ để người đọc ────────────────
+    os.makedirs(out_root, exist_ok=True)
+    os.makedirs(out_csv, exist_ok=True)
+    os.makedirs(out_html, exist_ok=True)
+    dump_csvs(a, out_csv)
+    dump_json(a, out_root, source)
+    dump_md(a, out_root, source)
     if not args.no_html:
-        dump_html(a, args.out, source)
-    if not args.no_browse:
-        items, bstat = collect_browse(recs, args.browse_max, args.images_root,
-                                      args.thumb, args.quiet)
-        if items:
-            dump_browse(items, bstat, args.out, source, quiet=args.quiet)
-        elif not args.quiet:
-            print("→ không bản ghi nào có khối `cam` — bỏ qua browse.html. "
-                  "Chạy lại mode=probe với run.cam_enabled: true.")
+        dump_html(a, out_html, source)
+
+    # ── browse: chỉ mở khoá khi token THẬT SỰ đọc được repo ảnh ─────────────
+    img_repo = resolve_image_repo(args.image_repo, args.config)
+    zip_name = resolve_image_zip(args.config)
+    img_rev = args.image_revision or "main"
+    browse_note, access_note, browse_path = None, None, None
+
+    if args.no_browse:
+        browse_note = "--no-browse"
+    elif token is None:
+        browse_note = ("hf_token=none — không hỏi/không điền, nên browse.html "
+                       "KHÔNG được dựng")
+    else:
+        ok, why, zsize = check_image_access(img_repo, args.image_revision,
+                                            zip_name, token, args.quiet)
+        access_note = why
+        if not ok:
+            browse_note = f"token không đọc được repo ảnh ({why}) — browse bị khoá"
+        else:
+            items, bstat = collect_browse(recs, args.browse_max, None,
+                                          not args.browse_public, args.quiet)
+            if not items:
+                browse_note = ("không bản ghi nào có khối `cam` — chạy lại "
+                               "mode=probe với run.cam_enabled: true")
+            else:
+                keys = [it["k"] for it in items if it["k"]]
+                zindex, _zn = build_zip_index(img_repo, args.image_revision,
+                                              zip_name, token, keys, args.quiet)
+                n_ok = 0
+                for it in items:
+                    it["z"] = zindex.get(it["k"])
+                    n_ok += 1 if it["z"] else 0
+                bstat["n_indexed"] = n_ok
+                bstat["n_missing_img"] = len(items) - n_ok
+                zipmeta = {
+                    "repo": img_repo, "revision": img_rev, "file": zip_name,
+                    "url": (f"https://huggingface.co/datasets/{img_repo}"
+                            f"/resolve/{img_rev}/{zip_name}"),
+                    "size": zsize,
+                }
+                browse_path = dump_browse(items, bstat, out_html, source,
+                                          zipmeta, not args.browse_public,
+                                          args.quiet)
+
+    annotate_json(out_root, {
+        "hf_token": TOKEN_NONE if token is None else "có",
+        "hf_token_source": tok_src,
+        "image_repo": img_repo,
+        "image_access": access_note or TOKEN_NONE,
+        "browse": ("html/browse.html" if browse_path else TOKEN_NONE),
+        "browse_locked_reason": browse_note,
+        "layout": {"csv": "csv/", "html": "html/",
+                   "md": "SUMMARY.md", "json": "summary.json"},
+    })
+
+    if browse_note and not args.quiet:
+        print(f"→ browse.html: {browse_note}")
 
     if a["absent"] and not args.quiet:
         for x in a["absent"]:
@@ -2138,9 +2694,15 @@ def main(argv=None):
               f"{fmt(a['clone_index'], 3)} ({lvl}) | balance "
               f"{fmt(a['balance'], 3)} | effective_experts "
               f"{fmt(a['effective_experts'], 2)}")
-        print(f"✓ ghi đè {os.path.relpath(args.out, ROOT)}/ : "
-              f"{'index.html, ' if not args.no_html else ''}SUMMARY.md, "
-              f"summary.json, {len(glob.glob(os.path.join(args.out, '*.csv')))} CSV")
+        rel = os.path.relpath(out_root, ROOT)
+        ncsv = len(glob.glob(os.path.join(out_csv, "*.csv")))
+        print(f"✓ ghi đè {rel}/ : SUMMARY.md, summary.json, "
+              f"csv/ ({ncsv} file), html/ ("
+              f"{'index.html' if not args.no_html else '—'}"
+              f"{', browse.html' if browse_path else ''})")
+        if browse_path:
+            print(f"  mở browse: python {os.path.relpath(__file__, os.getcwd())} "
+                  f"--serve   (hoặc mở thẳng file, cần trình duyệt cho phép CORS)")
     return 0
 
 

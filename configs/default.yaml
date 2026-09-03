@@ -215,7 +215,9 @@ run:
   # Chạy ở CẢ mode infer lẫn mode probe. Mỗi ảnh: 1 forward + n_det backward
   # trên nhánh router 39M tham số — vài % chi phí của một lần generate. Kết
   # quả ra `cam.npz` cạnh reports.csv (và nhúng vào bản ghi probe), rồi
-  # `scripts/probe_summary.py --browse` dựng trang tra cứu finding × state.
+  # `scripts/probe_summary.py` dựng trang tra cứu finding × state
+  # (reports/probe/html/browse.html) — cần một HF token đọc được
+  # run.data.repo, hỏi ngay đầu phiên; bỏ trống -> 'none', không dựng.
   cam_enabled: true
   cam_threshold: 0.5   # σ(sup_logit) ≥ đây thì bệnh đó "được phát hiện" -> có bản đồ
   cam_max_class: 6     # trần số bản đồ mỗi ảnh (xếp theo xác suất giảm dần)
@@ -250,7 +252,7 @@ run:
   # Số ảnh ĐẦU của tập test chạy ĐỦ n_expert expert (1+24 forward) thay vì
   # chỉ top-k (1+6 forward). Chỉ nhóm này cho hồ sơ VÔ ĐIỀU KIỆN — mọi
   # expert đo trên cùng một tập ảnh, kể cả expert router chưa từng chọn —
-  # nên bảng chuyên môn và ma trận cosine trong reports/probe/ dựng trên nó.
+  # nên bảng chuyên môn và ma trận cosine trong reports/probe/csv/ dựng trên nó.
   #   0    tắt, quay về hành vi cũ · null  MỌI ảnh chạy đủ 24 (chậm ~3.6×)
   probe_full_n: 300
   probe_commit_every: 1.0   # phút — CommitScheduler gom bao lâu thì commit

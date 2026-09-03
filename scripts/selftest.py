@@ -1057,7 +1057,10 @@ def test_cam():
     """[12] Grad-CAM nhánh router (src/cam.py) + trang tra cứu finding × state."""
     print("\n[12] Grad-CAM nhánh router (src/cam.py)")
     import json
+    import re
     import tempfile
+    import types
+    import zlib
 
     import numpy as np
 
@@ -1214,36 +1217,83 @@ def test_cam():
           f"{len(items)} items, n_no_cam={stat['n_no_cam']}")
     check("--browse-max là trần thật và tự khai đã cắt",
           ps.collect_browse(recs, limit=1, quiet=True)[1]["truncated"])
-    check("không có --images-root thì vẫn dựng được (chỉ mất phim nền)",
-          items[0]["img"] is None and stat["n_thumb"] == 0)
+    check("không có mục lục zip thì vẫn dựng được (chỉ mất phim nền)",
+          items[0]["z"] is None and stat["n_indexed"] == 0
+          and stat["n_missing_img"] == 2)
 
+    zmeta = {"repo": "u/r", "revision": "main", "file": "img_dir.zip",
+             "url": "https://huggingface.co/datasets/u/r/resolve/main/img_dir.zip"}
     with tempfile.TemporaryDirectory() as td:
-        path = ps.dump_browse(items, stat, td, "test://", quiet=True)
+        path = ps.dump_browse(items, stat, td, "test://", zmeta, quiet=True)
         html = open(path, encoding="utf-8").read()
-        check("browse.html tự chứa: dữ liệu nhúng thẳng, không fetch gì",
-              "__BROWSE__" in html and "fetch(" not in html
-              and html.count("<script>") == 2)
+        check("browse.html KHÔNG nhúng ảnh và KHÔNG mang token",
+              "data:image/jpeg;base64," not in html
+              and re.search(r"hf_[A-Za-z0-9]{16,}", html) is None
+              and '"z":null' in html.replace(" ", ""))
         check("cả 14 finding và 3 state đều có trong ô chọn truy vấn",
               all(f">{n}</option>" in html for n in names)
               and all(f'value="{x}">{x}<' in html for x in ("pos", "unc", "neg")))
+        check("browse_meta.json ghi đúng URL zip cho --serve",
+              json.load(open(os.path.join(td, "browse_meta.json"),
+                             encoding="utf-8"))["url"] == zmeta["url"])
         gi = os.path.join(td, ".gitignore")
-        check("dump_browse tự rào PHI: ghi .gitignore cho CHÍNH nó",
+        check("còn text báo cáo -> tự rào: ghi .gitignore cho CHÍNH nó",
               os.path.isfile(gi)
               and "browse.html" in open(gi, encoding="utf-8").read())
         check("browse.html mang key_id + text báo cáo (đúng vai của nó)",
               "p10/s1/a.jpg" in html and "Findings: y" in html)
 
-    # ── ghép đường dẫn ảnh ──────────────────────────────────────────────────
+        pub, pstat = ps.collect_browse(recs, limit=10, with_report=False,
+                                       quiet=True)
+        ps.dump_browse(pub, pstat, td, "test://", zmeta, with_report=False,
+                       quiet=True)
+        phtml = open(path, encoding="utf-8").read()
+        check("--browse-public: bỏ text báo cáo và GỠ .gitignore",
+              "Findings: y" not in phtml and not os.path.isfile(gi))
+
+    # ── chỉ mục byte trong zip: ghép key -> (offset, cỡ nén, phương pháp) ────
     with tempfile.TemporaryDirectory() as td:
-        os.makedirs(os.path.join(td, "p10", "s1"), exist_ok=True)
-        f = os.path.join(td, "p10", "s1", "a.jpg")
-        open(f, "wb").close()
-        check("ghép được đường dẫn khi img_rel khớp thẳng từ root",
-              ps.resolve_image("p10/s1/a.jpg", [td]) == f)
-        check("tự thử bỏ n đoạn đầu (image_rel_strip mà script không biết)",
-              ps.resolve_image("files/p10/s1/a.jpg", [td]) == f)
-        check("không ghép được thì trả None chứ không đoán bừa",
-              ps.resolve_image("p99/zz/none.jpg", [td]) is None)
+        import zipfile as _zf
+        zpath = os.path.join(td, "img_dir.zip")
+        blobs = {"p10/s1/a.jpg": b"\xff\xd8" + b"A" * 900 + b"\xff\xd9",
+                 "p10/s2/b.jpg": b"\xff\xd8" + b"B" * 900 + b"\xff\xd9"}
+        with _zf.ZipFile(zpath, "w", _zf.ZIP_DEFLATED) as z:
+            for k, v in blobs.items():
+                z.writestr("files/" + k, v)
+
+        class _FS:                       # HfFileSystem giả: mở file cục bộ
+            def __init__(self, token=None):
+                pass
+
+            def open(self, path, mode="rb", **kw):
+                return open(zpath, "rb")
+
+        real = sys.modules.get("huggingface_hub")
+        shim = types.ModuleType("huggingface_hub")
+        shim.HfFileSystem = _FS
+        sys.modules["huggingface_hub"] = shim
+        try:
+            idx, _note = ps.build_zip_index("u/r", None, "img_dir.zip", "tok",
+                                            list(blobs) + ["p99/zz/none.jpg"],
+                                            quiet=True)
+        finally:
+            if real is not None:
+                sys.modules["huggingface_hub"] = real
+            else:
+                del sys.modules["huggingface_hub"]
+
+        check("key không có trong zip thì KHÔNG vào mục lục (không đoán bừa)",
+              set(idx) == set(blobs))
+        raw = open(zpath, "rb").read()
+        ok = True
+        for k, want in blobs.items():
+            off, csz, mth, _nl = idx[k]
+            n = int.from_bytes(raw[off + 26:off + 28], "little")
+            e = int.from_bytes(raw[off + 28:off + 30], "little")
+            body = raw[off + 30 + n + e: off + 30 + n + e + csz]
+            got = zlib.decompress(body, -15) if mth == 8 else body
+            ok = ok and raw[off:off + 4] == b"PK\x03\x04" and got == want
+        check("offset/cỡ nén trong mục lục giải ra ĐÚNG byte của ảnh gốc", ok)
 
 
 def _raises(fn):
