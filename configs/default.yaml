@@ -18,7 +18,8 @@
 #   3. EXPERT CHỈ GẮN VÀO 4 MA TRẬN ATTENTION (q, k, v, o). Không đụng vào
 #      MLP của decoder — một expert còn 4.68M param thay vì 15.9M.
 #
-# Giữ nguyên từ bản trước: MỘT phase multi-task duy nhất; cân bằng tải bằng
+# HAI PHASE tách hẳn (run.phase: 1 = pretrain extractor, 2 = multi-task đầy
+# đủ — xem khối `run` ngay dưới). Trong phase 2: cân bằng tải bằng
 # ĐÚNG một số hạng aux trong Total_Loss (Switch, sàn 1.0); lịch Gumbel và
 # lịch LR đếm bằng MẪU; lịch train KHÔNG CÓ ĐÍCH (chạy tuần tự tập train,
 # hết thì epoch += 1, mãi mãi, tới khi Ctrl-C hoặc hết giờ máy); lần chạy
@@ -165,6 +166,23 @@ models:
       min_pixels: 3136        # 56²  — sàn mặc định, chặn việc phóng to ngược
       max_pixels: 262144      # 512² — trần, chặn ảnh nguồn to hơn dự kiến
 run:
+  # ══════════════════════════ HAI PHASE ═══════════════════════════════════
+  # 1 = PRETRAIN Feat-Extractor. Chỉ ảnh → extractor → qformer(query 0) →
+  #     sup_head → ASL. KHÔNG nạp Gemma, KHÔNG có expert, KHÔNG có CE.
+  #     Đóng băng: route_head, qformer.query[1] (hàng query của nhánh route)
+  #     và toàn bộ nhánh finetuning (nó không được dựng ra ở phase này).
+  #     Checkpoint đi repo RIÊNG (p1_repo) — nội dung là extractor pretrain,
+  #     KHÔNG phải MoE. Phase này không sinh được text nên mode mặc định
+  #     'both' tự đổi thành 'train' (có báo); ghi rõ test/probe thì NỔ.
+  # 2 = lịch multi-task đầy đủ (MẶC ĐỊNH): router + E expert QDoRA + decoder
+  #     cùng nhận gradient từ step đầu, không đóng băng gì. Lần chạy đầu của
+  #     một ô sẽ nạp extractor pretrain của phase 1 làm KHỞI TẠO nếu tìm
+  #     thấy (local ckpt/<tag>/p1/last hoặc p1_repo); không thấy thì cảnh báo
+  #     và train router từ số 0 như bản một-phase trước đây.
+  # Hai phase là HAI LẦN GỌI riêng, không có lịch tự chuyển tiếp:
+  #     python -m src.train --phase 1     # dừng bằng Ctrl-C
+  #     python -m src.train --phase 2
+  phase: 2
   mode: both                 # train | test | both | probe
   # both = train cho tới khi bị dừng tay (Ctrl-C) rồi mới chạy infer. Vì lịch
   # train không có đích, "train xong" chỉ xảy ra khi người dùng dừng: Ctrl-C
@@ -423,6 +441,28 @@ run:
 
   eval_every: 10
   eval_max_batches: 20
+
+  # ── PHASE 1: batch / lr / lịch LR riêng ──────────────────────────────────
+  # Phase 1 không nạp 4B tham số Gemma, cũng không giữ E bản delta QDoRA:
+  # VRAM đỉnh của nó là router (~67M param) + activation của 5 bậc conv trên
+  # ảnh 512². Dùng lại train_bs của phase 2 (1-2, bị decoder ép xuống) là bỏ
+  # phí 10-20× thông lượng, nên nó có batch riêng. Effective batch giữ đúng
+  # 32 như phase 2 để hai đường loss còn so được với nhau.
+  # STAGE 0 của phase 1 in VRAM đỉnh và gợi ý số lớn hơn nếu còn dư.
+  p1_train_bs: 8
+  p1_grad_accum: 4
+  # null = dùng lại giá trị tương ứng của phase 2. lr mặc định là lr_router
+  # vì đó CHÍNH LÀ mạng đang được train — ở đây không có expert nào để phải
+  # chia hai lr.
+  p1_lr: null               # null -> lr_router (3e-4)
+  p1_cycle_samples: null    # null -> cycle_samples
+  p1_warmup_samples: null   # null -> warmup_samples
+  # Repo checkpoint của phase 1. null -> "<owner>/<arch.tag>_Extractor-31M"
+  # (31M = số tham số THẬT của Feat-Extractor, xem router.extractor_params).
+  # Tách khỏi hub_repo có chủ ý: một bộ extractor pretrain dùng lại được cho
+  # nhiều lần chạy phase 2 khác nhau, còn ckpt phase 2 gắn chặt với đúng một
+  # cấu hình MoE (n_expert/top_k/model nền).
+  p1_repo: null
 
   # ── Checkpoint ───────────────────────────────────────────────────────────
   # KHÔNG có dừng sớm: lịch train không có đích thì "không cải thiện 3 lần"

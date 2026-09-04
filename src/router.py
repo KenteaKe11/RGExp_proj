@@ -125,6 +125,12 @@ NĂM CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
    vẫn thấp thì hạ `w_sup` — đó là dấu hiệu thân nhánh đã bị ASL chiếm.
    Hai head dùng MLP có skip 2560 → 1024 → 2560 (GELU) rồi chiếu ra.
 
+   HAI QUERY LÀ THỨ CHO PHÉP TÁCH PHASE. Phase 1 (src/phase1.py) chỉ chạy
+   `forward_sup`: query 0 → sup_head → ASL. Query 1 và route_head không nằm
+   trong đồ thị nên không nhận gradient, decoder thì không được nạp. Cái
+   phase đó để lại là một FEAT-EXTRACTOR ĐÃ BIẾT NHÌN PHIM, và phase 2 (lịch
+   multi-task đầy đủ) nạp nó làm khởi tạo thay vì bắt đầu từ số 0.
+
 ──────────────────────────────────────────────────────────────────────────────
 CÂN BẰNG TẢI: MỘT SỐ HẠNG AUX LOSS
 
@@ -678,6 +684,70 @@ class RouterNet(nn.Module):
         q = self.qformer(feat)                            # [B, 2, 2560]
         return self.sup_head(q[:, 0]).float(), fmap       # [B, 14]
 
+    # ── đường NGẮN của PHASE 1: chỉ nhánh supervised ────────────────────────
+    def forward_sup(self, pixel_values):
+        """pixel_values → sup_logits [B, 14]. KHÔNG chạy route_head.
+
+        Phase 1 (src/phase1.py) chỉ có MỘT loss là ASL, và trong phiên đó
+        decoder không tồn tại. Đi qua `forward` đầy đủ thì route_logit,
+        softmax, Gumbel, top-k và số hạng aux đều được tính rồi vứt đi — vô
+        hại về số học nhưng làm mờ đúng cái đang được dạy, và `stats` sẽ báo
+        một `balance` của một tuyến đường không ai dùng.
+
+        Hệ quả quan trọng, và là CHỦ Ý: `qformer.query[1]` (câu hỏi của nhánh
+        route) vẫn được cross-attn đọc — hai query đi chung MỘT lần attention
+        — nhưng đầu ra của nó không vào loss nào, nên autograd trả gradient
+        ĐÚNG BẰNG 0 cho hàng đó. Hàng route bị đóng băng bởi hình học của đồ
+        thị chứ không bởi một cái hook, và đó là kiểu đóng băng chắc chắn
+        nhất. Chỗ duy nhất còn động vào được nó là WEIGHT DECAY (AdamW nắn
+        tham số kể cả khi grad = 0), nên phase1.py xếp `qformer.query` vào
+        một param group riêng với wd = 0 — xem `pretrain_param_groups`.
+        """
+        feat = self.extractor(pixel_values)               # [B, 256, 2560]
+        q = self.qformer(feat)                            # [B, 2, 2560]
+        return self.sup_head(q[:, 0]).float()             # [B, 14]
+
+    # ── PHASE 1: đóng băng nhánh route ──────────────────────────────────────
+    def freeze_route_branch(self, log=None):
+        """Đặt requires_grad = False cho `route_head`. Trả (n_train, n_frozen).
+
+        Chỉ route_head — `qformer.query[1]` KHÔNG bị đụng tới ở đây, vì
+        requires_grad là thuộc tính của CẢ tensor `query` [2, dim] và hàng 0
+        vẫn phải học. Hàng 1 được giữ nguyên bằng hai thứ khác cộng lại:
+        `forward_sup` không cho nó vào loss (grad = 0) và param group của nó
+        có wd = 0. `pretrain_check` kiểm lại điều đó bằng số thật sau một
+        optimizer step.
+        """
+        for p in self.route_head.parameters():
+            p.requires_grad_(False)
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_frozen = sum(p.numel() for p in self.parameters()
+                       if not p.requires_grad)
+        if log:
+            log("p1", f"đóng băng route_head: {n_frozen:,} param | còn "
+                      f"{n_train:,} param train (extractor + qformer + "
+                      f"sup_head). query[1] của route giữ nguyên bằng "
+                      f"gradient = 0 (forward_sup) + wd = 0.")
+        return n_train, n_frozen
+
+    def pretrain_param_groups(self, lr, weight_decay):
+        """Hai param group cho phase 1, tách RA VÌ weight decay.
+
+        `qformer.query` nằm riêng với wd = 0. Nếu nó nằm chung nhóm wd = 0.01
+        thì AdamW co hàng 1 (route) lại mỗi step dù gradient bằng 0 — sau vài
+        nghìn step hàng đó teo dần về 0 và cái "pretrain" bàn giao sang phase
+        2 sẽ mang theo một query route đã hỏng, một cách âm thầm.
+
+        Nhân tiện: query là tham số kiểu embedding, wd = 0 cũng là quy ước
+        thông thường cho nó, nên hàng 0 không mất gì.
+        """
+        q = [self.qformer.query]
+        qids = {id(p) for p in q}
+        rest = [p for p in self.parameters()
+                if p.requires_grad and id(p) not in qids]
+        return [{"params": q, "lr": lr, "weight_decay": 0.0},
+                {"params": rest, "lr": lr, "weight_decay": float(weight_decay)}]
+
     def forward(self, pixel_values, mask=None):
         """pixel_values [B, 3, H, W] — ảnh đã qua processor của Gemma.
 
@@ -832,6 +902,18 @@ def router_params(n_expert, dim=D_MODEL, d_decoder=D_DECODER,
     return {"extractor": extractor, "qformer": qformer, "sup_head": sup,
             "route_head": route,
             "total": extractor + qformer + sup + route}
+
+
+def extractor_params(dim=D_MODEL, n_block=N_BLOCK, img_size=IMG_SIZE):
+    """Số tham số của RIÊNG Feat-Extractor — 30.68M ở cấu hình chốt.
+
+    Dùng để ĐẶT TÊN repo checkpoint của phase 1
+    (`<tag>_Extractor-31M`, src/config.py): tên repo phải nói ngay cái bên
+    trong nó là bao nhiêu tham số, vì hai lần chạy khác hình học sinh ra hai
+    bộ trọng số không nạp lẫn được.
+    """
+    return router_params(1, dim=dim, n_block=n_block,
+                         img_size=img_size)["extractor"]
 
 
 # ── Một expert QDoRA r8 trên 4 ma trận attn của gemma-3-4b-it ────────────────

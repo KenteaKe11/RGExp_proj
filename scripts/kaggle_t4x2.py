@@ -1,5 +1,5 @@
 # ═════════════════════════════════════════════════════════════════════════════
-# RGExp — Kaggle T4 ×2 (sm75) | fp32 · một phase multi-task · lịch train VÔ HẠN
+# RGExp — Kaggle T4 ×2 (sm75) | fp32 · HAI PHASE tách rời · lịch train VÔ HẠN
 #
 #   Settings → Accelerator = GPU T4 x2   |   Internet = ON
 #   Add-ons → Secrets      = HF_TOKEN (bắt buộc)
@@ -11,8 +11,18 @@
 # GPU đích, không phải nhớ bản nào đang đúng.
 #
 # ── REPO ĐÃ ĐỔI BỐN THỨ LỚN — CELL NÀY VIẾT LẠI THEO ────────────────────────
-# 1. MỘT PHASE multi-task. Không còn PHASE / PHASE_SAMPLES / only_phase / cờ
-#    --phase. Router + 12 expert + decoder cùng chạy từ step đầu.
+# 1. HAI PHASE TÁCH HẲN, chọn bằng PHASE ở khối cấu hình dưới:
+#      PHASE = 1  pretrain Feat-Extractor: ảnh → extractor → qformer(query 0)
+#                 → sup_head → ASL. KHÔNG nạp Gemma (VRAM ~1-2GB, batch lớn,
+#                 mỗi step rẻ), đóng băng route_head + query[1] + cả nhánh
+#                 finetuning. Ckpt đi REPO RIÊNG `<tag>_Extractor-31M`.
+#      PHASE = 2  (mặc định) multi-task đầy đủ: router + 12 expert + decoder
+#                 cùng chạy từ step đầu, không đóng băng gì. Lần chạy đầu tự
+#                 nạp extractor pretrain của phase 1 làm KHỞI TẠO nếu tìm
+#                 thấy trên repo đó.
+#    Đây KHÔNG phải bản hai-phase cũ (PHASE_SAMPLES / only_phase / hai phase
+#    nối nhau trong một lần gọi): mỗi phase là MỘT PHIÊN RIÊNG, không phase
+#    nào có đích, và phase 1 thậm chí không dựng ra decoder.
 # 2. LỊCH TRAIN KHÔNG CÓ ĐÍCH. Không có trần số mẫu, KHÔNG CÓ DỪNG SỚM. Chạy
 #    tuần tự tập train, hết thì epoch += 1 và chạy tiếp. Trên Kaggle đó chính
 #    là điều mình muốn: phiên bị cắt sau ~11h, phiên sau resume từ Hub và đi
@@ -98,6 +108,14 @@ import time
 
 REPO          = "https://github.com/KenteaKe11/RGExp_proj"
 BRANCH        = "main"
+PHASE         = 2         # 1 = pretrain Feat-Extractor (ASL, KHÔNG nạp Gemma,
+                          #     đóng băng route_head + query[1]); ckpt sang
+                          #     repo riêng <tag>_Extractor-31M. Rẻ hơn phase 2
+                          #     hàng chục lần — chạy nó TRƯỚC, vài phiên là đủ.
+                          # 2 = multi-task đầy đủ (mặc định). Lần chạy đầu tự
+                          #     nạp extractor pretrain làm khởi tạo.
+                          # PHASE=1 buộc MODE="train" (không có decoder để
+                          #     sinh text, nên không có gì để chấm).
 MODE          = "train"   # "train" = chỉ train (mặc định trên Kaggle: phiên
                           #   nào cũng bị cắt nên không bao giờ tới khâu infer)
                           # "test"  = không train, nạp last/ từ Hub rồi chấm
@@ -110,6 +128,14 @@ DRY_RUN       = False     # True = dừng sau STAGE 0 (đo tốc độ trước 
 # ── Batch ────────────────────────────────────────────────────────────────────
 TRAIN_BS      = 1         # 2 an toàn ở 9.1/15GB. 4 có thể OOM — thử bằng dry-run.
 GRAD_ACCUM    = 32        # effective = TRAIN_BS × GRAD_ACCUM
+
+# Batch của PHASE 1 (chỉ dùng khi PHASE = 1). Phase đó không nạp Gemma nên
+# 15GB gần như trống: dùng lại TRAIN_BS=1 ở trên là bỏ phí hàng chục lần
+# thông lượng. Giữ effective = 32 cho khớp phase 2. STAGE 0 của phase 1 in
+# VRAM đỉnh và gợi ý số lớn hơn nếu còn dư.
+P1_TRAIN_BS   = 8
+P1_GRAD_ACCUM = 4
+P1_LR         = None      # None = lr_router của repo (3e-4)
 
 # ── Ước tính thời gian (chỉ để IN RA, không đổi hành vi) ─────────────────────
 SAMPLES_PER_S = 0.05      # sửa theo mốc dry-run của CHÍNH máy này
@@ -375,7 +401,9 @@ _MARKS = [
     ("src/model.py", "add_router_slots", "256 token router ghép vào decoder"),
     ("src/losses.py", "def aux_loss", "cân bằng tải bằng aux loss (bỏ bias)"),
     ("src/optim.py", "đầu MỌI cycle", "warmup ở đầu mọi cycle LR"),
-    ("src/train.py", "epoch_samples", "một phase multi-task, lịch không có đích"),
+    ("src/train.py", "epoch_samples", "lịch train không có đích"),
+    ("src/phase1.py", "freeze_route_branch", "PHASE 1 — pretrain extractor"),
+    ("src/router.py", "def forward_sup", "đường sup-only của phase 1"),
 ]
 _bad = []
 for _f, _needle, _what in _MARKS:
@@ -468,6 +496,19 @@ cfg["run"]["grad_ckpt"] = True
 cfg["run"]["num_workers"] = 2                    # Kaggle chỉ ~4 vCPU
 cfg["run"]["push_to_hub"] = True                 # scratch mất sau session
 cfg["run"]["mode"] = MODE
+cfg["run"]["phase"] = int(PHASE)
+assert PHASE in (1, 2), f"PHASE phải là 1 hoặc 2, nhận {PHASE}"
+if PHASE == 1:
+    # Phase 1 không có decoder -> không sinh được text -> mode 'test'/'both'
+    # không có gì để chấm. src/config.py sẽ nổ nếu để nguyên; sửa ngay ở đây
+    # cho khỏi phải chạy lại cell.
+    if MODE != "train":
+        print(f"→ PHASE=1: ép MODE '{MODE}' → 'train' (phase này không sinh text)")
+        cfg["run"]["mode"] = "train"
+    cfg["run"]["p1_train_bs"] = P1_TRAIN_BS
+    cfg["run"]["p1_grad_accum"] = P1_GRAD_ACCUM
+    if P1_LR is not None:
+        cfg["run"]["p1_lr"] = P1_LR
 # KHÔNG đặt cfg["run"]["resume"]: khoá đó không còn tồn tại. src/train.py LUÔN
 # resume từ bản đi xa nhất giữa ckpt cục bộ và Hub — đó chính là cách nối phiên.
 cfg["remote"].update(enabled="on", volume=TEMP, workdir=ROOT,
@@ -581,6 +622,13 @@ if MODE == "both":
                  "sau khi train bị dừng bằng Ctrl-C, mà phiên Kaggle bị GIẾT "
                  "chứ không Ctrl-C. Dùng MODE='train', rồi một phiên riêng "
                  "MODE='test'.")
+if PHASE == 1 and (TRAIN_BS, GRAD_ACCUM) != (P1_TRAIN_BS, P1_GRAD_ACCUM):
+    print(f"→ PHASE 1: batch {P1_TRAIN_BS}×{P1_GRAD_ACCUM}="
+          f"{P1_TRAIN_BS*P1_GRAD_ACCUM} (TRAIN_BS/GRAD_ACCUM ở trên là của "
+          f"phase 2, không dùng ở phiên này)")
+if PHASE == 1 and HUB_SYNC:
+    warns.append("PHASE=1 không có cơ chế bàn giao nhiều máy: HUB_SYNC bị bỏ "
+                 "qua ở phase này, máy push sau ghi đè máy push trước.")
 if MAX_GRAD_NORM > 10:
     warns.append(f"MAX_GRAD_NORM={MAX_GRAD_NORM} gần như không cắt gì — router "
                  f"train từ số 0 rất dễ bắn một bước dài vào NaN.")
@@ -640,7 +688,8 @@ if PREFLIGHT:
 # LỚP 2 chống nghẹt log: lọc ở phía NHẬN. Chắc ăn hơn lớp 1 vì không phụ
 # thuộc thư viện có tôn trọng biến môi trường hay không.
 base = [sys.executable, "-u", "-m", "src.train", "--config", CONFIG]
-# Không còn cờ --phase: chỉ có một lịch train.
+# PHASE đã nằm trong yaml (cfg["run"]["phase"]) nên không cần cờ --phase ở đây;
+# cờ đó vẫn tồn tại cho ai chạy tay: `python -m src.train --phase 1`.
 
 
 def run_filtered(cmd):

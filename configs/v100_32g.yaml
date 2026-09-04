@@ -90,3 +90,12 @@ run:
   # hơn (từ khi bỏ SWA thì đó là cách duy nhất còn lại để chọn điểm dừng).
   cycle_samples: 1600
   warmup_samples: 256          # 16% cycle, bội của effective batch 32
+
+  # ── PHASE 1 (pretrain extractor) trên chính máy này ──────────────────────
+  # Phase 1 không nạp Gemma: 32GB fp32 còn gần như trống, nên batch của nó
+  # không liên quan gì tới train_bs ở trên. 16×2 giữ effective batch 32.
+  # Chạy:  python -m src.train --config configs/v100_32g.yaml --phase 1
+  # Nếu STAGE 0 của phase 1 báo VRAM đỉnh dưới 50% thì nâng p1_train_bs lên
+  # (32×1) — nó là phase rẻ nhất trong hai phase, đừng để card nằm không.
+  p1_train_bs: 16
+  p1_grad_accum: 2

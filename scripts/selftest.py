@@ -2,7 +2,7 @@
 
     python scripts/selftest.py
 
-Mười một thứ được kiểm:
+Mười hai thứ được kiểm (thứ 12: phase 1 — cái gì học, cái gì đứng yên):
   1. bảng tham số của nhánh router khớp tài liệu thiết kế;
   2. router forward ra đúng shape, gate thưa đúng top-k và tổng = 1;
   3. mask thật sự che token target/padding (đổi phần bị che không đổi kết quả);
@@ -1510,6 +1510,89 @@ def test_calib():
           states_of([0.1, 0.6, 0.9], 0.5, 0.2) == ["neg", "pos", "pos"])
 
 
+def test_phase1():
+    """PHASE 1 — cái gì học, cái gì đứng yên.
+
+    Đây là test quan trọng nhất của phase 1, vì "đã đóng băng chưa" là câu
+    hỏi KHÔNG trả lời được bằng cách đọc code: nó phụ thuộc cả đồ thị
+    autograd (route_head có nằm trong loss không) LẪN optimizer (weight decay
+    có nắn tham số grad = 0 không). Chỉ có chạy thật rồi so từng bit mới trả
+    lời được.
+    """
+    print("\n[12] phase 1 — pretrain extractor, đóng băng nhánh route")
+    torch.manual_seed(0)
+    B, E, K = 2, 12, 4
+    net = RouterNet(E, K)
+    net.train()
+    n_train, n_frozen = net.freeze_route_branch()
+    check("freeze_route_branch: route_head hết requires_grad",
+          all(not p.requires_grad for p in net.route_head.parameters())
+          and n_frozen == sum(p.numel() for p in net.route_head.parameters()),
+          f"train {n_train:,} / đóng băng {n_frozen:,}")
+    check("extractor + qformer + sup_head VẪN train",
+          all(p.requires_grad for m in (net.extractor, net.qformer,
+                                        net.sup_head)
+              for p in m.parameters()))
+
+    x = _fake_cxr(B)
+    logits = net.forward_sup(x)
+    check("forward_sup ra đúng [B, 14]", tuple(logits.shape) == (B, 14),
+          str(tuple(logits.shape)))
+    logits.sum().backward()
+    g_ex = sum(float(p.grad.abs().sum()) for p in net.extractor.parameters()
+               if p.grad is not None)
+    g_sup = sum(float(p.grad.abs().sum()) for p in net.sup_head.parameters()
+                if p.grad is not None)
+    g_route = sum(float(p.grad.abs().sum()) for p in net.route_head.parameters()
+                  if p.grad is not None)
+    check("gradient chảy về extractor và sup_head", g_ex > 0 and g_sup > 0,
+          f"extractor {g_ex:.3e} sup_head {g_sup:.3e}")
+    check("route_head KHÔNG có gradient nào", g_route == 0.0)
+    q_grad = net.qformer.query.grad
+    check("query[0] có gradient, query[1] (route) BẰNG 0",
+          float(q_grad[0].abs().sum()) > 0
+          and float(q_grad[1].abs().sum()) == 0.0,
+          f"q0 {float(q_grad[0].abs().sum()):.3e} "
+          f"q1 {float(q_grad[1].abs().sum()):.3e}")
+
+    # ── Weight decay: cái bẫy thật sự ───────────────────────────────────────
+    # AdamW nắn tham số kể cả khi grad = 0 (decoupled weight decay), nên một
+    # param group wd > 0 sẽ làm query[1] teo dần suốt phase 1 mà không ai
+    # thấy. `pretrain_param_groups` tách nó ra với wd = 0 vì đúng lý do này.
+    from torch.optim import AdamW
+    groups = net.pretrain_param_groups(1e-3, 0.5)   # wd CỐ TÌNH lớn
+    check("pretrain_param_groups: nhóm chứa query có wd = 0",
+          groups[0]["weight_decay"] == 0.0
+          and groups[0]["params"][0] is net.qformer.query)
+    check("pretrain_param_groups KHÔNG nhận param đã đóng băng",
+          all(p.requires_grad for g in groups for p in g["params"]))
+    opt = AdamW(groups)
+    before_q1 = net.qformer.query.detach()[1].clone()
+    before_route = [p.detach().clone() for p in net.route_head.parameters()]
+    before_q0 = net.qformer.query.detach()[0].clone()
+    opt.step()
+    q_now = net.qformer.query.detach()
+    d_q1 = float((q_now[1] - before_q1).abs().max())
+    d_q0 = float((q_now[0] - before_q0).abs().max())
+    d_route = max(float((a.detach() - b).abs().max()) for a, b in
+                  zip(net.route_head.parameters(), before_route))
+    check("sau optimizer.step: query[1] KHÔNG nhúc nhích (wd = 0)",
+          d_q1 == 0.0, f"Δ={d_q1:.3e}")
+    check("sau optimizer.step: route_head KHÔNG nhúc nhích", d_route == 0.0,
+          f"Δ={d_route:.3e}")
+    check("sau optimizer.step: query[0] CÓ đổi (nó đang được train)",
+          d_q0 > 0, f"Δ={d_q0:.3e}")
+
+    # ── forward đầy đủ vẫn nguyên vẹn: phase 2 dùng lại chính mạng này ──────
+    net.zero_grad(set_to_none=True)
+    sup2, gate, prefix, stats = net(x)
+    check("forward đầy đủ (phase 2) vẫn chạy trên mạng đã đóng băng route",
+          tuple(sup2.shape) == (B, 14) and tuple(gate.shape) == (B, E)
+          and int((gate > 0).sum(-1).float().mean()) == K)
+    check("sup_logits của forward_sup và forward là MỘT",
+          torch.allclose(net.forward_sup(x), net(x)[0].float(), atol=1e-5))
+
+
 def _raises(fn):
     try:
         fn()
@@ -1545,5 +1628,6 @@ if __name__ == "__main__":
     test_probe_summary()
     test_cam()
     test_calib()
+    test_phase1()
     print("\n" + ("✗ HỎNG: " + ", ".join(FAIL) if FAIL else "✓ tất cả OK"))
     raise SystemExit(1 if FAIL else 0)

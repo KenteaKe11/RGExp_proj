@@ -319,12 +319,23 @@ def encode_only(model, bridge, batch):
 
 
 # ═══════════════════════════════ dựng model ══════════════════════════════════
-def build_model(cfg, hf_token, log):
-    from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model
+def build_processor(cfg, hf_token, log=None):
+    """Processor của model nền — KHÔNG nạp một tham số model nào.
 
-    f, r = cfg.fixed, cfg.run
+    Tách khỏi `build_model` vì PHASE 1 (src/phase1.py) cần đúng và chỉ đúng
+    thứ này: nhánh router đọc `pixel_values`, mà `pixel_values` là do
+    processor sinh ra. Phase 1 không có decoder, nên nạp 4B tham số Gemma chỉ
+    để lấy một image processor là vô lý.
 
+    Điều KHÔNG được phép khác nhau giữa hai phase: cách ảnh biến thành tensor.
+    Extractor pretrain ở phase 1 rồi đem sang phase 2 mà dải giá trị hay cỡ
+    ảnh lệch đi thì trọng số nạp vào vẫn khớp shape nhưng nhìn một phân phối
+    khác — hỏng âm thầm, không có assert nào bắt được. Vì thế cả hai phase
+    gọi CHUNG hàm này, không ai dựng processor riêng.
+    """
+    from transformers import AutoProcessor
+
+    f = cfg.fixed
     proc_kwargs = dict(getattr(f, "processor_kwargs", None) or {})
     processor = AutoProcessor.from_pretrained(f.model_id, token=hf_token,
                                               **proc_kwargs)
@@ -340,9 +351,20 @@ def build_model(cfg, hf_token, log):
         shown = {k: getattr(ip, k) for k in
                  ("size", "min_pixels", "max_pixels", "patch_size",
                   "merge_size", "do_resize") if hasattr(ip, k)}
-        log("img", f"processor {type(ip).__name__} | "
-                   f"đầu vào {f.image_size_model or 'gốc (không resize)'} | "
-                   f"{shown}")
+        if log:
+            log("img", f"processor {type(ip).__name__} | "
+                       f"đầu vào {f.image_size_model or 'gốc (không resize)'} "
+                       f"| {shown}")
+    return processor
+
+
+def build_model(cfg, hf_token, log):
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from peft import LoraConfig, get_peft_model
+
+    f, r = cfg.fixed, cfg.run
+
+    processor = build_processor(cfg, hf_token, log)
     tokenizer = processor.tokenizer
 
     # QDoRA: base LUÔN 4-bit (run.quant khoá cứng trong config).
@@ -647,6 +669,41 @@ def build_collate(processor, tokenizer, cfg, prompt_str, log=None,
 
         # SAU cùng: chèn chỗ cho prefix của router (xem `add_router_slots`).
         return add_router_slots(inp, n_slot, tokenizer.pad_token_id)
+
+    return collate
+
+
+def build_image_collate(processor, cfg, log=None):
+    """Collate của PHASE 1: chỉ `pixel_values` + `sup_labels`.
+
+    Không tokenize gì cả. Phase 1 không có decoder nên `input_ids`,
+    `attention_mask`, `labels`, `router_mask` và 256 vị trí giữ chỗ đều vô
+    nghĩa — dựng chúng chỉ tốn CPU của worker, mà CPU là thứ hiếm trên đúng
+    những máy hay chạy phase này (Kaggle: 2-4 vCPU).
+
+    Đi thẳng qua `processor.image_processor` chứ không qua `processor(...)`:
+    processor đa phương thức của Gemma đòi cả text, và text ở đây không tồn
+    tại. Đường ảnh thì GIỐNG HỆT phase 2 — cùng một object image_processor đã
+    được `build_processor` chỉnh (pan_and_scan tắt, processor_kwargs áp vào),
+    nên `pixel_values` của hai phase là cùng một dải giá trị và cùng cỡ.
+    """
+    f = cfg.fixed
+    ip = getattr(processor, "image_processor", None)
+    assert ip is not None, (
+        "processor không có image_processor — phase 1 chỉ đọc ảnh, không có "
+        "đường nào khác để dựng pixel_values.")
+    if log:
+        log("p1", "collate phase 1: chỉ pixel_values + sup_labels (không "
+                  "tokenize, không chèn 256 vị trí giữ chỗ)")
+
+    def collate(batch):
+        images, _targets, ys = zip(*batch)
+        out = {"pixel_values": ip(images=list(images),
+                                  return_tensors="pt")["pixel_values"]}
+        if ys[0] is not None:
+            import numpy as np
+            out["sup_labels"] = torch.from_numpy(np.stack(ys)).long()
+        return out
 
     return collate
 

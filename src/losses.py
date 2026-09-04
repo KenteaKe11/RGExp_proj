@@ -1,8 +1,13 @@
 """Hai số hạng ngoài CE của Total_Loss — ASL (supervised) và Aux (cân bằng tải).
 
-Lịch train chỉ còn MỘT phase multi-task:
+PHASE 2 (lịch multi-task đầy đủ) dùng cả hai:
 
     L = CE + w_sup·ASL(sup) + w_aux·Aux(route)      (w_sup = 0.5, w_aux = 0.05)
+
+PHASE 1 (src/phase1.py — pretrain Feat-Extractor) chỉ dùng `asl_loss`, một số
+hạng duy nhất và KHÔNG nhân w_sup: hệ số đó tồn tại để cân ASL với CE, mà ở
+phase 1 không có CE nào để cân. `aux_loss` không xuất hiện ở đó vì nhánh route
+bị đóng băng — không có tải nào để cân bằng.
 
 CE nằm ở src/model.py (dính chặt với chuyện cắt logits của decoder). File này
 giữ hai phần còn lại:

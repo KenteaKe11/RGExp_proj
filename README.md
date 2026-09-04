@@ -64,8 +64,13 @@ adapter. Bỏ nó: 15.9M → **4.68M mỗi expert**.
 
 Ba điều khác cần biết trước khi đọc tiếp:
 
-- **MỘT phase multi-task.** Router + 24 expert + decoder cùng chạy trong một
-  forward và cùng nhận gradient của `Total_Loss` ngay từ step đầu ([§1.7](#17-lịch-train-một-phase-multi-task-không-có-đích)).
+- **HAI phase tách rời** ([§1.7](#17-hai-phase-tách-rời-không-phase-nào-có-đích)).
+  Phase 1 pretrain Feat-Extractor bằng ASL, **không nạp Gemma**, đóng băng
+  `route_head` + `qformer.query[1]` + cả nhánh finetuning. Phase 2 là lịch
+  multi-task đầy đủ: router + 24 expert + decoder cùng chạy trong một forward
+  và cùng nhận gradient của `Total_Loss` ngay từ step đầu, không đóng băng gì.
+  Hai phase là hai lần gọi riêng (`--phase 1` / `--phase 2`); cầu nối duy nhất
+  là phase 2 nạp extractor pretrain làm khởi tạo.
 - **Lịch train không có đích.** Không có trần số mẫu, không có dừng sớm. Dừng
   bằng Ctrl-C hoặc hết giờ máy; lần sau **tự resume** từ checkpoint đi xa nhất.
 - **Không có SWA.** Trọng số đem đi chấm và đem đi probe là bản **cuối** trong
@@ -104,6 +109,11 @@ export WANDB_API_KEY=xxxxxxxx              # tuỳ chọn
 
 python -m src.config                            # in cấu hình, không nạp model
 python -m src.train --dry-run                   # STAGE 0 (2 step) rồi dừng
+
+# PHASE 1 — pretrain Feat-Extractor (ASL, KHÔNG nạp Gemma nên rẻ hơn nhiều)
+python -m src.train --phase 1 --no-dry-run      # tới khi Ctrl-C
+
+# PHASE 2 — multi-task đầy đủ; lần chạy đầu tự nạp extractor pretrain ở trên
 python -m src.train --mode train --no-dry-run   # TRAIN — tới khi Ctrl-C
 python -m src.train --mode test  --no-dry-run   # chấm checkpoint hiện có
 python -m src.report                            # gom kết quả bất cứ lúc nào
@@ -327,12 +337,50 @@ trong config không phải con số model học.
 
 `src/losses.py`, `src/model.py::ce_loss`
 
-### 1.7. Lịch train: một phase multi-task, không có đích
+### 1.7. Hai phase tách rời, không phase nào có đích
 
-Ngay từ step đầu, router + 24 expert + decoder cùng chạy trong **một** forward
-và cùng nhận gradient. Không còn "phase 1 dạy router bằng nhãn bệnh rồi phase 2
-mới thả decoder ra": mọi thứ phase 1 dạy được đều có nguy cơ bị CE kéo đi ở
-phase sau.
+`run.phase` (hoặc cờ `--phase`) chọn phase. **Hai phase là hai lần gọi riêng**,
+không có lịch tự chuyển tiếp:
+
+| | **Phase 1** — pretrain extractor | **Phase 2** — multi-task (mặc định) |
+|---|---|---|
+| đường đi | ảnh → extractor → qformer(query 0) → sup_head | toàn bộ: + route → gate, + 256 token prefix → decoder |
+| loss | `ASL` (một số hạng duy nhất) | `1·CE + 0.5·ASL + 0.05·Aux` |
+| model nền | **không nạp** (chỉ processor để lấy `pixel_values`) | Gemma 3 4B NF4 + 24 expert QDoRA |
+| đóng băng | `route_head`, `qformer.query[1]`, cả nhánh finetuning | **không gì cả** |
+| batch mặc định | `p1_train_bs 8 × p1_grad_accum 4` | `train_bs × grad_accum` theo preset VRAM |
+| checkpoint | repo riêng `<tag>_Extractor-31M` | repo MoE (`hub_repo`) |
+| code | `src/phase1.py` | `src/train.py` |
+
+```bash
+python -m src.train --phase 1 --no-dry-run   # dừng bằng Ctrl-C
+python -m src.train --phase 2 --no-dry-run   # tự nạp extractor pretrain
+```
+
+**Phase 1 đóng băng bằng hình học của đồ thị, không bằng hook.**
+`RouterNet.forward_sup` không gọi `route_head`, nên hàng `query[1]` không nằm
+trong đồ thị autograd và gradient của nó bằng 0 *theo định nghĩa*. Chỗ duy
+nhất còn động vào được nó là **weight decay** (AdamW nắn tham số kể cả khi
+grad = 0), nên `qformer.query` nằm trong một param group riêng có `wd = 0`.
+STAGE 0 của phase 1 kiểm lại bằng số thật: sau 2 optimizer step, `route_head`
+và `query[1]` phải giống hệt lúc đầu **tới từng bit**, nếu không thì nổ.
+
+Vì sao không train luôn `query[1]` ở phase 1: nó chỉ có nghĩa khi có một
+`route_logit` được CE chấm điểm. Dạy nó dưới sức ép của ASL là dạy một câu hỏi
+sai, và phase 2 sẽ phải gỡ ra trước khi dạy lại được.
+
+**Cầu nối duy nhất giữa hai phase.** Khi phase 2 chưa có checkpoint của chính
+nó (cục bộ lẫn Hub), nó nạp `router.state_dict()` mà phase 1 để lại làm **khởi
+tạo** — `samples` vẫn bắt đầu từ 0, lịch LR và lịch σ vẫn từ đầu, optimizer và
+expert không lấy theo. Không tìm thấy thì **cảnh báo** và train router từ số 0
+như bản một-phase trước đây. Từ lần resume thứ hai trở đi đường này không chạy
+lại (nếu không thì mỗi lần resume lại kéo trọng số cũ đè lên).
+
+Trong **phase 2**, ngay từ step đầu router + 24 expert + decoder cùng chạy
+trong **một** forward và cùng nhận gradient — không có giai đoạn nào chỉ có
+một nửa. Cái phase 1 làm trước đó là một việc *khác*: nó chỉ dạy extractor
+nhìn phim, để phase 2 không phải học đọc ảnh và học định tuyến cùng lúc từ số
+0.
 
 Vòng train đi tuần tự hết tập train theo thứ tự rare-first, hết thì `epoch += 1`
 và đi lại từ đầu **đúng thứ tự đó**, mãi mãi. Con trỏ tiến độ là **số mẫu tích
@@ -961,8 +1009,10 @@ lên và bảo chạy `--set run.calib_refit=true`.
    **không phải** `compute_dtype: float16` — fp16 tràn ở layer 5.
 4. **STAGE 0**: 2 step thử của đúng đồ thị thật. In `mẫu/s`, VRAM đỉnh, thời
    gian một epoch và một cycle LR. `--dry-run` dừng ở đây.
-5. **Train**: một phase multi-task, chạy tới khi bị dừng tay. Ckpt mỗi
-   `save_every_n_vals` lần val, push lên Hub.
+5. **Train**: `--phase 1` (pretrain extractor, không nạp Gemma) rồi
+   `--phase 2` (multi-task đầy đủ), mỗi phase chạy tới khi bị dừng tay. Ckpt
+   mỗi `save_every_n_vals` lần val, push lên Hub — phase 1 đi repo
+   `<tag>_Extractor-31M`, phase 2 đi `hub_repo`.
 6. **Chấm điểm** là một phiên riêng: `--mode test` hoặc `--mode probe`.
 
 Không có khái niệm "chạy hết lịch": một lần chạy là một khoảng thời gian, và
@@ -1023,7 +1073,11 @@ grep -E "WARN|ERROR" outputs/*/logs/latest.log
 
 **Các loại event trong JSONL:** `environment`, `config`, `stage0`,
 `train_step`, `eval`, `checkpoint`, `epoch`, `interrupted`, `hub_adopt`,
-`vram`, `warning` / `error`, `infer_done`, `run_end`.
+`vram`, `warning` / `error`, `infer_done`, `run_end`. Phase 1 ghi bản riêng
+của bốn loại đầu — `stage0_p1`, `train_step_p1`, `eval_p1`, `checkpoint_p1`,
+`epoch_p1`, `interrupted_p1` — cộng `p1_init` (do PHASE 2 ghi, lúc nó nạp
+extractor pretrain). Hậu tố `_p1` có chủ ý: hai phase có hai loss khác nhau,
+gộp chung một tên thì mọi biểu đồ `loss theo step` đều sai.
 
 `grad_router` trong `stage0` là con số cần nhìn **đầu tiên**: > 0 nghĩa là
 gradient của CE thật sự chảy ngược về nhánh router. Bằng 0 thì gate đã bị tách
@@ -1075,7 +1129,9 @@ RGExp_proj/
 │   ├── calib.py              # ★ §1.8 đo band uncertain trên val trước infer
 │   │                         #   -> calib_bands.json (ngưỡng theo TỪNG bệnh)
 │   ├── cam.py                # ★ Grad-CAM nhánh router -> cam.npz + khối `cam`
-│   ├── train.py              # entrypoint: STAGE 0 → train (vô hạn) → infer
+│   ├── train.py              # entrypoint 2 phase: STAGE 0 → train → infer
+│   ├── phase1.py             # ★ PHASE 1: pretrain Feat-Extractor bằng ASL,
+│   │                         #   KHÔNG nạp Gemma; ckpt sang repo Extractor
 │   ├── logging_utils.py      # log text + events JSONL
 │   └── report.py             # gom các lần chạy
 └── scripts/
@@ -1100,6 +1156,10 @@ attach_labels        gắn y14, loại dòng thiếu nhãn
       ↓
 rare_first_order     xếp mẫu hiếm lên đầu → thứ tự CỐ ĐỊNH mọi epoch
       ↓
+      ├─ phase 1 ─→ phase1.run: processor + RouterNet (KHÔNG nạp Gemma)
+      │             STAGE 0 (kiểm chứng đóng băng) → train ASL vô hạn
+      │             → ckpt sang repo <tag>_Extractor-31M → HẾT
+      ↓ phase 2
 build_model          Gemma NF4 → 24 expert QDoRA → RouterNet → hook decoder
       ↓
 resolve_seq_len      đo image token thật → max_seq_len = 2^k
@@ -1108,6 +1168,8 @@ STAGE 0              2 step thử: VRAM đỉnh, mẫu/s, Σ|grad| router
                      ── dry_run dừng ở đây
       ↓
 RESUME               LUÔN: lấy bản đi xa nhất giữa ckpt cục bộ và Hub
+                     chưa có ckpt nào? → p1_init: nạp extractor pretrain
+                     của phase 1 làm KHỞI TẠO (samples vẫn = 0)
       ↓
 ┌─ TRAIN (vô hạn) ──────────────────────────────────────────────────────┐
 │  set_decay_samples(σ)                                                 │
@@ -1152,6 +1214,17 @@ tru, nhưng phân bố tải đã học dưới một áp lực cân bằng khá
 > (mất backbone ConvNeXt, đổi mọi shape) và expert đổi từ 7 ma trận xuống 4 —
 > `arch.tag` đổi thành `gemma3-cnnqf1024` nên `ckpt_dir`/`hub_repo` cũng là
 > thư mục mới, không có gì bị ghi đè.
+
+**Checkpoint của phase 1 là một thứ khác, ở một repo khác.**
+`ckpt/<tag>/p1/last/` và repo `<tag>_Extractor-31M` (đặt tay bằng
+`run.p1_repo`). Bố cục file giống hệt phase 2 (`weights.pt`, `optimizer.pt`,
+`train_state.json`) nhưng `weights.pt` **chỉ có khoá `router`** — không có
+expert nào ở phase đó — và `train_state.json` có `phase: 1` cùng
+`extractor_params`. Tách repo vì hai vòng đời khác nhau: một bộ extractor
+pretrain dùng lại được cho nhiều lần chạy phase 2 khác nhau, còn ckpt phase 2
+gắn chặt với đúng một cấu hình MoE. `p1_init` từ chối nạp một file có khoá
+`experts` (đó là ckpt phase 2) và cảnh báo khi `n_train`/`seed` khác — split
+khác nghĩa là extractor **có thể đã nhìn thấy ảnh val/test** của lần chạy này.
 
 **Đồng bộ nhiều máy (`hub_sync: true`).** Trước mỗi lần val, đọc
 `last/train_state.json` trên Hub và so `samples`: ta đi trước hoặc bằng → được

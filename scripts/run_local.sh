@@ -6,10 +6,14 @@
 # Tự nhận biết qua khối `remote:` trong config; ép bằng RGEXP_REMOTE=1|0.
 #
 #   bash scripts/run_local.sh                          # STAGE 0 rồi dừng
-#   bash scripts/run_local.sh --no-dry-run             # train thật
-#   bash scripts/run_local.sh --n-block 3 --no-dry-run
-#   bash scripts/run_local.sh --n-block 4 --mode both
+#   bash scripts/run_local.sh --no-dry-run             # train thật (phase 2)
+#   bash scripts/run_local.sh --phase 1 --no-dry-run   # pretrain extractor
+#   bash scripts/run_local.sh --phase 2 --no-dry-run   # multi-task đầy đủ
 #   bash scripts/run_local.sh --mode test              # chỉ chấm điểm ckpt
+#
+# HAI PHASE là HAI LẦN GỌI: chạy `--phase 1` trước (dừng bằng Ctrl-C, ckpt đi
+# repo `<tag>_Extractor-31M`), rồi `--phase 2` — nó tự nạp bộ extractor đó
+# làm khởi tạo ở lần chạy đầu.
 #
 # Mọi tham số được chuyển thẳng cho src.train. Xem `--help` để biết đủ.
 #

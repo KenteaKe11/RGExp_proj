@@ -15,10 +15,22 @@ Adapter đã CHỐT là QDoRA r8. MoE: E expert / top-k, thuần top-k, không c
 expert hứng và không còn trần tải; cân bằng tải là MỘT số hạng aux trong
 Total_Loss (run.w_aux).
 
-Lịch train là MỘT phase multi-task duy nhất và KHÔNG có đích (xem
-configs/default.yaml, khối `run`): không còn phase1_samples/phase2_samples,
-không còn only_phase, không còn dừng sớm. Vì thế file này cũng không còn hàm
-nào chia lịch — chỉ còn kiểm tra lịch LR (cycle_samples) cho hợp lệ.
+HAI PHASE, chọn bằng `run.phase` (hoặc cờ `--phase`), mỗi phase là MỘT LẦN
+GỌI RIÊNG và không phase nào có đích:
+
+    phase 1  pretrain Feat-Extractor bằng ASL, KHÔNG nạp Gemma; đóng băng
+             route_head + qformer.query[1] + cả nhánh finetuning. Batch/lr/
+             cycle riêng (`run.p1_*`), checkpoint sang repo riêng
+             (`run.p1_repo`, mặc định `<tag>_Extractor-31M`). → src/phase1.py
+    phase 2  lịch multi-task đầy đủ (mặc định), không đóng băng gì; nạp
+             extractor pretrain làm khởi tạo nếu có. → src/train.py
+
+Khoá của bản hai-phase CŨ (phase1_samples/only_phase/p2_freeze_*) vẫn nằm
+trong `_DEAD_KEYS`: chúng thuộc một cơ chế khác hẳn (hai phase nối nhau trong
+một lần gọi, có trần số mẫu) và sẽ bị bỏ qua kèm lời giải thích.
+
+Không phase nào có dừng sớm, nên file này vẫn không có hàm nào chia lịch —
+chỉ kiểm tra lịch LR (cycle_samples, p1_cycle_samples) cho hợp lệ.
 """
 from __future__ import annotations
 
@@ -31,7 +43,7 @@ from types import SimpleNamespace
 import yaml
 
 from .router import (D_CONCAT, D_MODEL, IMG_SIZE, N_BLOCK, N_TOKEN, STRIDE,
-                     arch_desc, decay_desc, estimate_params)
+                     arch_desc, decay_desc, estimate_params, extractor_params)
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
 # Chỉ đổi CHỖ ĐỂ FILE (cache, outputs, ckpt) và cách chạy. Không đụng tới
@@ -176,8 +188,10 @@ def _apply_remote(rm, run, explicit):
 #
 # Thấp hơn preset của sweep adapter cũ MỘT BẬC: MoE giữ E bản delta cùng lúc và
 # QDoRA phải dequantize base weight trong forward, nên đỉnh VRAM cao hơn LoRA
-# thường ở cùng batch. Từ khi gộp một phase multi-task, MỌI step đều là step
-# "nặng" (router + expert + decoder) — không còn phase 1 rẻ tiền để làm đệm.
+# thường ở cùng batch. MỌI step của PHASE 2 đều là step "nặng" (router +
+# expert + decoder), nên bảng này là bảng của phase 2. Phase 1 không nạp Gemma
+# nên không đi qua preset nào — nó có batch riêng (`run.p1_train_bs`), mặc
+# định 8×4, và STAGE 0 của nó in VRAM đỉnh để bạn nới thêm.
 PRESETS = [
     # (VRAM tối thiểu, tên, train_bs, grad_accum, infer_bs, grad_ckpt)
     (70, "A100-80 / H100", 8, 4, 8, True),
@@ -317,14 +331,20 @@ def _deep_set(d, dotted, value):
     d[keys[-1]] = yaml.safe_load(value)   # tự ép int/float/bool/null
 
 
-# Khoá của bản HAI PHASE cũ. Không còn ý nghĩa gì trong lịch một phase; để
-# nguyên trong config thì người đọc tưởng nó vẫn có tác dụng, nên báo rõ.
+# Khoá của bản HAI PHASE CŨ (phase 1 = router bằng Focal, phase 2 = thêm
+# decoder, cả hai có trần số mẫu và chạy nối nhau trong MỘT lần gọi). Bản hai
+# phase HIỆN TẠI khác hẳn: chọn bằng `run.phase` (1 hoặc 2), mỗi phase là một
+# lần gọi riêng, không phase nào có đích, và phase 1 thậm chí không nạp
+# decoder. Để nguyên khoá cũ trong config thì người đọc tưởng nó vẫn có tác
+# dụng, nên báo rõ.
 _DEAD_KEYS = {
-    "phase1_samples": "lịch train không còn trần số mẫu",
-    "phase2_samples": "lịch train không còn trần số mẫu",
-    "only_phase": "chỉ còn MỘT phase multi-task",
-    "p2_freeze_trunk": "không còn phase 2 để đóng băng trunk",
-    "p2_freeze_sup_head": "không còn phase 2 để đóng băng sup_head",
+    "phase1_samples": "không phase nào có trần số mẫu (dừng bằng Ctrl-C)",
+    "phase2_samples": "không phase nào có trần số mẫu (dừng bằng Ctrl-C)",
+    "only_phase": "chọn phase bằng `run.phase: 1|2` (hoặc cờ --phase)",
+    "p2_freeze_trunk": ("phase 2 KHÔNG đóng băng gì; phase 1 mới là phase "
+                        "đóng băng (route_head + query[1])"),
+    "p2_freeze_sup_head": ("phase 2 KHÔNG đóng băng gì; sup_head là thứ phase "
+                           "1 train, phase 2 train tiếp"),
     "focal_gamma": "nhánh supervised dùng ASL, không còn Focal (run.asl_*)",
     "focal_alpha_pow": "ASL không có bảng α theo tần suất — γ⁻ lo phần đó",
     "focal_alpha_normalize": "ASL không có bảng α theo tần suất",
@@ -756,7 +776,7 @@ def load_config(path="configs/default.yaml", overrides=None):
     # nhưng upload_folder/hf_hub_download/snapshot_download nhét repo_id thẳng
     # vào URL -> api/models/X/... -> 404 Repository Not Found. Push hỏng, và
     # resume-từ-Hub cũng chết lặng. Chặn ngay tại đây.
-    for _k in ("hub_repo", "probe_repo"):
+    for _k in ("hub_repo", "probe_repo", "p1_repo"):
         _v = run.get(_k)
         if _v and "/" not in _v:
             raise ValueError(
@@ -768,8 +788,22 @@ def load_config(path="configs/default.yaml", overrides=None):
     # ai tải ckpt cũng kéo theo cả đống bản ghi. Mặc định tách hẳn một repo.
     if run.get("probe_repo") is None:
         run["probe_repo"] = f"{run['hub_repo']}-probe"
+    # Checkpoint PHASE 1 đi repo RIÊNG, không đụng repo MoE: nội dung khác
+    # hẳn (không có expert nào) và vòng đời cũng khác — một bộ extractor
+    # pretrain dùng lại được cho nhiều lần chạy phase 2, còn ckpt phase 2
+    # gắn chặt với đúng một cấu hình MoE. Tên mang luôn số tham số thật của
+    # extractor: hai lần chạy khác hình học sinh ra hai bộ không nạp lẫn
+    # được, và cái tên phải nói ra điều đó trước khi ai đó tải nhầm.
+    if run.get("p1_repo") is None:
+        _owner = run["hub_repo"].split("/")[0]
+        _pm = max(round(extractor_params() / 1e6), 1)
+        run["p1_repo"] = f"{_owner}/{tag}_Extractor-{_pm}M"
     if run.get("wandb_run") is None:
-        run["wandb_run"] = tag
+        # Hai phase = hai lần chạy wandb KHÁC NHAU. Cùng tên thì hai đường
+        # loss (ASL một mình và Total_Loss có CE) nằm chồng lên nhau trên
+        # cùng một trục step — không so được gì mà còn dễ đọc nhầm.
+        run["wandb_run"] = (f"{tag}-p1" if int(run.get("phase", 2) or 2) == 1
+                            else tag)
     # Mỗi lần chạy có thư mục riêng theo tag: đổi model không đè checkpoint.
     run["out_dir"] = os.path.join(run["out_dir"], tag)
     run["ckpt_dir"] = os.path.join(run["ckpt_dir"], tag)
@@ -822,6 +856,68 @@ def load_config(path="configs/default.yaml", overrides=None):
         print(f"⚠ cycle_lr_decay={run['cycle_lr_decay']} với lịch VÔ HẠN: "
               f"đỉnh LR tắt dần về 0 và train sẽ tự chết. Giữ 1.0 trừ khi "
               f"bạn cố ý muốn thế.")
+
+    # ══════════════════════ HAI PHASE (run.phase) ═══════════════════════════
+    # 1 = pretrain Feat-Extractor bằng ASL, KHÔNG nạp Gemma (src/phase1.py)
+    # 2 = lịch multi-task đầy đủ (src/train.py) — mặc định, và là thứ mọi
+    #     khoá khác trong file này nói tới trừ khi có tiền tố `p1_`.
+    run.setdefault("phase", 2)
+    run["phase"] = int(run["phase"])
+    if run["phase"] not in (1, 2):
+        raise ValueError(f"run.phase phải là 1 hoặc 2, nhận {run['phase']}")
+    if run["phase"] == 1 and str(run.get("mode", "both")) != "train":
+        # Phase 1 không nạp decoder -> không sinh được text -> 'test'/'both'/
+        # 'probe' không có gì để chấm. `mode: both` là MẶC ĐỊNH của yaml chứ
+        # không phải một lựa chọn ai đó vừa gõ, nên ở đó ta sửa giúp và nói
+        # ra; còn mode do người dùng ghi rõ thì phải nổ, vì lặng lẽ đổi ý
+        # người ta mới là cái tệ hơn.
+        if str(run["mode"]) == "both" and "run.mode" not in explicit:
+            print("⚠ config: phase 1 không có decoder — run.mode 'both' -> "
+                  "'train' (không có gì để infer/chấm ở phase này).")
+            run["mode"] = "train"
+        else:
+            raise ValueError(
+                f"run.phase=1 nhưng run.mode={run.get('mode')!r}. Phase 1 "
+                f"không nạp decoder nên không sinh được text: 'test'/'both'/"
+                f"'probe' không có gì để chấm. Dùng --mode train, hoặc "
+                f"--phase 2 nếu bạn định chấm điểm.")
+    # Batch RIÊNG của phase 1. Nó không nạp Gemma nên VRAM còn gần như trống —
+    # dùng lại `train_bs` của phase 2 (thường là 1-2 vì decoder 4B) là bỏ phí
+    # 10-20× thông lượng. Effective batch mặc định giữ đúng 32 như phase 2 để
+    # hai bên còn so sánh được đường loss với nhau.
+    run.setdefault("p1_train_bs", 8)
+    run.setdefault("p1_grad_accum", 4)
+    run["p1_train_bs"] = int(run["p1_train_bs"])
+    run["p1_grad_accum"] = int(run["p1_grad_accum"])
+    if run["p1_train_bs"] < 1 or run["p1_grad_accum"] < 1:
+        raise ValueError("run.p1_train_bs và run.p1_grad_accum phải >= 1")
+    # null = dùng lại giá trị của phase 2. lr của phase 1 mặc định là
+    # `lr_router` vì đó CHÍNH LÀ mạng đang được train (không có expert nào ở
+    # đây để phải chia hai lr).
+    run.setdefault("p1_lr", None)
+    run.setdefault("p1_cycle_samples", None)
+    run.setdefault("p1_warmup_samples", None)
+    run["p1_lr"] = float(run["p1_lr"] if run["p1_lr"] is not None
+                         else run["lr_router"])
+    if run["p1_lr"] <= 0:
+        raise ValueError(f"run.p1_lr phải > 0, nhận {run['p1_lr']}")
+    run["p1_cycle_samples"] = int(run["p1_cycle_samples"]
+                                  if run["p1_cycle_samples"] is not None
+                                  else run["cycle_samples"])
+    run["p1_warmup_samples"] = int(run["p1_warmup_samples"]
+                                   if run["p1_warmup_samples"] is not None
+                                   else run["warmup_samples"])
+    _eff1 = run["p1_train_bs"] * run["p1_grad_accum"]
+    if run["p1_cycle_samples"] < _eff1:
+        raise ValueError(
+            f"p1_cycle_samples={run['p1_cycle_samples']} nhỏ hơn effective "
+            f"batch của phase 1 ({_eff1}): một cycle không đủ một optimizer "
+            f"step.")
+    if run["p1_warmup_samples"] >= run["p1_cycle_samples"]:
+        raise ValueError(
+            f"p1_warmup_samples={run['p1_warmup_samples']} >= "
+            f"p1_cycle_samples={run['p1_cycle_samples']}: cycle không còn "
+            f"đoạn cosine nào.")
 
     import torch
     dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32,
@@ -880,7 +976,7 @@ def resolve_seq_len(cfg, n_prompt_tok, n_image_tok, log):
 
 def build_argparser():
     ap = argparse.ArgumentParser(
-        description="MIMIC-CXR MoE-LoRA — một phase multi-task, lịch vô hạn")
+        description="MIMIC-CXR MoE-LoRA — hai phase tách rời, lịch vô hạn")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--set", dest="overrides", action="append", default=[],
                     metavar="KEY=VALUE",
@@ -890,6 +986,11 @@ def build_argparser():
     # siêu tham số nào để quét. Gọi kèm hai cờ đó thì argparse báo lỗi ngay
     # thay vì im lặng bỏ qua — đúng ý, vì script cũ gọi chúng sẽ chạy MỘT
     # kiến trúc khác hẳn với cùng dòng lệnh.
+    ap.add_argument("--phase", type=int, choices=[1, 2],
+                    help="1 = pretrain Feat-Extractor (ASL, KHÔNG nạp Gemma, "
+                         "đóng băng route_head + query[1], ckpt sang repo "
+                         "<tag>_Extractor-*); 2 = lịch multi-task đầy đủ "
+                         "(mặc định). Hai phase là hai lần gọi riêng.")
     ap.add_argument("--mode", choices=["train", "test", "both", "probe"],
                     help="probe = không train, nạp last/ từ Hub, sinh báo "
                          "cáo rồi bật lần lượt từng expert trong top-k để đo "
@@ -905,7 +1006,8 @@ def build_argparser():
 def config_from_args(argv=None):
     args = build_argparser().parse_args(argv)
     ov = list(args.overrides)
-    for name, key in (("model", "arch.model"), ("mode", "run.mode")):
+    for name, key in (("model", "arch.model"), ("mode", "run.mode"),
+                      ("phase", "run.phase")):
         val = getattr(args, name)
         if val is not None:
             ov.append(f"{key}={val}")
@@ -934,11 +1036,28 @@ if __name__ == "__main__":
           f"{est['experts']:,} = {est['total']:,} param trainable")
     print(f"Adapter : {adapter_desc(c.fixed)} | quant={c.run.quant}")
     print(f"Ảnh     : {image_desc(c.fixed)}")
-    print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
-          f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
-    print("Lịch    : MỘT phase multi-task, KHÔNG có đích — chạy tuần tự tập "
-          "train, hết thì epoch += 1 và chạy tiếp")
-    print(f"Loss    : 1·CE + {c.run.w_sup}·ASL + {c.run.w_aux}·Aux")
+    if c.run.phase == 1:
+        print(f"Batch   : {c.run.p1_train_bs} × {c.run.p1_grad_accum} = "
+              f"{c.run.p1_train_bs * c.run.p1_grad_accum} mẫu/step (phase 1)")
+    else:
+        print(f"Batch   : {c.run.train_bs} × {c.run.grad_accum} = "
+              f"{c.run.train_bs * c.run.grad_accum} mẫu/step")
+    print(f"Phase   : {c.run.phase} — "
+          + ("pretrain Feat-Extractor (ASL, KHÔNG nạp Gemma; đóng băng "
+             "route_head + query[1] + cả nhánh finetuning)" if c.run.phase == 1
+             else "multi-task đầy đủ: router + expert QDoRA + decoder"))
+    print(f"          ckpt → {c.run.p1_repo if c.run.phase == 1 else c.run.hub_repo}")
+    if c.run.phase == 2:
+        print(f"          khởi tạo router: extractor pretrain ở "
+              f"{c.run.p1_repo} nếu có, không thì từ số 0")
+    print("Lịch    : KHÔNG có đích — chạy tuần tự tập train, hết thì epoch "
+          "+= 1 và chạy tiếp")
+    if c.run.phase == 1:
+        print(f"Loss    : ASL (một số hạng duy nhất) | lr={c.run.p1_lr:g} | "
+              f"cycle {c.run.p1_cycle_samples} mẫu, warmup "
+              f"{c.run.p1_warmup_samples}")
+    else:
+        print(f"Loss    : 1·CE + {c.run.w_sup}·ASL + {c.run.w_aux}·Aux")
     print(f"          ASL γ+={c.run.asl_gamma_pos:g} γ-={c.run.asl_gamma_neg:g}"
           f" | ngưỡng âm m={c.run.asl_clip:g} (BI-RADS 3)"
           f" | uncertain={c.run.uncertain_soft:g}, blank=MASK")

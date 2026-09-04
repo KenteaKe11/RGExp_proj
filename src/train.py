@@ -1,18 +1,40 @@
-"""Entrypoint: STAGE 0 (2 step thử) -> train multi-task -> infer.
+"""Entrypoint: STAGE 0 (2 step thử) -> train -> infer. Hai phase TÁCH HẲN.
 
-Chạy:  python -m src.train --config configs/default.yaml
+Chạy:  python -m src.train --config configs/default.yaml --phase 1   # pretrain
+       python -m src.train --config configs/default.yaml --phase 2   # mặc định
 
-MỘT PHASE DUY NHẤT (multi-task). Không còn "phase 1 chỉ router bằng Focal" rồi
-"phase 2 thêm decoder bằng CE". Ngay từ step đầu:
+    PHASE 1 (src/phase1.py)          PHASE 2 (file này)
+    ────────────────────────────     ──────────────────────────────────────
+    ảnh → extractor → qformer        toàn bộ: router + E expert QDoRA +
+        → query 0 → sup_head              decoder, prefix 256 token
+    loss = ASL                       loss = 1·CE + w_sup·ASL + w_aux·Aux
+    KHÔNG nạp Gemma                  Gemma 4B NF4 + E bản delta QDoRA
+    đóng băng route_head, query[1]   không đóng băng gì trong nhánh router
+    ckpt → repo `<tag>_Extractor-*`  ckpt → repo MoE (`run.hub_repo`)
+
+Hai phase KHÔNG chạy chung một lần gọi và KHÔNG có lịch tự chuyển tiếp: phase
+1 dừng bằng Ctrl-C (hoặc hết giờ máy), rồi người dùng gọi lại với --phase 2.
+Chủ ý: chúng khác nhau về batch, về VRAM, về repo checkpoint và về cái đang
+được dạy, nên gộp vào một tiến trình chỉ tạo ra một cấu hình không đọc được.
+
+Cầu nối duy nhất giữa hai phase: khi phase 2 chưa có checkpoint của CHÍNH nó
+(cục bộ lẫn Hub), nó nạp trọng số router mà phase 1 để lại làm KHỞI TẠO —
+`samples` vẫn bắt đầu từ 0, lịch LR và lịch σ vẫn từ đầu. Không tìm thấy thì
+cảnh báo và train từ số 0 như bản trước (xem `p1_init`).
+
+──────────────────────────────────────────────────────────────────────────────
+PHẦN DƯỚI ĐÂY NÓI VỀ PHASE 2, và nó không đổi so với bản một-phase trước:
+
+Ngay từ step đầu:
 
     Total_Loss = 1·CE + w_sup·ASL + w_aux·Aux      (0.5 và 0.05)
 
 Router, E expert QDoRA và decoder cùng chạy trong MỘT forward và cùng nhận
 gradient. Gate nằm trong đồ thị autograd (src/moe.py), nên CE dạy router chọn
-expert, còn ASL giữ cho biểu diễn của router bám ngữ nghĩa bệnh học. Hai
-tín hiệu đó đến CÙNG LÚC thay vì nối tiếp — đó là toàn bộ ý nghĩa của việc
-gộp phase: bản cũ dạy router bằng nhánh supervised xong mới cho nó gặp CE, và
-mọi thứ nhánh đó dạy được đều có nguy cơ bị CE kéo đi ở phase sau.
+expert, còn ASL giữ cho biểu diễn của router bám ngữ nghĩa bệnh học. Hai tín
+hiệu đó đến CÙNG LÚC trong phase 2 — cái mà phase 1 làm trước đó là một việc
+KHÁC: nó chỉ dạy extractor nhìn phim (ASL, không có route, không có decoder),
+để phase 2 không phải học đọc ảnh và học định tuyến cùng lúc từ số 0.
 
 Nhánh supervised dùng ASL (Asymmetric Loss) trên MỘT trục nhị phân 14 finding
 — không còn softmax 4 aspect, không còn Focal. Nhãn uncertain thành soft
@@ -58,6 +80,7 @@ from . import calib as calib_mod
 from . import cam as cam_mod
 from . import logging_utils as L
 from . import moe
+from . import phase1 as phase1_mod
 from . import probe as probe_mod
 from .config import (adapter_desc, arch_summary, config_from_args,
                      cycles_desc, image_desc, resolve_seq_len)
@@ -144,9 +167,13 @@ def main(argv=None):
                f"ckpt={r.grad_ckpt} | batch {r.train_bs}×{r.grad_accum}"
                f"={r.train_bs*r.grad_accum} mẫu/step | mode={r.mode} "
                f"dry_run={r.dry_run}")
-    log("cfg", "lịch train: MỘT phase multi-task, KHÔNG có đích — chạy tuần "
-               "tự tập train, hết thì epoch += 1 và chạy tiếp; dừng bằng "
-               "Ctrl-C hoặc hết giờ máy, lần sau LUÔN resume")
+    log("cfg", f"PHASE {r.phase} — "
+               + ("pretrain Feat-Extractor bằng ASL, KHÔNG nạp decoder "
+                  "(src/phase1.py)" if r.phase == 1 else
+                  "multi-task đầy đủ: router + expert + decoder"))
+    log("cfg", "lịch train: KHÔNG có đích — chạy tuần tự tập train, hết thì "
+               "epoch += 1 và chạy tiếp; dừng bằng Ctrl-C hoặc hết giờ máy, "
+               "lần sau LUÔN resume")
     log("cfg", f"loss = 1·CE + {r.w_sup}·ASL + {r.w_aux}·Aux | ASL γ+="
                f"{r.asl_gamma_pos:g} γ-={r.asl_gamma_neg:g} ngưỡng âm "
                f"m={r.asl_clip:g} | uncertain={r.uncertain_soft:g}, blank=MASK")
@@ -191,6 +218,7 @@ def main(argv=None):
         import wandb
         os.environ["WANDB_SILENT"] = "true"
         wandb.init(project=r.wandb_project, name=r.wandb_run, config={
+            "phase": r.phase,
             "model": f.model_id, "arch": cfg.arch.tag,
             "n_expert": f.n_expert, "top_k": f.top_k,
             "router_img_size": f.router_img_size,
@@ -225,7 +253,10 @@ def main(argv=None):
             import wandb
             wandb.finish()
 
-    if r.push_to_hub and not r.dry_run:
+    # Repo MoE chỉ được dựng ở phase 2: phase 1 không sinh ra một expert nào
+    # để đẩy lên đó, và tạo sẵn một repo rỗng chỉ làm người đọc tưởng đã có
+    # checkpoint. Repo của phase 1 do src/phase1.py tự lo.
+    if r.push_to_hub and not r.dry_run and r.phase == 2:
         create_repo(repo_id=r.hub_repo, token=hf_token, private=r.hub_private,
                     exist_ok=True)
         log("hub", f"repo sẵn sàng: {r.hub_repo}")
@@ -263,6 +294,20 @@ def main(argv=None):
                 f"infer={len(df_infer)} | 1 epoch ≈ {steps_per_epoch} step ở "
                 f"batch {eff} | 1 cycle LR = {r.cycle_samples} mẫu = "
                 f"{n_train / max(r.cycle_samples, 1):.1f} cycle/epoch")
+
+    # ══════════════════════ RẼ NHÁNH: PHASE 1 ═══════════════════════════════
+    # Đặt ở ĐÂY, sau khi dữ liệu đã dựng xong và TRƯỚC `build_model`: phase 1
+    # dùng đúng split, đúng nhãn, đúng thứ tự rare-first của phase 2 (nếu
+    # không thì "pretrain" là pretrain trên một tập khác, và ảnh val của
+    # phase 2 có thể đã bị extractor nhìn thấy) — nhưng nó KHÔNG được nạp
+    # một tham số Gemma nào. Mọi thứ dưới dòng return này là chuyện của
+    # phase 2.
+    if r.phase == 1:
+        rc = phase1_mod.run(cfg, hf_token, df_train=df_train, df_val=df_val,
+                            order=order, sup_table=sup_table, n_train=n_train,
+                            wlog=wlog)
+        wfinish()
+        return rc
 
     # ── Model ────────────────────────────────────────────────────────────────
     processor, tokenizer, model, router, bridge, expert_ids = build_model(
@@ -498,6 +543,12 @@ def main(argv=None):
                         f"quota HF chưa được thu hồi")
 
     # ══════════════════════════ checkpoint ═══════════════════════════════════
+    # Nguồn của bộ trọng số router lúc bắt đầu: None = train từ số 0, hoặc
+    # một chuỗi mô tả ckpt phase 1 đã nạp. Đi vào train_state.json để sau này
+    # đọc một checkpoint bất kỳ là biết nó lớn lên từ đâu. Danh sách một phần
+    # tử vì `p1_init` (định nghĩa xa phía dưới) phải ghi vào được.
+    p1_used = [None]
+
     def save_checkpoint(state, optimizer, tag="last", push=True,
                         with_optimizer=True):
         """Lưu đủ để resume: router + E expert + optimizer.
@@ -523,7 +574,8 @@ def main(argv=None):
                        os.path.join(d, "optimizer.pt"))
         # samples/epoch/samples_per_step là số ĐỌC ĐƯỢC trên mọi máy; step chỉ
         # còn là số dẫn xuất để tiện đọc log.
-        meta = dict(state, n_train=n_train, seed=f.seed, gpu=cfg.hw.name,
+        meta = dict(state, phase=2, p1_init=p1_used[0],
+                    n_train=n_train, seed=f.seed, gpu=cfg.hw.name,
                     samples_per_step=eff, train_bs=r.train_bs,
                     grad_accum=r.grad_accum, saved_at=time.time(),
                     cycle_samples=r.cycle_samples, w_sup=r.w_sup,
@@ -689,6 +741,103 @@ def main(argv=None):
         event("hub_adopt", from_samples=old["samples"],
               to_samples=state["samples"], remote_gpu=st.get("gpu"))
 
+    # ── Khởi tạo từ PHASE 1 (chỉ khi phase 2 chưa có ckpt của chính nó) ─────
+    def p1_init():
+        """Nạp trọng số router mà phase 1 để lại. Trả về mô tả nguồn hoặc None.
+
+        KHỞI TẠO, KHÔNG PHẢI RESUME. Ba thứ KHÔNG lấy theo:
+
+          • `samples`/`epoch`/`step` — phase 2 bắt đầu từ mẫu 0. Con trỏ của
+            phase 1 đếm trên một loss khác, một batch khác, một lịch LR khác;
+            mang nó sang đây thì lịch σ và lịch LR của phase 2 vào lại giữa
+            dốc của một đường cong chưa từng chạy.
+          • optimizer — moment AdamW của ASL-một-mình không nói gì về
+            Total_Loss có CE.
+          • expert — phase 1 không có expert nào. Chúng bắt đầu từ init của
+            QDoRA như mọi lần chạy từ số 0.
+
+        `route_head` trong file đó là trọng số NGẪU NHIÊN lúc khởi tạo (phase
+        1 đóng băng nó, không train). Nạp vào cũng vô hại — nó vẫn là một
+        init hợp lệ — nhưng nếu `n_expert` đổi thì shape lệch, và lúc đó ta bỏ
+        đúng hai tensor đó ra chứ không vứt cả bộ extractor.
+        """
+        cand, where = None, None
+        local_p1 = os.path.join(r.ckpt_dir, "p1", "last")
+        if os.path.exists(os.path.join(local_p1, "weights.pt")):
+            cand, where = local_p1, f"local {local_p1}"
+        elif r.push_to_hub:
+            try:
+                root = snapshot_download(
+                    repo_id=r.p1_repo, token=hf_token,
+                    local_dir=os.path.join(r.ckpt_dir, "p1", "from_hub"),
+                    allow_patterns=["last/*"])
+                cand, where = os.path.join(root, "last"), f"{r.p1_repo}/last"
+            except Exception as e:
+                log("p1", f"không tải được extractor pretrain từ {r.p1_repo} "
+                          f"({type(e).__name__})")
+        if cand is None or not os.path.exists(os.path.join(cand,
+                                                           "weights.pt")):
+            warn("p1", f"KHÔNG có checkpoint phase 1 (đã tìm {local_p1} và "
+                       f"{r.p1_repo}) — nhánh router train TỪ SỐ 0 như bản "
+                       f"trước. Muốn có pretrain thì chạy `--phase 1` trước.")
+            return None
+
+        st = read_state(cand) or {}
+        if st.get("phase") not in (None, 1):
+            raise AssertionError(
+                f"{where} là checkpoint phase {st.get('phase')}, không phải "
+                f"phase 1. Đường này chỉ nhận bộ extractor pretrain.")
+        if st.get("arch") not in (None, cfg.arch.tag):
+            raise AssertionError(
+                f"extractor pretrain của {st.get('arch')}, đang chạy "
+                f"{cfg.arch.tag} — chiều làm việc của router bám theo hidden "
+                f"size của model nền, không nạp lẫn được.")
+        _was = st.get("router_img_size")
+        if _was is not None and int(_was) != int(f.router_img_size):
+            raise AssertionError(
+                f"extractor pretrain train ở router_img_size={_was}, đang "
+                f"chạy {f.router_img_size} — hình học đổi, trọng số không "
+                f"khớp shape.")
+        # Split khác nghĩa là extractor có thể ĐÃ NHÌN ảnh val/test của lần
+        # chạy này. Không chặn (người dùng có thể cố ý), nhưng phải nói ra:
+        # đây là kiểu rò rỉ không có metric nào bắt được.
+        if st.get("n_train") not in (None, n_train) or \
+                st.get("seed") not in (None, f.seed):
+            warn("p1", f"extractor pretrain train trên split khác "
+                       f"(n_train={st.get('n_train')} seed={st.get('seed')} "
+                       f"vs {n_train}/{f.seed}) — ảnh val/test của lần chạy "
+                       f"này có thể đã bị nó nhìn thấy ở phase 1.")
+
+        payload = torch.load(os.path.join(cand, "weights.pt"),
+                             map_location="cpu")
+        assert "experts" not in payload, (
+            f"{where}/weights.pt có khoá `experts` — đó là ckpt phase 2, "
+            f"không phải extractor pretrain.")
+        w = dict(payload["router"])
+        cur = router.state_dict()
+        bad = [k for k, v in w.items()
+               if k in cur and tuple(cur[k].shape) != tuple(v.shape)]
+        for k in bad:
+            w.pop(k)
+        missing, unexpected = router.load_state_dict(w, strict=False)
+        router.to(DEVICE, f.trainable_dtype)
+        if bad:
+            warn("p1", f"bỏ {len(bad)} tensor lệch shape khi nạp "
+                       f"({', '.join(bad[:3])}...) — thường là route_head do "
+                       f"n_expert đổi; phần đó khởi tạo ngẫu nhiên.")
+        if missing or unexpected:
+            warn("p1", f"nạp extractor: thiếu {len(missing)} khoá, thừa "
+                       f"{len(unexpected)} khoá")
+        n_load = sum(int(v.numel()) for k, v in w.items() if k in cur)
+        log("p1", f"KHỞI TẠO router từ extractor pretrain: {where} "
+                  f"({n_load:,} param, mẫu {st.get('samples')} của phase 1, "
+                  f"val tốt nhất {st.get('best_val')})")
+        log("p1", "samples/optimizer/expert KHÔNG lấy theo — phase 2 bắt đầu "
+                  "ở mẫu 0 với lịch LR và lịch σ từ đầu")
+        event("p1_init", source=where, params=n_load,
+              p1_samples=st.get("samples"), p1_best_val=st.get("best_val"))
+        return where
+
     # ── Resume: LUÔN, lấy bản ĐI XA NHẤT giữa local và Hub ───────────────────
     # Không còn cờ `run.resume`. Bản cục bộ KHÔNG mặc nhiên thắng: máy này có
     # thể vừa bật lại sau khi một máy khác đã chạy thêm vài nghìn mẫu và push.
@@ -727,6 +876,11 @@ def main(argv=None):
                       f"idx {state['epoch_samples']} step {state['step']}")
     else:
         log("resume", src)
+        # Chưa có ckpt phase 2 nào -> đây là lần chạy ĐẦU của ô này, và đúng
+        # là lúc (duy nhất) để nạp extractor pretrain của phase 1. Từ lần
+        # sau, `last/` của chính phase 2 đã đi trước nên đường này không chạy
+        # lại — nếu không thì mỗi lần resume lại kéo trọng số cũ đè lên.
+        p1_used[0] = p1_init()
     if r.hub_sync and r.push_to_hub:
         log("sync", "hub_sync BẬT — mỗi lần val sẽ hỏi Hub; chỉ máy đi xa nhất "
                     "mới được ghi, máy đi sau tự nạp bản của Hub rồi chạy tiếp")
