@@ -15,12 +15,37 @@ thì dịch nó sang câu "sửa thế này" thay vì lặp lại repr của exc
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 
 
 def _ver(mod_version: str) -> tuple[int, ...]:
     nums = re.findall(r"\d+", mod_version.split("+")[0])
     return tuple(int(x) for x in nums[:3]) or (0,)
+
+
+def has_c_compiler() -> str | None:
+    """Đường dẫn tới trình biên dịch C, hoặc None.
+
+    Cần cho torch.compile/inductor — nó SINH RA mã C++ rồi gọi compiler thật để
+    dịch. Ảnh pytorch/* trên máy thuê thường không có gcc (ảnh runtime, không
+    phải devel), và transformers thì TỰ BẬT torch.compile cho đường sinh
+    hybrid-cache của Gemma 3. Hệ quả: model nạp xong, generate đầu tiên chết
+    bằng
+        BackendCompilerFailed: RuntimeError: Failed to find C compiler.
+    một lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
+    """
+    cc = os.environ.get("CC")
+    if cc:
+        found = shutil.which(cc)
+        if found:
+            return found
+    for name in ("cc", "gcc", "clang", "g++", "c++"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def env_versions() -> dict:
@@ -101,6 +126,17 @@ def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
                     "Phi-3.5-vision import chính hàm đó.\n"
                     "      pip install -U 'transformers>=4.51,<4.53'")
 
+    if any(str(m.get("runner", "")).lower() == "gemma3" for m in models) \
+            and has_c_compiler() is None:
+        # Cảnh báo chứ không chặn: Runner._configure_compile tắt compile và
+        # chạy eager, chậm hơn chút nhưng ra kết quả. Vẫn phải nói ra, vì cài
+        # gcc là việc một phút và nó lấy lại phần tốc độ đó.
+        warns.append("⚠ Không có trình biên dịch C (gcc/cc). transformers tự bật "
+                     "torch.compile cho\n    đường sinh hybrid-cache của Gemma 3, "
+                     "và inductor cần compiler để dịch mã nó\n    sinh ra -> sẽ TẮT "
+                     "compile và chạy eager. Muốn nhanh hơn:\n"
+                     "      apt-get install -y build-essential")
+
     if v.get("cuda_available") and not v.get("bf16"):
         warns.append("⚠ GPU không có bf16: Gemma 3 sẽ chạy fp32 (chậm ~2-3×; fp16 tràn "
                      "số ở layer 5), Qwen/Phi dùng fp16.")
@@ -115,6 +151,11 @@ _RULES: list[tuple[str, str]] = [
     (r"_prepare_4d_causal_attention_mask|modeling_attn_mask_utils",
      "remote code của model đòi API mask cũ đã bị bỏ.\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),
+    (r"BackendCompilerFailed|Failed to find C compiler|backend='inductor'",
+     "torch.compile (inductor) cần một trình biên dịch C để dịch mã nó sinh ra,\n"
+     "      mà image này không có. Hai cách:\n"
+     "        apt-get install -y build-essential        # nhanh hơn, giữ compile\n"
+     "        --set models.0.disable_compile=true       # tắt compile, chạy eager"),
     (r"out of memory|CUDA out of memory",
      "hết VRAM. Hạ batch_size của model này trong configs/baseline.yaml,\n"
      "      hoặc với Phi thì hạ num_crops (4 -> 2)."),

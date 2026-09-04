@@ -226,9 +226,33 @@ Bốn lớp chặn, theo thứ tự rẻ nhất trước:
    thứ 2000.
 
 Ngoài ra `preflight.diagnose()` dịch lỗi đã biết mặt sang cách sửa (torch quá
-cũ, remote code đòi API đã bỏ, OOM, token không có quyền, thiếu flash-attn,
-ảnh hỏng), và mỗi loại lỗi chỉ in **một lần** — không có phần đó thì log là 3000
-dòng giống hệt nhau và nguyên nhân chìm nghỉm.
+cũ, remote code đòi API đã bỏ, thiếu trình biên dịch C, OOM, token không có
+quyền, thiếu flash-attn, ảnh hỏng), và mỗi loại lỗi chỉ in **một lần** — không
+có phần đó thì log là 3000 dòng giống hệt nhau và nguyên nhân chìm nghỉm.
+
+### Ảnh runtime không có gcc, mà transformers tự bật torch.compile
+
+Lỗi thật thứ hai, bắt được ngay ở lần sinh thử:
+
+```
+BackendCompilerFailed: backend='inductor' raised:
+RuntimeError: Failed to find C compiler. Please specify via CC environment variable.
+```
+
+Không phải ta gọi `torch.compile` — **transformers tự bật** nó cho đường sinh
+hybrid-cache của Gemma 3. inductor sinh mã C++ rồi gọi compiler thật để dịch,
+mà ảnh `pytorch/*` là ảnh **runtime**, thường không có `gcc`. Kết quả là một
+lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
+
+- `setup.sh` cài `gcc`/`g++` cùng với `git`/`tmux` ở chế độ container — một
+  phút, và giữ được phần tốc độ của compile.
+- `Runner.configure_compile()` là lưới an toàn: `models[].disable_compile: auto`
+  (mặc định) tắt compile khi **không** thấy compiler, cộng
+  `torch._dynamo.config.suppress_errors = True` để chỗ nào còn gọi compile mà ta
+  chưa biết thì rơi về eager thay vì ném. Ép bằng `true` / `false`.
+
+Tắt compile chỉ mất một phần tốc độ — đường eager vẫn dùng kernel hợp nhất của
+sdpa — nên đây là đánh đổi đúng khi thiếu compiler.
 
 ### Cây thư mục trong zip ≠ `img_rel` trong CSV
 
@@ -286,8 +310,8 @@ cảnh báo vào cả console lẫn `REPORT.md` nếu vi phạm.
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest.py                  # 79 phép kiểm, không cần GPU/mạng/model
-python scripts/selftest.py --with-metrics    # 88 phép kiểm (thêm BLEU/ROUGE)
+python scripts/selftest.py                  # 85 phép kiểm, không cần GPU/mạng/model
+python scripts/selftest.py --with-metrics    # 94 phép kiểm (thêm BLEU/ROUGE)
 ```
 
 Kiểm những chỗ mà lỗi sẽ **đi thẳng vào bảng kết quả mà không ném exception**:
@@ -297,7 +321,8 @@ rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không, bố
 mục trong zip có dò đúng không, resume có sinh lại đúng phần thiếu không, batch
 OOM có rơi về từng ảnh không, file JSONL bị cắt giữa dòng có được dọn không,
 **ngắt mạch có chặn được ca "3000 dòng rỗng rồi báo xong" không**, preflight có
-dịch đúng lỗi thật đã gặp không, W&B tắt có thành no-op sạch không.
+dịch đúng **hai lỗi thật đã gặp** không (torch quá cũ · thiếu gcc), ba nhánh của
+`disable_compile` có đúng không, W&B tắt có thành no-op sạch không.
 
 ---
 

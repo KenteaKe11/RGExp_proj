@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import Cfg
-from ..preflight import diagnose
+from ..preflight import diagnose, has_c_compiler
 from ..tracking import NullTracker
 
 
@@ -167,6 +167,7 @@ class Runner:
 
         print(f"  {self.name}: còn {len(todo)}/{len(df)} mẫu cần sinh", flush=True)
         self.load()
+        self.configure_compile()
         self.smoke_test(todo[0])
 
         bs = max(1, int(self.mcfg.get("batch_size", 1)))
@@ -267,6 +268,54 @@ class Runner:
         })
         print(f"✓ {self.name}: xong sau {mins:.1f} phút -> {out_path}", flush=True)
         return out_path
+
+    def configure_compile(self) -> None:
+        """Tắt torch.compile khi máy không có trình biên dịch C.
+
+        transformers TỰ BẬT torch.compile cho đường sinh hybrid-cache của
+        Gemma 3 — không phải ta yêu cầu. inductor sinh mã C++ rồi gọi compiler
+        thật để dịch; ảnh pytorch/* trên máy thuê là ảnh runtime, thường không
+        có gcc, nên generate đầu tiên chết bằng `Failed to find C compiler` —
+        một lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
+
+        Tắt compile chỉ mất một phần tốc độ (đường eager vẫn dùng kernel hợp
+        nhất của sdpa), nên đây là đánh đổi đúng khi thiếu compiler. Có compiler
+        thì KHÔNG đụng vào, để transformers tự quyết như bình thường.
+
+        `models[].disable_compile`: auto (mặc định) | true | false
+        """
+        want = str(self.mcfg.get("disable_compile", "auto")).lower()
+        if want in ("true", "1", "yes", "on"):
+            disable, why = True, "models[].disable_compile=true"
+        elif want in ("false", "0", "no", "off"):
+            return
+        else:
+            cc = has_c_compiler()
+            if cc is not None:
+                return
+            disable, why = True, "không thấy gcc/cc trên máy này"
+
+        if not disable:
+            return
+        print(f"  ⚙ tắt torch.compile ({why}) -> chạy eager", flush=True)
+        try:
+            import torch._dynamo
+
+            # suppress_errors: nếu vẫn còn chỗ nào gọi compile mà ta không biết,
+            # nó rơi về eager thay vì ném BackendCompilerFailed. Hai lớp, vì
+            # cách bật compile khác nhau giữa các bản transformers.
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        try:
+            if self.model is not None and getattr(self.model, "generation_config", None):
+                # Khoá chính thức của transformers (>= 4.48). Đặt trên
+                # generation_config chứ không truyền vào generate(): bản cũ hơn
+                # sẽ coi nó là kwarg lạ và cảnh báo ở MỖI batch.
+                self.model.generation_config.disable_compile = True
+        except Exception:
+            pass
 
     def smoke_test(self, item: dict) -> None:
         """Sinh THỬ đúng một ảnh ngay sau khi nạp model.

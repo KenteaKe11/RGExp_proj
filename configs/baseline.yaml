@@ -76,6 +76,16 @@ models:
     dtype: bfloat16
     batch_size: 4
     enabled: true
+    # transformers TỰ BẬT torch.compile cho đường sinh hybrid-cache của Gemma 3
+    # — không phải ta yêu cầu. inductor sinh mã C++ rồi gọi compiler thật để
+    # dịch, mà ảnh pytorch/* là ảnh RUNTIME, thường không có gcc: generate đầu
+    # tiên chết bằng `BackendCompilerFailed: Failed to find C compiler`.
+    #   auto (mặc định) — có gcc thì để nguyên, không có thì tắt và chạy eager
+    #   true            — luôn tắt
+    #   false           — luôn để transformers tự quyết
+    # Cách tốt nhất vẫn là cài gcc (apt-get install -y build-essential): giữ
+    # được phần tốc độ của compile.
+    disable_compile: auto
 
   - id: qwen25vl_3b
     name: "Qwen2.5-VL-3B-Instruct"

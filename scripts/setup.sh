@@ -28,8 +28,17 @@ rgexp_banner
 
 # ── 0. Gói hệ thống (chỉ ở container) ───────────────────────────────────────
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
+    # gcc: KHÔNG phải để build gì của ta. transformers tự bật torch.compile cho
+    # đường sinh hybrid-cache của Gemma 3, inductor sinh mã C++ rồi gọi compiler
+    # thật để dịch, và ảnh pytorch/* là ảnh RUNTIME nên thường không có gcc ->
+    # generate đầu tiên chết bằng "Failed to find C compiler". Cài ở đây (một
+    # phút) rẻ hơn là mất phần tốc độ của compile suốt cả lần chạy.
     MISSING=""
-    for c in git tmux; do command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c"; done
+    for c in git tmux gcc; do command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c"; done
+    # gcc có rồi nhưng g++ thì chưa là chuyện thường; inductor cần cả hai.
+    if command -v gcc >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1; then
+        MISSING="$MISSING g++"
+    fi
     if [ -n "$MISSING" ] && command -v apt-get >/dev/null 2>&1; then
         echo "→ cài gói hệ thống:$MISSING"
         apt-get update -qq >/dev/null 2>&1 || true
@@ -218,6 +227,11 @@ if p.total_memory / 1024**3 < 16:
     print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — hạ batch_size trong "
           "configs/baseline.yaml nếu OOM.")
 PYEOF
+
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+    echo "⚠ Không có gcc/cc — torch.compile sẽ bị TẮT (pipeline tự xử, chạy eager)."
+    echo "  Muốn giữ compile:  apt-get install -y build-essential"
+fi
 
 # Kiểm tương thích phiên bản bằng CHÍNH bộ luật mà lần chạy sẽ dùng — không
 # chép lại logic ở đây để rồi hai chỗ trôi khỏi nhau.
