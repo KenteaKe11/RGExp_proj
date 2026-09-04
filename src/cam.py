@@ -323,7 +323,7 @@ def gradcam(router, pixel_values, class_ids=None, threshold=0.5, max_k=6):
     import torch
 
     was_training = router.training
-    router.eval()                       # BatchNorm: thống kê chạy, tất định
+    router.eval()                       # GroupNorm: train/eval như nhau
     try:
         with torch.enable_grad():
             logits, fmap = router.sup_forward(pixel_values)   # [B,14], [B,C,G,G]

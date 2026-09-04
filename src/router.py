@@ -90,26 +90,33 @@ NĂM CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
    phép NÉN có học, không phải space-to-depth bảo toàn.
 
 3. **BACKBONE TỰ TRAIN, KHÔNG PRETRAIN.** DownBlock là khối res-conv thường
-   (Conv-SiLU-BN-Conv-SiLU, cộng skip, BN, rồi Conv stride-2 nhân bốn kênh).
+   (Conv-SiLU-GN-Conv-SiLU, cộng skip, GN, rồi Conv stride-2 nhân bốn kênh).
    Không có ConvNeXt/DenseNet nạp trọng số ngoài: cả nhánh học từ số 0 trên
    chính dữ liệu này, nên không phải giải thích một tầng chuẩn hoá ảnh nào
    cho khớp quy ước của bộ trọng số vay mượn.
 
-4. **CÓ BATCHNORM — hai hệ quả phải biết.**
+4. **GROUPNORM, KHÔNG PHẢI BATCHNORM — và đó là một quyết định.**
 
-   (a) BN chuẩn hoá theo cả batch, nên KHI TRAIN gate của một ảnh phụ thuộc
-   các ảnh cùng micro-batch. Lúc `eval()` BN dùng thống kê chạy nên gate độc
-   lập hoàn toàn: eval, probe và generate đều tất định. Đây là lý do
-   `router.eval()` được gọi tường minh ở mọi chỗ đo. Với train_bs = 1 thì BN
-   train ≈ instance-norm (thống kê vẫn lấy trên 512×512 vị trí của một ảnh),
-   nên "phụ thuộc bạn cùng batch" là yếu — cái lệch thật nằm ở (b).
+   Chuẩn hoá trong DownBlock lấy thống kê trên (nhóm kênh × H × W) của TỪNG
+   ảnh, không lấy trên chiều batch. Ba hệ quả, cả ba đều là lý do đổi:
 
-   (b) `running_mean/var` bắt đầu ở (0, 1) và chỉ hội tụ sau khoảng trăm
-   micro-batch (momentum 0.1). Trước mốc đó, `eval()` chuẩn hoá bằng một
-   thống kê chưa đúng: val loss vài lần đầu và `logit_std_ratio` đo ở chế độ
-   eval sẽ xấu hơn hẳn cùng số đo đo ở chế độ train. Đó là hiện tượng ĐANG
-   KHỞI ĐỘNG, không phải hỏng wiring — đọc `logit_std_ratio` trong log train
-   (nó được tính ở chế độ train) và chỉ tin số eval sau vài trăm step.
+   (a) **Gate của một ảnh không phụ thuộc ảnh nào khác, ở MỌI chế độ.** Với
+   BatchNorm thì lúc train nó có phụ thuộc, nên `train_bs` — một tham số
+   HẠ TẦNG, đổi theo GPU thuê được — lại đổi cả tuyến đường expert. Ở đây
+   train_bs = 1 trên T4 và train_bs = 8 trên A100 cho cùng một gate; các ô
+   sweep so được với nhau.
+
+   (b) **train() và eval() cho ĐÚNG cùng một kết quả.** GroupNorm không có
+   `running_mean/var` nên không có giai đoạn hâm thống kê: val loss và
+   `logit_std_ratio` đo ở eval tin được ngay từ step đầu, không phải chờ vài
+   trăm micro-batch như bản BatchNorm. `router.eval()` vẫn được gọi ở mọi
+   chỗ đo, nhưng giờ nó là thói quen chứ không còn là điều kiện đúng đắn.
+
+   (c) **Không tốn thêm tham số.** GroupNorm(g, C) cũng chỉ có 2C số như
+   BatchNorm2d(C), nên công thức `_down_params` (54c² + 10c) giữ nguyên.
+
+   Số nhóm: 32 theo mặc định của Wu & He, tự hạ xuống ước lớn nhất của C khi
+   C < 32 (bậc đầu C = 1 → 1 nhóm, tức chuẩn hoá trên cả bản đồ 512×512).
 
 5. **MỘT THÂN, HAI QUERY.** Cross-Attn hút feat về đúng 2 vector: một cho
    nhánh supervised, một cho định tuyến. Hai nhiệm vụ dùng chung mọi thứ
@@ -159,6 +166,7 @@ GRID = IMG_SIZE // STRIDE       # 16
 N_TOKEN = GRID * GRID           # 256 token
 D_CONV = 4 ** N_BLOCK           # 1024 kênh ở bậc conv cuối
 N_HEAD = 8                      # số head của self-attn và cross-attn
+GN_GROUPS = 32                  # số nhóm mong muốn của GroupNorm trong conv
 HEAD_HIDDEN = 1024              # nút cổ chai của MLP trong hai head (GELU)
 N_QUERY = 2                     # 1 query cho supervised, 1 cho route
 
@@ -245,13 +253,34 @@ class SkipMLP(nn.Module):
         return x + self.net(x)
 
 
+def n_groups(c, target=GN_GROUPS):
+    """Số nhóm cho GroupNorm: G = min(C, 32).
+
+    32 là mặc định của bài GroupNorm gốc (Wu & He). Kênh trong nhánh này luôn
+    là luỹ thừa của 4 — 1, 4, 16, 64, 256 — nên min(C, 32) luôn CHIA HẾT C và
+    không cần dò ước: bậc 1-3 lấy G = C (mỗi kênh một nhóm, tức instance-norm),
+    bậc 4-5 lấy G = 32.
+    """
+    c = int(c)
+    g = min(int(target), c)
+    if c % g:
+        raise RuntimeError(
+            f"GroupNorm: {c} kênh không chia hết cho {g} nhóm. Luật nhân kênh "
+            f"đã đổi khỏi luỹ thừa của 4 — chọn số nhóm khác min(C, 32).")
+    return g
+
+
 class DownBlock(nn.Module):
     """Một bậc downsample: (C, H, W) → (4C, H/2, W/2).
 
         skip ─────────────────────────────────┐
-        Conv(C,C,3) → SiLU → BN → Conv(C,C,3) → SiLU → (+) → BN
+        Conv(C,C,3) → SiLU → GN → Conv(C,C,3) → SiLU → (+) → GN
                                                          │
                                         Conv(C,4C,3,s2) → SiLU
+
+    GroupNorm chứ không BatchNorm: thống kê lấy trong TỪNG ảnh, nên gate
+    không đổi theo `train_bs` và train()/eval() cho cùng kết quả (xem mục 4
+    của docstring module). Cùng số tham số (2C), nên `_down_params` không đổi.
 
     Nhân bốn kênh trong khi chia bốn diện tích, nên SỐ PHẦN TỬ không đổi qua
     mỗi bậc: 1×512² = 4×256² = … = 1024×16². Toàn bộ việc của khối là đổi
@@ -261,17 +290,19 @@ class DownBlock(nn.Module):
 
     def __init__(self, c):
         super().__init__()
+        g = n_groups(c)
         self.conv1 = nn.Conv2d(c, c, 3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(c)
+        self.norm1 = nn.GroupNorm(g, c)
         self.conv2 = nn.Conv2d(c, c, 3, stride=1, padding=1)
-        self.bn_skip = nn.BatchNorm2d(c)
+        self.norm_skip = nn.GroupNorm(g, c)
         self.down = nn.Conv2d(c, 4 * c, 3, stride=2, padding=1)
         self.act = nn.SiLU()
+        self.n_groups = g
 
     def forward(self, x):
-        h = self.bn1(self.act(self.conv1(x)))
+        h = self.norm1(self.act(self.conv1(x)))
         h = self.act(self.conv2(h))
-        h = self.bn_skip(h + x)
+        h = self.norm_skip(h + x)
         return self.act(self.down(h))
 
 
@@ -638,7 +669,8 @@ class RouterNet(nn.Module):
         không được dựng và autograd trả về None mà không báo gì.
 
         Không đụng tới trạng thái train/eval của module: chỗ gọi phải bảo đảm
-        `router.eval()` (BatchNorm dùng thống kê chạy, bản đồ mới tất định).
+        `router.eval()`. Với GroupNorm thì hai chế độ cho cùng kết quả, nên
+        đó giờ chỉ là thói quen chứ không còn là điều kiện đúng đắn.
         """
         fmap = self.extractor.conv_map(pixel_values)
         fmap = fmap.requires_grad_(True) if not fmap.requires_grad else fmap
@@ -757,7 +789,11 @@ def _swiglu_params(d_in, d_out):
 
 
 def _down_params(n_block=N_BLOCK):
-    """Mỗi bậc: 54c² + 10c (2 conv 3×3 + 2 BN + 1 conv stride-2 ra 4c)."""
+    """Mỗi bậc: 54c² + 10c (2 conv 3×3 + 2 GroupNorm + 1 conv stride-2 ra 4c).
+
+    GroupNorm(g, c) có đúng 2c tham số như BatchNorm2d(c), nên công thức này
+    không đổi khi đổi loại chuẩn hoá.
+    """
     total, c = 0, 1
     for _ in range(n_block):
         total += 54 * c * c + 10 * c
@@ -888,9 +924,9 @@ def _selftest():
           f"(hidden={net.sup_head.mlp.net[0].out_features})")
 
     # ── hình dạng + đường đi ────────────────────────────────────────────────
-    # Đo ở chế độ TRAIN: BN chưa có thống kê chạy nào đáng tin lúc mới dựng,
-    # nên eval() ở đây chuẩn hoá bằng (0, 1) và mọi số đo phân tán sẽ sai
-    # lệch (xem mục 4b của docstring module).
+    # Với GroupNorm thì train() và eval() cho CÙNG kết quả, nên chế độ đo ở
+    # đây không còn quan trọng — vẫn đặt train() tường minh để test nói rõ nó
+    # đang đứng ở đâu.
     x = _fake_cxr(8)
     net.train()
     sup, gate, prefix, st = net(x)
@@ -939,38 +975,58 @@ def _selftest():
           f"(sample {st['logit_std_sample']:.3f} / "
           f"expert {st['logit_std_expert']:.3f})")
 
-    # ── BatchNorm: hâm thống kê chạy rồi mới đo ở eval ──────────────────────
-    # `momentum = None` = trung bình CỘNG DỒN thay vì trượt: 20 batch là đủ
-    # để running_mean/var bằng đúng thống kê thật, thay vì còn vướng phần
-    # khởi tạo (0, 1). Trong lần chạy thật momentum vẫn là 0.1 và mốc này rơi
-    # vào khoảng vài trăm micro-batch đầu — trước đó val loss và
-    # `logit_std_ratio` đo ở eval đều xấu hơn số đo ở train.
-    print("\n  (hâm running stats của BatchNorm: 20 batch, trung bình cộng dồn)")
-    for m in net.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            m.reset_running_stats()
-            m.momentum = None
-    net.train()
-    with torch.no_grad():
-        for _ in range(20):
-            net(_fake_cxr(4))
-    net.eval()
-    _, _, _, ste = net(x)
-    check("eval() sau khi hâm BN bám sát train (ratio > 0.1)",
-          ste["logit_std_ratio"] > 0.1,
-          f"eval={ste['logit_std_ratio']:.3f} vs train="
-          f"{st['logit_std_ratio']:.3f}")
-    g_b8 = net(x)[1]
-    g_b1 = net(x[:1])[1]
-    g_b3 = net(x[:3].flip(0))[1]
-    check("eval(): gate không phụ thuộc cỡ batch hay bạn cùng batch",
-          torch.allclose(g_b8[0], g_b1[0], atol=1e-4)
-          and torch.allclose(g_b8[2], g_b3[0], atol=1e-4),
-          "(cùng ảnh, batch 8 / 1 / 3-đảo-thứ-tự -> cùng một gate)")
+    # ── GroupNorm: KHÔNG có thống kê chạy, KHÔNG nhìn chiều batch ───────────
+    # Đây là toàn bộ lý do đổi khỏi BatchNorm, nên nó được kiểm bằng ba tính
+    # chất chứ không bằng một dòng ghi chú:
+    #   (1) không còn lớp BatchNorm nào để hâm;
+    #   (2) train() và eval() cho ĐÚNG cùng một tensor — không có giai đoạn
+    #       "running stats chưa hội tụ" làm val loss vài trăm step đầu xấu giả;
+    #   (3) gate của một ảnh không đổi theo cỡ micro-batch hay theo việc ảnh
+    #       nào đứng cạnh nó — kể cả Ở CHẾ ĐỘ TRAIN, thứ bản BatchNorm không
+    #       làm được. `train_bs` là tham số hạ tầng (1 trên T4, 8 trên A100);
+    #       nó không được phép đổi tuyến đường expert.
+    gns = [m for m in net.modules() if isinstance(m, nn.GroupNorm)]
     bns = [m for m in net.modules()
            if isinstance(m, nn.modules.batchnorm._BatchNorm)]
-    check("có đúng 2 BatchNorm mỗi bậc downsample", len(bns) == 2 * N_BLOCK,
-          f"({len(bns)} lớp — train phụ thuộc batch, eval thì không)")
+    check("có đúng 2 GroupNorm mỗi bậc, KHÔNG còn BatchNorm nào",
+          len(gns) == 2 * N_BLOCK and not bns,
+          f"({len(gns)} GroupNorm, {len(bns)} BatchNorm | nhóm: "
+          + ",".join(str(b.n_groups) for b in net.extractor.blocks) + ")")
+    check("state_dict KHÔNG có running_mean/var (không gì để hâm)",
+          not [k for k in net.state_dict()
+               if "running_" in k or "num_batches_tracked" in k])
+    # Ngưỡng 1e-4 chứ không 1e-6, và KHÔNG phải vì chuẩn hoá: ở `eval()`
+    # `nn.MultiheadAttention` chuyển sang fast-path hợp nhất
+    # (`_native_multi_head_attention`) khi q is k is v và không cần trọng số
+    # attention. Cùng phép toán, khác thứ tự cộng dồn -> lệch ~1e-5 ở fp32.
+    # Đó là hằng số của thư viện, không phải trạng thái của module: hai lần
+    # chạy TRONG CÙNG một chế độ khớp từng bit.
+    net.train()
+    with torch.no_grad():
+        p_tr, p_tr2 = net(x)[2], net(x)[2]
+    net.eval()
+    with torch.no_grad():
+        _, _, p_ev, ste = net(x)
+    check("cùng chế độ -> prefix khớp TỪNG BIT (không có nguồn ngẫu nhiên)",
+          torch.equal(p_tr, p_tr2))
+    check("train() và eval() cho cùng một prefix (±fast-path của MHA)",
+          torch.allclose(p_tr, p_ev, atol=1e-4),
+          f"|Δ|max={float((p_tr - p_ev).abs().max()):.2e}")
+    check("eval(): logit_std_ratio bám sát train ngay từ đầu (không cần hâm)",
+          ste["logit_std_ratio"] > 0.1
+          and abs(ste["logit_std_ratio"] - st["logit_std_ratio"]) < 1e-4,
+          f"eval={ste['logit_std_ratio']:.3f} vs train="
+          f"{st['logit_std_ratio']:.3f}")
+    for mode in ("eval", "train"):
+        getattr(net, mode)()
+        with torch.no_grad():
+            g_b8 = net(x)[1]
+            g_b1 = net(x[:1])[1]
+            g_b3 = net(x[:3].flip(0))[1]
+        check(f"{mode}(): gate không phụ thuộc cỡ batch hay bạn cùng batch",
+              torch.allclose(g_b8[0], g_b1[0], atol=1e-4)
+              and torch.allclose(g_b8[2], g_b3[0], atol=1e-4),
+              "(cùng ảnh, batch 8 / 1 / 3-đảo-thứ-tự -> cùng một gate)")
 
     # ── aux loss: giá trị, biên, gradient ──────────────────────────────────
     net.train()

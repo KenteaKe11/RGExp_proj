@@ -461,9 +461,9 @@ def build_model(cfg, hf_token, log):
     log("router", f"    {router.decay_desc()}")
     log("router", f"    cân bằng tải: aux loss w={cfg.run.w_aux:g} "
                   f"(E·Σf·P, sàn 1.0) — không còn bias/trần tải/expert hứng")
-    log("router", "    BatchNorm: lúc TRAIN gate phụ thuộc bạn cùng "
-                  "micro-batch; eval/probe/generate dùng thống kê chạy nên "
-                  "tất định")
+    log("router", "    GroupNorm (G=min(C,32)): thống kê trong TỪNG ảnh nên "
+                  "gate KHÔNG phụ thuộc train_bs hay bạn cùng micro-batch; "
+                  "train/eval/probe/generate cho cùng một kết quả")
     for k, v in router.param_table().items():
         log("router", f"    {k:<30} {v:>12,}")
     log("lora", f"✓ {adapter_desc(f)} | trainable expert {n_expert_p:,} "

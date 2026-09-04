@@ -55,11 +55,12 @@ def RouterNet(*args, **kwargs):
     Nhánh router không nạp trọng số ngoài nào nữa nên không còn tham số
     `backbone` — hàm bọc này giữ lại chỉ để mọi test gọi cùng một tên.
 
-    LƯU Ý CHO NGƯỜI SỬA TEST: Feat-Extractor có BatchNorm, và
-    `running_mean/var` của một mạng vừa dựng còn ở (0, 1). Nên `train()` và
-    `eval()` cho HAI kết quả khác nhau, và mọi phép so sánh dưới đây phải
-    nằm TRONG cùng một chế độ. So gate lấy ở train với gate lấy ở eval là
-    đo mức hâm của BN chứ không đo thứ mình định đo.
+    LƯU Ý CHO NGƯỜI SỬA TEST: chuẩn hoá trong Feat-Extractor là GroupNorm
+    (G = min(C, 32)), không phải BatchNorm. Không có `running_mean/var`, nên
+    `train()` và `eval()` cho ĐÚNG cùng một kết quả và gate của một ảnh
+    không đổi theo cỡ micro-batch. Khác biệt DUY NHẤT còn lại giữa hai chế
+    độ là nhiễu Gumbel ở nhánh CHỌN top-k — nên chỗ nào so gate mà không
+    khớp thì thủ phạm là σ, không phải chuẩn hoá.
     """
     return _RouterNet(*args, **kwargs)
 
@@ -104,9 +105,8 @@ def test_router():
     # tức router phát ra gần như cùng một vector cho mọi ảnh, và top-k khi
     # ấy do cân bằng tải quyết định chứ không do nội dung ảnh. Dưới 0.1 thì
     # mọi tinh chỉnh σ/w_aux đều vô nghĩa.
-    # Đo ở chế độ TRAIN: BN của mạng mới dựng chưa có thống kê chạy nào
-    # đáng tin, nên eval() ở đây chuẩn hoá bằng (0, 1) và mọi số đo phân tán
-    # sẽ thấp giả tạo (xem src/router.py, mục 3b).
+    # GroupNorm: chế độ không ảnh hưởng số đo này nữa (σ chỉ tác động lên
+    # nhánh CHỌN top-k, còn logit_std_* đo trên route_logit SẠCH).
     net.train()
     with torch.no_grad():
         st8 = net(_fake_cxr(8), None)[3]
@@ -155,7 +155,6 @@ def test_route_noise():
         ge2, st_e = on(x, mask)[1], on(x, mask)[3]
         g1_eval = off(x, mask)[1]
     check("eval mode -> nhiễu TẮT, gate tất định", torch.equal(ge1, ge2))
-    # So TRONG CÙNG chế độ eval: BN của mạng mới dựng làm train != eval.
     check("eval mode -> khớp đúng router không nhiễu",
           torch.equal(ge1, g1_eval))
 
@@ -170,9 +169,8 @@ def test_route_noise():
           and int((gt1 > 0).sum(dim=-1).min()) == K)
     check("có nhiễu: Σ gate vẫn = 1",
           torch.allclose(gt1.sum(-1), torch.ones(B), atol=1e-5))
-    # So TRONG CÙNG chế độ train (BatchNorm làm train != eval trên mạng mới
-    # dựng): σ=1.0 và σ=0 phải cho CÙNG route_entropy, vì entropy đo trên
-    # logit SẠCH — nhiễu chỉ nằm ở nhánh CHỌN top-k.
+    # σ=1.0 và σ=0 phải cho CÙNG route_entropy, vì entropy đo trên logit
+    # SẠCH — nhiễu chỉ nằm ở nhánh CHỌN top-k.
     check("route_entropy đo trên logit SẠCH -> σ không đổi được nó",
           abs(st_t["route_entropy"] - st_off["route_entropy"]) < 1e-5,
           f"σ=1 {st_t['route_entropy']:.5f} vs σ=0 "
@@ -592,25 +590,37 @@ def test_aux():
                   ("n_shared", "n_route", "shared_weight", "capacity_factor",
                    "bias_clip", "apply_bias_at_eval")))
 
-    # ── (4) gate KHÔNG còn cơ chế nào nhìn cả batch — trừ BatchNorm ────────
-    # Cân bằng tải là một số hạng loss, không phải trần tải mỗi micro-batch,
-    # nên ở EVAL gate của một ảnh độc lập hoàn toàn. Ở TRAIN thì không:
-    # BatchNorm trong Feat-Extractor chuẩn hoá theo cả batch. Đó là cái giá
-    # của backbone tự train và nó được kiểm ra ở đây, không phải giấu đi.
+    # ── (4) gate KHÔNG có cơ chế nào nhìn cả batch, ở CẢ HAI chế độ ────────
+    # Cân bằng tải là một số hạng loss chứ không phải trần tải mỗi
+    # micro-batch, và chuẩn hoá là GroupNorm chứ không BatchNorm — nên gate
+    # của một ảnh độc lập hoàn toàn kể cả lúc train. Đây là điều kiện để
+    # `train_bs` (1 trên T4, 8 trên A100) không đổi tuyến đường expert.
+    _sig = net.set_route_noise(0.0)      # tắt Gumbel: chỉ còn chuẩn hoá
+    for mode in ("eval", "train"):
+        getattr(net, mode)()
+        with torch.no_grad():
+            g_all = net(x, mask)[1]
+            g_one = net(x[:1], mask[:1])[1]
+            g_rev = net(x[:3].flip(0), mask[:3])[1]
+        check(f"{mode}: cùng ảnh, batch 12/1/3-đảo -> cùng một gate",
+              torch.allclose(g_all[0], g_one[0], atol=1e-4)
+              and torch.allclose(g_all[2], g_rev[0], atol=1e-4))
+    net.set_route_noise(_sig)
     net.eval()
     with torch.no_grad():
-        g_all = net(x, mask)[1]
-        g_one = net(x[:1], mask[:1])[1]
-        g_rev = net(x[:3].flip(0), mask[:3])[1]
-    check("eval: cùng ảnh, batch 12/1/3-đảo -> cùng một gate",
-          torch.allclose(g_all[0], g_one[0], atol=1e-4)
-          and torch.allclose(g_all[2], g_rev[0], atol=1e-4))
+        p_ev = net(x, mask)[2]
     net.train()
     with torch.no_grad():
-        gt_all = net(x, mask)[1]
-        gt_one = net(x[:1], mask[:1])[1]
-    check("train: BatchNorm làm gate phụ thuộc bạn cùng batch (đã biết)",
-          not torch.allclose(gt_all[0], gt_one[0], atol=1e-4))
+        p_tr = net(x, mask)[2]
+    # atol 1e-4: phần lệch còn lại KHÔNG đến từ chuẩn hoá mà từ fast-path
+    # của nn.MultiheadAttention ở eval() (~1e-5 fp32). GroupNorm tự nó cho
+    # hai chế độ kết quả bằng nhau từng bit.
+    check("GroupNorm: train() và eval() cho cùng một prefix",
+          torch.allclose(p_tr, p_ev, atol=1e-4),
+          f"|Δ|max={float((p_tr - p_ev).abs().max()):.2e}")
+    check("không còn lớp BatchNorm nào trong nhánh router",
+          not [m for m in net.modules()
+               if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)])
 
     # ── (5) `balance` trong stats == đúng L_aux ─────────────────────────────
     with torch.no_grad():
@@ -686,8 +696,8 @@ def test_decay():
           and plain.decay_samples == 0)
 
     # ── (4) σ giảm thì tuyến đường thôi đảo (khám phá -> khai thác) ─────────
-    # Mốc so sánh lấy Ở CHẾ ĐỘ TRAIN với σ = 0: BatchNorm làm train != eval
-    # trên mạng mới dựng, nên lấy mốc ở eval thì `churn` đo lẫn cả cái đó.
+    # Mốc so sánh lấy Ở CHẾ ĐỘ TRAIN với σ = 0, cùng chế độ với các lần đo
+    # sau, để `churn` chỉ đo tác động của σ.
     net.train()
     _sig = net.set_route_noise(0.0)
     with torch.no_grad():
@@ -709,9 +719,15 @@ def test_decay():
     # Điểm quan trọng của đợt này: σ_end = 0.5 chứ không phải 0. Từ khi bỏ
     # bias, Gumbel là cơ chế khám phá DUY NHẤT — tắt nó là đóng băng tuyến
     # đường, và aux loss không sửa được (nó chỉ nắn qua P_e).
+    # 60 lượt × 4 ảnh × K = 960 ô chọn cho 12 expert. Con số này là ĐỘ NHẠY
+    # của phép đo, không phải một siêu tham số: câu hỏi là "expert có CỬA để
+    # được chọn không", và trên mạng CHƯA TRAIN thì route_logit đã lệch sẵn
+    # vài phần mười — với quá ít lượt, expert xếp cuối trượt vì xui chứ không
+    # vì bị khoá. Nếu vẫn có expert không xuất hiện sau 960 ô thì σ = 0.5 đã
+    # thật sự không đủ để lật thứ hạng, và đó mới là điều test này muốn bắt.
     seen = torch.zeros(E, dtype=torch.bool)
     with torch.no_grad():
-        for _ in range(20):
+        for _ in range(60):
             seen |= (net(x[:4], mask[:4])[1] > 0).any(dim=0)
     check("σ=0.5: mọi expert vẫn có lúc được chọn (không expert nào chết)",
           bool(seen.all()), f"{int(seen.sum())}/{E}")
