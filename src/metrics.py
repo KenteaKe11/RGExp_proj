@@ -165,9 +165,7 @@ def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
         "run_tag": cfg.arch.tag,
         "n_expert": cfg.fixed.n_expert,
         "top_k": cfg.fixed.top_k,
-        "router_backbone": cfg.fixed.router_backbone,
         "router_img_size": int(cfg.fixed.router_img_size),
-        "router_frozen_upto": int(cfg.fixed.router_frozen_upto),
         "route_noise": float(getattr(cfg.fixed, "route_noise", 0.5) or 0.0),
         # Lịch decay: hai lần chạy cùng σ cuối nhưng khác σ đầu là hai buổi
         # train KHÁC nhau — không ghi lại thì bảng metrics không giải thích
