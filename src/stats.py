@@ -199,6 +199,30 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     return adj
 
 
+def perm_resolution_warning(n_tests: int, n_perm: int, alpha: float) -> str | None:
+    """Cảnh báo khi n_perm quá nhỏ để BẤT KỲ kết quả nào sống sót qua Holm.
+
+    p-value permutation có sàn cứng 1/(B+1). Holm nhân p nhỏ nhất với số kiểm
+    định m. Nên nếu m/(B+1) >= alpha thì KHÔNG kiểm định nào có thể đạt ý nghĩa
+    — dù hai model khác nhau một trời một vực.
+
+    Đây đúng là ca hỏng im lặng: bảng vẫn in ra đủ số, cột kết luận toàn "không
+    có ý nghĩa", và người đọc kết luận sai rằng ba model tương đương. Với
+    n_perm = 400 và 21 kiểm định thì sàn Holm là 0.052 — vừa đủ để mọi thứ trông
+    như âm tính. Rẻ hơn nhiều nếu nói thẳng ra ở đây.
+    """
+    if n_tests <= 0 or n_perm <= 0:
+        return None
+    floor = n_tests / (n_perm + 1)
+    if floor < alpha:
+        return None
+    need = int(n_tests / alpha)
+    return (f"n_perm={n_perm} là QUÁ NHỎ cho {n_tests} kiểm định: p nhỏ nhất có "
+            f"thể là 1/{n_perm + 1} = {1/(n_perm+1):.5f}, nhân {n_tests} (Holm) "
+            f"thành {floor:.4f} >= alpha {alpha}. Không kiểm định nào có thể đạt "
+            f"ý nghĩa, kể cả khi khác biệt là thật. Cần n_perm >= {need}.")
+
+
 # ── Ghép mọi cặp × mọi metric ──────────────────────────────────────────────
 def compare_all(scores: dict[str, pd.DataFrame], metrics: list[str],
                 cfg_stats: dict, seed: int = 42) -> pd.DataFrame:
@@ -252,6 +276,10 @@ def compare_all(scores: dict[str, pd.DataFrame], metrics: list[str],
         df[f"p_{base}_bh_permetric"] = bg
 
     alpha = float(cfg_stats.get("alpha", 0.05))
+    warn = perm_resolution_warning(len(df), n_perm, alpha)
+    if warn:
+        print(f"  ⚠ {warn}", flush=True)
+        df.attrs["underpowered"] = warn
     # Kết luận CHÍNH THỨC: permutation + Holm toàn cục. Nghiêm nhất trong bảng,
     # và là thứ nên trích khi viết "khác biệt có ý nghĩa thống kê".
     df["significant"] = df["p_perm_holm_global"] < alpha

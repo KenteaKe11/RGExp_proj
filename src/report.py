@@ -119,6 +119,9 @@ def build_markdown(cfg, summary: pd.DataFrame, tests: pd.DataFrame,
     # ── Bảng 2 ──────────────────────────────────────────────────────────────
     A("## 2. Kiểm định từng cặp")
     A("")
+    if manifest.get("stats_warning"):
+        A(f"> ⚠ **{manifest['stats_warning']}**")
+        A("")
     A(f"Metric chính: **{primary}**. Cột `p (Holm)` là kết luận chính thức —")
     A("permutation, hiệu chỉnh Holm trên **toàn bộ** bảng kiểm định.")
     A("")

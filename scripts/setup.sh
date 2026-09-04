@@ -261,17 +261,19 @@ PYEOF
 echo
 echo "═══ setup xong ═══"
 echo
-echo "  1. Token (gemma-3 là gated repo, phải có token ĐÃ được cấp quyền):"
-echo "       export HF_TOKEN=hf_xxxxxxxx"
+echo "  1. Token:"
+echo "       export HF_TOKEN=hf_xxxxxxxx        # BẮT BUỘC (gemma-3 gated + repo private)"
+echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ từ xa (https://wandb.ai/authorize)"
+echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
 echo "  2. Thử nhanh 8 ảnh (~5 phút, không đẩy lên Hub):"
 echo "       bash scripts/run.sh --dry-run"
 echo
 echo "  3. CHẠY THẬT — một lệnh, trọn §2.1:"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       tmux new -s rg          # máy thuê: ssh đứt là mất phiên"
-    echo "       bash scripts/run.sh"
-    echo "       # Ctrl-b d để thoát tmux;  tmux attach -t rg  để vào lại"
+    echo "       bash scripts/run.sh --detach"
+    echo "       # chạy nền, trả lại shell ngay, in link W&B. ssh đứt không giết nó,"
+    echo "       # và không cần tmux — tiến độ xem trên W&B."
 else
     echo "       bash scripts/run.sh"
 fi

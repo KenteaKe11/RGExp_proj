@@ -23,6 +23,7 @@ import pandas as pd
 from . import report as report_mod
 from .config import (Cfg, add_common_args, enabled_models, hf_token,
                      load_config, resolved_snapshot, seed_everything)
+from .tracking import Tracker
 
 STAGES = ["data", "infer", "score", "stats", "report", "push"]
 
@@ -83,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="8 ảnh, bootstrap/permutation 200 lần, KHÔNG đẩy Hub")
     ap.add_argument("--rescore", action="store_true", help="tính lại metric dù đã có CSV")
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--no-wandb", action="store_true", help="tắt theo dõi W&B")
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config, a.overrides)
@@ -95,9 +97,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg["stats"]["n_perm"] = 200
         cfg["output"]["push"] = False
         cfg["output"]["subdir"] = str(cfg["output"].get("subdir", "run")) + "_dryrun"
+        cfg.setdefault("wandb", {})["tags"] = list(
+            cfg.get("wandb", {}).get("tags", []) or []) + ["dry-run"]
         print("⚙ DRY-RUN: 8 ảnh, bootstrap/permutation 200, không đẩy Hub", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
+    if a.no_wandb:
+        cfg.setdefault("wandb", {})["enabled"] = False
 
     seed_everything(int(cfg.get("seed", 42)))
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
@@ -123,6 +129,13 @@ def main(argv: list[str] | None = None) -> int:
     }
     t_start = time.time()
     print(f"⚙ run dir: {run_dir}", flush=True)
+
+    tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
+    if tracker.url:
+        manifest["wandb_url"] = tracker.url
+    tracker.summary({"run/stages": ",".join(stages),
+                     "run/models_declared": ",".join(manifest["models_declared"]),
+                     **{f"env/{k}": v for k, v in manifest["env"].items()}})
     if not hf_token():
         print("⚠ Không thấy HF_TOKEN. google/gemma-3-4b-it là gated repo và repo dữ "
               "liệu là private — nhiều khả năng sẽ 401.\n"
@@ -132,10 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     from . import data as data_mod
 
     if "data" in stages:
-        df = data_mod.prepare(cfg)
+        df = data_mod.prepare(cfg, tracker)
     else:
         df = data_mod.load_manifest(cfg)
         print(f"⚙ dùng lại manifest: {len(df)} mẫu", flush=True)
+    tracker.summary({"data/n_samples": len(df)})
 
     # ── infer ───────────────────────────────────────────────────────────────
     pred_paths = {m["id"]: run_dir / "predictions" / f"{m['id']}.jsonl" for m in models}
@@ -147,11 +161,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n── {m.get('name', m['id'])} ({m['hf_id']}) ──", flush=True)
             t0 = time.time()
             try:
-                build(cfg, m).run(df, pred_paths[m["id"]])
+                build(cfg, m, tracker).run(df, pred_paths[m["id"]],
+                                           log_every=tracker.log_every)
                 manifest["model_status"][m["id"]] = {"ok": True,
                                                      "minutes": round((time.time()-t0)/60, 1)}
             except Exception as e:
                 manifest["model_status"][m["id"]] = {"ok": False, "error": repr(e)}
+                tracker.summary({f"infer/{m['id']}/failed": repr(e)})
+                tracker.alert("Model hỏng khi infer",
+                              f"{m['id']}: {e!r}\nrun={run_id}",
+                              "WARN" if m.get("optional", False) else "ERROR")
                 if m.get("optional", False):
                     # Model tuỳ chọn hỏng KHÔNG được giết cả lần chạy: hai model
                     # kia có thể đã tốn nhiều giờ GPU và kết quả của chúng vẫn
@@ -193,6 +212,10 @@ def main(argv: list[str] | None = None) -> int:
             sdf.to_csv(csv_path, index=False)
             scores[mid] = sdf
             corpus[mid] = c
+            from .metrics import metric_columns as _mc
+            tracker.summary({f"score/{mid}/{k}": float(sdf[k].mean()) for k in _mc(sdf)})
+            tracker.summary({f"score/{mid}/n": len(sdf),
+                             f"score/{mid}/n_empty": int(sdf["empty"].sum())})
         corpus_path.write_text(json.dumps(corpus, indent=2), encoding="utf-8")
     else:
         for m in models:
@@ -202,6 +225,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not scores:
         print("✗ Không có model nào chấm được điểm. Kiểm tra stage infer.", flush=True)
+        tracker.alert("§2.1 hỏng", f"run={run_id}: không model nào chấm được điểm",
+                      "ERROR")
+        tracker.finish(1)
         return 1
 
     # ── căn cùng tập ảnh ────────────────────────────────────────────────────
@@ -232,6 +258,11 @@ def main(argv: list[str] | None = None) -> int:
         tests = compare_all(scores, cols, dict(cfg["stats"]), seed=int(cfg.get("seed", 42)))
         tests.to_csv(tests_path, index=False)
         n_sig = int(tests["significant"].sum()) if not tests.empty else 0
+        tracker.table("stats/pairwise_tests", tests)
+        tracker.summary({"stats/n_tests": len(tests), "stats/n_significant": n_sig})
+        if tests.attrs.get("underpowered"):
+            manifest["stats_warning"] = tests.attrs["underpowered"]
+            tracker.summary({"stats/underpowered": tests.attrs["underpowered"]})
         print(f"✓ xong sau {time.time()-t0:.1f}s — {n_sig}/{len(tests)} kiểm định "
               f"có ý nghĩa (perm + Holm toàn cục, α={cfg['stats'].get('alpha', 0.05)})",
               flush=True)
@@ -249,6 +280,13 @@ def main(argv: list[str] | None = None) -> int:
             names.get(m["id"], m["id"]) for m in models if m["id"] not in scores]
         manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
         report_mod.write_all(cfg, run_dir, scores, corpus, names, tests, manifest)
+        summary_csv = run_dir / "metrics" / "summary.csv"
+        if summary_csv.exists():
+            tracker.table("results/summary", pd.read_csv(summary_csv))
+        tracker.save_file(run_dir / "REPORT.md")
+        tracker.summary({"run/n_eval": len(order),
+                         "run/models_scored": ",".join(scores),
+                         "run/minutes_total": manifest["minutes_total"]})
 
     # ── push ────────────────────────────────────────────────────────────────
     if "push" in stages and cfg["output"].get("push", True):
@@ -258,12 +296,19 @@ def main(argv: list[str] | None = None) -> int:
         url = push_results(cfg, run_dir)
         if url:
             manifest["hub_url"] = url
+            tracker.summary({"run/hub_url": url})
             (run_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8")
 
-    print(f"\n✓ HOÀN TẤT sau {(time.time()-t_start)/60:.1f} phút", flush=True)
+    mins = (time.time() - t_start) / 60
+    tracker.alert("§2.1 chạy xong",
+                  f"run={run_id} · {len(order)} ảnh · {len(scores)} model · {mins:.0f} phút")
+    tracker.finish(0)
+    print(f"\n✓ HOÀN TẤT sau {mins:.1f} phút", flush=True)
     print(f"  báo cáo : {run_dir / 'REPORT.md'}", flush=True)
+    if tracker.url:
+        print(f"  W&B     : {tracker.url}", flush=True)
     if manifest.get("hub_url"):
         print(f"  trên Hub: {manifest['hub_url']}", flush=True)
     return 0

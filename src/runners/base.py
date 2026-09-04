@@ -18,6 +18,36 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import Cfg
+from ..tracking import NullTracker
+
+
+def repair_tail(path: Path) -> int:
+    """Cắt bỏ dòng CUỐI nếu nó chưa kết thúc bằng newline. Trả số byte đã bỏ.
+
+    Ctrl-C (hay máy thuê hết giờ) giữa lúc ghi để lại một dòng JSON cụt. Mở
+    tiếp ở chế độ append thì bản ghi mới bị NỐI THẲNG vào dòng cụt đó, và file
+    mang một dòng hỏng vĩnh viễn: khâu đọc bỏ qua được, nhưng bất cứ ai — hay
+    công cụ nào — đọc file sau này cũng vấp phải nó, và ảnh nằm trong dòng đó
+    thì im lặng biến mất khỏi kết quả.
+
+    Rẻ hơn nhiều nếu dọn ngay lúc mở file, trước khi ghi thêm gì.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    with open(path, "rb+") as f:
+        f.seek(-1, 2)
+        if f.read(1) == b"\n":
+            return 0
+        size = path.stat().st_size
+        # Quét ngược tìm newline cuối. Dòng JSONL ở đây dài vài trăm byte tới
+        # vài KB, nên đọc lùi 1 MB là quá đủ mà không phải nạp cả file.
+        window = min(size, 1 << 20)
+        f.seek(size - window)
+        tail = f.read(window)
+        nl = tail.rfind(b"\n")
+        keep = size - window + nl + 1 if nl >= 0 else 0
+        f.truncate(keep)
+        return size - keep
 
 
 class Runner:
@@ -25,11 +55,12 @@ class Runner:
 
     name = "base"
 
-    def __init__(self, cfg: Cfg, mcfg: Cfg):
+    def __init__(self, cfg: Cfg, mcfg: Cfg, tracker=None):
         self.cfg = cfg
         self.mcfg = mcfg
         self.model = None
         self.processor = None
+        self.tracker = tracker or NullTracker()
 
     # ── giao diện con lớp phải cài ──────────────────────────────────────────
     def load(self) -> None:
@@ -95,6 +126,11 @@ class Runner:
     def run(self, df: pd.DataFrame, out_path: Path, log_every: int = 20) -> Path:
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
+        cut = repair_tail(out_path)
+        if cut:
+            print(f"  ⚠ dọn {cut} byte của dòng cuối bị cắt dở (lần chạy trước bị dừng "
+                  f"giữa lúc ghi)", flush=True)
+
         done: set[str] = set()
         if out_path.exists():
             # Đọc lại bằng try/except từng dòng: file bị cắt giữa chừng vì
@@ -124,6 +160,9 @@ class Runner:
         bs = max(1, int(self.mcfg.get("batch_size", 1)))
         t0 = time.time()
         n_done = 0
+        n_empty = 0
+        n_batch_failed = 0
+        samples: list[dict] = []
         with open(out_path, "a", encoding="utf-8") as f:
             for i in range(0, len(todo), bs):
                 batch = todo[i:i + bs]
@@ -137,6 +176,7 @@ class Runner:
                     # thật sự hỏng và đi tiếp. Chuỗi rỗng vẫn chấm được (điểm 0)
                     # và số ảnh hỏng được đếm vào báo cáo.
                     print(f"  ⚠ batch {i//bs} hỏng ({e!r}) -> thử từng ảnh", flush=True)
+                    n_batch_failed += 1
                     self._free()
                     outs = []
                     for item in batch:
@@ -148,6 +188,16 @@ class Runner:
                             self._free()
                 dt = time.time() - t1
                 for item, text in zip(batch, outs):
+                    if not text.strip():
+                        n_empty += 1
+                    if len(samples) < int(self.cfg.get_path("wandb.log_samples", 20) or 0):
+                        # Vài mẫu văn bản thật, gửi lên sớm. Nhìn số BLEU không
+                        # phân biệt được "model viết sai" với "model từ chối trả
+                        # lời" hay "prompt dính vào output" — ba ca cần ba cách
+                        # sửa khác hẳn nhau, và biết ở phút thứ 5 rẻ hơn nhiều
+                        # so với biết sau ba giờ.
+                        samples.append({"key": item["key"], "ref": item.get("ref", "")[:600],
+                                        "pred": text[:600]})
                     f.write(json.dumps({
                         "key": item["key"],
                         "pred": text,
@@ -162,10 +212,42 @@ class Runner:
                     eta = (len(todo) - n_done) / max(1e-9, rate)
                     print(f"  [{self.name}] {n_done}/{len(todo)} | {rate:.2f} ảnh/s "
                           f"| còn ~{eta/60:.1f} phút", flush=True)
+                    mid = self.mcfg["id"]
+                    self.tracker.log({
+                        f"infer/{mid}/done": len(done) + n_done,
+                        f"infer/{mid}/total": len(df),
+                        f"infer/{mid}/pct": 100.0 * (len(done) + n_done) / max(1, len(df)),
+                        f"infer/{mid}/rate_img_s": rate,
+                        f"infer/{mid}/eta_min": eta / 60,
+                        f"infer/{mid}/n_empty": n_empty,
+                        f"infer/{mid}/n_batch_failed": n_batch_failed,
+                        **self._vram(),
+                    })
 
         self.unload()
-        print(f"✓ {self.name}: xong sau {(time.time()-t0)/60:.1f} phút -> {out_path}", flush=True)
+        mins = (time.time() - t0) / 60
+        mid = self.mcfg["id"]
+        self.tracker.samples(f"samples/{mid}", samples)
+        self.tracker.summary({
+            f"infer/{mid}/minutes": round(mins, 1),
+            f"infer/{mid}/n_generated": n_done,
+            f"infer/{mid}/n_empty": n_empty,
+            f"infer/{mid}/n_batch_failed": n_batch_failed,
+        })
+        print(f"✓ {self.name}: xong sau {mins:.1f} phút -> {out_path}", flush=True)
         return out_path
+
+    @staticmethod
+    def _vram() -> dict:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return {}
+            return {"sys/vram_alloc_gb": torch.cuda.memory_allocated() / 1024 ** 3,
+                    "sys/vram_peak_gb": torch.cuda.max_memory_allocated() / 1024 ** 3}
+        except Exception:
+            return {}
 
     @staticmethod
     def _free() -> None:

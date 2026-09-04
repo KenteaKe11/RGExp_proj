@@ -12,6 +12,7 @@ hợp lý nhưng sai, nên phải bị bắt bằng kiểm thử chứ không ph
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -76,7 +77,16 @@ def test_stats() -> None:
     check("BH <= Holm", np.all(b <= h + 1e-12))
     check("Holm đơn điệu theo p", np.all(np.diff(h[np.argsort(p)]) >= -1e-12))
 
-    # 6. compare_all: ghép cặp có đúng chiều không.
+    # 6. Sàn p của permutation so với Holm — ca hỏng IM LẶNG.
+    from src.stats import perm_resolution_warning
+    check("cảnh báo khi n_perm quá nhỏ cho số kiểm định",
+          perm_resolution_warning(21, 400, 0.05) is not None)
+    check("không cảnh báo khi n_perm đủ lớn",
+          perm_resolution_warning(24, 10000, 0.05) is None)
+    check("biên: m/(B+1) vừa đúng alpha thì vẫn cảnh báo",
+          perm_resolution_warning(5, 99, 0.05) is not None)
+
+    # 7. compare_all: ghép cặp có đúng chiều không.
     n = 300
     keys = [f"k{i}" for i in range(n)]
     base = rng.random(n)
@@ -159,61 +169,92 @@ def test_metrics(enabled: bool) -> None:
 def test_zip() -> None:
     """Trích ảnh từ zip — kiểm bằng zip TỰ TẠO, không cần mạng.
 
-    Ba thứ được kiểm ở đây đều là loại lỗi im lặng: dò sai lớp bọc trong zip
-    (mọi ảnh "thiếu"), thu nhỏ sai (ảnh vào model lệch phân phối), và guard tốc
-    độ không nổ (chạy 30 giờ trên máy tính tiền theo giờ mà không ai biết).
+    Trọng tâm: cây thư mục BÊN TRONG zip không nhất thiết giống img_rel trong
+    CSV. Dò sai layout là lỗi im lặng tệ nhất của khâu dữ liệu — triệu chứng là
+    "cả 3000 ảnh đều thiếu", rất dễ tưởng nhầm sang hỏng mạng hoặc sai token.
+    Nên kiểm đủ bốn cách sắp zip đã gặp hoặc có thể gặp.
     """
     import zipfile
 
     from PIL import Image
 
-    from src.data import (StreamTooSlow, _extract, _resolve_prefix,
-                          _save_resized, _cache_path)
+    from src.data import (StreamTooSlow, _cache_path, _extract, _save_resized,
+                          build_name_map)
 
     print("\n[zip]")
-    keys = [f"files/p1{i}/s{i}/img{i}.jpg" for i in range(6)]
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        zpath = root / "img_dir.zip"
-        # Ghi NGƯỢC thứ tự để bài kiểm tra sắp-xếp-theo-offset có ý nghĩa.
-        with zipfile.ZipFile(zpath, "w") as zf:
-            for k in reversed(keys):
+    keys = [f"files/p1{i}/p1{i}00000{i}/s5{i}/img{i}.jpg" for i in range(6)]
+
+    def make_zip(path, name_of):
+        with zipfile.ZipFile(path, "w") as zf:
+            for k in reversed(keys):          # ghi ngược -> bài kiểm sắp offset có nghĩa
                 buf = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
                 Image.new("RGB", (1200, 900), (30, 30, 30)).save(buf.name, "JPEG")
-                zf.write(buf.name, "img_dir/" + k)
+                zf.write(buf.name, name_of(k))
+        return path
 
-        with zipfile.ZipFile(zpath) as zf:
-            names = set(zf.namelist())
-            prefix = _resolve_prefix(names, keys[0])
-            check("dò được lớp bọc trong zip", prefix == "img_dir/", f"{prefix!r}")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        layouts = {
+            "nguyên img_rel": lambda k: k,
+            "có lớp bọc": lambda k: "img_dir/" + k,
+            # cách sắp mới: bỏ hẳn tầng files/pXX
+            "bỏ tầng files/pXX": lambda k: "img_dir/" + "/".join(k.split("/")[2:]),
+            "phẳng hoàn toàn": lambda k: k.rsplit("/", 1)[-1],
+        }
+        for label, fn in layouts.items():
+            zp = make_zip(root / f"{abs(hash(label))}.zip", fn)
+            with zipfile.ZipFile(zp) as zf:
+                files = [i.filename for i in zf.infolist() if not i.is_dir()]
+                mapping, missing, desc = build_name_map(files, keys)
+                check(f"layout '{label}': ghép đủ 6 key",
+                      len(mapping) == 6 and not missing, f"missing={missing} · {desc}")
+                cache = root / f"c_{abs(hash(label))}"
+                bad = _extract(zf, mapping, keys, cache, 768, "t")
+                check(f"layout '{label}': trích ra đúng file",
+                      bad == [] and all(_cache_path(cache, k).exists() for k in keys))
+
+        # Trùng tên file giữa hai thư mục -> phải chọn theo đuôi dài nhất.
+        zp = root / "dup.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            b = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            Image.new("RGB", (60, 60)).save(b.name, "JPEG")
+            zf.write(b.name, "a/s50/img0.jpg")
+            zf.write(b.name, "b/s50/img0.jpg")
+            zf.write(b.name, "x/p100000000/s50/img0.jpg")
+        with zipfile.ZipFile(zp) as zf:
+            files = [i.filename for i in zf.infolist() if not i.is_dir()]
+            mp, _, _ = build_name_map(files, ["files/p10/p100000000/s50/img0.jpg"])
+            check("trùng tên file: chọn ứng viên chung đuôi dài nhất",
+                  mp["files/p10/p100000000/s50/img0.jpg"] == "x/p100000000/s50/img0.jpg",
+                  str(mp))
+
+        # Ảnh: thu nhỏ, guard tốc độ, key thiếu
+        zp = make_zip(root / "main.zip", lambda k: "img_dir/" + k)
+        with zipfile.ZipFile(zp) as zf:
+            files = [i.filename for i in zf.infolist() if not i.is_dir()]
+            mapping, _, _ = build_name_map(files, keys)
             cache = root / "cache"
-            bad = _extract(zf, prefix, keys, cache, 768, "test")
-            check("trích đủ ảnh, không lỗi", bad == [], f"{bad}")
-            check("mọi ảnh nằm đúng chỗ trong cache",
-                  all(_cache_path(cache, k).exists() for k in keys))
+            _extract(zf, mapping, keys, cache, 768, "t")
             im = Image.open(_cache_path(cache, keys[0]))
             check("thu nhỏ đúng cạnh dài 768", max(im.size) == 768, f"{im.size}")
             check("giữ nguyên tỉ lệ khung", abs(im.size[0]/im.size[1] - 1200/900) < 0.01)
 
-            # Guard tốc độ: min_rate rất cao + probe sớm -> phải NỔ, không im lặng.
             raised = False
             try:
-                _extract(zf, prefix, keys, root / "c2", 768, "slow",
+                _extract(zf, mapping, keys, root / "c2", 768, "slow",
                          min_rate=1e9, probe_after=2)
             except StreamTooSlow:
                 raised = True
             check("guard tốc độ nổ đúng lúc", raised)
 
-            # Key không có trong zip: phải báo hỏng chứ không làm sập cả mẻ.
-            bad2 = _extract(zf, prefix, keys[:2] + ["files/khong/co/x.jpg"],
-                            root / "c3", 768, "missing")
+            ghost = "files/khong/co/gi/x.jpg"
+            mp2, miss2, _ = build_name_map(files, keys[:2] + [ghost])
+            bad2 = _extract(zf, mp2, keys[:2] + [ghost], root / "c3", 768, "missing")
             check("key thiếu bị đánh dấu hỏng, mẻ vẫn chạy tiếp",
-                  bad2 == ["files/khong/co/x.jpg"], f"{bad2}")
+                  miss2 == [ghost] and bad2 == [ghost], f"{miss2} {bad2}")
 
-        # Ghi qua file tạm rồi đổi tên: không để lại .part
         dest = root / "x" / "y.jpg"
-        buf = io_bytes()
-        _save_resized(buf, dest, 256)
+        _save_resized(io_bytes(), dest, 256)
         check("ghi ảnh không để lại file .part",
               dest.exists() and not list(dest.parent.glob("*.part")))
 
@@ -226,6 +267,158 @@ def io_bytes() -> bytes:
     b = _io.BytesIO()
     Image.new("RGB", (400, 400), (200, 10, 10)).save(b, "JPEG")
     return b.getvalue()
+
+
+def test_runner_loop() -> None:
+    """Vòng chạy chung của runner: resume, batch hỏng, đếm rỗng.
+
+    Ba hành vi này quyết định chuyện một lần chạy nhiều giờ trên máy tính tiền
+    theo giờ có cứu được sau khi đứt hay không — nhưng chúng chỉ lộ ra khi có
+    sự cố thật, nên phải dựng sự cố giả để kiểm.
+    """
+    import pandas as pd
+
+    from src.config import Cfg
+    from src.runners.base import Runner
+
+    print("\n[vòng chạy runner]")
+    cfg = Cfg({"generate": {"max_new_tokens": 8, "do_sample": False, "num_beams": 1},
+               "wandb": {"log_samples": 3}})
+    keys = [f"k{i}" for i in range(7)]
+    df = pd.DataFrame({"key": keys, "ref": ["r"] * 7,
+                       "image_path": ["/x.jpg"] * 7})
+
+    class Fake(Runner):
+        name = "fake"
+
+        def __init__(self, cfg, mcfg, fail_batch=False, fail_all=False):
+            super().__init__(cfg, mcfg)
+            self.fail_batch, self.fail_all = fail_batch, fail_all
+            self.calls = 0
+
+        def load(self):
+            self.model = object()
+
+        def generate_batch(self, batch):
+            self.calls += 1
+            if self.fail_all:
+                raise RuntimeError("CUDA out of memory (giả)")
+            if self.fail_batch and len(batch) > 1:
+                raise RuntimeError("CUDA out of memory (giả)")
+            return [f"báo cáo cho {b['key']}" for b in batch]
+
+    mcfg = Cfg({"id": "fake", "batch_size": 3})
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "fake.jsonl"
+
+        Fake(cfg, mcfg).run(df, out)
+        lines = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
+        check("sinh đủ mọi mẫu", len(lines) == 7 and {l["key"] for l in lines} == set(keys))
+        check("nội dung đi đúng key",
+              all(l["pred"] == f"báo cáo cho {l['key']}" for l in lines))
+
+        r2 = Fake(cfg, mcfg)
+        r2.run(df, out)
+        check("chạy lại khi đã đủ -> không gọi model lần nào", r2.calls == 0)
+
+        # Bỏ 2 dòng giữa -> chỉ sinh lại đúng 2 mẫu thiếu
+        keep = [l for l in lines if l["key"] not in ("k2", "k5")]
+        with open(out, "w", encoding="utf-8") as f:
+            for l in keep:
+                f.write(json.dumps(l, ensure_ascii=False) + "\n")
+        r3 = Fake(cfg, mcfg)
+        r3.run(df, out)
+        got = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
+        check("resume chỉ sinh phần còn thiếu",
+              len(got) == 7 and r3.calls == 1, f"lines={len(got)} calls={r3.calls}")
+
+        # File bị cắt giữa dòng (Ctrl-C) -> chỉ mất dòng cuối, không vứt cả file
+        raw = open(out, encoding="utf-8").read()
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(raw[: raw.rindex("\n") - 12])
+        r4 = Fake(cfg, mcfg)
+        r4.run(df, out)
+        raw2 = open(out, encoding="utf-8").read()
+        try:
+            got = {json.loads(l)["key"] for l in raw2.splitlines() if l.strip()}
+            parseable = True
+        except Exception as e:
+            got, parseable = set(), False
+            print(f"    dòng hỏng còn sót: {e!r}")
+        check("dòng cuối cụt được DỌN, file còn parse trọn vẹn", parseable)
+        check("dòng cuối cụt không làm mất mẫu nào", got == set(keys), f"{sorted(got)}")
+        check("file kết thúc bằng newline", raw2.endswith("\n"))
+
+        # Batch hỏng -> rơi về từng ảnh, KHÔNG mất mẫu nào
+        out2 = Path(td) / "b.jsonl"
+        Fake(cfg, mcfg, fail_batch=True).run(df, out2)
+        got2 = [json.loads(l) for l in open(out2, encoding="utf-8") if l.strip()]
+        check("batch hỏng -> thử từng ảnh, không mất mẫu",
+              len(got2) == 7 and all(g["pred"] for g in got2))
+
+        # Hỏng cả khi chạy đơn -> ghi chuỗi rỗng và đi tiếp (điểm 0, có đếm)
+        out3 = Path(td) / "c.jsonl"
+        Fake(cfg, mcfg, fail_all=True).run(df, out3)
+        got3 = [json.loads(l) for l in open(out3, encoding="utf-8") if l.strip()]
+        check("hỏng hẳn -> ghi rỗng, đánh dấu empty, không ném",
+              len(got3) == 7 and all(g["empty"] and g["pred"] == "" for g in got3))
+
+
+def test_tracking() -> None:
+    """W&B phải là VỎ BỌC, không phải phụ thuộc cứng.
+
+    Thiếu gói, thiếu key, init hỏng, log hỏng — không ca nào được phép làm ngã
+    một lần chạy đã tốn nhiều giờ GPU. Kiểm bằng cách gọi hết mọi phương thức
+    ở trạng thái tắt và xem có ném gì ra không.
+    """
+    import pandas as pd
+
+    from src.tracking import NullTracker, Tracker
+
+    print("\n[tracking]")
+    for label, t in (("tắt bằng config", Tracker({"wandb": {"enabled": False}}, "x")),
+                     ("mode=disabled", Tracker({"wandb": {"mode": "disabled"}}, "x")),
+                     ("NullTracker", NullTracker())):
+        try:
+            t.log({"a": 1})
+            t.summary({"b": 2})
+            t.table("t", pd.DataFrame({"x": [1, 2]}))
+            t.samples("s", [{"key": "k", "pred": "p"}])
+            t.save_file("/khong/co/file")
+            t.artifact("a", "/khong/co/file")
+            t.alert("t", "x")
+            t.finish(0)
+            ok = not t.enabled and t.url is None and isinstance(t.log_every, int)
+        except Exception as e:
+            ok = False
+            print(f"    ném: {e!r}")
+        check(f"{label}: mọi lời gọi đều an toàn", ok)
+
+    # Thiếu gói `wandb`: phải xuống no-op chứ không ném ImportError.
+    import importlib
+    have_wandb = importlib.util.find_spec("wandb") is not None
+    if have_wandb:
+        print("  ⊘ bỏ qua nhánh 'thiếu wandb' (máy này CÓ wandb)")
+    else:
+        try:
+            t = Tracker({"wandb": {"enabled": True, "mode": "online"}}, "x")
+            t.log({"a": 1}); t.finish(0)
+            ok = not t.enabled
+        except Exception as e:
+            ok = False
+            print(f"    ném: {e!r}")
+        check("thiếu gói wandb: xuống no-op, không ném", ok)
+
+    # Bảng rỗng / None không được làm ngã
+    t = NullTracker()
+    try:
+        t.table("t", None)
+        t.table("t", pd.DataFrame())
+        t.samples("s", [])
+        ok = True
+    except Exception:
+        ok = False
+    check("bảng rỗng/None không làm ngã", ok)
 
 
 def test_report() -> None:
@@ -302,6 +495,8 @@ def main() -> int:
     test_alignment()
     test_metrics(a.with_metrics)
     test_zip()
+    test_runner_loop()
+    test_tracking()
     test_report()
     print(f"\n═══ {len(PASS)} đạt · {len(FAIL)} hỏng ═══")
     if FAIL:

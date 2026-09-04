@@ -106,29 +106,103 @@ def _save_resized(raw: bytes, dest: Path, max_side: int) -> None:
     os.replace(tmp, dest)
 
 
-def _resolve_prefix(names: set[str], probe_key: str) -> str:
-    """Dò lớp bọc trong zip.
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
-    Cùng một bộ ảnh có thể được nén thành `files/p10/...` hoặc
-    `img_dir/files/p10/...` tuỳ người tạo zip đứng ở đâu khi nén. Dò một lần
-    bằng một key mẫu thay vì đoán, rồi dùng lại cho cả 3000 entry.
+
+def build_name_map(files: list[str], keys: list[str]) -> tuple[dict[str, str], list[str], str]:
+    """Ghép mỗi `img_rel` với entry thật trong zip.
+
+    CSV ghi `files/p13/p13326174/s55828003/<uuid>.jpg`, nhưng cây thư mục BÊN
+    TRONG zip không nhất thiết giống thế: người tạo zip có thể đứng ở một thư
+    mục khác khi nén (thêm lớp bọc), bỏ bớt tầng `files/pXX`, hay nén phẳng
+    hết vào một chỗ. Đoán một cách cố định là hỏng ngay khi zip được đóng lại
+    theo cách khác — mà triệu chứng lại là "3000 ảnh đều thiếu", rất dễ tưởng
+    nhầm là hỏng mạng hay sai token.
+
+    Nên: dò bằng chính nội dung zip, theo hai bậc.
+      1. Khớp NGUYÊN img_rel (có thể kèm một lớp bọc chung). Giữ được ngữ
+         nghĩa thư mục, và xác nhận được trên TOÀN BỘ key chứ không chỉ một key
+         mẫu.
+      2. Không xong thì khớp theo ĐUÔI đường dẫn: tên file trước, trùng tên thì
+         so tiếp các đoạn thư mục đi ngược lên. Tên ảnh MIMIC là uuid nên bậc
+         này gần như luôn cho một ứng viên duy nhất, và nó đúng với mọi cách
+         sắp lại thư mục kể cả zip phẳng.
+
+    Trả (map key -> tên entry, danh sách key không tìm thấy, mô tả layout).
     """
-    if probe_key in names:
-        return ""
-    suffix = "/" + probe_key
-    for nm in names:
-        if nm.endswith(suffix):
-            return nm[: -len(probe_key)]
-    raise KeyError(f"Không thấy {probe_key} trong zip (đã quét {len(names)} entry)")
+    nameset = set(files)
+
+    # ── bậc 1: nguyên img_rel, có thể kèm lớp bọc ───────────────────────────
+    prefix = None
+    probe = keys[0]
+    if probe in nameset:
+        prefix = ""
+    else:
+        suffix = "/" + probe
+        for nm in files:
+            if nm.endswith(suffix):
+                prefix = nm[: -len(probe)]
+                break
+    if prefix is not None:
+        cand = {k: prefix + k for k in keys}
+        miss = [k for k, v in cand.items() if v not in nameset]
+        # Chấp nhận bậc 1 chỉ khi nó phủ gần hết. Phủ một phần nghĩa là zip
+        # trộn nhiều layout — lúc đó bậc 2 tổng quát hơn và nên thắng.
+        if len(miss) <= 0.01 * len(keys):
+            desc = f"nguyên img_rel{f' dưới lớp bọc {prefix!r}' if prefix else ''}"
+            return {k: v for k, v in cand.items() if v in nameset}, miss, desc
+
+    # ── bậc 2: khớp theo đuôi đường dẫn ─────────────────────────────────────
+    by_base: dict[str, list[str]] = {}
+    for nm in files:
+        if nm.lower().endswith(IMG_EXT):
+            by_base.setdefault(nm.rsplit("/", 1)[-1], []).append(nm)
+
+    mapping: dict[str, str] = {}
+    missing: list[str] = []
+    n_ambiguous = 0
+    for k in keys:
+        cands = by_base.get(k.rsplit("/", 1)[-1])
+        if not cands:
+            missing.append(k)
+            continue
+        if len(cands) == 1:
+            mapping[k] = cands[0]
+            continue
+        # Trùng tên file: chọn ứng viên chung ĐUÔI dài nhất với img_rel.
+        n_ambiguous += 1
+        kp = k.split("/")
+        best, best_score = cands[0], -1
+        for c in cands:
+            cp = c.split("/")
+            i = 0
+            while i < min(len(kp), len(cp)) and kp[-1 - i] == cp[-1 - i]:
+                i += 1
+            if i > best_score:
+                best, best_score = c, i
+        mapping[k] = best
+
+    sample = next(iter(mapping.items()), None)
+    desc = "khớp theo đuôi đường dẫn"
+    if sample:
+        desc += f" (vd {sample[0]} -> {sample[1]})"
+    if n_ambiguous:
+        desc += f"; {n_ambiguous} tên file trùng, chọn theo đuôi dài nhất"
+    return mapping, missing, desc
+
+
+def _list_files(zf: zipfile.ZipFile) -> list[str]:
+    return [i.filename for i in zf.infolist() if not i.is_dir()]
 
 
 class StreamTooSlow(RuntimeError):
     """Stream chạy được nhưng chậm tới mức tải trọn zip còn nhanh hơn."""
 
 
-def _extract(zf: zipfile.ZipFile, prefix: str, need: list[str],
+def _extract(zf: zipfile.ZipFile, mapping: dict[str, str], need: list[str],
              cache_root: Path, max_side: int, label: str,
-             min_rate: float = 0.0, probe_after: int = 60) -> list[str]:
+             min_rate: float = 0.0, probe_after: int = 60,
+             tracker=None) -> list[str]:
     """Trích các entry cần. `min_rate` > 0 -> bỏ cuộc sớm nếu quá chậm."""
     # Sắp theo VỊ TRÍ TRONG FILE ZIP, không theo thứ tự split. Đây là khác biệt
     # lớn nhất về tốc độ của chế độ stream: fsspec đệm theo block 8 MB, nên đọc
@@ -136,26 +210,32 @@ def _extract(zf: zipfile.ZipFile, prefix: str, need: list[str],
     # đã tải; đọc theo thứ tự ngẫu nhiên thì gần như mỗi ảnh là một request mới
     # và block vừa tải bị vứt đi.
     ordered = []
+    failed = [(k, "không có entry tương ứng trong zip") for k in need if k not in mapping]
     for key in need:
+        nm = mapping.get(key)
+        if nm is None:
+            continue
         try:
-            ordered.append((zf.getinfo(prefix + key).header_offset, key))
+            ordered.append((zf.getinfo(nm).header_offset, key, nm))
         except KeyError:
-            ordered.append((1 << 62, key))   # thiếu entry -> để cuối, báo lỗi sau
+            failed.append((key, f"KeyError {nm}"))
     ordered.sort()
 
-    failed = []
     t0 = time.time()
-    for i, (_off, key) in enumerate(ordered, 1):
+    for i, (_off, key, nm) in enumerate(ordered, 1):
         dest = _cache_path(cache_root, key)
         try:
-            _save_resized(zf.read(prefix + key), dest, max_side)
-        except Exception as e:  # entry hỏng / thiếu / ảnh không giải mã được
+            _save_resized(zf.read(nm), dest, max_side)
+        except Exception as e:  # entry hỏng / ảnh không giải mã được
             failed.append((key, repr(e)))
         if i % 100 == 0 or i == len(ordered):
             rate = i / max(1e-9, time.time() - t0)
             eta = (len(ordered) - i) / max(1e-9, rate)
             print(f"  [{label}] {i}/{len(ordered)} ảnh | {rate:.1f} ảnh/s "
                   f"| còn ~{eta/60:.1f} phút", flush=True)
+            if tracker is not None:
+                tracker.log({"data/images_done": i, "data/images_total": len(ordered),
+                             "data/rate_img_s": rate, "data/eta_min": eta / 60})
         if min_rate > 0 and i == probe_after:
             rate = i / max(1e-9, time.time() - t0)
             if rate < min_rate:
@@ -170,7 +250,22 @@ def _extract(zf: zipfile.ZipFile, prefix: str, need: list[str],
     return [k for k, _ in failed]
 
 
-def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path) -> list[str]:
+def _open_and_extract(zf: zipfile.ZipFile, need: list[str], cache_root: Path,
+                      cfg: Cfg, label: str, min_rate: float = 0.0,
+                      tracker=None) -> list[str]:
+    files = _list_files(zf)
+    mapping, missing, desc = build_name_map(files, need)
+    print(f"  zip: {len(files)} entry — layout: {desc}", flush=True)
+    if missing:
+        print(f"  ⚠ {len(missing)} key không tìm thấy trong zip. Ví dụ: {missing[:3]}",
+              flush=True)
+    return _extract(zf, mapping, need, cache_root,
+                    int(cfg.data.get("image_max_side", 768)), label,
+                    min_rate=min_rate, tracker=tracker)
+
+
+def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path,
+                    tracker=None) -> list[str]:
     """Đọc zip TỪ XA bằng HTTP range request, chỉ tải các entry cần."""
     from huggingface_hub import HfFileSystem
 
@@ -183,15 +278,13 @@ def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path) -> list[str]:
     # trong zip (chúng nằm cạnh nhau vì zip giữ nguyên thứ tự thư mục).
     fh = fs.open(uri, "rb", block_size=8 * 1024 * 1024)
     with zipfile.ZipFile(fh) as zf:
-        names = set(zf.namelist())
-        prefix = _resolve_prefix(names, need[0])
-        print(f"  zip: {len(names)} entry, prefix={prefix!r}", flush=True)
-        return _extract(zf, prefix, need, cache_root,
-                        int(cfg.data.get("image_max_side", 768)), "stream",
-                        min_rate=float(cfg.data.get("zip_stream_min_rate", 1.0)))
+        return _open_and_extract(zf, need, cache_root, cfg, "stream",
+                                 min_rate=float(cfg.data.get("zip_stream_min_rate", 1.0)),
+                                 tracker=tracker)
 
 
-def _download_extract(cfg: Cfg, need: list[str], cache_root: Path) -> list[str]:
+def _download_extract(cfg: Cfg, need: list[str], cache_root: Path,
+                      tracker=None) -> list[str]:
     """Tải trọn zip rồi giải nén. Chắc ăn, tốn ~18 GB đĩa."""
     from huggingface_hub import hf_hub_download
 
@@ -200,14 +293,10 @@ def _download_extract(cfg: Cfg, need: list[str], cache_root: Path) -> list[str]:
     zpath = hf_hub_download(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"),
                             filename=d["image_zip"], token=hf_token())
     with zipfile.ZipFile(zpath) as zf:
-        names = set(zf.namelist())
-        prefix = _resolve_prefix(names, need[0])
-        print(f"  zip: {len(names)} entry, prefix={prefix!r}", flush=True)
-        return _extract(zf, prefix, need, cache_root,
-                        int(cfg.data.get("image_max_side", 768)), "local")
+        return _open_and_extract(zf, need, cache_root, cfg, "local", tracker=tracker)
 
 
-def ensure_images(cfg: Cfg, df: pd.DataFrame) -> pd.DataFrame:
+def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
     """Bảo đảm mọi key có file ảnh trong cache; trả df thêm cột image_path."""
     cache_root = Path(cfg.data.get("cache_dir", "./data")).expanduser()
     max_side = int(cfg.data.get("image_max_side", 768))
@@ -223,12 +312,12 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame) -> pd.DataFrame:
     bad: list[str] = []
     if mode in ("stream", "auto"):
         try:
-            bad = _stream_extract(cfg, need, cache_root)
+            bad = _stream_extract(cfg, need, cache_root, tracker)
         except StreamTooSlow as e:
             print(f"  ⚠ stream quá chậm ({e}) -> chuyển sang tải trọn zip", flush=True)
             if mode == "stream":
                 raise
-            bad = _download_extract(cfg, need, cache_root)
+            bad = _download_extract(cfg, need, cache_root, tracker)
         except Exception as e:
             if mode == "stream":
                 raise
@@ -236,9 +325,9 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame) -> pd.DataFrame:
             # Range, hoặc vì fsspec không seek được. Rơi về tải trọn zip thay vì
             # chết — nhưng IN RA nguyên nhân, đừng để nó im lặng tốn 17.7 GB.
             print(f"  ⚠ stream hỏng ({e!r}) -> rơi về tải trọn zip", flush=True)
-            bad = _download_extract(cfg, need, cache_root)
+            bad = _download_extract(cfg, need, cache_root, tracker)
     else:
-        bad = _download_extract(cfg, need, cache_root)
+        bad = _download_extract(cfg, need, cache_root, tracker)
 
     if bad:
         before = len(df)
@@ -249,7 +338,7 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def prepare(cfg: Cfg) -> pd.DataFrame:
+def prepare(cfg: Cfg, tracker=None) -> pd.DataFrame:
     """Điểm vào: trả bảng [key, ref, image_path] và ghi manifest ra đĩa."""
     cache_root = Path(cfg.data.get("cache_dir", "./data")).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -257,7 +346,7 @@ def prepare(cfg: Cfg) -> pd.DataFrame:
 
     print("═══ Dữ liệu ═══", flush=True)
     df = load_index(cfg)
-    df = ensure_images(cfg, df)
+    df = ensure_images(cfg, df, tracker)
 
     with open(manifest, "w", encoding="utf-8") as f:
         for r in df.itertuples(index=False):

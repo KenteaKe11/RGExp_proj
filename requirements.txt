@@ -36,3 +36,7 @@ nltk>=3.8
 # Thống kê: dùng numpy thuần cho bootstrap/permutation; scipy chỉ để kiểm tra
 # chéo (wilcoxon) trong self-test.
 scipy>=1.11.0
+
+# Theo dõi lần chạy. Không có nó pipeline vẫn chạy (src/tracking.py tự no-op),
+# nhưng lúc đó chỉ còn cách ngồi canh console.
+wandb>=0.17.0

@@ -94,6 +94,19 @@ def main() -> int:
 
     out_path = Path(a.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Dòng cuối bị cắt dở (tiến trình bị giết giữa lúc ghi): cắt bỏ trước khi
+    # append, nếu không bản ghi mới bị nối thẳng vào nó và file mang một dòng
+    # hỏng vĩnh viễn. Viết lại tại chỗ vì venv này không import được `src`.
+    if out_path.exists() and out_path.stat().st_size:
+        with open(out_path, "rb+") as f:
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                size = out_path.stat().st_size
+                window = min(size, 1 << 20)
+                f.seek(size - window)
+                nl = f.read(window).rfind(b"\n")
+                f.truncate(size - window + nl + 1 if nl >= 0 else 0)
+                log(f"  ⚠ dọn dòng cuối bị cắt dở trong {out_path.name}")
     t0 = time.time()
     n_fail = 0
 

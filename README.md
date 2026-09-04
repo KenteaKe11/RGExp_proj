@@ -8,7 +8,10 @@ sau phải so được với bảng này, nên tập chấm và cách chấm ở
 
 ```bash
 export HF_TOKEN=hf_xxxxxxxx
-bash scripts/run.sh              # MỘT lệnh: setup -> tải data -> infer ×3 -> chấm -> kiểm định -> đẩy Hub
+export WANDB_API_KEY=xxxxxxxx    # theo dõi từ xa; thiếu -> W&B tự ghi offline
+
+bash scripts/run.sh              # MỘT lệnh: setup -> data -> infer ×3 -> chấm -> kiểm định -> đẩy Hub
+bash scripts/run.sh --detach     # ... nhưng chạy NỀN: trả lại shell ngay, in link W&B
 ```
 
 ---
@@ -25,6 +28,7 @@ bash scripts/run.sh              # MỘT lệnh: setup -> tải data -> infer ×
 | **Metrics** | BLEU-1..4, ROUGE-1/2/L, BERTScore-F1 — tính **theo từng mẫu** |
 | **Kiểm định** | paired bootstrap BCa (10 000) + permutation sign-flip (10 000) |
 | **Hiệu chỉnh** | Holm (FWER) + Benjamini-Hochberg (FDR), hai phạm vi: trong metric và toàn bảng |
+| **Theo dõi** | Weights & Biases — tiến độ, ETA, VRAM, mẫu văn bản, bảng điểm, bảng kiểm định |
 | **Kết quả** | `RGExp123/Research_results` (dataset repo, private) |
 
 ### Vì sao là những lựa chọn đó
@@ -72,6 +76,32 @@ bash scripts/run.sh --no-push     # chạy thật, giữ kết quả ở máy
 
 `run.sh` **tự gọi `setup.sh`** nếu môi trường chưa sẵn sàng — đó là lý do nó là
 một lệnh. Bỏ qua: `RGEXP_SKIP_SETUP=1`.
+
+### Theo dõi: W&B, không phải tmux
+
+`--detach` tách hẳn tiến trình khỏi phiên ssh (`setsid` + `nohup`) và trả lại
+shell ngay, kèm link W&B. ssh đứt không giết nó, và không cần giữ một phiên
+tmux mở nữa.
+
+Hai việc đó vốn là hai việc khác nhau, và tmux chỉ làm được một: tmux giữ tiến
+trình **sống**, còn W&B lo phần **nhìn thấy** nó. Tách ra thì mỗi việc có công
+cụ đúng của nó — và theo dõi được từ điện thoại, không phải từ đúng cái terminal
+đã mở phiên.
+
+Trên W&B có: `infer/<model>/pct · rate_img_s · eta_min · n_empty ·
+n_batch_failed`, `sys/vram_peak_gb`, `data/images_done`, bảng điểm, bảng 24
+kiểm định, vài chục mẫu **văn bản thật** của mỗi model, và `REPORT.md` cuối
+cùng. Chạy xong (hoặc hỏng) thì có `wandb.alert` đẩy về email.
+
+Mẫu văn bản gửi lên sớm là chỗ đáng nhìn nhất trong 5 phút đầu: BLEU 0.02 có
+thể là *model viết sai*, *model từ chối trả lời*, hay *prompt dính vào output* —
+ba ca cần ba cách sửa khác hẳn nhau, và chỉ nhìn số thì không phân biệt được.
+
+W&B là **vỏ bọc, không phải phụ thuộc cứng**: thiếu gói, thiếu key hay init
+hỏng thì mọi lời gọi thành no-op và pipeline chạy y nguyên. Thiếu
+`WANDB_API_KEY` thì tự hạ xuống *offline* (ghi vào `./wandb`, đẩy lên sau bằng
+`wandb sync wandb/latest-run`) thay vì tắt hẳn — mất tiền GPU rồi mới biết
+thiếu key thì ít nhất số liệu không mất theo. Tắt hẳn: `--no-wandb`.
 
 ### Bị đứt giữa chừng thì làm gì
 
@@ -151,6 +181,26 @@ JSONL đúng schema của hai runner kia. Khâu chấm điểm không biết s�
 Model này được đánh dấu `optional: true`: nạp hỏng thì báo cáo ghi rõ nó vắng
 mặt và chấm hai model còn lại, thay vì giết cả lần chạy đã tốn nhiều giờ GPU.
 
+### Cây thư mục trong zip ≠ `img_rel` trong CSV
+
+CSV ghi `files/p13/p13326174/s55828003/<uuid>.jpg`, nhưng bên trong
+`img_dir.zip` không nhất thiết giống thế: người đóng zip có thể đứng ở thư mục
+khác (thêm lớp bọc), bỏ bớt tầng `files/pXX`, hay nén phẳng hết vào một chỗ.
+Đoán cố định là hỏng ngay khi zip được đóng lại theo cách khác — mà triệu chứng
+lại là *"cả 3000 ảnh đều thiếu"*, rất dễ tưởng nhầm sang hỏng mạng hoặc sai token.
+
+`build_name_map` dò bằng chính nội dung zip, hai bậc:
+
+1. Khớp **nguyên** `img_rel` (có thể kèm một lớp bọc chung), xác nhận trên
+   *toàn bộ* key chứ không chỉ một key mẫu.
+2. Không xong thì khớp theo **đuôi đường dẫn**: tên file trước, trùng tên thì so
+   tiếp các đoạn thư mục đi ngược lên. Tên ảnh MIMIC là uuid nên bậc này gần như
+   luôn cho một ứng viên duy nhất, và nó đúng với mọi cách sắp lại thư mục —
+   kể cả zip phẳng.
+
+Layout dò được được **in ra** ở đầu stage `data`, kèm một ví dụ ánh xạ, nên
+nhìn một dòng là biết nó hiểu đúng hay không.
+
 ### 17.7 GB zip cho 3000 ảnh (~2%)
 
 `data.zip_mode`:
@@ -173,19 +223,31 @@ so thẳng thì các cặp lệch nhau và **mọi p-value đều vô nghĩa —
 báo lỗi**. `run_all.py` lấy **giao** các key rồi sắp lại theo cùng một thứ tự
 trước khi vào `stats.py`; số ảnh thực dùng được in ra và ghi vào `manifest.json`.
 
+### Sàn p-value của permutation so với Holm
+
+`p_perm` có sàn cứng `1/(n_perm+1)`, và Holm nhân p nhỏ nhất với **số kiểm
+định**. Hạ `n_perm` để "chạy cho nhanh" là có thể làm cho **không kiểm định nào
+đạt được ý nghĩa**, dù khác biệt là thật — bảng vẫn in đủ số, cột kết luận toàn
+"không", và rất dễ đọc thành *"ba model tương đương"*. Cần
+`n_perm >= số_kiểm_định / alpha` (24 / 0.05 = 480). `src/stats.py` tự kiểm và in
+cảnh báo vào cả console lẫn `REPORT.md` nếu vi phạm.
+
 ---
 
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest.py                  # 42 phép kiểm, không cần GPU/mạng
+python scripts/selftest.py                  # 65 phép kiểm, không cần GPU/mạng/model
 python scripts/selftest.py --with-metrics    # + BLEU/ROUGE (cần sacrebleu, rouge-score)
 ```
 
 Kiểm những chỗ mà lỗi sẽ **đi thẳng vào bảng kết quả mà không ném exception**:
 CI có phủ hiệu số thật không, p-value có sàn `1/(B+1)` không, Holm/BH có khớp
 giá trị tính tay không, hai bảng khác thứ tự có được căn đúng key không, chuỗi
-rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không.
+rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không, bốn cách sắp thư
+mục trong zip có dò đúng không, resume có sinh lại đúng phần thiếu không, batch
+OOM có rơi về từng ảnh không, file JSONL bị cắt giữa dòng có được dọn không,
+W&B tắt có thành no-op sạch không.
 
 ---
 
@@ -199,6 +261,7 @@ rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không.
 | LLaVA-Med 7B, batch 1 | 60–120 phút |
 | Chấm điểm (BERTScore) | 5–10 phút |
 | Kiểm định | < 1 phút |
+| Chấm + kiểm định (chạy lại riêng) | `--stages score,stats,report,push` |
 
 Trên một GPU 24 GB (L4 / 4090 / A10). VRAM tối thiểu ~20 GB vì LLaVA-Med 7B bf16
 riêng trọng số đã ~15 GB. Máy nhỏ hơn: hạ `batch_size`, hoặc tắt

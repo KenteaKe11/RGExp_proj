@@ -13,6 +13,7 @@ Khâu chấm điểm không cần biết sự sắp xếp này.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..prompts import flat_prompt
-from .base import Runner
+from .base import Runner, repair_tail
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 WORKER = ROOT / "scripts" / "infer_llavamed.py"
@@ -42,6 +43,39 @@ class LlavaMedRunner(Runner):
     def generate_batch(self, batch: list[dict]) -> list[str]:
         raise NotImplementedError("LlavaMedRunner ghi đè run(), không dùng generate_batch")
 
+    _PROGRESS = re.compile(
+        r"\[llavamed\]\s+(\d+)/(\d+)\s+\|\s+([\d.]+)\s+ảnh/s\s+\|\s+còn ~([\d.]+)\s+phút")
+
+    def _run_child(self, cmd: list[str], n_todo: int, n_done_before: int,
+                   n_total: int) -> int:
+        """Chạy tiến trình con, ĐỌC QUA stdout của nó rồi in tiếp ra console.
+
+        Không dùng subprocess.call(stdout=sys.stdout) nữa vì như thế tiến độ của
+        LLaVA-Med — khâu chạy lâu nhất — chỉ tồn tại trên terminal đang mở. Đọc
+        qua thì vừa in ra console y như cũ, vừa đẩy được lên W&B, nên đóng ssh
+        rồi vẫn theo dõi được từ chỗ khác.
+        """
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        assert proc.stdout is not None
+        mid = self.mcfg["id"]
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            m = self._PROGRESS.search(line)
+            if m:
+                i, n, rate, eta = int(m.group(1)), int(m.group(2)), float(m.group(3)), float(m.group(4))
+                self.tracker.log({
+                    f"infer/{mid}/done": n_done_before + i,
+                    f"infer/{mid}/total": n_total,
+                    f"infer/{mid}/pct": 100.0 * (n_done_before + i) / max(1, n_total),
+                    f"infer/{mid}/rate_img_s": rate,
+                    f"infer/{mid}/eta_min": eta,
+                })
+                _ = n
+        return proc.wait()
+
     def run(self, df: pd.DataFrame, out_path: Path, log_every: int = 20) -> Path:
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -53,6 +87,10 @@ class LlavaMedRunner(Runner):
                 print(f"  ⚠ bỏ qua {self.mcfg['id']}: {msg}", flush=True)
                 return out_path
             raise RuntimeError(msg)
+
+        cut = repair_tail(out_path)
+        if cut:
+            print(f"  ⚠ dọn {cut} byte của dòng cuối bị cắt dở", flush=True)
 
         done: set[str] = set()
         if out_path.exists():
@@ -91,10 +129,8 @@ class LlavaMedRunner(Runner):
         ]
         print(f"  → tiến trình con: {py}", flush=True)
         print(f"    {len(todo)} mẫu cần sinh", flush=True)
-        # stdout của tiến trình con đi thẳng ra console cha (không capture):
-        # đây là khâu chạy lâu nhất, và một thanh tiến độ bị nuốt mất nghĩa là
-        # ngồi nhìn màn hình đen vài giờ không biết nó còn sống hay không.
-        rc = subprocess.call(cmd, cwd=str(ROOT), stdout=sys.stdout, stderr=sys.stderr)
+        rc = self._run_child(cmd, n_todo=len(todo), n_done_before=len(done),
+                             n_total=len(df))
         if rc != 0:
             msg = f"tiến trình LLaVA-Med thoát với mã {rc}"
             if self.mcfg.get("optional", False):
@@ -103,5 +139,20 @@ class LlavaMedRunner(Runner):
                       flush=True)
                 return out_path
             raise RuntimeError(msg)
+        n_samples = int(self.cfg.get_path("wandb.log_samples", 20) or 0)
+        if n_samples:
+            refs = dict(zip(df["key"], df["ref"]))
+            rows = []
+            with open(out_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if len(rows) >= n_samples:
+                        break
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    rows.append({"key": r["key"], "ref": str(refs.get(r["key"], ""))[:600],
+                                 "pred": str(r.get("pred", ""))[:600]})
+            self.tracker.samples(f"samples/{self.mcfg['id']}", rows)
         print(f"✓ {self.name}: xong -> {out_path}", flush=True)
         return out_path

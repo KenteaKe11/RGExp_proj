@@ -141,6 +141,13 @@ metrics:
 #   bh    kiểm soát FDR  (thoáng hơn, dùng để SÀNG hướng đi tiếp)
 stats:
   n_boot: 10000
+  # KHÔNG hạ n_perm để "chạy cho nhanh". p-value permutation có sàn cứng
+  # 1/(B+1), và Holm nhân p nhỏ nhất với SỐ KIỂM ĐỊNH (24). Với B = 400 thì sàn
+  # sau Holm là 24/401 = 0.060 > alpha -> KHÔNG kiểm định nào có thể đạt ý
+  # nghĩa, dù hai model khác nhau một trời một vực; bảng vẫn in đủ số và cột
+  # kết luận toàn "không", nên rất dễ đọc thành "ba model tương đương". Cần
+  # B >= số_kiểm_định / alpha = 480; 10000 là dư dả và tốn chưa tới một phút.
+  # (src/stats.py tự kiểm điều này và kêu nếu vi phạm.)
   n_perm: 10000
   ci: 0.95
   alpha: 0.05
@@ -149,6 +156,33 @@ stats:
   # global:     hiệu chỉnh trên toàn bộ 24 kiểm định
   correction_scopes: [per_metric, global]
   block_size: 1     # >1 = moving-block bootstrap (không cần: mẫu độc lập)
+
+# ── Theo dõi: Weights & Biases ──────────────────────────────────────────────
+# Một lần chạy là nhiều giờ trên máy thuê. Nhìn qua tmux buộc phải giữ một phiên
+# ssh mở; mất mạng là mất tầm nhìn, và nếu nó chết ở giờ thứ ba thì không còn gì
+# để đọc lại. Đẩy lên W&B thì xem được từ điện thoại và số liệu ở lại sau khi
+# phiên đã đóng.
+#
+# W&B là VỎ BỌC, không phải phụ thuộc cứng: thiếu gói, thiếu key, hay init hỏng
+# thì mọi lời gọi thành no-op và pipeline chạy y nguyên.
+wandb:
+  enabled: true
+  project: rgexp-basemodel
+  entity: null              # null -> tài khoản mặc định
+  run_name: null            # null -> lấy theo output.subdir
+  # online | offline | disabled. Không có WANDB_API_KEY thì online TỰ hạ xuống
+  # offline (ghi vào ./wandb, `wandb sync` đẩy lên sau) thay vì tắt hẳn — mất
+  # tiền GPU rồi mới biết thiếu key thì ít nhất số liệu không mất theo.
+  mode: online
+  tags: [basemodel, zero-shot, mimic-cxr]
+  notes: ""
+  # Nhịp gửi tiến độ, tính theo BATCH (cũng là nhịp in ra console).
+  log_every: 20
+  # Số mẫu văn bản thật gửi kèm mỗi model. Nhìn số BLEU không phân biệt được
+  # "model viết sai" với "model từ chối trả lời" hay "prompt dính vào output" —
+  # ba ca cần ba cách sửa khác hẳn nhau, và biết ở phút thứ 5 rẻ hơn nhiều so
+  # với biết sau ba giờ. 0 = tắt.
+  log_samples: 20
 
 # ── Đầu ra ──────────────────────────────────────────────────────────────────
 output:
