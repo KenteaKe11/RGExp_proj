@@ -369,7 +369,7 @@ run:
   # tức LR tắt dần về 0 và train tự chết — gần như không bao giờ là ý muốn.
   cycle_lr_decay: 1.0
 
-  # ── §1.7 Total_Loss = 1·CE + 1·ASL + 0.05·Aux   (tỉ lệ CHỐT) ──────────
+  # ── §1.7 Total_Loss = 1·CE + 1·ASL + 0.07·Aux   (tỉ lệ CHỐT) ──────────
   w_sup: 1                # hệ số nhánh supervised (ASL trên 14 finding)
 
   # Hệ số số hạng CÂN BẰNG TẢI. Aux = E·Σ f_e·P_e (Switch-Transformer):
@@ -392,7 +392,7 @@ run:
   #
   # 0.01–0.05 là dải chuẩn. 0 = tắt hẳn cân bằng tải (router sẽ sập về vài
   # expert trong vài trăm step); >0.5 thì nó lấn át CE.
-  w_aux: 0.05
+  w_aux: 0.07
 
   # ── ASL: Asymmetric Loss trên 14 finding (§1.6) ──────────────────────────
   # Nhánh supervised KHÔNG còn softmax 4 aspect + Focal. Nhãn 4 aspect của
