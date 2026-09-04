@@ -25,10 +25,11 @@
 #    E·Σ f_e·P_e (Switch-Transformer), một số hạng trong loss. Không còn
 #    bias b_e, không còn trần tải mỗi micro-batch, không còn expert hứng.
 # 5. ROUTER ĐỔI KIẾN TRÚC và CẮM THÊM MỘT ĐƯỜNG VÀO DECODER: Feat-Extractor
-#    tự train (5 bậc conv, 512²→16², 1→1024 kênh) -> 256 token × 1024 ->
-#    self-attn -> QFormer 2 query -> 2 head. Ngoài gate, 256 token đó còn
-#    được chiếu lên 2560 chiều và ghép vào ĐẦU chuỗi decoder. Không còn
-#    backbone pretrain nào.
+#    tự train (5 bậc conv, 512²→16², 1→1024 kênh), MỖI bậc rẽ ra một conv
+#    patching về lưới 16×16 rồi nối kênh -> 256 token × 1984 -> self-attn ->
+#    SwiGLU 1984→2560 -> QFormer 2 query (2560) -> 2 head (MLP GELU hidden
+#    1024). Ngoài gate, CHÍNH 256 token 2560 chiều đó được ghép vào ĐẦU chuỗi
+#    decoder — không còn MLP Proj riêng. Không còn backbone pretrain nào.
 # 6. BỎ HẲN SWA. Trọng số đem đi chấm là bản CUỐI trong weights.pt.
 # 7. EXPERT chỉ gắn vào 4 ma trận attention (q,k,v,o): 4.68M/expert.
 #
@@ -369,6 +370,8 @@ _MARKS = [
     ("src/optim.py", "cycle_samples", "lịch LR VÔ HẠN (không còn total_samples)"),
     ("src/losses.py", "def asl_loss", "ASL thay cho Focal"),
     ("src/router.py", "QFormer", "router Feat-Extractor + QFormer + prefix"),
+    ("src/router.py", "class Patching", "feat-extractor ĐA TỈ LỆ (concat 1984)"),
+    ("src/router.py", "class SwiGLU", "SwiGLU 1984→2560, bỏ DecoderProjector"),
     ("src/model.py", "add_router_slots", "256 token router ghép vào decoder"),
     ("src/losses.py", "def aux_loss", "cân bằng tải bằng aux loss (bỏ bias)"),
     ("src/optim.py", "đầu MỌI cycle", "warmup ở đầu mọi cycle LR"),
@@ -531,15 +534,15 @@ with open(CONFIG, "w", encoding="utf-8") as fh:
 print(f"\n✓ {CONFIG}")
 print(f"  dtype     {cfg['fixed']['compute_dtype']} | batch {TRAIN_BS}×{GRAD_ACCUM}"
       f" = effective {eff} | {cfg['fixed']['n_expert']}E top-{cfg['fixed']['top_k']}"
-      f" | {cfg['arch']['model']}-cnnqf1024")
+      f" | {cfg['arch']['model']}-cnnqf2560")
 print(f"  loss      1·CE + {cfg['run']['w_sup']}·ASL + {cfg['run']['w_aux']}·Aux"
       f" | γ+={cfg['run']['asl_gamma_pos']}"
       f" γ-={cfg['run']['asl_gamma_neg']} | ngưỡng âm m={cfg['run']['asl_clip']}"
       f" (BI-RADS 3) | uncertain={cfg['run']['uncertain_soft']}, blank=MASK")
-print(f"  router    CNN 5 bậc + QFormer, ảnh "
-      f"{cfg['fixed']['router_img_size']}² -> 256 token × 1024 (train từ số "
-      f"0) | prefix 256 token vào decoder | cân bằng tải = aux loss "
-      f"w={cfg['run']['w_aux']} | clip chuẩn toàn cục {MAX_GRAD_NORM}")
+print(f"  router    CNN 5 bậc + patching đa tỉ lệ + QFormer, ảnh "
+      f"{cfg['fixed']['router_img_size']}² -> 256 token × 1984 -> SwiGLU 2560 "
+      f"(train từ số 0) | prefix 256 token vào decoder | cân bằng tải = aux "
+      f"loss w={cfg['run']['w_aux']} | clip chuẩn toàn cục {MAX_GRAD_NORM}")
 print(f"  decay     σ {cfg['fixed'].get('route_noise_start')}"
       f"→{cfg['fixed']['route_noise']}"
       f" | mũ, {cfg['fixed'].get('decay_warmup_samples')} MẪU đầu")

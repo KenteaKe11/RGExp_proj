@@ -9,28 +9,31 @@ trường hợp đó ra.
 ═══ Lấy từ Feat-Extractor, không phải từ SigLIP ═══
 
 Ảnh đi vào model theo HAI đường (xem src/router.py): SigLIP của Gemma, và
-Feat-Extractor 23M tham số train từ số 0. Bản đồ ở đây lấy từ đường THỨ HAI,
+Feat-Extractor ~31M tham số train từ số 0. Bản đồ ở đây lấy từ đường THỨ HAI,
 vì chỉ đường đó có một cái đầu phân loại để lấy đạo hàm: `sup_head` cho ra 14
 logit bệnh, mỗi logit là một đại lượng có nghĩa để hỏi "logit này tăng khi
 vùng nào của feature map tăng".
 
     pixel_values [B,3,896,896]
-        │  FeatExtractor.conv_map  (resize 512, xám, 5 bậc DownBlock)
+        │  FeatExtractor.conv_map  (resize 512, xám, 5 bậc DownBlock,
+        │                           mỗi bậc Patching về 16×16 rồi nối kênh)
         ▼
-    A = fmap [B, 1024, 16, 16]        ← LỚP MỤC TIÊU của Grad-CAM
-        │  from_map → self-attn → QFormer query-0 → sup_head
+    A = fmap [B, 1984, 16, 16]        ← LỚP MỤC TIÊU của Grad-CAM
+        │  from_map → self-attn → swiglu 2560 → QFormer query-0 → sup_head
         ▼
     y = sup_logits [B, 14]
 
     với mỗi bệnh d ĐƯỢC PHÁT HIỆN trong ảnh:
-        α_k = GAP_hw( ∂y_d / ∂A_k )              [1024]
+        α_k = GAP_hw( ∂y_d / ∂A_k )              [1984]
         M_d = ReLU( Σ_k α_k · A_k )              [16, 16]
 
-Chọn `fmap` (đầu ra bậc conv cuối) chứ không phải `feat` sau self-attn: sau
-self-attn mỗi token đã trộn cả 256 vị trí, chỉ số token không còn tương ứng
-với một ô trên phim nữa. Gradient vẫn đi NGƯỢC qua self-attn và QFormer để về
-tới `fmap` — nghĩa là bản đồ vẫn phản ánh trọn đường đi tới logit, chỉ được
-ĐỌC ở tầng còn giữ trục không gian.
+Chọn `fmap` (bản nối ĐA TỈ LỆ của cả 5 bậc conv) chứ không phải `feat` sau
+self-attn: sau self-attn mỗi token đã trộn cả 256 vị trí, chỉ số token không
+còn tương ứng với một ô trên phim nữa. Gradient vẫn đi NGƯỢC qua self-attn và
+QFormer để về tới `fmap` — nghĩa là bản đồ vẫn phản ánh trọn đường đi tới
+logit, chỉ được ĐỌC ở tầng còn giữ trục không gian. Từ đợt đổi kiến trúc, 1984
+kênh đó gom bằng chứng ở NĂM thang phân giải chứ không chỉ thang thô nhất, nên
+bản đồ bám được cả chi tiết nhỏ (nốt, đường ống) lẫn vùng lớn.
 
 ReLU giữ lại phần đóng góp DƯƠNG, đúng theo Grad-CAM gốc (Selvaraju et al.
 2017): câu hỏi là "chỗ nào ỦNG HỘ kết luận này", không phải "chỗ nào ảnh

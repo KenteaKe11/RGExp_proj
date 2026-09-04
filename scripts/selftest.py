@@ -116,7 +116,7 @@ def test_router():
           f"ratio={st8['logit_std_ratio']:.3f} "
           f"(mẫu {st8['logit_std_sample']:.3f} / "
           f"expert {st8['logit_std_expert']:.3f})")
-    check("vector 1024 chiều của trunk cũng đổi theo ảnh (tách được lỗi: "
+    check("vector 2560 chiều của trunk cũng đổi theo ảnh (tách được lỗi: "
           "nó ≈0 thì thủ phạm là backbone/trunk, không phải route_head)",
           st8["trunk_std_sample"] > 0,
           f"std={st8['trunk_std_sample']:.4f}")

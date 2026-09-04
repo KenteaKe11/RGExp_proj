@@ -18,7 +18,7 @@ HAI THỨ NHÁNH ROUTER CẮM VÀO DECODER, và cả hai đi qua cùng một hoo
 
   * **gate** — trọng số trộn E bản delta QDoRA (src/moe.py). Đặt TRƯỚC khi
     layer đầu tiên chạy, nên mọi Linear đã có trọng số expert đúng của batch.
-  * **prefix** — 256 token thị giác của router, chiếu lên 2560 chiều.
+  * **prefix** — 256 token thị giác của router, đã ở 2560 chiều.
 
 Cách ghép prefix KHÔNG đụng gì vào transformers. `build_collate` chèn sẵn 256
 vị trí giữ chỗ (token pad) ở ĐẦU `input_ids`, với attention_mask = 1 và
@@ -423,10 +423,12 @@ def build_model(cfg, hf_token, log):
             p.data = p.data.to(f.trainable_dtype)
 
     # ── Nhánh router ────────────────────────────────────────────────────────
-    # Router đọc ẢNH, nên không có `d_enc` nào. `d_dec` chỉ dùng cho MLP Proj
-    # (256 token router -> chiều hidden của decoder) và được ĐỌC TỪ CHÍNH
-    # config của model thay vì hằng số, để đổi model nền là hỏng ngay ở đây
-    # chứ không phải ở một phép cat lệch chiều giữa forward.
+    # Router đọc ẢNH, nên không có `d_enc` nào. `d_dec` là CHIỀU LÀM VIỆC của
+    # cả nhánh router: SwiGLU cuối của Feat-Extractor chiếu 1984 -> d_dec và
+    # `feat` đó vừa là prefix vừa là thứ QFormer/hai head đọc — không còn MLP
+    # Proj riêng. Đọc TỪ CHÍNH config của model thay vì hằng số, để đổi model
+    # nền là hỏng ngay ở đây chứ không phải ở một phép cat lệch chiều giữa
+    # forward.
     route_noise = float(getattr(f, "route_noise", 0.5) or 0.0)
     # Giá trị ĐẦU của lịch decay (None = không có lịch). Đọc bằng getattr để
     # config thiếu khoá vẫn dựng được model.
@@ -447,10 +449,12 @@ def build_model(cfg, hf_token, log):
     n_expert_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log("router", arch_summary(cfg))
     log("router", f"    ảnh {img_size}² -> {N_BLOCK} bậc downsample -> lưới "
-                  f"{router.grid}×{router.grid} = {router.n_token} token × "
-                  f"{router.dim} chiều | train từ số 0, không pretrain")
-    log("router", f"    prefix: {router.n_token} token × {d_dec} chiều ghi đè "
-                  f"{router.n_token} vị trí giữ chỗ ở đầu chuỗi decoder")
+                  f"{router.grid}×{router.grid} = {router.n_token} token | "
+                  f"patching đa tỉ lệ nối {router.d_cat} chiều -> SwiGLU "
+                  f"{router.dim} | train từ số 0, không pretrain")
+    log("router", f"    prefix: CHÍNH feat, {router.n_token} token × {d_dec} "
+                  f"chiều, ghi đè {router.n_token} vị trí giữ chỗ ở đầu chuỗi "
+                  f"decoder (không còn MLP Proj riêng)")
     log("router", f"    route_noise σ={route_noise:g} (sau warmup) "
                   + ("(Gumbel top-k, chỉ khi training)" if route_noise > 0
                      else "— TẮT, top-k tất định, KHÔNG còn cơ chế khám phá"))

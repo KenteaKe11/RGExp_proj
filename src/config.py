@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 import yaml
 
-from .router import (D_MODEL, IMG_SIZE, N_BLOCK, N_TOKEN, STRIDE,
+from .router import (D_CONCAT, D_MODEL, IMG_SIZE, N_BLOCK, N_TOKEN, STRIDE,
                      arch_desc, decay_desc, estimate_params)
 
 # ══════════════ OPTION 2 — container GPU thuê theo giờ (§9) ══════════════════
@@ -707,7 +707,7 @@ def load_config(path="configs/default.yaml", overrides=None):
     # ── Hình học của router: BỊ BUỘC bởi số bậc downsample ─────────────────
     # 5 bậc, mỗi bậc chia đôi cạnh và nhân bốn kênh, nên
     #     cạnh img/2^5 = 16 -> 16×16 = 256 token
-    #     kênh 1 × 4^5      = 1024   = chiều làm việc
+    #     kênh nối đa tỉ lệ Σ 4^i·r_i = 1984 -> SwiGLU -> 2560 = chiều làm việc
     # Xem docstring src/router.py.
     fixed.setdefault("router_img_size", IMG_SIZE)
     fixed["router_img_size"] = int(fixed["router_img_size"])
@@ -927,8 +927,9 @@ if __name__ == "__main__":
     print(f"Router  : {arch_summary(c)}")
     _g = c.fixed.router_img_size // STRIDE
     print(f"          ảnh {c.fixed.router_img_size}² -> {N_BLOCK} bậc -> lưới "
-          f"{_g}×{_g} = {_g*_g} token × {D_MODEL} chiều (train từ số 0) | "
-          f"prefix {N_TOKEN} token vào decoder")
+          f"{_g}×{_g} = {_g*_g} token, concat đa tỉ lệ {D_CONCAT} -> SwiGLU "
+          f"{D_MODEL} chiều (train từ số 0) | prefix {N_TOKEN} token vào "
+          f"decoder")
     print(f"          router {est['router']:,} + expert "
           f"{est['experts']:,} = {est['total']:,} param trainable")
     print(f"Adapter : {adapter_desc(c.fixed)} | quant={c.run.quant}")

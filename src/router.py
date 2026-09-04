@@ -1,5 +1,5 @@
-"""Nhánh Router — Feat-Extractor CNN → QFormer 2 query → 2 head, và 256 token
-đưa thẳng vào decoder.
+"""Nhánh Router — Feat-Extractor CNN đa tỉ lệ → QFormer 2 query → 2 head, và
+256 token đưa thẳng vào decoder.
 
 Nhánh này làm BA việc từ CÙNG một lần đọc ảnh:
 
@@ -13,42 +13,59 @@ Nhánh này làm BA việc từ CÙNG một lần đọc ảnh:
         │  resize 512, trung bình 3 kênh → [B,1,512,512]
         ▼
     5 × DownBlock          kênh ×4, cạnh ÷2 mỗi bậc
-        (1,512,512) → (4,256,256) → (16,128,128) → (64,64,64)
-                    → (256,32,32) → (1024,16,16)
+        │  MỖI bậc rẽ ra một nhánh Patching về lưới 16×16
+        │
+        │   bậc 1  (4,256,256) ─Patching r=16→ (  64,16,16)
+        │   bậc 2  (16,128,128) ─Patching r=8 → ( 128,16,16)
+        │   bậc 3  (64,64,64)   ─Patching r=4 → ( 256,16,16)
+        │   bậc 4  (256,32,32)  ─Patching r=2 → ( 512,16,16)
+        │   bậc 5  (1024,16,16) ─── đi thẳng ─→ (1024,16,16)
+        ▼
+    concat theo KÊNH → [B, 1984, 16, 16]      ← LỚP MỤC TIÊU của Grad-CAM
         │  flatten + permute
         ▼
-    [B, 256 token, 1024]                      ← "feat"
+    [B, 256 token, 1984]
         │  + Self-Attn(feat)        (skip)
         │  RMSNorm
-        │  + MLP 1024→256→1024      (skip)
+        │  SwiGLU 1984 → 2560
+        │  RMSNorm
         ▼
-    feat [B, 256, 1024] ──┬── MLP Proj (GELU) 1024→2560 ──► 256 token
-                          │      ghép vào ĐẦU chuỗi decoder
+    feat [B, 256, 2560] ──┬──────────────────────────► 256 token ghép vào
+                          │                            ĐẦU chuỗi decoder
                           │
-                          └── Cross-Attn với Query Learner (2, 1024)
+                          └── Cross-Attn với Query Learner (2, 2560)
                                      │
                                  split 2 vector
                                  ├─ q0 → Supervised MLP → 14 logit → ASL
                                  └─ q1 → Route-Gate MLP → E logit → top-k
 
-BA CON SỐ BỊ BUỘC VÀO NHAU. 5 bậc downsample quyết định cả hai chiều:
+──────────────────────────────────────────────────────────────────────────────
+HÌNH HỌC: MỘT CON SỐ SINH RA MỌI CON SỐ CÒN LẠI
+
+5 bậc downsample quyết định lưới và chiều concat:
 
     cạnh  512 / 2^5 = 16   →  16×16 = 256 TOKEN
-    kênh  1   × 4^5        →  1024   = CHIỀU LÀM VIỆC
+    kênh  bậc i có 4^i kênh, bị Patching thu về lưới 16×16 với hệ số r_i,
+          và Patching NHÂN kênh lên r_i lần (không phải r_i²), nên
+              4^i · r_i = 2^(i+N)   với  r_i = 2^(N-i)
+          Σ_{i=1..5} = 64+128+256+512+1024 = 1984 = CHIỀU CONCAT
 
-nên "256 token × 1024 chiều" không phải hai lựa chọn rời nhau mà là hai hệ
-quả của cùng một con số 5. Đổi `router_img_size` hoặc số bậc mà không đổi
-cái kia thì `RouterNet.__init__` chặn ngay bằng assert.
+Chiều LÀM VIỆC sau SwiGLU là 2560 — đúng bằng hidden của decoder Gemma 3 4b,
+vì `feat` được dùng THẲNG làm prefix, không còn một MLP Proj riêng nữa.
+QFormer và hai head vì thế cũng chạy ở 2560.
+
+Đổi `router_img_size` hoặc số bậc mà không đổi cái kia thì `RouterNet.__init__`
+chặn ngay bằng assert.
 
 Ảnh 512 cũng đúng bằng cỡ ẢNH NGUỒN (fixed.image_size_src = 512): processor
 của Gemma phóng nó lên 896 cho SigLIP, ở đây ta thu về 512 — tức router đọc
 gần đúng số pixel gốc chứ không nội suy thêm thông tin không có.
 
 ──────────────────────────────────────────────────────────────────────────────
-BỐN CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
+NĂM CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
 
-1. **256 TOKEN ĐI THẲNG VÀO DECODER.** Ngoài gate, nhánh này còn chiếu 256
-   token của nó lên 2560 chiều và ghép vào ĐẦU chuỗi mà decoder nhận:
+1. **256 TOKEN ĐI THẲNG VÀO DECODER.** Ngoài gate, nhánh này còn đưa CHÍNH
+   256 token 2560 chiều của nó vào ĐẦU chuỗi mà decoder nhận:
 
        [256 token router] ++ [prompt + ảnh SigLIP + target]
 
@@ -64,14 +81,21 @@ BỐN CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
    chủ ý: router chỉ học được cách nhìn ảnh nếu decoder thật sự đọc thứ nó
    nhìn thấy.
 
-2. **BACKBONE TỰ TRAIN, KHÔNG PRETRAIN.** DownBlock là khối res-conv thường
-   (Conv-SiLU-BN-Conv-SiLU, cộng skip, BN, rồi Conv stride-2 nhân bốn kênh).
-   Không còn ConvNeXt/DenseNet nạp trọng số ngoài: cả nhánh học từ số 0 trên
-   chính dữ liệu này. Đổi lại việc mất pretrain là 3.8M tham số cho toàn bộ
-   phần conv — rẻ hơn một backbone đóng băng, và không còn phải giải thích
-   một tầng chuẩn hoá ảnh nào cho khớp quy ước của bộ trọng số vay mượn.
+2. **ĐA TỈ LỆ, KHÔNG CHỈ TẦNG CUỐI.** Tầng conv cuối (1024,16,16) có trường
+   tiếp nhận rộng nhất nhưng đã bỏ mất mọi chi tiết nhỏ hơn 32 pixel — mà
+   nốt phổi, đường ống, viền màng phổi đều nằm ở thang đó. Bốn bậc trước
+   được kéo về cùng lưới 16×16 bằng một conv patch (kernel = stride = r) rồi
+   nối theo kênh, nên mỗi token 1984 chiều mang thông tin của CÙNG một ô trên
+   phim ở NĂM độ phân giải. Patching nhân kênh lên r lần chứ không r² — nó là
+   phép NÉN có học, không phải space-to-depth bảo toàn.
 
-3. **CÓ BATCHNORM — hai hệ quả phải biết.**
+3. **BACKBONE TỰ TRAIN, KHÔNG PRETRAIN.** DownBlock là khối res-conv thường
+   (Conv-SiLU-BN-Conv-SiLU, cộng skip, BN, rồi Conv stride-2 nhân bốn kênh).
+   Không có ConvNeXt/DenseNet nạp trọng số ngoài: cả nhánh học từ số 0 trên
+   chính dữ liệu này, nên không phải giải thích một tầng chuẩn hoá ảnh nào
+   cho khớp quy ước của bộ trọng số vay mượn.
+
+4. **CÓ BATCHNORM — hai hệ quả phải biết.**
 
    (a) BN chuẩn hoá theo cả batch, nên KHI TRAIN gate của một ảnh phụ thuộc
    các ảnh cùng micro-batch. Lúc `eval()` BN dùng thống kê chạy nên gate độc
@@ -87,11 +111,12 @@ BỐN CHỖ ĐẶC TRƯNG, phần còn lại là những khối tiêu chuẩn
    KHỞI ĐỘNG, không phải hỏng wiring — đọc `logit_std_ratio` trong log train
    (nó được tính ở chế độ train) và chỉ tin số eval sau vài trăm step.
 
-4. **MỘT THÂN, HAI QUERY.** Cross-Attn hút feat về đúng 2 vector: một cho
+5. **MỘT THÂN, HAI QUERY.** Cross-Attn hút feat về đúng 2 vector: một cho
    nhánh supervised, một cho định tuyến. Hai nhiệm vụ dùng chung mọi thứ
    phía dưới nhưng có hai đường hút riêng, nên ASL nắn thân nhánh chứ không
    chiếm chỗ của route logit. Nếu `sup_recall` lên tốt mà `logit_std_ratio`
    vẫn thấp thì hạ `w_sup` — đó là dấu hiệu thân nhánh đã bị ASL chiếm.
+   Hai head dùng MLP có skip 2560 → 1024 → 2560 (GELU) rồi chiếu ra.
 
 ──────────────────────────────────────────────────────────────────────────────
 CÂN BẰNG TẢI: MỘT SỐ HẠNG AUX LOSS
@@ -132,9 +157,9 @@ IMG_SIZE = 512                  # cạnh ảnh vào nhánh router
 STRIDE = 1 << N_BLOCK           # 32 — tổng stride của 5 bậc
 GRID = IMG_SIZE // STRIDE       # 16
 N_TOKEN = GRID * GRID           # 256 token
-D_MODEL = 4 ** N_BLOCK          # 1024 kênh = chiều làm việc
+D_CONV = 4 ** N_BLOCK           # 1024 kênh ở bậc conv cuối
 N_HEAD = 8                      # số head của self-attn và cross-attn
-MLP_HIDDEN = D_MODEL // 4       # 256 — nút cổ chai của mọi MLP có skip
+HEAD_HIDDEN = 1024              # nút cổ chai của MLP trong hai head (GELU)
 N_QUERY = 2                     # 1 query cho supervised, 1 cho route
 
 N_DISEASE = 14                  # §1.4 — 14 finding
@@ -144,8 +169,29 @@ N_DISEASE = 14                  # §1.4 — 14 finding
 # 4 tên aspect đó.
 N_ASPECT = 4
 
-# Chiều hidden của decoder Gemma 3 4b — đích của MLP Proj.
+# Chiều hidden của decoder Gemma 3 4b — cũng là chiều LÀM VIỆC của nhánh này,
+# vì `feat` được dùng thẳng làm prefix (không còn MLP Proj riêng).
 D_DECODER = 2560
+
+
+def concat_dim(n_block=N_BLOCK, img_size=IMG_SIZE):
+    """Chiều sau khi nối đa tỉ lệ: Σ_i 4^i · r_i. Với (5, 512) = 1984.
+
+    Patching nhân kênh lên r lần trong khi chia cạnh cho r, nên bậc càng nông
+    (nhiều pixel, ít kênh) thì đóng góp càng ít — đúng thứ tự ưu tiên mong
+    muốn: tầng sâu mang ngữ nghĩa, tầng nông chỉ thêm chi tiết.
+    """
+    grid = int(img_size) >> int(n_block)
+    total, c, s = 0, 1, int(img_size)
+    for _ in range(int(n_block)):
+        c *= 4
+        s //= 2
+        total += c * (s // grid)
+    return total
+
+
+D_CONCAT = concat_dim()         # 1984 — chiều vào Self-Attn của extractor
+D_MODEL = D_DECODER             # 2560 — chiều làm việc sau SwiGLU
 
 
 # ══════════════════════════════ khối cơ bản ══════════════════════════════════
@@ -164,15 +210,33 @@ class RMSNorm(nn.Module):
         return (x * self.weight.float()).to(dtype)
 
 
+class SwiGLU(nn.Module):
+    """d_in → d_out, hai ma trận: SiLU(W_gate·x) ⊙ (W_up·x).
+
+    Dạng hai ma trận (không có down-proj) vì đây là phép CHIẾU ra chiều
+    decoder chứ không phải một FFN nút cổ chai: không có "chiều ẩn" nào để
+    chọn, và cổng nhân giữ được tính phi tuyến mà một Linear trần không có.
+    """
+
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.gate = nn.Linear(d_in, d_out)
+        self.up = nn.Linear(d_in, d_out)
+
+    def forward(self, x):
+        return F.silu(self.gate(x)) * self.up(x)
+
+
 class SkipMLP(nn.Module):
     """dim → hidden → dim (GELU) rồi CỘNG lại đầu vào.
 
-    Dùng ở ba chỗ: sau self-attn của Feat-Extractor, và trong mỗi head trước
-    phép chiếu cuối. Nút cổ chai dim/4 nên nó rẻ (0.53M ở dim 1024) và skip
-    giữ cho nó không phải học lại hàm đồng nhất.
+    Dùng trong mỗi head trước phép chiếu cuối. `hidden` là 1024 cố định (chứ
+    không còn dim/4): ở dim 2560 thì dim/4 = 640 sẽ bóp thân nhánh ngay
+    trước chỗ ra quyết định. Skip giữ cho nó không phải học lại hàm đồng
+    nhất.
     """
 
-    def __init__(self, dim=D_MODEL, hidden=MLP_HIDDEN):
+    def __init__(self, dim=D_MODEL, hidden=HEAD_HIDDEN):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(),
                                  nn.Linear(hidden, dim))
@@ -191,8 +255,8 @@ class DownBlock(nn.Module):
 
     Nhân bốn kênh trong khi chia bốn diện tích, nên SỐ PHẦN TỬ không đổi qua
     mỗi bậc: 1×512² = 4×256² = … = 1024×16². Toàn bộ việc của khối là đổi
-    thông tin từ chiều không gian sang chiều kênh chứ không nén — cái nén duy
-    nhất trong nhánh này nằm ở nút cổ chai dim/4 của các MLP.
+    thông tin từ chiều không gian sang chiều kênh chứ không nén — phép nén
+    trong nhánh này nằm ở `Patching` và ở nút cổ chai 1024 của hai head.
     """
 
     def __init__(self, c):
@@ -211,9 +275,35 @@ class DownBlock(nn.Module):
         return self.act(self.down(h))
 
 
+class Patching(nn.Module):
+    """(C, S, S) → (C·r, G, G) với r = S/G. Conv có kernel = stride = r.
+
+    Kéo MỘT bậc downsample về đúng lưới chung 16×16 để nối được theo kênh với
+    các bậc khác. Kênh nhân r (chứ không r² như space-to-depth), nên đây là
+    phép NÉN 1/r có học: mỗi ô 16×16 của lưới chung được tóm tắt bởi C·r số
+    thay vì C·r² số thô.
+
+    r = 1 (bậc cuối, vốn đã ở lưới 16×16) → không có tham số nào, tensor đi
+    thẳng qua. Đó là lý do `proj` có thể là None chứ không phải một Conv 1×1
+    trá hình: thêm một phép chiếu ở đó chỉ để "đối xứng" là thêm 1M tham số
+    không làm gì.
+    """
+
+    def __init__(self, c_in, r):
+        super().__init__()
+        self.r = int(r)
+        self.c_out = int(c_in) * int(r)
+        self.proj = (None if self.r == 1
+                     else nn.Conv2d(int(c_in), self.c_out, self.r,
+                                    stride=self.r))
+
+    def forward(self, x):
+        return x if self.proj is None else self.proj(x)
+
+
 # ══════════════════════════ Feat-Extractor ═══════════════════════════════════
 class FeatExtractor(nn.Module):
-    """[B,3,H,W] → [B, 256, 1024]. Toàn bộ phần đọc ảnh của nhánh router.
+    """[B,3,H,W] → [B, 256, 2560]. Toàn bộ phần đọc ảnh của nhánh router.
 
     Ảnh vào là `pixel_values` mà processor của Gemma đã tạo, nên không có
     đường ống ảnh thứ hai nào phải bảo trì và không tốn thêm một lần decode
@@ -227,40 +317,71 @@ class FeatExtractor(nn.Module):
          hiệu ba lần. Dải [-1,1] của Gemma giữ nguyên: không có bộ trọng số
          vay mượn nào để phải khớp quy ước chuẩn hoá.
 
-    Sau 5 bậc DownBlock, [B,1024,16,16] được flatten + permute thành 256
-    token 1024 chiều, rồi đi qua đúng một khối transformer: self-attn có
-    skip, RMSNorm, MLP nút cổ chai có skip. Self-attn là chỗ DUY NHẤT trong
-    nhánh mà hai vùng xa nhau của phim gặp được nhau — conv trước đó chỉ nhìn
-    được vùng lân cận.
+    Sau đó 5 bậc DownBlock, MỖI bậc rẽ ra một `Patching` về lưới 16×16, nối
+    theo kênh thành [B, 1984, 16, 16]. Phần đuôi là đúng một khối
+    transformer: self-attn có skip, RMSNorm, rồi SwiGLU chiếu 1984 → 2560 và
+    một RMSNorm cuối.
+
+    Self-attn là chỗ DUY NHẤT trong nhánh mà hai vùng xa nhau của phim gặp
+    được nhau — conv trước đó chỉ nhìn được vùng lân cận.
+
+    RMSNorm CUỐI không phải trang trí: `feat` đi thẳng vào chuỗi decoder, mà
+    embedding của Gemma đã nhân sẵn √hidden_size nên có rms ≈ 1. Không có nó
+    thì thang của prefix hoàn toàn do khởi tạo quyết định — hoặc bị decoder
+    bỏ qua, hoặc át hết phần prompt thật.
     """
 
-    def __init__(self, img_size=IMG_SIZE, n_block=N_BLOCK, dim=D_MODEL,
-                 n_head=N_HEAD, hidden=MLP_HIDDEN):
+    def __init__(self, img_size=IMG_SIZE, n_block=N_BLOCK, d_out=D_MODEL,
+                 n_head=N_HEAD):
         super().__init__()
         self.img_size = int(img_size)
-        blocks, c = [], 1
-        for _ in range(int(n_block)):
+        n_block = int(n_block)
+        stride = 1 << n_block
+        grid = self.img_size // stride
+        if grid * stride != self.img_size or grid <= 0:
+            raise RuntimeError(
+                f"img_size={img_size} không chia hết cho tổng stride {stride} "
+                f"của {n_block} bậc downsample.")
+        blocks, patches, c, s = [], [], 1, self.img_size
+        for _ in range(n_block):
             blocks.append(DownBlock(c))
             c *= 4
-        if c != dim:
+            s //= 2
+            patches.append(Patching(c, s // grid))
+        self.blocks = nn.ModuleList(blocks)
+        self.patch = nn.ModuleList(patches)
+        self.grid = grid
+        self.n_token = grid * grid
+        self.d_conv = c                                   # 1024 ở bậc cuối
+        self.d_cat = sum(p.c_out for p in self.patch)     # 1984
+        want = concat_dim(n_block, self.img_size)
+        if self.d_cat != want:
             raise RuntimeError(
-                f"{n_block} bậc downsample cho {c} kênh nhưng chiều làm việc "
-                f"là {dim}. Kênh nhân 4 mỗi bậc, nên dim phải = 4^n_block.")
-        self.blocks = nn.Sequential(*blocks)
-        self.attn = nn.MultiheadAttention(dim, n_head, batch_first=True)
-        self.norm = RMSNorm(dim)
-        self.mlp = SkipMLP(dim, hidden)
-        self.dim = dim
+                f"chiều concat đếm được {self.d_cat} khác công thức {want} — "
+                f"concat_dim() và Patching đã lệch nhau.")
+        if self.d_cat % n_head:
+            raise RuntimeError(
+                f"chiều concat {self.d_cat} không chia hết cho {n_head} head "
+                f"của self-attn.")
+        self.attn = nn.MultiheadAttention(self.d_cat, n_head, batch_first=True)
+        self.norm = RMSNorm(self.d_cat)
+        self.out = SwiGLU(self.d_cat, int(d_out))
+        self.norm_out = RMSNorm(int(d_out))
+        self.dim = int(d_out)
 
     def conv_map(self, pixel_values):
-        """[B,3,H,W] → [B, 1024, 16, 16] — đầu ra 5 bậc DownBlock, CHƯA flatten.
+        """[B,3,H,W] → [B, 1984, 16, 16] — ĐA TỈ LỆ, CHƯA flatten.
 
         Tách ra khỏi `forward` vì Grad-CAM (src/cam.py) cần ĐÚNG tensor này:
         nó là feature map cuối cùng còn giữ TRỤC KHÔNG GIAN thật, chưa bị
         self-attn trộn giữa các vị trí. Chọn nó làm lớp mục tiêu là quy ước
-        chuẩn của Grad-CAM (lớp conv sâu nhất), và ở đây còn có thêm một lý do
-        riêng: sau `self.attn` mỗi token đã là tổ hợp của cả 256 vị trí, nên
-        "vùng nào của phim" không còn đọc được từ chỉ số token nữa.
+        chuẩn của Grad-CAM (sâu nhất mà còn không gian), và ở đây còn có thêm
+        một lý do riêng: sau `self.attn` mỗi token đã là tổ hợp của cả 256 vị
+        trí, nên "vùng nào của phim" không còn đọc được từ chỉ số token nữa.
+
+        Từ đợt đổi kiến trúc này, tensor đó gom cả NĂM bậc chứ không chỉ bậc
+        cuối, nên bản đồ nhiệt cũng cộng gộp bằng chứng ở năm thang — đúng
+        thứ mà sup_head thật sự đọc.
 
         `forward` gọi lại hàm này chứ không nhân đôi code — hai đường phải
         thấy CÙNG một feature map, nếu không thì bản đồ nhiệt mô tả một mạng
@@ -278,20 +399,24 @@ class FeatExtractor(nn.Module):
                               mode="bilinear", align_corners=False,
                               antialias=True)
         x = x.mean(dim=1, keepdim=True)              # [B, 1, S, S]
-        return self.blocks(x)                        # [B, 1024, 16, 16]
+        feats = []
+        for blk, pat in zip(self.blocks, self.patch):
+            x = blk(x)
+            feats.append(pat(x))
+        return torch.cat(feats, dim=1)               # [B, 1984, 16, 16]
 
     def from_map(self, h):
-        """[B, 1024, 16, 16] → [B, 256, 1024]. Nửa sau của `forward`.
+        """[B, 1984, 16, 16] → [B, 256, 2560]. Nửa sau của `forward`.
 
         Nhận feature map RỜI thay vì tự tính, để Grad-CAM giữ được tham chiếu
         tới đúng tensor nó sẽ lấy gradient theo. `torch.autograd.grad` cần
         CHÍNH node đó trong đồ thị; chạy hai forward riêng thì có hai node
         khác nhau và gradient không nối được về cái mình đang cầm.
         """
-        t = h.flatten(2).transpose(1, 2)             # [B, 256, 1024]
+        t = h.flatten(2).transpose(1, 2)             # [B, 256, 1984]
         t = t + self.attn(t, t, t, need_weights=False)[0]
         t = self.norm(t)
-        return self.mlp(t)                           # [B, 256, 1024]
+        return self.norm_out(self.out(t))            # [B, 256, 2560]
 
     def forward(self, pixel_values):
         return self.from_map(self.conv_map(pixel_values))
@@ -322,35 +447,15 @@ class QFormer(nn.Module):
 
 
 class Head(nn.Module):
-    """MLP có skip (dim→dim/4→dim) rồi một Linear chiếu ra `out` chiều."""
+    """MLP có skip (dim→1024→dim, GELU) rồi một Linear chiếu ra `out` chiều."""
 
-    def __init__(self, dim, out, hidden=MLP_HIDDEN):
+    def __init__(self, dim, out, hidden=HEAD_HIDDEN):
         super().__init__()
         self.mlp = SkipMLP(dim, hidden)
         self.proj = nn.Linear(dim, out)
 
     def forward(self, x):
         return self.proj(self.mlp(x))
-
-
-class DecoderProjector(nn.Module):
-    """256 token 1024 chiều → 256 token 2560 chiều cho đầu chuỗi decoder.
-
-    RMSNorm ở CUỐI là chỗ quan trọng: embedding của Gemma đã nhân sẵn
-    √hidden_size nên nó có rms ≈ 1, và 256 token cắm vào giữa chuỗi phải cùng
-    thang với chúng. Không có nó thì thang của prefix hoàn toàn do khởi tạo
-    quyết định — hoặc bị decoder bỏ qua, hoặc át hết phần prompt thật.
-    """
-
-    def __init__(self, dim=D_MODEL, d_out=D_DECODER):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim, d_out), nn.GELU(),
-                                 nn.Linear(d_out, d_out))
-        self.norm = RMSNorm(d_out)
-        self.d_out = int(d_out)
-
-    def forward(self, x):
-        return self.norm(self.net(x))
 
 
 # ════════════════════════════ lịch decay của σ ═══════════════════════════════
@@ -390,9 +495,14 @@ def decay_desc(noise_start, noise_end, n_samples):
 class RouterNet(nn.Module):
     """Cả nhánh router. Trả (sup_logits [B,14], gate [B,E], prefix, stats).
 
-    `prefix` là [B, 256, 2560] — 256 token ghép vào đầu chuỗi decoder
-    (src/model.py::RouterBridge ghi đè đúng 256 vị trí giữ chỗ mà collate đã
-    chèn sẵn).
+    `prefix` là [B, 256, 2560] — CHÍNH `feat` của Feat-Extractor, ghép vào đầu
+    chuỗi decoder (src/model.py::RouterBridge ghi đè đúng 256 vị trí giữ chỗ
+    mà collate đã chèn sẵn). Từ đợt đổi kiến trúc này không còn `DecoderProjector`
+    riêng: SwiGLU cuối của extractor đã chiếu 1984 → 2560, nên thứ hai head
+    nhìn và thứ decoder đọc là CÙNG một tensor. Đó là chủ ý — nếu gate và
+    prefix được sinh từ hai phép chiếu khác nhau thì "expert này hợp với ảnh
+    này" và "decoder thấy gì ở ảnh này" có thể trôi ra xa nhau mà không có
+    số đo nào bắt được.
 
     `gate` là vector THƯA, tổng mỗi hàng = 1, đúng `top_k` ô khác 0 ở MỌI chế
     độ. Nhân trực tiếp vào delta của từng expert trong decoder (src/moe.py).
@@ -410,7 +520,7 @@ class RouterNet(nn.Module):
     float thuần để ghi log.
     """
 
-    def __init__(self, n_expert, top_k, dim=D_MODEL, route_noise=0.5,
+    def __init__(self, n_expert, top_k, dim=None, route_noise=0.5,
                  route_noise_start=None, decay_samples=0,
                  img_size=IMG_SIZE, n_block=N_BLOCK, d_decoder=D_DECODER,
                  log=None):
@@ -422,14 +532,20 @@ class RouterNet(nn.Module):
             f"decay_samples phải >= 0, nhận {decay_samples}")
         assert route_noise_start is None or route_noise_start >= 0, (
             f"route_noise_start phải >= 0, nhận {route_noise_start}")
+        # Chiều làm việc BỊ BUỘC bằng chiều hidden của decoder: `feat` đi
+        # thẳng vào chuỗi decoder, không còn phép chiếu trung gian nào để
+        # hấp thụ chênh lệch.
+        d_decoder = int(d_decoder)
+        if dim is None:
+            dim = d_decoder
+        assert int(dim) == d_decoder, (
+            f"dim={dim} phải bằng d_decoder={d_decoder}: feat của extractor "
+            f"ĐƯỢC DÙNG THẲNG làm prefix, không còn MLP Proj để đổi chiều.")
         stride = 1 << int(n_block)
         grid = int(img_size) // stride
         assert grid * stride == int(img_size) and grid > 0, (
             f"img_size={img_size} không chia hết cho tổng stride {stride} "
             f"của {n_block} bậc downsample.")
-        assert 4 ** int(n_block) == dim, (
-            f"{n_block} bậc downsample cho {4 ** int(n_block)} kênh nhưng "
-            f"chiều làm việc là {dim} — kênh nhân 4 mỗi bậc.")
         self.n_expert, self.top_k = int(n_expert), int(top_k)
         self.dim = int(dim)
         self.grid = grid
@@ -446,16 +562,16 @@ class RouterNet(nn.Module):
 
         # ── Thân nhánh ──────────────────────────────────────────────────────
         self.extractor = FeatExtractor(img_size=img_size, n_block=n_block,
-                                       dim=dim)
-        self.qformer = QFormer(dim, N_QUERY)
-        self.sup_head = Head(dim, N_DISEASE)
-        self.route_head = Head(dim, n_expert)
-        self.proj = DecoderProjector(dim, d_decoder)
+                                       d_out=self.dim)
+        self.d_cat = self.extractor.d_cat
+        self.qformer = QFormer(self.dim, N_QUERY)
+        self.sup_head = Head(self.dim, N_DISEASE)
+        self.route_head = Head(self.dim, n_expert)
         if log:
             log("router", f"feat-extractor {n_block} bậc: ảnh {img_size}² → "
-                          f"{grid}×{grid} = {self.n_token} token × {dim} "
-                          f"chiều | prefix {self.n_token}×{d_decoder} vào "
-                          f"decoder")
+                          f"{grid}×{grid} = {self.n_token} token, concat đa "
+                          f"tỉ lệ {self.d_cat} → SwiGLU {self.dim} chiều | "
+                          f"prefix = chính feat, {self.n_token}×{self.dim}")
 
     # ── nhiễu Gumbel trên route logit ───────────────────────────────────────
     def set_route_noise(self, scale):
@@ -496,11 +612,12 @@ class RouterNet(nn.Module):
         return {
             "feat-extractor": n(ex),
             "  ├ 5 bậc downsample (conv+BN)": n(ex.blocks),
-            "  └ self-attn + norm + mlp": n(ex) - n(ex.blocks),
-            "qformer 2 query + cross-attn": n(self.qformer),
-            "sup_head (mlp skip + 1024→14)": n(self.sup_head),
-            "route_head (mlp skip + 1024→E)": n(self.route_head),
-            "mlp proj 1024→2560 (prefix)": n(self.proj),
+            f"  ├ patching đa tỉ lệ -> {ex.d_cat}": n(ex.patch),
+            f"  └ self-attn + norm + swiglu {ex.d_cat}->{ex.dim}":
+                n(ex) - n(ex.blocks) - n(ex.patch),
+            f"qformer {N_QUERY} query + cross-attn": n(self.qformer),
+            f"sup_head (mlp skip + {self.dim}->14)": n(self.sup_head),
+            f"route_head (mlp skip + {self.dim}->E)": n(self.route_head),
             "TOTAL": n(self),
             "TOTAL trainable": sum(p.numel() for p in self.parameters()
                                    if p.requires_grad),
@@ -508,11 +625,11 @@ class RouterNet(nn.Module):
 
     # ── đường riêng cho Grad-CAM ────────────────────────────────────────────
     def sup_forward(self, pixel_values):
-        """pixel_values → (sup_logits [B,14], fmap [B,1024,16,16]).
+        """pixel_values → (sup_logits [B,14], fmap [B,1984,16,16]).
 
-        Nhánh NGẮN của forward: chỉ đi tới `sup_head`, bỏ route_head, proj và
-        toàn bộ phần thống kê. Grad-CAM (src/cam.py) cần đúng hai thứ này —
-        logit để lấy đạo hàm, feature map để lấy đạo hàm THEO.
+        Nhánh NGẮN của forward: chỉ đi tới `sup_head`, bỏ route_head và toàn
+        bộ phần thống kê. Grad-CAM (src/cam.py) cần đúng hai thứ này — logit
+        để lấy đạo hàm, feature map để lấy đạo hàm THEO.
 
         `fmap` được trả ra ngoài (chứ không giữ trong một thuộc tính) vì
         `torch.autograd.grad(logit, fmap)` phải cầm CHÍNH node đó. Nó cũng đã
@@ -525,8 +642,8 @@ class RouterNet(nn.Module):
         """
         fmap = self.extractor.conv_map(pixel_values)
         fmap = fmap.requires_grad_(True) if not fmap.requires_grad else fmap
-        feat = self.extractor.from_map(fmap)              # [B, 256, 1024]
-        q = self.qformer(feat)                            # [B, 2, 1024]
+        feat = self.extractor.from_map(fmap)              # [B, 256, 2560]
+        q = self.qformer(feat)                            # [B, 2, 2560]
         return self.sup_head(q[:, 0]).float(), fmap       # [B, 14]
 
     def forward(self, pixel_values, mask=None):
@@ -535,11 +652,13 @@ class RouterNet(nn.Module):
         `mask` giữ lại trong chữ ký cho tương thích với RouterBridge nhưng
         KHÔNG dùng: nhánh này đọc ảnh, không đọc chuỗi hỗn hợp text+ảnh.
         """
-        feat = self.extractor(pixel_values)               # [B, 256, 1024]
-        q = self.qformer(feat)                            # [B, 2, 1024]
+        feat = self.extractor(pixel_values)               # [B, 256, 2560]
+        q = self.qformer(feat)                            # [B, 2, 2560]
         sup_logits = self.sup_head(q[:, 0])               # [B, 14]
         route_logits = self.route_head(q[:, 1]).float()   # [B, E]
-        prefix = self.proj(feat)                          # [B, 256, 2560]
+        # prefix = CHÍNH feat. Không sao chép, không chiếu lại (xem docstring
+        # của lớp): decoder đọc đúng tensor mà hai head vừa nhìn.
+        prefix = feat                                     # [B, 256, 2560]
 
         # (1) GIÁ TRỊ gate: softmax SẠCH trên E expert — đường duy nhất có
         # gradient của CE qua gate, và cũng là P_e của số hạng aux.
@@ -628,8 +747,13 @@ def _mha_params(dim):
     return 4 * dim * dim + 4 * dim
 
 
-def _skip_mlp_params(dim, hidden=MLP_HIDDEN):
+def _skip_mlp_params(dim, hidden=HEAD_HIDDEN):
     return 2 * dim * hidden + hidden + dim
+
+
+def _swiglu_params(d_in, d_out):
+    """Hai ma trận gate/up, mỗi cái d_in→d_out có bias."""
+    return 2 * (d_in * d_out + d_out)
 
 
 def _down_params(n_block=N_BLOCK):
@@ -641,19 +765,37 @@ def _down_params(n_block=N_BLOCK):
     return total
 
 
+def _patch_params(n_block=N_BLOCK, img_size=IMG_SIZE):
+    """Conv patch của từng bậc: (C·r)·C·r² + C·r. Bậc cuối r = 1 -> 0."""
+    grid = int(img_size) >> int(n_block)
+    total, c, s = 0, 1, int(img_size)
+    for _ in range(int(n_block)):
+        c *= 4
+        s //= 2
+        r = s // grid
+        if r > 1:
+            total += (c * r) * c * r * r + c * r
+    return total
+
+
 def router_params(n_expert, dim=D_MODEL, d_decoder=D_DECODER,
-                  n_block=N_BLOCK):
-    """Bảng tham số của nhánh router, theo khối."""
-    extractor = _down_params(n_block) + _mha_params(dim) + dim \
-        + _skip_mlp_params(dim)
+                  n_block=N_BLOCK, img_size=IMG_SIZE):
+    """Bảng tham số của nhánh router, theo khối.
+
+    `d_decoder` giữ trong chữ ký cho tương thích nhưng KHÔNG còn là một khối
+    riêng: chiều làm việc đã bằng chiều decoder, và phép chiếu ra nó nằm
+    trong SwiGLU cuối của extractor.
+    """
+    d_cat = concat_dim(n_block, img_size)
+    extractor = (_down_params(n_block) + _patch_params(n_block, img_size)
+                 + _mha_params(d_cat) + d_cat
+                 + _swiglu_params(d_cat, dim) + dim)
     qformer = N_QUERY * dim + _mha_params(dim) + dim
     sup = _skip_mlp_params(dim) + dim * N_DISEASE + N_DISEASE
     route = _skip_mlp_params(dim) + dim * n_expert + n_expert
-    proj = (dim * d_decoder + d_decoder) + (d_decoder * d_decoder + d_decoder) \
-        + d_decoder
     return {"extractor": extractor, "qformer": qformer, "sup_head": sup,
-            "route_head": route, "proj": proj,
-            "total": extractor + qformer + sup + route + proj}
+            "route_head": route,
+            "total": extractor + qformer + sup + route}
 
 
 # ── Một expert QDoRA r8 trên 4 ma trận attn của gemma-3-4b-it ────────────────
@@ -681,9 +823,10 @@ def estimate_params(n_expert, expert_params=EXPERT_PARAMS):
 def arch_desc(n_expert, top_k):
     """Một dòng mô tả kiến trúc, dùng chung cho log / metrics / print."""
     est = estimate_params(n_expert, 0)
-    return (f"feat-extractor {N_BLOCK} bậc (1→{D_MODEL} kênh) → "
-            f"[{N_TOKEN},{D_MODEL}] → qformer {N_QUERY} query → "
-            f"(14 | {n_expert}) + prefix {N_TOKEN}×{D_DECODER} vào decoder | "
+    return (f"feat-extractor {N_BLOCK} bậc (1→{D_CONV} kênh) + patching đa "
+            f"tỉ lệ → [{N_TOKEN},{D_CONCAT}] → swiglu {D_MODEL} → qformer "
+            f"{N_QUERY} query → (14 | {n_expert}) + prefix "
+            f"{N_TOKEN}×{D_DECODER} vào decoder | "
             f"router {est['router']/1e6:.2f}M (train hết) | "
             f"top-{top_k}/{n_expert}")
 
@@ -715,32 +858,39 @@ def _selftest():
         print(f"{name:<54}{'✓' if cond else '✗'} {extra}")
 
     net = RouterNet(E, K, route_noise=0.0)
-    print(f"{'khối':<40}{'đếm được':>14}")
+    print(f"{'khối':<44}{'đếm được':>14}")
     for k, v in net.param_table().items():
-        print(f"  {k:<38}{v:>14,}")
+        print(f"  {k:<42}{v:>14,}")
 
     est = router_params(E)
     real = {"extractor": sum(p.numel() for p in net.extractor.parameters()),
             "qformer": sum(p.numel() for p in net.qformer.parameters()),
             "sup_head": sum(p.numel() for p in net.sup_head.parameters()),
-            "route_head": sum(p.numel() for p in net.route_head.parameters()),
-            "proj": sum(p.numel() for p in net.proj.parameters())}
+            "route_head": sum(p.numel() for p in net.route_head.parameters())}
     for k in real:
         check(f"công thức khớp module: {k}", est[k] == real[k],
               f"({est[k]:,} vs {real[k]:,})")
     check("estimate_params khớp tổng module thật",
           estimate_params(E)["router"] == sum(p.numel()
                                               for p in net.parameters()))
-    check("hình học: 512 → 16×16 = 256 token × 1024 chiều",
-          net.grid == GRID and net.n_token == N_TOKEN and net.dim == D_MODEL,
-          f"(grid={net.grid}, token={net.n_token}, dim={net.dim})")
+    check("hình học: 512 → 16×16 = 256 token, concat 1984 → 2560",
+          net.grid == GRID and net.n_token == N_TOKEN
+          and net.d_cat == D_CONCAT == 1984 and net.dim == D_MODEL == 2560,
+          f"(grid={net.grid}, token={net.n_token}, cat={net.d_cat}, "
+          f"dim={net.dim})")
+    check("KHÔNG còn DecoderProjector riêng (prefix = chính feat)",
+          not hasattr(net, "proj"))
     check("cả nhánh TRAIN HẾT (không có phần đóng băng)",
           all(p.requires_grad for p in net.parameters()))
+    check("head MLP dùng GELU, nút cổ chai 1024",
+          isinstance(net.sup_head.mlp.net[1], nn.GELU)
+          and net.sup_head.mlp.net[0].out_features == HEAD_HIDDEN == 1024,
+          f"(hidden={net.sup_head.mlp.net[0].out_features})")
 
     # ── hình dạng + đường đi ────────────────────────────────────────────────
     # Đo ở chế độ TRAIN: BN chưa có thống kê chạy nào đáng tin lúc mới dựng,
     # nên eval() ở đây chuẩn hoá bằng (0, 1) và mọi số đo phân tán sẽ sai
-    # lệch (xem mục 3b của docstring module).
+    # lệch (xem mục 4b của docstring module).
     x = _fake_cxr(8)
     net.train()
     sup, gate, prefix, st = net(x)
@@ -757,19 +907,30 @@ def _selftest():
     check("stats có số đo chẩn đoán",
           {"logit_std_ratio", "trunk_std_sample", "balance"} <= set(st))
 
-    # ── shape trung gian đúng bảng 1×512² → 1024×16² ────────────────────────
+    # ── shape trung gian đúng bảng 1×512² → 1024×16², và nhánh patching ─────
     with torch.no_grad():
         t = x[:2].float().mean(dim=1, keepdim=True)
         t = F.interpolate(t, size=(IMG_SIZE, IMG_SIZE), mode="bilinear",
                           align_corners=False, antialias=True)
-        shapes = [tuple(t.shape[1:])]
-        for blk in net.extractor.blocks:
+        shapes, patched = [tuple(t.shape[1:])], []
+        for blk, pat in zip(net.extractor.blocks, net.extractor.patch):
             t = blk(t)
             shapes.append(tuple(t.shape[1:]))
+            patched.append(tuple(pat(t).shape[1:]))
     want = [(1, 512, 512), (4, 256, 256), (16, 128, 128), (64, 64, 64),
             (256, 32, 32), (1024, 16, 16)]
+    want_p = [(64, 16, 16), (128, 16, 16), (256, 16, 16), (512, 16, 16),
+              (1024, 16, 16)]
     check("chuỗi downsample đúng bảng thiết kế", shapes == want,
           " → ".join("×".join(map(str, s)) for s in shapes))
+    check("patching kéo MỌI bậc về 16×16, kênh ×r", patched == want_p,
+          " + ".join(str(p[0]) for p in patched)
+          + f" = {sum(p[0] for p in patched)}")
+    with torch.no_grad():
+        fmap = net.extractor.conv_map(x[:2])
+    check("conv_map trả feature map ĐA TỈ LỆ [B,1984,16,16]",
+          tuple(fmap.shape) == (2, D_CONCAT, GRID, GRID),
+          str(tuple(fmap.shape)))
 
     # ── router PHẢI phân biệt được ảnh khác nhau ────────────────────────────
     check("route_logit đổi theo ảnh (ratio > 0.1)",
@@ -826,13 +987,17 @@ def _selftest():
           net.route_head.proj.weight.grad is not None
           and float(net.route_head.proj.weight.grad.abs().sum()) > 0)
 
-    # ── gradient của prefix chảy về feat-extractor ─────────────────────────
+    # ── gradient của prefix chảy về feat-extractor, KỂ CẢ nhánh patching ────
     net.zero_grad(set_to_none=True)
     net(x)[2].sum().backward()
     g_ex = sum(float(p.grad.abs().sum()) for p in net.extractor.parameters()
                if p.grad is not None)
+    g_pa = sum(float(p.grad.abs().sum()) for p in net.extractor.patch.parameters()
+               if p.grad is not None)
     check("prefix truyền gradient về feat-extractor", g_ex > 0,
           f"(Σ|grad| = {g_ex:.3e})")
+    check("gradient tới cả 4 conv patching (bậc nông không chết)", g_pa > 0,
+          f"(Σ|grad| = {g_pa:.3e})")
 
     # ── hai tính chất của L_aux, và cái thứ hai là một GIỚI HẠN ─────────────
     # (a) P đều 1/E  ->  Σ f·P = 1/E · Σf = 1/E  ->  aux = 1.0 BẤT KỂ f lệch
