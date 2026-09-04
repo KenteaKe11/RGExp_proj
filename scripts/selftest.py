@@ -270,30 +270,30 @@ def io_bytes() -> bytes:
 
 
 def test_runner_loop() -> None:
-    """Vòng chạy chung của runner: resume, batch hỏng, đếm rỗng.
+    """Vòng chạy chung của runner: sinh thử, resume, batch hỏng, ngắt mạch.
 
-    Ba hành vi này quyết định chuyện một lần chạy nhiều giờ trên máy tính tiền
-    theo giờ có cứu được sau khi đứt hay không — nhưng chúng chỉ lộ ra khi có
-    sự cố thật, nên phải dựng sự cố giả để kiểm.
+    Ba hành vi đầu quyết định chuyện một lần chạy nhiều giờ trên máy tính tiền
+    theo giờ có cứu được sau khi đứt hay không. Cái thứ tư — ngắt mạch — quyết
+    định chuyện một môi trường SAI có bị phát hiện hay không: không có nó,
+    pipeline sinh 3000 chuỗi rỗng rồi báo "xong" với bảng điểm toàn số 0.
     """
     import pandas as pd
 
     from src.config import Cfg
-    from src.runners.base import Runner
+    from src.runners.base import Runner, RunnerUnusable
 
     print("\n[vòng chạy runner]")
     cfg = Cfg({"generate": {"max_new_tokens": 8, "do_sample": False, "num_beams": 1},
                "wandb": {"log_samples": 3}})
     keys = [f"k{i}" for i in range(7)]
-    df = pd.DataFrame({"key": keys, "ref": ["r"] * 7,
-                       "image_path": ["/x.jpg"] * 7})
+    df = pd.DataFrame({"key": keys, "ref": ["r"] * 7, "image_path": ["/x.jpg"] * 7})
 
     class Fake(Runner):
         name = "fake"
 
-        def __init__(self, cfg, mcfg, fail_batch=False, fail_all=False):
+        def __init__(self, cfg, mcfg, fail_batch=False, fail_all=False, empty=False):
             super().__init__(cfg, mcfg)
-            self.fail_batch, self.fail_all = fail_batch, fail_all
+            self.fail_batch, self.fail_all, self.empty = fail_batch, fail_all, empty
             self.calls = 0
 
         def load(self):
@@ -305,6 +305,8 @@ def test_runner_loop() -> None:
                 raise RuntimeError("CUDA out of memory (giả)")
             if self.fail_batch and len(batch) > 1:
                 raise RuntimeError("CUDA out of memory (giả)")
+            if self.empty:
+                return [""] * len(batch)
             return [f"báo cáo cho {b['key']}" for b in batch]
 
     mcfg = Cfg({"id": "fake", "batch_size": 3})
@@ -319,9 +321,8 @@ def test_runner_loop() -> None:
 
         r2 = Fake(cfg, mcfg)
         r2.run(df, out)
-        check("chạy lại khi đã đủ -> không gọi model lần nào", r2.calls == 0)
+        check("chạy lại khi đã đủ -> không nạp, không gọi model", r2.calls == 0)
 
-        # Bỏ 2 dòng giữa -> chỉ sinh lại đúng 2 mẫu thiếu
         keep = [l for l in lines if l["key"] not in ("k2", "k5")]
         with open(out, "w", encoding="utf-8") as f:
             for l in keep:
@@ -329,15 +330,14 @@ def test_runner_loop() -> None:
         r3 = Fake(cfg, mcfg)
         r3.run(df, out)
         got = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
+        # 1 lần sinh thử + 1 batch (2 mẫu còn thiếu, vừa trong batch 3)
         check("resume chỉ sinh phần còn thiếu",
-              len(got) == 7 and r3.calls == 1, f"lines={len(got)} calls={r3.calls}")
+              len(got) == 7 and r3.calls == 2, f"lines={len(got)} calls={r3.calls}")
 
-        # File bị cắt giữa dòng (Ctrl-C) -> chỉ mất dòng cuối, không vứt cả file
         raw = open(out, encoding="utf-8").read()
         with open(out, "w", encoding="utf-8") as f:
             f.write(raw[: raw.rindex("\n") - 12])
-        r4 = Fake(cfg, mcfg)
-        r4.run(df, out)
+        Fake(cfg, mcfg).run(df, out)
         raw2 = open(out, encoding="utf-8").read()
         try:
             got = {json.loads(l)["key"] for l in raw2.splitlines() if l.strip()}
@@ -349,19 +349,98 @@ def test_runner_loop() -> None:
         check("dòng cuối cụt không làm mất mẫu nào", got == set(keys), f"{sorted(got)}")
         check("file kết thúc bằng newline", raw2.endswith("\n"))
 
-        # Batch hỏng -> rơi về từng ảnh, KHÔNG mất mẫu nào
+        # Batch hỏng nhưng từng ảnh chạy được -> rơi về đơn lẻ, KHÔNG ngắt mạch
         out2 = Path(td) / "b.jsonl"
         Fake(cfg, mcfg, fail_batch=True).run(df, out2)
         got2 = [json.loads(l) for l in open(out2, encoding="utf-8") if l.strip()]
-        check("batch hỏng -> thử từng ảnh, không mất mẫu",
+        check("batch hỏng nhưng ảnh đơn chạy được -> không mất mẫu",
               len(got2) == 7 and all(g["pred"] for g in got2))
 
-        # Hỏng cả khi chạy đơn -> ghi chuỗi rỗng và đi tiếp (điểm 0, có đếm)
+        # ── Ngắt mạch ──────────────────────────────────────────────────────
+        # Hỏng cả khi chạy đơn: PHẢI dừng ở lần sinh thử, KHÔNG được ghi 7 dòng
+        # rỗng rồi báo xong. Đây chính là ca đã đốt một lần chạy thật.
         out3 = Path(td) / "c.jsonl"
-        Fake(cfg, mcfg, fail_all=True).run(df, out3)
-        got3 = [json.loads(l) for l in open(out3, encoding="utf-8") if l.strip()]
-        check("hỏng hẳn -> ghi rỗng, đánh dấu empty, không ném",
-              len(got3) == 7 and all(g["empty"] and g["pred"] == "" for g in got3))
+        raised = ""
+        try:
+            Fake(cfg, mcfg, fail_all=True).run(df, out3)
+        except RunnerUnusable as e:
+            raised = str(e)
+        check("hỏng hoàn toàn -> RunnerUnusable ngay ở lần sinh thử", bool(raised))
+        check("KHÔNG ghi ra dòng rỗng nào", not out3.exists() or out3.stat().st_size == 0)
+        check("thông báo có kèm cách sửa (OOM -> hạ batch_size)",
+              "batch_size" in raised, raised[:120])
+
+        # Nạp được nhưng sinh ra chuỗi rỗng: im lặng hơn, vẫn là hỏng
+        out4 = Path(td) / "d.jsonl"
+        raised4 = ""
+        try:
+            Fake(cfg, mcfg, empty=True).run(df, out4)
+        except RunnerUnusable as e:
+            raised4 = str(e)
+        check("sinh ra CHUỖI RỖNG cũng bị chặn ở lần sinh thử",
+              "RỖNG" in raised4, raised4[:120])
+
+        # Ngắt mạch trong VÒNG CHẠY (hỏng từ giữa chừng, không phải từ đầu)
+        class FailLater(Fake):
+            def generate_batch(self, batch):
+                self.calls += 1
+                if self.calls > 2:
+                    raise RuntimeError("Using `or_mask_function` requires torch>=2.6")
+                return [f"ok {b['key']}" for b in batch]
+
+        out5 = Path(td) / "e.jsonl"
+        raised5 = ""
+        try:
+            FailLater(cfg, Cfg({"id": "fake", "batch_size": 1,
+                                "consecutive_fail_limit": 2})).run(df, out5)
+        except RunnerUnusable as e:
+            raised5 = str(e)
+        check("hỏng giữa chừng -> ngắt mạch sau N batch liên tiếp", bool(raised5))
+        check("ngắt mạch nêu đúng nguyên nhân torch>=2.6",
+              "torch" in raised5, raised5[:160])
+        n5 = sum(1 for _ in open(out5, encoding="utf-8")) if out5.exists() else 0
+        check("ngắt mạch dừng SỚM, không đi hết 7 mẫu", n5 < 7, f"{n5} dòng")
+
+
+def test_preflight() -> None:
+    """Dịch lỗi môi trường sang cách sửa — và làm việc đó TRƯỚC khi nạp model."""
+    from src.preflight import check as pf_check
+    from src.preflight import diagnose
+
+    print("\n[preflight]")
+    # Đúng chuỗi lỗi đã đốt một lần chạy thật.
+    real = ValueError("Using `or_mask_function` or `and_mask_function` "
+                      "arguments require torch>=2.6")
+    hint = diagnose(real)
+    check("nhận ra lỗi or_mask_function", hint is not None)
+    check("gợi ý cách RẺ (ghim transformers) trước cách đắt (nâng torch)",
+          hint is not None and "transformers" in hint, str(hint)[:120])
+
+    cases = {
+        "CUDA out of memory. Tried to allocate 2.00 GiB": "batch_size",
+        "cannot import name '_prepare_4d_causal_attention_mask'": "transformers",
+        "401 Client Error. Access to model google/gemma-3-4b-it is restricted": "quyền",
+        "No module named 'flash_attn'": "eager",
+        "cannot identify image file '/data/x.jpg'": "data/images",
+    }
+    for msg, want in cases.items():
+        d = diagnose(RuntimeError(msg))
+        check(f"nhận ra: {msg[:40]}...", d is not None and want in d, str(d)[:100])
+
+    check("lỗi lạ thì trả None, không bịa lời khuyên",
+          diagnose(RuntimeError("một lỗi chưa từng gặp bao giờ")) is None)
+
+    # check() không được ném khi thiếu torch/transformers — nó là hàng rào,
+    # không phải một chỗ hỏng thêm.
+    try:
+        errs, warns = pf_check([{"id": "a", "runner": "gemma3"},
+                                {"id": "b", "runner": "qwen25vl"},
+                                {"id": "c", "runner": "phi35v"}])
+        ok = isinstance(errs, dict) and isinstance(warns, list)
+    except Exception as e:
+        ok = False
+        print(f"    ném: {e!r}")
+    check("check() chạy được kể cả khi môi trường trống", ok)
 
 
 def test_tracking() -> None:
@@ -496,6 +575,7 @@ def main() -> int:
     test_metrics(a.with_metrics)
     test_zip()
     test_runner_loop()
+    test_preflight()
     test_tracking()
     test_report()
     print(f"\n═══ {len(PASS)} đạt · {len(FAIL)} hỏng ═══")

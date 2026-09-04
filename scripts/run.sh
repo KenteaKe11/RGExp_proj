@@ -10,13 +10,10 @@
 #
 # Mọi tham số khác chuyển thẳng cho `python -m src.run_all` (xem --help của nó).
 #
-# Script này TỰ GỌI setup.sh nếu môi trường chưa sẵn sàng — đó là lý do nó là
-# "một lệnh". Bỏ qua: RGEXP_SKIP_SETUP=1.
-#
-# THEO DÕI: tiến độ, tốc độ, ETA, VRAM, mẫu văn bản, bảng điểm và bảng kiểm
-# định đều đẩy lên Weights & Biases, nên không cần ngồi canh console. `--detach`
-# tách hẳn tiến trình khỏi phiên ssh (setsid + nohup) — ssh đứt không giết nó,
-# và cũng không cần tmux nữa.
+# MỖI LẦN GỌI TẠO MỘT RUN MỚI TRÊN W&B, gom theo `group` = tên thí nghiệm. Tiến
+# độ, tốc độ, ETA, VRAM, mẫu văn bản, bảng điểm và bảng kiểm định đều lên đó,
+# nên không cần ngồi canh console. `--detach` tách hẳn tiến trình khỏi phiên ssh
+# (setsid + nohup) — ssh đứt không giết nó, và cũng không cần tmux nữa.
 #
 # Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP, không làm lại từ đầu.
 # ═════════════════════════════════════════════════════════════════════════════
@@ -67,6 +64,10 @@ LOG="${RGEXP_LOG:-logs/run_$(date +%Y%m%d_%H%M%S).log}"
 # setsid tách hẳn khỏi session của ssh, nên SIGHUP lúc ssh đứt không tới được
 # tiến trình. Đây là thứ thay cho tmux: tmux giữ tiến trình sống, W&B lo phần
 # nhìn thấy nó — không còn lý do phải giữ một phiên terminal mở.
+#
+# Tách TRƯỚC bước setup, không phải sau: setup có thể mất 10-20 phút (tải torch,
+# roberta-large), và tách sau đó thì ssh đứt giữa lúc setup vẫn giết cả lần chạy
+# — đúng cái --detach sinh ra để tránh.
 if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
     if command -v setsid >/dev/null 2>&1; then
         RGEXP_DETACHED=1 RGEXP_LOG="$LOG" setsid nohup \
@@ -83,7 +84,7 @@ if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
     echo "  log   : $LOG    (theo dõi:  tail -f $LOG)"
     echo "  dừng  : kill $PID"
     echo -n "  W&B   : đang chờ link"
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 100); do
         # Chỉ nhận link RUN thật (.../runs/<id>). Bắt 'https://wandb.ai/[^ ]*'
         # là dính luôn dòng hướng dẫn 'https://wandb.ai/authorize' do chính
         # script in ra vài dòng trước — và người đọc sẽ bấm vào một link sai.
@@ -100,11 +101,21 @@ if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
 fi
 
 # ── 3. Môi trường sẵn sàng chưa? ────────────────────────────────────────────
+# Kiểm hai tầng, và tầng thứ hai là tầng quan trọng:
+#   1. import được không          — thiếu gói
+#   2. PHIÊN BẢN có hợp nhau không — đủ gói nhưng sai bản
+# Bản trước chỉ có tầng 1. Hệ quả: một môi trường cũ (torch 2.5 + transformers
+# 4.53) qua được cửa, setup.sh không bao giờ chạy, và mọi ảnh chết ở
+# `or_mask_function ... require torch>=2.6` — 3000 lần, rồi báo "xong".
 need_setup=0
 if ! rgexp_activate_py allow-missing; then
     need_setup=1
 elif ! "$PYBIN" -c "import torch, transformers, sacrebleu, rouge_score, bert_score" \
         >/dev/null 2>&1; then
+    need_setup=1
+elif ! "$PYBIN" -m src.preflight >/dev/null 2>&1; then
+    echo "⚠ Phiên bản không hợp nhau:"
+    "$PYBIN" -m src.preflight || true
     need_setup=1
 fi
 
@@ -146,6 +157,10 @@ fi
 if [ "$RC" -ne 0 ]; then
     echo
     echo "✗ thoát với mã $RC — log: $LOG"
-    echo "  Chạy LẠI CHÍNH LỆNH NÀY để đi tiếp từ chỗ dở (mọi stage đều resume)."
+    case "$RC" in
+        2) echo "  (2 = dừng ở preflight: phiên bản không hợp. Sửa theo hướng dẫn ở trên.)" ;;
+        3) echo "  (3 = một model bắt buộc không chạy được. Xem dòng 'KHÔNG chạy được'.)" ;;
+        *) echo "  Chạy LẠI CHÍNH LỆNH NÀY để đi tiếp từ chỗ dở (mọi stage đều resume)." ;;
+    esac
 fi
 exit "$RC"

@@ -15,10 +15,10 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .qwen25vl import Qwen25VLRunner
 
         return Qwen25VLRunner(cfg, mcfg, tracker)
-    if kind == "llavamed":
-        from .llavamed import LlavaMedRunner
+    if kind == "phi35v":
+        from .phi35v import Phi35VisionRunner
 
-        return LlavaMedRunner(cfg, mcfg, tracker)
+        return Phi35VisionRunner(cfg, mcfg, tracker)
     raise ValueError(f"runner không biết: {kind!r} (models[].runner trong config)")
 
 

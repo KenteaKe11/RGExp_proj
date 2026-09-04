@@ -20,7 +20,7 @@ bash scripts/run.sh --detach     # ... nhưng chạy NỀN: trả lại shell ng
 
 | | |
 |---|---|
-| **Candidate** | `google/gemma-3-4b-it` · `Qwen/Qwen2.5-VL-3B-Instruct` · `microsoft/llava-med-v1.5-mistral-7b` |
+| **Candidate** | `google/gemma-3-4b-it` · `Qwen/Qwen2.5-VL-3B-Instruct` · `microsoft/Phi-3.5-vision-instruct` |
 | **Tập chấm** | 3000 ảnh từ `RGExp123/MIMIC_CXR_cleaned/split_ref/test_split.csv` (đã chốt, seed 42) |
 | **Tham chiếu** | cột `text_gt` của `csv_helper/clean_dataset.csv` |
 | **Prompt** | MỘT bản, dùng chung cho cả ba model |
@@ -28,8 +28,19 @@ bash scripts/run.sh --detach     # ... nhưng chạy NỀN: trả lại shell ng
 | **Metrics** | BLEU-1..4, ROUGE-1/2/L, BERTScore-F1 — tính **theo từng mẫu** |
 | **Kiểm định** | paired bootstrap BCa (10 000) + permutation sign-flip (10 000) |
 | **Hiệu chỉnh** | Holm (FWER) + Benjamini-Hochberg (FDR), hai phạm vi: trong metric và toàn bảng |
-| **Theo dõi** | Weights & Biases — tiến độ, ETA, VRAM, mẫu văn bản, bảng điểm, bảng kiểm định |
+| **Theo dõi** | Weights & Biases — mỗi lần chạy một run riêng, gom theo `group` |
 | **Kết quả** | `RGExp123/Research_results` (dataset repo, private) |
+
+> **Candidate thứ ba đã đổi.** Chỗ này trước là **LLaVA-Med v1.5 7B**, thay bằng
+> Phi-3.5-vision vì lý do **kỹ thuật**: LLaVA-Med khai `model_type=llava_mistral`
+> (ngoài transformers), phải cài package `llava` từ GitHub, và repo đó ghim
+> transformers 4.36 trong khi Gemma 3 đòi ≥ 4.50 — hai ràng buộc loại trừ nhau.
+> Đã thử tách venv riêng + tiến trình con, vẫn hỏng.
+>
+> **Hệ quả phải ghi vào luận văn:** bảng §2.1 giờ so ba VLM **đa dụng**, không
+> còn candidate y tế chuyên biệt nào. Nó vì thế **không** trả lời được câu *"model
+> y tế có hơn model đa dụng trên ảnh X-quang không"* — đó là câu hỏi khác, cần
+> một mục riêng với một baseline y tế chạy được (CheXagent, MAIRA-2, RadFM…).
 
 ### Vì sao là những lựa chọn đó
 
@@ -72,6 +83,7 @@ thức (kiểm soát xác suất có *dù chỉ một* dương tính giả); BH 
 bash scripts/run.sh --dry-run     # 8 ảnh, ~5 phút, không đẩy Hub — thử đường ống
 bash scripts/run.sh               # chạy thật, trọn gói
 bash scripts/run.sh --no-push     # chạy thật, giữ kết quả ở máy
+bash scripts/run.sh --no-wandb    # tắt theo dõi
 ```
 
 `run.sh` **tự gọi `setup.sh`** nếu môi trường chưa sẵn sàng — đó là lý do nó là
@@ -81,12 +93,16 @@ một lệnh. Bỏ qua: `RGEXP_SKIP_SETUP=1`.
 
 `--detach` tách hẳn tiến trình khỏi phiên ssh (`setsid` + `nohup`) và trả lại
 shell ngay, kèm link W&B. ssh đứt không giết nó, và không cần giữ một phiên
-tmux mở nữa.
+tmux mở nữa. Nó tách **trước** cả bước setup, vì setup có thể mất 10–20 phút và
+ssh đứt giữa lúc đó vẫn giết cả lần chạy.
 
-Hai việc đó vốn là hai việc khác nhau, và tmux chỉ làm được một: tmux giữ tiến
-trình **sống**, còn W&B lo phần **nhìn thấy** nó. Tách ra thì mỗi việc có công
-cụ đúng của nó — và theo dõi được từ điện thoại, không phải từ đúng cái terminal
-đã mở phiên.
+Hai việc đó vốn khác nhau và tmux chỉ làm được một: tmux giữ tiến trình **sống**,
+W&B lo phần **nhìn thấy** nó.
+
+**Mỗi lần gọi lệnh = một run mới trên W&B**, gom theo `group` = tên thí nghiệm.
+Trước đây các lần chạy resume vào cùng một run; khi dò lỗi (chạy đi chạy lại với
+cấu hình khác nhau) nó trộn số liệu của lần hỏng với lần tốt vào chung một biểu
+đồ, không tách ra được. Muốn hành vi cũ: `--set wandb.resume_same_run=true`.
 
 Trên W&B có: `infer/<model>/pct · rate_img_s · eta_min · n_empty ·
 n_batch_failed`, `sys/vram_peak_gb`, `data/images_done`, bảng điểm, bảng 24
@@ -100,8 +116,7 @@ ba ca cần ba cách sửa khác hẳn nhau, và chỉ nhìn số thì không ph
 W&B là **vỏ bọc, không phải phụ thuộc cứng**: thiếu gói, thiếu key hay init
 hỏng thì mọi lời gọi thành no-op và pipeline chạy y nguyên. Thiếu
 `WANDB_API_KEY` thì tự hạ xuống *offline* (ghi vào `./wandb`, đẩy lên sau bằng
-`wandb sync wandb/latest-run`) thay vì tắt hẳn — mất tiền GPU rồi mới biết
-thiếu key thì ít nhất số liệu không mất theo. Tắt hẳn: `--no-wandb`.
+`wandb sync wandb/latest-run`) thay vì tắt hẳn.
 
 ### Bị đứt giữa chừng thì làm gì
 
@@ -122,6 +137,14 @@ bash scripts/run.sh --stages infer --set models.0.batch_size=2   # gemma OOM -> 
 
 Stage hợp lệ: `data, infer, score, stats, report, push`.
 
+### Mã thoát
+
+| | |
+|---|---|
+| `2` | dừng ở **preflight** — phiên bản không hợp nhau. Thông báo kèm lệnh sửa. |
+| `3` | một model **bắt buộc** không chạy được (`RunnerUnusable`). |
+| khác | lỗi thường — chạy lại lệnh cũ để đi tiếp. |
+
 ---
 
 ## 3. Cấu trúc
@@ -130,17 +153,18 @@ Stage hợp lệ: `data, infer, score, stats, report, push`.
 configs/baseline.yaml       TOÀN BỘ tham số thí nghiệm, có chú thích lý do
 scripts/
   _env.sh                   dò container/cục bộ, cache HF trên volume       (source)
-  setup.sh                  dựng 2 môi trường python + tải trước roberta-large
+  setup.sh                  dựng môi trường + tải trước roberta-large
   run.sh                    MỘT LỆNH chạy trọn §2.1
-  infer_llavamed.py         worker chạy TRONG .venv-llavamed (xem §5)
   selftest.py               tự kiểm chứng, không cần GPU/mạng/model
 src/
   config.py                 nạp YAML + ghi đè --set
   data.py                   TestSet 3k: split + text_gt + trích ảnh từ zip
+  preflight.py              kiểm tương thích TRƯỚC khi nạp; dịch lỗi -> cách sửa
   prompts.py                prompt dùng chung
-  runners/{gemma3,qwen25vl,llavamed}.py
+  runners/{gemma3,qwen25vl,phi35v}.py
   metrics.py                BLEU / ROUGE / BERTScore theo từng mẫu
   stats.py                  bootstrap BCa · permutation · Holm · BH
+  tracking.py               vỏ bọc W&B (no-op sạch khi thiếu)
   report.py                 REPORT.md + CSV
   push.py                   đẩy lên RGExp123/Research_results
   run_all.py                điều phối 6 stage
@@ -165,21 +189,46 @@ REPORT.md                        báo cáo đọc được, có hướng dẫn �
 
 ---
 
-## 5. Ba chỗ dễ hỏng, và cách chúng được xử
+## 5. Bốn chỗ dễ hỏng, và cách chúng được xử
 
-### LLaVA-Med chạy ở một venv KHÁC
+### Môi trường sai — và pipeline vẫn báo "xong"
 
-`microsoft/llava-med-v1.5-mistral-7b` khai `model_type: llava_mistral` —
-transformers không biết kiến trúc này, phải có package `llava` của repo
-`microsoft/LLaVA-Med`, mà repo đó ghim **transformers 4.36.x**. Gemma 3 đòi
-**≥ 4.50**. Hai ràng buộc loại trừ nhau trong cùng một `sys.path`.
+**Đây là ca hỏng đắt nhất đã xảy ra thật.** Một lần chạy đi hết 3000 ảnh × 3
+model, mỗi ảnh ném đúng một lỗi:
 
-Nên: `.venv-llavamed` dựng bằng `--system-site-packages` (mượn torch, không tải
-lại 2.5 GB), cài đè `transformers==4.37.2`, và chạy như **tiến trình con** đổ ra
-JSONL đúng schema của hai runner kia. Khâu chấm điểm không biết sự sắp xếp này.
+```
+ValueError: Using `or_mask_function` or `and_mask_function` arguments require torch>=2.6
+```
 
-Model này được đánh dấu `optional: true`: nạp hỏng thì báo cáo ghi rõ nó vắng
-mặt và chấm hai model còn lại, thay vì giết cả lần chạy đã tốn nhiều giờ GPU.
+Từ transformers 4.53, mask ảnh hai chiều của Gemma 3 đi qua `or_mask_function`,
+và cái đó đòi torch ≥ 2.6 — ảnh `pytorch/*` trên máy thuê thường đứng ở 2.5.x.
+Vì tầng chống lỗi trong `Runner` bắt exception rồi ghi chuỗi rỗng để đi tiếp,
+pipeline kết thúc **"thành công"** với bảng điểm toàn số 0. Cơ chế đáng lẽ để
+cứu vài ảnh hỏng đã biến một lỗi phát hiện được trong một giây thành nhiều giờ
+GPU trả tiền cho rác.
+
+Bốn lớp chặn, theo thứ tự rẻ nhất trước:
+
+1. **`requirements.txt` ghim `transformers>=4.51,<4.53`.** Khoảng này thoả cả ba
+   model (Gemma 3 ≥ 4.50 · Qwen2.5-VL ≥ 4.49 · remote code của Phi cần
+   `_prepare_4d_causal_attention_mask`), và né hẳn ràng buộc torch ≥ 2.6. Ghim
+   tốn vài chục MB; nâng torch tốn ~2.5 GB. Muốn nâng torch thay vì ghim:
+   `RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh`.
+2. **`run.sh` kiểm cả PHIÊN BẢN, không chỉ import.** Bản trước chỉ kiểm
+   `import` được hay không, nên một môi trường cũ qua được cửa và `setup.sh`
+   không bao giờ chạy.
+3. **`src/preflight.py` chạy trước khi nạp model nào**, và in đúng lệnh sửa.
+   Model bắt buộc không hợp → dừng với mã 2. Model `optional` → bỏ qua, báo cáo
+   ghi rõ.
+4. **Sinh thử một ảnh ngay sau khi nạp model** (`Runner.smoke_test`), rồi **ngắt
+   mạch** nếu N batch liên tiếp hỏng hoàn toàn. Chuỗi rỗng cũng tính là hỏng.
+   Mọi lỗi tương thích đều lộ ra ở lần generate đầu tiên chứ không phải ở ảnh
+   thứ 2000.
+
+Ngoài ra `preflight.diagnose()` dịch lỗi đã biết mặt sang cách sửa (torch quá
+cũ, remote code đòi API đã bỏ, OOM, token không có quyền, thiếu flash-attn,
+ảnh hỏng), và mỗi loại lỗi chỉ in **một lần** — không có phần đó thì log là 3000
+dòng giống hệt nhau và nguyên nhân chìm nghỉm.
 
 ### Cây thư mục trong zip ≠ `img_rel` trong CSV
 
@@ -218,10 +267,10 @@ tệ hơn crash, vì không có gì báo động. Guard nổ thì tự chuyển 
 
 ### Ghép cặp bị lệch
 
-Nếu một model thiếu vài ảnh (batch hỏng, tiến trình con chết giữa chừng) mà cứ
-so thẳng thì các cặp lệch nhau và **mọi p-value đều vô nghĩa — mà không có gì
-báo lỗi**. `run_all.py` lấy **giao** các key rồi sắp lại theo cùng một thứ tự
-trước khi vào `stats.py`; số ảnh thực dùng được in ra và ghi vào `manifest.json`.
+Nếu một model thiếu vài ảnh (batch hỏng, ngắt mạch giữa chừng) mà cứ so thẳng
+thì các cặp lệch nhau và **mọi p-value đều vô nghĩa — mà không có gì báo lỗi**.
+`run_all.py` lấy **giao** các key rồi sắp lại theo cùng một thứ tự trước khi vào
+`stats.py`; số ảnh thực dùng được in ra và ghi vào `manifest.json`.
 
 ### Sàn p-value của permutation so với Holm
 
@@ -237,8 +286,8 @@ cảnh báo vào cả console lẫn `REPORT.md` nếu vi phạm.
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest.py                  # 65 phép kiểm, không cần GPU/mạng/model
-python scripts/selftest.py --with-metrics    # + BLEU/ROUGE (cần sacrebleu, rouge-score)
+python scripts/selftest.py                  # 79 phép kiểm, không cần GPU/mạng/model
+python scripts/selftest.py --with-metrics    # 88 phép kiểm (thêm BLEU/ROUGE)
 ```
 
 Kiểm những chỗ mà lỗi sẽ **đi thẳng vào bảng kết quả mà không ném exception**:
@@ -247,7 +296,8 @@ giá trị tính tay không, hai bảng khác thứ tự có được căn đún
 rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không, bốn cách sắp thư
 mục trong zip có dò đúng không, resume có sinh lại đúng phần thiếu không, batch
 OOM có rơi về từng ảnh không, file JSONL bị cắt giữa dòng có được dọn không,
-W&B tắt có thành no-op sạch không.
+**ngắt mạch có chặn được ca "3000 dòng rỗng rồi báo xong" không**, preflight có
+dịch đúng lỗi thật đã gặp không, W&B tắt có thành no-op sạch không.
 
 ---
 
@@ -258,14 +308,13 @@ W&B tắt có thành no-op sạch không.
 | Tải ảnh (stream) | 10–25 phút, ~200 MB |
 | Gemma 3 4B, batch 4 | 25–60 phút |
 | Qwen2.5-VL 3B, batch 4 | 25–60 phút |
-| LLaVA-Med 7B, batch 1 | 60–120 phút |
+| Phi-3.5-vision 4B, batch 1 | 60–110 phút |
 | Chấm điểm (BERTScore) | 5–10 phút |
 | Kiểm định | < 1 phút |
-| Chấm + kiểm định (chạy lại riêng) | `--stages score,stats,report,push` |
 
-Trên một GPU 24 GB (L4 / 4090 / A10). VRAM tối thiểu ~20 GB vì LLaVA-Med 7B bf16
-riêng trọng số đã ~15 GB. Máy nhỏ hơn: hạ `batch_size`, hoặc tắt
-`models[2].enabled` rồi chạy nó ở lượt riêng.
+Trên một GPU 24 GB (L4 / 4090 / A10). Phi chạy từng ảnh một vì processor của nó
+không có đường gộp batch sạch; hạ `num_crops` (4 → 2) là cách nhanh nhất để rút
+thời gian nếu cần.
 
 ## 8. Giới hạn của thí nghiệm này
 
@@ -275,3 +324,5 @@ riêng trọng số đã ~15 GB. Máy nhỏ hơn: hạ `batch_size`, hoặc tắ
 - Cả ba đều zero-shot — đây là mốc nền, không phải trần năng lực của chúng.
 - Một prompt duy nhất: model nào hợp định dạng `Findings/Impression` hơn thì có
   lợi thế. Đó là một phần của kết quả, nhưng phải nói rõ ra.
+- **Không còn baseline y tế chuyên biệt** (xem hộp ở §1). Bảng này so ba VLM đa
+  dụng với nhau, không so "y tế vs đa dụng".

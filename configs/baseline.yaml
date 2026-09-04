@@ -89,19 +89,34 @@ models:
     min_pixels: 200704      # =  256 × 28 × 28
     enabled: true
 
-  - id: llavamed_7b
-    name: "LLaVA-Med v1.5 7B"
-    runner: llavamed
-    hf_id: microsoft/llava-med-v1.5-mistral-7b
+  # Chỗ này TRƯỚC ĐÂY là LLaVA-Med v1.5 7B. Đổi vì lý do KỸ THUẬT, không phải
+  # khoa học: nó khai model_type=llava_mistral (ngoài transformers), phải cài
+  # package `llava` từ GitHub và repo đó ghim transformers 4.36 trong khi Gemma 3
+  # đòi >= 4.50 — hai ràng buộc loại trừ nhau, phải dựng venv riêng + tiến trình
+  # con, và vẫn hỏng.
+  #
+  # HỆ QUẢ PHẢI GHI VÀO BÁO CÁO: bảng §2.1 giờ so ba VLM ĐA DỤNG, không còn
+  # candidate y tế chuyên biệt nào. Nó vì thế KHÔNG trả lời được câu "model y tế
+  # có hơn model đa dụng trên ảnh X-quang không" — đó là câu hỏi khác và cần một
+  # mục riêng, với một baseline y tế chạy được (CheXagent, MAIRA, RadFM...).
+  - id: phi35v_4b
+    name: "Phi-3.5-vision-instruct"
+    runner: phi35v
+    hf_id: microsoft/Phi-3.5-vision-instruct
     dtype: bfloat16
-    batch_size: 1           # builder của LLaVA-Med không có đường batch sạch
-    venv: .venv-llavamed    # CHẠY Ở VENV KHÁC (xem requirements-llavamed.txt)
-    conv_mode: mistral_instruct
+    # Processor của Phi-3-V nhận một chuỗi text + ảnh của riêng nó, không có
+    # đường gộp batch sạch -> runner lặp từng ảnh. Để 1 cho khỏi hiểu nhầm.
+    batch_size: 1
+    # Số ô cắt ở "HD transform". README gợi ý 16 cho ảnh đơn, nhưng mỗi crop tốn
+    # 144 visual token; ảnh X-quang xám, một chủ thể, không có chữ nhỏ để đọc —
+    # thứ mà HD transform sinh ra để phục vụ. 4 là đủ và nhanh hơn nhiều.
+    num_crops: 4
     enabled: true
-    # Model này là mắt xích yếu nhất của pipeline (kiến trúc ngoài transformers).
-    # true = nạp hỏng thì ghi N/A vào báo cáo và chấm hai model còn lại, thay vì
-    # giết cả lần chạy đã tốn nhiều giờ GPU.
     optional: true
+    # Model dùng remote code trên Hub (auto_map -> modeling_phi3_v.py), nên
+    # transformers phải còn `_prepare_4d_causal_attention_mask`. src/preflight.py
+    # thử import chính hàm đó trước khi nạp gì.
+    trust_remote_code: true
 
 # ── Chấm điểm ───────────────────────────────────────────────────────────────
 # Mọi metric tính Ở MỨC TỪNG MẪU rồi mới lấy trung bình. Bắt buộc: kiểm định
@@ -169,7 +184,14 @@ wandb:
   enabled: true
   project: rgexp-basemodel
   entity: null              # null -> tài khoản mặc định
-  run_name: null            # null -> lấy theo output.subdir
+  run_name: null            # null -> "<subdir> · MM-DD HH:MM"
+  group: null               # null -> output.subdir; gom mọi lần chạy của cùng
+                            # thí nghiệm vào một nhóm trên dashboard
+  # MỖI LẦN GỌI LỆNH = MỘT RUN MỚI. Bản trước resume vào cùng một run, và khi dò
+  # lỗi (chạy đi chạy lại với cấu hình khác nhau) nó trộn số liệu của lần hỏng
+  # với lần tốt vào chung một biểu đồ, không tách ra được. true = quay lại hành
+  # vi cũ (nối tiếp run cũ khi chạy lại sau khi đứt).
+  resume_same_run: false
   # online | offline | disabled. Không có WANDB_API_KEY thì online TỰ hạ xuống
   # offline (ghi vào ./wandb, `wandb sync` đẩy lên sau) thay vì tắt hẳn — mất
   # tiền GPU rồi mới biết thiếu key thì ít nhất số liệu không mất theo.

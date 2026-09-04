@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -53,18 +54,30 @@ class Tracker:
                   "    Hoặc đặt trước:    export WANDB_API_KEY=xxxxxxxx", flush=True)
             mode = "offline"
 
-        # id ổn định theo run_id -> chạy lại sau khi đứt thì NỐI TIẾP đúng run
-        # cũ trên dashboard, không đẻ ra một run mới mỗi lần resume.
-        rid = hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:16]
+        # MỖI LẦN GỌI = MỘT RUN MỚI, gom lại bằng `group`.
+        #
+        # Bản trước dùng id ổn định + resume="allow" để lần chạy lại nối tiếp
+        # đúng run cũ. Nghe hợp lý, nhưng thực tế của việc dò lỗi là chạy đi
+        # chạy lại nhiều lần với cấu hình khác nhau — và resume thì trộn số
+        # liệu của lần HỎNG với lần TỐT vào cùng một biểu đồ, không tách ra
+        # được nữa. Group cho cả hai thứ: mỗi lần chạy một run riêng để so, mà
+        # vẫn nằm chung một chỗ trên dashboard.
+        stamp = datetime.now().strftime("%m-%d %H:%M")
+        kw: dict = {}
+        if wcfg.get("resume_same_run", False):
+            kw = {"id": hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:16],
+                  "resume": "allow"}
         try:
             self.run = wandb.init(
                 project=str(wcfg.get("project", "rgexp-basemodel")),
                 entity=wcfg.get("entity") or None,
-                name=wcfg.get("run_name") or run_id,
-                id=rid, resume="allow", mode=mode,
+                name=wcfg.get("run_name") or f"{run_id} · {stamp}",
+                group=str(wcfg.get("group") or run_id),
+                mode=mode,
                 config=config_snapshot or {},
                 tags=list(wcfg.get("tags", []) or []),
                 notes=str(wcfg.get("notes", "") or ""),
+                **kw,
             )
             self.wandb = wandb
             self._url = getattr(self.run, "url", None)

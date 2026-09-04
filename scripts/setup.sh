@@ -2,20 +2,17 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # setup.sh — dựng môi trường cho §2.1. Chạy MỘT LẦN.
 #
-#     bash scripts/setup.sh                 # tự dò container / cục bộ
-#     RGEXP_REMOTE=1 bash scripts/setup.sh  # ép chế độ container
-#     INSTALL_LLAVAMED=0 bash scripts/setup.sh   # bỏ venv LLaVA-Med
+#     bash scripts/setup.sh                    # tự dò container / cục bộ
+#     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
+#     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
 #
-# Đây là thí nghiệm CHỈ INFER: không train, không LoRA, không quantization.
-# Nên không cài peft/bitsandbytes/wandb — chúng chỉ làm chậm setup và thêm chỗ
-# để hỏng.
+# Đây là thí nghiệm CHỈ INFER: không train, không LoRA, không quantization. Nên
+# không cài peft/bitsandbytes — chúng chỉ làm chậm setup và thêm chỗ để hỏng.
 #
-# HAI môi trường được dựng:
-#   1. CHÍNH        — transformers >= 4.51 (Gemma 3 + Qwen2.5-VL) + bộ chấm điểm
-#   2. .venv-llavamed — transformers 4.37 + package `llava` của microsoft.
-#      Dựng bằng --system-site-packages nên KHÔNG tải lại torch (~2.5 GB): venv
-#      chỉ chứa đúng những gói cần che bản của môi trường chính, và site-packages
-#      của venv đứng TRƯỚC system trong sys.path nên nó thắng.
+# MỘT môi trường duy nhất. Bản trước còn một venv cô lập cho LLaVA-Med (nó ghim
+# transformers 4.36 trong khi Gemma 3 đòi >= 4.50); candidate thứ ba giờ là
+# Phi-3.5-vision, chạy chung transformers với hai model kia, nên toàn bộ cơ chế
+# venv-riêng + tiến trình con đã bị bỏ.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -30,8 +27,6 @@ echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
 # ── 0. Gói hệ thống (chỉ ở container) ───────────────────────────────────────
-# Ảnh pytorch/* rất gọn: thường không có git (không pip install từ GitHub được)
-# và không có tmux (ssh đứt là mất phiên infer nhiều giờ).
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     MISSING=""
     for c in git tmux; do command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c"; done
@@ -69,12 +64,12 @@ GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
 case "$GPU_SM" in
     12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;  # Blackwell (5090/B200)
     90)          CUDA_TAG="cu124"; MIN_TAG="cu124" ;;  # Hopper (H100)
-    # Ada (4090/L4/L40S) = sm89. KHÔNG wheel nào build riêng sm_89 — cubin
-    # sm_86 chạy được trên nó (cùng major, minor thấp hơn = tương thích nhị
-    # phân), nên đừng so chuỗi rồi kết luận "thiếu kernel".
+    # Ada (4090/L4/L40S) = sm89. KHÔNG wheel nào build riêng sm_89 — cubin sm_86
+    # chạy được trên nó (cùng major, minor thấp hơn = tương thích nhị phân), nên
+    # đừng so chuỗi rồi kết luận "thiếu kernel".
     89)          CUDA_TAG="cu124"; MIN_TAG="" ;;
     8*)          CUDA_TAG="cu121"; MIN_TAG="" ;;       # Ampere (A100/3090)
-    # Volta (V100) = sm70: ràng buộc đi NGƯỢC — không được QUÁ MỚI. torch bỏ
+    # Volta/Turing (V100/T4): ràng buộc đi NGƯỢC — không được QUÁ MỚI. torch bỏ
     # cubin sm70 từ các bản CUDA 12.8+; cu126 là mốc cuối còn có.
     70|75)       CUDA_TAG="cu126"; MIN_TAG="cu126" ;;
 esac
@@ -95,7 +90,7 @@ elif [ -z "$TORCH_CUDA" ] && command -v nvidia-smi >/dev/null 2>&1; then
     [ -n "$CUDA_VER" ] && echo "✓ nvidia-smi: CUDA $CUDA_VER -> $CUDA_TAG"
 fi
 
-# ── 3. Môi trường python chính ──────────────────────────────────────────────
+# ── 3. Môi trường python ────────────────────────────────────────────────────
 if [ "$USE_VENV" = "1" ]; then
     if [ -d "$VENV" ]; then echo "✓ venv đã có, dùng lại (xoá $VENV nếu muốn dựng mới)"
     else "$PY" -m venv "$VENV"; echo "✓ tạo venv"; fi
@@ -117,11 +112,9 @@ pipi() {
     # shellcheck disable=SC2086
     out=$("$PYBIN" -m pip install -q $PIP_FLAGS "$@" 2>&1); rc=$?
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "externally-managed-environment"; then
-        # PEP 668: container dùng-một-lần thì cứ ép.
         # shellcheck disable=SC2086
         "$PYBIN" -m pip install -q $PIP_FLAGS --break-system-packages "$@"; return $?
     fi
-    # Lỗi khác thì IN RA rồi dừng — retry mù chỉ giấu mất nguyên nhân thật.
     [ $rc -eq 0 ] || printf '%s\n' "$out" >&2
     return $rc
 }
@@ -164,60 +157,31 @@ else
     pipi torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
 fi
 
-# ── 5. requirements chính ───────────────────────────────────────────────────
+# ── 5. requirements ─────────────────────────────────────────────────────────
 for f in requirements.txt configs/baseline.yaml src/run_all.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
-# transformers >= 4.50 (Gemma 3) đòi torch >= 2.6. Ảnh pytorch/* hay đứng ở
-# 2.5.x. Ở đây KHÔNG hạ transformers được (Gemma 3 cần bản mới) nên phải nâng
-# torch — và báo rõ vì sao, thay vì để STAGE nạp model chết với "require torch>=2.6".
+# ── 5b. torch cũ: KHÔNG nâng torch, đã ghim transformers ────────────────────
+# requirements.txt ghim transformers < 4.53 CHÍNH VÌ chỗ này: từ 4.53 mask ảnh
+# của Gemma 3 đi qua `or_mask_function`, đòi torch >= 2.6, và ảnh pytorch/* hay
+# đứng ở 2.5.x. Ghim (vài chục MB) rẻ hơn nâng torch (~2.5 GB) và giữ nguyên
+# bản torch vốn đã khớp CUDA của máy. Ai cần transformers mới thì khai báo rõ.
 TV=$("$PYBIN" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || echo "0")
 if "$PYBIN" -c "import sys; v=tuple(int(x) for x in '$TV'.split('.')[:2]); sys.exit(0 if v<(2,6) else 1)" 2>/dev/null; then
-    echo "→ torch $TV < 2.6 nhưng Gemma 3 (transformers >= 4.50) đòi >= 2.6 -> nâng torch ($CUDA_TAG)"
-    pipi --upgrade torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
-    echo "✓ torch: $("$PYBIN" -c 'import torch; print(torch.__version__)')"
+    if [ "${RGEXP_UPGRADE_TORCH:-0}" = "1" ]; then
+        echo "→ RGEXP_UPGRADE_TORCH=1: nâng torch $TV -> bản $CUDA_TAG (~2.5 GB)"
+        pipi --upgrade torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+        echo "✓ torch: $("$PYBIN" -c 'import torch; print(torch.__version__)')"
+    else
+        echo "✓ torch $TV < 2.6 — không sao: transformers đã ghim < 4.53 (xem"
+        echo "  requirements.txt). Muốn nâng torch: RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh"
+    fi
 fi
 
-# ── 6. venv CÔ LẬP cho LLaVA-Med ────────────────────────────────────────────
-if [ "${INSTALL_LLAVAMED:-1}" = "1" ]; then
-    echo "→ dựng venv cô lập cho LLaVA-Med: $VENV_LLAVAMED"
-    if [ ! -d "$VENV_LLAVAMED" ]; then
-        # --system-site-packages: mượn torch (~2.5 GB) của môi trường ngoài,
-        # chỉ cài đè những gói cần phiên bản khác.
-        "$PYBIN" -m venv --system-site-packages "$VENV_LLAVAMED" \
-            || { echo "⚠ không dựng được venv LLaVA-Med — sẽ chấm 2 model"; INSTALL_LLAVAMED=0; }
-    fi
-    LMPY="$(rgexp_llavamed_py)"
-    if [ -n "$LMPY" ]; then
-        # --ignore-installed: không có cờ này thì pip thấy transformers 4.51 ở
-        # system site-packages và coi như "đã thoả", venv không có bản 4.37 của
-        # riêng nó, và llava vỡ ngay ở import.
-        "$LMPY" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
-        if "$LMPY" -m pip install -q --ignore-installed -r requirements-llavamed.txt; then
-            echo "✓ deps LLaVA-Med (transformers $("$LMPY" -c 'import transformers;print(transformers.__version__)' 2>/dev/null))"
-        else
-            echo "⚠ cài deps LLaVA-Med fail"
-        fi
-        # Package `llava` chỉ có trên GitHub. --no-deps vì pyproject của nó ghim
-        # cả torch: để nó tự kéo là mất bản torch vừa khớp CUDA ở trên.
-        if "$LMPY" -c "import llava" >/dev/null 2>&1; then
-            echo "✓ package llava đã có"
-        elif "$LMPY" -m pip install -q --no-deps "git+https://github.com/microsoft/LLaVA-Med.git"; then
-            echo "✓ cài package llava từ GitHub"
-        else
-            echo "⚠ không cài được llava (mạng chặn GitHub?) — LLaVA-Med sẽ báo N/A"
-        fi
-        "$LMPY" -c "import llava, transformers; print('✓ llava import OK, transformers', transformers.__version__)" 2>/dev/null \
-            || echo "⚠ llava chưa import được — pipeline vẫn chạy, LLaVA-Med báo N/A"
-    fi
-else
-    echo "⊘ bỏ qua LLaVA-Med (INSTALL_LLAVAMED=0)"
-fi
-
-# ── 7. Nạp trước model chấm BERTScore ───────────────────────────────────────
+# ── 6. Nạp trước model chấm BERTScore ───────────────────────────────────────
 # roberta-large ~1.4 GB. Tải ở đây để khâu chấm điểm (chạy SAU nhiều giờ infer)
 # không chết vì mạng.
 "$PYBIN" - <<'PYEOF' || echo "⚠ chưa tải được roberta-large — khâu chấm điểm sẽ tự tải lại"
@@ -227,7 +191,7 @@ AutoModel.from_pretrained("roberta-large")
 print("✓ roberta-large (BERTScore) đã nằm trong cache")
 PYEOF
 
-# ── 8. Xác nhận GPU + deps ──────────────────────────────────────────────────
+# ── 7. Xác nhận GPU + deps + TƯƠNG THÍCH ────────────────────────────────────
 "$PYBIN" - <<'PYEOF'
 import sys
 import torch
@@ -250,20 +214,25 @@ if not torch.cuda.is_available():
 p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
-if p.total_memory / 1024**3 < 20:
-    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — LLaVA-Med 7B bf16 cần ~16 GB chỉ riêng trọng số.")
-    print("  Giảm batch_size trong configs/baseline.yaml nếu OOM.")
-if sm[0] < 8:
-    print(f"⚠ sm{sm[0]}{sm[1]} không có bf16 -> pipeline tự rơi về float16 cho Qwen/LLaVA-Med.")
-    print("  Gemma 3 KHÔNG chạy được fp16 (tràn số ở layer 5) — nó sẽ dùng float32, chậm ~2-3×.")
+if p.total_memory / 1024**3 < 16:
+    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — hạ batch_size trong "
+          "configs/baseline.yaml nếu OOM.")
 PYEOF
+
+# Kiểm tương thích phiên bản bằng CHÍNH bộ luật mà lần chạy sẽ dùng — không
+# chép lại logic ở đây để rồi hai chỗ trôi khỏi nhau.
+echo "→ kiểm tương thích phiên bản..."
+"$PYBIN" -m src.preflight || {
+    echo "✗ Môi trường chưa chạy được. Sửa theo hướng dẫn ngay trên rồi chạy lại setup."
+    exit 1
+}
 
 echo
 echo "═══ setup xong ═══"
 echo
 echo "  1. Token:"
 echo "       export HF_TOKEN=hf_xxxxxxxx        # BẮT BUỘC (gemma-3 gated + repo private)"
-echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ từ xa (https://wandb.ai/authorize)"
+echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https://wandb.ai/authorize)"
 echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
 echo "  2. Thử nhanh 8 ảnh (~5 phút, không đẩy lên Hub):"

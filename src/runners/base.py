@@ -18,7 +18,18 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import Cfg
+from ..preflight import diagnose
 from ..tracking import NullTracker
+
+
+class RunnerUnusable(RuntimeError):
+    """Model này KHÔNG chạy được trên máy/môi trường hiện tại.
+
+    Khác hẳn "một vài ảnh hỏng": ở đây mọi ảnh sẽ hỏng như nhau, nên đi tiếp
+    chỉ tạo ra 3000 chuỗi rỗng và một bảng điểm toàn số 0 — trông như một kết
+    quả thật. Dừng model này lại và nói rõ vì sao.
+    """
+
 
 
 def repair_tail(path: Path) -> int:
@@ -156,12 +167,15 @@ class Runner:
 
         print(f"  {self.name}: còn {len(todo)}/{len(df)} mẫu cần sinh", flush=True)
         self.load()
+        self.smoke_test(todo[0])
 
         bs = max(1, int(self.mcfg.get("batch_size", 1)))
         t0 = time.time()
         n_done = 0
         n_empty = 0
         n_batch_failed = 0
+        fail_streak = 0
+        limit = max(1, int(self.mcfg.get("consecutive_fail_limit", 3)))
         samples: list[dict] = []
         with open(out_path, "a", encoding="utf-8") as f:
             for i in range(0, len(todo), bs):
@@ -169,23 +183,40 @@ class Runner:
                 t1 = time.time()
                 try:
                     outs = self.generate_batch(batch)
+                    fail_streak = 0
                 except Exception as e:
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
                     # giết cả lần chạy. Thử lại từng ảnh một — phần lớn ca OOM
                     # là do batch, không do ảnh — rồi ghi chuỗi rỗng cho ảnh
-                    # thật sự hỏng và đi tiếp. Chuỗi rỗng vẫn chấm được (điểm 0)
-                    # và số ảnh hỏng được đếm vào báo cáo.
-                    print(f"  ⚠ batch {i//bs} hỏng ({e!r}) -> thử từng ảnh", flush=True)
+                    # thật sự hỏng và đi tiếp.
+                    self._report_error(e)
                     n_batch_failed += 1
                     self._free()
                     outs = []
+                    n_item_fail = 0
                     for item in batch:
                         try:
                             outs.extend(self.generate_batch([item]))
                         except Exception as e2:
-                            print(f"    ✗ {item['key']}: {e2!r}", flush=True)
+                            n_item_fail += 1
+                            self._report_error(e2, key=item["key"])
                             outs.append("")
                             self._free()
+                    # ── NGẮT MẠCH ──────────────────────────────────────────
+                    # Cả batch hỏng VÀ từng ảnh cũng hỏng, nhiều lần liên tiếp:
+                    # đây không phải vài ảnh xấu mà là môi trường sai. Đi tiếp
+                    # chỉ để sinh ra 3000 dòng rỗng rồi báo "xong" — chính xác
+                    # cái đã đốt một lần chạy nhiều giờ. Dừng model này lại.
+                    if n_item_fail == len(batch):
+                        fail_streak += 1
+                        if fail_streak >= limit:
+                            raise RunnerUnusable(
+                                f"{limit} batch liên tiếp hỏng HOÀN TOÀN "
+                                f"({n_done}/{len(todo)} mẫu). Lỗi cuối: {e!r}"
+                                + (f"\n    → {diagnose(e)}" if diagnose(e) else "")
+                            ) from e
+                    else:
+                        fail_streak = 0
                 dt = time.time() - t1
                 for item, text in zip(batch, outs):
                     if not text.strip():
@@ -236,6 +267,52 @@ class Runner:
         })
         print(f"✓ {self.name}: xong sau {mins:.1f} phút -> {out_path}", flush=True)
         return out_path
+
+    def smoke_test(self, item: dict) -> None:
+        """Sinh THỬ đúng một ảnh ngay sau khi nạp model.
+
+        Vài giây này là ranh giới giữa "biết ngay môi trường sai" và "ba giờ sau
+        mới biết, qua một bảng điểm toàn số 0". Mọi lỗi tương thích đã gặp
+        (torch quá cũ cho mask của Gemma 3, remote code đòi API đã bị bỏ,
+        flash-attn thiếu, token không có quyền) đều lộ ra ở lần generate đầu
+        tiên chứ không phải ở ảnh thứ 2000.
+        """
+        try:
+            out = self.generate_batch([item])
+        except Exception as e:
+            hint = diagnose(e)
+            raise RunnerUnusable(
+                f"sinh thử một ảnh đã hỏng: {e!r}" + (f"\n    → {hint}" if hint else "")
+            ) from e
+        if not out or not out[0].strip():
+            # Không ném exception nhưng ra chuỗi rỗng: cũng là hỏng, chỉ là im
+            # lặng hơn. Hay gặp khi thiếu placeholder ảnh trong prompt, hoặc khi
+            # cắt nhầm phần sinh mới.
+            raise RunnerUnusable(
+                "sinh thử một ảnh ra CHUỖI RỖNG. Model nạp được nhưng không sinh "
+                "được gì — kiểm prompt/placeholder ảnh và chỗ cắt token đầu ra.")
+        preview = out[0].strip().replace("\n", " ")[:160]
+        print(f"  ✓ sinh thử OK: {preview}...", flush=True)
+
+    def _report_error(self, exc: BaseException, key: str | None = None) -> None:
+        """In lỗi MỘT lần cho mỗi loại, kèm cách sửa nếu nhận ra.
+
+        Không có phần "một lần" thì log là 3000 dòng giống hệt nhau, và dòng
+        hữu ích duy nhất — nguyên nhân — chìm nghỉm trong đó.
+        """
+        sig = f"{type(exc).__name__}:{str(exc)[:120]}"
+        seen = getattr(self, "_seen_errors", None)
+        if seen is None:
+            seen = self._seen_errors = {}
+        seen[sig] = seen.get(sig, 0) + 1
+        where = f"{key}: " if key else ""
+        if seen[sig] == 1:
+            print(f"  ✗ {where}{exc!r}", flush=True)
+            hint = diagnose(exc)
+            if hint:
+                print(f"    → {hint}", flush=True)
+        elif seen[sig] in (10, 100, 1000):
+            print(f"  ✗ (lỗi này đã lặp {seen[sig]} lần) {sig[:80]}", flush=True)
 
     @staticmethod
     def _vram() -> dict:

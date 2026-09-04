@@ -133,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
+    if tracker.url:
+        print(f"⚙ W&B  : {tracker.url}", flush=True)
     tracker.summary({"run/stages": ",".join(stages),
                      "run/models_declared": ",".join(manifest["models_declared"]),
                      **{f"env/{k}": v for k, v in manifest["env"].items()}})
@@ -153,11 +155,51 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── infer ───────────────────────────────────────────────────────────────
     pred_paths = {m["id"]: run_dir / "predictions" / f"{m['id']}.jsonl" for m in models}
+    skip_ids: set[str] = set()
     if "infer" in stages:
+        # ── Preflight ───────────────────────────────────────────────────────
+        # Một lần chạy đã từng đi hết 3000 ảnh × 3 model, mỗi ảnh ném đúng cùng
+        # một lỗi phiên bản, rồi kết thúc "thành công" với bảng điểm toàn số 0.
+        # Kiểm phiên bản mất một giây; phát hiện muộn mất nhiều giờ GPU trả tiền.
+        _hr("Kiểm tra môi trường")
+        from .preflight import check as preflight_check
+
+        pf_errors, pf_warns = preflight_check([dict(m) for m in models])
+        for w in pf_warns:
+            print(f"  {w}", flush=True)
+        for mid, msg in pf_errors.items():
+            print(f"  ✗ {mid}: {msg}", flush=True)
+        blocking = [m["id"] for m in models
+                    if m["id"] in pf_errors and not m.get("optional", False)]
+        if blocking:
+            print(f"\n✗ DỪNG: {', '.join(blocking)} không chạy được trong môi trường "
+                  "này, và chúng không phải model tuỳ chọn.", flush=True)
+            print("  Sửa theo hướng dẫn ở trên rồi chạy lại chính lệnh cũ.", flush=True)
+            for mid in pf_errors:
+                manifest["model_status"][mid] = {"ok": False, "preflight": pf_errors[mid]}
+            tracker.summary({"preflight/blocked": ",".join(blocking)})
+            tracker.alert("§2.1 dừng ở preflight",
+                          f"run={run_id}: {', '.join(blocking)}\n{list(pf_errors.values())[0]}",
+                          "ERROR")
+            tracker.finish(1)
+            (run_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8")
+            return 2
+        for mid in pf_errors:
+            print(f"  ⚠ bỏ qua {mid} (optional) — báo cáo sẽ ghi rõ", flush=True)
+            manifest["model_status"][mid] = {"ok": False, "preflight": pf_errors[mid]}
+            skip_ids.add(mid)
+        if not pf_errors:
+            print("  ✓ mọi model tương thích với môi trường này", flush=True)
+
         _hr("Sinh báo cáo")
         from .runners import build
+        from .runners.base import RunnerUnusable
 
         for m in models:
+            if m["id"] in skip_ids:
+                continue
             print(f"\n── {m.get('name', m['id'])} ({m['hf_id']}) ──", flush=True)
             t0 = time.time()
             try:
@@ -165,6 +207,19 @@ def main(argv: list[str] | None = None) -> int:
                                            log_every=tracker.log_every)
                 manifest["model_status"][m["id"]] = {"ok": True,
                                                      "minutes": round((time.time()-t0)/60, 1)}
+            except RunnerUnusable as e:
+                # Khác "vài ảnh hỏng": mọi ảnh sẽ hỏng như nhau. Đã dừng đúng
+                # lúc rồi, giờ chỉ cần nói rõ và không giả vờ có kết quả.
+                print(f"\n✗ {m['id']} KHÔNG chạy được: {e}", flush=True)
+                manifest["model_status"][m["id"]] = {"ok": False, "unusable": str(e)}
+                tracker.summary({f"infer/{m['id']}/unusable": str(e)})
+                tracker.alert("Model không chạy được", f"{m['id']}: {e}\nrun={run_id}",
+                              "WARN" if m.get("optional", False) else "ERROR")
+                if m.get("optional", False):
+                    print("  (optional -> chạy tiếp với các model còn lại)", flush=True)
+                    continue
+                tracker.finish(1)
+                return 3
             except Exception as e:
                 manifest["model_status"][m["id"]] = {"ok": False, "error": repr(e)}
                 tracker.summary({f"infer/{m['id']}/failed": repr(e)})

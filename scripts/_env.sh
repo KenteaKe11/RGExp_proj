@@ -38,7 +38,6 @@ fi
 export RGEXP_REMOTE_ACTIVE
 
 # ── venv hay không ──────────────────────────────────────────────────────────
-# Container: dùng thẳng python của image. Cục bộ: .venv trong repo.
 if [ -n "${RGEXP_USE_VENV:-}" ]; then
     if _rgexp_falsey "$RGEXP_USE_VENV"; then USE_VENV=0; else USE_VENV=1; fi
 elif [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
@@ -47,15 +46,11 @@ else
     USE_VENV=1
 fi
 VENV="${VENV_DIR:-$RGEXP_ROOT/.venv}"
-
-# venv CÔ LẬP cho LLaVA-Med. Luôn là venv thật, kể cả ở container: cả điểm của
-# nó là có transformers 4.37 riêng, không đụng bản 4.51 của môi trường chính.
-VENV_LLAVAMED="${VENV_LLAVAMED:-$RGEXP_ROOT/.venv-llavamed}"
-export VENV VENV_LLAVAMED USE_VENV
+export VENV USE_VENV
 
 # ── Volume: cache HF phải nằm ngoài lớp ghi của container ───────────────────
 # huggingface_hub đọc HF_HOME ĐÚNG MỘT LẦN lúc import, nên phải export TRƯỚC
-# khi python khởi động. Đặt muộn hơn là ~25 GB weight rơi vào lớp ghi của
+# khi python khởi động. Đặt muộn hơn là ~20 GB weight rơi vào lớp ghi của
 # container và mất sạch sau mỗi lần Restart.
 if [ -z "${RGEXP_VOLUME:-}" ]; then
     if [ -d /workspace ] && [ -w /workspace ]; then
@@ -75,8 +70,8 @@ if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 fi
 
-# Phân mảnh VRAM: prompt dài ngắn khác nhau (padding=longest) làm allocator
-# giữ nhiều block lẻ; expandable_segments gộp lại được.
+# Phân mảnh VRAM: prompt dài ngắn khác nhau (padding=longest) làm allocator giữ
+# nhiều block lẻ; expandable_segments gộp lại được.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
@@ -103,17 +98,6 @@ rgexp_activate_py() {
     fi
     export PYBIN
     return 0
-}
-
-# Đường dẫn tới python của venv LLaVA-Med (rỗng nếu chưa dựng).
-rgexp_llavamed_py() {
-    if [ -x "$VENV_LLAVAMED/bin/python" ]; then
-        printf '%s' "$VENV_LLAVAMED/bin/python"
-    elif [ -x "$VENV_LLAVAMED/Scripts/python.exe" ]; then
-        printf '%s' "$VENV_LLAVAMED/Scripts/python.exe"
-    else
-        printf ''
-    fi
 }
 
 rgexp_banner() {
