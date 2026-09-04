@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# venv CÔ LẬP cho LLaVA-Med v1.5 (.venv-llavamed)
+#
+# microsoft/llava-med-v1.5-mistral-7b có model_type=llava_mistral —
+# transformers KHÔNG biết kiến trúc này. Phải có package `llava` của repo
+# microsoft/LLaVA-Med, và repo đó ghim transformers 4.36.x. Gemma 3 đòi
+# >= 4.50. Hai ràng buộc loại trừ nhau -> hai venv, giao tiếp qua JSONL.
+#
+# torch cũng do setup.sh cài riêng theo CUDA, không ghim ở đây.
+# ─────────────────────────────────────────────────────────────────────────────
+transformers==4.37.2
+tokenizers>=0.15.0,<0.19
+accelerate>=0.21.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+huggingface_hub>=0.23.0
+pillow>=10.0.0
+numpy>=1.24.0,<2.0
+einops>=0.6.1
+timm>=0.9.12

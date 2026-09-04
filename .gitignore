@@ -1,8 +1,8 @@
 .venv/
+.venv-llavamed/
 __pycache__/
 *.pyc
-outputs/
-ckpt/
+runs/
+data/
 logs/
 .DS_Store
-data/

@@ -1,256 +1,144 @@
-"""§1.5 — BLEU, ROUGE, BERTScore (optional).
+"""BLEU / ROUGE / BERTScore — tính Ở MỨC TỪNG MẪU.
 
-Ở Phase sweep này POLICY ĐANG TẮT (`run.use_policy: false`): mô hình sinh đúng
-một lần, không retry, nên bảng kết quả chấm trên `raw_output` — đúng cột
-"raw_outp" trong tài liệu sweep. Khối `post_policy` và `delta_post_minus_raw`
-chỉ xuất hiện khi bật lại policy.
+Vì sao từng mẫu chứ không phải corpus-level: hai kiểm định ở src/stats.py đều
+là kiểm định GHÉP CẶP, và chúng cần một vector điểm theo ảnh để lấy lại mẫu
+(bootstrap) hoặc đảo dấu (permutation). Một con số corpus BLEU duy nhất không
+cho biết gì về phương sai, nên không kiểm định được.
 
-Khi `run.cond_enabled` bật, mỗi ảnh có THÊM một báo cáo `cond_output`: bản
-sinh lại sau khi nhãn pos/neg mà sup_head đọc được từ chính ảnh đó được viết
-vào prompt (src/cam.py::condition_text). Nó được chấm thành khối riêng `cond`,
-kèm `delta_cond_minus_raw` — hiệu số mới là thứ đáng đọc, vì hai khối chạy
-trên CÙNG một bộ trọng số và cùng một tập ảnh, khác nhau đúng một thứ: decoder
-có biết trước 14 nhãn hay không.
-
-Tất cả là metric TỔNG THỂ trên corpus — không sinh cột metric per-row.
+Corpus BLEU vẫn được tính thêm và ghi vào báo cáo, nhưng chỉ để đối chiếu với
+các bài báo khác — mọi kết luận thống kê dựa trên trung bình của điểm theo mẫu.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
+from typing import Iterable
 
 import numpy as np
+import pandas as pd
 
-from .config import adapter_desc, arch_summary
+from .config import Cfg
 
-
-def _setup_nltk():
-    import nltk
-    for pkg in ("punkt", "punkt_tab"):
-        try:
-            nltk.download(pkg, quiet=True)
-        except Exception:
-            pass
+_WS = re.compile(r"\s+")
+_HEADER = re.compile(r"^\s*(findings|impression)\s*:\s*", re.IGNORECASE | re.MULTILINE)
 
 
-def _norm(t):
-    return re.sub(r"\s+", " ", str(t)).strip()
+def normalize(text: str, ncfg: dict) -> str:
+    t = str(text or "")
+    if ncfg.get("strip_section_headers", False):
+        t = _HEADER.sub(" ", t)
+    if ncfg.get("lowercase", True):
+        t = t.lower()
+    if ncfg.get("collapse_whitespace", True):
+        t = _WS.sub(" ", t)
+    return t.strip()
 
 
-def compute_metrics(refs, refs_tok, hyps, tag, tokenizer, use_bertscore,
-                    device, log):
-    import sacrebleu
-    from nltk.tokenize import word_tokenize
-    from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+# ─────────────────────────────────────────────────────────────────────────────
+def _bleu_per_sample(hyps: list[str], refs: list[str], orders: Iterable[int]) -> dict:
+    """BLEU-n theo mẫu, dùng sacrebleu (tokenizer 13a, chuẩn WMT)."""
+    from sacrebleu.metrics import BLEU
+
+    out = {}
+    for n in orders:
+        # effective_order=True là BẮT BUỘC ở mức câu: một báo cáo ngắn có thể
+        # không có n-gram bậc 4 nào trùng, và BLEU chuẩn khi đó trả 0 cho MỌI
+        # câu như vậy — biến metric thành gần như nhị phân và làm hỏng cả phép
+        # kiểm định. effective_order chỉ tính trung bình hình học trên các bậc
+        # thực sự tồn tại.
+        scorer = BLEU(max_ngram_order=int(n), effective_order=True)
+        out[f"bleu{n}"] = np.array(
+            [scorer.sentence_score(h, [r]).score / 100.0 for h, r in zip(hyps, refs)],
+            dtype=np.float64)
+    return out
+
+
+def _corpus_bleu(hyps: list[str], refs: list[str], orders: Iterable[int]) -> dict:
+    from sacrebleu.metrics import BLEU
+
+    out = {}
+    for n in orders:
+        out[f"corpus_bleu{n}"] = BLEU(max_ngram_order=int(n)).corpus_score(
+            hyps, [refs]).score / 100.0
+    return out
+
+
+def _rouge_per_sample(hyps: list[str], refs: list[str], types: list[str]) -> dict:
     from rouge_score import rouge_scorer
 
-    smooth = SmoothingFunction().method1
-    rs = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"],
-                                 use_stemmer=True)
-    hyps_tok = [word_tokenize(h.lower()) for h in hyps]
-    m = {}
-
-    log("eval", f"[{tag}] BLEU...")
-    for n in range(1, 5):
-        m[f"bleu_{n}"] = float(np.mean([
-            sentence_bleu([r], h, weights=tuple([1 / n] * n),
-                          smoothing_function=smooth)
-            for r, h in zip(refs_tok, hyps_tok)])) * 100
-    m["corpus_bleu"] = sacrebleu.corpus_bleu(hyps, [refs]).score
-
-    log("eval", f"[{tag}] ROUGE...")
-    acc = {"rouge1_f1": [], "rouge2_f1": [], "rougeL_f1": []}
-    for r, h in zip(refs, hyps):
-        s = rs.score(r, h)
-        for k in acc:
-            acc[k].append(s[k.split("_")[0]].fmeasure)
-    m.update({k: float(np.mean(v)) for k, v in acc.items()})
-
-    if use_bertscore:
-        log("eval", f"[{tag}] BERTScore...")
-        import torch
-        from bert_score import score as bert_score_fn
-        try:
-            P, R, F1 = bert_score_fn(hyps, refs, lang="en", verbose=False,
-                                     device=str(device))
-        except torch.cuda.OutOfMemoryError:
-            # Model chính vẫn đang giữ VRAM; rơi về CPU thay vì hỏng cả lượt eval
-            P, R, F1 = bert_score_fn(hyps, refs, lang="en", verbose=False,
-                                     device="cpu")
-        m.update({"bertscore_precision": P.mean().item(),
-                  "bertscore_recall": R.mean().item(),
-                  "bertscore_f1": F1.mean().item()})
-
-    m["mean_gen_tokens"] = float(np.mean(
-        [len(tokenizer.encode(h, add_special_tokens=False)) for h in hyps]))
-    return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
+    # use_stemmer=True: "opacities" vs "opacity" là cùng một quan sát lâm sàng
+    # và không nên bị chấm như hai từ khác nhau.
+    sc = rouge_scorer.RougeScorer(list(types), use_stemmer=True)
+    cols = {t: [] for t in types}
+    for h, r in zip(hyps, refs):
+        s = sc.score(r, h)  # (target, prediction) — ĐÚNG THỨ TỰ, đảo là đo lệch
+        for t in types:
+            cols[t].append(s[t].fmeasure)
+    # Giữ NGUYÊN tên loại ("rougeL", không hạ thành "rougel"): tên cột này đi
+    # thẳng vào bảng báo cáo và vào cột `metric` của pairwise_tests.csv.
+    return {t: np.array(v, dtype=np.float64) for t, v in cols.items()}
 
 
-def _calib_meta(cfg, fname="calib_bands.json"):
-    """Khối band đã hiệu chuẩn để nhúng vào metrics.json.
+def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
+    from bert_score import BERTScorer
 
-    Đọc thẳng file mà src/calib.py vừa ghi thay vì tính lại: hai đường dựng
-    cùng một con số là hai đường để chúng lệch nhau.
-    """
-    path = os.path.join(getattr(cfg.run, "out_dir", "."), fname)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            d = json.load(fh)
-    except Exception:                                    # noqa: BLE001
-        return {"cond_pos_thr": float(getattr(cfg.run, "cam_pos_thr", 0.5)),
-                "cond_neg_thr": float(getattr(cfg.run, "cam_neg_thr", 0.2)),
-                "cond_band_source": "config (chưa hiệu chuẩn)"}
-    rows = d.get("classes", [])
-    src = {}
-    for row in rows:
-        src[row.get("source", "?")] = src.get(row.get("source", "?"), 0) + 1
-    return {
-        "cond_band_source": "calib_bands.json",
-        "cond_band_created": d.get("meta", {}).get("created"),
-        "cond_band_params": d.get("meta", {}).get("params"),
-        "cond_band_prior": d.get("meta", {}).get("prior"),
-        "cond_band_by_class": {row.get("name"): [row.get("lo"), row.get("hi")]
-                               for row in rows},
-        "cond_band_kinds": src,
-        # Con số TRUNG THỰC của mỗi bệnh: purity đo trên nửa val không tham
-        # gia chọn band. Cột `purity` (in-sample) cố tình KHÔNG vào đây.
-        "cond_band_holdout_lcb": {
-            row.get("name"): (row.get("holdout") or {}).get("purity_lcb")
-            for row in rows},
-    }
+    scorer = BERTScorer(
+        model_type=str(bcfg.get("model_type", "roberta-large")),
+        num_layers=int(bcfg.get("num_layers", 17)),
+        lang="en", idf=False,
+        rescale_with_baseline=bool(bcfg.get("rescale_with_baseline", False)),
+        batch_size=int(bcfg.get("batch_size", 32)),
+    )
+    # Chuỗi rỗng làm BERTScore ra NaN (không có token nào để khớp). Model sinh
+    # ra rỗng là một KẾT QUẢ, không phải dữ liệu thiếu, nên thay bằng "." để nó
+    # nhận điểm rất thấp thay vì biến mất khỏi phép tính.
+    safe = [h if h.strip() else "." for h in hyps]
+    P, R, F = scorer.score(safe, refs, verbose=False)
+    allv = {"p": P.numpy().astype(np.float64),
+            "r": R.numpy().astype(np.float64),
+            "f1": F.numpy().astype(np.float64)}
+    # Mặc định CHỈ F1. P và R gần như trùng thông tin với F1, mà mỗi cột thêm
+    # vào là thêm 3 kiểm định nữa vào họ hiệu chỉnh Holm — làm khó chính những
+    # so sánh mình quan tâm để đổi lấy hai cột hầu như không ai đọc.
+    keep = [str(k).lower() for k in bcfg.get("keep", ["f1"])]
+    return {f"bertscore_{k}": allv[k] for k in keep if k in allv}
 
 
-def run_metrics(res_df, tokenizer, cfg, step, log, expert_share=None):
-    """Chấm raw_output (và post-policy nếu policy bật), ghi metrics.json."""
-    _setup_nltk()
-    from nltk.tokenize import word_tokenize
-    import torch
+# ─────────────────────────────────────────────────────────────────────────────
+def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
+                refs_raw: list[str], label: str = "") -> tuple[pd.DataFrame, dict]:
+    """Trả (bảng điểm theo mẫu, các số corpus-level)."""
+    mcfg = cfg["metrics"]
+    ncfg = dict(mcfg.get("normalize", {}))
+    hyps = [normalize(h, ncfg) for h in hyps_raw]
+    refs = [normalize(r, ncfg) for r in refs_raw]
 
-    eval_df = res_df[res_df["reference"].astype(str).str.strip() != ""]
-    eval_df = eval_df.reset_index(drop=True)
-    refs = eval_df["reference"].apply(_norm).tolist()
-    hyps_raw = eval_df["raw_output"].apply(_norm).tolist()
-    hyps_post = eval_df["generated"].apply(_norm).tolist()
-    refs_tok = [word_tokenize(r.lower()) for r in refs]
-    n_diff = int(sum(a != b for a, b in zip(hyps_raw, hyps_post)))
-    log("eval", f"{len(refs)} mẫu | policy đổi {n_diff} mẫu")
+    cols: dict[str, np.ndarray] = {}
+    print(f"  [{label}] BLEU ...", flush=True)
+    cols.update(_bleu_per_sample(hyps, refs, mcfg.get("bleu_orders", [1, 2, 3, 4])))
+    print(f"  [{label}] ROUGE ...", flush=True)
+    cols.update(_rouge_per_sample(hyps, refs,
+                                  list(mcfg.get("rouge_types", ["rouge1", "rouge2", "rougeL"]))))
 
-    dev = torch.device("cuda:0")
-    m_raw = compute_metrics(refs, refs_tok, hyps_raw, "raw", tokenizer,
-                            cfg.run.use_bertscore, dev, log)
-    ref_len = float(np.mean([len(tokenizer.encode(r, add_special_tokens=False))
-                             for r in refs]))
+    bcfg = dict(mcfg.get("bertscore", {}))
+    if bcfg.get("enabled", True):
+        print(f"  [{label}] BERTScore ({bcfg.get('model_type', 'roberta-large')}) ...",
+              flush=True)
+        cols.update(_bertscore(hyps, refs, bcfg))
 
-    metrics = {"raw": m_raw}
-    # ── Lượt sinh CÓ ĐIỀU KIỆN (src/cam.py::condition_text) ──────────────────
-    # `cond_output` là báo cáo sinh lại sau khi nhãn pos/neg của chính ảnh đó
-    # được viết vào prompt. Chấm nó TÁCH khỏi raw và ghi cả hiệu số: câu hỏi
-    # của khối này không phải "điểm bao nhiêu" mà "điều kiện hoá làm điểm đi
-    # lên hay đi xuống", và chỉ có hiệu số mới trả lời được câu đó.
-    has_cond = ("cond_output" in eval_df.columns and
-                eval_df["cond_output"].astype(str).str.strip().ne("").any())
-    meta = {
-        "n_samples": len(refs),
-        "mean_ref_tokens": round(ref_len, 4),
-        "length_ratio_raw": round(m_raw["mean_gen_tokens"] / ref_len, 4),
-        "n_guard_passed_raw": int(eval_df["raw_guard_passed"].sum()),
-        "use_policy": bool(cfg.run.use_policy),
-        "n_changed_by_policy": n_diff,
-        "train_step": step,
-        "model": cfg.fixed.model_id,
-        "gpu": cfg.hw.name,
-        "preset": cfg.preset["name"],
-        "image_size": cfg.fixed.image_size_model,
-        "run_tag": cfg.arch.tag,
-        "n_expert": cfg.fixed.n_expert,
-        "top_k": cfg.fixed.top_k,
-        "router_img_size": int(cfg.fixed.router_img_size),
-        "route_noise": float(getattr(cfg.fixed, "route_noise", 0.5) or 0.0),
-        # Lịch decay: hai lần chạy cùng σ cuối nhưng khác σ đầu là hai buổi
-        # train KHÁC nhau — không ghi lại thì bảng metrics không giải thích
-        # nổi vì sao chúng lệch.
-        "route_noise_start": (None if getattr(cfg.fixed, "route_noise_start",
-                                              None) is None
-                              else float(cfg.fixed.route_noise_start)),
-        "decay_warmup_samples": int(getattr(cfg.fixed,
-                                            "decay_warmup_samples", 0) or 0),
-        "w_sup": float(cfg.run.w_sup),
-        "w_aux": float(getattr(cfg.run, "w_aux", 0.0)),
-        "asl_gamma_pos": float(getattr(cfg.run, "asl_gamma_pos", 0.0)),
-        "asl_gamma_neg": float(getattr(cfg.run, "asl_gamma_neg", 4.0)),
-        "asl_clip": float(getattr(cfg.run, "asl_clip", 0.02)),
-        "uncertain_soft": float(getattr(cfg.run, "uncertain_soft", 0.7)),
-        "architecture": arch_summary(cfg),
-        "adapter": adapter_desc(cfg.fixed),
-        "max_seq_len": cfg.run.max_seq_len,
-    }
-    if expert_share:
-        meta["expert_share"] = [round(float(v), 4) for v in expert_share]
-        # Cân bằng tải do MỘT số hạng aux trong loss lo (run.w_aux). Lệch xa
-        # 1/E nghĩa là w_aux quá nhỏ so với áp lực của CE, hoặc router đã sập
-        # về "luôn chọn cùng một expert" — đọc kèm `balance` trong log train.
-        meta["expert_share_max"] = round(float(max(expert_share)), 4)
-    if has_cond:
-        hyps_cond = eval_df["cond_output"].apply(_norm).tolist()
-        n_cond_diff = int(sum(a != b for a, b in zip(hyps_raw, hyps_cond)))
-        log("eval", f"điều kiện hoá đổi {n_cond_diff}/{len(refs)} báo cáo")
-        m_cond = compute_metrics(refs, refs_tok, hyps_cond, "cond", tokenizer,
-                                 cfg.run.use_bertscore, dev, log)
-        metrics["cond"] = m_cond
-        metrics["delta_cond_minus_raw"] = {
-            k: round(m_cond[k] - m_raw[k], 4)
-            for k in m_cond if isinstance(m_cond[k], float)}
-        # Ngưỡng gập nhãn KHÔNG còn là hằng số trong config: src/calib.py đo
-        # nó trên val trước khi infer, một cặp cho mỗi bệnh. Chép nguyên khối
-        # đã hiệu chuẩn vào metrics.json — không có nó thì đọc lại một
-        # metrics cũ sáu tháng sau, không ai dựng lại được y_pred từ sup_prob.
-        meta.update(
-            cond_enabled=True,
-            **_calib_meta(cfg),
-            length_ratio_cond=round(m_cond["mean_gen_tokens"] / ref_len, 4),
-            n_changed_by_cond=n_cond_diff)
-        for col, key in (("cond_guard_passed", "n_guard_passed_cond"),
-                         ("cond_applied", "n_cond_applied")):
-            if col in eval_df.columns:
-                meta[key] = int(eval_df[col].astype(bool).sum())
-        # Bao nhiêu ô thật sự vào y_pred, bao nhiêu ô bị bỏ vì lưỡng lự. Đọc
-        # kèm delta: điều kiện hoá gần như không đổi gì khi mean_cond_unc sát
-        # 14 (model không dám khẳng định gì) là một kết quả, không phải lỗi.
-        for col in ("n_cond_pos", "n_cond_neg", "n_cond_unc"):
-            if col in eval_df.columns:
-                meta[f"mean_{col[2:]}"] = round(float(eval_df[col].mean()), 3)
-    else:
-        meta["cond_enabled"] = bool(getattr(cfg.run, "cond_enabled", False))
-    if cfg.run.use_policy:
-        m_post = compute_metrics(refs, refs_tok, hyps_post, "post", tokenizer,
-                                 cfg.run.use_bertscore, dev, log)
-        metrics["post_policy"] = m_post
-        metrics["delta_post_minus_raw"] = {
-            k: round(m_post[k] - m_raw[k], 4)
-            for k in m_post if isinstance(m_post[k], float)}
-        meta.update(length_ratio_post=round(
-            m_post["mean_gen_tokens"] / ref_len, 4),
-            n_guard_passed_post=int(eval_df["guard_passed"].sum()),
-            avg_attempts=float(eval_df["attempts"].mean()))
-    metrics["meta"] = meta
+    df = pd.DataFrame({"key": keys, **cols})
+    df["n_words_pred"] = [len(h.split()) for h in hyps]
+    df["n_words_ref"] = [len(r.split()) for r in refs]
+    df["empty"] = [not h.strip() for h in hyps_raw]
 
-    out = os.path.join(cfg.run.out_dir, "metrics.json")
-    with open(out, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(json.dumps(metrics, indent=2), flush=True)
+    corpus = _corpus_bleu(hyps, refs, mcfg.get("bleu_orders", [1, 2, 3, 4]))
+    corpus["n"] = len(df)
+    corpus["n_empty"] = int(df["empty"].sum())
+    corpus["mean_words_pred"] = float(np.mean(df["n_words_pred"]))
+    corpus["mean_words_ref"] = float(np.mean(df["n_words_ref"]))
+    return df, corpus
 
-    head = ("corpus_bleu", "bleu_1", "bleu_2", "bleu_3", "bleu_4",
-            "rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1")
-    log("eval", f"── {cfg.arch.tag} (raw_output) ──")
-    for k in head:
-        if k in m_raw:
-            log("eval", f"    {k:<20} {m_raw[k]:>8.4f}")
-    if has_cond:
-        d = metrics["delta_cond_minus_raw"]
-        log("eval", f"── {cfg.arch.tag} (cond_output — Δ so với raw) ──")
-        for k in head:
-            if k in metrics["cond"]:
-                log("eval", f"    {k:<20} {metrics['cond'][k]:>8.4f}"
-                            f"  ({d.get(k, 0):+.4f})")
-    return metrics
+
+def metric_columns(df: pd.DataFrame) -> list[str]:
+    """Các cột thật sự là metric (bỏ key và các cột mô tả)."""
+    skip = {"key", "n_words_pred", "n_words_ref", "empty"}
+    return [c for c in df.columns if c not in skip]
