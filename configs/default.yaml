@@ -56,7 +56,7 @@ fixed:
   # TOP-K THUẦN trên CẢ 12 expert. Không còn expert HỨNG (n_shared) nào bị
   # loại khỏi vòng chọn, không còn trần tải mỗi micro-batch. Cân bằng tải
   # hoàn toàn do run.w_aux lo.
-  n_expert: 12
+  n_expert: 9
   top_k: 4
 
   # ── Nhiễu Gumbel khi CHỌN top-k (chỉ lúc TRAINING) ───────────────────────
