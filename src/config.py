@@ -511,6 +511,43 @@ def load_config(path="configs/default.yaml", overrides=None):
     # "unc" là một ca bệnh rút khỏi "Present:". Mặc định tắt: chi phí này
     # được ĐO và in ra ở cột `pos→unc`; bật trần sau khi đã nhìn con số.
     run.setdefault("calib_max_pos_swallow", 0.0)
+    # ĐƯỜNG LÙI khi một bệnh không đo được band nào đạt sàn. Bản trước gán
+    # cứng nhị phân tại điểm Youden — tức khẳng định đúng cái điều vừa đo
+    # được là KHÔNG chứng minh nổi, và mọi ô quanh đáy hố ASL (p* ≈ 0.68) đi
+    # thẳng vào "Present:"/"Absent:" của prompt như thể model chắc chắn.
+    #   "prior"   (MẶC ĐỊNH) band TIÊN NGHIỆM suy từ hình dạng ASL — với
+    #             γ⁺=0, γ⁻=4, m=0.02, uncertain_soft=0.55 là (0.544, 0.850).
+    #             Không hứa purity, nhưng bao đúng chỗ loss kéo ô unc tới, và
+    #             ô rơi vào đó đọc là "lưỡng lự" -> KHÔNG vào y_pred. Bỏ sót
+    #             một ô pos rẻ hơn khẳng định sai một ô unc.
+    #   "binary"  hành vi của bản trước.
+    #   [lo, hi]  ghim tay, vd [0.5, 0.85]. Không kèm bảo đảm gì hơn "prior",
+    #             và KHÔNG tự dịch theo uncertain_soft/γ như "prior".
+    run.setdefault("calib_none_fallback", "prior")
+    _fb = run["calib_none_fallback"]
+    if isinstance(_fb, str):
+        _fb = _fb.strip().lower()
+        if _fb not in ("prior", "binary"):
+            raise ValueError(
+                f"run.calib_none_fallback={run['calib_none_fallback']!r} — "
+                f"chỉ nhận 'prior', 'binary' hoặc một cặp [lo, hi]")
+        run["calib_none_fallback"] = _fb
+    else:
+        try:
+            _lo, _hi = (float(_x) for _x in _fb)
+        except Exception:
+            raise ValueError(
+                f"run.calib_none_fallback={_fb!r} — chỉ nhận 'prior', "
+                f"'binary' hoặc một cặp [lo, hi]") from None
+        if not 0.0 <= _lo < _hi <= 1.0:
+            raise ValueError(f"run.calib_none_fallback=[{_lo}, {_hi}] phải "
+                             f"thoả 0 ≤ lo < hi ≤ 1")
+        run["calib_none_fallback"] = [_lo, _hi]
+    if run["calib_none_fallback"] == "binary":
+        print("⚠ calib_none_fallback=binary — bệnh nào KHÔNG đo được band sẽ "
+              "gán CỨNG pos/neg tại điểm Youden. Ô nằm quanh đáy hố ASL đi "
+              "thẳng vào 'Present:' của prompt mà không có gì bảo lãnh; đó "
+              "đúng là chỗ mà §1.8 tồn tại để tránh.")
     for _k in ("calib_purity", "calib_lift", "calib_margin", "calib_conf",
                "calib_holdout", "calib_max_pos_swallow"):
         run[_k] = float(run[_k])
@@ -900,6 +937,12 @@ if __name__ == "__main__":
               f"{c.run.calib_lift:g}×nền), cận dưới Wilson "
               f"{c.run.calib_conf:g}, kiểm định trên "
               f"{c.run.calib_holdout:.0%} ô giữ lại")
+        _fb = getattr(c.run, "calib_none_fallback", "prior")
+        print("          không đo được -> " + (
+            "gán CỨNG nhị phân tại điểm Youden" if _fb == "binary"
+            else ("band tiên nghiệm suy từ ASL (mặc định — 'unc', không "
+                  "vào y_pred)" if _fb == "prior"
+                  else f"band ghim tay ({_fb[0]:g}, {_fb[1]:g})")))
     else:
         print(f"Band unc: TẮT hiệu chuẩn — dùng hằng số "
               f"({c.run.cam_neg_thr:g}, {c.run.cam_pos_thr:g}). Với "

@@ -21,7 +21,8 @@ Mười một thứ được kiểm:
      từng chọn vẫn phải có hàng), và cosine phát hiện được bản sao.
  11. hiệu chuẩn band uncertain (src/calib.py): bản numpy của ASL trùng bản
      torch, đáy hố thế năng KHÔNG nằm ở nhãn đã khai, cận dưới Wilson, phép
-     quét tìm lại được dải đã gieo, và ba mức rơi class -> global -> nhị phân.
+     quét tìm lại được dải đã gieo, và bốn mức rơi class -> global ->
+     prior -> nhị phân.
  10. Grad-CAM của nhánh router (src/cam.py): bản đồ ĐÚNG lưới 16×16, gradient
      nối được về feature map dù mọi tham số đang requires_grad = False, hai
      bệnh khác nhau cho hai bản đồ khác nhau, vòng cấu hình
@@ -1397,7 +1398,8 @@ def test_calib():
     Y = np.zeros((N, K), dtype=int)
     for c in range(K):
         # lớp 2: uncertain quá hiếm -> không được cấp band riêng
-        # lớp 3: uncertain trộn đều -> không tách được, phải rơi về nhị phân
+        # lớp 3: uncertain trộn đều -> không tách được, phải rơi về band
+        #        TIÊN NGHIỆM (không phải gán cứng nhị phân)
         pr = ([0.40, 0.20, 0.39, 0.01] if c == 2
               else [0.40, 0.20, 0.25, 0.15])
         a = rng.choice([AB, AP, AN, AU], size=N, p=pr)
@@ -1411,7 +1413,7 @@ def test_calib():
         if c == 3:
             # uncertain rút từ ĐÚNG hỗn hợp của neg và pos: không có vùng nào
             # của thang xác suất giàu uncertain hơn tỉ lệ nền, nên không có
-            # band nào đáng tin — phải rơi về quyết định nhị phân.
+            # band nào ĐO ĐƯỢC — phải rơi về đường lùi.
             k = int(m.sum())
             col[m] = np.where(rng.random(k) < 0.5,
                               rng.beta(1.2, 12.0, k), rng.beta(12.0, 1.2, k))
@@ -1428,8 +1430,34 @@ def test_calib():
           and src[1] == "class", str(src))
     check("lớp quá ít ô uncertain -> KHÔNG được band riêng", src[2] != "class",
           f"n_unc={b.rows[2]['n_unc']}, source={src[2]}")
-    check("lớp uncertain trộn đều -> không gán uncertain (nhị phân)",
-          src[3] == "none" and b.lo[3] == b.hi[3], str(b.rows[3].get("note")))
+    check("lớp uncertain trộn đều -> KHÔNG được cấp band đo được",
+          src[3] == "prior",
+          f"source={src[3]}, note={b.rows[3].get('note')}")
+    _plo, _phi = C.asl_prior_band(0.55)
+    check("...và rơi về band TIÊN NGHIỆM chứ KHÔNG gán cứng nhị phân",
+          abs(b.lo[3] - _plo) < 1e-9 and abs(b.hi[3] - _phi) < 1e-9
+          and b.lo[3] < b.hi[3],
+          f"({b.lo[3]:.3f}, {b.hi[3]:.3f}) vs prior ({_plo:.3f}, {_phi:.3f})")
+    check("band tiên nghiệm KHÔNG mang theo lời hứa purity (hold = —, "
+          "LCB < sàn)",
+          b.rows[3].get("holdout") is None
+          and b.rows[3]["purity_lcb"] < b.rows[3]["floor"],
+          f"LCB={b.rows[3].get('purity_lcb')}, sàn={b.rows[3].get('floor')}")
+    b_bin = C.fit_bands(P, Y, aspects, names, uncertain_soft=0.55, grid=400,
+                        min_unc=200, none_fallback="binary", log=None)
+    check("none_fallback='binary' -> vẫn về đúng hành vi nhị phân của bản cũ",
+          b_bin.rows[3]["source"] == "none" and b_bin.lo[3] == b_bin.hi[3],
+          f"source={b_bin.rows[3]['source']}")
+    b_pin = C.fit_bands(P, Y, aspects, names, uncertain_soft=0.55, grid=400,
+                        min_unc=200, none_fallback=[0.5, 0.85], log=None)
+    check("none_fallback=[0.5, 0.85] -> ghim ĐÚNG cặp đã đặt",
+          b_pin.lo[3] == 0.5 and b_pin.hi[3] == 0.85,
+          f"({b_pin.lo[3]}, {b_pin.hi[3]})")
+    check("đường lùi KHÔNG đụng vào lớp đã đo được band",
+          b_bin.lo[0] == b.lo[0] and b_pin.hi[1] == b.hi[1])
+    check("meta ghi lại đường lùi đã dùng (đọc lại JSON còn biết)",
+          b.meta["params"]["none_fallback"] == "prior"
+          and b_bin.meta["params"]["none_fallback"] == "binary")
     check("ô blank bị LOẠI khỏi phép đo (đã MASK khỏi ASL)",
           b.meta["n_cells_blank"] > 0
           and b.meta["n_cells_labelled"] + b.meta["n_cells_blank"] == N * K)

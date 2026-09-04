@@ -67,18 +67,44 @@ nên purity in ra sẽ lạc quan. Cho nên mỗi bệnh đi qua hai bước:
 `holdout_lcb` trong bảng và trong JSON là con số bước 1. Đọc nó, đừng đọc
 `purity`.
 
-═══ Ba mức rơi, không có mức nào im lặng ═══
+═══ Bốn mức rơi, không có mức nào im lặng ═══
 
     source = "class"   band riêng của bệnh, đã qua kiểm định
     source = "global"  bệnh quá ít ô uncertain (< calib_min_unc) hoặc trượt
                        kiểm định -> dùng band gộp của cả 14 bệnh
-    source = "none"    cả band gộp cũng không đạt sàn -> KHÔNG gán uncertain
-                       cho bệnh này. lo = hi = tau_split (điểm cắt pos/neg
-                       theo Youden J), tức quay về quyết định nhị phân.
+    source = "prior"   cả band gộp cũng không đạt sàn -> rơi về band TIÊN
+                       NGHIỆM suy từ hình dạng ASL; với cấu hình đang chốt
+                       (γ⁺ = 0, γ⁻ = 4, m = 0.02, y_unc = 0.55) đó là
+                       (0.544, 0.850). Đây là MẶC ĐỊNH của
+                       `run.calib_none_fallback`.
+    source = "none"    như trên, nhưng đường lùi bị đặt về "binary", hoặc
+                       bệnh đó không có LẤY MỘT ô uncertain trên val:
+                       lo = hi = tau_split (điểm cắt pos/neg theo Youden J),
+                       tức quay về quyết định nhị phân.
 
-"none" là một kết quả, không phải một lỗi: nó nói thẳng rằng với checkpoint
-này, ở bệnh này, xác suất của sup_head không tách được uncertain ra khỏi
-pos/neg đủ sạch để dám gán cứng. Thà biết điều đó trước khi infer.
+═══ Vì sao mức "prior" chứ không phải nhị phân ═══
+
+Không đo được band KHÔNG có nghĩa là ô uncertain biến mất. Nó chỉ có nghĩa
+là ở checkpoint này, trên chừng ấy ô val, phép quét không CHỨNG MINH được
+vùng nào đủ sạch để hứa purity ≥ sàn. Gán cứng nhị phân ở đó là trả lời một
+câu hỏi mình vừa đo được là không trả lời nổi — bằng một khẳng định: mọi ô
+nằm quanh đáy hố p* ≈ 0.68 đi thẳng vào danh sách "Present:" của prompt như
+thể model chắc chắn.
+
+Band tiên nghiệm không hứa purity nào, nhưng nó bao đúng khoảng mà `asl_loss`
+đang kéo ô uncertain tới, nên ô rơi vào đó được đọc là "lưỡng lự" và KHÔNG
+vào y_pred. Sai lầm của nó là BỎ SÓT (một ô pos thật bị đọc thành unc); sai
+lầm của nhị phân là KHẲNG ĐỊNH SAI. Ở một pipeline mà đầu ra đi thẳng vào
+câu chữ của báo cáo, hai loại sai đó không cùng một giá.
+
+Cột `purity` của hàng "prior" VẪN là số đo thật trên val và vẫn in ra — nó
+chỉ không còn là một ràng buộc. Đọc nó (và cột `pos→unc`) để biết đường lùi
+này đang tốn bao nhiêu. Muốn hành vi của bản trước: `calib_none_fallback:
+binary`.
+
+"none" và "prior" đều là KẾT QUẢ, không phải lỗi: cả hai nói thẳng rằng với
+checkpoint này, ở bệnh này, xác suất của sup_head không tách được uncertain
+ra khỏi pos/neg đủ sạch để dám gán cứng. Thà biết điều đó trước khi infer.
 
 ═══ Band gắn với CHECKPOINT, không gắn với bài toán ═══
 
@@ -112,6 +138,13 @@ from .losses import aspect_roles
 # Mã nhóm nội bộ. Không lưu xuống đĩa ở đâu cả — JSON ghi bằng TÊN.
 NEG, UNC, POS = 0, 1, 2
 GROUPS = ("neg", "unc", "pos")
+
+# Đường lùi CUỐI CÙNG, chỉ dùng khi ngay cả band tiên nghiệm cũng không dựng
+# được (một cấu hình γ / uncertain_soft mà `asl_prior_band` trả về vùng rỗng).
+# Hai con số này là bản làm tròn của band tiên nghiệm ở cấu hình đang chốt
+# (0.544, 0.850). Chúng KHÔNG bao giờ thay thế band tiên nghiệm khi band đó
+# dựng được: suy từ chính hàm loss đang train thì đúng hơn một cặp hằng số.
+PRIOR_FALLBACK = (0.5, 0.85)
 
 # z một phía cho cận dưới Wilson.
 _Z = {0.80: 0.8416, 0.90: 1.2816, 0.95: 1.6449, 0.975: 1.9600, 0.99: 2.3263}
@@ -458,7 +491,21 @@ class Bands:
 
     @property
     def n_none(self):
+        """Số bệnh chạy NHỊ PHÂN: lo = hi, không ô nào được đọc là 'unc'."""
         return sum(1 for r in self.rows if r.get("source") == "none")
+
+    @property
+    def n_prior(self):
+        """Số bệnh dùng band TIÊN NGHIỆM: có vùng 'unc', nhưng KHÔNG có bảo
+        đảm purity nào cho nó — đọc kèm cột purity và pos→unc."""
+        return sum(1 for r in self.rows if r.get("source") == "prior")
+
+    @property
+    def n_measured(self):
+        """Số bệnh có band ĐO ĐƯỢC (riêng hoặc gộp) — mức duy nhất kèm lời
+        hứa purity ≥ sàn trên dữ liệu chưa tham gia chọn band."""
+        return sum(1 for r in self.rows
+                   if r.get("source") in ("class", "global"))
 
     def as_dict(self):
         return {"version": self.VERSION, "meta": self.meta,
@@ -510,8 +557,12 @@ class Bands:
         out = [head, "─" * len(head)]
         for r in self.rows:
             h = r.get("holdout") or {}
-            band = ("—  (nhị phân)" if r.get("source") == "none"
-                    else f"{r['lo']:.3f}–{r['hi']:.3f}")
+            s = str(r.get("source", "?"))
+            # Dấu * đi SAU cho mọi hàng có band (khoảng trắng cho hàng đã đo)
+            # để cột số không bị lệch một ký tự giữa hai loại hàng.
+            band = ("—  (nhị phân)" if s == "none"
+                    else f"{r['lo']:.3f}–{r['hi']:.3f}"
+                         + ("*" if s == "prior" else " "))
             hold = (f"{h['purity_lcb']:.3f}" if h.get("purity_lcb")
                     is not None else "—")
             out.append(
@@ -520,6 +571,11 @@ class Bands:
                 f"{r.get('base_rate', 0):>7.3f}{r.get('coverage', 0):>7.3f}"
                 f"{r.get('purity', 0):>8.3f}{hold:>7}"
                 f"{r.get('pos_swallowed', 0):>9.3f}{r.get('n_unc', 0):>7d}")
+        if any(r.get("source") == "prior" for r in self.rows):
+            out.append("* band TIÊN NGHIỆM (suy từ hình dạng ASL — KHÔNG đo "
+                       "được band nào đạt sàn ở bệnh đó). Cột purity vẫn là "
+                       "số đo thật nhưng nó KHÔNG đạt sàn: đường lùi này "
+                       "chọn 'lưỡng lự' thay cho một khẳng định nhị phân.")
         return "\n".join(out)
 
 
@@ -571,11 +627,58 @@ def _global_holds(gfit, p_c, g_c, z, floor):
     return ev["n_band"] > 0 and ev["purity_lcb"] >= float(floor)
 
 
+def _resolve_fallback(spec, pri_lo, pri_hi, log=None):
+    """`calib_none_fallback` -> (lo, hi, tên).
+
+    (None, None, "binary") nghĩa là KHÔNG có band: quay về nhị phân.
+
+    Ba dạng nhận vào:
+
+        "prior"     band TIÊN NGHIỆM suy từ hình dạng ASL (MẶC ĐỊNH)
+        "binary"    không có band — quay về một ngưỡng Youden, như bản trước
+        [lo, hi]    ghim tay một cặp, vd [0.5, 0.85]
+
+    Ghim tay là đường dành cho người ĐÃ đọc `meta.prior.band` và cố ý muốn
+    một cặp khác; nó không kèm bảo đảm gì hơn "prior". Ưu tiên "prior" hơn
+    một cặp hằng số vì band tiên nghiệm đi theo `uncertain_soft` và γ đang
+    train — đổi loss thì nó tự dịch, còn cặp hằng số thì không, và sai lệch
+    đó im lặng.
+    """
+    if spec is None:
+        spec = "prior"
+    if isinstance(spec, str):
+        s = spec.strip().lower()
+        if s == "binary":
+            return None, None, "binary"
+        if s != "prior":
+            raise ValueError(f"none_fallback={spec!r} — chỉ nhận 'prior', "
+                             f"'binary' hoặc một cặp [lo, hi]")
+        lo, hi = float(pri_lo), float(pri_hi)
+        if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+            lo, hi = PRIOR_FALLBACK
+            if log is not None:
+                log("calib", f"band tiên nghiệm RỖNG ở cấu hình ASL này "
+                             f"(γ⁺/γ⁻/m/y_unc không chừa chỗ cho hố "
+                             f"uncertain) -> đường lùi dùng hằng số "
+                             f"({lo:g}, {hi:g})")
+            return lo, hi, f"const[{lo:g},{hi:g}]"
+        return lo, hi, "prior"
+    try:
+        lo, hi = (float(x) for x in spec)
+    except Exception:                                        # noqa: BLE001
+        raise ValueError(f"none_fallback={spec!r} — chỉ nhận 'prior', "
+                         f"'binary' hoặc một cặp [lo, hi]") from None
+    if not 0.0 <= lo < hi <= 1.0:
+        raise ValueError(f"none_fallback=[{lo}, {hi}] phải thoả "
+                         f"0 ≤ lo < hi ≤ 1")
+    return lo, hi, f"const[{lo:g},{hi:g}]"
+
+
 def fit_bands(P, Y, aspect_names, disease_names, *, uncertain_soft,
               asl_gamma_pos=0.0, asl_gamma_neg=4.0, asl_clip=0.02,
               purity=0.60, lift=1.5, conf=0.95, min_unc=200, min_cells=30,
               holdout=0.5, seed=0, grid=1000, margin=0.04, pos_cap=0.0,
-              meta=None, log=None):
+              none_fallback="prior", meta=None, log=None):
     """P [N, 14] xác suất + Y [N, 14] aspect  ->  Bands."""
     P = np.asarray(P, dtype=np.float64)
     G = group_codes(Y, aspect_names)
@@ -590,6 +693,8 @@ def fit_bands(P, Y, aspect_names, disease_names, *, uncertain_soft,
     well = asl_well(uncertain_soft, asl_gamma_pos, asl_gamma_neg, asl_clip)
     pri_lo, pri_hi = asl_prior_band(uncertain_soft, asl_gamma_pos,
                                     asl_gamma_neg, asl_clip)
+    fb_lo, fb_hi, fb_note = _resolve_fallback(none_fallback, pri_lo, pri_hi,
+                                              log=log)
 
     keep = G >= 0
     gfit = fit_one(P[keep], G[keep], purity=purity, lift=lift, z=z,
@@ -636,13 +741,46 @@ def fit_bands(P, Y, aspect_names, disease_names, *, uncertain_soft,
                 tau = gfit["tau_split"]
             if tau is None:
                 tau = 0.5
-            row["lo"] = row["hi"] = float(tau)
-            row["source"] = "none"
+            tau = float(tau)
+            row["tau_split"] = tau
             why = row.get("note") or "không đạt sàn"
             if gfit["ok"]:
                 why += " (band gộp cũng không đủ sạch trên riêng bệnh này)"
-            row["note"] = (f"không gán uncertain cho bệnh này — {why}; quay "
-                           f"về quyết định nhị phân tại {float(tau):.3f}")
+            if fb_lo is not None and row["n_unc"] > 0:
+                # KHÔNG đo được band đáng tin ≠ bệnh này không có ô uncertain.
+                # Gán cứng nhị phân ở đây là khẳng định đúng cái điều vừa đo
+                # được là không chứng minh nổi, và mọi ô quanh đáy hố ASL đi
+                # thẳng vào "Present:"/"Absent:" của prompt. Band tiên nghiệm
+                # không hứa purity, nhưng nó bao đúng chỗ loss đang kéo ô
+                # uncertain tới -> ô rơi vào đó đọc là "lưỡng lự", không vào
+                # y_pred. Bỏ sót một ô pos rẻ hơn khẳng định sai một ô unc.
+                measured = eval_band(fb_lo, fb_hi, p_c, g_c, z)
+                row.update(measured)
+                row["source"] = "prior"
+                # Không có gì BẢO LÃNH cho band này: `holdout` của phép fit
+                # riêng vừa trượt nói về một cặp (lo, hi) KHÁC, để lại đó thì
+                # cột `hold` của bảng đang nói về một band không ai dùng.
+                row["holdout"] = None
+                row["fallback"] = fb_note
+                row["note"] = (
+                    f"KHÔNG đo được band đáng tin — {why}; rơi về band "
+                    + ("TIÊN NGHIỆM" if fb_note == "prior" else "GHIM TAY")
+                    + f" ({fb_lo:.3f}, {fb_hi:.3f}) thay vì gán cứng nhị phân "
+                      f"tại {tau:.3f}. KHÔNG có bảo đảm purity nào: đo trên "
+                      f"val được {measured['purity']:.3f} (LCB "
+                      f"{measured['purity_lcb']:.3f} < sàn {row['floor']:.3f}"
+                      f"), phủ {measured['coverage']:.3f} số ô uncertain và "
+                      f"nuốt {measured['pos_swallowed']:.3f} số ô positive")
+            else:
+                row["lo"] = row["hi"] = tau
+                row["source"] = "none"
+                row["fallback"] = "binary"
+                extra = ("" if row["n_unc"] else
+                         " (bệnh này KHÔNG có lấy một ô uncertain nào trên "
+                         "val -> không có gì để một band đại diện cho)")
+                row["note"] = (f"không gán uncertain cho bệnh này — {why}"
+                               f"{extra}; quay về quyết định nhị phân tại "
+                               f"{tau:.3f}")
         row["well_in_band"] = bool(row["lo"] <= well <= row["hi"])
         lo_v.append(row["lo"])
         hi_v.append(row["hi"])
@@ -659,7 +797,11 @@ def fit_bands(P, Y, aspect_names, disease_names, *, uncertain_soft,
                    "min_unc": int(min_unc), "min_cells": int(min_cells),
                    "holdout": float(holdout), "seed": int(seed),
                    "grid": int(grid), "margin": float(margin),
-                   "max_pos_swallow": float(pos_cap)},
+                   "max_pos_swallow": float(pos_cap),
+                   "none_fallback": fb_note,
+                   "fallback_band": ([None, None] if fb_lo is None else
+                                     [round(float(fb_lo), 4),
+                                      round(float(fb_hi), 4)])},
         "asl": {"uncertain_soft": float(uncertain_soft),
                 "gamma_pos": float(asl_gamma_pos),
                 "gamma_neg": float(asl_gamma_neg), "clip": float(asl_clip)},
@@ -748,18 +890,31 @@ def _report(bands, log, warn, cfg_pos, cfg_neg):
     for row in bands.rows:
         if row.get("source") != "class" and row.get("note"):
             log("calib", f"    {row['name']}: {row['note']}")
+    if src.get("prior"):
+        fb = ((m.get("params") or {}).get("fallback_band")
+              or [plo, phi])
+        warn("calib", f"{src['prior']}/{len(bands)} bệnh KHÔNG đo được vùng "
+                      f"uncertain đạt sàn — ở những bệnh đó pipeline dùng "
+                      f"band ({fb[0]:.3f}, {fb[1]:.3f}) suy từ hình dạng ASL "
+                      f"thay vì gán cứng nhị phân. Ô rơi vào band đó đọc là "
+                      f"'lưỡng lự' và KHÔNG vào y_pred — an toàn hơn một "
+                      f"khẳng định sai, nhưng KHÔNG có bảo đảm purity nào: "
+                      f"đọc cột purity và pos→unc của những hàng có dấu *. "
+                      f"Muốn hành vi bản trước thì đặt "
+                      f"run.calib_none_fallback=binary.")
     if src.get("none"):
         warn("calib", f"{src['none']}/{len(bands)} bệnh KHÔNG có vùng "
-                      f"uncertain đáng tin — ở những bệnh đó pipeline quay về "
-                      f"quyết định nhị phân. Đây là kết quả đo được, không "
-                      f"phải lỗi: sup_head chưa tách được ô uncertain ra khỏi "
-                      f"pos/neg đủ sạch ở checkpoint này.")
+                      f"uncertain đáng tin VÀ không có đường lùi nào dựng "
+                      f"được — ở những bệnh đó pipeline quay về quyết định "
+                      f"nhị phân. Đây là kết quả đo được, không phải lỗi: "
+                      f"sup_head chưa tách được ô uncertain ra khỏi pos/neg "
+                      f"đủ sạch ở checkpoint này.")
     # Giá của việc mở rộng band: mỗi ô POSITIVE rơi vào band là một ca bệnh
     # bị rút khỏi danh sách "Present:" của prompt. Không phải một lỗi — nó là
     # đúng cái đánh đổi mà tiêu chí "phủ nhiều nhất, purity ≥ sàn" chọn — nhưng
     # phải nhìn thấy con số trước khi chạy 2000 ảnh với nó.
     sw = [(r["name"], r.get("pos_swallowed", 0.0)) for r in bands.rows
-          if r.get("source") in ("class", "global")
+          if r.get("source") in ("class", "global", "prior")
           and float(r.get("pos_swallowed", 0.0)) > 0.25]
     if sw:
         sw.sort(key=lambda t: -t[1])
@@ -851,6 +1006,7 @@ def prepare_bands(*, cfg, router, loader, device, aspect_names, disease_names,
         grid=int(getattr(r, "calib_grid", 1000)),
         margin=float(getattr(r, "calib_margin", 0.04)),
         pos_cap=float(getattr(r, "calib_max_pos_swallow", 0.0) or 0.0),
+        none_fallback=getattr(r, "calib_none_fallback", "prior"),
         meta={"run_tag": getattr(cfg.arch, "tag", None),
               "mode": getattr(r, "mode", None),
               "weights": weights, "train_samples": train_samples,

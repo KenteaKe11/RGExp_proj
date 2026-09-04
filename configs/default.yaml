@@ -264,6 +264,22 @@ run:
   # con số này vẫn được đo và in ở cột `pos→unc` của bảng hiệu chuẩn — nhìn
   # nó rồi hãy quyết định có siết không (0.15 là mức đáng thử).
   calib_max_pos_swallow: 0.0
+  # ĐƯỜNG LÙI khi một bệnh KHÔNG đo được band nào đạt sàn. Bản trước gán
+  # cứng nhị phân tại điểm Youden — tức khẳng định đúng cái điều vừa đo được
+  # là không chứng minh nổi: mọi ô nằm quanh đáy hố ASL (p* ≈ 0.68) đi thẳng
+  # vào "Present:"/"Absent:" của prompt như thể model chắc chắn.
+  #   prior       (MẶC ĐỊNH) band TIÊN NGHIỆM suy từ hình dạng ASL — với
+  #               γ+=0, γ-=4, m=0.02, uncertain_soft=0.55 là (0.544, 0.850).
+  #               KHÔNG hứa purity, nhưng bao đúng chỗ loss kéo ô unc tới, và
+  #               ô rơi vào đó đọc là "lưỡng lự" -> KHÔNG vào y_pred. Bỏ sót
+  #               một ô pos rẻ hơn khẳng định sai một ô unc.
+  #   binary      hành vi của bản trước (gán cứng tại điểm Youden).
+  #   [0.5, 0.85] ghim tay. Không kèm bảo đảm gì hơn `prior`, và KHÔNG tự
+  #               dịch theo uncertain_soft/γ như `prior` — đổi loss thì cặp
+  #               này lệch đi mà không có gì kêu.
+  # Hàng dùng đường lùi được đánh dấu * trong bảng hiệu chuẩn; purity của nó
+  # VẪN được đo và in ra, nó chỉ không còn là một ràng buộc.
+  calib_none_fallback: prior
 
   # ── Sinh CÓ ĐIỀU KIỆN: nhãn của sup_head quay ngược vào prompt ───────────
   # Mỗi ảnh sinh HAI lượt:

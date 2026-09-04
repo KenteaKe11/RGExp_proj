@@ -1483,8 +1483,9 @@ def main(argv=None):
         log("infer", f"sinh {len(df_infer)} báo cáo | policy="
                      f"{'BẬT' if r.use_policy else 'TẮT'} | điều kiện="
                      + (f"BẬT (2 lượt/ảnh, band hiệu chuẩn theo bệnh — "
-                        f"{sum(1 for x in bands.rows if x.get('source') == 'none')}"
-                        f"/{len(bands)} bệnh chạy nhị phân, 'unc' không vào "
+                        f"{bands.n_measured}/{len(bands)} bệnh có band ĐO "
+                        f"ĐƯỢC, {bands.n_prior} dùng band tiên nghiệm, "
+                        f"{bands.n_none} chạy nhị phân; 'unc' không vào "
                         f"y_pred)" if cond_on else "TẮT (1 lượt/ảnh)"))
         results, shares = [], []
         for i in range(0, len(df_infer), r.infer_bs):
