@@ -604,6 +604,16 @@ def load_config(path="configs/default.yaml", overrides=None):
             raise ValueError(f"run.{_k} phải ≥ 0 (0 = giữ đủ danh sách), "
                              f"nhận {run[_k]}")
 
+    # ── mode="test": trần số ảnh đem sinh text + chấm metrics ────────────────
+    # 0 = KHÔNG cắt, đi TRỌN tập test (fixed.n_test). Metrics báo cáo luôn
+    # đọc trên df_test; val chỉ phục vụ vòng validate lúc train và hiệu chuẩn
+    # band §1.8, không bao giờ là mẫu số của metrics.
+    run.setdefault("n_test_samples", 0)
+    run["n_test_samples"] = int(run["n_test_samples"] or 0)
+    if run["n_test_samples"] < 0:
+        raise ValueError(f"run.n_test_samples phải ≥ 0 (0 = trọn tập "
+                         f"test), nhận {run['n_test_samples']}")
+
     # ── mode="probe": khảo sát chuyên môn expert ─────────────────────────────
     run.setdefault("probe_repo", None)        # null -> "<hub_repo>-probe"
     run.setdefault("probe_commit_every", 1.0)   # phút, CommitScheduler
@@ -623,8 +633,8 @@ def load_config(path="configs/default.yaml", overrides=None):
         # Probe không train và không được bỏ qua infer vì "ô này đã có eval":
         # eval cũ là của mode=test, không có bản ghi probe nào.
         run["force_eval"] = True
-        # n_test_samples là trần của mode=test (200 mẫu để chấm metrics nhanh).
-        # Probe chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
+        # n_test_samples là TRẦN của mode=test; mặc định 0 = trọn tập test.
+        # Probe cũng chạy TRỌN test, trừ khi probe_n_images ghi số cứng.
         run["n_test_samples"] = run.get("probe_n_images") or 0
 
     # ── w_aux: hệ số của số hạng cân bằng tải (Switch-Transformer) ──────────

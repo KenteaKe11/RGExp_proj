@@ -209,7 +209,13 @@ run:
   # train theo thứ tự rare-first; hết tập thì epoch_idx += 1 và đi lại từ đầu
   # đúng thứ tự đó. Con trỏ tiến độ là SỐ MẪU TÍCH LUỸ, không reset theo epoch,
   # nên checkpoint đọc được trên mọi máy dù batch khác nhau.
-  n_test_samples: 200       # §1.1 — 200 mẫu sinh text có metrics (mode=test)
+  # Trần số ảnh đem sinh text + chấm metrics ở mode=test. 0 = KHÔNG cắt, chạy
+  # TRỌN tập test (fixed.n_test = 3000 ảnh) — đây là con số báo cáo. Metrics
+  # luôn tính trên df_test, KHÔNG phải trên val: val chỉ dùng cho vòng
+  # validate trong lúc train (eval_every) và cho hiệu chuẩn band §1.8.
+  # Đặt một số dương (ví dụ 200) chỉ khi cần một lần chấm nháp cho nhanh —
+  # lúc đó metrics không so được với lần chạy trọn tập.
+  n_test_samples: 0         # §1.1 — 0 = trọn 3000 ảnh test
 
   # ── Grad-CAM nhánh router: "model nhìn ĐÂU khi nó thấy bệnh này" ─────────
   # Chạy ở CẢ mode infer lẫn mode probe. Mỗi ảnh: 1 forward + n_det backward
