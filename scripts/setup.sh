@@ -35,9 +35,18 @@ if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     # phút) rẻ hơn là mất phần tốc độ của compile suốt cả lần chạy.
     MISSING=""
     for c in git tmux gcc; do command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c"; done
-    # gcc có rồi nhưng g++ thì chưa là chuyện thường; inductor cần cả hai.
     if command -v gcc >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1; then
         MISSING="$MISSING g++"
+    fi
+    # python3-dev: CÓ gcc vẫn chưa đủ. triton dịch cuda_utils.c có
+    # `#include <Python.h>`, header đó nằm trong python3-dev, và ảnh runtime
+    # không có nó -> gcc CHẠY rồi trả exit 1. Dò bằng chính header, không phải
+    # bằng tên gói (tên khác nhau giữa các distro).
+    if ! "$PY" -c "
+import os, sys, sysconfig
+sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'], 'Python.h')) else 1)
+" 2>/dev/null; then
+        MISSING="$MISSING python3-dev"
     fi
     if [ -n "$MISSING" ] && command -v apt-get >/dev/null 2>&1; then
         echo "→ cài gói hệ thống:$MISSING"
@@ -228,10 +237,17 @@ if p.total_memory / 1024**3 < 16:
           "configs/baseline.yaml nếu OOM.")
 PYEOF
 
-if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-    echo "⚠ Không có gcc/cc — torch.compile sẽ bị TẮT (pipeline tự xử, chạy eager)."
-    echo "  Muốn giữ compile:  apt-get install -y build-essential"
-fi
+# DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn
+# chạy rồi trả exit 1 — đã gặp thật.
+"$PYBIN" -c "
+import sys
+sys.path.insert(0, '.')
+from src.preflight import c_compiler_works
+ok, why = c_compiler_works()
+print('✓ dịch thử mã C OK (' + why + ') — torch.compile dùng được' if ok
+      else '⚠ Không dịch được mã C (' + why + ') — torch.compile sẽ bị TẮT, chạy eager.\n'
+           '  Muốn giữ compile:  apt-get install -y build-essential python3-dev')
+" 2>/dev/null || echo "⚠ không kiểm được trình biên dịch C"
 
 # Kiểm tương thích phiên bản bằng CHÍNH bộ luật mà lần chạy sẽ dùng — không
 # chép lại logic ở đây để rồi hai chỗ trôi khỏi nhau.

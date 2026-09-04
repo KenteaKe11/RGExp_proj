@@ -402,12 +402,28 @@ def test_runner_loop() -> None:
               r.model.generation_config.disable_compile is False)
 
         Gen.disable_compile = False
-        from src.preflight import has_c_compiler as _hcc
+        from src.preflight import c_compiler_works as _ccw
+        ok_cc, why_cc = _ccw()
         r = WithGC(cfg, Cfg({"id": "f", "batch_size": 1}))   # auto
         r.load(); r.configure_compile()
-        check("auto -> theo đúng việc máy có compiler hay không",
-              r.model.generation_config.disable_compile is (_hcc() is None),
-              f"cc={_hcc()}")
+        check("auto -> theo kết quả DỊCH THỬ, không phải `which gcc`",
+              r.model.generation_config.disable_compile is (not ok_cc),
+              f"dịch thử={ok_cc} ({why_cc})")
+
+        # Lưới an toàn phải được giăng ở CẢ BA nhánh, kể cả nhánh không tắt gì.
+        try:
+            import torch._dynamo
+            has_dynamo = True
+        except Exception:
+            has_dynamo = False
+        if has_dynamo:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = False
+            WithGC(cfg, Cfg({"id": "f", "disable_compile": "false"})).configure_compile()
+            check("suppress_errors được bật kể cả khi KHÔNG tắt compile",
+                  torch._dynamo.config.suppress_errors is True)
+        else:
+            print("  ⊘ bỏ qua kiểm suppress_errors (máy này không có torch)")
 
         # Ngắt mạch trong VÒNG CHẠY (hỏng từ giữa chừng, không phải từ đầu)
         class FailLater(Fake):
@@ -450,6 +466,10 @@ def test_preflight() -> None:
         # bật torch.compile cho Gemma 3.
         ("BackendCompilerFailed: backend='inductor' raised: RuntimeError: "
          "Failed to find C compiler."): "build-essential",
+        # Ca thứ hai: gcc CÓ, chạy rồi trả exit 1 vì thiếu Python.h.
+        ("BackendCompilerFailed: CalledProcessError: Command '['/usr/bin/gcc', "
+         "'/tmp/x/main.c', '-shared', '-o', 'cuda_utils.so']' returned "
+         "non-zero exit status 1."): "python3-dev",
         "CUDA out of memory. Tried to allocate 2.00 GiB": "batch_size",
         "cannot import name '_prepare_4d_causal_attention_mask'": "transformers",
         "401 Client Error. Access to model google/gemma-3-4b-it is restricted": "quyền",
@@ -466,10 +486,17 @@ def test_preflight() -> None:
     # Dò trình biên dịch C: kết quả phải là None hoặc một đường dẫn CÓ THẬT.
     from pathlib import Path as _P
 
-    from src.preflight import has_c_compiler
+    from src.preflight import c_compiler_works, has_c_compiler
     cc = has_c_compiler()
     check("has_c_compiler trả None hoặc đường dẫn có thật",
           cc is None or _P(cc).exists(), str(cc))
+    ok_cc, why_cc = c_compiler_works()
+    check("c_compiler_works trả (bool, lý do)",
+          isinstance(ok_cc, bool) and isinstance(why_cc, str) and why_cc != "")
+    # Điểm mấu chốt: DỊCH THỬ nghiêm hơn `which`. Có compiler mà thiếu Python.h
+    # thì which nói "có" còn dịch thử nói "không" — và dịch thử mới đúng.
+    check("dịch thử không thể qua khi không có compiler",
+          not (ok_cc and cc is None))
 
     # check() không được ném khi thiếu torch/transformers — nó là hàng rào,
     # không phải một chỗ hỏng thêm.

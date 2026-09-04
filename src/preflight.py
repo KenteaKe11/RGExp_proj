@@ -15,6 +15,7 @@ thì dịch nó sang câu "sửa thế này" thay vì lặp lại repr của exc
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -26,16 +27,7 @@ def _ver(mod_version: str) -> tuple[int, ...]:
 
 
 def has_c_compiler() -> str | None:
-    """Đường dẫn tới trình biên dịch C, hoặc None.
-
-    Cần cho torch.compile/inductor — nó SINH RA mã C++ rồi gọi compiler thật để
-    dịch. Ảnh pytorch/* trên máy thuê thường không có gcc (ảnh runtime, không
-    phải devel), và transformers thì TỰ BẬT torch.compile cho đường sinh
-    hybrid-cache của Gemma 3. Hệ quả: model nạp xong, generate đầu tiên chết
-    bằng
-        BackendCompilerFailed: RuntimeError: Failed to find C compiler.
-    một lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
-    """
+    """Đường dẫn tới trình biên dịch C, hoặc None. CHỈ là bước 1 — xem bên dưới."""
     cc = os.environ.get("CC")
     if cc:
         found = shutil.which(cc)
@@ -46,6 +38,54 @@ def has_c_compiler() -> str | None:
         if found:
             return found
     return None
+
+
+@functools.lru_cache(maxsize=1)
+def c_compiler_works() -> tuple[bool, str]:
+    """DỊCH THỬ một file C. Trả (chạy được, lý do/đường dẫn).
+
+    Vì sao không dừng ở `which gcc`: đã thử và SAI. Máy có sẵn /usr/bin/gcc,
+    heuristic "có gcc -> compile được" cho qua, rồi triton gọi gcc để dịch
+    cuda_utils.c và gcc trả về exit 1 — vì thiếu **Python.h**, tức thiếu gói
+    python3-dev. Có compiler không đồng nghĩa với dịch được: còn cần header của
+    Python, header CUDA, và thư viện để link.
+
+    Bài học chung: khi có thể THỬ THẲNG việc mình cần (mất chưa tới một giây ở
+    đây), đừng đoán nó qua một dấu hiệu gián tiếp.
+
+    Cache lại: kết quả không đổi trong một tiến trình, mà hàm này được gọi một
+    lần cho mỗi model cộng một lần ở preflight.
+    """
+    cc = has_c_compiler()
+    if cc is None:
+        return False, "không thấy gcc/cc trong PATH"
+
+    import subprocess
+    import sysconfig
+    import tempfile
+
+    inc = sysconfig.get_paths().get("include") or ""
+    # Dựng đúng hình dạng thứ triton dịch: một shared object có include Python.h.
+    src = "#include <Python.h>\nint rgexp_probe(void) { return 0; }\n"
+    with tempfile.TemporaryDirectory() as td:
+        cfile = os.path.join(td, "probe.c")
+        sofile = os.path.join(td, "probe.so")
+        with open(cfile, "w", encoding="utf-8") as f:
+            f.write(src)
+        cmd = [cc, cfile, "-O0", "-shared", "-fPIC", "-o", sofile]
+        if inc:
+            cmd.append(f"-I{inc}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=90)
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            detail = err[-1] if err else f"exit {r.returncode}"
+            if any("Python.h" in line for line in err):
+                detail = "thiếu Python.h -> cài python3-dev"
+            return False, detail
+    return True, cc
 
 
 def env_versions() -> dict:
@@ -126,16 +166,17 @@ def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
                     "Phi-3.5-vision import chính hàm đó.\n"
                     "      pip install -U 'transformers>=4.51,<4.53'")
 
-    if any(str(m.get("runner", "")).lower() == "gemma3" for m in models) \
-            and has_c_compiler() is None:
-        # Cảnh báo chứ không chặn: Runner._configure_compile tắt compile và
-        # chạy eager, chậm hơn chút nhưng ra kết quả. Vẫn phải nói ra, vì cài
-        # gcc là việc một phút và nó lấy lại phần tốc độ đó.
-        warns.append("⚠ Không có trình biên dịch C (gcc/cc). transformers tự bật "
-                     "torch.compile cho\n    đường sinh hybrid-cache của Gemma 3, "
-                     "và inductor cần compiler để dịch mã nó\n    sinh ra -> sẽ TẮT "
-                     "compile và chạy eager. Muốn nhanh hơn:\n"
-                     "      apt-get install -y build-essential")
+    if any(str(m.get("runner", "")).lower() == "gemma3" for m in models):
+        ok, why = c_compiler_works()
+        if not ok:
+            # Cảnh báo chứ không chặn: Runner.configure_compile tắt compile và
+            # chạy eager. Vẫn phải nói ra, kèm ĐÚNG lý do dịch thử hỏng.
+            warns.append(
+                f"⚠ Không dịch được mã C ({why}). transformers tự bật "
+                "torch.compile cho\n    đường sinh của Gemma 3, và inductor cần "
+                "dịch mã nó sinh ra -> sẽ TẮT compile,\n    chạy eager (chậm hơn "
+                "chút, kết quả không đổi). Muốn giữ compile:\n"
+                "      apt-get install -y build-essential python3-dev")
 
     if v.get("cuda_available") and not v.get("bf16"):
         warns.append("⚠ GPU không có bf16: Gemma 3 sẽ chạy fp32 (chậm ~2-3×; fp16 tràn "
@@ -151,11 +192,13 @@ _RULES: list[tuple[str, str]] = [
     (r"_prepare_4d_causal_attention_mask|modeling_attn_mask_utils",
      "remote code của model đòi API mask cũ đã bị bỏ.\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),
-    (r"BackendCompilerFailed|Failed to find C compiler|backend='inductor'",
-     "torch.compile (inductor) cần một trình biên dịch C để dịch mã nó sinh ra,\n"
-     "      mà image này không có. Hai cách:\n"
-     "        apt-get install -y build-essential        # nhanh hơn, giữ compile\n"
-     "        --set models.0.disable_compile=true       # tắt compile, chạy eager"),
+    (r"BackendCompilerFailed|Failed to find C compiler|backend='inductor'"
+     r"|CalledProcessError.*gcc|cuda_utils",
+     "torch.compile (inductor) không dịch được mã nó sinh ra. Hai ca hay gặp:\n"
+     "        không có gcc          -> apt-get install -y build-essential\n"
+     "        có gcc, thiếu Python.h -> apt-get install -y python3-dev\n"
+     "      Hoặc bỏ hẳn compile (kết quả không đổi, chỉ chậm hơn chút):\n"
+     "        --set models.0.disable_compile=true"),
     (r"out of memory|CUDA out of memory",
      "hết VRAM. Hạ batch_size của model này trong configs/baseline.yaml,\n"
      "      hoặc với Phi thì hạ num_crops (4 -> 2)."),

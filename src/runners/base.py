@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import Cfg
-from ..preflight import diagnose, has_c_compiler
+from ..preflight import c_compiler_works, diagnose
 from ..tracking import NullTracker
 
 
@@ -270,41 +270,52 @@ class Runner:
         return out_path
 
     def configure_compile(self) -> None:
-        """Tắt torch.compile khi máy không có trình biên dịch C.
+        """Quyết định có để torch.compile chạy hay không, và luôn giăng lưới.
 
-        transformers TỰ BẬT torch.compile cho đường sinh hybrid-cache của
-        Gemma 3 — không phải ta yêu cầu. inductor sinh mã C++ rồi gọi compiler
-        thật để dịch; ảnh pytorch/* trên máy thuê là ảnh runtime, thường không
-        có gcc, nên generate đầu tiên chết bằng `Failed to find C compiler` —
-        một lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
+        transformers TỰ BẬT torch.compile cho đường sinh của Gemma 3 — không
+        phải ta yêu cầu. inductor sinh mã C++/CUDA rồi gọi trình biên dịch thật
+        để dịch, và trên ảnh container việc đó đã hỏng HAI lần vì HAI lý do
+        khác nhau:
 
-        Tắt compile chỉ mất một phần tốc độ (đường eager vẫn dùng kernel hợp
-        nhất của sdpa), nên đây là đánh đổi đúng khi thiếu compiler. Có compiler
-        thì KHÔNG đụng vào, để transformers tự quyết như bình thường.
+            1. không có gcc          -> "Failed to find C compiler"
+            2. CÓ gcc, thiếu Python.h -> gcc chạy rồi trả về exit 1
+
+        Lần một tôi vá bằng `which gcc`. Lần hai chứng minh phép kiểm đó sai:
+        có compiler không đồng nghĩa với dịch được. Nên giờ `auto` DỊCH THỬ một
+        file C thật (chưa tới một giây) thay vì suy từ một dấu hiệu gián tiếp.
+
+        Và bất kể quyết định thế nào, `suppress_errors` vẫn được bật: nếu còn
+        chỗ nào gọi compile mà ta chưa biết, hoặc dịch thử qua được nhưng
+        triton vẫn hỏng vì một lý do thứ ba, nó rơi về eager thay vì giết cả
+        lần chạy. Compile chỉ là tối ưu tốc độ — không đáng để mất kết quả.
 
         `models[].disable_compile`: auto (mặc định) | true | false
         """
-        want = str(self.mcfg.get("disable_compile", "auto")).lower()
-        if want in ("true", "1", "yes", "on"):
-            disable, why = True, "models[].disable_compile=true"
-        elif want in ("false", "0", "no", "off"):
-            return
-        else:
-            cc = has_c_compiler()
-            if cc is not None:
-                return
-            disable, why = True, "không thấy gcc/cc trên máy này"
+        # ── Lưới an toàn, luôn giăng ────────────────────────────────────────
+        try:
+            import torch._dynamo
 
-        if not disable:
+            torch._dynamo.config.suppress_errors = True
+        except Exception:
+            pass
+
+        want = str(self.mcfg.get("disable_compile", "auto")).lower()
+        if want in ("false", "0", "no", "off"):
             return
+        if want in ("true", "1", "yes", "on"):
+            why = "models[].disable_compile=true"
+        else:
+            ok, detail = c_compiler_works()
+            if ok:
+                print(f"  ⚙ dịch thử mã C OK ({detail}) -> để torch.compile chạy",
+                      flush=True)
+                return
+            why = f"dịch thử mã C hỏng: {detail}"
+
         print(f"  ⚙ tắt torch.compile ({why}) -> chạy eager", flush=True)
         try:
             import torch._dynamo
 
-            # suppress_errors: nếu vẫn còn chỗ nào gọi compile mà ta không biết,
-            # nó rơi về eager thay vì ném BackendCompilerFailed. Hai lớp, vì
-            # cách bật compile khác nhau giữa các bản transformers.
-            torch._dynamo.config.suppress_errors = True
             torch._dynamo.reset()
         except Exception:
             pass

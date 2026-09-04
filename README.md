@@ -230,29 +230,40 @@ cũ, remote code đòi API đã bỏ, thiếu trình biên dịch C, OOM, token 
 quyền, thiếu flash-attn, ảnh hỏng), và mỗi loại lỗi chỉ in **một lần** — không
 có phần đó thì log là 3000 dòng giống hệt nhau và nguyên nhân chìm nghỉm.
 
-### Ảnh runtime không có gcc, mà transformers tự bật torch.compile
+### transformers tự bật torch.compile, và inductor không dịch được
 
-Lỗi thật thứ hai, bắt được ngay ở lần sinh thử:
+Lỗi thật thứ hai — thật ra là **hai** lỗi, cùng một gốc, và cái thứ hai chứng
+minh bản vá cho cái thứ nhất là sai:
 
 ```
-BackendCompilerFailed: backend='inductor' raised:
-RuntimeError: Failed to find C compiler. Please specify via CC environment variable.
+1)  RuntimeError: Failed to find C compiler.                 # không có gcc
+2)  CalledProcessError: ['/usr/bin/gcc', ..., 'cuda_utils.c'] exit 1   # CÓ gcc
 ```
 
 Không phải ta gọi `torch.compile` — **transformers tự bật** nó cho đường sinh
-hybrid-cache của Gemma 3. inductor sinh mã C++ rồi gọi compiler thật để dịch,
-mà ảnh `pytorch/*` là ảnh **runtime**, thường không có `gcc`. Kết quả là một
-lỗi chẳng liên quan gì tới model, dữ liệu hay VRAM.
+của Gemma 3. inductor sinh mã C++/CUDA rồi gọi trình biên dịch thật để dịch.
+Ảnh `pytorch/*` là ảnh **runtime**: lần đầu thiếu hẳn `gcc`; lần sau có `gcc`
+nhưng thiếu `Python.h` (gói `python3-dev`), nên gcc **chạy rồi trả exit 1**.
 
-- `setup.sh` cài `gcc`/`g++` cùng với `git`/`tmux` ở chế độ container — một
-  phút, và giữ được phần tốc độ của compile.
-- `Runner.configure_compile()` là lưới an toàn: `models[].disable_compile: auto`
-  (mặc định) tắt compile khi **không** thấy compiler, cộng
-  `torch._dynamo.config.suppress_errors = True` để chỗ nào còn gọi compile mà ta
-  chưa biết thì rơi về eager thay vì ném. Ép bằng `true` / `false`.
+Bản vá đầu dùng `which gcc` để quyết định — và lần hai cho thấy phép kiểm đó
+sai: *có compiler không đồng nghĩa với dịch được*. Nên bây giờ:
 
-Tắt compile chỉ mất một phần tốc độ — đường eager vẫn dùng kernel hợp nhất của
-sdpa — nên đây là đánh đổi đúng khi thiếu compiler.
+- `preflight.c_compiler_works()` **dịch thử một file C có `#include <Python.h>`**
+  (dưới một giây, cache lại) thay vì suy từ một dấu hiệu gián tiếp. Đây là
+  nguyên tắc chung đáng giữ: khi có thể thử thẳng việc mình cần, đừng đoán nó.
+- `setup.sh` cài `gcc`/`g++`/`python3-dev` ở chế độ container, và dò
+  `python3-dev` bằng **chính header** chứ không bằng tên gói (tên khác nhau
+  giữa các distro).
+- `Runner.configure_compile()`: `models[].disable_compile: auto` (mặc định)
+  chạy phép dịch thử rồi mới quyết; `true`/`false` để ép.
+- **Và bất kể quyết định thế nào**, `torch._dynamo.config.suppress_errors = True`
+  luôn được bật. Nếu còn chỗ nào gọi compile mà ta chưa biết, hoặc dịch thử qua
+  được mà triton vẫn hỏng vì một lý do thứ ba (thiếu `libcuda`, chẳng hạn), nó
+  rơi về eager thay vì giết cả lần chạy. Compile chỉ là tối ưu tốc độ — không
+  đáng để mất kết quả của nhiều giờ GPU.
+
+Tắt compile chỉ mất một phần tốc độ: đường eager vẫn dùng kernel hợp nhất của
+sdpa.
 
 ### Cây thư mục trong zip ≠ `img_rel` trong CSV
 
@@ -310,8 +321,8 @@ cảnh báo vào cả console lẫn `REPORT.md` nếu vi phạm.
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest.py                  # 85 phép kiểm, không cần GPU/mạng/model
-python scripts/selftest.py --with-metrics    # 94 phép kiểm (thêm BLEU/ROUGE)
+python scripts/selftest.py                  # 88 phép kiểm, không cần GPU/mạng/model
+python scripts/selftest.py --with-metrics    # 97 phép kiểm (thêm BLEU/ROUGE)
 ```
 
 Kiểm những chỗ mà lỗi sẽ **đi thẳng vào bảng kết quả mà không ném exception**:
@@ -321,8 +332,10 @@ rỗng có ra 0 thay vì NaN không, guard tốc độ zip có nổ không, bố
 mục trong zip có dò đúng không, resume có sinh lại đúng phần thiếu không, batch
 OOM có rơi về từng ảnh không, file JSONL bị cắt giữa dòng có được dọn không,
 **ngắt mạch có chặn được ca "3000 dòng rỗng rồi báo xong" không**, preflight có
-dịch đúng **hai lỗi thật đã gặp** không (torch quá cũ · thiếu gcc), ba nhánh của
-`disable_compile` có đúng không, W&B tắt có thành no-op sạch không.
+dịch đúng **ba lỗi thật đã gặp** không (torch quá cũ · không có gcc · có gcc mà
+thiếu `Python.h`), phép **dịch thử** có nghiêm hơn `which gcc` không, ba nhánh
+của `disable_compile` có đúng không, lưới `suppress_errors` có được giăng cả ở
+nhánh không tắt compile không, W&B tắt có thành no-op sạch không.
 
 ---
 

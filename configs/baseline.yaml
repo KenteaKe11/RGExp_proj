@@ -76,15 +76,17 @@ models:
     dtype: bfloat16
     batch_size: 4
     enabled: true
-    # transformers TỰ BẬT torch.compile cho đường sinh hybrid-cache của Gemma 3
-    # — không phải ta yêu cầu. inductor sinh mã C++ rồi gọi compiler thật để
-    # dịch, mà ảnh pytorch/* là ảnh RUNTIME, thường không có gcc: generate đầu
-    # tiên chết bằng `BackendCompilerFailed: Failed to find C compiler`.
-    #   auto (mặc định) — có gcc thì để nguyên, không có thì tắt và chạy eager
-    #   true            — luôn tắt
+    # transformers TỰ BẬT torch.compile cho đường sinh của Gemma 3 — không phải
+    # ta yêu cầu. inductor sinh mã C++/CUDA rồi gọi trình biên dịch thật để
+    # dịch, và trên ảnh container việc đó đã hỏng HAI lần vì HAI lý do khác
+    # nhau: (1) không có gcc, (2) CÓ gcc nhưng thiếu Python.h (python3-dev).
+    #   auto (mặc định) — DỊCH THỬ một file C rồi mới quyết (không suy từ
+    #                     `which gcc`: phép kiểm đó đã cho kết quả sai)
+    #   true            — luôn tắt, chắc chắn không vướng
     #   false           — luôn để transformers tự quyết
-    # Cách tốt nhất vẫn là cài gcc (apt-get install -y build-essential): giữ
-    # được phần tốc độ của compile.
+    # Dù chọn gì, torch._dynamo.config.suppress_errors cũng được bật: compile
+    # hỏng thì rơi về eager chứ không giết cả lần chạy. Compile chỉ là tối ưu
+    # tốc độ — không đáng để mất kết quả của nhiều giờ GPU.
     disable_compile: auto
 
   - id: qwen25vl_3b
