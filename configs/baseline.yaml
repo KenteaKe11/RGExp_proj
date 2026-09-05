@@ -101,16 +101,10 @@ models:
     min_pixels: 200704      # =  256 × 28 × 28
     enabled: true
 
-  # Chỗ này TRƯỚC ĐÂY là LLaVA-Med v1.5 7B. Đổi vì lý do KỸ THUẬT, không phải
-  # khoa học: nó khai model_type=llava_mistral (ngoài transformers), phải cài
-  # package `llava` từ GitHub và repo đó ghim transformers 4.36 trong khi Gemma 3
-  # đòi >= 4.50 — hai ràng buộc loại trừ nhau, phải dựng venv riêng + tiến trình
-  # con, và vẫn hỏng.
-  #
-  # HỆ QUẢ PHẢI GHI VÀO BÁO CÁO: bảng §2.1 giờ so ba VLM ĐA DỤNG, không còn
-  # candidate y tế chuyên biệt nào. Nó vì thế KHÔNG trả lời được câu "model y tế
-  # có hơn model đa dụng trên ảnh X-quang không" — đó là câu hỏi khác và cần một
-  # mục riêng, với một baseline y tế chạy được (CheXagent, MAIRA, RadFM...).
+  # Candidate thứ ba: VLM đa dụng của Microsoft, chạy chung transformers với
+  # hai model trên. Dùng REMOTE CODE (auto_map -> modeling_phi3_v.py) ghim vào
+  # transformers 4.38, nên src/compat.py trả lại vài API Cache đã bị bỏ trước
+  # khi nạp — xem chú thích ở đó.
   - id: phi35v_4b
     name: "Phi-3.5-vision-instruct"
     runner: phi35v
@@ -129,6 +123,31 @@ models:
     # transformers phải còn `_prepare_4d_causal_attention_mask`. src/preflight.py
     # thử import chính hàm đó trước khi nạp gì.
     trust_remote_code: true
+
+  # Candidate thứ tư: baseline Y TẾ CHUYÊN BIỆT. Đây là model duy nhất trong
+  # bảng từng được huấn luyện trên dữ liệu y sinh, nên nó là thứ cho phép §2.1
+  # nói được câu "model y tế có hơn model đa dụng trên ảnh X-quang không".
+  # Không có nó, bảng chỉ so ba VLM đa dụng với nhau.
+  #
+  # Cái giá: nó khai model_type=llava_mistral (transformers không biết kiến
+  # trúc này), phải cài package `llava` từ GitHub, và repo đó ghim transformers
+  # 4.36 trong khi Gemma 3 đòi >= 4.50 — hai ràng buộc loại trừ nhau trong cùng
+  # một sys.path. Nên nó chạy ở VENV RIÊNG (.venv-llavamed, dựng bằng
+  # --system-site-packages để mượn torch), qua một tiến trình con đổ ra JSONL
+  # đúng schema của ba runner kia. Khâu chấm điểm không cần biết chuyện đó.
+  - id: llavamed_7b
+    name: "LLaVA-Med v1.5 7B"
+    runner: llavamed
+    hf_id: microsoft/llava-med-v1.5-mistral-7b
+    dtype: bfloat16
+    batch_size: 1           # builder của LLaVA-Med không có đường batch sạch
+    venv: .venv-llavamed
+    conv_mode: mistral_instruct
+    enabled: true
+    # Mắt xích mong manh nhất của pipeline (kiến trúc ngoài transformers + cài
+    # từ GitHub). true = nạp hỏng thì ghi N/A vào báo cáo và chấm các model còn
+    # lại, thay vì giết cả lần chạy đã tốn nhiều giờ GPU.
+    optional: true
 
 # ── Chấm điểm ───────────────────────────────────────────────────────────────
 # Mọi metric tính Ở MỨC TỪNG MẪU rồi mới lấy trung bình. Bắt buộc: kiểm định
@@ -163,17 +182,18 @@ metrics:
 #   permutation       — đảo dấu hiệu số của từng ảnh (sign-flip) -> phân phối
 #                       không CHÍNH XÁC dưới H0 đối xứng, trả lời "nếu hai
 #                       model như nhau thì hiệu số cỡ này hiếm tới đâu".
-# 3 cặp × 8 metric = 24 kiểm định -> p thô sẽ có dương tính giả. Hiệu chỉnh:
+# 4 candidate -> 6 cặp × 8 metric = 48 kiểm định -> p thô sẽ có nhiều dương
+# tính giả (riêng ngẫu nhiên đã ~2.4 cái ở alpha 0.05). Hiệu chỉnh:
 #   holm  kiểm soát FWER (nghiêm, dùng để KẾT LUẬN)
 #   bh    kiểm soát FDR  (thoáng hơn, dùng để SÀNG hướng đi tiếp)
 stats:
   n_boot: 10000
   # KHÔNG hạ n_perm để "chạy cho nhanh". p-value permutation có sàn cứng
-  # 1/(B+1), và Holm nhân p nhỏ nhất với SỐ KIỂM ĐỊNH (24). Với B = 400 thì sàn
-  # sau Holm là 24/401 = 0.060 > alpha -> KHÔNG kiểm định nào có thể đạt ý
+  # 1/(B+1), và Holm nhân p nhỏ nhất với SỐ KIỂM ĐỊNH (48). Với B = 400 thì sàn
+  # sau Holm là 48/401 = 0.120 > alpha -> KHÔNG kiểm định nào có thể đạt ý
   # nghĩa, dù hai model khác nhau một trời một vực; bảng vẫn in đủ số và cột
   # kết luận toàn "không", nên rất dễ đọc thành "ba model tương đương". Cần
-  # B >= số_kiểm_định / alpha = 480; 10000 là dư dả và tốn chưa tới một phút.
+  # B >= số_kiểm_định / alpha = 48/0.05 = 960; 10000 là dư dả, tốn ~1 phút.
   # (src/stats.py tự kiểm điều này và kêu nếu vi phạm.)
   n_perm: 10000
   ci: 0.95

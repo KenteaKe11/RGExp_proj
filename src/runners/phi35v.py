@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from PIL import Image
 
+from ..compat import patch_legacy_cache_api
 from ..config import hf_token
 from ..prompts import flat_prompt
 from .base import Runner
@@ -26,6 +27,17 @@ class Phi35VisionRunner(Runner):
 
     def load(self) -> None:
         from transformers import AutoModelForCausalLM, AutoProcessor
+
+        # Remote code của Phi ghim vào transformers 4.38 và gọi
+        # `past_key_values.get_max_length()` trong prepare_inputs_for_generation.
+        # Bản 4.52 đã bỏ phương thức đó -> generate đầu tiên chết bằng
+        #   AttributeError: 'DynamicCache' object has no attribute 'get_max_length'
+        # Trả lại đúng những alias đã bị bỏ (xem src/compat.py) — mã mới không
+        # còn gọi chúng nên không có gì để xung đột.
+        patched = patch_legacy_cache_api()
+        if patched:
+            print(f"  ⚙ vá API Cache cũ cho remote code: {', '.join(patched)}",
+                  flush=True)
 
         hf_id = self.mcfg["hf_id"]
         tok = hf_token()

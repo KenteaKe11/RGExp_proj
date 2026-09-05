@@ -15,6 +15,10 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .qwen25vl import Qwen25VLRunner
 
         return Qwen25VLRunner(cfg, mcfg, tracker)
+    if kind == "llavamed":
+        from .llavamed import LlavaMedRunner
+
+        return LlavaMedRunner(cfg, mcfg, tracker)
     if kind == "phi35v":
         from .phi35v import Phi35VisionRunner
 

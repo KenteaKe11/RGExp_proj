@@ -30,6 +30,19 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def _registry_knows(kind: str) -> bool:
+    """Registry có nhận ra tên runner này không — không nạp model, chỉ tra tên."""
+    from src.config import Cfg
+    from src.runners import build
+    try:
+        build(Cfg({}), Cfg({"id": "x", "runner": kind}))
+    except ValueError:
+        return False        # "runner không biết"
+    except Exception:
+        return True         # dựng được, hỏng vì thiếu torch/model — vẫn là biết
+    return True
+
+
 def test_stats() -> None:
     from src.stats import (benjamini_hochberg, cohen_dz, compare_all, holm,
                            paired_bootstrap, permutation_paired)
@@ -470,6 +483,9 @@ def test_preflight() -> None:
         ("BackendCompilerFailed: CalledProcessError: Command '['/usr/bin/gcc', "
          "'/tmp/x/main.c', '-shared', '-o', 'cuda_utils.so']' returned "
          "non-zero exit status 1."): "python3-dev",
+        # Ca thứ ba: remote code của Phi gọi API Cache đã bị bỏ.
+        "AttributeError: 'DynamicCache' object has no attribute 'get_max_length'":
+            "compat.py",
         "CUDA out of memory. Tried to allocate 2.00 GiB": "batch_size",
         "cannot import name '_prepare_4d_causal_attention_mask'": "transformers",
         "401 Client Error. Access to model google/gemma-3-4b-it is restricted": "quyền",
@@ -509,6 +525,52 @@ def test_preflight() -> None:
         ok = False
         print(f"    ném: {e!r}")
     check("check() chạy được kể cả khi môi trường trống", ok)
+
+
+def test_compat() -> None:
+    """Vá API Cache cũ cho remote code — phải idempotent và không phá gì."""
+    from src.compat import legacy_cache_api_missing, patch_legacy_cache_api
+
+    print("\n[compat]")
+    try:
+        from transformers.cache_utils import DynamicCache  # noqa: F401
+        have_tf = True
+    except Exception:
+        have_tf = False
+
+    if not have_tf:
+        check("thiếu transformers -> vá thành no-op, không ném",
+              patch_legacy_cache_api() == [] and legacy_cache_api_missing() == [])
+        return
+
+    from transformers.cache_utils import DynamicCache
+
+    before = legacy_cache_api_missing()
+    patch_legacy_cache_api()
+    check("sau khi vá, DynamicCache có get_max_length",
+          hasattr(DynamicCache, "get_max_length"))
+    check("sau khi vá, DynamicCache có seen_tokens",
+          hasattr(DynamicCache, "seen_tokens"))
+    check("gọi lại lần hai không vá thêm gì (idempotent)",
+          patch_legacy_cache_api() == [])
+    check("legacy_cache_api_missing rỗng sau khi vá",
+          legacy_cache_api_missing() == [], f"trước={before}")
+
+    # Ngữ nghĩa: get_max_length của cache động = không giới hạn (None)
+    c = DynamicCache()
+    try:
+        v = c.get_max_length()
+        ok = v is None or isinstance(v, int)
+    except Exception as e:
+        ok = False
+        print(f"    ném: {e!r}")
+    check("get_max_length gọi được trên instance thật", ok)
+    try:
+        ok2 = isinstance(c.seen_tokens, int)
+    except Exception as e:
+        ok2 = False
+        print(f"    ném: {e!r}")
+    check("seen_tokens trả số nguyên", ok2)
 
 
 def test_tracking() -> None:
@@ -621,7 +683,19 @@ def test_config() -> None:
     cfg = load_config()
     check("nạp được configs/baseline.yaml", bool(cfg))
     ms = enabled_models(cfg)
-    check("có đúng 3 candidate", len(ms) == 3, f"{[m['id'] for m in ms]}")
+    check("có đúng 4 candidate", len(ms) == 4, f"{[m['id'] for m in ms]}")
+    check("có baseline y tế chuyên biệt trong bảng",
+          any(m["runner"] == "llavamed" for m in ms))
+    check("mỗi runner đều dựng được từ registry",
+          all(_registry_knows(m["runner"]) for m in ms),
+          f"{[m['runner'] for m in ms]}")
+    # 4 candidate -> 6 cặp. n_perm phải đủ lớn cho 6×8 = 48 kiểm định.
+    from src.stats import perm_resolution_warning
+    n_pairs = len(ms) * (len(ms) - 1) // 2
+    check("n_perm trong config đủ lớn cho số kiểm định thật",
+          perm_resolution_warning(n_pairs * 8, int(cfg["stats"]["n_perm"]),
+                                  float(cfg["stats"]["alpha"])) is None,
+          f"{n_pairs*8} kiểm định, n_perm={cfg['stats']['n_perm']}")
     check("mỗi model có runner + hf_id",
           all(m.get("runner") and m.get("hf_id") for m in ms))
     check("n_test = 3000", int(cfg["data"]["n_test"]) == 3000)
@@ -644,6 +718,7 @@ def main() -> int:
     test_zip()
     test_runner_loop()
     test_preflight()
+    test_compat()
     test_tracking()
     test_report()
     print(f"\n═══ {len(PASS)} đạt · {len(FAIL)} hỏng ═══")

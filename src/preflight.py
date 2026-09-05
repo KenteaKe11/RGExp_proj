@@ -151,11 +151,29 @@ def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
                 errors[mid] = (f"Qwen2.5-VL cần transformers >= 4.49, đang có "
                                f"{v['transformers']}.\n      pip install -U 'transformers>=4.51,<4.53'")
 
+        elif kind == "llavamed":
+            # Chạy ở venv KHÁC nên phiên bản của môi trường chính không nói lên
+            # gì. Kiểm thẳng cái duy nhất quan trọng: venv đó import được `llava`
+            # không. Mất ~2 giây, và nó bắt được ca hay gặp nhất — mạng chặn
+            # GitHub lúc setup nên package chưa bao giờ được cài.
+            err = _check_llavamed_venv(m)
+            if err:
+                errors[mid] = err
+
         elif kind == "phi35v":
             # Remote code của Phi-3.5-vision import _prepare_4d_causal_attention_mask.
             # Hàm này bị bỏ trong đợt tái cấu trúc mask của transformers. Thử
             # import THẲNG ở đây: một dòng, cho câu trả lời chắc chắn, thay vì
             # đoán theo số phiên bản rồi sai.
+            from .compat import legacy_cache_api_missing
+
+            gone = legacy_cache_api_missing()
+            if gone:
+                # KHÔNG phải lỗi: src/compat.py trả lại đúng những alias này
+                # ngay trước khi nạp Phi. Vẫn in ra, vì "có vá một API của thư
+                # viện" là thứ người đọc log phải biết, không nên lặng lẽ.
+                warns.append(f"ℹ Phi dùng remote code cũ; sẽ vá lại API Cache đã "
+                             f"bị bỏ: {', '.join(gone)} (xem src/compat.py)")
             try:
                 from transformers.modeling_attn_mask_utils import \
                     _prepare_4d_causal_attention_mask  # noqa: F401
@@ -184,11 +202,48 @@ def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
     return errors, warns
 
 
+def _check_llavamed_venv(mcfg: dict) -> str | None:
+    """venv cô lập của LLaVA-Med có import được `llava` không."""
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    venv = root / str(mcfg.get("venv", ".venv-llavamed"))
+    py = None
+    for cand in (venv / "bin" / "python", venv / "Scripts" / "python.exe"):
+        if cand.exists():
+            py = cand
+            break
+    if py is None:
+        return (f"chưa có venv {venv.name}.\n"
+                "      bash scripts/setup.sh        # dựng venv + cài llava\n"
+                "      (bỏ hẳn model này: --set models.3.enabled=false)")
+    try:
+        r = subprocess.run([str(py), "-c", "import llava, transformers; "
+                            "print(transformers.__version__)"],
+                           capture_output=True, timeout=120)
+    except Exception as e:
+        return f"không chạy được python của venv: {e!r}"
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        detail = err[-1] if err else f"exit {r.returncode}"
+        return (f"venv {venv.name} không import được `llava`: {detail}\n"
+                f"      {py} -m pip install --no-deps "
+                "git+https://github.com/microsoft/LLaVA-Med.git")
+    tv = (r.stdout or b"").decode("utf-8", "replace").strip()
+    print(f"  ✓ venv LLaVA-Med OK (transformers {tv})", flush=True)
+    return None
+
+
 # ── Dịch lỗi lúc chạy ───────────────────────────────────────────────────────
 _RULES: list[tuple[str, str]] = [
     (r"or_mask_function|and_mask_function",
      "transformers quá mới so với torch (Gemma 3 cần torch>=2.6 từ transformers 4.53).\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),
+    (r"get_max_length|seen_tokens|'DynamicCache' object has no attribute",
+     "remote code gọi một API Cache mà transformers đã bỏ.\n"
+     "      src/compat.py vá lại các alias đó — nếu vẫn lỗi thì có thêm API mới\n"
+     "      bị bỏ: thêm nó vào patch_legacy_cache_api(), hoặc tắt model này."),
     (r"_prepare_4d_causal_attention_mask|modeling_attn_mask_utils",
      "remote code của model đòi API mask cũ đã bị bỏ.\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),

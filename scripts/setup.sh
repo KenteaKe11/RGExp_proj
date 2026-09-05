@@ -5,14 +5,18 @@
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
 #     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
+#     INSTALL_LLAVAMED=0 bash scripts/setup.sh      # bỏ venv cô lập của LLaVA-Med
 #
 # Đây là thí nghiệm CHỈ INFER: không train, không LoRA, không quantization. Nên
 # không cài peft/bitsandbytes — chúng chỉ làm chậm setup và thêm chỗ để hỏng.
 #
-# MỘT môi trường duy nhất. Bản trước còn một venv cô lập cho LLaVA-Med (nó ghim
-# transformers 4.36 trong khi Gemma 3 đòi >= 4.50); candidate thứ ba giờ là
-# Phi-3.5-vision, chạy chung transformers với hai model kia, nên toàn bộ cơ chế
-# venv-riêng + tiến trình con đã bị bỏ.
+# HAI môi trường được dựng:
+#   1. CHÍNH          — transformers 4.51/4.52: Gemma 3, Qwen2.5-VL, Phi-3.5-vision
+#   2. .venv-llavamed — transformers 4.37 + package `llava` của microsoft.
+#      Dựng bằng --system-site-packages nên KHÔNG tải lại torch (~2.5 GB): venv
+#      chỉ chứa đúng những gói cần che bản của môi trường chính, và
+#      site-packages của venv đứng TRƯỚC system trong sys.path nên nó thắng.
+#      Bỏ qua nó:  INSTALL_LLAVAMED=0 bash scripts/setup.sh
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -199,7 +203,43 @@ if "$PYBIN" -c "import sys; v=tuple(int(x) for x in '$TV'.split('.')[:2]); sys.e
     fi
 fi
 
-# ── 6. Nạp trước model chấm BERTScore ───────────────────────────────────────
+# ── 6. venv CÔ LẬP cho LLaVA-Med ────────────────────────────────────────────
+if [ "${INSTALL_LLAVAMED:-1}" = "1" ]; then
+    echo "→ dựng venv cô lập cho LLaVA-Med: $VENV_LLAVAMED"
+    if [ ! -d "$VENV_LLAVAMED" ]; then
+        # --system-site-packages: mượn torch (~2.5 GB) của môi trường ngoài,
+        # chỉ cài đè những gói cần phiên bản khác.
+        "$PYBIN" -m venv --system-site-packages "$VENV_LLAVAMED" \
+            || { echo "⚠ không dựng được venv LLaVA-Med — sẽ chấm 3 model"; INSTALL_LLAVAMED=0; }
+    fi
+    LMPY="$(rgexp_llavamed_py)"
+    if [ -n "$LMPY" ]; then
+        # --ignore-installed: không có cờ này thì pip thấy transformers 4.52 ở
+        # system site-packages và coi như "đã thoả", venv không có bản 4.37 của
+        # riêng nó, và llava vỡ ngay ở import.
+        "$LMPY" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+        if "$LMPY" -m pip install -q --ignore-installed -r requirements-llavamed.txt; then
+            echo "✓ deps LLaVA-Med (transformers $("$LMPY" -c 'import transformers;print(transformers.__version__)' 2>/dev/null))"
+        else
+            echo "⚠ cài deps LLaVA-Med fail"
+        fi
+        # Package `llava` chỉ có trên GitHub. --no-deps vì pyproject của nó ghim
+        # cả torch: để nó tự kéo là mất bản torch vừa khớp CUDA ở trên.
+        if "$LMPY" -c "import llava" >/dev/null 2>&1; then
+            echo "✓ package llava đã có"
+        elif "$LMPY" -m pip install -q --no-deps "git+https://github.com/microsoft/LLaVA-Med.git"; then
+            echo "✓ cài package llava từ GitHub"
+        else
+            echo "⚠ không cài được llava (mạng chặn GitHub?) — LLaVA-Med sẽ báo N/A"
+        fi
+        "$LMPY" -c "import llava, transformers; print('✓ llava import OK, transformers', transformers.__version__)" 2>/dev/null \
+            || echo "⚠ llava chưa import được — pipeline vẫn chạy, LLaVA-Med báo N/A"
+    fi
+else
+    echo "⊘ bỏ qua LLaVA-Med (INSTALL_LLAVAMED=0)"
+fi
+
+# ── 7. Nạp trước model chấm BERTScore ───────────────────────────────────────
 # roberta-large ~1.4 GB. Tải ở đây để khâu chấm điểm (chạy SAU nhiều giờ infer)
 # không chết vì mạng.
 "$PYBIN" - <<'PYEOF' || echo "⚠ chưa tải được roberta-large — khâu chấm điểm sẽ tự tải lại"
@@ -209,7 +249,7 @@ AutoModel.from_pretrained("roberta-large")
 print("✓ roberta-large (BERTScore) đã nằm trong cache")
 PYEOF
 
-# ── 7. Xác nhận GPU + deps + TƯƠNG THÍCH ────────────────────────────────────
+# ── 8. Xác nhận GPU + deps + TƯƠNG THÍCH ────────────────────────────────────
 "$PYBIN" - <<'PYEOF'
 import sys
 import torch
