@@ -483,9 +483,9 @@ def test_preflight() -> None:
         ("BackendCompilerFailed: CalledProcessError: Command '['/usr/bin/gcc', "
          "'/tmp/x/main.c', '-shared', '-o', 'cuda_utils.so']' returned "
          "non-zero exit status 1."): "python3-dev",
-        # Ca thứ ba: remote code của Phi gọi API Cache đã bị bỏ.
+        # Ca thứ ba: mã của model gọi API Cache đã bị bỏ -> phải venv riêng.
         "AttributeError: 'DynamicCache' object has no attribute 'get_max_length'":
-            "compat.py",
+            "venv riêng",
         "CUDA out of memory. Tried to allocate 2.00 GiB": "batch_size",
         "cannot import name '_prepare_4d_causal_attention_mask'": "transformers",
         "401 Client Error. Access to model google/gemma-3-4b-it is restricted": "quyền",
@@ -514,63 +514,41 @@ def test_preflight() -> None:
     check("dịch thử không thể qua khi không có compiler",
           not (ok_cc and cc is None))
 
+    # preflight CLI phải thoát KHÁC 0 kể cả khi chỉ model OPTIONAL hỏng — nếu
+    # không, scripts/run.sh kết luận môi trường đủ và setup.sh không bao giờ
+    # chạy, nên venv của LLaVA-Med vĩnh viễn không được dựng. Đây đúng là lỗi
+    # đã xảy ra, nên phải có bài kiểm giữ nó lại.
+    import subprocess
+    import sys as _sys
+
+    import yaml as _yaml
+    root = Path(__file__).resolve().parent.parent
+    cfg_full = _yaml.safe_load(open(root / "configs" / "baseline.yaml", encoding="utf-8"))
+    only_opt = dict(cfg_full)
+    only_opt["models"] = [m for m in cfg_full["models"] if m.get("optional")]
+    check("config có ít nhất một model optional để kiểm", len(only_opt["models"]) >= 1)
+    with tempfile.TemporaryDirectory() as td:
+        cpath = Path(td) / "only_optional.yaml"
+        cpath.write_text(_yaml.safe_dump(only_opt, allow_unicode=True), encoding="utf-8")
+        r = subprocess.run([_sys.executable, "-m", "src.preflight", "--config", str(cpath)],
+                           cwd=str(root), capture_output=True, text=True)
+        out = (r.stdout or "") + (r.stderr or "")
+        check("chỉ model optional hỏng -> preflight vẫn thoát != 0",
+              r.returncode != 0, f"exit={r.returncode}")
+        check("và nói rõ rằng run.sh sẽ chạy setup.sh",
+              "setup.sh" in out, out.strip()[-160:])
+
     # check() không được ném khi thiếu torch/transformers — nó là hàng rào,
     # không phải một chỗ hỏng thêm.
     try:
         errs, warns = pf_check([{"id": "a", "runner": "gemma3"},
                                 {"id": "b", "runner": "qwen25vl"},
-                                {"id": "c", "runner": "phi35v"}])
+                                {"id": "c", "runner": "llavamed"}])
         ok = isinstance(errs, dict) and isinstance(warns, list)
     except Exception as e:
         ok = False
         print(f"    ném: {e!r}")
     check("check() chạy được kể cả khi môi trường trống", ok)
-
-
-def test_compat() -> None:
-    """Vá API Cache cũ cho remote code — phải idempotent và không phá gì."""
-    from src.compat import legacy_cache_api_missing, patch_legacy_cache_api
-
-    print("\n[compat]")
-    try:
-        from transformers.cache_utils import DynamicCache  # noqa: F401
-        have_tf = True
-    except Exception:
-        have_tf = False
-
-    if not have_tf:
-        check("thiếu transformers -> vá thành no-op, không ném",
-              patch_legacy_cache_api() == [] and legacy_cache_api_missing() == [])
-        return
-
-    from transformers.cache_utils import DynamicCache
-
-    before = legacy_cache_api_missing()
-    patch_legacy_cache_api()
-    check("sau khi vá, DynamicCache có get_max_length",
-          hasattr(DynamicCache, "get_max_length"))
-    check("sau khi vá, DynamicCache có seen_tokens",
-          hasattr(DynamicCache, "seen_tokens"))
-    check("gọi lại lần hai không vá thêm gì (idempotent)",
-          patch_legacy_cache_api() == [])
-    check("legacy_cache_api_missing rỗng sau khi vá",
-          legacy_cache_api_missing() == [], f"trước={before}")
-
-    # Ngữ nghĩa: get_max_length của cache động = không giới hạn (None)
-    c = DynamicCache()
-    try:
-        v = c.get_max_length()
-        ok = v is None or isinstance(v, int)
-    except Exception as e:
-        ok = False
-        print(f"    ném: {e!r}")
-    check("get_max_length gọi được trên instance thật", ok)
-    try:
-        ok2 = isinstance(c.seen_tokens, int)
-    except Exception as e:
-        ok2 = False
-        print(f"    ném: {e!r}")
-    check("seen_tokens trả số nguyên", ok2)
 
 
 def test_tracking() -> None:
@@ -683,9 +661,12 @@ def test_config() -> None:
     cfg = load_config()
     check("nạp được configs/baseline.yaml", bool(cfg))
     ms = enabled_models(cfg)
-    check("có đúng 4 candidate", len(ms) == 4, f"{[m['id'] for m in ms]}")
+    check("có đúng 3 candidate", len(ms) == 3, f"{[m['id'] for m in ms]}")
     check("có baseline y tế chuyên biệt trong bảng",
           any(m["runner"] == "llavamed" for m in ms))
+    check("không còn runner nào đã bị bỏ",
+          not any(m["runner"] in ("phi35v",) for m in ms),
+          f"{[m['runner'] for m in ms]}")
     check("mỗi runner đều dựng được từ registry",
           all(_registry_knows(m["runner"]) for m in ms),
           f"{[m['runner'] for m in ms]}")
@@ -718,7 +699,6 @@ def main() -> int:
     test_zip()
     test_runner_loop()
     test_preflight()
-    test_compat()
     test_tracking()
     test_report()
     print(f"\n═══ {len(PASS)} đạt · {len(FAIL)} hỏng ═══")

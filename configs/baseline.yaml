@@ -101,30 +101,7 @@ models:
     min_pixels: 200704      # =  256 × 28 × 28
     enabled: true
 
-  # Candidate thứ ba: VLM đa dụng của Microsoft, chạy chung transformers với
-  # hai model trên. Dùng REMOTE CODE (auto_map -> modeling_phi3_v.py) ghim vào
-  # transformers 4.38, nên src/compat.py trả lại vài API Cache đã bị bỏ trước
-  # khi nạp — xem chú thích ở đó.
-  - id: phi35v_4b
-    name: "Phi-3.5-vision-instruct"
-    runner: phi35v
-    hf_id: microsoft/Phi-3.5-vision-instruct
-    dtype: bfloat16
-    # Processor của Phi-3-V nhận một chuỗi text + ảnh của riêng nó, không có
-    # đường gộp batch sạch -> runner lặp từng ảnh. Để 1 cho khỏi hiểu nhầm.
-    batch_size: 1
-    # Số ô cắt ở "HD transform". README gợi ý 16 cho ảnh đơn, nhưng mỗi crop tốn
-    # 144 visual token; ảnh X-quang xám, một chủ thể, không có chữ nhỏ để đọc —
-    # thứ mà HD transform sinh ra để phục vụ. 4 là đủ và nhanh hơn nhiều.
-    num_crops: 4
-    enabled: true
-    optional: true
-    # Model dùng remote code trên Hub (auto_map -> modeling_phi3_v.py), nên
-    # transformers phải còn `_prepare_4d_causal_attention_mask`. src/preflight.py
-    # thử import chính hàm đó trước khi nạp gì.
-    trust_remote_code: true
-
-  # Candidate thứ tư: baseline Y TẾ CHUYÊN BIỆT. Đây là model duy nhất trong
+  # Candidate thứ ba: baseline Y TẾ CHUYÊN BIỆT. Đây là model duy nhất trong
   # bảng từng được huấn luyện trên dữ liệu y sinh, nên nó là thứ cho phép §2.1
   # nói được câu "model y tế có hơn model đa dụng trên ảnh X-quang không".
   # Không có nó, bảng chỉ so ba VLM đa dụng với nhau.
@@ -182,18 +159,18 @@ metrics:
 #   permutation       — đảo dấu hiệu số của từng ảnh (sign-flip) -> phân phối
 #                       không CHÍNH XÁC dưới H0 đối xứng, trả lời "nếu hai
 #                       model như nhau thì hiệu số cỡ này hiếm tới đâu".
-# 4 candidate -> 6 cặp × 8 metric = 48 kiểm định -> p thô sẽ có nhiều dương
-# tính giả (riêng ngẫu nhiên đã ~2.4 cái ở alpha 0.05). Hiệu chỉnh:
+# 3 cặp × 8 metric = 24 kiểm định -> p thô sẽ có dương tính giả (riêng ngẫu
+# nhiên đã ~1.2 cái ở alpha 0.05). Hiệu chỉnh:
 #   holm  kiểm soát FWER (nghiêm, dùng để KẾT LUẬN)
 #   bh    kiểm soát FDR  (thoáng hơn, dùng để SÀNG hướng đi tiếp)
 stats:
   n_boot: 10000
   # KHÔNG hạ n_perm để "chạy cho nhanh". p-value permutation có sàn cứng
-  # 1/(B+1), và Holm nhân p nhỏ nhất với SỐ KIỂM ĐỊNH (48). Với B = 400 thì sàn
-  # sau Holm là 48/401 = 0.120 > alpha -> KHÔNG kiểm định nào có thể đạt ý
+  # 1/(B+1), và Holm nhân p nhỏ nhất với SỐ KIỂM ĐỊNH (24). Với B = 400 thì sàn
+  # sau Holm là 24/401 = 0.060 > alpha -> KHÔNG kiểm định nào có thể đạt ý
   # nghĩa, dù hai model khác nhau một trời một vực; bảng vẫn in đủ số và cột
   # kết luận toàn "không", nên rất dễ đọc thành "ba model tương đương". Cần
-  # B >= số_kiểm_định / alpha = 48/0.05 = 960; 10000 là dư dả, tốn ~1 phút.
+  # B >= số_kiểm_định / alpha = 24/0.05 = 480; 10000 là dư dả, tốn ~1 phút.
   # (src/stats.py tự kiểm điều này và kêu nếu vi phạm.)
   n_perm: 10000
   ci: 0.95

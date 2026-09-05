@@ -160,29 +160,6 @@ def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
             if err:
                 errors[mid] = err
 
-        elif kind == "phi35v":
-            # Remote code của Phi-3.5-vision import _prepare_4d_causal_attention_mask.
-            # Hàm này bị bỏ trong đợt tái cấu trúc mask của transformers. Thử
-            # import THẲNG ở đây: một dòng, cho câu trả lời chắc chắn, thay vì
-            # đoán theo số phiên bản rồi sai.
-            from .compat import legacy_cache_api_missing
-
-            gone = legacy_cache_api_missing()
-            if gone:
-                # KHÔNG phải lỗi: src/compat.py trả lại đúng những alias này
-                # ngay trước khi nạp Phi. Vẫn in ra, vì "có vá một API của thư
-                # viện" là thứ người đọc log phải biết, không nên lặng lẽ.
-                warns.append(f"ℹ Phi dùng remote code cũ; sẽ vá lại API Cache đã "
-                             f"bị bỏ: {', '.join(gone)} (xem src/compat.py)")
-            try:
-                from transformers.modeling_attn_mask_utils import \
-                    _prepare_4d_causal_attention_mask  # noqa: F401
-            except Exception:
-                errors[mid] = (
-                    f"transformers {v['transformers']} không còn "
-                    "`_prepare_4d_causal_attention_mask`, mà remote code của "
-                    "Phi-3.5-vision import chính hàm đó.\n"
-                    "      pip install -U 'transformers>=4.51,<4.53'")
 
     if any(str(m.get("runner", "")).lower() == "gemma3" for m in models):
         ok, why = c_compiler_works()
@@ -218,16 +195,26 @@ def _check_llavamed_venv(mcfg: dict) -> str | None:
         return (f"chưa có venv {venv.name}.\n"
                 "      bash scripts/setup.sh        # dựng venv + cài llava\n"
                 "      (bỏ hẳn model này: --set models.3.enabled=false)")
+    # Kiểm bằng ĐÚNG những thứ worker dùng. `import llava` là phép kiểm quá yếu:
+    # llava/__init__.py gần như rỗng nên nó qua được kể cả khi phần thân hỏng —
+    # cho cảm giác an toàn sai rồi vỡ ở lần generate đầu.
+    probe = (
+        "import transformers;"
+        "from llava.model.builder import load_pretrained_model;"
+        "from llava.conversation import conv_templates;"
+        "from llava.mm_utils import process_images, tokenizer_image_token;"
+        "from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN;"
+        "assert 'mistral_instruct' in conv_templates, 'thiếu conv mistral_instruct';"
+        "print(transformers.__version__)"
+    )
     try:
-        r = subprocess.run([str(py), "-c", "import llava, transformers; "
-                            "print(transformers.__version__)"],
-                           capture_output=True, timeout=120)
+        r = subprocess.run([str(py), "-c", probe], capture_output=True, timeout=180)
     except Exception as e:
         return f"không chạy được python của venv: {e!r}"
     if r.returncode != 0:
         err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         detail = err[-1] if err else f"exit {r.returncode}"
-        return (f"venv {venv.name} không import được `llava`: {detail}\n"
+        return (f"venv {venv.name} chưa dùng được: {detail}\n"
                 f"      {py} -m pip install --no-deps "
                 "git+https://github.com/microsoft/LLaVA-Med.git")
     tv = (r.stdout or b"").decode("utf-8", "replace").strip()
@@ -241,9 +228,9 @@ _RULES: list[tuple[str, str]] = [
      "transformers quá mới so với torch (Gemma 3 cần torch>=2.6 từ transformers 4.53).\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),
     (r"get_max_length|seen_tokens|'DynamicCache' object has no attribute",
-     "remote code gọi một API Cache mà transformers đã bỏ.\n"
-     "      src/compat.py vá lại các alias đó — nếu vẫn lỗi thì có thêm API mới\n"
-     "      bị bỏ: thêm nó vào patch_legacy_cache_api(), hoặc tắt model này."),
+     "mã của model gọi một API Cache mà transformers đã bỏ. Model đó phải chạy ở\n"
+     "      venv riêng với bản transformers nó được viết cho (như LLaVA-Med),\n"
+     "      chứ không vá được bằng vài alias."),
     (r"_prepare_4d_causal_attention_mask|modeling_attn_mask_utils",
      "remote code của model đòi API mask cũ đã bị bỏ.\n"
      "      pip install -U 'transformers>=4.51,<4.53'"),
@@ -297,11 +284,23 @@ def main() -> int:
         print(f"  ✗ {mid}: {msg}")
     blocking = [m["id"] for m in models
                 if m["id"] in errors and not m.get("optional", False)]
-    if blocking:
-        return 1
     if not errors:
         print("  ✓ mọi model tương thích với môi trường này")
-    return 0
+        return 0
+    # Thoát khác 0 kể cả khi chỉ model OPTIONAL hỏng.
+    #
+    # Bản trước chỉ tính model bắt buộc, và hệ quả là: venv của LLaVA-Med chưa
+    # được dựng -> preflight nói "ổn" -> scripts/run.sh kết luận môi trường đủ
+    # -> setup.sh KHÔNG BAO GIỜ chạy -> model đó vắng mặt trong mọi lần chạy,
+    # với một dòng nhắc "chạy setup.sh" mà không ai bị buộc phải làm.
+    # setup.sh là thứ sửa được đúng những lỗi này, và nó idempotent, nên để
+    # run.sh gọi nó là đúng.
+    if blocking:
+        print(f"  ✗ model BẮT BUỘC không chạy được: {', '.join(blocking)}")
+    else:
+        print("  ⚠ chỉ model tuỳ chọn bị ảnh hưởng — scripts/run.sh sẽ chạy "
+              "setup.sh để sửa")
+    return 1
 
 
 if __name__ == "__main__":

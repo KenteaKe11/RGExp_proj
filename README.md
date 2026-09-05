@@ -20,7 +20,7 @@ bash scripts/run.sh --detach     # ... nhưng chạy NỀN: trả lại shell ng
 
 | | |
 |---|---|
-| **Candidate** | `google/gemma-3-4b-it` · `Qwen/Qwen2.5-VL-3B-Instruct` · `microsoft/Phi-3.5-vision-instruct` · `microsoft/llava-med-v1.5-mistral-7b` |
+| **Candidate** | `google/gemma-3-4b-it` · `Qwen/Qwen2.5-VL-3B-Instruct` · `microsoft/llava-med-v1.5-mistral-7b` |
 | **Tập chấm** | 3000 ảnh từ `RGExp123/MIMIC_CXR_cleaned/split_ref/test_split.csv` (đã chốt, seed 42) |
 | **Tham chiếu** | cột `text_gt` của `csv_helper/clean_dataset.csv` |
 | **Prompt** | MỘT bản, dùng chung cho cả ba model |
@@ -31,17 +31,18 @@ bash scripts/run.sh --detach     # ... nhưng chạy NỀN: trả lại shell ng
 | **Theo dõi** | Weights & Biases — mỗi lần chạy một run riêng, gom theo `group` |
 | **Kết quả** | `RGExp123/Research_results` (dataset repo, private) |
 
-> **Bốn candidate, hai loại.** Ba VLM **đa dụng** (Gemma 3, Qwen2.5-VL, Phi-3.5-V)
-> cộng một baseline **y tế chuyên biệt** (LLaVA-Med). Chỉ khi LLaVA-Med chạy được
+> **Ba candidate, hai loại.** Hai VLM **đa dụng** (Gemma 3 4B, Qwen2.5-VL 3B) và
+> một baseline **y tế chuyên biệt** (LLaVA-Med 7B). Chỉ khi LLaVA-Med chạy được
 > thì §2.1 mới trả lời được câu *"model y tế có hơn model đa dụng trên ảnh X-quang
-> không"*; nếu nó vắng mặt, bảng chỉ so ba VLM đa dụng với nhau và **kết luận phải
-> nói rõ điều đó** (`REPORT.md` tự ghi model nào vắng và vì sao).
+> không"*; nếu nó vắng mặt, bảng chỉ so hai VLM đa dụng và **kết luận phải nói rõ
+> điều đó** (`REPORT.md` tự ghi model nào vắng và vì sao).
 >
-> Hai model cuối được đánh dấu `optional: true` vì cả hai chạy bằng **mã ngoài
-> transformers**: Phi qua remote code trên Hub, LLaVA-Med qua package `llava` cài
-> từ GitHub trong một venv riêng. Đó là mắt xích mong manh nhất của pipeline —
-> nạp hỏng thì báo cáo ghi N/A và chấm các model còn lại, thay vì giết cả lần
-> chạy đã tốn nhiều giờ GPU.
+> Phi-3.5-vision từng ở đây một thời gian, đã **bỏ**: nó chạy bằng remote code
+> ghim vào transformers 4.38 và liên tục vỡ theo những cách mới mỗi khi chạm vào
+> (`get_max_length` bị bỏ khỏi Cache, …). Vá từng cái một là đuổi theo một mục
+> tiêu di động; và nó cũng chỉ là một VLM đa dụng thứ ba, không thêm gì cho câu
+> hỏi chính. LLaVA-Med thì khác — nó là thứ duy nhất làm bảng này có nghĩa — nên
+> nó được trả giá đúng: một venv riêng, không phải vài bản vá.
 
 ### Vì sao là những lựa chọn đó
 
@@ -71,8 +72,8 @@ cặp thì nó tự triệt tiêu trong hiệu số `d_i = a_i − b_i`.
 Một bảng chỉ có p-value không trả lời được câu đầu. Với n = 3000, một Δ tí xíu
 vẫn dễ đạt p < 0.05 — nên báo cáo in cả CI lẫn effect size `Cohen dz`.
 
-**Hiệu chỉnh p-value.** 4 candidate → 6 cặp × 8 metric = **48 kiểm định**. Không
-hiệu chỉnh thì riêng ngẫu nhiên đã cho ~2.4 kết quả "có ý nghĩa" giả. Holm là kết luận chính
+**Hiệu chỉnh p-value.** 3 cặp × 8 metric = **24 kiểm định**. Không hiệu chỉnh
+thì riêng ngẫu nhiên đã cho ~1.2 kết quả "có ý nghĩa" giả. Holm là kết luận chính
 thức (kiểm soát xác suất có *dù chỉ một* dương tính giả); BH thoáng hơn, dùng
 để sàng hướng đi tiếp.
 
@@ -163,8 +164,7 @@ src/
   data.py                   TestSet 3k: split + text_gt + trích ảnh từ zip
   preflight.py              kiểm tương thích TRƯỚC khi nạp; dịch lỗi -> cách sửa
   prompts.py                prompt dùng chung
-  runners/{gemma3,qwen25vl,phi35v,llavamed}.py
-  compat.py                 trả lại API transformers đã bỏ, cho remote code cũ
+  runners/{gemma3,qwen25vl,llavamed}.py
   metrics.py                BLEU / ROUGE / BERTScore theo từng mẫu
   stats.py                  bootstrap BCa · permutation · Holm · BH
   tracking.py               vỏ bọc W&B (no-op sạch khi thiếu)
@@ -182,7 +182,7 @@ lên `RGExp123/Research_results/2.1_basemodel_comparison/`:
 predictions/<model_id>.jsonl     văn bản sinh ra, một dòng một ảnh
 metrics/per_sample_<model>.csv   điểm từng metric cho từng ảnh
 metrics/summary.csv              bảng điểm trung bình
-metrics/pairwise_tests.csv       48 kiểm định, đủ 4 cách hiệu chỉnh
+metrics/pairwise_tests.csv       24 kiểm định, đủ 4 cách hiệu chỉnh
 manifest.json                    config đã giải quyết + môi trường + thời gian
 REPORT.md                        báo cáo đọc được, có hướng dẫn đọc bảng
 ```
@@ -268,29 +268,19 @@ sai: *có compiler không đồng nghĩa với dịch được*. Nên bây giờ
 Tắt compile chỉ mất một phần tốc độ: đường eager vẫn dùng kernel hợp nhất của
 sdpa.
 
-### Remote code cũ gọi API transformers đã bị bỏ
+### Mã ngoài transformers: venv riêng, đừng vá
 
-Lỗi thật thứ ba, lại bị smoke-test chặn ngay ở ảnh đầu:
+Phi-3.5-vision chạy bằng remote code ghim vào transformers 4.38. Trên bản 4.52
+nó vỡ ở `'DynamicCache' object has no attribute 'get_max_length'`. Tôi đã thử vá
+lại các alias đã bị bỏ — vá được, và nó chạy — nhưng đó là đuổi theo một mục
+tiêu di động: mỗi bản transformers lại bỏ thêm một API, và mỗi lần như thế là
+một lần chạy nữa bị mất.
 
-```
-AttributeError: 'DynamicCache' object has no attribute 'get_max_length'
-```
-
-Phi-3.5-vision chạy bằng **remote code** ghim vào transformers 4.38.
-`prepare_inputs_for_generation` của nó gọi `past_key_values.get_max_length()`,
-mà bản 4.52 đã bỏ hẳn phương thức đó (đổi tên thành `get_max_cache_shape()`).
-
-Hạ transformers xuống bản còn API cũ là **không được** — Gemma 3 đòi ≥ 4.50, mà
-API này biến mất từ 4.49. Nên `src/compat.py` trả lại đúng những alias đã bị bỏ,
-với đúng ngữ nghĩa cũ, ngay trước khi nạp Phi. Ta không đổi hành vi của
-transformers hiện tại: mã mới **không còn gọi** những tên đó nữa, nên không có
-gì để xung đột.
-
-Kiểm chứng trên chính bản 4.52.4 đang chạy: `get_max_length` đã mất,
-`seen_tokens` vẫn còn — shim chỉ thêm cái thiếu, và idempotent.
-
-**Ranh giới:** nếu một ngày remote code cần nhiều hơn vài alias vô hại như thế
-này, câu trả lời đúng là venv cô lập (như LLaVA-Med), không phải vá thêm.
+Nguyên tắc rút ra, đã ghi vào README để lần sau không trượt lại: **mã viết cho
+một bản transformers khác thì cho nó bản đó**, trong một venv riêng, thay vì kéo
+thư viện hiện tại lùi lại bằng các bản vá. LLaVA-Med được đối xử đúng như vậy.
+Phi thì bị bỏ, vì nó không đáng cái giá đó — nó chỉ là một VLM đa dụng thứ ba,
+không thêm gì cho câu hỏi mà §2.1 đang hỏi.
 
 ### LLaVA-Med chạy ở một venv KHÁC
 
@@ -304,9 +294,27 @@ lại 2.5 GB), cài đè `transformers==4.37.2`, và chạy như **tiến trình
 JSONL đúng schema của ba runner kia. Khâu chấm điểm không biết sự sắp xếp này.
 `run.sh` đọc qua stdout của tiến trình con để tiến độ vẫn lên được W&B.
 
-Preflight kiểm thẳng thứ duy nhất quan trọng — venv đó `import llava` được hay
-không — mất ~2 giây, và bắt được ca hay gặp nhất: mạng chặn GitHub lúc setup nên
-package chưa bao giờ được cài.
+Ba chỗ dễ sai trong đường này, đều đã sửa theo **API thật của repo** chứ không
+theo phỏng đoán:
+
+- `load_pretrained_model` của LLaVA-Med là
+  `(model_path, model_base, model_name, load_8bit, load_4bit, device_map, device)`
+  — **không có `**kwargs` và không nhận `torch_dtype`**. Worker soi
+  `inspect.signature` rồi chỉ truyền những gì hàm thật sự nhận, nên bản LLaVA
+  khác (có `use_flash_attn`) cũng chạy được.
+- Builder **ép cứng `float16`** bên trong. Lấy dtype từ `--dtype` (bfloat16) là
+  đưa vào image tensor lệch kiểu → `RuntimeError` ở phép nhân đầu tiên của
+  vision tower, mà model thì "nạp xong bình thường". Worker lấy dtype từ chính
+  `model.parameters()`.
+- Preflight và `setup.sh` xác minh bằng **đúng những import worker dùng**
+  (`load_pretrained_model`, `conv_templates['mistral_instruct']`,
+  `process_images`, `tokenizer_image_token`), không phải `import llava` —
+  `llava/__init__.py` gần như rỗng nên phép kiểm đó cho cảm giác an toàn sai.
+
+Worker cũng có **ngắt mạch** riêng: ảnh đầu hỏng → thoát mã 4; ba ảnh liên tiếp
+hỏng → mã 5. Không có nó, một lỗi môi trường làm tiến trình con chạy hết 3000
+ảnh, ghi 3000 chuỗi rỗng, rồi thoát mã 0 — và bảng điểm có thêm một cột toàn số
+0 trông như kết quả thật.
 
 ### Cây thư mục trong zip ≠ `img_rel` trong CSV
 
@@ -356,7 +364,7 @@ thì các cặp lệch nhau và **mọi p-value đều vô nghĩa — mà không
 định**. Hạ `n_perm` để "chạy cho nhanh" là có thể làm cho **không kiểm định nào
 đạt được ý nghĩa**, dù khác biệt là thật — bảng vẫn in đủ số, cột kết luận toàn
 "không", và rất dễ đọc thành *"ba model tương đương"*. Cần
-`n_perm >= số_kiểm_định / alpha` (48 / 0.05 = 960). `src/stats.py` tự kiểm và in
+`n_perm >= số_kiểm_định / alpha` (24 / 0.05 = 480). `src/stats.py` tự kiểm và in
 cảnh báo vào cả console lẫn `REPORT.md` nếu vi phạm.
 
 ---
@@ -376,8 +384,9 @@ mục trong zip có dò đúng không, resume có sinh lại đúng phần thi�
 OOM có rơi về từng ảnh không, file JSONL bị cắt giữa dòng có được dọn không,
 **ngắt mạch có chặn được ca "3000 dòng rỗng rồi báo xong" không**, preflight có
 dịch đúng **bốn lỗi thật đã gặp** không (torch quá cũ · không có gcc · có gcc mà
-thiếu `Python.h` · remote code gọi API Cache đã bỏ), shim `compat` có idempotent
-và không phá gì không, phép **dịch thử** có nghiêm hơn `which gcc` không, ba nhánh
+thiếu `Python.h` · mã model gọi API Cache đã bỏ), preflight có thoát khác 0 khi
+**chỉ model optional** hỏng không (nếu không, `setup.sh` sẽ không bao giờ chạy và
+venv LLaVA-Med vĩnh viễn không được dựng), phép **dịch thử** có nghiêm hơn `which gcc` không, ba nhánh
 của `disable_compile` có đúng không, lưới `suppress_errors` có được giăng cả ở
 nhánh không tắt compile không, W&B tắt có thành no-op sạch không.
 
@@ -390,15 +399,13 @@ nhánh không tắt compile không, W&B tắt có thành no-op sạch không.
 | Tải ảnh (stream) | 10–25 phút, ~200 MB |
 | Gemma 3 4B, batch 4 | 25–60 phút |
 | Qwen2.5-VL 3B, batch 4 | 25–60 phút |
-| Phi-3.5-vision 4B, batch 1 | 60–110 phút |
 | LLaVA-Med 7B, batch 1 | 60–120 phút |
 | Chấm điểm (BERTScore) | 5–10 phút |
 | Kiểm định | < 1 phút |
 
-Trên một GPU 24 GB (L4 / 4090 / A10). VRAM tối thiểu ~20 GB vì LLaVA-Med 7B bf16
-riêng trọng số đã ~15 GB. Phi và LLaVA-Med chạy từng ảnh một vì processor của
-chúng không có đường gộp batch sạch; hạ `num_crops` của Phi (4 → 2) là cách
-nhanh nhất để rút thời gian nếu cần.
+Trên một GPU 24 GB (L4 / 4090 / A10). VRAM tối thiểu ~20 GB vì LLaVA-Med 7B
+fp16 riêng trọng số đã ~15 GB. LLaVA-Med chạy từng ảnh một vì builder của nó
+không có đường batch sạch.
 
 ## 8. Giới hạn của thí nghiệm này
 

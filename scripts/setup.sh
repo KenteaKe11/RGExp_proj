@@ -204,36 +204,79 @@ if "$PYBIN" -c "import sys; v=tuple(int(x) for x in '$TV'.split('.')[:2]); sys.e
 fi
 
 # ── 6. venv CÔ LẬP cho LLaVA-Med ────────────────────────────────────────────
+# Vì sao phải tách: microsoft/llava-med-v1.5-mistral-7b khai
+# model_type=llava_mistral — transformers không có kiến trúc đó, phải dùng
+# package `llava` của repo microsoft/LLaVA-Med, mà repo đó ghim transformers
+# 4.36 trong khi Gemma 3 đòi >= 4.50. Hai ràng buộc loại trừ nhau trong cùng
+# một sys.path, nên không có cách nào chạy chung.
+#
+# --system-site-packages: mượn torch (~2.5 GB) của môi trường ngoài, venv chỉ
+# chứa đúng những gói cần che bản của môi trường chính. site-packages của venv
+# đứng TRƯỚC system trong sys.path nên nó thắng.
 if [ "${INSTALL_LLAVAMED:-1}" = "1" ]; then
-    echo "→ dựng venv cô lập cho LLaVA-Med: $VENV_LLAVAMED"
+    echo "→ venv cô lập cho LLaVA-Med: $VENV_LLAVAMED"
     if [ ! -d "$VENV_LLAVAMED" ]; then
-        # --system-site-packages: mượn torch (~2.5 GB) của môi trường ngoài,
-        # chỉ cài đè những gói cần phiên bản khác.
         "$PYBIN" -m venv --system-site-packages "$VENV_LLAVAMED" \
-            || { echo "⚠ không dựng được venv LLaVA-Med — sẽ chấm 3 model"; INSTALL_LLAVAMED=0; }
+            || echo "⚠ không dựng được venv LLaVA-Med"
     fi
     LMPY="$(rgexp_llavamed_py)"
-    if [ -n "$LMPY" ]; then
-        # --ignore-installed: không có cờ này thì pip thấy transformers 4.52 ở
+    if [ -z "$LMPY" ]; then
+        echo "✗ không có python trong $VENV_LLAVAMED — LLaVA-Med sẽ báo N/A"
+    else
+        "$LMPY" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+
+        # --ignore-installed: thiếu cờ này thì pip thấy transformers 4.52 ở
         # system site-packages và coi như "đã thoả", venv không có bản 4.37 của
         # riêng nó, và llava vỡ ngay ở import.
-        "$LMPY" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
-        if "$LMPY" -m pip install -q --ignore-installed -r requirements-llavamed.txt; then
-            echo "✓ deps LLaVA-Med (transformers $("$LMPY" -c 'import transformers;print(transformers.__version__)' 2>/dev/null))"
-        else
-            echo "⚠ cài deps LLaVA-Med fail"
+        echo "  → deps (transformers 4.37 riêng cho venv này)..."
+        if ! "$LMPY" -m pip install --ignore-installed -q -r requirements-llavamed.txt; then
+            echo "  ⚠ cài deps fail — chạy lại KHÔNG im lặng để đọc lỗi:"
+            "$LMPY" -m pip install --ignore-installed -r requirements-llavamed.txt 2>&1 | tail -20
         fi
-        # Package `llava` chỉ có trên GitHub. --no-deps vì pyproject của nó ghim
-        # cả torch: để nó tự kéo là mất bản torch vừa khớp CUDA ở trên.
-        if "$LMPY" -c "import llava" >/dev/null 2>&1; then
-            echo "✓ package llava đã có"
-        elif "$LMPY" -m pip install -q --no-deps "git+https://github.com/microsoft/LLaVA-Med.git"; then
-            echo "✓ cài package llava từ GitHub"
+
+        # Package `llava` chỉ có trên GitHub (tên phân phối là `llava_med`,
+        # tên import là `llava`). --no-deps vì pyproject của nó ghim cả torch
+        # lẫn gradio/openai: để nó tự kéo là mất bản torch vừa khớp CUDA ở trên
+        # và tải thêm vài trăm MB không dùng tới.
+        if "$LMPY" -c "from llava.model.builder import load_pretrained_model" >/dev/null 2>&1; then
+            echo "  ✓ package llava đã có"
         else
-            echo "⚠ không cài được llava (mạng chặn GitHub?) — LLaVA-Med sẽ báo N/A"
+            echo "  → cài llava_med từ GitHub..."
+            if ! "$LMPY" -m pip install -q --no-deps \
+                    "git+https://github.com/microsoft/LLaVA-Med.git"; then
+                echo "  ⚠ cài từ GitHub fail — in lỗi thật:"
+                "$LMPY" -m pip install --no-deps \
+                    "git+https://github.com/microsoft/LLaVA-Med.git" 2>&1 | tail -15
+                echo "  Nếu mạng chặn GitHub, cài tay ở máy có mạng rồi copy vào:"
+                echo "      $LMPY -m pip install --no-deps git+https://github.com/microsoft/LLaVA-Med.git"
+            fi
         fi
-        "$LMPY" -c "import llava, transformers; print('✓ llava import OK, transformers', transformers.__version__)" 2>/dev/null \
-            || echo "⚠ llava chưa import được — pipeline vẫn chạy, LLaVA-Med báo N/A"
+
+        # XÁC MINH bằng ĐÚNG những thứ worker dùng, không phải `import llava`.
+        # `llava/__init__.py` gần như rỗng nên nó import được kể cả khi phần
+        # thân hỏng — một phép kiểm cho cảm giác an toàn sai.
+        "$LMPY" - <<'LMEOF' || echo "  ⚠ venv LLaVA-Med CHƯA dùng được — model này sẽ báo N/A"
+import inspect
+import sys
+
+try:
+    import transformers
+    from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX  # noqa: F401
+    from llava.conversation import conv_templates
+    from llava.mm_utils import (get_model_name_from_path, process_images,  # noqa: F401
+                                tokenizer_image_token)
+    from llava.model.builder import load_pretrained_model
+except Exception as e:
+    print(f"  ✗ import hỏng: {e!r}")
+    sys.exit(1)
+
+if "mistral_instruct" not in conv_templates:
+    print(f"  ✗ thiếu conv template 'mistral_instruct' (có: {sorted(conv_templates)[:6]}...)")
+    sys.exit(1)
+params = sorted(inspect.signature(load_pretrained_model).parameters)
+print(f"  ✓ llava OK · transformers {transformers.__version__}")
+print(f"    builder nhận: {params}")
+LMEOF
     fi
 else
     echo "⊘ bỏ qua LLaVA-Med (INSTALL_LLAVAMED=0)"

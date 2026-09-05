@@ -8,6 +8,11 @@ transformers 4.51). Hợp đồng với bên ngoài chỉ là hai file JSONL:
     --tasks  {"key", "image_path"}                        (đọc)
     --out    {"key","pred","model_id","latency_s","empty"} (ghi, nối thêm)
 
+Mã thoát: 0 xong · 2 thiếu torch/pillow · 3 chưa cài `llava` · 4 ảnh ĐẦU hỏng
+· 5 nhiều ảnh liên tiếp hỏng. Bốn và năm là ngắt mạch: dừng sớm còn hơn ghi
+3000 chuỗi rỗng rồi thoát mã 0 và để bảng điểm có thêm một cột số 0 trông như
+kết quả thật.
+
 Cùng schema với các runner khác, nên khâu chấm điểm không phải biết model này
 chạy ở đâu.
 """
@@ -74,17 +79,43 @@ def main() -> int:
         dtype = torch.float16
 
     model_name = get_model_name_from_path(a.model_path)
-    log(f"  nạp {a.model_path} (name={model_name}, dtype={dtype}) ...")
-    # load_pretrained_model của LLaVA nhận cờ 8bit/4bit; ta để nguyên bf16 vì
-    # lượng tử hoá làm thay đổi chính cái đang được đo (chất lượng sinh) và §2.1
-    # so ba model ở dạng đầy đủ.
+    log(f"  nạp {a.model_path} (name={model_name}) ...")
+
+    # CHỮ KÝ CỦA load_pretrained_model KHÁC NHAU GIỮA CÁC BẢN LLaVA.
+    # Bản của microsoft/LLaVA-Med là
+    #     (model_path, model_base, model_name, load_8bit=False, load_4bit=False,
+    #      device_map="auto", device="cuda")
+    # — KHÔNG có **kwargs và KHÔNG nhận `torch_dtype`. Truyền vào là TypeError
+    # ngay dòng nạp model. Bản LLaVA gốc mới hơn thì lại có cả `use_flash_attn`.
+    # Nên: soi chữ ký rồi chỉ truyền những gì hàm thật sự nhận, thay vì ghim
+    # theo một bản cụ thể rồi vỡ khi repo đổi.
+    import inspect
+
+    accepted = set(inspect.signature(load_pretrained_model).parameters)
+    kw = {}
+    for k, v in (("device_map", "auto"), ("load_8bit", False), ("load_4bit", False),
+                 ("use_flash_attn", False)):
+        if k in accepted:
+            kw[k] = v
+    # Lượng tử hoá bị TẮT có chủ ý: nó làm thay đổi đúng cái đang được đo (chất
+    # lượng sinh), mà §2.1 so các model ở dạng đầy đủ.
+    log(f"  chữ ký builder nhận: {sorted(accepted)}")
     tokenizer, model, image_processor, _ctx = load_pretrained_model(
-        model_path=a.model_path, model_base=None, model_name=model_name,
-        device_map="auto", torch_dtype=dtype,
-    )
+        model_path=a.model_path, model_base=None, model_name=model_name, **kw)
     model.eval()
+
     device = next(model.parameters()).device
-    log(f"  ✓ nạp xong trên {device}")
+    # dtype LẤY TỪ CHÍNH MODEL, không lấy từ --dtype: builder của LLaVA-Med ép
+    # cứng float16 bên trong và bỏ qua mọi ý muốn bên ngoài. Tin vào --dtype
+    # (bfloat16) là đưa vào image tensor lệch kiểu -> RuntimeError ở phép nhân
+    # ma trận đầu tiên của vision tower, một lỗi rất khó lần vì model "nạp xong
+    # bình thường".
+    model_dtype = next(model.parameters()).dtype
+    if model_dtype != dtype:
+        log(f"  ⚙ builder ép dtype={model_dtype} (bỏ qua --dtype {a.dtype}) "
+            f"-> ảnh cũng dùng {model_dtype}")
+    dtype = model_dtype
+    log(f"  ✓ nạp xong trên {device}, dtype={dtype}")
 
     if a.conv_mode not in conv_templates:
         alt = "mistral_instruct" if "mistral_instruct" in conv_templates else \
@@ -109,6 +140,8 @@ def main() -> int:
                 log(f"  ⚠ dọn dòng cuối bị cắt dở trong {out_path.name}")
     t0 = time.time()
     n_fail = 0
+    fail_streak = 0
+    limit = 3
 
     with open(out_path, "a", encoding="utf-8") as fout:
         for i, task in enumerate(tasks, 1):
@@ -147,11 +180,24 @@ def main() -> int:
                 for stop in (conv.sep, getattr(conv, "sep2", None)):
                     if stop and text.endswith(stop):
                         text = text[: -len(stop)].strip()
+                fail_streak = 0
             except Exception as e:
                 n_fail += 1
+                fail_streak += 1
                 log(f"    ✗ {task['key']}: {e!r}")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                # NGẮT MẠCH, y như ở môi trường chính. Không có nó, một lỗi môi
+                # trường (lệch dtype, thiếu kernel, prompt sai) làm tiến trình
+                # con chạy hết 3000 ảnh, ghi 3000 chuỗi rỗng, rồi thoát mã 0 —
+                # và bảng điểm có thêm một cột toàn số 0 trông như kết quả thật.
+                if i == 1:
+                    log("✗ ẢNH ĐẦU TIÊN đã hỏng — dừng ngay thay vì sinh 3000 "
+                        "chuỗi rỗng.")
+                    return 4
+                if fail_streak >= limit:
+                    log(f"✗ {limit} ảnh liên tiếp hỏng — dừng ({i}/{len(tasks)}).")
+                    return 5
 
             fout.write(json.dumps({
                 "key": task["key"], "pred": text, "model_id": a.model_id,
