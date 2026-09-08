@@ -27,6 +27,28 @@ cd "$ROOT"
 # shellcheck disable=SC1091
 [ -f "$ROOT/scripts/_env.sh" ] && source "$ROOT/scripts/_env.sh"
 
+# ── 0. Chọn python ──────────────────────────────────────────────────────────
+# `python` trần KHÔNG tồn tại trên phần lớn máy Linux hiện nay: Debian/Ubuntu
+# thôi tạo alias đó từ 20.04, chỉ còn `python3`. Script này trước gọi thẳng
+# `python`, nên nó chạy qua được phần kiểm token rồi mới chết ở bước kiểm môi
+# trường với "python: command not found" — đọc như lỗi cài đặt, trong khi
+# nguyên nhân chỉ là tên lệnh.
+#
+# _env.sh biết chọn đúng: kích hoạt .venv khi chạy cục bộ, hoặc dùng python của
+# image khi ở container thuê. `allow-missing` để lần chạy đầu (chưa có venv)
+# vẫn đi tiếp được tới bước cài đặt bên dưới thay vì dừng ngay.
+if command -v rgexp_activate_py >/dev/null 2>&1; then
+    rgexp_activate_py allow-missing || exit 1
+fi
+PYBIN="${PYBIN:-$(command -v python3 || command -v python)}"
+if [ -z "$PYBIN" ]; then
+    echo "✗ Không thấy python3 lẫn python trong PATH."
+    echo "  Container thuê: thử  RGEXP_REMOTE=1 bash scripts/run_adapters.sh"
+    echo "  Máy cục bộ    : cài python >= 3.10 rồi  bash scripts/setup.sh"
+    exit 1
+fi
+export PYBIN
+
 DETACH=0
 ARGS=()
 for arg in "$@"; do
@@ -83,7 +105,7 @@ fi
 # Kiểm bằng IMPORT THẬT chứ không bằng `pip show`: một venv cũ vẫn có metadata
 # của gói đã gỡ, và `pip show` cho qua.
 if [ "${RGEXP_SKIP_SETUP:-0}" != "1" ]; then
-    if ! python - <<'PY' 2>/dev/null
+    if ! "$PYBIN" - <<'PY' 2>/dev/null
 import sys, inspect
 import transformers, peft, torch
 from peft import LoraConfig
@@ -95,8 +117,8 @@ PY
         if [ -f "$ROOT/scripts/setup.sh" ] && [ ! -d "$ROOT/.venv" ]; then
             bash "$ROOT/scripts/setup.sh"
         fi
-        python -m pip install -q -r "$ROOT/requirements-adapters.txt"
-        python - <<'PY'
+        "$PYBIN" -m pip install -q -r "$ROOT/requirements-adapters.txt"
+        "$PYBIN" - <<'PY'
 import inspect
 from peft import LoraConfig
 import bitsandbytes, peft
@@ -113,7 +135,7 @@ fi
 # Friedman/Wilcoxon không ném exception, nó chỉ cho ra một bảng sai.
 if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
     echo "⚙ Tự kiểm chứng khâu thống kê ..."
-    python "$ROOT/scripts/selftest_friedman.py" || {
+    "$PYBIN" "$ROOT/scripts/selftest_friedman.py" || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU."
         echo "  Bỏ qua (không khuyến khích): RGEXP_SKIP_SELFTEST=1"
         exit 1
@@ -121,4 +143,4 @@ if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
 fi
 
 # ── 5. Chạy ─────────────────────────────────────────────────────────────────
-exec python -m src.run_adapters "${ARGS[@]+"${ARGS[@]}"}"
+exec "$PYBIN" -m src.run_adapters "${ARGS[@]+"${ARGS[@]}"}"
