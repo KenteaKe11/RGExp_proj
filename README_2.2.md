@@ -369,23 +369,35 @@ ghi base — ghi base tám lần là 64 GB cho đúng một model lặp lại t�
 
 ---
 
-## 9. Cấu trúc thêm vào
+## 9. Cấu trúc
+
+Repo đã được thu về ĐÚNG đường chạy này: §2.0/§2.1 (so sánh base model zero-shot
+trên Qwen2.5-VL · Phi-3.5-vision · LLaVA-Med) nằm trong `_archive/`, ngoài mọi
+đường import. Không còn model nào ngoài Gemma 3, và không còn nhánh code nào
+không phục vụ tám arm.
 
 ```
 configs/adapters.yaml           TOÀN BỘ tham số §2.2, có chú thích lý do
 requirements-adapters.txt       peft>=0.12 · bitsandbytes>=0.43 (sàn có chủ ý)
 scripts/
+  setup.sh                      dựng MỘT môi trường (không còn venv LLaVA-Med)
   run_adapters.sh               MỘT LỆNH chạy trọn §2.2
-  selftest_friedman.py          99 phép kiểm, không cần GPU/mạng/model
+  selftest_friedman.py          94 phép kiểm, không cần GPU/mạng/model
 src/
   stats_friedman.py             Friedman (ties) · Iman-Davenport · Kendall W
                                 Wilcoxon (Pratt) · căn khối · cổng hậu kiểm
+                                + holm/BH/cohen_dz/permutation nội tuyến
   data_train.py                 6400 mẫu train + hàng rào rò rỉ
   train.py                      8 arm · one-cycle · che nhãn · chọn target module
   runners/gemma3_adapter.py     base + adapter, GIỮ ĐÚNG quantization khi sinh
   report_adapters.py            REPORT.md + 4 bảng CSV
   run_adapters.py               điều phối 7 stage
+  config.py data.py metrics.py prompts.py push.py tracking.py preflight.py
+                                phần dùng chung, giữ nguyên từ §2.1
 ```
+
+`_archive/` không nằm trên đường import nào. Cách kiểm rẻ nhất là chạy selftest:
+nó import cả cây `src/` mà không cần GPU, mạng hay model.
 
 Kết quả cục bộ ở `runs/2.2_adapter_friedman/`, đẩy lên
 `RGExp123/Research_results/2.2_adapter_friedman/`:

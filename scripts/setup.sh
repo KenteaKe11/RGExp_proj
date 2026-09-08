@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# setup.sh — dựng môi trường cho §2.1. Chạy MỘT LẦN.
+# setup.sh — dựng môi trường cho §2.2. Chạy MỘT LẦN.
 #
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
 #     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
-#     INSTALL_LLAVAMED=0 bash scripts/setup.sh      # bỏ venv cô lập của LLaVA-Med
 #
-# Đây là thí nghiệm CHỈ INFER: không train, không LoRA, không quantization. Nên
-# không cài peft/bitsandbytes — chúng chỉ làm chậm setup và thêm chỗ để hỏng.
+# MỘT môi trường duy nhất: transformers 4.51/4.52 cho Gemma 3, cộng
+# peft + bitsandbytes cho tám biến thể adapter (requirements-adapters.txt —
+# scripts/run_adapters.sh tự cài phần đó nếu thiếu).
 #
-# HAI môi trường được dựng:
-#   1. CHÍNH          — transformers 4.51/4.52: Gemma 3, Qwen2.5-VL, Phi-3.5-vision
-#   2. .venv-llavamed — transformers 4.37 + package `llava` của microsoft.
-#      Dựng bằng --system-site-packages nên KHÔNG tải lại torch (~2.5 GB): venv
-#      chỉ chứa đúng những gói cần che bản của môi trường chính, và
-#      site-packages của venv đứng TRƯỚC system trong sys.path nên nó thắng.
-#      Bỏ qua nó:  INSTALL_LLAVAMED=0 bash scripts/setup.sh
+# Repo này chỉ còn §2.2. Các model không phải Gemma (Qwen2.5-VL, LLaVA-Med,
+# Phi-3.5-vision) và toàn bộ đường chạy zero-shot của §2.0/§2.1 nằm trong
+# _archive/ — chúng cần transformers 4.36/4.37 trong một venv cô lập, và giữ
+# lại phần dựng venv đó ở đây nghĩa là mỗi lần setup phải trả ~10 phút cho một
+# thứ không lần chạy nào dùng tới.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -26,7 +24,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.1 So sánh BaseModel — setup ═══"
+echo "═══ §2.2 Tám biến thể adapter — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -180,7 +178,7 @@ else
 fi
 
 # ── 5. requirements ─────────────────────────────────────────────────────────
-for f in requirements.txt configs/baseline.yaml src/run_all.py; do
+for f in requirements.txt configs/adapters.yaml src/run_adapters.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
 echo "→ cài requirements.txt..."
@@ -201,85 +199,6 @@ if "$PYBIN" -c "import sys; v=tuple(int(x) for x in '$TV'.split('.')[:2]); sys.e
         echo "✓ torch $TV < 2.6 — không sao: transformers đã ghim < 4.53 (xem"
         echo "  requirements.txt). Muốn nâng torch: RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh"
     fi
-fi
-
-# ── 6. venv CÔ LẬP cho LLaVA-Med ────────────────────────────────────────────
-# Vì sao phải tách: microsoft/llava-med-v1.5-mistral-7b khai
-# model_type=llava_mistral — transformers không có kiến trúc đó, phải dùng
-# package `llava` của repo microsoft/LLaVA-Med, mà repo đó ghim transformers
-# 4.36 trong khi Gemma 3 đòi >= 4.50. Hai ràng buộc loại trừ nhau trong cùng
-# một sys.path, nên không có cách nào chạy chung.
-#
-# --system-site-packages: mượn torch (~2.5 GB) của môi trường ngoài, venv chỉ
-# chứa đúng những gói cần che bản của môi trường chính. site-packages của venv
-# đứng TRƯỚC system trong sys.path nên nó thắng.
-if [ "${INSTALL_LLAVAMED:-1}" = "1" ]; then
-    echo "→ venv cô lập cho LLaVA-Med: $VENV_LLAVAMED"
-    if [ ! -d "$VENV_LLAVAMED" ]; then
-        "$PYBIN" -m venv --system-site-packages "$VENV_LLAVAMED" \
-            || echo "⚠ không dựng được venv LLaVA-Med"
-    fi
-    LMPY="$(rgexp_llavamed_py)"
-    if [ -z "$LMPY" ]; then
-        echo "✗ không có python trong $VENV_LLAVAMED — LLaVA-Med sẽ báo N/A"
-    else
-        "$LMPY" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
-
-        # --ignore-installed: thiếu cờ này thì pip thấy transformers 4.52 ở
-        # system site-packages và coi như "đã thoả", venv không có bản 4.37 của
-        # riêng nó, và llava vỡ ngay ở import.
-        echo "  → deps (transformers 4.37 riêng cho venv này)..."
-        if ! "$LMPY" -m pip install --ignore-installed -q -r requirements-llavamed.txt; then
-            echo "  ⚠ cài deps fail — chạy lại KHÔNG im lặng để đọc lỗi:"
-            "$LMPY" -m pip install --ignore-installed -r requirements-llavamed.txt 2>&1 | tail -20
-        fi
-
-        # Package `llava` chỉ có trên GitHub (tên phân phối là `llava_med`,
-        # tên import là `llava`). --no-deps vì pyproject của nó ghim cả torch
-        # lẫn gradio/openai: để nó tự kéo là mất bản torch vừa khớp CUDA ở trên
-        # và tải thêm vài trăm MB không dùng tới.
-        if "$LMPY" -c "from llava.model.builder import load_pretrained_model" >/dev/null 2>&1; then
-            echo "  ✓ package llava đã có"
-        else
-            echo "  → cài llava_med từ GitHub..."
-            if ! "$LMPY" -m pip install -q --no-deps \
-                    "git+https://github.com/microsoft/LLaVA-Med.git"; then
-                echo "  ⚠ cài từ GitHub fail — in lỗi thật:"
-                "$LMPY" -m pip install --no-deps \
-                    "git+https://github.com/microsoft/LLaVA-Med.git" 2>&1 | tail -15
-                echo "  Nếu mạng chặn GitHub, cài tay ở máy có mạng rồi copy vào:"
-                echo "      $LMPY -m pip install --no-deps git+https://github.com/microsoft/LLaVA-Med.git"
-            fi
-        fi
-
-        # XÁC MINH bằng ĐÚNG những thứ worker dùng, không phải `import llava`.
-        # `llava/__init__.py` gần như rỗng nên nó import được kể cả khi phần
-        # thân hỏng — một phép kiểm cho cảm giác an toàn sai.
-        "$LMPY" - <<'LMEOF' || echo "  ⚠ venv LLaVA-Med CHƯA dùng được — model này sẽ báo N/A"
-import inspect
-import sys
-
-try:
-    import transformers
-    from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX  # noqa: F401
-    from llava.conversation import conv_templates
-    from llava.mm_utils import (get_model_name_from_path, process_images,  # noqa: F401
-                                tokenizer_image_token)
-    from llava.model.builder import load_pretrained_model
-except Exception as e:
-    print(f"  ✗ import hỏng: {e!r}")
-    sys.exit(1)
-
-if "mistral_instruct" not in conv_templates:
-    print(f"  ✗ thiếu conv template 'mistral_instruct' (có: {sorted(conv_templates)[:6]}...)")
-    sys.exit(1)
-params = sorted(inspect.signature(load_pretrained_model).parameters)
-print(f"  ✓ llava OK · transformers {transformers.__version__}")
-print(f"    builder nhận: {params}")
-LMEOF
-    fi
-else
-    echo "⊘ bỏ qua LLaVA-Med (INSTALL_LLAVAMED=0)"
 fi
 
 # ── 7. Nạp trước model chấm BERTScore ───────────────────────────────────────
@@ -317,7 +236,7 @@ sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
     print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — hạ batch_size trong "
-          "configs/baseline.yaml nếu OOM.")
+          "configs/adapters.yaml nếu OOM.")
 PYEOF
 
 # DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn

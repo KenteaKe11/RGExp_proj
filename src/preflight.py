@@ -107,121 +107,6 @@ def env_versions() -> dict:
     return out
 
 
-def check(models: list[dict]) -> tuple[dict[str, str], list[str]]:
-    """Trả (lỗi chặn theo model_id, cảnh báo chung)."""
-    errors: dict[str, str] = {}
-    warns: list[str] = []
-    v = env_versions()
-
-    if not v.get("torch"):
-        return ({m["id"]: "chưa cài torch" for m in models}, ["✗ chưa cài torch"])
-    if not v.get("transformers"):
-        return ({m["id"]: "chưa cài transformers" for m in models}, ["✗ chưa cài transformers"])
-
-    tv, fv = _ver(v["torch"]), _ver(v["transformers"])
-    print(f"  torch {v['torch']} · transformers {v['transformers']} · "
-          f"cuda={v.get('cuda_available')} · bf16={v.get('bf16')}", flush=True)
-
-    if not v.get("cuda_available"):
-        warns.append("⚠ torch KHÔNG thấy GPU — sẽ chạy CPU, chậm tới mức không dùng được.")
-
-    for m in models:
-        kind = str(m.get("runner", "")).lower()
-        mid = m["id"]
-
-        if kind == "gemma3":
-            if fv < (4, 50):
-                errors[mid] = (f"Gemma 3 cần transformers >= 4.50, đang có {v['transformers']}.\n"
-                               "      pip install -U 'transformers>=4.51,<4.53'")
-            elif fv >= (4, 53) and tv < (2, 6):
-                # ĐÂY là lỗi đã đốt một lần chạy. transformers >= 4.53 dựng mask
-                # ảnh hai chiều của Gemma 3 bằng or_mask_function, và cái đó đòi
-                # torch >= 2.6. Hai cách sửa, cách rẻ để trước.
-                errors[mid] = (
-                    f"transformers {v['transformers']} dựng mask ảnh của Gemma 3 bằng "
-                    f"`or_mask_function`, cái đó đòi torch >= 2.6 — đang có {v['torch']}.\n"
-                    "    Cách RẺ (vài chục MB, giữ nguyên torch đã khớp CUDA):\n"
-                    "      pip install -U 'transformers>=4.51,<4.53'\n"
-                    "    Cách ĐẮT (~2.5 GB, nếu cần tính năng của transformers mới):\n"
-                    "      pip install -U torch torchvision --index-url "
-                    "https://download.pytorch.org/whl/cu124")
-
-        elif kind == "qwen25vl":
-            if fv < (4, 49):
-                errors[mid] = (f"Qwen2.5-VL cần transformers >= 4.49, đang có "
-                               f"{v['transformers']}.\n      pip install -U 'transformers>=4.51,<4.53'")
-
-        elif kind == "llavamed":
-            # Chạy ở venv KHÁC nên phiên bản của môi trường chính không nói lên
-            # gì. Kiểm thẳng cái duy nhất quan trọng: venv đó import được `llava`
-            # không. Mất ~2 giây, và nó bắt được ca hay gặp nhất — mạng chặn
-            # GitHub lúc setup nên package chưa bao giờ được cài.
-            err = _check_llavamed_venv(m)
-            if err:
-                errors[mid] = err
-
-
-    if any(str(m.get("runner", "")).lower() == "gemma3" for m in models):
-        ok, why = c_compiler_works()
-        if not ok:
-            # Cảnh báo chứ không chặn: Runner.configure_compile tắt compile và
-            # chạy eager. Vẫn phải nói ra, kèm ĐÚNG lý do dịch thử hỏng.
-            warns.append(
-                f"⚠ Không dịch được mã C ({why}). transformers tự bật "
-                "torch.compile cho\n    đường sinh của Gemma 3, và inductor cần "
-                "dịch mã nó sinh ra -> sẽ TẮT compile,\n    chạy eager (chậm hơn "
-                "chút, kết quả không đổi). Muốn giữ compile:\n"
-                "      apt-get install -y build-essential python3-dev")
-
-    if v.get("cuda_available") and not v.get("bf16"):
-        warns.append("⚠ GPU không có bf16: Gemma 3 sẽ chạy fp32 (chậm ~2-3×; fp16 tràn "
-                     "số ở layer 5), Qwen/Phi dùng fp16.")
-    return errors, warns
-
-
-def _check_llavamed_venv(mcfg: dict) -> str | None:
-    """venv cô lập của LLaVA-Med có import được `llava` không."""
-    import subprocess
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    venv = root / str(mcfg.get("venv", ".venv-llavamed"))
-    py = None
-    for cand in (venv / "bin" / "python", venv / "Scripts" / "python.exe"):
-        if cand.exists():
-            py = cand
-            break
-    if py is None:
-        return (f"chưa có venv {venv.name}.\n"
-                "      bash scripts/setup.sh        # dựng venv + cài llava\n"
-                "      (bỏ hẳn model này: --set models.3.enabled=false)")
-    # Kiểm bằng ĐÚNG những thứ worker dùng. `import llava` là phép kiểm quá yếu:
-    # llava/__init__.py gần như rỗng nên nó qua được kể cả khi phần thân hỏng —
-    # cho cảm giác an toàn sai rồi vỡ ở lần generate đầu.
-    probe = (
-        "import transformers;"
-        "from llava.model.builder import load_pretrained_model;"
-        "from llava.conversation import conv_templates;"
-        "from llava.mm_utils import process_images, tokenizer_image_token;"
-        "from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN;"
-        "assert 'mistral_instruct' in conv_templates, 'thiếu conv mistral_instruct';"
-        "print(transformers.__version__)"
-    )
-    try:
-        r = subprocess.run([str(py), "-c", probe], capture_output=True, timeout=180)
-    except Exception as e:
-        return f"không chạy được python của venv: {e!r}"
-    if r.returncode != 0:
-        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
-        detail = err[-1] if err else f"exit {r.returncode}"
-        return (f"venv {venv.name} chưa dùng được: {detail}\n"
-                f"      {py} -m pip install --no-deps "
-                "git+https://github.com/microsoft/LLaVA-Med.git")
-    tv = (r.stdout or b"").decode("utf-8", "replace").strip()
-    print(f"  ✓ venv LLaVA-Med OK (transformers {tv})", flush=True)
-    return None
-
-
 # ── Dịch lỗi lúc chạy ───────────────────────────────────────────────────────
 _RULES: list[tuple[str, str]] = [
     (r"or_mask_function|and_mask_function",
@@ -242,7 +127,7 @@ _RULES: list[tuple[str, str]] = [
      "      Hoặc bỏ hẳn compile (kết quả không đổi, chỉ chậm hơn chút):\n"
      "        --set models.0.disable_compile=true"),
     (r"out of memory|CUDA out of memory",
-     "hết VRAM. Hạ batch_size của model này trong configs/baseline.yaml,\n"
+     "hết VRAM. Hạ batch_size của model này trong configs/adapters.yaml,\n"
      "      hoặc với Phi thì hạ num_crops (4 -> 2)."),
     (r"trust_remote_code",
      "model dùng kiến trúc ngoài transformers; runner phải truyền "
@@ -267,43 +152,3 @@ def diagnose(exc: BaseException) -> str | None:
     return None
 
 
-def main() -> int:
-    """`python -m src.preflight` — kiểm rồi thoát. Dùng trong scripts/run.sh."""
-    import argparse
-
-    from .config import add_common_args, enabled_models, load_config
-
-    ap = argparse.ArgumentParser(description="Kiểm tương thích môi trường rồi thoát.")
-    add_common_args(ap)
-    a = ap.parse_args()
-    models = [dict(m) for m in enabled_models(load_config(a.config, a.overrides))]
-    errors, warns = check(models)
-    for w in warns:
-        print(f"  {w}")
-    for mid, msg in errors.items():
-        print(f"  ✗ {mid}: {msg}")
-    blocking = [m["id"] for m in models
-                if m["id"] in errors and not m.get("optional", False)]
-    if not errors:
-        print("  ✓ mọi model tương thích với môi trường này")
-        return 0
-    # Thoát khác 0 kể cả khi chỉ model OPTIONAL hỏng.
-    #
-    # Bản trước chỉ tính model bắt buộc, và hệ quả là: venv của LLaVA-Med chưa
-    # được dựng -> preflight nói "ổn" -> scripts/run.sh kết luận môi trường đủ
-    # -> setup.sh KHÔNG BAO GIỜ chạy -> model đó vắng mặt trong mọi lần chạy,
-    # với một dòng nhắc "chạy setup.sh" mà không ai bị buộc phải làm.
-    # setup.sh là thứ sửa được đúng những lỗi này, và nó idempotent, nên để
-    # run.sh gọi nó là đúng.
-    if blocking:
-        print(f"  ✗ model BẮT BUỘC không chạy được: {', '.join(blocking)}")
-    else:
-        print("  ⚠ chỉ model tuỳ chọn bị ảnh hưởng — scripts/run.sh sẽ chạy "
-              "setup.sh để sửa")
-    return 1
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())

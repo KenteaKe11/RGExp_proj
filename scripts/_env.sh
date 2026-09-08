@@ -47,11 +47,7 @@ else
 fi
 VENV="${VENV_DIR:-$RGEXP_ROOT/.venv}"
 
-# venv CÔ LẬP cho LLaVA-Med. Luôn là venv thật, kể cả ở container: cả điểm của
-# nó là có transformers 4.37 riêng, không đụng bản 4.52 của môi trường chính
-# (Gemma 3 đòi >= 4.50, LLaVA-Med ghim 4.36 — hai ràng buộc loại trừ nhau).
-VENV_LLAVAMED="${VENV_LLAVAMED:-$RGEXP_ROOT/.venv-llavamed}"
-export VENV VENV_LLAVAMED USE_VENV
+export VENV USE_VENV
 
 # ── Volume: cache HF phải nằm ngoài lớp ghi của container ───────────────────
 # huggingface_hub đọc HF_HOME ĐÚNG MỘT LẦN lúc import, nên phải export TRƯỚC
@@ -103,17 +99,6 @@ rgexp_activate_py() {
     fi
     export PYBIN
     return 0
-}
-
-# Đường dẫn tới python của venv LLaVA-Med (rỗng nếu chưa dựng).
-rgexp_llavamed_py() {
-    if [ -x "$VENV_LLAVAMED/bin/python" ]; then
-        printf '%s' "$VENV_LLAVAMED/bin/python"
-    elif [ -x "$VENV_LLAVAMED/Scripts/python.exe" ]; then
-        printf '%s' "$VENV_LLAVAMED/Scripts/python.exe"
-    else
-        printf ''
-    fi
 }
 
 rgexp_banner() {

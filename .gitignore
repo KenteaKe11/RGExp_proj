@@ -6,3 +6,7 @@ runs/
 data/
 logs/
 .DS_Store
+# 8 adapter đã huấn luyện, 20-80 MB mỗi cái — thuộc repo model, không phải repo code
+adapters/
+adapters_dryrun/
+wandb/

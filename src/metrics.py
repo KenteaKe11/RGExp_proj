@@ -1,8 +1,8 @@
 """BLEU / ROUGE / BERTScore — tính Ở MỨC TỪNG MẪU.
 
-Vì sao từng mẫu chứ không phải corpus-level: hai kiểm định ở src/stats.py đều
-là kiểm định GHÉP CẶP, và chúng cần một vector điểm theo ảnh để lấy lại mẫu
-(bootstrap) hoặc đảo dấu (permutation). Một con số corpus BLEU duy nhất không
+Vì sao từng mẫu chứ không phải corpus-level: Friedman ở src/stats_friedman.py
+xếp hạng tám arm TRONG TỪNG ẢNH, và hậu kiểm Wilcoxon là kiểm định ghép cặp —
+cả hai đều cần một vector điểm theo ảnh. Một con số corpus BLEU duy nhất không
 cho biết gì về phương sai, nên không kiểm định được.
 
 Corpus BLEU vẫn được tính thêm và ghi vào báo cáo, nhưng chỉ để đối chiếu với

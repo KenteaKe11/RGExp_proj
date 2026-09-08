@@ -1,7 +1,8 @@
-"""Nạp và giải quyết cấu hình §2.1.
+"""Nạp và giải quyết cấu hình §2.2.
 
-Một file YAML duy nhất (configs/baseline.yaml). Không có kế thừa nhiều tầng:
-thí nghiệm này chỉ có một cấu hình, thêm tầng chỉ để giấu giá trị thật đi.
+Một file YAML duy nhất (configs/adapters.yaml). Không có kế thừa nhiều tầng:
+repo này chỉ chạy một thí nghiệm — tám biến thể adapter trên Gemma 3 — nên
+thêm tầng chỉ để giấu giá trị thật đi.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "baseline.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "adapters.yaml"
 
 
 class Cfg(dict):
@@ -82,10 +83,6 @@ def load_config(path: str | Path | None = None, overrides: list[str] | None = No
     cfg = Cfg(raw)
     cfg["_config_path"] = str(path)
     return cfg
-
-
-def enabled_models(cfg: Cfg) -> list[Cfg]:
-    return [Cfg(m) for m in cfg["models"] if m.get("enabled", True)]
 
 
 def hf_token() -> str | None:

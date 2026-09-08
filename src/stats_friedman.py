@@ -53,7 +53,74 @@ import math
 import numpy as np
 import pandas as pd
 
-from .stats import benjamini_hochberg, cohen_dz, holm, permutation_paired
+
+# ── Bốn hàm dùng chung, nội tuyến tại đây ───────────────────────────────────
+# Trước đây chúng nằm ở src/stats.py cùng bộ bootstrap/BCa của §2.1. §2.2 chỉ
+# cần đúng bốn hàm này, và giữ nguyên một module 300 dòng chỉ để import bốn
+# hàm là giữ lại một đường phụ thuộc vào phần đã bỏ. Nguyên văn, không sửa —
+# selftest đối chiếu holm/BH với scipy nên mọi thay đổi ở đây sẽ lộ ra ngay.
+# ── Permutation ghép cặp (sign-flip) ───────────────────────────────────────
+def permutation_paired(d: np.ndarray, n_perm: int, rng: np.random.Generator,
+                       chunk: int = 2000) -> dict:
+    d = np.asarray(d, dtype=np.float64)
+    n = d.size
+    obs = float(d.mean())
+    if n < 2:
+        return {"p_perm": float("nan"), "n_perm": n_perm}
+
+    count = 0
+    done = 0
+    target = abs(obs)
+    while done < n_perm:
+        m = min(chunk, n_perm - done)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(m, n))
+        null = (signs * d).mean(axis=1)
+        count += int(np.count_nonzero(np.abs(null) >= target - 1e-15))
+        done += m
+    # +1 ở tử và mẫu: ước lượng Monte-Carlo không thiên lệch và KHÔNG BAO GIỜ
+    # ra p = 0. "p = 0" là một khẳng định không thể rút ra từ 10000 lần lấy mẫu;
+    # cận đúng là 1/(B+1).
+    p = (count + 1) / (n_perm + 1)
+    return {"p_perm": float(min(1.0, p)), "n_perm": n_perm}
+
+
+def cohen_dz(d: np.ndarray) -> float:
+    """Effect size cho dữ liệu ghép cặp: trung bình hiệu số / độ lệch chuẩn."""
+    d = np.asarray(d, dtype=np.float64)
+    sd = d.std(ddof=1)
+    return float(d.mean() / sd) if sd > 0 else float("nan")
+
+
+# ── Hiệu chỉnh bội kiểm định ───────────────────────────────────────────────
+def holm(pvals: np.ndarray) -> np.ndarray:
+    """Holm-Bonferroni — kiểm soát FWER (xác suất có DÙ CHỈ MỘT dương tính giả)."""
+    p = np.asarray(pvals, dtype=np.float64)
+    m = p.size
+    order = np.argsort(p)
+    adj = np.empty(m, dtype=np.float64)
+    running = 0.0
+    for rank, i in enumerate(order):
+        val = (m - rank) * p[i]
+        running = max(running, val)      # ép đơn điệu không giảm
+        adj[i] = min(1.0, running)
+    return adj
+
+
+def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
+    """BH — kiểm soát FDR (tỉ lệ dương tính giả TRONG SỐ các kết quả đã báo)."""
+    p = np.asarray(pvals, dtype=np.float64)
+    m = p.size
+    order = np.argsort(p)
+    adj = np.empty(m, dtype=np.float64)
+    running = 1.0
+    for rank in range(m - 1, -1, -1):
+        i = order[rank]
+        val = p[i] * m / (rank + 1)
+        running = min(running, val)      # ép đơn điệu không tăng khi đi ngược
+        adj[i] = min(1.0, running)
+    return adj
+
+# ────────────────────────────────────────────────────────────────────────────
 
 
 # ── Phân phối tra p ─────────────────────────────────────────────────────────
