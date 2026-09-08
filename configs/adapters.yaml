@@ -1,0 +1,267 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.2 — TÁM BIẾN THỂ ADAPTER, KIỂM ĐỊNH FRIEDMAN
+#
+# Câu hỏi: với CÙNG một base model, CÙNG 6400 mẫu huấn luyện, CÙNG lịch học
+# one-cycle và CÙNG mọi siêu tham số khác — bốn cách gắn adapter (LoRA, QLoRA,
+# DoRA, QDoRA) ở hai mức rank (8, 16) có cho kết quả khác nhau không, và nếu
+# có thì cặp nào khác cặp nào?
+#
+# Thiết kế: 8 arm × CÙNG 3000 ảnh test của §2.1 -> mỗi ảnh là một KHỐI, trong
+# khối đó tám biến thể được xếp hạng. Đó là thiết kế khối đầy đủ, và kiểm định
+# tổng thể đúng cho nó là FRIEDMAN (xem src/stats_friedman.py để biết vì sao
+# không phải ANOVA lặp lại).
+#
+# Ghi đè từ dòng lệnh:  --set train.per_device_batch_size=2
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+# ── Dữ liệu ─────────────────────────────────────────────────────────────────
+# TẬP TEST KHOÁ CỨNG, y hệt §2.1. Đây là điều kiện để bảng §2.2 so được với
+# bảng §2.1: nếu tập chấm đổi, mọi so sánh chéo giữa các mục §2.x mất nghĩa.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 768
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+
+  # ── Tập HUẤN LUYỆN ────────────────────────────────────────────────────────
+  # 6400 key ĐẦU của split_ref/train_split.csv (152917 dòng, seed 42 đã chốt).
+  # Lấy từ đầu chứ không lấy ngẫu nhiên: thứ tự trong file là cố định, nên
+  # "6400 mẫu đầu" là một tập tái lập được mà không cần mang theo seed thứ hai.
+  #
+  # 6400 chia hết cho 8, 16, 32, 64 — nên mọi tổ hợp (batch × grad_accum) hợp
+  # lý đều cho số bước NGUYÊN, và lịch one-cycle kết thúc đúng ở đáy chứ không
+  # bị cắt ngang giữa nhánh giảm.
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  # Validation chỉ để NHÌN đường loss, không để chọn checkpoint. Chọn
+  # checkpoint theo val sẽ biến "tám biến thể huấn luyện như nhau" thành "tám
+  # biến thể được chọn điểm dừng khác nhau" — thêm một biến vào thí nghiệm mà
+  # kiểm định bên dưới không tách ra được. 0 = tắt hẳn.
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  # Chặn rò rỉ: giao giữa tập train và tập test PHẢI rỗng. Kiểm ở stage `data`
+  # và DỪNG nếu vi phạm — một mẫu test lọt vào train thì mọi con số §2.2 đều
+  # vô nghĩa, và triệu chứng lại là "điểm cao bất thường", rất dễ mừng nhầm.
+  assert_no_leak: true
+
+# ── Base model: MỘT, và giữ nguyên cho cả tám arm ───────────────────────────
+# Mọi arm gắn adapter lên đúng bản này. Đổi base giữa các arm là đổi mất biến
+# độc lập của thí nghiệm.
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_adapter
+  dtype: bfloat16
+  # Google khuyến nghị eager cho đường HUẤN LUYỆN của họ Gemma; sdpa cho đường
+  # SINH. Hai chỗ này tách riêng có chủ ý.
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 4          # batch lúc SINH (không phải lúc train)
+
+# ── Prompt: y hệt §2.1 ──────────────────────────────────────────────────────
+# Dùng lại nguyên văn. Nếu §2.2 đổi prompt thì con số của nó không so được với
+# mốc nền zero-shot ở §2.1, và cả hai mục cùng mất giá trị.
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  repetition_penalty: 1.0
+
+# ── Huấn luyện: MỘT cấu hình, dùng chung cho cả tám arm ─────────────────────
+train:
+  n_epochs: 1                    # 6400 mẫu × 1 vòng = "train qua 6400 mẫu"
+  per_device_batch_size: 1       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
+  grad_accum: 8                  # batch hiệu dụng 8 -> 6400/8 = 800 bước
+  max_seq_len: 640               # prompt + báo cáo; dài hơn thì cắt phần ĐUÔI
+  gradient_checkpointing: true
+  optimizer: adamw_torch
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_adapter_only: true        # chỉ ghi adapter (~20-80 MB), không ghi base
+
+  # ── Lịch học ONE-CYCLE ────────────────────────────────────────────────────
+  # Một chu kỳ: warmup tuyến tính tới max_lr trong pct_start đầu, rồi cosine
+  # xuống max_lr/(div_factor·final_div_factor). Đúng đường cong của torch
+  # OneCycleLR.
+  #
+  # Vì sao KHÔNG gọi thẳng torch.optim.lr_scheduler.OneCycleLR: nó ném
+  # ValueError khi bị step nhiều hơn total_steps, và số bước THẬT của HF
+  # Trainer phụ thuộc vào cách nó làm tròn len(dataloader)/grad_accum — công
+  # thức đó đã đổi giữa các bản transformers. Một lần chạy huấn luyện tám arm
+  # mà chết ở arm cuối vì lệch ĐÚNG MỘT bước là ca hỏng đắt và hoàn toàn tránh
+  # được: `impl: lambda` dựng cùng đường cong bằng LambdaLR và kẹp phẳng nếu
+  # bị step quá. `impl: torch` để dùng lớp gốc khi muốn đối chiếu.
+  schedule:
+    impl: lambda                 # lambda | torch
+    max_lr: 2.0e-4
+    pct_start: 0.1               # 10% số bước đầu để warmup
+    div_factor: 25.0             # lr khởi đầu = max_lr / 25
+    final_div_factor: 100.0      # lr cuối    = lr khởi đầu / 100
+    anneal: cos                  # cos | linear
+    # torch OneCycleLR mặc định CÒN đảo cả momentum (beta1 của AdamW). Ở đây
+    # tắt: nó không phải thứ §2.2 hỏi, và bật lên thì tám arm cùng chịu một
+    # yếu tố nữa mà không ai kiểm soát.
+    cycle_momentum: false
+
+  # ── Adapter gắn vào ĐÂU ───────────────────────────────────────────────────
+  # CHỈ khối ngôn ngữ. Vision tower của Gemma 3 (SigLIP) cũng có module tên
+  # q_proj/k_proj/v_proj/o_proj, nên một danh sách target_modules theo TÊN sẽ
+  # âm thầm gắn adapter cả vào đó — và "LoRA rank 8" khi ấy là một model khác
+  # hẳn model mà cái tên gợi ra. src/train.py duyệt named_modules() và lọc theo
+  # tiền tố thật, rồi IN RA số module đã khớp; 0 module hoặc có module vision
+  # lọt vào thì nó dừng.
+  #
+  # BỐN MA TRẬN ATTENTION, đúng theo thiết kế §2.2: q_proj, k_proj, v_proj,
+  # o_proj của khối ngôn ngữ — không gắn vào MLP (gate/up/down_proj).
+  # Vì sao chốt ở bốn: chỗ gắn adapter là một BIẾN của thí nghiệm. Thêm ba ma
+  # trận MLP làm số tham số học tăng ~3×, và khi bảng Friedman nói "DoRA r=16
+  # hơn LoRA r=8" thì phần nào do phương pháp, phần nào do adapter được gắn vào
+  # nhiều chỗ hơn — không tách được. Bốn ma trận attention là mặt cắt mà §2.2
+  # tuyên bố đo, nên nó phải là mặt cắt thật sự được chạy.
+  # Muốn chạy thêm biến thể "attn + MLP" thì đó là một thí nghiệm KHÁC (đổi
+  # target_modules và ghi rõ trong báo cáo), không phải một giá trị mặc định.
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+
+  # ── alpha theo rank, KHÔNG cố định ────────────────────────────────────────
+  # Hệ số nhân của LoRA là alpha/r. Để alpha = 16 cho cả r = 8 và r = 16 thì hệ
+  # số nhân đi từ 2.0 xuống 1.0 — nghĩa là "so rank 8 với rank 16" thật ra là
+  # so ĐỒNG THỜI hai thứ: số chiều của adapter VÀ độ lớn của cập nhật. Kiểm
+  # định Friedman bên dưới không tách được hai yếu tố đó ra, và bảng kết quả sẽ
+  # được đọc thành "rank cao hơn thì tốt/tệ hơn" trong khi nguyên nhân có thể
+  # nằm hoàn toàn ở hệ số nhân.
+  #   proportional (mặc định) — alpha = alpha_ratio × r  -> hệ số nhân KHÔNG đổi
+  #   fixed                   — alpha = alpha_fixed      -> giữ thói quen phổ biến
+  # Đổi sang `fixed` thì được, nhưng REPORT.md sẽ ghi rõ rằng so sánh rank đã bị
+  # trộn với hệ số nhân.
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  # ── Lượng tử hoá 4-bit cho các arm chữ Q ──────────────────────────────────
+  # Dùng CHUNG một cấu hình cho QLoRA và QDoRA, nếu không thì "Q" ở hai arm
+  # nghĩa hai chuyện khác nhau.
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+# ── Tám arm ─────────────────────────────────────────────────────────────────
+# Chỉ hai thứ thay đổi giữa các arm: `method` và `rank`. Mọi thứ khác lấy từ
+# khối train ở trên. Đó là điều kiện để hiệu số quan sát được quy về hai yếu tố
+# đó chứ không về điều gì khác.
+#
+#   lora   — adapter thường, base bf16
+#   qlora  — adapter thường, base lượng tử 4-bit NF4
+#   dora   — adapter tách hướng/độ lớn (use_dora=True), base bf16
+#   qdora  — DoRA trên base lượng tử 4-bit
+arms:
+  - {id: lora_r8,   method: lora,  rank: 8,  name: "LoRA r=8",   enabled: true}
+  - {id: lora_r16,  method: lora,  rank: 16, name: "LoRA r=16",  enabled: true}
+  - {id: qlora_r8,  method: qlora, rank: 8,  name: "QLoRA r=8",  enabled: true}
+  - {id: qlora_r16, method: qlora, rank: 16, name: "QLoRA r=16", enabled: true}
+  - {id: dora_r8,   method: dora,  rank: 8,  name: "DoRA r=8",   enabled: true}
+  - {id: dora_r16,  method: dora,  rank: 16, name: "DoRA r=16",  enabled: true}
+  - {id: qdora_r8,  method: qdora, rank: 8,  name: "QDoRA r=8",  enabled: true}
+  - {id: qdora_r16, method: qdora, rank: 16, name: "QDoRA r=16", enabled: true}
+
+# ── Chấm điểm: y hệt §2.1 ───────────────────────────────────────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định ───────────────────────────────────────────────────────────────
+# HAI TẦNG, và tầng dưới bị CHẶN bởi tầng trên:
+#
+#   1. Friedman (tổng thể)   — 8 metric × 1 kiểm định = 8, hiệu chỉnh Holm.
+#      H0: tám biến thể có cùng phân phối hạng trong mỗi khối.
+#   2. Hậu kiểm (từng cặp)   — CHỈ trên metric đã bác H0 ở tầng 1.
+#      28 cặp mỗi metric, Wilcoxon ghép cặp, hiệu chỉnh Holm.
+#
+# Chạy thẳng 224 kiểm định cặp mà bỏ tầng 1 thì Holm chia sức cho cả những
+# metric vốn không có gì để tìm, và những khác biệt thật ở metric chính bị dìm
+# theo.
+stats:
+  alpha: 0.05
+  n_perm: 10000          # cho kiểm định permutation chạy song song (đối chiếu §2.1)
+  posthoc_permutation: true
+
+  # Cách xử cặp có hiệu số BẰNG 0 trong Wilcoxon. Xem docstring
+  # wilcoxon_signed_rank() — đây KHÔNG phải chi tiết vụn vặt ở bài này.
+  #   pratt  (mặc định) — giữ các cặp d = 0 khi xếp hạng
+  #   wilcox            — vứt chúng đi (mặc định của scipy)
+  # Hai adapter cùng base, cùng dữ liệu thường sinh ra văn bản GIỐNG HỆT nhau
+  # trên nhiều ảnh. Vứt các cặp đó là vứt đúng bằng chứng ủng hộ H0, và p tụt
+  # xuống một cách giả tạo.
+  zero_method: pratt
+
+  # ── Hai cái sàn, chống hai cách đọc sai ngược nhau ────────────────────────
+  # n = 3000 khối là RẤT lớn cho Friedman. Ở cỡ đó, kiểm định bác H0 với những
+  # khác biệt nhỏ tới mức không nói được gì về thực hành, và bảng in đầy dấu ✓.
+  #   kendall_w_floor — W dưới mức này thì REPORT.md ghi cảnh báo ngay cạnh
+  #                     kết luận, dù p nhỏ tới đâu.
+  #   rrb_floor       — |rank-biserial| dưới mức này thì cặp đó bị đánh dấu
+  #                     "không đáng kể", và cột kết luận chính thức
+  #                     `significant_and_material` KHÔNG tính nó là thắng.
+  kendall_w_floor: 0.05
+  rrb_floor: 0.10
+
+# ── Theo dõi ────────────────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  project: rgexp-adapters
+  entity: null
+  run_name: null
+  group: null
+  resume_same_run: false
+  mode: online
+  tags: [adapters, lora, dora, friedman, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.2_adapter_friedman"
+  adapter_dir: ./adapters      # nơi ghi 8 adapter đã huấn luyện

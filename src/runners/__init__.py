@@ -11,6 +11,10 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3 import Gemma3Runner
 
         return Gemma3Runner(cfg, mcfg, tracker)
+    if kind == "gemma3_adapter":
+        from .gemma3_adapter import Gemma3AdapterRunner
+
+        return Gemma3AdapterRunner(cfg, mcfg, tracker)
     if kind == "qwen25vl":
         from .qwen25vl import Qwen25VLRunner
 

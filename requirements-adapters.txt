@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# §2.2 Tám biến thể adapter — thêm vào requirements.txt của §2.1
+#
+#     pip install -r requirements.txt -r requirements-adapters.txt
+#
+# torch KHÔNG nằm ở đây, vì lý do y hệt requirements.txt: bản torch phụ thuộc
+# CUDA của máy và scripts/setup.sh lo việc đó.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── SÀN 0.12 LÀ CÓ CHỦ Ý ────────────────────────────────────────────────────
+# `use_dora` xuất hiện từ peft 0.10 nhưng DoRA trên base LƯỢNG TỬ (arm qdora)
+# chỉ chạy đúng từ 0.12. Bản cũ hơn là ca hỏng ÂM THẦM tệ nhất trong §2.2:
+# LoraConfig bỏ qua tham số nó không hiểu, nên bốn arm DoRA/QDoRA trở thành bốn
+# arm LoRA/QLoRA mang tên khác. Bảng Friedman vẫn chạy, vẫn ra số, và kết luận
+# "DoRA không khác gì LoRA" là hệ quả của phiên bản thư viện chứ không của dữ
+# liệu. src/train.py:preflight_adapters() kiểm điều này trước khi nạp model.
+peft>=0.12.0
+
+# Lượng tử NF4 4-bit cho hai arm chữ Q. 0.43 là bản đầu tiên có wheel dựng sẵn
+# cho CUDA 12.x — bản cũ hơn phải biên dịch tại chỗ và hỏng đúng cách mà
+# preflight của §2.1 đã gặp (thiếu trình biên dịch C trên ảnh runtime).
+bitsandbytes>=0.43.0
+
+# Trainer + tích luỹ gradient + gradient checkpointing.
+# (accelerate đã có trong requirements.txt; ghi lại sàn cho rõ.)
+accelerate>=0.34.0
+
+# Tuỳ chọn: đọc dataset nhanh hơn nếu về sau đổi sang datasets.Dataset.
+# datasets>=2.20.0
