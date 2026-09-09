@@ -562,6 +562,77 @@ def quant_config(tcfg: dict):
         bnb_4bit_compute_dtype=dt)
 
 
+def device_map_for(cfg: Cfg, for_training: bool):
+    """`device_map` đưa cho from_pretrained. MỘT thiết bị khi huấn luyện.
+
+    `device_map="auto"` là mặc định hợp lý cho khâu SINH: accelerate được phép
+    trải model ra nhiều GPU, hoặc đẩy bớt lớp sang CPU/đĩa, và hook của nó lo
+    phần chuyển qua lại.
+
+    Ở khâu HUẤN LUYỆN thì "auto" là một cái bẫy. accelerate chừa lại một phần
+    VRAM làm khoảng thở, nên trên card vừa đủ nó đẩy vài lớp sang CPU/disk. Với
+    low_cpu_mem_usage (bật ngầm khi có device_map), những lớp ấy nằm trên
+    **meta** — tensor không có dữ liệu. Rồi peft gắn adapter cạnh chúng và
+    Trainer gọi `model.to(device)`, và cái nổ ra là:
+
+        NotImplementedError: Cannot copy out of meta tensor; no data!
+        Please use torch.nn.Module.to_empty() ...
+
+    Một thông báo không nhắc gì tới VRAM lẫn device_map, nên rất dễ đi sửa nhầm
+    chỗ. Ngay cả khi nó KHÔNG nổ, offload sang CPU giữa lúc huấn luyện làm mỗi
+    bước chậm hàng chục lần — tám arm sẽ không bao giờ chạy xong.
+
+    Nên đường train ghim thẳng vào một thiết bị: hết VRAM thì báo OOM ở đúng
+    chỗ, và thang dò batch xử lý được. `base.device_map_train: auto` để quay lại
+    hành vi cũ khi thật sự có nhiều GPU và biết mình đang làm gì.
+    """
+    import torch
+
+    if not for_training:
+        return str((cfg.get("base", {}) or {}).get("device_map_infer", "auto"))
+    want = str((cfg.get("base", {}) or {}).get("device_map_train", "single")).lower()
+    if want == "auto":
+        return "auto"
+    idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    return {"": idx}
+
+
+def assert_materialized(model, device_map) -> None:
+    """Không tham số nào được ở trên `meta`, và không lớp nào bị đẩy sang CPU/đĩa.
+
+    Kiểm NGAY sau khi nạp, chứ không đợi Trainer. Cùng một nguyên nhân, nhưng
+    lỗi của Trainer nói về `to_empty()` còn thông báo ở đây nói về VRAM và
+    device_map — tức là nói về thứ thật sự phải sửa.
+    """
+    meta = [n for n, p in model.named_parameters() if getattr(p, "is_meta", False)]
+    meta += [n for n, bfr in model.named_buffers() if getattr(bfr, "is_meta", False)]
+    dmap = getattr(model, "hf_device_map", None) or {}
+    offloaded = sorted({str(v) for v in dmap.values()
+                        if str(v).lower() in ("cpu", "disk", "meta")})
+    if not meta and not offloaded:
+        if dmap:
+            print(f"  thiết bị: {sorted({str(v) for v in dmap.values()})}", flush=True)
+        return
+    raise TrainUnusable(
+        f"model nạp xong nhưng CHƯA nằm trọn trên GPU "
+        f"(device_map={device_map!r}).\n"
+        + (f"    {len(meta)} tham số còn trên `meta` (không có dữ liệu), ví dụ: "
+           f"{meta[:3]}\n" if meta else "")
+        + (f"    lớp bị đẩy sang: {offloaded}\n" if offloaded else "")
+        + "    Huấn luyện trong trạng thái này hoặc nổ ở Trainer với "
+          "'Cannot copy out of meta tensor', hoặc chạy chậm hàng chục lần vì "
+          "mỗi bước phải kéo trọng số qua PCIe.\n"
+          "    Nguyên nhân gần như luôn là KHÔNG ĐỦ VRAM cho trọng số nền:\n"
+          "      · arm lora/dora  — Gemma 3 4B ở bf16 cần ~9 GB chỉ để chứa base\n"
+          "      · arm qlora/qdora — ~4 GB (4-bit), nhẹ hơn nhiều\n"
+          "    Cách xử, theo thứ tự:\n"
+          "      1. Card < 16 GB: chạy trước bốn arm chữ Q\n"
+          "         --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16\n"
+          "      2. Bảo đảm không tiến trình nào khác đang giữ VRAM (nvidia-smi)\n"
+          "      3. Thật sự có nhiều GPU: --set base.device_map_train=auto\n"
+          "         (chấp nhận model bị trải ra, và CHẬM)")
+
+
 def load_base(cfg: Cfg, method: str, for_training: bool = True):
     import torch
     from transformers import AutoProcessor, Gemma3ForConditionalGeneration
@@ -586,12 +657,12 @@ def load_base(cfg: Cfg, method: str, for_training: bool = True):
         # KHÁC với model đã huấn luyện — chữ "Q" biến mất, và bảng so sánh
         # QLoRA vs LoRA không còn nghĩa gì.
         kw["quantization_config"] = quant_config(tcfg)
-        kw["device_map"] = "auto"
-    else:
-        kw["device_map"] = "auto"
+    kw["device_map"] = device_map_for(cfg, for_training)
 
     processor = AutoProcessor.from_pretrained(b["hf_id"], token=tok)
     model = Gemma3ForConditionalGeneration.from_pretrained(b["hf_id"], **kw)
+    if for_training:
+        assert_materialized(model, kw["device_map"])
     return model, processor
 
 

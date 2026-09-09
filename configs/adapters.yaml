@@ -81,6 +81,29 @@ base:
   disable_compile: auto
   batch_size: 4          # batch lúc SINH (không phải lúc train)
 
+  # ── device_map: KHÁC NHAU giữa train và sinh, có chủ ý ─────────────────────
+  # sinh  = auto   — accelerate được trải model ra nhiều GPU hoặc đẩy bớt sang
+  #                  CPU; hook của nó lo phần chuyển qua lại, chậm nhưng đúng.
+  # train = single — ghim MỘT thiết bị.
+  #
+  # Vì sao không dùng auto cho train: accelerate chừa lại một phần VRAM làm
+  # khoảng thở, nên trên card vừa đủ nó đẩy vài lớp sang CPU/đĩa. Với
+  # low_cpu_mem_usage (bật ngầm khi có device_map) những lớp ấy nằm trên `meta`
+  # — tensor không có dữ liệu — rồi peft gắn adapter cạnh chúng và Trainer gọi
+  # model.to(device). Cái nổ ra là:
+  #
+  #     NotImplementedError: Cannot copy out of meta tensor; no data!
+  #
+  # Một thông báo không nhắc gì tới VRAM lẫn device_map, nên rất dễ đi sửa nhầm
+  # chỗ. Và ngay cả khi KHÔNG nổ, offload sang CPU giữa lúc huấn luyện làm mỗi
+  # bước chậm hàng chục lần — tám arm không bao giờ chạy xong.
+  #
+  # Ghim một thiết bị thì thiếu VRAM báo OOM ở đúng chỗ, và thang dò batch xử
+  # lý được. src/train.assert_materialized() kiểm ngay sau khi nạp và DỪNG nếu
+  # còn tham số trên meta hoặc còn lớp bị đẩy sang cpu/disk.
+  device_map_train: single     # single | auto
+  device_map_infer: auto
+
   # ── Ảnh vào processor ─────────────────────────────────────────────────────
   image:
     # PAN & SCAN TẮT. Bật lên, processor cắt ảnh không vuông thành 2-4 mảnh phụ

@@ -24,6 +24,12 @@ from .base import RunnerUnusable
 from .gemma3 import Gemma3Runner
 
 
+def _infer_device_map(cfg):
+    from ..train import device_map_for
+
+    return device_map_for(cfg, for_training=False)
+
+
 class Gemma3AdapterRunner(Gemma3Runner):
     name = "gemma3_adapter"
 
@@ -52,7 +58,11 @@ class Gemma3AdapterRunner(Gemma3Runner):
         hf_id = self.mcfg["hf_id"]
         tok = hf_token()
         dt = self.torch_dtype()
-        kw = dict(token=tok, torch_dtype=dt, device_map="auto",
+        # device_map của khâu SINH lấy từ base.device_map_infer (mặc định
+        # "auto"). Khác đường huấn luyện, ở đây offload sang CPU là chấp nhận
+        # được: chậm, nhưng hook của accelerate cho ra đúng kết quả.
+        kw = dict(token=tok, torch_dtype=dt,
+                  device_map=_infer_device_map(self.cfg),
                   attn_implementation=str(self.mcfg.get("attn_implementation", "sdpa")))
         if quantized:
             from .. import train as train_mod

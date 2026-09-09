@@ -126,6 +126,13 @@ _RULES: list[tuple[str, str]] = [
      "        có gcc, thiếu Python.h -> apt-get install -y python3-dev\n"
      "      Hoặc bỏ hẳn compile (kết quả không đổi, chỉ chậm hơn chút):\n"
      "        --set models.0.disable_compile=true"),
+    (r"Cannot copy out of meta tensor|to_empty\(\)",
+     "model nạp xong mà một phần trọng số còn trên `meta` — gần như luôn là\n"
+     "      device_map='auto' đã đẩy bớt lớp sang CPU/đĩa vì thiếu VRAM.\n"
+     "      Đường HUẤN LUYỆN phải ghim một thiết bị (mặc định của repo:\n"
+     "      base.device_map_train=single). Thiếu VRAM cho base bf16 thì chạy\n"
+     "      bốn arm chữ Q trước:\n"
+     "        --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16"),
     (r"out of memory|CUDA out of memory",
      "hết VRAM. Hạ batch_size của model này trong configs/adapters.yaml,\n"
      "      hoặc với Phi thì hạ num_crops (4 -> 2)."),

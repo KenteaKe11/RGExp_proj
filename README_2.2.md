@@ -196,6 +196,44 @@ tiên** — và `imaging.policy()` dừng ngay với thông báo nói đúng chu
 cắt VRAM (mỗi ảnh vẫn tốn đúng 256 token và một lượt SigLIP 896²). Cần VRAM thì
 hạ batch.
 
+### `Cannot copy out of meta tensor` — đọc là "thiếu VRAM"
+
+Nếu stage `train` chết với
+
+```
+NotImplementedError: Cannot copy out of meta tensor; no data!
+Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() ...
+```
+
+thì thông báo đang nói về triệu chứng, không phải nguyên nhân. Chuỗi sự kiện:
+`device_map="auto"` thấy VRAM không đủ → accelerate đẩy vài lớp sang CPU/đĩa →
+với `low_cpu_mem_usage` (bật ngầm khi có `device_map`) những lớp ấy nằm trên
+`meta`, tức tensor không có dữ liệu → peft gắn adapter cạnh chúng → `Trainer`
+gọi `model.to(device)` và nổ.
+
+Repo này **ghim một thiết bị cho đường huấn luyện** (`base.device_map_train:
+single`) đúng để chuyện đó không xảy ra: thiếu VRAM thì báo OOM ở đúng chỗ, và
+thang dò batch xử lý được. `assert_materialized()` còn kiểm ngay sau khi nạp và
+dừng với thông báo nói về VRAM thay vì về `to_empty()`.
+
+Vẫn thiếu VRAM cho **trọng số nền** thì thang dò batch không cứu được — batch
+không làm base nhỏ đi:
+
+| | base chiếm | |
+|---|---|---|
+| `lora` / `dora` | ~9 GB (bf16) | cần card ≥ 16 GB |
+| `qlora` / `qdora` | ~4 GB (NF4) | chạy được trên card nhỏ hơn |
+
+```bash
+# card nhỏ: chạy bốn arm chữ Q trước
+bash scripts/run_adapters.sh --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16
+# thật sự có nhiều GPU và chấp nhận chậm:
+bash scripts/run_adapters.sh --set base.device_map_train=auto
+```
+
+Kiểm trước khi đổ lỗi cho card: `nvidia-smi` — một tiến trình cũ chưa chết vẫn
+giữ nguyên VRAM của lần chạy trước.
+
 ### Bị đứt giữa chừng thì làm gì
 
 Chạy lại **đúng lệnh cũ**. Mọi stage đều resume:
