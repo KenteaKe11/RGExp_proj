@@ -86,10 +86,13 @@ def _cache_path(cache_root: Path, key: str) -> Path:
 def _save_resized(raw: bytes, dest: Path, max_side: int) -> None:
     """Giải mã, thu nhỏ cạnh dài về max_side, ghi JPEG.
 
-    Thu nhỏ ở ĐÂY chứ không ở lúc infer: cùng một ảnh được ba model đọc lại
-    nhiều lần, và ảnh CXR gốc 2500² giải nén tốn ~19 MB RAM mỗi lần. 768 là
-    trần trên mọi processor trong thí nghiệm (Gemma 3 dùng 896², Qwen resize
-    động, LLaVA-Med 336²) nên không model nào bị mất chi tiết vì bước này.
+    Thu nhỏ ở ĐÂY chứ không ở lúc infer: cùng một ảnh được đọc lại nhiều lần,
+    và ảnh CXR gốc 2500² giải nén tốn ~19 MB RAM mỗi lần.
+
+    §2.2 chốt trần ở 512 (data.image_max_side). Con số đó KHÔNG đổi VRAM —
+    processor của Gemma 3 vẫn resize lên 896² và vẫn phát ra đúng 256 token mỗi
+    ảnh — nó chỉ quyết định lượng CHI TIẾT thật sự đi vào model, và vì thế phải
+    giống hệt nhau ở khâu huấn luyện lẫn khâu chấm. Xem src/imaging.py.
     """
     img = Image.open(io.BytesIO(raw))
     img = img.convert("RGB")
@@ -333,7 +336,17 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
         before = len(df)
         df = df[~df["key"].isin(set(bad))].reset_index(drop=True)
         print(f"  ⚠ loại {before - len(df)} mẫu vì thiếu ảnh -> còn {len(df)}", flush=True)
-    _ = max_side
+
+    # ── Cưỡng chế trần cạnh dài lên TOÀN BỘ cache, kể cả ảnh đã có sẵn ───────
+    # Cache theo SỰ TỒN TẠI của file: ảnh do §2.1 tải về (trần 768) được dùng
+    # lại y nguyên và `_save_resized` không bao giờ chạm tới. Không có bước này
+    # thì tám adapter huấn luyện trên ảnh 768 trong khi config nói 512, và triệu
+    # chứng duy nhất là... không có triệu chứng nào.
+    if bool(cfg.data.get("image_max_side_enforce", True)):
+        from . import imaging
+
+        imaging.enforce_max_side(df["image_path"].tolist(), max_side,
+                                 label=f"{len(df)} ảnh")
     return df
 
 

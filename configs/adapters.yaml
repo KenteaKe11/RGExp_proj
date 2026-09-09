@@ -29,7 +29,20 @@ data:
   ref_column: text_gt
   n_test: 3000
   cache_dir: ./data
+  # ── TRẦN CẠNH DÀI: 512, RÀNG BUỘC CỨNG ────────────────────────────────────
+  # Không phải gợi ý. `image_max_side_enforce` duyệt lại cache ở stage `data`
+  # và thu nhỏ TẠI CHỖ mọi ảnh còn lớn hơn.
+  #
+  # Vì sao cần cưỡng chế chứ không chỉ đặt số: cache ảnh dùng CHUNG với §2.1,
+  # nơi trần từng là 768. `ensure_images` cache theo SỰ TỒN TẠI của file, nên
+  # chạy §2.1 trước rồi chạy §2.2 là tám adapter học trên ảnh 768 trong khi
+  # config nói 512 — và không dòng log nào phản đối.
+  #
+  # Lưu ý con số này KHÔNG đổi VRAM: processor của Gemma 3 luôn resize về 896²
+  # và luôn phát ra đúng 256 token/ảnh. 512 cắt CHI TIẾT đưa vào, không cắt bộ
+  # nhớ. Hạ VRAM là việc của train.batch_probe bên dưới.
   image_max_side: 512
+  image_max_side_enforce: true
   zip_mode: auto
   zip_stream_min_rate: 1.0
 
@@ -68,6 +81,29 @@ base:
   disable_compile: auto
   batch_size: 4          # batch lúc SINH (không phải lúc train)
 
+  # ── Ảnh vào processor ─────────────────────────────────────────────────────
+  image:
+    # PAN & SCAN TẮT. Bật lên, processor cắt ảnh không vuông thành 2-4 mảnh phụ
+    # và CHÈN THÊM 256 token ảnh cho mỗi mảnh: một CXR 512×400 thành 768-1280
+    # token ảnh thay vì 256. Hệ quả kép — VRAM tăng theo, VÀ max_seq_len=1024
+    # bị phần prompt ăn hết nên phần BÁO CÁO bị cắt đuôi. Tám arm khi ấy học
+    # trên nhãn cụt và loss vẫn giảm đẹp, nên lỗi này không tự lộ ra.
+    #
+    # Gemma3Processor mặc định đã là False, nhưng đó là mặc định của MỘT bản
+    # thư viện. Ở đây truyền tường minh mỗi lần gọi, VÀ kiểm bằng thực nghiệm:
+    # src/imaging.assert_single_crop() đưa một ảnh tỉ lệ 2:1 (vượt ngưỡng kích
+    # hoạt 1.2) qua processor rồi ĐẾM token ảnh, phải đúng 256.
+    do_pan_and_scan: false
+
+    # KHOÁ CỨNG ở 896 — ràng buộc kiến trúc, không phải lựa chọn.
+    # Gemma3MultiModalProjector chốt patches_per_image = image_size//patch_size
+    # = 64 ngay lúc __init__ và reshape cứng về (B, C, 64, 64); Gemma3 lại
+    # không truyền interpolate_pos_encoding xuống SigLIP nên position embedding
+    # cũng cố định 4096 patch. Đặt 512 ở đây là lỗi shape ở forward ĐẦU TIÊN,
+    # không phải "ảnh nhỏ hơn nên nhẹ hơn". src/imaging.policy() dừng ngay nếu
+    # ai đó thử.
+    processor_size: 896
+
 # ── Prompt: y hệt §2.1 ──────────────────────────────────────────────────────
 # Dùng lại nguyên văn. Nếu §2.2 đổi prompt thì con số của nó không so được với
 # mốc nền zero-shot ở §2.1, và cả hai mục cùng mất giá trị.
@@ -88,9 +124,35 @@ generate:
 # ── Huấn luyện: MỘT cấu hình, dùng chung cho cả tám arm ─────────────────────
 train:
   n_epochs: 1                    # 6400 mẫu × 1 vòng = "train qua 6400 mẫu"
-  per_device_batch_size: 2       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
-  grad_accum: 16                  # batch hiệu dụng = 32
-  max_seq_len: 640               # prompt + báo cáo; dài hơn thì cắt phần ĐUÔI
+
+  # Hai số dưới đây là ĐIỂM KHỞI ĐẦU của thang dò, không phải giá trị cuối:
+  # xem khối `batch_probe`. Lần chạy thật đọc nấc đã dò được từ file thay vì
+  # đọc thẳng ở đây (trừ khi bị --set ghi đè).
+  per_device_batch_size: 8       # nấc đầu tiên được thử
+  grad_accum: 4                  # = effective_batch / per_device_batch_size
+
+  # ── THANG DÒ BATCH ────────────────────────────────────────────────────────
+  # Bắt đầu ở per_device_batch_size, gặp OOM thì CHIA ĐÔI rồi thử lại:
+  #     8 → 4 → 2 → 1
+  # grad_accum đi ngược lại để BATCH HIỆU DỤNG luôn đúng bằng effective_batch:
+  #     8×4    4×8    2×16    1×32     -> 32 ở MỌI nấc
+  #
+  # Điều kiện bất biến đó là thứ giữ cho cái thang này không trở thành một biến
+  # của thí nghiệm: số bước tối ưu hoá = 6400/32 = 200 ở mọi nấc, nên lịch
+  # one-cycle giống hệt nhau và tám arm vẫn "cùng lịch học" đúng như §2.2 tuyên
+  # bố. Chỉ tốc độ đổi, không phải thứ được đo.
+  #
+  # DÒ Ở ĐÂU: `--dry-run` chạy thang cho TỪNG arm rồi ghi nấc THẤP NHẤT mà cả
+  # tám arm cùng qua vào `file`. Lần chạy thật đọc file đó và dùng CÙNG một bs
+  # cho cả tám arm. Nếu để mỗi arm tự tụt tới nấc riêng thì qdora_r16 chạy bs=1
+  # còn lora_r8 chạy bs=8 — một khác biệt giữa các arm mà kiểm định Friedman
+  # không tách ra được, vì nó không nằm trong hai yếu tố (method, rank).
+  batch_probe:
+    enabled: true
+    effective_batch: 32          # BẤT BIẾN qua mọi nấc
+    min_batch_size: 1            # tới đây mà vẫn OOM thì DỪNG, không im lặng
+    file: ./runs/batch_probe.json
+  max_seq_len: 1024               # prompt + báo cáo; dài hơn thì cắt phần ĐUÔI
   gradient_checkpointing: true
   optimizer: adamw_torch
   weight_decay: 0.0

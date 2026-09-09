@@ -24,8 +24,10 @@ bash scripts/run_adapters.sh --detach   # ... nhưng chạy NỀN (lần chạy 
 |---|---|
 | **Base** | `google/gemma-3-4b-it` — một bản duy nhất cho cả tám arm |
 | **Tám arm** | `{LoRA, QLoRA, DoRA, QDoRA} × {r=8, r=16}` |
-| **Huấn luyện** | 6400 mẫu đầu của `split_ref/train_split.csv`, 1 vòng, batch hiệu dụng 8 → **800 bước** |
-| **Lịch học** | one-cycle: warmup 10% tới `max_lr=2e-4`, rồi cosine xuống `max_lr/2500` |
+| **Huấn luyện** | 6400 mẫu đầu của `split_ref/train_split.csv`, 1 vòng, batch hiệu dụng **32** → **200 bước** |
+| **Batch/thiết bị** | dò tự động: 8 → 4 → 2 → 1 khi hết VRAM, `grad_accum` đi ngược lại nên eff_bs **luôn = 32** |
+| **Ảnh vào** | cạnh dài ≤ **512 px**, **pan & scan TẮT** → đúng 256 token ảnh mỗi mẫu |
+| **Lịch học** | one-cycle: warmup 10% tới `max_lr=3e-4`, rồi cosine xuống `max_lr/2500` |
 | **Adapter gắn vào** | **bốn ma trận attention** của khối ngôn ngữ — `q_proj · k_proj · v_proj · o_proj`. Không MLP, không vision tower |
 | **Tập chấm** | 3000 ảnh của §2.1 — **cùng tập, đã khoá** |
 | **Metrics** | BLEU-1..4, ROUGE-1/2/L, BERTScore-F1 — theo từng mẫu |
@@ -116,7 +118,7 @@ và ghi rõ trong báo cáo — đừng để hai lần chạy khác mặt cắt
 ## 3. Chạy
 
 ```bash
-bash scripts/run_adapters.sh --dry-run    # 16 mẫu train, 4 bước, 8 ảnh test — thử đường ống
+bash scripts/run_adapters.sh --dry-run    # thử đường ống + DÒ BATCH (xem bên dưới)
 bash scripts/run_adapters.sh              # chạy thật, trọn gói
 bash scripts/run_adapters.sh --no-push
 bash scripts/run_adapters.sh --arms lora_r8,dora_r8        # chỉ hai arm
@@ -125,6 +127,74 @@ bash scripts/run_adapters.sh --stages train --retrain      # huấn luyện lạ
 ```
 
 Stage hợp lệ: `data, train, infer, score, stats, report, push`.
+
+### Dò batch — chạy `--dry-run` TRƯỚC
+
+`--dry-run` không chỉ thử đường ống, nó còn tìm batch lớn nhất mà card này chịu
+được. Bắt đầu ở `train.per_device_batch_size` (8); gặp OOM thì **chia đôi** và
+thử lại, với `grad_accum` đi ngược lại:
+
+| nấc | batch | grad_accum | eff_bs | số bước |
+|---|---|---|---|---|
+| 1 | 8 | 4 | 32 | 200 |
+| 2 | 4 | 8 | 32 | 200 |
+| 3 | 2 | 16 | 32 | 200 |
+| 4 | 1 | 32 | 32 | 200 |
+
+**Batch hiệu dụng đứng yên ở 32 qua mọi nấc, và đó là điểm chính.** Nếu nó thay
+đổi thì số bước tối ưu hoá đổi theo, lịch one-cycle đổi theo, và "tám arm cùng
+lịch học" — tiền đề của cả §2.2 — thành sai chỉ vì một arm tình cờ hết VRAM.
+Tụt nấc chỉ đổi tốc độ, không đổi thứ được đo.
+
+Nấc **thấp nhất mà cả tám arm cùng qua** được ghi vào `runs/batch_probe.json`,
+và lần chạy thật đọc file đó. Không phải nấc riêng từng arm: hai arm chạy hai
+batch khác nhau là hai điều kiện huấn luyện khác nhau, và Friedman quy mọi hiệu
+số về `(method, rank)` — nó không có chỗ nào để trừ đi phần do batch.
+
+Ba chi tiết đáng biết:
+
+* **Lúc dò, mọi batch được đệm tới `max_seq_len`.** Bình thường batch chỉ đệm
+  tới mẫu dài nhất trong batch, nên VRAM đỉnh phụ thuộc vào việc 16 mẫu của
+  dry-run tình cờ ngắn hay dài. Một phép dò nói "batch 8 chạy được" dựa trên vài
+  báo cáo ngắn rồi OOM ở giờ thứ ba thì tệ hơn không dò. Đệm tới trần biến phép
+  dò thành trường hợp xấu nhất — có thể bi quan một nấc, và bi quan là hướng sai
+  an toàn duy nhất ở đây.
+* **File dò ghi kèm tên GPU.** Đổi card thì nó bị bỏ qua kèm cảnh báo, chứ không
+  mang con số dò trên A100 80 GB sang 4090 24 GB.
+* **Arm đã có adapter trong `adapters_dryrun/` thì bị bỏ qua** — chạy
+  `--dry-run --retrain` nếu muốn dò lại từ đầu.
+
+Ghi đè bằng tay vẫn thắng tất cả:
+
+```bash
+bash scripts/run_adapters.sh --set train.per_device_batch_size=2
+```
+
+### Ảnh vào: 512 px, pan & scan tắt
+
+Hai ràng buộc, ép ở `src/imaging.py` và dùng chung cho khâu huấn luyện lẫn khâu
+sinh:
+
+* **Cạnh dài ≤ 512 px.** Cưỡng chế thật: stage `data` duyệt lại cache và thu nhỏ
+  tại chỗ mọi ảnh còn lớn hơn. Cần thế vì cache dùng **chung với §2.1**, nơi trần
+  từng là 768, và `ensure_images` cache theo *sự tồn tại của file* — chạy §2.1
+  trước rồi chạy §2.2 là tám adapter học trên ảnh 768 mà không dòng log nào phản
+  đối.
+* **Pan & scan TẮT.** Bật thì processor cắt ảnh không vuông thành 2–4 mảnh phụ,
+  mỗi mảnh **thêm 256 token ảnh**. Hệ quả kép: VRAM tăng, *và* `max_seq_len=1024`
+  bị phần prompt ăn hết nên phần **báo cáo** bị cắt đuôi — tám arm học trên nhãn
+  cụt trong khi loss vẫn giảm đẹp. Không tin vào mặc định của thư viện:
+  `imaging.assert_single_crop()` đẩy một ảnh tỉ lệ 2:1 qua processor rồi **đếm**
+  token ảnh, phải đúng 256, mỗi lần nạp model.
+
+Điều **không** làm được: ép processor xuống 512. `Gemma3MultiModalProjector` chốt
+`patches_per_image = image_size // patch_size = 64` ngay lúc `__init__` và reshape
+cứng về `(B, C, 64, 64)`, còn Gemma 3 thì không truyền `interpolate_pos_encoding`
+xuống SigLIP. Đặt `base.image.processor_size: 512` là lỗi shape ở forward **đầu
+tiên** — và `imaging.policy()` dừng ngay với thông báo nói đúng chuyện đó thay vì
+để bạn đọc traceback. Nên nhớ: 512 px cắt **chi tiết** đưa vào model, **không**
+cắt VRAM (mỗi ảnh vẫn tốn đúng 256 token và một lượt SigLIP 896²). Cần VRAM thì
+hạ batch.
 
 ### Bị đứt giữa chừng thì làm gì
 
@@ -333,9 +403,9 @@ Trên một GPU 24 GB (L4 / 4090 / A10), cho **trọn tám arm**:
 | | mỗi arm | ×8 |
 |---|---|---|
 | Tải ảnh train + test (stream, lần đầu) | — | 30–60 phút, ~600 MB |
-| Huấn luyện 800 bước — `lora`/`qlora` | 35–60 phút | |
-| Huấn luyện 800 bước — `dora` | 50–90 phút | |
-| Huấn luyện 800 bước — `qdora` | 70–120 phút | |
+| Huấn luyện 200 bước — `lora`/`qlora` | 35–60 phút | |
+| Huấn luyện 200 bước — `dora` | 50–90 phút | |
+| Huấn luyện 200 bước — `qdora` | 70–120 phút | |
 | | | **6–11 giờ** |
 | Sinh 3000 ảnh, batch 4 | 25–60 phút | **3–8 giờ** |
 | Chấm điểm (BERTScore) ×8 | 5–10 phút | 40–80 phút |
@@ -343,7 +413,8 @@ Trên một GPU 24 GB (L4 / 4090 / A10), cho **trọn tám arm**:
 | **Tổng** | | **~10–20 giờ** |
 
 VRAM: arm `lora`/`dora` ~18–22 GB (bf16 + gradient checkpointing); arm `qlora`/
-`qdora` ~10–14 GB. Đĩa: tám adapter ~150–600 MB tổng (chỉ ghi adapter, không
+`qdora` ~10–14 GB — ở **batch 1**. Con số theo batch là việc của phép dò ở mục 3;
+đừng đoán, chạy `--dry-run` một lần rồi đọc `runs/batch_probe.json`. Đĩa: tám adapter ~150–600 MB tổng (chỉ ghi adapter, không
 ghi base — ghi base tám lần là 64 GB cho đúng một model lặp lại tám lần).
 
 ---

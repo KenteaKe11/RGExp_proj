@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .. import imaging
 from ..config import hf_token
 from .base import RunnerUnusable
 from .gemma3 import Gemma3Runner
@@ -68,6 +69,25 @@ class Gemma3AdapterRunner(Gemma3Runner):
         # phải, pad token nằm SAU prompt và model sinh tiếp từ pad -> đầu ra bắt
         # đầu bằng rác. Lỗi này không ném exception, nó chỉ làm điểm tụt.
         self.processor.tokenizer.padding_side = "left"
+        self._apply_image_policy()
+
+        # Cùng lý lẽ với `quantized` ở trên, áp cho ẢNH: arm nào huấn luyện với
+        # ảnh 512 và pan&scan tắt thì phải SINH y như vậy. Lệch nhau vẫn chạy
+        # trơn, vẫn ra văn bản đọc được, chỉ là adapter bị chấm trên phân phối
+        # đầu vào khác phân phối nó học — và cột số ấy vẫn trông như kết quả
+        # thật trong bảng tám arm.
+        want = imaging.policy(self.cfg)
+        for key, now in (("image_max_side",
+                          int((self.cfg.get("data", {}) or {}).get("image_max_side", 512))),
+                         ("do_pan_and_scan", bool(want["do_pan_and_scan"]))):
+            was = stats.get(key)
+            if was is not None and was != now:
+                raise RunnerUnusable(
+                    f"arm này huấn luyện với {key}={was}, còn cấu hình lúc sinh "
+                    f"là {now}. Sinh với ảnh khác lúc train là chấm một model "
+                    f"khác model đã huấn luyện.\n"
+                    f"    Sửa config cho khớp, hoặc xoá {adapter_dir} rồi huấn "
+                    f"luyện lại arm này.")
 
         base = Gemma3ForConditionalGeneration.from_pretrained(hf_id, **kw)
         from peft import PeftModel

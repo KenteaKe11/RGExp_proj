@@ -1,13 +1,22 @@
 """§2.2 — trọn thí nghiệm tám arm trong MỘT lệnh.
 
     python -m src.run_adapters                    # data -> train ×8 -> infer ×8 -> chấm -> Friedman -> báo cáo -> push
-    python -m src.run_adapters --dry-run          # 8 ảnh, 4 bước train, không đẩy Hub
+    python -m src.run_adapters --dry-run          # 8 ảnh, 4 bước train + DÒ BATCH
     python -m src.run_adapters --stages stats,report
     python -m src.run_adapters --arms lora_r8,dora_r8
 
 Mọi stage resume được, y hệt §2.1 — và ở đây nó còn quan trọng hơn: tám arm ×
 (huấn luyện + 3000 ảnh sinh) là nhiều giờ GPU, và một lần đứt ở arm thứ sáu mà
 phải làm lại từ đầu là mất tiền thật.
+
+`--dry-run` làm thêm một việc: DÒ BATCH. Nó thử từng arm ở nấc batch trong
+config (8), gặp OOM thì chia đôi và thử lại — 8, 4, 2, 1 — với grad_accum đi
+ngược lại để batch hiệu dụng đứng yên ở 32. Nấc THẤP NHẤT mà cả tám arm cùng
+qua được ghi vào runs/batch_probe.json, và lần chạy thật đọc file đó.
+
+Vì sao là nấc chung chứ không phải nấc riêng từng arm: hai arm chạy hai batch
+khác nhau là hai điều kiện huấn luyện khác nhau, và kiểm định Friedman quy mọi
+hiệu số về (method, rank) — nó không có chỗ nào để trừ đi phần do batch.
 """
 from __future__ import annotations
 
@@ -221,21 +230,65 @@ def main(argv: list[str] | None = None) -> int:
             train_df, val_df = dt_mod.load_train_manifest(cfg)
         manifest["n_train"] = len(train_df)
         tracker.summary({"data/n_train": len(train_df)})
+
+        # ── Batch: dò ở --dry-run, đọc lại ở lần chạy thật ───────────────────
+        # Thứ tự ưu tiên, cao xuống thấp:
+        #   1. --set train.per_device_batch_size=N   (người dùng nói thẳng)
+        #   2. runs/batch_probe.json                 (nấc đã dò được trên CARD NÀY)
+        #   3. train.per_device_batch_size trong YAML
+        from . import train as train_mod
+
+        forced = any(o.split("=", 1)[0].strip() == "train.per_device_batch_size"
+                     for o in (a.overrides or []))
+        probe = None if (a.dry_run or forced) else train_mod.read_probe(cfg)
+        bs, accum = train_mod.resolve_batch(dict(cfg["train"]), probe)
+        if forced:
+            src_txt = "--set (ghi đè tay)"
+        elif probe:
+            src_txt = f"{train_mod.probe_path(cfg)} (dò lúc {probe.get('probed_at')})"
+        elif a.dry_run:
+            src_txt = "config — đây là lần DÒ, nấc này chỉ là điểm khởi đầu"
+        else:
+            src_txt = ("config — CHƯA dò bao giờ; chạy `--dry-run` trước để "
+                       "khỏi phát hiện OOM ở giờ thứ ba")
+        print(f"  batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
+              f"[{src_txt}]", flush=True)
+        if a.dry_run:
+            print(f"  thang dò: "
+                  + " → ".join(f"{b}×{g}" for b, g in
+                               train_mod.batch_ladder(dict(cfg["train"]), start=bs)),
+                  flush=True)
+        manifest["batch"] = {"batch_size": bs, "grad_accum": accum,
+                             "effective_batch": bs * accum, "source": src_txt}
+        probe_hits: dict[str, int] = {}
+
         for arm in arms:
             odir = adapter_root / arm["id"]
             if already_trained(odir) and not a.retrain:
                 print(f"  ✓ {arm['id']}: đã có adapter ở {odir} — bỏ qua "
                       f"(--retrain để huấn luyện lại)", flush=True)
-                train_stats.append(json.loads(
-                    (odir / "train_stats.json").read_text(encoding="utf-8")))
+                cached = json.loads(
+                    (odir / "train_stats.json").read_text(encoding="utf-8"))
+                train_stats.append(cached)
+                if cached.get("batch_size"):
+                    probe_hits[arm["id"]] = int(cached["batch_size"])
                 manifest["arm_status"][arm["id"]] = {"trained": "cached"}
                 continue
             try:
                 st = train_arm(cfg, arm, train_df, val_df, odir, tracker,
-                               max_steps_override=dry_steps)
+                               max_steps_override=dry_steps,
+                               batch=bs, ladder=bool(a.dry_run))
                 train_stats.append(st)
+                probe_hits[arm["id"]] = int(st["batch_size"])
+                # Arm này phải tụt nấc -> các arm SAU bắt đầu thẳng từ nấc đó.
+                # Thử lại nấc đã biết là hỏng chỉ tốn thêm một lượt nạp model
+                # 4B cho mỗi arm còn lại.
+                if a.dry_run and int(st["batch_size"]) < bs:
+                    bs, accum = train_mod.resolve_batch(
+                        dict(cfg["train"]), {"batch_size": int(st["batch_size"])})
                 manifest["arm_status"][arm["id"]] = {"trained": True,
-                                                     "minutes": st["minutes"]}
+                                                     "minutes": st["minutes"],
+                                                     "batch_size": st["batch_size"]}
                 tracker.summary({f"train/{arm['id']}/minutes": st["minutes"],
                                  f"train/{arm['id']}/loss": st["train_loss"],
                                  f"train/{arm['id']}/vram_peak_gb": st["vram_peak_gb"],
@@ -257,6 +310,37 @@ def main(argv: list[str] | None = None) -> int:
                 manifest["arm_status"][arm["id"]] = {"trained": False, "error": repr(e)}
                 tracker.alert("Arm hỏng khi train", f"{arm['id']}: {e!r}", "ERROR")
                 raise
+
+        # ── Ghi nấc đã dò ────────────────────────────────────────────────────
+        # Lấy MIN qua tám arm, không lấy nấc của arm cuối: arm nặng nhất
+        # (qdora_r16) mới là arm quyết định, và nó không nhất thiết chạy sau
+        # cùng khi người dùng truyền --arms.
+        if a.dry_run and probe_hits:
+            lo = min(probe_hits.values())
+            _, lo_accum = train_mod.resolve_batch(dict(cfg["train"]),
+                                                  {"batch_size": lo})
+            pfile = train_mod.write_probe(cfg, lo, lo_accum, probe_hits)
+            manifest["batch_probe"] = {"batch_size": lo, "grad_accum": lo_accum,
+                                       "per_arm": probe_hits, "file": str(pfile)}
+            tracker.summary({"train/probe_batch_size": lo,
+                             "train/probe_grad_accum": lo_accum})
+            spread = sorted(set(probe_hits.values()))
+            print(f"\n⚙ DÒ XONG: batch {lo} × grad_accum {lo_accum} "
+                  f"(eff_bs {lo*lo_accum}) -> {pfile}", flush=True)
+            if len(spread) > 1:
+                print(f"  nấc theo arm: {probe_hits}\n"
+                      f"  -> lần chạy thật dùng {lo} cho CẢ TÁM arm, không phải "
+                      f"nấc riêng của từng arm: batch khác nhau giữa các arm là "
+                      f"một biến mà Friedman không tách ra được.", flush=True)
+            n_cached = sum(1 for x in arms
+                           if manifest["arm_status"].get(x["id"], {}).get("trained")
+                           == "cached")
+            if n_cached:
+                print(f"  ⚠ {n_cached}/{len(arms)} arm lấy từ adapter dry-run cũ, "
+                      f"KHÔNG dò lại lần này. `--dry-run --retrain` để dò sạch.",
+                      flush=True)
+            print(f"  Chạy thật:  bash scripts/run_adapters.sh --detach",
+                  flush=True)
     else:
         for arm in arms:
             p = adapter_root / arm["id"] / "train_stats.json"

@@ -132,11 +132,29 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
     # điểm đã có), và một dòng "? mẫu" trong phần Thiết kế làm báo cáo trông như
     # bị hỏng. Lấy từ config làm mức dự phòng.
     n_train_txt = manifest.get("n_train") or cfg["data"].get("n_train", "?")
+    # Batch lấy từ train_stats của arm đã chạy, KHÔNG từ config: nấc thật có thể
+    # do thang dò hạ xuống (8×4 -> 2×16). Batch hiệu dụng thì bất biến, nhưng
+    # báo cáo nói "batch 8" trong khi log nói 2 là đủ để người đọc lại nghi ngờ
+    # cả bảng.
+    bss = sorted({int(x.get("batch_size", 0)) for x in (train_stats or [])
+                  if x.get("batch_size")})
+    effs = sorted({int(x.get("effective_batch", 0)) for x in (train_stats or [])
+                   if x.get("effective_batch")})
+    eff_txt = (str(effs[0]) if len(effs) == 1 else
+               (f"{effs} — **KHÔNG đồng nhất giữa các arm**" if effs else
+                str(int(t.get("per_device_batch_size", 1))
+                    * int(t.get("grad_accum", 8)))))
+    bs_txt = (f" (batch/thiết bị {bss[0]} × grad_accum "
+              f"{effs[0]//bss[0] if bss and effs else '?'})" if len(bss) == 1
+              else (f" (batch/thiết bị KHÁC NHAU giữa các arm: {bss})" if bss else ""))
     A(f"- **Huấn luyện**: {n_train_txt} mẫu × "
-      f"{t.get('n_epochs', 1)} vòng, batch hiệu dụng "
-      f"{int(t.get('per_device_batch_size', 1)) * int(t.get('grad_accum', 8))}, "
+      f"{t.get('n_epochs', 1)} vòng, batch hiệu dụng {eff_txt}{bs_txt}, "
       f"one-cycle max_lr={t['schedule'].get('max_lr')} "
       f"(pct_start={t['schedule'].get('pct_start')}).")
+    A(f"- **Ảnh vào**: cạnh dài ≤ {cfg['data'].get('image_max_side', 512)}px, "
+      f"pan&scan "
+      f"{'BẬT' if (cfg.get('base', {}).get('image', {}) or {}).get('do_pan_and_scan') else 'tắt'}"
+      f" — 256 token ảnh mỗi mẫu, giống hệt nhau ở khâu huấn luyện và khâu chấm.")
     A(f"- **alpha**: `{t.get('alpha_mode')}`"
       + (f" — alpha = {t.get('alpha_ratio')}×r, nên hệ số nhân alpha/r **không đổi** "
          "giữa r=8 và r=16, và cột *rank* đo đúng một thứ."

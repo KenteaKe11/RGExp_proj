@@ -22,23 +22,195 @@ Bốn chỗ trong file này tồn tại vì đúng lý do đó:
      prompt vẫn "chạy được" và loss vẫn giảm, nên lỗi này không bao giờ tự lộ
      ra; nó chỉ làm tám arm cùng học sai một kiểu và bảng kết quả trông vẫn
      hợp lý.
+  5. `batch_ladder` — hết VRAM thì chia đôi batch và NHÂN ĐÔI grad_accum, nên
+     batch hiệu dụng đứng yên ở 32 qua mọi nấc. Nhờ đó số bước tối ưu hoá và
+     lịch one-cycle không đổi theo nấc, và cái thang không lẻn vào bảng kết quả
+     như một biến thứ ba bên cạnh (method, rank).
 """
 from __future__ import annotations
 
 import inspect
 import json
 import math
+import re
 import time
 from pathlib import Path
 
 import pandas as pd
 
+from . import imaging
 from .config import Cfg, hf_token, seed_everything
 from .prompts import texts
 
 
 class TrainUnusable(RuntimeError):
     """Arm này không huấn luyện được — dừng nó lại thay vì sinh ra adapter rác."""
+
+
+# ── Thang dò batch ──────────────────────────────────────────────────────────
+def effective_batch(tcfg: dict) -> int:
+    p = dict(tcfg.get("batch_probe", {}) or {})
+    if "effective_batch" in p:
+        return int(p["effective_batch"])
+    # Không khai báo thì suy từ cặp giá trị trong config — giữ tương thích với
+    # config cũ, nơi bs × grad_accum là nguồn sự thật duy nhất.
+    return int(tcfg.get("per_device_batch_size", 8)) * int(tcfg.get("grad_accum", 4))
+
+
+def batch_ladder(tcfg: dict, start: int | None = None) -> list[tuple[int, int]]:
+    """[(batch, grad_accum), ...] từ nấc đầu, chia đôi dần tới min_batch_size.
+
+    BẤT BIẾN của cái thang: batch × grad_accum = effective_batch ở MỌI nấc.
+    Không có nó, tụt một nấc là đổi luôn số bước tối ưu hoá (6400/eff), tức là
+    đổi cả lịch one-cycle — và khi đó "tám arm cùng lịch học" thành sai, một
+    cách âm thầm, chỉ vì một arm nào đó tình cờ hết VRAM.
+
+    Nấc không chia hết effective_batch thì DỪNG chứ không làm tròn: làm tròn là
+    đúng cái nó phải ngăn.
+    """
+    p = dict(tcfg.get("batch_probe", {}) or {})
+    eff = effective_batch(tcfg)
+    lo = max(1, int(p.get("min_batch_size", 1)))
+    bs = int(start if start else tcfg.get("per_device_batch_size", 8))
+    if bs < lo:
+        bs = lo
+    rungs: list[tuple[int, int]] = []
+    while bs >= lo:
+        if eff % bs:
+            raise TrainUnusable(
+                f"batch {bs} không chia hết batch hiệu dụng {eff}. Thang dò chỉ "
+                f"hợp lệ khi mọi nấc giữ nguyên eff_bs — sửa "
+                f"train.batch_probe.effective_batch hoặc nấc khởi đầu "
+                f"train.per_device_batch_size.")
+        rungs.append((bs, eff // bs))
+        if bs == 1:
+            break
+        bs //= 2
+    if not rungs:
+        raise TrainUnusable("thang dò batch rỗng: min_batch_size > "
+                            "per_device_batch_size?")
+    return rungs
+
+
+def resolve_batch(tcfg: dict, probe: dict | None = None) -> tuple[int, int]:
+    """(batch, grad_accum) sẽ dùng. `probe` (nếu có) thắng giá trị trong config."""
+    eff = effective_batch(tcfg)
+    bs = int((probe or {}).get("batch_size") or tcfg.get("per_device_batch_size", 8))
+    bs = max(1, bs)
+    if eff % bs:
+        raise TrainUnusable(f"batch {bs} không chia hết eff_bs {eff}")
+    return bs, eff // bs
+
+
+_OOM_PAT = re.compile(
+    r"CUDA out of memory|CUDA error: out of memory|out of memory|"
+    r"CUBLAS_STATUS_ALLOC_FAILED|CUDNN_STATUS_ALLOC_FAILED|"
+    r"HIP out of memory|Allocation on device",
+    re.IGNORECASE)
+
+
+def is_oom(exc: BaseException) -> bool:
+    """Đây có phải lỗi HẾT VRAM không?
+
+    Không bắt theo mỗi `torch.cuda.OutOfMemoryError`: cùng một ca hết bộ nhớ
+    hiện ra dưới ít nhất ba mặt khác nhau — OutOfMemoryError của torch,
+    RuntimeError từ cuBLAS/cuDNN khi cấp phát workspace hỏng, và RuntimeError
+    của bitsandbytes. Bắt hụt một mặt nghĩa là thang dò không tụt nấc mà cả lần
+    chạy chết — đúng thứ nó sinh ra để tránh.
+
+    Ngược lại, bắt QUÁ RỘNG cũng nguy: một lỗi cấu hình bị nhầm thành OOM sẽ
+    được "chữa" bằng cách hạ batch xuống 1 rồi vẫn hỏng, và thông báo cuối cùng
+    nói về VRAM trong khi nguyên nhân ở chỗ khác. Nên chỉ khớp theo chuỗi nói
+    thẳng về cấp phát bộ nhớ.
+    """
+    if type(exc).__name__ in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+        return True
+    return bool(_OOM_PAT.search(f"{type(exc).__name__}: {exc}"))
+
+
+def free_vram() -> None:
+    """Trả VRAM về driver giữa hai nấc của thang.
+
+    gc.collect() gọi HAI lần có chủ ý: vòng tham chiếu model <-> optimizer <->
+    Trainer thường chỉ đứt sau lượt thứ hai, và một nửa model còn sót lại đủ để
+    nấc kế tiếp OOM ngay — làm cái thang tụt thẳng xuống 1 mà không nấc nào
+    thật sự được thử.
+    """
+    import gc
+
+    gc.collect()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+# ── File ghi nấc đã dò được ─────────────────────────────────────────────────
+def probe_path(cfg: Cfg) -> Path:
+    p = dict(cfg["train"]).get("batch_probe", {}) or {}
+    return Path(str(p.get("file", "./runs/batch_probe.json")))
+
+
+def _gpu_name() -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return "?"
+
+
+def read_probe(cfg: Cfg) -> dict | None:
+    """Nấc đã dò được ở lần --dry-run trước, hoặc None.
+
+    GPU khác thì BỎ QUA và nói rõ: "bs=4 chạy được" là một mệnh đề về một card
+    cụ thể. Mang con số dò trên A100 80 GB sang RTX 4090 24 GB rồi chạy tám arm
+    qua đêm là ca hỏng đắt nhất mà file này có thể gây ra.
+    """
+    p = probe_path(cfg)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  ⚠ {p} không đọc được ({e!r}) — bỏ qua, dùng nấc trong config",
+              flush=True)
+        return None
+    now, was = _gpu_name(), str(d.get("gpu", "?"))
+    if now != "?" and was != "?" and now != was:
+        print(f"  ⚠ {p} dò trên {was}, máy này là {now} — BỎ QUA.\n"
+              f"    Chạy lại `--dry-run` để dò trên card hiện tại.", flush=True)
+        return None
+    if int(d.get("effective_batch", 0)) != effective_batch(dict(cfg["train"])):
+        print(f"  ⚠ {p} dò với eff_bs={d.get('effective_batch')}, config nay là "
+              f"{effective_batch(dict(cfg['train']))} — BỎ QUA.", flush=True)
+        return None
+    return d
+
+
+def write_probe(cfg: Cfg, bs: int, accum: int, per_arm: dict) -> Path:
+    from datetime import datetime, timezone
+
+    p = probe_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    d = {
+        "batch_size": int(bs), "grad_accum": int(accum),
+        "effective_batch": int(bs) * int(accum),
+        "per_arm": per_arm,
+        "gpu": _gpu_name(), "image_max_side": int(
+            (cfg.get("data", {}) or {}).get("image_max_side", 512)),
+        "do_pan_and_scan": bool(imaging.policy(cfg)["do_pan_and_scan"]),
+        "probed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    p.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
 
 
 # ── Siêu tham số suy ra từ arm ──────────────────────────────────────────────
@@ -238,11 +410,15 @@ class ReportDataset:
     viết đúng ngay từ đầu, không có phép kiểm nào ở cuối đường ống bắt được.
     """
 
-    def __init__(self, df: pd.DataFrame, processor, cfg: Cfg, max_len: int):
+    def __init__(self, df: pd.DataFrame, processor, cfg: Cfg, max_len: int,
+                 img_kw: dict | None = None):
         self.df = df.reset_index(drop=True)
         self.proc = processor
         self.cfg = cfg
         self.max_len = int(max_len)
+        # Chính sách ảnh (pan&scan tắt, size 896) truyền ở MỖI lần gọi chứ không
+        # chỉ đặt một lần lên processor: xem docstring src/imaging.policy().
+        self.img_kw = dict(img_kw if img_kw is not None else imaging.policy(cfg))
         self.n_skipped = 0
 
     def __len__(self) -> int:
@@ -295,10 +471,10 @@ class ReportDataset:
 
         prompt_only = self.proc.apply_chat_template(
             self._messages(img, None), add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt")
+            return_dict=True, return_tensors="pt", **self.img_kw)
         full = self.proc.apply_chat_template(
             self._messages(img, str(row["ref"])), add_generation_prompt=False,
-            tokenize=True, return_dict=True, return_tensors="pt")
+            tokenize=True, return_dict=True, return_tensors="pt", **self.img_kw)
 
         ids = full["input_ids"][0]
         n_prompt = int(prompt_only["input_ids"].shape[-1])
@@ -328,11 +504,19 @@ class ReportDataset:
         return out
 
 
-def collate(batch: list[dict | None], pad_id: int) -> dict:
+def collate(batch: list[dict | None], pad_id: int, pad_to: int | None = None) -> dict:
     """Đệm PHẢI (right padding) — đây là huấn luyện, không phải sinh.
 
     (Ở khâu sinh thì ngược lại: padding_side='left', nếu không model sinh tiếp
     từ pad token. Hai chỗ khác nhau và trộn chúng là một lỗi im lặng nữa.)
+
+    `pad_to` chỉ dùng khi ĐANG DÒ BATCH, và nó là điểm mấu chốt của phép dò:
+    bình thường batch được đệm tới mẫu DÀI NHẤT TRONG BATCH, nên VRAM đỉnh phụ
+    thuộc vào việc 16 mẫu của dry-run tình cờ ngắn hay dài. Một phép dò nói
+    "batch 8 chạy được" dựa trên vài báo cáo ngắn rồi OOM ở giờ thứ ba của lần
+    chạy thật thì tệ hơn là không dò: nó tiêu tiền GPU để tạo ra một niềm tin
+    sai. Đệm tới `max_seq_len` biến phép dò thành trường hợp XẤU NHẤT — có thể
+    bi quan một nấc, và bi quan là hướng sai an toàn duy nhất ở đây.
     """
     import torch
 
@@ -344,6 +528,8 @@ def collate(batch: list[dict | None], pad_id: int) -> dict:
         raise TrainUnusable("batch rỗng sau khi lọc: mọi mẫu trong batch đều "
                             "không có token báo cáo để học.")
     n = max(b["input_ids"].shape[0] for b in batch)
+    if pad_to:
+        n = max(n, int(pad_to))
     out: dict[str, "torch.Tensor"] = {}
     for key, fill in (("input_ids", pad_id), ("labels", -100), ("attention_mask", 0),
                       ("token_type_ids", 0)):
@@ -458,14 +644,73 @@ def attach_adapter(model, arm: dict, tcfg: dict):
 
 # ── Một arm ─────────────────────────────────────────────────────────────────
 def total_steps(n_samples: int, bs: int, accum: int, epochs: int) -> int:
+    """Số bước TỐI ƯU HOÁ (không phải số lượt forward).
+
+    Chỉ phụ thuộc vào TÍCH bs × accum. Đó là lý do thang dò batch giữ tích ấy cố
+    định: tụt từ 8×4 xuống 2×16 không đổi một bước nào, nên lịch one-cycle của
+    tám arm vẫn là cùng một đường cong.
+    """
     per_epoch = math.ceil(n_samples / max(1, bs * accum))
     return max(1, per_epoch * max(1, epochs))
 
 
 def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
               val_df: pd.DataFrame, out_dir: Path, tracker=None,
-              max_steps_override: int | None = None) -> dict:
-    """Huấn luyện MỘT arm, ghi adapter vào `out_dir`. Trả về thống kê."""
+              max_steps_override: int | None = None,
+              batch: int | None = None, ladder: bool = False) -> dict:
+    """Huấn luyện MỘT arm. `ladder=True` thì tụt nấc batch khi hết VRAM.
+
+    Vì sao phải NẠP LẠI model ở mỗi nấc thay vì chỉ đổi batch: sau một OOM,
+    trạng thái optimizer đã đi được vài bước và allocator đang phân mảnh. Chạy
+    tiếp trên đúng bộ nhớ đó thì nấc thấp hơn cũng OOM theo, và cái thang tụt
+    thẳng xuống 1 mà không nấc nào được thử thật.
+
+    Và vì sao `del e` trong khối except: traceback giữ frame của `_train_once`,
+    frame giữ biến `model`, nên chỉ cần còn tham chiếu tới exception là ~8 GB
+    trọng số vẫn nằm trong VRAM khi nấc sau bắt đầu.
+    """
+    tcfg = dict(cfg["train"])
+    rungs = (batch_ladder(tcfg, start=batch) if ladder
+             else [resolve_batch(tcfg, {"batch_size": batch} if batch else None)])
+    tried: list[int] = []
+    for i, (bs, accum) in enumerate(rungs):
+        tried.append(bs)
+        if i:
+            print(f"  ↓ tụt nấc: batch {rungs[i-1][0]} -> {bs} "
+                  f"(grad_accum {rungs[i-1][1]} -> {accum}, eff_bs vẫn "
+                  f"{bs*accum})", flush=True)
+        try:
+            st = _train_once(cfg, arm, train_df, val_df, out_dir, tracker,
+                             max_steps_override, bs, accum,
+                             # Đang dò -> đo trường hợp XẤU NHẤT: mọi batch đệm
+                             # tới trần độ dài. Xem docstring collate().
+                             pad_to=int(tcfg.get("max_seq_len", 1024)) if ladder
+                             else None)
+            st["batch_rungs_tried"] = tried
+            return st
+        except Exception as e:
+            oom = is_oom(e)
+            note = f"{type(e).__name__}: {e}"[:200]
+            del e          # nhả traceback -> nhả frame -> nhả model khỏi VRAM
+            free_vram()
+            if not oom:
+                raise
+            print(f"  ✗ OOM ở batch {bs}: {note}", flush=True)
+    raise TrainUnusable(
+        f"{arm['id']} hết VRAM ở MỌI nấc của thang: {tried}. "
+        f"batch=1 mà vẫn không đủ nghĩa là chỗ tốn bộ nhớ không phải batch — "
+        f"kiểm train.max_seq_len ({tcfg.get('max_seq_len')}), "
+        f"gradient_checkpointing ({tcfg.get('gradient_checkpointing')}), "
+        f"và pan&scan (phải TẮT, xem src/imaging.py). Card này có thể đơn giản "
+        f"là không đủ cho Gemma 3 4B + DoRA.")
+
+
+def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
+                val_df: pd.DataFrame, out_dir: Path, tracker=None,
+                max_steps_override: int | None = None,
+                bs: int = 1, accum: int = 8,
+                pad_to: int | None = None) -> dict:
+    """Một lần thử ở MỘT nấc batch. Ghi adapter vào `out_dir`, trả thống kê."""
     import torch
     from transformers import Trainer, TrainingArguments
 
@@ -479,8 +724,7 @@ def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     # số quan sát được là do đó chứ không do phương pháp.
     seed_everything(int(cfg.get("seed", 42)))
 
-    bs = int(tcfg.get("per_device_batch_size", 1))
-    accum = int(tcfg.get("grad_accum", 8))
+    bs, accum = int(bs), int(accum)
     steps = max_steps_override or total_steps(
         len(train_df), bs, accum, int(tcfg.get("n_epochs", 1)))
 
@@ -492,13 +736,20 @@ def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
 
     model, processor = load_base(cfg, arm["method"], for_training=True)
     processor.tokenizer.padding_side = "right"
+    # Kiểm bằng THỰC NGHIỆM (một ảnh 2:1 -> đếm token) chứ không tin mặc định
+    # của thư viện. Rẻ, và nó chặn đúng ca hỏng im lặng nhất ở đây: pan&scan
+    # lén bật -> prompt phình -> max_seq_len cắt mất đuôi báo cáo.
+    img_kw = imaging.configure_processor(processor, cfg)
+    print(f"  ảnh: {imaging.describe(cfg)}", flush=True)
     model, pstats = attach_adapter(model, arm, tcfg)
     if bool(tcfg.get("gradient_checkpointing", True)):
         model.enable_input_require_grads()   # bắt buộc khi checkpointing + peft
         model.config.use_cache = False
 
-    ds = ReportDataset(train_df, processor, cfg, int(tcfg.get("max_seq_len", 640)))
-    ds_val = ReportDataset(val_df, processor, cfg, int(tcfg.get("max_seq_len", 640))) \
+    ds = ReportDataset(train_df, processor, cfg, int(tcfg.get("max_seq_len", 640)),
+                       img_kw=img_kw)
+    ds_val = ReportDataset(val_df, processor, cfg, int(tcfg.get("max_seq_len", 640)),
+                           img_kw=img_kw) \
         if val_df is not None and len(val_df) else None
     pad_id = processor.tokenizer.pad_token_id or 0
 
@@ -539,8 +790,11 @@ def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     args = TrainingArguments(**{k: v for k, v in ta_kw.items() if k in allowed})
 
     trainer = Trainer(model=model, args=args, train_dataset=ds,
-                      data_collator=lambda b: collate(b, pad_id),
+                      data_collator=lambda b: collate(b, pad_id, pad_to),
                       optimizers=(opt, sched))
+    if pad_to:
+        print(f"  ⚙ đang DÒ: mọi batch đệm tới {pad_to} token (trường hợp xấu "
+              f"nhất) — chậm hơn lần chạy thật, có chủ ý", flush=True)
     if tracker is not None:
         trainer.add_callback(_TrackCallback(tracker, aid))
 
@@ -558,11 +812,18 @@ def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,
         "effective_batch": bs * accum,
+        # Chính sách ảnh đi kèm adapter: khâu SINH đọc lại file này (xem
+        # runners/gemma3_adapter.py) nên arm được chấm đúng bằng cách nó được
+        # huấn luyện, kể cả khi config đã bị --set sửa ở giữa.
+        "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
+        "do_pan_and_scan": bool(imaging.policy(cfg)["do_pan_and_scan"]),
+        "processor_size": imaging.PROCESSOR_SIZE,
         "schedule": dict(tcfg["schedule"]),
         "train_loss": float(result.training_loss) if result else None,
         "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2),
         "quantized": is_quantized(arm["method"]), "dora": uses_dora(arm["method"]),
         "seed": int(cfg.get("seed", 42)),
+        "probe_pad_to": pad_to,
     }
     if ds.n_skipped:
         print(f"  ⚠ {ds.n_skipped} lần phải thay mẫu vì prompt dài hơn "
