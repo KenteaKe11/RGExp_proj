@@ -167,8 +167,8 @@ train:
   # Hai số dưới đây là ĐIỂM KHỞI ĐẦU của thang dò, không phải giá trị cuối:
   # xem khối `batch_probe`. Lần chạy thật đọc nấc đã dò được từ file thay vì
   # đọc thẳng ở đây (trừ khi bị --set ghi đè).
-  per_device_batch_size: 8       # nấc đầu tiên được thử
-  grad_accum: 4                  # = effective_batch / per_device_batch_size
+  per_device_batch_size: 2       # nấc đầu tiên được thử
+  grad_accum: 16                  # = effective_batch / per_device_batch_size
 
   # ── THANG DÒ BATCH ────────────────────────────────────────────────────────
   # Bắt đầu ở per_device_batch_size, gặp OOM thì CHIA ĐÔI rồi thử lại:
