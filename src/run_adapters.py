@@ -3,7 +3,7 @@
     python -m src.run_adapters                    # data -> train ×8 -> infer ×8 -> chấm -> Friedman -> báo cáo -> push
     python -m src.run_adapters --dry-run          # 8 ảnh, 4 bước train + DÒ BATCH
     python -m src.run_adapters --stages stats,report
-    python -m src.run_adapters --arms lora_r8,dora_r8
+    python -m src.run_adapters --arms qlora_r8,qdora_r8
 
 Mọi stage resume được, y hệt §2.1 — và ở đây nó còn quan trọng hơn: tám arm ×
 (huấn luyện + 3000 ảnh sinh) là nhiều giờ GPU, và một lần đứt ở arm thứ sáu mà
@@ -313,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # ── Ghi nấc đã dò ────────────────────────────────────────────────────
         # Lấy MIN qua tám arm, không lấy nấc của arm cuối: arm nặng nhất
-        # (qdora_r16) mới là arm quyết định, và nó không nhất thiết chạy sau
+        # (qdora_r32) mới là arm quyết định, và nó không nhất thiết chạy sau
         # cùng khi người dùng truyền --arms.
         if a.dry_run and probe_hits:
             lo = min(probe_hits.values())

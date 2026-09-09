@@ -5,11 +5,13 @@ của khối decoder** trong `google/gemma-3-4b-it`, theo tám cách, rồi hỏ
 quả đó có khác nhau thật không.
 
 ```
-{LoRA, QLoRA, DoRA, QDoRA} × {r = 8, r = 16}  →  8 arm
+{QLoRA, QDoRA} × {r = 4, 8, 16, 32}  →  8 arm   (giai thừa đầy đủ 2×4)
 ```
 
-Cùng một base, cùng 6400 mẫu huấn luyện, cùng lịch one-cycle, cùng 3000 ảnh để
-chấm. Kiểm định tổng thể là **Friedman** (mỗi ảnh là một khối), hậu kiểm là
+Cùng một base **lượng tử NF4 4-bit**, cùng 6400 mẫu huấn luyện, cùng lịch
+one-cycle, cùng 3000 ảnh để chấm. Mọi arm dùng chung nền 4-bit, nên lượng tử
+hoá là *hằng số* chứ không phải biến — hai nhánh non-Q (`lora`, `dora`) đã tắt
+vì base bf16 không vừa VRAM; lý do và cái mất/cái được ghi ở README_2.2 mục 2. Kiểm định tổng thể là **Friedman** (mỗi ảnh là một khối), hậu kiểm là
 **Wilcoxon ghép cặp + Holm**, và chỉ chạy trên metric đã bác H0.
 
 **Toàn bộ chi tiết ở [`README_2.2.md`](README_2.2.md)** — thiết kế, lý do chọn

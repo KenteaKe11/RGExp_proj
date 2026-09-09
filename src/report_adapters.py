@@ -66,7 +66,7 @@ def marginal_ranks(friedman_df: pd.DataFrame, arms: list[dict],
     """Hạng trung bình gộp theo PHƯƠNG PHÁP và theo RANK.
 
     MÔ TẢ, KHÔNG PHẢI KIỂM ĐỊNH. Friedman ở đây coi tám arm là tám mức của MỘT
-    yếu tố; nó không phân tích thiết kế 4×2. Muốn tách "phương pháp" khỏi
+    yếu tố; nó không phân tích thiết kế 2×4. Muốn tách "phương pháp" khỏi
     "rank" một cách có kiểm định thì phải dùng mô hình hai yếu tố (ART ANOVA,
     hoặc mô hình hỗn hợp trên hạng) — không có trong §2.2.
 
@@ -120,9 +120,31 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
     A("")
     A("## Câu hỏi")
     A("")
-    A("Với **cùng một base**, **cùng 6400 mẫu**, **cùng lịch one-cycle** và cùng mọi")
-    A("siêu tham số khác — bốn cách gắn adapter (LoRA · QLoRA · DoRA · QDoRA) ở hai")
-    A("mức rank (8 · 16) có cho kết quả khác nhau không, và cặp nào khác cặp nào?")
+    # Dựng từ config chứ không viết cứng: thiết kế đã đổi một lần (bỏ hai nhánh
+    # non-Q, mở rank từ 2 lên 4 mức), và một câu hỏi viết cứng sẽ mô tả sai thí
+    # nghiệm mà chính báo cáo này đang trình bày.
+    _arms = [dict(a) for a in cfg["arms"] if a.get("enabled", True)]
+    _meth, _rk = [], []
+    for a in _arms:
+        m, r = str(a["method"]).lower(), int(a["rank"])
+        if m not in _meth:
+            _meth.append(m)
+        if r not in _rk:
+            _rk.append(r)
+    _label = {"lora": "LoRA", "qlora": "QLoRA", "dora": "DoRA", "qdora": "QDoRA"}
+    _mtxt = " · ".join(_label.get(m, m) for m in _meth)
+    _rtxt = " · ".join(str(r) for r in sorted(_rk))
+    _q = all(m in ("qlora", "qdora") for m in _meth)
+    _n = int((manifest.get("n_train") or cfg["data"].get("n_train", 0)) or 0)
+    A(f"Với **cùng một base**{' **lượng tử 4-bit**' if _q else ''}, "
+      f"**cùng {_n or '?'} mẫu**, **cùng lịch one-cycle** và cùng mọi")
+    A(f"siêu tham số khác — {len(_meth)} cách gắn adapter ({_mtxt}) ở "
+      f"{len(_rk)} mức rank")
+    A(f"({_rtxt}) có cho kết quả khác nhau không, và cặp nào khác cặp nào?")
+    if _q:
+        A("")
+        A("> Mọi arm đều đứng trên **cùng một nền NF4 4-bit**, nên lượng tử hoá là "
+          "**hằng số** của thí nghiệm này, không phải biến — xem mục Giới hạn.")
     A("")
     A("## Thiết kế")
     A("")
@@ -155,12 +177,13 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
       f"pan&scan "
       f"{'BẬT' if (cfg.get('base', {}).get('image', {}) or {}).get('do_pan_and_scan') else 'tắt'}"
       f" — 256 token ảnh mỗi mẫu, giống hệt nhau ở khâu huấn luyện và khâu chấm.")
+    _rspan = f"r={min(_rk)}..{max(_rk)}" if _rk else "các mức rank"
     A(f"- **alpha**: `{t.get('alpha_mode')}`"
       + (f" — alpha = {t.get('alpha_ratio')}×r, nên hệ số nhân alpha/r **không đổi** "
-         "giữa r=8 và r=16, và cột *rank* đo đúng một thứ."
+         f"qua {_rspan}, và cột *rank* đo đúng một thứ: số chiều adapter."
          if str(t.get("alpha_mode")) == "proportional"
          else f" — alpha cố định = {t.get('alpha_fixed')}. **Lưu ý khi đọc**: hệ số "
-              "nhân alpha/r do đó khác nhau giữa r=8 và r=16, nên so sánh theo rank "
+              f"nhân alpha/r do đó khác nhau qua {_rspan}, nên so sánh theo rank "
               "trộn *số chiều adapter* với *độ lớn cập nhật*."))
     A(f"- **Tập chấm**: {manifest.get('n_eval', '?')} ảnh — giao của các tập mà cả "
       f"{len(arm_ids)} arm đều sinh được, lấy từ tập test 3k đã khoá của §2.1.")
@@ -311,7 +334,8 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
         A(_tbl(["nhóm", "mức", "hạng TB"], rows))
         A("")
         A("> Friedman ở trên coi tám arm là **tám mức của một yếu tố**; nó không phân "
-          "tích thiết kế 4×2. Bảng này chỉ để thấy nhanh hiệu ứng nào lớn hơn. Muốn "
+          f"tích thiết kế {len(_meth)}×{len(_rk)}. Bảng này chỉ để thấy nhanh hiệu "
+          "ứng nào lớn hơn. Muốn "
           "tách *phương pháp* khỏi *rank* có kiểm định thì cần mô hình hai yếu tố "
           "trên hạng (ART ANOVA hoặc mô hình hỗn hợp) — không nằm trong §2.2.")
         A("")
@@ -331,9 +355,10 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
                 _f(s.get("vram_peak_gb"), 1), _f(s.get("train_loss"), 4)])
         A(_tbl(head, rows))
         A("")
-        A("> Số tham số học **không** tỉ lệ đúng 2× giữa r=8 và r=16 ở các arm DoRA: "
-          "DoRA thêm một vector độ lớn cho mỗi module, và vector đó không phụ thuộc "
-          "rank.")
+        A("> Số tham số học **không** tỉ lệ đúng theo rank ở các arm DoRA: DoRA "
+          "thêm một vector độ lớn cho mỗi module, và vector đó không phụ thuộc "
+          "rank. Chênh lệch ấy rõ nhất ở rank thấp, nơi vector độ lớn chiếm phần "
+          "lớn hơn trong tổng.")
         A("")
 
     # ── 6. Giới hạn ─────────────────────────────────────────────────────────
@@ -353,6 +378,13 @@ def build_markdown(cfg, summary: pd.DataFrame, friedman_df: pd.DataFrame,
       "như mất vai trò tiêu chí quyết định; đọc Kendall W và r_rb trước.")
     A("- **BLEU/ROUGE/BERTScore không đo đúng/sai lâm sàng.** Một báo cáo đảo ngược "
       "kết luận gần như không bị phạt. Giới hạn này thừa hưởng nguyên từ §2.1.")
+    if _q:
+        A("- **Không có bằng chứng nào ở đây về lượng tử hoá.** Cả tám arm chạy trên "
+          "base NF4 4-bit, nên bảng này KHÔNG trả lời được câu \"4-bit có làm giảm "
+          "chất lượng so với bf16 không\". Hai nhánh non-Q (`lora`, `dora`) bị tắt vì "
+          "base bf16 chiếm ~9 GB VRAM chỉ để chứa trọng số — một ràng buộc phần cứng, "
+          "không phải một phát hiện. Đổi lại, `QDoRA vs QLoRA` ở đây sạch hơn thiết kế "
+          "cũ: hai phương pháp đứng trên cùng một nền thay vì hai nền khác nhau.")
     sw = manifest.get("stats_warning")
     for w in ([sw] if isinstance(sw, str) else list(sw or [])):
         A("")

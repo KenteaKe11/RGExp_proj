@@ -130,9 +130,9 @@ _RULES: list[tuple[str, str]] = [
      "model nạp xong mà một phần trọng số còn trên `meta` — gần như luôn là\n"
      "      device_map='auto' đã đẩy bớt lớp sang CPU/đĩa vì thiếu VRAM.\n"
      "      Đường HUẤN LUYỆN phải ghim một thiết bị (mặc định của repo:\n"
-     "      base.device_map_train=single). Thiếu VRAM cho base bf16 thì chạy\n"
-     "      bốn arm chữ Q trước:\n"
-     "        --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16"),
+     "      base.device_map_train=single). Tám arm §2.2 đều chạy trên base NF4\n"
+     "      4-bit (~4 GB); không vừa nổi thế thì hạ batch cũng vô ích — kiểm\n"
+     "      nvidia-smi xem có tiến trình cũ còn giữ VRAM không."),
     (r"out of memory|CUDA out of memory",
      "hết VRAM. Hạ batch_size của model này trong configs/adapters.yaml,\n"
      "      hoặc với Phi thì hạ num_crops (4 -> 2)."),

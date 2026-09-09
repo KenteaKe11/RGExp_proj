@@ -1,15 +1,31 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # §2.2 — TÁM BIẾN THỂ ADAPTER, KIỂM ĐỊNH FRIEDMAN
 #
-# Câu hỏi: với CÙNG một base model, CÙNG 6400 mẫu huấn luyện, CÙNG lịch học
-# one-cycle và CÙNG mọi siêu tham số khác — bốn cách gắn adapter (LoRA, QLoRA,
-# DoRA, QDoRA) ở hai mức rank (8, 16) có cho kết quả khác nhau không, và nếu
-# có thì cặp nào khác cặp nào?
+# Câu hỏi: với CÙNG một base model LƯỢNG TỬ 4-bit, CÙNG 6400 mẫu huấn luyện,
+# CÙNG lịch học one-cycle và CÙNG mọi siêu tham số khác — hai cách gắn adapter
+# (QLoRA, QDoRA) ở bốn mức rank (4, 8, 16, 32) có cho kết quả khác nhau không,
+# và nếu có thì cặp nào khác cặp nào?
 #
-# Thiết kế: 8 arm × CÙNG 3000 ảnh test của §2.1 -> mỗi ảnh là một KHỐI, trong
-# khối đó tám biến thể được xếp hạng. Đó là thiết kế khối đầy đủ, và kiểm định
-# tổng thể đúng cho nó là FRIEDMAN (xem src/stats_friedman.py để biết vì sao
-# không phải ANOVA lặp lại).
+# Thiết kế: 2 phương pháp × 4 rank = 8 arm, giai thừa đầy đủ, × CÙNG 3000 ảnh
+# test của §2.1 -> mỗi ảnh là một KHỐI, trong khối đó tám biến thể được xếp
+# hạng. Đó là thiết kế khối đầy đủ, và kiểm định tổng thể đúng cho nó là
+# FRIEDMAN (xem src/stats_friedman.py để biết vì sao không phải ANOVA lặp lại).
+#
+# ── VÌ SAO BỎ HAI NHÁNH KHÔNG LƯỢNG TỬ (lora, dora) ─────────────────────────
+# Lý do là VRAM, và nói thẳng ra thì tốt hơn để trong bụng: base bf16 chiếm
+# ~9 GB chỉ để chứa trọng số, và card dùng cho luận văn này không đủ. Nhánh
+# 4-bit chiếm ~4 GB, chạy được.
+#
+# Cái mất, phải ghi vào phần giới hạn của báo cáo: §2.2 KHÔNG còn nói được gì
+# về LƯỢNG TỬ HOÁ. Cột "QLoRA vs LoRA" biến mất, nên không có bằng chứng nào ở
+# đây cho câu "4-bit có làm giảm chất lượng không". Mọi arm đều 4-bit, nên đó
+# là HẰNG SỐ của thí nghiệm chứ không phải biến.
+#
+# Cái được: hai biến còn lại sạch hơn hẳn. Trước đây "DoRA vs LoRA" bị trộn
+# giữa hai nền (bf16 và 4-bit); giờ cả hai phương pháp đứng trên CÙNG một nền
+# 4-bit, nên hiệu số quan sát được quy đúng về phân rã hướng/độ lớn của DoRA.
+# Và chiều rank được mở từ 2 mức lên 4 (4 → 32, span 8×), đủ rộng để bảng
+# Friedman có cơ hội thấy xu thế chứ không chỉ thấy một cặp.
 #
 # Ghi đè từ dòng lệnh:  --set train.per_device_batch_size=2
 # ═════════════════════════════════════════════════════════════════════════════
@@ -67,9 +83,9 @@ data:
   # vô nghĩa, và triệu chứng lại là "điểm cao bất thường", rất dễ mừng nhầm.
   assert_no_leak: true
 
-# ── Base model: MỘT, và giữ nguyên cho cả tám arm ───────────────────────────
-# Mọi arm gắn adapter lên đúng bản này. Đổi base giữa các arm là đổi mất biến
-# độc lập của thí nghiệm.
+# ── Base model: MỘT, lượng tử 4-bit, giữ nguyên cho cả tám arm ──────────────
+# Mọi arm gắn adapter lên đúng bản này, và mọi arm đều nạp nó ở NF4 4-bit (xem
+# train.quant). Đổi base giữa các arm là đổi mất biến độc lập của thí nghiệm.
 base:
   hf_id: google/gemma-3-4b-it
   runner: gemma3_adapter
@@ -247,33 +263,61 @@ train:
   alpha_ratio: 2.0
   alpha_fixed: 16
 
-  # ── Lượng tử hoá 4-bit cho các arm chữ Q ──────────────────────────────────
-  # Dùng CHUNG một cấu hình cho QLoRA và QDoRA, nếu không thì "Q" ở hai arm
-  # nghĩa hai chuyện khác nhau.
+  # ── Lượng tử hoá 4-bit — áp cho CẢ TÁM arm ────────────────────────────────
+  # Từ khi bỏ hai nhánh non-Q, đây không còn là "cấu hình của các arm chữ Q" mà
+  # là NỀN CHUNG của cả thí nghiệm. Một cấu hình duy nhất, nếu không thì "Q" ở
+  # tám arm nghĩa tám chuyện khác nhau và cột `method` mất nghĩa.
   quant:
     load_in_4bit: true
     quant_type: nf4
     double_quant: true
     compute_dtype: bfloat16
 
-# ── Tám arm ─────────────────────────────────────────────────────────────────
+# ── Tám arm: 2 phương pháp × 4 rank, giai thừa ĐẦY ĐỦ ───────────────────────
 # Chỉ hai thứ thay đổi giữa các arm: `method` và `rank`. Mọi thứ khác lấy từ
 # khối train ở trên. Đó là điều kiện để hiệu số quan sát được quy về hai yếu tố
 # đó chứ không về điều gì khác.
 #
-#   lora   — adapter thường, base bf16
 #   qlora  — adapter thường, base lượng tử 4-bit NF4
-#   dora   — adapter tách hướng/độ lớn (use_dora=True), base bf16
-#   qdora  — DoRA trên base lượng tử 4-bit
+#   qdora  — DoRA (tách hướng/độ lớn, use_dora=True) trên cùng base 4-bit đó
+#
+# Rank đi theo cấp số nhân 4 → 8 → 16 → 32 (span 8×), không phải cách đều. Hệ
+# quả của LoRA là hạng của ma trận cập nhật, và mọi kết quả đã biết đều nói nó
+# bão hoà theo LOG chứ không theo tuyến tính: 4 → 8 là một bước lớn, 24 → 32
+# gần như không phải bước nào. Bốn mức cách đều sẽ tiêu ba trong bốn arm vào
+# vùng phẳng.
+#
+# Vì sao mở XUỐNG (thêm 4) chứ không lên (thêm 64): r=4 trên bốn ma trận
+# attention là nơi adapter có khả năng thật sự thiếu sức, tức là nơi còn tín
+# hiệu để Friedman bắt. Trên r≈16, LoRA gắn vào attention thường đã hết đường
+# cải thiện, nên r=64 rất dễ thành một arm tốn GPU mà không mang thông tin.
+#
+# alpha = alpha_ratio × r (xem train.alpha_mode) -> 8, 16, 32, 64. Hệ số nhân
+# alpha/r vì thế KHÔNG đổi qua bốn mức, nên cột rank đo đúng một thứ: số chiều.
 arms:
-  - {id: lora_r8,   method: lora,  rank: 8,  name: "LoRA r=8",   enabled: true}
-  - {id: lora_r16,  method: lora,  rank: 16, name: "LoRA r=16",  enabled: true}
+  - {id: qlora_r4,  method: qlora, rank: 4,  name: "QLoRA r=4",  enabled: true}
   - {id: qlora_r8,  method: qlora, rank: 8,  name: "QLoRA r=8",  enabled: true}
   - {id: qlora_r16, method: qlora, rank: 16, name: "QLoRA r=16", enabled: true}
-  - {id: dora_r8,   method: dora,  rank: 8,  name: "DoRA r=8",   enabled: true}
-  - {id: dora_r16,  method: dora,  rank: 16, name: "DoRA r=16",  enabled: true}
+  - {id: qlora_r32, method: qlora, rank: 32, name: "QLoRA r=32", enabled: true}
+  - {id: qdora_r4,  method: qdora, rank: 4,  name: "QDoRA r=4",  enabled: true}
   - {id: qdora_r8,  method: qdora, rank: 8,  name: "QDoRA r=8",  enabled: true}
   - {id: qdora_r16, method: qdora, rank: 16, name: "QDoRA r=16", enabled: true}
+  - {id: qdora_r32, method: qdora, rank: 32, name: "QDoRA r=32", enabled: true}
+
+  # ── Hai nhánh KHÔNG lượng tử, đã tắt ──────────────────────────────────────
+  # Giữ lại ở đây thay vì xoá: chúng là bản ghi của thiết kế cũ, và bật lại chỉ
+  # là đổi một chữ. Bật lại CẦN card đủ chứa base bf16 (~9 GB chỉ riêng trọng
+  # số nền, chưa tính activation) — nếu không, stage `train` dừng ở
+  # assert_materialized() với thông báo về VRAM.
+  #
+  # Lưu ý nếu bật lại: k tăng từ 8 lên 10 hoặc 12, và tầng hậu kiểm nhảy từ 28
+  # cặp/metric lên 45 hoặc 66. Holm chia sức cho tất cả, nên vài khác biệt thật
+  # ở metric chính có thể chìm. Đó là một quyết định về thiết kế, không phải
+  # một cái công tắc vô hại.
+  - {id: lora_r8,   method: lora,  rank: 8,  name: "LoRA r=8",   enabled: false}
+  - {id: lora_r16,  method: lora,  rank: 16, name: "LoRA r=16",  enabled: false}
+  - {id: dora_r8,   method: dora,  rank: 8,  name: "DoRA r=8",   enabled: false}
+  - {id: dora_r16,  method: dora,  rank: 16, name: "DoRA r=16",  enabled: false}
 
 # ── Chấm điểm: y hệt §2.1 ───────────────────────────────────────────────────
 metrics:

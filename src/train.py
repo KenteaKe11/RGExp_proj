@@ -1,7 +1,7 @@
 """Huấn luyện TÁM adapter trên cùng một base, cùng một lịch, cùng một dữ liệu.
 
 Toàn bộ giá trị của §2.2 nằm ở chữ "cùng". Kiểm định Friedman ở
-`src/stats_friedman.py` chỉ trả lời được câu "bốn phương pháp × hai rank có
+`src/stats_friedman.py` chỉ trả lời được câu "hai phương pháp × bốn rank có
 khác nhau không" nếu MỌI thứ khác đã bị giữ chặt: cùng 6400 mẫu, cùng thứ tự,
 cùng seed, cùng số bước, cùng lịch one-cycle, cùng chỗ gắn adapter. Mỗi biến bị
 thả lỏng là một cách giải thích khác cho bảng kết quả mà kiểm định không loại
@@ -622,15 +622,17 @@ def assert_materialized(model, device_map) -> None:
         + "    Huấn luyện trong trạng thái này hoặc nổ ở Trainer với "
           "'Cannot copy out of meta tensor', hoặc chạy chậm hàng chục lần vì "
           "mỗi bước phải kéo trọng số qua PCIe.\n"
-          "    Nguyên nhân gần như luôn là KHÔNG ĐỦ VRAM cho trọng số nền:\n"
-          "      · arm lora/dora  — Gemma 3 4B ở bf16 cần ~9 GB chỉ để chứa base\n"
-          "      · arm qlora/qdora — ~4 GB (4-bit), nhẹ hơn nhiều\n"
+          "    Nguyên nhân gần như luôn là KHÔNG ĐỦ VRAM cho trọng số nền.\n"
+          "    Tám arm của §2.2 đều chạy trên base NF4 4-bit (~4 GB) — nếu ngay\n"
+          "    cả thế cũng không vừa thì HẠ BATCH KHÔNG CỨU ĐƯỢC: batch không\n"
+          "    làm trọng số nền nhỏ đi.\n"
           "    Cách xử, theo thứ tự:\n"
-          "      1. Card < 16 GB: chạy trước bốn arm chữ Q\n"
-          "         --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16\n"
-          "      2. Bảo đảm không tiến trình nào khác đang giữ VRAM (nvidia-smi)\n"
+          "      1. nvidia-smi — một tiến trình cũ chưa chết vẫn giữ nguyên VRAM\n"
+          "         của lần chạy trước; đó là ca hay gặp nhất\n"
+          "      2. Kiểm train.quant.load_in_4bit còn `true` (arm nào cũng cần)\n"
           "      3. Thật sự có nhiều GPU: --set base.device_map_train=auto\n"
-          "         (chấp nhận model bị trải ra, và CHẬM)")
+          "         (chấp nhận model bị trải ra, và CHẬM)\n"
+          "      4. Card này có thể đơn giản là quá nhỏ cho Gemma 3 4B")
 
 
 def load_base(cfg: Cfg, method: str, for_training: bool = True):

@@ -1,8 +1,9 @@
 # §2.2 — Tám biến thể adapter, kiểm định Friedman
 
-Huấn luyện **cùng một base** bằng **bốn cách gắn adapter** × **hai mức rank**,
-mỗi biến thể đi qua **đúng 6400 mẫu** với **cùng một lịch one-cycle**, rồi hỏi:
-tám kết quả này khác nhau thật, hay chỉ là nhiễu?
+Huấn luyện **cùng một base lượng tử 4-bit** bằng **hai cách gắn adapter**
+(QLoRA · QDoRA) × **bốn mức rank** (4 · 8 · 16 · 32), mỗi biến thể đi qua **đúng
+6400 mẫu** với **cùng một lịch one-cycle**, rồi hỏi: tám kết quả này khác nhau
+thật, hay chỉ là nhiễu?
 
 §2.1 so ba model bằng kiểm định ghép cặp từng đôi. Ở đây k = 8, và "so từng đôi
 rồi hiệu chỉnh" **không còn là cách đúng để mở đầu** — nên tầng trên là
@@ -23,7 +24,8 @@ bash scripts/run_adapters.sh --detach   # ... nhưng chạy NỀN (lần chạy 
 | | |
 |---|---|
 | **Base** | `google/gemma-3-4b-it` — một bản duy nhất cho cả tám arm |
-| **Tám arm** | `{LoRA, QLoRA, DoRA, QDoRA} × {r=8, r=16}` |
+| **Tám arm** | `{QLoRA, QDoRA} × {r=4, 8, 16, 32}` — giai thừa đầy đủ 2×4 |
+| **Nền chung** | mọi arm nạp base ở **NF4 4-bit** ⇒ lượng tử hoá là *hằng số*, không phải biến |
 | **Huấn luyện** | 6400 mẫu đầu của `split_ref/train_split.csv`, 1 vòng, batch hiệu dụng **32** → **200 bước** |
 | **Batch/thiết bị** | dò tự động: 8 → 4 → 2 → 1 khi hết VRAM, `grad_accum` đi ngược lại nên eff_bs **luôn = 32** |
 | **Ảnh vào** | cạnh dài ≤ **512 px**, **pan & scan TẮT** → đúng 256 token ảnh mỗi mẫu |
@@ -70,14 +72,17 @@ lập và công suất cao — với cái giá riêng của nó, cũng ở §4.
 
 ---
 
-## 2. Bốn phương pháp, và cái gì thật sự khác nhau
+## 2. Hai phương pháp × bốn rank, và cái gì thật sự khác nhau
 
 | arm | base | adapter | ghi chú |
 |---|---|---|---|
-| `lora` | bf16 | LoRA | mốc so sánh |
-| `qlora` | **NF4 4-bit** | LoRA | ít VRAM nhất |
-| `dora` | bf16 | **DoRA** (`use_dora=True`) | tách hướng / độ lớn |
-| `qdora` | **NF4 4-bit** | **DoRA** | chậm nhất trong tám arm |
+| `qlora` | **NF4 4-bit** | LoRA | mốc so sánh của §2.2 |
+| `qdora` | **NF4 4-bit** | **DoRA** (`use_dora=True`) | tách hướng / độ lớn; chậm nhất |
+
+Mỗi phương pháp chạy ở **r = 4 · 8 · 16 · 32**. Rank đi theo cấp số nhân, không
+cách đều: hệ quả của LoRA là *hạng* của ma trận cập nhật, và nó bão hoà theo
+log — 4 → 8 là một bước lớn, 24 → 32 gần như không phải bước nào. Bốn mức cách
+đều sẽ tiêu ba trong bốn arm vào vùng phẳng.
 
 DoRA tách cập nhật thành *hướng* (LoRA) và *độ lớn* (một vector học được cho
 mỗi module). Nó chậm hơn LoRA ~1.3–2× vì phải chuẩn hoá cột trọng số mỗi bước;
@@ -85,16 +90,39 @@ trên base 4-bit thì peft còn phải giải lượng tử để lấy chuẩn,
 arm đắt nhất. **Đó là chi phí, không phải lỗi** — và nó được ghi vào bảng chi
 phí trong `REPORT.md`.
 
+### Vì sao hai nhánh non-Q (`lora`, `dora`) bị tắt
+
+Lý do là **VRAM**, và nói thẳng thì tốt hơn để trong bụng: base bf16 chiếm ~9 GB
+chỉ để chứa trọng số, còn NF4 4-bit chiếm ~4 GB. Card dùng cho luận văn này
+không đủ cho nhánh bf16 — xem lỗi `Cannot copy out of meta tensor` ở mục 3.
+
+**Cái mất, phải ghi vào phần Giới hạn của báo cáo:** §2.2 không còn nói được gì
+về lượng tử hoá. Cột "QLoRA vs LoRA" biến mất, nên ở đây **không có bằng chứng
+nào** cho câu *"4-bit có làm giảm chất lượng không"*. Mọi arm đều 4-bit ⇒ đó là
+hằng số của thí nghiệm.
+
+**Cái được:** hai biến còn lại sạch hơn hẳn. Thiết kế cũ so `DoRA vs LoRA` trên
+**hai nền khác nhau** (bf16 và 4-bit); giờ cả hai đứng trên **cùng một nền**,
+nên hiệu số quan sát được quy đúng về phân rã hướng/độ lớn của DoRA. Và chiều
+rank mở từ 2 mức lên 4 (span 8×), đủ rộng để bảng Friedman có cơ hội thấy *xu
+thế* chứ không chỉ thấy một cặp.
+
+Hai nhánh ấy vẫn nằm trong `configs/adapters.yaml` ở dạng `enabled: false` —
+bật lại chỉ là đổi một chữ, nhưng cần card đủ chứa base bf16, và lưu ý k tăng
+lên 10–12 nên tầng hậu kiểm nhảy từ 28 lên 45–66 cặp/metric (Holm chia sức cho
+tất cả).
+
 ### alpha đi theo rank, không cố định
 
-Hệ số nhân của LoRA là `alpha/r`. Nếu để `alpha = 16` cho cả `r=8` và `r=16`
-thì hệ số nhân đi từ 2.0 xuống 1.0 — nghĩa là cột "rank" trong bảng kết quả đo
+Hệ số nhân của LoRA là `alpha/r`. Nếu để `alpha = 16` cố định cho cả bốn mức
+thì hệ số nhân đi từ 4.0 (r=4) xuống 0.5 (r=32) — **tám lần**, nghĩa là cột
+"rank" trong bảng kết quả đo
 **đồng thời hai thứ**: số chiều của adapter *và* độ lớn cập nhật. Friedman không
 tách hai yếu tố đó ra, và bảng sẽ được đọc thành "rank cao hơn thì tốt/tệ hơn"
 trong khi nguyên nhân có thể nằm hoàn toàn ở hệ số nhân.
 
-Nên mặc định là `alpha_mode: proportional` (`alpha = 2r`), giữ `alpha/r` không
-đổi. Đổi sang `fixed` thì được, nhưng `REPORT.md` sẽ tự ghi rõ rằng so sánh
+Nên mặc định là `alpha_mode: proportional` (`alpha = 2r` ⇒ 8 · 16 · 32 · 64),
+giữ `alpha/r` không đổi qua cả bốn mức. Đổi sang `fixed` thì được, nhưng `REPORT.md` sẽ tự ghi rõ rằng so sánh
 rank đã bị trộn.
 
 ### Bốn ma trận attention, không thêm MLP
@@ -121,7 +149,7 @@ và ghi rõ trong báo cáo — đừng để hai lần chạy khác mặt cắt
 bash scripts/run_adapters.sh --dry-run    # thử đường ống + DÒ BATCH (xem bên dưới)
 bash scripts/run_adapters.sh              # chạy thật, trọn gói
 bash scripts/run_adapters.sh --no-push
-bash scripts/run_adapters.sh --arms lora_r8,dora_r8        # chỉ hai arm
+bash scripts/run_adapters.sh --arms qlora_r4,qdora_r4      # chỉ hai arm
 bash scripts/run_adapters.sh --stages stats,report         # tính lại từ điểm đã có
 bash scripts/run_adapters.sh --stages train --retrain      # huấn luyện lại từ đầu
 ```
@@ -221,12 +249,14 @@ không làm base nhỏ đi:
 
 | | base chiếm | |
 |---|---|---|
-| `lora` / `dora` | ~9 GB (bf16) | cần card ≥ 16 GB |
-| `qlora` / `qdora` | ~4 GB (NF4) | chạy được trên card nhỏ hơn |
+| `lora` / `dora` (đã tắt) | ~9 GB (bf16) | cần card ≥ 16 GB |
+| `qlora` / `qdora` (tám arm hiện tại) | ~4 GB (NF4) | chạy được trên card nhỏ hơn |
+
+Tám arm của §2.2 **đều** đã là 4-bit, nên nếu vẫn không vừa thì nguyên nhân
+gần như chắc chắn nằm ngoài config:
 
 ```bash
-# card nhỏ: chạy bốn arm chữ Q trước
-bash scripts/run_adapters.sh --arms qlora_r8,qlora_r16,qdora_r8,qdora_r16
+nvidia-smi     # tiến trình cũ chưa chết vẫn giữ nguyên VRAM của lần chạy trước
 # thật sự có nhiều GPU và chấp nhận chậm:
 bash scripts/run_adapters.sh --set base.device_map_train=auto
 ```
@@ -441,17 +471,20 @@ Trên một GPU 24 GB (L4 / 4090 / A10), cho **trọn tám arm**:
 | | mỗi arm | ×8 |
 |---|---|---|
 | Tải ảnh train + test (stream, lần đầu) | — | 30–60 phút, ~600 MB |
-| Huấn luyện 200 bước — `lora`/`qlora` | 35–60 phút | |
-| Huấn luyện 200 bước — `dora` | 50–90 phút | |
-| Huấn luyện 200 bước — `qdora` | 70–120 phút | |
-| | | **6–11 giờ** |
+| Huấn luyện 200 bước — `qlora` ×4 | 35–60 phút | 2,5–4 giờ |
+| Huấn luyện 200 bước — `qdora` ×4 | 70–120 phút | 4,5–8 giờ |
+| | | **7–12 giờ** |
 | Sinh 3000 ảnh, batch 4 | 25–60 phút | **3–8 giờ** |
 | Chấm điểm (BERTScore) ×8 | 5–10 phút | 40–80 phút |
 | Friedman + hậu kiểm | | < 2 phút |
-| **Tổng** | | **~10–20 giờ** |
+| **Tổng** | | **~11–21 giờ** |
 
-VRAM: arm `lora`/`dora` ~18–22 GB (bf16 + gradient checkpointing); arm `qlora`/
-`qdora` ~10–14 GB — ở **batch 1**. Con số theo batch là việc của phép dò ở mục 3;
+> Nửa số arm giờ là `qdora` (trước là một phần tư), nên phần huấn luyện
+> nhích lên so với thiết kế cũ — rank không ảnh hưởng đáng kể tới thời
+> gian, phương pháp thì có.
+
+VRAM: cả tám arm đều 4-bit, ~10–14 GB ở **batch 1** (base NF4 ~4 GB + gradient
+checkpointing + activation). Con số theo batch là việc của phép dò ở mục 3;
 đừng đoán, chạy `--dry-run` một lần rồi đọc `runs/batch_probe.json`. Đĩa: tám adapter ~150–600 MB tổng (chỉ ghi adapter, không
 ghi base — ghi base tám lần là 64 GB cho đúng một model lặp lại tám lần).
 
