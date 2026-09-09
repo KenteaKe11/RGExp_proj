@@ -88,8 +88,8 @@ generate:
 # ── Huấn luyện: MỘT cấu hình, dùng chung cho cả tám arm ─────────────────────
 train:
   n_epochs: 1                    # 6400 mẫu × 1 vòng = "train qua 6400 mẫu"
-  per_device_batch_size: 4       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
-  grad_accum: 8                  # batch hiệu dụng = 4×8 = 32
+  per_device_batch_size: 2       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
+  grad_accum: 16                  # batch hiệu dụng = 32
   max_seq_len: 640               # prompt + báo cáo; dài hơn thì cắt phần ĐUÔI
   gradient_checkpointing: true
   optimizer: adamw_torch
