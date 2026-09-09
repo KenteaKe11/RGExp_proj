@@ -29,7 +29,7 @@ data:
   ref_column: text_gt
   n_test: 3000
   cache_dir: ./data
-  image_max_side: 768
+  image_max_side: 512
   zip_mode: auto
   zip_stream_min_rate: 1.0
 
@@ -88,8 +88,8 @@ generate:
 # ── Huấn luyện: MỘT cấu hình, dùng chung cho cả tám arm ─────────────────────
 train:
   n_epochs: 1                    # 6400 mẫu × 1 vòng = "train qua 6400 mẫu"
-  per_device_batch_size: 1       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
-  grad_accum: 8                  # batch hiệu dụng 8 -> 6400/8 = 800 bước
+  per_device_batch_size: 4       # Gemma 3 4B + ảnh 768² trên GPU 24 GB
+  grad_accum: 8                  # batch hiệu dụng = 4×8 = 32
   max_seq_len: 640               # prompt + báo cáo; dài hơn thì cắt phần ĐUÔI
   gradient_checkpointing: true
   optimizer: adamw_torch
@@ -114,7 +114,7 @@ train:
   # bị step quá. `impl: torch` để dùng lớp gốc khi muốn đối chiếu.
   schedule:
     impl: lambda                 # lambda | torch
-    max_lr: 2.0e-4
+    max_lr: 3.0e-4
     pct_start: 0.1               # 10% số bước đầu để warmup
     div_factor: 25.0             # lr khởi đầu = max_lr / 25
     final_div_factor: 100.0      # lr cuối    = lr khởi đầu / 100
