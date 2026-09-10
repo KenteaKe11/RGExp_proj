@@ -1,7 +1,13 @@
-"""Huấn luyện TÁM adapter trên cùng một base, cùng một lịch, cùng một dữ liệu.
+"""Huấn luyện adapter trên cùng một base, cùng một lịch, cùng một dữ liệu.
+
+File này viết cho §2.2 (tám arm) và được §2.3 DÙNG LẠI NGUYÊN VĂN cho
+candidate A. Đó là chủ ý: "candidate A đúng là arm qdora_r4 của §2.2" phải là
+một phát biểu kiểm tra được bằng cách đọc danh sách file, không phải bằng cách
+lần theo các nhánh if. Phần §2.3 thêm vào nằm trọn ở `src/recombiner.py` và
+`src/train_recomb.py`; đường điều phối của §2.2 đã sang `_archive/`.
 
 Toàn bộ giá trị của §2.2 nằm ở chữ "cùng". Kiểm định Friedman ở
-`src/stats_friedman.py` chỉ trả lời được câu "hai phương pháp × bốn rank có
+`_archive/src/stats_friedman.py` chỉ trả lời được câu "hai phương pháp × bốn rank có
 khác nhau không" nếu MỌI thứ khác đã bị giữ chặt: cùng 6400 mẫu, cùng thứ tự,
 cùng seed, cùng số bước, cùng lịch one-cycle, cùng chỗ gắn adapter. Mỗi biến bị
 thả lỏng là một cách giải thích khác cho bảng kết quả mà kiểm định không loại

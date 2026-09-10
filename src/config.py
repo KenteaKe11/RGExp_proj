@@ -1,8 +1,12 @@
-"""Nạp và giải quyết cấu hình §2.2.
+"""Nạp và giải quyết cấu hình §2.3.
 
-Một file YAML duy nhất (configs/adapters.yaml). Không có kế thừa nhiều tầng:
-repo này chỉ chạy một thí nghiệm — tám biến thể adapter trên Gemma 3 — nên
-thêm tầng chỉ để giấu giá trị thật đi.
+Một file YAML duy nhất (configs/recomb.yaml). Không có kế thừa nhiều tầng: repo
+này chỉ chạy một thí nghiệm tại một thời điểm — ở đây là hai candidate quanh
+nhánh Recombiner — nên thêm tầng chỉ để giấu giá trị thật đi.
+
+Cấu hình của §2.2 (tám biến thể adapter + Friedman) nằm ở
+`_archive/configs/adapters.yaml`; nó vẫn nạp được bằng `--config` nếu cần chạy
+lại, nhưng đường điều phối của nó cũng đã sang `_archive/`.
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "adapters.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "recomb.yaml"
 
 
 class Cfg(dict):

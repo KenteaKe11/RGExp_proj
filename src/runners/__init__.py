@@ -1,13 +1,14 @@
 """Bảng tra runner theo tên trong config.
 
-Sau khi §2.0/§2.1 bị gỡ, repo chỉ còn MỘT họ model: Gemma 3. Hai runner ở đây
-là hai chế độ của cùng một base:
+Repo chỉ còn MỘT họ model: Gemma 3. Ba runner ở đây là ba chế độ của cùng một
+base:
 
-    gemma3          — base trần (không adapter). Giữ lại vì Gemma3AdapterRunner
-                      kế thừa toàn bộ vòng sinh/resume của nó, và vì một lần
-                      chạy base trần là mốc đối chiếu rẻ khi bảng tám arm trông
-                      lạ.
-    gemma3_adapter  — base + một adapter đã huấn luyện. Đây là runner của §2.2.
+    gemma3          — base trần (không adapter). Giữ lại vì hai runner kia kế
+                      thừa toàn bộ vòng sinh/resume của nó, và vì một lần chạy
+                      base trần là mốc đối chiếu rẻ khi bảng kết quả trông lạ.
+    gemma3_adapter  — base + một adapter đã huấn luyện. Candidate A của §2.3
+                      (và cả tám arm của §2.2, xem _archive/).
+    gemma3_recomb   — base + adapter + nhánh Recombiner. Candidate B của §2.3.
 """
 from __future__ import annotations
 
@@ -25,9 +26,14 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3_adapter import Gemma3AdapterRunner
 
         return Gemma3AdapterRunner(cfg, mcfg, tracker)
+    if kind == "gemma3_recomb":
+        from .gemma3_recomb import Gemma3RecombRunner
+
+        return Gemma3RecombRunner(cfg, mcfg, tracker)
     raise ValueError(
-        f"runner không biết: {kind!r}. Repo này chỉ còn Gemma 3 — hợp lệ: "
-        f"'gemma3', 'gemma3_adapter' (khoá `base.runner` trong configs/adapters.yaml).")
+        f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
+        f"'gemma3_recomb' (khoá `base.runner` trong configs/recomb.yaml; "
+        f"candidate B tự chuyển sang gemma3_recomb qua cờ `recomb` của arm).")
 
 
 __all__ = ["build", "Runner"]

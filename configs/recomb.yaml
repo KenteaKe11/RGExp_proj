@@ -1,0 +1,307 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.3 — HAI CANDIDATE, MỘT NHÁNH ĐEM SO
+#
+# Câu hỏi: giữ NGUYÊN adapter QDoRA rank 4 trên bốn ma trận attention, thêm vào
+# nhánh Recombiner (+ QFormer 1 vector + head phân loại có giám sát) thì chất
+# lượng báo cáo sinh ra có đổi không, và đổi bao nhiêu?
+#
+#   A  qdora_r4         QDoRA r=4, đúng arm qdora_r4 của §2.2, không thêm gì
+#   B  qdora_r4_recomb  A + Recombiner + QFormer(1 vector) + Sup-head (ASL)
+#
+# ĐÚNG HAI candidate, nên KHÔNG có Friedman ở đây. Với k = 2 thì "kiểm định tổng
+# thể" và "kiểm định cặp" là cùng một câu hỏi; chèn một tầng tổng thể vào giữa
+# chỉ chia sức của Holm mà không thêm thông tin. Thay vào đó là hai kiểm định
+# ghép cặp trả lời hai câu khác nhau — xem khối `stats` và src/stats_ab.py.
+#
+# MoE KHÔNG nằm trong thí nghiệm này. Thiết kế gốc có QFormer tách 2 vector
+# (vector 2 -> Route_Gate -> Experts LoRA + Aux Loss); ở đây chỉ chạy MỘT loại
+# QDoRA rank 4 cố định, nên Route_Gate và các Expert bị bỏ hẳn khỏi đồ thị chứ
+# không phải để đó mà tắt. Lý do: một khối tham số không có gradient nào ngoài
+# weight decay vẫn xuất hiện trong bảng đếm tham số như thể nó có ích.
+#
+# Ghi đè từ dòng lệnh:  --set train.lambda_sup=1.0
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+# ── Dữ liệu ─────────────────────────────────────────────────────────────────
+# Y HỆT §2.2 và §2.1 — cùng repo, cùng split, cùng 3000 ảnh test, cùng 6400 mẫu
+# train, cùng trần cạnh dài 512. Đây không phải sự tiện tay: nếu §2.3 đổi tập
+# chấm thì con số của nó không so được với bảng §2.2, và cả candidate A cũng
+# phải huấn luyện lại từ đầu thay vì dùng lại adapter đã có.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  assert_no_leak: true
+
+# ── Nhãn phân loại cho Sup-head ─────────────────────────────────────────────
+# `csv_helper/labels.npz` không có schema công bố, nên src/labels_cls.py DÒ cấu
+# trúc rồi IN RA cái đã dò. Ba khoá dưới đây để ghi đè khi phép dò sai — để
+# `null` là để nó tự dò.
+#
+# Chạy trước khi tốn GPU:   python -m src.labels_cls --check-split
+labels:
+  npz: csv_helper/labels.npz
+  local_path: null          # có file rồi thì trỏ thẳng, khỏi tải lại
+  key_array: null           # tên mảng KEY   trong npz (null = tự dò)
+  label_array: null         # tên mảng NHÃN  trong npz (null = tự dò)
+  # Mã CheXpert thô -> chỉ số lớp, dùng KHI VÀ CHỈ KHI nhãn ở dạng (N, L).
+  # Nhãn đã là one-hot (N, L, 3) thì khối này bị bỏ qua.
+  #   0 -> neg      1 -> pos      -1 -> uncertain      NaN -> không có nhãn
+  encoding:
+    0.0: 0
+    1.0: 1
+    -1.0: 2
+  # Trần tỉ lệ mẫu THIẾU nhãn. Vượt ngưỡng thì DỪNG, vì trên ngưỡng này head
+  # phân loại gần như không được giám sát: nhánh Recombiner mất chỗ neo gradient
+  # và candidate B hội tụ về đúng candidate A cộng thêm 50 triệu tham số ngủ —
+  # một kết quả "không khác biệt" do lỗi dữ liệu, đọc y hệt một kết quả thật.
+  max_missing_frac: 0.20
+
+# ── Base model ──────────────────────────────────────────────────────────────
+# Một base, NF4 4-bit, đóng băng, dùng chung cho cả hai candidate. Mọi chú thích
+# về device_map / pan&scan / processor_size giữ nguyên từ §2.2 (xem
+# _archive/configs/adapters.yaml nếu cần đọc lại đầy đủ lý do).
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_adapter          # candidate B tự đổi sang gemma3_recomb
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 4                   # batch lúc SINH
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+# ── Prompt: y hệt §2.1/§2.2 ─────────────────────────────────────────────────
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  repetition_penalty: 1.0
+
+# ── Huấn luyện: MỘT cấu hình, dùng chung cho cả hai candidate ───────────────
+train:
+  n_epochs: 1
+  per_device_batch_size: 2
+  grad_accum: 16
+
+  # Thang dò batch giữ nguyên cơ chế của §2.2, và ở đây nó CẦN hơn: candidate B
+  # giữ thêm activation của 4096 token × 2560 chiều cho nhánh Recombiner, nên nó
+  # có thể phải tụt một nấc so với candidate A. Batch hiệu dụng vẫn đứng yên ở
+  # 32 nên số bước tối ưu hoá của hai candidate giống hệt nhau — đó là bất biến
+  # giữ cho "cùng lịch học" đúng như §2.3 tuyên bố.
+  batch_probe:
+    enabled: true
+    effective_batch: 32
+    min_batch_size: 1
+    file: ./runs/batch_probe_recomb.json
+  max_seq_len: 1024
+  gradient_checkpointing: true
+  optimizer: adamw_torch
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_adapter_only: true
+
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+
+  # Adapter: y hệt §2.2 — bốn ma trận attention của khối NGÔN NGỮ, không MLP,
+  # không vision tower. §2.3 đổi đúng một thứ so với §2.2 (nhánh Recombiner), và
+  # mọi thứ khác phải đứng yên để hiệu số quy về đúng thứ đó.
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+  # ── GỘP HAI LOSS ──────────────────────────────────────────────────────────
+  #     L = CE(decoder)  +  lambda_sup · ASL(sup-head)
+  #
+  # 0.5 là một hằng số ĐƯỢC CHỌN, không phải được tune — và điều đó phải nằm
+  # trong phần giới hạn của báo cáo. Tune lambda trên tập test là rò rỉ; tune
+  # trên val thì val ở đây chỉ 256 mẫu và chỉ dùng để nhìn đường loss, không để
+  # chọn gì cả (xem data.n_val). Nên: chốt một giá trị, ghi rõ, và nói thẳng
+  # rằng §2.3 không trả lời được "lambda nào tốt nhất".
+  #
+  # Vì sao 0.5 chứ không 1.0: CE là mục tiêu THẬT của thí nghiệm (báo cáo sinh
+  # ra được chấm bằng BLEU/ROUGE/BERTScore). ASL chỉ là chỗ neo gradient cho
+  # nhánh Recombiner. Để ASL ngang CE là để một mục tiêu phụ kéo decoder đi, và
+  # khi bảng kết quả nói "candidate B kém hơn" thì không tách được phần nào do
+  # nhánh mới, phần nào do CE đã bị chia nửa trọng số.
+  lambda_sup: 0.5
+  # Warmup lambda: 0 = tắt. Đặt N > 0 thì lambda đi tuyến tính 0 -> lambda_sup
+  # trong N bước đầu. Bật khi thấy loss CE nhảy vọt ở vài chục bước đầu.
+  lambda_warmup_steps: 0
+
+# ── Nhánh Recombiner — chỉ candidate B dùng ─────────────────────────────────
+# Số chiều KHÔNG tự do: d_vis = 1152 và n_vis = 4096 là đầu ra của SigLIP trong
+# Gemma 3 (896² / patch 14² = 64×64 patch), d_model = 2560 là chiều ẩn của khối
+# ngôn ngữ Gemma 3 4B. Ba số đó là RÀNG BUỘC KIẾN TRÚC; src/train_recomb.py đọc
+# thẳng từ config của model đã nạp và DỪNG nếu chúng lệch với khối này.
+branch:
+  enabled: true
+
+  recombiner:
+    d_hidden: 2560      # SwiGLU: 1152 -> 2560 -> 2560   <<Expand Capacity>>
+    n_query: 32         # số token tái tổ hợp             <<Tokens Pooling>>
+    n_heads: 40         # 2560 / 8 = 64 chiều mỗi head
+    dropout: 0.0
+
+  qformer:
+    n_query: 1          # MỘT vector, chỉ để nuôi Sup-head
+    d_model: 1024       # nhỏ hơn 2560 có chủ ý — xem chú thích bên dưới
+    n_heads: 8
+    n_layers: 1
+    ffn_mult: 2
+    dropout: 0.0
+  # Vì sao QFormer hẹp hơn (1024) chứ không bằng 2560: nó chỉ phục vụ MỘT head
+  # tuyến tính dự đoán L×3 logit. Cho nó 2560 chiều là thêm ~15 triệu tham số
+  # vào phía có thể tự học phân loại mà KHÔNG cần Recombiner học được gì —
+  # nghĩa là làm yếu chính chỗ neo gradient mà nó sinh ra để phục vụ.
+
+  n_classes: 3          # neg / pos / uncertain, khớp CLASS_ORDER ở labels_cls.py
+
+  # ── ASL ───────────────────────────────────────────────────────────────────
+  # gamma áp theo GIÁ TRỊ NHÃN của từng ô, không theo tên lớp:
+  #     gamma_neg  cho ô có nhãn = 0        gamma_pos  cho ô có nhãn = 1
+  # Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô dương và 2 ô âm. Cái lệch cần
+  # xử là: lớp `neg` bật ở phần lớn bệnh lý, nên hai ô pos/uncertain gần như
+  # luôn mang nhãn 0 và dễ đoán tới mức áp đảo tổng gradient. gamma_neg = 2.0
+  # nén phần đóng góp của những ô âm ĐÃ ĐOÁN ĐÚNG; gamma_pos = 0.0 để ô dương
+  # không bị nén gì.
+  #
+  # Muốn nén theo TÊN LỚP thay vì theo giá trị nhãn thì đặt gamma_neg thành một
+  # danh sách 3 số theo thứ tự [neg, pos, uncertain]. Đó là một hàm mất mát
+  # KHÁC và báo cáo phải ghi rõ.
+  asl:
+    gamma_neg: [2.0, 0.0, 0.0]
+    gamma_pos: 0.0
+    clip: 0.035        # m: ô âm có p < m đóng góp ĐÚNG 0, không phải chỉ nhỏ
+
+  # Cổng vào decoder, khởi tạo 0. Ở bước 0, đầu vào decoder của candidate B
+  # giống hệt candidate A cộng 32 token 0, và chính cổng này học mở dần. Đặt
+  # khác 0 thì 32 token nhiễu ngẫu nhiên đi thẳng vào một decoder đóng băng, và
+  # LoRA r=4 tiêu vài chục bước đầu chỉ để học cách phớt lờ chúng.
+  decoder_gate_init: 0.0
+
+# ── Hai candidate ───────────────────────────────────────────────────────────
+# Chỉ MỘT thứ khác nhau: `recomb`. method và rank giống hệt.
+#
+# `adapter_dir` của candidate A trỏ vào đúng thư mục arm qdora_r4 của §2.2 (xem
+# output.adapter_dir): nếu §2.2 đã chạy trên máy này thì stage `train` bỏ qua A
+# và dùng lại adapter cũ — cùng seed, cùng dữ liệu, cùng lịch, nên đó ĐÚNG là
+# candidate A chứ không phải một bản gần giống. `--retrain` để huấn luyện lại.
+arms:
+  - {id: qdora_r4,        method: qdora, rank: 4, recomb: false,
+     name: "A · QDoRA r=4", enabled: true}
+  - {id: qdora_r4_recomb, method: qdora, rank: 4, recomb: true,
+     name: "B · QDoRA r=4 + Recombiner", enabled: true}
+
+# ── Chấm điểm: y hệt §2.1/§2.2 ──────────────────────────────────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định: HAI, ghép cặp, trên cùng 3000 ảnh ────────────────────────────
+# Không có tầng cổng nào cả (k = 2 không cần), nhưng có một quy tắc kết luận
+# nghiêm hơn: một metric chỉ được ghi là "candidate X thắng" khi CẢ BA điều kiện
+# cùng đúng — permutation bác H0 sau Holm, bootstrap bác H0 sau Holm, VÀ
+# |Cohen dz| >= dz_floor.
+#
+# Vì sao đòi cả hai kiểm định: chúng dùng hai cơ chế lấy mẫu khác nhau
+# (đảo dấu vs lấy lại mẫu có hoàn lại), nên một lỗi cài đặt ở vòng này không
+# kéo theo lỗi tương ứng ở vòng kia. Đây là hàng rào rẻ nhất chống lại ca hỏng
+# tệ nhất của khâu thống kê: một bảng p-value sai mà trông hoàn toàn bình thường.
+stats:
+  alpha: 0.05
+  n_perm: 10000
+  n_boot: 10000
+  ci_method: bca        # bca | percentile
+  # Sàn effect size. n = 3000 ghép cặp là RẤT lớn: permutation bác H0 với những
+  # hiệu số nhỏ hơn cả sai số làm tròn của chính metric. |dz| dưới mức này thì
+  # cột kết luận chính thức KHÔNG tính là thắng, dù p nhỏ tới đâu.
+  dz_floor: 0.10
+
+# ── Theo dõi ────────────────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  project: rgexp-recomb
+  entity: null
+  run_name: null
+  group: null
+  resume_same_run: false
+  mode: online
+  tags: [recombiner, qformer, asl, bootstrap, permutation, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.3_recombiner_ab"
+  # CÙNG thư mục adapter với §2.2, có chủ ý: arm `qdora_r4` ở đó chính là
+  # candidate A. Trọng số nhánh Recombiner của candidate B ghi cạnh adapter của
+  # nó, trong recomb_branch.safetensors.
+  adapter_dir: ./adapters
