@@ -1,0 +1,544 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.3 — ĐẶC TRƯNG SigLIP CÓ GIÚP DECODER VIẾT BÁO CÁO TỐT HƠN KHÔNG?
+#
+# Câu hỏi: với CÙNG một cấu hình LoRA, CÙNG 6400 mẫu, CÙNG lịch one-cycle,
+# CÙNG 3000 ảnh để chấm — việc nối thêm vào emb_vec một nhánh đặc trưng lấy
+# TRỰC TIẾP từ SigLIP (dim 1152, TRƯỚC khi bị căn chỉnh với text token) có làm
+# chất lượng sinh văn bản khác đi không?
+#
+# HAI candidate, và chỉ MỘT thứ khác nhau giữa chúng:
+#
+#   emb_only         inputs_embeds = [prompt ... 256 token ảnh đã căn chỉnh ...]
+#   emb_plus_recomb  inputs_embeds = [prompt ... k token Recombiner + 256 token
+#                                     ảnh đã căn chỉnh ...]
+#
+# k = recombiner.decoder_qformer.n_query. Nhánh thêm vào: SwiGLU(1152 -> 2560 ->
+# 2560) trên TỪNG patch, rồi HAI QFormer RIÊNG cùng đọc đầu ra đó:
+#
+#     heads_qformer    -> 1 vector cho MỖI task, KHÔNG biết gì về nhau
+#                           `sup` -> head phân loại (ASLoss)
+#                           `aux` -> task aux/router của MoE (mục sau)
+#                                    §2.3: ĐÓNG BĂNG + detach
+#     decoder_qformer  -> k token, CHỈ để nối vào emb_vec
+#
+# Head phân loại bị giám sát bằng ASLoss — CHỈ để tạo gradient ràng buộc; decoder
+# KHÔNG nhận logit của head (xem classifier.feed_logits_to_decoder). Vì hai
+# QFormer tách nhau, ràng buộc đó tác dụng lên RECOMBINER (điểm neo chung duy
+# nhất), không lên chính những token nối vào decoder.
+# Xem khối `recombiner` bên dưới để biết vì sao đó là quy ước bắt buộc chứ không
+# phải một lựa chọn cài đặt.
+#
+# Vì sao lấy ở nhánh SigLIP: §2.0 đã cho thấy (bằng 2D-Laplacian vs 1D-DCT +
+# Wilcoxon trên 3000 mẫu) rằng emb_vec sau căn chỉnh không còn giữ nhiều thông
+# tin thị giác chất lượng, và BLINK cho kết luận trùng khớp (~39%, chỉ hơn đoán
+# bừa một chút) dù các chỉ số cấp thấp (depth, segmentation) rất cao. Đầu ra
+# SigLIP là nơi thông tin đó CÒN nguyên.
+#
+# ── §2.3 KHÔNG chạy MoE ────────────────────────────────────────────────────
+# Thiết kế tổng (route_gate + top-k gating + aux loss cân bằng expert) nằm ở
+# mục sau. Ở §2.3 chỉ có MỘT expert và MỘT cấu hình LoRA cố định: nếu bật MoE
+# ngay đây thì hiệu số quan sát được vừa do đặc trưng SigLIP vừa do router, và
+# hai kiểm định ghép cặp bên dưới không có chỗ nào để tách chúng ra.
+#
+# Ghi đè từ dòng lệnh:  --set lora.preset=qdora_r16
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+# ── Dữ liệu: Y HỆT §2.1 và §2.2, không đổi một dòng ─────────────────────────
+# Tập test khoá cứng là điều kiện để bảng §2.3 so được với bảng §2.2 và mốc nền
+# zero-shot của §2.1. Đổi tập chấm là làm mọi so sánh chéo giữa các mục mất
+# nghĩa — và §2.3 là mục dựa nhiều nhất vào so sánh chéo.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  # Trần cạnh dài 512, cưỡng chế thật (xem src/imaging.py). Cache dùng CHUNG
+  # với §2.1/§2.2 nên phải ép lại mỗi lần chạy stage `data`.
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  assert_no_leak: true
+
+# ── Nhãn cho HEAD PHÂN LOẠI ─────────────────────────────────────────────────
+# Nguồn: csv_helper/labels.npz trong cùng repo dữ liệu. File này KHÔNG có schema
+# công bố, nên src/labels_cls.py TỰ DÒ (tên array, hướng ma trận, cách mã hoá)
+# rồi IN RA cái nó đã dò được. Kiểm bằng mắt MỘT lần trước khi tốn GPU:
+#
+#     python -m src.labels_cls
+#
+# Nếu bản dò sai, ghi thẳng tên array vào hai khoá dưới thay vì để nó đoán.
+labels:
+  npz: csv_helper/labels.npz
+  key_array: null        # null = tự dò (img_rel / keys / key / ids / index)
+  label_array: null      # null = tự dò (labels / y / label / onehot / values)
+  names_array: null      # null = tự dò (columns / label_names / names)
+
+  # Mã hoá nguồn -> ba lớp (neg, pos, uncertain). CHỈ dùng khi file lưu dạng
+  # (N, L) chứ không phải (N, L, 3): nếu đã là one-hot 3 chiều thì bảng này
+  # không được dùng tới và src/labels_cls.py nói rõ điều đó trong log.
+  #   CheXpert quy ước:  0 = âm, 1 = dương, -1 = không chắc, NaN = không đề cập
+  # "không đề cập" gộp vào `uncertain` chứ không vào `neg`: gộp vào neg là DẠY
+  # model rằng "không nói tới" nghĩa là "không có", và đó là một mệnh đề lâm
+  # sàng sai mà không phép kiểm nào ở cuối đường ống bắt được.
+  encoding:
+    neg: [0]
+    pos: [1]
+    uncertain: [-1, 2]
+    nan_to: uncertain    # uncertain | neg | ignore
+  # Mẫu không tìm được nhãn: bỏ khỏi loss phân loại (mask), KHÔNG bỏ khỏi tập
+  # huấn luyện — nó vẫn dạy được decoder viết báo cáo. Số bị mask vào
+  # train_stats.json; vượt ngưỡng này thì DỪNG, vì lúc đó head phân loại gần
+  # như không được giám sát và nhánh Recombiner mất chỗ neo gradient.
+  max_missing_frac: 0.20
+
+# ── Base model: MỘT bản, lượng tử 4-bit, giữ nguyên cho cả hai candidate ────
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_recomb
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 2          # batch lúc SINH — thấp hơn §2.2 (4) vì nhánh
+                         # Recombiner giữ 4096×2560 activation cho mỗi ảnh
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+# ── Prompt: y hệt §2.1/§2.2, nguyên văn ─────────────────────────────────────
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  repetition_penalty: 1.0
+
+# ── CẤU HÌNH LoRA: CHỌN 1 TRONG 8 BIẾN THỂ CỦA §2.2 ─────────────────────────
+# §2.3 KHÔNG so các biến thể LoRA với nhau nữa — §2.2 làm việc đó. Ở đây LoRA
+# là HẰNG SỐ, và nó phải là một hằng số ĐÃ ĐƯỢC ĐO: chọn đúng một trong tám
+# arm mà §2.2 đã chạy, để hai candidate của §2.3 đứng trên một nền có số liệu
+# kèm theo thay vì trên một cấu hình mới không ai biết nó nằm đâu.
+#
+#     qlora_r4  qlora_r8  qlora_r16  qlora_r32
+#     qdora_r4  qdora_r8  qdora_r16  qdora_r32
+#
+# ĐÃ CHỌN: `qdora_r32` — rank lớn nhất trong tám arm, VÀ nhánh DoRA. Chọn ở đây
+# là CÓ CHỦ Ý và nó là hướng sai an toàn: nếu nối thêm nhánh SigLIP vẫn thắng
+# được một baseline đã ở cấu hình mạnh nhất mà §2.2 có, thì kết luận mạnh hơn
+# nhiều so với thắng một baseline rank 4 vốn đang thiếu sức.
+#
+# Cái giá của `qdora` so với `qlora`: DoRA phải chuẩn hoá cột trọng số mỗi bước,
+# và trên base 4-bit thì peft còn phải giải lượng tử để lấy chuẩn — đây là arm
+# ĐẮT NHẤT trong tám arm của §2.2 (~1.5-2× thời gian của qlora cùng rank). Bảng
+# chi phí ở README_2.3 mục 8 đã tính theo lựa chọn này.
+#
+# Đổi preset:  --set lora.preset=qdora_r16
+# Nếu §2.2 đã chạy xong và muốn lấy arm tốt nhất theo bảng của nó:
+#     --set lora.preset=from_2_2
+# (đọc runs/2.2_adapter_friedman/metrics/summary.csv, lấy dòng đầu — bảng đó đã
+#  được sort theo meanrank của metric chính; không có file thì DỪNG chứ không
+#  âm thầm rơi về mặc định)
+lora:
+  preset: qdora_r32
+  from_2_2_summary: ./runs/2.2_adapter_friedman/metrics/summary.csv
+
+  # Tám preset hợp lệ. Đây là bản ghi, không phải chỗ để thêm biến thể mới:
+  # thêm một dòng vào đây là §2.3 chạy trên một cấu hình mà §2.2 chưa đo.
+  presets:
+    qlora_r4:  {method: qlora, rank: 4}
+    qlora_r8:  {method: qlora, rank: 8}
+    qlora_r16: {method: qlora, rank: 16}
+    qlora_r32: {method: qlora, rank: 32}
+    qdora_r4:  {method: qdora, rank: 4}
+    qdora_r8:  {method: qdora, rank: 8}
+    qdora_r16: {method: qdora, rank: 16}
+    qdora_r32: {method: qdora, rank: 32}
+
+# ── Huấn luyện: MỘT cấu hình, dùng chung cho CẢ HAI candidate ───────────────
+train:
+  n_epochs: 1
+  per_device_batch_size: 4
+  grad_accum: 8
+
+  # ── THANG DÒ BATCH — FILE RIÊNG, KHÔNG DÙNG CHUNG VỚI §2.2 ───────────────
+  # Nhánh Recombiner giữ 4096×2560 activation cho mỗi ảnh, cộng ~200 MB tham số
+  # fp32 và hai moment AdamW của chúng. Hình dạng bộ nhớ khác hẳn §2.2, nên
+  # `runs/batch_probe.json` của §2.2 KHÔNG áp được: đọc nó là gần như chắc chắn
+  # OOM ở giờ thứ nhất, và OOM sau khi đã tải 9400 ảnh là mất thời gian thật.
+  #
+  # Nấc dò được là nấc THẤP NHẤT mà CẢ HAI candidate cùng qua — không phải nấc
+  # riêng từng candidate. Hai candidate chạy hai batch khác nhau là hai điều
+  # kiện huấn luyện khác nhau, và kiểm định ghép cặp bên dưới quy mọi hiệu số
+  # về "có nhánh Recombiner hay không"; nó không có chỗ nào để trừ đi phần do
+  # batch.
+  batch_probe:
+    enabled: true
+    effective_batch: 32
+    min_batch_size: 1
+    file: ./runs/batch_probe_2_3.json
+  max_seq_len: 1024              # KHÔNG tính k token chèn thêm — xem chú thích
+                                 # recombiner.n_query bên dưới
+  gradient_checkpointing: true
+  optimizer: adamw_torch
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_adapter_only: true
+
+  # Lịch one-cycle: y hệt §2.2, kể cả `impl: lambda` và lý do của nó.
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+
+  # ── LR RIÊNG CHO NHÁNH MỚI ────────────────────────────────────────────────
+  # LoRA khởi tạo B = 0 nên nó bắt đầu từ đúng model nền; Recombiner/QFormer
+  # khởi tạo ngẫu nhiên nên ở bước 0 nó bơm k token NHIỄU vào giữa prompt. Cho
+  # nó cùng lr với LoRA là để nhiễu đó đi qua 200 bước với biên độ ngang một
+  # adapter đã được canh cho fine-tune.
+  #
+  # sidecar_lr_mult nhân vào max_lr CHỈ cho nhóm tham số mới. Đường cong
+  # one-cycle vẫn là MỘT đường duy nhất cho mọi nhóm (cùng warmup, cùng cosine)
+  # — chỉ biên độ khác. Giữ một đường cong là điều kiện để câu "hai candidate
+  # cùng lịch học" còn đúng.
+  sidecar_lr_mult: 1.0
+  sidecar_weight_decay: 0.01     # nhánh mới là mạng dày đặc, khác LoRA
+  # Cổng nhân vào k token, khởi tạo 0 -> ở bước 0 candidate B GIỐNG HỆT
+  # candidate A, rồi mở dần theo học. Không có nó, 20-30 bước đầu của B là học
+  # cách sống với nhiễu chứ không phải học đặc trưng ảnh — và với ngân sách 200
+  # bước thì đó là 15% ngân sách.
+  sidecar_gate_init: 0.0
+
+  # ── lr RIÊNG CHO GATE, và đây là chỗ dễ hỏng nhất của §2.3 ────────────────
+  # AdamW chuẩn hoá bước cập nhật, nên `gate` dịch khoảng `lr` mỗi bước — không
+  # hơn, dù gradient lớn tới đâu. Với max_lr = 3e-4 và 200 bước một cycle
+  # (trung bình ~0.6·max_lr), quãng đường TỐI ĐA của một gate khởi tạo 0 là
+  #
+  #     200 × 3e-4 × 0.6 ≈ 0.036
+  #
+  # tức k token vào decoder với biên độ ~3.6% so với hàng xóm của chúng. Khi đó
+  # candidate B thực chất LÀ candidate A, hai cột trong bảng gần như trùng, và
+  # §2.3 kết luận "đặc trưng SigLIP không giúp" — trong khi thứ vừa được đo là
+  # số học của AdamW, không phải dữ liệu.
+  #
+  # ×20 nâng trần lên ~0.72: đủ để cổng MỞ ĐƯỢC nếu dữ liệu muốn thế, và vẫn đủ
+  # chậm để nó không mở khi dữ liệu không muốn. Điểm chính là gate được PHÉP
+  # mở, không phải bị ÉP mở — `gate_final` trong train_stats.json là con số nói
+  # nó có mở hay không, và REPORT.md đọc nó trước bảng BLEU.
+  gate_lr_mult: 20.0
+
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+# ── NHÁNH RECOMBINER: MỘT SwiGLU, HAI QFormer ───────────────────────────────
+# Nguồn đặc trưng: `vision_tower(pixel_values).last_hidden_state`, tức đầu ra
+# SigLIP TRƯỚC multi_modal_projector — (B, 4096, 1152) cho ảnh 896² patch 14.
+#
+# MỘT lượt SigLIP cho cả hai đường: §2.3 gọi vision_tower ĐÚNG MỘT LẦN mỗi
+# batch rồi dùng kết quả cho cả (a) multi_modal_projector -> 256 token ảnh đã
+# căn chỉnh, và (b) Recombiner. Chạy hai lượt là tăng gấp đôi phần đắt nhất của
+# forward để lấy lại đúng cùng một tensor.
+#
+# Sau SwiGLU có HAI ĐẦU RA, đi vào HAI QFormer RIÊNG (trọng số riêng):
+#
+#   SwiGLU(4096 patch, 2560)
+#     ├─> heads_qformer    -> 1 vector cho MỖI task, KHÔNG biết gì về nhau
+#     │     ├─ `sup` -> head phân loại (ASLoss)
+#     │     └─ `aux` -> task aux/router của MoE — §2.3 ĐÓNG BĂNG + detach
+#     └─> decoder_qformer  -> n_query token -> gate -> nối vào emb_vec
+#
+# Vì sao HAI QFormer chứ không phải một: nếu hai đầu việc dùng chung query và
+# trọng số QFormer thì gradient của ASLoss định hình luôn những token đi vào
+# decoder, và câu "head chỉ ràng buộc gradient" thành SAI — head khi đó đang
+# thiết kế đầu vào của decoder. Tách ra thì mỗi đường có tham số riêng, và điểm
+# neo chung duy nhất là SwiGLU Recombiner. Nói cách khác: ràng buộc của ASLoss
+# tác dụng lên RECOMBINER, không lên token nối vào.
+recombiner:
+  # dim đầu vào. null = đọc từ config.vision_config.hidden_size của base và
+  # KIỂM lại bằng shape thật của tensor. Ghi số cứng vào đây chỉ để tài liệu
+  # hoá; nếu nó lệch với model thì src/recombiner.py DỪNG.
+  siglip_dim: 1152
+
+  # SwiGLU trên TỪNG patch: 1152 -> swiglu_hidden (gate·up) -> out_dim.
+  # ĐÃ TINH CHỈNH: 2560 (không phải 4096). Hidden bằng đúng out_dim giữ khối này
+  # ở tỉ lệ 1:1 thay vì phình ra rồi nén lại, cắt ~7,5 M tham số và — quan trọng
+  # hơn — cắt activation 4096×hidden cho MỖI ảnh ở khâu backward, đúng chỗ tốn
+  # VRAM nhất của nhánh. Giờ có hai QFormer nên phần VRAM đó đắt hơn trước.
+  #
+  # out_dim: null = text hidden size của base (2560 với gemma-3-4b-it). Đặt số
+  # khác là lỗi shape lúc nối vào inputs_embeds, và src/recombiner.py nói thẳng
+  # điều đó thay vì để torch báo mismatch ở forward đầu tiên.
+  swiglu_hidden: 2560
+  out_dim: null
+  swiglu_dropout: 0.0
+  pre_norm: true                 # RMSNorm trên đặc trưng SigLIP trước SwiGLU
+
+  # ── QFormer #1 — HAI VECTOR CHO HAI TASK, KHÔNG BIẾT GÌ VỀ NHAU ───────────
+  # Đây là QUY ƯỚC CỦA THIẾT KẾ, không phải một chi tiết cài đặt. Mỗi task nhận
+  # ĐÚNG MỘT vector, và hai vector đó không được biết gì về nhau.
+  #
+  # Nên self-attention ở QFormer này bị TẮT CỨNG (không phải một khoá config):
+  # với một vector mỗi task, mọi attention query<->query đều là nhiễm chéo giữa
+  # hai task theo định nghĩa. Đặt `self_attn: true` ở đây là DỪNG.
+  # Cross-attention (query -> patch) không cần mặt nạ: nó không có đường nào
+  # giữa hai query. Trọng số thân QFormer thì dùng chung — cái bị chặn là ĐƯỜNG
+  # THÔNG TIN.
+  #
+  # `freeze`: §2.3 không có task aux (không chạy MoE), nên vector đó bị đóng
+  # băng — query `requires_grad=False` VÀ đầu ra bị `detach`. Chỉ khoá query là
+  # chưa đủ: nếu vector còn trong đồ thị và có ai đó cộng nó vào một loss thì
+  # gradient vẫn chảy ngược qua thân QFormer và Recombiner. Ở §2.3 không loss
+  # nào dùng nó, nhưng "không xảy ra vì hiện tại không ai gọi" là bảo đảm yếu.
+  #
+  # Vì sao GIỮ vector aux lại thay vì bỏ hẳn: hình dạng checkpoint khi đó khớp
+  # với mục MoE, nên Recombiner + heads_qformer của §2.3 nạp được sang đó. Cái
+  # giá là cross-attention cho ĐÚNG một query nữa — không đáng kể.
+  heads_qformer:
+    tasks: [sup, aux]
+    freeze: [aux]
+    # 1 lớp, ffn×1: khối này chỉ phải sinh HAI vector, không phải 32 token. Đây
+    # là lựa chọn của bản dựng, không suy ra từ thiết kế — nâng lên 2 lớp là
+    # thêm ~39 M tham số cho hai vector.
+    n_layers: 1
+    n_heads: 8
+    ffn_mult: 1
+    dropout: 0.0
+    pre_norm: true
+
+  # ── QFormer #2 — n_query TOKEN, CHỈ ĐỂ NỐI VÀO emb_vec ────────────────────
+  # n_query = 32. Vì sao không nhỏ hơn: 4096 patch nén xuống 8 token thì phần
+  # "mối liên hệ cục bộ" — chính thứ §2.3 đi tìm — bị bình quân hoá mất. Vì sao
+  # không lớn hơn: token nối vào CHIẾM CHỖ trong chuỗi, và 128 là thêm 12% độ
+  # dài cho mọi bước của mọi batch.
+  #
+  # LƯU Ý VỀ max_seq_len: token nối vào được chèn SAU khi mẫu đã bị cắt về
+  # max_seq_len, nên chuỗi thật vào decoder dài max_seq_len + n_query. Làm vậy
+  # có chủ ý: nếu trừ n_query vào trần thì candidate B học trên nhãn NGẮN HƠN
+  # candidate A đúng n_query token, và một phần hiệu số quan sát được là do độ
+  # dài nhãn chứ không do đặc trưng ảnh. Hai candidate phải thấy CÙNG một lượng
+  # văn bản đích.
+  #
+  # `self_attn: true` ở ĐÂY là đúng và cần: 32 token của cùng MỘT nhóm phải
+  # phối hợp với nhau (khác hẳn hai vector của hai task ở QFormer #1).
+  decoder_qformer:
+    n_query: 32
+    n_layers: 2
+    n_heads: 8
+    ffn_mult: 2                  # ĐÃ TINH CHỈNH (quay lại 2)
+    dropout: 0.0
+    self_attn: true
+    pre_norm: true
+
+  # ── Đưa token nối vào CÙNG THANG với 256 token ảnh ────────────────────────
+  # Đầu ra QFormer qua RMSNorm nên RMS ≈ 1. Nhưng chuỗi mà nó được nối vào KHÔNG
+  # ở thang đó: embedding văn bản của Gemma đã nhân sqrt(hidden) ≈ 50 bên trong
+  # Gemma3TextScaledWordEmbedding, còn 256 token ảnh mang thang riêng mà
+  # multi_modal_projector học được. Nối một tensor RMS ≈ 1 vào giữa chúng là nối
+  # một tín hiệu nhỏ hơn hàng chục lần so với hàng xóm — decoder học cách bỏ qua
+  # nó trong vài bước, và §2.3 kết luận "đặc trưng SigLIP không giúp" trong khi
+  # thứ được đo là một chênh lệch biên độ.
+  #
+  # true = lấy thang từ DỮ LIỆU: RMS của chính 256 token ảnh trong batch đang
+  # chạy (no_grad — nó là mốc đo, không phải đường gradient; cho nó học được thì
+  # mạng có hai cách hạ loss và `gate` mất nghĩa "cổng mở bao nhiêu").
+  match_scale: true
+
+  # token_type_ids gán cho k token chèn vào.
+  #   image (mặc định) — gán 1, cùng loại với 256 token ảnh. Vì k token được
+  #                      chèn NGAY TRƯỚC khối ảnh, chúng nhập vào cùng một dải
+  #                      liên tục và Gemma 3 cho cả dải attention HAI CHIỀU
+  #                      (xem Gemma3Model._update_causal_mask). Đó là cách 256
+  #                      token ảnh vốn được đối xử, nên k token mới được đối xử
+  #                      y như vậy.
+  #   text            — gán 0, attention một chiều như token văn bản.
+  # Đổi giá trị này là đổi kiến trúc, không phải đổi một cờ: ghi vào báo cáo.
+  token_type: image
+
+# ── HEAD PHÂN LOẠI + ASLoss ─────────────────────────────────────────────────
+# Vai trò ở §2.3: RÀNG BUỘC GRADIENT LÊN RECOMBINER, không phải đầu vào của
+# decoder.
+#
+# Vì sao cần: nhánh mới là ~212 M tham số khởi tạo ngẫu nhiên, và tín hiệu duy
+# nhất chạm tới chúng từ CE là gradient đi qua 34 lớp decoder, một adapter rank
+# thấp, và một cổng khởi tạo 0. Với 200 bước, chuyện dễ xảy ra nhất là token nối
+# vào hội tụ về một hằng số vô hại: candidate B khi đó KHÔNG hỏng, nó chỉ lặng lẽ
+# trở thành candidate A cộng thêm 212 M tham số ngủ, và bảng kết quả nói "nối đặc
+# trưng SigLIP không có tác dụng" trong khi điều thật sự xảy ra là nhánh ấy chưa
+# bao giờ học gì.
+#
+# Head đọc ĐÚNG vector `sup` của heads_qformer, dự đoán nhãn bệnh lý, và ASLoss
+# buộc RECOMBINER phải sinh ra đặc trưng mà từ đó bệnh lý giải mã được. Vì
+# decoder_qformer đọc CHÍNH đặc trưng đó, ràng buộc lan tới đường vào decoder một
+# cách gián tiếp — qua điểm neo chung, không qua tham số chung.
+#
+# Đó là một mệnh đề kiểm chứng được: cls_f1_pos trong train_stats.json ở mức đoán
+# bừa nghĩa là Recombiner chưa học, và điều đó phải đọc được TRƯỚC bảng BLEU.
+classifier:
+  enabled: true
+  # Decoder KHÔNG nhận logit của head. Bật lên là thêm một đường thông tin nữa
+  # vào candidate B, và khi đó hiệu số quan sát được vừa do đặc trưng SigLIP
+  # vừa do nhãn bệnh lý đã được dự đoán sẵn — hai kiểm định ghép cặp không tách
+  # được. Để `false` ở §2.3; nó thuộc mục sau.
+  feed_logits_to_decoder: false
+  n_labels: null                 # null = lấy từ labels.npz
+  n_classes: 3                   # neg / pos / uncertain
+  hidden: 1024
+  # Đầu vào của head là ĐÚNG MỘT vector (nhóm `sup` của heads_qformer có kích
+  # thước 1), nên không có bước pool: pool trên một token là một phép biến đổi vô
+  # nghĩa tốn ~26 M tham số (attn-pool ở dim 2560). `attn`/`mean` chỉ còn nghĩa
+  # nếu ai đó nâng `sup` lên nhiều hơn một vector.
+  pool: none                     # none | attn | mean
+  dropout: 0.1
+
+  # ── ASLoss (Asymmetric Loss) ──────────────────────────────────────────────
+  # Không dùng CE thường: nhãn lệch nặng (phần lớn ô là `neg`), và CE trên nhãn
+  # lệch cho ra một head dự đoán "âm hết" với loss thấp và F1 dương ~0. Đó lại
+  # là ca hỏng im lặng đúng kiểu: loss đẹp, số liệu vô nghĩa.
+  #
+  # ASL tính trên TỪNG Ô của one-hot (L × 3) theo sigmoid, không phải softmax
+  # theo hàng: mỗi ô là một câu hỏi nhị phân "ô này có bật không".
+  #   gamma_neg = 2.0 — nén gradient của các ô ĐANG TẮT (target 0). Đây là
+  #                     "lực nén grad neg" trong dàn ý.
+  #   gamma_pos = 0.0 — KHÔNG nén ô đang bật (target 1), kể cả ô `uncertain`:
+  #                     ô dương vốn đã hiếm, nén thêm là bóp đúng phần tín hiệu
+  #                     mình cần.
+  #   clip      = 0.05 — dịch xác suất của ô tắt xuống 0.05 rồi kẹp ở 0. Ô tắt
+  #                     mà model đã tự tin dưới 0.05 thì đóng góp gradient
+  #                     ĐÚNG BẰNG 0, không phải "gần 0".
+  asl:
+    gamma_neg: 2.0
+    gamma_pos: 0.0
+    clip: 0.05
+    eps: 1.0e-8
+    disable_grad_focal: true     # không cho hệ số focal nhận gradient (khuyến
+                                 # nghị của bài ASL: nó chỉ là trọng số)
+
+  # Trọng số loss phụ: loss = CE_decoder + lambda × ASL.
+  # 0.2 là điểm khởi đầu có chủ ý, không phải giá trị đã tinh chỉnh: đủ để
+  # nhánh mới nhận gradient rõ ràng, đủ nhỏ để CE vẫn là thứ dẫn dắt. Nếu đổi,
+  # nó phải VÀO BÁO CÁO — cùng một cặp candidate với hai lambda khác nhau là
+  # hai thí nghiệm.
+  lambda: 0.2
+  # lambda được warmup tuyến tính trong pct đầu của lịch, cùng nhịp warmup lr.
+  # Ở bước 0 head cũng ngẫu nhiên như Recombiner, nên lambda đầy ngay từ đầu là
+  # đẩy nhánh mới theo một gradient chưa mang thông tin gì.
+  lambda_warmup_pct: 0.1
+
+# ── HAI CANDIDATE ───────────────────────────────────────────────────────────
+# Chỉ MỘT thứ khác nhau: `recombiner`. Mọi thứ còn lại — preset LoRA, seed, thứ
+# tự dữ liệu, batch, lịch học, chính sách ảnh — lấy từ các khối trên và giống
+# hệt nhau. Đó là điều kiện để hiệu số theo từng ảnh quy về đúng một nguyên
+# nhân.
+arms:
+  - id: emb_only
+    name: "LoRA · chỉ emb_vec"
+    recombiner: false
+    enabled: true
+  - id: emb_plus_recomb
+    name: "LoRA · emb_vec + Recombiner"
+    recombiner: true
+    enabled: true
+
+# ── Chấm điểm: y hệt §2.1/§2.2 ──────────────────────────────────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định: HAI candidate -> quay về kiểm định GHÉP CẶP ──────────────────
+# §2.2 dùng Friedman vì k = 8 và "so từng đôi rồi hiệu chỉnh" không còn là cách
+# đúng để mở đầu. Ở đây k = 2: chỉ có MỘT cặp, nên không có tầng tổng thể nào
+# cần thiết và Friedman với k=2 chỉ là một dạng kém hơn của kiểm định dấu.
+#
+# Hai kiểm định trên CÙNG một vector hiệu số d_i = B_i − A_i, trả lời hai câu
+# khác nhau, và báo cáo in cả hai:
+#   paired bootstrap (BCa) — "hiệu số thật nằm trong khoảng nào"
+#   permutation (sign-flip) — "nếu hai candidate như nhau thì hiệu số cỡ này
+#                             hiếm tới đâu"
+# Họ kiểm định là 8 metric (BLEU-1..4, ROUGE-1/2/L, BERTScore-F1), hiệu chỉnh
+# Holm; BH in kèm để đọc đối chiếu.
+stats:
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci: 0.95
+  # Sàn effect size, cùng vai với rrb_floor của §2.2: n = 3000 khiến p rất nhỏ
+  # ở những hiệu số không nói được gì về thực hành. Cặp có |d_z| dưới sàn bị
+  # đánh dấu "không đáng kể" và KHÔNG được tính là thắng ở cột kết luận.
+  dz_floor: 0.10
+  # Kết luận chính thức lấy từ permutation + Holm trên 8 metric. Bootstrap CI
+  # là câu trả lời về ĐỘ LỚN, không phải về ý nghĩa.
+  primary_test: perm
+
+wandb:
+  enabled: true
+  project: rgexp-recombiner
+  entity: null
+  run_name: null
+  group: null
+  resume_same_run: false
+  mode: online
+  tags: [recombiner, qformer, siglip, asl, paired-bootstrap, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.3_recombiner"
+  adapter_dir: ./adapters_2_3

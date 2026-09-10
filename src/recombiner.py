@@ -308,6 +308,24 @@ class AsymmetricLoss(nn.Module):
 
 
 # ── Vỏ bọc: base Gemma đóng băng + LoRA + nhánh Recombiner ──────────────────
+def float_dtype(mod, default=torch.float32):
+    """dtype của tham số DẤU PHẨY ĐỘNG đầu tiên — bỏ qua trọng số đã lượng tử.
+
+    `next(model.parameters()).dtype` là cách viết quen tay và ở đây nó SAI: trên
+    base NF4, tham số đầu tiên là một `Params4bit` với dtype **uint8**. Ép
+    `pixel_values` sang uint8 rồi đưa vào vision tower thì ảnh bị lượng tử hoá
+    thành 256 mức nguyên — không có exception nào, model vẫn huấn luyện, và
+    candidate B chỉ đơn giản là học trên ảnh hỏng.
+
+    Tham số bf16 vẫn còn nhiều (embedding, norm, Conv2d patch-embed của SigLIP —
+    bitsandbytes chỉ lượng tử nn.Linear), nên hàm này luôn tìm được cái đúng.
+    """
+    for p in mod.parameters():
+        if p.is_floating_point():
+            return p.dtype
+    return default
+
+
 def _find_module(root, names: tuple[str, ...]):
     """Lần theo cây module tìm attribute đầu tiên khớp. Không đoán theo phiên bản.
 
@@ -362,6 +380,29 @@ class RecombGemma(torch.nn.Module):
         self.decoder_gate = nn.Parameter(
             torch.full((recombiner.d_model,), float(decoder_gate_init)))
         self.config = getattr(lm, "config", None)
+
+        # ── VÌ SAO PHẢI CẮM CỜ NÀY ────────────────────────────────────────────
+        # HF Trainer.__init__ có phép kiểm:
+        #
+        #     _is_quantized_and_base_model = getattr(model, "is_quantized", False) \
+        #         and not getattr(model, "_hf_peft_config_loaded", False)
+        #     if _is_quantized_and_base_model and not _is_peft_model(model) ...:
+        #         raise ValueError("You cannot perform fine-tuning on purely
+        #                           quantized models...")
+        #
+        # Vỏ bọc này KHÔNG phải instance của peft.PeftModel (nó CHỨA một cái),
+        # nên `_is_peft_model()` trả False; còn `is_quantized` thì __getattr__
+        # bên dưới lấy được từ `lm` và trả True. Trainer kết luận "model lượng
+        # tử trần, không có adapter nào" và dừng.
+        #
+        # Kết luận đó SAI về sự thật: adapter QDoRA đã gắn, chỉ nằm sâu hơn một
+        # tầng. `_hf_peft_config_loaded` đúng là cờ mà transformers dùng để nói
+        # "model này đã có adapter PEFT", nên cắm nó ở đây là phát biểu đúng chứ
+        # không phải mẹo đi vòng. Nó chỉ được đọc ở đúng phép kiểm trên; hai chỗ
+        # còn lại trong Trainer đụng tới peft_config đều đứng sau
+        # `_is_peft_model()` nên không với tới vỏ bọc này.
+        self._hf_peft_config_loaded = True
+
         # Trainer gọi hai hàm này khi bật gradient checkpointing.
         for fn in ("gradient_checkpointing_enable", "gradient_checkpointing_disable",
                    "enable_input_require_grads"):
@@ -402,14 +443,8 @@ class RecombGemma(torch.nn.Module):
     def _embed(self, input_ids, pixel_values):
         """-> (inputs_embeds đã ghép ảnh + 32 token, số token đã chèn, vec sup)."""
         emb_layer = self.lm.get_input_embeddings()
-        emb = emb_layer(input_ids)
 
-        vis = self._vision(pixel_values.to(dtype=next(self.lm.parameters()).dtype))
-        img = self._project(vis).to(emb.dtype)                 # (B, 256, 2560)
-
-        # Ghép token ảnh vào đúng vị trí placeholder. Đây là bản chép lại tối
-        # thiểu phần Gemma3 làm bên trong; kiểm ĐẾM trước khi ghép, vì
-        # masked_scatter với số lượng lệch thì vẫn chạy và ghép sai chỗ.
+        # Vị trí token ảnh, xác định TRƯỚC khi tra embedding.
         tok_id = getattr(self.config, "image_token_index", None)
         if tok_id is None:
             tok_id = getattr(self.config, "image_token_id", None)
@@ -418,6 +453,23 @@ class RecombGemma(torch.nn.Module):
                 "config không có image_token_index/image_token_id — không xác "
                 "định được vị trí token ảnh, và ghép sai chỗ là lỗi im lặng.")
         m = (input_ids == int(tok_id))
+
+        # Zero hoá id của token ảnh trước khi tra bảng. Ở một số cấu hình Gemma 3,
+        # image_token_index >= vocab_size của khối ngôn ngữ (nó là token đặc biệt
+        # nằm NGOÀI bảng embedding), và tra thẳng là IndexError ở CUDA — nổ ở
+        # tận trong kernel với thông báo "device-side assert triggered", không
+        # nhắc gì tới token ảnh. Gemma3 gốc cũng làm đúng bước này. Những vị trí
+        # ấy bị masked_scatter ghi đè ngay bên dưới nên giá trị 0 không đi tới đâu.
+        emb = emb_layer(input_ids.masked_fill(m, 0))
+
+        # dtype lấy từ tham số DẤU PHẨY ĐỘNG, không phải tham số đầu tiên —
+        # xem docstring float_dtype(). Đây là chỗ base 4-bit hay cắn.
+        vis = self._vision(pixel_values.to(dtype=float_dtype(self.lm, emb.dtype)))
+        img = self._project(vis).to(emb.dtype)                 # (B, 256, 2560)
+
+        # Ghép token ảnh vào đúng vị trí placeholder. Đây là bản chép lại tối
+        # thiểu phần Gemma3 làm bên trong; kiểm ĐẾM trước khi ghép, vì
+        # masked_scatter với số lượng lệch thì vẫn chạy và ghép sai chỗ.
         n_slot, n_feat = int(m.sum()), int(img.shape[0] * img.shape[1])
         if n_slot != n_feat:
             raise RuntimeError(

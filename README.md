@@ -47,7 +47,7 @@ requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
   setup.sh                   dựng môi trường
   run_recomb.sh              MỘT LỆNH chạy trọn §2.3
-  selftest_recomb.py         60 phép kiểm, không cần GPU/mạng/model
+  selftest_recomb.py         63 phép kiểm, không cần GPU/mạng/model
   _env.sh                    chọn python (container vs cục bộ)
 src/
   config.py                  nạp YAML, seed, token

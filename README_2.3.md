@@ -303,7 +303,7 @@ weight decay vẫn xuất hiện trong bảng đếm tham số như thể nó c�
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest_recomb.py        # 60 phép kiểm, vài giây, không cần GPU
+python scripts/selftest_recomb.py        # 63 phép kiểm, vài giây, không cần GPU
 python scripts/selftest_recomb.py -v     # kèm traceback
 ```
 
@@ -347,7 +347,7 @@ src/
   preflight.py                kiểm môi trường trước khi nạp model
 scripts/
   run_recomb.sh               MỘT LỆNH chạy trọn §2.3
-  selftest_recomb.py          60 phép kiểm, không cần GPU/mạng/model
+  selftest_recomb.py          63 phép kiểm, không cần GPU/mạng/model
   setup.sh · _env.sh          môi trường
 _archive/                     §2.0, §2.1, §2.2 — đã chốt, xem README.md
 ```

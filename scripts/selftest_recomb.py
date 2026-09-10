@@ -328,7 +328,8 @@ def branch_tests() -> None:
         return
 
     from src.recombiner import (AsymmetricLoss, QFormer, Recombiner, RecombGemma,
-                                RMSNorm, SupHead, TokenPool, build_branch)
+                                RMSNorm, SupHead, TokenPool, build_branch,
+                                float_dtype)
 
     D_VIS, D_MODEL, N_VIS, N_Q, L_LAB = 16, 24, 64, 8, 5
     torch.manual_seed(0)
@@ -484,13 +485,23 @@ def branch_tests() -> None:
             return self.lin(vis.view(b, 4, N_VIS // 4, D_VIS).mean(2))
 
     class FakeLM(nn.Module):
-        def __init__(self):
+        """LM giả mô phỏng ĐÚNG những gì vỏ bọc đụng tới, gồm cả bẫy 4-bit.
+
+        `q4` là một tham số uint8 đứng ĐẦU danh sách parameters(), y như
+        `Params4bit` của bitsandbytes trên base NF4 — nó là bẫy mà
+        `next(model.parameters()).dtype` rơi vào.
+        """
+
+        def __init__(self, img_token: int = 7):
             super().__init__()
+            self.q4 = nn.Parameter(torch.zeros(4, dtype=torch.uint8),
+                                   requires_grad=False)
             self.emb = nn.Embedding(50, D_MODEL)
             self.vision_tower = FakeVision()
             self.multi_modal_projector = FakeProj()
             self.head = nn.Linear(D_MODEL, 50)
-            self.config = type("C", (), {"image_token_index": 7})()
+            self.config = type("C", (), {"image_token_index": img_token})()
+            self.is_quantized = True          # như PreTrainedModel đã lượng tử
             self.seen = {}
 
         def get_input_embeddings(self):
@@ -507,8 +518,8 @@ def branch_tests() -> None:
                 ignore_index=-100) if labels is not None else logits.sum()
             return type("O", (), {"loss": loss, "logits": logits})()
 
-    def make(gate=0.0, lam=0.5, warm=0):
-        lm = FakeLM()
+    def make(gate=0.0, lam=0.5, warm=0, img_token=7):
+        lm = FakeLM(img_token)
         rec, qf, head, asl = build_branch(
             {"recombiner": {"d_hidden": D_MODEL, "n_query": N_Q, "n_heads": 4},
              "qformer": {"d_model": 12, "n_query": 1, "n_heads": 4, "n_layers": 1},
@@ -517,14 +528,46 @@ def branch_tests() -> None:
         return RecombGemma(lm, rec, qf, head, asl, lambda_sup=lam,
                            decoder_gate_init=gate, lambda_warmup_steps=warm)
 
-    def batch(b=2, T=12):
+    def batch(b=2, T=12, img_token=7):
         ids = torch.randint(10, 49, (b, T))
-        ids[:, 2:6] = 7                      # 4 chỗ trống cho token ảnh
+        ids[:, 2:6] = img_token              # 4 chỗ trống cho token ảnh
         labels = ids.clone()
         labels[:, :6] = -100
         return {"input_ids": ids, "attention_mask": torch.ones(b, T, dtype=torch.long),
                 "labels": labels, "pixel_values": torch.randn(b, 3, 8, 8),
                 "token_type_ids": torch.zeros(b, T, dtype=torch.long)}
+
+    def t_float_dtype_skips_quantized():
+        lm = FakeLM()
+        true(next(lm.parameters()).dtype == torch.uint8,
+             "ca thử phải có tham số uint8 đứng đầu, như base NF4")
+        true(float_dtype(lm) == torch.float32,
+             "float_dtype phải BỎ QUA trọng số đã lượng tử và trả dtype thật")
+    check("float_dtype: bỏ qua Params4bit (uint8) — ảnh không bị ép về uint8",
+          t_float_dtype_skips_quantized)
+
+    def t_trainer_quantized_guard():
+        """Đúng phép kiểm mà HF Trainer.__init__ chạy trước khi ném ValueError."""
+        m = make()
+        is_quantized_and_base = getattr(m, "is_quantized", False) and not getattr(
+            m, "_hf_peft_config_loaded", False)
+        true(getattr(m, "is_quantized", False),
+             "vỏ bọc phải NHÌN THẤY base đã lượng tử (qua __getattr__)")
+        true(not is_quantized_and_base,
+             "Trainer sẽ ném 'You cannot perform fine-tuning on purely quantized "
+             "models' nếu vỏ bọc không khai _hf_peft_config_loaded")
+    check("Trainer guard: vỏ bọc không bị coi là 'model lượng tử trần'",
+          t_trainer_quantized_guard)
+
+    def t_image_token_outside_vocab():
+        """image_token_index có thể nằm NGOÀI bảng embedding của khối ngôn ngữ."""
+        m = make(img_token=999)              # emb chỉ có 50 hàng
+        bt = batch(img_token=999)
+        m(**bt)                              # không được IndexError
+        pre = m.lm.seen["embeds"]
+        true(bool(torch.isfinite(pre).all()), "embedding phải hữu hạn")
+    check("RecombGemma: token ảnh ngoài vocab không làm vỡ tra bảng embedding",
+          t_image_token_outside_vocab)
 
     def t_prefix_lengths():
         m = make()

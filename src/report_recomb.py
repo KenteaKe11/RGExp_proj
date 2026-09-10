@@ -1,17 +1,18 @@
-"""REPORT.md + ba bảng CSV cho §2.3.
+"""REPORT.md + CSV cho §2.3 (hai candidate, bootstrap BCa + permutation).
 
-Nguyên tắc viết báo cáo ở repo này, giữ nguyên từ §2.1/§2.2: bảng phải in ra
-thứ đủ để người đọc TỰ kết luận, kể cả khi kết luận đó ngược với dòng tóm tắt.
-Cụ thể ở §2.3, mỗi metric in đủ bốn thứ và không được thiếu thứ nào:
+Báo cáo này có một việc mà báo cáo §2.2 không có: nói rõ **kết luận âm tính
+thuộc loại nào**. Với hai candidate và n = 3000, "không khác biệt" có ba nguyên
+nhân hoàn toàn khác nhau và chúng đòi ba hành động khác nhau:
 
-    mean_diff   hiệu số thật, đơn vị của chính metric
-    CI 95%      hiệu số đó dao động trong khoảng nào
-    p (×2)      permutation và bootstrap, đã hiệu chỉnh Holm
-    dz          hiệu số so với độ phân tán của nó
+  1. `gate` hội tụ về ~0 -> decoder chưa bao giờ thật sự nhận k token. Đây là
+     kết luận về QUÁ TRÌNH HUẤN LUYỆN, không phải về đặc trưng SigLIP.
+  2. `cls_f1_pos` ở mức đoán bừa -> nhánh Recombiner chưa học được gì mang
+     thông tin bệnh lý, dù gate có mở. Cũng là kết luận về quá trình.
+  3. gate mở, cls_f1_pos khá, mà điểm sinh văn bản vẫn không nhích -> ĐÂY mới là
+     kết luận về đặc trưng SigLIP, và nó là một kết quả thật.
 
-In riêng p là cách dễ nhất để một chênh lệch BERTScore 0.0006 trở thành một câu
-"candidate B tốt hơn có ý nghĩa thống kê" trong luận văn. Ở n = 3000, câu đó
-đúng về hình thức và vô nghĩa về nội dung.
+Một bảng chỉ in BLEU/ROUGE/p không phân biệt được ba ca đó, nên ba con số trên
+được đặt NGAY TRƯỚC bảng điểm, không phải trong phụ lục.
 """
 from __future__ import annotations
 
@@ -19,244 +20,424 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+GATE_FLOOR = 0.01          # |gate| dưới mức này -> cảnh báo ca (1)
+CLS_F1_FLOOR = 0.05        # cls_f1_pos dưới mức này -> cảnh báo ca (2)
 
 
 def _f(x, nd: int = 4) -> str:
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
         return "—"
-    return "—" if pd.isna(v) else f"{v:.{nd}f}"
+    return f"{x:.{nd}f}"
 
 
 def _sf(x, nd: int = 4) -> str:
-    s = _f(x, nd)
-    return s if s == "—" or s.startswith("-") else f"+{s}"
+    """Như _f nhưng có dấu — dùng cho hiệu số, nơi HƯỚNG là thông tin chính."""
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return "—"
+    return f"{x:+.{nd}f}"
 
 
 def _p(x) -> str:
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
+    if x is None or not np.isfinite(x):
         return "—"
-    if pd.isna(v):
-        return "—"
-    return f"{v:.2e}" if v < 1e-3 else f"{v:.4f}"
+    return "<1e-4" if x < 1e-4 else f"{x:.4f}"
 
 
 def _tbl(headers: list[str], rows: list[list[str]]) -> str:
-    out = ["| " + " | ".join(headers) + " |",
-           "|" + "|".join(["---"] * len(headers)) + "|"]
-    out += ["| " + " | ".join(r) + " |" for r in rows]
-    return "\n".join(out)
+    return "\n".join(["| " + " | ".join(headers) + " |",
+                      "|" + "|".join("---" for _ in headers) + "|"]
+                     + ["| " + " | ".join(r) + " |" for r in rows])
 
 
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
-                  arm_a: str, arm_b: str) -> pd.DataFrame:
-    """Điểm trung bình từng metric, hai cột, cộng hiệu số."""
-    cols = [c for c in scores[arm_a].columns
-            if c not in {"key", "n_words_pred", "n_words_ref", "empty"}]
+                  metrics: list[str], primary: str) -> pd.DataFrame:
     rows = []
-    for m in cols:
-        a = float(scores[arm_a][m].mean())
-        b = float(scores[arm_b][m].mean())
-        rows.append({"metric": m, names.get(arm_a, arm_a): a,
-                     names.get(arm_b, arm_b): b, "diff_B_minus_A": b - a,
-                     "rel_pct": (100.0 * (b - a) / abs(a)) if a else float("nan")})
-    return pd.DataFrame(rows)
+    for aid, df in scores.items():
+        row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
+        for m in metrics:
+            row[m] = float(df[m].mean())
+            row[f"{m}_sd"] = float(df[m].std(ddof=1)) if len(df) > 1 else float("nan")
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if primary in out.columns:
+        out = out.sort_values(primary, ascending=False).reset_index(drop=True)
+    return out
 
 
-def build_markdown(cfg, summary: pd.DataFrame, ab: pd.DataFrame,
-                   train_stats: list[dict], manifest: dict, names: dict[str, str],
-                   arm_a: str, arm_b: str) -> str:
-    na, nb = names.get(arm_a, arm_a), names.get(arm_b, arm_b)
+def _stat(train_stats: list[dict], arm_id: str) -> dict:
+    for s in train_stats or []:
+        if s.get("arm_id") == arm_id:
+            return s
+    return {}
+
+
+def diagnosis(train_stats: list[dict], arm_b: str) -> tuple[str, list[str]]:
+    """(nhãn ca hỏng, danh sách cảnh báo) — đọc TRƯỚC bảng điểm."""
+    st = _stat(train_stats, arm_b)
+    warns: list[str] = []
+    if not st:
+        return "unknown", ["không tìm được train_stats.json của candidate có nhánh "
+                           "-> không kiểm được gate lẫn cls_f1_pos."]
+    gate = st.get("gate_final")
+    cls = (st.get("cls_metrics_last") or {})
+    f1 = cls.get("cls_f1_pos")
+    label = "ok"
+    if gate is not None and abs(float(gate)) < GATE_FLOOR:
+        label = "gate_closed"
+        warns.append(
+            f"**gate = {float(gate):+.4f}**, gần 0. Cổng nhân vào k token gần như "
+            f"đóng, nên decoder hầu như không nhận đặc trưng SigLIP. Mọi kết luận "
+            f"'không khác biệt' bên dưới là kết luận về QUÁ TRÌNH HUẤN LUYỆN, "
+            f"không phải về đặc trưng SigLIP. Xem README_2.3 mục 5.")
+    if f1 is not None and float(f1) < CLS_F1_FLOOR:
+        if label == "ok":
+            label = "head_untrained"
+        warns.append(
+            f"**cls_f1_pos = {float(f1):.4f}**, ở mức đoán bừa. Head phân loại "
+            f"không đọc được bệnh lý từ k token, nên ràng buộc gradient đã không "
+            f"làm việc của nó và nhánh Recombiner có thể chưa học gì mang thông "
+            f"tin. Kiểm nhãn trước: `python -m src.labels_cls --check-split`.")
+    return label, warns
+
+
+def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
+                   train_stats: list[dict], names: dict[str, str],
+                   manifest: dict) -> str:
+    metrics = [c for c in summary.columns
+               if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")]
     primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
-    scfg = dict(cfg.get("stats", {}))
-    n = manifest.get("n_eval", "?")
-    ts = {s.get("arm_id"): s for s in train_stats if isinstance(s, dict)}
+    if primary not in metrics and metrics:
+        primary = metrics[0]
+    arms = [dict(a) for a in cfg["arms"] if a.get("enabled", True)]
+    a_id = next((a["id"] for a in arms if not a.get("recombiner")), None)
+    b_id = next((a["id"] for a in arms if a.get("recombiner")), None)
+    st_a, st_b = _stat(train_stats, a_id), _stat(train_stats, b_id)
+    alpha = float(cfg["stats"].get("alpha", 0.05))
+    dz_floor = float(cfg["stats"].get("dz_floor", 0.10))
 
     L: list[str] = []
-    L.append(f"# §2.3 — Nhánh Recombiner: {na} vs {nb}\n")
-    L.append(f"*{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · "
-             f"run `{manifest.get('run_id', '?')}` · {n} ảnh ghép cặp*\n")
+    A = L.append
+    A("# §2.3 — Đặc trưng SigLIP nối vào emb_vec: có giúp decoder viết tốt hơn?")
+    A("")
+    A(f"*{manifest.get('finished_at', '')}* · run `{manifest.get('run_id', '?')}`"
+      f" · {manifest.get('n_eval', '?')} ảnh chấm chung")
+    A("")
 
-    # ── Kết luận ────────────────────────────────────────────────────────────
-    L.append("## Kết luận\n")
-    L.append(manifest.get("headline", "_(chưa chạy stage stats)_") + "\n")
-    if not ab.empty:
-        n_sig = int(ab["significant"].sum())
-        n_mat = int(ab["significant_and_material"].sum())
-        L.append(f"Trên {len(ab)} metric: **{n_sig}** bác được H0 ở CẢ HAI kiểm "
-                 f"định sau Holm, và **{n_mat}** trong số đó có |Cohen dz| ≥ "
-                 f"{scfg.get('dz_floor', 0.1)}. Cột `verdict` chỉ ghi tên người "
-                 f"thắng khi cả ba điều kiện cùng đúng.\n")
+    # ── Kết luận + chẩn đoán ────────────────────────────────────────────────
+    label, warns = diagnosis(train_stats, b_id) if b_id else ("unknown", [])
+    prow = pw[pw["metric"] == primary] if not pw.empty else pd.DataFrame()
+    A("## Kết luận")
+    A("")
+    if not prow.empty:
+        r = prow.iloc[0]
+        verdict = ("candidate CÓ nhánh Recombiner cao hơn"
+                   if r["diff"] > 0 else "candidate CHỈ emb_vec cao hơn")
+        if bool(r["significant_and_material"]):
+            A(f"Trên metric chính **{primary}**: {verdict}, "
+              f"hiệu số **{_sf(r['diff'])}** "
+              f"(CI {int(100*float(cfg['stats'].get('ci', 0.95)))}% "
+              f"[{_f(r['ci_lo'])}, {_f(r['ci_hi'])}], "
+              f"p_perm+Holm = {_p(r['p_perm_holm'])}, d_z = {_sf(r['cohen_dz'], 3)}) "
+              f"— **có ý nghĩa VÀ đáng kể**.")
+        elif bool(r["significant"]):
+            A(f"Trên metric chính **{primary}**: hiệu số **{_sf(r['diff'])}** "
+              f"đạt ý nghĩa thống kê (p_perm+Holm = {_p(r['p_perm_holm'])}) nhưng "
+              f"**effect size KHÔNG đáng kể** (|d_z| = {_f(abs(float(r['cohen_dz'])), 3)} "
+              f"< {dz_floor}). Với n = {int(r['n'])} thì đây là kết quả chờ đợi "
+              f"được của một hiệu số nhỏ, không phải bằng chứng cho một khác biệt "
+              f"có ý nghĩa thực hành.")
+        else:
+            A(f"Trên metric chính **{primary}**: **không** bác được H0 "
+              f"(p_perm+Holm = {_p(r['p_perm_holm'])}), hiệu số {_sf(r['diff'])} "
+              f"với CI [{_f(r['ci_lo'])}, {_f(r['ci_hi'])}] — khoảng này "
+              f"{'KHÔNG chứa' if bool(r['ci_excludes_zero']) else 'chứa'} 0.")
+        n_sig = int(pw["significant"].sum())
+        n_mat = int(pw["significant_and_material"].sum())
+        A("")
+        A(f"Trên cả {len(pw)} metric: {n_sig} đạt ý nghĩa, {n_mat} trong đó có "
+          f"effect size đáng kể (|d_z| ≥ {dz_floor}).")
+    else:
+        A("Chưa có bảng kiểm định — chạy stage `stats`.")
+    A("")
 
-    # ── Thiết kế ────────────────────────────────────────────────────────────
-    L.append("## Thiết kế\n")
-    L.append(f"Hai candidate, cùng base `{cfg['base']['hf_id']}` lượng tử NF4 "
-             f"4-bit và ĐÓNG BĂNG, cùng {manifest.get('n_train', '?')} mẫu huấn "
-             f"luyện, cùng lịch one-cycle, cùng {n} ảnh chấm.\n")
-    L.append(f"* **{na}** — QDoRA rank 4 trên bốn ma trận attention của khối "
-             f"ngôn ngữ. Không thêm gì.\n"
-             f"* **{nb}** — {na} cộng nhánh Recombiner: SwiGLU mở "
-             f"1152 → 2560 chiều trên 4096 token của SigLIP, gộp học được "
-             f"4096 → 32 token, cross-attention + skip, RMSNorm. 32 token đó "
-             f"vừa được chèn vào chuỗi đầu vào của decoder (qua một cổng khởi "
-             f"tạo 0), vừa đi qua QFormer 1 vector tới head phân loại.\n")
-    lam = float(cfg["train"].get("lambda_sup", 0.5))
-    a_cfg = dict((cfg.get("branch", {}) or {}).get("asl", {}) or {})
-    L.append(f"Hàm mất mát của {nb}: `L = CE + {lam}·ASL`, ASL với "
-             f"`gamma_neg={a_cfg.get('gamma_neg', 2.0)}`, "
-             f"`gamma_pos={a_cfg.get('gamma_pos', 0.0)}`, "
-             f"`clip={a_cfg.get('clip', 0.05)}` trên nhãn one-hot 3 chiều "
-             f"(neg / pos / uncertain).\n")
-    lab = manifest.get("labels", {})
-    if lab:
-        L.append(f"Nhãn phân loại: {lab.get('n_labels')} bệnh lý, nguồn "
-                 f"`{lab.get('converted_from')}`, tỉ lệ lớp "
-                 f"`{lab.get('class_frac')}`.\n")
+    if warns:
+        A("### ⚠ Đọc ba con số này TRƯỚC bảng điểm")
+        A("")
+        for w in warns:
+            A(f"- {w}")
+        A("")
+        A("> Ba nguyên nhân của một kết luận âm tính — cổng đóng, head chưa học, "
+          "và đặc trưng SigLIP thật sự không giúp — đòi ba hành động khác nhau, "
+          "và bảng BLEU/ROUGE không phân biệt được chúng.")
+        A("")
+    elif b_id:
+        A(f"### ✓ Nhánh đã thật sự hoạt động")
+        A("")
+        gate = st_b.get("gate_final")
+        f1 = (st_b.get("cls_metrics_last") or {}).get("cls_f1_pos")
+        A(f"`gate = {_sf(gate, 4) if gate is not None else '—'}` (mở), "
+          f"`cls_f1_pos = {_f(f1) if f1 is not None else '—'}` (trên mức đoán bừa). "
+          f"Kết luận bên dưới vì thế là kết luận về ĐẶC TRƯNG SigLIP, không phải "
+          f"về quá trình huấn luyện.")
+        A("")
 
-    # ── Vì sao không Friedman ───────────────────────────────────────────────
-    L.append("### Vì sao không phải Friedman\n")
-    L.append("§2.2 so tám biến thể nên phải mở đầu bằng một kiểm định tổng thể. "
-             "Ở đây k = 2, và khi đó \"kiểm định tổng thể\" và \"kiểm định cặp\" "
-             "là cùng một câu hỏi — chèn Friedman vào giữa chỉ thêm một tầng "
-             "hiệu chỉnh Holm mà không thêm thông tin nào. Thay vào đó là hai "
-             "kiểm định ghép cặp trả lời hai câu khác nhau: permutation trả lời "
-             "*có khác không*, bootstrap trả lời *khác bao nhiêu*. Ở n = "
-             f"{n} thì câu thứ hai mới là câu quyết định.\n")
+    # ── Cấu hình đã chạy ────────────────────────────────────────────────────
+    A("## 1. Cấu hình đã chạy")
+    A("")
+    rec = dict(cfg.get("recombiner", {}) or {})
+    hq = dict(rec.get("heads_qformer", {}) or {})
+    dq = dict(rec.get("decoder_qformer", {}) or {})
+    ccfg = dict(cfg.get("classifier", {}) or {})
+    side = st_b.get("sidecar_params", {}) or {}
+    rows = [
+        ["Base", f"`{cfg['base']['hf_id']}` · NF4 4-bit"],
+        ["Preset LoRA", f"`{st_b.get('lora_preset') or st_a.get('lora_preset') or cfg['lora'].get('preset')}`"
+                        f" — {st_b.get('method') or '?'} r={st_b.get('rank') or '?'} "
+                        f"alpha={st_b.get('alpha') or '?'} "
+                        f"(một trong tám biến thể của §2.2)"],
+        ["Adapter gắn vào", "`" + " · ".join(cfg["train"]["target_modules"]) + "`"
+                            " của khối ngôn ngữ"],
+        ["Recombiner", f"SwiGLU({rec.get('siglip_dim', 1152)} → "
+                       f"{rec.get('swiglu_hidden', 4096)} → "
+                       f"{rec.get('out_dim') or 'hidden của decoder'})"],
+        ["QFormer #1 `heads`", f"task {side.get('head_tasks') or hq.get('tasks')} "
+                              f"— **1 vector mỗi task, self-attn TẮT CỨNG** · "
+                              f"đóng băng {side.get('frozen_tasks') or hq.get('freeze')} "
+                              f"· {hq.get('n_layers', 1)} lớp · ffn×{hq.get('ffn_mult', 1)}"],
+        ["QFormer #2 `decoder`", f"k = {side.get('n_query_decoder') or dq.get('n_query')} "
+                                f"token · {dq.get('n_layers', 2)} lớp · "
+                                f"{dq.get('n_heads', 8)} head · "
+                                f"ffn×{dq.get('ffn_mult', 2)} · self-attn "
+                                f"{'bật' if dq.get('self_attn', True) else 'tắt'}"],
+        ["Điểm neo của ASLoss", "**Recombiner** (điểm chung duy nhất của hai "
+                                "QFormer) — KHÔNG phải chính những token nối vào"],
+        ["Chèn ở đâu", f"ngay TRƯỚC 256 token ảnh · token_type = "
+                       f"`{rec.get('token_type', 'image')}`"],
+        ["Thang của k token", ("lấy từ RMS của 256 token ảnh trong chính batch "
+                               "(`match_scale`)") if rec.get("match_scale", True)
+                              else "**không khớp thang** (`match_scale: false`)"],
+        ["Cổng (gate)", f"khởi tạo {cfg['train'].get('sidecar_gate_init')} · lr "
+                        f"×{cfg['train'].get('gate_lr_mult')} so với LoRA · cuối "
+                        f"lần chạy = {_sf(st_b.get('gate_final'), 4) if st_b.get('gate_final') is not None else '—'}"],
+        ["Head phân loại", (f"ASL(γ⁻={ccfg.get('asl', {}).get('gamma_neg')}, "
+                            f"γ⁺={ccfg.get('asl', {}).get('gamma_pos')}, "
+                            f"clip={ccfg.get('asl', {}).get('clip')}) · "
+                            f"λ = {st_b.get('lambda_asl')} · "
+                            f"chỉ ràng buộc gradient, decoder KHÔNG nhận logit")
+                           if ccfg.get("enabled", True) else "TẮT"],
+        ["Tham số nhánh", f"{side.get('total', 0):,} "
+                          f"({side.get('trainable', 0):,} học được) — recombiner "
+                          f"{side.get('recombiner', 0):,} · qformer_heads "
+                          f"{side.get('qformer_heads', 0):,} · qformer_decoder "
+                          f"{side.get('qformer_decoder', 0):,} · head "
+                          f"{side.get('classifier', 0):,}"],
+        ["Tham số LoRA", f"{st_b.get('trainable_params', 0):,} "
+                         f"(candidate A: {st_a.get('trainable_params', 0):,})"],
+        ["Huấn luyện", f"{st_b.get('n_train', '?')} mẫu · batch "
+                       f"{st_b.get('batch_size', '?')}×{st_b.get('grad_accum', '?')} "
+                       f"= eff {st_b.get('effective_batch', '?')} · "
+                       f"{st_b.get('steps', '?')} bước · one-cycle "
+                       f"max_lr={cfg['train']['schedule'].get('max_lr')}"],
+        ["Tập chấm", f"{manifest.get('n_eval', '?')} ảnh (tập test khoá cứng của §2.1)"],
+        ["Kiểm định", f"paired bootstrap BCa (n_boot="
+                      f"{cfg['stats'].get('n_boot')}) + permutation sign-flip "
+                      f"(n_perm={cfg['stats'].get('n_perm')}), Holm trên "
+                      f"{len(metrics)} metric"],
+    ]
+    A(_tbl(["", ""], rows))
+    A("")
+    if st_b.get("cls_label_stats"):
+        ls = st_b["cls_label_stats"]
+        A(f"Nhãn phân loại: {ls.get('n_labels')} bệnh lý × 3 lớp · "
+          f"{ls.get('n_missing')} / {ls.get('n')} mẫu train không có nhãn "
+          f"({100*float(ls.get('missing_frac', 0)):.1f}%, bị mask khỏi ASL) · "
+          f"tỉ lệ lớp {ls.get('class_frac')}")
+        A("")
 
     # ── Bảng điểm ───────────────────────────────────────────────────────────
-    L.append("## Điểm trung bình\n")
-    rows = [[r["metric"], _f(r[na]), _f(r[nb]), _sf(r["diff_B_minus_A"]),
-             _sf(r["rel_pct"], 2) + "%"] for _, r in summary.iterrows()]
-    L.append(_tbl(["metric", na, nb, "B − A", "tương đối"], rows) + "\n")
+    A("## 2. Điểm trung bình theo từng ảnh")
+    A("")
+    heads = ["candidate"] + metrics
+    rows = []
+    for _, r in summary.iterrows():
+        rows.append([f"**{r['arm']}**"] + [_f(r[m]) for m in metrics])
+    if not pw.empty:
+        pm = pw.set_index("metric")
+        rows.append(["*hiệu số (B − A)*"]
+                    + [_sf(pm.loc[m, "diff"]) if m in pm.index else "—"
+                       for m in metrics])
+        rows.append(["*CI 95%*"]
+                    + [f"[{_f(pm.loc[m, 'ci_lo'], 3)}, {_f(pm.loc[m, 'ci_hi'], 3)}]"
+                       if m in pm.index else "—" for m in metrics])
+    A(_tbl(heads, rows))
+    A("")
+    A("Mọi con số là **trung bình của điểm theo TỪNG ẢNH**, không phải điểm "
+      "corpus: hai kiểm định bên dưới là kiểm định ghép cặp và chúng cần một "
+      "vector điểm theo ảnh.")
+    A("")
 
     # ── Bảng kiểm định ──────────────────────────────────────────────────────
-    if not ab.empty:
-        L.append("## Hai kiểm định ghép cặp\n")
-        L.append(f"Hiệu số luôn là **B − A**. `p` đã hiệu chỉnh Holm trong TỪNG "
-                 f"họ ({len(ab)} metric mỗi họ). CI là "
-                 f"{int((1-float(scfg.get('alpha', 0.05)))*100)}% bootstrap "
-                 f"({ab['ci_method'].iloc[0]}).\n")
+    A("## 3. Kiểm định ghép cặp")
+    A("")
+    if pw.empty:
+        A("*(chưa có — chạy stage `stats`)*")
+    else:
+        heads = ["metric", "A", "B", "hiệu số", f"CI {int(100*float(cfg['stats'].get('ci',0.95)))}%",
+                 "p_perm", "p_perm+Holm", "p_boot", "d_z", "thắng/hoà/thua",
+                 "ý nghĩa", "đáng kể", "kết luận"]
         rows = []
-        for _, r in ab.iterrows():
-            mark = "✓" if r["significant_and_material"] else (
-                "~" if r["significant"] else "✗")
+        for _, r in pw.iterrows():
             rows.append([
-                r["metric"], _sf(r["mean_diff"]),
-                f"[{_sf(r['ci_lo'])}, {_sf(r['ci_hi'])}]",
-                _p(r["p_perm_holm"]), _p(r["p_boot_holm"]),
-                _f(r["cohen_dz"], 3), f"{100*float(r['win_rate_b']):.1f}%",
-                f"{mark} {r['winner']}"])
-        L.append(_tbl(["metric", "B − A", "CI 95%", "p perm", "p boot", "dz",
-                       "B thắng", "kết luận"], rows) + "\n")
-        L.append("`✓` = bác H0 ở cả hai kiểm định VÀ |dz| ≥ "
-                 f"{scfg.get('dz_floor', 0.1)} · `~` = có ý nghĩa thống kê nhưng "
-                 "effect size không đáng kể · `✗` = không kết luận.\n")
-        warns = [w for w in ab["dz_warning"].tolist() if w]
-        if warns:
-            L.append("### Cảnh báo effect size\n")
-            for w in dict.fromkeys(warns):
-                L.append(f"* {w}\n")
+                f"`{r['metric']}`", _f(r["mean_a"]), _f(r["mean_b"]),
+                _sf(r["diff"]),
+                f"[{_f(r['ci_lo'], 3)}, {_f(r['ci_hi'], 3)}]",
+                _p(r["p_perm"]), _p(r["p_perm_holm"]), _p(r["p_boot"]),
+                _sf(r["cohen_dz"], 3),
+                f"{int(r['win_b'])}/{int(r['tie'])}/{int(r['win_a'])}",
+                "✓" if bool(r["significant"]) else "—",
+                "✓" if bool(r["material"]) else "—",
+                "**" + str(names.get(str(r["better"]), r["better"])) + "**"
+                if str(r["better"]) != "—" else "—",
+            ])
+        A(_tbl(heads, rows))
+        A("")
+        A(f"`A` = {names.get(a_id, a_id)} · `B` = {names.get(b_id, b_id)}. "
+          f"Hiệu số là **B − A**, nên dấu dương nghĩa là nhánh Recombiner cao "
+          f"điểm hơn. `thắng/hoà/thua` đếm theo ảnh, từ góc nhìn của B.")
+        A("")
+        if pw.attrs.get("underpowered"):
+            A(f"> ⚠ {pw.attrs['underpowered']}")
+            A("")
 
-        tie = ab["frac_tied"].max()
-        if pd.notna(tie) and tie > 0.2:
-            L.append(f"\n> **{100*float(tie):.0f}% ảnh có hiệu số bằng đúng 0** ở "
-                     f"metric có nhiều ràng buộc nhất — hai candidate sinh ra văn "
-                     f"bản giống hệt nhau trên phần lớn tập test. Đó là thông tin "
-                     f"về mức độ nhánh Recombiner thật sự đổi đầu ra, và nó nên "
-                     f"được đọc TRƯỚC bảng p-value.\n")
+    # ── Hướng dẫn đọc ───────────────────────────────────────────────────────
+    A("## 4. Đọc bảng này")
+    A("")
+    A("**Cột `đáng kể` quan trọng hơn cột `ý nghĩa`.** Với n = "
+      f"{manifest.get('n_eval', 3000)} cặp, permutation bác H0 ở những hiệu số "
+      "nhỏ tới mức không nói được gì về thực hành. Cặp có "
+      f"`|d_z| < {dz_floor}` bị đánh dấu không đáng kể và **không** được tính là "
+      "thắng ở cột kết luận — dù p nhỏ tới đâu. Khoảng cách giữa hai cột chính "
+      "là cái mà cỡ mẫu lớn tạo ra.")
+    A("")
+    A("**Khoảng tin cậy trả lời câu hỏi thật của §2.3.** Câu hỏi không phải "
+      "\"có khác không\" mà \"khác bao nhiêu, và có xứng với cái đã bỏ vào\": "
+      f"candidate B mang thêm {side.get('total', 0):,} tham số huấn luyện so với "
+      f"{st_a.get('trainable_params', 0):,} của candidate A. Một CI kiểu "
+      "`[+0.001, +0.004]` là *có khác biệt thật, và nó nhỏ* — đó là một kết luận "
+      "khác hẳn `[+0.02, +0.05]`, và p-value không phân biệt hai ca đó.")
+    A("")
+    A("**`thắng/hoà/thua` là chỗ đọc số ô HOÀ.** Nhiều ảnh hoà tuyệt đối nghĩa "
+      "là hai candidate sinh ra văn bản giống hệt nhau trên những ảnh đó. Ở §2.3 "
+      "đó là dấu hiệu trực tiếp của ca `gate ≈ 0`: k token không đổi được gì thì "
+      "greedy decode cho ra đúng cùng một chuỗi.")
+    A("")
+    A("**Thiết kế này KHÔNG khớp số tham số.** Nó so \"LoRA một mình\" với "
+      "\"LoRA + một nhánh thị giác học được\", không so hai model cùng cỡ. Một "
+      "hiệu số dương vì thế chứng minh rằng *thêm đường đặc trưng SigLIP có "
+      "ích*, chứ **không** chứng minh rằng ích lợi đó đến từ đặc trưng SigLIP "
+      "chứ không từ 200 M tham số thêm. Muốn tách hai thứ đó cần một arm thứ ba "
+      "(cùng nhánh, nhưng đọc đặc trưng đã bị xáo trộn hoặc đọc nhiễu) — không "
+      "nằm trong §2.3.")
+    A("")
 
-    # ── Chi phí ─────────────────────────────────────────────────────────────
-    L.append("## Chi phí và tham số\n")
-    rows = []
-    for aid in (arm_a, arm_b):
-        s = ts.get(aid, {})
-        n_lora = s.get("trainable_params")
-        n_all = s.get("trainable_total", n_lora)
-        rows.append([names.get(aid, aid),
-                     f"{n_lora:,}" if n_lora else "—",
-                     f"{s.get('branch_params', 0):,}" if s.get("branch_params") else "—",
-                     f"{n_all:,}" if n_all else "—",
-                     str(s.get("batch_size", "—")),
-                     _f(s.get("train_loss"), 4),
-                     f"{s.get('minutes', '—')}",
-                     f"{s.get('vram_peak_gb', '—')}"])
-    L.append(_tbl(["candidate", "LoRA", "nhánh mới", "tổng học được",
-                   "batch", "loss cuối", "phút", "VRAM đỉnh (GB)"], rows) + "\n")
+    # ── Huấn luyện ──────────────────────────────────────────────────────────
+    A("## 5. Chi phí và diễn biến huấn luyện")
+    A("")
+    if train_stats:
+        heads = ["candidate", "phút", "VRAM đỉnh (GB)", "loss đầu", "loss cuối",
+                 "CE cuối", "ASL cuối", "gate cuối", "cls_f1_pos", "mẫu bị thay"]
+        rows = []
+        for a in arms:
+            s = _stat(train_stats, a["id"])
+            if not s:
+                continue
+            cls = s.get("cls_metrics_last") or {}
+            rows.append([
+                names.get(a["id"], a["id"]), str(s.get("minutes", "—")),
+                str(s.get("vram_peak_gb", "—")),
+                _f(s.get("train_loss_first"), 4), _f(s.get("train_loss"), 4),
+                _f(s.get("ce_last"), 4), _f(s.get("asl_last"), 4),
+                _sf(s.get("gate_final"), 4) if s.get("gate_final") is not None else "—",
+                _f(cls.get("cls_f1_pos")) if cls.get("cls_f1_pos") is not None else "—",
+                str(s.get("n_substituted_too_long", 0)),
+            ])
+        A(_tbl(heads, rows))
+        A("")
+        A("`loss cuối` là trung bình 10% bước cuối, không phải bước cuối cùng: "
+          "một bước lẻ trên batch hiệu dụng 32 quá nhiễu để đọc.")
+        A("")
 
-    sb = ts.get(arm_b, {})
-    if sb.get("decoder_gate_norm") is not None:
-        g = float(sb["decoder_gate_norm"])
-        L.append(f"`decoder_gate` trung bình sau huấn luyện: **{g:.3e}** "
-                 f"(khởi tạo 0). ")
-        if g < 1e-3:
-            L.append("Ở mức này nhánh Recombiner gần như KHÔNG đi vào đường sinh: "
-                     f"{nb} thực chất là {na} cộng một head phân loại chạy song "
-                     "song. Mọi kết luận về \"nhánh mới không cải thiện chất "
-                     "lượng\" phải đọc kèm dòng này — cái được đo là một nhánh đã "
-                     "tự đóng cổng, không phải một nhánh đã thử và thất bại.\n")
-        else:
-            L.append("Cổng đã mở, nghĩa là 32 token tái tổ hợp thật sự tham gia "
-                     "vào chuỗi đầu vào của decoder.\n")
-
-    cls = sb.get("cls_labels")
-    if cls:
-        L.append(f"\nNhãn phân loại: {cls.get('n_missing', 0)}/{cls.get('n', 0)} "
-                 f"mẫu huấn luyện thiếu nhãn ({100*float(cls.get('frac_missing', 0)):.1f}%) "
-                 f"— chúng bị mask khỏi ASL nhưng VẪN ở trong tập huấn luyện, nên "
-                 f"hai candidate học trên đúng cùng một tập.\n")
+    # ── Môi trường ──────────────────────────────────────────────────────────
+    env = manifest.get("env", {}) or {}
+    A("## 6. Môi trường")
+    A("")
+    A(_tbl(["", ""], [[k, str(v)] for k, v in env.items() if v is not None]))
+    A("")
+    if manifest.get("hub_url"):
+        A(f"Kết quả trên Hub: {manifest['hub_url']}")
+        A("")
 
     # ── Giới hạn ────────────────────────────────────────────────────────────
-    L.append("## Giới hạn\n")
-    L.append(f"1. **Số tham số không cân.** {nb} có nhiều hơn {na} khoảng "
-             f"{(sb.get('trainable_total') or 1) / max(1, ts.get(arm_a, {}).get('trainable_params', 1)):.0f}× "
-             f"tham số học được. Nếu B thắng, §2.3 KHÔNG tách được phần nào do "
-             f"kiến trúc Recombiner và phần nào do đơn giản là có thêm sức chứa. "
-             f"Câu trả lời cho câu hỏi đó là một arm thứ ba (QDoRA rank cao hơn, "
-             f"khớp số tham số) — nó không nằm trong thí nghiệm này.\n")
-    L.append(f"2. **lambda_sup = {lam} là hằng số được chọn, không được tune.** "
-             f"Tune trên tập test là rò rỉ; val ở đây chỉ {cfg['data'].get('n_val')} "
-             f"mẫu và chỉ dùng để nhìn đường loss. §2.3 không trả lời được "
-             f"\"lambda nào tốt nhất\".\n")
-    L.append("3. **Một seed.** Cả hai candidate chạy ở seed "
-             f"{cfg.get('seed', 42)}. Kiểm định ở đây trả lời \"hai MODEL NÀY "
-             "khác nhau không trên 3000 ảnh này\", không phải \"hai PHƯƠNG PHÁP "
-             "này khác nhau không\" — câu sau cần nhiều seed, và đó là chi phí "
-             "GPU nhân đôi.\n")
-    L.append("4. **Lượng tử hoá là hằng số.** Cả hai đứng trên nền NF4 4-bit, "
-             "nên §2.3 không nói được gì về ảnh hưởng của lượng tử hoá — y hệt "
-             "giới hạn đã ghi ở §2.2.\n")
-
-    L.append("\n## File\n")
-    L.append("```\nmetrics/per_sample_*.csv   điểm TỪNG ảnh, từng candidate\n"
-             "metrics/summary.csv        điểm trung bình + hiệu số\n"
-             "metrics/ab_tests.csv       bảng kiểm định đầy đủ (mọi cột)\n"
-             "predictions/*.jsonl        văn bản sinh ra\n"
-             "manifest.json              cấu hình đã giải quyết + môi trường\n```\n")
+    A("## 7. Giới hạn của thí nghiệm này")
+    A("")
+    A("- **Một seed cho mỗi candidate.** Bảng này so *hai lần huấn luyện cụ "
+      "thể*, không phải *hai kiến trúc*. Phương sai giữa các seed của cùng một "
+      "kiến trúc chưa được đo, và với 6400 mẫu nó có thể lớn ngang hiệu số giữa "
+      "hai candidate. Đây là giới hạn nặng nhất ở đây, và không có cách nào đọc "
+      "bảng mà tránh được nó.")
+    A("- **Không khớp số tham số** — xem mục 4.")
+    A(f"- **Một cấu hình LoRA duy nhất** (`{st_b.get('lora_preset') or cfg['lora'].get('preset')}`). "
+      "Hiệu quả của nhánh Recombiner có thể phụ thuộc vào rank: ở rank thấp LoRA "
+      "thiếu sức nên nhánh thêm dễ giúp hơn, ở rank cao thì khó hơn. Bảng này "
+      "nói về đúng một điểm trên trục đó.")
+    A("- **`λ` của ASLoss không được tinh chỉnh.** Nó là một siêu tham số của "
+      "candidate B mà candidate A không có, nên nó thuộc về kiến trúc đang được "
+      "kiểm chứ không phải một hằng số trung tính.")
+    A("- **Vòng huấn luyện của §2.3 là vòng tường minh, không phải HF Trainer.** "
+      "Con số tuyệt đối vì thế **không** so trực tiếp được với bảng §2.2 (thứ tự "
+      "xáo dữ liệu khác). Chỉ hiệu số A↔B bên trong §2.3 là thứ hai kiểm định "
+      "nói về.")
+    A("- **BLEU/ROUGE/BERTScore không đo đúng/sai lâm sàng.** Một báo cáo đảo "
+      "ngược kết luận (`no pneumothorax` → `pneumothorax`) gần như không bị "
+      "phạt. Giới hạn này thừa hưởng nguyên từ §2.1, và ở §2.3 nó cắn mạnh hơn: "
+      "nhánh Recombiner được thiết kế để mang thông tin BỆNH LÝ, tức là đúng "
+      "thứ mà ba metric này đo kém nhất.")
+    A("")
+    if manifest.get("arms_missing"):
+        A(f"> ⚠ candidate không có điểm: {manifest['arms_missing']} — kiểm định "
+          f"ghép cặp cần cả hai.")
+        A("")
     return "\n".join(L)
 
 
 def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
-              names: dict[str, str], ab: pd.DataFrame, train_stats: list[dict],
-              manifest: dict, arm_a: str, arm_b: str) -> Path:
+              names: dict[str, str], pw: pd.DataFrame,
+              train_stats: list[dict], manifest: dict) -> Path:
+    from .metrics import metric_columns
+
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
-    summary = summary_table(scores, names, arm_a, arm_b)
-    summary.to_csv(mdir / "summary.csv", index=False)
-    if not ab.empty:
-        ab.to_csv(mdir / "ab_tests.csv", index=False)
-    if train_stats:
-        pd.DataFrame(train_stats).to_csv(mdir / "train_stats.csv", index=False)
+    metrics = metric_columns(next(iter(scores.values())))
+    primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
+    if primary not in metrics and metrics:
+        primary = metrics[0]
 
-    md = build_markdown(cfg, summary, ab, train_stats, manifest, names,
-                        arm_a=arm_a, arm_b=arm_b)
-    p = run_dir / "REPORT.md"
-    p.write_text(md, encoding="utf-8")
+    summary = summary_table(scores, names, metrics, primary)
+    summary.to_csv(mdir / "summary.csv", index=False)
+    if not pw.empty:
+        pw.to_csv(mdir / "pairwise_tests.csv", index=False)
+    if train_stats:
+        pd.json_normalize(train_stats).to_csv(mdir / "train_stats.csv", index=False)
+
+    manifest["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    md = build_markdown(cfg, summary, pw, train_stats, names, manifest)
+    path = run_dir / "REPORT.md"
+    path.write_text(md, encoding="utf-8")
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
-    print(f"✓ báo cáo: {p}", flush=True)
-    return p
+    print(f"✓ báo cáo -> {path}", flush=True)
+    return path
