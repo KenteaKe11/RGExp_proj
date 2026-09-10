@@ -220,9 +220,9 @@ branch:
   # danh sách 3 số theo thứ tự [neg, pos, uncertain]. Đó là một hàm mất mát
   # KHÁC và báo cáo phải ghi rõ.
   asl:
-    gamma_neg: [2.0, 0.0, 0.0]
+    gamma_neg: 2.0
     gamma_pos: 0.0
-    clip: 0.035        # m: ô âm có p < m đóng góp ĐÚNG 0, không phải chỉ nhỏ
+    clip: 0.025        # m: ô âm có p < m đóng góp ĐÚNG 0, không phải chỉ nhỏ
 
   # Cổng vào decoder, khởi tạo 0. Ở bước 0, đầu vào decoder của candidate B
   # giống hệt candidate A cộng 32 token 0, và chính cổng này học mở dần. Đặt
