@@ -22,10 +22,25 @@ cd "$ROOT"
 APPLY=0
 [ "${1:-}" = "--apply" ] && APPLY=1
 
-# nguồn -> đích. Chỉ đường ĐIỀU PHỐI của §2.2; train.py/data*/metrics/imaging/
-# runners/prompts ở lại vì §2.3 dùng nguyên chúng (xem README.md).
+# nguồn -> đích.
+#
+# `src/train.py` NAY CŨNG ĐI. Phần §2.3 dùng lại của nó (nạp base, gắn adapter,
+# ReportDataset, collate, one-cycle, device_map) đã được tách sang
+# `src/backbone.py`; phần ở lại trong train.py là vòng lặp HF Trainer của §2.2,
+# thang dò batch và file batch_probe.json — ba thứ §2.3 cố ý không còn dùng.
+# Giữ nó trong src/ nghĩa là hai cách huấn luyện cùng tồn tại và không có gì
+# ngăn ai đó gọi nhầm cái cũ.
+#
+# `configs/recomb.yaml` cũng đi: nó là config của bản §2.3 trước (khoá `branch:`,
+# một QFormer). Config đang dùng là `configs/recombiner.yaml`. Hai file cấu hình
+# cho cùng một thí nghiệm là cách chắc chắn nhất để chạy nhầm một cái.
+#
+# data*/metrics/imaging/labels_cls/runners/prompts/stats_ab ở lại — §2.3 dùng
+# nguyên chúng (xem README.md).
 FILES=(
     "configs/adapters.yaml:_archive/configs/adapters.yaml"
+    "configs/recomb.yaml:_archive/configs/recomb.yaml"
+    "src/train.py:_archive/src/train.py"
     "src/run_adapters.py:_archive/src/run_adapters.py"
     "src/report_adapters.py:_archive/src/report_adapters.py"
     "src/stats_friedman.py:_archive/src/stats_friedman.py"
@@ -33,6 +48,14 @@ FILES=(
     "scripts/selftest_friedman.py:_archive/scripts/selftest_friedman.py"
     "README_2.2.md:_archive/README_2.2.md"
 )
+
+# Lưới an toàn: nếu backbone.py chưa có thì chuyển train.py đi là làm hỏng repo.
+if [ ! -f "src/backbone.py" ]; then
+    echo "✗ không thấy src/backbone.py."
+    echo "  train.py chỉ được chuyển đi SAU khi phần dùng chung đã sang backbone.py."
+    echo "  Dừng — repo sẽ không import được nếu chuyển tiếp."
+    exit 1
+fi
 
 echo "═══ Chuyển §2.2 sang _archive/ ═══"
 [ "$APPLY" = "1" ] || echo "(xem trước — thêm --apply để thực hiện)"

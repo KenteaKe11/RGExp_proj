@@ -8,9 +8,12 @@ Cái nó bảo vệ: hai loại lỗi KHÔNG ném exception và KHÔNG hiện ra
   * Khâu thống kê. Một dấu sai trong hiệu số ghép cặp, một CI đặt nhầm đầu, một
     Holm hiệu chỉnh sai chiều — tất cả đều cho ra một bảng đọc được, và bảng đó
     đi thẳng vào luận văn.
-  * Nhánh Recombiner. Một ASL thoái hoá về BCE, một mask không có tác dụng, một
-    prefix chèn nhầm chỗ trong `labels` — model vẫn huấn luyện, loss vẫn giảm,
-    và candidate B chỉ đơn giản là kém hơn nó đáng ra phải thế.
+  * Nhánh Recombinator. Một ASL thoái hoá về BCE, một mask không có tác dụng,
+    32 token chèn nhầm chỗ, một skip-connect nối sai nguồn, một `aux` quên
+    detach — model vẫn huấn luyện, loss vẫn giảm, và candidate B chỉ đơn giản là
+    kém hơn nó đáng ra phải thế.
+  * Ranh giới. §2.2 đã sang _archive/; một câu `import` còn sót lại làm cái
+    ranh giới ấy thành hình thức.
 
 Không kiểm chất lượng model. Kiểm rằng những gì repo TUYÊN BỐ làm thì nó có làm.
 """
@@ -318,404 +321,472 @@ def label_tests() -> None:
     check("attach: vượt trần thiếu nhãn thì DỪNG", t_attach_threshold)
 
 
-# ═══ 3. Nhánh Recombiner ═════════════════════════════════════════════════════
+# ═══ 3. Nhánh Recombinator ═════════════════════════════════════════════════════
 def branch_tests() -> None:
+    """Nhánh Recombinator: hình dạng, đường gradient, ghi/nạp, chèn token.
+
+    Toàn bộ chạy trên CPU với chiều nhỏ — không nạp Gemma, không cần mạng. Cái
+    được kiểm là những khẳng định mà sơ đồ và docstring đưa ra, vì mỗi cái sai
+    trong số đó đều cho ra một model VẪN HUẤN LUYỆN ĐƯỢC và một bảng kết quả vẫn
+    đọc được.
+    """
     try:
         import torch
         import torch.nn as nn
     except ImportError:
-        FAIL.append(("torch", "không import được torch — bỏ qua phần nhánh", ""))
+        FAIL.append(("nhánh: cần torch", "không import được torch",
+                     "cài torch rồi chạy lại — mấy phép kiểm này là phần quan "
+                     "trọng nhất của selftest"))
         return
 
-    from src.recombiner import (AsymmetricLoss, QFormer, Recombiner, RecombGemma,
-                                RMSNorm, SupHead, TokenPool, build_branch,
-                                float_dtype)
+    from src.recombiner import (N_VIS_TOKENS, AsymmetricLoss, ClsHead, QFormer,
+                                Recombinator, RecombinerBranch, RMSNorm,
+                                RouteGate, SwiGLU, TokenPool, branch_exists,
+                                build_inputs_embeds, cls_metrics,
+                                first_image_index, image_start_indices,
+                                inject_tokens, load_branch, save_branch)
 
-    D_VIS, D_MODEL, N_VIS, N_Q, L_LAB = 16, 24, 64, 8, 5
     torch.manual_seed(0)
+    D_VIS, D_MODEL, N_VIS, N_Q, L_LAB = 16, 24, N_VIS_TOKENS, 8, 5
 
+    # ── khối cơ bản ─────────────────────────────────────────────────────────
     def t_rmsnorm():
         x = torch.randn(2, 3, 8) * 5.0
         y = RMSNorm(8)(x)
         rms = y.float().pow(2).mean(-1).sqrt()
         true(torch.allclose(rms, torch.ones_like(rms), atol=1e-4),
-             f"RMS sau chuẩn hoá phải ≈ 1, nhận {rms}")
-    check("RMSNorm: đưa RMS về 1", t_rmsnorm)
+             f"RMSNorm phải đưa RMS về 1, nhận {rms}")
+        # KHÔNG trừ trung bình: đó là khác biệt với LayerNorm, và Gemma dùng RMS.
+        x2 = torch.ones(1, 1, 8)
+        true(float(RMSNorm(8)(x2).abs().mean()) > 0.5,
+             "RMSNorm không được trừ trung bình (đầu vào hằng phải KHÁC 0)")
+    check("nhánh: RMSNorm chuẩn hoá theo RMS, không trừ trung bình", t_rmsnorm)
 
-    def t_rmsnorm_dtype():
-        x = torch.randn(2, 3, 8, dtype=torch.float32)
-        true(RMSNorm(8)(x).dtype == torch.float32, "phải trả về đúng dtype vào")
-    check("RMSNorm: giữ dtype", t_rmsnorm_dtype)
+    def t_swiglu():
+        m = SwiGLU(D_VIS, 32, D_MODEL)
+        y = m(torch.randn(2, 7, D_VIS))
+        true(tuple(y.shape) == (2, 7, D_MODEL), f"shape {tuple(y.shape)}")
+        true(hasattr(m, "gate_proj") and hasattr(m, "up_proj")
+             and hasattr(m, "down_proj"),
+             "SwiGLU phải có BA ma trận (gate · up rồi down), không phải hai")
+    check("nhánh: SwiGLU 3 ma trận, shape đúng", t_swiglu)
 
-    def t_pool_shape():
-        p = TokenPool(N_VIS, N_Q)
-        y = p(torch.randn(3, N_VIS, D_MODEL))
-        true(tuple(y.shape) == (3, N_Q, D_MODEL), f"shape {tuple(y.shape)}")
-    check("TokenPool: 4096 token -> n_query token, giữ số chiều", t_pool_shape)
-
-    def t_pool_is_linear_over_tokens():
-        p = TokenPool(4, 2)
-        with torch.no_grad():
-            p.proj.weight.copy_(torch.tensor([[1.0, 0, 0, 0], [0, 0, 0, 1.0]]))
-        x = torch.arange(8.0).view(1, 4, 2)
-        y = p(x)
-        true(torch.allclose(y[0, 0], x[0, 0]), "hàng 1 phải là token đầu")
-        true(torch.allclose(y[0, 1], x[0, 3]), "hàng 2 phải là token cuối")
-    check("TokenPool: tổ hợp trên TRỤC TOKEN, không phải trục chiều",
-          t_pool_is_linear_over_tokens)
-
-    def t_pool_guard():
-        try:
-            TokenPool(N_VIS, N_Q)(torch.randn(1, N_VIS + 1, D_MODEL))
-        except ValueError:
-            return
-        raise AssertionError("số token lệch mà vẫn chạy — pan&scan bật lén sẽ "
-                             "không bị bắt")
-    check("TokenPool: số token lệch thì DỪNG", t_pool_guard)
-
-    def t_recombiner_shape():
-        r = Recombiner(D_VIS, D_MODEL, D_MODEL, N_VIS, N_Q, n_heads=4)
-        y = r(torch.randn(2, N_VIS, D_VIS))
+    def t_tokenpool_axis():
+        m = TokenPool(N_VIS, N_Q)
+        y = m(torch.randn(2, N_VIS, D_MODEL))
         true(tuple(y.shape) == (2, N_Q, D_MODEL), f"shape {tuple(y.shape)}")
-    check("Recombiner: (B,4096,1152) -> (B,32,2560)", t_recombiner_shape)
+        # Trộn theo TRỤC TOKEN: đổi thứ tự token đầu vào phải đổi đầu ra. Nếu ai
+        # đó lỡ cài thành pooling trên trục dim (hoặc avg-pool), phép kiểm này
+        # là thứ duy nhất bắt được — shape vẫn đúng ở cả hai cách.
+        x = torch.randn(1, N_VIS, D_MODEL)
+        y1 = m(x)
+        y2 = m(x.flip(1))
+        true(not torch.allclose(y1, y2, atol=1e-5),
+             "TokenPool phải trộn theo TRỤC TOKEN — đảo thứ tự token mà đầu ra "
+             "không đổi nghĩa là nó đang pool theo trục khác, hoặc là avg-pool")
+    check("nhánh: TokenPool trộn trên trục token (không phải avg-pool)",
+          t_tokenpool_axis)
 
-    def t_recombiner_grad():
-        r = Recombiner(D_VIS, D_MODEL, D_MODEL, N_VIS, N_Q, n_heads=4)
-        r(torch.randn(2, N_VIS, D_VIS)).sum().backward()
-        for name in ("swiglu.gate_proj", "pool.proj", "attn.q_proj", "attn.k_proj"):
-            mod = r.get_submodule(name)
-            true(mod.weight.grad is not None and mod.weight.grad.abs().sum() > 0,
-                 f"{name} không nhận gradient — một nhánh chết mà loss vẫn giảm")
-    check("Recombiner: gradient tới mọi khối (không có nhánh chết)", t_recombiner_grad)
+    def t_tokenpool_guard():
+        m = TokenPool(N_VIS, N_Q)
+        try:
+            m(torch.randn(1, N_VIS + 256, D_MODEL))
+        except RuntimeError as e:
+            true("pan&scan" in str(e) or "4096" in str(e),
+                 f"thông báo phải chỉ tới pan&scan, nhận: {e}")
+            return
+        raise AssertionError(
+            "TokenPool nhận sai số token mà KHÔNG dừng — đó là ca pan&scan lén "
+            "bật, và nó phải nổ ở đây chứ không nổ trong matmul")
+    check("nhánh: TokenPool dừng khi số token vào khác 4096", t_tokenpool_guard)
 
-    def t_qformer():
-        q = QFormer(d_in=D_MODEL, d_model=12, n_query=1, n_heads=4, n_layers=1)
-        y = q(torch.randn(3, N_Q, D_MODEL))
-        true(tuple(y.shape) == (3, 1, 12), f"shape {tuple(y.shape)}")
-    check("QFormer: đúng MỘT vector ra", t_qformer)
+    # ── Recombinator ────────────────────────────────────────────────────────
+    def t_recombinator_shape():
+        m = Recombinator(d_vis=D_VIS, d_hidden=32, d_model=D_MODEL,
+                         n_vis=N_VIS, n_query=N_Q, n_heads=4)
+        y = m(torch.randn(2, N_VIS, D_VIS))
+        true(tuple(y.shape) == (2, N_Q, D_MODEL), f"shape {tuple(y.shape)}")
+    check("nhánh: Recombinator (B,4096,d_vis) -> (B,n_query,d_model)",
+          t_recombinator_shape)
 
-    def t_sup_head():
-        h = SupHead(12, L_LAB, 3)
-        y = h(torch.randn(3, 1, 12))
-        true(tuple(y.shape) == (3, L_LAB, 3), f"shape {tuple(y.shape)}")
-    check("SupHead: (B,1,d) -> (B,L,3)", t_sup_head)
+    def t_skip_source():
+        """Skip-connect đi từ đầu ra TokenPool, không từ đầu ra SwiGLU.
 
-    def t_asl_reduces_to_bce():
-        """gamma = 0 và clip = 0 thì ASL PHẢI đúng bằng BCE tổng-theo-ô."""
-        torch.manual_seed(1)
-        logits = torch.randn(4, L_LAB, 3)
-        target = torch.zeros(4, L_LAB, 3)
-        target[:, :, 0] = 1.0
+        Cách kiểm: zero hoá o_proj của MHA. Khi đó attention đóng góp 0, nên đầu
+        ra phải bằng đúng norm_out(q) với q là đầu ra TokenPool. Nếu ai đó nối
+        skip từ chỗ khác, đẳng thức này sai.
+        """
+        m = Recombinator(d_vis=D_VIS, d_hidden=32, d_model=D_MODEL,
+                         n_vis=N_VIS, n_query=N_Q, n_heads=4).eval()
+        with torch.no_grad():
+            m.attn.o_proj.weight.zero_()
+        x = torch.randn(1, N_VIS, D_VIS)
+        with torch.no_grad():
+            h = m.norm_in(m.swiglu(m.pre(x)))
+            q = m.pool(h)
+            want = m.norm_out(q)
+            got = m(x)
+        true(torch.allclose(got, want, atol=1e-5),
+             "skip-connect KHÔNG đi từ đầu ra TokenPool — sơ đồ nói nó đi từ đó")
+    check("nhánh: skip-connect đi từ đầu ra TokenPool (đúng sơ đồ)", t_skip_source)
+
+    # ── QFormer 2 vector ────────────────────────────────────────────────────
+    def t_qformer_two_vectors():
+        qf = QFormer(d_kv=D_MODEL, d_model=12, tasks=("sup", "aux"),
+                     freeze=("aux",), n_heads=4, n_layers=1)
+        out = qf(torch.randn(3, N_Q, D_MODEL))
+        true(set(out) == {"sup", "aux"}, f"task: {sorted(out)}")
+        for k, v in out.items():
+            true(tuple(v.shape) == (3, 12), f"{k}: {tuple(v.shape)}")
+    check("nhánh: QFormer cho ĐÚNG 1 vector mỗi task", t_qformer_two_vectors)
+
+    def t_aux_detached():
+        """`aux` phải bị detach — không phải chỉ 'hiện không ai dùng'."""
+        qf = QFormer(d_kv=D_MODEL, d_model=12, tasks=("sup", "aux"),
+                     freeze=("aux",), n_heads=4, n_layers=1)
+        ctx = torch.randn(2, N_Q, D_MODEL, requires_grad=True)
+        out = qf(ctx)
+        true(not out["aux"].requires_grad,
+             "vector `aux` còn requires_grad: một loss lỡ cộng nó vào sẽ đẩy "
+             "gradient ngược qua cả thân QFormer lẫn Recombinator, và không có "
+             "gì báo động")
+        true(out["sup"].requires_grad, "vector `sup` PHẢI còn gradient")
+    check("nhánh: vector `aux` (Route_Gate) bị detach", t_aux_detached)
+
+    def t_aux_query_frozen():
+        qf = QFormer(d_kv=D_MODEL, d_model=12, tasks=("sup", "aux"),
+                     freeze=("aux",), n_heads=4, n_layers=1)
+        qf(torch.randn(2, N_Q, D_MODEL))["sup"].sum().backward()
+        g = qf.query.grad
+        true(g is not None, "query phải có gradient")
+        eq(float(g[1].abs().sum()), 0.0, 1e-12,
+           "hàng `aux` của query phải nhận gradient 0")
+        true(float(g[0].abs().sum()) > 0, "hàng `sup` phải có gradient khác 0")
+    check("nhánh: query của task đóng băng nhận gradient 0", t_aux_query_frozen)
+
+    def t_freeze_survives_to():
+        """Đóng băng phải sống sót qua `.to()`.
+
+        Cách viết bằng `register_hook` HỎNG ở đây: `Module.to()` đổi thiết bị thì
+        PyTorch tạo Parameter MỚI và hook trên tensor cũ biến mất — im lặng, và
+        chỉ trên GPU. Nên phép kiểm này chạy `.to()` trước rồi mới đo.
+        """
+        qf = QFormer(d_kv=D_MODEL, d_model=12, tasks=("sup", "aux"),
+                     freeze=("aux",), n_heads=4, n_layers=1).to(torch.float64)
+        out = qf(torch.randn(2, N_Q, D_MODEL, dtype=torch.float64))
+        true(not out["aux"].requires_grad, "`aux` hết detach sau khi .to()")
+        out["sup"].sum().backward()
+        eq(float(qf.query.grad[1].abs().sum()), 0.0, 1e-12,
+           "hàng `aux` nhận gradient sau khi .to() — cơ chế đóng băng đã rơi mất")
+    check("nhánh: đóng băng `aux` sống sót qua .to()", t_freeze_survives_to)
+
+    # ── cổng vào decoder ────────────────────────────────────────────────────
+    def _branch(n_labels=L_LAB, gate_init=0.0):
+        rcfg = {"swiglu_hidden": 32, "n_query": N_Q, "n_heads": 4,
+                "n_vis": N_VIS, "gate_init": gate_init,
+                "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"],
+                            "d_model": 12, "n_heads": 4, "n_layers": 1,
+                            "ffn_mult": 2}}
+        ccfg = {"n_classes": 3, "hidden": 16,
+                "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.05}}
+        return RecombinerBranch(D_VIS, D_MODEL, n_labels, rcfg, ccfg)
+
+    def t_gate_zero():
+        b = _branch()
+        tokens, logits = b(torch.randn(2, N_VIS, D_VIS))
+        eq(float(tokens.abs().max()), 0.0, 1e-12,
+           "cổng khởi tạo 0 -> token vào decoder phải ĐÚNG BẰNG 0 ở bước đầu")
+        true(logits is not None and float(logits.abs().sum()) > 0,
+             "logit phân loại KHÔNG được bằng 0: nhánh có giám sát lấy tín hiệu "
+             "TRƯỚC cổng, nên ASL phải có gradient đầy đủ từ bước đầu tiên")
+    check("nhánh: gate=0 chặn đường vào decoder nhưng KHÔNG chặn ASL",
+          t_gate_zero)
+
+    def t_gate_grad():
+        b = _branch()
+        tokens, _ = b(torch.randn(2, N_VIS, D_VIS))
+        tokens.sum().backward()
+        true(b.gate.grad is not None and float(b.gate.grad.abs().sum()) > 0,
+             "cổng phải nhận gradient — nếu không thì nó vĩnh viễn bằng 0 và "
+             "candidate B đúng bằng candidate A")
+    check("nhánh: cổng nhận gradient (được PHÉP mở)", t_gate_grad)
+
+    def t_route_gate_inert():
+        b = _branch()
+        n = b.n_params()
+        true(n["route_gate"] > 0, "Route_Gate phải tồn tại (hình dạng cho mục MoE)")
+        true(isinstance(b.route_gate, RouteGate))
+        true(isinstance(b.cls_head, ClsHead))
+    check("nhánh: Route_Gate được dựng nhưng chỉ để giữ hình dạng", t_route_gate_inert)
+
+    # ── ASL ─────────────────────────────────────────────────────────────────
+    def t_asl_is_bce_when_off():
+        """gamma = 0 và clip = 0 thì ASL PHẢI trùng BCE. Nếu không, công thức sai."""
         asl = AsymmetricLoss(gamma_neg=0.0, gamma_pos=0.0, clip=0.0)
-        got = asl(logits, target)
-        want = nn.functional.binary_cross_entropy_with_logits(
-            logits, target, reduction="none").sum(dim=(1, 2)).mean()
-        eq(got.item(), want.item(), 1e-4, "ASL(gamma=0, clip=0) phải = BCE")
-    check("ASL: gamma=0, clip=0 -> đúng bằng BCE (không thoái hoá lặng lẽ)",
-          t_asl_reduces_to_bce)
+        lg = torch.randn(4, 3, 3)
+        tg = torch.zeros(4, 3, 3)
+        tg[:, :, 0] = 1.0
+        got = float(asl(lg, tg))
+        want = float(nn.functional.binary_cross_entropy_with_logits(
+            lg, tg, reduction="none").sum(dim=(1, 2)).mean())
+        eq(got, want, 1e-4, "ASL với gamma=0, clip=0 phải bằng BCE")
+    check("nhánh: ASL thoái hoá đúng về BCE khi tắt hết", t_asl_is_bce_when_off)
 
-    def t_asl_gamma_suppresses():
-        """gamma_neg > 0 phải LÀM GIẢM đóng góp của ô âm đã đoán đúng."""
-        logits = torch.tensor([[[3.0, -5.0, -5.0]]])     # ô âm đoán rất đúng
-        target = torch.tensor([[[1.0, 0.0, 0.0]]])
-        lo = AsymmetricLoss(2.0, 0.0, clip=0.0)(logits, target).item()
-        hi = AsymmetricLoss(0.0, 0.0, clip=0.0)(logits, target).item()
-        true(lo < hi, f"gamma_neg=2 phải nén loss ({lo}) xuống dưới BCE ({hi})")
-    check("ASL: gamma_neg nén ô âm dễ", t_asl_gamma_suppresses)
-
-    def t_asl_clip_zeroes():
-        """clip = m: ô âm có p < m phải đóng góp ĐÚNG 0, không phải chỉ nhỏ."""
-        logits = torch.tensor([[[10.0, -20.0, -20.0]]])
-        target = torch.tensor([[[1.0, 0.0, 0.0]]])
-        with_clip = AsymmetricLoss(2.0, 0.0, clip=0.05)(logits, target).item()
-        no_clip = AsymmetricLoss(2.0, 0.0, clip=0.0)(logits, target).item()
-        true(with_clip <= no_clip + 1e-9, "clip không được làm loss tăng")
-        true(with_clip < 1e-3, f"ô âm dưới ngưỡng m phải bị vứt hẳn, nhận {with_clip}")
-    check("ASL: clip vứt hẳn ô âm quá dễ", t_asl_clip_zeroes)
+    def t_asl_clip_kills_easy_neg():
+        asl = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
+        tg = torch.zeros(1, 1, 3)
+        tg[0, 0, 0] = 1.0
+        # Hai ô âm đã được đoán RẤT tự tin là âm (logit -20) -> đóng góp 0.
+        easy = torch.tensor([[[20.0, -20.0, -20.0]]])
+        hard = torch.tensor([[[20.0, -1.0, -1.0]]])
+        true(float(asl(easy, tg)) < float(asl(hard, tg)),
+             "ô âm dễ phải đóng góp ÍT hơn ô âm khó — đó là toàn bộ ý nghĩa của ASL")
+        true(float(asl(easy, tg)) < 1e-3,
+             "ô âm mà p < clip phải đóng góp ĐÚNG BẰNG 0, không phải chỉ nhỏ")
+    check("nhánh: ASL vứt hẳn ô âm dễ (asymmetric clipping)",
+          t_asl_clip_kills_easy_neg)
 
     def t_asl_mask():
-        torch.manual_seed(2)
-        logits = torch.randn(2, L_LAB, 3)
-        target = torch.zeros(2, L_LAB, 3)
-        target[:, :, 0] = 1.0
-        asl = AsymmetricLoss(2.0, 0.0, 0.05)
-        both = asl(logits, target, torch.tensor([1.0, 1.0]))
-        only0 = asl(logits, target, torch.tensor([1.0, 0.0]))
-        alone = asl(logits[:1], target[:1], torch.tensor([1.0]))
-        eq(only0.item(), alone.item(), 1e-5,
-           "mẫu bị mask phải đóng góp ĐÚNG 0, và mẫu còn lại không bị pha loãng")
-        true(abs(both.item() - only0.item()) > 1e-6, "mask phải có tác dụng thật")
-    check("ASL: mask loại mẫu khỏi loss mà không pha loãng mẫu còn lại", t_asl_mask)
+        asl = AsymmetricLoss()
+        lg = torch.randn(4, 3, 3)
+        tg = torch.zeros(4, 3, 3)
+        tg[:, :, 0] = 1.0
+        m = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        # Đổi hẳn logit của hai mẫu bị mask: loss KHÔNG được nhúc nhích.
+        lg2 = lg.clone()
+        lg2[2:] += 100.0
+        eq(float(asl(lg, tg, m)), float(asl(lg2, tg, m)), 1e-5,
+           "mẫu bị mask vẫn đóng góp vào ASL — mẫu không có nhãn khi đó dạy head "
+           "một nhãn toàn 0")
+    check("nhánh: mask của ASL thật sự loại mẫu không có nhãn", t_asl_mask)
 
-    def t_asl_mask_grad():
-        logits = torch.randn(2, L_LAB, 3, requires_grad=True)
-        target = torch.zeros(2, L_LAB, 3)
-        target[:, :, 1] = 1.0
-        AsymmetricLoss(2.0, 0.0, 0.05)(logits, target,
-                                       torch.tensor([1.0, 0.0])).backward()
-        eq(float(logits.grad[1].abs().sum()), 0.0, 1e-12,
-           "mẫu bị mask KHÔNG được có gradient")
-        true(float(logits.grad[0].abs().sum()) > 0, "mẫu có nhãn phải có gradient")
-    check("ASL: mẫu bị mask không sinh gradient", t_asl_mask_grad)
+    def t_cls_metrics():
+        # 1 mẫu, 4 bệnh lý. gold: pos, pos, neg, neg. pred: pos, neg, pos, neg.
+        # -> tp=1, fp=1, fn=1 -> f1 = 2/(2+1+1) = 0.5 ; acc = 2/4 = 0.5
+        gold = torch.tensor([[[0., 1., 0.], [0., 1., 0.],
+                              [1., 0., 0.], [1., 0., 0.]]])
+        lg = torch.tensor([[[0., 9., 0.], [9., 0., 0.],
+                            [0., 9., 0.], [9., 0., 0.]]])
+        m = cls_metrics(lg, gold)
+        eq(m["cls_f1_pos"], 0.5, 1e-6, "F1 lớp pos")
+        eq(m["cls_acc"], 0.5, 1e-6, "accuracy")
 
-    def t_asl_per_class_gamma():
-        logits = torch.randn(2, L_LAB, 3)
-        target = torch.zeros(2, L_LAB, 3)
-        target[:, :, 0] = 1.0
-        v = AsymmetricLoss([2.0, 0.0, 0.0], 0.0, 0.0)(logits, target)
-        true(torch.isfinite(v), "gamma_neg dạng danh sách phải chạy được")
-    check("ASL: nhận gamma_neg theo lớp (dạng danh sách)", t_asl_per_class_gamma)
+    check("nhánh: cls_metrics tính đúng F1 lớp pos", t_cls_metrics)
 
-    # ── Vỏ bọc RecombGemma với một LM giả ─────────────────────────────────
-    class FakeVision(nn.Module):
-        def forward(self, pixel_values):
-            b = pixel_values.shape[0]
-            return type("O", (), {"last_hidden_state":
-                                  torch.randn(b, N_VIS, D_VIS)})()
+    def t_cls_metrics_mask():
+        gold = torch.zeros(2, 2, 3)
+        gold[0, :, 1] = 1.0            # mẫu 0 có nhãn: cả hai đều pos
+        lg = torch.zeros(2, 2, 3)
+        lg[0, :, 1] = 9.0              # đoán đúng mẫu 0
+        lg[1, :, 0] = 9.0              # mẫu 1 (không nhãn) đoán neg
+        m = cls_metrics(lg, gold, mask=torch.tensor([1.0, 0.0]))
+        eq(m["cls_f1_pos"], 1.0, 1e-6,
+           "mẫu bị mask lọt vào cls_metrics: nhãn của nó là vector 0 nên nó "
+           "trông như một mẫu âm hoàn hảo và thổi số lên")
+    check("nhánh: cls_metrics loại mẫu bị mask", t_cls_metrics_mask)
 
-    class FakeProj(nn.Module):
-        """Gộp 64 patch -> 4 token, giống projector của Gemma (pool rồi chiếu)."""
+    # ── chèn token ──────────────────────────────────────────────────────────
+    def t_inject_uniform():
+        B, T, D, K = 2, 9, 4, 3
+        emb = torch.arange(B * T * D, dtype=torch.float32).view(B, T, D)
+        tok = torch.full((B, K, D), -1.0)
+        am = torch.ones(B, T, dtype=torch.long)
+        lb = torch.arange(B * T).view(B, T)
+        tt = torch.zeros(B, T, dtype=torch.long)
+        out = inject_tokens(emb, tok, 4, attention_mask=am, labels=lb,
+                            token_type_ids=tt, token_type_value=0)
+        e = out["inputs_embeds"]
+        true(tuple(e.shape) == (B, T + K, D), f"shape {tuple(e.shape)}")
+        true(torch.allclose(e[:, :4], emb[:, :4]), "phần TRƯỚC chỗ chèn phải nguyên")
+        true(torch.allclose(e[:, 4:4 + K], tok), "token chèn sai chỗ")
+        true(torch.allclose(e[:, 4 + K:], emb[:, 4:]), "phần SAU chỗ chèn phải nguyên")
+        true(bool((out["labels"][:, 4:4 + K] == -100).all()),
+             "nhãn của token chèn thêm PHẢI là -100 — quên chỗ này thì model bị "
+             "dạy sinh ra 32 token vô nghĩa ở đầu mỗi báo cáo, và loss vẫn giảm")
+        true(bool((out["attention_mask"][:, 4:4 + K] == 1).all()),
+             "token chèn thêm phải được nhìn thấy")
+    check("nhánh: inject_tokens chèn đúng chỗ, nhãn -100", t_inject_uniform)
 
-        def __init__(self):
-            super().__init__()
-            self.lin = nn.Linear(D_VIS, D_MODEL)
+    def t_inject_per_row():
+        B, T, D, K = 3, 8, 4, 2
+        emb = torch.randn(B, T, D)
+        tok = torch.full((B, K, D), -1.0)
+        at = torch.tensor([0, 3, 7])
+        out = inject_tokens(emb, tok, at,
+                            attention_mask=torch.ones(B, T, dtype=torch.long))
+        e = out["inputs_embeds"]
+        for r, p in enumerate(at.tolist()):
+            true(torch.allclose(e[r, p:p + K], tok[r]),
+                 f"hàng {r}: token chèn không nằm ở vị trí {p}")
+            true(torch.allclose(e[r, :p], emb[r, :p]), f"hàng {r}: phần đầu lệch")
+            true(torch.allclose(e[r, p + K:], emb[r, p:]), f"hàng {r}: phần đuôi lệch")
+    check("nhánh: inject_tokens chèn theo TỪNG HÀNG (khâu sinh, đệm trái)",
+          t_inject_per_row)
 
-        def forward(self, vis):
-            b = vis.shape[0]
-            return self.lin(vis.view(b, 4, N_VIS // 4, D_VIS).mean(2))
-
-    class FakeLM(nn.Module):
-        """LM giả mô phỏng ĐÚNG những gì vỏ bọc đụng tới, gồm cả bẫy 4-bit.
-
-        `q4` là một tham số uint8 đứng ĐẦU danh sách parameters(), y như
-        `Params4bit` của bitsandbytes trên base NF4 — nó là bẫy mà
-        `next(model.parameters()).dtype` rơi vào.
-        """
-
-        def __init__(self, img_token: int = 7):
-            super().__init__()
-            self.q4 = nn.Parameter(torch.zeros(4, dtype=torch.uint8),
-                                   requires_grad=False)
-            self.emb = nn.Embedding(50, D_MODEL)
-            self.vision_tower = FakeVision()
-            self.multi_modal_projector = FakeProj()
-            self.head = nn.Linear(D_MODEL, 50)
-            self.config = type("C", (), {"image_token_index": img_token})()
-            self.is_quantized = True          # như PreTrainedModel đã lượng tử
-            self.seen = {}
-
-        def get_input_embeddings(self):
-            return self.emb
-
-        def forward(self, inputs_embeds=None, attention_mask=None, labels=None,
-                    token_type_ids=None, **kw):
-            self.seen = {"T": inputs_embeds.shape[1], "embeds": inputs_embeds,
-                         "labels": labels, "attn": attention_mask,
-                         "tti": token_type_ids}
-            logits = self.head(inputs_embeds)
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, 50), labels.clamp(min=0).view(-1),
-                ignore_index=-100) if labels is not None else logits.sum()
-            return type("O", (), {"loss": loss, "logits": logits})()
-
-    def make(gate=0.0, lam=0.5, warm=0, img_token=7):
-        lm = FakeLM(img_token)
-        rec, qf, head, asl = build_branch(
-            {"recombiner": {"d_hidden": D_MODEL, "n_query": N_Q, "n_heads": 4},
-             "qformer": {"d_model": 12, "n_query": 1, "n_heads": 4, "n_layers": 1},
-             "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.05}},
-            d_vis=D_VIS, d_model=D_MODEL, n_vis=N_VIS, n_labels=L_LAB)
-        return RecombGemma(lm, rec, qf, head, asl, lambda_sup=lam,
-                           decoder_gate_init=gate, lambda_warmup_steps=warm)
-
-    def batch(b=2, T=12, img_token=7):
-        ids = torch.randint(10, 49, (b, T))
-        ids[:, 2:6] = img_token              # 4 chỗ trống cho token ảnh
-        labels = ids.clone()
-        labels[:, :6] = -100
-        return {"input_ids": ids, "attention_mask": torch.ones(b, T, dtype=torch.long),
-                "labels": labels, "pixel_values": torch.randn(b, 3, 8, 8),
-                "token_type_ids": torch.zeros(b, T, dtype=torch.long)}
-
-    def t_float_dtype_skips_quantized():
-        lm = FakeLM()
-        true(next(lm.parameters()).dtype == torch.uint8,
-             "ca thử phải có tham số uint8 đứng đầu, như base NF4")
-        true(float_dtype(lm) == torch.float32,
-             "float_dtype phải BỎ QUA trọng số đã lượng tử và trả dtype thật")
-    check("float_dtype: bỏ qua Params4bit (uint8) — ảnh không bị ép về uint8",
-          t_float_dtype_skips_quantized)
-
-    def t_trainer_quantized_guard():
-        """Đúng phép kiểm mà HF Trainer.__init__ chạy trước khi ném ValueError."""
-        m = make()
-        is_quantized_and_base = getattr(m, "is_quantized", False) and not getattr(
-            m, "_hf_peft_config_loaded", False)
-        true(getattr(m, "is_quantized", False),
-             "vỏ bọc phải NHÌN THẤY base đã lượng tử (qua __getattr__)")
-        true(not is_quantized_and_base,
-             "Trainer sẽ ném 'You cannot perform fine-tuning on purely quantized "
-             "models' nếu vỏ bọc không khai _hf_peft_config_loaded")
-    check("Trainer guard: vỏ bọc không bị coi là 'model lượng tử trần'",
-          t_trainer_quantized_guard)
-
-    def t_image_token_outside_vocab():
-        """image_token_index có thể nằm NGOÀI bảng embedding của khối ngôn ngữ."""
-        m = make(img_token=999)              # emb chỉ có 50 hàng
-        bt = batch(img_token=999)
-        m(**bt)                              # không được IndexError
-        pre = m.lm.seen["embeds"]
-        true(bool(torch.isfinite(pre).all()), "embedding phải hữu hạn")
-    check("RecombGemma: token ảnh ngoài vocab không làm vỡ tra bảng embedding",
-          t_image_token_outside_vocab)
-
-    def t_prefix_lengths():
-        m = make()
-        bt = batch()
-        m(**bt)
-        T = bt["input_ids"].shape[1]
-        eq(m.lm.seen["T"], T + N_Q, 0, "chuỗi phải dài thêm đúng n_query token")
-        eq(m.lm.seen["labels"].shape[1], T + N_Q, 0, "labels phải dài theo")
-        eq(m.lm.seen["attn"].shape[1], T + N_Q, 0, "attention_mask phải dài theo")
-        eq(m.lm.seen["tti"].shape[1], T + N_Q, 0, "token_type_ids phải dài theo")
-    check("RecombGemma: chèn đúng n_query token vào MỌI tensor theo chuỗi",
-          t_prefix_lengths)
-
-    def t_prefix_labels_masked():
-        m = make()
-        m(**batch())
-        pre = m.lm.seen["labels"][:, :N_Q]
-        true(bool((pre == -100).all()),
-             "32 token chèn thêm PHẢI là -100; quên thì model bị dạy sinh ra chúng")
-    check("RecombGemma: token chèn thêm bị che khỏi loss (-100)",
-          t_prefix_labels_masked)
-
-    def t_gate_zero_at_init():
-        m = make(gate=0.0)
-        m(**batch())
-        pre = m.lm.seen["embeds"][:, :N_Q]
-        true(float(pre.abs().max()) == 0.0,
-             "cổng khởi tạo 0 -> token chèn vào phải đúng bằng 0 ở bước đầu")
-    check("RecombGemma: cổng 0 -> đầu vào decoder giống hệt candidate A",
-          t_gate_zero_at_init)
-
-    def t_gate_open_changes_input():
-        m = make(gate=1.0)
-        m(**batch())
-        pre = m.lm.seen["embeds"][:, :N_Q]
-        true(float(pre.abs().max()) > 0.0, "cổng mở thì token chèn phải khác 0")
-    check("RecombGemma: cổng mở -> token tái tổ hợp thật sự vào decoder",
-          t_gate_open_changes_input)
-
-    def t_image_slot_guard():
-        m = make()
-        bt = batch()
-        bt["input_ids"][:, 2:6] = 8          # xoá hết chỗ trống cho ảnh
+    def t_image_index():
+        ids = torch.tensor([[1, 2, 7, 7, 3], [1, 2, 7, 7, 3]])
+        eq(first_image_index(ids, 7), 2, 0)
+        ragged = torch.tensor([[7, 2, 3, 4, 5], [1, 2, 7, 4, 5]])
+        true(bool((image_start_indices(ragged, 7) == torch.tensor([0, 2])).all()),
+             "image_start_indices phải trả vị trí của TỪNG hàng")
         try:
-            m(**bt)
-        except RuntimeError as e:
-            true("token ảnh" in str(e) or "pan&scan" in str(e),
-                 f"thông báo phải nói về token ảnh: {e}")
+            first_image_index(ragged, 7)
+        except RuntimeError:
             return
-        raise AssertionError("số chỗ trống lệch số token ảnh mà vẫn ghép — "
-                             "masked_scatter sẽ ghép sai chỗ trong im lặng")
-    check("RecombGemma: số chỗ trống ảnh lệch thì DỪNG", t_image_slot_guard)
+        raise AssertionError(
+            "first_image_index nhận batch lệch vị trí mà không dừng — ở khâu "
+            "huấn luyện điều đó nghĩa là chèn 32 token vào GIỮA prompt của vài mẫu")
+    check("nhánh: vị trí token ảnh — chặt ở train, theo hàng ở sinh", t_image_index)
 
-    def t_loss_composition():
-        m = make(lam=0.5)
-        bt = batch()
-        tgt = torch.zeros(2, L_LAB, 3)
-        tgt[:, :, 0] = 1.0
-        out = m(**bt, cls_target=tgt, cls_mask=torch.ones(2))
-        eq(float(out["loss"]), float(out["loss_ce"]) + 0.5 * float(out["loss_sup"]),
-           1e-4, "L phải đúng bằng CE + lambda·ASL")
-        true(float(out["loss_sup"]) > 0, "ASL phải khác 0 khi có nhãn")
-    check("RecombGemma: L = CE + lambda·ASL, đúng số", t_loss_composition)
+    def t_build_embeds_counts():
+        """build_inputs_embeds phải ĐẾM trước khi masked_scatter."""
+        class _Cfg:
+            image_token_index = 7
 
-    def t_loss_no_labels():
-        m = make()
-        out = m(**batch())
-        eq(float(out["loss_sup"]), 0.0, 1e-12,
-           "không có nhãn phân loại thì phần ASL phải bằng 0, không phải NaN")
-        true(np.isfinite(float(out["loss"])), "loss phải hữu hạn")
-    check("RecombGemma: thiếu nhãn -> chỉ còn CE, không NaN", t_loss_no_labels)
+        class _Gemma(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = nn.Embedding(10, D_MODEL)
+                self.config = _Cfg()
 
-    def t_lambda_warmup():
-        m = make(lam=0.4, warm=10)
-        m.train()
-        eq(m._lambda(), 0.0, 1e-12, "bước 0 thì lambda = 0")
-        m._step = 5
-        eq(m._lambda(), 0.2, 1e-12, "giữa chừng thì lambda đi tuyến tính")
-        m._step = 50
-        eq(m._lambda(), 0.4, 1e-12, "quá N bước thì kẹp ở lambda_sup")
-    check("RecombGemma: warmup lambda tuyến tính rồi kẹp", t_lambda_warmup)
+            def get_input_embeddings(self):
+                return self.emb
 
-    def t_grad_reaches_branch():
-        m = make(gate=0.5)
-        bt = batch()
-        tgt = torch.zeros(2, L_LAB, 3)
-        tgt[:, :, 1] = 1.0
-        m(**bt, cls_target=tgt, cls_mask=torch.ones(2))["loss"].backward()
-        for nm, p in (("recombiner.swiglu.gate_proj.weight",
-                       m.recombiner.swiglu.gate_proj.weight),
-                      ("decoder_gate", m.decoder_gate),
-                      ("sup_head.proj.weight", m.sup_head.proj.weight)):
-            true(p.grad is not None and float(p.grad.abs().sum()) > 0,
-                 f"{nm} không nhận gradient")
-    check("RecombGemma: gradient chảy tới Recombiner, cổng và Sup-head",
-          t_grad_reaches_branch)
+        g = _Gemma()
+        ids = torch.tensor([[1, 7, 7, 2]])
+        ok = build_inputs_embeds(g, ids, torch.randn(1, 2, D_MODEL))
+        true(tuple(ok.shape) == (1, 4, D_MODEL))
+        try:
+            build_inputs_embeds(g, ids, torch.randn(1, 3, D_MODEL))
+        except RuntimeError as e:
+            true("pan&scan" in str(e) or "token ảnh" in str(e), str(e))
+            return
+        raise AssertionError(
+            "số token ảnh lệch số chỗ trống mà không dừng — masked_scatter khi "
+            "đó vẫn chạy và ghép sai chỗ")
+    check("nhánh: build_inputs_embeds đếm chỗ trống trước khi ghép",
+          t_build_embeds_counts)
 
-    def t_branch_roundtrip():
+    # ── ghi / nạp ───────────────────────────────────────────────────────────
+    def t_roundtrip():
         import tempfile
 
-        from src.train_recomb import load_branch, save_branch
+        b1 = _branch()
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            true(not branch_exists(d), "thư mục rỗng mà branch_exists = True")
+            save_branch(b1, d)
+            true(branch_exists(d), "ghi xong mà branch_exists = False")
+            b2 = load_branch(d)
+            for name, p1 in b1.state_dict().items():
+                p2 = b2.state_dict()[name]
+                true(torch.allclose(p1.float(), p2.float(), atol=1e-6),
+                     f"trọng số {name} lệch sau khi nạp lại")
+            eq(b2.n_query, b1.n_query, 0)
+            true(b2.qformer.frozen == b1.qformer.frozen,
+                 "danh sách task đóng băng phải sống sót qua vòng ghi/nạp — "
+                 "không thì `aux` hết bị detach sau khi nạp và không ai biết")
+    check("nhánh: ghi rồi nạp lại cho ĐÚNG trọng số và ĐÚNG cấu hình", t_roundtrip)
 
-        m1, m2 = make(gate=0.3), make(gate=0.9)
-        with tempfile.TemporaryDirectory() as td:
-            save_branch(m1, Path(td), {"n_labels": L_LAB})
-            load_branch(m2, Path(td))
-        true(torch.allclose(m1.decoder_gate, m2.decoder_gate), "cổng phải khớp")
-        true(torch.allclose(m1.recombiner.swiglu.gate_proj.weight,
-                            m2.recombiner.swiglu.gate_proj.weight),
-             "trọng số Recombiner phải khớp sau khi nạp lại")
-        true(torch.allclose(m1.sup_head.proj.weight, m2.sup_head.proj.weight),
-             "Sup-head phải khớp")
-    check("save/load nhánh: khứ hồi không mất trọng số nào", t_branch_roundtrip)
-
-    def t_branch_load_strict():
+    def t_load_missing():
         import tempfile
 
-        from safetensors.torch import save_file
-
-        from src.train_recomb import BRANCH_FILE, load_branch
-
-        m = make()
-        with tempfile.TemporaryDirectory() as td:
-            save_file({"decoder_gate": m.decoder_gate.detach().cpu()},
-                      str(Path(td) / BRANCH_FILE))
+        with tempfile.TemporaryDirectory() as d:
             try:
-                load_branch(m, Path(td))
-            except Exception:
+                load_branch(Path(d))
+            except FileNotFoundError as e:
+                true("NGẪU NHIÊN" in str(e) or "ngẫu nhiên" in str(e), str(e))
                 return
-        raise AssertionError("file nhánh thiếu khoá mà vẫn nạp — khâu sinh sẽ "
-                             "chạy với một phần nhánh còn ngẫu nhiên")
-    check("load nhánh: thiếu khoá thì DỪNG (strict)", t_branch_load_strict)
+        raise AssertionError(
+            "nạp nhánh từ thư mục không có file mà không dừng — đó đúng là ca "
+            "sinh báo cáo bằng nhánh ngẫu nhiên")
+    check("nhánh: thiếu file nhánh thì DỪNG, không chạy nhánh ngẫu nhiên",
+          t_load_missing)
+
+    def t_params_reported():
+        n = _branch().n_params()
+        for k in ("total", "trainable", "recombinator", "qformer", "cls_head",
+                  "route_gate", "n_query", "qformer_tasks", "qformer_frozen"):
+            true(k in n, f"n_params thiếu {k}")
+        true(n["total"] >= n["recombinator"] + n["qformer"], "tổng không hợp lệ")
+    check("nhánh: n_params báo đủ từng khối", t_params_reported)
 
 
 # ═══ 4. Cấu hình và ranh giới _archive ═══════════════════════════════════════
 def config_tests() -> None:
     from src.config import load_config
 
-    cfg = load_config(ROOT / "configs" / "recomb.yaml")
+    cfg = load_config(ROOT / "configs" / "recombiner.yaml")
+
+    def _is_b(a: dict) -> bool:
+        true("recomb" in a or "recombiner" in a,
+             f"arm {a.get('id')!r} không khai cờ `recomb` — đó là thứ DUY NHẤT "
+             f"phân biệt hai candidate, nó không được có mặc định ngầm")
+        return bool(a.get("recomb", a.get("recombiner", False)))
 
     def t_two_arms():
         arms = [a for a in cfg["arms"] if a.get("enabled", True)]
         eq(len(arms), 2, 0, "§2.3 phải có ĐÚNG hai candidate được bật")
-        eq(sum(1 for a in arms if a.get("recomb")), 1, 0,
-           "đúng một candidate có nhánh Recombiner")
-        true(len({a["rank"] for a in arms}) == 1, "hai candidate phải cùng rank")
-        true(len({a["method"] for a in arms}) == 1, "hai candidate phải cùng method")
-    check("config: đúng 2 candidate, khác nhau đúng một thứ", t_two_arms)
+        eq(sum(1 for a in arms if _is_b(a)), 1, 0,
+           "đúng một candidate có nhánh Recombinator")
+        # Mọi khoá khác của hai arm phải trùng nhau: preset LoRA, batch, lịch...
+        # đều nằm ở khối chung, nên arm chỉ được mang id/name/cờ/enabled.
+        extra = set()
+        for a in arms:
+            extra |= set(a) - {"id", "name", "recomb", "recombiner", "enabled"}
+        true(not extra,
+             f"arm mang thêm khoá {sorted(extra)}. Mọi thứ khác PHẢI ở khối "
+             f"chung — một khoá riêng trong arm là một biến thứ hai giữa hai cột")
+    check("config: đúng 2 candidate, khác nhau đúng MỘT khoá", t_two_arms)
+
+    def t_lora_preset():
+        l = cfg["lora"]
+        true(l.get("preset") in (l.get("presets") or {}),
+             f"lora.preset = {l.get('preset')!r} không có trong lora.presets")
+        spec = l["presets"][l["preset"]]
+        true({"method", "rank"} <= set(spec), f"preset thiếu method/rank: {spec}")
+    check("config: lora.preset trỏ vào một preset có thật", t_lora_preset)
+
+    def t_no_probe():
+        t = cfg["train"]
+        true("batch_probe" not in t,
+             "train.batch_probe vẫn còn — §2.3 không dò batch nữa, và để lại "
+             "khối này là mời người đọc tin vào một cơ chế đã bị gỡ")
+        for k in ("per_device_batch_size", "grad_accum"):
+            true(int(t[k]) >= 1, f"train.{k} phải >= 1")
+    check("config: batch là hằng số, không còn khối dò", t_no_probe)
+
+    def t_recombiner_block():
+        r = cfg["recombiner"]
+        eq(float(r.get("gate_init", 0.0)), 0.0, 1e-12,
+           "cổng vào decoder PHẢI khởi tạo 0 — khác 0 là bỏ mất tính chất 'ở "
+           "bước 0, đầu vào decoder của B = của A cộng n_query token 0'")
+        q = r["qformer"]
+        eq(len(q["tasks"]), 2, 0, "sơ đồ có QFormer 2 vector")
+        true(list(q["freeze"]) == ["aux"],
+             "§2.3 không chạy MoE, nên `aux` (Route_Gate) phải đóng băng")
+        true(int(r["n_query"]) >= 1, "n_query phải >= 1")
+        true("heads_qformer" not in r and "decoder_qformer" not in r,
+             "config còn sót QFormer thứ hai của bản trước — sơ đồ chỉ có MỘT")
+    check("config: nhánh đúng sơ đồ (1 QFormer, 2 vector, cổng 0)",
+          t_recombiner_block)
+
+    def t_classifier_block():
+        c = cfg["classifier"]
+        eq(float(c["asl"]["gamma_neg"]), 2.0, 1e-9)
+        eq(float(c["asl"]["gamma_pos"]), 0.0, 1e-9)
+        true(0.0 < float(c["lambda"]) <= 2.0, "classifier.lambda phải dương, hợp lý")
+        true(not c.get("feed_logits_to_decoder", False),
+             "feed_logits_to_decoder phải TẮT ở §2.3: bật lên là thêm một đường "
+             "thông tin nữa vào candidate B, và hai kiểm định không tách được nữa")
+    check("config: khối classifier (ASL, λ) đúng thiết kế", t_classifier_block)
+
+    def t_no_panscan():
+        true(not bool(((cfg.get("base", {}) or {}).get("image", {}) or {})
+                      .get("do_pan_and_scan", False)),
+             "pan&scan phải TẮT: mỗi mảnh phụ thêm một lượt patch và TokenPool "
+             "(4096 -> n_query) sẽ dừng")
+    check("config: pan&scan tắt (điều kiện của TokenPool)", t_no_panscan)
 
     def t_stats_block():
         s = cfg["stats"]
@@ -725,38 +796,51 @@ def config_tests() -> None:
              "k = 2 thì không có chỗ cho Friedman trong config")
     check("config: khối stats đủ cho bootstrap + permutation", t_stats_block)
 
-    def t_branch_block():
-        b = cfg["branch"]
-        eq(b["qformer"]["n_query"], 1, 0, "QFormer của §2.3 chỉ 1 vector")
-        eq(b["n_classes"], 3, 0, "neg / pos / uncertain")
-        eq(float(b["asl"]["gamma_neg"]), 2.0, 1e-9)
-        eq(float(b["asl"]["gamma_pos"]), 0.0, 1e-9)
-        eq(float(b["decoder_gate_init"]), 0.0, 1e-9,
-           "cổng vào decoder phải khởi tạo 0")
-    check("config: nhánh đúng như thiết kế (1 vector, ASL 2.0/0.0, cổng 0)",
-          t_branch_block)
-
     def t_primary_metric():
         p = str(cfg["metrics"]["primary"])
         true(p == "bertscore_f1" and cfg["metrics"]["bertscore"]["enabled"],
              "metric chính phải nằm trong các metric thật sự được tính")
     check("config: metric chính có được tính", t_primary_metric)
 
-    def t_lambda():
-        true(0.0 < float(cfg["train"]["lambda_sup"]) <= 2.0,
-             "lambda_sup phải là một số dương hợp lý")
-    check("config: lambda_sup hợp lệ", t_lambda)
+    # ── thứ tự chạy: B trước A ──────────────────────────────────────────────
+    def t_b_first():
+        from src.run_recomb import enabled_arms, train_order
 
+        arms = enabled_arms(cfg)
+        order = train_order(arms)
+        true(bool(order[0].get("recomb")),
+             "candidate B phải chạy TRƯỚC: nó là candidate duy nhất có thể hỏng "
+             "vì lý do kiến trúc, và một cột lẻ không định nghĩa được phép so "
+             "sánh ghép cặp")
+        true([a["id"] for a in arms] != [a["id"] for a in order]
+             or len(arms) == 1,
+             "thứ tự trình bày và thứ tự chạy phải là hai thứ tách rời")
+    check("điều phối: candidate B chạy trước candidate A", t_b_first)
+
+    def t_arm_flag_required():
+        from src.config import Cfg
+        from src.run_recomb import enabled_arms
+
+        bad = Cfg({"arms": [{"id": "x", "enabled": True}]})
+        try:
+            enabled_arms(bad)
+        except ValueError:
+            return
+        raise AssertionError(
+            "arm thiếu cờ `recomb` mà không dừng — nó sẽ lặng lẽ thành candidate "
+            "A thứ hai, và bảng kết quả nói 'nhánh không có tác dụng'")
+    check("điều phối: arm quên khai `recomb` thì DỪNG", t_arm_flag_required)
+
+    # ── ranh giới _archive ──────────────────────────────────────────────────
     import re
 
     # Chỉ soi câu LỆNH import, không soi chú thích: docstring của repo này nhắc
     # tên module đã archive rất nhiều (đó là lịch sử thiết kế, và nó nên ở lại).
-    IMPORT_RE = re.compile(
-        r"^\s*(?:from\s+[.\w]*\b(%s)\b|import\s+[.\w]*\b(%s)\b)", re.M)
+    IMPORT_RE = r"^\s*(?:from\s+[.\w]*\b(%s)\b|import\s+[.\w]*\b(%s)\b)"
 
     def _imports(mod: str) -> list[str]:
-        rx = re.compile(IMPORT_RE.pattern % (mod, mod), re.M)
-        return [p.name for p in (ROOT / "src").rglob("*.py")
+        rx = re.compile(IMPORT_RE % (mod, mod), re.M)
+        return [str(p.relative_to(ROOT)) for p in (ROOT / "src").rglob("*.py")
                 if rx.search(p.read_text(encoding="utf-8"))]
 
     def t_no_archive_import():
@@ -770,10 +854,41 @@ def config_tests() -> None:
     check("ranh giới: §2.3 không dùng stats_friedman (đã archive)",
           t_no_friedman_import)
 
+    def t_no_train_import():
+        bad = [f for f in _imports("train") if "train_recomb" not in f]
+        # `from .train import ...` phải biến mất: phần dùng chung đã sang
+        # backbone.py, phần còn lại (HF Trainer + thang dò batch) đã archive.
+        rx = re.compile(r"^\s*from\s+\.train\s+import|^\s*from\s+\.\.train\s+import",
+                        re.M)
+        hits = [str(p.relative_to(ROOT)) for p in (ROOT / "src").rglob("*.py")
+                if rx.search(p.read_text(encoding="utf-8"))]
+        true(not hits,
+             f"còn import src/train.py (đã archive): {hits}. Phần dùng chung "
+             f"nằm ở src/backbone.py.")
+        _ = bad
+    check("ranh giới: không file nào còn import src/train.py", t_no_train_import)
+
+    def t_backbone_has_no_ladder():
+        import src.backbone as bb
+
+        for gone in ("batch_ladder", "read_probe", "write_probe", "probe_path",
+                     "resolve_batch", "effective_batch"):
+            true(not hasattr(bb, gone),
+                 f"backbone còn `{gone}` — cơ chế dò batch phải biến mất hẳn, "
+                 f"không phải chỉ thôi được gọi")
+    check("ranh giới: backbone không còn cơ chế dò batch", t_backbone_has_no_ladder)
+
+    def t_one_config():
+        true(not (ROOT / "configs" / "recomb.yaml").exists(),
+             "configs/recomb.yaml vẫn còn. Hai file cấu hình cho cùng một thí "
+             "nghiệm là cách chắc chắn nhất để chạy nhầm một cái — "
+             "bash scripts/archive_2.2.sh --apply")
+    check("ranh giới: chỉ còn MỘT config cho §2.3", t_one_config)
+
 
 # ═══ main ════════════════════════════════════════════════════════════════════
 def main() -> int:
-    print("═══ selftest §2.3 — thống kê · nhãn · nhánh Recombiner · config ═══\n")
+    print("═══ selftest §2.3 — thống kê · nhãn · nhánh Recombinator · config ═══\n")
     for fn in (stats_tests, label_tests, branch_tests, config_tests):
         fn()
     for name in PASS:

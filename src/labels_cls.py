@@ -9,7 +9,7 @@ Hai cách xử lý sai, và vì sao cả hai đều tệ:
 
   1. Ghi cứng một giả định. Nếu sai thì hoặc nổ ngay (may), hoặc — tệ hơn — nhãn
      bị hiểu lệch một bậc và head phân loại học một bài toán khác bài toán ta
-     nghĩ. ASL vẫn giảm, nhánh Recombiner vẫn nhận gradient; chỉ là gradient đó
+     nghĩ. ASL vẫn giảm, nhánh Recombinator vẫn nhận gradient; chỉ là gradient đó
      ràng buộc nó vào thông tin sai, và candidate B vẫn ra một cột số trông như
      kết quả thật.
   2. Đoán rồi im lặng. Cùng hậu quả, khó phát hiện hơn.
@@ -123,7 +123,7 @@ def to_onehot(raw: np.ndarray, encoding: dict[float, int]) -> np.ndarray:
 
     Ô nào không khớp lớp nào (ví dụ NaN = "không nhắc tới") -> TOÀN 0, và bị
     mask khỏi loss ở tầng trên. Trả toàn-0 chứ không đoán một lớp: đoán ở đây là
-    bịa nhãn, và nhãn bịa đi thẳng vào gradient của nhánh Recombiner.
+    bịa nhãn, và nhãn bịa đi thẳng vào gradient của nhánh Recombinator.
     """
     raw = np.asarray(raw)
     if raw.ndim != 2:
@@ -225,7 +225,7 @@ def attach(cfg: Cfg, keys: list[str], lut: dict[str, np.ndarray], n_labels: int,
     Mẫu thiếu nhãn nhận vector 0 và mask 0: nó VẪN dạy decoder viết báo cáo (CE
     bình thường) nhưng KHÔNG đóng góp vào ASL. Vứt hẳn mẫu là đổi tập huấn luyện
     của candidate B so với candidate A, và khi đó hiệu số quan sát được vừa do
-    nhánh Recombiner vừa do 6400 mẫu đã thành 6100 — không tách ra được.
+    nhánh Recombinator vừa do 6400 mẫu đã thành 6100 — không tách ra được.
     """
     y = np.zeros((len(keys), n_labels, len(CLASS_ORDER)), dtype=np.float32)
     m = np.zeros((len(keys),), dtype=np.float32)
@@ -249,7 +249,7 @@ def attach(cfg: Cfg, keys: list[str], lut: dict[str, np.ndarray], n_labels: int,
             f"[{label}] {100*frac:.1f}% mẫu thiếu nhãn, vượt ngưỡng "
             f"labels.max_missing_frac = {100*cap:.0f}%.\n"
             f"    Ở mức này head phân loại gần như không được giám sát, nên nhánh "
-            f"Recombiner mất chỗ neo gradient và candidate B rất dễ hội tụ về "
+            f"Recombinator mất chỗ neo gradient và candidate B rất dễ hội tụ về "
             f"đúng candidate A cộng thêm tham số ngủ.\n"
             f"    Nguyên nhân hay gặp: key trong labels.npz đã chuẩn hoá khác "
             f"split (thiếu tiền tố `files/`, thêm/bớt phần mở rộng). Chạy "

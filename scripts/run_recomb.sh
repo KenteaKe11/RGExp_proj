@@ -2,22 +2,34 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # run_recomb.sh — §2.3 HAI CANDIDATE + BOOTSTRAP/PERMUTATION, MỘT LỆNH.
 #
-#     bash scripts/run_recomb.sh                  # train ×2 -> infer ×2 -> chấm -> kiểm định -> đẩy Hub
+#     bash scripts/run_recomb.sh                  # train B,A -> infer B,A -> chấm -> kiểm định -> đẩy Hub
 #     bash scripts/run_recomb.sh --detach         # chạy NỀN, trả lại shell ngay
 #     bash scripts/run_recomb.sh --dry-run        # 16 mẫu train, 4 bước, 8 ảnh test
 #     bash scripts/run_recomb.sh --stages stats,report
-#     bash scripts/run_recomb.sh --arms qdora_r4_recomb
+#     bash scripts/run_recomb.sh --arms lora_recomb
 #
 # Mọi tham số khác chuyển thẳng cho `python -m src.run_recomb`.
 #
-# Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP:
-#   * candidate đã có adapter (+ recomb_branch.safetensors) -> bỏ qua train
-#   * ảnh đã sinh trong predictions/*.jsonl                 -> chỉ sinh phần thiếu
-#   * điểm đã chấm trong metrics/*.csv                      -> dùng lại
+# ── Candidate B chạy TRƯỚC candidate A ──────────────────────────────────────
+# B là candidate duy nhất có thể hỏng vì lý do kiến trúc (thiếu nhãn, pan&scan
+# lén bật, nhánh không vừa VRAM). A gần như chắc chắn chạy. Chạy A trước là trả
+# ~90 phút GPU rồi mới biết B không dựng được — và §2.3 cần ĐỦ HAI cột, một cột
+# lẻ không định nghĩa được phép so sánh ghép cặp.
 #
-# Nếu §2.2 đã chạy trên máy này thì `adapters/qdora_r4` đã có sẵn, và candidate A
-# được dùng lại nguyên chứ không huấn luyện lại — xem chú thích output.adapter_dir
-# trong configs/recomb.yaml.
+# ── KHÔNG CÒN DÒ BATCH ──────────────────────────────────────────────────────
+# `train.per_device_batch_size` × `train.grad_accum` trong configs/recombiner.yaml
+# là hằng số, dùng chung cho cả hai candidate. Hết VRAM là DỪNG, kèm thông báo
+# nêu đúng khoá phải giảm. `--dry-run` là phép thử ĐƯỜNG ỐNG (16 mẫu, 4 bước),
+# KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config.
+#
+# Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP:
+#   * candidate đã có adapter (+ recombiner_branch.safetensors) -> bỏ qua train
+#   * ảnh đã sinh trong predictions/*.jsonl                     -> chỉ sinh phần thiếu
+#   * điểm đã chấm trong metrics/*.csv                          -> dùng lại
+#
+# Trước lần chạy đầu tiên:
+#     bash scripts/archive_2.2.sh --apply     # chuyển §2.2 sang _archive/
+#     python scripts/selftest_recomb.py       # phải qua HẾT
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -118,7 +130,7 @@ fi
 # Vài giây, không cần GPU/mạng. Cái nó bảo vệ: một lỗi trong khâu bootstrap hay
 # trong ASL không ném exception, nó chỉ cho ra một bảng sai.
 if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
-    echo "⚙ Tự kiểm chứng thống kê + nhánh Recombiner ..."
+    echo "⚙ Tự kiểm chứng thống kê + nhánh Recombinator ..."
     "$PYBIN" "$ROOT/scripts/selftest_recomb.py" || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU."
         echo "  Bỏ qua (không khuyến khích): RGEXP_SKIP_SELFTEST=1"

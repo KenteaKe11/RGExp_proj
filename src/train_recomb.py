@@ -1,44 +1,59 @@
 """Huấn luyện HAI candidate của §2.3 trên cùng một base, cùng một lịch, cùng
-một dữ liệu — khác nhau đúng một thứ: có nhánh Recombiner hay không.
+một dữ liệu — khác nhau đúng một thứ: có nhánh Recombinator hay không.
 
-File này dùng lại gần hết `src/train.py` của §2.2 (thang dò batch, chọn target
-module, alpha theo rank, đường cong one-cycle, che nhãn, collate) và thay ĐÚNG
-một chỗ: vòng tối ưu hoá.
+File này dùng lại `src/backbone.py` cho mọi thứ không phải vòng tối ưu hoá
+(nạp base, chọn target module, alpha theo rank, đường cong one-cycle, che nhãn,
+collate) và tự viết ĐÚNG một thứ: vòng lặp.
 
 ── Vì sao KHÔNG dùng HF Trainer ở đây ──────────────────────────────────────
 Không phải vì Trainer tệ. Vì hàm mất mát của §2.3 không còn là `model(**batch)`:
 
-    loss = CE_decoder(  decoder(  [prompt ‖ k token Recombiner ‖ 256 token ảnh] )  )
-         + λ(step) · ASLoss( head(k token trước gate), nhãn bệnh lý )
+    loss = CE_decoder( decoder( [prompt ‖ 32 token Recombinator ‖ 256 token ảnh] ) )
+         + λ(step) · ASL( ClsHead(vec_1), nhãn bệnh lý )
 
-Chuỗi vào decoder được DỰNG TAY (một lượt SigLIP chia cho hai đường, rồi phẫu
-thuật chèn k token vào giữa), và λ đổi theo bước. Nhồi chuyện đó vào Trainer
-cần một `compute_loss` ghi đè, một wrapper `nn.Module` giả dạng
-`PreTrainedModel`, và một `save_pretrained` tự viết — tức là ba lớp gián tiếp
-để giành lại quyền điều khiển một vòng lặp 25 dòng. Ở một thí nghiệm mà điều
-duy nhất phải đúng là "hai candidate được đối xử y như nhau", vòng lặp tường
-minh là cách kiểm chứng được điều đó bằng cách ĐỌC.
+Chuỗi vào decoder được DỰNG TAY (một lượt SigLIP chia cho hai đường, rồi chèn
+32 token vào giữa), và λ đổi theo bước. Nhồi chuyện đó vào Trainer cần một
+`compute_loss` ghi đè, một wrapper `nn.Module` giả dạng `PreTrainedModel`, và
+một `save_pretrained` tự viết — ba lớp gián tiếp để giành lại quyền điều khiển
+một vòng lặp 30 dòng. Ở một thí nghiệm mà điều duy nhất phải đúng là "hai
+candidate được đối xử y như nhau", vòng lặp tường minh là cách kiểm chứng được
+điều đó bằng cách ĐỌC.
 
 Cái giá, và nó phải vào phần Giới hạn của báo cáo: candidate A ở đây KHÔNG phải
-cùng một lần chạy với arm tương ứng trong bảng §2.2 (Trainer xáo dữ liệu bằng
+cùng một lần chạy với arm cùng tên trong bảng §2.2 (Trainer xáo dữ liệu bằng
 RNG riêng của nó). Con số tuyệt đối của §2.3 vì thế không so trực tiếp được với
 bảng §2.2; chỉ hiệu số A↔B bên trong §2.3 là thứ hai kiểm định nói về.
 
-Bốn chỗ giữ cho "y như nhau" thành thật:
+── Bốn chỗ giữ cho "y như nhau" thành thật ─────────────────────────────────
 
-  1. Cùng THỨ TỰ dữ liệu. `torch.randperm` với một Generator seed cố định, đặt
+  1. Cùng ĐƯỜNG ĐI. Cả A và B đều đi qua `_forward_loss`, đều tự dựng
+     `inputs_embeds` bằng `recombiner.build_inputs_embeds`. A không đi đường
+     `model(input_ids=..., pixel_values=...)` của transformers cho "gọn": hai
+     đường ấy tương đương về toán nhưng khác nhau về thứ tự phép tính, và khi
+     hiệu số đo được là vài phần trăm BLEU thì "gần như tương đương" không đủ.
+  2. Cùng THỨ TỰ dữ liệu. `torch.randperm` với một Generator seed cố định, đặt
      lại trước MỖI candidate. Không phải một lần đầu chương trình: làm thế thì
      candidate thứ hai bắt đầu từ trạng thái RNG mà candidate thứ nhất để lại.
-  2. Cùng SỐ BƯỚC và cùng đường cong. Số bước chỉ phụ thuộc bs × accum, và thang
-     dò giữ tích đó bằng 32 ở mọi nấc (xem `src/train.batch_ladder`).
-  3. Cùng NẤC BATCH cho cả hai candidate — nấc thấp nhất mà cả hai cùng qua.
-  4. Cùng độ dài NHÃN. k token được chèn SAU khi mẫu đã bị cắt về max_seq_len,
-     nên candidate B không học trên báo cáo ngắn hơn candidate A đúng k token.
+  3. Cùng SỐ BƯỚC và cùng đường cong, vì batch và grad_accum là hằng số đọc
+     thẳng từ config (xem mục dưới).
+  4. Cùng độ dài NHÃN. 32 token được chèn SAU khi mẫu đã bị cắt về max_seq_len,
+     nên candidate B không học trên báo cáo ngắn hơn candidate A đúng 32 token.
+
+── Vì sao KHÔNG còn dò batch ───────────────────────────────────────────────
+Bản trước có một cái thang: hết VRAM thì chia đôi batch và nhân đôi grad_accum.
+Nó giữ được batch hiệu dụng, nhưng nó giấu một chuyện — nấc thật sự dùng phụ
+thuộc vào việc lúc ấy card còn trống bao nhiêu, tức là vào cái gì chạy trước.
+Với candidate B chạy trước A (thứ tự mặc định của §2.3, xem `src/run_recomb.py`),
+một cái thang còn có thể cho hai candidate hai nấc khác nhau.
+
+Nay: `train.per_device_batch_size` × `train.grad_accum` là hằng số, dùng chung
+cho cả hai candidate, và hết VRAM là DỪNG với thông báo chỉ đúng chỗ phải giảm.
+Một lần chạy dừng ở phút thứ ba rẻ hơn nhiều một bảng kết quả mà không ai nói
+được hai cột có cùng lịch học hay không.
 """
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 
@@ -46,340 +61,324 @@ import numpy as np
 import pandas as pd
 
 from . import imaging, labels_cls, recombiner
+from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
+                       build_scheduler, collate, free_vram, is_oom,
+                       is_quantized, load_base, resolve_alpha, total_steps,
+                       uses_dora)
 from .config import Cfg, seed_everything
-from .train import (TrainUnusable, attach_adapter, batch_ladder, collate,
-                    effective_batch, free_vram, is_oom, is_quantized, load_base,
-                    resolve_alpha, resolve_batch, total_steps, uses_dora)
 
 
-# ── Preset LoRA: chọn 1 trong 8 biến thể của §2.2 ───────────────────────────
+# ══ Preset LoRA: một hằng số cho CẢ HAI candidate ═══════════════════════════
 def resolve_preset(cfg: Cfg) -> dict:
-    """{id, method, rank, alpha} của cấu hình LoRA dùng cho CẢ HAI candidate.
+    """{id, method, rank, alpha} của cấu hình LoRA dùng cho cả A và B.
 
     §2.3 không so các biến thể LoRA nữa — §2.2 làm việc đó. Ở đây LoRA là hằng
-    số, và nó phải là một hằng số ĐÃ ĐƯỢC ĐO: đúng một trong tám arm §2.2 đã
-    chạy. Một preset lạ nghĩa là hai candidate của §2.3 đứng trên một nền không
-    có số liệu nào kèm theo, và khi đó "nối đặc trưng SigLIP có giúp không" mất
-    mốc để đối chiếu.
-
-    `preset: from_2_2` đọc bảng của §2.2 và lấy dòng đầu (bảng đó đã sort theo
-    meanrank của metric chính). Không có file thì DỪNG — rơi về mặc định ở đây
-    là âm thầm đổi thiết kế thí nghiệm.
+    số, và nó phải là một hằng số ĐÃ ĐƯỢC ĐO: đúng một trong các arm của §2.2.
+    Đặt preset ở MỘT chỗ (khoá `lora` trong config) thay vì lặp lại trong từng
+    arm là để "hai candidate cùng LoRA" đúng theo cách không gõ nhầm được.
     """
-    lc = dict(cfg.get("lora", {}) or {})
-    table = dict(lc.get("presets", {}) or {})
-    if not table:
-        raise TrainUnusable("lora.presets rỗng trong config")
-    want = str(lc.get("preset", "")).strip()
-    if not want:
+    l = dict(cfg.get("lora", {}) or {})
+    presets = dict(l.get("presets", {}) or {})
+    name = str(l.get("preset", "")).strip()
+    if not name:
         raise TrainUnusable(
-            f"lora.preset chưa đặt. Chọn một trong {sorted(table)} "
-            f"(hoặc `from_2_2` để lấy arm tốt nhất theo bảng §2.2).")
-
-    if want == "from_2_2":
-        p = Path(str(lc.get("from_2_2_summary",
-                            "./runs/2.2_adapter_friedman/metrics/summary.csv")))
-        if not p.exists():
-            raise TrainUnusable(
-                f"lora.preset = from_2_2 nhưng không thấy {p}.\n"
-                f"    §2.2 chưa chạy xong. Chọn tường minh một preset thay vì để "
-                f"§2.3 tự đoán: --set lora.preset=qlora_r32")
-        df = pd.read_csv(p)
-        col = "arm_id" if "arm_id" in df.columns else df.columns[0]
-        picked = None
-        for v in df[col].astype(str).tolist():
-            if v in table:
-                picked = v
-                break
-        if picked is None:
-            raise TrainUnusable(
-                f"{p} không có arm_id nào nằm trong tám preset ({sorted(table)}). "
-                f"File đó thuộc lần chạy nào khác?")
-        print(f"  preset LoRA lấy từ bảng §2.2 ({p}): {picked}", flush=True)
-        want = picked
-
-    if want not in table:
+            "config thiếu `lora.preset`. §2.3 phải nói RÕ nó đứng trên biến thể "
+            "LoRA nào của §2.2 — mặc định ngầm ở đây là một câu không kiểm được.")
+    if name not in presets:
         raise TrainUnusable(
-            f"lora.preset = {want!r} không nằm trong tám biến thể §2.2 "
-            f"({sorted(table)}).\n"
-            f"    Thêm một dòng vào lora.presets là để §2.3 chạy trên một cấu "
-            f"hình mà §2.2 chưa đo — nếu thật sự muốn thế thì phải ghi vào báo "
-            f"cáo, không phải sửa lặng lẽ.")
-    spec = dict(table[want])
-    rank = int(spec["rank"])
-    return {"id": want, "method": str(spec["method"]).lower(), "rank": rank,
-            "alpha": resolve_alpha(rank, dict(cfg["train"]))}
+            f"lora.preset = {name!r} không có trong lora.presets "
+            f"({sorted(presets)}).")
+    spec = dict(presets[name])
+    method = str(spec.get("method", "qdora")).lower()
+    rank = int(spec.get("rank", 4))
+    alpha = resolve_alpha(rank, dict(cfg["train"]))
+    return {"id": name, "method": method, "rank": rank, "alpha": alpha}
 
 
-# ── Preflight ───────────────────────────────────────────────────────────────
 def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
-    """Kiểm môi trường + nhãn TRƯỚC khi nạp base model.
+    """Kiểm những gì CHỈ §2.3 cần, trước khi nạp base. Trả (lỗi chặn, cảnh báo).
 
-    Cùng lý lẽ với §2.2, thêm một hạng mục: nhãn phân loại. Phát hiện "key
-    trong labels.npz không khớp split" sau khi đã tải 9400 ảnh và nạp base là
-    trả tiền cho một thứ đã biết trước là hỏng — và ca tệ hơn là không phát
-    hiện gì cả, vì `attach` mask hết và head phân loại lặng lẽ không được giám
-    sát.
+    `backbone.preflight_adapters` đã lo peft/bitsandbytes/GPU. Ở đây là ba thứ
+    riêng của nhánh: safetensors để ghi nhánh, labels.npz để có Sup Loss, và
+    pan&scan phải TẮT (bật lên thì TokenPool nhận khác 4096 token và dừng — thà
+    nói trước còn hơn dừng ở giữa bước đầu tiên).
     """
-    from .train import preflight_adapters
-
-    preset = resolve_preset(cfg)
-    errors, warns = preflight_adapters([{"method": preset["method"], "rank": preset["rank"]}])
-    needs_cls = any(a.get("recombiner") for a in arms) and \
-        bool(dict(cfg.get("classifier", {}) or {}).get("enabled", True))
-    if needs_cls:
-        try:
-            mapping, info = labels_cls.load_map(cfg, verbose=True)
-            if not mapping:
-                errors.append("labels.npz dò được nhưng bảng nhãn rỗng.")
-            else:
-                frac = info.get("class_frac", {})
-                if frac and float(frac.get("pos", 0)) < 0.005:
-                    warns.append(
-                        f"⚙ lớp `pos` chỉ chiếm {100*float(frac['pos']):.2f}% ô "
-                        f"nhãn. ASL được chọn đúng cho tình huống này, nhưng "
-                        f"cls_f1_pos sẽ nhiễu — đọc nó như một tín hiệu 'nhánh "
-                        f"có học không', không như một số liệu chẩn đoán.")
-        except labels_cls.LabelsUnusable as e:
-            errors.append(f"nhãn phân loại: {e}")
+    errors: list[str] = []
+    warns: list[str] = []
+    if not any(a.get("recomb") for a in arms):
+        return errors, warns
+    try:
+        import safetensors  # noqa: F401
+    except ImportError:
+        errors.append("thiếu `safetensors` — không ghi được nhánh Recombinator. "
+                      "pip install -U safetensors")
+    if imaging.policy(cfg)["do_pan_and_scan"]:
+        errors.append(
+            "data.do_pan_and_scan đang BẬT. Mỗi mảnh phụ thêm một lượt patch, "
+            "nên TokenPool(4096 -> 32) sẽ nhận sai số token và dừng. §2.3 chạy "
+            "một-mảnh: đặt do_pan_and_scan: false.")
+    try:
+        info = labels_cls.probe(cfg)
+        if not info.get("label_array"):
+            errors.append(f"labels.npz ({info.get('path')}) không dò ra mảng nhãn "
+                          f"— candidate B không có Sup Loss để học.")
+    except Exception as e:
+        errors.append(f"nhãn phân loại không dùng được: {e}")
+    if not bool(dict(cfg.get("classifier", {}) or {}).get("enabled", True)):
+        warns.append("⚠ classifier.enabled = false: candidate B chỉ còn CE, và "
+                     "nhánh chỉ nhận gradient qua cổng vào decoder (khởi tạo 0). "
+                     "Đó là một thí nghiệm khác — ghi rõ vào báo cáo.")
     return errors, warns
 
 
-# ── Dữ liệu: bảng §2.2 + nhãn bệnh lý ──────────────────────────────────────
-class ClsReportDataset:
-    """[key, ref, image_path] (+ nhãn bệnh lý) -> tensor cho một bước.
+# ══ Nhãn phân loại cho tập train ════════════════════════════════════════════
+def prepare_cls(cfg: Cfg, train_df: pd.DataFrame) -> dict | None:
+    """(y, mask, n_labels, stats) căn theo ĐÚNG thứ tự hàng của `train_df`.
 
-    Bọc `src.train.ReportDataset` thay vì kế thừa: phần che nhãn và cắt đuôi là
-    thứ KHÔNG được viết lại (xem docstring của nó — đó là ca hỏng im lặng số 3
-    của §2.2), nên nó được dùng nguyên vẹn và file này chỉ đính thêm hai khoá.
+    Căn theo KEY, không theo vị trí trong labels.npz — xem docstring của
+    `src.labels_cls.load_map`. Trả None khi head phân loại tắt.
+    """
+    ccfg = dict(cfg.get("classifier", {}) or {})
+    if not bool(ccfg.get("enabled", True)):
+        print("  head phân loại TẮT -> không nạp nhãn", flush=True)
+        return None
+    lut, info = labels_cls.load_map(cfg, verbose=True)
+    n_labels = int(ccfg.get("n_labels") or info["n_labels"])
+    y, mask, stats = labels_cls.attach(
+        cfg, train_df["key"].astype(str).tolist(), lut, n_labels, "train")
+    stats = dict(stats)
+    stats["n_labels"] = n_labels
+    stats["class_frac"] = info.get("class_frac")
+    stats["label_names"] = info.get("label_names")
+    return {"y": y, "mask": mask, "n_labels": n_labels, "stats": stats}
+
+
+class ClsReportDataset(ReportDataset):
+    """`ReportDataset` cộng thêm hai trường: nhãn bệnh lý và mask của nó.
+
+    Kế thừa chứ không viết lại: phần che nhãn (-100 lên prompt) và phần thay mẫu
+    hỏng bằng mẫu kế tiếp là chỗ dễ sai nhất trong cả đường ống, và nó phải
+    GIỐNG HỆT nhau ở hai candidate. Chép sang một lớp thứ hai là mời một khác
+    biệt lặng lẽ vào giữa phép so sánh.
+
+    Một hệ quả phải nhớ: khi mẫu i hỏng, `__getitem__` của lớp cha gọi lại
+    `_encode` với chỉ số (i+off) THẬT. Nhãn vì thế phải gắn ở `_encode`, theo
+    chỉ số nó nhận — gắn ở `__getitem__` theo i là gán nhãn của mẫu hỏng cho mẫu
+    thay thế, và ASL vẫn giảm bình thường trong khi head học sai cặp ảnh↔nhãn.
     """
 
-    def __init__(self, df: pd.DataFrame, processor, cfg: Cfg, max_len: int,
-                 img_kw: dict | None = None,
-                 cls_y: np.ndarray | None = None,
-                 cls_mask: np.ndarray | None = None):
-        from .train import ReportDataset
+    def __init__(self, df, processor, cfg, max_len, cls_pack, img_kw=None):
+        super().__init__(df, processor, cfg, max_len, img_kw)
+        self.y = None if cls_pack is None else np.asarray(cls_pack["y"])
+        self.m = None if cls_pack is None else np.asarray(cls_pack["mask"])
 
-        self.inner = ReportDataset(df, processor, cfg, max_len, img_kw=img_kw)
-        self.cls_y = cls_y
-        self.cls_mask = cls_mask
-        # Gắn ngay trong _encode (biết chỉ số THẬT) chứ không trong __getitem__:
-        # __getitem__ có thể thay mẫu i bằng mẫu i+1 khi prompt quá dài, và gắn
-        # ở tầng ngoài sẽ dán nhãn của mẫu i lên mẫu i+1 — lệch một hàng, không
-        # exception nào, và head phân loại học trên nhãn của mẫu bên cạnh.
-        base_encode = self.inner._encode
-
-        def encode(i: int):
-            item = base_encode(i)
-            if item is None or self.cls_y is None:
-                return item
-            import torch
-
-            item["cls_y"] = torch.from_numpy(np.ascontiguousarray(self.cls_y[i]))
-            item["cls_mask"] = torch.tensor(float(self.cls_mask[i]))
+    def _encode(self, i: int):
+        item = super()._encode(i)
+        if item is None or self.y is None:
             return item
+        import torch
 
-        self.inner._encode = encode
-
-    def __len__(self) -> int:
-        return len(self.inner)
-
-    def __getitem__(self, i: int) -> dict:
-        return self.inner[i]
-
-    @property
-    def n_skipped(self) -> int:
-        return int(self.inner.n_skipped)
+        item["cls_y"] = torch.from_numpy(self.y[i]).float()
+        item["cls_mask"] = torch.tensor(float(self.m[i]))
+        return item
 
 
 def collate_cls(batch: list[dict], pad_id: int, pad_to: int | None = None) -> dict:
-    """`src.train.collate` + xếp chồng nhãn phân loại."""
+    """`backbone.collate` cộng hai trường nhãn. Nhãn KHÔNG cần đệm: nó là (L, C)."""
     import torch
 
     out = collate(batch, pad_id, pad_to)
-    items = [b for b in batch if b is not None]
-    if items and "cls_y" in items[0]:
-        out["cls_y"] = torch.stack([b["cls_y"] for b in items])
-        out["cls_mask"] = torch.stack([b["cls_mask"] for b in items])
+    keep = [b for b in batch if b is not None]
+    if keep and "cls_y" in keep[0]:
+        out["cls_y"] = torch.stack([b["cls_y"] for b in keep])
+        out["cls_mask"] = torch.stack([b["cls_mask"] for b in keep])
     return out
 
 
-# ── λ warmup ────────────────────────────────────────────────────────────────
+# ══ λ theo bước ═════════════════════════════════════════════════════════════
 def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
-    """Trọng số ASLoss tại `step`, warmup tuyến tính rồi giữ phẳng.
+    """Trọng số của Sup Loss tại `step`: 0 -> lam tuyến tính trong warmup.
 
-    Ở bước 0 head phân loại cũng ngẫu nhiên như Recombiner, nên λ đầy ngay từ
-    đầu là đẩy nhánh mới theo một gradient chưa mang thông tin gì. Warmup cùng
-    nhịp với warmup lr (mặc định 10% số bước).
+    Vì sao khởi động từ 0 chứ không dùng thẳng `lam`: ở bước đầu ClsHead là
+    ngẫu nhiên, nên ASL lớn và gradient của nó áp đảo CE. LoRA r=4 khi đó tiêu
+    những bước quý nhất của lịch one-cycle để chiều một head chưa biết gì.
     """
-    if lam <= 0:
-        return 0.0
-    w = max(1, int(round(float(warmup_pct) * max(1, total))))
-    if step >= w:
+    w = max(0, int(round(float(warmup_pct) * max(1, int(total)))))
+    if w <= 0:
         return float(lam)
-    return float(lam) * (step + 1) / w
+    return float(lam) * min(1.0, step / w)
 
 
-# ── Nhóm tham số ────────────────────────────────────────────────────────────
-def build_optimizer(peft_model, sidecar, tcfg: dict):
-    """AdamW với năm nhóm: LoRA × (decay, không) · sidecar × (decay, không) · GATE.
+# ══ Optimizer: ba nhóm tham số ══════════════════════════════════════════════
+def build_optimizer(peft_model, branch, tcfg: dict):
+    """AdamW với ba nhóm: LoRA, thân nhánh, và `gate` riêng một nhóm.
 
-    Vì sao sidecar tách khỏi LoRA: LoRA là hai ma trận hạng thấp gắn cạnh trọng
-    số đã huấn luyện, còn Recombiner/QFormer là một mạng dày đặc khởi tạo ngẫu
-    nhiên. Cùng weight decay cho cả hai là áp một tiên nghiệm ("giữ gần 0") lên
-    một nhánh mà 0 KHÔNG phải điểm khởi đầu có ý nghĩa.
+    `gate` được tách ra vì AdamW CHUẨN HOÁ bước cập nhật: mỗi bước nó dịch một
+    tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Với lr đỉnh 2e-4 và
+    ~200 bước (trung bình ~0.6·max_lr), quãng đường TỐI ĐA của một gate khởi tạo
+    0 là cỡ 0.02 — tức là cổng gần như KHÔNG THỂ mở trong một lịch ngắn, và
+    candidate B sẽ trông y hệt candidate A vì lý do cơ học chứ không vì dữ liệu.
 
-    ── Vì sao `gate` phải có lr RIÊNG, và đây là chỗ dễ hỏng nhất của §2.3 ────
-    `gate` khởi tạo 0. AdamW chuẩn hoá bước cập nhật, nên mỗi bước nó dịch
-    khoảng `lr` — không hơn, dù gradient lớn tới đâu. Với `max_lr = 3e-4` và
-    ngân sách 200 bước (một cycle, trung bình ~0.6·max_lr), quãng đường TỐI ĐA
-    của gate là
-
-        200 × 3e-4 × 0.6 ≈ 0.036
-
-    tức là k token vào decoder với biên độ 3.6% so với hàng xóm của chúng. Khi
-    đó candidate B thực chất LÀ candidate A, hai cột trong bảng gần như trùng
-    nhau, và §2.3 kết luận "đặc trưng SigLIP không giúp" — trong khi thứ vừa
-    được đo là số học của AdamW.
-
-    `gate_lr_mult` (mặc định 20) nâng trần đó lên ~0.72, đủ để cổng mở thật nếu
-    dữ liệu muốn thế, và vẫn đủ chậm để nó KHÔNG mở khi dữ liệu không muốn —
-    đó là điểm chính: cái cần là gate ĐƯỢC PHÉP mở, không phải bị ép mở.
-    `gate_final` trong train_stats.json là con số nói nó có mở hay không.
+    `gate_lr_mult` nhân lr của riêng nhóm ấy lên. Điểm chính là cổng được PHÉP
+    mở, không phải bị ÉP mở: `gate_final` trong train_stats.json là con số nói
+    dữ liệu có muốn mở nó hay không, và nó phải vào báo cáo.
     """
     import torch
 
-    lr = float(tcfg["schedule"].get("max_lr", 3e-4))
+    lora = [p for p in peft_model.parameters() if p.requires_grad]
+    body, gate = [], []
+    if branch is not None:
+        for n, p in branch.named_parameters():
+            if not p.requires_grad:
+                continue
+            (gate if n == "gate" else body).append(p)
+
+    lr = float(tcfg["schedule"].get("max_lr", 2e-4))
     wd = float(tcfg.get("weight_decay", 0.0))
-    swd = float(tcfg.get("sidecar_weight_decay", 0.01))
-    mult = float(tcfg.get("sidecar_lr_mult", 1.0))
-    gate_mult = float(tcfg.get("gate_lr_mult", 20.0))
-
-    sidecar_ids = set()
-    gate_params = []
-    if sidecar is not None:
-        sidecar_ids = {id(p) for p in sidecar.parameters()}
-        gate_params = [sidecar.gate]
-
-    groups = {"lora_decay": [], "lora_nodecay": [], "side_decay": [], "side_nodecay": []}
-    for _, p in peft_model.named_parameters():
-        if not p.requires_grad or id(p) in sidecar_ids:
-            continue
-        groups["lora_decay" if p.ndim > 1 else "lora_nodecay"].append(p)
-    if sidecar is not None:
-        gate_ids = {id(p) for p in gate_params}
-        # `requires_grad` là bộ lọc, và nó KHÔNG vô tình: query của task đóng
-        # băng (`heads_qformer.freeze`, mặc định `aux`) có requires_grad = False,
-        # nên nó không vào bất kỳ nhóm nào và AdamW không giữ moment cho nó. Nếu
-        # nó lọt vào đây thì optimizer vẫn "cập nhật" một tham số có grad None —
-        # vô hại, nhưng đủ để một lần đọc `param_groups` sau này tưởng nó đang
-        # được học.
-        for p in sidecar.parameters():
-            if p.requires_grad and id(p) not in gate_ids:
-                groups["side_decay" if p.ndim > 1 else "side_nodecay"].append(p)
-
-    if not groups["lora_decay"] and not groups["lora_nodecay"]:
+    groups = [{"params": lora, "lr": lr, "weight_decay": wd, "name": "lora"}]
+    if body:
+        groups.append({"params": body, "lr": lr,
+                       "weight_decay": float(tcfg.get("branch_weight_decay", wd)),
+                       "name": "branch"})
+    if gate:
+        groups.append({"params": gate,
+                       "lr": lr * float(tcfg.get("gate_lr_mult", 20.0)),
+                       "weight_decay": 0.0, "name": "gate"})
+    groups = [g for g in groups if g["params"]]
+    if not groups:
         raise TrainUnusable(
-            "không tham số LoRA nào requires_grad. `attach_adapter` đã gắn "
-            "adapter nhưng mọi thứ vẫn đóng băng — kiểm train.target_modules và "
-            "include_prefixes.")
-
-    spec = [
-        {"params": groups["lora_decay"], "lr": lr, "weight_decay": wd},
-        {"params": groups["lora_nodecay"], "lr": lr, "weight_decay": 0.0},
-    ]
-    if sidecar is not None:
-        spec += [
-            {"params": groups["side_decay"], "lr": lr * mult, "weight_decay": swd},
-            {"params": groups["side_nodecay"], "lr": lr * mult, "weight_decay": 0.0},
-            # gate: lr riêng, và KHÔNG BAO GIỜ weight decay — decay lên một cổng
-            # khởi tạo 0 là kéo nó về đúng chỗ nó phải rời khỏi.
-            {"params": gate_params, "lr": lr * gate_mult, "weight_decay": 0.0},
-        ]
-    spec = [g for g in spec if g["params"]]
-    opt = torch.optim.AdamW(
-        spec, lr=lr,
-        betas=(float(tcfg.get("adam_beta1", 0.9)), float(tcfg.get("adam_beta2", 0.999))))
-    n = {k: sum(p.numel() for p in v) for k, v in groups.items()}
-    n["gate"] = sum(p.numel() for p in gate_params)
-    return opt, n
+            "không có tham số nào requires_grad. Adapter chưa gắn được, hoặc "
+            "prepare_model_for_kbit_training đã đóng băng hết.")
+    opt = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+    return opt, {g["name"]: sum(p.numel() for p in g["params"]) for g in groups}
 
 
-# ── Một candidate ───────────────────────────────────────────────────────────
+# ══ Một lượt forward ════════════════════════════════════════════════════════
+def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
+                  tt_value: int):
+    """-> (CE, ASL hoặc None, vài số để log).
+
+    Cả hai candidate đi qua đây. Khác biệt DUY NHẤT là `branch is None`.
+
+    Vì sao chèn 32 token vào vị trí token ảnh đầu tiên chứ không nối vào đầu
+    chuỗi: nối vào đầu là đặt chúng TRƯỚC cả BOS lẫn câu lệnh hệ thống. Vẫn
+    chạy, nhưng nó không phải cái "concat" trong sơ đồ, và nó đẩy mọi vị trí
+    trong chuỗi đi 32 — kể cả phần đã được che nhãn.
+    """
+    import torch
+
+    ids = batch["input_ids"]
+    vis, aligned = recombiner.encode_vision(
+        gemma, batch["pixel_values"].to(
+            dtype=recombiner.float_dtype(gemma, torch.float32)))
+    embeds = recombiner.build_inputs_embeds(gemma, ids, aligned)
+
+    kw = {
+        "inputs_embeds": embeds,
+        "attention_mask": batch.get("attention_mask"),
+        "labels": batch.get("labels"),
+        "token_type_ids": batch.get("token_type_ids"),
+    }
+    asl = None
+    cls_m: dict = {}
+    if branch is not None:
+        tokens, cls_logits = branch(vis.to(next(branch.parameters()).dtype))
+        at = recombiner.first_image_index(ids, img_token_id)
+        kw.update(recombiner.inject_tokens(
+            embeds, tokens, at,
+            attention_mask=batch.get("attention_mask"),
+            labels=batch.get("labels"),
+            token_type_ids=batch.get("token_type_ids"),
+            token_type_value=tt_value))
+        if cls_logits is not None and "cls_y" in batch:
+            asl = branch.sup_loss(cls_logits, batch["cls_y"], batch.get("cls_mask"))
+            cls_m = recombiner.cls_metrics(cls_logits.detach(), batch["cls_y"],
+                                           batch.get("cls_mask"))
+
+    kw = {k: v for k, v in kw.items() if v is not None}
+    out = model(use_cache=False, **kw)
+    if out.loss is None:
+        raise TrainUnusable(
+            "decoder trả loss = None — `labels` không tới được forward. "
+            "Kiểm ReportDataset và collate.")
+    return out.loss, asl, cls_m
+
+
+# ══ Một candidate ═══════════════════════════════════════════════════════════
 def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
               cls_pack: dict | None, out_dir: Path, tracker=None,
-              max_steps_override: int | None = None,
-              batch: int | None = None, ladder: bool = False) -> dict:
-    """Huấn luyện MỘT candidate. `ladder=True` thì tụt nấc batch khi hết VRAM.
+              max_steps_override: int | None = None) -> dict:
+    """Huấn luyện MỘT candidate. Hết VRAM là DỪNG, không tụt nấc.
 
-    Nạp lại model ở mỗi nấc, và `del e` trong khối except — hai chi tiết mượn
-    nguyên từ `src.train.train_arm` và cả hai đều cần: sau một OOM, allocator
-    đang phân mảnh và traceback còn giữ frame chứa `model`, nên nấc thấp hơn
-    cũng OOM theo nếu không dọn.
+    Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
+    Nó không nói "giảm batch đi" chung chung, vì với candidate B thì batch
+    thường không phải chỗ tốn nhất: activation 4096 × swiglu_hidden cho mỗi ảnh
+    mới là.
     """
-    tcfg = dict(cfg["train"])
-    rungs = (batch_ladder(tcfg, start=batch) if ladder
-             else [resolve_batch(tcfg, {"batch_size": batch} if batch else None)])
-    tried: list[int] = []
-    for i, (bs, accum) in enumerate(rungs):
-        tried.append(bs)
-        if i:
-            print(f"  ↓ tụt nấc: batch {rungs[i-1][0]} -> {bs} "
-                  f"(grad_accum {rungs[i-1][1]} -> {accum}, eff_bs vẫn "
-                  f"{bs*accum})", flush=True)
-        try:
-            st = _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
-                             max_steps_override, bs, accum,
-                             pad_to=int(tcfg.get("max_seq_len", 1024)) if ladder
-                             else None)
-            st["batch_rungs_tried"] = tried
-            return st
-        except Exception as e:
-            oom = is_oom(e)
-            note = f"{type(e).__name__}: {e}"[:200]
-            del e
-            free_vram()
-            if not oom:
-                raise
-            print(f"  ✗ OOM ở batch {bs}: {note}", flush=True)
-    raise TrainUnusable(
-        f"{arm['id']} hết VRAM ở MỌI nấc của thang: {tried}.\n"
-        f"    batch=1 mà vẫn không đủ nghĩa là chỗ tốn bộ nhớ không phải batch. "
-        f"Với §2.3 có ba chỗ đáng nghi, theo thứ tự:\n"
-        f"      1. recombiner.qformer.ffn_mult / n_layers — cross-attention đọc "
-        f"4096 patch, mỗi lớp giữ một activation 4096×{cfg.get('recombiner', {}).get('out_dim') or 2560}\n"
-        f"      2. recombiner.swiglu_hidden ({cfg.get('recombiner', {}).get('swiglu_hidden')}) "
-        f"— activation 4096×hidden cho mỗi ảnh\n"
-        f"      3. train.max_seq_len ({tcfg.get('max_seq_len')}) + n_query "
-        f"({cfg.get('recombiner', {}).get('n_query')}) -> độ dài chuỗi thật")
-
-
-def _train_once(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
-                cls_pack: dict | None, out_dir: Path, tracker=None,
-                max_steps_override: int | None = None,
-                bs: int = 1, accum: int = 16,
-                pad_to: int | None = None) -> dict:
-    """Một lần thử ở MỘT nấc batch. Ghi adapter + nhánh, trả thống kê."""
     import torch
 
-    tcfg = dict(cfg["train"])
     aid = arm["id"]
-    use_side = bool(arm.get("recombiner", False))
+    use_branch = bool(arm.get("recomb"))
+    tcfg = dict(cfg["train"])
+    rcfg = dict(cfg.get("recombiner", {}) or {})
+    ccfg = dict(cfg.get("classifier", {}) or {})
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Seed đặt lại TRƯỚC mỗi candidate, không một lần đầu chương trình.
-    seed_everything(int(cfg.get("seed", 42)))
+    bs = int(tcfg.get("per_device_batch_size", 1))
+    accum = int(tcfg.get("grad_accum", 16))
+    if bs < 1 or accum < 1:
+        raise TrainUnusable(
+            f"train.per_device_batch_size={bs}, train.grad_accum={accum} — cả "
+            f"hai phải >= 1. §2.3 không dò batch nữa, hai số này là hằng số.")
 
-    bs, accum = int(bs), int(accum)
-    steps = max_steps_override or total_steps(
-        len(train_df), bs, accum, int(tcfg.get("n_epochs", 1)))
-    print(f"\n── {arm.get('name', aid)} ── {len(train_df)} mẫu · batch {bs}×{accum} "
-          f"· {steps} bước · nhánh Recombiner: {'CÓ' if use_side else 'không'}",
-          flush=True)
+    try:
+        return _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
+                           max_steps_override, bs, accum, tcfg, rcfg, ccfg,
+                           use_branch, aid)
+    except Exception as e:
+        oom = is_oom(e)
+        note = f"{type(e).__name__}: {e}"[:200]
+        del e
+        free_vram()
+        if not oom:
+            raise
+        raise TrainUnusable(
+            f"{aid} HẾT VRAM ở batch {bs} × grad_accum {accum} ({note}).\n"
+            f"    §2.3 không tụt nấc batch: nấc phải giống nhau ở cả hai "
+            f"candidate, nên tự đổi ở đây là làm hỏng đúng thứ thí nghiệm đang "
+            f"đo. Sửa config rồi chạy lại cả hai.\n"
+            f"    Bốn khoá làm được gì đó, theo thứ tự sức nặng:\n"
+            f"      1. recombiner.swiglu_hidden "
+            f"({rcfg.get('swiglu_hidden', 2560)}) — activation "
+            f"4096 × hidden cho MỖI ảnh, ở cả forward lẫn backward. Đây là chỗ "
+            f"tốn nhất của nhánh.\n"
+            f"      2. train.max_seq_len ({tcfg.get('max_seq_len')}) + "
+            f"recombiner.n_query ({rcfg.get('n_query', 32)}) -> độ dài chuỗi "
+            f"thật mà decoder phải chạy.\n"
+            f"      3. train.per_device_batch_size ({bs}) — nhớ NHÂN grad_accum "
+            f"lên đúng bấy nhiêu lần để batch hiệu dụng {bs * accum} không đổi, "
+            f"nếu không thì số bước và lịch one-cycle đổi theo.\n"
+            f"      4. recombiner.qformer.n_layers "
+            f"({(rcfg.get('qformer') or {}).get('n_layers', 1)}) — rẻ nhất "
+            f"trong bốn, chỉ 2 query nên nó hiếm khi là thủ phạm.")
+
+
+def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
+                max_steps_override, bs, accum, tcfg, rcfg, ccfg, use_branch, aid):
+    import torch
+
     t0 = time.time()
+    # Seed đặt lại NGAY TRƯỚC candidate này, không phải một lần đầu chương
+    # trình: xem mục 2 trong docstring module.
+    seed = int(cfg.get("seed", 42))
+    seed_everything(seed)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    print(f"  preset LoRA: {preset['id']} "
+          f"(method={preset['method']} r={preset['rank']} "
+          f"alpha={preset['alpha']})", flush=True)
     model, processor = load_base(cfg, preset["method"], for_training=True)
     processor.tokenizer.padding_side = "right"
     img_kw = imaging.configure_processor(processor, cfg)
@@ -392,142 +391,162 @@ def _train_once(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
         model.enable_input_require_grads()
         model.config.use_cache = False
     gemma = recombiner.unwrap_gemma(model)
-    img_token_id = int(gemma.config.image_token_id)
+    img_tok = recombiner.image_token_id(gemma)
     dev = next(p for p in model.parameters() if p.device.type != "meta").device
+    bdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16,
+              "float16": torch.float16}.get(
+                  str(rcfg.get("dtype", "")).lower(),
+                  recombiner.float_dtype(gemma, torch.float32))
 
-    sidecar = None
-    side_stats: dict = {}
-    if use_side:
-        n_labels = (cls_pack or {}).get("n_labels")
-        sidecar = recombiner.build_sidecar(cfg, text_h, vis_h, n_labels, device=dev)
-        side_stats = sidecar.n_params()
-        print(f"  nhánh: SwiGLU({vis_h}->"
-              f"{cfg['recombiner'].get('swiglu_hidden')}->{text_h}) "
-              f"-> HAI QFormer: heads(task {side_stats['head_tasks']}, "
-              f"đóng băng {side_stats['frozen_tasks']}) · "
-              f"decoder(k={side_stats['n_query_decoder']})", flush=True)
-        print(f"  tham số nhánh: {side_stats['total']:,} "
-              f"({side_stats['trainable']:,} học được) — recombiner "
-              f"{side_stats['recombiner']:,} · qformer_heads "
-              f"{side_stats['qformer_heads']:,} · qformer_decoder "
-              f"{side_stats['qformer_decoder']:,} · head "
-              f"{side_stats['classifier']:,}", flush=True)
-        print(f"  gate khởi tạo {float(sidecar.gate.item()):.3f} — ở bước 0 "
-              f"candidate này GIỐNG HỆT candidate chỉ-emb_vec", flush=True)
+    branch = None
+    bstats: dict = {}
+    n_labels = int((cls_pack or {}).get("n_labels", 0))
+    if use_branch:
+        declared = rcfg.get("siglip_dim")
+        if declared is not None and int(declared) != vis_h:
+            raise TrainUnusable(
+                f"recombiner.siglip_dim = {declared} nhưng vision tower của base "
+                f"cho ra {vis_h}. Một trong hai sai, và đoán bừa ở đây là dựng "
+                f"nhánh chiếu sai chiều.")
+        out_dim = rcfg.get("out_dim")
+        d_model = int(out_dim) if out_dim is not None else text_h
+        if d_model != text_h:
+            raise TrainUnusable(
+                f"recombiner.out_dim = {d_model} nhưng decoder nhận embedding "
+                f"{text_h} chiều. 32 token nối vào chuỗi phải cùng chiều với "
+                f"embedding, không có chỗ nào chiếu lại.")
+        branch = recombiner.RecombinerBranch(vis_h, text_h, n_labels, rcfg, ccfg)
+        branch = branch.to(device=dev, dtype=bdtype)
+        bstats = branch.n_params()
+        print(f"  nhánh: SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}"
+              f"->{text_h}) -> TokenPool(4096->{bstats['n_query']}) -> MHA "
+              f"-> QFormer({len(bstats['qformer_tasks'])} vector: "
+              f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
+              f"{bstats['qformer_frozen'] or '—'})", flush=True)
+        print(f"  tham số nhánh: {bstats['total']:,} "
+              f"({bstats['trainable']:,} học được) — recombinator "
+              f"{bstats['recombinator']:,} · qformer {bstats['qformer']:,} · "
+              f"cls_head {bstats['cls_head']:,} · route_gate "
+              f"{bstats['route_gate']:,} (BẤT HOẠT ở §2.3)", flush=True)
+        print(f"  cổng vào decoder khởi tạo {float(branch.gate.detach().mean()):.3f}"
+              f" — ở bước 0, đầu vào decoder của B = của A cộng "
+              f"{bstats['n_query']} token 0", flush=True)
 
-    ccfg = dict(cfg.get("classifier", {}) or {})
-    acfg = dict(ccfg.get("asl", {}) or {})
-    lam_max = float(ccfg.get("lambda", 0.2)) if (use_side and sidecar is not None
-                                                 and sidecar.classifier is not None) else 0.0
-    lam_warm = float(ccfg.get("lambda_warmup_pct", 0.1))
-    tt_value = 1 if str((cfg.get("recombiner", {}) or {}).get("token_type",
-                                                              "image")) == "image" else 0
+    # ── dữ liệu ────────────────────────────────────────────────────────────
+    max_len = int(tcfg.get("max_seq_len", 1024))
+    ds = ClsReportDataset(train_df, processor, cfg, max_len,
+                          cls_pack if use_branch else None, img_kw)
+    pad_id = int(processor.tokenizer.pad_token_id or 0)
+    n = len(ds)
+    steps = total_steps(n, bs, accum, int(tcfg.get("n_epochs", 1)))
+    if max_steps_override:
+        steps = int(max_steps_override)
 
-    ds = ClsReportDataset(
-        train_df, processor, cfg, int(tcfg.get("max_seq_len", 1024)), img_kw=img_kw,
-        cls_y=(cls_pack or {}).get("y") if use_side else None,
-        cls_mask=(cls_pack or {}).get("mask") if use_side else None)
-    pad_id = processor.tokenizer.pad_token_id or 0
-
-    opt, n_by_group = build_optimizer(model, sidecar, tcfg)
-    from .train import build_scheduler
-
+    opt, n_by_group = build_optimizer(model, branch, tcfg)
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    max_norm = float(tcfg.get("max_grad_norm", 1.0))
-    log_every = max(1, int(tcfg.get("logging_steps", 10)))
+    # λ và warmup thuộc về SUP LOSS, nên chúng nằm dưới `classifier`, cạnh ASL —
+    # không phải dưới `recombiner`, vốn chỉ mô tả hình dạng nhánh.
+    lam = float(ccfg.get("lambda", 0.2)) if use_branch else 0.0
+    lam_warm = float(ccfg.get("lambda_warmup_pct", 0.1))
+    tt_value = 1 if str(rcfg.get("token_type", "text")).lower() == "image" else 0
+    clip = float(tcfg.get("max_grad_norm", 1.0))
 
-    # Thứ tự dữ liệu: cố định theo seed, đặt lại cho MỖI candidate.
-    g = torch.Generator().manual_seed(int(cfg.get("seed", 42)))
-    order = torch.randperm(len(ds), generator=g).tolist()
-    need = steps * bs * accum
-    if need > len(order):
-        # Ngân sách bước lớn hơn tập dữ liệu (chỉ xảy ra ở --dry-run hoặc
-        # n_epochs > 1): lặp lại danh sách ĐÃ XÁO thay vì xáo lại, để hai
-        # candidate vẫn thấy đúng cùng một chuỗi mẫu.
-        reps = math.ceil(need / len(order))
-        order = (order * reps)[:need]
-    else:
-        order = order[:need]
+    print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
+          f"· {steps} bước · nhóm tham số "
+          f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
 
-    model.train()
-    if sidecar is not None:
-        sidecar.train()
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    if sidecar is not None:
-        trainable += [p for p in sidecar.parameters() if p.requires_grad]
-
-    losses: list[float] = []
-    ce_hist: list[float] = []
-    asl_hist: list[float] = []
-    last_cls: dict = {}
+    # Thứ tự dữ liệu: Generator RIÊNG, seed cố định — không đụng tới RNG toàn
+    # cục, nên nó không phụ thuộc vào việc candidate nào chạy trước.
+    g = torch.Generator().manual_seed(seed)
+    order = torch.randperm(n, generator=g).tolist()
     cursor = 0
+
+    def next_micro() -> dict:
+        nonlocal cursor, order
+        rows = []
+        for _ in range(bs):
+            if cursor >= len(order):
+                order = torch.randperm(n, generator=g).tolist()
+                cursor = 0
+            rows.append(ds[order[cursor]])
+            cursor += 1
+        b = collate_cls(rows, pad_id)
+        return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in b.items()}
+
+    # ── vòng lặp ───────────────────────────────────────────────────────────
+    model.train()
+    if branch is not None:
+        branch.train()
+    log_every = max(1, int(tcfg.get("logging_steps", 10)))
+    total_loss = step_ce = step_asl = 0.0
+    first_loss = None
+    last_cls: dict = {}
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
-        lam = lambda_at(step, steps, lam_max, lam_warm)
+        lam_now = lambda_at(step, steps, lam, lam_warm) if use_branch else 0.0
         step_ce = step_asl = 0.0
         for _ in range(accum):
-            idx = order[cursor:cursor + bs]
-            cursor += bs
-            batch = collate_cls([ds[i] for i in idx], pad_id, pad_to)
-            batch = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in batch.items()}
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                ce, asl, cls_m = _forward_loss(
-                    model, gemma, sidecar, batch, img_token_id, tt_value, acfg)
-            loss = ce + (lam * asl if asl is not None else 0.0)
+            batch = next_micro()
+            ce, asl, cls_m = _forward_loss(model, gemma, branch, batch, img_tok,
+                                           tt_value)
+            loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
             (loss / accum).backward()
             step_ce += float(ce.detach()) / accum
             if asl is not None:
                 step_asl += float(asl.detach()) / accum
             if cls_m:
                 last_cls = cls_m
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm)
+        if clip > 0:
+            params = [p for grp in opt.param_groups for p in grp["params"]]
+            torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
         sched.step()
 
-        total_loss = step_ce + lam * step_asl
-        losses.append(total_loss)
-        ce_hist.append(step_ce)
-        asl_hist.append(step_asl)
-        if step % log_every == 0 or step == steps - 1:
+        total_loss = step_ce + lam_now * step_asl
+        if first_loss is None:
+            # Loss ở bước ĐẦU TIÊN, để báo cáo có mốc so với loss cuối. Không có
+            # nó thì "loss 2.41" không nói được gì: 2.41 là đã học được nhiều hay
+            # là gần như chưa nhúc nhích?
+            first_loss = total_loss
+        gate = float(branch.gate.detach().mean()) if branch is not None else 0.0
+        if (step + 1) % log_every == 0 or step == steps - 1:
             lr_now = opt.param_groups[0]["lr"]
-            gate = float(sidecar.gate.item()) if sidecar is not None else float("nan")
-            print(f"  [{aid}] bước {step+1}/{steps} · loss {total_loss:.4f} "
-                  f"(CE {step_ce:.4f}"
-                  + (f" · ASL {step_asl:.4f} × λ{lam:.3f}" if lam_max > 0 else "")
-                  + f") · lr {lr_now:.2e}"
-                  + (f" · gate {gate:+.3f}" if sidecar is not None else "")
-                  + (f" · cls_f1_pos {last_cls.get('cls_f1_pos')}" if last_cls else ""),
-                  flush=True)
+            print(f"    [{aid}] bước {step+1}/{steps} · loss {total_loss:.4f} "
+                  f"(ce {step_ce:.4f}" +
+                  (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · gate {gate:+.4f}"
+                   if use_branch else "") +
+                  f") · lr {lr_now:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({
                     f"train/{aid}/loss": total_loss, f"train/{aid}/ce": step_ce,
-                    f"train/{aid}/asl": step_asl, f"train/{aid}/lambda": lam,
+                    f"train/{aid}/asl": step_asl, f"train/{aid}/lambda": lam_now,
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
-                    **({f"train/{aid}/gate": gate} if sidecar is not None else {}),
+                    **({f"train/{aid}/gate": gate} if branch is not None else {}),
                     **{f"train/{aid}/{k}": v for k, v in last_cls.items()},
                 })
 
     mins = (time.time() - t0) / 60
-    peak = (torch.cuda.max_memory_allocated() / 1024 ** 3) if torch.cuda.is_available() else 0.0
+    peak = (torch.cuda.max_memory_allocated() / 1024 ** 3
+            if torch.cuda.is_available() else 0.0)
 
-    # Ghi: adapter bằng peft, nhánh Recombiner ra file RIÊNG. Nhồi nhánh vào
-    # state_dict của peft thì `PeftModel.from_pretrained` bỏ qua những khoá nó
-    # không nhận — im lặng — và runner sinh văn bản bằng một nhánh ngẫu nhiên.
+    # Ghi: adapter bằng peft, nhánh ra file RIÊNG. Nhồi nhánh vào state_dict của
+    # peft thì `PeftModel.from_pretrained` bỏ qua những khoá nó không nhận — im
+    # lặng — và runner sinh văn bản bằng một nhánh ngẫu nhiên.
     model.save_pretrained(str(out_dir), safe_serialization=True)
     processor.save_pretrained(str(out_dir))
-    if sidecar is not None:
-        recombiner.save_sidecar(sidecar, out_dir)
+    if branch is not None:
+        recombiner.save_branch(branch, out_dir)
 
     stats = {
         "arm_id": aid, "name": arm.get("name", aid),
-        "uses_recombiner": use_side,
+        "uses_recombiner": use_branch,
         "lora_preset": preset["id"], "method": preset["method"],
         "rank": preset["rank"], "alpha": preset["alpha"],
+        "dora": uses_dora(preset["method"]),
+        "quantized": is_quantized(preset["method"]),
         **{k: v for k, v in pstats.items() if k not in ("method", "rank", "alpha")},
-        "sidecar_params": side_stats,
+        "branch_params": bstats,
         "param_groups": n_by_group,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,
@@ -535,158 +554,48 @@ def _train_once(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
         "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
         "do_pan_and_scan": bool(imaging.policy(cfg)["do_pan_and_scan"]),
         "processor_size": imaging.PROCESSOR_SIZE,
+        "max_seq_len": max_len,
         "schedule": dict(tcfg["schedule"]),
-        "n_query": int(sidecar.n_query) if sidecar is not None else 0,
-        "token_type_value": tt_value if sidecar is not None else None,
-        "lambda_asl": lam_max,
-        "asl": dict(acfg) if lam_max > 0 else None,
-        # Gate cuối là con số phải đọc TRƯỚC bảng BLEU: gate ≈ 0 nghĩa là
-        # decoder chưa bao giờ thật sự nhận k token, nên "không có khác biệt" là
-        # kết luận về quá trình huấn luyện chứ không về đặc trưng SigLIP.
-        "gate_final": float(sidecar.gate.item()) if sidecar is not None else None,
-        "cls_metrics_last": last_cls or None,
-        "train_loss": float(np.mean(losses[-max(1, len(losses)//10):])) if losses else None,
-        "train_loss_first": float(losses[0]) if losses else None,
-        "ce_last": float(np.mean(ce_hist[-max(1, len(ce_hist)//10):])) if ce_hist else None,
-        "asl_last": float(np.mean(asl_hist[-max(1, len(asl_hist)//10):])) if asl_hist else None,
-        "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2),
-        "quantized": is_quantized(preset["method"]), "dora": uses_dora(preset["method"]),
-        "seed": int(cfg.get("seed", 42)),
-        "probe_pad_to": pad_to,
-        "cls_label_stats": (cls_pack or {}).get("stats") if use_side else None,
+        "n_query": int(bstats.get("n_query", 0)),
+        "token_type_value": tt_value if use_branch else None,
+        "lambda_sup": lam, "lambda_warmup_pct": lam_warm,
+        "token_type": str(rcfg.get("token_type", "text")),
+        "gate_final": (float(branch.gate.detach().mean())
+                       if branch is not None else None),
+        "gate_lr_mult": float(tcfg.get("gate_lr_mult", 20.0)),
+        "n_labels": n_labels if use_branch else 0,
+        "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,
+        "train_loss_first": first_loss,
+        "train_loss": total_loss, "ce_last": step_ce, "asl_last": step_asl,
+        "cls_metrics_last": last_cls,
+        "minutes": round(mins, 1),
+        "vram_peak_gb": round(peak, 2),
+        "seed": seed,
     }
-    if ds.n_skipped:
-        print(f"  ⚠ {ds.n_skipped} lần phải thay mẫu vì prompt dài hơn "
-              f"max_seq_len={tcfg.get('max_seq_len')}", flush=True)
-    if sidecar is not None and abs(stats["gate_final"]) < 0.01:
-        print(f"  ⚠ gate cuối = {stats['gate_final']:+.4f} — GẦN 0. Decoder gần "
-              f"như không nhận k token, nên nếu bảng kết quả nói 'không khác "
-              f"biệt' thì đó là kết luận về quá trình huấn luyện, KHÔNG phải về "
-              f"đặc trưng SigLIP. Xem README_2.3 mục 5.", flush=True)
     (out_dir / "train_stats.json").write_text(
-        json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"✓ {aid}: {mins:.1f} phút · loss {stats['train_loss']} · "
-          f"VRAM đỉnh {peak:.1f} GB -> {out_dir}", flush=True)
+        json.dumps(stats, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8")
 
-    del model, opt, sched, sidecar
+    del opt, sched, model, branch, gemma
     free_vram()
+    print(f"  ✓ {aid}: {mins:.1f} phút · loss {total_loss:.4f} · VRAM đỉnh "
+          f"{peak:.1f} GB -> {out_dir}", flush=True)
     return stats
 
 
-def _forward_loss(model, gemma, sidecar, batch: dict, img_token_id: int,
-                  tt_value: int, acfg: dict):
-    """(CE của decoder, ASL của head | None, số liệu phân loại).
-
-    Toàn bộ điểm khác biệt giữa hai candidate nằm trong hàm này, và nó cố tình
-    ngắn để đọc được một lượt:
-
-      * MỘT lượt SigLIP (`encode_vision`) -> đặc trưng thô 1152 + 256 token ảnh
-        đã căn chỉnh.
-      * `build_inputs_embeds` ghi 256 token đó vào đúng chỗ, y hệt cách
-        `Gemma3Model.forward` làm.
-      * candidate B: nhánh -> k token -> chèn NGAY TRƯỚC khối ảnh, và
-        attention_mask / labels / token_type_ids dài thêm k một cách đồng bộ.
-      * candidate A: đi thẳng.
-
-    CE lấy từ `outputs.loss` của chính Gemma 3 — không tự tính lại. Hàm loss của
-    nó dùng attention_mask để lọc vị trí đệm trước khi flatten, và viết lại chỗ
-    đó là mời một lỗi lệch-một-token vào đúng hàm mất mát.
-    """
-    from .recombiner import (build_inputs_embeds, encode_vision,
-                             first_image_index, inject_tokens)
-
-    ids = batch["input_ids"]
-    siglip, aligned = encode_vision(gemma, batch["pixel_values"])
-    embeds = build_inputs_embeds(gemma, ids, aligned)
-
-    kw = {
-        "inputs_embeds": embeds,
-        "attention_mask": batch.get("attention_mask"),
-        "labels": batch.get("labels"),
-        "token_type_ids": batch.get("token_type_ids"),
-    }
-    asl = None
-    cls_m: dict = {}
-    if sidecar is not None:
-        # `ref=aligned`: 256 token ảnh của chính batch này làm MỐC THANG ĐO cho
-        # k token — xem docstring VisionSideCar.forward.
-        #
-        # Ba đầu ra, và ở §2.3 chỉ hai cái đầu được dùng:
-        #   `tokens`     — n_query token của decoder_qformer, nối vào emb_vec
-        #   `cls_logits` — head phân loại, đọc vector `sup` của heads_qformer
-        #   `_heads`     — {task: vector} của heads_qformer. Vector `aux` đã bị
-        #                  detach trong forward (task của MoE, mục sau), nên
-        #                  không có đường gradient nào từ đây; giữ tên có dấu
-        #                  gạch dưới để rõ là §2.3 KHÔNG tiêu thụ nó.
-        tokens, cls_logits, _heads = sidecar(siglip, ref=aligned)
-        at = first_image_index(ids, img_token_id)
-        packed = inject_tokens(embeds, tokens, at,
-                              attention_mask=batch.get("attention_mask"),
-                              labels=batch.get("labels"),
-                              token_type_ids=batch.get("token_type_ids"),
-                              token_type_value=tt_value)
-        kw.update(packed)
-        if cls_logits is not None and "cls_y" in batch:
-            from .recombiner import asl_loss, cls_metrics
-
-            asl = asl_loss(
-                cls_logits, batch["cls_y"], batch.get("cls_mask"),
-                gamma_neg=float(acfg.get("gamma_neg", 2.0)),
-                gamma_pos=float(acfg.get("gamma_pos", 0.0)),
-                clip=float(acfg.get("clip", 0.05)),
-                eps=float(acfg.get("eps", 1e-8)),
-                disable_grad_focal=bool(acfg.get("disable_grad_focal", True)))
-            cls_m = cls_metrics(cls_logits.detach(), batch["cls_y"],
-                                batch.get("cls_mask"))
-
-    kw = {k: v for k, v in kw.items() if v is not None}
-    out = model(use_cache=False, **kw)
-    if out.loss is None:
-        raise TrainUnusable(
-            "decoder trả loss = None — `labels` không tới được forward. "
-            "Kiểm ReportDataset và collate.")
-    return out.loss, asl, cls_m
-
-
-# ── Resume ──────────────────────────────────────────────────────────────────
-def already_trained(out_dir: Path, needs_sidecar: bool) -> bool:
-    """Candidate này đã huấn luyện xong và ghi đủ chưa?
+# ══ Resume ══════════════════════════════════════════════════════════════════
+def already_trained(out_dir: Path, needs_branch: bool) -> bool:
+    """Candidate này đã huấn luyện xong và ghi ĐỦ chưa?
 
     Ba điều kiện, không phải một: trọng số adapter, `train_stats.json`, VÀ —
-    với candidate B — file nhánh Recombiner. Thiếu file nhánh mà vẫn coi là
+    với candidate B — file nhánh Recombinator. Thiếu file nhánh mà vẫn coi là
     xong nghĩa là stage `infer` nạp adapter đúng và nhánh NGẪU NHIÊN: nó vẫn
     sinh ra tiếng Anh đọc được, và cột số của candidate B vẫn trông như kết quả
     thật.
     """
-    w = (out_dir / "adapter_model.safetensors").exists() or \
-        (out_dir / "adapter_model.bin").exists()
-    ok = w and (out_dir / "train_stats.json").exists()
-    if ok and needs_sidecar:
-        ok = recombiner.sidecar_exists(out_dir)
+    d = Path(out_dir)
+    w = (d / "adapter_model.safetensors").exists() or (d / "adapter_model.bin").exists()
+    ok = w and (d / "train_stats.json").exists()
+    if ok and needs_branch:
+        ok = recombiner.branch_exists(d)
     return bool(ok)
-
-
-# ── Nhãn phân loại cho tập train ────────────────────────────────────────────
-def prepare_cls(cfg: Cfg, train_df: pd.DataFrame) -> dict | None:
-    """(y, mask, n_labels, stats) căn theo ĐÚNG thứ tự hàng của `train_df`.
-
-    Căn theo KEY, không theo vị trí trong labels.npz — xem docstring của
-    `src.labels_cls.load_map`. Trả None khi head phân loại tắt.
-    """
-    ccfg = dict(cfg.get("classifier", {}) or {})
-    if not bool(ccfg.get("enabled", True)):
-        print("  head phân loại TẮT -> không nạp nhãn (nhớ rằng lúc đó "
-              "train.sidecar_gate_init phải khác 0)", flush=True)
-        return None
-    mapping, info = labels_cls.load_map(cfg, verbose=True)
-    y, mask, stats = labels_cls.attach(
-        mapping, train_df["key"].astype(str).tolist(), "train",
-        max_missing_frac=float(dict(cfg.get("labels", {}) or {})
-                               .get("max_missing_frac", 0.2)))
-    stats = dict(stats)
-    stats["class_frac"] = info.get("class_frac")
-    stats["label_names"] = info.get("label_names")
-    return {"y": y, "mask": mask, "n_labels": int(y.shape[1]), "stats": stats}
-
-
-_ = effective_batch   # dùng lại từ §2.2; giữ tên trong không gian module này

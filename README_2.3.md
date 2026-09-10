@@ -1,41 +1,51 @@
-# §2.3 — Nhánh Recombiner: hai candidate, hai kiểm định ghép cặp
+# §2.3 — Nhánh Recombinator: hai candidate, hai kiểm định ghép cặp
 
 Mục này hỏi đúng một câu:
 
-> Giữ nguyên adapter QDoRA rank 4 trên bốn ma trận attention, **thêm** một nhánh
-> tái tổ hợp đặc trưng thị giác có giám sát vào — chất lượng báo cáo sinh ra có
-> đổi không, và đổi **bao nhiêu**?
+> Giữ nguyên adapter LoRA đã được §2.2 đo, **thêm** một nhánh tái tổ hợp đặc
+> trưng thị giác có giám sát vào — chất lượng báo cáo sinh ra có đổi không, và
+> đổi **bao nhiêu**?
 
 ```
-A  qdora_r4         QDoRA r=4, đúng arm qdora_r4 của §2.2, không thêm gì
-B  qdora_r4_recomb  A + Recombiner + QFormer(1 vector) + Sup-head (ASL)
+A  lora_only     LoRA (preset trong configs/recombiner.yaml), không thêm gì
+B  lora_recomb   A + Recombinator + QFormer(2 vector) + ClsHead (ASL)
 ```
 
 Cùng base `google/gemma-3-4b-it` lượng tử NF4 4-bit và **đóng băng**, cùng 6400
-mẫu huấn luyện, cùng lịch one-cycle, cùng 3000 ảnh test, cùng seed. Đúng một
-thứ khác nhau giữa hai cột, và đó là điều kiện để hiệu số quan sát được quy về
-nhánh mới chứ không về thứ gì khác.
+mẫu huấn luyện, cùng lịch one-cycle, cùng batch, cùng 3000 ảnh test, cùng seed.
+Đúng một thứ khác nhau giữa hai cột, và đó là điều kiện để hiệu số quan sát được
+quy về nhánh mới chứ không về thứ gì khác.
 
 ---
 
-## 1. Nhánh Recombiner làm gì
+## 1. Nhánh Recombinator làm gì
 
 ```
-SigLIP last_hidden_state          (B, 4096, 1152)
-  │
-  ├─ SwiGLU  1152 → 2560 → 2560                       <<Expand Capacity>>
-  │    RMSNorm
-  │      ├──────────────────────────────► Wk, Wv     (4096 token làm K/V)
-  │      └─ Linear trên TRỤC TOKEN 4096 → 32          <<Tokens Pooling>>
-  │            └─ Wq (32 token làm Q) ─┬─► MHA ─► ⊕ ─► RMSNorm
-  │                                    └──── skip ────┘
-  │                                                        │
-  │                                     (B, 32, 2560) "token tái tổ hợp"
-  ├────────────────────────────────────────┬──────────────┘
-  │                                        │
-  │  ► QFormer (1 vector) ► Sup-head ► ASL │  ► chèn vào chuỗi decoder
-                                              (qua cổng khởi tạo 0)
+Image ─► Vision Encoder ─┬─► Recombinator ──┬─► QFormer (2 vector) ─┬─► Classification (vec_1) ─► Sup Loss
+   (SigLIP, đóng băng)   │                  │                       └─► Route_Gate     (vec_2) ─► Aux Loss
+                         └─► VL-Adapter ────┤                                   │
+                            (256 token)     │                                   ▼
+Prompt ─► Embedding Layer ──────────────────┴─► concat ─► Decoder [Experts (LoRA)] ─► CE Loss
+                                                          (đóng băng)
 ```
+
+Màu hồng trong sơ đồ gốc = khối được huấn luyện. Ở §2.3 đó là: Recombinator,
+QFormer, Classification, Route_Gate (bất hoạt — xem §2.3 bên dưới) và Experts
+(LoRA). Xanh = đóng băng: vision encoder, VL-adapter, embedding layer, decoder.
+
+Bên trong Recombinator:
+
+```
+X (4096, 1152)
+  └─► SwiGLU   d_in 1152 → d_hidden 2560 → d_out 2560        <<Expand Capacity>>
+        └─► RMSNorm ─┬─────────────────────────► Wk, Wv    K,V = (4096, 2560)
+                     └─► Linear TRỤC TOKEN 4096 → 32         <<Tokens Pooling>>
+                           └─► Wq ─► Q = (32, 2560) ─► MultiHeadAttn ─► ⊕ ─► RMSNorm ─►
+                                 └──────────────── skip-connect ───────────┘
+```
+
+Đầu ra `(32, 2560)` đi **hai** đường: qua cổng rồi nối vào chuỗi decoder, và vào
+QFormer để chịu ràng buộc có giám sát.
 
 ### 1.1. Vì sao đọc `last_hidden_state` chứ không đọc 256 token đã chiếu
 
@@ -44,15 +54,15 @@ rồi **avg-pool** xuống 16×16 = 256 token trước khi chiếu sang 2560. Ph
 trung bình đó là chỗ thông tin không gian bị nén 16 lần, và nó xảy ra **trước**
 khi bất kỳ tham số học được nào của ta nhìn thấy ảnh.
 
-Recombiner đọc trước phép pool ấy, nên nó có cái để tái tổ hợp. Đọc sau thì nó
+Recombinator đọc trước phép pool ấy, nên nó có cái để tái tổ hợp. Đọc sau thì nó
 chỉ đang xào lại đúng thứ decoder đã nhận, và candidate B trở thành "candidate A
 cộng vài chục triệu tham số làm việc thừa" — một thí nghiệm vẫn chạy được, vẫn
 ra bảng số, và không trả lời câu hỏi nào.
 
-Vision tower chạy **đúng một lần** cho cả hai đường (`RecombGemma._embed`): cùng
-một tensor được đưa cho projector gốc của Gemma và cho Recombiner. Chạy hai lần
-thì tốn gấp đôi thời gian vision, và nếu vision tower có dropout thì hai đường
-nhìn thấy hai ảnh khác nhau.
+Vision tower chạy **đúng một lần** cho cả hai đường (`recombiner.encode_vision`):
+cùng một tensor được đưa cho projector gốc của Gemma và cho Recombinator. Chạy
+hai lần thì tốn gấp đôi thời gian khâu ảnh, và nếu vision tower có dropout thì
+hai đường nhìn thấy hai ảnh khác nhau.
 
 ### 1.2. `<<Tokens Pooling>>` không phải avg-pool
 
@@ -64,85 +74,123 @@ pooling này** (tức là Q), không từ K/V.
 Ma trận đó chốt cứng `n_in = 4096`. Con số là ràng buộc kiến trúc của Gemma 3
 (896² / patch 14² = 64×64 patch), không phải tham số. `TokenPool` dừng ngay nếu
 số token vào khác 4096 — đó cũng là cái lưới bắt được ca *pan & scan lén bật*
-(mỗi mảnh phụ thêm 256 token ảnh).
+(mỗi mảnh phụ thêm một lượt patch).
+
+Cả hai khẳng định trên đều có phép kiểm riêng trong `scripts/selftest_recomb.py`:
+một phép kiểm đảo thứ tự token đầu vào và đòi đầu ra phải đổi (nếu không thì nó
+đang pool theo trục khác, hoặc là avg-pool), và một phép kiểm zero hoá `o_proj`
+của MHA rồi đòi đầu ra bằng đúng `norm_out(q)` — tức là skip-connect nối đúng
+nguồn.
 
 ### 1.3. Cổng vào decoder khởi tạo 0
 
-32 token tái tổ hợp được chèn thẳng vào **đầu** chuỗi đầu vào của một decoder
-**đang đóng băng**. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian
-embedding: đủ để đẩy loss lên cao và để LoRA r=4 tiêu vài chục bước đầu chỉ để
-học cách *phớt lờ* chúng.
+32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder **đang đóng
+băng**. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ để đẩy
+loss lên cao và để LoRA tiêu vài chục bước đầu chỉ để học cách *phớt lờ* chúng.
 
-`decoder_gate` là một vector scale khởi tạo 0. Ở bước 0, đầu vào decoder của
-candidate B giống hệt candidate A cộng 32 token 0; chính cổng ấy học mở dần.
-Nhánh phân loại lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ
-bước đầu tiên.
+`gate` là một vector scale khởi tạo 0. Ở bước 0, đầu vào decoder của candidate B
+giống hệt candidate A cộng 32 token 0; chính cổng ấy học mở dần. Nhánh phân loại
+lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ bước đầu tiên.
 
-> Sau khi huấn luyện, `train_stats.json` ghi `decoder_gate_norm`. Nếu nó vẫn
-> ≈ 0 thì nhánh Recombiner **không** đi vào đường sinh, và candidate B thực chất
-> là candidate A cộng một head phân loại chạy song song. Đó là một kết quả hợp
-> lệ — nhưng nó phải được đọc ra, không được nằm im trong file. Cả `train_recomb`
-> lẫn runner lúc sinh đều in cảnh báo, và REPORT.md ghi lại.
+Một hệ quả cơ học phải xử: **AdamW chuẩn hoá bước cập nhật**, nên mỗi bước nó
+dịch một tham số đi khoảng `lr`. Với `max_lr` 3e-4 và ~200 bước (trung bình
+~0.6·max_lr), quãng đường **tối đa** của một cổng khởi tạo 0 là cỡ 0.04 — tức là
+cổng gần như *không thể* mở trong một lịch ngắn, và candidate B sẽ trông y hệt
+candidate A vì lý do cơ học chứ không vì dữ liệu. `train.gate_lr_mult` (mặc định
+20) nhân lr của riêng nhóm ấy lên.
 
-### 1.4. Ba token, ba mask — chỗ dễ hỏng im lặng nhất
+Điểm chính là cổng được **PHÉP** mở, không phải bị **ÉP** mở. `gate_final` trong
+`train_stats.json` là con số nói dữ liệu có muốn mở nó hay không, và REPORT.md
+đọc thẳng nó.
 
-Khi chèn 32 token vào chuỗi, **mọi** tensor đi theo chuỗi phải dài thêm đúng 32:
+### 1.4. Chèn ở đâu, và ba tensor phải nới theo
 
-| tensor           | giá trị chèn | hỏng nếu quên                                   |
-|------------------|--------------|--------------------------------------------------|
-| `inputs_embeds`  | token tái tổ hợp × gate | —                                     |
-| `attention_mask` | 1            | 32 token bị che, nhánh vô tác dụng                |
-| `labels`         | **−100**     | model bị dạy sinh ra 32 token vô nghĩa ở đầu mỗi báo cáo |
-| `token_type_ids` | 0            | lỗi shape ở forward                               |
+32 token được chèn **ngay trước** 256 token ảnh — đúng cái "concat" trong sơ đồ,
+và giữ nguyên BOS cùng câu lệnh hệ thống ở đầu chuỗi. Nối vào đầu chuỗi thì vẫn
+chạy, nhưng nó đặt chúng trước cả BOS.
 
-Ca `labels` là ca tệ nhất: loss vẫn giảm đẹp, không có exception nào, và nó chỉ
-lộ ra dưới dạng "BLEU của candidate B thấp hơn". `scripts/selftest_recomb.py`
-kiểm cả bốn dòng này.
+Chèn vào `inputs_embeds` thôi là chưa đủ. Ba tensor đi kèm phải nới theo, và mỗi
+cái quên là một lỗi im lặng riêng:
+
+| tensor | giá trị chèn | quên thì sao |
+|---|---|---|
+| `labels` | `-100` | model bị dạy sinh ra 32 token vô nghĩa ở đầu mỗi báo cáo. Loss vẫn giảm; chỉ lộ ra ở điểm BLEU |
+| `attention_mask` | `1` | 32 token bị che, cổng có mở cũng vô nghĩa, và candidate B = candidate A |
+| `token_type_ids` | `0` (`text`) | Gemma 3 dùng nó để cho token ảnh nhìn hai chiều; gán `1` là tuyên bố sai rằng đây là token ảnh của processor |
+
+Khâu **huấn luyện** đệm phải nên mọi hàng có cùng vị trí token ảnh, và
+`first_image_index` **dừng** nếu không phải vậy. Khâu **sinh** đệm trái nên vị
+trí lệch theo từng hàng, và `inject_tokens` chèn theo từng hàng
+(`image_start_indices`). Đây là hai chế độ khác nhau của cùng một hàm, không
+phải một hàm chạy được ở cả hai chỗ do may mắn.
 
 ---
 
-## 2. Sup-head và ASL
+## 2. QFormer 2 vector, ClsHead và ASL
 
-Nhãn là one-hot 3 chiều (`neg` / `pos` / `uncertain`) cho mỗi bệnh lý, đọc từ
-`csv_helper/labels.npz`. File đó **không có schema công bố**, nên
-`src/labels_cls.py` dò cấu trúc rồi **in ra cái đã dò** và cho phép ghi đè bằng
-config. Chạy trước khi tốn GPU:
+QFormer nhận 32 token của Recombinator và sinh **đúng hai vector**, một cho mỗi
+task:
 
-```bash
-python -m src.labels_cls --check-split
-```
+* `vec_1` → **Classification** → **Sup Loss** (ASL trên nhãn bệnh lý);
+* `vec_2` → **Route_Gate** → **Aux Loss** — phần MoE, **không chạy ở §2.3**.
 
-Hai cách xử lý sai mà file ấy tránh: ghi cứng một giả định (nếu sai thì nhãn bị
-hiểu lệch một bậc, ASL vẫn giảm, và nhánh Recombiner bị neo vào thông tin sai),
-hoặc đoán rồi im lặng (cùng hậu quả, khó phát hiện hơn).
+Self-attention giữa hai query bị **tắt cứng trong code**, không phải bằng một
+khoá config: với một vector mỗi task, mọi attention query↔query đều là nhiễm chéo
+giữa hai task theo định nghĩa. Cross-attention (query → token) không cần mặt nạ
+vì nó không có đường nào nối hai query. Trọng số **thân** QFormer thì dùng chung
+— cái bị chặn là *đường thông tin*, không phải tham số.
 
-**Mẫu thiếu nhãn nhận vector 0 và mask 0**: nó vẫn dạy decoder viết báo cáo (CE
+### 2.1. Route_Gate ở §2.3: dựng nhưng bất hoạt
+
+§2.3 chạy **một** preset LoRA cố định, nên không có gì để định tuyến. `vec_2`
+được sinh ra nhưng: query của nó **đóng băng**, đầu ra bị **detach**, không có
+Aux Loss, không có mũi tên nào tới Experts.
+
+Vì sao giữ lại thay vì bỏ hẳn: hình dạng checkpoint khi đó khớp với mục MoE, nên
+Recombinator + QFormer của §2.3 nạp thẳng sang đó được. Giá phải trả là
+cross-attention cho đúng một query nữa — không đáng kể.
+
+Vì sao chỉ đóng băng query là **chưa đủ**: nếu vector còn trong đồ thị và có ai
+đó cộng nó vào một loss thì gradient vẫn chảy ngược qua thân QFormer và
+Recombinator. "Không xảy ra vì hiện tại không ai gọi" là một bảo đảm yếu — nó
+hết đúng ở lần sửa code tiếp theo, và khi đó không có gì báo động.
+
+Và một chi tiết cài đặt đáng ghi lại, vì nó là cái bẫy đắt nhất trong file này:
+cách quen tay để đóng băng vài **hàng** của một Parameter là gắn `register_hook`
+xoá gradient những hàng ấy. **Không dùng được ở đây.** Khi `Module.to()` đổi
+thiết bị (CPU → CUDA), PyTorch tạo một `Parameter` mới và hook trên tensor cũ
+biến mất — không exception, không cảnh báo, và **chỉ trên GPU**. Nên §2.3 chặn ở
+*đồ thị* (`torch.where(frozen_mask, query.detach(), query)`) thay vì ở gradient,
+và selftest có một phép kiểm chạy `.to()` **trước** rồi mới đo.
+
+### 2.2. Vì sao ASL chứ không phải cross-entropy
+
+Nhãn là one-hot 3 chiều (`neg` / `pos` / `uncertain`) cho mỗi bệnh lý. Lớp `neg`
+bật ở phần lớn bệnh lý, nên hai ô `pos`/`uncertain` gần như luôn mang nhãn 0 và
+chúng dễ đoán tới mức áp đảo tổng gradient.
+
+* `gamma_neg = 2.0` nén phần đóng góp của những ô **âm đã đoán đúng** (p thấp)
+  xuống theo (p)², để gradient còn lại dồn về những ô model đang sai.
+* `gamma_pos = 0.0` — ô dương không bị nén gì cả.
+* `clip = 0.05` dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
+  `p < 0.05` đóng góp **đúng bằng 0**, tức là bị vứt hẳn khỏi gradient chứ không
+  phải chỉ nén. Đó là phần "asymmetric probability shifting", và nó là lý do ASL
+  chịu được tỉ lệ âm/dương cỡ 1:20.
+
+Hai tham số γ đi theo **giá trị nhãn của ô**, không theo tên lớp — chỗ này hay bị
+đọc nhầm. Trọng số focal được tính **không có gradient**: để gradient chảy qua nó
+thì phần nén tự triệt tiêu và ASL thoái hoá về BCE mà không có dấu hiệu gì.
+Selftest kiểm cả ba: γ = 0, clip = 0 phải cho ra **đúng** BCE; ô âm dễ phải đóng
+góp < 1e-3; và mẫu bị mask phải không nhúc nhích được loss.
+
+Mẫu **thiếu nhãn** nhận vector 0 và mask 0: nó vẫn dạy decoder viết báo cáo (CE
 bình thường) nhưng không đóng góp vào ASL. Vứt hẳn mẫu là đổi tập huấn luyện của
-candidate B so với candidate A — khi đó hiệu số quan sát được vừa do nhánh mới
-vừa do 6400 mẫu đã thành 6100, và không tách ra được. Nếu tỉ lệ thiếu vượt
-`labels.max_missing_frac` (20%) thì lần chạy **dừng**: trên ngưỡng đó head phân
-loại gần như không được giám sát.
+candidate B so với candidate A, và khi đó hiệu số vừa do nhánh vừa do 6400 mẫu
+đã thành 6100.
 
-### Vì sao ASL chứ không phải cross-entropy
-
-Với CXR, lớp `neg` bật ở phần lớn ô, nên hai ô `pos`/`uncertain` gần như luôn
-mang nhãn 0 và chúng dễ đoán tới mức áp đảo tổng gradient.
-
-`gamma` áp theo **giá trị nhãn** của từng ô, không theo tên lớp:
-
-* `gamma_neg = 2.0` — ô có nhãn 0. Nén đóng góp của những ô âm **đã đoán đúng**
-  theo `(p)^2`, dồn gradient còn lại về những ô model đang sai.
-* `gamma_pos = 0.0` — ô có nhãn 1. Không nén gì.
-* `clip = 0.05` — ô âm mà model đã cho `p < 0.05` đóng góp **đúng bằng 0**, tức
-  là bị vứt hẳn khỏi gradient chứ không phải chỉ nén. Đây là phần *asymmetric
-  probability shifting*, và là lý do ASL chịu được tỉ lệ âm/dương cỡ 1:20.
-
-Muốn nén theo **tên lớp** thay vì theo giá trị nhãn thì đặt `gamma_neg` thành
-danh sách 3 số `[neg, pos, uncertain]`. Đó là một hàm mất mát khác và báo cáo
-phải ghi rõ.
-
-Hàm mất mát tổng: `L = CE + 0.5 · ASL`. Xem mục 5.2 về vì sao 0.5 và vì sao nó
-là một giới hạn của thí nghiệm.
+Chỉ số đọc log là **`cls_f1_pos`**, không phải accuracy: lớp `neg` chiếm đa số áp
+đảo nên một head đoán `neg` cho mọi ô vẫn đạt accuracy rất cao trong khi chưa học
+được gì.
 
 ---
 
@@ -204,6 +252,7 @@ một bảng p-value sai mà trông hoàn toàn bình thường.
   trông như một kết luận về khoa học trong khi nó là một kết luận về `n_perm`.
 
 ---
+---
 
 ## 4. Chạy
 
@@ -211,41 +260,83 @@ một bảng p-value sai mà trông hoàn toàn bình thường.
 export HF_TOKEN=hf_xxxxxxxx          # đã được cấp quyền google/gemma-3-4b-it
 export WANDB_API_KEY=xxxxxxxx        # bỏ được → W&B ghi offline
 
-bash scripts/archive_2.2.sh --apply      # CHẠY MỘT LẦN: dọn §2.2 sang _archive/
 bash scripts/setup.sh                    # lần đầu
-python -m src.labels_cls --check-split   # DÒ NHÃN TRƯỚC, ~30 giây
-bash scripts/run_recomb.sh --dry-run     # thử đường ống + dò batch, ~15 phút
+bash scripts/archive_2.2.sh --apply      # MỘT LẦN: chuyển §2.2 sang _archive/
+python scripts/selftest_recomb.py        # phải qua HẾT
+python -m src.labels_cls --check-split   # dò nhãn, ~30 giây
+bash scripts/run_recomb.sh --dry-run     # thử đường ống (16 mẫu, 4 bước)
 bash scripts/run_recomb.sh --detach      # chạy thật
 ```
 
-Bảy stage, mọi stage resume được:
-`data → train ×2 → infer ×2 → score → stats → report → push`
+Mọi stage resume được: candidate đã có adapter (+ file nhánh) thì bỏ qua train,
+ảnh đã sinh thì chỉ sinh phần thiếu, điểm đã chấm thì dùng lại.
 
-```bash
-bash scripts/run_recomb.sh --stages stats,report      # chỉ tính lại thống kê
-bash scripts/run_recomb.sh --arms qdora_r4_recomb     # chỉ candidate B
-bash scripts/run_recomb.sh --retrain                  # huấn luyện lại cả hai
-```
+### 4.1. Candidate B chạy TRƯỚC candidate A
 
-### Candidate A được dùng lại từ §2.2
+B là candidate **duy nhất** có thể hỏng vì lý do kiến trúc: thiếu nhãn, pan&scan
+lén bật, nhánh không vừa VRAM. A thì gần như chắc chắn chạy — nó là một arm LoRA
+bình thường.
 
-`output.adapter_dir` trỏ vào cùng `./adapters` mà §2.2 đã ghi, và candidate A
-mang đúng id `qdora_r4`. Nếu §2.2 đã chạy trên máy này thì stage `train` **bỏ
-qua** candidate A và dùng lại adapter cũ — cùng seed, cùng 6400 mẫu, cùng lịch —
-nên nó *đúng là* arm qdora_r4 chứ không phải một bản huấn luyện lại gần giống.
-`--retrain` để ép làm lại.
+Chạy A trước nghĩa là trả ~90 phút GPU rồi mới biết B không dựng được, và lúc đó
+90 phút ấy không mua được gì: §2.3 cần **đủ hai cột**, một cột lẻ không định
+nghĩa được phép so sánh ghép cặp. Chạy B trước thì mọi thất bại kiểu ấy xảy ra ở
+phút thứ ba.
 
-### Batch
+Thứ tự này **không được phép** ảnh hưởng tới kết quả, và đó là một điều kiện chứ
+không phải một hy vọng:
 
-Candidate B giữ thêm activation của 4096 token × 2560 chiều, nên nó có thể phải
-tụt một nấc so với candidate A. `--dry-run` dò nấc mà **cả hai** cùng qua và ghi
-vào `runs/batch_probe_recomb.json`; lần chạy thật đọc file đó và dùng **cùng một
-batch cho cả hai**. Batch hiệu dụng đứng yên ở 32 qua mọi nấc, nên số bước tối
-ưu hoá của hai candidate giống hệt nhau — đó là bất biến giữ cho "cùng lịch học"
-đúng như thiết kế tuyên bố.
+* seed và thứ tự dữ liệu được đặt lại ngay trước **mỗi** candidate, bằng một
+  `torch.Generator` riêng — không đụng tới RNG toàn cục, nên nó không phụ thuộc
+  vào việc candidate nào chạy trước;
+* batch là hằng số trong config, không phải thứ dò được từ VRAM còn trống;
+* VRAM được dọn (`free_vram`, `gc.collect()` hai lượt) giữa hai candidate.
 
-Batch khác nhau giữa hai candidate là một biến mà hiệu số ghép cặp không tách ra
-được.
+Nếu đổi thứ tự mà bảng kết quả đổi theo thì có một chỗ rò trạng thái, và đó là
+lỗi.
+
+`--arms lora_recomb` chạy riêng candidate B khi cần soi một mình nó. Thứ tự
+**trình bày** trong REPORT.md vẫn là A rồi B, theo thứ tự khai trong config: "B
+chạy trước" là một quyết định vận hành và nó không được rò vào cách trình bày kết
+quả.
+
+### 4.2. Batch là hằng số — không còn dò
+
+Bản trước có một cái thang: hết VRAM thì chia đôi batch và nhân đôi `grad_accum`,
+giữ nguyên batch hiệu dụng. Nó giấu một chuyện — nấc thật sự dùng phụ thuộc vào
+việc lúc ấy card còn trống bao nhiêu, tức là vào cái gì chạy trước. Với B chạy
+trước A, một cái thang còn có thể cho hai candidate hai nấc khác nhau.
+
+Nay `train.per_device_batch_size` × `train.grad_accum` là hằng số dùng chung, và
+hết VRAM là **dừng**. Thông báo nêu đúng bốn khoá làm được gì đó, theo thứ tự sức
+nặng:
+
+1. `recombiner.swiglu_hidden` — activation 4096 × hidden cho **mỗi** ảnh, ở cả
+   forward lẫn backward. Chỗ tốn nhất của cả nhánh.
+2. `train.max_seq_len` + `recombiner.n_query` — độ dài chuỗi thật decoder phải
+   chạy.
+3. `train.per_device_batch_size` — **nhớ nhân `grad_accum` lên đúng bấy nhiêu
+   lần**, nếu không thì số bước và lịch one-cycle đổi theo và bảng kết quả không
+   so được với lần chạy trước.
+4. `recombiner.qformer.n_layers` — rẻ nhất trong bốn, chỉ 2 query nên hiếm khi là
+   thủ phạm.
+
+Một lần chạy dừng ở phút thứ ba rẻ hơn nhiều một bảng kết quả mà không ai nói
+được hai cột có cùng lịch học hay không.
+
+### 4.3. Cả hai candidate đi chung một đường code
+
+Cùng vòng huấn luyện (`train_recomb._forward_loss`) và cùng runner sinh
+(`gemma3_recomb`). Candidate A là candidate B với `branch = None`.
+
+Cả hai đều **tự dựng `inputs_embeds`** thay vì để `Gemma3ForConditionalGeneration`
+ghép từ `input_ids` + `pixel_values`. Hai đường tương đương về toán nhưng không
+giống nhau từng phép tính, và khi hiệu số đo được là vài phần trăm BLEU thì "gần
+như tương đương" không đủ.
+
+Hệ quả phải chấp nhận, và nó vào phần Giới hạn: candidate A ở đây **không** phải
+cùng một lần chạy với arm cùng tên trong bảng §2.2 (HF Trainer xáo dữ liệu bằng
+RNG riêng của nó). Con số tuyệt đối của §2.3 vì thế không so trực tiếp được với
+bảng §2.2; chỉ hiệu số A↔B **bên trong** §2.3 là thứ hai kiểm định nói về.
 
 ---
 
@@ -253,27 +344,25 @@ Batch khác nhau giữa hai candidate là một biến mà hiệu số ghép c�
 
 ### 5.1. Số tham số không cân
 
-Candidate B có nhiều hơn candidate A khoảng **hai bậc** tham số học được
-(QDoRA r=4 ≈ 1.8 M; nhánh Recombiner + QFormer + head ≈ 50 M). Nếu B thắng, §2.3
-**không tách được** phần nào do kiến trúc Recombiner và phần nào do đơn giản là
-có thêm sức chứa.
+Candidate B có nhiều hơn candidate A khoảng **hai bậc** tham số học được. Nếu B
+thắng, §2.3 **không tách được** phần nào do kiến trúc Recombinator và phần nào do
+đơn giản là có thêm sức chứa.
 
-Câu trả lời cho câu hỏi đó là một arm thứ ba — QDoRA rank cao hơn, khớp số tham
-số — và nó **không** nằm trong thí nghiệm này. Bảng §2.2 (`_archive/`) có sẵn
-qdora_r8/r16/r32 để đối chiếu thô, nhưng chúng khớp rank chứ không khớp số tham
-số, nên đó là gợi ý chứ không phải phép kiểm.
+Câu trả lời cho câu hỏi đó là một arm thứ ba — LoRA rank cao hơn, khớp số tham số
+— và nó **không** nằm trong thí nghiệm này. Bảng §2.2 (`_archive/`) có sẵn r=8/16/32
+để đối chiếu thô, nhưng chúng khớp rank chứ không khớp số tham số, nên đó là gợi
+ý chứ không phải phép kiểm.
 
-### 5.2. `lambda_sup = 0.5` là hằng số được chọn, không được tune
+### 5.2. `classifier.lambda` là hằng số được chọn, không được tune
 
-Tune lambda trên tập test là rò rỉ. Tune trên val thì val ở đây chỉ 256 mẫu và
-chỉ dùng để **nhìn** đường loss, không để chọn gì cả. Nên: chốt một giá trị, ghi
-rõ, và nói thẳng rằng §2.3 không trả lời được "lambda nào tốt nhất".
+Tune λ trên tập test là rò rỉ. Tune trên val thì val ở đây chỉ 256 mẫu và chỉ
+dùng để **nhìn** đường loss, không để chọn gì cả. Nên: chốt một giá trị, ghi rõ,
+và nói thẳng rằng §2.3 không trả lời được "λ nào tốt nhất".
 
-Vì sao 0.5 chứ không 1.0: CE là mục tiêu **thật** của thí nghiệm (báo cáo sinh
-ra được chấm bằng BLEU/ROUGE/BERTScore). ASL chỉ là chỗ neo gradient cho nhánh
-Recombiner. Để ASL ngang CE là để một mục tiêu phụ kéo decoder đi, và khi bảng
-kết quả nói "candidate B kém hơn" thì không tách được phần nào do nhánh mới,
-phần nào do CE đã bị chia nửa trọng số.
+CE là mục tiêu **thật** của thí nghiệm (báo cáo sinh ra được chấm bằng
+BLEU/ROUGE/BERTScore). ASL chỉ là chỗ neo gradient cho nhánh. Để ASL ngang CE là
+để một mục tiêu phụ kéo decoder đi, và khi bảng kết quả nói "candidate B kém hơn"
+thì không tách được phần nào do nhánh mới, phần nào do CE đã bị chia trọng số.
 
 ### 5.3. Một seed
 
@@ -289,81 +378,80 @@ lượng tử hoá — y hệt giới hạn đã ghi ở §2.2.
 
 ### 5.5. MoE không nằm trong thí nghiệm này
 
-Thiết kế gốc có QFormer tách **2 vector**: vector 1 cho head phân loại, vector 2
-cho `Route_Gate` (Gaussian noise học được → soft logit-clipping C=1.2 → softmax →
-top-k gating) điều phối một tập Expert LoRA, kèm Aux Loss cân tải.
+`Route_Gate (vec_2) → Aux Loss` và mũi tên xuống Experts trong sơ đồ tổng thuộc
+**mục sau**. Ở §2.3 khối ấy được dựng để hình dạng checkpoint khớp, nhưng query
+đóng băng, đầu ra detach, không Aux Loss, không định tuyến. Bảng đếm tham số
+trong REPORT.md ghi riêng dòng `route_gate` kèm chữ **BẤT HOẠT** — một khối tham
+số không có gradient mà nằm lẫn trong tổng sẽ trông như thể nó có ích.
 
-§2.3 chạy **một** loại QDoRA rank 4 cố định, nên toàn bộ nhánh đó bị bỏ khỏi đồ
-thị chứ không phải để đó mà tắt: một khối tham số không có gradient nào ngoài
-weight decay vẫn xuất hiện trong bảng đếm tham số như thể nó có ích. QFormer ở
-đây chỉ ra 1 vector.
+### 5.6. So với bảng §2.2
+
+Xem §4.3: candidate A ở đây được huấn luyện lại bằng vòng lặp của §2.3, không
+phải dùng lại adapter cũ của §2.2. Đó là chủ ý — dùng lại thì A và B đi hai vòng
+lặp khác nhau và "chỉ khác đúng một thứ" thành sai — nhưng nó có nghĩa là con số
+tuyệt đối của hai mục không đặt cạnh nhau được.
 
 ---
 
 ## 6. Tự kiểm chứng
 
 ```bash
-python scripts/selftest_recomb.py        # 63 phép kiểm, vài giây, không cần GPU
+python scripts/selftest_recomb.py        # ~55 phép kiểm, vài giây
 python scripts/selftest_recomb.py -v     # kèm traceback
 ```
 
-`scripts/run_recomb.sh` chạy nó trước khi động tới GPU. Nó kiểm hai loại lỗi
-không ném exception và không hiện ra ở đường loss:
+Không cần GPU, không cần mạng, không nạp Gemma — phần nhánh chạy trên CPU với
+chiều nhỏ. Cái nó bảo vệ là **hai loại lỗi không ném exception và không hiện ra ở
+đường loss**:
 
-* **Khâu thống kê** — dấu của hiệu số, sàn `1/(B+1)`, Holm đơn điệu, BCa lùi về
-  phân vị khi không xác định, `align_blocks` chặn lệch hàng, `significant` là
-  phép AND thật của hai kiểm định.
-* **Nhánh Recombiner** — ASL bằng đúng BCE khi `gamma=0, clip=0` (chống thoái
-  hoá lặng lẽ), `clip` vứt hẳn ô âm quá dễ, mask không sinh gradient và không
-  pha loãng mẫu còn lại, `TokenPool` tổ hợp trên đúng trục, prefix chèn vào cả
-  bốn tensor với `labels = −100`, cổng 0 cho ra token 0, `save/load` nhánh khứ
-  hồi không mất khoá.
+* **Khâu thống kê.** Một dấu sai trong hiệu số ghép cặp, một CI đặt nhầm đầu, một
+  Holm hiệu chỉnh sai chiều — tất cả đều cho ra một bảng đọc được, và bảng đó đi
+  thẳng vào luận văn.
+* **Nhánh Recombinator.** ASL thoái hoá về BCE, mask không có tác dụng, 32 token
+  chèn nhầm chỗ, skip-connect nối sai nguồn, `aux` quên detach, cổng khác 0 —
+  model vẫn huấn luyện, loss vẫn giảm, và candidate B chỉ đơn giản là kém hơn nó
+  đáng ra phải thế.
 
-Bỏ qua (không khuyến khích): `RGEXP_SKIP_SELFTEST=1`.
+Ngoài ra nó kiểm **ranh giới `_archive/`**: không file nào trong `src/` còn import
+`stats_friedman`, `src.train`, hay `_archive`; `configs/recomb.yaml` đã biến mất;
+và `backbone.py` không còn `batch_ladder`/`read_probe`/`write_probe`. Năm phép
+kiểm ấy **sẽ hỏng** cho tới khi chạy `bash scripts/archive_2.2.sh --apply` — đó
+là chủ ý, chúng là danh sách việc phải làm.
 
 ---
 
 ## 7. Cấu trúc
 
-```
-configs/recomb.yaml           TOÀN BỘ tham số §2.3, có chú thích lý do
-src/
-  config.py                   nạp YAML, seed, token
-  data.py · data_train.py     3000 ảnh test · 6400 mẫu train + hàng rào rò rỉ
-  labels_cls.py               DÒ labels.npz -> nhãn (L,3) + mask     [§2.3]
-  prompts.py                  prompt dùng chung train/infer
-  imaging.py                  chính sách ảnh (pan&scan tắt, 896)
-  train.py                    khung huấn luyện — dùng cho candidate A
-  recombiner.py               Recombiner · QFormer · Sup-head · ASL · RecombGemma  [§2.3]
-  train_recomb.py             huấn luyện candidate B                  [§2.3]
-  runners/gemma3.py           base trần
-  runners/gemma3_adapter.py   base + adapter          (candidate A)
-  runners/gemma3_recomb.py    base + adapter + nhánh  (candidate B)   [§2.3]
-  metrics.py                  BLEU · ROUGE · BERTScore, theo TỪNG MẪU
-  stats_ab.py                 bootstrap ghép cặp (BCa) · permutation · Holm  [§2.3]
-  report_recomb.py            REPORT.md + 3 bảng CSV                  [§2.3]
-  run_recomb.py               điều phối 7 stage                       [§2.3]
-  push.py · tracking.py       đẩy Hub · W&B
-  preflight.py                kiểm môi trường trước khi nạp model
-scripts/
-  run_recomb.sh               MỘT LỆNH chạy trọn §2.3
-  selftest_recomb.py          63 phép kiểm, không cần GPU/mạng/model
-  setup.sh · _env.sh          môi trường
-_archive/                     §2.0, §2.1, §2.2 — đã chốt, xem README.md
-```
+Xem [`README.md`](README.md).
+
+---
 
 ## 8. Đầu ra
 
 ```
-runs/2.3_recombiner_ab/
+runs/2.3_recombiner/
   REPORT.md                       kết luận + bảng, đọc từ trên xuống
   manifest.json                   cấu hình đã giải quyết + môi trường + headline
   metrics/per_sample_*.csv        điểm TỪNG ảnh, từng candidate
   metrics/summary.csv             điểm trung bình + hiệu số
   metrics/ab_tests.csv            bảng kiểm định đầy đủ (mọi cột)
-  metrics/train_stats.csv         tham số, batch, VRAM, decoder_gate_norm
+  metrics/train_stats.csv         tham số, batch, VRAM, gate_final, cls_f1_pos
   predictions/*.jsonl             văn bản sinh ra
-adapters/
-  qdora_r4/                       candidate A (dùng chung với §2.2)
-  qdora_r4_recomb/                candidate B: adapter + recomb_branch.safetensors
+adapters_2_3/
+  lora_only/                      candidate A: adapter
+  lora_recomb/                    candidate B: adapter
+                                  + recombiner_branch.safetensors
+                                  + recombiner_branch.json  (hình dạng nhánh)
 ```
+
+`recombiner_branch.json` giữ **nguyên văn** hai khối config đã dựng ra nhánh, và
+`load_branch` dựng lại **từ đó** chứ không từ config hiện tại — config có thể đã
+bị `--set` sửa, hoặc chỉ đơn giản là đã được chỉnh trong lúc chờ.
+
+Nhánh được ghi ra file **riêng**, không nhồi vào state_dict của peft:
+`PeftModel.from_pretrained` bỏ qua những khoá nó không nhận — im lặng — và khi đó
+khâu sinh nạp adapter **đúng** với một nhánh **ngẫu nhiên**. Kết quả vẫn là tiếng
+Anh đọc được, và cột số của candidate B vẫn trông như kết quả thật. Vì vậy
+`already_trained()` kiểm **ba** thứ (trọng số adapter, `train_stats.json`, file
+nhánh) và runner **dừng** nếu `train_stats.json` nói có nhánh mà file nhánh không
+có.

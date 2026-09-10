@@ -1,20 +1,27 @@
 """§2.3 — trọn thí nghiệm hai candidate trong MỘT lệnh.
 
-    python -m src.run_recomb                     # data -> train ×2 -> infer ×2 -> chấm -> bootstrap+permutation -> báo cáo -> push
-    python -m src.run_recomb --dry-run           # 8 ảnh, 4 bước train + DÒ BATCH
+    python -m src.run_recomb                  # data -> train B,A -> infer B,A -> chấm -> bootstrap+permutation -> báo cáo -> push
+    python -m src.run_recomb --dry-run        # 8 ảnh, 4 bước train, không đẩy Hub
     python -m src.run_recomb --stages stats,report
-    python -m src.run_recomb --arms qdora_r4_recomb
+    python -m src.run_recomb --arms lora_recomb
 
-Mọi stage resume được. Với hai candidate thì tổng chi phí nhỏ hơn §2.2 nhiều
-(2 arm thay vì 8), nhưng candidate B nặng hơn candidate A ở cả train lẫn sinh,
-nên `--dry-run` vẫn là bước đầu tiên đáng làm: nó dò nấc batch mà CẢ HAI cùng
-qua, và nấc chung đó là điều kiện để "cùng lịch học" đúng như thiết kế tuyên bố.
+Mọi stage resume được.
 
-Một khác biệt so với §2.2 đáng nói: `qdora_r4` ở đây trỏ vào ĐÚNG thư mục
-adapter của arm cùng tên trong §2.2. Nếu §2.2 đã chạy trên máy này thì stage
-`train` bỏ qua candidate A và dùng lại adapter cũ — cùng seed, cùng 6400 mẫu,
-cùng lịch — nên nó ĐÚNG là candidate A chứ không phải một bản huấn luyện lại
-gần giống. `--retrain` để ép huấn luyện lại cả hai.
+── Vì sao candidate B chạy TRƯỚC candidate A ────────────────────────────────
+B là candidate nặng hơn ở cả train lẫn sinh, và nó là candidate DUY NHẤT có thể
+hỏng vì lý do kiến trúc: thiếu nhãn, pan&scan lén bật, nhánh không vừa VRAM.
+A thì gần như chắc chắn chạy — nó là một arm LoRA bình thường.
+
+Chạy A trước nghĩa là trả 90 phút GPU rồi mới biết B không dựng được, và lúc đó
+90 phút ấy không mua được gì: §2.3 cần ĐỦ HAI cột, một cột lẻ không định nghĩa
+được phép so sánh ghép cặp. Chạy B trước thì mọi thất bại kiểu ấy xảy ra ở phút
+thứ ba.
+
+Thứ tự này KHÔNG được phép ảnh hưởng tới kết quả, và đó là điều kiện chứ không
+phải hy vọng: seed và thứ tự dữ liệu được đặt lại ngay trước MỖI candidate, và
+batch là hằng số trong config chứ không phải thứ dò được từ VRAM còn trống (xem
+docstring `src/train_recomb.py`). Nếu đổi thứ tự mà bảng kết quả đổi theo thì có
+một chỗ rò trạng thái, và nó là lỗi.
 """
 from __future__ import annotations
 
@@ -33,7 +40,7 @@ from .config import (Cfg, add_common_args, hf_token, load_config,
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recomb.yaml"
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
 
 
 def _hr(t: str) -> None:
@@ -78,39 +85,79 @@ def _env_info() -> dict:
 
 
 def enabled_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
-    arms = [dict(a) for a in cfg["arms"] if a.get("enabled", True)]
+    """Các candidate được bật, với cờ `recomb` đã CHUẨN HOÁ và bắt buộc.
+
+    Cờ này là toàn bộ khác biệt giữa hai cột trong bảng kết quả, nên nó không
+    được phép có giá trị mặc định. Một arm quên khai (hay gõ `recombiner:` trong
+    khi code đọc `recomb:`) mà lặng lẽ nhận `False` nghĩa là chạy candidate A
+    hai lần, ra hai cột gần như trùng nhau, và kết luận "nhánh không có tác
+    dụng" — một kết quả đọc được, hợp lý, và sai.
+    """
+    arms = []
+    for a in cfg["arms"]:
+        a = dict(a)
+        if not a.get("enabled", True):
+            continue
+        if "recomb" in a:
+            flag = a["recomb"]
+        elif "recombiner" in a:
+            flag = a["recombiner"]
+        else:
+            raise ValueError(
+                f"arm {a.get('id')!r} không khai `recomb:` (true/false). Đó là "
+                f"thứ DUY NHẤT phân biệt candidate A với candidate B — mặc định "
+                f"ngầm ở đây là chạy A hai lần mà không ai biết.")
+        a["recomb"] = bool(flag)
+        arms.append(a)
     if only:
         arms = [a for a in arms if a["id"] in only]
     return arms
 
 
+def train_order(arms: list[dict]) -> list[dict]:
+    """Candidate B trước, A sau — xem docstring module.
+
+    Chỉ đổi THỨ TỰ CHẠY. Mọi chỗ báo cáo (bảng, manifest, hiệu số A↔B) vẫn dùng
+    `arms` theo thứ tự khai báo, vì "B trước" là một quyết định vận hành và nó
+    không được phép rò vào cách trình bày kết quả.
+    """
+    return sorted(arms, key=lambda a: 0 if a.get("recomb") else 1)
+
+
 def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
     """Cấu hình kiểu `models[]` để dùng lại `Runner.run()` (resume, ngắt mạch)."""
     b = dict(cfg["base"])
-    runner = "gemma3_recomb" if arm.get("recomb") else b.get("runner", "gemma3_adapter")
     return Cfg({
         "id": arm["id"], "name": arm.get("name", arm["id"]),
-        "runner": runner,
+        # CẢ HAI candidate dùng `gemma3_recomb`. Runner ấy tự dựng inputs_embeds
+        # và candidate A đơn giản là chạy nó với `branch = None`. Cho A đi
+        # `gemma3_adapter` cho "gọn" là để hai cột trong bảng đi qua hai đường
+        # sinh khác nhau — tương đương về toán, không giống nhau từng phép tính.
+        "runner": "gemma3_recomb",
         "hf_id": b["hf_id"], "dtype": b.get("dtype", "bfloat16"),
         "batch_size": int(b.get("batch_size", 4)),
         "disable_compile": b.get("disable_compile", "auto"),
         "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
         "adapter_dir": str(adapter_root / arm["id"]),
-        "merge_adapter": bool(b.get("merge_adapter", True)) and not arm.get("recomb"),
+        # Không hợp nhất adapter ở candidate nào: hợp nhất ở A mà không hợp nhất
+        # ở B là một khác biệt nữa giữa hai cột. (Trên base 4-bit thì hợp nhất
+        # vốn đã bị tắt, nhưng đây phải là một quyết định, không phải may mắn.)
+        "merge_adapter": False,
         "optional": False,
     })
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="§2.3 Recombiner A/B — bootstrap + permutation, trọn gói.")
+        description="§2.3 Recombinator A/B — bootstrap + permutation, trọn gói.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--dry-run", action="store_true",
-                    help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy Hub")
+                    help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy "
+                         "Hub. KHÔNG dò batch — batch là hằng số trong config.")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại dù đã có")
     ap.add_argument("--no-push", action="store_true")
@@ -132,7 +179,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.setdefault("wandb", {})["tags"] = list(
             cfg.get("wandb", {}).get("tags", []) or []) + ["dry-run"]
         dry_steps = 4
-        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub", flush=True)
+        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub.\n"
+              "  Đây là phép thử ĐƯỜNG ỐNG, không phải phép dò VRAM: nó chạy với "
+              "đúng batch trong config,\n  nhưng 4 bước trên 16 mẫu ngắn không "
+              "nói được gì về VRAM đỉnh của 6400 mẫu.", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
     if a.no_wandb:
@@ -183,24 +233,26 @@ def main(argv: list[str] | None = None) -> int:
     # Dựng TRƯỚC mọi thứ tốn kém. Nếu labels.npz có schema khác cái ta đoán thì
     # phát hiện ra ở giây thứ 30 rẻ hơn nhiều so với ở giờ thứ hai của stage
     # train — và ca tệ nhất không phải lỗi mà là nhãn lệch âm thầm.
-    cls_lut, cls_info, n_labels = {}, {}, 0
+    cls_pack = None
     need_b = any(x.get("recomb") for x in arms)
     if need_b and ("train" in stages):
         from . import labels_cls
 
-        _hr("Nhãn phân loại (Sup-head)")
+        _hr("Nhãn phân loại (ClsHead)")
+        # Chỉ DÒ SCHEMA ở đây. Nhãn thật phải căn theo thứ tự hàng của train_df,
+        # mà train_df chưa tồn tại — nên nó được dựng ở stage train. Cái đắt cần
+        # chết sớm là "labels.npz có đúng hình dạng ta nghĩ không", và câu đó
+        # trả lời được ngay bây giờ, trước khi tải 3000 ảnh.
         try:
-            cls_lut, cls_info = labels_cls.load_map(cfg)
-            n_labels = int(cls_info["n_labels"])
+            info = labels_cls.probe(cfg)
+            print(f"  labels.npz: {info.get('path')} · nhãn "
+                  f"{info.get('label_array')} · key {info.get('key_array')}",
+                  flush=True)
         except labels_cls.LabelsUnusable as e:
             print(f"\n✗ DỪNG — nhãn phân loại không dùng được:\n    {e}", flush=True)
             tracker.alert("§2.3 dừng: nhãn phân loại", str(e), "ERROR")
             tracker.finish(1)
             return 5
-        manifest["labels"] = {k: v for k, v in cls_info.items() if k != "arrays"}
-        tracker.summary({"labels/n_labels": n_labels,
-                         **{f"labels/frac_{k}": v
-                            for k, v in cls_info["class_frac"].items()}})
 
     # ── data ────────────────────────────────────────────────────────────────
     from . import data as data_mod
@@ -225,12 +277,16 @@ def main(argv: list[str] | None = None) -> int:
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages:
-        _hr("Huấn luyện hai candidate")
-        from . import train as train_mod
+        _hr("Huấn luyện hai candidate — candidate B TRƯỚC")
         from . import train_recomb as tr_mod
-        from .train import TrainUnusable, preflight_adapters
+        from .backbone import TrainUnusable, preflight_adapters
 
-        pf_err, pf_warn = preflight_adapters(arms)
+        preset = tr_mod.resolve_preset(cfg)
+        pf_err, pf_warn = preflight_adapters(
+            [{"method": preset["method"], "rank": preset["rank"]}])
+        e2, w2 = tr_mod.preflight_recomb(cfg, arms)
+        pf_err += e2
+        pf_warn += w2
         for w in pf_warn:
             print(f"  {w}", flush=True)
         if pf_err:
@@ -244,71 +300,63 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8")
             return 2
-        print("  ✓ peft/bitsandbytes/GPU sẵn sàng", flush=True)
+        print(f"  ✓ peft/bitsandbytes/GPU/nhánh sẵn sàng · preset LoRA "
+              f"{preset['id']} (r={preset['rank']} alpha={preset['alpha']})",
+              flush=True)
+        manifest["lora_preset"] = preset
 
         if train_df is None:
             train_df, val_df = dt_mod.load_train_manifest(cfg)
         manifest["n_train"] = len(train_df)
         tracker.summary({"data/n_train": len(train_df)})
 
-        forced = any(o.split("=", 1)[0].strip() == "train.per_device_batch_size"
-                     for o in (a.overrides or []))
-        probe = None if (a.dry_run or forced) else train_mod.read_probe(cfg)
-        bs, accum = train_mod.resolve_batch(dict(cfg["train"]), probe)
-        if forced:
-            src_txt = "--set (ghi đè tay)"
-        elif probe:
-            src_txt = f"{train_mod.probe_path(cfg)} (dò lúc {probe.get('probed_at')})"
-        elif a.dry_run:
-            src_txt = "config — đây là lần DÒ, nấc này chỉ là điểm khởi đầu"
-        else:
-            src_txt = ("config — CHƯA dò bao giờ; chạy `--dry-run` trước, "
-                       "candidate B nặng hơn candidate A")
-        print(f"  batch {bs} × grad_accum {accum} = eff_bs {bs*accum} [{src_txt}]",
+        # Nhãn căn theo ĐÚNG thứ tự hàng của train_df, nên chỉ dựng được sau khi
+        # có train_df. Lần gọi ở trên chỉ để dò schema và chết sớm nếu hỏng.
+        if need_b:
+            cls_pack = tr_mod.prepare_cls(cfg, train_df)
+            if cls_pack:
+                manifest["labels"] = cls_pack["stats"]
+                tracker.summary({"labels/n_labels": cls_pack["n_labels"],
+                                 "labels/frac_missing":
+                                     cls_pack["stats"].get("frac_missing")})
+
+        tcfg = dict(cfg["train"])
+        bs = int(tcfg.get("per_device_batch_size", 1))
+        accum = int(tcfg.get("grad_accum", 16))
+        print(f"  batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
+              f"[config, dùng chung cho cả hai candidate — §2.3 KHÔNG dò batch]",
               flush=True)
         manifest["batch"] = {"batch_size": bs, "grad_accum": accum,
-                             "effective_batch": bs * accum, "source": src_txt}
-        probe_hits: dict[str, int] = {}
+                             "effective_batch": bs * accum, "source": "config"}
 
-        for arm in arms:
+        for arm in train_order(arms):
             aid = arm["id"]
             odir = adapter_root / aid
             is_b = bool(arm.get("recomb"))
-            done = (tr_mod.already_trained(odir) if is_b
-                    else train_mod.already_trained(odir))
-            if done and not a.retrain:
-                note = ("dùng lại adapter §2.2" if not is_b else "đã huấn luyện")
-                print(f"  ✓ {aid}: {note} ở {odir} — bỏ qua "
+            if tr_mod.already_trained(odir, is_b) and not a.retrain:
+                print(f"  ✓ {aid}: đã huấn luyện ở {odir} — bỏ qua "
                       f"(--retrain để làm lại)", flush=True)
                 cached = json.loads((odir / "train_stats.json").read_text(encoding="utf-8"))
                 train_stats.append(cached)
-                if cached.get("batch_size"):
-                    probe_hits[aid] = int(cached["batch_size"])
                 manifest["arm_status"][aid] = {"trained": "cached"}
                 continue
+            print(f"\n── {arm.get('name', aid)} "
+                  f"({'candidate B · CÓ nhánh' if is_b else 'candidate A · không nhánh'}) ──",
+                  flush=True)
             try:
-                if is_b:
-                    st = tr_mod.train_arm(cfg, arm, train_df, val_df, odir,
-                                          cls_lut, n_labels, tracker,
-                                          max_steps_override=dry_steps,
-                                          batch=bs, ladder=bool(a.dry_run))
-                else:
-                    st = train_mod.train_arm(cfg, arm, train_df, val_df, odir,
-                                             tracker, max_steps_override=dry_steps,
-                                             batch=bs, ladder=bool(a.dry_run))
+                st = tr_mod.train_arm(cfg, arm, preset, train_df,
+                                      cls_pack if is_b else None, odir, tracker,
+                                      max_steps_override=dry_steps)
                 train_stats.append(st)
-                probe_hits[aid] = int(st["batch_size"])
-                if a.dry_run and int(st["batch_size"]) < bs:
-                    bs, accum = train_mod.resolve_batch(
-                        dict(cfg["train"]), {"batch_size": int(st["batch_size"])})
                 manifest["arm_status"][aid] = {"trained": True,
                                                "minutes": st["minutes"],
-                                               "batch_size": st["batch_size"]}
+                                               "batch_size": st["batch_size"],
+                                               "vram_peak_gb": st["vram_peak_gb"]}
                 tracker.summary({f"train/{aid}/minutes": st["minutes"],
                                  f"train/{aid}/loss": st["train_loss"],
                                  f"train/{aid}/vram_peak_gb": st["vram_peak_gb"],
                                  f"train/{aid}/trainable_params":
-                                     st.get("trainable_total", st["trainable_params"])})
+                                     st.get("trainable_params")})
             except TrainUnusable as e:
                 print(f"\n✗ {aid} KHÔNG huấn luyện được: {e}", flush=True)
                 tracker.alert("§2.3 dừng ở train", f"{aid}: {e}", "ERROR")
@@ -321,31 +369,14 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:
                 print(f"\n✗ {aid} hỏng khi huấn luyện: {e!r}", flush=True)
                 manifest["arm_status"][aid] = {"trained": False, "error": repr(e)}
-                tracker.alert("Arm hỏng khi train", f"{aid}: {e!r}", "ERROR")
+                tracker.alert("Candidate hỏng khi train", f"{aid}: {e!r}", "ERROR")
                 raise
-
-        if a.dry_run and probe_hits:
-            lo = min(probe_hits.values())
-            _, lo_accum = train_mod.resolve_batch(dict(cfg["train"]),
-                                                  {"batch_size": lo})
-            pfile = train_mod.write_probe(cfg, lo, lo_accum, probe_hits)
-            manifest["batch_probe"] = {"batch_size": lo, "grad_accum": lo_accum,
-                                       "per_arm": probe_hits, "file": str(pfile)}
-            tracker.summary({"train/probe_batch_size": lo,
-                             "train/probe_grad_accum": lo_accum})
-            print(f"\n⚙ DÒ XONG: batch {lo} × grad_accum {lo_accum} "
-                  f"(eff_bs {lo*lo_accum}) -> {pfile}", flush=True)
-            if len(set(probe_hits.values())) > 1:
-                print(f"  nấc theo arm: {probe_hits}\n"
-                      f"  -> lần chạy thật dùng {lo} cho CẢ HAI. Batch khác nhau "
-                      f"giữa hai candidate là một biến mà hiệu số ghép cặp không "
-                      f"tách ra được.", flush=True)
-            print(f"  Chạy thật:  bash scripts/run_recomb.sh --detach", flush=True)
     else:
         for arm in arms:
             p = adapter_root / arm["id"] / "train_stats.json"
             if p.exists():
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
+
 
     # ── infer ───────────────────────────────────────────────────────────────
     pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}

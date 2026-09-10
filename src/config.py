@@ -1,8 +1,8 @@
 """Nạp và giải quyết cấu hình §2.3.
 
-Một file YAML duy nhất (configs/recomb.yaml). Không có kế thừa nhiều tầng: repo
+Một file YAML duy nhất (configs/recombiner.yaml). Không có kế thừa nhiều tầng: repo
 này chỉ chạy một thí nghiệm tại một thời điểm — ở đây là hai candidate quanh
-nhánh Recombiner — nên thêm tầng chỉ để giấu giá trị thật đi.
+nhánh Recombinator — nên thêm tầng chỉ để giấu giá trị thật đi.
 
 Cấu hình của §2.2 (tám biến thể adapter + Friedman) nằm ở
 `_archive/configs/adapters.yaml`; nó vẫn nạp được bằng `--config` nếu cần chạy
@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "recomb.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "recombiner.yaml"
 
 
 class Cfg(dict):

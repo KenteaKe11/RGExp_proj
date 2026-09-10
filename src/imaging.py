@@ -64,7 +64,8 @@ def policy(cfg) -> dict:
             f"được nội suy position embedding. Đặt số khác là lỗi shape ở forward "
             f"đầu tiên, không phải ảnh nhẹ hơn.\n"
             f"    Muốn ảnh nguồn nhỏ hơn: data.image_max_side.\n"
-            f"    Muốn nhẹ VRAM: train.batch_probe.")
+            f"    Muốn nhẹ VRAM: hạ recombiner.swiglu_hidden hoặc "
+            f"train.per_device_batch_size (§2.3 không dò batch).")
     return {
         "do_pan_and_scan": bool(img.get("do_pan_and_scan", False)),
         "size": {"height": size, "width": size},

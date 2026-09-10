@@ -360,7 +360,7 @@ def summary_line(df: pd.DataFrame, primary: str, arm_a: str, arm_b: str) -> str:
                 f"{r['mean_diff']:+.4f} (95% CI [{r['ci_lo']:+.4f}, "
                 f"{r['ci_hi']:+.4f}]) và KHÔNG bác được H0 "
                 f"(p_perm={r['p_perm_holm']:.3g}, p_boot={r['p_boot_holm']:.3g} "
-                f"sau Holm). Dữ liệu này không cho phép nói nhánh Recombiner "
+                f"sau Holm). Dữ liệu này không cho phép nói nhánh Recombinator "
                 f"thay đổi chất lượng báo cáo.")
     if not bool(r["material"]):
         return (f"Trên `{primary}`, {arm_b} khác {arm_a} một cách có ý nghĩa "

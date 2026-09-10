@@ -1,4 +1,4 @@
-"""Gemma 3 4B + một adapter đã huấn luyện — runner cho tám arm của §2.2.
+"""Gemma 3 4B + một adapter đã huấn luyện — runner của §2.2, giữ lại để chạy lại.
 
 Kế thừa nguyên `Gemma3Runner` của §2.1 (cùng prompt, cùng cách cắt token sinh
 ra, cùng vòng resume/ngắt mạch) và chỉ thay bước NẠP.
@@ -12,6 +12,9 @@ Gắn adapter QLoRA lên base bf16 vẫn nạp được, vẫn sinh ra văn bả
 đó KHÔNG phải model đã huấn luyện: trọng số nền khác, và toàn bộ ý nghĩa của
 cột "QLoRA vs LoRA" trong bảng Friedman bốc hơi. `train_stats.json` ghi lại
 arm nào lượng tử, và runner đọc lại từ đó chứ không đoán theo tên arm.
+
+§2.3 KHÔNG dùng runner này cho candidate A — cả hai candidate đi
+`gemma3_recomb` để hai cột dùng chung một đường sinh. Xem docstring file đó.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ from .gemma3 import Gemma3Runner
 
 
 def _infer_device_map(cfg):
-    from ..train import device_map_for
+    from ..backbone import device_map_for
 
     return device_map_for(cfg, for_training=False)
 
@@ -65,10 +68,9 @@ class Gemma3AdapterRunner(Gemma3Runner):
                   device_map=_infer_device_map(self.cfg),
                   attn_implementation=str(self.mcfg.get("attn_implementation", "sdpa")))
         if quantized:
-            from .. import train as train_mod
+            from ..backbone import quant_config
 
-            kw["quantization_config"] = train_mod.quant_config(
-                dict(self.cfg.get("train", {})))
+            kw["quantization_config"] = quant_config(dict(self.cfg.get("train", {})))
             print(f"  nạp {hf_id} ở 4-bit (arm này huấn luyện trên base lượng tử)",
                   flush=True)
         else:

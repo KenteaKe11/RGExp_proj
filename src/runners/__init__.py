@@ -6,9 +6,11 @@ base:
     gemma3          — base trần (không adapter). Giữ lại vì hai runner kia kế
                       thừa toàn bộ vòng sinh/resume của nó, và vì một lần chạy
                       base trần là mốc đối chiếu rẻ khi bảng kết quả trông lạ.
-    gemma3_adapter  — base + một adapter đã huấn luyện. Candidate A của §2.3
-                      (và cả tám arm của §2.2, xem _archive/).
-    gemma3_recomb   — base + adapter + nhánh Recombiner. Candidate B của §2.3.
+    gemma3_adapter  — base + một adapter đã huấn luyện. Tám arm của §2.2
+                      (xem _archive/). §2.3 KHÔNG dùng nó.
+    gemma3_recomb   — base + adapter + (tuỳ chọn) nhánh Recombinator. CẢ HAI
+                      candidate của §2.3 đi qua đây; A là B với branch = None,
+                      để hai cột trong bảng dùng chung một đường sinh.
 """
 from __future__ import annotations
 
@@ -32,8 +34,8 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         return Gemma3RecombRunner(cfg, mcfg, tracker)
     raise ValueError(
         f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
-        f"'gemma3_recomb' (khoá `base.runner` trong configs/recomb.yaml; "
-        f"candidate B tự chuyển sang gemma3_recomb qua cờ `recomb` của arm).")
+        f"'gemma3_recomb' (khoá `base.runner` trong configs/recombiner.yaml; "
+        f"§2.3 đặt thẳng 'gemma3_recomb' cho cả hai candidate).")
 
 
 __all__ = ["build", "Runner"]

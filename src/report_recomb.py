@@ -4,9 +4,9 @@ Báo cáo này có một việc mà báo cáo §2.2 không có: nói rõ **kết
 thuộc loại nào**. Với hai candidate và n = 3000, "không khác biệt" có ba nguyên
 nhân hoàn toàn khác nhau và chúng đòi ba hành động khác nhau:
 
-  1. `gate` hội tụ về ~0 -> decoder chưa bao giờ thật sự nhận k token. Đây là
+  1. `gate` hội tụ về ~0 -> decoder chưa bao giờ thật sự nhận 32 token. Đây là
      kết luận về QUÁ TRÌNH HUẤN LUYỆN, không phải về đặc trưng SigLIP.
-  2. `cls_f1_pos` ở mức đoán bừa -> nhánh Recombiner chưa học được gì mang
+  2. `cls_f1_pos` ở mức đoán bừa -> nhánh Recombinator chưa học được gì mang
      thông tin bệnh lý, dù gate có mở. Cũng là kết luận về quá trình.
   3. gate mở, cls_f1_pos khá, mà điểm sinh văn bản vẫn không nhích -> ĐÂY mới là
      kết luận về đặc trưng SigLIP, và nó là một kết quả thật.
@@ -88,7 +88,7 @@ def diagnosis(train_stats: list[dict], arm_b: str) -> tuple[str, list[str]]:
     if gate is not None and abs(float(gate)) < GATE_FLOOR:
         label = "gate_closed"
         warns.append(
-            f"**gate = {float(gate):+.4f}**, gần 0. Cổng nhân vào k token gần như "
+            f"**gate = {float(gate):+.4f}**, gần 0. Cổng nhân vào 32 token gần như "
             f"đóng, nên decoder hầu như không nhận đặc trưng SigLIP. Mọi kết luận "
             f"'không khác biệt' bên dưới là kết luận về QUÁ TRÌNH HUẤN LUYỆN, "
             f"không phải về đặc trưng SigLIP. Xem README_2.3 mục 5.")
@@ -97,8 +97,8 @@ def diagnosis(train_stats: list[dict], arm_b: str) -> tuple[str, list[str]]:
             label = "head_untrained"
         warns.append(
             f"**cls_f1_pos = {float(f1):.4f}**, ở mức đoán bừa. Head phân loại "
-            f"không đọc được bệnh lý từ k token, nên ràng buộc gradient đã không "
-            f"làm việc của nó và nhánh Recombiner có thể chưa học gì mang thông "
+            f"không đọc được bệnh lý từ 32 token, nên ràng buộc gradient đã không "
+            f"làm việc của nó và nhánh Recombinator có thể chưa học gì mang thông "
             f"tin. Kiểm nhãn trước: `python -m src.labels_cls --check-split`.")
     return label, warns
 
@@ -112,8 +112,12 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     if primary not in metrics and metrics:
         primary = metrics[0]
     arms = [dict(a) for a in cfg["arms"] if a.get("enabled", True)]
-    a_id = next((a["id"] for a in arms if not a.get("recombiner")), None)
-    b_id = next((a["id"] for a in arms if a.get("recombiner")), None)
+    # Chấp cả hai tên khoá: `recomb` (chuẩn) và `recombiner` (config đời trước).
+    def _is_b(a: dict) -> bool:
+        return bool(a.get("recomb", a.get("recombiner", False)))
+
+    a_id = next((a["id"] for a in arms if not _is_b(a)), None)
+    b_id = next((a["id"] for a in arms if _is_b(a)), None)
     st_a, st_b = _stat(train_stats, a_id), _stat(train_stats, b_id)
     alpha = float(cfg["stats"].get("alpha", 0.05))
     dz_floor = float(cfg["stats"].get("dz_floor", 0.10))
@@ -133,7 +137,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     if not prow.empty:
         r = prow.iloc[0]
-        verdict = ("candidate CÓ nhánh Recombiner cao hơn"
+        verdict = ("candidate CÓ nhánh Recombinator cao hơn"
                    if r["diff"] > 0 else "candidate CHỈ emb_vec cao hơn")
         if bool(r["significant_and_material"]):
             A(f"Trên metric chính **{primary}**: {verdict}, "
@@ -188,52 +192,57 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## 1. Cấu hình đã chạy")
     A("")
     rec = dict(cfg.get("recombiner", {}) or {})
-    hq = dict(rec.get("heads_qformer", {}) or {})
-    dq = dict(rec.get("decoder_qformer", {}) or {})
+    qf = dict(rec.get("qformer", {}) or {})
     ccfg = dict(cfg.get("classifier", {}) or {})
-    side = st_b.get("sidecar_params", {}) or {}
+    # Hình dạng nhánh đọc từ train_stats của lần chạy THẬT, không từ config hiện
+    # tại: config có thể đã bị sửa sau khi huấn luyện, và một bảng "Cấu hình đã
+    # chạy" mô tả cấu hình KHÔNG chạy là thứ tệ hơn không có bảng.
+    side = st_b.get("branch_params", {}) or {}
     rows = [
         ["Base", f"`{cfg['base']['hf_id']}` · NF4 4-bit"],
         ["Preset LoRA", f"`{st_b.get('lora_preset') or st_a.get('lora_preset') or cfg['lora'].get('preset')}`"
                         f" — {st_b.get('method') or '?'} r={st_b.get('rank') or '?'} "
                         f"alpha={st_b.get('alpha') or '?'} "
-                        f"(một trong tám biến thể của §2.2)"],
+                        f"(một trong các biến thể đã đo ở §2.2)"],
         ["Adapter gắn vào", "`" + " · ".join(cfg["train"]["target_modules"]) + "`"
                             " của khối ngôn ngữ"],
-        ["Recombiner", f"SwiGLU({rec.get('siglip_dim', 1152)} → "
-                       f"{rec.get('swiglu_hidden', 4096)} → "
-                       f"{rec.get('out_dim') or 'hidden của decoder'})"],
-        ["QFormer #1 `heads`", f"task {side.get('head_tasks') or hq.get('tasks')} "
-                              f"— **1 vector mỗi task, self-attn TẮT CỨNG** · "
-                              f"đóng băng {side.get('frozen_tasks') or hq.get('freeze')} "
-                              f"· {hq.get('n_layers', 1)} lớp · ffn×{hq.get('ffn_mult', 1)}"],
-        ["QFormer #2 `decoder`", f"k = {side.get('n_query_decoder') or dq.get('n_query')} "
-                                f"token · {dq.get('n_layers', 2)} lớp · "
-                                f"{dq.get('n_heads', 8)} head · "
-                                f"ffn×{dq.get('ffn_mult', 2)} · self-attn "
-                                f"{'bật' if dq.get('self_attn', True) else 'tắt'}"],
-        ["Điểm neo của ASLoss", "**Recombiner** (điểm chung duy nhất của hai "
-                                "QFormer) — KHÔNG phải chính những token nối vào"],
-        ["Chèn ở đâu", f"ngay TRƯỚC 256 token ảnh · token_type = "
-                       f"`{rec.get('token_type', 'image')}`"],
-        ["Thang của k token", ("lấy từ RMS của 256 token ảnh trong chính batch "
-                               "(`match_scale`)") if rec.get("match_scale", True)
-                              else "**không khớp thang** (`match_scale: false`)"],
-        ["Cổng (gate)", f"khởi tạo {cfg['train'].get('sidecar_gate_init')} · lr "
-                        f"×{cfg['train'].get('gate_lr_mult')} so với LoRA · cuối "
-                        f"lần chạy = {_sf(st_b.get('gate_final'), 4) if st_b.get('gate_final') is not None else '—'}"],
+        ["Recombinator", f"SwiGLU({rec.get('siglip_dim', 1152)} → "
+                         f"{rec.get('swiglu_hidden', 2560)} → "
+                         f"{rec.get('out_dim') or 'hidden của decoder'}) → RMSNorm "
+                         f"→ TokenPool(4096 → {side.get('n_query') or rec.get('n_query', 32)}) "
+                         f"→ MHA({rec.get('n_heads', 8)} head) ⊕ skip → RMSNorm"],
+        ["QFormer", f"**{len(side.get('qformer_tasks') or qf.get('tasks') or [])} "
+                    f"vector** — task {side.get('qformer_tasks') or qf.get('tasks')}, "
+                    f"1 vector mỗi task, **self-attn TẮT CỨNG** · đóng băng "
+                    f"{side.get('qformer_frozen') or qf.get('freeze')} · "
+                    f"{qf.get('n_layers', 1)} lớp · {qf.get('n_heads', 8)} head · "
+                    f"ffn×{qf.get('ffn_mult', 2)}"],
+        ["Route_Gate (`vec_2`)", "**BẤT HOẠT ở §2.3** — dựng để hình dạng "
+                                 "checkpoint khớp mục MoE, nhưng query đóng băng, "
+                                 "đầu ra detach, không Aux Loss, không định tuyến"],
+        ["Điểm neo của ASL", "đầu ra **Recombinator** (qua QFormer `vec_1`) — "
+                             "KHÔNG phải chính những token nối vào decoder, và "
+                             "lấy TRƯỚC cổng nên ASL có gradient đầy đủ từ bước 0"],
+        ["Chèn ở đâu", f"ngay TRƯỚC 256 token ảnh · "
+                       f"{side.get('n_query') or rec.get('n_query', 32)} token · "
+                       f"token_type = `{st_b.get('token_type') or rec.get('token_type', 'text')}`"],
+        ["Cổng (gate)", f"khởi tạo {rec.get('gate_init', 0.0)} · lr "
+                        f"×{st_b.get('gate_lr_mult') or cfg['train'].get('gate_lr_mult')} "
+                        f"so với LoRA · cuối lần chạy = "
+                        f"{_sf(st_b.get('gate_final'), 4) if st_b.get('gate_final') is not None else '—'}"],
         ["Head phân loại", (f"ASL(γ⁻={ccfg.get('asl', {}).get('gamma_neg')}, "
                             f"γ⁺={ccfg.get('asl', {}).get('gamma_pos')}, "
                             f"clip={ccfg.get('asl', {}).get('clip')}) · "
-                            f"λ = {st_b.get('lambda_asl')} · "
+                            f"λ = {st_b.get('lambda_sup')} "
+                            f"(warmup {st_b.get('lambda_warmup_pct')}) · "
                             f"chỉ ràng buộc gradient, decoder KHÔNG nhận logit")
                            if ccfg.get("enabled", True) else "TẮT"],
         ["Tham số nhánh", f"{side.get('total', 0):,} "
-                          f"({side.get('trainable', 0):,} học được) — recombiner "
-                          f"{side.get('recombiner', 0):,} · qformer_heads "
-                          f"{side.get('qformer_heads', 0):,} · qformer_decoder "
-                          f"{side.get('qformer_decoder', 0):,} · head "
-                          f"{side.get('classifier', 0):,}"],
+                          f"({side.get('trainable', 0):,} học được) — recombinator "
+                          f"{side.get('recombinator', 0):,} · qformer "
+                          f"{side.get('qformer', 0):,} · cls_head "
+                          f"{side.get('cls_head', 0):,} · route_gate "
+                          f"{side.get('route_gate', 0):,}"],
         ["Tham số LoRA", f"{st_b.get('trainable_params', 0):,} "
                          f"(candidate A: {st_a.get('trainable_params', 0):,})"],
         ["Huấn luyện", f"{st_b.get('n_train', '?')} mẫu · batch "
@@ -305,7 +314,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
         A(_tbl(heads, rows))
         A("")
         A(f"`A` = {names.get(a_id, a_id)} · `B` = {names.get(b_id, b_id)}. "
-          f"Hiệu số là **B − A**, nên dấu dương nghĩa là nhánh Recombiner cao "
+          f"Hiệu số là **B − A**, nên dấu dương nghĩa là nhánh Recombinator cao "
           f"điểm hơn. `thắng/hoà/thua` đếm theo ảnh, từ góc nhìn của B.")
         A("")
         if pw.attrs.get("underpowered"):
@@ -331,7 +340,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     A("**`thắng/hoà/thua` là chỗ đọc số ô HOÀ.** Nhiều ảnh hoà tuyệt đối nghĩa "
       "là hai candidate sinh ra văn bản giống hệt nhau trên những ảnh đó. Ở §2.3 "
-      "đó là dấu hiệu trực tiếp của ca `gate ≈ 0`: k token không đổi được gì thì "
+      "đó là dấu hiệu trực tiếp của ca `gate ≈ 0`: 32 token không đổi được gì thì "
       "greedy decode cho ra đúng cùng một chuỗi.")
     A("")
     A("**Thiết kế này KHÔNG khớp số tham số.** Nó so \"LoRA một mình\" với "
@@ -390,7 +399,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       "bảng mà tránh được nó.")
     A("- **Không khớp số tham số** — xem mục 4.")
     A(f"- **Một cấu hình LoRA duy nhất** (`{st_b.get('lora_preset') or cfg['lora'].get('preset')}`). "
-      "Hiệu quả của nhánh Recombiner có thể phụ thuộc vào rank: ở rank thấp LoRA "
+      "Hiệu quả của nhánh Recombinator có thể phụ thuộc vào rank: ở rank thấp LoRA "
       "thiếu sức nên nhánh thêm dễ giúp hơn, ở rank cao thì khó hơn. Bảng này "
       "nói về đúng một điểm trên trục đó.")
     A("- **`λ` của ASLoss không được tinh chỉnh.** Nó là một siêu tham số của "
@@ -403,7 +412,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("- **BLEU/ROUGE/BERTScore không đo đúng/sai lâm sàng.** Một báo cáo đảo "
       "ngược kết luận (`no pneumothorax` → `pneumothorax`) gần như không bị "
       "phạt. Giới hạn này thừa hưởng nguyên từ §2.1, và ở §2.3 nó cắn mạnh hơn: "
-      "nhánh Recombiner được thiết kế để mang thông tin BỆNH LÝ, tức là đúng "
+      "nhánh Recombinator được thiết kế để mang thông tin BỆNH LÝ, tức là đúng "
       "thứ mà ba metric này đo kém nhất.")
     A("")
     if manifest.get("arms_missing"):
