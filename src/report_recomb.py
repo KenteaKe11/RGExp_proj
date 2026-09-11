@@ -67,6 +67,59 @@ def _tbl(headers: list[str], rows: list[list[str]]) -> str:
                      + ["| " + " | ".join(r) + " |" for r in rows])
 
 
+def normalize_pw(pw: pd.DataFrame) -> pd.DataFrame:
+    """Bảng kiểm định về MỘT schema, bất kể ai đã ghi ra nó.
+
+    `stats_ab` gọi hiệu số là `mean_diff` và kết luận là `winner`; `stats_friedman`
+    gọi đúng hai đại lượng ấy là `diff` và `better`. Bảng này đọc được cả hai —
+    và, quan trọng hơn, đọc được **file `ab_tests.csv` của những lần chạy trước**,
+    thứ đã nằm sẵn trên đĩa và không có các cột mới.
+
+    Đó không phải chuyện thẩm mỹ: stage `report` chạy SAU cùng, sau nhiều giờ
+    GPU, và một `KeyError` ở đây vứt đi toàn bộ lần chạy. Hàm này biến ca ấy
+    thành một cột "—".
+    """
+    if pw is None or pw.empty:
+        return pd.DataFrame() if pw is None else pw
+    df = pw.copy()
+
+    if "diff" not in df.columns:
+        df["diff"] = df["mean_diff"] if "mean_diff" in df.columns else np.nan
+    if "mean_diff" not in df.columns:
+        df["mean_diff"] = df["diff"]
+    if "better" not in df.columns:
+        df["better"] = df["winner"] if "winner" in df.columns else "—"
+
+    # Đếm thắng/hoà/thua. Nếu lần chạy cũ chỉ ghi TỈ LỆ (`win_rate_b`) thì suy
+    # ngược ra số đếm — làm tròn, nhưng vẫn đúng thứ nó dùng để đọc: bao nhiêu
+    # ảnh hoà tuyệt đối.
+    n = df["n"] if "n" in df.columns else pd.Series(0, index=df.index)
+    if "tie" not in df.columns:
+        df["tie"] = df["n_tied"] if "n_tied" in df.columns else 0
+    if "win_b" not in df.columns:
+        df["win_b"] = ((df["win_rate_b"] * n).round()
+                       if "win_rate_b" in df.columns else 0)
+    if "win_a" not in df.columns:
+        df["win_a"] = (n - df["win_b"] - df["tie"]).clip(lower=0)
+    for c in ("win_b", "win_a", "tie"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    if "ci_excludes_zero" not in df.columns:
+        if {"ci_lo", "ci_hi"} <= set(df.columns):
+            df["ci_excludes_zero"] = (df["ci_lo"] > 0) | (df["ci_hi"] < 0)
+        else:
+            df["ci_excludes_zero"] = False
+    for c, default in (("significant", False), ("material", False),
+                       ("significant_and_material", False)):
+        if c not in df.columns:
+            df[c] = default
+    for c in ("ci_lo", "ci_hi", "p_perm", "p_perm_holm", "p_boot", "cohen_dz",
+              "mean_a", "mean_b"):
+        if c not in df.columns:
+            df[c] = np.nan
+    return df
+
+
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
                   metrics: list[str], primary: str) -> pd.DataFrame:
     rows = []
@@ -128,6 +181,7 @@ def diagnosis(train_stats: list[dict], arm_b: str) -> tuple[str, list[str]]:
 def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                    train_stats: list[dict], names: dict[str, str],
                    manifest: dict) -> str:
+    pw = normalize_pw(pw)
     metrics = [c for c in summary.columns
                if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")]
     primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
@@ -461,11 +515,15 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
 
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
+    if not scores:
+        raise ValueError("không có bảng điểm nào — chạy lại stage `score` "
+                         "(hoặc kiểm `runs/<run>/metrics/per_sample_*.csv`).")
     metrics = metric_columns(next(iter(scores.values())))
     primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
     if primary not in metrics and metrics:
         primary = metrics[0]
 
+    pw = normalize_pw(pw)
     summary = summary_table(scores, names, metrics, primary)
     summary.to_csv(mdir / "summary.csv", index=False)
     if not pw.empty:

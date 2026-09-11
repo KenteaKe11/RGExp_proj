@@ -6,7 +6,17 @@
     python -m src.run_recomb --exp 2.4 --stages stats,report
     python -m src.run_recomb --exp 2.3 --arms lora_recomb
 
-Mọi stage resume được.
+Mọi stage resume được, và lần chạy lại NÓI RA nó đọc lại được những gì: ngay
+sau dòng `run dir` là một bảng trạng thái đọc từ đĩa (adapter đã có chưa, đã
+sinh bao nhiêu ảnh, đã chấm chưa, đã có ab_tests/REPORT chưa). Candidate nào đã
+có `adapter_model.safetensors` + `train_stats.json` (+ file nhánh) thì KHÔNG
+huấn luyện lại — và nếu MỌI candidate đều thế thì cả việc chuẩn bị tập train
+(tải + resize 6400 ảnh) cũng bị bỏ qua, không chỉ vòng huấn luyện. `--retrain`
+/ `--rescore` để làm lại.
+
+Mã thoát 7 = "kết quả còn nguyên, chỉ stage `report` hỏng": adapter, dự đoán,
+`per_sample_*.csv` và `ab_tests.csv` đã ghi xong trước đó, nên chạy lại
+`--stages report` là đủ.
 
 ── HAI THÍ NGHIỆM, MỘT ĐƯỜNG CODE ──────────────────────────────────────────
 Khác nhau đúng ba chỗ, và cả ba đều hiện ra trong file này:
@@ -85,6 +95,80 @@ def _read_preds(path: Path) -> dict[str, str]:
                 continue
             out[r["key"]] = r.get("pred", "")
     return out
+
+
+def _count_preds(path: Path) -> int:
+    """Số dòng JSON đọc được trong file dự đoán (0 nếu chưa có).
+
+    Đếm bằng cách thử parse từng dòng chứ không đếm `\\n`: file bị Ctrl-C cắt
+    giữa lúc ghi có dòng cuối cụt, và nói dối về số mẫu đã sinh là cách chắc
+    chắn nhất để bỏ qua stage `infer` khi nó chưa xong.
+    """
+    if not path.exists():
+        return 0
+    n = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+            except Exception:
+                continue
+            n += 1
+    return n
+
+
+def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path,
+                is_moe: bool) -> dict:
+    """Cái gì đã nằm sẵn trên đĩa — đọc TRƯỚC khi tiêu một giây GPU nào.
+
+    Mọi stage ở đây vốn đã resume được, nhưng chúng resume LẶNG LẼ và mỗi stage
+    theo cách riêng: train nhìn `adapter_model.safetensors`, infer nhìn file
+    `.jsonl`, score nhìn `per_sample_*.csv`. Khi một lần chạy dài bị đứt ở stage
+    cuối, câu hỏi đầu tiên là "chạy lại có phải train lại không" — và trả lời nó
+    bằng cách đọc ba chỗ khác nhau trong log là lý do người ta chạy lại từ đầu
+    cho chắc. Bảng này trả lời câu ấy ở giây thứ nhất.
+    """
+    # Import MUỘN và có đường lui: `train_recomb` kéo theo torch/peft/bitsandbytes.
+    # Một lần chạy `--stages report` trên máy không GPU vẫn phải đọc được cache,
+    # và nó không cần biết adapter có đủ file hay không.
+    try:
+        from . import train_recomb as tr_mod
+
+        _trained = tr_mod.already_trained
+    except Exception:
+        def _trained(d, needs_branch=False, needs_experts=False) -> bool:
+            return (Path(d) / "train_stats.json").exists()
+
+    mdir = run_dir / "metrics"
+    st = {"arms": {}, "ab_tests": (mdir / "ab_tests.csv").exists(),
+          "friedman": (mdir / "friedman.csv").exists(),
+          "posthoc": (mdir / "posthoc.csv").exists(),
+          "report": (run_dir / "REPORT.md").exists()}
+    for arm in arms:
+        aid = arm["id"]
+        st["arms"][aid] = {
+            "trained": bool(_trained(adapter_root / aid,
+                                     bool(arm.get("recomb")), is_moe)),
+            "n_preds": _count_preds(run_dir / "predictions" / f"{aid}.jsonl"),
+            "scored": (mdir / f"per_sample_{aid}.csv").exists(),
+        }
+    return st
+
+
+def print_cache_state(st: dict, names: dict[str, str], n_test: int | None) -> None:
+    print("⚙ trạng thái đọc lại từ cache:", flush=True)
+    for aid, s in st["arms"].items():
+        tot = f"/{n_test}" if n_test else ""
+        print(f"    {names.get(aid, aid):<34} "
+              f"train {'✓' if s['trained'] else '—'} · "
+              f"sinh {s['n_preds']}{tot} · "
+              f"điểm {'✓' if s['scored'] else '—'}", flush=True)
+    flags = [k for k in ("ab_tests", "friedman", "posthoc", "report") if st.get(k)]
+    print(f"    đã có sẵn: {', '.join(flags) if flags else '(chưa có gì)'}"
+          f"  ·  --retrain / --rescore để làm lại", flush=True)
 
 
 def _env_info() -> dict:
@@ -336,6 +420,33 @@ def main(argv: list[str] | None = None) -> int:
               flush=True)
     print(f"⚙ run dir: {run_dir}\n⚙ adapters: {adapter_root}", flush=True)
 
+    # ── Trạng thái từ những lần chạy trước ─────────────────────────────────
+    # Đọc đĩa TRƯỚC mọi thứ tốn kém. `arms_to_train` quyết định hai việc, và cả
+    # hai đều đắt: có phải chuẩn bị (tải + resize) tập train hay không, và có
+    # phải dựng nhãn phân loại hay không. Cũ hơn, hai việc ấy chạy chỉ vì
+    # `"train" in stages` — nghĩa là một lần chạy lại chỉ để in báo cáo vẫn trả
+    # tiền cho 6400 ảnh, dù không candidate nào cần huấn luyện lại.
+    arms_to_train: list[dict] = []
+    cache: dict = {}
+    try:
+        cache = cache_state(arms, adapter_root, run_dir, is_moe)
+        print_cache_state(cache, names, int(cfg["data"].get("n_test") or 0) or None)
+        manifest["cache_at_start"] = cache
+    except Exception as e:  # đọc cache KHÔNG được phép làm hỏng lần chạy
+        print(f"⚠ không đọc được trạng thái cache ({e!r}) — coi như chưa có gì",
+              flush=True)
+    if "train" in stages:
+        if a.retrain or not cache:
+            arms_to_train = list(arms)
+        else:
+            arms_to_train = [x for x in arms
+                             if not cache["arms"].get(x["id"], {}).get("trained")]
+        if not arms_to_train:
+            print("⚙ mọi candidate đã có adapter + train_stats.json — BỎ QUA "
+                  "stage train và cả việc chuẩn bị tập train (--retrain để làm lại)",
+                  flush=True)
+    need_train_run = bool(arms_to_train)
+
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
@@ -352,8 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     # phát hiện ra ở giây thứ 30 rẻ hơn nhiều so với ở giờ thứ hai của stage
     # train — và ca tệ nhất không phải lỗi mà là nhãn lệch âm thầm.
     cls_pack = None
-    need_b = any(x.get("recomb") for x in arms)
-    if need_b and ("train" in stages):
+    need_b = any(x.get("recomb") for x in arms_to_train)
+    if need_b and need_train_run:
         from . import labels_cls
 
         _hr("Nhãn phân loại (ClsHead)")
@@ -379,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     train_df = val_df = None
     if "data" in stages:
         test_df = data_mod.prepare(cfg, tracker)
-        if "train" in stages:
+        if need_train_run:
             try:
                 train_df, val_df = dt_mod.prepare_train(cfg, test_df, tracker)
             except dt_mod.DataLeak as e:
@@ -394,8 +505,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
-    if "train" in stages:
-        _hr(f"Huấn luyện {len(arms)} candidate — "
+    if need_train_run:
+        _hr(f"Huấn luyện {len(arms_to_train)}/{len(arms)} candidate — "
             + ("candidate NẶNG nhất (E lớn nhất) TRƯỚC" if is_moe
                else "candidate B TRƯỚC"))
         from . import train_recomb as tr_mod
@@ -717,23 +828,56 @@ def main(argv: list[str] | None = None) -> int:
     if "report" in stages:
         _hr("Báo cáo")
         manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
-        if is_moe:
-            from . import report_moe
+        # Stage CUỐI, sau nhiều giờ GPU, và nó chỉ định dạng lại những con số đã
+        # nằm trên đĩa. Một lỗi ở đây (tên cột lệch, một khoá thiếu trong
+        # train_stats) không được phép là lý do vứt cả lần chạy: mọi thứ đắt tiền
+        # — adapter, predictions, per_sample_*.csv, ab_tests.csv — đã ghi xong
+        # trước dòng này. Nên lỗi được ghi lại, in ra, và lần chạy kết thúc bằng
+        # một mã lỗi RIÊNG (7) nghĩa là "kết quả còn nguyên, chỉ báo cáo hỏng":
+        # chạy lại `--stages report` là đủ, không phải train lại.
+        report_err = None
+        try:
+            if is_moe:
+                from . import report_moe
 
-            report_moe.write_all(cfg, run_dir, scores, names, fr, ab,
-                                 train_stats, manifest, arms=arms)
-        else:
-            from . import report_recomb
+                report_moe.write_all(cfg, run_dir, scores, names, fr, ab,
+                                     train_stats, manifest, arms=arms)
+            else:
+                from . import report_recomb
 
-            # `report_recomb.build_markdown` tự suy A/B từ cờ `recomb` trong
-            # config — truyền thêm arm_a/arm_b vào đây là một TypeError, và nó
-            # nổ ở stage CUỐI, sau khi đã trả xong tiền GPU.
-            report_recomb.write_all(cfg, run_dir, scores, names, ab, train_stats,
-                                    manifest)
+                # `report_recomb.build_markdown` tự suy A/B từ cờ `recomb` trong
+                # config — truyền thêm arm_a/arm_b vào đây là một TypeError, và nó
+                # nổ ở stage CUỐI, sau khi đã trả xong tiền GPU.
+                report_recomb.write_all(cfg, run_dir, scores, names, ab,
+                                        train_stats, manifest)
+        except Exception as e:
+            import traceback
+
+            report_err = traceback.format_exc()
+            print(f"\n✗ stage `report` hỏng: {e!r}", flush=True)
+            print(report_err, flush=True)
+            print("→ KẾT QUẢ VẪN CÒN NGUYÊN trên đĩa:\n"
+                  f"    adapters      : {adapter_root}\n"
+                  f"    predictions   : {run_dir / 'predictions'}\n"
+                  f"    điểm mỗi ảnh  : {mdir}/per_sample_*.csv\n"
+                  f"    kiểm định     : {ab_path if not is_moe else ph_path}\n"
+                  f"  Sửa rồi chạy lại MỘT MÌNH stage báo cáo — không train lại:\n"
+                  f"    python -m src.run_recomb --exp {exp} --stages report",
+                  flush=True)
+            manifest["report_error"] = report_err.splitlines()[-1]
+            tracker.alert(f"§{exp}: báo cáo hỏng (kết quả vẫn còn)",
+                          report_err[-1500:], "ERROR")
+            (run_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8")
         s = mdir / "summary.csv"
         if s.exists():
             tracker.table("results/summary", pd.read_csv(s))
-        tracker.save_file(run_dir / "REPORT.md")
+        if (run_dir / "REPORT.md").exists():
+            tracker.save_file(run_dir / "REPORT.md")
+        if report_err:
+            tracker.finish(1)
+            return 7
 
     # ── push ────────────────────────────────────────────────────────────────
     if "push" in stages and cfg["output"].get("push", True):

@@ -325,6 +325,12 @@ def compare_all(scores: dict[str, pd.DataFrame], metrics: list[str],
             "cohen_dz": dz,
             "win_rate_b": float(np.mean(d > 0)),
             "n_tied": n_tie, "frac_tied": n_tie / max(1, d.size),
+            # Đếm THEO ẢNH, không phải tỉ lệ. Ô hoà là chỗ đọc ca `gate ≈ 0`
+            # (hai candidate sinh ra đúng cùng một chuỗi), nên nó phải là một
+            # con số đếm được chứ không phải một tỉ lệ đã làm tròn.
+            "win_b": int(np.count_nonzero(d > 0)),
+            "win_a": int(np.count_nonzero(d < 0)),
+            "tie": n_tie,
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -346,6 +352,18 @@ def compare_all(scores: dict[str, pd.DataFrame], metrics: list[str],
     df["dz_warning"] = [materiality_warning(int(r.n), float(r.cohen_dz), dz_floor)
                         if bool(r.significant) else None
                         for r in df.itertuples(index=False)]
+
+    # CI có loại 0 ra không — câu hỏi này KHÁC câu "p có nhỏ không", và §2.3 đọc
+    # nó riêng (mục 4 của REPORT.md). Tính ở đây một lần thay vì để mỗi nơi đọc
+    # bảng tự suy từ ci_lo/ci_hi theo một quy ước riêng.
+    df["ci_excludes_zero"] = (df["ci_lo"] > 0) | (df["ci_hi"] < 0)
+
+    # Bí danh cho §2.4 (`stats_friedman` gọi cùng đại lượng là `diff`/`better`).
+    # Hai module thống kê đặt tên khác nhau cho cùng một cột là đủ để stage
+    # `report` — stage CUỐI, sau khi đã trả xong tiền GPU — chết vì KeyError.
+    # Giữ cả hai tên nên bảng đọc được từ cả hai phía, và CSV cũ vẫn hợp lệ.
+    df["diff"] = df["mean_diff"]
+    df["better"] = df["winner"]
     return df
 
 
