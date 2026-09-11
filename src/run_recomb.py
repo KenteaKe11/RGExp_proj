@@ -14,9 +14,10 @@ huấn luyện lại — và nếu MỌI candidate đều thế thì cả việc
 (tải + resize 6400 ảnh) cũng bị bỏ qua, không chỉ vòng huấn luyện. `--retrain`
 / `--rescore` để làm lại.
 
-Mã thoát 7 = "kết quả còn nguyên, chỉ stage `report` hỏng": adapter, dự đoán,
-`per_sample_*.csv` và `ab_tests.csv` đã ghi xong trước đó, nên chạy lại
-`--stages report` là đủ.
+Hai mã thoát nghĩa là "kết quả còn nguyên, chỉ bước cuối hỏng" — adapter, dự
+đoán, `per_sample_*.csv` và `ab_tests.csv` đều đã ghi xong trước đó:
+    7 = stage `report` hỏng  -> chạy lại `--stages report`
+    8 = bước đẩy Hub hỏng    -> chạy lại `--stages push`
 
 ── HAI THÍ NGHIỆM, MỘT ĐƯỜNG CODE ──────────────────────────────────────────
 Khác nhau đúng ba chỗ, và cả ba đều hiện ra trong file này:
@@ -880,14 +881,31 @@ def main(argv: list[str] | None = None) -> int:
             return 7
 
     # ── push ────────────────────────────────────────────────────────────────
+    push_err = None
     if "push" in stages and cfg["output"].get("push", True):
         _hr("Đẩy lên Hugging Face")
         from .push import push_results
 
-        url = push_results(cfg, run_dir)
-        if url:
-            manifest["hub_url"] = url
-            tracker.summary({"run/hub_url": url})
+        # Cùng lý do với stage `report`: đây là bước CUỐI, nó chỉ chuyển những
+        # file đã có trên đĩa đi nơi khác, và nó phụ thuộc vào hai thứ nằm ngoài
+        # tầm với của lần chạy — mạng và quyền của token. Một 401 ở phút thứ 700
+        # không được phép biến cả lần chạy thành thất bại.
+        try:
+            url = push_results(cfg, run_dir)
+            if url:
+                manifest["hub_url"] = url
+                tracker.summary({"run/hub_url": url})
+        except Exception as e:
+            import traceback
+
+            push_err = traceback.format_exc()
+            print(f"\n✗ đẩy lên Hub hỏng: {e}", flush=True)
+            print(f"→ Kết quả vẫn nằm nguyên ở {run_dir}. Đẩy lại RIÊNG bước này:\n"
+                  f"    python -m src.run_recomb --exp {exp} --stages push",
+                  flush=True)
+            manifest["push_error"] = str(e)
+            tracker.alert(f"§{exp}: đẩy Hub hỏng (kết quả vẫn còn)",
+                          push_err[-1500:], "ERROR")
 
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
@@ -896,12 +914,16 @@ def main(argv: list[str] | None = None) -> int:
     tracker.alert(f"§{exp} chạy xong",
                   f"run={run_id} · {manifest.get('n_eval')} ảnh · {mins:.0f} phút\n"
                   f"{manifest.get('headline', '')}")
-    tracker.finish(0)
+    tracker.finish(1 if push_err else 0)
     print(f"\n✓ HOÀN TẤT sau {mins:.1f} phút", flush=True)
     print(f"  báo cáo : {run_dir / 'REPORT.md'}", flush=True)
+    if manifest.get("hub_url"):
+        print(f"  Hub     : {manifest['hub_url']}", flush=True)
     if tracker.url:
         print(f"  W&B     : {tracker.url}", flush=True)
-    return 0
+    # Mã 8 = "mọi thứ xong, chỉ bước đẩy hỏng" — phân biệt với 7 (báo cáo hỏng)
+    # và với 0, để một script gọi tự động biết có cần đẩy lại hay không.
+    return 8 if push_err else 0
 
 
 if __name__ == "__main__":
