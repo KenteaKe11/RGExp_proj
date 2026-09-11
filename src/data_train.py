@@ -76,20 +76,29 @@ def check_leak(train_keys: list[str], test_keys: list[str]) -> set[str]:
     return set(train_keys) & set(test_keys)
 
 
-def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None
+def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None, *,
+                  n_train: int | None = None, name: str = "trainset",
+                  val_name: str = "valset"
                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Trả (train_df, val_df), mỗi bảng [key, ref, image_path].
 
     `test_df` phải là tập test ĐÃ chuẩn bị — nó là thứ dùng để kiểm rò rỉ, nên
     truyền vào chứ không đọc lại: đọc lại thì có thể đọc phải một phiên bản
     khác của split và phép kiểm mất ý nghĩa.
+
+    `n_train` / `name` cho chế độ `sup_pretrain`, vốn chạy trên NHIỀU dữ liệu
+    hơn §2.3 (thường là toàn bộ split). Hai tập phải nằm ở HAI file manifest:
+    dùng chung `trainset.jsonl` nghĩa là một lần chạy pretrain lặng lẽ đổi tập
+    huấn luyện của §2.3 từ 6400 mẫu thành toàn bộ split, và bảng A/B của §2.3
+    khi đó không so được với lần chạy trước — mà không có dòng log nào nói vậy.
     """
     d = cfg.data
     cache_root = Path(d.get("cache_dir", "./data")).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    print("═══ Dữ liệu huấn luyện ═══", flush=True)
-    train_keys = _read_split(cfg, d["train_split_csv"], int(d.get("n_train", 0) or 0), "train")
+    n_train = int(d.get("n_train", 0) or 0) if n_train is None else int(n_train)
+    print(f"═══ Dữ liệu huấn luyện ({name}) ═══", flush=True)
+    train_keys = _read_split(cfg, d["train_split_csv"], n_train, "train")
 
     # ── Hàng rào rò rỉ, TRƯỚC khi tải một byte ảnh nào ──────────────────────
     overlap = check_leak(train_keys, test_df["key"].tolist())
@@ -123,10 +132,10 @@ def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None
         val_df = _attach_refs(cfg, val_keys, "val")
         val_df = data_mod.ensure_images(cfg, val_df, tracker)
 
-    for name, dfx in (("trainset", train_df), ("valset", val_df)):
+    for fname, dfx in ((name, train_df), (val_name, val_df)):
         if dfx.empty:
             continue
-        with open(cache_root / f"{name}.jsonl", "w", encoding="utf-8") as f:
+        with open(cache_root / f"{fname}.jsonl", "w", encoding="utf-8") as f:
             for r in dfx.itertuples(index=False):
                 f.write(json.dumps({"key": r.key, "ref": r.ref,
                                     "image_path": r.image_path},
@@ -135,13 +144,15 @@ def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None
     return train_df, val_df
 
 
-def load_train_manifest(cfg: Cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_train_manifest(cfg: Cfg, name: str = "trainset",
+                        val_name: str = "valset"
+                        ) -> tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(cfg.data.get("cache_dir", "./data"))
     out = []
-    for name in ("trainset", "valset"):
-        p = root / f"{name}.jsonl"
+    for i, fname in enumerate((name, val_name)):
+        p = root / f"{fname}.jsonl"
         if not p.exists():
-            if name == "trainset":
+            if i == 0:
                 raise FileNotFoundError(f"Chưa có {p} — chạy stage `data` trước.")
             out.append(pd.DataFrame(columns=["key", "ref", "image_path"]))
             continue

@@ -62,7 +62,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import imaging, labels_cls, moe as moe_mod, recombiner
+from . import (imaging, labels_cls, moe as moe_mod, pretrain_io, recombiner)
 from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
                        build_scheduler, collate, find_target_modules,
                        free_vram, is_oom, is_quantized, load_base,
@@ -340,9 +340,11 @@ def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
     return float(lam) * min(1.0, step / w)
 
 
-# ══ Optimizer: ba nhóm tham số ══════════════════════════════════════════════
-def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora"):
+# ══ Optimizer: ba (hoặc bốn) nhóm tham số ═══════════════════════════════════
+def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
+                    from_pretrain: bool = False):
     """AdamW với ba nhóm: adapter (LoRA hoặc Experts), thân nhánh, và `gate`.
+    Ở chế độ `decoder_ft` thì thân nhánh TÁCH LÀM ĐÔI — bốn nhóm.
 
     `gate` được tách ra vì AdamW CHUẨN HOÁ bước cập nhật: mỗi bước nó dịch một
     tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Với lr đỉnh 2e-4 và
@@ -353,24 +355,60 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora")
     `gate_lr_mult` nhân lr của riêng nhóm ấy lên. Điểm chính là cổng được PHÉP
     mở, không phải bị ÉP mở: `gate_final` trong train_stats.json là con số nói
     dữ liệu có muốn mở nó hay không, và nó phải vào báo cáo.
+
+    ── Nhóm thứ tư: `branch_pretrained` (chỉ ở decoder_ft) ──────────────────
+    Cùng một lập luận về AdamW, ngược chiều. Sau `sup_pretrain`, Recombinator +
+    QFormer + ClsHead đã nằm ở một cực tiểu của ASL. Ở bước 0 của decoder_ft,
+    CE là nguồn gradient MỚI và lớn (decoder chưa từng thấy 32 token này), và
+    AdamW dịch mọi tham số đi ~lr bất kể chúng đã hội tụ hay chưa. Với lr đỉnh
+    3e-4 dùng chung, vài chục bước đầu đủ để đẩy nhánh ra khỏi chỗ đã hội tụ —
+    và cái mất đi là toàn bộ thứ pretrain vừa mua. Triệu chứng: `cls_f1_pos`
+    tụt trong 10% đầu lịch rồi không quay lại, trong khi CE giảm bình thường và
+    không có gì trong log gọi tên chuyện đó.
+
+    `pretrained_lr_mult` (mặc định 0.1) áp ĐÚNG lên các khối có trong file
+    pretrain — danh sách đọc thẳng từ `pretrain_io.PRETRAINED_MODULES`, cùng
+    hằng số mà `save_pretrain` dùng, nên "hạ lr đúng phần đã pretrain" kiểm được
+    bằng cách đọc chứ không phải bằng cách tin.
+
+    Phần còn lại của nhánh (`route_gate`) vẫn còn TƯƠI ở decoder_ft — nó chưa
+    học gì — nên nó ở nhóm `branch` với lr đầy đủ. Gộp nó vào nhóm đã pretrain
+    là ép một khối ngẫu nhiên học ở 1/10 tốc độ, và ở §2.4 thì đó chính là
+    router.
     """
     import torch
 
     lora = [p for p in peft_model.parameters() if p.requires_grad]
-    body, gate = [], []
+    body, body_pre, gate = [], [], []
     if branch is not None:
         for n, p in branch.named_parameters():
             if not p.requires_grad:
                 continue
-            (gate if n == "gate" else body).append(p)
+            if n == "gate":
+                gate.append(p)
+            elif from_pretrain and n.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
+                body_pre.append(p)
+            else:
+                body.append(p)
 
     lr = float(tcfg["schedule"].get("max_lr", 2e-4))
     wd = float(tcfg.get("weight_decay", 0.0))
+    bwd = float(tcfg.get("branch_weight_decay", wd))
+    pre_mult = float(tcfg.get("pretrained_lr_mult", 0.1))
     groups = [{"params": lora, "lr": lr, "weight_decay": wd,
                "name": str(adapter_group)}]
+    if body_pre:
+        if not (0.0 < pre_mult <= 1.0):
+            raise TrainUnusable(
+                f"train.pretrained_lr_mult = {pre_mult} — phải nằm trong (0, 1].\n"
+                f"    > 1 là cho phần ĐÃ hội tụ chạy nhanh hơn phần chưa, tức là "
+                f"ngược hẳn lý do nhóm này tồn tại.\n"
+                f"    = 0 thì dùng `--freeze-pretrained` cho rõ ràng, đừng mã "
+                f"hoá 'đóng băng' thành một learning rate bằng 0.")
+        groups.append({"params": body_pre, "lr": lr * pre_mult,
+                       "weight_decay": bwd, "name": "branch_pretrained"})
     if body:
-        groups.append({"params": body, "lr": lr,
-                       "weight_decay": float(tcfg.get("branch_weight_decay", wd)),
+        groups.append({"params": body, "lr": lr, "weight_decay": bwd,
                        "name": "branch"})
     if gate:
         groups.append({"params": gate,
@@ -578,6 +616,18 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    # `pretrain_init` do `run_recomb` đặt vào cfg sau khi đã GIẢI QUYẾT `--init-from`
+    # (tải Hub về, kiểm hai file tồn tại) đúng MỘT lần cho cả lần chạy. Giải
+    # quyết lại ở đây, mỗi candidate một lần, là tải lại cùng một checkpoint N
+    # lần — và tệ hơn: nếu revision trên Hub đổi giữa hai candidate thì hai cột
+    # trong bảng đứng trên hai checkpoint khác nhau.
+    pre_src = cfg.get("pretrain_init") or None
+    pre_report = None
+    if pre_src and not use_branch:
+        print(f"  ⚙ candidate không có nhánh -> pretrain KHÔNG áp dụng "
+              f"(đúng như thiết kế: đây là cột đối chứng).", flush=True)
+        pre_src = None
+
     print(f"  preset LoRA: {preset['id']} "
           f"(method={preset['method']} r={preset['rank']} "
           f"alpha={preset['alpha']})", flush=True)
@@ -648,6 +698,22 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 f"embedding, không có chỗ nào chiếu lại.")
         branch = recombiner.RecombinerBranch(vis_h, text_h, n_labels, rcfg, ccfg)
         branch = branch.to(device=dev, dtype=bdtype)
+        # ── decoder_ft: nạp nhánh đã pretrain ────────────────────────────────
+        # Nạp SAU `.to(device, dtype)` chứ không trước: `load_state_dict` chép
+        # vào tham số đã có nên nó giữ nguyên device/dtype đích. Nạp trước rồi
+        # mới `.to()` cũng ra đúng số, nhưng nó tạo thêm một bản fp32 trên CPU
+        # của cả nhánh ở đúng lúc VRAM đang căng nhất.
+        if pre_src:
+            pre_report = pretrain_io.load_into_branch(branch, pre_src)
+            if bool(tcfg.get("freeze_pretrained", False)):
+                for nm, pp in branch.named_parameters():
+                    if nm.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
+                        pp.requires_grad_(False)
+                print(f"  ⚙ train.freeze_pretrained: ĐÓNG BĂNG "
+                      f"{', '.join(pretrain_io.PRETRAINED_MODULES)} — chỉ "
+                      f"decoder (LoRA/Experts), `gate` và `route_gate` học. "
+                      f"ASL khi đó là một phép ĐO, không phải một lực.",
+                      flush=True)
         bstats = branch.n_params()
         print(f"  nhánh: SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}"
               f"->{text_h}) -> TokenPool(4096->{bstats['n_query']}) -> MHA "
@@ -680,7 +746,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         steps = int(max_steps_override)
 
     opt, n_by_group = build_optimizer(
-        model, branch, tcfg, adapter_group="experts" if spec else "lora")
+        model, branch, tcfg, adapter_group="experts" if spec else "lora",
+        from_pretrain=bool(pre_src))
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
@@ -689,12 +756,33 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     # không phải dưới `recombiner`, vốn chỉ mô tả hình dạng nhánh.
     lam = float(ccfg.get("lambda", 0.2)) if use_branch else 0.0
     lam_warm = float(ccfg.get("lambda_warmup_pct", 0.1))
+    if pre_src:
+        # λ-warmup có ĐÚNG MỘT lý do: ở bước 0 ClsHead là ngẫu nhiên, nên ASL
+        # lớn và gradient của nó áp đảo CE. Sau sup_pretrain, tiền đề ấy KHÔNG
+        # còn đúng — ClsHead đã hội tụ và ASL đã nhỏ.
+        #
+        # Giữ warmup ở đây thì trong 10% đầu lịch (đúng lúc lr leo tới đỉnh và
+        # CE mạnh nhất) gần như KHÔNG có lực nào giữ nhánh ở lại chỗ đã hội tụ.
+        # Đó là chỗ pretrain bị xoá đi, và đường loss trông hoàn toàn bình
+        # thường trong lúc nó xảy ra.
+        lam_warm = float(ccfg.get("lambda_warmup_pct_pretrained", 0.0))
     tt_value = 1 if str(rcfg.get("token_type", "text")).lower() == "image" else 0
     clip = float(tcfg.get("max_grad_norm", 1.0))
 
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
+    if pre_src:
+        base_lr = float(tcfg["schedule"].get("max_lr", 2e-4))
+        pm = float(tcfg.get("pretrained_lr_mult", 0.1))
+        print(f"  decoder_ft: lr đỉnh {base_lr:.2e} cho "
+              f"{'experts' if spec else 'lora'}/branch/route, "
+              f"{base_lr * pm:.2e} (×{pm}) cho nhánh ĐÃ pretrain "
+              f"({', '.join(pretrain_io.PRETRAINED_MODULES)}), "
+              f"{base_lr * float(tcfg.get('gate_lr_mult', 20.0)):.2e} cho gate"
+              f" · λ = {lam} warmup {lam_warm:.0%}"
+              + ("" if lam_warm else " (TẮT — ClsHead không còn ngẫu nhiên)"),
+              flush=True)
 
     # Thứ tự dữ liệu: Generator RIÊNG, seed cố định — không đụng tới RNG toàn
     # cục, nên nó không phụ thuộc vào việc candidate nào chạy trước.
@@ -841,6 +929,17 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "n_query": int(bstats.get("n_query", 0)),
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,
+        # Chế độ huấn luyện của candidate NÀY, ghi cạnh số của nó. `report_*`
+        # đọc từ đây: một bảng §2.3 trộn hai cột, một cột from-scratch và một
+        # cột đã pretrain, là một bảng không so được — và không có chỗ nào khác
+        # trong thư mục adapter nói ra điều đó.
+        "train_mode": "decoder_ft" if pre_src else "scratch",
+        "pretrain_init": (str(pre_src) if pre_src else None),
+        "pretrain_report": pre_report,
+        "pretrained_lr_mult": (float(tcfg.get("pretrained_lr_mult", 0.1))
+                               if pre_src else None),
+        "freeze_pretrained": (bool(tcfg.get("freeze_pretrained", False))
+                              if pre_src else None),
         "token_type": str(rcfg.get("token_type", "text")),
         "gate_final": (float(branch.gate.detach().mean())
                        if branch is not None else None),

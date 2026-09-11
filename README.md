@@ -43,6 +43,41 @@ Wilcoxon + Holm chỉ trên những metric đã qua cổng.
 
 **Chi tiết: [`README_2.4.md`](README_2.4.md)**
 
+### Hai chế độ huấn luyện — một trục THỨ HAI
+
+`--exp` chọn *câu hỏi*; `--mode` chọn *cách nhánh Recombinator được khởi tạo*.
+
+```
+                    --mode scratch          --mode decoder_ft
+--exp 2.3     nhánh ngẫu nhiên (như cũ)   nhánh nạp từ sup_pretrain
+--exp 2.4     nhánh ngẫu nhiên (như cũ)   nhánh nạp từ sup_pretrain
+```
+
+```bash
+bash scripts/run_pretrain.sh --detach                    # CHẾ ĐỘ 1
+bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
+     --init-from runs/sup_pretrain/ckpt/best --detach    # CHẾ ĐỘ 2
+```
+
+**`sup_pretrain`** huấn luyện Recombinator + QFormer(`vec_1`) + ClsHead bằng
+**đúng một** nguồn gradient — ASL trên nhãn bệnh lý — để phân loại hội tụ TRƯỚC.
+Decoder không chạy, nên `gate` và `route_gate` không nhận gradient và **không**
+nằm trong file checkpoint. Checkpoint đi vào một repo model riêng
+(`RGExp123/RGExp_sup_pretrain`), ghi theo từng epoch kèm vị trí mẫu, và chạy lại
+là đi tiếp đúng chỗ.
+
+**`decoder_ft`** nạp nhánh ấy rồi finetune **cùng lúc** với decoder, với lr của
+riêng nhánh đã pretrain hạ xuống ×0.1 (`train.pretrained_lr_mult`) — AdamW dịch
+mọi tham số đi ~`lr` mỗi bước bất kể đã hội tụ hay chưa, nên lr đầy đủ ở vài
+chục bước đầu sẽ xoá đúng thứ pretrain vừa mua. λ-warmup tắt theo, vì tiền đề
+của nó ("ClsHead còn ngẫu nhiên") không còn đúng. Ghi vào thư mục riêng
+(`_ft`), nên bảng `scratch` — mốc nền để trả lời "pretrain có giúp không" — còn
+nguyên.
+
+`scratch` là mặc định và không đổi một byte nào so với hành vi cũ.
+
+**Chi tiết: [`README_pretrain.md`](README_pretrain.md)**
+
 ### Cái chung
 
 Cùng base **NF4 4-bit đã đóng băng**, cùng 6400 mẫu huấn luyện, cùng lịch
@@ -111,9 +146,11 @@ requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
   setup.sh                   dựng môi trường
   archive_2.2.sh             chuyển §2.2 sang _archive/ (chạy một lần)
-  run_recomb.sh              MỘT LỆNH, chọn thí nghiệm bằng --exp
-  selftest_recomb.py         ~80 phép kiểm (§2.3 + §2.4), không cần GPU/mạng
+  run_recomb.sh              MỘT LỆNH, chọn thí nghiệm bằng --exp, chế độ bằng --mode
+  run_pretrain.sh            MỘT LỆNH cho chế độ sup_pretrain
+  selftest_recomb.py         ~100 phép kiểm (§2.3 + §2.4), không cần GPU/mạng
   selftest_friedman.py       ~30 phép kiểm cho stats_friedman (§2.4 dùng thật)
+  selftest_pretrain.py       ~34 phép kiểm cho sup_pretrain + decoder_ft
   _env.sh                    chọn python (container vs cục bộ)
 src/
   config.py                  nạp YAML, seed, token
@@ -127,6 +164,9 @@ src/
   moe.py            [§2.4]   Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
   train_recomb.py            vòng huấn luyện CHUNG cho mọi candidate
+  pretrain_sup.py   [ch.độ1] vòng huấn luyện 100% có giám sát, KHÔNG decoder
+  pretrain_io.py    [ch.độ1] ghi/nạp/đẩy ĐÚNG các khối đã pretrain
+  run_pretrain.py   [ch.độ1] điều phối 3 stage (data · train · push)
   runners/gemma3*.py         base trần · +adapter (§2.2) · +nhánh (§2.3) ·
                              +nhánh+Experts (§2.4)
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU

@@ -74,6 +74,12 @@ from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 EXPERIMENTS = ("2.3", "2.4")
+# Hai chế độ huấn luyện, TRỰC GIAO với --exp:
+#   scratch     nhánh khởi tạo ngẫu nhiên (hành vi cũ, không đổi một byte nào)
+#   decoder_ft  nhánh khởi tạo từ một checkpoint sup_pretrain, lr riêng cho phần
+#               đã pretrain
+# Xem README_pretrain.md.
+MODES = ("scratch", "decoder_ft")
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
 
 
@@ -316,6 +322,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="2.3 = nhánh Recombinator (A/B, bootstrap+permutation); "
                          "2.4 = MoE (5 cấu hình top-k/expert, Friedman). Mặc "
                          "định lấy từ khoá `experiment` trong config.")
+    ap.add_argument("--mode", default=None, choices=list(MODES),
+                    help="scratch = nhánh ngẫu nhiên (mặc định); decoder_ft = "
+                         "khởi tạo nhánh từ sup_pretrain và hạ lr của phần đã "
+                         "pretrain. Cần --init-from (hoặc pretrain.default_init).")
+    ap.add_argument("--init-from", default=None,
+                    help="nguồn checkpoint sup_pretrain: một thư mục cục bộ "
+                         "(runs/sup_pretrain/ckpt/best) hoặc hub:OWNER/NAME"
+                         "[/SUBDIR][@rev]. Bật --mode decoder_ft luôn.")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
@@ -349,6 +363,42 @@ def main(argv: list[str] | None = None) -> int:
             cfg["output"].get("adapter_dir_moe", "./adapters_2_4"))
         cfg.setdefault("wandb", {})["tags"] = list(
             cfg.get("wandb", {}).get("tags", []) or []) + ["moe", "friedman", "2.4"]
+
+    # ── Chọn chế độ huấn luyện ─────────────────────────────────────────────
+    # `--init-from` một mình đã đủ để nói ý định, nên nó BẬT chế độ luôn thay vì
+    # đòi gõ cả hai. Ngược lại, `--mode decoder_ft` mà không có nguồn thì DỪNG:
+    # mặc định ngầm ở đây (im lặng chạy scratch) là cách một bảng mang nhãn
+    # "đã pretrain" được sinh ra từ một nhánh ngẫu nhiên.
+    mode = str(a.mode or ("decoder_ft" if a.init_from else None)
+               or cfg.get("mode", "scratch")).strip()
+    if mode not in MODES:
+        print(f"✗ --mode phải là một trong {MODES}, nhận {mode!r}")
+        return 2
+    init_spec = a.init_from or (cfg.get("pretrain", {}) or {}).get("default_init")
+    if mode == "decoder_ft" and not init_spec:
+        print("✗ --mode decoder_ft nhưng không có nguồn pretrain.\n"
+              "    --init-from runs/sup_pretrain/ckpt/best\n"
+              "    --init-from hub:OWNER/NAME/best\n"
+              "    hoặc đặt `pretrain.default_init` trong config.\n"
+              "  Không có nguồn thì đây đúng là một lần chạy `scratch` mang "
+              "nhãn khác — và bảng kết quả sẽ nói sai về chính nó.")
+        return 2
+    if mode == "scratch" and a.init_from:
+        print("✗ --init-from cùng với --mode scratch: mâu thuẫn. Bỏ một trong hai.")
+        return 2
+    cfg["mode"] = mode
+    if mode == "decoder_ft":
+        # THƯ MỤC RIÊNG. Ghi đè lên runs/2.3_recombiner của lần chạy scratch là
+        # mất đúng cái mốc nền mà decoder_ft cần để trả lời "pretrain có giúp
+        # không" — và tệ hơn: `already_trained()` sẽ thấy adapter cũ trong
+        # adapters_2_3/ rồi BỎ QUA stage train, cho ra một bảng mang nhãn
+        # decoder_ft dựng từ trọng số của lần chạy scratch.
+        sfx = str(cfg["output"].get("ft_suffix", "_ft"))
+        cfg["output"]["subdir"] = str(cfg["output"].get("subdir", "run")) + sfx
+        cfg["output"]["adapter_dir"] = str(
+            cfg["output"].get("adapter_dir", "./adapters")) + sfx
+        cfg.setdefault("wandb", {})["tags"] = list(
+            cfg.get("wandb", {}).get("tags", []) or []) + ["decoder_ft"]
 
     dry_steps = None
     if a.dry_run:
@@ -401,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "run_id": run_id, "experiment": exp,
+        "mode": mode, "pretrain_init_spec": init_spec if mode == "decoder_ft" else None,
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": resolved_snapshot(cfg), "env": _env_info(),
         "stages_run": stages, "arms_declared": [x["id"] for x in arms],
@@ -419,6 +470,9 @@ def main(argv: list[str] | None = None) -> int:
             flush=True)
         print("  §2.4 LUÔN dùng concat — mọi candidate đều có nhánh Recombinator.",
               flush=True)
+    print(f"⚙ chế độ : {mode}"
+          + (f"  ← {init_spec}" if mode == "decoder_ft" else
+             "  (nhánh khởi tạo ngẫu nhiên)"), flush=True)
     print(f"⚙ run dir: {run_dir}\n⚙ adapters: {adapter_root}", flush=True)
 
     # ── Trạng thái từ những lần chạy trước ─────────────────────────────────
@@ -448,11 +502,69 @@ def main(argv: list[str] | None = None) -> int:
                   flush=True)
     need_train_run = bool(arms_to_train)
 
+    # ── decoder_ft: GIẢI QUYẾT nguồn pretrain đúng MỘT lần ──────────────────
+    # Ở đây, không trong `train_arm`: giải quyết lại theo từng candidate nghĩa
+    # là tải cùng một checkpoint N lần, và — nếu revision trên Hub đổi giữa hai
+    # candidate — hai cột trong bảng đứng trên hai nhánh khởi tạo khác nhau.
+    # Một phép so sánh ghép cặp khi đó không còn nghĩa gì, và không có gì trong
+    # log nói vậy.
+    #
+    # Cũng ở đây chứ không sớm hơn: một lần chạy lại chỉ để in báo cáo thì
+    # `arms_to_train` rỗng, và nó không có lý do gì phải tải vài trăm MB.
+    if mode == "decoder_ft" and need_train_run:
+        from . import pretrain_io
+
+        _hr("Nhánh khởi tạo từ sup_pretrain")
+        try:
+            src = pretrain_io.resolve_source(
+                init_spec, cache_dir=cfg["data"].get("cache_dir", "./data"))
+            pmeta = pretrain_io.read_meta(src)
+        except Exception as e:
+            print(f"\n✗ DỪNG — không lấy được checkpoint pretrain "
+                  f"({init_spec!r}):\n    {e}", flush=True)
+            return 2
+        cfg["pretrain_init"] = str(src)
+        manifest["pretrain_init"] = str(src)
+        manifest["pretrain_meta"] = {
+            k: pmeta.get(k) for k in
+            ("format", "epoch", "n_epochs", "global_step", "seen_samples",
+             "val", "train", "pretrained_modules", "untrained_modules",
+             "n_labels", "n_classes", "d_vis", "d_model", "seed", "data",
+             "base_hf_id")}
+        v = dict(pmeta.get("val") or {})
+        print(f"  nguồn : {src}", flush=True)
+        print(f"  epoch {pmeta.get('epoch')}/{pmeta.get('n_epochs')} · "
+              f"{pmeta.get('seen_samples')} lượt mẫu · val cls_f1_pos "
+              f"{v.get('cls_f1_pos')} · val asl {v.get('asl')}", flush=True)
+        print(f"  khối trong file: {', '.join(pmeta.get('pretrained_modules', []))}"
+              f"  ·  KHÔNG có: "
+              f"{', '.join(pmeta.get('untrained_modules', [])) or '—'}", flush=True)
+        # Base khác nhau giữa pretrain và ft = nhánh đọc một phân phối đặc trưng
+        # khác phân phối nó đã học. Không có exception nào ở lúc nạp (hình dạng
+        # vẫn khớp nếu hai base cùng kích thước), và điểm số vẫn ra số.
+        if pmeta.get("base_hf_id") and str(pmeta["base_hf_id"]) != str(cfg["base"]["hf_id"]):
+            print(f"\n✗ DỪNG — checkpoint pretrain học trên vision tower của "
+                  f"{pmeta['base_hf_id']}, lần chạy này dùng "
+                  f"{cfg['base']['hf_id']}.\n"
+                  f"    Nhánh sẽ đọc một phân phối đặc trưng khác phân phối nó "
+                  f"đã học, và không có gì trong log nói điều đó.", flush=True)
+            return 2
+        pdata = dict(pmeta.get("data") or {})
+        if pdata.get("image_max_side") and \
+                int(pdata["image_max_side"]) != int(cfg["data"].get("image_max_side", 512)):
+            print(f"  ⚠ pretrain dùng ảnh cạnh dài ≤ {pdata['image_max_side']}px, "
+                  f"lần chạy này {cfg['data'].get('image_max_side')}px — nhánh "
+                  f"đọc đặc trưng của một độ phân giải khác. Đây là CẢNH BÁO "
+                  f"chứ không phải lỗi, nhưng nó phải vào phần Giới hạn.",
+                  flush=True)
+
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
         print(f"⚙ W&B  : {tracker.url}", flush=True)
     tracker.summary({"run/stages": ",".join(stages), "run/experiment": exp,
+                     "run/mode": mode,
+                     "run/pretrain_init": str(manifest.get("pretrain_init") or ""),
                      "run/arms": ",".join(manifest["arms_declared"]),
                      **{f"env/{k}": v for k, v in manifest["env"].items()}})
     if not hf_token():

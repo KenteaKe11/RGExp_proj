@@ -63,6 +63,16 @@ seed: 42
 # `vec_2` không tồn tại, và khi đó không có gì để định tuyến.
 experiment: "2.3"          # 2.3 | 2.4 — ghi đè bằng --exp
 
+# ── CHẾ ĐỘ HUẤN LUYỆN, trực giao với `experiment` ──────────────────────────
+#   scratch     nhánh Recombinator khởi tạo ngẫu nhiên. Hành vi mặc định, và là
+#               hành vi mà mọi bảng §2.3/§2.4 đã có được sinh ra từ đó.
+#   decoder_ft  nhánh khởi tạo từ một checkpoint `sup_pretrain`, và phần đã
+#               pretrain chạy ở learning rate thấp hơn (train.pretrained_lr_mult).
+#
+# Ghi đè bằng `--mode`, hoặc bật luôn bằng `--init-from`. Chế độ decoder_ft ghi
+# vào THƯ MỤC RIÊNG (output.ft_suffix) — xem chú thích ở khối `output`.
+mode: scratch
+
 # ── Dữ liệu: Y HỆT §2.1 và §2.2, không đổi một dòng ─────────────────────────
 # Tập test khoá cứng là điều kiện để bảng §2.3 so được với bảng §2.2 và mốc nền
 # zero-shot của §2.1. Đổi tập chấm là làm mọi so sánh chéo giữa các mục mất
@@ -251,6 +261,34 @@ train:
   # vào báo cáo.
   gate_lr_mult: 20.0
 
+  # ── VÌ SAO NHÁNH ĐÃ PRETRAIN CÓ LR RIÊNG (chế độ decoder_ft) ─────────────
+  # Cùng một tính chất của AdamW như trên, dùng ngược chiều. Sau `sup_pretrain`,
+  # Recombinator + QFormer + ClsHead đã nằm ở một cực tiểu của ASL. Ở bước 0 của
+  # decoder_ft, CE là nguồn gradient MỚI và lớn — decoder chưa từng thấy 32 token
+  # này — và AdamW dịch mọi tham số đi khoảng `lr` mỗi bước, bất kể chúng đã hội
+  # tụ hay chưa.
+  #
+  # Với lr đỉnh 3e-4 dùng chung, vài chục bước đầu đủ để đẩy nhánh ra khỏi chỗ
+  # đã hội tụ, và cái mất đi là toàn bộ thứ pretrain vừa mua. Triệu chứng:
+  # `cls_f1_pos` tụt trong 10% đầu lịch rồi không quay lại, trong khi CE giảm
+  # bình thường — không có exception, không có dòng log nào gọi tên nó.
+  #
+  # 0.1 là một hằng số ĐƯỢC CHỌN, không được tune: chọn nó bằng bảng §2.3 là
+  # tune trên tập test. Nó chỉ áp lên các khối CÓ trong file pretrain
+  # (src/pretrain_io.PRETRAINED_MODULES). `route_gate` vẫn còn tươi ở decoder_ft
+  # nên nó ở nhóm lr đầy đủ — ép một khối ngẫu nhiên học ở 1/10 tốc độ, ở §2.4,
+  # chính là ép router học chậm gấp mười.
+  #
+  # Khoá này KHÔNG có tác dụng ở chế độ scratch (không có nhóm nào để áp).
+  pretrained_lr_mult: 0.1
+
+  # Đóng băng hẳn phần đã pretrain thay vì chỉ hạ lr. Mặc định `false`: đóng
+  # băng biến ASL từ một LỰC thành một PHÉP ĐO, và khi đó nhánh không còn học
+  # được gì từ việc decoder cần gì ở nó. Để `true` chỉ khi muốn một arm đối
+  # chứng "nhánh đóng băng hoàn toàn" — và đó là một arm KHÁC trong bảng, không
+  # phải một tinh chỉnh của arm decoder_ft.
+  freeze_pretrained: false
+
   # ── CHỖ GẮN ADAPTER ──────────────────────────────────────────────────────
   # exclude_prefixes quan trọng hơn ở §2.3 so với §2.2: nhánh Recombinator đọc
   # last_hidden_state của CHÍNH vision tower này. Adapter lọt vào đó thì hai
@@ -400,6 +438,17 @@ classifier:
   # mới theo một gradient chưa mang thông tin gì — và LoRA tiêu những bước quý
   # nhất của one-cycle để chiều nó.
   lambda_warmup_pct: 0.1
+
+  # λ-warmup ở chế độ decoder_ft. Mặc định 0.0 — TẮT — và đó là một quyết định,
+  # không phải một giá trị bỏ trống.
+  #
+  # Warmup ở trên có ĐÚNG MỘT lý do: ở bước 0 ClsHead là ngẫu nhiên. Sau
+  # `sup_pretrain` tiền đề ấy không còn đúng — ClsHead đã hội tụ và ASL đã nhỏ.
+  # Giữ warmup nghĩa là trong 10% đầu lịch, đúng lúc lr leo tới đỉnh và CE mạnh
+  # nhất, gần như KHÔNG có lực nào giữ nhánh ở lại chỗ nó đã hội tụ. Đó chính là
+  # chỗ pretrain bị xoá đi, và đường loss trông hoàn toàn bình thường trong lúc
+  # nó xảy ra.
+  lambda_warmup_pct_pretrained: 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §2.4 — MoE: Route_Gate hoạt động + Experts (LoRA)
@@ -643,3 +692,114 @@ output:
   adapter_dir: ./adapters_2_3
   subdir_moe: "2.4_moe"
   adapter_dir_moe: ./adapters_2_4
+
+  # Chế độ `decoder_ft` nối hậu tố này vào CẢ `subdir` lẫn `adapter_dir`, nên
+  # nó ghi vào runs/2.3_recombiner_ft/ + adapters_2_3_ft/ thay vì đè lên lần
+  # chạy scratch. Hai lý do, cả hai cơ học:
+  #   * bảng scratch là MỐC NỀN để trả lời "pretrain có giúp không" — đè lên nó
+  #     là xoá mất đúng cái đang cần so;
+  #   * `already_trained()` chỉ nhìn file trong thư mục adapter. Dùng chung thư
+  #     mục nghĩa là lần chạy decoder_ft thấy adapter cũ, BỎ QUA stage train, và
+  #     cho ra một bảng mang nhãn decoder_ft dựng từ trọng số scratch.
+  ft_suffix: "_ft"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHẾ ĐỘ 1 — sup_pretrain: nhánh có giám sát, 100%, KHÔNG decoder
+# ═══════════════════════════════════════════════════════════════════════════
+#     loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ) )
+#
+# Không CE, không λ, không LoRA, không Aux Loss. Decoder KHÔNG chạy — base chỉ
+# được nạp để lấy ĐÚNG vision tower và processor mà §2.3/§2.4 dùng, và lượt
+# vision chạy trong `no_grad`.
+#
+# Hình dạng nhánh lấy NGUYÊN từ khối `recombiner` + `classifier` ở trên, với ba
+# khoá bị ép trong code (src/pretrain_sup.pretrain_rcfg): `qformer.freeze` =
+# mọi task trừ `sup`, `route_enabled = false`, `gate_init` giữ nguyên. Nghĩa là
+# checkpoint pretrain có ĐÚNG hình dạng §2.3 và nạp thẳng sang §2.4 được.
+#
+# Hệ quả của "decoder không chạy": `gate` và `route_gate` không nhận một
+# gradient nào, nên chúng KHÔNG nằm trong file checkpoint. Xem src/pretrain_io.py.
+pretrain:
+  # ── Dữ liệu: NHIỀU hơn §2.3, và ở MỘT MANIFEST KHÁC ─────────────────────
+  # 0 = TOÀN BỘ `data.train_split_csv`. §2.3/§2.4 vẫn dùng `data.n_train`
+  # (6400) — hai con số, hai file (`data/pretrainset.jsonl` vs
+  # `data/trainset.jsonl`). Dùng chung một file nghĩa là chạy pretrain xong thì
+  # tập huấn luyện của §2.3 lặng lẽ thành toàn bộ split, và bảng A/B không so
+  # được với lần chạy trước.
+  #
+  # Hàng rào rò rỉ với 3000 ảnh test chạy LẠI cho tập này — phép kiểm của §2.3
+  # nói về 6400 mẫu kia, không nói gì về tập này.
+  n_train: 0
+  # Val dùng `data.val_split_csv` + `data.n_val` (256) — chỉ để CHỌN epoch tốt
+  # nhất và nhìn đường học. Không bao giờ để tune `lambda`, `alpha` hay bất cứ
+  # thứ gì vào bảng kết quả.
+
+  seed: null                 # null = dùng `seed` toàn cục (42)
+
+  # ── Batch: LỚN HƠN §2.3 được, và đó là điểm chính ────────────────────────
+  # Không decoder nghĩa là không có 1024 token đi qua 34 lớp, và lượt vision
+  # chạy trong `no_grad`. Phần tốn VRAM còn lại là activation 4096 ×
+  # swiglu_hidden của Recombinator cho mỗi ảnh.
+  #
+  # Hết VRAM là DỪNG, và thông báo nêu ba khoá. `recombiner.swiglu_hidden` đứng
+  # đầu danh sách ấy NHƯNG hạ nó là ĐỔI HÌNH DẠNG CHECKPOINT: nhánh pretrain sẽ
+  # không nạp được vào §2.3/§2.4 đang dùng giá trị cũ. Đổi thì phải đổi ở CẢ HAI.
+  per_device_batch_size: 8
+  grad_accum: 4              # tích = 32 mẫu mỗi bước — GIỐNG §2.3, có chủ ý:
+                             # hai chế độ dùng cùng một đơn vị "bước".
+  n_epochs: 8
+  max_grad_norm: 1.0
+  weight_decay: 0.01         # nhánh là mạng DÀY ĐẶC, không phải LoRA
+  logging_steps: 20
+
+  # Lịch one-cycle trải trên TOÀN BỘ n_epochs, không phải mỗi epoch một chu kỳ:
+  # nhiều chu kỳ nghĩa là mỗi epoch lại đẩy nhánh ra khỏi cực tiểu vừa tìm được,
+  # và `ckpt/best` sẽ luôn rơi vào ngay sau một đáy chu kỳ vì lý do cơ học.
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+
+  # Kiểu lượng tử của base lúc pretrain. Phải GIỐNG `lora.preset` của §2.3:
+  # nhánh học trên `last_hidden_state` của vision tower, và một vision tower
+  # NF4 cho ra đặc trưng khác một vision tower bf16. Lệch ở đây là pretrain
+  # trên một phân phối khác phân phối gặp ở decoder_ft — không có exception nào.
+  base_method: qlora
+
+  # ── Checkpoint: theo EPOCH, kèm vị trí mẫu ──────────────────────────────
+  # Ghi sau MỖI lượt đi hết trainset. Pretrain chạy nhiều epoch, nên ranh giới
+  # epoch là mốc duy nhất so sánh được giữa hai lần chạy — "bước thứ N" thì phụ
+  # thuộc vào batch, còn "đã đi hết dữ liệu bao nhiêu lần" thì không.
+  #
+  # `trainer_state.pt` của mỗi epoch giữ trạng thái Generator + `cursor` + chỉ
+  # số mẫu tại cursor + optimizer + scheduler, nên chạy lại là ĐI TIẾP đúng chỗ.
+  # Nó KHÔNG bao giờ được đẩy Hub (nặng gấp ~3 lần phần trọng số, vô nghĩa với
+  # người tái sử dụng).
+  keep_last_ckpt: 2          # `ckpt/best` KHÔNG bao giờ bị dọn
+  select_metric: cls_f1_pos  # trên VAL. `cls_acc` không dùng được: lớp `neg`
+                             # chiếm đa số áp đảo nên một head đoán `neg` cho
+                             # MỌI ô vẫn đạt accuracy rất cao.
+  select_mode: max
+
+  # ── Repo lưu trữ: repo MODEL riêng ──────────────────────────────────────
+  # KHÔNG dùng `output.hub_repo` (dataset kết quả). Hai lý do cơ học:
+  #   1. `src/push.push_results` có ignore_patterns chặn `*.safetensors` —
+  #      trọng số đẩy vào đó sẽ bị bỏ qua ÂM THẦM;
+  #   2. repo kết quả bị ghi đè mỗi lần chạy lại stage report, còn checkpoint
+  #      pretrain phải sống lâu hơn mọi lần chạy §2.3/§2.4 dùng nó.
+  hub_repo: RGExp123/RGExp_sup_pretrain
+  hub_subdir: best
+  hub_private: true
+  push: true
+
+  # Nguồn mặc định cho `--mode decoder_ft` khi không gõ `--init-from`.
+  # null = bắt buộc phải gõ. Để null là có chủ ý: một lần chạy decoder_ft đứng
+  # trên một checkpoint CỤ THỂ, và con số ấy phải nằm trong dòng lệnh đã chạy
+  # chứ không trong một mặc định mà ai đó sửa từ tuần trước.
+  default_init: null
+
+  subdir: "sup_pretrain"     # -> runs/sup_pretrain/
