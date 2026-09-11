@@ -118,7 +118,87 @@ def probe(cfg: Cfg) -> dict:
     return info
 
 
-def to_onehot(raw: np.ndarray, encoding: dict[float, int]) -> np.ndarray:
+def resolve_encoding(lcfg: dict) -> tuple[dict[float, int], int | None]:
+    """`labels.encoding` -> ({mã thô: chỉ số lớp}, chỉ số lớp cho NaN).
+
+    Chấp HAI cách viết, vì hai cách nói hai thứ khác nhau:
+
+      A. THEO TÊN LỚP (cách viết trong configs/recombiner.yaml):
+             encoding: {neg: [0], pos: [1], uncertain: [-1, 2], nan_to: uncertain}
+         Một lớp gom NHIỀU mã thô là chuyện bình thường và có chủ ý —
+         CheXpert ghi "uncertain" khi thì -1 khi thì 2 tuỳ bản trích xuất.
+
+      B. THEO MÃ THÔ (cách viết cũ, cũng là RAW_ENCODING):
+             encoding: {0: 0, 1: 1, -1: 2}
+
+    Ở cách A, lỗi đáng sợ KHÔNG phải "hai mã cùng một lớp" mà là ngược lại: MỘT
+    MÃ THÔ nằm dưới HAI TÊN LỚP. Khi đó một ô bật hai lớp, one-hot hết là
+    one-hot, và ASL học một phân phối không tồn tại. Hàm này chặn đúng cái đó.
+
+    `nan_to` nói NaN (= "bệnh lý không được nhắc tới trong báo cáo") thuộc lớp
+    nào: `uncertain`, `neg`, hoặc `ignore` để ô đó thành TOÀN 0 và bị mask khỏi
+    loss. Không có khoá này thì mặc định là `ignore` — đoán một lớp cho ô trống
+    là bịa nhãn, và nhãn bịa đi thẳng vào gradient.
+    """
+    raw_cfg = dict(lcfg.get("encoding") or {})
+    if not raw_cfg:
+        return dict(RAW_ENCODING), None
+
+    nan_name = str(raw_cfg.pop("nan_to", "ignore")).lower()
+    by_name = any(str(k).lower() in CLASS_ORDER for k in raw_cfg)
+
+    if not by_name:
+        # Cách B. Giữ nguyên phép kiểm cũ: ở đây "hai mã cùng một lớp" KHÔNG
+        # phân biệt được với một lỗi gõ, nên nó vẫn là lỗi.
+        enc = {float(k): int(v) for k, v in raw_cfg.items()}
+        nan_idx = None if nan_name in ("ignore", "none") else CLASS_ORDER.index(nan_name)
+        return enc, nan_idx
+
+    # Cách A.
+    enc: dict[float, int] = {}
+    owner: dict[float, str] = {}
+    for name, vals in raw_cfg.items():
+        key = str(name).lower()
+        if key not in CLASS_ORDER:
+            raise LabelsUnusable(
+                f"labels.encoding có lớp {name!r} không nằm trong CLASS_ORDER "
+                f"({'/'.join(CLASS_ORDER)}). Thêm một lớp ở config mà không sửa "
+                f"src/labels_cls.CLASS_ORDER và classifier.n_classes là một "
+                f"one-hot lệch cột.")
+        idx = CLASS_ORDER.index(key)
+        for v in (vals if isinstance(vals, (list, tuple)) else [vals]):
+            fv = float(v)
+            if fv in owner and owner[fv] != key:
+                raise LabelsUnusable(
+                    f"mã thô {v!r} nằm dưới CẢ HAI lớp {owner[fv]!r} và {key!r} "
+                    f"trong labels.encoding. Ô mang mã đó sẽ bật hai lớp cùng "
+                    f"lúc — one-hot hết là one-hot, và ASL học một phân phối "
+                    f"không tồn tại.")
+            owner[fv] = key
+            enc[fv] = idx
+
+    missing = [c for c in CLASS_ORDER if c not in set(owner.values())
+               and c != nan_name]
+    if missing:
+        raise LabelsUnusable(
+            f"labels.encoding không khai mã thô nào cho lớp {missing}. Lớp ấy sẽ "
+            f"trống ở MỌI mẫu, ASL vẫn chạy, và bảng báo cáo vẫn in đủ "
+            f"{len(CLASS_ORDER)} tên lớp.")
+
+    if nan_name in ("ignore", "none"):
+        nan_idx = None
+    elif nan_name in CLASS_ORDER:
+        nan_idx = CLASS_ORDER.index(nan_name)
+    else:
+        raise LabelsUnusable(
+            f"labels.encoding.nan_to = {nan_name!r}; hợp lệ: "
+            f"{'/'.join(CLASS_ORDER)} hoặc 'ignore'.")
+    return enc, nan_idx
+
+
+def to_onehot(raw: np.ndarray, encoding: dict[float, int],
+              nan_to: int | None = None,
+              allow_class_merge: bool = False) -> np.ndarray:
     """(N, L) mã hoá thô -> (N, L, 3) one-hot float32, theo CLASS_ORDER.
 
     Ô nào không khớp lớp nào (ví dụ NaN = "không nhắc tới") -> TOÀN 0, và bị
@@ -133,7 +213,7 @@ def to_onehot(raw: np.ndarray, encoding: dict[float, int]) -> np.ndarray:
     # `uncertain` vào `neg` — bài toán đổi từ 3 lớp thành 2, ASL vẫn chạy, và
     # bảng báo cáo vẫn in ba tên lớp.
     idx = [int(v) for v in encoding.values()]
-    if len(set(idx)) != len(idx):
+    if len(set(idx)) != len(idx) and not allow_class_merge:
         raise LabelsUnusable(
             f"labels.encoding trỏ hai mã thô về cùng một lớp: {encoding}. Điều "
             f"đó gộp lớp và biến bài toán 3 lớp thành ít hơn mà không có dấu "
@@ -146,6 +226,13 @@ def to_onehot(raw: np.ndarray, encoding: dict[float, int]) -> np.ndarray:
     out = np.zeros((n, L, len(CLASS_ORDER)), dtype=np.float32)
     for val, idx in encoding.items():
         out[..., int(idx)] += (raw == float(val)).astype(np.float32)
+    if nan_to is not None:
+        # `raw == nan` LUÔN False, nên NaN không bao giờ lọt vào vòng trên. Nếu
+        # config nói NaN thuộc một lớp thì phải gán ở đây; không thì ô đó ở lại
+        # TOÀN 0 và bị mask — cũng là một lựa chọn hợp lệ (`nan_to: ignore`).
+        with np.errstate(invalid="ignore"):
+            nan_cells = np.isnan(raw.astype(np.float64))
+        out[nan_cells, int(nan_to)] = 1.0
     over = int((out.sum(-1) > 1).sum())
     if over:
         raise LabelsUnusable(
@@ -184,11 +271,11 @@ def load_map(cfg: Cfg, verbose: bool = True) -> tuple[dict[str, np.ndarray], dic
             f"Kiểm lại {info['path']}.")
 
     if raw.ndim == 2:
-        enc = {float(k): int(v) for k, v in
-               (lcfg.get("encoding") or RAW_ENCODING).items()}
-        onehot = to_onehot(raw, enc)
+        enc, nan_to = resolve_encoding(lcfg)
+        onehot = to_onehot(raw, enc, nan_to=nan_to, allow_class_merge=True)
         info["converted_from"] = "raw"
-        info["encoding_used"] = enc
+        info["encoding_used"] = {str(k): int(v) for k, v in enc.items()}
+        info["nan_to"] = None if nan_to is None else CLASS_ORDER[nan_to]
     elif raw.ndim == 3:
         if raw.shape[-1] != len(CLASS_ORDER):
             raise LabelsUnusable(
