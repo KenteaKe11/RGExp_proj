@@ -1,11 +1,17 @@
-# RGExp — §2.3 (nhánh Recombinator) và §2.4 (MoE) trên Gemma 3
+# RGExp — §2.3 (nhánh Recombinator), §2.4 (MoE) và §3 (huấn luyện thật) trên Gemma 3
 
-Repo này chạy **hai thí nghiệm liên tiếp**, chọn bằng một cờ:
+Repo này chạy **hai thí nghiệm** rồi **một lần huấn luyện thật**:
 
 ```bash
 bash scripts/run_recomb.sh --exp 2.3     # nhánh Recombinator có đáng không?
 bash scripts/run_recomb.sh --exp 2.4     # cấu hình MoE nào tốt hơn?
+bash scripts/run_section3.sh             # §3: huấn luyện MỘT model cho tử tế
 ```
+
+Hai mục đầu là **thí nghiệm so sánh** (có candidate, có kiểm định, dữ liệu khoá
+cứng ở 6400 mẫu). §3 thì **không so gì** — nó lấy câu trả lời của hai mục đó làm
+siêu tham số và chạy toàn bộ trainset. Ba mục dùng hai file cấu hình và hai điểm
+vào tách rời, và đó là một điều kiện được cài đặt chứ không phải một quy ước.
 
 ### §2.3 — hai candidate, hai kiểm định ghép cặp
 
@@ -43,42 +49,37 @@ Wilcoxon + Holm chỉ trên những metric đã qua cổng.
 
 **Chi tiết: [`README_2.4.md`](README_2.4.md)**
 
-### Hai chế độ huấn luyện — một trục THỨ HAI
+### §3 — huấn luyện thật, hai chế độ, một model, toàn bộ trainset
 
-`--exp` chọn *câu hỏi*; `--mode` chọn *cách nhánh Recombinator được khởi tạo*.
+§2.3 hỏi *"nhánh có đáng không"*. §2.4 hỏi *"cấu hình MoE nào tốt hơn"*. §3
+**không hỏi gì** — nó lấy câu trả lời của hai mục đó làm **siêu tham số**
+(`top_k`, `n_experts`, `lora.preset`) và huấn luyện một model duy nhất trên
+**toàn bộ** train split, theo hai chế độ tuần tự:
 
 ```
-                    --mode scratch          --mode decoder_ft
---exp 2.3     nhánh ngẫu nhiên (như cũ)   nhánh nạp từ sup_pretrain
---exp 2.4     nhánh ngẫu nhiên (như cũ)   nhánh nạp từ sup_pretrain
+1  sup_pretrain   loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP ) ) ) )
+                  100% có giám sát, KHÔNG decoder. Cho phân loại hội tụ TRƯỚC.
+                  Ckpt theo từng epoch, kèm vị trí mẫu -> chạy lại là đi tiếp.
+
+2  decoder_ft     loss = CE + λ·ASL + α·Aux
+                  Nạp nhánh ấy, hạ lr của RIÊNG nó (×0.1), finetune CÙNG LÚC
+                  với decoder. λ-warmup tắt — ClsHead không còn ngẫu nhiên.
 ```
 
-```bash
-bash scripts/run_pretrain.sh --detach                    # CHẾ ĐỘ 1
-bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
-     --init-from runs/sup_pretrain/ckpt/best --detach    # CHẾ ĐỘ 2
-```
+Không candidate, không Friedman, không bootstrap: một model thì không có gì để
+xếp hạng. §3 dừng ở chỗ có trọng số — phần sinh văn bản và chấm điểm là việc của
+một mục sau.
 
-**`sup_pretrain`** huấn luyện Recombinator + QFormer(`vec_1`) + ClsHead bằng
-**đúng một** nguồn gradient — ASL trên nhãn bệnh lý — để phân loại hội tụ TRƯỚC.
-Decoder không chạy, nên `gate` và `route_gate` không nhận gradient và **không**
-nằm trong file checkpoint. Checkpoint đi vào một repo model riêng
-(`RGExp123/RGExp_sup_pretrain`), ghi theo từng epoch kèm vị trí mẫu, và chạy lại
-là đi tiếp đúng chỗ.
+File cấu hình **riêng** (`configs/section3.yaml`) và điểm vào **riêng**
+(`src/run_section3.py`), có chủ ý ngược với lý lẽ gộp §2.3 + §2.4: hai mục ấy
+**phải** giống nhau nên chúng chia một file; §3 **phải** khác (toàn bộ split
+thay vì 6400) nên nó đứng riêng — để một lần sửa cho §3 không lặng lẽ đổi tập
+huấn luyện của hai bảng đã chốt. Đường **huấn luyện** thì vẫn dùng chung
+(`train_recomb.train_arm`).
 
-**`decoder_ft`** nạp nhánh ấy rồi finetune **cùng lúc** với decoder, với lr của
-riêng nhánh đã pretrain hạ xuống ×0.1 (`train.pretrained_lr_mult`) — AdamW dịch
-mọi tham số đi ~`lr` mỗi bước bất kể đã hội tụ hay chưa, nên lr đầy đủ ở vài
-chục bước đầu sẽ xoá đúng thứ pretrain vừa mua. λ-warmup tắt theo, vì tiền đề
-của nó ("ClsHead còn ngẫu nhiên") không còn đúng. Ghi vào thư mục riêng
-(`_ft`), nên bảng `scratch` — mốc nền để trả lời "pretrain có giúp không" — còn
-nguyên.
+**Chi tiết: [`README_3.md`](README_3.md)**
 
-`scratch` là mặc định và không đổi một byte nào so với hành vi cũ.
-
-**Chi tiết: [`README_pretrain.md`](README_pretrain.md)**
-
-### Cái chung
+### Cái chung (§2.3 và §2.4)
 
 Cùng base **NF4 4-bit đã đóng băng**, cùng 6400 mẫu huấn luyện, cùng lịch
 one-cycle, cùng batch, cùng 3000 ảnh để chấm, cùng seed, cùng `configs/recombiner.yaml`.
@@ -127,6 +128,15 @@ bash scripts/run_recomb.sh --exp 2.3 --detach     # §2.3 chạy thật
 bash scripts/run_recomb.sh --exp 2.4 --detach     # §2.4 chạy thật
 ```
 
+§3 có điểm vào và selftest riêng — nó không đọc `configs/recombiner.yaml` và
+không ghi vào thư mục nào của hai mục trên:
+
+```bash
+python scripts/selftest_section3.py               # ~39 phép kiểm, vài giây
+bash scripts/run_section3.sh --dry-run            # thử đường ống (32 mẫu)
+bash scripts/run_section3.sh --detach             # §3 chạy thật, cả hai chế độ
+```
+
 Không có `--exp` thì lấy khoá `experiment` trong `configs/recombiner.yaml` (mặc
 định `2.3`) — script nói ra điều đó thay vì đoán giúp.
 
@@ -140,17 +150,18 @@ nó nguyên văn (k = 5). Xem [`README_2.4.md`](README_2.4.md) mục 5.
 ## Cấu trúc
 
 ```
-configs/recombiner.yaml      TOÀN BỘ tham số của CẢ HAI mục, có chú thích lý do
+configs/recombiner.yaml      TOÀN BỘ tham số của §2.3 + §2.4, có chú thích lý do
+configs/section3.yaml [§3]   §3 RIÊNG: toàn bộ trainset, siêu tham số đã chọn
 requirements.txt             môi trường chính (transformers/torch)
 requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
   setup.sh                   dựng môi trường
   archive_2.2.sh             chuyển §2.2 sang _archive/ (chạy một lần)
-  run_recomb.sh              MỘT LỆNH, chọn thí nghiệm bằng --exp, chế độ bằng --mode
-  run_pretrain.sh            MỘT LỆNH cho chế độ sup_pretrain
+  run_recomb.sh              MỘT LỆNH cho §2.3/§2.4, chọn bằng --exp
+  run_section3.sh    [§3]    MỘT LỆNH cho §3, chọn chế độ bằng --mode
   selftest_recomb.py         ~100 phép kiểm (§2.3 + §2.4), không cần GPU/mạng
   selftest_friedman.py       ~30 phép kiểm cho stats_friedman (§2.4 dùng thật)
-  selftest_pretrain.py       ~34 phép kiểm cho sup_pretrain + decoder_ft
+  selftest_section3.py [§3]  ~39 phép kiểm cho sup_pretrain + decoder_ft
   _env.sh                    chọn python (container vs cục bộ)
 src/
   config.py                  nạp YAML, seed, token
@@ -163,10 +174,10 @@ src/
                              RouteGate · ASL · cầu nối sang Gemma 3
   moe.py            [§2.4]   Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
-  train_recomb.py            vòng huấn luyện CHUNG cho mọi candidate
-  pretrain_sup.py   [ch.độ1] vòng huấn luyện 100% có giám sát, KHÔNG decoder
-  pretrain_io.py    [ch.độ1] ghi/nạp/đẩy ĐÚNG các khối đã pretrain
-  run_pretrain.py   [ch.độ1] điều phối 3 stage (data · train · push)
+  train_recomb.py            vòng huấn luyện CHUNG — §2.3, §2.4 VÀ chế độ 2 của §3
+  pretrain_sup.py   [§3]     chế độ 1: 100% có giám sát, KHÔNG decoder
+  pretrain_io.py    [§3]     ghi/nạp/đẩy ĐÚNG các khối đã pretrain
+  run_section3.py   [§3]     điều phối 3 stage (data · train · push), 2 chế độ
   runners/gemma3*.py         base trần · +adapter (§2.2) · +nhánh (§2.3) ·
                              +nhánh+Experts (§2.4)
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU

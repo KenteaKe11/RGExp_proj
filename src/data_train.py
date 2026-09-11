@@ -76,6 +76,17 @@ def check_leak(train_keys: list[str], test_keys: list[str]) -> set[str]:
     return set(train_keys) & set(test_keys)
 
 
+def read_split_keys(cfg: Cfg, filename: str, n: int = 0,
+                    label: str = "split") -> list[str]:
+    """Danh sách key của một split — KHÔNG tải một tấm ảnh nào.
+
+    §3 không chấm điểm nên nó không cần tập test; nó chỉ cần DANH SÁCH KEY để
+    chạy hàng rào rò rỉ. Gọi `data.prepare()` ở đó là tải và resize 3000 ảnh cho
+    một phép so tập hợp — vài chục phút và vài GB, cho một việc mất một giây.
+    """
+    return _read_split(cfg, filename, int(n or 0), label)
+
+
 def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None, *,
                   n_train: int | None = None, name: str = "trainset",
                   val_name: str = "valset"

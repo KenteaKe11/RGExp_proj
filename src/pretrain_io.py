@@ -447,6 +447,37 @@ Vision tower **đóng băng** và chạy trong `no_grad`: file này chỉ chứa
 """
 
 
+def push_folder(repo_id: str, folder: Path, path_in_repo: str = "",
+                private: bool = True, commit_message: str = "",
+                ignore_patterns: list[str] | None = None) -> str:
+    """Đẩy một thư mục lên repo MODEL. Dùng cho cả checkpoint pretrain lẫn model §3.
+
+    Tách ra khỏi `src/push.push_results` chứ không dùng lại nó: hàm ấy đẩy vào
+    một repo DATASET và có `ignore_patterns` chặn `*.safetensors` (kết quả §2.x
+    là bảng và văn bản, không phải trọng số). Gọi nó với một thư mục trọng số
+    thì nó chạy trơn tru và đẩy lên đúng... không có gì.
+    """
+    from huggingface_hub import HfApi
+
+    from .config import hf_token
+
+    api = HfApi(token=hf_token())
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="model", private=private,
+                        exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"không tạo/mở được model repo {repo_id}: {e!r}\n"
+            f"    Token phải có quyền WRITE, và tài khoản phải ghi được vào "
+            f"`{repo_id.split('/')[0]}`.") from e
+    api.upload_folder(
+        folder_path=str(folder), repo_id=repo_id, repo_type="model",
+        path_in_repo=path_in_repo.strip("/") or ".",
+        commit_message=commit_message or f"upload {Path(folder).name}",
+        ignore_patterns=list(ignore_patterns or []) + ["*.part", "__pycache__/*"])
+    return f"https://huggingface.co/{repo_id}"
+
+
 def push_pretrain(cfg, ckpt_dir: Path, extra_files: list[Path] | None = None
                   ) -> str | None:
     """Đẩy CHỈ các khối đã pretrain lên `pretrain.hub_repo` (repo MODEL).
@@ -484,32 +515,14 @@ def push_pretrain(cfg, ckpt_dir: Path, extra_files: list[Path] | None = None
         if f.exists() and f.parent != ckpt_dir:
             shutil.copy2(f, ckpt_dir / f.name)
 
-    try:
-        from huggingface_hub import HfApi
-    except ImportError as e:
-        raise RuntimeError(f"thiếu huggingface_hub ({e})") from e
-
-    api = HfApi(token=tok)
     subdir = str(p.get("hub_subdir", "best")).strip("/")
-    private = bool(p.get("hub_private", True))
-    try:
-        api.create_repo(repo_id=repo_id, repo_type="model", private=private,
-                        exist_ok=True)
-    except Exception as e:
-        raise RuntimeError(
-            f"không tạo/mở được model repo {repo_id}: {e!r}\n"
-            f"    Token phải có quyền WRITE, và tài khoản phải ghi được vào "
-            f"`{repo_id.split('/')[0]}`.") from e
-
     print(f"→ đẩy {ckpt_dir} -> {repo_id}/{subdir or '.'} (model)", flush=True)
-    api.upload_folder(
-        folder_path=str(ckpt_dir), repo_id=repo_id, repo_type="model",
-        path_in_repo=subdir or ".",
+    url = push_folder(
+        repo_id, ckpt_dir, subdir, bool(p.get("hub_private", True)),
         commit_message=f"sup_pretrain epoch {meta.get('epoch')} · val f1_pos "
                        f"{(meta.get('val') or {}).get('cls_f1_pos')}",
         # Trạng thái optimizer KHÔNG lên: nó chỉ phục vụ resume của chính lần
         # chạy pretrain này, và nó nặng gấp ~3 lần phần trọng số.
-        ignore_patterns=[TRAINER_STATE, "*.part", "__pycache__/*"])
-    url = f"https://huggingface.co/{repo_id}"
+        ignore_patterns=[TRAINER_STATE])
     print(f"✓ đã đẩy: {url}  (thư mục `{subdir or '.'}`)", flush=True)
     return url
