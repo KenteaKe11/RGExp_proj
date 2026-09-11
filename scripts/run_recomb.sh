@@ -1,20 +1,37 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# run_recomb.sh — §2.3 HAI CANDIDATE + BOOTSTRAP/PERMUTATION, MỘT LỆNH.
+# run_recomb.sh — MỘT LỆNH, CHỌN MỘT TRONG HAI THÍ NGHIỆM.
 #
-#     bash scripts/run_recomb.sh                  # train B,A -> infer B,A -> chấm -> kiểm định -> đẩy Hub
-#     bash scripts/run_recomb.sh --detach         # chạy NỀN, trả lại shell ngay
-#     bash scripts/run_recomb.sh --dry-run        # 16 mẫu train, 4 bước, 8 ảnh test
-#     bash scripts/run_recomb.sh --stages stats,report
-#     bash scripts/run_recomb.sh --arms lora_recomb
+#     bash scripts/run_recomb.sh --exp 2.3        # A (LoRA) vs B (LoRA + nhánh)
+#     bash scripts/run_recomb.sh --exp 2.4        # 5 cấu hình MoE (top-k, expert)
 #
-# Mọi tham số khác chuyển thẳng cho `python -m src.run_recomb`.
+#     bash scripts/run_recomb.sh --exp 2.4 --detach      # chạy NỀN, trả lại shell
+#     bash scripts/run_recomb.sh --exp 2.4 --dry-run     # 16 mẫu, 4 bước, 8 ảnh
+#     bash scripts/run_recomb.sh --exp 2.4 --stages stats,report
+#     bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb
 #
-# ── Candidate B chạy TRƯỚC candidate A ──────────────────────────────────────
-# B là candidate duy nhất có thể hỏng vì lý do kiến trúc (thiếu nhãn, pan&scan
-# lén bật, nhánh không vừa VRAM). A gần như chắc chắn chạy. Chạy A trước là trả
-# ~90 phút GPU rồi mới biết B không dựng được — và §2.3 cần ĐỦ HAI cột, một cột
-# lẻ không định nghĩa được phép so sánh ghép cặp.
+# Không có `--exp` thì lấy khoá `experiment` trong configs/recombiner.yaml
+# (mặc định 2.3). Mọi tham số khác chuyển thẳng cho `python -m src.run_recomb`.
+#
+# ── HAI THÍ NGHIỆM ──────────────────────────────────────────────────────────
+#   2.3  Nhánh Recombinator có đáng không?   k = 2 -> bootstrap BCa + permutation
+#        -> runs/2.3_recombiner/ · adapters_2_3/
+#   2.4  Cấu hình MoE nào tốt hơn?           k = 5 -> Friedman + Wilcoxon/Holm
+#        -> runs/2.4_moe/        · adapters_2_4/
+#
+# §2.4 giữ NGUYÊN VẸN mọi điều kiện của §2.3 (cùng base, cùng 6400 mẫu, cùng
+# 3000 ảnh test, cùng lịch, cùng batch, cùng seed, cùng nhánh) và LUÔN dùng
+# concat — mọi candidate của §2.4 đều có nhánh Recombinator nối vào chuỗi
+# decoder. Khác nhau đúng hai con số: top-k và số expert.
+#
+# Hai thí nghiệm ghi vào HAI thư mục tách rời, nên chạy cái này không đè cái
+# kia và chạy lại cái nào cũng resume được riêng.
+#
+# ── Thứ tự chạy: candidate dễ hỏng nhất TRƯỚC ───────────────────────────────
+# §2.3: candidate B (có nhánh) trước — nó là candidate duy nhất có thể hỏng vì
+# lý do kiến trúc (thiếu nhãn, pan&scan lén bật, nhánh không vừa VRAM).
+# §2.4: candidate NẶNG nhất (E lớn nhất) trước — cùng lý lẽ, và một bảng
+# Friedman thiếu một cột thì không dùng được.
 #
 # ── KHÔNG CÒN DÒ BATCH ──────────────────────────────────────────────────────
 # `train.per_device_batch_size` × `train.grad_accum` trong configs/recombiner.yaml
@@ -51,13 +68,34 @@ fi
 export PYBIN
 
 DETACH=0
+EXP=""
 ARGS=()
+TAKE_EXP=0
 for arg in "$@"; do
+    if [ "$TAKE_EXP" = "1" ]; then
+        EXP="$arg"; ARGS+=("$arg"); TAKE_EXP=0; continue
+    fi
     case "$arg" in
         --detach|-d) DETACH=1 ;;
+        --exp) TAKE_EXP=1; ARGS+=("$arg") ;;
+        --exp=*) EXP="${arg#--exp=}"; ARGS+=("$arg") ;;
         *) ARGS+=("$arg") ;;
     esac
 done
+
+# `--exp` được kiểm Ở ĐÂY, trước khi tách tiến trình nền: với `--detach`, một
+# giá trị sai chỉ hiện ra trong log vài giây sau khi shell đã trả lại dấu nhắc,
+# và rất dễ bị đọc thành "đang chạy".
+if [ -n "$EXP" ] && [ "$EXP" != "2.3" ] && [ "$EXP" != "2.4" ]; then
+    echo "✗ --exp phải là 2.3 hoặc 2.4 (nhận: '$EXP')."
+    echo "    2.3  nhánh Recombinator: A/B, bootstrap ghép cặp + permutation"
+    echo "    2.4  MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
+    exit 2
+fi
+if [ -z "$EXP" ]; then
+    echo "⚙ Không có --exp -> lấy khoá \`experiment\` trong configs/recombiner.yaml."
+    echo "  Nói rõ ra thì chắc hơn:  --exp 2.3   hoặc   --exp 2.4"
+fi
 
 # ── 1. Token — kiểm TRƯỚC khi tách tiến trình ───────────────────────────────
 if [ -z "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
@@ -77,7 +115,7 @@ if [ -z "${WANDB_API_KEY:-}" ] && [ ! -f "$HOME/.netrc" ] \
 fi
 
 mkdir -p logs
-LOG="${RGEXP_LOG:-logs/recomb_$(date +%Y%m%d_%H%M%S).log}"
+LOG="${RGEXP_LOG:-logs/$(echo "exp${EXP:-cfg}" | tr -d '.')_$(date +%Y%m%d_%H%M%S).log}"
 
 # ── 2. Chế độ nền ───────────────────────────────────────────────────────────
 if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
@@ -91,7 +129,7 @@ if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
             >"$LOG" 2>&1 </dev/null &
         disown || true
     fi
-    echo "▶ §2.3 chạy nền (pid $!)"
+    echo "▶ §${EXP:-(theo config)} chạy nền (pid $!)"
     echo "  log   : $LOG"
     echo "  theo dõi: tail -f $LOG   ·   hoặc W&B (link in ra trong log)"
     exit 0

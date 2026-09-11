@@ -20,6 +20,21 @@ Ba chỗ phải đúng, không chỗ nào tự lộ ra nếu sai:
   3. Đệm BÊN TRÁI khi sinh (ngược với khâu train). Hệ quả: vị trí token ảnh
      khác nhau theo từng hàng, nên chỗ chèn 32 token cũng phải theo từng hàng —
      xem `recombiner.image_start_indices`.
+
+── §2.4: cùng runner, thêm Experts ─────────────────────────────────────────
+Candidate của §2.4 KHÔNG có adapter peft — nó có E bộ LoRA nằm trong
+`MoELoraLinear` và một file `moe_experts.safetensors`. Runner dựng lại đúng
+cấu hình ấy rồi nạp trọng số vào, và ba chỗ nữa phải đúng:
+
+  4. Router ở chế độ `eval` -> KHÔNG có nhiễu Gauss. Nhiễu là cơ chế thăm dò
+     lúc học; để nó chạy lúc sinh là để cùng một ảnh ra hai báo cáo khác nhau ở
+     hai lần chạy, và cả §2.4 chấm greedy chính vì muốn con số lặp lại được.
+  5. Trọng số định tuyến phải nằm trong `RoutingContext` TRƯỚC `generate`, và
+     bị xoá NGAY SAU. `strict=True` biến "quên set" thành một exception thay vì
+     một model lặng lẽ chạy nền trần — vẫn ra tiếng Anh đọc được.
+  6. `num_beams = 1`. Beam search nhân bản batch, nên hàng thứ i của chuỗi
+     không còn là ảnh thứ i và mọi ảnh bị định tuyến bằng expert của ảnh khác.
+     `RoutingContext.get` kiểm số hàng và DỪNG nếu lệch.
 """
 from __future__ import annotations
 
@@ -28,7 +43,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .. import imaging, recombiner
+from .. import imaging, moe, recombiner
 from ..config import hf_token
 from ..prompts import chat_messages
 from .base import RunnerUnusable
@@ -42,6 +57,8 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
     _gemma = None
     _img_token_id = None
     _tt_value = 0
+    _router = None
+    _route_ctx = None
 
     def load(self) -> None:
         from transformers import AutoProcessor, Gemma3ForConditionalGeneration
@@ -60,6 +77,7 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
 
         quantized = bool(stats.get("quantized", False))
         uses_branch = bool(stats.get("uses_recombiner", False))
+        uses_moe = bool(stats.get("uses_moe", False))
         hf_id = self.mcfg["hf_id"]
         tok = hf_token()
         dt = self.torch_dtype()
@@ -97,9 +115,12 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                     f"luyện lại candidate này.")
 
         base = Gemma3ForConditionalGeneration.from_pretrained(hf_id, **kw)
-        from peft import PeftModel
+        if uses_moe:
+            self.model = self._attach_moe(base, stats, adapter_dir).eval()
+        else:
+            from peft import PeftModel
 
-        self.model = PeftModel.from_pretrained(base, str(adapter_dir)).eval()
+            self.model = PeftModel.from_pretrained(base, str(adapter_dir)).eval()
         self._gemma = recombiner.unwrap_gemma(self.model)
         self._img_token_id = recombiner.image_token_id(self._gemma)
         self._tt_value = int(stats.get("token_type_value") or 0)
@@ -138,7 +159,54 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         print(f"  ✓ {self.mcfg['id']}: {hf_id} + {adapter_dir.name} "
               f"(preset={stats.get('lora_preset')}, r={stats.get('rank')}, "
               f"alpha={stats.get('alpha')}, dora={stats.get('dora')}, "
-              f"4bit={quantized}, recombinator={uses_branch})", flush=True)
+              f"4bit={quantized}, recombinator={uses_branch}, moe={uses_moe})",
+              flush=True)
+
+    # ── §2.4 ───────────────────────────────────────────────────────────────
+    def _attach_moe(self, base, stats: dict, adapter_dir: Path):
+        """Dựng lại Experts + Router THEO `train_stats.json`, rồi nạp trọng số.
+
+        Hình dạng lấy từ file thống kê của lần huấn luyện, KHÔNG từ config hiện
+        tại — cùng lý lẽ với `recombiner.load_branch`. Config có thể đã bị
+        `--set` sửa giữa stage train và stage infer, và khi đó tốt nhất là
+        `load_experts` báo lệch shape; tệ nhất là chỉ lệch `top_k` (không đổi
+        hình dạng tensor nào) và candidate `K=2·E=8` được chấm bằng `K=6`.
+        """
+        from ..backbone import find_target_modules
+
+        m = dict(stats.get("moe") or {})
+        n_e = int(m.get("n_experts") or stats.get("n_experts") or 0)
+        k = int(m.get("top_k") or stats.get("top_k") or 0)
+        if n_e < 1 or k < 1:
+            raise RunnerUnusable(
+                f"{adapter_dir}/train_stats.json nói candidate này CÓ MoE nhưng "
+                f"không ghi top_k/n_experts. Huấn luyện lại candidate này.")
+        targets = find_target_modules(base, dict(self.cfg.get("train", {}) or {}))
+        ctx, st = moe.attach_experts(
+            base, targets, n_e, int(m["rank"]), float(m["alpha"]),
+            0.0)                      # dropout = 0 khi sinh, luôn luôn
+        meta = moe.load_experts(base, adapter_dir)
+        router = moe.Router(n_experts=n_e, top_k=k,
+                            clip_c=float(m.get("logit_clip_c", 1.2)),
+                            noise=bool(m.get("noise", True)),
+                            renormalize=bool(m.get("renormalize_topk", True)))
+        # eval() -> Router.training = False -> KHÔNG có nhiễu Gauss. Đây là chỗ
+        # tính chất ấy được bảo đảm, và selftest kiểm nó.
+        router.eval()
+        self._router, self._route_ctx = router, ctx
+        print(f"  ✓ Experts: {n_e} × LoRA(r={m['rank']}) trên "
+              f"{st['n_modules']} ma trận Attn · top-k = {k} · "
+              f"{st['expert_params']:,} tham số · nạp {meta.get('n_tensors')} "
+              f"tensor từ {adapter_dir.name}", flush=True)
+        print(f"  ✓ Router: soft clip C={m.get('logit_clip_c', 1.2)} -> softmax "
+              f"-> top-{k} · nhiễu TẮT khi sinh (greedy phải lặp lại được)",
+              flush=True)
+        if int(self.gen_kwargs().get("num_beams", 1) or 1) != 1:
+            raise RunnerUnusable(
+                "generate.num_beams != 1 với MoE. Beam search nhân bản batch, "
+                "nên hàng thứ i của chuỗi không còn là ảnh thứ i và mọi ảnh bị "
+                "định tuyến bằng expert của ảnh khác.")
+        return base
 
     def generate_batch(self, batch: list[dict]) -> list[str]:
         """Sinh cho một batch, đi ĐÚNG con đường của khâu huấn luyện."""
@@ -162,8 +230,15 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                   "attention_mask": inputs.get("attention_mask"),
                   "token_type_ids": inputs.get("token_type_ids")}
             if self.branch is not None:
-                tokens, _logits = self.branch(
+                tokens, _logits, route = self.branch(
                     vis.to(next(self.branch.parameters()).dtype))
+                if self._router is not None:
+                    if route is None:
+                        raise RunnerUnusable(
+                            "candidate này có Experts nhưng nhánh trả route = "
+                            "None — nhánh đã ghi ở chế độ §2.3 (route_enabled = "
+                            "false). Huấn luyện lại candidate này.")
+                    self._route_ctx.set(self._router(route[0], route[1])["weights"])
                 # Đệm TRÁI -> mỗi hàng có vị trí token ảnh riêng.
                 at = recombiner.image_start_indices(ids, self._img_token_id)
                 kw.update(recombiner.inject_tokens(
@@ -173,7 +248,14 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                     token_type_value=self._tt_value))
             kw = {k: v for k, v in kw.items() if v is not None}
             in_len = int(kw["inputs_embeds"].shape[1])
-            out = self.model.generate(**kw, **self.gen_kwargs())
+            try:
+                out = self.model.generate(**kw, **self.gen_kwargs())
+            finally:
+                # Xoá NGAY: batch là hằng số, nên một tensor sót lại từ batch
+                # trước có đúng số hàng của batch sau và phép kiểm shape KHÔNG
+                # bắt được — vài ảnh sẽ được định tuyến bằng expert của ảnh khác.
+                if self._route_ctx is not None:
+                    self._route_ctx.clear()
 
         # Với `inputs_embeds` (và không `input_ids`), transformers trả về CHỈ
         # phần sinh mới. Nhưng hành vi đó đã đổi giữa các bản, và đoán sai theo
@@ -187,4 +269,6 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
     def unload(self) -> None:
         self.branch = None
         self._gemma = None
+        self._router = None
+        self._route_ctx = None
         super().unload()

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tự kiểm chứng §2.3 — không cần GPU, không cần mạng, không cần model.
+"""Tự kiểm chứng §2.3 và §2.4 — không cần GPU, không cần mạng, không cần model.
 
 Chạy:  python scripts/selftest_recomb.py
 
-Cái nó bảo vệ: hai loại lỗi KHÔNG ném exception và KHÔNG hiện ra ở đường loss.
+Cái nó bảo vệ: những lỗi KHÔNG ném exception và KHÔNG hiện ra ở đường loss.
 
   * Khâu thống kê. Một dấu sai trong hiệu số ghép cặp, một CI đặt nhầm đầu, một
     Holm hiệu chỉnh sai chiều — tất cả đều cho ra một bảng đọc được, và bảng đó
@@ -12,8 +12,14 @@ Cái nó bảo vệ: hai loại lỗi KHÔNG ném exception và KHÔNG hiện ra
     32 token chèn nhầm chỗ, một skip-connect nối sai nguồn, một `aux` quên
     detach — model vẫn huấn luyện, loss vẫn giảm, và candidate B chỉ đơn giản là
     kém hơn nó đáng ra phải thế.
-  * Ranh giới. §2.2 đã sang _archive/; một câu `import` còn sót lại làm cái
-    ranh giới ấy thành hình thức.
+  * §2.4 — Router và Experts. Nhiễu cộng sau top-k (không đổi được thứ hạng),
+    clipping cứng (expert chết vĩnh viễn), trọng số định tuyến không tới được
+    `MoELoraLinear` (model chạy nền TRẦN), gradient không về tới router qua
+    gradient checkpointing (router chỉ học cân tải, không biết gì về chất lượng
+    báo cáo). Cả bốn đều cho ra một model vẫn sinh tiếng Anh đọc được và một
+    đường loss trông hoàn toàn bình thường.
+  * Ranh giới. §2.2 đã archive; `stats_friedman` quay lại làm đường chạy THẬT
+    của §2.4 nhưng KHÔNG được chạm vào đường §2.3 (k = 2 thì không có Friedman).
 
 Không kiểm chất lượng model. Kiểm rằng những gì repo TUYÊN BỐ làm thì nó có làm.
 """
@@ -481,10 +487,12 @@ def branch_tests() -> None:
     check("nhánh: đóng băng `aux` sống sót qua .to()", t_freeze_survives_to)
 
     # ── cổng vào decoder ────────────────────────────────────────────────────
-    def _branch(n_labels=L_LAB, gate_init=0.0):
+    def _branch(n_labels=L_LAB, gate_init=0.0, route=False, n_experts=4):
         rcfg = {"swiglu_hidden": 32, "n_query": N_Q, "n_heads": 4,
                 "n_vis": N_VIS, "gate_init": gate_init,
-                "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"],
+                "n_experts": n_experts, "route_enabled": route,
+                "qformer": {"tasks": ["sup", "aux"],
+                            "freeze": [] if route else ["aux"],
                             "d_model": 12, "n_heads": 4, "n_layers": 1,
                             "ffn_mult": 2}}
         ccfg = {"n_classes": 3, "hidden": 16,
@@ -493,7 +501,7 @@ def branch_tests() -> None:
 
     def t_gate_zero():
         b = _branch()
-        tokens, logits = b(torch.randn(2, N_VIS, D_VIS))
+        tokens, logits, _route = b(torch.randn(2, N_VIS, D_VIS))
         eq(float(tokens.abs().max()), 0.0, 1e-12,
            "cổng khởi tạo 0 -> token vào decoder phải ĐÚNG BẰNG 0 ở bước đầu")
         true(logits is not None and float(logits.abs().sum()) > 0,
@@ -504,7 +512,7 @@ def branch_tests() -> None:
 
     def t_gate_grad():
         b = _branch()
-        tokens, _ = b(torch.randn(2, N_VIS, D_VIS))
+        tokens, _, _ = b(torch.randn(2, N_VIS, D_VIS))
         tokens.sum().backward()
         true(b.gate.grad is not None and float(b.gate.grad.abs().sum()) > 0,
              "cổng phải nhận gradient — nếu không thì nó vĩnh viễn bằng 0 và "
@@ -517,7 +525,45 @@ def branch_tests() -> None:
         true(n["route_gate"] > 0, "Route_Gate phải tồn tại (hình dạng cho mục MoE)")
         true(isinstance(b.route_gate, RouteGate))
         true(isinstance(b.cls_head, ClsHead))
+        _t, _l, route = b(torch.randn(2, N_VIS, D_VIS))
+        true(route is None,
+             "§2.3 phải trả route = None. Trả tensor rồi trông chờ người gọi bỏ "
+             "qua là một lời mời cộng nó vào loss — và ở §2.3 thì Route_Gate "
+             "phải KHÔNG có đường nào tới loss nào")
     check("nhánh: Route_Gate được dựng nhưng chỉ để giữ hình dạng", t_route_gate_inert)
+
+    def t_route_gate_active():
+        """§2.4: cùng lớp nhánh, `route_enabled` bật -> hai tensor route ra ngoài."""
+        b = _branch(route=True, n_experts=6)
+        _t, _l, route = b(torch.randn(3, N_VIS, D_VIS))
+        true(route is not None, "§2.4 phải trả (logits, log_sigma)")
+        lg, ls = route
+        true(tuple(lg.shape) == (3, 6) and tuple(ls.shape) == (3, 6),
+             f"route shape sai: {tuple(lg.shape)} / {tuple(ls.shape)}")
+        true(b.qformer.frozen == (),
+             "§2.4 KHÔNG được đóng băng `aux`: `vec_2` là nguồn định tuyến, và "
+             "để nó bị detach nghĩa là QFormer/Recombinator không bao giờ học "
+             "được cách sinh ra một vec_2 hữu ích — một MoE có router mù")
+        lg.sum().backward()
+        true(b.route_gate.proj.weight.grad is not None
+             and float(b.route_gate.proj.weight.grad.abs().sum()) > 0,
+             "Route_Gate phải nhận gradient ở §2.4")
+        rec_w = b.recombinator.swiglu.down_proj.weight
+        true(rec_w.grad is not None and float(rec_w.grad.abs().sum()) > 0,
+             "gradient của route phải chảy NGƯỢC qua QFormer tới Recombinator — "
+             "nếu không thì `vec_2` bị detach ở đâu đó và router mù")
+    check("nhánh §2.4: Route_Gate hoạt động, gradient tới Recombinator",
+          t_route_gate_active)
+
+    def t_noise_bias_init():
+        b = _branch(route=True)
+        got = float(b.route_gate.noise_proj.bias.mean())
+        eq(got, -3.0, 1e-6,
+           "bias của noise_proj phải là noise_init SAU `_init` — `_init` zero "
+           "hoá mọi bias, và bias 0 cho σ₀ ≈ 0.69, lớn hơn cả trần clipping "
+           "C = 1.2, nên top-k ở những bước đầu gần như là bốc thăm")
+    check("nhánh §2.4: nhiễu khởi tạo σ₀ nhỏ, không bị `_init` xoá",
+          t_noise_bias_init)
 
     # ── ASL ─────────────────────────────────────────────────────────────────
     def t_asl_is_bce_when_off():
@@ -712,6 +758,458 @@ def branch_tests() -> None:
     check("nhánh: n_params báo đủ từng khối", t_params_reported)
 
 
+# ═══ 3b. §2.4 — Router và Experts ════════════════════════════════════════════
+def moe_tests() -> None:
+    """Bốn bước của Route_Gate, và hai chỗ MoE hỏng mà loss vẫn giảm.
+
+    Ca hỏng thứ nhất: trọng số định tuyến KHÔNG tới được `MoELoraLinear` (quên
+    `set`, hoặc đồ thị bị cắt). Model khi đó chạy nền trần, vẫn sinh ra tiếng
+    Anh đọc được, và cột số của nó vẫn trông như kết quả thật.
+
+    Ca hỏng thứ hai: gradient không chảy ngược tới router. Router khi đó chỉ học
+    từ Aux Loss, tức là chỉ học cân tải và không biết gì về chất lượng báo cáo —
+    và cái đó KHÔNG hiện ra ở đường loss, vì Experts vẫn học bình thường.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        FAIL.append(("MoE: cần torch", "không import được torch",
+                     "cài torch rồi chạy lại — mấy phép kiểm này là phần quan "
+                     "trọng nhất của selftest §2.4"))
+        return
+
+    from src.moe import (EXPERTS_FILE, MoELoraLinear, RouteStats,
+                         RoutingContext, Router, attach_experts, aux_alpha_at,
+                         experts_exist, load_experts, save_experts,
+                         soft_logit_clip)
+
+    C = 1.2
+
+    # ── 1. Soft logit-clipping ─────────────────────────────────────────────
+    def t_clip_shape():
+        x = torch.tensor([0.0, 0.01, -0.01])
+        y = soft_logit_clip(x, C)
+        true(torch.allclose(x, y, atol=2e-4),
+             "C·tanh(x/C) phải ≈ x quanh 0, nếu không thì nó đang bóp méo cả "
+             "những logit chưa cần bão hoà")
+        big = torch.tensor([50.0, -50.0])
+        z = soft_logit_clip(big, C)
+        true(float(z.max()) < C + 1e-6 and float(z.min()) > -C - 1e-6,
+             f"phải bão hoà trong ±{C}")
+    check("router: soft clip ≈ identity quanh 0, bão hoà ở ±C", t_clip_shape)
+
+    def t_clip_grad_alive():
+        x = torch.tensor([10.0], requires_grad=True)
+        soft_logit_clip(x, C).sum().backward()
+        true(x.grad is not None and float(x.grad) > 0,
+             "gradient NGOÀI khoảng phải còn dương. `clamp` cho đúng 0 ở đây, "
+             "nên một expert bị đẩy ra ngoài không bao giờ quay lại được — nó "
+             "chết vĩnh viễn và không có gì trong log báo điều đó")
+    check("router: clip MƯỢT — expert bị ghét không chết vĩnh viễn",
+          t_clip_grad_alive)
+
+    # ── 2. Nhiễu Gauss học được ────────────────────────────────────────────
+    def t_noise_train_only():
+        r = Router(n_experts=6, top_k=2, clip_c=C, noise=True)
+        lg = torch.randn(4, 6)
+        ls = torch.full((4, 6), 0.5)
+        r.eval()
+        a = r(lg, ls)["probs"]
+        b = r(lg, ls)["probs"]
+        true(torch.allclose(a, b),
+             "ở eval PHẢI tất định. Nhiễu lúc sinh là để cùng một ảnh ra hai "
+             "báo cáo khác nhau ở hai lần chạy — và cả §2.4 chấm greedy chính "
+             "vì muốn con số lặp lại được")
+        r.train()
+        torch.manual_seed(0)
+        c = r(lg, ls)["probs"]
+        torch.manual_seed(1)
+        d = r(lg, ls)["probs"]
+        true(not torch.allclose(c, d),
+             "ở train PHẢI có nhiễu — không nhiễu thì expert xếp thứ k+1 không "
+             "bao giờ lọt được vào top-k, và nó không bao giờ học được gì")
+    check("router: nhiễu CHỈ khi train, tắt khi sinh", t_noise_train_only)
+
+    def t_noise_before_topk():
+        """Nhiễu phải đủ sức ĐỔI thứ hạng — đó là toàn bộ nghĩa của 'thăm dò'."""
+        r = Router(n_experts=4, top_k=1, clip_c=C, noise=True).train()
+        lg = torch.tensor([[0.30, 0.28, -2.0, -2.0]])
+        ls = torch.full((1, 4), 2.0)          # σ = softplus(2) ≈ 2.13
+        seen = set()
+        for s in range(40):
+            torch.manual_seed(s)
+            seen.add(int(r(lg, ls)["top_idx"][0, 0]))
+        true(len(seen) > 1,
+             "với σ lớn, top-1 phải đổi giữa các lần — nếu không thì nhiễu đang "
+             "được cộng SAU top-k (hoặc sau softmax) và nó không đổi được thứ "
+             "hạng gì cả")
+    check("router: nhiễu đứng TRƯỚC top-k (đổi được thứ hạng)", t_noise_before_topk)
+
+    # ── 3. Top-k gating ────────────────────────────────────────────────────
+    def t_topk_sparse_and_normalized():
+        r = Router(n_experts=8, top_k=3, clip_c=C, noise=False).eval()
+        w = r(torch.randn(5, 8), None)["weights"]
+        nz = (w > 0).sum(dim=-1)
+        true(bool((nz == 3).all()), f"mỗi hàng phải có ĐÚNG 3 trọng số > 0: {nz}")
+        true(torch.allclose(w.sum(-1), torch.ones(5), atol=1e-5),
+             "chuẩn hoá lại trên k: không chuẩn hoá thì ĐỘ LỚN delta LoRA đổi "
+             "theo từng ảnh vì một lý do không liên quan tới ảnh — và đổi theo "
+             "K, đúng cái §2.4 đang so")
+    check("router: top-k thưa đúng k, tổng trọng số = 1", t_topk_sparse_and_normalized)
+
+    def t_topk_picks_largest():
+        r = Router(n_experts=5, top_k=2, clip_c=C, noise=False).eval()
+        lg = torch.tensor([[0.0, 3.0, 0.0, 1.0, 0.0]])
+        w = r(lg, None)["weights"][0]
+        true(float(w[1]) > float(w[3]) > 0 and float(w[0]) == 0.0,
+             f"top-2 phải là expert 1 rồi 3: {w.tolist()}")
+    check("router: top-k chọn đúng expert có xác suất cao nhất", t_topk_picks_largest)
+
+    def t_weights_differentiable():
+        r = Router(n_experts=4, top_k=2, clip_c=C, noise=False).eval()
+        lg = torch.randn(3, 4, requires_grad=True)
+        r(lg, None)["weights"].sum().backward()
+        true(lg.grad is not None and float(lg.grad.abs().sum()) > 0,
+             "trọng số định tuyến phải KHẢ VI theo logit — nếu không, router "
+             "chỉ còn học từ Aux Loss, tức là chỉ học cân tải và không biết gì "
+             "về chất lượng báo cáo")
+    check("router: trọng số khả vi theo logit (CE dạy được router)",
+          t_weights_differentiable)
+
+    def t_k_equals_e_rejected():
+        try:
+            Router(n_experts=4, top_k=4)
+        except ValueError:
+            return
+        raise AssertionError(
+            "k = E được chấp nhận — đó là một mô hình DÀY ĐẶC mang tên MoE, "
+            "không có gì được định tuyến")
+    check("router: k > E và k = E đều bị từ chối", t_k_equals_e_rejected)
+
+    # ── 4. Aux Loss ────────────────────────────────────────────────────────
+    def t_aux_balanced_is_one():
+        E = 8
+        r = Router(n_experts=E, top_k=2, clip_c=C, noise=False).eval()
+        # logit bằng nhau + nhiều mẫu -> top-k trải đều nhờ tie-break theo chỉ số?
+        # Không dựa vào tie-break: dựng logit xoay vòng để tải đều tuyệt đối.
+        lg = torch.full((E, E), -5.0)
+        for i in range(E):
+            lg[i, i] = 5.0
+            lg[i, (i + 1) % E] = 4.0
+        out = r(lg, None)
+        eq(float(out["load"].sum()), 1.0, 1e-5, "tổng tải phải = 1")
+        true(abs(float(out["aux"]) - 1.0) < 0.05,
+             f"tải đều -> aux ≈ 1.0, nhận {float(out['aux']):.4f}")
+    check("aux: cân hoàn hảo -> 1.0", t_aux_balanced_is_one)
+
+    def t_aux_collapsed_is_high():
+        """Dồn một chỗ -> aux lớn, nhưng TRẦN của nó là E·p_max, không phải E.
+
+        Soft clipping chặn logit ở ±C, nên ngay cả khi mọi mẫu dồn vào một
+        expert thì P của nó cũng chỉ tới e^C / (e^C + (E−1)·e^−C). Con số ấy
+        phải được biết khi đọc cột `aux` trong REPORT.md: với E = 6 và C = 1.2,
+        "dồn hoàn toàn" là aux ≈ 4.1 chứ không phải 6.0, và một người đọc chờ
+        6.0 sẽ kết luận nhầm rằng tải vẫn còn khá cân.
+        """
+        import math
+
+        E = 6
+        r = Router(n_experts=E, top_k=1, clip_c=C, noise=False).eval()
+        lg = torch.full((10, E), -50.0)
+        lg[:, 2] = 50.0                      # mọi mẫu dồn vào expert 2
+        out = r(lg, None)
+        p_max = math.exp(C) / (math.exp(C) + (E - 1) * math.exp(-C))
+        eq(float(out["aux"]), E * p_max, 0.02,
+           f"aux khi dồn một chỗ phải bằng E·p_max = {E * p_max:.3f}")
+        true(float(out["aux"]) > 3.5,
+             f"và nó phải LỚN hơn hẳn 1.0 (cân): {float(out['aux']):.3f}")
+        eq(float(out["load"][2]), 1.0, 1e-6, "toàn bộ lượt định tuyến vào expert 2")
+    check("aux: dồn vào một expert -> lớn, trần là E·p_max (do clipping)",
+          t_aux_collapsed_is_high)
+
+    def t_aux_grad_through_p_only():
+        r = Router(n_experts=5, top_k=2, clip_c=C, noise=False).eval()
+        lg = torch.randn(6, 5, requires_grad=True)
+        r(lg, None)["aux"].backward()
+        true(lg.grad is not None and float(lg.grad.abs().sum()) > 0,
+             "Aux Loss phải có gradient (qua P). Không có thì nó chỉ là một con "
+             "số để in ra, và không expert nào được nhả chỗ cho expert khác")
+    check("aux: có gradient qua P (f là phép đếm, không khả vi)",
+          t_aux_grad_through_p_only)
+
+    def t_aux_warmup():
+        eq(aux_alpha_at(0, 100, 0.01, 0.1), 0.0, 1e-12)
+        eq(aux_alpha_at(5, 100, 0.01, 0.1), 0.005, 1e-12)
+        eq(aux_alpha_at(50, 100, 0.01, 0.1), 0.01, 1e-12)
+        eq(aux_alpha_at(0, 100, 0.01, 0.0), 0.01, 1e-12)
+    check("aux: α warmup tuyến tính rồi phẳng", t_aux_warmup)
+
+    # ── 5. MoELoraLinear ───────────────────────────────────────────────────
+    D_IN, D_OUT, E, R = 16, 12, 4, 3
+
+    def _moe_linear(ctx=None):
+        ctx = ctx or RoutingContext()
+        base = nn.Linear(D_IN, D_OUT, bias=False)
+        return MoELoraLinear(base, E, R, alpha=2 * R, dropout=0.0, ctx=ctx), ctx, base
+
+    def t_delta_zero_at_init():
+        m, ctx, base = _moe_linear()
+        x = torch.randn(2, 5, D_IN)
+        ctx.set(torch.full((2, E), 1.0 / E))
+        true(torch.allclose(m(x), base(x), atol=1e-6),
+             "lora_B khởi tạo 0 -> delta = 0 ở bước 0 với MỌI cách định tuyến. "
+             "Khác 0 là decoder đóng băng nhận E nhiễu ngẫu nhiên ngay từ bước "
+             "đầu, và các expert tiêu những bước quý nhất của one-cycle để học "
+             "cách phớt lờ nhau")
+    check("expert: delta = 0 ở bước 0 (lora_B khởi tạo 0)", t_delta_zero_at_init)
+
+    def t_only_topk_contributes():
+        m, ctx, base = _moe_linear()
+        with torch.no_grad():
+            for e in range(E):
+                m.lora_B[e].normal_(0, 1.0 + e)
+        x = torch.randn(1, 4, D_IN)
+        w0 = torch.zeros(1, E); w0[0, 0] = 1.0
+        w1 = torch.zeros(1, E); w1[0, 1] = 1.0
+        ctx.set(w0); y0 = m(x)
+        ctx.set(w1); y1 = m(x)
+        true(not torch.allclose(y0, y1, atol=1e-5),
+             "hai cách định tuyến khác nhau PHẢI cho hai đầu ra khác nhau — nếu "
+             "không thì trọng số định tuyến không tới được delta và mọi ảnh "
+             "dùng cùng một expert")
+        # Đúng nghĩa "không được chọn": expert 1..3 không đóng góp gì vào y0.
+        with torch.no_grad():
+            h = torch.einsum("btd,rd->btr", x, m.lora_A[0])
+            d0 = torch.einsum("btr,or->bto", h, m.lora_B[0]) * m.scaling
+        true(torch.allclose(y0 - base(x), d0, atol=1e-4),
+             "với w = one-hot(0), delta phải ĐÚNG BẰNG nhánh của expert 0 — "
+             "expert ngoài top-k đóng góp 0, không phải 'đóng góp nhỏ'")
+    check("expert: chỉ expert trong top-k đóng góp, và đóng góp đúng công thức",
+          t_only_topk_contributes)
+
+    def t_ctx_strict():
+        m, ctx, _ = _moe_linear()
+        ctx.clear()
+        try:
+            m(torch.randn(2, 3, D_IN))
+        except RuntimeError as e:
+            true("định tuyến" in str(e), str(e))
+            return
+        raise AssertionError(
+            "forward mà không có trọng số định tuyến lại chạy im lặng — model "
+            "khi đó là nền TRẦN, vẫn ra tiếng Anh đọc được, và cột số của nó "
+            "vẫn trông như kết quả thật")
+    check("expert: quên set trọng số định tuyến thì DỪNG, không chạy nền trần",
+          t_ctx_strict)
+
+    def t_ctx_batch_mismatch():
+        m, ctx, _ = _moe_linear()
+        ctx.set(torch.full((3, E), 1.0 / E))
+        try:
+            m(torch.randn(2, 3, D_IN))        # 2 hàng chuỗi, 3 hàng trọng số
+        except RuntimeError as e:
+            true("nhân bản batch" in str(e) or "hàng" in str(e), str(e))
+            return
+        raise AssertionError(
+            "số hàng lệch mà vẫn chạy — đó đúng là ca beam search nhân bản "
+            "batch, và khi đó mọi ảnh bị định tuyến bằng expert của ảnh khác")
+    check("expert: số hàng lệch (beam search) thì DỪNG", t_ctx_batch_mismatch)
+
+    # ── 6. Gắn vào model, ghi/nạp ──────────────────────────────────────────
+    class _Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([
+                nn.ModuleDict({"q_proj": nn.Linear(D_IN, D_IN, bias=False),
+                               "o_proj": nn.Linear(D_IN, D_IN, bias=False)})
+                for _ in range(2)])
+
+        def forward(self, x):
+            for lyr in self.layers:
+                x = lyr["o_proj"](lyr["q_proj"](x))
+            return x
+
+    def _names():
+        return [f"layers.{i}.{n}" for i in range(2) for n in ("q_proj", "o_proj")]
+
+    def t_attach_replaces_and_freezes():
+        mdl = _Tiny()
+        ctx, st = attach_experts(mdl, _names(), E, R, 2 * R, 0.0)
+        eq(st["n_modules"], 4, 0)
+        true(all(isinstance(dict(mdl.named_modules())[n], MoELoraLinear)
+                 for n in _names()), "không phải module nào cũng được thay")
+        base_grads = [p.requires_grad for n, p in mdl.named_parameters()
+                      if "base_layer" in n]
+        true(base_grads and not any(base_grads),
+             "trọng số NỀN phải đóng băng — §2.4 vẫn là fine-tuning tham số "
+             "hiệu quả trên một decoder đóng băng, y như §2.3")
+        train = {n for n, p in mdl.named_parameters() if p.requires_grad}
+        true(train and all(("lora_A" in n or "lora_B" in n) for n in train),
+             f"chỉ expert được học, nhận: {sorted(train)[:4]}")
+    check("expert: gắn đúng 4 chỗ, nền đóng băng, chỉ expert học",
+          t_attach_replaces_and_freezes)
+
+    def t_attach_twice_rejected():
+        mdl = _Tiny()
+        attach_experts(mdl, _names(), E, R, 2 * R, 0.0)
+        try:
+            attach_experts(mdl, _names(), E, R, 2 * R, 0.0)
+        except RuntimeError:
+            return
+        raise AssertionError("gắn hai lần là hai tầng LoRA lồng nhau")
+    check("expert: gắn hai lần thì DỪNG", t_attach_twice_rejected)
+
+    def t_expert_roundtrip():
+        import tempfile
+
+        m1 = _Tiny()
+        attach_experts(m1, _names(), E, R, 2 * R, 0.0)
+        with torch.no_grad():
+            for n, p in m1.named_parameters():
+                if "lora_B" in n:
+                    p.normal_(0, 0.5)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            true(not experts_exist(d))
+            save_experts(m1, d, {"n_experts": E, "top_k": 2, "rank": R})
+            true(experts_exist(d) and (d / EXPERTS_FILE).exists())
+            m2 = _Tiny()
+            attach_experts(m2, _names(), E, R, 2 * R, 0.0)
+            load_experts(m2, d)
+            s1, s2 = dict(m1.named_parameters()), dict(m2.named_parameters())
+            for n in s1:
+                if "lora" in n:
+                    true(torch.allclose(s1[n], s2[n], atol=1e-6), f"lệch ở {n}")
+    check("expert: ghi rồi nạp lại cho ĐÚNG trọng số", t_expert_roundtrip)
+
+    def t_expert_load_wrong_shape():
+        import tempfile
+
+        m1 = _Tiny()
+        attach_experts(m1, _names(), E, R, 2 * R, 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            save_experts(m1, d, {"n_experts": E})
+            m2 = _Tiny()
+            attach_experts(m2, _names(), E + 2, R, 2 * R, 0.0)   # E khác
+            try:
+                load_experts(m2, d)
+            except RuntimeError as e:
+                true("shape" in str(e) or "n_experts" in str(e), str(e))
+                return
+        raise AssertionError(
+            "nạp trọng số của E khác mà không dừng — candidate `E=4` khi đó "
+            "được chấm bằng một bộ expert nửa ngẫu nhiên")
+    check("expert: nạp nhầm số expert thì DỪNG", t_expert_load_wrong_shape)
+
+    def t_load_missing_experts():
+        import tempfile
+
+        mdl = _Tiny()
+        attach_experts(mdl, _names(), E, R, 2 * R, 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                load_experts(mdl, Path(d))
+            except FileNotFoundError as e:
+                true("ngẫu nhiên" in str(e) or "NGẪU NHIÊN" in str(e), str(e))
+                return
+        raise AssertionError("thiếu file expert mà vẫn chạy tiếp")
+    check("expert: thiếu file trọng số thì DỪNG", t_load_missing_experts)
+
+    # ── 7. Gradient checkpointing KHÔNG-reentrant ──────────────────────────
+    def t_grad_through_checkpoint():
+        """Ca hỏng đắt nhất của cả §2.4, và nó KHÔNG hiện ra ở đường loss.
+
+        Trọng số định tuyến được tính MỘT LẦN rồi đọc lại trong TỪNG lớp
+        decoder qua `RoutingContext` — tức là nó là một tensor bắt từ NGOÀI đoạn
+        được checkpoint. Với checkpointing reentrant, backward đi ngược vào đồ
+        thị của nó nhiều lần: hoặc nổ "backward through the graph a second
+        time", hoặc router nhận thiếu gradient.
+
+        Phép kiểm này dựng đúng hình dạng ấy — hai "lớp" cùng đọc một tensor
+        trọng số — và đòi gradient về tới NGUỒN của trọng số đó.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        mdl = _Tiny()
+        ctx, _ = attach_experts(mdl, _names(), E, R, 2 * R, 0.0)
+        with torch.no_grad():
+            for n, p in mdl.named_parameters():
+                if "lora_B" in n:
+                    p.normal_(0, 0.5)
+        src = torch.randn(2, E, requires_grad=True)      # "vec_2 -> logit"
+        w = torch.softmax(src, -1)
+        ctx.set(w)
+        x = torch.randn(2, 3, D_IN)
+        for lyr in mdl.layers:
+            x = checkpoint(lambda t, l=lyr: l["o_proj"](l["q_proj"](t)), x,
+                           use_reentrant=False)
+        x.sum().backward()
+        true(src.grad is not None and float(src.grad.abs().sum()) > 0,
+             "gradient KHÔNG về tới nguồn của trọng số định tuyến qua "
+             "checkpointing. Router khi đó chỉ học từ Aux Loss — chỉ học cân "
+             "tải, không biết gì về chất lượng báo cáo — và đường loss trông "
+             "hoàn toàn bình thường vì Experts vẫn học")
+    check("MoE: gradient của router sống sót qua gradient checkpointing",
+          t_grad_through_checkpoint)
+
+    def t_forward_loss_does_not_clear():
+        """`_forward_loss` KHÔNG được xoá ngữ cảnh — backward còn cần nó.
+
+        Checkpointing không-reentrant tính lại forward trong lúc backward, tức
+        là `MoELoraLinear.forward` chạy lần thứ hai SAU khi `model(...)` đã trả
+        về. Một `finally: route_ctx.clear()` trong `_forward_loss` trông rất
+        đúng và nó làm chết mọi bước huấn luyện §2.4 ở `.backward()`.
+
+        Kiểm bằng NGUỒN thay vì bằng cách chạy: dựng được tình huống thật cần cả
+        một decoder Gemma, và phép kiểm này phải chạy trong vài giây trên CPU.
+        """
+        import inspect as _i
+
+        from src import train_recomb as tr
+
+        src_fwd = _i.getsource(tr._forward_loss)
+        true("clear()" not in src_fwd,
+             "_forward_loss xoá ngữ cảnh định tuyến. Lần tính lại forward trong "
+             "backward sẽ đọc phải None và cả bước huấn luyện chết — xoá phải "
+             "nằm SAU `.backward()` trong vòng lặp.")
+        src_loop = _i.getsource(tr._train_once)
+        true("route_ctx.clear()" in src_loop,
+             "vòng lặp không xoá ngữ cảnh sau backward — trọng số của "
+             "micro-batch trước ở lại, và vì batch là hằng số thì phép kiểm số "
+             "hàng KHÔNG bắt được")
+    check("MoE: ngữ cảnh định tuyến được xoá SAU backward, không trước",
+          t_forward_loss_does_not_clear)
+
+    # ── 8. Thống kê định tuyến ─────────────────────────────────────────────
+    def t_route_stats_dead():
+        rs = RouteStats(5)
+        r = Router(n_experts=5, top_k=1, clip_c=C, noise=False).eval()
+        lg = torch.full((8, 5), -50.0)
+        lg[:, 0] = 50.0
+        for _ in range(3):
+            rs.update(r(lg, None))
+        s = rs.summary()
+        eq(s["n_dead_experts"], 4, 0,
+           "4/5 expert chưa nhận ảnh nào — bảng §2.4 phải nói ra điều đó, vì "
+           "một candidate E=5 chỉ dùng 1 expert là một candidate E=1 mang nhãn "
+           "E=5")
+        true(s["load_cv"] > 1.0, "tải dồn một chỗ -> CV lớn")
+        true(abs(s["aux_mean"] - 5.0) < 0.5, f"aux ≈ E: {s['aux_mean']}")
+    check("MoE: thống kê định tuyến bắt được expert chết", t_route_stats_dead)
+
+    def t_route_stats_even():
+        rs = RouteStats(4)
+        r = Router(n_experts=4, top_k=2, clip_c=C, noise=False).eval()
+        lg = torch.tensor([[2.0, 1.0, -3.0, -3.0], [-3.0, -3.0, 2.0, 1.0]])
+        rs.update(r(lg, None))
+        s = rs.summary()
+        eq(s["n_dead_experts"], 0, 0)
+        true(s["load_cv"] < 1e-6, f"tải đều -> CV ≈ 0: {s['load_cv']}")
+    check("MoE: CV = 0 khi tải chia đều", t_route_stats_even)
+
+
 # ═══ 4. Cấu hình và ranh giới _archive ═══════════════════════════════════════
 def config_tests() -> None:
     from src.config import load_config
@@ -792,9 +1290,171 @@ def config_tests() -> None:
         s = cfg["stats"]
         for k in ("alpha", "n_perm", "n_boot", "dz_floor"):
             true(k in s, f"thiếu stats.{k}")
-        true("friedman" not in str(s).lower(),
-             "k = 2 thì không có chỗ cho Friedman trong config")
-    check("config: khối stats đủ cho bootstrap + permutation", t_stats_block)
+        # §2.3 vẫn KHÔNG dùng Friedman (k = 2). Khối `stats.friedman` có mặt là
+        # cho §2.4, và nó phải nằm gọn trong khối con ấy — một khoá Friedman
+        # trôi ra ngoài là một đường ngầm cho §2.3 đọc nhầm.
+        outer = {k: v for k, v in s.items() if k != "friedman"}
+        true("friedman" not in str(outer).lower() and "wilcoxon" not in str(outer).lower(),
+             "tham số Friedman phải nằm trong stats.friedman, không rải ra "
+             "ngoài: k = 2 của §2.3 không có chỗ cho chúng")
+        f = dict(s.get("friedman") or {})
+        for k in ("rrb_floor", "kendall_w_floor", "zero_method"):
+            true(k in f, f"thiếu stats.friedman.{k} (§2.4 cần)")
+    check("config: stats đủ cho CẢ bootstrap/permutation (2.3) và Friedman (2.4)",
+          t_stats_block)
+
+    # ── §2.4 ────────────────────────────────────────────────────────────────
+    def t_moe_block():
+        m = cfg["moe"]
+        true(not bool(m.get("enabled", False)),
+             "moe.enabled phải là false TRONG FILE: `--exp` là nguồn sự thật "
+             "duy nhất cho câu 'đang chạy mục nào'. Để true ở đây nghĩa là chạy "
+             "`--exp 2.3` vẫn ra một §2.3 có Route_Gate hoạt động — không phải "
+             "mục nào cả")
+        r = dict(m["router"])
+        eq(float(r["logit_clip_c"]), 1.2, 1e-12,
+           "soft logit-clipping C = 1.2 theo đặc tả §2.4.b.i")
+        true(bool(r.get("noise", True)), "Learnable Gaussian Noise phải BẬT")
+        true(float(r.get("noise_init", 0.0)) < -1.0,
+             f"noise_init = {r.get('noise_init')} cho σ₀ quá lớn. softplus(0) ≈ "
+             f"0.69 lớn hơn cả trần clipping 1.2, và top-k ở những bước đầu khi "
+             f"đó gần như là bốc thăm")
+        true(bool(r.get("renormalize_topk", True)),
+             "không chuẩn hoá lại trên k thì độ lớn delta LoRA đổi theo K — "
+             "đúng cái §2.4 đang so")
+        a = dict(m["aux"])
+        true(0.0 < float(a["alpha"]) < 0.5,
+             f"aux.alpha = {a['alpha']}: phải dương và NHỎ so với CE. CE là mục "
+             f"tiêu thật của thí nghiệm; α ngang CE là để cân tải kéo decoder đi")
+        true(str(a.get("kind")) == "switch_load_balance",
+             "Aux Loss phải là dạng load-balancing (Switch/GShard)")
+        true(str(dict(m["expert"]).get("method", "lora")) == "lora",
+             "Experts là LoRA — DoRA phải chuẩn hoá cột mỗi bước, và với mỗi "
+             "ảnh một tổ hợp expert khác nhau thì chuẩn ấy phải tính lại theo "
+             "từng ảnh trên nền 4-bit")
+    check("config §2.4: router đúng đặc tả (nhiễu · clip 1.2 · top-k · aux)",
+          t_moe_block)
+
+    def t_moe_arms():
+        from src.run_recomb import moe_arms
+
+        arms = moe_arms(cfg)
+        eq(len(arms), 5, 0, "§2.4 có ĐÚNG năm cấu hình (K, E) trong đề cương")
+        want = {(2, 4), (4, 6), (4, 8), (6, 8), (6, 10)}
+        got = {(int(a["top_k"]), int(a["n_experts"])) for a in arms}
+        true(got == want, f"danh sách (K, E) lệch đề cương: {sorted(got)}")
+        for a in arms:
+            true(bool(a["recomb"]),
+                 f"{a['id']}: §2.4 LUÔN dùng concat — `recomb` là hằng số, "
+                 f"không phải một khoá ai đó tắt được bằng một lần gõ")
+            true(int(a["top_k"]) < int(a["n_experts"]),
+                 f"{a['id']}: k phải NHỎ HƠN E, nếu không thì không có gì được "
+                 f"định tuyến")
+        true(len({a["id"] for a in arms}) == 5, "id candidate phải duy nhất")
+    check("config §2.4: đúng 5 cấu hình (K, E), đều dùng concat", t_moe_arms)
+
+    def t_moe_arm_keys_required():
+        from src.config import Cfg
+        from src.run_recomb import moe_arms
+
+        bad = Cfg({"arms_moe": [{"id": "x", "n_experts": 4, "enabled": True}]})
+        try:
+            moe_arms(bad)
+        except ValueError as e:
+            true("top_k" in str(e), str(e))
+            return
+        raise AssertionError(
+            "candidate thiếu `top_k` mà không dừng — bảng Friedman khi đó có "
+            "một hàng mang nhãn sai")
+    check("config §2.4: candidate thiếu top_k/n_experts thì DỪNG",
+          t_moe_arm_keys_required)
+
+    def t_moe_spec_rejects_k_eq_e():
+        from src.backbone import TrainUnusable
+        from src.config import Cfg
+        from src.train_recomb import moe_spec
+
+        c = Cfg({**{k: v for k, v in cfg.items()},
+                 "moe": {**dict(cfg["moe"]), "enabled": True}})
+        preset = {"id": "qdora_r4", "method": "qdora", "rank": 4, "alpha": 8}
+        ok = moe_spec(c, {"id": "a", "top_k": 2, "n_experts": 4}, preset)
+        eq(ok["rank"], 4, 0, "rank của expert mặc định theo lora.preset")
+        for bad in ({"id": "b", "top_k": 4, "n_experts": 4},
+                    {"id": "c", "top_k": 9, "n_experts": 4},
+                    {"id": "d", "top_k": 0, "n_experts": 4}):
+            try:
+                moe_spec(c, bad, preset)
+            except TrainUnusable:
+                continue
+            raise AssertionError(f"moe_spec nhận cấu hình vô nghĩa: {bad}")
+    check("config §2.4: moe_spec từ chối k ≥ E và k thiếu",
+          t_moe_spec_rejects_k_eq_e)
+
+    def t_effective_rcfg():
+        from src.config import Cfg
+        from src.train_recomb import effective_rcfg
+
+        c = Cfg(dict(cfg))
+        base = effective_rcfg(c, None)
+        true(list(base["qformer"]["freeze"]) == ["aux"],
+             "§2.3 phải giữ nguyên `freeze: [aux]`")
+        true(not base.get("route_enabled", False), "§2.3: route_enabled tắt")
+        spec = {"n_experts": 10, "noise_init": -3.0}
+        eff = effective_rcfg(c, spec)
+        true(list(eff["qformer"]["freeze"]) == [],
+             "§2.4 KHÔNG đóng băng `aux`: `vec_2` là nguồn định tuyến, và để nó "
+             "bị detach nghĩa là router mù trong khi loss vẫn giảm bình thường")
+        eq(eff["n_experts"], 10, 0)
+        true(eff["route_enabled"])
+        true(list(c["recombiner"]["qformer"]["freeze"]) == ["aux"],
+             "effective_rcfg KHÔNG được sửa config gốc tại chỗ — sửa là "
+             "candidate chạy SAU thừa hưởng trạng thái của candidate chạy TRƯỚC")
+    check("config §2.4: effective_rcfg mở `aux`, không đụng config gốc",
+          t_effective_rcfg)
+
+    def t_moe_train_order():
+        from src.run_recomb import moe_arms, train_order
+
+        arms = moe_arms(cfg)
+        order = [a["id"] for a in train_order(arms, "2.4")]
+        true(order[0] == "k6_e10",
+             f"candidate NẶNG nhất (E lớn nhất) phải chạy trước, nhận {order}. "
+             f"Chạy nó cuối là trả bốn lượt huấn luyện rồi mới biết bảng thiếu "
+             f"một cột — và Friedman đòi thiết kế khối ĐẦY ĐỦ")
+        true([a["id"] for a in arms] != order,
+             "thứ tự trình bày và thứ tự chạy phải là hai thứ tách rời")
+    check("điều phối §2.4: candidate nặng nhất chạy trước", t_moe_train_order)
+
+    def t_separate_output_dirs():
+        o = cfg["output"]
+        true(str(o["subdir"]) != str(o["subdir_moe"]),
+             "hai thí nghiệm phải ghi vào HAI thư mục runs/ khác nhau")
+        true(str(o["adapter_dir"]) != str(o["adapter_dir_moe"]),
+             "trộn adapter hai mục trong một thư mục là mở đường cho "
+             "`already_trained()` nhận nhầm candidate rồi bỏ qua stage train")
+    check("config: §2.3 và §2.4 ghi vào hai thư mục tách rời",
+          t_separate_output_dirs)
+
+    def t_shared_conditions():
+        """§2.4 'giữ nguyên vẹn mọi điều kiện §2.3' — kiểm bằng CẤU TRÚC file.
+
+        Không phải bằng cách so hai bảng số, mà bằng cách đòi hai mục đọc CÙNG
+        một khối config: nếu một khoá dữ liệu/huấn luyện xuất hiện riêng trong
+        `moe` hay trong một candidate, thì điều kiện đã có chỗ để lệch.
+        """
+        forbidden = {"n_train", "n_test", "seed", "max_seq_len", "n_epochs",
+                     "per_device_batch_size", "grad_accum", "schedule",
+                     "max_lr", "image_max_side", "do_pan_and_scan", "hf_id"}
+        leak = forbidden & set(cfg["moe"])
+        true(not leak, f"khối `moe` mang khoá điều kiện riêng: {sorted(leak)}")
+        for a in cfg["arms_moe"]:
+            extra = set(a) - {"id", "name", "top_k", "n_experts", "enabled"}
+            true(not extra,
+                 f"candidate {a.get('id')} mang thêm khoá {sorted(extra)}. "
+                 f"Mọi thứ khác PHẢI ở khối chung — một khoá riêng trong "
+                 f"candidate là một biến thứ ba trong một bảng đang so hai biến")
+    check("config §2.4: không khoá điều kiện nào tách khỏi khối chung",
+          t_shared_conditions)
 
     def t_primary_metric():
         p = str(cfg["metrics"]["primary"])
@@ -849,10 +1509,37 @@ def config_tests() -> None:
     check("ranh giới: không file nào trong src/ import _archive", t_no_archive_import)
 
     def t_no_friedman_import():
-        bad = _imports("stats_friedman")
-        true(not bad, f"§2.3 không được phụ thuộc stats_friedman: {bad}")
-    check("ranh giới: §2.3 không dùng stats_friedman (đã archive)",
-          t_no_friedman_import)
+        """`stats_friedman` là của §2.4 — và CHỈ của §2.4.
+
+        Bản trước của phép kiểm này đòi không file nào trong `src/` import nó,
+        vì §2.2 đã archive và §2.3 (k = 2) không có chỗ cho Friedman. §2.4 thì
+        k = 5, nên module ấy quay lại làm một đường chạy THẬT: nó được dùng lại
+        NGUYÊN VĂN, cùng bộ đã có ~30 phép kiểm riêng trong
+        `scripts/selftest_friedman.py` và đã cho ra bảng §2.2. Viết một bản thứ
+        hai là mời một lỗi dấu vào giữa hai mục.
+
+        Cái phép kiểm này còn bảo vệ: đường §2.3 KHÔNG được chạm vào nó. Một
+        `import` trong `train_recomb`, `stats_ab`, `report_recomb` hay
+        `recombiner` nghĩa là hai họ kiểm định đã trộn vào nhau, và khi đó
+        "k = 2 thì không dùng Friedman" thành một câu trong README chứ không
+        phải một sự thật của code.
+        """
+        allowed = {"src/run_recomb.py", "src/report_moe.py"}
+        bad = [f for f in _imports("stats_friedman")
+               if f.replace("\\", "/") not in allowed]
+        true(not bad,
+             f"chỉ đường §2.4 được dùng stats_friedman ({sorted(allowed)}); "
+             f"đang thấy thêm: {bad}")
+    check("ranh giới: stats_friedman CHỈ thuộc đường §2.4", t_no_friedman_import)
+
+    def t_moe_not_in_23_path():
+        bad = [f for f in _imports("moe")
+               if f.replace("\\", "/") not in {
+                   "src/train_recomb.py", "src/runners/gemma3_recomb.py",
+                   "src/moe.py"}]
+        true(not bad, f"src/moe.py lọt vào đường §2.3: {bad}")
+    check("ranh giới: src/moe.py chỉ được dùng ở đường huấn luyện/sinh",
+          t_moe_not_in_23_path)
 
     def t_no_train_import():
         bad = [f for f in _imports("train") if "train_recomb" not in f]
@@ -888,8 +1575,8 @@ def config_tests() -> None:
 
 # ═══ main ════════════════════════════════════════════════════════════════════
 def main() -> int:
-    print("═══ selftest §2.3 — thống kê · nhãn · nhánh Recombinator · config ═══\n")
-    for fn in (stats_tests, label_tests, branch_tests, config_tests):
+    print("═══ selftest §2.3 + §2.4 — thống kê · nhãn · nhánh · MoE · config ═══\n")
+    for fn in (stats_tests, label_tests, branch_tests, moe_tests, config_tests):
         fn()
     for name in PASS:
         print(f"  ✓ {name}")

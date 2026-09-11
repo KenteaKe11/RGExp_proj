@@ -1,13 +1,35 @@
-"""§2.3 — trọn thí nghiệm hai candidate trong MỘT lệnh.
+"""§2.3 và §2.4 — trọn một thí nghiệm trong MỘT lệnh. Chọn bằng `--exp`.
 
-    python -m src.run_recomb                  # data -> train B,A -> infer B,A -> chấm -> bootstrap+permutation -> báo cáo -> push
-    python -m src.run_recomb --dry-run        # 8 ảnh, 4 bước train, không đẩy Hub
-    python -m src.run_recomb --stages stats,report
-    python -m src.run_recomb --arms lora_recomb
+    python -m src.run_recomb --exp 2.3        # A (LoRA) vs B (LoRA + nhánh)
+    python -m src.run_recomb --exp 2.4        # 5 cấu hình (top-k, n_experts)
+    python -m src.run_recomb --exp 2.4 --dry-run
+    python -m src.run_recomb --exp 2.4 --stages stats,report
+    python -m src.run_recomb --exp 2.3 --arms lora_recomb
 
 Mọi stage resume được.
 
-── Vì sao candidate B chạy TRƯỚC candidate A ────────────────────────────────
+── HAI THÍ NGHIỆM, MỘT ĐƯỜNG CODE ──────────────────────────────────────────
+Khác nhau đúng ba chỗ, và cả ba đều hiện ra trong file này:
+
+  1. DANH SÁCH CANDIDATE. §2.3 đọc `arms` (2 candidate, cờ `recomb` phân biệt);
+     §2.4 đọc `arms_moe` (5 candidate, (top_k, n_experts) phân biệt) và MỌI
+     candidate đều có `recomb = True` — §2.4 luôn dùng concat.
+  2. THỨ TỰ CHẠY. §2.3: B trước A. §2.4: candidate NẶNG nhất trước.
+  3. KIỂM ĐỊNH. k = 2 -> bootstrap ghép cặp (BCa) + permutation. k = 5 ->
+     Friedman tổng thể, rồi hậu kiểm Wilcoxon + Holm trên những metric đã qua
+     cổng.
+
+Mọi thứ còn lại — data, base, prompt, ảnh, nhánh Recombinator, ASL, batch,
+lịch học, metric — đi qua CÙNG code và CÙNG khối config. Đó là nghĩa cơ học
+của "§2.4 giữ nguyên vẹn mọi điều kiện thí nghiệm tại §2.3": không phải một
+lời hứa trong README mà là một sự thật không có chỗ để lệch.
+
+Hai thư mục kết quả tách rời (`output.subdir` vs `output.subdir_moe`,
+`adapter_dir` vs `adapter_dir_moe`): ghi đè lên nhau là mất đúng cái bảng mà
+mục kia lấy làm mốc nền, và trộn adapter hai mục trong một thư mục là mở đường
+cho `already_trained()` nhận nhầm candidate rồi bỏ qua stage train.
+
+── Vì sao candidate B chạy TRƯỚC candidate A (§2.3) ─────────────────────────
 B là candidate nặng hơn ở cả train lẫn sinh, và nó là candidate DUY NHẤT có thể
 hỏng vì lý do kiến trúc: thiếu nhãn, pan&scan lén bật, nhánh không vừa VRAM.
 A thì gần như chắc chắn chạy — nó là một arm LoRA bình thường.
@@ -40,6 +62,7 @@ from .config import (Cfg, add_common_args, hf_token, load_config,
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
+EXPERIMENTS = ("2.3", "2.4")
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
 
 
@@ -114,13 +137,64 @@ def enabled_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
     return arms
 
 
-def train_order(arms: list[dict]) -> list[dict]:
-    """Candidate B trước, A sau — xem docstring module.
+def moe_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
+    """Các candidate của §2.4, với `recomb` ĐÓNG CỨNG bằng True.
 
-    Chỉ đổi THỨ TỰ CHẠY. Mọi chỗ báo cáo (bảng, manifest, hiệu số A↔B) vẫn dùng
-    `arms` theo thứ tự khai báo, vì "B trước" là một quyết định vận hành và nó
-    không được phép rò vào cách trình bày kết quả.
+    §2.4 LUÔN dùng concat, nên `recomb` ở đây không phải một khoá mà một hằng
+    số: nó không nằm trong `arms_moe` để không ai tắt được nó bằng một lần gõ.
+    Không nhánh thì không có `vec_2`, và Route_Gate không có gì để đọc — đó
+    không phải một biến thể của §2.4, nó là một thí nghiệm khác.
+
+    `top_k` và `n_experts` thì BẮT BUỘC phải khai: chúng là hai con số §2.4
+    đang so, và một candidate lặng lẽ nhận giá trị mặc định nghĩa là bảng kết
+    quả có một hàng mang nhãn sai.
     """
+    arms = []
+    for a in cfg.get("arms_moe", []) or []:
+        a = dict(a)
+        if not a.get("enabled", True):
+            continue
+        for key in ("top_k", "n_experts"):
+            if key not in a:
+                raise ValueError(
+                    f"candidate §2.4 {a.get('id')!r} không khai `{key}`. Hai con "
+                    f"số (top_k, n_experts) là thứ DUY NHẤT phân biệt năm "
+                    f"candidate — mặc định ngầm ở đây là một hàng mang nhãn sai "
+                    f"trong bảng Friedman.")
+        a["recomb"] = True
+        arms.append(a)
+    if not arms:
+        raise ValueError("config không có `arms_moe` nào được bật.")
+    if only:
+        arms = [a for a in arms if a["id"] in only]
+    return arms
+
+
+def select_arms(cfg: Cfg, exp: str, only: set[str] | None = None) -> list[dict]:
+    return moe_arms(cfg, only) if exp == "2.4" else enabled_arms(cfg, only)
+
+
+def train_order(arms: list[dict], exp: str = "2.3") -> list[dict]:
+    """Thứ tự CHẠY — không phải thứ tự trình bày.
+
+    §2.3: candidate B trước, A sau (xem docstring module).
+
+    §2.4: candidate NẶNG nhất trước — E lớn nhất, rồi K lớn nhất. Cùng lý lẽ,
+    một bậc rõ hơn: `n_experts` nhân thẳng vào activation LoRA (B×T×E×r) và vào
+    số tham số học được, nên `K=6·E=10` là candidate duy nhất có thể không vừa
+    VRAM. Chạy nó cuối nghĩa là trả bốn lượt huấn luyện rồi mới biết bảng §2.4
+    thiếu một cột — và một bảng Friedman thiếu cột thì hoặc phải bỏ hẳn một
+    candidate khỏi thiết kế khối, hoặc không dùng được.
+
+    Thứ tự này KHÔNG được phép ảnh hưởng tới kết quả, và đó là điều kiện chứ
+    không phải hy vọng: seed và thứ tự dữ liệu đặt lại trước MỖI candidate bằng
+    một Generator riêng, batch là hằng số trong config, VRAM được dọn giữa hai
+    candidate. Đổi thứ tự mà bảng đổi theo là một chỗ rò trạng thái, và đó là lỗi.
+    """
+    if exp == "2.4":
+        return sorted(arms, key=lambda a: (-int(a.get("n_experts", 0)),
+                                           -int(a.get("top_k", 0)),
+                                           str(a.get("id"))))
     return sorted(arms, key=lambda a: 0 if a.get("recomb") else 1)
 
 
@@ -149,9 +223,14 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="§2.3 Recombinator A/B — bootstrap + permutation, trọn gói.")
+        description="§2.3 (Recombinator A/B) hoặc §2.4 (MoE, 5 cấu hình) — "
+                    "trọn gói, chọn bằng --exp.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
+    ap.add_argument("--exp", default=None, choices=list(EXPERIMENTS),
+                    help="2.3 = nhánh Recombinator (A/B, bootstrap+permutation); "
+                         "2.4 = MoE (5 cấu hình top-k/expert, Friedman). Mặc "
+                         "định lấy từ khoá `experiment` trong config.")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
@@ -165,6 +244,27 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config, a.overrides)
+
+    # ── Chọn thí nghiệm ────────────────────────────────────────────────────
+    # `--exp` thắng config; config chỉ là mặc định. Và `moe.enabled` được đặt
+    # TỪ ĐÂY, không đọc từ file: để nó là một khoá người dùng sửa tay nghĩa là
+    # có hai nguồn sự thật cho cùng một câu hỏi ("đang chạy mục nào"), và ca
+    # hỏng là `--exp 2.3` với `moe.enabled: true` còn sót trong file — chạy ra
+    # §2.3 với Route_Gate hoạt động, tức là không phải mục nào cả.
+    exp = str(a.exp or cfg.get("experiment", "2.3")).strip()
+    if exp not in EXPERIMENTS:
+        print(f"✗ --exp phải là một trong {EXPERIMENTS}, nhận {exp!r}")
+        return 2
+    cfg["experiment"] = exp
+    cfg.setdefault("moe", {})["enabled"] = (exp == "2.4")
+    is_moe = exp == "2.4"
+    if is_moe:
+        cfg["output"]["subdir"] = str(cfg["output"].get("subdir_moe", "2.4_moe"))
+        cfg["output"]["adapter_dir"] = str(
+            cfg["output"].get("adapter_dir_moe", "./adapters_2_4"))
+        cfg.setdefault("wandb", {})["tags"] = list(
+            cfg.get("wandb", {}).get("tags", []) or []) + ["moe", "friedman", "2.4"]
+
     dry_steps = None
     if a.dry_run:
         cfg["data"]["n_test"] = 8
@@ -195,12 +295,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"✗ stage không biết: {s!r} (hợp lệ: {', '.join(STAGES)})")
             return 2
     only = set(x.strip() for x in a.arms.split(",")) if a.arms else None
-    arms = enabled_arms(cfg, only)
+    try:
+        arms = select_arms(cfg, exp, only)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 2
     if not arms:
         print("✗ không arm nào được bật")
         return 2
-    arm_a = next((x["id"] for x in arms if not x.get("recomb")), None)
-    arm_b = next((x["id"] for x in arms if x.get("recomb")), None)
+    arm_a = None if is_moe else next(
+        (x["id"] for x in arms if not x.get("recomb")), None)
+    arm_b = None if is_moe else next(
+        (x["id"] for x in arms if x.get("recomb")), None)
 
     run_id = a.run_id or str(cfg["output"].get("subdir", "run"))
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
@@ -209,20 +315,32 @@ def main(argv: list[str] | None = None) -> int:
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
 
     manifest = {
-        "run_id": run_id,
+        "run_id": run_id, "experiment": exp,
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": resolved_snapshot(cfg), "env": _env_info(),
         "stages_run": stages, "arms_declared": [x["id"] for x in arms],
         "arm_a": arm_a, "arm_b": arm_b, "arm_status": {},
+        "moe": ({x["id"]: {"top_k": x["top_k"], "n_experts": x["n_experts"]}
+                 for x in arms} if is_moe else None),
     }
     t_start = time.time()
+    hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
+           if is_moe else
+           "§2.3 — nhánh Recombinator: A/B, bootstrap ghép cặp + permutation")
+    print(f"\n═══ {hdr} ═══", flush=True)
+    if is_moe:
+        print("  candidate: " + " · ".join(
+            f"{x['id']}(k={x['top_k']},E={x['n_experts']})" for x in arms),
+            flush=True)
+        print("  §2.4 LUÔN dùng concat — mọi candidate đều có nhánh Recombinator.",
+              flush=True)
     print(f"⚙ run dir: {run_dir}\n⚙ adapters: {adapter_root}", flush=True)
 
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
         print(f"⚙ W&B  : {tracker.url}", flush=True)
-    tracker.summary({"run/stages": ",".join(stages),
+    tracker.summary({"run/stages": ",".join(stages), "run/experiment": exp,
                      "run/arms": ",".join(manifest["arms_declared"]),
                      **{f"env/{k}": v for k, v in manifest["env"].items()}})
     if not hf_token():
@@ -250,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
                   flush=True)
         except labels_cls.LabelsUnusable as e:
             print(f"\n✗ DỪNG — nhãn phân loại không dùng được:\n    {e}", flush=True)
-            tracker.alert("§2.3 dừng: nhãn phân loại", str(e), "ERROR")
+            tracker.alert(f"§{exp} dừng: nhãn phân loại", str(e), "ERROR")
             tracker.finish(1)
             return 5
 
@@ -266,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 train_df, val_df = dt_mod.prepare_train(cfg, test_df, tracker)
             except dt_mod.DataLeak as e:
                 print(f"\n✗ DỪNG — RÒ RỈ DỮ LIỆU:\n    {e}", flush=True)
-                tracker.alert("§2.3 dừng: rò rỉ train/test", str(e), "ERROR")
+                tracker.alert(f"§{exp} dừng: rò rỉ train/test", str(e), "ERROR")
                 tracker.finish(1)
                 return 4
     else:
@@ -277,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages:
-        _hr("Huấn luyện hai candidate — candidate B TRƯỚC")
+        _hr(f"Huấn luyện {len(arms)} candidate — "
+            + ("candidate NẶNG nhất (E lớn nhất) TRƯỚC" if is_moe
+               else "candidate B TRƯỚC"))
         from . import train_recomb as tr_mod
         from .backbone import TrainUnusable, preflight_adapters
 
@@ -294,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ✗ {e}", flush=True)
             print("\n✗ DỪNG ở preflight — sửa theo hướng dẫn rồi chạy lại.", flush=True)
             manifest["preflight_errors"] = pf_err
-            tracker.alert("§2.3 dừng ở preflight", "\n".join(pf_err), "ERROR")
+            tracker.alert(f"§{exp} dừng ở preflight", "\n".join(pf_err), "ERROR")
             tracker.finish(1)
             (run_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
@@ -329,20 +449,21 @@ def main(argv: list[str] | None = None) -> int:
         manifest["batch"] = {"batch_size": bs, "grad_accum": accum,
                              "effective_batch": bs * accum, "source": "config"}
 
-        for arm in train_order(arms):
+        for arm in train_order(arms, exp):
             aid = arm["id"]
             odir = adapter_root / aid
             is_b = bool(arm.get("recomb"))
-            if tr_mod.already_trained(odir, is_b) and not a.retrain:
+            if tr_mod.already_trained(odir, is_b, is_moe) and not a.retrain:
                 print(f"  ✓ {aid}: đã huấn luyện ở {odir} — bỏ qua "
                       f"(--retrain để làm lại)", flush=True)
                 cached = json.loads((odir / "train_stats.json").read_text(encoding="utf-8"))
                 train_stats.append(cached)
                 manifest["arm_status"][aid] = {"trained": "cached"}
                 continue
-            print(f"\n── {arm.get('name', aid)} "
-                  f"({'candidate B · CÓ nhánh' if is_b else 'candidate A · không nhánh'}) ──",
-                  flush=True)
+            tag = (f"top-k = {arm['top_k']} · {arm['n_experts']} expert · CÓ nhánh"
+                   if is_moe else
+                   ("candidate B · CÓ nhánh" if is_b else "candidate A · không nhánh"))
+            print(f"\n── {arm.get('name', aid)} ({tag}) ──", flush=True)
             try:
                 st = tr_mod.train_arm(cfg, arm, preset, train_df,
                                       cls_pack if is_b else None, odir, tracker,
@@ -359,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
                                      st.get("trainable_params")})
             except TrainUnusable as e:
                 print(f"\n✗ {aid} KHÔNG huấn luyện được: {e}", flush=True)
-                tracker.alert("§2.3 dừng ở train", f"{aid}: {e}", "ERROR")
+                tracker.alert(f"§{exp} dừng ở train", f"{aid}: {e}", "ERROR")
                 manifest["arm_status"][aid] = {"trained": False, "unusable": str(e)}
                 tracker.finish(1)
                 (run_dir / "manifest.json").write_text(
@@ -395,12 +516,14 @@ def main(argv: list[str] | None = None) -> int:
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                     "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
             except RunnerUnusable as e:
-                # Ở §2.2, mất một arm còn lại bảy và Friedman vẫn chạy. Ở đây
-                # k = 2: mất một candidate là mất CẢ phép so sánh. Dừng ngay.
+                # Dừng ngay ở CẢ HAI mục, dù vì hai lý do khác nhau. §2.3: k = 2,
+                # mất một candidate là mất cả phép so sánh. §2.4: Friedman đòi
+                # thiết kế khối ĐẦY ĐỦ — chạy tiếp với 4/5 cột là lặng lẽ đổi
+                # thí nghiệm, và bảng vẫn in ra bình thường.
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                     "ok": False, "unusable": str(e)}
-                tracker.alert("§2.3 dừng: một candidate không sinh được",
+                tracker.alert(f"§{exp} dừng: một candidate không sinh được",
                               f"{arm['id']}: {e}", "ERROR")
                 tracker.finish(1)
                 return 6
@@ -440,7 +563,19 @@ def main(argv: list[str] | None = None) -> int:
             if p.exists():
                 scores[arm["id"]] = pd.read_csv(p)
 
-    if len(scores) != 2 or arm_a not in scores or arm_b not in scores:
+    want_ids = [x["id"] for x in arms]
+    missing = [i for i in want_ids if i not in scores]
+    if is_moe:
+        if len(scores) < 3 or missing:
+            print(f"✗ §2.4 cần điểm của ĐỦ {len(want_ids)} candidate; thiếu "
+                  f"{missing}. Friedman đòi thiết kế khối đầy đủ — mọi candidate "
+                  f"phải có mặt trong MỌI khối, và chạy với một tập candidate "
+                  f"khác tập đã khai là đổi thí nghiệm mà bảng vẫn in ra bình "
+                  f"thường.", flush=True)
+            tracker.alert("§2.4 hỏng", f"run={run_id}: thiếu {missing}", "ERROR")
+            tracker.finish(1)
+            return 1
+    elif len(scores) != 2 or arm_a not in scores or arm_b not in scores:
         print(f"✗ cần ĐÚNG hai candidate có điểm (A={arm_a}, B={arm_b}); "
               f"đang có {sorted(scores)}. Phép so sánh ghép cặp không định "
               f"nghĩa được với một cột.", flush=True)
@@ -449,8 +584,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # ── căn khối ────────────────────────────────────────────────────────────
-    from .stats_ab import align_blocks
+    # Cùng một hàm, hai bản (stats_ab / stats_friedman) nội dung giống hệt nhau.
+    # Dùng bản thuộc về đường kiểm định đang chạy để không tạo một đường phụ
+    # thuộc chéo giữa hai module thống kê.
+    if is_moe:
+        from .stats_friedman import align_blocks
+    else:
+        from .stats_ab import align_blocks
 
+    # Thứ tự cột = thứ tự KHAI BÁO trong config, không phải thứ tự chạy. Hạng
+    # trong khối của Friedman không phụ thuộc vào thứ tự cột, nhưng bảng in ra
+    # thì có — và "candidate nặng chạy trước" là một quyết định vận hành, nó
+    # không được rò vào cách trình bày kết quả.
+    scores = {i: scores[i] for i in want_ids if i in scores}
     scores, align_info = align_blocks(scores, key_col="key",
                                       order_hint=test_df["key"].tolist())
     manifest["n_eval"] = align_info["n_common"]
@@ -462,8 +608,76 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── stats ───────────────────────────────────────────────────────────────
     ab = pd.DataFrame()
+    fr = pd.DataFrame()
     ab_path = mdir / "ab_tests.csv"
-    if "stats" in stages:
+    fr_path = mdir / "friedman.csv"
+    ph_path = mdir / "posthoc.csv"
+    if is_moe:
+        if "stats" in stages:
+            _hr("Friedman + hậu kiểm Wilcoxon/Holm")
+            from .stats_friedman import (friedman_all, negligible_warning,
+                                         posthoc_all)
+
+            cols = metric_columns(scores[want_ids[0]])
+            scfg = dict(cfg["stats"])
+            scfg.update(dict(scfg.get("friedman", {}) or {}))
+            k = len(scores)
+            n_pairs = k * (k - 1) // 2
+            print(f"  kiểm định TỔNG THỂ: {len(cols)} metric × Friedman trên "
+                  f"{align_info['n_common']} khối, k = {k}", flush=True)
+            t0 = time.time()
+            fr = friedman_all(scores, cols, scfg)
+            fr.to_csv(fr_path, index=False)
+            gate = dict(zip(fr["metric"], fr["reject_h0"]))
+            n_open = int(fr["reject_h0"].sum())
+            print(f"  -> {n_open}/{len(fr)} metric bác H0 sau Holm (α="
+                  f"{scfg.get('alpha', 0.05)}). Hậu kiểm CHỈ chạy trên chúng: "
+                  f"{n_open} × {n_pairs} cặp = {n_open * n_pairs} kiểm định "
+                  f"(thay vì {len(cols) * n_pairs}).", flush=True)
+            for wmsg in [x for x in fr.get("w_warning", []) if x]:
+                print(f"  ⚠ {wmsg}", flush=True)
+            ab = posthoc_all(scores, cols, scfg, gate=gate,
+                             seed=int(cfg.get("seed", 42)))
+            if not ab.empty:
+                ab.to_csv(ph_path, index=False)
+                n_sig = int(ab["significant"].sum())
+                n_mat = int(ab["significant_and_material"].sum())
+                print(f"  -> {n_sig}/{len(ab)} cặp có ý nghĩa (Wilcoxon + Holm "
+                      f"toàn cục); {n_mat} trong đó có |r_rb| >= "
+                      f"{scfg.get('rrb_floor', 0.1)}", flush=True)
+                tracker.table("stats/posthoc", ab)
+            else:
+                n_sig = n_mat = 0
+                print("  không metric nào qua cổng Friedman -> KHÔNG hậu kiểm. "
+                      "Đó là một kết luận, không phải một lỗi: bằng chứng không "
+                      "đủ để nói năm cấu hình khác nhau.", flush=True)
+            primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
+            prow = fr[fr["metric"] == primary]
+            if not prow.empty:
+                best = str(prow.iloc[0]["best_by_meanrank"])
+                line = (f"`{primary}`: hạng trung bình tốt nhất = "
+                        f"{names.get(best, best)} · Kendall W = "
+                        f"{float(prow.iloc[0]['kendall_w']):.4f} · H0 "
+                        f"{'BỊ BÁC' if bool(prow.iloc[0]['reject_h0']) else 'KHÔNG bị bác'}")
+                manifest["headline"] = line
+                print(f"  {line}", flush=True)
+                _w = negligible_warning(int(prow.iloc[0]["n_blocks"]),
+                                        float(prow.iloc[0]["kendall_w"]),
+                                        float(scfg.get("kendall_w_floor", 0.05)))
+                if _w:
+                    manifest["stats_warning"] = _w
+            tracker.table("stats/friedman", fr)
+            tracker.summary({"stats/n_metrics_open": n_open,
+                             "stats/n_significant": n_sig,
+                             "stats/n_material": n_mat,
+                             "stats/headline": manifest.get("headline", "")})
+            print(f"✓ xong sau {time.time()-t0:.1f}s", flush=True)
+        else:
+            if fr_path.exists():
+                fr = pd.read_csv(fr_path)
+            if ph_path.exists():
+                ab = pd.read_csv(ph_path)
+    elif "stats" in stages:
         _hr("Bootstrap ghép cặp + Permutation")
         from .stats_ab import compare_all, resolution_warning, summary_line
 
@@ -502,11 +716,20 @@ def main(argv: list[str] | None = None) -> int:
     # ── report ──────────────────────────────────────────────────────────────
     if "report" in stages:
         _hr("Báo cáo")
-        from . import report_recomb
-
         manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
-        report_recomb.write_all(cfg, run_dir, scores, names, ab, train_stats,
-                                manifest, arm_a=arm_a, arm_b=arm_b)
+        if is_moe:
+            from . import report_moe
+
+            report_moe.write_all(cfg, run_dir, scores, names, fr, ab,
+                                 train_stats, manifest, arms=arms)
+        else:
+            from . import report_recomb
+
+            # `report_recomb.build_markdown` tự suy A/B từ cờ `recomb` trong
+            # config — truyền thêm arm_a/arm_b vào đây là một TypeError, và nó
+            # nổ ở stage CUỐI, sau khi đã trả xong tiền GPU.
+            report_recomb.write_all(cfg, run_dir, scores, names, ab, train_stats,
+                                    manifest)
         s = mdir / "summary.csv"
         if s.exists():
             tracker.table("results/summary", pd.read_csv(s))
@@ -526,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
     mins = (time.time() - t_start) / 60
-    tracker.alert("§2.3 chạy xong",
+    tracker.alert(f"§{exp} chạy xong",
                   f"run={run_id} · {manifest.get('n_eval')} ảnh · {mins:.0f} phút\n"
                   f"{manifest.get('headline', '')}")
     tracker.finish(0)

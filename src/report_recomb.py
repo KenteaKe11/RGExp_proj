@@ -23,8 +23,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-GATE_FLOOR = 0.01          # |gate| dưới mức này -> cảnh báo ca (1)
+# Cổng là sigmoid (n_query, d_model), nên MỌI giá trị đều dương và "trung bình
+# ~0" không thể do triệt tiêu dấu. Nhưng trung bình trên 81.920 ô vẫn có thể nhỏ
+# trong khi vài token đã mở hẳn — mà vài token mở hẳn là một kết quả KHÁC HẲN
+# với cổng đóng. Nên ngưỡng đọc `gate_max`: ô mở nhất có qua nổi mức này không.
+GATE_FLOOR = 0.05          # gate_max dưới mức này -> cảnh báo ca (1)
 CLS_F1_FLOOR = 0.05        # cls_f1_pos dưới mức này -> cảnh báo ca (2)
+
+
+def _gate(st: dict) -> dict:
+    """Khối `gate_final` của train_stats, chuẩn hoá về dict.
+
+    Bản trước ghi `gate_final` là MỘT SỐ (trung bình của một vector scale tự do).
+    Đọc con số ấy bằng luật của cổng sigmoid là so hai đại lượng khác nhau, nên
+    ở đây nó bị coi là KHÔNG CÓ chứ không bị ép kiểu.
+    """
+    g = st.get("gate_final")
+    return dict(g) if isinstance(g, dict) else {}
 
 
 def _f(x, nd: int = 4) -> str:
@@ -81,17 +96,24 @@ def diagnosis(train_stats: list[dict], arm_b: str) -> tuple[str, list[str]]:
     if not st:
         return "unknown", ["không tìm được train_stats.json của candidate có nhánh "
                            "-> không kiểm được gate lẫn cls_f1_pos."]
-    gate = st.get("gate_final")
+    g = _gate(st)
     cls = (st.get("cls_metrics_last") or {})
     f1 = cls.get("cls_f1_pos")
     label = "ok"
-    if gate is not None and abs(float(gate)) < GATE_FLOOR:
+    if g and float(g.get("gate_max", 0.0)) < GATE_FLOOR:
         label = "gate_closed"
         warns.append(
-            f"**gate = {float(gate):+.4f}**, gần 0. Cổng nhân vào 32 token gần như "
-            f"đóng, nên decoder hầu như không nhận đặc trưng SigLIP. Mọi kết luận "
-            f"'không khác biệt' bên dưới là kết luận về QUÁ TRÌNH HUẤN LUYỆN, "
-            f"không phải về đặc trưng SigLIP. Xem README_2.3 mục 5.")
+            f"**gate_max = {float(g['gate_max']):.4f}** (khởi tạo "
+            f"{float(g.get('gate_init', 0.0)):.4f}), **{g.get('gate_open_tokens', 0)}"
+            f"/{st.get('n_query', '?')} token mở**. Không một ô nào của cổng qua "
+            f"nổi {GATE_FLOOR}, nên decoder hầu như không nhận đặc trưng SigLIP. "
+            f"Mọi kết luận 'không khác biệt' bên dưới là kết luận về QUÁ TRÌNH "
+            f"HUẤN LUYỆN, không phải về đặc trưng SigLIP.\n"
+            f"    Chỗ sửa trước tiên là `train.gate_lr_mult` "
+            f"({st.get('gate_lr_mult', '?')}): quãng đường tối đa của cổng trong "
+            f"cả lịch là steps × max_lr × gate_lr_mult × 0.6 và nó đo bằng đơn vị "
+            f"LOGIT — cần ≳ {abs(float(st.get('gate_init_logit') or 4)):.0f} để "
+            f"cổng đi từ khởi tạo tới nửa mở. Xem README_2.3 mục 1.3.")
     if f1 is not None and float(f1) < CLS_F1_FLOOR:
         if label == "ok":
             label = "head_untrained"
@@ -180,9 +202,11 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     elif b_id:
         A(f"### ✓ Nhánh đã thật sự hoạt động")
         A("")
-        gate = st_b.get("gate_final")
+        g = _gate(st_b)
         f1 = (st_b.get("cls_metrics_last") or {}).get("cls_f1_pos")
-        A(f"`gate = {_sf(gate, 4) if gate is not None else '—'}` (mở), "
+        A(f"`gate_max = {_f(g.get('gate_max')) if g else '—'}` · "
+          f"`gate_mean = {_f(g.get('gate_mean')) if g else '—'}` · "
+          f"**{g.get('gate_open_tokens', '—')}/{st_b.get('n_query', '?')} token mở**, "
           f"`cls_f1_pos = {_f(f1) if f1 is not None else '—'}` (trên mức đoán bừa). "
           f"Kết luận bên dưới vì thế là kết luận về ĐẶC TRƯNG SigLIP, không phải "
           f"về quá trình huấn luyện.")
@@ -226,10 +250,16 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
         ["Chèn ở đâu", f"ngay TRƯỚC 256 token ảnh · "
                        f"{side.get('n_query') or rec.get('n_query', 32)} token · "
                        f"token_type = `{st_b.get('token_type') or rec.get('token_type', 'text')}`"],
-        ["Cổng (gate)", f"khởi tạo {rec.get('gate_init', 0.0)} · lr "
-                        f"×{st_b.get('gate_lr_mult') or cfg['train'].get('gate_lr_mult')} "
-                        f"so với LoRA · cuối lần chạy = "
-                        f"{_sf(st_b.get('gate_final'), 4) if st_b.get('gate_final') is not None else '—'}"],
+        ["Cổng (gate)", (lambda g: (
+            f"**sigmoid**, hình dạng ({side.get('n_query') or rec.get('n_query', 32)}, "
+            f"{st_b.get('branch_params', {}).get('d_model') or rec.get('out_dim') or 'd_model'})"
+            f" — mỗi token một cổng riêng · khởi tạo logit "
+            f"{st_b.get('gate_init_logit', rec.get('gate_init_logit', -4.0))} "
+            f"(= {_f(g.get('gate_init')) if g else '—'}) · lr "
+            f"×{st_b.get('gate_lr_mult') or cfg['train'].get('gate_lr_mult')} so "
+            f"với LoRA · cuối lần chạy: mean {_f(g.get('gate_mean')) if g else '—'} · "
+            f"max {_f(g.get('gate_max')) if g else '—'} · "
+            f"{g.get('gate_open_tokens', '—') if g else '—'} token mở"))(_gate(st_b))],
         ["Head phân loại", (f"ASL(γ⁻={ccfg.get('asl', {}).get('gamma_neg')}, "
                             f"γ⁺={ccfg.get('asl', {}).get('gamma_pos')}, "
                             f"clip={ccfg.get('asl', {}).get('clip')}) · "
@@ -357,7 +387,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     if train_stats:
         heads = ["candidate", "phút", "VRAM đỉnh (GB)", "loss đầu", "loss cuối",
-                 "CE cuối", "ASL cuối", "gate cuối", "cls_f1_pos", "mẫu bị thay"]
+                 "CE cuối", "ASL cuối", "gate_max (token mở)", "cls_f1_pos",
+                 "mẫu bị thay"]
         rows = []
         for a in arms:
             s = _stat(train_stats, a["id"])
@@ -369,7 +400,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                 str(s.get("vram_peak_gb", "—")),
                 _f(s.get("train_loss_first"), 4), _f(s.get("train_loss"), 4),
                 _f(s.get("ce_last"), 4), _f(s.get("asl_last"), 4),
-                _sf(s.get("gate_final"), 4) if s.get("gate_final") is not None else "—",
+                (lambda g: f"{_f(g.get('gate_max'))} ({g.get('gate_open_tokens')} tok)"
+                 if g else "—")(_gate(s)),
                 _f(cls.get("cls_f1_pos")) if cls.get("cls_f1_pos") is not None else "—",
                 str(s.get("n_substituted_too_long", 0)),
             ])

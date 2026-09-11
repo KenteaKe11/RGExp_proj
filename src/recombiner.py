@@ -333,19 +333,42 @@ class ClsHead(nn.Module):
 
 
 class RouteGate(nn.Module):
-    """vec_2 -> logit định tuyến expert. BẤT HOẠT ở §2.3 — xem docstring module.
+    """vec_2 -> (logit định tuyến, log_sigma của nhiễu). BẤT HOẠT ở §2.3.
 
-    Không có Aux Loss và không có đường nào tới Experts trong mục này. Lớp tồn
-    tại để hình dạng checkpoint khớp với mục MoE.
+    Ở §2.3 lớp này được gọi để nằm trong đồ thị đúng như mục MoE sẽ dùng, nhưng
+    `vec_2` đã bị detach ở QFormer nên nó không nhận gradient và đầu ra bị vứt.
+    Ở §2.4 nó là nguồn của CẢ HAI mũi tên: `─► Aux Loss` và `─► Experts`.
+
+    Hai ma trận chứ không phải một: `proj` cho logit, `noise_proj` cho ĐỘ LỚN
+    nhiễu Gauss học được (σ = softplus(log_sigma)). Chính sách áp lên hai tensor
+    này — nhiễu -> soft logit-clipping (C=1.2) -> softmax -> top-k — nằm ở
+    `src/moe.Router`, vì nó KHÔNG có tham số và tách ra thì đọc được bằng mắt.
+
+    Vì sao `noise_proj` vẫn được dựng ở §2.3 dù không ai dùng: hình dạng
+    checkpoint phải khớp giữa hai mục — đó là lý do duy nhất RouteGate tồn tại
+    trong §2.3 ngay từ đầu. Dựng nó ở §2.4 mà không dựng ở §2.3 là bỏ mất chính
+    tính chất ấy.
+
+    `bias` của `noise_proj` khởi tạo `noise_init` (mặc định −3.0), tức là
+    σ ≈ softplus(−3) ≈ 0.049 ở bước 0. Để bias = 0 thì σ = softplus(0) ≈ 0.69 —
+    lớn hơn CẢ trần clipping C = 1.2, nên top-k ở những bước đầu gần như là bốc
+    thăm và Aux Loss không có tải thật nào để cân.
     """
 
-    def __init__(self, d_in: int, n_experts: int = 4):
+    def __init__(self, d_in: int, n_experts: int = 4, noise_init: float = -3.0):
         super().__init__()
         self.n_experts = int(n_experts)
+        self.noise_init = float(noise_init)
         self.proj = nn.Linear(d_in, self.n_experts, bias=False)
+        self.noise_proj = nn.Linear(d_in, self.n_experts, bias=True)
 
-    def forward(self, v: torch.Tensor) -> torch.Tensor:
-        return self.proj(v)
+    def init_noise(self) -> None:
+        """Đặt lại bias của `noise_proj`. Gọi SAU `_init`, vì `_init` zero hoá bias."""
+        with torch.no_grad():
+            self.noise_proj.bias.fill_(self.noise_init)
+
+    def forward(self, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.proj(v), self.noise_proj(v)
 
 
 # ══ Hàm mất mát có giám sát ═════════════════════════════════════════════════
@@ -520,8 +543,13 @@ class RecombinerBranch(nn.Module):
             n_classes=int(c.get("n_classes", 3)),
             hidden=int(c.get("hidden", 1024)),
             dropout=float(c.get("dropout", 0.0))) if int(n_labels) > 0 else None
+        # `route_enabled` là cờ phân biệt §2.3 với §2.4 Ở CẤP NHÁNH, và nó nằm
+        # trong `spec` nên `load_branch` dựng lại đúng chế độ đã huấn luyện —
+        # không phải chế độ đang ghi trong config lúc sinh.
+        self.route_enabled = bool(r.get("route_enabled", False))
         self.route_gate = RouteGate(
-            self.qformer.d_model, int(r.get("n_experts", 4)))
+            self.qformer.d_model, int(r.get("n_experts", 4)),
+            noise_init=float(r.get("route_noise_init", -3.0)))
         self.asl = AsymmetricLoss(
             gamma_neg=a.get("gamma_neg", 2.0),
             gamma_pos=float(a.get("gamma_pos", 0.0)),
@@ -535,10 +563,17 @@ class RecombinerBranch(nn.Module):
         for m in (self.recombinator, self.qformer, self.cls_head, self.route_gate):
             if m is not None:
                 _init(m)
+        # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
+        self.route_gate.init_noise()
 
     # ── forward ────────────────────────────────────────────────────────────
-    def forward(self, vis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """(B, 4096, d_vis) -> (token đã qua cổng, logit phân loại).
+    def forward(self, vis: torch.Tensor):
+        """(B, 4096, d_vis) -> (token đã qua cổng, logit phân loại, route).
+
+        `route` là `(route_logits, route_log_sigma)` khi §2.4 bật định tuyến, và
+        `None` ở §2.3. Trả `None` thay vì trả tensor rồi trông chờ người gọi bỏ
+        qua: một tensor route nằm sẵn ở đầu ra là một lời mời cộng nó vào loss,
+        và ở §2.3 thì Route_Gate phải KHÔNG có đường nào tới loss nào.
 
         Trả về token ĐÃ nhân cổng để người gọi không quên nhân — quên thì ở bước
         0 decoder nhận 32 vector ngẫu nhiên và cả ý nghĩa của "cổng khởi tạo 0"
@@ -550,11 +585,14 @@ class RecombinerBranch(nn.Module):
         logits = None
         if self.cls_head is not None and "sup" in heads:
             logits = self.cls_head(heads["sup"])
-        # Route_Gate được gọi để nó nằm trong đồ thị đúng như mục MoE sẽ dùng,
-        # nhưng đầu ra bị vứt: §2.3 không có Aux Loss và không định tuyến.
+        # §2.3: gọi để Route_Gate nằm trong đồ thị đúng như mục MoE sẽ dùng,
+        # rồi VỨT đầu ra — không Aux Loss, không định tuyến.
+        # §2.4: chính hai tensor này là nguồn của cả hai mũi tên.
         aux_task = "aux" if "aux" in heads else self.qformer.tasks[-1]
-        _ = self.route_gate(heads[aux_task])
-        return rec * self.gate.to(rec.dtype), logits
+        route = self.route_gate(heads[aux_task])
+        if not self.route_enabled:
+            route = None
+        return rec * self.gate.to(rec.dtype), logits, route
 
     def sup_loss(self, logits, target, mask=None) -> torch.Tensor:
         return self.asl(logits, target, mask)
@@ -575,6 +613,8 @@ class RecombinerBranch(nn.Module):
             "n_query": self.n_query,
             "qformer_tasks": list(self.qformer.tasks),
             "qformer_frozen": list(self.qformer.frozen),
+            "route_enabled": self.route_enabled,
+            "n_experts": self.route_gate.n_experts,
         }
 
 
@@ -609,6 +649,8 @@ def save_branch(branch: RecombinerBranch, out_dir: Path) -> Path:
         "qformer_d_model": branch.qformer.d_model,
         "qformer_tasks": list(branch.qformer.tasks),
         "qformer_frozen": list(branch.qformer.frozen),
+        "route_enabled": branch.route_enabled,
+        "n_experts": branch.route_gate.n_experts,
         "n_params": branch.n_params(),
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     return path

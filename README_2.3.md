@@ -82,26 +82,64 @@ một phép kiểm đảo thứ tự token đầu vào và đòi đầu ra phả
 của MHA rồi đòi đầu ra bằng đúng `norm_out(q)` — tức là skip-connect nối đúng
 nguồn.
 
-### 1.3. Cổng vào decoder khởi tạo 0
+### 1.3. Cổng vào decoder: sigmoid `(32, 2560)`, khởi tạo gần đóng
 
 32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder **đang đóng
 băng**. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ để đẩy
 loss lên cao và để LoRA tiêu vài chục bước đầu chỉ để học cách *phớt lờ* chúng.
 
-`gate` là một vector scale khởi tạo 0. Ở bước 0, đầu vào decoder của candidate B
-giống hệt candidate A cộng 32 token 0; chính cổng ấy học mở dần. Nhánh phân loại
-lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ bước đầu tiên.
+Tham số học được là `gate_logit`, hình dạng `(n_query, d_model)` = `(32, 2560)`;
+cổng thật là `sigmoid(gate_logit)`. Ba hệ quả, cả ba đều có chủ ý:
 
-Một hệ quả cơ học phải xử: **AdamW chuẩn hoá bước cập nhật**, nên mỗi bước nó
-dịch một tham số đi khoảng `lr`. Với `max_lr` 3e-4 và ~200 bước (trung bình
-~0.6·max_lr), quãng đường **tối đa** của một cổng khởi tạo 0 là cỡ 0.04 — tức là
-cổng gần như *không thể* mở trong một lịch ngắn, và candidate B sẽ trông y hệt
-candidate A vì lý do cơ học chứ không vì dữ liệu. `train.gate_lr_mult` (mặc định
-20) nhân lr của riêng nhóm ấy lên.
+**Cổng bị chặn trong (0, 1).** Nó chỉ mở được tới "cho qua trọn vẹn", không bao
+giờ khuếch đại. Một vector scale tự do chạy được tới ±5, và khi đó "cổng" hết là
+cổng — nó thành một lớp scale nữa, và con số đọc ra không còn nói được "decoder
+nhận bao nhiêu phần đặc trưng".
+
+**Mỗi token một cổng riêng.** 32 token là 32 "cách nhìn" khác nhau lên ảnh
+(§1.2); không có lý do nào bắt chúng cùng mở một lúc. Hình dạng `(32, 2560)` cho
+phép mạng giữ vài token và đóng phần còn lại — và `gate_open_tokens` trong
+`train_stats.json` đếm đúng chuyện đó. Đó mới là con số trả lời câu hỏi thiết kế;
+trung bình trên 81.920 ô có thể nhỏ trong khi ba token đã mở hẳn, và ba token mở
+hẳn là một kết quả khác hẳn với "cổng đóng".
+
+**Không còn "đúng bằng 0" ở bước 0.** Sigmoid không đạt 0. Với
+`gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào decoder của
+candidate B ở bước 0 bằng candidate A **cộng 32 token đã bị nén còn ~1.8% biên
+độ**. Đây là một phát biểu **yếu hơn** "bằng 0", và báo cáo phải ghi đúng như
+vậy.
+
+Nhánh phân loại lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ
+bước đầu tiên.
+
+#### Cổng có đủ quãng đường để mở không — một phép nhân phải kiểm
+
+**AdamW chuẩn hoá bước cập nhật**: mỗi bước nó dịch một tham số đi khoảng `lr`,
+bất kể gradient lớn hay nhỏ. Quãng đường tối đa của cổng trong cả lịch là
+
+```
+steps × max_lr × gate_lr_mult × ~0.6        (0.6 = trung bình one-cycle)
+```
+
+và nó đo bằng đơn vị **logit**, không phải đơn vị cổng:
+
+| `gate_lr_mult` | quãng đường | cổng đi được từ `sigmoid(-4) = 0.018` tới |
+|---|---|---|
+| 20 | ~0.7 logit | `sigmoid(-3.3) = 0.035` — **vẫn đóng** |
+| 120 | ~4.3 logit | `sigmoid(+0.3) = 0.57` — mở quá nửa nếu dữ liệu muốn |
+
+Với `mult = 20`, candidate B trông y hệt candidate A vì lý do **cơ học** chứ
+không vì dữ liệu — và bảng BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
+Đó là ca hỏng tốn nhất của mục này: ba tiếng GPU để kết luận về AdamW.
+
+Bất biến: **quãng đường ≥ `|gate_init_logit|`**. `scripts/selftest_recomb.py`
+kiểm đúng bất đẳng thức này từ chính config, nên đổi `gate_init_logit`,
+`schedule.max_lr`, `n_train`, `per_device_batch_size` hay `grad_accum` mà quên
+chỉnh `gate_lr_mult` thì selftest **dừng** trước khi tốn GPU.
 
 Điểm chính là cổng được **PHÉP** mở, không phải bị **ÉP** mở. `gate_final` trong
-`train_stats.json` là con số nói dữ liệu có muốn mở nó hay không, và REPORT.md
-đọc thẳng nó.
+`train_stats.json` (`gate_mean`, `gate_max`, `gate_open_tokens`) là con số nói dữ
+liệu có muốn mở nó hay không, và REPORT.md đọc thẳng nó.
 
 ### 1.4. Chèn ở đâu, và ba tensor phải nới theo
 
@@ -435,7 +473,7 @@ runs/2.3_recombiner/
   metrics/per_sample_*.csv        điểm TỪNG ảnh, từng candidate
   metrics/summary.csv             điểm trung bình + hiệu số
   metrics/ab_tests.csv            bảng kiểm định đầy đủ (mọi cột)
-  metrics/train_stats.csv         tham số, batch, VRAM, gate_final, cls_f1_pos
+  metrics/train_stats.csv         tham số, batch, VRAM, gate_max + token mở, cls_f1_pos
   predictions/*.jsonl             văn bản sinh ra
 adapters_2_3/
   lora_only/                      candidate A: adapter

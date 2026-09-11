@@ -6,9 +6,19 @@
 #     bash scripts/archive_2.2.sh --apply    # thực hiện
 #
 # Vì sao là một script chứ không phải đã làm sẵn: `git mv` giữ lịch sử của từng
-# file, còn "xoá chỗ này, tạo lại chỗ kia" thì không — và lịch sử của
-# stats_friedman.py là thứ đáng giữ nhất trong §2.2. Script này phải chạy trên
+# file, còn "xoá chỗ này, tạo lại chỗ kia" thì không. Script này phải chạy trên
 # chính máy có repo.
+#
+# ── `src/stats_friedman.py` Ở LẠI ───────────────────────────────────────────
+# Bản trước của script này chuyển nó sang _archive/, vì §2.3 có k = 2 và không
+# có chỗ cho Friedman. §2.4 thì k = 5 và dùng lại nó NGUYÊN VĂN — cùng bộ đã có
+# ~30 phép kiểm riêng trong scripts/selftest_friedman.py và đã cho ra bảng §2.2.
+# Viết một bản Friedman thứ hai cho §2.4 là mời một lỗi dấu vào giữa hai mục,
+# và đó đúng là loại lỗi cho ra một bảng p-value sai mà trông hoàn toàn bình
+# thường.
+#
+# `scripts/selftest_friedman.py` vì thế cũng ở lại: nó là phép kiểm của một
+# đường chạy THẬT, không phải của một bản ghi.
 #
 # Sau khi chạy, code §2.2 là BẢN GHI chứ không phải một đường chạy được (import
 # tương đối của nó không giải quyết được từ ngoài package `src/`). Muốn chạy lại
@@ -36,18 +46,24 @@ APPLY=0
 # cho cùng một thí nghiệm là cách chắc chắn nhất để chạy nhầm một cái.
 #
 # data*/metrics/imaging/labels_cls/runners/prompts/stats_ab ở lại — §2.3 dùng
-# nguyên chúng (xem README.md).
+# nguyên chúng (xem README.md). `stats_friedman.py` và `selftest_friedman.py`
+# cũng ở lại: §2.4 dùng chúng như một đường chạy thật (xem đầu file).
 FILES=(
     "configs/adapters.yaml:_archive/configs/adapters.yaml"
     "configs/recomb.yaml:_archive/configs/recomb.yaml"
     "src/train.py:_archive/src/train.py"
     "src/run_adapters.py:_archive/src/run_adapters.py"
     "src/report_adapters.py:_archive/src/report_adapters.py"
-    "src/stats_friedman.py:_archive/src/stats_friedman.py"
     "scripts/run_adapters.sh:_archive/scripts/run_adapters.sh"
-    "scripts/selftest_friedman.py:_archive/scripts/selftest_friedman.py"
     "README_2.2.md:_archive/README_2.2.md"
 )
+
+# Lưới an toàn thứ hai: §2.4 import stats_friedman. Chuyển nó đi là làm chết
+# `--exp 2.4` ở stage `stats` — tức là sau khi đã trả xong tiền GPU cho năm
+# candidate.
+if grep -rqs "stats_friedman" src/run_recomb.py src/report_moe.py 2>/dev/null; then
+    echo "⚙ src/stats_friedman.py Ở LẠI: §2.4 dùng nó (--exp 2.4)."
+fi
 
 # Lưới an toàn: nếu backbone.py chưa có thì chuyển train.py đi là làm hỏng repo.
 if [ ! -f "src/backbone.py" ]; then

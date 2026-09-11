@@ -53,18 +53,20 @@ Một lần chạy dừng ở phút thứ ba rẻ hơn nhiều một bảng kế
 """
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import imaging, labels_cls, recombiner
+from . import imaging, labels_cls, moe as moe_mod, recombiner
 from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
-                       build_scheduler, collate, free_vram, is_oom,
-                       is_quantized, load_base, resolve_alpha, total_steps,
-                       uses_dora)
+                       build_scheduler, collate, find_target_modules,
+                       free_vram, is_oom, is_quantized, load_base,
+                       resolve_alpha, total_steps, uses_dora)
 from .config import Cfg, seed_everything
 
 
@@ -93,6 +95,94 @@ def resolve_preset(cfg: Cfg) -> dict:
     rank = int(spec.get("rank", 4))
     alpha = resolve_alpha(rank, dict(cfg["train"]))
     return {"id": name, "method": method, "rank": rank, "alpha": alpha}
+
+
+# ══ §2.4: hình dạng MoE của MỘT candidate ═══════════════════════════════════
+def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
+    """(top_k, n_experts, rank, alpha, router, aux) đã giải quyết cho một candidate.
+
+    Trả None khi §2.3. Hai con số DUY NHẤT được phép khác nhau giữa các
+    candidate của §2.4 là `top_k` và `n_experts` — mọi thứ còn lại đi ra từ các
+    khối chung, và hàm này là chỗ điều đó kiểm được bằng cách đọc.
+
+    Rank/alpha mặc định lấy từ `lora.preset`: mỗi expert có ĐÚNG sức chứa của
+    adapter §2.3. Ghi số riêng vào `moe.expert.rank` là đưa một biến thứ ba vào
+    một bảng đang so hai biến.
+    """
+    m = dict(cfg.get("moe", {}) or {})
+    if not bool(m.get("enabled", False)):
+        return None
+    e = dict(m.get("expert", {}) or {})
+    k = int(arm.get("top_k", 0))
+    n_e = int(arm.get("n_experts", 0))
+    if k < 1 or n_e < 1:
+        raise TrainUnusable(
+            f"candidate {arm.get('id')!r} thiếu `top_k` hoặc `n_experts`. Đó là "
+            f"HAI con số §2.4 đang so — mặc định ngầm ở đây là chạy một cấu hình "
+            f"không ai khai và dán nhãn cấu hình khác lên kết quả.")
+    if k > n_e:
+        raise TrainUnusable(
+            f"candidate {arm.get('id')!r}: top_k = {k} > n_experts = {n_e}. "
+            f"Không định nghĩa được.")
+    if k == n_e:
+        raise TrainUnusable(
+            f"candidate {arm.get('id')!r}: top_k = n_experts = {k}. Mọi expert "
+            f"luôn được chọn, nên Route_Gate không định tuyến gì — đó là một mô "
+            f"hình DÀY ĐẶC mang tên MoE, và nó không thuộc bảng này.")
+    rank = int(e.get("rank") or preset["rank"])
+    alpha = float(e.get("alpha") or resolve_alpha(rank, dict(cfg["train"])))
+    method = str(e.get("method", "lora")).lower()
+    if method != "lora":
+        raise TrainUnusable(
+            f"moe.expert.method = {method!r}. §2.4 chỉ cài Experts dạng LoRA — "
+            f"DoRA phải chuẩn hoá cột của (W + BA) mỗi bước, và với mỗi ảnh một "
+            f"tổ hợp expert khác nhau thì chuẩn ấy phải tính lại theo TỪNG ẢNH "
+            f"trên ma trận nền 4-bit. Xem docstring src/moe.py.")
+    r = dict(m.get("router", {}) or {})
+    a = dict(m.get("aux", {}) or {})
+    return {
+        "arm_id": arm.get("id"), "top_k": k, "n_experts": n_e,
+        "rank": rank, "alpha": alpha, "dropout": float(e.get("dropout", 0.05)),
+        "method": method,
+        "base_method": preset["method"],
+        "noise": bool(r.get("noise", True)),
+        "noise_init": float(r.get("noise_init", -3.0)),
+        "logit_clip_c": float(r.get("logit_clip_c", 1.2)),
+        "renormalize_topk": bool(r.get("renormalize_topk", True)),
+        "aux_kind": str(a.get("kind", "switch_load_balance")),
+        "aux_alpha": float(a.get("alpha", 0.01)),
+        "aux_warmup_pct": float(a.get("warmup_pct", 0.1)),
+    }
+
+
+def effective_rcfg(cfg: Cfg, spec: dict | None) -> dict:
+    """Khối `recombiner` đã giải quyết cho candidate này.
+
+    §2.3 dùng nguyên khối trong config. §2.4 ghi đè ĐÚNG ba khoá, và cả ba đều
+    đi vào `spec` của nhánh (tức là vào `recombiner_branch.json`), nên
+    `load_branch` ở khâu sinh dựng lại đúng chế độ đã huấn luyện chứ không phải
+    chế độ đang ghi trong config lúc ấy:
+
+      * `n_experts`        — hình dạng hai ma trận của Route_Gate;
+      * `route_enabled`    — Route_Gate có trả đầu ra hay bị vứt;
+      * `qformer.freeze`   — §2.3 đóng băng `aux`; §2.4 thì KHÔNG, vì `vec_2`
+                             chính là nguồn định tuyến. Để nguyên `freeze: [aux]`
+                             ở §2.4 nghĩa là `vec_2` bị detach: router vẫn chạy,
+                             vẫn định tuyến, nhưng QFormer và Recombinator không
+                             bao giờ học được cách sinh ra một `vec_2` hữu ích —
+                             một MoE có router mù, và loss vẫn giảm bình thường.
+    """
+    r = dict(cfg.get("recombiner", {}) or {})
+    if spec is None:
+        return r
+    q = dict(r.get("qformer", {}) or {})
+    q["freeze"] = []
+    r = dict(r)
+    r["qformer"] = q
+    r["n_experts"] = int(spec["n_experts"])
+    r["route_enabled"] = True
+    r["route_noise_init"] = float(spec["noise_init"])
+    return r
 
 
 def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
@@ -128,7 +218,48 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
         warns.append("⚠ classifier.enabled = false: candidate B chỉ còn CE, và "
                      "nhánh chỉ nhận gradient qua cổng vào decoder (khởi tạo 0). "
                      "Đó là một thí nghiệm khác — ghi rõ vào báo cáo.")
+    errors += _preflight_moe(cfg, arms)
     return errors, warns
+
+
+def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
+    """Những gì CHỈ §2.4 cần, kiểm trước khi nạp base. Trả danh sách lỗi chặn.
+
+    Hai thứ ở đây đều là lỗi im lặng nếu không kiểm:
+
+      * `gradient_checkpointing` kiểu REENTRANT. Trọng số định tuyến được tính
+        một lần rồi đọc lại trong từng lớp decoder; với reentrant, backward đi
+        ngược vào đồ thị router NHIỀU LẦN. Ca nhẹ là nổ "backward through the
+        graph a second time" — ca nặng là router nhận thiếu gradient và bảng
+        §2.4 đo một router học sai mà không có gì báo.
+      * mọi candidate của §2.4 phải CÓ nhánh (concat). Không nhánh thì không có
+        `vec_2`, và không có gì để định tuyến.
+    """
+    errs: list[str] = []
+    if not bool(dict(cfg.get("moe", {}) or {}).get("enabled", False)):
+        return errs
+    bad = [a.get("id") for a in arms if not a.get("recomb", True)]
+    if bad:
+        errs.append(
+            f"candidate {bad} của §2.4 không bật nhánh Recombinator. §2.4 LUÔN "
+            f"dùng concat: không có nhánh thì không có `vec_2`, và Route_Gate "
+            f"không có gì để đọc.")
+    if bool(dict(cfg["train"]).get("gradient_checkpointing", True)):
+        try:
+            import transformers
+            from transformers import PreTrainedModel
+
+            sig = inspect.signature(PreTrainedModel.gradient_checkpointing_enable)
+            if "gradient_checkpointing_kwargs" not in sig.parameters:
+                errs.append(
+                    f"transformers {getattr(transformers, '__version__', '?')} "
+                    f"không nhận `gradient_checkpointing_kwargs`, nên không bật "
+                    f"được chế độ KHÔNG-reentrant. §2.4 cần nó — xem docstring "
+                    f"src/moe.py, mục gradient checkpointing. "
+                    f"pip install -U 'transformers>=4.35'")
+        except ImportError:
+            errs.append("thiếu `transformers`.")
+    return errs
 
 
 # ══ Nhãn phân loại cho tập train ════════════════════════════════════════════
@@ -210,8 +341,8 @@ def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
 
 
 # ══ Optimizer: ba nhóm tham số ══════════════════════════════════════════════
-def build_optimizer(peft_model, branch, tcfg: dict):
-    """AdamW với ba nhóm: LoRA, thân nhánh, và `gate` riêng một nhóm.
+def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora"):
+    """AdamW với ba nhóm: adapter (LoRA hoặc Experts), thân nhánh, và `gate`.
 
     `gate` được tách ra vì AdamW CHUẨN HOÁ bước cập nhật: mỗi bước nó dịch một
     tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Với lr đỉnh 2e-4 và
@@ -235,7 +366,8 @@ def build_optimizer(peft_model, branch, tcfg: dict):
 
     lr = float(tcfg["schedule"].get("max_lr", 2e-4))
     wd = float(tcfg.get("weight_decay", 0.0))
-    groups = [{"params": lora, "lr": lr, "weight_decay": wd, "name": "lora"}]
+    groups = [{"params": lora, "lr": lr, "weight_decay": wd,
+               "name": str(adapter_group)}]
     if body:
         groups.append({"params": body, "lr": lr,
                        "weight_decay": float(tcfg.get("branch_weight_decay", wd)),
@@ -255,15 +387,33 @@ def build_optimizer(peft_model, branch, tcfg: dict):
 
 # ══ Một lượt forward ════════════════════════════════════════════════════════
 def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
-                  tt_value: int):
-    """-> (CE, ASL hoặc None, vài số để log).
+                  tt_value: int, router=None, route_ctx=None):
+    """-> (CE, ASL hoặc None, route_out hoặc None, vài số để log).
 
-    Cả hai candidate đi qua đây. Khác biệt DUY NHẤT là `branch is None`.
+    MỌI candidate của cả hai mục đi qua đây. Khác biệt là hai cờ và chỉ hai cờ:
+    `branch is None` (candidate A của §2.3) và `router is None` (§2.3 nói chung).
 
     Vì sao chèn 32 token vào vị trí token ảnh đầu tiên chứ không nối vào đầu
     chuỗi: nối vào đầu là đặt chúng TRƯỚC cả BOS lẫn câu lệnh hệ thống. Vẫn
     chạy, nhưng nó không phải cái "concat" trong sơ đồ, và nó đẩy mọi vị trí
     trong chuỗi đi 32 — kể cả phần đã được che nhãn.
+
+    ── Thứ tự bắt buộc ở §2.4 ───────────────────────────────────────────────
+    Trọng số định tuyến phải nằm trong `route_ctx` TRƯỚC khi `model(...)` chạy,
+    vì `MoELoraLinear` đọc nó từ đó trong từng lớp decoder. `route_ctx.strict`
+    biến "quên set" thành một exception thay vì một model lặng lẽ không có
+    expert nào — cột số của nó vẫn trông như kết quả thật.
+
+    Và hàm này KHÔNG được `clear()` trước khi backward chạy. Gradient
+    checkpointing kiểu KHÔNG-reentrant TÍNH LẠI forward của từng đoạn trong lúc
+    backward, nên `MoELoraLinear.forward` chạy lần thứ hai — lúc đó, sau khi
+    `model(...)` đã trả về. Xoá ở đây nghĩa là lần chạy lại ấy đọc phải `None`,
+    và cả bước huấn luyện chết ở `.backward()` với một thông báo nói về định
+    tuyến chứ không về checkpointing.
+
+    Vòng lặp gọi `route_ctx.clear()` NGAY SAU `.backward()` của micro-batch —
+    đó mới là chỗ đúng. Trước khi ấy không có gì đọc nhầm được: mỗi lượt forward
+    đều `set()` lại.
     """
     import torch
 
@@ -280,9 +430,17 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
         "token_type_ids": batch.get("token_type_ids"),
     }
     asl = None
+    route_out = None
     cls_m: dict = {}
     if branch is not None:
-        tokens, cls_logits = branch(vis.to(next(branch.parameters()).dtype))
+        tokens, cls_logits, route = branch(vis.to(next(branch.parameters()).dtype))
+        if router is not None:
+            if route is None:
+                raise TrainUnusable(
+                    "§2.4 bật MoE nhưng nhánh trả route = None. `route_enabled` "
+                    "của nhánh sai — xem train_recomb.effective_rcfg.")
+            route_out = router(route[0], route[1])
+            route_ctx.set(route_out["weights"])
         at = recombiner.first_image_index(ids, img_token_id)
         kw.update(recombiner.inject_tokens(
             embeds, tokens, at,
@@ -301,7 +459,7 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
         raise TrainUnusable(
             "decoder trả loss = None — `labels` không tới được forward. "
             "Kiểm ReportDataset và collate.")
-    return out.loss, asl, cls_m
+    return out.loss, asl, route_out, cls_m
 
 
 # ══ Một candidate ═══════════════════════════════════════════════════════════
@@ -320,10 +478,15 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     aid = arm["id"]
     use_branch = bool(arm.get("recomb"))
     tcfg = dict(cfg["train"])
-    rcfg = dict(cfg.get("recombiner", {}) or {})
+    spec = moe_spec(cfg, arm, preset)
+    rcfg = effective_rcfg(cfg, spec)
     ccfg = dict(cfg.get("classifier", {}) or {})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if spec is not None and not use_branch:
+        raise TrainUnusable(
+            f"{aid}: §2.4 bật MoE nhưng candidate này không có nhánh. §2.4 LUÔN "
+            f"dùng concat — không nhánh thì không có `vec_2` để định tuyến.")
 
     bs = int(tcfg.get("per_device_batch_size", 1))
     accum = int(tcfg.get("grad_accum", 16))
@@ -335,7 +498,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     try:
         return _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                            max_steps_override, bs, accum, tcfg, rcfg, ccfg,
-                           use_branch, aid)
+                           use_branch, aid, spec)
     except Exception as e:
         oom = is_oom(e)
         note = f"{type(e).__name__}: {e}"[:200]
@@ -361,11 +524,50 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"nếu không thì số bước và lịch one-cycle đổi theo.\n"
             f"      4. recombiner.qformer.n_layers "
             f"({(rcfg.get('qformer') or {}).get('n_layers', 1)}) — rẻ nhất "
-            f"trong bốn, chỉ 2 query nên nó hiếm khi là thủ phạm.")
+            f"trong bốn, chỉ 2 query nên nó hiếm khi là thủ phạm."
+            + ("" if spec is None else
+               f"\n      5. §2.4: `n_experts` ({spec['n_experts']}) nhân thẳng "
+               f"vào activation LoRA (B×T×E×r) và vào số tham số học được. "
+               f"KHÔNG hạ nó để cứu VRAM — nó là biến đang được so. Nếu "
+               f"candidate E lớn nhất không vừa card thì cả bảng §2.4 phải hạ "
+               f"một khoá KHÁC, ở cả năm candidate."))
+
+
+def _attach_experts(model, tcfg: dict, spec: dict):
+    """§2.4: thay 4 ma trận Attn bằng `MoELoraLinear`, thay vì gắn adapter peft.
+
+    Cùng danh sách module mà §2.3 đưa cho peft (`find_target_modules`), vì thế
+    "Experts gắn đúng chỗ adapter của §2.3 gắn" là một câu ĐỌC được, không phải
+    một câu phải tin. Xem docstring src/moe.py cho lý do không dùng peft.
+
+    `prepare_model_for_kbit_training` được gọi với `use_gradient_checkpointing
+    =False`: checkpointing bật SAU, ở chế độ KHÔNG-reentrant. Để nó tự bật là
+    nhận chế độ reentrant mặc định của bản torch/peft đang cài, và khi đó
+    gradient của router hoặc nổ hoặc thiếu.
+    """
+    from peft import prepare_model_for_kbit_training
+
+    if is_quantized(spec["base_method"]):
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=False)
+    targets = find_target_modules(model, tcfg)
+    ctx, st = moe_mod.attach_experts(
+        model, targets, spec["n_experts"], spec["rank"], spec["alpha"],
+        spec["dropout"])
+    router = moe_mod.Router(
+        n_experts=spec["n_experts"], top_k=spec["top_k"],
+        clip_c=spec["logit_clip_c"], noise=spec["noise"],
+        renormalize=spec["renormalize_topk"])
+    st = dict(st)
+    st.update({"top_k": spec["top_k"], "logit_clip_c": spec["logit_clip_c"],
+               "noise": spec["noise"], "noise_init": spec["noise_init"],
+               "renormalize_topk": spec["renormalize_topk"]})
+    return model, ctx, router, st
 
 
 def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
-                max_steps_override, bs, accum, tcfg, rcfg, ccfg, use_branch, aid):
+                max_steps_override, bs, accum, tcfg, rcfg, ccfg, use_branch, aid,
+                spec=None):
     import torch
 
     t0 = time.time()
@@ -385,10 +587,39 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     print(f"  ảnh: {imaging.describe(cfg)}", flush=True)
 
     text_h, vis_h = recombiner.vision_and_text_dims(model)
-    model, pstats = attach_adapter(
-        model, {"method": preset["method"], "rank": preset["rank"], "id": aid}, tcfg)
+    route_ctx = router = None
+    mstats: dict = {}
+    if spec is None:
+        model, pstats = attach_adapter(
+            model, {"method": preset["method"], "rank": preset["rank"], "id": aid},
+            tcfg)
+    else:
+        model, route_ctx, router, mstats = _attach_experts(model, tcfg, spec)
+        pstats = {
+            "trainable_params": sum(p.numel() for p in model.parameters()
+                                    if p.requires_grad),
+            "all_params": sum(p.numel() for p in model.parameters()),
+            "alpha": spec["alpha"], "rank": spec["rank"],
+            "method": f"moe_{spec['method']}",
+            "n_target_modules": mstats["n_modules"]}
+        print(f"  Experts: {spec['n_experts']} × LoRA(r={spec['rank']}, "
+              f"alpha={spec['alpha']:.0f}) trên {mstats['n_modules']} ma trận Attn "
+              f"· top-k = {spec['top_k']} · {mstats['expert_params']:,} tham số "
+              f"({mstats['params_per_expert']:,}/expert)", flush=True)
+        print(f"  Router: nhiễu Gauss học được (σ₀≈"
+              f"{math.log1p(math.exp(spec['noise_init'])):.3f}) -> soft clip "
+              f"C={spec['logit_clip_c']} -> softmax -> top-{spec['top_k']} · "
+              f"Aux {spec['aux_kind']} α={spec['aux_alpha']}", flush=True)
     if bool(tcfg.get("gradient_checkpointing", True)):
-        model.enable_input_require_grads()
+        if spec is None:
+            model.enable_input_require_grads()
+        else:
+            # Bật SAU khi expert đã gắn, và bắt buộc KHÔNG-reentrant: trọng số
+            # định tuyến là một tensor bắt từ NGOÀI đoạn được checkpoint, và chỉ
+            # chế độ không-reentrant xử lý đúng chuyện đó.
+            moe_mod.assert_checkpoint_safe(
+                moe_mod.enable_checkpointing_non_reentrant(model), True)
+            model.enable_input_require_grads()
         model.config.use_cache = False
     gemma = recombiner.unwrap_gemma(model)
     img_tok = recombiner.image_token_id(gemma)
@@ -427,10 +658,16 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"({bstats['trainable']:,} học được) — recombinator "
               f"{bstats['recombinator']:,} · qformer {bstats['qformer']:,} · "
               f"cls_head {bstats['cls_head']:,} · route_gate "
-              f"{bstats['route_gate']:,} (BẤT HOẠT ở §2.3)", flush=True)
+              f"{bstats['route_gate']:,} "
+              f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT ở §2.3'})",
+              flush=True)
         print(f"  cổng vào decoder khởi tạo {float(branch.gate.detach().mean()):.3f}"
               f" — ở bước 0, đầu vào decoder của B = của A cộng "
               f"{bstats['n_query']} token 0", flush=True)
+        if spec is not None:
+            print(f"  Route_Gate HOẠT ĐỘNG: vec_2 -> {spec['n_experts']} logit "
+                  f"(+ nhiễu) -> Aux Loss và -> Experts. QFormer đóng băng "
+                  f"{bstats['qformer_frozen'] or '—'}", flush=True)
 
     # ── dữ liệu ────────────────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
@@ -442,8 +679,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if max_steps_override:
         steps = int(max_steps_override)
 
-    opt, n_by_group = build_optimizer(model, branch, tcfg)
+    opt, n_by_group = build_optimizer(
+        model, branch, tcfg, adapter_group="experts" if spec else "lora")
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
+    aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
+    aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
+    rstats = moe_mod.RouteStats(spec["n_experts"]) if spec else None
     # λ và warmup thuộc về SUP LOSS, nên chúng nằm dưới `classifier`, cạnh ASL —
     # không phải dưới `recombiner`, vốn chỉ mô tả hình dạng nhánh.
     lam = float(ccfg.get("lambda", 0.2)) if use_branch else 0.0
@@ -478,19 +719,30 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if branch is not None:
         branch.train()
     log_every = max(1, int(tcfg.get("logging_steps", 10)))
-    total_loss = step_ce = step_asl = 0.0
+    total_loss = step_ce = step_asl = step_aux = 0.0
     first_loss = None
     last_cls: dict = {}
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
         lam_now = lambda_at(step, steps, lam, lam_warm) if use_branch else 0.0
-        step_ce = step_asl = 0.0
+        aux_now = (moe_mod.aux_alpha_at(step, steps, aux_alpha, aux_warm)
+                   if spec else 0.0)
+        step_ce = step_asl = step_aux = 0.0
         for _ in range(accum):
             batch = next_micro()
-            ce, asl, cls_m = _forward_loss(model, gemma, branch, batch, img_tok,
-                                           tt_value)
+            ce, asl, route_out, cls_m = _forward_loss(
+                model, gemma, branch, batch, img_tok, tt_value, router, route_ctx)
             loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
+            if route_out is not None:
+                loss = loss + aux_now * route_out["aux"].to(ce.dtype)
+                step_aux += float(route_out["aux"].detach()) / accum
+                rstats.update(route_out)
             (loss / accum).backward()
+            # SAU backward, không trước: checkpointing không-reentrant tính lại
+            # forward trong lúc backward, và lần chạy lại ấy vẫn cần trọng số
+            # định tuyến. Xem docstring `_forward_loss`.
+            if route_ctx is not None:
+                route_ctx.clear()
             step_ce += float(ce.detach()) / accum
             if asl is not None:
                 step_asl += float(asl.detach()) / accum
@@ -502,7 +754,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         opt.step()
         sched.step()
 
-        total_loss = step_ce + lam_now * step_asl
+        total_loss = step_ce + lam_now * step_asl + aux_now * step_aux
         if first_loss is None:
             # Loss ở bước ĐẦU TIÊN, để báo cáo có mốc so với loss cuối. Không có
             # nó thì "loss 2.41" không nói được gì: 2.41 là đã học được nhiều hay
@@ -511,10 +763,15 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         gate = float(branch.gate.detach().mean()) if branch is not None else 0.0
         if (step + 1) % log_every == 0 or step == steps - 1:
             lr_now = opt.param_groups[0]["lr"]
+            rsum = rstats.summary() if rstats is not None else {}
             print(f"    [{aid}] bước {step+1}/{steps} · loss {total_loss:.4f} "
                   f"(ce {step_ce:.4f}" +
                   (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · gate {gate:+.4f}"
                    if use_branch else "") +
+                  (f" · aux {step_aux:.3f} · α {aux_now:.4f} · tải "
+                   f"[{rsum.get('load_min', 0):.2f}..{rsum.get('load_max', 0):.2f}]"
+                   f" · chết {rsum.get('n_dead_experts', 0)}"
+                   if spec else "") +
                   f") · lr {lr_now:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({
@@ -523,6 +780,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
                     **({f"train/{aid}/gate": gate} if branch is not None else {}),
+                    **({f"train/{aid}/aux": step_aux,
+                        f"train/{aid}/aux_alpha": aux_now,
+                        f"train/{aid}/route_load_cv": rsum.get("load_cv"),
+                        f"train/{aid}/route_entropy": rsum.get("route_entropy_mean"),
+                        f"train/{aid}/n_dead_experts": rsum.get("n_dead_experts")}
+                       if spec else {}),
                     **{f"train/{aid}/{k}": v for k, v in last_cls.items()},
                 })
 
@@ -533,14 +796,33 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     # Ghi: adapter bằng peft, nhánh ra file RIÊNG. Nhồi nhánh vào state_dict của
     # peft thì `PeftModel.from_pretrained` bỏ qua những khoá nó không nhận — im
     # lặng — và runner sinh văn bản bằng một nhánh ngẫu nhiên.
-    model.save_pretrained(str(out_dir), safe_serialization=True)
+    if spec is None:
+        model.save_pretrained(str(out_dir), safe_serialization=True)
+    else:
+        # §2.4 không dùng peft, nên không có `save_pretrained` nào ghi hộ phần
+        # học được. Ghi cả model là 4 GB trọng số nền cho MỖI candidate; không
+        # ghi gì là nạp lại một bộ expert NGẪU NHIÊN ở khâu sinh.
+        moe_mod.save_experts(model, out_dir, {
+            "arm_id": aid, "top_k": spec["top_k"], "n_experts": spec["n_experts"],
+            "rank": spec["rank"], "alpha": spec["alpha"],
+            "dropout": spec["dropout"], "method": spec["method"],
+            "base_method": spec["base_method"],
+            "target_modules": mstats["n_modules"]})
     processor.save_pretrained(str(out_dir))
     if branch is not None:
         recombiner.save_branch(branch, out_dir)
 
+    route_summary = rstats.summary() if rstats is not None else None
     stats = {
         "arm_id": aid, "name": arm.get("name", aid),
         "uses_recombiner": use_branch,
+        "uses_moe": spec is not None,
+        "top_k": (spec or {}).get("top_k"),
+        "n_experts": (spec or {}).get("n_experts"),
+        "moe": (dict(spec, **mstats) if spec is not None else None),
+        "route_stats": route_summary,
+        "aux_alpha": aux_alpha, "aux_warmup_pct": aux_warm,
+        "aux_last": step_aux if spec else None,
         "lora_preset": preset["id"], "method": preset["method"],
         "rank": preset["rank"], "alpha": preset["alpha"],
         "dora": uses_dora(preset["method"]),
@@ -576,6 +858,19 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         json.dumps(stats, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
 
+    if route_summary:
+        print(f"  định tuyến: tải expert {route_summary['expert_load']} · "
+              f"CV {route_summary['load_cv']} · aux {route_summary['aux_mean']} "
+              f"(1.0 = cân) · entropy {route_summary['route_entropy_mean']}/"
+              f"{route_summary['route_entropy_max']}", flush=True)
+        if route_summary["n_dead_experts"]:
+            print(f"  ⚠ {route_summary['n_dead_experts']}/{spec['n_experts']} "
+                  f"expert KHÔNG nhận ảnh nào: {route_summary['dead_experts']}. "
+                  f"Candidate này thực chất là E = "
+                  f"{spec['n_experts'] - route_summary['n_dead_experts']}, và "
+                  f"bảng §2.4 phải đọc nó như vậy — không phải như E = "
+                  f"{spec['n_experts']}.", flush=True)
+
     del opt, sched, model, branch, gemma
     free_vram()
     print(f"  ✓ {aid}: {mins:.1f} phút · loss {total_loss:.4f} · VRAM đỉnh "
@@ -584,18 +879,26 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
 
 
 # ══ Resume ══════════════════════════════════════════════════════════════════
-def already_trained(out_dir: Path, needs_branch: bool) -> bool:
+def already_trained(out_dir: Path, needs_branch: bool,
+                    needs_experts: bool = False) -> bool:
     """Candidate này đã huấn luyện xong và ghi ĐỦ chưa?
 
-    Ba điều kiện, không phải một: trọng số adapter, `train_stats.json`, VÀ —
-    với candidate B — file nhánh Recombinator. Thiếu file nhánh mà vẫn coi là
-    xong nghĩa là stage `infer` nạp adapter đúng và nhánh NGẪU NHIÊN: nó vẫn
-    sinh ra tiếng Anh đọc được, và cột số của candidate B vẫn trông như kết quả
-    thật.
+    Ba (hoặc bốn) điều kiện, không phải một: trọng số học được,
+    `train_stats.json`, file nhánh Recombinator, và — ở §2.4 — file Experts.
+    Thiếu một file mà vẫn coi là xong nghĩa là stage `infer` nạp phần này đúng
+    và phần kia NGẪU NHIÊN: nó vẫn sinh ra tiếng Anh đọc được, và cột số vẫn
+    trông như kết quả thật.
+
+    §2.4 KHÔNG có `adapter_model.safetensors` (không dùng peft), nên điều kiện
+    đầu tiên đổi chỗ sang file Experts — chứ không phải được bỏ đi.
     """
     d = Path(out_dir)
-    w = (d / "adapter_model.safetensors").exists() or (d / "adapter_model.bin").exists()
-    ok = w and (d / "train_stats.json").exists()
+    if needs_experts:
+        ok = moe_mod.experts_exist(d)
+    else:
+        ok = ((d / "adapter_model.safetensors").exists()
+              or (d / "adapter_model.bin").exists())
+    ok = ok and (d / "train_stats.json").exists()
     if ok and needs_branch:
         ok = recombiner.branch_exists(d)
     return bool(ok)
