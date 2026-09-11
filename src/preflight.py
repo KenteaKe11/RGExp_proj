@@ -130,12 +130,14 @@ _RULES: list[tuple[str, str]] = [
      "model nạp xong mà một phần trọng số còn trên `meta` — gần như luôn là\n"
      "      device_map='auto' đã đẩy bớt lớp sang CPU/đĩa vì thiếu VRAM.\n"
      "      Đường HUẤN LUYỆN phải ghim một thiết bị (mặc định của repo:\n"
-     "      base.device_map_train=single). Tám arm §2.2 đều chạy trên base NF4\n"
+     "      base.device_map_train=single). Cả hai candidate chạy trên base NF4\n"
      "      4-bit (~4 GB); không vừa nổi thế thì hạ batch cũng vô ích — kiểm\n"
      "      nvidia-smi xem có tiến trình cũ còn giữ VRAM không."),
     (r"out of memory|CUDA out of memory",
-     "hết VRAM. Hạ batch_size của model này trong configs/adapters.yaml,\n"
-     "      hoặc với Phi thì hạ num_crops (4 -> 2)."),
+     "hết VRAM. Ở §2.3 batch KHÔNG được dò tự động: hạ, theo thứ tự,\n"
+     "     recombiner.swiglu_hidden / train.max_seq_len /\n"
+     "     train.per_device_batch_size trong configs/recombiner.yaml\n"
+     "(hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần)."),
     (r"trust_remote_code",
      "model dùng kiến trúc ngoài transformers; runner phải truyền "
      "trust_remote_code=True."),

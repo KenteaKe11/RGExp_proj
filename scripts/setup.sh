@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# setup.sh — dựng môi trường cho §2.2. Chạy MỘT LẦN.
+# setup.sh — dựng môi trường cho §2.3. Chạy MỘT LẦN.
 #
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
 #     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
 #
 # MỘT môi trường duy nhất: transformers 4.51/4.52 cho Gemma 3, cộng
-# peft + bitsandbytes cho tám biến thể adapter (requirements-adapters.txt —
-# scripts/run_adapters.sh tự cài phần đó nếu thiếu).
+# peft + bitsandbytes cho adapter (requirements-adapters.txt —
+# scripts/run_recomb.sh tự cài phần đó nếu thiếu).
 #
-# Repo này chỉ còn §2.2. Các model không phải Gemma (Qwen2.5-VL, LLaVA-Med,
-# Phi-3.5-vision) và toàn bộ đường chạy zero-shot của §2.0/§2.1 nằm trong
-# _archive/ — chúng cần transformers 4.36/4.37 trong một venv cô lập, và giữ
-# lại phần dựng venv đó ở đây nghĩa là mỗi lần setup phải trả ~10 phút cho một
-# thứ không lần chạy nào dùng tới.
+# Repo này chỉ còn §2.3. §2.0/§2.1 (zero-shot, các model không phải Gemma) và
+# §2.2 (tám biến thể adapter + Friedman) nằm trong _archive/. Chúng cần
+# transformers 4.36/4.37 trong một venv cô lập, và giữ lại phần dựng venv đó ở
+# đây nghĩa là mỗi lần setup phải trả ~10 phút cho một thứ không lần chạy nào
+# dùng tới.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -24,7 +24,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.2 Tám biến thể adapter — setup ═══"
+echo "═══ §2.3 Nhánh Recombinator — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -178,9 +178,20 @@ else
 fi
 
 # ── 5. requirements ─────────────────────────────────────────────────────────
-for f in requirements.txt configs/adapters.yaml src/run_adapters.py; do
+# File BẮT BUỘC của §2.3. `configs/adapters.yaml` và `src/run_adapters.py`
+# KHÔNG còn trong danh sách: chúng thuộc §2.2 và đã sang _archive/ (xem
+# scripts/archive_2.2.sh). Đòi chúng ở đây là chặn setup vì một thứ repo đã cố
+# ý bỏ đi.
+for f in requirements.txt configs/recombiner.yaml src/run_recomb.py \
+         src/recombiner.py src/train_recomb.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
+# Nếu §2.2 vẫn còn ở src/, nhắc — nhưng KHÔNG chặn: setup không phải chỗ ép
+# người ta dọn repo.
+if [ -f "src/train.py" ] || [ -f "configs/recomb.yaml" ]; then
+    echo "⚙ §2.2 (và bản §2.3 đời trước) vẫn còn trong repo."
+    echo "  Chuyển đi trước khi chạy thật:  bash scripts/archive_2.2.sh --apply"
+fi
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
@@ -235,8 +246,12 @@ p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
-    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — hạ batch_size trong "
-          "configs/adapters.yaml nếu OOM.")
+    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.3 KHÔNG dò batch. "
+          "Hết VRAM thì hạ, theo thứ tự,")
+    print("  recombiner.swiglu_hidden / train.max_seq_len / "
+          "train.per_device_batch_size trong configs/recombiner.yaml")
+    print("  (hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần, nếu không "
+          "số bước và lịch one-cycle đổi theo).")
 PYEOF
 
 # DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn
@@ -267,15 +282,23 @@ echo "       export HF_TOKEN=hf_xxxxxxxx        # BẮT BUỘC (gemma-3 gated + 
 echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https://wandb.ai/authorize)"
 echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
-echo "  2. Thử nhanh 8 ảnh (~5 phút, không đẩy lên Hub):"
-echo "       bash scripts/run.sh --dry-run"
+echo "  2. Dọn §2.2 + tự kiểm chứng (vài giây, không cần GPU):"
+echo "       bash scripts/archive_2.2.sh --apply"
+echo "       python scripts/selftest_recomb.py     # phải qua HẾT"
 echo
-echo "  3. CHẠY THẬT — một lệnh, trọn §2.1:"
+echo "  3. Dò nhãn phân loại (~30 giây) — chết sớm rẻ hơn chết ở giờ thứ hai:"
+echo "       python -m src.labels_cls --check-split"
+echo
+echo "  4. Thử đường ống: 8 ảnh test, 16 mẫu train, 4 bước, không đẩy Hub:"
+echo "       bash scripts/run_recomb.sh --dry-run"
+echo "       # KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config."
+echo
+echo "  5. CHẠY THẬT — một lệnh, trọn §2.3 (candidate B trước, A sau):"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run.sh --detach"
+    echo "       bash scripts/run_recomb.sh --detach"
     echo "       # chạy nền, trả lại shell ngay, in link W&B. ssh đứt không giết nó,"
     echo "       # và không cần tmux — tiến độ xem trên W&B."
 else
-    echo "       bash scripts/run.sh"
+    echo "       bash scripts/run_recomb.sh"
 fi
 echo
