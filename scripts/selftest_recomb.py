@@ -770,6 +770,8 @@ def moe_tests() -> None:
     từ Aux Loss, tức là chỉ học cân tải và không biết gì về chất lượng báo cáo —
     và cái đó KHÔNG hiện ra ở đường loss, vì Experts vẫn học bình thường.
     """
+    import math
+
     try:
         import torch
         import torch.nn as nn
@@ -869,7 +871,12 @@ def moe_tests() -> None:
     def t_weights_differentiable():
         r = Router(n_experts=4, top_k=2, clip_c=C, noise=False).eval()
         lg = torch.randn(3, 4, requires_grad=True)
-        r(lg, None)["weights"].sum().backward()
+        w = r(lg, None)["weights"]
+        # KHÔNG dùng `w.sum()`: sau chuẩn hoá lại, mỗi hàng cộng ĐÚNG BẰNG 1,
+        # nên `w.sum()` là một hằng số và gradient của nó bằng 0 về mặt toán
+        # học — phép kiểm khi đó báo hỏng ngay cả với một router hoàn toàn
+        # đúng. Cần một phiếm hàm PHÂN BIỆT được các expert với nhau.
+        (w * torch.arange(1.0, 5.0)).sum().backward()
         true(lg.grad is not None and float(lg.grad.abs().sum()) > 0,
              "trọng số định tuyến phải KHẢ VI theo logit — nếu không, router "
              "chỉ còn học từ Aux Loss, tức là chỉ học cân tải và không biết gì "
@@ -912,8 +919,6 @@ def moe_tests() -> None:
         "dồn hoàn toàn" là aux ≈ 4.1 chứ không phải 6.0, và một người đọc chờ
         6.0 sẽ kết luận nhầm rằng tải vẫn còn khá cân.
         """
-        import math
-
         E = 6
         r = Router(n_experts=E, top_k=1, clip_c=C, noise=False).eval()
         lg = torch.full((10, E), -50.0)
@@ -1164,17 +1169,28 @@ def moe_tests() -> None:
 
         Kiểm bằng NGUỒN thay vì bằng cách chạy: dựng được tình huống thật cần cả
         một decoder Gemma, và phép kiểm này phải chạy trong vài giây trên CPU.
+
+        Soi CODE chứ không soi docstring: docstring của `_forward_loss` GIẢI
+        THÍCH luật này và vì thế có chứa đúng chuỗi đang bị cấm. Một phép kiểm
+        theo văn bản thô sẽ báo hỏng một file hoàn toàn đúng — và cách "sửa" tự
+        nhiên nhất khi đó là xoá lời giải thích, tức là vứt đi đúng thứ ngăn lỗi
+        này quay lại.
         """
         import inspect as _i
 
         from src import train_recomb as tr
 
-        src_fwd = _i.getsource(tr._forward_loss)
+        def _code_only(fn) -> str:
+            s = _i.getsource(fn)
+            doc = fn.__doc__
+            return s.replace(doc, "") if doc else s
+
+        src_fwd = _code_only(tr._forward_loss)
         true("clear()" not in src_fwd,
              "_forward_loss xoá ngữ cảnh định tuyến. Lần tính lại forward trong "
              "backward sẽ đọc phải None và cả bước huấn luyện chết — xoá phải "
              "nằm SAU `.backward()` trong vòng lặp.")
-        src_loop = _i.getsource(tr._train_once)
+        src_loop = _code_only(tr._train_once)
         true("route_ctx.clear()" in src_loop,
              "vòng lặp không xoá ngữ cảnh sau backward — trọng số của "
              "micro-batch trước ở lại, và vì batch là hằng số thì phép kiểm số "
@@ -1196,7 +1212,11 @@ def moe_tests() -> None:
            "một candidate E=5 chỉ dùng 1 expert là một candidate E=1 mang nhãn "
            "E=5")
         true(s["load_cv"] > 1.0, "tải dồn một chỗ -> CV lớn")
-        true(abs(s["aux_mean"] - 5.0) < 0.5, f"aux ≈ E: {s['aux_mean']}")
+        # Trần của aux là E·p_max, KHÔNG phải E — soft clipping chặn logit ở ±C
+        # nên P của expert thắng không bao giờ tới 1. Xem t_aux_collapsed_is_high.
+        p_max = math.exp(C) / (math.exp(C) + 4 * math.exp(-C))
+        eq(s["aux_mean"], 5 * p_max, 0.02,
+           f"aux khi dồn một chỗ = E·p_max = {5 * p_max:.4f}, không phải E")
     check("MoE: thống kê định tuyến bắt được expert chết", t_route_stats_dead)
 
     def t_route_stats_even():

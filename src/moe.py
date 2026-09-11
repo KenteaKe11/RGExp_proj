@@ -219,9 +219,14 @@ class Router(nn.Module):
         self.clip_c = float(clip_c)
         self.noise = bool(noise)
         self.renormalize = bool(renormalize)
-        if not (1 <= self.top_k <= self.n_experts):
+        # k < E, KHÔNG phải k <= E. Cận trên là chỗ dễ viết hụt nhất trong cả
+        # file này: `1 <= k <= E` đọc rất tự nhiên và nó cho k = E đi qua — khi
+        # đó mọi expert luôn được chọn, top-k không loại ai, Aux Loss không có
+        # gì để cân, và candidate ấy là một LoRA trung bình cộng của E nhánh
+        # mang nhãn "MoE". Nó vẫn huấn luyện, vẫn ra điểm, vẫn vào bảng Friedman.
+        if not (1 <= self.top_k < self.n_experts):
             raise ValueError(
-                f"top_k = {self.top_k} phải nằm trong [1, n_experts={self.n_experts}]. "
+                f"top_k = {self.top_k} phải nằm trong [1, n_experts={self.n_experts}). "
                 f"k > E không định nghĩa được, và k = E là mô hình DÀY ĐẶC mang "
                 f"tên MoE — không có gì được định tuyến.")
 
