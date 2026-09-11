@@ -159,7 +159,7 @@ generate:
 #
 # Đổi preset:  --set lora.preset=qdora_r4
 lora:
-  preset: qdora_r32
+  preset: qdora_r4
   presets:
     qlora_r4:  {method: qlora, rank: 4}
     qlora_r8:  {method: qlora, rank: 8}
