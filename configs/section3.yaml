@@ -226,7 +226,7 @@ classifier:
   hidden: 1024
   dropout: 0.1
   asl:
-    gamma_neg: 2.0
+    gamma_neg: [2.0, 0.0, 0.0]
     gamma_pos: 0.0
     clip: 0.05
     eps: 1.0e-8
