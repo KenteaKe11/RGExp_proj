@@ -667,7 +667,7 @@ pretrain:
   # CÓ CHỦ Ý — và vì thế phải vào phần Giới hạn. Đặt một số cụ thể (vd 6400) để
   # tách hai tập, và khi đó câu trả lời của §2.3 đổi nghĩa theo.
   n_train: 0
-  n_epochs: 8
+  n_epochs: 1
 
   # eff_bs = 8 × 4 = 32, BẰNG train.per_device_batch_size × train.grad_accum.
   # Không bắt buộc về toán, nhưng nó làm "một bước" có cùng nghĩa ở cả hai
@@ -680,7 +680,7 @@ pretrain:
   # trên lịch khác là DỪNG, trừ khi gõ --extend-schedule.
   schedule:
     impl: lambda
-    max_lr: 3.0e-4
+    max_lr: 1e-4
     pct_start: 0.1
     div_factor: 25.0
     final_div_factor: 100.0
