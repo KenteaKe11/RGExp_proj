@@ -154,8 +154,8 @@ moe:
   # Ràng buộc duy nhất, kiểm trong code: 1 <= top_k < n_experts. `top_k =
   # n_experts` là một mô hình DÀY ĐẶC mang tên MoE — mọi expert luôn được chọn
   # nên Route_Gate không định tuyến gì.
-  top_k: 4
-  n_experts: 8
+  top_k: 6
+  n_experts: 10
 
   router:
     noise: true
