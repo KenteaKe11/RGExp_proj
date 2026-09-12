@@ -415,7 +415,7 @@ classifier:
     # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
     # dương và 2 ô âm; lớp `neg` bật ở phần lớn bệnh lý nên hai ô pos/uncertain
     # gần như luôn mang nhãn 0 và dễ tới mức áp đảo tổng gradient.
-    gamma_neg: 2.0
+    gamma_neg: [2.0, 0.0, 0.0]
     gamma_pos: 0.0
     # clip dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
     # p < clip đóng góp ĐÚNG BẰNG 0, không phải chỉ nhỏ.
