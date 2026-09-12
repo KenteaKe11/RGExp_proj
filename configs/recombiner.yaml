@@ -672,8 +672,8 @@ pretrain:
   # eff_bs = 8 × 4 = 32, BẰNG train.per_device_batch_size × train.grad_accum.
   # Không bắt buộc về toán, nhưng nó làm "một bước" có cùng nghĩa ở cả hai
   # bảng. Hạ bs thì NHÂN grad_accum lên đúng bấy nhiêu, y như §2.3.
-  per_device_batch_size: 8
-  grad_accum: 4
+  per_device_batch_size: 16
+  grad_accum: 2
 
   # MỘT chu kỳ one-cycle trải trên TOÀN BỘ n_epochs — không phải mỗi epoch một
   # chu kỳ. Dùng chung build_scheduler với train.schedule. Nối tiếp một ckpt
