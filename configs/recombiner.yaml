@@ -686,7 +686,7 @@ pretrain:
     final_div_factor: 100.0
     anneal: cos
     cycle_momentum: false
-  weight_decay: 0.01
+  weight_decay: 0.1
 
   # Phải GIỐNG lora.preset của §2.3: nhánh đọc last_hidden_state của chính
   # vision tower này, và cách lượng tử hoá base đổi thì phân phối đặc trưng mà
