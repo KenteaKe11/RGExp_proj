@@ -378,6 +378,133 @@ def resolve_source(spec: str, cache_dir: str | Path | None = None) -> Path:
     return d
 
 
+# ══ Ckpt MỚI NHẤT trên Hub (cho `--resume`) ═════════════════════════════════
+def hub_candidates(repo_id: str, revision: str | None = None,
+                   token: str | None = None) -> list[dict]:
+    """Mọi thư mục trong repo MODEL có ĐỦ hai file của một ckpt sup_pretrain.
+
+    Chỉ tải META (vài KB mỗi cái), không tải trọng số: mục đích của hàm này là
+    TRẢ LỜI "cái nào mới nhất", và câu trả lời nằm trong META.
+
+    Một `{PRETRAIN_META}` không có `{PRETRAIN_FILE}` đi kèm thì KHÔNG tính là
+    ứng viên. Ca đó có thật: một lần `upload_folder` đứt giữa chừng để lại file
+    JSON nhỏ (đi trước, không qua LFS) mà không có file trọng số — và một hàm
+    chọn theo tên thư mục sẽ chọn đúng cái đó rồi hỏng ở bước nạp, sau khi đã
+    tải xong base và dựng xong nhánh.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi(token=token)
+    files = set(api.list_repo_files(repo_id=repo_id, repo_type="model",
+                                    revision=revision))
+    out: list[dict] = []
+    for f in sorted(files):
+        if f.rsplit("/", 1)[-1] != PRETRAIN_META:
+            continue
+        sub = f[: -len(PRETRAIN_META)].strip("/")
+        weight = f"{sub}/{PRETRAIN_FILE}" if sub else PRETRAIN_FILE
+        if weight not in files:
+            out.append({"subdir": sub, "meta": None,
+                        "error": f"thiếu {weight}"})
+            continue
+        try:
+            p = hf_hub_download(repo_id=repo_id, filename=f, repo_type="model",
+                                revision=revision, token=token)
+            out.append({"subdir": sub, "error": None,
+                        "meta": json.loads(Path(p).read_text(encoding="utf-8"))})
+        except Exception as e:                      # noqa: BLE001
+            out.append({"subdir": sub, "meta": None, "error": repr(e)})
+    return out
+
+
+def _rank(c: dict) -> tuple:
+    """Khoá sắp xếp "mới nhất": epoch, rồi global_step, rồi seen_samples.
+
+    Theo `epoch` chứ KHÔNG theo commit gần nhất, và KHÔNG theo `hub_subdir`:
+
+      * commit gần nhất là thời điểm ĐẨY, không phải thời điểm HUẤN LUYỆN. Chạy
+        lại `--stages push` cho một ckpt cũ là một commit mới mang một epoch cũ.
+      * `hub_subdir` (mặc định `best`) là một TÊN. `best/` giữ epoch có val tốt
+        nhất, và với `select_metric = cls_f1_pos` thì đó thường KHÔNG phải epoch
+        cuối. Lấy `best/` khi cạnh nó có `epoch_012/` là lùi lại vài epoch mà
+        không có dòng log nào nói vậy.
+    """
+    m = dict(c.get("meta") or {})
+
+    def _i(k: str) -> int:
+        try:
+            return int(m.get(k))
+        except (TypeError, ValueError):
+            return -1
+
+    return (_i("epoch"), _i("global_step"), _i("seen_samples"), c["subdir"])
+
+
+def latest_on_hub(cfg, revision: str | None = None,
+                  cache_dir: str | Path | None = None, verbose: bool = True
+                  ) -> tuple[Path, dict, str]:
+    """Ckpt MỚI NHẤT trên `pretrain.hub_repo` -> (thư mục cục bộ, META, subdir).
+
+    In RA TẤT CẢ ứng viên tìm thấy và đánh dấu cái được chọn. Một lần `--resume`
+    lấy nhầm epoch là một lần chạy mấy tiếng cho ra một checkpoint không ai giải
+    thích được, nên việc "nó chọn cái nào" phải đọc được từ log chứ không phải
+    suy ra từ quy ước đặt tên.
+    """
+    from .config import hf_token
+
+    p = dict(cfg.get("pretrain", {}) or {})
+    repo_id = str(p.get("hub_repo", "")).strip()
+    if not repo_id or "/" not in repo_id:
+        raise ValueError(
+            f"pretrain.hub_repo = {repo_id!r} — cần dạng owner/name thì mới "
+            f"biết lấy checkpoint ở đâu. Hoặc chỉ định thẳng nguồn: "
+            f"--resume hub:OWNER/NAME/SUBDIR")
+    tok = hf_token()
+    try:
+        cands = hub_candidates(repo_id, revision, tok)
+    except Exception as e:
+        raise RuntimeError(
+            f"không đọc được repo model {repo_id}: {e!r}\n"
+            f"    `pretrain.hub_private` mặc định là true, nên cần HF_TOKEN có "
+            f"quyền ĐỌC `{repo_id.split('/')[0]}`:\n"
+            f"      export HF_TOKEN=hf_xxxxxxxx") from e
+
+    ok = [c for c in cands if c["meta"]]
+    if not ok:
+        broken = "\n".join(f"      {c['subdir'] or '.'}: {c['error']}"
+                           for c in cands)
+        raise FileNotFoundError(
+            f"{repo_id} không có thư mục nào chứa đủ {PRETRAIN_FILE} + "
+            f"{PRETRAIN_META}.\n"
+            + (f"    Có {len(cands)} thư mục gần giống nhưng không dùng được:\n"
+               f"{broken}\n" if cands else "")
+            + f"    Chưa đẩy lần nào? Chạy `python -m src.run_pretrain "
+              f"--stages push` trước, hoặc trỏ thẳng vào một thư mục ckpt cục "
+              f"bộ: --resume runs/sup_pretrain/ckpt/best")
+
+    ok.sort(key=_rank, reverse=True)
+    win = ok[0]
+    sub = str(win["subdir"] or "")
+    if verbose:
+        print(f"  ⌁ {repo_id}: {len(ok)} checkpoint trên Hub"
+              + (f" (rev {revision})" if revision else ""), flush=True)
+        for c in ok:
+            m = dict(c["meta"])
+            v = dict(m.get("val") or {})
+            print(f"    {'→' if c is win else ' '} {(c['subdir'] or '.'):<14} "
+                  f"epoch {m.get('epoch')}/{m.get('n_epochs')} · bước "
+                  f"{m.get('global_step')} · {m.get('seen_samples')} lượt mẫu "
+                  f"· val f1_pos {v.get('cls_f1_pos')}", flush=True)
+        if len(ok) > 1:
+            print("      (chọn theo `epoch` trong META, không theo tên thư mục "
+                  "và không theo commit gần nhất)", flush=True)
+
+    spec = f"hub:{repo_id}" + (f"/{sub}" if sub else "")
+    if revision:
+        spec += f"@{revision}"
+    return resolve_source(spec, cache_dir=cache_dir), dict(win["meta"]), sub
+
+
 # ══ Đẩy lên Hub ═════════════════════════════════════════════════════════════
 def _model_card(meta: dict, cfg) -> str:
     v = dict(meta.get("val") or {})
@@ -387,6 +514,25 @@ def _model_card(meta: dict, cfg) -> str:
         f"| `{m}` | {'CÓ' if m in meta.get('pretrained_modules', []) else 'KHÔNG'} |"
         for m in list(meta.get("pretrained_modules", []))
         + list(meta.get("untrained_modules", [])))
+    # Nguồn gốc phải nằm TRONG card, không chỉ trong log của lần chạy đã trôi
+    # mất: một checkpoint `--resume` trông y hệt một checkpoint chạy liền mạch
+    # ở mọi con số trên Hub, mà đường lr của nó thì không giống — và "8 epoch"
+    # trong một bảng kết quả có nghĩa khác hẳn nếu nó là 3 + 5 trên hai chu kỳ.
+    r = dict(meta.get("resumed_from") or {})
+    lineage = "" if not r else f"""
+## Nguồn khởi tạo — đây là một **warm restart**
+
+Checkpoint này KHÔNG bắt đầu từ trọng số ngẫu nhiên. Nó nối tiếp
+`{r.get("spec")}` (epoch {r.get("epoch")}, val `cls_f1_pos` {r.get("val_f1_pos")})
+qua `--resume`, rồi chạy thêm {meta.get("n_epochs")} epoch trên một chu kỳ
+one-cycle **MỚI** (`max_lr` {(meta.get("schedule") or {}).get("max_lr")}).
+
+Trạng thái optimizer/scheduler/RNG của lần chạy trước **không** được nối tiếp —
+`trainer_state.pt` không bao giờ lên Hub. lr của lần chạy này bắt đầu lại từ đầu
+chu kỳ, nên `epoch` ở bảng dưới đếm từ 1 của lần chạy NÀY: tổng số epoch mà
+trọng số đã đi qua là {r.get("epoch")} + {meta.get("n_epochs")}, trên hai đường
+cong khác nhau. Con số ấy phải vào phần Giới hạn nếu checkpoint này ra bảng.
+"""
     return f"""---
 library_name: rgexp
 tags: [recombiner, qformer, siglip, asl, chest-xray, supervised-pretraining]
@@ -407,7 +553,7 @@ gradient nào (`gate` là cổng vào decoder, mà decoder không chạy; `route
 đọc `vec_2`, mà `vec_2` bị đóng băng). Ghi chúng vào đây sẽ làm file trông như
 một checkpoint đầy đủ của nhánh, và người nạp sẽ tưởng Route_Gate đã được
 pretrain.
-
+{lineage}
 ## Số liệu
 
 | | |

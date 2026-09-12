@@ -6,13 +6,47 @@
     python -m src.run_pretrain --stages push       # đẩy ckpt/best lên Hub
     python -m src.run_pretrain --no-resume         # bỏ ckpt cũ, chạy lại từ 0
     python -m src.run_pretrain --push-epoch 7      # đẩy ĐÚNG epoch 7
+    python -m src.run_pretrain --resume            # lấy ckpt mới nhất trên Hub
+                                                   # rồi train tiếp với config
+                                                   # hiện tại, ở run dir MỚI
 
 Mã thoát:
     0  xong
-    2  tham số dòng lệnh sai
+    2  tham số dòng lệnh sai, hoặc không lấy được checkpoint để train tiếp
     1  rò rỉ train/test, hoặc huấn luyện không chạy được
     5  nhãn phân loại không dùng được
     8  bước đẩy Hub hỏng  -> chạy lại `--stages push`, kết quả còn nguyên
+
+── `--resume` là WARM RESTART, không phải nối tiếp ──────────────────────────
+`--no-resume` (đã có) và `--resume` (thêm ở đây) KHÔNG phải hai chiều của một
+khoá. Chúng nói về hai NGUỒN khác nhau:
+
+  * mặc định / `--no-resume` — nguồn là ĐĨA: `runs/<subdir>/ckpt/last.json` và
+    `trainer_state.pt` cạnh nó. Có đủ optimizer, scheduler, trạng thái
+    Generator, cursor trong hoán vị -> nối tiếp CHÍNH XÁC, và đổi `n_epochs`
+    là DỪNG vì bước cũ sẽ bị đọc trên một đường cong one-cycle mới.
+
+  * `--resume` — nguồn là HUB: `pretrain.hub_repo`. Trên đó CHỈ có trọng số:
+    `push_pretrain` chặn cứng `trainer_state.pt` (nặng gấp ~3 lần phần trọng
+    số, và vô nghĩa với người tái sử dụng). Nên thứ duy nhất làm được là nạp
+    trọng số rồi dựng một chu kỳ one-cycle MỚI từ config hiện tại — tức là
+    ĐÚNG cái được yêu cầu: "train tiếp với cấu hình tôi vừa đổi".
+
+Vì lịch là lịch mới, `--resume` KHÔNG đụng hàng rào `--extend-schedule`: không
+có bước cũ nào bị đọc trên đường cong mới, `global_step` bắt đầu từ 0.
+
+Đổi lại, nó ghi vào một run dir MỚI (`<subdir>_r2`, `_r3`, …) chứ không ghi đè
+`runs/<subdir>/`. Hai lý do cơ học: `history.csv` của một thư mục phải là MỘT
+đường cong đọc được, và `ckpt/best` cũ là thứ `--resume` vừa lấy làm nguồn —
+ghi đè nó bằng epoch 1 của lần chạy mới là phá chính cái mốc đang so.
+
+── Bốn khoá config mà `--resume` KHÔNG cho đổi lặng lẽ ──────────────────────
+`base.hf_id`, `pretrain.base_method`, `data.image_max_side`, `do_pan_and_scan`.
+Chúng quyết định PHÂN PHỐI đặc trưng SigLIP mà nhánh đọc, và đổi một trong
+chúng không đổi một shape nào — nên `assert_compatible` im lặng cho qua, nhánh
+nạp trơn tru, rồi học tiếp trên một phân phối khác phân phối nó đã học. Triệu
+chứng là val tụt ở epoch đầu rồi bò lên lại, giống hệt một lần chạy bình
+thường. Nên ở đây chúng là điều kiện DỪNG, mở bằng `--allow-base-drift`.
 
 ── Vì sao một điểm vào RIÊNG chứ không phải `--mode` của run_recomb ─────────
 `run_recomb.py` điều phối bảy stage quanh một PHÉP SO SÁNH: nhiều candidate,
@@ -108,6 +142,105 @@ def _ckpt_status(run_dir: Path) -> dict:
             "history": (run_dir / "history.csv").exists()}
 
 
+def _resume_run_id(base: str, runs_root: Path) -> tuple[str, bool]:
+    """Tên run dir cho một lần `--resume`. -> (run_id, dùng lại thư mục cũ?)
+
+    DÙNG LẠI `<base>_rN` cao nhất nếu nó còn một `trainer_state.pt` nối tiếp
+    được; chỉ khi không có cái nào như vậy mới cấp một N mới.
+
+    Ca mà quy tắc này tồn tại để chặn: `--resume` lần một tạo `_r2` rồi chạy
+    được 3/10 epoch thì đứt (OOM, mất điện, Ctrl-C). Gõ lại `--resume` mà cấp
+    `_r3` nghĩa là tải lại trọng số CŨ từ Hub và bắt đầu lại từ epoch 1 — ba
+    epoch vừa chạy vẫn nằm trên đĩa, chỉ là không ai đọc chúng nữa, và không có
+    dòng log nào nói vậy. Dùng lại `_r2` thì `pretrain_sup.run` thấy
+    `last.json` và nối tiếp đúng chỗ.
+    """
+    from . import pretrain_sup
+
+    ns: list[int] = []
+    for d in sorted(runs_root.glob(f"{base}_r*")):
+        tail = d.name[len(base) + 2:]
+        if d.is_dir() and tail.isdigit():
+            ns.append(int(tail))
+    for n in sorted(ns, reverse=True):
+        if pretrain_sup.read_last(runs_root / f"{base}_r{n}"):
+            return f"{base}_r{n}", True
+    return f"{base}_r{(max(ns) + 1) if ns else 2}", False
+
+
+# Bốn khoá quyết định PHÂN PHỐI đặc trưng SigLIP mà nhánh đọc. Đổi chúng giữa
+# lần pretrain trước và lần này là đổi dữ liệu đầu vào của nhánh mà không đổi
+# một shape nào — xem docstring đầu file.
+_DRIFT_KEYS = ("base_hf_id", "base_method", "image_max_side", "do_pan_and_scan")
+
+
+def _now_conditions(cfg: Cfg, p: dict) -> dict:
+    """Điều kiện của lần chạy NÀY, đúng những khoá mà META của ckpt cũng ghi."""
+    from . import imaging
+
+    return {
+        "base_hf_id": str(cfg["base"]["hf_id"]),
+        "base_method": str(p.get("base_method", "qlora")),
+        "image_max_side": int(cfg["data"].get("image_max_side", 512)),
+        "do_pan_and_scan": bool(imaging.policy(cfg)["do_pan_and_scan"]),
+        "n_epochs": int(p.get("n_epochs", 8)),
+        "max_lr": (p.get("schedule", {}) or {}).get("max_lr"),
+        "per_device_batch_size": int(p.get("per_device_batch_size", 8)),
+        "grad_accum": int(p.get("grad_accum", 4)),
+        "n_train": int(p.get("n_train", 0) or 0),
+        "select_metric": str(p.get("select_metric", "cls_f1_pos")),
+        "weight_decay": p.get("weight_decay"),
+    }
+
+
+def _ckpt_conditions(meta: dict) -> dict:
+    """Cùng những khoá ấy, đọc từ META của checkpoint nguồn."""
+    d = dict(meta.get("data") or {})
+    s = dict(meta.get("schedule") or {})
+    return {
+        "base_hf_id": meta.get("base_hf_id"),
+        "base_method": meta.get("base_method"),
+        "image_max_side": d.get("image_max_side"),
+        "do_pan_and_scan": d.get("do_pan_and_scan"),
+        "n_epochs": meta.get("n_epochs"),
+        "max_lr": s.get("max_lr"),
+        "per_device_batch_size": meta.get("batch_size"),
+        "grad_accum": meta.get("grad_accum"),
+        "n_train": d.get("n_train"),
+        "select_metric": meta.get("select_metric"),
+        "weight_decay": None,
+    }
+
+
+def _drift(meta: dict, cfg: Cfg, p: dict) -> tuple[list[tuple], list[tuple]]:
+    """-> (khác biệt NGUY HIỂM, khác biệt lành). Mỗi phần tử: (khoá, cũ, mới).
+
+    Khoá mà META cũ không ghi (`None`) thì BỎ QUA chứ không báo là đã đổi: một
+    checkpoint do bản code cũ ghi ra thiếu khoá là chuyện bình thường, và báo
+    động giả ở đây sẽ dạy người chạy gõ `--allow-base-drift` theo phản xạ —
+    lúc đó cái hàng rào này không còn chặn được gì nữa.
+
+    `n_train` so theo con số ĐÃ GIẢI (số hàng thật), không theo `pretrain.
+    n_train` thô: `0` nghĩa là "toàn bộ split", nên `0` với `41_960` là CÙNG
+    một tập, và báo nó là một thay đổi thì cũng là báo động giả.
+    """
+    now, old = _now_conditions(cfg, p), _ckpt_conditions(meta)
+    risky: list[tuple] = []
+    benign: list[tuple] = []
+    for k in now:
+        o, n = old.get(k), now.get(k)
+        if o is None:
+            continue
+        if k == "n_train" and int(n or 0) == 0:
+            continue
+        same = (str(o) == str(n)) if not isinstance(o, bool) \
+            else (bool(o) == bool(n))
+        if same:
+            continue
+        (risky if k in _DRIFT_KEYS else benign).append((k, o, n))
+    return risky, benign
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="sup_pretrain — Recombinator + QFormer(vec_1) + ClsHead, "
@@ -128,11 +261,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-resume", action="store_true",
                     help="bỏ qua ckpt cũ và chạy lại từ epoch 0 (KHÔNG xoá "
                          "ckpt đã có — chúng bị ghi đè dần theo epoch)")
+    ap.add_argument("--resume", nargs="?", const="auto", default=None,
+                    metavar="NGUỒN",
+                    help="lấy ckpt MỚI NHẤT trên pretrain.hub_repo (epoch lớn "
+                         "nhất đọc từ META) và huấn luyện TIẾP nó với config "
+                         "hiện tại, trong một run dir MỚI <subdir>_rN. Chỉ "
+                         "TRỌNG SỐ được nối tiếp — lịch one-cycle dựng lại từ "
+                         "đầu. Đưa thêm giá trị để chỉ định nguồn khác: "
+                         "hub:OWNER/NAME[/SUBDIR][@rev] hoặc một thư mục ckpt "
+                         "cục bộ.")
+    ap.add_argument("--allow-base-drift", action="store_true",
+                    help="CHẤP NHẬN train tiếp một ckpt được pretrain với base "
+                         "/ chính sách ảnh KHÁC config hiện tại. Nhánh sẽ học "
+                         "tiếp trên một phân phối đặc trưng khác phân phối nó "
+                         "đã học, và không một phép kiểm shape nào bắt được — "
+                         "mặc định là DỪNG.")
     ap.add_argument("--push-epoch", type=int, default=None,
                     help="đẩy ĐÚNG epoch này thay vì ckpt/best")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
+
+    if a.resume and a.no_resume:
+        print("✗ --resume và --no-resume nói ngược nhau.\n"
+              "    --resume  = lấy trọng số từ Hub rồi train tiếp (run dir MỚI)\n"
+              "    --no-resume = bỏ ckpt trên ĐĨA, chạy lại từ epoch 0\n"
+              "    Chọn một.")
+        return 2
 
     cfg = load_config(a.config, a.overrides)
     cfg["experiment"] = "sup_pretrain"
@@ -172,8 +327,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     seed_everything(int(p.get("seed") or cfg.get("seed", 42)))
-    run_id = a.run_id or str(p.get("subdir", "sup_pretrain"))
-    run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
+    runs_root = Path(cfg["output"].get("dir", "./runs"))
+    base_id = str(p.get("subdir", "sup_pretrain"))
+    reused_dir = False
+    if a.run_id:
+        run_id = str(a.run_id)
+    elif a.resume:
+        run_id, reused_dir = _resume_run_id(base_id, runs_root)
+    else:
+        run_id = base_id
+    run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
@@ -209,6 +372,101 @@ def main(argv: list[str] | None = None) -> int:
             print("⚙ chưa có ckpt nào — chạy từ đầu", flush=True)
     except Exception as e:
         print(f"⚠ không đọc được trạng thái ckpt ({e!r}) — coi như chưa có gì",
+              flush=True)
+
+    # ── --resume: nguồn khởi tạo, giải quyết TRƯỚC mọi thứ tốn kém ──────────
+    # Trước cả Tracker: một HF_TOKEN thiếu quyền đọc phải hỏng ở giây thứ hai,
+    # không phải sau khi đã dựng xong dữ liệu và tải xong base.
+    init_src = None
+    init_spec = None
+    if a.resume and "train" in stages:
+        from . import pretrain_io
+
+        _hr("Nguồn khởi tạo — `--resume`")
+        if reused_dir:
+            print(f"  ⚙ {run_id} còn một lần chạy đang dở — sẽ NỐI TIẾP CỤC BỘ "
+                  f"ở đó, và nguồn Hub dưới đây chỉ dùng nếu nó không nối tiếp "
+                  f"được.\n    Muốn một lần chạy hoàn toàn mới từ Hub: "
+                  f"--run-id {base_id}_r{run_id.rsplit('_r', 1)[-1]}b",
+                  flush=True)
+        try:
+            if str(a.resume) == "auto":
+                init_src, init_meta, sub = pretrain_io.latest_on_hub(cfg)
+                init_spec = (f"hub:{p.get('hub_repo')}"
+                             + (f"/{sub}" if sub else ""))
+            else:
+                init_spec = str(a.resume)
+                init_src = pretrain_io.resolve_source(init_spec)
+                init_meta = pretrain_io.read_meta(init_src)
+        except Exception as e:
+            print(f"\n✗ DỪNG — không lấy được checkpoint để train tiếp:\n"
+                  f"    {e}", flush=True)
+            return 2
+
+        v = dict(init_meta.get("val") or {})
+        print(f"  nguồn : {init_spec}", flush=True)
+        print(f"  cục bộ: {init_src}", flush=True)
+        print(f"  đã học: epoch {init_meta.get('epoch')}/"
+              f"{init_meta.get('n_epochs')} · {init_meta.get('global_step')} "
+              f"bước · {init_meta.get('seen_samples')} lượt mẫu · val f1_pos "
+              f"{v.get('cls_f1_pos')} · asl {v.get('asl')}", flush=True)
+        manifest["resume_source"] = {
+            "spec": init_spec, "dir": str(init_src),
+            "epoch": init_meta.get("epoch"),
+            "run_id": init_meta.get("run_id"),
+            "val": v,
+        }
+
+        risky, benign = _drift(init_meta, cfg, p)
+        if benign:
+            print("\n  cấu hình ĐỔI so với checkpoint (lành — đây là chỗ "
+                  "`--resume` tồn tại):", flush=True)
+            for k, o, n in benign:
+                print(f"    · {k:<24} {o}  →  {n}", flush=True)
+        else:
+            print("\n  cấu hình: không đổi khoá nào so với checkpoint.",
+                  flush=True)
+        if risky:
+            print("\n  ⚠ ĐỔI ĐIỀU KIỆN ĐẦU VÀO của nhánh:", flush=True)
+            for k, o, n in risky:
+                print(f"    · {k:<24} {o}  →  {n}", flush=True)
+            if not a.allow_base_drift:
+                print(
+                    "\n✗ DỪNG — bốn khoá này quyết định phân phối đặc trưng "
+                    "SigLIP mà nhánh\n"
+                    "    đọc, và đổi chúng KHÔNG đổi một shape nào: "
+                    "`assert_compatible` cho qua,\n"
+                    "    nạp trơn tru, rồi nhánh học tiếp trên một phân phối "
+                    "khác phân phối nó\n"
+                    "    đã học. Val sẽ tụt ở epoch đầu rồi bò lên lại — giống "
+                    "hệt một lần chạy\n"
+                    "    bình thường, nên không có gì trong log nói tại sao "
+                    "checkpoint cuối tệ.\n"
+                    "    Hai cách đúng:\n"
+                    "      * trả bốn khoá ấy về đúng giá trị của checkpoint "
+                    "(bảng trên), rồi đổi\n"
+                    "        những khoá còn lại tuỳ ý;\n"
+                    "      * hoặc pretrain LẠI từ đầu với điều kiện mới — bỏ "
+                    "--resume.\n"
+                    "    Biết mình đang làm gì (vd đổi `base_method` "
+                    "qlora->lora, cùng base):\n"
+                    "      --allow-base-drift", flush=True)
+                return 2
+            print("  ⚠ --allow-base-drift: chạy tiếp. Điều này phải vào phần "
+                  "Giới hạn nếu checkpoint này ra bảng.", flush=True)
+
+        sch = dict(p.get("schedule", {}) or {})
+        print(f"\n  ⚠ CHỈ TRỌNG SỐ được nối tiếp "
+              f"({', '.join(pretrain_io.PRETRAINED_MODULES)}). "
+              f"`trainer_state.pt`\n"
+              f"    (optimizer, scheduler, RNG, cursor) KHÔNG có trên Hub — "
+              f"push_pretrain chặn\n"
+              f"    cứng nó. Lần chạy này dựng một chu kỳ one-cycle MỚI: "
+              f"{int(p.get('n_epochs', 8))} epoch,\n"
+              f"    max_lr {sch.get('max_lr')}, lr bắt đầu lại từ đầu chu kỳ. "
+              f"Đây là WARM RESTART,\n"
+              f"    không phải một lần chạy liền mạch "
+              f"{init_meta.get('epoch')}+{int(p.get('n_epochs', 8))} epoch.",
               flush=True)
 
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
@@ -294,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
             stats = pretrain_sup.run(
                 cfg, train_df, val_df, cls_train, cls_val, run_dir,
                 tracker=tracker, resume=not a.no_resume,
+                init_from=init_src, init_spec=init_spec,
                 allow_schedule_change=bool(a.extend_schedule),
                 max_steps_override=(4 * int(p.get("n_epochs", 2))
                                     if a.dry_run else None))
@@ -364,6 +623,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {stats['epochs_run']} epoch · {stats['seen_samples']:,} lượt "
               f"mẫu · best {b.get('metric')} = {b.get('value')} @ epoch "
               f"{b.get('epoch')}", flush=True)
+        r = stats.get("resumed_from") or {}
+        if r:
+            print(f"  nối tiếp {r.get('spec')} (epoch {r.get('epoch')}, val "
+                  f"f1_pos {r.get('val_f1_pos')}) trên một chu kỳ MỚI — "
+                  f"`epoch` ở trên đếm từ 1 của lần chạy này.", flush=True)
         print(f"  checkpoint tái sử dụng: {stats.get('best_dir')}", flush=True)
     if url:
         print(f"  Hub: {url}", flush=True)

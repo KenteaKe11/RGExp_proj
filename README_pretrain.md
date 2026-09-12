@@ -197,6 +197,66 @@ bash scripts/run_pretrain.sh --stages push            # đẩy ckpt/best
 bash scripts/run_pretrain.sh --stages push --push-epoch 7
 ```
 
+### 1.6. `--resume` — lấy ckpt mới nhất trên Hub rồi train tiếp
+
+```bash
+bash scripts/run_pretrain.sh --resume                          # ckpt mới nhất
+bash scripts/run_pretrain.sh --resume -o pretrain.n_epochs=6 \
+                                      -o pretrain.schedule.max_lr=5e-5
+bash scripts/run_pretrain.sh --resume hub:OWNER/NAME/best@a1b2c3d
+bash scripts/run_pretrain.sh --resume runs/sup_pretrain/ckpt/best
+```
+
+**`--resume` và `--no-resume` không phải hai chiều của một khoá.** Chúng nói về
+hai **nguồn** khác nhau:
+
+| | nguồn | có gì | nối tiếp kiểu gì |
+|---|---|---|---|
+| mặc định · `--no-resume` | đĩa: `runs/<subdir>/ckpt/last.json` | trọng số + optimizer + scheduler + RNG + cursor | **chính xác** — bước N đọc trên đúng đường cong đã ghi nó |
+| `--resume` | Hub: `pretrain.hub_repo` | **chỉ trọng số** | **warm restart** — chu kỳ one-cycle mới, epoch đếm lại từ 1 |
+
+Lý do cột giữa: `push_pretrain` chặn cứng `trainer_state.pt` (nặng gấp ~3 lần
+phần trọng số, vô nghĩa với người tái sử dụng), nên trên Hub **không có**
+optimizer/scheduler/RNG để mà nối tiếp. Thứ duy nhất làm được là nạp trọng số
+rồi dựng một lịch mới từ config hiện tại — tức là đúng cái ta muốn: *train tiếp
+với cấu hình vừa đổi*.
+
+Hệ quả: `--resume` **không** đụng hàng rào `--extend-schedule` ở §1.4, vì không
+có bước cũ nào bị đọc trên đường cong mới — `global_step` bắt đầu từ 0.
+
+**"Mới nhất" đọc từ META, không từ tên thư mục và không từ commit gần nhất.**
+Lệnh liệt kê mọi thư mục trong repo có đủ `sup_pretrain.safetensors` +
+`sup_pretrain.json`, đọc `epoch` của từng cái (mỗi META vài KB) và in ra cả
+bảng, đánh dấu cái được chọn. `best/` là một *tên*: với `select_metric:
+cls_f1_pos` nó giữ epoch có val tốt nhất, thường không phải epoch cuối. Và
+commit gần nhất là thời điểm **đẩy** — chạy lại `--stages push` cho một ckpt cũ
+là một commit mới mang một epoch cũ.
+
+**Ghi vào một run dir MỚI**, `<subdir>_r2`, `_r3`, … chứ không ghi đè
+`runs/<subdir>/`. Hai lý do cơ học: `history.csv` của một thư mục phải là **một**
+đường cong đọc được; và `ckpt/best` cũ chính là thứ `--resume` vừa lấy làm
+nguồn — ghi đè nó bằng epoch 1 của lần chạy mới là phá chính cái mốc đang so.
+Nếu `_rN` cao nhất còn một lần chạy dở (`trainer_state.pt` nối tiếp được) thì
+lệnh **dùng lại** thư mục ấy và nối tiếp cục bộ, thay vì tải lại trọng số cũ từ
+Hub và vứt mấy epoch vừa chạy. `--run-id` ghi đè mọi thứ.
+
+**Bốn khoá không được đổi lặng lẽ.** `base.hf_id`, `pretrain.base_method`,
+`data.image_max_side`, `do_pan_and_scan` quyết định **phân phối đặc trưng**
+SigLIP mà nhánh đọc. Đổi một trong chúng không đổi một shape nào, nên
+`assert_compatible` cho qua, nhánh nạp trơn tru, rồi học tiếp trên một phân phối
+khác phân phối nó đã học — val tụt ở epoch đầu rồi bò lên lại, giống hệt một
+lần chạy bình thường. Ở đây chúng là điều kiện **DỪNG** (mã thoát 2), mở bằng
+`--allow-base-drift`. Mọi khoá còn lại (`n_epochs`, `max_lr`,
+`per_device_batch_size`, `grad_accum`, `n_train`, `select_metric`, …) được in ra
+thành một bảng "cũ → mới" rồi chạy tiếp: đổi chúng chính là lý do khoá này tồn
+tại.
+
+**Nguồn gốc đi vào META của mọi epoch** (`resumed_from`) và vào model card, dưới
+một mục nói thẳng rằng đây là warm restart và tổng số epoch trọng số đã đi qua
+là `<epoch nguồn> + <n_epochs lần này>`, **trên hai đường cong khác nhau**.
+Không có nó thì một ckpt warm restart và một ckpt chạy liền mạch là hai file
+không phân biệt được, trong khi `epoch: 5` của chúng nghĩa khác nhau.
+
 ---
 
 ## 2. `decoder_ft` — finetune decoder CÙNG LÚC với nhánh

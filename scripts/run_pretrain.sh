@@ -32,6 +32,22 @@
 # tại cursor. Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP đúng chỗ, không
 # phải chạy lại từ epoch 0. `--no-resume` để cố ý bắt đầu lại.
 #
+# ── `--resume` — nguồn là HUB, không phải đĩa ───────────────────────────────
+#     bash scripts/run_pretrain.sh --resume
+#     bash scripts/run_pretrain.sh --resume -o pretrain.n_epochs=6 \
+#                                           -o pretrain.schedule.max_lr=5e-5
+#
+# Lấy ckpt có `epoch` LỚN NHẤT trên `pretrain.hub_repo` rồi huấn luyện tiếp nó
+# với config hiện tại, trong một run dir MỚI (`sup_pretrain_r2`, `_r3`, …).
+#
+# KHÔNG phải chiều ngược của `--no-resume`. Trên Hub chỉ có TRỌNG SỐ:
+# `push_pretrain` chặn cứng `trainer_state.pt`, nên không có optimizer/
+# scheduler/RNG để nối tiếp. Lịch one-cycle được dựng LẠI từ config, epoch đếm
+# lại từ 1 — một warm restart, và META + model card của ckpt mới khai đúng như
+# vậy. Đổi `base.hf_id` / `base_method` / `image_max_side` / pan&scan thì DỪNG
+# (mã 2), vì nhánh sẽ học tiếp trên một phân phối đặc trưng khác; mở bằng
+# `--allow-base-drift` nếu đó đúng là ý định.
+#
 # ── Sau khi xong ────────────────────────────────────────────────────────────
 #     bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
 #          --init-from runs/sup_pretrain/ckpt/best

@@ -396,14 +396,46 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         cls_train: dict, cls_val: dict | None, run_dir: Path,
         tracker=None, resume: bool = True,
         max_steps_override: int | None = None,
-        allow_schedule_change: bool = False) -> dict:
-    """Chạy (hoặc chạy tiếp) pretrain. Trả thống kê tổng kết."""
+        allow_schedule_change: bool = False,
+        init_from: Path | str | None = None,
+        init_spec: str | None = None) -> dict:
+    """Chạy (hoặc chạy tiếp) pretrain. Trả thống kê tổng kết.
+
+    Hai kiểu "chạy tiếp", và chúng KHÔNG giống nhau:
+
+      * `resume=True` + `ckpt/last.json` trong CHÍNH `run_dir` — nối tiếp CHÍNH
+        XÁC: trọng số, optimizer, scheduler, trạng thái Generator, cursor trong
+        hoán vị. Bước thứ N đọc trên đúng đường cong one-cycle đã ghi nó, nên
+        đổi `n_epochs` là DỪNG (xem phép kiểm `steps_total` bên dưới).
+
+      * `init_from=<thư mục ckpt>` — WARM RESTART: chỉ nạp TRỌNG SỐ của
+        `PRETRAINED_MODULES`, rồi dựng optimizer và một chu kỳ one-cycle MỚI từ
+        config hiện tại, đếm epoch lại từ 1. Đây là thứ duy nhất làm được với
+        một checkpoint lấy từ Hub, vì `trainer_state.pt` không bao giờ được đẩy
+        lên đó (`push_pretrain` chặn cứng nó).
+
+    Khi có CẢ HAI, trạng thái cục bộ THẮNG. Lý do là chiều hỏng không đối xứng:
+    ưu tiên warm restart sẽ vứt optimizer/cursor của một lần chạy đang dở và
+    bắt đầu lại từ epoch 1 — trong log thì mọi con số vẫn hợp lệ, chỉ là vài
+    tiếng GPU biến mất. Ưu tiên trạng thái cục bộ thì cùng lắm là một lần tải
+    META thừa, và nó được nói ra bằng một dòng log.
+    """
     import torch
 
     t0 = time.time()
     pcfg = dict(cfg.get("pretrain", {}) or {})
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Đọc TRƯỚC mọi thứ tốn kém: nó quyết định `init_from` có được dùng không,
+    # và quyết định ấy phải xong trước khi nạp base.
+    last = read_last(run_dir) if resume else None
+    if last and init_from is not None:
+        print(f"  ⚙ {run_dir.name} đã có trainer_state (epoch {last['epoch']}) "
+              f"— NỐI TIẾP CỤC BỘ, bỏ qua {init_spec or init_from}.\n"
+              f"    Trạng thái cục bộ mang theo optimizer/scheduler/RNG/cursor; "
+              f"trọng số lấy từ Hub thì không. Muốn bắt đầu lại từ Hub thật sự: "
+              f"chạy với --run-id <tên khác>.", flush=True)
+        init_from = None
     seed = int(pcfg.get("seed") or cfg.get("seed", 42))
     seed_everything(seed)
     if torch.cuda.is_available():
@@ -455,6 +487,16 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
           f"KHÔNG pretrain: {', '.join(pretrain_io.UNTRAINED_MODULES)} "
           f"(không nhận gradient khi decoder không chạy)", flush=True)
 
+    # ── warm restart: nạp trọng số từ một ckpt KHÁC (`--resume`) ───────────
+    # Trước `build_optimizer`, và trước khi `branch` được đưa vào bất cứ đâu:
+    # `load_into_branch` đối chiếu tập khoá theo cả hai chiều rồi mới nạp, nên
+    # một checkpoint thuộc kiến trúc khác dừng ở ĐÂY — trước khi tốn một giây
+    # GPU nào — thay vì nạp một nửa và để phần còn lại là số ngẫu nhiên.
+    init_report = None
+    if init_from is not None:
+        init_report = pretrain_io.load_into_branch(branch, Path(init_from))
+        init_report["spec"] = str(init_spec or init_from)
+
     # ── dữ liệu ────────────────────────────────────────────────────────────
     ds = VisionOnlyDataset(train_df, processor, cfg, cls_train["y"],
                            cls_train["mask"], img_kw)
@@ -490,7 +532,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     global_step = 0
     seen = 0
     best = {"metric": None, "epoch": None, "value": None}
-    last = read_last(run_dir) if resume else None
     if last:
         st = torch.load(Path(last["dir"]) / pretrain_io.TRAINER_STATE,
                         map_location="cpu", weights_only=False)
@@ -545,10 +586,35 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             print(f"  ⚙ đã đủ {n_epochs} epoch — không có gì để chạy "
                   f"(tăng pretrain.n_epochs, hoặc xoá {_ckpt_root(run_dir)})",
                   flush=True)
+    elif init_report is not None:
+        sch = dict(pcfg.get("schedule", {}) or {})
+        print(f"  ↻ WARM RESTART từ {init_report['spec']} (epoch "
+              f"{init_report.get('pretrain_epoch')} của run "
+              f"{init_report.get('pretrain_run_id')})", flush=True)
+        print(f"    lịch MỚI: epoch 1..{n_epochs} · {steps} bước · max_lr "
+              f"{sch.get('max_lr')} · lr bắt đầu lại từ đầu chu kỳ one-cycle.\n"
+              f"    Optimizer/scheduler/RNG KHÔNG nối tiếp (không có trên Hub) "
+              f"— `epoch` dưới đây đếm từ 1 của lần chạy NÀY, không cộng dồn.",
+              flush=True)
 
+    # Nguồn gốc đi vào META của MỌI epoch, nên nó còn đó sau khi log của lần
+    # chạy đã trôi mất và sau khi thư mục được `--init-from` sang một mục khác.
+    # Không có nó thì một ckpt warm restart và một ckpt chạy liền mạch là hai
+    # file không phân biệt được, trong khi `epoch: 5` của chúng nghĩa khác nhau.
+    resumed_from = None if not init_report else {
+        "spec": init_report.get("spec"),
+        "dir": str(init_from),
+        "epoch": init_report.get("pretrain_epoch"),
+        "run_id": init_report.get("pretrain_run_id"),
+        "val_f1_pos": (init_report.get("pretrain_val") or {}).get("cls_f1_pos"),
+        "val_asl": (init_report.get("pretrain_val") or {}).get("asl"),
+        "n_params_loaded": init_report.get("n_params_loaded"),
+        "schedule_continued": False,
+    }
     meta_base = {
         "run_id": run_dir.name,
         "seed": seed,
+        "resumed_from": resumed_from,
         "n_epochs": n_epochs,
         "steps_total": steps,
         "batch_size": bs, "grad_accum": accum, "effective_batch": bs * accum,
@@ -726,6 +792,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     best_dir = _ckpt_root(run_dir) / "best"
     stats = {
         "mode": "sup_pretrain",
+        "resumed_from": resumed_from,
         "n_train": int(len(train_df)), "n_val": int(len(val_df)),
         "n_labels": n_labels,
         "epochs_run": len(epoch_rows),
