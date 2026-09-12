@@ -680,13 +680,13 @@ pretrain:
   # trên lịch khác là DỪNG, trừ khi gõ --extend-schedule.
   schedule:
     impl: lambda
-    max_lr: 1e-4
+    max_lr: 7e-5
     pct_start: 0.1
     div_factor: 25.0
     final_div_factor: 100.0
     anneal: cos
     cycle_momentum: false
-  weight_decay: 0.1
+  weight_decay: 0.01
 
   # Phải GIỐNG lora.preset của §2.3: nhánh đọc last_hidden_state của chính
   # vision tower này, và cách lượng tử hoá base đổi thì phân phối đặc trưng mà
