@@ -65,15 +65,12 @@ Ngược lại, chiều còn lại thì DÙNG CHUNG và phải dùng chung: cùn
 — hai file cấu hình là cách chắc chắn nhất để pretrain xong mới biết nó không
 nạp được.
 
-── Tập pretrain nằm ở manifest RIÊNG ───────────────────────────────────────
-`pretrain.n_train: 0` = TOÀN BỘ `data.train_split_csv`, còn §2.3 dùng 6400
-(`data.n_train`). Hai con số, hai file: `data/pretrainset.jsonl` và
-`data/trainset.jsonl`. Dùng chung một file nghĩa là chạy pretrain xong thì tập
-huấn luyện của §2.3 lặng lẽ thành toàn bộ split, và bảng A/B không so được với
-lần chạy trước — không có dòng log nào nói vậy.
+── MỘT TẬP TRAIN THỐNG NHẤT ───────────────────────────────────────────────
+`pretrain.n_train` phải bằng đúng `data.n_train` (= 6400). Mọi stage dùng
+chung `data/trainset.jsonl`; không có manifest train riêng cho Stage 0.
 
-Hàng rào rò rỉ với 3000 ảnh test thì KHÔNG dùng chung mà chạy lại: tập pretrain
-là một tập khác, nên phép kiểm của §2.3 không nói gì về nó.
+Hàng rào rò rỉ với 3000 ảnh test áp dụng trực tiếp cho cùng tập 6400 mẫu train
+được dùng bởi tất cả các stage.
 """
 from __future__ import annotations
 
@@ -91,8 +88,8 @@ from .tracking import Tracker
 
 STAGES = ["data", "train", "push"]
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
-TRAIN_MANIFEST = "pretrainset"
-VAL_MANIFEST = "pretrainval"
+TRAIN_MANIFEST = "trainset"
+VAL_MANIFEST = "valset"
 
 
 def _hr(t: str) -> None:
@@ -351,10 +348,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ) )",
           flush=True)
     print(f"⚙ run dir: {run_dir}", flush=True)
-    n_pre = int(p.get("n_train", 0) or 0)
-    print(f"⚙ tập pretrain: {'TOÀN BỘ ' + str(cfg['data']['train_split_csv']) if not n_pre else str(n_pre) + ' mẫu'}"
+    n_data = int(cfg["data"].get("n_train", 6400) or 6400)
+    n_pre_cfg = int(p.get("n_train", n_data) or n_data)
+    if n_pre_cfg != n_data:
+        raise ValueError(
+            f"Tập train không thống nhất: data.n_train={n_data}, "
+            f"pretrain.n_train={n_pre_cfg}. Mọi stage phải dùng đúng 6400 mẫu."
+        )
+    n_pre = n_data
+    print(f"⚙ tập train: {n_pre} mẫu (CHUNG cho mọi stage)"
           f" · {int(p.get('n_epochs', 8))} epoch · manifest "
-          f"data/{TRAIN_MANIFEST}.jsonl (tách khỏi trainset.jsonl của §2.3)",
+          f"data/{TRAIN_MANIFEST}.jsonl (dùng CHUNG với trainset.jsonl của các stage khác)",
           flush=True)
 
     try:

@@ -78,9 +78,7 @@ D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
     "siglip_dim": D_VIS, "swiglu_hidden": 32, "out_dim": None,
     "n_query": 4, "n_vis": 12, "n_heads": 2, "dropout": 0.0,
-    "swiglu_dropout": 0.0, "pre_norm": True,
-    "gate": {"beta": 2.0 / 3.0, "stretch_lo": -0.1, "stretch_hi": 1.1},
-    "gate_init_logit": -2.5,
+    "swiglu_dropout": 0.0, "pre_norm": True, "gate_init_logit": -2.5,
     "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"], "d_model": 12,
                 "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0},
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,
@@ -635,12 +633,16 @@ def config_tests() -> None:
         true("no_grad" in src, "lượt vision phải chạy trong no_grad")
     check("pretrain_sup không chạm decoder / adapter", t_no_decoder_import)
 
-    def t_manifest_separate():
+    def t_manifest_shared():
         src = (ROOT / "src" / "run_pretrain.py").read_text(encoding="utf-8")
-        true('TRAIN_MANIFEST = "pretrainset"' in src,
-             "tập pretrain phải nằm ở manifest RIÊNG — dùng chung trainset.jsonl "
-             "nghĩa là §2.3 lặng lẽ đổi tập huấn luyện")
-    check("tập pretrain có manifest riêng", t_manifest_separate)
+        cfg = (ROOT / "configs" / "section25.yaml").read_text(encoding="utf-8")
+        true('TRAIN_MANIFEST = "trainset"' in src,
+             "Stage 0 phải dùng chung manifest trainset.jsonl")
+        true('n_train: 6400' in cfg,
+             "section25 phải chốt data.n_train = 6400")
+        true('pretrain:\n  n_train: 6400' in cfg,
+             "Stage 0 phải chốt pretrain.n_train = 6400")
+    check("một tập train 6400 dùng chung", t_manifest_shared)
 
 
 def main() -> int:

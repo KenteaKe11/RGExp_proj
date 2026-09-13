@@ -224,8 +224,8 @@ train:
   # Nếu phải hạ `per_device_batch_size`, NHÂN `grad_accum` lên đúng bấy nhiêu
   # lần để tích không đổi — nếu không thì số bước và lịch học đổi theo, và bảng
   # kết quả không so được với lần chạy trước.
-  per_device_batch_size: 1
-  grad_accum: 32                  # tích = 32 mẫu mỗi bước tối ưu hoá
+  per_device_batch_size: 2
+  grad_accum: 16                  # tích = 32 mẫu mỗi bước tối ưu hoá
 
   max_seq_len: 1024              # KHÔNG tính 32 token chèn thêm: chúng được
                                  # chèn SAU khi mẫu đã bị cắt, nên candidate B
@@ -744,7 +744,7 @@ pretrain:
   # 0 = TOÀN BỘ data.train_split_csv. Pretrain thấy nhiều dữ liệu hơn §2.3 là
   # CÓ CHỦ Ý — và vì thế phải vào phần Giới hạn. Đặt một số cụ thể (vd 6400) để
   # tách hai tập, và khi đó câu trả lời của §2.3 đổi nghĩa theo.
-  n_train: 0
+  n_train: 6400
   n_epochs: 1
 
   # eff_bs = 8 × 4 = 32, BẰNG train.per_device_batch_size × train.grad_accum.

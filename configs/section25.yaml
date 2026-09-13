@@ -491,7 +491,7 @@ stats:
 # lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 0               # 0 = toàn bộ train split đã khai ở `data`
+  n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
   cycle_per_epoch: 1
   per_device_batch_size: 16
