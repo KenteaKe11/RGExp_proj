@@ -1,0 +1,535 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · My Gemma
+# ═══════════════════════════════════════════════════════════════════════════
+# Đây là FILE CẤU HÌNH CHỦ ĐẠO của repo. Mọi điểm vào không truyền `--config`
+# đều đọc file này (`src/config.py::DEFAULT_CONFIG`).
+#
+# Câu hỏi của mục này, viết đủ một câu:
+#
+#     Trên CÙNG 6400 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
+#     công thức Gemma 3 + Recombinator + QFormer + ClsHead + Experts K=6·E=10
+#     có hơn hai kiến trúc sinh báo cáo đã công bố (R2Gen, AdaAtt) không, và
+#     hơn BAO NHIÊU?
+#
+# Ba candidate, nên ba cặp. k = 3 nhưng KHÔNG Friedman: thiết kế của mục này
+# (xem README_2.5.md mục 3) đòi hai kiểm định GHÉP CẶP — permutation và
+# bootstrap BCa — trên từng cặp, rồi Holm trên ba p-value. Friedman trả lời
+# "có ít nhất một cột khác" — ở k = 3 với ba cặp đều được quan tâm như nhau,
+# câu ấy không thêm thông tin mà lại làm mất sức kiểm định.
+#
+# ── NĂM ĐIỀU KIỆN ĐƯỢC THỐNG NHẤT (không candidate nào được miễn) ──────────
+#  1. SOTA đối chứng chỉ nạp lại trọng số ở ĐÚNG trạng thái setup của paper
+#     gốc — khối `sota:` dưới đây là bản chép nguyên văn, không hiệu chỉnh.
+#  2. Cùng 6400 mẫu train / 3000 ảnh test của tập này (`data:`).
+#  3. Kiểm định bằng Paired Bootstrap + Permutation Test (`stats:`).
+#  4. MỘT phương pháp resize duy nhất cho mọi model — kể cả khi kích thước
+#     đầu vào VÔ TÌNH khớp (`image_policy:`).
+#  5. Có ÍT NHẤT một kiến trúc mang stage pretrain/finetune cục bộ (R2Gen
+#     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
+#     một config pretrain (`pretrain:`), rồi vào main-stage với lr của phần
+#     đã pretrain bằng 1/5 lr chính thức (`train.pretrained_lr_mult: 0.2`).
+#
+# Điều kiện 5 là lý do `pretrained_lr_mult` ở đây là 0.2 chứ không phải 0.1
+# như `_archive/configs/recombiner.yaml`. 0.1 là con số của §2.3/§2.4 và
+# những bảng ấy đã chốt; đổi nó ở đây không đụng tới chúng, và 1/5 là con số
+# mục 2.5 công bố.
+# ═══════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+experiment: "2.5"
+
+# `scratch` | `decoder_ft`. Main-stage của §2.5 LUÔN là `decoder_ft` với
+# My Gemma vì điều kiện 5 bắt nhánh phải đi qua Stage 0 trước. `scratch` giữ
+# lại để chạy đối chứng "không pretrain" khi cần NÓI RA trong phần Giới hạn.
+mode: decoder_ft
+
+# ── Dữ liệu — điều kiện 2 ──────────────────────────────────────────────────
+# Khoá cứng. Ba candidate đọc CÙNG hai file split; `assert_no_leak` là hàng
+# rào cơ học chứ không phải một lời hứa trong README.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  assert_no_leak: true
+
+# ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
+# R2Gen (ResNet-101) và AdaAtt (ResNet-152) đều quen 224; Gemma 3 xử lý ở 896.
+# Ba con số khác nhau, và đó KHÔNG phải lý do để mỗi model tự resize theo cách
+# của nó: nếu R2Gen dùng RandomCrop còn Gemma dùng bilinear-longest-side thì
+# một phần chênh lệch trong bảng là chênh lệch của hai bộ tiền xử lý, không
+# phải của hai kiến trúc.
+#
+# Nên: MỘT lần resize dùng chung, ở `resize_to`, trước khi bất kỳ processor
+# riêng nào chạm vào ảnh. `allow_native_match: false` nghĩa là ngay cả khi một
+# model đòi đúng `resize_to` thì ảnh vẫn đi qua đường chung ấy — "vô tình
+# khớp" không được phép biến thành một đường tiền xử lý thứ hai.
+image_policy:
+  unified: true
+  resize_to: 512              # cạnh dài; khớp `data.image_max_side`
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  # Sau bước chung, mỗi model chỉ còn được phép chuẩn hoá giá trị pixel theo
+  # thống kê của backbone nó (ImageNet mean/std cho ResNet, SigLIP cho Gemma).
+  # Đó là phép biến đổi trên GIÁ TRỊ, không phải trên HÌNH HỌC.
+  per_model_normalize_only: true
+
+labels:
+  npz: csv_helper/labels.npz
+  key_array: null
+  label_array: null
+  names_array: null
+  encoding:
+    neg: [0]
+    pos: [1]
+    uncertain: [-1, 2]
+    nan_to: uncertain
+  max_missing_frac: 0.20
+
+# ── BA CANDIDATE ───────────────────────────────────────────────────────────
+# `arms_s25` chứ không phải `arms`: `arms` là khoá của §2.3 và nó đã sang
+# `_archive/configs/recombiner.yaml`. Trùng tên nghĩa là một lần nạp nhầm file
+# vẫn in ra một bảng trông bình thường với những cột sai.
+arms_s25:
+  - id: r2gen
+    name: "A · R2Gen (ResNet-101 + Relational Memory)"
+    kind: sota
+    runner: r2gen
+    setup: r2gen
+    pretrain_stage0: true
+    enabled: true
+
+  - id: adaatt
+    name: "B · AdaAtt (ResNet-152 + Visual Sentinel)"
+    kind: sota
+    runner: adaatt
+    setup: adaatt
+    pretrain_stage0: true
+    enabled: true
+
+  # Candidate nặng nhất và dễ hỏng nhất chạy TRƯỚC — quy ước 1 của repo.
+  # `order: 0` là chỗ nói ra điều đó; thứ tự không được phép ảnh hưởng kết
+  # quả (seed và thứ tự dữ liệu đặt lại trước MỖI candidate).
+  - id: my_gemma
+    name: "C · My Gemma · Recombinator · QFormer · Cls · K=6·E=10 · QLoRA r4"
+    kind: ours
+    runner: gemma3_recomb
+    recomb: true
+    top_k: 6
+    n_experts: 10
+    pretrain_stage0: true
+    order: 0
+    enabled: true
+
+# ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
+# KHÔNG hiệu chỉnh một con số nào ở đây. Chỗ duy nhất §2.5 được phép áp đặt là
+# `image_policy` (điều kiện 4) và `pretrain` (điều kiện 5) — hai chỗ ấy được
+# công bố trong README_2.5.md mục 4, và `src/run_section25.py` ghi chúng vào
+# `manifest.deviations` để báo cáo không thể im lặng về chúng.
+sota:
+  r2gen:
+    name: R2Gen
+    variant: R2Gen-origin
+    task: radiology_report_generation
+    visual_encoder:
+      type: ResNet-101
+      pretrained: true
+      pretrained_source: ImageNet
+      output_dim: 2048
+      trainable: true
+      fine_tune: true
+    visual_features:
+      input_dim: 2048
+      model_dim: 512
+    transformer:
+      d_model: 512
+      d_ff: 512
+      num_heads: 8
+      num_layers: 3
+      dropout: 0.1
+    relational_memory:
+      num_slots: 3
+      num_heads: 8
+      d_model: 512
+    decoder:
+      logit_layers: 1
+      drop_prob_lm: 0.5
+      use_bn: false
+    tokenizer:
+      max_seq_length: 60
+      min_word_frequency: 3
+      special_tokens: ["<bos>", "<eos>", "<pad>"]
+    initialization:
+      visual_encoder: ImageNet_pretrained_ResNet101
+      projection: random
+      transformer: random
+      relational_memory: random
+      decoder: random
+      word_embeddings: random
+      output_projection: random
+    fine_tuning:
+      strategy: end_to_end
+      freeze_visual_encoder: false
+      parameter_groups:
+        visual_encoder: {trainable: true, learning_rate: 0.00005}
+        all_remaining_parameters: {trainable: true, learning_rate: 0.0001}
+      optimizer: {type: Adam, amsgrad: true, weight_decay: 0.00005}
+      scheduler: {type: StepLR, step_size: 50, gamma: 0.1}
+      epochs: 100
+      batch_size: 16
+      early_stopping: {enabled: true, patience: 50, monitor: BLEU_4, mode: max}
+    decoding:
+      method: beam_search
+      beam_size: 3
+      temperature: 1.0
+      sample_n: 1
+      group_size: 1
+      output_logsoftmax: true
+      decoding_constraint: false
+      block_trigrams: true
+    reproducibility:
+      seed: 9233
+      cudnn_deterministic: true
+      cudnn_benchmark: false
+
+  adaatt:
+    name: AdaAtt
+    variant: Adaptive-Attention-Visual-Sentinel-origin
+    task: image_captioning
+    visual_encoder:
+      type: ResNet-152
+      pretrained: true
+      pretrained_source: ImageNet
+      feature_type: spatial_grid_features
+      trainable: true
+      fine_tune: true
+    visual_features:
+      spatial_regions: ResNet convolutional feature map
+      global_feature: true
+      feature_projection: true
+    decoder:
+      type: LSTM
+      num_layers: 1
+      hidden_size: 512
+    adaptive_attention:
+      type: visual_sentinel
+      spatial_attention: true
+      sentinel: true
+      adaptive_fusion: true
+    word_embedding: {trainable: true, initialization: random}
+    output_projection: {trainable: true, initialization: random}
+    initialization:
+      visual_encoder: ImageNet_pretrained_ResNet152
+      word_embedding: random
+      lstm: random
+      attention: random
+      visual_sentinel: random
+      output_projection: random
+    fine_tuning:
+      strategy: staged_end_to_end
+      stage_1:
+        description: train language model without CNN fine-tuning
+        visual_encoder_trainable: false
+        decoder_trainable: true
+        attention_trainable: true
+        embedding_trainable: true
+        output_projection_trainable: true
+        learning_rate_language_model: 0.0005
+      stage_2:
+        description: fine-tune CNN jointly with caption model
+        visual_encoder_trainable: true
+        decoder_trainable: true
+        attention_trainable: true
+        embedding_trainable: true
+        output_projection_trainable: true
+        learning_rate_cnn: 0.00001
+        learning_rate_language_model: 0.0005
+        start_after_epoch: 20
+        additional_epochs: "15-20"
+      optimizer:
+        type: Adam
+        learning_rate_language_model: 0.0005
+        learning_rate_cnn: 0.00001
+        beta1: 0.8
+        beta2: 0.999
+      training:
+        batch_size: 80
+        max_epochs: 50
+        early_stopping: {enabled: true, monitor: CIDEr, patience: 6}
+    decoding: {method: beam_search, beam_size: 3}
+    reproducibility:
+      framework: Torch/Lua
+      official_implementation: jiasenlu/AdaptiveAttention
+
+# ══════════════════════════════════════════════════════════════════════════
+# CANDIDATE C — MY GEMMA
+# ══════════════════════════════════════════════════════════════════════════
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_recomb
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 2
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  repetition_penalty: 1.0
+
+# §2.2 đã chốt: QLoRA r4. Giữ nguyên preset đó, không mở lại câu hỏi ấy ở đây.
+lora:
+  preset: qlora_r4
+  presets:
+    qlora_r4:  {method: qlora, rank: 4}
+    qlora_r8:  {method: qlora, rank: 8}
+    qlora_r16: {method: qlora, rank: 16}
+    qlora_r32: {method: qlora, rank: 32}
+    qdora_r4:  {method: qdora, rank: 4}
+    qdora_r8:  {method: qdora, rank: 8}
+    qdora_r16: {method: qdora, rank: 16}
+    qdora_r32: {method: qdora, rank: 32}
+
+train:
+  n_epochs: 1
+  per_device_batch_size: 1
+  grad_accum: 32
+  max_seq_len: 1024
+  gradient_checkpointing: true
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  logging_steps: 10
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+  branch_weight_decay: 0.01
+  gate_lr_mult: 250.0
+
+  # ĐIỀU KIỆN 5. 1/5 lr chính thức cho MỌI khối đã đi qua Stage 0 — nhánh của
+  # My Gemma ở đây, visual encoder của R2Gen/AdaAtt ở `src/runners/`.
+  # §2.3/§2.4 dùng 0.1; con số ấy thuộc về những bảng đã chốt trong _archive/.
+  pretrained_lr_mult: 0.2
+  freeze_pretrained: false
+
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+recombiner:
+  siglip_dim: 1152
+  swiglu_hidden: 2560
+  out_dim: null
+  n_query: 32
+  n_heads: 8
+  dropout: 0.0
+  swiglu_dropout: 0.0
+  pre_norm: true
+  qformer:
+    tasks: [sup, aux]
+    freeze: [aux]
+    d_model: 1024
+    n_layers: 1
+    n_heads: 8
+    ffn_mult: 2
+    dropout: 0.0
+  # Điều kiện của mục: E = 10 (§2.4 đã chốt), K = 6 nằm ở `arms_s25`.
+  n_experts: 10
+  token_type: text
+  dtype: null
+
+  # ── Cổng trước concat: Sigmoid Gate + Hard Discrete (L0) ────────────────
+  # `beta`, `stretch_lo/hi` là ba tham số của hard-concrete: sigmoid ra một
+  # xác suất liên tục, phép kéo giãn [-0.1, 1.1] rồi kẹp về [0, 1] cho phép
+  # cổng đóng HẲN (đúng 0) và mở HẲN (đúng 1) — thứ một sigmoid trơn không
+  # bao giờ làm được. Phạt L0 ở `classifier.l0_lambda`.
+  #
+  # Bất biến: quãng đường của cổng >= |gate_init_logit|.
+  gate:
+    beta: 0.6666666666666666
+    stretch_lo: -0.1
+    stretch_hi: 1.1
+  gate_init_logit: -2.5
+
+classifier:
+  enabled: true
+  feed_logits_to_decoder: false
+  n_labels: null
+  n_classes: 3
+  hidden: 1024
+  dropout: 0.1
+  # Lệch nhãn neg/pos/uncertain nên KHÔNG dùng CE thường. ASL, lực nén grad
+  # phía neg = 2.0, pos/uncertain = 0.0.
+  asl:
+    gamma_neg: [2.0, 0.0, 0.0]
+    gamma_pos: 0.0
+    clip: 0.05
+    eps: 1.0e-8
+  lambda: 0.2
+  lambda_warmup_pct: 0.1
+  # Nhánh vào main-stage đã qua Stage 0 => ClsHead không còn ngẫu nhiên =>
+  # không warmup. Đây là hệ quả của điều kiện 5, không phải một lựa chọn rời.
+  lambda_warmup_pct_pretrained: 0.0
+  l0_lambda: 0.01
+
+moe:
+  enabled: true
+  router:
+    noise: true
+    noise_init: -3.0
+    logit_clip_c: 1.2
+    renormalize_topk: true
+  aux:
+    kind: switch_load_balance
+    alpha: 0.01
+    warmup_pct: 0.1
+  expert:
+    rank: null
+    alpha: null
+    dropout: 0.05
+    method: lora
+  log_routing_n: 3000
+
+# ── Chấm điểm — theo TỪNG MẪU, vì kiểm định là ghép cặp ───────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định — điều kiện 3 ────────────────────────────────────────────────
+# Ba candidate => ba cặp. Mỗi cặp đi ĐÚNG đường của §2.3 (`src/stats_ab.py`):
+# permutation đảo dấu trả p, bootstrap BCa trả khoảng tin cậy cho hiệu số.
+# Holm chạy TRÊN BA p-value của ba cặp, trong từng metric.
+#
+# `reference: my_gemma` chỉ quyết định DẤU của hiệu số (mọi cặp đọc là
+# "candidate − my_gemma" hay ngược lại), không làm cặp nào bị bỏ.
+stats:
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci: 0.95
+  ci_method: bca
+  dz_floor: 0.10
+  primary_test: perm
+  pairs: all               # all | vs_reference
+  reference: my_gemma
+  adjust: holm
+  adjust_scope: pairs      # Holm trong TỪNG metric, trên ba cặp
+  # Friedman CỐ Ý không có mặt. Xem đầu file và README_2.5.md mục 3.
+
+# ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
+# Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ. Lịch: warm-up
+# cosine + suy giảm max_lr -> min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch
+# (tức 8 chu kỳ nối nhau, không phải một chu kỳ kéo dài 8 epoch).
+#
+#   max_lr = 3e-4 , min_lr = 1e-6  =>  div_factor = 3e-4 / 1e-6 = 300
+#                                      final_div_factor = 300
+# Hai con số ấy là CÁCH VIẾT của min_lr trong `impl: lambda`, không phải hai
+# tham số độc lập — sửa `max_lr` mà quên chúng là đổi min_lr trong im lặng.
+pretrain:
+  n_train: 0               # 0 = toàn bộ train split đã khai ở `data`
+  n_epochs: 8
+  cycle_per_epoch: 1
+  per_device_batch_size: 16
+  grad_accum: 2
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    min_lr: 1.0e-6
+    pct_start: 0.1
+    div_factor: 300.0
+    final_div_factor: 300.0
+    anneal: cos
+    cycle_momentum: false
+  # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
+  # đang dùng; hai đầu mút để ở đây để một lần dò không phải đi tìm lại.
+  weight_decay: 0.05
+  weight_decay_range: [0.03, 0.1]
+  base_method: qlora
+  select_metric: cls_f1_pos
+  keep_last_ckpt: 2
+  subdir: sup_pretrain
+  hub_repo: RGExp123/RGExp_sup_pretrain
+  hub_repo_type: model
+  hub_private: true
+  hub_subdir: best
+
+wandb:
+  enabled: true
+  project: rgexp-section25
+  entity: null
+  run_name: null
+  group: "section2.5"
+  resume_same_run: false
+  mode: online
+  tags: [section2.5, sota, r2gen, adaatt, gemma3, moe, paired-bootstrap, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.5_sota"
+  adapter_dir: ./adapters_2_5
+  ft_suffix: "_ft"

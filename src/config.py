@@ -1,12 +1,17 @@
-"""Nạp và giải quyết cấu hình §2.3.
+"""Nạp và giải quyết cấu hình §2.5.
 
-Một file YAML duy nhất (configs/recombiner.yaml). Không có kế thừa nhiều tầng: repo
-này chỉ chạy một thí nghiệm tại một thời điểm — ở đây là hai candidate quanh
-nhánh Recombinator — nên thêm tầng chỉ để giấu giá trị thật đi.
+Một file YAML duy nhất (configs/section25.yaml). Không có kế thừa nhiều tầng:
+repo này chỉ chạy một thí nghiệm tại một thời điểm — ở đây là ba candidate
+R2Gen / AdaAtt / My Gemma — nên thêm tầng chỉ để giấu giá trị thật đi.
 
-Cấu hình của §2.2 (tám biến thể adapter + Friedman) nằm ở
-`_archive/configs/adapters.yaml`; nó vẫn nạp được bằng `--config` nếu cần chạy
-lại, nhưng đường điều phối của nó cũng đã sang `_archive/`.
+Vì sao §2.5 KHÔNG đi vay khối điều kiện của §2.3/§2.4 như §4 từng làm: những
+bảng ấy đã chốt và code của chúng đã sang `_archive/`. Đi vay một file nằm
+ngoài đường chạy là để hai thứ cùng tồn tại — một file cấu hình chủ đạo và một
+file "thật ra mới là gốc" — và đó đúng là cách chạy nhầm một cái.
+
+Cấu hình của các mục đã chốt nằm ở `_archive/configs/` (`adapters.yaml` cho
+§2.2, `recombiner.yaml` cho §2.3/§2.4). Chúng vẫn nạp được bằng `--config` nếu
+cần đọc lại, nhưng đường điều phối của chúng cũng đã sang `_archive/`.
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "recombiner.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "section25.yaml"
 
 
 class Cfg(dict):
