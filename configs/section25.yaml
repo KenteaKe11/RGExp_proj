@@ -407,9 +407,9 @@ classifier:
   # Lệch nhãn neg/pos/uncertain nên KHÔNG dùng CE thường. ASL, lực nén grad
   # phía neg = 2.0, pos/uncertain = 0.0.
   asl:
-    gamma_neg: [2.0, 0.0, 0.0]
+    gamma_neg: [3.0, 0.0, 0.0]
     gamma_pos: 0.0
-    clip: 0.05
+    clip: 0.02
     eps: 1.0e-8
   lambda: 0.2
   lambda_warmup_pct: 0.1
