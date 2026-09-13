@@ -23,10 +23,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Cổng là sigmoid (n_query, d_model), nên MỌI giá trị đều dương và "trung bình
-# ~0" không thể do triệt tiêu dấu. Nhưng trung bình trên 81.920 ô vẫn có thể nhỏ
-# trong khi vài token đã mở hẳn — mà vài token mở hẳn là một kết quả KHÁC HẲN
-# với cổng đóng. Nên ngưỡng đọc `gate_max`: ô mở nhất có qua nổi mức này không.
+# Cổng là sigmoid THEO CHIỀU TOKEN, `(n_query,)` = 32 số trong (0, 1). Mọi giá
+# trị đều dương nên "trung bình ~0" không thể do triệt tiêu dấu; nhưng trung
+# bình trên 32 token vẫn có thể nhỏ trong khi vài token đã mở hẳn — mà vài
+# token mở hẳn là một kết quả KHÁC HẲN với cổng đóng. Nên ngưỡng đọc `gate_max`
+# (token mở nhất có qua nổi mức này không), và `gate_open_tokens` đếm thẳng.
 GATE_FLOOR = 0.05          # gate_max dưới mức này -> cảnh báo ca (1)
 CLS_F1_FLOOR = 0.05        # cls_f1_pos dưới mức này -> cảnh báo ca (2)
 

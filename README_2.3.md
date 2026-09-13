@@ -82,32 +82,44 @@ một phép kiểm đảo thứ tự token đầu vào và đòi đầu ra phả
 của MHA rồi đòi đầu ra bằng đúng `norm_out(q)` — tức là skip-connect nối đúng
 nguồn.
 
-### 1.3. Cổng vào decoder: sigmoid `(32, 2560)`, khởi tạo gần đóng
+### 1.3. Cổng vào decoder: sigmoid `(32,)` — mở theo chiều TOKEN
 
 32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder **đang đóng
 băng**. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ để đẩy
 loss lên cao và để LoRA tiêu vài chục bước đầu chỉ để học cách *phớt lờ* chúng.
 
-Tham số học được là `gate_logit`, hình dạng `(n_query, d_model)` = `(32, 2560)`;
-cổng thật là `sigmoid(gate_logit)`. Ba hệ quả, cả ba đều có chủ ý:
+Tham số học được là `gate`, hình dạng `(n_query,)` = `(32,)`, sống trong không
+gian **logit**; cổng thật là `sigmoid(gate)`, phát tán trên trục `d_model`. Ba hệ
+quả, cả ba đều có chủ ý:
 
 **Cổng bị chặn trong (0, 1).** Nó chỉ mở được tới "cho qua trọn vẹn", không bao
 giờ khuếch đại. Một vector scale tự do chạy được tới ±5, và khi đó "cổng" hết là
 cổng — nó thành một lớp scale nữa, và con số đọc ra không còn nói được "decoder
 nhận bao nhiêu phần đặc trưng".
 
-**Mỗi token một cổng riêng.** 32 token là 32 "cách nhìn" khác nhau lên ảnh
-(§1.2); không có lý do nào bắt chúng cùng mở một lúc. Hình dạng `(32, 2560)` cho
-phép mạng giữ vài token và đóng phần còn lại — và `gate_open_tokens` trong
-`train_stats.json` đếm đúng chuyện đó. Đó mới là con số trả lời câu hỏi thiết kế;
-trung bình trên 81.920 ô có thể nhỏ trong khi ba token đã mở hẳn, và ba token mở
-hẳn là một kết quả khác hẳn với "cổng đóng".
+**Mở theo chiều TOKEN, không theo chiều kênh.** 32 token là 32 "cách nhìn" khác
+nhau lên toàn ảnh (§1.2), nên đơn vị mà mạng được quyền chọn là **một cách
+nhìn** — không phải một kênh embedding. Hình dạng `(32,)` cho phép giữ vài token
+và đóng hẳn phần còn lại, mỗi token đi qua hoặc bị chặn **nguyên vẹn** trên mọi
+kênh, và `gate_open_tokens` trong `train_stats.json` là một phép **đếm trên 32
+số**.
+
+Cổng theo **kênh** — `(2560,)` hay `(32, 2560)` — bỏ mất đúng tính chất ấy: khi
+đó "trung bình nhỏ" và "ba token đã mở hẳn" cho ra cùng một con số, trong khi
+chúng là hai kết quả khác hẳn nhau. `gate_final` vì thế là một **dict**
+(`gate_mean`, `gate_max`, `gate_min`, `gate_open_tokens`, `gate_per_token`),
+không phải một số.
 
 **Không còn "đúng bằng 0" ở bước 0.** Sigmoid không đạt 0. Với
-`gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào decoder của
-candidate B ở bước 0 bằng candidate A **cộng 32 token đã bị nén còn ~1.8% biên
-độ**. Đây là một phát biểu **yếu hơn** "bằng 0", và báo cáo phải ghi đúng như
-vậy.
+`recombiner.gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào
+decoder của candidate B ở bước 0 bằng candidate A **cộng 32 token đã bị nén còn
+~1.8% biên độ**. Đây là một phát biểu **yếu hơn** "bằng 0", và báo cáo phải ghi
+đúng như vậy.
+
+Khoá đời trước `gate_init` mang giá trị **cổng**, khoá mới mang giá trị
+**logit** — cùng con số `0.0` nghĩa là "đóng hẳn" ở khoá cũ và "mở đúng một
+nửa" ở khoá mới. Nên `RecombinerBranch` **DỪNG** nếu thấy khoá cũ: đổi tên ngầm
+ở đây là một lỗi không có triệu chứng nào.
 
 Nhánh phân loại lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ
 bước đầu tiên.
@@ -123,19 +135,25 @@ steps × max_lr × gate_lr_mult × ~0.6        (0.6 = trung bình one-cycle)
 
 và nó đo bằng đơn vị **logit**, không phải đơn vị cổng:
 
+Với 6400 mẫu và `eff_bs = 2 × 16 = 32` thì lịch có **200 bước**:
+
 | `gate_lr_mult` | quãng đường | cổng đi được từ `sigmoid(-4) = 0.018` tới |
 |---|---|---|
-| 20 | ~0.7 logit | `sigmoid(-3.3) = 0.035` — **vẫn đóng** |
-| 120 | ~4.3 logit | `sigmoid(+0.3) = 0.57` — mở quá nửa nếu dữ liệu muốn |
+| 20 | 0.72 logit | `sigmoid(-3.28) = 0.036` — **vẫn đóng** |
+| 60 | 2.16 logit | `sigmoid(-1.84) = 0.137` — hé |
+| **120** | **4.32 logit** | **`sigmoid(+0.32) = 0.579`** — mở quá nửa nếu dữ liệu muốn |
 
 Với `mult = 20`, candidate B trông y hệt candidate A vì lý do **cơ học** chứ
 không vì dữ liệu — và bảng BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
-Đó là ca hỏng tốn nhất của mục này: ba tiếng GPU để kết luận về AdamW.
+Đó là ca hỏng tốn nhất của mục này: ba tiếng GPU để kết luận về AdamW. Config
+vì thế đặt `gate_lr_mult: 120.0`.
 
-Bất biến: **quãng đường ≥ `|gate_init_logit|`**. `scripts/selftest_recomb.py`
-kiểm đúng bất đẳng thức này từ chính config, nên đổi `gate_init_logit`,
-`schedule.max_lr`, `n_train`, `per_device_batch_size` hay `grad_accum` mà quên
-chỉnh `gate_lr_mult` thì selftest **dừng** trước khi tốn GPU.
+Bất biến: **quãng đường ≥ `|gate_init_logit|`**. `scripts/selftest_section4.py`
+kiểm đúng bất đẳng thức này từ chính config — kèm một phép kiểm **ngược**
+(`mult = 20` phải trượt, nếu không thì bất đẳng thức đang không bắt được gì) —
+nên đổi `gate_init_logit`, `schedule.max_lr`, `n_train`,
+`per_device_batch_size` hay `grad_accum` mà quên chỉnh `gate_lr_mult` thì
+selftest **dừng** trước khi tốn GPU.
 
 Điểm chính là cổng được **PHÉP** mở, không phải bị **ÉP** mở. `gate_final` trong
 `train_stats.json` (`gate_mean`, `gate_max`, `gate_open_tokens`) là con số nói dữ

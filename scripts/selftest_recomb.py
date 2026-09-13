@@ -487,9 +487,9 @@ def branch_tests() -> None:
     check("nhánh: đóng băng `aux` sống sót qua .to()", t_freeze_survives_to)
 
     # ── cổng vào decoder ────────────────────────────────────────────────────
-    def _branch(n_labels=L_LAB, gate_init=0.0, route=False, n_experts=4):
+    def _branch(n_labels=L_LAB, gate_init_logit=-4.0, route=False, n_experts=4):
         rcfg = {"swiglu_hidden": 32, "n_query": N_Q, "n_heads": 4,
-                "n_vis": N_VIS, "gate_init": gate_init,
+                "n_vis": N_VIS, "gate_init_logit": gate_init_logit,
                 "n_experts": n_experts, "route_enabled": route,
                 "qformer": {"tasks": ["sup", "aux"],
                             "freeze": [] if route else ["aux"],
@@ -499,16 +499,101 @@ def branch_tests() -> None:
                 "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.05}}
         return RecombinerBranch(D_VIS, D_MODEL, n_labels, rcfg, ccfg)
 
-    def t_gate_zero():
+    def t_gate_shape():
+        b = _branch()
+        true(tuple(b.gate.shape) == (N_Q,),
+             f"cổng phải có hình dạng (n_query,) = ({N_Q},) — MỞ THEO CHIỀU "
+             f"TOKEN. Nhận {tuple(b.gate.shape)}. Hình dạng (d_model,) là cổng "
+             f"theo KÊNH: nó mở 'một phần biên độ của mọi token' thay vì 'một "
+             f"số token trọn vẹn', và `gate_open_tokens` khi đó vô nghĩa.")
+    check("nhánh: cổng có hình dạng (n_query,) — theo token, không theo kênh",
+          t_gate_shape)
+
+    def t_gate_is_sigmoid():
+        b = _branch(gate_init_logit=0.0)
+        g = b.gate_value()
+        eq(float(g.mean()), 0.5, 1e-6,
+           "logit 0 -> cổng phải bằng sigmoid(0) = 0.5")
+        b.gate.data.fill_(50.0)
+        true(float(b.gate_value().max()) <= 1.0,
+             "cổng phải bị CHẶN TRÊN bởi 1: một vector scale tự do chạy được "
+             "tới ±5, và khi đó 'cổng' hết là cổng — nó thành một lớp scale nữa")
+        b.gate.data.fill_(-50.0)
+        true(float(b.gate_value().min()) >= 0.0,
+             "cổng phải bị chặn dưới bởi 0")
+    check("nhánh: cổng là sigmoid, chặn trong (0, 1)", t_gate_is_sigmoid)
+
+    def t_gate_per_token():
+        """Ca hỏng: cổng phát tán nhầm trục -> nó mở theo kênh chứ không theo
+        token, và mọi phép đếm token mở đọc ra số vô nghĩa."""
+        b = _branch()
+        with torch.no_grad():
+            b.gate.data = torch.tensor(
+                [20.0 if i % 2 == 0 else -20.0 for i in range(N_Q)])
+        tokens, _, _ = b(torch.randn(2, N_VIS, D_VIS))
+        closed = tokens[:, 1::2, :].abs().max()
+        opened = tokens[:, 0::2, :].abs().max()
+        true(float(closed) < 1e-5,
+             "token có logit -20 phải bị chặn NGUYÊN VẸN trên MỌI kênh — "
+             "nếu không thì cổng đang phát tán nhầm trục")
+        true(float(opened) > 1e-4,
+             "token có logit +20 phải đi qua gần như trọn vẹn")
+    check("nhánh: cổng chặn/mở TỪNG TOKEN trọn vẹn (phát tán đúng trục)",
+          t_gate_per_token)
+
+    def t_gate_init_not_zero():
         b = _branch()
         tokens, logits, _route = b(torch.randn(2, N_VIS, D_VIS))
-        eq(float(tokens.abs().max()), 0.0, 1e-12,
-           "cổng khởi tạo 0 -> token vào decoder phải ĐÚNG BẰNG 0 ở bước đầu")
+        true(float(tokens.abs().max()) > 0.0,
+             "cổng sigmoid KHÔNG đạt 0: ở bước 0, đầu vào decoder của B = của A "
+             "CỘNG 32 token đã nén còn ~1.8% biên độ. Đây là phát biểu YẾU HƠN "
+             "'cộng 32 token 0', và nó phải đúng trong code chứ không chỉ trong "
+             "README.")
+        g = b.gate_value()
+        eq(float(g.max()), 0.017986, 1e-5,
+           "gate_init_logit = -4 -> cổng phải bắt đầu ở sigmoid(-4) = 0.01799")
         true(logits is not None and float(logits.abs().sum()) > 0,
              "logit phân loại KHÔNG được bằng 0: nhánh có giám sát lấy tín hiệu "
              "TRƯỚC cổng, nên ASL phải có gradient đầy đủ từ bước đầu tiên")
-    check("nhánh: gate=0 chặn đường vào decoder nhưng KHÔNG chặn ASL",
-          t_gate_zero)
+    check("nhánh: cổng gần đóng (0.018) chặn phần lớn đường vào decoder "
+          "nhưng KHÔNG chặn ASL", t_gate_init_not_zero)
+
+    def t_gate_stats():
+        b = _branch()
+        with torch.no_grad():
+            b.gate.data = torch.tensor(
+                [20.0 if i < 3 else -20.0 for i in range(N_Q)])
+        s = b.gate_stats()
+        eq(int(s["gate_open_tokens"]), 3, 0,
+           "gate_open_tokens phải ĐẾM số token có cổng >= 0.5, không phải đặt "
+           "một ngưỡng lên trung bình")
+        eq(int(s["n_query"]), N_Q, 0, "gate_stats phải ghi n_query")
+        for k in ("gate_mean", "gate_max", "gate_min", "gate_init",
+                  "gate_init_logit", "gate_per_token"):
+            true(k in s, f"gate_stats thiếu khoá {k!r} — report_recomb._gate đọc nó")
+    check("nhánh: gate_stats đếm token mở, không trung bình hoá", t_gate_stats)
+
+    def t_gate_init_legacy_key_refused():
+        """Khoá cũ mang giá trị CỔNG, khoá mới mang LOGIT. Cùng số 0.0 nghĩa là
+        'đóng hẳn' và 'mở nửa' — không exception, không log, và candidate B ở
+        bước 0 nhận 32 vector ngẫu nhiên ở 50% biên độ."""
+        rcfg = {"swiglu_hidden": 32, "n_query": N_Q, "n_heads": 4,
+                "n_vis": N_VIS, "gate_init": 0.0, "n_experts": 4,
+                "route_enabled": False,
+                "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"],
+                            "d_model": 12, "n_heads": 4, "n_layers": 1,
+                            "ffn_mult": 2}}
+        ccfg = {"n_classes": 3, "hidden": 16,
+                "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.05}}
+        try:
+            RecombinerBranch(D_VIS, D_MODEL, L_LAB, rcfg, ccfg)
+        except ValueError:
+            return
+        raise AssertionError(
+            "`recombiner.gate_init` (khoá đời trước) phải làm nhánh DỪNG, không "
+            "được lặng lẽ bị bỏ qua: 0.0 ở khoá cũ là cổng đóng hẳn, 0.0 ở khoá "
+            "mới là cổng mở đúng một nửa.")
+    check("nhánh: khoá `gate_init` đời trước -> DỪNG", t_gate_init_legacy_key_refused)
 
     def t_gate_grad():
         b = _branch()
@@ -1276,9 +1361,18 @@ def config_tests() -> None:
 
     def t_recombiner_block():
         r = cfg["recombiner"]
-        eq(float(r.get("gate_init", 0.0)), 0.0, 1e-12,
-           "cổng vào decoder PHẢI khởi tạo 0 — khác 0 là bỏ mất tính chất 'ở "
-           "bước 0, đầu vào decoder của B = của A cộng n_query token 0'")
+        true("gate_init" not in r,
+             "config còn khoá `gate_init` của bản trước (giá trị CỔNG). Cổng nay "
+             "là sigmoid theo chiều token và khoá là `gate_init_logit` (giá trị "
+             "LOGIT) — cùng số 0.0 nghĩa là 'đóng hẳn' ở khoá cũ và 'mở nửa' ở "
+             "khoá mới.")
+        true("gate_init_logit" in r,
+             "config phải khai `recombiner.gate_init_logit` — không có mặc định "
+             "ngầm cho thứ quyết định đầu vào decoder ở bước 0")
+        true(float(r["gate_init_logit"]) < 0.0,
+             "gate_init_logit phải ÂM: cổng khởi tạo phải gần ĐÓNG, nếu không "
+             "thì ở bước 0 decoder đóng băng nhận 32 vector ngẫu nhiên ở biên độ "
+             "lớn và LoRA tiêu vài chục bước đầu chỉ để học cách phớt lờ chúng")
         q = r["qformer"]
         eq(len(q["tasks"]), 2, 0, "sơ đồ có QFormer 2 vector")
         true(list(q["freeze"]) == ["aux"],
@@ -1286,12 +1380,27 @@ def config_tests() -> None:
         true(int(r["n_query"]) >= 1, "n_query phải >= 1")
         true("heads_qformer" not in r and "decoder_qformer" not in r,
              "config còn sót QFormer thứ hai của bản trước — sơ đồ chỉ có MỘT")
-    check("config: nhánh đúng sơ đồ (1 QFormer, 2 vector, cổng 0)",
+    check("config: nhánh đúng sơ đồ (1 QFormer, 2 vector, cổng theo token)",
           t_recombiner_block)
 
     def t_classifier_block():
         c = cfg["classifier"]
-        eq(float(c["asl"]["gamma_neg"]), 2.0, 1e-9)
+        # `gamma_neg` chấp CẢ HAI dạng, và đó là thiết kế chứ không phải sự dễ
+        # dãi: một số = nén theo GIÁ TRỊ NHÃN (ô có nhãn 0), một danh sách 3 số
+        # = nén theo TÊN LỚP (neg/pos/uncertain). Ép `float()` ở đây làm phép
+        # kiểm nổ trên chính cấu hình đang chạy — xem docstring AsymmetricLoss.
+        gn = c["asl"]["gamma_neg"]
+        if isinstance(gn, (list, tuple)):
+            eq(len(gn), int(c.get("n_classes", 3)), 0,
+               "gamma_neg dạng danh sách phải có ĐÚNG n_classes phần tử, theo "
+               "thứ tự lớp trong config — lệch một chỗ là nén nhầm lớp và ASL "
+               "vẫn giảm bình thường:")
+            true(all(float(x) >= 0.0 for x in gn), "gamma_neg phải không âm")
+            true(float(gn[0]) > 0.0,
+                 "lớp `neg` chiếm đa số áp đảo, nên phần tử đầu của gamma_neg "
+                 "phải DƯƠNG — bằng 0 là tắt hẳn cơ chế mà ASL tồn tại vì nó")
+        else:
+            eq(float(gn), 2.0, 1e-9)
         eq(float(c["asl"]["gamma_pos"]), 0.0, 1e-9)
         true(0.0 < float(c["lambda"]) <= 2.0, "classifier.lambda phải dương, hợp lý")
         true(not c.get("feed_logits_to_decoder", False),

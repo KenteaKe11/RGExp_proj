@@ -78,7 +78,7 @@ D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
     "siglip_dim": D_VIS, "swiglu_hidden": 32, "out_dim": None,
     "n_query": 4, "n_vis": 12, "n_heads": 2, "dropout": 0.0,
-    "swiglu_dropout": 0.0, "pre_norm": True, "gate_init": 0.0,
+    "swiglu_dropout": 0.0, "pre_norm": True, "gate_init_logit": -4.0,
     "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"], "d_model": 12,
                 "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0},
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,
@@ -699,19 +699,51 @@ def config_tests() -> None:
     check("§3 ghi vào thư mục/repo RIÊNG, không đè §2.x", t_dirs_separate)
 
     def t_section2_untouched():
-        """§3 KHÔNG được rò vào configs/recombiner.yaml hay run_recomb.py."""
-        for k in ("pretrain", "mode", "section"):
-            true(k not in C23,
-                 f"configs/recombiner.yaml có khoá `{k}` của §3 — hai mục kia "
-                 f"đã chốt, và §3 không liên quan tới chúng")
-        true("pretrained_lr_mult" not in C23.get("train", {}),
-             "recombiner.yaml không được mang khoá của §3")
+        """§3 KHÔNG được rò vào configs/recombiner.yaml hay run_recomb.py.
+
+        Ranh giới ở đây là §3 — KHÔNG phải chữ "pretrain". `configs/
+        recombiner.yaml` CÓ một khối `pretrain:`, và nó hợp lệ: nó thuộc
+        `python -m src.run_pretrain` (chế độ 1 trên TOÀN BỘ split, xem
+        README_pretrain.md) và §4 đi vay nó. Hai khoá `pretrain` và
+        `train.pretrained_lr_mult` vì thế được phép có mặt.
+
+        Thứ KHÔNG được phép là §3 tự nhận chỗ trong file ấy: khoá `section`,
+        `mode`, hay một `pretrain.subdir` trỏ vào thư mục của §3. Cấm cả chữ
+        "pretrain" là cấm nhầm — và cách sửa quen tay khi một phép kiểm cấm
+        nhầm là tắt nó đi, chứ không phải làm nó chính xác hơn.
+        """
+        true("section" not in C23,
+             "configs/recombiner.yaml có khoá `section` của §3 — hai mục kia đã "
+             "chốt, và §3 không liên quan tới chúng")
+        # `mode` thì HỢP LỆ ở đó — nó là khoá của chính §2.3 (xem chú thích
+        # trong file). Cái phải giữ là GIÁ TRỊ: `scratch` là thứ đã sinh ra MỌI
+        # bảng §2.3/§2.4 hiện có, nên đổi mặc định ấy là lặng lẽ đổi nghĩa của
+        # những bảng đã chốt — và không dòng log nào nói vậy.
+        true(str(C23.get("mode", "scratch")) == "scratch",
+             f"configs/recombiner.yaml có `mode: {C23.get('mode')!r}`. Mọi bảng "
+             f"§2.3/§2.4 hiện có sinh ra từ `scratch`; đổi mặc định trong file "
+             f"là đổi nghĩa của chúng mà không có gì báo. Chọn chế độ khác bằng "
+             f"dòng lệnh, hoặc bằng §4 (điểm vào riêng).")
+        sub23 = str((C23.get("pretrain") or {}).get("subdir", ""))
+        sub3 = str((CFG.get("pretrain") or {}).get("subdir", ""))
+        true(not sub23 or sub23 != sub3,
+             f"`pretrain.subdir` của recombiner.yaml ({sub23!r}) trùng của §3 "
+             f"({sub3!r}) — hai checkpoint trông giống hệt nhau trên đĩa và chỉ "
+             f"khác ở TẬP đã học, nên trùng thư mục là mời một lần --init-from "
+             f"nạp nhầm và không có gì báo")
         src = (ROOT / "src" / "run_recomb.py").read_text(encoding="utf-8")
         for bad in ("section3", "sup_pretrain", "decoder_ft", "pretrain_io"):
             true(bad not in src,
                  f"src/run_recomb.py nhắc tới `{bad}` — đường §2.3/§2.4 phải "
                  f"không biết gì về §3")
-    check("ranh giới: §3 không rò vào config/điều phối của §2.x",
+        # Chiều thứ ba, thêm khi §4 xuất hiện: §3 cũng không được biết tới §4.
+        s3 = (ROOT / "src" / "run_section3.py").read_text(encoding="utf-8")
+        for bad in ("section4", "run_section4", "arms_s4"):
+            true(bad not in s3,
+                 f"src/run_section3.py nhắc tới `{bad}` — §3 huấn luyện MỘT "
+                 f"model và không có bảng nào; biết tới một mục so sánh là mở "
+                 f"đường cho một lần chạy §4 rơi vào nhánh code của §3")
+    check("ranh giới: §3 không rò vào §2.x, và không biết tới §4",
           t_section2_untouched)
 
     def t_eff_batch():

@@ -1,17 +1,19 @@
-# RGExp — §2.3 (nhánh Recombinator), §2.4 (MoE) và §3 (huấn luyện thật) trên Gemma 3
+# RGExp — §2.3 (nhánh Recombinator), §2.4 (MoE), §3 (huấn luyện thật) và §4 (đối đầu) trên Gemma 3
 
-Repo này chạy **hai thí nghiệm** rồi **một lần huấn luyện thật**:
+Repo này chạy **ba thí nghiệm** và **một lần huấn luyện thật**:
 
 ```bash
 bash scripts/run_recomb.sh --exp 2.3     # nhánh Recombinator có đáng không?
 bash scripts/run_recomb.sh --exp 2.4     # cấu hình MoE nào tốt hơn?
 bash scripts/run_section3.sh             # §3: huấn luyện MỘT model cho tử tế
+bash scripts/run_section4.sh             # §4: cả công thức có hơn LoRA trần không?
 ```
 
-Hai mục đầu là **thí nghiệm so sánh** (có candidate, có kiểm định, dữ liệu khoá
-cứng ở 6400 mẫu). §3 thì **không so gì** — nó lấy câu trả lời của hai mục đó làm
-siêu tham số và chạy toàn bộ trainset. Ba mục dùng hai file cấu hình và hai điểm
-vào tách rời, và đó là một điều kiện được cài đặt chứ không phải một quy ước.
+§2.3, §2.4 và §4 là **thí nghiệm so sánh** (có candidate, có kiểm định, dữ liệu
+khoá cứng ở 6400 mẫu / 3000 ảnh). §3 thì **không so gì** — nó lấy câu trả lời
+của §2.3/§2.4 làm siêu tham số và chạy toàn bộ trainset. Bốn mục dùng ba file
+cấu hình và ba điểm vào tách rời, và đó là một điều kiện được cài đặt chứ không
+phải một quy ước.
 
 ### §2.3 — hai candidate, hai kiểm định ghép cặp
 
@@ -79,10 +81,34 @@ huấn luyện của hai bảng đã chốt. Đường **huấn luyện** thì v
 
 **Chi tiết: [`README_3.md`](README_3.md)**
 
-### Cái chung (§2.3 và §2.4)
+### §4 — QLoRA r4 thuần vs cả công thức, hai kiểm định ghép cặp
+
+§2.3 hỏi *"nhánh có đáng không"* với LoRA thường. §4 hỏi lại câu ấy với **toàn
+bộ** công thức đã dựng xong:
+
+```
+A  qlora_r4          LoRA r=4 gắn vào decoder. KHÔNG nhánh, KHÔNG Experts,
+                     KHÔNG pretrain -> ĐỒNG NHẤT candidate A của §2.3
+B  recomb_pre_k6e10  A + Recombinator + QFormer + ClsHead + Experts K=6·E=10
+                     + nhánh khởi tạo từ sup_pretrain, train theo chế độ 2 của §3
+```
+
+k = 2 nên **không Friedman** — cùng `stats_ab` mà §2.3 dùng.
+
+Điểm khác §3: §4 **không được phép** có điều kiện riêng, vì bảng của nó phải đặt
+cạnh bảng §2.3/§2.4 được. Nên `src/run_section4.py` nạp
+`configs/recombiner.yaml` **trước** — đúng file hai mục kia đọc — rồi phủ
+`configs/section4.yaml` (chỉ candidate + chế độ 1 + nơi ghi) lên trên, và **DỪNG**
+nếu file §4 chạm vào bất kỳ khoá điều kiện nào. Cùng 6400 mẫu / 3000 ảnh khi đó
+là một sự thật cơ học, không phải một lời hứa.
+
+**Chi tiết: [`README_4.md`](README_4.md)**
+
+### Cái chung (§2.3, §2.4 và §4)
 
 Cùng base **NF4 4-bit đã đóng băng**, cùng 6400 mẫu huấn luyện, cùng lịch
-one-cycle, cùng batch, cùng 3000 ảnh để chấm, cùng seed, cùng `configs/recombiner.yaml`.
+one-cycle, cùng batch, cùng 3000 ảnh để chấm, cùng seed, cùng `configs/recombiner.yaml`
+(§4 **đi vay** file ấy thay vì khai lại — xem `README_4.md` mục 1).
 Hai thí nghiệm ghi vào **hai thư mục tách rời** (`runs/2.3_recombiner/` +
 `adapters_2_3/` · `runs/2.4_moe/` + `adapters_2_4/`), nên chạy cái này không đè
 cái kia và chạy lại cái nào cũng resume được riêng.
@@ -132,9 +158,18 @@ bash scripts/run_recomb.sh --exp 2.4 --detach     # §2.4 chạy thật
 không ghi vào thư mục nào của hai mục trên:
 
 ```bash
-python scripts/selftest_section3.py               # ~39 phép kiểm, vài giây
+python scripts/selftest_section3.py               # 39 phép kiểm, vài giây
 bash scripts/run_section3.sh --dry-run            # thử đường ống (32 mẫu)
 bash scripts/run_section3.sh --detach             # §3 chạy thật, cả hai chế độ
+```
+
+§4 có điểm vào riêng nhưng **đọc** `configs/recombiner.yaml` — cố ý, vì bảng của
+nó phải so được với hai mục kia — và ghi vào `runs/4_headtohead/` + `adapters_4/`:
+
+```bash
+python scripts/selftest_section4.py               # 29 phép kiểm, vài giây
+bash scripts/run_section4.sh --dry-run            # thử đường ống (8 ảnh, 16 mẫu)
+bash scripts/run_section4.sh --detach             # §4 chạy thật, trọn gói
 ```
 
 Không có `--exp` thì lấy khoá `experiment` trong `configs/recombiner.yaml` (mặc
@@ -151,7 +186,10 @@ nó nguyên văn (k = 5). Xem [`README_2.4.md`](README_2.4.md) mục 5.
 
 ```
 configs/recombiner.yaml      TOÀN BỘ tham số của §2.3 + §2.4, có chú thích lý do
+                             (§4 ĐI VAY khối điều kiện từ đây)
 configs/section3.yaml [§3]   §3 RIÊNG: toàn bộ trainset, siêu tham số đã chọn
+configs/section4.yaml [§4]   §4: CHỈ candidate + chế độ 1 + nơi ghi. Chạm vào một
+                             khoá điều kiện của §2.3 là DỪNG.
 requirements.txt             môi trường chính (transformers/torch)
 requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
@@ -159,9 +197,14 @@ scripts/
   archive_2.2.sh             chuyển §2.2 sang _archive/ (chạy một lần)
   run_recomb.sh              MỘT LỆNH cho §2.3/§2.4, chọn bằng --exp
   run_section3.sh    [§3]    MỘT LỆNH cho §3, chọn chế độ bằng --mode
+  run_section4.sh    [§4]    MỘT LỆNH cho §4 (data · pretrain · train · sinh ·
+                             chấm · kiểm định · báo cáo)
   selftest_recomb.py         ~100 phép kiểm (§2.3 + §2.4), không cần GPU/mạng
   selftest_friedman.py       ~30 phép kiểm cho stats_friedman (§2.4 dùng thật)
-  selftest_section3.py [§3]  ~39 phép kiểm cho sup_pretrain + decoder_ft
+  selftest_section3.py [§3]  39 phép kiểm cho sup_pretrain + decoder_ft
+  selftest_section4.py [§4]  29 phép kiểm: hàng rào điều kiện (hai chiều), cờ
+                             candidate, cách ly moe.enabled, bất biến quãng
+                             đường cổng, k=2 không chạm Friedman
   _env.sh                    chọn python (container vs cục bộ)
 src/
   config.py                  nạp YAML, seed, token
@@ -178,6 +221,8 @@ src/
   pretrain_sup.py   [§3]     chế độ 1: 100% có giám sát, KHÔNG decoder
   pretrain_io.py    [§3]     ghi/nạp/đẩy ĐÚNG các khối đã pretrain
   run_section3.py   [§3]     điều phối 3 stage (data · train · push), 2 chế độ
+  run_section4.py   [§4]     điều phối 8 stage; gộp recombiner.yaml + section4.yaml
+                             và DỪNG nếu §4 chạm khoá điều kiện
   runners/gemma3*.py         base trần · +adapter (§2.2) · +nhánh (§2.3) ·
                              +nhánh+Experts (§2.4)
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU

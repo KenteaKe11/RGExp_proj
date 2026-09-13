@@ -42,13 +42,43 @@ Bên trong Recombinator (sơ đồ chi tiết):
    DỪNG ngay nếu số token vào khác 4096. Đó cũng là cái lưới bắt được ca
    *pan & scan lén bật* (mỗi mảnh phụ thêm một lượt 4096 patch).
 
-4. CỔNG VÀO DECODER KHỞI TẠO 0. 32 token tái tổ hợp được chèn thẳng vào chuỗi
-   đầu vào của một decoder ĐANG ĐÓNG BĂNG. Ở bước 0 chúng là nhiễu ngẫu nhiên
-   trong không gian embedding: đủ để đẩy loss lên cao và để LoRA r=4 tiêu vài
-   chục bước đầu chỉ để học cách *phớt lờ* chúng. `gate` là một vector scale khởi
-   tạo 0, nên ở bước 0 đầu vào decoder của candidate B giống hệt candidate A
-   cộng 32 token 0 — và chính cổng ấy học mở dần. Nhánh phân loại lấy tín hiệu
-   TRƯỚC cổng, nên Sup Loss vẫn có gradient đầy đủ từ bước đầu tiên.
+4. CỔNG VÀO DECODER LÀ SIGMOID THEO CHIỀU TOKEN, hình dạng `(n_query,)` = 32.
+   32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder ĐANG
+   ĐÓNG BĂNG. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ
+   để đẩy loss lên cao và để LoRA r=4 tiêu vài chục bước đầu chỉ để học cách
+   *phớt lờ* chúng.
+
+   Tham số học được là `gate` trong không gian LOGIT; cổng thật là
+   `sigmoid(gate)`, phát tán trên trục d_model. Ba hệ quả, cả ba có chủ ý:
+
+   * **Chặn trong (0, 1).** Cổng chỉ mở được tới "cho qua trọn vẹn", không bao
+     giờ khuếch đại. Một vector scale tự do chạy được tới ±5, và khi đó "cổng"
+     hết là cổng — nó thành một lớp scale nữa, và con số đọc ra không còn nói
+     được "decoder nhận bao nhiêu phần đặc trưng".
+
+   * **Mở theo chiều TOKEN, không theo chiều kênh.** 32 token là 32 "cách nhìn"
+     khác nhau lên toàn ảnh (điểm 3), nên đơn vị mà mạng được quyền chọn là
+     MỘT CÁCH NHÌN, không phải một kênh embedding. Hình dạng `(32,)` cho phép
+     giữ vài token và đóng hẳn phần còn lại, và `gate_open_tokens` khi đó là
+     một phép ĐẾM trên 32 số chứ không phải một ngưỡng đặt lên trung bình của
+     81.920 ô. Với cổng theo kênh, "trung bình nhỏ" và "ba token đã mở hẳn"
+     cho ra cùng một con số — hai kết quả khác hẳn nhau, một chỉ số.
+
+   * **Không còn "đúng bằng 0" ở bước 0.** Sigmoid không đạt 0. Với
+     `gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào
+     decoder của candidate B ở bước 0 bằng candidate A CỘNG 32 token đã bị nén
+     còn ~1.8% biên độ. Đây là một phát biểu YẾU HƠN "bằng 0", và báo cáo phải
+     ghi đúng như vậy.
+
+   Nhánh phân loại lấy tín hiệu TRƯỚC cổng, nên Sup Loss vẫn có gradient đầy đủ
+   từ bước đầu tiên.
+
+   Quãng đường cổng đi được trong cả lịch đo bằng đơn vị LOGIT, không phải đơn
+   vị cổng: `steps × max_lr × gate_lr_mult × ~0.6`. Bất biến bắt buộc là quãng
+   đường ấy ≥ `|gate_init_logit|`, nếu không thì candidate B trông y hệt
+   candidate A vì lý do CƠ HỌC chứ không vì dữ liệu — và bảng BLEU/ROUGE không
+   phân biệt được hai nguyên nhân. `scripts/selftest_section4.py` kiểm đúng bất
+   đẳng thức này từ chính config.
 
 ── Route_Gate ở §2.3 ────────────────────────────────────────────────────────
 Sơ đồ tổng có `Route_Gate (vec_2) ─► Aux Loss` và một mũi tên xuống Experts
@@ -556,9 +586,25 @@ class RecombinerBranch(nn.Module):
             clip=float(a.get("clip", 0.05)),
             eps=float(a.get("eps", 1e-8)))
 
-        # Cổng vào decoder: một vector scale, khởi tạo 0. Xem docstring module.
+        # Cổng vào decoder: sigmoid THEO CHIỀU TOKEN, `(n_query,)`. Tham số
+        # sống trong không gian logit; cổng thật là `sigmoid(gate)`. Xem
+        # docstring module, điểm 4.
+        #
+        # `gate_init` (khoá đời trước) mang giá trị CỔNG; `gate_init_logit`
+        # mang giá trị LOGIT. Cùng con số 0.0 nghĩa là "đóng hẳn" ở khoá cũ và
+        # "mở đúng một nửa" ở khoá mới — không exception, không dòng log, và
+        # candidate B ở bước 0 nhận 32 vector ngẫu nhiên ở 50% biên độ. Nên
+        # khoá cũ là DỪNG, không phải cảnh báo.
+        if "gate_init" in r:
+            raise ValueError(
+                "recombiner.gate_init là khoá ĐỜI TRƯỚC (giá trị CỔNG của một "
+                "vector scale theo kênh). Cổng nay là sigmoid theo chiều token, "
+                "nên hãy khai `recombiner.gate_init_logit` — giá trị LOGIT. "
+                "Cùng số 0.0 nghĩa là 'đóng hẳn' ở khoá cũ và 'mở nửa' ở khoá "
+                "mới, nên đổi tên ngầm ở đây là một lỗi không có triệu chứng.")
+        self.gate_init_logit = float(r.get("gate_init_logit", -4.0))
         self.gate = nn.Parameter(
-            torch.full((d_model,), float(r.get("gate_init", 0.0))))
+            torch.full((self.n_query,), self.gate_init_logit))
 
         for m in (self.recombinator, self.qformer, self.cls_head, self.route_gate):
             if m is not None:
@@ -592,7 +638,37 @@ class RecombinerBranch(nn.Module):
         route = self.route_gate(heads[aux_task])
         if not self.route_enabled:
             route = None
-        return rec * self.gate.to(rec.dtype), logits, route
+        # (n_query,) -> (1, n_query, 1): cổng phát tán trên trục d_model, nên
+        # mỗi token đi qua hoặc bị chặn NGUYÊN VẸN. Nhân theo kênh ở đây là
+        # quay lại đúng thứ vừa bị bỏ.
+        g = self.gate_value().to(rec.dtype).view(1, -1, 1)
+        return rec * g, logits, route
+
+    # ── cổng ───────────────────────────────────────────────────────────────
+    def gate_value(self) -> torch.Tensor:
+        """Cổng THẬT, `(n_query,)` trong (0, 1). `self.gate` là logit."""
+        return torch.sigmoid(self.gate)
+
+    def gate_stats(self, open_floor: float = 0.5) -> dict:
+        """Bốn con số đọc được về cổng — đây là thứ đi vào `train_stats.json`.
+
+        `gate_open_tokens` là một phép ĐẾM trên đúng 32 số, không phải một
+        ngưỡng đặt lên trung bình: với cổng theo chiều token, "3 token mở hẳn"
+        và "cả 32 token hé 10%" là hai con số khác nhau, và chúng PHẢI khác
+        nhau vì chúng là hai kết quả khác hẳn nhau.
+        """
+        with torch.no_grad():
+            g = self.gate_value().detach().float().cpu()
+        return {
+            "gate_mean": float(g.mean()),
+            "gate_max": float(g.max()),
+            "gate_min": float(g.min()),
+            "gate_open_tokens": int((g >= float(open_floor)).sum()),
+            "n_query": int(g.numel()),
+            "gate_init": float(torch.sigmoid(torch.tensor(self.gate_init_logit))),
+            "gate_init_logit": float(self.gate_init_logit),
+            "gate_per_token": [round(float(x), 4) for x in g.tolist()],
+        }
 
     def sup_loss(self, logits, target, mask=None) -> torch.Tensor:
         return self.asl(logits, target, mask)
@@ -623,8 +699,9 @@ def _init(module: nn.Module) -> None:
 
     Không dùng mặc định của torch (Kaiming uniform theo fan_in): nhánh này ghép
     thẳng vào không gian embedding của một decoder đã đóng băng, nên độ lớn khởi
-    tạo phải cùng thang với model chủ. Cổng khởi tạo 0 che phần lớn hậu quả ở
-    bước 0, nhưng nó không che đường đi tới Sup Loss.
+    tạo phải cùng thang với model chủ. Cổng khởi tạo `sigmoid(-4) = 0.018` nén
+    phần lớn hậu quả ở bước 0 xuống ~1.8% biên độ — nén, KHÔNG phải xoá — và nó
+    không che đường đi tới Sup Loss.
     """
     for m in module.modules():
         if isinstance(m, nn.Linear):

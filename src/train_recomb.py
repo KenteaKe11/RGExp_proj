@@ -347,10 +347,23 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     Ở chế độ `decoder_ft` thì thân nhánh TÁCH LÀM ĐÔI — bốn nhóm.
 
     `gate` được tách ra vì AdamW CHUẨN HOÁ bước cập nhật: mỗi bước nó dịch một
-    tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Với lr đỉnh 2e-4 và
-    ~200 bước (trung bình ~0.6·max_lr), quãng đường TỐI ĐA của một gate khởi tạo
-    0 là cỡ 0.02 — tức là cổng gần như KHÔNG THỂ mở trong một lịch ngắn, và
-    candidate B sẽ trông y hệt candidate A vì lý do cơ học chứ không vì dữ liệu.
+    tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Cổng nay là sigmoid
+    theo chiều token, nên quãng đường đo bằng đơn vị LOGIT:
+
+        steps × max_lr × gate_lr_mult × ~0.6        (0.6 = trung bình one-cycle)
+
+    Với 200 bước, max_lr 3e-4 và `gate_lr_mult = 20`, quãng đường là ~0.7 logit
+    — cổng đi từ `sigmoid(-4) = 0.018` tới `sigmoid(-3.3) = 0.035`, tức là VẪN
+    ĐÓNG. Candidate B khi đó trông y hệt candidate A vì lý do CƠ HỌC chứ không
+    vì dữ liệu, và bảng BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
+    `gate_lr_mult = 120` cho ~4.3 logit -> `sigmoid(+0.3) = 0.57`, mở quá nửa
+    NẾU dữ liệu muốn.
+
+    Bất biến bắt buộc: quãng đường ≥ `|gate_init_logit|`. `scripts/
+    selftest_section4.py` kiểm đúng bất đẳng thức ấy từ chính config, nên đổi
+    `gate_init_logit`, `schedule.max_lr`, `n_train`, `per_device_batch_size`
+    hay `grad_accum` mà quên chỉnh `gate_lr_mult` thì selftest DỪNG trước khi
+    tốn GPU.
 
     `gate_lr_mult` nhân lr của riêng nhóm ấy lên. Điểm chính là cổng được PHÉP
     mở, không phải bị ÉP mở: `gate_final` trong train_stats.json là con số nói
@@ -727,9 +740,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"{bstats['route_gate']:,} "
               f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT ở §2.3'})",
               flush=True)
-        print(f"  cổng vào decoder khởi tạo {float(branch.gate.detach().mean()):.3f}"
-              f" — ở bước 0, đầu vào decoder của B = của A cộng "
-              f"{bstats['n_query']} token 0", flush=True)
+        _g0 = branch.gate_stats()
+        print(f"  cổng vào decoder: sigmoid THEO CHIỀU TOKEN, "
+              f"{_g0['n_query']} cổng · khởi tạo "
+              f"{_g0['gate_init']:.4f} (logit {_g0['gate_init_logit']:+.1f})\n"
+              f"    -> ở bước 0, đầu vào decoder của B = của A CỘNG "
+              f"{_g0['n_query']} token đã nén còn ~"
+              f"{100*_g0['gate_init']:.1f}% biên độ (KHÔNG phải 0)", flush=True)
         if spec is not None:
             print(f"  Route_Gate HOẠT ĐỘNG: vec_2 -> {spec['n_experts']} logit "
                   f"(+ nhiễu) -> Aux Loss và -> Experts. QFormer đóng băng "
@@ -848,7 +865,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             # nó thì "loss 2.41" không nói được gì: 2.41 là đã học được nhiều hay
             # là gần như chưa nhúc nhích?
             first_loss = total_loss
-        gate = float(branch.gate.detach().mean()) if branch is not None else 0.0
+        # Trung bình của CỔNG (sigmoid), không của logit: con số in ra trong
+        # log phải cùng thang với `gate_final` trong train_stats.json.
+        gate = (float(branch.gate_value().detach().mean())
+                if branch is not None else 0.0)
         if (step + 1) % log_every == 0 or step == steps - 1:
             lr_now = opt.param_groups[0]["lr"]
             rsum = rstats.summary() if rstats is not None else {}
@@ -941,8 +961,11 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "freeze_pretrained": (bool(tcfg.get("freeze_pretrained", False))
                               if pre_src else None),
         "token_type": str(rcfg.get("token_type", "text")),
-        "gate_final": (float(branch.gate.detach().mean())
-                       if branch is not None else None),
+        # DICT, không phải một số. Với cổng theo chiều token, "trung bình 0.04"
+        # và "3/32 token mở hẳn" là hai kết quả khác hẳn nhau — ghi một con số
+        # ở đây là bỏ mất đúng thứ hình dạng `(n_query,)` vừa mua, và
+        # `report_recomb._gate` đã chờ sẵn một dict.
+        "gate_final": (branch.gate_stats() if branch is not None else None),
         "gate_lr_mult": float(tcfg.get("gate_lr_mult", 20.0)),
         "n_labels": n_labels if use_branch else 0,
         "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,

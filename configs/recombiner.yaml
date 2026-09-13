@@ -255,10 +255,23 @@ train:
   # cổng gần như KHÔNG THỂ mở trong một lịch ngắn, và candidate B sẽ trông y hệt
   # candidate A vì lý do cơ học chứ không vì dữ liệu.
   #
+  # Quãng đường cổng đi được trong CẢ lịch, đo bằng đơn vị LOGIT:
+  #     steps × max_lr × gate_lr_mult × ~0.6
+  # Với config này: 6400/(2×16) = 200 bước × 3e-4 × 120 × 0.6 = 4.32 logit —
+  # cổng đi được từ sigmoid(-4) = 0.018 tới sigmoid(+0.32) = 0.58, tức là mở
+  # quá nửa NẾU dữ liệu muốn. Ở mult = 20 (giá trị đời trước) quãng đường chỉ
+  # 0.72 logit: cổng dừng ở 0.035 — VẪN ĐÓNG, và candidate B trông y hệt
+  # candidate A vì lý do CƠ HỌC chứ không vì dữ liệu. Ba tiếng GPU để kết luận
+  # về AdamW.
+  #
+  # Bất biến: quãng đường >= |gate_init_logit|. selftest_section4.py kiểm đúng
+  # bất đẳng thức này từ chính config, nên đổi max_lr / n_train / batch /
+  # grad_accum / gate_init_logit mà quên chỉnh mult thì nó DỪNG trước GPU.
+  #
   # Điểm chính là cổng được PHÉP mở, không phải bị ÉP mở. `gate_final` trong
   # train_stats.json là con số nói dữ liệu có muốn mở nó hay không, và nó phải
   # vào báo cáo.
-  gate_lr_mult: 20.0
+  gate_lr_mult: 120.0
 
   # ── decoder_ft: NHÁNH ĐÃ PRETRAIN CHẠY LR THẤP HƠN ───────────────────────
   # Cùng tính chất của AdamW ở trên, đọc theo chiều ngược lại: mỗi bước dịch
@@ -384,9 +397,20 @@ recombiner:
   # ổn định hơn khi tối ưu nhưng gấp đôi activation 4096 × 2560.
   dtype: null
 
-  # Cổng vào decoder, khởi tạo 0 — xem train.gate_lr_mult ở trên. Khác 0 là bỏ
-  # mất tính chất "ở bước 0, đầu vào decoder của B = của A cộng 32 token 0".
-  gate_init: 0.0
+  # Cổng vào decoder: SIGMOID THEO CHIỀU TOKEN, hình dạng (n_query,) = 32.
+  # Tham số sống trong không gian LOGIT; cổng thật là sigmoid(logit). Mỗi token
+  # một cổng riêng, phát tán trên trục d_model — nên `gate_open_tokens` là một
+  # phép ĐẾM trên 32 số, không phải một ngưỡng đặt lên trung bình của 81.920 ô.
+  #
+  # -4 -> sigmoid(-4) = 0.018: ở bước 0, đầu vào decoder của B = của A CỘNG 32
+  # token đã nén còn ~1.8% biên độ. Đây là phát biểu YẾU HƠN "cộng 32 token 0"
+  # của cổng đời trước, và báo cáo phải ghi đúng như vậy.
+  #
+  # Khoá đời trước `gate_init` mang giá trị CỔNG chứ không phải logit, nên cùng
+  # con số 0.0 nghĩa là "đóng hẳn" ở khoá cũ và "mở đúng một nửa" ở khoá mới.
+  # src/recombiner.py DỪNG nếu thấy khoá cũ — đổi tên ngầm ở đây là một lỗi
+  # không có triệu chứng nào.
+  gate_init_logit: -4.0
 
 # ── NHÁNH CÓ GIÁM SÁT: ClsHead + ASL ───────────────────────────────────────
 # ClsHead đọc ĐÚNG vector `sup` của QFormer, dự đoán nhãn bệnh lý, và ASL ràng

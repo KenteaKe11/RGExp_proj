@@ -1,0 +1,88 @@
+# ══════════════════════════════════════════════════════════════════════════
+# §4 — QLoRA r4 thuần  vs  Recombinator(pretrain) + K=6·E=10 + QFormer + Cls
+#
+# File này CỐ Ý NGẮN, và đó là toàn bộ lý lẽ của nó.
+#
+# §4 phải "giữ nguyên vẹn mọi điều kiện của §2.3/§2.4" — CÙNG 6400 mẫu train,
+# CÙNG 3000 ảnh test, cùng base NF4, cùng lịch one-cycle, cùng batch, cùng
+# seed, cùng chính sách ảnh, cùng metric, cùng tham số kiểm định. Với hai file
+# cấu hình độc lập, câu đó là một LỜI HỨA: ai đó sửa `data.n_train` ở một bên
+# mà quên bên kia, và ba mục thôi so được với nhau mà không có gì báo.
+#
+# Nên §4 KHÔNG khai lại một khoá nào trong số đó. `src/run_section4.py` nạp
+# `configs/recombiner.yaml` TRƯỚC — đúng file mà §2.3 và §2.4 đọc — rồi phủ
+# file này lên trên, và nó DỪNG nếu file này chạm vào bất kỳ khoá nào đã khoá.
+# "Cùng điều kiện" khi đó là một sự thật cơ học, không phải một câu trong README.
+#
+# Danh sách khoá bị khoá nằm trong `run_section4.LOCKED`, và selftest đối chiếu
+# nó với chính file này theo CẢ HAI chiều.
+# ══════════════════════════════════════════════════════════════════════════
+
+experiment: "4"
+
+# ── Hai candidate ─────────────────────────────────────────────────────────
+# Khoá riêng `arms_s4` chứ không phải `arms`: `arms` là của §2.3 và nó nằm
+# trong recombiner.yaml. Trùng tên nghĩa là một lần nạp sai thứ tự sẽ chạy §4
+# với hai candidate của §2.3 — cùng số cột, cùng kiểu kiểm định, bảng vẫn in ra
+# bình thường, và không có gì nói rằng nhánh pretrain chưa bao giờ được nạp.
+#
+# BA cờ, cả ba BẮT BUỘC, không cờ nào có mặc định ngầm:
+#   recomb    : có nhánh Recombinator + QFormer + ClsHead hay không
+#   pretrain  : nhánh có được khởi tạo từ chế độ 1 hay không
+#   top_k/n_experts : có mặt <=> arm này chạy Experts (MoE)
+#
+# Mặc định ngầm ở đây là candidate B lặng lẽ mất pretrain, hoặc mất Experts, và
+# cột kết quả khi đó mang nhãn của một cấu hình chưa từng chạy.
+arms_s4:
+  - id: qlora_r4
+    name: "A · QLoRA r4 thuần"
+    recomb: false
+    pretrain: false
+    enabled: true
+
+  - id: recomb_pre_k6e10
+    name: "B · Recombinator(pretrain) · K=6 · E=10 · QFormer · Cls"
+    recomb: true
+    pretrain: true
+    top_k: 6
+    n_experts: 10
+    enabled: true
+
+# ── Chế độ 1 (sup_pretrain) của riêng §4 ──────────────────────────────────
+# `n_train` KHÔNG có ở đây, và sự vắng mặt ấy là có chủ ý.
+#
+# run_section4 đưa CHÍNH `train_df` của §4 cho chế độ 1 — cùng đối tượng
+# DataFrame mà chế độ 2 và candidate A dùng. Không phải "cùng con số 6400" mà
+# là CÙNG MỘT BẢNG, nên "pretrain thấy đúng tập mà decoder thấy" không còn là
+# thứ phải kiểm: nó không có cách nào sai.
+#
+# (`pretrain.n_train` trong recombiner.yaml là của `python -m src.run_pretrain`
+#  — một điểm vào khác, chạy trên TOÀN BỘ split. §4 không đọc khoá đó, nên khai
+#  lại nó ở đây là dựng một khoá trông như điều khiển được gì đó mà không.)
+pretrain:
+  # 8 lượt đi hết 6400 mẫu. Là một HẰNG SỐ ĐƯỢC CHỌN, không được tune — val 256
+  # mẫu chỉ dùng để chọn epoch qua `select_metric` và để NHÌN đường học. §4
+  # không trả lời được "mấy epoch là tốt nhất", và điều đó vào phần Giới hạn.
+  n_epochs: 8
+
+  # runs/4_headtohead/pretrain/ — tách khỏi runs/sup_pretrain/ (toàn bộ split)
+  # và khỏi runs/3_full/pretrain/ (§3). Ba checkpoint trông giống hệt nhau trên
+  # đĩa và chỉ khác nhau ở tập đã học; trộn chúng một thư mục là mời một lần
+  # `--init-from` trỏ vào nhánh đã thấy 42k ảnh rồi dán nhãn "6400" lên bảng §4.
+  subdir: pretrain
+
+  # Repo MODEL riêng cho checkpoint của §4. Cùng lý do: một repo, một tập.
+  hub_repo: RGExp123/RGExp_s4_sup_pretrain
+  hub_repo_type: model
+  hub_private: true
+  hub_subdir: best
+  push: true
+
+# ── Nơi ghi ───────────────────────────────────────────────────────────────
+output:
+  subdir: "4_headtohead"
+  adapter_dir: ./adapters_4
+
+wandb:
+  group: "section4"
+  tags: [section4, headtohead, recombiner, pretrain, moe, paired-bootstrap]
