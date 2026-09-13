@@ -235,7 +235,7 @@ def compat_tests() -> None:
     import copy
 
     from src import pretrain_io as P
-    from src import train_recomb as T
+    from _archive.src import train_recomb as T
 
     def t_query_rows():
         b = _branch()
@@ -356,7 +356,7 @@ class _FakePeft:
 
 def lr_tests() -> None:
     from src import pretrain_io as P
-    from src import train_recomb as T
+    from _archive.src import train_recomb as T
 
     TCFG = {"schedule": {"max_lr": 3e-4}, "weight_decay": 0.0,
             "branch_weight_decay": 0.01, "gate_lr_mult": 20.0,
@@ -441,7 +441,7 @@ def lr_tests() -> None:
 
 # ═══ 5. λ-warmup ở decoder_ft ════════════════════════════════════════════════
 def lambda_tests() -> None:
-    from src import train_recomb as T
+    from _archive.src import train_recomb as T
 
     def t_warmup_math():
         # scratch: λ leo từ 0 trong 10% đầu

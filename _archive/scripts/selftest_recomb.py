@@ -1356,7 +1356,7 @@ def moe_tests() -> None:
         """
         import inspect as _i
 
-        from src import train_recomb as tr
+        from _archive.src import train_recomb as tr
 
         def _code_only(fn) -> str:
             s = _i.getsource(fn)
@@ -1606,7 +1606,7 @@ def config_tests() -> None:
     def t_moe_spec_rejects_k_eq_e():
         from src.backbone import TrainUnusable
         from src.config import Cfg
-        from src.train_recomb import moe_spec
+        from _archive.src.train_recomb import moe_spec
 
         c = Cfg({**{k: v for k, v in cfg.items()},
                  "moe": {**dict(cfg["moe"]), "enabled": True}})
@@ -1626,7 +1626,7 @@ def config_tests() -> None:
 
     def t_effective_rcfg():
         from src.config import Cfg
-        from src.train_recomb import effective_rcfg
+        from _archive.src.train_recomb import effective_rcfg
 
         c = Cfg(dict(cfg))
         base = effective_rcfg(c, None)

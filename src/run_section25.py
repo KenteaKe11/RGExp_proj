@@ -371,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
         if arm["kind"] == "sota":
             return ts_mod.already_trained(d)
         try:
-            from . import train_recomb as tr_mod
+            from .._archive.src import train_recomb as tr_mod
 
             return bool(tr_mod.already_trained(d, True, True))
         except Exception:
@@ -491,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
 
         preset = cls_pack = None
         if any(x["kind"] == "ours" for x in arms_to_train):
-            from . import train_recomb as tr_mod
+            from .._archive.src import train_recomb as tr_mod
             from .backbone import preflight_adapters
 
             preset = tr_mod.resolve_preset(cfg)
@@ -531,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
                                                run_dir, tracker,
                                                max_steps_override=dry_steps)
                 else:
-                    from . import train_recomb as tr_mod
+                    from .._archive.src import train_recomb as tr_mod
 
                     st = tr_mod.train_arm(cfg, arm, preset, train_df, cls_pack,
                                           odir, tracker,

@@ -62,12 +62,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import (imaging, labels_cls, moe as moe_mod, pretrain_io, recombiner)
-from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
+from ...src import (imaging, labels_cls, moe as moe_mod, pretrain_io, recombiner)
+from ...src.backbone import (ReportDataset, TrainUnusable, attach_adapter,
                        build_scheduler, collate, find_target_modules,
                        free_vram, is_oom, is_quantized, load_base,
                        resolve_alpha, total_steps, uses_dora)
-from .config import Cfg, seed_everything
+from ...src.config import Cfg, seed_everything
 
 
 # ══ Preset LoRA: một hằng số cho CẢ HAI candidate ═══════════════════════════
