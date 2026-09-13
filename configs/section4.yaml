@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════
-# §4 — QLoRA r4 thuần  vs  Recombinator(pretrain) + K=6·E=10 + QFormer + Cls
+# §4 — QLoRA r4 thuần  vs  Recombinator(pretrain §3) + K=6·E=10 + QFormer + Cls
 #
 # File này CỐ Ý NGẮN, và đó là toàn bộ lý lẽ của nó.
 #
@@ -12,10 +12,17 @@
 # Nên §4 KHÔNG khai lại một khoá nào trong số đó. `src/run_section4.py` nạp
 # `configs/recombiner.yaml` TRƯỚC — đúng file mà §2.3 và §2.4 đọc — rồi phủ
 # file này lên trên, và nó DỪNG nếu file này chạm vào bất kỳ khoá nào đã khoá.
-# "Cùng điều kiện" khi đó là một sự thật cơ học, không phải một câu trong README.
 #
-# Danh sách khoá bị khoá nằm trong `run_section4.LOCKED`, và selftest đối chiếu
-# nó với chính file này theo CẢ HAI chiều.
+# ── §4 KHÔNG CÓ PHASE PRETRAIN ────────────────────────────────────────────
+# Nhánh của candidate B nạp từ checkpoint mà §3 đã ghi ra. §4 không huấn luyện
+# lại chế độ 1, không có `pretrain:` block, và khai một khoá `pretrain.*` nào ở
+# đây là DỪNG — nó sẽ là một khoá trông như điều khiển được một phase không
+# tồn tại.
+#
+# Đường dẫn checkpoint KHÔNG viết cứng ở đây: `run_section4.py` đọc
+# `configs/section3.yaml` để dựng nó (`output.dir`/`output.subdir`/pretrain/
+# ckpt/best). Viết cứng "runs/3_full/..." là một LỜI HỨA rằng §3 vẫn ghi vào
+# đúng chỗ ấy; đọc file của §3 là một sự thật.
 # ══════════════════════════════════════════════════════════════════════════
 
 experiment: "4"
@@ -28,11 +35,8 @@ experiment: "4"
 #
 # BA cờ, cả ba BẮT BUỘC, không cờ nào có mặc định ngầm:
 #   recomb    : có nhánh Recombinator + QFormer + ClsHead hay không
-#   pretrain  : nhánh có được khởi tạo từ chế độ 1 hay không
+#   pretrain  : nhánh có nạp từ checkpoint §3 hay không
 #   top_k/n_experts : có mặt <=> arm này chạy Experts (MoE)
-#
-# Mặc định ngầm ở đây là candidate B lặng lẽ mất pretrain, hoặc mất Experts, và
-# cột kết quả khi đó mang nhãn của một cấu hình chưa từng chạy.
 arms_s4:
   - id: qlora_r4
     name: "A · QLoRA r4 thuần"
@@ -41,42 +45,32 @@ arms_s4:
     enabled: true
 
   - id: recomb_pre_k6e10
-    name: "B · Recombinator(pretrain) · K=6 · E=10 · QFormer · Cls"
+    name: "B · Recombinator(pretrain §3) · K=6 · E=10 · QFormer · Cls"
     recomb: true
     pretrain: true
     top_k: 6
     n_experts: 10
     enabled: true
 
-# ── Chế độ 1 (sup_pretrain) của riêng §4 ──────────────────────────────────
-# `n_train` KHÔNG có ở đây, và sự vắng mặt ấy là có chủ ý.
+# ── Nguồn nhánh đã pretrain ───────────────────────────────────────────────
+# `section3` = đọc configs/section3.yaml, dựng <output.dir>/<output.subdir>/
+# pretrain/ckpt/best. Đó là thư mục mà `run_section3.default_init` ghi ra.
 #
-# run_section4 đưa CHÍNH `train_df` của §4 cho chế độ 1 — cùng đối tượng
-# DataFrame mà chế độ 2 và candidate A dùng. Không phải "cùng con số 6400" mà
-# là CÙNG MỘT BẢNG, nên "pretrain thấy đúng tập mà decoder thấy" không còn là
-# thứ phải kiểm: nó không có cách nào sai.
+# Ghi đè bằng dòng lệnh khi cần: --init-from <dir> | hub:OWNER/NAME/best[@rev]
+# | none (arm đối chứng from-scratch, phải NÓI RA).
+pretrain_from: section3
+
+# §3 chạy chế độ 1 trên TOÀN BỘ train split, còn §4 huấn luyện trên 6400 mẫu.
+# Đó là một khác biệt THẬT giữa hai cột và nó phải vào phần Giới hạn — xem
+# README_4.md mục 2.2. `run_section4.py` in ra con số thật đọc từ META của
+# checkpoint và ghi nó vào `manifest.limitations`, nên báo cáo không thể im
+# lặng về nó.
 #
-# (`pretrain.n_train` trong recombiner.yaml là của `python -m src.run_pretrain`
-#  — một điểm vào khác, chạy trên TOÀN BỘ split. §4 không đọc khoá đó, nên khai
-#  lại nó ở đây là dựng một khoá trông như điều khiển được gì đó mà không.)
-pretrain:
-  # 8 lượt đi hết 6400 mẫu. Là một HẰNG SỐ ĐƯỢC CHỌN, không được tune — val 256
-  # mẫu chỉ dùng để chọn epoch qua `select_metric` và để NHÌN đường học. §4
-  # không trả lời được "mấy epoch là tốt nhất", và điều đó vào phần Giới hạn.
-  n_epochs: 8
-
-  # runs/4_headtohead/pretrain/ — tách khỏi runs/sup_pretrain/ (toàn bộ split)
-  # và khỏi runs/3_full/pretrain/ (§3). Ba checkpoint trông giống hệt nhau trên
-  # đĩa và chỉ khác nhau ở tập đã học; trộn chúng một thư mục là mời một lần
-  # `--init-from` trỏ vào nhánh đã thấy 42k ảnh rồi dán nhãn "6400" lên bảng §4.
-  subdir: pretrain
-
-  # Repo MODEL riêng cho checkpoint của §4. Cùng lý do: một repo, một tập.
-  hub_repo: RGExp123/RGExp_s4_sup_pretrain
-  hub_repo_type: model
-  hub_private: true
-  hub_subdir: best
-  push: true
+# `true`  = chấp nhận nhánh học trên nhiều dữ liệu hơn (mặc định: nó là một
+#           thành phần đã pretrain, cùng nghĩa với vision tower SigLIP đóng
+#           băng — được công bố, không phải rò rỉ).
+# `false` = DỪNG nếu checkpoint học trên số mẫu khác `data.n_train`.
+allow_pretrain_data_mismatch: true
 
 # ── Nơi ghi ───────────────────────────────────────────────────────────────
 output:
@@ -85,4 +79,4 @@ output:
 
 wandb:
   group: "section4"
-  tags: [section4, headtohead, recombiner, pretrain, moe, paired-bootstrap]
+  tags: [section4, headtohead, recombiner, pretrain-s3, moe, paired-bootstrap]

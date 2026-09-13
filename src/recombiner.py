@@ -598,11 +598,25 @@ class RecombinerBranch(nn.Module):
         if "gate_init" in r:
             raise ValueError(
                 "recombiner.gate_init là khoá ĐỜI TRƯỚC (giá trị CỔNG của một "
-                "vector scale theo kênh). Cổng nay là sigmoid theo chiều token, "
-                "nên hãy khai `recombiner.gate_init_logit` — giá trị LOGIT. "
-                "Cùng số 0.0 nghĩa là 'đóng hẳn' ở khoá cũ và 'mở nửa' ở khoá "
-                "mới, nên đổi tên ngầm ở đây là một lỗi không có triệu chứng.")
+                "vector scale theo kênh). Cổng nay là Hard-Concrete theo chiều "
+                "token, nên hãy khai `recombiner.gate_init_logit` — giá trị "
+                "log_alpha. Cùng số 0.0 nghĩa là 'đóng hẳn' ở khoá cũ và 'mở "
+                "quá nửa' ở khoá mới, nên đổi tên ngầm ở đây là một lỗi không "
+                "có triệu chứng.")
         self.gate_init_logit = float(r.get("gate_init_logit", -4.0))
+        g = dict(r.get("gate") or {})
+        self.gate_beta = float(g.get("beta", 2.0 / 3.0))
+        self.gate_gamma = float(g.get("stretch_lo", -0.1))
+        self.gate_zeta = float(g.get("stretch_hi", 1.1))
+        if not (self.gate_gamma < 0.0 < 1.0 < self.gate_zeta):
+            raise ValueError(
+                f"recombiner.gate.stretch phải THỰC SỰ trùm ra ngoài [0, 1] "
+                f"(nhận {self.gate_gamma}, {self.gate_zeta}). Đó là toàn bộ cơ "
+                f"chế: kẹp một khoảng rộng hơn về [0, 1] là thứ cho cổng đạt "
+                f"ĐÚNG 0 và ĐÚNG 1. Với (0, 1) thì nó thoái hoá về sigmoid và "
+                f"không token nào bị chặn thật.")
+        if self.gate_beta <= 0.0:
+            raise ValueError("recombiner.gate.beta phải > 0")
         self.gate = nn.Parameter(
             torch.full((self.n_query,), self.gate_init_logit))
 
@@ -644,31 +658,101 @@ class RecombinerBranch(nn.Module):
         g = self.gate_value().to(rec.dtype).view(1, -1, 1)
         return rec * g, logits, route
 
-    # ── cổng ───────────────────────────────────────────────────────────────
+    # ── cổng: Hard-Concrete (Louizos/Welling/Kingma 2018) ──────────────────
+    #
+    # Vì sao KHÔNG phải sigmoid thường. `sigmoid(x)` liên tục trong (0, 1) và
+    # không bao giờ chạm hai đầu: một token có cổng 0.3 vẫn đi qua với 30% biên
+    # độ — nó bị LÀM NHỎ, không bị CHẶN. "Đếm token mở" khi đó là một ngưỡng
+    # ĐỌC đặt lên một đại lượng liên tục, không phải một phép đếm những thứ đã
+    # bị tắt. Tệ hơn: gradient của sigmoid lớn nhất ở 0.5, nên optimizer không
+    # có áp lực nào đẩy ra hai cực — nó có xu hướng đậu ở giữa, và "mạng chọn
+    # giữ vài cách nhìn" không bao giờ xảy ra.
+    #
+    # Hard-Concrete sửa đúng chỗ đó bằng hai bước:
+    #   1. NỚI khoảng đầu ra ra ngoài [0, 1]:  s̄ = s·(ζ − γ) + γ  với γ < 0 < 1 < ζ
+    #   2. KẸP về [0, 1]:                      z = min(1, max(0, s̄))
+    # Phần bị kẹp có xác suất DƯƠNG, nên z = 0 và z = 1 là những biến cố thật —
+    # token bị đóng HẲN, không phải bị nhân với một số nhỏ.
+    #
+    # Và vì phần kẹp có xác suất tính được ở dạng đóng, xác suất "cổng mở"
+    # (`l0_expected`) là một hàm KHẢ VI của tham số. Nên "giữ m trong 32 cách
+    # nhìn" trở thành một thứ model HỌC được qua một phạt L0, chứ không phải
+    # một siêu tham số ai đó đặt.
     def gate_value(self) -> torch.Tensor:
-        """Cổng THẬT, `(n_query,)` trong (0, 1). `self.gate` là logit."""
-        return torch.sigmoid(self.gate)
+        """Cổng THẬT, `(n_query,)` trong [0, 1] — hai đầu ĐẠT ĐƯỢC.
+
+        Huấn luyện: lấy mẫu (ngẫu nhiên, có gradient qua reparameterization).
+        Sinh/eval: xác định — cùng công thức, bỏ nhiễu. `self.training` là thứ
+        rẽ nhánh, nên runner sinh (vốn gọi `.eval()`) tự động đi nhánh xác định;
+        không có cờ thứ hai để ai đó quên bật.
+        """
+        if self.training:
+            # u ~ U(0,1) -> logistic noise. `clamp` chặn log(0) ở biên.
+            u = torch.rand_like(self.gate).clamp_(1e-6, 1.0 - 1e-6)
+            s = torch.sigmoid(
+                (torch.log(u) - torch.log1p(-u) + self.gate) / self.gate_beta)
+        else:
+            s = torch.sigmoid(self.gate)
+        return (s * (self.gate_zeta - self.gate_gamma)
+                + self.gate_gamma).clamp(0.0, 1.0)
+
+    def gate_l0(self) -> torch.Tensor:
+        """Số cổng MỞ KỲ VỌNG — vô hướng, khả vi, KHÔNG lấy mẫu.
+
+        P(z != 0) = sigmoid(log_alpha − β·log(−γ/ζ)), dạng đóng. Đây là thứ
+        cộng vào loss: lấy mẫu rồi đếm sẽ cho một ước lượng nhiễu và không có
+        gradient đi qua phép đếm.
+        """
+        import math
+
+        shift = self.gate_beta * math.log(-self.gate_gamma / self.gate_zeta)
+        return torch.sigmoid(self.gate - shift).sum()
 
     def gate_stats(self, open_floor: float = 0.5) -> dict:
-        """Bốn con số đọc được về cổng — đây là thứ đi vào `train_stats.json`.
+        """Những con số đọc được về cổng — thứ đi vào `train_stats.json`.
 
-        `gate_open_tokens` là một phép ĐẾM trên đúng 32 số, không phải một
-        ngưỡng đặt lên trung bình: với cổng theo chiều token, "3 token mở hẳn"
-        và "cả 32 token hé 10%" là hai con số khác nhau, và chúng PHẢI khác
-        nhau vì chúng là hai kết quả khác hẳn nhau.
+        Đọc ở chế độ XÁC ĐỊNH (cùng cổng mà lượt sinh sẽ dùng), nên
+        `gate_closed_tokens` là một phép đếm những token THẬT SỰ bị tắt lúc
+        sinh — không phải một ngưỡng đặt lên một đại lượng liên tục.
+
+        `l0_expected` đứng cạnh nó và trả lời một câu KHÁC: trong lúc huấn
+        luyện, trung bình bao nhiêu cổng mở. Hai con số lệch nhau nhiều nghĩa
+        là cổng đang dao động chứ chưa quyết — và đó là một kết quả, không phải
+        một lỗi.
         """
-        with torch.no_grad():
-            g = self.gate_value().detach().float().cpu()
+        was = self.training
+        self.eval()
+        try:
+            with torch.no_grad():
+                g = self.gate_value().detach().float().cpu()
+                l0 = float(self.gate_l0().detach())
+        finally:
+            self.train(was)
+        n = int(g.numel())
         return {
             "gate_mean": float(g.mean()),
             "gate_max": float(g.max()),
             "gate_min": float(g.min()),
             "gate_open_tokens": int((g >= float(open_floor)).sum()),
-            "n_query": int(g.numel()),
-            "gate_init": float(torch.sigmoid(torch.tensor(self.gate_init_logit))),
+            "gate_closed_tokens": int((g <= 0.0).sum()),
+            "gate_saturated_tokens": int((g >= 1.0).sum()),
+            "l0_expected": l0,
+            "l0_frac": l0 / max(n, 1),
+            "n_query": n,
+            "gate_kind": "hard_concrete",
+            "gate_beta": float(self.gate_beta),
+            "gate_stretch": [float(self.gate_gamma), float(self.gate_zeta)],
+            "gate_init": float(self._det_gate(self.gate_init_logit)),
             "gate_init_logit": float(self.gate_init_logit),
             "gate_per_token": [round(float(x), 4) for x in g.tolist()],
         }
+
+    def _det_gate(self, log_alpha: float) -> float:
+        import math
+
+        s = 1.0 / (1.0 + math.exp(-log_alpha))
+        return min(1.0, max(0.0, s * (self.gate_zeta - self.gate_gamma)
+                            + self.gate_gamma))
 
     def sup_loss(self, logits, target, mask=None) -> torch.Tensor:
         return self.asl(logits, target, mask)

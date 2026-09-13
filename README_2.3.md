@@ -82,15 +82,34 @@ một phép kiểm đảo thứ tự token đầu vào và đòi đầu ra phả
 của MHA rồi đòi đầu ra bằng đúng `norm_out(q)` — tức là skip-connect nối đúng
 nguồn.
 
-### 1.3. Cổng vào decoder: sigmoid `(32,)` — mở theo chiều TOKEN
+### 1.3. Cổng vào decoder: Hard-Concrete `(32,)` — tắt/mở THẬT theo chiều TOKEN
 
 32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder **đang đóng
 băng**. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ để đẩy
 loss lên cao và để LoRA tiêu vài chục bước đầu chỉ để học cách *phớt lờ* chúng.
 
-Tham số học được là `gate`, hình dạng `(n_query,)` = `(32,)`, sống trong không
-gian **logit**; cổng thật là `sigmoid(gate)`, phát tán trên trục `d_model`. Ba hệ
-quả, cả ba đều có chủ ý:
+**Vì sao không phải sigmoid.** `sigmoid(x)` liên tục trong (0, 1) và không bao
+giờ chạm hai đầu: một token có cổng 0.3 vẫn đi qua với 30% biên độ — nó bị **làm
+nhỏ**, không bị **chặn**. "Đếm token mở" khi đó là một *ngưỡng đọc* đặt lên một
+đại lượng liên tục, không phải một phép đếm những thứ đã bị tắt. Tệ hơn: gradient
+của sigmoid lớn nhất ở 0.5, nên optimizer không có áp lực nào đẩy ra hai cực — nó
+đậu ở giữa, và "mạng chọn giữ vài cách nhìn" không bao giờ xảy ra.
+
+**Hard-Concrete** (Louizos / Welling / Kingma 2018) sửa đúng chỗ đó bằng hai bước:
+
+```
+s  = sigmoid((log u − log(1−u) + log_alpha) / beta)      u ~ U(0,1)
+s' = s·(hi − lo) + lo                    NỚI ra ngoài [0,1]   (lo = −0.1, hi = 1.1)
+z  = min(1, max(0, s'))                  KẸP về [0,1]
+```
+
+Phần bị kẹp có xác suất **dương**, nên `z = 0` và `z = 1` là những biến cố thật —
+token bị đóng **hẳn**, không phải bị nhân với một số nhỏ. Lúc sinh thì bỏ nhiễu
+(`self.training` rẽ nhánh, nên runner sinh tự đi nhánh xác định — không có cờ thứ
+hai để ai đó quên bật).
+
+Tham số học được là `gate` = `log_alpha`, hình dạng `(n_query,)` = `(32,)`, phát
+tán trên trục `d_model`. Ba hệ quả, cả ba đều có chủ ý:
 
 **Cổng bị chặn trong (0, 1).** Nó chỉ mở được tới "cho qua trọn vẹn", không bao
 giờ khuếch đại. Một vector scale tự do chạy được tới ±5, và khi đó "cổng" hết là
@@ -110,16 +129,29 @@ chúng là hai kết quả khác hẳn nhau. `gate_final` vì thế là một **
 (`gate_mean`, `gate_max`, `gate_min`, `gate_open_tokens`, `gate_per_token`),
 không phải một số.
 
-**Không còn "đúng bằng 0" ở bước 0.** Sigmoid không đạt 0. Với
-`recombiner.gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào
-decoder của candidate B ở bước 0 bằng candidate A **cộng 32 token đã bị nén còn
-~1.8% biên độ**. Đây là một phát biểu **yếu hơn** "bằng 0", và báo cáo phải ghi
-đúng như vậy.
+**"Đúng bằng 0" ở bước 0 là một phát biểu THẬT.** Với
+`recombiner.gate_init_logit = -2.5`, cổng lúc **sinh** bằng
+`clamp(sigmoid(-2.5)·1.2 − 0.1) = 0` — đúng bằng 0, không phải xấp xỉ. Nên "đầu
+vào decoder của candidate B ở bước 0 = của candidate A cộng 32 token 0" là một
+câu đúng theo nghĩa đen. Cổng sigmoid chỉ nói được "cộng 32 token ở 1.8% biên độ".
 
-Khoá đời trước `gate_init` mang giá trị **cổng**, khoá mới mang giá trị
-**logit** — cùng con số `0.0` nghĩa là "đóng hẳn" ở khoá cũ và "mở đúng một
-nửa" ở khoá mới. Nên `RecombinerBranch` **DỪNG** nếu thấy khoá cũ: đổi tên ngầm
-ở đây là một lỗi không có triệu chứng nào.
+Khoá đời trước `gate_init` mang giá trị **cổng**, khoá mới mang `log_alpha` —
+cùng con số `0.0` nghĩa là "đóng hẳn" ở khoá cũ và "mở quá nửa" ở khoá mới. Nên
+`RecombinerBranch` **DỪNG** nếu thấy khoá cũ: đổi tên ngầm ở đây là một lỗi không
+có triệu chứng nào.
+
+**Phạt L0 biến "giữ m cách nhìn" thành thứ model HỌC được.** Xác suất một cổng mở
+có dạng đóng khả vi — `P(z ≠ 0) = sigmoid(log_alpha − beta·log(−lo/hi))` — nên số
+cổng mở **kỳ vọng** cộng thẳng vào loss được, không cần lấy mẫu:
+
+```
+loss += classifier.l0_lambda × (số cổng mở kỳ vọng / n_query)
+```
+
+`l0_lambda: 0.01`, nhỏ và có chủ ý: phạt L0 là một **lực đẩy cổng đóng**, đúng
+chiều với ca hỏng mà `gate_lr_mult` tồn tại để tránh. Đặt nó cao là tự tay dựng
+lại "candidate B trông y hệt candidate A vì lý do cơ học", lần này với một cái
+tên nghe học thuật hơn. Con số phải đọc là `l0_expected` trong `train_stats.json`.
 
 Nhánh phân loại lấy tín hiệu **trước** cổng, nên ASL vẫn có gradient đầy đủ từ
 bước đầu tiên.
@@ -135,25 +167,42 @@ steps × max_lr × gate_lr_mult × ~0.6        (0.6 = trung bình one-cycle)
 
 và nó đo bằng đơn vị **logit**, không phải đơn vị cổng:
 
-Với 6400 mẫu và `eff_bs = 2 × 16 = 32` thì lịch có **200 bước**:
+Hard-Concrete thêm **một thừa số** vào phép nhân này, và bỏ quên nó là cách đúng
+để tin rằng cổng đi được gấp ba quãng đường thật của nó. `clamp` có gradient
+**bằng 0** ở vùng bị kẹp, nên chỉ phần mẫu rơi ra ngoài mới đẩy được cổng:
 
-| `gate_lr_mult` | quãng đường | cổng đi được từ `sigmoid(-4) = 0.018` tới |
-|---|---|---|
-| 20 | 0.72 logit | `sigmoid(-3.28) = 0.036` — **vẫn đóng** |
-| 60 | 2.16 logit | `sigmoid(-1.84) = 0.137` — hé |
-| **120** | **4.32 logit** | **`sigmoid(+0.32) = 0.579`** — mở quá nửa nếu dữ liệu muốn |
+```
+quãng đường = steps × max_lr × gate_lr_mult × ~0.6 × P_sống
+P_sống      = sigmoid(log_alpha − beta·log(−lo/hi))
+```
 
-Với `mult = 20`, candidate B trông y hệt candidate A vì lý do **cơ học** chứ
-không vì dữ liệu — và bảng BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
-Đó là ca hỏng tốn nhất của mục này: ba tiếng GPU để kết luận về AdamW. Config
-vì thế đặt `gate_lr_mult: 120.0`.
+Với 6400 mẫu và `eff_bs = 2 × 16 = 32` thì lịch có **200 bước**. Hai khoá kéo
+ngược chiều nhau — `log_alpha` càng âm thì cổng lúc sinh càng chắc bằng 0, nhưng
+càng ít mẫu sống:
+
+| `gate_init_logit` | cổng lúc sinh, bước 0 | `P_sống` | `gate_lr_mult` cần để tới z = 0.5 |
+|---|---|---|---|
+| −4.0 | 0 | 0.083 | **1338** — cổng đứng yên vì cơ học |
+| −3.0 | 0 | 0.198 | 422 |
+| **−2.5** | **0** | **0.289** | **240** |
+| −2.4 | 0 | 0.310 | 215 |
+| −2.0 | 0.043 — *thôi bằng 0* | 0.401 | 139 |
+
+Config chọn `gate_init_logit: -2.5` + `gate_lr_mult: 250.0`: quãng đường 2.60 ≥
+2.5, cổng đi từ `z = 0` (đóng hẳn) tới `z ≈ 0.53`. Biên mỏng, nhưng `P_sống` chỉ
+**tăng** khi cổng mở ra nên đây là ước lượng dè dặt — mô phỏng 200 bước với
+gradient đẩy mở cho cổng đi hết tới `z = 1`.
+
+Ở `mult = 20` (giá trị đời trước) quãng đường là 0.21: candidate B trông y hệt
+candidate A vì lý do **cơ học** chứ không vì dữ liệu, và bảng BLEU/ROUGE không
+phân biệt được hai nguyên nhân ấy. Ba tiếng GPU để kết luận về AdamW.
 
 Bất biến: **quãng đường ≥ `|gate_init_logit|`**. `scripts/selftest_section4.py`
-kiểm đúng bất đẳng thức này từ chính config — kèm một phép kiểm **ngược**
-(`mult = 20` phải trượt, nếu không thì bất đẳng thức đang không bắt được gì) —
-nên đổi `gate_init_logit`, `schedule.max_lr`, `n_train`,
-`per_device_batch_size` hay `grad_accum` mà quên chỉnh `gate_lr_mult` thì
-selftest **dừng** trước khi tốn GPU.
+kiểm nó từ chính config — kèm **hai** phép kiểm ngược (`mult = 20` phải trượt,
+và `gate_init_logit = -4` phải trượt; nếu cái thứ hai qua thì thừa số `P_sống`
+đang bị bỏ quên). `train_recomb` kiểm **lại** lúc chạy, nơi `n_train` đã là số
+thật — nên §3 với `n_train: 0` (toàn bộ split) cũng được kiểm, điều mà một phép
+kiểm đọc config không làm được.
 
 Điểm chính là cổng được **PHÉP** mở, không phải bị **ÉP** mở. `gate_final` trong
 `train_stats.json` (`gate_mean`, `gate_max`, `gate_open_tokens`) là con số nói dữ

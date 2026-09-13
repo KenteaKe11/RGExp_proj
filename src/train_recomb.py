@@ -767,6 +767,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         from_pretrain=bool(pre_src))
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
+    # Phạt L0 trên cổng Hard-Concrete. Dùng dạng ĐÓNG (`branch.gate_l0()`), không
+    # đếm trên mẫu: đếm cho một ước lượng nhiễu VÀ không có gradient đi qua phép
+    # đếm, nên "model học cách giữ m cách nhìn" sẽ thành một câu trong README.
+    #
+    # Chuẩn hoá theo n_query để `l0_lambda` không đổi nghĩa khi n_query đổi — một
+    # hằng số mà nghĩa của nó phụ thuộc một khoá khác là chỗ tệ nhất để đặt một
+    # giá trị "đã chọn, không tune".
+    l0_lambda = float(ccfg.get("l0_lambda", 0.0)) if use_branch else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
     rstats = moe_mod.RouteStats(spec["n_experts"]) if spec else None
     # λ và warmup thuộc về SUP LOSS, nên chúng nằm dưới `classifier`, cạnh ASL —
@@ -789,6 +797,54 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
+
+    # ── Cổng có đi nổi không — kiểm ở RUNTIME, không chỉ ở config ───────────
+    # `selftest_section4` kiểm bất đẳng thức này từ config, nhưng nó chỉ làm
+    # được khi `data.n_train` là một con số. §3 chạy `n_train: 0` (toàn bộ
+    # split), nên ở đó số bước chỉ biết được TẠI ĐÂY — sau khi train_df đã có.
+    #
+    # AdamW chuẩn hoá bước cập nhật, nên quãng đường tối đa của cổng trong cả
+    # lịch là một phép nhân, đo bằng đơn vị LOGIT. Ngắn hơn |gate_init_logit|
+    # thì cổng đứng yên vì CƠ HỌC chứ không vì dữ liệu — candidate có nhánh sẽ
+    # trông y hệt candidate không nhánh, và BLEU/ROUGE không phân biệt được hai
+    # nguyên nhân ấy. Đây là ca hỏng tốn nhất của repo: vài tiếng GPU để kết
+    # luận về một phép nhân.
+    if use_branch:
+        import math as _math
+
+        _la = float(rcfg.get("gate_init_logit", -2.5))
+        _gc = dict(rcfg.get("gate") or {})
+        _beta = float(_gc.get("beta", 2.0 / 3.0))
+        _lo = float(_gc.get("stretch_lo", -0.1))
+        _hi = float(_gc.get("stretch_hi", 1.1))
+        _g_mult = float(tcfg.get("gate_lr_mult", 20.0))
+        _max_lr = float(tcfg["schedule"].get("max_lr", 2e-4))
+        # P_sống: phần mẫu KHÔNG rơi vào vùng bị kẹp. `clamp` có gradient BẰNG
+        # 0 ở đó, nên chỉ phần này đẩy được cổng. Bỏ thừa số này đi là cách
+        # đúng để tin rằng cổng đi được gấp ba quãng đường thật của nó.
+        _p_live = 1.0 / (1.0 + _math.exp(-(_la - _beta * _math.log(-_lo / _hi))))
+        _travel = steps * _max_lr * _g_mult * 0.6 * _p_live
+        _need = abs(_la)
+        _det = lambda la: min(1.0, max(
+            0.0, (1.0 / (1.0 + _math.exp(-la))) * (_hi - _lo) + _lo))
+        if _travel < _need:
+            _want = _need / max(steps * _max_lr * 0.6 * _p_live, 1e-12)
+            print(f"  ⚠ CỔNG KHÔNG ĐI NỔI: {steps} bước × max_lr {_max_lr} × "
+                  f"gate_lr_mult {_g_mult} × 0.6 × P_sống {_p_live:.3f}\n"
+                  f"    = {_travel:.2f} log_alpha, trong khi cần >= "
+                  f"|gate_init_logit| = {_need:.2f}.\n"
+                  f"    Cổng sẽ đứng yên vì AdamW + phép kẹp của Hard-Concrete "
+                  f"chứ không vì dữ liệu, và candidate\n"
+                  f"    này sẽ trông y hệt candidate không nhánh. Nâng "
+                  f"train.gate_lr_mult lên >= {_want:.0f}, hoặc nâng "
+                  f"recombiner.gate_init_logit\n    (ít âm hơn -> nhiều mẫu "
+                  f"sống hơn, nhưng cổng lúc sinh thôi bằng 0 ở bước 0 nếu "
+                  f"> -2.303).", flush=True)
+        else:
+            print(f"  cổng Hard-Concrete: {steps} bước cho {_travel:.2f} "
+                  f"log_alpha (P_sống {_p_live:.3f})\n"
+                  f"    -> đi được từ z = {_det(_la):.3f} tới z = "
+                  f"{_det(_la + _travel):.3f} NẾU dữ liệu muốn", flush=True)
     if pre_src:
         base_lr = float(tcfg["schedule"].get("max_lr", 2e-4))
         pm = float(tcfg.get("pretrained_lr_mult", 0.1))
@@ -824,7 +880,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if branch is not None:
         branch.train()
     log_every = max(1, int(tcfg.get("logging_steps", 10)))
-    total_loss = step_ce = step_asl = step_aux = 0.0
+    total_loss = step_ce = step_asl = step_aux = step_l0 = 0.0
     first_loss = None
     last_cls: dict = {}
     for step in range(steps):
@@ -838,6 +894,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             ce, asl, route_out, cls_m = _forward_loss(
                 model, gemma, branch, batch, img_tok, tt_value, router, route_ctx)
             loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
+            if l0_lambda > 0.0 and branch is not None:
+                l0 = branch.gate_l0() / max(branch.n_query, 1)
+                loss = loss + l0_lambda * l0.to(ce.dtype)
+                step_l0 += float(l0.detach()) / accum
             if route_out is not None:
                 loss = loss + aux_now * route_out["aux"].to(ce.dtype)
                 step_aux += float(route_out["aux"].detach()) / accum
@@ -859,7 +919,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         opt.step()
         sched.step()
 
-        total_loss = step_ce + lam_now * step_asl + aux_now * step_aux
+        total_loss = (step_ce + lam_now * step_asl + aux_now * step_aux
+                      + l0_lambda * step_l0)
         if first_loss is None:
             # Loss ở bước ĐẦU TIÊN, để báo cáo có mốc so với loss cuối. Không có
             # nó thì "loss 2.41" không nói được gì: 2.41 là đã học được nhiều hay
@@ -875,6 +936,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             print(f"    [{aid}] bước {step+1}/{steps} · loss {total_loss:.4f} "
                   f"(ce {step_ce:.4f}" +
                   (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · gate {gate:+.4f}"
+                   + (f" · L0 {step_l0*branch.n_query:.1f}/{branch.n_query}"
+                      if l0_lambda > 0.0 and branch is not None else "")
                    if use_branch else "") +
                   (f" · aux {step_aux:.3f} · α {aux_now:.4f} · tải "
                    f"[{rsum.get('load_min', 0):.2f}..{rsum.get('load_max', 0):.2f}]"
@@ -885,6 +948,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 tracker.log({
                     f"train/{aid}/loss": total_loss, f"train/{aid}/ce": step_ce,
                     f"train/{aid}/asl": step_asl, f"train/{aid}/lambda": lam_now,
+                    **({f"train/{aid}/l0_open": step_l0 * branch.n_query}
+                       if l0_lambda > 0.0 and branch is not None else {}),
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
                     **({f"train/{aid}/gate": gate} if branch is not None else {}),
@@ -967,6 +1032,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         # `report_recomb._gate` đã chờ sẵn một dict.
         "gate_final": (branch.gate_stats() if branch is not None else None),
         "gate_lr_mult": float(tcfg.get("gate_lr_mult", 20.0)),
+        "l0_lambda": l0_lambda,
         "n_labels": n_labels if use_branch else 0,
         "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,
         "train_loss_first": first_loss,

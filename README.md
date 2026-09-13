@@ -90,17 +90,26 @@ bộ** công thức đã dựng xong:
 A  qlora_r4          LoRA r=4 gắn vào decoder. KHÔNG nhánh, KHÔNG Experts,
                      KHÔNG pretrain -> ĐỒNG NHẤT candidate A của §2.3
 B  recomb_pre_k6e10  A + Recombinator + QFormer + ClsHead + Experts K=6·E=10
-                     + nhánh khởi tạo từ sup_pretrain, train theo chế độ 2 của §3
+                     + nhánh NẠP TỪ CHECKPOINT §3, train theo chế độ 2 của §3
 ```
+
+**§4 không tự pretrain** — nó nạp `runs/<§3>/pretrain/ckpt/best`, nên §3 phải
+chạy xong chế độ 1 trước. Đường dẫn đọc từ `configs/section3.yaml` chứ không
+viết cứng.
 
 k = 2 nên **không Friedman** — cùng `stats_ab` mà §2.3 dùng.
 
 Điểm khác §3: §4 **không được phép** có điều kiện riêng, vì bảng của nó phải đặt
 cạnh bảng §2.3/§2.4 được. Nên `src/run_section4.py` nạp
 `configs/recombiner.yaml` **trước** — đúng file hai mục kia đọc — rồi phủ
-`configs/section4.yaml` (chỉ candidate + chế độ 1 + nơi ghi) lên trên, và **DỪNG**
-nếu file §4 chạm vào bất kỳ khoá điều kiện nào. Cùng 6400 mẫu / 3000 ảnh khi đó
-là một sự thật cơ học, không phải một lời hứa.
+`configs/section4.yaml` (chỉ candidate + nguồn nhánh + nơi ghi) lên trên, và
+**DỪNG** nếu file §4 chạm vào bất kỳ khoá điều kiện nào. Cùng 6400 mẫu / 3000
+ảnh khi đó là một sự thật cơ học, không phải một lời hứa.
+
+Một khác biệt được **công bố** chứ không bị chặn: §3 pretrain nhánh trên toàn bộ
+train split, còn §4 huấn luyện decoder trên 6400. Không rò rỉ (cùng file split,
+đã qua `check_leak` của §3), nhưng nó có nghĩa §4 đo **công thức §3 như nó được
+giao** — con số thật đi vào `manifest.limitations` và vào REPORT.md.
 
 **Chi tiết: [`README_4.md`](README_4.md)**
 
@@ -167,7 +176,8 @@ bash scripts/run_section3.sh --detach             # §3 chạy thật, cả hai 
 nó phải so được với hai mục kia — và ghi vào `runs/4_headtohead/` + `adapters_4/`:
 
 ```bash
-python scripts/selftest_section4.py               # 29 phép kiểm, vài giây
+bash scripts/run_section3.sh --mode sup_pretrain  # TIÊN QUYẾT: nhánh của §4
+python scripts/selftest_section4.py               # 33 phép kiểm, vài giây
 bash scripts/run_section4.sh --dry-run            # thử đường ống (8 ảnh, 16 mẫu)
 bash scripts/run_section4.sh --detach             # §4 chạy thật, trọn gói
 ```
@@ -188,8 +198,9 @@ nó nguyên văn (k = 5). Xem [`README_2.4.md`](README_2.4.md) mục 5.
 configs/recombiner.yaml      TOÀN BỘ tham số của §2.3 + §2.4, có chú thích lý do
                              (§4 ĐI VAY khối điều kiện từ đây)
 configs/section3.yaml [§3]   §3 RIÊNG: toàn bộ trainset, siêu tham số đã chọn
-configs/section4.yaml [§4]   §4: CHỈ candidate + chế độ 1 + nơi ghi. Chạm vào một
-                             khoá điều kiện của §2.3 là DỪNG.
+configs/section4.yaml [§4]   §4: CHỈ candidate + nguồn nhánh + nơi ghi. Chạm vào
+                             một khoá điều kiện của §2.3 là DỪNG, và cả khối
+                             `pretrain:` là CHẾT (§4 nạp ckpt của §3).
 requirements.txt             môi trường chính (transformers/torch)
 requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
@@ -197,14 +208,15 @@ scripts/
   archive_2.2.sh             chuyển §2.2 sang _archive/ (chạy một lần)
   run_recomb.sh              MỘT LỆNH cho §2.3/§2.4, chọn bằng --exp
   run_section3.sh    [§3]    MỘT LỆNH cho §3, chọn chế độ bằng --mode
-  run_section4.sh    [§4]    MỘT LỆNH cho §4 (data · pretrain · train · sinh ·
-                             chấm · kiểm định · báo cáo)
+  run_section4.sh    [§4]    MỘT LỆNH cho §4 (data · train · sinh · chấm ·
+                             kiểm định · báo cáo) — KHÔNG pretrain
   selftest_recomb.py         ~100 phép kiểm (§2.3 + §2.4), không cần GPU/mạng
   selftest_friedman.py       ~30 phép kiểm cho stats_friedman (§2.4 dùng thật)
   selftest_section3.py [§3]  39 phép kiểm cho sup_pretrain + decoder_ft
-  selftest_section4.py [§4]  29 phép kiểm: hàng rào điều kiện (hai chiều), cờ
+  selftest_section4.py [§4]  33 phép kiểm: hàng rào điều kiện (hai chiều), cờ
                              candidate, cách ly moe.enabled, bất biến quãng
-                             đường cổng, k=2 không chạm Friedman
+                             đường cổng, cổng chặn checkpoint §3 (split/ảnh/
+                             base/hình dạng), k=2 không chạm Friedman
   _env.sh                    chọn python (container vs cục bộ)
 src/
   config.py                  nạp YAML, seed, token
@@ -221,8 +233,9 @@ src/
   pretrain_sup.py   [§3]     chế độ 1: 100% có giám sát, KHÔNG decoder
   pretrain_io.py    [§3]     ghi/nạp/đẩy ĐÚNG các khối đã pretrain
   run_section3.py   [§3]     điều phối 3 stage (data · train · push), 2 chế độ
-  run_section4.py   [§4]     điều phối 8 stage; gộp recombiner.yaml + section4.yaml
-                             và DỪNG nếu §4 chạm khoá điều kiện
+  run_section4.py   [§4]     điều phối 7 stage; gộp recombiner.yaml + section4.yaml,
+                             DỪNG nếu §4 chạm khoá điều kiện, và giải quyết
+                             checkpoint §3 ở GIÂY THỨ NHẤT
   runners/gemma3*.py         base trần · +adapter (§2.2) · +nhánh (§2.3) ·
                              +nhánh+Experts (§2.4)
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU

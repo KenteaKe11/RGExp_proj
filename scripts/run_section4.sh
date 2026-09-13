@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# run_section4.sh — §4: QLoRA r4 THUẦN  vs  Recombinator(pretrain)·K=6·E=10.
+# run_section4.sh — §4: QLoRA r4 THUẦN  vs  Recombinator(pretrain §3)·K=6·E=10.
 #
 #     bash scripts/run_section4.sh                      # trọn gói
 #     bash scripts/run_section4.sh --detach             # chạy NỀN
 #     bash scripts/run_section4.sh --dry-run            # thử đường ống
-#     bash scripts/run_section4.sh --stages data,pretrain
 #     bash scripts/run_section4.sh --stages stats,report
 #     bash scripts/run_section4.sh --init-from hub:OWNER/NAME/best
 #     bash scripts/run_section4.sh --init-from none     # đối chứng from-scratch
+#
+# ĐIỀU KIỆN TIÊN QUYẾT: §3 đã chạy xong chế độ 1.
+#     bash scripts/run_section3.sh --mode sup_pretrain
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_section4`.
 #
@@ -18,31 +20,51 @@
 #                        -> ĐỒNG NHẤT với candidate A của §2.3.
 #
 #   B  recomb_pre_k6e10  A + Recombinator + QFormer(2 vector) + ClsHead (ASL)
-#                        + Experts K=6·E=10, nhánh khởi tạo từ chế độ 1
-#                        (sup_pretrain) và huấn luyện theo chế độ 2 của §3:
-#                        lr của riêng nhánh ×0.1, λ-warmup TẮT.
+#                        + Experts K=6·E=10, nhánh NẠP TỪ CHECKPOINT §3 và
+#                        huấn luyện theo chế độ 2 của §3: lr của riêng nhánh
+#                        ×0.1, λ-warmup TẮT.
 #
 # ── Hai file cấu hình, và đó là điểm chính ──────────────────────────────────
 # §4 phải so được với §2.3/§2.4, nên nó KHÔNG được có điều kiện riêng. Điểm vào
 # nạp `configs/recombiner.yaml` TRƯỚC — đúng file §2.3/§2.4 đọc, nên 6400 mẫu
 # train / 3000 ảnh test / base / lịch / batch / seed / metric / tham số kiểm
 # định là CÙNG MỘT NGUỒN, không phải hai bản sao phải nhớ đồng bộ — rồi phủ
-# `configs/section4.yaml` (chỉ candidate + chế độ 1 + nơi ghi) lên trên.
+# `configs/section4.yaml` (chỉ candidate + nguồn nhánh + nơi ghi) lên trên.
 #
 # Chạm vào một khoá đã khoá trong section4.yaml là DỪNG, mã thoát 2.
 #
-# ── Ba stage đầu ────────────────────────────────────────────────────────────
-#   data      3000 ảnh test + 6400 mẫu train, qua hàng rào rò rỉ
-#   pretrain  chế độ 1 cho candidate B: ASL(ClsHead(QFormer_sup(Recombinator))),
-#             KHÔNG decoder. Chạy trên CHÍNH `train_df` của §4 — cùng một bảng
-#             mà chế độ 2 và candidate A dùng, không phải "cùng con số 6400".
-#             Ckpt ghi sau MỖI epoch; chạy lại chính lệnh này là ĐI TIẾP.
-#   train     candidate B TRƯỚC (dễ hỏng nhất: có nhánh, E lớn nhất repo, và
-#             đứng trên một checkpoint), rồi candidate A.
+# ── §4 KHÔNG CÓ PHASE PRETRAIN ──────────────────────────────────────────────
+# Nhánh của candidate B đến từ `runs/<§3>/pretrain/ckpt/best` — thư mục mà
+# `run_section3` ghi ra. Đường dẫn KHÔNG viết cứng: điểm vào đọc
+# `configs/section3.yaml` để dựng nó.
+#
+# Nguồn được giải quyết ở GIÂY THỨ NHẤT, trước cả stage `data`: phát hiện "chưa
+# chạy §3" sau khi đã tải và resize 3000 + 6400 ảnh là trả xong tiền rồi mới
+# biết. Bốn cổng chặn tại đó, tất cả đều là ca "hình dạng vẫn khớp, điểm vẫn ra
+# số": cùng base · cùng hình dạng nhánh · cùng đường ảnh (image_max_side,
+# pan&scan) · CÙNG FILE SPLIT.
+#
+# Cổng thứ tư là hàng rào rò rỉ: bảo đảm "không ảnh test nào lọt vào nhánh" đến
+# từ check_leak mà §3 chạy TRÊN FILE SPLIT CỦA NÓ — nó không chuyển sang một
+# file khác được.
 #
 # Thiếu checkpoint mà không gõ gì là DỪNG, KHÔNG im lặng chạy from-scratch: một
 # cột mang nhãn "đã pretrain" dựng từ một nhánh ngẫu nhiên là thứ không ai phát
 # hiện được về sau. Muốn from-scratch thì NÓI RA: --init-from none.
+#
+# ── Một khác biệt được CÔNG BỐ, không bị chặn ───────────────────────────────
+# §3 pretrain nhánh trên TOÀN BỘ train split; §4 huấn luyện decoder trên 6400
+# mẫu. Không rò rỉ (cùng split, đã qua check_leak của §3 với toàn bộ key test),
+# nhưng nó đổi PHẠM VI câu trả lời: §4 đo CÔNG THỨC §3 NHƯ NÓ ĐƯỢC GIAO, không
+# đo kiến trúc dưới điều kiện dữ liệu khớp nhau.
+#
+# Con số thật đọc từ META được in ra và ghi vào `manifest.limitations`.
+# `allow_pretrain_data_mismatch: false` trong section4.yaml biến nó thành DỪNG.
+#
+# ── Hai stage đầu ───────────────────────────────────────────────────────────
+#   data      3000 ảnh test + 6400 mẫu train, qua hàng rào rò rỉ
+#   train     candidate B TRƯỚC (dễ hỏng nhất: có nhánh, E lớn nhất repo, và
+#             đứng trên một checkpoint), rồi candidate A.
 #
 # ── Kiểm định ───────────────────────────────────────────────────────────────
 # k = 2, nên KHÔNG Friedman: "kiểm định tổng thể" và "kiểm định cặp" là cùng một
@@ -53,7 +75,6 @@
 # bootstrap gần như chắc chắn bác H0. Đọc cột `verdict`, không đọc cột p.
 #
 # ── Đầu ra ──────────────────────────────────────────────────────────────────
-#     runs/4_headtohead/pretrain/ckpt/{epoch_NNN,best}/   nhánh đã pretrain
 #     runs/4_headtohead/predictions/*.jsonl
 #     runs/4_headtohead/metrics/per_sample_*.csv · ab_tests.csv · summary.csv
 #     runs/4_headtohead/REPORT.md · manifest.json
@@ -122,9 +143,9 @@ mkdir -p logs
 LOG="${RGEXP_LOG:-logs/section4_$(date +%Y%m%d_%H%M%S).log}"
 
 # ── 2. Chế độ nền ───────────────────────────────────────────────────────────
-# §4 chạy chế độ 1 (8 epoch) + HAI lượt huấn luyện + hai lượt sinh trên 3000
-# ảnh + BERTScore. Đây là lần chạy dài thứ hai của repo sau §3, nên `--detach`
-# là cách dùng bình thường chứ không phải tiện nghi.
+# §4 chạy HAI lượt huấn luyện + hai lượt sinh trên 3000 ảnh + BERTScore. Nó
+# KHÔNG chạy pretrain (nhánh đến từ §3), nên nó ngắn hơn §3 đáng kể — nhưng vẫn
+# đủ dài để `--detach` là cách dùng bình thường chứ không phải tiện nghi.
 if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
     if command -v setsid >/dev/null 2>&1; then
         RGEXP_DETACHED=1 RGEXP_LOG="$LOG" setsid nohup \
@@ -139,8 +160,8 @@ if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
     echo "▶ §4 chạy nền (pid $!)"
     echo "  log      : $LOG"
     echo "  theo dõi : tail -f $LOG   ·   hoặc W&B (link in ra trong log)"
-    echo "  bị đứt   : chạy lại chính lệnh này — chế độ 1 đi tiếp từ epoch cuối,"
-    echo "             candidate đã có adapter thì bỏ qua, điểm đã chấm thì dùng lại."
+    echo "  bị đứt   : chạy lại chính lệnh này — candidate đã có adapter thì bỏ"
+    echo "             qua, điểm đã chấm thì dùng lại."
     exit 0
 fi
 

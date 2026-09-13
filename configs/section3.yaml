@@ -215,7 +215,27 @@ recombiner:
 
   token_type: text
   dtype: null
-  gate_init: 0.0
+
+  # Cổng vào decoder: HARD-CONCRETE theo chiều TOKEN, (n_query,) = 32. Tham số
+  # là `log_alpha`; cổng đạt ĐÚNG 0 và ĐÚNG 1 nhờ phép kẹp một khoảng nới rộng
+  # hơn [0, 1]. Chi tiết + lý lẽ: configs/recombiner.yaml, khối `recombiner`.
+  #
+  # Chế độ 1 KHÔNG chạm cổng (nó không nhận gradient nào khi decoder không
+  # chạy, và nó không nằm trong file checkpoint — xem README_3.md muc 3.3), nên
+  # khoá này chỉ có tác dụng ở chế độ 2. Nhưng nó phải khai ở đây vì cùng một
+  # `rcfg` dựng nhánh cho CẢ HAI chế độ.
+  #
+  # -2.5: cổng lúc SINH đúng bằng 0 ở bước 0, và 28.9% mẫu sống nên gradient CE
+  # có đường tới cổng. Ba con số này đi THEO BỘ với train.gate_lr_mult — sửa
+  # một cái mà quên cái kia thì train_recomb DỪNG lúc chạy.
+  #
+  # Khoá đời trước `gate_init` mang giá trị CỔNG chứ không phải log_alpha.
+  # src/recombiner.py DỪNG nếu thấy khoá cũ.
+  gate:
+    beta: 0.6666666666666666
+    stretch_lo: -0.1
+    stretch_hi: 1.1
+  gate_init_logit: -2.5
 
 # ── SUP LOSS ───────────────────────────────────────────────────────────────
 classifier:
@@ -244,6 +264,12 @@ classifier:
   # nó xảy ra.
   lambda_warmup_pct: 0.1               # dùng khi chạy chế độ 2 KHÔNG có pretrain
   lambda_warmup_pct_pretrained: 0.0    # dùng khi có pretrain — mặc định TẮT
+
+  # Phạt L0 trên cổng Hard-Concrete: loss += l0_lambda × (cổng mở KỲ VỌNG / n_query).
+  # Nhỏ có chủ ý — phạt L0 đẩy cổng ĐÓNG, đúng chiều với ca hỏng mà gate_lr_mult
+  # tồn tại để tránh. Con số phải đọc là `l0_expected` trong train_stats.json.
+  # Xem configs/recombiner.yaml, khối `classifier`.
+  l0_lambda: 0.01
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CHẾ ĐỘ 2 — decoder_ft
@@ -276,7 +302,16 @@ train:
   #
   # Lưu ý: `gate` KHÔNG được pretrain ở chế độ 1 (decoder không chạy nên nó
   # không nhận gradient), nên lập luận này còn nguyên vẹn ở §3.
-  gate_lr_mult: 20.0
+  # 20.0 là giá trị của cổng ĐỜI TRƯỚC (scale thô theo kênh). Cổng nay là
+  # Hard-Concrete, và quãng đường có thêm một thừa số P_sống ~0.29 vì `clamp`
+  # không truyền gradient ở vùng bị kẹp. §3 chạy TOÀN BỘ split (~1310 bước) nên
+  # nó rộng rãi hơn §2.3/§4 (200 bước) — nhưng 20 vẫn cho quãng đường ~1.4,
+  # dưới |gate_init_logit| = 2.5. 60 cho ~4.1.
+  #
+  # `n_train: 0` nghĩa là số bước chỉ biết được LÚC CHẠY, nên bất biến ở đây
+  # KHÔNG kiểm được từ config — `train_recomb` kiểm lại sau khi train_df đã có
+  # và DỪNG/cảnh báo tại đó.
+  gate_lr_mult: 60.0
 
   # ── LR CỦA NHÁNH ĐÃ PRETRAIN ─────────────────────────────────────────────
   # Cùng tính chất AdamW ở trên, dùng NGƯỢC chiều. Sau chế độ 1, Recombinator +

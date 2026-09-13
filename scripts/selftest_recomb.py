@@ -25,6 +25,7 @@ Không kiểm chất lượng model. Kiểm rằng những gì repo TUYÊN BỐ 
 """
 from __future__ import annotations
 
+import math
 import sys
 import traceback
 from pathlib import Path
@@ -487,9 +488,11 @@ def branch_tests() -> None:
     check("nhánh: đóng băng `aux` sống sót qua .to()", t_freeze_survives_to)
 
     # ── cổng vào decoder ────────────────────────────────────────────────────
-    def _branch(n_labels=L_LAB, gate_init_logit=-4.0, route=False, n_experts=4):
+    def _branch(n_labels=L_LAB, gate_init_logit=-2.5, route=False, n_experts=4,
+                gate=None):
         rcfg = {"swiglu_hidden": 32, "n_query": N_Q, "n_heads": 4,
                 "n_vis": N_VIS, "gate_init_logit": gate_init_logit,
+                "gate": gate if gate is not None else {},
                 "n_experts": n_experts, "route_enabled": route,
                 "qformer": {"tasks": ["sup", "aux"],
                             "freeze": [] if route else ["aux"],
@@ -509,19 +512,74 @@ def branch_tests() -> None:
     check("nhánh: cổng có hình dạng (n_query,) — theo token, không theo kênh",
           t_gate_shape)
 
-    def t_gate_is_sigmoid():
+    def t_gate_reaches_both_ends():
+        """Cả lý do đổi sang Hard-Concrete nằm ở phép kiểm này.
+
+        `sigmoid(x)` không bao giờ chạm 0 hay 1: một token có cổng 0.3 vẫn đi
+        qua với 30% biên độ — nó bị LÀM NHỎ, không bị CHẶN. Hard-Concrete kẹp
+        một khoảng nới rộng hơn [0,1] về [0,1], nên hai đầu có xác suất DƯƠNG
+        và token bị đóng THẬT.
+        """
         b = _branch(gate_init_logit=0.0)
-        g = b.gate_value()
-        eq(float(g.mean()), 0.5, 1e-6,
-           "logit 0 -> cổng phải bằng sigmoid(0) = 0.5")
-        b.gate.data.fill_(50.0)
-        true(float(b.gate_value().max()) <= 1.0,
-             "cổng phải bị CHẶN TRÊN bởi 1: một vector scale tự do chạy được "
-             "tới ±5, và khi đó 'cổng' hết là cổng — nó thành một lớp scale nữa")
-        b.gate.data.fill_(-50.0)
-        true(float(b.gate_value().min()) >= 0.0,
-             "cổng phải bị chặn dưới bởi 0")
-    check("nhánh: cổng là sigmoid, chặn trong (0, 1)", t_gate_is_sigmoid)
+        b.train()
+        s = torch.stack([b.gate_value() for _ in range(2000)])
+        true(float((s <= 0.0).float().mean()) > 0.01,
+             "z = 0 phải là một biến cố THẬT (xác suất dương). Nếu không thì "
+             "cổng chỉ đang làm nhỏ token chứ không chặn nó, và "
+             "`gate_closed_tokens` là một ngưỡng đọc chứ không phải một phép đếm.")
+        true(float((s >= 1.0).float().mean()) > 0.01,
+             "z = 1 phải là một biến cố THẬT — token đi qua TRỌN VẸN")
+        true(float(s.min()) >= 0.0 and float(s.max()) <= 1.0,
+             "cổng phải nằm trong [0, 1]: một vector scale tự do chạy tới ±5, "
+             "và khi đó 'cổng' hết là cổng — nó thành một lớp scale nữa")
+    check("nhánh: cổng Hard-Concrete ĐẠT ĐƯỢC đúng 0 và đúng 1",
+          t_gate_reaches_both_ends)
+
+    def t_gate_stretch_must_straddle():
+        try:
+            _branch(gate={"stretch_lo": 0.0, "stretch_hi": 1.0})
+        except ValueError:
+            return
+        raise AssertionError(
+            "khoảng nới (0, 1) phải DỪNG: nó không trùm ra ngoài [0,1] nên "
+            "phép kẹp không cắt gì, và cổng thoái hoá về sigmoid — vẫn chạy, "
+            "vẫn ra số, và không token nào bị chặn thật")
+    check("nhánh: khoảng nới phải TRÙM ra ngoài [0, 1]",
+          t_gate_stretch_must_straddle)
+
+    def t_gate_eval_deterministic():
+        """Lượt SINH phải xác định, và phải rẽ nhánh bằng `self.training`.
+
+        Một cờ thứ hai ở đây là một cờ ai đó quên bật: khi đó mỗi lần sinh lại
+        cho một cổng khác, và hai lần chấm cùng một model ra hai bảng điểm.
+        """
+        b = _branch()
+        b.eval()
+        a1 = b.gate_value().detach().clone()
+        a2 = b.gate_value().detach().clone()
+        true(bool(torch.equal(a1, a2)),
+             "ở eval, hai lần gọi phải cho ĐÚNG cùng một cổng")
+        b.train()
+        s = torch.stack([b.gate_value() for _ in range(200)])
+        true(float(s.std(0).sum()) > 0.0,
+             "ở train, cổng phải NGẪU NHIÊN — reparameterization là đường duy "
+             "nhất gradient đi từ CE tới log_alpha")
+    check("nhánh: cổng xác định lúc eval, ngẫu nhiên lúc train",
+          t_gate_eval_deterministic)
+
+    def t_gate_l0_matches_sampling():
+        """Dạng đóng phải KHỚP tần suất lấy mẫu — nếu không thì loss đang phạt
+        một đại lượng khác đại lượng mà cổng thật sự có."""
+        b = _branch(gate_init_logit=-1.0)
+        b.train()
+        s = torch.stack([b.gate_value() for _ in range(4000)])
+        emp = float((s > 0.0).float().mean())
+        closed_form = float(b.gate_l0().detach()) / N_Q
+        true(abs(emp - closed_form) < 0.03,
+             f"P(z != 0) đo được {emp:.3f} vs dạng đóng {closed_form:.3f} — "
+             f"`gate_l0()` phải là chính xác suất ấy, vì nó là thứ cộng vào loss")
+    check("nhánh: gate_l0() dạng đóng khớp tần suất lấy mẫu",
+          t_gate_l0_matches_sampling)
 
     def t_gate_per_token():
         """Ca hỏng: cổng phát tán nhầm trục -> nó mở theo kênh chứ không theo
@@ -541,37 +599,54 @@ def branch_tests() -> None:
     check("nhánh: cổng chặn/mở TỪNG TOKEN trọn vẹn (phát tán đúng trục)",
           t_gate_per_token)
 
-    def t_gate_init_not_zero():
+    def t_gate_init_closed_at_inference():
+        """Ở bước 0, cổng LÚC SINH phải ĐÚNG BẰNG 0.
+
+        Đây là thứ cổng sigmoid không nói được: nó chỉ nói được "cộng 32 token
+        ở 1.8% biên độ". Với Hard-Concrete và log_alpha <= -2.303, phép kẹp cắt
+        hẳn — nên "đầu vào decoder của B ở bước 0 = của A cộng 32 token 0" là
+        một phát biểu THẬT, không phải một phép xấp xỉ.
+        """
         b = _branch()
+        b.eval()
         tokens, logits, _route = b(torch.randn(2, N_VIS, D_VIS))
-        true(float(tokens.abs().max()) > 0.0,
-             "cổng sigmoid KHÔNG đạt 0: ở bước 0, đầu vào decoder của B = của A "
-             "CỘNG 32 token đã nén còn ~1.8% biên độ. Đây là phát biểu YẾU HƠN "
-             "'cộng 32 token 0', và nó phải đúng trong code chứ không chỉ trong "
-             "README.")
-        g = b.gate_value()
-        eq(float(g.max()), 0.017986, 1e-5,
-           "gate_init_logit = -4 -> cổng phải bắt đầu ở sigmoid(-4) = 0.01799")
+        eq(float(tokens.abs().max()), 0.0, 1e-12,
+           "cổng lúc SINH ở bước 0 phải đóng HẲN -> token vào decoder = 0:")
         true(logits is not None and float(logits.abs().sum()) > 0,
              "logit phân loại KHÔNG được bằng 0: nhánh có giám sát lấy tín hiệu "
              "TRƯỚC cổng, nên ASL phải có gradient đầy đủ từ bước đầu tiên")
-    check("nhánh: cổng gần đóng (0.018) chặn phần lớn đường vào decoder "
-          "nhưng KHÔNG chặn ASL", t_gate_init_not_zero)
+        b.train()
+        s = torch.stack([b.gate_value() for _ in range(2000)])
+        true(float((s > 0.0).float().mean()) > 0.05,
+             "nhưng lúc HUẤN LUYỆN phải có đủ mẫu SỐNG: `clamp` có gradient "
+             "bằng 0 ở vùng bị kẹp, nên cổng khởi tạo quá âm sẽ ĐỨNG YÊN vì cơ "
+             "học — và candidate B khi đó trông y hệt candidate A")
+    check("nhánh: cổng ĐÓNG HẲN lúc sinh ở bước 0, vẫn có mẫu sống lúc train",
+          t_gate_init_closed_at_inference)
 
     def t_gate_stats():
         b = _branch()
+        b.train()                      # đọc stats phải TỰ chuyển sang eval
         with torch.no_grad():
             b.gate.data = torch.tensor(
                 [20.0 if i < 3 else -20.0 for i in range(N_Q)])
         s = b.gate_stats()
-        eq(int(s["gate_open_tokens"]), 3, 0,
-           "gate_open_tokens phải ĐẾM số token có cổng >= 0.5, không phải đặt "
-           "một ngưỡng lên trung bình")
+        eq(int(s["gate_saturated_tokens"]), 3, 0,
+           "3 token có log_alpha +20 phải mở TRỌN VẸN (z = 1):")
+        eq(int(s["gate_closed_tokens"]), N_Q - 3, 0,
+           "phần còn lại phải ĐÓNG HẲN (z = 0) — đây là một phép ĐẾM những "
+           "token thật sự bị tắt lúc sinh, không phải một ngưỡng đọc:")
         eq(int(s["n_query"]), N_Q, 0, "gate_stats phải ghi n_query")
+        true(b.training,
+             "gate_stats phải KHÔI PHỤC lại chế độ train — để nó ở eval nghĩa "
+             "là mọi bước sau đó dùng cổng xác định, và gradient thôi đi qua "
+             "reparameterization mà không có gì báo")
         for k in ("gate_mean", "gate_max", "gate_min", "gate_init",
-                  "gate_init_logit", "gate_per_token"):
+                  "gate_init_logit", "gate_per_token", "l0_expected",
+                  "l0_frac", "gate_kind", "gate_open_tokens"):
             true(k in s, f"gate_stats thiếu khoá {k!r} — report_recomb._gate đọc nó")
-    check("nhánh: gate_stats đếm token mở, không trung bình hoá", t_gate_stats)
+    check("nhánh: gate_stats đếm token ĐÓNG HẲN / MỞ TRỌN, không trung bình hoá",
+          t_gate_stats)
 
     def t_gate_init_legacy_key_refused():
         """Khoá cũ mang giá trị CỔNG, khoá mới mang LOGIT. Cùng số 0.0 nghĩa là
@@ -596,13 +671,31 @@ def branch_tests() -> None:
     check("nhánh: khoá `gate_init` đời trước -> DỪNG", t_gate_init_legacy_key_refused)
 
     def t_gate_grad():
+        """Gradient tới cổng đi theo HAI đường, và cả hai phải thông.
+
+        1. qua reparameterization (từ CE) — chỉ những lần lấy mẫu rơi NGOÀI
+           vùng kẹp mới truyền, nên phép kiểm lặp vài lượt;
+        2. qua phạt L0 dạng đóng — luôn thông, không phụ thuộc lấy mẫu.
+        """
         b = _branch()
-        tokens, _, _ = b(torch.randn(2, N_VIS, D_VIS))
-        tokens.sum().backward()
-        true(b.gate.grad is not None and float(b.gate.grad.abs().sum()) > 0,
-             "cổng phải nhận gradient — nếu không thì nó vĩnh viễn bằng 0 và "
-             "candidate B đúng bằng candidate A")
-    check("nhánh: cổng nhận gradient (được PHÉP mở)", t_gate_grad)
+        b.train()
+        ok = False
+        for _ in range(20):
+            b.zero_grad()
+            tokens, _, _ = b(torch.randn(2, N_VIS, D_VIS))
+            tokens.sum().backward()
+            if b.gate.grad is not None and float(b.gate.grad.abs().sum()) > 0:
+                ok = True
+                break
+        true(ok, "cổng phải nhận gradient qua reparameterization — nếu không "
+                 "thì nó vĩnh viễn đóng và candidate B đúng bằng candidate A")
+        b2 = _branch()
+        b2.gate_l0().backward()
+        true(b2.gate.grad is not None and float(b2.gate.grad.abs().sum()) > 0,
+             "phạt L0 phải có gradient tới cổng — đó là đường DUY NHẤT không "
+             "phụ thuộc vào việc lấy mẫu có rơi ngoài vùng kẹp hay không")
+    check("nhánh: cổng nhận gradient qua CẢ HAI đường (được PHÉP mở)",
+          t_gate_grad)
 
     def t_route_gate_inert():
         b = _branch()
@@ -1369,10 +1462,22 @@ def config_tests() -> None:
         true("gate_init_logit" in r,
              "config phải khai `recombiner.gate_init_logit` — không có mặc định "
              "ngầm cho thứ quyết định đầu vào decoder ở bước 0")
-        true(float(r["gate_init_logit"]) < 0.0,
-             "gate_init_logit phải ÂM: cổng khởi tạo phải gần ĐÓNG, nếu không "
-             "thì ở bước 0 decoder đóng băng nhận 32 vector ngẫu nhiên ở biên độ "
-             "lớn và LoRA tiêu vài chục bước đầu chỉ để học cách phớt lờ chúng")
+        g = dict(r.get("gate") or {})
+        true(float(g.get("stretch_lo", -0.1)) < 0.0 < 1.0
+             < float(g.get("stretch_hi", 1.1)),
+             "recombiner.gate.stretch phải TRÙM ra ngoài [0,1] — đó là toàn bộ "
+             "cơ chế cho cổng đạt đúng 0 và đúng 1")
+        la = float(r["gate_init_logit"])
+        true(la < 0.0,
+             "gate_init_logit phải ÂM: cổng khởi tạo phải ĐÓNG, nếu không thì ở "
+             "bước 0 decoder đóng băng nhận 32 vector ngẫu nhiên ở biên độ lớn "
+             "và LoRA tiêu vài chục bước đầu chỉ để học cách phớt lờ chúng")
+        lo, hi = float(g.get("stretch_lo", -0.1)), float(g.get("stretch_hi", 1.1))
+        det0 = min(1.0, max(0.0, (1 / (1 + math.exp(-la))) * (hi - lo) + lo))
+        eq(det0, 0.0, 1e-12,
+           "cổng LÚC SINH ở bước 0 phải ĐÚNG BẰNG 0 — đó là tính chất mà "
+           "Hard-Concrete mua được và sigmoid không: 'đầu vào decoder của B = "
+           "của A cộng 32 token 0' phải là một phát biểu THẬT. Nhận:")
         q = r["qformer"]
         eq(len(q["tasks"]), 2, 0, "sơ đồ có QFormer 2 vector")
         true(list(q["freeze"]) == ["aux"],

@@ -3,8 +3,9 @@
 
 Chạy:  python scripts/selftest_section4.py        (thêm -v để xem traceback)
 
-§4 so QLoRA r4 THUẦN với Recombinator(pretrain) + K=6·E=10 + QFormer + Cls, trên
-CÙNG 6400 mẫu / 3000 ảnh của §2.3, bằng kiểm định ghép cặp k = 2.
+§4 so QLoRA r4 THUẦN với Recombinator + K=6·E=10 + QFormer + Cls, trên CÙNG
+6400 mẫu / 3000 ảnh của §2.3, bằng kiểm định ghép cặp k = 2. §4 KHÔNG chạy
+pretrain — nhánh của candidate B nạp từ checkpoint mà §3 đã ghi ra.
 
 Cái nó bảo vệ là NĂM ca hỏng cho ra một bảng TRÔNG HOÀN TOÀN BÌNH THƯỜNG:
 
@@ -16,9 +17,16 @@ Cái nó bảo vệ là NĂM ca hỏng cho ra một bảng TRÔNG HOÀN TOÀN B�
      tại và code im lặng chạy from-scratch. Cột vẫn mang nhãn "đã pretrain",
      đường loss vẫn giảm bình thường, và không ai phát hiện được về sau.
 
-  3. Checkpoint pretrain đến từ một TẬP KHÁC. `runs/sup_pretrain/` (toàn bộ
-     split, ~42k ảnh) nạp vào §4 khớp mọi hình dạng. Bảng khi đó nói "cùng 6400
-     mẫu" trong khi candidate B đã thấy gấp bảy lần.
+  3. Checkpoint đến từ một SPLIT khác. §4 nạp nhánh của §3, và bảo đảm "không
+     ảnh test nào lọt vào nhánh" đến từ hàng rào check_leak mà §3 chạy TRÊN
+     FILE SPLIT CỦA NÓ — nó không chuyển sang một file khác được. Triệu chứng
+     của rò rỉ là "kết quả tốt bất ngờ": ca hỏng duy nhất người ta có xu hướng
+     KHÔNG đi kiểm tra.
+
+     Còn số MẪU khác nhau (§3 pretrain toàn split, §4 train 6400) thì KHÔNG bị
+     chặn — nó là một thành phần đã pretrain, cùng nghĩa với vision tower đóng
+     băng. Nhưng nó phải được CÔNG BỐ, và phép kiểm ở đây đòi cơ chế công bố ấy
+     tồn tại trong mã nguồn.
 
   4. Cổng không đi nổi. `gate_lr_mult` quá nhỏ so với `|gate_init_logit|` thì
      cổng đứng yên vì AdamW chứ không vì dữ liệu, candidate B trông y hệt
@@ -35,6 +43,7 @@ Cộng thêm: ranh giới file theo CẢ HAI chiều (§4 không ghi vào thư m
 """
 from __future__ import annotations
 
+import math
 import re
 import sys
 import traceback
@@ -120,16 +129,31 @@ def config_boundary_tests() -> None:
                f"phải điều kiện thí nghiệm và phải được phép khai:")
     check("§4: ba khoá của chế độ 2 vẫn khai được", t_exempt_allowed)
 
-    def t_pretrain_n_train_inert():
-        true(s4.violations({"pretrain": {"n_train": 6400}}),
-             "`pretrain.n_train` phải bị BẮT: §4 không đọc nó (chế độ 1 nhận "
-             "thẳng train_df), nên khai nó là dựng một khoá trông như điều "
-             "khiển được tập pretrain mà không điều khiển gì")
-        r = _raw(S4_YAML)
-        true("n_train" not in (r.get("pretrain") or {}),
-             "section4.yaml còn khai `pretrain.n_train`")
-    check("§4: `pretrain.n_train` là khoá CHẾT, và config không khai nó",
-          t_pretrain_n_train_inert)
+    def t_pretrain_block_inert():
+        for k in ("n_train", "n_epochs", "subdir", "hub_repo", "select_metric"):
+            true(s4.violations({"pretrain": {k: 1}}),
+                 f"`pretrain.{k}` phải bị BẮT: §4 KHÔNG có phase pretrain, nên "
+                 f"cả khối là chết. Khai nó là dựng một khoá trông như điều "
+                 f"khiển được một phase không tồn tại — và ca hỏng là ai đó "
+                 f"chỉnh nó rồi tin rằng §4 vừa học lại nhánh trên 6400 mẫu, "
+                 f"trong khi nó nạp nguyên checkpoint toàn-split của §3.")
+        true("pretrain" not in _raw(S4_YAML),
+             "section4.yaml còn khối `pretrain:`")
+    check("§4: CẢ KHỐI `pretrain:` là chết, và config không khai nó",
+          t_pretrain_block_inert)
+
+    def t_no_pretrain_stage():
+        true("pretrain" not in s4.STAGES,
+             f"§4 không được có stage `pretrain` (STAGES = {s4.STAGES}). Một "
+             f"stage mang tên `pretrain` mà không pretrain gì là chỗ tệ nhất để "
+             f"đặt một lời nói dối: người đọc log sẽ tin rằng §4 vừa học lại "
+             f"nhánh.")
+        src = (ROOT / "src" / "run_section4.py").read_text(encoding="utf-8")
+        true("pretrain_sup" not in src,
+             "run_section4.py còn import/gọi `pretrain_sup` — §4 NẠP nhánh, "
+             "không huấn luyện nó")
+    check("§4: KHÔNG có stage pretrain, KHÔNG gọi pretrain_sup",
+          t_no_pretrain_stage)
 
     def t_borrowed_values():
         """Điều kiện thật sự đi vay đúng con số, không phải chỉ 'không khai'."""
@@ -289,15 +313,31 @@ def gate_tests() -> None:
 
     AdamW CHUẨN HOÁ bước cập nhật — mỗi bước nó dịch một tham số đi khoảng `lr`,
     bất kể gradient lớn hay nhỏ. Nên quãng đường cổng đi được trong cả lịch là
-    một phép nhân đọc thẳng từ config, và nó đo bằng đơn vị LOGIT:
+    một phép nhân đọc thẳng từ config, đo bằng đơn vị LOG_ALPHA:
 
-        steps × max_lr × gate_lr_mult × ~0.6      (0.6 = trung bình one-cycle)
+        steps × max_lr × gate_lr_mult × ~0.6 × P_sống
 
-    Nếu quãng đường < |gate_init_logit| thì cổng đứng yên vì CƠ HỌC chứ không vì
-    dữ liệu, candidate B trông y hệt candidate A, và bảng BLEU/ROUGE không phân
-    biệt được hai nguyên nhân ấy.
+    Thừa số cuối là thứ cổng sigmoid KHÔNG có, và bỏ quên nó là cách đúng để
+    tin rằng cổng đi được gấp ba quãng đường thật. Hard-Concrete KẸP đầu ra về
+    [0,1], và `clamp` có gradient BẰNG 0 ở vùng bị kẹp — nên chỉ phần mẫu rơi
+    ra ngoài mới đẩy được cổng:
+
+        P_sống = sigmoid(log_alpha − beta·log(−stretch_lo/stretch_hi))
+
+    Ở log_alpha = -4 thì P_sống chỉ 8.3%, và cổng cần gate_lr_mult ~1338 để
+    nhúc nhích. Nếu quãng đường < |gate_init_logit| thì cổng đứng yên vì CƠ HỌC
+    chứ không vì dữ liệu, candidate B trông y hệt candidate A, và bảng
+    BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
     """
     base = _raw(BASE_YAML)
+
+    def p_live(cfg: dict) -> float:
+        r = cfg["recombiner"]
+        g = dict(r.get("gate") or {})
+        beta = float(g.get("beta", 2.0 / 3.0))
+        lo, hi = float(g.get("stretch_lo", -0.1)), float(g.get("stretch_hi", 1.1))
+        la = float(r["gate_init_logit"])
+        return 1.0 / (1.0 + math.exp(-(la - beta * math.log(-lo / hi))))
 
     def travel(cfg: dict) -> tuple[float, float, int]:
         d, t = cfg["data"], cfg["train"]
@@ -305,7 +345,7 @@ def gate_tests() -> None:
                                        * int(t["grad_accum"]))) \
             * int(t.get("n_epochs", 1))
         dist = steps * float(t["schedule"]["max_lr"]) \
-            * float(t["gate_lr_mult"]) * 0.6
+            * float(t["gate_lr_mult"]) * 0.6 * p_live(cfg)
         need = abs(float(cfg["recombiner"]["gate_init_logit"]))
         return dist, need, steps
 
@@ -314,27 +354,66 @@ def gate_tests() -> None:
         true(dist >= need,
              f"cổng KHÔNG đi nổi: {steps} bước × max_lr "
              f"{base['train']['schedule']['max_lr']} × gate_lr_mult "
-             f"{base['train']['gate_lr_mult']} × 0.6 = {dist:.2f} logit, trong "
-             f"khi cần >= |gate_init_logit| = {need:.2f}.\n"
-             f"      Cổng sẽ đứng yên vì AdamW chứ không vì dữ liệu — candidate "
-             f"B trông y hệt candidate A,\n      và BLEU/ROUGE không phân biệt "
-             f"được hai nguyên nhân. Nâng train.gate_lr_mult lên "
-             f">= {need / max(dist / float(base['train']['gate_lr_mult']), 1e-9):.0f}.")
+             f"{base['train']['gate_lr_mult']} × 0.6 × P_sống "
+             f"{p_live(base):.3f} = {dist:.2f} log_alpha, trong khi cần >= "
+             f"|gate_init_logit| = {need:.2f}.\n"
+             f"      Cổng sẽ đứng yên vì AdamW + phép kẹp chứ không vì dữ liệu "
+             f"— candidate B trông y hệt\n      candidate A, và BLEU/ROUGE "
+             f"không phân biệt được hai nguyên nhân. Nâng train.gate_lr_mult "
+             f"lên >= "
+             f"{need / max(dist / float(base['train']['gate_lr_mult']), 1e-9):.0f}.")
     check("§4: cổng có ĐỦ quãng đường để mở (phép nhân, không phải hy vọng)",
           t_gate_can_open)
 
+    def t_gate_closed_at_inference():
+        """Cổng LÚC SINH phải đúng bằng 0 ở bước 0 — tính chất mà Hard-Concrete
+        mua được và sigmoid không."""
+        r = base["recombiner"]
+        g = dict(r.get("gate") or {})
+        lo, hi = float(g.get("stretch_lo", -0.1)), float(g.get("stretch_hi", 1.1))
+        la = float(r["gate_init_logit"])
+        det = min(1.0, max(0.0, (1 / (1 + math.exp(-la))) * (hi - lo) + lo))
+        eq(det, 0.0, "cổng lúc SINH ở bước 0 phải ĐÚNG BẰNG 0 (cần log_alpha "
+                     "<= %.3f). Nhận:" % math.log((-lo / (hi - lo))
+                                                  / (1 + lo / (hi - lo))))
+    check("§4: cổng ĐÓNG HẲN lúc sinh ở bước 0", t_gate_closed_at_inference)
+
     def t_invariant_bites():
-        """Chiều ngược lại: bất đẳng thức phải THẬT SỰ bắt được config xấu."""
+        """Chiều ngược lại — HAI ca, vì bất đẳng thức có hai thừa số đổi được."""
         import copy as _c
 
         bad = _c.deepcopy(base)
         bad["train"]["gate_lr_mult"] = 20.0        # giá trị đời trước
-        dist, need, _ = travel(bad)
-        true(dist < need,
-             "với gate_lr_mult = 20 thì quãng đường phải KHÔNG đủ — nếu phép "
-             "kiểm này qua thì bất đẳng thức đang không bắt được gì")
-    check("§4: bất đẳng thức cổng bắt được gate_lr_mult = 20 (đời trước)",
+        d, n, _ = travel(bad)
+        true(d < n, "với gate_lr_mult = 20 thì quãng đường phải KHÔNG đủ — nếu "
+                    "phép kiểm này qua thì bất đẳng thức đang không bắt được gì")
+
+        bad2 = _c.deepcopy(base)
+        bad2["recombiner"]["gate_init_logit"] = -4.0   # quá âm -> P_sống 8.3%
+        d2, n2, _ = travel(bad2)
+        true(d2 < n2,
+             f"với gate_init_logit = -4 thì P_sống chỉ {p_live(bad2):.3f} và "
+             f"quãng đường phải KHÔNG đủ. Nếu phép kiểm này qua thì thừa số "
+             f"P_sống đang bị bỏ quên — và đó đúng là cách tin rằng cổng đi "
+             f"được gấp ba quãng đường thật của nó.")
+    check("§4: bất đẳng thức bắt được CẢ mult quá nhỏ LẪN init quá âm",
           t_invariant_bites)
+
+    def t_l0_penalty_is_a_nudge():
+        """Phạt L0 đẩy cổng ĐÓNG — đúng chiều với ca hỏng mà gate_lr_mult tồn
+        tại để tránh. Đặt nó cao là tự tay dựng lại 'candidate B trông y hệt
+        candidate A vì lý do cơ học', lần này với một cái tên học thuật hơn."""
+        c = base["classifier"]
+        lam_l0 = float(c.get("l0_lambda", 0.0))
+        true(lam_l0 >= 0.0, "classifier.l0_lambda không được âm — âm là THƯỞNG "
+                            "cho việc mở cổng, không phải phạt cho việc giữ nó")
+        true(lam_l0 <= 0.1 * float(c["lambda"]),
+             f"classifier.l0_lambda = {lam_l0} quá lớn so với λ (ASL) = "
+             f"{c['lambda']}. Đóng góp tối đa của L0 là chính l0_lambda (nó "
+             f"được chuẩn hoá về [0,1]), nên ở mức này nó thôi là một cú hích "
+             f"và thành một lực ép cổng đóng.")
+    check("§4: phạt L0 là một CÚ HÍCH, không phải một lực ép cổng đóng",
+          t_l0_penalty_is_a_nudge)
 
     def t_gate_is_per_token():
         import torch
@@ -342,6 +421,7 @@ def gate_tests() -> None:
         from src.recombiner import RecombinerBranch
 
         r = dict(base["recombiner"])
+        r["gate"] = dict(r.get("gate") or {})
         r.update({"swiglu_hidden": 32, "n_heads": 4, "n_vis": 4096,
                   "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"],
                               "d_model": 12, "n_heads": 4, "n_layers": 1,
@@ -350,6 +430,7 @@ def gate_tests() -> None:
                                             "asl": {"gamma_neg": 2.0,
                                                     "gamma_pos": 0.0,
                                                     "clip": 0.05}})
+        b.eval()
         n_q = int(base["recombiner"]["n_query"])
         eq(tuple(b.gate.shape), (n_q,),
            f"cổng phải MỞ THEO CHIỀU TOKEN, hình dạng (n_query,) = ({n_q},). "
@@ -357,14 +438,18 @@ def gate_tests() -> None:
            f"của mọi token' thay vì 'một số token trọn vẹn', và "
            f"`gate_open_tokens` khi đó là một con số vô nghĩa. Nhận:")
         g = b.gate_value().detach()
-        true(float(g.min()) > 0.0 and float(g.max()) < 1.0,
-             "cổng phải là sigmoid, chặn ngặt trong (0, 1)")
+        true(float(g.min()) >= 0.0 and float(g.max()) <= 1.0,
+             "cổng phải nằm trong [0, 1]")
         with torch.no_grad():
             b.gate.data = torch.tensor(
                 [20.0 if i < 3 else -20.0 for i in range(n_q)])
-        eq(b.gate_stats()["gate_open_tokens"], 3,
-           "gate_open_tokens phải ĐẾM token có cổng >= 0.5:")
-    check("§4: cổng là sigmoid THEO CHIỀU TOKEN, (n_query,)", t_gate_is_per_token)
+        s = b.gate_stats()
+        eq(s["gate_saturated_tokens"], 3, "3 token phải mở TRỌN VẸN:")
+        eq(s["gate_closed_tokens"], n_q - 3,
+           "phần còn lại phải ĐÓNG HẲN — phép ĐẾM, không phải ngưỡng đọc:")
+        eq(s["gate_kind"], "hard_concrete", "gate_stats phải khai loại cổng:")
+    check("§4: cổng Hard-Concrete THEO CHIỀU TOKEN, (n_query,)",
+          t_gate_is_per_token)
 
 
 # ══ 5. Kiểm định: k = 2, và nó phải ĐỌC được ════════════════════════════════
@@ -435,10 +520,17 @@ def boundary_tests() -> None:
     s4_src = (ROOT / "src" / "run_section4.py").read_text(encoding="utf-8")
 
     def t_s4_own_dirs():
+        import yaml
+
         r = _raw(S4_YAML)
         sub = str(r["output"]["subdir"])
         adir = str(r["output"]["adapter_dir"])
         base = _raw(BASE_YAML)["output"]
+        s3o = yaml.safe_load(
+            (ROOT / "configs" / "section3.yaml").read_text(encoding="utf-8"))["output"]
+        true(sub != str(s3o.get("subdir")),
+             "output.subdir của §4 trùng §3 — §4 sẽ ghi đè lên chính thư mục "
+             "chứa checkpoint mà nó đang đọc")
         for k in ("subdir", "subdir_moe"):
             true(sub != str(base.get(k)),
                  f"output.subdir của §4 trùng {k} của §2.x — một lần chạy §4 sẽ "
@@ -446,36 +538,73 @@ def boundary_tests() -> None:
         for k in ("adapter_dir", "adapter_dir_moe"):
             true(adir != str(base.get(k)),
                  f"output.adapter_dir của §4 trùng {k} của §2.x")
-        true("3_full" not in sub and "adapters_3" not in adir,
-             "§4 không được ghi vào thư mục của §3")
+        true(adir != str(s3o.get("adapter_dir", "./adapters_3")),
+             "adapter_dir của §4 trùng §3")
     check("§4: ghi vào thư mục RIÊNG, không đè §2.3/§2.4/§3", t_s4_own_dirs)
 
-    def t_pretrain_dir_separate():
-        r = _raw(S4_YAML)
-        sub = str((r.get("pretrain") or {}).get("subdir", ""))
-        base_sub = str((_raw(BASE_YAML).get("pretrain") or {}).get("subdir", ""))
-        true(sub and sub != base_sub,
-             f"checkpoint pretrain của §4 phải tách khỏi `runs/{base_sub}/` "
-             f"(chạy trên TOÀN BỘ split). Ba checkpoint trông giống hệt nhau "
-             f"trên đĩa và chỉ khác ở tập đã học — trộn chúng là mời một lần "
-             f"--init-from trỏ vào nhánh đã thấy 42k ảnh rồi dán nhãn '6400' "
-             f"lên bảng §4.")
-        repo = str((r.get("pretrain") or {}).get("hub_repo", ""))
-        base_repo = str((_raw(BASE_YAML).get("pretrain") or {}).get("hub_repo", ""))
-        true(repo and repo != base_repo,
-             "repo Hub của ckpt §4 phải khác repo của ckpt toàn-split: một repo, "
-             "một tập")
-    check("§4: ckpt pretrain tách khỏi §pretrain toàn-split (đĩa + Hub)",
-          t_pretrain_dir_separate)
+    def t_ckpt_path_from_s3_config():
+        """Đường dẫn ckpt phải ĐỌC từ configs/section3.yaml, không viết cứng."""
+        from src import run_section4 as s4
+        import yaml
 
-    def t_n_train_guard_present():
-        true(re.search(r"n_pre.*!=.*n_train|int\(n_pre\)\s*!=", s4_src),
-             "run_section4.py phải kiểm số mẫu của checkpoint pretrain khớp "
-             "`data.n_train`. Một ckpt toàn-split nạp vào đây khớp MỌI hình "
-             "dạng và vẫn cho ra một bảng — một bảng trong đó candidate B đã "
-             "thấy 42k ảnh và nhãn ghi 6400.")
-    check("§4: checkpoint pretrain phải học trên ĐÚNG 6400 mẫu",
-          t_n_train_guard_present)
+        s3 = yaml.safe_load(
+            (ROOT / "configs" / "section3.yaml").read_text(encoding="utf-8"))
+        want = Path(str(s3["output"].get("dir", "./runs"))) \
+            / str(s3["output"]["subdir"]) / "pretrain" / "ckpt" / "best"
+        eq(s4.s3_ckpt_dir(), want,
+           "s3_ckpt_dir() phải dựng từ output.dir/output.subdir của §3:")
+        # Nhìn MÃ, không nhìn chú thích: đoạn docstring giải thích vì sao không
+        # viết cứng thì buộc phải nhắc tới chính chuỗi nó cấm.
+        code = "\n".join(l for l in s4_src.splitlines()
+                         if not l.lstrip().startswith("#"))
+        code = re.sub(r'"""[\s\S]*?"""', "", code)
+        true("3_full" not in code,
+             "run_section4.py viết cứng 'runs/3_full/...' trong MÃ. Đó là một "
+             "LỜI HỨA rằng §3 vẫn ghi vào đúng chỗ ấy — và ngày ai đó đổi "
+             "output.subdir của §3, §4 sẽ báo 'chưa có checkpoint' cho một "
+             "checkpoint đang nằm ngay đó.")
+        # Đoạn "pretrain/ckpt/best" đóng cứng trong run_section3.default_init
+        # (không phải một khoá config), nên nó bị lặp ở hai chỗ — phép kiểm này
+        # là thứ giữ hai chỗ ấy bằng nhau.
+        s3src = (ROOT / "src" / "run_section3.py").read_text(encoding="utf-8")
+        true('"pretrain" / "ckpt" / "best"' in s3src,
+             "run_section3.default_init đã đổi bố cục thư mục ckpt — "
+             "s3_ckpt_dir() trong run_section4.py phải đổi theo")
+    check("§4: đường dẫn ckpt ĐỌC từ configs/section3.yaml, không viết cứng",
+          t_ckpt_path_from_s3_config)
+
+    def t_split_csv_guard():
+        true("split_csv" in s4_src,
+             "run_section4.py phải kiểm `data.split_csv` của checkpoint khớp "
+             "`data.train_split_csv` của §4. Bảo đảm 'không ảnh test nào lọt "
+             "vào nhánh' đến từ hàng rào check_leak mà §3 chạy TRÊN FILE SPLIT "
+             "CỦA NÓ — nó không chuyển sang một file khác được, và triệu chứng "
+             "của rò rỉ là 'kết quả tốt bất ngờ'.")
+        for k in ("image_max_side", "do_pan_and_scan", "base_hf_id"):
+            true(k in s4_src,
+                 f"thiếu phép kiểm `{k}`: nhánh học trên last_hidden_state của "
+                 f"vision tower, nên lệch khoá này là nhánh đọc một phân phối "
+                 f"đặc trưng KHÁC — hình dạng vẫn khớp, điểm vẫn ra số")
+    check("§4: ckpt phải cùng split / cùng đường ảnh / cùng base",
+          t_split_csv_guard)
+
+    def t_data_mismatch_disclosed():
+        """Số mẫu lệch KHÔNG bị chặn — nhưng phải được CÔNG BỐ."""
+        true("limitations" in s4_src,
+             "run_section4.py phải ghi khác biệt số mẫu pretrain vào "
+             "`manifest['limitations']`. §3 pretrain trên toàn split, §4 huấn "
+             "luyện trên 6400 — không rò rỉ, nhưng nó đổi PHẠM VI câu trả lời "
+             "(đo công thức §3 như nó được giao, không đo kiến trúc dưới điều "
+             "kiện dữ liệu khớp nhau). Im lặng về nó là để người đọc bảng tin "
+             "vào một câu mạnh hơn câu dữ liệu cho phép.")
+        true("allow_pretrain_data_mismatch" in s4_src,
+             "phải có khoá bật/tắt để ai muốn ràng buộc chặt hơn thì DỪNG được")
+        r = _raw(S4_YAML)
+        true("allow_pretrain_data_mismatch" in r,
+             "section4.yaml phải khai `allow_pretrain_data_mismatch` — mặc "
+             "định ngầm cho một câu thuộc phần Giới hạn là cách nó biến mất")
+    check("§4: số mẫu pretrain lệch -> CÔNG BỐ vào manifest.limitations",
+          t_data_mismatch_disclosed)
 
     def t_no_silent_scratch():
         true("--init-from none" in s4_src and "return 2" in s4_src,
@@ -500,8 +629,10 @@ def boundary_tests() -> None:
              "`_forward_loss` mà §2.3/§2.4/§3 dùng. Viết một vòng huấn luyện thứ "
              "hai là mời một khác biệt lặng lẽ vào giữa 'candidate B của §4' và "
              "'cấu hình mà §2.4 đã đo'.")
-        true("pretrain_sup" in s4_src,
-             "§4 phải gọi `pretrain_sup.run` cho chế độ 1, không viết lại nó")
+        true("pretrain_io" in s4_src,
+             "§4 phải nạp checkpoint bằng `pretrain_io` — cùng module mà "
+             "`save_pretrain` dùng, nên 'nạp đúng tập khối đã pretrain' kiểm "
+             "được bằng cách ĐỌC chứ không phải bằng cách tin")
         true("gemma3_recomb" in s4_src or "arm_model_cfg" in s4_src,
              "cả hai candidate phải đi CHUNG runner sinh: candidate A là B với "
              "`branch = None`. Cho A đi `gemma3_adapter` cho gọn là để hai cột "

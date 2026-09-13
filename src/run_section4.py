@@ -8,7 +8,8 @@
 Mã thoát:
     0  xong
     1  thiếu cột điểm -> phép so sánh ghép cặp không định nghĩa được
-    2  tham số sai, config chạm khoá đã khoá, hoặc preflight DỪNG
+    2  tham số sai, config chạm khoá đã khoá, checkpoint §3 không dùng được,
+       hoặc preflight DỪNG
     3  một candidate không huấn luyện được
     4  rò rỉ train/test
     5  nhãn phân loại không dùng được
@@ -25,7 +26,7 @@ khác:
     A  qlora_r4          LoRA r=4 gắn vào decoder, KHÔNG nhánh, KHÔNG pretrain
                          -> ĐỒNG NHẤT với candidate A của §2.3
     B  recomb_pre_k6e10  A + Recombinator + QFormer(2 vector) + ClsHead (ASL)
-                         + Experts K=6·E=10 + nhánh khởi tạo từ sup_pretrain,
+                         + Experts K=6·E=10 + nhánh NẠP TỪ CHECKPOINT §3,
                          huấn luyện theo chế độ 2 của §3 (lr nhánh ×0.1,
                          λ-warmup TẮT)
 
@@ -43,10 +44,10 @@ Hai ràng buộc kéo ngược chiều nhau, và §4 phải thoả CẢ HAI:
      là một LỜI HỨA — một lần sửa `data.n_train` ở một bên là đủ để ba mục thôi
      so được với nhau, và không có gì báo.
 
-  2. §4 cần chế độ 1 (sup_pretrain) và ba khoá của §3 — thứ mà `run_recomb.py`
-     KHÔNG được biết tới: selftest của §3 kiểm rằng `run_recomb.py` không nhắc
-     `sup_pretrain`/`decoder_ft`/`pretrain_io`, và ranh giới ấy tồn tại để một
-     lần chạy §3 không rơi vào nhánh code của `--exp 2.3` rồi ghi đè
+  2. §4 phải NẠP được checkpoint của §3 và dùng ba khoá của chế độ 2 — thứ mà
+     `run_recomb.py` KHÔNG được biết tới: selftest của §3 kiểm rằng file đó
+     không nhắc `sup_pretrain`/`decoder_ft`/`pretrain_io`, và ranh giới ấy tồn
+     tại để một lần chạy §3 không rơi vào nhánh code của `--exp 2.3` rồi ghi đè
      `runs/2.3_recombiner/`.
 
 Lối ra: điểm vào riêng, ĐIỀU KIỆN ĐI VAY. `_load()` nạp `configs/recombiner.yaml`
@@ -58,16 +59,31 @@ khai một `data.n_train` của riêng nó, kể cả khi ai đó gõ vào file.
 lần chạy, và `manifest.json` ghi lại nguyên văn cấu hình đã giải quyết. Cấm cả
 `--set` nghĩa là không dry-run được.
 
-══ Cùng 6400, và đó là CÙNG MỘT BẢNG ════════════════════════════════════════
+══ §4 KHÔNG chạy pretrain — nó NẠP checkpoint của §3 ════════════════════════
 
-Chế độ 1 của §4 nhận CHÍNH `train_df` mà chế độ 2 và candidate A dùng — cùng
-một đối tượng DataFrame, không phải "cùng con số 6400" đọc lại từ hai chỗ. Nên
-"nhánh pretrain thấy đúng tập mà decoder thấy" không phải một phép kiểm; nó
-không có cách nào sai.
+Nhánh của candidate B đến từ `runs/<§3>/pretrain/ckpt/best`, thư mục mà
+`run_section3` ghi ra. §4 không có stage `pretrain`, không có khối `pretrain:`
+trong config, và khai một khoá `pretrain.*` trong section4.yaml là DỪNG.
 
-Đây là khác biệt duy nhất đáng kể so với §3, nơi `pretrain.n_train: 0` cho chế
-độ 1 chạy trên TOÀN BỘ split. Ở §3 đó là có chủ ý và nằm trong Giới hạn; ở §4
-nó sẽ phá ràng buộc 1 ở trên.
+Đường dẫn KHÔNG viết cứng: `s3_ckpt_dir()` đọc `configs/section3.yaml` và dựng
+`<output.dir>/<output.subdir>/pretrain/ckpt/best`. Viết cứng "runs/3_full/..."
+là một LỜI HỨA rằng §3 vẫn ghi vào đúng chỗ ấy; đọc file của §3 là một sự thật.
+
+Hệ quả phải NÓI RA, không phải giấu: §3 chạy chế độ 1 trên TOÀN BỘ train split,
+còn §4 huấn luyện trên 6400 mẫu. Nhánh của candidate B vì thế đã thấy nhiều ảnh
+hơn số ảnh candidate A từng thấy.
+
+Đó KHÔNG phải rò rỉ — §3 chạy hàng rào `check_leak` với toàn bộ key của test
+split, và `_resolve_pretrain` ở đây kiểm rằng checkpoint đọc ĐÚNG
+`data.train_split_csv` mà §4 dùng, nên không một ảnh test nào lọt vào. Nó là
+một thành phần ĐÃ PRETRAIN, cùng nghĩa với vision tower SigLIP đóng băng mà cả
+hai candidate đứng trên.
+
+Nhưng nó đổi PHẠM VI của câu trả lời: §4 đo "công thức §3 như nó được giao",
+không đo "kiến trúc dưới điều kiện dữ liệu khớp nhau". Con số thật đọc từ META
+được in ra và ghi vào `manifest["limitations"]`, nên báo cáo không im lặng được
+về nó. `allow_pretrain_data_mismatch: false` biến nó thành DỪNG nếu ai đó muốn
+ràng buộc chặt hơn.
 """
 from __future__ import annotations
 
@@ -86,9 +102,13 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
     seed_everything
 from .tracking import Tracker
 
-STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "report", "push"]
+# KHÔNG có stage `pretrain`: nhánh đến từ checkpoint §3, §4 không huấn luyện
+# lại nó. Một stage mang tên `pretrain` mà không pretrain gì là chỗ tệ nhất để
+# đặt một lời nói dối — người đọc log sẽ tin rằng §4 vừa học lại nhánh.
+STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 ROOT = Path(__file__).resolve().parent.parent
 BASE_CONFIG = ROOT / "configs" / "recombiner.yaml"      # điều kiện đi vay
+S3_CONFIG = ROOT / "configs" / "section3.yaml"          # nơi checkpoint nằm
 DEFAULT_CONFIG = ROOT / "configs" / "section4.yaml"     # phần §4 sở hữu
 
 TRAIN_MANIFEST = "s4_trainset"
@@ -114,11 +134,12 @@ LOCK_EXEMPT: tuple[str, ...] = (
     "train.freeze_pretrained",      # đóng băng hẳn thay vì hạ lr
     "classifier.lambda_warmup_pct_pretrained",   # §3 §4.3 — warmup TẮT
 )
-# Khoá của §pretrain toàn-split mà §4 KHÔNG đọc. Khai nó trong section4.yaml là
-# dựng một khoá trông như điều khiển được tập pretrain của §4 mà không — và ca
-# hỏng là ai đó đặt 0 ở đó, tin rằng chế độ 1 vừa chạy trên 42k ảnh, rồi dán
-# nhãn "6400" lên bảng.
-PRETRAIN_INERT: tuple[str, ...] = ("pretrain.n_train",)
+# §4 KHÔNG chạy chế độ 1, nên CẢ KHỐI `pretrain:` là chết ở đây. Khai bất cứ
+# khoá nào dưới nó là dựng một khoá trông như điều khiển được một phase không
+# tồn tại — và ca hỏng là ai đó chỉnh `pretrain.n_epochs` rồi tin rằng §4 vừa
+# học lại nhánh trên 6400 mẫu, trong khi nó nạp nguyên checkpoint toàn-split
+# của §3.
+PRETRAIN_INERT_PREFIX = "pretrain"
 
 
 def _hr(t: str) -> None:
@@ -179,12 +200,13 @@ def violations(s4_raw: dict) -> list[str]:
     for key in _leaf_keys(s4_raw):
         if key in LOCK_EXEMPT:
             continue
-        if key in PRETRAIN_INERT:
+        if key.split(".", 1)[0] == PRETRAIN_INERT_PREFIX:
             bad.append(
-                f"{key} — §4 KHÔNG đọc khoá này. Chế độ 1 của §4 nhận CHÍNH "
-                f"`train_df` của §4 (cùng 6400 mẫu, cùng một bảng). Khai nó ở "
-                f"đây là dựng một khoá trông như điều khiển được tập pretrain "
-                f"mà không điều khiển gì.")
+                f"{key} — §4 KHÔNG có phase pretrain. Nhánh của candidate B nạp "
+                f"từ checkpoint mà §3 đã ghi ra, nên cả khối `pretrain:` là "
+                f"chết ở đây: khai nó là dựng một khoá trông như điều khiển "
+                f"được một phase không tồn tại. Sửa chế độ 1 thì sửa "
+                f"configs/section3.yaml rồi chạy lại §3.")
             continue
         if key.split(".", 1)[0] in LOCKED:
             bad.append(
@@ -335,9 +357,152 @@ def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
     return c
 
 
-def default_init(run_dir: Path, cfg: Cfg) -> Path:
-    sub = str((cfg.get("pretrain", {}) or {}).get("subdir", "pretrain"))
-    return run_dir / sub / "ckpt" / "best"
+def s3_ckpt_dir(s3_path: Path = S3_CONFIG) -> Path:
+    """`ckpt/best` của §3, dựng từ CHÍNH configs/section3.yaml.
+
+    Viết cứng "runs/3_full/pretrain/ckpt/best" là một LỜI HỨA rằng §3 vẫn ghi
+    vào đúng chỗ ấy — và ngày ai đó đổi `output.subdir` của §3, §4 sẽ báo
+    "chưa có checkpoint" cho một checkpoint đang nằm ngay đó. Đọc file của §3
+    là một sự thật.
+
+    `run_section3.default_init` đóng cứng đoạn "pretrain/ckpt/best" trong mã
+    nguồn (không phải một khoá config), nên nó được lặp lại ở đây — và
+    selftest đối chiếu hai chỗ ấy với nhau.
+    """
+    import yaml
+
+    p3 = Path(s3_path)
+    if not p3.exists():
+        raise FileNotFoundError(
+            f"§4 nạp nhánh từ checkpoint của §3, và nó định vị thư mục ấy bằng "
+            f"{p3} — file đó không có.")
+    raw = yaml.safe_load(p3.read_text(encoding="utf-8")) or {}
+    o = dict(raw.get("output") or {})
+    # KHÔNG mặc định ngầm cho `subdir`. Một giá trị lui ở đây là đúng thứ hàm
+    # này tồn tại để tránh: ngày ai đó xoá khoá ấy khỏi section3.yaml, §4 sẽ đi
+    # tìm một thư mục không ai khai và báo "chưa có checkpoint" — cho một
+    # checkpoint có thể đang nằm ngay cạnh.
+    if not o.get("subdir"):
+        raise ValueError(
+            f"{p3} không khai `output.subdir` — không suy ra được §3 ghi "
+            f"checkpoint ở đâu.")
+    return (Path(str(o.get("dir", "./runs"))) / str(o["subdir"])
+            / "pretrain" / "ckpt" / "best")
+
+
+# Những khoá của META quyết định nhánh ĐỌC ĐÚNG phân phối đặc trưng nó đã học.
+# Lệch bất kỳ khoá nào: hình dạng vẫn khớp, checkpoint vẫn nạp được, điểm số
+# vẫn ra số — và nhánh đang đọc một thứ khác thứ nó được huấn luyện trên.
+SHAPE_KEYS = ("n_query", "swiglu_hidden", "n_heads", "siglip_dim", "token_type")
+
+
+def _resolve_pretrain(cfg: Cfg, spec: str) -> tuple[Path | None, bool, dict]:
+    """-> (thư mục ckpt | None, from_scratch, ghi chú). ValueError = DỪNG.
+
+    Giải quyết ở GIÂY THỨ NHẤT, trước stage `data`: phát hiện "chưa chạy §3"
+    sau khi đã tải và resize 3000 + 6400 ảnh là trả xong tiền rồi mới biết.
+    """
+    from . import pretrain_io
+
+    if spec.lower() == "none":
+        return None, True, {}
+
+    want = spec or str(s3_ckpt_dir())
+    if not spec and not pretrain_io.pretrain_exists(Path(want)):
+        raise ValueError(
+            f"chưa có checkpoint pretrain của §3 ở {want}.\n"
+            f"    §4 KHÔNG tự pretrain — nhánh của candidate B đến từ §3. Ba cách:\n"
+            f"      * chạy §3 trước      : bash scripts/run_section3.sh --mode sup_pretrain\n"
+            f"      * hoặc lấy từ Hub    : --init-from hub:OWNER/NAME/best\n"
+            f"      * hoặc trỏ thư mục   : --init-from <dir>\n"
+            f"    Muốn cố ý chạy from-scratch thì NÓI RA: --init-from none\n"
+            f"    (im lặng chạy from-scratch ở đây nghĩa là cột B mang nhãn 'đã "
+            f"pretrain'\n     dựng từ một nhánh ngẫu nhiên — và không ai phát "
+            f"hiện được về sau.)")
+    try:
+        src = pretrain_io.resolve_source(
+            want, cache_dir=cfg["data"].get("cache_dir", "./data"))
+        meta = pretrain_io.read_meta(src)
+    except Exception as e:
+        raise ValueError(f"không lấy được checkpoint pretrain ({want!r}): {e}")
+
+    note: dict = {"source": str(src)}
+
+    # 1. Cùng base. Vision tower khác = phân phối đặc trưng khác, và hai base
+    #    cùng kích thước thì hình dạng vẫn khớp nên không gì khác bắt được.
+    if meta.get("base_hf_id") and \
+            str(meta["base_hf_id"]) != str(cfg["base"]["hf_id"]):
+        raise ValueError(
+            f"checkpoint học trên vision tower của {meta['base_hf_id']}, lần "
+            f"chạy này dùng {cfg['base']['hf_id']}.")
+
+    # 2. Cùng hình dạng nhánh. So với `spec` NGUYÊN VĂN mà checkpoint mang theo,
+    #    không với thứ ai đó nhớ là đã đặt.
+    mr = dict((meta.get("spec") or {}).get("recombiner") or {})
+    cr = dict(cfg.get("recombiner") or {})
+    for k in SHAPE_KEYS:
+        if k in mr and k in cr and mr[k] != cr[k]:
+            raise ValueError(
+                f"checkpoint dựng với `recombiner.{k} = {mr[k]!r}`, §4 chạy với "
+                f"{cr[k]!r}. Nhánh sẽ đọc một thứ khác thứ nó được huấn luyện "
+                f"trên.")
+
+    # 3. Cùng đường ảnh. Nhánh học trên `last_hidden_state` của vision tower,
+    #    và một độ phân giải khác (hay pan&scan bật) cho ra đặc trưng khác —
+    #    trong khi số token vào vẫn có thể khớp.
+    md = dict(meta.get("data") or {})
+    if md.get("image_max_side") and int(md["image_max_side"]) != \
+            int(cfg["data"].get("image_max_side", 512)):
+        raise ValueError(
+            f"checkpoint học trên ảnh cạnh dài <= {md['image_max_side']}px, §4 "
+            f"chạy {cfg['data'].get('image_max_side')}px.")
+    pas_cfg = bool((cfg["base"].get("image") or {}).get("do_pan_and_scan", False))
+    if md.get("do_pan_and_scan") is not None and \
+            bool(md["do_pan_and_scan"]) != pas_cfg:
+        raise ValueError(
+            f"checkpoint học với do_pan_and_scan = {md['do_pan_and_scan']}, §4 "
+            f"chạy {pas_cfg}. Mỗi mảnh phụ thêm một lượt 4096 patch, nên đây là "
+            f"một đường ảnh KHÁC.")
+
+    # 4. Hàng rào rò rỉ ĐI THEO được hay không.
+    #    §3 chạy `check_leak` với toàn bộ key của test split, nên checkpoint của
+    #    nó sạch — NHƯNG chỉ khi nó đọc cùng file split mà §4 đọc. Đọc file
+    #    khác thì bảo đảm ấy không chuyển sang được, và triệu chứng của rò rỉ là
+    #    "kết quả tốt bất ngờ": ca hỏng duy nhất người ta có xu hướng KHÔNG đi
+    #    kiểm tra.
+    want_csv = str(cfg["data"].get("train_split_csv"))
+    got_csv = str(md.get("split_csv") or "")
+    if got_csv and got_csv != want_csv:
+        raise ValueError(
+            f"checkpoint pretrain đọc split {got_csv!r}, §4 huấn luyện trên "
+            f"{want_csv!r}.\n"
+            f"    Bảo đảm 'không có ảnh test nào lọt vào nhánh' đến từ hàng rào "
+            f"check_leak mà §3\n    chạy TRÊN FILE SPLIT CỦA NÓ — nó không "
+            f"chuyển sang một file khác được.")
+    note["split_csv"] = got_csv or want_csv
+
+    # 5. Số mẫu — CÔNG BỐ, không chặn (trừ khi được yêu cầu chặn).
+    n_pre = md.get("n_train")
+    note["n_train_pretrain"] = int(n_pre) if n_pre is not None else None
+    note["n_train_section4"] = int(cfg["data"]["n_train"])
+    if n_pre is not None and int(n_pre) != int(cfg["data"]["n_train"]):
+        if not bool(cfg.get("allow_pretrain_data_mismatch", True)):
+            raise ValueError(
+                f"checkpoint pretrain học trên {int(n_pre)} mẫu, §4 huấn luyện "
+                f"trên {int(cfg['data']['n_train'])}, và "
+                f"`allow_pretrain_data_mismatch: false`.")
+        note["limitation"] = (
+            f"Nhánh của candidate B được pretrain trên {int(n_pre)} ảnh (§3, "
+            f"toàn bộ train split), trong khi CẢ HAI candidate chỉ huấn luyện "
+            f"decoder trên {int(cfg['data']['n_train'])} mẫu. Không phải rò rỉ "
+            f"— cùng file split, đã qua check_leak của §3 với toàn bộ key test "
+            f"— nhưng nó có nghĩa là §4 đo CÔNG THỨC §3 NHƯ NÓ ĐƯỢC GIAO, không "
+            f"đo kiến trúc dưới điều kiện dữ liệu khớp nhau.")
+    note["meta"] = {k: meta.get(k) for k in
+                    ("epoch", "n_epochs", "seen_samples", "val", "data",
+                     "pretrained_modules", "untrained_modules", "n_labels",
+                     "seed", "base_hf_id", "base_method")}
+    return src, False, note
 
 
 # ══ main ════════════════════════════════════════════════════════════════════
@@ -351,15 +516,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--dry-run", action="store_true",
-                    help="8 ảnh · 16 mẫu · 4 bước · 2 epoch pretrain · 200 lần "
-                         "mô phỏng · KHÔNG đẩy Hub. Thử ĐƯỜNG ỐNG, không dò VRAM.")
+                    help="8 ảnh · 16 mẫu · 4 bước · 200 lần mô phỏng · KHÔNG "
+                         "đẩy Hub. Thử ĐƯỜNG ỐNG, không dò VRAM.")
     ap.add_argument("--init-from", default=None,
-                    help="nguồn pretrain cho candidate B: <dir> | "
-                         "hub:OWNER/NAME/best[@rev] | none (from-scratch có ý thức)")
-    ap.add_argument("--no-resume", action="store_true",
-                    help="chế độ 1 bắt đầu lại từ epoch 1 thay vì đi tiếp")
-    ap.add_argument("--extend-schedule", action="store_true",
-                    help="cho phép nối tiếp ckpt pretrain trên một lịch KHÁC")
+                    help="nhánh đã pretrain cho candidate B. Mặc định: ckpt/best "
+                         "của §3, đọc từ configs/section3.yaml. Ghi đè bằng "
+                         "<dir> | hub:OWNER/NAME/best[@rev] | none (arm đối "
+                         "chứng from-scratch, phải NÓI RA).")
     ap.add_argument("--retrain", action="store_true")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--no-push", action="store_true")
@@ -388,7 +551,6 @@ def main(argv: list[str] | None = None) -> int:
 
     arm_a = next((x["id"] for x in arms if not x["recomb"]), None)
     arm_b = next((x["id"] for x in arms if x["recomb"]), None)
-    needs_pre = [x for x in arms if x["pretrain"]]
 
     # `report_recomb` suy A/B từ cờ `recomb` trong `cfg["arms"]`. §4 giữ
     # candidate ở `arms_s4` (xem docstring `s4_arms`), nên chỗ nối hai thứ ấy
@@ -396,28 +558,25 @@ def main(argv: list[str] | None = None) -> int:
     # một khoá `arms` thứ hai trong file YAML mà ai đó có thể sửa lệch.
     cfg["arms"] = [dict(x) for x in arms]
 
-    dry_steps = dry_pre = None
+    dry_steps = None
     if a.dry_run:
         cfg["data"]["n_test"] = 8
         cfg["data"]["n_train"] = 16
         cfg["data"]["n_val"] = 8
         cfg["stats"]["n_perm"] = 200
         cfg["stats"]["n_boot"] = 200
-        cfg["pretrain"]["n_epochs"] = 2
         cfg["output"]["push"] = False
         cfg["output"]["subdir"] = str(cfg["output"]["subdir"]) + "_dryrun"
         cfg["output"]["adapter_dir"] = str(cfg["output"]["adapter_dir"]) + "_dryrun"
         cfg.setdefault("wandb", {})["tags"] = list(
             cfg.get("wandb", {}).get("tags", []) or []) + ["dry-run"]
-        dry_steps, dry_pre = 4, 8
-        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · 2 epoch pretrain "
-              "· không đẩy Hub.\n"
+        dry_steps = 4
+        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub.\n"
               "  Phép thử ĐƯỜNG ỐNG, không phải phép dò VRAM: nó chạy với đúng "
               "batch trong config,\n  và 4 bước trên 16 mẫu ngắn không nói được "
               "gì về VRAM đỉnh của 6400 mẫu.", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
-        cfg.setdefault("pretrain", {})["push"] = False
     if a.no_wandb:
         cfg.setdefault("wandb", {})["enabled"] = False
 
@@ -427,16 +586,9 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
     adapter_root = Path(str(cfg["output"]["adapter_dir"]))
-    pre_dir = run_dir / str((cfg.get("pretrain", {}) or {}).get("subdir", "pretrain"))
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
-
-    # §4 KHÔNG đọc `pretrain.n_train` (chế độ 1 nhận thẳng train_df). Ghi con số
-    # thật vào cfg để `manifest.json` nói đúng thứ đã chạy thay vì chép lại một
-    # khoá của điểm vào khác.
-    cfg["pretrain"]["n_train"] = int(cfg["data"]["n_train"])
-    cfg["pretrain"]["train_source"] = "§4 train_df (cùng bảng với decoder_ft)"
 
     manifest = {
         "run_id": run_id, "experiment": "4",
@@ -450,21 +602,58 @@ def main(argv: list[str] | None = None) -> int:
     }
     t_start = time.time()
 
-    print("\n═══ §4 — QLoRA r4 thuần  vs  Recombinator(pretrain) · K=6 · E=10 "
+    # ── Nguồn nhánh — giải quyết ở GIÂY THỨ NHẤT ────────────────────────────
+    # Trước cả banner, và rất trước stage `data`: phát hiện "chưa chạy §3" sau
+    # khi đã tải và resize 3000 + 6400 ảnh là trả xong tiền rồi mới biết.
+    pre_src = None
+    pre_scratch = False
+    pre_note: dict = {}
+    if "train" in stages and any(x["pretrain"] for x in arms):
+        try:
+            pre_src, pre_scratch, pre_note = _resolve_pretrain(
+                cfg, str(a.init_from or "").strip())
+        except ValueError as e:
+            print(f"\n✗ DỪNG — {e}", flush=True)
+            return 2
+        manifest["pretrain_init"] = str(pre_src) if pre_src else None
+        manifest["pretrain_note"] = pre_note
+        if pre_note.get("limitation"):
+            manifest.setdefault("limitations", []).append(pre_note["limitation"])
+
+    print("\n═══ §4 — QLoRA r4 thuần  vs  Recombinator(pretrain §3) · K=6 · E=10 "
           "═══", flush=True)
     for x in arms:
         bits = []
         bits.append("nhánh + QFormer + ClsHead" if x["recomb"] else "KHÔNG nhánh")
         if "top_k" in x:
             bits.append(f"Experts k={x['top_k']}·E={x['n_experts']}")
-        bits.append("nhánh TỪ PRETRAIN" if x["pretrain"] else "không pretrain")
+        bits.append("nhánh TỪ CKPT §3" if x["pretrain"] else "không pretrain")
         print(f"  {x['id']:<18} {x.get('name','')}\n"
               f"  {'':<18} {' · '.join(bits)}", flush=True)
     print(f"⚙ điều kiện đi vay: {BASE_CONFIG.name} — "
           f"{cfg['data']['n_train']} mẫu train · {cfg['data']['n_test']} ảnh "
           f"test · seed {cfg.get('seed')}", flush=True)
-    print(f"⚙ run dir : {run_dir}\n⚙ adapters: {adapter_root}\n"
-          f"⚙ pretrain: {pre_dir}", flush=True)
+    print(f"⚙ run dir : {run_dir}\n⚙ adapters: {adapter_root}", flush=True)
+    if pre_scratch:
+        print("⚙ nhánh   : NGẪU NHIÊN (--init-from none) — arm ĐỐI CHỨNG, "
+              "KHÔNG phải candidate B của §4", flush=True)
+    elif pre_src:
+        m = dict(pre_note.get("meta") or {})
+        v = dict(m.get("val") or {})
+        print(f"⚙ nhánh   : {pre_src}\n"
+              f"            epoch {m.get('epoch')}/{m.get('n_epochs')} · "
+              f"{m.get('seen_samples')} lượt mẫu · val cls_f1_pos "
+              f"{v.get('cls_f1_pos')}", flush=True)
+        if pre_note.get("limitation"):
+            n_pre = pre_note.get("n_train_pretrain")
+            print(f"⚠ GIỚI HẠN — nhánh của B pretrain trên {n_pre} ảnh, cả hai "
+                  f"candidate huấn luyện decoder trên\n"
+                  f"  {pre_note.get('n_train_section4')} mẫu. Không rò rỉ (cùng "
+                  f"split, đã qua check_leak của §3), nhưng §4 đo\n"
+                  f"  CÔNG THỨC §3 NHƯ NÓ ĐƯỢC GIAO — không đo kiến trúc dưới "
+                  f"điều kiện dữ liệu khớp nhau.\n"
+                  f"  Câu này đi vào manifest.limitations và vào REPORT.md.",
+                  flush=True)
     print(f"⚙ k = 2 -> KHÔNG Friedman. Permutation + bootstrap ghép cặp BCa "
           f"(stats_ab), Holm riêng từng họ.", flush=True)
 
@@ -482,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
     from . import data as data_mod
     from . import data_train as dt_mod
 
-    need_train = ("train" in stages) or ("pretrain" in stages)
+    need_train = "train" in stages
 
     # ── nhãn: dò schema TRƯỚC mọi thứ tốn kém ───────────────────────────────
     if need_train and any(x["recomb"] for x in arms):
@@ -529,7 +718,11 @@ def main(argv: list[str] | None = None) -> int:
         tracker.summary({"data/n_train": len(train_df)})
 
     # ── nhãn căn theo ĐÚNG thứ tự hàng ──────────────────────────────────────
-    cls_train = cls_val = None
+    # `val_df` đi qua đây nhưng §4 KHÔNG dùng nó: chọn epoch là việc của chế độ
+    # 1, và chế độ 1 thuộc §3. Nó vẫn được chuẩn bị vì `data.n_val` là một điều
+    # kiện ĐI VAY — bỏ nó đi là làm stage `data` của §4 khác stage `data` của
+    # §2.3, tức là đúng thứ mục 1 của docstring cấm.
+    cls_train = None
     if need_train and any(x["recomb"] for x in arms):
         from . import labels_cls
 
@@ -543,124 +736,8 @@ def main(argv: list[str] | None = None) -> int:
                                    label_names=linfo.get("label_names"),
                                    class_frac=linfo.get("class_frac"))}
         manifest["labels"] = cls_train["stats"]
-        if val_df is not None and len(val_df):
-            vy, vm, vst = labels_cls.attach(
-                cfg, val_df["key"].astype(str).tolist(), lut, n_labels, "val")
-            cls_val = {"y": vy, "mask": vm, "n_labels": n_labels, "stats": vst}
 
-    # ══ CHẾ ĐỘ 1 — sup_pretrain (chỉ cho candidate cần) ════════════════════
-    pre_stats = None
-    if "pretrain" in stages and needs_pre:
-        from . import pretrain_sup
-
-        _hr("CHẾ ĐỘ 1 — sup_pretrain (100% có giám sát, KHÔNG decoder)")
-        print("  loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ) )",
-              flush=True)
-        print(f"  tập: CHÍNH train_df của §4 — {len(train_df)} mẫu, cùng bảng "
-              f"mà chế độ 2 và candidate A dùng.\n"
-              f"  (§3 chạy chế độ 1 trên TOÀN BỘ split; ở §4 điều đó sẽ phá "
-              f"ràng buộc 'cùng 6400'.)", flush=True)
-        try:
-            pre_stats = pretrain_sup.run(
-                cfg, train_df, val_df, cls_train, cls_val, pre_dir,
-                tracker=tracker, resume=not a.no_resume,
-                allow_schedule_change=bool(a.extend_schedule),
-                max_steps_override=dry_pre)
-        except Exception as e:
-            print(f"\n✗ DỪNG — chế độ 1 không chạy được:\n    {e}", flush=True)
-            tracker.alert("§4 dừng: sup_pretrain", str(e), "ERROR")
-            tracker.finish(1)
-            return 3
-        manifest["sup_pretrain"] = {k: v for k, v in pre_stats.items()
-                                    if k != "history"}
-        tracker.summary({
-            "pretrain/epochs_run": pre_stats["epochs_run"],
-            "pretrain/seen_samples": pre_stats["seen_samples"],
-            "pretrain/best_epoch": (pre_stats["best"] or {}).get("epoch"),
-            "pretrain/best_value": (pre_stats["best"] or {}).get("value"),
-            "pretrain/vram_peak_gb": pre_stats["vram_peak_gb"],
-        })
-
-    # ── nguồn pretrain cho candidate B ──────────────────────────────────────
-    pre_src = None
-    pre_scratch = False
-    if "train" in stages and needs_pre:
-        from . import pretrain_io
-
-        spec = str(a.init_from or "").strip()
-        if spec.lower() == "none":
-            print("\n  ⚙ --init-from none: nhánh khởi tạo NGẪU NHIÊN. Đây là arm "
-                  "đối chứng from-scratch,\n    KHÔNG phải candidate B của §4 — "
-                  "train_stats.json ghi rõ nó là cái nào.", flush=True)
-            pre_scratch = True
-        else:
-            want = spec or str(default_init(run_dir, cfg))
-            if not spec and not pretrain_io.pretrain_exists(Path(want)):
-                print(f"\n✗ DỪNG — chưa có checkpoint pretrain ở {want}.\n"
-                      f"    Candidate B của §4 đứng TRÊN chế độ 1. Ba cách:\n"
-                      f"      * chạy cả gói      : --stages data,pretrain,train,...\n"
-                      f"      * hoặc chỉ chế độ 1: --stages data,pretrain\n"
-                      f"      * hoặc trỏ chỗ khác: --init-from <dir|hub:OWNER/NAME/best>\n"
-                      f"    Muốn cố ý chạy from-scratch thì NÓI RA: --init-from none\n"
-                      f"    (im lặng chạy from-scratch ở đây nghĩa là cột B mang "
-                      f"nhãn 'đã pretrain'\n     dựng từ một nhánh ngẫu nhiên — "
-                      f"và không ai phát hiện được về sau.)", flush=True)
-                tracker.finish(1)
-                return 2
-            try:
-                pre_src = pretrain_io.resolve_source(
-                    want, cache_dir=cfg["data"].get("cache_dir", "./data"))
-                pmeta = pretrain_io.read_meta(pre_src)
-            except Exception as e:
-                print(f"\n✗ DỪNG — không lấy được checkpoint pretrain "
-                      f"({want!r}):\n    {e}", flush=True)
-                tracker.finish(1)
-                return 2
-            if pmeta.get("base_hf_id") and \
-                    str(pmeta["base_hf_id"]) != str(cfg["base"]["hf_id"]):
-                print(f"\n✗ DỪNG — checkpoint học trên vision tower của "
-                      f"{pmeta['base_hf_id']}, lần chạy này dùng "
-                      f"{cfg['base']['hf_id']}. Hình dạng vẫn khớp nên không có "
-                      f"gì khác bắt được.", flush=True)
-                tracker.finish(1)
-                return 2
-            pdata = dict(pmeta.get("data") or {})
-            if pdata.get("image_max_side") and int(pdata["image_max_side"]) != \
-                    int(cfg["data"].get("image_max_side", 512)):
-                print(f"  ⚠ pretrain dùng ảnh cạnh dài ≤ "
-                      f"{pdata['image_max_side']}px, lần này "
-                      f"{cfg['data'].get('image_max_side')}px.", flush=True)
-            # Ràng buộc RIÊNG của §4: checkpoint phải học trên đúng số mẫu mà
-            # §4 huấn luyện. Một ckpt của `run_pretrain` (toàn bộ split) nạp
-            # vào đây vẫn khớp mọi hình dạng và vẫn cho ra một bảng — một bảng
-            # trong đó candidate B đã thấy 42k ảnh và nhãn ghi "6400".
-            n_pre = (pmeta.get("train") or {}).get("n_train")
-            if n_pre is not None and int(n_pre) != int(cfg["data"]["n_train"]):
-                print(f"\n✗ DỪNG — checkpoint pretrain học trên {int(n_pre)} mẫu, "
-                      f"§4 huấn luyện trên {int(cfg['data']['n_train'])}.\n"
-                      f"    Đây là ràng buộc của §4, không phải của §3: cả bảng "
-                      f"đứng trên câu 'cùng 6400 mẫu'.\n"
-                      f"    Hình dạng vẫn khớp và điểm số vẫn ra số, nên không "
-                      f"có gì khác bắt được ca này.\n"
-                      f"    Dùng ckpt của §4 (`--stages data,pretrain`), hoặc "
-                      f"nói rõ bằng `--init-from <dir>` nếu\n    thật sự muốn "
-                      f"một checkpoint khác — và khi đó nó phải vào phần Giới hạn.",
-                      flush=True)
-                tracker.finish(1)
-                return 2
-            v = dict(pmeta.get("val") or {})
-            print(f"\n  nguồn pretrain: {pre_src}", flush=True)
-            print(f"  epoch {pmeta.get('epoch')}/{pmeta.get('n_epochs')} · "
-                  f"{pmeta.get('seen_samples')} lượt mẫu · val cls_f1_pos "
-                  f"{v.get('cls_f1_pos')}", flush=True)
-            manifest["pretrain_init"] = str(pre_src)
-            manifest["pretrain_meta"] = {
-                k: pmeta.get(k) for k in
-                ("epoch", "n_epochs", "seen_samples", "val", "train",
-                 "pretrained_modules", "untrained_modules", "n_labels",
-                 "d_vis", "d_model", "seed", "base_hf_id")}
-
-    # ══ CHẾ ĐỘ 2 — huấn luyện hai candidate ════════════════════════════════
+    # ══ Huấn luyện hai candidate ════════════════════════════════
     train_stats: list[dict] = []
     if "train" in stages:
         from . import train_recomb as tr_mod
@@ -909,7 +986,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n✗ stage `report` hỏng:\n{report_err}", flush=True)
             print("→ KẾT QUẢ VẪN CÒN NGUYÊN trên đĩa:\n"
                   f"    adapters      : {adapter_root}\n"
-                  f"    pretrain ckpt : {pre_dir / 'ckpt'}\n"
                   f"    predictions   : {run_dir / 'predictions'}\n"
                   f"    điểm mỗi ảnh  : {mdir}/per_sample_*.csv\n"
                   f"    kiểm định     : {ab_path}\n"
@@ -934,24 +1010,14 @@ def main(argv: list[str] | None = None) -> int:
     push_err = None
     if "push" in stages:
         _hr("Đẩy lên Hugging Face")
-        # Hai đích, hai thứ khác nhau — trộn chúng là mời người ta nạp nhầm:
-        #   pretrain.hub_repo : NỬA model (chỉ nhánh, không decoder), repo model
-        #   output.hub_repo   : kết quả §4 (REPORT.md, CSV), repo dataset
-        # `push_results` có ignore_patterns chặn *.safetensors, nên trọng số đẩy
-        # vào repo kết quả sẽ bị bỏ qua ÂM THẦM.
-        if needs_pre and bool((cfg.get("pretrain") or {}).get("push", True)):
-            from . import pretrain_io
-
-            src_p = default_init(run_dir, cfg)
-            if not pretrain_io.pretrain_exists(src_p):
-                print(f"⊘ chưa có {src_p} — bỏ qua", flush=True)
-            else:
-                try:
-                    manifest.setdefault("hub", {})["pretrain"] = \
-                        pretrain_io.push_pretrain(cfg, src_p)
-                except Exception as e:
-                    push_err = str(e)
-                    print(f"✗ đẩy ckpt pretrain hỏng: {e}", flush=True)
+        # CHỈ MỘT đích: `output.hub_repo` (repo dataset của kết quả). §4 không
+        # sinh ra checkpoint pretrain nào — nhánh của nó đến từ §3, và §3 tự đẩy
+        # checkpoint ấy lên repo model của nó. Đẩy lại từ đây là dựng một bản sao
+        # thứ hai của cùng trọng số dưới một cái tên khác, và ngày hai bản lệch
+        # nhau thì không có gì nói bản nào sinh ra bảng này.
+        #
+        # (`push_results` có ignore_patterns chặn *.safetensors, nên trọng số
+        #  đẩy vào repo kết quả sẽ bị bỏ qua ÂM THẦM.)
         if cfg["output"].get("push", True):
             from .push import push_results
 
