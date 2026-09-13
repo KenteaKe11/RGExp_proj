@@ -479,10 +479,17 @@ stats:
 # cosine + suy giảm max_lr -> min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch
 # (tức 8 chu kỳ nối nhau, không phải một chu kỳ kéo dài 8 epoch).
 #
-#   max_lr = 3e-4 , min_lr = 1e-6  =>  div_factor = 3e-4 / 1e-6 = 300
-#                                      final_div_factor = 300
-# Hai con số ấy là CÁCH VIẾT của min_lr trong `impl: lambda`, không phải hai
-# tham số độc lập — sửa `max_lr` mà quên chúng là đổi min_lr trong im lặng.
+# `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
+# chia, và min_lr là TÍCH của chúng:
+#
+#     lr đầu warm-up = max_lr / div_factor              = 3e-4 / 30 = 1e-5
+#     lr cuối cosine = lr đầu / final_div_factor        = 1e-5 / 10 = 1e-6
+#     =>  min_lr = max_lr / (div_factor × final_div_factor) = 3e-4 / 300
+#
+# `min_lr: 1.0e-6` dưới đây là con số ĐƯỢC KIỂM, không phải con số được đọc:
+# `scripts/selftest_section25.py` đối chiếu nó với tích hai hệ số và DỪNG nếu
+# lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
+# đường cong lr sai không ném exception nào.
 pretrain:
   n_train: 0               # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
@@ -492,10 +499,10 @@ pretrain:
   schedule:
     impl: lambda
     max_lr: 3.0e-4
-    min_lr: 1.0e-6
+    min_lr: 1.0e-6          # = max_lr / (div_factor × final_div_factor)
     pct_start: 0.1
-    div_factor: 300.0
-    final_div_factor: 300.0
+    div_factor: 30.0        # lr đầu warm-up = 3e-4 / 30 = 1e-5
+    final_div_factor: 10.0  # lr cuối cosine = 1e-5 / 10 = 1e-6
     anneal: cos
     cycle_momentum: false
   # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
@@ -510,6 +517,26 @@ pretrain:
   hub_repo_type: model
   hub_private: true
   hub_subdir: best
+
+# ── Khoá KỸ THUẬT của hai baseline — không thuộc paper nào ────────────────
+# Ba khoá dưới đây không có trong setup gốc của R2Gen lẫn AdaAtt, và cũng không
+# phải điều kiện của §2.5. Chúng ở đây vì phần cứng, và chúng được tách ra một
+# khối riêng để không ai đọc nhầm một con số phần cứng thành một con số của
+# paper.
+#
+# `micro_batch` KHÔNG phải "hạ batch". Paper của AdaAtt khai batch 80, và ở
+# 512px với ResNet-152 thì 80 ảnh trong MỘT lượt forward không vừa card nào
+# trong tầm. Khoá này chia một batch của paper thành nhiều lượt forward rồi
+# cộng dồn gradient: **batch hiệu dụng, số bước và đường cong lr không đổi**.
+# Hạ `batch_size` trong khối `sota:` thì mới là đổi thí nghiệm — và khối ấy
+# không được chạm vào.
+sota_train:
+  micro_batch: 8
+  infer_batch: 4          # beam nhân số chuỗi lên beam_size lần
+  eval_every: 1           # chấm val sau mỗi epoch (dừng sớm đọc con số này)
+  amp: true               # bf16 nếu card có; không có thì fp32, KHÔNG fp16
+  num_workers: 4
+  grad_clip: 0.0          # 0 = tắt. Không paper nào khai clip — đừng bật ngầm.
 
 wandb:
   enabled: true

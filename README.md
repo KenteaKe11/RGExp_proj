@@ -94,47 +94,61 @@ batch trong config, và vài bước trên vài chục mẫu ngắn không nói 
 configs/section25.yaml       TOÀN BỘ tham số của §2.5, có chú thích lý do.
                              File CHỦ ĐẠO — mọi điểm vào không truyền --config
                              đều đọc nó (src/config.py::DEFAULT_CONFIG).
-requirements.txt             môi trường chính (transformers/torch)
+requirements.txt             môi trường chính (transformers/torch/torchvision)
 requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
   setup.sh                   dựng môi trường
   _env.sh                    chọn python (container vs cục bộ)
-  run_pretrain.sh            Stage 0 — pretrain cục bộ, dùng chung cho mọi candidate
+  run_pretrain.sh            Stage 0 của My Gemma — sup_pretrain, TIÊN QUYẾT
   selftest_pretrain.py       phép kiểm cho sup_pretrain, không cần GPU/mạng
-  run_section25.sh    [⏳]   MỘT LỆNH cho §2.5 (data · train · sinh · chấm ·
+  run_section25.sh           MỘT LỆNH cho §2.5 (data · train · sinh · chấm ·
                              kiểm định · báo cáo)
-  selftest_section25.py [⏳] hàng rào điều kiện: resize thống nhất, ba cặp,
-                             k=3 không chạm Friedman
+  selftest_section25.py      39 phép kiểm: hàng rào chính sách ảnh, họ Holm ba
+                             cặp, dấu hiệu số, từ điển, beam, hai kiến trúc
+                             baseline, k=3 KHÔNG chạm Friedman
 src/
   config.py                  nạp YAML, seed, token
   data.py · data_train.py    3000 ảnh test · 6400 mẫu train + hàng rào rò rỉ
   labels_cls.py              dò labels.npz -> nhãn (L,3) + mask cho ClsHead
-  prompts.py · imaging.py    prompt dùng chung · chính sách ảnh (điều kiện 4)
+  prompts.py                 prompt dùng chung
+  imaging.py                 chính sách ảnh · `unified_tensor` = ĐIỀU KIỆN 4,
+                             một phép biến đổi hình học cho cả ba candidate
   backbone.py                nạp base, gắn adapter, ReportDataset, collate,
                              one-cycle, device_map
   recombiner.py              Recombinator · QFormer(2 vector) · ClsHead ·
                              RouteGate · Sigmoid Gate + Hard Discrete (L0) · ASL
   moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
-  train_recomb.py            vòng huấn luyện chung của candidate C
-  pretrain_sup.py            Stage 0: 100% có giám sát, KHÔNG decoder
+  train_recomb.py            vòng huấn luyện của candidate C
+  pretrain_sup.py            Stage 0 của C: 100% có giám sát, KHÔNG decoder
   pretrain_io.py             ghi/nạp/đẩy đúng các khối đã pretrain
-  run_pretrain.py            điều phối Stage 0 (data · train · push)
+  run_pretrain.py            điều phối Stage 0 của C (data · train · push)
+  sota/                      HAI BASELINE — cài lại theo paper gốc
+    __init__.py              build(name) · param_groups (hệ số 1/5 của đk 5)
+    visual.py                ResNet-101/152 ImageNet, đặc trưng lưới
+    r2gen.py                 Transformer 3 lớp + Relational Memory + MCLN
+    adaatt.py                LSTM + Adaptive Attention + Visual Sentinel
+    tokenizer.py             từ điển mức từ, DÙNG CHUNG cho cả hai
+    decoding.py              beam search dùng chung (block_trigrams…)
+    cider.py                 CIDEr-D + BLEU_4 — CHỈ để chọn checkpoint
+  train_sota.py              Stage 0 (đk 5) + main-stage (đk 1) cho hai baseline
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU
   stats_ab.py                bootstrap BCa · permutation · Holm · sàn dz
-                             — đường kiểm định DUY NHẤT của §2.5
-  runners/gemma3*.py         base trần · +adapter · +nhánh+Experts
-  runners/r2gen.py    [⏳]   R2Gen — vendor code gốc + nạp trọng số
-  runners/adaatt.py   [⏳]   AdaAtt — vendor code gốc + nạp trọng số
-  run_section25.py    [⏳]   điều phối các stage, đọc `arms_s25`
-  report_section25.py [⏳]   REPORT.md + bảng ba cặp
+  stats_multi.py             ba cặp; đổi DUY NHẤT họ Holm, mọi phép tính import
+                             nguyên văn từ stats_ab
+  runners/gemma3*.py         base trần · +adapter · +nhánh+Experts (candidate C)
+  runners/sota.py            R2Gen + AdaAtt — nạp ckpt, sinh bằng beam của paper
+  run_section25.py           điều phối 7 stage, đọc `arms_s25`, ghi `deviations`
+  report_section25.py        REPORT.md + summary.csv + pairwise_tests.csv
   push.py · tracking.py      đẩy Hub · W&B
   preflight.py               kiểm môi trường trước khi nạp model
 ```
 
-`[⏳]` = điều kiện thí nghiệm đã chốt trong config, đường ống chạy chưa dựng.
-Mẫu gần nhất là `_archive/src/run_recomb.py` (7 stage) và
-`_archive/src/report_recomb.py`.
+Hai baseline được **cài lại** chứ không `pip install`: khối `initialization` của
+cả hai setup gốc nói mọi khối ngoài ResNet ImageNet là `random`, nên không có
+checkpoint nào của paper để nạp. "Nạp lại trọng số ở đúng trạng thái setup gốc"
+ở đây có nghĩa đúng như thế — và `scripts/selftest_section25.py` kiểm chính câu
+đó từ config.
 
 ---
 

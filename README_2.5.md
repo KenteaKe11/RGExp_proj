@@ -222,21 +222,38 @@ chạy). Báo cáo vì thế không thể im lặng về chúng.
 
 ---
 
-## 7. Trạng thái cài đặt
+## 7. Cài đặt
 
-| thành phần | trạng thái |
+| điều kiện | sống ở đâu | kiểm ở đâu |
+|---|---|---|
+| 1 · setup gốc | `sota:` trong config · `train_sota.main_stage_spec` | `t_main_stage_spec_reads_paper_numbers`, `t_sota_init_block_says_random` |
+| 2 · 6400/3000 | `data:` · `data_train.check_leak` | `run_section25` dừng với mã 4 |
+| 3 · bootstrap + permutation | `src/stats_multi.py` | 6 phép kiểm ở mục 3 của selftest |
+| 4 · một phép resize | `imaging.unified_tensor` | `t_image_policy_guard`, `t_unified_tensor_shape_and_range` |
+| 5 · Stage 0 cho tất cả | `pretrain:` · `train_sota` · `run_pretrain` | `t_stage0_schedule_encodes_min_lr`, `t_param_groups_apply_mult_to_rest_only` |
+
+| thành phần | |
 |---|---|
-| `configs/section25.yaml` | ✅ file cấu hình chủ đạo |
-| `image_policy` (điều kiện 4) | ✅ khai báo · ⏳ `src/imaging.py` cần một nhánh `unified` |
-| `pretrain` Stage 0 (điều kiện 5) | ✅ dùng lại `src/run_pretrain.py` nguyên văn |
-| `src/stats_ab.py` ba cặp + Holm | ✅ hàm đã có (`compare_all`, `holm`) · ⏳ vòng ba cặp |
-| `src/runners/r2gen.py` | ⏳ chưa có — cần vendor code gốc + nạp trọng số |
-| `src/runners/adaatt.py` | ⏳ chưa có — cần vendor code gốc + nạp trọng số |
-| `src/run_section25.py` | ⏳ chưa có — điều phối stage, đọc `arms_s25` |
-| `src/report_section25.py` | ⏳ chưa có — REPORT.md + bảng ba cặp |
-| `scripts/run_section25.sh` | ⏳ chưa có |
-| `scripts/selftest_section25.py` | ⏳ chưa có |
+| `configs/section25.yaml` | file cấu hình chủ đạo |
+| `src/sota/{r2gen,adaatt,visual,tokenizer,decoding,cider}.py` | hai baseline, cài lại theo paper gốc |
+| `src/train_sota.py` | Stage 0 + main-stage cho hai baseline |
+| `src/runners/sota.py` | nạp ckpt, sinh bằng beam của paper |
+| `src/stats_multi.py` | ba cặp, Holm theo metric |
+| `src/run_section25.py` · `src/report_section25.py` | điều phối 7 stage · REPORT.md |
+| `scripts/run_section25.sh` · `scripts/selftest_section25.py` | một lệnh · 39 phép kiểm |
 
-Điều kiện thí nghiệm đã **chốt** trong config; phần còn lại là đường ống chạy.
-Mẫu gần nhất để dựng chúng là `_archive/src/run_recomb.py` (7 stage) và
-`_archive/src/report_recomb.py`.
+`scripts/selftest_section25.py` chạy vài giây, không cần GPU lẫn mạng, và
+`run_section25.sh` gọi nó trước khi tiêu một giây GPU nào. Nó không kiểm "code
+có chạy không" — nó kiểm đúng những thứ **hỏng mà không ném exception**: họ Holm
+sai kích thước, cặp bị đảo dấu, hai đường tiền xử lý ảnh, từ điển bị dựng lại
+giữa hai stage, `min_lr` lệch khỏi tích hai hệ số chia, và Friedman lẻn trở lại
+đường chạy.
+
+### Còn thiếu
+
+* **`bert_score` trên 3 cột** tốn thời gian hơn hai mục trước (3000 × 3 thay vì
+  × 2). Không có gì phải sửa, chỉ là một con số cần biết trước khi thuê máy.
+* **Chưa có phép kiểm nào chạy THẬT hai baseline tới hội tụ.** Selftest kiểm
+  hình dạng, gradient và ranh giới; nó không nói hai bản cài lại có tái lập
+  được điểm trong paper gốc trên MIMIC-CXR hay không. Đó là một câu hỏi của lần
+  chạy thật, và nó thuộc mục Giới hạn của REPORT.

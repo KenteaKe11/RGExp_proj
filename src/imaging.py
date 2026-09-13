@@ -204,3 +204,107 @@ def enforce_max_side(paths, max_side: int, label: str = "cache") -> dict:
     if bad:
         print(f"  ⚠ [{label}] {bad} file không đọc được", flush=True)
     return stats
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ĐIỀU KIỆN 4 CỦA §2.5 — MỘT phép biến đổi hình học cho BA candidate
+# ════════════════════════════════════════════════════════════════════════════
+# R2Gen quen 224 (ResNet-101), AdaAtt quen 224 (ResNet-152), Gemma 3 khoá cứng
+# 896. Ba con số khác nhau, và đó KHÔNG phải lý do để mỗi model tự resize theo
+# cách của nó: nếu R2Gen dùng RandomCrop còn Gemma dùng bilinear-longest-side
+# thì một phần chênh lệch trong bảng là chênh lệch của hai bộ TIỀN XỬ LÝ, không
+# phải của hai kiến trúc — và không có exception nào nổ ra để nói điều đó.
+#
+# Nên: đúng MỘT lần letterbox (giữ tỉ lệ, bicubic, pad vuông) về
+# `image_policy.resize_to`, rồi mỗi model chỉ còn được chuẩn hoá GIÁ TRỊ pixel
+# theo thống kê backbone của nó. Gemma vẫn đi qua processor 896 của nó — đó là
+# ràng buộc kiến trúc, không phải một lựa chọn — nhưng ảnh NGUỒN mà nó nhận đã
+# là đúng cùng một ảnh mà hai baseline nhận.
+#
+# `allow_native_match: false` là câu quan trọng nhất ở đây: ngay cả khi một
+# model đòi ĐÚNG `resize_to`, ảnh vẫn đi qua đường chung. "Vô tình khớp" không
+# được phép biến thành một đường tiền xử lý thứ hai.
+
+_INTERP = {"bicubic": "BICUBIC", "bilinear": "BILINEAR", "lanczos": "LANCZOS",
+           "nearest": "NEAREST"}
+
+
+def unified_policy(cfg) -> dict:
+    """Khối `image_policy` đã giải quyết, kèm hàng rào nhất quán với `data`."""
+    ip = dict((cfg.get("image_policy", {}) or {}))
+    if not ip.get("unified", False):
+        raise ImagePolicyViolation(
+            "image_policy.unified = false. §2.5 so ba kiến trúc trên cùng một "
+            "ảnh; tắt nó đi là để mỗi model tự resize, và bảng khi ấy đo cả "
+            "chênh lệch của ba bộ tiền xử lý. Nếu thật sự muốn vậy thì đó là "
+            "một thí nghiệm khác và nó phải nói ra trong REPORT.")
+    size = int(ip.get("resize_to", 512))
+    max_side = int((cfg.get("data", {}) or {}).get("image_max_side", size))
+    if size != max_side:
+        raise ImagePolicyViolation(
+            f"image_policy.resize_to = {size} nhưng data.image_max_side = "
+            f"{max_side}. Cache ảnh đã bị `enforce_max_side` cắt về "
+            f"{max_side}px, nên phóng lên {size}px chỉ nội suy lại chi tiết đã "
+            f"mất — một phép biến đổi im lặng làm ba cột nhìn ảnh mờ hơn chính "
+            f"nó. Đặt hai số bằng nhau.")
+    interp = str(ip.get("interpolation", "bicubic")).lower()
+    if interp not in _INTERP:
+        raise ImagePolicyViolation(
+            f"image_policy.interpolation = {interp!r}; hợp lệ: "
+            f"{', '.join(sorted(_INTERP))}.")
+    return {
+        "size": size,
+        "interpolation": interp,
+        "keep_aspect": bool(ip.get("keep_aspect", True)),
+        "pad_to_square": bool(ip.get("pad_to_square", True)),
+        "pad_fill": int(ip.get("pad_fill", 0)),
+        "allow_native_match": bool(ip.get("allow_native_match", False)),
+        "per_model_normalize_only": bool(ip.get("per_model_normalize_only", True)),
+    }
+
+
+def describe_unified(cfg) -> str:
+    p = unified_policy(cfg)
+    return (f"letterbox {p['size']}² · {p['interpolation']} · "
+            f"{'giữ tỉ lệ' if p['keep_aspect'] else 'kéo méo'}"
+            f"{' · pad vuông' if p['pad_to_square'] else ''} · "
+            f"khớp gốc {'ĐƯỢC BỎ QUA' if not p['allow_native_match'] else 'được dùng'}")
+
+
+def unified_image(path, cfg):
+    """Ảnh đã qua ĐÚNG một phép biến đổi hình học dùng chung. Trả PIL.Image."""
+    from PIL import Image
+
+    p = unified_policy(cfg)
+    resample = getattr(Image, _INTERP[p["interpolation"]])
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        s = p["size"]
+        if p["keep_aspect"]:
+            scale = s / max(w, h)
+            nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+            im = im.resize((nw, nh), resample)
+            if p["pad_to_square"]:
+                fill = p["pad_fill"]
+                canvas = Image.new("RGB", (s, s), (fill, fill, fill))
+                canvas.paste(im, ((s - nw) // 2, (s - nh) // 2))
+                im = canvas
+        else:
+            im = im.resize((s, s), resample)
+        return im.copy()
+
+
+def unified_tensor(paths, cfg):
+    """(B, 3, S, S) trong [0, 1]. KHÔNG chuẩn hoá — đó là việc của từng model.
+
+    Tách hai bước ra là chỗ `per_model_normalize_only` trở thành một sự thật
+    của code: hàm này không biết ImageNet mean/std là gì, nên nó không thể lén
+    áp một phép chuẩn hoá của riêng model nào.
+    """
+    import numpy as np
+    import torch
+
+    arrs = [np.asarray(unified_image(p, cfg), dtype=np.uint8) for p in paths]
+    x = torch.from_numpy(np.stack(arrs)).permute(0, 3, 1, 2).contiguous()
+    return x.float().div_(255.0)

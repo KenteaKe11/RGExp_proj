@@ -41,6 +41,13 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
+# §2.5 — hai baseline đối chứng dùng ResNet-101/152 ImageNet của torchvision.
+# KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản torch đang cài (cùng lý do
+# torch không nằm trong file này), và pip tự giải quyết ràng buộc ấy khi cài
+# cạnh một torch đã có. Cài nhầm bản là lỗi "operator torchvision::nms does not
+# exist" ở lần forward đầu tiên, không phải lúc import.
+torchvision
+
 # Metrics
 sacrebleu>=2.4.0
 rouge-score>=0.1.2
