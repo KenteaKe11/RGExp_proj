@@ -136,7 +136,7 @@ def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path,
     # Một lần chạy `--stages report` trên máy không GPU vẫn phải đọc được cache,
     # và nó không cần biết adapter có đủ file hay không.
     try:
-        from . import train_recomb as tr_mod
+        from .._archive.src import train_recomb as tr_mod
 
         _trained = tr_mod.already_trained
     except Exception:
@@ -466,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     cls_pack = None
     need_b = any(x.get("recomb") for x in arms_to_train)
     if need_b and need_train_run:
-        from . import labels_cls
+        from .._archive.src import labels_cls
 
         _hr("Nhãn phân loại (ClsHead)")
         # Chỉ DÒ SCHEMA ở đây. Nhãn thật phải căn theo thứ tự hàng của train_df,
@@ -485,8 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             return 5
 
     # ── data ────────────────────────────────────────────────────────────────
-    from . import data as data_mod
-    from . import data_train as dt_mod
+    from .._archive.src import data as data_mod
+    from .._archive.src import data_train as dt_mod
 
     train_df = val_df = None
     if "data" in stages:
@@ -510,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         _hr(f"Huấn luyện {len(arms_to_train)}/{len(arms)} candidate — "
             + ("candidate NẶNG nhất (E lớn nhất) TRƯỚC" if is_moe
                else "candidate B TRƯỚC"))
-        from . import train_recomb as tr_mod
+        from .._archive.src import train_recomb as tr_mod
         from .backbone import TrainUnusable, preflight_adapters
 
         preset = tr_mod.resolve_preset(cfg)
@@ -700,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     # Dùng bản thuộc về đường kiểm định đang chạy để không tạo một đường phụ
     # thuộc chéo giữa hai module thống kê.
     if is_moe:
-        from .stats_friedman import align_blocks
+        from .._archive.src.stats_friedman import align_blocks
     else:
         from .stats_ab import align_blocks
 
@@ -727,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     if is_moe:
         if "stats" in stages:
             _hr("Friedman + hậu kiểm Wilcoxon/Holm")
-            from .stats_friedman import (friedman_all, negligible_warning,
+            from .._archive.src.stats_friedman import (friedman_all, negligible_warning,
                                          posthoc_all)
 
             cols = metric_columns(scores[want_ids[0]])
@@ -839,12 +839,12 @@ def main(argv: list[str] | None = None) -> int:
         report_err = None
         try:
             if is_moe:
-                from . import report_moe
+                from .._archive.src import report_moe
 
                 report_moe.write_all(cfg, run_dir, scores, names, fr, ab,
                                      train_stats, manifest, arms=arms)
             else:
-                from . import report_recomb
+                from .._archive.src import report_recomb
 
                 # `report_recomb.build_markdown` tự suy A/B từ cờ `recomb` trong
                 # config — truyền thêm arm_a/arm_b vào đây là một TypeError, và nó
