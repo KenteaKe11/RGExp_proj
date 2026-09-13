@@ -78,7 +78,9 @@ D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
     "siglip_dim": D_VIS, "swiglu_hidden": 32, "out_dim": None,
     "n_query": 4, "n_vis": 12, "n_heads": 2, "dropout": 0.0,
-    "swiglu_dropout": 0.0, "pre_norm": True, "gate_init": 0.0,
+    "swiglu_dropout": 0.0, "pre_norm": True,
+    "gate": {"beta": 2.0 / 3.0, "stretch_lo": -0.1, "stretch_hi": 1.1},
+    "gate_init_logit": -2.5,
     "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"], "d_model": 12,
                 "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0},
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,
@@ -235,7 +237,7 @@ def compat_tests() -> None:
     import copy
 
     from src import pretrain_io as P
-    from _archive.src import train_recomb as T
+    from src import train_recomb as T
 
     def t_query_rows():
         b = _branch()
@@ -356,7 +358,7 @@ class _FakePeft:
 
 def lr_tests() -> None:
     from src import pretrain_io as P
-    from _archive.src import train_recomb as T
+    from src import train_recomb as T
 
     TCFG = {"schedule": {"max_lr": 3e-4}, "weight_decay": 0.0,
             "branch_weight_decay": 0.01, "gate_lr_mult": 20.0,
@@ -441,7 +443,7 @@ def lr_tests() -> None:
 
 # ═══ 5. λ-warmup ở decoder_ft ════════════════════════════════════════════════
 def lambda_tests() -> None:
-    from _archive.src import train_recomb as T
+    from src import train_recomb as T
 
     def t_warmup_math():
         # scratch: λ leo từ 0 trong 10% đầu
