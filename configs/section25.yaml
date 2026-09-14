@@ -494,8 +494,8 @@ pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
   cycle_per_epoch: 1
-  per_device_batch_size: 16
-  grad_accum: 2
+  per_device_batch_size: 8
+  grad_accum: 4
   schedule:
     impl: lambda
     max_lr: 3.0e-4
