@@ -264,11 +264,11 @@ def one_cycle(step: int, total: int, pct_start: float, div_factor: float,
 def build_scheduler(optimizer, total_steps: int, scfg: dict):
     """Build the warm-up/cosine scheduler.
 
-    ``cycle_steps`` makes the same warm-up + cosine curve restart continuously
-    at epoch boundaries.  It is deliberately expressed in optimizer steps (not
-    dataloader batches), so gradient accumulation cannot silently shift a
-    restart.  The pretrain runner resolves this value after it knows the true
-    number of optimizer steps in an epoch.
+    ``cycle_steps`` makes warm-up + cosine restart at epoch boundaries.
+    ``lr_decay`` scales the WHOLE curve at every restart: both ``max_lr`` and
+    the implied ``min_lr`` receive ``lr_decay ** epoch``. It is deliberately
+    expressed in optimizer steps (not dataloader batches), so gradient
+    accumulation cannot silently shift a restart.
     """
     impl = str(scfg.get("impl", "lambda")).lower()
     pct = float(scfg.get("pct_start", 0.1))
@@ -276,8 +276,11 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
     fdv = float(scfg.get("final_div_factor", 100.0))
     anneal = str(scfg.get("anneal", "cos"))
     cycle_steps = int(scfg.get("cycle_steps", 0) or 0)
+    lr_decay = float(scfg.get("lr_decay", 1.0))
     if cycle_steps < 0:
         raise TrainUnusable("schedule.cycle_steps phải >= 0")
+    if not 0.0 < lr_decay <= 1.0:
+        raise TrainUnusable("schedule.lr_decay phải nằm trong (0, 1]")
     if impl == "torch":
         if cycle_steps:
             raise TrainUnusable(
@@ -297,9 +300,11 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
         if not cycle_steps:
             return one_cycle(step, total_steps, pct, dv, fdv, anneal)
         # LambdaLR calls us at 0 initially, then after every optimizer step.
-        # At exactly k*cycle_steps, start the next cycle at the warm-up floor.
-        return one_cycle(int(step) % cycle_steps, cycle_steps, pct, dv, fdv,
-                         anneal)
+        # At exactly k*cycle_steps, start the next cycle at its decayed floor.
+        step = int(step)
+        epoch_idx = step // cycle_steps
+        return (lr_decay ** epoch_idx) * one_cycle(
+            step % cycle_steps, cycle_steps, pct, dv, fdv, anneal)
 
     return LambdaLR(optimizer, _factor)
 

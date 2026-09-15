@@ -354,9 +354,9 @@ recombiner:
   # giảm trên trục token: 1024 -> 512 -> 256 -> 128 -> 64.
   n_query: 64
   highway_token_dims: [512, 256, 128]
-  n_heads: 18                     # Extractor MHA: 1152 / 18 = head_dim 64
-  dropout: 0.0                    # trên attention
-  swiglu_dropout: 0.0             # chỉ Preparer SwiGLU
+  n_heads: 18                      # Extractor MHA: 1152 / 18 = head_dim 64
+  dropout: 0.05                    # trên attention
+  swiglu_dropout: 0.05             # chỉ Preparer SwiGLU
 
   # ── QFormer: 2 VECTOR CHO 2 TASK, KHÔNG BIẾT GÌ VỀ NHAU ──────────────────
   # Đây là QUY ƯỚC CỦA THIẾT KẾ, không phải một chi tiết cài đặt: mỗi task nhận
@@ -381,7 +381,7 @@ recombiner:
     n_layers: 1                  # chỉ phải sinh HAI vector, không phải 32 token
     n_heads: 16
     ffn_mult: 2
-    dropout: 0.0
+    dropout: 0.05
 
   # Số expert mà Route_Gate sẽ định tuyến — Ở §2.3 KHÔNG DÙNG. Khoá này chỉ
   # quyết định hình dạng hai ma trận (d_model × n_experts) trong checkpoint, để
@@ -468,7 +468,7 @@ classifier:
     # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
     # dương và 2 ô âm; lớp `neg` bật ở phần lớn bệnh lý nên hai ô pos/uncertain
     # gần như luôn mang nhãn 0 và dễ tới mức áp đảo tổng gradient.
-    gamma_neg: [3.0, 0.0, 0.0]
+    gamma_neg: [4.0, 2.0, 0.0]
     gamma_pos: 0.0
     # clip dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
     # p < clip đóng góp ĐÚNG BẰNG 0, không phải chỉ nhỏ.
@@ -743,8 +743,8 @@ pretrain:
 
   # Chỉ Stage 0 pretrain dùng train_bs (= effective batch) 32. Không áp dụng
   # giá trị này cho decoder fine-tuning hay các baseline.
-  per_device_batch_size: 32
-  grad_accum: 1
+  per_device_batch_size: 16
+  grad_accum: 2
 
   # Warm-up + cosine restart LIÊN TỤC ở MỖI epoch. `cycle_steps` được runner
   # suy ra từ số optimizer step thật trong một epoch rồi ghi vào checkpoint.
@@ -752,6 +752,9 @@ pretrain:
   schedule:
     impl: lambda
     max_lr: 3e-4
+    # Mỗi epoch restart giảm CẢ max_lr và min_lr theo cùng hệ số 0.9.
+    # min_lr epoch 1 = 3e-4/(25×100) = 1.2e-7; epoch e nhân thêm 0.9^e.
+    lr_decay: 0.9
     pct_start: 0.1
     div_factor: 25.0
     final_div_factor: 100.0

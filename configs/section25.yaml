@@ -369,8 +369,8 @@ recombiner:
   n_query: 64
   highway_token_dims: [512, 256, 128]
   n_heads: 18
-  dropout: 0.0
-  swiglu_dropout: 0.0
+  dropout: 0.05
+  swiglu_dropout: 0.05
   qformer:
     tasks: [sup, aux]
     freeze: [aux]
@@ -378,7 +378,7 @@ recombiner:
     n_layers: 1
     n_heads: 16
     ffn_mult: 2
-    dropout: 0.0
+    dropout: 0.05
   # Điều kiện của mục: E = 10 (§2.4 đã chốt), K = 6 nằm ở `arms_s25`.
   n_experts: 10
   token_type: text
@@ -407,7 +407,7 @@ classifier:
   # Lệch nhãn neg/pos/uncertain nên KHÔNG dùng CE thường. ASL, lực nén grad
   # phía neg = 2.0, pos/uncertain = 0.0.
   asl:
-    gamma_neg: [3.0, 0.0, 0.0]
+    gamma_neg: [4.0, 2.0, 0.0]
     gamma_pos: 0.0
     clip: 0.02
     eps: 1.0e-8
@@ -476,8 +476,8 @@ stats:
 
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ. Lịch: warm-up
-# cosine + suy giảm max_lr -> min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch
-# (tức 8 chu kỳ nối nhau, không phải một chu kỳ kéo dài 8 epoch).
+# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch. Sau mỗi
+# restart, `lr_decay` hạ CẢ hai mốc (tức 8 chu kỳ nối nhau có biên giảm dần).
 #
 # `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
 # chia, và min_lr là TÍCH của chúng:
@@ -495,12 +495,14 @@ pretrain:
   n_epochs: 8
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
-  per_device_batch_size: 32
-  grad_accum: 1
+  per_device_batch_size: 16
+  grad_accum: 2
   schedule:
     impl: lambda
     max_lr: 3.0e-4
     min_lr: 1.0e-6          # = max_lr / (div_factor × final_div_factor)
+    # Restart epoch e nhân cả max_lr và min_lr với 0.9^e.
+    lr_decay: 0.9
     pct_start: 0.1
     div_factor: 30.0        # lr đầu warm-up = 3e-4 / 30 = 1e-5
     final_div_factor: 10.0  # lr cuối cosine = 1e-5 / 10 = 1e-6
@@ -508,8 +510,8 @@ pretrain:
     cycle_momentum: false
   # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
   # đang dùng; hai đầu mút để ở đây để một lần dò không phải đi tìm lại.
-  weight_decay: 0.02
-  weight_decay_range: [0.03, 0.1]
+  weight_decay: 0.01
+  weight_decay_range: [0.01, 0.1]
   base_method: qlora
   select_metric: cls_f1_pos
   keep_last_ckpt: 2

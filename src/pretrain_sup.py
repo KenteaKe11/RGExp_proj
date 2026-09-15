@@ -551,6 +551,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
           f"· {n_epochs} epoch × {per_epoch} bước = {steps} bước "
           f"· val {0 if ds_val is None else len(ds_val)} mẫu"
           + (f" · warmup+cosine restart / {per_epoch} bước"
+             f" · lr_decay {float(scfg.get('lr_decay', 1.0)):.4g} (max/min cùng giảm)"
              if scfg.get("cycle_steps") else "")
           + (f" · SWA từ epoch {swa_start_epoch}" if swa_enabled else ""),
           flush=True)
