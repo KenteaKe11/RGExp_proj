@@ -301,7 +301,9 @@ class QFormer(nn.Module):
                 "ffn": SwiGLU(d_model, d_model * max(1, int(ffn_mult)),
                               d_model, dropout),
             }))
-        self.norm_out = RMSNorm(d_model)
+        # Mỗi vector task có RMSNorm RIÊNG: vec_1 (sup) và vec_2 (aux) không
+        # dùng chung scale học được, dù chúng đi qua cùng thân QFormer.
+        self.output_norms = nn.ModuleDict({t: RMSNorm(d_model) for t in self.tasks})
 
         # ── VÌ SAO KHÔNG DÙNG register_hook ──────────────────────────────────
         # Cách viết quen tay để đóng băng vài HÀNG của một Parameter là gắn một
@@ -330,10 +332,9 @@ class QFormer(nn.Module):
         for lyr in self.layers:
             x = x + lyr["attn"](lyr["norm_q"](x), ctx)
             x = x + lyr["ffn"](lyr["norm_f"](x))
-        x = self.norm_out(x)                              # (B, n_task, d_model)
         out: dict[str, torch.Tensor] = {}
         for i, t in enumerate(self.tasks):
-            v = x[:, i]
+            v = self.output_norms[t](x[:, i])             # RMSNorm riêng cho từng vec
             # detach cho task đóng băng: khoá query thôi là chưa đủ — xem
             # docstring module, mục Route_Gate.
             out[t] = v.detach() if t in self.frozen else v
