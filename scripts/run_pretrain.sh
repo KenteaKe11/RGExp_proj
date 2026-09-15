@@ -6,7 +6,7 @@
 #     bash scripts/run_pretrain.sh --detach             # chạy NỀN, trả lại shell
 #     bash scripts/run_pretrain.sh --dry-run            # 32 mẫu, 2 epoch
 #     bash scripts/run_pretrain.sh --stages train
-#     bash scripts/run_pretrain.sh --stages push        # đẩy ckpt/best
+#     bash scripts/run_pretrain.sh --stages push        # đẩy ckpt/latest (SWA)
 #     bash scripts/run_pretrain.sh --epochs 12
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_pretrain`.
@@ -25,7 +25,8 @@
 #
 # ── Checkpoint theo EPOCH ───────────────────────────────────────────────────
 #     runs/sup_pretrain/ckpt/epoch_001/ … epoch_NNN/   (giữ keep_last_ckpt cái)
-#     runs/sup_pretrain/ckpt/best/                     (KHÔNG bao giờ bị dọn)
+#     runs/sup_pretrain/ckpt/best/                     (metric tốt nhất)
+#     runs/sup_pretrain/ckpt/latest/                   (SWA cuối, để finetune)
 #     runs/sup_pretrain/ckpt/last.json                 (mốc để chạy tiếp)
 #
 # Ghi sau MỖI lượt đi hết trainset, kèm trạng thái RNG + `cursor` + chỉ số mẫu
@@ -50,7 +51,7 @@
 #
 # ── Sau khi xong ────────────────────────────────────────────────────────────
 #     bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
-#          --init-from runs/sup_pretrain/ckpt/best
+#          --init-from runs/sup_pretrain/ckpt/latest
 #
 # `decoder_ft` hạ learning rate của riêng nhánh MLP đã pretrain
 # (`train.pretrained_lr_mult`) để nó không bị CE kéo giật khỏi chỗ đã hội tụ

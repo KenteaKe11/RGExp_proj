@@ -4,7 +4,7 @@
     python -m src.run_section25 --dry-run            # 8 ảnh, 16 mẫu, 4 bước
     python -m src.run_section25 --stages stats,report
     python -m src.run_section25 --arms my_gemma
-    python -m src.run_section25 --init-from hub:OWNER/NAME/best
+    python -m src.run_section25 --init-from hub:OWNER/NAME/latest
     python -m src.run_section25 --init-from none     # My Gemma KHÔNG pretrain
 
 Mã thoát:
@@ -33,7 +33,7 @@ khi bảng vẫn in ra bình thường).
 
 ── VÌ SAO STAGE 0 CỦA MY GEMMA KHÔNG CHẠY Ở ĐÂY ────────────────────────────
 `sup_pretrain` có điểm vào riêng (`scripts/run_pretrain.sh`), ghi ra
-`runs/<pretrain.subdir>/ckpt/best`, và nó chạy trên TOÀN BỘ train split. Gộp nó
+`runs/<pretrain.subdir>/ckpt/latest`, và nó chạy trên TOÀN BỘ train split. Gộp nó
 vào đây nghĩa là mỗi lần chạy lại §2.5 để in một bảng cũng kéo theo 8 epoch
 pretrain — và tệ hơn, `--arms my_gemma` sẽ lặng lẽ pretrain LẠI trên một run
 dir khác. §2.5 chỉ NẠP checkpoint ấy và dừng nếu không thấy (mã 9).
@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--init-from", default=None,
-                    help="nguồn Stage 0 cho My Gemma: thư mục | hub:OWNER/NAME/best "
+                    help="nguồn Stage 0 cho My Gemma: thư mục | hub:OWNER/NAME/latest "
                          "| none (đối chứng from-scratch, PHẢI nói ra)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
@@ -417,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         if spec is None:
             p = dict(cfg.get("pretrain", {}) or {})
             spec = str(Path(cfg["output"].get("dir", "./runs"))
-                       / str(p.get("subdir", "sup_pretrain")) / "ckpt" / "best")
+                       / str(p.get("subdir", "sup_pretrain")) / "ckpt" / "latest")
         if str(spec).lower() == "none":
             cfg["pretrain_init"] = None
             cfg["mode"] = "scratch"

@@ -20,7 +20,7 @@ bash scripts/run_pretrain.sh --detach
 
 # CHẾ ĐỘ 2 — finetune decoder CÙNG LÚC với nhánh đã pretrain
 bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
-     --init-from runs/sup_pretrain/ckpt/best --detach
+     --init-from runs/sup_pretrain/ckpt/latest --detach
 ```
 
 ---
@@ -41,7 +41,7 @@ Không CE, không `λ`, không LoRA, không Aux Loss. **Decoder không chạy.**
 Ở §2.3, nhánh học **hai việc cùng lúc** từ một điểm khởi đầu ngẫu nhiên:
 
 * sinh ra đặc trưng **mang thông tin bệnh lý** — gradient từ ASL;
-* sinh ra 32 token **mà decoder dùng được** — gradient từ CE.
+* sinh ra 64 token **mà decoder dùng được** — gradient từ CE.
 
 Cả hai đi qua cùng một Recombinator, và cả hai bắt đầu từ nhiễu. Với
 `lambda = 0.2` và ~200 bước one-cycle, phần lớn lịch học bị tiêu vào việc đưa
@@ -143,6 +143,7 @@ runs/sup_pretrain/
   ckpt/
     epoch_001/ … epoch_NNN/   sup_pretrain.* + trainer_state.pt
     best/                     theo `select_metric` trên VAL — KHÔNG bao giờ bị dọn
+    latest/                   trung bình SWA cuối — checkpoint dùng cho finetune
     last.json                 mốc để chạy tiếp
   history.csv                 mỗi epoch một hàng
   pretrain_stats.json
@@ -176,7 +177,7 @@ nhiên nhất mà người ta làm với một lần pretrain.
 ```yaml
 pretrain:
   hub_repo: RGExp123/RGExp_sup_pretrain      # model, private
-  hub_subdir: best
+  hub_subdir: latest
 ```
 
 Không dùng `output.hub_repo` (dataset kết quả). Hai lý do, cả hai cơ học:
@@ -193,7 +194,7 @@ phần Giới hạn trong card nói rằng file này chỉ dùng lại được 
 và **đúng** chính sách ảnh ấy.
 
 ```bash
-bash scripts/run_pretrain.sh --stages push            # đẩy ckpt/best
+bash scripts/run_pretrain.sh --stages push            # đẩy ckpt/latest (SWA)
 bash scripts/run_pretrain.sh --stages push --push-epoch 7
 ```
 
@@ -203,8 +204,8 @@ bash scripts/run_pretrain.sh --stages push --push-epoch 7
 bash scripts/run_pretrain.sh --resume                          # ckpt mới nhất
 bash scripts/run_pretrain.sh --resume -o pretrain.n_epochs=6 \
                                       -o pretrain.schedule.max_lr=5e-5
-bash scripts/run_pretrain.sh --resume hub:OWNER/NAME/best@a1b2c3d
-bash scripts/run_pretrain.sh --resume runs/sup_pretrain/ckpt/best
+bash scripts/run_pretrain.sh --resume hub:OWNER/NAME/latest@a1b2c3d
+bash scripts/run_pretrain.sh --resume runs/sup_pretrain/ckpt/latest
 ```
 
 **`--resume` và `--no-resume` không phải hai chiều của một khoá.** Chúng nói về
@@ -234,7 +235,7 @@ là một commit mới mang một epoch cũ.
 
 **Ghi vào một run dir MỚI**, `<subdir>_r2`, `_r3`, … chứ không ghi đè
 `runs/<subdir>/`. Hai lý do cơ học: `history.csv` của một thư mục phải là **một**
-đường cong đọc được; và `ckpt/best` cũ chính là thứ `--resume` vừa lấy làm
+đường cong đọc được; và `ckpt/latest` cũ chính là thứ `--resume` vừa lấy làm
 nguồn — ghi đè nó bằng epoch 1 của lần chạy mới là phá chính cái mốc đang so.
 Nếu `_rN` cao nhất còn một lần chạy dở (`trainer_state.pt` nối tiếp được) thì
 lệnh **dùng lại** thư mục ấy và nối tiếp cục bộ, thay vì tải lại trọng số cũ từ
@@ -267,9 +268,9 @@ vẫn cùng `runners/gemma3_recomb`. Khác đúng ba chỗ, và cả ba đọc �
 ### 2.1. Nhánh khởi tạo từ checkpoint, không từ nhiễu
 
 ```bash
---init-from runs/sup_pretrain/ckpt/best
---init-from hub:RGExp123/RGExp_sup_pretrain/best
---init-from hub:RGExp123/RGExp_sup_pretrain/best@a1b2c3d
+--init-from runs/sup_pretrain/ckpt/latest
+--init-from hub:RGExp123/RGExp_sup_pretrain/latest
+--init-from hub:RGExp123/RGExp_sup_pretrain/latest@a1b2c3d
 ```
 
 Nguồn được **giải quyết đúng một lần** cho cả lần chạy, trong `run_recomb`, chứ
@@ -300,7 +301,7 @@ khoảng `lr`, bất kể gradient lớn hay nhỏ, bất kể tham số ấy đ
 
 Sau `sup_pretrain`, Recombinator + QFormer + ClsHead đã nằm ở một cực tiểu của
 ASL. Ở bước 0 của `decoder_ft`, CE là nguồn gradient **mới** và lớn — decoder
-chưa từng thấy 32 token này. Với lr đỉnh 3e-4 dùng chung, vài chục bước đầu đủ
+chưa từng thấy 64 token này. Với lr đỉnh 3e-4 dùng chung, vài chục bước đầu đủ
 để đẩy nhánh ra khỏi chỗ đã hội tụ, và cái mất đi là **toàn bộ thứ pretrain vừa
 mua**. Triệu chứng: `cls_f1_pos` tụt trong 10% đầu lịch rồi không quay lại,
 trong khi CE giảm bình thường — không có exception, không có dòng log nào gọi
@@ -393,9 +394,9 @@ tail -f logs/pretrain_*.log
 
 # CHẾ ĐỘ 2
 bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
-     --init-from runs/sup_pretrain/ckpt/best --detach
+     --init-from runs/sup_pretrain/ckpt/latest --detach
 bash scripts/run_recomb.sh --exp 2.4 --mode decoder_ft \
-     --init-from runs/sup_pretrain/ckpt/best --detach
+     --init-from runs/sup_pretrain/ckpt/latest --detach
 ```
 
 Muốn so "pretrain có giúp không" thì chạy **cả hai** chế độ của cùng một `--exp`
@@ -414,9 +415,9 @@ liệu mà nhánh đã thấy (pretrain dùng toàn bộ split).
 | `pretrain.n_train` | `0` | 0 = **toàn bộ** `data.train_split_csv` |
 | `pretrain.n_epochs` | `8` | số lượt đi hết trainset |
 | `pretrain.per_device_batch_size` × `grad_accum` | `8 × 4` | eff_bs 32 — **bằng** §2.3, có chủ ý |
-| `pretrain.schedule` | one-cycle 3e-4 | trải trên **toàn bộ** n_epochs, không phải mỗi epoch một chu kỳ |
+| `pretrain.schedule` | warm-up + cosine 3e-4 | restart liên tục ở mỗi epoch |
 | `pretrain.base_method` | `qlora` | phải **giống** `lora.preset` của §2.3 |
-| `pretrain.keep_last_ckpt` | `2` | `ckpt/best` không bao giờ bị dọn |
+| `pretrain.keep_last_ckpt` | `2` | `ckpt/best` và `ckpt/latest` không bao giờ bị dọn |
 | `pretrain.select_metric` | `cls_f1_pos` | trên **val**; `cls_acc` không dùng được |
 | `pretrain.hub_repo` | `RGExp123/RGExp_sup_pretrain` | repo **model**, tách khỏi repo kết quả |
 | `train.pretrained_lr_mult` | `0.1` | lr của nhánh đã pretrain, ở decoder_ft |
@@ -429,10 +430,9 @@ một head đoán `neg` cho **mọi** ô vẫn đạt accuracy rất cao trong k
 được gì. F1 của lớp `pos` không có chỗ trốn kiểu đó — cùng lý lẽ với
 `recombiner.cls_metrics`.
 
-Vì sao lịch one-cycle trải trên toàn bộ `n_epochs` chứ không lặp mỗi epoch:
-nhiều chu kỳ nghĩa là mỗi epoch lại đẩy nhánh ra khỏi cực tiểu vừa tìm được, và
-`ckpt/best` sẽ luôn rơi vào ngay sau một đáy chu kỳ **vì lý do cơ học** chứ
-không vì epoch ấy tốt hơn.
+Lịch warm-up + cosine được restart liên tục ở mỗi epoch. Checkpoint để finetune
+là `ckpt/latest`: trung bình SWA của nửa sau lịch, thay vì checkpoint `best`
+được chọn theo một metric validation đơn lẻ.
 
 ---
 

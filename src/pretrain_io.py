@@ -329,7 +329,7 @@ def resolve_source(spec: str, cache_dir: str | Path | None = None) -> Path:
     """`--init-from` -> một thư mục cục bộ có sẵn hai file.
 
     Ba dạng nhận vào:
-        /đường/dẫn/ckpt/best          thư mục cục bộ
+        /đường/dẫn/ckpt/latest        thư mục cục bộ (SWA cuối)
         hub:OWNER/NAME                repo model, gốc repo
         hub:OWNER/NAME/SUBDIR@rev     thư mục con + revision
 
@@ -347,7 +347,7 @@ def resolve_source(spec: str, cache_dir: str | Path | None = None) -> Path:
                 f"{p} không phải checkpoint sup_pretrain (thiếu {PRETRAIN_FILE} "
                 f"hoặc {PRETRAIN_META}).\n"
                 f"    Trỏ vào thư mục ckpt cụ thể, ví dụ "
-                f"runs/sup_pretrain/ckpt/best — không phải thư mục run.")
+                f"runs/sup_pretrain/ckpt/latest — không phải thư mục run.")
         return p
 
     from huggingface_hub import snapshot_download
@@ -480,7 +480,7 @@ def latest_on_hub(cfg, revision: str | None = None,
                f"{broken}\n" if cands else "")
             + f"    Chưa đẩy lần nào? Chạy `python -m src.run_pretrain "
               f"--stages push` trước, hoặc trỏ thẳng vào một thư mục ckpt cục "
-              f"bộ: --resume runs/sup_pretrain/ckpt/best")
+              f"bộ: --resume runs/sup_pretrain/ckpt/latest")
 
     ok.sort(key=_rank, reverse=True)
     win = ok[0]
@@ -580,8 +580,8 @@ pretrain.
 ## Nạp lại
 
 ```bash
-python -m src.run_recomb --exp 2.3 --mode decoder_ft \\
-    --init-from hub:{(cfg.get("pretrain", {}) or {}).get("hub_repo")}/{(cfg.get("pretrain", {}) or {}).get("hub_subdir", "best")}
+    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\
+    --init-from hub:{(cfg.get("pretrain", {}) or {}).get("hub_repo")}/{(cfg.get("pretrain", {}) or {}).get("hub_subdir", "latest")}
 ```
 
 ## Giới hạn
@@ -661,7 +661,7 @@ def push_pretrain(cfg, ckpt_dir: Path, extra_files: list[Path] | None = None
         if f.exists() and f.parent != ckpt_dir:
             shutil.copy2(f, ckpt_dir / f.name)
 
-    subdir = str(p.get("hub_subdir", "best")).strip("/")
+    subdir = str(p.get("hub_subdir", "latest")).strip("/")
     print(f"→ đẩy {ckpt_dir} -> {repo_id}/{subdir or '.'} (model)", flush=True)
     url = push_folder(
         repo_id, ckpt_dir, subdir, bool(p.get("hub_private", True)),

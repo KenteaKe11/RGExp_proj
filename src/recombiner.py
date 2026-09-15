@@ -44,8 +44,8 @@ Bên trong Recombinator (sơ đồ chi tiết):
    DỪNG ngay nếu số token vào khác 4096. Đó cũng là cái lưới bắt được ca
    *pan & scan lén bật* (mỗi mảnh phụ thêm một lượt 4096 patch).
 
-4. CỔNG VÀO DECODER LÀ SIGMOID THEO CHIỀU TOKEN, hình dạng `(n_query,)` = 32.
-   32 token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder ĐANG
+4. CỔNG VÀO DECODER LÀ SIGMOID THEO CHIỀU TOKEN, hình dạng `(n_query,)`.
+   Các token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder ĐANG
    ĐÓNG BĂNG. Ở bước 0 chúng là nhiễu ngẫu nhiên trong không gian embedding: đủ
    để đẩy loss lên cao và để LoRA r=4 tiêu vài chục bước đầu chỉ để học cách
    *phớt lờ* chúng.
@@ -58,7 +58,7 @@ Bên trong Recombinator (sơ đồ chi tiết):
      hết là cổng — nó thành một lớp scale nữa, và con số đọc ra không còn nói
      được "decoder nhận bao nhiêu phần đặc trưng".
 
-   * **Mở theo chiều TOKEN, không theo chiều kênh.** 32 token là 32 "cách nhìn"
+   * **Mở theo chiều TOKEN, không theo chiều kênh.** `n_query` token là các "cách nhìn"
      khác nhau lên toàn ảnh (điểm 3), nên đơn vị mà mạng được quyền chọn là
      MỘT CÁCH NHÌN, không phải một kênh embedding. Hình dạng `(32,)` cho phép
      giữ vài token và đóng hẳn phần còn lại, và `gate_open_tokens` khi đó là
@@ -68,7 +68,7 @@ Bên trong Recombinator (sơ đồ chi tiết):
 
    * **Không còn "đúng bằng 0" ở bước 0.** Sigmoid không đạt 0. Với
      `gate_init_logit = -4`, cổng bắt đầu ở `sigmoid(-4) = 0.018`: đầu vào
-     decoder của candidate B ở bước 0 bằng candidate A CỘNG 32 token đã bị nén
+     decoder của candidate B ở bước 0 bằng candidate A CỘNG `n_query` token đã bị nén
      còn ~1.8% biên độ. Đây là một phát biểu YẾU HƠN "bằng 0", và báo cáo phải
      ghi đúng như vậy.
 
@@ -141,8 +141,8 @@ class SwiGLU(nn.Module):
     nhưng đó là một khối khác với khối trong sơ đồ.
 
     d_hidden = d_out = 2560 là chủ ý: giữ khối này ở tỉ lệ 1:1 thay vì phình ra
-    rồi nén lại. Khối này chạy sau attention, tức là trên `n_query` token (32
-    theo cấu hình), không phải 4096 patch.
+    rồi nén lại. Khối này chạy sau attention, tức là trên `n_query` token,
+    không phải 4096 patch.
     """
 
     def __init__(self, d_in: int, d_hidden: int, d_out: int, dropout: float = 0.0):
@@ -191,8 +191,8 @@ class CrossAttention(nn.Module):
     """MultiHeadAttn một chiều: query nhìn sang kv, KHÔNG có self-attention.
 
     Dùng ở hai chỗ với hai ý nghĩa khác nhau:
-      * trong Recombinator — 32 query pooled nhìn 4096 patch;
-      * trong QFormer      — 2 query task nhìn 32 token tái tổ hợp.
+      * trong Recombinator — `n_query` query pooled nhìn 4096 patch;
+      * trong QFormer      — 2 query task nhìn `n_query` token tái tổ hợp.
 
     Ở chỗ thứ hai, việc lớp này KHÔNG có self-attention giữa các query là một
     quy ước của thiết kế chứ không phải một chi tiết cài đặt: xem docstring
@@ -230,11 +230,11 @@ class CrossAttention(nn.Module):
 
 # ══ Recombinator ════════════════════════════════════════════════════════════
 class Recombinator(nn.Module):
-    """(B, 4096, 1152) -> (B, 32, 2560), theo sơ đồ Recombinator.
+    """(B, 4096, 1152) -> (B, n_query, 2560), theo sơ đồ Recombinator.
 
-    Attention diễn ra hoàn toàn trong không gian vision 1152 chiều: 32 query
+    Attention diễn ra hoàn toàn trong không gian vision 1152 chiều: `n_query` query
     pooled (sau RMSNorm) nhìn 4096 key/value của ảnh. Residual cộng lại chính
-    query đã chuẩn hoá; chỉ sau đó SwiGLU mới chiếu 32 token sang không gian
+    query đã chuẩn hoá; chỉ sau đó SwiGLU mới chiếu các token sang không gian
     decoder. Điều này giữ skip-connect cùng chiều với đầu ra attention.
     """
 
@@ -261,14 +261,37 @@ class Recombinator(nn.Module):
                 f"ra {vis.shape[-1]}. Ghi số cứng vào config mà không khớp model "
                 f"thì lỗi phải hiện ra ở đây, không phải ở giữa một matmul.")
         x = self.pre(vis)                                 # (B, 4096, d_vis)
-        q = self.norm_q(self.pool(x))                     # (B, 32, d_vis) <- residual đi từ đây
-        x = self.attn(q, x) + q                           # (B, 32, d_vis)
-        return self.norm_out(self.swiglu(x))              # (B, 32, d_model)
+        q = self.norm_q(self.pool(x))                     # (B, n_query, d_vis)
+        x = self.attn(q, x) + q                           # (B, n_query, d_vis)
+        return self.norm_out(self.swiglu(x))              # (B, n_query, d_model)
+
+
+def recombinator_grad_norms(branch) -> dict[str, float]:
+    """Pre-clipping L2 norms for the three learnable recombination stages.
+
+    Kept here so supervised pretraining and decoder fine-tuning report the
+    exact same quantities to W&B.  Parameters without a gradient are skipped:
+    that makes a deliberately frozen component read as 0 rather than fail.
+    """
+    if branch is None:
+        return {}
+    rec = branch.recombinator
+    out: dict[str, float] = {}
+    for name, module in (("pooling", rec.pool), ("attn", rec.attn),
+                         ("swiglu", rec.swiglu)):
+        squared = None
+        for param in module.parameters():
+            if param.grad is None:
+                continue
+            value = param.grad.detach().float().square().sum()
+            squared = value if squared is None else squared + value
+        out[name] = (float(squared.sqrt()) if squared is not None else 0.0)
+    return out
 
 
 # ══ QFormer: 2 vector, hai task KHÔNG biết gì về nhau ═══════════════════════
 class QFormer(nn.Module):
-    """(B, 32, d_kv) -> {task: (B, d_model)}. Mỗi task đúng MỘT vector.
+    """(B, n_query, d_kv) -> {task: (B, d_model)}. Mỗi task đúng MỘT vector.
 
     Self-attention giữa các query bị TẮT CỨNG ở đây, không phải bằng một khoá
     config: với một vector mỗi task, mọi attention query↔query đều là nhiễm chéo
@@ -593,7 +616,7 @@ class RecombinerBranch(nn.Module):
         # `gate_init` (khoá đời trước) mang giá trị CỔNG; `gate_init_logit`
         # mang giá trị LOGIT. Cùng con số 0.0 nghĩa là "đóng hẳn" ở khoá cũ và
         # "mở đúng một nửa" ở khoá mới — không exception, không dòng log, và
-        # candidate B ở bước 0 nhận 32 vector ngẫu nhiên ở 50% biên độ. Nên
+        # candidate B ở bước 0 nhận `n_query` vector ngẫu nhiên ở 50% biên độ. Nên
         # khoá cũ là DỪNG, không phải cảnh báo.
         if "gate_init" in r:
             raise ValueError(
@@ -636,11 +659,11 @@ class RecombinerBranch(nn.Module):
         và ở §2.3 thì Route_Gate phải KHÔNG có đường nào tới loss nào.
 
         Trả về token ĐÃ nhân cổng để người gọi không quên nhân — quên thì ở bước
-        0 decoder nhận 32 vector ngẫu nhiên và cả ý nghĩa của "cổng khởi tạo 0"
+        0 decoder nhận `n_query` vector ngẫu nhiên và cả ý nghĩa của "cổng khởi tạo 0"
         biến mất. Nhánh phân loại đọc tín hiệu TRƯỚC cổng (biến `rec`), nên Sup
         Loss vẫn có gradient đầy đủ từ bước đầu.
         """
-        rec = self.recombinator(vis)                       # (B, 32, d_model)
+        rec = self.recombinator(vis)                       # (B, n_query, d_model)
         heads = self.qformer(rec)
         logits = None
         if self.cls_head is not None and "sup" in heads:

@@ -3,7 +3,7 @@
     python -m src.run_pretrain                     # data -> train -> push
     python -m src.run_pretrain --dry-run           # 32 mẫu, 2 epoch, không đẩy
     python -m src.run_pretrain --stages train      # chỉ huấn luyện (đã có data)
-    python -m src.run_pretrain --stages push       # đẩy ckpt/best lên Hub
+    python -m src.run_pretrain --stages push       # đẩy ckpt/latest (SWA) lên Hub
     python -m src.run_pretrain --no-resume         # bỏ ckpt cũ, chạy lại từ 0
     python -m src.run_pretrain --push-epoch 7      # đẩy ĐÚNG epoch 7
     python -m src.run_pretrain --resume            # lấy ckpt mới nhất trên Hub
@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                          "đã học, và không một phép kiểm shape nào bắt được — "
                          "mặc định là DỪNG.")
     ap.add_argument("--push-epoch", type=int, default=None,
-                    help="đẩy ĐÚNG epoch này thay vì ckpt/best")
+                    help="đẩy ĐÚNG epoch này thay vì ckpt/latest (SWA)")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -586,11 +586,11 @@ def main(argv: list[str] | None = None) -> int:
                 have = sorted(x.name for x in root.glob("epoch_*"))
                 print(f"✗ không có {src.name}. Có trên đĩa: {have or '—'}\n"
                       f"    `pretrain.keep_last_ckpt` chỉ giữ vài epoch gần "
-                      f"nhất; `ckpt/best` thì không bao giờ bị dọn.")
+                      f"nhất; `ckpt/best` và `ckpt/latest` thì không bao giờ bị dọn.")
                 tracker.finish(1)
                 return 2
         else:
-            src = root / "best"
+            src = root / "latest"
             if not pretrain_io.pretrain_exists(src):
                 print(f"✗ chưa có {src} — chạy stage `train` trước, hoặc chỉ "
                       f"định `--push-epoch N`.")
@@ -632,16 +632,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  nối tiếp {r.get('spec')} (epoch {r.get('epoch')}, val "
                   f"f1_pos {r.get('val_f1_pos')}) trên một chu kỳ MỚI — "
                   f"`epoch` ở trên đếm từ 1 của lần chạy này.", flush=True)
-        print(f"  checkpoint tái sử dụng: {stats.get('best_dir')}", flush=True)
+        print(f"  checkpoint tái sử dụng: {stats.get('latest_dir') or stats.get('best_dir')}",
+              flush=True)
     if url:
         print(f"  Hub: {url}", flush=True)
     print(f"\n  Dùng cho §2.3 / §2.4:\n"
           f"    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\\n"
-          f"        --init-from {run_dir / 'ckpt' / 'best'}\n"
+          f"        --init-from {run_dir / 'ckpt' / 'latest'}\n"
           f"  hoặc, sau khi đã đẩy:\n"
           f"    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\\n"
           f"        --init-from hub:{p.get('hub_repo')}/"
-          f"{p.get('hub_subdir', 'best')}", flush=True)
+          f"{p.get('hub_subdir', 'latest')}", flush=True)
     tracker.finish(0)
     return 0
 

@@ -912,6 +912,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 step_asl += float(asl.detach()) / accum
             if cls_m:
                 last_cls = cls_m
+        grad_norms = recombiner.recombinator_grad_norms(branch)
         if clip > 0:
             params = [p for grp in opt.param_groups for p in grp["params"]]
             torch.nn.utils.clip_grad_norm_(params, clip)
@@ -952,6 +953,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
                     **({f"train/{aid}/gate": gate} if branch is not None else {}),
+                    **{f"train/{aid}/grad_norm_{k}": v
+                       for k, v in grad_norms.items()},
                     **({f"train/{aid}/aux": step_aux,
                         f"train/{aid}/aux_alpha": aux_now,
                         f"train/{aid}/route_load_cv": rsum.get("load_cv"),

@@ -24,7 +24,7 @@
 #    thuộc vào VRAM còn trống lúc ấy — tức là vào việc candidate nào chạy
 #    trước. Hết VRAM nay là DỪNG, kèm thông báo chỉ đúng khoá phải giảm.
 # 2. MỘT QFormer, HAI VECTOR. Bản trước có hai QFormer (một cho head, một cho
-#    decoder). Sơ đồ chỉ có một, và 32 token của Recombinator nối THẲNG vào
+#    decoder). Sơ đồ chỉ có một, và 64 token của Recombinator nối THẲNG vào
 #    chuỗi decoder.
 # 3. CANDIDATE B CHẠY TRƯỚC. B là candidate duy nhất có thể hỏng vì lý do kiến
 #    trúc; A gần như chắc chắn chạy. Chạy A trước là trả 90 phút GPU rồi mới
@@ -227,9 +227,9 @@ train:
   per_device_batch_size: 2
   grad_accum: 16                  # tích = 32 mẫu mỗi bước tối ưu hoá
 
-  max_seq_len: 1024              # KHÔNG tính 32 token chèn thêm: chúng được
+  max_seq_len: 1024              # KHÔNG tính 64 token chèn thêm: chúng được
                                  # chèn SAU khi mẫu đã bị cắt, nên candidate B
-                                 # không học trên báo cáo ngắn hơn A đúng 32
+                                 # không học trên báo cáo ngắn hơn A đúng 64
                                  # token.
   gradient_checkpointing: true
   weight_decay: 0.0
@@ -354,9 +354,9 @@ recombiner:
   # lên toàn ảnh, không phải n_query vùng.
   #
   # n_query cũng là số token cộng thêm vào chuỗi decoder, nên nó vào cả VRAM lẫn
-  # thời gian sinh. 32 là con số trong sơ đồ.
-  n_query: 32
-  n_heads: 8                     # cho MultiHeadAttn trong Recombinator
+  # thời gian sinh. Thí nghiệm hiện dùng 64 cách nhìn.
+  n_query: 64
+  n_heads: 18                     # cho MultiHeadAttn trong Recombinator
   dropout: 0.0                   # trên attention
   swiglu_dropout: 0.0
 
@@ -381,7 +381,7 @@ recombiner:
     freeze: [aux]
     d_model: 1024
     n_layers: 1                  # chỉ phải sinh HAI vector, không phải 32 token
-    n_heads: 8
+    n_heads: 16
     ffn_mult: 2
     dropout: 0.0
 
@@ -394,7 +394,7 @@ recombiner:
   n_experts: 4
 
   # token_type_ids của Gemma 3 phân biệt token văn bản (0) với token ảnh (1).
-  # 32 token này KHÔNG phải token ảnh của processor: chúng không có placeholder
+  # 64 token này KHÔNG phải token ảnh của processor: chúng không có placeholder
   # tương ứng và không đi qua projector. `text` là phát biểu đúng về chúng.
   token_type: text               # text | image
 
@@ -402,7 +402,7 @@ recombiner:
   # ổn định hơn khi tối ưu nhưng gấp đôi activation của nhánh.
   dtype: null
 
-  # ── Cổng vào decoder: HARD-CONCRETE theo chiều TOKEN, (n_query,) = 32 ────
+  # ── Cổng vào decoder: HARD-CONCRETE theo chiều TOKEN, (n_query,) = 64 ────
   #
   # Vì sao KHÔNG phải sigmoid thường. sigmoid(x) liên tục trong (0, 1) và không
   # bao giờ chạm hai đầu: một token có cổng 0.3 vẫn đi qua với 30% biên độ — nó
@@ -430,8 +430,8 @@ recombiner:
   # thoả cả hai — xem bảng trong README_2.3.md muc 1.3:
   #
   #   1. Cổng lúc SINH phải ĐÚNG BẰNG 0 ở bước 0, để "đầu vào decoder của B =
-  #      của A cộng 32 token 0" là một phát biểu THẬT (cổng sigmoid chỉ nói được
-  #      "cộng 32 token ở 1.8% biên độ"). Cần log_alpha <= -2.303.
+  #      của A cộng 64 token 0" là một phát biểu THẬT (cổng sigmoid chỉ nói được
+  #      "cộng 64 token ở 1.8% biên độ"). Cần log_alpha <= -2.303.
   #
   #   2. Phải đủ MẪU SỐNG để gradient CE có đường tới cổng. `clamp` có gradient
   #      BẰNG 0 ở vùng bị kẹp, nên chỉ những lần lấy mẫu rơi ra ngoài mới đẩy
@@ -470,11 +470,11 @@ classifier:
     # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
     # dương và 2 ô âm; lớp `neg` bật ở phần lớn bệnh lý nên hai ô pos/uncertain
     # gần như luôn mang nhãn 0 và dễ tới mức áp đảo tổng gradient.
-    gamma_neg: [2.0, 0.0, 0.0]
+    gamma_neg: [3.0, 0.0, 0.0]
     gamma_pos: 0.0
     # clip dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
     # p < clip đóng góp ĐÚNG BẰNG 0, không phải chỉ nhỏ.
-    clip: 0.05
+    clip: 0.02
     eps: 1.0e-8
 
   # Trọng số của Sup Loss trong tổng: loss = CE + λ(step) · ASL.
@@ -749,12 +749,12 @@ pretrain:
   per_device_batch_size: 16
   grad_accum: 2
 
-  # MỘT chu kỳ one-cycle trải trên TOÀN BỘ n_epochs — không phải mỗi epoch một
-  # chu kỳ. Dùng chung build_scheduler với train.schedule. Nối tiếp một ckpt
-  # trên lịch khác là DỪNG, trừ khi gõ --extend-schedule.
+  # Warm-up + cosine restart LIÊN TỤC ở MỖI epoch. `cycle_steps` được runner
+  # suy ra từ số optimizer step thật trong một epoch rồi ghi vào checkpoint.
+  cycle_per_epoch: true
   schedule:
     impl: lambda
-    max_lr: 2e-4
+    max_lr: 3e-4
     pct_start: 0.1
     div_factor: 25.0
     final_div_factor: 100.0
@@ -771,7 +771,11 @@ pretrain:
   # áp đảo nên một head đoán `neg` cho MỌI ô vẫn đạt accuracy rất cao trong khi
   # chưa học được gì. F1 của lớp `pos` không có chỗ trốn kiểu đó.
   select_metric: cls_f1_pos
-  keep_last_ckpt: 2          # ckpt/best KHÔNG bao giờ bị dọn
+  keep_last_ckpt: 2          # ckpt/best và ckpt/latest không bao giờ bị dọn
+  swa:
+    enabled: true
+    # Bắt đầu lấy trung bình từ nửa sau; ckpt/latest luôn là trung bình SWA.
+    start_epoch: 0.5
 
   subdir: sup_pretrain       # runs/sup_pretrain/ — tách khỏi runs/2.3_*, 2.4_*
 
@@ -783,7 +787,7 @@ pretrain:
   hub_repo: RGExp123/RGExp_sup_pretrain
   hub_repo_type: model
   hub_private: true
-  hub_subdir: best
+  hub_subdir: latest
 
 wandb:
   enabled: true
