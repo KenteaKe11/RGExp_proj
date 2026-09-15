@@ -123,7 +123,7 @@ def resolve_encoding(lcfg: dict) -> tuple[dict[float, int], int | None]:
 
     Chấp HAI cách viết, vì hai cách nói hai thứ khác nhau:
 
-      A. THEO TÊN LỚP (cách viết trong configs/recombiner.yaml):
+      A. THEO TÊN LỚP (cách viết trong configs/section25.yaml):
              encoding: {neg: [0], pos: [1], uncertain: [-1, 2], nan_to: uncertain}
          Một lớp gom NHIỀU mã thô là chuyện bình thường và có chủ ý —
          CheXpert ghi "uncertain" khi thì -1 khi thì 2 tuỳ bản trích xuất.

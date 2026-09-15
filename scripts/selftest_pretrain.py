@@ -455,8 +455,9 @@ def lambda_tests() -> None:
     def t_config_key():
         import yaml
 
-        c = yaml.safe_load((ROOT / "configs" / "recombiner.yaml").read_text(
-            encoding="utf-8"))
+        from src.config import DEFAULT_CONFIG
+
+        c = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
         cc = c["classifier"]
         true("lambda_warmup_pct_pretrained" in cc,
              "config thiếu `classifier.lambda_warmup_pct_pretrained`")
@@ -601,8 +602,30 @@ def ckpt_tests() -> None:
 def config_tests() -> None:
     import yaml
 
-    CFG = yaml.safe_load((ROOT / "configs" / "recombiner.yaml").read_text(
-        encoding="utf-8"))
+    from src.config import DEFAULT_CONFIG
+
+    CFG = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+
+    def t_single_config():
+        """MỘT file cấu hình: Stage 0 và §2.5 đọc cùng một file.
+
+        Hai file là cách Stage 0 của My Gemma từng chạy lịch lr (div 25/100)
+        khác hẳn khối `pretrain` mà điều kiện 5 công bố (div 30/10) — không
+        exception, không một dòng log nào gọi tên nó.
+        """
+        from src import run_pretrain, run_section25
+
+        eq(Path(run_pretrain.DEFAULT_CONFIG).resolve(),
+           Path(DEFAULT_CONFIG).resolve(),
+           "run_pretrain phải đọc config mặc định của repo")
+        eq(Path(run_section25.DEFAULT_CONFIG).resolve(),
+           Path(DEFAULT_CONFIG).resolve(),
+           "run_section25 phải đọc config mặc định của repo")
+        ymls = sorted(p.name for p in (ROOT / "configs").glob("*.y*ml"))
+        eq(ymls, [DEFAULT_CONFIG.name],
+           "configs/ chỉ được có MỘT file — file thứ hai là mở lại đường để "
+           "Stage 0 và §2.5 đọc hai khối `pretrain` khác nhau")
+    check("một file cấu hình cho Stage 0 và §2.5", t_single_config)
 
     def t_block():
         p = CFG.get("pretrain")
@@ -638,12 +661,13 @@ def config_tests() -> None:
            t["per_device_batch_size"] * t["grad_accum"],
            "eff_bs của hai chế độ nên bằng nhau — không bắt buộc về toán, "
            "nhưng nó làm 'một bước' có cùng nghĩa ở cả hai bảng")
-    check("eff_bs của pretrain = eff_bs của §2.3", t_effective_batch_matches)
+    check("eff_bs của pretrain = eff_bs của main-stage", t_effective_batch_matches)
 
     def t_mode_key():
-        eq(CFG.get("mode"), "scratch",
-           "mặc định phải là scratch — mọi bảng §2.3/§2.4 đã có đều sinh ra từ đó")
-    check("mode mặc định = scratch", t_mode_key)
+        eq(CFG.get("mode"), "decoder_ft",
+           "mặc định của §2.5 là decoder_ft — điều kiện 5 bắt My Gemma đi qua "
+           "Stage 0 trước; `scratch` chỉ bật qua `--init-from none`")
+    check("mode mặc định = decoder_ft", t_mode_key)
 
     def t_no_decoder_import():
         """`pretrain_sup` KHÔNG được gọi decoder: đó là toàn bộ định nghĩa chế độ."""

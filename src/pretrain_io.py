@@ -580,7 +580,7 @@ pretrain.
 ## Nạp lại
 
 ```bash
-    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\
+    bash scripts/run_section25.sh \\
     --init-from hub:{(cfg.get("pretrain", {}) or {}).get("hub_repo")}/{(cfg.get("pretrain", {}) or {}).get("hub_subdir", "latest")}
 ```
 

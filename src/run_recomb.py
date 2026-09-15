@@ -74,7 +74,10 @@ from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 EXPERIMENTS = ("2.3", "2.4")
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
+# §2.3/§2.4 đã chốt; `configs/` nay chỉ còn MỘT file (section25.yaml) và file
+# ấy không có `arms`/`arms_moe`/`stats.friedman`. Điểm vào này đọc bản ghi.
+DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "_archive" / "configs"
+                  / "recombiner.yaml")
 
 
 def _hr(t: str) -> None:

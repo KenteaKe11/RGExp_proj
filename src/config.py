@@ -1,8 +1,10 @@
 """Nạp và giải quyết cấu hình §2.5.
 
-Một file YAML duy nhất (configs/section25.yaml). Không có kế thừa nhiều tầng:
-repo này chỉ chạy một thí nghiệm tại một thời điểm — ở đây là ba candidate
-R2Gen / AdaAtt / My Gemma — nên thêm tầng chỉ để giấu giá trị thật đi.
+Một file YAML duy nhất (configs/section25.yaml), dùng chung cho CẢ HAI điểm vào
+còn chạy: `src.run_pretrain` (Stage 0 của My Gemma) và `src.run_section25`.
+Không có kế thừa nhiều tầng: repo này chỉ chạy một thí nghiệm tại một thời
+điểm — ở đây là ba candidate R2Gen / AdaAtt / My Gemma — nên thêm tầng chỉ để
+giấu giá trị thật đi.
 
 Vì sao §2.5 KHÔNG đi vay khối điều kiện của §2.3/§2.4 như §4 từng làm: những
 bảng ấy đã chốt và code của chúng đã sang `_archive/`. Đi vay một file nằm

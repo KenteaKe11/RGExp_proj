@@ -60,10 +60,10 @@ nhánh code của `--exp 2.3` rồi ghi đè `runs/2.3_recombiner/`. Hai điểm
 ranh giới ấy là một sự thật cơ học.
 
 Ngược lại, chiều còn lại thì DÙNG CHUNG và phải dùng chung: cùng
-`configs/recombiner.yaml`, cùng `data`, cùng `base`, cùng `recombiner`, cùng
-`classifier`. Nhánh mà pretrain ghi ra phải có ĐÚNG hình dạng mà §2.3/§2.4 dựng
-— hai file cấu hình là cách chắc chắn nhất để pretrain xong mới biết nó không
-nạp được.
+`configs/section25.yaml` với `run_section25`, cùng `data`, cùng `base`, cùng
+`recombiner`, cùng `classifier`, cùng khối `pretrain` (điều kiện 5). Nhánh mà
+pretrain ghi ra phải có ĐÚNG hình dạng mà §2.5 dựng — hai file cấu hình là cách
+chắc chắn nhất để pretrain xong mới biết nó không nạp được.
 
 ── MỘT TẬP TRAIN THỐNG NHẤT ───────────────────────────────────────────────
 `pretrain.n_train` phải bằng đúng `data.n_train` (= 6400). Mọi stage dùng
@@ -82,12 +82,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import (Cfg, add_common_args, hf_token, load_config,
-                     resolved_snapshot, seed_everything)
+from .config import (DEFAULT_CONFIG, Cfg, add_common_args, hf_token,
+                     load_config, resolved_snapshot, seed_everything)
 from .tracking import Tracker
 
 STAGES = ["data", "train", "push"]
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "recombiner.yaml"
 TRAIN_MANIFEST = "trainset"
 VAL_MANIFEST = "valset"
 
@@ -294,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.setdefault("moe", {})["enabled"] = False
     p = dict(cfg.get("pretrain", {}) or {})
     if not p:
-        print("✗ config thiếu khối `pretrain:`. Xem configs/recombiner.yaml.")
+        print("✗ config thiếu khối `pretrain:`. Xem configs/section25.yaml.")
         return 2
     if a.epochs:
         p["n_epochs"] = int(a.epochs)
@@ -662,11 +661,11 @@ def main(argv: list[str] | None = None) -> int:
               flush=True)
     if url:
         print(f"  Hub: {url}", flush=True)
-    print(f"\n  Dùng cho §2.3 / §2.4:\n"
-          f"    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\\n"
+    print(f"\n  Dùng cho §2.5 (My Gemma, decoder_ft):\n"
+          f"    bash scripts/run_section25.sh \\\n"
           f"        --init-from {run_dir / 'ckpt' / 'latest'}\n"
           f"  hoặc, sau khi đã đẩy:\n"
-          f"    python -m src.run_recomb --exp 2.3 --mode decoder_ft \\\n"
+          f"    bash scripts/run_section25.sh \\\n"
           f"        --init-from hub:{p.get('hub_repo')}/"
           f"{p.get('hub_subdir', 'latest')}", flush=True)
     tracker.finish(0)

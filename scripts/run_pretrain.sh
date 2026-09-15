@@ -50,8 +50,10 @@
 # `--allow-base-drift` nếu đó đúng là ý định.
 #
 # ── Sau khi xong ────────────────────────────────────────────────────────────
-#     bash scripts/run_recomb.sh --exp 2.3 --mode decoder_ft \
-#          --init-from runs/sup_pretrain/ckpt/latest
+#     bash scripts/run_section25.sh --init-from runs/sup_pretrain/ckpt/latest
+#
+# (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
+# Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
 # `decoder_ft` hạ learning rate của riêng nhánh MLP đã pretrain
 # (`train.pretrained_lr_mult`) để nó không bị CE kéo giật khỏi chỗ đã hội tụ

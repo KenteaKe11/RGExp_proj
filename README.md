@@ -113,9 +113,10 @@ batch trong config, và vài bước trên vài chục mẫu ngắn không nói 
 ## Cấu trúc
 
 ```
-configs/section25.yaml       TOÀN BỘ tham số của §2.5, có chú thích lý do.
-                             File CHỦ ĐẠO — mọi điểm vào không truyền --config
-                             đều đọc nó (src/config.py::DEFAULT_CONFIG).
+configs/section25.yaml       File cấu hình DUY NHẤT: toàn bộ tham số của §2.5,
+                             kể cả Stage 0 của My Gemma, có chú thích lý do.
+                             run_pretrain và run_section25 đều đọc nó khi không
+                             truyền --config (src/config.py::DEFAULT_CONFIG).
 requirements.txt             môi trường chính (transformers/torch/torchvision)
 requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
 scripts/
@@ -189,7 +190,8 @@ ra thì chúng vẫn ở đây.
   `src/{train.py, run_adapters.py, report_adapters.py}`,
   `scripts/run_adapters.sh`, `README_2.2.md`.
 * **§2.3 / §2.4** — nhánh PDVR và năm cấu hình MoE.
-  `configs/recombiner.yaml` (và bản đời trước `configs/recomb.yaml`),
+  `configs/recombiner.yaml` (và bản đời trước `configs/recomb.yaml`) — các
+  khối dùng chung với §2.5 đã gộp vào `configs/section25.yaml`,
   `src/{run_recomb.py, report_recomb.py, report_moe.py}`,
   `scripts/{run_recomb.sh, selftest_recomb.py}`, `README_2.3.md`,
   `README_2.4.md`.

@@ -1,8 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · My Gemma
 # ═══════════════════════════════════════════════════════════════════════════
-# Đây là FILE CẤU HÌNH CHỦ ĐẠO của repo. Mọi điểm vào không truyền `--config`
-# đều đọc file này (`src/config.py::DEFAULT_CONFIG`).
+# Đây là file cấu hình DUY NHẤT của repo. Mọi điểm vào không truyền `--config`
+# đều đọc file này (`src/config.py::DEFAULT_CONFIG`):
+#
+#     scripts/run_pretrain.sh   -> src.run_pretrain   Stage 0 của My Gemma
+#     scripts/run_section25.sh  -> src.run_section25  §2.5 trọn gói
+#
+# Trước đây Stage 0 đọc `configs/recombiner.yaml` còn §2.5 đọc file này — hai
+# khối `pretrain:` khác lịch lr (div 25/100 so với 30/10) trong khi điều kiện 5
+# đòi MỘT config Stage 0 cho mọi kiến trúc, và nhánh pretrain ra phải có đúng
+# hình dạng mà §2.5 dựng. Nay hai điểm vào đọc cùng một file nên chuyện lệch
+# ấy không còn xảy ra được. Khối riêng của §2.3/§2.4 (`arms`, `arms_moe`,
+# `stats.friedman`, `output.*_moe`) KHÔNG được mang sang: những mục ấy đã chốt,
+# bản ghi của chúng — kèm chú thích lý do cho từng khoá của `train`,
+# `recombiner`, `classifier`, `moe` — nằm ở `_archive/configs/recombiner.yaml`.
 #
 # Câu hỏi của mục này, viết đủ một câu:
 #
@@ -62,9 +74,9 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 6400
+  n_train: 16000
   val_split_csv: split_ref/val_split.csv
-  n_val: 256
+  n_val: 512
   assert_no_leak: true
 
 # ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
@@ -475,7 +487,8 @@ stats:
   # Friedman CỐ Ý không có mặt. Xem đầu file và README.md.
 
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
-# Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ. Lịch: warm-up
+# Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ: `train_sota` đọc
+# nó cho R2Gen/AdaAtt, `src.run_pretrain` đọc nó cho My Gemma. Lịch: warm-up
 # cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch. Sau mỗi
 # restart, `lr_decay` hạ CẢ hai mốc (tức 8 chu kỳ nối nhau có biên giảm dần).
 #
@@ -491,7 +504,7 @@ stats:
 # lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
+  n_train: 16000 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
