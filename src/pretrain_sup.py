@@ -486,10 +486,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         device=dev, dtype=bdtype)
     bstats = branch.n_params()
     n_sup = sum(p.numel() for _, p in trainable_params(branch))
-    print(f"  nhánh: RMSNorm({vis_h}) -> TokenPool(4096->{bstats['n_query']}) "
-          f"-> RMSNorm({vis_h}) -> MHA(Q,K,V={vis_h}) + residual "
-          f"-> SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}->{text_h}) "
-          f"-> RMSNorm({text_h}) -> QFormer("
+    print(f"  nhánh PDVR: Preparer AvgPool(4->1) -> RMSNorm({vis_h}) -> "
+          f"SwiGLU(mult=2) + skip; Highway 1152->{text_h}, token chain -> "
+          f"{bstats['n_query']}; Extractor pool -> MHA(head=64) -> {text_h}; "
+          f"sum -> RMSNorm({text_h}) -> QFormer("
           f"{len(bstats['qformer_tasks'])} vector: "
           f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
           f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector) -> ClsHead({n_labels}×"
@@ -716,12 +716,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                         ep_fp += float((pp & ~gp).sum())
                         ep_fn += float((~pp & gp).sum())
                 if clip > 0:
-                    grad_norms = recombiner.recombinator_grad_norms(branch)
+                    grad_norms = recombiner.pdvr_grad_norms(branch)
                     torch.nn.utils.clip_grad_norm_(
                         [p for grp in opt.param_groups for p in grp["params"]],
                         clip)
                 else:
-                    grad_norms = recombiner.recombinator_grad_norms(branch)
+                    grad_norms = recombiner.pdvr_grad_norms(branch)
                 opt.step()
                 sched.step()
                 global_step += 1
@@ -731,6 +731,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                     print(f"    [pretrain] epoch {epoch+1}/{n_epochs} · bước "
                           f"{step+1}/{per_epoch} (tổng {global_step}/{steps}) · "
                           f"asl {st_asl:.4f} · mẫu {cursor}/{n} ({idx}) · "
+                          f"grad P/H/E "
+                          f"{grad_norms.get('preparer_mean_per_param', 0.0):.2e}/"
+                          f"{grad_norms.get('highway_mean_per_param', 0.0):.2e}/"
+                          f"{grad_norms.get('extractor_mean_per_param', 0.0):.2e} · "
                           f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
                     if tracker is not None:
                         tracker.log({
@@ -819,8 +823,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"sup_pretrain HẾT VRAM ở batch {bs} × grad_accum {accum} "
                 f"({note}).\n"
                 f"    Ba khoá làm được gì đó, theo thứ tự sức nặng:\n"
-                f"      1. recombiner.swiglu_hidden "
-                f"({rcfg.get('swiglu_hidden', 2560)}) — activation n_query × hidden "
+                f"      1. PDVR highway_token_dims "
+                f"({rcfg.get('highway_token_dims', [512, 256, 128])}) — activation "
+                f"trên trục token "
                 f"cho MỖI ảnh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH DẠNG CHECKPOINT: nhánh "
                 f"pretrain sẽ không nạp được vào §2.3/§2.4 đang dùng giá trị cũ. "
                 f"Đổi thì phải đổi ở CẢ HAI.\n"

@@ -1,23 +1,20 @@
-"""Nhánh Recombinator của §2.3 — thứ DUY NHẤT khác nhau giữa candidate A và B.
+"""Nhánh PDVR của §2.3 — thứ DUY NHẤT khác nhau giữa candidate A và B.
 
 Toàn bộ file này là phần "Fine-tuning Block" màu hồng trong sơ đồ tổng, trừ
 Experts (LoRA) — phần đó do `peft` lo và cả hai candidate đều có.
 
-    Image ─► Vision Encoder ─┬─► Recombinator ──┬─► QFormer (2 vector) ─┬─► Classification (vec_1) ─► Sup Loss
+    Image ─► Vision Encoder ─┬─► PDVR ─────────┬─► QFormer (2 vector) ─┬─► Classification (vec_1) ─► Sup Loss
                              │                  │                       └─► Route_Gate     (vec_2) ─► Aux Loss
                              └─► VL-Adapter ────┤                                   │
                                   (256 token)   │                                   ▼
     Prompt ─► Embedding Layer ──────────────────┴─► concat ─► Decoder [Experts (LoRA)] ─► CE Loss
 
-Bên trong Recombinator (sơ đồ chi tiết):
+Bên trong PDVR (sơ đồ chi tiết):
 
-    X (4096, 1152) ─► RMSNorm ─┬──────────────────► Wk, Wv   K,V = (4096, 1152)
-                               └─► Linear trên TRỤC TOKEN 4096 → 32  <<Tokens Pooling>>
-                                     └─► RMSNorm ─► Wq ─► Q = (32, 1152) ─► MultiHeadAttn ─► ⊕
-                                           └──────────────────── skip-connect ───────────────────┘
-                                                                                  └─► SwiGLU
-                                                                                       1152 → 2560 → 2560
-                                                                                       └─► RMSNorm ─►
+    X (4096, 1152) ─► AvgPool(4→1) ─► RMSNorm ─► SwiGLU(mult=2) ─► ⊕
+                                                   ├─► Highway: 1152→2560, 1024→512→256→128→64
+                                                   └─► Extractor: pool 1024→64, MHA(head_dim=64), 1152→2560
+                                                                 └────────────── ⊕ ─► RMSNorm ─► (64,2560)
 
 ── Bốn quyết định trong file này, và hậu quả nếu làm khác ───────────────────
 
@@ -34,15 +31,11 @@ Bên trong Recombinator (sơ đồ chi tiết):
    lần thì tốn gấp đôi thời gian vision, và tệ hơn: nếu vision tower có dropout
    thì hai đường nhìn thấy hai ảnh khác nhau.
 
-3. `<<Tokens Pooling>>` KHÔNG phải avg-pool. Nó là `Linear(4096 → 32)` áp lên
-   TRỤC TOKEN: mỗi token đầu ra là một tổ hợp tuyến tính học được của cả 4096
-   token đầu vào — 32 "cách nhìn" lên toàn ảnh, không phải 32 vùng. Sau một
-   RMSNorm, chính tensor query này là skip-connect; không phải K/V hay đầu ra
-   của SwiGLU.
-   Ma trận đó chốt cứng n_in = 4096. Con số là ràng buộc kiến trúc của Gemma 3
-   (896² / patch 14² = 64×64 patch), không phải siêu tham số — nên `TokenPool`
-   DỪNG ngay nếu số token vào khác 4096. Đó cũng là cái lưới bắt được ca
-   *pan & scan lén bật* (mỗi mảnh phụ thêm một lượt 4096 patch).
+3. PDVR dùng **hai loại pooling có chủ ý**. Preparer average-pool 4 patch kề
+   nhau thành một token để tạo lưới 1024 token ổn định. Extractor sau đó dùng
+   `Linear(1024 → 64)` trên TRỤC TOKEN để học 64 query toàn cục; Highway giảm
+   cùng trục theo chuỗi 1024→512→256→128→64. Ba đường này gặp nhau đúng ở
+   `(64, 2560)`, nên phép cộng không broadcast ngầm.
 
 4. CỔNG VÀO DECODER LÀ SIGMOID THEO CHIỀU TOKEN, hình dạng `(n_query,)`.
    Các token tái tổ hợp được chèn thẳng vào chuỗi đầu vào của một decoder ĐANG
@@ -109,8 +102,8 @@ import torch.nn.functional as F
 
 # Số patch của SigLIP trong Gemma 3: 896² / 14² = 64×64. Hằng số kiến trúc.
 N_VIS_TOKENS = 4096
-BRANCH_FILE = "recombiner_branch.safetensors"
-BRANCH_META = "recombiner_branch.json"
+BRANCH_FILE = "pdvr_branch.safetensors"
+BRANCH_META = "pdvr_branch.json"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -228,64 +221,105 @@ class CrossAttention(nn.Module):
         return self.o_proj(out.transpose(1, 2).reshape(b, n, h * dh))
 
 
-# ══ Recombinator ════════════════════════════════════════════════════════════
-class Recombinator(nn.Module):
-    """(B, 4096, 1152) -> (B, n_query, 2560), theo sơ đồ Recombinator.
+# ══ PDVR — Progressive Dual-Path Visual Recombiner ═════════════════════════
+class PDVRPreparer(nn.Module):
+    """4096 patch -> 1024 prepared token: AvgPool(4->1), RMSNorm, SwiGLU + skip."""
 
-    Attention diễn ra hoàn toàn trong không gian vision 1152 chiều: `n_query` query
-    pooled (sau RMSNorm) nhìn 4096 key/value của ảnh. Residual cộng lại chính
-    query đã chuẩn hoá; chỉ sau đó SwiGLU mới chiếu các token sang không gian
-    decoder. Điều này giữ skip-connect cùng chiều với đầu ra attention.
-    """
-
-    def __init__(self, d_vis: int = 1152, d_hidden: int = 2560,
-                 d_model: int = 2560, n_vis: int = N_VIS_TOKENS,
-                 n_query: int = 32, n_heads: int = 8, dropout: float = 0.0,
-                 swiglu_dropout: float = 0.0):
+    def __init__(self, d_vis: int, pool_factor: int, dropout: float):
         super().__init__()
-        self.d_vis = int(d_vis)
-        self.d_model = int(d_model)
-        self.n_vis = int(n_vis)
-        self.n_query = int(n_query)
-        self.pre = RMSNorm(d_vis)
-        self.pool = TokenPool(n_vis, n_query)
-        self.norm_q = RMSNorm(d_vis)
+        self.pool_factor = int(pool_factor)
+        self.norm = RMSNorm(d_vis)
+        self.swiglu = SwiGLU(d_vis, d_vis * 2, d_vis, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, d = x.shape
+        if n % self.pool_factor:
+            raise RuntimeError(
+                f"PDVR Preparer cần số patch chia hết cho {self.pool_factor}, "
+                f"nhưng nhận {n}.")
+        pooled = x.reshape(b, n // self.pool_factor, self.pool_factor, d).mean(2)
+        prepared = self.norm(pooled)
+        return prepared + self.swiglu(prepared)
+
+
+class PDVRHighway(nn.Module):
+    """Đường Highway: 1152->2560, RMSNorm, token chain/GELU, RMSNorm."""
+
+    def __init__(self, d_vis: int, d_model: int, token_dims: list[int]):
+        super().__init__()
+        self.project = nn.Sequential(nn.Linear(d_vis, d_model), nn.GELU(), RMSNorm(d_model))
+        self.token_layers = nn.ModuleList(
+            nn.Linear(int(a), int(b), bias=True) for a, b in zip(token_dims, token_dims[1:]))
+        self.output_norm = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.project(x)
+        for layer in self.token_layers:
+            x = F.gelu(layer(x.transpose(1, 2)).transpose(1, 2))
+        return self.output_norm(x)
+
+
+class PDVRExtractor(nn.Module):
+    """Đường Extractor: pool query, RMSNorm K/V, MHA, residual, GELU + RMSNorm."""
+
+    def __init__(self, n_prepared: int, n_query: int, d_vis: int, d_model: int,
+                 n_heads: int, dropout: float):
+        super().__init__()
+        self.query_pool = TokenPool(n_prepared, n_query)
+        self.query_norm = RMSNorm(d_vis)
+        self.kv_norm = RMSNorm(d_vis)
         self.attn = CrossAttention(d_vis, d_vis, d_vis, n_heads, dropout)
-        self.swiglu = SwiGLU(d_vis, d_hidden, d_model, swiglu_dropout)
-        self.norm_out = RMSNorm(d_model)
+        self.project = nn.Sequential(nn.Linear(d_vis, d_model), nn.GELU())
+        self.output_norm = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.query_norm(self.query_pool(x))
+        return self.output_norm(self.project(q + self.attn(q, self.kv_norm(x))))
+
+
+class PDVR(nn.Module):
+    """Progressive Dual-Path Visual Recombiner: (B,4096,1152)->(B,64,2560)."""
+
+    def __init__(self, d_vis: int = 1152, d_model: int = 2560,
+                 n_vis: int = N_VIS_TOKENS, n_query: int = 64, n_heads: int = 18,
+                 prepare_pool_factor: int = 4, highway_token_dims=None,
+                 dropout: float = 0.0, swiglu_dropout: float = 0.0):
+        super().__init__()
+        self.d_vis, self.d_model = int(d_vis), int(d_model)
+        self.n_vis, self.n_query = int(n_vis), int(n_query)
+        self.prepare_pool_factor = int(prepare_pool_factor)
+        if self.n_vis % self.prepare_pool_factor:
+            raise ValueError("pdvr.n_vis phải chia hết pdvr.prepare_pool_factor")
+        n_prepared = self.n_vis // self.prepare_pool_factor
+        mids = list(highway_token_dims or [n_prepared // 2, n_prepared // 4, n_prepared // 8])
+        token_dims = [n_prepared, *[max(1, int(v)) for v in mids], self.n_query]
+        self.preparer = PDVRPreparer(self.d_vis, self.prepare_pool_factor, swiglu_dropout)
+        self.highway = PDVRHighway(self.d_vis, self.d_model, token_dims)
+        self.extractor = PDVRExtractor(n_prepared, self.n_query, self.d_vis,
+                                       self.d_model, n_heads, dropout)
+        self.norm_out = RMSNorm(self.d_model)
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
-        if vis.shape[-1] != self.d_vis:
-            raise RuntimeError(
-                f"Recombinator dựng cho d_vis={self.d_vis} nhưng vision tower cho "
-                f"ra {vis.shape[-1]}. Ghi số cứng vào config mà không khớp model "
-                f"thì lỗi phải hiện ra ở đây, không phải ở giữa một matmul.")
-        x = self.pre(vis)                                 # (B, 4096, d_vis)
-        q = self.norm_q(self.pool(x))                     # (B, n_query, d_vis)
-        x = self.attn(q, x) + q                           # (B, n_query, d_vis)
-        return self.norm_out(self.swiglu(x))              # (B, n_query, d_model)
+        if vis.shape[1] != self.n_vis or vis.shape[-1] != self.d_vis:
+            raise RuntimeError(f"PDVR dựng cho ({self.n_vis}, {self.d_vis}) nhưng nhận "
+                               f"({vis.shape[1]}, {vis.shape[-1]}).")
+        x = self.preparer(vis)
+        return self.norm_out(self.highway(x) + self.extractor(x))
 
 
-def recombinator_grad_norms(branch) -> dict[str, float]:
-    """Pre-clipping L2 norms for the three learnable recombination stages.
-
-    Kept here so supervised pretraining and decoder fine-tuning report the
-    exact same quantities to W&B.  Parameters without a gradient are skipped:
-    that makes a deliberately frozen component read as 0 rather than fail.
-    """
+def pdvr_grad_norms(branch) -> dict[str, float]:
+    """L2 gradient norm / số tham số, trước clipping, cho ba khối PDVR."""
     if branch is None:
         return {}
-    rec = branch.recombinator
     out: dict[str, float] = {}
-    for name, module in (("pooling", rec.pool), ("attn", rec.attn),
-                         ("swiglu", rec.swiglu)):
-        squared = None
-        for param in module.parameters():
-            if param.grad is None:
-                continue
-            value = param.grad.detach().float().square().sum()
-            squared = value if squared is None else squared + value
-        out[name] = (float(squared.sqrt()) if squared is not None else 0.0)
+    for name, module in (("preparer", branch.pdvr.preparer),
+                         ("highway", branch.pdvr.highway),
+                         ("extractor", branch.pdvr.extractor)):
+        grads = [p.grad.detach().float().square().sum() for p in module.parameters()
+                 if p.grad is not None]
+        n_params = sum(p.numel() for p in module.parameters())
+        total = sum(grads) if grads else torch.tensor(0.0)
+        out[f"{name}_mean_per_param"] = float(total.sqrt() / max(n_params, 1))
     return out
 
 
@@ -545,7 +579,7 @@ class RecombinerBranch(nn.Module):
     """Recombinator + QFormer + ClsHead + RouteGate + cổng vào decoder.
 
     Đây là TOÀN BỘ phần candidate B có mà candidate A không có. Nó được ghi ra
-    một file RIÊNG (`recombiner_branch.safetensors`), không nhồi vào state_dict
+    một file RIÊNG (`pdvr_branch.safetensors`), không nhồi vào state_dict
     của peft: `PeftModel.from_pretrained` bỏ qua những khoá nó không nhận — im
     lặng — và khi đó khâu sinh nạp adapter ĐÚNG với một nhánh NGẪU NHIÊN. Kết
     quả vẫn là tiếng Anh đọc được, và cột số của candidate B vẫn trông như kết
@@ -557,10 +591,15 @@ class RecombinerBranch(nn.Module):
         super().__init__()
         r = dict(rcfg or {})
         c = dict(ccfg or {})
+        if "swiglu_hidden" in r:
+            raise ValueError(
+                "recombiner.swiglu_hidden thuộc Recombinator cũ. PDVR dùng "
+                "Preparer SwiGLU cố định mult=2; hãy dùng prepare_pool_factor "
+                "và highway_token_dims.")
         # Giữ nguyên văn hai khối config đã dựng ra nhánh này. `save_branch` ghi
         # chúng vào file META, và `load_branch` dựng lại TỪ ĐÓ chứ không từ config
         # hiện tại — xem docstring load_branch.
-        self.spec = {"recombiner": r, "classifier": c,
+        self.spec = {"pdvr": r, "classifier": c,
                      "d_vis": int(d_vis), "d_model": int(d_model),
                      "n_labels": int(n_labels)}
         q = dict(r.get("qformer", {}) or {})
@@ -570,14 +609,15 @@ class RecombinerBranch(nn.Module):
 
         self.d_vis = int(d_vis)
         self.d_model = int(d_model)
-        self.n_query = int(r.get("n_query", 32))
-        self.recombinator = Recombinator(
+        self.n_query = int(r.get("n_query", 64))
+        self.pdvr = PDVR(
             d_vis=d_vis,
-            d_hidden=int(r.get("swiglu_hidden", 2560)),
             d_model=d_model,
             n_vis=int(r.get("n_vis", N_VIS_TOKENS)),
             n_query=self.n_query,
             n_heads=int(r.get("n_heads", 8)),
+            prepare_pool_factor=int(r.get("prepare_pool_factor", 4)),
+            highway_token_dims=r.get("highway_token_dims"),
             dropout=float(r.get("dropout", 0.0)),
             swiglu_dropout=float(r.get("swiglu_dropout", 0.0)))
 
@@ -643,7 +683,7 @@ class RecombinerBranch(nn.Module):
         self.gate = nn.Parameter(
             torch.full((self.n_query,), self.gate_init_logit))
 
-        for m in (self.recombinator, self.qformer, self.cls_head, self.route_gate):
+        for m in (self.pdvr, self.qformer, self.cls_head, self.route_gate):
             if m is not None:
                 _init(m)
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
@@ -663,7 +703,7 @@ class RecombinerBranch(nn.Module):
         biến mất. Nhánh phân loại đọc tín hiệu TRƯỚC cổng (biến `rec`), nên Sup
         Loss vẫn có gradient đầy đủ từ bước đầu.
         """
-        rec = self.recombinator(vis)                       # (B, n_query, d_model)
+        rec = self.pdvr(vis)                               # (B, n_query, d_model)
         heads = self.qformer(rec)
         logits = None
         if self.cls_head is not None and "sup" in heads:
@@ -789,7 +829,7 @@ class RecombinerBranch(nn.Module):
         return {
             "total": total,
             "trainable": sum(p.numel() for p in self.parameters() if p.requires_grad),
-            "recombinator": c(self.recombinator),
+            "pdvr": c(self.pdvr),
             "qformer": c(self.qformer),
             "cls_head": c(self.cls_head),
             "route_gate": c(self.route_gate),
@@ -875,7 +915,7 @@ def load_branch(out_dir: Path, rcfg: dict | None = None, ccfg: dict | None = Non
             f"{d / BRANCH_META} không có khối `spec`. File này do một bản "
             f"src/recombiner.py cũ ghi ra, và hình dạng nhánh khi đó không suy "
             f"lại được. Huấn luyện lại candidate B.")
-    r = dict(spec.get("recombiner") or rcfg or {})
+    r = dict(spec.get("pdvr") or rcfg or {})
     c = dict(spec.get("classifier") or ccfg or {})
 
     branch = RecombinerBranch(int(spec["d_vis"]), int(spec["d_model"]),

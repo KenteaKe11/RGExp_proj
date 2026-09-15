@@ -159,7 +159,7 @@ def effective_rcfg(cfg: Cfg, spec: dict | None) -> dict:
     """Khối `recombiner` đã giải quyết cho candidate này.
 
     §2.3 dùng nguyên khối trong config. §2.4 ghi đè ĐÚNG ba khoá, và cả ba đều
-    đi vào `spec` của nhánh (tức là vào `recombiner_branch.json`), nên
+    đi vào `spec` của nhánh (tức là vào `pdvr_branch.json`), nên
     `load_branch` ở khâu sinh dựng lại đúng chế độ đã huấn luyện chứ không phải
     chế độ đang ghi trong config lúc ấy:
 
@@ -726,15 +726,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                       f"ASL khi đó là một phép ĐO, không phải một lực.",
                       flush=True)
         bstats = branch.n_params()
-        print(f"  nhánh: RMSNorm({vis_h}) -> TokenPool(4096->{bstats['n_query']}) "
-              f"-> RMSNorm({vis_h}) -> MHA(Q,K,V={vis_h}) + residual "
-              f"-> SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}->{text_h}) "
-              f"-> RMSNorm({text_h}) -> QFormer({len(bstats['qformer_tasks'])} vector: "
+        print(f"  nhánh PDVR: Preparer AvgPool(4->1) -> RMSNorm -> SwiGLU(mult=2) "
+              f"+ skip; Highway + Extractor(MHA head=64) -> RMSNorm({text_h}) "
+              f"-> {bstats['n_query']} token -> QFormer({len(bstats['qformer_tasks'])} vector: "
               f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
               f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector)", flush=True)
         print(f"  tham số nhánh: {bstats['total']:,} "
-              f"({bstats['trainable']:,} học được) — recombinator "
-              f"{bstats['recombinator']:,} · qformer {bstats['qformer']:,} · "
+              f"({bstats['trainable']:,} học được) — PDVR "
+              f"{bstats['pdvr']:,} · qformer {bstats['qformer']:,} · "
               f"cls_head {bstats['cls_head']:,} · route_gate "
               f"{bstats['route_gate']:,} "
               f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT ở §2.3'})",
@@ -912,7 +911,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 step_asl += float(asl.detach()) / accum
             if cls_m:
                 last_cls = cls_m
-        grad_norms = recombiner.recombinator_grad_norms(branch)
+        grad_norms = recombiner.pdvr_grad_norms(branch)
         if clip > 0:
             params = [p for grp in opt.param_groups for p in grp["params"]]
             torch.nn.utils.clip_grad_norm_(params, clip)
@@ -943,6 +942,11 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                    f"[{rsum.get('load_min', 0):.2f}..{rsum.get('load_max', 0):.2f}]"
                    f" · chết {rsum.get('n_dead_experts', 0)}"
                    if spec else "") +
+                  (f" · grad P/H/E "
+                   f"{grad_norms.get('preparer_mean_per_param', 0.0):.2e}/"
+                   f"{grad_norms.get('highway_mean_per_param', 0.0):.2e}/"
+                   f"{grad_norms.get('extractor_mean_per_param', 0.0):.2e}"
+                   if branch is not None else "") +
                   f") · lr {lr_now:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({

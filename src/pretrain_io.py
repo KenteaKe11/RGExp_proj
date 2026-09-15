@@ -55,7 +55,7 @@ from pathlib import Path
 # `train_recomb.build_optimizer` đọc CHÍNH hằng số này, nên "nhóm lr giảm áp
 # đúng vào phần đã pretrain" kiểm được bằng cách đọc chứ không phải bằng cách
 # tin.
-PRETRAINED_MODULES: tuple[str, ...] = ("recombinator", "qformer", "cls_head")
+PRETRAINED_MODULES: tuple[str, ...] = ("pdvr", "qformer", "cls_head")
 
 # Những khối có trong nhánh nhưng KHÔNG nhận gradient ở pretrain. Khai tường
 # minh (thay vì "phần còn lại") để `save_pretrain` dừng khi nhánh mọc thêm một

@@ -135,7 +135,7 @@ _RULES: list[tuple[str, str]] = [
      "      nvidia-smi xem có tiến trình cũ còn giữ VRAM không."),
     (r"out of memory|CUDA out of memory",
      "hết VRAM. Ở §2.3 batch KHÔNG được dò tự động: hạ, theo thứ tự,\n"
-     "     recombiner.swiglu_hidden / train.max_seq_len /\n"
+     "     recombiner.highway_token_dims / train.max_seq_len /\n"
      "     train.per_device_batch_size trong configs/recombiner.yaml\n"
      "(hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần)."),
     (r"trust_remote_code",
@@ -159,5 +159,4 @@ def diagnose(exc: BaseException) -> str | None:
         if re.search(pattern, text, re.IGNORECASE):
             return advice
     return None
-
 

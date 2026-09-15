@@ -76,7 +76,7 @@ def raises(exc, fn, msg=""):
 # ── một nhánh nhỏ, cùng đường code với nhánh thật ───────────────────────────
 D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
-    "siglip_dim": D_VIS, "swiglu_hidden": 32, "out_dim": None,
+    "siglip_dim": D_VIS, "out_dim": None, "prepare_pool_factor": 4,
     "n_query": 4, "n_vis": 12, "n_heads": 2, "dropout": 0.0,
     "swiglu_dropout": 0.0, "gate_init_logit": -2.5,
     "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"], "d_model": 12,

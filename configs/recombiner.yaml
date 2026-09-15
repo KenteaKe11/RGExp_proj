@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §2.3 — Nhánh Recombinator: HAI candidate, HAI kiểm định ghép cặp
+# §2.3 — Nhánh PDVR: HAI candidate, HAI kiểm định ghép cặp
 # ═══════════════════════════════════════════════════════════════════════════
 # Câu hỏi của mục này, viết đủ một câu:
 #
@@ -8,7 +8,7 @@
 #     và đổi BAO NHIÊU?
 #
 #     A  lora_only     LoRA (preset ở khối `lora`), không thêm gì
-#     B  lora_recomb   A + Recombinator + QFormer(2 vector) + ClsHead (ASL)
+#     B  lora_recomb   A + PDVR + QFormer(2 vector) + ClsHead (ASL)
 #
 # Cùng base, cùng dữ liệu, cùng seed, cùng lịch, cùng batch. Đúng MỘT thứ khác
 # nhau, và đó là điều kiện để hiệu số quan sát được quy về nhánh mới.
@@ -24,7 +24,7 @@
 #    thuộc vào VRAM còn trống lúc ấy — tức là vào việc candidate nào chạy
 #    trước. Hết VRAM nay là DỪNG, kèm thông báo chỉ đúng khoá phải giảm.
 # 2. MỘT QFormer, HAI VECTOR. Bản trước có hai QFormer (một cho head, một cho
-#    decoder). Sơ đồ chỉ có một, và 64 token của Recombinator nối THẲNG vào
+#    decoder). Sơ đồ chỉ có một, và 64 token của PDVR nối THẲNG vào
 #    chuỗi decoder.
 # 3. CANDIDATE B CHẠY TRƯỚC. B là candidate duy nhất có thể hỏng vì lý do kiến
 #    trúc; A gần như chắc chắn chạy. Chạy A trước là trả 90 phút GPU rồi mới
@@ -37,7 +37,7 @@ seed: 42
 # ═══════════════════════════════════════════════════════════════════════════
 # HAI THÍ NGHIỆM, MỘT FILE CẤU HÌNH
 # ═══════════════════════════════════════════════════════════════════════════
-#   2.3  Nhánh Recombinator có đáng không?   A (LoRA) vs B (LoRA + nhánh)
+#   2.3  Nhánh PDVR có đáng không?   A (LoRA) vs B (LoRA + nhánh)
 #        k = 2 -> bootstrap ghép cặp (BCa) + permutation.
 #   2.4  Cấu hình MoE nào tốt hơn?           5 cặp (top-k, n_experts)
 #        k = 5 -> Friedman + hậu kiểm Wilcoxon/Holm.
@@ -57,7 +57,7 @@ seed: 42
 # `moe`, và nhánh kiểm định trong `stats`.
 #
 # ── §2.4 LUÔN dùng concat ──────────────────────────────────────────────────
-# Mọi candidate của §2.4 đều CÓ nhánh Recombinator nối vào chuỗi decoder (cái
+# Mọi candidate của §2.4 đều CÓ nhánh PDVR nối vào chuỗi decoder (cái
 # "concat" trong sơ đồ). §2.4 không hỏi lại câu của §2.3 — nó hỏi câu tiếp
 # theo, và nó hỏi trên nền mà §2.3 đã đo. Một candidate §2.4 không có nhánh thì
 # `vec_2` không tồn tại, và khi đó không có gì để định tuyến.
@@ -322,13 +322,14 @@ train:
     double_quant: true
     compute_dtype: bfloat16
 
-# ── HÌNH DẠNG NHÁNH RECOMBINATOR ───────────────────────────────────────────
+# ── HÌNH DẠNG PDVR — Progressive Dual-Path Visual Recombiner ───────────────
 #
-#   X (4096, 1152) → RMSNorm ─┬────────────────────────► Wk, Wv
-#                              └─ Linear TRỤC TOKEN 4096 → n_query → RMSNorm
-#                                   └─ Wq → Q (n_query, 1152) → MultiHeadAttn → ⊕
-#                                         └──────────── skip-connect ───────────┘
-#                                                               → SwiGLU 1152 → swiglu_hidden → out_dim → RMSNorm
+#   X (4096,1152) -> Preparer: AvgPool(4->1) -> RMSNorm -> SwiGLU(mult=2) + skip
+#                  -> Highway: Linear/GELU 1152->2560 -> RMSNorm -> token chain
+#                              1024->512->256->128->64 (GELU) -> RMSNorm
+#                  -> Extractor: LinearPool(1024->64), RMSNorm Q; RMSNorm K/V,
+#                                MHA(head_dim=64) + Q -> Linear/GELU 1152->2560 -> RMSNorm
+#                  -> Highway + Extractor -> RMSNorm -> (64,2560)
 #
 # Đầu ra (n_query, out_dim) đi HAI đường:
 #   · qua `gate` rồi nối thẳng vào chuỗi đầu vào decoder;
@@ -339,26 +340,23 @@ recombiner:
   # src/train_recomb.py DỪNG.
   siglip_dim: 1152
 
-  # SwiGLU trên TỪNG token SAU attention: 1152 -> swiglu_hidden (gate·up) ->
-  # out_dim. Attention chỉ có n_query token nên activation SwiGLU là
-  # n_query × hidden, không phải 4096 × hidden.
-  swiglu_hidden: 2560
+  # Preparer giảm 4096 patch thành 1024 token trước khi hai đường tách nhau.
+  # SwiGLU trong Preparer có hidden = 2 × siglip_dim, đúng sơ đồ; không có
+  # `swiglu_hidden` của Recombinator cũ.
+  prepare_pool_factor: 4
 
   # out_dim: null = text hidden size của base (2560 với gemma-3-4b-it). Đặt số
   # khác là lỗi shape lúc nối vào inputs_embeds, và train_recomb.py nói thẳng
   # điều đó thay vì để torch báo mismatch ở forward đầu tiên.
   out_dim: null
 
-  # <<Tokens Pooling>>: Linear(4096 -> n_query) trên TRỤC TOKEN. Mỗi token ra là
-  # một tổ hợp tuyến tính học được của cả 4096 token vào — n_query "cách nhìn"
-  # lên toàn ảnh, không phải n_query vùng.
-  #
-  # n_query cũng là số token cộng thêm vào chuỗi decoder, nên nó vào cả VRAM lẫn
-  # thời gian sinh. Thí nghiệm hiện dùng 64 cách nhìn.
+  # Cả Highway và Extractor kết thúc ở 64 token để cộng từng token. Highway
+  # giảm trên trục token: 1024 -> 512 -> 256 -> 128 -> 64.
   n_query: 64
-  n_heads: 18                     # cho MultiHeadAttn trong Recombinator
-  dropout: 0.0                   # trên attention
-  swiglu_dropout: 0.0
+  highway_token_dims: [512, 256, 128]
+  n_heads: 18                     # Extractor MHA: 1152 / 18 = head_dim 64
+  dropout: 0.0                    # trên attention
+  swiglu_dropout: 0.0             # chỉ Preparer SwiGLU
 
   # ── QFormer: 2 VECTOR CHO 2 TASK, KHÔNG BIẾT GÌ VỀ NHAU ──────────────────
   # Đây là QUY ƯỚC CỦA THIẾT KẾ, không phải một chi tiết cài đặt: mỗi task nhận
@@ -653,7 +651,7 @@ arms:
     recomb: false
     enabled: true
   - id: lora_recomb
-    name: "B · LoRA + Recombinator"
+    name: "B · LoRA + PDVR"
     recomb: true
     enabled: true
 
@@ -735,7 +733,7 @@ stats:
 # định nghĩa của chế độ, và selftest kiểm nó bằng nguồn chứ không bằng lời.
 # Mọi điều kiện khác (data, base, recombiner, classifier.asl) lấy từ các khối
 # ở trên: checkpoint chỉ dùng lại được với ĐÚNG base và ĐÚNG chính sách ảnh ấy.
-# Chi tiết: README_pretrain.md.
+# Chi tiết: README.md, section “Pretrain cục bộ”.
 pretrain:
   # 0 = TOÀN BỘ data.train_split_csv. Pretrain thấy nhiều dữ liệu hơn §2.3 là
   # CÓ CHỦ Ý — và vì thế phải vào phần Giới hạn. Đặt một số cụ thể (vd 6400) để

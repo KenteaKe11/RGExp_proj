@@ -14,7 +14,7 @@
 #
 # ── MỤC NÀY HỎI GÌ ──────────────────────────────────────────────────────────
 # Trên CÙNG 6400 mẫu train và CÙNG 3000 ảnh test của tập này, công thức
-# Gemma 3 + Recombinator + QFormer + ClsHead + Experts K=6·E=10 có hơn hai kiến
+# Gemma 3 + PDVR + QFormer + ClsHead + Experts K=6·E=10 có hơn hai kiến
 # trúc sinh báo cáo đã công bố không, và hơn BAO NHIÊU?
 #
 #     A  r2gen      ResNet-101 + Transformer 3 lớp + Relational Memory
@@ -23,7 +23,7 @@
 #
 # k = 3 nhưng KHÔNG Friedman: ba cặp đều được quan tâm như nhau, nên mỗi cặp đi
 # permutation + bootstrap BCa, rồi Holm trên BA p-value trong TỪNG metric. Xem
-# README_2.5.md mục 3.
+# README.md, phần kiểm định ghép cặp.
 #
 # ── STAGE 0 LÀ TIÊN QUYẾT, VÀ CHỈ CHO MY GEMMA ─────────────────────────────
 # Điều kiện 5 nói MỌI kiến trúc đi qua một stage pretrain cục bộ với CÙNG một

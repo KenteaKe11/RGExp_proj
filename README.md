@@ -1,4 +1,4 @@
-# RGExp — §2.5: đối chứng với SOTA trên Gemma 3
+# RGExp — PDVR: đối chứng với SOTA trên Gemma 3
 
 Repo này chạy **một** thí nghiệm tại một thời điểm. Thí nghiệm đang mở là
 **§2.5** — ba candidate, hai kiểm định ghép cặp, Holm trên ba cặp:
@@ -11,16 +11,38 @@ bash scripts/run_section25.sh --detach      # §2.5 chạy thật
 ```
 A  r2gen      R2Gen — ResNet-101 + Transformer 3 lớp + Relational Memory
 B  adaatt     AdaAtt — ResNet-152 + LSTM + Adaptive Attention (Visual Sentinel)
-C  my_gemma   Gemma 3 4b-it NF4 + Recombinator + QFormer(2 vector) + ClsHead
+C  my_gemma   Gemma 3 4b-it NF4 + PDVR + QFormer(2 vector) + ClsHead
               + Experts K=6·E=10, adapter QLoRA r4
 ```
 
 Câu hỏi: trên **cùng** 6400 mẫu train và **cùng** 3000 ảnh test của tập này,
 công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao nhiêu**?
 
-**Chi tiết: [`README_2.5.md`](README_2.5.md)**
-
 ---
+
+## PDVR — Progressive Dual-Path Visual Recombiner
+
+PDVR thay thế hoàn toàn Recombinator cũ. Nó nhận `X [4096, 1152]` từ vision
+tower và tạo `Y [64, 2560]` để đưa vào QFormer và decoder.
+
+```text
+X -> Preparer: AvgPool(4->1) -> RMSNorm -> SwiGLU(mult=2) + residual
+  -> Highway:   Linear/GELU 1152->2560 -> RMSNorm -> token chain 1024->512->256->128->64 -> RMSNorm
+  -> Extractor: LinearPool 1024->64 -> RMSNorm(Q), RMSNorm(K/V) -> MHA(head_dim=64)
+                -> residual -> Linear/GELU 1152->2560 -> RMSNorm
+  -> Highway + Extractor -> RMSNorm -> Y [64, 2560]
+```
+
+`Preparer`, `Highway`, và `Extractor` là ba khối độc lập. Log trước gradient
+clipping có ba metric `grad_norm_{block}_mean_per_param`, tức `L2(gradient) /
+số tham số` của từng khối, để so sánh trực tiếp dù kích thước khối khác nhau.
+
+## Pretrain cục bộ
+
+Stage 0 học `PDVR + QFormer + ClsHead` bằng ASL trước khi decoder fine-tune.
+Checkpoint pretrain chỉ chứa ba khối này; `gate` và `route_gate` không có
+gradient ở Stage 0 nên không được lưu như trọng số đã học. Chạy bằng
+`bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
 
 ## Dàn ý nghiên cứu
 
@@ -29,14 +51,14 @@ công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao 
 | 2.0 | emb_vec còn giữ bao nhiêu thông tin thị giác so với ảnh gốc 512px | emb_vec **không** còn mang nhiều thông tin thị giác chất lượng — có cơ sở thống kê (Wilcoxon signed-rank trên Laplacian-2D vs 1D-DCT) |
 | 2.1 | baseline nào infer thuần tốt nhất trên ảnh X-quang khi chưa pretrain | **Gemma 3 4b-it** vượt trội so với Qwen2.5-VL-3B-Instruct và LLaVA-Med 7B |
 | 2.2 | cấu hình LoRA nào tốt nhất — {LoRA, DoRA} × {r = 4, 8, 16, 32} | **QLoRA rank 4** |
-| 2.3 | thêm nhánh Recombinator + QFormer + Sup-head vào có đáng không | nhánh concat **tham gia không đáng kể** — chưa hội tụ nên chưa kết luận tốt/tệ |
+| 2.3 | thêm PDVR + QFormer + Sup-head vào có đáng không | nhánh concat **tham gia không đáng kể** — chưa hội tụ nên chưa kết luận tốt/tệ |
 | 2.4 | cấu hình MoE nào tốt nhất — 5 tổ hợp (K, E) | **E = 10 · K = 6** |
 | **2.5** | **có hơn R2Gen / AdaAtt không, hơn bao nhiêu** | **đang chạy** |
 
 §2.5 lấy kết quả của năm mục trên làm **siêu tham số đã chốt**: base Gemma 3 từ
 §2.1, QLoRA r4 từ §2.2, E=10·K=6 từ §2.4, và nguồn đặc trưng ảnh SigLIP
 dim = 1152 từ kết luận của §2.0 (emb_vec sau căn chỉnh không đủ giàu thông tin
-thị giác — xem `README_2.5.md` mục 1).
+thị giác — xem phần PDVR ở trên).
 
 Code của 2.0–2.4 nằm ở [`_archive/`](#_archive) — **bản ghi**, không phải một
 đường chạy được.
@@ -52,7 +74,7 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
    `configs/section25.yaml` là bản chép nguyên văn, không hiệu chỉnh.
 2. **Cùng 6400 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
 3. **Paired Bootstrap + Permutation Test** cho từng cặp, Holm trên ba p-value.
-   Không Friedman — xem `README_2.5.md` mục 3.
+   Không Friedman — xem phần kiểm định ghép cặp trong cấu hình.
 4. **Một phương pháp resize duy nhất** cho mọi model, **kể cả khi kích thước đầu
    vào vô tình khớp** (`image_policy.allow_native_match: false`).
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
@@ -115,7 +137,7 @@ src/
                              một phép biến đổi hình học cho cả ba candidate
   backbone.py                nạp base, gắn adapter, ReportDataset, collate,
                              one-cycle, device_map
-  recombiner.py              Recombinator · QFormer(2 vector) · ClsHead ·
+  recombiner.py              PDVR · QFormer(2 vector) · ClsHead ·
                              RouteGate · Sigmoid Gate + Hard Discrete (L0) · ASL
   moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
@@ -166,14 +188,14 @@ ra thì chúng vẫn ở đây.
   Friedman + hậu kiểm Wilcoxon/Holm. `configs/adapters.yaml`,
   `src/{train.py, run_adapters.py, report_adapters.py}`,
   `scripts/run_adapters.sh`, `README_2.2.md`.
-* **§2.3 / §2.4** — nhánh Recombinator và năm cấu hình MoE.
+* **§2.3 / §2.4** — nhánh PDVR và năm cấu hình MoE.
   `configs/recombiner.yaml` (và bản đời trước `configs/recomb.yaml`),
   `src/{run_recomb.py, report_recomb.py, report_moe.py}`,
   `scripts/{run_recomb.sh, selftest_recomb.py}`, `README_2.3.md`,
   `README_2.4.md`.
 * **Friedman** — `src/stats_friedman.py` và `scripts/selftest_friedman.py`.
   §2.5 có k = 3 nhưng **cố ý** không mở đầu bằng kiểm định tổng thể
-  (`README_2.5.md` mục 3). Để chúng trong `src/` nghĩa là câu ấy chỉ là một câu
+  (phần kiểm định ghép cặp của README này). Để chúng trong `src/` nghĩa là câu ấy chỉ là một câu
   trong README chứ không phải một sự thật của code.
 
 **Không file nào trong `src/` import sang `_archive/`.** Code trong `_archive/`

@@ -7,12 +7,12 @@
 # Câu hỏi của mục này, viết đủ một câu:
 #
 #     Trên CÙNG 6400 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
-#     công thức Gemma 3 + Recombinator + QFormer + ClsHead + Experts K=6·E=10
+#     công thức Gemma 3 + PDVR + QFormer + ClsHead + Experts K=6·E=10
 #     có hơn hai kiến trúc sinh báo cáo đã công bố (R2Gen, AdaAtt) không, và
 #     hơn BAO NHIÊU?
 #
 # Ba candidate, nên ba cặp. k = 3 nhưng KHÔNG Friedman: thiết kế của mục này
-# (xem README_2.5.md mục 3) đòi hai kiểm định GHÉP CẶP — permutation và
+# (xem README.md, phần kiểm định) đòi hai kiểm định GHÉP CẶP — permutation và
 # bootstrap BCa — trên từng cặp, rồi Holm trên ba p-value. Friedman trả lời
 # "có ít nhất một cột khác" — ở k = 3 với ba cặp đều được quan tâm như nhau,
 # câu ấy không thêm thông tin mà lại làm mất sức kiểm định.
@@ -128,7 +128,7 @@ arms_s25:
   # `order: 0` là chỗ nói ra điều đó; thứ tự không được phép ảnh hưởng kết
   # quả (seed và thứ tự dữ liệu đặt lại trước MỖI candidate).
   - id: my_gemma
-    name: "C · My Gemma · Recombinator · QFormer · Cls · K=6·E=10 · QLoRA r4"
+    name: "C · My Gemma · PDVR · QFormer · Cls · K=6·E=10 · QLoRA r4"
     kind: ours
     runner: gemma3_recomb
     recomb: true
@@ -141,7 +141,7 @@ arms_s25:
 # ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
 # KHÔNG hiệu chỉnh một con số nào ở đây. Chỗ duy nhất §2.5 được phép áp đặt là
 # `image_policy` (điều kiện 4) và `pretrain` (điều kiện 5) — hai chỗ ấy được
-# công bố trong README_2.5.md mục 4, và `src/run_section25.py` ghi chúng vào
+# công bố trong README.md, và `src/run_section25.py` ghi chúng vào
 # `manifest.deviations` để báo cáo không thể im lặng về chúng.
 sota:
   r2gen:
@@ -364,9 +364,10 @@ train:
 
 recombiner:
   siglip_dim: 1152
-  swiglu_hidden: 2560
   out_dim: null
+  prepare_pool_factor: 4
   n_query: 64
+  highway_token_dims: [512, 256, 128]
   n_heads: 18
   dropout: 0.0
   swiglu_dropout: 0.0
@@ -471,7 +472,7 @@ stats:
   reference: my_gemma
   adjust: holm
   adjust_scope: pairs      # Holm trong TỪNG metric, trên ba cặp
-  # Friedman CỐ Ý không có mặt. Xem đầu file và README_2.5.md mục 3.
+  # Friedman CỐ Ý không có mặt. Xem đầu file và README.md.
 
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ. Lịch: warm-up

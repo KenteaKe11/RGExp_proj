@@ -12,7 +12,7 @@
 # Mọi tham số chuyển thẳng cho `python -m src.run_pretrain`.
 #
 # ── Nó huấn luyện cái gì ────────────────────────────────────────────────────
-#     loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ) )
+#     loss = ASL( ClsHead( QFormer_sup( PDVR( SigLIP(ảnh) ) ) ) )
 #
 # Không CE, không λ, không LoRA, không Aux Loss. Decoder KHÔNG chạy — base chỉ
 # được nạp để lấy ĐÚNG vision tower và processor mà §2.3/§2.4 dùng, và lượt

@@ -248,7 +248,7 @@ print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
     print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.3 KHÔNG dò batch. "
           "Hết VRAM thì hạ, theo thứ tự,")
-    print("  recombiner.swiglu_hidden / train.max_seq_len / "
+    print("  recombiner.highway_token_dims / train.max_seq_len / "
           "train.per_device_batch_size trong configs/recombiner.yaml")
     print("  (hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần, nếu không "
           "số bước và lịch one-cycle đổi theo).")
