@@ -340,7 +340,7 @@ train:
   grad_accum: 32
   max_seq_len: 1024
   gradient_checkpointing: true
-  weight_decay: 0.0
+  weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
   schedule:
@@ -523,8 +523,8 @@ pretrain:
     cycle_momentum: false
   # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
   # đang dùng; hai đầu mút để ở đây để một lần dò không phải đi tìm lại.
-  weight_decay: 0.01
-  weight_decay_range: [0.01, 0.1]
+  weight_decay: 0.03
+  weight_decay_range: [0.03, 0.1]
   base_method: qlora
   select_metric: cls_f1_pos
   keep_last_ckpt: 2
