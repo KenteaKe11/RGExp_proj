@@ -552,6 +552,31 @@ def main(argv: list[str] | None = None) -> int:
             vy, vm, vst = labels_cls.attach(
                 cfg, val_df["key"].astype(str).tolist(), lut, n_labels, "val")
             cls_val = {"y": vy, "mask": vm, "n_labels": n_labels, "stats": vst}
+
+        # `--push-epoch 1` ở cuối toàn bộ lượt train có thể đến quá muộn: khi
+        # keep_last=2, epoch_001 đã bị dọn. Đẩy đồng bộ ngay sau mỗi epoch để
+        # Hub luôn có checkpoint gần nhất; trainer_state vẫn bị chặn cứng trong
+        # push_pretrain, nên resume chính xác vẫn dùng bản cục bộ.
+        push_each_epoch = (
+            "push" in stages and bool(p.get("push", True))
+            and bool(p.get("push_each_epoch", False)) and not a.dry_run
+        )
+
+        def _push_epoch(ckpt_dir: Path, row: dict) -> None:
+            if not push_each_epoch:
+                return
+            try:
+                url = pretrain_io.push_pretrain(
+                    cfg, ckpt_dir,
+                    extra_files=[run_dir / "history.csv"])
+                if url:
+                    print(f"  ✓ đã đẩy epoch {row['epoch']} ngay sau khi ghi", flush=True)
+            except Exception as e:
+                # Mạng/Hub hỏng không được làm mất lượt GPU kế tiếp. Checkpoint
+                # cục bộ còn nguyên và stage `push` cuối run sẽ thử lại.
+                print(f"  ⚠ không đẩy được epoch {row['epoch']}: {e!r}"
+                      " — tiếp tục train; sẽ thử lại ở bước push cuối.", flush=True)
+                tracker.alert("push epoch pretrain hỏng", str(e), "WARN")
         try:
             stats = pretrain_sup.run(
                 cfg, train_df, val_df, cls_train, cls_val, run_dir,
@@ -559,7 +584,8 @@ def main(argv: list[str] | None = None) -> int:
                 init_from=init_src, init_spec=init_spec,
                 allow_schedule_change=bool(a.extend_schedule),
                 max_steps_override=(4 * int(p.get("n_epochs", 2))
-                                    if a.dry_run else None))
+                                    if a.dry_run else None),
+                on_epoch_checkpoint=_push_epoch)
         except Exception as e:
             print(f"\n✗ DỪNG — huấn luyện không chạy được:\n    {e}", flush=True)
             tracker.alert("sup_pretrain dừng", str(e), "ERROR")

@@ -772,6 +772,9 @@ pretrain:
   # chưa học được gì. F1 của lớp `pos` không có chỗ trốn kiểu đó.
   select_metric: cls_f1_pos
   keep_last_ckpt: 2          # ckpt/best và ckpt/latest không bao giờ bị dọn
+  # Đẩy đồng bộ ngay sau mỗi epoch, trước khi keep_last có thể dọn epoch cũ.
+  # Hub chỉ nhận trọng số + META; trainer_state.pt luôn chỉ ở máy local.
+  push_each_epoch: true
   swa:
     enabled: true
     # Bắt đầu lấy trung bình từ nửa sau; ckpt/latest luôn là trung bình SWA.

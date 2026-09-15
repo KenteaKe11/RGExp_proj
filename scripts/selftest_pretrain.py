@@ -528,6 +528,30 @@ def ckpt_tests() -> None:
                  "ckpt/best không mang theo trạng thái optimizer")
     check("keep_last dọn epoch cũ nhưng CHỪA ckpt/best", t_keep_last_spares_best)
 
+    def t_keep_last_spares_current_after_restart():
+        """Run mới bắt đầu epoch 1 không được tự dọn state của chính nó."""
+        import torch
+
+        b = _branch()
+        opt = torch.optim.AdamW([p for _, p in PS.trainable_params(b)], lr=1e-3)
+        sch = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        g = torch.Generator().manual_seed(2)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            for e in (4, 5):
+                st = {"global_step": e, "cursor": 0, "sample_index": None,
+                      "seen_samples": e, "gen_state": g.get_state(), "best": None}
+                PS.write_ckpt(b, opt, sch, d, e, st, {"epoch": e}, keep_last=2)
+            st = {"global_step": 1, "cursor": 0, "sample_index": None,
+                  "seen_samples": 1, "gen_state": g.get_state(), "best": None}
+            PS.write_ckpt(b, opt, sch, d, 1, st, {"epoch": 1}, keep_last=2)
+            last = PS.read_last(d)
+            eq(last["epoch"], 1)
+            true((Path(last["dir"]) / P.TRAINER_STATE).exists(),
+                 "epoch hiện tại không được bị keep_last xóa sau --no-resume")
+    check("keep_last chừa trainer_state của epoch mới sau khi chạy lại",
+          t_keep_last_spares_current_after_restart)
+
     def t_schedule_guard():
         """Ckpt phải mang theo đường cong one-cycle nó nằm trên.
 

@@ -511,6 +511,8 @@ pretrain:
   base_method: qlora
   select_metric: cls_f1_pos
   keep_last_ckpt: 2
+  # Đẩy ngay từng epoch; Hub không bao giờ nhận trainer_state.pt.
+  push_each_epoch: true
   swa:
     enabled: true
     start_epoch: 0.5

@@ -65,6 +65,7 @@ import math
 import shutil
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -371,9 +372,16 @@ def write_ckpt(branch, opt, sched, run_dir: Path, epoch: int, state: dict,
         encoding="utf-8")
 
     # Dọn epoch cũ — nhưng KHÔNG bao giờ `best/`, và không bao giờ epoch vừa ghi.
+    # Điều này đặc biệt quan trọng với `--no-resume`: thư mục có thể còn
+    # epoch_004/epoch_005 của run trước, nên sắp xếp tên thuần tuý sẽ xem
+    # epoch_001 mới ghi là "cũ" và xoá chính trainer_state mà last.json vừa trỏ.
     if keep_last and keep_last > 0:
         eps = sorted(root.glob("epoch_*"), key=lambda p: p.name)
-        for old in eps[:-keep_last]:
+        old_eps = [p for p in eps if p != d]
+        # `d` đã chiếm một trong keep_last chỗ cần giữ. Giữ các checkpoint cũ
+        # mới nhất còn lại, nhưng dù cấu hình keep_last=1 cũng không xóa `d`.
+        n_other_to_keep = max(0, keep_last - 1)
+        for old in old_eps[:-n_other_to_keep] if n_other_to_keep else old_eps:
             shutil.rmtree(old, ignore_errors=True)
     return d
 
@@ -399,7 +407,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         max_steps_override: int | None = None,
         allow_schedule_change: bool = False,
         init_from: Path | str | None = None,
-        init_spec: str | None = None) -> dict:
+        init_spec: str | None = None,
+        on_epoch_checkpoint: Callable[[Path, dict], None] | None = None) -> dict:
     """Chạy (hoặc chạy tiếp) pretrain. Trả thống kê tổng kết.
 
     Hai kiểu "chạy tiếp", và chúng KHÔNG giống nhau:
@@ -796,6 +805,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             if tracker is not None:
                 tracker.log({f"pretrain/epoch_{k}": v for k, v in row.items()
                              if v is not None})
+            # Gọi sau khi epoch đã được ghi HOÀN CHỈNH (state, best, history).
+            # Runner dùng hook này để đẩy ngay checkpoint vừa tạo, trước khi
+            # keep_last có cơ hội dọn nó ở các epoch sau.
+            if on_epoch_checkpoint is not None:
+                on_epoch_checkpoint(d, row)
     except Exception as e:
         if is_oom(e):
             note = f"{type(e).__name__}: {e}"[:200]
