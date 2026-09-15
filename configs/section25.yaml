@@ -370,7 +370,6 @@ recombiner:
   n_heads: 8
   dropout: 0.0
   swiglu_dropout: 0.0
-  pre_norm: true
   qformer:
     tasks: [sup, aux]
     freeze: [aux]

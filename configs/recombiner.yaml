@@ -324,12 +324,11 @@ train:
 
 # ── HÌNH DẠNG NHÁNH RECOMBINATOR ───────────────────────────────────────────
 #
-#   X (4096, 1152)
-#     └─ SwiGLU 1152 → swiglu_hidden → out_dim          <<Expand Capacity>>
-#          └─ RMSNorm ─┬────────────────────► Wk, Wv    K,V = (4096, out_dim)
-#                      └─ Linear TRỤC TOKEN 4096 → n_query   <<Tokens Pooling>>
-#                           └─ Wq → Q → MultiHeadAttn → ⊕ → RMSNorm →
-#                                 └────── skip-connect ──────┘
+#   X (4096, 1152) → RMSNorm ─┬────────────────────────► Wk, Wv
+#                              └─ Linear TRỤC TOKEN 4096 → n_query → RMSNorm
+#                                   └─ Wq → Q (n_query, 1152) → MultiHeadAttn → ⊕
+#                                         └──────────── skip-connect ───────────┘
+#                                                               → SwiGLU 1152 → swiglu_hidden → out_dim → RMSNorm
 #
 # Đầu ra (n_query, out_dim) đi HAI đường:
 #   · qua `gate` rồi nối thẳng vào chuỗi đầu vào decoder;
@@ -340,11 +339,9 @@ recombiner:
   # src/train_recomb.py DỪNG.
   siglip_dim: 1152
 
-  # SwiGLU trên TỪNG patch: 1152 -> swiglu_hidden (gate·up) -> out_dim.
-  # Hidden bằng đúng out_dim giữ khối này ở tỉ lệ 1:1 thay vì phình ra rồi nén
-  # lại. Đây là khoá TỐN VRAM NHẤT của cả nhánh — activation 4096 × hidden cho
-  # MỖI ảnh, ở cả forward lẫn backward — nên nó là khoá đầu tiên phải hạ khi hết
-  # bộ nhớ.
+  # SwiGLU trên TỪNG token SAU attention: 1152 -> swiglu_hidden (gate·up) ->
+  # out_dim. Attention chỉ có n_query token nên activation SwiGLU là
+  # n_query × hidden, không phải 4096 × hidden.
   swiglu_hidden: 2560
 
   # out_dim: null = text hidden size của base (2560 với gemma-3-4b-it). Đặt số
@@ -362,7 +359,6 @@ recombiner:
   n_heads: 8                     # cho MultiHeadAttn trong Recombinator
   dropout: 0.0                   # trên attention
   swiglu_dropout: 0.0
-  pre_norm: true                 # RMSNorm trên đặc trưng SigLIP trước SwiGLU
 
   # ── QFormer: 2 VECTOR CHO 2 TASK, KHÔNG BIẾT GÌ VỀ NHAU ──────────────────
   # Đây là QUY ƯỚC CỦA THIẾT KẾ, không phải một chi tiết cài đặt: mỗi task nhận

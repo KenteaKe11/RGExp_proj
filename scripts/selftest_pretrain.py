@@ -78,7 +78,7 @@ D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
     "siglip_dim": D_VIS, "swiglu_hidden": 32, "out_dim": None,
     "n_query": 4, "n_vis": 12, "n_heads": 2, "dropout": 0.0,
-    "swiglu_dropout": 0.0, "pre_norm": True, "gate_init_logit": -2.5,
+    "swiglu_dropout": 0.0, "gate_init_logit": -2.5,
     "qformer": {"tasks": ["sup", "aux"], "freeze": ["aux"], "d_model": 12,
                 "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0},
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,

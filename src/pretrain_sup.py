@@ -775,7 +775,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"({note}).\n"
                 f"    Ba khoá làm được gì đó, theo thứ tự sức nặng:\n"
                 f"      1. recombiner.swiglu_hidden "
-                f"({rcfg.get('swiglu_hidden', 2560)}) — activation 4096 × hidden "
+                f"({rcfg.get('swiglu_hidden', 2560)}) — activation n_query × hidden "
                 f"cho MỖI ảnh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH DẠNG CHECKPOINT: nhánh "
                 f"pretrain sẽ không nạp được vào §2.3/§2.4 đang dùng giá trị cũ. "
                 f"Đổi thì phải đổi ở CẢ HAI.\n"
@@ -783,7 +783,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"grad_accum lên đúng bấy nhiêu lần để eff_bs {bs*accum} không "
                 f"đổi, nếu không thì số bước và lịch one-cycle đổi theo.\n"
                 f"      3. recombiner.dtype: float32 -> null (bf16) nếu đang ép "
-                f"fp32 — gấp đôi activation 4096 × swiglu_hidden.") from None
+                f"fp32 — gấp đôi activation của nhánh.") from None
         raise
 
     peak = (torch.cuda.max_memory_allocated() / 1024 ** 3

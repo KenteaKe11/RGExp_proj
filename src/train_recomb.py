@@ -521,8 +521,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
 
     Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
     Nó không nói "giảm batch đi" chung chung, vì với candidate B thì batch
-    thường không phải chỗ tốn nhất: activation 4096 × swiglu_hidden cho mỗi ảnh
-    mới là.
+    thường không phải chỗ tốn nhất: attention trên 32 query × 4096 patch mới là.
     """
     import torch
 

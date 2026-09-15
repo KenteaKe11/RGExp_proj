@@ -11,12 +11,13 @@ Experts (LoRA) — phần đó do `peft` lo và cả hai candidate đều có.
 
 Bên trong Recombinator (sơ đồ chi tiết):
 
-    X (4096, 1152)
-      └─► SwiGLU  d_in 1152 → d_hidden 2560 → d_out 2560     <<Expand Capacity>>
-            └─► RMSNorm ─┬──────────────────────────► Wk, Wv   K,V = (4096, 2560)
-                         └─► Linear trên TRỤC TOKEN 4096 → 32  <<Tokens Pooling>>
-                               └─► Wq ─► Q = (32, 2560) ─► MultiHeadAttn ─► ⊕ ─► RMSNorm ─►
-                                     └───────────── skip-connect ──────────────┘
+    X (4096, 1152) ─► RMSNorm ─┬──────────────────► Wk, Wv   K,V = (4096, 1152)
+                               └─► Linear trên TRỤC TOKEN 4096 → 32  <<Tokens Pooling>>
+                                     └─► RMSNorm ─► Wq ─► Q = (32, 1152) ─► MultiHeadAttn ─► ⊕
+                                           └──────────────────── skip-connect ───────────────────┘
+                                                                                  └─► SwiGLU
+                                                                                       1152 → 2560 → 2560
+                                                                                       └─► RMSNorm ─►
 
 ── Bốn quyết định trong file này, và hậu quả nếu làm khác ───────────────────
 
@@ -35,8 +36,9 @@ Bên trong Recombinator (sơ đồ chi tiết):
 
 3. `<<Tokens Pooling>>` KHÔNG phải avg-pool. Nó là `Linear(4096 → 32)` áp lên
    TRỤC TOKEN: mỗi token đầu ra là một tổ hợp tuyến tính học được của cả 4096
-   token đầu vào — 32 "cách nhìn" lên toàn ảnh, không phải 32 vùng. Skip-connect
-   trong sơ đồ đi từ đầu ra của khối pooling này (tức là Q), không từ K/V.
+   token đầu vào — 32 "cách nhìn" lên toàn ảnh, không phải 32 vùng. Sau một
+   RMSNorm, chính tensor query này là skip-connect; không phải K/V hay đầu ra
+   của SwiGLU.
    Ma trận đó chốt cứng n_in = 4096. Con số là ràng buộc kiến trúc của Gemma 3
    (896² / patch 14² = 64×64 patch), không phải siêu tham số — nên `TokenPool`
    DỪNG ngay nếu số token vào khác 4096. Đó cũng là cái lưới bắt được ca
@@ -229,30 +231,28 @@ class CrossAttention(nn.Module):
 
 # ══ Recombinator ════════════════════════════════════════════════════════════
 class Recombinator(nn.Module):
-    """(B, 4096, 1152) -> (B, 32, 2560). Đúng sơ đồ chi tiết, theo thứ tự.
+    """(B, 4096, 1152) -> (B, 32, 2560), theo sơ đồ Recombinator.
 
-    Một chi tiết dễ làm sai và không tự lộ ra: skip-connect cộng vào là đầu ra
-    của TokenPool (Q trước khi qua Wq), KHÔNG phải đầu ra của SwiGLU. Cộng nhầm
-    nguồn thì shape vẫn khớp ở mọi chỗ (cả hai đều là d_model) — chỉ có điều
-    nhánh residual khi đó nối 32 token với 4096 token, nên nó phải broadcast
-    hoặc nổ; nếu tình cờ không nổ thì nhánh đang học một kiến trúc khác kiến
-    trúc trong báo cáo.
+    Attention diễn ra hoàn toàn trong không gian vision 1152 chiều: 32 query
+    pooled (sau RMSNorm) nhìn 4096 key/value của ảnh. Residual cộng lại chính
+    query đã chuẩn hoá; chỉ sau đó SwiGLU mới chiếu 32 token sang không gian
+    decoder. Điều này giữ skip-connect cùng chiều với đầu ra attention.
     """
 
     def __init__(self, d_vis: int = 1152, d_hidden: int = 2560,
                  d_model: int = 2560, n_vis: int = N_VIS_TOKENS,
                  n_query: int = 32, n_heads: int = 8, dropout: float = 0.0,
-                 swiglu_dropout: float = 0.0, pre_norm: bool = True):
+                 swiglu_dropout: float = 0.0):
         super().__init__()
         self.d_vis = int(d_vis)
         self.d_model = int(d_model)
         self.n_vis = int(n_vis)
         self.n_query = int(n_query)
-        self.pre = RMSNorm(d_vis) if pre_norm else nn.Identity()
-        self.swiglu = SwiGLU(d_vis, d_hidden, d_model, swiglu_dropout)
-        self.norm_in = RMSNorm(d_model)
+        self.pre = RMSNorm(d_vis)
         self.pool = TokenPool(n_vis, n_query)
-        self.attn = CrossAttention(d_model, d_model, d_model, n_heads, dropout)
+        self.norm_q = RMSNorm(d_vis)
+        self.attn = CrossAttention(d_vis, d_vis, d_vis, n_heads, dropout)
+        self.swiglu = SwiGLU(d_vis, d_hidden, d_model, swiglu_dropout)
         self.norm_out = RMSNorm(d_model)
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
@@ -261,9 +261,10 @@ class Recombinator(nn.Module):
                 f"Recombinator dựng cho d_vis={self.d_vis} nhưng vision tower cho "
                 f"ra {vis.shape[-1]}. Ghi số cứng vào config mà không khớp model "
                 f"thì lỗi phải hiện ra ở đây, không phải ở giữa một matmul.")
-        h = self.norm_in(self.swiglu(self.pre(vis)))     # (B, 4096, d_model)
-        q = self.pool(h)                                  # (B, 32, d_model)  <- skip đi từ đây
-        return self.norm_out(self.attn(q, h) + q)         # (B, 32, d_model)
+        x = self.pre(vis)                                 # (B, 4096, d_vis)
+        q = self.norm_q(self.pool(x))                     # (B, 32, d_vis) <- residual đi từ đây
+        x = self.attn(q, x) + q                           # (B, 32, d_vis)
+        return self.norm_out(self.swiglu(x))              # (B, 32, d_model)
 
 
 # ══ QFormer: 2 vector, hai task KHÔNG biết gì về nhau ═══════════════════════
@@ -555,8 +556,7 @@ class RecombinerBranch(nn.Module):
             n_query=self.n_query,
             n_heads=int(r.get("n_heads", 8)),
             dropout=float(r.get("dropout", 0.0)),
-            swiglu_dropout=float(r.get("swiglu_dropout", 0.0)),
-            pre_norm=bool(r.get("pre_norm", True)))
+            swiglu_dropout=float(r.get("swiglu_dropout", 0.0)))
 
         tasks = tuple(str(t) for t in q.get("tasks", ("sup", "aux")))
         frozen = tuple(str(t) for t in q.get("freeze", ("aux",)))
