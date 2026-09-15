@@ -739,13 +739,12 @@ pretrain:
   # CÓ CHỦ Ý — và vì thế phải vào phần Giới hạn. Đặt một số cụ thể (vd 6400) để
   # tách hai tập, và khi đó câu trả lời của §2.3 đổi nghĩa theo.
   n_train: 6400
-  n_epochs: 1
+  n_epochs: 8
 
-  # eff_bs = 8 × 4 = 32, BẰNG train.per_device_batch_size × train.grad_accum.
-  # Không bắt buộc về toán, nhưng nó làm "một bước" có cùng nghĩa ở cả hai
-  # bảng. Hạ bs thì NHÂN grad_accum lên đúng bấy nhiêu, y như §2.3.
-  per_device_batch_size: 16
-  grad_accum: 2
+  # Chỉ Stage 0 pretrain dùng train_bs (= effective batch) 32. Không áp dụng
+  # giá trị này cho decoder fine-tuning hay các baseline.
+  per_device_batch_size: 32
+  grad_accum: 1
 
   # Warm-up + cosine restart LIÊN TỤC ở MỖI epoch. `cycle_steps` được runner
   # suy ra từ số optimizer step thật trong một epoch rồi ghi vào checkpoint.
