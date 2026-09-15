@@ -562,10 +562,9 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"candidate, nên tự đổi ở đây là làm hỏng đúng thứ thí nghiệm đang "
             f"đo. Sửa config rồi chạy lại cả hai.\n"
             f"    Bốn khoá làm được gì đó, theo thứ tự sức nặng:\n"
-            f"      1. recombiner.swiglu_hidden "
-            f"({rcfg.get('swiglu_hidden', 2560)}) — activation "
-            f"4096 × hidden cho MỖI ảnh, ở cả forward lẫn backward. Đây là chỗ "
-            f"tốn nhất của nhánh.\n"
+            f"      1. recombiner.n_query ({rcfg.get('n_query', 32)}) — số "
+            f"query của attention nhìn 4096 patch, đồng thời là số token thêm "
+            f"vào decoder.\n"
             f"      2. train.max_seq_len ({tcfg.get('max_seq_len')}) + "
             f"recombiner.n_query ({rcfg.get('n_query', 32)}) -> độ dài chuỗi "
             f"thật mà decoder phải chạy.\n"
@@ -727,11 +726,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                       f"ASL khi đó là một phép ĐO, không phải một lực.",
                       flush=True)
         bstats = branch.n_params()
-        print(f"  nhánh: SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}"
-              f"->{text_h}) -> TokenPool(4096->{bstats['n_query']}) -> MHA "
-              f"-> QFormer({len(bstats['qformer_tasks'])} vector: "
+        print(f"  nhánh: RMSNorm({vis_h}) -> TokenPool(4096->{bstats['n_query']}) "
+              f"-> RMSNorm({vis_h}) -> MHA(Q,K,V={vis_h}) + residual "
+              f"-> SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}->{text_h}) "
+              f"-> RMSNorm({text_h}) -> QFormer({len(bstats['qformer_tasks'])} vector: "
               f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
-              f"{bstats['qformer_frozen'] or '—'})", flush=True)
+              f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector)", flush=True)
         print(f"  tham số nhánh: {bstats['total']:,} "
               f"({bstats['trainable']:,} học được) — recombinator "
               f"{bstats['recombinator']:,} · qformer {bstats['qformer']:,} · "

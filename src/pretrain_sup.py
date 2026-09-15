@@ -476,11 +476,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         device=dev, dtype=bdtype)
     bstats = branch.n_params()
     n_sup = sum(p.numel() for _, p in trainable_params(branch))
-    print(f"  nhánh: SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}->{text_h})"
-          f" -> TokenPool(4096->{bstats['n_query']}) -> QFormer("
+    print(f"  nhánh: RMSNorm({vis_h}) -> TokenPool(4096->{bstats['n_query']}) "
+          f"-> RMSNorm({vis_h}) -> MHA(Q,K,V={vis_h}) + residual "
+          f"-> SwiGLU({vis_h}->{rcfg.get('swiglu_hidden', 2560)}->{text_h}) "
+          f"-> RMSNorm({text_h}) -> QFormer("
           f"{len(bstats['qformer_tasks'])} vector: "
           f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
-          f"{bstats['qformer_frozen'] or '—'}) -> ClsHead({n_labels}×"
+          f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector) -> ClsHead({n_labels}×"
           f"{int(cfg.get('classifier', {}).get('n_classes', 3))})", flush=True)
     print(f"  pretrain {n_sup:,}/{bstats['total']:,} tham số — ĐÚNG "
           f"{', '.join(pretrain_io.PRETRAINED_MODULES)}. "

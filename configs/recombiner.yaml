@@ -399,7 +399,7 @@ recombiner:
   token_type: text               # text | image
 
   # dtype của nhánh. null = theo tham số dấu phẩy động của base (bf16). float32
-  # ổn định hơn khi tối ưu nhưng gấp đôi activation 4096 × 2560.
+  # ổn định hơn khi tối ưu nhưng gấp đôi activation của nhánh.
   dtype: null
 
   # ── Cổng vào decoder: HARD-CONCRETE theo chiều TOKEN, (n_query,) = 32 ────

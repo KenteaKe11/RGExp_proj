@@ -134,16 +134,15 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """<<Expand Capacity>>: 1152 → 2560 (gate · up) → 2560, áp lên TỪNG patch.
+    """<<Expand Capacity>>: 1152 → 2560 (gate · up) → 2560, áp lên từng query.
 
     Ba ma trận, không phải hai: `gate` đi qua SiLU rồi NHÂN từng phần tử với
     `up`, và `down` đưa về d_out. Thay bằng một MLP thường vẫn chạy và vẫn học,
     nhưng đó là một khối khác với khối trong sơ đồ.
 
     d_hidden = d_out = 2560 là chủ ý: giữ khối này ở tỉ lệ 1:1 thay vì phình ra
-    rồi nén lại. Đây cũng là chỗ tốn VRAM nhất của cả nhánh — activation
-    4096 × d_hidden cho MỖI ảnh ở khâu backward — nên d_hidden là khoá đầu tiên
-    phải hạ khi hết bộ nhớ.
+    rồi nén lại. Khối này chạy sau attention, tức là trên `n_query` token (32
+    theo cấu hình), không phải 4096 patch.
     """
 
     def __init__(self, d_in: int, d_hidden: int, d_out: int, dropout: float = 0.0):
