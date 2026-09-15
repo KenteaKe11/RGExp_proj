@@ -494,8 +494,8 @@ pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
   cycle_per_epoch: true
-  per_device_batch_size: 8
-  grad_accum: 4
+  per_device_batch_size: 16
+  grad_accum: 2
   schedule:
     impl: lambda
     max_lr: 3.0e-4
@@ -507,7 +507,7 @@ pretrain:
     cycle_momentum: false
   # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
   # đang dùng; hai đầu mút để ở đây để một lần dò không phải đi tìm lại.
-  weight_decay: 0.05
+  weight_decay: 0.02
   weight_decay_range: [0.03, 0.1]
   base_method: qlora
   select_metric: cls_f1_pos
