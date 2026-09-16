@@ -71,7 +71,7 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 16000
+  n_train: 9600
   val_split_csv: split_ref/val_split.csv
   n_val: 512
   assert_no_leak: true
