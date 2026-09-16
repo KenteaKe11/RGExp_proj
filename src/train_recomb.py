@@ -374,51 +374,79 @@ def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
 
 
 # ══ Đóng băng sau pretrain ══════════════════════════════════════════════════
+# Những phần của nhánh ĐÃ pretrain có thể đóng băng ở decoder_ft. Tên có chấm
+# là một PHẦN của khối: `cls_head.main_head` là Main Head (RMSNorm -> Linear/GELU
+# -> Linear) của Classification Head, KHÔNG gồm Pooling Stack của nó.
+FREEZABLE_PARTS: dict = {
+    "recombinator": lambda b: [b.recombinator],
+    "cls_head": lambda b: [b.cls_head],
+    "cls_head.pooling_stack": lambda b: [b.cls_head.head.pool],
+    "cls_head.main_head": lambda b: b.cls_head.head.main_head_modules(),
+}
+DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ("cls_head.main_head",)
+
+
 def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
-    """Các khối ĐÃ pretrain bị đóng băng hoàn toàn ở decoder_ft.
+    """Các phần ĐÃ pretrain bị đóng băng hoàn toàn ở decoder_ft.
 
     `train.freeze_pretrained: true` -> toàn bộ PRETRAINED_MODULES.
-    Ngược lại -> `train.freeze_after_pretrain` (mặc định [cls_head]).
+    Ngược lại -> `train.freeze_after_pretrain` (mặc định [cls_head.main_head]):
+    Main Head của Classification Head đứng yên, còn Pooling Stack của nó học
+    tiếp cùng Recombinator ở lr × `pretrained_lr_mult`.
 
-    Tên lạ là DỪNG: một tên gõ nhầm (`cls_heads`) mà im lặng bỏ qua nghĩa là
-    head vẫn học trong khi báo cáo nói nó đóng băng. Khối KHÔNG được pretrain
-    (`route_head`, `dec_proj`) cũng DỪNG: đóng băng một khối ngẫu nhiên là vứt
-    nó đi.
+    Tên lạ là DỪNG: một tên gõ nhầm mà im lặng bỏ qua nghĩa là head vẫn học
+    trong khi báo cáo nói nó đóng băng. Khối KHÔNG được pretrain (`route_head`,
+    `dec_proj`) cũng DỪNG: đóng băng một khối ngẫu nhiên là vứt nó đi.
     """
     if bool(tcfg.get("freeze_pretrained", False)):
         return tuple(pretrain_io.PRETRAINED_MODULES)
-    raw = tcfg.get("freeze_after_pretrain", ["cls_head"])
+    raw = tcfg.get("freeze_after_pretrain", list(DEFAULT_FREEZE_AFTER_PRETRAIN))
     if raw is None:
         raw = []
     if isinstance(raw, str):
         raw = [raw]
     names = tuple(dict.fromkeys(str(x) for x in raw))
-    bad = [n for n in names if n not in pretrain_io.PRETRAINED_MODULES]
+    bad = [n for n in names if n not in FREEZABLE_PARTS
+           or n.split(".", 1)[0] not in pretrain_io.PRETRAINED_MODULES]
     if bad:
         raise TrainUnusable(
-            f"train.freeze_after_pretrain chứa {bad} — chỉ được là tập con của "
-            f"PRETRAINED_MODULES {list(pretrain_io.PRETRAINED_MODULES)}. Khối "
-            f"không qua Stage 0 thì đóng băng là giữ nguyên số ngẫu nhiên.")
+            f"train.freeze_after_pretrain chứa {bad} — chỉ nhận "
+            f"{sorted(FREEZABLE_PARTS)}. Khối không qua Stage 0 thì đóng băng "
+            f"là giữ nguyên số ngẫu nhiên.")
     return names
 
 
+def learning_pretrained_parts(branch) -> list[str]:
+    """Các phần ĐÃ pretrain còn tham số requires_grad — để log, không để quyết định."""
+    out = []
+    for name in ("recombinator", "cls_head.pooling_stack", "cls_head.main_head"):
+        if name.startswith("cls_head") and branch.cls_head is None:
+            continue
+        if any(p.requires_grad for m in FREEZABLE_PARTS[name](branch)
+               for p in m.parameters()):
+            out.append(name)
+    return out
+
+
 def apply_freeze(branch, names) -> int:
-    """requires_grad=False + eval() cho các khối trong `names`. Trả số tham số.
+    """requires_grad=False + eval() cho các phần trong `names`. Trả số tham số.
 
     eval() là một nửa của "đóng băng hoàn toàn": không có nó thì dropout của
-    head vẫn chạy, và cùng một ảnh cho ra hai logit khác nhau giữa hai bước —
-    head đứng yên về trọng số nhưng không đứng yên về hàm. Vòng lặp gọi lại hàm
-    này sau `branch.train()`.
+    Main Head vẫn chạy, và cùng một đặc trưng cho ra hai logit khác nhau giữa
+    hai bước — head đứng yên về trọng số nhưng không đứng yên về hàm. Chỉ các
+    lớp được đóng băng bị eval(); Pooling Stack vẫn ở train mode. Vòng lặp gọi
+    lại hàm này sau `branch.train()`.
     """
     n = 0
     for name in names:
-        mod = getattr(branch, name, None)
-        if mod is None:
+        if name.split(".", 1)[0] == "cls_head" and branch.cls_head is None:
             continue
-        for p in mod.parameters():
-            p.requires_grad_(False)
-            n += p.numel()
-        mod.eval()
+        for mod in FREEZABLE_PARTS[name](branch):
+            for p in mod.parameters():
+                if p.requires_grad:
+                    n += p.numel()
+                p.requires_grad_(False)
+            mod.eval()
     return n
 
 
@@ -777,13 +805,15 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             frozen = frozen_after_pretrain(tcfg)
             n_frozen = apply_freeze(branch, frozen)
             if frozen:
-                learn = [m for m in pretrain_io.PRETRAINED_MODULES
-                         if m not in frozen]
+                n_learn = sum(
+                    p.numel() for nm, p in branch.named_parameters()
+                    if p.requires_grad
+                    and nm.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES)
                 print(f"  ⚙ decoder_ft: ĐÓNG BĂNG HOÀN TOÀN "
                       f"{', '.join(frozen)} ({n_frozen:,} tham số, eval mode, "
-                      f"ngoài optimizer). Đã pretrain và còn học: "
-                      f"{', '.join(learn) or '—'} (lr × "
-                      f"{float(tcfg.get('pretrained_lr_mult', 0.1)):g}).",
+                      f"ngoài optimizer). Phần đã pretrain còn học: "
+                      f"{n_learn:,} tham số ở lr × "
+                      f"{float(tcfg.get('pretrained_lr_mult', 0.1)):g}.",
                       flush=True)
         bstats = branch.n_params()
         print(f"  nhánh: {branch.describe()}", flush=True)
@@ -848,7 +878,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         print(f"  decoder_ft: lr đỉnh {base_lr:.2e} cho "
               f"{'experts' if spec else 'lora'}/dec_proj/route, "
               f"{base_lr * pm:.2e} (×{pm}) cho phần ĐÃ pretrain còn học "
-              f"({', '.join(m for m in pretrain_io.PRETRAINED_MODULES if m not in frozen) or '—'})"
+              f"({', '.join(learning_pretrained_parts(branch)) or '—'})"
               f" · đóng băng {', '.join(frozen) or '—'}"
               f" · λ = {lam} warmup {lam_warm:.0%}"
               + ("" if lam_warm else " (TẮT — ClsHead không còn ngẫu nhiên)"),

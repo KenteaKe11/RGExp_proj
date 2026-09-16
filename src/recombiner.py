@@ -409,6 +409,15 @@ class TaskHead(nn.Module):
         # KHÔNG GELU sau fc2 — điểm 5 của docstring module.
         return self.fc2(self.features(x))
 
+    def main_head_modules(self) -> list[nn.Module]:
+        """Các lớp của Main Head (RMSNorm, fc1, dropout, fc2) — không gồm Pooling Stack.
+
+        Không gom chúng vào một `nn.Module` con: làm thế là đổi tên khoá
+        state_dict (`head.fc1` -> `head.main.fc1`) và checkpoint Stage 0 đã ghi
+        sẽ không nạp được.
+        """
+        return [self.norm, self.fc1, self.drop, self.fc2]
+
 
 class ClsHead(nn.Module):
     """(B, 256, d) -> logit (B, L, C). target = L·C (14 · 3)."""

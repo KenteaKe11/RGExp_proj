@@ -59,9 +59,10 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# `decoder_ft` ĐÓNG BĂNG HOÀN TOÀN Classification Head
-# (`train.freeze_after_pretrain: [cls_head]`), hạ learning rate của Recombinator
-# (`train.pretrained_lr_mult: 0.1`) để nó không bị CE kéo giật khỏi chỗ đã hội tụ
+# `decoder_ft` ĐÓNG BĂNG HOÀN TOÀN Main Head của Classification Head
+# (`train.freeze_after_pretrain: [cls_head.main_head]`), hạ learning rate của
+# Recombinator + Pooling Stack (`train.pretrained_lr_mult: 0.1`) để chúng không
+# bị CE kéo giật khỏi chỗ đã hội tụ
 # trong những bước đầu — và tắt λ-warmup, vốn chỉ có lý do khi ClsHead còn
 # ngẫu nhiên.
 # ═════════════════════════════════════════════════════════════════════════════

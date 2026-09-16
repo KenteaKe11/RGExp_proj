@@ -76,10 +76,11 @@ Stage 0 học `Recombinator + Classification Head` bằng ASL trước khi decod
 fine-tune. Checkpoint pretrain chỉ chứa hai khối này; `dec_proj` và `route_head`
 không có gradient ở Stage 0 (decoder không chạy, định tuyến tắt) nên không được
 lưu, và học ở lr đầy đủ trong decoder_ft. Sang decoder_ft, Recombinator học
-tiếp ở lr × `train.pretrained_lr_mult` (0.1), còn Classification Head **đóng
-băng hoàn toàn** (`train.freeze_after_pretrain: [cls_head]` — không gradient,
-không dropout, không nằm trong optimizer); ASL vẫn cộng vào loss và kéo
-Recombinator qua head cố định đó. Chạy bằng
+tiếp ở lr × `train.pretrained_lr_mult` (0.1) cùng Pooling Stack của
+Classification Head, còn **Main Head** của Classification Head **đóng băng hoàn
+toàn** (`train.freeze_after_pretrain: [cls_head.main_head]` — không gradient,
+không dropout, không nằm trong optimizer); ASL vẫn cộng vào loss và kéo Pooling
+Stack + Recombinator qua Main Head cố định đó. Chạy bằng
 `bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
 
 Checkpoint Stage 0 của kiến trúc cũ (PDVR + QFormer, `format /1`) **không** nạp
@@ -121,8 +122,9 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
    vào vô tình khớp** (`image_policy.allow_native_match: false`).
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
    config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
-   (`train.pretrained_lr_mult: 0.1`). Riêng My Gemma, Classification Head
-   **đóng băng hoàn toàn** sau Stage 0 (`train.freeze_after_pretrain`).
+   (`train.pretrained_lr_mult: 0.1`). Riêng My Gemma, Main Head của
+   Classification Head **đóng băng hoàn toàn** sau Stage 0
+   (`train.freeze_after_pretrain`); Pooling Stack của nó vẫn học ở lr × 0.1.
 
 Hai điều kiện cuối **sửa** setup gốc của R2Gen/AdaAtt. Đó là sai lệch có chủ ý
 và nó được ghi vào `manifest.deviations` + REPORT.md kèm con số thật, nên báo

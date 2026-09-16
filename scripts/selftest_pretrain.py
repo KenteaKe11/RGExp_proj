@@ -718,7 +718,7 @@ def lr_tests() -> None:
     check("one-cycle giữ nguyên tỉ lệ lr giữa các nhóm", t_scheduler_keeps_ratio)
 
 
-# ═══ 4b. Đóng băng Classification Head sau pretrain ═════════════════════════
+# ═══ 4b. Đóng băng Main Head của Classification Head sau pretrain ═══════════
 def freeze_ft_tests() -> None:
     from src import pretrain_io as P
     from src import train_recomb as T
@@ -726,83 +726,108 @@ def freeze_ft_tests() -> None:
 
     TCFG = {"schedule": {"max_lr": 3e-4}, "weight_decay": 0.0,
             "branch_weight_decay": 0.01, "pretrained_lr_mult": 0.1,
-            "freeze_after_pretrain": ["cls_head"]}
+            "freeze_after_pretrain": ["cls_head.main_head"]}
+
+    def ids(mods):
+        return {id(p) for m in mods for p in m.parameters()}
 
     def t_config_values():
         from src.config import load_config
 
         tc = load_config()["train"]
         eq(float(tc["pretrained_lr_mult"]), 0.1, "pretrained_lr_mult sau pretrain")
-        eq(list(tc["freeze_after_pretrain"]), ["cls_head"],
-           "cls_head phải đóng băng hoàn toàn sau pretrain")
+        eq(list(tc["freeze_after_pretrain"]), ["cls_head.main_head"],
+           "chỉ Main Head của cls_head đóng băng sau pretrain")
         eq(bool(tc.get("freeze_pretrained", False)), False)
-        eq(T.frozen_after_pretrain(dict(tc)), ("cls_head",))
-    check("config: lr × 0.1, đóng băng cls_head sau pretrain", t_config_values)
+        eq(T.frozen_after_pretrain(dict(tc)), ("cls_head.main_head",))
+    check("config: lr × 0.1, đóng băng cls_head.main_head", t_config_values)
 
     def t_resolve():
-        eq(T.frozen_after_pretrain({}), ("cls_head",), "mặc định = [cls_head]")
+        eq(T.frozen_after_pretrain({}), ("cls_head.main_head",),
+           "mặc định = [cls_head.main_head]")
         eq(T.frozen_after_pretrain({"freeze_after_pretrain": []}), ())
         eq(T.frozen_after_pretrain({"freeze_after_pretrain": "cls_head"}),
            ("cls_head",))
         eq(sorted(T.frozen_after_pretrain({"freeze_pretrained": True})),
            sorted(P.PRETRAINED_MODULES), "freeze_pretrained ghi đè")
-        for bad in (["cls_heads"], ["route_head"], ["dec_proj"]):
+        for bad in (["cls_heads"], ["route_head"], ["dec_proj"],
+                    ["route_head.main_head"], ["cls_head.fc2"]):
             raises(TrainUnusable,
                    lambda bad=bad: T.frozen_after_pretrain(
                        {"freeze_after_pretrain": bad}),
                    f"{bad} phải DỪNG")
     check("freeze_after_pretrain: mặc định, ghi đè, tên sai -> DỪNG", t_resolve)
 
+    def t_main_head_parts():
+        b = _branch()
+        th = b.cls_head.head
+        eq(ids(th.main_head_modules()), ids([th.norm, th.fc1, th.fc2]),
+           "Main Head = RMSNorm + fc1 + fc2")
+        true(not (ids(th.main_head_modules()) & ids([th.pool])),
+             "Main Head không được gồm Pooling Stack")
+        eq(ids([th.pool]) | ids(th.main_head_modules()), ids([b.cls_head]),
+           "Pooling Stack + Main Head = toàn bộ cls_head")
+    check("cls_head = Pooling Stack ⊔ Main Head", t_main_head_parts)
+
     def t_optimizer_groups():
         b = _branch(dict(RCFG_BASE, route_enabled=True))
-        T.apply_freeze(b, T.frozen_after_pretrain(TCFG))
+        n = T.apply_freeze(b, T.frozen_after_pretrain(TCFG))
+        th = b.cls_head.head
+        eq(n, sum(p.numel() for m in th.main_head_modules() for p in m.parameters()))
         opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True)
         by = {g["name"]: g for g in opt.param_groups}
-        ids = lambda mod: {id(p) for p in mod.parameters()}
         in_opt = set().union(*({id(p) for p in g["params"]}
                                for g in opt.param_groups))
-        true(not (ids(b.cls_head) & in_opt), "cls_head KHÔNG được nằm trong optimizer")
-        eq({id(p) for p in by["branch_pretrained"]["params"]}, ids(b.recombinator),
-           "nhóm đã-pretrain còn học = ĐÚNG Recombinator")
+        true(not (ids(th.main_head_modules()) & in_opt),
+             "Main Head KHÔNG được nằm trong optimizer")
+        eq({id(p) for p in by["branch_pretrained"]["params"]},
+           ids([b.recombinator, th.pool]),
+           "nhóm đã-pretrain còn học = Recombinator + Pooling Stack của cls_head")
         eq(by["branch_pretrained"]["lr"], 3e-4 * 0.1)
         eq({id(p) for p in by["branch"]["params"]},
-           ids(b.route_head) | ids(b.dec_proj), "nhóm tươi = route_head + dec_proj")
+           ids([b.route_head, b.dec_proj]), "nhóm tươi = route_head + dec_proj")
         eq(by["branch"]["lr"], 3e-4)
-    check("decoder_ft: cls_head ngoài optimizer, Recombinator lr × 0.1",
+        eq(T.learning_pretrained_parts(b),
+           ["recombinator", "cls_head.pooling_stack"])
+    check("decoder_ft: Main Head ngoài optimizer; Recombinator + Pooling lr × 0.1",
           t_optimizer_groups)
 
-    def t_frozen_head_behaviour():
-        """Head đóng băng: không gradient, không dropout; ASL vẫn kéo Recombinator."""
+    def t_frozen_main_head_behaviour():
+        """Main Head đóng băng: không grad, không dropout; Pooling + Recombinator vẫn học."""
         import copy
 
         import torch
 
+        from src import recombiner as R
         c = copy.deepcopy(CCFG)
         c["dropout"] = 0.5
-        from src import recombiner as R
         b = R.RecombinerBranch(D_VIS, D_MODEL, N_LABELS,
                                copy.deepcopy(RCFG_BASE), c).float()
         b.train()
-        T.apply_freeze(b, ("cls_head",))
-        true(not b.cls_head.training, "cls_head phải ở eval mode")
-        true(b.recombinator.training, "Recombinator vẫn ở train mode")
+        T.apply_freeze(b, ("cls_head.main_head",))
+        th = b.cls_head.head
+        true(all(not m.training for m in th.main_head_modules()),
+             "các lớp Main Head phải ở eval mode")
+        true(th.pool.training and b.recombinator.training,
+             "Pooling Stack và Recombinator vẫn ở train mode")
         vis = torch.randn(2, RCFG_BASE["n_vis"], D_VIS)
         with torch.no_grad():
-            rec = b.recombinator.eval()(vis)
-            b.recombinator.train()
+            rec = b.recombinator(vis)
             l1, l2 = b.cls_head(rec), b.cls_head(rec)
-        true(torch.equal(l1, l2), "head đóng băng phải là hàm cố định (không dropout)")
+        true(torch.equal(l1, l2),
+             "Main Head đóng băng phải không còn dropout (cùng vào -> cùng ra)")
         _t, logits, _r = b(vis)
         y = torch.zeros(2, N_LABELS, 3)
         y[:, :, 1] = 1.0
         b.sup_loss(logits, y, torch.ones(2)).backward()
-        true(all(p.grad is None for p in b.cls_head.parameters()),
-             "cls_head không được nhận gradient")
-        gs = [p.grad for p in b.recombinator.parameters() if p.grad is not None]
-        true(gs and any(float(g.abs().sum()) > 0 for g in gs),
-             "ASL vẫn phải kéo Recombinator qua head đóng băng")
-    check("cls_head đóng băng: eval, không grad, ASL vẫn tới Recombinator",
-          t_frozen_head_behaviour)
+        true(all(p.grad is None for m in th.main_head_modules()
+                 for p in m.parameters()), "Main Head không được nhận gradient")
+        for name, mod in (("Pooling Stack", th.pool), ("Recombinator", b.recombinator)):
+            gs = [p.grad for p in mod.parameters() if p.grad is not None]
+            true(gs and any(float(g.abs().sum()) > 0 for g in gs),
+                 f"ASL vẫn phải kéo {name} qua Main Head đóng băng")
+    check("Main Head đóng băng: eval, không grad; Pooling/Recombinator vẫn học",
+          t_frozen_main_head_behaviour)
 
     def t_loop_refreezes():
         """`branch.train()` trong vòng lặp phải được theo sau bởi apply_freeze."""

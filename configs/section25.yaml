@@ -40,8 +40,9 @@
 #     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
 #     một config pretrain (`pretrain:`), rồi vào main-stage với lr của phần
 #     đã pretrain bằng 1/10 lr chính thức (`train.pretrained_lr_mult: 0.1`).
-#     Riêng My Gemma: Classification Head ĐÓNG BĂNG HOÀN TOÀN sau Stage 0
-#     (`train.freeze_after_pretrain: [cls_head]`).
+#     Riêng My Gemma: Main Head của Classification Head ĐÓNG BĂNG HOÀN TOÀN
+#     sau Stage 0 (`train.freeze_after_pretrain: [cls_head.main_head]`);
+#     Pooling Stack của nó học tiếp ở 1/10 lr.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -351,15 +352,16 @@ train:
   branch_weight_decay: 0.01
 
   # ĐIỀU KIỆN 5. 1/10 lr chính thức cho MỌI khối đã đi qua Stage 0 và còn
-  # học — Recombinator của My Gemma ở đây, phần đã pretrain của R2Gen/AdaAtt
-  # ở `src/train_sota.py`.
+  # học — Recombinator + Pooling Stack của Classification Head ở My Gemma,
+  # phần đã pretrain của R2Gen/AdaAtt ở `src/train_sota.py`.
   pretrained_lr_mult: 0.1
-  # Khối đã pretrain bị ĐÓNG BĂNG HOÀN TOÀN ở main-stage (requires_grad=False,
-  # eval mode -> không dropout, không nằm trong optimizer). Classification Head
-  # sau Stage 0 là một thước đo cố định: ASL vẫn cộng vào loss và vẫn kéo
-  # Recombinator (gradient đi QUA head đóng băng), nhưng head không đổi theo
-  # CE. Phải là tập con của PRETRAINED_MODULES (recombinator, cls_head).
-  freeze_after_pretrain: [cls_head]
+  # Phần đã pretrain bị ĐÓNG BĂNG HOÀN TOÀN ở main-stage (requires_grad=False,
+  # eval mode -> không dropout, không nằm trong optimizer). Main Head của
+  # Classification Head (RMSNorm -> Linear/GELU 2560→1024 -> Linear 1024→14·3)
+  # đứng yên sau Stage 0; Pooling Stack của nó vẫn học ở lr × 0.1. ASL vẫn cộng
+  # vào loss và kéo Pooling Stack + Recombinator qua Main Head cố định.
+  # Nhận: recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
+  freeze_after_pretrain: [cls_head.main_head]
   # true = đóng băng TOÀN BỘ phần đã pretrain (cả Recombinator). Ghi đè
   # `freeze_after_pretrain`.
   freeze_pretrained: false
