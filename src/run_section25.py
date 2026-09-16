@@ -6,6 +6,7 @@
     python -m src.run_section25 --arms my_gemma
     python -m src.run_section25 --init-from hub:OWNER/NAME/latest
     python -m src.run_section25 --init-from none     # My Gemma KHÔNG pretrain
+    python -m src.run_section25 --no-resume          # decoder_ft My Gemma làm LẠI từ đầu
 
 Mã thoát:
     0  xong
@@ -30,6 +31,15 @@ File này là chỗ ranh giới ấy được giữ, nên nó nói ra ranh giớ
 `_deviations()` ghi mọi thứ §2.5 áp lên setup gốc, và stage `stats` DỪNG nếu
 thiếu bất kỳ cột nào (ba cặp đòi đủ ba cột — thiếu một là đổi thiết kế trong
 khi bảng vẫn in ra bình thường).
+
+── `--no-resume` — decoder_ft làm lại từ đầu ────────────────────────────────
+Mặc định mọi stage ĐI TIẾP từ đĩa: adapter đã có -> bỏ qua train, predictions
+đã có -> chỉ sinh phần thiếu, per_sample đã có -> dùng lại. Với decoder_ft của
+My Gemma, `--no-resume` bỏ qua cả ba: checkpoint decoder_ft, predictions và
+điểm của candidate `ours` được ĐỔI TÊN sang `*.old_<thời điểm>` (không xoá),
+rồi train (vẫn nạp Stage 0) -> sinh -> chấm lại từ đầu. `--retrain` thì chỉ
+huấn luyện lại và giữ predictions cũ — sinh tiếp trên file của model CŨ.
+Hai baseline không bị đụng; muốn làm lại chúng thì `--retrain`.
 
 ── VÌ SAO STAGE 0 CỦA MY GEMMA KHÔNG CHẠY Ở ĐÂY ────────────────────────────
 `sup_pretrain` có điểm vào riêng (`scripts/run_pretrain.sh`), ghi ra
@@ -248,11 +258,22 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
                 f"ĐIỀU KIỆN 5 — {a['id']}: paper gốc KHÔNG có stage pretrain "
                 f"cục bộ (`strategy: {ft.get('strategy')}`). Stage 0 thống nhất "
                 f"được thêm vào từ ngoài, rồi main-stage chạy đúng setup gốc.")
+    tc = dict(cfg.get("train") or {})
+    div = float(tc.get("pretrained_lr_div", 2.0))
+    p_lr = (p.get("schedule") or {}).get("max_lr")
+    amult = float((cfg.get("recombiner") or {}).get("attn_lr_mult", 3.0))
+    frozen = tc.get("freeze_after_pretrain") or []
+    if isinstance(frozen, str):
+        frozen = [frozen]
+    if tc.get("freeze_pretrained"):
+        frozen = ["recombinator", "cls_head"]
     out.append(
-        f"ĐIỀU KIỆN 5 — mọi khối đã qua Stage 0 chạy main-stage ở "
-        f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`); My Gemma "
-        f"đóng băng hoàn toàn "
-        f"{', '.join((cfg.get('train') or {}).get('freeze_after_pretrain') or []) or '—'} "
+        f"ĐIỀU KIỆN 5 — phần đã qua Stage 0 của hai baseline chạy main-stage ở "
+        f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`). My Gemma "
+        f"(decoder_ft) fine-tune TOÀN BỘ: phần đã pretrain chạy lr Stage 0 / "
+        f"{div:g} (= {p_lr} / {div:g}, `train.pretrained_lr_div`), ma trận "
+        f"Attn của Recombinator × {amult:g} (`recombiner.attn_lr_mult`, cả ở "
+        f"Stage 0); đóng băng: {', '.join(frozen) or 'không'} "
         f"(`train.freeze_after_pretrain`).")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
@@ -265,6 +286,38 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         "lịch của §2.3/§2.4. Đó là một khác biệt THẬT giữa ba cột và nó thuộc "
         "phần Giới hạn, không phải một lỗi cần sửa.")
     return out
+
+
+def ft_artifacts(arm: dict, adapter_root: Path, run_dir: Path) -> list[Path]:
+    """Những gì §2.5 ĐỌC LẠI từ đĩa cho một candidate: checkpoint, sinh, điểm."""
+    aid = arm["id"]
+    return [adapter_root / aid,
+            run_dir / "predictions" / f"{aid}.jsonl",
+            run_dir / "metrics" / f"per_sample_{aid}.csv"]
+
+
+def archive_ft(arms: list[dict], adapter_root: Path, run_dir: Path,
+               stamp: str) -> list[tuple[Path, Path]]:
+    """`--no-resume`: ĐỔI TÊN (không xoá) mọi thứ đọc lại được của decoder_ft.
+
+    Chỉ candidate `ours` — hai baseline không có decoder_ft. Đổi tên chứ không
+    xoá: một lần gõ nhầm cờ không được phép vứt hàng giờ GPU. Trả [(cũ, mới)].
+    """
+    moved: list[tuple[Path, Path]] = []
+    for arm in arms:
+        if arm.get("kind") != "ours":
+            continue
+        for src in ft_artifacts(arm, adapter_root, run_dir):
+            if not src.exists():
+                continue
+            dst = src.with_name(f"{src.name}.old_{stamp}")
+            i = 1
+            while dst.exists():
+                dst = src.with_name(f"{src.name}.old_{stamp}_{i}")
+                i += 1
+            src.rename(dst)
+            moved.append((src, dst))
+    return moved
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -282,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="decoder_ft của My Gemma làm LẠI từ đầu: bỏ qua (đổi tên "
+                         "sang *.old_<ts>) checkpoint ft, predictions và điểm cũ")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -334,10 +390,41 @@ def main(argv: list[str] | None = None) -> int:
         print("✗ không arm nào được bật")
         return 2
 
+    ft_arms = [x for x in arms if x["kind"] == "ours"]
+    if a.no_resume:
+        if "train" not in stages:
+            print("✗ --no-resume làm lại decoder_ft từ đầu nên cần stage `train` "
+                  "(đang --stages " + ",".join(stages) + ").\n"
+                  "    Chỉ muốn chấm lại: --rescore. Chỉ muốn sinh lại: xoá "
+                  "predictions/<arm>.jsonl.")
+            return 2
+        if not ft_arms:
+            print("✗ --no-resume chỉ áp cho decoder_ft của My Gemma, nhưng "
+                  "không candidate `ours` nào đang được chọn (--arms). Hai "
+                  "baseline làm lại bằng --retrain.")
+            return 2
+        if str(a.init_from or "").lower() == "none":
+            print("⚠ --no-resume + --init-from none: đây là chạy scratch, "
+                  "không phải decoder_ft — vẫn làm lại từ đầu.", flush=True)
+
     run_id = a.run_id or str(cfg["output"].get("subdir", "2.5_sota"))
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
     adapter_root = Path(str(cfg["output"].get("adapter_dir", "./adapters_2_5")))
+
+    no_resume_moved: list[tuple[Path, Path]] = []
+    if a.no_resume:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        no_resume_moved = archive_ft(ft_arms, adapter_root, run_dir, stamp)
+        print(f"⚙ --no-resume: decoder_ft của "
+              f"{', '.join(x['id'] for x in ft_arms)} làm LẠI từ đầu "
+              f"(train -> sinh -> chấm).", flush=True)
+        if no_resume_moved:
+            for old, new in no_resume_moved:
+                print(f"    {old} -> {new.name}", flush=True)
+            print("    (đổi tên, KHÔNG xoá — dọn tay khi chắc chắn)", flush=True)
+        else:
+            print("    không có gì cũ để cất.", flush=True)
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
     declared = [x["id"] for x in arms]
 
@@ -352,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "run_id": run_id, "experiment": "2.5",
+        "no_resume": ({"arms": [x["id"] for x in ft_arms],
+                       "archived": [[str(o), str(n)] for o, n in no_resume_moved]}
+                      if a.no_resume else None),
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": resolved_snapshot(cfg), "env": _env_info(),
         "stages_run": stages, "arms_declared": declared, "arm_status": {},

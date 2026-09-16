@@ -288,8 +288,11 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
                 "Dùng impl=lambda khi khai cycle_steps.")
         from torch.optim.lr_scheduler import OneCycleLR
 
+        # Mỗi nhóm có lr đỉnh riêng (Attn × 3, phần đã pretrain ...): lr lúc
+        # dựng optimizer CHÍNH LÀ lr đỉnh của nhóm đó. Một số max_lr chung sẽ
+        # ghi đè mọi tỉ lệ ấy trong im lặng.
         return OneCycleLR(
-            optimizer, max_lr=float(scfg.get("max_lr", 2e-4)),
+            optimizer, max_lr=[float(g["lr"]) for g in optimizer.param_groups],
             total_steps=total_steps + 1,   # +1: đệm cho chênh lệch làm tròn
             pct_start=pct, div_factor=dv, final_div_factor=fdv,
             anneal_strategy="cos" if anneal.startswith("cos") else "linear",

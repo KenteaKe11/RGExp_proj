@@ -11,10 +11,11 @@ Cái nó bảo vệ là bốn ca hỏng cho ra một lần chạy TRÔNG HOÀN T
      ngẫu nhiên. Thiếu khoá theo chiều ngược lại thì một phần của khối "đã pretrain"
      là ngẫu nhiên, còn META vẫn nói nó đã học.
 
-  2. Nhóm learning-rate áp nhầm chỗ. `pretrained_lr_mult` phải áp ĐÚNG các khối
-     có trong file pretrain, không áp lên `route_head` (còn tươi) và không áp
-     lên `dec_proj` (còn tươi). Áp nhầm nghĩa là router học chậm gấp mười, và bảng
-     định tuyến sẽ đầy expert chết vì một lý do không liên quan tới MoE.
+  2. Nhóm learning-rate áp nhầm chỗ. Ở decoder_ft phần đã pretrain chạy
+     pretrain max_lr / 2, KHÔNG áp lên `route_head`/`dec_proj` (còn tươi); ma
+     trận Attn của Recombinator luôn × 3 (Stage 0 lẫn decoder_ft). Áp nhầm
+     nghĩa là router học chậm, và bảng định tuyến sẽ đầy expert chết vì một lý
+     do không liên quan tới MoE.
 
   3. Route Head lọt vào pretrain. Ở Stage 0 không có Experts, nên Route Head
      không được gọi và không được nhận gradient; nếu nó có gradient thì file
@@ -633,78 +634,137 @@ class _FakePeft:
         return iter(self._p)
 
 
+def ids_of(mod) -> set:
+    return {id(p) for p in mod.parameters()}
+
+
+LRS = {"main": 3e-4, "pretrain_max_lr": 2e-4, "pretrained_div": 2.0,
+       "pretrained": 1e-4, "attn_mult": 3.0}
+
+
+def _close(a, b, msg=""):
+    if abs(float(a) - float(b)) > 1e-12 * max(1.0, abs(float(b))):
+        raise AssertionError(f"{msg} {a!r} != {b!r}")
+
+
 def lr_tests() -> None:
     from src import pretrain_io as P
+    from src import pretrain_sup as S
+    from src import recombiner as R
     from src import train_recomb as T
+    from src.backbone import TrainUnusable
 
     TCFG = {"schedule": {"max_lr": 3e-4}, "weight_decay": 0.0,
-            "branch_weight_decay": 0.01,
-            "pretrained_lr_mult": 0.1}
+            "branch_weight_decay": 0.01}
 
-    def t_scratch_unchanged():
-        """Chế độ scratch: ĐÚNG hai nhóm — không còn nhóm `gate`."""
+    def attn_ids(b):
+        return {id(p) for n, p in b.named_parameters() if R.is_attn_param(n)}
+
+    def t_attn_params_are_qkvo():
         b = _branch()
-        opt, n = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=False)
-        names = [g["name"] for g in opt.param_groups]
-        eq(names, ["lora", "branch"], "nhóm của chế độ scratch")
-        for g in opt.param_groups:
-            if g["name"] == "branch":
-                eq(g["lr"], 3e-4, "scratch: nhánh chạy lr đầy đủ")
-    check("scratch: đúng 2 nhóm, nhánh lr đầy đủ",
-          t_scratch_unchanged)
+        names = [n for n, _ in b.named_parameters() if R.is_attn_param(n)]
+        eq(sorted(n.rsplit(".", 2)[-2] for n in names),
+           ["k_proj", "o_proj", "q_proj", "v_proj"], "Attn = Q/K/V/O")
+        eq(attn_ids(b), ids_of(b.recombinator.global_extractor.attn))
+    check("ma trận Attn = Q/K/V/O của Global Extractor", t_attn_params_are_qkvo)
+
+    def t_pretrain_groups():
+        b = _branch()
+        pcfg = {"schedule": {"max_lr": 2e-4}, "weight_decay": 0.8}
+        opt, n = S.build_optimizer(b, pcfg, {"attn_lr_mult": 3.0})
+        by = {g["name"]: g for g in opt.param_groups}
+        eq([g["name"] for g in opt.param_groups],
+           ["branch_sup", "branch_sup_attn"], "nhóm Stage 0")
+        _close(by["branch_sup"]["lr"], 2e-4, "lr chính Stage 0")
+        _close(by["branch_sup_attn"]["lr"], 6e-4, "Attn Stage 0 = 3×")
+        eq(by["branch_sup"]["weight_decay"], 0.8)
+        eq(by["branch_sup_attn"]["weight_decay"], 0.8)
+        eq({id(p) for p in by["branch_sup_attn"]["params"]}, attn_ids(b))
+        want = {id(p) for nm, p in b.named_parameters()
+                if nm.split(".", 1)[0] in P.PRETRAINED_MODULES}
+        eq({id(p) for g in opt.param_groups for p in g["params"]}, want,
+           "Stage 0 tối ưu ĐÚNG PRETRAINED_MODULES")
+        raises(TrainUnusable,
+               lambda: S.build_optimizer(b, pcfg, {"attn_lr_mult": 0.5}),
+               "attn_lr_mult < 1 phải DỪNG")
+    check("Stage 0: lr 2e-4, Attn 6e-4, wd 0.8", t_pretrain_groups)
+
+    def t_scratch_groups():
+        b = _branch()
+        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=False,
+                                   lrs=LRS)
+        by = {g["name"]: g for g in opt.param_groups}
+        eq(list(by), ["lora", "branch", "branch_attn"], "nhóm của scratch")
+        _close(by["branch"]["lr"], 3e-4)
+        _close(by["branch_attn"]["lr"], 9e-4, "scratch: Attn = 3 × main")
+        eq({id(p) for p in by["branch_attn"]["params"]}, attn_ids(b))
+    check("scratch: nhánh lr chính, Attn × 3", t_scratch_groups)
 
     def t_ft_groups():
         b = _branch()
-        opt, n = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True)
-        names = [g["name"] for g in opt.param_groups]
-        eq(names, ["lora", "branch_pretrained", "branch"],
-           "decoder_ft phải tách thân nhánh làm đôi")
+        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
+                                   lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
-        eq(by["branch_pretrained"]["lr"], 3e-4 * 0.1, "lr của phần đã pretrain")
-        eq(by["branch"]["lr"], 3e-4, "phần còn TƯƠI chạy lr đầy đủ")
-    check("decoder_ft: 3 nhóm, đúng 2 mức lr", t_ft_groups)
+        eq(list(by), ["lora", "branch_pretrained", "branch_pretrained_attn",
+                      "branch"], "nhóm của decoder_ft")
+        _close(by["lora"]["lr"], 3e-4, "adapter lr chính")
+        _close(by["branch_pretrained"]["lr"], 1e-4, "đã pretrain = 2e-4 / 2")
+        _close(by["branch_pretrained_attn"]["lr"], 3e-4, "Attn = 1e-4 × 3")
+        _close(by["branch"]["lr"], 3e-4, "phần còn TƯƠI lr chính")
+        true(by["branch_pretrained_attn"]["lr"] > by["branch_pretrained"]["lr"],
+             "Attn phải cao hơn phần đã pretrain")
+    check("decoder_ft: pretrain lr / 2, Attn × 3, tươi lr chính", t_ft_groups)
 
     def t_ft_membership():
-        """Nhóm đã-pretrain phải chứa ĐÚNG tham số của PRETRAINED_MODULES."""
+        """Không còn lr riêng cho Main Head: cả cls_head ở nhóm đã pretrain."""
         b = _branch()
-        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True)
+        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
+                                   lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
-        want_pre, want_fresh = set(), set()
-        for nm, p in b.named_parameters():
-            if nm.split(".", 1)[0] in P.PRETRAINED_MODULES:
-                want_pre.add(id(p))
-            else:
-                want_fresh.add(id(p))
-        eq({id(p) for p in by["branch_pretrained"]["params"]}, want_pre,
-           "nhóm đã-pretrain")
-        eq({id(p) for p in by["branch"]["params"]}, want_fresh,
-           "nhóm tươi phải là route_head + dec_proj và CHỈ chúng")
-        fresh_mods = {nm.split(".", 1)[0] for nm, p in b.named_parameters()
-                      if id(p) in want_fresh}
-        eq(fresh_mods, {"route_head", "dec_proj"}, "khối trong nhóm tươi")
-        true(want_fresh, "phải có ít nhất route_head ở nhóm tươi — nếu rỗng thì "
-                         "`route_head` đã lọt vào nhóm đã-pretrain")
-    check("decoder_ft: route_head/dec_proj ở nhóm TƯƠI, không bị hạ lr",
+        pre = {id(p) for nm, p in b.named_parameters()
+               if nm.split(".", 1)[0] in P.PRETRAINED_MODULES}
+        eq({id(p) for p in by["branch_pretrained"]["params"]},
+           pre - attn_ids(b), "nhóm đã pretrain = Recombinator(−Attn) + cls_head")
+        true(ids_of(b.cls_head) <= {id(p) for p in by["branch_pretrained"]["params"]},
+             "Main Head + Pooling Stack chạy CÙNG lr phần đã pretrain")
+        eq({id(p) for p in by["branch_pretrained_attn"]["params"]}, attn_ids(b))
+        eq({id(p) for p in by["branch"]["params"]},
+           ids_of(b.route_head) | ids_of(b.dec_proj),
+           "nhóm tươi = route_head + dec_proj và CHỈ chúng")
+    check("decoder_ft: route_head/dec_proj tươi, cls_head không có lr riêng",
           t_ft_membership)
 
-    def t_bad_mult():
-        from src.backbone import TrainUnusable
+    def t_ft_lrs_from_cfg():
+        from src.config import load_config
 
-        b = _branch()
-        for bad in (0.0, 1.5, -0.1):
-            raises(TrainUnusable,
-                   lambda bad=bad: T.build_optimizer(
-                       _FakePeft(), b, dict(TCFG, pretrained_lr_mult=bad),
-                       from_pretrain=True),
-                   f"pretrained_lr_mult={bad} phải DỪNG")
-    check("pretrained_lr_mult ngoài (0,1] -> DỪNG", t_bad_mult)
+        cfg = load_config()
+        l = T.ft_lrs(cfg)
+        _close(l["main"], float(cfg["train"]["schedule"]["max_lr"]))
+        _close(l["pretrain_max_lr"], 2e-4, "pretrain.schedule.max_lr")
+        _close(l["pretrained"], 1e-4, "decoder_ft: 2e-4 / 2")
+        eq(l["attn_mult"], 3.0)
+        eq(float(cfg["pretrain"]["weight_decay"]), 0.8)
+        bad = load_config()
+        bad["train"]["pretrained_lr_div"] = 0.5
+        raises(TrainUnusable, lambda: T.ft_lrs(bad), "div < 1 phải DỪNG")
+        bad = load_config()
+        bad["recombiner"]["attn_lr_mult"] = 0.9
+        raises(TrainUnusable, lambda: T.ft_lrs(bad), "attn < 1 phải DỪNG")
+        raises(TrainUnusable,
+               lambda: T.build_optimizer(_FakePeft(), _branch(), TCFG,
+                                         from_pretrain=True,
+                                         lrs=dict(LRS, pretrained=None)),
+               "decoder_ft thiếu lr Stage 0 phải DỪNG")
+    check("ft_lrs đọc config: 2e-4/2, Attn × 3, tên sai -> DỪNG",
+          t_ft_lrs_from_cfg)
 
     def t_scheduler_keeps_ratio():
         """LambdaLR nhân CÙNG hệ số vào mọi nhóm -> tỉ lệ lr giữ nguyên."""
         from src.backbone import build_scheduler
 
         b = _branch()
-        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True)
+        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
+                                   lrs=LRS)
         sch = build_scheduler(opt, 100, {"impl": "lambda", "max_lr": 3e-4,
                                          "pct_start": 0.1, "div_factor": 25.0,
                                          "final_div_factor": 100.0})
@@ -713,8 +773,9 @@ def lr_tests() -> None:
             sch.step()
         by = {g["name"]: g["lr"] for g in opt.param_groups}
         r = by["branch_pretrained"] / by["branch"]
-        true(abs(r - 0.1) < 1e-9,
-             f"tỉ lệ lr phải giữ 0.1 suốt lịch, đang {r}")
+        true(abs(r - 1 / 3) < 1e-9, f"tỉ lệ đã pretrain/tươi phải giữ 1/3, đang {r}")
+        r = by["branch_pretrained_attn"] / by["branch_pretrained"]
+        true(abs(r - 3.0) < 1e-9, f"tỉ lệ Attn phải giữ 3, đang {r}")
     check("one-cycle giữ nguyên tỉ lệ lr giữa các nhóm", t_scheduler_keeps_ratio)
 
 
@@ -725,8 +786,7 @@ def freeze_ft_tests() -> None:
     from src.backbone import TrainUnusable
 
     TCFG = {"schedule": {"max_lr": 3e-4}, "weight_decay": 0.0,
-            "branch_weight_decay": 0.01, "pretrained_lr_mult": 0.1,
-            "freeze_after_pretrain": ["cls_head.main_head"]}
+            "branch_weight_decay": 0.01, "freeze_after_pretrain": []}
 
     def ids(mods):
         return {id(p) for m in mods for p in m.parameters()}
@@ -736,15 +796,19 @@ def freeze_ft_tests() -> None:
 
         tc = load_config()["train"]
         eq(float(tc["pretrained_lr_mult"]), 0.1, "pretrained_lr_mult sau pretrain")
-        eq(list(tc["freeze_after_pretrain"]), ["cls_head.main_head"],
-           "chỉ Main Head của cls_head đóng băng sau pretrain")
+        true("pretrained_lr_parts" not in tc,
+             "train.pretrained_lr_parts đã bỏ — Main Head không có lr riêng")
+        eq(float(tc["pretrained_lr_div"]), 2.0)
+        eq(list(tc["freeze_after_pretrain"]), [],
+           "decoder_ft không đóng băng gì")
         eq(bool(tc.get("freeze_pretrained", False)), False)
-        eq(T.frozen_after_pretrain(dict(tc)), ("cls_head.main_head",))
-    check("config: lr × 0.1, đóng băng cls_head.main_head", t_config_values)
+        eq(T.frozen_after_pretrain(dict(tc)), ())
+    check("config: không đóng băng, lr phần đã pretrain = Stage 0 / 2",
+          t_config_values)
 
     def t_resolve():
-        eq(T.frozen_after_pretrain({}), ("cls_head.main_head",),
-           "mặc định = [cls_head.main_head]")
+        eq(T.frozen_after_pretrain({}), (), "mặc định = không đóng băng")
+        eq(T.frozen_after_pretrain({"freeze_after_pretrain": None}), ())
         eq(T.frozen_after_pretrain({"freeze_after_pretrain": []}), ())
         eq(T.frozen_after_pretrain({"freeze_after_pretrain": "cls_head"}),
            ("cls_head",))
@@ -772,25 +836,39 @@ def freeze_ft_tests() -> None:
     def t_optimizer_groups():
         b = _branch(dict(RCFG_BASE, route_enabled=True))
         n = T.apply_freeze(b, T.frozen_after_pretrain(TCFG))
+        eq(n, 0, "không đóng băng tham số nào")
         th = b.cls_head.head
-        eq(n, sum(p.numel() for m in th.main_head_modules() for p in m.parameters()))
-        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True)
+        opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
+                                   lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
         in_opt = set().union(*({id(p) for p in g["params"]}
                                for g in opt.param_groups))
-        true(not (ids(th.main_head_modules()) & in_opt),
-             "Main Head KHÔNG được nằm trong optimizer")
-        eq({id(p) for p in by["branch_pretrained"]["params"]},
-           ids([b.recombinator, th.pool]),
-           "nhóm đã-pretrain còn học = Recombinator + Pooling Stack của cls_head")
-        eq(by["branch_pretrained"]["lr"], 3e-4 * 0.1)
+        true(ids([b]) <= in_opt, "MỌI tham số nhánh phải nằm trong optimizer")
+        true(ids(th.main_head_modules())
+             <= {id(p) for p in by["branch_pretrained"]["params"]},
+             "Main Head ở nhóm đã pretrain (không có lr riêng)")
         eq({id(p) for p in by["branch"]["params"]},
            ids([b.route_head, b.dec_proj]), "nhóm tươi = route_head + dec_proj")
-        eq(by["branch"]["lr"], 3e-4)
         eq(T.learning_pretrained_parts(b),
-           ["recombinator", "cls_head.pooling_stack"])
-    check("decoder_ft: Main Head ngoài optimizer; Recombinator + Pooling lr × 0.1",
+           ["recombinator", "cls_head.pooling_stack", "cls_head.main_head"])
+    check("decoder_ft: fine-tune toàn bộ, không đóng băng",
           t_optimizer_groups)
+
+    def t_explicit_freeze_still_works():
+        """Đối chứng: đóng băng tường minh Main Head -> nó rời optimizer."""
+        b = _branch(dict(RCFG_BASE, route_enabled=True))
+        tc = dict(TCFG, freeze_after_pretrain=["cls_head.main_head"])
+        th = b.cls_head.head
+        n = T.apply_freeze(b, T.frozen_after_pretrain(tc))
+        eq(n, sum(p.numel() for m in th.main_head_modules() for p in m.parameters()))
+        opt, _ = T.build_optimizer(_FakePeft(), b, tc, from_pretrain=True,
+                                   lrs=LRS)
+        in_opt = set().union(*({id(p) for p in g["params"]}
+                               for g in opt.param_groups))
+        true(not (ids(th.main_head_modules()) & in_opt),
+             "Main Head đóng băng KHÔNG được nằm trong optimizer")
+    check("freeze_after_pretrain tường minh vẫn đóng băng đúng",
+          t_explicit_freeze_still_works)
 
     def t_frozen_main_head_behaviour():
         """Main Head đóng băng: không grad, không dropout; Pooling + Recombinator vẫn học."""

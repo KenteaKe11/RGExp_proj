@@ -75,13 +75,25 @@ dù kích thước khối khác nhau.
 Stage 0 học `Recombinator + Classification Head` bằng ASL trước khi decoder
 fine-tune. Checkpoint pretrain chỉ chứa hai khối này; `dec_proj` và `route_head`
 không có gradient ở Stage 0 (decoder không chạy, định tuyến tắt) nên không được
-lưu, và học ở lr đầy đủ trong decoder_ft. Sang decoder_ft, Recombinator học
-tiếp ở lr × `train.pretrained_lr_mult` (0.1) cùng Pooling Stack của
-Classification Head, còn **Main Head** của Classification Head **đóng băng hoàn
-toàn** (`train.freeze_after_pretrain: [cls_head.main_head]` — không gradient,
-không dropout, không nằm trong optimizer); ASL vẫn cộng vào loss và kéo Pooling
-Stack + Recombinator qua Main Head cố định đó. Chạy bằng
+lưu, và học ở lr đầy đủ trong decoder_ft. Sang decoder_ft **không đóng băng
+gì** — fine-tune toàn bộ (`train.freeze_after_pretrain: []`).
+
+| nhóm | Stage 0 | decoder_ft |
+|---|---|---|
+| Recombinator + Classification Head (gồm Main Head) | 2e-4 | 2e-4 / 2 = **1e-4** (`train.pretrained_lr_div`) |
+| Attn (Q/K/V/O) của Recombinator | 2e-4 × 3 = **6e-4** | 1e-4 × 3 = **3e-4** (`recombiner.attn_lr_mult`) |
+| Experts, `route_head`, `dec_proj` | — | 3e-4 (`train.schedule.max_lr`) |
+
+Stage 0 dùng `weight_decay: 0.8`. Main Head không còn lr nhỏ riêng. Checkpoint
+Stage 0 dở dang với optimizer một nhóm (trước khi Attn có nhóm riêng) không
+nối tiếp được — chạy `run_pretrain.sh --no-resume`. Chạy bằng
 `bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
+
+decoder_ft mặc định đi tiếp từ đĩa (adapter / predictions / điểm đã có thì
+dùng lại). Muốn làm lại decoder_ft từ đầu:
+`bash scripts/run_section25.sh --no-resume` — checkpoint ft, predictions và
+điểm cũ của My Gemma được đổi tên sang `*.old_<thời điểm>` (không xoá), Stage 0
+vẫn được nạp; hai baseline không bị đụng.
 
 Checkpoint Stage 0 của kiến trúc cũ (PDVR + QFormer, `format /1`) **không** nạp
 được vào nhánh này — phải chạy lại Stage 0. Nếu `runs/sup_pretrain` còn
@@ -122,9 +134,10 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
    vào vô tình khớp** (`image_policy.allow_native_match: false`).
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
    config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
-   (`train.pretrained_lr_mult: 0.1`). Riêng My Gemma, Main Head của
-   Classification Head **đóng băng hoàn toàn** sau Stage 0
-   (`train.freeze_after_pretrain`); Pooling Stack của nó vẫn học ở lr × 0.1.
+   (`train.pretrained_lr_mult: 0.1`) — áp cho R2Gen/AdaAtt. Riêng My Gemma
+   fine-tune toàn bộ, không đóng băng; phần đã pretrain chạy lr Stage 0 / 2
+   (`train.pretrained_lr_div`), ma trận Attn của Recombinator luôn × 3
+   (`recombiner.attn_lr_mult`).
 
 Hai điều kiện cuối **sửa** setup gốc của R2Gen/AdaAtt. Đó là sai lệch có chủ ý
 và nó được ghi vào `manifest.deviations` + REPORT.md kèm con số thật, nên báo

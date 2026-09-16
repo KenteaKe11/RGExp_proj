@@ -40,9 +40,11 @@
 #     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
 #     một config pretrain (`pretrain:`), rồi vào main-stage với lr của phần
 #     đã pretrain bằng 1/10 lr chính thức (`train.pretrained_lr_mult: 0.1`).
-#     Riêng My Gemma: Main Head của Classification Head ĐÓNG BĂNG HOÀN TOÀN
-#     sau Stage 0 (`train.freeze_after_pretrain: [cls_head.main_head]`);
-#     Pooling Stack của nó học tiếp ở 1/10 lr.
+#     Riêng My Gemma (decoder_ft): KHÔNG đóng băng, fine-tune toàn bộ; phần đã
+#     pretrain học ở lr Stage 0 GIẢM 2 lần (`train.pretrained_lr_div: 2` ->
+#     2e-4 / 2 = 1e-4), không còn lr nhỏ riêng cho Main Head. Ma trận Attn của
+#     Recombinator LUÔN chạy lr × 3 so với nhóm của nó, ở cả Stage 0 lẫn
+#     decoder_ft (`recombiner.attn_lr_mult: 3`).
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -351,17 +353,19 @@ train:
     cycle_momentum: false
   branch_weight_decay: 0.01
 
-  # ĐIỀU KIỆN 5. 1/10 lr chính thức cho MỌI khối đã đi qua Stage 0 và còn
-  # học — Recombinator + Pooling Stack của Classification Head ở My Gemma,
-  # phần đã pretrain của R2Gen/AdaAtt ở `src/train_sota.py`.
+  # ĐIỀU KIỆN 5 — CHỈ cho R2Gen/AdaAtt (`src/train_sota.py`): phần đã pretrain
+  # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
   pretrained_lr_mult: 0.1
-  # Phần đã pretrain bị ĐÓNG BĂNG HOÀN TOÀN ở main-stage (requires_grad=False,
-  # eval mode -> không dropout, không nằm trong optimizer). Main Head của
-  # Classification Head (RMSNorm -> Linear/GELU 2560→1024 -> Linear 1024→14·3)
-  # đứng yên sau Stage 0; Pooling Stack của nó vẫn học ở lr × 0.1. ASL vẫn cộng
-  # vào loss và kéo Pooling Stack + Recombinator qua Main Head cố định.
-  # Nhận: recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
-  freeze_after_pretrain: [cls_head.main_head]
+  # My Gemma · decoder_ft — lr đỉnh từng nhóm (`train_recomb.build_optimizer`):
+  #   experts / route_head / dec_proj      : schedule.max_lr            = 3e-4
+  #   Recombinator + cls_head (đã pretrain): pretrain.schedule.max_lr / 2 = 1e-4
+  #   Attn (Q/K/V/O) của Recombinator      : 1e-4 × recombiner.attn_lr_mult = 3e-4
+  # Main Head KHÔNG còn lr nhỏ riêng — nó chạy cùng lr với phần đã pretrain.
+  pretrained_lr_div: 2.0
+  # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
+  # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer); nhận
+  # cùng bộ tên như trên.
+  freeze_after_pretrain: []
   # true = đóng băng TOÀN BỘ phần đã pretrain (cả Recombinator). Ghi đè
   # `freeze_after_pretrain`.
   freeze_pretrained: false
@@ -398,6 +402,10 @@ recombiner:
     pool_factor: 4
   head_dim: 64
   dropout: 0.05
+  # Ma trận Attn (Q/K/V/O của Global Extractor) LUÔN chạy lr × hệ số này so với
+  # nhóm chứa nó — Stage 0: 3 × pretrain max_lr; decoder_ft: 3 × lr phần đã
+  # pretrain; scratch: 3 × train max_lr. Phải >= 1.
+  attn_lr_mult: 3.0
   # ── Classification Head / Route Head ────────────────────────────────────
   # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
   # Linear/GELU trục token N→N/2 -> AvgPool N/2→N/4; 256→64→16→4→1) -> Main
@@ -434,11 +442,11 @@ classifier:
   # Lệch nhãn neg/pos/uncertain nên KHÔNG dùng CE thường. ASL, lực nén grad
   # phía neg = 2.0, pos/uncertain = 0.0.
   asl:
-    gamma_neg: [4.0, 2.0, 0.0]
+    gamma_neg: [4.0, 3.0, 0.0]
     gamma_pos: 0.0
-    clip: 0.02
+    clip: 0.05
     eps: 1.0e-8
-  lambda: 0.2
+  lambda: 0.4
   lambda_warmup_pct: 0.1
   # Nhánh vào main-stage đã qua Stage 0 => ClsHead không còn ngẫu nhiên =>
   # không warmup. Đây là hệ quả của điều kiện 5, không phải một lựa chọn rời.
@@ -509,11 +517,14 @@ stats:
 # `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
 # chia, và min_lr là TÍCH của chúng:
 #
-#     lr đầu warm-up = max_lr / div_factor              = 3e-4 / 30 = 1e-5
-#     lr cuối cosine = lr đầu / final_div_factor        = 1e-5 / 10 = 1e-6
-#     =>  min_lr = max_lr / (div_factor × final_div_factor) = 3e-4 / 300
+#     lr đầu warm-up = max_lr / div_factor              = 2e-4 / 30 ≈ 6.67e-6
+#     lr cuối cosine = lr đầu / final_div_factor        ≈ 6.67e-6 / 10 ≈ 6.67e-7
+#     =>  min_lr = max_lr / (div_factor × final_div_factor) = 2e-4 / 300
 #
-# `min_lr: 1.0e-6` dưới đây là con số ĐƯỢC KIỂM, không phải con số được đọc:
+# Attn của Recombinator chạy cả đường cong này × `recombiner.attn_lr_mult` (3):
+# đỉnh 6e-4.
+#
+# `min_lr: 6.667e-7` dưới đây là con số ĐƯỢC KIỂM, không phải con số được đọc:
 # `scripts/selftest_section25.py` đối chiếu nó với tích hai hệ số và DỪNG nếu
 # lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
@@ -526,19 +537,20 @@ pretrain:
   grad_accum: 2
   schedule:
     impl: lambda
-    max_lr: 3.0e-4
-    min_lr: 1.0e-6          # = max_lr / (div_factor × final_div_factor)
+    max_lr: 2.0e-4
+    min_lr: 6.667e-7        # = max_lr / (div_factor × final_div_factor)
     # Restart epoch e nhân cả max_lr và min_lr với 0.9^e.
     lr_decay: 0.9
     pct_start: 0.1
-    div_factor: 30.0        # lr đầu warm-up = 3e-4 / 30 = 1e-5
-    final_div_factor: 10.0  # lr cuối cosine = 1e-5 / 10 = 1e-6
+    div_factor: 30.0        # lr đầu warm-up = 2e-4 / 30 ≈ 6.67e-6
+    final_div_factor: 10.0  # lr cuối cosine ≈ 6.67e-7
     anneal: cos
     cycle_momentum: false
-  # Dữ liệu ít => weight decay nằm trong khoảng 0.03–0.1. 0.05 là điểm giữa
-  # đang dùng; hai đầu mút để ở đây để một lần dò không phải đi tìm lại.
-  weight_decay: 0.03
-  weight_decay_range: [0.03, 0.1]
+  # AdamW (decoupled): mỗi bước kéo trọng số về 0 một lượng lr × wd
+  # (đỉnh 2e-4 × 0.8 = 1.6e-4; Attn 6e-4 × 0.8 = 4.8e-4). `weight_decay_range`
+  # là khoảng được selftest chấp nhận.
+  weight_decay: 0.8
+  weight_decay_range: [0.03, 1.0]
   base_method: qlora
   select_metric: cls_f1_pos
   keep_last_ckpt: 2

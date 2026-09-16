@@ -59,12 +59,15 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# `decoder_ft` ĐÓNG BĂNG HOÀN TOÀN Main Head của Classification Head
-# (`train.freeze_after_pretrain: [cls_head.main_head]`), hạ learning rate của
-# Recombinator + Pooling Stack (`train.pretrained_lr_mult: 0.1`) để chúng không
-# bị CE kéo giật khỏi chỗ đã hội tụ
-# trong những bước đầu — và tắt λ-warmup, vốn chỉ có lý do khi ClsHead còn
-# ngẫu nhiên.
+# lr Stage 0: max 2e-4, weight_decay 0.8; ma trận Attn (Q/K/V/O) của
+# Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 6e-4. Ckpt dở dang ghi
+# bằng optimizer một nhóm KHÔNG nối tiếp được: chạy với --no-resume.
+#
+# `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ. Phần đã pretrain chạy lr
+# Stage 0 / 2 = 1e-4 (`train.pretrained_lr_div`), Attn × 3 = 3e-4; Experts,
+# route_head, dec_proj ở 3e-4. Không còn lr nhỏ riêng cho Main Head. λ-warmup
+# tắt, vốn chỉ có lý do khi ClsHead còn ngẫu nhiên. Làm lại decoder_ft từ đầu:
+#     bash scripts/run_section25.sh --no-resume
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 

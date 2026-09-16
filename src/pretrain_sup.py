@@ -226,20 +226,32 @@ def trainable_params(branch) -> list:
     return out
 
 
-def build_optimizer(branch, pcfg: dict):
+def build_optimizer(branch, pcfg: dict, rcfg: dict | None = None):
+    """AdamW, hai nhóm: `branch_sup` ở lr chính và `branch_sup_attn` — ma trận
+    Attn (Q/K/V/O) của Recombinator — ở lr × `recombiner.attn_lr_mult` (3).
+
+    `branch_sup` luôn đứng ĐẦU: log đọc `param_groups[0]["lr"]` làm lr chính.
+    LambdaLR nhân cùng một hệ số vào mọi nhóm nên tỉ lệ 3× giữ suốt lịch.
+    """
     import torch
 
     named = trainable_params(branch)
-    params = [p for _, p in named]
-    if not params:
+    if not named:
         raise TrainUnusable("không có tham số nào để pretrain.")
+    try:
+        amult = recombiner.attn_lr_mult(rcfg)
+    except ValueError as e:
+        raise TrainUnusable(str(e)) from None
     lr = float(dict(pcfg.get("schedule", {}) or {}).get("max_lr", 3e-4))
-    opt = torch.optim.AdamW(
-        [{"params": params, "lr": lr,
-          "weight_decay": float(pcfg.get("weight_decay", 0.01)),
-          "name": "branch_sup"}],
-        betas=(0.9, 0.999), eps=1e-8)
-    return opt, {"branch_sup": sum(p.numel() for p in params)}
+    wd = float(pcfg.get("weight_decay", 0.01))
+    main = [p for n, p in named if not recombiner.is_attn_param(n)]
+    attn = [p for n, p in named if recombiner.is_attn_param(n)]
+    groups = [{"params": main, "lr": lr, "weight_decay": wd, "name": "branch_sup"}]
+    if attn:
+        groups.append({"params": attn, "lr": lr * amult, "weight_decay": wd,
+                       "name": "branch_sup_attn"})
+    opt = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+    return opt, {g["name"]: sum(p.numel() for p in g["params"]) for g in groups}
 
 
 # ══ Một lượt forward ════════════════════════════════════════════════════════
@@ -506,7 +518,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         steps = int(max_steps_override)
         per_epoch = max(1, steps // max(1, n_epochs))
 
-    opt, n_by_group = build_optimizer(branch, pcfg)
+    opt, n_by_group = build_optimizer(branch, pcfg, rcfg)
+    print("  optimizer: " + " · ".join(
+        f"{g['name']} {sum(p.numel() for p in g['params']):,} tham số "
+        f"@ max_lr {g['lr']:.2e} wd {g['weight_decay']:g}"
+        for g in opt.param_groups), flush=True)
     scfg = dict(pcfg["schedule"])
     if bool(pcfg.get("cycle_per_epoch", False)):
         # Restarts use optimizer steps so gradient accumulation cannot shift an
@@ -589,6 +605,15 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"      --run-id sup_pretrain_recomb")
         branch.load_state_dict({k: v.to(device=dev, dtype=bdtype)
                                 for k, v in st["branch"].items()})
+        n_old = len((st.get("opt") or {}).get("param_groups") or [])
+        if n_old != len(opt.param_groups):
+            raise TrainUnusable(
+                f"ckpt ở {last['dir']} có optimizer {n_old} nhóm tham số; lần "
+                f"chạy này dựng {len(opt.param_groups)} nhóm "
+                f"({', '.join(g['name'] for g in opt.param_groups)}) — ma trận "
+                f"Attn nay có nhóm lr riêng (× recombiner.attn_lr_mult).\n"
+                f"    Trạng thái AdamW không nối tiếp được qua thay đổi đó. "
+                f"Bắt đầu lại: --no-resume   (hoặc --run-id <tên mới>)")
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
         g.set_state(st["gen_state"])
@@ -655,6 +680,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "label_stats": cls_train.get("stats"),
         "branch_params": bstats,
         "param_groups": n_by_group,
+        "param_group_max_lr": {g["name"]: float(g["lr"]) for g in opt.param_groups},
+        "attn_lr_mult": recombiner.attn_lr_mult(rcfg),
     }
 
     hist_path = run_dir / "history.csv"
@@ -723,11 +750,15 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                           f"{step+1}/{per_epoch} (tổng {global_step}/{steps}) · "
                           f"asl {st_asl:.4f} · mẫu {cursor}/{n} ({idx}) · "
                           f"{recombiner.format_grad_norms(grad_norms)} · "
-                          f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
+                          f"lr {opt.param_groups[0]['lr']:.2e}"
+                          + (f" (attn {opt.param_groups[1]['lr']:.2e})"
+                             if len(opt.param_groups) > 1 else ""), flush=True)
                     if tracker is not None:
                         tracker.log({
                             "pretrain/asl": st_asl,
                             "pretrain/lr": opt.param_groups[0]["lr"],
+                            **({"pretrain/lr_attn": opt.param_groups[1]["lr"]}
+                               if len(opt.param_groups) > 1 else {}),
                             "pretrain/epoch": epoch + 1,
                             "pretrain/step": global_step,
                             "pretrain/cursor": cursor,
@@ -863,6 +894,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "n_params_pretrained": int(n_sup),
         "branch_params": bstats,
         "param_groups": n_by_group,
+        "attn_lr_mult": recombiner.attn_lr_mult(rcfg),
         "best": best,
         "best_dir": str(best_dir) if best_dir.exists() else None,
         "latest_dir": str(latest_dir) if latest_dir.exists() else None,

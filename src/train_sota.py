@@ -8,7 +8,7 @@ ra điều đó.
 ── HAI STAGE, VÀ RANH GIỚI GIỮA CHÚNG ──────────────────────────────────────
 STAGE 0 (điều kiện 5) — `cfg.pretrain`, GIỐNG HỆT nhau ở mọi candidate:
     CNN đóng băng, phần ngôn ngữ học trước. Lịch warm-up cosine, một chu kỳ =
-    một epoch, 8 epoch, max_lr 3e-4 -> min_lr 1e-6, weight decay 0.03-0.1.
+    một epoch, 8 epoch, max_lr 2e-4 -> min_lr ≈ 6.67e-7, weight decay 0.8.
 
     Với AdaAtt, stage này THAY THẾ `fine_tuning.stage_1` của paper (cùng ý đồ —
     "train language model without CNN fine-tuning" — nhưng lr và lịch lấy từ

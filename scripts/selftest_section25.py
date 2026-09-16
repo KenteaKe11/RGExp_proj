@@ -608,6 +608,48 @@ def t_deviations_name_conditions_4_and_5():
     assert "micro_batch" in d
 
 
+def t_no_resume_archives_only_ours():
+    """`--no-resume` cất (đổi tên) đúng ba thứ của My Gemma, không đụng baseline."""
+    import tempfile
+
+    from src.run_section25 import archive_ft
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        ad, rd = d / "adapters", d / "run"
+        for aid in ("my_gemma", "r2gen"):
+            (ad / aid).mkdir(parents=True)
+            (ad / aid / "train_stats.json").write_text("{}")
+            (rd / "predictions").mkdir(parents=True, exist_ok=True)
+            (rd / "metrics").mkdir(parents=True, exist_ok=True)
+            (rd / "predictions" / f"{aid}.jsonl").write_text("{}\n")
+            (rd / "metrics" / f"per_sample_{aid}.csv").write_text("key\n")
+        arms = [{"id": "my_gemma", "kind": "ours"}, {"id": "r2gen", "kind": "sota"}]
+        moved = archive_ft(arms, ad, rd, "T")
+        assert len(moved) == 3, moved
+        assert not (ad / "my_gemma").exists()
+        assert (ad / "my_gemma.old_T" / "train_stats.json").exists()
+        assert not (rd / "predictions" / "my_gemma.jsonl").exists()
+        assert (rd / "predictions" / "my_gemma.jsonl.old_T").exists()
+        assert (rd / "metrics" / "per_sample_my_gemma.csv.old_T").exists()
+        for pth in (ad / "r2gen", rd / "predictions" / "r2gen.jsonl",
+                    rd / "metrics" / "per_sample_r2gen.csv"):
+            assert pth.exists(), f"baseline bị đụng: {pth}"
+        (ad / "my_gemma").mkdir()
+        moved = archive_ft(arms, ad, rd, "T")
+        assert moved and moved[0][1].name == "my_gemma.old_T_1", moved
+
+
+def t_no_resume_requires_train_stage():
+    from src.run_section25 import main
+
+    rc = main(["--no-resume", "--stages", "stats,report", "--no-wandb",
+               "--no-push"])
+    assert rc == 2, rc
+    rc = main(["--no-resume", "--arms", "r2gen", "--no-wandb", "--no-push"])
+    assert rc == 2, rc
+
+
 def t_report_never_computes_cider():
     """CIDEr dừng lại ở khâu chọn checkpoint, không lọt vào bảng kết quả.
 
@@ -687,6 +729,10 @@ if __name__ == "__main__":
     check("src/ không import sang _archive/", t_src_does_not_import_archive)
     check("deviations nêu điều kiện 4 và 5", t_deviations_name_conditions_4_and_5)
     check("báo cáo không bao giờ tính CIDEr", t_report_never_computes_cider)
+    check("--no-resume chỉ cất checkpoint/sinh/điểm của My Gemma",
+          t_no_resume_archives_only_ours)
+    check("--no-resume cần stage train và một candidate ours",
+          t_no_resume_requires_train_stage)
 
     print(f"\n═══ {PASS} qua · {FAIL} hỏng · {SKIP} bỏ qua ═══")
     if FAILURES:

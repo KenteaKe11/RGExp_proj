@@ -9,6 +9,7 @@
 #     bash scripts/run_section25.sh --arms my_gemma
 #     bash scripts/run_section25.sh --init-from hub:OWNER/NAME/best
 #     bash scripts/run_section25.sh --init-from none # My Gemma KHÔNG pretrain
+#     bash scripts/run_section25.sh --no-resume      # decoder_ft My Gemma làm LẠI từ đầu
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_section25`.
 #
@@ -45,6 +46,11 @@
 #   * candidate đã có checkpoint (model_best.pt / adapter + nhánh) -> bỏ qua train
 #   * ảnh đã sinh trong predictions/*.jsonl                        -> chỉ sinh phần thiếu
 #   * điểm đã chấm trong metrics/*.csv                             -> dùng lại
+#
+# `--no-resume` tắt cả ba điều trên cho decoder_ft của My Gemma: adapter,
+# predictions/my_gemma.jsonl và metrics/per_sample_my_gemma.csv được ĐỔI TÊN sang
+# `*.old_<thời điểm>` (không xoá), rồi train (vẫn nạp Stage 0) -> sinh -> chấm
+# lại. Hai baseline giữ nguyên (làm lại chúng bằng `--retrain`).
 #
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 5 nhãn ·
 #           6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu Stage 0

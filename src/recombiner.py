@@ -326,6 +326,28 @@ class Recombinator(nn.Module):
 
 GRAD_GROUPS: tuple[str, ...] = ("local", "global", "ffn")
 
+# ══ Ma trận Attn của Recombinator: lr × `recombiner.attn_lr_mult` ════════════
+# Q/K/V/O của MHA trong Global Extractor. Dùng chung cho Stage 0
+# (`pretrain_sup.build_optimizer`) và main-stage (`train_recomb.build_optimizer`)
+# — "Attn luôn có lr cao hơn" là MỘT quy tắc, nên nó chỉ được định nghĩa ở đây.
+ATTN_PARAM_PREFIX = "recombinator.global_extractor.attn."
+DEFAULT_ATTN_LR_MULT = 3.0
+
+
+def attn_lr_mult(rcfg: dict | None) -> float:
+    """`recombiner.attn_lr_mult` (mặc định 3). Phải >= 1: Attn chạy lr CAO hơn."""
+    v = float((rcfg or {}).get("attn_lr_mult", DEFAULT_ATTN_LR_MULT))
+    if not (v >= 1.0 and math.isfinite(v)):
+        raise ValueError(
+            f"recombiner.attn_lr_mult = {v} — phải >= 1 (ma trận Attn của "
+            f"Recombinator luôn chạy lr cao hơn lr chính).")
+    return v
+
+
+def is_attn_param(name: str) -> bool:
+    """Tên tham số (theo `branch.named_parameters()`) thuộc ma trận Attn?"""
+    return str(name).startswith(ATTN_PARAM_PREFIX)
+
 
 def recombinator_grad_norms(branch) -> dict[str, float]:
     """L2 gradient norm / số tham số, trước clipping, cho ba khối của Recombinator."""
