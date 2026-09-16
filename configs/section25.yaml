@@ -19,7 +19,7 @@
 # Câu hỏi của mục này, viết đủ một câu:
 #
 #     Trên CÙNG 6400 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
-#     công thức Gemma 3 + PDVR + QFormer + ClsHead + Experts K=6·E=10
+#     công thức Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10
 #     có hơn hai kiến trúc sinh báo cáo đã công bố (R2Gen, AdaAtt) không, và
 #     hơn BAO NHIÊU?
 #
@@ -39,12 +39,9 @@
 #  5. Có ÍT NHẤT một kiến trúc mang stage pretrain/finetune cục bộ (R2Gen
 #     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
 #     một config pretrain (`pretrain:`), rồi vào main-stage với lr của phần
-#     đã pretrain bằng 1/5 lr chính thức (`train.pretrained_lr_mult: 0.2`).
-#
-# Điều kiện 5 là lý do `pretrained_lr_mult` ở đây là 0.2 chứ không phải 0.1
-# như `_archive/configs/recombiner.yaml`. 0.1 là con số của §2.3/§2.4 và
-# những bảng ấy đã chốt; đổi nó ở đây không đụng tới chúng, và 1/5 là con số
-# mục 2.5 công bố.
+#     đã pretrain bằng 1/10 lr chính thức (`train.pretrained_lr_mult: 0.1`).
+#     Riêng My Gemma: Classification Head ĐÓNG BĂNG HOÀN TOÀN sau Stage 0
+#     (`train.freeze_after_pretrain: [cls_head]`).
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -140,7 +137,7 @@ arms_s25:
   # `order: 0` là chỗ nói ra điều đó; thứ tự không được phép ảnh hưởng kết
   # quả (seed và thứ tự dữ liệu đặt lại trước MỖI candidate).
   - id: my_gemma
-    name: "C · My Gemma · PDVR · QFormer · Cls · K=6·E=10 · QLoRA r4"
+    name: "C · My Gemma · Recombinator · Cls/Route Head · K=6·E=10 · QLoRA r4"
     kind: ours
     runner: gemma3_recomb
     recomb: true
@@ -352,12 +349,19 @@ train:
     anneal: cos
     cycle_momentum: false
   branch_weight_decay: 0.01
-  gate_lr_mult: 250.0
 
-  # ĐIỀU KIỆN 5. 1/5 lr chính thức cho MỌI khối đã đi qua Stage 0 — nhánh của
-  # My Gemma ở đây, visual encoder của R2Gen/AdaAtt ở `src/runners/`.
-  # §2.3/§2.4 dùng 0.1; con số ấy thuộc về những bảng đã chốt trong _archive/.
-  pretrained_lr_mult: 0.2
+  # ĐIỀU KIỆN 5. 1/10 lr chính thức cho MỌI khối đã đi qua Stage 0 và còn
+  # học — Recombinator của My Gemma ở đây, phần đã pretrain của R2Gen/AdaAtt
+  # ở `src/train_sota.py`.
+  pretrained_lr_mult: 0.1
+  # Khối đã pretrain bị ĐÓNG BĂNG HOÀN TOÀN ở main-stage (requires_grad=False,
+  # eval mode -> không dropout, không nằm trong optimizer). Classification Head
+  # sau Stage 0 là một thước đo cố định: ASL vẫn cộng vào loss và vẫn kéo
+  # Recombinator (gradient đi QUA head đóng băng), nhưng head không đổi theo
+  # CE. Phải là tập con của PRETRAINED_MODULES (recombinator, cls_head).
+  freeze_after_pretrain: [cls_head]
+  # true = đóng băng TOÀN BỘ phần đã pretrain (cả Recombinator). Ghi đè
+  # `freeze_after_pretrain`.
   freeze_pretrained: false
 
   target_modules: [q_proj, k_proj, v_proj, o_proj]
@@ -377,37 +381,46 @@ train:
 recombiner:
   siglip_dim: 1152
   out_dim: null
-  prepare_pool_factor: 4
-  n_query: 64
-  highway_token_dims: [512, 256, 128]
-  n_heads: 18
+  # ── Recombinator: X (4096, 1152) -> Y (256, 2560) ─────────────────────────
+  # 1. Local Extractors ×2: RMSNorm -> Linear 1152→hidden GELU -> RMSNorm
+  #    -> AvgPool 2×2 trên lưới ảnh (N → N/4) -> Linear hidden→1152 GELU.
+  #    4096 (64×64) -> 1024 (32×32) -> 256 (16×16).
+  # 2. Global Extractor: Query = đầu ra Local, Key/Value = X gốc (RMSNorm riêng),
+  #    MHA head_dim=64 (1152/64 = 18 head) + residual RMSNorm(Query).
+  # 3. FFN: Linear 1152→2560 GELU -> RMSNorm -> Linear 2560→2560 GELU + residual.
+  n_vis: 4096
+  n_tokens: 256          # được KIỂM: = n_vis / pool_factor^n_blocks
+  local:
+    n_blocks: 2
+    hidden: 2048
+    pool_factor: 4
+  head_dim: 64
   dropout: 0.05
-  swiglu_dropout: 0.05
-  qformer:
-    tasks: [sup, aux]
-    freeze: [aux]
-    d_model: 1024
-    n_layers: 1
-    n_heads: 16
-    ffn_mult: 2
+  # ── Classification Head / Route Head ────────────────────────────────────
+  # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
+  # Linear/GELU trục token N→N/2 -> AvgPool N/2→N/4; 256→64→16→4→1) -> Main
+  # Head (RMSNorm -> Linear/GELU 2560→hidden -> Linear hidden→target).
+  # Classification Head đọc `classifier.hidden/dropout`, target = n_labels × 3.
+  # Route Head đọc khối dưới đây, target = n_experts, cộng `noise_proj`
+  # (hidden → E) cho nhiễu học được của Top-k Gate.
+  pool_stages: 4
+  route_head:
+    hidden: 1024
     dropout: 0.05
   # Điều kiện của mục: E = 10 (§2.4 đã chốt), K = 6 nằm ở `arms_s25`.
   n_experts: 10
   token_type: text
   dtype: null
 
-  # ── Cổng trước concat: Sigmoid Gate + Hard Discrete (L0) ────────────────
-  # `beta`, `stretch_lo/hi` là ba tham số của hard-concrete: sigmoid ra một
-  # xác suất liên tục, phép kéo giãn [-0.1, 1.1] rồi kẹp về [0, 1] cho phép
-  # cổng đóng HẲN (đúng 0) và mở HẲN (đúng 1) — thứ một sigmoid trơn không
-  # bao giờ làm được. Phạt L0 ở `classifier.l0_lambda`.
-  #
-  # Bất biến: quãng đường của cổng >= |gate_init_logit|.
-  gate:
-    beta: 0.6666666666666666
-    stretch_lo: -0.1
-    stretch_hi: 1.1
-  gate_init_logit: -2.5
+  # ── Vào decoder: Linear/GELU trên TRỤC TOKEN, KHÔNG cổng ────────────────
+  # 256 token của Recombinator -> Linear (không bias) + GELU -> `n_dec_tokens`
+  # token, nối THẲNG vào chuỗi decoder TRƯỚC 256 token ảnh (First / Second
+  # trong sơ đồ); phần văn bản của prompt giữ nguyên vị trí. Khởi tạo =
+  # trung bình 2×2 trên lưới 16×16 -> 8×8. Hai head vẫn đọc đủ 256 token.
+  # Khoá của kiến trúc cũ (`qformer`, `prepare_pool_factor`,
+  # `highway_token_dims`, `swiglu_dropout`, `n_query`, `n_heads`, `gate*`) đã
+  # BỎ — còn sót khoá nào là DỪNG.
+  n_dec_tokens: 64
 
 classifier:
   enabled: true
@@ -428,7 +441,6 @@ classifier:
   # Nhánh vào main-stage đã qua Stage 0 => ClsHead không còn ngẫu nhiên =>
   # không warmup. Đây là hệ quả của điều kiện 5, không phải một lựa chọn rời.
   lambda_warmup_pct_pretrained: 0.0
-  l0_lambda: 0.01
 
 moe:
   enabled: true
@@ -504,7 +516,7 @@ stats:
 # lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 16000 # 0 = toàn bộ train split đã khai ở `data`
+  n_train: 9600 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 8
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
@@ -532,7 +544,7 @@ pretrain:
   push_each_epoch: true
   swa:
     enabled: true
-    start_epoch: 0.5
+    start_epoch: 0.25
   subdir: sup_pretrain
   hub_repo: RGExp123/RGExp_sup_pretrain
   hub_repo_type: model

@@ -1,18 +1,17 @@
 """Chế độ `sup_pretrain` — huấn luyện nhánh thị giác 100% CÓ GIÁM SÁT, không decoder.
 
-    loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ),  nhãn )
+    loss = ASL( ClsHead( Recombinator( SigLIP(ảnh) ) ),  nhãn )
 
 Không có CE, không có λ, không có Aux Loss, không có LoRA. Mục tiêu đúng một
-câu: cho Recombinator + QFormer + ClsHead HỘI TỤ VỀ PHÂN LOẠI trước, rồi mới
+câu: cho Recombinator + Classification Head HỘI TỤ VỀ PHÂN LOẠI trước, rồi mới
 đưa nhánh đã biết nhìn bệnh lý sang cho decoder ở chế độ `decoder_ft`.
 
 ── Vì sao đáng tách thành một chế độ riêng ─────────────────────────────────
 Ở §2.3 nhánh học cùng lúc hai việc từ một điểm khởi đầu ngẫu nhiên: sinh ra
-đặc trưng mang thông tin bệnh lý (qua ASL) và sinh ra 32 token mà decoder dùng
+đặc trưng mang thông tin bệnh lý (qua ASL) và sinh ra token mà decoder dùng
 được (qua CE). Cả hai đều đi qua cùng một Recombinator, và cả hai đều bắt đầu
 từ nhiễu. Với `lambda = 0.2` và ~200 bước one-cycle, phần lớn lịch học bị tiêu
-vào việc đưa nhánh ra khỏi vùng ngẫu nhiên — `gate_final` trong bảng §2.3 là
-con số nói chuyện đó có kịp xảy ra hay không.
+vào việc đưa nhánh ra khỏi vùng ngẫu nhiên.
 
 Pretrain cắt việc thứ nhất ra, làm nó rẻ (không decoder -> không CE, không
 KV-cache, không 1024 token; một lượt SigLIP trong `no_grad` cộng một mạng dày
@@ -28,16 +27,15 @@ epoch trên 6400 mẫu).
      kiểm chạy ở mỗi lần chạy: nó so `pixel_values` của đường vision-only với
      đường `ReportDataset` trên một mẫu THẬT và đòi bằng nhau TỪNG BIT.
 
-  2. CÙNG HÌNH DẠNG NHÁNH. `qformer.tasks = [sup, aux]`, `freeze = [aux]`,
-     `route_enabled = false` — đúng cấu hình §2.3. Chỉ `sup` có gradient (đó là
-     "QFormer 1 vector" theo nghĩa đường thông tin), nhưng `query` vẫn là
-     (2, d) và `route_gate` vẫn được dựng, nên checkpoint nạp thẳng sang §2.4.
-     Xem docstring `src/pretrain_io.py`.
+  2. CÙNG HÌNH DẠNG NHÁNH. Cùng khối `recombiner`/`classifier` với main-stage,
+     chỉ khác `route_enabled = false`. `route_head` vẫn được dựng (nhưng không
+     được gọi), nên checkpoint nạp thẳng sang decoder_ft. Xem docstring
+     `src/pretrain_io.py`.
 
   3. DECODER KHÔNG CHẠY, và điều đó phải ĐÚNG chứ không chỉ được nói. Base vẫn
      được nạp (điều kiện 1), nhưng `model(...)` không bao giờ được gọi và không
-     một tham số nào của base nằm trong optimizer. Hệ quả kéo theo: `gate` (cổng
-     vào decoder) và `route_gate` (đọc `vec_2` đã đóng băng) không nhận gradient
+     một tham số nào của base nằm trong optimizer. Hệ quả kéo theo: `dec_proj` (chiếu
+     vào decoder) và `route_head` (chỉ chạy khi định tuyến bật) không nhận gradient
      — nên chúng KHÔNG vào file pretrain, và `pretrain_io.UNTRAINED_MODULES` là
      chỗ điều đó được khai.
 
@@ -186,29 +184,18 @@ def assert_pixel_path_matches(ds: VisionOnlyDataset, df: pd.DataFrame,
 
 # ══ Nhánh cho pretrain ══════════════════════════════════════════════════════
 def pretrain_rcfg(cfg: Cfg) -> dict:
-    """Khối `recombiner` ở chế độ pretrain: ĐÓNG BĂNG `aux`, TẮT định tuyến.
+    """Khối `recombiner` ở chế độ pretrain: TẮT định tuyến, còn lại giữ nguyên.
 
-    Ba khoá bị ép, không đọc từ config — cùng cơ chế với
-    `train_recomb.effective_rcfg` ở §2.4, ngược chiều:
+    Một khoá bị ép, không đọc từ config — cùng cơ chế với
+    `train_recomb.effective_rcfg` ở main-stage, ngược chiều:
 
-      * `qformer.freeze = [aux]` — chỉ `vec_1` có gradient. Để `freeze: []` ở
-        đây nghĩa là `vec_2` cũng được kéo bởi ASL, tức là hai query học cùng
-        một việc và "hai vector không biết gì về nhau" mất nghĩa.
-      * `route_enabled = false` — không có gì để định tuyến khi không có decoder.
-      * `gate_init` giữ nguyên (0.0): cổng không nhận gradient ở đây, và nó phải
-        tới `decoder_ft` ở đúng trạng thái đóng, y như một lần chạy from-scratch.
+      * `route_enabled = false` — không có gì để định tuyến khi không có
+        decoder. Route Head khi đó KHÔNG được gọi trong forward, nên nó không
+        nhận gradient và không vào file.
+      * `dec_proj` (Linear/GELU 256→64 vào decoder) cũng không nhận gradient ở
+        đây và không vào file: nó tới `decoder_ft` ở đúng khởi tạo trung bình cụm.
     """
     r = dict(cfg.get("recombiner", {}) or {})
-    q = dict(r.get("qformer", {}) or {})
-    tasks = tuple(str(t) for t in q.get("tasks", ("sup", "aux")))
-    if "sup" not in tasks:
-        raise TrainUnusable(
-            f"recombiner.qformer.tasks = {list(tasks)} không có `sup`. "
-            f"sup_pretrain huấn luyện ĐÚNG vector ấy — không có nó thì không có "
-            f"gì để pretrain.")
-    q["freeze"] = [t for t in tasks if t != "sup"]
-    r = dict(r)
-    r["qformer"] = q
     r["route_enabled"] = False
     return r
 
@@ -225,7 +212,7 @@ def build_branch(cfg: Cfg, d_vis: int, d_model: int, n_labels: int, rcfg: dict):
 def trainable_params(branch) -> list:
     """Tham số được tối ưu ở pretrain: ĐÚNG PRETRAINED_MODULES.
 
-    Lọc theo tên khối chứ không theo `requires_grad`: `gate` và `route_gate`
+    Lọc theo tên khối chứ không theo `requires_grad`: `dec_proj` và `route_head`
     vẫn `requires_grad=True` (chúng là Parameter bình thường), chúng chỉ không
     nhận gradient vì không nằm trên đường tới loss. Đưa chúng vào optimizer
     không làm chúng đổi (AdamW bỏ qua tham số có `grad is None`), nhưng nó làm
@@ -486,14 +473,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         device=dev, dtype=bdtype)
     bstats = branch.n_params()
     n_sup = sum(p.numel() for _, p in trainable_params(branch))
-    print(f"  nhánh PDVR: Preparer AvgPool(4->1) -> RMSNorm({vis_h}) -> "
-          f"SwiGLU(mult=2) + skip; Highway 1152->{text_h}, token chain -> "
-          f"{bstats['n_query']}; Extractor pool -> MHA(head=64) -> {text_h}; "
-          f"sum -> RMSNorm({text_h}) -> QFormer("
-          f"{len(bstats['qformer_tasks'])} vector: "
-          f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
-          f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector) -> ClsHead({n_labels}×"
-          f"{int(cfg.get('classifier', {}).get('n_classes', 3))})", flush=True)
+    print(f"  nhánh: {branch.describe()}", flush=True)
     print(f"  pretrain {n_sup:,}/{bstats['total']:,} tham số — ĐÚNG "
           f"{', '.join(pretrain_io.PRETRAINED_MODULES)}. "
           f"KHÔNG pretrain: {', '.join(pretrain_io.UNTRAINED_MODULES)} "
@@ -597,6 +577,16 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             print(f"  ⚠ --extend-schedule: lịch đổi từ {prev_total} sang {steps} "
                   f"bước. lr sẽ nhảy tại điểm nối, và điều đó phải vào phần "
                   f"Giới hạn nếu checkpoint này ra bảng.", flush=True)
+        own_keys = set(branch.state_dict())
+        ck_keys = set(st["branch"])
+        if own_keys != ck_keys:
+            raise TrainUnusable(
+                f"ckpt ở {last['dir']} được ghi bởi một kiến trúc nhánh KHÁC "
+                f"(thiếu {sorted(own_keys - ck_keys)[:3]}, thừa "
+                f"{sorted(ck_keys - own_keys)[:3]}).\n"
+                f"    Gần như chắc chắn đó là checkpoint của PDVR + QFormer cũ. "
+                f"Chạy Stage 0 MỚI với một run id khác:\n"
+                f"      --run-id sup_pretrain_recomb")
         branch.load_state_dict({k: v.to(device=dev, dtype=bdtype)
                                 for k, v in st["branch"].items()})
         opt.load_state_dict(st["opt"])
@@ -717,12 +707,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                         ep_fp += float((pp & ~gp).sum())
                         ep_fn += float((~pp & gp).sum())
                 if clip > 0:
-                    grad_norms = recombiner.pdvr_grad_norms(branch)
+                    grad_norms = recombiner.recombinator_grad_norms(branch)
                     torch.nn.utils.clip_grad_norm_(
                         [p for grp in opt.param_groups for p in grp["params"]],
                         clip)
                 else:
-                    grad_norms = recombiner.pdvr_grad_norms(branch)
+                    grad_norms = recombiner.recombinator_grad_norms(branch)
                 opt.step()
                 sched.step()
                 global_step += 1
@@ -732,10 +722,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                     print(f"    [pretrain] epoch {epoch+1}/{n_epochs} · bước "
                           f"{step+1}/{per_epoch} (tổng {global_step}/{steps}) · "
                           f"asl {st_asl:.4f} · mẫu {cursor}/{n} ({idx}) · "
-                          f"grad P/H/E "
-                          f"{grad_norms.get('preparer_mean_per_param', 0.0):.2e}/"
-                          f"{grad_norms.get('highway_mean_per_param', 0.0):.2e}/"
-                          f"{grad_norms.get('extractor_mean_per_param', 0.0):.2e} · "
+                          f"{recombiner.format_grad_norms(grad_norms)} · "
                           f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
                     if tracker is not None:
                         tracker.log({
@@ -824,12 +811,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"sup_pretrain HẾT VRAM ở batch {bs} × grad_accum {accum} "
                 f"({note}).\n"
                 f"    Ba khoá làm được gì đó, theo thứ tự sức nặng:\n"
-                f"      1. PDVR highway_token_dims "
-                f"({rcfg.get('highway_token_dims', [512, 256, 128])}) — activation "
-                f"trên trục token "
-                f"cho MỖI ảnh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH DẠNG CHECKPOINT: nhánh "
-                f"pretrain sẽ không nạp được vào §2.3/§2.4 đang dùng giá trị cũ. "
-                f"Đổi thì phải đổi ở CẢ HAI.\n"
+                f"      1. recombiner.local.hidden "
+                f"({(rcfg.get('local') or {}).get('hidden', 2048)}) — Local "
+                f"Extractor đầu tiên chạy trên ĐỦ 4096 patch × hidden cho MỖI ảnh, "
+                f"đây là activation lớn nhất của nhánh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH "
+                f"DẠNG CHECKPOINT: nhánh pretrain sẽ không nạp được vào main-stage "
+                f"đang dùng giá trị cũ. Đổi thì phải đổi ở CẢ HAI.\n"
                 f"      2. pretrain.per_device_batch_size ({bs}) — nhớ NHÂN "
                 f"grad_accum lên đúng bấy nhiêu lần để eff_bs {bs*accum} không "
                 f"đổi, nếu không thì số bước và lịch one-cycle đổi theo.\n"

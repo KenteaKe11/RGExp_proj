@@ -8,11 +8,12 @@ collate) và tự viết ĐÚNG một thứ: vòng lặp.
 ── Vì sao KHÔNG dùng HF Trainer ở đây ──────────────────────────────────────
 Không phải vì Trainer tệ. Vì hàm mất mát của §2.3 không còn là `model(**batch)`:
 
-    loss = CE_decoder( decoder( [prompt ‖ 32 token Recombinator ‖ 256 token ảnh] ) )
-         + λ(step) · ASL( ClsHead(vec_1), nhãn bệnh lý )
+    loss = CE_decoder( decoder( [prompt ‖ 64 token Recombinator ‖ 256 token ảnh] ) )
+         + λ(step) · ASL( ClsHead(Recombinator), nhãn bệnh lý )
+         + α(step) · Aux( RouteHead(Recombinator) )
 
 Chuỗi vào decoder được DỰNG TAY (một lượt SigLIP chia cho hai đường, rồi chèn
-32 token vào giữa), và λ đổi theo bước. Nhồi chuyện đó vào Trainer cần một
+64 token vào giữa), và λ đổi theo bước. Nhồi chuyện đó vào Trainer cần một
 `compute_loss` ghi đè, một wrapper `nn.Module` giả dạng `PreTrainedModel`, và
 một `save_pretrained` tự viết — ba lớp gián tiếp để giành lại quyền điều khiển
 một vòng lặp 30 dòng. Ở một thí nghiệm mà điều duy nhất phải đúng là "hai
@@ -36,8 +37,8 @@ bảng §2.2; chỉ hiệu số A↔B bên trong §2.3 là thứ hai kiểm đ�
      candidate thứ hai bắt đầu từ trạng thái RNG mà candidate thứ nhất để lại.
   3. Cùng SỐ BƯỚC và cùng đường cong, vì batch và grad_accum là hằng số đọc
      thẳng từ config (xem mục dưới).
-  4. Cùng độ dài NHÃN. 32 token được chèn SAU khi mẫu đã bị cắt về max_seq_len,
-     nên candidate B không học trên báo cáo ngắn hơn candidate A đúng 32 token.
+  4. Cùng độ dài NHÃN. Token nhánh được chèn SAU khi mẫu đã bị cắt về max_seq_len,
+     nên candidate có nhánh không học trên báo cáo ngắn hơn đúng bấy nhiêu token.
 
 ── Vì sao KHÔNG còn dò batch ───────────────────────────────────────────────
 Bản trước có một cái thang: hết VRAM thì chia đôi batch và nhân đôi grad_accum.
@@ -127,7 +128,7 @@ def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
     if k == n_e:
         raise TrainUnusable(
             f"candidate {arm.get('id')!r}: top_k = n_experts = {k}. Mọi expert "
-            f"luôn được chọn, nên Route_Gate không định tuyến gì — đó là một mô "
+            f"luôn được chọn, nên Top-k Gate không định tuyến gì — đó là một mô "
             f"hình DÀY ĐẶC mang tên MoE, và nó không thuộc bảng này.")
     rank = int(e.get("rank") or preset["rank"])
     alpha = float(e.get("alpha") or resolve_alpha(rank, dict(cfg["train"])))
@@ -158,27 +159,19 @@ def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
 def effective_rcfg(cfg: Cfg, spec: dict | None) -> dict:
     """Khối `recombiner` đã giải quyết cho candidate này.
 
-    §2.3 dùng nguyên khối trong config. §2.4 ghi đè ĐÚNG ba khoá, và cả ba đều
-    đi vào `spec` của nhánh (tức là vào `pdvr_branch.json`), nên
+    Không MoE thì dùng nguyên khối trong config. Có MoE thì ghi đè ĐÚNG ba khoá,
+    và cả ba đều đi vào `spec` của nhánh (tức là vào `recomb_branch.json`), nên
     `load_branch` ở khâu sinh dựng lại đúng chế độ đã huấn luyện chứ không phải
     chế độ đang ghi trong config lúc ấy:
 
-      * `n_experts`        — hình dạng hai ma trận của Route_Gate;
-      * `route_enabled`    — Route_Gate có trả đầu ra hay bị vứt;
-      * `qformer.freeze`   — §2.3 đóng băng `aux`; §2.4 thì KHÔNG, vì `vec_2`
-                             chính là nguồn định tuyến. Để nguyên `freeze: [aux]`
-                             ở §2.4 nghĩa là `vec_2` bị detach: router vẫn chạy,
-                             vẫn định tuyến, nhưng QFormer và Recombinator không
-                             bao giờ học được cách sinh ra một `vec_2` hữu ích —
-                             một MoE có router mù, và loss vẫn giảm bình thường.
+      * `n_experts`        — hình dạng lớp cuối của Route Head (target = E);
+      * `route_enabled`    — Route Head có được gọi hay không;
+      * `route_noise_init` — bias khởi tạo của `noise_proj` (Top-k Gate).
     """
     r = dict(cfg.get("recombiner", {}) or {})
     if spec is None:
         return r
-    q = dict(r.get("qformer", {}) or {})
-    q["freeze"] = []
     r = dict(r)
-    r["qformer"] = q
     r["n_experts"] = int(spec["n_experts"])
     r["route_enabled"] = True
     r["route_noise_init"] = float(spec["noise_init"])
@@ -190,8 +183,8 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
 
     `backbone.preflight_adapters` đã lo peft/bitsandbytes/GPU. Ở đây là ba thứ
     riêng của nhánh: safetensors để ghi nhánh, labels.npz để có Sup Loss, và
-    pan&scan phải TẮT (bật lên thì TokenPool nhận khác 4096 token và dừng — thà
-    nói trước còn hơn dừng ở giữa bước đầu tiên).
+    pan&scan phải TẮT (bật lên thì Recombinator nhận khác 4096 token và dừng —
+    thà nói trước còn hơn dừng ở giữa bước đầu tiên).
     """
     errors: list[str] = []
     warns: list[str] = []
@@ -205,8 +198,14 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
     if imaging.policy(cfg)["do_pan_and_scan"]:
         errors.append(
             "data.do_pan_and_scan đang BẬT. Mỗi mảnh phụ thêm một lượt patch, "
-            "nên TokenPool(4096 -> 32) sẽ nhận sai số token và dừng. §2.3 chạy "
+            "nên Recombinator sẽ nhận sai số token (khác 4096) và dừng. Chạy "
             "một-mảnh: đặt do_pan_and_scan: false.")
+    errors += stale_gate_keys(cfg)
+    errors += stale_recomb_keys(cfg)
+    try:
+        frozen_after_pretrain(dict(cfg.get("train", {}) or {}))
+    except TrainUnusable as e:
+        errors.append(str(e))
     try:
         info = labels_cls.probe(cfg)
         if not info.get("label_array"):
@@ -216,10 +215,44 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
         errors.append(f"nhãn phân loại không dùng được: {e}")
     if not bool(dict(cfg.get("classifier", {}) or {}).get("enabled", True)):
         warns.append("⚠ classifier.enabled = false: candidate B chỉ còn CE, và "
-                     "nhánh chỉ nhận gradient qua cổng vào decoder (khởi tạo 0). "
+                     "nhánh chỉ nhận gradient qua `dec_proj` vào decoder. "
                      "Đó là một thí nghiệm khác — ghi rõ vào báo cáo.")
     errors += _preflight_moe(cfg, arms)
     return errors, warns
+
+
+def stale_gate_keys(cfg: Cfg) -> list[str]:
+    """Khoá của cổng Hard-Concrete đã bỏ. Còn sót là DỪNG, không lặng lẽ bỏ qua.
+
+    Để yên thì người đọc config tưởng `gate_lr_mult`/`l0_lambda` vẫn tác động
+    lên lần chạy — trong khi code không còn đọc chúng.
+    """
+    found = []
+    r = dict(cfg.get("recombiner", {}) or {})
+    t = dict(cfg.get("train", {}) or {})
+    c = dict(cfg.get("classifier", {}) or {})
+    found += [f"recombiner.{k}" for k in ("gate", "gate_init", "gate_init_logit")
+              if k in r]
+    found += ["train.gate_lr_mult"] if "gate_lr_mult" in t else []
+    found += ["classifier.l0_lambda"] if "l0_lambda" in c else []
+    if not found:
+        return []
+    return [f"config còn khoá của cổng vào decoder đã BỎ: {', '.join(found)}. "
+            f"Token nay đi thẳng qua `dec_proj` (Linear/GELU 256 -> "
+            f"recombiner.n_dec_tokens). Xoá các khoá này."]
+
+
+def stale_recomb_keys(cfg: Cfg) -> list[str]:
+    """Khoá của PDVR / QFormer đã bỏ. Còn sót là DỪNG trước khi nạp base."""
+    r = dict(cfg.get("recombiner", {}) or {})
+    found = [k for k in recombiner.STALE_RECOMB_KEYS
+             if k in r and k not in ("gate", "gate_init", "gate_init_logit")]
+    if not found:
+        return []
+    return [f"config còn khoá của kiến trúc nhánh cũ (PDVR/QFormer): "
+            f"recombiner.{', recombiner.'.join(found)}. Recombinator hiện tại "
+            f"khai bằng `local`, `head_dim`, `pool_stages`, `route_head`, "
+            f"`n_dec_tokens`. Xoá các khoá này."]
 
 
 def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
@@ -233,7 +266,7 @@ def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
         graph a second time" — ca nặng là router nhận thiếu gradient và bảng
         §2.4 đo một router học sai mà không có gì báo.
       * mọi candidate của §2.4 phải CÓ nhánh (concat). Không nhánh thì không có
-        `vec_2`, và không có gì để định tuyến.
+        Route Head, và không có gì để định tuyến.
     """
     errs: list[str] = []
     if not bool(dict(cfg.get("moe", {}) or {}).get("enabled", False)):
@@ -242,7 +275,7 @@ def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
     if bad:
         errs.append(
             f"candidate {bad} của §2.4 không bật nhánh Recombinator. §2.4 LUÔN "
-            f"dùng concat: không có nhánh thì không có `vec_2`, và Route_Gate "
+            f"dùng concat: không có nhánh thì không có Route Head, và Top-k Gate "
             f"không có gì để đọc.")
     if bool(dict(cfg["train"]).get("gradient_checkpointing", True)):
         try:
@@ -340,39 +373,68 @@ def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
     return float(lam) * min(1.0, step / w)
 
 
+# ══ Đóng băng sau pretrain ══════════════════════════════════════════════════
+def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
+    """Các khối ĐÃ pretrain bị đóng băng hoàn toàn ở decoder_ft.
+
+    `train.freeze_pretrained: true` -> toàn bộ PRETRAINED_MODULES.
+    Ngược lại -> `train.freeze_after_pretrain` (mặc định [cls_head]).
+
+    Tên lạ là DỪNG: một tên gõ nhầm (`cls_heads`) mà im lặng bỏ qua nghĩa là
+    head vẫn học trong khi báo cáo nói nó đóng băng. Khối KHÔNG được pretrain
+    (`route_head`, `dec_proj`) cũng DỪNG: đóng băng một khối ngẫu nhiên là vứt
+    nó đi.
+    """
+    if bool(tcfg.get("freeze_pretrained", False)):
+        return tuple(pretrain_io.PRETRAINED_MODULES)
+    raw = tcfg.get("freeze_after_pretrain", ["cls_head"])
+    if raw is None:
+        raw = []
+    if isinstance(raw, str):
+        raw = [raw]
+    names = tuple(dict.fromkeys(str(x) for x in raw))
+    bad = [n for n in names if n not in pretrain_io.PRETRAINED_MODULES]
+    if bad:
+        raise TrainUnusable(
+            f"train.freeze_after_pretrain chứa {bad} — chỉ được là tập con của "
+            f"PRETRAINED_MODULES {list(pretrain_io.PRETRAINED_MODULES)}. Khối "
+            f"không qua Stage 0 thì đóng băng là giữ nguyên số ngẫu nhiên.")
+    return names
+
+
+def apply_freeze(branch, names) -> int:
+    """requires_grad=False + eval() cho các khối trong `names`. Trả số tham số.
+
+    eval() là một nửa của "đóng băng hoàn toàn": không có nó thì dropout của
+    head vẫn chạy, và cùng một ảnh cho ra hai logit khác nhau giữa hai bước —
+    head đứng yên về trọng số nhưng không đứng yên về hàm. Vòng lặp gọi lại hàm
+    này sau `branch.train()`.
+    """
+    n = 0
+    for name in names:
+        mod = getattr(branch, name, None)
+        if mod is None:
+            continue
+        for p in mod.parameters():
+            p.requires_grad_(False)
+            n += p.numel()
+        mod.eval()
+    return n
+
+
 # ══ Optimizer: ba (hoặc bốn) nhóm tham số ═══════════════════════════════════
 def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
                     from_pretrain: bool = False):
-    """AdamW với ba nhóm: adapter (LoRA hoặc Experts), thân nhánh, và `gate`.
-    Ở chế độ `decoder_ft` thì thân nhánh TÁCH LÀM ĐÔI — bốn nhóm.
+    """AdamW với hai nhóm: adapter (LoRA hoặc Experts) và thân nhánh.
+    Ở chế độ `decoder_ft` thì thân nhánh TÁCH LÀM ĐÔI — ba nhóm.
 
-    `gate` được tách ra vì AdamW CHUẨN HOÁ bước cập nhật: mỗi bước nó dịch một
-    tham số đi khoảng `lr`, bất kể gradient lớn hay nhỏ. Cổng nay là sigmoid
-    theo chiều token, nên quãng đường đo bằng đơn vị LOGIT:
+    Không còn nhóm `gate`: cổng Hard-Concrete đã bỏ, `dec_proj` (Linear/GELU
+    trên trục token vào decoder) là tham số thường và nằm ở nhóm `branch`.
 
-        steps × max_lr × gate_lr_mult × ~0.6        (0.6 = trung bình one-cycle)
-
-    Với 200 bước, max_lr 3e-4 và `gate_lr_mult = 20`, quãng đường là ~0.7 logit
-    — cổng đi từ `sigmoid(-4) = 0.018` tới `sigmoid(-3.3) = 0.035`, tức là VẪN
-    ĐÓNG. Candidate B khi đó trông y hệt candidate A vì lý do CƠ HỌC chứ không
-    vì dữ liệu, và bảng BLEU/ROUGE không phân biệt được hai nguyên nhân ấy.
-    `gate_lr_mult = 120` cho ~4.3 logit -> `sigmoid(+0.3) = 0.57`, mở quá nửa
-    NẾU dữ liệu muốn.
-
-    Bất biến bắt buộc: quãng đường ≥ `|gate_init_logit|`. `scripts/
-    selftest_section4.py` kiểm đúng bất đẳng thức ấy từ chính config, nên đổi
-    `gate_init_logit`, `schedule.max_lr`, `n_train`, `per_device_batch_size`
-    hay `grad_accum` mà quên chỉnh `gate_lr_mult` thì selftest DỪNG trước khi
-    tốn GPU.
-
-    `gate_lr_mult` nhân lr của riêng nhóm ấy lên. Điểm chính là cổng được PHÉP
-    mở, không phải bị ÉP mở: `gate_final` trong train_stats.json là con số nói
-    dữ liệu có muốn mở nó hay không, và nó phải vào báo cáo.
-
-    ── Nhóm thứ tư: `branch_pretrained` (chỉ ở decoder_ft) ──────────────────
+    ── Nhóm `branch_pretrained` (chỉ ở decoder_ft) ───────────────────────────
     Cùng một lập luận về AdamW, ngược chiều. Sau `sup_pretrain`, Recombinator +
-    QFormer + ClsHead đã nằm ở một cực tiểu của ASL. Ở bước 0 của decoder_ft,
-    CE là nguồn gradient MỚI và lớn (decoder chưa từng thấy 32 token này), và
+    ClsHead đã nằm ở một cực tiểu của ASL. Ở bước 0 của decoder_ft,
+    CE là nguồn gradient MỚI và lớn (decoder chưa từng thấy token nhánh), và
     AdamW dịch mọi tham số đi ~lr bất kể chúng đã hội tụ hay chưa. Với lr đỉnh
     3e-4 dùng chung, vài chục bước đầu đủ để đẩy nhánh ra khỏi chỗ đã hội tụ —
     và cái mất đi là toàn bộ thứ pretrain vừa mua. Triệu chứng: `cls_f1_pos`
@@ -384,22 +446,20 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     hằng số mà `save_pretrain` dùng, nên "hạ lr đúng phần đã pretrain" kiểm được
     bằng cách đọc chứ không phải bằng cách tin.
 
-    Phần còn lại của nhánh (`route_gate`) vẫn còn TƯƠI ở decoder_ft — nó chưa
-    học gì — nên nó ở nhóm `branch` với lr đầy đủ. Gộp nó vào nhóm đã pretrain
+    Phần còn lại của nhánh (`route_head`, `dec_proj`) vẫn còn TƯƠI ở
+    decoder_ft — chúng chưa học gì — nên chúng ở nhóm `branch` với lr đầy đủ. Gộp nó vào nhóm đã pretrain
     là ép một khối ngẫu nhiên học ở 1/10 tốc độ, và ở §2.4 thì đó chính là
     router.
     """
     import torch
 
     lora = [p for p in peft_model.parameters() if p.requires_grad]
-    body, body_pre, gate = [], [], []
+    body, body_pre = [], []
     if branch is not None:
         for n, p in branch.named_parameters():
             if not p.requires_grad:
                 continue
-            if n == "gate":
-                gate.append(p)
-            elif from_pretrain and n.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
+            if from_pretrain and n.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
                 body_pre.append(p)
             else:
                 body.append(p)
@@ -423,10 +483,6 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     if body:
         groups.append({"params": body, "lr": lr, "weight_decay": bwd,
                        "name": "branch"})
-    if gate:
-        groups.append({"params": gate,
-                       "lr": lr * float(tcfg.get("gate_lr_mult", 20.0)),
-                       "weight_decay": 0.0, "name": "gate"})
     groups = [g for g in groups if g["params"]]
     if not groups:
         raise TrainUnusable(
@@ -444,10 +500,10 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
     MỌI candidate của cả hai mục đi qua đây. Khác biệt là hai cờ và chỉ hai cờ:
     `branch is None` (candidate A của §2.3) và `router is None` (§2.3 nói chung).
 
-    Vì sao chèn 32 token vào vị trí token ảnh đầu tiên chứ không nối vào đầu
-    chuỗi: nối vào đầu là đặt chúng TRƯỚC cả BOS lẫn câu lệnh hệ thống. Vẫn
-    chạy, nhưng nó không phải cái "concat" trong sơ đồ, và nó đẩy mọi vị trí
-    trong chuỗi đi 32 — kể cả phần đã được che nhãn.
+    Vì sao chèn `n_dec_tokens` (64) token vào vị trí token ảnh đầu tiên chứ không
+    nối vào đầu chuỗi: đó là thứ tự First (Recombinator) / Second (VL-Adapter)
+    của "concat" trong sơ đồ. Nối vào đầu là đặt chúng TRƯỚC cả BOS lẫn câu lệnh
+    hệ thống, và đẩy mọi vị trí trong chuỗi đi 64 — kể cả phần đã được che nhãn.
 
     ── Thứ tự bắt buộc ở §2.4 ───────────────────────────────────────────────
     Trọng số định tuyến phải nằm trong `route_ctx` TRƯỚC khi `model(...)` chạy,
@@ -520,8 +576,9 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     """Huấn luyện MỘT candidate. Hết VRAM là DỪNG, không tụt nấc.
 
     Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
-    Nó không nói "giảm batch đi" chung chung, vì với candidate B thì batch
-    thường không phải chỗ tốn nhất: attention trên 32 query × 4096 patch mới là.
+    Nó không nói "giảm batch đi" chung chung, vì với nhánh Recombinator thì
+    batch thường không phải chỗ tốn nhất: Local Extractor đầu tiên chạy trên đủ
+    4096 patch × hidden, và attention là 256 query × 4096 patch.
     """
     import torch
 
@@ -536,7 +593,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     if spec is not None and not use_branch:
         raise TrainUnusable(
             f"{aid}: §2.4 bật MoE nhưng candidate này không có nhánh. §2.4 LUÔN "
-            f"dùng concat — không nhánh thì không có `vec_2` để định tuyến.")
+            f"dùng concat — không nhánh thì không có Route Head để định tuyến.")
 
     bs = int(tcfg.get("per_device_batch_size", 1))
     accum = int(tcfg.get("grad_accum", 16))
@@ -562,18 +619,18 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"candidate, nên tự đổi ở đây là làm hỏng đúng thứ thí nghiệm đang "
             f"đo. Sửa config rồi chạy lại cả hai.\n"
             f"    Bốn khoá làm được gì đó, theo thứ tự sức nặng:\n"
-            f"      1. recombiner.n_query ({rcfg.get('n_query', 32)}) — số "
-            f"query của attention nhìn 4096 patch, đồng thời là số token thêm "
-            f"vào decoder.\n"
+            f"      1. recombiner.local.hidden "
+            f"({(rcfg.get('local') or {}).get('hidden', 2048)}) — activation "
+            f"4096 patch × hidden của Local Extractor đầu. ĐỔI NÓ LÀ ĐỔI HÌNH "
+            f"DẠNG CHECKPOINT Stage 0 — phải pretrain lại.\n"
             f"      2. train.max_seq_len ({tcfg.get('max_seq_len')}) + "
-            f"recombiner.n_query ({rcfg.get('n_query', 32)}) -> độ dài chuỗi "
-            f"thật mà decoder phải chạy.\n"
+            f"recombiner.n_dec_tokens ({rcfg.get('n_dec_tokens', 32)}) -> độ "
+            f"dài chuỗi thật mà decoder phải chạy.\n"
             f"      3. train.per_device_batch_size ({bs}) — nhớ NHÂN grad_accum "
             f"lên đúng bấy nhiêu lần để batch hiệu dụng {bs * accum} không đổi, "
             f"nếu không thì số bước và lịch one-cycle đổi theo.\n"
-            f"      4. recombiner.qformer.n_layers "
-            f"({(rcfg.get('qformer') or {}).get('n_layers', 1)}) — rẻ nhất "
-            f"trong bốn, chỉ 2 query nên nó hiếm khi là thủ phạm."
+            f"      4. recombiner.dtype: float32 -> null (bf16) nếu đang ép "
+            f"fp32 — gấp đôi activation của nhánh."
             + ("" if spec is None else
                f"\n      5. §2.4: `n_experts` ({spec['n_experts']}) nhân thẳng "
                f"vào activation LoRA (B×T×E×r) và vào số tham số học được. "
@@ -634,6 +691,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     # trong bảng đứng trên hai checkpoint khác nhau.
     pre_src = cfg.get("pretrain_init") or None
     pre_report = None
+    frozen: tuple[str, ...] = ()
     if pre_src and not use_branch:
         print(f"  ⚙ candidate không có nhánh -> pretrain KHÔNG áp dụng "
               f"(đúng như thiết kế: đây là cột đối chứng).", flush=True)
@@ -705,7 +763,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         if d_model != text_h:
             raise TrainUnusable(
                 f"recombiner.out_dim = {d_model} nhưng decoder nhận embedding "
-                f"{text_h} chiều. 32 token nối vào chuỗi phải cùng chiều với "
+                f"{text_h} chiều. Token nhánh nối vào chuỗi phải cùng chiều với "
                 f"embedding, không có chỗ nào chiếu lại.")
         branch = recombiner.RecombinerBranch(vis_h, text_h, n_labels, rcfg, ccfg)
         branch = branch.to(device=dev, dtype=bdtype)
@@ -716,39 +774,35 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         # của cả nhánh ở đúng lúc VRAM đang căng nhất.
         if pre_src:
             pre_report = pretrain_io.load_into_branch(branch, pre_src)
-            if bool(tcfg.get("freeze_pretrained", False)):
-                for nm, pp in branch.named_parameters():
-                    if nm.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
-                        pp.requires_grad_(False)
-                print(f"  ⚙ train.freeze_pretrained: ĐÓNG BĂNG "
-                      f"{', '.join(pretrain_io.PRETRAINED_MODULES)} — chỉ "
-                      f"decoder (LoRA/Experts), `gate` và `route_gate` học. "
-                      f"ASL khi đó là một phép ĐO, không phải một lực.",
+            frozen = frozen_after_pretrain(tcfg)
+            n_frozen = apply_freeze(branch, frozen)
+            if frozen:
+                learn = [m for m in pretrain_io.PRETRAINED_MODULES
+                         if m not in frozen]
+                print(f"  ⚙ decoder_ft: ĐÓNG BĂNG HOÀN TOÀN "
+                      f"{', '.join(frozen)} ({n_frozen:,} tham số, eval mode, "
+                      f"ngoài optimizer). Đã pretrain và còn học: "
+                      f"{', '.join(learn) or '—'} (lr × "
+                      f"{float(tcfg.get('pretrained_lr_mult', 0.1)):g}).",
                       flush=True)
         bstats = branch.n_params()
-        print(f"  nhánh PDVR: Preparer AvgPool(4->1) -> RMSNorm -> SwiGLU(mult=2) "
-              f"+ skip; Highway + Extractor(MHA head=64) -> RMSNorm({text_h}) "
-              f"-> {bstats['n_query']} token -> QFormer({len(bstats['qformer_tasks'])} vector: "
-              f"{'/'.join(bstats['qformer_tasks'])}, đóng băng "
-              f"{bstats['qformer_frozen'] or '—'}, RMSNorm riêng từng vector)", flush=True)
+        print(f"  nhánh: {branch.describe()}", flush=True)
         print(f"  tham số nhánh: {bstats['total']:,} "
-              f"({bstats['trainable']:,} học được) — PDVR "
-              f"{bstats['pdvr']:,} · qformer {bstats['qformer']:,} · "
-              f"cls_head {bstats['cls_head']:,} · route_gate "
-              f"{bstats['route_gate']:,} "
-              f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT ở §2.3'})",
-              flush=True)
-        _g0 = branch.gate_stats()
-        print(f"  cổng vào decoder: sigmoid THEO CHIỀU TOKEN, "
-              f"{_g0['n_query']} cổng · khởi tạo "
-              f"{_g0['gate_init']:.4f} (logit {_g0['gate_init_logit']:+.1f})\n"
-              f"    -> ở bước 0, đầu vào decoder của B = của A CỘNG "
-              f"{_g0['n_query']} token đã nén còn ~"
-              f"{100*_g0['gate_init']:.1f}% biên độ (KHÔNG phải 0)", flush=True)
+              f"({bstats['trainable']:,} học được) — recombinator "
+              f"{bstats['recombinator']:,} (local {bstats['recombinator_local']:,}"
+              f" · global {bstats['recombinator_global']:,} · ffn "
+              f"{bstats['recombinator_ffn']:,}) · cls_head "
+              f"{bstats['cls_head']:,} · route_head {bstats['route_head']:,} "
+              f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT'}) · dec_proj "
+              f"{bstats['dec_proj']:,}", flush=True)
+        print(f"  vào decoder: Linear/GELU {bstats['n_tokens']} -> "
+              f"{bstats['n_dec_tokens']} token (trục token, khởi tạo trung bình "
+              f"2×2) -> nối THẲNG vào chuỗi (First), trước 256 token ảnh "
+              f"(Second), không cổng", flush=True)
         if spec is not None:
-            print(f"  Route_Gate HOẠT ĐỘNG: vec_2 -> {spec['n_experts']} logit "
-                  f"(+ nhiễu) -> Aux Loss và -> Experts. QFormer đóng băng "
-                  f"{bstats['qformer_frozen'] or '—'}", flush=True)
+            print(f"  Route Head HOẠT ĐỘNG: Recombinator -> PoolingStack -> "
+                  f"{spec['n_experts']} logit (+ nhiễu) -> Aux Loss và -> Top-"
+                  f"{spec['top_k']} Gate -> Experts", flush=True)
 
     # ── dữ liệu ────────────────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
@@ -765,14 +819,6 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         from_pretrain=bool(pre_src))
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
-    # Phạt L0 trên cổng Hard-Concrete. Dùng dạng ĐÓNG (`branch.gate_l0()`), không
-    # đếm trên mẫu: đếm cho một ước lượng nhiễu VÀ không có gradient đi qua phép
-    # đếm, nên "model học cách giữ m cách nhìn" sẽ thành một câu trong README.
-    #
-    # Chuẩn hoá theo n_query để `l0_lambda` không đổi nghĩa khi n_query đổi — một
-    # hằng số mà nghĩa của nó phụ thuộc một khoá khác là chỗ tệ nhất để đặt một
-    # giá trị "đã chọn, không tune".
-    l0_lambda = float(ccfg.get("l0_lambda", 0.0)) if use_branch else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
     rstats = moe_mod.RouteStats(spec["n_experts"]) if spec else None
     # λ và warmup thuộc về SUP LOSS, nên chúng nằm dưới `classifier`, cạnh ASL —
@@ -796,61 +842,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
 
-    # ── Cổng có đi nổi không — kiểm ở RUNTIME, không chỉ ở config ───────────
-    # `selftest_section4` kiểm bất đẳng thức này từ config, nhưng nó chỉ làm
-    # được khi `data.n_train` là một con số. §3 chạy `n_train: 0` (toàn bộ
-    # split), nên ở đó số bước chỉ biết được TẠI ĐÂY — sau khi train_df đã có.
-    #
-    # AdamW chuẩn hoá bước cập nhật, nên quãng đường tối đa của cổng trong cả
-    # lịch là một phép nhân, đo bằng đơn vị LOGIT. Ngắn hơn |gate_init_logit|
-    # thì cổng đứng yên vì CƠ HỌC chứ không vì dữ liệu — candidate có nhánh sẽ
-    # trông y hệt candidate không nhánh, và BLEU/ROUGE không phân biệt được hai
-    # nguyên nhân ấy. Đây là ca hỏng tốn nhất của repo: vài tiếng GPU để kết
-    # luận về một phép nhân.
-    if use_branch:
-        import math as _math
-
-        _la = float(rcfg.get("gate_init_logit", -2.5))
-        _gc = dict(rcfg.get("gate") or {})
-        _beta = float(_gc.get("beta", 2.0 / 3.0))
-        _lo = float(_gc.get("stretch_lo", -0.1))
-        _hi = float(_gc.get("stretch_hi", 1.1))
-        _g_mult = float(tcfg.get("gate_lr_mult", 20.0))
-        _max_lr = float(tcfg["schedule"].get("max_lr", 2e-4))
-        # P_sống: phần mẫu KHÔNG rơi vào vùng bị kẹp. `clamp` có gradient BẰNG
-        # 0 ở đó, nên chỉ phần này đẩy được cổng. Bỏ thừa số này đi là cách
-        # đúng để tin rằng cổng đi được gấp ba quãng đường thật của nó.
-        _p_live = 1.0 / (1.0 + _math.exp(-(_la - _beta * _math.log(-_lo / _hi))))
-        _travel = steps * _max_lr * _g_mult * 0.6 * _p_live
-        _need = abs(_la)
-        _det = lambda la: min(1.0, max(
-            0.0, (1.0 / (1.0 + _math.exp(-la))) * (_hi - _lo) + _lo))
-        if _travel < _need:
-            _want = _need / max(steps * _max_lr * 0.6 * _p_live, 1e-12)
-            print(f"  ⚠ CỔNG KHÔNG ĐI NỔI: {steps} bước × max_lr {_max_lr} × "
-                  f"gate_lr_mult {_g_mult} × 0.6 × P_sống {_p_live:.3f}\n"
-                  f"    = {_travel:.2f} log_alpha, trong khi cần >= "
-                  f"|gate_init_logit| = {_need:.2f}.\n"
-                  f"    Cổng sẽ đứng yên vì AdamW + phép kẹp của Hard-Concrete "
-                  f"chứ không vì dữ liệu, và candidate\n"
-                  f"    này sẽ trông y hệt candidate không nhánh. Nâng "
-                  f"train.gate_lr_mult lên >= {_want:.0f}, hoặc nâng "
-                  f"recombiner.gate_init_logit\n    (ít âm hơn -> nhiều mẫu "
-                  f"sống hơn, nhưng cổng lúc sinh thôi bằng 0 ở bước 0 nếu "
-                  f"> -2.303).", flush=True)
-        else:
-            print(f"  cổng Hard-Concrete: {steps} bước cho {_travel:.2f} "
-                  f"log_alpha (P_sống {_p_live:.3f})\n"
-                  f"    -> đi được từ z = {_det(_la):.3f} tới z = "
-                  f"{_det(_la + _travel):.3f} NẾU dữ liệu muốn", flush=True)
     if pre_src:
         base_lr = float(tcfg["schedule"].get("max_lr", 2e-4))
         pm = float(tcfg.get("pretrained_lr_mult", 0.1))
         print(f"  decoder_ft: lr đỉnh {base_lr:.2e} cho "
-              f"{'experts' if spec else 'lora'}/branch/route, "
-              f"{base_lr * pm:.2e} (×{pm}) cho nhánh ĐÃ pretrain "
-              f"({', '.join(pretrain_io.PRETRAINED_MODULES)}), "
-              f"{base_lr * float(tcfg.get('gate_lr_mult', 20.0)):.2e} cho gate"
+              f"{'experts' if spec else 'lora'}/dec_proj/route, "
+              f"{base_lr * pm:.2e} (×{pm}) cho phần ĐÃ pretrain còn học "
+              f"({', '.join(m for m in pretrain_io.PRETRAINED_MODULES if m not in frozen) or '—'})"
+              f" · đóng băng {', '.join(frozen) or '—'}"
               f" · λ = {lam} warmup {lam_warm:.0%}"
               + ("" if lam_warm else " (TẮT — ClsHead không còn ngẫu nhiên)"),
               flush=True)
@@ -877,8 +876,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     model.train()
     if branch is not None:
         branch.train()
+        if frozen:
+            apply_freeze(branch, frozen)        # train() vừa bật lại dropout
     log_every = max(1, int(tcfg.get("logging_steps", 10)))
-    total_loss = step_ce = step_asl = step_aux = step_l0 = 0.0
+    total_loss = step_ce = step_asl = step_aux = 0.0
     first_loss = None
     last_cls: dict = {}
     for step in range(steps):
@@ -892,10 +893,6 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             ce, asl, route_out, cls_m = _forward_loss(
                 model, gemma, branch, batch, img_tok, tt_value, router, route_ctx)
             loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
-            if l0_lambda > 0.0 and branch is not None:
-                l0 = branch.gate_l0() / max(branch.n_query, 1)
-                loss = loss + l0_lambda * l0.to(ce.dtype)
-                step_l0 += float(l0.detach()) / accum
             if route_out is not None:
                 loss = loss + aux_now * route_out["aux"].to(ce.dtype)
                 step_aux += float(route_out["aux"].detach()) / accum
@@ -911,52 +908,45 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 step_asl += float(asl.detach()) / accum
             if cls_m:
                 last_cls = cls_m
-        grad_norms = recombiner.pdvr_grad_norms(branch)
+        grad_norms = recombiner.recombinator_grad_norms(branch)
         if clip > 0:
             params = [p for grp in opt.param_groups for p in grp["params"]]
             torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
         sched.step()
 
-        total_loss = (step_ce + lam_now * step_asl + aux_now * step_aux
-                      + l0_lambda * step_l0)
+        total_loss = step_ce + lam_now * step_asl + aux_now * step_aux
         if first_loss is None:
             # Loss ở bước ĐẦU TIÊN, để báo cáo có mốc so với loss cuối. Không có
             # nó thì "loss 2.41" không nói được gì: 2.41 là đã học được nhiều hay
             # là gần như chưa nhúc nhích?
             first_loss = total_loss
-        # Trung bình của CỔNG (sigmoid), không của logit: con số in ra trong
-        # log phải cùng thang với `gate_final` trong train_stats.json.
-        gate = (float(branch.gate_value().detach().mean())
-                if branch is not None else 0.0)
         if (step + 1) % log_every == 0 or step == steps - 1:
+            # ‖W − W₀‖/‖W₀‖ của dec_proj — cùng đại lượng với
+            # `dec_proj_final.dec_proj_rel_change` trong train_stats.json.
+            dproj = (branch.dec_stats()["dec_proj_rel_change"]
+                     if branch is not None else 0.0)
             lr_now = opt.param_groups[0]["lr"]
             rsum = rstats.summary() if rstats is not None else {}
             print(f"    [{aid}] bước {step+1}/{steps} · loss {total_loss:.4f} "
                   f"(ce {step_ce:.4f}" +
-                  (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · gate {gate:+.4f}"
-                   + (f" · L0 {step_l0*branch.n_query:.1f}/{branch.n_query}"
-                      if l0_lambda > 0.0 and branch is not None else "")
+                  (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · Δproj {dproj:.3f}"
                    if use_branch else "") +
                   (f" · aux {step_aux:.3f} · α {aux_now:.4f} · tải "
                    f"[{rsum.get('load_min', 0):.2f}..{rsum.get('load_max', 0):.2f}]"
                    f" · chết {rsum.get('n_dead_experts', 0)}"
                    if spec else "") +
-                  (f" · grad P/H/E "
-                   f"{grad_norms.get('preparer_mean_per_param', 0.0):.2e}/"
-                   f"{grad_norms.get('highway_mean_per_param', 0.0):.2e}/"
-                   f"{grad_norms.get('extractor_mean_per_param', 0.0):.2e}"
+                  (f" · {recombiner.format_grad_norms(grad_norms)}"
                    if branch is not None else "") +
                   f") · lr {lr_now:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({
                     f"train/{aid}/loss": total_loss, f"train/{aid}/ce": step_ce,
                     f"train/{aid}/asl": step_asl, f"train/{aid}/lambda": lam_now,
-                    **({f"train/{aid}/l0_open": step_l0 * branch.n_query}
-                       if l0_lambda > 0.0 and branch is not None else {}),
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
-                    **({f"train/{aid}/gate": gate} if branch is not None else {}),
+                    **({f"train/{aid}/dec_proj_rel_change": dproj}
+                       if branch is not None else {}),
                     **{f"train/{aid}/grad_norm_{k}": v
                        for k, v in grad_norms.items()},
                     **({f"train/{aid}/aux": step_aux,
@@ -1017,7 +1007,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "processor_size": imaging.PROCESSOR_SIZE,
         "max_seq_len": max_len,
         "schedule": dict(tcfg["schedule"]),
-        "n_query": int(bstats.get("n_query", 0)),
+        "n_rec_tokens": int(bstats.get("n_tokens", 0)),
+        "n_dec_tokens": int(bstats.get("n_dec_tokens", 0)),
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,
         # Chế độ huấn luyện của candidate NÀY, ghi cạnh số của nó. `report_*`
@@ -1031,14 +1022,9 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                                if pre_src else None),
         "freeze_pretrained": (bool(tcfg.get("freeze_pretrained", False))
                               if pre_src else None),
+        "frozen_after_pretrain": list(frozen),
         "token_type": str(rcfg.get("token_type", "text")),
-        # DICT, không phải một số. Với cổng theo chiều token, "trung bình 0.04"
-        # và "3/32 token mở hẳn" là hai kết quả khác hẳn nhau — ghi một con số
-        # ở đây là bỏ mất đúng thứ hình dạng `(n_query,)` vừa mua, và
-        # `report_recomb._gate` đã chờ sẵn một dict.
-        "gate_final": (branch.gate_stats() if branch is not None else None),
-        "gate_lr_mult": float(tcfg.get("gate_lr_mult", 20.0)),
-        "l0_lambda": l0_lambda,
+        "dec_proj_final": (branch.dec_stats() if branch is not None else None),
         "n_labels": n_labels if use_branch else 0,
         "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,
         "train_loss_first": first_loss,

@@ -231,7 +231,7 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
            f"quen 224px trong paper gốc (lưới 7×7); ở đây chúng nhận {size}px, "
            f"nên lưới đặc trưng ResNet là {grid}×{grid} = {grid * grid} vùng."]
     p = dict(cfg.get("pretrain", {}) or {})
-    mult = float((cfg.get("train") or {}).get("pretrained_lr_mult", 0.2))
+    mult = float((cfg.get("train") or {}).get("pretrained_lr_mult", 0.1))
     for a in arms:
         if a["kind"] != "sota":
             continue
@@ -250,7 +250,10 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
                 f"được thêm vào từ ngoài, rồi main-stage chạy đúng setup gốc.")
     out.append(
         f"ĐIỀU KIỆN 5 — mọi khối đã qua Stage 0 chạy main-stage ở "
-        f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`).")
+        f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`); My Gemma "
+        f"đóng băng hoàn toàn "
+        f"{', '.join((cfg.get('train') or {}).get('freeze_after_pretrain') or []) or '—'} "
+        f"(`train.freeze_after_pretrain`).")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
         f"KỸ THUẬT — batch của paper được chia thành nhiều lượt forward "

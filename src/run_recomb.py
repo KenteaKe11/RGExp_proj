@@ -230,7 +230,7 @@ def moe_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
 
     §2.4 LUÔN dùng concat, nên `recomb` ở đây không phải một khoá mà một hằng
     số: nó không nằm trong `arms_moe` để không ai tắt được nó bằng một lần gõ.
-    Không nhánh thì không có `vec_2`, và Route_Gate không có gì để đọc — đó
+    Không nhánh thì không có Route Head, và Top-k Gate không có gì để đọc — đó
     không phải một biến thể của §2.4, nó là một thí nghiệm khác.
 
     `top_k` và `n_experts` thì BẮT BUỘC phải khai: chúng là hai con số §2.4

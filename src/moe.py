@@ -1,22 +1,20 @@
-"""§2.4 — Experts (LoRA) + Route_Gate: phần MoE mà §2.3 dựng sẵn rồi bỏ trống.
+"""Experts (LoRA) + Top-k Gate: phần MoE của candidate C.
 
-§2.3 dừng ở đây:
-
-    Image ─► Vision ─┬─► Recombinator ─┬─► QFormer ─┬─► Classification (vec_1) ─► Sup Loss
-                     │                 │            └─► Route_Gate     (vec_2) ─► Aux Loss
-                     └─► VL-Adapter ───┤                        │                 ▲
-                        (256 token)    │                        ▼                 │
+    Image ─► Vision ─┬─► Recombinator ─┬─► Classification Head ─► Sup Loss
+                     │                 ├─► Route Head ─► Aux Loss
+                     │                 │       └─► Top-k Gate ─┐
+                     └─► VL-Adapter ───┤                       ▼
+                        (256 token)    │
     Prompt ─► Embedding ───────────────┴─► concat ─► Decoder [Experts (LoRA)] ─► CE Loss
 
-Hai mũi tên in đậm — `Route_Gate ─► Aux Loss` và `Route_Gate ─► Experts` — là
-TOÀN BỘ nội dung của file này. Ở §2.3 chúng bị cắt (query `aux` đóng băng, đầu
-ra detach, không Aux Loss, không định tuyến); ở §2.4 chúng được nối lại và
-KHÔNG có gì khác đổi.
+Hai mũi tên `Route Head ─► Aux Loss` và `Route Head ─► Top-k Gate ─► Experts` là
+TOÀN BỘ nội dung của file này. Route Head (có tham số) nằm ở
+`recombiner.RouteHead`; Top-k Gate (KHÔNG có tham số) là `Router` dưới đây.
 
-── Route_Gate làm gì, theo đúng đặc tả §2.4.b ──────────────────────────────
+── Top-k Gate làm gì, theo đúng đặc tả §2.4.b ──────────────────────────────
 
-    vec_2 ─┬─► proj        ─► logits      (B, E)
-           └─► noise_proj  ─► log_sigma   (B, E)      << Learnable Gaussian Noise >>
+    Route Head ─┬─► fc2         ─► logits      (B, E)
+                └─► noise_proj  ─► log_sigma   (B, E)      << Learnable Gaussian Noise >>
                   │
                   ▼
     logits + ε·softplus(log_sigma)     ε ~ N(0,1), CHỈ khi train
@@ -71,10 +69,11 @@ hơn" trong đặc tả — nó không ép chia đều, nó chỉ làm cho việ
 trở nên đắt.
 
 ── Experts: E bộ LoRA trên 4 ma trận Attn, định tuyến THEO ẢNH ─────────────
-`vec_2` là ĐÚNG MỘT vector cho mỗi ảnh, nên định tuyến cũng là một quyết định
-cho mỗi ảnh: một ảnh chọn k expert, và k expert ấy áp cho toàn bộ chuỗi của ảnh
-đó. Định tuyến theo TOKEN cần một gate đọc hidden state của decoder, tức là
-`vec_2` thôi làm nguồn định tuyến — một kiến trúc khác kiến trúc trong sơ đồ.
+Route Head gộp 256 token của Recombinator về ĐÚNG MỘT vector cho mỗi ảnh
+(Pooling Stack), nên định tuyến cũng là một quyết định cho mỗi ảnh: một ảnh chọn
+k expert, và k expert ấy áp cho toàn bộ chuỗi của ảnh đó. Định tuyến theo TOKEN
+cần một gate đọc hidden state của decoder — một kiến trúc khác kiến trúc trong
+sơ đồ.
 
     y = W₀·x  +  ( Σ_{e} w_e · B_e·A_e·x ) · (alpha / r)
         └ đóng băng ┘   └── w_e = 0 với expert ngoài top-k ──┘
@@ -86,8 +85,8 @@ gom/tán nào để sai, delta là hàm ĐÚNG và KHẢ VI của trọng số �
 đường gradient tới router đọc được bằng mắt.
 
 `lora_B` khởi tạo 0 -> ở bước 0, delta = 0 với MỌI expert và MỌI cách định
-tuyến. Cùng tính chất với `gate` của §2.3: candidate MoE ở bước 0 là base trần
-cộng 32 token 0, không phải base trần cộng E nhiễu ngẫu nhiên.
+tuyến. Nhờ vậy candidate MoE ở bước 0 là base (+ 64 token của nhánh), không phải
+base cộng E nhiễu ngẫu nhiên.
 
 ── Vì sao KHÔNG dùng peft ở §2.4 ───────────────────────────────────────────
 peft gắn MỘT adapter; "E adapter, mỗi ảnh trộn k cái theo trọng số khả vi"
@@ -135,7 +134,7 @@ class RoutingContext:
     """Chỗ đặt trọng số định tuyến của LƯỢT FORWARD hiện tại.
 
     Vì sao phải là trạng thái dùng chung chứ không phải một tham số truyền tay:
-    trọng số được tính MỘT LẦN từ `vec_2` (trước decoder), nhưng nó phải tới
+    trọng số được tính MỘT LẦN từ Route Head (trước decoder), nhưng nó phải tới
     được TỪNG `MoELoraLinear` nằm sâu trong các lớp decoder của transformers.
     Không có đường nào truyền một tensor phụ xuống đó mà không vá
     `Gemma3DecoderLayer.forward`.
@@ -199,16 +198,16 @@ def soft_logit_clip(x: torch.Tensor, c: float) -> torch.Tensor:
 
 
 class Router(nn.Module):
-    """vec_2 -> (weights thưa (B,E), probs (B,E), aux loss, vài số để đọc log).
+    """Route Head -> (weights thưa (B,E), probs (B,E), aux loss, vài số để đọc log).
 
     Bốn bước theo đúng thứ tự trong đặc tả: nhiễu Gauss học được -> soft
     logit-clipping (C=1.2) -> softmax -> top-k gating. Xem docstring module cho
     lý do của từng chỗ đặt.
 
     Lớp này KHÔNG chứa ma trận chiếu: `logits` và `log_sigma` do
-    `recombiner.RouteGate` sinh ra, vì RouteGate là khối đã có tên trong sơ đồ
-    và hình dạng checkpoint của nó phải giữ nguyên giữa hai mục. Router ở đây là
-    phần KHÔNG có tham số — chỉ là chính sách.
+    `recombiner.RouteHead` sinh ra, vì Route Head là khối đã có tên trong sơ đồ
+    và nằm trong file nhánh. Router ở đây là Top-k Gate — phần KHÔNG có tham
+    số, chỉ là chính sách.
     """
 
     def __init__(self, n_experts: int, top_k: int, clip_c: float = 1.2,

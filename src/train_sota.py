@@ -17,8 +17,8 @@ STAGE 0 (điều kiện 5) — `cfg.pretrain`, GIỐNG HỆT nhau ở mọi cand
 
 MAIN-STAGE (điều kiện 1) — `cfg.sota.<name>.fine_tuning`, chép nguyên văn paper:
     optimizer, learning rate từng nhóm, scheduler, số epoch, batch, dừng sớm.
-    Khoá duy nhất §2.5 áp lên nó là `train.pretrained_lr_mult` (= 0.2): những
-    khối ĐÃ đi qua Stage 0 chạy ở 1/5 lr chính thức.
+    Khoá duy nhất §2.5 áp lên nó là `train.pretrained_lr_mult` (= 0.1): những
+    khối ĐÃ đi qua Stage 0 chạy ở 1/10 lr chính thức.
 
 ── VÌ SAO CÓ `sota_train.micro_batch` ───────────────────────────────────────
 Paper của AdaAtt khai `batch_size: 80`, và ở 512px với ResNet-152 thì 80 ảnh
@@ -341,7 +341,7 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
 
         # ── MAIN-STAGE — điều kiện 1, setup gốc ────────────────────────────
         info = model.set_stage(2)
-        mult = float((cfg.get("train", {}) or {}).get("pretrained_lr_mult", 0.2))
+        mult = float((cfg.get("train", {}) or {}).get("pretrained_lr_mult", 0.1))
         micro1 = min(micro, spec["batch_size"])
         accum1 = max(1, math.ceil(spec["batch_size"] / micro1))
         loader1 = _loader(ds_tr, micro1, True, cfg, seed=int(cfg.get("seed", 42)))

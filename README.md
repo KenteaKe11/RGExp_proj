@@ -1,4 +1,4 @@
-# RGExp — PDVR: đối chứng với SOTA trên Gemma 3
+# RGExp — Recombinator: đối chứng với SOTA trên Gemma 3
 
 Repo này chạy **một** thí nghiệm tại một thời điểm. Thí nghiệm đang mở là
 **§2.5** — ba candidate, hai kiểm định ghép cặp, Holm trên ba cặp:
@@ -11,7 +11,7 @@ bash scripts/run_section25.sh --detach      # §2.5 chạy thật
 ```
 A  r2gen      R2Gen — ResNet-101 + Transformer 3 lớp + Relational Memory
 B  adaatt     AdaAtt — ResNet-152 + LSTM + Adaptive Attention (Visual Sentinel)
-C  my_gemma   Gemma 3 4b-it NF4 + PDVR + QFormer(2 vector) + ClsHead
+C  my_gemma   Gemma 3 4b-it NF4 + Recombinator + Classification/Route Head
               + Experts K=6·E=10, adapter QLoRA r4
 ```
 
@@ -20,29 +20,71 @@ công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao 
 
 ---
 
-## PDVR — Progressive Dual-Path Visual Recombiner
+## Kiến trúc nhánh — Recombinator + hai head
 
-PDVR thay thế hoàn toàn Recombinator cũ. Nó nhận `X [4096, 1152]` từ vision
-tower và tạo `Y [64, 2560]` để đưa vào QFormer và decoder.
+Recombinator nhận `X [4096, 1152]` (last_hidden_state của vision tower) và tạo
+`Y [256, 2560]`. Classification Head và Route Head đọc cả 256 token; decoder
+nhận 64 token qua Linear/GELU trên trục token, **không có cổng**.
 
 ```text
-X -> Preparer: AvgPool(4->1) -> RMSNorm -> SwiGLU(mult=2) + residual
-  -> Highway:   Linear/GELU 1152->2560 -> RMSNorm -> token chain 1024->512->256->128->64 -> RMSNorm
-  -> Extractor: LinearPool 1024->64 -> RMSNorm(Q), RMSNorm(K/V) -> MHA(head_dim=64)
-                -> residual -> Linear/GELU 1152->2560 -> RMSNorm
-  -> Highway + Extractor -> RMSNorm -> Y [64, 2560]
+Image -> Vision Encoder ─┬─> Recombinator (256, 2560) ─┬─> Classification Head (14·3) -> Sup Loss
+                         │                             ├─> Route Head (E) -> Aux Loss
+                         │                             │     └─> Top-k Gate -> Experts (LoRA)
+                         │                             └─> Linear/GELU 256->64 ─┐ First
+                         └─> VL-Adapter (256) ──────────────────────────────────┤ Second
+Prompt -> Embedding ────────────────────────────────────────────────────────────┴─> concat -> Decoder -> CE
+
+Recombinator: X (4096, 1152)
+  1. Local Extractor ×2: RMSNorm -> Linear 1152->2048 GELU -> RMSNorm
+                         -> AvgPool 2×2 trên lưới (N -> N/4) -> Linear 2048->1152 GELU
+                         4096 -> 1024 -> 256 token
+  2. Global Extractor:   Q = RMSNorm(local), K/V = RMSNorm(X) -> MHA(head_dim=64, 18 head)
+                         + residual RMSNorm(Q)
+  3. FFN:                Linear 1152->2560 GELU -> RMSNorm -> Linear 2560->2560 GELU
+                         + residual RMSNorm  -> Y (256, 2560)
+
+Classification Head / Route Head (cùng hình dạng, khác target):
+  Pooling Stack ×4: RMSNorm -> Linear/GELU trục token N->N/2 -> AvgPool N/2->N/4
+                    256 -> 64 -> 16 -> 4 -> 1
+  Main Head:        RMSNorm -> Linear/GELU 2560->1024 -> Linear 1024->target
+  Route Head thêm `noise_proj` 1024->E cho nhiễu học được của Top-k Gate.
 ```
 
-`Preparer`, `Highway`, và `Extractor` là ba khối độc lập. Log trước gradient
-clipping có ba metric `grad_norm_{block}_mean_per_param`, tức `L2(gradient) /
-số tham số` của từng khối, để so sánh trực tiếp dù kích thước khối khác nhau.
+Ba chỗ cài đặt cần biết, vì sơ đồ không nói rõ:
+
+* AvgPool của Local Extractor là pool **2×2 trên lưới ảnh** (64×64 -> 32×32 ->
+  16×16), nên 256 token của Recombinator trùng lưới 16×16 của VL-Adapter.
+* Lớp cuối của Main Head **không** qua GELU: đầu ra là logit của ASL và của
+  softmax/top-k, và GELU chặn logit dưới ở ≈ −0.17.
+* Các Linear trên trục token (Pooling Stack, `dec_proj`) không bias, khởi tạo bằng
+  trung bình cụm; `dec_proj` là trung bình 2×2 trên lưới 16×16 -> 8×8, nên ở
+  bước 0 decoder nhận đúng đặc trưng Stage 0 đã học (qua GELU).
+
+Số token vào decoder khai ở `recombiner.n_dec_tokens`. Khoá của kiến trúc cũ
+(`qformer`, `prepare_pool_factor`, `highway_token_dims`, `swiglu_dropout`,
+`n_query`, `n_heads`, cổng Hard-Concrete `gate*`, `train.gate_lr_mult`,
+`classifier.l0_lambda`) đã bỏ — còn sót khoá nào trong config thì chương trình
+dừng.
+
+Log trước gradient clipping có ba metric `grad_norm_{local,global,ffn}_mean_per_param`,
+tức `L2(gradient) / số tham số` của từng khối Recombinator, để so sánh trực tiếp
+dù kích thước khối khác nhau.
 
 ## Pretrain cục bộ
 
-Stage 0 học `PDVR + QFormer + ClsHead` bằng ASL trước khi decoder fine-tune.
-Checkpoint pretrain chỉ chứa ba khối này; `gate` và `route_gate` không có
-gradient ở Stage 0 nên không được lưu như trọng số đã học. Chạy bằng
+Stage 0 học `Recombinator + Classification Head` bằng ASL trước khi decoder
+fine-tune. Checkpoint pretrain chỉ chứa hai khối này; `dec_proj` và `route_head`
+không có gradient ở Stage 0 (decoder không chạy, định tuyến tắt) nên không được
+lưu, và học ở lr đầy đủ trong decoder_ft. Sang decoder_ft, Recombinator học
+tiếp ở lr × `train.pretrained_lr_mult` (0.1), còn Classification Head **đóng
+băng hoàn toàn** (`train.freeze_after_pretrain: [cls_head]` — không gradient,
+không dropout, không nằm trong optimizer); ASL vẫn cộng vào loss và kéo
+Recombinator qua head cố định đó. Chạy bằng
 `bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
+
+Checkpoint Stage 0 của kiến trúc cũ (PDVR + QFormer, `format /1`) **không** nạp
+được vào nhánh này — phải chạy lại Stage 0. Nếu `runs/sup_pretrain` còn
+`trainer_state.pt` cũ thì chạy với `--no-resume` (hoặc `--run-id <tên mới>`).
 
 ## Dàn ý nghiên cứu
 
@@ -58,7 +100,7 @@ gradient ở Stage 0 nên không được lưu như trọng số đã học. Ch�
 §2.5 lấy kết quả của năm mục trên làm **siêu tham số đã chốt**: base Gemma 3 từ
 §2.1, QLoRA r4 từ §2.2, E=10·K=6 từ §2.4, và nguồn đặc trưng ảnh SigLIP
 dim = 1152 từ kết luận của §2.0 (emb_vec sau căn chỉnh không đủ giàu thông tin
-thị giác — xem phần PDVR ở trên).
+thị giác — xem phần kiến trúc nhánh ở trên).
 
 Code của 2.0–2.4 nằm ở [`_archive/`](#_archive) — **bản ghi**, không phải một
 đường chạy được.
@@ -78,8 +120,9 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
 4. **Một phương pháp resize duy nhất** cho mọi model, **kể cả khi kích thước đầu
    vào vô tình khớp** (`image_policy.allow_native_match: false`).
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
-   config Stage 0; main-stage dùng lr **1/5** cho phần đã pretrain
-   (`train.pretrained_lr_mult: 0.2`).
+   config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
+   (`train.pretrained_lr_mult: 0.1`). Riêng My Gemma, Classification Head
+   **đóng băng hoàn toàn** sau Stage 0 (`train.freeze_after_pretrain`).
 
 Hai điều kiện cuối **sửa** setup gốc của R2Gen/AdaAtt. Đó là sai lệch có chủ ý
 và nó được ghi vào `manifest.deviations` + REPORT.md kèm con số thật, nên báo
@@ -138,8 +181,9 @@ src/
                              một phép biến đổi hình học cho cả ba candidate
   backbone.py                nạp base, gắn adapter, ReportDataset, collate,
                              one-cycle, device_map
-  recombiner.py              PDVR · QFormer(2 vector) · ClsHead ·
-                             RouteGate · Sigmoid Gate + Hard Discrete (L0) · ASL
+  recombiner.py              Recombinator (Local×2 · Global MHA · FFN) ·
+                             ClsHead · RouteHead (Pooling Stack + Main Head) ·
+                             Linear/GELU 256→64 token vào decoder · ASL
   moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
   train_recomb.py            vòng huấn luyện của candidate C
@@ -147,7 +191,7 @@ src/
   pretrain_io.py             ghi/nạp/đẩy đúng các khối đã pretrain
   run_pretrain.py            điều phối Stage 0 của C (data · train · push)
   sota/                      HAI BASELINE — cài lại theo paper gốc
-    __init__.py              build(name) · param_groups (hệ số 1/5 của đk 5)
+    __init__.py              build(name) · param_groups (hệ số 1/10 của đk 5)
     visual.py                ResNet-101/152 ImageNet, đặc trưng lưới
     r2gen.py                 Transformer 3 lớp + Relational Memory + MCLN
     adaatt.py                LSTM + Adaptive Attention + Visual Sentinel

@@ -66,11 +66,12 @@ pretrain ghi ra phải có ĐÚNG hình dạng mà §2.5 dựng — hai file c�
 chắc chắn nhất để pretrain xong mới biết nó không nạp được.
 
 ── MỘT TẬP TRAIN THỐNG NHẤT ───────────────────────────────────────────────
-`pretrain.n_train` phải bằng đúng `data.n_train` (= 6400). Mọi stage dùng
-chung `data/trainset.jsonl`; không có manifest train riêng cho Stage 0.
+`pretrain.n_train` phải bằng `data.n_train` (con số do config quyết định, không
+ghim cứng). Mọi stage dùng chung `data/trainset.jsonl`; không có manifest train
+riêng cho Stage 0.
 
-Hàng rào rò rỉ với 3000 ảnh test áp dụng trực tiếp cho cùng tập 6400 mẫu train
-được dùng bởi tất cả các stage.
+Hàng rào rò rỉ với 3000 ảnh test áp dụng trực tiếp cho cùng tập train được dùng
+bởi tất cả các stage.
 """
 from __future__ import annotations
 
@@ -239,7 +240,7 @@ def _drift(meta: dict, cfg: Cfg, p: dict) -> tuple[list[tuple], list[tuple]]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="sup_pretrain — Recombinator + QFormer(vec_1) + ClsHead, "
+        description="sup_pretrain — Recombinator + Classification Head, "
                     "100% có giám sát, không decoder.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
@@ -344,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     t_start = time.time()
     print("\n═══ sup_pretrain — nhánh thị giác có giám sát, KHÔNG decoder ═══",
           flush=True)
-    print(f"  loss = ASL( ClsHead( QFormer_sup( Recombinator( SigLIP(ảnh) ) ) ) )",
+    print(f"  loss = ASL( ClsHead( Recombinator( SigLIP(ảnh) ) ) )",
           flush=True)
     print(f"⚙ run dir: {run_dir}", flush=True)
     n_data = int(cfg["data"].get("n_train", 6400) or 6400)
@@ -352,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     if n_pre_cfg != n_data:
         raise ValueError(
             f"Tập train không thống nhất: data.n_train={n_data}, "
-            f"pretrain.n_train={n_pre_cfg}. Mọi stage phải dùng đúng 6400 mẫu."
+            f"pretrain.n_train={n_pre_cfg}. Mọi stage phải dùng CÙNG một tập train."
         )
     n_pre = n_data
     print(f"⚙ tập train: {n_pre} mẫu (CHUNG cho mọi stage)"

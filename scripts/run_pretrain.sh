@@ -12,16 +12,20 @@
 # Mọi tham số chuyển thẳng cho `python -m src.run_pretrain`.
 #
 # ── Nó huấn luyện cái gì ────────────────────────────────────────────────────
-#     loss = ASL( ClsHead( QFormer_sup( PDVR( SigLIP(ảnh) ) ) ) )
+#     loss = ASL( ClsHead( Recombinator( SigLIP(ảnh) ) ) )
 #
 # Không CE, không λ, không LoRA, không Aux Loss. Decoder KHÔNG chạy — base chỉ
 # được nạp để lấy ĐÚNG vision tower và processor mà §2.3/§2.4 dùng, và lượt
 # vision chạy trong `no_grad`.
 #
-# Hệ quả trực tiếp: `gate` (cổng vào decoder) và `route_gate` (đọc `vec_2` đã
-# đóng băng) KHÔNG nhận một gradient nào, nên chúng KHÔNG nằm trong file
-# checkpoint. File chỉ chứa `recombinator`, `qformer`, `cls_head` — đúng những
-# khối đã thật sự được pretrain. Xem src/pretrain_io.py.
+# Hệ quả trực tiếp: `dec_proj` (chiếu vào decoder) và `route_head` (chỉ chạy khi
+# định tuyến bật) KHÔNG nhận một gradient nào, nên chúng KHÔNG nằm trong file
+# checkpoint. File chỉ chứa `recombinator`, `cls_head` — đúng những khối đã
+# thật sự được pretrain. Xem src/pretrain_io.py.
+#
+# Checkpoint của kiến trúc cũ (PDVR + QFormer, format /1) KHÔNG nạp được: nếu
+# runs/sup_pretrain còn trainer_state cũ thì chạy với --no-resume hoặc
+# --run-id <tên mới>; `--resume` từ Hub cũng dừng cho tới khi Hub có ckpt /2.
 #
 # ── Checkpoint theo EPOCH ───────────────────────────────────────────────────
 #     runs/sup_pretrain/ckpt/epoch_001/ … epoch_NNN/   (giữ keep_last_ckpt cái)
@@ -55,8 +59,9 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# `decoder_ft` hạ learning rate của riêng nhánh MLP đã pretrain
-# (`train.pretrained_lr_mult`) để nó không bị CE kéo giật khỏi chỗ đã hội tụ
+# `decoder_ft` ĐÓNG BĂNG HOÀN TOÀN Classification Head
+# (`train.freeze_after_pretrain: [cls_head]`), hạ learning rate của Recombinator
+# (`train.pretrained_lr_mult: 0.1`) để nó không bị CE kéo giật khỏi chỗ đã hội tụ
 # trong những bước đầu — và tắt λ-warmup, vốn chỉ có lý do khi ClsHead còn
 # ngẫu nhiên.
 # ═════════════════════════════════════════════════════════════════════════════

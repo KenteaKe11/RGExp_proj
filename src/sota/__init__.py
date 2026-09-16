@@ -45,7 +45,7 @@ def param_groups(model: nn.Module, lr_visual: float, lr_rest: float,
                  pretrained_mult: float = 1.0) -> list[dict]:
     """Hai nhóm tham số — visual encoder và phần còn lại.
 
-    `pretrained_mult` là điều kiện 5: main-stage chạy lr bằng 1/5 lr chính thức
+    `pretrained_mult` là điều kiện 5: main-stage chạy lr bằng 1/10 lr chính thức
     cho những khối ĐÃ đi qua Stage 0. Với hai baseline thì Stage 0 huấn luyện
     phần ngôn ngữ (CNN đóng băng), nên hệ số nhân áp lên NHÓM CÒN LẠI — không
     phải lên ResNet, khối duy nhất chưa học gì từ tập này.

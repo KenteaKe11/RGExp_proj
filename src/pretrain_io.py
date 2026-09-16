@@ -2,19 +2,19 @@
 thật sự được pretrain, không hơn.
 
 ── Vì sao file này tồn tại thay vì dùng lại `recombiner.save_branch` ────────
-`save_branch` ghi TOÀN BỘ `state_dict()` của nhánh: recombinator, qformer,
-cls_head, route_gate, gate. Ở chế độ pretrain, hai khoá cuối KHÔNG nhận một
-gradient nào:
+`save_branch` ghi TOÀN BỘ `state_dict()` của nhánh: recombinator, cls_head,
+route_head, dec_proj. Ở chế độ pretrain, hai khối cuối KHÔNG nhận một gradient
+nào:
 
-  * `gate` là cổng vào DECODER, và pretrain không chạy decoder. Nó ở lại đúng
-    giá trị khởi tạo (0.0).
-  * `route_gate` đọc `vec_2` của QFormer, mà `vec_2` bị đóng băng ở pretrain
-    (`qformer.freeze = [aux]`) — query detach, đầu ra detach. Nó ở lại đúng
-    giá trị `_init` + `init_noise`.
+  * `dec_proj` là phép chiếu (Linear/GELU 256→64 trên trục token) vào DECODER,
+    và pretrain không chạy decoder. Nó ở lại đúng khởi tạo trung bình cụm.
+  * `route_head` chỉ được gọi khi định tuyến bật (`route_enabled`), mà
+    pretrain tắt định tuyến — không có Experts nào để chọn. Nó ở lại đúng giá
+    trị `_init` + `init_noise`.
 
 Ghi chúng vào file pretrain thì file ấy nói một câu không đúng: nó trông như
 một checkpoint đầy đủ của nhánh. Ca hỏng cụ thể: ai đó nạp nó vào §2.4, thấy
-`route_gate.*` có trong file, và kết luận rằng Route_Gate đã được pretrain —
+`route_head.*` có trong file, và kết luận rằng Route Head đã được pretrain —
 trong khi nó là số ngẫu nhiên của một lần `torch.manual_seed` nào đó. Không có
 exception nào, và đường loss của §2.4 trông hoàn toàn bình thường.
 
@@ -23,17 +23,12 @@ khối KHÔNG được pretrain, và `load_into_branch` đối chiếu tập kho
 chiều (thiếu VÀ thừa) trước khi nạp. Khối nào không có trong file thì được nói
 ra bằng một dòng log ở lúc nạp, chứ không im lặng dùng giá trị khởi tạo.
 
-── Vì sao HÌNH DẠNG nhánh vẫn là hình dạng của §2.3/§2.4 ───────────────────
-Pretrain dựng `RecombinerBranch` với `qformer.tasks = [sup, aux]`,
-`freeze = [aux]`, `route_enabled = false` — tức là đúng cấu hình §2.3. Chỉ MỘT
-vector có gradient (`sup`), nên "QFormer 1 vector" là đúng theo nghĩa đường
-thông tin; nhưng `query` vẫn là (2, d_model) và `route_gate` vẫn được dựng, nên
-checkpoint NẠP THẲNG sang §2.4 được mà không cần một hàm mở rộng shape nào.
-
-Một hàm mở rộng shape là chỗ tệ nhất để đặt một lỗi: nó chạy đúng ở mọi phép
-kiểm hình dạng, và nếu nó chèn hàng `aux` vào SAI vị trí thì §2.4 định tuyến
-bằng vector phân loại và phân loại bằng vector định tuyến — cả hai loss vẫn
-giảm.
+── Vì sao HÌNH DẠNG nhánh vẫn là hình dạng của main-stage ───────────────────
+Pretrain dựng `RecombinerBranch` với ĐÚNG khối `recombiner`/`classifier` của
+main-stage, chỉ khác `route_enabled = false`. `route_head` vẫn được dựng (và
+`n_experts` lấy từ config), nên checkpoint NẠP THẲNG sang decoder_ft mà không
+cần một hàm mở rộng shape nào — hai head không dùng chung tham số nào, nên
+không có gì phải "tách" hay "chèn" khi bật định tuyến.
 
 ── Repo lưu trữ ────────────────────────────────────────────────────────────
 `pretrain.hub_repo` là một repo MODEL riêng, không phải `output.hub_repo`
@@ -55,17 +50,20 @@ from pathlib import Path
 # `train_recomb.build_optimizer` đọc CHÍNH hằng số này, nên "nhóm lr giảm áp
 # đúng vào phần đã pretrain" kiểm được bằng cách đọc chứ không phải bằng cách
 # tin.
-PRETRAINED_MODULES: tuple[str, ...] = ("pdvr", "qformer", "cls_head")
+PRETRAINED_MODULES: tuple[str, ...] = ("recombinator", "cls_head")
 
 # Những khối có trong nhánh nhưng KHÔNG nhận gradient ở pretrain. Khai tường
 # minh (thay vì "phần còn lại") để `save_pretrain` dừng khi nhánh mọc thêm một
-# khối thứ sáu mà không ai quyết định nó thuộc nhóm nào.
-UNTRAINED_MODULES: tuple[str, ...] = ("route_gate", "gate")
+# khối mới mà không ai quyết định nó thuộc nhóm nào.
+UNTRAINED_MODULES: tuple[str, ...] = ("route_head", "dec_proj")
 
 PRETRAIN_FILE = "sup_pretrain.safetensors"
 PRETRAIN_META = "sup_pretrain.json"
 TRAINER_STATE = "trainer_state.pt"      # chỉ để resume, KHÔNG bao giờ đẩy Hub
-FORMAT = "rgexp.sup_pretrain/1"
+# /2: Recombinator (Local×2 + Global MHA + FFN) + Pooling-Stack heads. Checkpoint
+# /1 (PDVR + QFormer) không nạp được — `assert_compatible` dừng ở đây trước khi
+# đối chiếu khoá.
+FORMAT = "rgexp.sup_pretrain/2"
 
 
 class PretrainIncompatible(RuntimeError):
@@ -74,7 +72,7 @@ class PretrainIncompatible(RuntimeError):
 
 # ══ Tách state_dict ═════════════════════════════════════════════════════════
 def _module_of(key: str) -> str:
-    """Tên khối của một khoá state_dict. `gate` là Parameter trần -> chính nó."""
+    """Tên khối của một khoá state_dict (phần trước dấu chấm đầu tiên)."""
     return key.split(".", 1)[0]
 
 
@@ -124,7 +122,6 @@ def save_pretrain(branch, out_dir: Path, extra: dict | None = None) -> Path:
     path = out_dir / PRETRAIN_FILE
     save_file(sd, str(path))
 
-    q = branch.qformer
     meta = {
         "format": FORMAT,
         "pretrained_modules": list(PRETRAINED_MODULES),
@@ -139,15 +136,15 @@ def save_pretrain(branch, out_dir: Path, extra: dict | None = None) -> Path:
         # `spec` là NGUYÊN VĂN hai khối config đã dựng ra nhánh — cùng cơ chế
         # với recombiner.save_branch, và là thứ `assert_compatible` đối chiếu.
         "spec": branch.spec,
-        "qformer": {"tasks": list(q.tasks), "frozen": list(q.frozen),
-                    "d_model": int(q.d_model)},
-        "n_query": int(branch.n_query),
+        "n_tokens": int(branch.n_tokens),
+        "n_dec_tokens": int(branch.n_dec_tokens),
+        "pool_stages": int(branch.pool_stages),
         "d_vis": int(branch.d_vis),
         "d_model": int(branch.d_model),
         "n_labels": int(getattr(branch.cls_head, "n_labels", 0) or 0),
         "n_classes": int(getattr(branch.cls_head, "n_classes", 0) or 0),
         "route_enabled": bool(branch.route_enabled),
-        "n_experts": int(branch.route_gate.n_experts),
+        "n_experts": int(branch.route_head.n_experts),
     }
     meta.update(dict(extra or {}))
     (out_dir / PRETRAIN_META).write_text(
@@ -193,27 +190,36 @@ def copy_ckpt(src: Path, dst: Path, with_trainer_state: bool = False) -> Path:
 def assert_compatible(meta: dict, branch, where: str = "") -> None:
     """Checkpoint này có dựng ra ĐÚNG nhánh đang có trong bộ nhớ không?
 
-    Bốn con số phải khớp, và cả bốn đều là loại "lệch thì `load_state_dict` vẫn
-    có thể chạy":
+    `format` kiểm TRƯỚC: checkpoint của kiến trúc cũ (PDVR + QFormer, format
+    /1) dừng ở đây với một câu nói rõ nguyên nhân, thay vì ở một danh sách khoá
+    lệch khó đọc.
+
+    Rồi các con số dưới đây phải khớp — đều là loại "lệch thì `load_state_dict`
+    vẫn có thể chạy" hoặc báo lỗi mà không nói vì sao:
 
       * `d_vis`   — vision tower khác -> Recombinator chiếu sai chiều;
-      * `d_model` — decoder khác -> 32 token nối vào sai chiều;
+      * `d_model` — decoder khác -> token nhánh nối vào sai chiều;
       * `n_labels`/`n_classes` — ClsHead khác hình dạng; lệch là nạp một head
         học trên một bộ bệnh lý KHÁC, và ASL vẫn giảm bình thường vì nó không
         biết gì về tên nhãn;
-      * `qformer.d_model` — vec_1/vec_2 khác chiều.
-
-    Riêng `qformer.tasks` phải khớp THỨ TỰ, không chỉ tập hợp: `query` là một
-    Parameter (n_task, d) và chỉ số hàng được suy ra từ vị trí trong `tasks`.
-    Đổi thứ tự là phân loại bằng vector định tuyến, và không có gì nổ.
+      * `n_tokens` / `pool_stages` — số token ra của Recombinator và số tầng
+        Pooling Stack của hai head.
     """
     tag = f" ({where})" if where else ""
-    q_now = branch.qformer
+    fmt = str(meta.get("format", ""))
+    if fmt != FORMAT:
+        raise PretrainIncompatible(
+            f"checkpoint pretrain{tag} có format {fmt or '(trống)'!r}, bản này "
+            f"đọc {FORMAT!r}.\n"
+            f"    Checkpoint do một kiến trúc nhánh KHÁC ghi ra (format /1 = "
+            f"PDVR + QFormer). Chạy lại Stage 0: bash scripts/run_pretrain.sh.")
     want = {
         "d_vis": int(branch.d_vis),
         "d_model": int(branch.d_model),
         "n_labels": int(getattr(branch.cls_head, "n_labels", 0) or 0),
         "n_classes": int(getattr(branch.cls_head, "n_classes", 0) or 0),
+        "n_tokens": int(branch.n_tokens),
+        "pool_stages": int(branch.pool_stages),
     }
     for k, v in want.items():
         got = meta.get(k)
@@ -226,23 +232,6 @@ def assert_compatible(meta: dict, branch, where: str = "") -> None:
                 f"    Nạp tiếp là chạy với một phần trọng số ngẫu nhiên (hoặc "
                 f"tệ hơn: một ClsHead đã học trên một bộ nhãn khác). Pretrain "
                 f"lại, hoặc sửa config cho khớp checkpoint.")
-    mq = dict(meta.get("qformer") or {})
-    if mq.get("d_model") is not None and int(mq["d_model"]) != int(q_now.d_model):
-        raise PretrainIncompatible(
-            f"checkpoint pretrain{tag}: qformer.d_model = {mq['d_model']}, "
-            f"nhánh cần {q_now.d_model}.")
-    if mq.get("tasks") and list(mq["tasks"]) != list(q_now.tasks):
-        raise PretrainIncompatible(
-            f"checkpoint pretrain{tag}: qformer.tasks = {list(mq['tasks'])}, "
-            f"nhánh đang dựng {list(q_now.tasks)}.\n"
-            f"    THỨ TỰ cũng phải khớp, không chỉ tập hợp: `query` là một "
-            f"Parameter (n_task, d) và chỉ số hàng lấy từ vị trí trong danh "
-            f"sách. Đổi chỗ `sup` với `aux` là phân loại bằng vector định tuyến "
-            f"và định tuyến bằng vector phân loại — cả hai loss vẫn giảm.")
-    fmt = str(meta.get("format", ""))
-    if fmt and fmt != FORMAT:
-        raise PretrainIncompatible(
-            f"checkpoint pretrain{tag} có format {fmt!r}, bản này đọc {FORMAT!r}.")
 
 
 def load_into_branch(branch, src_dir: Path, verbose: bool = True) -> dict:
@@ -535,24 +524,24 @@ cong khác nhau. Con số ấy phải vào phần Giới hạn nếu checkpoint 
 """
     return f"""---
 library_name: rgexp
-tags: [recombiner, qformer, siglip, asl, chest-xray, supervised-pretraining]
+tags: [recombiner, siglip, asl, chest-xray, supervised-pretraining]
 ---
 
-# RGExp — sup_pretrain (Recombinator + QFormer(vec_1) + ClsHead)
+# RGExp — sup_pretrain (Recombinator + Classification Head)
 
 Checkpoint của chế độ **`sup_pretrain`**: nhánh thị giác có giám sát được huấn
 luyện 100% bằng Sup Loss (ASL trên nhãn bệnh lý), **không có decoder, không có
-CE**. Dùng để khởi tạo nhánh cho §2.3 / §2.4 ở chế độ `decoder_ft`.
+CE**. Dùng để khởi tạo nhánh cho §2.5 ở chế độ `decoder_ft`.
 
 | khối | có trong file này |
 |---|---|
 {rows}
 
-`route_gate` và `gate` **không** nằm trong file: ở pretrain chúng không nhận một
-gradient nào (`gate` là cổng vào decoder, mà decoder không chạy; `route_gate`
-đọc `vec_2`, mà `vec_2` bị đóng băng). Ghi chúng vào đây sẽ làm file trông như
-một checkpoint đầy đủ của nhánh, và người nạp sẽ tưởng Route_Gate đã được
-pretrain.
+`route_head` và `dec_proj` **không** nằm trong file: ở pretrain chúng không nhận
+một gradient nào (`dec_proj` chiếu vào decoder, mà decoder không chạy;
+`route_head` chỉ chạy khi định tuyến bật, mà pretrain không có Experts). Ghi
+chúng vào đây sẽ làm file trông như một checkpoint đầy đủ của nhánh, và người
+nạp sẽ tưởng Route Head đã được pretrain.
 {lineage}
 ## Số liệu
 

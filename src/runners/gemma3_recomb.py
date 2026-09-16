@@ -18,7 +18,7 @@ Ba chỗ phải đúng, không chỗ nào tự lộ ra nếu sai:
      ngẫu nhiên vẫn sinh ra tiếng Anh trôi chảy, và cột số ấy trông y như kết
      quả thật.
   3. Đệm BÊN TRÁI khi sinh (ngược với khâu train). Hệ quả: vị trí token ảnh
-     khác nhau theo từng hàng, nên chỗ chèn 32 token cũng phải theo từng hàng —
+     khác nhau theo từng hàng, nên chỗ chèn token nhánh cũng phải theo từng hàng —
      xem `recombiner.image_start_indices`.
 
 ── §2.4: cùng runner, thêm Experts ─────────────────────────────────────────
@@ -141,17 +141,11 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                 ccfg=dict(self.cfg.get("classifier", {}) or {}),
                 device=dev, dtype=recombiner.float_dtype(self._gemma))
             n = self.branch.n_params()
-            gate = float(self.branch.gate.detach().mean())
-            print(f"  ✓ nhánh Recombinator: {n['n_query']} token nối vào chuỗi "
-                  f"decoder · QFormer {len(n['qformer_tasks'])} vector "
-                  f"({'/'.join(n['qformer_tasks'])}, đóng băng "
-                  f"{n['qformer_frozen'] or '—'}) · {n['total']:,} tham số · "
-                  f"gate {gate:+.4f}", flush=True)
-            if abs(gate) < 0.01:
-                print("  ⚠ gate gần 0 — 32 token gần như không tới decoder. Điểm "
-                      "của candidate B sẽ rất sát candidate A, và đó là kết luận "
-                      "về QUÁ TRÌNH HUẤN LUYỆN (cổng không kịp mở) chứ không phải "
-                      "về đặc trưng SigLIP. Xem train.gate_lr_mult.", flush=True)
+            d = self.branch.dec_stats()
+            print(f"  ✓ nhánh: {self.branch.describe()} · {n['total']:,} tham "
+                  f"số · route {'BẬT' if n['route_enabled'] else 'TẮT'} · "
+                  f"dec_proj rời khởi tạo {d['dec_proj_rel_change']:.3f}",
+                  flush=True)
         else:
             self.branch = None
             print("  candidate A: không nạp nhánh Recombinator", flush=True)

@@ -109,8 +109,8 @@ def t_moe_config_matches_24():
     assert str(CFG["lora"]["preset"]) == "qlora_r4"
 
 
-def t_pretrained_lr_mult_is_one_fifth():
-    assert abs(float(CFG["train"]["pretrained_lr_mult"]) - 0.2) < 1e-12
+def t_pretrained_lr_mult_is_one_tenth():
+    assert abs(float(CFG["train"]["pretrained_lr_mult"]) - 0.1) < 1e-12
 
 
 def t_stage0_schedule_encodes_min_lr():
@@ -636,7 +636,7 @@ if __name__ == "__main__":
     check("ba candidate hợp lệ", t_arms_valid)
     check("cờ candidate là BẮT BUỘC", t_arm_flags_are_mandatory)
     check("MoE E=10·K=6 + QLoRA r4 (§2.2, §2.4 đã chốt)", t_moe_config_matches_24)
-    check("pretrained_lr_mult = 1/5", t_pretrained_lr_mult_is_one_fifth)
+    check("pretrained_lr_mult = 1/10", t_pretrained_lr_mult_is_one_tenth)
     check("lịch Stage 0 mã hoá đúng min_lr", t_stage0_schedule_encodes_min_lr)
     check("candidate nặng nhất chạy trước", t_train_order_heaviest_first)
 

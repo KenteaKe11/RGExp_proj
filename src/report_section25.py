@@ -8,9 +8,10 @@ Báo cáo này có hai việc mà báo cáo §2.3 không có.
    không đọc được — người đọc không biết nó so ba kiến trúc hay so ba cấu hình
    tiền xử lý. Nên `manifest.deviations` đứng ở MỤC 1, trước bảng điểm.
 
-2. **Phân loại kết luận âm tính của candidate C**, giống §2.3: `gate ≈ 0` hay
-   `cls_f1_pos` ở mức đoán bừa nghĩa là kết luận thuộc về QUÁ TRÌNH HUẤN LUYỆN
-   chứ không phải về kiến trúc, và ba con số ấy đặt ngay cạnh bảng.
+2. **Phân loại kết luận âm tính của candidate C**, `cls_f1_pos` ở mức
+   đoán bừa nghĩa là kết luận thuộc về QUÁ TRÌNH HUẤN LUYỆN chứ không phải về
+   kiến trúc, và con số ấy đặt ngay cạnh bảng. (Không còn cổng vào decoder, nên
+   không còn ca "cổng không mở".)
 
 Một điểm CỐ Ý thiếu: không có cột CIDEr. Nó được tính trong `train_sota` để
 chọn checkpoint của AdaAtt theo đúng setup gốc, và nó dừng ở đó — bảng kết quả
@@ -26,7 +27,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-GATE_FLOOR = 0.05
 CLS_F1_FLOOR = 0.05
 
 
@@ -82,28 +82,17 @@ def diagnosis(train_stats: list[dict], arm_id: str) -> tuple[str, list[str]]:
     warns: list[str] = []
     if not st:
         return "unknown", [f"không tìm được `train_stats.json` của `{arm_id}` -> "
-                           f"không kiểm được gate lẫn cls_f1_pos."]
-    g = st.get("gate_final")
-    g = dict(g) if isinstance(g, dict) else {}
+                           f"không kiểm được cls_f1_pos."]
+    # Không còn cổng: token của nhánh LUÔN tới decoder, nên câu hỏi "nhánh có
+    # tham gia không" chỉ còn phụ thuộc việc head đọc được bệnh lý hay không.
     cls = st.get("cls_metrics_last") or {}
     f1 = cls.get("cls_f1_pos")
     label = "ok"
-    if g and float(g.get("gate_max", 0.0)) < GATE_FLOOR:
-        label = "gate_closed"
-        warns.append(
-            f"**gate_max = {float(g['gate_max']):.4f}**, "
-            f"**{g.get('gate_open_tokens', 0)}/{st.get('n_query', '?')} token "
-            f"mở**. Không ô nào của cổng Sigmoid+Hard-Discrete qua nổi "
-            f"{GATE_FLOOR}, nên decoder hầu như không nhận đặc trưng SigLIP. "
-            f"Mọi so sánh với hai baseline bên dưới khi đó đo một My Gemma "
-            f"CHƯA BAO GIỜ dùng nhánh — đó là kết luận về quá trình huấn "
-            f"luyện, không phải về kiến trúc.")
     if f1 is not None and float(f1) < CLS_F1_FLOOR:
-        if label == "ok":
-            label = "head_untrained"
+        label = "head_untrained"
         warns.append(
             f"**cls_f1_pos = {float(f1):.4f}**, ở mức đoán bừa. Head phân loại "
-            f"không đọc được bệnh lý từ 32 token — Stage 0 có thể đã không làm "
+            f"không đọc được bệnh lý từ 256 token của Recombinator — Stage 0 có thể đã không làm "
             f"việc của nó. Kiểm nhãn: `python -m src.labels_cls --check-split`.")
     return label, warns
 
@@ -179,13 +168,14 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
         L.append("## 2. Candidate C có thật sự dùng nhánh không\n")
         if label == "ok" and not warns:
             st = _stat(train_stats, ours)
-            g = st.get("gate_final") or {}
+            d = st.get("dec_proj_final") or {}
             cls = st.get("cls_metrics_last") or {}
-            L.append(f"Cổng mở (`gate_max` = {_f((g or {}).get('gate_max'))}, "
-                     f"{(g or {}).get('gate_open_tokens', '—')} token) và "
-                     f"`cls_f1_pos` = {_f(cls.get('cls_f1_pos'))}. Nhánh đã "
-                     f"tham gia, nên so sánh bên dưới là so sánh về KIẾN "
-                     f"TRÚC.\n")
+            L.append(f"{d.get('n_dec_tokens', st.get('n_dec_tokens', '—'))} "
+                     f"token của nhánh đi THẲNG vào decoder qua một phép chiếu "
+                     f"Linear/GELU trên trục token (không cổng; rời khởi tạo "
+                     f"{_f(d.get('dec_proj_rel_change'))}) và `cls_f1_pos` = "
+                     f"{_f(cls.get('cls_f1_pos'))}. Nhánh đã tham gia, nên so "
+                     f"sánh bên dưới là so sánh về KIẾN TRÚC.\n")
         else:
             for w in warns:
                 L.append(f"* ⚠ {w}")

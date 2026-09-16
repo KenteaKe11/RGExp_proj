@@ -14,7 +14,7 @@
 #
 # ── MỤC NÀY HỎI GÌ ──────────────────────────────────────────────────────────
 # Trên CÙNG 6400 mẫu train và CÙNG 3000 ảnh test của tập này, công thức
-# Gemma 3 + PDVR + QFormer + ClsHead + Experts K=6·E=10 có hơn hai kiến
+# Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10 có hơn hai kiến
 # trúc sinh báo cáo đã công bố không, và hơn BAO NHIÊU?
 #
 #     A  r2gen      ResNet-101 + Transformer 3 lớp + Relational Memory
