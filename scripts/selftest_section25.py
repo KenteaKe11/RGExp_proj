@@ -519,14 +519,16 @@ def t_beam_search_matches_transformers():
                      {"num_beams": 3, "length_penalty": 1.0,
                       "early_stopping": True}):
             k = spec["num_beams"]
+            # Mỗi khoá giải mã xuất hiện ĐÚNG MỘT lần: mặc định của đặc tả chung
+            # bị `spec` ghi đè, không truyền song song (TypeError trùng khoá).
+            gen = {"early_stopping": False, "no_repeat_ngram_size": 0,
+                   "repetition_penalty": 1.0, **spec}
             hf = model.generate(
                 input_ids=torch.stack([img, torch.full_like(img, tok.bos_id)], 1),
                 attention_mask=torch.ones(len(img), 2, dtype=torch.long),
                 do_sample=False, max_new_tokens=max_new, use_cache=False,
                 pad_token_id=tok.pad_id, eos_token_id=tok.eos_id,
-                bad_words_ids=[[tok.pad_id], [tok.bos_id]],
-                no_repeat_ngram_size=0, repetition_penalty=1.0,
-                early_stopping=spec.get("early_stopping", False), **spec)
+                bad_words_ids=[[tok.pad_id], [tok.bos_id]], **gen)
             want = [tok.decode(r[1:].tolist()) for r in hf]
 
             def step(state, last, _m=model):
@@ -542,7 +544,7 @@ def t_beam_search_matches_transformers():
             st0 = (torch.zeros(len(img) * k, 0, dtype=torch.long),
                    img.repeat_interleave(k))
             got = beam_search(step, reorder, st0, len(img), tok,
-                              dict(spec, max_new_tokens=max_new), device="cpu")
+                              dict(gen, max_new_tokens=max_new), device="cpu")
             assert got == want, (seed, spec, got, want)
             checked += 1
     assert checked == 18
