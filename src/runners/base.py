@@ -116,21 +116,14 @@ class Runner:
         return dt
 
     def gen_kwargs(self) -> dict:
-        g = dict(self.cfg["generate"])
-        kw = {
-            "max_new_tokens": int(g.get("max_new_tokens", 256)),
-            "do_sample": bool(g.get("do_sample", False)),
-        }
-        if not kw["do_sample"]:
-            # num_beams/repetition_penalty vẫn có nghĩa khi greedy; temperature
-            # và top_p thì KHÔNG, và truyền chúng vào chỉ tổ nhận warning.
-            kw["num_beams"] = int(g.get("num_beams", 1))
-        else:
-            kw["temperature"] = float(g.get("temperature", 1.0))
-            kw["top_p"] = float(g.get("top_p", 1.0))
-        rp = float(g.get("repetition_penalty", 1.0))
-        if rp != 1.0:
-            kw["repetition_penalty"] = rp
+        """kwargs của `transformers.generate` — đặc tả giải mã CHUNG của §2.5
+        (`src/decoding_spec.py`), cùng luật với beam search của R2Gen/AdaAtt."""
+        from ..decoding_spec import DecodingSpecError, hf_kwargs
+
+        try:
+            kw = hf_kwargs(self.cfg)
+        except DecodingSpecError as e:
+            raise RunnerUnusable(str(e)) from e
         return kw
 
     # ── vòng chạy ───────────────────────────────────────────────────────────

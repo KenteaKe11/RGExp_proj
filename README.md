@@ -15,7 +15,7 @@ C  my_gemma   Gemma 3 4b-it NF4 + Recombinator + Classification/Route Head
               + Experts K=6·E=10, adapter QLoRA r4
 ```
 
-Câu hỏi: trên **cùng** 6400 mẫu train và **cùng** 3000 ảnh test của tập này,
+Câu hỏi: trên **cùng** 9600 mẫu train và **cùng** 3000 ảnh test của tập này,
 công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao nhiêu**?
 
 ---
@@ -75,16 +75,48 @@ dù kích thước khối khác nhau.
 Stage 0 học `Recombinator + Classification Head` bằng ASL trước khi decoder
 fine-tune. Checkpoint pretrain chỉ chứa hai khối này; `dec_proj` và `route_head`
 không có gradient ở Stage 0 (decoder không chạy, định tuyến tắt) nên không được
-lưu, và học ở lr đầy đủ trong decoder_ft. Sang decoder_ft **không đóng băng
+lưu, và học từ khởi tạo trong decoder_ft. Sang decoder_ft **không đóng băng
 gì** — fine-tune toàn bộ (`train.freeze_after_pretrain: []`).
 
-| nhóm | Stage 0 | decoder_ft |
-|---|---|---|
-| Recombinator + Classification Head (gồm Main Head) | 2e-4 | 2e-4 / 2 = **1e-4** (`train.pretrained_lr_div`) |
-| Attn (Q/K/V/O) của Recombinator | 2e-4 × 3 = **6e-4** | 1e-4 × 3 = **3e-4** (`recombiner.attn_lr_mult`) |
-| Experts, `route_head`, `dec_proj` | — | 3e-4 (`train.schedule.max_lr`) |
+lr đỉnh:
 
-Stage 0 dùng `weight_decay: 0.8`. Main Head không còn lr nhỏ riêng. Checkpoint
+| nhóm | Stage 0 | decoder_ft (`train.ft_lr`) |
+|---|---|---|
+| Sup Head (`cls_head`: Pooling Stack + Main Head) | 2e-4 | **3e-4** |
+| Route Head (`route_head`) | — | **3e-4** |
+| Concat Linear (`dec_proj`, 256 → 64 token) | — | **3e-4** |
+| Attn (Q/K/V/O) của Recombinator (`recombinator_attn`) | 2e-4 × 3 = **6e-4** | **1e-4** |
+| Phần còn lại của Recombinator (`recombinator`) | 2e-4 | **3e-5** |
+| Experts (LoRA) — cùng lr với Attn | — | **1e-4** (`train.schedule.max_lr`) |
+
+Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.8`, hệ số Attn
+`recombiner.attn_lr_mult: 3`. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
+stage (không restart) để mọi nhóm cùng hội tụ.
+
+Cả hai giai đoạn dùng `div_factor` 30 · `final_div_factor` 10, rồi đầu warm-up
+và đáy của từng nhóm được **làm tròn xuống** còn 1 chữ số có nghĩa
+(`schedule.round_down_sig: 1`) thay vì để số lẻ vô hạn như 3.33e-6:
+
+| giai đoạn · nhóm | đầu warm-up | đỉnh | đáy |
+|---|---|---|---|
+| Stage 0 · Recombinator + cls_head | 6e-6 (6.67e-6) | 2e-4 | 6e-7 (6.67e-7) |
+| Stage 0 · Attn | 2e-5 | 6e-4 | 2e-6 |
+| decoder_ft · Sup Head / Route Head / Concat Linear | 1e-5 | 3e-4 | 1e-6 |
+| decoder_ft · Attn và LoRA | 3e-6 (3.33e-6) | 1e-4 | 3e-7 (3.33e-7) |
+| decoder_ft · phần còn lại của Recombinator | 1e-6 | 3e-5 | **1e-7** |
+
+Đáy nhỏ nhất của decoder_ft là **1e-7** (`train.schedule.min_lr`, được kiểm).
+Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
+làm tròn.
+
+Sup Loss (dùng chung cho hai giai đoạn): ASL với `gamma_neg: [4.0, 3.0, 0.0]`
+(nén theo tên lớp neg/pos/uncertain trên ô mang nhãn 0), `gamma_pos: 0.0`,
+`clip: 0.05`; ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
+warmup. META và model card của checkpoint Stage 0 ghi max_lr từng nhóm,
+`attn_lr_mult`, `weight_decay` và ASL; `run_pretrain.sh --resume` báo khi các
+khoá này khác config hiện tại.
+
+Checkpoint
 Stage 0 dở dang với optimizer một nhóm (trước khi Attn có nhóm riêng) không
 nối tiếp được — chạy `run_pretrain.sh --no-resume`. Chạy bằng
 `bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
@@ -127,7 +159,7 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
 
 1. **SOTA chỉ nạp lại trọng số ở đúng setup của paper gốc** — khối `sota:` trong
    `configs/section25.yaml` là bản chép nguyên văn, không hiệu chỉnh.
-2. **Cùng 6400 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
+2. **Cùng 9600 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
 3. **Paired Bootstrap + Permutation Test** cho từng cặp, Holm trên ba p-value.
    Không Friedman — xem phần kiểm định ghép cặp trong cấu hình.
 4. **Một phương pháp resize duy nhất** cho mọi model, **kể cả khi kích thước đầu
@@ -135,9 +167,23 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
    config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
    (`train.pretrained_lr_mult: 0.1`) — áp cho R2Gen/AdaAtt. Riêng My Gemma
-   fine-tune toàn bộ, không đóng băng; phần đã pretrain chạy lr Stage 0 / 2
-   (`train.pretrained_lr_div`), ma trận Attn của Recombinator luôn × 3
-   (`recombiner.attn_lr_mult`).
+   fine-tune toàn bộ, không đóng băng, lr từng nhóm theo `train.ft_lr`
+   (Recombinator 3e-5, Attn và LoRA 1e-4, các head và Concat Linear 3e-4).
+
+Cả ba candidate sinh bằng **một đặc tả giải mã** — khối `generate:`
+(`src/decoding_spec.py`): beam search `num_beams: 3`, `length_penalty: 1.0`,
+`early_stopping: false`, `no_repeat_ngram_size: 0`, `repetition_penalty: 1.0`,
+không lấy mẫu. My Gemma đưa nó cho `transformers.generate`; R2Gen/AdaAtt đưa nó
+cho `src/sota/decoding.py`, bản chép lại từng bước `_beam_search` của
+transformers 4.52 (top 2·k ứng viên, `<eos>` chỉ nhận ở hạng < k, điểm = tổng
+log-prob / số token sinh^lp, cùng điều kiện dừng xét chung cả batch) — cả khi
+chọn checkpoint trên val. `selftest_section25.py` đối chiếu nó TỪNG TOKEN với
+`transformers.generate` trên một GPT-2 tí hon ngẫu nhiên. Khối
+`sota.*.decoding` của paper chỉ còn là bản ghi; R2Gen mất `block_trigrams`, và
+chỗ lệch này nằm trong `manifest.deviations`. Khác biệt duy nhất là độ dài tối
+đa theo từ điển: 256 subword (My Gemma) / 59 từ (hai baseline). Với Experts,
+trọng số định tuyến của mỗi ảnh được nhân bản theo beam
+(`moe.RoutingContext.set(..., repeat=num_beams)`).
 
 Hai điều kiện cuối **sửa** setup gốc của R2Gen/AdaAtt. Đó là sai lệch có chủ ý
 và nó được ghi vào `manifest.deviations` + REPORT.md kèm con số thật, nên báo
@@ -164,7 +210,7 @@ bash scripts/run_section25.sh --detach       # §2.5: chạy thật
 
 `--dry-run` là phép thử **đường ống**, không phải phép dò VRAM: nó chạy với đúng
 batch trong config, và vài bước trên vài chục mẫu ngắn không nói được gì về VRAM
-đỉnh của 6400 mẫu.
+đỉnh của 9600 mẫu.
 
 ---
 
@@ -184,12 +230,14 @@ scripts/
   selftest_pretrain.py       phép kiểm cho sup_pretrain, không cần GPU/mạng
   run_section25.sh           MỘT LỆNH cho §2.5 (data · train · sinh · chấm ·
                              kiểm định · báo cáo)
-  selftest_section25.py      39 phép kiểm: hàng rào chính sách ảnh, họ Holm ba
+  selftest_section25.py      49 phép kiểm: hàng rào chính sách ảnh, họ Holm ba
                              cặp, dấu hiệu số, từ điển, beam, hai kiến trúc
-                             baseline, k=3 KHÔNG chạm Friedman
+                             baseline, k=3 KHÔNG chạm Friedman, cấu hình
+                             lr/ASL/λ, `--no-resume`
 src/
   config.py                  nạp YAML, seed, token
-  data.py · data_train.py    3000 ảnh test · 6400 mẫu train + hàng rào rò rỉ
+  decoding_spec.py           MỘT đặc tả giải mã (khối `generate:`) cho cả ba candidate
+  data.py · data_train.py    3000 ảnh test · 9600 mẫu train + hàng rào rò rỉ
   labels_cls.py              dò labels.npz -> nhãn (L,3) + mask cho ClsHead
   prompts.py                 prompt dùng chung
   imaging.py                 chính sách ảnh · `unified_tensor` = ĐIỀU KIỆN 4,
@@ -211,7 +259,7 @@ src/
     r2gen.py                 Transformer 3 lớp + Relational Memory + MCLN
     adaatt.py                LSTM + Adaptive Attention + Visual Sentinel
     tokenizer.py             từ điển mức từ, DÙNG CHUNG cho cả hai
-    decoding.py              beam search dùng chung (block_trigrams…)
+    decoding.py              beam search dùng chung — luật của transformers.generate
     cider.py                 CIDEr-D + BLEU_4 — CHỈ để chọn checkpoint
   train_sota.py              Stage 0 (đk 5) + main-stage (đk 1) cho hai baseline
   metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU
@@ -219,7 +267,7 @@ src/
   stats_multi.py             ba cặp; đổi DUY NHẤT họ Holm, mọi phép tính import
                              nguyên văn từ stats_ab
   runners/gemma3*.py         base trần · +adapter · +nhánh+Experts (candidate C)
-  runners/sota.py            R2Gen + AdaAtt — nạp ckpt, sinh bằng beam của paper
+  runners/sota.py            R2Gen + AdaAtt — nạp ckpt, sinh bằng đặc tả giải mã chung
   run_section25.py           điều phối 7 stage, đọc `arms_s25`, ghi `deviations`
   report_section25.py        REPORT.md + summary.csv + pairwise_tests.csv
   push.py · tracking.py      đẩy Hub · W&B

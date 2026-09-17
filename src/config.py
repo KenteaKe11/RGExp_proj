@@ -118,7 +118,7 @@ def hf_token() -> str | None:
 def seed_everything(seed: int) -> None:
     """Cố định seed.
 
-    Decode là greedy (do_sample=false) nên sinh văn bản vốn đã tất định; seed ở
+    Decode là beam search (do_sample=false) nên sinh văn bản vốn đã tất định; seed ở
     đây phục vụ khâu THỐNG KÊ — bootstrap và permutation đều lấy mẫu ngẫu nhiên,
     và một bảng p-value không lặp lại được thì không kiểm chứng lại được.
     """

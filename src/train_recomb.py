@@ -65,7 +65,8 @@ import pandas as pd
 
 from . import (imaging, labels_cls, moe as moe_mod, pretrain_io, recombiner)
 from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
-                       build_scheduler, collate, find_target_modules,
+                       build_scheduler, collate, cycle_endpoints,
+                       find_target_modules,
                        free_vram, is_oom, is_quantized, load_base,
                        resolve_alpha, total_steps, uses_dora)
 from .config import Cfg, seed_everything
@@ -207,10 +208,6 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
         ft_lrs(cfg)
     except TrainUnusable as e:
         errors.append(str(e))
-    if "pretrained_lr_parts" in dict(cfg.get("train", {}) or {}):
-        errors.append("train.pretrained_lr_parts đã BỎ — decoder_ft không còn lr "
-                      "nhỏ riêng cho Main Head. Xoá khoá này; lr phần đã "
-                      "pretrain đặt bằng `train.pretrained_lr_div`.")
     try:
         info = labels_cls.probe(cfg)
         if not info.get("label_array"):
@@ -389,9 +386,11 @@ FREEZABLE_PARTS: dict = {
     "cls_head.main_head": lambda b: b.cls_head.head.main_head_modules(),
 }
 DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ()
-# lr của phần ĐÃ pretrain trong decoder_ft = `pretrain.schedule.max_lr` /
-# `train.pretrained_lr_div` (2). Không còn lr nhỏ riêng cho Main Head.
-DEFAULT_PRETRAINED_LR_DIV = 2.0
+# lr đỉnh TỪNG NHÓM của nhánh ở decoder_ft — `train.ft_lr`. Thứ tự = thứ tự
+# nhóm trong optimizer (sau adapter). Mỗi tham số của nhánh rơi vào ĐÚNG một
+# nhóm; `recombinator` là phần còn lại của Recombinator sau khi tách Attn.
+FT_LR_GROUPS: tuple[str, ...] = ("cls_head", "route_head", "dec_proj",
+                                 "recombinator_attn", "recombinator")
 
 
 def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
@@ -424,38 +423,69 @@ def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
 
 
 def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
-    """lr đỉnh của từng nhóm ở main-stage. -> {main, pretrained, attn_mult, ...}
+    """lr đỉnh của main-stage + phép kiểm lịch one-cycle.
 
-      * `main`        = `train.schedule.max_lr` — adapter/Experts, `route_head`,
-                        `dec_proj` (và cả nhánh ở chế độ scratch).
-      * `pretrained`  = `pretrain.schedule.max_lr` / `train.pretrained_lr_div`
-                        — phần ĐÃ qua Stage 0 (Recombinator + cls_head, gồm cả
-                        Main Head: không còn lr nhỏ riêng cho nó).
-      * ma trận Attn của Recombinator luôn chạy × `recombiner.attn_lr_mult` so
-        với nhóm chứa nó: `pretrained × 3` ở decoder_ft, `main × 3` ở scratch.
+    -> {"main", "groups", "attn_mult", "min_lr", "floor"}
 
-    Đọc lr của Stage 0 từ CHÍNH config (một config Stage 0 duy nhất — điều kiện
-    5), không từ META của checkpoint; `_train_once` cảnh báo nếu hai số lệch.
+      * `main`   = `train.schedule.max_lr` (1e-4, = Attn) — adapter/Experts
+                   (cả hai chế độ) và
+                   toàn bộ nhánh ở chế độ scratch (Attn × `attn_lr_mult`).
+      * `groups` = `train.ft_lr` — lr đỉnh từng nhóm của nhánh ở decoder_ft:
+                   cls_head 3e-4 · route_head 3e-4 · dec_proj 3e-4 ·
+                   recombinator_attn 1e-4 · recombinator 3e-5.
+
+    MỘT chu kỳ one-cycle cho CẢ stage (không restart): `train.schedule` không
+    được khai `cycle_steps`/`lr_decay`. LambdaLR nhân cùng một hệ số vào mọi
+    nhóm, nên đáy của nhóm nhỏ nhất = min(lr đỉnh) / (div × final_div) — con
+    số ấy phải bằng `train.schedule.min_lr` (1e-7), cùng kiểu kiểm với Stage 0.
+    `round_down_sig: 1` làm tròn xuống đầu warm-up và đáy từng nhóm
+    (1e-4 -> 3e-6 / 3e-7 thay vì 3.33e-6 / 3.33e-7).
     """
     tcfg = dict(cfg.get("train", {}) or {})
-    pcfg = dict(cfg.get("pretrain", {}) or {})
-    main = float(dict(tcfg.get("schedule", {}) or {}).get("max_lr", 2e-4))
-    p_max = dict(pcfg.get("schedule", {}) or {}).get("max_lr")
-    div = float(tcfg.get("pretrained_lr_div", DEFAULT_PRETRAINED_LR_DIV))
-    if not (div >= 1.0 and math.isfinite(div)):
+    sch = dict(tcfg.get("schedule", {}) or {})
+    main = float(sch.get("max_lr", 2e-4))
+    for k in ("cycle_steps", "lr_decay"):
+        if k in sch and sch[k] not in (None, 0, 1, 1.0):
+            raise TrainUnusable(
+                f"train.schedule.{k} = {sch[k]} — decoder_ft chạy MỘT chu kỳ "
+                f"one-cycle cho cả stage, không restart. Xoá khoá này.")
+    for k in ("pretrained_lr_div", "pretrained_lr_parts"):
+        if k in tcfg:
+            raise TrainUnusable(
+                f"train.{k} đã BỎ — lr decoder_ft nay khai tường minh ở "
+                f"`train.ft_lr`. Xoá khoá này.")
+    raw = dict(tcfg.get("ft_lr", {}) or {})
+    missing = [g for g in FT_LR_GROUPS if g not in raw]
+    extra = [g for g in raw if g not in FT_LR_GROUPS]
+    if missing or extra:
         raise TrainUnusable(
-            f"train.pretrained_lr_div = {div} — phải >= 1: decoder_ft chạy phần "
-            f"đã pretrain ở lr Stage 0 GIẢM đi, không tăng.")
+            f"train.ft_lr phải khai ĐÚNG {list(FT_LR_GROUPS)} "
+            f"(thiếu {missing}, thừa {extra}).")
+    groups = {g: float(raw[g]) for g in FT_LR_GROUPS}
+    bad = {g: v for g, v in groups.items() if not (v > 0 and math.isfinite(v))}
+    if bad or not (main > 0):
+        raise TrainUnusable(f"lr phải > 0: {bad or {'schedule.max_lr': main}}")
     try:
         amult = recombiner.attn_lr_mult(
             rcfg if rcfg is not None else dict(cfg.get("recombiner", {}) or {}))
     except ValueError as e:
         raise TrainUnusable(str(e)) from None
-    return {"main": main,
-            "pretrain_max_lr": None if p_max is None else float(p_max),
-            "pretrained_div": div,
-            "pretrained": (None if p_max is None else float(p_max) / div),
-            "attn_mult": amult}
+    div = float(sch.get("div_factor", 25.0))
+    fdiv = float(sch.get("final_div_factor", 100.0))
+    rsig = int(sch.get("round_down_sig", 0) or 0)
+    ends = {k: cycle_endpoints(v, div, fdiv, rsig)
+            for k, v in dict(groups, adapter=main).items()}
+    floor = min(e for _, e in ends.values())
+    min_lr = sch.get("min_lr")
+    if min_lr is not None and abs(floor - float(min_lr)) > 1e-3 * float(min_lr):
+        raise TrainUnusable(
+            f"train.schedule.min_lr = {min_lr} nhưng đáy one-cycle của nhóm nhỏ "
+            f"nhất = lr đỉnh / ({div:g} × {fdiv:g})"
+            f"{' (làm tròn xuống)' if rsig else ''} = {floor:.3e}. Sửa "
+            f"div_factor/final_div_factor hoặc min_lr cho khớp.")
+    return {"main": main, "groups": groups, "attn_mult": amult,
+            "min_lr": None if min_lr is None else float(min_lr), "floor": floor,
+            "endpoints": ends}
 
 
 def learning_pretrained_parts(branch) -> list[str]:
@@ -493,72 +523,71 @@ def apply_freeze(branch, names) -> int:
 
 
 # ══ Optimizer ═══════════════════════════════════════════════════════════════
+def _branch_group(name: str) -> str:
+    """Tên tham số của nhánh -> khoá trong `train.ft_lr`."""
+    top = name.split(".", 1)[0]
+    if top == "recombinator":
+        return ("recombinator_attn" if recombiner.is_attn_param(name)
+                else "recombinator")
+    if top in ("cls_head", "route_head", "dec_proj"):
+        return top
+    raise TrainUnusable(
+        f"tham số nhánh `{name}` không thuộc nhóm lr nào của decoder_ft "
+        f"({list(FT_LR_GROUPS)}). Khối mới phải được khai vào `train.ft_lr`.")
+
+
 def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
                     from_pretrain: bool = False, lrs: dict | None = None):
     """AdamW. Nhóm (bỏ nhóm rỗng), theo thứ tự:
 
-      scratch   : lora|experts @main · branch @main · branch_attn @main×3
-      decoder_ft: lora|experts @main · branch_pretrained @pre ·
-                  branch_pretrained_attn @pre×3 · branch @main
+      decoder_ft: lora|experts @main · cls_head · route_head · dec_proj ·
+                  recombinator_attn · recombinator   (lr đỉnh từ `train.ft_lr`)
+      scratch   : lora|experts @main · branch @main · branch_attn @main×attn_mult
 
-    `main` = `train.schedule.max_lr`; `pre` = `pretrain.schedule.max_lr` /
-    `train.pretrained_lr_div` (2e-4 / 2 = 1e-4); ×3 = `recombiner.attn_lr_mult`,
-    chỉ áp lên Q/K/V/O của Global Extractor (`recombiner.is_attn_param`).
-    Không còn nhóm lr nhỏ riêng cho Main Head: toàn bộ cls_head nằm ở `pre`.
+    Mặc định (config hiện tại): adapter 1e-4 (= Attn) · cls_head 3e-4 ·
+    route_head 3e-4 · dec_proj 3e-4 · Attn của Recombinator 1e-4 · phần còn lại
+    của Recombinator 3e-5. Không đóng băng gì.
 
-    Vì sao phần đã pretrain vẫn chạy lr THẤP hơn Stage 0: ở bước 0 của
-    decoder_ft, CE là nguồn gradient MỚI và lớn, và AdamW dịch mọi tham số đi
-    ~lr bất kể chúng đã hội tụ hay chưa. `route_head`/`dec_proj` chưa học gì nên
-    ở `main` — hạ lr một khối ngẫu nhiên là ép nó học chậm, và ở §2.4 thì đó
-    chính là router.
+    Adapter luôn đứng ĐẦU: log đọc `param_groups[0]["lr"]` làm lr chính. Một
+    LambdaLR one-cycle nhân cùng một hệ số vào mọi nhóm, nên tỉ lệ giữa các
+    nhóm giữ nguyên suốt stage.
 
-    `lrs` = `ft_lrs(cfg, rcfg)`. Bỏ trống thì chỉ dùng được ở scratch với
-    attn × mặc định (selftest cũ); decoder_ft bắt buộc truyền.
-
-    LambdaLR nhân cùng một hệ số vào mọi nhóm, nên các tỉ lệ giữ nguyên suốt lịch.
+    `lrs` = `ft_lrs(cfg, rcfg)`; bỏ trống thì chỉ dùng được ở scratch.
     """
     import torch
 
     if lrs is None:
-        lr0 = float(tcfg["schedule"].get("max_lr", 2e-4))
-        lrs = {"main": lr0, "pretrained": None,
-               "attn_mult": recombiner.DEFAULT_ATTN_LR_MULT}
+        if from_pretrain:
+            raise TrainUnusable("decoder_ft cần `lrs = ft_lrs(cfg)` (train.ft_lr).")
+        lrs = {"main": float(tcfg["schedule"].get("max_lr", 2e-4)),
+               "groups": {}, "attn_mult": recombiner.DEFAULT_ATTN_LR_MULT}
     lr = float(lrs["main"])
     amult = float(lrs["attn_mult"])
-    pre_lr = lrs.get("pretrained")
-    if from_pretrain and not pre_lr:
-        raise TrainUnusable(
-            "decoder_ft cần lr của phần đã pretrain = pretrain.schedule.max_lr / "
-            "train.pretrained_lr_div, nhưng config không khai "
-            "`pretrain.schedule.max_lr`.")
-    if from_pretrain and not (0.0 < float(pre_lr)):
-        raise TrainUnusable(f"lr phần đã pretrain = {pre_lr} — phải > 0.")
 
     lora = [p for p in peft_model.parameters() if p.requires_grad]
-    body, body_attn, pre, pre_attn = [], [], [], []
-    if branch is not None:
-        for n, p in branch.named_parameters():
-            if not p.requires_grad:
-                continue
-            attn = recombiner.is_attn_param(n)
-            if from_pretrain and n.split(".", 1)[0] in pretrain_io.PRETRAINED_MODULES:
-                (pre_attn if attn else pre).append(p)
-            else:
-                (body_attn if attn else body).append(p)
-
     wd = float(tcfg.get("weight_decay", 0.0))
     bwd = float(tcfg.get("branch_weight_decay", wd))
     groups = [{"params": lora, "lr": lr, "weight_decay": wd,
                "name": str(adapter_group)}]
     if from_pretrain:
-        groups.append({"params": pre, "lr": float(pre_lr),
-                       "weight_decay": bwd, "name": "branch_pretrained"})
-        groups.append({"params": pre_attn, "lr": float(pre_lr) * amult,
-                       "weight_decay": bwd, "name": "branch_pretrained_attn"})
-    groups.append({"params": body, "lr": lr, "weight_decay": bwd,
-                   "name": "branch"})
-    groups.append({"params": body_attn, "lr": lr * amult, "weight_decay": bwd,
-                   "name": "branch_attn"})
+        by: dict[str, list] = {g: [] for g in FT_LR_GROUPS}
+        if branch is not None:
+            for n, p in branch.named_parameters():
+                if p.requires_grad:
+                    by[_branch_group(n)].append(p)
+        for g in FT_LR_GROUPS:
+            groups.append({"params": by[g], "lr": float(lrs["groups"][g]),
+                           "weight_decay": bwd, "name": g})
+    else:
+        body, body_attn = [], []
+        if branch is not None:
+            for n, p in branch.named_parameters():
+                if p.requires_grad:
+                    (body_attn if recombiner.is_attn_param(n) else body).append(p)
+        groups.append({"params": body, "lr": lr, "weight_decay": bwd,
+                       "name": "branch"})
+        groups.append({"params": body_attn, "lr": lr * amult,
+                       "weight_decay": bwd, "name": "branch_attn"})
     groups = [g for g in groups if g["params"]]
     if not groups:
         raise TrainUnusable(
@@ -899,17 +928,6 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         model, branch, tcfg, adapter_group="experts" if spec else "lora",
         from_pretrain=bool(pre_src), lrs=lrs)
     lr_by_group = {g["name"]: float(g["lr"]) for g in opt.param_groups}
-    if pre_src and pre_report is not None:
-        try:
-            ck_lr = (pretrain_io.read_meta(pre_src).get("schedule") or {}).get("max_lr")
-        except Exception:
-            ck_lr = None
-        if ck_lr is not None and lrs["pretrain_max_lr"] is not None and \
-                abs(float(ck_lr) - lrs["pretrain_max_lr"]) > 1e-12:
-            print(f"  ⚠ checkpoint Stage 0 được train với max_lr {float(ck_lr):.2e}, "
-                  f"config khai pretrain.schedule.max_lr "
-                  f"{lrs['pretrain_max_lr']:.2e}. decoder_ft dùng số của CONFIG "
-                  f"({lrs['pretrained']:.2e}).", flush=True)
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
@@ -939,12 +957,19 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         print("  lr đỉnh: " + " · ".join(
             f"{k} {v:.2e}" for k, v in lr_by_group.items())
             + f" (Attn × {lrs['attn_mult']:g})", flush=True)
+    _sch = dict(tcfg["schedule"])
+    curve = {}
+    for k, v in lr_by_group.items():
+        a, b = cycle_endpoints(v, float(_sch.get("div_factor", 25.0)),
+                               float(_sch.get("final_div_factor", 100.0)),
+                               int(_sch.get("round_down_sig", 0) or 0))
+        curve[k] = (a, v, b)
     if pre_src:
-        print(f"  decoder_ft: fine-tune TOÀN BỘ · lr đỉnh "
-              + " · ".join(f"{k} {v:.2e}" for k, v in lr_by_group.items())
-              + f" (phần đã pretrain = {lrs['pretrain_max_lr']:.2e} / "
-              f"{lrs['pretrained_div']:g}; Attn × {lrs['attn_mult']:g})"
-              f" · đóng băng {', '.join(frozen) or '—'}"
+        print(f"  decoder_ft: fine-tune TOÀN BỘ · MỘT chu kỳ one-cycle "
+              f"{steps} bước · lr đầu -> đỉnh -> đáy: "
+              + " · ".join(f"{k} {a:.0e}->{v:.0e}->{b:.0e}"
+                           for k, (a, v, b) in curve.items())
+              + f" · đóng băng {', '.join(frozen) or '—'}"
               f" · λ = {lam} warmup {lam_warm:.0%}"
               + ("" if lam_warm else " (TẮT — ClsHead không còn ngẫu nhiên)"),
               flush=True)
@@ -1039,6 +1064,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                     f"train/{aid}/loss": total_loss, f"train/{aid}/ce": step_ce,
                     f"train/{aid}/asl": step_asl, f"train/{aid}/lambda": lam_now,
                     f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
+                    **{f"train/{aid}/lr_{g['name']}": g["lr"]
+                       for g in opt.param_groups[1:]},
                     f"train/{aid}/pct": 100.0 * (step + 1) / steps,
                     **({f"train/{aid}/dec_proj_rel_change": dproj}
                        if branch is not None else {}),
@@ -1106,6 +1133,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "n_dec_tokens": int(bstats.get("n_dec_tokens", 0)),
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,
+        "asl": dict(ccfg.get("asl", {}) or {}) if use_branch else None,
         # Chế độ huấn luyện của candidate NÀY, ghi cạnh số của nó. `report_*`
         # đọc từ đây: một bảng §2.3 trộn hai cột, một cột from-scratch và một
         # cột đã pretrain, là một bảng không so được — và không có chỗ nào khác
@@ -1114,9 +1142,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "pretrain_init": (str(pre_src) if pre_src else None),
         "pretrain_report": pre_report,
         "param_group_max_lr": lr_by_group,
-        "attn_lr_mult": lrs["attn_mult"],
-        "pretrained_lr": (lrs["pretrained"] if pre_src else None),
-        "pretrained_lr_div": (lrs["pretrained_div"] if pre_src else None),
+        "attn_lr_mult": (None if pre_src else lrs["attn_mult"]),
+        "ft_lr": (dict(lrs["groups"]) if pre_src else None),
+        "min_lr": lrs["floor"],
+        "lr_curve_start_peak_end": curve,
         "freeze_pretrained": (bool(tcfg.get("freeze_pretrained", False))
                               if pre_src else None),
         "frozen_after_pretrain": list(frozen),

@@ -38,7 +38,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .backbone import TrainUnusable, build_scheduler, free_vram, is_oom, one_cycle
+from .backbone import (TrainUnusable, build_scheduler, cycle_endpoints,
+                       free_vram, is_oom, one_cycle_lr)
 from .config import Cfg
 from .sota import build as build_sota
 from .sota import count_params, param_groups
@@ -220,11 +221,12 @@ def _train_epoch(model, loader, optim, sched, cfg: Cfg, device, accum: int,
 
 def _evaluate(model, tok, val_df: pd.DataFrame, cfg: Cfg, device, dcfg: dict,
               monitor: str, batch_size: int) -> tuple[float, list[str]]:
-    """Sinh trên val bằng ĐÚNG bộ giải mã của setup gốc, rồi chấm `monitor`.
+    """Sinh trên val bằng ĐÚNG bộ giải mã sẽ dùng lúc chấm, rồi chấm `monitor`.
 
-    Dùng beam của paper chứ không phải greedy cho nhanh: checkpoint được chọn
-    theo điểm đo được ở đây, và chọn bằng một bộ giải mã khác bộ sẽ dùng lúc
-    chấm thật là chọn nhầm checkpoint một cách có hệ thống.
+    `dcfg` = `decoding_spec.sota_kwargs(cfg)` — cùng đặc tả với khâu sinh của
+    cả ba candidate. Checkpoint được chọn theo điểm đo được ở đây, và chọn bằng
+    một bộ giải mã khác bộ sẽ dùng lúc chấm thật là chọn nhầm checkpoint một
+    cách có hệ thống.
     """
     import torch
 
@@ -265,7 +267,12 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     spec = main_stage_spec(name, mcfg)
     pcfg = dict(cfg.get("pretrain", {}) or {})
     stcfg = dict(cfg.get("sota_train", {}) or {})
-    dcfg = dict(mcfg.get("decoding", {}) or {})
+    from .decoding_spec import DecodingSpecError, sota_kwargs
+
+    try:
+        dcfg = sota_kwargs(cfg)
+    except DecodingSpecError as e:
+        raise TrainUnusable(str(e)) from e
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Seed đặt lại NGAY TRƯỚC candidate này — thứ tự chạy không được phép ảnh
@@ -309,15 +316,17 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
             # MỘT chu kỳ = MỘT epoch: bước được lấy modulo số bước mỗi epoch,
             # nên lr quay lại đỉnh ở đầu mỗi epoch thay vì tắt dần suốt 8 epoch.
             span = max(1, steps_per_epoch // cycle_per_epoch)
-            return max_lr0 * one_cycle(
-                step % span, span, float(p_sched.get("pct_start", 0.1)),
+            return one_cycle_lr(
+                step % span, span, max_lr0, float(p_sched.get("pct_start", 0.1)),
                 float(p_sched.get("div_factor", 300.0)),
                 float(p_sched.get("final_div_factor", 300.0)),
-                str(p_sched.get("anneal", "cos")))
+                str(p_sched.get("anneal", "cos")),
+                int(p_sched.get("round_down_sig", 0) or 0))
 
         print(f"  ⚙ STAGE 0 ({info}) · {n_ep0} epoch × {steps_per_epoch} bước · "
               f"batch hiệu dụng {eff} ({micro0}×{accum0}) · "
-              f"lr {max_lr0:g} -> {max_lr0 / float(p_sched.get('div_factor', 300.0)) / float(p_sched.get('final_div_factor', 300.0)):g} · "
+              f"lr {max_lr0:g} -> "
+              f"{cycle_endpoints(max_lr0, float(p_sched.get('div_factor', 300.0)), float(p_sched.get('final_div_factor', 300.0)), int(p_sched.get('round_down_sig', 0) or 0))[1]:g} · "
               f"wd {pcfg.get('weight_decay')}", flush=True)
         gstep = 0
         s0_losses = []
@@ -419,6 +428,7 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
                            "lr_visual": spec["lr_visual"],
                            "lr_rest_paper": spec["lr_rest"],
                            "pretrained_lr_mult": mult,
+                           "decoding": dcfg,
                            "lr_rest_effective": spec["lr_rest"] * mult,
                            "monitor": spec["monitor"],
                            "best_score": (None if best == -float("inf") else best),

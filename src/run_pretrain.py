@@ -187,6 +187,8 @@ def _now_conditions(cfg: Cfg, p: dict) -> dict:
         "n_train": int(p.get("n_train", 0) or 0),
         "select_metric": str(p.get("select_metric", "cls_f1_pos")),
         "weight_decay": p.get("weight_decay"),
+        "attn_lr_mult": (cfg.get("recombiner", {}) or {}).get("attn_lr_mult", 3.0),
+        "asl": dict((cfg.get("classifier", {}) or {}).get("asl", {}) or {}),
     }
 
 
@@ -205,7 +207,11 @@ def _ckpt_conditions(meta: dict) -> dict:
         "grad_accum": meta.get("grad_accum"),
         "n_train": d.get("n_train"),
         "select_metric": meta.get("select_metric"),
-        "weight_decay": None,
+        # Ba khoá dưới chỉ có trong META do bản code hiện tại ghi; ckpt cũ trả
+        # None và `_drift` bỏ qua chúng.
+        "weight_decay": meta.get("weight_decay"),
+        "attn_lr_mult": meta.get("attn_lr_mult"),
+        "asl": meta.get("asl"),
     }
 
 

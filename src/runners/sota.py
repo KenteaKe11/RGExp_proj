@@ -2,7 +2,10 @@
 
 MỘT file cho cả hai, có chủ ý: chúng khác nhau đúng một dòng (tên mô hình đưa
 cho `sota.build`), và mọi thứ còn lại — nạp checkpoint, nạp từ điển, dựng tensor
-ảnh theo `image_policy`, gọi beam search của setup gốc — phải giống hệt nhau.
+ảnh theo `image_policy`, gọi beam search dùng chung — phải giống hệt nhau.
+
+Giải mã đọc `decoding_spec.sota_kwargs(cfg)` — CÙNG khối `generate:` mà My
+Gemma đưa cho `transformers.generate`, không phải `sota.*.decoding` của paper.
 Hai file nghĩa là hai chỗ để lệch, và một lệch ở đây (ví dụ một bên quên
 `model.eval()`) cho ra hai cột số trông bình thường.
 
@@ -18,7 +21,7 @@ from .base import Runner, RunnerUnusable
 
 
 class SotaRunner(Runner):
-    """Nạp `model_best.pt` + `tokenizer.json`, sinh bằng beam của paper gốc."""
+    """Nạp `model_best.pt` + `tokenizer.json`, sinh bằng đặc tả giải mã chung."""
 
     name = "sota"
     setup = ""
@@ -43,7 +46,12 @@ class SotaRunner(Runner):
                 f"giải mã bằng từ điển khác sinh ra văn bản trôi chảy và sai "
                 f"nghĩa hoàn toàn.")
         self.tok = WordTokenizer.load(tok_path)
-        self.dcfg = dict(self.mcfg.get("decoding", {}) or {})
+        from ..decoding_spec import DecodingSpecError, sota_kwargs
+
+        try:
+            self.dcfg = sota_kwargs(self.cfg)
+        except DecodingSpecError as e:
+            raise RunnerUnusable(str(e)) from e
 
         scfg = dict(self.cfg.get("sota", {}) or {})
         model = build_sota(self.setup, len(self.tok), scfg)
@@ -70,8 +78,9 @@ class SotaRunner(Runner):
         print(f"  ✓ {self.setup}: nạp {ckpt.name}"
               + (f" (epoch {ep}" + (f", {mon}={sc:.4f}" if sc is not None else "")
                  + ")" if ep is not None else "")
-              + f" · từ điển {len(self.tok)} từ · beam "
-              f"{self.dcfg.get('beam_size', 3)}", flush=True)
+              + f" · từ điển {len(self.tok)} từ · giải mã chung: beam "
+              f"{self.dcfg['num_beams']}, lp {self.dcfg['length_penalty']:g}, "
+              f"tối đa {self.tok.max_seq_length - 1} token", flush=True)
 
     def generate_batch(self, batch: list[dict]) -> list[str]:
         import torch

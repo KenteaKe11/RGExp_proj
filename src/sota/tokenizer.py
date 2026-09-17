@@ -10,7 +10,7 @@ MỘT từ điển cho CẢ HAI. `sota.r2gen.tokenizer` là khối duy nhất kh
 (`max_seq_length: 60`, `min_word_frequency: 3`); AdaAtt không khai gì về từ
 điển trong setup gốc, nên nó dùng lại đúng từ điển ấy thay vì dựng một bản thứ
 hai với ngưỡng khác. Hai từ điển khác nhau nghĩa là hai không gian nhãn khác
-nhau, và khi đó "cùng 6400 mẫu train" không còn là cùng một bài toán.
+nhau, và khi đó "cùng 9600 mẫu train" không còn là cùng một bài toán.
 
 Từ điển được ghi ra `<run_dir>/tokenizer.json` và ĐỌC LẠI ở mọi stage sau. Dựng
 lại từ train_df mỗi lần là mời một lỗi im lặng: chỉ cần thứ tự hàng đổi (hay

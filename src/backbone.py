@@ -261,6 +261,42 @@ def one_cycle(step: int, total: int, pct_start: float, div_factor: float,
     return end + (1.0 - end) * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
+def round_down_sig(x: float, digits: int = 1) -> float:
+    """Làm tròn XUỐNG còn `digits` chữ số có nghĩa: 6.667e-7 -> 6e-7,
+    3.333e-6 -> 3e-6. Số đã tròn giữ nguyên (1e-5 -> 1e-5, kể cả khi phép chia
+    dấu chấm động trả 9.999999999999999e-06)."""
+    x = float(x)
+    digits = int(digits)
+    if digits <= 0 or not (x > 0 and math.isfinite(x)):
+        return x
+    e = math.floor(math.log10(x)) - digits + 1
+    k = math.floor(x / 10.0 ** e * (1.0 + 1e-9))
+    if k >= 10 ** digits:          # log10 làm tròn lệch một bậc
+        k //= 10
+        e += 1
+    return float(f"{k}e{e}")
+
+
+def cycle_endpoints(max_lr: float, div_factor: float, final_div_factor: float,
+                    round_sig: int = 0) -> tuple[float, float]:
+    """(lr đầu warm-up, lr đáy) của MỘT chu kỳ, đã làm tròn xuống nếu
+    `round_sig` > 0. lr đỉnh không bao giờ bị làm tròn."""
+    start = float(max_lr) / float(div_factor)
+    end = start / float(final_div_factor)
+    if round_sig:
+        start, end = round_down_sig(start, round_sig), round_down_sig(end, round_sig)
+    return start, end
+
+
+def one_cycle_lr(step: int, total: int, max_lr: float, pct_start: float,
+                 div_factor: float, final_div_factor: float,
+                 anneal: str = "cos", round_sig: int = 0) -> float:
+    """lr TUYỆT ĐỐI tại `step` — `one_cycle` với hai đầu mút đã làm tròn."""
+    start, end = cycle_endpoints(max_lr, div_factor, final_div_factor, round_sig)
+    return float(max_lr) * one_cycle(step, total, pct_start,
+                                     float(max_lr) / start, start / end, anneal)
+
+
 def build_scheduler(optimizer, total_steps: int, scfg: dict):
     """Build the warm-up/cosine scheduler.
 
@@ -269,6 +305,12 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
     the implied ``min_lr`` receive ``lr_decay ** epoch``. It is deliberately
     expressed in optimizer steps (not dataloader batches), so gradient
     accumulation cannot silently shift a restart.
+
+    ``round_down_sig`` (>0) làm tròn XUỐNG lr đầu warm-up và lr đáy của TỪNG
+    nhóm (lr đỉnh = lr lúc dựng optimizer) còn chừng ấy chữ số có nghĩa: nhóm
+    1e-4 với div 30 · final_div 10 đi 3e-6 -> 1e-4 -> 3e-7 thay vì
+    3.33e-6 -> 1e-4 -> 3.33e-7. Mỗi nhóm khi đó có hệ số riêng (một LambdaLR
+    với danh sách hàm).
     """
     impl = str(scfg.get("impl", "lambda")).lower()
     pct = float(scfg.get("pct_start", 0.1))
@@ -277,11 +319,18 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
     anneal = str(scfg.get("anneal", "cos"))
     cycle_steps = int(scfg.get("cycle_steps", 0) or 0)
     lr_decay = float(scfg.get("lr_decay", 1.0))
+    rsig = int(scfg.get("round_down_sig", 0) or 0)
+    if rsig < 0:
+        raise TrainUnusable("schedule.round_down_sig phải >= 0")
     if cycle_steps < 0:
         raise TrainUnusable("schedule.cycle_steps phải >= 0")
     if not 0.0 < lr_decay <= 1.0:
         raise TrainUnusable("schedule.lr_decay phải nằm trong (0, 1]")
     if impl == "torch":
+        if rsig:
+            raise TrainUnusable(
+                "schedule.impl=torch không hỗ trợ round_down_sig. Dùng "
+                "impl=lambda.")
         if cycle_steps:
             raise TrainUnusable(
                 "schedule.impl=torch không hỗ trợ warmup + cosine restart. "
@@ -299,17 +348,26 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
             cycle_momentum=bool(scfg.get("cycle_momentum", False)))
     from torch.optim.lr_scheduler import LambdaLR
 
-    def _factor(step: int) -> float:
-        if not cycle_steps:
-            return one_cycle(step, total_steps, pct, dv, fdv, anneal)
-        # LambdaLR calls us at 0 initially, then after every optimizer step.
-        # At exactly k*cycle_steps, start the next cycle at its decayed floor.
-        step = int(step)
-        epoch_idx = step // cycle_steps
-        return (lr_decay ** epoch_idx) * one_cycle(
-            step % cycle_steps, cycle_steps, pct, dv, fdv, anneal)
+    def _make(g_dv: float, g_fdv: float):
+        def _factor(step: int) -> float:
+            if not cycle_steps:
+                return one_cycle(step, total_steps, pct, g_dv, g_fdv, anneal)
+            # LambdaLR calls us at 0 initially, then after every optimizer step.
+            # At exactly k*cycle_steps, start the next cycle at its decayed floor.
+            step = int(step)
+            epoch_idx = step // cycle_steps
+            return (lr_decay ** epoch_idx) * one_cycle(
+                step % cycle_steps, cycle_steps, pct, g_dv, g_fdv, anneal)
+        return _factor
 
-    return LambdaLR(optimizer, _factor)
+    if not rsig:
+        return LambdaLR(optimizer, _make(dv, fdv))
+    fns = []
+    for g in optimizer.param_groups:
+        peak = float(g["lr"])
+        start, end = cycle_endpoints(peak, dv, fdv, rsig)
+        fns.append(_make(peak / start, start / end))
+    return LambdaLR(optimizer, fns)
 
 
 # ── Dữ liệu -> tensor ───────────────────────────────────────────────────────

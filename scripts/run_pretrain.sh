@@ -59,14 +59,18 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# lr Stage 0: max 2e-4, weight_decay 0.8; ma trận Attn (Q/K/V/O) của
+# lr Stage 0: 6e-6 -> 2e-4 -> 6e-7 mỗi epoch, weight_decay 0.8; ma trận Attn (Q/K/V/O) của
 # Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 6e-4. Ckpt dở dang ghi
 # bằng optimizer một nhóm KHÔNG nối tiếp được: chạy với --no-resume.
+# Sup Loss: ASL gamma_neg [4, 3, 0] (neg/pos/uncertain) · gamma_pos 0 · clip
+# 0.05. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.
 #
-# `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ. Phần đã pretrain chạy lr
-# Stage 0 / 2 = 1e-4 (`train.pretrained_lr_div`), Attn × 3 = 3e-4; Experts,
-# route_head, dec_proj ở 3e-4. Không còn lr nhỏ riêng cho Main Head. λ-warmup
-# tắt, vốn chỉ có lý do khi ClsHead còn ngẫu nhiên. Làm lại decoder_ft từ đầu:
+# `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ, lr đỉnh `train.ft_lr`:
+# Sup Head / Route Head / Concat Linear 3e-4 · Attn = Experts (LoRA) 1e-4 ·
+# phần còn lại của Recombinator 3e-5. MỘT chu kỳ one-cycle cho cả stage, đáy
+# nhỏ nhất 1e-7. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
+# có nghĩa (`round_down_sig: 1`: 6.67e-7 -> 6e-7, 3.33e-7 -> 3e-7). λ = 0.4, warmup tắt — vốn chỉ có lý do khi ClsHead còn ngẫu
+# nhiên. Làm lại decoder_ft từ đầu:
 #     bash scripts/run_section25.sh --no-resume
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail

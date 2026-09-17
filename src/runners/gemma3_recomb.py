@@ -28,12 +28,14 @@ cấu hình ấy rồi nạp trọng số vào, và ba chỗ nữa phải đúng
 
   4. Router ở chế độ `eval` -> KHÔNG có nhiễu Gauss. Nhiễu là cơ chế thăm dò
      lúc học; để nó chạy lúc sinh là để cùng một ảnh ra hai báo cáo khác nhau ở
-     hai lần chạy, và cả §2.4 chấm greedy chính vì muốn con số lặp lại được.
+     hai lần chạy, và §2.5 chấm bằng beam search tất định chính vì muốn con số
+     lặp lại được.
   5. Trọng số định tuyến phải nằm trong `RoutingContext` TRƯỚC `generate`, và
      bị xoá NGAY SAU. `strict=True` biến "quên set" thành một exception thay vì
      một model lặng lẽ chạy nền trần — vẫn ra tiếng Anh đọc được.
-  6. `num_beams = 1`. Beam search nhân bản batch, nên hàng thứ i của chuỗi
-     không còn là ảnh thứ i và mọi ảnh bị định tuyến bằng expert của ảnh khác.
+  6. Beam search (`generate.num_beams`, §2.5 = 3) nhân mỗi ảnh thành k hàng
+     liền nhau, nên trọng số định tuyến được đặt với `repeat = k` và nhân bản
+     theo đúng thứ tự đó. `num_return_sequences` phải là 1.
      `RoutingContext.get` kiểm số hàng và DỪNG nếu lệch.
 """
 from __future__ import annotations
@@ -193,14 +195,16 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
               f"{st['expert_params']:,} tham số · nạp {meta.get('n_tensors')} "
               f"tensor từ {adapter_dir.name}", flush=True)
         print(f"  ✓ Router: soft clip C={m.get('logit_clip_c', 1.2)} -> softmax "
-              f"-> top-{k} · nhiễu TẮT khi sinh (greedy phải lặp lại được)",
-              flush=True)
-        if int(self.gen_kwargs().get("num_beams", 1) or 1) != 1:
+              f"-> top-{k} · nhiễu TẮT khi sinh (beam search phải lặp lại được)"
+              f" · trọng số × {self._n_beams()} theo beam", flush=True)
+        if int(self.gen_kwargs().get("num_return_sequences", 1) or 1) != 1:
             raise RunnerUnusable(
-                "generate.num_beams != 1 với MoE. Beam search nhân bản batch, "
-                "nên hàng thứ i của chuỗi không còn là ảnh thứ i và mọi ảnh bị "
-                "định tuyến bằng expert của ảnh khác.")
+                "generate.num_return_sequences != 1 với MoE: mỗi ảnh chỉ được "
+                "trả một báo cáo, và định tuyến chỉ nhân bản theo num_beams.")
         return base
+
+    def _n_beams(self) -> int:
+        return max(1, int(self.gen_kwargs().get("num_beams", 1) or 1))
 
     def generate_batch(self, batch: list[dict]) -> list[str]:
         """Sinh cho một batch, đi ĐÚNG con đường của khâu huấn luyện."""
@@ -232,7 +236,10 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                             "candidate này có Experts nhưng nhánh trả route = "
                             "None — nhánh đã ghi ở chế độ §2.3 (route_enabled = "
                             "false). Huấn luyện lại candidate này.")
-                    self._route_ctx.set(self._router(route[0], route[1])["weights"])
+                    # generate nhân mỗi ảnh thành num_beams hàng liền nhau.
+                    self._route_ctx.set(
+                        self._router(route[0], route[1])["weights"],
+                        repeat=self._n_beams())
                 # Đệm TRÁI -> mỗi hàng có vị trí token ảnh riêng.
                 at = recombiner.image_start_indices(ids, self._img_token_id)
                 kw.update(recombiner.inject_tokens(

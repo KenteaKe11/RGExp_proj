@@ -682,6 +682,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "param_groups": n_by_group,
         "param_group_max_lr": {g["name"]: float(g["lr"]) for g in opt.param_groups},
         "attn_lr_mult": recombiner.attn_lr_mult(rcfg),
+        "weight_decay": float(pcfg.get("weight_decay", 0.01)),
+        "asl": dict((cfg.get("classifier", {}) or {}).get("asl", {}) or {}),
     }
 
     hist_path = run_dir / "history.csv"

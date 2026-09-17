@@ -213,9 +213,9 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path, run_dir: Path) -> Cfg
         "id": aid, "name": arm.get("name", aid), "runner": arm["runner"],
         "ckpt": str(adapter_root / aid / "model_best.pt"),
         "tokenizer": str(run_dir / "tokenizer.json"),
-        "decoding": dict((cfg["sota"][setup].get("decoding", {}) or {})),
-        # Batch của khâu SINH, không phải của khâu huấn luyện: beam nhân số
-        # chuỗi lên `beam_size` lần, nên con số an toàn ở đây nhỏ hơn micro_batch.
+        # Giải mã KHÔNG đọc `sota.*.decoding` — runner dùng `decoding_spec`
+        # (khối `generate:` chung). Batch của khâu SINH: beam nhân số chuỗi lên
+        # `num_beams` lần, nên con số an toàn ở đây nhỏ hơn micro_batch.
         "batch_size": max(1, int(st.get("infer_batch", st.get("micro_batch", 8)))),
         "disable_compile": True, "optional": False,
     })
@@ -259,8 +259,8 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
                 f"cục bộ (`strategy: {ft.get('strategy')}`). Stage 0 thống nhất "
                 f"được thêm vào từ ngoài, rồi main-stage chạy đúng setup gốc.")
     tc = dict(cfg.get("train") or {})
-    div = float(tc.get("pretrained_lr_div", 2.0))
-    p_lr = (p.get("schedule") or {}).get("max_lr")
+    ftl = dict(tc.get("ft_lr") or {})
+    tsch = dict(tc.get("schedule") or {})
     amult = float((cfg.get("recombiner") or {}).get("attn_lr_mult", 3.0))
     frozen = tc.get("freeze_after_pretrain") or []
     if isinstance(frozen, str):
@@ -270,19 +270,39 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
     out.append(
         f"ĐIỀU KIỆN 5 — phần đã qua Stage 0 của hai baseline chạy main-stage ở "
         f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`). My Gemma "
-        f"(decoder_ft) fine-tune TOÀN BỘ: phần đã pretrain chạy lr Stage 0 / "
-        f"{div:g} (= {p_lr} / {div:g}, `train.pretrained_lr_div`), ma trận "
-        f"Attn của Recombinator × {amult:g} (`recombiner.attn_lr_mult`, cả ở "
-        f"Stage 0); đóng băng: {', '.join(frozen) or 'không'} "
-        f"(`train.freeze_after_pretrain`).")
+        f"Stage 0 cho ma trận Attn của Recombinator lr × {amult:g} "
+        f"(`recombiner.attn_lr_mult`). decoder_ft fine-tune TOÀN BỘ, lr đỉnh "
+        f"từng nhóm (`train.ft_lr`): "
+        + ", ".join(f"{k} {float(v):.0e}" for k, v in ftl.items())
+        + f"; adapter (LoRA/Experts) {float(tsch.get('max_lr', 0)):.0e}; MỘT chu "
+        f"kỳ one-cycle cho cả stage, đầu warm-up và đáy làm tròn xuống "
+        f"(`round_down_sig` {tsch.get('round_down_sig', 0)}), đáy nhỏ nhất "
+        f"{float(tsch.get('min_lr', 0)):.0e}; đóng băng: "
+        f"{', '.join(frozen) or 'không'} (`train.freeze_after_pretrain`).")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
         f"KỸ THUẬT — batch của paper được chia thành nhiều lượt forward "
         f"(`sota_train.micro_batch` = {st.get('micro_batch')}); batch HIỆU DỤNG, "
         f"số bước và đường cong lr không đổi.")
+    from . import decoding_spec
+
+    diffs = {a["id"]: decoding_spec.paper_differences(cfg, a["setup"])
+             for a in arms if a["kind"] == "sota"}
+    out.append(
+        f"GIẢI MÃ — cả ba candidate sinh bằng MỘT đặc tả (`generate:`, "
+        f"{decoding_spec.describe(cfg)}); R2Gen/AdaAtt dùng bản chép lại "
+        f"`_beam_search` của transformers 4.52 (selftest đối chiếu từng token), cả "
+        f"khi chọn checkpoint trên val. Khối "
+        f"`sota.*.decoding` của paper không được đọc"
+        + ("; lệch so với paper: " + "; ".join(
+            f"{k}: {', '.join(v)}" for k, v in diffs.items() if v)
+           if any(diffs.values()) else "")
+        + ". Độ dài tối đa khác nhau theo từ điển: My Gemma "
+        f"{decoding_spec.unified(cfg)['max_new_tokens']} subword, hai baseline "
+        f"`max_seq_length − 1` từ.")
     out.append(
         "KHÔNG ĐỔI — R2Gen và AdaAtt chạy toàn bộ số epoch, optimizer, "
-        "scheduler, beam và tiêu chí dừng sớm của paper gốc; My Gemma chạy "
+        "scheduler và tiêu chí dừng sớm của paper gốc; My Gemma chạy "
         "lịch của §2.3/§2.4. Đó là một khác biệt THẬT giữa ba cột và nó thuộc "
         "phần Giới hạn, không phải một lỗi cần sửa.")
     return out
@@ -368,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub.\n"
               "  Phép thử ĐƯỜNG ỐNG, không phải phép dò VRAM: nó chạy với đúng "
               "micro_batch trong config,\n  và vài bước trên 16 mẫu không nói "
-              "được gì về VRAM đỉnh của 6400 mẫu ở 512px.", flush=True)
+              "được gì về VRAM đỉnh của 9600 mẫu ở 512px.", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
     if a.no_wandb:

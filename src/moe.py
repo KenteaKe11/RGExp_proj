@@ -144,22 +144,37 @@ class RoutingContext:
         một model KHÔNG có expert nào — và cột số của nó vẫn trông bình thường,
         nên `strict` bên dưới biến ca đó thành một exception.
       * `strict` (mặc định True): forward mà chưa set trọng số là DỪNG.
-      * kiểm batch: `x.shape[0]` phải khớp `weights.shape[0]`. Đây là cái lưới
-        bắt beam search / batch bị nhân bản trong `generate` — khi đó hàng thứ
-        i của chuỗi không còn là ảnh thứ i, và định tuyến bị lệch mẫu mà không
-        có gì báo.
+      * kiểm batch: `x.shape[0]` phải bằng `weights.shape[0] × repeat`.
+
+    Beam search (`num_beams = k`): `generate` nhân mỗi ảnh thành k hàng LIỀN
+    NHAU (`repeat_interleave(k, 0)`), và khi sắp lại beam nó chỉ đổi chỗ trong
+    khối k hàng của chính ảnh đó. Nên `set(w, repeat=k)` rồi trả
+    `w.repeat_interleave(k, 0)` là đúng ảnh cho đúng hàng ở MỌI bước. Số hàng
+    khác `B × k` (quên khai `repeat`, `num_return_sequences > 1`, batch sót lại)
+    vẫn là DỪNG.
     """
 
     def __init__(self, strict: bool = True):
         self.weights: torch.Tensor | None = None
         self.strict = bool(strict)
         self.n_experts = 0
+        self.repeat = 1
+        self._expanded: torch.Tensor | None = None
 
-    def set(self, w: torch.Tensor) -> None:
+    def set(self, w: torch.Tensor, repeat: int = 1) -> None:
+        """`repeat` = số hàng mà `generate` tạo cho mỗi ảnh (= num_beams)."""
+        repeat = int(repeat)
+        if repeat < 1:
+            raise ValueError(f"repeat = {repeat} — phải >= 1")
         self.weights = w
+        self.repeat = repeat
+        self._expanded = (w if repeat == 1
+                          else w.repeat_interleave(repeat, dim=0))
 
     def clear(self) -> None:
         self.weights = None
+        self._expanded = None
+        self.repeat = 1
 
     def get(self, batch: int) -> torch.Tensor | None:
         w = self.weights
@@ -172,14 +187,15 @@ class RoutingContext:
                     "thật. Gọi `route_ctx.set(weights)` trước forward (xem "
                     "train_recomb._forward_loss và runners/gemma3_recomb).")
             return None
-        if w.shape[0] != batch:
+        if w.shape[0] * self.repeat != batch:
             raise RuntimeError(
-                f"trọng số định tuyến có {w.shape[0]} hàng nhưng chuỗi có "
-                f"{batch}. Gần như luôn là `generate` đã nhân bản batch "
-                f"(num_beams > 1, num_return_sequences > 1): khi đó hàng thứ i "
-                f"không còn là ảnh thứ i và mọi ảnh bị định tuyến bằng expert "
-                f"của ảnh khác. §2.4 sinh greedy, num_beams = 1.")
-        return w
+                f"trọng số định tuyến có {w.shape[0]} hàng × repeat "
+                f"{self.repeat} nhưng chuỗi có {batch}. Gần như luôn là "
+                f"`generate` đã nhân bản batch mà `set(..., repeat=num_beams)` "
+                f"không được khai (hoặc num_return_sequences > 1): khi đó hàng "
+                f"thứ i không còn là ảnh thứ i và ảnh bị định tuyến bằng expert "
+                f"của ảnh khác.")
+        return self._expanded
 
 
 # ══ Router ══════════════════════════════════════════════════════════════════
@@ -240,7 +256,7 @@ class Router(nn.Module):
 
         # ── 1. Learnable Gaussian Noise ────────────────────────────────────
         # CHỈ khi train. Ở khâu sinh, nhiễu làm cùng một ảnh ra hai báo cáo khác
-        # nhau ở hai lần chạy — và §2.4 chấm 3000 ảnh bằng greedy decode chính
+        # nhau ở hai lần chạy — và §2.5 chấm 3000 ảnh bằng beam search tất định chính
         # vì muốn con số lặp lại được.
         sigma = None
         if self.noise and self.training and log_sigma is not None:

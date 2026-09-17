@@ -245,6 +245,22 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                      f"được · {st.get('minutes', '—')} phút · VRAM đỉnh "
                      f"{st.get('vram_peak_gb', '—')} GB · chế độ "
                      f"`{st.get('train_mode', '—')}`.\n")
+            lrs = st.get("param_group_max_lr") or {}
+            if lrs:
+                L.append(_tbl(["nhóm tham số", "max_lr"],
+                              [[f"`{k}`", f"{float(v):.2e}"]
+                               for k, v in lrs.items()]))
+                L.append("")
+            if st.get("train_mode") == "decoder_ft":
+                mn = st.get("min_lr")
+                L.append(f"lr đỉnh theo `train.ft_lr`, MỘT chu kỳ one-cycle cho "
+                         f"cả stage ({st.get('steps', '—')} bước), đáy nhỏ nhất "
+                         f"{'—' if mn is None else format(float(mn), '.1e')}; "
+                         f"đóng băng: "
+                         f"{', '.join(st.get('frozen_after_pretrain') or []) or 'không'}.")
+            L.append(f"Sup Loss: λ = {st.get('lambda_sup', '—')} (warmup "
+                     f"{st.get('lambda_warmup_pct', '—')}) · ASL "
+                     f"{json.dumps(st.get('asl'), ensure_ascii=False)}.\n")
 
     # ── 7. Giới hạn ────────────────────────────────────────────────────────
     L.append("## 7. Giới hạn\n")

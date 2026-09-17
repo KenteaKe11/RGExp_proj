@@ -566,6 +566,20 @@ nạp sẽ tưởng Route Head đã được pretrain.
 | nhãn | {meta.get("n_labels")} bệnh lý × {meta.get("n_classes")} lớp |
 | seed | {meta.get("seed")} |
 
+## Tối ưu hoá
+
+| | |
+|---|---|
+| max_lr (Recombinator + Classification Head) | {(meta.get("schedule") or {}).get("max_lr")} |
+| max_lr theo nhóm | {meta.get("param_group_max_lr")} |
+| Attn (Q/K/V/O) của Recombinator | × {meta.get("attn_lr_mult")} |
+| weight_decay | {meta.get("weight_decay")} |
+| ASL | {meta.get("asl")} |
+| lịch | warm-up + cosine, restart mỗi epoch, lr_decay {(meta.get("schedule") or {}).get("lr_decay")} |
+
+Ở `decoder_ft`, lr của từng phần khai tường minh ở `train.ft_lr` (Attn và
+phần còn lại của Recombinator tách nhóm), một chu kỳ one-cycle cho cả stage.
+
 ## Nạp lại
 
 ```bash

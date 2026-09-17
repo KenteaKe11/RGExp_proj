@@ -3,7 +3,7 @@
 Cài lại theo setup gốc trong `configs/section25.yaml` (`sota.adaatt`). Bài báo
 gốc là Torch/Lua (`jiasenlu/AdaptiveAttention`) nên không có gì để `pip
 install`, và khối `initialization` của nó nói mọi thứ ngoài ResNet-152 là
-`random`. Cài lại đúng kiến trúc rồi huấn luyện trên 6400 mẫu của tập này
+`random`. Cài lại đúng kiến trúc rồi huấn luyện trên 9600 mẫu của tập này
 CHÍNH LÀ điều kiện 1.
 
 Cái làm nên bài báo là **visual sentinel**: ở mỗi bước, mô hình tự quyết định
@@ -163,7 +163,7 @@ class AdaAtt(nn.Module):
         from .decoding import beam_search
 
         v_proj, v_att, v_g = self.encode_image(pixel_values)
-        k = max(1, int(dcfg.get("beam_size", 3)))
+        k = max(1, int(dcfg.get("num_beams", 3)))   # decoding_spec.sota_kwargs
         b = pixel_values.size(0)
         v_proj = v_proj.repeat_interleave(k, dim=0)
         v_att = v_att.repeat_interleave(k, dim=0)

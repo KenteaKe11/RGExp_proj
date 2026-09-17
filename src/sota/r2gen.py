@@ -13,7 +13,7 @@ Vì sao phải cài lại thay vì `pip install`: R2Gen không phát hành packa
 khối `initialization` của setup gốc nói mọi thứ ngoài visual encoder là
 `random`. Nghĩa là không có checkpoint nào để nạp — thứ duy nhất "nạp lại" là
 trọng số ImageNet của ResNet-101. Cài lại đúng kiến trúc rồi huấn luyện trên
-6400 mẫu của tập này CHÍNH LÀ điều kiện 1, không phải một cách lách nó.
+9600 mẫu của tập này CHÍNH LÀ điều kiện 1, không phải một cách lách nó.
 
 Ba chỗ dễ cài sai, xử ở đây:
   * Bộ nhớ chạy THEO BƯỚC, kể cả lúc huấn luyện (vòng `for` trên chiều thời
@@ -371,7 +371,7 @@ class R2Gen(nn.Module):
         from .decoding import beam_search
 
         hidden, src_mask = self.encode_image(pixel_values)
-        k = max(1, int(dcfg.get("beam_size", 3)))
+        k = max(1, int(dcfg.get("num_beams", 3)))   # decoding_spec.sota_kwargs
         b = pixel_values.size(0)
         hidden = hidden.repeat_interleave(k, dim=0)
         src_mask = src_mask.repeat_interleave(k, dim=0)

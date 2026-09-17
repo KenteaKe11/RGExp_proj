@@ -11,11 +11,11 @@ Cái nó bảo vệ là bốn ca hỏng cho ra một lần chạy TRÔNG HOÀN T
      ngẫu nhiên. Thiếu khoá theo chiều ngược lại thì một phần của khối "đã pretrain"
      là ngẫu nhiên, còn META vẫn nói nó đã học.
 
-  2. Nhóm learning-rate áp nhầm chỗ. Ở decoder_ft phần đã pretrain chạy
-     pretrain max_lr / 2, KHÔNG áp lên `route_head`/`dec_proj` (còn tươi); ma
-     trận Attn của Recombinator luôn × 3 (Stage 0 lẫn decoder_ft). Áp nhầm
-     nghĩa là router học chậm, và bảng định tuyến sẽ đầy expert chết vì một lý
-     do không liên quan tới MoE.
+  2. Nhóm learning-rate áp nhầm chỗ. Ở decoder_ft mỗi tham số nhánh phải rơi
+     vào ĐÚNG nhóm của `train.ft_lr` (cls_head / route_head / dec_proj 3e-4,
+     Attn 1e-4, phần còn lại của Recombinator 3e-5); ở Stage 0 Attn × 3. Áp
+     nhầm nghĩa là router học chậm, và bảng định tuyến sẽ đầy expert chết vì
+     một lý do không liên quan tới MoE.
 
   3. Route Head lọt vào pretrain. Ở Stage 0 không có Experts, nên Route Head
      không được gọi và không được nhận gradient; nếu nó có gradient thì file
@@ -638,8 +638,12 @@ def ids_of(mod) -> set:
     return {id(p) for p in mod.parameters()}
 
 
-LRS = {"main": 3e-4, "pretrain_max_lr": 2e-4, "pretrained_div": 2.0,
-       "pretrained": 1e-4, "attn_mult": 3.0}
+FT_LR = {"cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
+         "recombinator_attn": 1e-4, "recombinator": 3e-5}
+LRS = {"main": 1e-4, "groups": dict(FT_LR), "attn_mult": 3.0,
+       "min_lr": 1e-7, "floor": 1e-7}
+FT_GROUPS = ["lora", "cls_head", "route_head", "dec_proj",
+             "recombinator_attn", "recombinator"]
 
 
 def _close(a, b, msg=""):
@@ -705,78 +709,124 @@ def lr_tests() -> None:
         opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
                                    lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
-        eq(list(by), ["lora", "branch_pretrained", "branch_pretrained_attn",
-                      "branch"], "nhóm của decoder_ft")
-        _close(by["lora"]["lr"], 3e-4, "adapter lr chính")
-        _close(by["branch_pretrained"]["lr"], 1e-4, "đã pretrain = 2e-4 / 2")
-        _close(by["branch_pretrained_attn"]["lr"], 3e-4, "Attn = 1e-4 × 3")
-        _close(by["branch"]["lr"], 3e-4, "phần còn TƯƠI lr chính")
-        true(by["branch_pretrained_attn"]["lr"] > by["branch_pretrained"]["lr"],
-             "Attn phải cao hơn phần đã pretrain")
-    check("decoder_ft: pretrain lr / 2, Attn × 3, tươi lr chính", t_ft_groups)
+        eq(list(by), FT_GROUPS, "nhóm của decoder_ft (adapter ĐẦU)")
+        _close(by["lora"]["lr"], 1e-4, "adapter = Attn")
+        for g, v in FT_LR.items():
+            _close(by[g]["lr"], v, f"lr đỉnh {g}")
+    check("decoder_ft: 3e-4 head/concat · LoRA = Attn 1e-4 · Recomb 3e-5",
+          t_ft_groups)
 
     def t_ft_membership():
-        """Không còn lr riêng cho Main Head: cả cls_head ở nhóm đã pretrain."""
-        b = _branch()
+        """Mỗi tham số nhánh thuộc ĐÚNG một nhóm, đúng khối."""
+        b = _branch(dict(RCFG_BASE, route_enabled=True))
         opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
                                    lrs=LRS)
-        by = {g["name"]: g for g in opt.param_groups}
-        pre = {id(p) for nm, p in b.named_parameters()
-               if nm.split(".", 1)[0] in P.PRETRAINED_MODULES}
-        eq({id(p) for p in by["branch_pretrained"]["params"]},
-           pre - attn_ids(b), "nhóm đã pretrain = Recombinator(−Attn) + cls_head")
-        true(ids_of(b.cls_head) <= {id(p) for p in by["branch_pretrained"]["params"]},
-             "Main Head + Pooling Stack chạy CÙNG lr phần đã pretrain")
-        eq({id(p) for p in by["branch_pretrained_attn"]["params"]}, attn_ids(b))
-        eq({id(p) for p in by["branch"]["params"]},
-           ids_of(b.route_head) | ids_of(b.dec_proj),
-           "nhóm tươi = route_head + dec_proj và CHỈ chúng")
-    check("decoder_ft: route_head/dec_proj tươi, cls_head không có lr riêng",
-          t_ft_membership)
+        by = {g["name"]: {id(p) for p in g["params"]} for g in opt.param_groups}
+        eq(by["cls_head"], ids_of(b.cls_head), "Sup Head = cả cls_head")
+        eq(by["route_head"], ids_of(b.route_head))
+        eq(by["dec_proj"], ids_of(b.dec_proj), "Concat Linear = dec_proj")
+        eq(by["recombinator_attn"], attn_ids(b))
+        eq(by["recombinator"], ids_of(b.recombinator) - attn_ids(b),
+           "phần còn lại của Recombinator")
+        allp = [x for n in FT_GROUPS[1:] for x in by[n]]
+        eq(len(allp), len(set(allp)), "không tham số nào ở hai nhóm")
+        eq(set(allp), ids_of(b), "MỌI tham số nhánh đều có nhóm")
+        raises(TrainUnusable, lambda: T._branch_group("foo.weight"),
+               "khối lạ phải DỪNG")
+        raises(TrainUnusable,
+               lambda: T.build_optimizer(_FakePeft(), b, TCFG,
+                                         from_pretrain=True, lrs=None),
+               "decoder_ft thiếu lrs phải DỪNG")
+    check("decoder_ft: phân nhóm tham số đầy đủ, không trùng", t_ft_membership)
 
     def t_ft_lrs_from_cfg():
         from src.config import load_config
 
         cfg = load_config()
         l = T.ft_lrs(cfg)
-        _close(l["main"], float(cfg["train"]["schedule"]["max_lr"]))
-        _close(l["pretrain_max_lr"], 2e-4, "pretrain.schedule.max_lr")
-        _close(l["pretrained"], 1e-4, "decoder_ft: 2e-4 / 2")
-        eq(l["attn_mult"], 3.0)
+        _close(l["main"], 1e-4, "adapter")
+        _close(l["main"], l["groups"]["recombinator_attn"], "LoRA = Attn")
+        eq(l["endpoints"]["adapter"], (3e-6, 3e-7), "LoRA làm tròn xuống")
+        eq(l["endpoints"]["recombinator_attn"], (3e-6, 3e-7))
+        for g, v in FT_LR.items():
+            _close(l["groups"][g], v, f"config ft_lr.{g}")
+        _close(l["floor"], 1e-7, "đáy nhỏ nhất = 3e-5 / 300")
+        sch = cfg["train"]["schedule"]
+        true("cycle_steps" not in sch and "lr_decay" not in sch,
+             "decoder_ft: MỘT chu kỳ, không restart")
         eq(float(cfg["pretrain"]["weight_decay"]), 0.8)
-        bad = load_config()
-        bad["train"]["pretrained_lr_div"] = 0.5
-        raises(TrainUnusable, lambda: T.ft_lrs(bad), "div < 1 phải DỪNG")
-        bad = load_config()
-        bad["recombiner"]["attn_lr_mult"] = 0.9
-        raises(TrainUnusable, lambda: T.ft_lrs(bad), "attn < 1 phải DỪNG")
-        raises(TrainUnusable,
-               lambda: T.build_optimizer(_FakePeft(), _branch(), TCFG,
-                                         from_pretrain=True,
-                                         lrs=dict(LRS, pretrained=None)),
-               "decoder_ft thiếu lr Stage 0 phải DỪNG")
-    check("ft_lrs đọc config: 2e-4/2, Attn × 3, tên sai -> DỪNG",
+
+        def bad(mut, msg):
+            c = load_config()
+            mut(c)
+            raises(TrainUnusable, lambda: T.ft_lrs(c), msg)
+
+        bad(lambda c: c["train"]["ft_lr"].pop("dec_proj"), "thiếu nhóm")
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("x", 1e-4), "thừa nhóm")
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("recombinator", 0.0),
+            "lr 0")
+        bad(lambda c: c["train"]["schedule"].__setitem__("min_lr", 1e-6),
+            "min_lr lệch đáy thật")
+        bad(lambda c: c["train"]["schedule"].__setitem__("cycle_steps", 10),
+            "restart trong decoder_ft")
+        bad(lambda c: c["train"].__setitem__("pretrained_lr_div", 2.0),
+            "khoá đã bỏ")
+        bad(lambda c: c["recombiner"].__setitem__("attn_lr_mult", 0.9),
+            "attn < 1")
+    check("ft_lrs đọc config: ft_lr, đáy 1e-7, khoá sai -> DỪNG",
           t_ft_lrs_from_cfg)
 
-    def t_scheduler_keeps_ratio():
-        """LambdaLR nhân CÙNG hệ số vào mọi nhóm -> tỉ lệ lr giữ nguyên."""
+    def t_round_down():
+        from src.backbone import cycle_endpoints, round_down_sig
+
+        for x, want in ((6.666666e-7, 6e-7), (1e-4 / 30, 3e-6),
+                        (1e-4 / 300, 3e-7), (3e-4 / 30, 1e-5),
+                        (9.999999999999999e-06, 1e-5), (2e-6, 2e-6),
+                        (1.9999999999999998e-05, 2e-5), (0.00019, 1e-4)):
+            eq(round_down_sig(x), want, f"round_down_sig({x!r})")
+        eq(round_down_sig(1.26e-6, 2), 1.2e-6)
+        eq(round_down_sig(5e-5, 0), 5e-5, "0 = tắt")
+        eq(cycle_endpoints(2e-4, 30, 10, 1), (6e-6, 6e-7), "Stage 0")
+        eq(cycle_endpoints(6e-4, 30, 10, 1), (2e-5, 2e-6), "Stage 0 Attn")
+    check("làm tròn xuống: 6.67e-7 -> 6e-7, 3.33e-6 -> 3e-6", t_round_down)
+
+    def t_one_cycle_whole_stage():
+        """MỘT chu kỳ: đầu/đáy đã làm tròn, đỉnh ở cuối warm-up, không restart."""
         from src.backbone import build_scheduler
+        from src.config import load_config
 
         b = _branch()
         opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
                                    lrs=LRS)
-        sch = build_scheduler(opt, 100, {"impl": "lambda", "max_lr": 3e-4,
-                                         "pct_start": 0.1, "div_factor": 25.0,
-                                         "final_div_factor": 100.0})
-        for _ in range(30):
+        total = 200
+        sch = build_scheduler(opt, total,
+                              dict(load_config()["train"]["schedule"]))
+        seen = [{g["name"]: g["lr"] for g in opt.param_groups}]
+        for _ in range(total):
             opt.step()
             sch.step()
-        by = {g["name"]: g["lr"] for g in opt.param_groups}
-        r = by["branch_pretrained"] / by["branch"]
-        true(abs(r - 1 / 3) < 1e-9, f"tỉ lệ đã pretrain/tươi phải giữ 1/3, đang {r}")
-        r = by["branch_pretrained_attn"] / by["branch_pretrained"]
-        true(abs(r - 3.0) < 1e-9, f"tỉ lệ Attn phải giữ 3, đang {r}")
-    check("one-cycle giữ nguyên tỉ lệ lr giữa các nhóm", t_scheduler_keeps_ratio)
+            seen.append({g["name"]: g["lr"] for g in opt.param_groups})
+        for row in seen:
+            _close(row["lora"], row["recombinator_attn"], "LoRA = Attn mọi bước")
+            _close(row["cls_head"] / row["recombinator"], 10.0, "tỉ lệ head/Recomb")
+        want0 = {"lora": 3e-6, "cls_head": 1e-5, "route_head": 1e-5,
+                 "dec_proj": 1e-5, "recombinator_attn": 3e-6,
+                 "recombinator": 1e-6}
+        want_end = {"lora": 3e-7, "cls_head": 1e-6, "route_head": 1e-6,
+                    "dec_proj": 1e-6, "recombinator_attn": 3e-7,
+                    "recombinator": 1e-7}
+        for g in want0:
+            true(abs(seen[0][g] - want0[g]) < 1e-9 * want0[g],
+                 f"đầu warm-up {g}: {seen[0][g]!r} != {want0[g]}")
+            true(abs(seen[-1][g] - want_end[g]) < 1e-9 * want_end[g],
+                 f"đáy {g}: {seen[-1][g]!r} != {want_end[g]}")
+        peak = max(range(total), key=lambda i: seen[i]["cls_head"])
+        true(peak <= int(0.1 * total) + 1, f"đỉnh phải ở cuối warm-up, đang {peak}")
+        true(all(seen[i + 1]["cls_head"] <= seen[i]["cls_head"] + 1e-15
+                 for i in range(peak, total - 1)),
+             "sau đỉnh lr chỉ giảm — không restart")
+    check("one-cycle cho cả stage: đầu/đáy làm tròn, không restart, đáy 1e-7",
+          t_one_cycle_whole_stage)
 
 
 # ═══ 4b. Đóng băng Main Head của Classification Head sau pretrain ═══════════
@@ -796,14 +846,14 @@ def freeze_ft_tests() -> None:
 
         tc = load_config()["train"]
         eq(float(tc["pretrained_lr_mult"]), 0.1, "pretrained_lr_mult sau pretrain")
-        true("pretrained_lr_parts" not in tc,
-             "train.pretrained_lr_parts đã bỏ — Main Head không có lr riêng")
-        eq(float(tc["pretrained_lr_div"]), 2.0)
+        for k in ("pretrained_lr_parts", "pretrained_lr_div"):
+            true(k not in tc, f"train.{k} đã bỏ")
+        eq({k: float(v) for k, v in tc["ft_lr"].items()}, FT_LR)
         eq(list(tc["freeze_after_pretrain"]), [],
            "decoder_ft không đóng băng gì")
         eq(bool(tc.get("freeze_pretrained", False)), False)
         eq(T.frozen_after_pretrain(dict(tc)), ())
-    check("config: không đóng băng, lr phần đã pretrain = Stage 0 / 2",
+    check("config: không đóng băng, lr decoder_ft theo train.ft_lr",
           t_config_values)
 
     def t_resolve():
@@ -845,10 +895,8 @@ def freeze_ft_tests() -> None:
                                for g in opt.param_groups))
         true(ids([b]) <= in_opt, "MỌI tham số nhánh phải nằm trong optimizer")
         true(ids(th.main_head_modules())
-             <= {id(p) for p in by["branch_pretrained"]["params"]},
-             "Main Head ở nhóm đã pretrain (không có lr riêng)")
-        eq({id(p) for p in by["branch"]["params"]},
-           ids([b.route_head, b.dec_proj]), "nhóm tươi = route_head + dec_proj")
+             <= {id(p) for p in by["cls_head"]["params"]},
+             "Main Head ở nhóm cls_head")
         eq(T.learning_pretrained_parts(b),
            ["recombinator", "cls_head.pooling_stack", "cls_head.main_head"])
     check("decoder_ft: fine-tune toàn bộ, không đóng băng",

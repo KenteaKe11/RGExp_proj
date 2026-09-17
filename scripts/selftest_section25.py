@@ -113,11 +113,51 @@ def t_pretrained_lr_mult_is_one_tenth():
     assert abs(float(CFG["train"]["pretrained_lr_mult"]) - 0.1) < 1e-12
 
 
+def t_lr_asl_lambda_config():
+    """Con số của cấu hình hiện tại — đặc tả trong README/config phải khớp."""
+    p, t = CFG["pretrain"], CFG["train"]
+    assert abs(float(p["schedule"]["max_lr"]) - 2e-4) < 1e-12
+    assert abs(float(p["weight_decay"]) - 0.8) < 1e-12
+    assert float(CFG["recombiner"]["attn_lr_mult"]) == 3.0
+    assert {k: float(v) for k, v in t["ft_lr"].items()} == {
+        "cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
+        "recombinator_attn": 1e-4, "recombinator": 3e-5}
+    s = t["schedule"]
+    assert "cycle_steps" not in s and "lr_decay" not in s, "decoder_ft: một chu kỳ"
+    from src.backbone import cycle_endpoints
+
+    assert float(s["max_lr"]) == float(t["ft_lr"]["recombinator_attn"]) == 1e-4, \
+        "LoRA/Experts phải cùng lr với Attn"
+    assert int(s["round_down_sig"]) == 1
+    ends = [cycle_endpoints(v, s["div_factor"], s["final_div_factor"], 1)
+            for v in list(t["ft_lr"].values()) + [s["max_lr"]]]
+    assert (3e-6, 3e-7) in ends, ends
+    assert min(e for _, e in ends) == float(s["min_lr"]) == 1e-7
+    assert "pretrained_lr_div" not in t
+    assert list(t["freeze_after_pretrain"] or []) == []
+    assert "pretrained_lr_parts" not in t
+    c = CFG["classifier"]
+    assert [float(x) for x in c["asl"]["gamma_neg"]] == [4.0, 3.0, 0.0]
+    assert float(c["asl"]["clip"]) == 0.05
+    assert float(c["lambda"]) == 0.4
+    assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 9600
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for s in ("attn_lr_mult", "train.ft_lr", "**1e-7**", "round_down_sig",
+              "weight_decay: 0.8",
+              "gamma_neg: [4.0, 3.0, 0.0]", "classifier.lambda: 0.4",
+              "9600 mẫu train"):
+        assert s in readme, f"README không nhắc `{s}`"
+
+
 def t_stage0_schedule_encodes_min_lr():
+    from src.backbone import cycle_endpoints
+
     s = CFG["pretrain"]["schedule"]
-    got = float(s["max_lr"]) / float(s["div_factor"]) / float(s["final_div_factor"])
+    got = cycle_endpoints(s["max_lr"], s["div_factor"], s["final_div_factor"],
+                          int(s.get("round_down_sig", 0) or 0))
     want = float(s["min_lr"])
-    assert abs(got - want) / want < 0.05, (got, want)
+    assert got[1] == want, (got, want)
+    assert got == (6e-6, 6e-7), got           # 6.67e-6 / 6.67e-7 làm tròn xuống
     assert int(CFG["pretrain"]["n_epochs"]) == 8
     lo, hi = CFG["pretrain"]["weight_decay_range"]
     assert lo <= float(CFG["pretrain"]["weight_decay"]) <= hi
@@ -375,7 +415,7 @@ def t_beam_search_greedy_path():
         return lg, t
 
     out = beam_search(step, lambda s, i: s, torch.tensor(0), 2, tok,
-                      {"beam_size": 1}, device="cpu")
+                      {"num_beams": 1}, device="cpu")
     assert len(out) == 2 and out[0].startswith("a"), out
 
 
@@ -394,11 +434,147 @@ def t_beam_search_blocks_trigrams():
         return lg, state
 
     free = beam_search(step, lambda s, i: s, None, 1, tok,
-                       {"beam_size": 1, "block_trigrams": False}, device="cpu")
+                       {"num_beams": 1, "no_repeat_ngram_size": 0}, device="cpu")
     blocked = beam_search(step, lambda s, i: s, None, 1, tok,
-                          {"beam_size": 1, "block_trigrams": True}, device="cpu")
+                          {"num_beams": 1, "no_repeat_ngram_size": 3}, device="cpu")
     assert free[0].split().count("a") > blocked[0].split().count("a"), (
         free, blocked)
+
+
+def _toy_step(table):
+    """step() trả logits theo SỐ BƯỚC — cùng cho mọi beam."""
+    import torch
+
+    tok = _ToyTok()
+    t = {"i": 0}
+
+    def step(state, last):
+        row = torch.full((len(tok),), -20.0)
+        for w, v in table(t["i"]).items():
+            row[w] = v
+        t["i"] += 1
+        return row.expand(last.shape[0], -1).clone(), state
+    return step
+
+
+def t_beam_search_length_penalty_like_hf():
+    """Giả thuyết `<eos>` ngay bước đầu (tổng log-prob cao hơn) thua
+    `a <eos>` khi length_penalty = 1 và thắng khi = 0 — đúng công thức
+    tổng log-prob / (số token sinh)^lp của transformers."""
+    from src.sota.decoding import beam_search
+
+    tok = _ToyTok()
+    table = lambda i: {4: 1.9, 2: 2.0} if i == 0 else {2: 5.0}   # 4='a', 2=<eos>
+    lp1 = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                      {"num_beams": 2, "length_penalty": 1.0}, device="cpu")
+    lp0 = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                      {"num_beams": 2, "length_penalty": 0.0}, device="cpu")
+    assert lp1 == ["a"], lp1
+    assert lp0 == [""], lp0
+
+
+def t_beam_search_eos_rank_rule():
+    """`<eos>` ở hạng >= num_beams KHÔNG được nhận (luật của transformers):
+    với beam 1, `<eos>` luôn đứng thứ hai nên chuỗi chạy tới hết độ dài."""
+    from src.sota.decoding import beam_search
+
+    tok = _ToyTok()
+    table = lambda i: {4: 1.0, 2: 0.9}
+    out = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                      {"num_beams": 1}, device="cpu")
+    assert out == [" ".join(["a"] * (tok.max_seq_length - 1))], out
+    short = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                        {"num_beams": 1, "max_new_tokens": 3}, device="cpu")
+    assert short == ["a a a"], short
+
+
+def t_beam_search_matches_transformers():
+    """Đối chiếu TỪNG TOKEN với `transformers.generate` (4.51–4.52) trên một
+    GPT-2 tí hon ngẫu nhiên: cùng mô hình, cùng đặc tả -> cùng chuỗi."""
+    try:
+        import torch
+        import transformers
+        from transformers import GPT2Config, GPT2LMHeadModel
+    except ImportError as e:
+        raise _Skip(f"thiếu torch/transformers ({e})") from e
+    ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+    if not ((4, 51) <= ver < (4, 53)):
+        raise _Skip(f"transformers {transformers.__version__} ngoài 4.51–4.52 "
+                    f"(bản đã đối chiếu)")
+    from src.sota.decoding import beam_search
+
+    tok = _ToyTok()
+    V, max_new = len(tok), tok.max_seq_length - 1
+    img = torch.tensor([4, 9, 13, 17])            # "ảnh" = một token đầu chuỗi
+    checked = 0
+    for seed in range(6):
+        torch.manual_seed(seed)
+        model = GPT2LMHeadModel(GPT2Config(
+            vocab_size=V, n_positions=32, n_embd=32, n_layer=2, n_head=2,
+            bos_token_id=tok.bos_id, eos_token_id=tok.eos_id)).eval()
+        with torch.no_grad():                     # đẩy <eos> lên cho có chuỗi ngắn
+            model.lm_head.weight[tok.eos_id] *= 3.0
+        for spec in ({"num_beams": 3, "length_penalty": 1.0},
+                     {"num_beams": 2, "length_penalty": 0.0},
+                     {"num_beams": 3, "length_penalty": 1.0,
+                      "early_stopping": True}):
+            k = spec["num_beams"]
+            hf = model.generate(
+                input_ids=torch.stack([img, torch.full_like(img, tok.bos_id)], 1),
+                attention_mask=torch.ones(len(img), 2, dtype=torch.long),
+                do_sample=False, max_new_tokens=max_new, use_cache=False,
+                pad_token_id=tok.pad_id, eos_token_id=tok.eos_id,
+                bad_words_ids=[[tok.pad_id], [tok.bos_id]],
+                no_repeat_ngram_size=0, repetition_penalty=1.0,
+                early_stopping=spec.get("early_stopping", False), **spec)
+            want = [tok.decode(r[1:].tolist()) for r in hf]
+
+            def step(state, last, _m=model):
+                pre, im = state
+                pre = torch.cat([pre, last.unsqueeze(1)], 1)
+                out = _m(input_ids=torch.cat([im.unsqueeze(1), pre], 1),
+                         use_cache=False).logits[:, -1]
+                return out, (pre, im)
+
+            def reorder(state, i):
+                return state[0][i], state[1][i]
+
+            st0 = (torch.zeros(len(img) * k, 0, dtype=torch.long),
+                   img.repeat_interleave(k))
+            got = beam_search(step, reorder, st0, len(img), tok,
+                              dict(spec, max_new_tokens=max_new), device="cpu")
+            assert got == want, (seed, spec, got, want)
+            checked += 1
+    assert checked == 18
+
+
+def t_decoding_spec_is_shared():
+    """Một khối `generate:` cho cả ba; paper chỉ còn là bản ghi."""
+    from src import decoding_spec as D
+
+    hf, so = D.hf_kwargs(CFG), D.sota_kwargs(CFG)
+    for k in D.KEYS:
+        assert hf[k] == so[k], (k, hf[k], so[k])
+    assert hf["num_beams"] == 3 and hf["do_sample"] is False
+    assert hf["length_penalty"] == 1.0 and hf["early_stopping"] is False
+    assert hf["no_repeat_ngram_size"] == 0 and hf["repetition_penalty"] == 1.0
+    for k in D.KEYS:
+        assert k in CFG["generate"], f"generate.{k} phải khai TƯỜNG MINH"
+    assert "block_trigrams true -> no_repeat_ngram_size 0" in \
+        D.paper_differences(CFG, "r2gen")
+    from src.config import Cfg
+    bad = Cfg(dict(CFG))
+    bad["generate"] = dict(CFG["generate"], do_sample=True)
+    try:
+        D.unified(bad)
+    except D.DecodingSpecError:
+        pass
+    else:
+        raise AssertionError("do_sample = true mà vẫn qua")
+    for f in ("src/runners/sota.py", "src/train_sota.py"):
+        src = (ROOT / f).read_text(encoding="utf-8")
+        assert "sota_kwargs(" in src, f"{f} phải đọc decoding_spec"
+        assert 'get("decoding"' not in src, f"{f} còn đọc sota.*.decoding"
 
 
 # ── 6. Setup gốc của hai baseline ──────────────────────────────────────────
@@ -550,7 +726,7 @@ def t_adaatt_rejects_multilayer():
 def t_models_generate_text():
     model, px, _ids = _tiny("r2gen")
     tok = _ToyTok()
-    out = model.generate(px, tok, {"beam_size": 2})
+    out = model.generate(px, tok, {"num_beams": 2})
     assert len(out) == 2 and all(isinstance(s, str) for s in out), out
 
 
@@ -650,6 +826,67 @@ def t_no_resume_requires_train_stage():
     assert rc == 2, rc
 
 
+def t_beam_size_is_3_everywhere():
+    """Ba candidate sinh cùng một độ rộng beam."""
+    assert int(CFG["generate"]["num_beams"]) == 3
+    assert not CFG["generate"].get("do_sample", False)
+    for k in ("r2gen", "adaatt"):
+        assert int(CFG["sota"][k]["decoding"]["beam_size"]) == 3, k
+    from src.config import Cfg
+    from src.runners.base import Runner
+
+    class _R(Runner):
+        name = "x"
+
+    r = _R.__new__(_R)
+    r.cfg = Cfg(dict(CFG))
+    assert r.gen_kwargs()["num_beams"] == 3
+
+
+def t_routing_weights_follow_beams():
+    """repeat_interleave: hàng i*k..i*k+k-1 của generate đều là ảnh i."""
+    try:
+        import torch
+    except ImportError as e:
+        raise _Skip("không có torch") from e
+    from src.moe import RoutingContext
+
+    ctx = RoutingContext()
+    w = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    ctx.set(w, repeat=3)
+    got = ctx.get(6)
+    assert got.shape == (6, 2)
+    assert torch.equal(got[:3], w[0].expand(3, 2))
+    assert torch.equal(got[3:], w[1].expand(3, 2))
+    for bad in (2, 4, 7):
+        try:
+            ctx.get(bad)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"batch {bad} ≠ 2×3 mà không DỪNG")
+    ctx.clear()
+    ctx.set(w)
+    assert torch.equal(ctx.get(2), w)
+    try:
+        ctx.get(6)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("quên repeat mà vẫn qua")
+    ctx.clear()
+    try:
+        ctx.get(2)
+    except RuntimeError:
+        return True
+    raise AssertionError("strict: chưa set mà vẫn qua")
+
+
+def t_recomb_runner_passes_beams_to_routing():
+    src = (ROOT / "src" / "runners" / "gemma3_recomb.py").read_text(encoding="utf-8")
+    assert "repeat=self._n_beams()" in src, "runner phải set(..., repeat=num_beams)"
+    assert "generate.num_beams != 1" not in src, "chặn beam cũ vẫn còn"
+
+
 def t_report_never_computes_cider():
     """CIDEr dừng lại ở khâu chọn checkpoint, không lọt vào bảng kết quả.
 
@@ -680,6 +917,8 @@ if __name__ == "__main__":
     check("MoE E=10·K=6 + QLoRA r4 (§2.2, §2.4 đã chốt)", t_moe_config_matches_24)
     check("pretrained_lr_mult = 1/10", t_pretrained_lr_mult_is_one_tenth)
     check("lịch Stage 0 mã hoá đúng min_lr", t_stage0_schedule_encodes_min_lr)
+    check("lr · one-cycle · wd · Attn · ASL · λ · n_train khớp đặc tả",
+          t_lr_asl_lambda_config)
     check("candidate nặng nhất chạy trước", t_train_order_heaviest_first)
 
     hr("2. Điều kiện 4 — một phép resize cho ba candidate")
@@ -706,7 +945,13 @@ if __name__ == "__main__":
 
     hr("5. Beam search dùng chung")
     check("đường greedy (beam=1)", t_beam_search_greedy_path)
-    check("block_trigrams thật sự chặn", t_beam_search_blocks_trigrams)
+    check("no_repeat_ngram_size thật sự chặn", t_beam_search_blocks_trigrams)
+    check("length_penalty theo công thức transformers",
+          t_beam_search_length_penalty_like_hf)
+    check("<eos> hạng >= num_beams bị bỏ qua", t_beam_search_eos_rank_rule)
+    check("beam search của baseline = transformers.generate từng token",
+          t_beam_search_matches_transformers)
+    check("một đặc tả giải mã cho cả ba candidate", t_decoding_spec_is_shared)
 
     hr("6. Setup gốc của hai baseline")
     check("đọc đúng số của paper", t_main_stage_spec_reads_paper_numbers)
@@ -729,6 +974,11 @@ if __name__ == "__main__":
     check("src/ không import sang _archive/", t_src_does_not_import_archive)
     check("deviations nêu điều kiện 4 và 5", t_deviations_name_conditions_4_and_5)
     check("báo cáo không bao giờ tính CIDEr", t_report_never_computes_cider)
+    check("beam = 3 cho cả ba candidate", t_beam_size_is_3_everywhere)
+    check("MoE: trọng số định tuyến nhân bản theo beam",
+          t_routing_weights_follow_beams)
+    check("runner My Gemma khai repeat = num_beams",
+          t_recomb_runner_passes_beams_to_routing)
     check("--no-resume chỉ cất checkpoint/sinh/điểm của My Gemma",
           t_no_resume_archives_only_ours)
     check("--no-resume cần stage train và một candidate ours",
