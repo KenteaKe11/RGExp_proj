@@ -172,7 +172,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
             cls = st.get("cls_metrics_last") or {}
             L.append(f"{d.get('n_dec_tokens', st.get('n_dec_tokens', '—'))} "
                      f"token của nhánh đi THẲNG vào decoder qua một phép chiếu "
-                     f"Linear/GELU trên trục token (không cổng; rời khởi tạo "
+                     f"Linear/GELU -> Linear trên trục token (không cổng; rời khởi tạo "
                      f"{_f(d.get('dec_proj_rel_change'))}) và `cls_f1_pos` = "
                      f"{_f(cls.get('cls_f1_pos'))}. Nhánh đã tham gia, nên so "
                      f"sánh bên dưới là so sánh về KIẾN TRÚC.\n")

@@ -15,7 +15,7 @@ C  my_gemma   Gemma 3 4b-it NF4 + Recombinator + Classification/Route Head
               + Experts K=6·E=10, adapter QLoRA r4
 ```
 
-Câu hỏi: trên **cùng** 9600 mẫu train và **cùng** 3000 ảnh test của tập này,
+Câu hỏi: trên **cùng** 6400 mẫu train và **cùng** 3000 ảnh test của tập này,
 công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao nhiêu**?
 
 ---
@@ -24,13 +24,13 @@ công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao 
 
 Recombinator nhận `X [4096, 1152]` (last_hidden_state của vision tower) và tạo
 `Y [256, 2560]`. Classification Head và Route Head đọc cả 256 token; decoder
-nhận 64 token qua Linear/GELU trên trục token, **không có cổng**.
+nhận 64 token qua hai Linear trên trục token (256 → 128 GELU → 64), **không có cổng**.
 
 ```text
 Image -> Vision Encoder ─┬─> Recombinator (256, 2560) ─┬─> Classification Head (14·3) -> Sup Loss
                          │                             ├─> Route Head (E) -> Aux Loss
                          │                             │     └─> Top-k Gate -> Experts (LoRA)
-                         │                             └─> Linear/GELU 256->64 ─┐ First
+                         │                             └─> Linear/GELU 256->128 -> Linear 128->64 ─┐ First
                          └─> VL-Adapter (256) ──────────────────────────────────┤ Second
 Prompt -> Embedding ────────────────────────────────────────────────────────────┴─> concat -> Decoder -> CE
 
@@ -57,10 +57,12 @@ Ba chỗ cài đặt cần biết, vì sơ đồ không nói rõ:
 * Lớp cuối của Main Head **không** qua GELU: đầu ra là logit của ASL và của
   softmax/top-k, và GELU chặn logit dưới ở ≈ −0.17.
 * Các Linear trên trục token (Pooling Stack, `dec_proj`) không bias, khởi tạo bằng
-  trung bình cụm; `dec_proj` là trung bình 2×2 trên lưới 16×16 -> 8×8, nên ở
-  bước 0 decoder nhận đúng đặc trưng Stage 0 đã học (qua GELU).
+  trung bình cụm; `dec_proj` gồm hai lớp (256 → 128 + GELU, 128 → 64 không
+  GELU) mà tích của chúng là trung bình 2×2 trên lưới 16×16 -> 8×8 (lớp 1 pool
+  ngang, lớp 2 pool dọc), nên ở bước 0 decoder nhận ≈ đặc trưng Stage 0 đã học.
+  Lớp cuối không GELU để token vào decoder mang được giá trị âm như embedding thật.
 
-Số token vào decoder khai ở `recombiner.n_dec_tokens`. Khoá của kiến trúc cũ
+Số token vào decoder khai ở `recombiner.n_dec_tokens`, tầng giữa ở `recombiner.n_dec_hidden`. Khoá của kiến trúc cũ
 (`qformer`, `prepare_pool_factor`, `highway_token_dims`, `swiglu_dropout`,
 `n_query`, `n_heads`, cổng Hard-Concrete `gate*`, `train.gate_lr_mult`,
 `classifier.l0_lambda`) đã bỏ — còn sót khoá nào trong config thì chương trình
@@ -82,25 +84,25 @@ lr đỉnh:
 
 | nhóm | Stage 0 | decoder_ft (`train.ft_lr`) |
 |---|---|---|
-| Sup Head (`cls_head`: Pooling Stack + Main Head) | 2e-4 | **3e-4** |
+| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-4** |
 | Route Head (`route_head`) | — | **3e-4** |
-| Concat Linear (`dec_proj`, 256 → 64 token) | — | **3e-4** |
-| Attn (Q/K/V/O) của Recombinator (`recombinator_attn`) | 2e-4 × 3 = **6e-4** | **1e-4** |
-| Phần còn lại của Recombinator (`recombinator`) | 2e-4 | **3e-5** |
+| Concat Linear (`dec_proj`, 256 → 128 GELU → 64 token) | — | **3e-4** |
+| Attn (Q/K/V/O) của Recombinator (`recombinator_attn`) | 1.6e-4 × 3 = **4.8e-4** | **1e-4** |
+| Phần còn lại của Recombinator (`recombinator`) | 1.6e-4 | **3e-5** |
 | Experts (LoRA) — cùng lr với Attn | — | **1e-4** (`train.schedule.max_lr`) |
 
-Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.8`, hệ số Attn
+Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.05`, hệ số Attn
 `recombiner.attn_lr_mult: 3`. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
 stage (không restart) để mọi nhóm cùng hội tụ.
 
 Cả hai giai đoạn dùng `div_factor` 30 · `final_div_factor` 10, rồi đầu warm-up
-và đáy của từng nhóm được **làm tròn xuống** còn 1 chữ số có nghĩa
+và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 chữ số có nghĩa; Stage 0: 2 chữ số để giữ đúng 0.8 × lịch cũ)
 (`schedule.round_down_sig: 1`) thay vì để số lẻ vô hạn như 3.33e-6:
 
 | giai đoạn · nhóm | đầu warm-up | đỉnh | đáy |
 |---|---|---|---|
-| Stage 0 · Recombinator + cls_head | 6e-6 (6.67e-6) | 2e-4 | 6e-7 (6.67e-7) |
-| Stage 0 · Attn | 2e-5 | 6e-4 | 2e-6 |
+| Stage 0 · Recombinator + cls_head | 4.8e-6 | 1.6e-4 | 4.8e-7 |
+| Stage 0 · Attn | 1.4e-5 (1.44e-5) | 4.8e-4 | 1.4e-6 (1.44e-6) |
 | decoder_ft · Sup Head / Route Head / Concat Linear | 1e-5 | 3e-4 | 1e-6 |
 | decoder_ft · Attn và LoRA | 3e-6 (3.33e-6) | 1e-4 | 3e-7 (3.33e-7) |
 | decoder_ft · phần còn lại của Recombinator | 1e-6 | 3e-5 | **1e-7** |
@@ -159,7 +161,7 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
 
 1. **SOTA chỉ nạp lại trọng số ở đúng setup của paper gốc** — khối `sota:` trong
    `configs/section25.yaml` là bản chép nguyên văn, không hiệu chỉnh.
-2. **Cùng 9600 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
+2. **Cùng 6400 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
 3. **Paired Bootstrap + Permutation Test** cho từng cặp, Holm trên ba p-value.
    Không Friedman — xem phần kiểm định ghép cặp trong cấu hình.
 4. **Một phương pháp resize duy nhất** cho mọi model, **kể cả khi kích thước đầu
@@ -202,7 +204,7 @@ python -m src.config                         # in cấu hình §2.5 đã giải 
 python -m src.labels_cls --check-split       # dò nhãn, ~30 giây
 
 bash scripts/run_pretrain.sh --dry-run       # Stage 0: thử đường ống
-bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 8 epoch
+bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 5 epoch
 
 bash scripts/run_section25.sh --dry-run      # §2.5: thử đường ống
 bash scripts/run_section25.sh --detach       # §2.5: chạy thật
@@ -210,7 +212,7 @@ bash scripts/run_section25.sh --detach       # §2.5: chạy thật
 
 `--dry-run` là phép thử **đường ống**, không phải phép dò VRAM: nó chạy với đúng
 batch trong config, và vài bước trên vài chục mẫu ngắn không nói được gì về VRAM
-đỉnh của 9600 mẫu.
+đỉnh của 6400 mẫu.
 
 ---
 
@@ -237,7 +239,7 @@ scripts/
 src/
   config.py                  nạp YAML, seed, token
   decoding_spec.py           MỘT đặc tả giải mã (khối `generate:`) cho cả ba candidate
-  data.py · data_train.py    3000 ảnh test · 9600 mẫu train + hàng rào rò rỉ
+  data.py · data_train.py    3000 ảnh test · 6400 mẫu train + hàng rào rò rỉ
   labels_cls.py              dò labels.npz -> nhãn (L,3) + mask cho ClsHead
   prompts.py                 prompt dùng chung
   imaging.py                 chính sách ảnh · `unified_tensor` = ĐIỀU KIỆN 4,
@@ -246,7 +248,7 @@ src/
                              one-cycle, device_map
   recombiner.py              Recombinator (Local×2 · Global MHA · FFN) ·
                              ClsHead · RouteHead (Pooling Stack + Main Head) ·
-                             Linear/GELU 256→64 token vào decoder · ASL
+                             Linear/GELU 256→128 → Linear 128→64 token vào decoder · ASL
   moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·
                              Aux Loss · MoELoraLinear · ghi/nạp Experts
   train_recomb.py            vòng huấn luyện của candidate C

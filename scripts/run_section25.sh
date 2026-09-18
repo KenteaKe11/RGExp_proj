@@ -14,7 +14,7 @@
 # Mọi tham số chuyển thẳng cho `python -m src.run_section25`.
 #
 # ── MỤC NÀY HỎI GÌ ──────────────────────────────────────────────────────────
-# Trên CÙNG 9600 mẫu train và CÙNG 3000 ảnh test của tập này, công thức
+# Trên CÙNG 6400 mẫu train và CÙNG 3000 ảnh test của tập này, công thức
 # Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10 có hơn hai kiến
 # trúc sinh báo cáo đã công bố không, và hơn BAO NHIÊU?
 #
@@ -31,7 +31,7 @@
 # config. Hai baseline tự chạy nó bên trong `train_sota` (CNN đóng băng, phần
 # ngôn ngữ học trước). My Gemma thì NẠP từ `sup_pretrain` — mục ấy có điểm vào
 # riêng vì nó chạy trên TOÀN BỘ train split, và gộp vào đây nghĩa là mỗi lần
-# chạy lại §2.5 để in một bảng cũng kéo theo 8 epoch pretrain.
+# chạy lại §2.5 để in một bảng cũng kéo theo 5 epoch pretrain.
 #
 # Thiếu checkpoint ấy là DỪNG với mã 9, không phải chạy tiếp với nhánh ngẫu
 # nhiên. Muốn cố ý chạy không pretrain thì phải NÓI RA: `--init-from none`.

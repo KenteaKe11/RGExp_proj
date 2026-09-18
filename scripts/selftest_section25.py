@@ -116,8 +116,8 @@ def t_pretrained_lr_mult_is_one_tenth():
 def t_lr_asl_lambda_config():
     """Con số của cấu hình hiện tại — đặc tả trong README/config phải khớp."""
     p, t = CFG["pretrain"], CFG["train"]
-    assert abs(float(p["schedule"]["max_lr"]) - 2e-4) < 1e-12
-    assert abs(float(p["weight_decay"]) - 0.8) < 1e-12
+    assert abs(float(p["schedule"]["max_lr"]) - 1.6e-4) < 1e-12
+    assert abs(float(p["weight_decay"]) - 0.05) < 1e-12
     assert float(CFG["recombiner"]["attn_lr_mult"]) == 3.0
     assert {k: float(v) for k, v in t["ft_lr"].items()} == {
         "cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
@@ -140,12 +140,12 @@ def t_lr_asl_lambda_config():
     assert [float(x) for x in c["asl"]["gamma_neg"]] == [4.0, 3.0, 0.0]
     assert float(c["asl"]["clip"]) == 0.05
     assert float(c["lambda"]) == 0.4
-    assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 9600
+    assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 6400
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for s in ("attn_lr_mult", "train.ft_lr", "**1e-7**", "round_down_sig",
-              "weight_decay: 0.8",
+              "weight_decay: 0.05",
               "gamma_neg: [4.0, 3.0, 0.0]", "classifier.lambda: 0.4",
-              "9600 mẫu train"):
+              "6400 mẫu train"):
         assert s in readme, f"README không nhắc `{s}`"
 
 
@@ -157,8 +157,8 @@ def t_stage0_schedule_encodes_min_lr():
                           int(s.get("round_down_sig", 0) or 0))
     want = float(s["min_lr"])
     assert got[1] == want, (got, want)
-    assert got == (6e-6, 6e-7), got           # 6.67e-6 / 6.67e-7 làm tròn xuống
-    assert int(CFG["pretrain"]["n_epochs"]) == 8
+    assert got == (4.8e-6, 4.8e-7), got       # = 0.8 × (6e-6, 6e-7) của lịch cũ
+    assert int(CFG["pretrain"]["n_epochs"]) == 5
     lo, hi = CFG["pretrain"]["weight_decay_range"]
     assert lo <= float(CFG["pretrain"]["weight_decay"]) <= hi
 
@@ -585,8 +585,8 @@ def t_main_stage_spec_reads_paper_numbers():
 
     r = main_stage_spec("r2gen", CFG["sota"]["r2gen"])
     assert abs(r["lr_visual"] - 5e-5) < 1e-12 and abs(r["lr_rest"] - 1e-4) < 1e-12
-    assert r["epochs"] == 100 and r["batch_size"] == 16
-    assert r["monitor"].upper().startswith("BLEU") and r["patience"] == 50
+    assert r["epochs"] == 50 and r["batch_size"] == 16
+    assert r["monitor"].upper().startswith("BLEU") and r["patience"] == 5
     assert r["amsgrad"] is True
 
     a = main_stage_spec("adaatt", CFG["sota"]["adaatt"])

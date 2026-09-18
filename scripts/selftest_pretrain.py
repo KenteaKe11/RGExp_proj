@@ -26,7 +26,7 @@ Cái nó bảo vệ là bốn ca hỏng cho ra một lần chạy TRÔNG HOÀN T
      qua) một phần dữ liệu, và không có gì trong log nói vậy.
 
 Cộng thêm: kiến trúc nhánh khớp sơ đồ (Recombinator 4096→1024→256 token,
-MHA 18 head, Pooling Stack 256→64→16→4→1, dec_proj 256→64), checkpoint
+MHA 18 head, Pooling Stack 256→64→16→4→1, dec_proj 256→128→64), checkpoint
 pretrain nạp được sang main-stage (Route Head dựng theo E của candidate),
 `assert_compatible` bắt được lệch n_labels / format cũ, λ-warmup bị TẮT ở
 decoder_ft, và `pretrain_rcfg` tắt định tuyến.
@@ -85,7 +85,7 @@ RCFG_BASE = {
     "local": {"n_blocks": 2, "hidden": 20, "pool_factor": 4},
     "head_dim": 4, "dropout": 0.0, "pool_stages": 2,
     "route_head": {"hidden": 12, "dropout": 0.0},
-    "n_dec_tokens": 4,
+    "n_dec_hidden": 8, "n_dec_tokens": 4,
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,
 }
 CCFG = {"n_classes": 3, "hidden": 16, "dropout": 0.0,
@@ -171,12 +171,11 @@ def io_tests() -> None:
                          f"khoá {k} không khớp sau khi nạp lại")
             # Và khối KHÔNG pretrain phải giữ giá trị khởi tạo của b2, không
             # phải của b: nếu nó khớp b thì file đã lén mang chúng theo.
-            from src.recombiner import avg_pool_matrix
-
-            w2 = b2.dec_proj.proj.weight
-            true(torch.allclose(w2, avg_pool_matrix(w2.shape[1], w2.shape[0])),
-                 "`dec_proj` của b2 phải giữ khởi tạo, không được lấy từ file")
-            true(not torch.allclose(b.dec_proj.proj.weight, w2),
+            w_init = b2.dec_proj.init_weights()
+            for i, w2 in enumerate((b2.dec_proj.proj1.weight, b2.dec_proj.proj2.weight)):
+                true(torch.allclose(w2, w_init[i]),
+                     "`dec_proj` của b2 phải giữ khởi tạo, không được lấy từ file")
+            true(not torch.allclose(b.dec_proj.proj1.weight, b2.dec_proj.proj1.weight),
                  "`dec_proj` của b đã bị làm lệch — phải khác b2")
     check("ghi rồi nạp lại: đúng trọng số, đúng khối tươi", t_roundtrip)
 
@@ -353,9 +352,9 @@ def freeze_tests() -> None:
         y = torch.zeros(2, N_LABELS, 3)
         y[:, :, 1] = 1.0
         b.sup_loss(logits, y, torch.ones(2)).backward()
-        gw = b.dec_proj.proj.weight.grad
-        true(gw is None or float(gw.abs().sum()) == 0.0,
-             "`dec_proj` không được nhận gradient — đó là lý do nó ở ngoài file")
+        for gw in (b.dec_proj.proj1.weight.grad, b.dec_proj.proj2.weight.grad):
+            true(gw is None or float(gw.abs().sum()) == 0.0,
+                 "`dec_proj` không được nhận gradient — đó là lý do nó ở ngoài file")
         for n, p in b.route_head.named_parameters():
             true(p.grad is None or float(p.grad.abs().sum()) == 0.0,
                  f"route_head.{n} không được nhận gradient ở pretrain")
@@ -388,7 +387,7 @@ def dec_proj_tests() -> None:
     check("nhánh trả (B, n_dec_tokens, d) và không còn `gate`", t_shape_and_no_gate)
 
     def t_is_linear_gelu_on_recombinator():
-        """Token ra = GELU(W · Recombinator(vis)) trên trục token."""
+        """Token ra = W2 · GELU(W1 · Recombinator(vis)) trên trục token."""
         import torch
         import torch.nn.functional as F
 
@@ -397,11 +396,14 @@ def dec_proj_tests() -> None:
         with torch.no_grad():
             tok, _l, _r = b(vis)
             rec = b.recombinator(vis)
-            want = F.gelu(torch.einsum("oi,bid->bod", b.dec_proj.proj.weight, rec))
+            h = F.gelu(torch.einsum("oi,bid->bod", b.dec_proj.proj1.weight, rec))
+            want = torch.einsum("oi,bid->bod", b.dec_proj.proj2.weight, h)
         true(torch.allclose(tok, want, atol=1e-6),
-             "token vào decoder phải đúng bằng GELU(Linear(Recombinator))")
-        eq(b.dec_proj.proj.bias, None, "dec_proj không có bias")
-    check("token vào decoder = Linear/GELU trục token của Recombinator",
+             "token vào decoder phải đúng bằng Linear(GELU(Linear(Recombinator)))")
+        eq(tuple(h.shape[1:2]), (RCFG_BASE["n_dec_hidden"],), "tầng giữa n_dec_hidden")
+        eq(b.dec_proj.proj1.bias, None, "dec_proj không có bias")
+        eq(b.dec_proj.proj2.bias, None, "dec_proj không có bias")
+    check("token vào decoder = Linear/GELU -> Linear trục token của Recombinator",
           t_is_linear_gelu_on_recombinator)
 
     def t_init_is_cluster_mean():
@@ -418,9 +420,17 @@ def dec_proj_tests() -> None:
         eq(sorted(w2[0].nonzero().flatten().tolist()), [0, 1, 16, 17],
            "hàng 0 phải là ô 2×2 góc trên-trái của lưới 16×16")
         eq(float(w2[0, 16]), 0.25)
+        for n_in, n_mid, n_out in ((256, 128, 64), (16, 8, 4)):
+            w1, w2b = R.split_grid_pool(n_in, n_mid, n_out)
+            true(torch.allclose(w2b @ w1, R.avg_pool_matrix(n_in, n_out)),
+                 f"tích hai lớp {n_in}->{n_mid}->{n_out} phải = trung bình 2×2 trên lưới")
+        w1, _ = R.split_grid_pool(256, 128, 64)
+        eq(sorted(w1[0].nonzero().flatten().tolist()), [0, 1],
+           "lớp 1 pool NGANG: token 0 = trung bình (0, 1)")
         stats = _branch().dec_stats()
         eq(stats["dec_proj_rel_change"], 0.0, "mới dựng thì chưa rời khởi tạo")
-    check("khởi tạo dec_proj = trung bình cụm (2×2 trên lưới)", t_init_is_cluster_mean)
+    check("khởi tạo dec_proj: hai lớp, tích = trung bình 2×2 trên lưới",
+          t_init_is_cluster_mean)
 
     def t_grid_pool_matches_matrix():
         """avg_pool_tokens(grid) == ma trận 2×2 của avg_pool_matrix."""
@@ -443,9 +453,9 @@ def dec_proj_tests() -> None:
         b = _branch()
         tok, _l, _r = b(torch.randn(2, RCFG_BASE["n_vis"], D_VIS))
         tok.pow(2).mean().backward()
-        g = b.dec_proj.proj.weight.grad
-        true(g is not None and float(g.abs().sum()) > 0,
-             "gradient từ decoder phải tới dec_proj")
+        for g in (b.dec_proj.proj1.weight.grad, b.dec_proj.proj2.weight.grad):
+            true(g is not None and float(g.abs().sum()) > 0,
+                 "gradient từ decoder phải tới cả hai lớp dec_proj")
         gp = [p.grad for p in b.recombinator.parameters() if p.grad is not None]
         true(gp and any(float(x.abs().sum()) > 0 for x in gp),
              "và đi tiếp tới Recombinator — không có cổng nào chặn")
@@ -470,6 +480,9 @@ def dec_proj_tests() -> None:
         r = copy.deepcopy(RCFG_BASE)
         r["n_dec_tokens"] = r["n_tokens"] + 1
         raises(ValueError, lambda: _branch(r), "n_dec_tokens > n_tokens phải DỪNG")
+        r = copy.deepcopy(RCFG_BASE)
+        r["n_dec_hidden"] = r["n_dec_tokens"] - 1
+        raises(ValueError, lambda: _branch(r), "n_dec_hidden < n_dec_tokens phải DỪNG")
         r = copy.deepcopy(RCFG_BASE)
         r["n_tokens"] = 32
         raises(ValueError, lambda: _branch(r), "n_tokens khai sai phải DỪNG")
@@ -564,7 +577,8 @@ def arch_tests() -> None:
         eq(tuple(logits.shape), (2, 14, 3))
         eq(tuple(route[0].shape), (2, 10))
         eq(tuple(route[1].shape), (2, 10))
-        eq(tuple(tok.shape), (2, 64, 2560), "dec_proj 256 -> 64")
+        eq(b.dec_proj.n_mid, 128, "dec_proj tầng giữa 128")
+        eq(tuple(tok.shape), (2, 64, 2560), "dec_proj 256 -> 128 -> 64")
         true(b.cls_head.head.pool is not b.route_head.head.pool,
              "hai head có Pooling Stack RIÊNG")
     check("ClsHead/RouteHead: PoolingStack 256→1, target 14·3 / E; dec 64 token",
@@ -674,15 +688,15 @@ def lr_tests() -> None:
 
     def t_pretrain_groups():
         b = _branch()
-        pcfg = {"schedule": {"max_lr": 2e-4}, "weight_decay": 0.8}
+        pcfg = {"schedule": {"max_lr": 1.6e-4}, "weight_decay": 0.05}
         opt, n = S.build_optimizer(b, pcfg, {"attn_lr_mult": 3.0})
         by = {g["name"]: g for g in opt.param_groups}
         eq([g["name"] for g in opt.param_groups],
            ["branch_sup", "branch_sup_attn"], "nhóm Stage 0")
-        _close(by["branch_sup"]["lr"], 2e-4, "lr chính Stage 0")
-        _close(by["branch_sup_attn"]["lr"], 6e-4, "Attn Stage 0 = 3×")
-        eq(by["branch_sup"]["weight_decay"], 0.8)
-        eq(by["branch_sup_attn"]["weight_decay"], 0.8)
+        _close(by["branch_sup"]["lr"], 1.6e-4, "lr chính Stage 0")
+        _close(by["branch_sup_attn"]["lr"], 4.8e-4, "Attn Stage 0 = 3×")
+        eq(by["branch_sup"]["weight_decay"], 0.05)
+        eq(by["branch_sup_attn"]["weight_decay"], 0.05)
         eq({id(p) for p in by["branch_sup_attn"]["params"]}, attn_ids(b))
         want = {id(p) for nm, p in b.named_parameters()
                 if nm.split(".", 1)[0] in P.PRETRAINED_MODULES}
@@ -691,7 +705,7 @@ def lr_tests() -> None:
         raises(TrainUnusable,
                lambda: S.build_optimizer(b, pcfg, {"attn_lr_mult": 0.5}),
                "attn_lr_mult < 1 phải DỪNG")
-    check("Stage 0: lr 2e-4, Attn 6e-4, wd 0.8", t_pretrain_groups)
+    check("Stage 0: lr 1.6e-4, Attn 4.8e-4, wd 0.05", t_pretrain_groups)
 
     def t_scratch_groups():
         b = _branch()
@@ -754,7 +768,7 @@ def lr_tests() -> None:
         sch = cfg["train"]["schedule"]
         true("cycle_steps" not in sch and "lr_decay" not in sch,
              "decoder_ft: MỘT chu kỳ, không restart")
-        eq(float(cfg["pretrain"]["weight_decay"]), 0.8)
+        eq(float(cfg["pretrain"]["weight_decay"]), 0.05)
 
         def bad(mut, msg):
             c = load_config()
@@ -788,6 +802,10 @@ def lr_tests() -> None:
         eq(round_down_sig(5e-5, 0), 5e-5, "0 = tắt")
         eq(cycle_endpoints(2e-4, 30, 10, 1), (6e-6, 6e-7), "Stage 0")
         eq(cycle_endpoints(6e-4, 30, 10, 1), (2e-5, 2e-6), "Stage 0 Attn")
+        eq(cycle_endpoints(1.6e-4, 33.3333, 10, 2), (4.8e-6, 4.8e-7),
+           "Stage 0 = 0.8 × lịch cũ")
+        eq(cycle_endpoints(4.8e-4, 33.3333, 10, 2), (1.4e-5, 1.4e-6),
+           "Stage 0 Attn")
     check("làm tròn xuống: 6.67e-7 -> 6e-7, 3.33e-6 -> 3e-6", t_round_down)
 
     def t_one_cycle_whole_stage():

@@ -44,7 +44,7 @@ Hai baseline không bị đụng; muốn làm lại chúng thì `--retrain`.
 ── VÌ SAO STAGE 0 CỦA MY GEMMA KHÔNG CHẠY Ở ĐÂY ────────────────────────────
 `sup_pretrain` có điểm vào riêng (`scripts/run_pretrain.sh`), ghi ra
 `runs/<pretrain.subdir>/ckpt/latest`, và nó chạy trên TOÀN BỘ train split. Gộp nó
-vào đây nghĩa là mỗi lần chạy lại §2.5 để in một bảng cũng kéo theo 8 epoch
+vào đây nghĩa là mỗi lần chạy lại §2.5 để in một bảng cũng kéo theo 5 epoch
 pretrain — và tệ hơn, `--arms my_gemma` sẽ lặng lẽ pretrain LẠI trên một run
 dir khác. §2.5 chỉ NẠP checkpoint ấy và dừng nếu không thấy (mã 9).
 """
@@ -301,8 +301,17 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         f"{decoding_spec.unified(cfg)['max_new_tokens']} subword, hai baseline "
         f"`max_seq_length − 1` từ.")
     out.append(
-        "KHÔNG ĐỔI — R2Gen và AdaAtt chạy toàn bộ số epoch, optimizer, "
-        "scheduler và tiêu chí dừng sớm của paper gốc; My Gemma chạy "
+        "R2GEN · LỊCH — scheduler theo setup MIMIC-CXR của chính paper "
+        "(`train_mimic_cxr.sh`: StepLR step 1 · gamma 0.8) thay cho setup IU "
+        "X-ray (step 50 · gamma 0.1); số epoch "
+        f"{int(((cfg['sota'].get('r2gen') or {}).get('fine_tuning') or {}).get('epochs', 50))} "
+        "(paper: 100 IU X-ray / 30 MIMIC) và patience dừng sớm "
+        f"{int(((cfg['sota'].get('r2gen') or {}).get('fine_tuning') or {}).get('early_stopping', {}).get('patience', 5))} "
+        "(mặc định repo: 50) đặt vì chi phí. Từ điển giữ nguyên setup trong "
+        "config (max_seq_length 60, min_word_frequency 3).")
+    out.append(
+        "KHÔNG ĐỔI — ngoài các mục trên, R2Gen và AdaAtt chạy optimizer, lr "
+        "và tiêu chí chọn checkpoint của paper gốc; My Gemma chạy "
         "lịch của §2.3/§2.4. Đó là một khác biệt THẬT giữa ba cột và nó thuộc "
         "phần Giới hạn, không phải một lỗi cần sửa.")
     return out
@@ -388,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub.\n"
               "  Phép thử ĐƯỜNG ỐNG, không phải phép dò VRAM: nó chạy với đúng "
               "micro_batch trong config,\n  và vài bước trên 16 mẫu không nói "
-              "được gì về VRAM đỉnh của 9600 mẫu ở 512px.", flush=True)
+              "được gì về VRAM đỉnh của 6400 mẫu ở 512px.", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
     if a.no_wandb:

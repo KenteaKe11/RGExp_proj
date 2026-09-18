@@ -10,7 +10,7 @@ MỘT từ điển cho CẢ HAI. `sota.r2gen.tokenizer` là khối duy nhất kh
 (`max_seq_length: 60`, `min_word_frequency: 3`); AdaAtt không khai gì về từ
 điển trong setup gốc, nên nó dùng lại đúng từ điển ấy thay vì dựng một bản thứ
 hai với ngưỡng khác. Hai từ điển khác nhau nghĩa là hai không gian nhãn khác
-nhau, và khi đó "cùng 9600 mẫu train" không còn là cùng một bài toán.
+nhau, và khi đó "cùng 6400 mẫu train" không còn là cùng một bài toán.
 
 Từ điển được ghi ra `<run_dir>/tokenizer.json` và ĐỌC LẠI ở mọi stage sau. Dựng
 lại từ train_df mỗi lần là mời một lỗi im lặng: chỉ cần thứ tự hàng đổi (hay
@@ -153,7 +153,18 @@ def build_or_load(run_dir: Path, texts, tcfg: dict) -> WordTokenizer:
     """
     path = Path(run_dir) / "tokenizer.json"
     if path.exists():
-        return WordTokenizer.load(path)
+        tok = WordTokenizer.load(path)
+        want = (int(tcfg.get("max_seq_length", tok.max_seq_length)),
+                int(tcfg.get("min_word_frequency", tok.min_word_frequency)))
+        if want != (tok.max_seq_length, tok.min_word_frequency):
+            # Không dừng: stage `infer` phải giải mã đúng checkpoint cũ. Nhưng
+            # một lần chạy MỚI với config đã đổi mà lặng lẽ dùng từ điển cũ là
+            # lỗi im lặng — nên nói to ra, kèm cách làm lại.
+            print(f"  ⚠ tokenizer.json ({tok.max_seq_length}/{tok.min_word_frequency}) "
+                  f"KHÁC config ({want[0]}/{want[1]}) — đang dùng bản trên đĩa. "
+                  f"Muốn áp config mới: xoá {path} rồi chạy lại hai baseline "
+                  f"với --retrain.", flush=True)
+        return tok
     tok = WordTokenizer.build(
         texts,
         max_seq_length=int(tcfg.get("max_seq_length", 60)),

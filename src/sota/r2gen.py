@@ -13,7 +13,7 @@ Vì sao phải cài lại thay vì `pip install`: R2Gen không phát hành packa
 khối `initialization` của setup gốc nói mọi thứ ngoài visual encoder là
 `random`. Nghĩa là không có checkpoint nào để nạp — thứ duy nhất "nạp lại" là
 trọng số ImageNet của ResNet-101. Cài lại đúng kiến trúc rồi huấn luyện trên
-9600 mẫu của tập này CHÍNH LÀ điều kiện 1, không phải một cách lách nó.
+6400 mẫu của tập này CHÍNH LÀ điều kiện 1, không phải một cách lách nó.
 
 Ba chỗ dễ cài sai, xử ở đây:
   * Bộ nhớ chạy THEO BƯỚC, kể cả lúc huấn luyện (vòng `for` trên chiều thời

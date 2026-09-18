@@ -6,7 +6,7 @@ Sơ đồ tổng:
     Image ─► Vision Encoder ─┬─► Recombinator (256, 2560) ─┬─► Classification Head (14·3) ─► Sup Loss
                              │                             ├─► Route Head (E) ─► Aux Loss
                              │                             │        └─► Top-k Gate ─► Experts (LoRA)
-                             │                             └─► Linear/GELU 256→64 ──┐ (First)
+                             │                             └─► Linear/GELU 256→128 ─► Linear 128→64 ┐ (First)
                              └─► VL-Adapter (256 token) ────────────────────────────┤ (Second)
     Prompt ─► Embedding Layer ──────────────────────────────────────────────────────┴─► concat
                                                                   ─► Decoder [Experts (LoRA)] ─► CE Loss
@@ -63,8 +63,11 @@ Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`)
    trên trục token cho ra một tổ hợp ngẫu nhiên ở vài phần trăm biên độ — tức
    là xoá tín hiệu ngay tầng đầu.
 
-7. VÀO DECODER: `dec_proj` = Linear(256 → 64) trên trục token + GELU, không
-   cổng. Khởi tạo = trung bình 2×2 trên lưới 16×16 → 8×8. `dec_proj` KHÔNG
+7. VÀO DECODER: `dec_proj` = HAI Linear trên trục token, không cổng:
+   Linear(256 → 128) + GELU -> Linear(128 → 64) (lớp cuối KHÔNG GELU, để
+   token vào decoder nhận được cả giá trị âm như embedding thật). Khởi tạo tách
+   phép trung bình 2×2 (lưới 16×16 → 8×8) thành hai nửa: lớp 1 = trung bình
+   cặp NGANG (16×16 → 16×8), lớp 2 = trung bình cặp DỌC (16×8 → 8×8). `dec_proj` KHÔNG
    thuộc Stage 0 (decoder không chạy ở đó) — nó nằm trong
    `pretrain_io.UNTRAINED_MODULES` và học ở lr đầy đủ trong decoder_ft.
 
@@ -606,34 +609,70 @@ def cls_metrics(logits: torch.Tensor, target: torch.Tensor,
 
 # ══ Chiếu vào decoder ═══════════════════════════════════════════════════════
 class DecoderProjection(nn.Module):
-    """Linear/GELU (n_in → n_out) trên TRỤC TOKEN: (B, 256, d) -> (B, 64, d).
+    """Linear/GELU (n_in → n_mid) -> Linear (n_mid → n_out) trên TRỤC TOKEN.
 
-    Không bias, không norm, không cổng. Khởi tạo = trung bình 2×2 trên lưới
-    16×16 -> 8×8 (điểm 7 của docstring module).
+    (B, 256, d) -> (B, 128, d) -> (B, 64, d). Không bias, không norm, không
+    cổng; GELU chỉ ở giữa. Khởi tạo: tích hai ma trận = trung bình 2×2 trên
+    lưới 16×16 -> 8×8 (điểm 7 của docstring module), xem `split_grid_pool`.
     """
 
-    def __init__(self, n_in: int, n_out: int):
+    def __init__(self, n_in: int, n_out: int, n_mid: int | None = None):
         super().__init__()
         self.n_in = int(n_in)
         self.n_out = int(n_out)
-        if not 0 < self.n_out <= self.n_in:
+        self.n_mid = int(n_mid) if n_mid else self.n_in // 2
+        if not 0 < self.n_out <= self.n_mid <= self.n_in:
             raise ValueError(
-                f"recombiner.n_dec_tokens = {self.n_out} phải nằm trong "
-                f"(0, {self.n_in}] (số token của Recombinator). Chiếu LÊN nhiều "
+                f"dec_proj cần 0 < n_dec_tokens ({self.n_out}) <= n_dec_hidden "
+                f"({self.n_mid}) <= n_tokens ({self.n_in}). Chiếu LÊN nhiều "
                 f"token hơn chỉ nhân bản thông tin và kéo dài chuỗi decoder.")
-        self.proj = nn.Linear(self.n_in, self.n_out, bias=False)
+        self.proj1 = nn.Linear(self.n_in, self.n_mid, bias=False)
+        self.proj2 = nn.Linear(self.n_mid, self.n_out, bias=False)
         self.reset_parameters()
 
+    def init_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return split_grid_pool(self.n_in, self.n_mid, self.n_out)
+
     def reset_parameters(self) -> None:
+        w1, w2 = self.init_weights()
         with torch.no_grad():
-            self.proj.weight.copy_(avg_pool_matrix(self.n_in, self.n_out))
+            self.proj1.weight.copy_(w1)
+            self.proj2.weight.copy_(w2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[1] != self.n_in:
             raise RuntimeError(
                 f"dec_proj nhận {x.shape[1]} token nhưng được dựng cho "
                 f"{self.n_in} (= số token của Recombinator).")
-        return F.gelu(self.proj(x.transpose(1, 2)).transpose(1, 2))
+        h = F.gelu(self.proj1(x.transpose(1, 2)))
+        return self.proj2(h).transpose(1, 2)
+
+
+def split_grid_pool(n_in: int, n_mid: int, n_out: int
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hai ma trận (n_mid, n_in), (n_out, n_mid) có TÍCH = `avg_pool_matrix(n_in, n_out)`.
+
+    Lưới s×s -> t×t (k = s/t) được tách thành: pool NGANG k (s×s -> s×t, thứ
+    tự hàng-trước) rồi pool DỌC k (s×t -> t×t). Cần n_mid = s·t (256 -> 128 ->
+    64: 16×16 -> 16×8 -> 8×8). Không khớp dạng lưới thì mỗi lớp là trung bình
+    cụm liền kề của riêng nó (`avg_pool_matrix`).
+    """
+    n_in, n_mid, n_out = int(n_in), int(n_mid), int(n_out)
+    s, t = _isqrt_exact(n_in), _isqrt_exact(n_out)
+    if s and t and s % t == 0 and n_mid == s * t:
+        k = s // t
+        w1 = torch.zeros(n_mid, n_in)
+        for r in range(s):
+            for c in range(t):
+                for dc in range(k):
+                    w1[r * t + c, r * s + c * k + dc] = 1.0 / k
+        w2 = torch.zeros(n_out, n_mid)
+        for r in range(t):
+            for c in range(t):
+                for dr in range(k):
+                    w2[r * t + c, (r * k + dr) * t + c] = 1.0 / k
+        return w1, w2
+    return avg_pool_matrix(n_in, n_mid), avg_pool_matrix(n_mid, n_out)
 
 
 # ══ Nhánh hoàn chỉnh ════════════════════════════════════════════════════════
@@ -712,7 +751,9 @@ class RecombinerBranch(nn.Module):
             eps=float(a.get("eps", 1e-8)))
 
         self.n_dec_tokens = int(r.get("n_dec_tokens", 64))
-        self.dec_proj = DecoderProjection(self.n_tokens, self.n_dec_tokens)
+        self.n_dec_hidden = int(r.get("n_dec_hidden", self.n_tokens // 2))
+        self.dec_proj = DecoderProjection(self.n_tokens, self.n_dec_tokens,
+                                          self.n_dec_hidden)
 
         for m in (self.recombinator, self.cls_head, self.route_head):
             if m is not None:
@@ -741,15 +782,20 @@ class RecombinerBranch(nn.Module):
         return self.dec_proj(rec), logits, route
 
     def dec_stats(self) -> dict:
-        """`dec_proj_rel_change` = ‖W − W₀‖ / ‖W₀‖, W₀ là khởi tạo trung bình cụm."""
+        """`dec_proj_rel_change` = ‖W − W₀‖ / ‖W₀‖ trên CẢ HAI lớp (nối lại),
+        W₀ là khởi tạo trung bình cụm."""
         with torch.no_grad():
-            w = self.dec_proj.proj.weight.detach().float().cpu()
-            w0 = avg_pool_matrix(self.dec_proj.n_in, self.dec_proj.n_out)
+            dp = self.dec_proj
+            w = torch.cat([dp.proj1.weight.detach().float().cpu().flatten(),
+                           dp.proj2.weight.detach().float().cpu().flatten()])
+            w1, w2 = dp.init_weights()
+            w0 = torch.cat([w1.flatten(), w2.flatten()])
             d = float((w - w0).norm())
             n0 = float(w0.norm())
         return {
-            "kind": "linear_gelu_token_proj",
+            "kind": "linear_gelu_linear_token_proj",
             "n_in": int(self.dec_proj.n_in),
+            "n_dec_hidden": int(self.dec_proj.n_mid),
             "n_dec_tokens": int(self.dec_proj.n_out),
             "dec_proj_fro": float(w.norm()),
             "dec_proj_init_fro": n0,
@@ -779,6 +825,7 @@ class RecombinerBranch(nn.Module):
             "n_vis": int(rec.n_vis),
             "n_tokens": self.n_tokens,
             "n_dec_tokens": self.n_dec_tokens,
+            "n_dec_hidden": self.n_dec_hidden,
             "n_local": len(rec.local_extractors),
             "n_heads": int(rec.global_extractor.n_heads),
             "pool_stages": self.pool_stages,
@@ -800,7 +847,8 @@ class RecombinerBranch(nn.Module):
                 f"PoolingStack×{n['pool_stages']} -> MainHead "
                 f"(target {getattr(self.cls_head, 'n_labels', 0)}×"
                 f"{getattr(self.cls_head, 'n_classes', 0)} / {n['n_experts']}) · "
-                f"dec_proj Linear/GELU {n['n_tokens']}→{n['n_dec_tokens']}")
+                f"dec_proj Linear/GELU {n['n_tokens']}→{n['n_dec_hidden']} -> "
+                f"Linear {n['n_dec_hidden']}→{n['n_dec_tokens']}")
 
 
 def _init(module: nn.Module) -> None:

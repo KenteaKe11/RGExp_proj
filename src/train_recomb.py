@@ -241,7 +241,7 @@ def stale_gate_keys(cfg: Cfg) -> list[str]:
         return []
     return [f"config còn khoá của cổng vào decoder đã BỎ: {', '.join(found)}. "
             f"Token nay đi thẳng qua `dec_proj` (Linear/GELU 256 -> "
-            f"recombiner.n_dec_tokens). Xoá các khoá này."]
+            f"n_dec_hidden -> Linear -> recombiner.n_dec_tokens). Xoá các khoá này."]
 
 
 def stale_recomb_keys(cfg: Cfg) -> list[str]:
@@ -905,8 +905,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT'}) · dec_proj "
               f"{bstats['dec_proj']:,}", flush=True)
         print(f"  vào decoder: Linear/GELU {bstats['n_tokens']} -> "
-              f"{bstats['n_dec_tokens']} token (trục token, khởi tạo trung bình "
-              f"2×2) -> nối THẲNG vào chuỗi (First), trước 256 token ảnh "
+              f"{bstats['n_dec_hidden']} -> Linear -> {bstats['n_dec_tokens']} "
+              f"token (trục token, khởi tạo = trung bình 2×2 tách ngang/dọc) -> nối THẲNG vào chuỗi (First), trước 256 token ảnh "
               f"(Second), không cổng", flush=True)
         if spec is not None:
             print(f"  Route Head HOẠT ĐỘNG: Recombinator -> PoolingStack -> "

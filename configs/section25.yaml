@@ -18,7 +18,7 @@
 #
 # Câu hỏi của mục này, viết đủ một câu:
 #
-#     Trên CÙNG 9600 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
+#     Trên CÙNG 6400 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
 #     công thức Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10
 #     có hơn hai kiến trúc sinh báo cáo đã công bố (R2Gen, AdaAtt) không, và
 #     hơn BAO NHIÊU?
@@ -32,13 +32,13 @@
 # ── NĂM ĐIỀU KIỆN ĐƯỢC THỐNG NHẤT (không candidate nào được miễn) ──────────
 #  1. SOTA đối chứng chỉ nạp lại trọng số ở ĐÚNG trạng thái setup của paper
 #     gốc — khối `sota:` dưới đây là bản chép nguyên văn, không hiệu chỉnh.
-#  2. Cùng 9600 mẫu train / 3000 ảnh test của tập này (`data:`).
+#  2. Cùng 6400 mẫu train / 3000 ảnh test của tập này (`data:`).
 #  3. Kiểm định bằng Paired Bootstrap + Permutation Test (`stats:`).
 #  4. MỘT phương pháp resize duy nhất cho mọi model — kể cả khi kích thước
 #     đầu vào VÔ TÌNH khớp (`image_policy:`).
 #  5. Có ÍT NHẤT một kiến trúc mang stage pretrain/finetune cục bộ (R2Gen
 #     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
-#     một config pretrain (`pretrain:` — max_lr 2e-4, weight_decay 0.8), rồi
+#     một config pretrain (`pretrain:` — max_lr 1.6e-4, weight_decay 0.05), rồi
 #     vào main-stage. R2Gen/AdaAtt: lr phần đã pretrain = 1/10 lr chính thức
 #     (`train.pretrained_lr_mult: 0.1`).
 #     Riêng My Gemma: Stage 0 cho ma trận Attn của Recombinator chạy lr × 3
@@ -75,7 +75,7 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 9600
+  n_train: 6400
   val_split_csv: split_ref/val_split.csv
   n_val: 512
   assert_no_leak: true
@@ -204,10 +204,18 @@ sota:
         visual_encoder: {trainable: true, learning_rate: 0.00005}
         all_remaining_parameters: {trainable: true, learning_rate: 0.0001}
       optimizer: {type: Adam, amsgrad: true, weight_decay: 0.00005}
-      scheduler: {type: StepLR, step_size: 50, gamma: 0.1}
-      epochs: 100
+      # Scheduler lấy từ setup MIMIC-CXR CỦA CHÍNH PAPER (`train_mimic_cxr.sh`
+      # của repo gốc zhjohnchan/R2Gen: step_size 1, gamma 0.8) thay cho setup
+      # IU X-ray (step_size 50, gamma 0.1) — dữ liệu ở đây là MIMIC-CXR.
+      scheduler: {type: StepLR, step_size: 1, gamma: 0.8}
+      # epochs 50 + patience 5 là sai lệch CÓ CHỦ Ý vì chi phí (paper: 100 epoch
+      # IU X-ray / 30 epoch MIMIC, patience mặc định 50) — ghi vào
+      # manifest.deviations. Số bước tối đa: 6400/16 × 50 = 20 000 (trước:
+      # 9600/16 × 100 = 60 000). Với gamma 0.8/epoch, lr ở epoch 20 còn ~1%
+      # nên dừng sau 5 epoch không cải thiện BLEU_4 val hiếm khi bỏ lỡ gì.
+      epochs: 50
       batch_size: 16
-      early_stopping: {enabled: true, patience: 50, monitor: BLEU_4, mode: max}
+      early_stopping: {enabled: true, patience: 5, monitor: BLEU_4, mode: max}
     # Bản ghi của paper — §2.5 KHÔNG đọc khi sinh (xem khối `generate:`).
     decoding:
       method: beam_search
@@ -400,7 +408,7 @@ train:
   ft_lr:
     cls_head: 3.0e-4           # Sup Head: Pooling Stack + Main Head
     route_head: 3.0e-4         # Route Head (+ noise_proj)
-    dec_proj: 3.0e-4           # Concat Linear 256 -> 64 token vào decoder
+    dec_proj: 3.0e-4           # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
     recombinator_attn: 1.0e-4  # Q/K/V/O của Global Extractor
     recombinator: 3.0e-5       # phần còn lại: Local ×2, norm, FFN
   # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
@@ -444,7 +452,7 @@ recombiner:
   head_dim: 64
   dropout: 0.05
   # Ma trận Attn (Q/K/V/O của Global Extractor) chạy lr × hệ số này ở Stage 0
-  # (3 × 2e-4 = 6e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
+  # (3 × 1.6e-4 = 4.8e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
   # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_attn`. Phải >= 1.
   attn_lr_mult: 3.0
   # ── Classification Head / Route Head ────────────────────────────────────
@@ -463,14 +471,17 @@ recombiner:
   token_type: text
   dtype: null
 
-  # ── Vào decoder: Linear/GELU trên TRỤC TOKEN, KHÔNG cổng ────────────────
-  # 256 token của Recombinator -> Linear (không bias) + GELU -> `n_dec_tokens`
-  # token, nối THẲNG vào chuỗi decoder TRƯỚC 256 token ảnh (First / Second
-  # trong sơ đồ); phần văn bản của prompt giữ nguyên vị trí. Khởi tạo =
-  # trung bình 2×2 trên lưới 16×16 -> 8×8. Hai head vẫn đọc đủ 256 token.
+  # ── Vào decoder: HAI Linear trên TRỤC TOKEN, KHÔNG cổng ──────────────────
+  # 256 token của Recombinator -> Linear (không bias) + GELU -> `n_dec_hidden`
+  # (128) -> Linear (không bias, KHÔNG GELU) -> `n_dec_tokens` (64) token, nối
+  # THẲNG vào chuỗi decoder TRƯỚC 256 token ảnh (First / Second trong sơ đồ);
+  # phần văn bản của prompt giữ nguyên vị trí. Khởi tạo: tích hai lớp = trung
+  # bình 2×2 trên lưới 16×16 -> 8×8 (lớp 1 pool NGANG 16×16 -> 16×8, lớp 2 pool
+  # DỌC 16×8 -> 8×8). Hai head vẫn đọc đủ 256 token.
   # Khoá của kiến trúc cũ (`qformer`, `prepare_pool_factor`,
   # `highway_token_dims`, `swiglu_dropout`, `n_query`, `n_heads`, `gate*`) đã
   # BỎ — còn sót khoá nào là DỪNG.
+  n_dec_hidden: 128
   n_dec_tokens: 64
 
 classifier:
@@ -556,48 +567,53 @@ stats:
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ: `train_sota` đọc
 # nó cho R2Gen/AdaAtt, `src.run_pretrain` đọc nó cho My Gemma. Lịch: warm-up
-# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 8 epoch. Sau mỗi
-# restart, `lr_decay` hạ CẢ hai mốc (tức 8 chu kỳ nối nhau có biên giảm dần).
+# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 5 epoch. Sau mỗi
+# restart, `lr_decay` hạ CẢ hai mốc (tức 5 chu kỳ nối nhau có biên giảm dần).
 #
 # `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
 # chia, và min_lr là TÍCH của chúng:
 #
-#     lr đầu warm-up = max_lr / div_factor         = 2e-4 / 30 = 6.67e-6 -> 6e-6
-#     lr cuối cosine = lr đầu / final_div_factor   = 6.67e-7            -> 6e-7
+#     lr đầu warm-up = max_lr / div_factor  = 1.6e-4 / 33.3333 = 4.8e-6
+#     lr cuối cosine = lr đầu / final_div   = 4.8e-7
 #
-# "-> " là bước LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa (`round_down_sig: 1`),
-# áp riêng cho từng nhóm. Attn của Recombinator (× `recombiner.attn_lr_mult`
-# = 3): 2e-5 -> 6e-4 -> 2e-6 (đã tròn sẵn). Restart epoch e nhân cả đường
+# Cả đường cong = 0.8 × đường cong cũ (đỉnh 2e-4 -> 1.6e-4, đầu 6e-6 ->
+# 4.8e-6, đáy 6e-7 -> 4.8e-7). `div_factor` 33.3333 (≈ 100/3) giữ ĐÚNG tỉ lệ
+# đỉnh/đầu mà lịch cũ có SAU làm tròn (2e-4 / 6e-6); `round_down_sig: 2` vì
+# 4.8e-7 cần 2 chữ số có nghĩa (với 1 chữ số nó thành 4e-7/5e-7).
+# Làm tròn XUỐNG áp riêng cho từng nhóm. Attn của Recombinator
+# (× `recombiner.attn_lr_mult` = 3): 1.4e-5 -> 4.8e-4 -> 1.4e-6
+# (1.44e-5/1.44e-6 làm tròn xuống). Restart epoch e nhân cả đường
 # cong với 0.9^e. R2Gen/AdaAtt đọc CÙNG khối này (`train_sota`), nên cùng
 # quy tắc làm tròn.
 #
-# `min_lr: 6.0e-7` dưới đây là con số ĐƯỢC KIỂM, không phải con số được đọc:
+# `min_lr: 4.8e-7` dưới đây là con số ĐƯỢC KIỂM, không phải con số được đọc:
 # `scripts/selftest_section25.py` đối chiếu nó với hai hệ số (đã làm tròn) và
 # DỪNG nếu lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 9600 # 0 = toàn bộ train split đã khai ở `data`
-  n_epochs: 8
+  n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
+  n_epochs: 5
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16
   grad_accum: 2
   schedule:
     impl: lambda
-    max_lr: 2.0e-4
-    min_lr: 6.0e-7          # = round_down(max_lr / (div × final_div))
-    round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
+    max_lr: 1.6e-4          # = 0.8 × 2e-4 (lịch cũ)
+    min_lr: 4.8e-7          # = 0.8 × 6e-7 = round_down(max_lr / (div × final_div))
+    round_down_sig: 2       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
     # Restart epoch e nhân cả max_lr và min_lr với 0.9^e.
-    lr_decay: 0.9
+    lr_decay: 0.8
     pct_start: 0.1
-    div_factor: 30.0        # lr đầu warm-up = 2e-4 / 30 -> 6e-6
-    final_div_factor: 10.0  # lr cuối cosine            -> 6e-7
+    div_factor: 33.3333     # lr đầu warm-up = 1.6e-4 / 33.3333 -> 4.8e-6
+    final_div_factor: 10.0  # lr cuối cosine                   -> 4.8e-7
     anneal: cos
     cycle_momentum: false
   # AdamW (decoupled): mỗi bước kéo trọng số về 0 một lượng lr × wd
-  # (đỉnh 2e-4 × 0.8 = 1.6e-4; Attn 6e-4 × 0.8 = 4.8e-4). `weight_decay_range`
-  # là khoảng được selftest chấp nhận.
-  weight_decay: 0.8
+  # (đỉnh 1.6e-4 × 0.05 = 8e-6; Attn 4.8e-4 × 0.05 = 2.4e-5). 0.8 trước đây
+  # kéo trọng số về 0 mạnh tới mức triệt tiêu phần vừa học; 0.05 là mức
+  # AdamW thông dụng. `weight_decay_range` là khoảng được selftest chấp nhận.
+  weight_decay: 0.05
   weight_decay_range: [0.03, 1.0]
   base_method: qlora
   select_metric: cls_f1_pos

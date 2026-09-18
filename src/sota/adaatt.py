@@ -3,7 +3,7 @@
 Cài lại theo setup gốc trong `configs/section25.yaml` (`sota.adaatt`). Bài báo
 gốc là Torch/Lua (`jiasenlu/AdaptiveAttention`) nên không có gì để `pip
 install`, và khối `initialization` của nó nói mọi thứ ngoài ResNet-152 là
-`random`. Cài lại đúng kiến trúc rồi huấn luyện trên 9600 mẫu của tập này
+`random`. Cài lại đúng kiến trúc rồi huấn luyện trên 6400 mẫu của tập này
 CHÍNH LÀ điều kiện 1.
 
 Cái làm nên bài báo là **visual sentinel**: ở mỗi bước, mô hình tự quyết định

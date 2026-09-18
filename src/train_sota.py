@@ -8,7 +8,7 @@ ra điều đó.
 ── HAI STAGE, VÀ RANH GIỚI GIỮA CHÚNG ──────────────────────────────────────
 STAGE 0 (điều kiện 5) — `cfg.pretrain`, GIỐNG HỆT nhau ở mọi candidate:
     CNN đóng băng, phần ngôn ngữ học trước. Lịch warm-up cosine, một chu kỳ =
-    một epoch, 8 epoch, max_lr 2e-4 -> min_lr ≈ 6.67e-7, weight decay 0.8.
+    một epoch, 5 epoch, max_lr 1.6e-4 -> min_lr 4.8e-7, weight decay 0.05.
 
     Với AdaAtt, stage này THAY THẾ `fine_tuning.stage_1` của paper (cùng ý đồ —
     "train language model without CNN fine-tuning" — nhưng lr và lịch lấy từ
@@ -314,7 +314,7 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
 
         def lr_fn0(step: int, group: dict) -> float:
             # MỘT chu kỳ = MỘT epoch: bước được lấy modulo số bước mỗi epoch,
-            # nên lr quay lại đỉnh ở đầu mỗi epoch thay vì tắt dần suốt 8 epoch.
+            # nên lr quay lại đỉnh ở đầu mỗi epoch thay vì tắt dần suốt cả Stage 0.
             span = max(1, steps_per_epoch // cycle_per_epoch)
             return one_cycle_lr(
                 step % span, span, max_lr0, float(p_sched.get("pct_start", 0.1)),

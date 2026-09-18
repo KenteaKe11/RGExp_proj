@@ -59,8 +59,8 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# lr Stage 0: 6e-6 -> 2e-4 -> 6e-7 mỗi epoch, weight_decay 0.8; ma trận Attn (Q/K/V/O) của
-# Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 6e-4. Ckpt dở dang ghi
+# lr Stage 0: 4.8e-6 -> 1.6e-4 -> 4.8e-7 mỗi epoch, weight_decay 0.05; ma trận Attn (Q/K/V/O) của
+# Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 4.8e-4. Ckpt dở dang ghi
 # bằng optimizer một nhóm KHÔNG nối tiếp được: chạy với --no-resume.
 # Sup Loss: ASL gamma_neg [4, 3, 0] (neg/pos/uncertain) · gamma_pos 0 · clip
 # 0.05. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.

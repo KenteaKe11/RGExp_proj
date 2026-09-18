@@ -6,7 +6,7 @@ thật sự được pretrain, không hơn.
 route_head, dec_proj. Ở chế độ pretrain, hai khối cuối KHÔNG nhận một gradient
 nào:
 
-  * `dec_proj` là phép chiếu (Linear/GELU 256→64 trên trục token) vào DECODER,
+  * `dec_proj` là phép chiếu (Linear/GELU 256→128 → Linear 128→64 trên trục token) vào DECODER,
     và pretrain không chạy decoder. Nó ở lại đúng khởi tạo trung bình cụm.
   * `route_head` chỉ được gọi khi định tuyến bật (`route_enabled`), mà
     pretrain tắt định tuyến — không có Experts nào để chọn. Nó ở lại đúng giá

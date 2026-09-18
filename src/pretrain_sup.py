@@ -192,7 +192,7 @@ def pretrain_rcfg(cfg: Cfg) -> dict:
       * `route_enabled = false` — không có gì để định tuyến khi không có
         decoder. Route Head khi đó KHÔNG được gọi trong forward, nên nó không
         nhận gradient và không vào file.
-      * `dec_proj` (Linear/GELU 256→64 vào decoder) cũng không nhận gradient ở
+      * `dec_proj` (Linear/GELU 256→128 → Linear 128→64 vào decoder) cũng không nhận gradient ở
         đây và không vào file: nó tới `decoder_ft` ở đúng khởi tạo trung bình cụm.
     """
     r = dict(cfg.get("recombiner", {}) or {})
