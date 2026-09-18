@@ -498,9 +498,9 @@ classifier:
   # `clip` 0.05: ô âm đã có p < 0.05 bị loại hẳn khỏi gradient.
   # `lambda` 0.4: trọng số ASL cạnh CE ở main-stage (Stage 0 chỉ có ASL).
   asl:
-    gamma_neg: [4.0, 3.0, 0.0]
+    gamma_neg: [4.0, 2.0, 0.0]
     gamma_pos: 0.0
-    clip: 0.05
+    clip: 0.08
     eps: 1.0e-8
   lambda: 0.4
   lambda_warmup_pct: 0.1
@@ -610,7 +610,7 @@ pretrain:
     anneal: cos
     cycle_momentum: false
   # AdamW (decoupled): mỗi bước kéo trọng số về 0 một lượng lr × wd
-  # (đỉnh 1.6e-4 × 0.05 = 8e-6; Attn 4.8e-4 × 0.05 = 2.4e-5). 0.8 trước đây
+  # (đỉnh 1.6e-4 × 0.2 = 3.2e-5; Attn 4.8e-4 × 0.2 = 9.6e-5). 0.8 trước đây
   # kéo trọng số về 0 mạnh tới mức triệt tiêu phần vừa học; 0.05 là mức
   # AdamW thông dụng. `weight_decay_range` là khoảng được selftest chấp nhận.
   weight_decay: 0.2
