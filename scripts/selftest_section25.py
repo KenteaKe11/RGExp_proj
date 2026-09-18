@@ -117,7 +117,7 @@ def t_lr_asl_lambda_config():
     """Con số của cấu hình hiện tại — đặc tả trong README/config phải khớp."""
     p, t = CFG["pretrain"], CFG["train"]
     assert abs(float(p["schedule"]["max_lr"]) - 1.6e-4) < 1e-12
-    assert abs(float(p["weight_decay"]) - 0.05) < 1e-12
+    assert abs(float(p["weight_decay"]) - 0.2) < 1e-12
     assert float(CFG["recombiner"]["attn_lr_mult"]) == 3.0
     assert {k: float(v) for k, v in t["ft_lr"].items()} == {
         "cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
@@ -137,14 +137,14 @@ def t_lr_asl_lambda_config():
     assert list(t["freeze_after_pretrain"] or []) == []
     assert "pretrained_lr_parts" not in t
     c = CFG["classifier"]
-    assert [float(x) for x in c["asl"]["gamma_neg"]] == [4.0, 3.0, 0.0]
-    assert float(c["asl"]["clip"]) == 0.05
+    assert [float(x) for x in c["asl"]["gamma_neg"]] == [4.0, 2.0, 0.0]
+    assert float(c["asl"]["clip"]) == 0.08
     assert float(c["lambda"]) == 0.4
     assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 6400
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for s in ("attn_lr_mult", "train.ft_lr", "**1e-7**", "round_down_sig",
-              "weight_decay: 0.05",
-              "gamma_neg: [4.0, 3.0, 0.0]", "classifier.lambda: 0.4",
+              "weight_decay: 0.2",
+              "gamma_neg: [4.0, 2.0, 0.0]", "classifier.lambda: 0.4",
               "6400 mẫu train"):
         assert s in readme, f"README không nhắc `{s}`"
 
@@ -158,7 +158,7 @@ def t_stage0_schedule_encodes_min_lr():
     want = float(s["min_lr"])
     assert got[1] == want, (got, want)
     assert got == (4.8e-6, 4.8e-7), got       # = 0.8 × (6e-6, 6e-7) của lịch cũ
-    assert int(CFG["pretrain"]["n_epochs"]) == 5
+    assert int(CFG["pretrain"]["n_epochs"]) == 10
     lo, hi = CFG["pretrain"]["weight_decay_range"]
     assert lo <= float(CFG["pretrain"]["weight_decay"]) <= hi
 

@@ -772,7 +772,7 @@ def lr_tests() -> None:
         sch = cfg["train"]["schedule"]
         true("cycle_steps" not in sch and "lr_decay" not in sch,
              "decoder_ft: MỘT chu kỳ, không restart")
-        eq(float(cfg["pretrain"]["weight_decay"]), 0.05)
+        eq(float(cfg["pretrain"]["weight_decay"]), 0.2)
 
         def bad(mut, msg):
             c = load_config()

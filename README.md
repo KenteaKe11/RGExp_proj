@@ -91,7 +91,7 @@ lr đỉnh:
 | Phần còn lại của Recombinator (`recombinator`) | 1.6e-4 | **3e-5** |
 | Experts (LoRA) — cùng lr với Attn | — | **1e-4** (`train.schedule.max_lr`) |
 
-Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.05`, hệ số Attn
+Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`, hệ số Attn
 `recombiner.attn_lr_mult: 3`. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
 stage (không restart) để mọi nhóm cùng hội tụ.
 
@@ -111,9 +111,9 @@ và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 ch�
 Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
 làm tròn.
 
-Sup Loss (dùng chung cho hai giai đoạn): ASL với `gamma_neg: [4.0, 3.0, 0.0]`
+Sup Loss (dùng chung cho hai giai đoạn): ASL với `gamma_neg: [4.0, 2.0, 0.0]`
 (nén theo tên lớp neg/pos/uncertain trên ô mang nhãn 0), `gamma_pos: 0.0`,
-`clip: 0.05`; ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
+`clip: 0.08`; ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
 warmup. META và model card của checkpoint Stage 0 ghi max_lr từng nhóm,
 `attn_lr_mult`, `weight_decay` và ASL; `run_pretrain.sh --resume` báo khi các
 khoá này khác config hiện tại.
