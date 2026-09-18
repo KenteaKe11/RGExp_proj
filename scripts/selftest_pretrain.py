@@ -713,8 +713,12 @@ def lr_tests() -> None:
                                    lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
         eq(list(by), ["lora", "branch", "branch_attn"], "nhóm của scratch")
-        _close(by["branch"]["lr"], 3e-4)
-        _close(by["branch_attn"]["lr"], 9e-4, "scratch: Attn = 3 × main")
+        # scratch đọc lr chính từ `lrs["main"]` (= train.schedule.max_lr = 1e-4),
+        # KHÔNG từ TCFG: truyền `lrs` là thắng. Attn = main × attn_mult.
+        _close(by["lora"]["lr"], LRS["main"])
+        _close(by["branch"]["lr"], LRS["main"])
+        _close(by["branch_attn"]["lr"], LRS["main"] * LRS["attn_mult"],
+               "scratch: Attn = 3 × main")
         eq({id(p) for p in by["branch_attn"]["params"]}, attn_ids(b))
     check("scratch: nhánh lr chính, Attn × 3", t_scratch_groups)
 
