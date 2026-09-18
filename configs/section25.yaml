@@ -70,7 +70,7 @@ data:
   ref_column: text_gt
   n_test: 3000
   cache_dir: ./data
-  image_max_side: 512
+  image_max_side: 256
   image_max_side_enforce: true
   zip_mode: auto
   zip_stream_min_rate: 1.0
@@ -406,7 +406,7 @@ train:
   # bằng `recombinator_attn`).
   # Phải khai ĐỦ năm khoá, mỗi tham số nhánh thuộc đúng một nhóm.
   ft_lr:
-    cls_head: 3.0e-4           # Sup Head: Pooling Stack + Main Head
+    cls_head: 1.0e-4           # Sup Head: Pooling Stack + Main Head
     route_head: 3.0e-4         # Route Head (+ noise_proj)
     dec_proj: 3.0e-4           # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
     recombinator_attn: 1.0e-4  # Q/K/V/O của Global Extractor
@@ -498,11 +498,11 @@ classifier:
   # `clip` 0.05: ô âm đã có p < 0.05 bị loại hẳn khỏi gradient.
   # `lambda` 0.4: trọng số ASL cạnh CE ở main-stage (Stage 0 chỉ có ASL).
   asl:
-    gamma_neg: [4.0, 3.0, 0.0]
+    gamma_neg: [4.0, 2.0, 0.0]
     gamma_pos: 0.0
-    clip: 0.05
+    clip: 0.08
     eps: 1.0e-8
-  lambda: 0.4
+  lambda: 0.5
   lambda_warmup_pct: 0.1
   # Nhánh vào main-stage đã qua Stage 0 => ClsHead không còn ngẫu nhiên =>
   # không warmup. Đây là hệ quả của điều kiện 5, không phải một lựa chọn rời.
@@ -592,18 +592,18 @@ stats:
 # đường cong lr sai không ném exception nào.
 pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
-  n_epochs: 5
+  n_epochs: 10
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16
   grad_accum: 2
   schedule:
     impl: lambda
-    max_lr: 1.6e-4          # = 0.8 × 2e-4 (lịch cũ)
-    min_lr: 4.8e-7          # = 0.8 × 6e-7 = round_down(max_lr / (div × final_div))
+    max_lr: 3.6e-4          # = 0.8 × 2e-4 (lịch cũ)
+    min_lr: 4.8e-8          # = 0.8 × 6e-7 = round_down(max_lr / (div × final_div))
     round_down_sig: 2       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
     # Restart epoch e nhân cả max_lr và min_lr với 0.9^e.
-    lr_decay: 0.8
+    lr_decay: 0.85
     pct_start: 0.1
     div_factor: 33.3333     # lr đầu warm-up = 1.6e-4 / 33.3333 -> 4.8e-6
     final_div_factor: 10.0  # lr cuối cosine                   -> 4.8e-7
@@ -613,7 +613,7 @@ pretrain:
   # (đỉnh 1.6e-4 × 0.05 = 8e-6; Attn 4.8e-4 × 0.05 = 2.4e-5). 0.8 trước đây
   # kéo trọng số về 0 mạnh tới mức triệt tiêu phần vừa học; 0.05 là mức
   # AdamW thông dụng. `weight_decay_range` là khoảng được selftest chấp nhận.
-  weight_decay: 0.05
+  weight_decay: 0.1
   weight_decay_range: [0.03, 1.0]
   base_method: qlora
   select_metric: cls_f1_pos
