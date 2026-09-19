@@ -319,18 +319,18 @@ loss = CE_decoder( decoder([prompt ‖ 64 token dec_proj ‖ 256 token ảnh]) )
 <tr><td>Batch</td><td>1 × grad_accum 32 = <b>32 hiệu dụng</b> → 200 bước; hằng số, hết VRAM là dừng (không dò batch)</td></tr>
 <tr><td>Chuỗi</td><td><code>max_seq_len</code> 1024, gradient checkpointing <b>non-reentrant</b> (bắt buộc để router nhận gradient)</td></tr>
 <tr><td>Optimizer</td><td>AdamW, weight_decay 0.01 (cả nhánh), <code>max_grad_norm</code> 1.0</td></tr>
-<tr><td>Lịch</td><td><b>một</b> chu kỳ one-cycle cho cả stage (không restart), warm-up 10%, cosine, div 30 · final_div 10, làm tròn xuống; <code>min_lr</code> 1e-7 được kiểm (lệch là dừng)</td></tr>
+<tr><td>Lịch</td><td><b>một</b> chu kỳ one-cycle cho cả stage (không restart), warm-up 10%, cosine, div 30 · final_div 33.3, làm tròn xuống; <code>min_lr</code> 3e-8 được kiểm (lệch là dừng)</td></tr>
 <tr><td>Log</td><td>mỗi 10 bước; thêm <code>grad_norm_{local,global,ffn}_mean_per_param</code> = L2(gradient)/số tham số từng khối Recombinator, trước clipping</td></tr>
 </table></div>
 <p><b>lr theo nhóm (decoder_ft):</b></p>
 <div class="tbl"><table>
 <tr><th>Nhóm</th><th>Đầu warm-up</th><th>Đỉnh</th><th>Đáy</th></tr>
-<tr><td>Sup Head (<code>cls_head</code>) · Route Head (<code>route_head</code>) · Concat Linear (<code>dec_proj</code>, 256 → 128 → 64)</td><td>1e-5</td><td><b>3e-4</b></td><td>1e-6</td></tr>
-<tr><td>Attn Q/K/V/O của Recombinator (<code>recombinator_attn</code>)</td><td>3e-6</td><td><b>1e-4</b></td><td>3e-7</td></tr>
-<tr><td>Experts (LoRA) — cùng lr với Attn</td><td>3e-6</td><td><b>1e-4</b></td><td>3e-7</td></tr>
-<tr><td>Phần còn lại của Recombinator (Local ×2, norm, FFN)</td><td>1e-6</td><td><b>3e-5</b></td><td><b>1e-7</b></td></tr>
+<tr><td>MLP gate — Route Head (<code>route_head</code>)</td><td>2e-5</td><td><b>6e-4</b></td><td>6e-7</td></tr>
+<tr><td>FFN của Recombinator (<code>recombinator_ffn</code>) · Concat Linear (<code>dec_proj</code>, 256 → 128 → 64)</td><td>1e-5</td><td><b>3e-4</b></td><td>3e-7</td></tr>
+<tr><td>Experts (LoRA)</td><td>3e-6</td><td><b>1e-4</b></td><td>1e-7</td></tr>
+<tr><td>Local ×2 (<code>recombinator_local</code>) · Global (<code>recombinator_global</code>, norm + Q/K/V/O) · Sup Head (<code>cls_head</code>)</td><td>1e-6</td><td><b>3e-5</b></td><td><b>3e-8</b></td></tr>
 </table></div>
-<p>Ý đồ: head mới (route, dec_proj) và head đã pretrain học nhanh; phần thân Recombinator đã học ở Stage 0 chỉ tinh chỉnh chậm (3e-5) để không phá đặc trưng phân loại.</p>
+<p>Ý đồ: MLP gate (mới, ngẫu nhiên) học nhanh nhất; FFN và Concat Linear học nhanh để khớp decoder; Local/Global/Sup Head đã học ở Stage 0 chỉ tinh chỉnh chậm (3e-5) để không phá đặc trưng phân loại.</p>
 <h3>4.4. Sup Loss — ASL</h3>
 <ul>
 <li><code>gamma_neg: [4.0, 3.0, 0.0]</code> theo <b>tên lớp</b> neg/pos/uncertain, áp lên ô mang nhãn 0 (nén mạnh các ô âm dễ); <code>gamma_pos: 0.0</code>; <code>clip: 0.05</code> (ô âm có p &lt; 0.05 bị loại khỏi gradient); eps 1e-8.</li>

@@ -376,24 +376,26 @@ train:
   logging_steps: 10
   # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (mọi epoch, không restart —
   # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
-  # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 10, rồi đầu warm-up và
-  # đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa (`round_down_sig: 1`):
+  # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
+  # rồi đầu warm-up và đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa
+  # (`round_down_sig: 1`):
   #
-  #     nhóm                          đầu      đỉnh     đáy
-  #     cls_head/route_head/dec_proj  1e-5  -> 3e-4  -> 1e-6
-  #     adapter (LoRA/Experts) = Attn 3e-6  -> 1e-4  -> 3e-7   (3.33.. -> 3)
-  #     recombinator                  1e-6  -> 3e-5  -> 1e-7   <- đáy nhỏ nhất
+  #     nhóm                                    đầu      đỉnh     đáy
+  #     route_head (MLP gate)                   2e-5  -> 6e-4  -> 6e-7
+  #     recombinator_ffn / dec_proj             1e-5  -> 3e-4  -> 3e-7
+  #     adapter (LoRA/Experts)                  3e-6  -> 1e-4  -> 1e-7   (3.33.. -> 3)
+  #     recombinator_local/_global · cls_head   1e-6  -> 3e-5  -> 3e-8   <- đáy nhỏ nhất
   #
   # `min_lr` là con số ĐƯỢC KIỂM (`train_recomb.ft_lrs` DỪNG nếu lệch), không
   # phải con số được đọc.
   schedule:
     impl: lambda
-    max_lr: 1.0e-4          # adapter / Experts — CÙNG lr với Attn
-    min_lr: 1.0e-7          # = đáy (đã làm tròn) của nhóm nhỏ nhất
+    max_lr: 1.0e-4          # adapter / Experts (LoRA)
+    min_lr: 3.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất
     round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
     pct_start: 0.1
     div_factor: 30.0
-    final_div_factor: 10.0
+    final_div_factor: 33.3  # 3e-5 / 30 / 33.3 = 3.003e-8 -> làm tròn 3e-8
     anneal: cos
     cycle_momentum: false
   branch_weight_decay: 0.01
@@ -402,15 +404,15 @@ train:
   # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
   pretrained_lr_mult: 0.1
   # My Gemma · decoder_ft — lr ĐỈNH từng nhóm của nhánh
-  # (`train_recomb.build_optimizer`; adapter/Experts ở `schedule.max_lr`,
-  # bằng `recombinator_attn`).
-  # Phải khai ĐỦ năm khoá, mỗi tham số nhánh thuộc đúng một nhóm.
+  # (`train_recomb.build_optimizer`; adapter/Experts ở `schedule.max_lr`).
+  # Phải khai ĐỦ sáu khoá, mỗi tham số nhánh thuộc đúng một nhóm.
   ft_lr:
-    cls_head: 3.0e-4           # Sup Head: Pooling Stack + Main Head
-    route_head: 3.0e-4         # Route Head (+ noise_proj)
-    dec_proj: 3.0e-4           # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
-    recombinator_attn: 1.0e-4  # Q/K/V/O của Global Extractor
-    recombinator: 3.0e-5       # phần còn lại: Local ×2, norm, FFN
+    cls_head: 3.0e-5             # Sup Head: Pooling Stack + Main Head
+    route_head: 6.0e-4           # MLP gate: Route Head (+ noise_proj) -> Top-k Gate
+    dec_proj: 3.0e-4             # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
+    recombinator_local: 3.0e-5   # Local Extractor ×2
+    recombinator_global: 3.0e-5  # Global Extractor: norm_q/norm_kv + Q/K/V/O
+    recombinator_ffn: 3.0e-4     # FFN 1152 -> 2560 -> 2560
   # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
   # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer). Nhận:
   # recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
@@ -453,7 +455,7 @@ recombiner:
   dropout: 0.05
   # Ma trận Attn (Q/K/V/O của Global Extractor) chạy lr × hệ số này ở Stage 0
   # (3 × 1.6e-4 = 4.8e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
-  # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_attn`. Phải >= 1.
+  # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_global`. Phải >= 1.
   attn_lr_mult: 3.0
   # ── Classification Head / Route Head ────────────────────────────────────
   # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
@@ -592,7 +594,7 @@ stats:
 # đường cong lr sai không ném exception nào.
 pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
-  n_epochs: 10
+  n_epochs: 6
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16

@@ -652,12 +652,13 @@ def ids_of(mod) -> set:
     return {id(p) for p in mod.parameters()}
 
 
-FT_LR = {"cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
-         "recombinator_attn": 1e-4, "recombinator": 3e-5}
+FT_LR = {"cls_head": 3e-5, "route_head": 6e-4, "dec_proj": 3e-4,
+         "recombinator_local": 3e-5, "recombinator_global": 3e-5,
+         "recombinator_ffn": 3e-4}
 LRS = {"main": 1e-4, "groups": dict(FT_LR), "attn_mult": 3.0,
-       "min_lr": 1e-7, "floor": 1e-7}
+       "min_lr": 3e-8, "floor": 3e-8}
 FT_GROUPS = ["lora", "cls_head", "route_head", "dec_proj",
-             "recombinator_attn", "recombinator"]
+             "recombinator_local", "recombinator_global", "recombinator_ffn"]
 
 
 def _close(a, b, msg=""):
@@ -728,10 +729,11 @@ def lr_tests() -> None:
                                    lrs=LRS)
         by = {g["name"]: g for g in opt.param_groups}
         eq(list(by), FT_GROUPS, "nhóm của decoder_ft (adapter ĐẦU)")
-        _close(by["lora"]["lr"], 1e-4, "adapter = Attn")
+        _close(by["lora"]["lr"], 1e-4, "adapter")
         for g, v in FT_LR.items():
             _close(by[g]["lr"], v, f"lr đỉnh {g}")
-    check("decoder_ft: 3e-4 head/concat · LoRA = Attn 1e-4 · Recomb 3e-5",
+    check("decoder_ft: gate 6e-4 · FFN/concat 3e-4 · LoRA 1e-4 · "
+          "Local/Global/Cls 3e-5",
           t_ft_groups)
 
     def t_ft_membership():
@@ -743,9 +745,10 @@ def lr_tests() -> None:
         eq(by["cls_head"], ids_of(b.cls_head), "Sup Head = cả cls_head")
         eq(by["route_head"], ids_of(b.route_head))
         eq(by["dec_proj"], ids_of(b.dec_proj), "Concat Linear = dec_proj")
-        eq(by["recombinator_attn"], attn_ids(b))
-        eq(by["recombinator"], ids_of(b.recombinator) - attn_ids(b),
-           "phần còn lại của Recombinator")
+        eq(by["recombinator_local"], ids_of(b.recombinator.local_extractors))
+        eq(by["recombinator_global"], ids_of(b.recombinator.global_extractor))
+        true(attn_ids(b) <= by["recombinator_global"], "Attn thuộc Global")
+        eq(by["recombinator_ffn"], ids_of(b.recombinator.ffn))
         allp = [x for n in FT_GROUPS[1:] for x in by[n]]
         eq(len(allp), len(set(allp)), "không tham số nào ở hai nhóm")
         eq(set(allp), ids_of(b), "MỌI tham số nhánh đều có nhóm")
@@ -763,12 +766,13 @@ def lr_tests() -> None:
         cfg = load_config()
         l = T.ft_lrs(cfg)
         _close(l["main"], 1e-4, "adapter")
-        _close(l["main"], l["groups"]["recombinator_attn"], "LoRA = Attn")
-        eq(l["endpoints"]["adapter"], (3e-6, 3e-7), "LoRA làm tròn xuống")
-        eq(l["endpoints"]["recombinator_attn"], (3e-6, 3e-7))
+        eq(l["endpoints"]["adapter"], (3e-6, 1e-7), "LoRA làm tròn xuống")
+        eq(l["endpoints"]["route_head"], (2e-5, 6e-7))
+        eq(l["endpoints"]["recombinator_ffn"], (1e-5, 3e-7))
+        eq(l["endpoints"]["recombinator_global"], (1e-6, 3e-8))
         for g, v in FT_LR.items():
             _close(l["groups"][g], v, f"config ft_lr.{g}")
-        _close(l["floor"], 1e-7, "đáy nhỏ nhất = 3e-5 / 300")
+        _close(l["floor"], 3e-8, "đáy nhỏ nhất = 3e-5 / (30 × 33.3)")
         sch = cfg["train"]["schedule"]
         true("cycle_steps" not in sch and "lr_decay" not in sch,
              "decoder_ft: MỘT chu kỳ, không restart")
@@ -781,7 +785,7 @@ def lr_tests() -> None:
 
         bad(lambda c: c["train"]["ft_lr"].pop("dec_proj"), "thiếu nhóm")
         bad(lambda c: c["train"]["ft_lr"].__setitem__("x", 1e-4), "thừa nhóm")
-        bad(lambda c: c["train"]["ft_lr"].__setitem__("recombinator", 0.0),
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("recombinator_ffn", 0.0),
             "lr 0")
         bad(lambda c: c["train"]["schedule"].__setitem__("min_lr", 1e-6),
             "min_lr lệch đáy thật")
@@ -791,7 +795,7 @@ def lr_tests() -> None:
             "khoá đã bỏ")
         bad(lambda c: c["recombiner"].__setitem__("attn_lr_mult", 0.9),
             "attn < 1")
-    check("ft_lrs đọc config: ft_lr, đáy 1e-7, khoá sai -> DỪNG",
+    check("ft_lrs đọc config: ft_lr, đáy 3e-8, khoá sai -> DỪNG",
           t_ft_lrs_from_cfg)
 
     def t_round_down():
@@ -829,25 +833,27 @@ def lr_tests() -> None:
             sch.step()
             seen.append({g["name"]: g["lr"] for g in opt.param_groups})
         for row in seen:
-            _close(row["lora"], row["recombinator_attn"], "LoRA = Attn mọi bước")
-            _close(row["cls_head"] / row["recombinator"], 10.0, "tỉ lệ head/Recomb")
-        want0 = {"lora": 3e-6, "cls_head": 1e-5, "route_head": 1e-5,
-                 "dec_proj": 1e-5, "recombinator_attn": 3e-6,
-                 "recombinator": 1e-6}
-        want_end = {"lora": 3e-7, "cls_head": 1e-6, "route_head": 1e-6,
-                    "dec_proj": 1e-6, "recombinator_attn": 3e-7,
-                    "recombinator": 1e-7}
+            _close(row["route_head"] / row["recombinator_local"], 20.0,
+                   "tỉ lệ gate/Local")
+            _close(row["recombinator_ffn"] / row["recombinator_global"], 10.0,
+                   "tỉ lệ FFN/Global")
+        want0 = {"lora": 3e-6, "cls_head": 1e-6, "route_head": 2e-5,
+                 "dec_proj": 1e-5, "recombinator_local": 1e-6,
+                 "recombinator_global": 1e-6, "recombinator_ffn": 1e-5}
+        want_end = {"lora": 1e-7, "cls_head": 3e-8, "route_head": 6e-7,
+                    "dec_proj": 3e-7, "recombinator_local": 3e-8,
+                    "recombinator_global": 3e-8, "recombinator_ffn": 3e-7}
         for g in want0:
             true(abs(seen[0][g] - want0[g]) < 1e-9 * want0[g],
                  f"đầu warm-up {g}: {seen[0][g]!r} != {want0[g]}")
             true(abs(seen[-1][g] - want_end[g]) < 1e-9 * want_end[g],
                  f"đáy {g}: {seen[-1][g]!r} != {want_end[g]}")
-        peak = max(range(total), key=lambda i: seen[i]["cls_head"])
+        peak = max(range(total), key=lambda i: seen[i]["route_head"])
         true(peak <= int(0.1 * total) + 1, f"đỉnh phải ở cuối warm-up, đang {peak}")
-        true(all(seen[i + 1]["cls_head"] <= seen[i]["cls_head"] + 1e-15
+        true(all(seen[i + 1]["route_head"] <= seen[i]["route_head"] + 1e-15
                  for i in range(peak, total - 1)),
              "sau đỉnh lr chỉ giảm — không restart")
-    check("one-cycle cho cả stage: đầu/đáy làm tròn, không restart, đáy 1e-7",
+    check("one-cycle cho cả stage: đầu/đáy làm tròn, không restart, đáy 3e-8",
           t_one_cycle_whole_stage)
 
 

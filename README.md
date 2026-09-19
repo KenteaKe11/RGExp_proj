@@ -84,18 +84,20 @@ lr đỉnh:
 
 | nhóm | Stage 0 | decoder_ft (`train.ft_lr`) |
 |---|---|---|
-| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-4** |
-| Route Head (`route_head`) | — | **3e-4** |
+| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-5** |
+| MLP gate — Route Head (`route_head`) | — | **6e-4** |
 | Concat Linear (`dec_proj`, 256 → 128 GELU → 64 token) | — | **3e-4** |
-| Attn (Q/K/V/O) của Recombinator (`recombinator_attn`) | 1.6e-4 × 3 = **4.8e-4** | **1e-4** |
-| Phần còn lại của Recombinator (`recombinator`) | 1.6e-4 | **3e-5** |
-| Experts (LoRA) — cùng lr với Attn | — | **1e-4** (`train.schedule.max_lr`) |
+| Local Extractor ×2 (`recombinator_local`) | 1.6e-4 | **3e-5** |
+| Global Extractor (`recombinator_global`, norm + Q/K/V/O) | 1.6e-4 (Attn × 3 = **4.8e-4**) | **3e-5** |
+| FFN của Recombinator (`recombinator_ffn`) | 1.6e-4 | **3e-4** |
+| Experts (LoRA) | — | **1e-4** (`train.schedule.max_lr`) |
 
 Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`, hệ số Attn
 `recombiner.attn_lr_mult: 3`. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
 stage (không restart) để mọi nhóm cùng hội tụ.
 
-Cả hai giai đoạn dùng `div_factor` 30 · `final_div_factor` 10, rồi đầu warm-up
+Stage 0 dùng `div_factor` 33.3333 · `final_div_factor` 10; decoder_ft dùng
+`div_factor` 30 · `final_div_factor` 33.3 (đỉnh/đáy ≈ 1000), rồi đầu warm-up
 và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 chữ số có nghĩa; Stage 0: 2 chữ số để giữ đúng 0.8 × lịch cũ)
 (`schedule.round_down_sig: 1`) thay vì để số lẻ vô hạn như 3.33e-6:
 
@@ -103,11 +105,12 @@ và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 ch�
 |---|---|---|---|
 | Stage 0 · Recombinator + cls_head | 4.8e-6 | 1.6e-4 | 4.8e-7 |
 | Stage 0 · Attn | 1.4e-5 (1.44e-5) | 4.8e-4 | 1.4e-6 (1.44e-6) |
-| decoder_ft · Sup Head / Route Head / Concat Linear | 1e-5 | 3e-4 | 1e-6 |
-| decoder_ft · Attn và LoRA | 3e-6 (3.33e-6) | 1e-4 | 3e-7 (3.33e-7) |
-| decoder_ft · phần còn lại của Recombinator | 1e-6 | 3e-5 | **1e-7** |
+| decoder_ft · MLP gate (Route Head) | 2e-5 | 6e-4 | 6e-7 |
+| decoder_ft · FFN / Concat Linear | 1e-5 | 3e-4 | 3e-7 |
+| decoder_ft · LoRA | 3e-6 (3.33e-6) | 1e-4 | 1e-7 (1.001e-7) |
+| decoder_ft · Local / Global / Sup Head | 1e-6 | 3e-5 | **3e-8** (3.003e-8) |
 
-Đáy nhỏ nhất của decoder_ft là **1e-7** (`train.schedule.min_lr`, được kiểm).
+Đáy nhỏ nhất của decoder_ft là **3e-8** (`train.schedule.min_lr`, được kiểm).
 Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
 làm tròn.
 
@@ -170,7 +173,8 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
    config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
    (`train.pretrained_lr_mult: 0.1`) — áp cho R2Gen/AdaAtt. Riêng My Gemma
    fine-tune toàn bộ, không đóng băng, lr từng nhóm theo `train.ft_lr`
-   (Recombinator 3e-5, Attn và LoRA 1e-4, các head và Concat Linear 3e-4).
+   (Local/Global/Sup Head 3e-5, LoRA 1e-4, FFN và Concat Linear 3e-4,
+   MLP gate 6e-4).
 
 Cả ba candidate sinh bằng **một đặc tả giải mã** — khối `generate:`
 (`src/decoding_spec.py`): beam search `num_beams: 3`, `length_penalty: 1.0`,

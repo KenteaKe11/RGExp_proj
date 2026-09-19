@@ -66,9 +66,9 @@
 # 0.05. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.
 #
 # `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ, lr đỉnh `train.ft_lr`:
-# Sup Head / Route Head / Concat Linear 3e-4 · Attn = Experts (LoRA) 1e-4 ·
-# phần còn lại của Recombinator 3e-5. MỘT chu kỳ one-cycle cho cả stage, đáy
-# nhỏ nhất 1e-7. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
+# MLP gate (Route Head) 6e-4 · FFN / Concat Linear 3e-4 · Experts (LoRA) 1e-4 ·
+# Local / Global / Sup Head 3e-5. MỘT chu kỳ one-cycle cho cả stage (div 30 ·
+# final_div 33.3), đáy nhỏ nhất 3e-8. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
 # có nghĩa (`round_down_sig: 1`: 6.67e-7 -> 6e-7, 3.33e-7 -> 3e-7). λ = 0.4, warmup tắt — vốn chỉ có lý do khi ClsHead còn ngẫu
 # nhiên. Làm lại decoder_ft từ đầu:
 #     bash scripts/run_section25.sh --no-resume

@@ -388,9 +388,16 @@ FREEZABLE_PARTS: dict = {
 DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ()
 # lr đỉnh TỪNG NHÓM của nhánh ở decoder_ft — `train.ft_lr`. Thứ tự = thứ tự
 # nhóm trong optimizer (sau adapter). Mỗi tham số của nhánh rơi vào ĐÚNG một
-# nhóm; `recombinator` là phần còn lại của Recombinator sau khi tách Attn.
+# nhóm; Recombinator tách theo ba khối Local / Global / FFN.
 FT_LR_GROUPS: tuple[str, ...] = ("cls_head", "route_head", "dec_proj",
-                                 "recombinator_attn", "recombinator")
+                                 "recombinator_local", "recombinator_global",
+                                 "recombinator_ffn")
+# Tiền tố tham số (theo `branch.named_parameters()`) -> nhóm của Recombinator.
+RECOMB_LR_PREFIX: dict = {
+    "recombinator.local_extractors.": "recombinator_local",
+    "recombinator.global_extractor.": "recombinator_global",
+    "recombinator.ffn.": "recombinator_ffn",
+}
 
 
 def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
@@ -427,19 +434,20 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
 
     -> {"main", "groups", "attn_mult", "min_lr", "floor"}
 
-      * `main`   = `train.schedule.max_lr` (1e-4, = Attn) — adapter/Experts
+      * `main`   = `train.schedule.max_lr` (1e-4) — adapter/Experts
                    (cả hai chế độ) và
                    toàn bộ nhánh ở chế độ scratch (Attn × `attn_lr_mult`).
       * `groups` = `train.ft_lr` — lr đỉnh từng nhóm của nhánh ở decoder_ft:
-                   cls_head 3e-4 · route_head 3e-4 · dec_proj 3e-4 ·
-                   recombinator_attn 1e-4 · recombinator 3e-5.
+                   cls_head 3e-5 · route_head (MLP gate) 6e-4 · dec_proj 3e-4 ·
+                   recombinator_local 3e-5 · recombinator_global 3e-5 ·
+                   recombinator_ffn 3e-4.
 
     MỘT chu kỳ one-cycle cho CẢ stage (không restart): `train.schedule` không
     được khai `cycle_steps`/`lr_decay`. LambdaLR nhân cùng một hệ số vào mọi
     nhóm, nên đáy của nhóm nhỏ nhất = min(lr đỉnh) / (div × final_div) — con
-    số ấy phải bằng `train.schedule.min_lr` (1e-7), cùng kiểu kiểm với Stage 0.
+    số ấy phải bằng `train.schedule.min_lr` (3e-8), cùng kiểu kiểm với Stage 0.
     `round_down_sig: 1` làm tròn xuống đầu warm-up và đáy từng nhóm
-    (1e-4 -> 3e-6 / 3e-7 thay vì 3.33e-6 / 3.33e-7).
+    (1e-4 -> 3e-6 / 1e-7 thay vì 3.33e-6 / 1.001e-7).
     """
     tcfg = dict(cfg.get("train", {}) or {})
     sch = dict(tcfg.get("schedule", {}) or {})
@@ -527,8 +535,9 @@ def _branch_group(name: str) -> str:
     """Tên tham số của nhánh -> khoá trong `train.ft_lr`."""
     top = name.split(".", 1)[0]
     if top == "recombinator":
-        return ("recombinator_attn" if recombiner.is_attn_param(name)
-                else "recombinator")
+        for pre, g in RECOMB_LR_PREFIX.items():
+            if name.startswith(pre):
+                return g
     if top in ("cls_head", "route_head", "dec_proj"):
         return top
     raise TrainUnusable(
@@ -541,12 +550,13 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     """AdamW. Nhóm (bỏ nhóm rỗng), theo thứ tự:
 
       decoder_ft: lora|experts @main · cls_head · route_head · dec_proj ·
-                  recombinator_attn · recombinator   (lr đỉnh từ `train.ft_lr`)
+                  recombinator_local · recombinator_global ·
+                  recombinator_ffn   (lr đỉnh từ `train.ft_lr`)
       scratch   : lora|experts @main · branch @main · branch_attn @main×attn_mult
 
-    Mặc định (config hiện tại): adapter 1e-4 (= Attn) · cls_head 3e-4 ·
-    route_head 3e-4 · dec_proj 3e-4 · Attn của Recombinator 1e-4 · phần còn lại
-    của Recombinator 3e-5. Không đóng băng gì.
+    Mặc định (config hiện tại): adapter 1e-4 · cls_head 3e-5 · route_head
+    (MLP gate) 6e-4 · dec_proj 3e-4 · Local 3e-5 · Global 3e-5 · FFN 3e-4.
+    Không đóng băng gì.
 
     Adapter luôn đứng ĐẦU: log đọc `param_groups[0]["lr"]` làm lr chính. Một
     LambdaLR one-cycle nhân cùng một hệ số vào mọi nhóm, nên tỉ lệ giữa các
