@@ -158,7 +158,7 @@ def t_stage0_schedule_encodes_min_lr():
     want = float(s["min_lr"])
     assert got[1] == want, (got, want)
     assert got == (4.8e-6, 4.8e-7), got       # = 0.8 × (6e-6, 6e-7) của lịch cũ
-    assert int(CFG["pretrain"]["n_epochs"]) == 10
+    assert int(CFG["pretrain"]["n_epochs"]) == 6
     lo, hi = CFG["pretrain"]["weight_decay_range"]
     assert lo <= float(CFG["pretrain"]["weight_decay"]) <= hi
 
