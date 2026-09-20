@@ -182,9 +182,8 @@ fi
 # KHÔNG còn trong danh sách: chúng thuộc §2.2 và đã sang _archive/ (xem
 # scripts/archive_2.2.sh). Đòi chúng ở đây là chặn setup vì một thứ repo đã cố
 # ý bỏ đi.
-for f in requirements.txt configs/section25.yaml src/run_section25.py \
-         src/run_pretrain.py src/recombiner.py src/train_recomb.py \
-         src/backbone.py; do
+for f in requirements.txt configs/lora.yaml configs/gpu/rtx3060.yaml \
+         src/run_lora.py src/train_recomb.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
 # Nếu §2.2 vẫn còn ở src/, nhắc — nhưng KHÔNG chặn: setup không phải chỗ ép
@@ -249,10 +248,9 @@ print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
     print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.3 KHÔNG dò batch. "
           "Hết VRAM thì hạ, theo thứ tự,")
-    print("  recombiner.local.hidden / train.max_seq_len / "
-          "train.per_device_batch_size trong configs/section25.yaml")
-    print("  (hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần, nếu không "
-          "số bước và lịch one-cycle đổi theo).")
+    print("  train.max_seq_len (configs/lora.yaml) hoặc "
+          "train.per_device_batch_size (configs/gpu/<card>.yaml)")
+    print("  (grad_accum tự suy ra = effective_batch / per_device_batch_size).")
 PYEOF
 
 # DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn
@@ -284,25 +282,16 @@ echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https:
 echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
 echo "  2. Tự kiểm chứng (vài giây, không cần GPU):"
-echo "       python scripts/selftest_pretrain.py   # phải qua HẾT"
-echo "       python scripts/selftest_section25.py  # phải qua HẾT"
+echo "       python scripts/selftest_lora.py   # phải qua HẾT"
 echo
-echo "  3. Dò nhãn phân loại (~30 giây) — chết sớm rẻ hơn chết ở giờ thứ hai:"
-echo "       python -m src.labels_cls --check-split"
+echo "  3. Thử đường ống + VRAM đỉnh (config: configs/lora.yaml + configs/gpu/):"
+echo "       bash scripts/run_lora.sh --dry-run"
 echo
-echo "  4. Thử đường ống (config duy nhất: configs/section25.yaml):"
-echo "       bash scripts/run_pretrain.sh --dry-run"
-echo "       bash scripts/run_section25.sh --dry-run"
-echo "       # KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config."
-echo
-echo "  5. CHẠY THẬT — Stage 0 trước, rồi trọn §2.5:"
+echo "  4. CHẠY THẬT:"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run_pretrain.sh --detach"
-    echo "       bash scripts/run_section25.sh --detach   # sau khi Stage 0 xong"
-    echo "       # chạy nền, trả lại shell ngay, in link W&B. ssh đứt không giết nó,"
-    echo "       # và không cần tmux — tiến độ xem trên W&B."
+    echo "       bash scripts/run_lora.sh --detach"
+    echo "       # chạy nền, trả lại shell ngay, in link W&B."
 else
-    echo "       bash scripts/run_pretrain.sh"
-    echo "       bash scripts/run_section25.sh"
+    echo "       bash scripts/run_lora.sh"
 fi
 echo

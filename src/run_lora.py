@@ -6,18 +6,17 @@
     python -m src.run_lora --arms qlora_r4_attn,qlora_r4_decoder
     python -m src.run_lora --gpu rtx3060
 
-Khôi phục §2.2 (đã archive) ở dạng 2 × 2, trên đường code CÒN SỐNG của repo:
-huấn luyện bằng `train_recomb.train_arm` với candidate KHÔNG nhánh (đúng đường
-của candidate A §2.3 — Gemma 3 NF4 + adapter peft), sinh bằng runner
-`gemma3_recomb`, chấm bằng `metrics`, kiểm định bằng `stats_multi` (permutation
-+ bootstrap BCa, Holm trên các cặp) — CÙNG mọi thứ §2.5 dùng. Không dùng lại
-`_archive/src/train.py`: nó là HF Trainer + thang dò batch, hai thứ repo này đã
-bỏ có lý do (xem README, `_archive/`).
+Khôi phục §2.2 (xem `_archive/`) ở dạng 2 × 2: huấn luyện bằng
+`train_recomb.train_arm` với candidate KHÔNG nhánh (Gemma 3 NF4 + adapter peft),
+sinh bằng runner `gemma3_recomb`, chấm bằng `metrics`, kiểm định bằng
+`stats_multi` (permutation + bootstrap BCa, Holm trên các cặp). Không dùng lại
+`_archive/src/train.py`: nó là HF Trainer + thang dò batch, hai thứ đã bỏ có lý
+do (prefetch, autobatch, config GPU chỉ có ở đường này).
 
 Hai biến — `rank`, `target` — là thứ DUY NHẤT khác nhau giữa bốn candidate; mọi
-thứ khác đến từ các khối chung của configs/section25.yaml (xem khối `lora_exp`).
-MoE bị tắt cứng ở đây: `moe.enabled: true` của §2.5 mà lọt vào thì mỗi candidate
-đòi `top_k`/`n_experts` và không còn là LoRA thuần.
+thứ khác đến từ các khối chung của configs/lora.yaml (xem khối `lora_exp`).
+MoE bị tắt cứng ở đây: `moe.enabled: true` mà lọt vào thì mỗi candidate đòi
+`top_k`/`n_experts` và không còn là LoRA thuần.
 
 Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 6 sinh hỏng ·
           7 báo cáo hỏng · 8 đẩy Hub hỏng
@@ -34,13 +33,60 @@ from pathlib import Path
 
 import pandas as pd
 
+import platform
+
 from .config import (Cfg, add_common_args, load_config, resolved_snapshot,
                      seed_everything)
-from .run_section25 import _count_preds, _env_info, _hr, _read_preds
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 METHODS = ("qlora", "qdora")
+
+
+def _hr(t: str) -> None:
+    print(f"\n═══ {t} ═══", flush=True)
+
+
+def _iter_jsonl(path: Path):
+    if not path.exists():
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
+def _read_preds(path: Path) -> dict[str, str]:
+    return {r["key"]: r.get("pred", "") for r in _iter_jsonl(path)}
+
+
+def _count_preds(path: Path) -> int:
+    return sum(1 for _ in _iter_jsonl(path))
+
+
+def _env_info() -> dict:
+    info = {"python": sys.version.split()[0], "platform": platform.platform()}
+    for mod in ("torch", "transformers", "peft", "bitsandbytes", "safetensors"):
+        try:
+            info[mod] = getattr(__import__(mod), "__version__", "?")
+        except Exception:
+            info[mod] = None
+    try:
+        import torch
+
+        info["cuda"] = torch.version.cuda
+        if torch.cuda.is_available():
+            info["gpu"] = torch.cuda.get_device_name(0)
+            info["gpu_mem_gb"] = round(
+                torch.cuda.get_device_properties(0).total_memory / 1024 ** 3, 1)
+    except Exception:
+        pass
+    return info
 
 
 # ── candidate ───────────────────────────────────────────────────────────────
@@ -131,14 +177,10 @@ def factor_pairs(arms: list[dict]) -> list[tuple[str, str, str]]:
 
 
 def apply_exp(cfg: Cfg) -> None:
-    """Khối `lora_exp` ghi đè output/wandb/stats của §2.5 cho lần chạy này."""
+    """Ràng buộc của thí nghiệm, áp bất kể file config nói gì: mọi cặp được
+    kiểm, tham chiếu dấu = `lora_exp.reference`, MoE tắt."""
     L = dict(cfg.get("lora_exp") or {})
-    o = dict(L.get("output") or {})
     cfg["experiment"] = "lora"
-    cfg["output"]["subdir"] = str(o.get("subdir", "2.2_lora_rank_target"))
-    cfg["output"]["adapter_dir"] = str(o.get("adapter_dir", "./adapters_2_2"))
-    w = dict(L.get("wandb") or {})
-    cfg["wandb"] = dict(cfg.get("wandb") or {}, **w)
     cfg["stats"] = dict(cfg["stats"], pairs="all", reference=L.get("reference"))
     cfg["moe"] = dict(cfg.get("moe") or {}, enabled=False)
 

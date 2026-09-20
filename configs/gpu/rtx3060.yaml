@@ -1,15 +1,13 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIG GPU — NVIDIA GeForce RTX 3060 (12 GB GDDR6, Ampere, sm_86)
 #
-#     bash scripts/run_pretrain.sh  --gpu rtx3060 --detach
-#     bash scripts/run_section25.sh --gpu rtx3060 --detach
+#     bash scripts/run_lora.sh --gpu rtx3060 --detach
 #     (không truyền --gpu thì cũng là file này: src/config.DEFAULT_GPU)
 #
 # CHỈ các khoá trong src/config.GPU_KEYS, và PHẢI khai đủ tất cả — thiếu một
 # khoá là DỪNG, không rơi về mặc định trong code. Thí nghiệm (lr, epoch, dữ liệu,
-# batch HIỆU DỤNG) ở configs/section25.yaml. grad_accum được suy ra:
-#     decoder_ft : 32 / 1  = 32
-#     Stage 0    : 32 / 16 = 2
+# batch HIỆU DỤNG) ở configs/lora.yaml. grad_accum được suy ra:
+#     32 / 1 = 32
 # Các con số dưới đây là cấu hình mặc định đã chạy của repo trên card này.
 # ═════════════════════════════════════════════════════════════════════════════
 name: rtx3060
@@ -19,25 +17,15 @@ requires:
   min_vram_gb: 11
 
 set:
-  # ── My Gemma · decoder_ft ────────────────────────────────────────────────
-  # 1 mẫu mỗi lượt + gradient checkpointing: Gemma 3 4B NF4 + nhánh + chuỗi
-  # ~1.3k token mới vừa 12 GB.
+  # ── Huấn luyện adapter ──────────────────────────────────────────────────
+  # 1 mẫu mỗi lượt + gradient checkpointing: Gemma 3 4B NF4 + chuỗi ~1.3k
+  # token. Kiểm VRAM thật bằng `bash scripts/run_lora.sh --dry-run`.
   train.per_device_batch_size: 1
   train.gradient_checkpointing: true
   train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
 
-  # ── Stage 0 (sup_pretrain + Stage 0 của hai baseline) ───────────────────
-  pretrain.per_device_batch_size: 16
-  pretrain.data_threads: 4
-
-  # ── R2Gen / AdaAtt — batch paper giữ nguyên, chỉ đổi số ảnh mỗi lượt ────
-  # AdaAtt 80 = 8 × 10 · R2Gen 16 = 8 × 2 · Stage 0 32 = 8 × 4.
-  sota_train.micro_batch: 8
-  sota_train.infer_batch: 4       # × beam 3 = 12 chuỗi mỗi lượt
-  sota_train.num_workers: 4
-
   # ── Sinh + chấm ─────────────────────────────────────────────────────────
-  base.batch_size: 2              # My Gemma sinh: 2 ảnh × beam 3
+  base.batch_size: 2              # sinh: 2 ảnh × beam 3
   metrics.bertscore.batch_size: 32
 
   # ── Batch mỗi lượt theo hồi quy VRAM (src/autobatch.py) — TẮT ───────────

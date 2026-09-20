@@ -11,9 +11,41 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from .report_section25 import _f, _p, _tbl, summary_table
+
+def _f(x, nd: int = 4) -> str:
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return "—"
+    return f"{x:.{nd}f}"
+
+
+def _p(x) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{x:.3g}" if x >= 1e-4 else "<1e-4"
+
+
+def _tbl(headers: list[str], rows: list[list[str]]) -> str:
+    return "\n".join(["| " + " | ".join(headers) + " |",
+                      "|" + "|".join("---" for _ in headers) + "|"]
+                     + ["| " + " | ".join(r) + " |" for r in rows])
+
+
+def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
+                  metrics: list[str], primary: str) -> pd.DataFrame:
+    rows = []
+    for aid, df in scores.items():
+        row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
+        for m in metrics:
+            row[m] = float(df[m].mean())
+            row[f"{m}_sd"] = float(df[m].std(ddof=1)) if len(df) > 1 else float("nan")
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if primary in out.columns:
+        out = out.sort_values(primary, ascending=False).reset_index(drop=True)
+    return out
 
 
 def _stat(train_stats: list[dict], aid: str) -> dict:

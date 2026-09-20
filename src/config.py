@@ -1,7 +1,7 @@
 """Nạp và giải quyết cấu hình §2.5.
 
-HAI file: config NỘI DUNG (configs/section25.yaml — thí nghiệm là gì), dùng
-chung cho CẢ HAI điểm vào còn chạy (`src.run_pretrain`, `src.run_section25`),
+HAI file: config NỘI DUNG (configs/lora.yaml — thí nghiệm là gì) của điểm vào
+duy nhất còn chạy (`src.run_lora`),
 và config GPU (configs/gpu/<card>.yaml — chạy nó thế nào trên một card). Xem
 khối "HAI loại config" bên dưới.
 Không có kế thừa nhiều tầng: repo này chỉ chạy một thí nghiệm tại một thời
@@ -30,7 +30,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "section25.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "lora.yaml"
 
 
 class Cfg(dict):
@@ -83,8 +83,8 @@ def _set_path(d: dict, dotted: str, value: Any) -> None:
 
 
 # ── HAI loại config: NỘI DUNG + GPU ─────────────────────────────────────────
-# configs/section25.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
-# epoch, BATCH HIỆU DỤNG (`train.effective_batch`, `pretrain.effective_batch`),
+# configs/lora.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
+# epoch, BATCH HIỆU DỤNG (`train.effective_batch`),
 # giải mã, kiểm định. configs/gpu/<tên>.yaml (GPU) nói chạy nó thế nào trên MỘT
 # card: số mẫu mỗi lượt forward, checkpointing, worker, batch lúc sinh/chấm.
 #
@@ -100,16 +100,11 @@ DEFAULT_GPU = "rtx3060"
 GPU_KEYS = frozenset({
     "train.per_device_batch_size", "train.gradient_checkpointing",
     "train.prefetch",
-    "pretrain.per_device_batch_size", "pretrain.data_threads",
-    "sota_train.micro_batch", "sota_train.infer_batch",
-    "sota_train.num_workers",
     "base.batch_size", "metrics.bertscore.batch_size",
     "autobatch.enabled", "autobatch.target_frac", "autobatch.probe_sizes",
 })
-_DERIVED = ("train.grad_accum", "pretrain.grad_accum")
-_EFF = (("train.effective_batch", "train.per_device_batch_size", "train.grad_accum"),
-        ("pretrain.effective_batch", "pretrain.per_device_batch_size",
-         "pretrain.grad_accum"))
+_DERIVED = ("train.grad_accum",)
+_EFF = (("train.effective_batch", "train.per_device_batch_size", "train.grad_accum"),)
 # Tên cũ, giữ cho mã gọi còn dùng.
 HW_KEYS = GPU_KEYS
 

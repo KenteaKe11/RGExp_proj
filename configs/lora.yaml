@@ -1,0 +1,386 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# research_v2 — THÍ NGHIỆM LoRA: QLoRA rank × chỗ gắn — CONFIG NỘI DUNG
+# ═════════════════════════════════════════════════════════════════════════════
+# File này nói thí nghiệm LÀ GÌ. Chạy nó THẾ NÀO trên một card (số mẫu mỗi lượt
+# forward, checkpointing, worker, batch lúc sinh/chấm, autobatch) ở
+# configs/gpu/<card>.yaml, chọn bằng `--gpu` (mặc định `rtx3060`).
+# `src/config.load_config` kiểm hai chiều: file này KHÔNG được khai khoá GPU,
+# file GPU không được khai gì khác. `grad_accum` không khai ở đâu:
+# = train.effective_batch / train.per_device_batch_size.
+#
+# Câu hỏi: trên CÙNG Gemma 3 4B NF4, CÙNG 6400 mẫu train, CÙNG lịch học và CÙNG
+# 3000 ảnh test, rank (4 vs 8) và chỗ gắn adapter (4 ma trận attention vs toàn
+# bộ decoder) có đổi chất lượng báo cáo không, và cặp nào khác cặp nào?
+#
+# Bốn candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
+# Kiểm định: 6 cặp, permutation + bootstrap BCa, Holm trên 6 p-value trong
+# từng metric (`stats`). Tham chiếu dấu = qlora_r4_attn.
+#
+# Các khối `recombiner`, `classifier`, `moe` KHÔNG phải một phần của thí
+# nghiệm: đường huấn luyện (`src/train_recomb.py`, candidate KHÔNG nhánh) vẫn
+# đọc chúng khi dựng cấu hình, nên chúng ở lại với giá trị trung tính — MoE
+# TẮT, không nhánh nào được dựng. Mọi thứ của §2.x cũ ở `_archive/`.
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+experiment: "lora"
+
+# ── Dữ liệu — điều kiện 2 ──────────────────────────────────────────────────
+# Khoá cứng. Ba candidate đọc CÙNG hai file split; `assert_no_leak` là hàng
+# rào cơ học chứ không phải một lời hứa trong README.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 512
+  assert_no_leak: true
+
+# ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
+# R2Gen (ResNet-101) và AdaAtt (ResNet-152) đều quen 224; Gemma 3 xử lý ở 896.
+# Ba con số khác nhau, và đó KHÔNG phải lý do để mỗi model tự resize theo cách
+# của nó: nếu R2Gen dùng RandomCrop còn Gemma dùng bilinear-longest-side thì
+# một phần chênh lệch trong bảng là chênh lệch của hai bộ tiền xử lý, không
+# phải của hai kiến trúc.
+#
+# Nên: MỘT lần resize dùng chung, ở `resize_to`, trước khi bất kỳ processor
+# riêng nào chạm vào ảnh. `allow_native_match: false` nghĩa là ngay cả khi một
+# model đòi đúng `resize_to` thì ảnh vẫn đi qua đường chung ấy — "vô tình
+# khớp" không được phép biến thành một đường tiền xử lý thứ hai.
+image_policy:
+  unified: true
+  resize_to: 512              # cạnh dài; khớp `data.image_max_side`
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  # Sau bước chung, mỗi model chỉ còn được phép chuẩn hoá giá trị pixel theo
+  # thống kê của backbone nó (ImageNet mean/std cho ResNet, SigLIP cho Gemma).
+  # Đó là phép biến đổi trên GIÁ TRỊ, không phải trên HÌNH HỌC.
+  per_model_normalize_only: true
+
+# ══════════════════════════════════════════════════════════════════════════
+# CANDIDATE C — MY GEMMA
+# ══════════════════════════════════════════════════════════════════════════
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_recomb
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+# ── Giải mã — MỘT đặc tả cho CẢ BA candidate (`src/decoding_spec.py`) ─────
+# My Gemma đưa khối này cho `transformers.generate`; R2Gen/AdaAtt đưa nó cho
+# `src/sota/decoding.beam_search`, vốn cài lại ĐÚNG luật beam search của
+# transformers — kể cả lúc chọn checkpoint trên val. Khối `sota.*.decoding`
+# bên dưới chỉ còn là bản ghi của paper (điều kiện 1) và KHÔNG được đọc; chỗ
+# lệch (block_trigrams của R2Gen) vào `manifest.deviations`.
+#
+# Mọi khoá phải khai TƯỜNG MINH: generation_config.json của Gemma 3 khai
+# sampling, và một khoá bỏ trống là để nó chen vào.
+#
+# Khác biệt duy nhất: độ dài tối đa. `max_new_tokens` là của My Gemma
+# (subword); R2Gen/AdaAtt dừng ở `max_seq_length − 1` = 59 từ của từ điển.
+#
+# Với MoE, trọng số định tuyến của mỗi ảnh được nhân bản theo beam
+# (`moe.RoutingContext.set(..., repeat=num_beams)`). Beam nhân số chuỗi trong
+# một lượt sinh lên 3 lần: hết VRAM thì hạ `base.batch_size`.
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 3
+  length_penalty: 1.0          # điểm = tổng log-prob / (số token sinh)^1
+  early_stopping: false        # heuristic dừng của transformers
+  no_repeat_ngram_size: 0      # không chặn n-gram
+  repetition_penalty: 1.0      # không phạt lặp
+  num_return_sequences: 1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CANDIDATE — rank × chỗ gắn (`scripts/run_lora.sh`, `src/run_lora.py`)
+# ═════════════════════════════════════════════════════════════════════════════
+# Khôi phục thí nghiệm adapter của §2.2, thu về 2 × 2: QLoRA r ∈ {4, 8} × chỗ gắn
+# ∈ {4 ma trận attention, toàn bộ decoder}. KHÔNG nhánh Recombinator, KHÔNG
+# Experts (MoE tắt cứng), KHÔNG Stage 0 — chỉ Gemma 3 4B NF4 + adapter peft.
+#
+# Mọi thứ khác dùng CHUNG cho bốn candidate, đọc từ các khối của file này: `data`
+# (6400 train / 3000 test, hàng rào rò rỉ), `base`, `prompt`, `generate` (beam
+# 3), `image_policy`, `metrics`, `stats` (permutation + bootstrap BCa, Holm trên
+# các cặp), `train` (1 epoch, eff_bs 32, one-cycle; nhóm adapter chạy ở
+# `train.schedule.max_lr`), alpha = 2 × r (`train.alpha_mode: proportional`,
+# nên alpha/r không đổi và cột rank đo đúng một thứ: số chiều). Batch mỗi lượt
+# ở config GPU.
+#
+# Hai biến, và CHỈ hai biến khác nhau giữa bốn candidate: `rank` và `target`.
+#   attn    — q/k/v/o_proj của khối ngôn ngữ (= mặt cắt §2.2 gốc, = chỗ gắn
+#             My Gemma đã dùng ở §2.5, = `train.target_modules`; selftest kiểm).
+#   decoder — thêm gate/up/down_proj (MLP): mọi Linear của decoder ngôn ngữ.
+# Vision tower / projector KHÔNG bao giờ được gắn (`train.exclude_prefixes`).
+#
+# Kiểm định: 4 candidate -> 6 cặp, mỗi cặp permutation + BCa, Holm trên 6
+# p-value trong từng metric. Tham chiếu (dấu của hiệu số) = qlora_r4_attn, cấu
+# hình §2.5 đã dùng. Bốn trong sáu cặp là hiệu ứng ĐƠN của một biến (rank ở
+# cùng chỗ gắn, chỗ gắn ở cùng rank); REPORT.md tách riêng bốn cặp ấy.
+lora_exp:
+  targets:
+    attn: [q_proj, k_proj, v_proj, o_proj]
+    decoder: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  arms:
+    - {id: qlora_r4_attn,    method: qlora, rank: 4, target: attn,
+       name: "QLoRA r=4 · attention (q,k,v,o)"}
+    - {id: qlora_r8_attn,    method: qlora, rank: 8, target: attn,
+       name: "QLoRA r=8 · attention (q,k,v,o)"}
+    - {id: qlora_r4_decoder, method: qlora, rank: 4, target: decoder,
+       name: "QLoRA r=4 · full decoder (attn + MLP)"}
+    - {id: qlora_r8_decoder, method: qlora, rank: 8, target: decoder,
+       name: "QLoRA r=8 · full decoder (attn + MLP)"}
+  reference: qlora_r4_attn
+
+train:
+  n_epochs: 1   # decoder_ft: 1 epoch
+  # Batch HIỆU DỤNG của decoder_ft. Số mẫu mỗi lượt ở configs/gpu/<card>.yaml;
+  # grad_accum = 32 / per_device_batch_size (phải chia hết).
+  effective_batch: 32
+  max_seq_len: 1024
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  logging_steps: 10
+  # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (1 epoch, không restart —
+  # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
+  # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
+  # rồi đầu warm-up và đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa
+  # (`round_down_sig: 1`):
+  #
+  #     nhóm                                    đầu      đỉnh      đáy
+  #     cls_head · route_head · dec_proj · FFN  1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_3 (i = n)        1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_2                1e-6  -> 5.48e-5 -> 5e-8
+  #     adapter (LoRA/Experts)                  3e-6  -> 1e-4   -> 1e-7
+  #     recombinator_retriever_1 (+ Query)      3e-7  -> 1e-5   -> 1e-8  <- đáy nhỏ nhất
+  #
+  # `min_lr` là con số ĐƯỢC KIỂM (`train_recomb.ft_lrs` DỪNG nếu lệch), không
+  # phải con số được đọc.
+  schedule:
+    impl: lambda
+    max_lr: 1.0e-4          # adapter / Experts (LoRA)
+    min_lr: 1.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất (Retriever 1)
+    round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
+    pct_start: 0.1
+    div_factor: 30.0
+    final_div_factor: 33.3  # 1e-5 / 30 / 33.3 = 1.001e-8 -> làm tròn 1e-8
+    anneal: cos
+    cycle_momentum: false
+  branch_weight_decay: 0.01
+
+  # ĐIỀU KIỆN 5 — CHỈ cho R2Gen/AdaAtt (`src/train_sota.py`): phần đã pretrain
+  # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
+  pretrained_lr_mult: 0.1
+  # My Gemma · decoder_ft — lịch lr ĐƠN GIẢN (`train_recomb.ft_lrs`):
+  #   1. lr_max toàn hệ = `max_lr` (3e-4): Sup Head, Route Head, Concat Linear,
+  #      FFN của Recombinator và Retriever n. LoRA/Experts ở `schedule.max_lr`.
+  #   2. lr_max CHỈ đổi theo Retriever i = 1..n, tăng dần theo cấp số nhân:
+  #      i=1 = `retriever_first` (1e-5, kèm Learnable Query), i=n = `max_lr`.
+  #      n = 3: 1e-5 · 5.48e-5 · 3e-4. Không có hệ số Attn ở decoder_ft.
+  # Phải khai ĐÚNG hai khoá.
+  ft_lr:
+    max_lr: 3.0e-4               # lr_max toàn hệ
+    retriever_first: 1.0e-5      # Retriever 1 (+ Learnable Query)
+  # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
+  # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer). Nhận:
+  # recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
+  freeze_after_pretrain: []
+  # true = đóng băng TOÀN BỘ phần đã pretrain (cả Recombinator). Ghi đè
+  # `freeze_after_pretrain`.
+  freeze_pretrained: false
+
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+recombiner:
+  siglip_dim: 1152
+  out_dim: null
+  # ── Recombinator: X (4096, 1152) -> Y (256, 2560) ─────────────────────────
+  # Learnable Query (n_tokens, 1152) -> Information Retriever × n_blocks, mỗi khối:
+  #    q = RMSNorm(Query) -> W_Query ; K/V = RMSNorm(X gốc 4096 patch) -> W_Key/W_Value
+  #    h = q + GQA(q, K, V)          (18 head Q, 6 group = 6 head KV, head_dim 64;
+  #                                    residual = đầu ra RMSNorm, KHÔNG phải Query thô)
+  #    n = RMSNorm(h) ; out = n + GELU(Linear hidden→1152 (GELU(Linear 1152→hidden (n))))
+  # -> FFN: Linear 1152→2560 GELU -> RMSNorm -> Linear 2560→2560 GELU + residual.
+  n_vis: 4096
+  n_tokens: 256          # số Learnable Query = số token ra; phải = 4^pool_stages
+  retriever:
+    n_blocks: 3          # Information Retriever (1) … (n), n = 3
+    n_heads: 18          # 1152 / 18 = head_dim 64
+    n_kv_groups: 6       # GQA: 6 head KV, mỗi head dùng chung cho 3 head Q
+    hidden: 2560         # MLP trong Retriever: 1152 → 2560 → 1152
+    query_init_std: 0.02
+  dropout: 0.05
+  # Ma trận Attn (Q/K/V/O của GQA trong MỌI Retriever) chạy lr × hệ số này ở Stage 0
+  # (3 × 1.6e-4 = 4.8e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
+  # đọc khoá này — Attn ở đó dùng chung lr của Retriever chứa nó. Phải >= 1.
+  attn_lr_mult: 3.0
+  # ── Classification Head / Route Head ────────────────────────────────────
+  # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
+  # Linear/GELU trục token N→N/2 -> AvgPool N/2→N/4; 256→64→16→4→1) -> Main
+  # Head (RMSNorm -> Linear/GELU 2560→hidden -> Linear hidden→target).
+  # Classification Head đọc `classifier.hidden/dropout`, target = n_labels × 3.
+  # Route Head đọc khối dưới đây, target = n_experts, cộng `noise_proj`
+  # (hidden → E) cho nhiễu học được của Top-k Gate.
+  pool_stages: 4
+  route_head:
+    hidden: 1024
+    dropout: 0.05
+  # Điều kiện của mục: E = 10 (§2.4 đã chốt), K = 6 nằm ở `arms_s25`.
+  n_experts: 10
+  token_type: text
+  dtype: null
+
+  # ── Vào decoder: HAI Linear trên TRỤC TOKEN, KHÔNG cổng ──────────────────
+  # 256 token của Recombinator -> Linear (không bias) + GELU -> `n_dec_hidden`
+  # (128) -> Linear (không bias, KHÔNG GELU) -> `n_dec_tokens` (64) token, nối
+  # THẲNG vào chuỗi decoder TRƯỚC 256 token ảnh (First / Second trong sơ đồ);
+  # phần văn bản của prompt giữ nguyên vị trí. Khởi tạo: tích hai lớp = trung
+  # bình 2×2 trên chỉ số query xếp 16×16 -> 8×8 (lớp 1 pool NGANG 16×16 -> 16×8,
+  # lớp 2 pool DỌC 16×8 -> 8×8). Hai head vẫn đọc đủ 256 token.
+  # Khoá của kiến trúc cũ (`qformer`, `prepare_pool_factor`,
+  # `highway_token_dims`, `swiglu_dropout`, `n_query`, `n_heads`, `gate*`) và
+  # của Local/Global Extractor (`local`, `head_dim`) đã BỎ — còn sót là DỪNG.
+  n_dec_hidden: 128
+  n_dec_tokens: 64
+
+classifier:
+  enabled: true
+  feed_logits_to_decoder: false
+  n_labels: null
+  n_classes: 3
+  hidden: 1024
+  dropout: 0.1
+  # Lệch nhãn neg/pos/uncertain nên KHÔNG dùng CE thường -> ASL, dùng CHUNG
+  # cho Stage 0 và decoder_ft. `gamma_neg` dạng danh sách = nén theo TÊN LỚP
+  # (thứ tự neg/pos/uncertain), áp lên ô mang nhãn 0: ô lớp neg 4.0, ô lớp pos
+  # 3.0, ô lớp uncertain 0.0 (không nén). `gamma_pos` 0.0 = ô dương không nén.
+  # `clip` 0.10 (10%): ô âm đã có p < 0.10 bị loại hẳn khỏi gradient.
+  # `lambda` 0.4: trọng số ASL cạnh CE ở main-stage (Stage 0 chỉ có ASL).
+  asl:
+    gamma_neg: [4.0, 2.0, 0.0]
+    gamma_pos: 0.0
+    clip: 0.10
+    eps: 1.0e-8
+  lambda: 0.4
+  lambda_warmup_pct: 0.1
+  # Nhánh vào main-stage đã qua Stage 0 => ClsHead không còn ngẫu nhiên =>
+  # không warmup. Đây là hệ quả của điều kiện 5, không phải một lựa chọn rời.
+  lambda_warmup_pct_pretrained: 0.0
+
+# TẮT: thí nghiệm LoRA không có Experts. `run_lora` cũng tắt cứng.
+moe:
+  enabled: false
+  router:
+    noise: true
+    noise_init: -3.0
+    logit_clip_c: 1.2
+    renormalize_topk: true
+  aux:
+    kind: switch_load_balance
+    alpha: 0.01
+    warmup_pct: 0.1
+  expert:
+    rank: null
+    alpha: null
+    dropout: 0.05
+    method: lora
+  log_routing_n: 3000
+
+# ── Chấm điểm — theo TỪNG MẪU, vì kiểm định là ghép cặp ───────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định ─────────────────────────────────────────────────────────────
+# Bốn candidate => sáu cặp. Mỗi cặp: permutation đảo dấu trả p, bootstrap BCa
+# trả khoảng tin cậy cho hiệu số (`src/stats_ab.py`). Holm chạy trên SÁU
+# p-value của sáu cặp, trong từng metric. `reference` chỉ quyết định DẤU.
+stats:
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci: 0.95
+  ci_method: bca
+  dz_floor: 0.10
+  primary_test: perm
+  pairs: all               # all | vs_reference
+  reference: qlora_r4_attn
+  adjust: holm
+  adjust_scope: pairs      # Holm trong TỪNG metric, trên sáu cặp
+  # Friedman CỐ Ý không có mặt. Xem đầu file và README.md.
+
+wandb:
+  enabled: true
+  project: rgexp-lora
+  entity: null
+  run_name: null
+  group: "lora-rank-target"
+  resume_same_run: false
+  mode: online
+  tags: [lora, qlora, rank, target-modules, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/research_v2        # repo DATASET kết quả (private); tự tạo ở lần đẩy đầu
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "lora_rank_target"      # runs/<subdir>, và thư mục trên Hub
+  adapter_dir: ./adapters_lora

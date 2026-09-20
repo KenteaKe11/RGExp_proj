@@ -2,14 +2,14 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # run_lora.sh — thí nghiệm LoRA: QLoRA r ∈ {4, 8} × chỗ gắn ∈ {attn, decoder}.
 #
-#     bash scripts/run_lora.sh --dry-run          # thử đường ống + VRAM đỉnh
+#     bash scripts/run_lora.sh --dry-run          # thử đường ống + in VRAM đỉnh
 #     bash scripts/run_lora.sh --detach           # chạy thật, NỀN
 #     bash scripts/run_lora.sh --gpu rtx3060 --detach
 #     bash scripts/run_lora.sh --stages stats,report
 #     bash scripts/run_lora.sh --arms qlora_r4_attn,qlora_r4_decoder
 #
-# Bốn candidate, khối `lora_exp` trong configs/section25.yaml. KHÔNG nhánh, KHÔNG
-# MoE, KHÔNG Stage 0 — không cần chạy run_pretrain.sh trước. Mọi tham số chuyển
+# Bốn candidate, khối `lora_exp` trong configs/lora.yaml (nội dung); card ở
+# configs/gpu/<card>.yaml (`--gpu`, mặc định rtx3060). KHÔNG nhánh, KHÔNG MoE. Mọi tham số chuyển
 # thẳng cho `python -m src.run_lora`. Chạy lại chính lệnh này sau khi đứt là ĐI
 # TIẾP: adapter đã có -> bỏ qua train, predictions đã có -> chỉ sinh phần thiếu.
 #
@@ -78,7 +78,7 @@ fi
 
 if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
     echo "⚙ Tự kiểm chứng ..."
-    "$PYBIN" "$ROOT/scripts/selftest_section25.py" || {
+    "$PYBIN" "$ROOT/scripts/selftest_lora.py" || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU."
         echo "  Bỏ qua (không khuyến khích): RGEXP_SKIP_SELFTEST=1"
         exit 1

@@ -1,233 +1,27 @@
-# RGExp — Recombinator: đối chứng với SOTA trên Gemma 3
+# research_v2 — LoRA trên Gemma 3: rank × chỗ gắn
 
-Repo này chạy **một** thí nghiệm tại một thời điểm. Thí nghiệm đang mở là
-**§2.5** — ba candidate, hai kiểm định ghép cặp, Holm trên ba cặp:
+Câu hỏi: trên **cùng** Gemma 3 4B lượng tử NF4, **cùng** 6400 mẫu train
+MIMIC-CXR, **cùng** lịch học và **cùng** 3000 ảnh test, hai lựa chọn của adapter
+QLoRA — **rank** (4 vs 8) và **chỗ gắn** (4 ma trận attention vs toàn bộ
+decoder) — có đổi chất lượng báo cáo X-quang sinh ra không, và cặp nào khác cặp
+nào?
 
-```bash
-bash scripts/run_pretrain.sh --detach       # TIÊN QUYẾT — Stage 0 cho mọi candidate
-bash scripts/run_section25.sh --detach      # §2.5 chạy thật
-```
-
-```
-A  r2gen      R2Gen — ResNet-101 + Transformer 3 lớp + Relational Memory
-B  adaatt     AdaAtt — ResNet-152 + LSTM + Adaptive Attention (Visual Sentinel)
-C  my_gemma   Gemma 3 4b-it NF4 + Recombinator + Classification/Route Head
-              + Experts K=6·E=10, adapter QLoRA r4
-```
-
-Câu hỏi: trên **cùng** 6400 mẫu train và **cùng** 3000 ảnh test của tập này,
-công thức C có hơn hai kiến trúc đã công bố không, và hơn **bao nhiêu**?
-
----
-
-## Kiến trúc nhánh — Recombinator + hai head
-
-Recombinator nhận `X [4096, 1152]` (last_hidden_state của vision tower) và tạo
-`Y [256, 2560]`. Classification Head và Route Head đọc cả 256 token; decoder
-nhận 64 token qua hai Linear trên trục token (256 → 128 GELU → 64), **không có cổng**.
-
-```text
-Image -> Vision Encoder ─┬─> Recombinator (256, 2560) ─┬─> Classification Head (14·3) -> Sup Loss
-                         │                             ├─> Route Head (E) -> Aux Loss
-                         │                             │     └─> Top-k Gate -> Experts (LoRA)
-                         │                             └─> Linear/GELU 256->128 -> Linear 128->64 ─┐ First
-                         └─> VL-Adapter (256) ──────────────────────────────────┤ Second
-Prompt -> Embedding ────────────────────────────────────────────────────────────┴─> concat -> Decoder -> CE
-
-Recombinator: X (4096, 1152), Learnable Query Q0 (256, 1152)
-  1. Information Retriever (i), i = 1..3, mỗi khối (X đi vào MỌI khối):
-                         q = RMSNorm(Q_{i-1}) -> W_Query ; K/V = RMSNorm(X) -> W_Key / W_Value
-                         h = q + GQA(q, K, V)      Head = 18, Group = 6 (head_dim 64)
-                         n = RMSNorm(h)
-                         Q_i = n + GELU(Linear 2560->1152 (GELU(Linear 1152->2560 (n))))
-  2. FFN:                Linear 1152->2560 GELU -> RMSNorm -> Linear 2560->2560 GELU
-                         + residual RMSNorm  -> Y (256, 2560)
-
-Classification Head / Route Head (cùng hình dạng, khác target):
-  Pooling Stack ×4: RMSNorm -> Linear/GELU trục token N->N/2 -> AvgPool N/2->N/4
-                    256 -> 64 -> 16 -> 4 -> 1
-  Main Head:        RMSNorm -> Linear/GELU 2560->1024 -> Linear 1024->target
-  Route Head thêm `noise_proj` 1024->E cho nhiễu học được của Top-k Gate.
-```
-
-Ba chỗ cài đặt cần biết, vì sơ đồ không nói rõ:
-
-* 256 token của Recombinator là **256 Learnable Query** (`recombiner.n_tokens`),
-  không còn gắn với lưới 16×16 của ảnh; mỗi query nhìn đủ 4096 patch ở cả 3
-  Retriever. **Mọi residual lấy từ đầu ra RMSNorm**: Attention cộng
-  `RMSNorm(Q_{i-1})` (không phải Query thô), MLP của Retriever cộng `RMSNorm(h)`,
-  FFN cộng `RMSNorm(2560)`.
-* GQA: 18 head Q, 6 group = 6 head K/V (mỗi head K/V dùng chung cho 3 head Q
-  liền nhau), nên W_Key/W_Value chiếu 1152 -> 384.
-* Lớp cuối của Main Head **không** qua GELU: đầu ra là logit của ASL và của
-  softmax/top-k, và GELU chặn logit dưới ở ≈ −0.17.
-* Các Linear trên trục token (Pooling Stack, `dec_proj`) không bias, khởi tạo bằng
-  trung bình cụm; `dec_proj` gồm hai lớp (256 → 128 + GELU, 128 → 64 không
-  GELU) mà tích của chúng là trung bình 2×2 trên chỉ số query xếp 16×16 -> 8×8
-  (lớp 1 pool ngang, lớp 2 pool dọc), nên ở bước 0 decoder nhận ≈ đặc trưng
-  Stage 0 đã học.
-  Lớp cuối không GELU để token vào decoder mang được giá trị âm như embedding thật.
-
-Số token vào decoder khai ở `recombiner.n_dec_tokens`, tầng giữa ở `recombiner.n_dec_hidden`. Khoá của kiến trúc cũ
-(`qformer`, `prepare_pool_factor`, `highway_token_dims`, `swiglu_dropout`,
-`n_query`, `n_heads` ở cấp `recombiner`, cổng Hard-Concrete `gate*`,
-`train.gate_lr_mult`, `classifier.l0_lambda`, và của Local/Global Extractor:
-`local`, `head_dim`, `train.ft_lr.recombinator_local/_global`, `pretrain.swa`)
-đã bỏ — còn sót khoá nào trong config thì chương trình dừng.
-
-Log trước gradient clipping có hai metric `grad_norm_retriever` và
-`grad_norm_ffn`: **L2 thô** (`√Σ‖g‖²`, không chia số tham số) trên **nguyên bộ
-Retriever** (Learnable Query + 3 Information Retriever) và trên FFN — cùng đại
-lượng mà `clip_grad_norm_` đo, nên đọc thẳng cạnh `max_grad_norm`. Dòng log in
-`grad R/F <retriever>/<ffn>`.
-
-## Pretrain cục bộ
-
-Stage 0 học `Recombinator + Classification Head` bằng ASL trước khi decoder
-fine-tune. Checkpoint pretrain chỉ chứa hai khối này; `dec_proj` và `route_head`
-không có gradient ở Stage 0 (decoder không chạy, định tuyến tắt) nên không được
-lưu, và học từ khởi tạo trong decoder_ft. Sang decoder_ft **không đóng băng
-gì** — fine-tune toàn bộ (`train.freeze_after_pretrain: []`).
-
-lr đỉnh:
-
-decoder_ft dùng lịch lr đơn giản (`train.ft_lr`): lr_max toàn hệ
-`max_lr: 3e-4` (LoRA giữ 1e-4); lr_max **chỉ** đổi theo Retriever i = 1..n,
-tăng dần theo cấp số nhân từ `retriever_first: 1e-5` (i=1) tới lr_max (i=n).
-
-| nhóm | Stage 0 | decoder_ft (`train.ft_lr`) |
+| candidate | rank | gắn vào |
 |---|---|---|
-| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-4** |
-| MLP gate — Route Head (`route_head`) | — | **3e-4** |
-| Concat Linear (`dec_proj`, 256 → 128 GELU → 64 token) | — | **3e-4** |
-| Retriever 1 + Learnable Query (`recombinator_retriever_1`) | 1.6e-4 (Attn Q/K/V/O × 3 = **4.8e-4**) | **1e-5** |
-| Retriever 2 (`recombinator_retriever_2`) | 1.6e-4 (Attn × 3) | **5.48e-5** |
-| Retriever 3 = n (`recombinator_retriever_3`) | 1.6e-4 (Attn × 3) | **3e-4** |
-| FFN của Recombinator (`recombinator_ffn`) | 1.6e-4 | **3e-4** |
-| Experts (LoRA) | — | **1e-4** (`train.schedule.max_lr`) |
+| `qlora_r4_attn` (tham chiếu) | 4 | q, k, v, o_proj |
+| `qlora_r8_attn` | 8 | q, k, v, o_proj |
+| `qlora_r4_decoder` | 4 | q, k, v, o + gate, up, down_proj |
+| `qlora_r8_decoder` | 8 | q, k, v, o + gate, up, down_proj |
 
-Stage 0: **3 epoch**, warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`,
-hệ số Attn `recombiner.attn_lr_mult: 3`, **không SWA** — `ckpt/latest` (thứ
-decoder_ft nạp và được đẩy Hub) là trọng số của epoch cuối. decoder_ft: **1 epoch**, **một** chu kỳ one-cycle cho toàn bộ
-stage (không restart) để mọi nhóm cùng hội tụ.
+Chỉ HAI biến khác nhau giữa bốn candidate; mọi thứ khác dùng chung: base NF4,
+prompt, giải mã beam 3, 1 epoch, batch hiệu dụng 32, one-cycle (lr adapter
+1e-4), alpha = 2 × r (alpha/r không đổi, nên cột rank đo đúng số chiều). Vision
+tower không bao giờ được gắn adapter.
 
-Stage 0 dùng `div_factor` 33.3333 · `final_div_factor` 10; decoder_ft dùng
-`div_factor` 30 · `final_div_factor` 33.3 (đỉnh/đáy ≈ 1000), rồi đầu warm-up
-và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 chữ số có nghĩa; Stage 0: 2 chữ số để giữ đúng 0.8 × lịch cũ)
-(`schedule.round_down_sig: 1`) thay vì để số lẻ vô hạn như 3.33e-6:
-
-| giai đoạn · nhóm | đầu warm-up | đỉnh | đáy |
-|---|---|---|---|
-| Stage 0 · Recombinator + cls_head | 4.8e-6 | 1.6e-4 | 4.8e-7 |
-| Stage 0 · Attn | 1.4e-5 (1.44e-5) | 4.8e-4 | 1.4e-6 (1.44e-6) |
-| decoder_ft · Sup Head / Route Head / Concat Linear / FFN / Retriever 3 | 1e-5 | 3e-4 | 3e-7 |
-| decoder_ft · LoRA | 3e-6 (3.33e-6) | 1e-4 | 1e-7 (1.001e-7) |
-| decoder_ft · Retriever 2 | 1e-6 (1.83e-6) | 5.48e-5 | 5e-8 (5.48e-8) |
-| decoder_ft · Retriever 1 + Learnable Query | 3e-7 (3.33e-7) | 1e-5 | **1e-8** (1.001e-8) |
-
-Đáy nhỏ nhất của decoder_ft là **1e-8** (`train.schedule.min_lr`, được kiểm).
-Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
-làm tròn.
-
-Sup Loss (dùng chung cho hai giai đoạn): ASL với `gamma_neg: [4.0, 2.0, 0.0]`
-(nén theo tên lớp neg/pos/uncertain trên ô mang nhãn 0), `gamma_pos: 0.0`,
-`clip: 0.10` (10%); ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
-warmup. META và model card của checkpoint Stage 0 ghi max_lr từng nhóm,
-`attn_lr_mult`, `weight_decay` và ASL; `run_pretrain.sh --resume` báo khi các
-khoá này khác config hiện tại.
-
-Checkpoint
-Stage 0 dở dang với optimizer một nhóm (trước khi Attn có nhóm riêng) không
-nối tiếp được — chạy `run_pretrain.sh --no-resume`. Chạy bằng
-`bash scripts/run_pretrain.sh --detach`; sau đó chạy §2.5 như phần dưới.
-
-decoder_ft mặc định đi tiếp từ đĩa (adapter / predictions / điểm đã có thì
-dùng lại). Muốn làm lại decoder_ft từ đầu:
-`bash scripts/run_section25.sh --no-resume` — checkpoint ft, predictions và
-điểm cũ của My Gemma được đổi tên sang `*.old_<thời điểm>` (không xoá), Stage 0
-vẫn được nạp; hai baseline không bị đụng.
-
-Hai baseline có thể chạy **tách riêng** và đi qua Hub:
-
-```bash
-bash scripts/run_section25.sh --mode comparer_pretrain --detach  # R2Gen + AdaAtt -> sota_hub.repo
-bash scripts/run_section25.sh --mode infer_test --detach         # sinh + chấm + kiểm định, không train
-```
-
-`comparer_pretrain` chỉ chạy data -> train -> push cho `kind: sota`, và
-`push` ở đây đẩy **checkpoint** (`model_best.pt`, `train_stats.json`,
-`tokenizer.json`, `hub_meta.json`) lên `sota_hub.repo/<subdir>/<arm_id>/`, mỗi
-baseline ngay khi nó xong. Baseline đã có checkpoint cục bộ thì chỉ đẩy
-(`--retrain` để huấn luyện lại). Manifest của mode này là
-`manifest_comparer_pretrain.json`, không đè `manifest.json`.
-`infer_test` và mode mặc định thấy thiếu checkpoint baseline cục bộ thì kéo từ
-Hub (kiểm sha256 và `image_policy`) trước khi quyết định huấn luyện;
-`infer_test` vẫn thiếu thì dừng mã 10. `--no-pull` tắt việc kéo.
-
-Checkpoint Stage 0 của kiến trúc cũ (Local/Global Extractor `format /2`, PDVR +
-QFormer `format /1`) **không** nạp
-được vào nhánh này — phải chạy lại Stage 0. Nếu `runs/sup_pretrain` còn
-`trainer_state.pt` cũ thì chạy với `--no-resume` (hoặc `--run-id <tên mới>`).
-
-## Dàn ý nghiên cứu
-
-| mục | câu hỏi | kết quả |
-|---|---|---|
-| 2.0 | emb_vec còn giữ bao nhiêu thông tin thị giác so với ảnh gốc 512px | emb_vec **không** còn mang nhiều thông tin thị giác chất lượng — có cơ sở thống kê (Wilcoxon signed-rank trên Laplacian-2D vs 1D-DCT) |
-| 2.1 | baseline nào infer thuần tốt nhất trên ảnh X-quang khi chưa pretrain | **Gemma 3 4b-it** vượt trội so với Qwen2.5-VL-3B-Instruct và LLaVA-Med 7B |
-| 2.2 | cấu hình LoRA nào tốt nhất — {LoRA, DoRA} × {r = 4, 8, 16, 32} | **QLoRA rank 4** |
-| 2.3 | thêm PDVR + QFormer + Sup-head vào có đáng không | nhánh concat **tham gia không đáng kể** — chưa hội tụ nên chưa kết luận tốt/tệ |
-| 2.4 | cấu hình MoE nào tốt nhất — 5 tổ hợp (K, E) | **E = 10 · K = 6** |
-| **2.5** | **có hơn R2Gen / AdaAtt không, hơn bao nhiêu** | **đang chạy** |
-
-§2.5 lấy kết quả của năm mục trên làm **siêu tham số đã chốt**: base Gemma 3 từ
-§2.1, QLoRA r4 từ §2.2, E=10·K=6 từ §2.4, và nguồn đặc trưng ảnh SigLIP
-dim = 1152 từ kết luận của §2.0 (emb_vec sau căn chỉnh không đủ giàu thông tin
-thị giác — xem phần kiến trúc nhánh ở trên).
-
-Code của 2.0–2.4 nằm ở [`_archive/`](#_archive) — **bản ghi**, không phải một
-đường chạy được.
-
----
-
-## Năm điều kiện được thống nhất của §2.5
-
-Mọi khác biệt giữa ba cột phải là khác biệt của **kiến trúc**. Năm điều kiện
-dưới đây là chỗ điều đó được cài đặt chứ không phải chỗ nó được hứa:
-
-1. **SOTA chỉ nạp lại trọng số ở đúng setup của paper gốc** — khối `sota:` trong
-   `configs/section25.yaml` là bản chép nguyên văn, không hiệu chỉnh.
-2. **Cùng 6400 mẫu train / 3000 ảnh test** của tập này, `assert_no_leak: true`.
-3. **Paired Bootstrap + Permutation Test** cho từng cặp, Holm trên ba p-value.
-   Không Friedman — xem phần kiểm định ghép cặp trong cấu hình.
-4. **Một phương pháp resize duy nhất** cho mọi model, **kể cả khi kích thước đầu
-   vào vô tình khớp** (`image_policy.allow_native_match: false`).
-5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
-   config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
-   (`train.pretrained_lr_mult: 0.1`) — áp cho R2Gen/AdaAtt. Riêng My Gemma
-   fine-tune toàn bộ, không đóng băng, lịch lr `train.ft_lr`: lr_max toàn
-   hệ 3e-4, LoRA 1e-4, Retriever i=1..n tăng dần 1e-5 -> 3e-4.
-
-Cả ba candidate sinh bằng **một đặc tả giải mã** — khối `generate:`
-(`src/decoding_spec.py`): beam search `num_beams: 3`, `length_penalty: 1.0`,
-`early_stopping: false`, `no_repeat_ngram_size: 0`, `repetition_penalty: 1.0`,
-không lấy mẫu. My Gemma đưa nó cho `transformers.generate`; R2Gen/AdaAtt đưa nó
-cho `src/sota/decoding.py`, bản chép lại từng bước `_beam_search` của
-transformers 4.52 (top 2·k ứng viên, `<eos>` chỉ nhận ở hạng < k, điểm = tổng
-log-prob / số token sinh^lp, cùng điều kiện dừng xét chung cả batch) — cả khi
-chọn checkpoint trên val. `selftest_section25.py` đối chiếu nó TỪNG TOKEN với
-`transformers.generate` trên một GPT-2 tí hon ngẫu nhiên. Khối
-`sota.*.decoding` của paper chỉ còn là bản ghi; R2Gen mất `block_trigrams`, và
-chỗ lệch này nằm trong `manifest.deviations`. Khác biệt duy nhất là độ dài tối
-đa theo từ điển: 256 subword (My Gemma) / 59 từ (hai baseline). Với Experts,
-trọng số định tuyến của mỗi ảnh được nhân bản theo beam
-(`moe.RoutingContext.set(..., repeat=num_beams)`).
-
-Hai điều kiện cuối **sửa** setup gốc của R2Gen/AdaAtt. Đó là sai lệch có chủ ý
-và nó được ghi vào `manifest.deviations` + REPORT.md kèm con số thật, nên báo
-cáo không thể im lặng về nó.
-
----
+**Kiểm định.** 6 cặp; mỗi cặp permutation đảo dấu + bootstrap BCa trên hiệu số
+ghép cặp theo ảnh, Holm trên 6 p-value trong từng metric, "thắng" = cả hai
+kiểm định bác H0 **và** |Cohen dz| ≥ 0.10. `REPORT.md` tách riêng bốn cặp khác
+nhau đúng một biến (hiệu ứng của rank, hiệu ứng của chỗ gắn).
 
 ## Chạy
 
@@ -235,162 +29,63 @@ cáo không thể im lặng về nó.
 export HF_TOKEN=hf_xxxxxxxx          # đã được cấp quyền google/gemma-3-4b-it
 export WANDB_API_KEY=xxxxxxxx        # bỏ được → W&B ghi offline
 
-bash scripts/setup.sh                        # lần đầu
-python -m src.config                         # in cấu hình §2.5 đã giải quyết
-python -m src.labels_cls --check-split       # dò nhãn, ~30 giây
-
-bash scripts/run_pretrain.sh --dry-run       # Stage 0: thử đường ống
-bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 3 epoch
-
-bash scripts/run_section25.sh --dry-run      # §2.5: thử đường ống
-bash scripts/run_section25.sh --detach       # §2.5: chạy thật
+bash scripts/setup.sh                # lần đầu
+python scripts/selftest_lora.py      # vài giây, không cần GPU
+bash scripts/run_lora.sh --dry-run   # 8 ảnh, 16 mẫu, 4 bước + in VRAM đỉnh
+bash scripts/run_lora.sh --detach    # chạy thật, nền; log ở logs/
 ```
 
-**Thí nghiệm LoRA — rank × chỗ gắn** (khôi phục §2.2, thu về 2 × 2):
+Chạy lại chính lệnh sau khi đứt là **đi tiếp**: adapter đã có → bỏ qua train,
+predictions đã có → chỉ sinh phần thiếu, điểm đã có → dùng lại. Chỉ một phần:
+`--stages stats,report`, `--arms qlora_r4_attn,qlora_r4_decoder`,
+`--retrain`, `--rescore`.
 
-```bash
-bash scripts/run_lora.sh --dry-run
-bash scripts/run_lora.sh --detach
-```
+Đầu ra: `runs/lora_rank_target/` (REPORT.md, manifest.json, predictions,
+metrics), adapter ở `adapters_lora/`. Stage `push` đẩy thư mục run (không đẩy
+trọng số) lên dataset **private** `RGExp123/research_v2` trên Hugging Face.
 
-Bốn candidate QLoRA: r ∈ {4, 8} × chỗ gắn ∈ {`attn` = q/k/v/o_proj, `decoder` =
-thêm gate/up/down_proj}, khai ở khối `lora_exp` của `configs/section25.yaml`.
-Không nhánh, không MoE, không Stage 0; mọi thứ khác (dữ liệu, base NF4, prompt,
-giải mã beam 3, lịch học, alpha = 2r, metric) dùng chung với §2.5. Huấn luyện
-bằng đường candidate-không-nhánh của `train_recomb`, kiểm định bằng
-`stats_multi` (6 cặp, permutation + BCa, Holm). `REPORT.md` tách riêng bốn cặp
-khác nhau đúng một biến (hiệu ứng của rank, hiệu ứng của chỗ gắn). Đầu ra:
-`runs/2.2_lora_rank_target/`, adapter ở `adapters_2_2/`.
+## Hai loại config
 
-**Hai loại config.** `configs/section25.yaml` là config **nội dung** — thí
-nghiệm là gì (dữ liệu, mô hình, lr, epoch, batch **hiệu dụng**
-`train.effective_batch` / `pretrain.effective_batch`). `configs/gpu/<card>.yaml`
-là config **GPU** — chạy nó thế nào trên một card (số mẫu mỗi lượt,
-checkpointing, worker, batch lúc sinh/chấm, autobatch), chọn bằng `--gpu`
-(mặc định `rtx3060`). `grad_accum` được suy ra = batch hiệu dụng / số mẫu mỗi
-lượt, phải chia hết. `src/config.load_config` DỪNG nếu file nội dung khai khoá
-GPU, nếu file GPU khai khoá khác `GPU_KEYS`, hoặc nếu file GPU thiếu một khoá.
+* `configs/lora.yaml` — **nội dung**: thí nghiệm là gì (dữ liệu, base, prompt,
+  giải mã, lịch học, batch hiệu dụng, bốn candidate ở khối `lora_exp`, kiểm
+  định, repo Hub).
+* `configs/gpu/<card>.yaml` — **GPU**: chạy thế nào trên một card (số mẫu mỗi
+  lượt, checkpointing, prefetch, batch lúc sinh/chấm, autobatch), chọn bằng
+  `--gpu` (mặc định `rtx3060`). `grad_accum` tự suy ra = batch hiệu dụng / số
+  mẫu mỗi lượt. `src/config.load_config` DỪNG nếu hai file lấn ranh giới của
+  nhau hoặc file GPU thiếu khoá.
 
-| `--gpu` | card | decoder_ft | Stage 0 | baseline `micro_batch` |
-|---|---|---|---|---|
-| `rtx3060` (mặc định) | RTX 3060 12 GB | 1 × 32, checkpointing | 16 × 2 | 8 |
+| `--gpu` | card | mỗi lượt × accum | checkpointing |
+|---|---|---|---|
+| `rtx3060` | RTX 3060 12 GB | 1 × 32 | có |
 
-Thêm card mới: chép `configs/gpu/rtx3060.yaml`, đổi `name`,
-`gpu_name_contains`, `requires` và các số trong `set:`.
-
-**Dry-run cả 3 pipeline + VRAM đỉnh:** `bash scripts/dry_run_all.sh [--gpu
-rtx3060] [--detach]` chạy lần lượt Stage 0 My Gemma, `--mode comparer_pretrain`
-(R2Gen + AdaAtt) và §2.5 full (decoder_ft + sinh + chấm + kiểm định + báo cáo)
-ở chế độ `--dry-run`, rồi in bảng VRAM đỉnh từng pipeline (`total − free` của
-thiết bị, lấy mẫu 0.1 s — gồm CUDA context). Batch mỗi lượt là của config GPU,
-decoder_ft đệm tới `max_seq_len`, nên con số là VRAM thật (trường hợp xấu
-nhất) của lần chạy thật. Đầu ra dry-run cũ (`*_dryrun`) bị xoá trước khi chạy.
-
-`--dry-run` chạy vài bước trên vài chục mẫu: nhanh, nhưng VRAM đỉnh là thật vì
-batch mỗi lượt không bị thu nhỏ (Stage 0 ảnh cố định; decoder_ft đệm tới
-`max_seq_len`). Thứ nó không đo: thời gian của lần chạy thật.
-
----
+Thêm card: chép `configs/gpu/rtx3060.yaml`, đổi `name`, `gpu_name_contains`,
+`requires` và các số trong `set:`; chạy `--dry-run` để xem VRAM đỉnh thật.
 
 ## Cấu trúc
 
 ```
-configs/section25.yaml       File cấu hình DUY NHẤT: toàn bộ tham số của §2.5,
-                             kể cả Stage 0 của My Gemma, có chú thích lý do.
-                             run_pretrain và run_section25 đều đọc nó khi không
-                             truyền --config (src/config.py::DEFAULT_CONFIG).
-requirements.txt             môi trường chính (transformers/torch/torchvision)
-requirements-adapters.txt    peft>=0.12 · bitsandbytes>=0.43
-scripts/
-  setup.sh                   dựng môi trường
-  _env.sh                    chọn python (container vs cục bộ)
-  run_pretrain.sh            Stage 0 của My Gemma — sup_pretrain, TIÊN QUYẾT
-  selftest_pretrain.py       phép kiểm cho sup_pretrain, không cần GPU/mạng
-  run_section25.sh           MỘT LỆNH cho §2.5 (data · train · sinh · chấm ·
-                             kiểm định · báo cáo)
-  selftest_section25.py      49 phép kiểm: hàng rào chính sách ảnh, họ Holm ba
-                             cặp, dấu hiệu số, từ điển, beam, hai kiến trúc
-                             baseline, k=3 KHÔNG chạm Friedman, cấu hình
-                             lr/ASL/λ, `--no-resume`
-src/
-  config.py                  nạp YAML, seed, token
-  decoding_spec.py           MỘT đặc tả giải mã (khối `generate:`) cho cả ba candidate
-  data.py · data_train.py    3000 ảnh test · 6400 mẫu train + hàng rào rò rỉ
-  labels_cls.py              dò labels.npz -> nhãn (L,3) + mask cho ClsHead
-  prompts.py                 prompt dùng chung
-  imaging.py                 chính sách ảnh · `unified_tensor` = ĐIỀU KIỆN 4,
-                             một phép biến đổi hình học cho cả ba candidate
-  backbone.py                nạp base, gắn adapter, ReportDataset, collate,
-                             one-cycle, device_map
-  recombiner.py              Recombinator (Learnable Query · Retriever×3 GQA · FFN) ·
-                             ClsHead · RouteHead (Pooling Stack + Main Head) ·
-                             Linear/GELU 256→128 → Linear 128→64 token vào decoder · ASL
-  moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·
-                             Aux Loss · MoELoraLinear · ghi/nạp Experts
-  train_recomb.py            vòng huấn luyện của candidate C
-  pretrain_sup.py            Stage 0 của C: 100% có giám sát, KHÔNG decoder
-  pretrain_io.py             ghi/nạp/đẩy đúng các khối đã pretrain
-  run_pretrain.py            điều phối Stage 0 của C (data · train · push)
-  sota/                      HAI BASELINE — cài lại theo paper gốc
-    __init__.py              build(name) · param_groups (hệ số 1/10 của đk 5)
-    visual.py                ResNet-101/152 ImageNet, đặc trưng lưới
-    r2gen.py                 Transformer 3 lớp + Relational Memory + MCLN
-    adaatt.py                LSTM + Adaptive Attention + Visual Sentinel
-    tokenizer.py             từ điển mức từ, DÙNG CHUNG cho cả hai
-    decoding.py              beam search dùng chung — luật của transformers.generate
-    cider.py                 CIDEr-D + BLEU_4 — CHỈ để chọn checkpoint
-  train_sota.py              Stage 0 (đk 5) + main-stage (đk 1) cho hai baseline
-  metrics.py                 BLEU · ROUGE · BERTScore, theo TỪNG MẪU
-  stats_ab.py                bootstrap BCa · permutation · Holm · sàn dz
-  stats_multi.py             ba cặp; đổi DUY NHẤT họ Holm, mọi phép tính import
-                             nguyên văn từ stats_ab
-  runners/gemma3*.py         base trần · +adapter · +nhánh+Experts (candidate C)
-  runners/sota.py            R2Gen + AdaAtt — nạp ckpt, sinh bằng đặc tả giải mã chung
-  run_section25.py           điều phối 7 stage, đọc `arms_s25`, ghi `deviations`
-  report_section25.py        REPORT.md + summary.csv + pairwise_tests.csv
-  push.py · tracking.py      đẩy Hub · W&B
-  preflight.py               kiểm môi trường trước khi nạp model
+configs/lora.yaml · configs/gpu/rtx3060.yaml
+scripts/run_lora.sh · selftest_lora.py · setup.sh · _env.sh
+src/run_lora.py        điều phối: data → train → infer → score → stats → report → push
+src/report_lora.py     REPORT.md
+src/train_recomb.py    vòng huấn luyện (candidate KHÔNG nhánh = Gemma NF4 + adapter peft)
+src/backbone.py        nạp base, chọn target module (lọc vision), alpha, one-cycle
+src/runners/           sinh (gemma3_recomb) — cùng đường dựng chuỗi với lúc train
+src/data*.py · imaging.py · metrics.py · stats_ab.py · stats_multi.py
+src/prefetch.py · autobatch.py · vram_monitor.py · config.py · push.py · tracking.py
 ```
 
-Hai baseline được **cài lại** chứ không `pip install`: khối `initialization` của
-cả hai setup gốc nói mọi khối ngoài ResNet ImageNet là `random`, nên không có
-checkpoint nào của paper để nạp. "Nạp lại trọng số ở đúng trạng thái setup gốc"
-ở đây có nghĩa đúng như thế — và `scripts/selftest_section25.py` kiểm chính câu
-đó từ config.
-
----
+`recombiner.py`, `moe.py`, `pretrain_io.py`, `labels_cls.py` còn ở `src/` chỉ
+vì `train_recomb.py` import chúng; thí nghiệm LoRA không dựng nhánh nào và MoE
+tắt cứng.
 
 ## `_archive/`
 
-Năm mục đã **chốt** và không còn chạy nữa. Giữ lại thay vì xoá vì bảng §2.5
-trích số của chúng làm mốc nền, và vì khi cần đọc lại cách những con số ấy sinh
-ra thì chúng vẫn ở đây.
-
-* **§2.0 / §2.1** — so sánh base model zero-shot (Gemma 3, Qwen2.5-VL,
-  LLaVA-Med). `run_all.py`, `report.py`, `stats.py`, hai runner ngoài Gemma,
-  `configs/baseline.yaml`, `scripts/{run.sh,selftest.py,infer_llavamed.py}`,
-  `README_2.0_2.1.md`.
-* **§2.2** — tám biến thể adapter `{QLoRA, QDoRA} × {r = 4, 8, 16, 32}`,
-  Friedman + hậu kiểm Wilcoxon/Holm. `configs/adapters.yaml`,
-  `src/{train.py, run_adapters.py, report_adapters.py}`,
-  `scripts/run_adapters.sh`, `README_2.2.md`.
-* **§2.3 / §2.4** — nhánh PDVR và năm cấu hình MoE.
-  `configs/recombiner.yaml` (và bản đời trước `configs/recomb.yaml`) — các
-  khối dùng chung với §2.5 đã gộp vào `configs/section25.yaml`,
-  `src/{run_recomb.py, report_recomb.py, report_moe.py}`,
-  `scripts/{run_recomb.sh, selftest_recomb.py}`, `README_2.3.md`,
-  `README_2.4.md`.
-* **Friedman** — `src/stats_friedman.py` và `scripts/selftest_friedman.py`.
-  §2.5 có k = 3 nhưng **cố ý** không mở đầu bằng kiểm định tổng thể
-  (phần kiểm định ghép cặp của README này). Để chúng trong `src/` nghĩa là câu ấy chỉ là một câu
-  trong README chứ không phải một sự thật của code.
-
-**Không file nào trong `src/` import sang `_archive/`.** Code trong `_archive/`
-nằm ngoài package `src/` nên import tương đối của nó không giải quyết được từ
-đó. Muốn chạy lại một mục thì `git mv` ngược lại là đủ — lịch sử vẫn còn nguyên
-vì `scripts/archive_to_2.5.sh` dùng `git mv` chứ không xoá-rồi-tạo-lại.
-
-`§3` và `§4` (huấn luyện thật trên toàn bộ split, và đối đầu QLoRA r4 thuần vs
-cả công thức) **đã bị xoá** chứ không archive: chúng không nằm trong dàn ý
-nghiên cứu ở trên. Lịch sử git vẫn giữ chúng — `git log --diff-filter=D
---name-only` tìm ra commit xoá, `git checkout <commit>~1 -- <file>` lấy lại.
+Mọi thí nghiệm trước: §2.0–§2.2 (base zero-shot, 8 biến thể adapter + Friedman),
+§2.3–§2.4 (nhánh Recombinator, MoE), và §2.5 (R2Gen · AdaAtt · My Gemma, Stage 0,
+`comparer_pretrain`, `sota_hub`, profile GPU). Code, config, script và README
+của từng mục (`_archive/README_*.md`, README gốc của §2.5 là
+`_archive/README_2.5.md`). Không file nào trong `src/` import sang `_archive/`
+(selftest kiểm). Lịch sử git đầy đủ của các mục ấy ở repo cũ
+`KenteaKe11/RGExp_proj`.

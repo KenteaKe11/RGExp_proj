@@ -10,3 +10,7 @@ logs/
 adapters/
 adapters_dryrun/
 wandb/
+# adapter / checkpoint của mọi thí nghiệm — thuộc repo model trên Hub, không phải repo code
+adapters_*/
+*.safetensors
+*.pt
