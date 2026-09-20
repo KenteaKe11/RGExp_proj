@@ -258,8 +258,8 @@ bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --detach
 Khối `set:` chỉ đổi khoá phần cứng (`src/config.HW_KEYS`): My Gemma 4×8 không
 checkpointing, Stage 0 32×1, `micro_batch` 40, batch sinh/chấm lớn hơn. Batch
 hiệu dụng giữ nguyên (lệch là DỪNG). Khối `experiment:` là một thí nghiệm
-**khác**: 16384 mẫu train cho cả ba candidate và Stage 0, decoder_ft My Gemma 2
-epoch. Nó được ghi vào `manifest.deviations`, và phải có run dir / checkpoint /
+**khác**: 16384 mẫu train cho cả ba candidate và Stage 0, Stage 0 2 epoch (thay
+vì 3, cho cả ba), decoder_ft My Gemma 2 epoch. Nó được ghi vào `manifest.deviations`, và phải có run dir / checkpoint /
 repo Stage 0 / thư mục ckpt baseline riêng (`src/config.ISOLATION_KEYS`), nếu
 thiếu là DỪNG. Cần torch build cu128 (>= 2.7).
 

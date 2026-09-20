@@ -60,6 +60,11 @@ experiment:
   # candidate và cho Stage 0 — điều kiện 2 vẫn giữ: cùng một tập train.
   data.n_train: 16384
   pretrain.n_train: 16384
+  # Stage 0 (sup_pretrain của My Gemma + Stage 0 của hai baseline): 2 epoch
+  # thay vì 3 — tập train dài gấp 2.56 lần, nên 2 epoch vẫn nhiều bước hơn
+  # (2 × 512 = 1024 bước so với 3 × 200 = 600). Điều kiện 5 giữ: CẢ BA dùng
+  # chung con số này.
+  pretrain.n_epochs: 2
   # My Gemma · decoder_ft: 2 epoch = 1024 bước, vẫn MỘT chu kỳ one-cycle cho
   # toàn bộ main-stage. Hai baseline giữ số epoch của paper (sota.*).
   train.n_epochs: 2

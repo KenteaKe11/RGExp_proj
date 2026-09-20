@@ -52,6 +52,11 @@ experiment:
   # CHÉP NGUYÊN từ rtx_pro_6000_blackwell.yaml — sửa một bên thì sửa cả hai.
   data.n_train: 16384
   pretrain.n_train: 16384
+  # Stage 0 (sup_pretrain của My Gemma + Stage 0 của hai baseline): 2 epoch
+  # thay vì 3 — tập train dài gấp 2.56 lần, nên 2 epoch vẫn nhiều bước hơn
+  # (2 × 512 = 1024 bước so với 3 × 200 = 600). Điều kiện 5 giữ: CẢ BA dùng
+  # chung con số này.
+  pretrain.n_epochs: 2
   train.n_epochs: 2
 
   output.subdir: "2.5_sota_b16k"

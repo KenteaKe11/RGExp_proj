@@ -965,6 +965,7 @@ def t_hw_profile_blackwell_keeps_experiment():
     assert diff <= HW_KEYS | exp, f"profile đổi khoá không khai: {diff - HW_KEYS - exp}"
     assert hw["data"]["n_train"] == hw["pretrain"]["n_train"] == 16384
     assert hw["train"]["n_epochs"] == 2
+    assert hw["pretrain"]["n_epochs"] == 2 and CFG["pretrain"]["n_epochs"] == 3
     assert CFG["data"]["n_train"] == 6400 and CFG["train"]["n_epochs"] == 1
     from src.config import ISOLATION_KEYS, _get_path
     for k in ISOLATION_KEYS:
