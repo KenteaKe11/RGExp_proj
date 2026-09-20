@@ -253,7 +253,7 @@ def stale_recomb_keys(cfg: Cfg) -> list[str]:
         return []
     return [f"config còn khoá của kiến trúc nhánh cũ (PDVR/QFormer): "
             f"recombiner.{', recombiner.'.join(found)}. Recombinator hiện tại "
-            f"khai bằng `local`, `head_dim`, `pool_stages`, `route_head`, "
+            f"khai bằng `n_tokens`, `retriever`, `pool_stages`, `route_head`, "
             f"`n_dec_tokens`. Xoá các khoá này."]
 
 
@@ -388,14 +388,14 @@ FREEZABLE_PARTS: dict = {
 DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ()
 # lr đỉnh TỪNG NHÓM của nhánh ở decoder_ft — `train.ft_lr`. Thứ tự = thứ tự
 # nhóm trong optimizer (sau adapter). Mỗi tham số của nhánh rơi vào ĐÚNG một
-# nhóm; Recombinator tách theo ba khối Local / Global / FFN.
+# nhóm; Recombinator tách theo hai khối: NGUYÊN bộ Retriever (Learnable Query +
+# mọi Information Retriever) / FFN.
 FT_LR_GROUPS: tuple[str, ...] = ("cls_head", "route_head", "dec_proj",
-                                 "recombinator_local", "recombinator_global",
-                                 "recombinator_ffn")
+                                 "recombinator_retriever", "recombinator_ffn")
 # Tiền tố tham số (theo `branch.named_parameters()`) -> nhóm của Recombinator.
 RECOMB_LR_PREFIX: dict = {
-    "recombinator.local_extractors.": "recombinator_local",
-    "recombinator.global_extractor.": "recombinator_global",
+    "recombinator.query": "recombinator_retriever",
+    "recombinator.retrievers.": "recombinator_retriever",
     "recombinator.ffn.": "recombinator_ffn",
 }
 
@@ -439,8 +439,7 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
                    toàn bộ nhánh ở chế độ scratch (Attn × `attn_lr_mult`).
       * `groups` = `train.ft_lr` — lr đỉnh từng nhóm của nhánh ở decoder_ft:
                    cls_head 3e-5 · route_head (MLP gate) 6e-4 · dec_proj 3e-4 ·
-                   recombinator_local 3e-5 · recombinator_global 3e-5 ·
-                   recombinator_ffn 3e-4.
+                   recombinator_retriever 3e-5 · recombinator_ffn 3e-4.
 
     MỘT chu kỳ one-cycle cho CẢ stage (không restart): `train.schedule` không
     được khai `cycle_steps`/`lr_decay`. LambdaLR nhân cùng một hệ số vào mọi
@@ -550,12 +549,12 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     """AdamW. Nhóm (bỏ nhóm rỗng), theo thứ tự:
 
       decoder_ft: lora|experts @main · cls_head · route_head · dec_proj ·
-                  recombinator_local · recombinator_global ·
-                  recombinator_ffn   (lr đỉnh từ `train.ft_lr`)
+                  recombinator_retriever · recombinator_ffn
+                  (lr đỉnh từ `train.ft_lr`)
       scratch   : lora|experts @main · branch @main · branch_attn @main×attn_mult
 
     Mặc định (config hiện tại): adapter 1e-4 · cls_head 3e-5 · route_head
-    (MLP gate) 6e-4 · dec_proj 3e-4 · Local 3e-5 · Global 3e-5 · FFN 3e-4.
+    (MLP gate) 6e-4 · dec_proj 3e-4 · Retriever 3e-5 · FFN 3e-4.
     Không đóng băng gì.
 
     Adapter luôn đứng ĐẦU: log đọc `param_groups[0]["lr"]` làm lr chính. Một
@@ -692,8 +691,8 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
 
     Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
     Nó không nói "giảm batch đi" chung chung, vì với nhánh Recombinator thì
-    batch thường không phải chỗ tốn nhất: Local Extractor đầu tiên chạy trên đủ
-    4096 patch × hidden, và attention là 256 query × 4096 patch.
+    batch thường không phải chỗ tốn nhất: MỖI Information Retriever chuẩn hoá và
+    chiếu K/V trên đủ 4096 patch, và attention là 256 query × 4096 patch.
     """
     import torch
 
@@ -734,10 +733,11 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"candidate, nên tự đổi ở đây là làm hỏng đúng thứ thí nghiệm đang "
             f"đo. Sửa config rồi chạy lại cả hai.\n"
             f"    Bốn khoá làm được gì đó, theo thứ tự sức nặng:\n"
-            f"      1. recombiner.local.hidden "
-            f"({(rcfg.get('local') or {}).get('hidden', 2048)}) — activation "
-            f"4096 patch × hidden của Local Extractor đầu. ĐỔI NÓ LÀ ĐỔI HÌNH "
-            f"DẠNG CHECKPOINT Stage 0 — phải pretrain lại.\n"
+            f"      1. recombiner.retriever.n_blocks "
+            f"({(rcfg.get('retriever') or {}).get('n_blocks', 3)}) — mỗi "
+            f"Information Retriever giữ RMSNorm(X) + K/V trên 4096 patch và "
+            f"attention 256 × 4096. ĐỔI NÓ LÀ ĐỔI HÌNH DẠNG CHECKPOINT Stage 0 "
+            f"— phải pretrain lại.\n"
             f"      2. train.max_seq_len ({tcfg.get('max_seq_len')}) + "
             f"recombiner.n_dec_tokens ({rcfg.get('n_dec_tokens', 32)}) -> độ "
             f"dài chuỗi thật mà decoder phải chạy.\n"
@@ -908,8 +908,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         print(f"  nhánh: {branch.describe()}", flush=True)
         print(f"  tham số nhánh: {bstats['total']:,} "
               f"({bstats['trainable']:,} học được) — recombinator "
-              f"{bstats['recombinator']:,} (local {bstats['recombinator_local']:,}"
-              f" · global {bstats['recombinator_global']:,} · ffn "
+              f"{bstats['recombinator']:,} (retriever "
+              f"{bstats['recombinator_retriever']:,} · ffn "
               f"{bstats['recombinator_ffn']:,}) · cls_head "
               f"{bstats['cls_head']:,} · route_head {bstats['route_head']:,} "
               f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT'}) · dec_proj "

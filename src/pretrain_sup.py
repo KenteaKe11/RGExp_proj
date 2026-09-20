@@ -332,7 +332,7 @@ def _ckpt_root(run_dir: Path) -> Path:
 
 
 def write_ckpt(branch, opt, sched, run_dir: Path, epoch: int, state: dict,
-               meta_extra: dict, keep_last: int = 2, swa_model=None) -> Path:
+               meta_extra: dict, keep_last: int = 2) -> Path:
     """Ghi ckpt của một epoch + cập nhật `last.json`. Trả thư mục epoch.
 
     Hai file có ý nghĩa khác nhau và không được lẫn:
@@ -361,7 +361,6 @@ def write_ckpt(branch, opt, sched, run_dir: Path, epoch: int, state: dict,
         "seen_samples": int(state["seen_samples"]),
         "gen_state": state["gen_state"],
         "best": state.get("best"),
-        "swa": (swa_model.state_dict() if swa_model is not None else None),
         "branch": {k: v.detach().cpu() for k, v in branch.state_dict().items()},
         "opt": opt.state_dict(),
         "sched": sched.state_dict(),
@@ -534,22 +533,20 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     keep_last = int(pcfg.get("keep_last_ckpt", 2))
     sel_metric = str(pcfg.get("select_metric", "cls_f1_pos"))
     sel_mode = str(pcfg.get("select_mode", "max")).lower()
-    swa_cfg = dict(pcfg.get("swa", {}) or {})
-    swa_enabled = bool(swa_cfg.get("enabled", False))
-    swa_start_cfg = float(swa_cfg.get("start_epoch", 0.5))
-    if not 0.0 <= swa_start_cfg <= 1.0:
-        raise TrainUnusable("pretrain.swa.start_epoch phải nằm trong [0, 1].")
-    swa_start_epoch = max(1, math.ceil(swa_start_cfg * n_epochs))
-    swa_model = (torch.optim.swa_utils.AveragedModel(branch, device=dev)
-                 if swa_enabled else None)
+    # SWA đã BỎ: `ckpt/latest` = trọng số của epoch CUỐI, không trung bình.
+    # Còn khai `pretrain.swa` là DỪNG — để im thì người đọc config tưởng
+    # checkpoint tái sử dụng vẫn là trung bình nhiều epoch.
+    if "swa" in pcfg:
+        raise TrainUnusable(
+            "pretrain.swa đã BỎ — Stage 0 không còn dùng SWA; ckpt/latest là "
+            "epoch cuối. Xoá khối `pretrain.swa` khỏi config.")
 
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
           f"· {n_epochs} epoch × {per_epoch} bước = {steps} bước "
           f"· val {0 if ds_val is None else len(ds_val)} mẫu"
           + (f" · warmup+cosine restart / {per_epoch} bước"
              f" · lr_decay {float(scfg.get('lr_decay', 1.0)):.4g} (max/min cùng giảm)"
-             if scfg.get("cycle_steps") else "")
-          + (f" · SWA từ epoch {swa_start_epoch}" if swa_enabled else ""),
+             if scfg.get("cycle_steps") else ""),
           flush=True)
 
     # ── trạng thái (mới hoặc nối tiếp) ─────────────────────────────────────
@@ -621,8 +618,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         global_step = int(st["global_step"])
         seen = int(st.get("seen_samples", 0))
         best = dict(st.get("best") or best)
-        if swa_model is not None and st.get("swa") is not None:
-            swa_model.load_state_dict(st["swa"])
         nxt = st.get("sample_index")
         print(f"  ↻ NỐI TIẾP từ {last['dir']}: đã xong epoch {start_epoch}"
               f"/{n_epochs} · bước {global_step}/{steps} · {seen:,} lượt mẫu"
@@ -794,12 +789,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             meta = dict(meta_base, train=tr, val=val,
                         global_step=global_step, seen_samples=seen,
                         minutes_epoch=round(mins, 2))
-            if swa_model is not None and epoch + 1 >= swa_start_epoch:
-                # Update before serializing trainer state, so interruption at an
-                # epoch boundary resumes with the same SWA accumulator.
-                swa_model.update_parameters(branch)
             d = write_ckpt(branch, opt, sched, run_dir, epoch + 1, state, meta,
-                           keep_last, swa_model=swa_model)
+                           keep_last)
             if is_best:
                 best = {"metric": sel_metric, "epoch": epoch + 1, "value": cur}
                 pretrain_io.copy_ckpt(d, _ckpt_root(run_dir) / "best")
@@ -844,10 +835,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"sup_pretrain HẾT VRAM ở batch {bs} × grad_accum {accum} "
                 f"({note}).\n"
                 f"    Ba khoá làm được gì đó, theo thứ tự sức nặng:\n"
-                f"      1. recombiner.local.hidden "
-                f"({(rcfg.get('local') or {}).get('hidden', 2048)}) — Local "
-                f"Extractor đầu tiên chạy trên ĐỦ 4096 patch × hidden cho MỖI ảnh, "
-                f"đây là activation lớn nhất của nhánh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH "
+                f"      1. recombiner.retriever.n_blocks "
+                f"({(rcfg.get('retriever') or {}).get('n_blocks', 3)}) — MỖI "
+                f"Information Retriever chuẩn hoá + chiếu K/V trên ĐỦ 4096 patch "
+                f"và chạy attention 256 × 4096 cho MỖI ảnh, đây là activation lớn "
+                f"nhất của nhánh. Nhưng ĐỔI NÓ LÀ ĐỔI HÌNH "
                 f"DẠNG CHECKPOINT: nhánh pretrain sẽ không nạp được vào main-stage "
                 f"đang dùng giá trị cũ. Đổi thì phải đổi ở CẢ HAI.\n"
                 f"      2. pretrain.per_device_batch_size ({bs}) — nhớ NHÂN "
@@ -858,23 +850,14 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         raise
 
     latest_dir = _ckpt_root(run_dir) / "latest"
-    if swa_model is not None and epoch_rows:
-        branch.load_state_dict(swa_model.module.state_dict())
-        final = epoch_rows[-1]
-        pretrain_io.save_pretrain(
-            branch, latest_dir,
-            dict(meta_base, epoch=int(final["epoch"]), train={
-                 "asl": final["train_asl"], "cls_f1_pos": final["train_f1_pos"]},
-                 val={"asl": final["val_asl"], "cls_f1_pos": final["val_f1_pos"],
-                      "cls_acc": final["val_acc"]},
-                 global_step=global_step, seen_samples=seen,
-                 weight_averaging={"type": "swa", "start_epoch": swa_start_epoch,
-                                   "n_averaged": int(swa_model.n_averaged)}))
-        print(f"  ✓ ckpt/latest: SWA của {int(swa_model.n_averaged)} epoch "
-              f"(từ epoch {swa_start_epoch})", flush=True)
-    elif not latest_dir.exists() and epoch_rows:
-        pretrain_io.copy_ckpt(_ckpt_root(run_dir) / f"epoch_{epoch_rows[-1]['epoch']:03d}",
+    if epoch_rows:
+        # `latest` = epoch CUỐI của lần chạy này (không SWA). Ghi đè mỗi lần
+        # chạy xong, kể cả khi thư mục đã có — một lần nối tiếp chạy thêm
+        # epoch phải cập nhật nó.
+        last_ep = int(epoch_rows[-1]["epoch"])
+        pretrain_io.copy_ckpt(_ckpt_root(run_dir) / f"epoch_{last_ep:03d}",
                               latest_dir)
+        print(f"  ✓ ckpt/latest = epoch {last_ep}", flush=True)
 
     peak = (torch.cuda.max_memory_allocated() / 1024 ** 3
             if torch.cuda.is_available() else 0.0)
@@ -900,9 +883,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "best": best,
         "best_dir": str(best_dir) if best_dir.exists() else None,
         "latest_dir": str(latest_dir) if latest_dir.exists() else None,
-        "swa": ({"enabled": swa_enabled, "start_epoch": swa_start_epoch,
-                 "n_averaged": int(swa_model.n_averaged)} if swa_model else
-                {"enabled": False}),
         "last_epoch": epoch_rows[-1] if epoch_rows else None,
         "history": epoch_rows,
         "n_bad_images": int(ds.n_bad),
@@ -913,7 +893,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     (run_dir / "pretrain_stats.json").write_text(
         json.dumps(stats, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
-    del opt, sched, swa_model, branch, model, gemma
+    del opt, sched, branch, model, gemma
     free_vram()
     print(f"  ✓ sup_pretrain: {mins:.1f} phút · {len(epoch_rows)} epoch · "
           f"best {best.get('metric')} = {best.get('value')} @ epoch "

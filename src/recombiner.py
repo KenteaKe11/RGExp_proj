@@ -13,18 +13,19 @@ Sơ đồ tổng:
 
 Bên trong Recombinator (sơ đồ chi tiết):
 
-    X (4096, 1152)
-      ├─► 1. Local Extractors ×2, mỗi khối:
-      │      RMSNorm(1152) ─► Linear 1152→2048 GELU ─► RMSNorm(2048)
-      │      ─► AvgPool (N → N/4) ─► Linear 2048→1152 GELU
-      │      (4096 ─► 1024 ─► 256 token)
-      │                              │
-      │                              ▼ Query
-      └─► RMSNorm(1152) ─► W_Key / W_Value ─► 2. Global Extractor: MHA(head_dim=64) ─► ⊕ (residual Query)
-                                                              │
-                                                              ▼
-          3. FFN: Linear 1152→2560 GELU ─► RMSNorm(2560) ─► Linear 2560→2560 GELU ─► ⊕ ─► Y (256, 2560)
-                                                  └──────────── residual ─────────────┘
+    Learnable Query Q₀ (256, 1152)            X (4096, 1152)
+      │                                          │  (đi vào MỌI Information Retriever)
+      ▼                                          ▼
+    Information Retriever (i), i = 1..n (n = 3), mỗi khối:
+        q  = RMSNorm(Q_{i-1}) ─► W_Query (Q_Value)          1152 → 18·64
+        kv = RMSNorm(X)       ─► W_Key / W_Value            1152 → 6·64
+        h  = q + GQA(q, kv)           (Head = 18, Group = 6 — 3 head Q / 1 head KV)
+        n  = RMSNorm(h)
+        Q_i = n + GELU(Linear 2560→1152 (GELU(Linear 1152→2560 (n))))
+      │
+      ▼  Q_n (256, 1152)
+    FFN: Linear 1152→2560 GELU ─► RMSNorm(2560) ─► Linear 2560→2560 GELU ─► ⊕ ─► Y (256, 2560)
+                                        └──────────── residual ─────────────┘
 
 Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`):
 
@@ -39,19 +40,22 @@ Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`)
    `Gemma3MultiModalProjector` avg-pool 64×64 xuống 16×16 TRƯỚC khi chiếu, tức
    là nén thông tin không gian 16 lần trước khi tham số học được nào của ta nhìn
    thấy ảnh. Đọc sau phép pool ấy thì Recombinator chỉ xào lại đúng thứ decoder
-   đã nhận qua VL-Adapter.
+   đã nhận qua VL-Adapter. Ở đây Key/Value của MỌI Information Retriever là đủ
+   4096 patch gốc.
 
 2. VISION TOWER CHẠY ĐÚNG MỘT LẦN cho cả hai đường (`encode_vision`).
 
-3. AvgPool của Local Extractor là pool 2×2 TRÊN LƯỚI ẢNH (64×64 → 32×32 →
-   16×16), không phải gộp 4 token liên tiếp của chuỗi phẳng: gộp liên tiếp là
-   trộn 4 patch cùng một HÀNG ảnh, tức là một cửa sổ 1×4 chứ không phải 2×2.
-   Lưới 16×16 ra khỏi Local Extractor trùng lưới của VL-Adapter, nên 256 token
-   của Recombinator và 256 token ảnh nói về cùng những vùng ảnh.
+3. 256 TOKEN LÀ 256 LEARNABLE QUERY, không còn là lưới 16×16 của ảnh. Chúng
+   không có vị trí không gian nào gắn sẵn: mỗi query tự học "hỏi gì" từ 4096
+   patch. Hệ quả: phép trung bình cụm dùng để khởi tạo Pooling Stack và
+   `dec_proj` (điểm 6, 7) giờ chỉ là một khởi tạo trung tính trên CHỈ SỐ query,
+   không còn mang nghĩa "pool 2×2 trên ảnh".
 
-4. RESIDUAL lấy từ ĐẦU RA RMSNorm, đúng như sơ đồ vẽ (mũi tên xuất phát từ
-   khối RMSNorm): Global Extractor cộng `RMSNorm(query)`, FFN cộng
-   `RMSNorm(2560)`. Không có residual trong Local Extractor.
+4. RESIDUAL LẤY TỪ ĐẦU RA RMSNorm ở CẢ BA chỗ: Attention cộng
+   `RMSNorm(Q_{i-1})` (KHÔNG phải Learnable Query / Q_{i-1} thô), MLP của
+   Retriever cộng `RMSNorm(h)`, FFN cộng `RMSNorm(2560)`.
+   Mỗi Retriever có RMSNorm(X) RIÊNG — cùng X, nhưng mỗi khối chuẩn hoá theo
+   trọng số của mình.
 
 5. Main Head KHÔNG áp GELU sau lớp cuối (1024 → target). Đầu ra ấy là LOGIT —
    của ASL (sigmoid) ở Classification Head và của softmax/top-k ở Route Head.
@@ -66,8 +70,9 @@ Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`)
 7. VÀO DECODER: `dec_proj` = HAI Linear trên trục token, không cổng:
    Linear(256 → 128) + GELU -> Linear(128 → 64) (lớp cuối KHÔNG GELU, để
    token vào decoder nhận được cả giá trị âm như embedding thật). Khởi tạo tách
-   phép trung bình 2×2 (lưới 16×16 → 8×8) thành hai nửa: lớp 1 = trung bình
-   cặp NGANG (16×16 → 16×8), lớp 2 = trung bình cặp DỌC (16×8 → 8×8). `dec_proj` KHÔNG
+   phép trung bình 2×2 (chỉ số query xếp 16×16 → 8×8) thành hai nửa: lớp 1 =
+   trung bình cặp NGANG (16×16 → 16×8), lớp 2 = trung bình cặp DỌC (16×8 → 8×8)
+   — xem điểm 3: "lưới" ở đây là cách xếp chỉ số query. `dec_proj` KHÔNG
    thuộc Stage 0 (decoder không chạy ở đó) — nó nằm trong
    `pretrain_io.UNTRAINED_MODULES` và học ở lr đầy đủ trong decoder_ft.
 
@@ -83,6 +88,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -93,14 +99,17 @@ import torch.nn.functional as F
 N_VIS_TOKENS = 4096
 BRANCH_FILE = "recomb_branch.safetensors"
 BRANCH_META = "recomb_branch.json"
-BRANCH_FORMAT = "rgexp.recomb_branch/2"
+BRANCH_FORMAT = "rgexp.recomb_branch/3"
 
-# Khoá của những kiến trúc cũ (PDVR, QFormer, cổng Hard-Concrete). Còn sót
+# Khoá của những kiến trúc cũ (PDVR, QFormer, cổng Hard-Concrete, Local/Global
+# Extractor). `n_heads`/`n_query` ở CẤP `recombiner` là của QFormer — số head
+# và số query hiện khai ở `retriever.n_heads` và `n_tokens`. Còn sót
 # trong config là DỪNG: im lặng bỏ qua thì người đọc config tưởng chúng vẫn tác
 # động lên lần chạy.
 STALE_RECOMB_KEYS: tuple[str, ...] = (
     "qformer", "prepare_pool_factor", "highway_token_dims", "swiglu_dropout",
-    "swiglu_hidden", "n_query", "n_heads", "gate", "gate_init", "gate_init_logit")
+    "swiglu_hidden", "n_query", "n_heads", "gate", "gate_init", "gate_init_logit",
+    "local", "head_dim")
 
 
 def _isqrt_exact(n: int) -> int | None:
@@ -203,29 +212,47 @@ class TokenLinear(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """MultiHeadAttn một chiều: query nhìn sang kv (W_Query, W_Key, W_Value, W_O)."""
+    """Grouped-Query Attention một chiều: query nhìn sang kv.
+
+    `n_heads` head cho Query, `n_kv_heads` head cho Key/Value (= số GROUP của
+    GQA); mỗi head KV dùng chung cho `n_heads / n_kv_heads` head Q liền nhau
+    (head Q thứ h đọc head KV thứ h // (n_heads/n_kv_heads)). `n_kv_heads =
+    n_heads` là MHA thường. W_Key/W_Value vì thế chỉ chiếu ra n_kv_heads·d_head.
+    """
 
     def __init__(self, d_q: int, d_kv: int, d_model: int, n_heads: int,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, n_kv_heads: int | None = None):
         super().__init__()
+        n_kv = int(n_kv_heads) if n_kv_heads else int(n_heads)
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} không chia hết n_heads {n_heads}")
+        if n_kv < 1 or int(n_heads) % n_kv:
+            raise ValueError(
+                f"GQA: n_heads {n_heads} phải chia hết cho số group (head KV) "
+                f"{n_kv} — mỗi group dùng chung cho đúng n_heads/group head Q.")
         self.n_heads = int(n_heads)
+        self.n_kv_heads = n_kv
         self.d_head = d_model // int(n_heads)
         self.q_proj = nn.Linear(d_q, d_model, bias=False)
-        self.k_proj = nn.Linear(d_kv, d_model, bias=False)
-        self.v_proj = nn.Linear(d_kv, d_model, bias=False)
+        self.k_proj = nn.Linear(d_kv, n_kv * self.d_head, bias=False)
+        self.v_proj = nn.Linear(d_kv, n_kv * self.d_head, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         self.p_drop = float(dropout)
 
-    def _split(self, t: torch.Tensor) -> torch.Tensor:
+    def _split(self, t: torch.Tensor, n_heads: int) -> torch.Tensor:
         b, n, _ = t.shape
-        return t.view(b, n, self.n_heads, self.d_head).transpose(1, 2)
+        return t.view(b, n, n_heads, self.d_head).transpose(1, 2)
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        qh = self._split(self.q_proj(q))
-        kh = self._split(self.k_proj(kv))
-        vh = self._split(self.v_proj(kv))
+        qh = self._split(self.q_proj(q), self.n_heads)
+        kh = self._split(self.k_proj(kv), self.n_kv_heads)
+        vh = self._split(self.v_proj(kv), self.n_kv_heads)
+        rep = self.n_heads // self.n_kv_heads
+        if rep > 1:
+            # repeat_interleave thay vì `enable_gqa=` của SDPA: cờ ấy chỉ có từ
+            # torch 2.5 và thứ tự ghép head của nó phải tin theo tài liệu.
+            kh = kh.repeat_interleave(rep, dim=1)
+            vh = vh.repeat_interleave(rep, dim=1)
         # SDPA thay vì softmax(QKᵀ) viết tay: với 4096 key, ma trận attention
         # tường minh là (B, 18, 256, 4096) và nó phải sống qua cả backward.
         out = F.scaled_dot_product_attention(
@@ -235,44 +262,38 @@ class CrossAttention(nn.Module):
 
 
 # ══ Recombinator ════════════════════════════════════════════════════════════
-class LocalExtractor(nn.Module):
-    """RMSNorm(d) -> Linear d→h GELU -> RMSNorm(h) -> AvgPool(N→N/f) -> Linear h→d GELU."""
+class InformationRetriever(nn.Module):
+    """Một Information Retriever: GQA (Query = khối trước, KV = X gốc) + MLP.
 
-    def __init__(self, d_vis: int, hidden: int, pool_factor: int):
-        super().__init__()
-        self.pool_factor = int(pool_factor)
-        self.norm_in = RMSNorm(d_vis)
-        self.up = nn.Linear(d_vis, hidden)
-        self.norm_mid = RMSNorm(hidden)
-        self.down = nn.Linear(hidden, d_vis)
+        q   = RMSNorm(query)
+        h   = q + GQA(q, RMSNorm(X))                        # residual = đầu ra RMSNorm
+        n   = RMSNorm(h)
+        out = n + GELU(Linear h→d (GELU(Linear d→h (n))))  # residual = đầu ra RMSNorm
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm_mid(F.gelu(self.up(self.norm_in(x))))
-        x = avg_pool_tokens(x, self.pool_factor, grid=True)
-        return F.gelu(self.down(x))
-
-
-class GlobalExtractor(nn.Module):
-    """Attention Block: Query = Local Extractors, Key/Value = X gốc (4096 patch).
-
-        q   = RMSNorm(local)                 # (B, 256, 1152)
-        kv  = RMSNorm(X)                     # (B, 4096, 1152)
-        out = q + MHA(q, kv)                 # residual từ đầu ra RMSNorm (điểm 4)
+    Không residual nào cộng `query` thô (điểm 4 của docstring module).
     """
 
-    def __init__(self, d_vis: int, head_dim: int, dropout: float):
+    def __init__(self, d_vis: int, hidden: int, n_heads: int, n_kv_groups: int,
+                 dropout: float):
         super().__init__()
-        if int(d_vis) % int(head_dim):
-            raise ValueError(f"siglip_dim {d_vis} không chia hết head_dim {head_dim}")
-        self.n_heads = int(d_vis) // int(head_dim)
+        if int(d_vis) % int(n_heads):
+            raise ValueError(f"siglip_dim {d_vis} không chia hết n_heads {n_heads}")
+        self.n_heads = int(n_heads)
+        self.n_kv_groups = int(n_kv_groups)
         self.norm_q = RMSNorm(d_vis)
         self.norm_kv = RMSNorm(d_vis)
-        self.attn = CrossAttention(d_vis, d_vis, d_vis, self.n_heads, dropout)
+        self.attn = CrossAttention(d_vis, d_vis, d_vis, self.n_heads, dropout,
+                                   n_kv_heads=self.n_kv_groups)
+        self.norm_mlp = RMSNorm(d_vis)
+        self.up = nn.Linear(d_vis, int(hidden))
+        self.down = nn.Linear(int(hidden), d_vis)
         self.drop = nn.Dropout(float(dropout)) if dropout else nn.Identity()
 
-    def forward(self, local: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
-        q = self.norm_q(local)
-        return q + self.drop(self.attn(q, self.norm_kv(vis)))
+    def forward(self, query: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(query)
+        h = q + self.drop(self.attn(q, self.norm_kv(vis)))
+        n = self.norm_mlp(h)
+        return n + self.drop(F.gelu(self.down(F.gelu(self.up(n)))))
 
 
 class RecombFFN(nn.Module):
@@ -294,25 +315,31 @@ class Recombinator(nn.Module):
     """(B, 4096, 1152) -> (B, 256, 2560). Xem sơ đồ ở docstring module."""
 
     def __init__(self, d_vis: int = 1152, d_model: int = 2560,
-                 n_vis: int = N_VIS_TOKENS, n_local: int = 2,
-                 local_hidden: int = 2048, pool_factor: int = 4,
-                 head_dim: int = 64, dropout: float = 0.0):
+                 n_vis: int = N_VIS_TOKENS, n_tokens: int = 256,
+                 n_retrievers: int = 3, n_heads: int = 18, n_kv_groups: int = 6,
+                 retriever_hidden: int = 2560, query_init_std: float = 0.02,
+                 dropout: float = 0.0):
         super().__init__()
         self.d_vis, self.d_model = int(d_vis), int(d_model)
         self.n_vis = int(n_vis)
-        n = self.n_vis
-        for _ in range(int(n_local)):
-            if n % int(pool_factor):
-                raise ValueError(
-                    f"recombiner.n_vis = {self.n_vis} không chia hết "
-                    f"pool_factor^{n_local} = {int(pool_factor) ** int(n_local)}.")
-            n //= int(pool_factor)
-        self.n_tokens = n
-        self.local_extractors = nn.ModuleList(
-            LocalExtractor(self.d_vis, int(local_hidden), int(pool_factor))
-            for _ in range(int(n_local)))
-        self.global_extractor = GlobalExtractor(self.d_vis, int(head_dim), dropout)
+        self.n_tokens = int(n_tokens)
+        if self.n_tokens < 1 or int(n_retrievers) < 1:
+            raise ValueError(
+                f"recombiner.n_tokens = {n_tokens}, retriever.n_blocks = "
+                f"{n_retrievers} — cả hai phải >= 1.")
+        self.query_init_std = float(query_init_std)
+        # Learnable Query (256, 1152) — dùng chung cho mọi ảnh, mở rộng theo batch.
+        self.query = nn.Parameter(torch.empty(self.n_tokens, self.d_vis))
+        self.retrievers = nn.ModuleList(
+            InformationRetriever(self.d_vis, int(retriever_hidden), int(n_heads),
+                                 int(n_kv_groups), dropout)
+            for _ in range(int(n_retrievers)))
         self.ffn = RecombFFN(self.d_vis, self.d_model, dropout)
+        self.reset_query()
+
+    def reset_query(self) -> None:
+        with torch.no_grad():
+            nn.init.normal_(self.query, mean=0.0, std=self.query_init_std)
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         if vis.shape[1] != self.n_vis or vis.shape[-1] != self.d_vis:
@@ -320,20 +347,24 @@ class Recombinator(nn.Module):
                 f"Recombinator dựng cho ({self.n_vis}, {self.d_vis}) nhưng nhận "
                 f"({vis.shape[1]}, {vis.shape[-1]}). 4096 khác đi gần như luôn "
                 f"nghĩa là pan&scan đang BẬT — xem src/imaging.assert_single_crop().")
-        x = vis
-        for blk in self.local_extractors:
-            x = blk(x)
-        x = self.global_extractor(x, vis)
+        x = self.query.to(vis.dtype).unsqueeze(0).expand(vis.shape[0], -1, -1)
+        for blk in self.retrievers:
+            x = blk(x, vis)
         return self.ffn(x)
 
+    def retriever_parameters(self):
+        """Tham số của NGUYÊN bộ Retriever: Learnable Query + mọi Information Retriever."""
+        yield self.query
+        yield from self.retrievers.parameters()
 
-GRAD_GROUPS: tuple[str, ...] = ("local", "global", "ffn")
+
+GRAD_GROUPS: tuple[str, ...] = ("retriever", "ffn")
 
 # ══ Ma trận Attn của Recombinator: lr × `recombiner.attn_lr_mult` ════════════
-# Q/K/V/O của MHA trong Global Extractor. Dùng chung cho Stage 0
-# (`pretrain_sup.build_optimizer`) và main-stage (`train_recomb.build_optimizer`)
+# Q/K/V/O của GQA trong MỌI Information Retriever. Dùng chung cho Stage 0
+# (`pretrain_sup.build_optimizer`) và chế độ scratch (`train_recomb.build_optimizer`)
 # — "Attn luôn có lr cao hơn" là MỘT quy tắc, nên nó chỉ được định nghĩa ở đây.
-ATTN_PARAM_PREFIX = "recombinator.global_extractor.attn."
+ATTN_PARAM_RE = re.compile(r"^recombinator\.retrievers\.\d+\.attn\.")
 DEFAULT_ATTN_LR_MULT = 3.0
 
 
@@ -349,30 +380,34 @@ def attn_lr_mult(rcfg: dict | None) -> float:
 
 def is_attn_param(name: str) -> bool:
     """Tên tham số (theo `branch.named_parameters()`) thuộc ma trận Attn?"""
-    return str(name).startswith(ATTN_PARAM_PREFIX)
+    return ATTN_PARAM_RE.match(str(name)) is not None
+
+
+def _l2(params) -> float:
+    sq = [p.grad.detach().float().square().sum() for p in params
+          if p.grad is not None]
+    return float(torch.stack(sq).sum().sqrt()) if sq else 0.0
 
 
 def recombinator_grad_norms(branch) -> dict[str, float]:
-    """L2 gradient norm / số tham số, trước clipping, cho ba khối của Recombinator."""
+    """L2 gradient norm THÔ (không chia số tham số), trước clipping, cho hai khối:
+
+        retriever = NGUYÊN bộ Retriever (Learnable Query + mọi Information Retriever)
+        ffn       = FFN 1152 → 2560 → 2560
+
+    Mỗi khối là MỘT norm trên tất cả tham số của nó (√Σ‖g‖²), cùng đại lượng
+    mà `clip_grad_norm_` đo — nên đọc thẳng được cạnh `max_grad_norm`.
+    """
     if branch is None:
         return {}
     rec = branch.recombinator
-    out: dict[str, float] = {}
-    for name, module in (("local", rec.local_extractors),
-                         ("global", rec.global_extractor),
-                         ("ffn", rec.ffn)):
-        grads = [p.grad.detach().float().square().sum() for p in module.parameters()
-                 if p.grad is not None]
-        n_params = sum(p.numel() for p in module.parameters())
-        total = sum(grads) if grads else torch.tensor(0.0)
-        out[f"{name}_mean_per_param"] = float(total.sqrt() / max(n_params, 1))
-    return out
+    return {"retriever": _l2(rec.retriever_parameters()),
+            "ffn": _l2(rec.ffn.parameters())}
 
 
 def format_grad_norms(g: dict) -> str:
-    """'grad L/G/F a/b/c' — một chuỗi dùng chung cho log của cả hai chế độ."""
-    return ("grad L/G/F " + "/".join(
-        f"{g.get(f'{k}_mean_per_param', 0.0):.2e}" for k in GRAD_GROUPS))
+    """'grad R/F a/b' — một chuỗi dùng chung cho log của cả hai chế độ."""
+    return "grad R/F " + "/".join(f"{g.get(k, 0.0):.2e}" for k in GRAD_GROUPS)
 
 
 # ══ Classification Head / Route Head ════════════════════════════════════════
@@ -520,7 +555,7 @@ class AsymmetricLoss(nn.Module):
     """
 
     def __init__(self, gamma_neg=2.0, gamma_pos: float = 0.0,
-                 clip: float = 0.05, eps: float = 1e-8):
+                 clip: float = 0.10, eps: float = 1e-8):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = float(gamma_pos)
@@ -699,15 +734,15 @@ class RecombinerBranch(nn.Module):
             raise ValueError(
                 f"recombiner.{', recombiner.'.join(stale)}: khoá của kiến trúc "
                 f"cũ (PDVR / QFormer / cổng Hard-Concrete). Recombinator hiện "
-                f"tại khai bằng `local`, `head_dim`, `pool_stages`, `route_head`, "
-                f"`n_dec_tokens` — xoá các khoá cũ khỏi config.")
+                f"tại khai bằng `n_tokens`, `retriever`, `pool_stages`, "
+                f"`route_head`, `n_dec_tokens` — xoá các khoá cũ khỏi config.")
         # Giữ nguyên văn hai khối config đã dựng ra nhánh. `save_branch` ghi
         # chúng vào META, và `load_branch` dựng lại TỪ ĐÓ chứ không từ config
         # hiện tại — xem docstring load_branch.
         self.spec = {"recombiner": r, "classifier": c,
                      "d_vis": int(d_vis), "d_model": int(d_model),
                      "n_labels": int(n_labels)}
-        loc = dict(r.get("local", {}) or {})
+        ret = dict(r.get("retriever", {}) or {})
         rh = dict(r.get("route_head", {}) or {})
         a = dict(c.get("asl", {}) or {})
 
@@ -716,17 +751,14 @@ class RecombinerBranch(nn.Module):
         self.recombinator = Recombinator(
             d_vis=d_vis, d_model=d_model,
             n_vis=int(r.get("n_vis", N_VIS_TOKENS)),
-            n_local=int(loc.get("n_blocks", 2)),
-            local_hidden=int(loc.get("hidden", 2048)),
-            pool_factor=int(loc.get("pool_factor", 4)),
-            head_dim=int(r.get("head_dim", 64)),
+            n_tokens=int(r.get("n_tokens", 256)),
+            n_retrievers=int(ret.get("n_blocks", 3)),
+            n_heads=int(ret.get("n_heads", 18)),
+            n_kv_groups=int(ret.get("n_kv_groups", 6)),
+            retriever_hidden=int(ret.get("hidden", 2560)),
+            query_init_std=float(ret.get("query_init_std", 0.02)),
             dropout=float(r.get("dropout", 0.0)))
         self.n_tokens = int(self.recombinator.n_tokens)
-        declared = r.get("n_tokens")
-        if declared is not None and int(declared) != self.n_tokens:
-            raise ValueError(
-                f"recombiner.n_tokens = {declared}, nhưng n_vis / pool_factor^"
-                f"n_blocks = {self.n_tokens}. Một trong hai sai.")
         self.pool_stages = int(r.get("pool_stages", 4))
 
         self.cls_head = ClsHead(
@@ -747,7 +779,7 @@ class RecombinerBranch(nn.Module):
         self.asl = AsymmetricLoss(
             gamma_neg=a.get("gamma_neg", 2.0),
             gamma_pos=float(a.get("gamma_pos", 0.0)),
-            clip=float(a.get("clip", 0.05)),
+            clip=float(a.get("clip", 0.10)),
             eps=float(a.get("eps", 1e-8)))
 
         self.n_dec_tokens = int(r.get("n_dec_tokens", 64))
@@ -758,6 +790,9 @@ class RecombinerBranch(nn.Module):
         for m in (self.recombinator, self.cls_head, self.route_head):
             if m is not None:
                 _init(m)
+        # `_init` chỉ chạm nn.Linear — Learnable Query đặt riêng (normal, std
+        # `retriever.query_init_std`), gọi lại cho rõ thứ tự.
+        self.recombinator.reset_query()
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
         self.route_head.init_noise()
         # `dec_proj` KHÔNG đi qua `_init`: khởi tạo của nó là trung bình cụm.
@@ -816,8 +851,8 @@ class RecombinerBranch(nn.Module):
             "total": sum(p.numel() for p in self.parameters()),
             "trainable": sum(p.numel() for p in self.parameters() if p.requires_grad),
             "recombinator": c(rec),
-            "recombinator_local": c(rec.local_extractors),
-            "recombinator_global": c(rec.global_extractor),
+            "recombinator_retriever": sum(p.numel() for p in rec.retriever_parameters()),
+            "recombinator_query": int(rec.query.numel()),
             "recombinator_ffn": c(rec.ffn),
             "cls_head": c(self.cls_head),
             "route_head": c(self.route_head),
@@ -826,8 +861,9 @@ class RecombinerBranch(nn.Module):
             "n_tokens": self.n_tokens,
             "n_dec_tokens": self.n_dec_tokens,
             "n_dec_hidden": self.n_dec_hidden,
-            "n_local": len(rec.local_extractors),
-            "n_heads": int(rec.global_extractor.n_heads),
+            "n_retrievers": len(rec.retrievers),
+            "n_heads": int(rec.retrievers[0].n_heads),
+            "n_kv_groups": int(rec.retrievers[0].n_kv_groups),
             "pool_stages": self.pool_stages,
             "route_enabled": self.route_enabled,
             "n_experts": self.route_head.n_experts,
@@ -837,12 +873,11 @@ class RecombinerBranch(nn.Module):
         """Một dòng mô tả kiến trúc cho log — dùng chung ở pretrain/train/sinh."""
         n = self.n_params()
         rec = self.recombinator
-        loc = rec.local_extractors[0] if len(rec.local_extractors) else None
-        hid = loc.up.out_features if loc is not None else 0
-        return (f"Recombinator: LocalExtractor×{n['n_local']} "
-                f"({self.d_vis}→{hid}→{self.d_vis}, {n['n_vis']}→{n['n_tokens']} "
-                f"token) -> Global MHA(Q={n['n_tokens']}, KV={n['n_vis']}, "
-                f"{n['n_heads']} head) -> FFN {self.d_vis}→{self.d_model} "
+        hid = rec.retrievers[0].up.out_features
+        return (f"Recombinator: LearnableQuery ({n['n_tokens']}, {self.d_vis}) -> "
+                f"InformationRetriever×{n['n_retrievers']} (GQA Q={n['n_tokens']}, "
+                f"KV={n['n_vis']}, {n['n_heads']} head / {n['n_kv_groups']} group · "
+                f"MLP {self.d_vis}→{hid}→{self.d_vis}) -> FFN {self.d_vis}→{self.d_model} "
                 f"= ({n['n_tokens']}, {self.d_model}) · ClsHead/RouteHead: "
                 f"PoolingStack×{n['pool_stages']} -> MainHead "
                 f"(target {getattr(self.cls_head, 'n_labels', 0)}×"

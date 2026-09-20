@@ -6,7 +6,7 @@
 #     bash scripts/run_pretrain.sh --detach             # chạy NỀN, trả lại shell
 #     bash scripts/run_pretrain.sh --dry-run            # 32 mẫu, 2 epoch
 #     bash scripts/run_pretrain.sh --stages train
-#     bash scripts/run_pretrain.sh --stages push        # đẩy ckpt/latest (SWA)
+#     bash scripts/run_pretrain.sh --stages push        # đẩy ckpt/latest (epoch cuối)
 #     bash scripts/run_pretrain.sh --epochs 12
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_pretrain`.
@@ -30,7 +30,7 @@
 # ── Checkpoint theo EPOCH ───────────────────────────────────────────────────
 #     runs/sup_pretrain/ckpt/epoch_001/ … epoch_NNN/   (giữ keep_last_ckpt cái)
 #     runs/sup_pretrain/ckpt/best/                     (metric tốt nhất)
-#     runs/sup_pretrain/ckpt/latest/                   (SWA cuối, để finetune)
+#     runs/sup_pretrain/ckpt/latest/                   (epoch cuối, để finetune)
 #     runs/sup_pretrain/ckpt/last.json                 (mốc để chạy tiếp)
 #
 # Ghi sau MỖI lượt đi hết trainset, kèm trạng thái RNG + `cursor` + chỉ số mẫu
@@ -59,15 +59,16 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# lr Stage 0: 4.8e-6 -> 1.6e-4 -> 4.8e-7 mỗi epoch, weight_decay 0.05; ma trận Attn (Q/K/V/O) của
-# Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 4.8e-4. Ckpt dở dang ghi
+# Stage 0: 5 epoch, KHÔNG SWA (ckpt/latest = epoch cuối).
+# lr Stage 0: 4.8e-6 -> 1.6e-4 -> 4.8e-7 mỗi epoch, weight_decay 0.2; ma trận Attn (Q/K/V/O,
+# GQA của mọi Information Retriever) của Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 4.8e-4. Ckpt dở dang ghi
 # bằng optimizer một nhóm KHÔNG nối tiếp được: chạy với --no-resume.
-# Sup Loss: ASL gamma_neg [4, 3, 0] (neg/pos/uncertain) · gamma_pos 0 · clip
-# 0.05. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.
+# Sup Loss: ASL gamma_neg [4, 2, 0] (neg/pos/uncertain) · gamma_pos 0 · clip
+# 0.10. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.
 #
 # `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ, lr đỉnh `train.ft_lr`:
 # MLP gate (Route Head) 6e-4 · FFN / Concat Linear 3e-4 · Experts (LoRA) 1e-4 ·
-# Local / Global / Sup Head 3e-5. MỘT chu kỳ one-cycle cho cả stage (div 30 ·
+# Retriever (Learnable Query + Information Retriever×3) / Sup Head 3e-5. MỘT chu kỳ one-cycle cho cả stage (div 30 ·
 # final_div 33.3), đáy nhỏ nhất 3e-8. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
 # có nghĩa (`round_down_sig: 1`: 6.67e-7 -> 6e-7, 3.33e-7 -> 3e-7). λ = 0.4, warmup tắt — vốn chỉ có lý do khi ClsHead còn ngẫu
 # nhiên. Làm lại decoder_ft từ đầu:

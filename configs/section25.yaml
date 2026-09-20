@@ -384,7 +384,7 @@ train:
   #     route_head (MLP gate)                   2e-5  -> 6e-4  -> 6e-7
   #     recombinator_ffn / dec_proj             1e-5  -> 3e-4  -> 3e-7
   #     adapter (LoRA/Experts)                  3e-6  -> 1e-4  -> 1e-7   (3.33.. -> 3)
-  #     recombinator_local/_global · cls_head   1e-6  -> 3e-5  -> 3e-8   <- đáy nhỏ nhất
+  #     recombinator_retriever · cls_head       1e-6  -> 3e-5  -> 3e-8   <- đáy nhỏ nhất
   #
   # `min_lr` là con số ĐƯỢC KIỂM (`train_recomb.ft_lrs` DỪNG nếu lệch), không
   # phải con số được đọc.
@@ -405,13 +405,12 @@ train:
   pretrained_lr_mult: 0.1
   # My Gemma · decoder_ft — lr ĐỈNH từng nhóm của nhánh
   # (`train_recomb.build_optimizer`; adapter/Experts ở `schedule.max_lr`).
-  # Phải khai ĐỦ sáu khoá, mỗi tham số nhánh thuộc đúng một nhóm.
+  # Phải khai ĐỦ năm khoá, mỗi tham số nhánh thuộc đúng một nhóm.
   ft_lr:
     cls_head: 3.0e-5             # Sup Head: Pooling Stack + Main Head
     route_head: 6.0e-4           # MLP gate: Route Head (+ noise_proj) -> Top-k Gate
     dec_proj: 3.0e-4             # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
-    recombinator_local: 3.0e-5   # Local Extractor ×2
-    recombinator_global: 3.0e-5  # Global Extractor: norm_q/norm_kv + Q/K/V/O
+    recombinator_retriever: 3.0e-5  # NGUYÊN bộ Retriever: Learnable Query + Information Retriever ×3
     recombinator_ffn: 3.0e-4     # FFN 1152 -> 2560 -> 2560
   # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
   # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer). Nhận:
@@ -439,23 +438,24 @@ recombiner:
   siglip_dim: 1152
   out_dim: null
   # ── Recombinator: X (4096, 1152) -> Y (256, 2560) ─────────────────────────
-  # 1. Local Extractors ×2: RMSNorm -> Linear 1152→hidden GELU -> RMSNorm
-  #    -> AvgPool 2×2 trên lưới ảnh (N → N/4) -> Linear hidden→1152 GELU.
-  #    4096 (64×64) -> 1024 (32×32) -> 256 (16×16).
-  # 2. Global Extractor: Query = đầu ra Local, Key/Value = X gốc (RMSNorm riêng),
-  #    MHA head_dim=64 (1152/64 = 18 head) + residual RMSNorm(Query).
-  # 3. FFN: Linear 1152→2560 GELU -> RMSNorm -> Linear 2560→2560 GELU + residual.
+  # Learnable Query (n_tokens, 1152) -> Information Retriever × n_blocks, mỗi khối:
+  #    q = RMSNorm(Query) -> W_Query ; K/V = RMSNorm(X gốc 4096 patch) -> W_Key/W_Value
+  #    h = q + GQA(q, K, V)          (18 head Q, 6 group = 6 head KV, head_dim 64;
+  #                                    residual = đầu ra RMSNorm, KHÔNG phải Query thô)
+  #    n = RMSNorm(h) ; out = n + GELU(Linear hidden→1152 (GELU(Linear 1152→hidden (n))))
+  # -> FFN: Linear 1152→2560 GELU -> RMSNorm -> Linear 2560→2560 GELU + residual.
   n_vis: 4096
-  n_tokens: 256          # được KIỂM: = n_vis / pool_factor^n_blocks
-  local:
-    n_blocks: 2
-    hidden: 2048
-    pool_factor: 4
-  head_dim: 64
+  n_tokens: 256          # số Learnable Query = số token ra; phải = 4^pool_stages
+  retriever:
+    n_blocks: 3          # Information Retriever (1) … (n), n = 3
+    n_heads: 18          # 1152 / 18 = head_dim 64
+    n_kv_groups: 6       # GQA: 6 head KV, mỗi head dùng chung cho 3 head Q
+    hidden: 2560         # MLP trong Retriever: 1152 → 2560 → 1152
+    query_init_std: 0.02
   dropout: 0.05
-  # Ma trận Attn (Q/K/V/O của Global Extractor) chạy lr × hệ số này ở Stage 0
+  # Ma trận Attn (Q/K/V/O của GQA trong MỌI Retriever) chạy lr × hệ số này ở Stage 0
   # (3 × 1.6e-4 = 4.8e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
-  # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_global`. Phải >= 1.
+  # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_retriever`. Phải >= 1.
   attn_lr_mult: 3.0
   # ── Classification Head / Route Head ────────────────────────────────────
   # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
@@ -478,11 +478,11 @@ recombiner:
   # (128) -> Linear (không bias, KHÔNG GELU) -> `n_dec_tokens` (64) token, nối
   # THẲNG vào chuỗi decoder TRƯỚC 256 token ảnh (First / Second trong sơ đồ);
   # phần văn bản của prompt giữ nguyên vị trí. Khởi tạo: tích hai lớp = trung
-  # bình 2×2 trên lưới 16×16 -> 8×8 (lớp 1 pool NGANG 16×16 -> 16×8, lớp 2 pool
-  # DỌC 16×8 -> 8×8). Hai head vẫn đọc đủ 256 token.
+  # bình 2×2 trên chỉ số query xếp 16×16 -> 8×8 (lớp 1 pool NGANG 16×16 -> 16×8,
+  # lớp 2 pool DỌC 16×8 -> 8×8). Hai head vẫn đọc đủ 256 token.
   # Khoá của kiến trúc cũ (`qformer`, `prepare_pool_factor`,
-  # `highway_token_dims`, `swiglu_dropout`, `n_query`, `n_heads`, `gate*`) đã
-  # BỎ — còn sót khoá nào là DỪNG.
+  # `highway_token_dims`, `swiglu_dropout`, `n_query`, `n_heads`, `gate*`) và
+  # của Local/Global Extractor (`local`, `head_dim`) đã BỎ — còn sót là DỪNG.
   n_dec_hidden: 128
   n_dec_tokens: 64
 
@@ -497,12 +497,12 @@ classifier:
   # cho Stage 0 và decoder_ft. `gamma_neg` dạng danh sách = nén theo TÊN LỚP
   # (thứ tự neg/pos/uncertain), áp lên ô mang nhãn 0: ô lớp neg 4.0, ô lớp pos
   # 3.0, ô lớp uncertain 0.0 (không nén). `gamma_pos` 0.0 = ô dương không nén.
-  # `clip` 0.05: ô âm đã có p < 0.05 bị loại hẳn khỏi gradient.
+  # `clip` 0.10 (10%): ô âm đã có p < 0.10 bị loại hẳn khỏi gradient.
   # `lambda` 0.4: trọng số ASL cạnh CE ở main-stage (Stage 0 chỉ có ASL).
   asl:
     gamma_neg: [4.0, 2.0, 0.0]
     gamma_pos: 0.0
-    clip: 0.08
+    clip: 0.10
     eps: 1.0e-8
   lambda: 0.4
   lambda_warmup_pct: 0.1
@@ -569,7 +569,8 @@ stats:
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ: `train_sota` đọc
 # nó cho R2Gen/AdaAtt, `src.run_pretrain` đọc nó cho My Gemma. Lịch: warm-up
-# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 5 epoch. Sau mỗi
+# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 5 epoch, KHÔNG SWA
+# (checkpoint tái sử dụng `ckpt/latest` = epoch cuối). Sau mỗi
 # restart, `lr_decay` hạ CẢ hai mốc (tức 5 chu kỳ nối nhau có biên giảm dần).
 #
 # `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
@@ -594,7 +595,7 @@ stats:
 # đường cong lr sai không ném exception nào.
 pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
-  n_epochs: 6
+  n_epochs: 5
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16
@@ -622,9 +623,7 @@ pretrain:
   keep_last_ckpt: 2
   # Đẩy ngay từng epoch; Hub không bao giờ nhận trainer_state.pt.
   push_each_epoch: true
-  swa:
-    enabled: true
-    start_epoch: 0.25
+  # SWA đã BỎ — khai lại khối `swa:` là DỪNG (`pretrain_sup.run`).
   subdir: sup_pretrain
   hub_repo: RGExp123/RGExp_sup_pretrain
   hub_repo_type: model

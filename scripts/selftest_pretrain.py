@@ -79,17 +79,18 @@ def raises(exc, fn, msg=""):
 # ── một nhánh nhỏ, cùng đường code với nhánh thật ───────────────────────────
 D_VIS, D_MODEL, N_LABELS = 16, 24, 5
 RCFG_BASE = {
-    # Lưới 16×16 -> 8×8 -> 4×4: cùng CẤU TRÚC với 64×64 -> 32×32 -> 16×16 thật,
+    # 16 Learnable Query nhìn 256 patch qua 3 Information Retriever (GQA 4 head
+    # Q / 2 group KV): cùng CẤU TRÚC với 256 query × 4096 patch thật (18 / 6),
     # nhỏ đủ để chạy trên CPU.
     "siglip_dim": D_VIS, "out_dim": None, "n_vis": 256, "n_tokens": 16,
-    "local": {"n_blocks": 2, "hidden": 20, "pool_factor": 4},
-    "head_dim": 4, "dropout": 0.0, "pool_stages": 2,
+    "retriever": {"n_blocks": 3, "n_heads": 4, "n_kv_groups": 2, "hidden": 20},
+    "dropout": 0.0, "pool_stages": 2,
     "route_head": {"hidden": 12, "dropout": 0.0},
     "n_dec_hidden": 8, "n_dec_tokens": 4,
     "n_experts": 4, "route_noise_init": -3.0, "route_enabled": False,
 }
 CCFG = {"n_classes": 3, "hidden": 16, "dropout": 0.0,
-        "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.05, "eps": 1e-8}}
+        "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0, "clip": 0.10, "eps": 1e-8}}
 
 
 def _branch(rcfg=None, n_labels=N_LABELS):
@@ -329,18 +330,34 @@ def freeze_tests() -> None:
             gs = [p.grad for p in mod.parameters() if p.grad is not None]
             true(gs and any(float(g.abs().sum()) > 0 for g in gs),
                  f"{name} phải nhận gradient từ ASL")
-        for k in ("local", "global", "ffn"):
-            m = getattr(b.recombinator, {"local": "local_extractors",
-                                         "global": "global_extractor",
-                                         "ffn": "ffn"}[k])
-            gs = [p.grad for p in m.parameters() if p.grad is not None]
+        rec = b.recombinator
+        true(rec.query.grad is not None and float(rec.query.grad.abs().sum()) > 0,
+             "Learnable Query phải nhận gradient")
+        for i, blk in enumerate(rec.retrievers):
+            gs = [p.grad for p in blk.parameters() if p.grad is not None]
             true(gs and any(float(g.abs().sum()) > 0 for g in gs),
-                 f"khối {k} của Recombinator phải nhận gradient")
+                 f"Information Retriever ({i + 1}) phải nhận gradient")
+        gs = [p.grad for p in rec.ffn.parameters() if p.grad is not None]
+        true(gs and any(float(g.abs().sum()) > 0 for g in gs),
+             "FFN của Recombinator phải nhận gradient")
         from src import recombiner as R
         gn = R.recombinator_grad_norms(b)
-        eq(sorted(gn), sorted(f"{k}_mean_per_param" for k in R.GRAD_GROUPS))
+        eq(sorted(gn), sorted(R.GRAD_GROUPS))
+        eq(sorted(R.GRAD_GROUPS), ["ffn", "retriever"])
         true(all(v > 0 for v in gn.values()), f"grad norm phải > 0: {gn}")
-    check("ASL tới Recombinator (local/global/ffn) + ClsHead", t_asl_reaches_recombinator)
+        # L2 THÔ trên NGUYÊN bộ — không chia số tham số.
+        want_r = float(torch.sqrt(sum(p.grad.float().square().sum()
+                                      for p in rec.retriever_parameters())))
+        want_f = float(torch.sqrt(sum(p.grad.float().square().sum()
+                                      for p in rec.ffn.parameters())))
+        true(abs(gn["retriever"] - want_r) < 1e-4 * max(1.0, want_r),
+             f"grad_norm retriever = L2 thô của Query + mọi Retriever "
+             f"({gn['retriever']} vs {want_r})")
+        true(abs(gn["ffn"] - want_f) < 1e-4 * max(1.0, want_f),
+             f"grad_norm ffn = L2 thô ({gn['ffn']} vs {want_f})")
+        true(R.format_grad_norms(gn).startswith("grad R/F "), "chuỗi log R/F")
+    check("ASL tới Query/Retriever×3/FFN + ClsHead; grad_norm R/F là L2 thô",
+          t_asl_reaches_recombinator)
 
     def t_dec_route_no_grad():
         """`dec_proj` và `route_head` không nhận gradient khi decoder không chạy."""
@@ -432,20 +449,35 @@ def dec_proj_tests() -> None:
     check("khởi tạo dec_proj: hai lớp, tích = trung bình 2×2 trên lưới",
           t_init_is_cluster_mean)
 
-    def t_grid_pool_matches_matrix():
-        """avg_pool_tokens(grid) == ma trận 2×2 của avg_pool_matrix."""
+    def t_gqa_matches_reference():
+        """GQA: head Q thứ h đọc head KV thứ h // (n_heads / n_kv) — so với bản tay."""
         import torch
 
-        x = torch.randn(3, 256, 5)
-        got = R.avg_pool_tokens(x, 4, grid=True)
-        want = torch.einsum("oi,bid->bod", R.avg_pool_matrix(256, 64), x)
-        true(torch.allclose(got, want, atol=1e-6),
-             "AvgPool của Local Extractor phải là pool 2×2 trên lưới ảnh")
-        flat = R.avg_pool_tokens(x, 4, grid=False)
-        true(not torch.allclose(got, flat),
-             "pool lưới phải KHÁC gộp 4 token liên tiếp")
-    check("AvgPool Local Extractor = 2×2 trên lưới, không phải 1×4",
-          t_grid_pool_matches_matrix)
+        torch.manual_seed(0)
+        att = R.CrossAttention(16, 16, 16, n_heads=4, n_kv_heads=2).eval()
+        eq(tuple(att.k_proj.weight.shape), (8, 16), "W_Key chiếu ra n_kv·d_head")
+        eq(tuple(att.v_proj.weight.shape), (8, 16), "W_Value chiếu ra n_kv·d_head")
+        q, kv = torch.randn(2, 5, 16), torch.randn(2, 9, 16)
+        with torch.no_grad():
+            got = att(q, kv)
+            Q = att.q_proj(q).view(2, 5, 4, 4)
+            K = att.k_proj(kv).view(2, 9, 2, 4)
+            V = att.v_proj(kv).view(2, 9, 2, 4)
+            outs = []
+            for h in range(4):
+                g = h // 2
+                a = torch.softmax(Q[:, :, h] @ K[:, :, g].transpose(1, 2) / 2.0, -1)
+                outs.append(a @ V[:, :, g])
+            want = att.o_proj(torch.cat(outs, -1))
+        true(torch.allclose(got, want, atol=1e-5), "GQA lệch bản tham chiếu")
+        try:
+            R.CrossAttention(16, 16, 16, n_heads=4, n_kv_heads=3)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("n_heads không chia hết số group phải DỪNG")
+    check("GQA: 1 head KV dùng chung cho n_heads/group head Q",
+          t_gqa_matches_reference)
 
     def t_ce_reaches_dec_proj():
         import torch
@@ -472,11 +504,12 @@ def dec_proj_tests() -> None:
                    f"recombiner.{k} còn sót phải DỪNG")
         for k, v in (("qformer", {"tasks": ["sup", "aux"]}),
                      ("prepare_pool_factor", 4), ("highway_token_dims", [512]),
-                     ("swiglu_dropout", 0.05), ("n_query", 64), ("n_heads", 18)):
+                     ("swiglu_dropout", 0.05), ("n_query", 64), ("n_heads", 18),
+                     ("local", {"n_blocks": 2}), ("head_dim", 64)):
             r = copy.deepcopy(RCFG_BASE)
             r[k] = v
             raises(ValueError, lambda r=r: _branch(r),
-                   f"recombiner.{k} (PDVR/QFormer cũ) còn sót phải DỪNG")
+                   f"recombiner.{k} (PDVR/QFormer/Local-Global cũ) còn sót phải DỪNG")
         r = copy.deepcopy(RCFG_BASE)
         r["n_dec_tokens"] = r["n_tokens"] + 1
         raises(ValueError, lambda: _branch(r), "n_dec_tokens > n_tokens phải DỪNG")
@@ -485,7 +518,12 @@ def dec_proj_tests() -> None:
         raises(ValueError, lambda: _branch(r), "n_dec_hidden < n_dec_tokens phải DỪNG")
         r = copy.deepcopy(RCFG_BASE)
         r["n_tokens"] = 32
-        raises(ValueError, lambda: _branch(r), "n_tokens khai sai phải DỪNG")
+        raises(ValueError, lambda: _branch(r),
+               "n_tokens (số query) != 4^pool_stages phải DỪNG")
+        r = copy.deepcopy(RCFG_BASE)
+        r["retriever"] = dict(r["retriever"], n_kv_groups=3)
+        raises(ValueError, lambda: _branch(r),
+               "n_heads không chia hết n_kv_groups phải DỪNG")
         r = copy.deepcopy(RCFG_BASE)
         r["pool_stages"] = 3
         raises(ValueError, lambda: _branch(r),
@@ -538,23 +576,28 @@ def arch_tests() -> None:
 
         b = _real()
         rec = b.recombinator
-        eq(len(rec.local_extractors), 2, "Local Extractors ×2")
-        eq(rec.local_extractors[0].up.out_features, 2048)
-        eq(rec.global_extractor.n_heads, 18, "MHA head_dim=64 -> 1152/64 = 18")
-        eq(rec.global_extractor.attn.d_head, 64)
+        eq(tuple(rec.query.shape), (256, 1152), "Learnable Query [256, 1152]")
+        eq(len(rec.retrievers), 3, "Information Retriever × 3")
+        for blk in rec.retrievers:
+            eq(blk.attn.n_heads, 18, "GQA Head = 18")
+            eq(blk.attn.n_kv_heads, 6, "GQA Group = 6")
+            eq(blk.attn.d_head, 64, "1152 / 18 = 64")
+            eq(tuple(blk.attn.k_proj.weight.shape), (6 * 64, 1152))
+            eq((blk.up.in_features, blk.up.out_features), (1152, 2560))
+            eq((blk.down.in_features, blk.down.out_features), (2560, 1152))
         x = torch.randn(1, 4096, 1152)
         shapes = []
         with torch.no_grad():
-            h = x
-            for blk in rec.local_extractors:
-                h = blk(h)
+            h = rec.query.unsqueeze(0)
+            for blk in rec.retrievers:
+                h = blk(h, x)
                 shapes.append(tuple(h.shape))
-            g = rec.global_extractor(h, x)
-            y = rec.ffn(g)
-        eq(shapes, [(1, 1024, 1152), (1, 256, 1152)], "Local Extractor")
-        eq(tuple(g.shape), (1, 256, 1152), "Global Extractor")
+            y = rec.ffn(h)
+            true(torch.allclose(y, rec(x), atol=1e-4),
+                 "Recombinator.forward = Query -> Retriever×3 -> FFN")
+        eq(shapes, [(1, 256, 1152)] * 3, "Information Retriever giữ (256, 1152)")
         eq(tuple(y.shape), (1, 256, 2560), "FFN -> Y [256, 2560]")
-    check("Recombinator: 4096→1024→256 token, 18 head, Y (256, 2560)",
+    check("Recombinator: Query 256 -> Retriever×3 (GQA 18/6) -> Y (256, 2560)",
           t_recombinator_shapes)
 
     def t_heads_shapes():
@@ -603,20 +646,37 @@ def arch_tests() -> None:
         import torch.nn as nn
 
         b = _real()
-        ge, ffn = b.recombinator.global_extractor, b.recombinator.ffn
-        q = torch.randn(1, 256, 1152)
+        ir, ffn = b.recombinator.retrievers[0], b.recombinator.ffn
+        q = torch.randn(1, 256, 1152) * 5.0      # thang ≠ 1: phân biệt q với RMSNorm(q)
         kv = torch.randn(1, 4096, 1152)
+        ir.eval()
         with torch.no_grad():
-            nn.init.zeros_(ge.attn.o_proj.weight)
-            eq_ = torch.allclose(ge(q, kv), ge.norm_q(q), atol=1e-5)
-            true(eq_, "MHA = 0 thì Global Extractor phải trả RMSNorm(query)")
+            # MLP = 0 -> out = RMSNorm(h). So h với hai giả thuyết residual.
+            nn.init.zeros_(ir.down.weight)
+            nn.init.zeros_(ir.down.bias)
+            nq = ir.norm_q(q)
+            nn.init.normal_(ir.attn.o_proj.weight, std=1.0)
+            att = ir.attn(nq, ir.norm_kv(kv))
+            got = ir(q, kv)
+            want = ir.norm_mlp(nq + att)         # residual = RMSNorm(query)
+            raw = ir.norm_mlp(q + att)           # residual = query thô
+            true(torch.allclose(got, want, atol=1e-4),
+                 "Attn: residual phải là đầu ra RMSNorm(query)")
+            true(not torch.allclose(got, raw, atol=1e-3),
+                 "Attn: residual KHÔNG được là query thô")
+            # MLP: residual là đầu ra RMSNorm(h).
+            nn.init.normal_(ir.down.weight, std=0.02)
+            n = ir.norm_mlp(nq + att)
+            mlp = torch.nn.functional.gelu(ir.down(torch.nn.functional.gelu(ir.up(n))))
+            true(torch.allclose(ir(q, kv), n + mlp, atol=1e-4),
+                 "MLP của Retriever: residual phải là đầu ra RMSNorm")
             nn.init.zeros_(ffn.fc.weight)
             nn.init.zeros_(ffn.fc.bias)
             h = ffn.norm(torch.nn.functional.gelu(ffn.up(q)))
             true(torch.allclose(ffn(q), h + torch.nn.functional.gelu(torch.zeros(())),
                                 atol=1e-5),
                  "FFN: residual phải là đầu ra RMSNorm(2560)")
-    check("residual của Global Extractor và FFN lấy từ RMSNorm", t_residuals)
+    check("residual của Retriever (Attn + MLP) và FFN lấy từ RMSNorm", t_residuals)
 
     def t_roundtrip_branch():
         import torch
@@ -653,12 +713,11 @@ def ids_of(mod) -> set:
 
 
 FT_LR = {"cls_head": 3e-5, "route_head": 6e-4, "dec_proj": 3e-4,
-         "recombinator_local": 3e-5, "recombinator_global": 3e-5,
-         "recombinator_ffn": 3e-4}
+         "recombinator_retriever": 3e-5, "recombinator_ffn": 3e-4}
 LRS = {"main": 1e-4, "groups": dict(FT_LR), "attn_mult": 3.0,
        "min_lr": 3e-8, "floor": 3e-8}
 FT_GROUPS = ["lora", "cls_head", "route_head", "dec_proj",
-             "recombinator_local", "recombinator_global", "recombinator_ffn"]
+             "recombinator_retriever", "recombinator_ffn"]
 
 
 def _close(a, b, msg=""):
@@ -682,10 +741,16 @@ def lr_tests() -> None:
     def t_attn_params_are_qkvo():
         b = _branch()
         names = [n for n, _ in b.named_parameters() if R.is_attn_param(n)]
+        n_blk = len(b.recombinator.retrievers)
         eq(sorted(n.rsplit(".", 2)[-2] for n in names),
-           ["k_proj", "o_proj", "q_proj", "v_proj"], "Attn = Q/K/V/O")
-        eq(attn_ids(b), ids_of(b.recombinator.global_extractor.attn))
-    check("ma trận Attn = Q/K/V/O của Global Extractor", t_attn_params_are_qkvo)
+           sorted(["k_proj", "o_proj", "q_proj", "v_proj"] * n_blk),
+           "Attn = Q/K/V/O của mọi Retriever")
+        want = set()
+        for blk in b.recombinator.retrievers:
+            want |= ids_of(blk.attn)
+        eq(attn_ids(b), want)
+    check("ma trận Attn = Q/K/V/O (GQA) của mọi Information Retriever",
+          t_attn_params_are_qkvo)
 
     def t_pretrain_groups():
         b = _branch()
@@ -733,7 +798,7 @@ def lr_tests() -> None:
         for g, v in FT_LR.items():
             _close(by[g]["lr"], v, f"lr đỉnh {g}")
     check("decoder_ft: gate 6e-4 · FFN/concat 3e-4 · LoRA 1e-4 · "
-          "Local/Global/Cls 3e-5",
+          "Retriever/Cls 3e-5",
           t_ft_groups)
 
     def t_ft_membership():
@@ -745,9 +810,12 @@ def lr_tests() -> None:
         eq(by["cls_head"], ids_of(b.cls_head), "Sup Head = cả cls_head")
         eq(by["route_head"], ids_of(b.route_head))
         eq(by["dec_proj"], ids_of(b.dec_proj), "Concat Linear = dec_proj")
-        eq(by["recombinator_local"], ids_of(b.recombinator.local_extractors))
-        eq(by["recombinator_global"], ids_of(b.recombinator.global_extractor))
-        true(attn_ids(b) <= by["recombinator_global"], "Attn thuộc Global")
+        eq(by["recombinator_retriever"],
+           {id(p) for p in b.recombinator.retriever_parameters()},
+           "Retriever = Learnable Query + mọi Information Retriever")
+        true(id(b.recombinator.query) in by["recombinator_retriever"],
+             "Learnable Query thuộc nhóm Retriever")
+        true(attn_ids(b) <= by["recombinator_retriever"], "Attn thuộc Retriever")
         eq(by["recombinator_ffn"], ids_of(b.recombinator.ffn))
         allp = [x for n in FT_GROUPS[1:] for x in by[n]]
         eq(len(allp), len(set(allp)), "không tham số nào ở hai nhóm")
@@ -769,7 +837,7 @@ def lr_tests() -> None:
         eq(l["endpoints"]["adapter"], (3e-6, 1e-7), "LoRA làm tròn xuống")
         eq(l["endpoints"]["route_head"], (2e-5, 6e-7))
         eq(l["endpoints"]["recombinator_ffn"], (1e-5, 3e-7))
-        eq(l["endpoints"]["recombinator_global"], (1e-6, 3e-8))
+        eq(l["endpoints"]["recombinator_retriever"], (1e-6, 3e-8))
         for g, v in FT_LR.items():
             _close(l["groups"][g], v, f"config ft_lr.{g}")
         _close(l["floor"], 3e-8, "đáy nhỏ nhất = 3e-5 / (30 × 33.3)")
@@ -833,16 +901,16 @@ def lr_tests() -> None:
             sch.step()
             seen.append({g["name"]: g["lr"] for g in opt.param_groups})
         for row in seen:
-            _close(row["route_head"] / row["recombinator_local"], 20.0,
-                   "tỉ lệ gate/Local")
-            _close(row["recombinator_ffn"] / row["recombinator_global"], 10.0,
-                   "tỉ lệ FFN/Global")
+            _close(row["route_head"] / row["recombinator_retriever"], 20.0,
+                   "tỉ lệ gate/Retriever")
+            _close(row["recombinator_ffn"] / row["recombinator_retriever"], 10.0,
+                   "tỉ lệ FFN/Retriever")
         want0 = {"lora": 3e-6, "cls_head": 1e-6, "route_head": 2e-5,
-                 "dec_proj": 1e-5, "recombinator_local": 1e-6,
-                 "recombinator_global": 1e-6, "recombinator_ffn": 1e-5}
+                 "dec_proj": 1e-5, "recombinator_retriever": 1e-6,
+                 "recombinator_ffn": 1e-5}
         want_end = {"lora": 1e-7, "cls_head": 3e-8, "route_head": 6e-7,
-                    "dec_proj": 3e-7, "recombinator_local": 3e-8,
-                    "recombinator_global": 3e-8, "recombinator_ffn": 3e-7}
+                    "dec_proj": 3e-7, "recombinator_retriever": 3e-8,
+                    "recombinator_ffn": 3e-7}
         for g in want0:
             true(abs(seen[0][g] - want0[g]) < 1e-9 * want0[g],
                  f"đầu warm-up {g}: {seen[0][g]!r} != {want0[g]}")

@@ -60,10 +60,10 @@ UNTRAINED_MODULES: tuple[str, ...] = ("route_head", "dec_proj")
 PRETRAIN_FILE = "sup_pretrain.safetensors"
 PRETRAIN_META = "sup_pretrain.json"
 TRAINER_STATE = "trainer_state.pt"      # chỉ để resume, KHÔNG bao giờ đẩy Hub
-# /2: Recombinator (Local×2 + Global MHA + FFN) + Pooling-Stack heads. Checkpoint
-# /1 (PDVR + QFormer) không nạp được — `assert_compatible` dừng ở đây trước khi
-# đối chiếu khoá.
-FORMAT = "rgexp.sup_pretrain/2"
+# /3: Recombinator (Learnable Query + Information Retriever×3 GQA + FFN) +
+# Pooling-Stack heads. Checkpoint /2 (Local×2 + Global MHA + FFN) và /1 (PDVR +
+# QFormer) không nạp được — `assert_compatible` dừng ở đây trước khi đối chiếu khoá.
+FORMAT = "rgexp.sup_pretrain/3"
 
 
 class PretrainIncompatible(RuntimeError):
@@ -211,8 +211,9 @@ def assert_compatible(meta: dict, branch, where: str = "") -> None:
         raise PretrainIncompatible(
             f"checkpoint pretrain{tag} có format {fmt or '(trống)'!r}, bản này "
             f"đọc {FORMAT!r}.\n"
-            f"    Checkpoint do một kiến trúc nhánh KHÁC ghi ra (format /1 = "
-            f"PDVR + QFormer). Chạy lại Stage 0: bash scripts/run_pretrain.sh.")
+            f"    Checkpoint do một kiến trúc nhánh KHÁC ghi ra (format /2 = "
+            f"Local/Global Extractor, /1 = PDVR + QFormer). Chạy lại Stage 0: "
+            f"bash scripts/run_pretrain.sh.")
     want = {
         "d_vis": int(branch.d_vis),
         "d_model": int(branch.d_model),
@@ -318,7 +319,7 @@ def resolve_source(spec: str, cache_dir: str | Path | None = None) -> Path:
     """`--init-from` -> một thư mục cục bộ có sẵn hai file.
 
     Ba dạng nhận vào:
-        /đường/dẫn/ckpt/latest        thư mục cục bộ (SWA cuối)
+        /đường/dẫn/ckpt/latest        thư mục cục bộ (epoch cuối)
         hub:OWNER/NAME                repo model, gốc repo
         hub:OWNER/NAME/SUBDIR@rev     thư mục con + revision
 
@@ -578,7 +579,7 @@ nạp sẽ tưởng Route Head đã được pretrain.
 | lịch | warm-up + cosine, restart mỗi epoch, lr_decay {(meta.get("schedule") or {}).get("lr_decay")} |
 
 Ở `decoder_ft`, lr của từng phần khai tường minh ở `train.ft_lr` (Recombinator
-tách ba nhóm Local / Global / FFN), một chu kỳ one-cycle cho cả stage.
+tách hai nhóm Retriever / FFN), một chu kỳ one-cycle cho cả stage.
 
 ## Nạp lại
 

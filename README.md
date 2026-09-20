@@ -34,13 +34,13 @@ Image -> Vision Encoder ─┬─> Recombinator (256, 2560) ─┬─> Classific
                          └─> VL-Adapter (256) ──────────────────────────────────┤ Second
 Prompt -> Embedding ────────────────────────────────────────────────────────────┴─> concat -> Decoder -> CE
 
-Recombinator: X (4096, 1152)
-  1. Local Extractor ×2: RMSNorm -> Linear 1152->2048 GELU -> RMSNorm
-                         -> AvgPool 2×2 trên lưới (N -> N/4) -> Linear 2048->1152 GELU
-                         4096 -> 1024 -> 256 token
-  2. Global Extractor:   Q = RMSNorm(local), K/V = RMSNorm(X) -> MHA(head_dim=64, 18 head)
-                         + residual RMSNorm(Q)
-  3. FFN:                Linear 1152->2560 GELU -> RMSNorm -> Linear 2560->2560 GELU
+Recombinator: X (4096, 1152), Learnable Query Q0 (256, 1152)
+  1. Information Retriever (i), i = 1..3, mỗi khối (X đi vào MỌI khối):
+                         q = RMSNorm(Q_{i-1}) -> W_Query ; K/V = RMSNorm(X) -> W_Key / W_Value
+                         h = q + GQA(q, K, V)      Head = 18, Group = 6 (head_dim 64)
+                         n = RMSNorm(h)
+                         Q_i = n + GELU(Linear 2560->1152 (GELU(Linear 1152->2560 (n))))
+  2. FFN:                Linear 1152->2560 GELU -> RMSNorm -> Linear 2560->2560 GELU
                          + residual RMSNorm  -> Y (256, 2560)
 
 Classification Head / Route Head (cùng hình dạng, khác target):
@@ -52,25 +52,34 @@ Classification Head / Route Head (cùng hình dạng, khác target):
 
 Ba chỗ cài đặt cần biết, vì sơ đồ không nói rõ:
 
-* AvgPool của Local Extractor là pool **2×2 trên lưới ảnh** (64×64 -> 32×32 ->
-  16×16), nên 256 token của Recombinator trùng lưới 16×16 của VL-Adapter.
+* 256 token của Recombinator là **256 Learnable Query** (`recombiner.n_tokens`),
+  không còn gắn với lưới 16×16 của ảnh; mỗi query nhìn đủ 4096 patch ở cả 3
+  Retriever. **Mọi residual lấy từ đầu ra RMSNorm**: Attention cộng
+  `RMSNorm(Q_{i-1})` (không phải Query thô), MLP của Retriever cộng `RMSNorm(h)`,
+  FFN cộng `RMSNorm(2560)`.
+* GQA: 18 head Q, 6 group = 6 head K/V (mỗi head K/V dùng chung cho 3 head Q
+  liền nhau), nên W_Key/W_Value chiếu 1152 -> 384.
 * Lớp cuối của Main Head **không** qua GELU: đầu ra là logit của ASL và của
   softmax/top-k, và GELU chặn logit dưới ở ≈ −0.17.
 * Các Linear trên trục token (Pooling Stack, `dec_proj`) không bias, khởi tạo bằng
   trung bình cụm; `dec_proj` gồm hai lớp (256 → 128 + GELU, 128 → 64 không
-  GELU) mà tích của chúng là trung bình 2×2 trên lưới 16×16 -> 8×8 (lớp 1 pool
-  ngang, lớp 2 pool dọc), nên ở bước 0 decoder nhận ≈ đặc trưng Stage 0 đã học.
+  GELU) mà tích của chúng là trung bình 2×2 trên chỉ số query xếp 16×16 -> 8×8
+  (lớp 1 pool ngang, lớp 2 pool dọc), nên ở bước 0 decoder nhận ≈ đặc trưng
+  Stage 0 đã học.
   Lớp cuối không GELU để token vào decoder mang được giá trị âm như embedding thật.
 
 Số token vào decoder khai ở `recombiner.n_dec_tokens`, tầng giữa ở `recombiner.n_dec_hidden`. Khoá của kiến trúc cũ
 (`qformer`, `prepare_pool_factor`, `highway_token_dims`, `swiglu_dropout`,
-`n_query`, `n_heads`, cổng Hard-Concrete `gate*`, `train.gate_lr_mult`,
-`classifier.l0_lambda`) đã bỏ — còn sót khoá nào trong config thì chương trình
-dừng.
+`n_query`, `n_heads` ở cấp `recombiner`, cổng Hard-Concrete `gate*`,
+`train.gate_lr_mult`, `classifier.l0_lambda`, và của Local/Global Extractor:
+`local`, `head_dim`, `train.ft_lr.recombinator_local/_global`, `pretrain.swa`)
+đã bỏ — còn sót khoá nào trong config thì chương trình dừng.
 
-Log trước gradient clipping có ba metric `grad_norm_{local,global,ffn}_mean_per_param`,
-tức `L2(gradient) / số tham số` của từng khối Recombinator, để so sánh trực tiếp
-dù kích thước khối khác nhau.
+Log trước gradient clipping có hai metric `grad_norm_retriever` và
+`grad_norm_ffn`: **L2 thô** (`√Σ‖g‖²`, không chia số tham số) trên **nguyên bộ
+Retriever** (Learnable Query + 3 Information Retriever) và trên FFN — cùng đại
+lượng mà `clip_grad_norm_` đo, nên đọc thẳng cạnh `max_grad_norm`. Dòng log in
+`grad R/F <retriever>/<ffn>`.
 
 ## Pretrain cục bộ
 
@@ -87,13 +96,13 @@ lr đỉnh:
 | Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-5** |
 | MLP gate — Route Head (`route_head`) | — | **6e-4** |
 | Concat Linear (`dec_proj`, 256 → 128 GELU → 64 token) | — | **3e-4** |
-| Local Extractor ×2 (`recombinator_local`) | 1.6e-4 | **3e-5** |
-| Global Extractor (`recombinator_global`, norm + Q/K/V/O) | 1.6e-4 (Attn × 3 = **4.8e-4**) | **3e-5** |
+| Retriever (`recombinator_retriever`: Learnable Query + Information Retriever ×3) | 1.6e-4 (Attn Q/K/V/O × 3 = **4.8e-4**) | **3e-5** |
 | FFN của Recombinator (`recombinator_ffn`) | 1.6e-4 | **3e-4** |
 | Experts (LoRA) | — | **1e-4** (`train.schedule.max_lr`) |
 
-Stage 0: warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`, hệ số Attn
-`recombiner.attn_lr_mult: 3`. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
+Stage 0: **5 epoch**, warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`,
+hệ số Attn `recombiner.attn_lr_mult: 3`, **không SWA** — `ckpt/latest` (thứ
+decoder_ft nạp và được đẩy Hub) là trọng số của epoch cuối. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
 stage (không restart) để mọi nhóm cùng hội tụ.
 
 Stage 0 dùng `div_factor` 33.3333 · `final_div_factor` 10; decoder_ft dùng
@@ -108,7 +117,7 @@ và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 ch�
 | decoder_ft · MLP gate (Route Head) | 2e-5 | 6e-4 | 6e-7 |
 | decoder_ft · FFN / Concat Linear | 1e-5 | 3e-4 | 3e-7 |
 | decoder_ft · LoRA | 3e-6 (3.33e-6) | 1e-4 | 1e-7 (1.001e-7) |
-| decoder_ft · Local / Global / Sup Head | 1e-6 | 3e-5 | **3e-8** (3.003e-8) |
+| decoder_ft · Retriever / Sup Head | 1e-6 | 3e-5 | **3e-8** (3.003e-8) |
 
 Đáy nhỏ nhất của decoder_ft là **3e-8** (`train.schedule.min_lr`, được kiểm).
 Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
@@ -116,7 +125,7 @@ làm tròn.
 
 Sup Loss (dùng chung cho hai giai đoạn): ASL với `gamma_neg: [4.0, 2.0, 0.0]`
 (nén theo tên lớp neg/pos/uncertain trên ô mang nhãn 0), `gamma_pos: 0.0`,
-`clip: 0.08`; ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
+`clip: 0.10` (10%); ở decoder_ft ASL cộng vào CE với `classifier.lambda: 0.4`, không
 warmup. META và model card của checkpoint Stage 0 ghi max_lr từng nhóm,
 `attn_lr_mult`, `weight_decay` và ASL; `run_pretrain.sh --resume` báo khi các
 khoá này khác config hiện tại.
@@ -132,7 +141,8 @@ dùng lại). Muốn làm lại decoder_ft từ đầu:
 điểm cũ của My Gemma được đổi tên sang `*.old_<thời điểm>` (không xoá), Stage 0
 vẫn được nạp; hai baseline không bị đụng.
 
-Checkpoint Stage 0 của kiến trúc cũ (PDVR + QFormer, `format /1`) **không** nạp
+Checkpoint Stage 0 của kiến trúc cũ (Local/Global Extractor `format /2`, PDVR +
+QFormer `format /1`) **không** nạp
 được vào nhánh này — phải chạy lại Stage 0. Nếu `runs/sup_pretrain` còn
 `trainer_state.pt` cũ thì chạy với `--no-resume` (hoặc `--run-id <tên mới>`).
 
@@ -250,7 +260,7 @@ src/
                              một phép biến đổi hình học cho cả ba candidate
   backbone.py                nạp base, gắn adapter, ReportDataset, collate,
                              one-cycle, device_map
-  recombiner.py              Recombinator (Local×2 · Global MHA · FFN) ·
+  recombiner.py              Recombinator (Learnable Query · Retriever×3 GQA · FFN) ·
                              ClsHead · RouteHead (Pooling Stack + Main Head) ·
                              Linear/GELU 256→128 → Linear 128→64 token vào decoder · ASL
   moe.py                     Router (nhiễu · clip 1.2 · softmax · top-k) ·

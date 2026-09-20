@@ -3,7 +3,7 @@
     python -m src.run_pretrain                     # data -> train -> push
     python -m src.run_pretrain --dry-run           # 32 mẫu, 2 epoch, không đẩy
     python -m src.run_pretrain --stages train      # chỉ huấn luyện (đã có data)
-    python -m src.run_pretrain --stages push       # đẩy ckpt/latest (SWA) lên Hub
+    python -m src.run_pretrain --stages push       # đẩy ckpt/latest (epoch cuối) lên Hub
     python -m src.run_pretrain --no-resume         # bỏ ckpt cũ, chạy lại từ 0
     python -m src.run_pretrain --push-epoch 7      # đẩy ĐÚNG epoch 7
     python -m src.run_pretrain --resume            # lấy ckpt mới nhất trên Hub
@@ -280,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                          "đã học, và không một phép kiểm shape nào bắt được — "
                          "mặc định là DỪNG.")
     ap.add_argument("--push-epoch", type=int, default=None,
-                    help="đẩy ĐÚNG epoch này thay vì ckpt/latest (SWA)")
+                    help="đẩy ĐÚNG epoch này thay vì ckpt/latest (epoch cuối)")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
