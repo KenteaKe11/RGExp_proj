@@ -346,7 +346,93 @@ def t_autobatch_regression_and_choice():
 
     off = {"autobatch": {"enabled": False}}
     assert ab.autotune(off, "t", 32, 4, None, measure_fn=lin, total_bytes=G)[0] == 4
-    assert CFG["autobatch"]["enabled"] is False, "config gốc phải giữ số viết tay"
+    assert CFG["autobatch"]["enabled"] is True, "config GPU phải BẬT autobatch"
+    assert abs(float(CFG["autobatch"]["target_frac"]) - 0.85) < 1e-9, \
+        "đích VRAM của mọi pipeline là 85% card"
+
+
+def t_infer_autobatch_ladder():
+    """Autobatch lúc SINH: chọn bậc lớn nhất vừa 85%, lùi khi OOM/vượt."""
+    from src import autobatch as ab
+
+    G = 1024 ** 3
+    on = {"autobatch": {"enabled": True, "target_frac": 0.85,
+                        "infer_probe_sizes": [2, 4], "infer_max_bs": 16}}
+
+    def lin(bs):                                # 4 GiB + 0.5 GiB/ảnh
+        return (4 + 0.5 * bs) * G
+
+    bs, rep = ab.autotune_infer(on, "t", 2, None, measure_fn=lin,
+                                total_bytes=12 * G)
+    # 85% của 12 = 10.2 GiB -> 4 + 0.5·bs <= 10.2 -> bs <= 12.4 -> bậc 12
+    assert bs == 12 and rep["chosen"] == 12, (bs, rep)
+    assert rep["peak_frac"] <= 0.85 + 1e-9
+
+    def oom6(bs):
+        return None if bs >= 6 else (4 + 0.5 * bs) * G
+
+    assert ab.autotune_infer(on, "t", 2, None, measure_fn=oom6,
+                             total_bytes=12 * G)[0] == 4
+    off = {"autobatch": {"enabled": False}}
+    assert ab.autotune_infer(off, "t", 2, None, measure_fn=lin,
+                             total_bytes=G)[0] == 2
+
+
+def t_batch_locked_across_arms():
+    """Bốn candidate dùng CHUNG batch mỗi lượt: nặng nhất dò trước rồi khoá."""
+    from src.run_lora import heaviest_first, lock_train, lora_arms
+    from src.config import Cfg
+
+    arms = lora_arms(CFG)
+    order = [x["id"] for x in heaviest_first(arms)]
+    assert order[0] == "qlora_r8_decoder" and order[-1] == "qlora_r4_attn", order
+    c = lock_train(Cfg({"train": dict(CFG["train"]), "autobatch": {"enabled": True}}), 4)
+    assert c["train"]["per_device_batch_size"] == 4
+    assert c["train"]["grad_accum"] == 8, c["train"]["grad_accum"]
+    assert c["train"]["per_device_batch_size"] * c["train"]["grad_accum"] == \
+        CFG["train"]["effective_batch"], "batch hiệu dụng KHÔNG được đổi"
+    assert c["autobatch"]["enabled"] is False, "candidate sau không dò lại"
+
+
+def t_val_sampling():
+    """Val: 256 bốc ngẫu nhiên trong hồ, CHUNG cho bốn candidate, bốc lại mỗi lần đo."""
+    from src.train_recomb import eval_cfg, val_indices
+
+    ev = eval_cfg(dict(CFG["train"]))
+    assert ev["enabled"] and ev["n_samples"] == 256 and ev["resample"], ev
+    assert int(CFG["data"]["n_val"]) >= ev["n_samples"], "hồ val nhỏ hơn số mẫu bốc"
+
+    a = val_indices(42, 0, 2000, 256)
+    b = val_indices(42, 1, 2000, 256)
+    assert len(a) == len(set(a)) == 256 and max(a) < 2000, "phải là 256 mẫu KHÁC nhau"
+    assert a == sorted(a)
+    assert a != b, "resample=true phải bốc lại ở lần đo sau"
+    assert len(set(a) & set(b)) < 200, "hai lần đo trùng quá nhiều -> không ngẫu nhiên"
+    # Hàm không nhận arm id: cùng lần đo -> bốn candidate cùng một tập.
+    assert val_indices(42, 3, 2000, 256) == val_indices(42, 3, 2000, 256)
+    # Tái lập được giữa hai lần chạy; seed khác -> tập khác.
+    assert val_indices(7, 0, 2000, 256) != a
+    # resample=false -> mọi lần đo chung một tập.
+    c0 = val_indices(42, 0, 2000, 256, resample=False)
+    assert c0 == val_indices(42, 9, 2000, 256, resample=False)
+    # Hồ nhỏ hơn số mẫu (dry-run) -> lấy hết, không lặp.
+    assert val_indices(42, 0, 8, 256) == list(range(8))
+    assert val_indices(42, 0, 0, 256) == []
+
+
+def t_io_keys_present():
+    """Khoá I/O nằm ở config GPU (máy), không ở config nội dung (thí nghiệm)."""
+    from src.hw import cpu_budget, io_opt, io_workers
+
+    for k in ("workers", "prefetch_depth", "pin_memory", "zip_mode"):
+        assert k in (CFG.get("io") or {}), f"config GPU thiếu io.{k}"
+    assert 1 <= io_workers(CFG) <= 32 and cpu_budget() >= 1
+    assert io_opt(CFG, "prefetch_depth", 1) >= 1
+    from src.data import zip_mode
+
+    assert zip_mode(CFG) == "download"
+    assert zip_mode(type(CFG)(dict(CFG, io=dict(CFG["io"], zip_mode="content")))) \
+        == str(CFG["data"]["zip_mode"]).lower()
 
 
 def t_lora_exp_design():
@@ -496,6 +582,11 @@ if __name__ == "__main__":
     check("prefetch giữ nguyên thứ tự mẫu", t_prefetch_keeps_order)
     check("autobatch: hồi quy VRAM, chạy thử, lùi khi vượt/OOM",
           t_autobatch_regression_and_choice)
+    check("autobatch lúc sinh: thang bậc, đích 85%", t_infer_autobatch_ladder)
+    check("batch mỗi lượt KHOÁ chung bốn candidate", t_batch_locked_across_arms)
+    check("khoá io.* ở config GPU", t_io_keys_present)
+    check("val: 256/2000 ngẫu nhiên, chung bốn candidate, bốc lại mỗi lần đo",
+          t_val_sampling)
     check("dry-run in VRAM đỉnh", t_dry_run_reports_vram)
 
     print(f"\n═══ {PASS} qua · {FAIL} hỏng · {SKIP} bỏ qua ═══")

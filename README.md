@@ -40,6 +40,17 @@ predictions đã có → chỉ sinh phần thiếu, điểm đã có → dùng l
 `--stages stats,report`, `--arms qlora_r4_attn,qlora_r4_decoder`,
 `--retrain`, `--rescore`.
 
+**Val.** Mỗi 25 bước (và ở bước cuối), mỗi candidate tính CE trên **256 mẫu
+bốc ngẫu nhiên** trong hồ 2000 mẫu val (`data.n_val`), bốc lại ở **mỗi lần
+đo** (`train.eval` trong `configs/lora.yaml`). Ở lần đo thứ k, bốn candidate
+dùng **chung một tập** — chỉ số sinh từ (seed, số thứ tự lần đo), không từ arm
+id — nên bốn đường val so được với nhau và chạy lại cùng seed cho đúng loạt tập
+ấy. Val **không** chọn checkpoint, **không** early stop, **không** chạm trọng
+số: cả bốn vẫn chạy đúng một epoch theo lịch one-cycle mà bảng kết quả dựa vào.
+CE lấy trung bình theo **token** nên nó không đổi khi autobatch đổi batch mỗi
+lượt. Số ra ở `val/<arm>/loss` trên W&B, `train_stats.json` (`val.curve`) và
+cột *val CE cuối* của `REPORT.md`.
+
 Đầu ra: `runs/lora_rank_target/` (REPORT.md, manifest.json, predictions,
 metrics), adapter ở `adapters_lora/`. Stage `push` đẩy thư mục run (không đẩy
 trọng số) lên dataset **private** `RGExp123/research_v2` trên Hugging Face.
@@ -49,18 +60,56 @@ trọng số) lên dataset **private** `RGExp123/research_v2` trên Hugging Face
 * `configs/lora.yaml` — **nội dung**: thí nghiệm là gì (dữ liệu, base, prompt,
   giải mã, lịch học, batch hiệu dụng, bốn candidate ở khối `lora_exp`, kiểm
   định, repo Hub).
-* `configs/gpu/<card>.yaml` — **GPU**: chạy thế nào trên một card (số mẫu mỗi
-  lượt, checkpointing, prefetch, batch lúc sinh/chấm, autobatch), chọn bằng
-  `--gpu` (mặc định `rtx3060`). `grad_accum` tự suy ra = batch hiệu dụng / số
-  mẫu mỗi lượt. `src/config.load_config` DỪNG nếu hai file lấn ranh giới của
-  nhau hoặc file GPU thiếu khoá.
+* `configs/gpu/<card>.yaml` — **GPU + I/O**: chạy thế nào trên một máy (số mẫu
+  mỗi lượt, checkpointing, prefetch, batch lúc sinh/chấm, autobatch, khối
+  `io.*`), chọn bằng `--gpu` (mặc định `rtx3060`). `grad_accum` tự suy ra =
+  batch hiệu dụng / số mẫu mỗi lượt. `src/config.load_config` DỪNG nếu hai file
+  lấn ranh giới của nhau hoặc file GPU thiếu khoá.
 
-| `--gpu` | card | mỗi lượt × accum | checkpointing |
-|---|---|---|---|
-| `rtx3060` | RTX 3060 12 GB | 1 × 32 | có |
+| `--gpu` | card | mỗi lượt × accum | checkpointing | autobatch |
+|---|---|---|---|---|
+| `rtx3060` | RTX 3060 12 GB | tự dò × accum suy ra (khởi điểm 1 × 32) | có | 85% VRAM |
 
 Thêm card: chép `configs/gpu/rtx3060.yaml`, đổi `name`, `gpu_name_contains`,
 `requires` và các số trong `set:`; chạy `--dry-run` để xem VRAM đỉnh thật.
+
+## VRAM ~85% và tốc độ I/O
+
+**Batch tự dò, đích 85% card.** `autobatch.enabled: true` +
+`target_frac: 0.85`: cả khâu **train**, khâu **sinh** lẫn khâu **chấm**
+(`metrics.bertscore.batch_size: auto`) đo VRAM thật ở vài batch nhỏ, hồi quy tuyến tính, chọn batch lớn nhất vừa 85% rồi **chạy thử lại**
+ở batch ấy (OOM/vượt thì lùi một nấc). Con số được đo là VRAM **thiết bị** —
+đúng cái `nvidia-smi` in, gồm CUDA context và phân mảnh — nên 85% là 85% thật,
+không phải "85% tensor rồi tràn vì context". Lượt dò lúc train đệm tới
+`max_seq_len`, lượt dò lúc sinh ép đủ `max_new_tokens`: batch đã chọn là batch
+chịu được mẫu **xấu nhất**, không chỉ mẫu trung bình.
+
+Batch hiệu dụng (32), số bước và đường lr **không đổi** — `grad_accum` suy lại.
+Và batch mỗi lượt là **một số dùng chung cho cả bốn candidate**: candidate nặng
+nhất (`qlora_r8_decoder`) được dò trước, số của nó khoá cho ba candidate còn
+lại (lúc sinh: khoá ghi ở `runs/<subdir>/infer_batch.json`). Lý do: HF lấy
+trung bình CE theo token trong micro-batch, nên hai candidate chạy hai batch
+khác nhau là thêm một biến thứ ba vào bảng so sánh. Trộn với adapter cũ đã
+huấn luyện ở batch khác -> repo khoá theo số cũ và nhắc `--retrain`.
+
+VRAM thiết bị được ghi vào W&B (`sys/vram_device_frac`) ở mỗi lần log, và bản
+tóm tắt `▣ VRAM đỉnh` in ở cuối MỌI lần chạy (`RGEXP_VRAM_MONITOR=0` để tắt).
+
+**Đọc–ghi.** Khối `io.*` của config GPU:
+
+| khoá | rtx3060 | làm gì |
+|---|---|---|
+| `io.workers` | `auto` | luồng trích zip / quét cache; `auto` = số vCPU cgroup thật cấp (`src/hw.py`), không phải 128 lõi của máy chủ |
+| `io.zip_mode` | `download` | mạng ~5 Gbps + đĩa 100 GB: tải trọn `img_dir.zip` (đa kết nối qua `hf_transfer`) rồi trích **song song** từ NVMe, nhanh hơn stream range-request một kết nối. `content` = theo `data.zip_mode` |
+| `io.prefetch_depth` | 3 | số micro-batch (train) / batch (sinh) dựng sẵn trong luồng nền |
+| `io.pin_memory` | true | collate + `pin_memory` chạy luôn ở luồng nền, luồng chính chỉ còn chép `non_blocking` lên GPU |
+
+Ở khâu sinh, phần CPU của batch k+1 (mở ảnh, processor 896, token hoá) chạy
+trong lúc batch k đang trên GPU; mọi lần chạm tokenizer đi qua một khoá vì
+tokenizer "fast" của HF không an toàn đa luồng.
+
+Không khoá nào ở đây đổi kết quả: thứ tự dữ liệu vẫn do cùng Generator sinh ra,
+ảnh trích ra từ zip là cùng những byte ấy, và batch hiệu dụng không đổi.
 
 ## Cấu trúc
 

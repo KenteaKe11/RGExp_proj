@@ -11,9 +11,11 @@ context lẫn phần allocator giữ mà chưa dùng. Ở đây một luồng n�
     reserved  = `torch.cuda.memory_reserved()`: phần allocator của tiến trình
                 này đang giữ (không gồm context).
 
-Bật khi dòng lệnh có `--dry-run`, hoặc khi đặt `RGEXP_VRAM_REPORT=<file.jsonl>`
-(mỗi tiến trình GHI THÊM một dòng JSON vào đó — `scripts/dry_run_all.sh` đọc lại
-để in bảng tổng).
+LUÔN bật (một luồng lấy mẫu mỗi 0.1 s, chi phí không đáng kể): đích của config
+GPU là chạm ~85% card ở mọi pipeline, nên con số đó phải được ĐO ở mỗi lần
+chạy thật chứ không chỉ ở dry-run. `RGEXP_VRAM_MONITOR=0` tắt.
+`RGEXP_VRAM_REPORT=<file.jsonl>` thì mỗi tiến trình GHI THÊM một dòng JSON vào
+đó (`scripts/dry_run_all.sh` đọc lại để in bảng tổng).
 """
 from __future__ import annotations
 
@@ -107,7 +109,7 @@ def record(mon: VramMonitor, label: str, rc, minutes: float) -> dict:
 def run_with_monitor(prog: str, fn) -> int:
     """Chạy `fn()`; nếu dry-run/RGEXP_VRAM_REPORT thì đo VRAM đỉnh suốt tiến trình."""
     report = os.environ.get("RGEXP_VRAM_REPORT", "").strip()
-    if "--dry-run" not in sys.argv and not report:
+    if os.environ.get("RGEXP_VRAM_MONITOR", "1").strip() in ("0", "false", "no"):
         return fn()
     label = label_from_argv(prog, sys.argv[1:])
     # Import torch Ở LUỒNG CHÍNH trước khi luồng đo chạy: hai luồng cùng import
@@ -171,3 +173,26 @@ if __name__ == "__main__":
     rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
             if line.strip()]
     print("\n".join(summarize(rows)))
+
+
+def device_usage() -> dict:
+    """VRAM THIẾT BỊ ngay lúc này — cùng đại lượng nvidia-smi in, cho W&B.
+
+    `sys/vram_device_frac` là con số phải xấp xỉ `autobatch.target_frac` (0.85)
+    khi pipeline chạy đúng ngân sách. Tensor/allocator đi kèm để biết phần nào
+    là của torch, phần nào là context + thư viện ngoài.
+    """
+    try:
+        import torch
+
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return {}
+        free, total = torch.cuda.mem_get_info(0)
+        used = float(total - free)
+        return {"sys/vram_device_gb": used / GIB,
+                "sys/vram_device_frac": used / float(total),
+                "sys/vram_reserved_gb": torch.cuda.memory_reserved(0) / GIB,
+                "sys/vram_alloc_gb": torch.cuda.memory_allocated(0) / GIB,
+                "sys/vram_peak_gb": torch.cuda.max_memory_allocated(0) / GIB}
+    except Exception:
+        return {}

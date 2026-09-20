@@ -76,6 +76,19 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
+# ── Tải/đẩy Hub: nhiều kết nối ──────────────────────────────────────────────
+# Máy đích có ~5 Gbps xuống. Một kết nối HTTP không lấp nổi đường ấy, nên 17.7
+# GB img_dir.zip (và ~8.6 GB trọng số Gemma) tải bằng hf_transfer/hf_xet nhanh
+# hơn nhiều lần. hf_transfer chỉ được bật khi gói CÓ THẬT: bật mà thiếu gói là
+# huggingface_hub ném lỗi ngay ở lần tải đầu.
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+rgexp_enable_fast_download() {
+    [ -n "${HF_HUB_ENABLE_HF_TRANSFER:-}" ] && return 0
+    if [ -n "${PYBIN:-}" ] && "$PYBIN" -c "import hf_transfer" >/dev/null 2>&1; then
+        export HF_HUB_ENABLE_HF_TRANSFER=1
+    fi
+}
+
 # ── Kích hoạt python ────────────────────────────────────────────────────────
 # $1 = "allow-missing" -> không lỗi khi chưa có venv (setup.sh sẽ tạo)
 rgexp_activate_py() {

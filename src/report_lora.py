@@ -105,9 +105,21 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                      str(s.get("n_target_modules", "—")),
                      f"{s['trainable_params']:,}" if s.get("trainable_params") else "—",
                      str(s.get("alpha", "—")), str(s.get("minutes", "—")),
-                     str(s.get("vram_peak_gb", "—"))])
+                     str(s.get("vram_peak_gb", "—")),
+                     _f(s.get("val_loss_last"), 4)])
     L.append(_tbl(["candidate", "r", "chỗ gắn", "loại ma trận", "module khớp",
-                   "tham số học", "alpha", "phút", "VRAM GB"], rows))
+                   "tham số học", "alpha", "phút", "VRAM GB", "val CE cuối"],
+                  rows))
+    v = next((_stat(train_stats, x["id"]).get("val") for x in arms
+              if _stat(train_stats, x["id"]).get("val")), None)
+    if v:
+        L.append(f"\n*val CE = cross-entropy trên {v.get('n_samples')} mẫu bốc "
+                 f"ngẫu nhiên trong {v.get('n_pool')} mẫu val, đo lại mỗi "
+                 f"{v.get('every_steps')} bước"
+                 f"{' (bốc lại mỗi lần đo)' if v.get('resample') else ''}; ở mỗi "
+                 f"lần đo, bốn candidate dùng CHUNG một tập. Val KHÔNG chọn "
+                 f"checkpoint và KHÔNG chạm vào trọng số — cả bốn vẫn chạy đúng "
+                 f"một epoch theo lịch one-cycle.*\n")
 
     L.append(f"\n## Điểm trung bình (sắp theo `{primary}`)\n")
     mets = [c for c in summary.columns

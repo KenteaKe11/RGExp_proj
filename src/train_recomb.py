@@ -57,6 +57,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import random
 import re
 import time
 from pathlib import Path
@@ -737,10 +738,46 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
     return out.loss, asl, route_out, cls_m
 
 
+# ══ Bốc mẫu val ════════════════════════════════════════════════════════════
+def eval_cfg(tcfg: dict) -> dict:
+    e = dict((tcfg.get("eval") or {}))
+    return {"enabled": bool(e.get("enabled", False)),
+            "n_samples": int(e.get("n_samples", 256) or 0),
+            "every_steps": max(1, int(e.get("every_steps", 25) or 1)),
+            "resample": bool(e.get("resample", True)),
+            "seed_mix": int(e.get("seed_mix", 0) or 0)}
+
+
+def val_indices(seed: int, eval_idx: int, n_pool: int, n_take: int,
+                resample: bool = True, seed_mix: int = 0) -> list[int]:
+    """Chỉ số của `n_take` mẫu val cho LẦN ĐO thứ `eval_idx`.
+
+    Hàm này KHÔNG nhận arm id, và đó là một điều kiện chứ không phải tình cờ:
+    ở lần đo thứ k, bốn candidate phải đo trên ĐÚNG cùng một tập 256 mẫu. Bốc
+    riêng cho từng candidate thì chênh lệch val giữa hai cột lẫn cả chênh lệch
+    của hai tập mẫu khác nhau — và không có dòng log nào nói ra điều đó.
+
+    Ngẫu nhiên nhưng TÁI LẬP được: hạt giống là (seed, seed_mix, số thứ tự lần
+    đo), nên chạy lại cùng seed cho đúng loạt tập ấy. `resample=False` -> mọi
+    lần đo dùng chung một tập.
+
+    Trả danh sách đã SẮP: đọc ảnh theo thứ tự cache; trung bình theo token
+    không phụ thuộc thứ tự.
+    """
+    n_pool = max(0, int(n_pool))
+    k = max(0, min(int(n_take), n_pool))
+    if k == 0:
+        return []
+    r = random.Random(f"val|{int(seed)}|{int(seed_mix)}|"
+                      f"{int(eval_idx) if resample else 0}")
+    return sorted(r.sample(range(n_pool), k))
+
+
 # ══ Một candidate ═══════════════════════════════════════════════════════════
 def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
               cls_pack: dict | None, out_dir: Path, tracker=None,
-              max_steps_override: int | None = None) -> dict:
+              max_steps_override: int | None = None,
+              val_df: pd.DataFrame | None = None) -> dict:
     """Huấn luyện MỘT candidate. Hết VRAM là DỪNG, không tụt nấc.
 
     Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
@@ -773,7 +810,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     try:
         return _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                            max_steps_override, bs, accum, tcfg, rcfg, ccfg,
-                           use_branch, aid, spec)
+                           use_branch, aid, spec, val_df)
     except Exception as e:
         oom = is_oom(e)
         note = f"{type(e).__name__}: {e}"[:200]
@@ -842,7 +879,7 @@ def _attach_experts(model, tcfg: dict, spec: dict):
 
 def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 max_steps_override, bs, accum, tcfg, rcfg, ccfg, use_branch, aid,
-                spec=None):
+                spec=None, val_df=None):
     import torch
 
     t0 = time.time()
@@ -1029,7 +1066,9 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             if frozen:
                 apply_freeze(branch, frozen)    # train() vừa bật lại dropout
         rows = [ds[i] for i in _heavy[:k]]
-        b = collate_cls(rows, pad_id)
+        # Đệm tới max_seq_len: đo TRƯỜNG HỢP XẤU NHẤT, để bs đã chọn không
+        # bao giờ OOM giữa chừng vì một mẫu dài hơn các mẫu đã dò.
+        b = collate_cls(rows, pad_id, max_len)
         b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
         ce, asl, route_out, _ = _forward_loss(
             model, gemma, branch, b, img_tok, tt_value, router, route_ctx)
@@ -1093,20 +1132,118 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     # GPU. Một luồng, không hơn: dataset gọi tokenizer fast của HF, vốn không an
     # toàn khi gọi đồng thời. `g` chỉ dùng ở đây, nên rút hoán vị sớm hơn một
     # micro-batch vẫn cho ĐÚNG dãy chỉ số như trước (src/prefetch.py).
-    from .prefetch import OrderedPrefetcher
+    #
+    # I/O (config GPU, khối `io`): `prefetch_depth` micro-batch được dựng SẴN
+    # (vẫn tuần tự trong MỘT luồng, cùng dãy chỉ số); collate + pin_memory chạy
+    # luôn trong luồng nền, luồng chính chỉ còn chép non_blocking lên GPU.
+    from collections import deque
 
-    pf = OrderedPrefetcher(ds.__getitem__,
-                           1 if bool(tcfg.get("prefetch", True)) else 0)
-    pending = [pf.submit(next_idx())]
+    from .hw import io_opt
+    from . import vram_monitor as vram_mod
+    from .prefetch import OrderedPrefetcher
 
     # Dry-run: đệm mọi batch tới max_seq_len — VRAM đỉnh tất định, xấu nhất.
     pad_to = max_len if bool(tcfg.get("_pad_to_max", False)) else None
+    use_pf = bool(tcfg.get("prefetch", True))
+    pin = bool(io_opt(cfg, "pin_memory", False)) and dev.type == "cuda"
+    depth = max(1, int(io_opt(cfg, "prefetch_depth", 1) or 1)) if use_pf else 1
+
+    def _post(rows):
+        b = collate_cls(rows, pad_id, pad_to)
+        if pin:
+            b = {k: (v.pin_memory() if hasattr(v, "pin_memory") else v)
+                 for k, v in b.items()}
+        return b
+
+    pf = OrderedPrefetcher(ds.__getitem__, 1 if use_pf else 0, post=_post)
+    pending = deque(pf.submit(next_idx()) for _ in range(depth))
+    print(f"  ⚙ nạp dữ liệu: prefetch {'BẬT' if use_pf else 'tắt'} · sâu "
+          f"{depth} micro-batch · pin_memory {'BẬT' if pin else 'tắt'}",
+          flush=True)
 
     def next_micro() -> dict:
-        rows = pf.result(pending[0])
-        pending[0] = pf.submit(next_idx())
-        b = collate_cls(rows, pad_id, pad_to)
-        return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in b.items()}
+        b = pf.result(pending.popleft())
+        pending.append(pf.submit(next_idx()))
+        return {k: (v.to(dev, non_blocking=pin) if hasattr(v, "to") else v)
+                for k, v in b.items()}
+
+    # ── val: mỗi `every_steps` bước, CE trên 256 mẫu bốc ngẫu nhiên ────────
+    # Chỉ để NHÌN: không chọn checkpoint, không early stop, không chạm optimizer
+    # — bốn candidate vẫn chạy đúng một epoch với cùng lịch one-cycle.
+    ev = eval_cfg(tcfg)
+    n_pool = 0 if val_df is None else len(val_df)
+    ev_on = bool(ev["enabled"] and ev["n_samples"] and n_pool)
+    vds = vpf = None
+    val_curve: list[dict] = []
+    if ev_on:
+        vds = ClsReportDataset(val_df, processor, cfg, max_len, None, img_kw)
+        vpf = OrderedPrefetcher(vds.__getitem__, 1 if use_pf else 0, post=_post)
+        n_take = min(int(ev["n_samples"]), n_pool)
+        print(f"  ⚙ val: {n_take} mẫu bốc NGẪU NHIÊN trong {n_pool} · mỗi "
+              f"{ev['every_steps']} bước · "
+              f"{'bốc lại mỗi lần đo' if ev['resample'] else 'cùng một tập mọi lần đo'}"
+              f" · CHUNG cho cả bốn candidate (seed {seed})", flush=True)
+    elif ev["enabled"] and ev["n_samples"]:
+        print("  ⚠ val: không có mẫu nào (data.n_val = 0 hoặc chưa chạy stage "
+              "`data`) -> bỏ qua đo val", flush=True)
+
+    def _run_eval(eval_idx: int, step_no: int) -> dict:
+        """CE trung bình theo TOKEN trên tập val của lần đo này.
+
+        Trung bình theo token chứ không theo micro-batch: batch mỗi lượt do
+        autobatch chọn, và một trung bình-của-trung-bình sẽ đổi theo con số ấy
+        — hai lần chạy cùng candidate trên hai card khác nhau sẽ ra hai đường
+        val khác nhau mà chẳng có gì thay đổi về mô hình.
+        """
+        idx = val_indices(seed, eval_idx, n_pool, int(ev["n_samples"]),
+                          ev["resample"], ev["seed_mix"])
+        chunks = [idx[i:i + bs] for i in range(0, len(idx), bs)]
+        q = deque()
+        nx = [0]
+
+        def _fill_v() -> None:
+            while len(q) < depth and nx[0] < len(chunks):
+                q.append(vpf.submit(chunks[nx[0]]))
+                nx[0] += 1
+
+        _fill_v()
+        model.eval()
+        if branch is not None:
+            branch.eval()
+        tot_ce, tot_tok, t_ev = 0.0, 0, time.time()
+        try:
+            with torch.no_grad():
+                while q:
+                    b = vpf.result(q.popleft())
+                    _fill_v()
+                    b = {k: (v.to(dev, non_blocking=pin) if hasattr(v, "to") else v)
+                         for k, v in b.items()}
+                    ce, _asl, _route, _cm = _forward_loss(
+                        model, gemma, branch, b, img_tok, tt_value, router,
+                        route_ctx)
+                    ntok = int((b["labels"] != -100).sum())
+                    tot_ce += float(ce.detach()) * ntok
+                    tot_tok += ntok
+                    if route_ctx is not None:
+                        route_ctx.clear()
+        finally:
+            model.train()
+            if branch is not None:
+                branch.train()
+                if frozen:
+                    apply_freeze(branch, frozen)   # train() vừa bật lại dropout
+        rec = {"step": int(step_no), "eval_idx": int(eval_idx),
+               "n": len(idx), "n_tokens": tot_tok,
+               "loss": tot_ce / max(1, tot_tok),
+               "seconds": round(time.time() - t_ev, 1)}
+        val_curve.append(rec)
+        print(f"    [{aid}] val@{step_no}: CE {rec['loss']:.4f} trên {rec['n']} "
+              f"mẫu ({tot_tok:,} token) · {rec['seconds']:.0f}s", flush=True)
+        if tracker is not None:
+            tracker.log({f"val/{aid}/loss": rec["loss"], f"val/{aid}/n": rec["n"],
+                         f"val/{aid}/step": step_no,
+                         f"train/{aid}/step": step_no})
+        return rec
 
     # ── vòng lặp ───────────────────────────────────────────────────────────
     model.train()
@@ -1150,6 +1287,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
         sched.step()
+        if ev_on and ((step + 1) % ev["every_steps"] == 0 or step == steps - 1):
+            _run_eval(len(val_curve), step + 1)
 
         total_loss = step_ce + lam_now * step_asl + aux_now * step_aux
         if first_loss is None:
@@ -1194,8 +1333,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                         f"train/{aid}/n_dead_experts": rsum.get("n_dead_experts")}
                        if spec else {}),
                     **{f"train/{aid}/{k}": v for k, v in last_cls.items()},
+                    # Đích của config GPU là ~85% card; đo nó ở MỖI lần log chứ
+                    # không chỉ ở dry-run (src/vram_monitor.device_usage).
+                    **vram_mod.device_usage(),
                 })
 
+    pf.close()          # huỷ các micro-batch dựng sẵn còn thừa sau bước cuối
+    if vpf is not None:
+        vpf.close()
     mins = (time.time() - t0) / 60
     peak = (torch.cuda.max_memory_allocated() / 1024 ** 3
             if torch.cuda.is_available() else 0.0)
@@ -1270,6 +1415,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "dec_proj_final": (branch.dec_stats() if branch is not None else None),
         "n_labels": n_labels if use_branch else 0,
         "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,
+        "val": ({"n_pool": n_pool, "n_samples": int(ev["n_samples"]),
+                 "every_steps": ev["every_steps"], "resample": ev["resample"],
+                 "seed": seed, "seed_mix": ev["seed_mix"], "curve": val_curve,
+                 "loss_first": (val_curve[0]["loss"] if val_curve else None),
+                 "loss_last": (val_curve[-1]["loss"] if val_curve else None)}
+                if ev_on else None),
+        "val_loss_last": (val_curve[-1]["loss"] if val_curve else None),
         "train_loss_first": first_loss,
         "train_loss": total_loss, "ce_last": step_ce, "asl_last": step_asl,
         "cls_metrics_last": last_cls,

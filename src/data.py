@@ -202,11 +202,46 @@ class StreamTooSlow(RuntimeError):
     """Stream chạy được nhưng chậm tới mức tải trọn zip còn nhanh hơn."""
 
 
-def _extract(zf: zipfile.ZipFile, mapping: dict[str, str], need: list[str],
+class _ZipOpener:
+    """Mở một ZipFile MỚI cho mỗi luồng: ZipFile dùng chung một con trỏ file,
+    nên hai luồng đọc cùng một handle là đọc lẫn byte của nhau."""
+
+    def __init__(self, open_fh):
+        self.open_fh = open_fh
+
+    def __call__(self):
+        fh = self.open_fh()
+        zf = zipfile.ZipFile(fh)
+        if not isinstance(fh, (str, os.PathLike)):
+            zf._rgexp_fh = fh            # đóng cùng zf (ZipFile không đóng fh truyền vào)
+        return zf
+
+    @staticmethod
+    def close(zf) -> None:
+        fh = getattr(zf, "_rgexp_fh", None)
+        zf.close()
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _extract(opener: _ZipOpener, mapping: dict[str, str], need: list[str],
              cache_root: Path, max_side: int, label: str,
              min_rate: float = 0.0, probe_after: int = 60,
-             tracker=None) -> list[str]:
-    """Trích các entry cần. `min_rate` > 0 -> bỏ cuộc sớm nếu quá chậm."""
+             tracker=None, workers: int = 1, zf=None) -> list[str]:
+    """Trích các entry cần, SONG SONG `workers` luồng. `min_rate` > 0 -> bỏ cuộc
+    sớm nếu quá chậm.
+
+    Mỗi luồng nhận một đoạn LIỀN KỀ của danh sách đã sắp theo vị trí trong zip
+    và mở handle riêng: stream vẫn đọc tuần tự trong từng đoạn (block 8 MB được
+    dùng lại), nhưng giờ là `workers` kết nối song song; zip cục bộ thì giải mã
+    JPEG + resize + nén lại chạy trên nhiều lõi (PIL/zlib nhả GIL).
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     # Sắp theo VỊ TRÍ TRONG FILE ZIP, không theo thứ tự split. Đây là khác biệt
     # lớn nhất về tốc độ của chế độ stream: fsspec đệm theo block 8 MB, nên đọc
     # tuần tự từ đầu file tới cuối thì nhiều ảnh liền kề rơi vào cùng một block
@@ -224,53 +259,95 @@ def _extract(zf: zipfile.ZipFile, mapping: dict[str, str], need: list[str],
             failed.append((key, f"KeyError {nm}"))
     ordered.sort()
 
-    t0 = time.time()
-    for i, (_off, key, nm) in enumerate(ordered, 1):
-        dest = _cache_path(cache_root, key)
+    workers = max(1, min(int(workers), len(ordered) or 1))
+    per = -(-len(ordered) // workers) if ordered else 0
+    chunks = [ordered[i:i + per] for i in range(0, len(ordered), per)] if per else []
+    lock = threading.Lock()
+    stop = threading.Event()
+    done = [0]
+
+    def work(chunk):
+        z = zf if (workers == 1 and zf is not None) else opener()
         try:
-            _save_resized(zf.read(nm), dest, max_side)
-        except Exception as e:  # entry hỏng / ảnh không giải mã được
-            failed.append((key, repr(e)))
-        if i % 100 == 0 or i == len(ordered):
-            rate = i / max(1e-9, time.time() - t0)
-            eta = (len(ordered) - i) / max(1e-9, rate)
-            print(f"  [{label}] {i}/{len(ordered)} ảnh | {rate:.1f} ảnh/s "
-                  f"| còn ~{eta/60:.1f} phút", flush=True)
-            if tracker is not None:
-                tracker.log({"data/images_done": i, "data/images_total": len(ordered),
-                             "data/rate_img_s": rate, "data/eta_min": eta / 60})
-        if min_rate > 0 and i == probe_after:
-            rate = i / max(1e-9, time.time() - t0)
-            if rate < min_rate:
-                # Proxy của chỗ thuê máy có thể "hỗ trợ" Range bằng cách tải lại
-                # cả file mỗi request. Khi đó stream vẫn CHẠY ĐÚNG, chỉ là mất
-                # hàng chục giờ — và trên máy tính tiền theo giờ thì đó là ca
-                # hỏng tệ hơn cả crash, vì không có gì báo động.
-                raise StreamTooSlow(
-                    f"{rate:.2f} ảnh/s sau {i} ảnh (< {min_rate} ảnh/s)")
+            for _off, key, nm in chunk:
+                if stop.is_set():
+                    return
+                try:
+                    _save_resized(z.read(nm), _cache_path(cache_root, key), max_side)
+                except Exception as e:  # entry hỏng / ảnh không giải mã được
+                    with lock:
+                        failed.append((key, repr(e)))
+                with lock:
+                    done[0] += 1
+        finally:
+            if z is not zf:
+                _ZipOpener.close(z)
+
+    print(f"  [{label}] trích {len(ordered)} ảnh · {len(chunks)} luồng", flush=True)
+    t0 = time.time()
+    last = 0
+    probed = False
+    with ThreadPoolExecutor(max_workers=max(1, len(chunks)),
+                            thread_name_prefix="unzip") as pool:
+        futs = [pool.submit(work, c) for c in chunks]
+        while True:
+            fin = all(f.done() for f in futs)
+            i = done[0]
+            if i - last >= 200 or (fin and i != last):
+                last = i
+                rate = i / max(1e-9, time.time() - t0)
+                eta = (len(ordered) - i) / max(1e-9, rate)
+                print(f"  [{label}] {i}/{len(ordered)} ảnh | {rate:.1f} ảnh/s "
+                      f"| còn ~{eta/60:.1f} phút", flush=True)
+                if tracker is not None:
+                    tracker.log({"data/images_done": i,
+                                 "data/images_total": len(ordered),
+                                 "data/rate_img_s": rate, "data/eta_min": eta / 60})
+            if min_rate > 0 and not probed and i >= probe_after:
+                probed = True
+                rate = i / max(1e-9, time.time() - t0)
+                if rate < min_rate:
+                    # Proxy của chỗ thuê máy có thể "hỗ trợ" Range bằng cách tải
+                    # lại cả file mỗi request. Khi đó stream vẫn CHẠY ĐÚNG, chỉ
+                    # là mất hàng chục giờ — và trên máy tính tiền theo giờ thì
+                    # đó là ca hỏng tệ hơn cả crash, vì không có gì báo động.
+                    stop.set()
+                    raise StreamTooSlow(
+                        f"{rate:.2f} ảnh/s sau {i} ảnh (< {min_rate} ảnh/s)")
+            if fin:
+                for f in futs:
+                    f.result()
+                break
+            time.sleep(0.5)
     if failed:
         print(f"  ⚠ {len(failed)} ảnh không lấy được. Ví dụ: {failed[:3]}", flush=True)
     return [k for k, _ in failed]
 
 
-def _open_and_extract(zf: zipfile.ZipFile, need: list[str], cache_root: Path,
+def _open_and_extract(opener: _ZipOpener, need: list[str], cache_root: Path,
                       cfg: Cfg, label: str, min_rate: float = 0.0,
-                      tracker=None) -> list[str]:
-    files = _list_files(zf)
-    mapping, missing, desc = build_name_map(files, need)
-    print(f"  zip: {len(files)} entry — layout: {desc}", flush=True)
-    if missing:
-        print(f"  ⚠ {len(missing)} key không tìm thấy trong zip. Ví dụ: {missing[:3]}",
-              flush=True)
-    return _extract(zf, mapping, need, cache_root,
-                    int(cfg.data.get("image_max_side", 768)), label,
-                    min_rate=min_rate, tracker=tracker)
+                      tracker=None, workers: int = 1) -> list[str]:
+    zf = opener()
+    try:
+        files = _list_files(zf)
+        mapping, missing, desc = build_name_map(files, need)
+        print(f"  zip: {len(files)} entry — layout: {desc}", flush=True)
+        if missing:
+            print(f"  ⚠ {len(missing)} key không tìm thấy trong zip. Ví dụ: "
+                  f"{missing[:3]}", flush=True)
+        return _extract(opener, mapping, need, cache_root,
+                        int(cfg.data.get("image_max_side", 768)), label,
+                        min_rate=min_rate, tracker=tracker, workers=workers, zf=zf)
+    finally:
+        _ZipOpener.close(zf)
 
 
 def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path,
                     tracker=None) -> list[str]:
     """Đọc zip TỪ XA bằng HTTP range request, chỉ tải các entry cần."""
     from huggingface_hub import HfFileSystem
+
+    from .hw import io_workers
 
     d = cfg.data
     uri = f"datasets/{d['repo']}/{d['image_zip']}" if d.get("repo_type", "dataset") == "dataset" \
@@ -279,24 +356,49 @@ def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path,
     # block_size lớn: mỗi ảnh CXR nén ~150-300 KB, và một range request 8 MB rẻ
     # hơn nhiều so với ba mươi request 256 KB liên tiếp cho các ảnh cạnh nhau
     # trong zip (chúng nằm cạnh nhau vì zip giữ nguyên thứ tự thư mục).
-    fh = fs.open(uri, "rb", block_size=8 * 1024 * 1024)
-    with zipfile.ZipFile(fh) as zf:
-        return _open_and_extract(zf, need, cache_root, cfg, "stream",
-                                 min_rate=float(cfg.data.get("zip_stream_min_rate", 1.0)),
-                                 tracker=tracker)
+    opener = _ZipOpener(lambda: fs.open(uri, "rb", block_size=8 * 1024 * 1024))
+    # Trần 8 kết nối song song: đủ lấp băng thông, không bị Hub rate-limit.
+    return _open_and_extract(opener, need, cache_root, cfg, "stream",
+                             min_rate=float(cfg.data.get("zip_stream_min_rate", 1.0)),
+                             tracker=tracker, workers=min(8, io_workers(cfg)))
 
 
 def _download_extract(cfg: Cfg, need: list[str], cache_root: Path,
                       tracker=None) -> list[str]:
-    """Tải trọn zip rồi giải nén. Chắc ăn, tốn ~18 GB đĩa."""
+    """Tải trọn zip rồi giải nén SONG SONG. Tốn ~18 GB đĩa.
+
+    Trên máy mạng nhanh (5 Gbps) + NVMe, đây là đường NHANH NHẤT: tải đa kết
+    nối (hf_transfer / hf_xet, bật trong scripts/run_lora.sh) mất vài phút,
+    rồi `io.workers` luồng giải mã trên đĩa cục bộ.
+    """
     from huggingface_hub import hf_hub_download
 
+    from .hw import io_workers
+
     d = cfg.data
-    print("  → tải trọn img_dir.zip (17.7 GB, khá lâu)...", flush=True)
+    t0 = time.time()
+    print("  → tải trọn img_dir.zip (17.7 GB)"
+          + (" · hf_transfer BẬT" if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+             else "") + " ...", flush=True)
     zpath = hf_hub_download(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"),
                             filename=d["image_zip"], token=hf_token())
-    with zipfile.ZipFile(zpath) as zf:
-        return _open_and_extract(zf, need, cache_root, cfg, "local", tracker=tracker)
+    gb = os.path.getsize(zpath) / 1024 ** 3
+    dt = max(1e-9, time.time() - t0)
+    print(f"  ✓ zip {gb:.1f} GB sẵn sàng sau {dt/60:.1f} phút"
+          f"{f' (~{gb * 8 / dt:.2f} Gbit/s)' if dt > 5 else ' (có trong cache)'}",
+          flush=True)
+    return _open_and_extract(_ZipOpener(lambda: zpath), need, cache_root, cfg,
+                             "local", tracker=tracker, workers=io_workers(cfg))
+
+
+def zip_mode(cfg: Cfg) -> str:
+    """`io.zip_mode` (config GPU — phụ thuộc mạng/đĩa của máy) thắng
+    `data.zip_mode`, trừ khi nó là `content`/trống. Ảnh ra giống hệt nhau ở
+    mọi chế độ: đây là khoá tốc độ, không phải khoá thí nghiệm."""
+    io_mode = str(((cfg.get("io") or {}).get("zip_mode") or "")).lower()
+    if io_mode and io_mode != "content":
+        return io_mode
+    return str(cfg.data.get("zip_mode", "auto")).lower()
 
 
 def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
@@ -311,7 +413,8 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
     if not need:
         return df
 
-    mode = str(cfg.data.get("zip_mode", "auto")).lower()
+    mode = zip_mode(cfg)
+    print(f"  chế độ zip: {mode}", flush=True)
     bad: list[str] = []
     if mode in ("stream", "auto"):
         try:
@@ -345,8 +448,10 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
     if bool(cfg.data.get("image_max_side_enforce", True)):
         from . import imaging
 
+        from .hw import io_workers
+
         imaging.enforce_max_side(df["image_path"].tolist(), max_side,
-                                 label=f"{len(df)} ảnh")
+                                 label=f"{len(df)} ảnh", workers=io_workers(cfg))
     return df
 
 

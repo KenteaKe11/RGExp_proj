@@ -28,6 +28,7 @@ fi
 PYBIN="${PYBIN:-$(command -v python3 || command -v python)}"
 [ -n "$PYBIN" ] || { echo "✗ Không thấy python3 lẫn python trong PATH."; exit 1; }
 export PYBIN
+command -v rgexp_enable_fast_download >/dev/null 2>&1 && rgexp_enable_fast_download
 
 DETACH=0
 ARGS=()

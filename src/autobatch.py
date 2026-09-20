@@ -19,9 +19,15 @@ suy. Quy trình, `autotune()`:
   5. KIỂM CHỨNG: chạy thật một lượt ở bs đã chọn. Vượt ngân sách hoặc OOM thì
      lùi xuống ứng viên kế tiếp. Không bao giờ trả một bs chưa chạy thử.
 
-Chỉ số được đo là `torch.cuda.max_memory_allocated` — KHÔNG gồm CUDA context
-(~0.5–1 GB) và phân mảnh của allocator. `target_frac` 0.80 chừa ~20% cho hai
-thứ ấy và cho mẫu dài bất thường: đó là mức AN TOÀN cho MỘT tiến trình.
+Chỉ số được đo là VRAM THIẾT BỊ — đúng con số nvidia-smi thấy:
+
+    đỉnh = (total − free − reserved) lúc bắt đầu      CUDA context, bitsandbytes,
+                                                        tiến trình khác
+         + torch.cuda.max_memory_reserved()             allocator giữ (gồm phân mảnh)
+
+nên `target_frac` 0.85 nghĩa là card đầy ~85% thật, không phải "tensor 85% rồi
+cộng thêm context lẫn phân mảnh vượt trần". Lượt dò train đệm tới max_seq_len
+(xấu nhất); lượt dò sinh ép đủ max_new_tokens (KV cache dài nhất).
 
 Đo không được phép đổi thí nghiệm: RNG (CPU + CUDA) và mọi buffer (BatchNorm
 running stats của ResNet) được chụp trước và trả lại sau; gradient bị xoá;
@@ -80,7 +86,14 @@ def ab_cfg(cfg) -> dict:
     c = dict(cfg.get("autobatch", {}) or {})
     return {"enabled": bool(c.get("enabled", False)),
             "target_frac": float(c.get("target_frac", 0.80)),
-            "probe_sizes": [int(x) for x in (c.get("probe_sizes") or [1, 2, 4])]}
+            "probe_sizes": [int(x) for x in (c.get("probe_sizes") or [1, 2, 4])],
+            "infer_probe_sizes": [int(x) for x in
+                                  (c.get("infer_probe_sizes") or [2, 4])],
+            "infer_max_bs": int(c.get("infer_max_bs", 16) or 16)}
+
+
+INFER_LADDER = (1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128,
+                192, 256)
 
 
 def _is_oom(e: BaseException) -> bool:
@@ -104,9 +117,13 @@ def measure(step_fn, bs: int, modules=()) -> float | None:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        # Phần KHÔNG thuộc allocator của torch: CUDA context, workspace của
+        # cuBLAS/bitsandbytes, tiến trình khác trên card.
+        overhead = max(0, int(total - free) - int(torch.cuda.memory_reserved()))
         step_fn(bs)
         torch.cuda.synchronize()
-        peak = float(torch.cuda.max_memory_allocated())
+        peak = float(overhead + torch.cuda.max_memory_reserved())
     except Exception as e:  # noqa: BLE001
         if not _is_oom(e):
             raise
@@ -206,5 +223,82 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
           f"ngân sách {rep['budget_gib']} GiB = {ac['target_frac']:.0%} của "
           f"{rep['total_gib']} GiB -> bs {current} -> {chosen} × accum "
           f"{rep['accum']} = {eff} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
+          f"({rep['peak_frac']:.0%})", flush=True)
+    return int(chosen), rep
+
+
+def autotune_infer(cfg, label: str, current: int, step_fn,
+                   measure_fn=None, total_bytes: float | None = None,
+                   max_bs: int | None = None, probe_sizes=None
+                   ) -> tuple[int, dict]:
+    """Batch lúc SINH. Không có batch hiệu dụng để giữ -> ứng viên là thang
+    `INFER_LADDER` tới `autobatch.infer_max_bs`. `step_fn(bs)` phải là trường
+    hợp xấu nhất (sinh đủ max_new_tokens)."""
+    ac = ab_cfg(cfg)
+    rep = {"label": label, "enabled": ac["enabled"], "from": int(current),
+           "chosen": int(current), "kind": "infer"}
+    if not ac["enabled"]:
+        return int(current), rep
+    if measure_fn is None:
+        import torch
+
+        if not torch.cuda.is_available():
+            rep["skipped"] = "không có CUDA"
+            return int(current), rep
+        total_bytes = float(torch.cuda.get_device_properties(0).total_memory)
+
+        def measure_fn(bs):
+            return measure(step_fn, bs, ())
+    cands = [c for c in INFER_LADDER
+             if c <= max(1, int(max_bs if max_bs is not None else ac["infer_max_bs"]))]
+    budget = ac["target_frac"] * float(total_bytes)
+    want = [int(x) for x in (probe_sizes or ac["infer_probe_sizes"])]
+    sizes = sorted({s for s in want if s in cands} or {cands[0]})
+    pts, oom_at = [], None
+    for s in sizes:
+        pk = measure_fn(s)
+        if pk is None:
+            oom_at = s
+            break
+        pts.append((s, pk))
+        if pk > budget:
+            break
+    if not pts:
+        pk = measure_fn(1)
+        if pk is None:
+            rep.update(error="OOM ngay ở bs 1 — giữ config")
+            print(f"  ⚠ autobatch[{label}]: {rep['error']}", flush=True)
+            return int(current), rep
+        pts.append((1, pk))
+    a, b, r2 = fit_line(pts)
+    chosen = verified = None
+    for c in choose(cands, a, b, budget):
+        if oom_at is not None and c >= oom_at:
+            continue
+        done = dict(pts)
+        pk = done[c] if c in done else measure_fn(c)
+        if pk is not None and pk <= budget:
+            chosen, verified = c, pk
+            break
+        if pk is None:
+            oom_at = c
+        else:
+            pts.append((c, pk))
+    if chosen is None:
+        chosen = min(c for c, _ in pts)
+        verified = dict(pts)[chosen]
+    gib = 1024 ** 3
+    rep.update(chosen=int(chosen),
+               points=[[int(x), round(y / gib, 3)] for x, y in pts],
+               a_gib=round(a / gib, 3), b_gib=round(b / gib, 4),
+               r2=(None if r2 != r2 else round(r2, 4)),
+               budget_gib=round(budget / gib, 2),
+               total_gib=round(float(total_bytes) / gib, 2),
+               peak_gib=round(verified / gib, 2),
+               peak_frac=round(verified / float(total_bytes), 3))
+    print(f"  ⚙ autobatch[{label}]: VRAM sinh ≈ {rep['a_gib']:.2f} + "
+          f"{rep['b_gib']:.3f}·bs GiB (R² {rep['r2']}, đo {rep['points']}) · "
+          f"ngân sách {rep['budget_gib']} GiB = {ac['target_frac']:.0%} -> bs "
+          f"{current} -> {chosen} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
           f"({rep['peak_frac']:.0%})", flush=True)
     return int(chosen), rep

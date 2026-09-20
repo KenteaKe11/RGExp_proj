@@ -176,6 +176,49 @@ def factor_pairs(arms: list[dict]) -> list[tuple[str, str, str]]:
     return out
 
 
+def heaviest_first(arms: list[dict]) -> list[dict]:
+    """Candidate nặng VRAM nhất trước: nhiều ma trận gắn hơn, rồi rank lớn hơn.
+
+    Thứ tự huấn luyện không đổi kết quả (seed đặt lại mỗi candidate, thứ tự
+    dữ liệu từ Generator riêng) — nó chỉ để autobatch dò trên candidate nặng
+    nhất, rồi KHOÁ số đó cho cả bốn.
+    """
+    return sorted(arms, key=lambda x: (-len(x["target_modules"]), -int(x["rank"])))
+
+
+def locked_train_bs(adapter_root: Path, arms: list[dict], skip: list[dict]
+                    ) -> int | None:
+    """batch mỗi lượt của candidate ĐÃ huấn luyện (nếu có) — để phần còn lại khớp."""
+    seen = set()
+    for x in arms:
+        if x in skip:
+            continue
+        p = adapter_root / x["id"] / "train_stats.json"
+        if p.exists():
+            try:
+                bs = json.loads(p.read_text(encoding="utf-8")).get("batch_size")
+            except Exception:
+                bs = None
+            if bs:
+                seen.add(int(bs))
+    if len(seen) > 1:
+        print(f"  ⚠ các candidate đã huấn luyện dùng batch mỗi lượt KHÁC nhau "
+              f"{sorted(seen)} — nên --retrain để bốn cột so được.", flush=True)
+    return min(seen) if seen else None
+
+
+def lock_train(c: Cfg, bs: int) -> Cfg:
+    """Ép batch mỗi lượt = bs (grad_accum suy lại, batch hiệu dụng giữ nguyên)."""
+    t = dict(c["train"])
+    eff = int(t["per_device_batch_size"]) * int(t["grad_accum"])
+    if eff % bs:
+        raise ValueError(f"batch khoá {bs} không chia hết batch hiệu dụng {eff}")
+    t.update(per_device_batch_size=int(bs), grad_accum=eff // int(bs))
+    c["train"] = t
+    c["autobatch"] = dict(c.get("autobatch") or {}, enabled=False)
+    return c
+
+
 def apply_exp(cfg: Cfg) -> None:
     """Ràng buộc của thí nghiệm, áp bất kể file config nói gì: mọi cặp được
     kiểm, tham chiếu dấu = `lora_exp.reference`, MoE tắt."""
@@ -200,6 +243,10 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
+    from .hw import cpu_budget, io_workers, set_torch_threads
+
+    print(f"⚙ CPU: {cpu_budget()} lõi được cấp · torch {set_torch_threads(cfg)} "
+          f"luồng · I/O {io_workers(cfg)} luồng", flush=True)
     if "lora_exp" not in cfg:
         print("✗ config không có khối `lora_exp`.")
         return 2
@@ -210,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"]["n_test"] = 8
         cfg["data"]["n_train"] = 16
         cfg["data"]["n_val"] = 8
+        cfg["train"]["eval"] = dict(cfg["train"].get("eval") or {},
+                                    n_samples=4, every_steps=2)
         cfg["stats"]["n_perm"] = 200
         cfg["stats"]["n_boot"] = 200
         cfg["output"]["push"] = False
@@ -314,12 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     from . import data as data_mod
     from . import data_train as dt_mod
 
-    train_df = None
+    train_df = val_df = None
     if "data" in stages:
         test_df = data_mod.prepare(cfg, tracker)
         if to_train:
             try:
-                train_df, _ = dt_mod.prepare_train(cfg, test_df, tracker)
+                train_df, val_df = dt_mod.prepare_train(cfg, test_df, tracker)
             except dt_mod.DataLeak as e:
                 print(f"\n✗ DỪNG — RÒ RỈ DỮ LIỆU:\n    {e}", flush=True)
                 tracker.finish(1)
@@ -334,7 +383,14 @@ def main(argv: list[str] | None = None) -> int:
         from .backbone import TrainUnusable, preflight_adapters
 
         if train_df is None:
-            train_df, _ = dt_mod.load_train_manifest(cfg)
+            train_df, val_df = dt_mod.load_train_manifest(cfg)
+        ev = dict(cfg["train"].get("eval") or {})
+        if ev.get("enabled") and (val_df is None or val_df.empty):
+            print("  ⚠ train.eval BẬT nhưng không có mẫu val — chạy stage "
+                  "`data` để tải hồ val (data.n_val).", flush=True)
+        manifest["val"] = {"n_pool": (0 if val_df is None else len(val_df)),
+                           **{k: ev.get(k) for k in
+                              ("enabled", "n_samples", "every_steps", "resample")}}
         errs, warns = preflight_adapters(
             [{"method": x["method"], "rank": x["rank"]} for x in to_train])
         for w in warns:
@@ -344,14 +400,35 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ✗ {e}", flush=True)
             tracker.finish(1)
             return 2
+        # ── batch mỗi lượt: MỘT số cho cả bốn candidate ──────────────────
+        # HF lấy trung bình CE theo TOKEN trong micro-batch, nên batch mỗi lượt
+        # đổi trọng số giữa các mẫu. Autobatch tự chọn riêng từng candidate thì
+        # r8·decoder (nặng) và r4·attn (nhẹ) có thể nhận hai số khác nhau -> cột
+        # so sánh lẫn thêm một biến thứ ba. Nên: khoá theo candidate đã có, hoặc
+        # dò trên candidate NẶNG NHẤT rồi khoá cho phần còn lại.
+        ab_on = bool((cfg.get("autobatch") or {}).get("enabled", False))
+        locked = locked_train_bs(adapter_root, arms, to_train) if ab_on else None
+        if ab_on:
+            to_train = heaviest_first(to_train)
+            if locked:
+                print(f"  ⚙ batch mỗi lượt KHOÁ = {locked} theo candidate đã "
+                      f"huấn luyện", flush=True)
+            else:
+                print(f"  ⚙ autobatch dò trên {to_train[0]['id']} (nặng nhất) "
+                      f"rồi khoá cho {len(to_train) - 1} candidate còn lại",
+                      flush=True)
+        manifest["train_order"] = [x["id"] for x in to_train]
         for arm in to_train:
             c = arm_cfg(cfg, arm)
+            if locked:
+                c = lock_train(c, locked)
             preset = preset_for(c, arm)
             print(f"\n── {arm['name']} ──", flush=True)
             try:
                 st = tr_mod.train_arm(c, arm, preset, train_df, None,
                                       adapter_root / arm["id"], tracker,
-                                      max_steps_override=dry_steps)
+                                      max_steps_override=dry_steps,
+                                      val_df=val_df)
             except TrainUnusable as e:
                 print(f"\n✗ {arm['id']} KHÔNG huấn luyện được: {e}", flush=True)
                 manifest["arm_status"][arm["id"]] = {"trained": False,
@@ -360,6 +437,9 @@ def main(argv: list[str] | None = None) -> int:
                 tracker.finish(1)
                 return 3
             st["target"] = arm["target"]
+            if ab_on and not locked and st.get("batch_size"):
+                locked = int(st["batch_size"])
+                manifest["train_batch_locked"] = locked
             (adapter_root / arm["id"] / "train_stats.json").write_text(
                 json.dumps(st, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8")
@@ -367,7 +447,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest["arm_status"][arm["id"]] = {
                 "trained": True, "minutes": st.get("minutes"),
                 "trainable_params": st.get("trainable_params"),
-                "vram_peak_gb": st.get("vram_peak_gb")}
+                "vram_peak_gb": st.get("vram_peak_gb"),
+                "val_loss_last": st.get("val_loss_last")}
     for arm in arms:
         if arm in to_train:
             continue
@@ -382,12 +463,37 @@ def main(argv: list[str] | None = None) -> int:
         from .runners import build
         from .runners.base import RunnerUnusable
 
+        # Batch lúc sinh cũng KHOÁ chung: batch + đệm trái đổi số học bf16 một
+        # chút, và bốn cột phải chịu cùng một thay đổi ấy. Lưu ra file để lần
+        # chạy tiếp (resume) dùng lại đúng số.
+        lock_p = run_dir / "infer_batch.json"
+        ilock = None
+        if lock_p.exists():
+            try:
+                ilock = int(json.loads(lock_p.read_text(encoding="utf-8"))["batch_size"])
+            except Exception:
+                ilock = None
+        if ilock is None and any(_count_preds(pred[x["id"]]) for x in arms):
+            # Đã có dự đoán từ trước khi có khoá -> giữ đúng số của config.
+            ilock = int(cfg["base"].get("batch_size", 2))
+            lock_p.write_text(json.dumps({"batch_size": ilock, "source":
+                                          "predictions có sẵn"}), encoding="utf-8")
         for arm in arms:
             print(f"\n── {arm['name']} ──", flush=True)
+            mc = model_cfg(cfg, arm, adapter_root)
+            if ilock:
+                mc["batch_size_locked"] = ilock
             try:
-                build(arm_cfg(cfg, arm), model_cfg(cfg, arm, adapter_root),
-                      tracker).run(test_df, pred[arm["id"]],
-                                   log_every=tracker.log_every)
+                runner = build(arm_cfg(cfg, arm), mc, tracker)
+                runner.run(test_df, pred[arm["id"]], log_every=tracker.log_every)
+                rep_ab = getattr(runner, "autobatch_report", None)
+                if ilock is None and rep_ab and rep_ab.get("chosen"):
+                    ilock = int(rep_ab["chosen"])
+                    lock_p.write_text(json.dumps(
+                        {"batch_size": ilock, "source": arm["id"],
+                         "autobatch": rep_ab}, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                    manifest["infer_batch_locked"] = ilock
             except RunnerUnusable as e:
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 tracker.finish(1)

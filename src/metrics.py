@@ -78,7 +78,43 @@ def _rouge_per_sample(hyps: list[str], refs: list[str], types: list[str]) -> dic
     return {t: np.array(v, dtype=np.float64) for t, v in cols.items()}
 
 
-def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
+def _bert_batch(scorer, hyps: list[str], refs: list[str], bcfg: dict,
+                cfg=None, default: int = 64) -> int:
+    """`metrics.bertscore.batch_size: auto` -> dò như mọi pipeline khác: đích
+    85% VRAM thiết bị, đo trên những cặp DÀI NHẤT (bert_score xếp theo độ dài,
+    nên batch nặng nhất là batch của các cặp dài nhất)."""
+    want = bcfg.get("batch_size", 32)
+    if str(want).lower() != "auto":
+        return max(1, int(want))
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or not hasattr(scorer, "_batch_size"):
+            return default
+    except ImportError:
+        return default
+    from .autobatch import autotune_infer
+
+    order = sorted(range(len(hyps)),
+                   key=lambda i: -(len(hyps[i]) + len(refs[i])))
+
+    # Cặp PHẢI khác nhau: `bert_cos_score_idf` gộp câu trùng trước khi chia
+    # batch, nên dò bằng cùng một câu lặp k lần là đo bộ nhớ của MỘT câu — rồi
+    # chọn một batch quá lớn và OOM ở lần chấm thật.
+    def step(k: int) -> None:
+        idx = order[:k]
+        scorer._batch_size = int(k)
+        scorer.score([hyps[i] for i in idx], [refs[i] for i in idx], verbose=False)
+
+    cap = min(256, len(order))
+    if cap < 4:
+        return min(default, max(1, cap))
+    bs, _rep = autotune_infer(cfg or {}, "bertscore", min(default, cap), step,
+                              max_bs=cap, probe_sizes=[16, 32])
+    return max(1, int(bs))
+
+
+def _bertscore(hyps: list[str], refs: list[str], bcfg: dict, cfg=None) -> dict:
     from bert_score import BERTScorer
 
     scorer = BERTScorer(
@@ -86,12 +122,18 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
         num_layers=int(bcfg.get("num_layers", 17)),
         lang="en", idf=False,
         rescale_with_baseline=bool(bcfg.get("rescale_with_baseline", False)),
-        batch_size=int(bcfg.get("batch_size", 32)),
+        batch_size=64,      # thay bằng số đã dò ngay bên dưới
     )
     # Chuỗi rỗng làm BERTScore ra NaN (không có token nào để khớp). Model sinh
     # ra rỗng là một KẾT QUẢ, không phải dữ liệu thiếu, nên thay bằng "." để nó
     # nhận điểm rất thấp thay vì biến mất khỏi phép tính.
     safe = [h if h.strip() else "." for h in hyps]
+    bs = _bert_batch(scorer, safe, refs, bcfg, cfg)
+    try:
+        scorer._batch_size = int(bs)
+    except Exception:
+        pass
+    print(f"  chấm BERTScore: batch {bs}", flush=True)
     P, R, F = scorer.score(safe, refs, verbose=False)
     allv = {"p": P.numpy().astype(np.float64),
             "r": R.numpy().astype(np.float64),
@@ -123,7 +165,7 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
     if bcfg.get("enabled", True):
         print(f"  [{label}] BERTScore ({bcfg.get('model_type', 'roberta-large')}) ...",
               flush=True)
-        cols.update(_bertscore(hyps, refs, bcfg))
+        cols.update(_bertscore(hyps, refs, bcfg, cfg))
 
     df = pd.DataFrame({"key": keys, **cols})
     df["n_words_pred"] = [len(h.split()) for h in hyps]

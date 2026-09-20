@@ -12,7 +12,10 @@ tiền thật.
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -72,6 +75,11 @@ class Runner:
         self.model = None
         self.processor = None
         self.tracker = tracker or NullTracker()
+        # Tokenizer "fast" của HF không an toàn khi hai luồng dùng cùng lúc
+        # ("Already borrowed"): luồng nền chuẩn bị batch sau (encode) trong khi
+        # luồng chính decode batch trước -> mọi lần chạm tokenizer đi qua khoá.
+        self._tok_lock = threading.RLock()
+        self.autobatch_report = None
 
     # ── giao diện con lớp phải cài ──────────────────────────────────────────
     def load(self) -> None:
@@ -80,6 +88,33 @@ class Runner:
     def generate_batch(self, batch: list[dict]) -> list[str]:
         """batch = [{key, ref, image_path}] -> danh sách văn bản sinh ra."""
         raise NotImplementedError
+
+    # Tuỳ chọn — con lớp cài thì vòng chạy tách phần CPU ra luồng nền:
+    #   prepare_batch(batch) -> inputs trên CPU (ảnh + token, pinned)
+    #   generate_prepared(inputs) -> danh sách văn bản
+    #   probe_generate(batch) -> sinh ĐỦ max_new_tokens (cho autobatch)
+
+    def pick_batch_size(self, todo: list[dict]) -> int:
+        """Batch lúc sinh: khoá chung (nếu có) > autobatch 85% VRAM > config."""
+        bs = max(1, int(self.mcfg.get("batch_size", 1)))
+        locked = self.mcfg.get("batch_size_locked")
+        if locked:
+            print(f"  ⚙ batch sinh KHOÁ = {int(locked)} (dùng chung mọi candidate "
+                  f"của lần chạy này)", flush=True)
+            return max(1, int(locked))
+        probe = getattr(self, "probe_generate", None)
+        if probe is None or not todo:
+            return bs
+        from .. import autobatch
+
+        def step(k: int) -> None:
+            probe([todo[j % len(todo)] for j in range(k)])
+
+        chosen, rep = autobatch.autotune_infer(
+            self.cfg, f"{self.mcfg['id']}/infer", bs, step)
+        self.autobatch_report = rep
+        self._free()
+        return max(1, int(chosen))
 
     def unload(self) -> None:
         self.model = None
@@ -163,7 +198,27 @@ class Runner:
         self.configure_compile()
         self.smoke_test(todo[0])
 
-        bs = max(1, int(self.mcfg.get("batch_size", 1)))
+        bs = self.pick_batch_size(todo)
+        batches = [todo[i:i + bs] for i in range(0, len(todo), bs)]
+        # Batch k+1 (mở ảnh + processor 896 + token hoá) dựng trong luồng nền
+        # lúc batch k đang sinh trên GPU.
+        prep = getattr(self, "prepare_batch", None)
+        from ..hw import io_opt
+
+        depth = max(1, int(io_opt(self.cfg, "prefetch_depth", 1) or 1))
+        pool = (ThreadPoolExecutor(1, thread_name_prefix="infer-prefetch")
+                if prep is not None else None)
+        queue: deque = deque()
+        nxt = [0]
+
+        def _fill() -> None:
+            while pool is not None and len(queue) < depth and nxt[0] < len(batches):
+                queue.append(pool.submit(prep, batches[nxt[0]]))
+                nxt[0] += 1
+
+        _fill()
+        print(f"  ⚙ sinh: batch {bs} · {len(batches)} lượt · chuẩn bị nền "
+              f"{'BẬT (sâu ' + str(depth) + ')' if pool else 'tắt'}", flush=True)
         t0 = time.time()
         n_done = 0
         n_empty = 0
@@ -172,11 +227,16 @@ class Runner:
         limit = max(1, int(self.mcfg.get("consecutive_fail_limit", 3)))
         samples: list[dict] = []
         with open(out_path, "a", encoding="utf-8") as f:
-            for i in range(0, len(todo), bs):
-                batch = todo[i:i + bs]
+          try:
+            for bi, batch in enumerate(batches):
                 t1 = time.time()
                 try:
-                    outs = self.generate_batch(batch)
+                    if pool is not None:
+                        fut = queue.popleft()
+                        _fill()
+                        outs = self.generate_prepared(fut.result())
+                    else:
+                        outs = self.generate_batch(batch)
                     fail_streak = 0
                 except Exception as e:
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
@@ -232,7 +292,7 @@ class Runner:
                     }, ensure_ascii=False) + "\n")
                 f.flush()
                 n_done += len(batch)
-                if (i // bs) % log_every == 0 or n_done >= len(todo):
+                if bi % log_every == 0 or n_done >= len(todo):
                     rate = n_done / max(1e-9, time.time() - t0)
                     eta = (len(todo) - n_done) / max(1e-9, rate)
                     print(f"  [{self.name}] {n_done}/{len(todo)} | {rate:.2f} ảnh/s "
@@ -248,6 +308,9 @@ class Runner:
                         f"infer/{mid}/n_batch_failed": n_batch_failed,
                         **self._vram(),
                     })
+          finally:
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
 
         self.unload()
         mins = (time.time() - t0) / 60
@@ -369,15 +432,9 @@ class Runner:
 
     @staticmethod
     def _vram() -> dict:
-        try:
-            import torch
+        from ..vram_monitor import device_usage
 
-            if not torch.cuda.is_available():
-                return {}
-            return {"sys/vram_alloc_gb": torch.cuda.memory_allocated() / 1024 ** 3,
-                    "sys/vram_peak_gb": torch.cuda.max_memory_allocated() / 1024 ** 3}
-        except Exception:
-            return {}
+        return device_usage()
 
     @staticmethod
     def _free() -> None:

@@ -171,6 +171,16 @@ def load_train_manifest(cfg: Cfg, name: str = "trainset",
     # `trainset.jsonl` nằm chung ở cache_dir cho mọi thí nghiệm: một profile
     # config nội dung với n_train khác ghi đè nó. Đọc lại bằng số hàng SAI là huấn luyện
     # trên tập khác mà không có dòng log nào nói vậy.
+    # Hồ val: `train.eval` bốc ngẫu nhiên trong ĐÚNG hồ này, nên một
+    # `valset.jsonl` cũ (n_val nhỏ hơn) nghĩa là mọi lần đo val chỉ nhìn một
+    # góc của hồ mà config nói. Không DỪNG — val chỉ để nhìn, không vào bảng
+    # kết quả — nhưng phải nói ra.
+    want_val = int(cfg.data.get("n_val", 0) or 0)
+    if want_val and len(out[1]) < 0.9 * want_val:
+        print(f"  ⚠ {root / (val_name + '.jsonl')} có {len(out[1])} mẫu, config "
+              f"đòi data.n_val={want_val}. Hoặc split val chỉ có bấy nhiêu, "
+              f"hoặc file do lần chạy trước ghi — chạy lại stage `data` để "
+              f"dựng đúng hồ val.", flush=True)
     want = int(cfg.data.get("n_train", 0) or 0)
     if name == "trainset" and want and len(out[0]) != want:
         raise FileNotFoundError(

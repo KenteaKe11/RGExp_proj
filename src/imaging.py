@@ -168,29 +168,45 @@ def shrink_to(path: Path, max_side: int) -> bool:
     return True
 
 
-def enforce_max_side(paths, max_side: int, label: str = "cache") -> dict:
+def enforce_max_side(paths, max_side: int, label: str = "cache",
+                     workers: int = 1) -> dict:
     """Duyệt cache, thu nhỏ mọi ảnh vượt trần. Trả thống kê.
 
     Mở bằng PIL nhưng chỉ đọc HEADER để lấy kích thước (Image.open lười giải
     mã), nên 9400 file mất vài giây chứ không phải vài phút — rẻ hơn nhiều so
     với việc phát hiện muộn rằng adapter đã học trên ảnh 768.
     """
-    checked = fixed = bad = 0
-    biggest = 0
-    for p in paths:
+    def one(p):
         p = Path(p)
         side = _long_side(p)
+        if side is None:
+            return None, False, True
+        if side > max_side:
+            try:
+                return side, shrink_to(p, max_side), False
+            except Exception:
+                return side, False, True
+        return side, False, False
+
+    paths = list(paths)
+    if int(workers) > 1 and len(paths) > 64:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=int(workers),
+                                thread_name_prefix="imgscan") as pool:
+            res = list(pool.map(one, paths, chunksize=64))
+    else:
+        res = [one(p) for p in paths]
+    checked = fixed = bad = 0
+    biggest = 0
+    for side, fx, err in res:
         if side is None:
             bad += 1
             continue
         checked += 1
         biggest = max(biggest, side)
-        if side > max_side:
-            try:
-                if shrink_to(p, max_side):
-                    fixed += 1
-            except Exception:
-                bad += 1
+        fixed += int(bool(fx))
+        bad += int(bool(err))
     stats = {"checked": checked, "resized": fixed, "unreadable": bad,
              "max_side_before": biggest, "max_side": int(max_side)}
     if fixed:

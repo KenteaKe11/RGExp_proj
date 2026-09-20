@@ -206,16 +206,45 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
     def _n_beams(self) -> int:
         return max(1, int(self.gen_kwargs().get("num_beams", 1) or 1))
 
-    def generate_batch(self, batch: list[dict]) -> list[str]:
-        """Sinh cho một batch, đi ĐÚNG con đường của khâu huấn luyện."""
+    # ── Phần CPU: chạy được ở luồng nền (src/runners/base.run) ──────────────
+    def prepare_batch(self, batch: list[dict]) -> dict:
+        """Ảnh + prompt -> tensor trên CPU (pinned nếu `io.pin_memory`)."""
         import torch
 
-        msgs = [chat_messages(self.cfg, Image.open(it["image_path"]).convert("RGB"))
-                for it in batch]
-        inputs = self.processor.apply_chat_template(
-            msgs, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt", padding=True, **self.img_kw,
-        ).to(self.model.device)
+        from ..hw import io_opt
+
+        msgs = []
+        for it in batch:
+            with Image.open(it["image_path"]) as im:
+                msgs.append(chat_messages(self.cfg, im.convert("RGB")))
+        with self._tok_lock:
+            inputs = self.processor.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt", padding=True, **self.img_kw,
+            )
+        out = dict(inputs)
+        if bool(io_opt(self.cfg, "pin_memory", False)) and torch.cuda.is_available():
+            out = {k: (v.pin_memory() if torch.is_tensor(v) else v)
+                   for k, v in out.items()}
+        return out
+
+    def generate_batch(self, batch: list[dict]) -> list[str]:
+        """Sinh cho một batch, đi ĐÚNG con đường của khâu huấn luyện."""
+        return self.generate_prepared(self.prepare_batch(batch))
+
+    def probe_generate(self, batch: list[dict]) -> None:
+        """Trường hợp xấu nhất cho autobatch: ép sinh ĐỦ max_new_tokens."""
+        n = int(self.gen_kwargs().get("max_new_tokens", 256) or 256)
+        self.generate_prepared(self.prepare_batch(batch),
+                               extra_gen={"min_new_tokens": n})
+
+    def generate_prepared(self, inputs: dict, extra_gen: dict | None = None
+                          ) -> list[str]:
+        import torch
+
+        dev = self.model.device
+        inputs = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v)
+                  for k, v in inputs.items()}
 
         ids = inputs["input_ids"]
         with torch.inference_mode():
@@ -250,7 +279,9 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
             kw = {k: v for k, v in kw.items() if v is not None}
             in_len = int(kw["inputs_embeds"].shape[1])
             try:
-                out = self.model.generate(**kw, **self.gen_kwargs())
+                gkw = dict(self.gen_kwargs())
+                gkw.update(extra_gen or {})
+                out = self.model.generate(**kw, **gkw)
             finally:
                 # Xoá NGAY: batch là hằng số, nên một tensor sót lại từ batch
                 # trước có đúng số hàng của batch sau và phép kiểm shape KHÔNG
@@ -264,8 +295,9 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         # đầu bằng nguyên văn prompt và BLEU bị thổi lên; cắt khi lẽ ra không
         # thì mất phần đầu báo cáo. Nên KIỂM theo độ dài thay vì tin một bản.
         gen = out[:, in_len:] if out.shape[1] > in_len else out
-        return [t.strip() for t in
-                self.processor.batch_decode(gen, skip_special_tokens=True)]
+        with self._tok_lock:
+            texts = self.processor.batch_decode(gen, skip_special_tokens=True)
+        return [t.strip() for t in texts]
 
     def unload(self) -> None:
         self.branch = None

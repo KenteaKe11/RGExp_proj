@@ -46,7 +46,9 @@ data:
   train_split_csv: split_ref/train_split.csv
   n_train: 6400
   val_split_csv: split_ref/val_split.csv
-  n_val: 512
+  # HỒ val: 2000 mẫu được tải về và giữ trong cache. Mỗi lần eval bốc RANDOM
+  # `train.eval.n_samples` (256) trong hồ này — xem khối `train.eval`.
+  n_val: 2000
   assert_no_leak: true
 
 # ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
@@ -172,6 +174,29 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
+
+  # ── Đo trên val — CHỈ để nhìn, KHÔNG chạm vào trọng số ──────────────────
+  # Mỗi `every_steps` bước (và ở bước cuối), bốc NGẪU NHIÊN `n_samples` = 256
+  # trong `data.n_val` = 2000 mẫu val rồi tính CE trên đó. Không chọn
+  # checkpoint theo val, không early stop: bốn candidate vẫn chạy ĐÚNG một
+  # epoch với cùng lịch one-cycle như README chốt — val chỉ trả lời "candidate
+  # này có bắt đầu học thuộc tập train chưa".
+  #
+  # `resample: true` = bốc lại mỗi lần eval ("mỗi lần"), nên đường val hơi
+  # nhiễu: mỗi điểm đo trên một tập 256 khác nhau. Bù lại nó phủ hết 2000 mẫu
+  # sau vài lần đo thay vì nhìn mãi một góc.
+  #
+  # Tập 256 ấy KHÔNG phụ thuộc candidate: chỉ số được sinh từ (seed, số thứ tự
+  # lần eval) chứ không từ arm id, nên ở lần eval thứ k cả bốn candidate đo
+  # trên ĐÚNG cùng 256 mẫu và bốn đường val so được với nhau. Cũng vì thế nó
+  # tái lập được: chạy lại cùng seed cho đúng những tập ấy (`seed_mix` đổi số
+  # này nếu muốn một loạt tập khác).
+  eval:
+    enabled: true
+    n_samples: 256
+    every_steps: 25
+    resample: true
+    seed_mix: 0
   # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (1 epoch, không restart —
   # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
   # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
