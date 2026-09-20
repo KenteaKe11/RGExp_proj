@@ -120,8 +120,7 @@ def t_lr_asl_lambda_config():
     assert abs(float(p["weight_decay"]) - 0.2) < 1e-12
     assert float(CFG["recombiner"]["attn_lr_mult"]) == 3.0
     assert {k: float(v) for k, v in t["ft_lr"].items()} == {
-        "cls_head": 3e-5, "route_head": 6e-4, "dec_proj": 3e-4,
-        "recombinator_retriever": 3e-5, "recombinator_ffn": 3e-4}
+        "max_lr": 3e-4, "retriever_first": 1e-5}
     s = t["schedule"]
     assert "cycle_steps" not in s and "lr_decay" not in s, "decoder_ft: một chu kỳ"
     from src.backbone import cycle_endpoints
@@ -130,8 +129,8 @@ def t_lr_asl_lambda_config():
     assert int(s["round_down_sig"]) == 1
     ends = [cycle_endpoints(v, s["div_factor"], s["final_div_factor"], 1)
             for v in list(t["ft_lr"].values()) + [s["max_lr"]]]
-    assert (3e-6, 1e-7) in ends and (2e-5, 6e-7) in ends, ends
-    assert min(e for _, e in ends) == float(s["min_lr"]) == 3e-8
+    assert (3e-6, 1e-7) in ends and (1e-5, 3e-7) in ends, ends
+    assert min(e for _, e in ends) == float(s["min_lr"]) == 1e-8
     assert "pretrained_lr_div" not in t
     assert list(t["freeze_after_pretrain"] or []) == []
     assert "pretrained_lr_parts" not in t
@@ -141,7 +140,7 @@ def t_lr_asl_lambda_config():
     assert float(c["lambda"]) == 0.4
     assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 6400
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for s in ("attn_lr_mult", "train.ft_lr", "**3e-8**", "round_down_sig",
+    for s in ("attn_lr_mult", "train.ft_lr", "**1e-8**", "round_down_sig",
               "weight_decay: 0.2",
               "gamma_neg: [4.0, 2.0, 0.0]", "clip: 0.10", "classifier.lambda: 0.4",
               "6400 mẫu train"):
@@ -157,7 +156,7 @@ def t_stage0_schedule_encodes_min_lr():
     want = float(s["min_lr"])
     assert got[1] == want, (got, want)
     assert got == (4.8e-6, 4.8e-7), got       # = 0.8 × (6e-6, 6e-7) của lịch cũ
-    assert int(CFG["pretrain"]["n_epochs"]) == 5
+    assert int(CFG["pretrain"]["n_epochs"]) == 3
     assert "swa" not in CFG["pretrain"], "Stage 0 không còn SWA"
     lo, hi = CFG["pretrain"]["weight_decay_range"]
     assert lo <= float(CFG["pretrain"]["weight_decay"]) <= hi

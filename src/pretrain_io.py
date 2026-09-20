@@ -578,8 +578,9 @@ nạp sẽ tưởng Route Head đã được pretrain.
 | ASL | {meta.get("asl")} |
 | lịch | warm-up + cosine, restart mỗi epoch, lr_decay {(meta.get("schedule") or {}).get("lr_decay")} |
 
-Ở `decoder_ft`, lr của từng phần khai tường minh ở `train.ft_lr` (Recombinator
-tách hai nhóm Retriever / FFN), một chu kỳ one-cycle cho cả stage.
+Ở `decoder_ft`, lịch lr ở `train.ft_lr`: lr_max toàn hệ cho mọi nhóm nhánh,
+chỉ Retriever i=1..n tăng dần từ `retriever_first` lên lr_max; một chu kỳ
+one-cycle cho cả stage.
 
 ## Nạp lại
 

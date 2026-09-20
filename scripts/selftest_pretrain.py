@@ -12,8 +12,8 @@ Cái nó bảo vệ là bốn ca hỏng cho ra một lần chạy TRÔNG HOÀN T
      là ngẫu nhiên, còn META vẫn nói nó đã học.
 
   2. Nhóm learning-rate áp nhầm chỗ. Ở decoder_ft mỗi tham số nhánh phải rơi
-     vào ĐÚNG nhóm của `train.ft_lr` (cls_head / route_head / dec_proj 3e-4,
-     Attn 1e-4, phần còn lại của Recombinator 3e-5); ở Stage 0 Attn × 3. Áp
+     vào ĐÚNG nhóm của lịch `train.ft_lr` (mọi nhóm nhánh 3e-4, Retriever
+     i=1..n tăng dần 1e-5 -> 3e-4, Query theo Retriever 1); ở Stage 0 Attn × 3. Áp
      nhầm nghĩa là router học chậm, và bảng định tuyến sẽ đầy expert chết vì
      một lý do không liên quan tới MoE.
 
@@ -712,12 +712,16 @@ def ids_of(mod) -> set:
     return {id(p) for p in mod.parameters()}
 
 
-FT_LR = {"cls_head": 3e-5, "route_head": 6e-4, "dec_proj": 3e-4,
-         "recombinator_retriever": 3e-5, "recombinator_ffn": 3e-4}
+R2 = 1e-5 * 30 ** 0.5     # Retriever 2 = trung bình nhân của 1e-5 và 3e-4
+FT_CFG = {"max_lr": 3e-4, "retriever_first": 1e-5}
+FT_LR = {"cls_head": 3e-4, "route_head": 3e-4, "dec_proj": 3e-4,
+         "recombinator_ffn": 3e-4, "recombinator_retriever_1": 1e-5,
+         "recombinator_retriever_2": R2, "recombinator_retriever_3": 3e-4}
 LRS = {"main": 1e-4, "groups": dict(FT_LR), "attn_mult": 3.0,
-       "min_lr": 3e-8, "floor": 3e-8}
-FT_GROUPS = ["lora", "cls_head", "route_head", "dec_proj",
-             "recombinator_retriever", "recombinator_ffn"]
+       "min_lr": 1e-8, "floor": 1e-8}
+FT_GROUPS = ["lora", "cls_head", "route_head", "dec_proj", "recombinator_ffn",
+             "recombinator_retriever_1", "recombinator_retriever_2",
+             "recombinator_retriever_3"]
 
 
 def _close(a, b, msg=""):
@@ -797,8 +801,7 @@ def lr_tests() -> None:
         _close(by["lora"]["lr"], 1e-4, "adapter")
         for g, v in FT_LR.items():
             _close(by[g]["lr"], v, f"lr đỉnh {g}")
-    check("decoder_ft: gate 6e-4 · FFN/concat 3e-4 · LoRA 1e-4 · "
-          "Retriever/Cls 3e-5",
+    check("decoder_ft: nhánh 3e-4 · LoRA 1e-4 · Retriever 1e-5 -> 5.48e-5 -> 3e-4",
           t_ft_groups)
 
     def t_ft_membership():
@@ -810,12 +813,20 @@ def lr_tests() -> None:
         eq(by["cls_head"], ids_of(b.cls_head), "Sup Head = cả cls_head")
         eq(by["route_head"], ids_of(b.route_head))
         eq(by["dec_proj"], ids_of(b.dec_proj), "Concat Linear = dec_proj")
-        eq(by["recombinator_retriever"],
+        rets = list(b.recombinator.retrievers)
+        eq(len(rets), 3, "n = 3 Retriever")
+        for i, blk in enumerate(rets, start=1):
+            want = ids_of(blk) | ({id(b.recombinator.query)} if i == 1 else set())
+            eq(by[f"recombinator_retriever_{i}"], want,
+               f"Retriever {i}" + (" + Learnable Query" if i == 1 else ""))
+        eq(set().union(*(by[f"recombinator_retriever_{i}"] for i in (1, 2, 3))),
            {id(p) for p in b.recombinator.retriever_parameters()},
-           "Retriever = Learnable Query + mọi Information Retriever")
-        true(id(b.recombinator.query) in by["recombinator_retriever"],
-             "Learnable Query thuộc nhóm Retriever")
-        true(attn_ids(b) <= by["recombinator_retriever"], "Attn thuộc Retriever")
+           "ba nhóm Retriever = NGUYÊN bộ Retriever")
+        eq(T._branch_group("recombinator.retrievers.0.attn.q_proj.weight"),
+           "recombinator_retriever_1")
+        eq(T._branch_group("recombinator.retrievers.2.mlp.0.weight"),
+           "recombinator_retriever_3")
+        eq(T._branch_group("recombinator.query"), "recombinator_retriever_1")
         eq(by["recombinator_ffn"], ids_of(b.recombinator.ffn))
         allp = [x for n in FT_GROUPS[1:] for x in by[n]]
         eq(len(allp), len(set(allp)), "không tham số nào ở hai nhóm")
@@ -834,13 +845,32 @@ def lr_tests() -> None:
         cfg = load_config()
         l = T.ft_lrs(cfg)
         _close(l["main"], 1e-4, "adapter")
+        eq(l["n_retrievers"], 3)
         eq(l["endpoints"]["adapter"], (3e-6, 1e-7), "LoRA làm tròn xuống")
-        eq(l["endpoints"]["route_head"], (2e-5, 6e-7))
+        eq(l["endpoints"]["route_head"], (1e-5, 3e-7))
         eq(l["endpoints"]["recombinator_ffn"], (1e-5, 3e-7))
-        eq(l["endpoints"]["recombinator_retriever"], (1e-6, 3e-8))
+        eq(l["endpoints"]["recombinator_retriever_1"], (3e-7, 1e-8))
+        eq(l["endpoints"]["recombinator_retriever_2"], (1e-6, 5e-8))
+        eq(l["endpoints"]["recombinator_retriever_3"], (1e-5, 3e-7))
+        eq(list(l["groups"]), FT_GROUPS[1:], "thứ tự nhóm")
         for g, v in FT_LR.items():
-            _close(l["groups"][g], v, f"config ft_lr.{g}")
-        _close(l["floor"], 3e-8, "đáy nhỏ nhất = 3e-5 / (30 × 33.3)")
+            _close(l["groups"][g], v, f"lr đỉnh {g}")
+        eq(l["groups"]["recombinator_retriever_1"], 1e-5, "i=1 ĐÚNG 1e-5")
+        eq(l["groups"]["recombinator_retriever_3"], 3e-4, "i=n ĐÚNG lr_max")
+        _close(l["floor"], 1e-8, "đáy nhỏ nhất = 1e-5 / (30 × 33.3)")
+        # ramp: tăng dần, i=1 / i=n cố định với mọi n
+        for n in (2, 3, 4, 6):
+            r = T.retriever_lr_ramp(1e-5, 3e-4, n)
+            eq((r[0], r[-1]), (1e-5, 3e-4), f"hai đầu mút, n={n}")
+            true(all(a < b for a, b in zip(r, r[1:])), f"tăng dần, n={n}")
+            for a, b, c in zip(r, r[1:], r[2:]):
+                _close(b * b, a * c, f"cấp số nhân, n={n}")
+        raises(TrainUnusable, lambda: T.retriever_lr_ramp(1e-5, 3e-4, 1),
+               "n=1 không có lịch i=1..n")
+        l4 = T.ft_lrs(cfg, dict(cfg["recombiner"], retriever=dict(
+            cfg["recombiner"]["retriever"], n_blocks=4)))
+        eq(l4["n_retrievers"], 4)
+        eq(l4["groups"]["recombinator_retriever_4"], 3e-4)
         sch = cfg["train"]["schedule"]
         true("cycle_steps" not in sch and "lr_decay" not in sch,
              "decoder_ft: MỘT chu kỳ, không restart")
@@ -851,10 +881,12 @@ def lr_tests() -> None:
             mut(c)
             raises(TrainUnusable, lambda: T.ft_lrs(c), msg)
 
-        bad(lambda c: c["train"]["ft_lr"].pop("dec_proj"), "thiếu nhóm")
-        bad(lambda c: c["train"]["ft_lr"].__setitem__("x", 1e-4), "thừa nhóm")
-        bad(lambda c: c["train"]["ft_lr"].__setitem__("recombinator_ffn", 0.0),
-            "lr 0")
+        bad(lambda c: c["train"]["ft_lr"].pop("retriever_first"), "thiếu khoá")
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("cls_head", 3e-5),
+            "khoá lr từng nhóm cũ")
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("max_lr", 0.0), "lr 0")
+        bad(lambda c: c["train"]["ft_lr"].__setitem__("retriever_first", 1e-3),
+            "i=1 > lr_max")
         bad(lambda c: c["train"]["schedule"].__setitem__("min_lr", 1e-6),
             "min_lr lệch đáy thật")
         bad(lambda c: c["train"]["schedule"].__setitem__("cycle_steps", 10),
@@ -863,7 +895,7 @@ def lr_tests() -> None:
             "khoá đã bỏ")
         bad(lambda c: c["recombiner"].__setitem__("attn_lr_mult", 0.9),
             "attn < 1")
-    check("ft_lrs đọc config: ft_lr, đáy 3e-8, khoá sai -> DỪNG",
+    check("ft_lrs đọc config: lr_max 3e-4, Retriever tăng dần, đáy 1e-8, khoá sai -> DỪNG",
           t_ft_lrs_from_cfg)
 
     def t_round_down():
@@ -901,16 +933,20 @@ def lr_tests() -> None:
             sch.step()
             seen.append({g["name"]: g["lr"] for g in opt.param_groups})
         for row in seen:
-            _close(row["route_head"] / row["recombinator_retriever"], 20.0,
-                   "tỉ lệ gate/Retriever")
-            _close(row["recombinator_ffn"] / row["recombinator_retriever"], 10.0,
-                   "tỉ lệ FFN/Retriever")
-        want0 = {"lora": 3e-6, "cls_head": 1e-6, "route_head": 2e-5,
-                 "dec_proj": 1e-5, "recombinator_retriever": 1e-6,
-                 "recombinator_ffn": 1e-5}
-        want_end = {"lora": 1e-7, "cls_head": 3e-8, "route_head": 6e-7,
-                    "dec_proj": 3e-7, "recombinator_retriever": 3e-8,
-                    "recombinator_ffn": 3e-7}
+            true(row["recombinator_retriever_1"] < row["recombinator_retriever_2"]
+                 < row["recombinator_retriever_3"], "Retriever tăng dần theo i")
+            _close(row["recombinator_ffn"], row["recombinator_retriever_3"],
+                   "Retriever n = lr_max toàn hệ")
+        want0 = {"lora": 3e-6, "cls_head": 1e-5, "route_head": 1e-5,
+                 "dec_proj": 1e-5, "recombinator_ffn": 1e-5,
+                 "recombinator_retriever_1": 3e-7,
+                 "recombinator_retriever_2": 1e-6,
+                 "recombinator_retriever_3": 1e-5}
+        want_end = {"lora": 1e-7, "cls_head": 3e-7, "route_head": 3e-7,
+                    "dec_proj": 3e-7, "recombinator_ffn": 3e-7,
+                    "recombinator_retriever_1": 1e-8,
+                    "recombinator_retriever_2": 5e-8,
+                    "recombinator_retriever_3": 3e-7}
         for g in want0:
             true(abs(seen[0][g] - want0[g]) < 1e-9 * want0[g],
                  f"đầu warm-up {g}: {seen[0][g]!r} != {want0[g]}")
@@ -921,7 +957,7 @@ def lr_tests() -> None:
         true(all(seen[i + 1]["route_head"] <= seen[i]["route_head"] + 1e-15
                  for i in range(peak, total - 1)),
              "sau đỉnh lr chỉ giảm — không restart")
-    check("one-cycle cho cả stage: đầu/đáy làm tròn, không restart, đáy 3e-8",
+    check("one-cycle cho cả stage: đầu/đáy làm tròn, không restart, đáy 1e-8",
           t_one_cycle_whole_stage)
 
 
@@ -944,7 +980,7 @@ def freeze_ft_tests() -> None:
         eq(float(tc["pretrained_lr_mult"]), 0.1, "pretrained_lr_mult sau pretrain")
         for k in ("pretrained_lr_parts", "pretrained_lr_div"):
             true(k not in tc, f"train.{k} đã bỏ")
-        eq({k: float(v) for k, v in tc["ft_lr"].items()}, FT_LR)
+        eq({k: float(v) for k, v in tc["ft_lr"].items()}, FT_CFG)
         eq(list(tc["freeze_after_pretrain"]), [],
            "decoder_ft không đóng băng gì")
         eq(bool(tc.get("freeze_pretrained", False)), False)

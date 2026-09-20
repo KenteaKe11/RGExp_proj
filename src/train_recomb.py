@@ -57,6 +57,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -386,18 +387,42 @@ FREEZABLE_PARTS: dict = {
     "cls_head.main_head": lambda b: b.cls_head.head.main_head_modules(),
 }
 DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ()
-# lr đỉnh TỪNG NHÓM của nhánh ở decoder_ft — `train.ft_lr`. Thứ tự = thứ tự
-# nhóm trong optimizer (sau adapter). Mỗi tham số của nhánh rơi vào ĐÚNG một
-# nhóm; Recombinator tách theo hai khối: NGUYÊN bộ Retriever (Learnable Query +
-# mọi Information Retriever) / FFN.
-FT_LR_GROUPS: tuple[str, ...] = ("cls_head", "route_head", "dec_proj",
-                                 "recombinator_retriever", "recombinator_ffn")
-# Tiền tố tham số (theo `branch.named_parameters()`) -> nhóm của Recombinator.
-RECOMB_LR_PREFIX: dict = {
-    "recombinator.query": "recombinator_retriever",
-    "recombinator.retrievers.": "recombinator_retriever",
-    "recombinator.ffn.": "recombinator_ffn",
-}
+# Lịch lr decoder_ft — `train.ft_lr`, ĐƠN GIẢN:
+#   * `max_lr` (3e-4) = lr_max TOÀN HỆ: cls_head · route_head · dec_proj ·
+#     recombinator_ffn · Retriever n. Adapter (LoRA/Experts) riêng ở
+#     `train.schedule.max_lr` (1e-4).
+#   * lr_max CHỈ thay đổi theo chỉ số Retriever i = 1..n, TĂNG DẦN theo cấp số
+#     nhân: i=1 -> `retriever_first` (1e-5), i=n -> `max_lr`.
+#     Learnable Query đi cùng Retriever 1. Không có hệ số Attn riêng.
+FT_LR_KEYS: tuple[str, ...] = ("max_lr", "retriever_first")
+# Nhóm ở lr_max toàn hệ. Thứ tự = thứ tự nhóm trong optimizer (sau adapter),
+# rồi tới recombinator_retriever_1..n.
+FT_LR_FLAT_GROUPS: tuple[str, ...] = ("cls_head", "route_head", "dec_proj",
+                                      "recombinator_ffn")
+RETRIEVER_GROUP = "recombinator_retriever_{i}"      # i đếm từ 1
+
+
+def retriever_lr_ramp(first: float, peak: float, n: int) -> list[float]:
+    """lr đỉnh của Retriever 1..n: cấp số nhân từ `first` (i=1) tới `peak` (i=n).
+
+    lr_i = first · (peak / first) ** ((i - 1) / (n - 1)). n = 3, 1e-5 -> 3e-4:
+    1e-5 · 5.48e-5 · 3e-4. Hai đầu mút gán ĐÚNG giá trị khai (không qua pow)
+    để không lệch vì sai số dấu phẩy động.
+    """
+    n = int(n)
+    if n < 2:
+        raise TrainUnusable(
+            f"recombiner.retriever.n_blocks = {n} — lịch lr Retriever cần n >= 2 "
+            f"(i=1 ở `train.ft_lr.retriever_first`, i=n ở `train.ft_lr.max_lr`).")
+    first, peak = float(first), float(peak)
+    out = [first * (peak / first) ** ((i - 1) / (n - 1)) for i in range(1, n + 1)]
+    out[0], out[-1] = first, peak
+    return out
+
+
+def ft_group_names(n_retrievers: int) -> tuple[str, ...]:
+    return FT_LR_FLAT_GROUPS + tuple(
+        RETRIEVER_GROUP.format(i=i) for i in range(1, int(n_retrievers) + 1))
 
 
 def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
@@ -432,21 +457,23 @@ def frozen_after_pretrain(tcfg: dict) -> tuple[str, ...]:
 def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
     """lr đỉnh của main-stage + phép kiểm lịch one-cycle.
 
-    -> {"main", "groups", "attn_mult", "min_lr", "floor"}
+    -> {"main", "groups", "attn_mult", "min_lr", "floor", "endpoints",
+        "n_retrievers"}
 
       * `main`   = `train.schedule.max_lr` (1e-4) — adapter/Experts
                    (cả hai chế độ) và
                    toàn bộ nhánh ở chế độ scratch (Attn × `attn_lr_mult`).
-      * `groups` = `train.ft_lr` — lr đỉnh từng nhóm của nhánh ở decoder_ft:
-                   cls_head 3e-5 · route_head (MLP gate) 6e-4 · dec_proj 3e-4 ·
-                   recombinator_retriever 3e-5 · recombinator_ffn 3e-4.
+      * `groups` = lr đỉnh từng nhóm của nhánh ở decoder_ft, dựng từ
+                   `train.ft_lr`: cls_head · route_head · dec_proj ·
+                   recombinator_ffn ở `max_lr` (3e-4); recombinator_retriever_i
+                   tăng dần theo cấp số nhân 1e-5 (i=1, + Learnable Query) ->
+                   3e-4 (i=n). `attn_lr_mult` KHÔNG áp ở decoder_ft.
 
     MỘT chu kỳ one-cycle cho CẢ stage (không restart): `train.schedule` không
     được khai `cycle_steps`/`lr_decay`. LambdaLR nhân cùng một hệ số vào mọi
     nhóm, nên đáy của nhóm nhỏ nhất = min(lr đỉnh) / (div × final_div) — con
-    số ấy phải bằng `train.schedule.min_lr` (3e-8), cùng kiểu kiểm với Stage 0.
-    `round_down_sig: 1` làm tròn xuống đầu warm-up và đáy từng nhóm
-    (1e-4 -> 3e-6 / 1e-7 thay vì 3.33e-6 / 1.001e-7).
+    số ấy phải bằng `train.schedule.min_lr` (1e-8), cùng kiểu kiểm với Stage 0.
+    `round_down_sig: 1` làm tròn xuống đầu warm-up và đáy từng nhóm.
     """
     tcfg = dict(cfg.get("train", {}) or {})
     sch = dict(tcfg.get("schedule", {}) or {})
@@ -459,22 +486,33 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
     for k in ("pretrained_lr_div", "pretrained_lr_parts"):
         if k in tcfg:
             raise TrainUnusable(
-                f"train.{k} đã BỎ — lr decoder_ft nay khai tường minh ở "
-                f"`train.ft_lr`. Xoá khoá này.")
+                f"train.{k} đã BỎ — lr decoder_ft nay khai ở `train.ft_lr`. "
+                f"Xoá khoá này.")
     raw = dict(tcfg.get("ft_lr", {}) or {})
-    missing = [g for g in FT_LR_GROUPS if g not in raw]
-    extra = [g for g in raw if g not in FT_LR_GROUPS]
+    missing = [k for k in FT_LR_KEYS if k not in raw]
+    extra = [k for k in raw if k not in FT_LR_KEYS]
     if missing or extra:
         raise TrainUnusable(
-            f"train.ft_lr phải khai ĐÚNG {list(FT_LR_GROUPS)} "
-            f"(thiếu {missing}, thừa {extra}).")
-    groups = {g: float(raw[g]) for g in FT_LR_GROUPS}
-    bad = {g: v for g, v in groups.items() if not (v > 0 and math.isfinite(v))}
+            f"train.ft_lr phải khai ĐÚNG {list(FT_LR_KEYS)} "
+            f"(thiếu {missing}, thừa {extra}). Lịch cũ khai lr từng nhóm đã bỏ: "
+            f"mọi nhóm nhánh chạy `max_lr`, chỉ Retriever i=1..n tăng dần từ "
+            f"`retriever_first` lên `max_lr`.")
+    peak, first = float(raw["max_lr"]), float(raw["retriever_first"])
+    bad = {k: v for k, v in (("max_lr", peak), ("retriever_first", first))
+           if not (v > 0 and math.isfinite(v))}
     if bad or not (main > 0):
         raise TrainUnusable(f"lr phải > 0: {bad or {'schedule.max_lr': main}}")
+    if first > peak:
+        raise TrainUnusable(
+            f"train.ft_lr.retriever_first = {first:g} > max_lr = {peak:g} — lr "
+            f"Retriever phải TĂNG dần theo i.")
+    r = rcfg if rcfg is not None else dict(cfg.get("recombiner", {}) or {})
+    n_ret = int(dict(r.get("retriever", {}) or {}).get("n_blocks", 3))
+    ramp = retriever_lr_ramp(first, peak, n_ret)
+    groups = {g: peak for g in FT_LR_FLAT_GROUPS}
+    groups.update({RETRIEVER_GROUP.format(i=i + 1): v for i, v in enumerate(ramp)})
     try:
-        amult = recombiner.attn_lr_mult(
-            rcfg if rcfg is not None else dict(cfg.get("recombiner", {}) or {}))
+        amult = recombiner.attn_lr_mult(r)
     except ValueError as e:
         raise TrainUnusable(str(e)) from None
     div = float(sch.get("div_factor", 25.0))
@@ -492,7 +530,8 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
             f"div_factor/final_div_factor hoặc min_lr cho khớp.")
     return {"main": main, "groups": groups, "attn_mult": amult,
             "min_lr": None if min_lr is None else float(min_lr), "floor": floor,
-            "endpoints": ends}
+            "endpoints": ends, "n_retrievers": n_ret,
+            "ft_lr": {"max_lr": peak, "retriever_first": first}}
 
 
 def learning_pretrained_parts(branch) -> list[str]:
@@ -531,17 +570,26 @@ def apply_freeze(branch, names) -> int:
 
 # ══ Optimizer ═══════════════════════════════════════════════════════════════
 def _branch_group(name: str) -> str:
-    """Tên tham số của nhánh -> khoá trong `train.ft_lr`."""
+    """Tên tham số của nhánh -> nhóm lr của decoder_ft.
+
+    `recombinator.query` -> Retriever 1; `recombinator.retrievers.<k>.` ->
+    Retriever k+1; `recombinator.ffn.` -> recombinator_ffn.
+    """
     top = name.split(".", 1)[0]
     if top == "recombinator":
-        for pre, g in RECOMB_LR_PREFIX.items():
-            if name.startswith(pre):
-                return g
+        if name == "recombinator.query" or name.startswith("recombinator.query."):
+            return RETRIEVER_GROUP.format(i=1)
+        m = re.match(r"recombinator\.retrievers\.(\d+)\.", name)
+        if m:
+            return RETRIEVER_GROUP.format(i=int(m.group(1)) + 1)
+        if name.startswith("recombinator.ffn."):
+            return "recombinator_ffn"
     if top in ("cls_head", "route_head", "dec_proj"):
         return top
     raise TrainUnusable(
         f"tham số nhánh `{name}` không thuộc nhóm lr nào của decoder_ft "
-        f"({list(FT_LR_GROUPS)}). Khối mới phải được khai vào `train.ft_lr`.")
+        f"({list(FT_LR_FLAT_GROUPS)} + {RETRIEVER_GROUP.format(i='i')}). "
+        f"Khối mới phải được gán nhóm ở `_branch_group`.")
 
 
 def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
@@ -549,13 +597,13 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     """AdamW. Nhóm (bỏ nhóm rỗng), theo thứ tự:
 
       decoder_ft: lora|experts @main · cls_head · route_head · dec_proj ·
-                  recombinator_retriever · recombinator_ffn
-                  (lr đỉnh từ `train.ft_lr`)
+                  recombinator_ffn · recombinator_retriever_1..n
+                  (lr đỉnh dựng từ `train.ft_lr`, xem `ft_lrs`)
       scratch   : lora|experts @main · branch @main · branch_attn @main×attn_mult
 
-    Mặc định (config hiện tại): adapter 1e-4 · cls_head 3e-5 · route_head
-    (MLP gate) 6e-4 · dec_proj 3e-4 · Retriever 3e-5 · FFN 3e-4.
-    Không đóng băng gì.
+    Mặc định (config hiện tại): adapter 1e-4 · cls_head / route_head /
+    dec_proj / FFN 3e-4 · Retriever 1 (+ Learnable Query) 1e-5 · Retriever 2
+    5.48e-5 · Retriever 3 3e-4. Không đóng băng gì.
 
     Adapter luôn đứng ĐẦU: log đọc `param_groups[0]["lr"]` làm lr chính. Một
     LambdaLR one-cycle nhân cùng một hệ số vào mọi nhóm, nên tỉ lệ giữa các
@@ -579,12 +627,18 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
     groups = [{"params": lora, "lr": lr, "weight_decay": wd,
                "name": str(adapter_group)}]
     if from_pretrain:
-        by: dict[str, list] = {g: [] for g in FT_LR_GROUPS}
+        by: dict[str, list] = {g: [] for g in lrs["groups"]}
         if branch is not None:
             for n, p in branch.named_parameters():
                 if p.requires_grad:
-                    by[_branch_group(n)].append(p)
-        for g in FT_LR_GROUPS:
+                    g = _branch_group(n)
+                    if g not in by:
+                        raise TrainUnusable(
+                            f"`{n}` thuộc nhóm {g} nhưng lịch lr chỉ dựng "
+                            f"{list(by)} — recombiner.retriever.n_blocks của "
+                            f"nhánh khác của config.")
+                    by[g].append(p)
+        for g in lrs["groups"]:
             groups.append({"params": by[g], "lr": float(lrs["groups"][g]),
                            "weight_decay": bwd, "name": g})
     else:
@@ -1153,7 +1207,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "pretrain_report": pre_report,
         "param_group_max_lr": lr_by_group,
         "attn_lr_mult": (None if pre_src else lrs["attn_mult"]),
-        "ft_lr": (dict(lrs["groups"]) if pre_src else None),
+        "ft_lr": (dict(lrs["ft_lr"]) if pre_src else None),
         "min_lr": lrs["floor"],
         "lr_curve_start_peak_end": curve,
         "freeze_pretrained": (bool(tcfg.get("freeze_pretrained", False))

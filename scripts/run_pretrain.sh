@@ -59,17 +59,18 @@
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
 # Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
 #
-# Stage 0: 5 epoch, KHÔNG SWA (ckpt/latest = epoch cuối).
+# Stage 0: 3 epoch, KHÔNG SWA (ckpt/latest = epoch cuối).
 # lr Stage 0: 4.8e-6 -> 1.6e-4 -> 4.8e-7 mỗi epoch, weight_decay 0.2; ma trận Attn (Q/K/V/O,
 # GQA của mọi Information Retriever) của Recombinator luôn × 3 (`recombiner.attn_lr_mult`) -> 4.8e-4. Ckpt dở dang ghi
 # bằng optimizer một nhóm KHÔNG nối tiếp được: chạy với --no-resume.
 # Sup Loss: ASL gamma_neg [4, 2, 0] (neg/pos/uncertain) · gamma_pos 0 · clip
 # 0.10. META + model card ghi lại lr từng nhóm, attn_lr_mult, wd và ASL.
 #
-# `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ, lr đỉnh `train.ft_lr`:
-# MLP gate (Route Head) 6e-4 · FFN / Concat Linear 3e-4 · Experts (LoRA) 1e-4 ·
-# Retriever (Learnable Query + Information Retriever×3) / Sup Head 3e-5. MỘT chu kỳ one-cycle cho cả stage (div 30 ·
-# final_div 33.3), đáy nhỏ nhất 3e-8. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
+# `decoder_ft` KHÔNG đóng băng — fine-tune toàn bộ, lịch lr `train.ft_lr`:
+# lr_max toàn hệ 3e-4 (Sup Head · Route Head · Concat Linear · FFN) · Experts
+# (LoRA) 1e-4 · Retriever i=1..3 tăng dần 1e-5 · 5.48e-5 · 3e-4 (Learnable Query
+# theo Retriever 1). MỘT chu kỳ one-cycle cho cả stage (div 30 ·
+# final_div 33.3), đáy nhỏ nhất 1e-8. Hai giai đoạn làm tròn xuống đầu warm-up + đáy còn 1 chữ số
 # có nghĩa (`round_down_sig: 1`: 6.67e-7 -> 6e-7, 3.33e-7 -> 3e-7). λ = 0.4, warmup tắt — vốn chỉ có lý do khi ClsHead còn ngẫu
 # nhiên. Làm lại decoder_ft từ đầu:
 #     bash scripts/run_section25.sh --no-resume

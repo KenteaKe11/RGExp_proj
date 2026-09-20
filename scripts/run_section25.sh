@@ -31,7 +31,7 @@
 # config. Hai baseline tự chạy nó bên trong `train_sota` (CNN đóng băng, phần
 # ngôn ngữ học trước). My Gemma thì NẠP từ `sup_pretrain` — mục ấy có điểm vào
 # riêng vì nó chạy trên TOÀN BỘ train split, và gộp vào đây nghĩa là mỗi lần
-# chạy lại §2.5 để in một bảng cũng kéo theo 5 epoch pretrain.
+# chạy lại §2.5 để in một bảng cũng kéo theo 3 epoch pretrain.
 #
 # Thiếu checkpoint ấy là DỪNG với mã 9, không phải chạy tiếp với nhánh ngẫu
 # nhiên. Muốn cố ý chạy không pretrain thì phải NÓI RA: `--init-from none`.

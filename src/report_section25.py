@@ -253,7 +253,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                 L.append("")
             if st.get("train_mode") == "decoder_ft":
                 mn = st.get("min_lr")
-                L.append(f"lr đỉnh theo `train.ft_lr`, MỘT chu kỳ one-cycle cho "
+                L.append(f"lịch lr `train.ft_lr` (lr_max toàn hệ, Retriever "
+                         f"i=1..n tăng dần), MỘT chu kỳ one-cycle cho "
                          f"cả stage ({st.get('steps', '—')} bước), đáy nhỏ nhất "
                          f"{'—' if mn is None else format(float(mn), '.1e')}; "
                          f"đóng băng: "

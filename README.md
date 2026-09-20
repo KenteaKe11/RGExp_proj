@@ -91,18 +91,24 @@ gì** — fine-tune toàn bộ (`train.freeze_after_pretrain: []`).
 
 lr đỉnh:
 
+decoder_ft dùng lịch lr đơn giản (`train.ft_lr`): lr_max toàn hệ
+`max_lr: 3e-4` (LoRA giữ 1e-4); lr_max **chỉ** đổi theo Retriever i = 1..n,
+tăng dần theo cấp số nhân từ `retriever_first: 1e-5` (i=1) tới lr_max (i=n).
+
 | nhóm | Stage 0 | decoder_ft (`train.ft_lr`) |
 |---|---|---|
-| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-5** |
-| MLP gate — Route Head (`route_head`) | — | **6e-4** |
+| Sup Head (`cls_head`: Pooling Stack + Main Head) | 1.6e-4 | **3e-4** |
+| MLP gate — Route Head (`route_head`) | — | **3e-4** |
 | Concat Linear (`dec_proj`, 256 → 128 GELU → 64 token) | — | **3e-4** |
-| Retriever (`recombinator_retriever`: Learnable Query + Information Retriever ×3) | 1.6e-4 (Attn Q/K/V/O × 3 = **4.8e-4**) | **3e-5** |
+| Retriever 1 + Learnable Query (`recombinator_retriever_1`) | 1.6e-4 (Attn Q/K/V/O × 3 = **4.8e-4**) | **1e-5** |
+| Retriever 2 (`recombinator_retriever_2`) | 1.6e-4 (Attn × 3) | **5.48e-5** |
+| Retriever 3 = n (`recombinator_retriever_3`) | 1.6e-4 (Attn × 3) | **3e-4** |
 | FFN của Recombinator (`recombinator_ffn`) | 1.6e-4 | **3e-4** |
 | Experts (LoRA) | — | **1e-4** (`train.schedule.max_lr`) |
 
-Stage 0: **5 epoch**, warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`,
+Stage 0: **3 epoch**, warm-up + cosine restart mỗi epoch, `weight_decay: 0.2`,
 hệ số Attn `recombiner.attn_lr_mult: 3`, **không SWA** — `ckpt/latest` (thứ
-decoder_ft nạp và được đẩy Hub) là trọng số của epoch cuối. decoder_ft: **một** chu kỳ one-cycle cho toàn bộ
+decoder_ft nạp và được đẩy Hub) là trọng số của epoch cuối. decoder_ft: **1 epoch**, **một** chu kỳ one-cycle cho toàn bộ
 stage (không restart) để mọi nhóm cùng hội tụ.
 
 Stage 0 dùng `div_factor` 33.3333 · `final_div_factor` 10; decoder_ft dùng
@@ -114,12 +120,12 @@ và đáy của từng nhóm được **làm tròn xuống** (decoder_ft: 1 ch�
 |---|---|---|---|
 | Stage 0 · Recombinator + cls_head | 4.8e-6 | 1.6e-4 | 4.8e-7 |
 | Stage 0 · Attn | 1.4e-5 (1.44e-5) | 4.8e-4 | 1.4e-6 (1.44e-6) |
-| decoder_ft · MLP gate (Route Head) | 2e-5 | 6e-4 | 6e-7 |
-| decoder_ft · FFN / Concat Linear | 1e-5 | 3e-4 | 3e-7 |
+| decoder_ft · Sup Head / Route Head / Concat Linear / FFN / Retriever 3 | 1e-5 | 3e-4 | 3e-7 |
 | decoder_ft · LoRA | 3e-6 (3.33e-6) | 1e-4 | 1e-7 (1.001e-7) |
-| decoder_ft · Retriever / Sup Head | 1e-6 | 3e-5 | **3e-8** (3.003e-8) |
+| decoder_ft · Retriever 2 | 1e-6 (1.83e-6) | 5.48e-5 | 5e-8 (5.48e-8) |
+| decoder_ft · Retriever 1 + Learnable Query | 3e-7 (3.33e-7) | 1e-5 | **1e-8** (1.001e-8) |
 
-Đáy nhỏ nhất của decoder_ft là **3e-8** (`train.schedule.min_lr`, được kiểm).
+Đáy nhỏ nhất của decoder_ft là **1e-8** (`train.schedule.min_lr`, được kiểm).
 Stage 0 của R2Gen/AdaAtt đọc cùng khối `pretrain.schedule` nên cùng quy tắc
 làm tròn.
 
@@ -182,9 +188,8 @@ dưới đây là chỗ điều đó được cài đặt chứ không phải ch
 5. **Có một kiến trúc pretrain cục bộ ⇒ tất cả pretrain cục bộ**, cùng một
    config Stage 0; main-stage dùng lr **1/10** cho phần đã pretrain
    (`train.pretrained_lr_mult: 0.1`) — áp cho R2Gen/AdaAtt. Riêng My Gemma
-   fine-tune toàn bộ, không đóng băng, lr từng nhóm theo `train.ft_lr`
-   (Local/Global/Sup Head 3e-5, LoRA 1e-4, FFN và Concat Linear 3e-4,
-   MLP gate 6e-4).
+   fine-tune toàn bộ, không đóng băng, lịch lr `train.ft_lr`: lr_max toàn
+   hệ 3e-4, LoRA 1e-4, Retriever i=1..n tăng dần 1e-5 -> 3e-4.
 
 Cả ba candidate sinh bằng **một đặc tả giải mã** — khối `generate:`
 (`src/decoding_spec.py`): beam search `num_beams: 3`, `length_penalty: 1.0`,
@@ -218,7 +223,7 @@ python -m src.config                         # in cấu hình §2.5 đã giải 
 python -m src.labels_cls --check-split       # dò nhãn, ~30 giây
 
 bash scripts/run_pretrain.sh --dry-run       # Stage 0: thử đường ống
-bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 5 epoch
+bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 3 epoch
 
 bash scripts/run_section25.sh --dry-run      # §2.5: thử đường ống
 bash scripts/run_section25.sh --detach       # §2.5: chạy thật

@@ -43,9 +43,9 @@
 #     (`train.pretrained_lr_mult: 0.1`).
 #     Riêng My Gemma: Stage 0 cho ma trận Attn của Recombinator chạy lr × 3
 #     (`recombiner.attn_lr_mult`). decoder_ft KHÔNG đóng băng, fine-tune toàn
-#     bộ với lr đỉnh khai tường minh từng nhóm (`train.ft_lr`): Sup Head,
-#     Route Head, Concat Linear 3e-4 · Attn 1e-4 · phần còn lại của
-#     Recombinator 3e-5 — MỘT chu kỳ one-cycle cho cả stage, đáy 1e-7.
+#     bộ theo lịch lr đơn giản (`train.ft_lr`): lr_max toàn hệ 3e-4 cho mọi
+#     nhóm nhánh, LoRA 1e-4, chỉ Retriever i=1..n tăng dần 1e-5 -> 3e-4 —
+#     MỘT chu kỳ one-cycle cho cả stage, đáy 1e-8.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -366,7 +366,7 @@ lora:
     qdora_r32: {method: qdora, rank: 32}
 
 train:
-  n_epochs: 2
+  n_epochs: 1   # decoder_ft: 1 epoch
   per_device_batch_size: 1
   grad_accum: 32
   max_seq_len: 1024
@@ -374,28 +374,29 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
-  # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (mọi epoch, không restart —
+  # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (1 epoch, không restart —
   # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
   # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
   # rồi đầu warm-up và đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa
   # (`round_down_sig: 1`):
   #
-  #     nhóm                                    đầu      đỉnh     đáy
-  #     route_head (MLP gate)                   2e-5  -> 6e-4  -> 6e-7
-  #     recombinator_ffn / dec_proj             1e-5  -> 3e-4  -> 3e-7
-  #     adapter (LoRA/Experts)                  3e-6  -> 1e-4  -> 1e-7   (3.33.. -> 3)
-  #     recombinator_retriever · cls_head       1e-6  -> 3e-5  -> 3e-8   <- đáy nhỏ nhất
+  #     nhóm                                    đầu      đỉnh      đáy
+  #     cls_head · route_head · dec_proj · FFN  1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_3 (i = n)        1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_2                1e-6  -> 5.48e-5 -> 5e-8
+  #     adapter (LoRA/Experts)                  3e-6  -> 1e-4   -> 1e-7
+  #     recombinator_retriever_1 (+ Query)      3e-7  -> 1e-5   -> 1e-8  <- đáy nhỏ nhất
   #
   # `min_lr` là con số ĐƯỢC KIỂM (`train_recomb.ft_lrs` DỪNG nếu lệch), không
   # phải con số được đọc.
   schedule:
     impl: lambda
     max_lr: 1.0e-4          # adapter / Experts (LoRA)
-    min_lr: 3.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất
+    min_lr: 1.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất (Retriever 1)
     round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
     pct_start: 0.1
     div_factor: 30.0
-    final_div_factor: 33.3  # 3e-5 / 30 / 33.3 = 3.003e-8 -> làm tròn 3e-8
+    final_div_factor: 33.3  # 1e-5 / 30 / 33.3 = 1.001e-8 -> làm tròn 1e-8
     anneal: cos
     cycle_momentum: false
   branch_weight_decay: 0.01
@@ -403,15 +404,16 @@ train:
   # ĐIỀU KIỆN 5 — CHỈ cho R2Gen/AdaAtt (`src/train_sota.py`): phần đã pretrain
   # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
   pretrained_lr_mult: 0.1
-  # My Gemma · decoder_ft — lr ĐỈNH từng nhóm của nhánh
-  # (`train_recomb.build_optimizer`; adapter/Experts ở `schedule.max_lr`).
-  # Phải khai ĐỦ năm khoá, mỗi tham số nhánh thuộc đúng một nhóm.
+  # My Gemma · decoder_ft — lịch lr ĐƠN GIẢN (`train_recomb.ft_lrs`):
+  #   1. lr_max toàn hệ = `max_lr` (3e-4): Sup Head, Route Head, Concat Linear,
+  #      FFN của Recombinator và Retriever n. LoRA/Experts ở `schedule.max_lr`.
+  #   2. lr_max CHỈ đổi theo Retriever i = 1..n, tăng dần theo cấp số nhân:
+  #      i=1 = `retriever_first` (1e-5, kèm Learnable Query), i=n = `max_lr`.
+  #      n = 3: 1e-5 · 5.48e-5 · 3e-4. Không có hệ số Attn ở decoder_ft.
+  # Phải khai ĐÚNG hai khoá.
   ft_lr:
-    cls_head: 3.0e-5             # Sup Head: Pooling Stack + Main Head
-    route_head: 6.0e-4           # MLP gate: Route Head (+ noise_proj) -> Top-k Gate
-    dec_proj: 3.0e-4             # Concat Linear 256 -> 128 (GELU) -> 64 token vào decoder
-    recombinator_retriever: 3.0e-5  # NGUYÊN bộ Retriever: Learnable Query + Information Retriever ×3
-    recombinator_ffn: 3.0e-4     # FFN 1152 -> 2560 -> 2560
+    max_lr: 3.0e-4               # lr_max toàn hệ
+    retriever_first: 1.0e-5      # Retriever 1 (+ Learnable Query)
   # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
   # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer). Nhận:
   # recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
@@ -455,7 +457,7 @@ recombiner:
   dropout: 0.05
   # Ma trận Attn (Q/K/V/O của GQA trong MỌI Retriever) chạy lr × hệ số này ở Stage 0
   # (3 × 1.6e-4 = 4.8e-4) và ở chế độ scratch (3 × train max_lr). decoder_ft KHÔNG
-  # đọc khoá này — lr Attn ở đó là `train.ft_lr.recombinator_retriever`. Phải >= 1.
+  # đọc khoá này — Attn ở đó dùng chung lr của Retriever chứa nó. Phải >= 1.
   attn_lr_mult: 3.0
   # ── Classification Head / Route Head ────────────────────────────────────
   # Cùng hình dạng: Pooling Stack (`pool_stages` tầng, mỗi tầng RMSNorm ->
@@ -569,9 +571,9 @@ stats:
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ: `train_sota` đọc
 # nó cho R2Gen/AdaAtt, `src.run_pretrain` đọc nó cho My Gemma. Lịch: warm-up
-# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 5 epoch, KHÔNG SWA
+# cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 3 epoch, KHÔNG SWA
 # (checkpoint tái sử dụng `ckpt/latest` = epoch cuối). Sau mỗi
-# restart, `lr_decay` hạ CẢ hai mốc (tức 5 chu kỳ nối nhau có biên giảm dần).
+# restart, `lr_decay` hạ CẢ hai mốc (tức 3 chu kỳ nối nhau có biên giảm dần).
 #
 # `min_lr` KHÔNG phải một khoá mà `one_cycle` đọc. Đường cong nhận hai hệ số
 # chia, và min_lr là TÍCH của chúng:
@@ -595,7 +597,7 @@ stats:
 # đường cong lr sai không ném exception nào.
 pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
-  n_epochs: 5
+  n_epochs: 3
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16
