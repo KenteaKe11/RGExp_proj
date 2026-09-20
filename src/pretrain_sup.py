@@ -541,6 +541,24 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             "pretrain.swa đã BỎ — Stage 0 không còn dùng SWA; ckpt/latest là "
             "epoch cuối. Xoá khối `pretrain.swa` khỏi config.")
 
+    # ── batch mỗi lượt theo hồi quy VRAM (src/autobatch.py) ───────────────
+    # eff_bs, số bước và lịch lr KHÔNG đổi — chỉ chia lại bs × accum.
+    from . import autobatch
+
+    def _probe(k: int) -> None:
+        branch.train()
+        rows = [ds[i] for i in range(min(k, n))]
+        b = collate_vision(rows)
+        b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
+        loss, _ = forward_sup(gemma, branch, b, vis_dtype, bdtype)
+        loss.backward()
+
+    _eff = bs * accum
+    _bs, ab_rep = autobatch.autotune(cfg, "stage0", _eff, bs, _probe,
+                                     modules=(branch,))
+    if _bs != bs:
+        bs, accum = _bs, _eff // _bs
+
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
           f"· {n_epochs} epoch × {per_epoch} bước = {steps} bước "
           f"· val {0 if ds_val is None else len(ds_val)} mẫu"
@@ -660,6 +678,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "n_epochs": n_epochs,
         "steps_total": steps,
         "batch_size": bs, "grad_accum": accum, "effective_batch": bs * accum,
+        "autobatch": ab_rep,
         "schedule": scfg,
         "select_metric": sel_metric, "select_mode": sel_mode,
         "data": {
@@ -880,6 +899,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "seen_samples": seen,
         "steps_total": steps,
         "batch_size": bs, "grad_accum": accum, "effective_batch": bs * accum,
+        "autobatch": ab_rep,
         "pretrained_modules": list(pretrain_io.PRETRAINED_MODULES),
         "untrained_modules": list(pretrain_io.UNTRAINED_MODULES),
         "n_params_pretrained": int(n_sup),

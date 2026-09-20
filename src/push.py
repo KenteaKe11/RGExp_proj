@@ -1,4 +1,4 @@
-"""Đẩy kết quả lên HF: RGExp123/Research_results (dataset repo, private).
+"""Đẩy kết quả lên HF: `output.hub_repo` (hiện là RGExp123/research_v2) (dataset repo, private).
 
 Đẩy cả THƯ MỤC run, không đẩy trọng số: `runs/<subdir>/` chứa REPORT.md,
 manifest.json, metrics/*.csv, predictions/*.jsonl — tức là đủ để đọc lại kết

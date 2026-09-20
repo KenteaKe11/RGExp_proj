@@ -293,12 +293,42 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     t0 = time.time()
 
     try:
-        # ── STAGE 0 — điều kiện 5, config THỐNG NHẤT ───────────────────────
-        info = model.set_stage(1)
         p_bs = int(pcfg.get("per_device_batch_size", 16))
         p_accum = int(pcfg.get("grad_accum", 2))
         eff = p_bs * p_accum
-        micro0 = min(micro, p_bs)
+
+        # ── micro_batch theo hồi quy VRAM (src/autobatch.py) ───────────────
+        # Đo ở main-stage (CNN mở băng — lượt nặng nhất), ảnh cố định cỡ
+        # `resize_to`, chuỗi dài tối đa. Ứng viên: số mà CẢ Stage 0 (eff) LẪN
+        # main-stage (batch paper) chia hết — accum phải nguyên.
+        from . import autobatch
+
+        B = int(spec["batch_size"])
+        cands = autobatch.shared_cands(eff, B)
+        size = int((cfg.get("image_policy", {}) or {}).get("resize_to", 512))
+
+        def _probe(k: int) -> None:
+            model.set_stage(2)
+            model.train()
+            px = torch.rand(k, 3, size, size, device=device)
+            ids = torch.randint(1, len(tok), (k, tok.max_seq_length),
+                                device=device)
+            with _autocast(cfg):
+                loss, _ = model.loss(px, ids)
+            loss.backward()
+
+        micro, ab_rep = autobatch.autotune(cfg, f"{aid}", B, micro, _probe,
+                                           modules=(model,), cands=cands)
+        stats["autobatch"] = ab_rep
+
+        # ── STAGE 0 — điều kiện 5, config THỐNG NHẤT ───────────────────────
+        info = model.set_stage(1)
+        micro0 = min(micro, p_bs * p_accum)
+        if eff % micro0:
+            raise TrainUnusable(
+                f"{aid}: sota_train.micro_batch {micro} không chia hết batch "
+                f"hiệu dụng Stage 0 ({eff}) — mỗi bước sẽ ăn "
+                f"{micro0 * math.ceil(eff / micro0)} mẫu thay vì {eff}.")
         accum0 = max(1, math.ceil(eff / micro0))
         p_sched = dict(pcfg.get("schedule", {}) or {})
         n_ep0 = int(pcfg.get("n_epochs", 8))
@@ -352,6 +382,10 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         info = model.set_stage(2)
         mult = float((cfg.get("train", {}) or {}).get("pretrained_lr_mult", 0.1))
         micro1 = min(micro, spec["batch_size"])
+        if spec["batch_size"] % micro1:
+            raise TrainUnusable(
+                f"{aid}: sota_train.micro_batch {micro} không chia hết batch "
+                f"của paper ({spec['batch_size']}) — batch hiệu dụng sẽ lệch.")
         accum1 = max(1, math.ceil(spec["batch_size"] / micro1))
         loader1 = _loader(ds_tr, micro1, True, cfg, seed=int(cfg.get("seed", 42)))
         opt1 = _optimizer(model, spec["lr_visual"], spec["lr_rest"], spec, mult)

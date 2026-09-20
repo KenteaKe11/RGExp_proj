@@ -1013,6 +1013,40 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     tt_value = 1 if str(rcfg.get("token_type", "text")).lower() == "image" else 0
     clip = float(tcfg.get("max_grad_norm", 1.0))
 
+    # ── batch mỗi lượt theo hồi quy VRAM (src/autobatch.py) ───────────────
+    # Đo trên các mẫu có báo cáo DÀI NHẤT: độ dài chuỗi đổi theo mẫu, và VRAM
+    # đỉnh là của batch nặng nhất chứ không phải batch trung bình. eff_bs, số
+    # bước và lịch lr KHÔNG đổi.
+    from . import autobatch
+
+    _heavy = [int(i) for i in np.argsort(
+        -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
+
+    def _probe(k: int) -> None:
+        model.train()
+        if branch is not None:
+            branch.train()
+            if frozen:
+                apply_freeze(branch, frozen)    # train() vừa bật lại dropout
+        rows = [ds[i] for i in _heavy[:k]]
+        b = collate_cls(rows, pad_id)
+        b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
+        ce, asl, route_out, _ = _forward_loss(
+            model, gemma, branch, b, img_tok, tt_value, router, route_ctx)
+        loss = ce if asl is None else ce + asl.to(ce.dtype)
+        if route_out is not None:
+            loss = loss + route_out["aux"].to(ce.dtype)
+        loss.backward()
+        if route_ctx is not None:
+            route_ctx.clear()
+
+    _eff = bs * accum
+    _bs, ab_rep = autobatch.autotune(cfg, f"{aid}/decoder_ft", _eff, bs, _probe,
+                                     modules=(model, branch))
+    if _bs != bs:
+        bs, accum = _bs, _eff // _bs
+    opt.zero_grad(set_to_none=True)
+
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
@@ -1065,10 +1099,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                            1 if bool(tcfg.get("prefetch", True)) else 0)
     pending = [pf.submit(next_idx())]
 
+    # Dry-run: đệm mọi batch tới max_seq_len — VRAM đỉnh tất định, xấu nhất.
+    pad_to = max_len if bool(tcfg.get("_pad_to_max", False)) else None
+
     def next_micro() -> dict:
         rows = pf.result(pending[0])
         pending[0] = pf.submit(next_idx())
-        b = collate_cls(rows, pad_id)
+        b = collate_cls(rows, pad_id, pad_to)
         return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in b.items()}
 
     # ── vòng lặp ───────────────────────────────────────────────────────────
@@ -1185,6 +1222,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     route_summary = rstats.summary() if rstats is not None else None
     stats = {
         "arm_id": aid, "name": arm.get("name", aid),
+        "autobatch": ab_rep,
         "uses_recombiner": use_branch,
         "uses_moe": spec is not None,
         "top_k": (spec or {}).get("top_k"),

@@ -1287,7 +1287,8 @@ def config_tests() -> None:
     def t_block():
         p = CFG.get("pretrain")
         true(p, "config thiếu khối `pretrain:`")
-        for k in ("n_train", "n_epochs", "per_device_batch_size", "grad_accum",
+        # Số mẫu mỗi lượt ở configs/gpu/<card>.yaml; grad_accum được suy ra.
+        for k in ("n_train", "n_epochs", "effective_batch",
                   "schedule", "hub_repo", "hub_subdir", "select_metric",
                   "keep_last_ckpt", "base_method", "subdir"):
             true(k in p, f"pretrain thiếu khoá `{k}`")
@@ -1314,8 +1315,7 @@ def config_tests() -> None:
 
     def t_effective_batch_matches():
         p, t = CFG["pretrain"], CFG["train"]
-        eq(p["per_device_batch_size"] * p["grad_accum"],
-           t["per_device_batch_size"] * t["grad_accum"],
+        eq(p["effective_batch"], t["effective_batch"],
            "eff_bs của hai chế độ nên bằng nhau — không bắt buộc về toán, "
            "nhưng nó làm 'một bước' có cùng nghĩa ở cả hai bảng")
     check("eff_bs của pretrain = eff_bs của main-stage", t_effective_batch_matches)

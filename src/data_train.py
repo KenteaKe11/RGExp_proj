@@ -169,7 +169,7 @@ def load_train_manifest(cfg: Cfg, name: str = "trainset",
             continue
         out.append(pd.DataFrame([json.loads(l) for l in open(p, encoding="utf-8") if l.strip()]))
     # `trainset.jsonl` nằm chung ở cache_dir cho mọi thí nghiệm: một profile
-    # `--hw` với n_train khác ghi đè nó. Đọc lại bằng số hàng SAI là huấn luyện
+    # config nội dung với n_train khác ghi đè nó. Đọc lại bằng số hàng SAI là huấn luyện
     # trên tập khác mà không có dòng log nào nói vậy.
     want = int(cfg.data.get("n_train", 0) or 0)
     if name == "trainset" and want and len(out[0]) != want:

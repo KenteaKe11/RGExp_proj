@@ -99,7 +99,7 @@ if [ -z "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
     echo "✗ Thiếu HF_TOKEN."
     echo "  Cần cho: đọc repo dữ liệu private (gồm csv_helper/labels.npz), tải"
     echo "  google/gemma-3-4b-it (gated — token phải ĐÃ được cấp quyền), và đẩy"
-    echo "  kết quả lên Research_results."
+    echo "  kết quả lên RGExp123/research_v2."
     echo "      export HF_TOKEN=hf_xxxxxxxx"
     exit 1
 fi

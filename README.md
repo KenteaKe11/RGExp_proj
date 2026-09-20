@@ -246,32 +246,49 @@ bash scripts/run_section25.sh --dry-run      # §2.5: thử đường ống
 bash scripts/run_section25.sh --detach       # §2.5: chạy thật
 ```
 
-**GPU cấp cao — RTX PRO 6000 Blackwell 96 GB.** `--hw rtx_pro_6000_blackwell`
-(file `configs/hw/rtx_pro_6000_blackwell.yaml`) áp cho cả hai điểm vào:
+**Thí nghiệm LoRA — rank × chỗ gắn** (khôi phục §2.2, thu về 2 × 2):
 
 ```bash
-bash scripts/run_pretrain.sh  --hw rtx_pro_6000_blackwell --detach
-bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --mode comparer_pretrain --detach
-bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --detach
+bash scripts/run_lora.sh --dry-run
+bash scripts/run_lora.sh --detach
 ```
 
-Khối `set:` chỉ đổi khoá phần cứng (`src/config.HW_KEYS`): My Gemma 4×8 không
-checkpointing, Stage 0 32×1, `micro_batch` 40, batch sinh/chấm lớn hơn. Batch
-hiệu dụng giữ nguyên (lệch là DỪNG). Khối `experiment:` là một thí nghiệm
-**khác**: 16384 mẫu train cho cả ba candidate và Stage 0, Stage 0 2 epoch (thay
-vì 3, cho cả ba), decoder_ft My Gemma 2 epoch. Nó được ghi vào `manifest.deviations`, và phải có run dir / checkpoint /
-repo Stage 0 / thư mục ckpt baseline riêng (`src/config.ISOLATION_KEYS`), nếu
-thiếu là DỪNG. Cần torch build cu128 (>= 2.7).
+Bốn candidate QLoRA: r ∈ {4, 8} × chỗ gắn ∈ {`attn` = q/k/v/o_proj, `decoder` =
+thêm gate/up/down_proj}, khai ở khối `lora_exp` của `configs/section25.yaml`.
+Không nhánh, không MoE, không Stage 0; mọi thứ khác (dữ liệu, base NF4, prompt,
+giải mã beam 3, lịch học, alpha = 2r, metric) dùng chung với §2.5. Huấn luyện
+bằng đường candidate-không-nhánh của `train_recomb`, kiểm định bằng
+`stats_multi` (6 cặp, permutation + BCa, Holm). `REPORT.md` tách riêng bốn cặp
+khác nhau đúng một biến (hiệu ứng của rank, hiệu ứng của chỗ gắn). Đầu ra:
+`runs/2.2_lora_rank_target/`, adapter ở `adapters_2_2/`.
 
-**Lát MIG 2g.48gb của cùng card** — `--hw rtx_pro_6000_mig_2g48` (đặt
-`CUDA_VISIBLE_DEVICES=MIG-<uuid>` trước). `set:` nhỏ hơn: My Gemma 2×16 không
-checkpointing, Stage 0 16×2, `micro_batch` 20. Khối `experiment:` chép nguyên
-profile 96 GB (selftest kiểm), nên hai profile dùng chung run dir và checkpoint:
-baseline train trên card nguyên được lát MIG kéo về dùng thẳng.
+**Hai loại config.** `configs/section25.yaml` là config **nội dung** — thí
+nghiệm là gì (dữ liệu, mô hình, lr, epoch, batch **hiệu dụng**
+`train.effective_batch` / `pretrain.effective_batch`). `configs/gpu/<card>.yaml`
+là config **GPU** — chạy nó thế nào trên một card (số mẫu mỗi lượt,
+checkpointing, worker, batch lúc sinh/chấm, autobatch), chọn bằng `--gpu`
+(mặc định `rtx3060`). `grad_accum` được suy ra = batch hiệu dụng / số mẫu mỗi
+lượt, phải chia hết. `src/config.load_config` DỪNG nếu file nội dung khai khoá
+GPU, nếu file GPU khai khoá khác `GPU_KEYS`, hoặc nếu file GPU thiếu một khoá.
 
-`--dry-run` là phép thử **đường ống**, không phải phép dò VRAM: nó chạy với đúng
-batch trong config, và vài bước trên vài chục mẫu ngắn không nói được gì về VRAM
-đỉnh của 6400 mẫu.
+| `--gpu` | card | decoder_ft | Stage 0 | baseline `micro_batch` |
+|---|---|---|---|---|
+| `rtx3060` (mặc định) | RTX 3060 12 GB | 1 × 32, checkpointing | 16 × 2 | 8 |
+
+Thêm card mới: chép `configs/gpu/rtx3060.yaml`, đổi `name`,
+`gpu_name_contains`, `requires` và các số trong `set:`.
+
+**Dry-run cả 3 pipeline + VRAM đỉnh:** `bash scripts/dry_run_all.sh [--gpu
+rtx3060] [--detach]` chạy lần lượt Stage 0 My Gemma, `--mode comparer_pretrain`
+(R2Gen + AdaAtt) và §2.5 full (decoder_ft + sinh + chấm + kiểm định + báo cáo)
+ở chế độ `--dry-run`, rồi in bảng VRAM đỉnh từng pipeline (`total − free` của
+thiết bị, lấy mẫu 0.1 s — gồm CUDA context). Batch mỗi lượt là của config GPU,
+decoder_ft đệm tới `max_seq_len`, nên con số là VRAM thật (trường hợp xấu
+nhất) của lần chạy thật. Đầu ra dry-run cũ (`*_dryrun`) bị xoá trước khi chạy.
+
+`--dry-run` chạy vài bước trên vài chục mẫu: nhanh, nhưng VRAM đỉnh là thật vì
+batch mỗi lượt không bị thu nhỏ (Stage 0 ảnh cố định; decoder_ft đệm tới
+`max_seq_len`). Thứ nó không đo: thời gian của lần chạy thật.
 
 ---
 

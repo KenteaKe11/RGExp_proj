@@ -1,8 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · My Gemma
+# §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · My Gemma — CONFIG NỘI DUNG
 # ═══════════════════════════════════════════════════════════════════════════
-# Đây là file cấu hình DUY NHẤT của repo. Mọi điểm vào không truyền `--config`
-# đều đọc file này (`src/config.py::DEFAULT_CONFIG`):
+# File này nói thí nghiệm LÀ GÌ. Chạy nó THẾ NÀO trên một card (số mẫu mỗi lượt
+# forward, checkpointing, worker, batch lúc sinh/chấm) nằm ở configs/gpu/<card>.yaml,
+# chọn bằng `--gpu` (mặc định `rtx3060`). File này KHÔNG được khai khoá GPU và
+# file GPU không được khai gì khác — `src/config.load_config` kiểm cả hai chiều.
+# `grad_accum` không khai ở đâu: = effective_batch / per_device_batch_size.
+#
+# Đây là file cấu hình NỘI DUNG duy nhất của repo. Mọi điểm vào không truyền
+# `--config` đều đọc file này (`src/config.py::DEFAULT_CONFIG`):
 #
 #     scripts/run_pretrain.sh   -> src.run_pretrain   Stage 0 của My Gemma
 #     scripts/run_section25.sh  -> src.run_section25  §2.5 trọn gói
@@ -311,7 +317,6 @@ base:
   attn_implementation_train: eager
   attn_implementation_infer: sdpa
   disable_compile: auto
-  batch_size: 2
   device_map_train: single
   device_map_infer: auto
   image:
@@ -365,15 +370,59 @@ lora:
     qdora_r16: {method: qdora, rank: 16}
     qdora_r32: {method: qdora, rank: 32}
 
+# ═════════════════════════════════════════════════════════════════════════════
+# THÍ NGHIỆM LoRA — rank × chỗ gắn (`scripts/run_lora.sh`, `src/run_lora.py`)
+# ═════════════════════════════════════════════════════════════════════════════
+# Khôi phục thí nghiệm adapter của §2.2, thu về 2 × 2: QLoRA r ∈ {4, 8} × chỗ gắn
+# ∈ {4 ma trận attention, toàn bộ decoder}. KHÔNG nhánh Recombinator, KHÔNG
+# Experts (MoE tắt cứng), KHÔNG Stage 0 — chỉ Gemma 3 4B NF4 + adapter peft.
+#
+# Mọi thứ khác dùng CHUNG với §2.5 và đọc từ các khối của file này: `data`
+# (6400 train / 3000 test, hàng rào rò rỉ), `base`, `prompt`, `generate` (beam
+# 3), `image_policy`, `metrics`, `stats` (permutation + bootstrap BCa, Holm trên
+# các cặp), `train` (1 epoch, eff_bs 32, one-cycle; nhóm adapter chạy ở
+# `train.schedule.max_lr`), alpha = 2 × r (`train.alpha_mode: proportional`,
+# nên alpha/r không đổi và cột rank đo đúng một thứ: số chiều). Batch mỗi lượt
+# ở config GPU.
+#
+# Hai biến, và CHỈ hai biến khác nhau giữa bốn candidate: `rank` và `target`.
+#   attn    — q/k/v/o_proj của khối ngôn ngữ (= mặt cắt §2.2 gốc, và = chỗ gắn
+#             của My Gemma ở §2.5: `train.target_modules`, selftest kiểm).
+#   decoder — thêm gate/up/down_proj (MLP): mọi Linear của decoder ngôn ngữ.
+# Vision tower / projector KHÔNG bao giờ được gắn (`train.exclude_prefixes`).
+#
+# Kiểm định: 4 candidate -> 6 cặp, mỗi cặp permutation + BCa, Holm trên 6
+# p-value trong từng metric. Tham chiếu (dấu của hiệu số) = qlora_r4_attn, cấu
+# hình §2.5 đang dùng. Bốn trong sáu cặp là hiệu ứng ĐƠN của một biến (rank ở
+# cùng chỗ gắn, chỗ gắn ở cùng rank); REPORT.md tách riêng bốn cặp ấy.
+lora_exp:
+  targets:
+    attn: [q_proj, k_proj, v_proj, o_proj]
+    decoder: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  arms:
+    - {id: qlora_r4_attn,    method: qlora, rank: 4, target: attn,
+       name: "QLoRA r=4 · attention (q,k,v,o)"}
+    - {id: qlora_r8_attn,    method: qlora, rank: 8, target: attn,
+       name: "QLoRA r=8 · attention (q,k,v,o)"}
+    - {id: qlora_r4_decoder, method: qlora, rank: 4, target: decoder,
+       name: "QLoRA r=4 · full decoder (attn + MLP)"}
+    - {id: qlora_r8_decoder, method: qlora, rank: 8, target: decoder,
+       name: "QLoRA r=8 · full decoder (attn + MLP)"}
+  reference: qlora_r4_attn
+  output:
+    subdir: "2.2_lora_rank_target"      # runs/<subdir>, và thư mục trên Hub
+    adapter_dir: ./adapters_2_2
+  wandb:
+    project: rgexp-lora
+    group: "lora-rank-target"
+    tags: [lora, qlora, rank, target-modules, mimic-cxr]
+
 train:
   n_epochs: 1   # decoder_ft: 1 epoch
-  per_device_batch_size: 1
-  grad_accum: 32
+  # Batch HIỆU DỤNG của decoder_ft. Số mẫu mỗi lượt ở configs/gpu/<card>.yaml;
+  # grad_accum = 32 / per_device_batch_size (phải chia hết).
+  effective_batch: 32
   max_seq_len: 1024
-  gradient_checkpointing: true
-  # Dựng micro-batch kế tiếp trong MỘT luồng nền khi GPU đang chạy (thứ tự mẫu
-  # không đổi — src/prefetch.py). Khoá tốc độ, không phải khoá thí nghiệm.
-  prefetch: true
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
@@ -545,7 +594,6 @@ metrics:
     enabled: true
     model_type: roberta-large
     num_layers: 17
-    batch_size: 32
     rescale_with_baseline: false
     keep: [f1]
   primary: bertscore_f1
@@ -602,12 +650,9 @@ pretrain:
   n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 3
   cycle_per_epoch: true
-  # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
-  per_device_batch_size: 16
-  grad_accum: 2
-  # Số luồng dựng ảnh (PIL + processor 896px) cho micro-batch kế tiếp; 0 = đồng
-  # bộ như cũ. Thứ tự mẫu không đổi. Khoá tốc độ.
-  data_threads: 4
+  # Batch HIỆU DỤNG của Stage 0 (cả My Gemma lẫn hai baseline) = 32; số mẫu
+  # mỗi lượt ở configs/gpu/<card>.yaml.
+  effective_batch: 32
   schedule:
     impl: lambda
     max_lr: 1.6e-4          # = 0.8 × 2e-4 (lịch cũ)
@@ -639,23 +684,13 @@ pretrain:
   hub_subdir: latest
 
 # ── Khoá KỸ THUẬT của hai baseline — không thuộc paper nào ────────────────
-# Ba khoá dưới đây không có trong setup gốc của R2Gen lẫn AdaAtt, và cũng không
-# phải điều kiện của §2.5. Chúng ở đây vì phần cứng, và chúng được tách ra một
-# khối riêng để không ai đọc nhầm một con số phần cứng thành một con số của
-# paper.
-#
-# `micro_batch` KHÔNG phải "hạ batch". Paper của AdaAtt khai batch 80, và ở
-# 512px với ResNet-152 thì 80 ảnh trong MỘT lượt forward không vừa card nào
-# trong tầm. Khoá này chia một batch của paper thành nhiều lượt forward rồi
-# cộng dồn gradient: **batch hiệu dụng, số bước và đường cong lr không đổi**.
-# Hạ `batch_size` trong khối `sota:` thì mới là đổi thí nghiệm — và khối ấy
-# không được chạm vào.
+# Không có trong setup gốc của R2Gen lẫn AdaAtt, cũng không phải điều kiện của
+# §2.5. `micro_batch` / `infer_batch` / `num_workers` (phần cứng) ở
+# configs/gpu/<card>.yaml: micro_batch chia MỘT batch của paper thành nhiều
+# lượt forward, batch hiệu dụng, số bước và đường cong lr không đổi.
 sota_train:
-  micro_batch: 8
-  infer_batch: 4          # beam nhân số chuỗi lên beam_size lần
   eval_every: 1           # chấm val sau mỗi epoch (dừng sớm đọc con số này)
   amp: true               # bf16 nếu card có; không có thì fp32, KHÔNG fp16
-  num_workers: 4
   grad_clip: 0.0          # 0 = tắt. Không paper nào khai clip — đừng bật ngầm.
 
 # ── Checkpoint hai baseline trên Hub — `--mode comparer_pretrain` ──────────
@@ -685,7 +720,7 @@ wandb:
 
 output:
   dir: ./runs
-  hub_repo: RGExp123/Research_results
+  hub_repo: RGExp123/research_v2        # repo DATASET kết quả (private); tự tạo ở lần đẩy đầu
   hub_repo_type: dataset
   hub_private: true
   push: true

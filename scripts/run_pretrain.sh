@@ -57,7 +57,7 @@
 #     bash scripts/run_section25.sh --init-from runs/sup_pretrain/ckpt/latest
 #
 # (Không truyền `--init-from` thì §2.5 tự tìm `runs/sup_pretrain/ckpt/latest`.)
-# Cả hai lệnh đọc CÙNG `configs/section25.yaml` — không có file cấu hình thứ hai.
+# Cả hai lệnh đọc CÙNG config nội dung `configs/section25.yaml` (+ config GPU `--gpu`, mặc định rtx3060).
 #
 # Stage 0: 3 epoch, KHÔNG SWA (ckpt/latest = epoch cuối).
 # lr Stage 0: 4.8e-6 -> 1.6e-4 -> 4.8e-7 mỗi epoch, weight_decay 0.2; ma trận Attn (Q/K/V/O,

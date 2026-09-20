@@ -351,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check-split", action="store_true",
                     help="đối chiếu với split_ref/test_split.csv để đếm mẫu thiếu nhãn")
     a = ap.parse_args(argv)
-    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
+    cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
     print(json.dumps(probe(cfg), indent=2, ensure_ascii=False))
     lut, info = load_map(cfg)
     print(json.dumps({k: v for k, v in info.items() if k != "arrays"},

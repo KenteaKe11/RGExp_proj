@@ -209,6 +209,15 @@ def enabled_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
     return arms
 
 
+def dry_n_train(cfg: Cfg) -> int:
+    """Số mẫu train của dry-run: >= batch paper lớn nhất (AdaAtt 80), >= 16."""
+    from .train_sota import main_stage_spec
+
+    return max([16] + [int(main_stage_spec(s, dict(v or {}))["batch_size"])
+                       for s, v in (cfg.get("sota") or {}).items()
+                       if isinstance(v, dict) and v.get("fine_tuning")])
+
+
 def train_order(arms: list[dict]) -> list[dict]:
     """Candidate dễ hỏng nhất TRƯỚC — quy ước 1 của repo.
 
@@ -313,13 +322,6 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         f"(`round_down_sig` {tsch.get('round_down_sig', 0)}), đáy nhỏ nhất "
         f"{float(tsch.get('min_lr', 0)):.0e}; đóng băng: "
         f"{', '.join(frozen) or 'không'} (`train.freeze_after_pretrain`).")
-    hwp = dict(cfg.get("hardware_profile") or {})
-    if hwp.get("experiment"):
-        out.append(
-            f"THÍ NGHIỆM — profile `{hwp.get('name')}` đổi thiết kế so với "
-            f"configs/section25.yaml: "
-            + "; ".join(f"{k} {o} -> {n}" for k, (o, n) in hwp["experiment"].items())
-            + ". Bảng này KHÔNG so được với bảng của config gốc.")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
         f"KỸ THUẬT — batch của paper được chia thành nhiều lượt forward "
@@ -419,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
 
-    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
+    cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
     if str(cfg.get("experiment", "")) != "2.5":
         print(f"✗ config khai `experiment: {cfg.get('experiment')!r}`, chờ đợi "
               f"'2.5'. Điểm vào này đọc `arms_s25` và `sota`; một file cấu hình "
@@ -429,9 +431,21 @@ def main(argv: list[str] | None = None) -> int:
 
     dry_steps = None
     if a.dry_run:
+        # Số mẫu train >= batch paper lớn nhất (AdaAtt 80): ít hơn thì main-stage
+        # không bao giờ đủ một bước optimizer, và VRAM của trạng thái Adam
+        # không bao giờ xuất hiện. Batch MỖI LƯỢT giữ đúng config GPU.
+        n_dry = dry_n_train(cfg)
         cfg["data"]["n_test"] = 8
-        cfg["data"]["n_train"] = 16
+        cfg["data"]["n_train"] = n_dry
         cfg["data"]["n_val"] = 8
+        # decoder_ft: grad_accum 2 cho nhanh; mọi chuỗi đệm tới max_seq_len ->
+        # VRAM đo được là trường hợp XẤU NHẤT, không phụ thuộc mẫu nào tình cờ
+        # ngắn.
+        cfg["train"]["grad_accum"] = min(2, int(cfg["train"]["grad_accum"]))
+        cfg["train"]["_pad_to_max"] = True
+        # Stage 0 của My Gemma do `run_pretrain --dry-run` ghi ra (`*_dryrun`).
+        cfg["pretrain"]["subdir"] = str(cfg["pretrain"].get("subdir",
+                                                           "sup_pretrain")) + "_dryrun"
         cfg["stats"]["n_perm"] = 200
         cfg["stats"]["n_boot"] = 200
         cfg["pretrain"]["n_epochs"] = 1
@@ -442,10 +456,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.setdefault("wandb", {})["tags"] = list(
             cfg.get("wandb", {}).get("tags", []) or []) + ["dry-run"]
         dry_steps = 4
-        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub.\n"
-              "  Phép thử ĐƯỜNG ỐNG, không phải phép dò VRAM: nó chạy với đúng "
-              "micro_batch trong config,\n  và vài bước trên 16 mẫu không nói "
-              "được gì về VRAM đỉnh của 6400 mẫu ở 512px.", flush=True)
+        print(f"⚙ DRY-RUN: 8 ảnh test · {n_dry} mẫu train · tối đa 4 bước · không "
+              f"đẩy Hub · Stage 0 từ {cfg['pretrain']['subdir']}.\n  Batch mỗi lượt"
+              f" = config GPU, decoder_ft đệm tới max_seq_len -> VRAM đỉnh in ở "
+              f"cuối là trường hợp xấu nhất.", flush=True)
     if a.no_push:
         cfg["output"]["push"] = False
     if a.no_wandb:
@@ -1066,4 +1080,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from .vram_monitor import run_with_monitor
+
+    sys.exit(run_with_monitor("section25", main))

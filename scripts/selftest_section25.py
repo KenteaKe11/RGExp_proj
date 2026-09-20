@@ -935,131 +935,6 @@ def t_config_declares_sota_hub():
     assert sota_hub.path_in_repo(CFG, "adaatt").endswith("/adaatt")
 
 
-def t_hw_profile_blackwell_keeps_experiment():
-    """Profile RTX PRO 6000 chỉ đổi khoá phần cứng; batch hiệu dụng giữ nguyên."""
-    from src.config import HW_KEYS, load_config, resolve_hw
-
-    assert "hardware_profile" not in CFG, "config gốc không được mang profile"
-    hw = load_config(hw="rtx_pro_6000_blackwell")
-    rec = hw["hardware_profile"]
-    assert rec["changed"] and set(rec["changed"]) <= HW_KEYS, rec["changed"]
-    for sec in ("train", "pretrain"):
-        a = CFG[sec]["per_device_batch_size"] * CFG[sec]["grad_accum"]
-        b = hw[sec]["per_device_batch_size"] * hw[sec]["grad_accum"]
-        assert a == b, (sec, a, b)
-    skip = {"hardware_profile", "_config_path"}
-
-    def walk(d, p=""):
-        out = {}
-        for k, v in d.items():
-            if f"{p}{k}" in skip:
-                continue
-            if isinstance(v, dict):
-                out.update(walk(v, f"{p}{k}."))
-            else:
-                out[f"{p}{k}"] = v
-        return out
-
-    diff = {k for k, v in walk(hw).items() if walk(CFG).get(k) != v}
-    exp = set(rec["experiment"])
-    assert diff <= HW_KEYS | exp, f"profile đổi khoá không khai: {diff - HW_KEYS - exp}"
-    assert hw["data"]["n_train"] == hw["pretrain"]["n_train"] == 16384
-    assert hw["train"]["n_epochs"] == 2
-    assert hw["pretrain"]["n_epochs"] == 2 and CFG["pretrain"]["n_epochs"] == 3
-    assert CFG["data"]["n_train"] == 6400 and CFG["train"]["n_epochs"] == 1
-    from src.config import ISOLATION_KEYS, _get_path
-    for k in ISOLATION_KEYS:
-        assert _get_path(hw, k) != _get_path(CFG, k), f"{k} dùng chung với config gốc"
-    from src.run_section25 import _deviations, enabled_arms
-    assert any("THÍ NGHIỆM" in x for x in _deviations(hw, enabled_arms(hw)))
-    assert not any("THÍ NGHIỆM" in x for x in _deviations(CFG, enabled_arms(CFG)))
-    assert resolve_hw("rtx_pro_6000_blackwell").exists()
-
-
-def t_hw_profile_rejects_experiment_keys():
-    import tempfile
-
-    from src.config import HardwareProfileError, load_config
-
-    with tempfile.TemporaryDirectory() as d:
-        bad1 = Path(d) / "lr.yaml"
-        bad1.write_text("name: x\nset:\n  train.ft_lr.max_lr: 1.0e-3\n")
-        bad2 = Path(d) / "eff.yaml"
-        bad2.write_text("name: y\nset:\n  train.per_device_batch_size: 4\n"
-                        "  train.grad_accum: 4\n")
-        bad3 = Path(d) / "iso.yaml"
-        bad3.write_text("name: z\nexperiment:\n  data.n_train: 100\n"
-                        "  pretrain.n_train: 100\n")
-        for f in (bad1, bad2, bad3):
-            try:
-                load_config(hw=str(f))
-                raise AssertionError(f"{f.name} lẽ ra phải bị từ chối")
-            except HardwareProfileError:
-                pass
-
-
-def t_hw_profile_mig_2g48_shares_experiment():
-    """Lát MIG 2g.48gb: chỉ phần cứng khác profile 96 GB; cùng thí nghiệm, cùng chỗ."""
-    import yaml
-
-    from src.config import HW_KEYS, load_config, resolve_hw
-
-    mig = load_config(hw="rtx_pro_6000_mig_2g48")
-    full = load_config(hw="rtx_pro_6000_blackwell")
-    rec = mig["hardware_profile"]
-    assert set(rec["changed"]) <= HW_KEYS, rec["changed"]
-    for sec in ("train", "pretrain"):
-        a = CFG[sec]["per_device_batch_size"] * CFG[sec]["grad_accum"]
-        b = mig[sec]["per_device_batch_size"] * mig[sec]["grad_accum"]
-        assert a == b, (sec, a, b)
-    ea = yaml.safe_load(resolve_hw("rtx_pro_6000_mig_2g48").read_text(encoding="utf-8"))
-    eb = yaml.safe_load(resolve_hw("rtx_pro_6000_blackwell").read_text(encoding="utf-8"))
-    assert ea["experiment"] == eb["experiment"], "hai profile lệch khối experiment"
-    assert ea["requires"]["min_vram_gb"] < 48 < eb["requires"]["min_vram_gb"]
-    # nhỏ hơn card nguyên ở MỌI khoá batch mỗi lượt
-    for k in ("train.per_device_batch_size", "base.batch_size"):
-        a, b = k.split(".")
-        assert mig[a][b] <= full[a][b], k
-
-
-def t_hw_decoder_ft_two_epochs_one_cycle():
-    """GPU cao cấp: decoder_ft 2 epoch = MỘT chu kỳ one-cycle, không restart."""
-    import torch
-
-    from src.backbone import build_scheduler, total_steps
-    from src.config import load_config
-    from src.train_recomb import ft_lrs
-
-    for prof in ("rtx_pro_6000_blackwell", "rtx_pro_6000_mig_2g48"):
-        hw = load_config(hw=prof)
-        tc = hw["train"]
-        assert int(tc["n_epochs"]) == 2, prof
-        sch = dict(tc["schedule"])
-        assert not sch.get("cycle_steps") and "lr_decay" not in sch, sch
-        ft_lrs(hw)                                   # không ném = lịch hợp lệ
-        n = int(hw["data"]["n_train"])
-        steps = total_steps(n, int(tc["per_device_batch_size"]),
-                            int(tc["grad_accum"]), int(tc["n_epochs"]))
-        per_ep = steps // 2
-        assert steps == 1024 and per_ep == 512, (prof, steps)
-        p = torch.nn.Parameter(torch.zeros(1))
-        opt = torch.optim.SGD([p], lr=float(sch["max_lr"]))
-        sc = build_scheduler(opt, steps, sch)
-        lrs = []
-        for _ in range(steps):
-            lrs.append(opt.param_groups[0]["lr"])
-            opt.step()
-            sc.step()
-        peak = max(range(steps), key=lambda i: lrs[i])
-        assert abs(peak - float(sch["pct_start"]) * steps) <= 2, peak
-        tail = lrs[peak:]
-        assert all(b <= a + 1e-15 for a, b in zip(tail, tail[1:])), \
-            "lr tăng lại sau đỉnh — có restart"
-        assert lrs[per_ep] < 0.9 * lrs[peak] and lrs[per_ep] > lrs[-1], \
-            "đầu epoch 2 phải đang ở giữa đoạn cosine"
-        assert lrs[-1] < 1e-2 * lrs[peak]
-
-
 def t_prefetch_keeps_order():
     """Prefetch trả mẫu ĐÚNG thứ tự chỉ số, ở cả ba chế độ; một luồng thì tuần tự."""
     import threading
@@ -1089,6 +964,236 @@ def t_prefetch_keeps_order():
         pf.close()
         if th == 1:
             assert peak[0] == 1, "threads=1 phải gọi fetch TUẦN TỰ (tokenizer)"
+
+
+def t_autobatch_regression_and_choice():
+    """Hồi quy VRAM chọn bs lớn nhất vừa ngân sách, chạy thử, lùi khi vượt."""
+    from src import autobatch as ab
+
+    a, b, r2 = ab.fit_line([(16, 11060.0), (32, 20454.0)])
+    assert abs(b - 587.125) < 1e-6 and abs(a - 1666.0) < 1e-6
+    assert ab.divisors(32) == [1, 2, 4, 8, 16, 32]
+    assert ab.shared_cands(32, 80) == [1, 2, 4, 8, 16, 40, 80]
+    assert ab.shared_cands(32, 16) == [1, 2, 4, 8, 16, 32]
+
+    G = 1024 ** 3
+    on = {"autobatch": {"enabled": True, "target_frac": 0.80,
+                        "probe_sizes": [2, 4, 8]}}
+    calls = []
+
+    def lin(bs):                               # 2 GiB + 0.6 GiB/mẫu
+        calls.append(bs)
+        return (2 + 0.6 * bs) * G
+
+    bs, rep = ab.autotune(on, "t", 32, 1, None, measure_fn=lin, total_bytes=48 * G)
+    # ngân sách 38.4 GiB -> 2 + 0.6·bs <= 38.4 -> bs <= 60 -> ước lớn nhất = 32
+    assert bs == 32 and rep["accum"] == 1 and 32 in calls, (bs, calls)
+    assert abs(rep["r2"] - 1.0) < 1e-9
+
+    bs, _ = ab.autotune(on, "t", 32, 1, None, measure_fn=lin, total_bytes=20 * G)
+    # 16 GiB -> bs <= 23.3 -> 16
+    assert bs == 16, bs
+
+    def lying(bs):                             # dự đoán vừa, thực tế ở 16 vượt
+        return (2 + 0.6 * bs + (30 if bs == 16 else 0)) * G
+
+    bs, _ = ab.autotune(on, "t", 32, 1, None, measure_fn=lying, total_bytes=20 * G)
+    assert bs == 8, bs                         # lùi xuống ứng viên kế tiếp
+
+    def oom8(bs):
+        return None if bs >= 8 else (2 + 0.6 * bs) * G
+
+    bs, _ = ab.autotune(on, "t", 32, 1, None, measure_fn=oom8, total_bytes=48 * G)
+    assert bs == 4, bs                         # OOM ở 8 -> không bao giờ chọn >= 8
+
+    off = {"autobatch": {"enabled": False}}
+    assert ab.autotune(off, "t", 32, 4, None, measure_fn=lin, total_bytes=G)[0] == 4
+    assert CFG["autobatch"]["enabled"] is False, "config gốc phải giữ số viết tay"
+
+
+def t_gpu_config_split():
+    """Nội dung / GPU tách hai file; rtx3060 = cấu hình mặc định cũ; accum suy ra."""
+    import tempfile
+
+    import yaml
+
+    from src.config import (DEFAULT_CONFIG, DEFAULT_GPU, GPU_KEYS, GpuConfigError,
+                            _has_path, load_config, resolve_gpu)
+
+    raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    leak = [k for k in GPU_KEYS | {"train.grad_accum", "pretrain.grad_accum"}
+            if _has_path(raw, k)]
+    assert not leak, f"config nội dung còn khoá GPU: {leak}"
+    assert DEFAULT_GPU == "rtx3060" and CFG["gpu_config"]["name"] == "rtx3060"
+    old_defaults = {   # configs/section25.yaml trước khi tách
+        ("train", "per_device_batch_size"): 1, ("train", "grad_accum"): 32,
+        ("train", "gradient_checkpointing"): True, ("train", "prefetch"): True,
+        ("pretrain", "per_device_batch_size"): 16, ("pretrain", "grad_accum"): 2,
+        ("pretrain", "data_threads"): 4, ("sota_train", "micro_batch"): 8,
+        ("sota_train", "infer_batch"): 4, ("sota_train", "num_workers"): 4,
+        ("base", "batch_size"): 2, ("autobatch", "enabled"): False}
+    for (a, b), v in old_defaults.items():
+        assert CFG[a][b] == v, (a, b, CFG[a][b], v)
+    assert CFG["metrics"]["bertscore"]["batch_size"] == 32
+    assert resolve_gpu("rtx3060").parent.name == "gpu"
+    assert not (ROOT / "configs" / "hw").exists(), "profile GPU cao cấp phải xoá"
+
+    c = load_config(overrides=["train.per_device_batch_size=4"])
+    assert c["train"]["grad_accum"] == 8
+    for bad in (["train.per_device_batch_size=5"],
+                ["train.grad_accum=16"]):
+        try:
+            load_config(overrides=bad)
+            raise AssertionError(f"{bad} lẽ ra phải DỪNG")
+        except GpuConfigError:
+            pass
+    g = yaml.safe_load(resolve_gpu("rtx3060").read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory() as d:
+        extra = dict(g, set=dict(g["set"], **{"train.n_epochs": 2}))
+        miss = dict(g, set={k: v for k, v in g["set"].items()
+                            if k != "base.batch_size"})
+        for name, body in (("extra", extra), ("miss", miss)):
+            f = Path(d) / f"{name}.yaml"
+            f.write_text(yaml.safe_dump(body), encoding="utf-8")
+            try:
+                load_config(gpu=str(f))
+                raise AssertionError(f"config GPU {name} lẽ ra phải DỪNG")
+            except GpuConfigError:
+                pass
+        leaky = dict(raw)
+        leaky["train"] = dict(raw["train"], per_device_batch_size=1)
+        f = Path(d) / "content.yaml"
+        f.write_text(yaml.safe_dump(leaky, allow_unicode=True), encoding="utf-8")
+        try:
+            load_config(path=str(f))
+            raise AssertionError("config nội dung khai khoá GPU mà không DỪNG")
+        except GpuConfigError:
+            pass
+
+
+def t_dry_run_vram_report():
+    """Dry-run: đủ mẫu cho một bước Adam của AdaAtt; bảng VRAM đọc được."""
+    from src.run_section25 import dry_n_train
+    from src.vram_monitor import label_from_argv, summarize
+
+    assert dry_n_train(CFG) == 80, dry_n_train(CFG)
+    assert label_from_argv("section25", ["--mode", "comparer_pretrain",
+                                         "--dry-run"]) == "section25:comparer_pretrain"
+    assert label_from_argv("section25", ["--dry-run"]) == "section25:full"
+    assert label_from_argv("pretrain", ["--dry-run"]).startswith("stage0")
+    rows = [{"pipeline": "stage0 (sup_pretrain)", "rc": 0, "minutes": 1.2,
+             "peak_device_gib": 7.5, "peak_device_frac": 0.63, "total_gib": 11.8,
+             "peak_reserved_gib": 6.9, "peak_allocated_gib": 6.1},
+            {"pipeline": "section25:full", "rc": 0, "minutes": 4.0,
+             "peak_device_gib": 10.9, "peak_device_frac": 0.92, "total_gib": 11.8,
+             "peak_reserved_gib": 10.2, "peak_allocated_gib": 9.4, "gpu": "RTX 3060"}]
+    out = summarize(rows)
+    assert len(out) == 4 and "section25:full" in out[-1] and "10.9" in out[-1], out
+    sh = (ROOT / "scripts" / "dry_run_all.sh").read_text(encoding="utf-8")
+    for step in ("run_pretrain.sh --dry-run", "--mode comparer_pretrain --dry-run",
+                 "run_section25.sh --dry-run", "RGEXP_VRAM_REPORT"):
+        assert step in sh, step
+
+
+def t_lora_exp_design():
+    """LoRA: 2 rank × 2 chỗ gắn, chỉ hai biến khác nhau; attn = chỗ gắn §2.5."""
+    from src.run_lora import arm_cfg, factor_pairs, lora_arms, preset_for
+    from src.stats_multi import pair_list
+
+    arms = lora_arms(CFG)
+    assert [(x["rank"], x["target"]) for x in arms] == [
+        (4, "attn"), (8, "attn"), (4, "decoder"), (8, "decoder")], arms
+    assert {x["method"] for x in arms} == {"qlora"}
+    T = CFG["lora_exp"]["targets"]
+    assert T["attn"] == list(CFG["train"]["target_modules"]), \
+        "chỗ gắn `attn` phải trùng chỗ gắn của My Gemma (§2.5)"
+    assert set(T["attn"]) < set(T["decoder"])
+    assert {"gate_proj", "up_proj", "down_proj"} <= set(T["decoder"])
+    ref = CFG["lora_exp"]["reference"]
+    assert ref == "qlora_r4_attn" == CFG["lora"]["preset"].replace("qlora_r4", "qlora_r4_attn")
+    pairs = pair_list([x["id"] for x in arms], "all", ref)
+    assert len(pairs) == 6 and all(a == ref for a, b in pairs if ref in (a, b))
+    fp = factor_pairs(arms)
+    assert len(fp) == 4, fp
+    assert ("qlora_r4_attn", "qlora_r8_attn", "rank 4→8 @ attn") in fp
+    assert ("qlora_r4_attn", "qlora_r4_decoder", "attn→decoder @ r=4") in fp
+    c = arm_cfg(CFG, arms[3])
+    assert c["train"]["target_modules"] == T["decoder"]
+    assert c["moe"]["enabled"] is False and c["pretrain_init"] is None
+    assert CFG["train"]["target_modules"] == T["attn"], "arm_cfg làm bẩn cfg gốc"
+    assert CFG["moe"]["enabled"] is True
+    assert [preset_for(CFG, x)["alpha"] for x in arms] == [8, 16, 8, 16]
+    for k in ("train", "base", "data", "generate", "image_policy"):
+        diff = {kk for kk in set(c[k]) | set(CFG[k])
+                if c[k].get(kk) != CFG[k].get(kk)}
+        assert diff <= {"target_modules"}, (k, diff)
+
+
+def t_lora_targets_match_real_names():
+    """`decoder` khớp đủ 7 Linear mỗi lớp ngôn ngữ; vision không bao giờ khớp."""
+    import torch.nn as nn
+
+    from src.backbone import find_target_modules
+
+    class Lin(nn.Module):
+        def __init__(self, names):
+            super().__init__()
+            for n in names:
+                setattr(self, n, nn.Linear(2, 2))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Lin(["q_proj", "k_proj", "v_proj", "o_proj"])
+            self.mlp = Lin(["gate_proj", "up_proj", "down_proj"])
+
+    class Fake(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList([Layer(), Layer()])
+            self.vision_tower = nn.Module()
+            self.vision_tower.layers = nn.ModuleList([Layer()])
+
+    tc = dict(CFG["train"])
+    for t, want in (("attn", 8), ("decoder", 14)):
+        hits = find_target_modules(
+            Fake(), dict(tc, target_modules=CFG["lora_exp"]["targets"][t]))
+        assert len(hits) == want, (t, hits)
+        assert not any("vision_tower" in h for h in hits)
+
+
+def t_lora_report_builds():
+    """REPORT.md dựng được từ điểm giả: đủ bảng hiệu ứng đơn (4 cặp)."""
+    from src.report_lora import build_markdown
+    from src.report_section25 import summary_table
+    from src.run_lora import factor_pairs, lora_arms
+    from src.stats_multi import compare_pairs
+
+    arms = lora_arms(CFG)
+    rng = np.random.default_rng(0)
+    keys = [f"k{i}" for i in range(60)]
+    scores = {x["id"]: pd.DataFrame({"key": keys, "bertscore_f1":
+                                     rng.normal(0.5 + 0.01 * j, 0.05, 60)})
+              for j, x in enumerate(arms)}
+    st = dict(CFG["stats"], n_perm=200, n_boot=200, pairs="all",
+              reference="qlora_r4_attn")
+    ids = [x["id"] for x in arms]
+    pw = compare_pairs(scores, ["bertscore_f1"], st, ids, seed=1)
+    names = {x["id"]: x["name"] for x in arms}
+    summ = summary_table(scores, names, ["bertscore_f1"], "bertscore_f1")
+    md = build_markdown(CFG, summ, pw, [{"arm_id": "qlora_r4_attn",
+                                         "trainable_params": 1234}],
+                        names, {"run_id": "t", "factor_pairs": factor_pairs(arms),
+                                "headline": ["x"]}, arms)
+    assert "Hiệu ứng đơn" in md and md.count("@ r=") == 2 and md.count("@ attn") >= 1
+    assert "1,234" in md
+
+
+def t_lora_main_rejects_unknown_arm():
+    from src.run_lora import main
+
+    assert main(["--arms", "qlora_r16_attn", "--no-wandb", "--no-push"]) == 2
 
 
 def t_beam_size_is_3_everywhere():
@@ -1254,15 +1359,17 @@ if __name__ == "__main__":
           t_sota_hub_tokenizer_travels_with_ckpt)
     check("--mode từ chối tổ hợp vô nghĩa", t_modes_reject_bad_combinations)
     check("config khai sota_hub (repo MODEL riêng)", t_config_declares_sota_hub)
-    check("profile RTX PRO 6000: phần cứng + thí nghiệm đã khai + cách ly",
-          t_hw_profile_blackwell_keeps_experiment)
-    check("profile MIG 2g.48gb: cùng thí nghiệm với profile 96 GB",
-          t_hw_profile_mig_2g48_shares_experiment)
     check("prefetch giữ nguyên thứ tự mẫu", t_prefetch_keeps_order)
-    check("GPU cao cấp: decoder_ft 2 epoch, MỘT chu kỳ one-cycle",
-          t_hw_decoder_ft_two_epochs_one_cycle)
-    check("profile từ chối khoá thí nghiệm ở `set:` / đổi eff_bs / không cách ly",
-          t_hw_profile_rejects_experiment_keys)
+    check("config nội dung / config GPU tách, rtx3060 = mặc định cũ",
+          t_gpu_config_split)
+    check("dry-run 3 pipeline + bảng VRAM đỉnh", t_dry_run_vram_report)
+    check("LoRA: 2 rank × 2 chỗ gắn, chỉ hai biến khác nhau", t_lora_exp_design)
+    check("LoRA: `decoder` khớp 7 Linear/lớp, vision không khớp",
+          t_lora_targets_match_real_names)
+    check("LoRA: REPORT.md dựng được", t_lora_report_builds)
+    check("LoRA: --arms lạ là DỪNG", t_lora_main_rejects_unknown_arm)
+    check("autobatch: hồi quy VRAM, chạy thử, lùi khi vượt/OOM",
+          t_autobatch_regression_and_choice)
 
     print(f"\n═══ {PASS} qua · {FAIL} hỏng · {SKIP} bỏ qua ═══")
     if FAILURES:

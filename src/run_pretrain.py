@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
               "    Chọn một.")
         return 2
 
-    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
+    cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
     cfg["experiment"] = "sup_pretrain"
     # MoE tắt cứng ở đây, không đọc từ file: pretrain không có decoder nên không
     # có gì để định tuyến, và một `moe.enabled: true` còn sót trong config sẽ
@@ -305,17 +305,23 @@ def main(argv: list[str] | None = None) -> int:
     if a.epochs:
         p["n_epochs"] = int(a.epochs)
     if a.dry_run:
-        p = dict(p, n_epochs=2, per_device_batch_size=2, grad_accum=2,
-                 n_train=32, logging_steps=1, keep_last_ckpt=2)
+        # Batch MỖI LƯỢT giữ đúng config GPU -> VRAM đo được là VRAM thật của
+        # lần chạy thật (ảnh cố định 896px). Chỉ grad_accum (= 1) và số mẫu
+        # (2 lượt/epoch × 2 epoch = 4 bước) nhỏ lại cho nhanh.
+        bs_dry = int(p.get("per_device_batch_size", 16))
+        n_dry = max(32, 2 * bs_dry)
+        p = dict(p, n_epochs=2, grad_accum=1, n_train=n_dry, logging_steps=1,
+                 keep_last_ckpt=2)
+        cfg["data"]["n_train"] = n_dry
         cfg["data"]["n_test"] = 8
         cfg["data"]["n_val"] = 8
         p["push"] = False
         p["subdir"] = str(p.get("subdir", "sup_pretrain")) + "_dryrun"
         cfg.setdefault("wandb", {})["tags"] = list(
             cfg.get("wandb", {}).get("tags", []) or []) + ["dry-run", "pretrain"]
-        print("⚙ DRY-RUN: 32 mẫu · 2 epoch · 4 bước/epoch · không đẩy Hub.\n"
-              "  Đây là phép thử ĐƯỜNG ỐNG. Nó chạy với batch NHỎ hơn config, "
-              "nên nó không nói được gì\n  về VRAM đỉnh của lần chạy thật.",
+        print(f"⚙ DRY-RUN: {n_dry} mẫu · 2 epoch · batch mỗi lượt {bs_dry} (config "
+              f"GPU) × accum 1 · không đẩy Hub.\n  Batch mỗi lượt là của lần "
+              f"chạy thật, nên VRAM đỉnh in ở cuối là VRAM thật của Stage 0.",
               flush=True)
     if a.no_push:
         p["push"] = False
@@ -680,4 +686,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from .vram_monitor import run_with_monitor
+
+    sys.exit(run_with_monitor("pretrain", main))
