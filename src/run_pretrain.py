@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
               "    Chọn một.")
         return 2
 
-    cfg = load_config(a.config, a.overrides)
+    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
     cfg["experiment"] = "sup_pretrain"
     # MoE tắt cứng ở đây, không đọc từ file: pretrain không có decoder nên không
     # có gì để định tuyến, và một `moe.enabled: true` còn sót trong config sẽ

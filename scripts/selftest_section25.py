@@ -827,6 +827,176 @@ def t_no_resume_requires_train_stage():
     assert rc == 2, rc
 
 
+def _fake_sota_bundle(d: Path) -> Path:
+    import json as _json
+
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model_best.pt").write_bytes(b"weights-v1")
+    (d / "train_stats.json").write_text(_json.dumps({"selection": "best_BLEU_4@epoch3",
+                                                      "vocab_size": 7}))
+    (d / "tokenizer.json").write_text('{"vocab": ["a"]}')
+    return d
+
+
+def t_sota_hub_bundle_roundtrip():
+    """Gói đẩy lên kéo về nguyên vẹn; sha256 lệch hay image_policy lệch là DỪNG."""
+    import copy
+    import tempfile
+
+    from src import sota_hub
+    from src.train_sota import already_trained
+
+    arm = {"id": "r2gen", "setup": "r2gen", "kind": "sota"}
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        src = _fake_sota_bundle(d / "src")
+        meta = sota_hub.write_meta(CFG, arm, src)
+        assert set(meta["files"]) == set(sota_hub.BUNDLE), meta
+        dst = d / "adapters" / "r2gen"
+        got = sota_hub.install_bundle(CFG, arm, src, dst)
+        assert got["files"] == meta["files"]
+        assert already_trained(dst)
+        assert (dst / "tokenizer.json").read_text() == '{"vocab": ["a"]}'
+        assert not list(dst.glob("*.part"))
+
+        (src / "model_best.pt").write_bytes(b"weights-v2")   # trộn hai lần đẩy
+        try:
+            sota_hub.install_bundle(CFG, arm, src, d / "x")
+            raise AssertionError("sha256 lệch mà vẫn cài")
+        except sota_hub.SotaHubError:
+            pass
+        assert not (d / "x" / "train_stats.json").exists()
+
+        sota_hub.write_meta(CFG, arm, src)
+        cfg2 = copy.deepcopy(CFG)
+        cfg2["image_policy"]["resize_to"] = int(cfg2["image_policy"]["resize_to"]) // 2
+        try:
+            sota_hub.install_bundle(cfg2, arm, src, d / "y")
+            raise AssertionError("image_policy lệch mà vẫn cài")
+        except sota_hub.SotaHubError:
+            pass
+
+        (src / "hub_meta.json").unlink()
+        try:
+            sota_hub.install_bundle(CFG, arm, src, d / "z")
+            raise AssertionError("thiếu hub_meta.json mà vẫn cài")
+        except sota_hub.SotaHubError:
+            pass
+
+
+def t_sota_hub_tokenizer_travels_with_ckpt():
+    """Runner đọc từ điển ĐI CÙNG checkpoint trước từ điển chung của run_dir."""
+    import tempfile
+
+    from src import sota_hub
+    from src.run_section25 import arm_model_cfg, enabled_arms
+
+    arm = [x for x in enabled_arms(CFG) if x["id"] == "r2gen"][0]
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        ad, rd = d / "adapters", d / "run"
+        rd.mkdir()
+        (rd / "tokenizer.json").write_text("RUN")
+        m = arm_model_cfg(CFG, arm, ad, rd)
+        assert Path(m["tokenizer"]) == rd / "tokenizer.json", m["tokenizer"]
+        sota_hub.bundle_tokenizer(ad / "r2gen", rd)
+        m = arm_model_cfg(CFG, arm, ad, rd)
+        assert Path(m["tokenizer"]) == ad / "r2gen" / "tokenizer.json"
+        (rd / "tokenizer.json").write_text("NEW")
+        sota_hub.bundle_tokenizer(ad / "r2gen", rd)            # không đè
+        assert (ad / "r2gen" / "tokenizer.json").read_text() == "RUN"
+        sota_hub.bundle_tokenizer(ad / "r2gen", rd, overwrite=True)
+        assert (ad / "r2gen" / "tokenizer.json").read_text() == "NEW"
+
+
+def t_modes_reject_bad_combinations():
+    from src.run_section25 import MODES, main
+
+    assert "train" not in MODES["infer_test"][0]
+    assert MODES["comparer_pretrain"][0] == ["data", "train", "push"]
+    base = ["--no-wandb", "--no-push"]
+    for argv in (["--mode", "comparer_pretrain", "--no-resume"],
+                 ["--mode", "comparer_pretrain", "--arms", "my_gemma"],
+                 ["--mode", "comparer_pretrain", "--stages", "infer"],
+                 ["--mode", "infer_test", "--stages", "train"],
+                 ["--mode", "infer_test", "--retrain"],
+                 ["--mode", "infer_test", "--no-resume"]):
+        rc = main(argv + base)
+        assert rc == 2, (argv, rc)
+
+
+def t_config_declares_sota_hub():
+    from src import sota_hub
+
+    h = sota_hub.hub_cfg(CFG)
+    assert h["repo"] and "/" in h["repo"], h
+    assert h["repo"] != str(CFG["output"].get("hub_repo")), (
+        "checkpoint baseline không được đi vào repo DATASET kết quả")
+    assert sota_hub.path_in_repo(CFG, "adaatt").endswith("/adaatt")
+
+
+def t_hw_profile_blackwell_keeps_experiment():
+    """Profile RTX PRO 6000 chỉ đổi khoá phần cứng; batch hiệu dụng giữ nguyên."""
+    from src.config import HW_KEYS, load_config, resolve_hw
+
+    assert "hardware_profile" not in CFG, "config gốc không được mang profile"
+    hw = load_config(hw="rtx_pro_6000_blackwell")
+    rec = hw["hardware_profile"]
+    assert rec["changed"] and set(rec["changed"]) <= HW_KEYS, rec["changed"]
+    for sec in ("train", "pretrain"):
+        a = CFG[sec]["per_device_batch_size"] * CFG[sec]["grad_accum"]
+        b = hw[sec]["per_device_batch_size"] * hw[sec]["grad_accum"]
+        assert a == b, (sec, a, b)
+    skip = {"hardware_profile", "_config_path"}
+
+    def walk(d, p=""):
+        out = {}
+        for k, v in d.items():
+            if f"{p}{k}" in skip:
+                continue
+            if isinstance(v, dict):
+                out.update(walk(v, f"{p}{k}."))
+            else:
+                out[f"{p}{k}"] = v
+        return out
+
+    diff = {k for k, v in walk(hw).items() if walk(CFG).get(k) != v}
+    exp = set(rec["experiment"])
+    assert diff <= HW_KEYS | exp, f"profile đổi khoá không khai: {diff - HW_KEYS - exp}"
+    assert hw["data"]["n_train"] == hw["pretrain"]["n_train"] == 16384
+    assert hw["train"]["n_epochs"] == 2
+    assert CFG["data"]["n_train"] == 6400 and CFG["train"]["n_epochs"] == 1
+    from src.config import ISOLATION_KEYS, _get_path
+    for k in ISOLATION_KEYS:
+        assert _get_path(hw, k) != _get_path(CFG, k), f"{k} dùng chung với config gốc"
+    from src.run_section25 import _deviations, enabled_arms
+    assert any("THÍ NGHIỆM" in x for x in _deviations(hw, enabled_arms(hw)))
+    assert not any("THÍ NGHIỆM" in x for x in _deviations(CFG, enabled_arms(CFG)))
+    assert resolve_hw("rtx_pro_6000_blackwell").exists()
+
+
+def t_hw_profile_rejects_experiment_keys():
+    import tempfile
+
+    from src.config import HardwareProfileError, load_config
+
+    with tempfile.TemporaryDirectory() as d:
+        bad1 = Path(d) / "lr.yaml"
+        bad1.write_text("name: x\nset:\n  train.ft_lr.max_lr: 1.0e-3\n")
+        bad2 = Path(d) / "eff.yaml"
+        bad2.write_text("name: y\nset:\n  train.per_device_batch_size: 4\n"
+                        "  train.grad_accum: 4\n")
+        bad3 = Path(d) / "iso.yaml"
+        bad3.write_text("name: z\nexperiment:\n  data.n_train: 100\n"
+                        "  pretrain.n_train: 100\n")
+        for f in (bad1, bad2, bad3):
+            try:
+                load_config(hw=str(f))
+                raise AssertionError(f"{f.name} lẽ ra phải bị từ chối")
+            except HardwareProfileError:
+                pass
+
+
 def t_beam_size_is_3_everywhere():
     """Ba candidate sinh cùng một độ rộng beam."""
     assert int(CFG["generate"]["num_beams"]) == 3
@@ -984,6 +1154,16 @@ if __name__ == "__main__":
           t_no_resume_archives_only_ours)
     check("--no-resume cần stage train và một candidate ours",
           t_no_resume_requires_train_stage)
+    check("gói checkpoint baseline: kéo về nguyên vẹn, lệch là dừng",
+          t_sota_hub_bundle_roundtrip)
+    check("từ điển đi cùng checkpoint baseline",
+          t_sota_hub_tokenizer_travels_with_ckpt)
+    check("--mode từ chối tổ hợp vô nghĩa", t_modes_reject_bad_combinations)
+    check("config khai sota_hub (repo MODEL riêng)", t_config_declares_sota_hub)
+    check("profile RTX PRO 6000: phần cứng + thí nghiệm đã khai + cách ly",
+          t_hw_profile_blackwell_keeps_experiment)
+    check("profile từ chối khoá thí nghiệm ở `set:` / đổi eff_bs / không cách ly",
+          t_hw_profile_rejects_experiment_keys)
 
     print(f"\n═══ {PASS} qua · {FAIL} hỏng · {SKIP} bỏ qua ═══")
     if FAILURES:

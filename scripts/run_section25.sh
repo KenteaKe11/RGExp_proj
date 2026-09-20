@@ -10,6 +10,10 @@
 #     bash scripts/run_section25.sh --init-from hub:OWNER/NAME/best
 #     bash scripts/run_section25.sh --init-from none # My Gemma KHÔNG pretrain
 #     bash scripts/run_section25.sh --no-resume      # decoder_ft My Gemma làm LẠI từ đầu
+#     bash scripts/run_section25.sh --mode comparer_pretrain --detach
+#                                  # CHỈ R2Gen + AdaAtt -> đẩy ckpt lên sota_hub.repo
+#     bash scripts/run_section25.sh --mode infer_test --detach
+#                                  # không train; ckpt baseline kéo từ Hub khi thiếu
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_section25`.
 #
@@ -52,8 +56,15 @@
 # `*.old_<thời điểm>` (không xoá), rồi train (vẫn nạp Stage 0) -> sinh -> chấm
 # lại. Hai baseline giữ nguyên (làm lại chúng bằng `--retrain`).
 #
+# `--mode comparer_pretrain` tách hai baseline ra chạy riêng (data -> train ->
+# đẩy CHECKPOINT lên `sota_hub.repo`, không sinh/chấm, không ghi đè
+# manifest.json). `--mode infer_test` không huấn luyện gì: baseline thiếu ckpt
+# cục bộ thì kéo từ Hub, vẫn thiếu thì dừng mã 10. Ở mode mặc định (full),
+# baseline thiếu ckpt cũng được kéo từ Hub trước khi huấn luyện; `--no-pull` tắt.
+#
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 5 nhãn ·
-#           6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu Stage 0
+#           6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu Stage 0 ·
+#           10 infer_test thiếu checkpoint
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 

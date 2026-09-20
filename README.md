@@ -147,6 +147,23 @@ dùng lại). Muốn làm lại decoder_ft từ đầu:
 điểm cũ của My Gemma được đổi tên sang `*.old_<thời điểm>` (không xoá), Stage 0
 vẫn được nạp; hai baseline không bị đụng.
 
+Hai baseline có thể chạy **tách riêng** và đi qua Hub:
+
+```bash
+bash scripts/run_section25.sh --mode comparer_pretrain --detach  # R2Gen + AdaAtt -> sota_hub.repo
+bash scripts/run_section25.sh --mode infer_test --detach         # sinh + chấm + kiểm định, không train
+```
+
+`comparer_pretrain` chỉ chạy data -> train -> push cho `kind: sota`, và
+`push` ở đây đẩy **checkpoint** (`model_best.pt`, `train_stats.json`,
+`tokenizer.json`, `hub_meta.json`) lên `sota_hub.repo/<subdir>/<arm_id>/`, mỗi
+baseline ngay khi nó xong. Baseline đã có checkpoint cục bộ thì chỉ đẩy
+(`--retrain` để huấn luyện lại). Manifest của mode này là
+`manifest_comparer_pretrain.json`, không đè `manifest.json`.
+`infer_test` và mode mặc định thấy thiếu checkpoint baseline cục bộ thì kéo từ
+Hub (kiểm sha256 và `image_policy`) trước khi quyết định huấn luyện;
+`infer_test` vẫn thiếu thì dừng mã 10. `--no-pull` tắt việc kéo.
+
 Checkpoint Stage 0 của kiến trúc cũ (Local/Global Extractor `format /2`, PDVR +
 QFormer `format /1`) **không** nạp
 được vào nhánh này — phải chạy lại Stage 0. Nếu `runs/sup_pretrain` còn
@@ -228,6 +245,23 @@ bash scripts/run_pretrain.sh --detach        # Stage 0: chạy thật, 3 epoch
 bash scripts/run_section25.sh --dry-run      # §2.5: thử đường ống
 bash scripts/run_section25.sh --detach       # §2.5: chạy thật
 ```
+
+**GPU cấp cao — RTX PRO 6000 Blackwell 96 GB.** `--hw rtx_pro_6000_blackwell`
+(file `configs/hw/rtx_pro_6000_blackwell.yaml`) áp cho cả hai điểm vào:
+
+```bash
+bash scripts/run_pretrain.sh  --hw rtx_pro_6000_blackwell --detach
+bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --mode comparer_pretrain --detach
+bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --detach
+```
+
+Khối `set:` chỉ đổi khoá phần cứng (`src/config.HW_KEYS`): My Gemma 4×8 không
+checkpointing, Stage 0 32×1, `micro_batch` 40, batch sinh/chấm lớn hơn. Batch
+hiệu dụng giữ nguyên (lệch là DỪNG). Khối `experiment:` là một thí nghiệm
+**khác**: 16384 mẫu train cho cả ba candidate và Stage 0, decoder_ft My Gemma 2
+epoch. Nó được ghi vào `manifest.deviations`, và phải có run dir / checkpoint /
+repo Stage 0 / thư mục ckpt baseline riêng (`src/config.ISOLATION_KEYS`), nếu
+thiếu là DỪNG. Cần torch build cu128 (>= 2.7).
 
 `--dry-run` là phép thử **đường ống**, không phải phép dò VRAM: nó chạy với đúng
 batch trong config, và vài bước trên vài chục mẫu ngắn không nói được gì về VRAM

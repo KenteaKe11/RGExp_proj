@@ -7,6 +7,8 @@
     python -m src.run_section25 --init-from hub:OWNER/NAME/latest
     python -m src.run_section25 --init-from none     # My Gemma KHÔNG pretrain
     python -m src.run_section25 --no-resume          # decoder_ft My Gemma làm LẠI từ đầu
+    python -m src.run_section25 --mode comparer_pretrain   # CHỈ R2Gen+AdaAtt -> Hub
+    python -m src.run_section25 --mode infer_test          # sinh+chấm, ckpt kéo từ Hub
 
 Mã thoát:
     0  xong
@@ -18,6 +20,7 @@ Mã thoát:
     7  stage `report` hỏng   -> chạy lại `--stages report`, kết quả còn nguyên
     8  bước đẩy Hub hỏng     -> chạy lại `--stages push`
     9  thiếu checkpoint Stage 0 của My Gemma -> chạy `scripts/run_pretrain.sh`
+    10 `infer_test`: một candidate không có checkpoint (cục bộ lẫn Hub)
 
 ── BA CANDIDATE, HAI HỌ CODE, MỘT ĐIỀU KIỆN ────────────────────────────────
 `r2gen` và `adaatt` đi qua `src/train_sota.py` + `src/runners/sota.py`;
@@ -40,6 +43,24 @@ My Gemma, `--no-resume` bỏ qua cả ba: checkpoint decoder_ft, predictions và
 rồi train (vẫn nạp Stage 0) -> sinh -> chấm lại từ đầu. `--retrain` thì chỉ
 huấn luyện lại và giữ predictions cũ — sinh tiếp trên file của model CŨ.
 Hai baseline không bị đụng; muốn làm lại chúng thì `--retrain`.
+
+── `--mode` — tách hai baseline khỏi phần còn lại ──────────────────────────
+    full               (mặc định) data -> train -> infer -> score -> stats ->
+                       report -> push, cả ba candidate — như trước.
+    comparer_pretrain  CHỈ R2Gen + AdaAtt: data -> train -> push, trong đó
+                       `push` đẩy CHECKPOINT (model_best.pt + train_stats.json +
+                       tokenizer.json + hub_meta.json) lên repo MODEL
+                       `sota_hub.repo`, mỗi candidate ngay khi nó huấn luyện
+                       xong. Candidate đã có checkpoint cục bộ thì không huấn
+                       luyện lại mà chỉ đẩy (--retrain để làm lại). Không đụng
+                       predictions/metrics/manifest.json của run chính.
+    infer_test         data -> infer -> score -> stats -> report -> push, KHÔNG
+                       huấn luyện gì. Checkpoint baseline thiếu cục bộ thì kéo
+                       từ `sota_hub.repo`; vẫn thiếu thì DỪNG (mã 10) thay vì
+                       lặng lẽ huấn luyện.
+Ở `full`, baseline thiếu checkpoint cục bộ cũng được kéo từ Hub TRƯỚC khi quyết
+định huấn luyện; không kéo được thì huấn luyện như cũ. `--no-pull` tắt việc kéo.
+Chi tiết gói checkpoint: `src/sota_hub.py`.
 
 ── VÌ SAO STAGE 0 CỦA MY GEMMA KHÔNG CHẠY Ở ĐÂY ────────────────────────────
 `sup_pretrain` có điểm vào riêng (`scripts/run_pretrain.sh`), ghi ra
@@ -66,6 +87,13 @@ from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 KINDS = ("sota", "ours")
+# Stage mặc định của từng mode, và những stage mode ấy CHO PHÉP khai qua --stages.
+MODES = {
+    "full": (STAGES, STAGES),
+    "comparer_pretrain": (["data", "train", "push"], ["data", "train", "push"]),
+    "infer_test": ([s for s in STAGES if s != "train"],
+                   [s for s in STAGES if s != "train"]),
+}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section25.yaml"
 
 
@@ -212,7 +240,11 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path, run_dir: Path) -> Cfg
     return Cfg({
         "id": aid, "name": arm.get("name", aid), "runner": arm["runner"],
         "ckpt": str(adapter_root / aid / "model_best.pt"),
-        "tokenizer": str(run_dir / "tokenizer.json"),
+        # Từ điển đi CÙNG checkpoint khi có (gói kéo từ Hub, hoặc vừa huấn
+        # luyện); run_dir/tokenizer.json chỉ là đường lui cho checkpoint cũ.
+        "tokenizer": str(adapter_root / aid / "tokenizer.json"
+                         if (adapter_root / aid / "tokenizer.json").exists()
+                         else run_dir / "tokenizer.json"),
         # Giải mã KHÔNG đọc `sota.*.decoding` — runner dùng `decoding_spec`
         # (khối `generate:` chung). Batch của khâu SINH: beam nhân số chuỗi lên
         # `num_beams` lần, nên con số an toàn ở đây nhỏ hơn micro_batch.
@@ -281,6 +313,13 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         f"(`round_down_sig` {tsch.get('round_down_sig', 0)}), đáy nhỏ nhất "
         f"{float(tsch.get('min_lr', 0)):.0e}; đóng băng: "
         f"{', '.join(frozen) or 'không'} (`train.freeze_after_pretrain`).")
+    hwp = dict(cfg.get("hardware_profile") or {})
+    if hwp.get("experiment"):
+        out.append(
+            f"THÍ NGHIỆM — profile `{hwp.get('name')}` đổi thiết kế so với "
+            f"configs/section25.yaml: "
+            + "; ".join(f"{k} {o} -> {n}" for k, (o, n) in hwp["experiment"].items())
+            + ". Bảng này KHÔNG so được với bảng của config gốc.")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
         f"KỸ THUẬT — batch của paper được chia thành nhiều lượt forward "
@@ -357,7 +396,12 @@ def main(argv: list[str] | None = None) -> int:
         description="§2.5 — R2Gen vs AdaAtt vs My Gemma, trọn gói.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--stages", default=",".join(STAGES))
+    ap.add_argument("--mode", default="full", choices=list(MODES),
+                    help="full | comparer_pretrain (chỉ R2Gen+AdaAtt, đẩy ckpt "
+                         "lên sota_hub.repo) | infer_test (không train, ckpt "
+                         "baseline kéo từ Hub)")
+    ap.add_argument("--stages", default=None,
+                    help="mặc định theo --mode (full: " + ",".join(STAGES) + ")")
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--init-from", default=None,
@@ -369,11 +413,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-resume", action="store_true",
                     help="decoder_ft của My Gemma làm LẠI từ đầu: bỏ qua (đổi tên "
                          "sang *.old_<ts>) checkpoint ft, predictions và điểm cũ")
+    ap.add_argument("--no-pull", action="store_true",
+                    help="không kéo checkpoint baseline từ sota_hub.repo")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
 
-    cfg = load_config(a.config, a.overrides)
+    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
     if str(cfg.get("experiment", "")) != "2.5":
         print(f"✗ config khai `experiment: {cfg.get('experiment')!r}`, chờ đợi "
               f"'2.5'. Điểm vào này đọc `arms_s25` và `sota`; một file cấu hình "
@@ -406,11 +452,22 @@ def main(argv: list[str] | None = None) -> int:
         cfg.setdefault("wandb", {})["enabled"] = False
 
     seed_everything(int(cfg.get("seed", 42)))
-    stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+    mode = a.mode
+    default_stages, allowed = MODES[mode]
+    stages = ([s.strip() for s in a.stages.split(",") if s.strip()]
+              if a.stages else list(default_stages))
     for s in stages:
-        if s not in STAGES:
-            print(f"✗ stage không biết: {s!r} (hợp lệ: {', '.join(STAGES)})")
+        if s not in allowed:
+            print(f"✗ stage {s!r} không hợp lệ ở --mode {mode} (hợp lệ: "
+                  f"{', '.join(allowed)})")
             return 2
+    if mode != "full" and a.no_resume:
+        print(f"✗ --no-resume chỉ dành cho decoder_ft của My Gemma (--mode "
+              f"full). Làm lại hai baseline: --mode comparer_pretrain --retrain")
+        return 2
+    if mode == "infer_test" and a.retrain:
+        print("✗ --mode infer_test không huấn luyện gì — --retrain vô nghĩa ở đây.")
+        return 2
     only = set(x.strip() for x in a.arms.split(",")) if a.arms else None
     try:
         arms = enabled_arms(cfg, only)
@@ -420,6 +477,17 @@ def main(argv: list[str] | None = None) -> int:
     if not arms:
         print("✗ không arm nào được bật")
         return 2
+    if mode == "comparer_pretrain":
+        ours_sel = [x["id"] for x in arms if x["kind"] != "sota"]
+        if only and ours_sel:
+            print(f"✗ --mode comparer_pretrain chỉ huấn luyện hai baseline; "
+                  f"{ours_sel} là candidate `ours` — bỏ khỏi --arms.")
+            return 2
+        arms = [x for x in arms if x["kind"] == "sota"]
+        if not arms:
+            print("✗ --mode comparer_pretrain: không baseline (kind=sota) nào "
+                  "được bật.")
+            return 2
 
     ft_arms = [x for x in arms if x["kind"] == "ours"]
     if a.no_resume:
@@ -443,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
     adapter_root = Path(str(cfg["output"].get("adapter_dir", "./adapters_2_5")))
 
+    # comparer_pretrain ghi manifest RIÊNG: manifest.json là của run chính, và
+    # một lần huấn luyện baseline không được phép ghi đè bảng kết quả của nó.
+    manifest_path = run_dir / ("manifest_comparer_pretrain.json"
+                               if mode == "comparer_pretrain" else "manifest.json")
     no_resume_moved: list[tuple[Path, Path]] = []
     if a.no_resume:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -469,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     manifest = {
-        "run_id": run_id, "experiment": "2.5",
+        "run_id": run_id, "experiment": "2.5", "mode": mode,
         "no_resume": ({"arms": [x["id"] for x in ft_arms],
                        "archived": [[str(o), str(n)] for o, n in no_resume_moved]}
                       if a.no_resume else None),
@@ -514,6 +586,53 @@ def main(argv: list[str] | None = None) -> int:
               f"điểm {'✓' if s['scored'] else '—'}", flush=True)
     manifest["cache_at_start"] = cache
 
+    # ── Checkpoint baseline từ Hub: KÉO trước khi quyết định huấn luyện ────
+    def _needs_ckpt(x: dict) -> bool:
+        if cache[x["id"]]["trained"]:
+            return False
+        if "train" in stages:
+            return True
+        return "infer" in stages and not (n_test and cache[x["id"]]["n_preds"] >= n_test)
+
+    if (mode != "comparer_pretrain" and not a.no_pull and not a.dry_run
+            and not a.retrain):
+        from . import sota_hub
+
+        want = [x for x in arms if x["kind"] == "sota" and _needs_ckpt(x)]
+        repo = ""
+        try:
+            repo = sota_hub.hub_cfg(cfg)["repo"]
+        except sota_hub.SotaHubError as e:
+            print(f"  ⚠ {e}", flush=True)
+        if want and repo:
+            print(f"⚙ kéo checkpoint baseline từ {repo}: "
+                  f"{', '.join(x['id'] for x in want)}", flush=True)
+            manifest["sota_from_hub"] = {}
+            for x in want:
+                try:
+                    meta = sota_hub.pull_arm(cfg, x, adapter_root / x["id"])
+                except sota_hub.SotaHubError as e:
+                    print(f"  ⚠ [{x['id']}] {e}", flush=True)
+                    manifest["sota_from_hub"][x["id"]] = {"ok": False, "error": str(e)}
+                    continue
+                cache[x["id"]]["trained"] = _trained(x)
+                manifest["sota_from_hub"][x["id"]] = {"ok": True, **meta}
+                print(f"  ✓ [{x['id']}] {meta.get('selection')} · đẩy lúc "
+                      f"{meta.get('pushed_at')}", flush=True)
+
+    if mode == "infer_test":
+        not_ready = [x for x in arms if _needs_ckpt(x)]
+        if not_ready:
+            for x in not_ready:
+                how = ("--mode comparer_pretrain trên máy có GPU, rồi kiểm "
+                       "`sota_hub.repo`" if x["kind"] == "sota"
+                       else "--mode full (decoder_ft My Gemma)")
+                print(f"✗ {x['id']}: không có checkpoint cục bộ lẫn trên Hub -> "
+                      f"{how}", flush=True)
+            print("  --mode infer_test KHÔNG huấn luyện: một cột sinh bằng "
+                  "trọng số ngẫu nhiên vẫn ra tiếng Anh đọc được.", flush=True)
+            return 10
+
     arms_to_train: list[dict] = []
     if "train" in stages:
         arms_to_train = (list(arms) if a.retrain
@@ -523,7 +642,27 @@ def main(argv: list[str] | None = None) -> int:
                   "việc chuẩn bị tập train (--retrain để làm lại)", flush=True)
     need_train = bool(arms_to_train)
 
-    tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
+    push_ckpt = ("push" in stages and mode == "comparer_pretrain"
+                 and bool(cfg["output"].get("push", True)))
+    pushed: dict[str, str | None] = {}
+    push_ckpt_err: list[str] = []
+
+    def _push_ckpt(arm: dict) -> None:
+        """Đẩy ngay khi MỘT baseline xong — baseline thứ hai hỏng không được
+        phép kéo theo vài giờ GPU của baseline thứ nhất."""
+        if not push_ckpt or arm["id"] in pushed:
+            return
+        from . import sota_hub
+
+        try:
+            pushed[arm["id"]] = sota_hub.push_arm(
+                cfg, arm, adapter_root / arm["id"], run_dir)
+        except sota_hub.SotaHubError as e:
+            print(f"  ✗ {e}", flush=True)
+            push_ckpt_err.append(str(e))
+
+    tracker = Tracker(cfg, run_id=(run_id if mode == "full" else f"{run_id}-{mode}"),
+                      config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
         print(f"⚙ W&B  : {tracker.url}", flush=True)
@@ -595,10 +734,13 @@ def main(argv: list[str] | None = None) -> int:
                 tracker.alert("§2.5 dừng: rò rỉ train/test", str(e), "ERROR")
                 tracker.finish(1)
                 return 4
+    elif mode == "comparer_pretrain" and not need_train:
+        test_df = None      # chỉ đẩy checkpoint đã có — không cần tập test
     else:
         test_df = data_mod.load_manifest(cfg)
         print(f"⚙ dùng lại manifest test: {len(test_df)} mẫu", flush=True)
-    tracker.summary({"data/n_test": len(test_df)})
+    if test_df is not None:
+        tracker.summary({"data/n_test": len(test_df)})
 
     # ── train ──────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
@@ -654,6 +796,12 @@ def main(argv: list[str] | None = None) -> int:
                     st = ts_mod.train_sota_arm(cfg, arm, train_df, val_df, odir,
                                                run_dir, tracker,
                                                max_steps_override=dry_steps)
+                    from . import sota_hub
+
+                    # Từ điển VỪA dùng đi cùng checkpoint (đè bản cũ nếu có).
+                    sota_hub.bundle_tokenizer(odir, run_dir, overwrite=True)
+                    if mode == "comparer_pretrain":
+                        _push_ckpt(arm)
                 else:
                     from . import train_recomb as tr_mod
 
@@ -674,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
                 manifest["arm_status"][aid] = {"trained": False, "unusable": str(e)}
                 tracker.alert("§2.5 dừng ở train", f"{aid}: {e}", "ERROR")
                 tracker.finish(1)
-                (run_dir / "manifest.json").write_text(
+                manifest_path.write_text(
                     json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
                     encoding="utf-8")
                 return 3
@@ -683,6 +831,34 @@ def main(argv: list[str] | None = None) -> int:
             p = adapter_root / arm["id"] / "train_stats.json"
             if p.exists():
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
+
+    if mode == "comparer_pretrain":
+        if push_ckpt:
+            _hr(f"Đẩy checkpoint baseline lên {cfg.get('sota_hub', {}).get('repo')}")
+            for arm in arms:
+                if _trained(arm):
+                    _push_ckpt(arm)
+                else:
+                    print(f"  ⊘ [{arm['id']}] chưa có checkpoint — không đẩy",
+                          flush=True)
+        elif "push" in stages:
+            print("⊘ output.push = false (--no-push / --dry-run) — không đẩy "
+                  "checkpoint", flush=True)
+        manifest["sota_pushed"] = pushed
+        if push_ckpt_err:
+            manifest["push_error"] = push_ckpt_err
+        manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
+        tracker.finish(1 if push_ckpt_err else 0)
+        print(f"\n✓ comparer_pretrain xong sau {manifest['minutes_total']} phút"
+              f" · checkpoint: {adapter_root}", flush=True)
+        for aid, url in pushed.items():
+            print(f"  {aid:<8} {url or '(không đẩy)'}", flush=True)
+        print("  Tiếp theo (máy nào cũng được): --mode infer_test hoặc --mode "
+              "full — checkpoint baseline sẽ được kéo về khi thiếu.", flush=True)
+        return 8 if push_ckpt_err else 0
 
     # ── infer ──────────────────────────────────────────────────────────────
     pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
@@ -838,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest["report_error"] = report_err.splitlines()[-1]
             tracker.alert("§2.5: báo cáo hỏng (kết quả vẫn còn)",
                           report_err[-1500:], "ERROR")
-            (run_dir / "manifest.json").write_text(
+            manifest_path.write_text(
                 json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8")
         s = mdir / "summary.csv"
@@ -873,7 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
             tracker.alert("§2.5: đẩy Hub hỏng (kết quả vẫn còn)",
                           push_err[-1500:], "ERROR")
 
-    (run_dir / "manifest.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
     mins = (time.time() - t_start) / 60

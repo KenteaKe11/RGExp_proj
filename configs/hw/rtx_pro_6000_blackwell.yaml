@@ -1,0 +1,72 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Profile — NVIDIA RTX PRO 6000 Blackwell (96 GB GDDR7, sm_120)
+#
+#     bash scripts/run_pretrain.sh  --hw rtx_pro_6000_blackwell --detach   # Stage 0 TRƯỚC
+#     bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --mode comparer_pretrain --detach
+#     bash scripts/run_section25.sh --hw rtx_pro_6000_blackwell --detach
+#
+# HAI khối, và `load_config` đối xử với chúng khác nhau:
+#
+# `set:`        — PHẦN CỨNG. Chỉ các khoá trong `src/config.HW_KEYS` (batch mỗi
+#                 lượt forward, grad_accum, checkpointing, worker, batch lúc
+#                 sinh/chấm). DỪNG nếu khai khoá khác, hoặc nếu
+#                 `per_device_batch_size × grad_accum` của `train`/`pretrain`
+#                 lệch config gốc.
+# `experiment:` — THÍ NGHIỆM. Đổi được mọi khoá, nhưng đây là một thí nghiệm
+#                 KHÁC bản 6400 mẫu / 1 epoch của configs/section25.yaml: nó
+#                 được ghi vào `manifest.deviations`, và `load_config` DỪNG nếu
+#                 khối này không đồng thời đổi mọi khoá trong
+#                 `src/config.ISOLATION_KEYS` — run dir, thư mục checkpoint,
+#                 Stage 0 cục bộ và trên Hub, checkpoint baseline trên Hub. Chung
+#                 một chỗ nghĩa là `--resume`, "đã có checkpoint -> bỏ qua train"
+#                 hay việc kéo ckpt baseline từ Hub lặng lẽ lấy checkpoint của
+#                 thí nghiệm kia.
+#
+# Blackwell cần PyTorch build cho CUDA >= 12.8 (torch >= 2.7, cu128) và
+# bitsandbytes bản có kernel sm_120; build cũ nổ "no kernel image is available"
+# ngay ở kernel đầu tiên. `requires.cuda_arch` được kiểm lúc nạp config.
+# ═════════════════════════════════════════════════════════════════════════════
+name: rtx_pro_6000_blackwell
+gpu_name_contains: "RTX PRO 6000"
+requires:
+  cuda_arch: sm_120
+  min_vram_gb: 90
+
+set:
+  # ── My Gemma · decoder_ft — eff_bs 32 = 4 × 8 (gốc 1 × 32) ─────────────
+  # Không checkpointing: bớt một lượt forward lặp lại mỗi bước. Với 4 mẫu ×
+  # ~1.3k token, khối lớn nhất là logits fp32 trên từ vựng 262k (~5.5 GB).
+  # Hết VRAM thì hạ về 2 × 16 trước, rồi mới bật lại checkpointing.
+  train.per_device_batch_size: 4
+  train.grad_accum: 8
+  train.gradient_checkpointing: false
+
+  # ── Stage 0 (sup_pretrain + Stage 0 của hai baseline) — eff_bs 32 = 32 × 1
+  pretrain.per_device_batch_size: 32
+  pretrain.grad_accum: 1
+
+  # ── R2Gen / AdaAtt — batch paper giữ nguyên, chỉ đổi số ảnh mỗi lượt ────
+  # AdaAtt 80 = 40 × 2 · R2Gen 16 = 16 × 1 · Stage 0 32 = 32 × 1.
+  sota_train.micro_batch: 40
+  sota_train.infer_batch: 32      # × beam 3 = 96 chuỗi mỗi lượt
+  sota_train.num_workers: 12
+
+  # ── Sinh + chấm ─────────────────────────────────────────────────────────
+  base.batch_size: 16             # My Gemma sinh: 16 ảnh × beam 3
+  metrics.bertscore.batch_size: 128
+
+experiment:
+  # 16384 mẫu train (= 2^14 = 512 bước × eff_bs 32 mỗi epoch) cho CẢ BA
+  # candidate và cho Stage 0 — điều kiện 2 vẫn giữ: cùng một tập train.
+  data.n_train: 16384
+  pretrain.n_train: 16384
+  # My Gemma · decoder_ft: 2 epoch = 1024 bước, vẫn MỘT chu kỳ one-cycle cho
+  # toàn bộ main-stage. Hai baseline giữ số epoch của paper (sota.*).
+  train.n_epochs: 2
+
+  # ── Cách ly khỏi thí nghiệm 6400 mẫu (bắt buộc — ISOLATION_KEYS) ────────
+  output.subdir: "2.5_sota_b16k"
+  output.adapter_dir: ./adapters_2_5_b16k
+  pretrain.subdir: sup_pretrain_b16k
+  pretrain.hub_repo: RGExp123/RGExp_sup_pretrain_b16k
+  sota_hub.subdir: "2.5_sota_b16k"

@@ -384,5 +384,5 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Chuẩn bị TestSet 3k rồi thoát.")
     add_common_args(ap)
     a = ap.parse_args()
-    prepare(load_config(a.config, a.overrides))
+    prepare(load_config(a.config, a.overrides, getattr(a, "hw", None)))
     sys.exit(0)

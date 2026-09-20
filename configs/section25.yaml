@@ -652,6 +652,18 @@ sota_train:
   num_workers: 4
   grad_clip: 0.0          # 0 = tắt. Không paper nào khai clip — đừng bật ngầm.
 
+# ── Checkpoint hai baseline trên Hub — `--mode comparer_pretrain` ──────────
+# comparer_pretrain huấn luyện RIÊNG R2Gen + AdaAtt rồi đẩy gói
+# model_best.pt + train_stats.json + tokenizer.json + hub_meta.json lên
+# `<repo>/<subdir>/<arm_id>/` (repo MODEL). `infer_test` và `full` thấy thiếu
+# checkpoint cục bộ thì kéo về từ đây (kiểm sha256 + image_policy) trước khi
+# quyết định có huấn luyện hay không. `repo: ""` = tắt cả đẩy lẫn kéo.
+sota_hub:
+  repo: RGExp123/RGExp_sota_ckpt
+  private: true
+  subdir: "2.5_sota"      # thư mục trong repo; mỗi candidate một thư mục con
+  revision: null          # ghim một commit/nhánh khi kéo; null = main
+
 wandb:
   enabled: true
   project: rgexp-section25

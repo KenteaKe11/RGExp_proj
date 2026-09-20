@@ -331,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
 
-    cfg = load_config(a.config, a.overrides)
+    cfg = load_config(a.config, a.overrides, getattr(a, "hw", None))
 
     # ── Chọn thí nghiệm ────────────────────────────────────────────────────
     # `--exp` thắng config; config chỉ là mặc định. Và `moe.enabled` được đặt
