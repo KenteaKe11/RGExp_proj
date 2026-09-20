@@ -1,0 +1,61 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Profile — 1 × NVIDIA RTX PRO 6000 Blackwell, lát MIG 2g.48gb
+#           (~48 GB, một nửa số SM của card, sm_120)
+#
+#     export CUDA_VISIBLE_DEVICES=MIG-<uuid>      # nvidia-smi -L
+#     bash scripts/run_pretrain.sh  --hw rtx_pro_6000_mig_2g48 --detach
+#     bash scripts/run_section25.sh --hw rtx_pro_6000_mig_2g48 --mode comparer_pretrain --detach
+#     bash scripts/run_section25.sh --hw rtx_pro_6000_mig_2g48 --detach
+#
+# Luật của hai khối giống hệt `rtx_pro_6000_blackwell.yaml` (đọc đầu file đó).
+#
+# `experiment:` CHÉP NGUYÊN khối của profile 96 GB — cùng thí nghiệm 16384 mẫu
+# / My Gemma 2 epoch, cùng run dir, cùng thư mục checkpoint, cùng repo Stage 0.
+# Chung chỗ ở đây là CỐ Ý: chỉ `set:` (phần cứng) khác nhau, batch hiệu dụng
+# bằng nhau, nên checkpoint baseline train trên card đủ 96 GB (--mode
+# comparer_pretrain) được lát MIG kéo về dùng thẳng, và ngược lại. selftest
+# kiểm hai khối `experiment:` bằng nhau từng khoá.
+#
+# MIG: một lát chỉ thấy MỘT thiết bị CUDA, không P2P, không NVLink, và chỉ có
+# phần SM của lát — thời gian mỗi bước xấp xỉ gấp đôi card nguyên. Bộ nhớ
+# `torch.cuda.get_device_properties(0).total_memory` là của LÁT (~47 GiB).
+# ═════════════════════════════════════════════════════════════════════════════
+name: rtx_pro_6000_mig_2g48
+gpu_name_contains: "RTX PRO 6000"
+requires:
+  cuda_arch: sm_120
+  min_vram_gb: 44
+
+set:
+  # ── My Gemma · decoder_ft — eff_bs 32 = 2 × 16 ─────────────────────────
+  # Không checkpointing: ước lượng ~20 GB ở 2 mẫu × ~1.3k token (logits fp32
+  # trên từ vựng 262k ~2.7 GB). Hết VRAM thì bật lại checkpointing TRƯỚC khi
+  # hạ về 1 × 32.
+  train.per_device_batch_size: 2
+  train.grad_accum: 16
+  train.gradient_checkpointing: false
+
+  # ── Stage 0 — eff_bs 32 = 16 × 2 (như config gốc) ──────────────────────
+  pretrain.per_device_batch_size: 16
+  pretrain.grad_accum: 2
+
+  # ── R2Gen / AdaAtt — AdaAtt 80 = 20 × 4 · R2Gen 16 = 16 × 1 · Stage 0 16 × 2
+  sota_train.micro_batch: 20
+  sota_train.infer_batch: 16      # × beam 3 = 48 chuỗi mỗi lượt
+  sota_train.num_workers: 8
+
+  # ── Sinh + chấm ─────────────────────────────────────────────────────────
+  base.batch_size: 8              # My Gemma sinh: 8 ảnh × beam 3
+  metrics.bertscore.batch_size: 64
+
+experiment:
+  # CHÉP NGUYÊN từ rtx_pro_6000_blackwell.yaml — sửa một bên thì sửa cả hai.
+  data.n_train: 16384
+  pretrain.n_train: 16384
+  train.n_epochs: 2
+
+  output.subdir: "2.5_sota_b16k"
+  output.adapter_dir: ./adapters_2_5_b16k
+  pretrain.subdir: sup_pretrain_b16k
+  pretrain.hub_repo: RGExp123/RGExp_sup_pretrain_b16k
+  sota_hub.subdir: "2.5_sota_b16k"

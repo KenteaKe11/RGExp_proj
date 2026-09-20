@@ -997,6 +997,31 @@ def t_hw_profile_rejects_experiment_keys():
                 pass
 
 
+def t_hw_profile_mig_2g48_shares_experiment():
+    """Lát MIG 2g.48gb: chỉ phần cứng khác profile 96 GB; cùng thí nghiệm, cùng chỗ."""
+    import yaml
+
+    from src.config import HW_KEYS, load_config, resolve_hw
+
+    mig = load_config(hw="rtx_pro_6000_mig_2g48")
+    full = load_config(hw="rtx_pro_6000_blackwell")
+    rec = mig["hardware_profile"]
+    assert set(rec["changed"]) <= HW_KEYS, rec["changed"]
+    for sec in ("train", "pretrain"):
+        a = CFG[sec]["per_device_batch_size"] * CFG[sec]["grad_accum"]
+        b = mig[sec]["per_device_batch_size"] * mig[sec]["grad_accum"]
+        assert a == b, (sec, a, b)
+    ea = yaml.safe_load(resolve_hw("rtx_pro_6000_mig_2g48").read_text(encoding="utf-8"))
+    eb = yaml.safe_load(resolve_hw("rtx_pro_6000_blackwell").read_text(encoding="utf-8"))
+    assert ea["experiment"] == eb["experiment"], "hai profile lệch khối experiment"
+    assert ea["requires"]["min_vram_gb"] < 48 < eb["requires"]["min_vram_gb"]
+    # nhỏ hơn card nguyên ở MỌI khoá batch mỗi lượt
+    for k in ("train.per_device_batch_size", "sota_train.micro_batch",
+              "base.batch_size"):
+        a, b = k.split(".")
+        assert mig[a][b] <= full[a][b], k
+
+
 def t_beam_size_is_3_everywhere():
     """Ba candidate sinh cùng một độ rộng beam."""
     assert int(CFG["generate"]["num_beams"]) == 3
@@ -1162,6 +1187,8 @@ if __name__ == "__main__":
     check("config khai sota_hub (repo MODEL riêng)", t_config_declares_sota_hub)
     check("profile RTX PRO 6000: phần cứng + thí nghiệm đã khai + cách ly",
           t_hw_profile_blackwell_keeps_experiment)
+    check("profile MIG 2g.48gb: cùng thí nghiệm với profile 96 GB",
+          t_hw_profile_mig_2g48_shares_experiment)
     check("profile từ chối khoá thí nghiệm ở `set:` / đổi eff_bs / không cách ly",
           t_hw_profile_rejects_experiment_keys)
 

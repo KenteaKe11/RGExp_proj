@@ -263,6 +263,12 @@ epoch. Nó được ghi vào `manifest.deviations`, và phải có run dir / che
 repo Stage 0 / thư mục ckpt baseline riêng (`src/config.ISOLATION_KEYS`), nếu
 thiếu là DỪNG. Cần torch build cu128 (>= 2.7).
 
+**Lát MIG 2g.48gb của cùng card** — `--hw rtx_pro_6000_mig_2g48` (đặt
+`CUDA_VISIBLE_DEVICES=MIG-<uuid>` trước). `set:` nhỏ hơn: My Gemma 2×16 không
+checkpointing, Stage 0 16×2, `micro_batch` 20. Khối `experiment:` chép nguyên
+profile 96 GB (selftest kiểm), nên hai profile dùng chung run dir và checkpoint:
+baseline train trên card nguyên được lát MIG kéo về dùng thẳng.
+
 `--dry-run` là phép thử **đường ống**, không phải phép dò VRAM: nó chạy với đúng
 batch trong config, và vài bước trên vài chục mẫu ngắn không nói được gì về VRAM
 đỉnh của 6400 mẫu.
