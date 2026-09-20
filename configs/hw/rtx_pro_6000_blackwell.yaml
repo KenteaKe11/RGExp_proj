@@ -44,6 +44,7 @@ set:
   # ── Stage 0 (sup_pretrain + Stage 0 của hai baseline) — eff_bs 32 = 32 × 1
   pretrain.per_device_batch_size: 32
   pretrain.grad_accum: 1
+  pretrain.data_threads: 16       # dựng 32 ảnh 896px song song với GPU
 
   # ── R2Gen / AdaAtt — batch paper giữ nguyên, chỉ đổi số ảnh mỗi lượt ────
   # AdaAtt 80 = 40 × 2 · R2Gen 16 = 16 × 1 · Stage 0 32 = 32 × 1.
@@ -65,8 +66,11 @@ experiment:
   # (2 × 512 = 1024 bước so với 3 × 200 = 600). Điều kiện 5 giữ: CẢ BA dùng
   # chung con số này.
   pretrain.n_epochs: 2
-  # My Gemma · decoder_ft: 2 epoch = 1024 bước, vẫn MỘT chu kỳ one-cycle cho
-  # toàn bộ main-stage. Hai baseline giữ số epoch của paper (sota.*).
+  # Hai baseline giữ số epoch main-stage của paper (sota.*).
+  # My Gemma · decoder_ft: 2 epoch = 2 × 512 = 1024 bước, MỘT chu kỳ one-cycle
+  # trải trên CẢ 1024 bước (warm-up 10% đầu -> đỉnh -> cosine về đáy ở bước
+  # cuối), KHÔNG restart ở ranh giới epoch. `train_recomb.ft_lrs` DỪNG nếu
+  # `train.schedule` khai `cycle_steps`/`lr_decay`; selftest kiểm đường lr.
   train.n_epochs: 2
 
   # ── Cách ly khỏi thí nghiệm 6400 mẫu (bắt buộc — ISOLATION_KEYS) ────────

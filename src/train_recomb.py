@@ -1044,15 +1044,30 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     order = torch.randperm(n, generator=g).tolist()
     cursor = 0
 
-    def next_micro() -> dict:
+    def next_idx() -> list[int]:
         nonlocal cursor, order
-        rows = []
+        idx = []
         for _ in range(bs):
             if cursor >= len(order):
                 order = torch.randperm(n, generator=g).tolist()
                 cursor = 0
-            rows.append(ds[order[cursor]])
+            idx.append(order[cursor])
             cursor += 1
+        return idx
+
+    # Micro-batch k+1 được dựng trong MỘT luồng nền lúc micro-batch k chạy trên
+    # GPU. Một luồng, không hơn: dataset gọi tokenizer fast của HF, vốn không an
+    # toàn khi gọi đồng thời. `g` chỉ dùng ở đây, nên rút hoán vị sớm hơn một
+    # micro-batch vẫn cho ĐÚNG dãy chỉ số như trước (src/prefetch.py).
+    from .prefetch import OrderedPrefetcher
+
+    pf = OrderedPrefetcher(ds.__getitem__,
+                           1 if bool(tcfg.get("prefetch", True)) else 0)
+    pending = [pf.submit(next_idx())]
+
+    def next_micro() -> dict:
+        rows = pf.result(pending[0])
+        pending[0] = pf.submit(next_idx())
         b = collate_cls(rows, pad_id)
         return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in b.items()}
 

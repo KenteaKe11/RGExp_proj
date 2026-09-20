@@ -88,8 +88,9 @@ def _set_path(d: dict, dotted: str, value: Any) -> None:
 HW_DIR = ROOT / "configs" / "hw"
 HW_KEYS = frozenset({
     "train.per_device_batch_size", "train.grad_accum",
-    "train.gradient_checkpointing",
+    "train.gradient_checkpointing", "train.prefetch",
     "pretrain.per_device_batch_size", "pretrain.grad_accum",
+    "pretrain.data_threads",
     "sota_train.micro_batch", "sota_train.infer_batch",
     "sota_train.num_workers",
     "base.batch_size", "metrics.bertscore.batch_size",

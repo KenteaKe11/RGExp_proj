@@ -371,6 +371,9 @@ train:
   grad_accum: 32
   max_seq_len: 1024
   gradient_checkpointing: true
+  # Dựng micro-batch kế tiếp trong MỘT luồng nền khi GPU đang chạy (thứ tự mẫu
+  # không đổi — src/prefetch.py). Khoá tốc độ, không phải khoá thí nghiệm.
+  prefetch: true
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
@@ -602,6 +605,9 @@ pretrain:
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
   per_device_batch_size: 16
   grad_accum: 2
+  # Số luồng dựng ảnh (PIL + processor 896px) cho micro-batch kế tiếp; 0 = đồng
+  # bộ như cũ. Thứ tự mẫu không đổi. Khoá tốc độ.
+  data_threads: 4
   schedule:
     impl: lambda
     max_lr: 1.6e-4          # = 0.8 × 2e-4 (lịch cũ)

@@ -689,6 +689,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
 
     branch.train()
     epoch_rows: list[dict] = []
+    from .prefetch import OrderedPrefetcher
+
+    # Ảnh của micro-batch k+1 được dựng trong lúc micro-batch k chạy trên GPU;
+    # thứ tự mẫu KHÔNG đổi (src/prefetch.py). Chỉ PIL + image processor, nên
+    # nhiều luồng được.
+    pf = OrderedPrefetcher(ds.__getitem__, int(pcfg.get("data_threads", 4)))
     try:
         for epoch in range(start_epoch, n_epochs):
             te = time.time()
@@ -697,18 +703,18 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             # "epoch 5 của một lần chạy liền mạch" thấy.
             order = torch.randperm(n, generator=g).tolist()
             cursor = 0
+            # Không prefetch vượt ranh giới epoch: hoán vị của epoch sau chỉ
+            # được rút từ `g` khi epoch ấy bắt đầu, như trước.
+            pending = pf.submit(order[cursor:cursor + bs])
             ep_asl = ep_w = 0.0
             ep_tp = ep_fp = ep_fn = 0.0
             for step in range(per_epoch):
                 opt.zero_grad(set_to_none=True)
                 st_asl = 0.0
                 for _ in range(accum):
-                    rows = []
-                    for _ in range(bs):
-                        if cursor >= len(order):
-                            break
-                        rows.append(ds[order[cursor]])
-                        cursor += 1
+                    rows = pf.result(pending)
+                    cursor += len(rows)
+                    pending = pf.submit(order[cursor:cursor + bs])
                     if not rows:
                         break
                     b = collate_vision(rows)

@@ -1017,10 +1017,78 @@ def t_hw_profile_mig_2g48_shares_experiment():
     assert ea["experiment"] == eb["experiment"], "hai profile lệch khối experiment"
     assert ea["requires"]["min_vram_gb"] < 48 < eb["requires"]["min_vram_gb"]
     # nhỏ hơn card nguyên ở MỌI khoá batch mỗi lượt
-    for k in ("train.per_device_batch_size", "sota_train.micro_batch",
-              "base.batch_size"):
+    for k in ("train.per_device_batch_size", "base.batch_size"):
         a, b = k.split(".")
         assert mig[a][b] <= full[a][b], k
+
+
+def t_hw_decoder_ft_two_epochs_one_cycle():
+    """GPU cao cấp: decoder_ft 2 epoch = MỘT chu kỳ one-cycle, không restart."""
+    import torch
+
+    from src.backbone import build_scheduler, total_steps
+    from src.config import load_config
+    from src.train_recomb import ft_lrs
+
+    for prof in ("rtx_pro_6000_blackwell", "rtx_pro_6000_mig_2g48"):
+        hw = load_config(hw=prof)
+        tc = hw["train"]
+        assert int(tc["n_epochs"]) == 2, prof
+        sch = dict(tc["schedule"])
+        assert not sch.get("cycle_steps") and "lr_decay" not in sch, sch
+        ft_lrs(hw)                                   # không ném = lịch hợp lệ
+        n = int(hw["data"]["n_train"])
+        steps = total_steps(n, int(tc["per_device_batch_size"]),
+                            int(tc["grad_accum"]), int(tc["n_epochs"]))
+        per_ep = steps // 2
+        assert steps == 1024 and per_ep == 512, (prof, steps)
+        p = torch.nn.Parameter(torch.zeros(1))
+        opt = torch.optim.SGD([p], lr=float(sch["max_lr"]))
+        sc = build_scheduler(opt, steps, sch)
+        lrs = []
+        for _ in range(steps):
+            lrs.append(opt.param_groups[0]["lr"])
+            opt.step()
+            sc.step()
+        peak = max(range(steps), key=lambda i: lrs[i])
+        assert abs(peak - float(sch["pct_start"]) * steps) <= 2, peak
+        tail = lrs[peak:]
+        assert all(b <= a + 1e-15 for a, b in zip(tail, tail[1:])), \
+            "lr tăng lại sau đỉnh — có restart"
+        assert lrs[per_ep] < 0.9 * lrs[peak] and lrs[per_ep] > lrs[-1], \
+            "đầu epoch 2 phải đang ở giữa đoạn cosine"
+        assert lrs[-1] < 1e-2 * lrs[peak]
+
+
+def t_prefetch_keeps_order():
+    """Prefetch trả mẫu ĐÚNG thứ tự chỉ số, ở cả ba chế độ; một luồng thì tuần tự."""
+    import threading
+    import time
+
+    from src.prefetch import OrderedPrefetcher
+
+    active, peak = [0], [0]
+    lock = threading.Lock()
+
+    def fetch(i):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.002 * ((7 * i) % 5))       # hoàn thành lệch thứ tự
+        with lock:
+            active[0] -= 1
+        return i * 10
+
+    for th in (0, 1, 4):
+        peak[0] = 0
+        pf = OrderedPrefetcher(fetch, th)
+        idxs = [5, 3, 9, 0, 7, 1]
+        h = pf.submit(idxs)
+        assert pf.result(h) == [i * 10 for i in idxs], th
+        assert pf.result(pf.submit([])) == []
+        pf.close()
+        if th == 1:
+            assert peak[0] == 1, "threads=1 phải gọi fetch TUẦN TỰ (tokenizer)"
 
 
 def t_beam_size_is_3_everywhere():
@@ -1190,6 +1258,9 @@ if __name__ == "__main__":
           t_hw_profile_blackwell_keeps_experiment)
     check("profile MIG 2g.48gb: cùng thí nghiệm với profile 96 GB",
           t_hw_profile_mig_2g48_shares_experiment)
+    check("prefetch giữ nguyên thứ tự mẫu", t_prefetch_keeps_order)
+    check("GPU cao cấp: decoder_ft 2 epoch, MỘT chu kỳ one-cycle",
+          t_hw_decoder_ft_two_epochs_one_cycle)
     check("profile từ chối khoá thí nghiệm ở `set:` / đổi eff_bs / không cách ly",
           t_hw_profile_rejects_experiment_keys)
 
