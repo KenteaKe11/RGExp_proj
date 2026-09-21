@@ -555,7 +555,8 @@ def t_lora_report_builds():
 
 
 def t_rank_trend_plot():
-    """Xu hướng theo rank: CHỈ decoder, log2(r), γ xếp tầng, nét đứt ở max, PNG + REPORT."""
+    """Metric theo MỌI candidate (attn + decoder); hồi quy rank chỉ trên decoder;
+    γ xếp tầng; nét đứt + chấm ở max; PNG + REPORT."""
     import tempfile
 
     from src import report_plots as rp
@@ -573,9 +574,13 @@ def t_rank_trend_plot():
         scores[x["id"]] = pd.DataFrame({"key": keys, **{
             m: base[m] + slope[m] * lx + img[m] + rng.normal(0, 0.01, 120)
             for m in base}})
+    # attn r=8 cao vượt trội ở BertF1 -> max của BertF1 phải là candidate attn
+    scores["qlora_r8_attn"]["bertscore_f1"] += 0.05
     tr = rp.rank_trend(scores, arms, CFG)
     assert tr is not None and tr.attrs["ranks"] == [2, 4, 8, 32], tr.attrs
-    assert "qlora_r8_attn" not in tr.attrs["arm_ids"], "attn KHÔNG được vào hồi quy"
+    assert tr.attrs["arm_ids"] == ["qlora_r8_attn", "qlora_r2_decoder", "qlora_r4_decoder",
+                                   "qlora_r8_decoder", "qlora_r32_decoder"], tr.attrs
+    assert tr.attrs["labels"][0] == "attn r=8" and tr.attrs["labels"][-1] == "decoder r=32"
     assert list(tr["label"]) == ["B3", "B4", "RL", "BertF1"]
     for _, r in tr.iterrows():
         want = slope[r["metric"]]
@@ -586,7 +591,8 @@ def t_rank_trend_plot():
     # cách nhau đúng gamma_spread · M (sai số do làm tròn γ).
     g = dict(zip(tr["metric"], tr["gamma"]))
     assert g["bertscore_f1"] == 1.0, g
-    lvl = {r["metric"]: np.mean([r[f"mean_r{k}"] for k in (2, 4, 8, 32)]) * r["scale"]
+    ids = tr.attrs["arm_ids"]
+    lvl = {r["metric"]: np.mean([r[f"mean__{a}"] for a in ids]) * r["scale"]
            for _, r in tr.iterrows()}
     order = ["bleu4", "bleu3", "rougeL", "bertscore_f1"]      # TB gốc tăng dần
     assert [lvl[m] for m in order] == sorted(lvl.values()), lvl
@@ -600,22 +606,29 @@ def t_rank_trend_plot():
         "bleu3": 1.0, "bleu4": 2.5, "rougeL": 1.0, "bertscore_f1": 1.0}
     off = rp.rank_trend(scores, arms, type(CFG)(dict(CFG, report={"rank_plot": {"gamma": "off"}})))
     assert (off["scale"] == 1.0).all()
-    # Max từng metric: đúng giá trị TB lớn nhất và rank đạt nó (số GỐC)
+    # Max từng metric: đúng giá trị TB lớn nhất và candidate đạt nó (số GỐC), xét
+    # MỌI candidate — kể cả attn
     for _, r in tr.iterrows():
-        vals = {k: r[f"mean_r{k}"] for k in (2, 4, 8, 32)}
-        assert r["max"] == max(vals.values()) and vals[r["max_rank"]] == r["max"], r
+        vals = {a: r[f"mean__{a}"] for a in ids}
+        assert r["max"] == max(vals.values()) and vals[r["max_arm"]] == r["max"], r
+    mx = dict(zip(tr["metric"], tr["max_arm"]))
+    assert mx["bertscore_f1"] == "qlora_r8_attn" and mx["bleu3"] == "qlora_r32_decoder", mx
     assert not hasattr(rp, "local_quadratic"), "không còn line chart"
-    # < 2 rank decoder có điểm -> không vẽ, không ném lỗi
-    one = {k: v for k, v in scores.items() if k in ("qlora_r8_attn", "qlora_r2_decoder")}
-    assert rp.rank_trend(one, arms, CFG) is None
+    # < 2 rank decoder: vẫn vẽ các candidate, nhưng không hồi quy (b = NaN)
+    two = {k: v for k, v in scores.items() if k in ("qlora_r8_attn", "qlora_r2_decoder")}
+    t2 = rp.rank_trend(two, arms, CFG)
+    assert t2 is not None and t2["slope_per_doubling"].isna().all()
+    assert "—" in "\n".join(rp.markdown_section(t2, None))
+    # < 2 candidate -> không vẽ, không ném lỗi
+    assert rp.rank_trend({"qlora_r8_attn": scores["qlora_r8_attn"]}, arms, CFG) is None
     with tempfile.TemporaryDirectory() as d:
         png = rp.plot_rank_trend(tr, Path(d) / "figures" / "t.png")
         assert png.exists() and png.stat().st_size > 10_000
     md = "\n".join(rp.markdown_section(tr, "figures/t.png"))
-    assert "![metric theo rank](figures/t.png)" in md and "| B4 |" in md
-    assert "r = 32" in md and "CI95" in md
+    assert "![metric theo candidate](figures/t.png)" in md and "| B4 |" in md
+    assert "attn r=8" in md and "decoder r=32" in md and "CI95" in md
     assert "(γ=1.00)" in rp._leg(tr.iloc[3]) and "Cách đọc" in md and "e^(γ−1)" in md
-    assert "nét đứt" in md.lower() and "max (rank)" in md and "b / TB" in md
+    assert "nét đứt" in md.lower() and "max (candidate)" in md and "b / TB" in md
 
 
 def t_friedman_matches_scipy():
@@ -959,7 +972,7 @@ if __name__ == "__main__":
           t_lora_targets_match_real_names)
     check("REPORT.md dựng được", t_lora_report_builds)
     check("kết quả từng candidate lên Hub + tem; kéo về không sinh lại", t_hub_sync_per_arm)
-    check("xu hướng theo rank: decoder, log2, PNG", t_rank_trend_plot)
+    check("metric theo mọi candidate: bar + max, hồi quy trên decoder, PNG", t_rank_trend_plot)
     check("--arms lạ là DỪNG", t_lora_main_rejects_unknown_arm)
     check("ba lệnh train / push / stats tách rời", t_commands_split)
     check("fixture: sub-dataset + loader-setup khoá, lệch là DỪNG",

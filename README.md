@@ -27,16 +27,17 @@ metric (`stats.posthoc_scope: permetric`; `global` = Holm trên mọi cặp × m
 "Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng 7
 cặp khác nhau đúng một biến (6 cặp rank @ decoder, 1 cặp chỗ gắn ở r=8).
 
-**Xu hướng theo rank** (cuối `REPORT.md`, CHỈ `decoder` = full linear;
-`report.rank_plot` trong `configs/lora.yaml`). Một đồ thị hỗn hợp
-`figures/rank_trend_decoder.png`: X = rank (thang log2: 2, 4, 8, 32), mỗi rank
-một cụm **bar** 4 metric (B3 · B4 · RL · BertF1), và mỗi metric một **đường
-ngang nét đứt mảnh** cùng màu ở giá trị MAX của metric ấy qua các rank (nhãn
-ghi max gốc + rank đạt max) — không có line chart nối các rank. Bảng kèm
-theo: điểm TB từng rank, max (rank), hồi quy
-`metric ≈ a + b·log2(r)` làm số tóm tắt (`b` = đổi bao nhiêu mỗi lần gấp đôi
-rank), CI95 của `b` (bootstrap ghép cặp theo ảnh), R².
-Số liệu ở `metrics/rank_trend_decoder.csv`. Chỉ mô tả, không thay kiểm định.
+**Metric theo candidate** (cuối `REPORT.md`; `report.rank_plot` trong
+`configs/lora.yaml`). Một đồ thị hỗn hợp `figures/metrics_by_candidate.png`
+cho **mọi** candidate (attn r=8 · decoder r=2, 4, 8, 32 — nhóm theo chỗ gắn,
+có khoảng hở giữa hai nhóm): mỗi candidate một cụm **bar** 4 metric (B3 · B4 ·
+RL · BertF1), mỗi metric một **đường ngang nét đứt mảnh** cùng màu ở giá trị
+MAX của metric ấy qua mọi candidate, **chấm** ở cột đạt max (nhãn ghi max gốc +
+candidate đạt max) — không có line chart. Bảng kèm theo: điểm TB từng
+candidate, max (candidate), và hồi quy `metric ≈ a + b·log2(r)` CHỈ trên các
+candidate `decoder` (`target`; `b` = đổi bao nhiêu mỗi lần gấp đôi rank), CI95
+của `b` (bootstrap ghép cặp theo ảnh), R². Số liệu ở
+`metrics/metrics_by_candidate.csv`. Chỉ mô tả, không thay kiểm định.
 
 Trên đồ thị, mỗi metric được nhân `e^(γ−1)` để các đường xếp thành **tầng tách
 rời** thay vì B3/B4 (~0.1) nằm bẹp dưới BertF1 (~0.86); legend ghi
@@ -198,7 +199,7 @@ src/fixture.py         adapters_lora/_fixture: sub-dataset + loader-setup + sổ
 src/stats_friedman.py  Friedman (ties, Iman-Davenport) + hậu kiểm Wilcoxon/permutation, Holm
 src/push.py            push vào repo cũ, current/, kiểm trùng weight
 src/report_lora.py     REPORT.md (ghi đè mỗi lần stats)
-src/report_plots.py    xu hướng theo rank của decoder: bar điểm TB + nét đứt ở max từng metric (figures/)
+src/report_plots.py    metric theo mọi candidate: bar điểm TB + nét đứt/chấm ở max từng metric (figures/)
 src/train_recomb.py    vòng huấn luyện (candidate KHÔNG nhánh = Gemma NF4 + adapter peft)
 src/backbone.py        nạp base, chọn target module (lọc vision), alpha, one-cycle
 src/runners/           sinh (gemma3_recomb) — cùng đường dựng chuỗi với lúc train

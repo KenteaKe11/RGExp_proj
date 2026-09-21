@@ -424,17 +424,18 @@ wandb:
   log_every: 20
   log_samples: 20
 
-# ── REPORT: xu hướng theo rank (`src/report_plots.py`) ─────────────────────
-# CHỈ cho một chỗ gắn (`target`, mặc định decoder = full linear). Một đồ thị
-# hỗn hợp `figures/rank_trend_<target>.png`: BAR = điểm TB của 4 metric ở mỗi
-# rank, NÉT ĐỨT ngang mảnh ở MAX của từng metric (không line chart); hồi
-# quy metric ≈ a + b·log2(r) chỉ cho số tóm tắt b (bảng). CI95 của b
+# ── REPORT: metric theo candidate (`src/report_plots.py`) ──────────────────
+# MỌI candidate (attn + decoder). Một đồ thị hỗn hợp
+# `figures/metrics_by_candidate.png`: BAR = điểm TB của 4 metric ở mỗi candidate,
+# NÉT ĐỨT ngang mảnh ở MAX của từng metric + chấm ở cột đạt max (không line
+# chart); hồi quy metric ≈ a + b·log2(r) CHỈ trên candidate của `target` (decoder)
+# cho số tóm tắt b (bảng). CI95 của b
 # = bootstrap ghép cặp theo ảnh (`n_boot`). Trên đồ thị mỗi metric nhân e^(γ−1)
 # để xếp thành TẦNG tách rời (bảng/CSV vẫn là số gốc). Chỉ là mô tả, không phải kiểm định;
 # không nằm trong vân tay fixture (đổi khối này không cần --retrain).
 report:
   rank_plot:
-    target: decoder
+    target: decoder          # chỗ gắn dùng cho hồi quy theo rank (đồ thị luôn gồm MỌI candidate)
     metrics: [bleu3, bleu4, rougeL, bertscore_f1]    # B3 · B4 · RL · BertF1
     n_boot: 2000
     # Scale CHỈ trên đồ thị: giá trị vẽ = gốc × e^(γ−1); legend ghi `Metric (γ=…)`.

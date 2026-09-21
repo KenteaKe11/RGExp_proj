@@ -5,8 +5,9 @@ metrics/train_stats.csv, manifest.json. Thứ tự đọc: thiết lập (tham s
 thời gian, VRAM, val CE) -> điểm trung bình -> Friedman tổng thể từng metric
 (W, p·Holm) -> hạng trung bình -> HIỆU ỨNG ĐƠN (cặp khác nhau đúng một biến) ->
 mọi cặp. "Thắng" = Wilcoxon·Holm bác H0 VÀ |rank-biserial| >= `rrb_floor`.
-Cuối cùng: xu hướng theo rank của `decoder` (full linear) — bảng hồi quy +
-`figures/rank_trend_decoder.png` (bar điểm TB + nét đứt ngang ở max từng metric, `src/report_plots.py`).
+Cuối cùng: metric theo MỌI candidate — bảng + `figures/metrics_by_candidate.png`
+(bar điểm TB + nét đứt ngang ở max từng metric; hồi quy theo rank trên decoder,
+`src/report_plots.py`).
 """
 from __future__ import annotations
 
@@ -247,15 +248,16 @@ def _rank_trend(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     trend = rp.rank_trend(scores, arms, cfg, seed=int(cfg.get("seed", 0)))
     fig_rel, err = None, None
     if trend is not None:
-        trend.to_csv(run_dir / "metrics" / f"rank_trend_{pc['target']}.csv", index=False)
-        fig_rel = f"figures/rank_trend_{pc['target']}.png"
+        trend.to_csv(run_dir / "metrics" / "metrics_by_candidate.csv", index=False)
+        fig_rel = "figures/metrics_by_candidate.png"
         try:
             rp.plot_rank_trend(trend, run_dir / fig_rel)
         except Exception as e:  # noqa: BLE001
             fig_rel, err = None, f"{type(e).__name__}: {e}"
-            print(f"  ⚠ đồ thị xu hướng rank: {err}", flush=True)
-        manifest["rank_trend"] = {"target": pc["target"], "figure": fig_rel,
-                                  "arms": trend.attrs["arm_ids"]}
+            print(f"  ⚠ đồ thị metric theo candidate: {err}", flush=True)
+        manifest["metrics_by_candidate"] = {"figure": fig_rel,
+                                            "arms": trend.attrs["arm_ids"],
+                                            "regression_target": pc["target"]}
     return rp.markdown_section(trend, fig_rel, err, pc["target"])
 
 
