@@ -76,8 +76,8 @@ def t_repo_is_lora_only():
         "đẩy vào repo CŨ, không repo mới"
     assert CFG["output"]["hub_root"] == "current"
     from src.push import hub_base, hub_dir_name
-    assert hub_base(CFG) == "current/$1_LoRA_Reports", hub_base(CFG)
-    assert hub_dir_name({"hub_index": 2, "hub_title": "MoE"}) == "$2_MoE_Reports"
+    assert hub_base(CFG) == "current/$1_LoRA_Test", hub_base(CFG)
+    assert hub_dir_name({"hub_index": 2, "hub_title": "MoE"}) == "$2_MoE_Test"
     for bad in ({"hub_index": 0, "hub_title": "X"}, {"hub_index": 1, "hub_title": "a/b"}):
         try:
             hub_dir_name(bad)
@@ -634,7 +634,7 @@ def t_push_dedupe():
 
     from src import fixture as fx
     from src.config import Cfg
-    from src.push import decide, git_blob_sha1, local_plan
+    from src.push import decide, git_blob_sha1, local_plan, reports_placeholder
 
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -650,24 +650,29 @@ def t_push_dedupe():
             (d / "ad" / aid / "adapter_config.json").write_text("{}", encoding="utf-8")
             (d / "ad" / aid / "tokenizer.json").write_text("{}", encoding="utf-8")
         plan = local_plan(c, run, ["old_same", "old_diff", "new"])
-        base = "current/$1_LoRA_Reports"
+        base = "current/$1_LoRA_Test"
+        rp = f"{base}/Reports"
         paths = {p for p, _f, _k in plan}
-        assert f"{base}/REPORT.md" in paths and f"{base}/weights/new/adapter_model.safetensors" in paths
+        assert f"{rp}/REPORT.md" in paths and f"{base}/REPORT.md" not in paths and f"{base}/weights/new/adapter_model.safetensors" in paths
         assert not any(p.endswith("tokenizer.json") for p in paths), "processor không đi lên"
         sha = lambda b: __import__("hashlib").sha256(b).hexdigest()  # noqa: E731
         remote = {
             f"{base}/weights/old_same/adapter_model.safetensors": {"sha256": sha(b"W1")},
             f"{base}/weights/old_diff/adapter_model.safetensors": {"sha256": sha(b"ZZ")},
-            f"{base}/metrics/summary.csv": {"blob_id": git_blob_sha1(run / "metrics" / "summary.csv")},
-            f"{base}/REPORT.md": {"blob_id": "0" * 40},
+            f"{rp}/metrics/summary.csv": {"blob_id": git_blob_sha1(run / "metrics" / "summary.csv")},
+            f"{rp}/REPORT.md": {"blob_id": "0" * 40},
         }
         todo, log = decide(plan, remote)
         got = {p for p, _f, _k in todo}
         assert f"{base}/weights/new/adapter_model.safetensors" in got
         assert f"{base}/weights/new/adapter_config.json" in got
         assert not any("/old_same/" in p or "/old_diff/" in p for p in got), got
-        assert f"{base}/REPORT.md" in got, "REPORT đổi phải được đẩy"
-        assert f"{base}/metrics/summary.csv" not in got, "file trùng phải bỏ qua"
+        assert f"{rp}/REPORT.md" in got, "REPORT đổi phải được đẩy"
+        assert f"{rp}/metrics/summary.csv" not in got, "file trùng phải bỏ qua"
+        # Reports/ chưa có trên repo và commit không mang kết quả -> tạo ngay
+        assert reports_placeholder(base, {}, []) == f"{rp}/.keep"
+        assert reports_placeholder(base, {}, todo) is None, "đã có kết quả đi lên"
+        assert reports_placeholder(base, remote, []) is None, "repo đã có Reports/"
         assert any("old_diff" in ln and "KHÁC" in ln for ln in log), log
         todo2, _ = decide(plan, remote, force_weights=True)
         assert any("/old_diff/" in p for p, _f, _k in todo2)
@@ -707,8 +712,9 @@ def t_stats_overwrites_report():
             pd.DataFrame({"key": keys, "bertscore_f1": rng.normal(0.5 + 0.03 * j, 0.05, 50),
                           "bleu4": rng.uniform(0, 0.2, 50)}).to_csv(
                 mdir / f"per_sample_{aid}.csv", index=False)
+        # cache_dir cũng ở thư mục tạm: không đọc testset.jsonl THẬT ở ./data
         sets = ["--set", f"output.adapter_dir={ad}", "--set", f"output.dir={runs}",
-                "--no-wandb"]
+                "--set", f"data.cache_dir={d / 'data'}", "--no-wandb"]
         # chưa có weight -> DỪNG (ckpt phải lưu TRƯỚC stats)
         assert main(["stats"] + sets) == 1
         for aid in ids:

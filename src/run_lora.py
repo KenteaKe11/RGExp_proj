@@ -1,7 +1,7 @@
 """Thí nghiệm LoRA — QLoRA rank × chỗ gắn, BA lệnh tách rời.
 
     python -m src.run_lora train     # data -> train -> infer -> score (chỉ phần còn thiếu)
-    python -m src.run_lora push      # weight (kiểm trùng) + kết quả -> <hub_repo>/current/$1_LoRA_Reports
+    python -m src.run_lora push      # weight (kiểm trùng) + kết quả -> <hub_repo>/current/$1_LoRA_Test/Reports
     python -m src.run_lora stats     # Friedman + hậu kiểm Holm -> REPORT.md (luôn GHI ĐÈ)
     python -m src.run_lora all       # train -> stats -> push
 
@@ -678,6 +678,14 @@ def _cmd_stats(a, cfg: Cfg, arms: list[dict], declared: list[str],
         print(f"✗ thiếu điểm của {missing} — chạy `train` trước.", flush=True)
         return 1
     scores, info = align_blocks(scores, key_col="key", order_hint=order_hint)
+    if order_hint and info["n_unhinted"]:
+        print(f"  ⚠ {info['n_unhinted']}/{info['n_common']} ảnh không có trong "
+              f"testset tham chiếu thứ tự — xếp theo bảng điểm.", flush=True)
+    if info["n_common"] < 2:
+        print(f"✗ chỉ {info['n_common']} ảnh có mặt ở MỌI candidate "
+              f"({info['n_per_arm']}) — Friedman cần >= 2. Chạy lại `train` "
+              f"(stage score) cho đủ.", flush=True)
+        return 1
     if any(info["n_dropped"].values()):
         print(f"  ⚠ căn khối: bỏ {info['n_dropped']} ảnh không đủ mặt ở mọi "
               f"candidate", flush=True)

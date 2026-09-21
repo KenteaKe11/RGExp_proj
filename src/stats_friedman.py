@@ -470,12 +470,15 @@ def align_blocks(scores: dict[str, pd.DataFrame], key_col: str = "key",
     """
     sets = {mid: set(df[key_col]) for mid, df in scores.items()}
     common = set.intersection(*sets.values()) if sets else set()
-    if order_hint:
-        order = [k for k in order_hint if k in common]
-    else:
-        first = next(iter(scores.values()))
-        order = [k for k in first[key_col] if k in common]
-    info = {"n_common": len(order),
+    # `order_hint` chỉ quyết định THỨ TỰ, không bao giờ quyết định TẬP khối:
+    # key chung mà hint không nhắc tới (hint từ một testset khác, vd. cache
+    # ./data của lần chạy thật) vẫn được giữ, xếp sau theo thứ tự bảng đầu.
+    first = next(iter(scores.values())) if scores else pd.DataFrame({key_col: []})
+    order = [k for k in dict.fromkeys(order_hint or []) if k in common]
+    seen = set(order)
+    n_hinted = len(order)
+    order += [k for k in first[key_col] if k in common and k not in seen]
+    info = {"n_common": len(order), "n_unhinted": len(order) - n_hinted,
             "n_per_arm": {mid: len(s) for mid, s in sets.items()},
             "n_dropped": {mid: len(s) - len(common) for mid, s in sets.items()}}
     out = {mid: df.set_index(key_col).loc[order].reset_index()

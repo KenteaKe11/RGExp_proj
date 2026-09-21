@@ -1,14 +1,17 @@
 """Lệnh `push`: đẩy weight + kết quả vào repo CŨ `output.hub_repo`, thư mục
 thứ hai `output.hub_root` (current/). KHÔNG BAO GIỜ tạo repo mới.
 
-Thư mục con theo quy ước `$<Chỉ số>_<Test title>_Reports` (`hub_dir_name`),
-dựng từ `output.hub_index` + `output.hub_title` — thí nghiệm này: `$1_LoRA_Reports`.
+Thư mục con theo quy ước `$<Chỉ số>_<Test title>_Test` (`hub_dir_name`),
+dựng từ `output.hub_index` + `output.hub_title` — thí nghiệm này: `$1_LoRA_Test`.
 
-    current/$1_LoRA_Reports/                  REPORT.md, manifest.json, metrics/,
+    current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/,
                                               predictions/, config.resolved.yaml, logs/
-    current/$1_LoRA_Reports/fixture/          sub-dataset + loader-setup (adapters_lora/_fixture/)
-    current/$1_LoRA_Reports/weights/<arm>/    adapter_model.safetensors, adapter_config.json,
+    current/$1_LoRA_Test/fixture/             sub-dataset + loader-setup (adapters_lora/_fixture/)
+    current/$1_LoRA_Test/weights/<arm>/       adapter_model.safetensors, adapter_config.json,
                                               train_stats.json
+
+Repo chưa có `Reports/` thì lần `push` đầu tạo NGAY (Hub không giữ thư mục
+rỗng, nên kèm `Reports/.keep` khi commit chưa có file kết quả nào).
 
 MỘT commit cho mọi thứ, và chỉ những file THẬT SỰ mới/đổi:
 
@@ -37,6 +40,10 @@ from .config import Cfg, hf_token, resolved_snapshot
 # log bị lỗi vòng lặp thì không. Quá ngưỡng này thì cắt, giữ ĐẦU và ĐUÔI: đầu có
 # preflight và cấu hình, đuôi có kết luận, khúc giữa là tiến độ lặp lại.
 LOG_MAX_BYTES = 8 * 1024 * 1024
+
+
+# Kết quả (REPORT, metrics, predictions, ...) nằm ở `<hub_base>/Reports/`.
+REPORTS_DIR = "Reports"
 
 
 class PushFailed(RuntimeError):
@@ -104,7 +111,7 @@ def _copy_log(run_dir: Path) -> Path | None:
 
 
 def hub_dir_name(o: dict) -> str:
-    """`$<Chỉ số>_<Test title>_Reports`, vd. `$1_LoRA_Reports`.
+    """`$<Chỉ số>_<Test title>_Test`, vd. `$1_LoRA_Test`.
 
     Chỉ số và tiêu đề khai RIÊNG ở config (`hub_index`, `hub_title`) rồi ghép ở
     đây, để mọi thí nghiệm sau đặt tên cùng một khuôn. Không khai -> dùng
@@ -118,11 +125,11 @@ def hub_dir_name(o: dict) -> str:
     if any(ch in title for ch in "/\\ "):
         raise ValueError(f"output.hub_title không được chứa '/', '\\' hay khoảng "
                          f"trắng: {title!r}")
-    return f"${int(idx)}_{title}_Reports"
+    return f"${int(idx)}_{title}_Test"
 
 
 def hub_base(cfg: Cfg) -> str:
-    """Đường dẫn trong repo: `<hub_root>/<hub_dir_name>`, vd. `current/$1_LoRA_Reports`."""
+    """Đường dẫn trong repo: `<hub_root>/<hub_dir_name>`, vd. `current/$1_LoRA_Test`."""
     o = cfg["output"]
     return "/".join(x for x in (str(o.get("hub_root", "current")).strip("/"),
                                 hub_dir_name(o)) if x)
@@ -158,7 +165,7 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str]) -> list[tuple[str, Path
             if (not f.is_file() or skip_parts & set(rel.parts)
                     or f.name.endswith(skip_suffix) or f.name.endswith("_tasks.jsonl")):
                 continue
-            out.append((f"{base}/{rel.as_posix()}", f, "result"))
+            out.append((f"{base}/{REPORTS_DIR}/{rel.as_posix()}", f, "result"))
     fx = fixture_dir(cfg)
     if fx.exists():
         for f in sorted(fx.iterdir()):
@@ -211,6 +218,15 @@ def decide(plan: list[tuple[str, Path, str]], remote: dict[str, dict],
             log.append(f"⚠ {aid}: weight trên repo KHÁC bản cục bộ -> GIỮ bản repo "
                        f"(ghi đè: push --force-weights)")
     return todo, log
+
+
+def reports_placeholder(base: str, remote: dict, todo: list) -> str | None:
+    """`<base>/Reports/.keep` nếu repo CHƯA có `Reports/` và commit này cũng
+    không mang file kết quả nào vào đó; ngược lại None (thư mục đã/sẽ có)."""
+    pre = f"{base}/{REPORTS_DIR}/"
+    if any(p.startswith(pre) for p in remote) or any(p.startswith(pre) for p, _f, _k in todo):
+        return None
+    return pre + ".keep"
 
 
 def _same(f: Path, r: dict) -> bool:
@@ -268,9 +284,8 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
         _copy_log(run_dir)
     plan = local_plan(cfg, run_dir, list(arms or []))
     if not plan:
-        print(f"⊘ không có gì để đẩy (không thấy {run_dir}, fixture hay weight)",
-              flush=True)
-        return None
+        print(f"⊘ chưa có kết quả/fixture/weight cục bộ ({run_dir}) — chỉ bảo đảm "
+              f"{base}/{REPORTS_DIR}/ có trên repo", flush=True)
 
     try:
         from huggingface_hub import CommitOperationAdd, HfApi
@@ -289,6 +304,9 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
 
     remote = _remote_index(api, repo_id, repo_type, base)
     todo, log = decide(plan, remote, force_weights=force_weights)
+    keep = reports_placeholder(base, remote, todo)
+    if keep:
+        log.append(f"＋ {base}/{REPORTS_DIR}/ chưa có trên repo -> tạo ngay ({keep})")
     print(f"→ {repo_id}/{base} ({repo_type}) · trên repo đã có {len(remote)} file",
           flush=True)
     for ln in log:
@@ -296,7 +314,7 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
     kinds = {k: sum(1 for x in todo if x[2] == k) for k in ("weight", "fixture", "result")}
     url = (f"https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}"
            f"{repo_id}/tree/main/{base}")
-    if not todo:
+    if not todo and not keep:
         print(f"✓ không có file mới/đổi — repo đã khớp: {url}", flush=True)
         return url
     print(f"  cần đẩy: {kinds['weight']} file weight · {kinds['fixture']} fixture "
@@ -304,9 +322,13 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
     if dry:
         for p_, _f, k in todo:
             print(f"    [{k}] {p_}", flush=True)
+        if keep:
+            print(f"    [dir] {keep}", flush=True)
         return url
     ops = [CommitOperationAdd(path_in_repo=p_, path_or_fileobj=str(f))
            for p_, f, _k in todo]
+    if keep:
+        ops.append(CommitOperationAdd(path_in_repo=keep, path_or_fileobj=b""))
     new_w = sorted({p_.rsplit("/", 2)[-2] for p_, _f, k in todo if k == "weight"})
     msg = (f"{base}: {kinds['result']} kết quả, {kinds['fixture']} fixture"
            + (f", weight {', '.join(new_w)}" if new_w else ""))

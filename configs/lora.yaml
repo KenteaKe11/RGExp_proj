@@ -24,7 +24,7 @@
 #           Sub-dataset + loader-setup khoá ở `adapters_lora/_fixture/` nên
 #           thêm candidate KHÔNG phải chạy lại từ đầu.
 #   push  — đẩy weight (bỏ qua cái đã có trên repo) + kết quả vào
-#           `current/$1_LoRA_Reports/` của repo CŨ `output.hub_repo`. Không tạo repo.
+#           `current/$1_LoRA_Test/Reports/` của repo CŨ `output.hub_repo`. Không tạo repo.
 #   stats — Friedman + hậu kiểm + REPORT.md, luôn GHI ĐÈ.
 #
 # Các khối `recombiner`, `classifier`, `moe` KHÔNG phải một phần của thí
@@ -429,17 +429,17 @@ output:
   # Repo CŨ, KHÔNG BAO GIỜ tạo repo mới: không có repo / không có quyền ghi
   # là DỪNG. Thư mục thứ nhất (`SoICT Archivements/`) giữ §2.0–§2.5; lần này
   # đẩy vào thư mục thứ hai `hub_root` (current/), thư mục con đặt tên theo
-  # khuôn `$<Chỉ số>_<Test title>_Reports` = `$<hub_index>_<hub_title>_Reports`:
-  #   current/$1_LoRA_Reports/                 REPORT.md, manifest, metrics, predictions
-  #   current/$1_LoRA_Reports/fixture/         sub-dataset + loader-setup (adapters_lora/_fixture)
-  #   current/$1_LoRA_Reports/weights/<arm>/   adapter_model.safetensors + adapter_config + train_stats
+  # khuôn `$<Chỉ số>_<Test title>_Test` = `$<hub_index>_<hub_title>_Test`, kết quả ở `Reports/` bên trong:
+  #   current/$1_LoRA_Test/Reports/            REPORT.md, manifest, metrics, predictions
+  #   current/$1_LoRA_Test/fixture/            sub-dataset + loader-setup (adapters_lora/_fixture)
+  #   current/$1_LoRA_Test/weights/<arm>/      adapter_model.safetensors + adapter_config + train_stats
   # Weight đã có trên repo thì BỎ QUA (cùng sha256 -> trùng; khác -> cảnh báo,
   # chỉ ghi đè khi `push --force-weights`).
   hub_repo: RGExp123/Research_results
   hub_repo_type: dataset
   hub_root: current
   hub_index: 1                    # <Chỉ số>
-  hub_title: LoRA                 # <Test title>  -> current/$1_LoRA_Reports
+  hub_title: LoRA                 # <Test title>  -> current/$1_LoRA_Test/Reports
   push: true
   subdir: "lora_rank_target"      # runs/<subdir> (chỉ cục bộ)
   adapter_dir: ./adapters_lora    # weight mỗi candidate + _fixture/

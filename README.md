@@ -39,7 +39,7 @@ python scripts/selftest_lora.py              # vài giây, không cần GPU
 bash scripts/run_lora.sh train --dry-run     # 8 ảnh, 16 mẫu, 4 bước + in VRAM đỉnh
 
 bash scripts/run_lora.sh train --detach      # 1. data -> train -> infer -> score (nền; log ở logs/)
-bash scripts/run_lora.sh push                # 2. weight + kết quả -> Hub current/$1_LoRA_Reports/
+bash scripts/run_lora.sh push                # 2. weight + kết quả -> Hub current/$1_LoRA_Test/Reports/
 bash scripts/run_lora.sh stats               # 3. Friedman + hậu kiểm -> REPORT.md (GHI ĐÈ)
 bash scripts/run_lora.sh push                #    đẩy lại REPORT mới (weight trùng -> bỏ qua)
 ```
@@ -47,7 +47,7 @@ bash scripts/run_lora.sh push                #    đẩy lại REPORT mới (wei
 | lệnh | làm gì | cần |
 |---|---|---|
 | `train` | stage data, train, infer, score — chỉ phần còn thiếu. Weight mỗi candidate ghi ở `adapters_lora/<arm>/` và sha256 vào `_fixture/loader.json` ngay khi candidate đó xong, **trước** mọi lệnh stats | GPU, HF_TOKEN |
-| `push` | một commit vào `RGExp123/Research_results` (repo CŨ — không bao giờ tạo repo mới), thư mục thứ hai `current/`, thư mục con `$1_LoRA_Reports` (khuôn `$<Chỉ số>_<Test title>_Reports` từ `output.hub_index` + `output.hub_title`). Weight đã có trên repo thì **bỏ qua** (trùng sha256); khác thì cảnh báo và giữ bản repo, ghi đè chỉ khi `--force-weights`. File kết quả chỉ đẩy khi nội dung đổi. `--plan` in danh sách mà không đẩy | HF_TOKEN (WRITE) |
+| `push` | một commit vào `RGExp123/Research_results` (repo CŨ — không bao giờ tạo repo mới), thư mục thứ hai `current/`, thư mục con `$1_LoRA_Test` (kết quả ở `Reports/`, chưa có thì tạo ngay) (khuôn `$<Chỉ số>_<Test title>_Test` từ `output.hub_index` + `output.hub_title`). Weight đã có trên repo thì **bỏ qua** (trùng sha256); khác thì cảnh báo và giữ bản repo, ghi đè chỉ khi `--force-weights`. File kết quả chỉ đẩy khi nội dung đổi. `--plan` in danh sách mà không đẩy | HF_TOKEN (WRITE) |
 | `stats` | đọc `metrics/per_sample_*.csv` → Friedman + hậu kiểm → **ghi đè** `REPORT.md`, `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `manifest.json`. DỪNG nếu thiếu weight của candidate nào | chỉ CPU |
 | `all` | train → stats → push | |
 
@@ -85,9 +85,9 @@ metrics), weight + fixture ở `adapters_lora/`. Trên Hub
 (`RGExp123/Research_results`, cạnh `SoICT Archivements/`):
 
 ```
-current/$1_LoRA_Reports/                  REPORT.md, manifest.json, metrics/, predictions/, logs/
-current/$1_LoRA_Reports/fixture/          sub-dataset + loader.json
-current/$1_LoRA_Reports/weights/<arm>/    adapter_model.safetensors, adapter_config.json, train_stats.json
+current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/, predictions/, logs/
+current/$1_LoRA_Test/fixture/             sub-dataset + loader.json
+current/$1_LoRA_Test/weights/<arm>/       adapter_model.safetensors, adapter_config.json, train_stats.json
 ```
 
 ## Hai loại config
