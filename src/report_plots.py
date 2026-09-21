@@ -188,6 +188,10 @@ def plot_rank_trend(trend: pd.DataFrame, path: Path) -> Path:
         y_max = float(r["max"]) * sc
         ax.hlines(y_max, x_lo, x_end, colors=col, linestyles=(0, (4, 3)),
                   linewidth=0.9, zorder=3)
+        # Điểm ở giao của đường max với đỉnh cột đạt max (đúng tâm cột ấy).
+        x_max = float(np.log2(int(r["max_rank"]))) + off
+        ax.scatter([x_max], [y_max], s=42, color=col, edgecolor=SURFACE,
+                   linewidth=1.5, zorder=4)
         tags.append([y_max, f"{_leg(r)}  max {r['max']:.4f} @ r={int(r['max_rank'])}", col])
 
     ax.set_xticks(lx, [f"r = {k}" for k in ranks])
@@ -224,11 +228,13 @@ def plot_rank_trend(trend: pd.DataFrame, path: Path) -> Path:
                for j, (_, r) in enumerate(trend.iterrows())]
     handles += [Patch(facecolor="#999", alpha=0.38, label="cột = điểm TB × e^(γ−1)"),
                 Line2D([0], [0], color="#777", linewidth=0.9, linestyle=(0, (4, 3)),
-                       label="nét đứt = giá trị MAX của metric (qua các rank)")]
+                       marker="o", markersize=6, markerfacecolor="#777",
+                       markeredgecolor=SURFACE,
+                       label="nét đứt = MAX của metric · chấm = cột đạt max")]
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.13),
               ncol=3, frameon=False, fontsize=8.5, labelcolor=INK_2)
     fig.text(0.01, -0.05, "Cách đọc: giá trị gốc = giá trị trên trục Y ÷ e^(γ−1). "
-             "Nét đứt = max của metric ấy; nhãn phải ghi max GỐC và rank đạt max.\n"
+             "Nét đứt = max của metric ấy, chấm = cột đạt max; nhãn phải ghi max GỐC và rank đạt max.\n"
              "Mỗi metric một tầng — chỉ so cột của CÙNG một metric với đường max của nó. γ = 1: không scale.", fontsize=8, color=INK_2, ha="left")
     fig.tight_layout()
     path = Path(path)
@@ -263,7 +269,8 @@ def markdown_section(trend: pd.DataFrame | None, fig_rel: str | None,
              "giá trị LỚN NHẤT của metric ấy qua các rank. Cột nào chạm đường là "
              "rank tốt nhất của metric đó; khoảng hở giữa đỉnh cột và đường cho "
              "thấy rank ấy kém rank tốt nhất bao nhiêu (tương đối, trong cùng "
-             "tầng). Nhãn bên phải ghi max GỐC (chưa scale) và rank đạt max.\n"
+             "tầng). Chấm tròn đánh dấu đúng cột đạt max (giao của nét đứt với "
+             "đỉnh cột). Nhãn bên phải ghi max GỐC (chưa scale) và rank đạt max.\n"
              "- **Xu hướng:** không vẽ đường nối các rank; tóm tắt bằng số ở cột "
              "`b` (độ dốc hồi quy `a + b·log2(r)` trên số GỐC) và `b / TB` (thay "
              "đổi TƯƠNG ĐỐI mỗi lần gấp đôi rank — dùng cột này để so giữa các "
