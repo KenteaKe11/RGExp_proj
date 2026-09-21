@@ -12,9 +12,20 @@
 # 3000 ảnh test, rank (4 vs 8) và chỗ gắn adapter (4 ma trận attention vs toàn
 # bộ decoder) có đổi chất lượng báo cáo không, và cặp nào khác cặp nào?
 #
-# Bốn candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
-# Kiểm định: 6 cặp, permutation + bootstrap BCa, Holm trên 6 p-value trong
-# từng metric (`stats`). Tham chiếu dấu = qlora_r4_attn.
+# Sáu candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
+#   attn    × r ∈ {4, 8, 16, 32}
+#   decoder × r ∈ {4, 8}
+# Kiểm định: Friedman (Iman-Davenport, có hiệu chỉnh ties) trên 6 candidate
+# trong từng metric -> Holm trên các metric; metric nào bác H0 mới hậu kiểm
+# 15 cặp bằng Wilcoxon signed-rank (Pratt) + Holm (`stats`).
+#
+# Ba lệnh (`bash scripts/run_lora.sh <lệnh>`):
+#   train — data -> train -> infer -> score, chỉ những candidate còn thiếu.
+#           Sub-dataset + loader-setup khoá ở `adapters_lora/_fixture/` nên
+#           thêm candidate KHÔNG phải chạy lại từ đầu.
+#   push  — đẩy weight (bỏ qua cái đã có trên repo) + kết quả vào
+#           `current/$1_LoRA_Reports/` của repo CŨ `output.hub_repo`. Không tạo repo.
+#   stats — Friedman + hậu kiểm + REPORT.md, luôn GHI ĐÈ.
 #
 # Các khối `recombiner`, `classifier`, `moe` KHÔNG phải một phần của thí
 # nghiệm: đường huấn luyện (`src/train_recomb.py`, candidate KHÔNG nhánh) vẫn
@@ -128,28 +139,32 @@ generate:
 # ═════════════════════════════════════════════════════════════════════════════
 # CANDIDATE — rank × chỗ gắn (`scripts/run_lora.sh`, `src/run_lora.py`)
 # ═════════════════════════════════════════════════════════════════════════════
-# Khôi phục thí nghiệm adapter của §2.2, thu về 2 × 2: QLoRA r ∈ {4, 8} × chỗ gắn
-# ∈ {4 ma trận attention, toàn bộ decoder}. KHÔNG nhánh Recombinator, KHÔNG
+# Khôi phục thí nghiệm adapter của §2.2: QLoRA r ∈ {4, 8, 16, 32} ở 4 ma trận
+# attention, r ∈ {4, 8} ở toàn bộ decoder (6 candidate). KHÔNG nhánh Recombinator, KHÔNG
 # Experts (MoE tắt cứng), KHÔNG Stage 0 — chỉ Gemma 3 4B NF4 + adapter peft.
 #
-# Mọi thứ khác dùng CHUNG cho bốn candidate, đọc từ các khối của file này: `data`
+# Mọi thứ khác dùng CHUNG cho mọi candidate, đọc từ các khối của file này: `data`
 # (6400 train / 3000 test, hàng rào rò rỉ), `base`, `prompt`, `generate` (beam
-# 3), `image_policy`, `metrics`, `stats` (permutation + bootstrap BCa, Holm trên
-# các cặp), `train` (1 epoch, eff_bs 32, one-cycle; nhóm adapter chạy ở
+# 3), `image_policy`, `metrics`, `stats` (Friedman + hậu kiểm Wilcoxon, Holm), `train` (1 epoch, eff_bs 32, one-cycle; nhóm adapter chạy ở
 # `train.schedule.max_lr`), alpha = 2 × r (`train.alpha_mode: proportional`,
 # nên alpha/r không đổi và cột rank đo đúng một thứ: số chiều). Batch mỗi lượt
 # ở config GPU.
 #
-# Hai biến, và CHỈ hai biến khác nhau giữa bốn candidate: `rank` và `target`.
+# Hai biến, và CHỈ hai biến khác nhau giữa các candidate: `rank` và `target`.
 #   attn    — q/k/v/o_proj của khối ngôn ngữ (= mặt cắt §2.2 gốc, = chỗ gắn
 #             My Gemma đã dùng ở §2.5, = `train.target_modules`; selftest kiểm).
 #   decoder — thêm gate/up/down_proj (MLP): mọi Linear của decoder ngôn ngữ.
 # Vision tower / projector KHÔNG bao giờ được gắn (`train.exclude_prefixes`).
 #
-# Kiểm định: 4 candidate -> 6 cặp, mỗi cặp permutation + BCa, Holm trên 6
-# p-value trong từng metric. Tham chiếu (dấu của hiệu số) = qlora_r4_attn, cấu
-# hình §2.5 đã dùng. Bốn trong sáu cặp là hiệu ứng ĐƠN của một biến (rank ở
-# cùng chỗ gắn, chỗ gắn ở cùng rank); REPORT.md tách riêng bốn cặp ấy.
+# Kiểm định: 6 candidate -> Friedman tổng thể trong từng metric, rồi 15 cặp
+# hậu kiểm (Wilcoxon + Holm) ở metric đã qua cổng. Tham chiếu (luôn đứng ở vị
+# trí A của cặp, nên Δ = B − A) = qlora_r4_attn, cấu hình §2.5 đã dùng. Chín
+# trong 15 cặp là hiệu ứng ĐƠN của một biến (rank ở cùng chỗ gắn, chỗ gắn ở
+# cùng rank); REPORT.md tách riêng chín cặp ấy.
+#
+# Thêm candidate về sau: thêm một dòng vào `arms` (chỉ đổi `rank`/`target`),
+# rồi `run_lora.sh train` -> chỉ candidate mới được huấn luyện/sinh/chấm, trên
+# ĐÚNG sub-dataset + batch đã khoá ở `adapters_lora/_fixture/`.
 lora_exp:
   targets:
     attn: [q_proj, k_proj, v_proj, o_proj]
@@ -159,6 +174,10 @@ lora_exp:
        name: "QLoRA r=4 · attention (q,k,v,o)"}
     - {id: qlora_r8_attn,    method: qlora, rank: 8, target: attn,
        name: "QLoRA r=8 · attention (q,k,v,o)"}
+    - {id: qlora_r16_attn,   method: qlora, rank: 16, target: attn,
+       name: "QLoRA r=16 · attention (q,k,v,o)"}
+    - {id: qlora_r32_attn,   method: qlora, rank: 32, target: attn,
+       name: "QLoRA r=32 · attention (q,k,v,o)"}
     - {id: qlora_r4_decoder, method: qlora, rank: 4, target: decoder,
        name: "QLoRA r=4 · full decoder (attn + MLP)"}
     - {id: qlora_r8_decoder, method: qlora, rank: 8, target: decoder,
@@ -178,7 +197,7 @@ train:
   # ── Đo trên val — CHỈ để nhìn, KHÔNG chạm vào trọng số ──────────────────
   # Mỗi `every_steps` bước (và ở bước cuối), bốc NGẪU NHIÊN `n_samples` = 256
   # trong `data.n_val` = 2000 mẫu val rồi tính CE trên đó. Không chọn
-  # checkpoint theo val, không early stop: bốn candidate vẫn chạy ĐÚNG một
+  # checkpoint theo val, không early stop: mọi candidate vẫn chạy ĐÚNG một
   # epoch với cùng lịch one-cycle như README chốt — val chỉ trả lời "candidate
   # này có bắt đầu học thuộc tập train chưa".
   #
@@ -187,8 +206,8 @@ train:
   # sau vài lần đo thay vì nhìn mãi một góc.
   #
   # Tập 256 ấy KHÔNG phụ thuộc candidate: chỉ số được sinh từ (seed, số thứ tự
-  # lần eval) chứ không từ arm id, nên ở lần eval thứ k cả bốn candidate đo
-  # trên ĐÚNG cùng 256 mẫu và bốn đường val so được với nhau. Cũng vì thế nó
+  # lần eval) chứ không từ arm id, nên ở lần eval thứ k mọi candidate đo
+  # trên ĐÚNG cùng 256 mẫu và các đường val so được với nhau. Cũng vì thế nó
   # tái lập được: chạy lại cùng seed cho đúng những tập ấy (`seed_mix` đổi số
   # này nếu muốn một loạt tập khác).
   eval:
@@ -370,23 +389,27 @@ metrics:
     keep: [f1]
   primary: bertscore_f1
 
-# ── Kiểm định ─────────────────────────────────────────────────────────────
-# Bốn candidate => sáu cặp. Mỗi cặp: permutation đảo dấu trả p, bootstrap BCa
-# trả khoảng tin cậy cho hiệu số (`src/stats_ab.py`). Holm chạy trên SÁU
-# p-value của sáu cặp, trong từng metric. `reference` chỉ quyết định DẤU.
+# ── Kiểm định — Friedman + hậu kiểm Holm (`src/stats_friedman.py`) ────────
+# 6 candidate => 15 cặp × n metric: so từng đôi rồi hiệu chỉnh KHÔNG còn là
+# cách mở đầu đúng. Thứ tự:
+#   1. Friedman trong từng metric (hạng trong từng ảnh, hiệu chỉnh ties của
+#      Conover, p chính thức = xấp xỉ F Iman-Davenport), Holm trên các metric.
+#   2. CHỈ metric bác H0 mới hậu kiểm: 15 cặp, Wilcoxon signed-rank ghép cặp
+#      (`zero_method: pratt`) + permutation đảo dấu đối chiếu, Holm.
+#      `posthoc_scope`: permetric = Holm trên 15 cặp trong từng metric;
+#      global = Holm trên mọi cặp × metric đã qua cổng (nghiêm hơn).
+#   3. "Thắng" = Holm bác H0 VÀ |rank-biserial| >= `rrb_floor`.
+# `lora_exp.reference` chỉ quyết định DẤU (tham chiếu luôn ở vị trí A).
 stats:
+  method: friedman
   alpha: 0.05
-  n_boot: 10000
-  n_perm: 10000
-  ci: 0.95
-  ci_method: bca
-  dz_floor: 0.10
-  primary_test: perm
-  pairs: all               # all | vs_reference
+  n_perm: 10000          # permutation đảo dấu chạy song song để đối chiếu
+  posthoc_permutation: true
+  posthoc_scope: permetric   # permetric | global
+  zero_method: pratt         # giữ cặp d = 0 khi xếp hạng (xem stats_friedman)
+  kendall_w_floor: 0.05      # W dưới mức này -> cảnh báo cạnh kết luận
+  rrb_floor: 0.10            # |r_rb| dưới mức này -> "không đáng kể"
   reference: qlora_r4_attn
-  adjust: holm
-  adjust_scope: pairs      # Holm trong TỪNG metric, trên sáu cặp
-  # Friedman CỐ Ý không có mặt. Xem đầu file và README.md.
 
 wandb:
   enabled: true
@@ -403,9 +426,20 @@ wandb:
 
 output:
   dir: ./runs
-  hub_repo: RGExp123/research_v2        # repo DATASET kết quả (private); tự tạo ở lần đẩy đầu
+  # Repo CŨ, KHÔNG BAO GIỜ tạo repo mới: không có repo / không có quyền ghi
+  # là DỪNG. Thư mục thứ nhất (`SoICT Archivements/`) giữ §2.0–§2.5; lần này
+  # đẩy vào thư mục thứ hai `hub_root` (current/), thư mục con đặt tên theo
+  # khuôn `$<Chỉ số>_<Test title>_Reports` = `$<hub_index>_<hub_title>_Reports`:
+  #   current/$1_LoRA_Reports/                 REPORT.md, manifest, metrics, predictions
+  #   current/$1_LoRA_Reports/fixture/         sub-dataset + loader-setup (adapters_lora/_fixture)
+  #   current/$1_LoRA_Reports/weights/<arm>/   adapter_model.safetensors + adapter_config + train_stats
+  # Weight đã có trên repo thì BỎ QUA (cùng sha256 -> trùng; khác -> cảnh báo,
+  # chỉ ghi đè khi `push --force-weights`).
+  hub_repo: RGExp123/Research_results
   hub_repo_type: dataset
-  hub_private: true
+  hub_root: current
+  hub_index: 1                    # <Chỉ số>
+  hub_title: LoRA                 # <Test title>  -> current/$1_LoRA_Reports
   push: true
-  subdir: "lora_rank_target"      # runs/<subdir>, và thư mục trên Hub
-  adapter_dir: ./adapters_lora
+  subdir: "lora_rank_target"      # runs/<subdir> (chỉ cục bộ)
+  adapter_dir: ./adapters_lora    # weight mỗi candidate + _fixture/

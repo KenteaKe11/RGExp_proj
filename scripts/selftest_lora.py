@@ -72,8 +72,20 @@ def t_repo_is_lora_only():
     for k in ("arms_s25", "sota", "pretrain", "sota_train", "sota_hub", "labels"):
         assert k not in CFG, f"configs/lora.yaml còn khối `{k}` của §2.5"
     assert sorted(p.name for p in (ROOT / "configs").glob("*.yaml")) == ["lora.yaml"]
-    assert CFG["output"]["hub_repo"] == "RGExp123/research_v2"
-    assert CFG["output"]["hub_private"] is True
+    assert CFG["output"]["hub_repo"] == "RGExp123/Research_results", \
+        "đẩy vào repo CŨ, không repo mới"
+    assert CFG["output"]["hub_root"] == "current"
+    from src.push import hub_base, hub_dir_name
+    assert hub_base(CFG) == "current/$1_LoRA_Reports", hub_base(CFG)
+    assert hub_dir_name({"hub_index": 2, "hub_title": "MoE"}) == "$2_MoE_Reports"
+    for bad in ({"hub_index": 0, "hub_title": "X"}, {"hub_index": 1, "hub_title": "a/b"}):
+        try:
+            hub_dir_name(bad)
+            raise AssertionError(f"{bad} lẽ ra phải DỪNG")
+        except ValueError:
+            pass
+    src = (ROOT / "src" / "push.py").read_text(encoding="utf-8")
+    assert "create_repo" not in src, "push KHÔNG được tạo repo"
 
 
 def t_active_code_imports_resolve():
@@ -379,7 +391,7 @@ def t_infer_autobatch_ladder():
 
 
 def t_batch_locked_across_arms():
-    """Bốn candidate dùng CHUNG batch mỗi lượt: nặng nhất dò trước rồi khoá."""
+    """Mọi candidate dùng CHUNG batch mỗi lượt: nặng nhất dò trước rồi khoá."""
     from src.run_lora import heaviest_first, lock_train, lora_arms
     from src.config import Cfg
 
@@ -436,13 +448,14 @@ def t_io_keys_present():
 
 
 def t_lora_exp_design():
-    """LoRA: 2 rank × 2 chỗ gắn, chỉ hai biến khác nhau; attn = chỗ gắn §2.5."""
+    """LoRA: attn r∈{4,8,16,32} + decoder r∈{4,8}; chỉ hai biến khác nhau."""
     from src.run_lora import arm_cfg, factor_pairs, lora_arms, preset_for
     from src.stats_multi import pair_list
 
     arms = lora_arms(CFG)
     assert [(x["rank"], x["target"]) for x in arms] == [
-        (4, "attn"), (8, "attn"), (4, "decoder"), (8, "decoder")], arms
+        (4, "attn"), (8, "attn"), (16, "attn"), (32, "attn"),
+        (4, "decoder"), (8, "decoder")], arms
     assert {x["method"] for x in arms} == {"qlora"}
     T = CFG["lora_exp"]["targets"]
     assert T["attn"] == list(CFG["train"]["target_modules"]), \
@@ -452,17 +465,20 @@ def t_lora_exp_design():
     ref = CFG["lora_exp"]["reference"]
     assert ref == "qlora_r4_attn"
     pairs = pair_list([x["id"] for x in arms], "all", ref)
-    assert len(pairs) == 6 and all(a == ref for a, b in pairs if ref in (a, b))
+    assert len(pairs) == 15 and all(a == ref for a, b in pairs if ref in (a, b))
     fp = factor_pairs(arms)
-    assert len(fp) == 4, fp
+    assert len(fp) == 9, fp          # 6 cặp rank @ attn + 1 @ decoder + 2 chỗ gắn
     assert ("qlora_r4_attn", "qlora_r8_attn", "rank 4→8 @ attn") in fp
+    assert ("qlora_r16_attn", "qlora_r32_attn", "rank 16→32 @ attn") in fp
     assert ("qlora_r4_attn", "qlora_r4_decoder", "attn→decoder @ r=4") in fp
-    c = arm_cfg(CFG, arms[3])
+    assert not any("r=16" in lb or "r=32" in lb for _a, _b, lb in fp), \
+        "r16/r32 không có bản decoder -> không có cặp chỗ gắn ở r ấy"
+    c = arm_cfg(CFG, arms[5])
     assert c["train"]["target_modules"] == T["decoder"]
     assert c["moe"]["enabled"] is False and c["pretrain_init"] is None
     assert CFG["train"]["target_modules"] == T["attn"], "arm_cfg làm bẩn cfg gốc"
     assert CFG["moe"]["enabled"] is False, "thí nghiệm LoRA không có Experts"
-    assert [preset_for(CFG, x)["alpha"] for x in arms] == [8, 16, 8, 16]
+    assert [preset_for(CFG, x)["alpha"] for x in arms] == [8, 16, 32, 64, 8, 16]
     for k in ("train", "base", "data", "generate", "image_policy"):
         diff = {kk for kk in set(c[k]) | set(CFG[k])
                 if c[k].get(kk) != CFG[k].get(kk)}
@@ -504,36 +520,214 @@ def t_lora_targets_match_real_names():
 
 
 def t_lora_report_builds():
-    """REPORT.md dựng được từ điểm giả: đủ bảng hiệu ứng đơn (4 cặp)."""
-    from src.report_lora import build_markdown
-    from src.report_lora import summary_table
-    from src.run_lora import factor_pairs, lora_arms
-    from src.stats_multi import compare_pairs
+    """REPORT.md dựng được từ điểm giả: Friedman + 9 cặp hiệu ứng đơn + 15 cặp."""
+    from src.report_lora import build_markdown, summary_table
+    from src.run_lora import factor_pairs, lora_arms, ref_first
+    from src.stats_friedman import friedman_all, posthoc_all
 
     arms = lora_arms(CFG)
     rng = np.random.default_rng(0)
-    keys = [f"k{i}" for i in range(60)]
+    keys = [f"k{i}" for i in range(80)]
+    ids = ref_first([x["id"] for x in arms], "qlora_r4_attn")
     scores = {x["id"]: pd.DataFrame({"key": keys, "bertscore_f1":
-                                     rng.normal(0.5 + 0.01 * j, 0.05, 60)})
+                                     rng.normal(0.5 + 0.02 * j, 0.05, 80)})
               for j, x in enumerate(arms)}
-    st = dict(CFG["stats"], n_perm=200, n_boot=200, pairs="all",
-              reference="qlora_r4_attn")
-    ids = [x["id"] for x in arms]
-    pw = compare_pairs(scores, ["bertscore_f1"], st, ids, seed=1)
+    st = dict(CFG["stats"], n_perm=200)
+    fr = friedman_all(scores, ["bertscore_f1"], st)
+    assert bool(fr["reject_h0"].iloc[0]), fr
+    ph = posthoc_all(scores, ["bertscore_f1"], st,
+                     gate=dict(zip(fr["metric"], fr["reject_h0"])), seed=1, order=ids)
+    assert len(ph) == 15 and (ph["posthoc_scope"] == "permetric").all()
+    assert (ph[ph["arm_a"] == "qlora_r4_attn"].shape[0] == 5), "tham chiếu phải ở vị trí A"
     names = {x["id"]: x["name"] for x in arms}
     summ = summary_table(scores, names, ["bertscore_f1"], "bertscore_f1")
-    md = build_markdown(CFG, summ, pw, [{"arm_id": "qlora_r4_attn",
-                                         "trainable_params": 1234}],
+    md = build_markdown(CFG, summ, fr, ph, [{"arm_id": "qlora_r4_attn",
+                                             "trainable_params": 1234}],
                         names, {"run_id": "t", "factor_pairs": factor_pairs(arms),
                                 "headline": ["x"]}, arms)
-    assert "Hiệu ứng đơn" in md and md.count("@ r=") == 2 and md.count("@ attn") >= 1
+    assert "Friedman tổng thể" in md and "Hiệu ứng đơn" in md
+    assert md.count("@ r=") == 2 and md.count("@ attn") >= 6, md
     assert "1,234" in md
+    # r32 (điểm cao nhất ở dữ liệu giả) phải thắng r4 ở dòng "rank 4→32 @ attn"
+    line = next(l for l in md.splitlines() if l.startswith("| rank 4→32 @ attn"))
+    assert "r=32" in line and "+0.0" in line, line
+
+
+def t_friedman_matches_scipy():
+    """Friedman (không ties) và Wilcoxon (không zeros) khớp scipy."""
+    try:
+        from scipy import stats as ss
+    except ImportError:
+        raise _Skip("không có scipy")
+    from src.stats_friedman import friedman, wilcoxon_signed_rank
+
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(200, 6)) + np.arange(6) * 0.1
+    r = friedman(X)
+    ref = ss.friedmanchisquare(*[X[:, j] for j in range(6)])
+    assert abs(r["chi2"] - ref.statistic) < 1e-8 and abs(r["p_chi2"] - ref.pvalue) < 1e-8
+    d = rng.normal(0.1, 1, 300)
+    w = wilcoxon_signed_rank(d, zero_method="wilcox", continuity=False)
+    rw = ss.wilcoxon(d, zero_method="wilcox", correction=False, method="approx")
+    assert abs(w["p"] - rw.pvalue) < 1e-6, (w["p"], rw.pvalue)
+
+
+def t_fixture_roundtrip():
+    """Fixture: chụp split + khoá, đọc lại được, config lệch là DỪNG."""
+    import copy
+    import tempfile
+
+    from src import fixture as fx
+    from src.config import Cfg
+
+    test = pd.DataFrame({"key": ["t1", "t2"], "ref": ["a", "b"]})
+    train = pd.DataFrame({"key": ["x1", "x2", "x3"], "ref": ["c", "d", "e"]})
+    val = pd.DataFrame({"key": ["v1"], "ref": ["f"]})
+    with tempfile.TemporaryDirectory() as d:
+        c = Cfg(copy.deepcopy(dict(CFG)))
+        c["output"] = dict(c["output"], adapter_dir=d)
+        f = fx.fixture_dir(c)
+        assert f == Path(d) / "_fixture"
+        fx.create(c, f, test, train, val)
+        assert fx.exists(f)
+        fx.verify(c, f)
+        te, tr, va = fx.load_splits(c, f, with_images=False)
+        assert te["key"].tolist() == ["t1", "t2"] and len(tr) == 3 and len(va) == 1
+        # khoá batch: lần đầu ghi, lần sau GIỮ
+        assert fx.set_lock(f, "train_batch", 4, "a") == 4
+        assert fx.set_lock(f, "train_batch", 8, "b") == 4
+        assert fx.get_lock(f, "train_batch") == 4
+        # GPU config (batch mỗi lượt) KHÔNG nằm trong vân tay
+        c2 = Cfg(copy.deepcopy(dict(c)))
+        c2["train"] = dict(c2["train"], per_device_batch_size=2, target_modules=["x"])
+        fx.verify(c2, f)
+        # khoá nội dung lệch -> DỪNG, và nói khoá nào
+        c3 = Cfg(copy.deepcopy(dict(c)))
+        c3["data"] = dict(c3["data"], n_train=999)
+        try:
+            fx.verify(c3, f)
+            raise AssertionError("n_train lệch mà không DỪNG")
+        except fx.FixtureMismatch as e:
+            assert "data.n_train" in str(e), e
+        # sửa tay split -> DỪNG
+        (f / "trainset.jsonl").write_text('{"key": "zz", "ref": "q"}\n', encoding="utf-8")
+        try:
+            fx.verify(c, f)
+            raise AssertionError("split bị sửa mà không DỪNG")
+        except fx.FixtureMismatch:
+            pass
+        # sổ weight
+        w = Path(d) / "armA"
+        w.mkdir()
+        (w / "adapter_model.safetensors").write_bytes(b"abc")
+        rec = fx.record_weights(f, "armA", w)
+        assert rec["adapter_model.safetensors"] == fx.sha256_file(w / "adapter_model.safetensors")
+        assert "armA" in fx.load_loader(f)["weights"]
+
+
+def t_push_dedupe():
+    """push: weight đã có (trùng/khác) bỏ qua; mới thì đẩy; kết quả đổi thì đẩy."""
+    import copy
+    import tempfile
+
+    from src import fixture as fx
+    from src.config import Cfg
+    from src.push import decide, git_blob_sha1, local_plan
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        c = Cfg(copy.deepcopy(dict(CFG)))
+        c["output"] = dict(c["output"], adapter_dir=str(d / "ad"))
+        run = d / "run"
+        (run / "metrics").mkdir(parents=True)
+        (run / "REPORT.md").write_text("new", encoding="utf-8")
+        (run / "metrics" / "summary.csv").write_text("a,b\n", encoding="utf-8")
+        for aid, body in (("old_same", b"W1"), ("old_diff", b"W2"), ("new", b"W3")):
+            (d / "ad" / aid).mkdir(parents=True)
+            (d / "ad" / aid / "adapter_model.safetensors").write_bytes(body)
+            (d / "ad" / aid / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (d / "ad" / aid / "tokenizer.json").write_text("{}", encoding="utf-8")
+        plan = local_plan(c, run, ["old_same", "old_diff", "new"])
+        base = "current/$1_LoRA_Reports"
+        paths = {p for p, _f, _k in plan}
+        assert f"{base}/REPORT.md" in paths and f"{base}/weights/new/adapter_model.safetensors" in paths
+        assert not any(p.endswith("tokenizer.json") for p in paths), "processor không đi lên"
+        sha = lambda b: __import__("hashlib").sha256(b).hexdigest()  # noqa: E731
+        remote = {
+            f"{base}/weights/old_same/adapter_model.safetensors": {"sha256": sha(b"W1")},
+            f"{base}/weights/old_diff/adapter_model.safetensors": {"sha256": sha(b"ZZ")},
+            f"{base}/metrics/summary.csv": {"blob_id": git_blob_sha1(run / "metrics" / "summary.csv")},
+            f"{base}/REPORT.md": {"blob_id": "0" * 40},
+        }
+        todo, log = decide(plan, remote)
+        got = {p for p, _f, _k in todo}
+        assert f"{base}/weights/new/adapter_model.safetensors" in got
+        assert f"{base}/weights/new/adapter_config.json" in got
+        assert not any("/old_same/" in p or "/old_diff/" in p for p in got), got
+        assert f"{base}/REPORT.md" in got, "REPORT đổi phải được đẩy"
+        assert f"{base}/metrics/summary.csv" not in got, "file trùng phải bỏ qua"
+        assert any("old_diff" in ln and "KHÁC" in ln for ln in log), log
+        todo2, _ = decide(plan, remote, force_weights=True)
+        assert any("/old_diff/" in p for p, _f, _k in todo2)
+        assert not any("/old_same/" in p for p, _f, _k in todo2)
+
+
+def t_commands_split():
+    """Ba lệnh train / push / stats tách rời; stats không chạm train."""
+    from src.run_lora import COMMANDS, main
+
+    assert COMMANDS["train"] == ["data", "train", "infer", "score"]
+    assert COMMANDS["stats"] == ["stats", "report"] and COMMANDS["push"] == ["push"]
+    assert not set(COMMANDS["train"]) & set(COMMANDS["stats"] + COMMANDS["push"])
+    assert main(["--no-wandb"]) == 2, "thiếu lệnh phải DỪNG"
+    assert main(["stats", "--stages", "train", "--no-wandb"]) == 2
+    sh = (ROOT / "scripts" / "run_lora.sh").read_text(encoding="utf-8")
+    assert "train|push|stats|all)" in sh
+
+
+def t_stats_overwrites_report():
+    """`stats` chạy trên CSV có sẵn, cần weight trên đĩa, GHI ĐÈ REPORT.md."""
+    import copy
+    import json
+    import tempfile
+
+    from src.run_lora import lora_arms, main
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        ad, runs = d / "ad", d / "runs"
+        ids = [x["id"] for x in lora_arms(CFG)]
+        mdir = runs / "lora_rank_target" / "metrics"
+        mdir.mkdir(parents=True)
+        rng = np.random.default_rng(5)
+        keys = [f"k{i}" for i in range(50)]
+        for j, aid in enumerate(ids):
+            pd.DataFrame({"key": keys, "bertscore_f1": rng.normal(0.5 + 0.03 * j, 0.05, 50),
+                          "bleu4": rng.uniform(0, 0.2, 50)}).to_csv(
+                mdir / f"per_sample_{aid}.csv", index=False)
+        sets = ["--set", f"output.adapter_dir={ad}", "--set", f"output.dir={runs}",
+                "--no-wandb"]
+        # chưa có weight -> DỪNG (ckpt phải lưu TRƯỚC stats)
+        assert main(["stats"] + sets) == 1
+        for aid in ids:
+            (ad / aid).mkdir(parents=True)
+            (ad / aid / "adapter_model.safetensors").write_bytes(aid.encode())
+            (ad / aid / "train_stats.json").write_text(json.dumps(
+                {"arm_id": aid, "batch_size": 1}), encoding="utf-8")
+        rep = runs / "lora_rank_target" / "REPORT.md"
+        rep.write_text("CŨ", encoding="utf-8")
+        (mdir / "pairwise_tests.csv").write_text("cũ", encoding="utf-8")
+        assert main(["stats", "--set", "stats.n_perm=100"] + sets) == 0
+        txt = rep.read_text(encoding="utf-8")
+        assert "CŨ" not in txt and "Friedman tổng thể" in txt
+        assert (mdir / "friedman_tests.csv").exists() and (mdir / "posthoc_tests.csv").exists()
+        assert not (mdir / "pairwise_tests.csv").exists(), "file kiểm định cũ phải bị xoá"
 
 
 def t_lora_main_rejects_unknown_arm():
     from src.run_lora import main
 
-    assert main(["--arms", "qlora_r16_attn", "--no-wandb", "--no-push"]) == 2
+    assert main(["train", "--arms", "qlora_r64_attn", "--no-wandb"]) == 2
 
 
 def t_dry_run_reports_vram():
@@ -558,11 +752,17 @@ if __name__ == "__main__":
     check("src/ không import sang _archive/", t_src_does_not_import_archive)
 
     hr("2. Thí nghiệm LoRA")
-    check("2 rank × 2 chỗ gắn, chỉ hai biến khác nhau", t_lora_exp_design)
+    check("attn r∈{4,8,16,32} + decoder r∈{4,8}, chỉ hai biến khác nhau",
+          t_lora_exp_design)
     check("`decoder` khớp 7 Linear/lớp, vision không khớp",
           t_lora_targets_match_real_names)
     check("REPORT.md dựng được", t_lora_report_builds)
     check("--arms lạ là DỪNG", t_lora_main_rejects_unknown_arm)
+    check("ba lệnh train / push / stats tách rời", t_commands_split)
+    check("fixture: sub-dataset + loader-setup khoá, lệch là DỪNG",
+          t_fixture_roundtrip)
+    check("push: kiểm trùng weight, chỉ đẩy file mới/đổi", t_push_dedupe)
+    check("stats cần weight trên đĩa, GHI ĐÈ REPORT", t_stats_overwrites_report)
 
     hr("3. Ảnh")
     check("allow_native_match = false", t_image_policy_guard)
@@ -570,7 +770,8 @@ if __name__ == "__main__":
     check("unified_tensor: hình dạng, khoảng giá trị, letterbox",
           t_unified_tensor_shape_and_range)
 
-    hr("4. Kiểm định ghép cặp")
+    hr("4. Kiểm định")
+    check("Friedman / Wilcoxon khớp scipy", t_friedman_matches_scipy)
     check("stats_multi dùng lại nguyên văn stats_ab", t_stats_multi_reuses_stats_ab)
     check("reference lạ là DỪNG", t_pair_list_rejects_unknown_reference)
     check("họ Holm = số cặp trong từng metric", t_compare_pairs_holm_family_is_pairs)
@@ -583,7 +784,7 @@ if __name__ == "__main__":
     check("autobatch: hồi quy VRAM, chạy thử, lùi khi vượt/OOM",
           t_autobatch_regression_and_choice)
     check("autobatch lúc sinh: thang bậc, đích 85%", t_infer_autobatch_ladder)
-    check("batch mỗi lượt KHOÁ chung bốn candidate", t_batch_locked_across_arms)
+    check("batch mỗi lượt KHOÁ chung mọi candidate", t_batch_locked_across_arms)
     check("khoá io.* ở config GPU", t_io_keys_present)
     check("val: 256/2000 ngẫu nhiên, chung bốn candidate, bốc lại mỗi lần đo",
           t_val_sampling)

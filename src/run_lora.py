@@ -1,25 +1,34 @@
-"""Thí nghiệm LoRA — QLoRA r ∈ {4, 8} × chỗ gắn ∈ {attention, full decoder}.
+"""Thí nghiệm LoRA — QLoRA rank × chỗ gắn, BA lệnh tách rời.
 
-    python -m src.run_lora                       # data -> train ×4 -> infer ×4 -> chấm -> kiểm định -> báo cáo -> push
-    python -m src.run_lora --dry-run             # 8 ảnh test, 16 mẫu train, 4 bước
-    python -m src.run_lora --stages stats,report
-    python -m src.run_lora --arms qlora_r4_attn,qlora_r4_decoder
-    python -m src.run_lora --gpu rtx3060
+    python -m src.run_lora train     # data -> train -> infer -> score (chỉ phần còn thiếu)
+    python -m src.run_lora push      # weight (kiểm trùng) + kết quả -> <hub_repo>/current/$1_LoRA_Reports
+    python -m src.run_lora stats     # Friedman + hậu kiểm Holm -> REPORT.md (luôn GHI ĐÈ)
+    python -m src.run_lora all       # train -> stats -> push
 
-Khôi phục §2.2 (xem `_archive/`) ở dạng 2 × 2: huấn luyện bằng
-`train_recomb.train_arm` với candidate KHÔNG nhánh (Gemma 3 NF4 + adapter peft),
-sinh bằng runner `gemma3_recomb`, chấm bằng `metrics`, kiểm định bằng
-`stats_multi` (permutation + bootstrap BCa, Holm trên các cặp). Không dùng lại
-`_archive/src/train.py`: nó là HF Trainer + thang dò batch, hai thứ đã bỏ có lý
-do (prefetch, autobatch, config GPU chỉ có ở đường này).
+    python -m src.run_lora train --dry-run          # 8 ảnh test, 16 mẫu train, 4 bước
+    python -m src.run_lora train --arms qlora_r32_attn
+    python -m src.run_lora train --stages infer,score
+    python -m src.run_lora push --force-weights     # ghi đè weight KHÁC trên repo
+    python -m src.run_lora push --plan              # chỉ in file sẽ đẩy
 
-Hai biến — `rank`, `target` — là thứ DUY NHẤT khác nhau giữa bốn candidate; mọi
-thứ khác đến từ các khối chung của configs/lora.yaml (xem khối `lora_exp`).
-MoE bị tắt cứng ở đây: `moe.enabled: true` mà lọt vào thì mỗi candidate đòi
-`top_k`/`n_experts` và không còn là LoRA thuần.
+Sáu candidate ở `lora_exp.arms`: attn × r ∈ {4, 8, 16, 32}, decoder × r ∈ {4, 8}.
+Hai biến — `rank`, `target` — là thứ DUY NHẤT khác nhau giữa các candidate; mọi
+thứ khác đến từ các khối chung của configs/lora.yaml.
 
-Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 6 sinh hỏng ·
-          7 báo cáo hỏng · 8 đẩy Hub hỏng
+`train` lưu weight từng candidate ở `adapters_lora/<arm>/` (+ sha256 vào
+`adapters_lora/_fixture/loader.json`) NGAY khi candidate ấy xong — trước mọi
+lệnh stats. Cũng ở `_fixture/`: sub-dataset (key + ref của test/train/val) và
+loader-setup (vân tay các khoá quyết định kết quả, batch mỗi lượt lúc train và
+lúc sinh đã khoá). Thêm candidate mới = thêm một dòng vào `lora_exp.arms` rồi
+`train`: chỉ candidate mới chạy, trên ĐÚNG dữ liệu + batch cũ.
+
+`stats` KHÔNG cần GPU/mạng: đọc `metrics/per_sample_*.csv`, chạy Friedman
+(Iman-Davenport, ties Conover) trong từng metric + Holm trên các metric, rồi
+hậu kiểm mọi cặp (Wilcoxon Pratt + permutation, Holm) ở metric đã qua cổng.
+Mỗi lần chạy ghi đè REPORT.md, summary/friedman/posthoc CSV.
+
+Mã thoát: 0 xong · 1 thiếu kết quả · 2 cấu hình sai / fixture lệch · 3 train
+          hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng
 """
 from __future__ import annotations
 
@@ -40,6 +49,12 @@ from .config import (Cfg, add_common_args, load_config, resolved_snapshot,
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
+COMMANDS = {
+    "train": ["data", "train", "infer", "score"],
+    "stats": ["stats", "report"],
+    "push": ["push"],
+    "all": ["data", "train", "infer", "score", "stats", "report", "push"],
+}
 METHODS = ("qlora", "qdora")
 
 
@@ -181,7 +196,7 @@ def heaviest_first(arms: list[dict]) -> list[dict]:
 
     Thứ tự huấn luyện không đổi kết quả (seed đặt lại mỗi candidate, thứ tự
     dữ liệu từ Generator riêng) — nó chỉ để autobatch dò trên candidate nặng
-    nhất, rồi KHOÁ số đó cho cả bốn.
+    nhất, rồi KHOÁ số đó cho mọi candidate.
     """
     return sorted(arms, key=lambda x: (-len(x["target_modules"]), -int(x["rank"])))
 
@@ -203,7 +218,7 @@ def locked_train_bs(adapter_root: Path, arms: list[dict], skip: list[dict]
                 seen.add(int(bs))
     if len(seen) > 1:
         print(f"  ⚠ các candidate đã huấn luyện dùng batch mỗi lượt KHÁC nhau "
-              f"{sorted(seen)} — nên --retrain để bốn cột so được.", flush=True)
+              f"{sorted(seen)} — nên --retrain để các cột so được.", flush=True)
     return min(seen) if seen else None
 
 
@@ -220,37 +235,72 @@ def lock_train(c: Cfg, bs: int) -> Cfg:
 
 
 def apply_exp(cfg: Cfg) -> None:
-    """Ràng buộc của thí nghiệm, áp bất kể file config nói gì: mọi cặp được
-    kiểm, tham chiếu dấu = `lora_exp.reference`, MoE tắt."""
+    """Ràng buộc của thí nghiệm, áp bất kể file config nói gì: Friedman + hậu
+    kiểm mọi cặp, tham chiếu dấu = `lora_exp.reference`, MoE tắt."""
     L = dict(cfg.get("lora_exp") or {})
     cfg["experiment"] = "lora"
-    cfg["stats"] = dict(cfg["stats"], pairs="all", reference=L.get("reference"))
+    cfg["stats"] = dict(cfg["stats"], method="friedman", reference=L.get("reference"))
     cfg["moe"] = dict(cfg.get("moe") or {}, enabled=False)
+
+
+def ref_first(ids: list[str], ref: str | None) -> list[str]:
+    """Tham chiếu đứng ĐẦU -> luôn ở vị trí A của mọi cặp chứa nó."""
+    return ([ref] + [i for i in ids if i != ref]) if ref in ids else list(ids)
+
+
+def load_manifest(run_dir: Path) -> dict:
+    p = run_dir / "manifest.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
 
 
 # ════════════════════════════════════════════════════════════════════════════
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Thí nghiệm LoRA: rank × chỗ gắn.")
+    ap = argparse.ArgumentParser(
+        description="Thí nghiệm LoRA: rank × chỗ gắn — lệnh train | push | stats | all.")
+    ap.add_argument("command", nargs="?", choices=sorted(COMMANDS),
+                    help="train | push | stats | all")
     add_common_args(ap)
-    ap.add_argument("--stages", default=",".join(STAGES))
+    ap.add_argument("--stages", default=None,
+                    help="tập con stage CỦA lệnh (vd. train --stages infer,score)")
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true")
-    ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--refixture", action="store_true",
+                    help="dựng lại adapters_lora/_fixture (đi kèm --retrain)")
+    ap.add_argument("--force-weights", action="store_true",
+                    help="push: ghi đè weight KHÁC bản trên repo")
+    ap.add_argument("--plan", action="store_true",
+                    help="push: chỉ in những file sẽ đẩy")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
+    if not a.command:
+        ap.print_usage()
+        print("✗ thiếu lệnh: train | push | stats | all")
+        return 2
 
     cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
-    from .hw import cpu_budget, io_workers, set_torch_threads
-
-    print(f"⚙ CPU: {cpu_budget()} lõi được cấp · torch {set_torch_threads(cfg)} "
-          f"luồng · I/O {io_workers(cfg)} luồng", flush=True)
     if "lora_exp" not in cfg:
         print("✗ config không có khối `lora_exp`.")
         return 2
     apply_exp(cfg)
+
+    allowed = COMMANDS[a.command]
+    if a.stages:
+        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+        bad = [s for s in stages if s not in allowed]
+        if bad:
+            print(f"✗ stage {bad} không thuộc lệnh `{a.command}` "
+                  f"(hợp lệ: {', '.join(allowed)})")
+            return 2
+    else:
+        stages = list(allowed)
 
     dry_steps = None
     if a.dry_run:
@@ -260,7 +310,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg["train"]["eval"] = dict(cfg["train"].get("eval") or {},
                                     n_samples=4, every_steps=2)
         cfg["stats"]["n_perm"] = 200
-        cfg["stats"]["n_boot"] = 200
         cfg["output"]["push"] = False
         cfg["output"]["subdir"] += "_dryrun"
         cfg["output"]["adapter_dir"] += "_dryrun"
@@ -271,17 +320,10 @@ def main(argv: list[str] | None = None) -> int:
         print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · 4 bước · không đẩy Hub · "
               "batch mỗi lượt = config GPU, chuỗi đệm tới max_seq_len (VRAM xấu "
               "nhất).", flush=True)
-    if a.no_push:
-        cfg["output"]["push"] = False
-    if a.no_wandb:
+    if a.no_wandb or a.command in ("push", "stats"):
         cfg["wandb"]["enabled"] = False
 
     seed_everything(int(cfg.get("seed", 42)))
-    stages = [s.strip() for s in a.stages.split(",") if s.strip()]
-    bad = [s for s in stages if s not in STAGES]
-    if bad:
-        print(f"✗ stage không biết: {bad} (hợp lệ: {', '.join(STAGES)})")
-        return 2
     only = set(x.strip() for x in a.arms.split(",")) if a.arms else None
     try:
         arms = lora_arms(cfg, only)
@@ -303,38 +345,81 @@ def main(argv: list[str] | None = None) -> int:
     run_id = a.run_id or str(cfg["output"]["subdir"])
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
-    mdir = run_dir / "metrics"
     adapter_root = Path(cfg["output"]["adapter_dir"])
-    names = {x["id"]: x["name"] for x in arms}
-    declared = [x["id"] for x in arms]
+    declared = ref_first([x["id"] for x in arms], cfg["stats"].get("reference"))
+    arms = sorted(arms, key=lambda x: declared.index(x["id"]))
 
+    from . import fixture as fx_mod
+
+    fx = fx_mod.fixture_dir(cfg)
+    manifest = load_manifest(run_dir)
+    manifest.update({
+        "run_id": run_id, "experiment": "lora",
+        "config": resolved_snapshot(cfg), "env": _env_info(),
+        "arms_declared": declared,
+        "arms": [{k: x[k] for k in ("id", "method", "rank", "target",
+                                    "target_modules")} for x in arms],
+        "factor_pairs": factor_pairs(arms),
+        "fixture": {"dir": str(fx)},
+    })
+    manifest.setdefault("arm_status", {})
+    manifest.setdefault("commands", {})[a.command] = datetime.now(
+        timezone.utc).isoformat(timespec="seconds")
+
+    def _save_manifest() -> None:
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
+
+    t_start = time.time()
+    print(f"\n═══ LoRA — lệnh `{a.command}` ({', '.join(stages)}) ═══", flush=True)
+    for x in arms:
+        print(f"  {x['id']:<18} r={x['rank']:<2} {x['target']:<8} "
+              f"{','.join(x['target_modules'])}", flush=True)
+    print(f"⚙ run dir: {run_dir}\n⚙ adapter + fixture: {adapter_root}", flush=True)
+
+    rc = 0
+    if set(stages) & set(COMMANDS["train"]):
+        rc = _cmd_train(a, cfg, arms, stages, run_dir, adapter_root, fx, manifest,
+                        _save_manifest, dry_steps)
+        if rc:
+            return rc
+    if set(stages) & set(COMMANDS["stats"]):
+        rc = _cmd_stats(a, cfg, arms, declared, stages, run_dir, adapter_root, fx,
+                        manifest, _save_manifest, t_start)
+        if rc:
+            return rc
+    if "push" in stages:
+        rc = _cmd_push(a, cfg, arms, run_dir, manifest, _save_manifest)
+        if rc:
+            return rc
+    _save_manifest()
+    print(f"\n✓ `{a.command}` xong sau {(time.time() - t_start) / 60:.1f} phút",
+          flush=True)
+    if a.command == "train":
+        print("  tiếp: bash scripts/run_lora.sh push   ·   bash scripts/run_lora.sh stats",
+              flush=True)
+    return 0
+
+
+# ── train: data -> train -> infer -> score ─────────────────────────────────
+def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
+               adapter_root: Path, fx: Path, manifest: dict, _save_manifest,
+               dry_steps) -> int:
+    from . import fixture as fx_mod
     from . import imaging
+    from . import train_recomb as tr_mod
+    from .hw import cpu_budget, io_workers, set_torch_threads
 
+    print(f"⚙ CPU: {cpu_budget()} lõi được cấp · torch {set_torch_threads(cfg)} "
+          f"luồng · I/O {io_workers(cfg)} luồng", flush=True)
     try:
         imaging.unified_policy(cfg)
     except imaging.ImagePolicyViolation as e:
         print(f"✗ DỪNG — chính sách ảnh:\n    {e}")
         return 2
 
-    manifest = {
-        "run_id": run_id, "experiment": "lora",
-        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "config": resolved_snapshot(cfg), "env": _env_info(),
-        "stages_run": stages, "arms_declared": declared,
-        "arms": [{k: x[k] for k in ("id", "method", "rank", "target",
-                                    "target_modules")} for x in arms],
-        "factor_pairs": factor_pairs(arms), "arm_status": {},
-    }
-    t_start = time.time()
-    print("\n═══ LoRA — QLoRA rank × chỗ gắn: permutation + bootstrap BCa, Holm "
-          "trên các cặp ═══", flush=True)
-    for x in arms:
-        print(f"  {x['id']:<18} r={x['rank']:<2} {x['target']:<8} "
-              f"{','.join(x['target_modules'])}", flush=True)
-    print(f"⚙ run dir: {run_dir}\n⚙ adapter: {adapter_root}", flush=True)
-
-    from . import train_recomb as tr_mod
-
+    mdir = run_dir / "metrics"
     n_test = int(cfg["data"].get("n_test") or 0)
     cache = {x["id"]: {
         "trained": bool(tr_mod.already_trained(adapter_root / x["id"], False)),
@@ -344,50 +429,71 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    {aid:<18} train {'✓' if s['trained'] else '—'} · sinh "
               f"{s['n_preds']}/{n_test} · điểm {'✓' if s['scored'] else '—'}",
               flush=True)
-    manifest["cache_at_start"] = cache
+    manifest["cache_at_train"] = cache
+
+    if a.refixture and not a.retrain and any(s["trained"] for s in cache.values()):
+        print("✗ --refixture mà không --retrain: candidate đã huấn luyện trên "
+              "fixture CŨ sẽ đứng chung bảng với candidate trên fixture MỚI. "
+              "Thêm --retrain.", flush=True)
+        return 2
 
     to_train = []
     if "train" in stages:
         to_train = list(arms) if a.retrain else [x for x in arms
                                                  if not cache[x["id"]]["trained"]]
-    tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
+    need_infer = "infer" in stages and any(
+        cache[x["id"]]["n_preds"] < n_test or x in to_train for x in arms)
+    need_images = bool(to_train) or need_infer
+
+    from .tracking import Tracker
+
+    tracker = Tracker(cfg, run_id=manifest["run_id"],
+                      config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
 
-    def _save_manifest() -> None:
-        (run_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8")
-
-    # ── data ───────────────────────────────────────────────────────────────
+    # ── data: fixture có thì đọc fixture, không thì dựng + chụp ─────────────
     from . import data as data_mod
     from . import data_train as dt_mod
 
-    train_df = val_df = None
-    if "data" in stages:
-        test_df = data_mod.prepare(cfg, tracker)
-        if to_train:
-            try:
-                train_df, val_df = dt_mod.prepare_train(cfg, test_df, tracker)
-            except dt_mod.DataLeak as e:
-                print(f"\n✗ DỪNG — RÒ RỈ DỮ LIỆU:\n    {e}", flush=True)
-                tracker.finish(1)
-                return 4
-    else:
-        test_df = data_mod.load_manifest(cfg)
+    have_fx = fx_mod.exists(fx) and not a.refixture
+    try:
+        if have_fx:
+            loader = fx_mod.verify(cfg, fx)
+            print(f"  ⚙ fixture {fx} · vân tay {loader['fingerprint'][:12]} · "
+                  f"train_batch {fx_mod.get_lock(fx, 'train_batch') or '—'} · "
+                  f"infer_batch {fx_mod.get_lock(fx, 'infer_batch') or '—'}",
+                  flush=True)
+            test_df, train_df, val_df = fx_mod.load_splits(
+                cfg, fx, tracker, with_images=need_images)
+        elif "data" in stages:
+            test_df = data_mod.prepare(cfg, tracker)
+            train_df, val_df = dt_mod.prepare_train(cfg, test_df, tracker)
+            fx_mod.create(cfg, fx, test_df, train_df, val_df)
+        else:
+            print(f"✗ chưa có fixture {fx} — chạy `train` (có stage data) trước.",
+                  flush=True)
+            tracker.finish(1)
+            return 2
+    except fx_mod.FixtureMismatch as e:
+        print(f"\n✗ DỪNG — FIXTURE LỆCH:\n    {e}", flush=True)
+        tracker.finish(1)
+        return 2
+    except dt_mod.DataLeak as e:
+        print(f"\n✗ DỪNG — RÒ RỈ DỮ LIỆU:\n    {e}", flush=True)
+        tracker.finish(1)
+        return 4
+    manifest["fixture"].update(fx_mod.load_loader(fx).get("n", {}),
+                               fingerprint=fx_mod.load_loader(fx)["fingerprint"])
 
     # ── train ──────────────────────────────────────────────────────────────
-    train_stats: list[dict] = []
     if to_train:
         _hr(f"Huấn luyện {len(to_train)}/{len(arms)} candidate")
         from .backbone import TrainUnusable, preflight_adapters
 
-        if train_df is None:
-            train_df, val_df = dt_mod.load_train_manifest(cfg)
         ev = dict(cfg["train"].get("eval") or {})
         if ev.get("enabled") and (val_df is None or val_df.empty):
-            print("  ⚠ train.eval BẬT nhưng không có mẫu val — chạy stage "
-                  "`data` để tải hồ val (data.n_val).", flush=True)
+            print("  ⚠ train.eval BẬT nhưng fixture không có mẫu val.", flush=True)
         manifest["val"] = {"n_pool": (0 if val_df is None else len(val_df)),
                            **{k: ev.get(k) for k in
                               ("enabled", "n_samples", "every_steps", "resample")}}
@@ -400,23 +506,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ✗ {e}", flush=True)
             tracker.finish(1)
             return 2
-        # ── batch mỗi lượt: MỘT số cho cả bốn candidate ──────────────────
-        # HF lấy trung bình CE theo TOKEN trong micro-batch, nên batch mỗi lượt
-        # đổi trọng số giữa các mẫu. Autobatch tự chọn riêng từng candidate thì
-        # r8·decoder (nặng) và r4·attn (nhẹ) có thể nhận hai số khác nhau -> cột
-        # so sánh lẫn thêm một biến thứ ba. Nên: khoá theo candidate đã có, hoặc
-        # dò trên candidate NẶNG NHẤT rồi khoá cho phần còn lại.
+        # Batch mỗi lượt: MỘT số cho mọi candidate, khoá ở fixture. HF lấy
+        # trung bình CE theo TOKEN trong micro-batch -> hai batch khác nhau là
+        # thêm một biến thứ ba vào bảng. Chưa khoá -> dò trên candidate NẶNG
+        # nhất rồi khoá cho phần còn lại VÀ cho mọi candidate thêm về sau.
         ab_on = bool((cfg.get("autobatch") or {}).get("enabled", False))
-        locked = locked_train_bs(adapter_root, arms, to_train) if ab_on else None
-        if ab_on:
-            to_train = heaviest_first(to_train)
+        locked = (None if a.retrain and a.refixture
+                  else fx_mod.get_lock(fx, "train_batch"))
+        if locked is None and not a.retrain:
+            locked = locked_train_bs(adapter_root, arms, to_train)
             if locked:
-                print(f"  ⚙ batch mỗi lượt KHOÁ = {locked} theo candidate đã "
-                      f"huấn luyện", flush=True)
-            else:
-                print(f"  ⚙ autobatch dò trên {to_train[0]['id']} (nặng nhất) "
-                      f"rồi khoá cho {len(to_train) - 1} candidate còn lại",
-                      flush=True)
+                fx_mod.set_lock(fx, "train_batch", locked, "train_stats.json cũ")
+        to_train = heaviest_first(to_train)
+        if locked:
+            print(f"  ⚙ batch mỗi lượt KHOÁ = {locked} (fixture)", flush=True)
+        elif ab_on:
+            print(f"  ⚙ autobatch dò trên {to_train[0]['id']} (nặng nhất) rồi "
+                  f"khoá vào fixture", flush=True)
         manifest["train_order"] = [x["id"] for x in to_train]
         for arm in to_train:
             c = arm_cfg(cfg, arm)
@@ -437,24 +543,27 @@ def main(argv: list[str] | None = None) -> int:
                 tracker.finish(1)
                 return 3
             st["target"] = arm["target"]
-            if ab_on and not locked and st.get("batch_size"):
-                locked = int(st["batch_size"])
+            if not locked and st.get("batch_size"):
+                locked = fx_mod.set_lock(fx, "train_batch", int(st["batch_size"]),
+                                         arm["id"], st.get("autobatch"))
                 manifest["train_batch_locked"] = locked
             (adapter_root / arm["id"] / "train_stats.json").write_text(
                 json.dumps(st, indent=2, ensure_ascii=False, default=str),
                 encoding="utf-8")
-            train_stats.append(st)
+            # Checkpoint của candidate này đã nằm trên đĩa -> ghi sha vào
+            # fixture NGAY, trước mọi lệnh stats/push.
+            fx_mod.record_weights(fx, arm["id"], adapter_root / arm["id"])
             manifest["arm_status"][arm["id"]] = {
                 "trained": True, "minutes": st.get("minutes"),
                 "trainable_params": st.get("trainable_params"),
                 "vram_peak_gb": st.get("vram_peak_gb"),
                 "val_loss_last": st.get("val_loss_last")}
-    for arm in arms:
-        if arm in to_train:
-            continue
-        p = adapter_root / arm["id"] / "train_stats.json"
-        if p.exists():
-            train_stats.append(json.loads(p.read_text(encoding="utf-8")))
+            _save_manifest()
+    # candidate đã có từ trước mà fixture chưa ghi sha (repo cũ) -> ghi bù
+    rec = fx_mod.load_loader(fx).get("weights") or {}
+    for x in arms:
+        if x["id"] not in rec and tr_mod.already_trained(adapter_root / x["id"], False):
+            fx_mod.record_weights(fx, x["id"], adapter_root / x["id"])
 
     # ── infer ──────────────────────────────────────────────────────────────
     pred = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
@@ -463,22 +572,24 @@ def main(argv: list[str] | None = None) -> int:
         from .runners import build
         from .runners.base import RunnerUnusable
 
-        # Batch lúc sinh cũng KHOÁ chung: batch + đệm trái đổi số học bf16 một
-        # chút, và bốn cột phải chịu cùng một thay đổi ấy. Lưu ra file để lần
-        # chạy tiếp (resume) dùng lại đúng số.
-        lock_p = run_dir / "infer_batch.json"
-        ilock = None
-        if lock_p.exists():
+        # Batch lúc sinh cũng KHOÁ chung (batch + đệm trái đổi số học bf16),
+        # ở fixture để candidate thêm sau dùng lại đúng số.
+        ilock = fx_mod.get_lock(fx, "infer_batch")
+        legacy = run_dir / "infer_batch.json"
+        if ilock is None and legacy.exists():
             try:
-                ilock = int(json.loads(lock_p.read_text(encoding="utf-8"))["batch_size"])
+                ilock = int(json.loads(legacy.read_text(encoding="utf-8"))["batch_size"])
+                fx_mod.set_lock(fx, "infer_batch", ilock, str(legacy))
             except Exception:
                 ilock = None
         if ilock is None and any(_count_preds(pred[x["id"]]) for x in arms):
-            # Đã có dự đoán từ trước khi có khoá -> giữ đúng số của config.
-            ilock = int(cfg["base"].get("batch_size", 2))
-            lock_p.write_text(json.dumps({"batch_size": ilock, "source":
-                                          "predictions có sẵn"}), encoding="utf-8")
+            ilock = fx_mod.set_lock(fx, "infer_batch",
+                                    int(cfg["base"].get("batch_size", 2)),
+                                    "predictions có sẵn")
         for arm in arms:
+            if not tr_mod.already_trained(adapter_root / arm["id"], False):
+                print(f"  ⚠ {arm['id']}: chưa có weight — bỏ qua sinh", flush=True)
+                continue
             print(f"\n── {arm['name']} ──", flush=True)
             mc = model_cfg(cfg, arm, adapter_root)
             if ilock:
@@ -488,11 +599,8 @@ def main(argv: list[str] | None = None) -> int:
                 runner.run(test_df, pred[arm["id"]], log_every=tracker.log_every)
                 rep_ab = getattr(runner, "autobatch_report", None)
                 if ilock is None and rep_ab and rep_ab.get("chosen"):
-                    ilock = int(rep_ab["chosen"])
-                    lock_p.write_text(json.dumps(
-                        {"batch_size": ilock, "source": arm["id"],
-                         "autobatch": rep_ab}, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+                    ilock = fx_mod.set_lock(fx, "infer_batch", int(rep_ab["chosen"]),
+                                            arm["id"], rep_ab)
                     manifest["infer_batch_locked"] = ilock
             except RunnerUnusable as e:
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
@@ -500,98 +608,187 @@ def main(argv: list[str] | None = None) -> int:
                 return 6
 
     # ── score ──────────────────────────────────────────────────────────────
-    from .metrics import metric_columns, score_model
+    if "score" in stages:
+        from .metrics import score_model
 
-    mdir.mkdir(parents=True, exist_ok=True)
-    ref_map = dict(zip(test_df["key"], test_df["ref"]))
-    scores: dict[str, pd.DataFrame] = {}
-    for arm in arms:
-        aid = arm["id"]
-        csv = mdir / f"per_sample_{aid}.csv"
-        if "score" in stages and (a.rescore or not csv.exists()):
+        mdir.mkdir(parents=True, exist_ok=True)
+        ref_map = dict(zip(test_df["key"], test_df["ref"]))
+        for arm in arms:
+            aid = arm["id"]
+            csv = mdir / f"per_sample_{aid}.csv"
+            if csv.exists() and not a.rescore and aid not in {x["id"] for x in to_train}:
+                continue
             preds = _read_preds(pred[aid])
             keys = [k for k in test_df["key"] if k in preds]
             if not keys:
                 print(f"  ⚠ [{aid}] không có dự đoán nào", flush=True)
                 continue
+            if len(keys) < len(test_df):
+                print(f"  ⚠ [{aid}] mới có {len(keys)}/{len(test_df)} dự đoán — "
+                      f"chấm phần đã có; chạy lại `train` để sinh nốt", flush=True)
             sdf, _c = score_model(cfg, keys, [preds[k] for k in keys],
                                   [ref_map[k] for k in keys], label=aid)
             sdf.to_csv(csv, index=False)
-            scores[aid] = sdf
-        elif csv.exists():
+    _save_manifest()
+    tracker.finish(0)
+    return 0
+
+
+# ── stats: Friedman + hậu kiểm Holm -> REPORT.md (ghi đè) ──────────────────
+def _cmd_stats(a, cfg: Cfg, arms: list[dict], declared: list[str],
+               stages: list[str], run_dir: Path, adapter_root: Path, fx: Path,
+               manifest: dict, _save_manifest, t_start: float) -> int:
+    from . import fixture as fx_mod
+    from . import train_recomb as tr_mod
+    from .metrics import metric_columns
+    from .stats_friedman import align_blocks, friedman_all, posthoc_all
+
+    names = {x["id"]: x["name"] for x in arms}
+    mdir = run_dir / "metrics"
+
+    # Checkpoint phải nằm trên đĩa TRƯỚC khi có con số nào vào bảng: một
+    # REPORT không truy ngược được về weight là một REPORT không tái lập được.
+    no_ckpt = [x["id"] for x in arms
+               if not tr_mod.already_trained(adapter_root / x["id"], False)]
+    if no_ckpt:
+        print(f"✗ chưa có weight của {no_ckpt} ở {adapter_root} — chạy `train` "
+              f"trước `stats`.", flush=True)
+        return 1
+    if fx_mod.exists(fx):
+        rec = fx_mod.load_loader(fx).get("weights") or {}
+        for x in arms:
+            if x["id"] not in rec:
+                fx_mod.record_weights(fx, x["id"], adapter_root / x["id"])
+        order_hint = fx_mod._read_split(fx / "testset.jsonl")["key"].tolist()
+    else:
+        try:
+            from . import data as data_mod
+
+            order_hint = data_mod.load_manifest(cfg)["key"].tolist()
+        except FileNotFoundError:
+            order_hint = None
+
+    scores: dict[str, pd.DataFrame] = {}
+    for aid in declared:
+        csv = mdir / f"per_sample_{aid}.csv"
+        if csv.exists():
             scores[aid] = pd.read_csv(csv)
     missing = [i for i in declared if i not in scores]
-    if missing and ({"stats", "report"} & set(stages)):
-        print(f"✗ thiếu điểm của {missing} — chạy stage infer/score trước.",
-              flush=True)
-        tracker.finish(1)
+    if missing:
+        print(f"✗ thiếu điểm của {missing} — chạy `train` trước.", flush=True)
         return 1
+    scores, info = align_blocks(scores, key_col="key", order_hint=order_hint)
+    if any(info["n_dropped"].values()):
+        print(f"  ⚠ căn khối: bỏ {info['n_dropped']} ảnh không đủ mặt ở mọi "
+              f"candidate", flush=True)
+    manifest["n_eval"] = info["n_common"]
+    manifest["n_per_arm"] = info["n_per_arm"]
 
-    pw = pd.DataFrame()
-    if scores and not missing:
-        from .stats_multi import align_blocks
-
-        scores = {i: scores[i] for i in declared}
-        scores, info = align_blocks(scores, key_col="key",
-                                    order_hint=test_df["key"].tolist())
-        manifest["n_eval"] = info["n_common"]
-
-    # ── stats ──────────────────────────────────────────────────────────────
-    pw_path = mdir / "pairwise_tests.csv"
-    if "stats" in stages and scores and not missing:
-        _hr("Permutation + bootstrap BCa trên mọi cặp, Holm trong từng metric")
-        from .stats_multi import compare_pairs, summary_lines
-
-        cols = metric_columns(scores[declared[0]])
-        pw = compare_pairs(scores, cols, dict(cfg["stats"]), declared,
-                           seed=int(cfg.get("seed", 42)))
-        pw.to_csv(pw_path, index=False)
+    scfg = dict(cfg["stats"])
+    seed = int(cfg.get("seed", 42))
+    cols = metric_columns(scores[declared[0]])
+    fr = pd.DataFrame()
+    ph = pd.DataFrame()
+    if "stats" in stages:
+        _hr(f"Friedman ({len(declared)} candidate × {info['n_common']} ảnh) + "
+            f"hậu kiểm Wilcoxon, Holm {scfg.get('posthoc_scope', 'global')}")
+        fr = friedman_all(scores, cols, scfg)
+        gate = dict(zip(fr["metric"], fr["reject_h0"].astype(bool)))
+        ph = posthoc_all(scores, cols, scfg, gate=gate, seed=seed, order=declared)
+        mdir.mkdir(parents=True, exist_ok=True)
+        fr.to_csv(mdir / "friedman_tests.csv", index=False)
+        ph.to_csv(mdir / "posthoc_tests.csv", index=False)
+        # file của đường kiểm định cũ -> xoá để không ai đọc nhầm số cũ
+        for old in ("pairwise_tests.csv",):
+            try:
+                (mdir / old).unlink()
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
         primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
-        manifest["headline"] = summary_lines(pw, primary, names)
+        manifest["headline"] = headline(fr, ph, primary, names)
+        manifest["stats_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for ln in manifest["headline"]:
             print(f"  · {ln}", flush=True)
-    elif pw_path.exists():
-        pw = pd.read_csv(pw_path)
+    else:
+        try:
+            fr = pd.read_csv(mdir / "friedman_tests.csv")
+            ph = pd.read_csv(mdir / "posthoc_tests.csv")
+        except FileNotFoundError:
+            print("✗ chưa có friedman_tests.csv — chạy `stats` đủ.", flush=True)
+            return 1
 
-    # ── report ─────────────────────────────────────────────────────────────
-    if "report" in stages and scores and not missing:
-        _hr("Báo cáo")
-        manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
+    if "report" in stages:
+        _hr("Báo cáo (ghi đè)")
+        train_stats = []
+        for x in arms:
+            p = adapter_root / x["id"] / "train_stats.json"
+            if p.exists():
+                train_stats.append(json.loads(p.read_text(encoding="utf-8")))
+        manifest["minutes_stats"] = round((time.time() - t_start) / 60, 2)
         try:
             from . import report_lora
 
-            report_lora.write_all(cfg, run_dir, scores, names, pw, train_stats,
-                                  manifest, arms)
+            report_lora.write_all(cfg, run_dir, scores, names, fr, ph,
+                                  train_stats, manifest, arms)
         except Exception as e:  # noqa: BLE001
             import traceback
 
             traceback.print_exc()
-            print(f"\n✗ stage `report` hỏng: {e!r} — kết quả vẫn còn; chạy lại "
-                  f"--stages report", flush=True)
+            print(f"\n✗ `report` hỏng: {e!r} — chạy lại `stats`", flush=True)
             _save_manifest()
-            tracker.finish(1)
             return 7
+    return 0
 
-    # ── push ───────────────────────────────────────────────────────────────
-    push_err = None
-    if "push" in stages and cfg["output"].get("push", True):
-        _hr("Đẩy lên Hugging Face")
-        from .push import push_results
 
-        try:
-            url = push_results(cfg, run_dir)
-            if url:
-                manifest["hub_url"] = url
-        except Exception as e:  # noqa: BLE001
-            push_err = str(e)
-            print(f"\n✗ đẩy Hub hỏng: {e} — chạy lại --stages push", flush=True)
-            manifest["push_error"] = push_err
+def headline(fr: pd.DataFrame, ph: pd.DataFrame, primary: str,
+             names: dict[str, str]) -> list[str]:
+    out = []
+    row = fr[fr["metric"] == primary]
+    if row.empty:
+        return out
+    r = row.iloc[0]
+    out.append(f"Friedman `{primary}`: F = {r['F_iman_davenport']:.3g}, "
+               f"p·Holm = {r['p_F_holm']:.3g}, Kendall W = {r['kendall_w']:.4f} "
+               f"-> {'BÁC H0' if bool(r['reject_h0']) else 'không bác H0'}; "
+               f"hạng TB tốt nhất: {r['best_by_meanrank']}")
+    if ph is None or ph.empty:
+        return out
+    sub = ph[(ph["metric"] == primary) & ph["significant_and_material"].astype(bool)]
+    for _, p in sub.iterrows():
+        win = p["arm_a"] if float(p["r_rb"]) > 0 else p["arm_b"]
+        lose = p["arm_b"] if win == p["arm_a"] else p["arm_a"]
+        out.append(f"{names.get(win, win)} > {names.get(lose, lose)} "
+                   f"(r_rb = {abs(float(p['r_rb'])):.3f}, p·Holm = "
+                   f"{float(p['p_official']):.3g})")
+    if len(out) == 1 and bool(r["reject_h0"]):
+        out.append("không cặp nào vừa qua Holm vừa vượt sàn |r_rb|")
+    return out
+
+
+# ── push ────────────────────────────────────────────────────────────────────
+def _cmd_push(a, cfg: Cfg, arms: list[dict], run_dir: Path, manifest: dict,
+              _save_manifest) -> int:
+    if not cfg["output"].get("push", True) and not a.plan:
+        print("⊘ output.push = false (dry-run?) — không đẩy", flush=True)
+        return 0
+    _hr("Đẩy lên Hugging Face")
+    from .push import push_results
 
     _save_manifest()
-    tracker.finish(1 if push_err else 0)
-    print(f"\n✓ HOÀN TẤT sau {(time.time() - t_start) / 60:.1f} phút · "
-          f"{run_dir / 'REPORT.md'}", flush=True)
-    return 8 if push_err else 0
+    try:
+        url = push_results(cfg, run_dir, arms=[x["id"] for x in arms],
+                           force_weights=a.force_weights, dry=a.plan)
+        if url and not a.plan:
+            manifest["hub_url"] = url
+            manifest["pushed_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            manifest.pop("push_error", None)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n✗ đẩy Hub hỏng: {e} — chạy lại `push`", flush=True)
+        manifest["push_error"] = str(e)
+        _save_manifest()
+        return 8
+    return 0
 
 
 if __name__ == "__main__":

@@ -1,23 +1,29 @@
-"""Đẩy kết quả lên HF: `output.hub_repo` (hiện là RGExp123/research_v2) (dataset repo, private).
+"""Lệnh `push`: đẩy weight + kết quả vào repo CŨ `output.hub_repo`, thư mục
+thứ hai `output.hub_root` (current/). KHÔNG BAO GIỜ tạo repo mới.
 
-Đẩy cả THƯ MỤC run, không đẩy trọng số: `runs/<subdir>/` chứa REPORT.md,
-manifest.json, metrics/*.csv, predictions/*.jsonl — tức là đủ để đọc lại kết
-luận và kiểm lại mọi con số trong bảng mà không cần GPU.
+Thư mục con theo quy ước `$<Chỉ số>_<Test title>_Reports` (`hub_dir_name`),
+dựng từ `output.hub_index` + `output.hub_title` — thí nghiệm này: `$1_LoRA_Reports`.
 
-Hai thứ được GOM VÀO run_dir ngay trước khi đẩy, vì thiếu chúng thì bảng kết quả
-không tái lập được:
+    current/$1_LoRA_Reports/                  REPORT.md, manifest.json, metrics/,
+                                              predictions/, config.resolved.yaml, logs/
+    current/$1_LoRA_Reports/fixture/          sub-dataset + loader-setup (adapters_lora/_fixture/)
+    current/$1_LoRA_Reports/weights/<arm>/    adapter_model.safetensors, adapter_config.json,
+                                              train_stats.json
 
-  `config.resolved.yaml` — cấu hình ĐÃ giải quyết (kể cả `--set` từ dòng lệnh),
-      không phải file YAML trong repo. Repo còn bị sửa tiếp; bản này thì không.
-  `logs/<tên>.log`       — bản chụp log của đúng lần chạy ấy, lấy từ biến môi
-      trường `RGEXP_LOG` do `scripts/run_recomb.sh` đặt. Log là chỗ DUY NHẤT ghi
-      lại diễn biến gate, cảnh báo preflight và tốc độ sinh; manifest chỉ có số
-      cuối cùng.
+MỘT commit cho mọi thứ, và chỉ những file THẬT SỰ mới/đổi:
 
-Adapter KHÔNG đi lên đây (chúng nằm ngoài run_dir, ở `adapters_2_3/`): repo này
-là repo KẾT QUẢ, và một dataset repo phình vì vài trăm MB trọng số mỗi lần chạy
-là thứ về sau không ai muốn clone.
+  * Weight — kiểm trùng trước: repo đã có `weights/<arm>/adapter_model.safetensors`
+    thì so sha256 (LFS). Trùng -> bỏ qua. Khác -> KHÔNG ghi đè, cảnh báo;
+    ghi đè chỉ khi `--force-weights` (weight trên repo là thứ bảng kết quả đã
+    dựa vào, lặng lẽ thay nó là làm bảng cũ mất gốc).
+  * Kết quả + fixture — file nào nội dung giống hệt bản trên repo (sha256 LFS
+    hoặc git blob sha1) thì bỏ qua; khác thì cập nhật (REPORT luôn là bản mới
+    nhất của lệnh `stats`).
+
+Processor/tokenizer KHÔNG đi lên: chúng là của google/gemma-3-4b-it, tải lại
+được; weight của một candidate chỉ là adapter peft.
 """
+
 from __future__ import annotations
 
 import json
@@ -60,7 +66,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_recomb.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_recomb`
+    `scripts/run_lora.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_lora`
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -97,7 +103,149 @@ def _copy_log(run_dir: Path) -> Path | None:
         return None
 
 
-def push_results(cfg: Cfg, run_dir: Path) -> str | None:
+def hub_dir_name(o: dict) -> str:
+    """`$<Chỉ số>_<Test title>_Reports`, vd. `$1_LoRA_Reports`.
+
+    Chỉ số và tiêu đề khai RIÊNG ở config (`hub_index`, `hub_title`) rồi ghép ở
+    đây, để mọi thí nghiệm sau đặt tên cùng một khuôn. Không khai -> dùng
+    `subdir` như cũ.
+    """
+    idx, title = o.get("hub_index"), str(o.get("hub_title") or "").strip()
+    if idx is None or not title:
+        return str(o.get("subdir", "")).strip("/")
+    if not str(idx).isdigit() or int(idx) < 1:
+        raise ValueError(f"output.hub_index phải là số nguyên >= 1, nhận {idx!r}")
+    if any(ch in title for ch in "/\\ "):
+        raise ValueError(f"output.hub_title không được chứa '/', '\\' hay khoảng "
+                         f"trắng: {title!r}")
+    return f"${int(idx)}_{title}_Reports"
+
+
+def hub_base(cfg: Cfg) -> str:
+    """Đường dẫn trong repo: `<hub_root>/<hub_dir_name>`, vd. `current/$1_LoRA_Reports`."""
+    o = cfg["output"]
+    return "/".join(x for x in (str(o.get("hub_root", "current")).strip("/"),
+                                hub_dir_name(o)) if x)
+
+
+def git_blob_sha1(path: Path) -> str:
+    """sha1 kiểu git (`blob <n>\0` + nội dung) — thứ Hub trả ở `blob_id`."""
+    import hashlib
+
+    data = Path(path).read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    from .fixture import sha256_file
+
+    return sha256_file(path)
+
+
+def local_plan(cfg: Cfg, run_dir: Path, arms: list[str]) -> list[tuple[str, Path, str]]:
+    """[(path_in_repo, file cục bộ, loại)] — loại ∈ weight | fixture | result."""
+    from .fixture import WEIGHT_FILES, fixture_dir
+
+    o = cfg["output"]
+    base = hub_base(cfg)
+    out: list[tuple[str, Path, str]] = []
+    run_dir = Path(run_dir)
+    skip_parts = {"__pycache__", "images"}
+    skip_suffix = (".part", ".safetensors", ".bin", ".pt", ".tmp")
+    if run_dir.exists():
+        for f in sorted(run_dir.rglob("*")):
+            rel = f.relative_to(run_dir)
+            if (not f.is_file() or skip_parts & set(rel.parts)
+                    or f.name.endswith(skip_suffix) or f.name.endswith("_tasks.jsonl")):
+                continue
+            out.append((f"{base}/{rel.as_posix()}", f, "result"))
+    fx = fixture_dir(cfg)
+    if fx.exists():
+        for f in sorted(fx.iterdir()):
+            if f.is_file() and not f.name.endswith(".tmp"):
+                out.append((f"{base}/fixture/{f.name}", f, "fixture"))
+    root = Path(o["adapter_dir"])
+    for aid in arms:
+        for name in WEIGHT_FILES:
+            f = root / aid / name
+            if f.exists():
+                out.append((f"{base}/weights/{aid}/{name}", f, "weight"))
+    return out
+
+
+def decide(plan: list[tuple[str, Path, str]], remote: dict[str, dict],
+           force_weights: bool = False) -> tuple[list, list[str]]:
+    """Chọn file cần đẩy. `remote[path] = {"sha256": ..., "blob_id": ...}`.
+
+    Trả (cần đẩy [(path_in_repo, file, loại)], dòng log).
+    Weight của một candidate đi TRỌN BỘ: arm nào đã có safetensors trên repo
+    (dù trùng hay khác) thì không đẩy file nào của arm đó — trừ khi
+    `force_weights` và nội dung khác.
+    """
+    todo, log = [], []
+    by_arm: dict[str, list] = {}
+    for item in plan:
+        if item[2] == "weight":
+            by_arm.setdefault(item[0].rsplit("/", 2)[-2], []).append(item)
+            continue
+        path_in_repo, f, kind = item
+        r = remote.get(path_in_repo)
+        if r and _same(f, r):
+            continue
+        todo.append(item)
+    for aid, items in by_arm.items():
+        st = next((x for x in items if x[0].endswith("adapter_model.safetensors")), None)
+        if st is None:
+            log.append(f"⊘ {aid}: không có adapter_model.safetensors cục bộ — bỏ qua")
+            continue
+        r = remote.get(st[0])
+        if r is None:
+            todo.extend(items)
+            log.append(f"＋ {aid}: chưa có trên repo -> đẩy {len(items)} file")
+        elif _same(st[1], r):
+            log.append(f"= {aid}: weight trùng bản trên repo -> bỏ qua")
+        elif force_weights:
+            todo.extend(items)
+            log.append(f"! {aid}: weight KHÁC bản trên repo -> GHI ĐÈ (--force-weights)")
+        else:
+            log.append(f"⚠ {aid}: weight trên repo KHÁC bản cục bộ -> GIỮ bản repo "
+                       f"(ghi đè: push --force-weights)")
+    return todo, log
+
+
+def _same(f: Path, r: dict) -> bool:
+    if r.get("sha256"):
+        return _sha256(f) == r["sha256"]
+    if r.get("blob_id"):
+        return git_blob_sha1(f) == r["blob_id"]
+    return False
+
+
+def _remote_index(api, repo_id: str, repo_type: str, base: str) -> dict[str, dict]:
+    try:
+        from huggingface_hub.hf_api import RepoFile
+    except ImportError:  # pragma: no cover
+        RepoFile = None
+    out = {}
+    try:
+        items = api.list_repo_tree(repo_id, path_in_repo=base, repo_type=repo_type,
+                                   recursive=True, expand=False)
+        for it in items:
+            if RepoFile is not None and not isinstance(it, RepoFile):
+                continue
+            lfs = getattr(it, "lfs", None)
+            sha = (lfs.get("sha256") if isinstance(lfs, dict)
+                   else getattr(lfs, "sha256", None)) if lfs else None
+            out[it.path] = {"sha256": sha, "blob_id": getattr(it, "blob_id", None)}
+    except Exception as e:  # thư mục chưa có trên repo = chưa có gì
+        if ("NotFound" not in type(e).__name__ and "404" not in str(e)
+                and "not found" not in str(e).lower()):
+            raise
+    return out
+
+
+def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
+                 force_weights: bool = False, dry: bool = False) -> str | None:
     o = cfg["output"]
     repo_id = str(o.get("hub_repo", "")).strip()
     if not repo_id:
@@ -105,61 +253,67 @@ def push_results(cfg: Cfg, run_dir: Path) -> str | None:
         return None
     if "/" not in repo_id:
         raise ValueError(f"hub_repo phải có dạng owner/name, nhận {repo_id!r}")
-
     run_dir = Path(run_dir)
-    if not run_dir.exists():
-        print(f"⊘ không có {run_dir} — không có gì để đẩy", flush=True)
-        return None
+    repo_type = str(o.get("hub_repo_type", "dataset"))
+    base = hub_base(cfg)
 
     tok = hf_token()
-    if not tok:
-        print("⚠ không có HF_TOKEN — bỏ qua bước đẩy. Kết quả vẫn nằm ở "
-              f"{run_dir}\n"
-              "    export HF_TOKEN=hf_xxxxxxxx  &&  "
-              f"python -m src.run_recomb --exp {cfg.get('experiment', '2.3')} "
-              "--stages push", flush=True)
+    if not tok and not dry:
+        print("⚠ không có HF_TOKEN — không đẩy.  export HF_TOKEN=hf_xxxxxxxx  &&  "
+              "bash scripts/run_lora.sh push", flush=True)
         return None
 
-    _write_config_snapshot(cfg, run_dir)
-    _copy_log(run_dir)
+    if run_dir.exists():
+        _write_config_snapshot(cfg, run_dir)
+        _copy_log(run_dir)
+    plan = local_plan(cfg, run_dir, list(arms or []))
+    if not plan:
+        print(f"⊘ không có gì để đẩy (không thấy {run_dir}, fixture hay weight)",
+              flush=True)
+        return None
 
     try:
-        from huggingface_hub import HfApi
+        from huggingface_hub import CommitOperationAdd, HfApi
     except ImportError as e:
-        raise PushFailed(f"thiếu huggingface_hub ({e}) — pip install huggingface_hub"
-                         ) from e
-
+        raise PushFailed(f"thiếu huggingface_hub ({e})") from e
     api = HfApi(token=tok)
-    repo_type = str(o.get("hub_repo_type", "dataset"))
-    subdir = str(o.get("subdir", "")).strip("/")
-    exp = str(cfg.get("experiment", "?"))
+
+    # Repo CŨ, không tạo mới: không thấy = DỪNG.
     try:
-        api.create_repo(repo_id=repo_id, repo_type=repo_type,
-                        private=bool(o.get("hub_private", True)), exist_ok=True)
+        api.repo_info(repo_id=repo_id, repo_type=repo_type)
     except Exception as e:
         raise PushFailed(
-            f"không tạo/mở được {repo_type} repo {repo_id}: {e!r}\n"
-            f"    Kiểm: token có quyền WRITE chưa (token read không đẩy được), "
-            f"và tài khoản có quyền ghi vào `{repo_id.split('/')[0]}` không."
-        ) from e
+            f"không mở được {repo_type} repo {repo_id}: {e!r}\n"
+            f"    Lệnh push KHÔNG tạo repo mới. Kiểm: tên repo, và token có "
+            f"quyền WRITE vào `{repo_id.split('/')[0]}`.") from e
 
-    print(f"→ đẩy {run_dir} -> {repo_id}/{subdir or '.'} ({repo_type})", flush=True)
+    remote = _remote_index(api, repo_id, repo_type, base)
+    todo, log = decide(plan, remote, force_weights=force_weights)
+    print(f"→ {repo_id}/{base} ({repo_type}) · trên repo đã có {len(remote)} file",
+          flush=True)
+    for ln in log:
+        print(f"  {ln}", flush=True)
+    kinds = {k: sum(1 for x in todo if x[2] == k) for k in ("weight", "fixture", "result")}
+    url = (f"https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}"
+           f"{repo_id}/tree/main/{base}")
+    if not todo:
+        print(f"✓ không có file mới/đổi — repo đã khớp: {url}", flush=True)
+        return url
+    print(f"  cần đẩy: {kinds['weight']} file weight · {kinds['fixture']} fixture "
+          f"· {kinds['result']} kết quả", flush=True)
+    if dry:
+        for p_, _f, k in todo:
+            print(f"    [{k}] {p_}", flush=True)
+        return url
+    ops = [CommitOperationAdd(path_in_repo=p_, path_or_fileobj=str(f))
+           for p_, f, _k in todo]
+    new_w = sorted({p_.rsplit("/", 2)[-2] for p_, _f, k in todo if k == "weight"})
+    msg = (f"{base}: {kinds['result']} kết quả, {kinds['fixture']} fixture"
+           + (f", weight {', '.join(new_w)}" if new_w else ""))
     try:
-        api.upload_folder(
-            folder_path=str(run_dir),
-            repo_id=repo_id,
-            repo_type=repo_type,
-            path_in_repo=subdir or ".",
-            commit_message=f"§{exp} — {run_dir.name}",
-            # Ảnh không đi lên: chúng thuộc về repo dữ liệu gốc, và nhân bản
-            # 3000 ảnh sang repo kết quả chỉ làm repo phình mà không thêm thông
-            # tin gì — key trong predictions đã trỏ ngược về ảnh nguồn.
-            ignore_patterns=["*.part", "**/images/**", "*_tasks.jsonl",
-                             "__pycache__/*", "*.safetensors", "*.bin", "*.pt"],
-        )
+        api.create_commit(repo_id=repo_id, repo_type=repo_type, operations=ops,
+                          commit_message=msg)
     except Exception as e:
-        raise PushFailed(f"upload_folder hỏng: {e!r}") from e
-
-    url = f"https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}{repo_id}"
-    print(f"✓ đã đẩy: {url}  (thư mục `{subdir or '.'}`)", flush=True)
+        raise PushFailed(f"create_commit hỏng: {e!r}") from e
+    print(f"✓ đã đẩy {len(ops)} file: {url}", flush=True)
     return url

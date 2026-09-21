@@ -2,63 +2,98 @@
 
 Câu hỏi: trên **cùng** Gemma 3 4B lượng tử NF4, **cùng** 6400 mẫu train
 MIMIC-CXR, **cùng** lịch học và **cùng** 3000 ảnh test, hai lựa chọn của adapter
-QLoRA — **rank** (4 vs 8) và **chỗ gắn** (4 ma trận attention vs toàn bộ
-decoder) — có đổi chất lượng báo cáo X-quang sinh ra không, và cặp nào khác cặp
-nào?
+QLoRA — **rank** và **chỗ gắn** (4 ma trận attention vs toàn bộ decoder) — có
+đổi chất lượng báo cáo X-quang sinh ra không, và candidate nào khác candidate nào?
 
 | candidate | rank | gắn vào |
 |---|---|---|
 | `qlora_r4_attn` (tham chiếu) | 4 | q, k, v, o_proj |
 | `qlora_r8_attn` | 8 | q, k, v, o_proj |
+| `qlora_r16_attn` | 16 | q, k, v, o_proj |
+| `qlora_r32_attn` | 32 | q, k, v, o_proj |
 | `qlora_r4_decoder` | 4 | q, k, v, o + gate, up, down_proj |
 | `qlora_r8_decoder` | 8 | q, k, v, o + gate, up, down_proj |
 
-Chỉ HAI biến khác nhau giữa bốn candidate; mọi thứ khác dùng chung: base NF4,
+Chỉ HAI biến khác nhau giữa sáu candidate; mọi thứ khác dùng chung: base NF4,
 prompt, giải mã beam 3, 1 epoch, batch hiệu dụng 32, one-cycle (lr adapter
 1e-4), alpha = 2 × r (alpha/r không đổi, nên cột rank đo đúng số chiều). Vision
 tower không bao giờ được gắn adapter.
 
-**Kiểm định.** 6 cặp; mỗi cặp permutation đảo dấu + bootstrap BCa trên hiệu số
-ghép cặp theo ảnh, Holm trên 6 p-value trong từng metric, "thắng" = cả hai
-kiểm định bác H0 **và** |Cohen dz| ≥ 0.10. `REPORT.md` tách riêng bốn cặp khác
-nhau đúng một biến (hiệu ứng của rank, hiệu ứng của chỗ gắn).
+**Kiểm định — Friedman + hậu kiểm Holm** (`src/stats_friedman.py`). Trong từng
+metric: Friedman trên 6 candidate × 3000 ảnh (hạng trong từng ảnh, hiệu chỉnh
+ties Conover, p = xấp xỉ F Iman-Davenport), Holm trên các metric, Kendall W là
+effect size. CHỈ metric bác H0 mới hậu kiểm 15 cặp: Wilcoxon signed-rank ghép
+cặp (Pratt, giữ cặp d = 0) + permutation đối chiếu, Holm trên 15 cặp trong từng
+metric (`stats.posthoc_scope: permetric`; `global` = Holm trên mọi cặp × metric).
+"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng chín
+cặp khác nhau đúng một biến (6 cặp rank @ attn, 1 @ decoder, 2 cặp chỗ gắn).
 
-## Chạy
+## Chạy — ba lệnh tách rời
 
 ```bash
-export HF_TOKEN=hf_xxxxxxxx          # đã được cấp quyền google/gemma-3-4b-it
+export HF_TOKEN=hf_xxxxxxxx          # gemma-3-4b-it gated + quyền WRITE vào RGExp123/Research_results
 export WANDB_API_KEY=xxxxxxxx        # bỏ được → W&B ghi offline
 
-bash scripts/setup.sh                # lần đầu
-python scripts/selftest_lora.py      # vài giây, không cần GPU
-bash scripts/run_lora.sh --dry-run   # 8 ảnh, 16 mẫu, 4 bước + in VRAM đỉnh
-bash scripts/run_lora.sh --detach    # chạy thật, nền; log ở logs/
+bash scripts/setup.sh                        # lần đầu
+python scripts/selftest_lora.py              # vài giây, không cần GPU
+bash scripts/run_lora.sh train --dry-run     # 8 ảnh, 16 mẫu, 4 bước + in VRAM đỉnh
+
+bash scripts/run_lora.sh train --detach      # 1. data -> train -> infer -> score (nền; log ở logs/)
+bash scripts/run_lora.sh push                # 2. weight + kết quả -> Hub current/$1_LoRA_Reports/
+bash scripts/run_lora.sh stats               # 3. Friedman + hậu kiểm -> REPORT.md (GHI ĐÈ)
+bash scripts/run_lora.sh push                #    đẩy lại REPORT mới (weight trùng -> bỏ qua)
 ```
 
-Chạy lại chính lệnh sau khi đứt là **đi tiếp**: adapter đã có → bỏ qua train,
-predictions đã có → chỉ sinh phần thiếu, điểm đã có → dùng lại. Chỉ một phần:
-`--stages stats,report`, `--arms qlora_r4_attn,qlora_r4_decoder`,
-`--retrain`, `--rescore`.
+| lệnh | làm gì | cần |
+|---|---|---|
+| `train` | stage data, train, infer, score — chỉ phần còn thiếu. Weight mỗi candidate ghi ở `adapters_lora/<arm>/` và sha256 vào `_fixture/loader.json` ngay khi candidate đó xong, **trước** mọi lệnh stats | GPU, HF_TOKEN |
+| `push` | một commit vào `RGExp123/Research_results` (repo CŨ — không bao giờ tạo repo mới), thư mục thứ hai `current/`, thư mục con `$1_LoRA_Reports` (khuôn `$<Chỉ số>_<Test title>_Reports` từ `output.hub_index` + `output.hub_title`). Weight đã có trên repo thì **bỏ qua** (trùng sha256); khác thì cảnh báo và giữ bản repo, ghi đè chỉ khi `--force-weights`. File kết quả chỉ đẩy khi nội dung đổi. `--plan` in danh sách mà không đẩy | HF_TOKEN (WRITE) |
+| `stats` | đọc `metrics/per_sample_*.csv` → Friedman + hậu kiểm → **ghi đè** `REPORT.md`, `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `manifest.json`. DỪNG nếu thiếu weight của candidate nào | chỉ CPU |
+| `all` | train → stats → push | |
+
+Chạy lại `train` sau khi đứt là **đi tiếp**. Tuỳ chọn: `--arms a,b`,
+`--stages infer,score` (tập con stage của lệnh), `--retrain`, `--rescore`.
+
+**Thêm candidate về sau** (vd. `qlora_r64_attn`): thêm một dòng vào
+`lora_exp.arms` → `train` (chỉ candidate mới được huấn luyện/sinh/chấm) →
+`push` (chỉ weight mới lên repo) → `stats` (Friedman lại trên đủ k candidate,
+REPORT ghi đè).
+
+**Fixture — `adapters_lora/_fixture/`.** Sub-dataset + loader-setup khoá cứng,
+cùng đĩa với weight: `testset/trainset/valset.jsonl` (key + ref; thứ tự test =
+thứ tự khối Friedman, thứ tự train = đầu vào `randperm(seed)`) và `loader.json`
+(vân tay sha256 của mọi khoá quyết định kết quả — data, image_policy, base,
+prompt, generate, lịch học, eval, quant, metrics —, batch mỗi lượt lúc train và
+lúc sinh đã khoá, sha256 weight từng candidate). Có fixture thì `train` đọc
+split từ đây (không đọc lại Hub), chỉ tải ảnh còn thiếu, và **DỪNG** nếu config
+lệch vân tay (in đúng khoá lệch). Khoá GPU/I-O không nằm trong vân tay. Cố ý
+đổi thí nghiệm: `train --refixture --retrain`.
 
 **Val.** Mỗi 25 bước (và ở bước cuối), mỗi candidate tính CE trên **256 mẫu
 bốc ngẫu nhiên** trong hồ 2000 mẫu val (`data.n_val`), bốc lại ở **mỗi lần
-đo** (`train.eval` trong `configs/lora.yaml`). Ở lần đo thứ k, bốn candidate
+đo** (`train.eval` trong `configs/lora.yaml`). Ở lần đo thứ k, mọi candidate
 dùng **chung một tập** — chỉ số sinh từ (seed, số thứ tự lần đo), không từ arm
-id — nên bốn đường val so được với nhau và chạy lại cùng seed cho đúng loạt tập
+id — nên các đường val so được với nhau và chạy lại cùng seed cho đúng loạt tập
 ấy. Val **không** chọn checkpoint, **không** early stop, **không** chạm trọng
-số: cả bốn vẫn chạy đúng một epoch theo lịch one-cycle mà bảng kết quả dựa vào.
+số: mọi candidate vẫn chạy đúng một epoch theo lịch one-cycle mà bảng kết quả dựa vào.
 CE lấy trung bình theo **token** nên nó không đổi khi autobatch đổi batch mỗi
 lượt. Số ra ở `val/<arm>/loss` trên W&B, `train_stats.json` (`val.curve`) và
 cột *val CE cuối* của `REPORT.md`.
 
 Đầu ra: `runs/lora_rank_target/` (REPORT.md, manifest.json, predictions,
-metrics), adapter ở `adapters_lora/`. Stage `push` đẩy thư mục run (không đẩy
-trọng số) lên dataset **private** `RGExp123/research_v2` trên Hugging Face.
+metrics), weight + fixture ở `adapters_lora/`. Trên Hub
+(`RGExp123/Research_results`, cạnh `SoICT Archivements/`):
+
+```
+current/$1_LoRA_Reports/                  REPORT.md, manifest.json, metrics/, predictions/, logs/
+current/$1_LoRA_Reports/fixture/          sub-dataset + loader.json
+current/$1_LoRA_Reports/weights/<arm>/    adapter_model.safetensors, adapter_config.json, train_stats.json
+```
 
 ## Hai loại config
 
 * `configs/lora.yaml` — **nội dung**: thí nghiệm là gì (dữ liệu, base, prompt,
-  giải mã, lịch học, batch hiệu dụng, bốn candidate ở khối `lora_exp`, kiểm
+  giải mã, lịch học, batch hiệu dụng, các candidate ở khối `lora_exp`, kiểm
   định, repo Hub).
 * `configs/gpu/<card>.yaml` — **GPU + I/O**: chạy thế nào trên một máy (số mẫu
   mỗi lượt, checkpointing, prefetch, batch lúc sinh/chấm, autobatch, khối
@@ -85,12 +120,13 @@ không phải "85% tensor rồi tràn vì context". Lượt dò lúc train đệ
 chịu được mẫu **xấu nhất**, không chỉ mẫu trung bình.
 
 Batch hiệu dụng (32), số bước và đường lr **không đổi** — `grad_accum` suy lại.
-Và batch mỗi lượt là **một số dùng chung cho cả bốn candidate**: candidate nặng
-nhất (`qlora_r8_decoder`) được dò trước, số của nó khoá cho ba candidate còn
-lại (lúc sinh: khoá ghi ở `runs/<subdir>/infer_batch.json`). Lý do: HF lấy
+Và batch mỗi lượt là **một số dùng chung cho mọi candidate**: candidate nặng
+nhất (`qlora_r8_decoder`) được dò trước, số của nó khoá vào
+`adapters_lora/_fixture/loader.json` (`train_batch`; lúc sinh: `infer_batch`)
+cho các candidate còn lại **và** mọi candidate thêm về sau. Lý do: HF lấy
 trung bình CE theo token trong micro-batch, nên hai candidate chạy hai batch
-khác nhau là thêm một biến thứ ba vào bảng so sánh. Trộn với adapter cũ đã
-huấn luyện ở batch khác -> repo khoá theo số cũ và nhắc `--retrain`.
+khác nhau là thêm một biến thứ ba vào bảng so sánh. Candidate mới nặng hơn
+(vd. r lớn) mà batch đã khoá không vừa VRAM -> thử trước bằng `train --dry-run`.
 
 VRAM thiết bị được ghi vào W&B (`sys/vram_device_frac`) ở mỗi lần log, và bản
 tóm tắt `▣ VRAM đỉnh` in ở cuối MỌI lần chạy (`RGEXP_VRAM_MONITOR=0` để tắt).
@@ -116,12 +152,15 @@ Không khoá nào ở đây đổi kết quả: thứ tự dữ liệu vẫn do 
 ```
 configs/lora.yaml · configs/gpu/rtx3060.yaml
 scripts/run_lora.sh · selftest_lora.py · setup.sh · _env.sh
-src/run_lora.py        điều phối: data → train → infer → score → stats → report → push
-src/report_lora.py     REPORT.md
+src/run_lora.py        ba lệnh: train (data→train→infer→score) · push · stats (stats→report)
+src/fixture.py         adapters_lora/_fixture: sub-dataset + loader-setup + sổ weight
+src/stats_friedman.py  Friedman (ties, Iman-Davenport) + hậu kiểm Wilcoxon/permutation, Holm
+src/push.py            push vào repo cũ, current/, kiểm trùng weight
+src/report_lora.py     REPORT.md (ghi đè mỗi lần stats)
 src/train_recomb.py    vòng huấn luyện (candidate KHÔNG nhánh = Gemma NF4 + adapter peft)
 src/backbone.py        nạp base, chọn target module (lọc vision), alpha, one-cycle
 src/runners/           sinh (gemma3_recomb) — cùng đường dựng chuỗi với lúc train
-src/data*.py · imaging.py · metrics.py · stats_ab.py · stats_multi.py
+src/data*.py · imaging.py · metrics.py · stats_ab.py · stats_multi.py (đường ghép cặp cũ, còn selftest)
 src/prefetch.py · autobatch.py · vram_monitor.py · config.py · push.py · tracking.py
 ```
 
