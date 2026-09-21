@@ -30,9 +30,10 @@ cặp khác nhau đúng một biến (6 cặp rank @ decoder, 1 cặp chỗ gắ
 **Xu hướng theo rank** (cuối `REPORT.md`, CHỈ `decoder` = full linear;
 `report.rank_plot` trong `configs/lora.yaml`). Một đồ thị hỗn hợp
 `figures/rank_trend_decoder.png`: X = rank (thang log2: 2, 4, 8, 32), mỗi rank
-một cụm **bar** 4 metric (B3 · B4 · RL · BertF1), và mỗi metric một **line**
-nội suy bậc hai cục bộ tại các nút (nút = điểm TB các rank; mỗi đoạn trộn hai
-parabol qua 3 nút kề, không làm mượt) — đường đi đúng qua mọi chấm tròn. Bảng kèm theo: điểm TB từng rank, hồi quy
+một cụm **bar** 4 metric (B3 · B4 · RL · BertF1), và mỗi metric một **đường
+ngang nét đứt mảnh** cùng màu ở giá trị MAX của metric ấy qua các rank (nhãn
+ghi max gốc + rank đạt max) — không có line chart nối các rank. Bảng kèm
+theo: điểm TB từng rank, max (rank), hồi quy
 `metric ≈ a + b·log2(r)` làm số tóm tắt (`b` = đổi bao nhiêu mỗi lần gấp đôi
 rank), CI95 của `b` (bootstrap ghép cặp theo ảnh), R².
 Số liệu ở `metrics/rank_trend_decoder.csv`. Chỉ mô tả, không thay kiểm định.
@@ -197,7 +198,7 @@ src/fixture.py         adapters_lora/_fixture: sub-dataset + loader-setup + sổ
 src/stats_friedman.py  Friedman (ties, Iman-Davenport) + hậu kiểm Wilcoxon/permutation, Holm
 src/push.py            push vào repo cũ, current/, kiểm trùng weight
 src/report_lora.py     REPORT.md (ghi đè mỗi lần stats)
-src/report_plots.py    xu hướng theo rank của decoder: bar điểm TB + line nội suy bậc hai cục bộ qua các nút (figures/)
+src/report_plots.py    xu hướng theo rank của decoder: bar điểm TB + nét đứt ở max từng metric (figures/)
 src/train_recomb.py    vòng huấn luyện (candidate KHÔNG nhánh = Gemma NF4 + adapter peft)
 src/backbone.py        nạp base, chọn target module (lọc vision), alpha, one-cycle
 src/runners/           sinh (gemma3_recomb) — cùng đường dựng chuỗi với lúc train

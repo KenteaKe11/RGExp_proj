@@ -2,10 +2,11 @@
 
 Một đồ thị hỗn hợp (`figures/rank_trend_<target>.png`, nhúng vào REPORT.md):
   * BAR  — mỗi rank một cụm 4 cột: điểm TB của B3 · B4 · RL · BertF1.
-  * LINE — mỗi metric một đường NỘI SUY BẬC HAI CỤC BỘ đi đúng qua các NÚT =
-           điểm TB ở từng rank — `local_quadratic`.
-  * Hồi quy metric ≈ a + b·log2(r) KHÔNG vẽ; nó cho con số tóm tắt `b` (in cạnh
-    đường và trong bảng) cùng CI95, R².
+  * MAX  — mỗi metric một đường NGANG, nét đứt mảnh, cùng màu, ở giá trị LỚN
+           NHẤT của metric ấy qua các rank; nhãn bên phải ghi số GỐC và rank đạt.
+           Không có line chart nối các rank.
+  * Hồi quy metric ≈ a + b·log2(r) KHÔNG vẽ; nó cho con số tóm tắt `b` (bảng)
+    cùng CI95, R².
 Trục X đặt theo log2(r) (2, 4, 8, 32 -> 1, 2, 3, 5), nên khoảng trống giữa 8 và
 32 là khoảng trống thật, và b đọc thẳng là "đổi bao nhiêu mỗi lần GẤP ĐÔI rank".
 
@@ -18,19 +19,12 @@ trùng hồi quy trên từng ảnh). Khoảng tin cậy 95% của b: bootstrap 
 ảnh được chấm ở mọi rank; OLS trên từng ảnh coi 4 × 3000 điểm là độc lập và cho
 CI hẹp giả.
 
-Nội suy bậc hai cục bộ tại các nút (không Gauss, không làm mượt): trên đoạn
-giữa hai nút liền nhau, đường là trộn tuyến tính của hai parabol đi đúng qua
-3 nút kề (nút trước + hai đầu đoạn, và hai đầu đoạn + nút sau) — `local_quadratic`.
-Đường đi ĐÚNG qua mọi nút, trơn tại nút, và lên xuống theo đúng dữ liệu; đường
-thẳng hay parabol được giữ nguyên. Giữa hai nút đường có thể vồng nhẹ (dao động
-tự nhiên của nội suy bậc hai) — phần đó KHÔNG phải số đo, chỉ nút mới là số đo.
-
 Chỉ là mô tả: với 4 rank, R² và b nói "xu hướng trông thế nào", không thay kiểm
 định Friedman/Wilcoxon ở phần trên của REPORT.
 
 ── Hệ số scale γ — CHỈ để NHÌN ─────────────────────────────────────────────
-BertF1 ~0.86 còn B4 ~0.06: chung một trục Y thì đường B3/B4 nằm bẹp dưới đáy;
-đưa tất cả về CÙNG một tầm cao thì các đường chồng lên nhau. Nên trên ĐỒ THỊ mỗi
+BertF1 ~0.86 còn B4 ~0.06: chung một trục Y thì cột B3/B4 nằm bẹp dưới đáy;
+đưa tất cả về CÙNG một tầm cao thì các đường max chồng lên nhau. Nên trên ĐỒ THỊ mỗi
 metric được nhân với  e^(γ−1)  (γ = 1 -> giữ nguyên) để xếp thành TẦNG tách rời:
 
     giá trị vẽ = giá trị gốc × e^(γ−1)
@@ -41,9 +35,9 @@ metric được nhân với  e^(γ−1)  (γ = 1 -> giữ nguyên) để xếp t
 rồi γ_i = 1 + ln(T_i / TB_i), làm tròn 2 chữ số. Metric lớn nhất ở tầng trên
 cùng với γ = 1; thứ tự tầng = thứ tự TB gốc, nên metric thấp hơn luôn nằm dưới.
 Hệ số tính từ γ ĐÃ LÀM TRÒN, nên người đọc nhân/chia lại được từ đúng số trên
-legend. Nhân hằng số không đổi hình dạng, nhưng độ dốc trên hình = b × e^(γ−1):
-KHÔNG so độ nghiêng giữa hai đường — so cột `b / TB` (thay đổi tương đối) trong
-bảng. Bảng trong REPORT và file CSV luôn là số GỐC.
+legend. Nhân hằng số không đổi thứ tự các cột của CÙNG một metric, nhưng độ
+cao giữa hai metric là do γ: KHÔNG so cột/đường max giữa hai metric — so cột
+`b / TB` (thay đổi tương đối) trong bảng. Bảng trong REPORT và file CSV luôn là số GỐC.
 """
 from __future__ import annotations
 
@@ -149,56 +143,14 @@ def rank_trend(scores: dict[str, pd.DataFrame], arms: list[dict], cfg,
                "rel_slope": float(b[j] / means[:, j].mean()) if means[:, j].mean() else float("nan")}
         for k, r in enumerate(ranks.astype(int)):
             row[f"mean_r{r}"] = float(means[k, j])
+        kmax = int(np.argmax(means[:, j]))
+        row["max"] = float(means[kmax, j])
+        row["max_rank"] = int(ranks[kmax])
         rows.append(row)
     out = pd.DataFrame(rows)
     out.attrs["ranks"] = [int(r) for r in ranks]
     out.attrs["arm_ids"] = [x["id"] for x in sel]
     return out
-
-
-def _quad(xk: np.ndarray, yk: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """Parabol Lagrange đi ĐÚNG qua 3 nút (xk, yk), tính tại x."""
-    (x0, x1, x2), (y0, y1, y2) = xk, yk
-    return (y0 * (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2))
-            + y1 * (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2))
-            + y2 * (x - x0) * (x - x1) / ((x2 - x0) * (x2 - x1)))
-
-
-def local_quadratic(x: np.ndarray, y: np.ndarray,
-                    n: int = 400) -> tuple[np.ndarray, np.ndarray]:
-    """Nội suy bậc hai cục bộ TẠI CÁC NÚT -> (xs, ys) trên [x_min, x_max].
-
-    Đoạn [x_i, x_{i+1}] = trộn tuyến tính hai parabol cục bộ:
-        P_i   qua nút (i−1, i, i+1)      P_{i+1} qua nút (i, i+1, i+2)
-        y(x)  = (1 − t)·P_i(x) + t·P_{i+1}(x),   t = (x − x_i) / (x_{i+1} − x_i)
-    Đoạn đầu/cuối chỉ có một parabol -> dùng nguyên nó. Không làm mượt, không
-    trọng số: đường đi ĐÚNG qua mọi nút, liền mạch và trơn (C¹) tại nút, và dao
-    động tự nhiên theo đúng dữ liệu (có thể vồng nhẹ giữa hai nút). < 3 nút ->
-    nối thẳng.
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    xs = np.linspace(x.min(), x.max(), n)
-    k = len(x)
-    if k < 3:
-        return xs, np.interp(xs, x, y)
-    seg = np.clip(np.searchsorted(x, xs, side="right") - 1, 0, k - 2)
-    ys = np.empty(n)
-    for i in range(k - 1):
-        msk = seg == i
-        if not msk.any():
-            continue
-        xx = xs[msk]
-        left = _quad(x[i - 1:i + 2], y[i - 1:i + 2], xx) if i >= 1 else None
-        right = _quad(x[i:i + 3], y[i:i + 3], xx) if i + 2 < k else None
-        if left is None:
-            ys[msk] = right
-        elif right is None:
-            ys[msk] = left
-        else:
-            t = (xx - x[i]) / (x[i + 1] - x[i])
-            ys[msk] = (1 - t) * left + t * right
-    return xs, ys
 
 
 def _leg(r) -> str:
@@ -207,7 +159,7 @@ def _leg(r) -> str:
 
 
 def plot_rank_trend(trend: pd.DataFrame, path: Path) -> Path:
-    """Bar (điểm TB × e^(γ−1)) + line (nội suy bậc hai cục bộ qua các nút), X = log2(rank)."""
+    """Bar (điểm TB × e^(γ−1)) + đường ngang nét đứt ở MAX của từng metric."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -222,36 +174,35 @@ def plot_rank_trend(trend: pd.DataFrame, path: Path) -> Path:
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
 
+    x_lo = lx.min() - 0.5
+    x_end = lx.max() + width * (m - 1) / 2 + 0.12
     tags: list[list] = []
     for j, (_, r) in enumerate(trend.iterrows()):
         col = COLORS[j % len(COLORS)]
         off = (j - (m - 1) / 2) * width
         sc = float(r["scale"])
         vals = [r[f"mean_r{k}"] * sc for k in ranks]
-        ax.bar(lx + off, vals, width=width, color=col, alpha=0.38,
+        ax.bar(lx + off, vals, width=width, color=col, alpha=0.45,
                edgecolor=SURFACE, linewidth=2, zorder=2)
-        # Nội suy bậc hai cục bộ qua các nút (điểm TB đã scale). Vẽ lệch đúng `off` để
-        # đường nằm trên cột của chính metric ấy (chỉ dịch ngang).
-        xs, ys = local_quadratic(lx, np.array(vals))
-        ax.plot(xs + off, ys, color=col, linewidth=2, zorder=3)
-        ax.scatter(lx + off, vals, s=26, color=col, edgecolor=SURFACE, linewidth=1.5, zorder=4)
-        # Nhãn trực tiếp ở đầu phải: tên metric + độ dốc GỐC (chưa scale) mỗi lần ×2.
-        tags.append([float(ys[-1]), f"{_leg(r)}  b = {r['slope_per_doubling']:+.4f}/×2", col])
+        # Đường ngang ở MAX của metric này (đã scale), nét đứt mảnh, cùng màu.
+        y_max = float(r["max"]) * sc
+        ax.hlines(y_max, x_lo, x_end, colors=col, linestyles=(0, (4, 3)),
+                  linewidth=0.9, zorder=3)
+        tags.append([y_max, f"{_leg(r)}  max {r['max']:.4f} @ r={int(r['max_rank'])}", col])
 
     ax.set_xticks(lx, [f"r = {k}" for k in ranks])
-    ax.set_xlim(lx.min() - 0.6, lx.max() + 2.3)
+    ax.set_xlim(x_lo - 0.1, lx.max() + 2.6)
     ymax = float(np.nanmax(trend[[f"mean_r{k}" for k in ranks]].to_numpy()
                            * trend["scale"].to_numpy()[:, None]))
     ax.set_ylim(0, ymax * 1.12)
-    # Nhãn cuối đường: đẩy cho cách nhau tối thiểu `gap` (phòng khi hai tầng
-    # sát nhau), rồi nối về đầu đường bằng một gạch mảnh.
+    # Nhãn ở đầu phải đường max: đẩy cho cách nhau tối thiểu `gap` (phòng khi
+    # hai tầng sát nhau), rồi nối về đường bằng một gạch mảnh.
     gap = ymax * 0.055
     tags.sort(key=lambda t: t[0])
     pos = [t[0] for t in tags]
     for i in range(1, len(pos)):
         pos[i] = max(pos[i], pos[i - 1] + gap)
     shift = max(0.0, pos[-1] - ymax * 1.08) if pos else 0.0
-    x_end = lx.max() + width * (m - 1) / 2 + 0.08
     for (y0, txt, col), y in zip(tags, pos):
         y -= shift
         ax.plot([x_end + 0.02, x_end + 0.14], [y0, y], color=col, linewidth=0.8, zorder=3)
@@ -272,14 +223,13 @@ def plot_rank_trend(trend: pd.DataFrame, path: Path) -> Path:
     handles = [Patch(facecolor=COLORS[j % len(COLORS)], alpha=0.38, label=_leg(r))
                for j, (_, r) in enumerate(trend.iterrows())]
     handles += [Patch(facecolor="#999", alpha=0.38, label="cột = điểm TB × e^(γ−1)"),
-                Line2D([0], [0], color="#777", linewidth=2,
-                       label="đường = nội suy bậc hai cục bộ, đi đúng qua các nút")]
+                Line2D([0], [0], color="#777", linewidth=0.9, linestyle=(0, (4, 3)),
+                       label="nét đứt = giá trị MAX của metric (qua các rank)")]
     ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.13),
               ncol=3, frameon=False, fontsize=8.5, labelcolor=INK_2)
     fig.text(0.01, -0.05, "Cách đọc: giá trị gốc = giá trị trên trục Y ÷ e^(γ−1). "
-             "Chấm tròn = điểm TB thật (nút), đường đi đúng qua nút.\nMỗi metric một tầng — không so độ cao / độ nghiêng giữa hai tầng.\n"
-             "b in cạnh đường = độ dốc hồi quy GỐC (chưa scale) mỗi lần gấp đôi rank — "
-             "tóm tắt bằng số, không phải đường được vẽ. γ = 1: không scale.", fontsize=8, color=INK_2, ha="left")
+             "Nét đứt = max của metric ấy; nhãn phải ghi max GỐC và rank đạt max.\n"
+             "Mỗi metric một tầng — chỉ so cột của CÙNG một metric với đường max của nó. γ = 1: không scale.", fontsize=8, color=INK_2, ha="left")
     fig.tight_layout()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,25 +252,22 @@ def markdown_section(trend: pd.DataFrame | None, fig_rel: str | None,
     gl = " · ".join(f"{r['label']} γ = {r['gamma']:.2f} (×{r['scale']:.3g})"
                     for _, r in trend.iterrows())
     L.append("**Cách đọc đồ thị.** Mỗi metric được NHÂN với hệ số `e^(γ−1)` trước "
-             "khi vẽ để các đường xếp thành TẦNG tách rời (thứ tự tầng = thứ tự "
+             "khi vẽ để các metric xếp thành TẦNG tách rời (thứ tự tầng = thứ tự "
              "điểm TB gốc, metric lớn nhất ở trên cùng); legend ghi `Metric (γ=…)`. "
              f"Ở lần chạy này: {gl}.\n")
     L.append("- **Đổi về số gốc:** giá trị gốc = giá trị đọc trên trục Y ÷ `e^(γ−1)`. "
              "Ví dụ cột đọc được 0.60 với γ = 3.00 -> 0.60 ÷ e² ≈ 0.081.\n"
              "- **γ = 1** nghĩa là không scale (metric lớn nhất luôn có γ = 1 ở chế "
              "độ `auto`), trục Y đọc thẳng cho metric ấy.\n"
-             "- **Đường:** nội suy bậc hai cục bộ TẠI CÁC NÚT (nút = điểm TB ở "
-             "từng rank, chấm tròn trên cột), không làm mượt: trên mỗi đoạn giữa "
-             "hai nút, đường trộn hai parabol đi đúng qua 3 nút kề. Đường đi ĐÚNG "
-             "qua mọi chấm và lên xuống theo đúng dữ liệu. Phần giữa hai nút chỉ "
-             "là nội suy (có thể vồng nhẹ) — số đo chỉ có ở nút; đọc HÌNH DẠNG ở "
-             "đường (tăng đều, bão hoà, hay đi xuống).\n"
-             "- **Độ dốc:** hình dạng TRONG một tầng là thật, nhưng độ dốc trên "
-             "hình = độ dốc gốc × `e^(γ−1)` và mỗi tầng một hệ số: KHÔNG so độ "
-             "nghiêng giữa hai đường. So giữa các metric bằng cột `b / TB` của "
-             "bảng (thay đổi TƯƠNG ĐỐI mỗi lần gấp đôi rank).\n"
-             "- **`b`** in cạnh mỗi đường là độ dốc của hồi quy `a + b·log2(r)` "
-             "trên số GỐC — một con số tóm tắt, KHÔNG phải đường được vẽ.\n"
+             "- **Đường nét đứt:** mỗi metric một đường ngang mảnh, cùng màu, ở "
+             "giá trị LỚN NHẤT của metric ấy qua các rank. Cột nào chạm đường là "
+             "rank tốt nhất của metric đó; khoảng hở giữa đỉnh cột và đường cho "
+             "thấy rank ấy kém rank tốt nhất bao nhiêu (tương đối, trong cùng "
+             "tầng). Nhãn bên phải ghi max GỐC (chưa scale) và rank đạt max.\n"
+             "- **Xu hướng:** không vẽ đường nối các rank; tóm tắt bằng số ở cột "
+             "`b` (độ dốc hồi quy `a + b·log2(r)` trên số GỐC) và `b / TB` (thay "
+             "đổi TƯƠNG ĐỐI mỗi lần gấp đôi rank — dùng cột này để so giữa các "
+             "metric).\n"
              "- **Không** so chiều cao cột giữa hai metric khác nhau: chiều cao "
              "ấy do γ quyết định. Chỉ so cột của CÙNG một metric qua các rank.\n"
              "- Bảng dưới và `metrics/rank_trend_*.csv` là số GỐC, không scale.\n")
@@ -330,12 +277,13 @@ def markdown_section(trend: pd.DataFrame | None, fig_rel: str | None,
              f"ảnh. Mô tả thôi — kết luận \"khác nhau\" vẫn đọc ở Friedman / "
              f"hậu kiểm phía trên.\n")
     head = (["metric", "γ", "e^(γ−1)"] + [f"r = {k}" for k in ranks]
-            + ["b / ×2", "CI95 của b", "b / TB", "R²"])
+            + ["max (rank)", "b / ×2", "CI95 của b", "b / TB", "R²"])
     rows = []
     for _, r in trend.iterrows():
         rows.append([r["label"], f"{r['gamma']:.2f}", f"{r['scale']:.3g}"]
                     + [f"{r[f'mean_r{k}']:.4f}" for k in ranks]
-                    + [f"{r['slope_per_doubling']:+.4f}",
+                    + [f"{r['max']:.4f} (r={int(r['max_rank'])})",
+                       f"{r['slope_per_doubling']:+.4f}",
                        f"[{r['slope_ci_lo']:+.4f}, {r['slope_ci_hi']:+.4f}]",
                        f"{r['rel_slope']:+.2%}" if np.isfinite(r["rel_slope"]) else "—",
                        f"{r['r2']:.2f}" if np.isfinite(r["r2"]) else "—"])

@@ -555,7 +555,7 @@ def t_lora_report_builds():
 
 
 def t_rank_trend_plot():
-    """Xu hướng theo rank: CHỈ decoder, log2(r), γ xếp tầng, nội suy bậc hai tại nút, PNG + REPORT."""
+    """Xu hướng theo rank: CHỈ decoder, log2(r), γ xếp tầng, nét đứt ở max, PNG + REPORT."""
     import tempfile
 
     from src import report_plots as rp
@@ -600,21 +600,11 @@ def t_rank_trend_plot():
         "bleu3": 1.0, "bleu4": 2.5, "rougeL": 1.0, "bertscore_f1": 1.0}
     off = rp.rank_trend(scores, arms, type(CFG)(dict(CFG, report={"rank_plot": {"gamma": "off"}})))
     assert (off["scale"] == 1.0).all()
-    # Nội suy bậc hai cục bộ: đi ĐÚNG qua mọi nút; đường thẳng và parabol (theo
-    # log2 r) giữ nguyên; liền mạch, không nhảy bậc; 2 nút -> nối thẳng.
-    x4 = np.log2([2, 4, 8, 32])
-    yk = np.array([0.1, 0.3, 0.15, 0.25])
-    xs, ys = rp.local_quadratic(x4, yk)
-    for xi, yi in zip(x4, yk):
-        assert abs(ys[int(np.argmin(np.abs(xs - xi)))] - yi) < 2e-3, (xi, yi)
-    assert np.max(np.abs(np.diff(ys))) < 0.01, "đường phải liền mạch"
-    xs, ys = rp.local_quadratic(x4, 0.2 + 0.05 * x4)
-    assert np.allclose(ys, 0.2 + 0.05 * xs, atol=1e-12), "đường thẳng phải giữ nguyên"
-    q = lambda t: 0.1 + 0.08 * t - 0.01 * t * t
-    xs, ys = rp.local_quadratic(x4, q(x4))
-    assert np.allclose(ys, q(xs), atol=1e-12), "parabol phải giữ nguyên"
-    xs, ys = rp.local_quadratic(x4[:2], yk[:2])
-    assert np.allclose(ys, np.interp(xs, x4[:2], yk[:2]))
+    # Max từng metric: đúng giá trị TB lớn nhất và rank đạt nó (số GỐC)
+    for _, r in tr.iterrows():
+        vals = {k: r[f"mean_r{k}"] for k in (2, 4, 8, 32)}
+        assert r["max"] == max(vals.values()) and vals[r["max_rank"]] == r["max"], r
+    assert not hasattr(rp, "local_quadratic"), "không còn line chart"
     # < 2 rank decoder có điểm -> không vẽ, không ném lỗi
     one = {k: v for k, v in scores.items() if k in ("qlora_r8_attn", "qlora_r2_decoder")}
     assert rp.rank_trend(one, arms, CFG) is None
@@ -625,7 +615,7 @@ def t_rank_trend_plot():
     assert "![metric theo rank](figures/t.png)" in md and "| B4 |" in md
     assert "r = 32" in md and "CI95" in md
     assert "(γ=1.00)" in rp._leg(tr.iloc[3]) and "Cách đọc" in md and "e^(γ−1)" in md
-    assert "nội suy bậc hai cục bộ" in md and "Gauss" not in md and "b / TB" in md
+    assert "nét đứt" in md.lower() and "max (rank)" in md and "b / TB" in md
 
 
 def t_friedman_matches_scipy():

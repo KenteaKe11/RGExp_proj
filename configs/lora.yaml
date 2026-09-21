@@ -427,7 +427,7 @@ wandb:
 # ── REPORT: xu hướng theo rank (`src/report_plots.py`) ─────────────────────
 # CHỈ cho một chỗ gắn (`target`, mặc định decoder = full linear). Một đồ thị
 # hỗn hợp `figures/rank_trend_<target>.png`: BAR = điểm TB của 4 metric ở mỗi
-# rank, LINE = nội suy bậc hai cục bộ đi đúng qua các nút = điểm TB; hồi
+# rank, NÉT ĐỨT ngang mảnh ở MAX của từng metric (không line chart); hồi
 # quy metric ≈ a + b·log2(r) chỉ cho số tóm tắt b (bảng). CI95 của b
 # = bootstrap ghép cặp theo ảnh (`n_boot`). Trên đồ thị mỗi metric nhân e^(γ−1)
 # để xếp thành TẦNG tách rời (bảng/CSV vẫn là số gốc). Chỉ là mô tả, không phải kiểm định;
@@ -444,7 +444,6 @@ report:
     # -> 1). off = không scale.
     gamma: auto
     gamma_spread: 0.18        # khoảng cách hai tầng liền nhau = 18% của M
-    # LINE không có tham số: nội suy bậc hai cục bộ, đi đúng qua mọi nút (không làm mượt).
 
 output:
   dir: ./runs

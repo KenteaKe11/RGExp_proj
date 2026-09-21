@@ -6,7 +6,7 @@ thời gian, VRAM, val CE) -> điểm trung bình -> Friedman tổng thể từn
 (W, p·Holm) -> hạng trung bình -> HIỆU ỨNG ĐƠN (cặp khác nhau đúng một biến) ->
 mọi cặp. "Thắng" = Wilcoxon·Holm bác H0 VÀ |rank-biserial| >= `rrb_floor`.
 Cuối cùng: xu hướng theo rank của `decoder` (full linear) — bảng hồi quy +
-`figures/rank_trend_decoder.png` (bar điểm TB + line nội suy bậc hai cục bộ qua các nút, `src/report_plots.py`).
+`figures/rank_trend_decoder.png` (bar điểm TB + nét đứt ngang ở max từng metric, `src/report_plots.py`).
 """
 from __future__ import annotations
 
