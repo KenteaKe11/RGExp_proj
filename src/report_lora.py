@@ -5,6 +5,8 @@ metrics/train_stats.csv, manifest.json. Thứ tự đọc: thiết lập (tham s
 thời gian, VRAM, val CE) -> điểm trung bình -> Friedman tổng thể từng metric
 (W, p·Holm) -> hạng trung bình -> HIỆU ỨNG ĐƠN (cặp khác nhau đúng một biến) ->
 mọi cặp. "Thắng" = Wilcoxon·Holm bác H0 VÀ |rank-biserial| >= `rrb_floor`.
+Cuối cùng: xu hướng theo rank của `decoder` (full linear) — bảng hồi quy +
+`figures/rank_trend_decoder.png` (bar điểm TB + line nội suy bậc hai cục bộ qua các nút, `src/report_plots.py`).
 """
 from __future__ import annotations
 
@@ -82,7 +84,8 @@ def _verdict(r, names: dict, sign: float, a: str, b: str) -> str:
 
 def build_markdown(cfg, summary: pd.DataFrame, fr: pd.DataFrame,
                    ph: pd.DataFrame, train_stats: list[dict], names: dict,
-                   manifest: dict, arms: list[dict]) -> str:
+                   manifest: dict, arms: list[dict],
+                   trend_md: list[str] | None = None) -> str:
     primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
     st = dict(cfg["stats"])
     scope = str(st.get("posthoc_scope", "global"))
@@ -210,6 +213,9 @@ def build_markdown(cfg, summary: pd.DataFrame, fr: pd.DataFrame,
     elif fr is not None and not fr.empty:
         L.append(f"\n*`{primary}` không qua cổng Friedman -> không hậu kiểm cặp.*\n")
 
+    if trend_md:
+        L.extend(trend_md)
+
     if manifest.get("headline"):
         L.append("## Tóm tắt\n")
         for ln in manifest["headline"]:
@@ -228,6 +234,31 @@ def build_markdown(cfg, summary: pd.DataFrame, fr: pd.DataFrame,
     return "\n".join(L) + "\n"
 
 
+def _rank_trend(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
+                arms: list[dict], manifest: dict) -> list[str]:
+    """Bảng + đồ thị xu hướng theo rank (`src/report_plots.py`).
+
+    Đồ thị hỏng (thiếu matplotlib, ...) KHÔNG làm hỏng REPORT: bảng vẫn ghi,
+    chỗ đồ thị ghi rõ lý do.
+    """
+    from . import report_plots as rp
+
+    pc = rp.plot_cfg(cfg)
+    trend = rp.rank_trend(scores, arms, cfg, seed=int(cfg.get("seed", 0)))
+    fig_rel, err = None, None
+    if trend is not None:
+        trend.to_csv(run_dir / "metrics" / f"rank_trend_{pc['target']}.csv", index=False)
+        fig_rel = f"figures/rank_trend_{pc['target']}.png"
+        try:
+            rp.plot_rank_trend(trend, run_dir / fig_rel)
+        except Exception as e:  # noqa: BLE001
+            fig_rel, err = None, f"{type(e).__name__}: {e}"
+            print(f"  ⚠ đồ thị xu hướng rank: {err}", flush=True)
+        manifest["rank_trend"] = {"target": pc["target"], "figure": fig_rel,
+                                  "arms": trend.attrs["arm_ids"]}
+    return rp.markdown_section(trend, fig_rel, err, pc["target"])
+
+
 def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
               names: dict, fr: pd.DataFrame, ph: pd.DataFrame,
               train_stats: list[dict], manifest: dict, arms: list[dict]) -> Path:
@@ -243,10 +274,11 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     summary.to_csv(mdir / "summary.csv", index=False)
     if train_stats:
         pd.json_normalize(train_stats).to_csv(mdir / "train_stats.csv", index=False)
+    trend_md = _rank_trend(cfg, run_dir, scores, arms, manifest)
     manifest["report_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     path = run_dir / "REPORT.md"
     path.write_text(build_markdown(cfg, summary, fr, ph, train_stats, names,
-                                   manifest, arms), encoding="utf-8")
+                                   manifest, arms, trend_md), encoding="utf-8")
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")

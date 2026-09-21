@@ -58,6 +58,8 @@ nltk>=3.8
 
 # Thống kê: numpy thuần cho bootstrap/permutation; scipy để đối chiếu chéo.
 scipy>=1.11.0
+# Đồ thị xu hướng theo rank trong REPORT.md (backend Agg, không cần màn hình).
+matplotlib>=3.7
 
 # Theo dõi lần chạy. Không có nó pipeline vẫn chạy (src/tracking.py tự no-op),
 # nhưng lúc đó chỉ còn cách ngồi canh console.
