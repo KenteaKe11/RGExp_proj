@@ -7,27 +7,25 @@ QLoRA — **rank** và **chỗ gắn** (4 ma trận attention vs toàn bộ deco
 
 | candidate | rank | gắn vào |
 |---|---|---|
-| `qlora_r4_attn` (tham chiếu) | 4 | q, k, v, o_proj |
-| `qlora_r8_attn` | 8 | q, k, v, o_proj |
+| `qlora_r8_attn` (tham chiếu) | 8 | q, k, v, o_proj |
 | `qlora_r2_decoder` | 2 | q, k, v, o + gate, up, down_proj |
 | `qlora_r4_decoder` | 4 | q, k, v, o + gate, up, down_proj |
 | `qlora_r8_decoder` | 8 | q, k, v, o + gate, up, down_proj |
-| `qlora_r16_decoder` | 16 | q, k, v, o + gate, up, down_proj |
 | `qlora_r32_decoder` | 32 | q, k, v, o + gate, up, down_proj |
 
-Chỉ HAI biến khác nhau giữa bảy candidate; mọi thứ khác dùng chung: base NF4,
+Chỉ HAI biến khác nhau giữa năm candidate; mọi thứ khác dùng chung: base NF4,
 prompt, giải mã beam 3, 1 epoch, batch hiệu dụng 32, one-cycle (lr adapter
 1e-4), alpha = 2 × r (alpha/r không đổi, nên cột rank đo đúng số chiều). Vision
 tower không bao giờ được gắn adapter.
 
 **Kiểm định — Friedman + hậu kiểm Holm** (`src/stats_friedman.py`). Trong từng
-metric: Friedman trên 7 candidate × 3000 ảnh (hạng trong từng ảnh, hiệu chỉnh
+metric: Friedman trên 5 candidate × 3000 ảnh (hạng trong từng ảnh, hiệu chỉnh
 ties Conover, p = xấp xỉ F Iman-Davenport), Holm trên các metric, Kendall W là
-effect size. CHỈ metric bác H0 mới hậu kiểm 21 cặp: Wilcoxon signed-rank ghép
-cặp (Pratt, giữ cặp d = 0) + permutation đối chiếu, Holm trên 21 cặp trong từng
+effect size. CHỈ metric bác H0 mới hậu kiểm 10 cặp: Wilcoxon signed-rank ghép
+cặp (Pratt, giữ cặp d = 0) + permutation đối chiếu, Holm trên 10 cặp trong từng
 metric (`stats.posthoc_scope: permetric`; `global` = Holm trên mọi cặp × metric).
-"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng 13
-cặp khác nhau đúng một biến (1 cặp rank @ attn, 10 @ decoder, 2 cặp chỗ gắn).
+"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng 7
+cặp khác nhau đúng một biến (6 cặp rank @ decoder, 1 cặp chỗ gắn ở r=8).
 
 ## Chạy — ba lệnh tách rời
 

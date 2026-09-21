@@ -12,12 +12,12 @@
 # 3000 ảnh test, rank và chỗ gắn adapter (4 ma trận attention vs toàn bộ Linear
 # của decoder) có đổi chất lượng báo cáo không, và cặp nào khác cặp nào?
 #
-# Bảy candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
-#   attn    × r ∈ {4, 8}
-#   decoder × r ∈ {2, 4, 8, 16, 32}      (full linear: attn + MLP)
-# Kiểm định: Friedman (Iman-Davenport, có hiệu chỉnh ties) trên 7 candidate
+# Năm candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
+#   attn    × r ∈ {8}
+#   decoder × r ∈ {2, 4, 8, 32}          (full linear: attn + MLP)
+# Kiểm định: Friedman (Iman-Davenport, có hiệu chỉnh ties) trên 5 candidate
 # trong từng metric -> Holm trên các metric; metric nào bác H0 mới hậu kiểm
-# 21 cặp bằng Wilcoxon signed-rank (Pratt) + Holm (`stats`).
+# 10 cặp bằng Wilcoxon signed-rank (Pratt) + Holm (`stats`).
 #
 # Ba lệnh (`bash scripts/run_lora.sh <lệnh>`):
 #   train — data -> train -> infer -> score, chỉ những candidate còn thiếu.
@@ -139,8 +139,8 @@ generate:
 # ═════════════════════════════════════════════════════════════════════════════
 # CANDIDATE — rank × chỗ gắn (`scripts/run_lora.sh`, `src/run_lora.py`)
 # ═════════════════════════════════════════════════════════════════════════════
-# Khôi phục thí nghiệm adapter của §2.2: QLoRA r ∈ {4, 8} ở 4 ma trận
-# attention, r ∈ {2, 4, 8, 16, 32} ở toàn bộ Linear của decoder (7 candidate). KHÔNG nhánh Recombinator, KHÔNG
+# Khôi phục thí nghiệm adapter của §2.2: QLoRA r = 8 ở 4 ma trận
+# attention, r ∈ {2, 4, 8, 32} ở toàn bộ Linear của decoder (5 candidate). KHÔNG nhánh Recombinator, KHÔNG
 # Experts (MoE tắt cứng), KHÔNG Stage 0 — chỉ Gemma 3 4B NF4 + adapter peft.
 #
 # Mọi thứ khác dùng CHUNG cho mọi candidate, đọc từ các khối của file này: `data`
@@ -156,11 +156,11 @@ generate:
 #   decoder — thêm gate/up/down_proj (MLP): mọi Linear của decoder ngôn ngữ.
 # Vision tower / projector KHÔNG bao giờ được gắn (`train.exclude_prefixes`).
 #
-# Kiểm định: 7 candidate -> Friedman tổng thể trong từng metric, rồi 21 cặp
+# Kiểm định: 5 candidate -> Friedman tổng thể trong từng metric, rồi 10 cặp
 # hậu kiểm (Wilcoxon + Holm) ở metric đã qua cổng. Tham chiếu (luôn đứng ở vị
-# trí A của cặp, nên Δ = B − A) = qlora_r4_attn, cấu hình §2.5 đã dùng. 13
-# trong 21 cặp là hiệu ứng ĐƠN của một biến (1 cặp rank @ attn, 10 @ decoder,
-# 2 cặp chỗ gắn ở r=4/8); REPORT.md tách riêng 13 cặp ấy.
+# trí A của cặp, nên Δ = B − A) = qlora_r8_attn, candidate attention duy nhất.
+# 7 trong 10 cặp là hiệu ứng ĐƠN của một biến (6 cặp rank @ decoder, 1 cặp chỗ
+# gắn ở r=8); REPORT.md tách riêng 7 cặp ấy.
 #
 # Thêm candidate về sau: thêm một dòng vào `arms` (chỉ đổi `rank`/`target`),
 # rồi `run_lora.sh train` -> chỉ candidate mới được huấn luyện/sinh/chấm, trên
@@ -170,8 +170,6 @@ lora_exp:
     attn: [q_proj, k_proj, v_proj, o_proj]
     decoder: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   arms:
-    - {id: qlora_r4_attn,    method: qlora, rank: 4, target: attn,
-       name: "QLoRA r=4 · attention (q,k,v,o)"}
     - {id: qlora_r8_attn,    method: qlora, rank: 8, target: attn,
        name: "QLoRA r=8 · attention (q,k,v,o)"}
     - {id: qlora_r2_decoder, method: qlora, rank: 2, target: decoder,
@@ -180,11 +178,9 @@ lora_exp:
        name: "QLoRA r=4 · full decoder (attn + MLP)"}
     - {id: qlora_r8_decoder, method: qlora, rank: 8, target: decoder,
        name: "QLoRA r=8 · full decoder (attn + MLP)"}
-    - {id: qlora_r16_decoder, method: qlora, rank: 16, target: decoder,
-       name: "QLoRA r=16 · full decoder (attn + MLP)"}
     - {id: qlora_r32_decoder, method: qlora, rank: 32, target: decoder,
        name: "QLoRA r=32 · full decoder (attn + MLP)"}
-  reference: qlora_r4_attn
+  reference: qlora_r8_attn
 
 train:
   n_epochs: 1   # decoder_ft: 1 epoch
@@ -411,7 +407,7 @@ stats:
   zero_method: pratt         # giữ cặp d = 0 khi xếp hạng (xem stats_friedman)
   kendall_w_floor: 0.05      # W dưới mức này -> cảnh báo cạnh kết luận
   rrb_floor: 0.10            # |r_rb| dưới mức này -> "không đáng kể"
-  reference: qlora_r4_attn
+  reference: qlora_r8_attn
 
 wandb:
   enabled: true

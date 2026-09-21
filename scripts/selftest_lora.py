@@ -397,7 +397,7 @@ def t_batch_locked_across_arms():
 
     arms = lora_arms(CFG)
     order = [x["id"] for x in heaviest_first(arms)]
-    assert order[0] == "qlora_r32_decoder" and order[-1] == "qlora_r4_attn", order
+    assert order[0] == "qlora_r32_decoder" and order[-1] == "qlora_r8_attn", order
     c = lock_train(Cfg({"train": dict(CFG["train"]), "autobatch": {"enabled": True}}), 4)
     assert c["train"]["per_device_batch_size"] == 4
     assert c["train"]["grad_accum"] == 8, c["train"]["grad_accum"]
@@ -448,15 +448,14 @@ def t_io_keys_present():
 
 
 def t_lora_exp_design():
-    """LoRA: attn r∈{4,8} + decoder r∈{2,4,8,16,32}; chỉ hai biến khác nhau."""
+    """LoRA: attn r∈{8} + decoder r∈{2,4,8,32}; chỉ hai biến khác nhau."""
     from src.run_lora import arm_cfg, factor_pairs, lora_arms, preset_for
     from src.stats_multi import pair_list
 
     arms = lora_arms(CFG)
     assert [(x["rank"], x["target"]) for x in arms] == [
-        (4, "attn"), (8, "attn"),
-        (2, "decoder"), (4, "decoder"), (8, "decoder"),
-        (16, "decoder"), (32, "decoder")], arms
+        (8, "attn"),
+        (2, "decoder"), (4, "decoder"), (8, "decoder"), (32, "decoder")], arms
     assert {x["method"] for x in arms} == {"qlora"}
     T = CFG["lora_exp"]["targets"]
     assert T["attn"] == list(CFG["train"]["target_modules"]), \
@@ -464,23 +463,23 @@ def t_lora_exp_design():
     assert set(T["attn"]) < set(T["decoder"])
     assert {"gate_proj", "up_proj", "down_proj"} <= set(T["decoder"])
     ref = CFG["lora_exp"]["reference"]
-    assert ref == "qlora_r4_attn"
+    assert ref == "qlora_r8_attn"
     pairs = pair_list([x["id"] for x in arms], "all", ref)
-    assert len(pairs) == 21 and all(a == ref for a, b in pairs if ref in (a, b))
+    assert len(pairs) == 10 and all(a == ref for a, b in pairs if ref in (a, b))
     fp = factor_pairs(arms)
-    assert len(fp) == 13, fp         # 1 cặp rank @ attn + 10 @ decoder + 2 chỗ gắn
-    assert ("qlora_r4_attn", "qlora_r8_attn", "rank 4→8 @ attn") in fp
-    assert ("qlora_r16_decoder", "qlora_r32_decoder", "rank 16→32 @ decoder") in fp
+    assert len(fp) == 7, fp          # 6 cặp rank @ decoder + 1 chỗ gắn (r=8)
+    assert ("qlora_r8_decoder", "qlora_r32_decoder", "rank 8→32 @ decoder") in fp
     assert ("qlora_r2_decoder", "qlora_r8_decoder", "rank 2→8 @ decoder") in fp
-    assert ("qlora_r4_attn", "qlora_r4_decoder", "attn→decoder @ r=4") in fp
-    assert not any(lb.endswith(("r=2", "r=16", "r=32")) for _a, _b, lb in fp), \
-        "r2/r16/r32 không có bản attn -> không có cặp chỗ gắn ở r ấy"
-    c = arm_cfg(CFG, arms[5])
+    assert ("qlora_r8_attn", "qlora_r8_decoder", "attn→decoder @ r=8") in fp
+    assert not any(lb.endswith("@ attn") for _a, _b, lb in fp), "attn chỉ còn một rank"
+    assert not any(lb.endswith(("r=2", "r=4", "r=32")) for _a, _b, lb in fp), \
+        "r2/r4/r32 không có bản attn -> không có cặp chỗ gắn ở r ấy"
+    c = arm_cfg(CFG, arms[-1])
     assert c["train"]["target_modules"] == T["decoder"]
     assert c["moe"]["enabled"] is False and c["pretrain_init"] is None
     assert CFG["train"]["target_modules"] == T["attn"], "arm_cfg làm bẩn cfg gốc"
     assert CFG["moe"]["enabled"] is False, "thí nghiệm LoRA không có Experts"
-    assert [preset_for(CFG, x)["alpha"] for x in arms] == [8, 16, 4, 8, 16, 32, 64]
+    assert [preset_for(CFG, x)["alpha"] for x in arms] == [16, 4, 8, 16, 64]
     for k in ("train", "base", "data", "generate", "image_policy"):
         diff = {kk for kk in set(c[k]) | set(CFG[k])
                 if c[k].get(kk) != CFG[k].get(kk)}
@@ -522,7 +521,7 @@ def t_lora_targets_match_real_names():
 
 
 def t_lora_report_builds():
-    """REPORT.md dựng được từ điểm giả: Friedman + 13 cặp hiệu ứng đơn + 21 cặp."""
+    """REPORT.md dựng được từ điểm giả: Friedman + 7 cặp hiệu ứng đơn + 10 cặp."""
     from src.report_lora import build_markdown, summary_table
     from src.run_lora import factor_pairs, lora_arms, ref_first
     from src.stats_friedman import friedman_all, posthoc_all
@@ -530,7 +529,7 @@ def t_lora_report_builds():
     arms = lora_arms(CFG)
     rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(80)]
-    ids = ref_first([x["id"] for x in arms], "qlora_r4_attn")
+    ids = ref_first([x["id"] for x in arms], "qlora_r8_attn")
     scores = {x["id"]: pd.DataFrame({"key": keys, "bertscore_f1":
                                      rng.normal(0.5 + 0.02 * j, 0.05, 80)})
               for j, x in enumerate(arms)}
@@ -539,17 +538,16 @@ def t_lora_report_builds():
     assert bool(fr["reject_h0"].iloc[0]), fr
     ph = posthoc_all(scores, ["bertscore_f1"], st,
                      gate=dict(zip(fr["metric"], fr["reject_h0"])), seed=1, order=ids)
-    assert len(ph) == 21 and (ph["posthoc_scope"] == "permetric").all()
-    assert (ph[ph["arm_a"] == "qlora_r4_attn"].shape[0] == 6), "tham chiếu phải ở vị trí A"
+    assert len(ph) == 10 and (ph["posthoc_scope"] == "permetric").all()
+    assert (ph[ph["arm_a"] == "qlora_r8_attn"].shape[0] == 4), "tham chiếu phải ở vị trí A"
     names = {x["id"]: x["name"] for x in arms}
     summ = summary_table(scores, names, ["bertscore_f1"], "bertscore_f1")
-    md = build_markdown(CFG, summ, fr, ph, [{"arm_id": "qlora_r4_attn",
+    md = build_markdown(CFG, summ, fr, ph, [{"arm_id": "qlora_r8_attn",
                                              "trainable_params": 1234}],
                         names, {"run_id": "t", "factor_pairs": factor_pairs(arms),
                                 "headline": ["x"]}, arms)
     assert "Friedman tổng thể" in md and "Hiệu ứng đơn" in md
-    assert md.count("@ r=") == 2 and md.count("@ attn") >= 1 \
-        and md.count("@ decoder") >= 10, md
+    assert md.count("@ r=") == 1 and md.count("@ decoder") >= 6, md
     assert "1,234" in md
     # r32 (điểm cao nhất nhánh decoder ở dữ liệu giả) phải thắng r2 ở dòng "rank 2→32 @ decoder"
     line = next(l for l in md.splitlines() if l.startswith("| rank 2→32 @ decoder"))
@@ -761,7 +759,7 @@ if __name__ == "__main__":
     check("src/ không import sang _archive/", t_src_does_not_import_archive)
 
     hr("2. Thí nghiệm LoRA")
-    check("attn r∈{4,8} + decoder r∈{2,4,8,16,32}, chỉ hai biến khác nhau",
+    check("attn r∈{8} + decoder r∈{2,4,8,32}, chỉ hai biến khác nhau",
           t_lora_exp_design)
     check("`decoder` khớp 7 Linear/lớp, vision không khớp",
           t_lora_targets_match_real_names)
