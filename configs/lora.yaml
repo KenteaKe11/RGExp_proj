@@ -9,15 +9,15 @@
 # = train.effective_batch / train.per_device_batch_size.
 #
 # Câu hỏi: trên CÙNG Gemma 3 4B NF4, CÙNG 6400 mẫu train, CÙNG lịch học và CÙNG
-# 3000 ảnh test, rank (4 vs 8) và chỗ gắn adapter (4 ma trận attention vs toàn
-# bộ decoder) có đổi chất lượng báo cáo không, và cặp nào khác cặp nào?
+# 3000 ảnh test, rank và chỗ gắn adapter (4 ma trận attention vs toàn bộ Linear
+# của decoder) có đổi chất lượng báo cáo không, và cặp nào khác cặp nào?
 #
-# Sáu candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
-#   attn    × r ∈ {4, 8, 16}
-#   decoder × r ∈ {2, 4, 8}
-# Kiểm định: Friedman (Iman-Davenport, có hiệu chỉnh ties) trên 6 candidate
+# Bảy candidate (`lora_exp.arms`), chỉ HAI biến khác nhau: `rank`, `target`.
+#   attn    × r ∈ {4, 8}
+#   decoder × r ∈ {2, 4, 8, 16, 32}      (full linear: attn + MLP)
+# Kiểm định: Friedman (Iman-Davenport, có hiệu chỉnh ties) trên 7 candidate
 # trong từng metric -> Holm trên các metric; metric nào bác H0 mới hậu kiểm
-# 15 cặp bằng Wilcoxon signed-rank (Pratt) + Holm (`stats`).
+# 21 cặp bằng Wilcoxon signed-rank (Pratt) + Holm (`stats`).
 #
 # Ba lệnh (`bash scripts/run_lora.sh <lệnh>`):
 #   train — data -> train -> infer -> score, chỉ những candidate còn thiếu.
@@ -139,8 +139,8 @@ generate:
 # ═════════════════════════════════════════════════════════════════════════════
 # CANDIDATE — rank × chỗ gắn (`scripts/run_lora.sh`, `src/run_lora.py`)
 # ═════════════════════════════════════════════════════════════════════════════
-# Khôi phục thí nghiệm adapter của §2.2: QLoRA r ∈ {4, 8, 16} ở 4 ma trận
-# attention, r ∈ {2, 4, 8} ở toàn bộ decoder (6 candidate). KHÔNG nhánh Recombinator, KHÔNG
+# Khôi phục thí nghiệm adapter của §2.2: QLoRA r ∈ {4, 8} ở 4 ma trận
+# attention, r ∈ {2, 4, 8, 16, 32} ở toàn bộ Linear của decoder (7 candidate). KHÔNG nhánh Recombinator, KHÔNG
 # Experts (MoE tắt cứng), KHÔNG Stage 0 — chỉ Gemma 3 4B NF4 + adapter peft.
 #
 # Mọi thứ khác dùng CHUNG cho mọi candidate, đọc từ các khối của file này: `data`
@@ -156,11 +156,11 @@ generate:
 #   decoder — thêm gate/up/down_proj (MLP): mọi Linear của decoder ngôn ngữ.
 # Vision tower / projector KHÔNG bao giờ được gắn (`train.exclude_prefixes`).
 #
-# Kiểm định: 6 candidate -> Friedman tổng thể trong từng metric, rồi 15 cặp
+# Kiểm định: 7 candidate -> Friedman tổng thể trong từng metric, rồi 21 cặp
 # hậu kiểm (Wilcoxon + Holm) ở metric đã qua cổng. Tham chiếu (luôn đứng ở vị
-# trí A của cặp, nên Δ = B − A) = qlora_r4_attn, cấu hình §2.5 đã dùng. Tám
-# trong 15 cặp là hiệu ứng ĐƠN của một biến (3 cặp rank @ attn, 3 @ decoder,
-# 2 cặp chỗ gắn ở r=4/8); REPORT.md tách riêng tám cặp ấy.
+# trí A của cặp, nên Δ = B − A) = qlora_r4_attn, cấu hình §2.5 đã dùng. 13
+# trong 21 cặp là hiệu ứng ĐƠN của một biến (1 cặp rank @ attn, 10 @ decoder,
+# 2 cặp chỗ gắn ở r=4/8); REPORT.md tách riêng 13 cặp ấy.
 #
 # Thêm candidate về sau: thêm một dòng vào `arms` (chỉ đổi `rank`/`target`),
 # rồi `run_lora.sh train` -> chỉ candidate mới được huấn luyện/sinh/chấm, trên
@@ -174,14 +174,16 @@ lora_exp:
        name: "QLoRA r=4 · attention (q,k,v,o)"}
     - {id: qlora_r8_attn,    method: qlora, rank: 8, target: attn,
        name: "QLoRA r=8 · attention (q,k,v,o)"}
-    - {id: qlora_r16_attn,   method: qlora, rank: 16, target: attn,
-       name: "QLoRA r=16 · attention (q,k,v,o)"}
     - {id: qlora_r2_decoder, method: qlora, rank: 2, target: decoder,
        name: "QLoRA r=2 · full decoder (attn + MLP)"}
     - {id: qlora_r4_decoder, method: qlora, rank: 4, target: decoder,
        name: "QLoRA r=4 · full decoder (attn + MLP)"}
     - {id: qlora_r8_decoder, method: qlora, rank: 8, target: decoder,
        name: "QLoRA r=8 · full decoder (attn + MLP)"}
+    - {id: qlora_r16_decoder, method: qlora, rank: 16, target: decoder,
+       name: "QLoRA r=16 · full decoder (attn + MLP)"}
+    - {id: qlora_r32_decoder, method: qlora, rank: 32, target: decoder,
+       name: "QLoRA r=32 · full decoder (attn + MLP)"}
   reference: qlora_r4_attn
 
 train:

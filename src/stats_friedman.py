@@ -1,7 +1,7 @@
 """Kiểm định Friedman + hậu kiểm — cho k > 2 biến thể chấm trên CÙNG một tập.
 
 Chép từ `_archive/src/stats_friedman.py` (đường §2.2 đã có selftest đối chiếu
-scipy), đem về dùng cho thí nghiệm LoRA 6 candidate. Chỗ đổi DUY NHẤT:
+scipy), đem về dùng cho thí nghiệm LoRA 7 candidate. Chỗ đổi DUY NHẤT:
 `posthoc_all` đọc `stats.posthoc_scope` (permetric | global) để chọn họ Holm
 cho kết luận chính thức, và nhận `order` để tham chiếu luôn đứng ở vị trí A.
 
