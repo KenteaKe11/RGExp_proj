@@ -8,7 +8,7 @@
 #     bash scripts/run_lora.sh all [--detach]     # train -> stats -> push
 #
 #     bash scripts/run_lora.sh train --dry-run    # thử đường ống + in VRAM đỉnh
-#     bash scripts/run_lora.sh train --arms qlora_r32_attn
+#     bash scripts/run_lora.sh train --arms qlora_r2_decoder
 #     bash scripts/run_lora.sh push --plan        # chỉ in file sẽ đẩy
 #     bash scripts/run_lora.sh push --force-weights
 #

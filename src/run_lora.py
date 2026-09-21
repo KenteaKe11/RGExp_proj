@@ -6,12 +6,12 @@
     python -m src.run_lora all       # train -> stats -> push
 
     python -m src.run_lora train --dry-run          # 8 ảnh test, 16 mẫu train, 4 bước
-    python -m src.run_lora train --arms qlora_r32_attn
+    python -m src.run_lora train --arms qlora_r2_decoder
     python -m src.run_lora train --stages infer,score
     python -m src.run_lora push --force-weights     # ghi đè weight KHÁC trên repo
     python -m src.run_lora push --plan              # chỉ in file sẽ đẩy
 
-Sáu candidate ở `lora_exp.arms`: attn × r ∈ {4, 8, 16, 32}, decoder × r ∈ {4, 8}.
+Sáu candidate ở `lora_exp.arms`: attn × r ∈ {4, 8, 16}, decoder × r ∈ {2, 4, 8}.
 Hai biến — `rank`, `target` — là thứ DUY NHẤT khác nhau giữa các candidate; mọi
 thứ khác đến từ các khối chung của configs/lora.yaml.
 

@@ -10,7 +10,7 @@ QLoRA — **rank** và **chỗ gắn** (4 ma trận attention vs toàn bộ deco
 | `qlora_r4_attn` (tham chiếu) | 4 | q, k, v, o_proj |
 | `qlora_r8_attn` | 8 | q, k, v, o_proj |
 | `qlora_r16_attn` | 16 | q, k, v, o_proj |
-| `qlora_r32_attn` | 32 | q, k, v, o_proj |
+| `qlora_r2_decoder` | 2 | q, k, v, o + gate, up, down_proj |
 | `qlora_r4_decoder` | 4 | q, k, v, o + gate, up, down_proj |
 | `qlora_r8_decoder` | 8 | q, k, v, o + gate, up, down_proj |
 
@@ -25,8 +25,8 @@ ties Conover, p = xấp xỉ F Iman-Davenport), Holm trên các metric, Kendall 
 effect size. CHỈ metric bác H0 mới hậu kiểm 15 cặp: Wilcoxon signed-rank ghép
 cặp (Pratt, giữ cặp d = 0) + permutation đối chiếu, Holm trên 15 cặp trong từng
 metric (`stats.posthoc_scope: permetric`; `global` = Holm trên mọi cặp × metric).
-"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng chín
-cặp khác nhau đúng một biến (6 cặp rank @ attn, 1 @ decoder, 2 cặp chỗ gắn).
+"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng tám
+cặp khác nhau đúng một biến (3 cặp rank @ attn, 3 @ decoder, 2 cặp chỗ gắn).
 
 ## Chạy — ba lệnh tách rời
 
