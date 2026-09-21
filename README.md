@@ -65,7 +65,7 @@ bash scripts/run_lora.sh push                #    đẩy lại REPORT mới (wei
 |---|---|---|
 | `train` | stage data, train, infer, score — chỉ phần còn thiếu. Weight mỗi candidate ghi ở `adapters_lora/<arm>/` và sha256 vào `_fixture/loader.json` ngay khi candidate đó xong, **trước** mọi lệnh stats | GPU, HF_TOKEN |
 | `push` | một commit vào `RGExp123/Research_results` (repo CŨ — không bao giờ tạo repo mới), thư mục thứ hai `current/`, thư mục con `$1_LoRA_Test` (kết quả ở `Reports/`, chưa có thì tạo ngay) (khuôn `$<Chỉ số>_<Test title>_Test` từ `output.hub_index` + `output.hub_title`). Weight đã có trên repo thì **bỏ qua** (trùng sha256); khác thì cảnh báo và giữ bản repo, ghi đè chỉ khi `--force-weights`. File kết quả chỉ đẩy khi nội dung đổi. `--plan` in danh sách mà không đẩy | HF_TOKEN (WRITE) |
-| `stats` | đọc `metrics/per_sample_*.csv` → Friedman + hậu kiểm → **ghi đè** `REPORT.md`, `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `manifest.json`. DỪNG nếu thiếu weight của candidate nào | chỉ CPU |
+| `stats` | kéo điểm còn thiếu từ Hub (có tem khớp) → đọc `metrics/per_sample_*.csv` → Friedman + hậu kiểm → **ghi đè** `REPORT.md`, `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `manifest.json`. DỪNG nếu candidate nào không truy được về weight (cục bộ hoặc tem) | chỉ CPU (mạng để kéo; không có thì dùng cục bộ) |
 | `all` | train → stats → push | |
 
 Chạy lại `train` sau khi đứt là **đi tiếp**. Tuỳ chọn: `--arms a,b`,
@@ -73,8 +73,31 @@ Chạy lại `train` sau khi đứt là **đi tiếp**. Tuỳ chọn: `--arms a,
 
 **Thêm candidate về sau** (vd. `qlora_r64_attn`): thêm một dòng vào
 `lora_exp.arms` → `train` (chỉ candidate mới được huấn luyện/sinh/chấm) →
-`push` (chỉ weight mới lên repo) → `stats` (Friedman lại trên đủ k candidate,
-REPORT ghi đè).
+`stats` (Friedman lại trên đủ k candidate, REPORT ghi đè) → `push`. Làm được
+cả trên một máy MỚI trống trơn — xem mục dưới.
+
+**Kết quả từng candidate trên Hub (`src/hub_sync.py`).** Ngay khi một candidate
+sinh đủ 3000 báo cáo — và lại sau khi chấm — `train` đẩy RIÊNG candidate ấy lên
+`current/$1_LoRA_Test/`: `Reports/predictions/<arm>.jsonl`,
+`Reports/metrics/per_sample_<arm>.csv`, **tem** `Reports/arms/<arm>.json`,
+weight (nếu repo chưa có) và `fixture/`. Tem ghi vân tay fixture (dữ liệu,
+prompt, giải mã, metric…), sha256 weight đã sinh ra báo cáo, batch lúc sinh,
+số dòng + sha256 của predictions/per_sample và điểm TB từng metric của riêng
+candidate đó. Đẩy hỏng không dừng lệnh (file còn trên đĩa, `push` sau).
+
+Trước `train` và `stats`, máy kéo về những gì CÒN THIẾU: fixture (nếu chưa có),
+weight của candidate chưa có cục bộ (nên không huấn luyện lại), và predictions
++ điểm — **chỉ khi tem khớp máy này** (cùng vân tay config, cùng sha256 weight,
+cùng batch sinh, đủ mẫu, sha file tải về khớp tem). Lệch điều nào thì in lý do
+và candidate đó được sinh lại như thường; không có tem thì không dùng. `stats`
+không tải adapter (hàng trăm MB): weight đối chiếu qua sha256 LFS trên Hub.
+File cục bộ không bao giờ bị ghi đè. Tắt: `--no-pull` hoặc `output.pull: false`;
+tắt đẩy từng candidate: `output.push_each_arm: false`. `--retrain` không kéo
+(weight sẽ đổi), và kết quả của weight cũ bị đổi thành `*.stale`.
+
+Máy mới, thêm một candidate: clone repo → `export HF_TOKEN=…` → thêm dòng vào
+`lora_exp.arms` → `bash scripts/run_lora.sh train` (kéo fixture + weight +
+kết quả cũ, chỉ train/sinh/chấm candidate mới) → `stats` → `push`.
 
 **Fixture — `adapters_lora/_fixture/`.** Sub-dataset + loader-setup khoá cứng,
 cùng đĩa với weight: `testset/trainset/valset.jsonl` (key + ref; thứ tự test =
@@ -102,7 +125,7 @@ metrics), weight + fixture ở `adapters_lora/`. Trên Hub
 (`RGExp123/Research_results`, cạnh `SoICT Archivements/`):
 
 ```
-current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/, predictions/, logs/
+current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/, predictions/, arms/ (tem), logs/
 current/$1_LoRA_Test/fixture/             sub-dataset + loader.json
 current/$1_LoRA_Test/weights/<arm>/       adapter_model.safetensors, adapter_config.json, train_stats.json
 ```

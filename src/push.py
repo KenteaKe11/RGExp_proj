@@ -5,7 +5,8 @@ Thư mục con theo quy ước `$<Chỉ số>_<Test title>_Test` (`hub_dir_name`
 dựng từ `output.hub_index` + `output.hub_title` — thí nghiệm này: `$1_LoRA_Test`.
 
     current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/,
-                                              predictions/, config.resolved.yaml, logs/
+                                              predictions/, arms/ (tem từng candidate),
+                                              config.resolved.yaml, logs/
     current/$1_LoRA_Test/fixture/             sub-dataset + loader-setup (adapters_lora/_fixture/)
     current/$1_LoRA_Test/weights/<arm>/       adapter_model.safetensors, adapter_config.json,
                                               train_stats.json
@@ -149,8 +150,12 @@ def _sha256(path: Path) -> str:
     return sha256_file(path)
 
 
-def local_plan(cfg: Cfg, run_dir: Path, arms: list[str]) -> list[tuple[str, Path, str]]:
-    """[(path_in_repo, file cục bộ, loại)] — loại ∈ weight | fixture | result."""
+def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
+               results_only: set[str] | None = None) -> list[tuple[str, Path, str]]:
+    """[(path_in_repo, file cục bộ, loại)] — loại ∈ weight | fixture | result.
+
+    `results_only` (đường dẫn tương đối trong run_dir) -> chỉ những file kết quả
+    ấy (đẩy riêng một candidate, `hub_sync.push_arm`)."""
     from .fixture import WEIGHT_FILES, fixture_dir
 
     o = cfg["output"]
@@ -158,12 +163,15 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str]) -> list[tuple[str, Path
     out: list[tuple[str, Path, str]] = []
     run_dir = Path(run_dir)
     skip_parts = {"__pycache__", "images"}
-    skip_suffix = (".part", ".safetensors", ".bin", ".pt", ".tmp")
+    skip_suffix = (".part", ".safetensors", ".bin", ".pt", ".tmp", ".hub",
+                   ".stale", ".remote.json")
     if run_dir.exists():
         for f in sorted(run_dir.rglob("*")):
             rel = f.relative_to(run_dir)
             if (not f.is_file() or skip_parts & set(rel.parts)
                     or f.name.endswith(skip_suffix) or f.name.endswith("_tasks.jsonl")):
+                continue
+            if results_only is not None and rel.as_posix() not in results_only:
                 continue
             out.append((f"{base}/{REPORTS_DIR}/{rel.as_posix()}", f, "result"))
     fx = fixture_dir(cfg)
@@ -261,7 +269,9 @@ def _remote_index(api, repo_id: str, repo_type: str, base: str) -> dict[str, dic
 
 
 def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
-                 force_weights: bool = False, dry: bool = False) -> str | None:
+                 force_weights: bool = False, dry: bool = False,
+                 results_only: set[str] | None = None,
+                 message_tag: str | None = None) -> str | None:
     o = cfg["output"]
     repo_id = str(o.get("hub_repo", "")).strip()
     if not repo_id:
@@ -279,10 +289,10 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
               "bash scripts/run_lora.sh push", flush=True)
         return None
 
-    if run_dir.exists():
+    if run_dir.exists() and results_only is None:
         _write_config_snapshot(cfg, run_dir)
         _copy_log(run_dir)
-    plan = local_plan(cfg, run_dir, list(arms or []))
+    plan = local_plan(cfg, run_dir, list(arms or []), results_only)
     if not plan:
         print(f"⊘ chưa có kết quả/fixture/weight cục bộ ({run_dir}) — chỉ bảo đảm "
               f"{base}/{REPORTS_DIR}/ có trên repo", flush=True)
@@ -331,7 +341,8 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
         ops.append(CommitOperationAdd(path_in_repo=keep, path_or_fileobj=b""))
     new_w = sorted({p_.rsplit("/", 2)[-2] for p_, _f, k in todo if k == "weight"})
     msg = (f"{base}: {kinds['result']} kết quả, {kinds['fixture']} fixture"
-           + (f", weight {', '.join(new_w)}" if new_w else ""))
+           + (f", weight {', '.join(new_w)}" if new_w else "")
+           + (f" [{message_tag}]" if message_tag else ""))
     try:
         api.create_commit(repo_id=repo_id, repo_type=repo_type, operations=ops,
                           commit_message=msg)

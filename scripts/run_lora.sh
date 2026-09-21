@@ -15,7 +15,9 @@
 # `train` chạy lại sau khi đứt là ĐI TIẾP: weight đã có -> bỏ qua, predictions
 # đã có -> chỉ sinh phần thiếu. Sub-dataset + loader-setup khoá ở
 # adapters_lora/_fixture/: thêm candidate vào configs/lora.yaml rồi `train` ->
-# chỉ candidate mới chạy. `stats` không cần GPU/mạng/HF_TOKEN.
+# chỉ candidate mới chạy. Kết quả từng candidate lên Hub kèm tem ngay khi
+# xong; máy mới kéo về (nếu tem khớp) thay vì sinh lại. `--no-pull` để tắt.
+# `stats` không cần GPU; mạng/HF_TOKEN chỉ để kéo điểm còn thiếu từ Hub.
 #
 # Mã thoát: 0 xong · 1 thiếu kết quả · 2 cấu hình sai / fixture lệch · 3 train
 #           hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng

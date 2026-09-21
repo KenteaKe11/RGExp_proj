@@ -787,7 +787,7 @@ def t_stats_overwrites_report():
                 mdir / f"per_sample_{aid}.csv", index=False)
         # cache_dir cũng ở thư mục tạm: không đọc testset.jsonl THẬT ở ./data
         sets = ["--set", f"output.adapter_dir={ad}", "--set", f"output.dir={runs}",
-                "--set", f"data.cache_dir={d / 'data'}", "--no-wandb"]
+                "--set", f"data.cache_dir={d / 'data'}", "--no-wandb", "--no-pull"]
         # chưa có weight -> DỪNG (ckpt phải lưu TRƯỚC stats)
         assert main(["stats"] + sets) == 1
         for aid in ids:
@@ -803,6 +803,136 @@ def t_stats_overwrites_report():
         assert "CŨ" not in txt and "Friedman tổng thể" in txt
         assert (mdir / "friedman_tests.csv").exists() and (mdir / "posthoc_tests.csv").exists()
         assert not (mdir / "pairwise_tests.csv").exists(), "file kiểm định cũ phải bị xoá"
+
+
+def t_hub_sync_per_arm():
+    """Kết quả từng candidate lên Hub kèm TEM; máy mới kéo về mà không sinh lại —
+    nhưng CHỈ khi tem khớp (fixture, weight, batch sinh, đủ mẫu, sha file)."""
+    import json
+    import shutil
+    import tempfile
+
+    from src import fixture as fx_mod
+    from src import hub_sync as hs
+    from src.config import Cfg
+    from src.push import REPORTS_DIR, hub_base, local_plan
+    from src.run_lora import _retire_results, lora_arms
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+
+        def mk_cfg(tag):
+            c = Cfg(json.loads(json.dumps(dict(CFG), default=str)))
+            c["output"] = dict(c["output"], adapter_dir=str(d / tag / "ad"),
+                               dir=str(d / tag / "runs"), pull=True, push=True)
+            return c
+
+        cfg = mk_cfg("A")
+        arm = lora_arms(cfg)[1]                       # qlora_r2_decoder
+        aid = arm["id"]
+        ad, run = Path(cfg["output"]["adapter_dir"]), Path(cfg["output"]["dir"]) / "x"
+        fx = fx_mod.fixture_dir(cfg)
+        keys = [f"k{i}" for i in range(12)]
+        tdf = pd.DataFrame({"key": keys, "ref": ["r"] * 12})
+        fx_mod.create(cfg, fx, tdf, pd.DataFrame({"key": ["t1", "t2"], "ref": ["a", "b"]}), None)
+        fx_mod.set_lock(fx, "infer_batch", 4, "test")
+        (ad / aid).mkdir(parents=True)
+        (ad / aid / "adapter_model.safetensors").write_bytes(b"W" * 64)
+        (ad / aid / "adapter_config.json").write_text("{}", encoding="utf-8")
+        (ad / aid / "train_stats.json").write_text('{"arm_id": "%s"}' % aid, encoding="utf-8")
+        (run / "predictions").mkdir(parents=True)
+        (run / "metrics").mkdir(parents=True)
+        with open(run / "predictions" / f"{aid}.jsonl", "w", encoding="utf-8") as f:
+            for k in keys:
+                f.write(json.dumps({"key": k, "pred": "p " + k}) + "\n")
+        pd.DataFrame({"key": keys, "bleu3": np.linspace(0, 1, 12),
+                      "bertscore_f1": np.full(12, 0.8)}).to_csv(
+            run / "metrics" / f"per_sample_{aid}.csv", index=False)
+        st = hs.write_stamp(cfg, run, fx, arm, ad / aid, 12)
+        assert st["n_preds"] == 12 and st["infer_batch"] == 4
+        assert abs(st["means"]["bertscore_f1"] - 0.8) < 1e-12 and st["per_sample_sha256"]
+        assert hs.same_stamp(st, hs.write_stamp(cfg, run, fx, arm, ad / aid, 12, write=False))
+
+        # push riêng một candidate: chỉ file kết quả của NÓ (+ fixture + weight của nó)
+        (run / "predictions" / "khac.jsonl").write_text("{}\n", encoding="utf-8")
+        keep = {f"predictions/{aid}.jsonl", f"metrics/per_sample_{aid}.csv", f"arms/{aid}.json"}
+        plan = local_plan(cfg, run, [aid], keep)
+        base = hub_base(cfg)
+        res = {p for p, _f, k in plan if k == "result"}
+        assert res == {f"{base}/{REPORTS_DIR}/{x}" for x in keep}, res
+        assert any(k == "weight" for _p, _f, k in plan) and any(k == "fixture" for _p, _f, k in plan)
+
+        # "Hub" giả = thư mục; path_in_repo -> file
+        hub = d / "hub"
+        for p, f, _k in local_plan(cfg, run, [aid]):
+            (hub / p).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, hub / p)
+
+        class FakeApi:
+            def hf_hub_download(self, repo_id, filename, repo_type):
+                return str(hub / filename)
+
+        def index():
+            return {str(p.relative_to(hub)).replace("\\", "/"): {
+                "sha256": fx_mod.sha256_file(p), "blob_id": None}
+                for p in hub.rglob("*") if p.is_file()}
+
+        orig = hs._api_and_index
+        hs._api_and_index = lambda c: (FakeApi(), "o/r", "dataset", index())
+        try:
+            # Máy B trống trơn -> kéo đủ fixture, weight, predictions, điểm
+            cB = mk_cfg("B")
+            adB, runB = Path(cB["output"]["adapter_dir"]), Path(cB["output"]["dir"]) / "x"
+            fxB = fx_mod.fixture_dir(cB)
+            out = hs.pull(cB, runB, adB, fxB, [arm], 12)
+            assert out["fixture"] and out["weights"] == [aid] and out["results"] == [aid], out
+            for rel in (f"predictions/{aid}.jsonl", f"metrics/per_sample_{aid}.csv"):
+                assert (runB / rel).read_bytes() == (run / rel).read_bytes(), rel
+            assert (adB / aid / "adapter_model.safetensors").read_bytes() == b"W" * 64
+            assert fx_mod.get_lock(fxB, "infer_batch") == 4
+            # Kéo lần nữa: không thiếu gì -> không tải gì
+            again = hs.pull(cB, runB, adB, fxB, [arm], 12)
+            assert not (again["fixture"] or again["weights"] or again["results"])
+
+            # Máy C chỉ chạy stats: KHÔNG tải adapter, weight đối chiếu qua sha LFS
+            cC = mk_cfg("C")
+            adC, runC = Path(cC["output"]["adapter_dir"]), Path(cC["output"]["dir"]) / "x"
+            outC = hs.pull(cC, runC, adC, fx_mod.fixture_dir(cC), [arm], 12, want_weights=False)
+            assert outC["results"] == [aid] and not (adC / aid / "adapter_model.safetensors").exists()
+            assert (adC / aid / "train_stats.json").exists()
+
+            # Máy D có weight KHÁC (huấn luyện lại) -> không dùng kết quả trên Hub
+            cD = mk_cfg("D")
+            adD, runD = Path(cD["output"]["adapter_dir"]), Path(cD["output"]["dir"]) / "x"
+            (adD / aid).mkdir(parents=True)
+            (adD / aid / "adapter_model.safetensors").write_bytes(b"X" * 64)
+            (adD / aid / "train_stats.json").write_text("{}", encoding="utf-8")
+            outD = hs.pull(cD, runD, adD, fx_mod.fixture_dir(cD), [arm], 12)
+            assert aid in outD["skipped"] and "weight" in outD["skipped"][aid], outD
+            assert not (runD / "predictions" / f"{aid}.jsonl").exists()
+
+            # Config đổi thứ quyết định kết quả (giải mã) -> tem không khớp
+            cE = mk_cfg("E")
+            cE["generate"] = dict(cE["generate"], num_beams=1)
+            outE = hs.pull(cE, Path(cE["output"]["dir"]) / "x", Path(cE["output"]["adapter_dir"]),
+                           fx_mod.fixture_dir(cE), [arm], 12)
+            assert "vân tay" in outE["skipped"].get(aid, ""), outE
+
+            # predictions trên Hub bị sửa -> sha lệch tem -> không dùng
+            pth = hub / base / REPORTS_DIR / "predictions" / f"{aid}.jsonl"
+            pth.write_text(pth.read_text(encoding="utf-8").replace("p k1", "XX"), encoding="utf-8")
+            cF = mk_cfg("F")
+            outF = hs.pull(cF, Path(cF["output"]["dir"]) / "x", Path(cF["output"]["adapter_dir"]),
+                           fx_mod.fixture_dir(cF), [arm], 12)
+            assert "sha256" in outF["skipped"].get(aid, ""), outF
+        finally:
+            hs._api_and_index = orig
+
+        # Huấn luyện lại -> kết quả của weight cũ thành *.stale (không bị đẩy)
+        _retire_results(run, aid)
+        assert not (run / "predictions" / f"{aid}.jsonl").exists()
+        assert (run / "predictions" / f"{aid}.jsonl.stale").exists()
+        assert not any(p.endswith(".stale") for p, _f, _k in local_plan(cfg, run, [aid]))
 
 
 def t_lora_main_rejects_unknown_arm():
@@ -838,6 +968,7 @@ if __name__ == "__main__":
     check("`decoder` khớp 7 Linear/lớp, vision không khớp",
           t_lora_targets_match_real_names)
     check("REPORT.md dựng được", t_lora_report_builds)
+    check("kết quả từng candidate lên Hub + tem; kéo về không sinh lại", t_hub_sync_per_arm)
     check("xu hướng theo rank: decoder, log2, PNG", t_rank_trend_plot)
     check("--arms lạ là DỪNG", t_lora_main_rejects_unknown_arm)
     check("ba lệnh train / push / stats tách rời", t_commands_split)

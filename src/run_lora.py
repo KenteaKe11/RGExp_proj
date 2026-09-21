@@ -22,7 +22,11 @@ loader-setup (vân tay các khoá quyết định kết quả, batch mỗi lư�
 lúc sinh đã khoá). Thêm candidate mới = thêm một dòng vào `lora_exp.arms` rồi
 `train`: chỉ candidate mới chạy, trên ĐÚNG dữ liệu + batch cũ.
 
-`stats` KHÔNG cần GPU/mạng: đọc `metrics/per_sample_*.csv`, chạy Friedman
+Kết quả TỪNG candidate lên Hub ngay khi sinh/chấm xong, kèm tem; trước `train`
+và `stats`, máy kéo về những gì còn thiếu nếu tem khớp (`src/hub_sync.py`) ->
+thêm candidate mới trên máy mới KHÔNG phải sinh lại candidate cũ. `--no-pull`.
+
+`stats` KHÔNG cần GPU (mạng chỉ để kéo): đọc `metrics/per_sample_*.csv`, chạy Friedman
 (Iman-Davenport, ties Conover) trong từng metric + Holm trên các metric, rồi
 hậu kiểm mọi cặp (Wilcoxon Pratt + permutation, Holm) ở metric đã qua cổng.
 Mỗi lần chạy ghi đè REPORT.md, summary/friedman/posthoc CSV.
@@ -102,6 +106,39 @@ def _env_info() -> dict:
     except Exception:
         pass
     return info
+
+
+def _retire_results(run_dir: Path, aid: str) -> None:
+    """predictions / per_sample / tem của weight CŨ -> *.stale (giữ lại để soi)."""
+    from .hub_sync import stamp_path
+
+    for p in (run_dir / "predictions" / f"{aid}.jsonl",
+              run_dir / "metrics" / f"per_sample_{aid}.csv", stamp_path(run_dir, aid)):
+        if p.exists():
+            p.replace(p.with_name(p.name + ".stale"))
+            print(f"  ⚙ {p.name} của weight cũ -> {p.name}.stale", flush=True)
+
+
+def _stamp_and_push(cfg: Cfg, run_dir: Path, fx: Path, arm: dict,
+                    adapter_root: Path, n_test: int, why: str) -> None:
+    """Candidate sinh ĐỦ n_test -> ghi tem; tem đổi so với bản trên đĩa -> đẩy
+    riêng candidate này lên Hub. Chưa đủ -> không làm gì (chưa dùng lại được)."""
+    from . import hub_sync
+    from . import train_recomb as tr_mod
+
+    aid = arm["id"]
+    if not tr_mod.already_trained(adapter_root / aid, False):
+        return
+    if hub_sync._count_lines(run_dir / "predictions" / f"{aid}.jsonl") < int(n_test):
+        return
+    old = hub_sync.read_stamp(hub_sync.stamp_path(run_dir, aid))
+    new = hub_sync.write_stamp(cfg, run_dir, fx, arm, adapter_root / aid, n_test,
+                               env=_env_info(), write=False)
+    if hub_sync.same_stamp(old, new):
+        return      # kết quả không đổi (vd. vừa kéo từ Hub) -> giữ tem cũ, không đẩy
+    hub_sync.write_stamp(cfg, run_dir, fx, arm, adapter_root / aid, n_test,
+                         env=_env_info())
+    hub_sync.push_arm(cfg, run_dir, aid, why)
 
 
 # ── candidate ───────────────────────────────────────────────────────────────
@@ -279,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--plan", action="store_true",
                     help="push: chỉ in những file sẽ đẩy")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--no-pull", action="store_true",
+                    help="không kéo fixture/weight/kết quả đã có từ Hub trước khi chạy")
     a = ap.parse_args(argv)
     if not a.command:
         ap.print_usage()
@@ -311,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
                                     n_samples=4, every_steps=2)
         cfg["stats"]["n_perm"] = 200
         cfg["output"]["push"] = False
+        cfg["output"]["pull"] = False
         cfg["output"]["subdir"] += "_dryrun"
         cfg["output"]["adapter_dir"] += "_dryrun"
         cfg["train"]["grad_accum"] = min(2, int(cfg["train"]["grad_accum"]))
@@ -421,6 +461,13 @@ def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
 
     mdir = run_dir / "metrics"
     n_test = int(cfg["data"].get("n_test") or 0)
+    # Kéo từ Hub những gì máy này còn thiếu (fixture, weight, predictions +
+    # điểm có TEM khớp) -> candidate đã có trên Hub KHÔNG bị huấn luyện/sinh lại.
+    # --retrain: weight sẽ đổi, kết quả cũ không còn là của nó -> không kéo.
+    if not (a.no_pull or a.retrain or a.refixture):
+        from . import hub_sync
+
+        manifest["pulled"] = hub_sync.pull(cfg, run_dir, adapter_root, fx, arms, n_test)
     cache = {x["id"]: {
         "trained": bool(tr_mod.already_trained(adapter_root / x["id"], False)),
         "n_preds": _count_preds(run_dir / "predictions" / f"{x['id']}.jsonl"),
@@ -553,6 +600,10 @@ def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
             # Checkpoint của candidate này đã nằm trên đĩa -> ghi sha vào
             # fixture NGAY, trước mọi lệnh stats/push.
             fx_mod.record_weights(fx, arm["id"], adapter_root / arm["id"])
+            # Weight MỚI -> predictions/điểm/tem cũ không còn là của nó. Đổi tên
+            # thành *.stale (không bị đẩy) thay vì để `infer` "đi tiếp" trên
+            # báo cáo của weight cũ.
+            _retire_results(run_dir, arm["id"])
             manifest["arm_status"][arm["id"]] = {
                 "trained": True, "minutes": st.get("minutes"),
                 "trainable_params": st.get("trainable_params"),
@@ -606,6 +657,9 @@ def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 tracker.finish(1)
                 return 6
+            # Sinh ĐỦ -> tem + đẩy riêng candidate này NGAY (không đợi cả lượt).
+            _stamp_and_push(cfg, run_dir, fx, arm, adapter_root, len(test_df),
+                            "sinh xong")
 
     # ── score ──────────────────────────────────────────────────────────────
     if "score" in stages:
@@ -617,6 +671,9 @@ def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
             aid = arm["id"]
             csv = mdir / f"per_sample_{aid}.csv"
             if csv.exists() and not a.rescore and aid not in {x["id"] for x in to_train}:
+                # điểm có từ trước (hoặc vừa kéo về) mà tem chưa ghi -> ghi bù + đẩy
+                _stamp_and_push(cfg, run_dir, fx, arm, adapter_root, len(test_df),
+                                "ghi bù tem")
                 continue
             preds = _read_preds(pred[aid])
             keys = [k for k in test_df["key"] if k in preds]
@@ -629,6 +686,8 @@ def _cmd_train(a, cfg: Cfg, arms: list[dict], stages: list[str], run_dir: Path,
             sdf, _c = score_model(cfg, keys, [preds[k] for k in keys],
                                   [ref_map[k] for k in keys], label=aid)
             sdf.to_csv(csv, index=False)
+            _stamp_and_push(cfg, run_dir, fx, arm, adapter_root, len(test_df),
+                            "chấm xong")
     _save_manifest()
     tracker.finish(0)
     return 0
@@ -643,21 +702,34 @@ def _cmd_stats(a, cfg: Cfg, arms: list[dict], declared: list[str],
     from .metrics import metric_columns
     from .stats_friedman import align_blocks, friedman_all, posthoc_all
 
+    from . import hub_sync
+
     names = {x["id"]: x["name"] for x in arms}
     mdir = run_dir / "metrics"
+    if not a.no_pull:
+        # stats không tải adapter (nặng): chỉ fixture, train_stats, và kết quả
+        # có tem khớp (weight đối chiếu qua sha256 LFS trên Hub).
+        manifest["pulled"] = hub_sync.pull(
+            cfg, run_dir, adapter_root, fx, arms,
+            int(cfg["data"].get("n_test") or 0), want_weights=False)
 
-    # Checkpoint phải nằm trên đĩa TRƯỚC khi có con số nào vào bảng: một
-    # REPORT không truy ngược được về weight là một REPORT không tái lập được.
-    no_ckpt = [x["id"] for x in arms
-               if not tr_mod.already_trained(adapter_root / x["id"], False)]
+    # Mọi con số trong bảng phải truy ngược được về một weight: hoặc weight
+    # nằm trên đĩa, hoặc tem của candidate ghi sha256 weight đã sinh ra nó.
+    def _traceable(aid: str) -> bool:
+        if tr_mod.already_trained(adapter_root / aid, False):
+            return True
+        st = hub_sync.read_stamp(hub_sync.stamp_path(run_dir, aid)) or {}
+        return bool((st.get("weights") or {}).get("adapter_model.safetensors"))
+
+    no_ckpt = [x["id"] for x in arms if not _traceable(x["id"])]
     if no_ckpt:
-        print(f"✗ chưa có weight của {no_ckpt} ở {adapter_root} — chạy `train` "
-              f"trước `stats`.", flush=True)
+        print(f"✗ chưa có weight (cục bộ, hoặc tem trên Hub) của {no_ckpt} — chạy "
+              f"`train` trước `stats`.", flush=True)
         return 1
     if fx_mod.exists(fx):
         rec = fx_mod.load_loader(fx).get("weights") or {}
         for x in arms:
-            if x["id"] not in rec:
+            if x["id"] not in rec and tr_mod.already_trained(adapter_root / x["id"], False):
                 fx_mod.record_weights(fx, x["id"], adapter_root / x["id"])
         order_hint = fx_mod._read_split(fx / "testset.jsonl")["key"].tolist()
     else:

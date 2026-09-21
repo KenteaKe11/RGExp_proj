@@ -164,7 +164,9 @@ generate:
 #
 # Thêm candidate về sau: thêm một dòng vào `arms` (chỉ đổi `rank`/`target`),
 # rồi `run_lora.sh train` -> chỉ candidate mới được huấn luyện/sinh/chấm, trên
-# ĐÚNG sub-dataset + batch đã khoá ở `adapters_lora/_fixture/`.
+# ĐÚNG sub-dataset + batch đã khoá ở `adapters_lora/_fixture/`. Máy mới: `train`
+# kéo fixture + weight + kết quả (có tem khớp) của candidate cũ từ Hub trước.
+# Xem `output.pull` / `output.push_each_arm`.
 lora_exp:
   targets:
     attn: [q_proj, k_proj, v_proj, o_proj]
@@ -450,7 +452,7 @@ output:
   # là DỪNG. Thư mục thứ nhất (`SoICT Archivements/`) giữ §2.0–§2.5; lần này
   # đẩy vào thư mục thứ hai `hub_root` (current/), thư mục con đặt tên theo
   # khuôn `$<Chỉ số>_<Test title>_Test` = `$<hub_index>_<hub_title>_Test`, kết quả ở `Reports/` bên trong:
-  #   current/$1_LoRA_Test/Reports/            REPORT.md, manifest, metrics, predictions
+  #   current/$1_LoRA_Test/Reports/            REPORT.md, manifest, metrics, predictions, arms/ (tem)
   #   current/$1_LoRA_Test/fixture/            sub-dataset + loader-setup (adapters_lora/_fixture)
   #   current/$1_LoRA_Test/weights/<arm>/      adapter_model.safetensors + adapter_config + train_stats
   # Weight đã có trên repo thì BỎ QUA (cùng sha256 -> trùng; khác -> cảnh báo,
@@ -461,5 +463,12 @@ output:
   hub_index: 1                    # <Chỉ số>
   hub_title: LoRA                 # <Test title>  -> current/$1_LoRA_Test/Reports
   push: true
+  # Đẩy RIÊNG từng candidate ngay khi sinh đủ / chấm xong: predictions,
+  # per_sample, tem Reports/arms/<arm>.json (vân tay config, sha256 weight, batch
+  # sinh, sha256 file, điểm TB), weight nếu repo chưa có, fixture.
+  push_each_arm: true
+  # Trước train/stats: kéo từ Hub fixture (nếu chưa có), weight còn thiếu, và
+  # predictions + điểm CHỈ khi tem khớp máy này. Không bao giờ ghi đè file cục bộ.
+  pull: true
   subdir: "lora_rank_target"      # runs/<subdir> (chỉ cục bộ)
   adapter_dir: ./adapters_lora    # weight mỗi candidate + _fixture/
