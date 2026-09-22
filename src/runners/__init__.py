@@ -3,7 +3,7 @@
     gemma3          — base trần (không adapter); hai runner kia kế thừa vòng
                       sinh/resume của nó.
     gemma3_adapter  — base + một adapter (đường §2.2 cũ).
-    gemma3_recomb   — base + adapter (+ nhánh/Experts nếu có). `run_lora` dùng
+    gemma3_recomb   — base + adapter (+ nhánh/Experts nếu có). `run_zrecomb` (và `run_lora` của $1) dùng
                       runner này với candidate KHÔNG nhánh — cùng đường đã
                       huấn luyện (`train_recomb`), nên chuỗi vào decoder dựng
                       giống hệt lúc train.

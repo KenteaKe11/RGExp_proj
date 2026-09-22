@@ -1,0 +1,53 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# CONFIG GPU — NVIDIA GeForce RTX 3060 (12 GB GDDR6, Ampere, sm_86)
+#
+#     bash scripts/run_lora.sh --gpu rtx3060 --detach
+#     (không truyền --gpu thì cũng là file này: src/config.DEFAULT_GPU)
+#
+# CHỈ các khoá trong src/config.GPU_KEYS, và PHẢI khai đủ tất cả — thiếu một
+# khoá là DỪNG, không rơi về mặc định trong code. Thí nghiệm (lr, epoch, dữ liệu,
+# batch HIỆU DỤNG) ở configs/lora.yaml. grad_accum được suy ra:
+#     32 / 1 = 32
+# Máy đích: 1× RTX 3060 12 GB · EPYC 7713 · 54 GB RAM · NVMe ~6/4.8 GB/s ·
+# mạng ~5 Gbps · đĩa 100 GB. Mọi pipeline (train, sinh) TỰ chọn batch mỗi lượt
+# để VRAM THIẾT BỊ (như nvidia-smi thấy, gồm CUDA context) chạm ~85% card.
+# ═════════════════════════════════════════════════════════════════════════════
+name: rtx3060
+gpu_name_contains: "RTX 3060"
+requires:
+  cuda_arch: sm_86
+  min_vram_gb: 11
+
+set:
+  # ── Huấn luyện adapter ──────────────────────────────────────────────────
+  # Con số KHỞI ĐIỂM; autobatch (bên dưới) thay nó bằng ước lớn nhất của 32
+  # vừa 85% VRAM. grad_accum tự suy lại để batch hiệu dụng vẫn = 32. Candidate
+  # NẶNG NHẤT (r8 · decoder) được dò trước, số của nó KHOÁ cho cả bốn — batch
+  # mỗi lượt đổi cách lấy trung bình loss theo token, nên bốn candidate phải
+  # dùng CÙNG một số (src/run_lora.py).
+  train.per_device_batch_size: 1
+  train.gradient_checkpointing: true
+  train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
+
+  # ── Sinh + chấm ─────────────────────────────────────────────────────────
+  base.batch_size: 2              # khởi điểm; autobatch sinh dò lại (khoá chung 4 candidate)
+  metrics.bertscore.batch_size: auto  # dò như hai pipeline kia (khởi điểm 64)
+
+  # ── Batch theo hồi quy VRAM (src/autobatch.py) — BẬT, đích 85% ─────────
+  # Đo = VRAM THIẾT BỊ (context + allocator giữ), không chỉ tensor. Lượt dò
+  # train đệm tới max_seq_len (xấu nhất); lượt dò sinh ép đủ max_new_tokens.
+  autobatch.enabled: true
+  autobatch.target_frac: 0.85
+  autobatch.probe_sizes: [2, 4, 8]
+  autobatch.infer_probe_sizes: [2, 4]
+  autobatch.infer_max_bs: 16
+
+  # ── I/O (src/hw.py, src/data.py, src/prefetch.py) ───────────────────────
+  # workers auto = số vCPU container thật được cấp (cgroup), trần 32.
+  # zip_mode download: mạng 5 Gbps + đĩa 100 GB -> tải trọn img_dir.zip
+  # (17.7 GB, ~1-3 phút với hf_transfer) rồi trích SONG SONG từ NVMe, nhanh hơn
+  # hẳn stream range-request một kết nối. `content` = theo data.zip_mode.
+  io.workers: auto
+  io.prefetch_depth: 3            # số micro-batch dựng sẵn trước GPU
+  io.pin_memory: true             # CPU->GPU không chặn (pinned + non_blocking)
+  io.zip_mode: download

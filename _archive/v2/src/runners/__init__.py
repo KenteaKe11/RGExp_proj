@@ -1,0 +1,38 @@
+"""Bảng tra runner theo tên.
+
+    gemma3          — base trần (không adapter); hai runner kia kế thừa vòng
+                      sinh/resume của nó.
+    gemma3_adapter  — base + một adapter (đường §2.2 cũ).
+    gemma3_recomb   — base + adapter (+ nhánh/Experts nếu có). `run_lora` dùng
+                      runner này với candidate KHÔNG nhánh — cùng đường đã
+                      huấn luyện (`train_recomb`), nên chuỗi vào decoder dựng
+                      giống hệt lúc train.
+
+R2Gen/AdaAtt (runner `sota`) đã sang `_archive/src/runners/`.
+"""
+from __future__ import annotations
+
+from ..config import Cfg
+from .base import Runner
+
+
+def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
+    kind = str(mcfg.get("runner", "")).lower()
+    if kind == "gemma3":
+        from .gemma3 import Gemma3Runner
+
+        return Gemma3Runner(cfg, mcfg, tracker)
+    if kind == "gemma3_adapter":
+        from .gemma3_adapter import Gemma3AdapterRunner
+
+        return Gemma3AdapterRunner(cfg, mcfg, tracker)
+    if kind == "gemma3_recomb":
+        from .gemma3_recomb import Gemma3RecombRunner
+
+        return Gemma3RecombRunner(cfg, mcfg, tracker)
+    raise ValueError(
+        f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
+        f"'gemma3_recomb'.")
+
+
+__all__ = ["build", "Runner"]

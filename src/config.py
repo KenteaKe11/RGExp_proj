@@ -1,7 +1,8 @@
 """Nạp và giải quyết cấu hình §2.5.
 
-HAI file: config NỘI DUNG (configs/lora.yaml — thí nghiệm là gì) của điểm vào
-duy nhất còn chạy (`src.run_lora`),
+HAI file: config NỘI DUNG (configs/recomb.yaml — thí nghiệm là gì) của điểm vào
+duy nhất còn chạy (`src.run_zrecomb`, $2 Recombiner Test; $1 LoRA ở
+_archive/v2/),
 và config GPU (configs/gpu/<card>.yaml — chạy nó thế nào trên một card). Xem
 khối "HAI loại config" bên dưới.
 Không có kế thừa nhiều tầng: repo này chỉ chạy một thí nghiệm tại một thời
@@ -30,7 +31,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "lora.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "recomb.yaml"
 
 
 class Cfg(dict):
@@ -83,7 +84,7 @@ def _set_path(d: dict, dotted: str, value: Any) -> None:
 
 
 # ── HAI loại config: NỘI DUNG + GPU ─────────────────────────────────────────
-# configs/lora.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
+# configs/recomb.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
 # epoch, BATCH HIỆU DỤNG (`train.effective_batch`),
 # giải mã, kiểm định. configs/gpu/<tên>.yaml (GPU) nói chạy nó thế nào trên MỘT
 # card: số mẫu mỗi lượt forward, checkpointing, worker, batch lúc sinh/chấm.
@@ -99,7 +100,7 @@ GPU_DIR = ROOT / "configs" / "gpu"
 DEFAULT_GPU = "rtx3060"
 GPU_KEYS = frozenset({
     "train.per_device_batch_size", "train.gradient_checkpointing",
-    "train.prefetch",
+    "train.prefetch", "stage0.micro_batch",
     "base.batch_size", "metrics.bertscore.batch_size",
     "autobatch.enabled", "autobatch.target_frac", "autobatch.probe_sizes",
     "autobatch.infer_probe_sizes", "autobatch.infer_max_bs",

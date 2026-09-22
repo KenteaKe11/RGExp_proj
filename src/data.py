@@ -368,7 +368,7 @@ def _download_extract(cfg: Cfg, need: list[str], cache_root: Path,
     """Tải trọn zip rồi giải nén SONG SONG. Tốn ~18 GB đĩa.
 
     Trên máy mạng nhanh (5 Gbps) + NVMe, đây là đường NHANH NHẤT: tải đa kết
-    nối (hf_transfer / hf_xet, bật trong scripts/run_lora.sh) mất vài phút,
+    nối (hf_transfer / hf_xet, bật trong scripts/run_zrecomb.sh) mất vài phút,
     rồi `io.workers` luồng giải mã trên đĩa cục bộ.
     """
     from huggingface_hub import hf_hub_download

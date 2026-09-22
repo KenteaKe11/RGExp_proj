@@ -56,6 +56,7 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
     name = "gemma3_recomb"
 
     branch = None
+    zbranch = None          # $2: Z -> Z' (src/zrecomb.py)
     _gemma = None
     _img_token_id = None
     _tt_value = 0
@@ -127,6 +128,21 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         self._img_token_id = recombiner.image_token_id(self._gemma)
         self._tt_value = int(stats.get("token_type_value") or 0)
 
+        self.zbranch = None
+        if bool(stats.get("uses_zrecomb", False)):
+            from .. import zrecomb as Z
+
+            if not Z.branch_exists(adapter_dir):
+                raise RunnerUnusable(
+                    f"train_stats.json nói candidate này dùng Recomb (Z -> Z'), "
+                    f"nhưng {adapter_dir} thiếu {Z.BRANCH_FILE}. Sinh tiếp là chấm "
+                    f"candidate A dưới tên B. Huấn luyện lại candidate này.")
+            dev = next(p for p in self.model.parameters()
+                       if p.device.type != "meta").device
+            self.zbranch = Z.load_branch(adapter_dir, device=dev)
+            n = self.zbranch.n_params()
+            print(f"  ✓ Z -> Z': {self.zbranch.describe()} · {n['total']:,} tham số",
+                  flush=True)
         if uses_branch:
             if not recombiner.branch_exists(adapter_dir):
                 raise RunnerUnusable(
@@ -150,7 +166,8 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                   flush=True)
         else:
             self.branch = None
-            print("  candidate A: không nạp nhánh Recombinator", flush=True)
+            if self.zbranch is None:
+                print("  không nhánh: chuỗi vào decoder = [text ‖ Z]", flush=True)
 
         print(f"  ✓ {self.mcfg['id']}: {hf_id} + {adapter_dir.name} "
               f"(preset={stats.get('lora_preset')}, r={stats.get('rank')}, "
@@ -252,6 +269,12 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                 self._gemma,
                 inputs["pixel_values"].to(
                     dtype=recombiner.float_dtype(self._gemma, torch.float32)))
+            if self.zbranch is not None:
+                from .. import zrecomb as Z
+
+                # Z' THAY Z ở đúng 256 chỗ token ảnh — cùng đường với lúc train.
+                with Z.autocast(aligned.device):
+                    aligned = self.zbranch(vis, aligned).to(aligned.dtype)
             embeds = recombiner.build_inputs_embeds(self._gemma, ids, aligned)
             kw = {"inputs_embeds": embeds,
                   "attention_mask": inputs.get("attention_mask"),
@@ -301,6 +324,7 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
 
     def unload(self) -> None:
         self.branch = None
+        self.zbranch = None
         self._gemma = None
         self._router = None
         self._route_ctx = None

@@ -87,7 +87,8 @@ def write_stamp(cfg, run_dir: Path, fx: Path, arm: dict, adapter_dir: Path,
     csv = run_dir / "metrics" / f"per_sample_{aid}.csv"
     st = {
         "arm": aid,
-        "spec": {k: arm.get(k) for k in ("method", "rank", "target", "target_modules")},
+        "spec": {k: arm.get(k) for k in ("method", "rank", "target", "target_modules",
+                                         "recomb", "source")},
         "fixture_fingerprint": fx_mod.fingerprint(cfg),
         "weights": {f: fx_mod.sha256_file(Path(adapter_dir) / f)
                     for f in fx_mod.WEIGHT_FILES if (Path(adapter_dir) / f).exists()},

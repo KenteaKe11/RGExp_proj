@@ -33,7 +33,7 @@ from .config import Cfg, add_common_args, hf_token, load_config
 
 KEY_CANDIDATES = ("img_rel", "keys", "key", "ids", "id", "paths", "path", "names")
 LABEL_CANDIDATES = ("labels", "y", "onehot", "targets", "chexpert", "label")
-NAME_CANDIDATES = ("label_names", "classes", "columns", "cols", "pathologies")
+NAME_CANDIDATES = ("disease_labels", "label_names", "classes", "columns", "cols", "pathologies")
 
 # Mã CheXpert thô -> chỉ số lớp. THỨ TỰ NÀY LÀ HỢP ĐỒNG: nó quyết định cột nào
 # của one-hot là "neg", và ASL trong config đánh gamma theo giá trị nhãn chứ

@@ -255,8 +255,13 @@ def set_lock(fx: Path, which: str, value: int, source: str, extra=None) -> int:
     return int(value)
 
 
+# $2: candidate có Recomb ghi thêm nhánh Z -> Z' và checkpoint Stage 0 đã nạp
+# vào nó. File không tồn tại (candidate chỉ có LoRA) thì không vào sổ/tem, nên
+# sha của các candidate $1 KHÔNG đổi.
 WEIGHT_FILES = ("adapter_model.safetensors", "adapter_config.json",
-                "train_stats.json")
+                "train_stats.json", "zrecomb_branch.safetensors",
+                "zrecomb_branch.json", "zrecomb_stage0.safetensors",
+                "zrecomb_stage0.json")
 
 
 def record_weights(fx: Path, arm_id: str, adapter_dir: Path) -> dict:

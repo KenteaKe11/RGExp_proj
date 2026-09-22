@@ -74,7 +74,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_lora.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_lora`
+    `scripts/run_zrecomb.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_zrecomb`
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -179,6 +179,15 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
         for f in sorted(fx.iterdir()):
             if f.is_file() and not f.name.endswith(".tmp"):
                 out.append((f"{base}/fixture/{f.name}", f, "fixture"))
+    # $2: Stage 0 (Recomb + Cls Head đã pretrain) + loader của nó, cạnh fixture.
+    s0 = Path(o["adapter_dir"]) / "_stage0"
+    if s0.exists():
+        from .stage0_zrecomb import KEEP
+
+        for rel in KEEP:
+            f = s0 / rel
+            if f.is_file():
+                out.append((f"{base}/stage0/{rel}", f, "stage0"))
     root = Path(o["adapter_dir"])
     for aid in arms:
         for name in WEIGHT_FILES:
@@ -286,7 +295,7 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
     tok = hf_token()
     if not tok and not dry:
         print("⚠ không có HF_TOKEN — không đẩy.  export HF_TOKEN=hf_xxxxxxxx  &&  "
-              "bash scripts/run_lora.sh push", flush=True)
+              "bash scripts/run_zrecomb.sh push", flush=True)
         return None
 
     if run_dir.exists() and results_only is None:
@@ -321,14 +330,15 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
           flush=True)
     for ln in log:
         print(f"  {ln}", flush=True)
-    kinds = {k: sum(1 for x in todo if x[2] == k) for k in ("weight", "fixture", "result")}
+    kinds = {k: sum(1 for x in todo if x[2] == k)
+             for k in ("weight", "fixture", "result", "stage0")}
     url = (f"https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}"
            f"{repo_id}/tree/main/{base}")
     if not todo and not keep:
         print(f"✓ không có file mới/đổi — repo đã khớp: {url}", flush=True)
         return url
     print(f"  cần đẩy: {kinds['weight']} file weight · {kinds['fixture']} fixture "
-          f"· {kinds['result']} kết quả", flush=True)
+          f"· {kinds['stage0']} Stage 0 · {kinds['result']} kết quả", flush=True)
     if dry:
         for p_, _f, k in todo:
             print(f"    [{k}] {p_}", flush=True)
@@ -341,6 +351,7 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
         ops.append(CommitOperationAdd(path_in_repo=keep, path_or_fileobj=b""))
     new_w = sorted({p_.rsplit("/", 2)[-2] for p_, _f, k in todo if k == "weight"})
     msg = (f"{base}: {kinds['result']} kết quả, {kinds['fixture']} fixture"
+           + (f", {kinds['stage0']} Stage 0" if kinds["stage0"] else "")
            + (f", weight {', '.join(new_w)}" if new_w else "")
            + (f" [{message_tag}]" if message_tag else ""))
     try:

@@ -1,222 +1,179 @@
-# research_v2 — LoRA trên Gemma 3: rank × chỗ gắn
+# research_v2 — $2 Recombiner Test: Z vs Z' = F(Z | Recomb)
 
-Câu hỏi: trên **cùng** Gemma 3 4B lượng tử NF4, **cùng** 6400 mẫu train
-MIMIC-CXR, **cùng** lịch học và **cùng** 3000 ảnh test, hai lựa chọn của adapter
-QLoRA — **rank** và **chỗ gắn** (4 ma trận attention vs toàn bộ decoder) — có
-đổi chất lượng báo cáo X-quang sinh ra không, và candidate nào khác candidate nào?
+Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
+QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
+cùng loader, cùng 3000 ảnh test), rồi thay 256 token ảnh **Z** bằng
+**Z' = F(Z | Recomb)** — chất lượng báo cáo X-quang có đổi không?
 
-| candidate | rank | gắn vào |
+| candidate | nguồn | chuỗi vào decoder |
 |---|---|---|
-| `qlora_r8_attn` (tham chiếu) | 8 | q, k, v, o_proj |
-| `qlora_r2_decoder` | 2 | q, k, v, o + gate, up, down_proj |
-| `qlora_r4_decoder` | 4 | q, k, v, o + gate, up, down_proj |
-| `qlora_r8_decoder` | 8 | q, k, v, o + gate, up, down_proj |
-| `qlora_r32_decoder` | 32 | q, k, v, o + gate, up, down_proj |
+| **A** `qlora_r32_decoder` (tham chiếu) | $1 — weight, predictions, điểm từng ảnh lấy lại (tem khớp), **không** train lại | `[text ‖ Z]` |
+| **B** `qlora_r32_decoder_recomb` | $2 — Stage 0 → main stage y hệt A + nhánh | `[text ‖ Z']` |
 
-Chỉ HAI biến khác nhau giữa năm candidate; mọi thứ khác dùng chung: base NF4,
-prompt, giải mã beam 3, 1 epoch, batch hiệu dụng 32, one-cycle (lr adapter
-1e-4), alpha = 2 × r (alpha/r không đổi, nên cột rank đo đúng số chiều). Vision
-tower không bao giờ được gắn adapter.
+**Biến duy nhất là Z vs Z'.** Z' thay đúng 256 chỗ token ảnh (không thêm token),
+nên độ dài chuỗi, nhãn, mask giữ nguyên. Lớp cuối của Retriever khởi tạo 0, nên
+ở bước 0 B trùng A từng bit. Mọi khoá quyết định kết quả của A (`seed`, `data`,
+`image_policy`, `base`, `prompt`, `generate`, `train`, `metrics`) được chép
+nguyên văn từ `configs/lora.yaml` của $1. Vân tay fixture của `configs/recomb.yaml`
+phải **trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
 
-**Kiểm định — Friedman + hậu kiểm Holm** (`src/stats_friedman.py`). Trong từng
-metric: Friedman trên 5 candidate × 3000 ảnh (hạng trong từng ảnh, hiệu chỉnh
-ties Conover, p = xấp xỉ F Iman-Davenport), Holm trên các metric, Kendall W là
-effect size. CHỈ metric bác H0 mới hậu kiểm 10 cặp: Wilcoxon signed-rank ghép
-cặp (Pratt, giữ cặp d = 0) + permutation đối chiếu, Holm trên 10 cặp trong từng
-metric (`stats.posthoc_scope: permetric`; `global` = Holm trên mọi cặp × metric).
-"Thắng" = Holm bác H0 **và** |rank-biserial| ≥ 0.10. `REPORT.md` tách riêng 7
-cặp khác nhau đúng một biến (6 cặp rank @ decoder, 1 cặp chỗ gắn ở r=8).
+## Kiến trúc (`src/zrecomb.py`)
 
-**Metric theo candidate** (cuối `REPORT.md`; `report.rank_plot` trong
-`configs/lora.yaml`). Một đồ thị hỗn hợp `figures/metrics_by_candidate.png`
-cho **mọi** candidate (attn r=8 · decoder r=2, 4, 8, 32 — nhóm theo chỗ gắn,
-có khoảng hở giữa hai nhóm): mỗi candidate một cụm **bar** 4 metric (B3 · B4 ·
-RL · BertF1), mỗi metric một **đường ngang nét đứt mảnh** cùng màu ở giá trị
-MAX của metric ấy qua mọi candidate, **chấm** ở cột đạt max (nhãn ghi max gốc +
-candidate đạt max) — không có line chart. Bảng kèm theo: điểm TB từng
-candidate, max (candidate), và hồi quy `metric ≈ a + b·log2(r)` CHỈ trên các
-candidate `decoder` (`target`; `b` = đổi bao nhiêu mỗi lần gấp đôi rank), CI95
-của `b` (bootstrap ghép cặp theo ảnh), R². Số liệu ở
-`metrics/metrics_by_candidate.csv`. Chỉ mô tả, không thay kiểm định.
+```
+X = SigLIP(ảnh) (4096, 1152) ─► Recomb ─► R (4096, 2560)
+    Recomb: h0 = Linear 1152→2560 ; h = RMSNorm(h0) ; h = Self-attn(h)
+            h = Linear 3072→2560(GELU(Linear 2560→3072(h))) ; R = h0 + h
+R ─► Cls Head (CHỈ Stage 0): RMSNorm -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
+Z = projector(X) (256, 2560) ─► Retriever(Z, R):
+    h = CrossAttn(RMSNorm_q(Z), RMSNorm_kv(R)) ; h = Linear 1152→2560(GELU(Linear 2560→1152(h)))
+    Z' = Z + h
+[text ‖ Z'] ─► Gemma decoder (QLoRA r32) ─► CE
+```
 
-Trên đồ thị, mỗi metric được nhân `e^(γ−1)` để các đường xếp thành **tầng tách
-rời** thay vì B3/B4 (~0.1) nằm bẹp dưới BertF1 (~0.86); legend ghi
-`Metric (γ=…)`. `gamma: auto` xếp tầng theo TB gốc (metric lớn nhất ở trên cùng,
-γ = 1; hai tầng cách nhau `gamma_spread` = 18% của TB lớn nhất). **Đọc lại số
-gốc: giá trị trên trục Y ÷ e^(γ−1).** Chỉ đọc hình dạng TRONG một tầng; không so
-độ cao hay độ nghiêng giữa hai tầng — so giữa metric bằng cột `b / TB` của bảng.
-`b` in cạnh đường, bảng và CSV là số gốc.
+20 head (head_dim 128) ở cả ba attention. Tham số nhánh để fp32, chạy dưới
+autocast bf16.
 
-## Chạy — ba lệnh tách rời
+## Lịch
+
+**Stage 0: pretrain Recomb** (`src/stage0_zrecomb.py`). Chỉ vision tower của
+Gemma chạy (đóng băng); không có decoder, không có LoRA.
+
+* AdamW, lr **cố định 1e-4**, wd 0.03, **tối đa 5 epoch**, batch 32 (micro do autobatch chọn).
+* Val: sau mỗi epoch trên cả hồ val (2000 mẫu); giữ epoch có
+  **sqrt(F1 · Recall)** lớn nhất. F1/Recall là macro trên 14 bệnh lý × lớp
+  {pos, uncertain}, dự đoán = argmax 3 lớp.
+* Loss: **ASL** one-hot 3 nhãn, γ_neg = **neg 2.0 · uncertain 3.0 · pos 0.0**
+  (khai theo tên lớp), γ_pos 0, **p_clip 0.05**.
+* Nhãn lấy từ `csv_helper/labels.npz`, mảng `y_gt`, key `img_rel`. Mã trong
+  `y_gt` là chỉ số của `class_names`: **0 = positive, 1 = negative,
+  2 = uncertain, 3 = blank**. Đây không phải mã CheXpert thô. Ô **blank**
+  (bệnh không được nhắc tới, chiếm ~62% số ô) bị **mask theo ô**: không vào
+  ASL (`zrecomb.CellMaskedASL`), không vào metric val. Không dùng `y_aug`.
+
+**Main stage: QLoRA r32 + Recomb** (`src/train_zrecomb.py`). Dùng **lịch r32 của
+$1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt đã khoá, 1 epoch =
+200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo val (CE trên 256 mẫu
+bốc lại mỗi 25 bước). Phần thêm:
+
+* Cls Head **bị bỏ**. Recomb nạp từ Stage 0 và **đóng băng hoàn toàn trong epoch
+  đầu**. Main stage chỉ có 1 epoch, nên Recomb đóng băng suốt main stage. Nếu mở
+  băng sau đó thì lr cố định 1e-5, wd 0.01.
+* Retriever ("Main"): AdamW riêng, lr **cố định 1e-4**, wd 0.03.
+* Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
+  cập nhật của LoRA so với A.
+* B nặng hơn A. Nếu batch đã khoá không vừa VRAM, micro-batch được chạy thành
+  từng mảnh và CE được ghép lại theo token. Kết quả đúng bằng con số HF tính
+  trên cả micro-batch, nên gradient không đổi.
+* Khởi tạo nhánh chạy trong `fork_rng`, nên LoRA được khởi tạo từ đúng trạng
+  thái RNG như A.
+
+Không áp dụng cho $2 (các mục của lịch MoE): patience/early-stop, max 50 epoch,
+nhiễu Route.
+
+## Kiểm định (`src/stats_ab.py`)
+
+Ghép cặp theo ảnh: d_i = điểm(B, i) − điểm(A, i), trên BLEU-1..4, ROUGE-1/2/L
+và BERTScore-F1 (metric chính).
+
+* **Paired bootstrap**: 10 000 lần, lấy lại mẫu theo ảnh. Cho CI95 BCa của
+  mean(d) và p_boot.
+* **Permutation test** đảo dấu: 10 000 lần, cho p_perm.
+* Holm riêng từng họ trên các metric.
+* **Thắng** khi cả hai kiểm định bác H0 sau Holm **và** |Cohen dz| ≥ 0.10.
+
+REPORT.md ghi thêm: số ảnh B thắng/hoà/thua, Stage 0 từng epoch, và bảng main
+stage của A và B.
+
+## Chạy
 
 ```bash
-export HF_TOKEN=hf_xxxxxxxx          # gemma-3-4b-it gated + quyền WRITE vào RGExp123/Research_results
-export WANDB_API_KEY=xxxxxxxx        # bỏ được → W&B ghi offline
+export HF_TOKEN=hf_xxxxxxxx          # gemma gated + WRITE vào RGExp123/Research_results
+export WANDB_API_KEY=xxxxxxxx
 
-bash scripts/setup.sh                        # lần đầu
-python scripts/selftest_lora.py              # vài giây, không cần GPU
-bash scripts/run_lora.sh train --dry-run     # 8 ảnh, 16 mẫu, 4 bước + in VRAM đỉnh
+python scripts/selftest_zrecomb.py              # vài giây, không cần GPU
+bash scripts/run_zrecomb.sh train --dry-run     # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_lora.sh train --detach      # 1. data -> train -> infer -> score (nền; log ở logs/)
-bash scripts/run_lora.sh push                # 2. weight + kết quả -> Hub current/$1_LoRA_Test/Reports/
-bash scripts/run_lora.sh stats               # 3. Friedman + hậu kiểm -> REPORT.md (GHI ĐÈ)
-bash scripts/run_lora.sh push                #    đẩy lại REPORT mới (weight trùng -> bỏ qua)
+bash scripts/run_zrecomb.sh train --detach      # 1. kéo A -> Stage 0 -> main B -> sinh -> chấm
+bash scripts/run_zrecomb.sh stats               # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
+bash scripts/run_zrecomb.sh push                # 3. -> current/$2_Recombiner_Test/
 ```
 
-| lệnh | làm gì | cần |
-|---|---|---|
-| `train` | stage data, train, infer, score — chỉ phần còn thiếu. Weight mỗi candidate ghi ở `adapters_lora/<arm>/` và sha256 vào `_fixture/loader.json` ngay khi candidate đó xong, **trước** mọi lệnh stats | GPU, HF_TOKEN |
-| `push` | một commit vào `RGExp123/Research_results` (repo CŨ — không bao giờ tạo repo mới), thư mục thứ hai `current/`, thư mục con `$1_LoRA_Test` (kết quả ở `Reports/`, chưa có thì tạo ngay) (khuôn `$<Chỉ số>_<Test title>_Test` từ `output.hub_index` + `output.hub_title`). Weight đã có trên repo thì **bỏ qua** (trùng sha256); khác thì cảnh báo và giữ bản repo, ghi đè chỉ khi `--force-weights`. File kết quả chỉ đẩy khi nội dung đổi. `--plan` in danh sách mà không đẩy | HF_TOKEN (WRITE) |
-| `stats` | kéo điểm còn thiếu từ Hub (có tem khớp) → đọc `metrics/per_sample_*.csv` → Friedman + hậu kiểm → **ghi đè** `REPORT.md`, `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `manifest.json`. DỪNG nếu candidate nào không truy được về weight (cục bộ hoặc tem) | chỉ CPU (mạng để kéo; không có thì dùng cục bộ) |
-| `all` | train → stats → push | |
+Nguồn của A, theo thứ tự ưu tiên:
 
-Chạy lại `train` sau khi đứt là **đi tiếp**. Tuỳ chọn: `--arms a,b`,
-`--stages infer,score` (tập con stage của lệnh), `--retrain`, `--rescore`.
+1. Máy đã chạy $1: `adapters_lora/_fixture` và `runs/lora_rank_target/`. Chỉ dùng
+   khi tem khớp sha.
+2. Hub `current/$1_LoRA_Test/`: fixture, `Reports/predictions`, `metrics`,
+   `arms/` (tem). Chỉ dùng khi tem khớp: vân tay config, sha256 weight trên Hub,
+   batch sinh, đủ 3000 dòng.
 
-**Thêm candidate về sau** (vd. `qlora_r64_attn`): thêm một dòng vào
-`lora_exp.arms` → `train` (chỉ candidate mới được huấn luyện/sinh/chấm) →
-`stats` (Friedman lại trên đủ k candidate, REPORT ghi đè) → `push`. Làm được
-cả trên một máy MỚI trống trơn — xem mục dưới.
+Weight của A không được tải, vì A không sinh lại.
 
-**Kết quả từng candidate trên Hub (`src/hub_sync.py`).** Ngay khi một candidate
-sinh đủ 3000 báo cáo — và lại sau khi chấm — `train` đẩy RIÊNG candidate ấy lên
-`current/$1_LoRA_Test/`: `Reports/predictions/<arm>.jsonl`,
-`Reports/metrics/per_sample_<arm>.csv`, **tem** `Reports/arms/<arm>.json`,
-weight (nếu repo chưa có) và `fixture/`. Tem ghi vân tay fixture (dữ liệu,
-prompt, giải mã, metric…), sha256 weight đã sinh ra báo cáo, batch lúc sinh,
-số dòng + sha256 của predictions/per_sample và điểm TB từng metric của riêng
-candidate đó. Đẩy hỏng không dừng lệnh (file còn trên đĩa, `push` sau).
+`train` chạy lại sau khi đứt thì **đi tiếp**: Stage 0 có checkpoint mỗi epoch
+(`_stage0/last/state.pt`); B có weight thì bỏ qua train; sinh thiếu thì sinh tiếp.
+Các cờ:
 
-Trước `train` và `stats`, máy kéo về những gì CÒN THIẾU: fixture (nếu chưa có),
-weight của candidate chưa có cục bộ (nên không huấn luyện lại), và predictions
-+ điểm — **chỉ khi tem khớp máy này** (cùng vân tay config, cùng sha256 weight,
-cùng batch sinh, đủ mẫu, sha file tải về khớp tem). Lệch điều nào thì in lý do
-và candidate đó được sinh lại như thường; không có tem thì không dùng. `stats`
-không tải adapter (hàng trăm MB): weight đối chiếu qua sha256 LFS trên Hub.
-File cục bộ không bao giờ bị ghi đè. Tắt: `--no-pull` hoặc `output.pull: false`;
-tắt đẩy từng candidate: `output.push_each_arm: false`. `--retrain` không kéo
-(weight sẽ đổi), và kết quả của weight cũ bị đổi thành `*.stale`.
+* `--restage0`: pretrain lại, kéo theo `--retrain`.
+* `--retrain`: chỉ main stage.
+* `--stages infer,score`.
+* `--no-pull`.
 
-Máy mới, thêm một candidate: clone repo → `export HF_TOKEN=…` → thêm dòng vào
-`lora_exp.arms` → `bash scripts/run_lora.sh train` (kéo fixture + weight +
-kết quả cũ, chỉ train/sinh/chấm candidate mới) → `stats` → `push`.
-
-**Fixture — `adapters_lora/_fixture/`.** Sub-dataset + loader-setup khoá cứng,
-cùng đĩa với weight: `testset/trainset/valset.jsonl` (key + ref; thứ tự test =
-thứ tự khối Friedman, thứ tự train = đầu vào `randperm(seed)`) và `loader.json`
-(vân tay sha256 của mọi khoá quyết định kết quả — data, image_policy, base,
-prompt, generate, lịch học, eval, quant, metrics —, batch mỗi lượt lúc train và
-lúc sinh đã khoá, sha256 weight từng candidate). Có fixture thì `train` đọc
-split từ đây (không đọc lại Hub), chỉ tải ảnh còn thiếu, và **DỪNG** nếu config
-lệch vân tay (in đúng khoá lệch). Khoá GPU/I-O không nằm trong vân tay. Cố ý
-đổi thí nghiệm: `train --refixture --retrain`.
-
-**Val.** Mỗi 25 bước (và ở bước cuối), mỗi candidate tính CE trên **256 mẫu
-bốc ngẫu nhiên** trong hồ 2000 mẫu val (`data.n_val`), bốc lại ở **mỗi lần
-đo** (`train.eval` trong `configs/lora.yaml`). Ở lần đo thứ k, mọi candidate
-dùng **chung một tập** — chỉ số sinh từ (seed, số thứ tự lần đo), không từ arm
-id — nên các đường val so được với nhau và chạy lại cùng seed cho đúng loạt tập
-ấy. Val **không** chọn checkpoint, **không** early stop, **không** chạm trọng
-số: mọi candidate vẫn chạy đúng một epoch theo lịch one-cycle mà bảng kết quả dựa vào.
-CE lấy trung bình theo **token** nên nó không đổi khi autobatch đổi batch mỗi
-lượt. Số ra ở `val/<arm>/loss` trên W&B, `train_stats.json` (`val.curve`) và
-cột *val CE cuối* của `REPORT.md`.
-
-Đầu ra: `runs/lora_rank_target/` (REPORT.md, manifest.json, predictions,
-metrics), weight + fixture ở `adapters_lora/`. Trên Hub
-(`RGExp123/Research_results`, cạnh `SoICT Archivements/`):
+## Lưu trữ (bố cục như $1)
 
 ```
-current/$1_LoRA_Test/Reports/             REPORT.md, manifest.json, metrics/, predictions/, arms/ (tem), logs/
-current/$1_LoRA_Test/fixture/             sub-dataset + loader.json
-current/$1_LoRA_Test/weights/<arm>/       adapter_model.safetensors, adapter_config.json, train_stats.json
+adapters_recomb/_fixture/                   = fixture của $1 (vân tay trùng) + sha weight của B
+adapters_recomb/_stage0/                    PRETRAIN — để về sau đối chứng SoTA
+    best/zrecomb_stage0.safetensors|.json   Recomb + Cls Head, epoch tốt nhất
+    loader.json                             fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
+                                            batch/micro, lịch, ASL, spec, vân tay, sha256 weight
+    stage0_labels.npz                       nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
+    stage0_history.json                     từng epoch: train/val ASL, F1, Recall, sqrt(F1·R)
+    last/state.pt                           chỉ để chạy tiếp (không đẩy Hub)
+adapters_recomb/qlora_r32_decoder_recomb/   MAIN STAGE — để về sau đối chứng MoE n·r = 32
+    adapter_model.safetensors, adapter_config.json   LoRA r32
+    zrecomb_branch.safetensors|.json        Recomb (từ Stage 0) + Retriever
+    zrecomb_stage0.safetensors|.json        bản chép Stage 0 đã nạp (truy nguồn)
+    train_stats.json                        batch/accum/mảnh, lr, val curve, ‖Z'−Z‖/‖Z‖, VRAM, phút
+runs/recombiner/                            REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
 ```
 
-## Hai loại config
+Trên Hub (`RGExp123/Research_results`):
 
-* `configs/lora.yaml` — **nội dung**: thí nghiệm là gì (dữ liệu, base, prompt,
-  giải mã, lịch học, batch hiệu dụng, các candidate ở khối `lora_exp`, kiểm
-  định, repo Hub).
-* `configs/gpu/<card>.yaml` — **GPU + I/O**: chạy thế nào trên một máy (số mẫu
-  mỗi lượt, checkpointing, prefetch, batch lúc sinh/chấm, autobatch, khối
-  `io.*`), chọn bằng `--gpu` (mặc định `rtx3060`). `grad_accum` tự suy ra =
-  batch hiệu dụng / số mẫu mỗi lượt. `src/config.load_config` DỪNG nếu hai file
-  lấn ranh giới của nhau hoặc file GPU thiếu khoá.
+```
+current/$2_Recombiner_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
+current/$2_Recombiner_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
+current/$2_Recombiner_Test/stage0/                  best/, loader.json, stage0_labels.npz, stage0_history.json
+current/$2_Recombiner_Test/weights/qlora_r32_decoder_recomb/
+```
 
-| `--gpu` | card | mỗi lượt × accum | checkpointing | autobatch |
-|---|---|---|---|---|
-| `rtx3060` | RTX 3060 12 GB | tự dò × accum suy ra (khởi điểm 1 × 32) | có | 85% VRAM |
+Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
-Thêm card: chép `configs/gpu/rtx3060.yaml`, đổi `name`, `gpu_name_contains`,
-`requires` và các số trong `set:`; chạy `--dry-run` để xem VRAM đỉnh thật.
+Hai lần đẩy tự động trong lúc `train`:
 
-## VRAM ~85% và tốc độ I/O
+* Stage 0 được đẩy ngay khi xong, kèm fixture.
+* B được đẩy riêng ngay khi sinh xong, và lại sau khi chấm xong.
 
-**Batch tự dò, đích 85% card.** `autobatch.enabled: true` +
-`target_frac: 0.85`: cả khâu **train**, khâu **sinh** lẫn khâu **chấm**
-(`metrics.bertscore.batch_size: auto`) đo VRAM thật ở vài batch nhỏ, hồi quy tuyến tính, chọn batch lớn nhất vừa 85% rồi **chạy thử lại**
-ở batch ấy (OOM/vượt thì lùi một nấc). Con số được đo là VRAM **thiết bị** —
-đúng cái `nvidia-smi` in, gồm CUDA context và phân mảnh — nên 85% là 85% thật,
-không phải "85% tensor rồi tràn vì context". Lượt dò lúc train đệm tới
-`max_seq_len`, lượt dò lúc sinh ép đủ `max_new_tokens`: batch đã chọn là batch
-chịu được mẫu **xấu nhất**, không chỉ mẫu trung bình.
-
-Batch hiệu dụng (32), số bước và đường lr **không đổi** — `grad_accum` suy lại.
-Và batch mỗi lượt là **một số dùng chung cho mọi candidate**: candidate nặng
-nhất (`qlora_r32_decoder`) được dò trước, số của nó khoá vào
-`adapters_lora/_fixture/loader.json` (`train_batch`; lúc sinh: `infer_batch`)
-cho các candidate còn lại **và** mọi candidate thêm về sau. Lý do: HF lấy
-trung bình CE theo token trong micro-batch, nên hai candidate chạy hai batch
-khác nhau là thêm một biến thứ ba vào bảng so sánh. Candidate mới nặng hơn
-(vd. r lớn) mà batch đã khoá không vừa VRAM -> thử trước bằng `train --dry-run`.
-
-VRAM thiết bị được ghi vào W&B (`sys/vram_device_frac`) ở mỗi lần log, và bản
-tóm tắt `▣ VRAM đỉnh` in ở cuối MỌI lần chạy (`RGEXP_VRAM_MONITOR=0` để tắt).
-
-**Đọc–ghi.** Khối `io.*` của config GPU:
-
-| khoá | rtx3060 | làm gì |
-|---|---|---|
-| `io.workers` | `auto` | luồng trích zip / quét cache; `auto` = số vCPU cgroup thật cấp (`src/hw.py`), không phải 128 lõi của máy chủ |
-| `io.zip_mode` | `download` | mạng ~5 Gbps + đĩa 100 GB: tải trọn `img_dir.zip` (đa kết nối qua `hf_transfer`) rồi trích **song song** từ NVMe, nhanh hơn stream range-request một kết nối. `content` = theo `data.zip_mode` |
-| `io.prefetch_depth` | 3 | số micro-batch (train) / batch (sinh) dựng sẵn trong luồng nền |
-| `io.pin_memory` | true | collate + `pin_memory` chạy luôn ở luồng nền, luồng chính chỉ còn chép `non_blocking` lên GPU |
-
-Ở khâu sinh, phần CPU của batch k+1 (mở ảnh, processor 896, token hoá) chạy
-trong lúc batch k đang trên GPU; mọi lần chạm tokenizer đi qua một khoá vì
-tokenizer "fast" của HF không an toàn đa luồng.
-
-Không khoá nào ở đây đổi kết quả: thứ tự dữ liệu vẫn do cùng Generator sinh ra,
-ảnh trích ra từ zip là cùng những byte ấy, và batch hiệu dụng không đổi.
+Trên máy mới, `train` kéo Stage 0 từ Hub nếu vân tay khớp, rồi kéo weight và kết
+quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 
 ## Cấu trúc
 
 ```
-configs/lora.yaml · configs/gpu/rtx3060.yaml
-scripts/run_lora.sh · selftest_lora.py · setup.sh · _env.sh
-src/run_lora.py        ba lệnh: train (data→train→infer→score) · push · stats (stats→report)
-src/fixture.py         adapters_lora/_fixture: sub-dataset + loader-setup + sổ weight
-src/stats_friedman.py  Friedman (ties, Iman-Davenport) + hậu kiểm Wilcoxon/permutation, Holm
-src/push.py            push vào repo cũ, current/, kiểm trùng weight
-src/report_lora.py     REPORT.md (ghi đè mỗi lần stats)
-src/report_plots.py    metric theo mọi candidate: bar điểm TB + nét đứt/chấm ở max từng metric (figures/)
-src/train_recomb.py    vòng huấn luyện (candidate KHÔNG nhánh = Gemma NF4 + adapter peft)
-src/backbone.py        nạp base, chọn target module (lọc vision), alpha, one-cycle
-src/runners/           sinh (gemma3_recomb) — cùng đường dựng chuỗi với lúc train
-src/data*.py · imaging.py · metrics.py · stats_ab.py · stats_multi.py (đường ghép cặp cũ, còn selftest)
-src/prefetch.py · autobatch.py · vram_monitor.py · config.py · push.py · tracking.py
+configs/recomb.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
+scripts/run_zrecomb.sh · selftest_zrecomb.py · setup.sh · _env.sh
+src/run_zrecomb.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · push
+src/zrecomb.py          Recomb · Cls Head (Attn-Pooling) · Retriever · ASL theo tên lớp · metric Stage 0 · ghi/nạp
+src/stage0_zrecomb.py   Stage 0 + loader.json + nhãn chụp lại
+src/train_zrecomb.py    main stage của B (vòng lặp chép từ train_recomb._train_once, chèn Z')
+src/report_zrecomb.py   REPORT.md
+src/stats_ab.py         bootstrap ghép cặp (BCa) + permutation, Holm
+src/runners/gemma3_recomb.py   sinh: A = [text ‖ Z], B = [text ‖ Z'] (cùng đường)
+src/fixture.py · hub_sync.py · push.py · train_recomb.py · backbone.py · recombiner.py (RMSNorm, ASL, encode_vision) …
 ```
-
-`recombiner.py`, `moe.py`, `pretrain_io.py`, `labels_cls.py` còn ở `src/` chỉ
-vì `train_recomb.py` import chúng; thí nghiệm LoRA không dựng nhánh nào và MoE
-tắt cứng.
 
 ## `_archive/`
 
-Mọi thí nghiệm trước: §2.0–§2.2 (base zero-shot, 8 biến thể adapter + Friedman),
-§2.3–§2.4 (nhánh Recombinator, MoE), và §2.5 (R2Gen · AdaAtt · My Gemma, Stage 0,
-`comparer_pretrain`, `sota_hub`, profile GPU). Code, config, script và README
-của từng mục (`_archive/README_*.md`, README gốc của §2.5 là
-`_archive/README_2.5.md`). Không file nào trong `src/` import sang `_archive/`
-(selftest kiểm). Lịch sử git đầy đủ của các mục ấy ở repo cũ
-`KenteaKe11/RGExp_proj`.
+* `_archive/v2/`: **toàn bộ $1 LoRA Test** (rank × chỗ gắn). Gồm README, config,
+  script, `run_lora` / `report_lora` / `report_plots` / `stats_friedman`, và bản
+  chụp mọi module dùng chung đúng như lúc $1 chạy. Muốn chạy lại $1 thì chép
+  `_archive/v2/{src,scripts,configs}` ra một bản clone riêng.
+* §2.0–§2.5: xem `_archive/README_*.md`.
