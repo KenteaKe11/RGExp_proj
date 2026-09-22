@@ -377,6 +377,11 @@ def _():
     assert cfg["recomb_exp"]["retrain_all"] is False
     src = (ROOT / "src/run_zrecomb.py").read_text(encoding="utf-8")
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
+    # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
+    assert "--refinal" in src and "restart_final=a.refinal" in src
+    assert "a.restage0 or a.refinal or s0.finished(cfg) is None" in src
+    from src.run_zrecomb import COMMANDS
+    assert COMMANDS["train"][:2] == ["data", "stage0"]
 
 
 @check("15. Stage 0 chạy thật (mô hình giả): 8 epoch -> base/ + đẩy NGAY -> epoch 9 cosine 3e-5→1e-8 -> final/; chạy lại chỉ epoch 9")

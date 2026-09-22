@@ -220,14 +220,14 @@ def labels_for(cfg: Cfg, df: pd.DataFrame, lut: dict, n_labels: int, name: str):
 # ── chạy ───────────────────────────────────────────────────────────────────
 def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         max_steps: int | None = None, restart: bool = False,
-        on_base_done=None) -> dict:
+        on_base_done=None, restart_final: bool = False) -> dict:
     """Chạy (hoặc chạy tiếp) Stage 0. -> history (có `best_epoch`, `best_score`)."""
     import torch
 
     sc = s0cfg(cfg)
     d = stage0_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
-    if not restart:
+    if not (restart or restart_final):
         h = finished(cfg)
         if h is not None:
             print(f"  ✓ Stage 0 đã xong: dùng epoch {h['best_epoch']} · score "
@@ -325,8 +325,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     n = len(ds_tr)
     steps_per_epoch = math.ceil(n / bs_eff)
+    if restart_final and base_finished(cfg) is None:
+        raise TrainUnusable(
+            "`--refinal` chỉ chạy lại epoch n+1, nhưng máy này chưa có base/ "
+            f"({sc['max_epochs']} epoch) khớp cấu hình. Chạy `--restage0`.")
     hb = None if restart else base_finished(cfg)
-    if hb is not None and start_epoch <= sc["max_epochs"]:
+    if hb is not None and (restart_final or start_epoch <= sc["max_epochs"]):
         from safetensors.torch import load_file
 
         block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))

@@ -309,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stages", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restage0", action="store_true", help="chạy lại Stage 0 (+ --retrain)")
+    ap.add_argument("--refinal", action="store_true",
+                    help="chỉ chạy lại epoch n+1 (final_anneal) của Stage 0, giữ base/; "
+                         "kéo theo --retrain (main stage phải học lại trên final mới)")
     ap.add_argument("--retrain-all", action="store_true",
                     help="huấn luyện lại TOÀN BỘ B: Stage 0 + main + sinh + chấm, bỏ qua "
                          "mọi thứ đã có (= recomb_exp.retrain_all: true). A ($1) không đổi.")
@@ -333,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         print("⚙ RETRAIN-ALL: Stage 0 + main stage + sinh + chấm của B chạy lại từ đầu; "
               "không kéo Stage 0 / weight / kết quả B từ Hub. A ($1) giữ nguyên.",
               flush=True)
-    if a.restage0:
+    if a.restage0 or a.refinal:
         a.retrain = True
     try:
         A, B = arms_of(cfg)
@@ -453,7 +456,10 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     need_train = "train" in stages and (a.retrain or not trained)
     need_infer = "infer" in stages and (
         need_train or _count_preds(run_dir / "predictions" / f"{B['id']}.jsonl") < n_test)
-    need_stage0 = "stage0" in stages and need_train
+    # Stage 0 chạy khi: main stage cần nó, hoặc lệnh chỉ gọi stage0 (`--stages
+    # data,stage0`), hoặc buộc chạy lại (`--restage0` / `--refinal`).
+    need_stage0 = "stage0" in stages and (
+        need_train or a.restage0 or a.refinal or s0.finished(cfg) is None)
     need_images = need_train or need_infer or need_stage0
 
     tracker = Tracker(cfg, run_id=manifest["run_id"], config_snapshot=manifest["config"])
@@ -491,11 +497,11 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
 
     # ── Stage 0 ────────────────────────────────────────────────────────────
     s0dir = s0.stage0_dir(cfg)
-    if need_stage0 and pull and not a.restage0:
+    if need_stage0 and pull and not (a.restage0 or a.refinal):
         pull_stage0(cfg)
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
-        ran_stage0 = s0.finished(cfg) is None or a.restage0
+        ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal
         _hr("Stage 0 — pretrain Recomb + Cls Head (ASL)")
         try:
             def _base_done() -> None:
@@ -508,7 +514,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
 
             h = s0.run(cfg, train_df, val_df, tracker,
                        max_steps=2 if a.dry_run else None, restart=a.restage0,
-                       on_base_done=_base_done)
+                       on_base_done=_base_done, restart_final=a.refinal)
         except TrainUnusable as e:
             print(f"\n✗ Stage 0 hỏng: {e}", flush=True)
             tracker.finish(1)

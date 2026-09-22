@@ -98,7 +98,7 @@ export WANDB_API_KEY=xxxxxxxx
 python scripts/selftest_zrecomb.py              # vài giây, không cần GPU
 bash scripts/run_zrecomb.sh train --dry-run     # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_zrecomb.sh train --detach      # 1. kéo A -> Stage 0 -> main B -> sinh -> chấm
+bash scripts/run_zrecomb.sh train --detach      # 1. kéo A -> Stage 0 (8 epoch -> base, epoch 9 -> final) -> main B -> sinh -> chấm
 bash scripts/run_zrecomb.sh stats               # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
 bash scripts/run_zrecomb.sh push                # 3. -> current/$2_Recombiner_Test/
 ```
@@ -119,7 +119,10 @@ Các cờ:
 
 * `--retrain-all` (hoặc `recomb_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
-* `--restage0`: pretrain lại, kéo theo `--retrain`.
+* `--restage0`: pretrain lại cả 9 epoch, kéo theo `--retrain`.
+* `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
+  `--retrain`. Cần `base/` đã có và khớp vân tay.
+* `--stages data,stage0`: chỉ chạy Stage 0 (8 epoch + epoch 9), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
 * `--no-pull`.
