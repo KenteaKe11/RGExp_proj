@@ -209,15 +209,20 @@ def bring_baseline(cfg: Cfg, A: dict, run_dir: Path, adapter_root: Path, fx: Pat
     return out
 
 
-def pull_stage0(cfg: Cfg) -> bool:
+def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
     """Stage 0 đã có trên Hub (`<hub_base>/stage0/`) mà máy này chưa có -> kéo về,
-    để máy mới KHÔNG pretrain lại. Chỉ dùng nếu vân tay cấu hình khớp."""
+    để máy mới KHÔNG pretrain lại. Chỉ dùng nếu vân tay cấu hình khớp.
+
+    `base_only` (dùng với `--refinal`): chỉ lấy `base/` (8 epoch) và bỏ `final/`
+    — epoch n+1 sẽ chạy lại trên máy này."""
     from . import stage0_zrecomb as s0
     from .hub_sync import _api_and_index, _download
     from .push import hub_base
 
-    if s0.finished(cfg) is not None:
+    if not base_only and s0.finished(cfg) is not None:
         return False
+    if base_only and s0.base_finished(cfg) is not None:
+        return False              # đã có base cục bộ
     try:
         api, repo_id, repo_type, remote = _api_and_index(cfg)
     except Exception as e:  # noqa: BLE001
@@ -232,7 +237,8 @@ def pull_stage0(cfg: Cfg) -> bool:
     for r in have:
         _download(api, repo_id, repo_type, f"{base}/stage0/{r}", tmp / r)
     h = json.loads((tmp / s0.HISTORY).read_text(encoding="utf-8"))
-    full = h.get("finished") and h.get("config_fingerprint") == s0.config_fingerprint(cfg)
+    full = (not base_only and h.get("finished")
+            and h.get("config_fingerprint") == s0.config_fingerprint(cfg))
     base_ok = h.get("base_finished") and h.get("base_fingerprint") == s0.base_fingerprint(cfg)
     if not (full or base_ok):
         print("  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng", flush=True)
@@ -497,8 +503,9 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
 
     # ── Stage 0 ────────────────────────────────────────────────────────────
     s0dir = s0.stage0_dir(cfg)
-    if need_stage0 and pull and not (a.restage0 or a.refinal):
-        pull_stage0(cfg)
+    if need_stage0 and pull and not a.restage0:
+        # `--refinal`: chưa có base cục bộ thì kéo base từ Hub rồi chạy epoch n+1.
+        pull_stage0(cfg, base_only=a.refinal)
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal

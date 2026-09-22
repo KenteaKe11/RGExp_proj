@@ -379,6 +379,8 @@ def _():
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
     # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
     assert "--refinal" in src and "restart_final=a.refinal" in src
+    assert "pull_stage0(cfg, base_only=a.refinal)" in src     # --refinal: base thiếu -> kéo Hub
+    assert "if base_only and s0.base_finished(cfg) is not None:" in src
     assert "a.restage0 or a.refinal or s0.finished(cfg) is None" in src
     from src.run_zrecomb import COMMANDS
     assert COMMANDS["train"][:2] == ["data", "stage0"]

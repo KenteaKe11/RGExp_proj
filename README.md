@@ -121,7 +121,8 @@ Các cờ:
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
 * `--restage0`: pretrain lại cả 9 epoch, kéo theo `--retrain`.
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
-  `--retrain`. Cần `base/` đã có và khớp vân tay.
+  `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
+  vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
 * `--stages data,stage0`: chỉ chạy Stage 0 (8 epoch + epoch 9), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.

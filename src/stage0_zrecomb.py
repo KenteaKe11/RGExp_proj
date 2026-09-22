@@ -327,8 +327,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     steps_per_epoch = math.ceil(n / bs_eff)
     if restart_final and base_finished(cfg) is None:
         raise TrainUnusable(
-            "`--refinal` chỉ chạy lại epoch n+1, nhưng máy này chưa có base/ "
-            f"({sc['max_epochs']} epoch) khớp cấu hình. Chạy `--restage0`.")
+            f"`--refinal` chỉ chạy lại epoch n+1, nhưng máy này không có base/ "
+            f"({sc['max_epochs']} epoch) khớp cấu hình — cục bộ lẫn trên Hub "
+            f"(`<hub_base>/stage0/base/`). Chạy `--restage0` để pretrain lại, hoặc "
+            f"kiểm `output.pull` / `--no-pull` và HF_TOKEN.")
     hb = None if restart else base_finished(cfg)
     if hb is not None and (restart_final or start_epoch <= sc["max_epochs"]):
         from safetensors.torch import load_file
