@@ -23,6 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
      đổi lịch anneal thì chỉ chạy lại epoch 9
  16. lịch cosine của epoch 9
  17. checkpoint bố cục CŨ (chỉ `final/` = 8 epoch) được nhận làm `base/`
+ 18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
 """
 from __future__ import annotations
 
@@ -527,6 +528,49 @@ def _():
         assert s0.base_finished(cfg2) is None
     src = (ROOT / "src/run_zrecomb.py").read_text(encoding="utf-8")
     assert "s0.legacy_base(h, cfg)" in src        # Hub bố cục cũ cũng nhận được
+
+
+@check("18. kéo Stage 0 từ Hub (giả lập): bố cục cũ chỉ có final/ -> về máy thành base/")
+def _():
+    import json
+    import shutil
+
+    from src import hub_sync
+    from src import stage0_zrecomb as s0
+    from src import zrecomb as Z
+    from src.config import load_config
+    from src.push import hub_base
+    from src.run_zrecomb import pull_stage0
+
+    cfg = load_config(ROOT / "configs/recomb.yaml")
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        cfg["output"] = dict(cfg["output"], adapter_dir=str(t / "ad"))
+        base = hub_base(cfg)
+        hub = t / "hub"                       # "Hub" giả: bố cục CŨ, chỉ có final/
+        Z.save_stage0(Z.SupervisedBlock(small_spec()), hub / s0.CKPT,
+                      {"select": "last", "best_epoch": 8})
+        (hub / s0.HISTORY).write_text(json.dumps({
+            "finished": True, "select": "last", "best_epoch": 8, "best_score": 0.37,
+            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 9)],
+            "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
+        (hub / s0.LOADER).write_text("{}", encoding="utf-8")
+        (hub / s0.LABELS).write_bytes(b"npz")
+        remote = {f"{base}/stage0/{r}": {} for r in s0.KEEP if (hub / r).exists()}
+        orig = (hub_sync._api_and_index, hub_sync._download)
+        hub_sync._api_and_index = lambda _c: ("api", "repo", "dataset", remote)
+        hub_sync._download = lambda _a, _r, _t, path, dst: (
+            Path(dst).parent.mkdir(parents=True, exist_ok=True),
+            shutil.copyfile(hub / path.split("/stage0/", 1)[1], dst), Path(dst))[-1]
+        try:
+            assert pull_stage0(cfg, base_only=True) is True
+        finally:
+            hub_sync._api_and_index, hub_sync._download = orig
+        d = s0.stage0_dir(cfg)
+        assert Z.stage0_exists(d / s0.BASE) and not Z.stage0_exists(d / s0.CKPT)
+        h = json.loads((d / s0.HISTORY).read_text())
+        assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 8
+        assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
 print()

@@ -239,17 +239,18 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
     h = json.loads((tmp / s0.HISTORY).read_text(encoding="utf-8"))
     full = (not base_only and h.get("finished")
             and h.get("config_fingerprint") == s0.config_fingerprint(cfg))
-    base_ok = h.get("base_finished") and h.get("base_fingerprint") == s0.base_fingerprint(cfg)
-    if not (full or base_ok):
-        print("  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng", flush=True)
-        shutil.rmtree(tmp, ignore_errors=True)
-        return False
-    legacy = (not full) and s0.legacy_base(h, cfg) and any(
-        r.startswith(s0.CKPT + "/") for r in have)
+    base_ok = bool(h.get("base_finished")
+                   and h.get("base_fingerprint") == s0.base_fingerprint(cfg))
+    # Bố cục CŨ trên Hub (chỉ có `final/` = epoch cuối của n epoch lr cố định):
+    # nhận làm base/ khi vân tay base khớp. Phải xét TRƯỚC cổng dưới, nếu không
+    # thì `base_finished` (khoá chỉ bản mới ghi) làm nó rớt ngay.
+    legacy = (not full and not base_ok and s0.legacy_base(h, cfg)
+              and any(r.startswith(s0.CKPT + "/") for r in have))
     if legacy:
-        # Bố cục CŨ trên Hub: `final/` chính là epoch cuối của 8 epoch -> nhận làm base/
         for r in have:
             if r.startswith(s0.CKPT + "/"):
+                (tmp / (s0.BASE + r[len(s0.CKPT):])).parent.mkdir(parents=True,
+                                                                  exist_ok=True)
                 (tmp / r).replace(tmp / (s0.BASE + r[len(s0.CKPT):]))
         have = [(s0.BASE + r[len(s0.CKPT):]) if r.startswith(s0.CKPT + "/") else r
                 for r in have]
@@ -257,6 +258,13 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
                  base_epoch=h.get("best_epoch"), base_score=h.get("best_score"),
                  adopted_from="stage0/final (bố cục cũ trên Hub)")
         base_ok = True
+    if not (full or base_ok):
+        print(f"  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng "
+              f"(vân tay base của máy này {s0.base_fingerprint(cfg)[:12]}, "
+              f"của Hub {str(h.get('base_fingerprint') or h.get('config_fingerprint'))[:12]})",
+              flush=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
     keep = have if full else [r for r in have if not r.startswith(s0.CKPT + "/")]
     if not full:
         # chỉ base khớp (vd. đổi lịch anneal): giữ base, epoch n+1 sẽ chạy lại
@@ -438,6 +446,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     from . import train_zrecomb as tz
     from .backbone import TrainUnusable
     from .hw import cpu_budget, io_workers, set_torch_threads
+    from .push import hub_base
     from .tracking import Tracker
 
     print(f"⚙ CPU: {cpu_budget()} lõi · torch {set_torch_threads(cfg)} luồng · I/O "
@@ -523,6 +532,14 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         # Chưa đủ (vd. Hub còn bố cục cũ chỉ có final/) -> thử kéo riêng base.
         if not a.refinal and s0.finished(cfg) is None and s0.base_finished(cfg) is None:
             pull_stage0(cfg, base_only=True)
+    if a.refinal and s0.base_finished(cfg) is None:
+        # Dừng TRƯỚC khi nạp base 4B + dò autobatch (mất vài phút) thay vì sau.
+        print(f"✗ `--refinal` cần base/ ({cfg['stage0']['max_epochs']} epoch) khớp vân "
+              f"tay, nhưng máy này không có và cũng không kéo được từ Hub "
+              f"(`{hub_base(cfg)}/stage0/`). Chạy `--restage0`, hoặc kiểm "
+              f"`output.pull` / `--no-pull` / HF_TOKEN.", flush=True)
+        tracker.finish(1)
+        return 3
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal
