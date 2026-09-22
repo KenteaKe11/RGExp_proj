@@ -123,6 +123,9 @@ Các cờ:
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
   `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
   vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
+  Checkpoint **bố cục cũ** (lần chạy trước khi tách base/final: chỉ có `stage0/final/`
+  = epoch cuối của 8 epoch) được **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn
+  trên Hub — nên không phải pretrain lại 8 epoch.
 * `--stages data,stage0`: chỉ chạy Stage 0 (8 epoch + epoch 9), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.

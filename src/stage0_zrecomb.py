@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import time
 from pathlib import Path
 
@@ -92,6 +93,40 @@ def anneal_cfg(s: dict) -> dict:
     if not (out["lr_start"] > out["lr_end"] >= 0) or out["epochs"] < 1:
         raise TrainUnusable(f"stage0.final_anneal không hợp lệ: {out}")
     return out
+
+
+def legacy_base(h: dict, cfg: Cfg) -> bool:
+    """History kiểu CŨ (trước khi tách base/final) có dùng lại làm base được không?
+
+    Bản cũ chạy đúng `max_epochs` epoch lr cố định rồi ghi checkpoint cuối vào
+    `final/`, và `config_fingerprint` của nó tính trên KHỐI stage0 CHƯA có
+    `final_anneal` — tức là ĐÚNG công thức `base_fingerprint` bây giờ. Nên chỉ
+    nhận khi vân tay ấy khớp và history không có epoch anneal nào.
+    """
+    return bool(h and not h.get("base_finished")
+                and h.get("config_fingerprint") == base_fingerprint(cfg)
+                and not any(x.get("phase") == "anneal" for x in h.get("history") or []))
+
+
+def adopt_legacy_base(cfg: Cfg) -> dict | None:
+    """`final/` kiểu cũ (= epoch cuối của 8 epoch) -> `base/`. Trả history hoặc None."""
+    d = stage0_dir(cfg)
+    p = d / HISTORY
+    if base_finished(cfg) is not None or not (p.exists() and Z.stage0_exists(d / CKPT)):
+        return None
+    h = json.loads(p.read_text(encoding="utf-8"))
+    if not legacy_base(h, cfg):
+        return None
+    (d / BASE).mkdir(parents=True, exist_ok=True)
+    for f in (Z.STAGE0_FILE, Z.STAGE0_META):
+        shutil.copyfile(d / CKPT / f, d / BASE / f)
+    h.update(finished=False, base_finished=True, base_fingerprint=base_fingerprint(cfg),
+             base_epoch=h.get("best_epoch"), base_score=h.get("best_score"),
+             adopted_from=f"{CKPT}/ (bố cục cũ, trước khi tách base/final)")
+    p.write_text(json.dumps(h, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    print(f"  ⚙ nhận {d / CKPT} (epoch {h.get('best_epoch')}, bố cục cũ) làm base/ — "
+          f"vân tay base khớp, không pretrain lại", flush=True)
+    return h
 
 
 def base_finished(cfg: Cfg) -> dict | None:
@@ -325,6 +360,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     n = len(ds_tr)
     steps_per_epoch = math.ceil(n / bs_eff)
+    if not restart:
+        adopt_legacy_base(cfg)          # `final/` kiểu cũ -> base/ (nếu vân tay khớp)
     if restart_final and base_finished(cfg) is None:
         raise TrainUnusable(
             f"`--refinal` chỉ chạy lại epoch n+1, nhưng máy này không có base/ "

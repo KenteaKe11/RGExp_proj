@@ -244,6 +244,19 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
         print("  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng", flush=True)
         shutil.rmtree(tmp, ignore_errors=True)
         return False
+    legacy = (not full) and s0.legacy_base(h, cfg) and any(
+        r.startswith(s0.CKPT + "/") for r in have)
+    if legacy:
+        # Bố cục CŨ trên Hub: `final/` chính là epoch cuối của 8 epoch -> nhận làm base/
+        for r in have:
+            if r.startswith(s0.CKPT + "/"):
+                (tmp / r).replace(tmp / (s0.BASE + r[len(s0.CKPT):]))
+        have = [(s0.BASE + r[len(s0.CKPT):]) if r.startswith(s0.CKPT + "/") else r
+                for r in have]
+        h.update(base_finished=True, base_fingerprint=s0.base_fingerprint(cfg),
+                 base_epoch=h.get("best_epoch"), base_score=h.get("best_score"),
+                 adopted_from="stage0/final (bố cục cũ trên Hub)")
+        base_ok = True
     keep = have if full else [r for r in have if not r.startswith(s0.CKPT + "/")]
     if not full:
         # chỉ base khớp (vd. đổi lịch anneal): giữ base, epoch n+1 sẽ chạy lại
@@ -257,8 +270,9 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"  ↓ Stage 0 từ Hub {base}/stage0: "
           + (f"final (epoch {h.get('best_epoch')})" if full
-             else f"chỉ base ({h.get('base_epoch')} epoch) — sẽ chạy epoch n+1"),
-          flush=True)
+             else f"base ({h.get('base_epoch')} epoch"
+                  + (", bố cục cũ: lấy từ stage0/final" if legacy else "")
+                  + ") — sẽ chạy epoch n+1"), flush=True)
     return True
 
 
@@ -506,6 +520,9 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     if need_stage0 and pull and not a.restage0:
         # `--refinal`: chưa có base cục bộ thì kéo base từ Hub rồi chạy epoch n+1.
         pull_stage0(cfg, base_only=a.refinal)
+        # Chưa đủ (vd. Hub còn bố cục cũ chỉ có final/) -> thử kéo riêng base.
+        if not a.refinal and s0.finished(cfg) is None and s0.base_finished(cfg) is None:
+            pull_stage0(cfg, base_only=True)
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal

@@ -22,6 +22,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  15. Stage 0 chạy thật trên mô hình giả: base (8 epoch) đẩy ngay, epoch 9 anneal -> final;
      đổi lịch anneal thì chỉ chạy lại epoch 9
  16. lịch cosine của epoch 9
+ 17. checkpoint bố cục CŨ (chỉ `final/` = 8 epoch) được nhận làm `base/`
 """
 from __future__ import annotations
 
@@ -493,6 +494,39 @@ def _():
         lrs.append(opt.param_groups[0]["lr"])
     assert abs(lrs[0] - 3e-5) < 1e-12 and abs(lrs[-1] - 1e-8) < 1e-12
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
+
+
+@check("17. bố cục CŨ (chỉ có final/ = epoch 8): nhận làm base/, không pretrain lại")
+def _():
+    import json
+
+    from src import stage0_zrecomb as s0
+    from src import zrecomb as Z
+    from src.config import load_config
+
+    cfg = load_config(ROOT / "configs/recomb.yaml")
+    with tempfile.TemporaryDirectory() as t:
+        cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
+        d = s0.stage0_dir(cfg)
+        Z.save_stage0(Z.SupervisedBlock(small_spec()), d / s0.CKPT,
+                      {"select": "last", "best_epoch": 8})
+        # history kiểu cũ: config_fingerprint tính KHÔNG có final_anneal == base_fingerprint
+        (d / s0.HISTORY).write_text(json.dumps({
+            "finished": True, "select": "last", "best_epoch": 8, "best_score": 0.37,
+            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 9)],
+            "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
+        assert s0.base_finished(cfg) is None and s0.finished(cfg) is None
+        h = s0.adopt_legacy_base(cfg)
+        assert h is not None and Z.stage0_exists(d / s0.BASE)
+        assert s0.base_finished(cfg) is not None      # dùng được làm base
+        assert s0.finished(cfg) is None               # epoch n+1 vẫn phải chạy
+        # vân tay base khác -> KHÔNG nhận
+        cfg2 = load_config(ROOT / "configs/recomb.yaml")
+        cfg2["output"] = dict(cfg["output"])
+        cfg2["stage0"] = dict(cfg2["stage0"], lr=1.0e-4)
+        assert s0.base_finished(cfg2) is None
+    src = (ROOT / "src/run_zrecomb.py").read_text(encoding="utf-8")
+    assert "s0.legacy_base(h, cfg)" in src        # Hub bố cục cũ cũng nhận được
 
 
 print()
