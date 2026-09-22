@@ -88,7 +88,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[text ‖ **Z**] (256 token ảnh)",
          "[text ‖ **Z'**] (256 token, Z' = Z + Retriever(Z, Recomb(X)))"],
-        ["Stage 0", "—", f"Recomb + Cls Head, ASL, chọn epoch {s0.get('best_epoch', '?')}"],
+        ["Stage 0", "—", f"Recomb + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
+                          f"({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
          f"Retriever lr {zm.get('retriever_lr')} wd {zm.get('retriever_wd')} (cố định) · "
          f"Recomb đóng băng {zm.get('freeze_recomb_epochs')} epoch đầu · Cls Head bỏ"],
@@ -102,8 +103,9 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                  f"{s0.get('stage0', {}).get('weight_decay')} · ≤ "
                  f"{s0.get('stage0', {}).get('max_epochs')} epoch · ASL γ_neg "
                  f"{s0.get('stage0', {}).get('asl', {}).get('gamma_neg')} · clip "
-                 f"{s0.get('stage0', {}).get('asl', {}).get('clip')} · chọn theo "
-                 f"sqrt(F1·Recall) macro {s0.get('stage0', {}).get('val_classes')}\n")
+                 f"{s0.get('stage0', {}).get('asl', {}).get('clip')} · epoch dùng: "
+                 f"{s0.get('select', 'last')} · val {s0.get('stage0', {}).get('val_n_samples')} "
+                 f"mẫu bốc lại, sqrt(F1·Recall) macro {s0.get('stage0', {}).get('val_classes')}\n")
         L.append(_tbl(["epoch", "train ASL", "val ASL", "F1 macro", "Recall macro",
                        "sqrt(F1·R)", "phút"],
                       [[("**" + str(h["epoch"]) + "** ★") if h["epoch"] == s0.get("best_epoch")
@@ -177,8 +179,9 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     L.append("- Recomb được Stage 0 dạy trên nhãn bệnh lý của 6400 ảnh train — một "
              "nguồn giám sát A không có. \"Biến duy nhất là Z vs Z'\" nghĩa là chuỗi "
              "vào decoder; Z' mang theo cả thông tin do Stage 0 học.")
-    L.append("- Recomb đóng băng suốt main stage (1 epoch): chỉ Retriever và LoRA học "
-             "từ CE.")
+    L.append(f"- Recomb đóng băng {zm.get('freeze_recomb_epochs')} epoch đầu của main "
+             f"stage, sau đó học ở lr {zm.get('recomb_lr')} — nhánh của B có nhiều tham số "
+             f"học được hơn A ở nửa sau.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")

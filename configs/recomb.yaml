@@ -266,6 +266,9 @@ recomb_exp:
     local_adapter_dir: ./adapters_lora
     local_run_dir: ./runs/lora_rank_target
   # B: y như A + Recomb (Stage 0 + Z -> Z').
+  # true = huấn luyện lại TOÀN BỘ B: Stage 0 + main + sinh + chấm, bỏ qua mọi
+  # thứ đã có (cục bộ lẫn Hub). Tương đương cờ `--retrain-all`.
+  retrain_all: false
   candidate:
     id: qlora_r32_decoder_recomb
     name: "QLoRA r=32 · full decoder + Recomb (Z')"
@@ -312,23 +315,24 @@ zrecomb:
     retriever_wd: 0.03
     recomb_lr: 1.0e-5       # "Pretrain" (chỉ sau khi mở băng)
     recomb_wd: 0.01
-    freeze_recomb_epochs: 1 # đóng băng HOÀN TOÀN epoch đầu = cả main stage (1 epoch)
+    freeze_recomb_epochs: 0.5  # đóng băng HOÀN TOÀN 0.5 epoch đầu (100/200 bước), rồi học ở recomb_lr
     separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 0: pretrain Recomb + Cls Head (`src/stage0_zrecomb.py`) ──────────
 stage0:
-  lr: 1.0e-4                # CỐ ĐỊNH
+  lr: 3.0e-4                # CỐ ĐỊNH
   weight_decay: 0.03
-  max_epochs: 5
+  max_epochs: 8
+  select: last              # LUÔN lấy epoch cuối (best = theo val)
   batch_size: 32            # batch hiệu dụng; mảnh mỗi lượt (`stage0.micro_batch`)
                             # ở config GPU, autobatch dò lại
   max_grad_norm: 1.0
-  # chọn epoch theo sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
+  # val (theo dõi): sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
   val_classes: [pos, uncertain]
   val_n_samples: 256        # mỗi epoch bốc 256 mẫu từ hồ val 2000 (0 = cả hồ)
   val_resample: true        # bốc lại mỗi epoch; chỉ số từ (seed, epoch)
   asl:                      # ASL one-hot 3 lớp
-    gamma_neg: {neg: 2.0, uncertain: 3.0, pos: 0.0}
+    gamma_neg: {neg: 4.0, uncertain: 1.0, pos: 0.0}
     gamma_pos: 0.0
     clip: 0.05
     eps: 1.0e-8

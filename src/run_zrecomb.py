@@ -298,6 +298,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stages", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restage0", action="store_true", help="chạy lại Stage 0 (+ --retrain)")
+    ap.add_argument("--retrain-all", action="store_true",
+                    help="huấn luyện lại TOÀN BỘ B: Stage 0 + main + sinh + chấm, bỏ qua "
+                         "mọi thứ đã có (= recomb_exp.retrain_all: true). A ($1) không đổi.")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại main stage B")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--force-weights", action="store_true")
@@ -309,11 +312,18 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_usage()
         print("✗ thiếu lệnh: train | stats | push | all")
         return 2
-    if a.restage0:
-        a.retrain = True
 
     cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
     cfg["experiment"] = "recomb"
+    if bool(dict(cfg.get("recomb_exp") or {}).get("retrain_all", False)):
+        a.retrain_all = True
+    if a.retrain_all:
+        a.restage0 = a.retrain = a.rescore = True
+        print("⚙ RETRAIN-ALL: Stage 0 + main stage + sinh + chấm của B chạy lại từ đầu; "
+              "không kéo Stage 0 / weight / kết quả B từ Hub. A ($1) giữ nguyên.",
+              flush=True)
+    if a.restage0:
+        a.retrain = True
     try:
         A, B = arms_of(cfg)
     except ValueError as e:
@@ -507,7 +517,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
             c = lock_train(c, locked)
         preset = preset_for(c, B)
         try:
-            st = tz.train_arm(c, B, preset, train_df, b_dir, s0dir / "best", tracker,
+            st = tz.train_arm(c, B, preset, train_df, b_dir, s0dir / s0.CKPT, tracker,
                               max_steps_override=dry_steps, val_df=val_df)
         except TrainUnusable as e:
             print(f"\n✗ {B['id']} KHÔNG huấn luyện được: {e}", flush=True)

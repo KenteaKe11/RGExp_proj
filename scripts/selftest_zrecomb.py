@@ -18,6 +18,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  12. Stage 0 (weight + loader + nhãn + history) và main stage (weight + nhánh)
      nằm trong plan đẩy Hub, giống bố cục $1
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
+ 14. lịch Stage 0 / main hiện hành và cờ --retrain-all
 """
 from __future__ import annotations
 
@@ -121,7 +122,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/recomb.yaml")
     g = Z.asl_gammas(cfg["stage0"]["asl"])
-    want = {"neg": 2.0, "uncertain": 3.0, "pos": 0.0}
+    want = {"neg": 4.0, "uncertain": 1.0, "pos": 0.0}
     assert g == [want[c] for c in CLASS_ORDER], (g, CLASS_ORDER)
     asl = Z.build_asl(cfg["stage0"]["asl"])
     assert asl.clip == 0.05 and asl.gamma_pos == 0.0
@@ -305,7 +306,7 @@ def _():
         cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
         d = Path(t) / "ad" / "_stage0"
         sp = small_spec()
-        Z.save_stage0(Z.SupervisedBlock(sp), d / "best", {})
+        Z.save_stage0(Z.SupervisedBlock(sp), d / s0.CKPT, {})
         for f in (s0.HISTORY, s0.LOADER, s0.LABELS):
             (d / f).write_text("{}")
         (d / "last").mkdir()
@@ -352,6 +353,25 @@ def _():
     lg = torch.randn(1, 4, 3, requires_grad=True)
     asl(lg, y, torch.ones(1)).backward()
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
+
+
+@check("14. lịch mới: Stage 0 lr 3e-4 · 8 epoch · lấy LAST · val 256; main mở băng Recomb sau 0.5 epoch; --retrain-all")
+def _():
+    from src import stage0_zrecomb as s0
+    from src.config import load_config
+    from src.train_zrecomb import zcfg
+
+    cfg = load_config(ROOT / "configs/recomb.yaml")
+    sc = s0.s0cfg(cfg)
+    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (3e-4, 0.03, 8, "last")
+    assert sc["val_n_samples"] == 256 and sc["val_resample"]
+    assert s0.CKPT == "final" and all(not k.startswith("best/") for k in s0.KEEP)
+    zc = zcfg(cfg)
+    assert zc["freeze_recomb_epochs"] == 0.5 and int(round(0.5 * 200)) == 100
+    assert (zc["retriever_lr"], zc["retriever_wd"], zc["recomb_lr"], zc["recomb_wd"]) == (1e-4, 0.03, 1e-5, 0.01)
+    assert cfg["recomb_exp"]["retrain_all"] is False
+    src = (ROOT / "src/run_zrecomb.py").read_text(encoding="utf-8")
+    assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
 
 
 print()

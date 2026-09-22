@@ -12,8 +12,8 @@ bằng Z' = F(Z | Recomb). Vòng lặp dưới đây vì thế chép lại từn
                  nhánh có AdamW RIÊNG với lr CỐ ĐỊNH:
                      Retriever ("Main")  1e-4 · wd 0.03
                      Recomb ("Pretrain") 1e-5 · wd 0.01 — đóng băng hoàn toàn
-                                          trong `freeze_recomb_epochs` (1) epoch
-                                          đầu = CẢ main stage (1 epoch);
+                                          trong `freeze_recomb_epochs` (0.5) epoch
+                                          đầu = 100/200 bước, rồi mới học;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh. Clip chung
                  thì chuẩn gradient của Retriever kéo nhỏ bước cập nhật LoRA —
                  một khác biệt thứ hai so với A.
@@ -58,7 +58,7 @@ def zcfg(cfg: Cfg) -> dict:
            "retriever_wd": float(m.get("retriever_wd", 0.03)),
            "recomb_lr": float(m.get("recomb_lr", 1e-5)),
            "recomb_wd": float(m.get("recomb_wd", 0.01)),
-           "freeze_recomb_epochs": int(m.get("freeze_recomb_epochs", 1)),
+           "freeze_recomb_epochs": float(m.get("freeze_recomb_epochs", 0.5)),
            "separate_clip": bool(m.get("separate_clip", True))}
     return out
 
@@ -170,7 +170,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         branch = Z.ZRecombBranch(spec)
         pre = Z.load_stage0_into(branch, stage0_best)
     branch = branch.to(dev)                               # fp32, forward dưới autocast
-    frozen_until = int(zc["freeze_recomb_epochs"])
+    frozen_until = float(zc["freeze_recomb_epochs"])
     branch.set_recomb_frozen(frozen_until > 0)
     nb = branch.n_params()
     print(f"  nhánh: {branch.describe()}", flush=True)
@@ -178,7 +178,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
           f"{pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
           f"{pre['dropped']}) · Retriever {nb['retriever']:,} · Recomb "
           f"{'ĐÓNG BĂNG' if frozen_until > 0 else 'học'} "
-          f"{frozen_until} epoch đầu", flush=True)
+          f"{frozen_until:g} epoch đầu", flush=True)
 
     # ── dữ liệu: y như A ─────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
@@ -189,6 +189,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     steps_per_epoch = total_steps(n, bs, accum, 1)
     if max_steps_override:
         steps = int(max_steps_override)
+    unfreeze_step = int(round(frozen_until * steps_per_epoch))
+    will_unfreeze = frozen_until > 0 and unfreeze_step < steps
 
     # ── optimizer ────────────────────────────────────────────────────────
     lora = [p for p in model.parameters() if p.requires_grad]
@@ -210,7 +212,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
           f"Retriever CỐ ĐỊNH {zc['retriever_lr']:g} wd {zc['retriever_wd']} · "
           f"Recomb CỐ ĐỊNH {zc['recomb_lr']:g} wd {zc['recomb_wd']} (sau "
-          f"{frozen_until} epoch) · clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}",
+          f"{frozen_until:g} epoch) · clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}",
           flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
@@ -221,12 +223,20 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
 
     def _probe(k: int) -> None:
-        model.train()
-        branch.train()
-        b = collate_cls([ds[i] for i in _heavy[:k]], pad_id, max_len)
-        b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
-        ce, _ = forward_ce(model, gemma, branch, b, dev)
-        ce.backward()
+        # Dò ở trạng thái NẶNG nhất sẽ gặp: nếu Recomb được mở băng giữa
+        # chừng thì activation của nó (4096 token) cũng phải vừa VRAM.
+        was = branch.recomb_frozen
+        if will_unfreeze:
+            branch.set_recomb_frozen(False)
+        try:
+            model.train()
+            branch.train()
+            b = collate_cls([ds[i] for i in _heavy[:k]], pad_id, max_len)
+            b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
+            ce, _ = forward_ce(model, gemma, branch, b, dev)
+            ce.backward()
+        finally:
+            branch.set_recomb_frozen(was)
 
     ab_cfg = _C(dict(cfg, autobatch=dict(cfg.get("autobatch") or {}, enabled=True)))
     chunk, ab_rep = autobatch.autotune(ab_cfg, f"{aid}/chunk", bs, bs, _probe,
@@ -364,7 +374,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     unfrozen_at = None
     for step in range(steps):
         if (branch.recomb_frozen and frozen_until > 0
-                and step >= frozen_until * steps_per_epoch):
+                and step >= unfreeze_step):
             branch.set_recomb_frozen(False)
             branch.train()
             unfrozen_at = step

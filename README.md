@@ -38,11 +38,12 @@ autocast bf16.
 **Stage 0: pretrain Recomb** (`src/stage0_zrecomb.py`). Chỉ vision tower của
 Gemma chạy (đóng băng); không có decoder, không có LoRA.
 
-* AdamW, lr **cố định 1e-4**, wd 0.03, **tối đa 5 epoch**, batch 32 (micro do autobatch chọn).
-* Val: sau mỗi epoch trên 256 mẫu bốc lại từ hồ val 2000 (chỉ số từ seed + epoch); giữ epoch có
-  **sqrt(F1 · Recall)** lớn nhất. F1/Recall là macro trên 14 bệnh lý × lớp
+* AdamW, lr **cố định 3e-4**, wd 0.03, **8 epoch**, batch 32 (micro do autobatch chọn).
+  **Luôn lấy epoch cuối** (`stage0.select: last`), lưu ở `_stage0/final/`.
+* Val (chỉ theo dõi): sau mỗi epoch trên **256 mẫu bốc lại** từ hồ val 2000 (chỉ số
+  từ seed + epoch): ASL, F1, Recall, sqrt(F1 · Recall), macro trên 14 bệnh lý × lớp
   {pos, uncertain}, dự đoán = argmax 3 lớp.
-* Loss: **ASL** one-hot 3 nhãn, γ_neg = **neg 2.0 · uncertain 3.0 · pos 0.0**
+* Loss: **ASL** one-hot 3 nhãn, γ_neg = **neg 4.0 · uncertain 1.0 · pos 0.0**
   (khai theo tên lớp), γ_pos 0, **p_clip 0.05**.
 * Nhãn lấy từ `csv_helper/labels.npz`, mảng `y_gt`, key `img_rel`. Mã trong
   `y_gt` là chỉ số của `class_names`: **0 = positive, 1 = negative,
@@ -55,9 +56,9 @@ $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt đã khoá
 200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo val (CE trên 256 mẫu
 bốc lại mỗi 25 bước). Phần thêm:
 
-* Cls Head **bị bỏ**. Recomb nạp từ Stage 0 và **đóng băng hoàn toàn trong epoch
-  đầu**. Main stage chỉ có 1 epoch, nên Recomb đóng băng suốt main stage. Nếu mở
-  băng sau đó thì lr cố định 1e-5, wd 0.01.
+* Cls Head **bị bỏ**. Recomb nạp từ Stage 0 và **đóng băng hoàn toàn trong 0.5 epoch
+  đầu** (100/200 bước), sau đó học ở lr cố định 1e-5, wd 0.01. Autobatch dò VRAM ở
+  trạng thái đã mở băng (nặng nhất).
 * Retriever ("Main"): AdamW riêng, lr **cố định 1e-4**, wd 0.03.
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
@@ -112,6 +113,8 @@ Weight của A không được tải, vì A không sinh lại.
 (`_stage0/last/state.pt`); B có weight thì bỏ qua train; sinh thiếu thì sinh tiếp.
 Các cờ:
 
+* `--retrain-all` (hoặc `recomb_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
+  — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
 * `--restage0`: pretrain lại, kéo theo `--retrain`.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
@@ -122,7 +125,7 @@ Các cờ:
 ```
 adapters_recomb/_fixture/                   = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_recomb/_stage0/                    PRETRAIN — để về sau đối chứng SoTA
-    best/zrecomb_stage0.safetensors|.json   Recomb + Cls Head, epoch tốt nhất
+    final/zrecomb_stage0.safetensors|.json  Recomb + Cls Head, epoch CUỐI (select: last)
     loader.json                             fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
                                             batch/micro, lịch, ASL, spec, vân tay, sha256 weight
     stage0_labels.npz                       nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
@@ -141,7 +144,7 @@ Trên Hub (`RGExp123/Research_results`):
 ```
 current/$2_Recombiner_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
 current/$2_Recombiner_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
-current/$2_Recombiner_Test/stage0/                  best/, loader.json, stage0_labels.npz, stage0_history.json
+current/$2_Recombiner_Test/stage0/                  final/, loader.json, stage0_labels.npz, stage0_history.json
 current/$2_Recombiner_Test/weights/qlora_r32_decoder_recomb/
 ```
 

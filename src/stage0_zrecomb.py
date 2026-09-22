@@ -3,19 +3,18 @@
     X = SigLIP(ảnh) (đóng băng, no_grad) ─► Recomb ─► Cls Head ─► ASL (14 × 3)
 
 Lịch (khối `stage0` của configs/recomb.yaml):
-  * AdamW, lr CỐ ĐỊNH 1e-4 (không warm-up, không decay), weight_decay 0.03;
-  * tối đa 5 epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
+  * AdamW, lr CỐ ĐỊNH 3e-4 (không warm-up, không decay), weight_decay 0.03;
+  * 8 epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
+  * LUÔN lấy epoch CUỐI (`stage0.select: last`) — val chỉ để theo dõi;
   * sau MỖI epoch đo trên 256 mẫu bốc lại từ hồ val 2000 (`stage0.val_n_samples`,
-    chỉ số từ (seed, epoch) — tái lập được) và giữ epoch có
-        score = sqrt(F1_macro · Recall_macro)
-    lớn nhất — macro trên (14 bệnh lý × lớp ∈ {pos, uncertain}), dự đoán =
-    argmax 3 lớp. F1 cao, Recall được ưu tiên hơn (nó xuất hiện trong cả hai
-    thừa số của tích);
-  * ASL one-hot 3 lớp: γ_neg theo tên lớp neg 2.0 · uncertain 3.0 · pos 0.0,
+    chỉ số từ (seed, epoch) — tái lập được): ASL, F1, Recall, sqrt(F1·Recall)
+    macro trên (14 bệnh lý × lớp ∈ {pos, uncertain}) — ghi lại, không chọn
+    epoch (trừ khi `select: best`);
+  * ASL one-hot 3 lớp: γ_neg theo tên lớp neg 4.0 · uncertain 1.0 · pos 0.0,
     γ_pos 0, clip 0.05.
 
 Chỉ vision tower của Gemma chạy (không decoder, không LoRA) -> mỗi epoch rẻ
-hơn main stage nhiều. Checkpoint tốt nhất ở `<adapter_dir>/_stage0/best/`,
+hơn main stage nhiều. Checkpoint đem sang main stage ở `<adapter_dir>/_stage0/final/` (select: last = epoch cuối),
 trạng thái để CHẠY TIẾP ở `<adapter_dir>/_stage0/last/state.pt` (không đẩy Hub).
 """
 from __future__ import annotations
@@ -40,7 +39,8 @@ LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy 
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
 # dùng lại Recomb đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
-KEEP = ("best/zrecomb_stage0.safetensors", "best/zrecomb_stage0.json", HISTORY,
+CKPT = "final"                        # checkpoint Stage 0 đem sang main stage
+KEEP = (f"{CKPT}/zrecomb_stage0.safetensors", f"{CKPT}/zrecomb_stage0.json", HISTORY,
         LOADER, LABELS)
 
 
@@ -57,6 +57,8 @@ def s0cfg(cfg: Cfg) -> dict:
            "micro_batch": int(s.get("micro_batch", 8) or 8),
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
            "val_classes": list(s.get("val_classes") or ["pos", "uncertain"]),
+           # epoch đem sang main stage: last (luôn lấy epoch cuối) | best (theo val)
+           "select": str(s.get("select", "last")).lower(),
            # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ), bốc lại mỗi epoch
            "val_n_samples": int(s.get("val_n_samples", 256) or 0),
            "val_resample": bool(s.get("val_resample", True)),
@@ -72,7 +74,7 @@ def finished(cfg: Cfg) -> dict | None:
     """Stage 0 đã chạy XONG với ĐÚNG cấu hình hiện tại? -> history, hoặc None."""
     d = stage0_dir(cfg)
     p = d / HISTORY
-    if not (p.exists() and Z.stage0_exists(d / "best")):
+    if not (p.exists() and Z.stage0_exists(d / CKPT)):
         return None
     h = json.loads(p.read_text(encoding="utf-8"))
     if not h.get("finished"):
@@ -177,8 +179,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not restart:
         h = finished(cfg)
         if h is not None:
-            print(f"  ✓ Stage 0 đã xong: epoch tốt nhất {h['best_epoch']} · score "
-                  f"{h['best_score']:.4f} ({d / 'best'})", flush=True)
+            print(f"  ✓ Stage 0 đã xong: dùng epoch {h['best_epoch']} · score "
+                  f"{h['best_score']:.4f} ({d / CKPT})", flush=True)
             return h
     seed = int(cfg.get("seed", 42))
     seed_everything(seed)
@@ -363,17 +365,18 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                "n_val": ev["n_val"],
                "minutes": round((time.time() - t_ep) / 60, 2)}
         history.append(rec)
-        better = ev["score"] > best["score"]
+        better = (ep == sc["max_epochs"] or (max_steps is not None)) \
+            if sc["select"] == "last" else ev["score"] > best["score"]
         print(f"  [stage0] epoch {ep}: val ASL {ev['asl']:.4f} · F1 {ev['f1_macro']:.4f}"
               f" · Recall {ev['recall_macro']:.4f} · sqrt(F1·R) {ev['score']:.4f}"
-              f"{'  ★ tốt nhất' if better else ''}", flush=True)
+              f"{'  ★ dùng' if better else ''}", flush=True)
         if tracker is not None:
             tracker.log({"stage0/val_asl": ev["asl"], "stage0/val_f1": ev["f1_macro"],
                          "stage0/val_recall": ev["recall_macro"],
                          "stage0/val_score": ev["score"], "stage0/epoch": ep})
         if better:
             best = {"epoch": ep, "score": ev["score"]}
-            Z.save_stage0(block, d / "best", {
+            Z.save_stage0(block, d / CKPT, {"select": sc["select"],
                 "best_epoch": ep, "best_score": ev["score"], "val": ev,
                 "config_fingerprint": config_fingerprint(cfg)})
         last.parent.mkdir(parents=True, exist_ok=True)
@@ -385,7 +388,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     pf_tr.close()
     pf_va.close()
-    out = {"finished": True, "best_epoch": best["epoch"], "best_score": best["score"],
+    if best["epoch"] is None:          # select=last mà vòng dừng sớm: lấy epoch cuối đã chạy
+        best = {"epoch": history[-1]["epoch"], "score": history[-1]["val_score"]}
+        Z.save_stage0(block, d / CKPT, {"select": sc["select"], "best_epoch": best["epoch"],
+                                        "best_score": best["score"],
+                                        "config_fingerprint": config_fingerprint(cfg)})
+    out = {"finished": True, "select": sc["select"],
+           "best_epoch": best["epoch"], "best_score": best["score"],
            "history": history, "stage0": {k: v for k, v in sc.items()},
            "micro_batch": micro, "autobatch": ab_rep,
            "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
@@ -403,8 +412,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                  steps_per_epoch, spec, best)
     block = opt = model = gemma = None  # nhả VRAM trước free_vram
     free_vram()
-    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · chọn epoch {best['epoch']} "
-          f"(sqrt(F1·R) = {best['score']:.4f}) -> {d / 'best'}", flush=True)
+    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · dùng epoch {best['epoch']} ({sc['select']}) "
+          f"(sqrt(F1·R) = {best['score']:.4f}) -> {d / CKPT}", flush=True)
     return out
 
 
