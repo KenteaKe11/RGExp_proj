@@ -224,28 +224,39 @@ def pull_stage0(cfg: Cfg) -> bool:
         print(f"  ⚠ không đọc được Hub ({e!r}) — Stage 0 sẽ chạy cục bộ", flush=True)
         return False
     base = hub_base(cfg)
-    if api is None or any(f"{base}/stage0/{r}" not in remote for r in s0.KEEP):
+    have = [r for r in s0.KEEP if f"{base}/stage0/{r}" in remote]
+    if api is None or s0.HISTORY not in have:
         return False
     d = s0.stage0_dir(cfg)
     tmp = d.with_name(d.name + ".hub")
-    for r in s0.KEEP:
+    for r in have:
         _download(api, repo_id, repo_type, f"{base}/stage0/{r}", tmp / r)
     h = json.loads((tmp / s0.HISTORY).read_text(encoding="utf-8"))
-    if h.get("config_fingerprint") != s0.config_fingerprint(cfg):
+    full = h.get("finished") and h.get("config_fingerprint") == s0.config_fingerprint(cfg)
+    base_ok = h.get("base_finished") and h.get("base_fingerprint") == s0.base_fingerprint(cfg)
+    if not (full or base_ok):
         print("  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng", flush=True)
         shutil.rmtree(tmp, ignore_errors=True)
         return False
+    keep = have if full else [r for r in have if not r.startswith(s0.CKPT + "/")]
+    if not full:
+        # chỉ base khớp (vd. đổi lịch anneal): giữ base, epoch n+1 sẽ chạy lại
+        h = dict(h, finished=False)
+        (tmp / s0.HISTORY).write_text(json.dumps(h, indent=2, ensure_ascii=False),
+                                      encoding="utf-8")
     d.mkdir(parents=True, exist_ok=True)
-    for r in s0.KEEP:
+    for r in keep:
         (d / r).parent.mkdir(parents=True, exist_ok=True)
         (tmp / r).replace(d / r)
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"  ↓ Stage 0 từ Hub {base}/stage0 (epoch {h.get('best_epoch')}, "
-          f"sqrt(F1·R) {h.get('best_score')})", flush=True)
+    print(f"  ↓ Stage 0 từ Hub {base}/stage0: "
+          + (f"final (epoch {h.get('best_epoch')})" if full
+             else f"chỉ base ({h.get('base_epoch')} epoch) — sẽ chạy epoch n+1"),
+          flush=True)
     return True
 
 
-def push_stage0(cfg: Cfg, run_dir: Path) -> None:
+def push_stage0(cfg: Cfg, run_dir: Path, tag: str = "Stage 0") -> None:
     """Đẩy NGAY Stage 0 (weight + loader + nhãn + history) và fixture lên Hub —
     không đợi main stage. Hỏng -> cảnh báo, `push` sau."""
     o = cfg["output"]
@@ -255,7 +266,7 @@ def push_stage0(cfg: Cfg, run_dir: Path) -> None:
 
     try:
         push_results(cfg, run_dir, arms=[], results_only={"stage0/stage0_history.json"},
-                     message_tag="Stage 0")
+                     message_tag=tag)
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ đẩy Stage 0 hỏng ({e!r}) — file vẫn trên đĩa; chạy `push` sau",
               flush=True)
@@ -487,8 +498,17 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         ran_stage0 = s0.finished(cfg) is None or a.restage0
         _hr("Stage 0 — pretrain Recomb + Cls Head (ASL)")
         try:
+            def _base_done() -> None:
+                # 8 epoch xong -> đẩy base/ + history + loader NGAY, trước epoch n+1
+                if a.dry_run:
+                    return
+                (run_dir / "stage0").mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(s0dir / s0.HISTORY, run_dir / "stage0" / s0.HISTORY)
+                push_stage0(cfg, run_dir, "Stage 0 base")
+
             h = s0.run(cfg, train_df, val_df, tracker,
-                       max_steps=2 if a.dry_run else None, restart=a.restage0)
+                       max_steps=2 if a.dry_run else None, restart=a.restage0,
+                       on_base_done=_base_done)
         except TrainUnusable as e:
             print(f"\n✗ Stage 0 hỏng: {e}", flush=True)
             tracker.finish(1)
@@ -501,7 +521,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         (run_dir / "stage0").mkdir(parents=True, exist_ok=True)
         shutil.copyfile(hist, run_dir / "stage0" / s0.HISTORY)
         if ran_stage0 and not a.dry_run:
-            push_stage0(cfg, run_dir)
+            push_stage0(cfg, run_dir, "Stage 0 final")
 
     # ── main stage B ──────────────────────────────────────────────────────
     if need_train:

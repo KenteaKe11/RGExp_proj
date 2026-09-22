@@ -39,8 +39,10 @@ LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy 
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
 # dùng lại Recomb đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
-CKPT = "final"                        # checkpoint Stage 0 đem sang main stage
-KEEP = (f"{CKPT}/zrecomb_stage0.safetensors", f"{CKPT}/zrecomb_stage0.json", HISTORY,
+BASE = "base"                         # sau `max_epochs` (8) epoch lr cố định — đẩy Hub ngay
+CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
+KEEP = (f"{BASE}/zrecomb_stage0.safetensors", f"{BASE}/zrecomb_stage0.json",
+        f"{CKPT}/zrecomb_stage0.safetensors", f"{CKPT}/zrecomb_stage0.json", HISTORY,
         LOADER, LABELS)
 
 
@@ -62,12 +64,46 @@ def s0cfg(cfg: Cfg) -> dict:
            # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ), bốc lại mỗi epoch
            "val_n_samples": int(s.get("val_n_samples", 256) or 0),
            "val_resample": bool(s.get("val_resample", True)),
-           "asl": dict(s.get("asl") or {})}
+           "asl": dict(s.get("asl") or {}),
+           "final_anneal": anneal_cfg(s)}
     Z.asl_gammas(out["asl"])            # kiểm sớm
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
         raise TrainUnusable(f"stage0.micro_batch {out['micro_batch']} không chia "
                             f"hết stage0.batch_size {out['batch_size']}")
     return out
+
+
+def anneal_cfg(s: dict) -> dict:
+    """`stage0.final_anneal`: epoch n+1 (sau `max_epochs`) -> checkpoint `final/`.
+
+    Optimizer MỚI (không mang trạng thái/lịch sử scheduler của 8 epoch trước),
+    lr cosine từ `lr_start` xuống `lr_end` trong `epochs` epoch, cập nhật mỗi bước.
+    """
+    a = dict(s.get("final_anneal") or {})
+    out = {"enabled": bool(a.get("enabled", True)),
+           "epochs": int(a.get("epochs", 1)),
+           "lr_start": float(a.get("lr_start", 3e-5)),
+           "lr_end": float(a.get("lr_end", 1e-8)),
+           "schedule": str(a.get("schedule", "cosine")).lower(),
+           "weight_decay": float(a.get("weight_decay", s.get("weight_decay", 0.03))),
+           "reset_optimizer": bool(a.get("reset_optimizer", True))}
+    if out["schedule"] != "cosine":
+        raise TrainUnusable("stage0.final_anneal.schedule chỉ nhận `cosine`.")
+    if not (out["lr_start"] > out["lr_end"] >= 0) or out["epochs"] < 1:
+        raise TrainUnusable(f"stage0.final_anneal không hợp lệ: {out}")
+    return out
+
+
+def base_finished(cfg: Cfg) -> dict | None:
+    """Phần `max_epochs` epoch (base/) đã xong với đúng cấu hình? -> history hoặc None."""
+    d = stage0_dir(cfg)
+    p = d / HISTORY
+    if not (p.exists() and Z.stage0_exists(d / BASE)):
+        return None
+    h = json.loads(p.read_text(encoding="utf-8"))
+    if not h.get("base_finished") or h.get("base_fingerprint") != base_fingerprint(cfg):
+        return None
+    return h
 
 
 def finished(cfg: Cfg) -> dict | None:
@@ -80,15 +116,29 @@ def finished(cfg: Cfg) -> dict | None:
     if not h.get("finished"):
         return None
     if h.get("config_fingerprint") != config_fingerprint(cfg):
-        print(f"  ⚠ Stage 0 ở {d} chạy với cấu hình KHÁC (khối stage0/zrecomb) — "
-              f"cần chạy lại: `--restage0`", flush=True)
+        if h.get("base_fingerprint") == base_fingerprint(cfg):
+            print(f"  ⚙ Stage 0 ở {d}: base/ còn khớp, chỉ `final_anneal` đổi — chạy "
+                  f"lại epoch n+1", flush=True)
+        else:
+            print(f"  ⚠ Stage 0 ở {d} chạy với cấu hình KHÁC (khối stage0/zrecomb) — "
+                  f"cần chạy lại: `--restage0`", flush=True)
         return None
     return h
 
 
 def config_fingerprint(cfg: Cfg) -> str:
-    """Vân tay những gì quyết định Stage 0: khối stage0 (trừ micro_batch) + zrecomb + seed."""
+    """Vân tay của CẢ Stage 0 (base + anneal): khối stage0 (trừ micro_batch) + zrecomb + seed."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items() if k != "micro_batch"}
+    return Z.spec_fingerprint({"stage0": s, "zrecomb": dict(cfg.get("zrecomb") or {}),
+                               "seed": int(cfg.get("seed", 42)),
+                               "labels": dict(cfg.get("labels") or {})})
+
+
+def base_fingerprint(cfg: Cfg) -> str:
+    """Vân tay của phần base (8 epoch): như trên nhưng KHÔNG gồm `final_anneal` —
+    đổi lịch anneal thì chỉ chạy lại epoch n+1, không chạy lại 8 epoch."""
+    s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
+         if k not in ("micro_batch", "final_anneal")}
     return Z.spec_fingerprint({"stage0": s, "zrecomb": dict(cfg.get("zrecomb") or {}),
                                "seed": int(cfg.get("seed", 42)),
                                "labels": dict(cfg.get("labels") or {})})
@@ -169,7 +219,8 @@ def labels_for(cfg: Cfg, df: pd.DataFrame, lut: dict, n_labels: int, name: str):
 
 # ── chạy ───────────────────────────────────────────────────────────────────
 def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
-        max_steps: int | None = None, restart: bool = False) -> dict:
+        max_steps: int | None = None, restart: bool = False,
+        on_base_done=None) -> dict:
     """Chạy (hoặc chạy tiếp) Stage 0. -> history (có `best_epoch`, `best_score`)."""
     import torch
 
@@ -218,11 +269,15 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
           f"{sum(p.numel() for p in block.recomb.parameters()):,} · Cls Head "
           f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
           f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn", flush=True)
-    print(f"  Stage 0: lr CỐ ĐỊNH {sc['lr']:g} · wd {sc['weight_decay']} · ≤ "
-          f"{sc['max_epochs']} epoch · batch {sc['batch_size']} · ASL γ_neg "
-          f"{dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} clip "
-          f"{sc['asl'].get('clip', 0.05)} · chọn epoch theo sqrt(F1·Recall) macro "
-          f"{sc['val_classes']}", flush=True)
+    fa = sc["final_anneal"]
+    print(f"  Stage 0: lr CỐ ĐỊNH {sc['lr']:g} · wd {sc['weight_decay']} · "
+          f"{sc['max_epochs']} epoch ({sc['select']}) -> {BASE}/ · batch {sc['batch_size']}"
+          f" · ASL γ_neg {dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} "
+          f"clip {sc['asl'].get('clip', 0.05)} · val {sc['val_n_samples']} mẫu", flush=True)
+    if fa["enabled"]:
+        print(f"  Stage 0 · epoch n+1: optimizer MỚI, cosine {fa['lr_start']:g} -> "
+              f"{fa['lr_end']:g} trong {fa['epochs']} epoch · wd {fa['weight_decay']} "
+              f"-> {CKPT}/ (main stage dùng bản này)", flush=True)
 
     def vis_of(pv):
         with torch.no_grad():
@@ -258,18 +313,30 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     last = d / "last" / "state.pt"
     if last.exists() and not restart:
         st = torch.load(last, map_location="cpu", weights_only=False)
-        if st.get("config_fingerprint") == config_fingerprint(cfg):
+        if st.get("base_fingerprint") == base_fingerprint(cfg):
             block.load_state_dict(st["block"])
             opt.load_state_dict(st["opt"])
             g.set_state(st["gen"])
             history = list(st["history"])
             best = dict(st["best"])
             start_epoch = int(st["epoch"]) + 1
-            print(f"  ⚙ Stage 0 chạy TIẾP từ epoch {start_epoch} (tốt nhất tới giờ: "
-                  f"epoch {best['epoch']} · {best['score']:.4f})", flush=True)
+            print(f"  ⚙ Stage 0 chạy TIẾP từ epoch {start_epoch} (đã lưu base: "
+                  f"epoch {best['epoch']})", flush=True)
 
     n = len(ds_tr)
     steps_per_epoch = math.ceil(n / bs_eff)
+    hb = None if restart else base_finished(cfg)
+    if hb is not None and start_epoch <= sc["max_epochs"]:
+        from safetensors.torch import load_file
+
+        block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
+        g = torch.Generator().manual_seed(seed)
+        for _ in range(sc["max_epochs"]):            # cùng Generator như lúc chạy base
+            torch.randperm(n, generator=g)
+        history = [h for h in hb.get("history", []) if h.get("phase", "base") == "base"]
+        best = {"epoch": hb.get("base_epoch"), "score": hb.get("base_score")}
+        start_epoch = sc["max_epochs"] + 1
+        print(f"  ⚙ base/ ({sc['max_epochs']} epoch) đã có — chỉ chạy epoch n+1", flush=True)
 
     # ── nạp ảnh trong luồng nền (PIL + processor 896 là việc CPU; dataset này
     # KHÔNG gọi tokenizer nên chạy nhiều luồng được). Thứ tự không đổi.
@@ -318,10 +385,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         r["n_val"] = len(vidx)
         return r
 
-    for ep in range(start_epoch, sc["max_epochs"] + 1):
+    def run_epoch(ep: int, opt_, sched_=None) -> float:
         block.train()
         order = torch.randperm(n, generator=g).tolist()
-        t_ep, run_loss = time.time(), 0.0
+        run_loss = 0.0
         n_steps = steps_per_epoch if max_steps is None else min(steps_per_epoch, max_steps)
         chunks = []                       # (bước, micro-batch) theo đúng thứ tự
         for step in range(n_steps):
@@ -349,50 +416,122 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                 step_loss += float(loss.detach()) * wgt
             if sc["max_grad_norm"] > 0:
                 torch.nn.utils.clip_grad_norm_(block.parameters(), sc["max_grad_norm"])
-            opt.step()
+            opt_.step()
+            if sched_ is not None:
+                sched_.step()
             run_loss += step_loss
             if (step + 1) % 20 == 0 or step == steps_per_epoch - 1:
+                lr_now = opt_.param_groups[0]["lr"]
                 print(f"    [stage0] epoch {ep} bước {step + 1}/{steps_per_epoch} · "
-                      f"ASL {step_loss:.4f}", flush=True)
+                      f"ASL {step_loss:.4f} · lr {lr_now:.2e}", flush=True)
                 if tracker is not None:
                     tracker.log({"stage0/asl": step_loss, "stage0/epoch": ep,
+                                 "stage0/lr": lr_now,
                                  "stage0/step": (ep - 1) * steps_per_epoch + step + 1})
+        return run_loss
+
+    def record(ep: int, run_loss: float, t_ep: float, phase: str) -> dict:
         ev = evaluate(ep)
         rec = {"epoch": ep, "train_asl": run_loss / max(1, steps_per_epoch),
                "val_asl": ev["asl"], "val_f1_macro": ev["f1_macro"],
                "val_recall_macro": ev["recall_macro"], "val_score": ev["score"],
                "val_per_class": ev["per_class"], "n_cells": ev["n_cells"],
-               "n_val": ev["n_val"],
+               "n_val": ev["n_val"], "phase": phase,
                "minutes": round((time.time() - t_ep) / 60, 2)}
         history.append(rec)
-        better = (ep == sc["max_epochs"] or (max_steps is not None)) \
-            if sc["select"] == "last" else ev["score"] > best["score"]
-        print(f"  [stage0] epoch {ep}: val ASL {ev['asl']:.4f} · F1 {ev['f1_macro']:.4f}"
-              f" · Recall {ev['recall_macro']:.4f} · sqrt(F1·R) {ev['score']:.4f}"
-              f"{'  ★ dùng' if better else ''}", flush=True)
+        print(f"  [stage0] epoch {ep} ({phase}): val ASL {ev['asl']:.4f} · F1 "
+              f"{ev['f1_macro']:.4f} · Recall {ev['recall_macro']:.4f} · sqrt(F1·R) "
+              f"{ev['score']:.4f}", flush=True)
         if tracker is not None:
             tracker.log({"stage0/val_asl": ev["asl"], "stage0/val_f1": ev["f1_macro"],
                          "stage0/val_recall": ev["recall_macro"],
                          "stage0/val_score": ev["score"], "stage0/epoch": ep})
+        return ev
+
+    for ep in range(start_epoch, sc["max_epochs"] + 1):
+        t_ep = time.time()
+        run_loss = run_epoch(ep, opt)
+        ev = record(ep, run_loss, t_ep, "base")
+        better = (ep == sc["max_epochs"] or (max_steps is not None)) \
+            if sc["select"] == "last" else ev["score"] > best["score"]
         if better:
             best = {"epoch": ep, "score": ev["score"]}
-            Z.save_stage0(block, d / CKPT, {"select": sc["select"],
+            Z.save_stage0(block, d / BASE, {"select": sc["select"], "phase": "base",
                 "best_epoch": ep, "best_score": ev["score"], "val": ev,
-                "config_fingerprint": config_fingerprint(cfg)})
+                "base_fingerprint": base_fingerprint(cfg)})
         last.parent.mkdir(parents=True, exist_ok=True)
         tmp = last.with_suffix(".tmp")
         torch.save({"block": block.state_dict(), "opt": opt.state_dict(),
                     "gen": g.get_state(), "history": history, "best": best,
-                    "epoch": ep, "config_fingerprint": config_fingerprint(cfg)}, tmp)
+                    "epoch": ep, "base_fingerprint": base_fingerprint(cfg)}, tmp)
         tmp.replace(last)
+
+    if best["epoch"] is None:          # select=last mà vòng dừng sớm: lấy epoch cuối đã chạy
+        best = {"epoch": history[-1]["epoch"], "score": history[-1]["val_score"]}
+        Z.save_stage0(block, d / BASE, {"select": sc["select"], "phase": "base",
+                                        "best_epoch": best["epoch"],
+                                        "best_score": best["score"],
+                                        "base_fingerprint": base_fingerprint(cfg)})
+    base = dict(best)
+
+    def summary(done: bool) -> dict:
+        o = {"finished": done, "base_finished": True, "select": sc["select"],
+             "base_epoch": base["epoch"], "base_score": base["score"],
+             "best_epoch": best["epoch"], "best_score": best["score"],
+             "history": history, "stage0": {k: v for k, v in sc.items()},
+             "micro_batch": micro, "autobatch": ab_rep,
+             "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
+             "label_stats": {"train": st_tr, "val": st_va,
+                             "class_frac": info.get("class_frac"),
+                             "label_names": info.get("label_names")},
+             "spec": spec, "base_fingerprint": base_fingerprint(cfg),
+             "config_fingerprint": config_fingerprint(cfg),
+             "minutes": round((time.time() - t0) / 60, 1),
+             "n_bad_images": ds_tr.n_bad + ds_va.n_bad}
+        if max_steps is not None:
+            o["dry_run"] = True
+        return o
+
+    # ── base xong: ghi history + loader rồi ĐẨY NGAY (không đợi epoch n+1) ──
+    if base_finished(cfg) is None or restart or hb is None:
+        (d / HISTORY).write_text(json.dumps(summary(False), indent=2, ensure_ascii=False,
+                                            default=str), encoding="utf-8")
+        write_loader(cfg, d, train_df, val_df, y_tr, m_tr, y_va, m_va, info, sc, micro,
+                     steps_per_epoch, spec, best)
+        print(f"  ✓ Stage 0 base: {sc['max_epochs']} epoch xong -> {d / BASE}", flush=True)
+        if on_base_done is not None:
+            on_base_done()
+
+    # ── epoch n+1: anneal cosine -> final/ ──────────────────────────────────
+    if fa["enabled"]:
+        ep_last = sc["max_epochs"]
+        if fa["reset_optimizer"]:
+            opt = torch.optim.AdamW(block.parameters(), lr=fa["lr_start"],
+                                    weight_decay=fa["weight_decay"], betas=(0.9, 0.999),
+                                    eps=1e-8)
+        else:
+            for grp in opt.param_groups:
+                grp["lr"], grp["weight_decay"] = fa["lr_start"], fa["weight_decay"]
+        n_st = steps_per_epoch if max_steps is None else min(steps_per_epoch, max_steps)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, n_st * fa["epochs"]), eta_min=fa["lr_end"])
+        for k in range(1, fa["epochs"] + 1):
+            ep = ep_last + k
+            t_ep = time.time()
+            run_loss = run_epoch(ep, opt, sched)
+            ev = record(ep, run_loss, t_ep, "anneal")
+        best = {"epoch": ep, "score": ev["score"]}
+        Z.save_stage0(block, d / CKPT, {
+            "phase": "anneal", "best_epoch": ep, "best_score": ev["score"], "val": ev,
+            "from": f"{BASE}/ (epoch {base['epoch']})", "anneal": fa,
+            "config_fingerprint": config_fingerprint(cfg)})
+    else:
+        Z.save_stage0(block, d / CKPT, {
+            "phase": "base", "best_epoch": base["epoch"], "best_score": base["score"],
+            "config_fingerprint": config_fingerprint(cfg)})
 
     pf_tr.close()
     pf_va.close()
-    if best["epoch"] is None:          # select=last mà vòng dừng sớm: lấy epoch cuối đã chạy
-        best = {"epoch": history[-1]["epoch"], "score": history[-1]["val_score"]}
-        Z.save_stage0(block, d / CKPT, {"select": sc["select"], "best_epoch": best["epoch"],
-                                        "best_score": best["score"],
-                                        "config_fingerprint": config_fingerprint(cfg)})
     out = {"finished": True, "select": sc["select"],
            "best_epoch": best["epoch"], "best_score": best["score"],
            "history": history, "stage0": {k: v for k, v in sc.items()},
@@ -402,6 +541,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                            "class_frac": info.get("class_frac"),
                            "label_names": info.get("label_names")},
            "spec": spec, "config_fingerprint": config_fingerprint(cfg),
+           "base_finished": True, "base_epoch": base["epoch"], "base_score": base["score"],
+           "base_fingerprint": base_fingerprint(cfg), "final_anneal": fa,
            "minutes": round((time.time() - t0) / 60, 1),
            "n_bad_images": ds_tr.n_bad + ds_va.n_bad}
     if max_steps is not None:
@@ -412,7 +553,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                  steps_per_epoch, spec, best)
     block = opt = model = gemma = None  # nhả VRAM trước free_vram
     free_vram()
-    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · dùng epoch {best['epoch']} ({sc['select']}) "
+    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · final = epoch {best['epoch']} "
           f"(sqrt(F1·R) = {best['score']:.4f}) -> {d / CKPT}", flush=True)
     return out
 

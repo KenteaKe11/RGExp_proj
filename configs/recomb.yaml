@@ -324,6 +324,18 @@ stage0:
   weight_decay: 0.03
   max_epochs: 8
   select: last              # LUÔN lấy epoch cuối (best = theo val)
+  # ── epoch n+1 (= 9): "final weight" ─────────────────────────────────────
+  # Sau `max_epochs` epoch, base/ được ĐẨY Hub ngay. Rồi chạy thêm `epochs`
+  # epoch với optimizer MỚI (không mang lịch sử scheduler/Adam trước đó), lr
+  # cosine lr_start -> lr_end cập nhật mỗi bước -> final/. Main stage dùng final/.
+  final_anneal:
+    enabled: true
+    epochs: 1
+    lr_start: 3.0e-5
+    lr_end: 1.0e-8
+    schedule: cosine
+    weight_decay: 0.03
+    reset_optimizer: true
   batch_size: 32            # batch hiệu dụng; mảnh mỗi lượt (`stage0.micro_batch`)
                             # ở config GPU, autobatch dò lại
   max_grad_norm: 1.0

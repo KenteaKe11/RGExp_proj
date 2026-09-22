@@ -106,10 +106,12 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                  f"{s0.get('stage0', {}).get('asl', {}).get('clip')} · epoch dùng: "
                  f"{s0.get('select', 'last')} · val {s0.get('stage0', {}).get('val_n_samples')} "
                  f"mẫu bốc lại, sqrt(F1·Recall) macro {s0.get('stage0', {}).get('val_classes')}\n")
-        L.append(_tbl(["epoch", "train ASL", "val ASL", "F1 macro", "Recall macro",
+        L.append(_tbl(["epoch", "pha", "train ASL", "val ASL", "F1 macro", "Recall macro",
                        "sqrt(F1·R)", "phút"],
                       [[("**" + str(h["epoch"]) + "** ★") if h["epoch"] == s0.get("best_epoch")
-                        else str(h["epoch"]), _f(h["train_asl"]), _f(h["val_asl"]),
+                        else str(h["epoch"]),
+                        ("anneal (final)" if h.get("phase") == "anneal" else "lr cố định"),
+                        _f(h["train_asl"]), _f(h["val_asl"]),
                         _f(h["val_f1_macro"]), _f(h["val_recall_macro"]),
                         _f(h["val_score"]), _f(h.get("minutes"), 1)]
                        for h in s0["history"]]))

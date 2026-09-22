@@ -39,7 +39,11 @@ autocast bf16.
 Gemma chạy (đóng băng); không có decoder, không có LoRA.
 
 * AdamW, lr **cố định 3e-4**, wd 0.03, **8 epoch**, batch 32 (micro do autobatch chọn).
-  **Luôn lấy epoch cuối** (`stage0.select: last`), lưu ở `_stage0/final/`.
+  Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 8 epoch xong.
+* **Epoch n+1 = 9 — final weight** (`stage0.final_anneal`): optimizer **mới** (không mang
+  lịch sử scheduler/Adam của 8 epoch), lr **cosine 3e-5 → 1e-8** cập nhật mỗi bước trong
+  1 epoch, bắt đầu từ `base/` -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.**
+  Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 9 (base giữ nguyên, có vân tay riêng).
 * Val (chỉ theo dõi): sau mỗi epoch trên **256 mẫu bốc lại** từ hồ val 2000 (chỉ số
   từ seed + epoch): ASL, F1, Recall, sqrt(F1 · Recall), macro trên 14 bệnh lý × lớp
   {pos, uncertain}, dự đoán = argmax 3 lớp.
@@ -125,7 +129,8 @@ Các cờ:
 ```
 adapters_recomb/_fixture/                   = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_recomb/_stage0/                    PRETRAIN — để về sau đối chứng SoTA
-    final/zrecomb_stage0.safetensors|.json  Recomb + Cls Head, epoch CUỐI (select: last)
+    base/zrecomb_stage0.safetensors|.json   Recomb + Cls Head sau 8 epoch lr cố định
+    final/zrecomb_stage0.safetensors|.json  sau epoch 9 (cosine 3e-5 → 1e-8) — main stage dùng bản này
     loader.json                             fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
                                             batch/micro, lịch, ASL, spec, vân tay, sha256 weight
     stage0_labels.npz                       nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
@@ -144,7 +149,7 @@ Trên Hub (`RGExp123/Research_results`):
 ```
 current/$2_Recombiner_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
 current/$2_Recombiner_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
-current/$2_Recombiner_Test/stage0/                  final/, loader.json, stage0_labels.npz, stage0_history.json
+current/$2_Recombiner_Test/stage0/                  base/, final/, loader.json, stage0_labels.npz, stage0_history.json
 current/$2_Recombiner_Test/weights/qlora_r32_decoder_recomb/
 ```
 
@@ -152,7 +157,7 @@ Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
 Hai lần đẩy tự động trong lúc `train`:
 
-* Stage 0 được đẩy ngay khi xong, kèm fixture.
+* Stage 0: `base/` được đẩy ngay khi 8 epoch xong, `final/` được đẩy khi epoch 9 xong (kèm fixture).
 * B được đẩy riêng ngay khi sinh xong, và lại sau khi chấm xong.
 
 Trên máy mới, `train` kéo Stage 0 từ Hub nếu vân tay khớp, rồi kéo weight và kết
