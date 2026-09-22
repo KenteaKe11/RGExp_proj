@@ -5,7 +5,8 @@
 Lịch (khối `stage0` của configs/recomb.yaml):
   * AdamW, lr CỐ ĐỊNH 1e-4 (không warm-up, không decay), weight_decay 0.03;
   * tối đa 5 epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
-  * sau MỖI epoch đo trên TOÀN hồ val (2000 mẫu) và giữ epoch có
+  * sau MỖI epoch đo trên 256 mẫu bốc lại từ hồ val 2000 (`stage0.val_n_samples`,
+    chỉ số từ (seed, epoch) — tái lập được) và giữ epoch có
         score = sqrt(F1_macro · Recall_macro)
     lớn nhất — macro trên (14 bệnh lý × lớp ∈ {pos, uncertain}), dự đoán =
     argmax 3 lớp. F1 cao, Recall được ưu tiên hơn (nó xuất hiện trong cả hai
@@ -56,6 +57,9 @@ def s0cfg(cfg: Cfg) -> dict:
            "micro_batch": int(s.get("micro_batch", 8) or 8),
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
            "val_classes": list(s.get("val_classes") or ["pos", "uncertain"]),
+           # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ), bốc lại mỗi epoch
+           "val_n_samples": int(s.get("val_n_samples", 256) or 0),
+           "val_resample": bool(s.get("val_resample", True)),
            "asl": dict(s.get("asl") or {})}
     Z.asl_gammas(out["asl"])            # kiểm sớm
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
@@ -265,13 +269,42 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     n = len(ds_tr)
     steps_per_epoch = math.ceil(n / bs_eff)
 
+    # ── nạp ảnh trong luồng nền (PIL + processor 896 là việc CPU; dataset này
+    # KHÔNG gọi tokenizer nên chạy nhiều luồng được). Thứ tự không đổi.
+    from collections import deque
+
+    from .hw import io_workers
+    from .prefetch import OrderedPrefetcher
+
+    n_thr = max(1, min(16, io_workers(cfg)))
+    pf_tr = OrderedPrefetcher(ds_tr.__getitem__, n_thr, post=collate)
+    pf_va = OrderedPrefetcher(ds_va.__getitem__, n_thr, post=collate)
+    depth = 3
+
+    def stream(pf, chunks):
+        """Dựng trước `depth` micro-batch trong lúc GPU chạy micro-batch hiện tại."""
+        q, it = deque(), iter(chunks)
+        for c in it:
+            q.append(pf.submit(c))
+            if len(q) >= depth:
+                break
+        while q:
+            b = pf.result(q.popleft())
+            nxt = next(it, None)
+            if nxt is not None:
+                q.append(pf.submit(nxt))
+            yield b
+
+    from .train_recomb import val_indices
+
     @torch.no_grad()
-    def evaluate() -> dict:
+    def evaluate(ep: int) -> dict:
         block.eval()
         cnt = Z.ClsCounter(n_labels, sc["val_classes"])
         tot, w = 0.0, 0.0
-        for s in range(0, len(ds_va), micro):
-            b = collate([ds_va[i] for i in range(s, min(len(ds_va), s + micro))])
+        k_val = sc["val_n_samples"] or len(ds_va)
+        vidx = val_indices(seed, ep, len(ds_va), k_val, sc["val_resample"])
+        for b in stream(pf_va, [vidx[s:s + micro] for s in range(0, len(vidx), micro)]):
             loss, logits = loss_of(b)
             k = float(b["cls_mask"].sum())
             tot += float(loss) * k
@@ -280,22 +313,32 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         block.train()
         r = cnt.result()
         r["asl"] = tot / max(w, 1e-9)
+        r["n_val"] = len(vidx)
         return r
 
     for ep in range(start_epoch, sc["max_epochs"] + 1):
         block.train()
         order = torch.randperm(n, generator=g).tolist()
         t_ep, run_loss = time.time(), 0.0
-        for step in range(steps_per_epoch):
-            if max_steps is not None and step >= max_steps:
-                break
+        n_steps = steps_per_epoch if max_steps is None else min(steps_per_epoch, max_steps)
+        chunks = []                       # (bước, micro-batch) theo đúng thứ tự
+        for step in range(n_steps):
             idx = order[step * bs_eff:(step + 1) * bs_eff]
-            rows = [ds_tr[i] for i in idx]
-            n_lab = max(1.0, float(sum(float(r["cls_mask"]) for r in rows)))
+            chunks += [(step, idx[c:c + micro]) for c in range(0, len(idx), micro)]
+        mb = stream(pf_tr, [c for _, c in chunks])
+        n_lab_of = {}
+        for step, c in chunks:
+            n_lab_of[step] = n_lab_of.get(step, 0.0) + float(
+                sum(float(ds_tr.m[i]) for i in c))
+        per_step = {}
+        for step, _c in chunks:
+            per_step[step] = per_step.get(step, 0) + 1
+        for step in range(n_steps):
+            n_lab = max(1.0, n_lab_of[step])
             opt.zero_grad(set_to_none=True)
             step_loss = 0.0
-            for c in range(0, len(rows), micro):
-                b = collate(rows[c:c + micro])
+            for _ in range(per_step[step]):
+                b = next(mb)
                 loss, _ = loss_of(b)
                 # ASL là trung bình trên mẫu CÓ nhãn của micro-batch -> đổi về
                 # trung bình trên cả batch hiệu dụng (không phụ thuộc micro).
@@ -312,11 +355,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                 if tracker is not None:
                     tracker.log({"stage0/asl": step_loss, "stage0/epoch": ep,
                                  "stage0/step": (ep - 1) * steps_per_epoch + step + 1})
-        ev = evaluate()
+        ev = evaluate(ep)
         rec = {"epoch": ep, "train_asl": run_loss / max(1, steps_per_epoch),
                "val_asl": ev["asl"], "val_f1_macro": ev["f1_macro"],
                "val_recall_macro": ev["recall_macro"], "val_score": ev["score"],
                "val_per_class": ev["per_class"], "n_cells": ev["n_cells"],
+               "n_val": ev["n_val"],
                "minutes": round((time.time() - t_ep) / 60, 2)}
         history.append(rec)
         better = ev["score"] > best["score"]
@@ -339,6 +383,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                     "epoch": ep, "config_fingerprint": config_fingerprint(cfg)}, tmp)
         tmp.replace(last)
 
+    pf_tr.close()
+    pf_va.close()
     out = {"finished": True, "best_epoch": best["epoch"], "best_score": best["score"],
            "history": history, "stage0": {k: v for k, v in sc.items()},
            "micro_batch": micro, "autobatch": ab_rep,

@@ -39,7 +39,7 @@ autocast bf16.
 Gemma chạy (đóng băng); không có decoder, không có LoRA.
 
 * AdamW, lr **cố định 1e-4**, wd 0.03, **tối đa 5 epoch**, batch 32 (micro do autobatch chọn).
-* Val: sau mỗi epoch trên cả hồ val (2000 mẫu); giữ epoch có
+* Val: sau mỗi epoch trên 256 mẫu bốc lại từ hồ val 2000 (chỉ số từ seed + epoch); giữ epoch có
   **sqrt(F1 · Recall)** lớn nhất. F1/Recall là macro trên 14 bệnh lý × lớp
   {pos, uncertain}, dự đoán = argmax 3 lớp.
 * Loss: **ASL** one-hot 3 nhãn, γ_neg = **neg 2.0 · uncertain 3.0 · pos 0.0**
@@ -81,7 +81,7 @@ và BERTScore-F1 (metric chính).
 * Holm riêng từng họ trên các metric.
 * **Thắng** khi cả hai kiểm định bác H0 sau Holm **và** |Cohen dz| ≥ 0.10.
 
-REPORT.md ghi thêm: số ảnh B thắng/hoà/thua, Stage 0 từng epoch, và bảng main
+REPORT.md ghi thêm: đồ thị `figures/metrics_ab.png` (như $1 nhưng chỉ A và B, bar ngang: B3 · B4 · RL · BertF1 × e^(γ−1), nét đứt ở max, Δ và ★ khi khác biệt có ý nghĩa), số ảnh B thắng/hoà/thua, Stage 0 từng epoch, và bảng main
 stage của A và B.
 
 ## Chạy

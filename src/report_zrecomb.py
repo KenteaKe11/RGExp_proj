@@ -132,6 +132,20 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     ]))
     L.append("")
 
+    # ── đồ thị A vs B (bar ngang, như $1) ─────────────────────────────────
+    from . import report_plots_ab as rp
+
+    tab, fig_rel, err = None, None, None
+    try:
+        tab = rp.ab_table(scores, A, B, cfg, tests)
+        if tab is not None:
+            tab.to_csv(mdir / "metrics_ab.csv", index=False)
+            rp.plot_ab(tab, run_dir / "figures" / "metrics_ab.png")
+            fig_rel = "figures/metrics_ab.png"
+    except Exception as e:  # noqa: BLE001
+        err = repr(e)
+    L += rp.markdown_section(tab, fig_rel, err)
+
     L.append(f"## Kiểm định ghép cặp — {len(tests)} metric\n")
     L.append(f"d_i = điểm(B, ảnh i) − điểm(A, ảnh i). **Bootstrap ghép cặp** "
              f"({sc.get('n_boot')} lần, CI {sc.get('ci_method', 'bca').upper()} 95%, "

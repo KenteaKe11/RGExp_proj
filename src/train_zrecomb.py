@@ -323,9 +323,17 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         branch.eval()
         tot_ce, tot_tok, t_ev = 0.0, 0, time.time()
         try:
+            # Dựng trước `depth` batch (như A) — không submit rồi chờ ngay.
+            q, nx = deque(), 0
+            while nx < len(chunks) and len(q) < depth:
+                q.append(vpf.submit(chunks[nx]))
+                nx += 1
             with torch.no_grad():
-                for ch in chunks:
-                    b = vpf.result(vpf.submit(ch))
+                while q:
+                    b = vpf.result(q.popleft())
+                    if nx < len(chunks):
+                        q.append(vpf.submit(chunks[nx]))
+                        nx += 1
                     b = {k: (v.to(dev, non_blocking=pin) if hasattr(v, "to") else v)
                          for k, v in b.items()}
                     ce, _ = micro_ce(b, None)

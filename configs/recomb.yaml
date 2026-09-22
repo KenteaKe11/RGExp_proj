@@ -325,6 +325,8 @@ stage0:
   max_grad_norm: 1.0
   # chọn epoch theo sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
   val_classes: [pos, uncertain]
+  val_n_samples: 256        # mỗi epoch bốc 256 mẫu từ hồ val 2000 (0 = cả hồ)
+  val_resample: true        # bốc lại mỗi epoch; chỉ số từ (seed, epoch)
   asl:                      # ASL one-hot 3 lớp
     gamma_neg: {neg: 2.0, uncertain: 3.0, pos: 0.0}
     gamma_pos: 0.0
@@ -344,6 +346,13 @@ stats:
   ci_method: bca
   dz_floor: 0.10
   metrics: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1]
+
+# ── Đồ thị A vs B (`src/report_plots_ab.py`) — như $1 nhưng 2 candidate, bar NGANG ─
+report:
+  ab_plot:
+    metrics: [bleu3, bleu4, rougeL, bertscore_f1]   # B3 · B4 · RL · BertF1
+    gamma: auto               # xếp tầng: gốc × e^(γ−1); off = không scale
+    gamma_spread: 0.18
 
 wandb:
   enabled: true
