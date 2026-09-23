@@ -1002,17 +1002,30 @@ def _find_module(root, names: tuple[str, ...]):
     (Gemma3ForConditionalGeneration.vision_tower -> .model.vision_tower). Ghi
     cứng một đường dẫn là hỏng ở lần nâng cấp thư viện tiếp theo, với một
     AttributeError không nói gì về nguyên nhân.
+
+    Cây không phải một dây thẳng: phần chữ nằm ở nhánh RIÊNG
+    (`Gemma3ForConditionalGeneration.model.language_model.norm`), nên đi theo
+    duy nhất `.model` sẽ hụt `norm` / `layers`. Duyệt theo chiều rộng qua các
+    tên "vỏ" thường gặp, ưu tiên khớp ở tầng nông nhất.
     """
-    seen, cur = [], root
-    for _ in range(6):
-        for n in names:
-            if hasattr(cur, n):
-                return getattr(cur, n)
-        nxt = getattr(cur, "model", None) or getattr(cur, "base_model", None)
-        if nxt is None or nxt is cur:
-            break
+    HOPS = ("model", "base_model", "language_model", "text_model", "decoder",
+            "transformer", "vision_model")
+    seen: list[str] = []
+    queue, visited = [root], set()
+    while queue and len(seen) < 24:
+        cur = queue.pop(0)
+        if id(cur) in visited:
+            continue
+        visited.add(id(cur))
         seen.append(type(cur).__name__)
-        cur = nxt
+        for n in names:
+            m = getattr(cur, n, None)
+            if isinstance(m, nn.Module) or callable(m):   # loại tensor/str/None
+                return m
+        for h in HOPS:
+            nxt = getattr(cur, h, None)
+            if isinstance(nxt, nn.Module) and id(nxt) not in visited:
+                queue.append(nxt)
     raise AttributeError(
         f"không tìm thấy module {names} trong {type(root).__name__} "
         f"(đã đi qua {seen}). Bản transformers này đặt nó ở chỗ khác — sửa "

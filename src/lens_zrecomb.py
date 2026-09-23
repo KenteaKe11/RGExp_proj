@@ -239,10 +239,14 @@ def logit_lens(model, gemma, hidden_last: np.ndarray, k: int) -> list[dict]:
     dev = next(p for p in lm.parameters()).device
     dt = next(p for p in lm.parameters()).dtype
     out = []
+    last = len(hidden_last) - 1
     with torch.no_grad():
         for i, h in enumerate(hidden_last):
             v = torch.tensor(h, device=dev, dtype=dt).view(1, 1, -1)
-            lg = lm(norm(v)).float()[0, 0]
+            # HF đã chạy RMSNorm cuối TRƯỚC khi gắn hidden_state của lớp chót
+            # vào output, nên chuẩn hoá lần nữa là nhân trọng số hai lần và
+            # hàng cuối cùng sẽ lệch so với logits thật.
+            lg = lm(v if i == last else norm(v)).float()[0, 0]
             p = torch.softmax(lg, dim=-1)
             top = torch.topk(p, k)
             out.append({"layer": i + 1,

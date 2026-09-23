@@ -587,6 +587,7 @@ def _():
     from PIL import Image
 
     from src import lens_zrecomb as LZ
+    from src import recombiner
     from src import zrecomb as Z
     from src.config import load_config
 
@@ -601,16 +602,32 @@ def _():
         def forward(self, x):
             return self.fc(x).mean(1, keepdim=True).expand(1, NZ, DM)
 
+    class _Tower(nn.Module):
+        def forward(self, pixel_values=None):
+            return types.SimpleNamespace(
+                last_hidden_state=pixel_values.reshape(1, NV, DV).float())
+
+    class _Text(nn.Module):
+        """Khối chữ nằm ở NHÁNH riêng, đúng như Gemma3: .model.language_model."""
+
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.LayerNorm(DM)
+            self.layers = nn.ModuleList(nn.Linear(DM, DM) for _ in range(L))
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_tower = _Tower()
+            self.multi_modal_projector = _Proj()
+            self.language_model = _Text()
+
     class Fake(nn.Module):
         def __init__(self):
             super().__init__()
-            self.vision_tower = lambda pixel_values: types.SimpleNamespace(
-                last_hidden_state=pixel_values.reshape(1, NV, DV).float())
-            self.multi_modal_projector = _Proj()
+            self.model = _Inner()
             self.emb = nn.Embedding(V, DM)
             self.lm_head = nn.Linear(DM, V, bias=False)
-            self.norm = nn.LayerNorm(DM)
-            self.layers = nn.ModuleList(nn.Linear(DM, DM) for _ in range(L))
             self.config = types.SimpleNamespace(
                 image_token_index=IMG_TOK,
                 text_config=types.SimpleNamespace(hidden_size=DM))
@@ -623,14 +640,21 @@ def _():
 
         def forward(self, inputs_embeds=None, labels=None, output_hidden_states=False,
                     **_kw):
+            txt = self.model.language_model
             h, hs = inputs_embeds, [inputs_embeds]
-            for lay in self.layers:
+            for lay in txt.layers:
                 h = torch.tanh(lay(h)) + h
                 hs.append(h)
-            return types.SimpleNamespace(logits=self.lm_head(self.norm(h)),
+            h = txt.norm(h)              # HF chuẩn hoá TRƯỚC khi ghi hidden cuối
+            hs[-1] = h
+            return types.SimpleNamespace(logits=self.lm_head(h),
                                          hidden_states=tuple(hs), loss=None)
 
     fake = Fake()
+    # Cây module không phải một dây thẳng — đây chính là chỗ `lens` từng nổ.
+    assert recombiner._find_module(fake, ("norm", "final_layernorm")) is \
+        fake.model.language_model.norm
+    assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/recomb.yaml")
     sp = Z.spec_from_cfg({"zrecomb": {"recomb": {"n_heads": 2, "hidden": 24},
                                       "retriever": {"n_heads": 2, "hidden": 12},
