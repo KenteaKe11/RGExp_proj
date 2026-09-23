@@ -313,7 +313,7 @@ def plot_visual(item: dict, maps: dict, path: Path, cfg_l: dict) -> Path:
     with Image.open(item["image_path"]) as im:
         img = np.asarray(im.convert("L"), dtype=float) / 255.0
     H, W = img.shape
-    order = [k for k in ("A: Z (encoder)", "B: Z (encoder)", "B: Z' qua Recomb",
+    order = [k for k in ("Z (encoder)", "Z' qua Recomb",
                          "OR (cộng, chuẩn hoá)", "AND (nhân, chuẩn hoá)")
              if maps.get(k) is not None]
     cmap = plt.get_cmap(cfg_l["cmap"])
@@ -382,12 +382,14 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
             torch.cuda.empty_cache()
 
     # ── bản đồ thị giác: 3, 4 rồi 5 ────────────────────────────────────────
-    maps = {"A: Z (encoder)": res[A["id"]]["sal_z"],
-            "B: Z (encoder)": res[B["id"]]["sal_z"],
-            "B: Z' qua Recomb": res[B["id"]]["sal_recomb"]}
-    if maps["B: Z' qua Recomb"] is not None:
-        a1 = _norm01(maps["B: Z' qua Recomb"], lc["percentile_clip"])
-        a2 = _norm01(maps["B: Z (encoder)"], lc["percentile_clip"])
+    # Đường `y → Z → projector → X` là CHUNG cho A và B (cùng vision tower,
+    # cùng projector), nên chỉ vẽ MỘT lần — lấy từ B. Số thô của cả hai nhánh
+    # vẫn nằm trong `lens_maps.npz` (`sal_z__<arm>`).
+    maps = {"Z (encoder)": res[B["id"]]["sal_z"],
+            "Z' qua Recomb": res[B["id"]]["sal_recomb"]}
+    if maps["Z' qua Recomb"] is not None:
+        a1 = _norm01(maps["Z' qua Recomb"], lc["percentile_clip"])
+        a2 = _norm01(maps["Z (encoder)"], lc["percentile_clip"])
         maps["OR (cộng, chuẩn hoá)"] = _norm01(a1 + a2, 100.0)
         maps["AND (nhân, chuẩn hoá)"] = _norm01(a1 * a2, 100.0)
     figs = {}
@@ -443,7 +445,7 @@ def diagnostics(res: dict, maps: dict, a: str, b: str) -> dict:
     lo, hi = res[b]["image_span"]
     out["diff_on_image_tokens"] = float(np.abs(D[:, lo:hi + 1]).sum()
                                         / max(float(np.abs(D).sum()), 1e-12))
-    m1, m2 = maps.get("B: Z' qua Recomb"), maps.get("B: Z (encoder)")
+    m1, m2 = maps.get("Z' qua Recomb"), maps.get("Z (encoder)")
     if m1 is not None and m2 is not None:
         x, y = m1.ravel(), m2.ravel()
         out["saliency_corr"] = float(np.corrcoef(x, y)[0, 1]) if x.std() and y.std() else None
@@ -594,25 +596,26 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, maps, figs, out) -> Path:
           "1. Sáng = y nhạy với patch đó; tối/trong suốt = đổi patch đó gần như không đổi "
           "log-prob của báo cáo. Đây là **độ nhạy**, KHÔNG phải \"model nhìn vào đây\" "
           "theo nghĩa nhân quả, và cũng không phải phân đoạn tổn thương.\n",
-          "2. So `B: Z' qua Recomb` với `B: Z (encoder)`: hai vùng sáng **trùng nhau** = "
+          "2. So `Z' qua Recomb` với `Z (encoder)`: hai vùng sáng **trùng nhau** = "
           "Recomb khuếch đại cái encoder vốn đã dùng; **lệch nhau** = Recomb mang vào một "
           "vùng khác (thường là điều ta muốn thấy).\n",
           "3. `AND` sáng ở đâu thì **cả hai đường cùng chỉ vào đó** — vùng đáng tin nhất "
           "để kể trong báo cáo. `OR` là hợp của hai đường, dùng để thấy tổng vùng được "
           "dùng tới.\n",
-          "4. So `A: Z (encoder)` với `B: Z (encoder)`: cùng đường đi, khác trọng số LoRA "
-          "— lệch nhiều nghĩa là chính đường cũ cũng đã bị huấn luyện lại khác đi.\n",
-          "5. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 8 px của ảnh gốc 512). "
+          "4. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 8 px của ảnh gốc 512). "
           "Đừng đọc chi tiết nhỏ hơn một ô.\n",
-          "6. Mỗi bản đồ tự chuẩn hoá về [0,1], nên **không** so độ sáng giữa hai bản đồ "
+          "5. Mỗi bản đồ tự chuẩn hoá về [0,1], nên **không** so độ sáng giữa hai bản đồ "
           "như so số tuyệt đối; tỉ lệ năng lượng thật ở mục \"Kiểm nhanh\" phía trên.\n",
           "",
           "Mỗi bản đồ là `‖∂y / ∂X_p‖₂` trên 4096 patch của SigLIP, xếp lại thành lưới "
           "64×64 rồi chồng lên ảnh gốc "
           f"(alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị {lc['percentile_clip']}).\n",
-          "- **3. `B: Z' qua Recomb`** — đường `y → Z' → Retriever → Recomb → X`.\n",
-          "- **4. `Z (encoder)`** — đường `y → Z → projector → X`, vẽ cho cả A và B. "
-          "A chỉ có đường này.\n",
+          "- **3. `Z' qua Recomb`** — đường `y → Z' → Retriever → Recomb → X` (chỉ B "
+          "mới có đường này).\n",
+          "- **4. `Z (encoder)`** — đường `y → Z → projector → X`. Hai nhánh đi CHUNG "
+          "đường này (cùng vision tower, cùng projector, đều đóng băng) nên chỉ vẽ một "
+          "bản, lấy từ nhánh có Recomb; số thô của cả hai vẫn nằm trong "
+          "`lens_maps.npz` (`sal_z__<arm>`) nếu cần đối chiếu.\n",
           "- **5. `OR` / `AND`** — hai bản đồ của B, chuẩn hoá [0,1] rồi **cộng** "
           "(OR: ít nhất một đường nhìn vào đây) và **nhân** (AND: cả hai cùng nhìn), "
           "chuẩn hoá lại để so được.\n",

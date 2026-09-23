@@ -666,8 +666,7 @@ def _():
         lc = LZ.lcfg(cfg)
         a1 = LZ._norm01(rb["sal_recomb"], lc["percentile_clip"])
         a2 = LZ._norm01(rb["sal_z"], lc["percentile_clip"])
-        maps = {"A: Z (encoder)": ra["sal_z"], "B: Z (encoder)": rb["sal_z"],
-                "B: Z' qua Recomb": rb["sal_recomb"],
+        maps = {"Z (encoder)": rb["sal_z"], "Z' qua Recomb": rb["sal_recomb"],
                 "OR (cộng, chuẩn hoá)": LZ._norm01(a1 + a2, 100.0),
                 "AND (nhân, chuẩn hoá)": LZ._norm01(a1 * a2, 100.0)}
         assert maps["OR (cộng, chuẩn hoá)"].max() <= 1.0 + 1e-9
@@ -690,6 +689,7 @@ def _():
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3–5 thế nào"):
             assert need in doc, need
+        assert "A: Z" not in doc and "B: Z (encoder)" not in doc  # chung -> vẽ 1 bản
         assert json.dumps(out, default=str)
 
 
