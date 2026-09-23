@@ -16,6 +16,12 @@ suy. Quy trình, `autotune()`:
   4. ứng viên = ước của batch hiệu dụng (grad_accum phải NGUYÊN — batch hiệu
      dụng, số bước và đường lr giữ nguyên); chọn ứng viên LỚN NHẤT có
      a + b·bs <= ngân sách;
+
+MỖI PIPELINE DÒ RIÊNG. Stage 0 (chỉ vision tower + nhánh) và main stage (decoder
+4B + LoRA + nhánh) có hai đường `peak(bs)` khác hẳn nhau, nên chúng gọi
+`autotune` riêng, với `probe_sizes` riêng, và KHÔNG có con số nào bắt hai bên
+phải trùng. Cái duy nhất bị khoá ở main stage là batch HIỆU DỤNG của $1 — và nó
+không nói gì về Stage 0.
   5. KIỂM CHỨNG: chạy thật một lượt ở bs đã chọn. Vượt ngân sách hoặc OOM thì
      lùi xuống ứng viên kế tiếp. Không bao giờ trả một bs chưa chạy thử.
 
@@ -42,17 +48,6 @@ def divisors(n: int) -> list[int]:
     n = max(1, int(n))
     return sorted({d for i in range(1, int(math.isqrt(n)) + 1) if n % i == 0
                    for d in (i, n // i)})
-
-
-def shared_cands(eff_a: int, eff_b: int) -> list[int]:
-    """micro dùng chung cho hai stage có batch hiệu dụng eff_a, eff_b.
-
-    Stage dùng min(micro, eff) mỗi lượt, nên micro hợp lệ khi min(micro, eff)
-    chia hết eff ở CẢ HAI stage — accum nguyên, batch hiệu dụng không lệch.
-    """
-    top = max(int(eff_a), int(eff_b))
-    return [c for c in range(1, top + 1)
-            if eff_a % min(c, eff_a) == 0 and eff_b % min(c, eff_b) == 0]
 
 
 def fit_line(points: list[tuple[int, float]]) -> tuple[float, float, float]:

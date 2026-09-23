@@ -14,7 +14,7 @@ Ba chỗ phải đúng, không chỗ nào tự lộ ra nếu sai:
      nạp được và vẫn ra văn bản đọc được — chỉ là model được chấm không phải
      model đã huấn luyện. Nguồn sự thật là `train_stats.json`, không phải config
      hiện tại (config có thể đã bị `--set` sửa giữa hai stage).
-  2. Candidate B mà thiếu file nhánh thì DỪNG. Nạp adapter đúng mà không có 128
+  2. Candidate B mà thiếu file nhánh thì DỪNG. Nạp adapter đúng mà không có 256
      learner vector là chấm candidate A rồi dán nhãn B lên kết quả.
   3. Đệm BÊN TRÁI khi sinh (ngược với khâu train). Hệ quả: khối ảnh kết thúc
      ở chỗ khác nhau theo từng hàng, nên chỗ nối Q cũng phải theo từng hàng —

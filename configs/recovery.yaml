@@ -3,7 +3,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 # QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 128 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 256 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
@@ -301,17 +301,18 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/recovery.py`) ────────────────────────────────────────────
-# KHÔNG còn khối Recomb của §2.0 (Linear + RMSNorm + Self-attn + MLP + residual
-# trên cả 4096 vị trí). X vào nhánh qua ĐÚNG MỘT `Linear 1152→2560` rồi RMSNorm,
-# và chỉ xuất hiện ở Key/Value của Cross-Attn; mọi thứ còn lại chạy trên n_query
-# vị trí.
+# KHÔNG còn khối Recomb của §2.0. BA không gian: Learner + Self-attn ở d_learn
+# (3072); Cross-Attn ở d_vis (1152) với X vào NGUYÊN VẸN, chỉ qua RMSNorm —
+# không phép nhân ma trận nào áp lên 4096 vị trí; d_model (2560) chạm đúng một
+# lần ở Linear cuối.
 recovery:
   n_labels: null            # null = theo labels.npz (14)
   recovery:                 # X (4096, 1152) -> Q (256, 2560)
     n_query: 256            # số learner vector NỐI vào chuỗi (chuỗi dài thêm đúng ngần này)
-    n_heads: 20             # head_dim 128 (2560 = 20 × 128), cho Self-attn và Cross-Attn
-    hidden: 1024            # MLP(GeLU) sau Cross-Attn: 2560 -> 1024 -> 2560 (+res)
-    out_hidden: 2560        # MLP(GeLU) cuối: 2560 -> 2560 -> 2560
+    d_learn: 3072           # không gian của Learner + Self-attn
+    n_heads: 24             # Self-attn ở 3072: head_dim 128 (3072 = 24 × 128)
+    x_heads: 9              # Cross-Attn ở 1152: head_dim 128 (1152 = 9 × 128)
+    hidden: 2048            # MLP(GeLU) sau Cross-Attn: 1152 -> 2048 -> 3072 (+res)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
@@ -328,9 +329,9 @@ recovery:
 stage0:
   lr: 3.0e-4                # CỐ ĐỊNH
   weight_decay: 0.03
-  max_epochs: 8
+  max_epochs: 5
   select: last              # LUÔN lấy epoch cuối (best = theo val)
-  # ── epoch n+1 (= 9): "final weight" ─────────────────────────────────────
+  # ── epoch n+1 (= 6): "final weight" ─────────────────────────────────────
   # Sau `max_epochs` epoch, base/ được ĐẨY Hub ngay. Rồi chạy thêm `epochs`
   # epoch với optimizer MỚI (không mang lịch sử scheduler/Adam trước đó), lr
   # cosine lr_start -> lr_end cập nhật mỗi bước -> final/. Main stage dùng final/.
@@ -342,8 +343,12 @@ stage0:
     schedule: cosine
     weight_decay: 0.03
     reset_optimizer: true
-  batch_size: 32            # batch hiệu dụng; mảnh mỗi lượt (`stage0.micro_batch`)
-                            # ở config GPU, autobatch dò lại
+  # Batch hiệu dụng RIÊNG của Stage 0 — trùng 32 của main stage chỉ là trùng số,
+  # không có ràng buộc nào bắt hai bên bằng nhau: batch của main stage bị khoá
+  # theo $1 (`train_batch` trong fixture), Stage 0 thì không dính gì tới A.
+  # Mảnh vật lý mỗi lượt (`stage0.micro_batch`) và điểm đo (`stage0.probe_sizes`)
+  # nằm ở config GPU và autobatch dò lại — cũng tách hẳn main stage.
+  batch_size: 32
   max_grad_norm: 1.0
   # val (theo dõi): sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
   val_classes: [pos, uncertain]

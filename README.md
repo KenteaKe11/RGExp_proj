@@ -29,38 +29,43 @@ ra để làm. Mọi khoá quyết định kết quả của A (`seed`, `data`, 
 ## Kiến trúc (`src/recovery.py`)
 
 ```
-X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐
+X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐   KHÔNG bị chiếu
 Z = projector(X) (256, 2560)                           │
                                           ┌──── Recovery ────┐
-  v = RMSNorm(Linear 1152→2560 (X))                    │ ĐÚNG MỘT phép chiếu
-  h = Self-attn(RMSNorm(Learner))                      │ Learner (256, 2560) — tham số
-  u = Cross-Attn(RMSNorm_q(h), v)                      │ query = h, key/value = v
-  h = h + Linear 1024→2560(GELU(Linear 2560→1024 (u))) │
-  Q = Linear 2560→2560(GELU(Linear 2560→2560 (h)))     │ -> Q (256, 2560)
+  h = Self-attn(RMSNorm(Learner))                      │ Learner (256, 3072) — tham số
+  q = RMSNorm(Linear 3072→1152 (h))                    │ query hạ xuống gặp X
+  u = Cross-Attn(q, RMSNorm(X))                        │ ở 1152, 9 head
+  h = h + Linear 2048→3072(GELU(Linear 1152→2048 (u))) │ vừa mở rộng vừa đổi không gian
+  Q = Linear 3072→2560 (h)                             │ -> Q (256, 2560)
                                           └──────────────────┘
 Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**Không còn khối Recomb.** §2.0 cho X qua Linear + RMSNorm + Self-attn + MLP +
-residual trên cả 4096 vị trí rồi mới dùng. Ở đây X vào nhánh qua **đúng một**
-`Linear 1152→2560` rồi RMSNorm, và chỉ xuất hiện ở Key/Value của Cross-Attn; mọi
-thứ còn lại chạy trên `n_query` (256) vị trí. Phần nặng nhất vì thế là attention
-256 × 4096, không phải một stack 4096 × 2560.
+**Ba không gian, mỗi cái một việc.**
 
-Head_dim 128 ở mọi attention (2560 = 20 × 128): 20 head cho Self-attn,
-Cross-Attn và Attn-Pooling. Tham số nhánh để fp32, chạy dưới autocast bf16.
+| | dùng ở đâu | vì sao |
+|---|---|---|
+| `d_learn` 3072 | Learner + Self-attn + residual | 256 câu hỏi nói chuyện với nhau, rộng hơn cả `d_model` để không bị bóp trước khi hỏi |
+| `d_vis` 1152 | Cross-Attn | X vào **nguyên vẹn**, chỉ qua RMSNorm; query hạ xuống gặp nó. Không phép nhân ma trận nào áp lên 4096 vị trí — phần đắt nhất của nhánh chỉ còn attention 256 × 4096 ở 1152 chiều |
+| `d_model` 2560 | `Linear` cuối | không gian embedding của decoder, chạm đúng một lần |
+
+**Không còn khối Recomb** (§2.0 cho X qua Linear + RMSNorm + Self-attn + MLP +
+residual trên cả 4096 vị trí), và cũng không còn phép chiếu `1152→2560` áp lên X
+như bản trước. Head_dim 128 ở mọi attention: 24 head ở 3072, 9 head ở 1152, 20
+head cho Attn-Pooling ở 2560. Tham số nhánh để fp32, chạy dưới autocast bf16.
 
 | khối | tham số |
 |---|---|
-| `Linear 1152→2560` (X) | 2,95 M |
-| Learner (256 × 2560) | 0,66 M |
-| Self-attn · Cross-Attn | 26,2 M · 26,2 M |
-| MLP 2560→1024→2560 | 5,25 M |
-| MLP cuối 2560→2560→2560 | 13,1 M |
-| **Recovery** | **74,4 M** |
+| Learner (256 × 3072) | 0,79 M |
+| Self-attn @3072 | 37,7 M |
+| `Linear 3072→1152` (query) | 3,54 M |
+| Cross-Attn @1152 | 5,31 M |
+| MLP 1152→2048→3072 | 8,66 M |
+| `Linear 3072→2560` (ra) | 7,87 M |
+| **Recovery** | **63,9 M** |
 | Cls Head (chỉ Stage 0) | 26,3 M |
-| **Stage 0 tổng** | **100,7 M** |
+| **Stage 0 tổng** | **90,2 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
@@ -81,12 +86,19 @@ Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không đọc một biểu
 diễn trung gian nào rồi vứt đi.
 
-* AdamW, lr **cố định 3e-4**, wd 0.03, **8 epoch**, batch 32 (micro do autobatch chọn).
-  Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 8 epoch xong.
-* **Epoch n+1 = 9 — final weight** (`stage0.final_anneal`): optimizer **mới** (không mang
-  lịch sử scheduler/Adam của 8 epoch), lr **cosine 3e-5 → 1e-8** cập nhật mỗi bước trong
+* AdamW, lr **cố định 3e-4**, wd 0.03, **5 epoch**, batch hiệu dụng 32 — **của
+  riêng Stage 0**. Nó trùng 32 của main stage chỉ là trùng số: batch main stage
+  bị khoá theo $1 (`train_batch` trong fixture, một phần lịch học của A), còn
+  Stage 0 không dính gì tới A. Mảnh vật lý (`stage0.micro_batch`) và điểm đo
+  autobatch (`stage0.probe_sizes`, mặc định `[4, 8, 16]`) cũng tách hẳn
+  `autobatch.probe_sizes` của main stage — hai pipeline có hai đường `peak(bs)`
+  khác nhau, đo chung thì Stage 0 luôn bị ngoại suy từ vùng quá nhỏ và ra micro
+  thấp. Cả hai khoá ấy là khoá phần cứng: đổi chúng KHÔNG đổi vân tay Stage 0.
+  Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 5 epoch xong.
+* **Epoch n+1 = 6 — final weight** (`stage0.final_anneal`): optimizer **mới** (không mang
+  lịch sử scheduler/Adam của 5 epoch), lr **cosine 3e-5 → 1e-8** cập nhật mỗi bước trong
   1 epoch, bắt đầu từ `base/` -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.**
-  Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 9 (base giữ nguyên, có vân tay riêng).
+  Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 6 (base giữ nguyên, có vân tay riêng).
 * Val (chỉ theo dõi): sau mỗi epoch trên **256 mẫu bốc lại** từ hồ val 2000 (chỉ số
   từ seed + epoch): ASL, F1, Recall, sqrt(F1 · Recall), macro trên 14 bệnh lý × lớp
   {pos, uncertain}, dự đoán = argmax 3 lớp.
@@ -196,7 +208,7 @@ export WANDB_API_KEY=xxxxxxxx
 python scripts/selftest_recovery.py             # vài giây, không cần GPU
 bash scripts/run_recovery.sh train --dry-run    # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_recovery.sh train --detach     # 1. kéo A -> Stage 0 (8 epoch -> base, epoch 9 -> final) -> main B -> sinh -> chấm
+bash scripts/run_recovery.sh train --detach     # 1. kéo A -> Stage 0 (5 epoch -> base, epoch 6 -> final) -> main B -> sinh -> chấm
 bash scripts/run_recovery.sh stats              # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
 bash scripts/run_recovery.sh lens               # 3. mổ khối Q trên 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
 bash scripts/run_recovery.sh push               # 4. -> current/$2.1_Recovery_Test/ (kèm Reports/Lens/)
@@ -218,14 +230,14 @@ Các cờ:
 
 * `--retrain-all` (hoặc `recovery_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
-* `--restage0`: pretrain lại cả 9 epoch, kéo theo `--retrain`.
+* `--restage0`: pretrain lại cả 6 epoch, kéo theo `--retrain`.
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
   `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
   vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
-  Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của 8 epoch) được
+  Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của 5 epoch) được
   **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn trên Hub — nên không phải
-  pretrain lại 8 epoch.
-* `--stages data,stage0`: chỉ chạy Stage 0 (8 epoch + epoch 9), không đụng main stage.
+  pretrain lại 5 epoch.
+* `--stages data,stage0`: chỉ chạy Stage 0 (5 epoch + epoch 6), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
 * `--no-pull`.
@@ -235,8 +247,8 @@ Các cờ:
 ```
 adapters_recovery/_fixture/                  = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_recovery/_stage0/                   PRETRAIN — để về sau đối chứng SoTA
-    base/recovery_stage0.safetensors|.json   Recovery + Cls Head sau 8 epoch lr cố định
-    final/recovery_stage0.safetensors|.json  sau epoch 9 (cosine 3e-5 → 1e-8) — main stage dùng bản này
+    base/recovery_stage0.safetensors|.json   Recovery + Cls Head sau 5 epoch lr cố định
+    final/recovery_stage0.safetensors|.json  sau epoch 6 (cosine 3e-5 → 1e-8) — main stage dùng bản này
     loader.json                              fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
                                              batch/micro, lịch, ASL, spec, vân tay, sha256 weight
     stage0_labels.npz                        nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
@@ -263,7 +275,7 @@ Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
 Hai lần đẩy tự động trong lúc `train`:
 
-* Stage 0: `base/` được đẩy ngay khi 8 epoch xong, `final/` được đẩy khi epoch 9 xong (kèm fixture).
+* Stage 0: `base/` được đẩy ngay khi 5 epoch xong, `final/` được đẩy khi epoch 6 xong (kèm fixture).
 * B được đẩy riêng ngay khi sinh xong, và lại sau khi chấm xong.
 
 Trên máy mới, `train` kéo Stage 0 từ Hub nếu vân tay khớp, rồi kéo weight và kết
@@ -275,7 +287,7 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/recovery.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_recovery.sh · selftest_recovery.py · setup.sh · _env.sh
 src/run_recovery.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/recovery.py          Recovery (Linear 1152→2560 + Learner + Self/Cross-Attn) · Cls Head (đọc Q) ·
+src/recovery.py          Recovery (Learner@3072 + Self-attn + Cross-Attn@1152) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_recovery.py   Stage 0 + loader.json + nhãn chụp lại
 src/train_recovery.py    main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)

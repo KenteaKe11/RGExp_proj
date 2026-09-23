@@ -8,7 +8,7 @@ diễn trung gian nào rồi vứt đi. Main stage nạp nguyên `recovery.*` v�
 
 Lịch (khối `stage0` của configs/recovery.yaml):
   * AdamW, lr CỐ ĐỊNH 3e-4 (không warm-up, không decay), weight_decay 0.03;
-  * 8 epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
+  * `max_epochs` (5) epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
   * LUÔN lấy epoch CUỐI (`stage0.select: last`) — val chỉ để theo dõi;
   * sau MỖI epoch đo trên 256 mẫu bốc lại từ hồ val 2000 (`stage0.val_n_samples`,
     chỉ số từ (seed, epoch) — tái lập được): ASL, F1, Recall, sqrt(F1·Recall)
@@ -44,7 +44,7 @@ LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy 
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
 # dùng lại Recovery đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
-BASE = "base"                         # sau `max_epochs` (8) epoch lr cố định — đẩy Hub ngay
+BASE = "base"                         # sau `max_epochs` (5) epoch lr cố định — đẩy Hub ngay
 CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
 KEEP = (f"{BASE}/recovery_stage0.safetensors", f"{BASE}/recovery_stage0.json",
         f"{CKPT}/recovery_stage0.safetensors", f"{CKPT}/recovery_stage0.json", HISTORY,
@@ -61,7 +61,12 @@ def s0cfg(cfg: Cfg) -> dict:
            "weight_decay": float(s.get("weight_decay", 0.03)),
            "max_epochs": int(s.get("max_epochs", 5)),
            "batch_size": int(s.get("batch_size", 32)),
-           "micro_batch": int(s.get("micro_batch", 8) or 8),
+           "micro_batch": int(s.get("micro_batch", 16) or 16),
+           # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
+           # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
+           # hai đường peak(bs) khác hẳn nhau: Stage 0 không có decoder 4B, nên
+           # đo nó ở [2, 4, 8] là ngoại suy từ vùng quá nhỏ và luôn ra micro thấp.
+           "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
            "val_classes": list(s.get("val_classes") or ["pos", "uncertain"]),
            # epoch đem sang main stage: last (luôn lấy epoch cuối) | best (theo val)
@@ -75,13 +80,19 @@ def s0cfg(cfg: Cfg) -> dict:
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
         raise TrainUnusable(f"stage0.micro_batch {out['micro_batch']} không chia "
                             f"hết stage0.batch_size {out['batch_size']}")
+    if not any(out["batch_size"] % p == 0 for p in out["probe_sizes"]):
+        # autotune lọc probe_sizes theo ước của batch hiệu dụng; không số nào
+        # khớp thì nó lặng lẽ rơi về dò ở ứng viên nhỏ nhất (1).
+        raise TrainUnusable(
+            f"stage0.probe_sizes {out['probe_sizes']} không có số nào chia hết "
+            f"stage0.batch_size {out['batch_size']} — autobatch sẽ dò ở bs 1.")
     return out
 
 
 def anneal_cfg(s: dict) -> dict:
     """`stage0.final_anneal`: epoch n+1 (sau `max_epochs`) -> checkpoint `final/`.
 
-    Optimizer MỚI (không mang trạng thái/lịch sử scheduler của 8 epoch trước),
+    Optimizer MỚI (không mang trạng thái/lịch sử scheduler của `max_epochs` epoch trước),
     lr cosine từ `lr_start` xuống `lr_end` trong `epochs` epoch, cập nhật mỗi bước.
     """
     a = dict(s.get("final_anneal") or {})
@@ -113,7 +124,7 @@ def legacy_base(h: dict, cfg: Cfg) -> bool:
 
 
 def adopt_legacy_base(cfg: Cfg) -> dict | None:
-    """`final/` kiểu cũ (= epoch cuối của 8 epoch) -> `base/`. Trả history hoặc None."""
+    """`final/` kiểu cũ (= epoch cuối của `max_epochs` epoch) -> `base/`. Trả history hoặc None."""
     d = stage0_dir(cfg)
     p = d / HISTORY
     if base_finished(cfg) is not None or not (p.exists() and Z.stage0_exists(d / CKPT)):
@@ -166,18 +177,22 @@ def finished(cfg: Cfg) -> dict | None:
 
 
 def config_fingerprint(cfg: Cfg) -> str:
-    """Vân tay của CẢ Stage 0 (base + anneal): khối stage0 (trừ micro_batch) + recovery + seed."""
-    s = {k: v for k, v in dict(cfg.get("stage0") or {}).items() if k != "micro_batch"}
+    """Vân tay của CẢ Stage 0 (base + anneal): khối stage0 (trừ khoá phần cứng)
+    + recovery + seed. `micro_batch` và `probe_sizes` chỉ nói chuyện VRAM của máy
+    đang chạy, không đổi thí nghiệm, nên không vào vân tay."""
+    s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
+         if k not in ("micro_batch", "probe_sizes")}
     return Z.spec_fingerprint({"stage0": s, "recovery": dict(cfg.get("recovery") or {}),
                                "seed": int(cfg.get("seed", 42)),
                                "labels": dict(cfg.get("labels") or {})})
 
 
 def base_fingerprint(cfg: Cfg) -> str:
-    """Vân tay của phần base (8 epoch): như trên nhưng KHÔNG gồm `final_anneal` —
-    đổi lịch anneal thì chỉ chạy lại epoch n+1, không chạy lại 8 epoch."""
+    """Vân tay của phần base (`max_epochs` epoch): như trên nhưng KHÔNG gồm
+    `final_anneal` — đổi lịch anneal thì chỉ chạy lại epoch n+1, không chạy lại
+    cả phần base."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
-         if k not in ("micro_batch", "final_anneal")}
+         if k not in ("micro_batch", "probe_sizes", "final_anneal")}
     return Z.spec_fingerprint({"stage0": s, "recovery": dict(cfg.get("recovery") or {}),
                                "seed": int(cfg.get("seed", 42)),
                                "labels": dict(cfg.get("labels") or {})})
@@ -339,7 +354,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         loss, _ = loss_of(b)
         loss.backward()
 
-    micro, ab_rep = autobatch.autotune(cfg, "stage0", bs_eff,
+    # Dò bằng điểm đo của RIÊNG Stage 0 (`stage0.probe_sizes`), không phải
+    # `autobatch.probe_sizes` của main stage.
+    ab_c = Cfg(dict(cfg, autobatch=dict(cfg.get("autobatch") or {},
+                                        probe_sizes=sc["probe_sizes"])))
+    micro, ab_rep = autobatch.autotune(ab_c, "stage0", bs_eff,
                                        min(sc["micro_batch"], bs_eff), _probe,
                                        modules=(block,))
     opt.zero_grad(set_to_none=True)
@@ -644,6 +663,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                                 "torch.randperm(n_train, generator=g) trên thứ tự dòng "
                                 "của trainset.jsonl; batch = lát liên tiếp"},
         "batch": {"batch_size": sc["batch_size"], "micro_batch": int(micro),
+                  "probe_sizes": sc["probe_sizes"],
                   "steps_per_epoch": int(steps_per_epoch),
                   "loss_average": "ASL trung bình trên mẫu có nhãn của CẢ batch"},
         "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8)", "lr": sc["lr"],

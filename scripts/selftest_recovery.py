@@ -19,11 +19,12 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  12. Stage 0 (weight + loader + nhãn + history) và main stage (weight + nhánh)
      nằm trong plan đẩy Hub, giống bố cục $1
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
- 14. lịch Stage 0 / main hiện hành và cờ --retrain-all
- 15. Stage 0 chạy thật trên mô hình giả: base (8 epoch) đẩy ngay, epoch 9 anneal -> final;
-     đổi lịch anneal thì chỉ chạy lại epoch 9
- 16. lịch cosine của epoch 9
- 17. checkpoint bố cục CŨ (chỉ `final/` = 8 epoch) được nhận làm `base/`
+ 14. lịch Stage 0 / main hiện hành, cờ --retrain-all, và hai stage KHÔNG dùng
+     chung khoá batch nào (micro + điểm đo riêng, không vào vân tay)
+ 15. Stage 0 chạy thật trên mô hình giả: base (5 epoch) đẩy ngay, epoch 6 anneal -> final;
+     đổi lịch anneal thì chỉ chạy lại epoch 6
+ 16. lịch cosine của epoch 6
+ 17. checkpoint bố cục CŨ (chỉ `final/` = 5 epoch) được nhận làm `base/`
  18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
  19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap 1/4 lớp cuối có
      chỉ số lớp thật, MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
@@ -60,8 +61,8 @@ def check(name: str):
 def small_spec(n_labels=14, n_query=5):
     from src import recovery as R
 
-    cfg = {"recovery": {"recovery": {"n_query": n_query, "n_heads": 4, "hidden": 12,
-                                     "out_hidden": 40},
+    cfg = {"recovery": {"recovery": {"n_query": n_query, "d_learn": 16, "n_heads": 4,
+                                     "x_heads": 4, "hidden": 12},
                         "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, 24, 32, n_labels)
 
@@ -98,11 +99,16 @@ def _():
     assert torch.isfinite(q).all()
     # KHÔNG còn TokenMix/zero-init: Q có tín hiệu ngay bước 0 (Stage 0 dạy sẵn)
     assert q.abs().sum() > 0
-    assert not hasattr(br.recovery, "out")
+    # `out` là Linear d_learn→d_model bình thường, KHÔNG phải TokenMix init 0
+    assert isinstance(br.recovery.out, torch.nn.Linear)
+    assert br.recovery.out.weight.abs().sum() > 0
     assert not hasattr(br, "recomb")            # Recomb đã bị bỏ khỏi kiến trúc
-    # X vào nhánh qua ĐÚNG MỘT phép chiếu; phần còn lại chạy ở d_model
-    assert br.recovery.inp.in_features == 24 and br.recovery.inp.out_features == 32
-    assert tuple(br.recovery.learner.shape) == (1, sp["recovery"]["n_query"], 32)
+    # X KHÔNG bị chiếu: Cross-Attn chạy thẳng ở d_vis, query hạ xuống gặp nó
+    assert not hasattr(br.recovery, "inp")
+    assert br.recovery.q_proj.in_features == 16 and br.recovery.q_proj.out_features == 24
+    assert br.recovery.xattn.d == 24 and br.recovery.sattn.d == 16
+    assert br.recovery.out.in_features == 16 and br.recovery.out.out_features == 32
+    assert tuple(br.recovery.learner.shape) == (1, sp["recovery"]["n_query"], 16)
     # Q phụ thuộc ẢNH (Cross-Attn thật sự đọc X), không phải hằng số
     assert not torch.allclose(q[0], q[1])
     before = q.detach().clone()
@@ -404,7 +410,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 lr 3e-4 · 8 epoch · LAST · val 256; main mở băng Recovery sau 1/4 epoch, lr 3e-5; --retrain-all")
+@check("14. lịch: Stage 0 lr 3e-4 · 5 epoch · LAST · val 256; main mở băng Recovery sau 1/4 epoch, lr 3e-5; --retrain-all")
 def _():
     from src import stage0_recovery as s0
     from src.config import load_config
@@ -412,7 +418,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (3e-4, 0.03, 8, "last")
+    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (3e-4, 0.03, 5, "last")
     assert sc["val_n_samples"] == 256 and sc["val_resample"]
     assert s0.CKPT == "final" and s0.BASE == "base"
     assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
@@ -422,9 +428,10 @@ def _():
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert cfg["recovery_exp"]["retrain_all"] is False
     rv = cfg["recovery"]["recovery"]
-    assert int(rv["n_query"]) == 256 and int(rv["n_heads"]) == 20
-    assert 2560 % int(rv["n_heads"]) == 0 and 2560 // int(rv["n_heads"]) == 128
-    assert int(rv["hidden"]) == 1024 and int(rv["out_hidden"]) == 2560
+    assert int(rv["n_query"]) == 256 and int(rv["d_learn"]) == 3072
+    assert int(rv["d_learn"]) // int(rv["n_heads"]) == 128 == 1152 // int(rv["x_heads"])
+    assert int(rv["d_learn"]) % int(rv["n_heads"]) == 0 and 1152 % int(rv["x_heads"]) == 0
+    assert int(rv["hidden"]) == 2048 and "out_hidden" not in rv
     assert "zero_init_out" not in rv and "recomb" not in cfg["recovery"]
     src = (ROOT / "src/run_recovery.py").read_text(encoding="utf-8")
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
@@ -436,8 +443,35 @@ def _():
     from src.run_recovery import COMMANDS
     assert COMMANDS["train"][:2] == ["data", "stage0"]
 
+    # ── hai stage KHÔNG dùng chung khoá batch nào ──────────────────────────
+    import src.autobatch as ab
 
-@check("15. Stage 0 chạy thật (mô hình giả): 8 epoch -> base/ + đẩy NGAY -> epoch 9 cosine 3e-5→1e-8 -> final/; chạy lại chỉ epoch 9")
+    # di tích của thời hai stage bị ép dùng chung một micro — phải biến mất
+    assert not hasattr(ab, "shared_cands")
+    gcfg = load_config(ROOT / "configs/recovery.yaml", gpu="rtx3060")
+    gsc = s0.s0cfg(gcfg)
+    assert gsc["probe_sizes"] != gcfg["autobatch"]["probe_sizes"], (
+        "Stage 0 và main stage đang dùng chung điểm đo autobatch")
+    assert all(gsc["batch_size"] % p == 0 for p in gsc["probe_sizes"])
+    assert gsc["micro_batch"] in ab.divisors(gsc["batch_size"])
+    # micro_batch / probe_sizes là khoá PHẦN CỨNG: đổi chúng KHÔNG được làm
+    # hỏng checkpoint Stage 0 đã có
+    f0, b0 = s0.config_fingerprint(gcfg), s0.base_fingerprint(gcfg)
+    g2 = load_config(ROOT / "configs/recovery.yaml", gpu="rtx3060")
+    g2["stage0"] = dict(g2["stage0"], micro_batch=4, probe_sizes=[1, 2])
+    assert s0.config_fingerprint(g2) == f0 and s0.base_fingerprint(g2) == b0
+    # probe không chia hết batch hiệu dụng -> DỪNG, không lặng lẽ dò ở bs 1
+    g3 = load_config(ROOT / "configs/recovery.yaml", gpu="rtx3060")
+    g3["stage0"] = dict(g3["stage0"], probe_sizes=[5, 7])
+    try:
+        s0.s0cfg(g3)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("stage0.probe_sizes lệch batch_size phải DỪNG")
+
+
+@check("15. Stage 0 chạy thật (mô hình giả): 5 epoch -> base/ + đẩy NGAY -> epoch 6 cosine 3e-5→1e-8 -> final/; chạy lại chỉ epoch 6")
 def _():
     import json
 
@@ -463,10 +497,10 @@ def _():
         return x, x[..., :1].expand(b, N_TOK, D_MOD)
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
-    cfg["recovery"] = {"recovery": {"n_query": 5, "n_heads": 4, "hidden": 16,
-                                    "out_hidden": 40},
+    cfg["recovery"] = {"recovery": {"n_query": 5, "d_learn": 16, "n_heads": 4,
+                                    "x_heads": 4, "hidden": 12},
                        "cls_head": {"n_heads": 4}}
-    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2, max_epochs=8)
+    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2, max_epochs=5)
     cfg["autobatch"] = {"enabled": False}
     rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
@@ -492,39 +526,39 @@ def _():
 
             def cb():
                 h = json.loads((d / s0.HISTORY).read_text())
-                assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 8
+                assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 5
                 assert R.stage0_exists(d / s0.BASE) and not R.stage0_exists(d / s0.CKPT)
                 pushed.append("base")
 
             h = s0.run(cfg, tr, va, on_base_done=cb)
             assert pushed == ["base"], pushed
-            assert h["finished"] and h["best_epoch"] == 9 and h["base_epoch"] == 8
+            assert h["finished"] and h["best_epoch"] == 6 and h["base_epoch"] == 5
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            assert ph == [(e, "base") for e in range(1, 9)] + [(9, "anneal")], ph
+            assert ph == [(e, "base") for e in range(1, 6)] + [(6, "anneal")], ph
             m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
             assert m["phase"] == "anneal" and m["anneal"]["lr_start"] == 3e-5
             from safetensors.torch import load_file
-            b8 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            f9 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
-            assert any(not torch.equal(b8[k], f9[k]) for k in b8)       # epoch 9 đã học
+            b5 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
+            f6 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
+            assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 6 đã học
             assert s0.finished(cfg) is not None
-            # đổi lịch anneal -> base còn dùng được, chỉ chạy lại epoch 9, không đẩy base lại
+            # đổi lịch anneal -> base còn dùng được, chỉ chạy lại epoch 6, không đẩy base lại
             cfg["stage0"] = dict(cfg["stage0"], final_anneal=dict(
                 cfg["stage0"]["final_anneal"], lr_start=2e-5))
             assert s0.finished(cfg) is None and s0.base_finished(cfg) is not None
             pushed.clear()
             h2 = s0.run(cfg, tr, va, on_base_done=cb)
-            assert pushed == [] and h2["best_epoch"] == 9
-            assert [x["epoch"] for x in h2["history"]] == list(range(1, 10))
-            b8b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            assert all(torch.equal(b8[k], b8b[k]) for k in b8)          # base không đổi
+            assert pushed == [] and h2["best_epoch"] == 6
+            assert [x["epoch"] for x in h2["history"]] == list(range(1, 7))
+            b5b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
+            assert all(torch.equal(b5[k], b5b[k]) for k in b5)          # base không đổi
     finally:
         (s0.load_base, s0.labels_cls.load_map, s0.imaging.configure_processor,
          s0.assert_same_pixels, s0.VisionOnlyDataset.pixel_values,
          recombiner.encode_vision, recombiner.vision_and_text_dims) = orig
 
 
-@check("16. lịch epoch 9: cosine 3e-5 -> 1e-8 trong 200 bước, optimizer mới")
+@check("16. lịch epoch 6: cosine 3e-5 -> 1e-8 trong 200 bước, optimizer mới")
 def _():
     import torch
 
@@ -546,7 +580,7 @@ def _():
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
 
 
-@check("17. bố cục CŨ (chỉ có final/ = epoch 8): nhận làm base/, không pretrain lại")
+@check("17. bố cục CŨ (chỉ có final/ = epoch 5): nhận làm base/, không pretrain lại")
 def _():
     import json
 
@@ -559,11 +593,11 @@ def _():
         cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
         d = s0.stage0_dir(cfg)
         R.save_stage0(R.SupervisedBlock(small_spec()), d / s0.CKPT,
-                      {"select": "last", "best_epoch": 8})
+                      {"select": "last", "best_epoch": 5})
         # history kiểu cũ: config_fingerprint tính KHÔNG có final_anneal == base_fingerprint
         (d / s0.HISTORY).write_text(json.dumps({
-            "finished": True, "select": "last", "best_epoch": 8, "best_score": 0.37,
-            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 9)],
+            "finished": True, "select": "last", "best_epoch": 5, "best_score": 0.37,
+            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 6)],
             "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
         assert s0.base_finished(cfg) is None and s0.finished(cfg) is None
         h = s0.adopt_legacy_base(cfg)
@@ -598,10 +632,10 @@ def _():
         base = hub_base(cfg)
         hub = t / "hub"                       # "Hub" giả: bố cục CŨ, chỉ có final/
         R.save_stage0(R.SupervisedBlock(small_spec()), hub / s0.CKPT,
-                      {"select": "last", "best_epoch": 8})
+                      {"select": "last", "best_epoch": 5})
         (hub / s0.HISTORY).write_text(json.dumps({
-            "finished": True, "select": "last", "best_epoch": 8, "best_score": 0.37,
-            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 9)],
+            "finished": True, "select": "last", "best_epoch": 5, "best_score": 0.37,
+            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 6)],
             "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
         (hub / s0.LOADER).write_text("{}", encoding="utf-8")
         (hub / s0.LABELS).write_bytes(b"npz")
@@ -618,7 +652,7 @@ def _():
         d = s0.stage0_dir(cfg)
         assert R.stage0_exists(d / s0.BASE) and not R.stage0_exists(d / s0.CKPT)
         h = json.loads((d / s0.HISTORY).read_text())
-        assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 8
+        assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 5
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
@@ -703,8 +737,9 @@ def _():
         fake.model.language_model.norm
     assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/recovery.yaml")
-    sp = R.spec_from_cfg({"recovery": {"recovery": {"n_query": NQ, "n_heads": 2,
-                                                    "hidden": 8, "out_hidden": 16},
+    sp = R.spec_from_cfg({"recovery": {"recovery": {"n_query": NQ, "d_learn": 8,
+                                                    "n_heads": 2, "x_heads": 2,
+                                                    "hidden": 8},
                                        "cls_head": {"n_heads": 2}}}, DV, DM, 14)
     branch = R.RecoveryBranch(sp)
     branch.set_frozen(True)

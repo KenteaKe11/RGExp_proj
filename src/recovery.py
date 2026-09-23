@@ -5,16 +5,16 @@ Sơ đồ (đúng hình "Recovery" + "Cls Head"):
     Image ─► Vision Encoder (SigLIP) ─► X (4096, 1152) ──────────────┐
                     │                                                  │
                     ▼                        ┌──────── Recovery ───────┴──────┐
-              Adapter (projector)            │ v  = RMSNorm(Linear 1152→2560  │
-                    │                        │                          (X))  │
-                    ▼                        │ q  = Learner (256, 2560)       │
-          Vision Tokens Z (256, 2560)        │ h  = Self-attn(RMSNorm(q))     │
-                    │                        │ u  = Cross-Attn(RMSNorm_q(h),  │
-                    │                        │                 v)             │
-                    │                        │ h  = h + Linear 1024→2560(     │
-                    │                        │      GELU(Linear 2560→1024 u)) │
-                    │                        │ Q  = Linear 2560→2560(         │
-                    │                        │      GELU(Linear 2560→2560 h)) │
+              Adapter (projector)            │ q  = Learner (256, 3072)       │
+                    │                        │ h  = Self-attn(RMSNorm(q))     │
+                    ▼                        │ u  = Cross-Attn(                │
+          Vision Tokens Z (256, 2560)        │        RMSNorm(Linear 3072→1152 │
+                    │                        │                          (h)),  │
+                    │                        │        RMSNorm(X))              │
+                    │                        │ u  = Linear 2048→3072(          │
+                    │                        │      GELU(Linear 1152→2048 u))  │
+                    │                        │ h  = h + u                      │
+                    │                        │ Q  = Linear 3072→2560(h)        │
                     │                        └────────┬───────────────┬───────┘
                     │                    Q (256, 2560)│               │
                     │                                 │               ▼
@@ -24,11 +24,22 @@ Sơ đồ (đúng hình "Recovery" + "Cls Head"):
                     ▼                                 ▼
     [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
+BA không gian, mỗi cái một việc:
+
+  * `d_learn` (3072) — nơi Learner sống và Self-attn chạy: 256 câu hỏi nói
+    chuyện với nhau, rộng hơn cả d_model để không bị bóp trước khi hỏi;
+  * `d_vis` (1152) — nơi Cross-Attn chạy. X đi vào nhánh **NGUYÊN VẸN**, chỉ qua
+    RMSNorm; query được hạ xuống gặp nó bằng `Linear 3072→1152`. Không còn phép
+    chiếu nào áp lên 4096 token thị giác, nên phần đắt nhất của nhánh chỉ còn
+    đúng attention 256 × 4096 ở 1152 chiều;
+  * `d_model` (2560) — không gian embedding của decoder, chạm đúng một lần ở
+    `Linear 3072→2560` cuối.
+
+MLP sau Cross-Attn vì thế vừa mở rộng vừa đổi không gian: 1152 → `hidden`
+(2048) → 3072, để cộng được vào residual của Self-attn.
+
 KHÔNG còn khối Recomb của §2.0 (Linear + RMSNorm + Self-attn + MLP + residual
-trên cả 4096 vị trí). X đi vào nhánh qua ĐÚNG MỘT phép chiếu `Linear 1152→2560`
-rồi RMSNorm, và chỉ xuất hiện ở Key/Value của Cross-Attn. Mọi thứ còn lại của
-nhánh chạy trên `n_query` (256) vị trí, nên phần nặng nhất là attention
-256 × 4096 chứ không phải một stack 4096 × 2560.
+trên cả 4096 vị trí).
 
 KHÁC §2.0 ở chuỗi: ở đó Z bị THAY bằng Z' = Z + Retriever(Z, R) — đúng 256 chỗ
 token ảnh, chuỗi không dài thêm. Ở đây Z **không bị đụng vào**; nhánh sinh ra 256
@@ -70,10 +81,12 @@ STAGE0_FILE = "recovery_stage0.safetensors"
 STAGE0_META = "recovery_stage0.json"
 BRANCH_FILE = "recovery_branch.safetensors"
 BRANCH_META = "recovery_branch.json"
-# /3 = Recovery chạy ở 2560, X vào nhánh qua một Linear 1152→2560. Checkpoint
-# /1 (có Recomb) và /2 (nhánh ở 1152) KHÔNG nạp được và phải bị từ chối ồn ào
-# thay vì lệch khoá im lặng.
-FORMAT = "rgexp.recovery/3"
+# /4 = Learner ở d_learn (3072), Cross-Attn ở d_vis (1152) với X nguyên vẹn,
+# đầu ra qua một Linear 3072→2560. Checkpoint /1 (có Recomb), /2 (nhánh ở 1152)
+# và /3 (nhánh ở 2560, X qua Linear) KHÔNG nạp được và phải bị từ chối ồn ào
+# thay vì lệch khoá im lặng. Đổi riêng n_query/hidden thì KHÔNG cần đổi format:
+# `spec` trong meta được so từng khoá khi nạp (`load_stage0_into`).
+FORMAT = "rgexp.recovery/4"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -148,43 +161,45 @@ class ClsHead(nn.Module):
 
 
 class Recovery(nn.Module):
-    """X (B, 4096, d_vis) -> Q (B, n_query, d_model).
+    """X (B, 4096, d_vis) -> Q (B, n_query, d_model), qua BA không gian.
 
-        v = RMSNorm_kv(Linear(X))                        d_vis → d_model
-        h = Self-attn(RMSNorm(Learner))                  (n_query, d_model)
-        u = Cross-Attn(RMSNorm_q(h), v)                  query = h, kv = v
-        h = h + Linear(GELU(Linear(u)))                  d_model → hidden → d_model
-        Q = Linear(GELU(Linear(h)))                      d_model → out_hidden → d_model
+        h = Self-attn(RMSNorm(Learner))                  (n_query, d_learn)
+        u = Cross-Attn(RMSNorm_q(Linear(h)), RMSNorm_kv(X))
+                                                         query, kv ở d_vis
+        u = Linear(GELU(Linear(u)))                      d_vis → hidden → d_learn
+        h = h + u                                        (n_query, d_learn)
+        Q = Linear(h)                                    d_learn → d_model
 
     `Learner` là tham số (không phải hàm của ảnh) — nó là `n_query` câu hỏi cố
-    định, còn câu trả lời đến từ Cross-Attn sang X. `inp` là ĐÚNG MỘT phép chiếu
-    đưa X vào không gian của nhánh; nó là thứ duy nhất chạy trên cả 4096 vị trí.
+    định ở `d_learn`, còn câu trả lời đến từ Cross-Attn sang X. X **không** bị
+    chiếu: nó vào Cross-Attn nguyên vẹn ở `d_vis`, chỉ qua RMSNorm, và query
+    được hạ xuống gặp nó bằng `q_proj`. Nhờ vậy không phép nhân ma trận nào áp
+    lên cả 4096 vị trí; phần đắt nhất của nhánh chỉ còn attention.
     """
 
     def __init__(self, d_vis: int = 1152, d_model: int = 2560, n_query: int = 256,
-                 n_heads: int = 20, hidden: int = 1024, out_hidden: int = 2560,
-                 dropout: float = 0.0):
+                 d_learn: int = 3072, n_heads: int = 24, x_heads: int = 9,
+                 hidden: int = 2048, dropout: float = 0.0):
         super().__init__()
         self.n_query = int(n_query)
-        self.inp = nn.Linear(d_vis, d_model)
-        self.learner = nn.Parameter(torch.randn(1, self.n_query, d_model) * 0.02)
-        self.norm_in = RMSNorm(d_model)
-        self.sattn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.norm_q = RMSNorm(d_model)
-        self.norm_kv = RMSNorm(d_model)
-        self.xattn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.up = nn.Linear(d_model, hidden)
-        self.down = nn.Linear(hidden, d_model)
-        self.out_up = nn.Linear(d_model, out_hidden)
-        self.out_down = nn.Linear(out_hidden, d_model)
+        self.learner = nn.Parameter(torch.randn(1, self.n_query, d_learn) * 0.02)
+        self.norm_in = RMSNorm(d_learn)
+        self.sattn = MultiHeadAttention(d_learn, n_heads, dropout)
+        self.q_proj = nn.Linear(d_learn, d_vis)
+        self.norm_q = RMSNorm(d_vis)
+        self.norm_kv = RMSNorm(d_vis)
+        self.xattn = MultiHeadAttention(d_vis, x_heads, dropout)
+        self.up = nn.Linear(d_vis, hidden)
+        self.down = nn.Linear(hidden, d_learn)
+        self.out = nn.Linear(d_learn, d_model)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        v = self.norm_kv(self.inp(x))
         h = self.sattn(self.norm_in(self.learner.expand(x.shape[0], -1, -1)))
-        u = self.xattn(self.norm_q(h), v.to(h.dtype))
+        q = self.norm_q(self.q_proj(h))
+        u = self.xattn(q, self.norm_kv(x.to(q.dtype)))
         h = h + self.down(self.drop(F.gelu(self.up(u))))
-        return self.out_down(self.drop(F.gelu(self.out_up(h))))
+        return self.out(h)
 
 
 def _init(module: nn.Module) -> None:
@@ -206,9 +221,10 @@ def spec_from_cfg(cfg, d_vis: int, d_model: int, n_labels: int) -> dict:
         "n_labels": int(n_labels), "n_classes": len(CLASS_ORDER),
         "class_order": list(CLASS_ORDER),
         "recovery": {"n_query": int(rv.get("n_query", 256)),
-                     "n_heads": int(rv.get("n_heads", 20)),
-                     "hidden": int(rv.get("hidden", 1024)),
-                     "out_hidden": int(rv.get("out_hidden", 2560)),
+                     "d_learn": int(rv.get("d_learn", 3072)),
+                     "n_heads": int(rv.get("n_heads", 24)),
+                     "x_heads": int(rv.get("x_heads", 9)),
+                     "hidden": int(rv.get("hidden", 2048)),
                      "dropout": float(rv.get("dropout", 0.0))},
         "cls_head": {"n_heads": int(ch.get("n_heads", 20)),
                      "dropout": float(ch.get("dropout", 0.0))},
@@ -221,8 +237,8 @@ def spec_fingerprint(spec: dict) -> str:
 
 def build_recovery(spec: dict) -> Recovery:
     r = spec["recovery"]
-    return Recovery(spec["d_vis"], spec["d_model"], r["n_query"], r["n_heads"],
-                    r["hidden"], r["out_hidden"], r["dropout"])
+    return Recovery(spec["d_vis"], spec["d_model"], r["n_query"], r["d_learn"],
+                    r["n_heads"], r["x_heads"], r["hidden"], r["dropout"])
 
 
 def build_cls_head(spec: dict) -> ClsHead:
@@ -286,11 +302,11 @@ class RecoveryBranch(nn.Module):
     def describe(self) -> str:
         s = self.spec
         r = s["recovery"]
-        return (f"Recovery: Linear {s['d_vis']}→{s['d_model']} (X) · "
-                f"Learner({r['n_query']}, {s['d_model']}) -> RMSNorm -> Self-attn "
-                f"({r['n_heads']} head) -> Cross-Attn(·, RMSNorm X') -> Linear/GELU "
-                f"{s['d_model']}→{r['hidden']}→{s['d_model']} (+res) -> Linear/GELU "
-                f"{s['d_model']}→{r['out_hidden']}→{s['d_model']}")
+        return (f"Recovery: Learner({r['n_query']}, {r['d_learn']}) -> RMSNorm -> "
+                f"Self-attn ({r['n_heads']} head) -> Linear →{s['d_vis']} -> "
+                f"Cross-Attn(·, RMSNorm X) ({r['x_heads']} head, {s['d_vis']}) -> "
+                f"Linear/GELU {s['d_vis']}→{r['hidden']}→{r['d_learn']} (+res) -> "
+                f"Linear {r['d_learn']}→{s['d_model']}")
 
 
 # ══ ASL: γ theo TÊN lớp ═════════════════════════════════════════════════════

@@ -29,9 +29,18 @@ set:
   train.gradient_checkpointing: true
   train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
 
-  # ── $2 Stage 0 (chỉ vision tower + Recomb/Cls Head) ─────────────────────
-  # Khởi điểm; autobatch dò lại (ước của stage0.batch_size = 32).
-  stage0.micro_batch: 8
+  # ── §2.1 Stage 0 (chỉ vision tower + Recovery/Cls Head) ─────────────────
+  # KHÔNG dùng chung gì với main stage. Main stage kéo cả decoder 4B nên mảnh
+  # vật lý của nó bị kẹt ở ước của `train_batch` đã khoá theo $1 và KHÔNG được
+  # nâng (nó là một phần lịch học của A). Stage 0 thì không có decoder, không
+  # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
+  # configs/recovery.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
+  # phép leo tới tận 32 nếu VRAM cho phép.
+  stage0.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
+  stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
+                                  # autobatch.probe_sizes bên dưới). Đo ở vùng
+                                  # nó thật sự chạy thì ngoại suy tới 16/32 mới
+                                  # đúng; dùng chung [2,4,8] là luôn ra micro thấp.
 
   # ── Sinh + chấm ─────────────────────────────────────────────────────────
   base.batch_size: 2              # khởi điểm; autobatch sinh dò lại (khoá chung 4 candidate)
@@ -42,7 +51,7 @@ set:
   # train đệm tới max_seq_len (xấu nhất); lượt dò sinh ép đủ max_new_tokens.
   autobatch.enabled: true
   autobatch.target_frac: 0.85
-  autobatch.probe_sizes: [2, 4, 8]
+  autobatch.probe_sizes: [2, 4, 8]   # điểm đo của MAIN STAGE (xem stage0.probe_sizes)
   autobatch.infer_probe_sizes: [2, 4]
   autobatch.infer_max_bs: 16
 

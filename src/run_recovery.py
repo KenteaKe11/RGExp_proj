@@ -231,7 +231,7 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
     """Stage 0 đã có trên Hub (`<hub_base>/stage0/`) mà máy này chưa có -> kéo về,
     để máy mới KHÔNG pretrain lại. Chỉ dùng nếu vân tay cấu hình khớp.
 
-    `base_only` (dùng với `--refinal`): chỉ lấy `base/` (8 epoch) và bỏ `final/`
+    `base_only` (dùng với `--refinal`): chỉ lấy `base/` (`max_epochs` epoch) và bỏ `final/`
     — epoch n+1 sẽ chạy lại trên máy này."""
     from . import stage0_recovery as s0
     from .hub_sync import _api_and_index, _download
@@ -567,7 +567,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         _hr("Stage 0 — pretrain Recovery + Cls Head (ASL)")
         try:
             def _base_done() -> None:
-                # 8 epoch xong -> đẩy base/ + history + loader NGAY, trước epoch n+1
+                # base xong -> đẩy base/ + history + loader NGAY, trước epoch n+1
                 if a.dry_run:
                     return
                 (run_dir / "stage0").mkdir(parents=True, exist_ok=True)
