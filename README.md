@@ -2,9 +2,9 @@
 
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-cùng loader, cùng 3000 ảnh test), rồi **nối thêm 128 learner vector**
-**Q = Recovery(Recomb(X))** ngay sau 256 token ảnh — chất lượng báo cáo X-quang
-có đổi không?
+cùng loader, cùng 3000 ảnh test), rồi **nối thêm 256 learner vector**
+**Q = Recovery(X)** ngay sau 256 token ảnh — chất lượng báo cáo X-quang có đổi
+không?
 
 | candidate | nguồn | chuỗi vào decoder |
 |---|---|---|
@@ -12,47 +12,64 @@ có đổi không?
 | **B** `qlora_r32_decoder_recovery` | §2.1 — Stage 0 → main stage y hệt A + nhánh | `[Z ‖ Q ‖ text]` |
 
 **Biến duy nhất là chuỗi vào decoder.** Z (256 token ảnh) **không bị đụng vào**;
-B chỉ có thêm 128 vị trí nằm ngay sau khối ảnh. 128 vị trí ấy có nhãn `-100`,
+B chỉ có thêm 256 vị trí nằm ngay sau khối ảnh. 256 vị trí ấy có nhãn `-100`,
 `attention_mask = 1`, `token_type_ids = 0` — nên **số token vào CE không đổi** và
-CE của A với B vẫn là cùng một đại lượng. TokenMix cuối của Recovery khởi tạo 0,
-nên ở bước 0 thì Q = 0. Mọi khoá quyết định kết quả của A (`seed`, `data`,
-`image_policy`, `base`, `prompt`, `generate`, `train`, `metrics`) được chép
-nguyên văn từ `configs/lora.yaml` của $1. Vân tay fixture của
-`configs/recovery.yaml` phải **trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
+CE của A với B vẫn là cùng một đại lượng. **Không có lớp khởi tạo 0**: Q mang sẵn
+thông tin Stage 0 ngay từ bước đầu của main stage — đó chính là việc Stage 0 sinh
+ra để làm. Mọi khoá quyết định kết quả của A (`seed`, `data`, `image_policy`,
+`base`, `prompt`, `generate`, `train`, `metrics`) được chép nguyên văn từ
+`configs/lora.yaml` của $1. Vân tay fixture của `configs/recovery.yaml` phải
+**trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
 
-> §2.0 (Recombiner Test: `Z' = Z + Retriever(Z, R)` thay chỗ 256 token ảnh, chuỗi
-> không dài thêm) đã đóng — code ở `_archive/zrecomb/`, README ở
-> `_archive/README_2.0_Recomb.md`.
+> §2.0 (Recombiner Test: khối Recomb chiếu X lên 2560, rồi
+> `Z' = Z + Retriever(Z, R)` thay chỗ 256 token ảnh, chuỗi không dài thêm) đã
+> đóng — code ở `_archive/zrecomb/`, README ở `_archive/README_2.0_Recomb.md`.
 
 ## Kiến trúc (`src/recovery.py`)
 
 ```
-X = SigLIP(ảnh) (4096, 1152) ─► Recomb ─► R (4096, 2560)
-    Recomb: h0 = Linear 1152→2560 ; h = RMSNorm(h0) ; h = Self-attn(h)
-            h = Linear 1280→2560(GELU(Linear 2560→1280(h))) ; R = h0 + h
-R ─► Cls Head (CHỈ Stage 0): RMSNorm -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
-R ─► Recovery ─► Q (128, 2560):
-    h = Self-attn(RMSNorm(Learner))                 Learner = tham số (128, 2560)
-    u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(R))     query = h, key/value = R
-    u = Linear 1280→2560(GELU(Linear 2560→1280(u)))
-    Q = TokenMix(h + u)                             Linear 128→128 trên TRỤC TOKEN, init = 0
-Z = projector(X) (256, 2560)
+X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐
+Z = projector(X) (256, 2560)                           │
+                                          ┌──── Recovery ────┐
+  h = Self-attn(RMSNorm(Learner))         │ Learner (256, 1152) — tham số
+  u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(X))          │ query = h, key/value = X
+  u = Linear 2560→1152(GELU(Linear 1152→2560 (u)))     │
+  h = h + u                                            │
+  Q = Linear 2560→2560(GELU(Linear 1152→2560 (h)))     │ -> Q (256, 2560)
+                                          └──────────────────┘
+Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-20 head (head_dim 128) ở cả bốn attention. Tham số nhánh để fp32, chạy dưới
-autocast bf16.
+**Không còn khối Recomb.** §2.0 chiếu X lên 2560 rồi xử lý toàn bộ nhánh ở 2560
+trên 4096 vị trí. Ở đây Recovery làm việc **ngay trong không gian 1152 của
+SigLIP** và chỉ giữ `n_query` (256) vị trí; 4096 token thị giác chỉ xuất hiện ở
+Key/Value của Cross-Attn. Đúng một chỗ đổi sang 2560: MLP cuối — chỗ viết vào
+không gian embedding của decoder. Kết quả: nhánh 26,3 M tham số (Stage 0 thêm
+Cls Head thành 52,7 M), và phần nặng nhất là attention 256 × 4096 chứ không phải
+activation 4096 × 2560.
+
+Head_dim 128 ở mọi attention: 9 head cho khối 1152 (Self-attn, Cross-Attn), 20
+head cho Attn-Pooling ở 2560. Tham số nhánh để fp32, chạy dưới autocast bf16.
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
-Đặt Q trước Z thì 128 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
+Đặt Q trước Z thì 256 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
 lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) và
 `recombiner.image_end_indices(ids) + 1` (khâu sinh, đệm trái — mỗi hàng một chỗ).
 
 ## Lịch
 
-**Stage 0: pretrain Recomb** (`src/stage0_recovery.py`). Chỉ vision tower của
-Gemma chạy (đóng băng); không có decoder, không có LoRA, **không có Recovery**.
+**Stage 0: pretrain Recovery** (`src/stage0_recovery.py`). Chỉ vision tower của
+Gemma chạy (đóng băng); không có decoder, không có LoRA.
+
+```
+X = SigLIP(ảnh) (đóng băng, no_grad) ─► Recovery ─► Q ─► Cls Head ─► ASL (14 × 3)
+```
+
+Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main stage sẽ nối vào
+chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không đọc một biểu
+diễn trung gian nào rồi vứt đi.
 
 * AdamW, lr **cố định 3e-4**, wd 0.03, **8 epoch**, batch 32 (micro do autobatch chọn).
   Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 8 epoch xong.
@@ -76,18 +93,21 @@ $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt đã khoá
 200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo val (CE trên 256 mẫu
 bốc lại mỗi 25 bước). Phần thêm:
 
-* Cls Head **bị bỏ**. Recomb nạp từ Stage 0 và **đóng băng hoàn toàn trong 0.5 epoch
-  đầu** (100/200 bước), sau đó học ở lr cố định 1e-5, wd 0.01. Autobatch dò VRAM ở
-  trạng thái đã mở băng (nặng nhất).
-* Recovery ("Main"): AdamW riêng, lr **cố định 1e-4**, wd 0.03.
+* Cls Head **bị bỏ**. Recovery nạp **trọn vẹn** từ Stage 0 (`final/`) và **đóng
+  băng hoàn toàn trong 1/4 epoch đầu** (50/200 bước), sau đó học ở lr cố định
+  **3e-5**, wd 0.01. Autobatch dò VRAM ở trạng thái đã mở băng (nặng nhất).
+* Nhánh chỉ có **một** nhóm tham số — không còn "Main" / "Pretrain" như §2.0, vì
+  không còn phần nào của nhánh là mới tinh (§2.0 tách hai nhóm chính vì Retriever
+  ở đó khởi tạo ngẫu nhiên).
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: một nhánh **cộng 128 token** trong chuỗi. Nếu batch đã khoá không
+* B nặng hơn A: một nhánh **cộng 256 token** trong chuỗi. Nếu batch đã khoá không
   vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo token.
   Kết quả đúng bằng con số HF tính trên cả micro-batch, nên gradient không đổi.
 * Khởi tạo nhánh chạy trong `fork_rng`, nên LoRA được khởi tạo từ đúng trạng
   thái RNG như A.
-* Theo dõi `RMS(Q)/RMS(Z)` mỗi bước: ≈ 0 nghĩa là nhánh chưa nói gì với decoder.
+* Theo dõi `RMS(Q)/RMS(Z)` mỗi bước — độ lớn một chiều của Q so với một chiều
+  của token ảnh, ghi vào `train_stats.json` cùng đường cong val.
 
 Không áp dụng cho §2.1 (các mục của lịch MoE): patience/early-stop, max 50 epoch,
 nhiễu Route, Route_Gate/Experts.
@@ -130,14 +150,14 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 1. **[Language] Độ nhạy theo lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, **một** heatmap,
    chỉ `lens.layer_frac` (1/4, làm tròn lên → 9/34) **lớp cuối**, trục y ghi
    **chỉ số lớp thật**. Thanh màu phía trên đánh dấu vùng **Z** (256 token ảnh)
-   và vùng **Q** (128 learner) — so hai vùng ấy là câu hỏi chính: *decoder có
-   thật sự đọc 128 vector mới không*. Kèm bảng 5 ô nhạy nhất (có nhãn `Z[i]` /
+   và vùng **Q** (256 learner) — so hai vùng ấy là câu hỏi chính: *decoder có
+   thật sự đọc 256 vector mới không*. Kèm bảng 5 ô nhạy nhất (có nhãn `Z[i]` /
    `Q[k]` / `text`) và 8 learner vector được đọc nhiều nhất. Lớp thấp bị bỏ có
    chủ ý: ở đó gradient gần như chỉ nói về hình thái token.
 2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token ở
    các lớp mốc trong khoảng ấy, kèm bảng 14 nhãn bệnh lý của ảnh đó. Đầy đủ ở
    `logit_lens.csv`.
-3. **[Visual] Chain rule từ Q về ảnh** — `y → Q → Recovery → Recomb → X`, chuẩn
+3. **[Visual] Chain rule từ Q về ảnh** — `y → Q → Recovery → X`, chuẩn
    gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc. **Một bản đồ duy
    nhất, và nó nói về chính Q.** Đường `y → Z → projector → X` không vẽ nữa
    (vision tower + projector đóng băng, Z không bị đụng → bản đồ ấy của B giống
@@ -149,7 +169,7 @@ theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc v�
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
-chỉ vài learner làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
+chỉ vài trong 256 learner làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
 encoder‖`, tương quan và IoU giữa hai bản đồ.
 
 Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
@@ -205,7 +225,7 @@ Các cờ:
 ```
 adapters_recovery/_fixture/                  = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_recovery/_stage0/                   PRETRAIN — để về sau đối chứng SoTA
-    base/recovery_stage0.safetensors|.json   Recomb + Cls Head sau 8 epoch lr cố định
+    base/recovery_stage0.safetensors|.json   Recovery + Cls Head sau 8 epoch lr cố định
     final/recovery_stage0.safetensors|.json  sau epoch 9 (cosine 3e-5 → 1e-8) — main stage dùng bản này
     loader.json                              fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
                                              batch/micro, lịch, ASL, spec, vân tay, sha256 weight
@@ -214,7 +234,7 @@ adapters_recovery/_stage0/                   PRETRAIN — để về sau đối 
     last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
 adapters_recovery/qlora_r32_decoder_recovery/   MAIN STAGE
     adapter_model.safetensors, adapter_config.json   LoRA r32
-    recovery_branch.safetensors|.json        Recomb (từ Stage 0) + Recovery
+    recovery_branch.safetensors|.json        Recovery (nạp trọn từ Stage 0)
     recovery_stage0.safetensors|.json        bản chép Stage 0 đã nạp (truy nguồn)
     train_stats.json                         batch/accum/mảnh, lr, val curve, RMS(Q)/RMS(Z), VRAM, phút
 runs/recovery/                               REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
@@ -245,7 +265,7 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/recovery.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_recovery.sh · selftest_recovery.py · setup.sh · _env.sh
 src/run_recovery.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/recovery.py          Recomb · Cls Head (Attn-Pooling) · Recovery (Learner + TokenMix) ·
+src/recovery.py          Recovery (Learner + Self/Cross-Attn ở 1152) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_recovery.py   Stage 0 + loader.json + nhãn chụp lại
 src/train_recovery.py    main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)

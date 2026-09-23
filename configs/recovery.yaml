@@ -8,17 +8,19 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_recovery  — Stage 0 (pretrain Recomb + Cls Head, ASL) ->
-#                                    main stage y hệt A + nhánh Recovery.
+#   B  qlora_r32_decoder_recovery  — Stage 0 (pretrain Recovery + Cls Head, ASL)
+#                                    -> main stage y hệt A + nhánh Recovery.
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Recovery(Recomb(X)) — 128 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng
-# vào. 128 vị trí thêm có nhãn −100 nên số token vào CE không đổi. TokenMix cuối
-# của Recovery khởi tạo 0 nên ở bước 0 thì Q = 0. Kiểm định: bootstrap ghép cặp
-# (BCa) + permutation đảo dấu, Holm trên các metric (`src/stats_ab.py`).
+# với Q = Recovery(X) — 256 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# 256 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# tạo 0: Q mang sẵn thông tin Stage 0 ngay từ bước 0 — đó chính là việc Stage 0
+# sinh ra để làm. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
+# Holm trên các metric (`src/stats_ab.py`).
 #
-# KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó Z bị THAY bằng
-# Z' = Z + Retriever(Z, R) và chuỗi không dài thêm. Ở đây chuỗi dài thêm 128.
+# KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
+# lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
+# đây KHÔNG còn Recomb — Recovery đọc thẳng X (1152) — và chuỗi dài thêm 256.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
 # generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
@@ -299,31 +301,30 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/recovery.py`) ────────────────────────────────────────────
+# KHÔNG còn Recomb. Recovery làm việc NGAY trong không gian 1152 của SigLIP và
+# chỉ giữ n_query vị trí; 4096 token thị giác chỉ xuất hiện ở Key/Value của
+# Cross-Attn. Đúng một chỗ đổi sang 2560: MLP cuối, chỗ viết vào không gian
+# embedding của decoder.
 recovery:
   n_labels: null            # null = theo labels.npz (14)
-  recomb:                   # X (4096, 1152) -> R (4096, 2560)
-    n_heads: 20             # head_dim 128
-    hidden: 1280            # Linear/GELU 2560 -> 1280 -> Linear -> 2560
-    dropout: 0.0
-  cls_head:                 # CHỈ Stage 0: RMSNorm -> Attn-Pooling -> Linear 2560 -> 14·3
-    n_heads: 20
-    dropout: 0.1
-  recovery:                 # Learner -> Self-attn -> Cross-Attn(·, R) -> MLP -> TokenMix
-    n_query: 128            # số learner vector NỐI vào chuỗi (chuỗi dài thêm đúng ngần này)
-    n_heads: 20
-    hidden: 1280            # Linear/GELU 2560 -> 1280 -> Linear -> 2560
+  recovery:                 # X (4096, 1152) -> Q (256, 2560)
+    n_query: 256            # số learner vector NỐI vào chuỗi (chuỗi dài thêm đúng ngần này)
+    n_heads: 9              # head_dim 128 (1152 = 9 × 128), cho Self-attn và Cross-Attn
+    hidden: 2560            # MLP(GeLU) sau Cross-Attn: 1152 -> 2560 -> 1152 (+res)
+    out_hidden: 2560        # MLP(GeLU) cuối: 1152 -> 2560 -> 2560 (ra không gian decoder)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-    zero_init_out: true     # TokenMix (128→128 trên trục token) = 0 -> Q = 0 ở bước 0
-  # Main stage — nhánh có optimizer RIÊNG, lr CỐ ĐỊNH; LoRA theo `train` ($1).
+  cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
+    n_heads: 20             # head_dim 128 (2560 = 20 × 128)
+    dropout: 0.1
+  # Main stage — cả Recovery đã được Stage 0 dạy, nên chỉ MỘT nhóm tham số:
+  # đóng băng hoàn toàn 1/4 epoch đầu rồi học ở lr cố định. LoRA theo `train` ($1).
   main:
-    recovery_lr: 1.0e-4     # "Main"
-    recovery_wd: 0.03
-    recomb_lr: 1.0e-5       # "Pretrain" (chỉ sau khi mở băng)
-    recomb_wd: 0.01
-    freeze_recomb_epochs: 0.5  # đóng băng HOÀN TOÀN 0.5 epoch đầu (100/200 bước), rồi học ở recomb_lr
+    recovery_lr: 3.0e-5     # sau khi mở băng, CỐ ĐỊNH
+    recovery_wd: 0.01
+    freeze_recovery_epochs: 0.25   # đóng băng HOÀN TOÀN 1/4 epoch đầu (50/200 bước)
     separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
 
-# ── Stage 0: pretrain Recomb + Cls Head (`src/stage0_recovery.py`) ─────────
+# ── Stage 0: pretrain Recovery + Cls Head (`src/stage0_recovery.py`) ───────
 stage0:
   lr: 3.0e-4                # CỐ ĐỊNH
   weight_decay: 0.03
@@ -394,13 +395,13 @@ lens:
 
 wandb:
   enabled: true
-  project: rgexp-recomb
+  project: rgexp-recovery
   entity: null
   run_name: null
-  group: "recombiner-z"
+  group: "recovery-q"
   resume_same_run: false
   mode: online
-  tags: [recomb, qlora, r32, mimic-cxr]
+  tags: [recovery, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20

@@ -88,17 +88,18 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{((st_b.get('recovery') or {}).get('spec') or {}).get('recovery', {}).get('n_query', '?')} "
-         f"token, Q = Recovery(Recomb(X)), Z giữ nguyên)"],
-        ["Stage 0", "—", f"Recomb + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
+         f"token, Q = Recovery(X), Z giữ nguyên)"],
+        ["Stage 0", "—", f"Recovery + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
                           f"({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
-         f"Recovery lr {zm.get('recovery_lr')} wd {zm.get('recovery_wd')} (cố định) · "
-         f"Recomb đóng băng {zm.get('freeze_recomb_epochs')} epoch đầu · Cls Head bỏ"],
+         f"Recovery nạp TRỌN từ Stage 0, đóng băng "
+         f"{zm.get('freeze_recovery_epochs')} epoch đầu rồi lr cố định "
+         f"{zm.get('recovery_lr')} wd {zm.get('recovery_wd')} · Cls Head bỏ"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
 
-    L.append("## Stage 0 — Recomb + Cls Head\n")
+    L.append("## Stage 0 — Recovery + Cls Head\n")
     if s0.get("history"):
         L.append(f"lr cố định {s0.get('stage0', {}).get('lr')} · wd "
                  f"{s0.get('stage0', {}).get('weight_decay')} · ≤ "
@@ -127,8 +128,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
          if isinstance(st_a.get("trainable_params"), int) else "—",
          f"{st_b.get('trainable_params', '—'):,}"
          if isinstance(st_b.get("trainable_params"), int) else "—"],
-        ["tham số nhánh", "—", f"{((st_b.get('recovery') or {}).get('n_params') or {}).get('recovery', '—')} "
-         f"(Recovery) + {((st_b.get('recovery') or {}).get('n_params') or {}).get('recomb', '—')} (Recomb)"],
+        ["tham số nhánh", "—",
+         f"{((st_b.get('recovery') or {}).get('n_params') or {}).get('recovery', '—')} (Recovery)"],
         ["CE train cuối", _f(st_a.get("ce_last")), _f(st_b.get("ce_last"))],
         ["val CE cuối (256 mẫu)", _f(st_a.get("val_loss_last")), _f(st_b.get("val_loss_last"))],
         ["RMS(Q)/RMS(Z) cuối", "—", _f(st_b.get("q_rms_rel_last"))],
@@ -179,16 +180,17 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              "và khởi tạo LoRA của B trùng A, nhưng mặt nạ dropout LoRA không trùng "
              "từng bit (lượt dò autobatch của A trong $1 tiêu RNG; B không dò ở batch "
              "đã khoá). Đây là nhiễu hạt giống, không phải một biến có hệ thống.")
-    L.append("- Recomb được Stage 0 dạy trên nhãn bệnh lý của 6400 ảnh train — một "
+    L.append("- Recovery được Stage 0 dạy trên nhãn bệnh lý của 6400 ảnh train — một "
              "nguồn giám sát A không có. \"Biến duy nhất là chuỗi vào decoder\" "
              "nghĩa là đúng thế; Q mang theo cả thông tin do Stage 0 học.")
     L.append("- B có chuỗi DÀI HƠN A đúng 128 token. Số token vào CE giữ nguyên "
              "(128 vị trí ấy có nhãn −100), nhưng decoder của B có thêm 128 vị trí "
              "để attention nhìn vào — đó là một phần của biến đang đo, không phải "
              "một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
-    L.append(f"- Recomb đóng băng {zm.get('freeze_recomb_epochs')} epoch đầu của main "
-             f"stage, sau đó học ở lr {zm.get('recomb_lr')} — nhánh của B có nhiều tham số "
-             f"học được hơn A ở nửa sau.")
+    L.append(f"- Recovery đóng băng {zm.get('freeze_recovery_epochs')} epoch đầu của "
+             f"main stage, sau đó học ở lr {zm.get('recovery_lr')} — nhánh của B có thêm "
+             f"tham số học được mà A không có, kể từ bước "
+             f"{((st_b.get('recovery') or {}).get('frozen_steps'), '?')[0]}.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")

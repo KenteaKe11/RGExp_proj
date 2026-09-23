@@ -31,7 +31,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
 2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token ở các lớp
    mốc trong khoảng ấy, kèm 14 nhãn bệnh lý của ảnh đó.
 3. [Visual] Chain rule từ Q VÒNG QUA Recovery: ∂y/∂X đi theo đường
-   y -> Q -> Recovery -> Recomb -> X (X = 4096 patch của SigLIP, lưới 64×64) —
+   y -> Q -> Recovery -> X (X = 4096 patch của SigLIP, lưới 64×64) —
    "Q rút thông tin từ vùng nào của ảnh". Đường `y -> Z -> projector -> X` KHÔNG
    vẽ nữa (vision tower + projector đóng băng, Z không bị đụng -> bản đồ ấy của B
    giống hệt của A); số thô của nó vẫn lưu trong `lens_maps.npz` (`sal_z`) và
@@ -157,7 +157,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     """-> {layer_sens (L, T), hidden (L, d) ở vị trí cuối, sal_z, sal_recomb, y}.
 
     `sal_*` là chuẩn gradient trên 4096 patch của SigLIP, cho về lưới 64×64.
-    Hai đường (Z và Recomb) tách nhau bằng hai LÁ gradient của cùng một X:
+    Hai đường (Z và Recovery) tách nhau bằng hai LÁ gradient của cùng một X:
     cùng giá trị, khác node — nên `∂y/∂lá` chỉ chứa đúng đường đi qua lá ấy.
     """
     import torch
@@ -175,18 +175,18 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     span = _image_span(ids, img_tok)
     leaf_r, q, ins = None, None, None
     if branch is not None:
-        # Recomb bị đóng băng lúc TRAIN (forward trong no_grad). Ở Lens ta cần đồ
+        # Recovery bị đóng băng lúc nạp lại (forward trong no_grad). Ở Lens ta cần đồ
         # thị để chain rule đi qua nó, nên mở cờ frozen rồi khoá lại requires_grad
         # của tham số — trọng số vẫn không đổi, chỉ có đường gradient được nối.
-        was_frozen = branch.recomb_frozen
-        branch.set_recomb_frozen(False)
+        was_frozen = branch.frozen
+        branch.set_frozen(False)
         for p in branch.parameters():
             p.requires_grad_(False)
         leaf_r = vis.detach().clone().requires_grad_(True)  # đường Recovery
         with RCV.autocast(dev):
             q = branch(leaf_r)
         q = q.to(aligned.dtype)
-        branch.set_recomb_frozen(was_frozen)
+        branch.set_frozen(was_frozen)
         for p in branch.parameters():
             p.requires_grad_(False)
     embeds = recombiner.build_inputs_embeds(gemma, ids, aligned)
@@ -392,7 +392,7 @@ def plot_visual(item: dict, q_map: np.ndarray, path: Path, cfg_l: dict) -> Path:
     rgba[..., 3] = np.clip(big, 0.0, 1.0) * float(cfg_l["overlay_alpha"])
     axes[1].imshow(img, cmap="gray", vmin=0, vmax=1)
     axes[1].imshow(rgba, interpolation="bilinear")
-    axes[1].set_title("Q qua Recovery — y → Q → Recovery → Recomb → X", fontsize=9)
+    axes[1].set_title("Q qua Recovery — y → Q → Recovery → X", fontsize=9)
     axes[1].axis("off")
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
     cb = fig.colorbar(sm, ax=list(axes), fraction=0.02, pad=0.01)
@@ -690,7 +690,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "64×64 rồi chồng lên ảnh gốc "
           f"(alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị {lc['percentile_clip']}), "
           "đi theo đường\n",
-          "```\ny → Q → Recovery → Recomb → X\n```\n",
+          "```\ny → Q → Recovery → X\n```\n",
           "**Chỉ một bản đồ, và nó nói về chính Q.** Đường thứ hai của §2.0 "
           "(`y → Z → projector → X`) không được vẽ nữa: vision tower và projector đều "
           "đóng băng và Z không bị nhánh đụng vào, nên bản đồ ấy của B giống hệt của A "

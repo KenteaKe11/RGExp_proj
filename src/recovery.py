@@ -1,55 +1,55 @@
-"""§2.1 Recovery — kiến trúc [Z ‖ Q ‖ T]: 128 learner vector NỐI vào chuỗi.
+"""§2.1 Recovery — kiến trúc [Z ‖ Q ‖ T]: 256 learner vector NỐI vào chuỗi.
 
-Sơ đồ (đúng hình "Recovery" + "Supervised Block"):
+Sơ đồ (đúng hình "Recovery" + "Cls Head"):
 
     Image ─► Vision Encoder (SigLIP) ─► X (4096, 1152) ──────────────┐
-                    │                                                  ▼
-                    ▼                                  ┌──────── Recomb ────────┐
-              Adapter (projector)                      │ h0 = Linear 1152→2560  │
-                    │                                  │ h  = RMSNorm(h0)       │
-                    ▼                                  │ h  = Self-attn(h)      │
-          Vision Tokens Z (256, 2560)                  │ h  = Linear 1280→2560( │
-                    │                                  │      GELU(Linear       │
-                    │                                  │      2560→1280 (h)))   │
-                    │                                  │ R  = h0 + h            │
-                    │                                  └──────────┬─────────────┘
-                    │                    R (4096, 2560)           │
-                    │                            ┌────────────────┴──► Cls Head (CHỈ Stage 0)
-        ┌────────── Recovery ───────────┐        │                     RMSNorm -> Attn-Pooling
-        │ q  = Learner (128, 2560)      │        │                     -> Linear 2560→14·3 -> ASL
-        │ h  = Self-attn(RMSNorm(q))    │        │
-        │ u  = Cross-Attn(RMSNorm_q(h), │◄───────┘
-        │                 RMSNorm_kv(R))│
-        │ u  = Linear 1280→2560(        │
-        │      GELU(Linear 2560→1280 u))│
-        │ Q  = TokenMix(h + u)          │   TokenMix: Linear 128→128 trên TRỤC TOKEN
-        └───────────────┬───────────────┘
-                        ▼
+                    │                                                  │
+                    ▼                        ┌──────── Recovery ───────┴──────┐
+              Adapter (projector)            │ q  = Learner (256, 1152)       │
+                    │                        │ h  = Self-attn(RMSNorm(q))     │
+                    ▼                        │ u  = Cross-Attn(RMSNorm_q(h),  │
+          Vision Tokens Z (256, 2560)        │                RMSNorm_kv(X))  │
+                    │                        │ u  = Linear 2560→1152(         │
+                    │                        │      GELU(Linear 1152→2560 u)) │
+                    │                        │ h  = h + u                     │
+                    │                        │ Q  = Linear 2560→2560(         │
+                    │                        │      GELU(Linear 1152→2560 h)) │
+                    │                        └────────┬───────────────┬───────┘
+                    │                    Q (256, 2560)│               │
+                    │                                 │               ▼
+                    │                                 │      Cls Head (CHỈ Stage 0)
+                    │                                 │      RMSNorm(2560) -> Attn-Pooling
+                    │                                 │      -> Linear 2560→14·3 -> ASL
+                    ▼                                 ▼
     [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
-KHÁC §2.0 (Recombiner Test, `_archive/zrecomb/`): ở đó Z bị THAY bằng
-Z' = Z + Retriever(Z, R) — đúng 256 chỗ token ảnh, chuỗi không dài thêm. Ở đây
-Z **không bị đụng vào**; nhánh sinh ra 128 vector MỚI và chúng được NỐI ngay
-SAU 256 token ảnh (thứ tự Z → Q → T, giữ nguyên BOS và câu lệnh hệ thống ở đầu
-chuỗi; Q đứng sau Z nên với attention nhân quả mọi vị trí của Q đều đọc được
-toàn bộ token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q). Hệ quả phải
-nhớ:
+KHÔNG còn khối Recomb. §2.0 (`_archive/zrecomb/`) chiếu X lên 2560 rồi mới xử lý,
+và nhánh chạy toàn bộ ở 2560 trên 4096 vị trí. Ở đây Recovery làm việc NGAY
+trong không gian 1152 của SigLIP và chỉ giữ `n_query` (256) vị trí; chỉ đúng một
+chỗ đổi sang 2560, là MLP cuối — chỗ viết vào không gian embedding của decoder.
+4096 token thị giác chỉ xuất hiện ở Key/Value của Cross-Attn, nên phần nặng nhất
+của nhánh là 256 × 4096 attention chứ không phải 4096 × 2560 activation.
 
-  * chuỗi vào decoder DÀI THÊM 128 token, nên B không còn trùng A từng bit ở
-    bước 0 dù lớp cuối khởi tạo 0 — nó trùng A "cộng 128 token embedding 0";
-  * nhãn của 128 vị trí ấy là −100 và attention_mask = 1, token_type_ids = 0
+KHÁC §2.0 ở chuỗi: ở đó Z bị THAY bằng Z' = Z + Retriever(Z, R) — đúng 256 chỗ
+token ảnh, chuỗi không dài thêm. Ở đây Z **không bị đụng vào**; nhánh sinh ra 256
+vector MỚI và chúng được NỐI ngay SAU 256 token ảnh (thứ tự Z → Q → T, giữ
+nguyên BOS và câu lệnh hệ thống ở đầu chuỗi; Q đứng sau Z nên với attention nhân
+quả mọi vị trí của Q đều đọc được toàn bộ token ảnh, còn phần văn bản phía sau
+đọc được cả Z lẫn Q). Hệ quả phải nhớ:
+
+  * chuỗi vào decoder DÀI THÊM `n_query` (256) token, nên B không trùng A ở bước
+    0 — và điều đó là CÓ CHỦ Ý: Stage 0 sinh ra chính là để Q có nghĩa ngay từ
+    bước đầu của main stage (§2.0 có TokenMix khởi tạo 0, ở đây bỏ);
+  * nhãn của 256 vị trí ấy là −100 và attention_mask = 1, token_type_ids = 0
     (chúng KHÔNG phải token ảnh của processor): số token vào CE giữ nguyên, nên
     CE của A và B vẫn so được;
-  * VRAM và thời gian mỗi bước tăng theo 128/(độ dài chuỗi).
+  * VRAM và thời gian mỗi bước tăng theo 256/(độ dài chuỗi).
 
-Hai quyết định có chủ ý (giữ từ §2.0):
-
-1. `recovery.zero_init_out: true` — TokenMix cuối khởi tạo 0, nên ở bước 0 thì
-   Q = 0 và nhánh chưa nói gì với decoder. Mọi ảnh hưởng về sau là do Recovery
-   đã học, không phải một phép chiếu ngẫu nhiên chen vào chuỗi ngay từ đầu.
-2. Tham số của nhánh để fp32, forward chạy dưới autocast bf16. Ở lr 1e-5..1e-4
-   một bước Adam nhỏ hơn eps của bf16 (7.8e-3 tương đối) so với trọng số ~0.02,
-   nên tham số bf16 sẽ nuốt mất phần lớn cập nhật mà không báo gì.
+Stage 0 pretrain CHÍNH Recovery (Recovery + Cls Head, ASL trên 14 bệnh lý × 3
+lớp), rồi main stage nạp nguyên khối ấy: không còn phần nào của nhánh là mới
+tinh. Tham số của nhánh để fp32, forward chạy dưới autocast bf16 — ở lr
+1e-5..1e-4 một bước Adam nhỏ hơn eps của bf16 (7.8e-3 tương đối) so với trọng số
+~0.02, nên tham số bf16 sẽ nuốt mất phần lớn cập nhật mà không báo gì.
 """
 from __future__ import annotations
 
@@ -70,7 +70,9 @@ STAGE0_FILE = "recovery_stage0.safetensors"
 STAGE0_META = "recovery_stage0.json"
 BRANCH_FILE = "recovery_branch.safetensors"
 BRANCH_META = "recovery_branch.json"
-FORMAT = "rgexp.recovery/1"
+# /2 = bố cục bỏ Recomb, Recovery chạy ở 1152. Checkpoint /1 KHÔNG nạp được và
+# phải bị từ chối ồn ào thay vì lệch khoá im lặng.
+FORMAT = "rgexp.recovery/2"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -104,46 +106,6 @@ class MultiHeadAttention(nn.Module):
         return self.o(y.transpose(1, 2).reshape(b, n, self.d))
 
 
-class TokenMix(nn.Module):
-    """Linear(n → n) áp lên TRỤC TOKEN (trộn chéo 128 learner vector), không bias.
-
-    Số token vào bị chốt cứng và kiểm mỗi lượt forward: một bản torch nào đó
-    broadcast được thì nhánh học trên rác mà không ném gì.
-    """
-
-    def __init__(self, n_in: int, n_out: int | None = None):
-        super().__init__()
-        self.n_in = int(n_in)
-        self.n_out = int(n_out if n_out is not None else n_in)
-        self.proj = nn.Linear(self.n_in, self.n_out, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[1] != self.n_in:
-            raise RuntimeError(f"TokenMix nhận {x.shape[1]} token nhưng được dựng "
-                               f"cho {self.n_in}.")
-        return self.proj(x.transpose(1, 2)).transpose(1, 2)
-
-
-class Recomb(nn.Module):
-    """X (B, 4096, d_vis) -> R (B, 4096, d_model). Một residual bao trọn khối."""
-
-    def __init__(self, d_vis: int = 1152, d_model: int = 2560, n_heads: int = 20,
-                 hidden: int = 1280, dropout: float = 0.0):
-        super().__init__()
-        self.inp = nn.Linear(d_vis, d_model)
-        self.norm = RMSNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.up = nn.Linear(d_model, hidden)
-        self.down = nn.Linear(hidden, d_model)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h0 = self.inp(x)
-        h = self.attn(self.norm(h0))
-        h = self.down(self.drop(F.gelu(self.up(h))))
-        return h0 + h
-
-
 class AttnPooling(nn.Module):
     """Một learnable query đọc N token -> 1 vector."""
 
@@ -158,7 +120,17 @@ class AttnPooling(nn.Module):
 
 
 class ClsHead(nn.Module):
-    """R -> RMSNorm -> Attn-Pooling -> Linear d_model → L·C. CHỈ dùng ở Stage 0."""
+    """Q -> RMSNorm -> Attn-Pooling -> Linear d_model → L·C. CHỈ dùng ở Stage 0.
+
+    Đọc ĐẦU RA của Recovery (256 × 2560), không đọc đặc trưng thị giác thô: đó là
+    điều làm Stage 0 có nghĩa với main stage — thứ bị ép mang đủ thông tin bệnh
+    lý chính là khối Q mà decoder sẽ đọc, chứ không phải một biểu diễn trung gian
+    nào đó rồi bị vứt đi.
+
+    `self.norm` là pre-norm CỦA RIÊNG khối Attn-Pooling ở đây, đúng quy ước
+    pre-norm của một khối attention. Nó KHÔNG đụng tới Q: thứ main stage nối vào
+    chuỗi decoder là đầu ra thô của Recovery, và Cls Head biến mất sau Stage 0.
+    """
 
     def __init__(self, d_model: int, n_labels: int, n_classes: int = 3,
                  n_heads: int = 20, dropout: float = 0.0):
@@ -169,50 +141,47 @@ class ClsHead(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.fc = nn.Linear(d_model, self.n_labels * self.n_classes)
 
-    def forward(self, r: torch.Tensor) -> torch.Tensor:
-        z = self.drop(self.pool(self.norm(r)))
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        z = self.drop(self.pool(self.norm(q)))
         return self.fc(z).view(-1, self.n_labels, self.n_classes)
 
 
 class Recovery(nn.Module):
-    """R -> Q: 128 learner vector đọc R rồi đi thẳng vào chuỗi của decoder.
+    """X (B, 4096, d_vis) -> Q (B, n_query, d_model).
 
-        h = Self-attn(RMSNorm(Learner))                 (128, d_model)
-        u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(R))     query = h, kv = R
-        u = Linear(GELU(Linear(u)))                     hidden = `hidden`
-        Q = TokenMix(h + u)                             Linear 128→128 trên trục token
+        h = Self-attn(RMSNorm(Learner))                  (n_query, d_vis)
+        u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(X))      query = h, kv = X
+        u = Linear(GELU(Linear(u)))                      d_vis → hidden → d_vis
+        h = h + u
+        Q = Linear(GELU(Linear(h)))                      d_vis → out_hidden → d_model
 
-    KHÔNG nhận Z: Z đi thẳng vào decoder như của A, không bị nhánh đụng vào.
-    `Learner` là tham số (không phải hàm của ảnh) — nó là 128 câu hỏi cố định,
-    còn câu trả lời đến từ Cross-Attn sang R.
+    `Learner` là tham số (không phải hàm của ảnh) — nó là `n_query` câu hỏi cố
+    định, còn câu trả lời đến từ Cross-Attn sang X. Cả khối trừ MLP cuối chạy ở
+    d_vis (1152): chỉ chỗ viết vào không gian embedding của decoder mới lên 2560.
     """
 
-    def __init__(self, d_model: int = 2560, n_query: int = 128, n_heads: int = 20,
-                 hidden: int = 1280, dropout: float = 0.0, zero_init_out: bool = True):
+    def __init__(self, d_vis: int = 1152, d_model: int = 2560, n_query: int = 256,
+                 n_heads: int = 9, hidden: int = 2560, out_hidden: int = 2560,
+                 dropout: float = 0.0):
         super().__init__()
         self.n_query = int(n_query)
-        self.learner = nn.Parameter(torch.randn(1, self.n_query, d_model) * 0.02)
-        self.norm_in = RMSNorm(d_model)
-        self.sattn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.norm_q = RMSNorm(d_model)
-        self.norm_kv = RMSNorm(d_model)
-        self.xattn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.up = nn.Linear(d_model, hidden)
-        self.down = nn.Linear(hidden, d_model)
+        self.learner = nn.Parameter(torch.randn(1, self.n_query, d_vis) * 0.02)
+        self.norm_in = RMSNorm(d_vis)
+        self.sattn = MultiHeadAttention(d_vis, n_heads, dropout)
+        self.norm_q = RMSNorm(d_vis)
+        self.norm_kv = RMSNorm(d_vis)
+        self.xattn = MultiHeadAttention(d_vis, n_heads, dropout)
+        self.up = nn.Linear(d_vis, hidden)
+        self.down = nn.Linear(hidden, d_vis)
+        self.out_up = nn.Linear(d_vis, out_hidden)
+        self.out_down = nn.Linear(out_hidden, d_model)
         self.drop = nn.Dropout(dropout)
-        self.out = TokenMix(self.n_query)
-        self.zero_init_out = bool(zero_init_out)
 
-    def reset_out(self) -> None:
-        if self.zero_init_out:
-            nn.init.zeros_(self.out.proj.weight)
-
-    def forward(self, r: torch.Tensor) -> torch.Tensor:
-        """R (B, 4096, d_model) -> Q (B, n_query, d_model)."""
-        h = self.sattn(self.norm_in(self.learner.expand(r.shape[0], -1, -1)))
-        u = self.xattn(self.norm_q(h), self.norm_kv(r.to(h.dtype)))
-        u = self.down(self.drop(F.gelu(self.up(u))))
-        return self.out(h + u)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.sattn(self.norm_in(self.learner.expand(x.shape[0], -1, -1)))
+        u = self.xattn(self.norm_q(h), self.norm_kv(x.to(h.dtype)))
+        h = h + self.down(self.drop(F.gelu(self.up(u))))
+        return self.out_down(self.drop(F.gelu(self.out_up(h))))
 
 
 def _init(module: nn.Module) -> None:
@@ -228,19 +197,16 @@ def _init(module: nn.Module) -> None:
 def spec_from_cfg(cfg, d_vis: int, d_model: int, n_labels: int) -> dict:
     """Khối `recovery` đã giải quyết — ghi NGUYÊN VĂN vào meta mọi checkpoint."""
     z = dict(cfg.get("recovery") or {})
-    rc, rv, ch = (dict(z.get(k) or {}) for k in ("recomb", "recovery", "cls_head"))
+    rv, ch = (dict(z.get(k) or {}) for k in ("recovery", "cls_head"))
     return {
         "format": FORMAT, "d_vis": int(d_vis), "d_model": int(d_model),
         "n_labels": int(n_labels), "n_classes": len(CLASS_ORDER),
         "class_order": list(CLASS_ORDER),
-        "recomb": {"n_heads": int(rc.get("n_heads", 20)),
-                   "hidden": int(rc.get("hidden", 1280)),
-                   "dropout": float(rc.get("dropout", 0.0))},
-        "recovery": {"n_query": int(rv.get("n_query", 128)),
-                     "n_heads": int(rv.get("n_heads", 20)),
-                     "hidden": int(rv.get("hidden", 1280)),
-                     "dropout": float(rv.get("dropout", 0.0)),
-                     "zero_init_out": bool(rv.get("zero_init_out", True))},
+        "recovery": {"n_query": int(rv.get("n_query", 256)),
+                     "n_heads": int(rv.get("n_heads", 9)),
+                     "hidden": int(rv.get("hidden", 2560)),
+                     "out_hidden": int(rv.get("out_hidden", 2560)),
+                     "dropout": float(rv.get("dropout", 0.0))},
         "cls_head": {"n_heads": int(ch.get("n_heads", 20)),
                      "dropout": float(ch.get("dropout", 0.0))},
     }
@@ -250,9 +216,10 @@ def spec_fingerprint(spec: dict) -> str:
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
 
 
-def build_recomb(spec: dict) -> Recomb:
-    r = spec["recomb"]
-    return Recomb(spec["d_vis"], spec["d_model"], r["n_heads"], r["hidden"], r["dropout"])
+def build_recovery(spec: dict) -> Recovery:
+    r = spec["recovery"]
+    return Recovery(spec["d_vis"], spec["d_model"], r["n_query"], r["n_heads"],
+                    r["hidden"], r["out_hidden"], r["dropout"])
 
 
 def build_cls_head(spec: dict) -> ClsHead:
@@ -261,79 +228,65 @@ def build_cls_head(spec: dict) -> ClsHead:
                    c["n_heads"], c["dropout"])
 
 
-def build_recovery(spec: dict) -> Recovery:
-    r = spec["recovery"]
-    return Recovery(spec["d_model"], r["n_query"], r["n_heads"], r["hidden"],
-                    r["dropout"], r["zero_init_out"])
-
-
 class SupervisedBlock(nn.Module):
-    """Stage 0: Recomb + Cls Head (X -> logits (B, L, 3))."""
+    """Stage 0: Recovery + Cls Head (X -> logits (B, L, 3))."""
 
     def __init__(self, spec: dict):
         super().__init__()
         self.spec = dict(spec)
-        self.recomb = build_recomb(spec)
+        self.recovery = build_recovery(spec)
         self.cls_head = build_cls_head(spec)
         _init(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cls_head(self.recomb(x))
+        return self.cls_head(self.recovery(x))
 
 
 class RecoveryBranch(nn.Module):
-    """Main stage: Recomb (từ Stage 0) + Recovery. Cls Head BỊ BỎ."""
+    """Main stage: CHỈ Recovery (nạp từ Stage 0). Cls Head BỊ BỎ."""
 
     def __init__(self, spec: dict):
         super().__init__()
         self.spec = dict(spec)
-        self.recomb = build_recomb(spec)
         self.recovery = build_recovery(spec)
         _init(self)
-        self.recovery.reset_out()
-        self.recomb_frozen = False
+        self.frozen = False
 
     @property
     def n_query(self) -> int:
         return int(self.recovery.n_query)
 
-    def set_recomb_frozen(self, frozen: bool) -> None:
+    def set_frozen(self, frozen: bool) -> None:
         """Đóng băng HOÀN TOÀN: requires_grad=False + eval() + chạy no_grad."""
-        self.recomb_frozen = bool(frozen)
-        for p in self.recomb.parameters():
+        self.frozen = bool(frozen)
+        for p in self.recovery.parameters():
             p.requires_grad_(not frozen)
-        self.recomb.train(self.training and not frozen)
+        self.recovery.train(self.training and not frozen)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.recomb.train(mode and not self.recomb_frozen)
+        self.recovery.train(mode and not self.frozen)
         return self
-
-    def recomb_features(self, vis: torch.Tensor) -> torch.Tensor:
-        ctx = torch.no_grad() if self.recomb_frozen else contextlib.nullcontext()
-        with ctx:
-            return self.recomb(vis)
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         """vis (B, 4096, d_vis) -> Q (B, n_query, d_model)."""
-        return self.recovery(self.recomb_features(vis))
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
+        with ctx:
+            return self.recovery(vis)
 
     def n_params(self) -> dict:
         c = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
-        return {"recomb": c(self.recomb), "recovery": c(self.recovery),
+        return {"recovery": c(self.recovery),
                 "trainable": sum(p.numel() for p in self.parameters() if p.requires_grad),
                 "total": c(self)}
 
     def describe(self) -> str:
         s = self.spec
         r = s["recovery"]
-        return (f"Recomb: Linear {s['d_vis']}→{s['d_model']} -> RMSNorm -> Self-attn "
-                f"({s['recomb']['n_heads']} head) -> Linear/GELU {s['d_model']}→"
-                f"{s['recomb']['hidden']} -> Linear → {s['d_model']} (+res) · Recovery: "
-                f"Learner({r['n_query']}) -> RMSNorm -> Self-attn -> Cross-Attn(·, "
-                f"RMSNorm R) ({r['n_heads']} head) -> Linear/GELU {s['d_model']}→"
-                f"{r['hidden']} -> Linear → {s['d_model']} (+res) -> TokenMix "
-                f"{r['n_query']}→{r['n_query']}{' [out=0]' if r['zero_init_out'] else ''}")
+        return (f"Recovery: Learner({r['n_query']}, {s['d_vis']}) -> RMSNorm -> "
+                f"Self-attn ({r['n_heads']} head) -> Cross-Attn(·, RMSNorm X) -> "
+                f"Linear/GELU {s['d_vis']}→{r['hidden']}→{s['d_vis']} (+res) -> "
+                f"Linear/GELU {s['d_vis']}→{r['out_hidden']}→{s['d_model']}")
 
 
 # ══ ASL: γ theo TÊN lớp ═════════════════════════════════════════════════════
@@ -485,23 +438,27 @@ def stage0_exists(d: Path) -> bool:
 
 
 def load_stage0_into(branch: RecoveryBranch, d: Path) -> dict:
-    """Nạp `recomb.*` từ checkpoint Stage 0 vào nhánh main. Cls Head bị bỏ."""
+    """Nạp `recovery.*` từ checkpoint Stage 0 vào nhánh main. Cls Head bị bỏ."""
     from safetensors.torch import load_file
 
     d = Path(d)
     meta = json.loads((d / STAGE0_META).read_text(encoding="utf-8"))
-    sp_a = {k: meta["spec"][k] for k in ("d_vis", "d_model", "recomb")}
-    sp_b = {k: branch.spec[k] for k in ("d_vis", "d_model", "recomb")}
+    if meta.get("format") != FORMAT:
+        raise RuntimeError(f"{d / STAGE0_META}: format {meta.get('format')!r} ≠ "
+                           f"{FORMAT!r} — checkpoint của bố cục cũ (có Recomb). "
+                           f"Chạy lại Stage 0 (`--restage0`).")
+    sp_a = {k: meta["spec"][k] for k in ("d_vis", "d_model", "recovery")}
+    sp_b = {k: branch.spec[k] for k in ("d_vis", "d_model", "recovery")}
     if sp_a != sp_b:
-        raise RuntimeError(f"Stage 0 ở {d} dựng Recomb {sp_a}, nhánh main cần "
+        raise RuntimeError(f"Stage 0 ở {d} dựng Recovery {sp_a}, nhánh main cần "
                            f"{sp_b}. Chạy lại Stage 0 (`--restage0`).")
     sd = load_file(str(d / STAGE0_FILE))
-    rec = {k[len("recomb."):]: v for k, v in sd.items() if k.startswith("recomb.")}
-    branch.recomb.load_state_dict(rec, strict=True)     # lệch khoá -> ném lỗi
+    rec = {k[len("recovery."):]: v for k, v in sd.items() if k.startswith("recovery.")}
+    branch.recovery.load_state_dict(rec, strict=True)   # lệch khoá -> ném lỗi
     return {"stage0_dir": str(d), "best_epoch": meta.get("best_epoch"),
             "best_score": meta.get("best_score"),
-            "n_recomb_tensors": len(rec),
-            "dropped": sorted({k.split(".", 1)[0] for k in sd} - {"recomb"})}
+            "n_recovery_tensors": len(rec),
+            "dropped": sorted({k.split(".", 1)[0] for k in sd} - {"recovery"})}
 
 
 def save_branch(branch: RecoveryBranch, out_dir: Path, extra: dict) -> Path:
@@ -522,7 +479,7 @@ def branch_exists(d: Path) -> bool:
 
 
 def load_branch(d: Path, device=None) -> RecoveryBranch:
-    """Dựng lại nhánh theo META (không theo config hiện tại), eval, Recomb đóng băng."""
+    """Dựng lại nhánh theo META (không theo config hiện tại), eval, đóng băng."""
     from safetensors.torch import load_file
 
     d = Path(d)
@@ -531,7 +488,7 @@ def load_branch(d: Path, device=None) -> RecoveryBranch:
         raise RuntimeError(f"{d / BRANCH_META}: format {meta.get('format')!r} ≠ {FORMAT!r}")
     br = RecoveryBranch(meta["spec"])
     br.load_state_dict(load_file(str(d / BRANCH_FILE)), strict=True)
-    br.set_recomb_frozen(True)
+    br.set_frozen(True)
     if device is not None:
         br = br.to(device)
     return br.eval()

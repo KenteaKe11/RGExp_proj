@@ -5,12 +5,13 @@
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/recovery.yaml == $1 (_archive/v2/configs/lora.yaml)
-  2. TokenMix khởi tạo 0 -> Q == 0 ở bước 0, và KHÁC 0 sau một bước học
-  3. Stage 0 -> main: Recomb nạp đúng, Cls Head bị bỏ; ghi/nạp nhánh khớp từng bit
+  2. Recovery: hình dạng Q, không còn lớp khởi tạo 0, và học được
+  3. Stage 0 -> main: Recovery nạp đúng (Q khớp TỪNG BIT với Stage 0), Cls Head bị
+     bỏ, format checkpoint cũ bị từ chối; ghi/nạp nhánh khớp từng bit
   4. γ ASL theo TÊN lớp -> đúng thứ tự CLASS_ORDER (neg, pos, uncertain)
   5. metric chọn epoch Stage 0 (sqrt(F1·Recall) macro pos+unc) trên ví dụ tay
   6. CE ghép theo token qua các mảnh == CE trung bình token của cả micro-batch
-  7. đóng băng Recomb: không grad, eval, không bị optimizer chạm
+  7. đóng băng Recovery: không grad, eval, forward chạy trong no_grad
   8. kiểm định A/B: bootstrap + permutation nhận ra hiệu số thật, không bịa hiệu số
   9. Hub: A kéo từ current/$1_LoRA_Test, B đẩy vào current/$2.1_Recovery_Test
  10. không file nào trong src/ import _archive hay run_lora; runner có đường Q
@@ -59,9 +60,8 @@ def check(name: str):
 def small_spec(n_labels=14, n_query=5):
     from src import recovery as R
 
-    cfg = {"recovery": {"recomb": {"n_heads": 4, "hidden": 48},
-                        "recovery": {"n_query": n_query, "n_heads": 4, "hidden": 24,
-                                     "zero_init_out": True},
+    cfg = {"recovery": {"recovery": {"n_query": n_query, "n_heads": 4, "hidden": 48,
+                                     "out_hidden": 40},
                         "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, 24, 32, n_labels)
 
@@ -82,7 +82,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. Q == 0 lúc khởi tạo (TokenMix = 0), và KHÁC 0 sau một bước học")
+@check("2. Recovery: Q (n_query, d_model) từ X (4096, d_vis), không lớp init 0, học được")
 def _():
     import torch
 
@@ -91,43 +91,63 @@ def _():
     torch.manual_seed(0)
     sp = small_spec()
     br = R.RecoveryBranch(sp)
-    br.set_recomb_frozen(True)
-    x = torch.randn(2, 64, 24)
+    br.set_frozen(False)
+    x = torch.randn(2, 64, 24)                  # X: 64 patch × d_vis 24
     q = br(x)
     assert q.shape == (2, sp["recovery"]["n_query"], 32), q.shape
-    assert torch.equal(q, torch.zeros_like(q))          # bước 0: nhánh im lặng
+    assert torch.isfinite(q).all()
+    # KHÔNG còn TokenMix/zero-init: Q có tín hiệu ngay bước 0 (Stage 0 dạy sẵn)
+    assert q.abs().sum() > 0
+    assert not hasattr(br.recovery, "out")
+    assert not hasattr(br, "recomb")            # Recomb đã bị bỏ khỏi kiến trúc
+    # Q phụ thuộc ẢNH (Cross-Attn thật sự đọc X), không phải hằng số
+    assert not torch.allclose(q[0], q[1])
+    before = q.detach().clone()
     opt = torch.optim.AdamW([p for p in br.parameters() if p.requires_grad], lr=1e-2)
     (br(x) - 1.0).pow(2).mean().backward()
     opt.step()
-    assert br(x).abs().sum() > 0
-    # zero_init_out = false -> KHÔNG còn im lặng ở bước 0
-    sp2 = dict(sp, recovery=dict(sp["recovery"], zero_init_out=False))
-    assert R.RecoveryBranch(sp2)(x).abs().sum() > 0
+    assert not torch.allclose(br(x), before)
 
 
-@check("3. Stage 0 -> main: nạp Recomb, bỏ Cls Head; ghi/nạp nhánh khớp từng bit")
+@check("3. Stage 0 -> main: Q khớp từng bit, bỏ Cls Head, từ chối format cũ")
 def _():
     import torch
 
     from src import recovery as R
 
+    import json
+
     sp = small_spec()
-    blk = R.SupervisedBlock(sp)
+    blk = R.SupervisedBlock(sp).eval()
+    x = torch.randn(1, 64, 24)
     with tempfile.TemporaryDirectory() as t:
         R.save_stage0(blk, Path(t) / "s0", {"best_epoch": 3, "best_score": 0.5})
         br = R.RecoveryBranch(sp)
         rep = R.load_stage0_into(br, Path(t) / "s0")
         assert rep["dropped"] == ["cls_head"], rep
-        for k, v in blk.recomb.state_dict().items():
-            assert torch.equal(v, br.recomb.state_dict()[k]), k
+        for k, v in blk.recovery.state_dict().items():
+            assert torch.equal(v, br.recovery.state_dict()[k]), k
         assert not hasattr(br, "cls_head")
-        torch.nn.init.normal_(br.recovery.out.proj.weight, std=0.05)
+        br.set_frozen(False)
+        br.eval()
+        # Q của main stage == Q mà Cls Head của Stage 0 đã nhìn thấy, TỪNG BIT
+        with torch.no_grad():
+            assert torch.equal(blk.recovery(x), br(x))
         R.save_branch(br, Path(t) / "b", {})
         br2 = R.load_branch(Path(t) / "b")
-        x = torch.randn(1, 64, 24)
-        br.eval()
         assert torch.equal(br(x), br2(x))
-        assert br2.recomb_frozen and br2.n_query == sp["recovery"]["n_query"]
+        assert br2.frozen and br2.n_query == sp["recovery"]["n_query"]
+        # checkpoint bố cục CŨ (format /1, có Recomb) phải bị TỪ CHỐI, không
+        # phải lệch khoá im lặng
+        m = Path(t) / "s0" / R.STAGE0_META
+        meta = json.loads(m.read_text(encoding="utf-8"))
+        m.write_text(json.dumps(dict(meta, format="rgexp.recovery/1")), encoding="utf-8")
+        try:
+            R.load_stage0_into(R.RecoveryBranch(sp), Path(t) / "s0")
+        except RuntimeError as e:
+            assert "format" in str(e)
+        else:
+            raise AssertionError("format cũ phải bị từ chối")
 
 
 @check("4. γ ASL theo tên lớp -> thứ tự CLASS_ORDER")
@@ -212,25 +232,30 @@ def _():
         assert abs(acc - float(full)) < 1e-5, (chunk, acc, float(full))
 
 
-@check("7. Recomb đóng băng: requires_grad=False, eval, không grad")
+@check("7. Recovery đóng băng: requires_grad=False, eval, forward trong no_grad")
 def _():
     import torch
 
     from src import recovery as R
 
     sp = small_spec()
-    sp["recomb"]["dropout"] = 0.5
+    sp["recovery"]["dropout"] = 0.5
     br = R.RecoveryBranch(sp)
-    br.set_recomb_frozen(True)
+    br.set_frozen(True)
     br.train()
-    assert not br.recomb.training and br.recovery.training
+    assert not br.recovery.training            # eval ngay cả khi branch.train()
     x = torch.randn(2, 64, 24)
-    torch.nn.init.normal_(br.recovery.out.proj.weight, std=0.02)
+    q = br(x)
+    assert not q.requires_grad                 # forward chạy trong no_grad
+    assert all(not p.requires_grad for p in br.recovery.parameters())
+    assert torch.equal(br(x), q)               # eval: dropout tắt -> tái lập được
+    assert br.n_params()["trainable"] == 0
+    br.set_frozen(False)
+    br.train()
+    assert br.recovery.training
     br(x).sum().backward()
-    assert all(p.grad is None for p in br.recomb.parameters())
-    assert any(p.grad is not None for p in br.recovery.parameters())
-    r1, r2 = br.recomb_features(x), br.recomb_features(x)
-    assert torch.equal(r1, r2)                        # eval: dropout tắt
+    assert all(p.grad is not None for p in br.recovery.parameters())
+    assert br.n_params()["trainable"] == br.n_params()["total"]
 
 
 @check("8. bootstrap ghép cặp + permutation: thấy hiệu số thật, không bịa")
@@ -376,7 +401,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch mới: Stage 0 lr 3e-4 · 8 epoch · lấy LAST · val 256; main mở băng Recomb sau 0.5 epoch; --retrain-all")
+@check("14. lịch: Stage 0 lr 3e-4 · 8 epoch · LAST · val 256; main mở băng Recovery sau 1/4 epoch, lr 3e-5; --retrain-all")
 def _():
     from src import stage0_recovery as s0
     from src.config import load_config
@@ -389,11 +414,15 @@ def _():
     assert s0.CKPT == "final" and s0.BASE == "base"
     assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
     zc = zcfg(cfg)
-    assert zc["freeze_recomb_epochs"] == 0.5 and int(round(0.5 * 200)) == 100
-    assert (zc["recovery_lr"], zc["recovery_wd"], zc["recomb_lr"], zc["recomb_wd"]) == (1e-4, 0.03, 1e-5, 0.01)
+    assert zc["freeze_recovery_epochs"] == 0.25 and int(round(0.25 * 200)) == 50
+    assert (zc["recovery_lr"], zc["recovery_wd"]) == (3e-5, 0.01)
+    assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert cfg["recovery_exp"]["retrain_all"] is False
-    assert int(cfg["recovery"]["recovery"]["n_query"]) == 128
-    assert cfg["recovery"]["recovery"]["zero_init_out"] is True
+    rv = cfg["recovery"]["recovery"]
+    assert int(rv["n_query"]) == 256 and int(rv["n_heads"]) == 9
+    assert 1152 % int(rv["n_heads"]) == 0 and 1152 // int(rv["n_heads"]) == 128
+    assert int(rv["hidden"]) == int(rv["out_hidden"]) == 2560
+    assert "zero_init_out" not in rv and "recomb" not in cfg["recovery"]
     src = (ROOT / "src/run_recovery.py").read_text(encoding="utf-8")
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
     # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
@@ -431,8 +460,8 @@ def _():
         return x, x[..., :1].expand(b, N_TOK, D_MOD)
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
-    cfg["recovery"] = {"recomb": {"n_heads": 4, "hidden": 32},
-                       "recovery": {"n_query": 5, "n_heads": 4, "hidden": 16},
+    cfg["recovery"] = {"recovery": {"n_query": 5, "n_heads": 4, "hidden": 16,
+                                    "out_hidden": 32},
                        "cls_head": {"n_heads": 4}}
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2, max_epochs=8)
     cfg["autobatch"] = {"enabled": False}
@@ -671,13 +700,11 @@ def _():
         fake.model.language_model.norm
     assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/recovery.yaml")
-    sp = R.spec_from_cfg({"recovery": {"recomb": {"n_heads": 2, "hidden": 24},
-                                       "recovery": {"n_query": NQ, "n_heads": 2,
-                                                    "hidden": 12},
+    sp = R.spec_from_cfg({"recovery": {"recovery": {"n_query": NQ, "n_heads": 2,
+                                                    "hidden": 12, "out_hidden": 16},
                                        "cls_head": {"n_heads": 2}}}, DV, DM, 14)
     branch = R.RecoveryBranch(sp)
-    branch.set_recomb_frozen(True)
-    torch.nn.init.normal_(branch.recovery.out.proj.weight, std=0.05)   # Q ≠ 0
+    branch.set_frozen(True)
     ids = torch.tensor([[0, 1] + [IMG_TOK] * NZ + [2, 3, 4]])
     labels = ids.clone()
     labels[:, : 2 + NZ] = -100
@@ -736,7 +763,7 @@ def _():
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "y → Q → Recovery → Recomb → X", "`Q[0]`"):
+                     "y → Q → Recovery → X", "`Q[0]`"):
             assert need in doc, need
         # bản đồ encoder KHÔNG còn được vẽ, nhưng số thô vẫn nhắc tới
         assert "OR (cộng" not in doc and "AND (nhân" not in doc

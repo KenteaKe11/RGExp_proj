@@ -20,7 +20,7 @@ Hai candidate:
      — chỉ khi TEM khớp (vân tay config, sha256 weight, batch sinh, đủ mẫu).
   B  `recovery_exp.candidate` = A + Recovery: Stage 0 rồi main stage trên ĐÚNG
      fixture/lịch của A (`src/train_recovery.py`), chuỗi vào decoder dài thêm
-     `recovery.recovery.n_query` (128) token.
+     `recovery.recovery.n_query` (256) token.
 
 Mã thoát: 0 xong · 1 thiếu kết quả · 2 cấu hình sai / fixture lệch · 3 train
           hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng
@@ -429,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
                      "test": "$2.1_Recovery_Test",
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
-                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = Recovery(Recomb(X)) (B)"})
+                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = Recovery(X) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 
@@ -564,7 +564,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal
-        _hr("Stage 0 — pretrain Recomb + Cls Head (ASL)")
+        _hr("Stage 0 — pretrain Recovery + Cls Head (ASL)")
         try:
             def _base_done() -> None:
                 # 8 epoch xong -> đẩy base/ + history + loader NGAY, trước epoch n+1

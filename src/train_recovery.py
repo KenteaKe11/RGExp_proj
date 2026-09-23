@@ -1,8 +1,8 @@
 """Main stage của candidate B (`qlora_r32_decoder_recovery`) — §2.1 Recovery.
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
-`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 128 learner
-vector Q = Recovery(Recomb(X)) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 256 learner
+vector Q = Recovery(X) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -10,16 +10,17 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                   (A: build_inputs_embeds(ids, Z) và hết) — thứ tự [Z ‖ Q ‖ T],
                   tức Q nằm SAU token ảnh nên mọi vị trí của Q đều đọc được
                   toàn bộ Z bằng attention nhân quả;
-                  128 vị trí thêm vào có nhãn −100, attention_mask 1,
+                  256 vị trí thêm vào có nhãn −100, attention_mask 1,
                   token_type_ids 0, nên SỐ TOKEN VÀO CE không đổi và CE của A
                   với B vẫn là cùng một đại lượng;
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
-                 nhánh có AdamW RIÊNG với lr CỐ ĐỊNH:
-                     Recovery ("Main")   1e-4 · wd 0.03
-                     Recomb ("Pretrain") 1e-5 · wd 0.01 — đóng băng hoàn toàn
-                                          trong `freeze_recomb_epochs` (0.5) epoch
-                                          đầu = 100/200 bước, rồi mới học;
+                 nhánh có AdamW RIÊNG, MỘT nhóm: cả Recovery đã được Stage 0
+                 dạy, nên nó bị đóng băng HOÀN TOÀN trong `freeze_recovery_epochs`
+                 (0.25) epoch đầu = 50/200 bước, rồi học ở lr CỐ ĐỊNH 3e-5,
+                 wd 0.01. Không còn nhóm "Main" riêng vì không còn phần nào của
+                 nhánh là mới tinh — §2.0 tách Recomb/Retriever chính vì ở đó
+                 Retriever khởi tạo ngẫu nhiên;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh. Clip chung
                  thì chuẩn gradient của Recovery kéo nhỏ bước cập nhật LoRA —
                  một khác biệt thứ hai so với A.
@@ -30,12 +31,12 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
-KHÁC §2.0: chuỗi vào decoder DÀI THÊM `n_query` (128) token, nên B tốn VRAM và
-thời gian mỗi bước nhiều hơn A ở mức 128/(độ dài chuỗi), và ở bước 0 B KHÔNG
-trùng A từng bit — TokenMix cuối khởi tạo 0 nên Q = 0, tức B = A + 128 token
-embedding 0 (vẫn được attention nhìn thấy).
+KHÁC §2.0: chuỗi vào decoder DÀI THÊM `n_query` (256) token, nên B tốn VRAM và
+thời gian mỗi bước nhiều hơn A ở mức 256/(độ dài chuỗi), và ở bước 0 B KHÔNG
+trùng A — Q mang sẵn thông tin Stage 0 đã học, điều mà cả hai stage sinh ra để
+làm (§2.0 có TokenMix khởi tạo 0 nên bước 0 Q = 0; ở đây bỏ).
 
-Batch mỗi lượt đã khoá = L. Nếu B (nặng hơn A một nhánh + 128 token) không vừa
+Batch mỗi lượt đã khoá = L. Nếu B (nặng hơn A một nhánh + 256 token) không vừa
 VRAM ở L mẫu một lượt, micro-batch logic L được chạy thành các mảnh c | L và CE
 được ghép lại theo TOKEN:  CE_L = Σ_mảnh CE_mảnh · n_tok_mảnh / n_tok_L  — đúng
 con số HF tính trên cả L mẫu (trung bình theo token trong micro-batch), nên
@@ -65,11 +66,9 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 
 def zcfg(cfg: Cfg) -> dict:
     m = dict(dict(cfg.get("recovery") or {}).get("main") or {})
-    out = {"recovery_lr": float(m.get("recovery_lr", 1e-4)),
-           "recovery_wd": float(m.get("recovery_wd", 0.03)),
-           "recomb_lr": float(m.get("recomb_lr", 1e-5)),
-           "recomb_wd": float(m.get("recomb_wd", 0.01)),
-           "freeze_recomb_epochs": float(m.get("freeze_recomb_epochs", 0.5)),
+    out = {"recovery_lr": float(m.get("recovery_lr", 3e-5)),
+           "recovery_wd": float(m.get("recovery_wd", 0.01)),
+           "freeze_recovery_epochs": float(m.get("freeze_recovery_epochs", 0.25)),
            "separate_clip": bool(m.get("separate_clip", True))}
     return out
 
@@ -197,14 +196,13 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         branch = RCV.RecoveryBranch(spec)
         pre = RCV.load_stage0_into(branch, stage0_best)
     branch = branch.to(dev)                               # fp32, forward dưới autocast
-    frozen_until = float(zc["freeze_recomb_epochs"])
-    branch.set_recomb_frozen(frozen_until > 0)
+    frozen_until = float(zc["freeze_recovery_epochs"])
+    branch.set_frozen(frozen_until > 0)
     nb = branch.n_params()
     print(f"  nhánh: {branch.describe()}", flush=True)
-    print(f"  tham số nhánh: Recomb {nb['recomb']:,} (Stage 0 epoch "
-          f"{pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
-          f"{pre['dropped']}) · Recovery {nb['recovery']:,} · Recomb "
-          f"{'ĐÓNG BĂNG' if frozen_until > 0 else 'học'} "
+    print(f"  tham số nhánh: Recovery {nb['recovery']:,} — NẠP TRỌN từ Stage 0 "
+          f"(epoch {pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
+          f"{pre['dropped']}) · {'ĐÓNG BĂNG' if frozen_until > 0 else 'học ngay'} "
           f"{frozen_until:g} epoch đầu", flush=True)
 
     # ── dữ liệu: y như A ─────────────────────────────────────────────────
@@ -227,20 +225,16 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                               "name": "lora"}], betas=(0.9, 0.999), eps=1e-8)
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     rcv_p = list(branch.recovery.parameters())
-    rec_p = list(branch.recomb.parameters())
-    opt_b = torch.optim.AdamW([
-        {"params": rcv_p, "lr": zc["recovery_lr"], "weight_decay": zc["recovery_wd"],
-         "name": "recovery"},
-        {"params": rec_p, "lr": zc["recomb_lr"], "weight_decay": zc["recomb_wd"],
-         "name": "recomb"}], betas=(0.9, 0.999), eps=1e-8)
+    opt_b = torch.optim.AdamW(
+        [{"params": rcv_p, "lr": zc["recovery_lr"], "weight_decay": zc["recovery_wd"],
+          "name": "recovery"}], betas=(0.9, 0.999), eps=1e-8)
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
-          f"Recovery CỐ ĐỊNH {zc['recovery_lr']:g} wd {zc['recovery_wd']} · "
-          f"Recomb CỐ ĐỊNH {zc['recomb_lr']:g} wd {zc['recomb_wd']} (sau "
-          f"{frozen_until:g} epoch) · clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}",
-          flush=True)
+          f"Recovery ĐÓNG BĂNG {frozen_until:g} epoch đầu ({unfreeze_step}/{steps} "
+          f"bước) rồi CỐ ĐỊNH {zc['recovery_lr']:g} wd {zc['recovery_wd']} · "
+          f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}", flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
     from . import autobatch
@@ -250,11 +244,11 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
 
     def _probe(k: int) -> None:
-        # Dò ở trạng thái NẶNG nhất sẽ gặp: nếu Recomb được mở băng giữa
-        # chừng thì activation của nó (4096 token) cũng phải vừa VRAM.
-        was = branch.recomb_frozen
+        # Dò ở trạng thái NẶNG nhất sẽ gặp: khi Recovery được mở băng giữa
+        # chừng thì activation của nó (Cross-Attn 256 × 4096) cũng phải vừa VRAM.
+        was = branch.frozen
         if will_unfreeze:
-            branch.set_recomb_frozen(False)
+            branch.set_frozen(False)
         try:
             model.train()
             branch.train()
@@ -263,7 +257,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             ce, _ = forward_ce(model, gemma, branch, b, dev)
             ce.backward()
         finally:
-            branch.set_recomb_frozen(was)
+            branch.set_frozen(was)
 
     ab_cfg = _C(dict(cfg, autobatch=dict(cfg.get("autobatch") or {}, enabled=True)))
     chunk, ab_rep = autobatch.autotune(ab_cfg, f"{aid}/chunk", bs, bs, _probe,
@@ -400,13 +394,12 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     rel_last = 0.0
     unfrozen_at = None
     for step in range(steps):
-        if (branch.recomb_frozen and frozen_until > 0
-                and step >= unfreeze_step):
-            branch.set_recomb_frozen(False)
+        if branch.frozen and frozen_until > 0 and step >= unfreeze_step:
+            branch.set_frozen(False)
             branch.train()
             unfrozen_at = step
-            print(f"    [{aid}] bước {step}: mở băng Recomb (lr {zc['recomb_lr']:g})",
-                  flush=True)
+            print(f"    [{aid}] bước {step}: mở băng Recovery "
+                  f"(lr {zc['recovery_lr']:g})", flush=True)
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
         step_ce = 0.0
@@ -453,8 +446,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
 
     model.save_pretrained(str(out_dir), safe_serialization=True)
     processor.save_pretrained(str(out_dir))
-    RCV.save_branch(branch, out_dir, {"stage0": pre, "recomb_frozen_steps":
-                                    unfrozen_at if unfrozen_at is not None else steps})
+    RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps":
+                                      unfrozen_at if unfrozen_at is not None else steps})
     for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
         shutil.copyfile(stage0_best / f, out_dir / f)
 
@@ -467,8 +460,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         "dora": uses_dora(preset["method"]), "quantized": is_quantized(preset["method"]),
         **{k: v for k, v in pstats.items() if k not in ("method", "rank", "alpha")},
         "recovery": {"spec": spec, "spec_fingerprint": RCV.spec_fingerprint(spec),
-                    "n_params": nb, "main": zc, "stage0": pre,
-                    "recomb_frozen_steps": unfrozen_at if unfrozen_at is not None else steps},
+                     "n_params": nb, "main": zc, "stage0": pre,
+                     "frozen_steps": unfrozen_at if unfrozen_at is not None else steps},
         "autobatch_chunk": ab_rep, "physical_chunk": chunk,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,

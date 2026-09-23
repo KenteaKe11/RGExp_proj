@@ -1,6 +1,10 @@
-"""Stage 0 — pretrain Supervised Block (Recomb + Cls Head) trước main stage.
+"""Stage 0 — pretrain Supervised Block (Recovery + Cls Head) trước main stage.
 
-    X = SigLIP(ảnh) (đóng băng, no_grad) ─► Recomb ─► Cls Head ─► ASL (14 × 3)
+    X = SigLIP(ảnh) (đóng băng, no_grad) ─► Recovery ─► Q ─► Cls Head ─► ASL (14 × 3)
+
+Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
+chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không đọc một biểu
+diễn trung gian nào rồi vứt đi. Main stage nạp nguyên `recovery.*` và bỏ Cls Head.
 
 Lịch (khối `stage0` của configs/recovery.yaml):
   * AdamW, lr CỐ ĐỊNH 3e-4 (không warm-up, không decay), weight_decay 0.03;
@@ -38,7 +42,7 @@ HISTORY = "stage0_history.json"
 LOADER = "loader.json"                  # như _fixture/loader.json của $1
 LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
-# dùng lại Recomb đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
+# dùng lại Recovery đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
 BASE = "base"                         # sau `max_epochs` (8) epoch lr cố định — đẩy Hub ngay
 CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
@@ -243,7 +247,7 @@ def assert_same_pixels(ds: VisionOnlyDataset, cfg: Cfg, processor, img_kw) -> No
     if a.shape != b.shape or not torch.allclose(a.float(), b.float(), atol=1e-6):
         raise TrainUnusable(
             "pixel_values của Stage 0 (image_processor) KHÁC main stage "
-            "(apply_chat_template) — Recomb sẽ được pretrain trên ảnh khác ảnh "
+            "(apply_chat_template) — Recovery sẽ được pretrain trên ảnh khác ảnh "
             "nó nhận lúc fine-tune. Kiểm src/imaging.policy.")
 
 
@@ -300,8 +304,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                             weight_decay=sc["weight_decay"], betas=(0.9, 0.999),
                             eps=1e-8)
     n_par = sum(p.numel() for p in block.parameters())
-    print(f"  Stage 0: Supervised Block {n_par:,} tham số · Recomb "
-          f"{sum(p.numel() for p in block.recomb.parameters()):,} · Cls Head "
+    print(f"  Stage 0: Supervised Block {n_par:,} tham số · Recovery "
+          f"{sum(p.numel() for p in block.recovery.parameters()):,} · Cls Head "
           f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
           f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn", flush=True)
     fa = sc["final_anneal"]

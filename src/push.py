@@ -184,7 +184,7 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
         for f in sorted(fx.iterdir()):
             if f.is_file() and not f.name.endswith(".tmp"):
                 out.append((f"{base}/fixture/{f.name}", f, "fixture"))
-    # $2: Stage 0 (Recomb + Cls Head đã pretrain) + loader của nó, cạnh fixture.
+    # §2.1: Stage 0 (Recovery + Cls Head đã pretrain) + loader của nó, cạnh fixture.
     s0 = Path(o["adapter_dir"]) / "_stage0"
     if s0.exists():
         from .stage0_recovery import KEEP
