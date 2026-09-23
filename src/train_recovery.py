@@ -17,7 +17,7 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
                  nhánh có AdamW RIÊNG, MỘT nhóm: cả Recovery đã được Stage 0
                  dạy, nên nó bị đóng băng HOÀN TOÀN trong `freeze_recovery_epochs`
-                 (0.25) epoch đầu = 50/200 bước, rồi học ở lr CỐ ĐỊNH 3e-5,
+                 (0.2) epoch đầu = 40/200 bước, rồi FINETUNE ở lr CỐ ĐỊNH 1e-5,
                  wd 0.01. Không còn nhóm "Main" riêng vì không còn phần nào của
                  nhánh là mới tinh — §2.0 tách Recomb/Retriever chính vì ở đó
                  Retriever khởi tạo ngẫu nhiên;
@@ -66,9 +66,9 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 
 def zcfg(cfg: Cfg) -> dict:
     m = dict(dict(cfg.get("recovery") or {}).get("main") or {})
-    out = {"recovery_lr": float(m.get("recovery_lr", 3e-5)),
+    out = {"recovery_lr": float(m.get("recovery_lr", 1e-5)),
            "recovery_wd": float(m.get("recovery_wd", 0.01)),
-           "freeze_recovery_epochs": float(m.get("freeze_recovery_epochs", 0.25)),
+           "freeze_recovery_epochs": float(m.get("freeze_recovery_epochs", 0.2)),
            "separate_clip": bool(m.get("separate_clip", True))}
     return out
 

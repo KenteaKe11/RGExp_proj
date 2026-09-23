@@ -21,10 +21,10 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
  14. lịch Stage 0 / main hiện hành, cờ --retrain-all, và hai stage KHÔNG dùng
      chung khoá batch nào (micro + điểm đo riêng, không vào vân tay)
- 15. Stage 0 chạy thật trên mô hình giả: base (5 epoch) đẩy ngay, epoch 6 anneal -> final;
-     đổi lịch anneal thì chỉ chạy lại epoch 6
- 16. lịch cosine của epoch 6
- 17. checkpoint bố cục CŨ (chỉ `final/` = 5 epoch) được nhận làm `base/`
+ 15. Stage 0 chạy thật trên mô hình giả: base (1 warm-up + 3 main) đẩy ngay,
+     epoch 5 anneal -> final; đổi lịch anneal thì chỉ chạy lại epoch 5
+ 16. lịch cosine của epoch 5 (final)
+ 17. checkpoint bố cục CŨ (chỉ `final/` = epoch cuối của base) được nhận làm `base/`
  18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
  19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap 1/4 lớp cuối có
      chỉ số lớp thật, MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
@@ -410,7 +410,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 lr 3e-4 · 5 epoch · LAST · val 256; main mở băng Recovery sau 1/4 epoch, lr 3e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + 3 main + 1 final = 5 epoch, đỉnh 1e-4, val 256 CỐ ĐỊNH; main mở băng Recovery sau 0.2 epoch, lr 1e-5; --retrain-all")
 def _():
     from src import stage0_recovery as s0
     from src.config import load_config
@@ -418,13 +418,43 @@ def _():
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (3e-4, 0.03, 5, "last")
-    assert sc["val_n_samples"] == 256 and sc["val_resample"]
+    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (1e-4, 0.03, 3, "last")
+    # warm-up là epoch THÊM VÀO: base = warmup + max_epochs; final cộng thêm 1
+    assert sc["warmup_epochs"] == 1 and sc["base_epochs"] == 4
+    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 5
+
+    # ── warm-up TUYẾN TÍNH THEO BƯỚC rồi giữ đỉnh ──────────────────────────
+    import torch
+
+    from src.train_recomb import val_indices
+
+    spe = 200                                   # bước mỗi epoch
+    par = torch.nn.Parameter(torch.zeros(1))
+    o = torch.optim.AdamW([par], lr=sc["lr"])
+    sch = s0.base_scheduler(o, sc, spe)
+    lrs = []
+    for _ in range(3 * spe):
+        o.step()
+        sch.step()
+        lrs.append(o.param_groups[0]["lr"])
+    w = int(round(sc["warmup_epochs"] * spe))
+    assert abs(lrs[0] - sc["lr"] * 2 / w) < 1e-12           # sau bước 1
+    assert abs(lrs[w - 2] - sc["lr"]) < 1e-12               # chạm đỉnh cuối warm-up
+    assert all(abs(x - sc["lr"]) < 1e-12 for x in lrs[w:])  # rồi PHẲNG
+    assert all(a <= b + 1e-15 for a, b in zip(lrs[:w], lrs[1:w]))   # không tụt
+    assert s0.base_scheduler(o, dict(sc, warmup_epochs=0.0), spe) is None
+
+    # ── val CỐ ĐỊNH: mọi lần đo dùng chung một tập ─────────────────────────
+    assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
+    a0 = val_indices(42, 0, 2000, 256, sc["val_resample"])
+    a5 = val_indices(42, 5, 2000, 256, sc["val_resample"])
+    assert a0 == a5 and len(a0) == 256 and len(set(a0)) == 256
+    assert val_indices(42, 5, 2000, 256, True) != a0        # resample=True thì đổi
     assert s0.CKPT == "final" and s0.BASE == "base"
     assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
     zc = zcfg(cfg)
-    assert zc["freeze_recovery_epochs"] == 0.25 and int(round(0.25 * 200)) == 50
-    assert (zc["recovery_lr"], zc["recovery_wd"]) == (3e-5, 0.01)
+    assert zc["freeze_recovery_epochs"] == 0.2 and int(round(0.2 * 200)) == 40
+    assert (zc["recovery_lr"], zc["recovery_wd"]) == (1e-5, 0.01)
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert cfg["recovery_exp"]["retrain_all"] is False
     rv = cfg["recovery"]["recovery"]
@@ -471,7 +501,7 @@ def _():
         raise AssertionError("stage0.probe_sizes lệch batch_size phải DỪNG")
 
 
-@check("15. Stage 0 chạy thật (mô hình giả): 5 epoch -> base/ + đẩy NGAY -> epoch 6 cosine 3e-5→1e-8 -> final/; chạy lại chỉ epoch 6")
+@check("15. Stage 0 chạy thật (mô hình giả): 1 warm-up + 3 main -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP 1e-4→1e-7 -> final/; chạy lại chỉ epoch 5")
 def _():
     import json
 
@@ -500,7 +530,8 @@ def _():
     cfg["recovery"] = {"recovery": {"n_query": 5, "d_learn": 16, "n_heads": 4,
                                     "x_heads": 4, "hidden": 12},
                        "cls_head": {"n_heads": 4}}
-    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2, max_epochs=5)
+    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
+                         warmup_epochs=1, max_epochs=3)
     cfg["autobatch"] = {"enabled": False}
     rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
@@ -526,48 +557,72 @@ def _():
 
             def cb():
                 h = json.loads((d / s0.HISTORY).read_text())
-                assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 5
+                assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 4
                 assert R.stage0_exists(d / s0.BASE) and not R.stage0_exists(d / s0.CKPT)
                 pushed.append("base")
 
             h = s0.run(cfg, tr, va, on_base_done=cb)
             assert pushed == ["base"], pushed
-            assert h["finished"] and h["best_epoch"] == 6 and h["base_epoch"] == 5
+            assert h["finished"] and h["best_epoch"] == 5 and h["base_epoch"] == 4
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            assert ph == [(e, "base") for e in range(1, 6)] + [(6, "anneal")], ph
+            assert ph == [(e, "base") for e in range(1, 5)] + [(5, "anneal")], ph
             m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
-            assert m["phase"] == "anneal" and m["anneal"]["lr_start"] == 3e-5
+            assert m["phase"] == "anneal"
+            # lr_start: null -> lấy lr đỉnh của base; và chạy NỐI TIẾP thật
+            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 1e-4
+            assert m["anneal"]["lr_start_from_base_lr"] is True
+            assert m["anneal"]["reset_optimizer"] is False
+            assert m["optimizer_continued"] is True
             from safetensors.torch import load_file
             b5 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
             f6 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
-            assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 6 đã học
+            assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 5 đã học
             assert s0.finished(cfg) is not None
-            # đổi lịch anneal -> base còn dùng được, chỉ chạy lại epoch 6, không đẩy base lại
+            # đổi lịch anneal -> base còn dùng được, chỉ chạy lại epoch 5, không đẩy base lại
             cfg["stage0"] = dict(cfg["stage0"], final_anneal=dict(
-                cfg["stage0"]["final_anneal"], lr_start=2e-5))
+                cfg["stage0"]["final_anneal"], lr_end=2e-7))
             assert s0.finished(cfg) is None and s0.base_finished(cfg) is not None
             pushed.clear()
             h2 = s0.run(cfg, tr, va, on_base_done=cb)
-            assert pushed == [] and h2["best_epoch"] == 6
-            assert [x["epoch"] for x in h2["history"]] == list(range(1, 7))
+            assert pushed == [] and h2["best_epoch"] == 5
+            assert [x["epoch"] for x in h2["history"]] == list(range(1, 6))
             b5b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
             assert all(torch.equal(b5[k], b5b[k]) for k in b5)          # base không đổi
+            # Máy chỉ có base/ (kéo Hub), KHÔNG có last/state.pt -> không có
+            # moment của base. Chạy được, nhưng phải GHI NHẬN là không nối tiếp.
+            (d / "last" / "state.pt").unlink()
+            cfg["stage0"] = dict(cfg["stage0"], final_anneal=dict(
+                cfg["stage0"]["final_anneal"], lr_end=3e-7))
+            h3 = s0.run(cfg, tr, va, restart_final=True)
+            m3 = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
+            assert h3["best_epoch"] == 5
+            assert m3["anneal"]["reset_optimizer"] is False
+            assert m3["optimizer_continued"] is False
     finally:
         (s0.load_base, s0.labels_cls.load_map, s0.imaging.configure_processor,
          s0.assert_same_pixels, s0.VisionOnlyDataset.pixel_values,
          recombiner.encode_vision, recombiner.vision_and_text_dims) = orig
 
 
-@check("16. lịch epoch 6: cosine 3e-5 -> 1e-8 trong 200 bước, optimizer mới")
+@check("16. lịch epoch 5 (final): NỐI TIẾP, cosine 1e-4 -> 1e-7 trong 200 bước, giữ moment")
 def _():
     import torch
 
     from src import stage0_recovery as s0
     from src.config import load_config
 
-    fa = s0.s0cfg(load_config(ROOT / "configs/recovery.yaml"))["final_anneal"]
-    assert fa == {"enabled": True, "epochs": 1, "lr_start": 3e-5, "lr_end": 1e-8,
-                  "schedule": "cosine", "weight_decay": 0.03, "reset_optimizer": True}
+    scfg = s0.s0cfg(load_config(ROOT / "configs/recovery.yaml"))
+    fa = scfg["final_anneal"]
+    assert fa == {"enabled": True, "epochs": 1, "lr_start": 1e-4,
+                  "lr_start_from_base_lr": True, "lr_end": 1e-7,
+                  "schedule": "cosine", "weight_decay": 0.03,
+                  "reset_optimizer": False}, fa
+    # lr_start bám theo lr đỉnh của base, không phải một con số rời
+    assert fa["lr_start"] == scfg["lr"]
+    from src.stage0_recovery import anneal_cfg
+    assert anneal_cfg({"lr": 5e-4})["lr_start"] == 5e-4          # null -> theo base
+    assert anneal_cfg({"lr": 5e-4, "final_anneal": {"lr_start": 2e-5}}
+                      )["lr_start"] == 2e-5                       # khai tay thì giữ
     p = torch.nn.Parameter(torch.zeros(1))
     opt = torch.optim.AdamW([p], lr=fa["lr_start"])
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200, eta_min=fa["lr_end"])
@@ -576,11 +631,13 @@ def _():
         opt.step()
         sch.step()
         lrs.append(opt.param_groups[0]["lr"])
-    assert abs(lrs[0] - 3e-5) < 1e-12 and abs(lrs[-1] - 1e-8) < 1e-12
+    assert abs(lrs[0] - 1e-4) < 1e-12 and abs(lrs[-1] - 1e-7) < 1e-12
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
+    # nối tiếp = lr KHÔNG nhảy nấc ở ranh giới epoch: bước cuối của base cũng 1e-4
+    assert abs(lrs[0] - scfg["lr"]) < 1e-12
 
 
-@check("17. bố cục CŨ (chỉ có final/ = epoch 5): nhận làm base/, không pretrain lại")
+@check("17. bố cục CŨ (chỉ có final/ = epoch cuối của base): nhận làm base/, không pretrain lại")
 def _():
     import json
 
@@ -607,7 +664,9 @@ def _():
         # vân tay base khác -> KHÔNG nhận
         cfg2 = load_config(ROOT / "configs/recovery.yaml")
         cfg2["output"] = dict(cfg["output"])
-        cfg2["stage0"] = dict(cfg2["stage0"], lr=1.0e-4)
+        # đổi MỘT khoá thí nghiệm bất kỳ -> vân tay base khác -> KHÔNG nhận
+        cfg2["stage0"] = dict(cfg2["stage0"], lr=cfg2["stage0"]["lr"] * 2)
+        assert s0.base_fingerprint(cfg2) != s0.base_fingerprint(cfg)
         assert s0.base_finished(cfg2) is None
     src = (ROOT / "src/run_recovery.py").read_text(encoding="utf-8")
     assert "s0.legacy_base(h, cfg)" in src        # Hub bố cục cũ cũng nhận được

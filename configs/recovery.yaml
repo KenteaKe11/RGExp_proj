@@ -320,29 +320,34 @@ recovery:
   # Main stage — cả Recovery đã được Stage 0 dạy, nên chỉ MỘT nhóm tham số:
   # đóng băng hoàn toàn 1/4 epoch đầu rồi học ở lr cố định. LoRA theo `train` ($1).
   main:
-    recovery_lr: 3.0e-5     # sau khi mở băng, CỐ ĐỊNH
+    recovery_lr: 1.0e-5     # sau khi mở băng, CỐ ĐỊNH (finetune phần đã pretrain)
     recovery_wd: 0.01
-    freeze_recovery_epochs: 0.25   # đóng băng HOÀN TOÀN 1/4 epoch đầu (50/200 bước)
+    freeze_recovery_epochs: 0.2    # đóng băng HOÀN TOÀN 0.2 epoch đầu (40/200 bước)
     separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 0: pretrain Recovery + Cls Head (`src/stage0_recovery.py`) ───────
 stage0:
-  lr: 3.0e-4                # CỐ ĐỊNH
+  lr: 1.0e-4                # ĐỈNH (sau warm-up), rồi giữ phẳng tới hết phần base
+  # Số epoch THÊM VÀO ở đầu (nằm NGOÀI `max_epochs`): lr đi TUYẾN TÍNH THEO BƯỚC
+  # từ đỉnh/số-bước lên đỉnh. 0 = tắt warm-up, lr phẳng ngay từ epoch 1.
+  #     base = warmup_epochs + max_epochs = 1 + 3 = 4 epoch
+  warmup_epochs: 1
   weight_decay: 0.03
-  max_epochs: 5
+  max_epochs: 3            # epoch CHÍNH (sau warm-up)
   select: last              # LUÔN lấy epoch cuối (best = theo val)
-  # ── epoch n+1 (= 6): "final weight" ─────────────────────────────────────
-  # Sau `max_epochs` epoch, base/ được ĐẨY Hub ngay. Rồi chạy thêm `epochs`
-  # epoch với optimizer MỚI (không mang lịch sử scheduler/Adam trước đó), lr
+  # ── epoch n+1 (= 5): "final weight" ─────────────────────────────────────
+  # Sau phần base (warm-up + max_epochs), base/ được ĐẨY Hub ngay. Rồi chạy thêm
+  # `epochs` epoch NỐI TIẾP: giữ nguyên moment AdamW đã tích trong phần base, lr
   # cosine lr_start -> lr_end cập nhật mỗi bước -> final/. Main stage dùng final/.
   final_anneal:
     enabled: true
     epochs: 1
-    lr_start: 3.0e-5
-    lr_end: 1.0e-8
+    lr_start: null          # null = lr ĐỈNH của phần base (stage0.lr) -> lr không
+                            # nhảy nấc ở ranh giới epoch, chỉ bắt đầu đi xuống
+    lr_end: 1.0e-7
     schedule: cosine
     weight_decay: 0.03
-    reset_optimizer: true
+    reset_optimizer: false  # GIỮ moment AdamW của phần base (chạy nối tiếp)
   # Batch hiệu dụng RIÊNG của Stage 0 — trùng 32 của main stage chỉ là trùng số,
   # không có ràng buộc nào bắt hai bên bằng nhau: batch của main stage bị khoá
   # theo $1 (`train_batch` trong fixture), Stage 0 thì không dính gì tới A.
@@ -352,8 +357,10 @@ stage0:
   max_grad_norm: 1.0
   # val (theo dõi): sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
   val_classes: [pos, uncertain]
-  val_n_samples: 256        # mỗi epoch bốc 256 mẫu từ hồ val 2000 (0 = cả hồ)
-  val_resample: true        # bốc lại mỗi epoch; chỉ số từ (seed, epoch)
+  val_n_samples: 256        # 256 mẫu bốc từ hồ val 2000 (0 = cả hồ)
+  val_resample: false       # CỐ ĐỊNH: mọi epoch đo trên ĐÚNG một tập, chỉ số
+                            # chỉ phụ thuộc seed. Đường val giữa các epoch khi
+                            # đó chỉ phản ánh model đổi, không lẫn tập đổi.
   asl:                      # ASL one-hot 3 lớp
     gamma_neg: {neg: 4.0, uncertain: 1.0, pos: 0.0}
     gamma_pos: 0.0

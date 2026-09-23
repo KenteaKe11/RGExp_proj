@@ -86,7 +86,8 @@ Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không đọc một biểu
 diễn trung gian nào rồi vứt đi.
 
-* AdamW, lr **cố định 3e-4**, wd 0.03, **5 epoch**, batch hiệu dụng 32 — **của
+* AdamW, lr **đỉnh 1e-4**, wd 0.03, **1 warm-up + 3 main + 1 final = 5 epoch**,
+  batch hiệu dụng 32 — **của
   riêng Stage 0**. Nó trùng 32 của main stage chỉ là trùng số: batch main stage
   bị khoá theo $1 (`train_batch` trong fixture, một phần lịch học của A), còn
   Stage 0 không dính gì tới A. Mảnh vật lý (`stage0.micro_batch`) và điểm đo
@@ -95,13 +96,23 @@ diễn trung gian nào rồi vứt đi.
   khác nhau, đo chung thì Stage 0 luôn bị ngoại suy từ vùng quá nhỏ và ra micro
   thấp. Cả hai khoá ấy là khoá phần cứng: đổi chúng KHÔNG đổi vân tay Stage 0.
   Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 5 epoch xong.
-* **Epoch n+1 = 6 — final weight** (`stage0.final_anneal`): optimizer **mới** (không mang
-  lịch sử scheduler/Adam của 5 epoch), lr **cosine 3e-5 → 1e-8** cập nhật mỗi bước trong
-  1 epoch, bắt đầu từ `base/` -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.**
-  Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 6 (base giữ nguyên, có vân tay riêng).
-* Val (chỉ theo dõi): sau mỗi epoch trên **256 mẫu bốc lại** từ hồ val 2000 (chỉ số
-  từ seed + epoch): ASL, F1, Recall, sqrt(F1 · Recall), macro trên 14 bệnh lý × lớp
-  {pos, uncertain}, dự đoán = argmax 3 lớp.
+* **Epoch n+1 = 5 — final weight** (`stage0.final_anneal`): chạy **nối tiếp** —
+  giữ nguyên **moment AdamW** đã tích trong phần base, và `lr_start: null` lấy
+  đúng **lr đỉnh của base (1e-4)** làm điểm xuất phát, nên lr **không nhảy nấc**
+  ở ranh giới epoch, nó chỉ bắt đầu đi xuống: **cosine 1e-4 → 1e-7** cập nhật mỗi
+  bước trong 1 epoch -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.**
+  (`reset_optimizer: true` là lịch cũ: optimizer mới tinh, moment 0.)
+  Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 5 (base giữ nguyên, có vân tay riêng).
+* **Lịch lr**: `warmup_epochs` (1) epoch đầu lr đi **tuyến tính theo bước** từ
+  1e-6 lên 1e-4, rồi **giữ phẳng** suốt `max_epochs` (3) epoch chính. Warm-up là
+  epoch **thêm vào**, nằm NGOÀI `max_epochs` — `base = warmup + max_epochs = 4`,
+  cộng epoch final thành **5 epoch tổng**. Theo bước chứ không theo epoch: warm-up
+  theo epoch chỉ có vài nấc và nấc đầu đã là 1/w đỉnh — gần như không warm-up gì.
+* Val (chỉ theo dõi): sau mỗi epoch trên **đúng một tập 256 mẫu CỐ ĐỊNH** bốc từ
+  hồ val 2000 (`val_resample: false`, chỉ số chỉ phụ thuộc seed): ASL, F1,
+  Recall, sqrt(F1 · Recall), macro trên 14 bệnh lý × lớp {pos, uncertain}, dự
+  đoán = argmax 3 lớp. Cố định tập val nghĩa là đường val giữa các epoch chỉ
+  phản ánh model đổi, không lẫn tập đổi.
 * Loss: **ASL** one-hot 3 nhãn, γ_neg = **neg 4.0 · uncertain 1.0 · pos 0.0**
   (khai theo tên lớp), γ_pos 0, **p_clip 0.05**.
 * Nhãn lấy từ `csv_helper/labels.npz`, mảng `y_gt`, key `img_rel`. Mã trong
@@ -116,8 +127,8 @@ $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt đã khoá
 bốc lại mỗi 25 bước). Phần thêm:
 
 * Cls Head **bị bỏ**. Recovery nạp **trọn vẹn** từ Stage 0 (`final/`) và **đóng
-  băng hoàn toàn trong 1/4 epoch đầu** (50/200 bước), sau đó học ở lr cố định
-  **3e-5**, wd 0.01. Autobatch dò VRAM ở trạng thái đã mở băng (nặng nhất).
+  băng hoàn toàn trong 0.2 epoch đầu** (40/200 bước), sau đó **finetune** ở lr cố
+  định **1e-5**, wd 0.01. Autobatch dò VRAM ở trạng thái đã mở băng (nặng nhất).
 * Nhánh chỉ có **một** nhóm tham số — không còn "Main" / "Pretrain" như §2.0, vì
   không còn phần nào của nhánh là mới tinh (§2.0 tách hai nhóm chính vì Retriever
   ở đó khởi tạo ngẫu nhiên).
@@ -208,7 +219,7 @@ export WANDB_API_KEY=xxxxxxxx
 python scripts/selftest_recovery.py             # vài giây, không cần GPU
 bash scripts/run_recovery.sh train --dry-run    # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_recovery.sh train --detach     # 1. kéo A -> Stage 0 (5 epoch -> base, epoch 6 -> final) -> main B -> sinh -> chấm
+bash scripts/run_recovery.sh train --detach     # 1. kéo A -> Stage 0 (1+3 epoch -> base, epoch 5 -> final) -> main B -> sinh -> chấm
 bash scripts/run_recovery.sh stats              # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
 bash scripts/run_recovery.sh lens               # 3. mổ khối Q trên 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
 bash scripts/run_recovery.sh push               # 4. -> current/$2.1_Recovery_Test/ (kèm Reports/Lens/)
@@ -230,14 +241,14 @@ Các cờ:
 
 * `--retrain-all` (hoặc `recovery_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
-* `--restage0`: pretrain lại cả 6 epoch, kéo theo `--retrain`.
+* `--restage0`: pretrain lại cả 5 epoch, kéo theo `--retrain`.
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
   `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
   vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
-  Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của 5 epoch) được
+  Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của phần base) được
   **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn trên Hub — nên không phải
-  pretrain lại 5 epoch.
-* `--stages data,stage0`: chỉ chạy Stage 0 (5 epoch + epoch 6), không đụng main stage.
+  pretrain lại phần base.
+* `--stages data,stage0`: chỉ chạy Stage 0 (base 4 epoch + epoch 5), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
 * `--no-pull`.
@@ -247,8 +258,8 @@ Các cờ:
 ```
 adapters_recovery/_fixture/                  = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_recovery/_stage0/                   PRETRAIN — để về sau đối chứng SoTA
-    base/recovery_stage0.safetensors|.json   Recovery + Cls Head sau 5 epoch lr cố định
-    final/recovery_stage0.safetensors|.json  sau epoch 6 (cosine 3e-5 → 1e-8) — main stage dùng bản này
+    base/recovery_stage0.safetensors|.json   Recovery + Cls Head sau 1 warm-up + 3 main epoch
+    final/recovery_stage0.safetensors|.json  sau epoch 5 (cosine 3e-5 → 1e-8) — main stage dùng bản này
     loader.json                              fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
                                              batch/micro, lịch, ASL, spec, vân tay, sha256 weight
     stage0_labels.npz                        nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
@@ -275,7 +286,7 @@ Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
 Hai lần đẩy tự động trong lúc `train`:
 
-* Stage 0: `base/` được đẩy ngay khi 5 epoch xong, `final/` được đẩy khi epoch 6 xong (kèm fixture).
+* Stage 0: `base/` được đẩy ngay khi phần base xong, `final/` được đẩy khi epoch 5 xong (kèm fixture).
 * B được đẩy riêng ngay khi sinh xong, và lại sau khi chấm xong.
 
 Trên máy mới, `train` kéo Stage 0 từ Hub nếu vân tay khớp, rồi kéo weight và kết

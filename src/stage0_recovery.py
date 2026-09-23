@@ -7,13 +7,20 @@ chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không 
 diễn trung gian nào rồi vứt đi. Main stage nạp nguyên `recovery.*` và bỏ Cls Head.
 
 Lịch (khối `stage0` của configs/recovery.yaml):
-  * AdamW, lr CỐ ĐỊNH 3e-4 (không warm-up, không decay), weight_decay 0.03;
-  * `max_epochs` (5) epoch trên 6400 mẫu train CỦA FIXTURE $1 (cùng tập main stage);
+  * AdamW, lr ĐỈNH 1e-4: `warmup_epochs` (1) epoch đầu lr đi TUYẾN TÍNH theo
+    BƯỚC từ đỉnh/w lên đỉnh, rồi giữ phẳng tới hết phần base. weight_decay 0.03;
+  * `warmup_epochs` (1) + `max_epochs` (3) = 4 epoch base trên 6400 mẫu train
+    CỦA FIXTURE $1 (cùng tập main stage). Epoch warm-up là epoch THÊM VÀO, nằm
+    NGOÀI `max_epochs`;
+  * epoch n+1 chạy NỐI TIẾP: giữ moment AdamW của phần base, lr cosine từ đỉnh
+    (`stage0.lr`) xuống `final_anneal.lr_end` -> `final/`;
   * LUÔN lấy epoch CUỐI (`stage0.select: last`) — val chỉ để theo dõi;
-  * sau MỖI epoch đo trên 256 mẫu bốc lại từ hồ val 2000 (`stage0.val_n_samples`,
-    chỉ số từ (seed, epoch) — tái lập được): ASL, F1, Recall, sqrt(F1·Recall)
-    macro trên (14 bệnh lý × lớp ∈ {pos, uncertain}) — ghi lại, không chọn
-    epoch (trừ khi `select: best`);
+  * sau MỖI epoch đo trên ĐÚNG MỘT tập 256 mẫu CỐ ĐỊNH bốc từ hồ val 2000
+    (`stage0.val_n_samples`, `val_resample: false` — chỉ số chỉ phụ thuộc seed):
+    ASL, F1, Recall, sqrt(F1·Recall) macro trên (14 bệnh lý × lớp ∈ {pos,
+    uncertain}) — ghi lại, không chọn epoch (trừ khi `select: best`). Cố định
+    tập val nghĩa là đường val giữa các epoch chỉ phản ánh model đổi, không lẫn
+    tập đổi;
   * ASL one-hot 3 lớp: γ_neg theo tên lớp neg 4.0 · uncertain 1.0 · pos 0.0,
     γ_pos 0, clip 0.05.
 
@@ -44,7 +51,7 @@ LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy 
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
 # dùng lại Recovery đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
-BASE = "base"                         # sau `max_epochs` (5) epoch lr cố định — đẩy Hub ngay
+BASE = "base"                         # sau warm-up + `max_epochs` epoch — đẩy Hub ngay
 CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
 KEEP = (f"{BASE}/recovery_stage0.safetensors", f"{BASE}/recovery_stage0.json",
         f"{CKPT}/recovery_stage0.safetensors", f"{CKPT}/recovery_stage0.json", HISTORY,
@@ -57,9 +64,12 @@ def stage0_dir(cfg: Cfg) -> Path:
 
 def s0cfg(cfg: Cfg) -> dict:
     s = dict(cfg.get("stage0") or {})
-    out = {"lr": float(s.get("lr", 1e-4)),
+    out = {"lr": float(s.get("lr", 1e-4)),          # ĐỈNH, sau warm-up
+           # Số epoch THÊM VÀO ở đầu, lr đi tuyến tính theo BƯỚC lên đỉnh.
+           # Nằm NGOÀI `max_epochs`: base = warmup_epochs + max_epochs.
+           "warmup_epochs": int(s.get("warmup_epochs", 1)),
            "weight_decay": float(s.get("weight_decay", 0.03)),
-           "max_epochs": int(s.get("max_epochs", 5)),
+           "max_epochs": int(s.get("max_epochs", 3)),   # epoch CHÍNH, sau warm-up
            "batch_size": int(s.get("batch_size", 32)),
            "micro_batch": int(s.get("micro_batch", 16) or 16),
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
@@ -71,12 +81,19 @@ def s0cfg(cfg: Cfg) -> dict:
            "val_classes": list(s.get("val_classes") or ["pos", "uncertain"]),
            # epoch đem sang main stage: last (luôn lấy epoch cuối) | best (theo val)
            "select": str(s.get("select", "last")).lower(),
-           # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ), bốc lại mỗi epoch
+           # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ). val_resample = false
+           # -> MỌI epoch dùng chung một tập, chỉ số chỉ phụ thuộc seed.
            "val_n_samples": int(s.get("val_n_samples", 256) or 0),
            "val_resample": bool(s.get("val_resample", True)),
            "asl": dict(s.get("asl") or {}),
            "final_anneal": anneal_cfg(s)}
     Z.asl_gammas(out["asl"])            # kiểm sớm
+    if out["warmup_epochs"] < 0 or out["max_epochs"] < 1:
+        raise TrainUnusable(
+            f"stage0.warmup_epochs {out['warmup_epochs']} phải >= 0 và "
+            f"stage0.max_epochs {out['max_epochs']} phải >= 1.")
+    # Tổng phần base. `max_epochs` là số epoch CHÍNH; warm-up cộng THÊM vào đầu.
+    out["base_epochs"] = out["warmup_epochs"] + out["max_epochs"]
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
         raise TrainUnusable(f"stage0.micro_batch {out['micro_batch']} không chia "
                             f"hết stage0.batch_size {out['batch_size']}")
@@ -89,20 +106,47 @@ def s0cfg(cfg: Cfg) -> dict:
     return out
 
 
-def anneal_cfg(s: dict) -> dict:
-    """`stage0.final_anneal`: epoch n+1 (sau `max_epochs`) -> checkpoint `final/`.
+def base_scheduler(opt, sc: dict, steps_per_epoch: int):
+    """Lịch lr của phần BASE: warm-up tuyến tính theo BƯỚC rồi giữ phẳng.
 
-    Optimizer MỚI (không mang trạng thái/lịch sử scheduler của `max_epochs` epoch trước),
-    lr cosine từ `lr_start` xuống `lr_end` trong `epochs` epoch, cập nhật mỗi bước.
+        lr(step) = lr_đỉnh · min(1, (step + 1) / w),  w = warmup_epochs × bước/epoch
+
+    Theo BƯỚC chứ không theo epoch: với 5 epoch, warm-up theo epoch chỉ có 5 nấc
+    và nấc đầu đã là 1/5 đỉnh — gần như không warm-up gì. `warmup_epochs = 0`
+    -> None (lr phẳng suốt, như lịch cũ).
+    """
+    import torch
+
+    w = int(round(float(sc["warmup_epochs"]) * int(steps_per_epoch)))
+    if w <= 0:
+        return None
+    return torch.optim.lr_scheduler.LambdaLR(opt, lambda step: min(1.0, (step + 1) / w))
+
+
+def anneal_cfg(s: dict) -> dict:
+    """`stage0.final_anneal`: epoch n+1 (sau phần base) -> checkpoint `final/`.
+
+    Mặc định chạy NỐI TIẾP phần base: `reset_optimizer: false` giữ nguyên moment
+    AdamW đã tích trong 4 epoch trước, và `lr_start: null` lấy đúng lr ĐỈNH của
+    phần base (`stage0.lr`) làm điểm xuất phát — tức lr không nhảy nấc ở ranh
+    giới epoch, nó chỉ bắt đầu đi xuống. Cosine từ `lr_start` tới `lr_end` trong
+    `epochs` epoch, cập nhật MỖI BƯỚC.
+
+    `reset_optimizer: true` là lịch cũ: optimizer mới tinh, moment = 0, và
+    `lr_start` phải khai tay.
     """
     a = dict(s.get("final_anneal") or {})
+    ls = a.get("lr_start")
     out = {"enabled": bool(a.get("enabled", True)),
            "epochs": int(a.get("epochs", 1)),
-           "lr_start": float(a.get("lr_start", 3e-5)),
-           "lr_end": float(a.get("lr_end", 1e-8)),
+           # null -> lr đỉnh của phần base: đổi `stage0.lr` thì điểm xuất phát
+           # của epoch final đi theo, không lệch thành hai con số rời nhau.
+           "lr_start": float(s.get("lr", 1e-4)) if ls is None else float(ls),
+           "lr_start_from_base_lr": ls is None,
+           "lr_end": float(a.get("lr_end", 1e-7)),
            "schedule": str(a.get("schedule", "cosine")).lower(),
            "weight_decay": float(a.get("weight_decay", s.get("weight_decay", 0.03))),
-           "reset_optimizer": bool(a.get("reset_optimizer", True))}
+           "reset_optimizer": bool(a.get("reset_optimizer", False))}
     if out["schedule"] != "cosine":
         raise TrainUnusable("stage0.final_anneal.schedule chỉ nhận `cosine`.")
     if not (out["lr_start"] > out["lr_end"] >= 0) or out["epochs"] < 1:
@@ -113,7 +157,7 @@ def anneal_cfg(s: dict) -> dict:
 def legacy_base(h: dict, cfg: Cfg) -> bool:
     """History kiểu CŨ (trước khi tách base/final) có dùng lại làm base được không?
 
-    Bản cũ chạy đúng `max_epochs` epoch lr cố định rồi ghi checkpoint cuối vào
+    Bản cũ chạy đúng phần base rồi ghi checkpoint cuối vào
     `final/`, và `config_fingerprint` của nó tính trên KHỐI stage0 CHƯA có
     `final_anneal` — tức là ĐÚNG công thức `base_fingerprint` bây giờ. Nên chỉ
     nhận khi vân tay ấy khớp và history không có epoch anneal nào.
@@ -124,7 +168,7 @@ def legacy_base(h: dict, cfg: Cfg) -> bool:
 
 
 def adopt_legacy_base(cfg: Cfg) -> dict | None:
-    """`final/` kiểu cũ (= epoch cuối của `max_epochs` epoch) -> `base/`. Trả history hoặc None."""
+    """`final/` kiểu cũ (= epoch cuối của phần base) -> `base/`. Trả history hoặc None."""
     d = stage0_dir(cfg)
     p = d / HISTORY
     if base_finished(cfg) is not None or not (p.exists() and Z.stage0_exists(d / CKPT)):
@@ -145,7 +189,7 @@ def adopt_legacy_base(cfg: Cfg) -> dict | None:
 
 
 def base_finished(cfg: Cfg) -> dict | None:
-    """Phần `max_epochs` epoch (base/) đã xong với đúng cấu hình? -> history hoặc None."""
+    """Phần base (warm-up + `max_epochs`, base/) đã xong với đúng cấu hình? -> history hoặc None."""
     d = stage0_dir(cfg)
     p = d / HISTORY
     if not (p.exists() and Z.stage0_exists(d / BASE)):
@@ -188,7 +232,7 @@ def config_fingerprint(cfg: Cfg) -> str:
 
 
 def base_fingerprint(cfg: Cfg) -> str:
-    """Vân tay của phần base (`max_epochs` epoch): như trên nhưng KHÔNG gồm
+    """Vân tay của phần base (warm-up + `max_epochs`): như trên nhưng KHÔNG gồm
     `final_anneal` — đổi lịch anneal thì chỉ chạy lại epoch n+1, không chạy lại
     cả phần base."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
@@ -324,12 +368,18 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
           f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
           f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn", flush=True)
     fa = sc["final_anneal"]
-    print(f"  Stage 0: lr CỐ ĐỊNH {sc['lr']:g} · wd {sc['weight_decay']} · "
-          f"{sc['max_epochs']} epoch ({sc['select']}) -> {BASE}/ · batch {sc['batch_size']}"
+    print(f"  Stage 0: lr ĐỈNH {sc['lr']:g} (warm-up tuyến tính "
+          f"{sc['warmup_epochs']:g} epoch đầu) · wd {sc['weight_decay']} · "
+          f"{sc['warmup_epochs']}+{sc['max_epochs']} = {sc['base_epochs']} epoch "
+          f"({sc['select']}) -> {BASE}/ · batch {sc['batch_size']}"
           f" · ASL γ_neg {dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} "
-          f"clip {sc['asl'].get('clip', 0.05)} · val {sc['val_n_samples']} mẫu", flush=True)
+          f"clip {sc['asl'].get('clip', 0.05)} · val {sc['val_n_samples']} mẫu "
+          f"{'bốc lại mỗi epoch' if sc['val_resample'] else 'CỐ ĐỊNH'}", flush=True)
     if fa["enabled"]:
-        print(f"  Stage 0 · epoch n+1: optimizer MỚI, cosine {fa['lr_start']:g} -> "
+        print(f"  Stage 0 · epoch n+1: "
+              f"{'optimizer MỚI (moment = 0)' if fa['reset_optimizer'] else 'NỐI TIẾP (giữ moment AdamW của base)'}"
+              f", cosine {fa['lr_start']:g}"
+              f"{' (= lr đỉnh của base)' if fa['lr_start_from_base_lr'] else ''} -> "
               f"{fa['lr_end']:g} trong {fa['epochs']} epoch · wd {fa['weight_decay']} "
               f"-> {CKPT}/ (main stage dùng bản này)", flush=True)
 
@@ -369,6 +419,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     start_epoch = 1
     best = {"epoch": None, "score": -1.0}
     last = d / "last" / "state.pt"
+    # Epoch final chạy NỐI TIẾP thì phải có moment AdamW THẬT của phần base.
+    # `last/state.pt` KHÔNG được đẩy Hub, nên một máy chỉ kéo `base/` về sẽ
+    # không có nó — trường hợp đó phải nói ra, không chạy im lặng.
+    base_opt_live = False
     if last.exists() and not restart:
         st = torch.load(last, map_location="cpu", weights_only=False)
         if st.get("base_fingerprint") == base_fingerprint(cfg):
@@ -378,31 +432,42 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             history = list(st["history"])
             best = dict(st["best"])
             start_epoch = int(st["epoch"]) + 1
+            base_opt_live = True
             print(f"  ⚙ Stage 0 chạy TIẾP từ epoch {start_epoch} (đã lưu base: "
                   f"epoch {best['epoch']})", flush=True)
 
     n = len(ds_tr)
     steps_per_epoch = math.ceil(n / bs_eff)
+    # LambdaLR chụp `base_lrs` từ param_groups LÚC DỰNG. Sau khi chạy tiếp,
+    # lr trong đó là lr của bước cuối (có thể đang giữa dốc warm-up), nên đặt
+    # lại về đỉnh trước khi dựng, rồi TUA scheduler tới đúng số bước đã chạy —
+    # lr là hàm thuần của số bước nên tua lại cho đúng con số cũ.
+    for grp in opt.param_groups:
+        grp["lr"] = sc["lr"]
+    sched_b = base_scheduler(opt, sc, steps_per_epoch)
+    if sched_b is not None:
+        for _ in range((start_epoch - 1) * steps_per_epoch):
+            sched_b.step()
     if not restart:
         adopt_legacy_base(cfg)          # `final/` kiểu cũ -> base/ (nếu vân tay khớp)
     if restart_final and base_finished(cfg) is None:
         raise TrainUnusable(
             f"`--refinal` chỉ chạy lại epoch n+1, nhưng máy này không có base/ "
-            f"({sc['max_epochs']} epoch) khớp cấu hình — cục bộ lẫn trên Hub "
+            f"({sc['base_epochs']} epoch) khớp cấu hình — cục bộ lẫn trên Hub "
             f"(`<hub_base>/stage0/base/`). Chạy `--restage0` để pretrain lại, hoặc "
             f"kiểm `output.pull` / `--no-pull` và HF_TOKEN.")
     hb = None if restart else base_finished(cfg)
-    if hb is not None and (restart_final or start_epoch <= sc["max_epochs"]):
+    if hb is not None and (restart_final or start_epoch <= sc["base_epochs"]):
         from safetensors.torch import load_file
 
         block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
         g = torch.Generator().manual_seed(seed)
-        for _ in range(sc["max_epochs"]):            # cùng Generator như lúc chạy base
+        for _ in range(sc["base_epochs"]):           # cùng Generator như lúc chạy base
             torch.randperm(n, generator=g)
         history = [h for h in hb.get("history", []) if h.get("phase", "base") == "base"]
         best = {"epoch": hb.get("base_epoch"), "score": hb.get("base_score")}
-        start_epoch = sc["max_epochs"] + 1
-        print(f"  ⚙ base/ ({sc['max_epochs']} epoch) đã có — chỉ chạy epoch n+1", flush=True)
+        start_epoch = sc["base_epochs"] + 1
+        print(f"  ⚙ base/ ({sc['base_epochs']} epoch) đã có — chỉ chạy epoch n+1", flush=True)
 
     # ── nạp ảnh trong luồng nền (PIL + processor 896 là việc CPU; dataset này
     # KHÔNG gọi tokenizer nên chạy nhiều luồng được). Thứ tự không đổi.
@@ -514,11 +579,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                          "stage0/val_score": ev["score"], "stage0/epoch": ep})
         return ev
 
-    for ep in range(start_epoch, sc["max_epochs"] + 1):
+    for ep in range(start_epoch, sc["base_epochs"] + 1):
         t_ep = time.time()
-        run_loss = run_epoch(ep, opt)
+        run_loss = run_epoch(ep, opt, sched_b)
         ev = record(ep, run_loss, t_ep, "base")
-        better = (ep == sc["max_epochs"] or (max_steps is not None)) \
+        base_opt_live = True          # optimizer này vừa chạy thật phần base
+        better = (ep == sc["base_epochs"] or (max_steps is not None)) \
             if sc["select"] == "last" else ev["score"] > best["score"]
         if better:
             best = {"epoch": ep, "score": ev["score"]}
@@ -564,18 +630,24 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                                             default=str), encoding="utf-8")
         write_loader(cfg, d, train_df, val_df, y_tr, m_tr, y_va, m_va, info, sc, micro,
                      steps_per_epoch, spec, best)
-        print(f"  ✓ Stage 0 base: {sc['max_epochs']} epoch xong -> {d / BASE}", flush=True)
+        print(f"  ✓ Stage 0 base: {sc['base_epochs']} epoch xong -> {d / BASE}", flush=True)
         if on_base_done is not None:
             on_base_done()
 
     # ── epoch n+1: anneal cosine -> final/ ──────────────────────────────────
     if fa["enabled"]:
-        ep_last = sc["max_epochs"]
+        ep_last = sc["base_epochs"]
         if fa["reset_optimizer"]:
             opt = torch.optim.AdamW(block.parameters(), lr=fa["lr_start"],
                                     weight_decay=fa["weight_decay"], betas=(0.9, 0.999),
                                     eps=1e-8)
         else:
+            if not base_opt_live:
+                print("  ⚠ final_anneal.reset_optimizer = false (chạy NỐI TIẾP) "
+                      "nhưng máy này KHÔNG có trạng thái AdamW của phần base "
+                      "(`last/state.pt` không được đẩy Hub) — epoch final sẽ chạy "
+                      "với moment = 0, khác một lần chạy liền mạch. Cần đúng lịch "
+                      "thì `--restage0`.", flush=True)
             for grp in opt.param_groups:
                 grp["lr"], grp["weight_decay"] = fa["lr_start"], fa["weight_decay"]
         n_st = steps_per_epoch if max_steps is None else min(steps_per_epoch, max_steps)
@@ -590,6 +662,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         Z.save_stage0(block, d / CKPT, {
             "phase": "anneal", "best_epoch": ep, "best_score": ev["score"], "val": ev,
             "from": f"{BASE}/ (epoch {base['epoch']})", "anneal": fa,
+            "optimizer_continued": bool(not fa["reset_optimizer"] and base_opt_live),
             "config_fingerprint": config_fingerprint(cfg)})
     else:
         Z.save_stage0(block, d / CKPT, {
@@ -667,8 +740,14 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                   "steps_per_epoch": int(steps_per_epoch),
                   "loss_average": "ASL trung bình trên mẫu có nhãn của CẢ batch"},
         "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8)", "lr": sc["lr"],
-                     "lr_schedule": "fixed", "weight_decay": sc["weight_decay"],
-                     "max_epochs": sc["max_epochs"], "max_grad_norm": sc["max_grad_norm"],
+                     "lr_schedule": (f"warm-up tuyến tính theo bước trong "
+                                     f"{sc['warmup_epochs']:g} epoch đầu -> giữ đỉnh"
+                                     if sc["warmup_epochs"] > 0 else "fixed"),
+                     "warmup_epochs": sc["warmup_epochs"],
+                     "weight_decay": sc["weight_decay"],
+                     "warmup_epochs": sc["warmup_epochs"],
+                     "max_epochs": sc["max_epochs"], "base_epochs": sc["base_epochs"],
+                     "max_grad_norm": sc["max_grad_norm"],
                      "select": f"sqrt(F1_macro·Recall_macro) trên val, lớp {sc['val_classes']}"},
         "asl": sc["asl"], "spec": spec,
         "vision": {"hf_id": cfg["base"]["hf_id"], "quant": cfg["train"].get("quant"),
