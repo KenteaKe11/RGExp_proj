@@ -21,7 +21,8 @@ ra để làm. Mọi khoá quyết định kết quả của A (`seed`, `data`, 
 `configs/lora.yaml` của $1. Vân tay fixture của `configs/recovery.yaml` phải
 **trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
 
-> §2.0 (Recombiner Test: khối Recomb chiếu X lên 2560, rồi
+> §2.0 (Recombiner Test: khối Recomb — Linear + RMSNorm + Self-attn + MLP +
+> residual trên cả 4096 vị trí — rồi
 > `Z' = Z + Retriever(Z, R)` thay chỗ 256 token ảnh, chuỗi không dài thêm) đã
 > đóng — code ở `_archive/zrecomb/`, README ở `_archive/README_2.0_Recomb.md`.
 
@@ -31,26 +32,35 @@ ra để làm. Mọi khoá quyết định kết quả của A (`seed`, `data`, 
 X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐
 Z = projector(X) (256, 2560)                           │
                                           ┌──── Recovery ────┐
-  h = Self-attn(RMSNorm(Learner))         │ Learner (256, 1152) — tham số
-  u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(X))          │ query = h, key/value = X
-  u = Linear 2560→1152(GELU(Linear 1152→2560 (u)))     │
-  h = h + u                                            │
-  Q = Linear 2560→2560(GELU(Linear 1152→2560 (h)))     │ -> Q (256, 2560)
+  v = RMSNorm(Linear 1152→2560 (X))                    │ ĐÚNG MỘT phép chiếu
+  h = Self-attn(RMSNorm(Learner))                      │ Learner (256, 2560) — tham số
+  u = Cross-Attn(RMSNorm_q(h), v)                      │ query = h, key/value = v
+  h = h + Linear 1024→2560(GELU(Linear 2560→1024 (u))) │
+  Q = Linear 2560→2560(GELU(Linear 2560→2560 (h)))     │ -> Q (256, 2560)
                                           └──────────────────┘
 Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**Không còn khối Recomb.** §2.0 chiếu X lên 2560 rồi xử lý toàn bộ nhánh ở 2560
-trên 4096 vị trí. Ở đây Recovery làm việc **ngay trong không gian 1152 của
-SigLIP** và chỉ giữ `n_query` (256) vị trí; 4096 token thị giác chỉ xuất hiện ở
-Key/Value của Cross-Attn. Đúng một chỗ đổi sang 2560: MLP cuối — chỗ viết vào
-không gian embedding của decoder. Kết quả: nhánh 26,3 M tham số (Stage 0 thêm
-Cls Head thành 52,7 M), và phần nặng nhất là attention 256 × 4096 chứ không phải
-activation 4096 × 2560.
+**Không còn khối Recomb.** §2.0 cho X qua Linear + RMSNorm + Self-attn + MLP +
+residual trên cả 4096 vị trí rồi mới dùng. Ở đây X vào nhánh qua **đúng một**
+`Linear 1152→2560` rồi RMSNorm, và chỉ xuất hiện ở Key/Value của Cross-Attn; mọi
+thứ còn lại chạy trên `n_query` (256) vị trí. Phần nặng nhất vì thế là attention
+256 × 4096, không phải một stack 4096 × 2560.
 
-Head_dim 128 ở mọi attention: 9 head cho khối 1152 (Self-attn, Cross-Attn), 20
-head cho Attn-Pooling ở 2560. Tham số nhánh để fp32, chạy dưới autocast bf16.
+Head_dim 128 ở mọi attention (2560 = 20 × 128): 20 head cho Self-attn,
+Cross-Attn và Attn-Pooling. Tham số nhánh để fp32, chạy dưới autocast bf16.
+
+| khối | tham số |
+|---|---|
+| `Linear 1152→2560` (X) | 2,95 M |
+| Learner (256 × 2560) | 0,66 M |
+| Self-attn · Cross-Attn | 26,2 M · 26,2 M |
+| MLP 2560→1024→2560 | 5,25 M |
+| MLP cuối 2560→2560→2560 | 13,1 M |
+| **Recovery** | **74,4 M** |
+| Cls Head (chỉ Stage 0) | 26,3 M |
+| **Stage 0 tổng** | **100,7 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
@@ -265,7 +275,7 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/recovery.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_recovery.sh · selftest_recovery.py · setup.sh · _env.sh
 src/run_recovery.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/recovery.py          Recovery (Learner + Self/Cross-Attn ở 1152) · Cls Head (đọc Q) ·
+src/recovery.py          Recovery (Linear 1152→2560 + Learner + Self/Cross-Attn) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_recovery.py   Stage 0 + loader.json + nhãn chụp lại
 src/train_recovery.py    main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)

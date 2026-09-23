@@ -60,7 +60,7 @@ def check(name: str):
 def small_spec(n_labels=14, n_query=5):
     from src import recovery as R
 
-    cfg = {"recovery": {"recovery": {"n_query": n_query, "n_heads": 4, "hidden": 48,
+    cfg = {"recovery": {"recovery": {"n_query": n_query, "n_heads": 4, "hidden": 12,
                                      "out_hidden": 40},
                         "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, 24, 32, n_labels)
@@ -100,6 +100,9 @@ def _():
     assert q.abs().sum() > 0
     assert not hasattr(br.recovery, "out")
     assert not hasattr(br, "recomb")            # Recomb đã bị bỏ khỏi kiến trúc
+    # X vào nhánh qua ĐÚNG MỘT phép chiếu; phần còn lại chạy ở d_model
+    assert br.recovery.inp.in_features == 24 and br.recovery.inp.out_features == 32
+    assert tuple(br.recovery.learner.shape) == (1, sp["recovery"]["n_query"], 32)
     # Q phụ thuộc ẢNH (Cross-Attn thật sự đọc X), không phải hằng số
     assert not torch.allclose(q[0], q[1])
     before = q.detach().clone()
@@ -419,9 +422,9 @@ def _():
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert cfg["recovery_exp"]["retrain_all"] is False
     rv = cfg["recovery"]["recovery"]
-    assert int(rv["n_query"]) == 256 and int(rv["n_heads"]) == 9
-    assert 1152 % int(rv["n_heads"]) == 0 and 1152 // int(rv["n_heads"]) == 128
-    assert int(rv["hidden"]) == int(rv["out_hidden"]) == 2560
+    assert int(rv["n_query"]) == 256 and int(rv["n_heads"]) == 20
+    assert 2560 % int(rv["n_heads"]) == 0 and 2560 // int(rv["n_heads"]) == 128
+    assert int(rv["hidden"]) == 1024 and int(rv["out_hidden"]) == 2560
     assert "zero_init_out" not in rv and "recomb" not in cfg["recovery"]
     src = (ROOT / "src/run_recovery.py").read_text(encoding="utf-8")
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
@@ -461,7 +464,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
     cfg["recovery"] = {"recovery": {"n_query": 5, "n_heads": 4, "hidden": 16,
-                                    "out_hidden": 32},
+                                    "out_hidden": 40},
                        "cls_head": {"n_heads": 4}}
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2, max_epochs=8)
     cfg["autobatch"] = {"enabled": False}
@@ -701,7 +704,7 @@ def _():
     assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/recovery.yaml")
     sp = R.spec_from_cfg({"recovery": {"recovery": {"n_query": NQ, "n_heads": 2,
-                                                    "hidden": 12, "out_hidden": 16},
+                                                    "hidden": 8, "out_hidden": 16},
                                        "cls_head": {"n_heads": 2}}}, DV, DM, 14)
     branch = R.RecoveryBranch(sp)
     branch.set_frozen(True)

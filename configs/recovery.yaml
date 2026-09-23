@@ -301,17 +301,17 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/recovery.py`) ────────────────────────────────────────────
-# KHÔNG còn Recomb. Recovery làm việc NGAY trong không gian 1152 của SigLIP và
-# chỉ giữ n_query vị trí; 4096 token thị giác chỉ xuất hiện ở Key/Value của
-# Cross-Attn. Đúng một chỗ đổi sang 2560: MLP cuối, chỗ viết vào không gian
-# embedding của decoder.
+# KHÔNG còn khối Recomb của §2.0 (Linear + RMSNorm + Self-attn + MLP + residual
+# trên cả 4096 vị trí). X vào nhánh qua ĐÚNG MỘT `Linear 1152→2560` rồi RMSNorm,
+# và chỉ xuất hiện ở Key/Value của Cross-Attn; mọi thứ còn lại chạy trên n_query
+# vị trí.
 recovery:
   n_labels: null            # null = theo labels.npz (14)
   recovery:                 # X (4096, 1152) -> Q (256, 2560)
     n_query: 256            # số learner vector NỐI vào chuỗi (chuỗi dài thêm đúng ngần này)
-    n_heads: 9              # head_dim 128 (1152 = 9 × 128), cho Self-attn và Cross-Attn
-    hidden: 2560            # MLP(GeLU) sau Cross-Attn: 1152 -> 2560 -> 1152 (+res)
-    out_hidden: 2560        # MLP(GeLU) cuối: 1152 -> 2560 -> 2560 (ra không gian decoder)
+    n_heads: 20             # head_dim 128 (2560 = 20 × 128), cho Self-attn và Cross-Attn
+    hidden: 1024            # MLP(GeLU) sau Cross-Attn: 2560 -> 1024 -> 2560 (+res)
+    out_hidden: 2560        # MLP(GeLU) cuối: 2560 -> 2560 -> 2560
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
