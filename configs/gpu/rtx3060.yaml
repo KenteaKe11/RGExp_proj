@@ -1,12 +1,12 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIG GPU — NVIDIA GeForce RTX 3060 (12 GB GDDR6, Ampere, sm_86)
 #
-#     bash scripts/run_zrecomb.sh --gpu rtx3060 --detach
+#     bash scripts/run_recovery.sh --gpu rtx3060 --detach
 #     (không truyền --gpu thì cũng là file này: src/config.DEFAULT_GPU)
 #
 # CHỈ các khoá trong src/config.GPU_KEYS, và PHẢI khai đủ tất cả — thiếu một
 # khoá là DỪNG, không rơi về mặc định trong code. Thí nghiệm (lr, epoch, dữ liệu,
-# batch HIỆU DỤNG) ở configs/recomb.yaml. grad_accum được suy ra:
+# batch HIỆU DỤNG) ở configs/recovery.yaml. grad_accum được suy ra:
 #     32 / 1 = 32
 # Máy đích: 1× RTX 3060 12 GB · EPYC 7713 · 54 GB RAM · NVMe ~6/4.8 GB/s ·
 # mạng ~5 Gbps · đĩa 100 GB. Mọi pipeline (train, sinh) TỰ chọn batch mỗi lượt

@@ -1135,6 +1135,35 @@ def image_start_indices(input_ids: torch.Tensor, tok_id: int) -> torch.Tensor:
     return hit.float().argmax(dim=1).long()
 
 
+def image_end_indices(input_ids: torch.Tensor, tok_id: int) -> torch.Tensor:
+    """Vị trí token ảnh CUỐI CÙNG của TỪNG hàng. (B,) int64.
+
+    Dùng để nối token nhánh NGAY SAU khối ảnh (`at = image_end_indices(...) + 1`).
+    256 token ảnh của Gemma 3 nằm liền một khối, nên "cuối cùng" = hết khối.
+    """
+    hit = (input_ids == int(tok_id))
+    image_start_indices(input_ids, tok_id)       # dùng chung mọi phép kiểm ở trên
+    n = input_ids.shape[1]
+    # argmax trên bản lật -> vị trí hit cuối cùng
+    return (n - 1 - hit.flip(1).float().argmax(dim=1)).long()
+
+
+def last_image_index(input_ids: torch.Tensor, tok_id: int) -> int:
+    """Vị trí token ảnh cuối cùng, và nó phải GIỐNG NHAU ở mọi hàng của batch.
+
+    Cùng lý lẽ với `first_image_index`: ở khâu HUẤN LUYỆN mọi mẫu dùng chung một
+    prompt và đệm bên PHẢI, nên khối ảnh kết thúc ở cùng một chỗ. Khâu SINH đệm
+    bên TRÁI -> dùng `image_end_indices` và để `inject_tokens` chèn theo hàng.
+    """
+    idx = image_end_indices(input_ids, tok_id)
+    if int(idx.min()) != int(idx.max()):
+        raise RuntimeError(
+            f"khối token ảnh kết thúc ở các vị trí khác nhau trong cùng batch "
+            f"({int(idx.min())}..{int(idx.max())}). Ở khâu huấn luyện điều đó "
+            f"nghĩa là padding_side đã bị đặt 'left', hoặc prompt đổi theo mẫu.")
+    return int(idx[0])
+
+
 def first_image_index(input_ids: torch.Tensor, tok_id: int) -> int:
     """Vị trí token ảnh đầu tiên, và nó phải GIỐNG NHAU ở mọi hàng của batch.
 
@@ -1161,11 +1190,13 @@ def inject_tokens(embeds: torch.Tensor, tokens: torch.Tensor,
                   token_type_value: int = 0) -> dict:
     """Chèn `tokens` vào chuỗi ở vị trí `at`, và nới MỌI tensor đi kèm theo.
 
-    `at` là vị trí token ảnh đầu tiên, nên `n_dec_tokens` (64) token nằm NGAY TRƯỚC
-    256 token ảnh — đúng thứ tự First (Recombinator) / Second (VL-Adapter)
-    của "concat" trong sơ đồ tổng, và giữ nguyên BOS cùng
-    câu lệnh hệ thống ở đầu chuỗi. `at` là một số (mọi hàng chèn cùng chỗ, khâu
-    huấn luyện) hoặc một tensor (B,) — mỗi hàng một chỗ, khâu sinh đệm trái.
+    `at` là vị trí CHÈN VÀO (token đang ở đó bị đẩy sang phải). Hai chỗ dùng:
+    `first_image_index(...)` -> token nhánh nằm NGAY TRƯỚC 256 token ảnh (thứ tự
+    First/Second của "concat" ở §2.3/§2.4); `last_image_index(...) + 1` -> ngay
+    SAU khối ảnh (thứ tự [Z ‖ Q ‖ T] của §2.1 Recovery). Cả hai đều giữ nguyên
+    BOS và câu lệnh hệ thống ở đầu chuỗi. `at` là một số (mọi hàng chèn cùng
+    chỗ, khâu huấn luyện) hoặc một tensor (B,) — mỗi hàng một chỗ, khâu sinh
+    đệm trái.
 
     Nhãn của phần chèn thêm là -100. Quên chỗ này thì model bị dạy sinh ra 64
     token vô nghĩa ở đầu mỗi báo cáo: loss vẫn giảm, và chuyện đó chỉ lộ ra ở

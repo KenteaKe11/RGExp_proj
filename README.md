@@ -1,42 +1,58 @@
-# research_v2 — $2 Recombiner Test: Z vs Z' = F(Z | Recomb)
+# research_v2 — §2.1 Recovery: `[Z ‖ T]` vs `[Z ‖ Q ‖ T]`
 
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-cùng loader, cùng 3000 ảnh test), rồi thay 256 token ảnh **Z** bằng
-**Z' = F(Z | Recomb)** — chất lượng báo cáo X-quang có đổi không?
+cùng loader, cùng 3000 ảnh test), rồi **nối thêm 128 learner vector**
+**Q = Recovery(Recomb(X))** ngay sau 256 token ảnh — chất lượng báo cáo X-quang
+có đổi không?
 
 | candidate | nguồn | chuỗi vào decoder |
 |---|---|---|
-| **A** `qlora_r32_decoder` (tham chiếu) | $1 — weight, predictions, điểm từng ảnh lấy lại (tem khớp), **không** train lại | `[text ‖ Z]` |
-| **B** `qlora_r32_decoder_recomb` | $2 — Stage 0 → main stage y hệt A + nhánh | `[text ‖ Z']` |
+| **A** `qlora_r32_decoder` (tham chiếu) | $1 — weight, predictions, điểm từng ảnh lấy lại (tem khớp), **không** train lại | `[Z ‖ text]` |
+| **B** `qlora_r32_decoder_recovery` | §2.1 — Stage 0 → main stage y hệt A + nhánh | `[Z ‖ Q ‖ text]` |
 
-**Biến duy nhất là Z vs Z'.** Z' thay đúng 256 chỗ token ảnh (không thêm token),
-nên độ dài chuỗi, nhãn, mask giữ nguyên. Lớp cuối của Retriever khởi tạo 0, nên
-ở bước 0 B trùng A từng bit. Mọi khoá quyết định kết quả của A (`seed`, `data`,
+**Biến duy nhất là chuỗi vào decoder.** Z (256 token ảnh) **không bị đụng vào**;
+B chỉ có thêm 128 vị trí nằm ngay sau khối ảnh. 128 vị trí ấy có nhãn `-100`,
+`attention_mask = 1`, `token_type_ids = 0` — nên **số token vào CE không đổi** và
+CE của A với B vẫn là cùng một đại lượng. TokenMix cuối của Recovery khởi tạo 0,
+nên ở bước 0 thì Q = 0. Mọi khoá quyết định kết quả của A (`seed`, `data`,
 `image_policy`, `base`, `prompt`, `generate`, `train`, `metrics`) được chép
-nguyên văn từ `configs/lora.yaml` của $1. Vân tay fixture của `configs/recomb.yaml`
-phải **trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
+nguyên văn từ `configs/lora.yaml` của $1. Vân tay fixture của
+`configs/recovery.yaml` phải **trùng** $1 (selftest kiểm, `train` dừng nếu lệch).
 
-## Kiến trúc (`src/zrecomb.py`)
+> §2.0 (Recombiner Test: `Z' = Z + Retriever(Z, R)` thay chỗ 256 token ảnh, chuỗi
+> không dài thêm) đã đóng — code ở `_archive/zrecomb/`, README ở
+> `_archive/README_2.0_Recomb.md`.
+
+## Kiến trúc (`src/recovery.py`)
 
 ```
 X = SigLIP(ảnh) (4096, 1152) ─► Recomb ─► R (4096, 2560)
     Recomb: h0 = Linear 1152→2560 ; h = RMSNorm(h0) ; h = Self-attn(h)
-            h = Linear 3072→2560(GELU(Linear 2560→3072(h))) ; R = h0 + h
+            h = Linear 1280→2560(GELU(Linear 2560→1280(h))) ; R = h0 + h
 R ─► Cls Head (CHỈ Stage 0): RMSNorm -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
-Z = projector(X) (256, 2560) ─► Retriever(Z, R):
-    h = CrossAttn(RMSNorm_q(Z), RMSNorm_kv(R)) ; h = Linear 1152→2560(GELU(Linear 2560→1152(h)))
-    Z' = Z + h
-[text ‖ Z'] ─► Gemma decoder (QLoRA r32) ─► CE
+R ─► Recovery ─► Q (128, 2560):
+    h = Self-attn(RMSNorm(Learner))                 Learner = tham số (128, 2560)
+    u = Cross-Attn(RMSNorm_q(h), RMSNorm_kv(R))     query = h, key/value = R
+    u = Linear 1280→2560(GELU(Linear 2560→1280(u)))
+    Q = TokenMix(h + u)                             Linear 128→128 trên TRỤC TOKEN, init = 0
+Z = projector(X) (256, 2560)
+[Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-20 head (head_dim 128) ở cả ba attention. Tham số nhánh để fp32, chạy dưới
+20 head (head_dim 128) ở cả bốn attention. Tham số nhánh để fp32, chạy dưới
 autocast bf16.
+
+**Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
+đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
+Đặt Q trước Z thì 128 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
+lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) và
+`recombiner.image_end_indices(ids) + 1` (khâu sinh, đệm trái — mỗi hàng một chỗ).
 
 ## Lịch
 
-**Stage 0: pretrain Recomb** (`src/stage0_zrecomb.py`). Chỉ vision tower của
-Gemma chạy (đóng băng); không có decoder, không có LoRA.
+**Stage 0: pretrain Recomb** (`src/stage0_recovery.py`). Chỉ vision tower của
+Gemma chạy (đóng băng); không có decoder, không có LoRA, **không có Recovery**.
 
 * AdamW, lr **cố định 3e-4**, wd 0.03, **8 epoch**, batch 32 (micro do autobatch chọn).
   Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 8 epoch xong.
@@ -53,9 +69,9 @@ Gemma chạy (đóng băng); không có decoder, không có LoRA.
   `y_gt` là chỉ số của `class_names`: **0 = positive, 1 = negative,
   2 = uncertain, 3 = blank**. Đây không phải mã CheXpert thô. Ô **blank**
   (bệnh không được nhắc tới, chiếm ~62% số ô) bị **mask theo ô**: không vào
-  ASL (`zrecomb.CellMaskedASL`), không vào metric val. Không dùng `y_aug`.
+  ASL (`recovery.CellMaskedASL`), không vào metric val. Không dùng `y_aug`.
 
-**Main stage: QLoRA r32 + Recomb** (`src/train_zrecomb.py`). Dùng **lịch r32 của
+**Main stage: QLoRA r32 + Recovery** (`src/train_recovery.py`). Dùng **lịch r32 của
 $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt đã khoá, 1 epoch =
 200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo val (CE trên 256 mẫu
 bốc lại mỗi 25 bước). Phần thêm:
@@ -63,17 +79,18 @@ bốc lại mỗi 25 bước). Phần thêm:
 * Cls Head **bị bỏ**. Recomb nạp từ Stage 0 và **đóng băng hoàn toàn trong 0.5 epoch
   đầu** (100/200 bước), sau đó học ở lr cố định 1e-5, wd 0.01. Autobatch dò VRAM ở
   trạng thái đã mở băng (nặng nhất).
-* Retriever ("Main"): AdamW riêng, lr **cố định 1e-4**, wd 0.03.
+* Recovery ("Main"): AdamW riêng, lr **cố định 1e-4**, wd 0.03.
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A. Nếu batch đã khoá không vừa VRAM, micro-batch được chạy thành
-  từng mảnh và CE được ghép lại theo token. Kết quả đúng bằng con số HF tính
-  trên cả micro-batch, nên gradient không đổi.
+* B nặng hơn A: một nhánh **cộng 128 token** trong chuỗi. Nếu batch đã khoá không
+  vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo token.
+  Kết quả đúng bằng con số HF tính trên cả micro-batch, nên gradient không đổi.
 * Khởi tạo nhánh chạy trong `fork_rng`, nên LoRA được khởi tạo từ đúng trạng
   thái RNG như A.
+* Theo dõi `RMS(Q)/RMS(Z)` mỗi bước: ≈ 0 nghĩa là nhánh chưa nói gì với decoder.
 
-Không áp dụng cho $2 (các mục của lịch MoE): patience/early-stop, max 50 epoch,
-nhiễu Route.
+Không áp dụng cho §2.1 (các mục của lịch MoE): patience/early-stop, max 50 epoch,
+nhiễu Route, Route_Gate/Experts.
 
 ## Kiểm định (`src/stats_ab.py`)
 
@@ -89,36 +106,56 @@ và BERTScore-F1 (metric chính).
 REPORT.md ghi thêm: đồ thị `figures/metrics_ab.png` (như $1 nhưng chỉ A và B, bar ngang: B3 · B4 · RL · BertF1 × e^(γ−1), nét đứt ở max, Δ và ★ khi khác biệt có ý nghĩa), số ảnh B thắng/hoà/thua, Stage 0 từng epoch, và bảng main
 stage của A và B.
 
-## Lens — mổ MỘT ảnh (`src/lens_zrecomb.py`, lệnh `lens`)
+## Lens — mổ khối Q trên MỘT ảnh (`src/lens_recovery.py`, lệnh `lens`)
 
 Phần minh hoạ, tách khỏi kiểm định. Chọn **một ảnh test nhiều `pos` + `uncertain`
-nhất** (`lens.sample: auto`) và dùng đúng ảnh đó cho cả năm phần. Mọi bản đồ là đạo
-hàm của **một số**
+nhất** (`lens.sample: auto`) và dùng đúng ảnh đó cho cả ba phần.
+
+**Chỉ chạy candidate B.** Z của B giống A *từng bit* (nhánh không đụng vào 256
+token ảnh) và chuỗi chỉ dài thêm khối Q — nên **Q chính là phần `B − A`**. Nạp
+thêm A để trừ ra một dải gần như trắng là tốn một lần tải model 4B, một lượt
+backward, và đẻ ra một cột số dễ bị đọc thành kết luận A/B; kết luận ấy nằm ở
+`REPORT.md`, trên 3000 ảnh, có kiểm định. (§2.0 phải chạy cả hai vì ở đó Z bị
+thay bằng Z' và chênh lệch nằm rải trên 256 token ảnh.)
+
+Mọi bản đồ là đạo hàm của **một số**
 
 ```
 y = Σ_t log p(ref_t | ref_<t, ảnh)        (lens.target: ref_logprob)
 ```
 
-nên mỗi candidate chỉ tốn một lượt backward (Jacobian đầy đủ 2560 × số vị trí là
-không dựng nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
+nên chỉ tốn một lượt backward (Jacobian đầy đủ 2560 × số vị trí là không dựng
+nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 
-1. **[Language] Độ nhạy theo lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, heatmap lớp × vị trí
-   cho A, B và **B − A**; dải token ảnh được tô nền để thấy đúng chỗ Z → Z'.
-2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token của A
-   và B ở các lớp mốc, kèm bảng 14 nhãn bệnh lý của ảnh đó. Đầy đủ ở `logit_lens.csv`.
-3. **[Visual] Chain rule qua Recomb** — `y → Z' → Retriever → Recomb → X`, chuẩn
-   gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc.
-4. **[Visual] Chain rule qua encoder** — `y → Z → projector → X`, vẽ cho cả A và B.
-5. **[Visual] OR / AND** — hai bản đồ của B chuẩn hoá [0,1] rồi **cộng** (ít nhất một
-   đường nhìn vào đây) và **nhân** (cả hai cùng nhìn), chuẩn hoá lại.
+1. **[Language] Độ nhạy theo lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, **một** heatmap,
+   chỉ `lens.layer_frac` (1/4, làm tròn lên → 9/34) **lớp cuối**, trục y ghi
+   **chỉ số lớp thật**. Thanh màu phía trên đánh dấu vùng **Z** (256 token ảnh)
+   và vùng **Q** (128 learner) — so hai vùng ấy là câu hỏi chính: *decoder có
+   thật sự đọc 128 vector mới không*. Kèm bảng 5 ô nhạy nhất (có nhãn `Z[i]` /
+   `Q[k]` / `text`) và 8 learner vector được đọc nhiều nhất. Lớp thấp bị bỏ có
+   chủ ý: ở đó gradient gần như chỉ nói về hình thái token.
+2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token ở
+   các lớp mốc trong khoảng ấy, kèm bảng 14 nhãn bệnh lý của ảnh đó. Đầy đủ ở
+   `logit_lens.csv`.
+3. **[Visual] Chain rule từ Q về ảnh** — `y → Q → Recovery → Recomb → X`, chuẩn
+   gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc. **Một bản đồ duy
+   nhất, và nó nói về chính Q.** Đường `y → Z → projector → X` không vẽ nữa
+   (vision tower + projector đóng băng, Z không bị đụng → bản đồ ấy của B giống
+   hệt của A); số thô vẫn ở `lens_maps.npz` (`sal_z`) và được tóm tắt thành hai
+   con số tương quan / IoU ở mục "Kiểm nhanh".
 
-Hai đường 3 và 4 tách được vì cùng một X đi vào **hai lá gradient riêng**. Độ mờ
-overlay theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn đọc được.
+Hai đường tách được vì cùng một X đi vào **hai lá gradient riêng**. Độ mờ overlay
+theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn đọc được.
+
+Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
+độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
+chỉ vài learner làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
+encoder‖`, tương quan và IoU giữa hai bản đồ.
 
 Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
 `figures/lens_layers.png`, `figures/lens_visual.png`, `logit_lens.csv`,
-`lens_maps.npz`, `lens.json`. Lens cần **weight của cả A và B** trên máy (A được kéo
-từ `current/$1_LoRA_Test/weights/`), và cần GPU.
+`lens_maps.npz`, `lens.json`. Lens cần **weight của B** trên máy và cần GPU —
+không kéo weight của A về nữa.
 
 ## Chạy
 
@@ -126,13 +163,13 @@ từ `current/$1_LoRA_Test/weights/`), và cần GPU.
 export HF_TOKEN=hf_xxxxxxxx          # gemma gated + WRITE vào RGExp123/Research_results
 export WANDB_API_KEY=xxxxxxxx
 
-python scripts/selftest_zrecomb.py              # vài giây, không cần GPU
-bash scripts/run_zrecomb.sh train --dry-run     # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
+python scripts/selftest_recovery.py             # vài giây, không cần GPU
+bash scripts/run_recovery.sh train --dry-run    # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_zrecomb.sh train --detach      # 1. kéo A -> Stage 0 (8 epoch -> base, epoch 9 -> final) -> main B -> sinh -> chấm
-bash scripts/run_zrecomb.sh stats               # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
-bash scripts/run_zrecomb.sh lens                # 3. mổ 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
-bash scripts/run_zrecomb.sh push                # 4. -> current/$2_Recombiner_Test/ (kèm Reports/Lens/)
+bash scripts/run_recovery.sh train --detach     # 1. kéo A -> Stage 0 (8 epoch -> base, epoch 9 -> final) -> main B -> sinh -> chấm
+bash scripts/run_recovery.sh stats              # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
+bash scripts/run_recovery.sh lens               # 3. mổ khối Q trên 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
+bash scripts/run_recovery.sh push               # 4. -> current/$2.1_Recovery_Test/ (kèm Reports/Lens/)
 ```
 
 Nguồn của A, theo thứ tự ưu tiên:
@@ -149,15 +186,15 @@ Weight của A không được tải, vì A không sinh lại.
 (`_stage0/last/state.pt`); B có weight thì bỏ qua train; sinh thiếu thì sinh tiếp.
 Các cờ:
 
-* `--retrain-all` (hoặc `recomb_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
+* `--retrain-all` (hoặc `recovery_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
 * `--restage0`: pretrain lại cả 9 epoch, kéo theo `--retrain`.
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
   `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
   vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
-  Checkpoint **bố cục cũ** (lần chạy trước khi tách base/final: chỉ có `stage0/final/`
-  = epoch cuối của 8 epoch) được **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn
-  trên Hub — nên không phải pretrain lại 8 epoch.
+  Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của 8 epoch) được
+  **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn trên Hub — nên không phải
+  pretrain lại 8 epoch.
 * `--stages data,stage0`: chỉ chạy Stage 0 (8 epoch + epoch 9), không đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
@@ -166,30 +203,30 @@ Các cờ:
 ## Lưu trữ (bố cục như $1)
 
 ```
-adapters_recomb/_fixture/                   = fixture của $1 (vân tay trùng) + sha weight của B
-adapters_recomb/_stage0/                    PRETRAIN — để về sau đối chứng SoTA
-    base/zrecomb_stage0.safetensors|.json   Recomb + Cls Head sau 8 epoch lr cố định
-    final/zrecomb_stage0.safetensors|.json  sau epoch 9 (cosine 3e-5 → 1e-8) — main stage dùng bản này
-    loader.json                             fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
-                                            batch/micro, lịch, ASL, spec, vân tay, sha256 weight
-    stage0_labels.npz                       nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
-    stage0_history.json                     từng epoch: train/val ASL, F1, Recall, sqrt(F1·R)
-    last/state.pt                           chỉ để chạy tiếp (không đẩy Hub)
-adapters_recomb/qlora_r32_decoder_recomb/   MAIN STAGE — để về sau đối chứng MoE n·r = 32
+adapters_recovery/_fixture/                  = fixture của $1 (vân tay trùng) + sha weight của B
+adapters_recovery/_stage0/                   PRETRAIN — để về sau đối chứng SoTA
+    base/recovery_stage0.safetensors|.json   Recomb + Cls Head sau 8 epoch lr cố định
+    final/recovery_stage0.safetensors|.json  sau epoch 9 (cosine 3e-5 → 1e-8) — main stage dùng bản này
+    loader.json                              fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
+                                             batch/micro, lịch, ASL, spec, vân tay, sha256 weight
+    stage0_labels.npz                        nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
+    stage0_history.json                      từng epoch: train/val ASL, F1, Recall, sqrt(F1·R)
+    last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
+adapters_recovery/qlora_r32_decoder_recovery/   MAIN STAGE
     adapter_model.safetensors, adapter_config.json   LoRA r32
-    zrecomb_branch.safetensors|.json        Recomb (từ Stage 0) + Retriever
-    zrecomb_stage0.safetensors|.json        bản chép Stage 0 đã nạp (truy nguồn)
-    train_stats.json                        batch/accum/mảnh, lr, val curve, ‖Z'−Z‖/‖Z‖, VRAM, phút
-runs/recombiner/                            REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
+    recovery_branch.safetensors|.json        Recomb (từ Stage 0) + Recovery
+    recovery_stage0.safetensors|.json        bản chép Stage 0 đã nạp (truy nguồn)
+    train_stats.json                         batch/accum/mảnh, lr, val curve, RMS(Q)/RMS(Z), VRAM, phút
+runs/recovery/                               REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
 ```
 
 Trên Hub (`RGExp123/Research_results`):
 
 ```
-current/$2_Recombiner_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
-current/$2_Recombiner_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
-current/$2_Recombiner_Test/stage0/                  base/, final/, loader.json, stage0_labels.npz, stage0_history.json
-current/$2_Recombiner_Test/weights/qlora_r32_decoder_recomb/
+current/$2.1_Recovery_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
+current/$2.1_Recovery_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
+current/$2.1_Recovery_Test/stage0/                  base/, final/, loader.json, stage0_labels.npz, stage0_history.json
+current/$2.1_Recovery_Test/weights/qlora_r32_decoder_recovery/
 ```
 
 Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
@@ -205,21 +242,26 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 ## Cấu trúc
 
 ```
-configs/recomb.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
-scripts/run_zrecomb.sh · selftest_zrecomb.py · setup.sh · _env.sh
-src/run_zrecomb.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · push
-src/zrecomb.py          Recomb · Cls Head (Attn-Pooling) · Retriever · ASL theo tên lớp · metric Stage 0 · ghi/nạp
-src/stage0_zrecomb.py   Stage 0 + loader.json + nhãn chụp lại
-src/train_zrecomb.py    main stage của B (vòng lặp chép từ train_recomb._train_once, chèn Z')
-src/lens_zrecomb.py     Lens: Jacobian theo lớp · logit lens · chain rule về ảnh · Lens_Explain.md
-src/report_zrecomb.py   REPORT.md
-src/stats_ab.py         bootstrap ghép cặp (BCa) + permutation, Holm
-src/runners/gemma3_recomb.py   sinh: A = [text ‖ Z], B = [text ‖ Z'] (cùng đường)
-src/fixture.py · hub_sync.py · push.py · train_recomb.py · backbone.py · recombiner.py (RMSNorm, ASL, encode_vision) …
+configs/recovery.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
+scripts/run_recovery.sh · selftest_recovery.py · setup.sh · _env.sh
+src/run_recovery.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
+src/recovery.py          Recomb · Cls Head (Attn-Pooling) · Recovery (Learner + TokenMix) ·
+                         ASL theo tên lớp · metric Stage 0 · ghi/nạp
+src/stage0_recovery.py   Stage 0 + loader.json + nhãn chụp lại
+src/train_recovery.py    main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)
+src/lens_recovery.py     Lens (CHỈ B): Jacobian 1/4 lớp cuối · logit lens · chain rule Q → ảnh
+src/report_recovery.py   REPORT.md
+src/stats_ab.py          bootstrap ghép cặp (BCa) + permutation, Holm
+src/runners/gemma3_recovery.py   sinh: A = [Z ‖ text], B = [Z ‖ Q ‖ text] (cùng đường)
+src/recombiner.py        RMSNorm, ASL, encode_vision, build_inputs_embeds, inject_tokens,
+                         image_end_indices / last_image_index (chỗ nối Q)
+src/fixture.py · hub_sync.py · push.py · train_recomb.py · backbone.py …
 ```
 
 ## `_archive/`
 
+* `_archive/zrecomb/`: **toàn bộ §2.0 Recombiner Test** (Z → Z'). Gồm `src/`,
+  `configs/recomb.yaml`, `scripts/`; README ở `_archive/README_2.0_Recomb.md`.
 * `_archive/v2/`: **toàn bộ $1 LoRA Test** (rank × chỗ gắn). Gồm README, config,
   script, `run_lora` / `report_lora` / `report_plots` / `stats_friedman`, và bản
   chụp mọi module dùng chung đúng như lúc $1 chạy. Muốn chạy lại $1 thì chép

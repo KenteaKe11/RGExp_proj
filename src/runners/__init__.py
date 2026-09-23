@@ -3,12 +3,13 @@
     gemma3          — base trần (không adapter); hai runner kia kế thừa vòng
                       sinh/resume của nó.
     gemma3_adapter  — base + một adapter (đường §2.2 cũ).
-    gemma3_recomb   — base + adapter (+ nhánh/Experts nếu có). `run_zrecomb` (và `run_lora` của $1) dùng
-                      runner này với candidate KHÔNG nhánh — cùng đường đã
-                      huấn luyện (`train_recomb`), nên chuỗi vào decoder dựng
-                      giống hệt lúc train.
+    gemma3_recovery — base + adapter (+ nhánh Recovery nếu có): chuỗi vào
+                      decoder dựng TAY thành [Q ‖ Z ‖ text], đúng như
+                      `train_recovery` đã huấn luyện. Candidate KHÔNG nhánh đi
+                      cùng runner này để hai cột đi chung một đường.
 
-R2Gen/AdaAtt (runner `sota`) đã sang `_archive/src/runners/`.
+`gemma3_recomb` (§2.3/§2.4/§2.0) đã sang `_archive/zrecomb/src/runners/`,
+R2Gen/AdaAtt (runner `sota`) sang `_archive/src/runners/`.
 """
 from __future__ import annotations
 
@@ -26,13 +27,13 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3_adapter import Gemma3AdapterRunner
 
         return Gemma3AdapterRunner(cfg, mcfg, tracker)
-    if kind == "gemma3_recomb":
-        from .gemma3_recomb import Gemma3RecombRunner
+    if kind == "gemma3_recovery":
+        from .gemma3_recovery import Gemma3RecoveryRunner
 
-        return Gemma3RecombRunner(cfg, mcfg, tracker)
+        return Gemma3RecoveryRunner(cfg, mcfg, tracker)
     raise ValueError(
         f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
-        f"'gemma3_recomb'.")
+        f"'gemma3_recovery'.")
 
 
 __all__ = ["build", "Runner"]

@@ -74,7 +74,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_zrecomb.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_zrecomb`
+    `scripts/run_recovery.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_recovery`
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -112,21 +112,26 @@ def _copy_log(run_dir: Path) -> Path | None:
 
 
 def hub_dir_name(o: dict) -> str:
-    """`$<Chỉ số>_<Test title>_Test`, vd. `$1_LoRA_Test`.
+    """`$<Chỉ số>_<Test title>_Test`, vd. `$1_LoRA_Test`, `$2.1_Recovery_Test`.
 
     Chỉ số và tiêu đề khai RIÊNG ở config (`hub_index`, `hub_title`) rồi ghép ở
     đây, để mọi thí nghiệm sau đặt tên cùng một khuôn. Không khai -> dùng
-    `subdir` như cũ.
+    `subdir` như cũ. Chỉ số nhận cả dạng có chấm (`2.1`) để một thí nghiệm con
+    nằm cạnh thí nghiệm gốc trên Hub mà không phải đổi khuôn tên.
     """
+    import re as _re
+
     idx, title = o.get("hub_index"), str(o.get("hub_title") or "").strip()
     if idx is None or not title:
         return str(o.get("subdir", "")).strip("/")
-    if not str(idx).isdigit() or int(idx) < 1:
-        raise ValueError(f"output.hub_index phải là số nguyên >= 1, nhận {idx!r}")
+    idx = str(idx).strip()
+    if not _re.fullmatch(r"[1-9][0-9]*(\.[0-9]+)*", idx):
+        raise ValueError(f"output.hub_index phải là số nguyên >= 1 hoặc dạng có "
+                         f"chấm (vd. 2.1), nhận {idx!r}")
     if any(ch in title for ch in "/\\ "):
         raise ValueError(f"output.hub_title không được chứa '/', '\\' hay khoảng "
                          f"trắng: {title!r}")
-    return f"${int(idx)}_{title}_Test"
+    return f"${idx}_{title}_Test"
 
 
 def hub_base(cfg: Cfg) -> str:
@@ -182,7 +187,7 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
     # $2: Stage 0 (Recomb + Cls Head đã pretrain) + loader của nó, cạnh fixture.
     s0 = Path(o["adapter_dir"]) / "_stage0"
     if s0.exists():
-        from .stage0_zrecomb import KEEP
+        from .stage0_recovery import KEEP
 
         for rel in KEEP:
             f = s0 / rel
@@ -295,7 +300,7 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
     tok = hf_token()
     if not tok and not dry:
         print("⚠ không có HF_TOKEN — không đẩy.  export HF_TOKEN=hf_xxxxxxxx  &&  "
-              "bash scripts/run_zrecomb.sh push", flush=True)
+              "bash scripts/run_recovery.sh push", flush=True)
         return None
 
     if run_dir.exists() and results_only is None:
