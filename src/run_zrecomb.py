@@ -2,6 +2,8 @@
 
     python -m src.run_zrecomb train    # kéo A ($1) -> Stage 0 -> main B -> sinh -> chấm
     python -m src.run_zrecomb stats    # bootstrap ghép cặp + permutation -> REPORT.md (GHI ĐÈ)
+    python -m src.run_zrecomb lens      # mổ MỘT ảnh: Jacobian theo lớp, logit lens,
+                                       # chain rule về ảnh -> Lens/Lens_Explain.md
     python -m src.run_zrecomb push     # -> <hub_repo>/current/$2_Recombiner_Test/
     python -m src.run_zrecomb all      # train -> stats -> push
 
@@ -40,6 +42,7 @@ from .config import Cfg, add_common_args, load_config, resolved_snapshot, seed_e
 COMMANDS = {
     "train": ["data", "stage0", "train", "infer", "score"],
     "stats": ["stats", "report"],
+    "lens": ["lens"],
     "push": ["push"],
     "all": ["data", "stage0", "train", "infer", "score", "stats", "report", "push"],
 }
@@ -104,6 +107,19 @@ def arms_of(cfg: Cfg) -> tuple[dict, dict]:
          "target_modules": list(b["target_modules"]), "recomb": False, "source": src}
     B = dict(A, id=c["id"], name=c.get("name", c["id"]), recomb=True, source="$2")
     return A, B
+
+
+def arm_weight_dir(cfg: Cfg, arm: dict, adapter_root: Path) -> Path:
+    """Thư mục weight dùng được của một candidate: $2 trước, rồi thư mục $1 cục bộ."""
+    d = Path(adapter_root) / arm["id"]
+    if (d / "adapter_model.safetensors").exists():
+        return d
+    loc = str(dict(dict(cfg.get("recomb_exp") or {}).get("baseline") or {})
+              .get("local_adapter_dir") or "")
+    alt = Path(loc) / arm["id"] if loc else None
+    if alt is not None and (alt / "adapter_model.safetensors").exists():
+        return alt
+    return d
 
 
 def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
@@ -429,6 +445,8 @@ def main(argv: list[str] | None = None) -> int:
                         save, dry_steps)
     if not rc and set(stages) & set(COMMANDS["stats"]):
         rc = _cmd_stats(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save)
+    if not rc and "lens" in stages:
+        rc = _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save)
     if not rc and "push" in stages:
         rc = _cmd_push(a, cfg, A, B, run_dir, adapter_root, manifest, save)
     save()
@@ -722,6 +740,62 @@ def _cmd_stats(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save) 
             print(f"\n✗ `report` hỏng: {e!r}", flush=True)
             return 7
     save()
+    return 0
+
+
+# ── lens ────────────────────────────────────────────────────────────────────
+def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
+    from . import fixture as fx_mod
+    from . import lens_zrecomb as lens
+    from .backbone import TrainUnusable
+    from .tracking import Tracker
+
+    if not lens.lcfg(cfg)["enabled"]:
+        print("⊘ lens.enabled = false — bỏ qua", flush=True)
+        return 0
+    _hr("Lens — mổ một ảnh tiêu biểu (Jacobian · logit lens · chain rule)")
+    n_test = int(cfg["data"].get("n_test") or 0)
+    pull = bool(cfg["output"].get("pull", True)) and not a.no_pull
+    if not fx_mod.exists(fx):
+        bring_baseline(cfg, A, run_dir, adapter_root, fx, n_test, pull)
+    if not fx_mod.exists(fx):
+        print("✗ chưa có fixture — chạy `train` trước.", flush=True)
+        return 2
+    # Lens CẦN weight của cả hai candidate (A không sinh lại nhưng phải chạy forward).
+    if pull and not (arm_weight_dir(cfg, A, adapter_root)
+                     / "adapter_model.safetensors").exists():
+        from . import hub_sync
+
+        hub_sync.pull(baseline_cfg(cfg), run_dir, adapter_root, fx, [A], n_test,
+                      want_weights=True)
+    tracker = Tracker(cfg, run_id=manifest["run_id"], config_snapshot=manifest["config"])
+    try:
+        test_df, _tr, _va = fx_mod.load_splits(cfg, fx, tracker, with_images=True)
+        roots = {x["id"]: arm_weight_dir(cfg, x, adapter_root).parent for x in (A, B)}
+        if roots[A["id"]] != roots[B["id"]]:
+            # A lấy từ thư mục $1 cục bộ: dựng một "root ảo" bằng đường dẫn tuyệt đối
+            class _Root:
+                def __truediv__(self, aid):
+                    return roots[aid] / aid
+
+            root = _Root()
+        else:
+            root = roots[A["id"]]
+        out = lens.run(cfg, A, B, run_dir, root, test_df, tracker)
+    except TrainUnusable as e:
+        print(f"\n✗ Lens hỏng: {e}", flush=True)
+        tracker.finish(1)
+        return 7
+    except Exception as e:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        print(f"\n✗ Lens hỏng: {e!r}", flush=True)
+        tracker.finish(1)
+        return 7
+    manifest["lens"] = {k: out.get(k) for k in ("sample", "minutes", "target")}
+    save()
+    tracker.finish(0)
     return 0
 
 

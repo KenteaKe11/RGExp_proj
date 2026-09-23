@@ -24,6 +24,9 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  16. lịch cosine của epoch 9
  17. checkpoint bố cục CŨ (chỉ `final/` = 8 epoch) được nhận làm `base/`
  18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
+ 19. Lens trên mô hình giả: ‖∂y/∂h‖ theo lớp, logit lens, chain rule 2 đường,
+     OR/AND, và Lens_Explain.md dựng được
+ 20. lệnh `lens` nối vào CLI + script + config
 """
 from __future__ import annotations
 
@@ -571,6 +574,138 @@ def _():
         h = json.loads((d / s0.HISTORY).read_text())
         assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 8
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
+
+
+@check("19. Lens chạy thật (mô hình giả): Jacobian theo lớp, logit lens, 2 đường chain rule, OR/AND, Lens_Explain.md")
+def _():
+    import json
+    import types
+
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from PIL import Image
+
+    from src import lens_zrecomb as LZ
+    from src import zrecomb as Z
+    from src.config import load_config
+
+    NV, DV, DM, NZ, V, L = 64, 8, 16, 4, 11, 3     # patch, d_vis, d_model, |Z|, vocab, lớp
+    IMG_TOK = V - 1
+
+    class _Proj(nn.Module):                        # (1, NV, DV) -> (1, NZ, DM)
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(DV, DM)
+
+        def forward(self, x):
+            return self.fc(x).mean(1, keepdim=True).expand(1, NZ, DM)
+
+    class Fake(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_tower = lambda pixel_values: types.SimpleNamespace(
+                last_hidden_state=pixel_values.reshape(1, NV, DV).float())
+            self.multi_modal_projector = _Proj()
+            self.emb = nn.Embedding(V, DM)
+            self.lm_head = nn.Linear(DM, V, bias=False)
+            self.norm = nn.LayerNorm(DM)
+            self.layers = nn.ModuleList(nn.Linear(DM, DM) for _ in range(L))
+            self.config = types.SimpleNamespace(
+                image_token_index=IMG_TOK,
+                text_config=types.SimpleNamespace(hidden_size=DM))
+
+        def get_input_embeddings(self):
+            return self.emb
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, inputs_embeds=None, labels=None, output_hidden_states=False,
+                    **_kw):
+            h, hs = inputs_embeds, [inputs_embeds]
+            for lay in self.layers:
+                h = torch.tanh(lay(h)) + h
+                hs.append(h)
+            return types.SimpleNamespace(logits=self.lm_head(self.norm(h)),
+                                         hidden_states=tuple(hs), loss=None)
+
+    fake = Fake()
+    cfg = load_config(ROOT / "configs/recomb.yaml")
+    sp = Z.spec_from_cfg({"zrecomb": {"recomb": {"n_heads": 2, "hidden": 24},
+                                      "retriever": {"n_heads": 2, "hidden": 12},
+                                      "cls_head": {"n_heads": 2}}}, DV, DM, 14)
+    branch = Z.ZRecombBranch(sp)
+    branch.set_recomb_frozen(True)
+    torch.nn.init.normal_(branch.retriever.down.weight, std=0.05)   # Δ ≠ 0
+    ids = torch.tensor([[0, 1] + [IMG_TOK] * NZ + [2, 3, 4]])
+    labels = ids.clone()
+    labels[:, : 2 + NZ] = -100
+    batch = {"input_ids": ids, "labels": labels,
+             "attention_mask": torch.ones_like(ids),
+             "pixel_values": torch.randn(1, NV * DV)}
+
+    ra = LZ.analyze(cfg, fake, fake, None, batch, "ref_logprob")
+    rb = LZ.analyze(cfg, fake, fake, branch, batch, "ref_logprob")
+    assert ra["layer_sens"].shape == (L, ids.shape[1]) == rb["layer_sens"].shape
+    assert ra["sal_recomb"] is None and rb["sal_recomb"] is not None
+    assert ra["sal_z"].shape == (8, 8) and rb["sal_recomb"].shape == (8, 8)
+    assert np.isfinite(rb["sal_recomb"]).all() and rb["sal_recomb"].sum() > 0
+    assert rb["image_span"] == [2, 1 + NZ]
+    top = LZ.logit_lens(fake, fake, rb["hidden_last"], 3)
+    assert len(top) == L and all(len(t["ids"]) == 3 for t in top)
+    for t in top:
+        t["tokens"] = [f"t{i}" for i in t["ids"]]
+
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        Image.fromarray((np.random.rand(32, 32) * 255).astype("uint8")).save(t / "x.png")
+        item = {"key": "k0", "ref": "r", "image_path": str(t / "x.png"), "n_pos": 5,
+                "n_unc": 3, "n_labelled": 8,
+                "findings": [{"label": "Edema", "class": "pos"}]}
+        lc = LZ.lcfg(cfg)
+        a1 = LZ._norm01(rb["sal_recomb"], lc["percentile_clip"])
+        a2 = LZ._norm01(rb["sal_z"], lc["percentile_clip"])
+        maps = {"A: Z (encoder)": ra["sal_z"], "B: Z (encoder)": rb["sal_z"],
+                "B: Z' qua Recomb": rb["sal_recomb"],
+                "OR (cộng, chuẩn hoá)": LZ._norm01(a1 + a2, 100.0),
+                "AND (nhân, chuẩn hoá)": LZ._norm01(a1 * a2, 100.0)}
+        assert maps["OR (cộng, chuẩn hoá)"].max() <= 1.0 + 1e-9
+        figs = {"layers": LZ.plot_layers(ra, rb, t / "figures" / "lens_layers.png", lc),
+                "visual": LZ.plot_visual(item, maps, t / "figures" / "lens_visual.png", lc)}
+        A, B = {"id": "a"}, {"id": "b"}
+        out = {"lens": lc, "arms": {"a": {"layers": L, "n_tokens": int(ids.shape[1]),
+                                          "image_span": rb["image_span"]},
+                                    "b": {"layers": L, "n_tokens": int(ids.shape[1]),
+                                          "image_span": rb["image_span"]}},
+               "diagnostics": LZ.diagnostics({"a": ra, "b": rb}, maps, "a", "b")}
+        dg = out["diagnostics"]
+        assert 0.0 <= dg["image_token_share"]["b"] <= 1.0
+        assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["recomb_energy_ratio"] > 0
+        p = LZ.write_doc(cfg, t, A, B, item, {"a": ra, "b": rb},
+                         {"a": top, "b": top}, maps, figs, out)
+        doc = p.read_text(encoding="utf-8")
+        for need in ("## 1.", "## 2.", "## 3–5.", "lens_layers.png", "lens_visual.png",
+                     "Edema", "OR", "AND", "Giới hạn", "## Cách đọc",
+                     "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
+                     "Đọc bảng 2 thế nào", "Đọc hình 3–5 thế nào"):
+            assert need in doc, need
+        assert json.dumps(out, default=str)
+
+
+@check("20. lệnh `lens` có trong CLI + script, config lens hợp lệ")
+def _():
+    from src.config import load_config
+    from src.lens_zrecomb import lcfg
+    from src.run_zrecomb import COMMANDS
+
+    assert COMMANDS["lens"] == ["lens"]
+    c = lcfg(load_config(ROOT / "configs/recomb.yaml"))
+    assert c["enabled"] and c["target"] == "ref_logprob" and c["dir"] == "Lens"
+    sh = (ROOT / "scripts/run_zrecomb.sh").read_text(encoding="utf-8")
+    assert "train|push|stats|lens|all)" in sh
+    src = (ROOT / "src/run_zrecomb.py").read_text(encoding="utf-8")
+    assert "_cmd_lens" in src and "want_weights=True" in src   # Lens cần weight của A
 
 
 print()

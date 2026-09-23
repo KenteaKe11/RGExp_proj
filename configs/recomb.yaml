@@ -370,6 +370,20 @@ report:
     gamma: auto               # xếp tầng: gốc × e^(γ−1); off = không scale
     gamma_spread: 0.18
 
+# ── Lens (`src/lens_zrecomb.py`, lệnh `lens`) — MỔ MỘT ẢNH, minh hoạ ─────────
+# Mọi bản đồ là đạo hàm của MỘT số y (log-prob báo cáo tham chiếu), nên chỉ tốn
+# một lượt backward mỗi candidate. Ghi ra runs/<subdir>/Lens/Lens_Explain.md.
+lens:
+  enabled: true
+  sample: auto              # auto = ảnh test nhiều pos + uncertain nhất; hoặc key cụ thể
+  target: ref_logprob       # ref_logprob | next_token
+  top_k: 8                  # logit lens: số token mỗi lớp
+  layer_marks: 6            # số lớp mốc in trong bảng (đầy đủ ở logit_lens.csv)
+  overlay_alpha: 0.45       # độ mờ của heatmap chồng lên ảnh gốc
+  percentile_clip: 99.0     # cắt đuôi trước khi chuẩn hoá màu
+  cmap: inferno
+  dir: Lens
+
 wandb:
   enabled: true
   project: rgexp-recomb

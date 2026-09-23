@@ -89,6 +89,37 @@ và BERTScore-F1 (metric chính).
 REPORT.md ghi thêm: đồ thị `figures/metrics_ab.png` (như $1 nhưng chỉ A và B, bar ngang: B3 · B4 · RL · BertF1 × e^(γ−1), nét đứt ở max, Δ và ★ khi khác biệt có ý nghĩa), số ảnh B thắng/hoà/thua, Stage 0 từng epoch, và bảng main
 stage của A và B.
 
+## Lens — mổ MỘT ảnh (`src/lens_zrecomb.py`, lệnh `lens`)
+
+Phần minh hoạ, tách khỏi kiểm định. Chọn **một ảnh test nhiều `pos` + `uncertain`
+nhất** (`lens.sample: auto`) và dùng đúng ảnh đó cho cả năm phần. Mọi bản đồ là đạo
+hàm của **một số**
+
+```
+y = Σ_t log p(ref_t | ref_<t, ảnh)        (lens.target: ref_logprob)
+```
+
+nên mỗi candidate chỉ tốn một lượt backward (Jacobian đầy đủ 2560 × số vị trí là
+không dựng nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
+
+1. **[Language] Độ nhạy theo lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, heatmap lớp × vị trí
+   cho A, B và **B − A**; dải token ảnh được tô nền để thấy đúng chỗ Z → Z'.
+2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token của A
+   và B ở các lớp mốc, kèm bảng 14 nhãn bệnh lý của ảnh đó. Đầy đủ ở `logit_lens.csv`.
+3. **[Visual] Chain rule qua Recomb** — `y → Z' → Retriever → Recomb → X`, chuẩn
+   gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc.
+4. **[Visual] Chain rule qua encoder** — `y → Z → projector → X`, vẽ cho cả A và B.
+5. **[Visual] OR / AND** — hai bản đồ của B chuẩn hoá [0,1] rồi **cộng** (ít nhất một
+   đường nhìn vào đây) và **nhân** (cả hai cùng nhìn), chuẩn hoá lại.
+
+Hai đường 3 và 4 tách được vì cùng một X đi vào **hai lá gradient riêng**. Độ mờ
+overlay theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn đọc được.
+
+Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
+`figures/lens_layers.png`, `figures/lens_visual.png`, `logit_lens.csv`,
+`lens_maps.npz`, `lens.json`. Lens cần **weight của cả A và B** trên máy (A được kéo
+từ `current/$1_LoRA_Test/weights/`), và cần GPU.
+
 ## Chạy
 
 ```bash
@@ -100,7 +131,8 @@ bash scripts/run_zrecomb.sh train --dry-run     # 8 ảnh, 16 mẫu, Stage 0 ≤
 
 bash scripts/run_zrecomb.sh train --detach      # 1. kéo A -> Stage 0 (8 epoch -> base, epoch 9 -> final) -> main B -> sinh -> chấm
 bash scripts/run_zrecomb.sh stats               # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
-bash scripts/run_zrecomb.sh push                # 3. -> current/$2_Recombiner_Test/
+bash scripts/run_zrecomb.sh lens                # 3. mổ 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
+bash scripts/run_zrecomb.sh push                # 4. -> current/$2_Recombiner_Test/ (kèm Reports/Lens/)
 ```
 
 Nguồn của A, theo thứ tự ưu tiên:
@@ -179,6 +211,7 @@ src/run_zrecomb.py      train (kéo A → Stage 0 → main B → sinh → chấm
 src/zrecomb.py          Recomb · Cls Head (Attn-Pooling) · Retriever · ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_zrecomb.py   Stage 0 + loader.json + nhãn chụp lại
 src/train_zrecomb.py    main stage của B (vòng lặp chép từ train_recomb._train_once, chèn Z')
+src/lens_zrecomb.py     Lens: Jacobian theo lớp · logit lens · chain rule về ảnh · Lens_Explain.md
 src/report_zrecomb.py   REPORT.md
 src/stats_ab.py         bootstrap ghép cặp (BCa) + permutation, Holm
 src/runners/gemma3_recomb.py   sinh: A = [text ‖ Z], B = [text ‖ Z'] (cùng đường)

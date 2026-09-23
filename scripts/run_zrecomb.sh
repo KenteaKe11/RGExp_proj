@@ -4,6 +4,7 @@
 #
 #     bash scripts/run_zrecomb.sh train [--detach]  # kéo A ($1) -> Stage 0 -> main B -> sinh -> chấm
 #     bash scripts/run_zrecomb.sh stats             # bootstrap ghép cặp + permutation -> REPORT.md
+#     bash scripts/run_zrecomb.sh lens              # mổ 1 ảnh -> Lens/Lens_Explain.md
 #     bash scripts/run_zrecomb.sh push              # -> Hub current/$2_Recombiner_Test/
 #     bash scripts/run_zrecomb.sh all [--detach]    # train -> stats -> push
 #
@@ -36,12 +37,12 @@ command -v rgexp_enable_fast_download >/dev/null 2>&1 && rgexp_enable_fast_downl
 
 CMD="${1:-}"
 case "$CMD" in
-    train|push|stats|all) shift ;;
+    train|push|stats|lens|all) shift ;;
     ""|-h|--help)
-        sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
-        [ -z "$CMD" ] && { echo "✗ thiếu lệnh: train | push | stats | all"; exit 2; }
+        sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'
+        [ -z "$CMD" ] && { echo "✗ thiếu lệnh: train | push | stats | lens | all"; exit 2; }
         exit 0 ;;
-    *) echo "✗ lệnh lạ '$CMD' — hợp lệ: train | push | stats | all"; exit 2 ;;
+    *) echo "✗ lệnh lạ '$CMD' — hợp lệ: train | push | stats | lens | all"; exit 2 ;;
 esac
 
 DETACH=0
