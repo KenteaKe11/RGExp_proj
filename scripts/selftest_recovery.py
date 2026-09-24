@@ -26,8 +26,9 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  16. lịch cosine của epoch 5 (final)
  17. checkpoint bố cục CŨ (chỉ `final/` = epoch cuối của base) được nhận làm `base/`
  18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
- 19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap 1/4 lớp cuối có
-     chỉ số lớp thật, MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
+ 19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp có
+     chỉ số lớp thật (chỉ bảng top-k lấy 1/4 lớp cuối), MỘT bản đồ ảnh đi qua Q,
+     và Lens_Explain.md dựng được
  20. lệnh `lens` nối vào CLI + script + config
  21. THỨ TỰ CHUỖI [Z ‖ Q ‖ T]: Q nằm ngay SAU khối token ảnh, nhãn của nó là
      −100, mask = 1, token_type = 0, và số token vào CE KHÔNG đổi
@@ -714,7 +715,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, 1/4 lớp cuối có idx, một bản đồ Q, Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), một bản đồ Q, Lens_Explain.md")
 def _():
     import json
     import types
@@ -846,7 +847,7 @@ def _():
         assert 0.0 <= dg["q_token_share"] <= 1.0
         assert dg["q_vector_share"]["n"] == NQ
         assert 1 <= dg["q_vector_share"]["n_active_50pct"] <= NQ
-        assert dg["peak_last_quarter"]["layer"] == L
+        assert 1 <= dg["peak"]["layer"] <= L
         assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["recovery_energy_ratio"] > 0
         out = {"lens": lc, "diagnostics": dg, "reference_arm": "a",
                "arm": {"id": "b", "y": rb["y"], "n_tokens": T + NQ, "layers": L,
@@ -854,6 +855,8 @@ def _():
                        "insert_span": rb["insert_span"]}}
         p = LZ.write_doc(cfg, t, A, B, item, rb, top, figs, out)
         doc = p.read_text(encoding="utf-8")
+        assert "ĐỦ mọi lớp" in doc and "lớp cuối" in doc   # hình 1 đủ, bảng 2 cắt
+        assert "Trục **Y là vị trí token**" in doc and "**X là lớp**" in doc
         for need in ("## 1.", "## 2.", "## 3.", "lens_layers.png", "lens_visual.png",
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",

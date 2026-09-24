@@ -23,13 +23,17 @@ auto`), hoặc key khai tay. Cùng một ảnh cho cả ba phần dưới.
 gradient — lấy đúng một lượt backward. Jacobian đầy đủ của một lớp 2560 chiều
 × 500 vị trí là 10⁹ số; một hàng đã trả lời được câu "đổi ở đâu thì y đổi".
 
-1. [Language] Độ nhạy theo LỚP × VỊ TRÍ: S[ℓ, t] = ‖∂y / ∂h_{ℓ,t}‖₂ — h là hidden
-   state ra khỏi lớp decoder ℓ. Vẽ MỘT dải, chỉ `lens.layer_frac` (1/4) lớp CUỐI,
-   trục y ghi CHỈ SỐ THẬT của lớp. Khối Q được tô nền vàng, 256 token ảnh tô nền
-   xanh: so hai vùng ấy là câu "decoder có thật sự đọc 128 vector mới không".
-   Lớp thấp bị bỏ vì ở đó gradient gần như chỉ nói về hình thái token.
-2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token ở các lớp
-   mốc trong khoảng ấy, kèm 14 nhãn bệnh lý của ảnh đó.
+1. [Language] Độ nhạy theo TOKEN × LỚP: S[ℓ, t] = ‖∂y / ∂h_{ℓ,t}‖₂ — h là hidden
+   state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
+   xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
+   LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
+   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 256 learner), rồi phần văn bản.
+   So khối Q với khối Z là câu "decoder có thật sự đọc 256 vector mới không".
+   Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
+2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
+   nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
+   lớp cuối): phép đọc tuyến tính bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra
+   token vô nghĩa.
 3. [Visual] Chain rule từ Q VÒNG QUA Recovery: ∂y/∂X đi theo đường
    y -> Q -> Recovery -> X (X = 4096 patch của SigLIP, lưới 64×64) —
    "Q rút thông tin từ vùng nào của ảnh". Đường `y -> Z -> projector -> X` KHÔNG
@@ -64,6 +68,7 @@ def lcfg(cfg: Cfg) -> dict:
             "target": str(c.get("target", "ref_logprob")).lower(),
             "top_k": int(c.get("top_k", 8)),
             "layer_marks": int(c.get("layer_marks", 6)),
+            # CHỈ áp cho bảng top-k của logit lens (mục 2). Hình 1 vẽ đủ lớp.
             "layer_frac": float(c.get("layer_frac", 0.25)),
             "overlay_alpha": float(c.get("overlay_alpha", 0.45)),
             "percentile_clip": float(c.get("percentile_clip", 99.0)),
@@ -311,9 +316,22 @@ def _norm01(a: np.ndarray, pct: float) -> np.ndarray:
 
 
 def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
-    """Một dải DUY NHẤT: ‖∂y/∂h‖ của B, `layer_frac` lớp cuối, trục y = chỉ số lớp thật.
+    """‖∂y/∂h‖ — trục Y là TOKEN, trục X là LỚP, trên đủ mọi lớp decoder.
 
-    Không còn dải A và dải B − A: Z của B giống A từng bit (nhánh không đụng vào
+    Token nằm dọc vì chuỗi mới là chiều dài: `[Z(256) ‖ Q(256) ‖ text]` là hàng
+    trăm vị trí, còn decoder chỉ có vài chục lớp. Xếp token theo chiều đứng (đọc
+    từ trên xuống đúng thứ tự trong chuỗi, `origin="upper"`) thì ba vùng Z / Q /
+    text thành ba khối liền nhau và so được bằng mắt; xếp ngang thì 776 cột bị
+    nén vào bề ngang một trang và vùng Q chỉ còn là một vệt.
+
+    Đường kẻ MỜ ở biên mỗi vùng + thanh màu có nhãn nằm ngoài heatmap: tô nền
+    trong lòng heatmap thì alpha nào cũng chìm mất trong colormap tối.
+
+    Vẽ ĐỦ lớp chứ không cắt đuôi: câu hỏi ở đây là "gradient dồn vào vùng nào
+    của chuỗi, ở tầng nào của mạng", và nó cần cả lớp thấp để có mức nền mà so.
+    `lens.layer_frac` chỉ còn áp cho BẢNG top-k (logit lens, mục 2).
+
+    Không có dải A và dải B − A: Z của B giống A từng bit (nhánh không đụng vào
     token ảnh), nên toàn bộ chênh lệch giữa hai candidate NẰM Ở khối Q — vùng
     vàng trên hình đã chính là "B − A". Chạy thêm A chỉ để trừ ra một dải gần
     như trắng là tốn một lượt nạp model 4B và một lượt backward.
@@ -321,44 +339,44 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
     S = np.asarray(res["layer_sens"])                     # (L, T)
-    n_layers = int(S.shape[0])
-    rows = last_layers(n_layers, cfg_l["layer_frac"])
-    M = S[rows[0] - 1:, :]
+    n_layers, n_tok = int(S.shape[0]), int(S.shape[1])
+    M = S.T                                               # (T, L): y = token, x = lớp
     fig, ax = plt.subplots(1, 1, dpi=150,
-                           figsize=(12, max(3.2, 0.34 * len(rows) + 1.8)))
+                           figsize=(max(5.5, 0.16 * n_layers + 3.4), 11.0))
     v = float(np.nanpercentile(M, cfg_l["percentile_clip"])) or 1.0
-    im = ax.imshow(M, aspect="auto", cmap=cfg_l["cmap"], origin="lower",
+    im = ax.imshow(M, aspect="auto", cmap=cfg_l["cmap"], origin="upper",
                    vmin=0.0, vmax=v, interpolation="nearest")
-    ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([str(r) for r in rows], fontsize=8)
-    ax.set_ylabel("lớp decoder (chỉ số thật)")
-    ax.set_title(f"‖∂y/∂h‖ theo lớp × vị trí — {len(rows)}/{n_layers} lớp cuối",
-                 loc="left", fontsize=10)
-    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
-    # Đánh dấu vùng Z và Q bằng THANH MÀU nằm NGOÀI heatmap + vạch đứt ở biên.
-    # Tô nền trong lòng heatmap (axvspan) thì alpha nào cũng chìm mất trong
-    # colormap tối, và vùng Q — thứ cả hình này sinh ra để chỉ — trở nên vô hình.
-    from matplotlib.patches import Rectangle
+    step = 1 if n_layers <= 24 else max(1, n_layers // 17)
+    ticks = [k for k in range(n_layers) if (k + 1) % step == 0 or k == 0]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(k + 1) for k in ticks], fontsize=7)
+    ax.set_xlabel("lớp decoder (chỉ số thật)")
+    ax.set_ylabel("vị trí token trong chuỗi (thứ tự hàng = thứ tự token)")
+    ax.set_title(f"‖∂y/∂h‖ theo token × lớp — đủ {n_layers} lớp", loc="left",
+                 fontsize=10)
+    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
 
     sp = res.get("image_span") or [0, 0]
     ins = res.get("insert_span")
-    n_rows = len(rows)
-    bar_h, gap = n_rows * 0.09, n_rows * 0.03
-    y0 = n_rows - 0.5 + gap
     bands = [(sp[0], sp[1] + 1, "#2a78d6", f"Z · {sp[1] - sp[0] + 1} token ảnh")]
     if ins:
         bands.append((ins[0], ins[1], "#e8a317", f"Q · {ins[1] - ins[0]} learner"))
-    for x0, x1, color, lab in bands:
-        ax.add_patch(Rectangle((x0 - 0.5, y0), x1 - x0, bar_h, color=color,
+    bar_w = max(0.55, n_layers * 0.035)
+    gap = max(0.12, n_layers * 0.012)
+    x0 = -0.5 - gap - bar_w
+    for y0, y1, color, lab in bands:
+        ax.add_patch(Rectangle((x0, y0 - 0.5), bar_w, y1 - y0, color=color,
                                clip_on=False, zorder=5))
-        ax.text((x0 + x1) / 2, y0 + bar_h / 2, lab, ha="center", va="center",
-                fontsize=7.5, color="white", clip_on=False, zorder=6)
-        for x in (x0 - 0.5, x1 - 0.5):
-            ax.axvline(x, color=color, lw=0.9, ls="--", alpha=0.9, zorder=4)
-    ax.set_ylim(-0.5, n_rows - 0.5 + gap + bar_h)
-    ax.set_xlabel("vị trí token trong chuỗi")
+        ax.text(x0 + bar_w / 2, (y0 + y1) / 2, lab, ha="center", va="center",
+                rotation=90, fontsize=7.5, color="white", clip_on=False, zorder=6)
+        # đường kẻ MỜ chia vùng token, vắt ngang cả heatmap
+        for y in (y0 - 0.5, y1 - 0.5):
+            ax.axhline(y, color="#ffffff", lw=0.7, ls="--", alpha=0.35, zorder=4)
+    ax.set_xlim(x0, n_layers - 0.5)
+    ax.set_ylim(n_tok - 0.5, -0.5)                        # token 0 ở TRÊN
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, bbox_inches="tight")
@@ -500,12 +518,9 @@ def diagnostics(res: dict) -> dict:
                 np.cumsum(np.sort(per)[::-1]) / max(float(per.sum()), 1e-12), 0.5) + 1),
             "max_over_mean": float(per.max() / max(float(per.mean()), 1e-12)),
         }
-    lq = last_layers(int(S.shape[0]), 0.25)
-    T = S[lq[0] - 1:, :]
-    i, j = np.unravel_index(int(np.argmax(T)), T.shape)
-    out["peak_last_quarter"] = {"layer": int(lq[0] + i), "pos": int(j),
-                                "value": float(T[i, j]),
-                                "where": _where(int(j), res)}
+    i, j = np.unravel_index(int(np.argmax(S)), S.shape)
+    out["peak"] = {"layer": int(i + 1), "pos": int(j), "value": float(S[i, j]),
+                   "where": _where(int(j), res)}
     m1, m2 = res.get("sal_recovery"), res.get("sal_z")
     if m1 is not None and m2 is not None:
         x, y = np.asarray(m1).ravel(), np.asarray(m2).ravel()
@@ -533,10 +548,10 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     """Mục "Cách đọc" đặt NGAY sau định nghĩa y: đọc theo thứ tự nào, kết luận
     nào được phép rút ra, và mấy con số phải liếc trước khi tin mấy cái hình."""
     dg = dict(out.get("diagnostics") or {})
-    pk = dict(dg.get("peak_last_quarter") or {})
+    pk = dict(dg.get("peak") or {})
     qv = dict(dg.get("q_vector_share") or {})
     L = ["## Cách đọc\n",
-         "**Thứ tự đọc**: (0) kiểm nhanh bên dưới → (1) heatmap 1/4 lớp cuối để biết "
+         "**Thứ tự đọc**: (0) kiểm nhanh bên dưới → (1) heatmap đủ lớp để biết "
          "decoder đọc khối **Q** ở lớp nào, mạnh bằng bao nhiêu so với token ảnh → "
          "(2) bảng logit lens ở đúng những lớp ấy để xem nó đang nghiêng về TỪ gì → "
          "(3) bản đồ ảnh để xem Q rút thông tin từ vùng nào. Ba tầng trả lời ba câu "
@@ -581,7 +596,7 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     L.append("| đại lượng | giá trị | đọc thế nào |\n|---|---|---|")
     L += ["| " + " | ".join(r) + " |" for r in rows]
     if pk:
-        L.append(f"\nÔ nhạy nhất trong 1/4 lớp cuối: **lớp {pk.get('layer')}**, vị trí "
+        L.append(f"\nÔ nhạy nhất trên toàn bộ lớp: **lớp {pk.get('layer')}**, vị trí "
                  f"{pk.get('pos')} (`{pk.get('where')}`, {pk.get('value', 0):.3g}).\n")
     return L
 
@@ -590,7 +605,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
     lc = out["lens"]
     b = B["id"]
     n_layers = out["arm"]["layers"]
-    rows = last_layers(n_layers, lc["layer_frac"])
+    marks_src = last_layers(n_layers, lc["layer_frac"])   # chỉ cho bảng top-k (mục 2)
     ins = out["arm"].get("insert_span")
     L = [f"# Lens — {b} `[Z ‖ Q ‖ T]`\n",
          f"_Một ảnh tiêu biểu, ghi đè mỗi lần chạy `lens`. Ảnh: `{item['key']}` — "
@@ -606,53 +621,55 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
          "(2560 × số vị trí, không dựng nổi).\n"]
     L += reading_guide(out, res)
 
-    L += ["## 1. [Language] Độ nhạy theo lớp decoder — 1/4 lớp cuối\n"]
+    L += ["## 1. [Language] Độ nhạy theo lớp decoder — ĐỦ mọi lớp\n"]
     if figs.get("layers"):
         L.append(f"![lens layers](figures/{Path(figs['layers']).name})\n")
-    L += [f"`S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂` — h là hidden state ra khỏi lớp ℓ. Hình vẽ "
-          f"**lớp {rows[0]}–{rows[-1]}** (={len(rows)}/{n_layers} lớp cuối), trục y ghi "
-          f"CHỈ SỐ THẬT của lớp; {out['arm']['n_tokens']} vị trí trên trục x. Vùng xanh "
-          f"= 256 token ảnh Z (cột {out['arm']['image_span'][0]}–"
+    L += [f"`S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂` — h là hidden state ra khỏi lớp ℓ. Trục **Y "
+          f"là vị trí token** ({out['arm']['n_tokens']} hàng, đọc từ trên xuống đúng "
+          f"thứ tự trong chuỗi), trục **X là lớp** với chỉ số THẬT, vẽ **đủ "
+          f"{n_layers} lớp**. Đường kẻ mờ + thanh màu bên trái chia ba vùng token: "
+          f"xanh = 256 token ảnh **Z** (hàng {out['arm']['image_span'][0]}–"
           f"{out['arm']['image_span'][1]})"
-          + (f", vùng vàng = {ins[1] - ins[0]} token **Q** (cột {ins[0]}–{ins[1] - 1})"
-             if ins else "") + ".\n",
-          "Lớp thấp bị bỏ có chủ ý: ở đó gradient gần như chỉ nói về hình thái token, "
-          "còn phần quyết định \"sẽ viết chữ gì\" nằm ở đuôi — và đó mới là chỗ đáng "
-          "hỏi Q có được đọc hay không.\n"]
+          + (f", vàng = {ins[1] - ins[0]} token **Q** (hàng {ins[0]}–{ins[1] - 1})"
+             if ins else "") + ", còn lại là phần văn bản.\n",
+          f"Vẽ đủ lớp chứ không cắt đuôi: câu hỏi của hình này là *gradient dồn vào "
+          f"vùng nào của chuỗi, ở tầng nào của mạng*, và nó cần cả lớp thấp để có mức "
+          f"nền mà so. `lens.layer_frac` ({lc['layer_frac']:g}) chỉ còn áp cho **bảng "
+          f"top-k ở mục 2**, nơi lớp thấp thật sự vô nghĩa.\n"]
     S = np.asarray(res["layer_sens"])
-    T = S[rows[0] - 1:, :]
-    fl = np.argsort(-T.ravel())[:5]
-    L.append("Năm ô nhạy nhất trong khoảng lớp này:\n")
+    fl = np.argsort(-S.ravel())[:5]
+    L.append("Năm ô nhạy nhất trên toàn bộ lớp:\n")
     L.append("| lớp | vị trí | ở đâu | ‖∂y/∂h‖ |\n|---|---|---|---|")
     for f in fl:
-        i, j = np.unravel_index(int(f), T.shape)
-        L.append(f"| {rows[0] + i} | {j} | `{_where(int(j), res)}` | {T[i, j]:.3g} |")
+        i, j = np.unravel_index(int(f), S.shape)
+        L.append(f"| {i + 1} | {j} | `{_where(int(j), res)}` | {S[i, j]:.3g} |")
     L.append("")
     if ins:
-        q = S[rows[0] - 1:, ins[0]:ins[1]].sum(axis=0)
+        q = S[:, ins[0]:ins[1]].sum(axis=0)
         top = np.argsort(-q)[:8]
-        L.append(f"Tám learner vector được đọc nhiều nhất (tổng trên lớp "
-                 f"{rows[0]}–{rows[-1]}):\n")
+        L.append("Tám learner vector được đọc nhiều nhất (tổng trên MỌI lớp):\n")
         L.append("| Q[k] | " + " | ".join(f"`Q[{int(k)}]`" for k in top) + " |")
         L.append("|---|" + "---|" * len(top))
         L.append("| độ nhạy | " + " | ".join(f"{q[int(k)]:.3g}" for k in top) + " |")
         L.append("")
     L += ["**Đọc hình 1 thế nào.**\n",
-          "1. **Vùng vàng (Q) so với vùng xanh (Z)**: đây là câu hỏi chính. Vàng sáng "
-          "ngang hoặc hơn xanh = decoder thật sự dùng 128 vector mới. Vàng tối om = "
+          "1. **Dải vàng (Q) so với dải xanh (Z)**: đây là câu hỏi chính. Vàng sáng "
+          "ngang hoặc hơn xanh = decoder thật sự dùng 256 vector mới. Vàng tối om = "
           "nhánh đang bị bỏ qua, và mọi chênh lệch A/B nếu có là do nhiễu huấn luyện.\n",
-          "2. **Cột trong vùng vàng**: vài cột sáng, còn lại tối = chỉ một nhúm learner "
+          "2. **Hàng trong dải vàng**: vài hàng sáng, còn lại tối = chỉ một nhúm learner "
           "vector làm việc (đối chiếu dòng \"số vector Q gánh 50%\" ở mục Kiểm nhanh). "
-          "Đều tay = 128 vector chia nhau tải.\n",
-          "3. **Hàng**: trong 1/4 lớp cuối, càng về lớp chót càng gần quyết định từ sẽ "
-          "sinh. Q sáng ở lớp chót = nó đang đổi kết luận, không chỉ đổi biểu diễn.\n",
+          "Đều tay = 256 vector chia nhau tải.\n",
+          "3. **Cột (lớp)**: lớp thấp ≈ đặc trưng cục bộ của token, lớp cao ≈ quyết "
+          "định từ sẽ sinh. Dải Q sáng ở 1/4 lớp CUỐI (bên phải) = nó đang đổi kết "
+          "luận; chỉ sáng ở lớp thấp = nhánh mới đổi biểu diễn, chưa chạm tới chữ.\n",
           "4. Màu cắt ở phân vị "
           f"{lc['percentile_clip']:g} của chính dải này, nên **không** đọc độ sáng như "
           "số tuyệt đối; con số tuyệt đối ở bảng ngay trên.\n",
           "5. Chuẩn gradient **tăng dần theo độ sâu** là chuyện bình thường của kiến trúc "
           "residual, không phải \"lớp cao quan trọng hơn\".\n"]
 
-    L.append("## 2. [Language] Logit lens — top-k sau khi unembed\n")
+    L.append(f"## 2. [Language] Logit lens — top-k, {len(marks_src)}/{n_layers} "
+             f"lớp cuối\n")
     L.append("`ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` rồi softmax → k token nhiều xác suất "
              "nhất. Đây là xấp xỉ TUYẾN TÍNH: đọc hidden state giữa chừng bằng đúng "
              "cái đầu ra của model, không qua các lớp còn lại.\n")
@@ -661,9 +678,10 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
     for f in item["findings"]:
         L.append(f"| {f['label']} | {f['class']} |")
     L.append("")
-    marks = [m for m in rows]
-    step = max(1, len(marks) // max(1, lc["layer_marks"]))
-    marks = sorted(set(marks[::step] + [rows[-1]]))
+    # CHỈ bảng top-k này lấy từ 1/4 lớp cuối: phép đọc tuyến tính bỏ qua mọi lớp
+    # sau ℓ, nên ở lớp thấp nó ra token vô nghĩa — đọc cũng không rút được gì.
+    step = max(1, len(marks_src) // max(1, lc["layer_marks"]))
+    marks = sorted(set(marks_src[::step] + [marks_src[-1]]))
     L.append(f"| lớp | top-{lc['top_k']} |\n|---|---|")
     for m in marks:
         r = next((x for x in tops if x["layer"] == m), None)
@@ -672,6 +690,8 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
         L.append(f"| {m} | {txt} |")
     L.append("\nĐầy đủ mọi lớp ở `logit_lens.csv`.\n")
     L += ["**Đọc bảng 2 thế nào.**\n",
+          f"0. Bảng này CHỈ lấy **lớp {marks_src[0]}–{marks_src[-1]}** "
+          f"(`lens.layer_frac` = {lc['layer_frac']:g}), khác hình 1 vốn vẽ đủ lớp.\n",
           "1. Điều đáng đọc là **lớp nào bắt đầu ra từ lâm sàng** (effusion, opacity, "
           "cardiomegaly…) — sớm hơn = thông tin đã sẵn sàng sớm hơn.\n",
           "2. Đối chiếu với bảng 14 nhãn ở trên: từ khớp nhãn `pos` là tín hiệu tốt; "

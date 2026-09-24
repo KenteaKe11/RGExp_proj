@@ -177,15 +177,18 @@ y = Σ_t log p(ref_t | ref_<t, ảnh)        (lens.target: ref_logprob)
 nên chỉ tốn một lượt backward (Jacobian đầy đủ 2560 × số vị trí là không dựng
 nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 
-1. **[Language] Độ nhạy theo lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, **một** heatmap,
-   chỉ `lens.layer_frac` (1/4, làm tròn lên → 9/34) **lớp cuối**, trục y ghi
-   **chỉ số lớp thật**. Thanh màu phía trên đánh dấu vùng **Z** (256 token ảnh)
-   và vùng **Q** (256 learner) — so hai vùng ấy là câu hỏi chính: *decoder có
-   thật sự đọc 256 vector mới không*. Kèm bảng 5 ô nhạy nhất (có nhãn `Z[i]` /
-   `Q[k]` / `text`) và 8 learner vector được đọc nhiều nhất. Lớp thấp bị bỏ có
-   chủ ý: ở đó gradient gần như chỉ nói về hình thái token.
-2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token ở
-   các lớp mốc trong khoảng ấy, kèm bảng 14 nhãn bệnh lý của ảnh đó. Đầy đủ ở
+1. **[Language] Độ nhạy token × lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, **một**
+   heatmap: trục **Y là vị trí token** (đọc từ trên xuống đúng thứ tự trong
+   chuỗi), trục **X là lớp** với chỉ số thật, trên **đủ mọi lớp** (34/34). Đường
+   kẻ mờ + thanh màu bên trái chia ba vùng token: **Z** (xanh, 256 token ảnh),
+   **Q** (vàng, 256 learner), rồi phần văn bản — so dải Q với dải Z là câu hỏi
+   chính: *decoder có thật sự đọc 256 vector mới không*. Kèm bảng 5 ô nhạy nhất
+   (có nhãn `Z[i]` / `Q[k]` / `text`) và 8 learner vector được đọc nhiều nhất.
+   Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
+2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token,
+   kèm bảng 14 nhãn bệnh lý của ảnh đó. **Đây là chỗ duy nhất còn dùng
+   `lens.layer_frac`** (1/4 lớp cuối, làm tròn lên → 9/34): phép đọc tuyến tính
+   bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra token vô nghĩa. Đầy đủ ở
    `logit_lens.csv`.
 3. **[Visual] Chain rule từ Q về ảnh** — `y → Q → Recovery → X`, chuẩn
    gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc. **Một bản đồ duy

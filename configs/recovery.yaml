@@ -396,7 +396,8 @@ lens:
   sample: auto              # auto = ảnh test nhiều pos + uncertain nhất; hoặc key cụ thể
   target: ref_logprob       # ref_logprob | next_token
   top_k: 8                  # logit lens: số token mỗi lớp
-  layer_frac: 0.25          # heatmap token: CHỈ 1/4 lớp cuối, trục y ghi chỉ số lớp thật
+  layer_frac: 0.25          # CHỈ cho bảng top-k của logit lens (1/4 lớp cuối).
+                            # Heatmap token × lớp vẽ ĐỦ mọi lớp.
   layer_marks: 6            # số lớp mốc in trong bảng (đầy đủ ở logit_lens.csv)
   overlay_alpha: 0.45       # độ mờ của heatmap chồng lên ảnh gốc
   percentile_clip: 99.0     # cắt đuôi trước khi chuẩn hoá màu
