@@ -5,16 +5,13 @@ Sơ đồ (đúng hình "Recovery" + "Cls Head"):
     Image ─► Vision Encoder (SigLIP) ─► X (4096, 1152) ──────────────┐
                     │                                                  │
                     ▼                        ┌──────── Recovery ───────┴──────┐
-              Adapter (projector)            │ q  = Learner (256, 3072)       │
-                    │                        │ h  = Self-attn(RMSNorm(q))     │
-                    ▼                        │ u  = Cross-Attn(                │
-          Vision Tokens Z (256, 2560)        │        RMSNorm(Linear 3072→1152 │
-                    │                        │                          (h)),  │
-                    │                        │        RMSNorm(X))              │
-                    │                        │ u  = Linear 2048→3072(          │
-                    │                        │      GELU(Linear 1152→2048 u))  │
-                    │                        │ h  = h + u                      │
-                    │                        │ Q  = Linear 3072→2560(h)        │
+              Adapter (projector)            │ v  = RMSNorm(Linear 1152→3072  │
+                    │                        │                          (X))  │
+                    ▼                        │ q  = Learner (256, 3072)       │
+          Vision Tokens Z (256, 2560)        │ h  = Self-attn(RMSNorm(q))     │
+                    │                        │ h  = h + Cross-Attn(           │
+                    │                        │        RMSNorm_q(h), v)        │
+                    │                        │ Q  = Linear 3072→2560(h)       │
                     │                        └────────┬───────────────┬───────┘
                     │                    Q (256, 2560)│               │
                     │                                 │               ▼
@@ -24,22 +21,16 @@ Sơ đồ (đúng hình "Recovery" + "Cls Head"):
                     ▼                                 ▼
     [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
-BA không gian, mỗi cái một việc:
-
-  * `d_learn` (3072) — nơi Learner sống và Self-attn chạy: 256 câu hỏi nói
-    chuyện với nhau, rộng hơn cả d_model để không bị bóp trước khi hỏi;
-  * `d_vis` (1152) — nơi Cross-Attn chạy. X đi vào nhánh **NGUYÊN VẸN**, chỉ qua
-    RMSNorm; query được hạ xuống gặp nó bằng `Linear 3072→1152`. Không còn phép
-    chiếu nào áp lên 4096 token thị giác, nên phần đắt nhất của nhánh chỉ còn
-    đúng attention 256 × 4096 ở 1152 chiều;
-  * `d_model` (2560) — không gian embedding của decoder, chạm đúng một lần ở
-    `Linear 3072→2560` cuối.
-
-MLP sau Cross-Attn vì thế vừa mở rộng vừa đổi không gian: 1152 → `hidden`
-(2048) → 3072, để cộng được vào residual của Self-attn.
+MỘT không gian làm việc duy nhất: `d_learn` (3072). Learner sống ở đó, cả
+Self-attn lẫn Cross-Attn chạy ở đó, và X được kéo lên đó bằng đúng một
+`Linear 1152→3072`. `d_model` (2560, không gian embedding của decoder) chỉ được
+chạm một lần, ở `Linear` cuối. Không còn phép hạ query xuống 1152, cũng không
+còn MLP giữa: residual cộng THẲNG đầu ra Cross-Attn — khối chỉ còn hai attention
+và hai phép chiếu.
 
 KHÔNG còn khối Recomb của §2.0 (Linear + RMSNorm + Self-attn + MLP + residual
-trên cả 4096 vị trí).
+trên cả 4096 vị trí). Ở đây thứ duy nhất chạy trên 4096 vị trí là `inp` và
+RMSNorm của nó; phần còn lại của nhánh chỉ đụng `n_query` (256) vị trí.
 
 KHÁC §2.0 ở chuỗi: ở đó Z bị THAY bằng Z' = Z + Retriever(Z, R) — đúng 256 chỗ
 token ảnh, chuỗi không dài thêm. Ở đây Z **không bị đụng vào**; nhánh sinh ra 256
@@ -59,8 +50,9 @@ quả mọi vị trí của Q đều đọc được toàn bộ token ảnh, cò
 Stage 0 pretrain CHÍNH Recovery (Recovery + Cls Head, ASL trên 14 bệnh lý × 3
 lớp), rồi main stage nạp nguyên khối ấy: không còn phần nào của nhánh là mới
 tinh. Tham số của nhánh để fp32, forward chạy dưới autocast bf16 — ở lr
-1e-5..1e-4 một bước Adam nhỏ hơn eps của bf16 (7.8e-3 tương đối) so với trọng số
-~0.02, nên tham số bf16 sẽ nuốt mất phần lớn cập nhật mà không báo gì.
+1e-5..7e-5 (main stage · đỉnh Stage 0) một bước Adam nhỏ hơn eps của bf16
+(7.8e-3 tương đối) so với trọng số ~0.02, nên tham số bf16 sẽ nuốt mất phần lớn
+cập nhật mà không báo gì.
 """
 from __future__ import annotations
 
@@ -81,12 +73,12 @@ STAGE0_FILE = "recovery_stage0.safetensors"
 STAGE0_META = "recovery_stage0.json"
 BRANCH_FILE = "recovery_branch.safetensors"
 BRANCH_META = "recovery_branch.json"
-# /4 = Learner ở d_learn (3072), Cross-Attn ở d_vis (1152) với X nguyên vẹn,
-# đầu ra qua một Linear 3072→2560. Checkpoint /1 (có Recomb), /2 (nhánh ở 1152)
-# và /3 (nhánh ở 2560, X qua Linear) KHÔNG nạp được và phải bị từ chối ồn ào
-# thay vì lệch khoá im lặng. Đổi riêng n_query/hidden thì KHÔNG cần đổi format:
-# `spec` trong meta được so từng khoá khi nạp (`load_stage0_into`).
-FORMAT = "rgexp.recovery/4"
+# /5 = cả hai attention ở d_learn (3072), X kéo lên đó bằng Linear 1152→3072,
+# KHÔNG còn q_proj lẫn MLP giữa. Checkpoint /1..../4 KHÔNG nạp được và phải bị
+# từ chối ồn ào thay vì lệch khoá im lặng. Đổi riêng n_query/d_learn thì KHÔNG
+# cần đổi format: `spec` trong meta được so từng khoá khi nạp
+# (`load_stage0_into`).
+FORMAT = "rgexp.recovery/5"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -161,44 +153,37 @@ class ClsHead(nn.Module):
 
 
 class Recovery(nn.Module):
-    """X (B, 4096, d_vis) -> Q (B, n_query, d_model), qua BA không gian.
+    """X (B, 4096, d_vis) -> Q (B, n_query, d_model).
 
+        v = RMSNorm_kv(Linear(X))                        d_vis → d_learn
         h = Self-attn(RMSNorm(Learner))                  (n_query, d_learn)
-        u = Cross-Attn(RMSNorm_q(Linear(h)), RMSNorm_kv(X))
-                                                         query, kv ở d_vis
-        u = Linear(GELU(Linear(u)))                      d_vis → hidden → d_learn
-        h = h + u                                        (n_query, d_learn)
+        h = h + Cross-Attn(RMSNorm_q(h), v)              query, kv ở d_learn
         Q = Linear(h)                                    d_learn → d_model
 
     `Learner` là tham số (không phải hàm của ảnh) — nó là `n_query` câu hỏi cố
-    định ở `d_learn`, còn câu trả lời đến từ Cross-Attn sang X. X **không** bị
-    chiếu: nó vào Cross-Attn nguyên vẹn ở `d_vis`, chỉ qua RMSNorm, và query
-    được hạ xuống gặp nó bằng `q_proj`. Nhờ vậy không phép nhân ma trận nào áp
-    lên cả 4096 vị trí; phần đắt nhất của nhánh chỉ còn attention.
+    định, còn câu trả lời đến từ Cross-Attn sang X. Cả khối chạy ở MỘT không
+    gian `d_learn`; `inp` (và RMSNorm của nó) là thứ DUY NHẤT đụng cả 4096 vị
+    trí, phần còn lại chỉ làm việc trên `n_query` vị trí. Không MLP giữa:
+    residual cộng thẳng đầu ra Cross-Attn.
     """
 
     def __init__(self, d_vis: int = 1152, d_model: int = 2560, n_query: int = 256,
-                 d_learn: int = 3072, n_heads: int = 24, x_heads: int = 9,
-                 hidden: int = 2048, dropout: float = 0.0):
+                 d_learn: int = 3072, n_heads: int = 24, dropout: float = 0.0):
         super().__init__()
         self.n_query = int(n_query)
+        self.inp = nn.Linear(d_vis, d_learn)
         self.learner = nn.Parameter(torch.randn(1, self.n_query, d_learn) * 0.02)
         self.norm_in = RMSNorm(d_learn)
         self.sattn = MultiHeadAttention(d_learn, n_heads, dropout)
-        self.q_proj = nn.Linear(d_learn, d_vis)
-        self.norm_q = RMSNorm(d_vis)
-        self.norm_kv = RMSNorm(d_vis)
-        self.xattn = MultiHeadAttention(d_vis, x_heads, dropout)
-        self.up = nn.Linear(d_vis, hidden)
-        self.down = nn.Linear(hidden, d_learn)
+        self.norm_q = RMSNorm(d_learn)
+        self.norm_kv = RMSNorm(d_learn)
+        self.xattn = MultiHeadAttention(d_learn, n_heads, dropout)
         self.out = nn.Linear(d_learn, d_model)
-        self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        v = self.norm_kv(self.inp(x))
         h = self.sattn(self.norm_in(self.learner.expand(x.shape[0], -1, -1)))
-        q = self.norm_q(self.q_proj(h))
-        u = self.xattn(q, self.norm_kv(x.to(q.dtype)))
-        h = h + self.down(self.drop(F.gelu(self.up(u))))
+        h = h + self.xattn(self.norm_q(h), v.to(h.dtype))
         return self.out(h)
 
 
@@ -223,8 +208,6 @@ def spec_from_cfg(cfg, d_vis: int, d_model: int, n_labels: int) -> dict:
         "recovery": {"n_query": int(rv.get("n_query", 256)),
                      "d_learn": int(rv.get("d_learn", 3072)),
                      "n_heads": int(rv.get("n_heads", 24)),
-                     "x_heads": int(rv.get("x_heads", 9)),
-                     "hidden": int(rv.get("hidden", 2048)),
                      "dropout": float(rv.get("dropout", 0.0))},
         "cls_head": {"n_heads": int(ch.get("n_heads", 20)),
                      "dropout": float(ch.get("dropout", 0.0))},
@@ -238,7 +221,7 @@ def spec_fingerprint(spec: dict) -> str:
 def build_recovery(spec: dict) -> Recovery:
     r = spec["recovery"]
     return Recovery(spec["d_vis"], spec["d_model"], r["n_query"], r["d_learn"],
-                    r["n_heads"], r["x_heads"], r["hidden"], r["dropout"])
+                    r["n_heads"], r["dropout"])
 
 
 def build_cls_head(spec: dict) -> ClsHead:
@@ -302,11 +285,10 @@ class RecoveryBranch(nn.Module):
     def describe(self) -> str:
         s = self.spec
         r = s["recovery"]
-        return (f"Recovery: Learner({r['n_query']}, {r['d_learn']}) -> RMSNorm -> "
-                f"Self-attn ({r['n_heads']} head) -> Linear →{s['d_vis']} -> "
-                f"Cross-Attn(·, RMSNorm X) ({r['x_heads']} head, {s['d_vis']}) -> "
-                f"Linear/GELU {s['d_vis']}→{r['hidden']}→{r['d_learn']} (+res) -> "
-                f"Linear {r['d_learn']}→{s['d_model']}")
+        return (f"Recovery: Linear {s['d_vis']}→{r['d_learn']} (X) · "
+                f"Learner({r['n_query']}, {r['d_learn']}) -> RMSNorm -> Self-attn "
+                f"({r['n_heads']} head) -> Cross-Attn(·, RMSNorm X') "
+                f"({r['n_heads']} head) (+res) -> Linear {r['d_learn']}→{s['d_model']}")
 
 
 # ══ ASL: γ theo TÊN lớp ═════════════════════════════════════════════════════

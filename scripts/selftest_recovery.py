@@ -61,8 +61,7 @@ def check(name: str):
 def small_spec(n_labels=14, n_query=5):
     from src import recovery as R
 
-    cfg = {"recovery": {"recovery": {"n_query": n_query, "d_learn": 16, "n_heads": 4,
-                                     "x_heads": 4, "hidden": 12},
+    cfg = {"recovery": {"recovery": {"n_query": n_query, "d_learn": 16, "n_heads": 4},
                         "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, 24, 32, n_labels)
 
@@ -103,10 +102,10 @@ def _():
     assert isinstance(br.recovery.out, torch.nn.Linear)
     assert br.recovery.out.weight.abs().sum() > 0
     assert not hasattr(br, "recomb")            # Recomb đã bị bỏ khỏi kiến trúc
-    # X KHÔNG bị chiếu: Cross-Attn chạy thẳng ở d_vis, query hạ xuống gặp nó
-    assert not hasattr(br.recovery, "inp")
-    assert br.recovery.q_proj.in_features == 16 and br.recovery.q_proj.out_features == 24
-    assert br.recovery.xattn.d == 24 and br.recovery.sattn.d == 16
+    # MỘT không gian: X kéo lên d_learn, cả hai attention chạy ở đó, không MLP
+    assert not hasattr(br.recovery, "q_proj") and not hasattr(br.recovery, "up")
+    assert br.recovery.inp.in_features == 24 and br.recovery.inp.out_features == 16
+    assert br.recovery.xattn.d == br.recovery.sattn.d == 16
     assert br.recovery.out.in_features == 16 and br.recovery.out.out_features == 32
     assert tuple(br.recovery.learner.shape) == (1, sp["recovery"]["n_query"], 16)
     # Q phụ thuộc ẢNH (Cross-Attn thật sự đọc X), không phải hằng số
@@ -410,7 +409,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 = 1 warm-up + 3 main + 1 final = 5 epoch, đỉnh 1e-4, val 256 CỐ ĐỊNH; main mở băng Recovery sau 0.2 epoch, lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + 3 main + 1 final = 5 epoch, đỉnh 7e-5, val 256 CỐ ĐỊNH; main mở băng Recovery sau 0.2 epoch, lr 1e-5; --retrain-all")
 def _():
     from src import stage0_recovery as s0
     from src.config import load_config
@@ -418,7 +417,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (1e-4, 0.03, 3, "last")
+    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (7e-5, 0.03, 3, "last")
     # warm-up là epoch THÊM VÀO: base = warmup + max_epochs; final cộng thêm 1
     assert sc["warmup_epochs"] == 1 and sc["base_epochs"] == 4
     assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 5
@@ -459,9 +458,10 @@ def _():
     assert cfg["recovery_exp"]["retrain_all"] is False
     rv = cfg["recovery"]["recovery"]
     assert int(rv["n_query"]) == 256 and int(rv["d_learn"]) == 3072
-    assert int(rv["d_learn"]) // int(rv["n_heads"]) == 128 == 1152 // int(rv["x_heads"])
-    assert int(rv["d_learn"]) % int(rv["n_heads"]) == 0 and 1152 % int(rv["x_heads"]) == 0
-    assert int(rv["hidden"]) == 2048 and "out_hidden" not in rv
+    assert int(rv["d_learn"]) % int(rv["n_heads"]) == 0
+    assert int(rv["d_learn"]) // int(rv["n_heads"]) == 128      # head_dim 128
+    # một không gian duy nhất: không còn head/MLP riêng cho Cross-Attn
+    assert not {"x_heads", "hidden", "out_hidden"} & set(rv)
     assert "zero_init_out" not in rv and "recomb" not in cfg["recovery"]
     src = (ROOT / "src/run_recovery.py").read_text(encoding="utf-8")
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
@@ -501,7 +501,7 @@ def _():
         raise AssertionError("stage0.probe_sizes lệch batch_size phải DỪNG")
 
 
-@check("15. Stage 0 chạy thật (mô hình giả): 1 warm-up + 3 main -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP 1e-4→1e-7 -> final/; chạy lại chỉ epoch 5")
+@check("15. Stage 0 chạy thật (mô hình giả): 1 warm-up + 3 main -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP 7e-5→1e-7 -> final/; chạy lại chỉ epoch 5")
 def _():
     import json
 
@@ -527,8 +527,7 @@ def _():
         return x, x[..., :1].expand(b, N_TOK, D_MOD)
 
     cfg = load_config(ROOT / "configs/recovery.yaml")
-    cfg["recovery"] = {"recovery": {"n_query": 5, "d_learn": 16, "n_heads": 4,
-                                    "x_heads": 4, "hidden": 12},
+    cfg["recovery"] = {"recovery": {"n_query": 5, "d_learn": 16, "n_heads": 4},
                        "cls_head": {"n_heads": 4}}
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
                          warmup_epochs=1, max_epochs=3)
@@ -569,7 +568,7 @@ def _():
             m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
             assert m["phase"] == "anneal"
             # lr_start: null -> lấy lr đỉnh của base; và chạy NỐI TIẾP thật
-            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 1e-4
+            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 7e-5
             assert m["anneal"]["lr_start_from_base_lr"] is True
             assert m["anneal"]["reset_optimizer"] is False
             assert m["optimizer_continued"] is True
@@ -604,7 +603,7 @@ def _():
          recombiner.encode_vision, recombiner.vision_and_text_dims) = orig
 
 
-@check("16. lịch epoch 5 (final): NỐI TIẾP, cosine 1e-4 -> 1e-7 trong 200 bước, giữ moment")
+@check("16. lịch epoch 5 (final): NỐI TIẾP, cosine 7e-5 -> 1e-7 trong 200 bước, giữ moment")
 def _():
     import torch
 
@@ -613,7 +612,7 @@ def _():
 
     scfg = s0.s0cfg(load_config(ROOT / "configs/recovery.yaml"))
     fa = scfg["final_anneal"]
-    assert fa == {"enabled": True, "epochs": 1, "lr_start": 1e-4,
+    assert fa == {"enabled": True, "epochs": 1, "lr_start": 7e-5,
                   "lr_start_from_base_lr": True, "lr_end": 1e-7,
                   "schedule": "cosine", "weight_decay": 0.03,
                   "reset_optimizer": False}, fa
@@ -631,9 +630,9 @@ def _():
         opt.step()
         sch.step()
         lrs.append(opt.param_groups[0]["lr"])
-    assert abs(lrs[0] - 1e-4) < 1e-12 and abs(lrs[-1] - 1e-7) < 1e-12
+    assert abs(lrs[0] - 7e-5) < 1e-12 and abs(lrs[-1] - 1e-7) < 1e-12
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
-    # nối tiếp = lr KHÔNG nhảy nấc ở ranh giới epoch: bước cuối của base cũng 1e-4
+    # nối tiếp = lr KHÔNG nhảy nấc ở ranh giới epoch: bước cuối của base cũng 7e-5
     assert abs(lrs[0] - scfg["lr"]) < 1e-12
 
 
@@ -797,8 +796,7 @@ def _():
     assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/recovery.yaml")
     sp = R.spec_from_cfg({"recovery": {"recovery": {"n_query": NQ, "d_learn": 8,
-                                                    "n_heads": 2, "x_heads": 2,
-                                                    "hidden": 8},
+                                                    "n_heads": 2},
                                        "cls_head": {"n_heads": 2}}}, DV, DM, 14)
     branch = R.RecoveryBranch(sp)
     branch.set_frozen(True)

@@ -29,43 +29,40 @@ ra để làm. Mọi khoá quyết định kết quả của A (`seed`, `data`, 
 ## Kiến trúc (`src/recovery.py`)
 
 ```
-X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐   KHÔNG bị chiếu
+X = SigLIP(ảnh) (4096, 1152)  ─────────────────────────┐
 Z = projector(X) (256, 2560)                           │
                                           ┌──── Recovery ────┐
+  v = RMSNorm(Linear 1152→3072 (X))                    │ thứ DUY NHẤT đụng 4096 vị trí
   h = Self-attn(RMSNorm(Learner))                      │ Learner (256, 3072) — tham số
-  q = RMSNorm(Linear 3072→1152 (h))                    │ query hạ xuống gặp X
-  u = Cross-Attn(q, RMSNorm(X))                        │ ở 1152, 9 head
-  h = h + Linear 2048→3072(GELU(Linear 1152→2048 (u))) │ vừa mở rộng vừa đổi không gian
+  h = h + Cross-Attn(RMSNorm_q(h), v)                  │ query và kv đều ở 3072
   Q = Linear 3072→2560 (h)                             │ -> Q (256, 2560)
                                           └──────────────────┘
 Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**Ba không gian, mỗi cái một việc.**
-
-| | dùng ở đâu | vì sao |
-|---|---|---|
-| `d_learn` 3072 | Learner + Self-attn + residual | 256 câu hỏi nói chuyện với nhau, rộng hơn cả `d_model` để không bị bóp trước khi hỏi |
-| `d_vis` 1152 | Cross-Attn | X vào **nguyên vẹn**, chỉ qua RMSNorm; query hạ xuống gặp nó. Không phép nhân ma trận nào áp lên 4096 vị trí — phần đắt nhất của nhánh chỉ còn attention 256 × 4096 ở 1152 chiều |
-| `d_model` 2560 | `Linear` cuối | không gian embedding của decoder, chạm đúng một lần |
+**Một không gian làm việc duy nhất: `d_learn` = 3072.** Learner sống ở đó, cả
+Self-attn lẫn Cross-Attn chạy ở đó, và X được kéo lên đó bằng đúng một
+`Linear 1152→3072`. `d_model` (2560, không gian embedding của decoder) chỉ được
+chạm một lần, ở `Linear` cuối. **Không MLP giữa**: residual cộng thẳng đầu ra
+Cross-Attn — khối chỉ còn hai attention và hai phép chiếu.
 
 **Không còn khối Recomb** (§2.0 cho X qua Linear + RMSNorm + Self-attn + MLP +
-residual trên cả 4096 vị trí), và cũng không còn phép chiếu `1152→2560` áp lên X
-như bản trước. Head_dim 128 ở mọi attention: 24 head ở 3072, 9 head ở 1152, 20
-head cho Attn-Pooling ở 2560. Tham số nhánh để fp32, chạy dưới autocast bf16.
+residual trên cả 4096 vị trí). Ở đây thứ duy nhất chạy trên 4096 vị trí là `inp`
+và RMSNorm của nó; phần còn lại chỉ đụng `n_query` (256) vị trí. Head_dim 128 ở
+mọi attention: 24 head ở 3072 (Self-attn, Cross-Attn), 20 head cho Attn-Pooling
+ở 2560. Tham số nhánh để fp32, chạy dưới autocast bf16.
 
 | khối | tham số |
 |---|---|
+| `Linear 1152→3072` (X) | 3,54 M |
 | Learner (256 × 3072) | 0,79 M |
 | Self-attn @3072 | 37,7 M |
-| `Linear 3072→1152` (query) | 3,54 M |
-| Cross-Attn @1152 | 5,31 M |
-| MLP 1152→2048→3072 | 8,66 M |
+| Cross-Attn @3072 | 37,7 M |
 | `Linear 3072→2560` (ra) | 7,87 M |
-| **Recovery** | **63,9 M** |
+| **Recovery** | **87,7 M** |
 | Cls Head (chỉ Stage 0) | 26,3 M |
-| **Stage 0 tổng** | **90,2 M** |
+| **Stage 0 tổng** | **114,0 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
@@ -86,7 +83,7 @@ Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không đọc một biểu
 diễn trung gian nào rồi vứt đi.
 
-* AdamW, lr **đỉnh 1e-4**, wd 0.03, **1 warm-up + 3 main + 1 final = 5 epoch**,
+* AdamW, lr **đỉnh 7e-5**, wd 0.03, **1 warm-up + 3 main + 1 final = 5 epoch**,
   batch hiệu dụng 32 — **của
   riêng Stage 0**. Nó trùng 32 của main stage chỉ là trùng số: batch main stage
   bị khoá theo $1 (`train_batch` trong fixture, một phần lịch học của A), còn
@@ -98,13 +95,13 @@ diễn trung gian nào rồi vứt đi.
   Luôn lấy epoch cuối (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay** khi 5 epoch xong.
 * **Epoch n+1 = 5 — final weight** (`stage0.final_anneal`): chạy **nối tiếp** —
   giữ nguyên **moment AdamW** đã tích trong phần base, và `lr_start: null` lấy
-  đúng **lr đỉnh của base (1e-4)** làm điểm xuất phát, nên lr **không nhảy nấc**
-  ở ranh giới epoch, nó chỉ bắt đầu đi xuống: **cosine 1e-4 → 1e-7** cập nhật mỗi
+  đúng **lr đỉnh của base (7e-5)** làm điểm xuất phát, nên lr **không nhảy nấc**
+  ở ranh giới epoch, nó chỉ bắt đầu đi xuống: **cosine 7e-5 → 1e-7** cập nhật mỗi
   bước trong 1 epoch -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.**
   (`reset_optimizer: true` là lịch cũ: optimizer mới tinh, moment 0.)
   Đổi riêng khối `final_anneal` thì chỉ chạy lại epoch 5 (base giữ nguyên, có vân tay riêng).
 * **Lịch lr**: `warmup_epochs` (1) epoch đầu lr đi **tuyến tính theo bước** từ
-  1e-6 lên 1e-4, rồi **giữ phẳng** suốt `max_epochs` (3) epoch chính. Warm-up là
+  đỉnh/w lên 7e-5, rồi **giữ phẳng** suốt `max_epochs` (3) epoch chính. Warm-up là
   epoch **thêm vào**, nằm NGOÀI `max_epochs` — `base = warmup + max_epochs = 4`,
   cộng epoch final thành **5 epoch tổng**. Theo bước chứ không theo epoch: warm-up
   theo epoch chỉ có vài nấc và nấc đầu đã là 1/w đỉnh — gần như không warm-up gì.
@@ -298,7 +295,7 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/recovery.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_recovery.sh · selftest_recovery.py · setup.sh · _env.sh
 src/run_recovery.py      train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/recovery.py          Recovery (Learner@3072 + Self-attn + Cross-Attn@1152) · Cls Head (đọc Q) ·
+src/recovery.py          Recovery (Linear 1152→3072 + Learner + 2 attention @3072) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_recovery.py   Stage 0 + loader.json + nhãn chụp lại
 src/train_recovery.py    main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)

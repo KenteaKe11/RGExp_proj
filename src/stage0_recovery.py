@@ -7,7 +7,7 @@ chuỗi của decoder — Cls Head đọc đầu ra 2560 của Recovery, không 
 diễn trung gian nào rồi vứt đi. Main stage nạp nguyên `recovery.*` và bỏ Cls Head.
 
 Lịch (khối `stage0` của configs/recovery.yaml):
-  * AdamW, lr ĐỈNH 1e-4: `warmup_epochs` (1) epoch đầu lr đi TUYẾN TÍNH theo
+  * AdamW, lr ĐỈNH 7e-5: `warmup_epochs` (1) epoch đầu lr đi TUYẾN TÍNH theo
     BƯỚC từ đỉnh/w lên đỉnh, rồi giữ phẳng tới hết phần base. weight_decay 0.03;
   * `warmup_epochs` (1) + `max_epochs` (3) = 4 epoch base trên 6400 mẫu train
     CỦA FIXTURE $1 (cùng tập main stage). Epoch warm-up là epoch THÊM VÀO, nằm
@@ -64,7 +64,7 @@ def stage0_dir(cfg: Cfg) -> Path:
 
 def s0cfg(cfg: Cfg) -> dict:
     s = dict(cfg.get("stage0") or {})
-    out = {"lr": float(s.get("lr", 1e-4)),          # ĐỈNH, sau warm-up
+    out = {"lr": float(s.get("lr", 7e-5)),          # ĐỈNH, sau warm-up
            # Số epoch THÊM VÀO ở đầu, lr đi tuyến tính theo BƯỚC lên đỉnh.
            # Nằm NGOÀI `max_epochs`: base = warmup_epochs + max_epochs.
            "warmup_epochs": int(s.get("warmup_epochs", 1)),
@@ -141,7 +141,7 @@ def anneal_cfg(s: dict) -> dict:
            "epochs": int(a.get("epochs", 1)),
            # null -> lr đỉnh của phần base: đổi `stage0.lr` thì điểm xuất phát
            # của epoch final đi theo, không lệch thành hai con số rời nhau.
-           "lr_start": float(s.get("lr", 1e-4)) if ls is None else float(ls),
+           "lr_start": float(s.get("lr", 7e-5)) if ls is None else float(ls),
            "lr_start_from_base_lr": ls is None,
            "lr_end": float(a.get("lr_end", 1e-7)),
            "schedule": str(a.get("schedule", "cosine")).lower(),

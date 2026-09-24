@@ -301,18 +301,16 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/recovery.py`) ────────────────────────────────────────────
-# KHÔNG còn khối Recomb của §2.0. BA không gian: Learner + Self-attn ở d_learn
-# (3072); Cross-Attn ở d_vis (1152) với X vào NGUYÊN VẸN, chỉ qua RMSNorm —
-# không phép nhân ma trận nào áp lên 4096 vị trí; d_model (2560) chạm đúng một
-# lần ở Linear cuối.
+# KHÔNG còn khối Recomb của §2.0. MỘT không gian làm việc: d_learn (3072) —
+# Learner, Self-attn và Cross-Attn đều ở đó, X được kéo lên đó bằng đúng một
+# Linear 1152→3072 (thứ DUY NHẤT đụng cả 4096 vị trí). d_model (2560) chạm đúng
+# một lần ở Linear cuối. Không MLP giữa: residual cộng thẳng đầu ra Cross-Attn.
 recovery:
   n_labels: null            # null = theo labels.npz (14)
   recovery:                 # X (4096, 1152) -> Q (256, 2560)
     n_query: 256            # số learner vector NỐI vào chuỗi (chuỗi dài thêm đúng ngần này)
-    d_learn: 3072           # không gian của Learner + Self-attn
-    n_heads: 24             # Self-attn ở 3072: head_dim 128 (3072 = 24 × 128)
-    x_heads: 9              # Cross-Attn ở 1152: head_dim 128 (1152 = 9 × 128)
-    hidden: 2048            # MLP(GeLU) sau Cross-Attn: 1152 -> 2048 -> 3072 (+res)
+    d_learn: 3072           # không gian làm việc của cả khối
+    n_heads: 24             # Self-attn VÀ Cross-Attn: head_dim 128 (3072 = 24 × 128)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
@@ -327,7 +325,7 @@ recovery:
 
 # ── Stage 0: pretrain Recovery + Cls Head (`src/stage0_recovery.py`) ───────
 stage0:
-  lr: 1.0e-4                # ĐỈNH (sau warm-up), rồi giữ phẳng tới hết phần base
+  lr: 7.0e-5                # ĐỈNH (sau warm-up), rồi giữ phẳng tới hết phần base
   # Số epoch THÊM VÀO ở đầu (nằm NGOÀI `max_epochs`): lr đi TUYẾN TÍNH THEO BƯỚC
   # từ đỉnh/số-bước lên đỉnh. 0 = tắt warm-up, lr phẳng ngay từ epoch 1.
   #     base = warmup_epochs + max_epochs = 1 + 3 = 4 epoch
