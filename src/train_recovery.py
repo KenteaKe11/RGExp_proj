@@ -73,10 +73,49 @@ def zcfg(cfg: Cfg) -> dict:
     return out
 
 
-def already_trained(out_dir: Path) -> bool:
+def branch_stale(out_dir: Path, stage0_dir: Path | None = None) -> str | None:
+    """Weight của B đã có nhưng KHÔNG còn dùng được? -> câu giải thích, hoặc None.
+
+    "Đã có weight" KHÔNG đồng nghĩa "đã huấn luyện cho lần chạy NÀY". Đổi kiến
+    trúc nhánh hay chạy lại Stage 0 là `recovery_branch.safetensors` cũ thành
+    weight của một MẠNG KHÁC, trong khi tên file và `train_stats.json` vẫn y
+    nguyên. Không kiểm ở đây thì `train` bỏ qua main stage, nhảy thẳng sang sinh
+    với nhánh cũ, và (tệ hơn) NỐI TIẾP đống dự đoán của mạng cũ trong cùng một
+    file — hai kiến trúc bị chấm chung thành một candidate. Lỗi ấy chỉ lộ ra khi
+    `load_branch` ném format, tức là SAU khi đã tốn cả lượt Stage 0.
+
+    Hai thứ được đối chiếu:
+      * `format` của meta nhánh so với `recovery.FORMAT` của code đang chạy;
+      * `spec_fingerprint` của nhánh so với spec mà Stage 0 hiện tại sẽ dựng —
+        bắt được cả trường hợp format không đổi nhưng n_query/d_learn/... đổi.
+    """
     d = Path(out_dir)
-    return ((d / "adapter_model.safetensors").exists()
-            and (d / "train_stats.json").exists() and RCV.branch_exists(d))
+    if not RCV.branch_exists(d):
+        return None
+    try:
+        meta = json.loads((d / RCV.BRANCH_META).read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return f"{RCV.BRANCH_META} đọc không được ({e!r})"
+    if meta.get("format") != RCV.FORMAT:
+        return (f"nhánh ghi ở format {meta.get('format')!r}, code hiện tại dựng "
+                f"{RCV.FORMAT!r} — kiến trúc đã đổi")
+    if stage0_dir is not None and RCV.stage0_exists(Path(stage0_dir)):
+        s0 = json.loads((Path(stage0_dir) / RCV.STAGE0_META).read_text(encoding="utf-8"))
+        want = RCV.spec_fingerprint(dict(s0["spec"]))
+        have = str(meta.get("spec_fingerprint") or "")
+        if want != have:
+            return (f"nhánh dựng theo spec {have[:12] or '?'}, Stage 0 hiện tại là "
+                    f"{want[:12]}")
+    return None
+
+
+def already_trained(out_dir: Path, stage0_dir: Path | None = None) -> bool:
+    """Có weight B dùng được NGAY cho lần chạy này? (`stage0_dir` -> kiểm cả spec)."""
+    d = Path(out_dir)
+    if not ((d / "adapter_model.safetensors").exists()
+            and (d / "train_stats.json").exists() and RCV.branch_exists(d)):
+        return False
+    return branch_stale(d, stage0_dir) is None
 
 
 def _ntok(labels, attention_mask) -> int:

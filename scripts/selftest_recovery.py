@@ -17,7 +17,8 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  10. không file nào trong src/ import _archive hay run_lora; runner có đường Q
  11. REPORT.md dựng được
  12. Stage 0 (weight + loader + nhãn + history) và main stage (weight + nhánh)
-     nằm trong plan đẩy Hub, giống bố cục $1
+     nằm trong plan đẩy Hub, giống bố cục $1; và weight B của một KIẾN TRÚC
+     KHÁC (format hoặc spec lệch) bị phát hiện trước khi `train` bỏ qua main stage
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
  14. lịch Stage 0 / main hiện hành, cờ --retrain-all, và hai stage KHÔNG dùng
      chung khoá batch nào (micro + điểm đo riêng, không vào vân tay)
@@ -346,7 +347,7 @@ def _():
         assert "‖ **Q** ‖" in s and "bertscore_f1" in s
 
 
-@check("12. lưu như $1: Stage 0 (weight + loader + nhãn) và main stage (weight + fixture) vào plan đẩy Hub")
+@check("12. lưu như $1: Stage 0 + main stage vào plan đẩy Hub; weight B lệch format/spec bị phát hiện")
 def _():
     import torch
 
@@ -381,6 +382,32 @@ def _():
                   "recovery_branch.json", "train_stats.json"):
             assert f"{base}/weights/{aid}/{f}" in plan, f
         assert "recovery_branch.safetensors" in WEIGHT_FILES
+
+        # ── weight B CŨ của một kiến trúc khác phải bị phát hiện ───────────
+        # Không bắt ở đây thì `train` bỏ qua main stage, nhảy sang sinh với
+        # nhánh cũ và NỐI TIẾP dự đoán của mạng cũ vào cùng một file.
+        import json as _json
+
+        from src.train_recovery import already_trained, branch_stale
+
+        s0ck = d / s0.CKPT
+        assert branch_stale(bdir, s0ck) is None
+        assert already_trained(bdir, s0ck) is True
+        # (a) format cũ -> stale
+        mp = bdir / R.BRANCH_META
+        meta = _json.loads(mp.read_text(encoding="utf-8"))
+        mp.write_text(_json.dumps(dict(meta, format="rgexp.recovery/4")), encoding="utf-8")
+        assert "format" in (branch_stale(bdir, s0ck) or "")
+        assert already_trained(bdir, s0ck) is False
+        assert already_trained(bdir) is False          # không cần Stage 0 để thấy
+        mp.write_text(_json.dumps(meta), encoding="utf-8")
+        assert already_trained(bdir, s0ck) is True
+        # (b) format khớp nhưng Stage 0 dựng spec KHÁC -> vẫn stale
+        sp2 = small_spec(n_query=7)
+        assert R.spec_fingerprint(sp2) != R.spec_fingerprint(sp)
+        R.save_stage0(R.SupervisedBlock(sp2), s0ck, {})
+        assert "spec" in (branch_stale(bdir, s0ck) or "")
+        assert already_trained(bdir, s0ck) is False
     _ = torch
 
 

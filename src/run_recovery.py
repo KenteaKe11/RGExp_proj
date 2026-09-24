@@ -502,7 +502,16 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
             manifest["pulled_b"] = hub_sync.pull(cfg, run_dir, adapter_root, fx, [B],
                                                  n_test)
     b_dir = adapter_root / B["id"]
-    trained = tz.already_trained(b_dir)
+    s0dir = s0.stage0_dir(cfg)
+    # Weight B cũ có thể là của một KIẾN TRÚC KHÁC (đổi `recovery.*`, chạy lại
+    # Stage 0). Phải phát hiện TẠI ĐÂY: bỏ qua thì `train` nhảy thẳng sang sinh
+    # với nhánh cũ và nối tiếp dự đoán của mạng cũ vào cùng một file.
+    stale = tz.branch_stale(b_dir, s0dir / s0.CKPT)
+    if stale:
+        print(f"  ⚠ weight của {B['id']} đã có nhưng KHÔNG dùng được: {stale}.\n"
+              f"    -> huấn luyện lại main stage, và dự đoán cũ sẽ bị cho về "
+              f"`.stale` (không chấm chung).", flush=True)
+    trained = tz.already_trained(b_dir, s0dir / s0.CKPT)
     need_train = "train" in stages and (a.retrain or not trained)
     need_infer = "infer" in stages and (
         need_train or _count_preds(run_dir / "predictions" / f"{B['id']}.jsonl") < n_test)
@@ -546,7 +555,6 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
                            "fingerprint": fx_mod.load_loader(fx)["fingerprint"]}
 
     # ── Stage 0 ────────────────────────────────────────────────────────────
-    s0dir = s0.stage0_dir(cfg)
     if need_stage0 and pull and not a.restage0:
         # `--refinal`: chưa có base cục bộ thì kéo base từ Hub rồi chạy epoch n+1.
         pull_stage0(cfg, base_only=a.refinal)
