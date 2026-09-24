@@ -34,13 +34,15 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
    lớp cuối): phép đọc tuyến tính bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra
    token vô nghĩa.
-3. [Visual] Chain rule từ Q VÒNG QUA Recovery: ∂y/∂X đi theo đường
-   y -> Q -> Recovery -> X (X = 4096 patch của SigLIP, lưới 64×64) —
-   "Q rút thông tin từ vùng nào của ảnh". Đường `y -> Z -> projector -> X` KHÔNG
-   vẽ nữa (vision tower + projector đóng băng, Z không bị đụng -> bản đồ ấy của B
-   giống hệt của A); số thô của nó vẫn lưu trong `lens_maps.npz` (`sal_z`) và
-   được tóm tắt thành hai con số tương quan / IoU ở mục "Kiểm nhanh".
-   Hai đường tách nhau bằng hai lá gradient riêng cho cùng một X (xem `analyze`).
+3. [Visual] BỐN ô đối chứng trên cùng một ảnh, tất cả trên lưới 64×64 của 4096
+   patch SigLIP: (1) ảnh gốc; (2) HOẠT ĐỘ đầu ra SigLIP `‖X_p − X̄‖` — không
+   gradient, không dính decoder; (3) `‖∂y/∂X‖` qua đường `y -> Z -> projector ->
+   X`; (4) `‖∂y/∂X‖` qua đường `y -> Q -> Recovery -> X`. Ba câu hỏi xếp chồng:
+   *đầu ra SigLIP có gì để học* -> *adapter rút được gì qua đường cũ* -> *Recovery
+   rút được gì*. Ô 2 khác bản chất hai ô sau (hoạt độ vs độ nhạy) nên mỗi ô tự
+   chuẩn hoá [0,1]: chỉ so hình dạng, so định lượng bằng tương quan / IoU ở mục
+   "Kiểm nhanh". Hai đường gradient tách nhau bằng hai lá riêng cho cùng một X
+   (xem `analyze`).
 """
 from __future__ import annotations
 
@@ -246,7 +248,17 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
         g = leaf.grad[0].float().norm(dim=-1).detach().cpu().numpy()
         return g[: n * n].reshape(n, n)
 
+    # Bản đồ HOẠT ĐỘ của chính đầu ra SigLIP — KHÔNG gradient, không phụ thuộc
+    # decoder: ‖X_p − X̄‖ trên từng patch. Trừ patch trung bình vì X có một thành
+    # phần nền chung rất lớn ở mọi vị trí; giữ nguyên thì bản đồ gần như phẳng và
+    # không đọc được gì. Đây là mốc "encoder còn phân biệt được gì trên ảnh này"
+    # TRƯỚC khi có projector hay Recovery.
+    xv = vis[0].float().detach()
+    act = (xv - xv.mean(dim=0, keepdim=True)).norm(dim=-1).cpu().numpy()
+    act = act[: n * n].reshape(n, n)
+
     return {"layer_sens": sens, "sal_z": grid(leaf_z), "sal_recovery": grid(leaf_r),
+            "act_siglip": act,
             "hidden_last": np.stack([h[0, -1].float().detach().cpu().numpy()
                                      for h in hs[1:]]),
             "y": float(y.detach()), "target": tgt_info,
@@ -386,11 +398,26 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
     return path
 
 
-def plot_visual(item: dict, q_map: np.ndarray, path: Path, cfg_l: dict) -> Path:
-    """Ảnh gốc + MỘT bản đồ: ‖∂y/∂X‖ đi vòng qua Q.
+def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
+    """BỐN ô đối chứng nhau trên cùng một ảnh — ba chặng của cùng một đường đi.
 
-    Độ mờ theo TỪNG ĐIỂM: alpha = `overlay_alpha` × m (m đã chuẩn hoá [0,1]), nên
-    chỗ không nhạy gần như trong suốt và ảnh gốc vẫn đọc được, chỗ nhạy mới ăn màu.
+    1. **ảnh gốc** — mốc để đọc ba ô còn lại.
+    2. **đầu ra SigLIP**: ‖X_p − X̄‖, bản đồ HOẠT ĐỘ, không gradient, không dính
+       tới decoder. Vision tower đóng băng nên ô này là *chất lượng đầu vào*:
+       encoder còn phân biệt được gì trên ảnh này TRƯỚC khi qua bất cứ nhánh nào.
+       Phẳng lì ở đây thì hai ô sau có sáng cũng không thể là thông tin ảnh.
+    3. **Z**: ‖∂y/∂X‖ theo đường `y → Z → projector → X` — đường cũ, đo xem
+       decoder (đã finetune LoRA) rút được gì qua 256 token ảnh.
+    4. **Q**: ‖∂y/∂X‖ theo đường `y → Q → Recovery → X` — nhánh mới.
+
+    Ba câu hỏi xếp chồng: *có gì để học* (2) → *adapter học được gì qua đường cũ*
+    (3) → *Recovery học được gì* (4). Ô 2 KHÁC BẢN CHẤT hai ô sau (hoạt độ, không
+    phải độ nhạy; đơn vị khác hẳn) nên MỖI ô tự chuẩn hoá [0,1] — chỉ so HÌNH
+    DẠNG giữa các ô, tuyệt đối không so độ sáng. Số để so định lượng nằm ở mục
+    "Kiểm nhanh" (tương quan / IoU), không đọc bằng mắt.
+
+    Độ mờ theo TỪNG ĐIỂM: alpha = `overlay_alpha` × m, nên chỗ không nhạy gần như
+    trong suốt và ảnh gốc vẫn đọc được, chỗ nhạy mới ăn màu.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -401,22 +428,33 @@ def plot_visual(item: dict, q_map: np.ndarray, path: Path, cfg_l: dict) -> Path:
         img = np.asarray(im.convert("L"), dtype=float) / 255.0
     H, W = img.shape
     cmap = plt.get_cmap(cfg_l["cmap"])
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.9), dpi=150)
+    # "mean(X)" chứ không phải "X̄": dấu ngang kết hợp (U+0304) không có trong
+    # font mặc định của matplotlib nên nó rơi mất, thành "X" trần gây hiểu nhầm.
+    panels = [("đầu ra SigLIP\n‖X_p − mean(X)‖ · hoạt độ, không gradient",
+               res.get("act_siglip")),
+              ("Z\ny → Z → projector → X", res.get("sal_z")),
+              ("Q\ny → Q → Recovery → X", res.get("sal_recovery"))]
+    panels = [(t, m) for t, m in panels if m is not None]
+    fig, axes = plt.subplots(1, 1 + len(panels), dpi=150,
+                             figsize=(3.45 * (1 + len(panels)), 4.1))
+    axes = np.atleast_1d(np.asarray(axes)).ravel()
     axes[0].imshow(img, cmap="gray", vmin=0, vmax=1)
-    axes[0].set_title("ảnh gốc", fontsize=9)
+    axes[0].set_title("1. ảnh gốc", fontsize=9)
     axes[0].axis("off")
-    m = _norm01(q_map, cfg_l["percentile_clip"])
-    big = np.asarray(Image.fromarray((m * 255).astype("uint8")).resize(
-        (W, H), Image.BILINEAR), dtype=float) / 255.0
-    rgba = cmap(big)
-    rgba[..., 3] = np.clip(big, 0.0, 1.0) * float(cfg_l["overlay_alpha"])
-    axes[1].imshow(img, cmap="gray", vmin=0, vmax=1)
-    axes[1].imshow(rgba, interpolation="bilinear")
-    axes[1].set_title("Q qua Recovery — y → Q → Recovery → X", fontsize=9)
-    axes[1].axis("off")
+    for k, (title, mp) in enumerate(panels, start=1):
+        m = _norm01(np.asarray(mp), cfg_l["percentile_clip"])
+        big = np.asarray(Image.fromarray((m * 255).astype("uint8")).resize(
+            (W, H), Image.BILINEAR), dtype=float) / 255.0
+        rgba = cmap(big)
+        rgba[..., 3] = np.clip(big, 0.0, 1.0) * float(cfg_l["overlay_alpha"])
+        axes[k].imshow(img, cmap="gray", vmin=0, vmax=1)
+        axes[k].imshow(rgba, interpolation="bilinear")
+        axes[k].set_title(f"{k + 1}. {title}", fontsize=8.5)
+        axes[k].axis("off")
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
     cb = fig.colorbar(sm, ax=list(axes), fraction=0.02, pad=0.01)
-    cb.set_label("‖∂y/∂X‖ đã chuẩn hoá", fontsize=8)
+    cb.set_label("chuẩn hoá [0,1] theo TỪNG ô — không so độ sáng giữa các ô",
+                 fontsize=7.5)
     fig.suptitle(f"Lens · {item['key']} · {item['n_pos']} pos · {item['n_unc']} unc",
                  fontsize=10)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -485,18 +523,16 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
     figs = {}
     try:
         figs["layers"] = plot_layers(res, d / "figures" / "lens_layers.png", lc)
-        figs["visual"] = plot_visual(item, res["sal_recovery"],
+        figs["visual"] = plot_visual(item, res,
                                      d / "figures" / "lens_visual.png", lc)
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ vẽ hình hỏng: {e!r}", flush=True)
 
     # ── số liệu thô ────────────────────────────────────────────────────────
     raw = {"layer_sens": res["layer_sens"], "sal_recovery": res["sal_recovery"]}
-    if res.get("sal_z") is not None:
-        # Đường y → Z → projector → X: KHÔNG vẽ nữa (vision tower + projector
-        # đóng băng, nên bản đồ này của B giống hệt A và không nói gì về nhánh).
-        # Vẫn lưu số thô để đối chiếu "Q có nhìn cùng chỗ với encoder không".
-        raw["sal_z"] = res["sal_z"]
+    for k in ("sal_z", "act_siglip"):
+        if res.get(k) is not None:
+            raw[k] = res[k]
     np.savez_compressed(d / "lens_maps.npz", **raw)
     pd.DataFrame([{"arm": bid, "layer": r["layer"],
                    "tokens": " | ".join(r["tokens"]),
@@ -546,6 +582,27 @@ def diagnostics(res: dict) -> dict:
         out["top10_iou"] = float((s1 & s2).sum() / max(int((s1 | s2).sum()), 1))
         out["recovery_energy_ratio"] = float(
             np.linalg.norm(x) / max(np.linalg.norm(y), 1e-12))
+    a = res.get("act_siglip")
+    if a is not None:
+        av = np.asarray(a).ravel()
+        # "đầu ra SigLIP có còn cấu trúc không": phẳng lì -> max/mean ≈ 1 và 10%
+        # patch nóng nhất chỉ gánh ≈ 10% tổng hoạt độ. Có cấu trúc -> cả hai lớn hơn.
+        srt = np.sort(av)[::-1]
+        k10 = max(1, int(round(0.1 * av.size)))
+        out["siglip_activity"] = {
+            "max_over_mean": float(srt[0] / max(float(av.mean()), 1e-12)),
+            "top10_share": float(srt[:k10].sum() / max(float(av.sum()), 1e-12)),
+        }
+        # Hình dạng của ô 2 so với ô 3 / ô 4: cùng vùng hay lệch nhau.
+        cs = {}
+        for key, mm in (("z", m2), ("recovery", m1)):
+            if mm is None:
+                continue
+            w = np.asarray(mm).ravel()
+            cs[key] = (float(np.corrcoef(av, w)[0, 1])
+                       if av.std() and w.std() else None)
+        if cs:
+            out["siglip_corr"] = cs
     return out
 
 
@@ -570,9 +627,9 @@ def reading_guide(out: dict, res: dict) -> list[str]:
          "**Thứ tự đọc**: (0) kiểm nhanh bên dưới → (1) heatmap đủ lớp để biết "
          "decoder đọc khối **Q** ở lớp nào, mạnh bằng bao nhiêu so với token ảnh → "
          "(2) bảng logit lens ở đúng những lớp ấy để xem nó đang nghiêng về TỪ gì → "
-         "(3) bản đồ ảnh để xem Q rút thông tin từ vùng nào. Ba tầng trả lời ba câu "
-         "khác nhau: *decoder có đọc Q không*, *Q đẩy vào chữ gì*, *Q lấy từ chỗ nào "
-         "trên ảnh*.\n",
+         "(3) bốn ô đối chứng trên ảnh: hoạt độ đầu ra SigLIP → bản đồ của Z → bản đồ "
+         "của Q. Ba tầng trả lời ba câu khác nhau: *decoder có đọc Q không*, *Q đẩy "
+         "vào chữ gì*, *SigLIP có gì để học và Z / Q lấy được từ chỗ nào trên ảnh*.\n",
          "**Chỉ có candidate B ở đây.** Z của B giống A từng bit (nhánh không đụng "
          "vào 256 token ảnh) và chuỗi chỉ dài thêm khối Q — nên **Q chính là phần "
          "B − A**, không cần chạy A rồi trừ. Con số A/B nằm ở `REPORT.md`.\n",
@@ -589,7 +646,7 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     if dg.get("q_token_share") is not None:
         rows.append(["phần độ nhạy nằm trên khối Q",
                      f"{100 * dg['q_token_share']:.1f}%",
-                     "≈0 = decoder bỏ qua 128 vector mới (nhánh chưa nói gì); "
+                     "≈0 = decoder bỏ qua khối learner (nhánh chưa nói gì); "
                      "cao = nó đang đọc Q thật"])
     if qv:
         rows.append([f"số vector Q gánh 50% độ nhạy (trên {qv.get('n')})",
@@ -609,6 +666,23 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     if dg.get("top10_iou") is not None:
         rows.append(["IoU 10% patch nóng nhất (Q vs encoder)", f"{dg['top10_iou']:.2f}",
                      "đo cùng chuyện nhưng chỉ trên vùng nóng"])
+    sa = dict(dg.get("siglip_activity") or {})
+    if sa:
+        rows.append(["đầu ra SigLIP — max/mean hoạt độ",
+                     f"{sa.get('max_over_mean', float('nan')):.1f}",
+                     "≈1 = bản đồ phẳng lì, encoder không phân biệt được vùng nào "
+                     "với vùng nào trên ảnh này — ô 2 của hình 3 vô nghĩa, và hai ô "
+                     "sau có sáng cũng không thể là thông tin ảnh"])
+        rows.append(["đầu ra SigLIP — 10% patch nóng nhất gánh",
+                     f"{100 * sa.get('top10_share', float('nan')):.0f}%",
+                     "≈10% = phẳng; càng cao càng tập trung vào một vùng hẹp"])
+    sc = dict(dg.get("siglip_corr") or {})
+    for key, lab in (("z", "Z"), ("recovery", "Q")):
+        if sc.get(key) is not None:
+            rows.append([f"tương quan bản đồ {lab} với hoạt độ SigLIP",
+                         f"{sc[key]:+.2f}",
+                         f"gần 1 = {lab} bám đúng chỗ encoder vốn đã có tín hiệu "
+                         f"mạnh; gần 0 = {lab} đang lấy từ vùng encoder coi là nền"])
     L.append("| đại lượng | giá trị | đọc thế nào |\n|---|---|---|")
     L += ["| " + " | ".join(r) + " |" for r in rows]
     if pk:
@@ -719,32 +793,49 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "cuối, nơi mọi đường đã trộn vào nhau. Câu \"Q có được đọc không\" trả lời ở "
           "hình 1, không phải ở đây.\n"]
 
-    L.append("## 3. [Visual] Chain rule từ Q về ảnh\n")
+    L.append("## 3. [Visual] Bốn ô đối chứng — SigLIP → Z → Q\n")
     if figs.get("visual"):
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
-    L += ["Bản đồ là `‖∂y / ∂X_p‖₂` trên 4096 patch của SigLIP, xếp lại thành lưới "
-          "64×64 rồi chồng lên ảnh gốc "
-          f"(alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị {lc['percentile_clip']}), "
-          "đi theo đường\n",
-          "```\ny → Q → Recovery → X\n```\n",
-          "**Chỉ một bản đồ, và nó nói về chính Q.** Đường thứ hai của §2.0 "
-          "(`y → Z → projector → X`) không được vẽ nữa: vision tower và projector đều "
-          "đóng băng và Z không bị nhánh đụng vào, nên bản đồ ấy của B giống hệt của A "
-          "và không nói gì về Recovery. Số thô của nó vẫn nằm trong `lens_maps.npz` "
-          "(`sal_z`) để đối chiếu, và hai dòng \"tương quan\" / \"IoU\" ở mục Kiểm "
-          "nhanh đã tóm tắt phép đối chiếu ấy thành hai con số.\n",
+    L += ["Tất cả đều trên **4096 patch của SigLIP**, xếp lại thành lưới 64×64 rồi "
+          f"chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị "
+          f"{lc['percentile_clip']}):\n",
+          "| ô | đại lượng | hỏi gì |\n|---|---|---|",
+          "| 1 | ảnh gốc | mốc để đọc ba ô còn lại |",
+          "| 2 | `‖X_p − X̄‖` — **hoạt độ**, KHÔNG gradient | đầu ra SigLIP còn phân "
+          "biệt được gì trên ảnh này, **trước** khi qua Recomb |",
+          "| 3 | `‖∂y/∂X‖` qua `y → Z → projector → X` | adapter (LoRA đã finetune) "
+          "rút được gì qua đường cũ |",
+          "| 4 | `‖∂y/∂X‖` qua `y → Q → Recovery → X` | Recovery rút được gì |",
+          "",
+          "Ba câu hỏi **xếp chồng**: có gì để học (2) → đường cũ dùng được bao nhiêu "
+          "(3) → nhánh mới thêm được gì (4). Trừ patch trung bình ở ô 2 vì X có một "
+          "thành phần nền chung rất lớn ở mọi patch; giữ nguyên thì bản đồ phẳng lì "
+          "vì cái nền ấy chứ không phải vì encoder mù.\n",
+          "**Ô 2 khác BẢN CHẤT hai ô sau** — hoạt độ, không phải độ nhạy, đơn vị khác "
+          "hẳn — nên mỗi ô **tự chuẩn hoá [0,1]**. Chỉ so **hình dạng** giữa các ô; "
+          "so định lượng thì đọc mấy dòng tương quan / IoU ở mục Kiểm nhanh, đừng đọc "
+          "bằng mắt.\n",
           "**Đọc hình 3 thế nào.**\n",
-          "1. Sáng = y nhạy với patch đó **qua đường Q**; tối/trong suốt = Q không rút "
-          "gì từ vùng đó. Đây là **độ nhạy**, KHÔNG phải \"model nhìn vào đây\" theo "
-          "nghĩa nhân quả, và cũng không phải phân đoạn tổn thương.\n",
-          "2. Nếu \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm nhanh ≈ 0 thì hình này "
-          "là nhiễu — decoder chưa đọc Q, đọc bản đồ của nó là đọc số 0 phóng to.\n",
-          "3. Vùng sáng trùng vùng encoder hay lệch đi, đọc bằng hai con số tương quan "
-          "/ IoU chứ không bằng mắt: mỗi bản đồ tự chuẩn hoá [0,1].\n",
-          "4. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 8 px của ảnh gốc 512). "
-          "Đừng đọc chi tiết nhỏ hơn một ô.\n",
-          "Số thô: `lens_maps.npz` (`layer_sens`, `sal_recovery`, `sal_z`), "
-          "`lens.json`, `logit_lens.csv`.\n",
+          "1. **Ô 2 trước tiên.** Phẳng lì (max/mean ≈ 1, 10% patch nóng nhất gánh "
+          "≈10%) = encoder không phân biệt được vùng nào với vùng nào trên ảnh này; "
+          "khi đó ô 3 và ô 4 có sáng cũng KHÔNG thể là thông tin ảnh, và phần hỏng "
+          "nằm ở trước Recomb chứ không phải ở Recovery.\n",
+          "2. **Ô 3 so ô 2**: đường cũ có bám vào chỗ encoder vốn đã có tín hiệu "
+          "mạnh không. Bám sát = adapter đang dùng được đầu ra SigLIP. Lệch hẳn = nó "
+          "đang lấy từ vùng encoder coi là nền.\n",
+          "3. **Ô 4 so ô 3**: đây là câu về chính Recovery. Trùng ô 3 = nhánh đang "
+          "khuếch đại đúng thứ decoder đã có (không hẳn là vô dụng, nhưng không mang "
+          "vào cái gì MỚI). Lệch đi mà vẫn bám ô 2 = nhánh rút được vùng đường cũ bỏ "
+          "sót — đúng việc nó sinh ra để làm. Lệch cả ô 2 lẫn ô 3 = nhiều khả năng là "
+          "nhiễu.\n",
+          "4. Nếu \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm nhanh ≈ 0 thì ô 4 là "
+          "nhiễu — decoder chưa đọc Q, đọc bản đồ của nó là đọc số 0 phóng to.\n",
+          "5. Sáng ở ô 3/ô 4 = y **nhạy** với patch đó, KHÔNG phải \"model nhìn vào "
+          "đây\" theo nghĩa nhân quả, và cũng không phải phân đoạn tổn thương.\n",
+          "6. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 8 px của ảnh gốc "
+          "512). Đừng đọc chi tiết nhỏ hơn một ô.\n",
+          "Số thô: `lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, "
+          "`sal_recovery`), `lens.json`, `logit_lens.csv`.\n",
           "## Giới hạn\n",
           "- Một ảnh, chọn vì nhiều `pos`/`uncertain` — MINH HOẠ, không phải bằng chứng "
           "thống kê. Kết luận A/B vẫn nằm ở `REPORT.md`.\n",

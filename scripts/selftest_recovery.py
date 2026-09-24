@@ -742,7 +742,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), một bản đồ Q, Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), hình 3 gồm 4 ô (gốc / SigLIP / Z / Q), Lens_Explain.md")
 def _():
     import json
     import types
@@ -843,6 +843,11 @@ def _():
     assert ra["sal_recovery"] is None and rb["sal_recovery"] is not None
     assert ra["sal_z"].shape == (8, 8) and rb["sal_recovery"].shape == (8, 8)
     assert np.isfinite(rb["sal_recovery"]).all() and rb["sal_recovery"].sum() > 0
+    # ô 2 của hình 3: hoạt độ SigLIP — có ở CẢ hai lượt vì nó không cần nhánh
+    for r in (ra, rb):
+        assert r["act_siglip"].shape == (8, 8)
+        assert np.isfinite(r["act_siglip"]).all()
+    assert np.allclose(ra["act_siglip"], rb["act_siglip"])     # cùng một X
     # Q nằm SAU khối ảnh -> vị trí của token ảnh KHÔNG đổi
     assert ra["image_span"] == rb["image_span"] == [2, 1 + NZ]
     assert rb["insert_span"] == [2 + NZ, 2 + NZ + NQ], rb["insert_span"]
@@ -866,7 +871,7 @@ def _():
         lc = LZ.lcfg(cfg)
         assert lc["layer_frac"] == 0.25
         figs = {"layers": LZ.plot_layers(rb, t / "figures" / "lens_layers.png", lc),
-                "visual": LZ.plot_visual(item, rb["sal_recovery"],
+                "visual": LZ.plot_visual(item, rb,
                                          t / "figures" / "lens_visual.png", lc)}
         A, B = {"id": "a"}, {"id": "b"}
         dg = LZ.diagnostics(rb)
@@ -876,6 +881,9 @@ def _():
         assert 1 <= dg["q_vector_share"]["n_active_50pct"] <= NQ
         assert 1 <= dg["peak"]["layer"] <= L
         assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["recovery_energy_ratio"] > 0
+        assert dg["siglip_activity"]["max_over_mean"] >= 1.0
+        assert 0.0 <= dg["siglip_activity"]["top10_share"] <= 1.0
+        assert set(dg["siglip_corr"]) == {"z", "recovery"}
         out = {"lens": lc, "diagnostics": dg, "reference_arm": "a",
                "arm": {"id": "b", "y": rb["y"], "n_tokens": T + NQ, "layers": L,
                        "image_span": rb["image_span"],
@@ -888,6 +896,7 @@ def _():
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
+                     "hoạt độ", "đầu ra SigLIP", "act_siglip",
                      "y → Q → Recovery → X", "`Q[0]`"):
             assert need in doc, need
         # bản đồ encoder KHÔNG còn được vẽ, nhưng số thô vẫn nhắc tới

@@ -190,20 +190,27 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    `lens.layer_frac`** (1/4 lớp cuối, làm tròn lên → 9/34): phép đọc tuyến tính
    bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra token vô nghĩa. Đầy đủ ở
    `logit_lens.csv`.
-3. **[Visual] Chain rule từ Q về ảnh** — `y → Q → Recovery → X`, chuẩn
-   gradient trên 4096 patch → lưới 64×64 → chồng lên ảnh gốc. **Một bản đồ duy
-   nhất, và nó nói về chính Q.** Đường `y → Z → projector → X` không vẽ nữa
-   (vision tower + projector đóng băng, Z không bị đụng → bản đồ ấy của B giống
-   hệt của A); số thô vẫn ở `lens_maps.npz` (`sal_z`) và được tóm tắt thành hai
-   con số tương quan / IoU ở mục "Kiểm nhanh".
+3. **[Visual] Bốn ô đối chứng — SigLIP → Z → Q**, tất cả trên 4096 patch của
+   SigLIP → lưới 64×64 → chồng lên ảnh gốc: (1) **ảnh gốc**; (2) **hoạt độ đầu
+   ra SigLIP** `‖X_p − X̄‖` — KHÔNG gradient, không dính decoder; (3) **Z**,
+   `‖∂y/∂X‖` qua `y → Z → projector → X`; (4) **Q**, `‖∂y/∂X‖` qua
+   `y → Q → Recovery → X`. Ba câu hỏi xếp chồng: *đầu ra SigLIP có gì để học*
+   (trước Recomb) → *adapter rút được gì qua đường cũ* → *Recovery rút được gì*.
+   Ô 2 trừ patch trung bình vì X có thành phần nền chung rất lớn; phẳng lì ở ô 2
+   (max/mean ≈ 1) nghĩa là phần hỏng nằm TRƯỚC Recomb.
 
-Hai đường tách được vì cùng một X đi vào **hai lá gradient riêng**. Độ mờ overlay
-theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn đọc được.
+Ô 2 khác bản chất hai ô sau (hoạt độ vs độ nhạy) nên **mỗi ô tự chuẩn hoá
+[0,1]**: chỉ so hình dạng, so định lượng bằng tương quan / IoU ở "Kiểm nhanh".
+Hai đường gradient tách được vì cùng một X đi vào **hai lá gradient riêng**. Độ
+mờ overlay theo từng điểm (`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn
+đọc được.
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
 chỉ vài trong 256 learner làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
-encoder‖`, tương quan và IoU giữa hai bản đồ.
+encoder‖`, tương quan và IoU giữa hai bản đồ, cộng hai dòng về **hoạt độ đầu ra
+SigLIP** (max/mean, 10% patch nóng nhất gánh bao nhiêu) và tương quan của Z / Q
+với hoạt độ ấy.
 
 Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
 `figures/lens_layers.png`, `figures/lens_visual.png`, `logit_lens.csv`,
