@@ -1,0 +1,448 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.2 V-EXTRACTOR — [Z ‖ T] vs [Z ‖ Q ‖ T] — CONFIG NỘI DUNG
+# ═════════════════════════════════════════════════════════════════════════════
+# Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
+# QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 256 learner vector Q ngay sau 256
+# token ảnh có đổi chất lượng báo cáo không?
+#
+#   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
+#                                    tem khớp), KHÔNG huấn luyện lại.
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (pretrain V-Extractor + Cls Head, ASL)
+#                                    -> main stage y hệt A + nhánh V-Extractor.
+#
+# Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
+# với Q = V-Extractor(ảnh 512²) — 256 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# 256 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# tạo 0: Q mang sẵn thông tin Stage 0 ngay từ bước 0 — đó chính là việc Stage 0
+# sinh ra để làm. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
+# Holm trên các metric (`src/stats_ab.py`).
+#
+# KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
+# lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
+# đây nhánh có encoder RIÊNG (ResNet50 ăn ảnh 512²) — và chuỗi dài thêm 256.
+#
+# Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
+# generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
+# (_archive/v2/configs/lora.yaml) — vân tay fixture của file này PHẢI trùng $1
+# (selftest kiểm), nếu không thì B không đứng cùng bảng với A được.
+# Phần riêng của §2.2 nằm ở các khối `labels`, `stage0`, `vextractor`, `vextractor_exp`.
+#
+#   bash scripts/run_vextractor.sh train    # kéo A từ $1 -> Stage 0 -> main -> sinh -> chấm
+#   bash scripts/run_vextractor.sh stats    # bootstrap + permutation -> REPORT.md (GHI ĐÈ)
+#   bash scripts/run_vextractor.sh push     # -> current/$2.2_V-Extractor_Test/
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+experiment: "vextractor"
+
+# ── Dữ liệu — điều kiện 2 ──────────────────────────────────────────────────
+# Khoá cứng. Ba candidate đọc CÙNG hai file split; `assert_no_leak` là hàng
+# rào cơ học chứ không phải một lời hứa trong README.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  # HỒ val: 2000 mẫu được tải về và giữ trong cache. Mỗi lần eval bốc RANDOM
+  # `train.eval.n_samples` (256) trong hồ này — xem khối `train.eval`.
+  n_val: 2000
+  assert_no_leak: true
+
+# ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
+# R2Gen (ResNet-101) và AdaAtt (ResNet-152) đều quen 224; Gemma 3 xử lý ở 896.
+# Ba con số khác nhau, và đó KHÔNG phải lý do để mỗi model tự resize theo cách
+# của nó: nếu R2Gen dùng RandomCrop còn Gemma dùng bilinear-longest-side thì
+# một phần chênh lệch trong bảng là chênh lệch của hai bộ tiền xử lý, không
+# phải của hai kiến trúc.
+#
+# Nên: MỘT lần resize dùng chung, ở `resize_to`, trước khi bất kỳ processor
+# riêng nào chạm vào ảnh. `allow_native_match: false` nghĩa là ngay cả khi một
+# model đòi đúng `resize_to` thì ảnh vẫn đi qua đường chung ấy — "vô tình
+# khớp" không được phép biến thành một đường tiền xử lý thứ hai.
+image_policy:
+  unified: true
+  resize_to: 512              # cạnh dài; khớp `data.image_max_side`
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  # Sau bước chung, mỗi model chỉ còn được phép chuẩn hoá giá trị pixel theo
+  # thống kê của backbone nó (ImageNet mean/std cho ResNet, SigLIP cho Gemma).
+  # Đó là phép biến đổi trên GIÁ TRỊ, không phải trên HÌNH HỌC.
+  per_model_normalize_only: true
+
+# ══════════════════════════════════════════════════════════════════════════
+# CANDIDATE C — MY GEMMA
+# ══════════════════════════════════════════════════════════════════════════
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_vextractor
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+# ── Giải mã — MỘT đặc tả cho CẢ BA candidate (`src/decoding_spec.py`) ─────
+# My Gemma đưa khối này cho `transformers.generate`; R2Gen/AdaAtt đưa nó cho
+# `src/sota/decoding.beam_search`, vốn cài lại ĐÚNG luật beam search của
+# transformers — kể cả lúc chọn checkpoint trên val. Khối `sota.*.decoding`
+# bên dưới chỉ còn là bản ghi của paper (điều kiện 1) và KHÔNG được đọc; chỗ
+# lệch (block_trigrams của R2Gen) vào `manifest.deviations`.
+#
+# Mọi khoá phải khai TƯỜNG MINH: generation_config.json của Gemma 3 khai
+# sampling, và một khoá bỏ trống là để nó chen vào.
+#
+# Khác biệt duy nhất: độ dài tối đa. `max_new_tokens` là của My Gemma
+# (subword); R2Gen/AdaAtt dừng ở `max_seq_length − 1` = 59 từ của từ điển.
+#
+# Với MoE, trọng số định tuyến của mỗi ảnh được nhân bản theo beam
+# (`moe.RoutingContext.set(..., repeat=num_beams)`). Beam nhân số chuỗi trong
+# một lượt sinh lên 3 lần: hết VRAM thì hạ `base.batch_size`.
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 3
+  length_penalty: 1.0          # điểm = tổng log-prob / (số token sinh)^1
+  early_stopping: false        # heuristic dừng của transformers
+  no_repeat_ngram_size: 0      # không chặn n-gram
+  repetition_penalty: 1.0      # không phạt lặp
+  num_return_sequences: 1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LỊCH MAIN STAGE — CHÉP NGUYÊN VĂN TỪ $1 (khoá của fixture). Candidate B dùng
+# ĐÚNG khối này cho LoRA: 1 epoch, eff_bs 32, one-cycle đỉnh 1e-4, wd 0.01,
+# val 256 mẫu mỗi 25 bước. Các khoá `ft_lr`, `freeze_*`, `branch_weight_decay`,
+# `pretrained_lr_mult` là của §2.x cũ — $2 KHÔNG đọc chúng (lr của nhánh ở
+# `vextractor.main`), chúng ở lại chỉ để khối này trùng $1 từng chữ.
+# ═════════════════════════════════════════════════════════════════════════════
+train:
+  n_epochs: 1   # decoder_ft: 1 epoch
+  # Batch HIỆU DỤNG của decoder_ft. Số mẫu mỗi lượt ở configs/gpu/<card>.yaml;
+  # grad_accum = 32 / per_device_batch_size (phải chia hết).
+  effective_batch: 32
+  max_seq_len: 1024
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  logging_steps: 10
+
+  # ── Đo trên val — CHỈ để nhìn, KHÔNG chạm vào trọng số ──────────────────
+  # Mỗi `every_steps` bước (và ở bước cuối), bốc NGẪU NHIÊN `n_samples` = 256
+  # trong `data.n_val` = 2000 mẫu val rồi tính CE trên đó. Không chọn
+  # checkpoint theo val, không early stop: mọi candidate vẫn chạy ĐÚNG một
+  # epoch với cùng lịch one-cycle như README chốt — val chỉ trả lời "candidate
+  # này có bắt đầu học thuộc tập train chưa".
+  #
+  # `resample: true` = bốc lại mỗi lần eval ("mỗi lần"), nên đường val hơi
+  # nhiễu: mỗi điểm đo trên một tập 256 khác nhau. Bù lại nó phủ hết 2000 mẫu
+  # sau vài lần đo thay vì nhìn mãi một góc.
+  #
+  # Tập 256 ấy KHÔNG phụ thuộc candidate: chỉ số được sinh từ (seed, số thứ tự
+  # lần eval) chứ không từ arm id, nên ở lần eval thứ k mọi candidate đo
+  # trên ĐÚNG cùng 256 mẫu và các đường val so được với nhau. Cũng vì thế nó
+  # tái lập được: chạy lại cùng seed cho đúng những tập ấy (`seed_mix` đổi số
+  # này nếu muốn một loạt tập khác).
+  eval:
+    enabled: true
+    n_samples: 256
+    every_steps: 25
+    resample: true
+    seed_mix: 0
+  # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (1 epoch, không restart —
+  # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
+  # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
+  # rồi đầu warm-up và đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa
+  # (`round_down_sig: 1`):
+  #
+  #     nhóm                                    đầu      đỉnh      đáy
+  #     cls_head · route_head · dec_proj · FFN  1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_3 (i = n)        1e-5  -> 3e-4   -> 3e-7
+  #     recombinator_retriever_2                1e-6  -> 5.48e-5 -> 5e-8
+  #     adapter (LoRA/Experts)                  3e-6  -> 1e-4   -> 1e-7
+  #     recombinator_retriever_1 (+ Query)      3e-7  -> 1e-5   -> 1e-8  <- đáy nhỏ nhất
+  #
+  # `min_lr` là con số ĐƯỢC KIỂM (`train_recomb.ft_lrs` DỪNG nếu lệch), không
+  # phải con số được đọc.
+  schedule:
+    impl: lambda
+    max_lr: 1.0e-4          # adapter / Experts (LoRA)
+    min_lr: 1.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất (Retriever 1)
+    round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
+    pct_start: 0.1
+    div_factor: 30.0
+    final_div_factor: 33.3  # 1e-5 / 30 / 33.3 = 1.001e-8 -> làm tròn 1e-8
+    anneal: cos
+    cycle_momentum: false
+  branch_weight_decay: 0.01
+
+  # ĐIỀU KIỆN 5 — CHỈ cho R2Gen/AdaAtt (`src/train_sota.py`): phần đã pretrain
+  # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
+  pretrained_lr_mult: 0.1
+  # My Gemma · decoder_ft — lịch lr ĐƠN GIẢN (`train_recomb.ft_lrs`):
+  #   1. lr_max toàn hệ = `max_lr` (3e-4): Sup Head, Route Head, Concat Linear,
+  #      FFN của Recombinator và Retriever n. LoRA/Experts ở `schedule.max_lr`.
+  #   2. lr_max CHỈ đổi theo Retriever i = 1..n, tăng dần theo cấp số nhân:
+  #      i=1 = `retriever_first` (1e-5, kèm Learnable Query), i=n = `max_lr`.
+  #      n = 3: 1e-5 · 5.48e-5 · 3e-4. Không có hệ số Attn ở decoder_ft.
+  # Phải khai ĐÚNG hai khoá.
+  ft_lr:
+    max_lr: 3.0e-4               # lr_max toàn hệ
+    retriever_first: 1.0e-5      # Retriever 1 (+ Learnable Query)
+  # KHÔNG đóng băng gì — decoder_ft fine-tune toàn bộ. Khoá còn giữ để đối
+  # chứng khi cần (requires_grad=False + eval mode + ngoài optimizer). Nhận:
+  # recombinator · cls_head · cls_head.pooling_stack · cls_head.main_head.
+  freeze_after_pretrain: []
+  # true = đóng băng TOÀN BỘ phần đã pretrain (cả Recombinator). Ghi đè
+  # `freeze_after_pretrain`.
+  freeze_pretrained: false
+
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+# ── Chấm điểm — theo TỪNG MẪU, vì kiểm định là ghép cặp ───────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.1 — PHẦN RIÊNG (không nằm trong vân tay fixture của $1)
+# ═════════════════════════════════════════════════════════════════════════════
+vextractor_exp:
+  # A: lấy từ thí nghiệm trước. Kéo từ Hub `<hub_root>/$<hub_index>_<hub_title>_Test`
+  # (fixture + predictions + điểm, CHỈ khi tem khớp: vân tay config, sha256
+  # weight, batch sinh). Weight của A không cần tải (không sinh lại).
+  baseline:
+    id: qlora_r32_decoder
+    name: "QLoRA r=32 · full decoder ($1)"
+    method: qlora
+    rank: 32
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    hub_index: 1
+    hub_title: LoRA
+    # máy đã chạy $1: fixture + điểm cục bộ được dùng trước khi kéo Hub
+    local_adapter_dir: ./adapters_lora
+    local_run_dir: ./runs/lora_rank_target
+  # B: y như A + V-Extractor (Stage 0 + ảnh -> Q, nối [Z ‖ Q ‖ T]).
+  # true = huấn luyện lại TOÀN BỘ B: Stage 0 + main + sinh + chấm, bỏ qua mọi
+  # thứ đã có (cục bộ lẫn Hub). Tương đương cờ `--retrain-all`.
+  retrain_all: false
+  candidate:
+    id: qlora_r32_decoder_vextractor
+    name: "QLoRA r=32 · full decoder + V-Extractor (Q)"
+
+# ── Nhãn bệnh lý cho Stage 0 (csv_helper/labels.npz, `src/labels_cls.py`) ──
+labels:
+  npz: csv_helper/labels.npz
+  local_path: null
+  # labels.npz (đã soi): y_gt (157917, 14) int · y_aug · img_rel · study_id ·
+  # disease_labels (14 tên) · class_names = [positive, negative, uncertain, blank].
+  # Mã trong y_gt là CHỈ SỐ của class_names — 0 = positive, 1 = negative (KHÔNG
+  # phải mã CheXpert thô 1/0/-1). Cột "No Finding" chỉ có 0/3 -> 0 là dương.
+  key_array: img_rel
+  label_array: y_gt           # y_aug (nhãn tăng cường, có mã -1) KHÔNG dùng
+  encoding:
+    pos: [0]
+    neg: [1]
+    uncertain: [2]
+    nan_to: ignore
+  # blank (3) = bệnh không được nhắc tới (~62% số ô): không map lớp nào -> ô
+  # one-hot TOÀN 0 -> bị mask THEO Ô khỏi ASL (vextractor.CellMaskedASL) và khỏi
+  # metric val (ClsCounter). Head chỉ học trên ô được nhắc tới.
+  blank_policy: ignore
+  max_missing_frac: 0.20
+
+# ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
+# Nhánh có ENCODER RIÊNG: ResNet50 ImageNet ăn thẳng ảnh gốc resize 512×512, BN
+# thay hết bằng InstanceNorm (giữ affine đã học). Lưới conv cuối 16×16 = 256 ô
+# CHÍNH LÀ 256 vector Q — không có learner vector, không Cross-Attn. Linear
+# 2048→2560 rồi MỘT khối Self-attn pre-norm với residual cộng thẳng.
+#   `n_query` KHÔNG khai được: nó là (image_size/32)² = 256.
+vextractor:
+  n_labels: null            # null = theo labels.npz (14)
+  vextractor:               # ảnh (3, 512, 512) -> Q (256, 2560)
+    image_size: 512         # PHẢI chia hết 32. Đổi nó là đổi cả số vector Q
+    arch: resnet50          # torchvision; lần chạy đầu tải ~100 MB
+    pretrained: true        # ImageNet. false = trả lời một câu hỏi KHÁC
+    n_heads: 20             # Self-attn ở 2560: head_dim 128 (2560 = 20 × 128)
+    dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
+  cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
+    n_heads: 20             # head_dim 128 (2560 = 20 × 128)
+    dropout: 0.1
+  # Main stage — cả nhánh đã được Stage 0 dạy, nên chỉ MỘT nhóm tham số:
+  # đóng băng hoàn toàn 0.2 epoch đầu rồi học ở lr cố định. LoRA theo `train` ($1).
+  main:
+    vext_lr: 1.0e-5         # sau khi mở băng, CỐ ĐỊNH (finetune phần đã pretrain)
+    vext_wd: 0.01
+    freeze_vext_epochs: 0.2 # đóng băng HOÀN TOÀN 0.2 epoch đầu (40/200 bước)
+    separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
+
+# ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ResNet50 + một khối
+# attention. 1 + 4 + 1 = 6 epoch.
+stage0:
+  lr: 1.0e-5                # lr CHÍNH của cả nhánh (epoch 2 trở đi)
+  # ── epoch 1: "norm" ────────────────────────────────────────────────────
+  # conv/fc của ResNet ĐÓNG BĂNG, chỉ affine của InstanceNorm học ở `norm_lr`;
+  # phần NGOÀI ResNet (Linear, Self-attn, Cls Head) vẫn học ở `lr`. Việc của
+  # epoch này là kéo thống kê chuẩn hoá từ ImageNet về ảnh CXR — phép dịch/scale
+  # trên mỗi kênh, đi nhanh được vì nó không đụng đặc trưng conv.
+  #     base = norm_epochs + max_epochs = 1 + 4 = 5 epoch
+  norm_epochs: 1
+  norm_lr: 1.0e-4
+  # Từ epoch 2: mở băng TOÀN BỘ ResNet, cả hai nhóm về `lr`, có warm-up tuyến
+  # tính THEO BƯỚC trong 0.25 epoch đầu của phần này (50/200 bước) rồi phẳng.
+  warmup_epochs: 0.25
+  weight_decay: 0.03
+  max_epochs: 4             # epoch CHÍNH (sau epoch norm)
+  select: last              # LUÔN lấy epoch cuối (best = theo val)
+  # ── epoch n+1 (= 6): "final weight" ─────────────────────────────────────
+  # Sau phần base (norm + max_epochs), base/ được ĐẨY Hub ngay. Rồi chạy thêm
+  # `epochs` epoch NỐI TIẾP: giữ nguyên moment AdamW đã tích trong phần base, lr
+  # cosine lr_start -> lr_end cập nhật mỗi bước -> final/. Main stage dùng final/.
+  final_anneal:
+    enabled: true
+    epochs: 1
+    lr_start: null          # null = `stage0.lr` -> lr không nhảy nấc ở ranh
+                            # giới epoch, chỉ bắt đầu đi xuống
+    lr_end: 1.0e-7
+    schedule: cosine
+    weight_decay: 0.03
+    reset_optimizer: false  # GIỮ moment AdamW của phần base (chạy nối tiếp)
+  # Batch hiệu dụng RIÊNG của Stage 0 — trùng 32 của main stage chỉ là trùng số,
+  # không có ràng buộc nào bắt hai bên bằng nhau: batch của main stage bị khoá
+  # theo $1 (`train_batch` trong fixture), Stage 0 thì không dính gì tới A.
+  # Mảnh vật lý mỗi lượt (`stage0.micro_batch`) và điểm đo (`stage0.probe_sizes`)
+  # nằm ở config GPU và autobatch dò lại — cũng tách hẳn main stage.
+  batch_size: 32
+  max_grad_norm: 1.0
+  # val (theo dõi): sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
+  val_classes: [pos, uncertain]
+  val_n_samples: 256        # 256 mẫu bốc từ hồ val 2000 (0 = cả hồ)
+  val_resample: false       # CỐ ĐỊNH: mọi epoch đo trên ĐÚNG một tập, chỉ số
+                            # chỉ phụ thuộc seed. Đường val giữa các epoch khi
+                            # đó chỉ phản ánh model đổi, không lẫn tập đổi.
+  asl:                      # ASL one-hot 3 lớp
+    gamma_neg: {neg: 4.0, uncertain: 1.0, pos: 0.0}
+    gamma_pos: 0.0
+    clip: 0.05
+    eps: 1.0e-8
+
+# ── Kiểm định: A vs B, ghép cặp theo ảnh (`src/stats_ab.compare_all`) ──────
+#   d_i = điểm(B, ảnh i) − điểm(A, ảnh i)
+#   bootstrap ghép cặp (BCa, n_boot) -> CI95 + p_boot;  permutation đảo dấu
+#   (n_perm) -> p_perm;  Holm RIÊNG từng họ trên các metric.
+#   "Thắng" = cả hai bác H0 sau Holm VÀ |Cohen dz| >= dz_floor.
+stats:
+  method: paired
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci_method: bca
+  dz_floor: 0.10
+  metrics: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1]
+
+# ── Đồ thị A vs B (`src/report_plots_ab.py`) — như $1 nhưng 2 candidate, bar NGANG ─
+report:
+  ab_plot:
+    metrics: [bleu3, bleu4, rougeL, bertscore_f1]   # B3 · B4 · RL · BertF1
+    gamma: auto               # xếp tầng: gốc × e^(γ−1); off = không scale
+    gamma_spread: 0.18
+
+# ── Lens (`src/lens_vextractor.py`, lệnh `lens`) — MỔ KHỐI Q, minh hoạ ─────────
+# Mọi bản đồ là đạo hàm của MỘT số y (log-prob báo cáo tham chiếu), nên chỉ tốn
+# một lượt backward. CHỈ chạy candidate B: Z của B giống A từng bit, nên chênh
+# lệch A/B nằm trọn trong khối Q — Q chính là "B − A", không phải chạy A để trừ.
+# Ghi ra runs/<subdir>/Lens/Lens_Explain.md.
+lens:
+  enabled: true
+  sample: auto              # auto = ảnh test nhiều pos + uncertain nhất; hoặc key cụ thể
+  target: ref_logprob       # ref_logprob | next_token
+  top_k: 8                  # logit lens: số token mỗi lớp
+  layer_frac: 0.25          # CHỈ cho bảng top-k của logit lens (1/4 lớp cuối).
+                            # Heatmap token × lớp vẽ ĐỦ mọi lớp.
+  layer_marks: 6            # số lớp mốc in trong bảng (đầy đủ ở logit_lens.csv)
+  overlay_alpha: 0.45       # độ mờ của heatmap chồng lên ảnh gốc
+  percentile_clip: 99.0     # cắt đuôi trước khi chuẩn hoá màu
+  cmap: inferno
+  dir: Lens
+
+wandb:
+  enabled: true
+  project: rgexp-vextractor
+  entity: null
+  run_name: null
+  group: "vextractor-q"
+  resume_same_run: false
+  mode: online
+  tags: [vextractor, resnet50, qlora, r32, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  # Repo CŨ, không tạo repo mới -> current/$2.2_V-Extractor_Test/
+  #   Reports/                 REPORT.md, manifest, metrics, predictions, arms/ (tem)
+  #   fixture/                 = fixture của $1 (cùng vân tay)
+  #   weights/<B>/             adapter + vextractor_branch + vextractor_stage0 + train_stats
+  #   stage0/                  stage0_history.json
+  # A không đẩy weight (nằm ở current/$1_LoRA_Test/weights/qlora_r32_decoder).
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_root: current
+  hub_index: "2.2"
+  hub_title: V-Extractor
+  push: true
+  push_each_arm: true
+  pull: true
+  subdir: "vextractor"
+  adapter_dir: ./adapters_vextractor

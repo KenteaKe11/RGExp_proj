@@ -182,13 +182,13 @@ fi
 # KHÔNG còn trong danh sách: chúng thuộc §2.2 và đã sang _archive/ (xem
 # scripts/archive_2.2.sh). Đòi chúng ở đây là chặn setup vì một thứ repo đã cố
 # ý bỏ đi.
-for f in requirements.txt configs/recovery.yaml configs/gpu/rtx3060.yaml \
-         src/run_recovery.py src/train_recomb.py src/backbone.py; do
+for f in requirements.txt configs/vextractor.yaml configs/gpu/rtx3060.yaml \
+         src/run_vextractor.py src/train_recomb.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
 # Nếu §2.2 vẫn còn ở src/, nhắc — nhưng KHÔNG chặn: setup không phải chỗ ép
 # người ta dọn repo.
-if [ -f "src/train.py" ] || [ -f "configs/recovery.yaml" ]; then
+if [ -f "src/train.py" ] || [ -f "configs/vextractor.yaml" ]; then
     echo "⚙ §2.2 (và bản §2.3 đời trước) vẫn còn trong repo."
     echo "  Chuyển đi trước khi chạy thật:  bash scripts/archive_2.2.sh --apply"
 fi
@@ -248,7 +248,7 @@ print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
     print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.3 KHÔNG dò batch. "
           "Hết VRAM thì hạ, theo thứ tự,")
-    print("  train.max_seq_len (configs/recovery.yaml) hoặc "
+    print("  train.max_seq_len (configs/vextractor.yaml) hoặc "
           "train.per_device_batch_size (configs/gpu/<card>.yaml)")
     print("  (grad_accum tự suy ra = effective_batch / per_device_batch_size).")
 PYEOF
@@ -282,16 +282,16 @@ echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https:
 echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
 echo "  2. Tự kiểm chứng (vài giây, không cần GPU):"
-echo "       python scripts/selftest_recovery.py   # phải qua HẾT"
+echo "       python scripts/selftest_vextractor.py   # phải qua HẾT"
 echo
-echo "  3. Thử đường ống + VRAM đỉnh (config: configs/recovery.yaml + configs/gpu/):"
-echo "       bash scripts/run_recovery.sh --dry-run"
+echo "  3. Thử đường ống + VRAM đỉnh (config: configs/vextractor.yaml + configs/gpu/):"
+echo "       bash scripts/run_vextractor.sh --dry-run"
 echo
 echo "  4. CHẠY THẬT:"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run_recovery.sh --detach"
+    echo "       bash scripts/run_vextractor.sh --detach"
     echo "       # chạy nền, trả lại shell ngay, in link W&B."
 else
-    echo "       bash scripts/run_recovery.sh"
+    echo "       bash scripts/run_vextractor.sh"
 fi
 echo

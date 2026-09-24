@@ -85,7 +85,7 @@ def ab_table(scores: dict[str, pd.DataFrame], A: dict, B: dict, cfg,
             "winner": win})
     out = pd.DataFrame(rows)
     out.attrs.update(ids=[a, b], labels=[f"A · r{A['rank']} · Z ($1)",
-                                         f"B · r{B['rank']} + Recovery · Q"],
+                                         f"B · r{B['rank']} + V-Extractor · Q"],
                      short={a: "A", b: "B"})
     return out
 
@@ -147,7 +147,7 @@ def plot_ab(tab: pd.DataFrame, path: Path) -> Path:
     for s in ("left", "bottom"):
         ax.spines[s].set_color(GRID)
     ax.tick_params(colors=INK_2, labelsize=9)
-    ax.set_title(f"§2.1 Recovery — A [Z‖T] vs B [Z‖Q‖T] · "
+    ax.set_title(f"§2.2 V-Extractor — A [Z‖T] vs B [Z‖Q‖T] · "
                  f"{int(tab['n_images'].iloc[0])} ảnh",
                  loc="left", color=INK, fontsize=11.5)
     hd = [Patch(facecolor=COLORS[j % len(COLORS)], alpha=0.45,

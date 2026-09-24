@@ -185,7 +185,7 @@ class RoutingContext:
                     "này CÓ expert nhưng lượt forward đang đi qua nền trần — "
                     "kết quả vẫn là văn bản đọc được và cột số vẫn trông như "
                     "thật. Gọi `route_ctx.set(weights)` trước forward (xem "
-                    "train_recomb._forward_loss và runners/gemma3_recovery).")
+                    "train_recomb._forward_loss và runners/gemma3_vextractor).")
             return None
         if w.shape[0] * self.repeat != batch:
             raise RuntimeError(

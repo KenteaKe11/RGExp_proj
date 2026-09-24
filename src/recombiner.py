@@ -1193,7 +1193,7 @@ def inject_tokens(embeds: torch.Tensor, tokens: torch.Tensor,
     `at` là vị trí CHÈN VÀO (token đang ở đó bị đẩy sang phải). Hai chỗ dùng:
     `first_image_index(...)` -> token nhánh nằm NGAY TRƯỚC 256 token ảnh (thứ tự
     First/Second của "concat" ở §2.3/§2.4); `last_image_index(...) + 1` -> ngay
-    SAU khối ảnh (thứ tự [Z ‖ Q ‖ T] của §2.1 Recovery). Cả hai đều giữ nguyên
+    SAU khối ảnh (thứ tự [Z ‖ Q ‖ T] của §2.2 V-Extractor). Cả hai đều giữ nguyên
     BOS và câu lệnh hệ thống ở đầu chuỗi. `at` là một số (mọi hàng chèn cùng
     chỗ, khâu huấn luyện) hoặc một tensor (B,) — mỗi hàng một chỗ, khâu sinh
     đệm trái.

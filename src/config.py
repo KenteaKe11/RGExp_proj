@@ -1,7 +1,7 @@
 """Nạp và giải quyết cấu hình §2.5.
 
-HAI file: config NỘI DUNG (configs/recovery.yaml — thí nghiệm là gì) của điểm vào
-duy nhất còn chạy (`src.run_recovery`, §2.1 Recovery; $1 LoRA ở
+HAI file: config NỘI DUNG (configs/vextractor.yaml — thí nghiệm là gì) của điểm vào
+duy nhất còn chạy (`src.run_vextractor`, §2.2 V-Extractor; $1 LoRA ở
 _archive/v2/),
 và config GPU (configs/gpu/<card>.yaml — chạy nó thế nào trên một card). Xem
 khối "HAI loại config" bên dưới.
@@ -31,7 +31,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "recovery.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "vextractor.yaml"
 
 
 class Cfg(dict):
@@ -84,7 +84,7 @@ def _set_path(d: dict, dotted: str, value: Any) -> None:
 
 
 # ── HAI loại config: NỘI DUNG + GPU ─────────────────────────────────────────
-# configs/recovery.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
+# configs/vextractor.yaml (NỘI DUNG) nói thí nghiệm là gì: dữ liệu, mô hình, lr,
 # epoch, BATCH HIỆU DỤNG (`train.effective_batch`),
 # giải mã, kiểm định. configs/gpu/<tên>.yaml (GPU) nói chạy nó thế nào trên MỘT
 # card: số mẫu mỗi lượt forward, checkpointing, worker, batch lúc sinh/chấm.

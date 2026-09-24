@@ -1,12 +1,12 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIG GPU — NVIDIA GeForce RTX 3060 (12 GB GDDR6, Ampere, sm_86)
 #
-#     bash scripts/run_recovery.sh --gpu rtx3060 --detach
+#     bash scripts/run_vextractor.sh --gpu rtx3060 --detach
 #     (không truyền --gpu thì cũng là file này: src/config.DEFAULT_GPU)
 #
 # CHỈ các khoá trong src/config.GPU_KEYS, và PHẢI khai đủ tất cả — thiếu một
 # khoá là DỪNG, không rơi về mặc định trong code. Thí nghiệm (lr, epoch, dữ liệu,
-# batch HIỆU DỤNG) ở configs/recovery.yaml. grad_accum được suy ra:
+# batch HIỆU DỤNG) ở configs/vextractor.yaml. grad_accum được suy ra:
 #     32 / 1 = 32
 # Máy đích: 1× RTX 3060 12 GB · EPYC 7713 · 54 GB RAM · NVMe ~6/4.8 GB/s ·
 # mạng ~5 Gbps · đĩa 100 GB. Mọi pipeline (train, sinh) TỰ chọn batch mỗi lượt
@@ -34,8 +34,9 @@ set:
   # vật lý của nó bị kẹt ở ước của `train_batch` đã khoá theo $1 và KHÔNG được
   # nâng (nó là một phần lịch học của A). Stage 0 thì không có decoder, không
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
-  # configs/recovery.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
-  # phép leo tới tận 32 nếu VRAM cho phép.
+  # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
+  # phép leo tới tận 32 nếu VRAM cho phép. §2.2: Stage 0 KHÔNG nạp Gemma (chỉ
+  # ResNet50 ở 512²), nên mảnh vật lý ở đây thường leo cao hơn hẳn §2.1.
   stage0.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng

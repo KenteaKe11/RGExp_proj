@@ -74,7 +74,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_recovery.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_recovery`
+    `scripts/run_vextractor.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_vextractor`
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -112,7 +112,7 @@ def _copy_log(run_dir: Path) -> Path | None:
 
 
 def hub_dir_name(o: dict) -> str:
-    """`$<Chỉ số>_<Test title>_Test`, vd. `$1_LoRA_Test`, `$2.1_Recovery_Test`.
+    """`$<Chỉ số>_<Test title>_Test`, vd. `$1_LoRA_Test`, `$2.2_V-Extractor_Test`.
 
     Chỉ số và tiêu đề khai RIÊNG ở config (`hub_index`, `hub_title`) rồi ghép ở
     đây, để mọi thí nghiệm sau đặt tên cùng một khuôn. Không khai -> dùng
@@ -187,7 +187,7 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
     # §2.1: Stage 0 (Recovery + Cls Head đã pretrain) + loader của nó, cạnh fixture.
     s0 = Path(o["adapter_dir"]) / "_stage0"
     if s0.exists():
-        from .stage0_recovery import KEEP
+        from .stage0_vextractor import KEEP
 
         for rel in KEEP:
             f = s0 / rel
@@ -300,7 +300,7 @@ def push_results(cfg: Cfg, run_dir: Path, arms: list[str] | None = None,
     tok = hf_token()
     if not tok and not dry:
         print("⚠ không có HF_TOKEN — không đẩy.  export HF_TOKEN=hf_xxxxxxxx  &&  "
-              "bash scripts/run_recovery.sh push", flush=True)
+              "bash scripts/run_vextractor.sh push", flush=True)
         return None
 
     if run_dir.exists() and results_only is None:

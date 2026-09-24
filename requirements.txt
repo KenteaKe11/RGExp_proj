@@ -43,7 +43,10 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
-# §2.5 — hai baseline đối chứng dùng ResNet-101/152 ImageNet của torchvision.
+# §2.2 — nhánh V-Extractor LÀ một ResNet50 ImageNet của torchvision (và §2.5 cũ
+# dùng ResNet-101/152). Đây là phụ thuộc BẮT BUỘC của pipeline đang chạy, không
+# phải phụ thuộc phụ: thiếu nó thì Stage 0 không dựng được nhánh.
+# Lần chạy đầu tải ~100 MB trọng số ImageNet từ download.pytorch.org.
 # KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản torch đang cài (cùng lý do
 # torch không nằm trong file này), và pip tự giải quyết ràng buộc ấy khi cài
 # cạnh một torch đã có. Cài nhầm bản là lỗi "operator torchvision::nms does not

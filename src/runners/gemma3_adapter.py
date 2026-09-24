@@ -14,7 +14,7 @@ cột "QLoRA vs LoRA" trong bảng Friedman bốc hơi. `train_stats.json` ghi l
 arm nào lượng tử, và runner đọc lại từ đó chứ không đoán theo tên arm.
 
 §2.3 KHÔNG dùng runner này cho candidate A — cả hai candidate đi
-`gemma3_recovery` để hai cột dùng chung một đường sinh. Xem docstring file đó.
+`gemma3_vextractor` để hai cột dùng chung một đường sinh. Xem docstring file đó.
 """
 from __future__ import annotations
 
