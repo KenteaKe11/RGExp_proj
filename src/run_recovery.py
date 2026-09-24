@@ -776,6 +776,19 @@ def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
         return 2
     # Lens của §2.1 CHỈ cần weight của B: Z của B giống A từng bit, nên chênh lệch
     # A/B nằm trọn trong khối Q và không phải kéo weight của A về để trừ.
+    # Chặn TRƯỚC khi nạp fixture + 3000 ảnh: weight B của một kiến trúc khác thì
+    # có nạp xong cũng chỉ để `load_branch` ném format ở tận trong ruột.
+    from . import stage0_recovery as s0
+    from . import train_recovery as tz
+
+    b_dir = arm_weight_dir(cfg, B, adapter_root)
+    why = tz.branch_stale(b_dir, s0.stage0_dir(cfg) / s0.CKPT)
+    if why:
+        print(f"✗ weight của {B['id']} KHÔNG dùng được với code hiện tại: {why}.\n"
+              f"    Lens mổ chính khối Q nên cần nhánh của ĐÚNG kiến trúc đang chạy.\n"
+              f"    Huấn luyện lại main stage trước:\n"
+              f"        bash scripts/run_recovery.sh train --retrain --detach", flush=True)
+        return 2
     tracker = Tracker(cfg, run_id=manifest["run_id"], config_snapshot=manifest["config"])
     try:
         test_df, _tr, _va = fx_mod.load_splits(cfg, fx, tracker, with_images=True)

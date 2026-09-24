@@ -54,6 +54,8 @@ import pandas as pd
 
 from . import imaging, labels_cls, recombiner
 from . import recovery as RCV
+from .stage0_recovery import CKPT as STAGE0_CKPT
+from .stage0_recovery import stage0_dir
 from .backbone import ReportDataset, TrainUnusable, free_vram, quant_config
 from .config import Cfg, hf_token
 
@@ -440,16 +442,30 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
     d = lens_dir(cfg, run_dir)
     (d / "figures").mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    item = pick_sample(cfg, test_df)
-    print(f"  ⚙ Lens dùng ảnh {item['key']} · {item['n_pos']} pos · {item['n_unc']} "
-          f"uncertain · {item['n_labelled']}/14 nhãn có mặt", flush=True)
-
+    # Kiểm weight TRƯỚC `pick_sample`: chọn ảnh phải nạp bảng nhãn (có thể tải
+    # từ Hub) và quét cả tập test — không đáng tốn khi nhánh còn chưa dùng được.
     bid = B["id"]
     adir = Path(adapter_root) / bid
     if not (adir / "adapter_model.safetensors").exists():
         raise TrainUnusable(
             f"Lens cần weight của {bid} trên máy này ({adir}). Chạy `train` trước, "
             f"hoặc bật `output.pull` + HF_TOKEN để kéo về.")
+    # Weight có đó nhưng là của một KIẾN TRÚC KHÁC thì dừng NGAY, với câu nói rõ
+    # phải làm gì — đừng để `load_branch` ném một RuntimeError format ở tận
+    # trong ruột sau khi đã nạp xong model 4B.
+    from .train_recovery import branch_stale
+
+    why = branch_stale(adir, stage0_dir(cfg) / STAGE0_CKPT)
+    if why:
+        raise TrainUnusable(
+            f"weight của {bid} ở {adir} KHÔNG dùng được với code hiện tại: {why}.\n"
+            f"    Lens mổ chính khối Q, nên nó cần nhánh của ĐÚNG kiến trúc đang "
+            f"chạy. Huấn luyện lại main stage trước:\n"
+            f"        bash scripts/run_recovery.sh train --retrain --detach")
+    item = pick_sample(cfg, test_df)
+    print(f"  ⚙ Lens dùng ảnh {item['key']} · {item['n_pos']} pos · {item['n_unc']} "
+          f"uncertain · {item['n_labelled']}/14 nhãn có mặt", flush=True)
+
     print(f"  ── {bid} ──", flush=True)
     model, processor, gemma, branch, st = load_arm(cfg, adir)
     if branch is None:
