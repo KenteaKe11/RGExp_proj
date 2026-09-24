@@ -358,7 +358,7 @@ def decoder_width(cfg: Cfg) -> int:
 
     from .config import hf_token
 
-    c = AutoConfig.from_pretrained(str(cfg["base"]["hf_id"]), token=hf_token(cfg))
+    c = AutoConfig.from_pretrained(str(cfg["base"]["hf_id"]), token=hf_token())
     for path in (("text_config", "hidden_size"), ("hidden_size",)):
         o = c
         for k in path:

@@ -402,7 +402,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"]["n_test"], cfg["data"]["n_train"], cfg["data"]["n_val"] = 8, 16, 8
         cfg["train"]["eval"] = dict(cfg["train"].get("eval") or {}, n_samples=4,
                                     every_steps=2)
-        cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, warmup_epochs=0)
+        # Giữ NGUYÊN `norm_epochs`: epoch norm (ResNet đóng băng trừ InstanceNorm)
+        # rồi mở băng là đúng phần code mới nhất của §2.2 — dry-run phải đi qua
+        # nó. `warmup_epochs = 0` để lr không còn phụ thuộc số bước của lần chạy
+        # thật (dry-run chỉ chạy vài bước mỗi epoch).
+        cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, warmup_epochs=0.0)
         cfg["stats"] = dict(cfg["stats"], n_perm=200, n_boot=200)
         cfg["output"] = dict(cfg["output"], push=False, pull=False,
                              subdir=cfg["output"]["subdir"] + "_dryrun",
@@ -563,7 +567,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
             pull_stage0(cfg, base_only=True)
     if a.refinal and s0.base_finished(cfg) is None:
         # Dừng TRƯỚC khi nạp base 4B + dò autobatch (mất vài phút) thay vì sau.
-        _nb = (int(cfg["stage0"].get("warmup_epochs", 0))
+        _nb = (int(cfg["stage0"].get("norm_epochs", 0))
                + int(cfg["stage0"]["max_epochs"]))
         print(f"✗ `--refinal` cần base/ ({_nb} epoch) khớp vân "
               f"tay, nhưng máy này không có và cũng không kéo được từ Hub "

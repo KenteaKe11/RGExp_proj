@@ -579,6 +579,12 @@ def _():
     assert not {"n_query", "d_learn", "x_heads", "hidden"} & set(rv)
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
+    # epoch NORM là epoch thêm vào -> mọi chỗ đếm "số epoch của base" phải cộng
+    # `norm_epochs`, không phải `warmup_epochs` (0.25, int() ra 0)
+    assert 'int(cfg["stage0"].get("norm_epochs", 0))' in src
+    assert 'get("warmup_epochs", 0))' not in src
+    # dry-run vẫn đi qua epoch norm + lúc mở băng ResNet
+    assert 'max_epochs=1, warmup_epochs=0.0' in src and "norm_epochs=0" not in src
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
     # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
     assert "--refinal" in src and "restart_final=a.refinal" in src
@@ -715,6 +721,65 @@ def _():
     finally:
         (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
          s0.ImageOnlyDataset.pixels) = orig
+
+
+@check("15b. decoder_width: đọc hidden_size từ AutoConfig (không tải trọng số); mọi hf_token() gọi KHÔNG tham số")
+def _():
+    import sys
+    import types
+
+    # Gọi ĐÚNG hàm thật (không patch nó) với một `transformers` giả: đây là chỗ
+    # duy nhất §2.2 còn chạm tới model, và nó chỉ được phép đọc CONFIG.
+    calls = {}
+
+    class _Cfg:
+        text_config = types.SimpleNamespace(hidden_size=2560)
+
+    class _Auto:
+        @staticmethod
+        def from_pretrained(hf_id, **kw):
+            calls["hf_id"], calls["kw"] = hf_id, dict(kw)
+            return _Cfg()
+
+    fake = types.ModuleType("transformers")
+    fake.AutoConfig = _Auto
+    real = sys.modules.get("transformers")
+    sys.modules["transformers"] = fake
+    try:
+        from src.stage0_vextractor import decoder_width
+
+        assert decoder_width({"base": {"hf_id": "google/gemma-3-4b-it"}}) == 2560
+        assert calls["hf_id"] == "google/gemma-3-4b-it"
+        assert set(calls["kw"]) == {"token"}        # chỉ token, không weight/dtype
+        # model không có text_config (kiểu text-only) -> rơi về hidden_size gốc
+        _Cfg.text_config = None
+        _Cfg.hidden_size = 1536
+        assert decoder_width({"base": {"hf_id": "x"}}) == 1536
+        # không đọc được -> DỪNG, không đoán một con số
+        _Cfg.hidden_size = None
+        try:
+            decoder_width({"base": {"hf_id": "x"}})
+        except Exception:
+            pass
+        else:
+            raise AssertionError("không đọc được hidden_size phải DỪNG")
+    finally:
+        if real is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = real
+
+    # `config.hf_token()` KHÔNG nhận tham số — gọi nó với cfg là TypeError ở
+    # tận runtime, sau khi đã nạp xong dữ liệu (đúng cái đã xảy ra một lần).
+    import inspect
+    import re
+
+    from src.config import hf_token
+
+    assert not inspect.signature(hf_token).parameters
+    for f in (ROOT / "src").rglob("*.py"):
+        for m in re.finditer(r"hf_token\(([^)]*)\)", f.read_text(encoding="utf-8")):
+            assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
 @check("16. lịch epoch 6 (final): NỐI TIẾP, cosine 1e-5 -> 1e-7 trong 200 bước, giữ moment")
