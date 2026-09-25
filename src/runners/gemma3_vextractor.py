@@ -43,7 +43,7 @@ from .gemma3_adapter import Gemma3AdapterRunner
 class Gemma3VExtractorRunner(Gemma3AdapterRunner):
     name = "gemma3_vextractor"
 
-    branch = None           # §2.2: ảnh 448² -> ViT-B/16 (8 block) -> Q (src/vextractor.py)
+    branch = None           # §2.2: ảnh 448² -> ViT-B/16 -> Q (src/vextractor.py)
     _gemma = None
     _img_token_id = None
 

@@ -20,7 +20,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ViT-B/16 ăn ảnh 448², 8 block đầu) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (ViT-B/16 ĐỦ 12 block ăn ảnh 448²) — và chuỗi dài
 # thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -342,13 +342,13 @@ vextractor:
     # (cùng 0.5/0.5, cùng 12 block) — đổi arch là phải chạy lại Stage 0.
     arch: vit_base_patch16_224.augreg_in21k_ft_in1k
     pretrained: true        # ImageNet. false bị TỪ CHỐI (câu hỏi khác hẳn)
-    # Số block ĐẦU được giữ lại. CẮT THẬT: `net.blocks` bị thay bằng 8 block
-    # đầu, nên 4 block còn lại không vào đồ thị, không vào state_dict, không
-    # chiếm VRAM, không có tham số nào để optimizer chạm vào — ViT-B từ 86 M
-    # xuống 58 M. Phần nhánh cần là biểu diễn thị giác còn mang cấu trúc không
-    # gian (nằm ở đầu ViT); đuôi của nó đã chuyên hoá cho phân loại 1000 lớp.
-    # null = dùng hết 12 block. `net.norm` (LayerNorm cuối) vẫn chạy sau khi cắt.
-    n_layers: 8
+    # Số block ĐẦU được giữ lại; null = DÙNG HẾT (ở đây: đủ 12 block của
+    # ViT-B/16, 86 M tham số). Khai một số thì `net.blocks` bị thay bằng đúng
+    # ngần ấy block đầu — CẮT THẬT: phần còn lại không vào đồ thị, không vào
+    # state_dict, không chiếm VRAM, không có tham số nào để optimizer chạm vào.
+    # Khoá này nằm trong spec, nên đổi nó -> lệch spec_fingerprint -> checkpoint
+    # Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
+    n_layers: null
     n_query: 32             # số learner vector = số token Q nối vào chuỗi decoder
     n_heads: 20             # Self/Cross-attn ở 2560: head_dim 128 (2560 = 20 × 128)
     mlp_hidden: 3072        # MLP(GeLU) GIỮA hai attn: 2560 -> 3072 -> 2560
@@ -386,7 +386,7 @@ vextractor:
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
 # Aligner KHÔNG có mặt ở đây: Cls Head đọc THẲNG Q_raw của khối cam.
-# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy 8 block ViT-B + hai khối
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-B + hai khối
 # attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
 # MỘT lr cho TẤT CẢ: 1e-5, PHẲNG suốt quá trình. Optimizer vẫn giữ hai nhóm

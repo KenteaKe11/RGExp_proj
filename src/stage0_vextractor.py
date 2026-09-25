@@ -1,13 +1,13 @@
 """Stage 0 — pretrain Supervised Block (V-Extractor + Cls Head) trước main stage.
 
-    ảnh 448² ─► ViT-B/16 ImageNet, 8 block đầu ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
+    ảnh 448² ─► ViT-B/16 ImageNet (đủ 12 block) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
 
 Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor. Main stage nạp
 nguyên `vextractor.*` và bỏ Cls Head.
 
 KHÁC §2.1: Stage 0 ở đây KHÔNG nạp Gemma. Nhánh có encoder thị giác của riêng
-nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là 8 block ViT-B/16 +
+nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ViT-B/16 +
 hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
 `d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
 config, không tải trọng số).
@@ -113,7 +113,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ 8 block ViT-B), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
+           # NÀO CẢ (chỉ ViT-B), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
            # quá nhỏ và luôn ra micro thấp hơn hẳn mức máy chịu được.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
@@ -463,7 +463,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if val_df is None or val_df.empty:
         raise TrainUnusable("Stage 0 chọn epoch theo val — fixture không có mẫu val.")
 
-    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy 8 block ViT-B.
+    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ViT-B.
     # Thứ duy nhất cần từ model là d_model (2560) — đọc từ config, không tải
     # trọng số. Lệch con số này với model thật thì `load_stage0_into` ở main
     # stage ném spec mismatch, to và sớm.

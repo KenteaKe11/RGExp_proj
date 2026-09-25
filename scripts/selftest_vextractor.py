@@ -742,9 +742,13 @@ def _():
     assert int(rv["image_size"]) == 448 and int(rv["image_size"]) % 16 == 0
     assert (int(rv["image_size"]) // 16) ** 2 == 784            # lưới patch ViT
     assert rv["arch"] == "vit_base_patch16_224.augreg_in21k_ft_in1k"
-    # ViT-B/16: 12 block, giữ 8 block ĐẦU. `n_layers` là khoá của spec nên đổi
-    # nó -> lệch `spec_fingerprint` -> `branch_stale` bắt được weight cũ.
-    assert int(rv["n_layers"]) == 8
+    # ĐỦ 12 block của ViT-B/16: `n_layers: null`. Khoá vẫn phải CÓ MẶT trong
+    # spec (giá trị None) — nó nằm trong `spec_fingerprint`, nên bật/tắt việc
+    # cắt là checkpoint Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
+    from src import vextractor as R
+
+    assert rv["n_layers"] is None
+    assert "n_layers" in R.spec_from_cfg(cfg, 2560, 14)["vextractor"]
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
     assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2

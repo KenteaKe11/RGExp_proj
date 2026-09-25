@@ -24,7 +24,7 @@ kiểm, `train` dừng nếu lệch).
 > **Khác §2.1 Recovery ở đúng một chỗ, và nó là chỗ quan trọng nhất.** §2.1 rút
 > Q ra từ chính X của SigLIP, nên nó chỉ hỏi được *"có rút thêm được gì từ X mà
 > projector đã bỏ sót không"*. §2.2 cho nhánh một **encoder của riêng nó** —
-> **ViT-B/16 pretrain ImageNet, cắt còn 8 block đầu** ăn thẳng ảnh gốc — nên câu
+> **ViT-B/16 pretrain ImageNet (đủ 12 block)** ăn thẳng ảnh gốc — nên câu
 > hỏi thành: *một encoder học từ ImageNet (chứ không phải từ web image–text) có mang vào thứ
 > SigLIP không có không*. §2.1 đã đóng: code ở `_archive/recovery/`, README ở
 > `_archive/README_2.1_Recovery.md`. §2.0 Recombiner ở `_archive/zrecomb/`.
@@ -36,7 +36,7 @@ kiểm, `train` dừng nếu lệch).
 ảnh ──────────────┤
                   └─► resize 448×448, chuẩn hoá theo pretrained_cfg  [đường RIÊNG của nhánh]
                          │
-                      ViT-B/16 ImageNet · 8 BLOCK ĐẦU ─► forward_features, bỏ cls
+                      ViT-B/16 ImageNet · 12 BLOCK ─► forward_features, bỏ cls
                          │                              ─► (784, 768)
                       Linear 768→2560 ─► RMSNorm(2560) ──────────────┐   (K, V)
                                                                      │
@@ -72,13 +72,13 @@ lại. Self-attn chạy **trước** Cross-Attn và trên **riêng** các learne
 ra MLP (khối MLP nằm **giữa** hai attention), một cộng **thẳng learner Q** vào
 đầu ra Cross-Attn. Learner vì thế có đường gradient ngắn nhất về tới chính nó.
 
-**Backbone: ViT-B/16 ImageNet, cắt còn 8 block đầu** (`n_layers: 8`). Cắt
-**thật**: `net.blocks` bị thay bằng 8 block đầu, nên 4 block còn lại không vào
-đồ thị, không vào `state_dict`, không chiếm VRAM và không có tham số nào để
-optimizer chạm vào — 86,3 M xuống 57,9 M. Thứ nhánh cần là biểu diễn **thị
-giác còn mang cấu trúc không gian**, vốn nằm ở đầu ViT; đuôi của nó đã chuyên
-hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi. `net.norm` (LayerNorm
-cuối của `forward_features`) vẫn chạy sau khi cắt. Checkpoint là
+**Backbone: ViT-B/16 ImageNet, đủ 12 block** (`n_layers: null`) — cả 86,3 M
+tham số đều được Stage 0 fine-tune. `n_layers` vẫn là **khoá khai được**: khai
+một số thì `net.blocks` bị thay bằng đúng ngần ấy block **đầu** và cắt **thật**
+(phần còn lại không vào đồ thị, không vào `state_dict`, không chiếm VRAM, không
+có tham số nào để optimizer chạm vào; `net.norm` vẫn chạy). Khoá ấy nằm trong
+spec, nên bật/tắt việc cắt là checkpoint Stage 0 cũ bị **từ chối ồn ào** chứ
+không lệch khoá im lặng. Checkpoint là
 `vit_base_patch16_224.augreg_in21k_ft_in1k` — pretrain ImageNet-21k, fine-tune
 ImageNet-1k, chuẩn hoá **0.5/0.5** (họ AugReg). Muốn ImageNet-1k thuần thì đổi
 sang `vit_base_patch16_224.augreg_in1k` — cùng 0.5/0.5, cùng 12 block. Lần chạy
@@ -117,17 +117,17 @@ trên một mẫu thật mỗi lần chạy.
 
 | khối | tham số |
 |---|---|
-| ViT-B/16 @448, **8 block đầu** (cắt head) | 57,9 M *(đủ 12 block: 86,3 M)* |
+| ViT-B/16 @448, **đủ 12 block** (cắt head) | 86,3 M |
 | `Linear 768→2560` | 1,97 M |
 | 32 learner Q | 81,9 K |
 | Self-attn @2560 | 26,2 M |
 | `MLP(GeLU) 2560→3072→2560` | 15,7 M |
 | Cross-attn @2560 | 26,2 M |
-| **V-Extractor (khối CAM)** | **128,1 M** |
+| **V-Extractor (khối CAM)** | **156,5 M** |
 | Cls Head (CHỈ Stage 0) | 26,3 M |
-| **Stage 0 tổng** | **154,4 M** |
+| **Stage 0 tổng** | **182,8 M** |
 | **Aligner (CHỈ main stage)** | **41,95 M** — *toàn bộ phần học được của nhánh* |
-| nhánh ở main stage (cam + vàng) | 170,1 M, trong đó **học được 41,95 M** |
+| nhánh ở main stage (cam + vàng) | 198,4 M, trong đó **học được 41,95 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
@@ -138,13 +138,13 @@ lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) v
 ## Lịch
 
 **Stage 0: pretrain V-Extractor** (`src/stage0_vextractor.py`). **Không nạp
-Gemma**: nhánh có encoder riêng, nên cả lượt pretrain chỉ là 8 block ViT-B + hai
+Gemma**: nhánh có encoder riêng, nên cả lượt pretrain chỉ là ViT-B + hai
 khối attention — rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
 `d_model` (2560) và nó được đọc từ `AutoConfig` (một file json, không tải trọng
 số).
 
 ```
-ảnh 448² (mean/std của checkpoint) ─► ViT-B (8 block đầu) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
+ảnh 448² (mean/std của checkpoint) ─► ViT-B (đủ 12 block) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
                                                    (Aligner KHÔNG có mặt ở đây)
 ```
 
@@ -153,7 +153,7 @@ chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor, khô
 patch thô rồi vứt đi.
 
 **Một lr duy nhất: `lr` = 1e-5, phẳng suốt Stage 0** (AdamW, wd 0.03). Optimizer
-vẫn giữ **hai nhóm** — `backbone` (8 block ViT-B/16) và `rest` (Linear vào · 32
+vẫn giữ **hai nhóm** — `backbone` (ViT-B/16) và `rest` (Linear vào · 32
 learner Q · Self/Cross-attn · MLP · Cls Head) — để về sau tách ra được, nhưng
 `backbone_lr: null` nghĩa là nó **lấy theo `lr`**, nên hiện tại chỉ có đúng một
 con số. Thứ **duy nhất** làm lr đổi là epoch warm-up ở đầu: không anneal, không
@@ -241,7 +241,7 @@ trên 256 mẫu bốc lại mỗi 25 bước). Phần thêm:
   không giữ activation nào).
 * Clip gradient **tách riêng** LoRA và Aligner, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: **32 token** thêm vào chuỗi **cộng** một lượt 8 block ViT-B/16 ở
+* B nặng hơn A: **32 token** thêm vào chuỗi **cộng** một lượt ViT-B/16 ở
   448² (784 patch) cho mỗi ảnh. Nhánh của §2.2 nặng hơn nhánh của §2.1 vì nó có
   encoder riêng chứ không đi nhờ đặc trưng đã tính sẵn. Nếu batch đã khoá không
   vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo
@@ -319,7 +319,7 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    tách được hai chặng — mọi lá đều cho đúng ô 4. Ô 3 vì thế lấy `g = ∂y/∂Q`
    (gradient đã tới **đầu ra** Aligner) rồi bơm thẳng `g` vào `Q_raw` và lan về
    ảnh qua **riêng khối cam**; đọc là *nếu Aligner không xoay gì thì decoder đòi
-   ảnh ở đâu*. Chạy bằng một lượt forward/backward riêng qua 8 block ViT-B chứ
+   ảnh ở đâu*. Chạy bằng một lượt forward/backward riêng qua ViT-B chứ
    không phải `retain_graph=True` trên đồ thị của decoder 4B.
 
    **Hiệu ô 3 → ô 4 chính là Aligner.** Khối cam đóng băng hoàn toàn suốt main
@@ -440,7 +440,7 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/vextractor.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/vextractor.py        V-Extractor (ViT-B/16 ImageNet, 8 block đầu + Linear 768→2560 + 32 learner Q
+src/vextractor.py        V-Extractor (ViT-B/16 ImageNet + Linear 768→2560 + 32 learner Q
                          + Self-attn + MLP 2560→3072→2560 + CrossAttn) · Aligner (main
                          stage) · vext_tensor (đường ảnh
                          riêng, mean/std của checkpoint) · Cls Head (đọc Q) ·

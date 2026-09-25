@@ -4,7 +4,7 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
 
     Image ─┬─► Vision Encoder (SigLIP, đóng băng) ─► Adapter ─► Z (256, 2560)
            │
-           └─► Resize 448×448 ─► ViT-B/16 ImageNet, 8 BLOCK ĐẦU ─► (784, 768)
+           └─► Resize 448×448 ─► ViT-B/16 ImageNet (đủ 12 block) ─► (784, 768)
                                           │
                                  Linear 768→2560              32 Learner (Q)
                                           │                          │
@@ -36,17 +36,17 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
            [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
 Nhánh có encoder thị giác của RIÊNG nó — ViT-B/16 pretrain ImageNet
-(`augreg_in21k_ft_in1k`), CẮT còn 8 block đầu, ăn thẳng ảnh resize 448², KHÔNG
-đọc X của SigLIP. Hệ quả:
+(`augreg_in21k_ft_in1k`), ĐỦ 12 block, ăn thẳng ảnh resize 448², KHÔNG đọc X
+của SigLIP. Hệ quả:
 
   * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet chứ không phải
     web-image–text, có mang vào thứ SigLIP không có không";
-  * **8 block đầu, cắt THẬT** (`n_layers`): `net.blocks` bị thay bằng 8 block
-    đầu, nên 4 block còn lại không được dựng vào đồ thị, không nằm trong
-    `state_dict`, không chiếm VRAM và không có tham số nào để optimizer chạm
-    vào — 86 M tham số của ViT-B đủ 12 block còn 58 M. Phần nhánh cần là biểu
-    diễn THỊ GIÁC còn mang cấu trúc không gian, vốn nằm ở đầu ViT; đuôi của nó
-    đã chuyên hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi;
+  * **đủ 12 block** (`n_layers: null`): cả ViT-B, 86 M tham số, đều được
+    Stage 0 fine-tune. `n_layers` vẫn là khoá KHAI ĐƯỢC — khai một số thì
+    `net.blocks` bị thay bằng đúng ngần ấy block ĐẦU, cắt THẬT (phần còn lại
+    không vào đồ thị, không vào `state_dict`, không chiếm VRAM, không có tham
+    số nào để optimizer chạm vào). Nó nằm trong spec nên đổi là checkpoint
+    Stage 0 cũ bị từ chối ồn ào;
   * lưới patch của ViT (448/16 = 28 -> 28² = 784 ô) KHÔNG phải là khối Q: 784
     quá dài để nối vào chuỗi decoder. `n_query` learner vector (32) đi HỎI 784
     ô ấy qua Cross-Attn và nén lại — `n_query` vì thế là một khoá khai tường
@@ -243,10 +243,10 @@ def vit_body(arch: str, pretrained: bool, image_size: int,
     **`n_layers` cắt THẬT, không phải early-exit.** `net.blocks` bị thay bằng
     `n_layers` block ĐẦU, nên các block sau không được dựng vào đồ thị, không
     nằm trong `state_dict`, không chiếm VRAM và không có tham số nào để
-    optimizer chạm vào. ViT-B/16 đủ 12 block là 86 M tham số; giữ 8 block đầu
-    còn 58 M — thứ nhánh cần là biểu diễn THỊ GIÁC còn mang cấu trúc không
-    gian, vốn nằm ở phần đầu của ViT, còn đuôi của nó đã chuyên hoá cho bài
-    toán phân loại 1000 lớp mà §2.2 không hỏi.
+    optimizer chạm vào. Cấu hình hiện tại để `null` (đủ 12 block, 86 M); khoá
+    này để dành cho lúc muốn giữ lại riêng phần đầu của ViT — nơi biểu diễn
+    còn mang cấu trúc không gian, trước khi đuôi chuyên hoá cho bài toán phân
+    loại 1000 lớp mà §2.2 không hỏi.
 
     Cắt rồi thì `net.norm` (LayerNorm cuối) vẫn chạy — nó là norm của đầu ra
     `forward_features`, không thuộc block nào.
@@ -302,7 +302,7 @@ class VExtractor(nn.Module):
 
     def __init__(self, image_size: int = 448, d_model: int = 2560,
                  arch: str = "vit_base_patch16_224.augreg_in21k_ft_in1k",
-                 pretrained: bool = True, n_layers: int | None = 8,
+                 pretrained: bool = True, n_layers: int | None = None,
                  n_query: int = 32, n_heads: int = 20, mlp_hidden: int = 3072,
                  dropout: float = 0.0, normalize: dict | None = None):
         super().__init__()
