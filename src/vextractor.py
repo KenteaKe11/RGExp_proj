@@ -4,9 +4,9 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
 
     Image ─┬─► Vision Encoder (SigLIP, đóng băng) ─► Adapter ─► Z (256, 2560)
            │
-           └─► Resize 448×448 ─► ViT-Small/16 (ImageNet-1k) ─► (784, 384)
+           └─► Resize 448×448 ─► ViT-L/16 ImageNet, 6 BLOCK ĐẦU ─► (784, 1024)
                                           │
-                                 Linear 384→2560              32 Learner (Q)
+                                 Linear 1024→2560             32 Learner (Q)
                                           │                          │
                                    RMSNorm(2560)              RMSNorm(2560)
                                           │                          │
@@ -35,11 +35,18 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
                                           │
            [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
-Nhánh có encoder thị giác của RIÊNG nó — ViT-Small/16 ImageNet-1k ăn thẳng ảnh
-resize 448², KHÔNG đọc X của SigLIP. Hệ quả:
+Nhánh có encoder thị giác của RIÊNG nó — ViT-L/16 pretrain ImageNet
+(`augreg_in21k_ft_in1k`), CẮT còn 6 block đầu, ăn thẳng ảnh resize 448², KHÔNG
+đọc X của SigLIP. Hệ quả:
 
-  * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet-1k chứ không phải
+  * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet chứ không phải
     web-image–text, có mang vào thứ SigLIP không có không";
+  * **6 block đầu, cắt THẬT** (`n_layers`): `net.blocks` bị thay bằng 6 block
+    đầu, nên 18 block còn lại không được dựng vào đồ thị, không nằm trong
+    `state_dict`, không chiếm VRAM và không có tham số nào để optimizer chạm
+    vào — 304 M tham số của ViT-L đủ 24 block còn 77 M. Phần nhánh cần là biểu
+    diễn THỊ GIÁC còn mang cấu trúc không gian, vốn nằm ở đầu ViT; đuôi của nó
+    đã chuyên hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi;
   * lưới patch của ViT (448/16 = 28 -> 28² = 784 ô) KHÔNG phải là khối Q: 784
     quá dài để nối vào chuỗi decoder. `n_query` learner vector (32) đi HỎI 784
     ô ấy qua Cross-Attn và nén lại — `n_query` vì thế là một khoá khai tường
@@ -49,11 +56,11 @@ resize 448², KHÔNG đọc X của SigLIP. Hệ quả:
     hai dấu `+` trong hình: một quanh MLP (cộng đầu ra Self-attn), một quanh cả
     khối (cộng THẲNG learner) — learner vì thế có đường gradient ngắn nhất;
   * thân nhánh chạy THẲNG ở `d_model` = 2560. Bố cục cũ làm việc ở `d_branch`
-    2048 rồi mới nở ra 2560 ở MLP cuối; ở đây Linear vào nở 384 → 2560 ngay và
+    2048 rồi mới nở ra 2560 ở MLP cuối; ở đây Linear vào nở 1024 → 2560 ngay và
     MLP(GeLU) 2560 → 3072 → 2560 KHÔNG còn đổi chiều, nên không có chỗ nào
     trong nhánh bị bóp lại dưới chiều embedding của decoder;
   * đường ảnh THỨ HAI: batch phải mang thêm `vext_pixels` (3, 448, 448) chuẩn
-    hoá theo ĐÚNG thống kê đi kèm trọng số ImageNet-1k của chính checkpoint ViT
+    hoá theo ĐÚNG thống kê đi kèm trọng số ImageNet của chính checkpoint ViT
     (`timm.pretrained_cfg.mean/std`, ghi vào `spec.vextractor.normalize`), độc
     lập hoàn toàn với `pixel_values` 896 của Gemma. `vext_tensor()` dưới đây là
     chỗ DUY NHẤT dựng nó, và nó BẮT phải truyền mean/std — không có giá trị mặc
@@ -104,7 +111,7 @@ BRANCH_META = "vextractor_branch.json"
 # CHỈ là giá trị DỰ PHÒNG khi không hỏi được `timm.get_pretrained_cfg`. Thống kê
 # thật của checkpoint được ghi vào `spec.vextractor.normalize` lúc dựng spec và
 # được KIỂM lại với `pretrained_cfg` của model vừa dựng (`_check_normalize`):
-# nhiều checkpoint ViT ImageNet-1k (họ AugReg) dùng mean/std = 0.5 chứ KHÔNG
+# nhiều checkpoint ViT ImageNet (họ AugReg) dùng mean/std = 0.5 chứ KHÔNG
 # phải mean/std của ImageNet, nên hard-code một cặp số ở đây là sai lặng lẽ.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -192,13 +199,13 @@ class VExtractorUnusable(RuntimeError):
     """Không dựng được backbone — DỪNG, đừng pretrain trên đặc trưng ngẫu nhiên."""
 
 
-# ══ Backbone: ViT-Small/16 ImageNet-1k (timm) ═══════════════════════════════
+# ══ Backbone: ViT-L/16 ImageNet (timm), CẮT còn `n_layers` block đầu ═════════
 def _timm():
     try:
         import timm
     except Exception as e:  # pragma: no cover - môi trường thiếu timm
         raise VExtractorUnusable(
-            "không import được timm — nhánh §2.2 dùng ViT-Small/16 ImageNet-1k "
+            "không import được timm — nhánh §2.2 dùng ViT-L/16 pretrain ImageNet "
             "của timm.\n"
             "    pip install timm") from e
     return timm
@@ -207,9 +214,9 @@ def _timm():
 def arch_normalize(arch: str) -> tuple[tuple, tuple]:
     """(mean, std) ĐÚNG của checkpoint `arch` — hỏi `pretrained_cfg`, không tải weight.
 
-    Không đoán: họ AugReg (`*.augreg_in1k`) chuẩn hoá bằng 0.5/0.5 chứ không
-    phải mean/std của ImageNet, và một cặp số sai ở đây không làm chương trình
-    lỗi — nó chỉ làm mọi activation lệch ngay từ bước 0.
+    Không đoán: họ AugReg (`*.augreg_*`) chuẩn hoá bằng 0.5/0.5 chứ không phải
+    mean/std của ImageNet, và một cặp số sai ở đây không làm chương trình lỗi —
+    nó chỉ làm mọi activation lệch ngay từ bước 0.
     """
     try:
         pc = _timm().get_pretrained_cfg(str(arch))
@@ -218,17 +225,31 @@ def arch_normalize(arch: str) -> tuple[tuple, tuple]:
         raise VExtractorUnusable(
             f"không đọc được `pretrained_cfg` của {arch!r} để lấy mean/std: {e!r}.\n"
             f"    Đây KHÔNG phải chỗ để rơi về mean/std của ImageNet: checkpoint "
-            f"ViT ImageNet-1k họ AugReg chuẩn hoá bằng 0.5/0.5.") from e
+            f"ViT họ AugReg chuẩn hoá bằng 0.5/0.5.") from e
     return (tuple(float(x) for x in mean), tuple(float(x) for x in std))
 
 
-def vit_body(arch: str, pretrained: bool, image_size: int):
-    """ViT của timm ở độ phân giải `image_size`, CẮT head -> (body, d_feat, n_patch).
+def vit_body(arch: str, pretrained: bool, image_size: int,
+             n_layers: int | None = None):
+    """ViT của timm ở `image_size`, CẮT head và cắt còn `n_layers` block đầu.
+
+    -> (body, d_feat, n_patch, n_layers_used).
 
     `num_classes=0, global_pool=""` bỏ head phân loại; `forward_features` trả
-    chuỗi token ĐÃ qua norm cuối, gồm cả prefix token (cls/reg) — `n_prefix`
-    dưới đây là số token bị cắt bỏ để còn ĐÚNG lưới patch. `img_size` khác
+    chuỗi token ĐÃ qua norm cuối, gồm cả prefix token (cls/reg) — `n_prefix` ở
+    `VExtractor` là số token bị cắt bỏ để còn ĐÚNG lưới patch. `img_size` khác
     224 thì timm nội suy lại positional embedding của checkpoint.
+
+    **`n_layers` cắt THẬT, không phải early-exit.** `net.blocks` bị thay bằng
+    `n_layers` block ĐẦU, nên các block sau không được dựng vào đồ thị, không
+    nằm trong `state_dict`, không chiếm VRAM và không có tham số nào để
+    optimizer chạm vào. ViT-L/16 đủ 24 block là 304 M tham số — quá nặng để
+    fine-tune ở Stage 0 cạnh mọi thứ khác, trong khi thứ nhánh cần là biểu diễn
+    THỊ GIÁC còn mang cấu trúc không gian, vốn nằm ở phần đầu của ViT; đuôi của
+    nó đã chuyên hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi.
+
+    Cắt rồi thì `net.norm` (LayerNorm cuối) vẫn chạy — nó là norm của đầu ra
+    `forward_features`, không thuộc block nào.
     """
     timm = _timm()
     # `pretrained=False` dựng được (selftest cần một ViT nhỏ, offline), nhưng
@@ -241,22 +262,31 @@ def vit_body(arch: str, pretrained: bool, image_size: int):
     except Exception as e:  # noqa: BLE001
         raise VExtractorUnusable(
             f"không dựng được backbone {arch!r} ở {image_size}²: {e!r}.\n"
-            f"    Lần chạy đầu tải checkpoint từ Hugging Face (~85 MB cho "
-            f"ViT-Small/16).") from e
+            f"    Lần chạy đầu tải checkpoint từ Hugging Face (~1,2 GB cho "
+            f"ViT-L/16 — cả 24 block đều được tải về rồi mới cắt).") from e
     pe = getattr(net, "patch_embed", None)
-    if pe is None or not hasattr(net, "forward_features"):
+    blocks = getattr(net, "blocks", None)
+    if pe is None or blocks is None or not hasattr(net, "forward_features"):
         raise VExtractorUnusable(
-            f"{arch!r} không phải ViT của timm (thiếu `patch_embed`/"
+            f"{arch!r} không phải ViT của timm (thiếu `patch_embed`/`blocks`/"
             f"`forward_features`) — nhánh cần lưới patch, không cần một vector.")
+    n_have = len(blocks)
+    n_use = n_have if n_layers is None else int(n_layers)
+    if not 1 <= n_use <= n_have:
+        raise VExtractorUnusable(
+            f"n_layers = {n_layers} nhưng {arch!r} chỉ có {n_have} block "
+            f"(hợp lệ 1..{n_have}; null = dùng hết).")
+    if n_use < n_have:
+        net.blocks = nn.Sequential(*list(blocks)[:n_use])
     n_patch = int(pe.num_patches)
-    return net, int(net.num_features), n_patch
+    return net, int(net.num_features), n_patch, n_use
 
 
 class VExtractor(nn.Module):
     """Ảnh (B, 3, S, S) -> Q_raw (B, n_query, d_model). KHỐI MÀU CAM.
 
         p   = ViT.forward_features(px)[:, n_prefix:]     (B, n_patch, d_feat)
-        kv  = RMSNorm(Linear(p))                         d_feat → d_model
+        kv  = RMSNorm(Linear(p))                         d_feat (1024) → d_model
         s   = Self-attn(RMSNorm(learner))                (B, n_query, d_model)
         h   = s + MLP_GeLU(s)                            (+) quanh MLP
         Q_raw = learner + Cross-attn(RMSNorm(h), kv)     (+) quanh cả khối
@@ -271,9 +301,9 @@ class VExtractor(nn.Module):
     """
 
     def __init__(self, image_size: int = 448, d_model: int = 2560,
-                 arch: str = "vit_small_patch16_224.augreg_in1k",
-                 pretrained: bool = True, n_query: int = 32,
-                 n_heads: int = 20, mlp_hidden: int = 3072,
+                 arch: str = "vit_large_patch16_224.augreg_in21k_ft_in1k",
+                 pretrained: bool = True, n_layers: int | None = 6,
+                 n_query: int = 32, n_heads: int = 20, mlp_hidden: int = 3072,
                  dropout: float = 0.0, normalize: dict | None = None):
         super().__init__()
         self.image_size = int(image_size)
@@ -281,10 +311,13 @@ class VExtractor(nn.Module):
         self.d_model = int(d_model)
         if self.n_query < 1:
             raise ValueError(f"n_query {n_query} phải >= 1")
-        self.body, self.d_feat, self.n_patch = vit_body(arch, pretrained, self.image_size)
+        self.body, self.d_feat, self.n_patch, self.n_layers = vit_body(
+            arch, pretrained, self.image_size, n_layers)
         self.n_prefix = int(getattr(self.body, "num_prefix_tokens", 1))
         self.mean, self.std = _check_normalize(self.body, arch, normalize)
-        self.inp = nn.Linear(self.d_feat, self.d_model)           # 384 → 2560
+        # d_feat đến từ CHÍNH model (`num_features`), không gõ tay: đổi `arch`
+        # là chiều vào của Linear đi theo. ViT-L/16 -> 1024 → 2560.
+        self.inp = nn.Linear(self.d_feat, self.d_model)
         self.inp_norm = RMSNorm(self.d_model)
         # Learner vector: khởi tạo normal(0, 0.02) như mọi tham số mới của Gemma 3.
         # `_init` chỉ chạm `nn.Linear` nên nó giữ nguyên khởi tạo ở đây.
@@ -299,7 +332,7 @@ class VExtractor(nn.Module):
 
     # ── hai nhóm tham số của Stage 0 ──────────────────────────────────────
     def backbone_parameters(self):
-        """Tham số của ViT — phần ĐÃ pretrain ImageNet-1k."""
+        """Tham số của ViT — phần ĐÃ pretrain ImageNet (chỉ `n_layers` block đầu)."""
         yield from self.body.parameters()
 
     def head_parameters(self):
@@ -424,7 +457,7 @@ def norm_of(spec: dict) -> tuple[tuple, tuple]:
 def _init(module: nn.Module) -> None:
     """normal(0, 0.02) cho Linear MỚI, bias 0 — quy ước của Gemma 3.
 
-    ViT bị BỎ QUA hoàn toàn: trọng số của nó là ImageNet-1k, khởi tạo đè lên là
+    ViT bị BỎ QUA hoàn toàn: trọng số của nó là ImageNet, khởi tạo đè lên là
     vứt đi đúng cái thứ §2.2 đang mang vào. Khác bản ResNet50 cũ, chỗ `skip`
     này KHÔNG phải đề phòng: ViT có RẤT nhiều `nn.Linear` (qkv, proj, mlp của
     12 block) và thiếu nó là xoá sạch backbone một cách im lặng.
@@ -456,7 +489,7 @@ def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
     """
     z = dict(cfg.get("vextractor") or {})
     rv, al, ch = (dict(z.get(k) or {}) for k in ("vextractor", "aligner", "cls_head"))
-    arch = str(rv.get("arch", "vit_small_patch16_224.augreg_in1k"))
+    arch = str(rv.get("arch", "vit_large_patch16_224.augreg_in21k_ft_in1k"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -465,6 +498,10 @@ def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
         "vextractor": {"image_size": int(rv.get("image_size", 448)),
                        "arch": arch,
                        "pretrained": bool(rv.get("pretrained", True)),
+                       # null = dùng hết số block của `arch`. Số ở đây là số
+                       # block ĐẦU được giữ lại — xem `vit_body`.
+                       "n_layers": (None if rv.get("n_layers") is None
+                                    else int(rv["n_layers"])),
                        "n_query": int(rv.get("n_query", 32)),
                        "n_heads": int(rv.get("n_heads", 20)),
                        "mlp_hidden": int(rv.get("mlp_hidden", 3072)),
@@ -482,6 +519,12 @@ def n_query_of(spec: dict) -> int:
     return int(spec["vextractor"]["n_query"])
 
 
+def n_layers_of(spec: dict) -> int | None:
+    """Số block ĐẦU của ViT được giữ lại; None = dùng hết."""
+    v = spec["vextractor"].get("n_layers")
+    return None if v is None else int(v)
+
+
 def spec_fingerprint(spec: dict) -> str:
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
 
@@ -489,8 +532,8 @@ def spec_fingerprint(spec: dict) -> str:
 def build_vextractor(spec: dict) -> VExtractor:
     r = spec["vextractor"]
     return VExtractor(r["image_size"], spec["d_model"], r["arch"], r["pretrained"],
-                      r["n_query"], r["n_heads"], r["mlp_hidden"], r["dropout"],
-                      r.get("normalize"))
+                      r.get("n_layers"), r["n_query"], r["n_heads"],
+                      r["mlp_hidden"], r["dropout"], r.get("normalize"))
 
 
 def build_aligner(spec: dict) -> Aligner:
@@ -521,7 +564,7 @@ class SupervisedBlock(nn.Module):
     def param_groups(self, lr: float, backbone_lr: float) -> list[dict]:
         """[{ViT @ backbone_lr}, {phần còn lại @ lr}].
 
-        ViT là phần ĐÃ pretrain ImageNet-1k: nó chỉ cần fine-tune, nên lr của nó
+        ViT là phần ĐÃ pretrain ImageNet: nó chỉ cần fine-tune, nên lr của nó
         là `stage0.backbone_lr` (1e-5) và PHẲNG suốt Stage 0 — không warm-up,
         không anneal (`base_lr_at` / `anneal_lr_at`). Phần còn lại (Linear vào,
         learner Q, Self/Cross-attn, MLP, Cls Head) khởi tạo ngẫu nhiên nên nó
@@ -622,8 +665,9 @@ class VExtractorBranch(nn.Module):
         r, a = s["vextractor"], s["aligner"]
         v = self.vextractor
         d = int(s["d_model"])
-        return (f"V-Extractor: ảnh {r['image_size']}² -> {r['arch']} (ImageNet-1k) "
-                f"-> {v.n_patch} patch × {v.d_feat} -> Linear {v.d_feat}→{d} "
+        return (f"V-Extractor: ảnh {r['image_size']}² -> {r['arch']} "
+                f"({v.n_layers} block đầu) -> {v.n_patch} patch × {v.d_feat} "
+                f"-> Linear {v.d_feat}→{d} "
                 f"-> RMSNorm ‖ {v.n_query} learner Q -> Self-attn -> MLP(GeLU) "
                 f"{d}→{r['mlp_hidden']}→{d} (+res) -> CrossAttn ({r['n_heads']} "
                 f"head) (+res learner) │ Aligner: RMSNorm -> Self-attn "

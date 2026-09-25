@@ -1,13 +1,13 @@
 """Stage 0 — pretrain Supervised Block (V-Extractor + Cls Head) trước main stage.
 
-    ảnh 448² ─► ViT-Small/16 (ImageNet-1k) ─► 128 learner Q ─► Cls Head ─► ASL (14 × 3)
+    ảnh 448² ─► ViT-L/16 ImageNet, 6 block đầu ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
 
 Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor. Main stage nạp
 nguyên `vextractor.*` và bỏ Cls Head.
 
 KHÁC §2.1: Stage 0 ở đây KHÔNG nạp Gemma. Nhánh có encoder thị giác của riêng
-nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ViT-Small/16 +
+nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là 6 block ViT-L/16 +
 hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
 `d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
 config, không tải trọng số).
@@ -113,7 +113,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ViT-Small), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
+           # NÀO CẢ (chỉ 6 block ViT-L), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
            # quá nhỏ và luôn ra micro thấp hơn hẳn mức máy chịu được.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
@@ -463,7 +463,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if val_df is None or val_df.empty:
         raise TrainUnusable("Stage 0 chọn epoch theo val — fixture không có mẫu val.")
 
-    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ViT-Small.
+    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy 6 block ViT-L.
     # Thứ duy nhất cần từ model là d_model (2560) — đọc từ config, không tải
     # trọng số. Lệch con số này với model thật thì `load_stage0_into` ở main
     # stage ném spec mismatch, to và sớm.
@@ -479,7 +479,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         # backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
         raise TrainUnusable(
             "vextractor.vextractor.pretrained = false: cả điểm của §2.2 là 'một "
-            "encoder ĐÃ học từ ImageNet-1k mang vào thứ SigLIP không có'. Một "
+            "encoder ĐÃ học từ ImageNet mang vào thứ SigLIP không có'. Một "
             "ViT khởi tạo ngẫu nhiên không mang vào gì cả — Stage 0 DỪNG.")
     img_size = int(spec["vextractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
@@ -497,7 +497,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     n_par = sum(p.numel() for p in block.parameters())
     n_bb = sum(p.numel() for p in vx.backbone_parameters())
     print(f"  Stage 0: Supervised Block {n_par:,} tham số · {spec['vextractor']['arch']} "
-          f"{n_bb:,} ({vx.n_patch} patch × {vx.d_feat}) · Linear+{vx.n_query} "
+          f"{n_bb:,} ({vx.n_layers} block đầu, {vx.n_patch} patch × "
+          f"{vx.d_feat}) · Linear+{vx.n_query} "
           f"learner Q+Self/Cross-attn+MLP "
           f"{sum(p.numel() for p in vx.head_parameters()):,} · Cls Head "
           f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
@@ -969,7 +970,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                    "pretrained": spec["vextractor"]["pretrained"],
                    "norm": "LayerNorm của ViT (không có BatchNorm, không thống kê chạy)",
                    "image_size": spec["vextractor"]["image_size"],
-                   # ĐÚNG mean/std đi kèm trọng số ImageNet-1k của checkpoint
+                   # ĐÚNG mean/std đi kèm trọng số ImageNet của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
                    "normalize": dict(spec["vextractor"]["normalize"]),
                    # Thân nhánh chạy THẲNG ở d_model (không còn `d_branch`).

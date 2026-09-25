@@ -66,6 +66,7 @@ def check(name: str):
 # thứ đáng kiểm; `pretrained: false` để selftest không tải mạng (một lượt
 # Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn — xem check 14).
 SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "vit_tiny_patch16_224", 6
+SMALL_NL = 3          # ViT-Tiny có 12 block; giữ 3 block đầu để KIỂM việc cắt
 
 
 def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q):
@@ -73,7 +74,7 @@ def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q):
 
     cfg = {"vextractor": {"vextractor": {"image_size": image_size,
                                          "arch": SMALL_ARCH, "pretrained": False,
-                                         "n_query": n_query,
+                                         "n_layers": SMALL_NL, "n_query": n_query,
                                          "mlp_hidden": 64, "n_heads": 4},
                           "aligner": {"n_heads": 4, "mlp_hidden": 64},
                           "cls_head": {"n_heads": 4}}}
@@ -119,6 +120,25 @@ def _():
     p = vx.patches(x)
     assert p.shape == (2, vx.n_patch, vx.d_feat), p.shape
     assert vx.n_prefix >= 1
+    # ── CẮT còn n_layers block ĐẦU: cắt THẬT, không phải early-exit ───────
+    # 18 (ở đây 9) block còn lại không được dựng vào đồ thị, nên chúng KHÔNG có
+    # trong state_dict và không có tham số nào để optimizer chạm vào.
+    assert vx.n_layers == SMALL_NL == len(vx.body.blocks)
+    assert R.n_layers_of(sp) == SMALL_NL
+    assert not any(k.startswith(f"body.blocks.{SMALL_NL}.")
+                   for k in vx.state_dict())
+    full = R.vit_body(SMALL_ARCH, False, SMALL_IMG, None)
+    assert full[3] > SMALL_NL and full[1] == vx.d_feat      # d_feat không đổi
+    assert (sum(q.numel() for q in vx.backbone_parameters())
+            < sum(q.numel() for q in full[0].parameters()))
+    # cắt quá số block có thật -> DỪNG, không lặng lẽ dùng hết
+    for bad in (0, full[3] + 1):
+        try:
+            R.vit_body(SMALL_ARCH, False, SMALL_IMG, bad)
+        except R.VExtractorUnusable as e:
+            assert "n_layers" in str(e)
+        else:
+            raise AssertionError(f"n_layers = {bad} phải bị từ chối")
     # đường đi đúng hình: Linear d_feat→d_model NGAY, thân chạy THẲNG ở d_model,
     # MLP(GeLU) nằm GIỮA Self-attn và Cross-attn và KHÔNG đổi chiều
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == 32
@@ -590,7 +610,7 @@ def _():
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
-    from src.train_vextractor import zcfg
+    from src.train_vextractor import align_lr_at, zcfg
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
@@ -662,8 +682,35 @@ def _():
     assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
     zc = zcfg(cfg)
     # main stage: khối cam ĐÓNG BĂNG HOÀN TOÀN (không còn khoá nào để khai),
-    # Aligner học ở lr CỐ ĐỊNH 1e-5
+    # Aligner warm-up 20 bước rồi CỐ ĐỊNH 1e-5
     assert (zc["align_lr"], zc["align_wd"]) == (1e-5, 0.01)
+    assert (zc["align_warmup_steps"], zc["align_warmup_start_lr"]) == (20, 1e-8)
+    # ── lịch lr của Aligner: ramp TUYẾN TÍNH trên GIÁ TRỊ rồi PHẲNG ───────
+    w, s_al, hi = 20, 1e-8, 1e-5
+    at = lambda k: s_al + (hi - s_al) * (k + 1) / w   # noqa: E731
+    assert abs(align_lr_at(0, zc) - at(0)) < 1e-18    # bước 1 = ĐÚNG 1e-8-ish
+    assert align_lr_at(0, zc) < hi / 10               # không phải hi/w cũng không phải hi
+    assert abs(align_lr_at(w // 2 - 1, zc) - (s_al + (hi - s_al) * 0.5)) < 1e-18
+    assert abs(align_lr_at(w - 1, zc) - hi) < 1e-18   # hết warm-up = đỉnh
+    # PHẲNG tới tận bước cuối của main stage (200 bước) — không anneal
+    assert all(abs(align_lr_at(k, zc) - hi) < 1e-18 for k in (w, 50, 199, 1999))
+    ramp = [align_lr_at(k, zc) for k in range(w)]
+    assert all(a <= b + 1e-20 for a, b in zip(ramp, ramp[1:]))   # không tụt
+    # tắt warm-up -> phẳng ngay từ bước 0
+    assert align_lr_at(0, dict(zc, align_warmup_steps=0)) == hi
+    # khoá sai bị TỪ CHỐI, không lặng lẽ chạy
+    for bad in ({"align_warmup_steps": -1},
+                {"align_warmup_start_lr": 0.0},
+                {"align_warmup_start_lr": 1e-3}):   # > align_lr: đầu dốc ở trên đỉnh
+        c2 = dict(cfg)
+        c2["vextractor"] = dict(cfg["vextractor"],
+                                main=dict(cfg["vextractor"]["main"], **bad))
+        try:
+            zcfg(c2)
+        except Exception as e:
+            assert "align_warmup" in str(e), (bad, e)
+        else:
+            raise AssertionError(f"{bad} phải bị từ chối")
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert not (set(zc) & {"vext_lr", "vext_wd", "freeze_vext_epochs"})
     # khoá của bố cục CŨ trong config phải bị TỪ CHỐI, không bỏ qua im lặng
@@ -681,7 +728,10 @@ def _():
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448 and int(rv["image_size"]) % 16 == 0
     assert (int(rv["image_size"]) // 16) ** 2 == 784            # lưới patch ViT
-    assert rv["arch"] == "vit_small_patch16_224.augreg_in1k"
+    assert rv["arch"] == "vit_large_patch16_224.augreg_in21k_ft_in1k"
+    # ViT-L/16: 24 block, giữ 6 block ĐẦU. `n_layers` là khoá của spec nên đổi
+    # nó -> lệch `spec_fingerprint` -> `branch_stale` bắt được weight cũ.
+    assert int(rv["n_layers"]) == 6
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
     assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
@@ -768,9 +818,10 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
-                                        "pretrained": True, "n_query": SMALL_Q,
-                                        "mlp_hidden": 64,
+                                        "pretrained": True, "n_layers": SMALL_NL,
+                                        "n_query": SMALL_Q, "mlp_hidden": 64,
                                         "n_heads": 4},
+                         "aligner": {"n_heads": 4, "mlp_hidden": 64},
                          "cls_head": {"n_heads": 4}}
     # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
     # thật đã tắt) và TẮT patience + `select: last` để số epoch cố định 4.
@@ -789,7 +840,8 @@ def _():
     # vẫn là True nên guard "pretrained phải bật" của `run` đi qua thật.
     orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
             s0.ImageOnlyDataset.pixels, R.vit_body)
-    R.vit_body = lambda arch, pretrained, image_size: orig[4](arch, False, image_size)
+    R.vit_body = (lambda arch, pretrained, image_size, n_layers=None:
+                  orig[4](arch, False, image_size, n_layers))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})
     s0.assert_same_pixels = lambda *_a, **_k: None
@@ -896,9 +948,10 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
-                                        "pretrained": True, "n_query": SMALL_Q,
-                                        "mlp_hidden": 64,
+                                        "pretrained": True, "n_layers": SMALL_NL,
+                                        "n_query": SMALL_Q, "mlp_hidden": 64,
                                         "n_heads": 4},
+                         "aligner": {"n_heads": 4, "mlp_hidden": 64},
                          "cls_head": {"n_heads": 4}}
     # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
@@ -913,7 +966,8 @@ def _():
     lut = {k: np.eye(3, dtype=np.float32)[rng.integers(0, 3, L)] for k in keys}
     orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
             s0.ImageOnlyDataset.pixels, R.vit_body, R.ClsCounter)
-    R.vit_body = lambda arch, pretrained, image_size: orig[4](arch, False, image_size)
+    R.vit_body = (lambda arch, pretrained, image_size, n_layers=None:
+                  orig[4](arch, False, image_size, n_layers))
     R.ClsCounter = FakeCounter
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})

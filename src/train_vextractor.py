@@ -22,9 +22,14 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                  hỏi của lần chạy này là "một Aligner học được, đứng giữa một
                  khối thị giác CỐ ĐỊNH và decoder, đủ để đổi chất lượng báo cáo
                  chưa" — mở băng nó giữa chừng là trộn hai biến vào một lượt.
-                 Aligner (khởi tạo ngẫu nhiên, không có ở Stage 0) học ở lr CỐ
-                 ĐỊNH `vextractor.main.align_lr` = 1e-5, wd 0.01, PHẲNG từ bước
-                 0 tới bước cuối — không warm-up, không anneal;
+                 Aligner (khởi tạo ngẫu nhiên, không có ở Stage 0) học ở lr
+                 `vextractor.main.align_lr` = 1e-5, wd 0.01: warm-up TUYẾN TÍNH
+                 theo BƯỚC từ 1e-8 trong `align_warmup_steps` = 20/200 bước rồi
+                 PHẲNG tới bước cuối — không anneal. 20 bước warm-up vì Aligner
+                 là khối DUY NHẤT khởi tạo ngẫu nhiên, kẹp giữa một khối thị
+                 giác đã dạy xong và một decoder đã dạy xong: một bước Adam ở lr
+                 đầy đủ trên ma trận ngẫu nhiên là cách chắc nhất để Q lệch khỏi
+                 phân phối mà LoRA đang học cùng lúc;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh. Clip chung
                  thì chuẩn gradient của nhánh kéo nhỏ bước cập nhật LoRA —
                  một khác biệt thứ hai so với A.
@@ -43,7 +48,7 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ViT-Small/16 ở 448²
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt 6 block ViT-L/16 ở 448²
 cho mỗi ảnh. Lượt ViT ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
 giữ activation nào — phần nặng còn lại của nhánh là Aligner trên đúng 32 token.
 
@@ -100,11 +105,51 @@ def zcfg(cfg: Cfg) -> dict:
                             + "\n    ".join(bad))
     out = {"align_lr": float(m.get("align_lr", 1e-5)),
            "align_wd": float(m.get("align_wd", 0.01)),
+           # Warm-up theo BƯỚC (không theo epoch: main stage chỉ có 1 epoch =
+           # 200 bước, nên đơn vị epoch ở đây là một nấc duy nhất).
+           "align_warmup_steps": int(m.get("align_warmup_steps", 20)),
+           "align_warmup_start_lr": float(m.get("align_warmup_start_lr", 1e-8)),
            "separate_clip": bool(m.get("separate_clip", True))}
     if out["align_lr"] <= 0:
         raise TrainUnusable(f"vextractor.main.align_lr {out['align_lr']} phải > 0 "
                             f"— Aligner là tham số DUY NHẤT của nhánh được học.")
+    if out["align_warmup_steps"] < 0:
+        raise TrainUnusable(f"vextractor.main.align_warmup_steps "
+                            f"{out['align_warmup_steps']} phải >= 0 (0 = tắt).")
+    s0, hi = out["align_warmup_start_lr"], out["align_lr"]
+    if out["align_warmup_steps"] and not 0 < s0 <= hi:
+        raise TrainUnusable(
+            f"vextractor.main.align_warmup_start_lr {s0} phải > 0 và <= "
+            f"align_lr {hi} — đây là ĐẦU dốc warm-up, không phải đỉnh.")
     return out
+
+
+def align_lr_at(step: int, zc: dict) -> float:
+    """lr của Aligner tại bước `step` (0-based) — ramp TUYẾN TÍNH rồi PHẲNG.
+
+        f  = min(1, (step + 1) / align_warmup_steps)
+        lr = align_warmup_start_lr + (align_lr − align_warmup_start_lr) · f
+
+    Cùng quy ước với warm-up của Stage 0 (`stage0_vextractor.base_lr_at`): nội
+    suy trên GIÁ TRỊ lr chứ không nhân hệ số, nên bước 1 có ĐÚNG
+    `align_warmup_start_lr`. Nhân `align_lr · f` thì bước 1 ra align_lr/20, tức
+    đầu dốc bị quyết định bởi số bước warm-up thay vì bởi một khoá trong config.
+
+    Vì sao Aligner cần warm-up dù chỉ có 20 bước: nó là khối DUY NHẤT của nhánh
+    khởi tạo ngẫu nhiên, và ở bước 0 nó đứng giữa một khối thị giác đã được dạy
+    xong và một decoder đã được dạy xong. Bước Adam đầu tiên ở lr đầy đủ trên
+    một ma trận ngẫu nhiên là cách chắc chắn nhất để Q lệch hẳn khỏi phân phối
+    mà LoRA đang học cùng lúc — 20 bước = 10% của 200 bước, đủ để moment của
+    AdamW ổn định trước khi bước cập nhật lớn dần.
+
+    `align_warmup_steps = 0` -> phẳng 1e-5 ngay từ bước 0.
+    """
+    w = int(zc["align_warmup_steps"])
+    hi = float(zc["align_lr"])
+    if w <= 0:
+        return hi
+    s0 = float(zc["align_warmup_start_lr"])
+    return s0 + (hi - s0) * min(1.0, (int(step) + 1) / w)
 
 
 class VExtReportDataset(ClsReportDataset):
@@ -359,15 +404,22 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước dù grad là None.
     align_p = list(branch.aligner_parameters())
     opt_b = torch.optim.AdamW(
-        [{"params": align_p, "lr": zc["align_lr"], "weight_decay": zc["align_wd"],
+        [{"params": align_p, "lr": align_lr_at(0, zc), "weight_decay": zc["align_wd"],
           "name": "aligner"}], betas=(0.9, 0.999), eps=1e-8)
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
+    _aw = int(zc["align_warmup_steps"])
+    _asched = (f"CỐ ĐỊNH {zc['align_lr']:g} suốt {steps} bước" if _aw <= 0 else
+               f"warm-up tuyến tính {zc['align_warmup_start_lr']:g} -> "
+               f"{zc['align_lr']:g} trong {_aw}/{steps} bước rồi CỐ ĐỊNH")
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
-          f"V-Extractor ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · Aligner lr CỐ ĐỊNH "
-          f"{zc['align_lr']:g} wd {zc['align_wd']} suốt {steps} bước · "
+          f"V-Extractor ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · Aligner {_asched} "
+          f"wd {zc['align_wd']} · "
           f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}", flush=True)
+    if 0 < _aw >= steps:
+        print(f"  ⚠ align_warmup_steps {_aw} >= tổng {steps} bước: Aligner KHÔNG "
+              f"bao giờ chạm {zc['align_lr']:g}.", flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
     from . import autobatch
@@ -523,6 +575,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     step_ce = 0.0
     rel_last = 0.0
     for step in range(steps):
+        # lr của Aligner là hàm THUẦN của số bước — không có scheduler nào giữ
+        # trạng thái, nên nó tái lập được và không lệch khi `steps` bị override.
+        alr = align_lr_at(step, zc)
+        opt_b.param_groups[0]["lr"] = alr
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
         step_ce = 0.0
@@ -548,10 +604,13 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             lr_now = opt.param_groups[0]["lr"]
             print(f"    [{aid}] bước {step + 1}/{steps} · ce {step_ce:.4f} · "
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} nhánh "
-                  f"{gn_br or 0:.3f} (Aligner) · lr {lr_now:.2e}", flush=True)
+                  f"{gn_br or 0:.3f} (Aligner) · lr {lr_now:.2e} · lr_align "
+                  f"{alr:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
-                             f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
+                             f"train/{aid}/lr": lr_now,
+                             f"train/{aid}/lr_aligner": alr,
+                             f"train/{aid}/step": step + 1,
                              f"train/{aid}/q_rms_rel": rel_last,
                              f"train/{aid}/grad_norm_lora": gn_lora,
                              f"train/{aid}/grad_norm_branch": gn_br,

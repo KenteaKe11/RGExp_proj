@@ -347,7 +347,7 @@ def _vext_pre_map(branch, px, g_out, dev):
     Kết quả đọc là: *nếu Aligner không xoay gì, decoder sẽ đòi ảnh ở đâu*. Hiệu
     giữa nó và `sal_vext` là phần Aligner — khối DUY NHẤT được học ở main stage.
 
-    Chạy một lượt forward/backward RIÊNG qua khối cam (ViT-Small trên một ảnh)
+    Chạy một lượt forward/backward RIÊNG qua khối cam (6 block ViT-L trên một ảnh)
     thay vì `retain_graph=True` ở `y.backward()`: giữ lại đồ thị của cả decoder
     4B chỉ để dùng một nhánh con của nó là cách chắc chắn nhất để Lens hết VRAM
     trên đúng máy đang chạy được main stage.

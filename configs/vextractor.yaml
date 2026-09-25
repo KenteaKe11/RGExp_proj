@@ -20,7 +20,8 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ViT-Small/16 ăn ảnh 448²) — và chuỗi dài thêm 32.
+# đây nhánh có encoder RIÊNG (ViT-L/16 ăn ảnh 448², 6 block đầu) — và chuỗi dài
+# thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
 # generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
@@ -301,13 +302,13 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: ViT-Small/16 pretrain ImageNet-1k ăn thẳng ảnh gốc
-# resize 448×448 -> lưới 28×28 = 784 patch × 384. Lưới ấy KHÔNG phải khối Q (784
+# Nhánh có ENCODER RIÊNG: ViT-L/16 pretrain ImageNet ăn thẳng ảnh gốc resize
+# 448×448 -> lưới 28×28 = 784 patch × 1024. Lưới ấy KHÔNG phải khối Q (784
 # quá dài để nối vào chuỗi decoder): `n_query` learner vector đi HỎI nó qua
 # Cross-Attn. Đường đi, đúng hình:
 #
 #   KHỐI CAM (V-Extractor) — Stage 0 dạy, main stage ĐÓNG BĂNG HOÀN TOÀN:
-#     784 patch ─► Linear 384→2560 ─► RMSNorm(2560) ────────────────┐
+#     784 patch ─► Linear 1024→2560 ─► RMSNorm(2560) ───────────────┐
 #     32 learner Q ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
 #                    │                      └──────── skip ────────────────┘
 #                    │                                    │
@@ -327,14 +328,25 @@ labels:
 #
 # `n_query` là khoá KHAI TƯỜNG MINH. Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi
 # từ `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi
-# checkpoint — checkpoint ViT ImageNet-1k họ AugReg dùng 0.5/0.5 chứ không phải
+# checkpoint — checkpoint ViT họ AugReg dùng 0.5/0.5 chứ không phải
 # mean/std của ImageNet, nên một cặp số gõ tay ở đây là sai lặng lẽ.
 vextractor:
   n_labels: null            # null = theo labels.npz (14)
   vextractor:               # KHỐI CAM: ảnh (3, 448, 448) -> Q_raw (32, 2560)
     image_size: 448         # PHẢI chia hết patch size (16). 448/16 = 28 -> 784 patch
-    arch: vit_small_patch16_224.augreg_in1k   # timm; lần chạy đầu tải ~85 MB
-    pretrained: true        # ImageNet-1k. false bị TỪ CHỐI (câu hỏi khác hẳn)
+    # timm; lần chạy đầu tải ~1,2 GB (CẢ 24 block được tải rồi mới cắt).
+    # `augreg_in21k_ft_in1k` = pretrain ImageNet-21k, fine-tune ImageNet-1k —
+    # đây là checkpoint ImageNet chuẩn của ViT-L/16 (họ AugReg không có bản
+    # in1k thuần cho ViT-L). Chuẩn hoá của nó vẫn là 0.5/0.5 như bản ViT-S cũ.
+    arch: vit_large_patch16_224.augreg_in21k_ft_in1k
+    pretrained: true        # ImageNet. false bị TỪ CHỐI (câu hỏi khác hẳn)
+    # Số block ĐẦU được giữ lại. CẮT THẬT: `net.blocks` bị thay bằng 6 block
+    # đầu, nên 18 block còn lại không vào đồ thị, không vào state_dict, không
+    # chiếm VRAM, không có tham số nào để optimizer chạm vào — ViT-L từ 304 M
+    # xuống 77 M. Phần nhánh cần là biểu diễn thị giác còn mang cấu trúc không
+    # gian (nằm ở đầu ViT); đuôi của nó đã chuyên hoá cho phân loại 1000 lớp.
+    # null = dùng hết 24 block. `net.norm` (LayerNorm cuối) vẫn chạy sau khi cắt.
+    n_layers: 6
     n_query: 32             # số learner vector = số token Q nối vào chuỗi decoder
     n_heads: 20             # Self/Cross-attn ở 2560: head_dim 128 (2560 = 20 × 128)
     mlp_hidden: 3072        # MLP(GeLU) GIỮA hai attn: 2560 -> 3072 -> 2560
@@ -347,19 +359,32 @@ vextractor:
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
     dropout: 0.1
   # ── Main stage ─────────────────────────────────────────────────────────
-  # ĐÚNG MỘT nhóm tham số học được trong nhánh: Aligner, lr CỐ ĐỊNH, PHẲNG từ
-  # bước 0 tới bước cuối. Khối cam đã được Stage 0 dạy xong và bị đóng băng
-  # HOÀN TOÀN (requires_grad=False + eval + chạy trong no_grad + KHÔNG nằm
-  # trong optimizer) — không còn `freeze_vext_epochs`, không còn bước mở băng.
-  # LoRA của decoder vẫn chạy ĐÚNG lịch one-cycle của $1 (khối `train`).
+  # ĐÚNG MỘT nhóm tham số học được trong nhánh: Aligner. Khối cam đã được
+  # Stage 0 dạy xong và bị đóng băng HOÀN TOÀN (requires_grad=False + eval +
+  # chạy trong no_grad + KHÔNG nằm trong optimizer) — không còn
+  # `freeze_vext_epochs`, không còn bước mở băng. LoRA của decoder vẫn chạy
+  # ĐÚNG lịch one-cycle của $1 (khối `train`).
+  #
+  # Lịch lr của Aligner: warm-up TUYẾN TÍNH theo BƯỚC 20/200 rồi PHẲNG 1e-5 tới
+  # bước cuối. Không anneal. lr là hàm THUẦN của số bước (`align_lr_at`), không
+  # có scheduler giữ trạng thái.
   main:
-    align_lr: 1.0e-5        # lr CỐ ĐỊNH của Aligner (lr_fix)
+    align_lr: 1.0e-5        # lr CỐ ĐỊNH sau warm-up (lr_fix)
     align_wd: 0.01
+    # Vì sao Aligner cần warm-up dù chỉ 20 bước: nó là khối DUY NHẤT của nhánh
+    # khởi tạo NGẪU NHIÊN, kẹp giữa một khối thị giác đã dạy xong (Stage 0) và
+    # một decoder đã dạy xong ($1). Một bước Adam ở lr đầy đủ trên ma trận ngẫu
+    # nhiên là cách chắc nhất để Q lệch hẳn khỏi phân phối mà LoRA đang học
+    # cùng lúc. 20 = 10% của 200 bước, đủ để moment AdamW ổn định. 0 = tắt.
+    align_warmup_steps: 20
+    # ĐẦU dốc, cùng quy ước với `stage0.warmup_start_lr`: nội suy trên GIÁ TRỊ
+    # lr nên bước 1 có ĐÚNG 1e-8, không phải align_lr/20.
+    align_warmup_start_lr: 1.0e-8
     separate_clip: true     # clip_grad_norm_ riêng LoRA / Aligner
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
 # Aligner KHÔNG có mặt ở đây: Cls Head đọc THẲNG Q_raw của khối cam.
-# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-Small + hai khối
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy 6 block ViT-L + hai khối
 # attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
 # MỘT lr cho TẤT CẢ: 1e-5, PHẲNG suốt quá trình. Optimizer vẫn giữ hai nhóm

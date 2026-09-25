@@ -104,8 +104,9 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                           f"({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
          f"V-Extractor nạp TRỌN từ Stage 0 và ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · "
-         f"Aligner MỚI, lr cố định {zm.get('align_lr')} wd {zm.get('align_wd')} "
-         f"· Cls Head bỏ"],
+         f"Aligner MỚI, warm-up {zm.get('align_warmup_steps')} bước từ "
+         f"{zm.get('align_warmup_start_lr')} rồi lr cố định {zm.get('align_lr')} "
+         f"wd {zm.get('align_wd')} · Cls Head bỏ"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
@@ -212,7 +213,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     L.append(f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage: 0 bước cập nhật, "
              f"không có gradient nào chạm vào nó. Tham số học được mà A không có nằm "
              f"TRỌN trong Aligner ({_np.get('aligner', '?'):,} tham số nếu là số) ở lr "
-             f"cố định {zm.get('align_lr')} — nên chênh lệch A/B là của một khối thị "
+             f"cố định {zm.get('align_lr')} (warm-up {zm.get('align_warmup_steps')} "
+             f"bước đầu) — nên chênh lệch A/B là của một khối thị "
              f"giác CỐ ĐỊNH cộng một phép xoay học được, không phải của một encoder "
              f"được finetune thêm." if isinstance(_np.get("aligner"), int) else
              f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
