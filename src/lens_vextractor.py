@@ -35,17 +35,25 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
    lớp cuối): phép đọc tuyến tính bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra
    token vô nghĩa.
-3. [Visual] BỐN ô đối chứng trên cùng một ảnh. Ở §2.2 hai nhánh KHÔNG còn
-   chung đầu vào: đường Z đi qua SigLIP (4096 patch, lưới 64×64), đường Q đi
-   qua ViT-Small/16 ăn thẳng ảnh 448×448. Bốn ô là: (1) ảnh gốc; (2) HOẠT ĐỘ đầu ra
-   SigLIP `‖X_p − mean(X)‖` — không gradient, không dính decoder; (3)
-   `‖∂y/∂X‖` qua `y -> Z -> projector -> X`; (4) `‖∂y/∂I‖` qua
-   `y -> Q -> V-Extractor -> I` với I là chính ảnh 448² (chuẩn trên 3 kênh).
-   Ba câu hỏi xếp chồng: *đầu ra SigLIP có gì để học* -> *adapter rút được gì
-   qua đường cũ* -> *encoder RIÊNG của nhánh rút được gì*. Ô 4 mịn hơn hẳn (448²
-   so với 64²) vì gradient về tới tận pixel chứ không dừng ở patch; để so số
-   với ô 2/ô 3 nó được gộp về lưới 64×64 (`sal_vext_64`), và mọi tương quan /
-   IoU ở mục "Kiểm nhanh" tính trên lưới chung ấy.
+3. [Visual] BỐN ô đối chứng trên cùng một ảnh, tất cả là đạo hàm của CÙNG số y:
+   (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
+   ĐẦU RA encoder (lưới 64²); (3) đầu ra V-Extractor (`Q_raw`) về THẲNG ảnh gốc
+   (448²); (4) `‖∂y/∂I‖` qua `y -> Q -> Aligner -> V-Extractor -> I`, tức 32
+   vector SAU Aligner về thẳng ảnh gốc (448²).
+
+   **Ô 3 và ô 4 khác nhau ĐÚNG bằng Aligner.** `∂y/∂I` là chain rule nên nó đã
+   bao gồm cả Aligner — không có "gradient tới pixel không đi qua Aligner" nào
+   cả, và chọn lá khác chỉ cho lại đúng ô 4. Nên ô 3 được dựng bằng cách ĐÈ
+   Jacobian của Aligner bằng identity: lấy `g = ∂y/∂Q` (gradient ở ĐẦU RA
+   Aligner) rồi bơm thẳng nó vào `Q_raw` và lan về ảnh qua riêng khối cam. Ô 3 =
+   "bản đồ sẽ ra sao nếu Aligner không xoay gì", ô 4 = bản đồ THẬT. Khối cam
+   đóng băng hoàn toàn ở main stage, nên hiệu hai ô là phần Aligner đóng góp —
+   đúng thứ DUY NHẤT được học ở đó.
+
+   Ô 3/ô 4 mịn hơn hẳn ô 2 (448² so với 64²) vì gradient về tới tận pixel chứ
+   không dừng ở patch; để so số với ô 2 chúng được gộp về lưới 64×64
+   (`sal_vext_64`, `sal_vext_pre_64`), và mọi tương quan / IoU ở mục "Kiểm
+   nhanh" tính trên lưới chung ấy.
 """
 from __future__ import annotations
 
@@ -205,12 +213,15 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
       * `sal_z`    = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64;
       * `sal_vext` = ‖∂y/∂I‖ trên chính ảnh 448×448 của nhánh, chuẩn trên 3
-        kênh -> lưới 448×448. Gradient về tới TẬN PIXEL: `patch_embed` của ViT
-        là một conv stride 16, nên đường về pixel không bị chặn ở đâu cả.
+        kênh -> lưới 448×448 (SAU Aligner). Gradient về tới TẬN PIXEL:
+        `patch_embed` của ViT là một conv stride 16, nên đường về pixel không
+        bị chặn ở đâu cả;
+      * `sal_vext_pre` = CÙNG bản đồ ấy nhưng ĐÈ Jacobian của Aligner bằng
+        identity (TRƯỚC Aligner) — xem `_vext_pre_map`.
 
-    `sal_vext_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
-    tương quan / IoU đều tính trên lưới chung ấy, không phải trên hai lưới khác
-    độ phân giải.
+    `sal_vext_64` / `sal_vext_pre_64` là bản gộp trung bình về 64×64 để so được
+    với `sal_z` — mọi tương quan / IoU đều tính trên lưới chung ấy, không phải
+    trên hai lưới khác độ phân giải.
     """
     import torch
 
@@ -226,7 +237,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     aligned = proj(leaf_z)
     img_tok = recombiner.image_token_id(gemma)
     span = _image_span(ids, img_tok)
-    leaf_r, q, ins = None, None, None
+    leaf_r, q, q_al, ins = None, None, None, None
     if branch is not None:
         # Nhánh bị đóng băng lúc nạp lại (forward trong no_grad). Ở Lens ta cần đồ
         # thị để chain rule đi qua nó, nên mở cờ frozen rồi khoá lại requires_grad
@@ -240,9 +251,12 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
             p.requires_grad_(False)
         # LÁ gradient của đường Q là chính ẢNH 448² (không phải X của SigLIP).
         leaf_r = batch["vext_pixels"].detach().clone().float().requires_grad_(True)
+        # Tách làm HAI chặng để giữ được node ở ĐẦU RA Aligner: `q_al.grad` =
+        # ∂y/∂Q, và đó là thứ ô "trước Aligner" cần bơm ngược vào Q_raw.
         with RCV.autocast(dev):
-            q = branch(leaf_r)
-        q = q.to(aligned.dtype)
+            q_al = branch.aligner(branch.vextractor(leaf_r))
+        q_al.retain_grad()
+        q = q_al.to(aligned.dtype)
         branch.set_frozen(was_frozen)
         for p in branch.parameters():
             p.requires_grad_(False)
@@ -303,23 +317,61 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
             return None
         return leaf.grad[0].float().norm(dim=0).detach().cpu().numpy()
 
-    # Bản đồ HOẠT ĐỘ của chính đầu ra SigLIP — KHÔNG gradient, không phụ thuộc
-    # decoder: ‖X_p − X̄‖ trên từng patch. Trừ patch trung bình vì X có một thành
-    # phần nền chung rất lớn ở mọi vị trí; giữ nguyên thì bản đồ gần như phẳng và
-    # không đọc được gì. Đây là mốc "encoder còn phân biệt được gì trên ảnh này"
-    # TRƯỚC khi có projector hay nhánh.
-    xv = vis[0].float().detach()
-    act = (xv - xv.mean(dim=0, keepdim=True)).norm(dim=-1).cpu().numpy()
-    act = act[: n * n].reshape(n, n)
-
     sal_v = pixel_grid(leaf_r)
-    return {"layer_sens": sens, "sal_z": grid(leaf_z), "sal_vext": sal_v,
-            "sal_vext_64": pool_to(sal_v, n), "act_siglip": act,
-            "hidden_last": np.stack([h[0, -1].float().detach().cpu().numpy()
-                                     for h in hs[1:]]),
-            "y": float(y.detach()), "target": tgt_info,
-            "n_tokens": int(kw["inputs_embeds"].shape[1]), "grid": n,
-            "image_span": span, "insert_span": ins}
+    sal_pre = (_vext_pre_map(branch, batch["vext_pixels"], q_al.grad, dev)
+               if (branch is not None and q_al is not None
+                   and q_al.grad is not None) else None)
+    out_d = {"layer_sens": sens, "sal_z": grid(leaf_z), "sal_vext": sal_v,
+             "sal_vext_64": pool_to(sal_v, n),
+             "hidden_last": np.stack([h[0, -1].float().detach().cpu().numpy()
+                                      for h in hs[1:]]),
+             "y": float(y.detach()), "target": tgt_info,
+             "n_tokens": int(kw["inputs_embeds"].shape[1]), "grid": n,
+             "image_span": span, "insert_span": ins}
+    if sal_pre is not None:
+        out_d["sal_vext_pre"] = sal_pre
+        out_d["sal_vext_pre_64"] = pool_to(sal_pre, n)
+    return out_d
+
+
+def _vext_pre_map(branch, px, g_out, dev):
+    """Bản đồ ảnh TRƯỚC Aligner: ĐÈ Jacobian của Aligner bằng identity.
+
+    `∂y/∂I` là chain rule — nó đi qua Aligner rồi mới tới khối cam, nên KHÔNG có
+    cách nào "tắt" Aligner bằng cách chọn một lá khác: lá nào thì đường về pixel
+    cũng vẫn là đường ấy. Muốn tách được phần Aligner đóng góp thì phải thay
+    Jacobian của nó bằng identity, và đó đúng là việc ở đây: lấy `g = ∂y/∂Q`
+    (gradient đã tới ĐẦU RA Aligner) rồi bơm thẳng g vào `Q_raw` và lan về ảnh
+    qua RIÊNG khối cam.
+
+    Kết quả đọc là: *nếu Aligner không xoay gì, decoder sẽ đòi ảnh ở đâu*. Hiệu
+    giữa nó và `sal_vext` là phần Aligner — khối DUY NHẤT được học ở main stage.
+
+    Chạy một lượt forward/backward RIÊNG qua khối cam (ViT-Small trên một ảnh)
+    thay vì `retain_graph=True` ở `y.backward()`: giữ lại đồ thị của cả decoder
+    4B chỉ để dùng một nhánh con của nó là cách chắc chắn nhất để Lens hết VRAM
+    trên đúng máy đang chạy được main stage.
+    """
+    import torch
+
+    if g_out is None:
+        return None
+    was = branch.frozen
+    branch.set_frozen(False)
+    for prm in branch.parameters():
+        prm.requires_grad_(False)
+    try:
+        leaf = px.detach().clone().float().requires_grad_(True)
+        with RCV.autocast(dev):
+            q_raw = branch.vextractor(leaf)
+        q_raw.backward(gradient=g_out.detach().to(q_raw.dtype))
+        g = (leaf.grad[0].float().norm(dim=0).detach().cpu().numpy()
+             if leaf.grad is not None else None)
+    finally:
+        branch.set_frozen(was)
+        for prm in branch.parameters():
+            prm.requires_grad_(False)
+    return g
 
 
 def last_layers(n_layers: int, frac: float) -> list[int]:
@@ -455,25 +507,28 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
 
 
 def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
-    """BỐN ô đối chứng nhau trên cùng một ảnh — ba chặng của cùng một đường đi.
+    """BỐN ô đối chứng nhau trên cùng một ảnh — đường cũ, rồi nhánh trước/sau Aligner.
 
     1. **ảnh gốc** — mốc để đọc ba ô còn lại.
-    2. **đầu ra SigLIP**: ‖X_p − X̄‖, bản đồ HOẠT ĐỘ, không gradient, không dính
-       tới decoder. Vision tower đóng băng nên ô này là *chất lượng đầu vào*:
-       encoder còn phân biệt được gì trên ảnh này TRƯỚC khi qua bất cứ nhánh nào.
-       Phẳng lì ở đây thì hai ô sau có sáng cũng không thể là thông tin ảnh.
-    3. **Z**: ‖∂y/∂X‖ theo đường `y → Z → projector → X` — đường cũ, đo xem
+    2. **Z**: ‖∂y/∂X‖ theo đường `y → Z → projector → X` — đường cũ, đo xem
        decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Lưới 64².
-    4. **Q**: ‖∂y/∂I‖ theo đường `y → Q → V-Extractor → I` — nhánh mới, với I
-       là chính ảnh 448² của nó. Lưới 448², tức MỊN HƠN ô 3 bảy lần mỗi chiều:
-       gradient về tới tận pixel qua `patch_embed`, không dừng ở patch.
+    3. **Q trước Aligner**: cùng bản đồ ảnh của ô 4 nhưng ĐÈ Jacobian của
+       Aligner bằng identity (`_vext_pre_map`) — *nếu Aligner không xoay gì thì
+       decoder đòi ảnh ở đâu*. Lưới 448².
+    4. **Q sau Aligner**: ‖∂y/∂I‖ theo đường `y → Q → Aligner → V-Extractor → I`
+       — bản đồ THẬT, với I là chính ảnh 448² của nhánh. Lưới 448², tức MỊN HƠN
+       ô 2 bảy lần mỗi chiều: gradient về tới tận pixel qua `patch_embed`, không
+       dừng ở patch.
 
-    Ba câu hỏi xếp chồng: *có gì để học* (2) → *adapter học được gì qua đường cũ*
-    (3) → *encoder riêng của nhánh học được gì* (4). Ô 2 KHÁC BẢN CHẤT hai ô sau
-    (hoạt độ, không phải độ nhạy; đơn vị khác hẳn), và ô 4 khác ĐỘ PHÂN GIẢI hai
-    ô kia — nên MỖI ô tự chuẩn hoá [0,1] và chỉ so HÌNH DẠNG, tuyệt đối không so
-    độ sáng. Số để so định lượng nằm ở mục "Kiểm nhanh" (tương quan / IoU, tính
-    trên lưới chung 64²), không đọc bằng mắt.
+    **Ô 3 so ô 4 là câu hỏi về riêng Aligner.** Khối cam đóng băng hoàn toàn ở
+    main stage, nên Aligner là thứ DUY NHẤT được học — hai ô này giống nhau đúng
+    ở phần khối cam và khác nhau đúng ở phần nó. Trùng khít = Aligner chỉ đổi
+    tỉ lệ; lệch hẳn = nó đang lái nhu cầu của decoder sang vùng khác của ảnh.
+
+    Ô 3/ô 4 khác ĐỘ PHÂN GIẢI với ô 2 (448² so với 64²) — nên MỖI ô tự chuẩn hoá
+    [0,1] và chỉ so HÌNH DẠNG, tuyệt đối không so độ sáng. Số để so định lượng
+    nằm ở mục "Kiểm nhanh" (tương quan / IoU, tính trên lưới chung 64²), không
+    đọc bằng mắt.
 
     Độ mờ theo TỪNG ĐIỂM: alpha = `overlay_alpha` × m, nên chỗ không nhạy gần như
     trong suốt và ảnh gốc vẫn đọc được, chỗ nhạy mới ăn màu.
@@ -487,12 +542,12 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
         img = np.asarray(im.convert("L"), dtype=float) / 255.0
     H, W = img.shape
     cmap = plt.get_cmap(cfg_l["cmap"])
-    # "mean(X)" chứ không phải "X̄": dấu ngang kết hợp (U+0304) không có trong
-    # font mặc định của matplotlib nên nó rơi mất, thành "X" trần gây hiểu nhầm.
-    panels = [("đầu ra SigLIP\n‖X_p − mean(X)‖ · hoạt độ, không gradient",
-               res.get("act_siglip")),
-              ("Z\ny → Z → projector → X", res.get("sal_z")),
-              ("Q\ny → Q → V-Extractor → ảnh 448²", res.get("sal_vext"))]
+    panels = [("Z\ny → Z → adapter → vision encoder (X)\nlưới 64², DỪNG ở đầu ra encoder",
+               res.get("sal_z")),
+              ("đầu ra V-Extractor (Q_raw)\nvề THẲNG ảnh gốc · 448²\n"
+               "Jacobian(Aligner) := identity", res.get("sal_vext_pre")),
+              ("32 vector SAU Aligner (Q)\nvề THẲNG ảnh gốc · 448²",
+               res.get("sal_vext"))]
     panels = [(t, m) for t, m in panels if m is not None]
     fig, axes = plt.subplots(1, 1 + len(panels), dpi=150,
                              figsize=(3.45 * (1 + len(panels)), 4.1))
@@ -590,7 +645,7 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
 
     # ── số liệu thô ────────────────────────────────────────────────────────
     raw = {"layer_sens": res["layer_sens"], "sal_vext": res["sal_vext"]}
-    for k in ("sal_vext_64", "sal_z", "act_siglip"):
+    for k in ("sal_vext_64", "sal_vext_pre", "sal_vext_pre_64", "sal_z"):
         if res.get(k) is not None:
             raw[k] = res[k]
     np.savez_compressed(d / "lens_maps.npz", **raw)
@@ -643,27 +698,20 @@ def diagnostics(res: dict) -> dict:
         out["top10_iou"] = float((s1 & s2).sum() / max(int((s1 | s2).sum()), 1))
         out["vext_energy_ratio"] = float(
             np.linalg.norm(x) / max(np.linalg.norm(y), 1e-12))
-    a = res.get("act_siglip")
-    if a is not None:
-        av = np.asarray(a).ravel()
-        # "đầu ra SigLIP có còn cấu trúc không": phẳng lì -> max/mean ≈ 1 và 10%
-        # patch nóng nhất chỉ gánh ≈ 10% tổng hoạt độ. Có cấu trúc -> cả hai lớn hơn.
-        srt = np.sort(av)[::-1]
-        k10 = max(1, int(round(0.1 * av.size)))
-        out["siglip_activity"] = {
-            "max_over_mean": float(srt[0] / max(float(av.mean()), 1e-12)),
-            "top10_share": float(srt[:k10].sum() / max(float(av.sum()), 1e-12)),
-        }
-        # Hình dạng của ô 2 so với ô 3 / ô 4: cùng vùng hay lệch nhau.
-        cs = {}
-        for key, mm in (("z", m2), ("vext", m1)):
-            if mm is None:
-                continue
-            w = np.asarray(mm).ravel()
-            cs[key] = (float(np.corrcoef(av, w)[0, 1])
-                       if av.std() and w.std() else None)
-        if cs:
-            out["siglip_corr"] = cs
+    # Ô 3 vs ô 4 — phần Aligner đóng góp. Hai bản đồ này khác nhau ĐÚNG bằng
+    # Jacobian của Aligner (khối cam đóng băng nên phần còn lại y hệt nhau), nên
+    # đây là số đo trực tiếp của khối DUY NHẤT được học ở main stage.
+    m0 = res.get("sal_vext_pre_64")
+    if m0 is not None and m1 is not None:
+        u, v = np.asarray(m0).ravel(), np.asarray(m1).ravel()
+        al = {"corr": (float(np.corrcoef(u, v)[0, 1])
+                       if u.std() and v.std() else None),
+              "energy_ratio": float(np.linalg.norm(v)
+                                    / max(float(np.linalg.norm(u)), 1e-12))}
+        tu, tv = np.percentile(u, 90), np.percentile(v, 90)
+        su, sv = u >= tu, v >= tv
+        al["top10_iou"] = float((su & sv).sum() / max(int((su | sv).sum()), 1))
+        out["aligner_shift"] = al
     return out
 
 
@@ -688,9 +736,10 @@ def reading_guide(out: dict, res: dict) -> list[str]:
          "**Thứ tự đọc**: (0) kiểm nhanh bên dưới → (1) heatmap đủ lớp để biết "
          "decoder đọc khối **Q** ở lớp nào, mạnh bằng bao nhiêu so với token ảnh → "
          "(2) bảng logit lens ở đúng những lớp ấy để xem nó đang nghiêng về TỪ gì → "
-         "(3) bốn ô đối chứng trên ảnh: hoạt độ đầu ra SigLIP → bản đồ của Z → bản đồ "
-         "của Q. Ba tầng trả lời ba câu khác nhau: *decoder có đọc Q không*, *Q đẩy "
-         "vào chữ gì*, *SigLIP có gì để học và Z / Q lấy được từ chỗ nào trên ảnh*.\n",
+         "(3) bốn ô đối chứng trên ảnh: bản đồ của Z → bản đồ của Q TRƯỚC Aligner → "
+         "bản đồ của Q SAU Aligner. Ba tầng trả lời ba câu khác nhau: *decoder có "
+         "đọc Q không*, *Q đẩy vào chữ gì*, *Z / Q lấy được từ chỗ nào trên ảnh và "
+         "Aligner xoay nhu cầu ấy đi bao nhiêu*.\n",
          "**Chỉ có candidate B ở đây.** Z của B giống A từng bit (nhánh không đụng "
          "vào 256 token ảnh) và chuỗi chỉ dài thêm khối Q — nên **Q chính là phần "
          "B − A**, không cần chạy A rồi trừ. Con số A/B nằm ở `REPORT.md`.\n",
@@ -727,23 +776,23 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     if dg.get("top10_iou") is not None:
         rows.append(["IoU 10% patch nóng nhất (Q vs encoder)", f"{dg['top10_iou']:.2f}",
                      "đo cùng chuyện nhưng chỉ trên vùng nóng"])
-    sa = dict(dg.get("siglip_activity") or {})
-    if sa:
-        rows.append(["đầu ra SigLIP — max/mean hoạt độ",
-                     f"{sa.get('max_over_mean', float('nan')):.1f}",
-                     "≈1 = bản đồ phẳng lì, encoder không phân biệt được vùng nào "
-                     "với vùng nào trên ảnh này — ô 2 của hình 3 vô nghĩa, và hai ô "
-                     "sau có sáng cũng không thể là thông tin ảnh"])
-        rows.append(["đầu ra SigLIP — 10% patch nóng nhất gánh",
-                     f"{100 * sa.get('top10_share', float('nan')):.0f}%",
-                     "≈10% = phẳng; càng cao càng tập trung vào một vùng hẹp"])
-    sc = dict(dg.get("siglip_corr") or {})
-    for key, lab in (("z", "Z"), ("vext", "Q")):
-        if sc.get(key) is not None:
-            rows.append([f"tương quan bản đồ {lab} với hoạt độ SigLIP",
-                         f"{sc[key]:+.2f}",
-                         f"gần 1 = {lab} bám đúng chỗ encoder vốn đã có tín hiệu "
-                         f"mạnh; gần 0 = {lab} đang lấy từ vùng encoder coi là nền"])
+    al = dict(dg.get("aligner_shift") or {})
+    if al.get("corr") is not None:
+        rows.append(["tương quan bản đồ Q TRƯỚC vs SAU Aligner",
+                     f"{al['corr']:+.2f}",
+                     "≈1 = Aligner chỉ đổi tỉ lệ, không lái nhu cầu của decoder "
+                     "sang vùng khác của ảnh; thấp = nó thật sự xoay hướng — "
+                     "đây là số đo của khối DUY NHẤT được học ở main stage"])
+    if al.get("top10_iou") is not None:
+        rows.append(["IoU 10% vùng nóng nhất (trước vs sau Aligner)",
+                     f"{al['top10_iou']:.2f}",
+                     "cùng chuyện nhưng chỉ trên vùng nóng"])
+    if al.get("energy_ratio") is not None:
+        rows.append(["‖bản đồ sau Aligner‖ / ‖trước Aligner‖",
+                     f"{al['energy_ratio']:.2f}",
+                     ">1 = Aligner khuếch đại nhu cầu về ảnh, <1 = nó nén lại. "
+                     "Đọc cùng dòng tương quan ở trên: tỉ lệ thôi thì chưa nói "
+                     "được nó có đổi HƯỚNG hay không"])
     L.append("| đại lượng | giá trị | đọc thế nào |\n|---|---|---|")
     L += ["| " + " | ".join(r) + " |" for r in rows]
     if pk:
@@ -854,55 +903,62 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "cuối, nơi mọi đường đã trộn vào nhau. Câu \"Q có được đọc không\" trả lời ở "
           "hình 1, không phải ở đây.\n"]
 
-    L.append("## 3. [Visual] Bốn ô đối chứng — SigLIP → Z → Q\n")
+    L.append("## 3. [Visual] Bốn ô đối chứng — Z · V-Extractor · Aligner\n")
     if figs.get("visual"):
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
     L += [f"Chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị "
-          f"{lc['percentile_clip']}). Ô 2 và ô 3 trên **4096 patch của SigLIP** "
-          f"(lưới 64×64); ô 4 trên **chính ảnh 448×448 của nhánh** — hai đường "
-          f"không còn chung đầu vào:\n",
+          f"{lc['percentile_clip']}). Cả ba bản đồ đều là đạo hàm của CÙNG một số "
+          f"`y`, khác nhau ở chỗ đường về dừng ở đâu:\n",
           "| ô | đại lượng | hỏi gì |\n|---|---|---|",
           "| 1 | ảnh gốc | mốc để đọc ba ô còn lại |",
-          "| 2 | `‖X_p − mean(X)‖` — **hoạt độ**, KHÔNG gradient · lưới 64² | đầu ra "
-          "SigLIP còn phân biệt được gì trên ảnh này |",
-          "| 3 | `‖∂y/∂X‖` qua `y → Z → projector → X` · lưới 64² | adapter (LoRA "
-          "đã finetune) rút được gì qua đường cũ |",
-          "| 4 | `‖∂y/∂I‖` qua `y → Q → V-Extractor → I` (I = ảnh 448²) | "
-          "encoder RIÊNG của nhánh rút được gì |",
+          "| 2 | `‖∂y/∂X‖` qua `y → Z → adapter → vision encoder` · lưới 64² | "
+          "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
+          "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
+          "| 3 | đầu ra V-Extractor (`Q_raw`) về THẲNG ảnh gốc · lưới 448² | "
+          "khối CAM (đóng băng) dẫn nhu cầu của decoder về vùng nào trên ảnh, "
+          "khi Jacobian của Aligner bị đè bằng identity |",
+          "| 4 | `‖∂y/∂I‖` qua `y → Q → Aligner → V-Extractor → I` · lưới 448² | "
+          "bản đồ THẬT: 32 vector SAU Aligner về thẳng ảnh gốc |",
           "",
-          "Ba câu hỏi **xếp chồng**: có gì để học (2) → đường cũ dùng được bao nhiêu "
-          "(3) → nhánh mới thêm được gì (4). Trừ patch trung bình ở ô 2 vì X có một "
-          "thành phần nền chung rất lớn ở mọi patch; giữ nguyên thì bản đồ phẳng lì "
-          "vì cái nền ấy chứ không phải vì encoder mù.\n",
-          "**Ô 2 khác BẢN CHẤT hai ô sau** (hoạt độ, không phải độ nhạy) và **ô 4 "
-          "khác ĐỘ PHÂN GIẢI hai ô kia** (448² so với 64²: `patch_embed` của ViT "
-          "là conv stride 16 nên gradient về tới tận pixel) — nên mỗi ô **tự chuẩn "
-          "hoá [0,1]**. Chỉ so "
-          "**hình dạng** giữa các ô; so định lượng thì đọc mấy dòng tương quan / IoU "
-          "ở mục Kiểm nhanh, vốn đã gộp ô 4 về lưới chung 64² trước khi so.\n",
+          "**Vì sao ô 3 phải đè Jacobian của Aligner.** `∂y/∂I` là chain rule: "
+          "đường về pixel luôn đi qua Aligner rồi mới tới khối cam, nên chọn lá "
+          "khác không tách được hai chặng — mọi lá đều cho đúng ô 4. Ô 3 vì thế "
+          "lấy `g = ∂y/∂Q` (gradient đã tới ĐẦU RA Aligner) rồi bơm thẳng `g` vào "
+          "`Q_raw` và lan về ảnh qua RIÊNG khối cam. Đọc là: *nếu Aligner không "
+          "xoay gì thì decoder đòi ảnh ở đâu*.\n",
+          "**Hiệu ô 3 → ô 4 chính là Aligner.** Khối cam đóng băng hoàn toàn suốt "
+          "main stage, nên hai ô này dùng chung y hệt một khối thị giác và khác "
+          "nhau ĐÚNG bằng phần được học. Đây là chỗ duy nhất trong cả tài liệu "
+          "nhìn thấy trực tiếp thứ main stage huấn luyện.\n",
+          "**Ô 2 khác ĐỘ PHÂN GIẢI và khác ĐIỂM DỪNG với ô 3/ô 4** (64² ở đầu ra "
+          "encoder, so với 448² tới tận pixel: `patch_embed` của ViT là conv "
+          "stride 16 nên đường về pixel không bị chặn) — nên mỗi ô **tự chuẩn hoá "
+          "[0,1]**. Chỉ so **hình dạng** giữa các ô; so định lượng thì đọc mấy "
+          "dòng tương quan / IoU ở mục Kiểm nhanh, vốn đã gộp ô 3/ô 4 về lưới "
+          "chung 64² trước khi so.\n",
           "**Đọc hình 3 thế nào.**\n",
-          "1. **Ô 2 trước tiên.** Phẳng lì (max/mean ≈ 1, 10% patch nóng nhất gánh "
-          "≈10%) = encoder không phân biệt được vùng nào với vùng nào trên ảnh này; "
-          "khi đó ô 3 và ô 4 có sáng cũng KHÔNG thể là thông tin ảnh, và phần hỏng "
-          "nằm ở đường SigLIP chứ không phải ở nhánh — và nhánh §2.2 thì KHÔNG "
-          "đi qua SigLIP, nên ô 4 vẫn có thể sáng đàng hoàng khi ô 2 phẳng. Đó "
-          "chính là kết quả §2.2 đi tìm.\n",
-          "2. **Ô 3 so ô 2**: đường cũ có bám vào chỗ encoder vốn đã có tín hiệu "
-          "mạnh không. Bám sát = adapter đang dùng được đầu ra SigLIP. Lệch hẳn = nó "
-          "đang lấy từ vùng encoder coi là nền.\n",
-          "3. **Ô 4 so ô 3**: đây là câu về chính nhánh. Trùng ô 3 = nhánh đang "
-          "khuếch đại đúng thứ decoder đã có (không hẳn là vô dụng, nhưng không mang "
-          "vào cái gì MỚI). Lệch đi mà vẫn bám ô 2 = nhánh rút được vùng đường cũ bỏ "
-          "sót — đúng việc nó sinh ra để làm. Lệch cả ô 2 lẫn ô 3 = nhiều khả năng là "
-          "nhiễu.\n",
-          "4. Nếu \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm nhanh ≈ 0 thì ô 4 là "
-          "nhiễu — decoder chưa đọc Q, đọc bản đồ của nó là đọc số 0 phóng to.\n",
-          "5. Sáng ở ô 3/ô 4 = y **nhạy** với patch đó, KHÔNG phải \"model nhìn vào "
+          "1. **Ô 4 so ô 2**: nhánh mới có nhìn chỗ khác đường cũ không. Trùng ô 2 = "
+          "nhánh đang khuếch đại đúng thứ decoder đã có (không hẳn vô dụng, nhưng "
+          "không mang vào cái gì MỚI). Lệch đi = nhánh rút được vùng đường cũ bỏ "
+          "sót — đúng việc §2.2 sinh ra để hỏi.\n",
+          "2. **Ô 3 so ô 4**: câu về riêng Aligner. Trùng khít (tương quan ≈ 1) = "
+          "Aligner chỉ đổi tỉ lệ, phần học được ở main stage gần như không lái nhu "
+          "cầu về ảnh đi đâu cả; lệch hẳn = nó thật sự xoay hướng. Tỉ lệ năng lượng "
+          "ở mục Kiểm nhanh nói độ lớn, tương quan nói HƯỚNG — phải đọc cả hai.\n",
+          "3. **Ô 3 so ô 2**: khối cam (đóng băng, do Stage 0 dạy) và đường cũ có "
+          "cùng nhìn một chỗ không — câu này KHÔNG dính gì tới main stage, vì cả "
+          "hai phần đều không được cập nhật ở đó.\n",
+          "4. Nếu \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm nhanh ≈ 0 thì ô 3 và "
+          "ô 4 đều là nhiễu — decoder chưa đọc Q, đọc bản đồ của nó là đọc số 0 "
+          "phóng to.\n",
+          "5. Sáng ở ô 2/3/4 = y **nhạy** với chỗ đó, KHÔNG phải \"model nhìn vào "
           "đây\" theo nghĩa nhân quả, và cũng không phải phân đoạn tổn thương.\n",
-          "6. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 7 px của ảnh 448 "
-          "mà nhánh đọc). Đừng đọc chi tiết nhỏ hơn một ô.\n",
-          "Số thô: `lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, "
-          "`sal_vext` 448², `sal_vext_64`), `lens.json`, `logit_lens.csv`.\n",
+          "6. Lưới 64×64 của ô 2 là **thô**: một ô ≈ 14 px của ảnh 896. Đừng đọc chi "
+          "tiết nhỏ hơn một ô — ô 3/ô 4 mịn hơn nhưng vẫn là độ nhạy, không phải "
+          "đường viền.\n",
+          "Số thô: `lens_maps.npz` (`layer_sens`, `sal_z`, `sal_vext_pre` 448², "
+          "`sal_vext_pre_64`, `sal_vext` 448², `sal_vext_64`), `lens.json`, "
+          "`logit_lens.csv`.\n",
           "## Giới hạn\n",
           "- Một ảnh, chọn vì nhiều `pos`/`uncertain` — MINH HOẠ, không phải bằng chứng "
           "thống kê. Kết luận A/B vẫn nằm ở `REPORT.md`.\n",

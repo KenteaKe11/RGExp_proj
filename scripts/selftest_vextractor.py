@@ -1154,7 +1154,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), hình 3 gồm 4 ô (gốc / SigLIP / Z / Q tới tận pixel), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), hình 3 gồm 4 ô (gốc / Z / Q_raw về pixel / Q sau Aligner về pixel), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1263,11 +1263,21 @@ def _():
     assert np.isclose(rb["sal_vext_64"].mean(), rb["sal_vext"].mean(), rtol=1e-5)
     assert LZ.pool_to(np.ones((8, 8)), 8).shape == (8, 8)
     assert LZ.pool_to(np.ones((9, 9)), 8) is None            # không chia hết -> None
-    # ô 2 của hình 3: hoạt độ SigLIP — có ở CẢ hai lượt vì nó không cần nhánh
+    # Ô "output vision encoder" (hoạt độ SigLIP) đã BỎ hẳn — panel lẫn số liệu
     for r in (ra, rb):
-        assert r["act_siglip"].shape == (8, 8)
-        assert np.isfinite(r["act_siglip"]).all()
-    assert np.allclose(ra["act_siglip"], rb["act_siglip"])     # cùng một X
+        assert "act_siglip" not in r
+    # Ô 3: đầu ra V-Extractor về THẲNG ảnh gốc, Jacobian(Aligner) := identity.
+    # Chỉ có ở lượt CÓ nhánh, cùng lưới pixel với ô 4, và KHÁC ô 4 (nếu trùng
+    # từng bit thì việc đè Jacobian đã không xảy ra).
+    assert ra.get("sal_vext_pre") is None
+    assert rb["sal_vext_pre"].shape == (SMALL_IMG, SMALL_IMG)
+    assert np.isfinite(rb["sal_vext_pre"]).all() and rb["sal_vext_pre"].sum() > 0
+    assert not np.allclose(rb["sal_vext_pre"], rb["sal_vext"])
+    assert rb["sal_vext_pre_64"].shape == (8, 8)
+    assert np.isclose(rb["sal_vext_pre_64"].mean(), rb["sal_vext_pre"].mean(),
+                      rtol=1e-5)
+    # Lens KHÔNG được để lại dấu vết trên nhánh: trọng số đóng băng, cờ như cũ
+    assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
     # Q nằm SAU khối ảnh -> vị trí của token ảnh KHÔNG đổi
     assert ra["image_span"] == rb["image_span"] == [2, 1 + NZ]
     assert rb["insert_span"] == [2 + NZ, 2 + NZ + NQ], rb["insert_span"]
@@ -1301,9 +1311,10 @@ def _():
         assert 1 <= dg["q_vector_share"]["n_active_50pct"] <= NQ
         assert 1 <= dg["peak"]["layer"] <= L
         assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["vext_energy_ratio"] > 0
-        assert dg["siglip_activity"]["max_over_mean"] >= 1.0
-        assert 0.0 <= dg["siglip_activity"]["top10_share"] <= 1.0
-        assert set(dg["siglip_corr"]) == {"z", "vext"}
+        assert "siglip_activity" not in dg and "siglip_corr" not in dg
+        al = dg["aligner_shift"]
+        assert -1.0 <= al["corr"] <= 1.0 and al["energy_ratio"] > 0
+        assert 0.0 <= al["top10_iou"] <= 1.0
         out = {"lens": lc, "diagnostics": dg, "reference_arm": "a",
                "arm": {"id": "b", "y": rb["y"], "n_tokens": T + NQ, "layers": L,
                        "image_span": rb["image_span"],
@@ -1316,12 +1327,15 @@ def _():
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "hoạt độ", "đầu ra SigLIP", "act_siglip",
-                     "y → Q → V-Extractor → I", "`Q[0]`", "448²"):
+                     "đầu ra V-Extractor", "THẲNG ảnh gốc",
+                     "Jacobian của Aligner", "identity",
+                     "y → Q → Aligner → V-Extractor → I", "`Q[0]`", "448²"):
             assert need in doc, need
         # bốn ô, không còn OR/AND của §2.0
         assert "OR (cộng" not in doc and "AND (nhân" not in doc
         assert "`sal_z`" in doc and "`sal_vext`" in doc
+        assert "`sal_vext_pre`" in doc
+        assert "act_siglip" not in doc and "SigLIP còn phân biệt" not in doc
         assert json.dumps(out, default=str)
 
 

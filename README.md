@@ -279,37 +279,51 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    `lens.layer_frac`** (1/4 lớp cuối, làm tròn lên → 9/34): phép đọc tuyến tính
    bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra token vô nghĩa. Đầy đủ ở
    `logit_lens.csv`.
-3. **[Visual] Bốn ô đối chứng — SigLIP → Z → Q**, chồng lên ảnh gốc. Ở §2.2
-   **hai nhánh không còn chung đầu vào**, nên hai ô cuối nằm trên hai lưới khác
-   nhau: (1) **ảnh gốc**; (2) **hoạt độ đầu ra SigLIP** `‖X_p − mean(X)‖` —
-   KHÔNG gradient, không dính decoder, lưới 64²; (3) **Z**, `‖∂y/∂X‖` qua
-   `y → Z → projector → X`, lưới 64²; (4) **Q**, `‖∂y/∂I‖` qua
-   `y → Q → V-Extractor → I` với I là **chính ảnh 448² của nhánh** — lưới 448²,
-   mịn hơn ô 3 bảy lần mỗi chiều vì gradient của ViT về tới tận pixel qua
-   `patch_embed`.
-   Ba câu hỏi xếp chồng: *đầu ra SigLIP có gì để học* → *adapter rút được gì qua
-   đường cũ* → *encoder riêng của nhánh rút được gì*. Ô 2 trừ patch trung bình
-   vì X có thành phần nền chung rất lớn ở mọi patch.
+3. **[Visual] Bốn ô đối chứng — Z · V-Extractor · Aligner**, chồng lên ảnh gốc.
+   Cả ba bản đồ đều là đạo hàm của **cùng một số `y`**, khác nhau ở chỗ đường về
+   dừng lại ở đâu: (1) **ảnh gốc**; (2) **Z**, `‖∂y/∂X‖` qua
+   `y → Z → adapter → vision encoder`, **dừng ở đầu ra encoder**, lưới 64²;
+   (3) **đầu ra V-Extractor (`Q_raw`) về thẳng ảnh gốc**, lưới 448²;
+   (4) **32 vector sau Aligner về thẳng ảnh gốc**, `‖∂y/∂I‖` qua
+   `y → Q → Aligner → V-Extractor → I` với I là **chính ảnh 448² của nhánh** —
+   lưới 448², mịn hơn ô 2 bảy lần mỗi chiều vì gradient của ViT về tới tận pixel
+   qua `patch_embed`.
 
-   Ở §2.2 ô 2 phẳng lì **không** kết luận được gì về ô 4: nhánh không đi qua
-   SigLIP. "Ô 2 phẳng mà ô 4 vẫn sáng đàng hoàng" chính là kết quả §2.2 đi tìm.
+   **Ô 3 phải đè Jacobian của Aligner bằng identity.** `∂y/∂I` là chain rule:
+   đường về pixel luôn đi qua Aligner rồi mới tới khối cam, nên đổi lá không
+   tách được hai chặng — mọi lá đều cho đúng ô 4. Ô 3 vì thế lấy `g = ∂y/∂Q`
+   (gradient đã tới **đầu ra** Aligner) rồi bơm thẳng `g` vào `Q_raw` và lan về
+   ảnh qua **riêng khối cam**; đọc là *nếu Aligner không xoay gì thì decoder đòi
+   ảnh ở đâu*. Chạy bằng một lượt forward/backward riêng qua ViT-Small chứ
+   không phải `retain_graph=True` trên đồ thị của decoder 4B.
 
-Ô 2 khác **bản chất** hai ô sau (hoạt độ vs độ nhạy) và ô 4 khác **độ phân giải**
-hai ô kia, nên **mỗi ô tự chuẩn hoá [0,1]**: chỉ so hình dạng bằng mắt. Mọi so
-sánh định lượng (tương quan / IoU ở "Kiểm nhanh") gộp ô 4 về **lưới chung 64²**
-(`sal_vext_64`) trước khi so. Độ mờ overlay theo từng điểm
-(`alpha = overlay_alpha × giá trị`), nên ảnh gốc vẫn đọc được.
+   **Hiệu ô 3 → ô 4 chính là Aligner.** Khối cam đóng băng hoàn toàn suốt main
+   stage, nên hai ô dùng chung y hệt một khối thị giác và khác nhau đúng bằng
+   phần được học — đây là chỗ duy nhất nhìn thấy trực tiếp thứ main stage huấn
+   luyện. Ô 4 so ô 2 vẫn là câu cũ: *nhánh mới có nhìn chỗ khác đường cũ không*.
+
+   Ô 2 khác **độ phân giải** và khác **điểm dừng** với ô 3/ô 4 (64² ở đầu ra
+   encoder, so với 448² tới tận pixel), nên **mỗi ô tự chuẩn hoá [0,1]**: chỉ so
+   hình dạng bằng mắt. Mọi so sánh định lượng (tương quan / IoU ở "Kiểm nhanh")
+   gộp ô 3/ô 4 về **lưới chung 64²** (`sal_vext_pre_64`, `sal_vext_64`) trước
+   khi so. Độ mờ overlay theo từng điểm (`alpha = overlay_alpha × giá trị`), nên
+   ảnh gốc vẫn đọc được.
+
+   Ô **hoạt độ đầu ra SigLIP** của bản trước đã **bỏ hẳn** — panel lẫn số liệu
+   (`act_siglip`, `siglip_activity`, `siglip_corr`).
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
 chỉ vài trong 32 vector làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
-encoder‖`, tương quan và IoU giữa hai bản đồ, cộng hai dòng về **hoạt độ đầu ra
-SigLIP** (max/mean, 10% patch nóng nhất gánh bao nhiêu) và tương quan của Z / Q
-với hoạt độ ấy.
+encoder‖`, tương quan và IoU giữa hai bản đồ, cộng ba dòng về **Aligner**:
+tương quan bản đồ **trước vs sau Aligner**, IoU 10% vùng nóng nhất, và tỉ lệ
+năng lượng `‖sau‖ / ‖trước‖` (tỉ lệ nói độ lớn, tương quan nói hướng — phải đọc
+cả hai).
 
 Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
 `figures/lens_layers.png`, `figures/lens_visual.png`, `logit_lens.csv`,
-`lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, `sal_vext` 448²,
+`lens_maps.npz` (`layer_sens`, `sal_z`, `sal_vext_pre` 448², `sal_vext_pre_64`,
+`sal_vext` 448²,
 `sal_vext_64`), `lens.json`. Lens cần **weight của B** trên máy và cần GPU —
 không kéo weight của A về nữa.
 
