@@ -339,42 +339,47 @@ vextractor:
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
 # KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-Small + hai khối
-# attention. 1 + 6 + 1 = 8 epoch.
+# attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
-# HAI nhóm tham số, KHÔNG dùng chung lr:
-#   backbone  ViT-Small (đã pretrain ImageNet-1k)   `backbone_lr` 1e-5, PHẲNG suốt
-#   rest      Linear vào · learner Q · Self/Cross-attn · MLP · Cls Head
-#                                                    `lr` 3e-5 lr_max, warm-up + anneal
-# Cho ViT đi cùng 3e-5 là đẩy một backbone đã hội tụ bằng gradient của một Cls
-# Head còn ngẫu nhiên; cho phần mới đi cùng 1e-5 là bắt nó học chậm gấp ba mà
-# không có lý do nào.
+# MỘT lr cho TẤT CẢ: 1e-5, PHẲNG suốt quá trình. Optimizer vẫn giữ hai nhóm
+# (`backbone` = ViT · `rest` = Linear vào, learner Q, Self/Cross-attn, MLP, Cls
+# Head) để sau này tách ra được, nhưng `backbone_lr` bỏ trống thì nó LẤY THEO
+# `lr`, nên ở đây chỉ có đúng một con số. Thứ DUY NHẤT làm lr đổi là epoch
+# warm-up ở đầu — không anneal, không one-cycle.
 stage0:
-  lr: 3.0e-5                # lr_max của nhóm `rest`
-  backbone_lr: 1.0e-5       # ViT-Small — fine-tune phần đã pretrain, PHẲNG suốt
+  lr: 1.0e-5                # lr của CẢ HAI nhóm, PHẲNG sau warm-up
+  backbone_lr: null         # null = lấy theo `lr`. Khai số chỉ khi muốn tách ViT ra
   # ── epoch 1: "warmup" ──────────────────────────────────────────────────
-  # Nhóm `rest` ramp TUYẾN TÍNH THEO BƯỚC từ 0 lên `lr` trong `warmup_epochs`
-  # epoch (1.0 epoch = 200/200 bước); backbone đã ở `backbone_lr` ngay bước 0.
-  # KHÔNG còn epoch "norm" của bản ResNet50: ViT không có BatchNorm nên không có
-  # thống kê chạy nào của ImageNet cần kéo về phân phối ảnh CXR.
-  #     base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7 epoch
+  # CẢ HAI nhóm ramp TUYẾN TÍNH THEO BƯỚC từ 0 lên `lr` trong `warmup_epochs`
+  # epoch (1.0 epoch = 200/200 bước). KHÔNG còn epoch "norm" của bản ResNet50:
+  # ViT không có BatchNorm nên không có thống kê chạy nào cần kéo về ảnh CXR.
   warmup_epochs: 1.0
   weight_decay: 0.03
-  max_epochs: 6             # epoch CHÍNH (sau epoch warmup), `rest` phẳng ở 3e-5
-  select: last              # LUÔN lấy epoch cuối (best = theo val)
-  # ── epoch n+1 (= 8): "final weight" ─────────────────────────────────────
-  # Sau phần base (warmup + max_epochs), base/ được ĐẨY Hub ngay. Rồi chạy thêm
-  # `epochs` epoch NỐI TIẾP: giữ nguyên moment AdamW đã tích trong phần base,
-  # nhóm `rest` cosine lr_start -> lr_end cập nhật mỗi bước (backbone VẪN phẳng
-  # ở `backbone_lr`) -> final/. Main stage dùng final/.
+  # ── epoch 2..51: "base", lr phẳng ──────────────────────────────────────
+  # `max_epochs` là TRẦN, không phải số epoch sẽ chạy:
+  #     base tối đa = ceil(warmup_epochs) + max_epochs = 1 + 50 = 51 epoch
+  max_epochs: 50
+  # ── dừng sớm ───────────────────────────────────────────────────────────
+  # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`
+  # (= sqrt(F1_macro · Recall_macro)) không vượt kỷ lục cũ quá `min_delta` thì
+  # DỪNG phần base. 0 = tắt (chạy đủ `max_epochs`).
+  patience: 5
+  min_delta: 0.0
+  # Checkpoint đem sang main stage = epoch TỐT NHẤT theo val, không phải epoch
+  # cuối. `patience` + `select: last` bị TỪ CHỐI: dừng vì val hết cải thiện rồi
+  # lại lấy đúng epoch cuối của cửa sổ chờ là tự phủ định chính nó.
+  select: best
+  # ── epoch anneal: TẮT ──────────────────────────────────────────────────
+  # lr cố định suốt quá trình nên không có gì để anneal. `final/` = đúng
+  # checkpoint tốt nhất của phần base, và main stage vẫn nạp `final/` như cũ.
   final_anneal:
-    enabled: true
+    enabled: false
     epochs: 1
-    lr_start: null          # null = `stage0.lr` -> lr của `rest` không nhảy nấc
-                            # ở ranh giới epoch, chỉ bắt đầu đi xuống
+    lr_start: null          # null = `stage0.lr`
     lr_end: 1.0e-7
     schedule: cosine
     weight_decay: 0.03
-    reset_optimizer: false  # GIỮ moment AdamW của phần base (chạy nối tiếp)
+    reset_optimizer: false
   # Batch hiệu dụng RIÊNG của Stage 0 — trùng 32 của main stage chỉ là trùng số,
   # không có ràng buộc nào bắt hai bên bằng nhau: batch của main stage bị khoá
   # theo $1 (`train_batch` trong fixture), Stage 0 thì không dính gì tới A.
@@ -382,12 +387,14 @@ stage0:
   # nằm ở config GPU và autobatch dò lại — cũng tách hẳn main stage.
   batch_size: 32
   max_grad_norm: 1.0
-  # val (theo dõi): sqrt(F1_macro · Recall_macro), macro trên 14 bệnh lý × lớp này
+  # val (theo dõi VÀ chọn epoch VÀ đếm patience): sqrt(F1_macro · Recall_macro),
+  # macro trên 14 bệnh lý × lớp này
   val_classes: [pos, uncertain]
   val_n_samples: 256        # 256 mẫu bốc từ hồ val 2000 (0 = cả hồ)
   val_resample: false       # CỐ ĐỊNH: mọi epoch đo trên ĐÚNG một tập, chỉ số
-                            # chỉ phụ thuộc seed. Đường val giữa các epoch khi
-                            # đó chỉ phản ánh model đổi, không lẫn tập đổi.
+                            # chỉ phụ thuộc seed. Bắt buộc khi có early-stop:
+                            # bốc lại mỗi epoch thì `patience` đang đếm cả nhiễu
+                            # của việc đổi tập, không riêng việc model hết tiến.
   asl:                      # ASL one-hot 3 lớp
     gamma_neg: {neg: 4.0, uncertain: 1.0, pos: 0.0}
     gamma_pos: 0.0

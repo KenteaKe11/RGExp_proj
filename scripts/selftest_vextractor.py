@@ -555,7 +555,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 = 1 warmup + 6 main + 1 final = 8 epoch, backbone 1e-5 phẳng | rest 3e-5, val 256 CỐ ĐỊNH; main mở băng nhánh sau 0.2 epoch, lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best, val 256 CỐ ĐỊNH; main mở băng nhánh sau 0.2 epoch, lr 1e-5; --retrain-all")
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
@@ -563,37 +563,54 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["backbone_lr"]) == (3e-5, 1e-5)
-    assert (sc["weight_decay"], sc["max_epochs"], sc["select"]) == (0.03, 6, "last")
+    assert (sc["lr"], sc["backbone_lr"]) == (1e-5, 1e-5)   # MỘT lr cho cả hai nhóm
+    assert (sc["weight_decay"], sc["max_epochs"], sc["select"]) == (0.03, 50, "best")
+    assert (sc["patience"], sc["min_delta"]) == (5, 0.0)
+    # `backbone_lr: null` -> LẤY THEO `lr`. .get() trả None (khoá CÓ mặt), nên
+    # chỗ này phải là `or`; float(None) là TypeError ở tận runtime.
+    assert cfg["stage0"]["backbone_lr"] is None
+    assert s0.s0cfg({"stage0": dict(cfg["stage0"], lr=4e-5)})["backbone_lr"] == 4e-5
     # warm-up chiếm TRỌN epoch đầu và nằm NGOÀI `max_epochs`:
-    # base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7; final cộng thêm 1
+    # base TỐI ĐA = ceil(warmup_epochs) + max_epochs = 1 + 50 = 51
     assert sc["warmup_epochs"] == 1.0 and sc["n_warmup_epochs"] == 1
-    assert sc["base_epochs"] == 7
-    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 8
+    assert sc["base_epochs"] == 51
+    # lr cố định suốt quá trình -> KHÔNG có epoch anneal
+    assert sc["final_anneal"]["enabled"] is False
     # epoch "norm" của bản ResNet50 đã biến mất khỏi CẢ config lẫn sc
     assert "norm_lr" not in sc and "norm_epochs" not in sc
     assert "norm_lr" not in cfg["stage0"] and "norm_epochs" not in cfg["stage0"]
+    # patience mà vẫn `select: last` là tự phủ định -> phải bị TỪ CHỐI
+    try:
+        s0.s0cfg({"stage0": dict(cfg["stage0"], select="last")})
+    except Exception as e:
+        assert "select" in str(e)
+    else:
+        raise AssertionError("patience + select=last phải bị từ chối")
+    # patience 0 (tắt dừng sớm) thì select=last lại hợp lệ
+    assert s0.s0cfg({"stage0": dict(cfg["stage0"], select="last",
+                                    patience=0)})["select"] == "last"
 
-    # ── lr theo BƯỚC: backbone PHẲNG, `rest` warm-up rồi phẳng ─────────────
+    # ── lr theo BƯỚC: MỘT lr, warm-up 1 epoch rồi PHẲNG MÃI ────────────────
     from src.train_recomb import val_indices
 
     spe = 200                                   # bước mỗi epoch
-    lrs = [s0.base_lr_at(k, sc, spe) for k in range(sc["base_epochs"] * spe)]
+    lrs = [s0.base_lr_at(k, sc, spe) for k in range(0, sc["base_epochs"] * spe, 7)]
     assert set(lrs[0]) == {"backbone", "rest"}              # hai nhóm, đúng tên
-    # backbone (ViT đã pretrain ImageNet-1k): 1e-5 ở MỌI bước của phần base —
-    # không warm-up (không có gì để warm lên), không đổi
-    assert all(abs(x["backbone"] - sc["backbone_lr"]) < 1e-15 for x in lrs)
-    # hai nhóm KHÔNG bao giờ gặp nhau ở vùng phẳng
-    assert lrs[-1]["backbone"] != lrs[-1]["rest"]
-    # `rest`: warm-up tuyến tính theo BƯỚC trong 1.0 epoch = 200 bước
+    # hai nhóm đi CÙNG một con số ở MỌI bước (backbone_lr lấy theo lr)
+    assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in lrs)
     w = int(round(sc["warmup_epochs"] * spe))
     assert w == spe == 200
-    assert abs(lrs[0]["rest"] - sc["lr"] / w) < 1e-15       # bước đầu tiên
-    assert abs(lrs[w - 1]["rest"] - sc["lr"]) < 1e-15       # chạm đỉnh cuối epoch 1
-    assert all(abs(x["rest"] - sc["lr"]) < 1e-15 for x in lrs[w:])   # rồi PHẲNG
-    assert all(a["rest"] <= b["rest"] + 1e-18
-               for a, b in zip(lrs[:w], lrs[1:w]))          # không tụt
-    # warmup_epochs = 0 -> vào thẳng lr đỉnh ngay bước 0 (đường của dry-run)
+    assert abs(s0.base_lr_at(0, sc, spe)["rest"] - sc["lr"] / w) < 1e-18
+    assert abs(s0.base_lr_at(w - 1, sc, spe)["rest"] - sc["lr"]) < 1e-18
+    # sau warm-up: PHẲNG tới tận bước cuối của trần 51 epoch — không anneal
+    flat = [s0.base_lr_at(k, sc, spe)["rest"]
+            for k in range(w, sc["base_epochs"] * spe, 101)]
+    assert all(abs(x - sc["lr"]) < 1e-18 for x in flat)
+    assert abs(s0.base_lr_at(sc["base_epochs"] * spe - 1, sc, spe)["rest"]
+               - sc["lr"]) < 1e-18
+    ramp = [s0.base_lr_at(k, sc, spe)["rest"] for k in range(w)]
+    assert all(a <= b + 1e-20 for a, b in zip(ramp, ramp[1:]))   # không tụt
+    # warmup_epochs = 0 -> vào thẳng lr ngay bước 0 (đường của dry-run)
     assert s0.base_lr_at(0, dict(sc, warmup_epochs=0.0), spe)["rest"] == sc["lr"]
 
     # ── val CỐ ĐỊNH: mọi lần đo dùng chung một tập ─────────────────────────
@@ -692,8 +709,13 @@ def _():
                                         "d_branch": 32, "mlp_hidden": 64,
                                         "n_heads": 4},
                          "cls_head": {"n_heads": 4}}
+    # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
+    # thật đã tắt) và TẮT patience + `select: last` để số epoch cố định 4.
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
-                         warmup_epochs=1.0, max_epochs=3)
+                         warmup_epochs=1.0, max_epochs=3, patience=0,
+                         select="last",
+                         final_anneal=dict(cfg["stage0"]["final_anneal"],
+                                           enabled=True))
     cfg["autobatch"] = {"enabled": False}
     rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
@@ -734,7 +756,7 @@ def _():
             m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
             assert m["phase"] == "anneal"
             # lr_start: null -> lấy lr đỉnh của base; và chạy NỐI TIẾP thật
-            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 3e-5
+            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 1e-5
             assert m["anneal"]["lr_start_from_base_lr"] is True
             assert m["anneal"]["reset_optimizer"] is False
             assert m["optimizer_continued"] is True
@@ -773,6 +795,106 @@ def _():
     finally:
         (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
          s0.ImageOnlyDataset.pixels, R.vit_body) = orig
+
+
+@check("15c. dừng sớm: patience đếm epoch val không cải thiện, DỪNG, và `final/` mang trọng số epoch TỐT NHẤT (không phải epoch cuối)")
+def _():
+    import json
+
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    from src import vextractor as R
+    from src import stage0_vextractor as s0
+    from src.config import load_config
+
+    D_MOD, L = 32, 14
+    # val_score kịch bản sẵn: tăng ở epoch 2 rồi ĐỨNG YÊN. patience = 2 nên
+    # epoch 3 (bad=1), epoch 4 (bad=2) -> DỪNG ở epoch 4, best = epoch 2.
+    SCORES = [0.50, 0.60, 0.55, 0.55] + [0.10] * 20
+    it = iter(SCORES)
+
+    class FakeCounter:
+        """Thay `ClsCounter` để val_score là một dãy ĐÃ BIẾT — dừng sớm phải
+        kiểm được bằng một con số xác định, không phải bằng may rủi của
+        gradient trên dữ liệu ngẫu nhiên."""
+
+        def __init__(self, n_labels, classes=("pos", "uncertain")):
+            pass
+
+        def update(self, *a, **k):
+            pass
+
+        def result(self):
+            v = float(next(it))
+            return {"f1_macro": v, "recall_macro": v, "score": v,
+                    "n_cells": 1, "per_class": {}}
+
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
+                                        "pretrained": True, "n_query": SMALL_Q,
+                                        "d_branch": 32, "mlp_hidden": 64,
+                                        "n_heads": 4},
+                         "cls_head": {"n_heads": 4}}
+    # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
+    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
+                         warmup_epochs=1.0, max_epochs=8, patience=2,
+                         min_delta=0.0, select="best")
+    cfg["autobatch"] = {"enabled": False}
+    assert s0.s0cfg(cfg)["base_epochs"] == 9
+    assert s0.s0cfg(cfg)["final_anneal"]["enabled"] is False   # không anneal
+
+    rng = np.random.default_rng(0)
+    keys = [f"k{i}" for i in range(12)]
+    lut = {k: np.eye(3, dtype=np.float32)[rng.integers(0, 3, L)] for k in keys}
+    orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
+            s0.ImageOnlyDataset.pixels, R.vit_body, R.ClsCounter)
+    R.vit_body = lambda arch, pretrained, image_size: orig[4](arch, False, image_size)
+    R.ClsCounter = FakeCounter
+    s0.decoder_width = lambda *_a, **_k: D_MOD
+    s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})
+    s0.assert_same_pixels = lambda *_a, **_k: None
+    s0.ImageOnlyDataset.pixels = lambda self, i: torch.randn(
+        1, 3, self.image_size, self.image_size,
+        generator=torch.Generator().manual_seed(i))
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
+            tr = pd.DataFrame({"key": keys[:8], "ref": "x"})
+            va = pd.DataFrame({"key": keys[8:], "ref": "x"})
+            d = s0.stage0_dir(cfg)
+            h = s0.run(cfg, tr, va)
+
+            # DỪNG ở epoch 4, không chạy hết trần 9
+            assert h["stopped_early"] is True, h["stopped_early"]
+            assert h["base_epochs_run"] == 4, h["base_epochs_run"]
+            assert [x["epoch"] for x in h["history"]] == [1, 2, 3, 4]
+            assert [x["phase"] for x in h["history"]] == ["warmup"] + ["base"] * 3
+            assert [round(x["val_score"], 2) for x in h["history"]] == SCORES[:4]
+            # epoch đem đi là epoch TỐT NHẤT (2), không phải epoch cuối (4)
+            assert h["best_epoch"] == 2 and abs(h["best_score"] - 0.60) < 1e-9
+            assert h["base_epoch"] == 2
+
+            # ── `final/` phải mang ĐÚNG trọng số của epoch 2 ───────────────
+            from safetensors.torch import load_file
+
+            b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
+            f = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
+            assert set(b) == set(f)
+            assert all(torch.equal(b[k], f[k]) for k in b), \
+                "final/ đang mang trọng số epoch cuối chứ không phải epoch tốt nhất"
+            m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text(encoding="utf-8"))
+            assert m["best_epoch"] == 2 and m["phase"] == "base"
+            assert s0.finished(cfg) is not None
+
+            # patience = 0 -> tắt dừng sớm (cùng cấu hình, select phải là last
+            # hay best đều được vì không còn cửa sổ chờ nào)
+            sc0 = s0.s0cfg({"stage0": dict(cfg["stage0"], patience=0)})
+            assert sc0["patience"] == 0
+    finally:
+        (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
+         s0.ImageOnlyDataset.pixels, R.vit_body, R.ClsCounter) = orig
 
 
 @check("15b. decoder_width: đọc hidden_size từ AutoConfig (không tải trọng số); mọi hf_token() gọi KHÔNG tham số")
@@ -834,7 +956,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. lịch epoch 8 (final): NỐI TIẾP, `rest` cosine 3e-5 -> 1e-7 / 200 bước, backbone phẳng")
+@check("16. final_anneal đang TẮT (lr cố định suốt); công thức cosine vẫn khớp CosineAnnealingLR khi bật")
 def _():
     import torch
 
@@ -843,11 +965,12 @@ def _():
 
     scfg = s0.s0cfg(load_config(ROOT / "configs/vextractor.yaml"))
     fa = scfg["final_anneal"]
-    assert fa == {"enabled": True, "epochs": 1, "lr_start": 3e-5,
+    # lr cố định 1e-5 suốt Stage 0 -> KHÔNG có epoch anneal nào chạy
+    assert fa == {"enabled": False, "epochs": 1, "lr_start": 1e-5,
                   "lr_start_from_base_lr": True, "lr_end": 1e-7,
                   "schedule": "cosine", "weight_decay": 0.03,
                   "reset_optimizer": False}, fa
-    # lr_start bám theo lr đỉnh của base, không phải một con số rời
+    # lr_start bám theo lr của base, không phải một con số rời
     assert fa["lr_start"] == scfg["lr"]
     from src.stage0_vextractor import anneal_cfg
     assert anneal_cfg({"lr": 5e-4})["lr_start"] == 5e-4          # null -> theo base
@@ -856,7 +979,7 @@ def _():
     # cosine là hàm THUẦN của bước — cùng công thức CosineAnnealingLR
     lrs = [s0.anneal_lr_at(k, 200, fa, scfg["backbone_lr"])["rest"]
            for k in range(201)]
-    assert abs(lrs[0] - 3e-5) < 1e-15 and abs(lrs[-1] - 1e-7) < 1e-15
+    assert abs(lrs[0] - 1e-5) < 1e-15 and abs(lrs[-1] - 1e-7) < 1e-15
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
     ref = torch.optim.lr_scheduler.CosineAnnealingLR(
         torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=fa["lr_start"]),
@@ -874,17 +997,16 @@ def _():
           for k in (0, 7, 100, 200)]
     assert bb == [scfg["backbone_lr"]] * 4 == [1e-5] * 4, bb
 
-    # ── phần base: backbone phẳng, `rest` ramp tuyến tính theo BƯỚC ────────
+    # ── phần base: MỘT lr, warm-up áp lên CẢ HAI nhóm rồi phẳng ───────────
     spe = 200
     b = [s0.base_lr_at(k, scfg, spe) for k in (0, 99, 199, 200, 1399)]
-    assert all(abs(x["backbone"] - 1e-5) < 1e-15 for x in b)   # phẳng suốt base
-    assert abs(b[0]["rest"] - 3e-5 / spe) < 1e-15              # bước 0 của warm-up
-    assert abs(b[1]["rest"] - 3e-5 * 100 / spe) < 1e-15        # giữa warm-up
-    assert abs(b[2]["rest"] - 3e-5) < 1e-15                    # hết epoch 1 = đỉnh
-    assert abs(b[3]["rest"] - 3e-5) < 1e-15 and abs(b[4]["rest"] - 3e-5) < 1e-15
-    # warm-up chiếm TRỌN epoch đầu; 7 epoch base + 1 final = 8
-    assert scfg["n_warmup_epochs"] == 1 and scfg["base_epochs"] == 7
-    assert scfg["base_epochs"] + fa["epochs"] == 8
+    assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in b)   # một lr
+    assert abs(b[0]["rest"] - 1e-5 / spe) < 1e-18              # bước 0 của warm-up
+    assert abs(b[1]["rest"] - 1e-5 * 100 / spe) < 1e-18        # giữa warm-up
+    assert abs(b[2]["rest"] - 1e-5) < 1e-18                    # hết epoch 1 = đỉnh
+    assert abs(b[3]["rest"] - 1e-5) < 1e-18 and abs(b[4]["rest"] - 1e-5) < 1e-18
+    # warm-up chiếm TRỌN epoch đầu; trần = 1 + 50 = 51 epoch base
+    assert scfg["n_warmup_epochs"] == 1 and scfg["base_epochs"] == 51
 
 
 @check("17. bố cục CŨ (chỉ có final/ = epoch cuối của base): nhận làm base/, không pretrain lại")

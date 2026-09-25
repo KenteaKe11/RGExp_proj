@@ -112,23 +112,27 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
 
     L.append("## Stage 0 — V-Extractor + Cls Head\n")
     if s0.get("history"):
-        L.append(f"backbone ViT lr {s0.get('stage0', {}).get('backbone_lr')} "
-                 f"(phẳng) · phần mới lr_max {s0.get('stage0', {}).get('lr')} "
-                 f"(warm-up {s0.get('stage0', {}).get('warmup_epochs')} epoch) · wd "
-                 f"{s0.get('stage0', {}).get('weight_decay')} · "
-                 f"{s0.get('stage0', {}).get('base_epochs')} epoch base + "
-                 f"{(s0.get('stage0', {}).get('final_anneal') or {}).get('epochs')} "
-                 f"final · ASL γ_neg "
-                 f"{s0.get('stage0', {}).get('asl', {}).get('gamma_neg')} · clip "
-                 f"{s0.get('stage0', {}).get('asl', {}).get('clip')} · epoch dùng: "
-                 f"{s0.get('select', 'last')} · val {s0.get('stage0', {}).get('val_n_samples')} "
-                 f"mẫu bốc lại, sqrt(F1·Recall) macro {s0.get('stage0', {}).get('val_classes')}\n")
+        sc0 = s0.get("stage0", {}) or {}
+        fa0 = sc0.get("final_anneal") or {}
+        ann = (f" + {fa0.get('epochs')} epoch anneal" if fa0.get("enabled")
+               else " · không anneal (lr cố định)")
+        L.append(f"lr {sc0.get('lr')} PHẲNG (warm-up {sc0.get('warmup_epochs')} "
+                 f"epoch; backbone_lr {sc0.get('backbone_lr')}) · wd "
+                 f"{sc0.get('weight_decay')} · chạy "
+                 f"**{s0.get('base_epochs_run', '?')}**/{sc0.get('base_epochs')} epoch"
+                 f"{' — DỪNG SỚM' if s0.get('stopped_early') else ''} "
+                 f"(patience {sc0.get('patience')}, min_delta {sc0.get('min_delta')})"
+                 f"{ann}"
+                 f" · ASL γ_neg {sc0.get('asl', {}).get('gamma_neg')} · clip "
+                 f"{sc0.get('asl', {}).get('clip')} · epoch dùng: "
+                 f"{s0.get('select', 'best')} · val {sc0.get('val_n_samples')} "
+                 f"mẫu CỐ ĐỊNH, sqrt(F1·Recall) macro {sc0.get('val_classes')}\n")
         L.append(_tbl(["epoch", "pha", "train ASL", "val ASL", "F1 macro", "Recall macro",
                        "sqrt(F1·R)", "phút"],
                       [[("**" + str(h["epoch"]) + "** ★") if h["epoch"] == s0.get("best_epoch")
                         else str(h["epoch"]),
                         {"anneal": "anneal (final)", "warmup": "warm-up",
-                         "base": "lr_max phẳng"}.get(h.get("phase"), str(h.get("phase"))),
+                         "base": "lr phẳng"}.get(h.get("phase"), str(h.get("phase"))),
                         _f(h["train_asl"]), _f(h["val_asl"]),
                         _f(h["val_f1_macro"]), _f(h["val_recall_macro"]),
                         _f(h["val_score"]), _f(h.get("minutes"), 1)]

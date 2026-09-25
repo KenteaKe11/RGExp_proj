@@ -12,27 +12,28 @@ hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn c
 `d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
 config, không tải trọng số).
 
-HAI nhóm tham số, và chúng KHÔNG dùng chung một lr:
+MỘT lr cho TẤT CẢ: `stage0.lr` = 1e-5, PHẲNG suốt Stage 0. Optimizer vẫn giữ
+hai nhóm (`backbone` = ViT, `rest` = Linear vào · 128 learner Q · Self-attn ·
+Cross-attn · MLP · Cls Head) để về sau tách ra được, nhưng `stage0.backbone_lr`
+mặc định LẤY THEO `stage0.lr`, nên khai một số là cả hai nhóm đi cùng một số.
+Thứ DUY NHẤT làm lr đổi là epoch warm-up ở đầu.
 
-  * **backbone** — ViT-Small/16 đã pretrain ImageNet-1k. Nó chỉ cần fine-tune,
-    nên lr của nó là `stage0.backbone_lr` = 1e-5 và PHẲNG suốt Stage 0: không
-    warm-up (không có gì để warm lên), không anneal (nó vốn đã đi chậm);
-  * **rest** — Linear vào, 128 learner Q, Self-attn, Cross-attn, MLP, Cls Head:
-    khởi tạo ngẫu nhiên, nên đây mới là phần đi theo lịch `stage0.lr` (lr_max
-    3e-5) với warm-up rồi anneal.
+Lịch (khối `stage0` của configs/vextractor.yaml) — 1 warm-up + tối đa 50 epoch,
+DỪNG SỚM theo `patience`:
 
-Lịch (khối `stage0` của configs/vextractor.yaml) — 1 + 6 + 1 = 8 epoch:
-
-  * **epoch 1 — "warmup"**: nhóm `rest` ramp tuyến tính theo BƯỚC từ 0 lên
-    `lr` = 3e-5 trong `warmup_epochs` (1.0) epoch; backbone đã ở 1e-5 ngay từ
-    bước 0. KHÔNG còn epoch "norm" của bản ResNet50: ViT không có BatchNorm nên
-    không có thống kê chạy nào cần kéo về phân phối ảnh CXR;
-  * **epoch 2–7 — "base"**: nhóm `rest` giữ phẳng ở `lr` = 3e-5, backbone giữ
-    1e-5. weight_decay 0.03;
-  * **epoch 8 — "anneal"**: chạy NỐI TIẾP (giữ moment AdamW), nhóm `rest` cosine
-    từ `lr` xuống `final_anneal.lr_end` (1e-7); backbone VẪN phẳng ở 1e-5
-    -> `final/`;
-  * LUÔN lấy epoch CUỐI (`stage0.select: last`) — val chỉ để theo dõi;
+  * **epoch 1 — "warmup"**: CẢ HAI nhóm ramp tuyến tính theo BƯỚC từ 0 lên
+    `lr` = 1e-5 trong `warmup_epochs` (1.0) epoch. KHÔNG còn epoch "norm" của
+    bản ResNet50: ViT không có BatchNorm nên không có thống kê chạy nào cần kéo
+    về phân phối ảnh CXR;
+  * **epoch 2–51 — "base"**: lr PHẲNG ở 1e-5, weight_decay 0.03. `max_epochs`
+    (50) là TRẦN, không phải số epoch sẽ chạy;
+  * **dừng sớm**: sau mỗi epoch đo val; `patience` (5) epoch LIÊN TIẾP không cải
+    thiện `val_score` quá `min_delta` thì DỪNG phần base. Checkpoint đem đi là
+    epoch TỐT NHẤT (`stage0.select: best`) chứ không phải epoch cuối — patience
+    mà vẫn lấy epoch cuối thì nó chỉ còn là một cách tiết kiệm giờ GPU;
+  * **`final_anneal.enabled: false`**: lr cố định suốt quá trình nên không có
+    epoch anneal nào. `final/` = đúng checkpoint tốt nhất của phần base, và main
+    stage vẫn nạp `final/` như cũ;
   * sau MỖI epoch đo trên ĐÚNG MỘT tập 256 mẫu CỐ ĐỊNH bốc từ hồ val 2000
     (`stage0.val_n_samples`, `val_resample: false` — chỉ số chỉ phụ thuộc seed):
     ASL, F1, Recall, sqrt(F1·Recall) macro trên (14 bệnh lý × lớp ∈ {pos,
@@ -82,15 +83,24 @@ def stage0_dir(cfg: Cfg) -> Path:
 
 def s0cfg(cfg: Cfg) -> dict:
     s = dict(cfg.get("stage0") or {})
-    out = {"lr": float(s.get("lr", 3e-5)),          # lr_max của nhóm `rest`
-           # ViT-Small đã pretrain ImageNet-1k: fine-tune ở lr RIÊNG, thấp hơn
-           # và PHẲNG suốt Stage 0 (không warm-up, không anneal).
-           "backbone_lr": float(s.get("backbone_lr", 1e-5)),
-           # Warm-up tuyến tính theo BƯỚC của nhóm `rest`, tính từ bước 0, đơn
-           # vị = epoch. 1.0 epoch = 200/200 bước — đúng một epoch warmup.
+    out = {"lr": float(s.get("lr", 1e-5)),          # lr của CẢ HAI nhóm
+           # Nhóm backbone (ViT) mặc định đi CÙNG `lr`. Khai riêng chỉ khi thật
+           # sự muốn tách — bỏ trống thì Stage 0 chỉ có đúng MỘT con số lr.
+           # `or`, không phải default của .get(): `backbone_lr: null` trong YAML
+           # là KHOÁ CÓ MẶT với giá trị None, nên .get() trả None chứ không rơi
+           # về default — và float(None) là TypeError ở tận runtime.
+           "backbone_lr": float(s.get("backbone_lr") or s.get("lr") or 1e-5),
+           # Warm-up tuyến tính theo BƯỚC, áp lên CẢ HAI nhóm, tính từ bước 0,
+           # đơn vị = epoch. 1.0 epoch = 200/200 bước — đúng một epoch warmup.
+           # Đây là thứ DUY NHẤT làm lr đổi.
            "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
            "weight_decay": float(s.get("weight_decay", 0.03)),
-           "max_epochs": int(s.get("max_epochs", 6)),   # epoch CHÍNH, sau warmup
+           # TRẦN, không phải số epoch sẽ chạy: `patience` quyết định lúc dừng.
+           "max_epochs": int(s.get("max_epochs", 50)),  # epoch CHÍNH, sau warmup
+           # Dừng sớm: bao nhiêu epoch LIÊN TIẾP không cải thiện `val_score`
+           # quá `min_delta` thì dừng phần base. 0 = tắt (chạy đủ max_epochs).
+           "patience": int(s.get("patience", 5)),
+           "min_delta": float(s.get("min_delta", 0.0)),
            "batch_size": int(s.get("batch_size", 32)),
            "micro_batch": int(s.get("micro_batch", 16) or 16),
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
@@ -101,8 +111,10 @@ def s0cfg(cfg: Cfg) -> dict:
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
            "val_classes": list(s.get("val_classes") or ["pos", "uncertain"]),
-           # epoch đem sang main stage: last (luôn lấy epoch cuối) | best (theo val)
-           "select": str(s.get("select", "last")).lower(),
+           # epoch đem sang main stage: best (theo val) | last (luôn epoch cuối).
+           # Có `patience` thì phải là `best`: dừng vì val hết cải thiện rồi lại
+           # lấy đúng epoch tệ nhất trong cửa sổ chờ là tự phủ định chính nó.
+           "select": str(s.get("select", "best")).lower(),
            # val mỗi epoch: n mẫu bốc từ hồ val (0 = cả hồ). val_resample = false
            # -> MỌI epoch dùng chung một tập, chỉ số chỉ phụ thuộc seed.
            "val_n_samples": int(s.get("val_n_samples", 256) or 0),
@@ -112,6 +124,16 @@ def s0cfg(cfg: Cfg) -> dict:
     Z.asl_gammas(out["asl"])            # kiểm sớm
     if out["max_epochs"] < 1:
         raise TrainUnusable(f"stage0.max_epochs {out['max_epochs']} phải >= 1.")
+    if out["patience"] < 0:
+        raise TrainUnusable(f"stage0.patience {out['patience']} phải >= 0 (0 = tắt).")
+    if out["select"] not in ("best", "last"):
+        raise TrainUnusable(f"stage0.select {out['select']!r} chỉ nhận best | last.")
+    if out["patience"] and out["select"] != "best":
+        raise TrainUnusable(
+            f"stage0.patience = {out['patience']} nhưng select = {out['select']!r}: "
+            f"dừng sớm VÌ val hết cải thiện rồi lại lấy đúng epoch cuối của cửa sổ "
+            f"chờ (tức epoch tệ hơn) là tự phủ định chính nó. Đặt `select: best`, "
+            f"hoặc `patience: 0` nếu muốn chạy đủ max_epochs.")
     if out["warmup_epochs"] < 0:
         raise TrainUnusable(f"stage0.warmup_epochs {out['warmup_epochs']} phải >= 0.")
     if out["backbone_lr"] <= 0:
@@ -136,13 +158,13 @@ def s0cfg(cfg: Cfg) -> dict:
 def base_lr_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
     """lr của HAI nhóm tại bước `step` (0-based, tính từ đầu phần base).
 
-        backbone (ViT, đã pretrain ImageNet-1k):  backbone_lr — PHẲNG
+        backbone (ViT, đã pretrain ImageNet-1k):  backbone_lr · min(1, t/w)
         rest     (Linear, learner Q, attn, MLP, Cls Head):  lr · min(1, t/w)
 
-    Hai nhóm KHÔNG bao giờ gặp nhau ở một con số: ViT chỉ fine-tune, phần mới
-    thì phải học từ đầu. Cho ViT đi cùng lr_max 3e-5 là đẩy một backbone đã hội
-    tụ bằng gradient của một Cls Head còn ngẫu nhiên; cho phần mới đi cùng 1e-5
-    là bắt nó học chậm gấp ba mà không có lý do nào.
+    MỘT hệ số warm-up dùng chung cho cả hai nhóm, rồi PHẲNG mãi mãi: sau epoch
+    warm-up, lr không còn đổi nữa ở bất kỳ đâu trong Stage 0. `backbone_lr` mặc
+    định lấy theo `lr`, nên bình thường hai nhóm là cùng một con số — hai nhóm ở
+    đây là chỗ để tách khi cần, không phải hai lịch khác nhau.
 
     Warm-up tính theo BƯỚC chứ không theo epoch: 1.0 epoch = 200 bước ramp
     tuyến tính, còn theo epoch thì nó chỉ là một nấc duy nhất.
@@ -150,7 +172,7 @@ def base_lr_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
     """
     w = int(round(float(sc["warmup_epochs"]) * int(steps_per_epoch)))
     f = 1.0 if w <= 0 else min(1.0, (int(step) + 1) / w)
-    return {"backbone": float(sc["backbone_lr"]), "rest": float(sc["lr"]) * f}
+    return {"backbone": float(sc["backbone_lr"]) * f, "rest": float(sc["lr"]) * f}
 
 
 def anneal_lr_at(step: int, n_total: int, fa: dict, backbone_lr: float) -> dict:
@@ -176,7 +198,7 @@ def anneal_cfg(s: dict) -> dict:
     """`stage0.final_anneal`: epoch n+1 (sau phần base) -> checkpoint `final/`.
 
     Mặc định chạy NỐI TIẾP phần base: `reset_optimizer: false` giữ nguyên moment
-    AdamW đã tích trong 7 epoch trước, và `lr_start: null` lấy đúng lr ĐỈNH của
+    AdamW đã tích trong 9 epoch trước, và `lr_start: null` lấy đúng lr ĐỈNH của
     nhóm `rest` ở phần base (`stage0.lr`) làm điểm xuất phát — tức lr không nhảy nấc ở ranh
     giới epoch, nó chỉ bắt đầu đi xuống. Cosine từ `lr_start` tới `lr_end` trong
     `epochs` epoch, cập nhật MỖI BƯỚC.
@@ -186,11 +208,11 @@ def anneal_cfg(s: dict) -> dict:
     """
     a = dict(s.get("final_anneal") or {})
     ls = a.get("lr_start")
-    out = {"enabled": bool(a.get("enabled", True)),
+    out = {"enabled": bool(a.get("enabled", False)),
            "epochs": int(a.get("epochs", 1)),
            # null -> lr đỉnh của phần base: đổi `stage0.lr` thì điểm xuất phát
            # của epoch final đi theo, không lệch thành hai con số rời nhau.
-           "lr_start": float(s.get("lr", 3e-5)) if ls is None else float(ls),
+           "lr_start": float(s.get("lr", 1e-5)) if ls is None else float(ls),
            "lr_start_from_base_lr": ls is None,
            "lr_end": float(a.get("lr_end", 1e-7)),
            "schedule": str(a.get("schedule", "cosine")).lower(),
@@ -464,12 +486,16 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
           f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn · chuẩn hoá "
           f"mean {nz_mean} std {nz_std}", flush=True)
     fa = sc["final_anneal"]
-    print(f"  Stage 0: backbone ViT @ {sc['backbone_lr']:g} PHẲNG suốt · nhóm "
-          f"`rest` warm-up tuyến tính 0 -> {sc['lr']:g} trong "
-          f"{sc['warmup_epochs']:g} epoch (epoch 1–{sc['n_warmup_epochs']}) rồi "
-          f"phẳng tới epoch {sc['base_epochs']} · wd {sc['weight_decay']} · "
-          f"{sc['n_warmup_epochs']}+{sc['max_epochs']} = "
-          f"{sc['base_epochs']} epoch ({sc['select']}) -> {BASE}/ · batch "
+    _lr2 = ("" if abs(sc["backbone_lr"] - sc["lr"]) < 1e-15
+            else f" (backbone {sc['backbone_lr']:g})")
+    _stop = (f"dừng sớm khi {sc['patience']} epoch liên tiếp val_score không vượt "
+             f"kỷ lục quá {sc['min_delta']:g}"
+             if sc["patience"] else "KHÔNG dừng sớm (patience 0)")
+    print(f"  Stage 0: MỘT lr {sc['lr']:g}{_lr2} — warm-up tuyến tính 0 -> lr "
+          f"trong {sc['warmup_epochs']:g} epoch (epoch 1–{sc['n_warmup_epochs']}) "
+          f"rồi PHẲNG, không anneal · wd {sc['weight_decay']} · TRẦN "
+          f"{sc['n_warmup_epochs']}+{sc['max_epochs']} = {sc['base_epochs']} epoch, "
+          f"{_stop} · epoch đem đi: {sc['select']} -> {BASE}/ · batch "
           f"{sc['batch_size']}"
           f" · ASL γ_neg {dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} "
           f"clip {sc['asl'].get('clip', 0.05)} · val {sc['val_n_samples']} mẫu "
@@ -513,6 +539,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     history: list[dict] = []
     start_epoch = 1
     best = {"epoch": None, "score": -1.0}
+    bad = 0                 # số epoch LIÊN TIẾP không cải thiện (đếm cho patience)
     last = d / "last" / "state.pt"
     # Epoch final chạy NỐI TIẾP thì phải có moment AdamW THẬT của phần base.
     # `last/state.pt` KHÔNG được đẩy Hub, nên một máy chỉ kéo `base/` về sẽ
@@ -526,6 +553,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             g.set_state(st["gen"])
             history = list(st["history"])
             best = dict(st["best"])
+            bad = int(st.get("bad", 0))     # chạy tiếp thì cửa sổ chờ cũng chạy tiếp
             start_epoch = int(st["epoch"]) + 1
             base_opt_live = True
             print(f"  ⚙ Stage 0 chạy TIẾP từ epoch {start_epoch} (đã lưu base: "
@@ -543,7 +571,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if restart_final and base_finished(cfg) is None:
         raise TrainUnusable(
             f"`--refinal` chỉ chạy lại epoch n+1, nhưng máy này không có base/ "
-            f"({sc['base_epochs']} epoch) khớp cấu hình — cục bộ lẫn trên Hub "
+            f"(≤ {sc['base_epochs']} epoch) khớp cấu hình — cục bộ lẫn trên Hub "
             f"(`<hub_base>/stage0/base/`). Chạy `--restage0` để pretrain lại, hoặc "
             f"kiểm `output.pull` / `--no-pull` và HF_TOKEN.")
     hb = None if restart else base_finished(cfg)
@@ -552,13 +580,18 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
         block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
         g = torch.Generator().manual_seed(seed)
-        for _ in range(sc["base_epochs"]):           # cùng Generator như lúc chạy base
+        # Phần base có `patience` nên nó DỪNG SỚM được: số epoch thật sự đã chạy
+        # nằm ở `base_epochs_run`, KHÔNG phải `max_epochs`. Tua Generator sai số
+        # lần thì epoch nối tiếp đọc một thứ tự mẫu khác lần chạy liền mạch.
+        n_ran = int(hb.get("base_epochs_run") or sc["base_epochs"])
+        for _ in range(n_ran):                       # cùng Generator như lúc chạy base
             torch.randperm(n, generator=g)
         history = [h for h in hb.get("history", [])
                    if h.get("phase") in ("base", "warmup", "norm")]
         best = {"epoch": hb.get("base_epoch"), "score": hb.get("base_score")}
-        start_epoch = sc["base_epochs"] + 1
-        print(f"  ⚙ base/ ({sc['base_epochs']} epoch) đã có — chỉ chạy epoch n+1", flush=True)
+        start_epoch = n_ran + 1
+        print(f"  ⚙ base/ ({n_ran} epoch{' — đã dừng sớm' if hb.get('stopped_early') else ''}) "
+              f"đã có — chỉ chạy epoch n+1", flush=True)
 
     # ── nạp ảnh trong luồng nền (PIL mở + resize 512 là việc CPU; dataset này
     # KHÔNG gọi tokenizer nên chạy nhiều luồng được). Thứ tự không đổi.
@@ -679,29 +712,51 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                          "stage0/val_score": ev["score"], "stage0/epoch": ep})
         return ev
 
+    ep_ran = start_epoch - 1          # epoch CUỐI CÙNG thật sự đã chạy của phần base
+    stopped_early = False
     for ep in range(start_epoch, sc["base_epochs"] + 1):
         t_ep = time.time()
         phase = phase_of(ep)
         lr0 = sched_base((ep - 1) * steps_per_epoch)
-        print(f"  [stage0] epoch {ep} ({phase}): backbone {lr0['backbone']:.2e} · "
-              f"rest {lr0['rest']:.2e} -> {sched_base(ep * steps_per_epoch - 1)['rest']:.2e}",
-              flush=True)
+        lr1 = sched_base(ep * steps_per_epoch - 1)
+        wait = (f" · chờ {bad}/{sc['patience']}" if sc["patience"] and bad else "")
+        print(f"  [stage0] epoch {ep}/{sc['base_epochs']} ({phase}): lr "
+              f"{lr0['rest']:.2e} -> {lr1['rest']:.2e}"
+              + ("" if abs(lr1["backbone"] - lr1["rest"]) < 1e-15
+                 else f" · backbone {lr0['backbone']:.2e} -> {lr1['backbone']:.2e}")
+              + wait, flush=True)
         run_loss = run_epoch(ep, opt, sched_base, (ep - 1) * steps_per_epoch)
         ev = record(ep, run_loss, t_ep, phase)
+        ep_ran = ep
         base_opt_live = True          # optimizer này vừa chạy thật phần base
+        # "Cải thiện" đo trên val_score (sqrt(F1·Recall) macro), CÙNG một đại
+        # lượng mà `select: best` dùng — nếu không thì cửa sổ chờ đang đếm một
+        # thứ, còn checkpoint lại chọn theo một thứ khác.
+        improved = float(ev["score"]) > float(best.get("score") or -1.0) + sc["min_delta"]
         better = (ep == sc["base_epochs"] or (max_steps is not None)) \
-            if sc["select"] == "last" else ev["score"] > best["score"]
+            if sc["select"] == "last" else improved
         if better:
             best = {"epoch": ep, "score": ev["score"]}
             Z.save_stage0(block, d / BASE, {"select": sc["select"], "phase": "base",
                 "best_epoch": ep, "best_score": ev["score"], "val": ev,
                 "base_fingerprint": base_fingerprint(cfg)})
+        bad = 0 if improved else bad + 1
         last.parent.mkdir(parents=True, exist_ok=True)
         tmp = last.with_suffix(".tmp")
         torch.save({"block": block.state_dict(), "opt": opt.state_dict(),
                     "gen": g.get_state(), "history": history, "best": best,
-                    "epoch": ep, "base_fingerprint": base_fingerprint(cfg)}, tmp)
+                    "epoch": ep, "bad": bad,
+                    "base_fingerprint": base_fingerprint(cfg)}, tmp)
         tmp.replace(last)
+        if sc["patience"] and bad >= sc["patience"]:
+            stopped_early = True
+            print(f"  ⏹ Stage 0 DỪNG SỚM ở epoch {ep}/{sc['base_epochs']}: "
+                  f"{bad} epoch LIÊN TIẾP val_score không vượt "
+                  f"{float(best.get('score') or 0.0):.4f}"
+                  + (f" + {sc['min_delta']:g}" if sc["min_delta"] else "")
+                  + f" (patience {sc['patience']}). Checkpoint đem đi: epoch "
+                  f"{best['epoch']}.", flush=True)
+            break
 
     if best["epoch"] is None:          # select=last mà vòng dừng sớm: lấy epoch cuối đã chạy
         best = {"epoch": history[-1]["epoch"], "score": history[-1]["val_score"]}
@@ -713,6 +768,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     def summary(done: bool) -> dict:
         o = {"finished": done, "base_finished": True, "select": sc["select"],
+             "base_epochs_run": ep_ran, "stopped_early": stopped_early,
              "base_epoch": base["epoch"], "base_score": base["score"],
              "best_epoch": best["epoch"], "best_score": best["score"],
              "history": history, "stage0": {k: v for k, v in sc.items()},
@@ -735,13 +791,32 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                                             default=str), encoding="utf-8")
         write_loader(cfg, d, train_df, val_df, y_tr, m_tr, y_va, m_va, info, sc, micro,
                      steps_per_epoch, spec, best)
-        print(f"  ✓ Stage 0 base: {sc['base_epochs']} epoch xong -> {d / BASE}", flush=True)
+        tail = f" (dừng sớm, trần {sc['base_epochs']})" if stopped_early else ""
+        print(f"  ✓ Stage 0 base: {ep_ran} epoch{tail} xong · best = epoch "
+              f"{best['epoch']} -> {d / BASE}", flush=True)
         if on_base_done is not None:
             on_base_done()
 
+    # ── `select: best`: trọng số đem đi PHẢI là của epoch tốt nhất ─────────
+    # `block` trong bộ nhớ đang giữ epoch CUỐI CÙNG đã chạy. Với `select: last`
+    # hai thứ đó là một, nhưng với `select: best` + `patience` thì epoch cuối
+    # chính là epoch đã khiến cửa sổ chờ hết hạn — tức một epoch TỆ HƠN. Không
+    # nạp lại thì `final/` mang trọng số epoch cuối nhưng đề `best_epoch` là
+    # epoch tốt nhất: sai mà không có exception nào.
+    if sc["select"] == "best" and best["epoch"] is not None and best["epoch"] != ep_ran:
+        from safetensors.torch import load_file
+
+        block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
+        # Moment AdamW đang là của epoch cuối, không khớp trọng số vừa nạp —
+        # epoch anneal (nếu bật) vì thế KHÔNG còn là "chạy nối tiếp" nữa.
+        base_opt_live = False
+        print(f"  ⚙ `select: best` — nạp lại base/ (epoch {best['epoch']}, score "
+              f"{float(best['score']):.4f}); epoch cuối đã chạy là {ep_ran}",
+              flush=True)
+
     # ── epoch n+1: anneal cosine -> final/ ──────────────────────────────────
     if fa["enabled"]:
-        ep_last = sc["base_epochs"]
+        ep_last = ep_ran
         if fa["reset_optimizer"]:
             opt = torch.optim.AdamW(block.parameters(), lr=fa["lr_start"],
                                     weight_decay=fa["weight_decay"], betas=(0.9, 0.999),
@@ -780,6 +855,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     pf_tr.close()
     pf_va.close()
     out = {"finished": True, "select": sc["select"],
+           "base_epochs_run": ep_ran, "stopped_early": stopped_early,
            "best_epoch": best["epoch"], "best_score": best["score"],
            "history": history, "stage0": {k: v for k, v in sc.items()},
            "micro_batch": micro, "autobatch": ab_rep,
@@ -850,18 +926,23 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
         "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8), 2 nhóm: backbone | rest",
                      "lr": sc["lr"], "backbone_lr": sc["backbone_lr"],
                      "lr_schedule": (
-                         f"backbone (ViT, pretrain ImageNet-1k): lr "
-                         f"{sc['backbone_lr']:g} PHẲNG suốt Stage 0 (kể cả epoch "
-                         f"final_anneal); rest (Linear vào, learner Q, Self/Cross-"
-                         f"attn, MLP, Cls Head): warm-up tuyến tính theo bước 0 -> "
-                         f"{sc['lr']:g} trong {sc['warmup_epochs']:g} epoch đầu rồi "
-                         f"phẳng tới hết epoch {sc['base_epochs']}"),
+                         f"MỘT lr {sc['lr']:g} cho CẢ HAI nhóm (backbone_lr "
+                         f"{sc['backbone_lr']:g}), warm-up tuyến tính theo bước "
+                         f"0 -> lr trong {sc['warmup_epochs']:g} epoch đầu rồi "
+                         f"PHẲNG tới lúc dừng — không anneal, không one-cycle"),
                      "n_warmup_epochs": sc["n_warmup_epochs"],
                      "warmup_epochs": sc["warmup_epochs"],
                      "weight_decay": sc["weight_decay"],
+                     # `max_epochs`/`base_epochs` là TRẦN; số epoch thật sự chạy
+                     # nằm ở `base_epochs_run` của history.
                      "max_epochs": sc["max_epochs"], "base_epochs": sc["base_epochs"],
+                     # Số epoch THẬT SỰ chạy nằm ở `base_epochs_run` của
+                     # stage0_history.json, không lặp lại ở đây.
+                     "early_stop": {"patience": sc["patience"],
+                                    "min_delta": sc["min_delta"],
+                                    "monitor": "val_score = sqrt(F1_macro·Recall_macro)"},
                      "max_grad_norm": sc["max_grad_norm"],
-                     "select": f"sqrt(F1_macro·Recall_macro) trên val, lớp {sc['val_classes']}"},
+                     "select": f"{sc['select']} theo sqrt(F1_macro·Recall_macro) trên val, lớp {sc['val_classes']}"},
         "asl": sc["asl"], "spec": spec,
         "vision": {"branch_encoder": spec["vextractor"]["arch"],
                    "pretrained": spec["vextractor"]["pretrained"],

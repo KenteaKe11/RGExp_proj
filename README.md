@@ -116,38 +116,42 @@ Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor, không đọc lưới
 patch thô rồi vứt đi.
 
-**Hai nhóm tham số, và chúng KHÔNG dùng chung một lr** (AdamW, wd 0.03):
+**Một lr duy nhất: `lr` = 1e-5, phẳng suốt Stage 0** (AdamW, wd 0.03). Optimizer
+vẫn giữ **hai nhóm** — `backbone` (ViT-Small/16) và `rest` (Linear vào · 128
+learner Q · Self/Cross-attn · MLP · Cls Head) — để về sau tách ra được, nhưng
+`backbone_lr: null` nghĩa là nó **lấy theo `lr`**, nên hiện tại chỉ có đúng một
+con số. Thứ **duy nhất** làm lr đổi là epoch warm-up ở đầu: không anneal, không
+one-cycle.
 
-| nhóm | gồm | lr |
-|---|---|---|
-| `backbone` | ViT-Small/16 (đã pretrain ImageNet-1k) | **`backbone_lr` = 1e-5, PHẲNG suốt Stage 0** |
-| `rest` | Linear vào · 128 learner Q · Self/Cross-attn · MLP · Cls Head | **`lr` = 3e-5 lr_max**, warm-up rồi anneal |
+**Lịch: 1 epoch warm-up + tối đa 50 epoch, dừng sớm theo `patience`.**
 
-Cho ViT đi cùng 3e-5 là đẩy một backbone đã hội tụ bằng gradient của một Cls Head
-còn ngẫu nhiên; cho phần mới đi cùng 1e-5 là bắt nó học chậm gấp ba mà không có
-lý do nào. ViT chỉ **fine-tune phần đã pretrain**, nên nó không tham gia
-one-cycle nào cả — kể cả epoch final.
-
-**Lịch: 1 + 6 + 1 = 8 epoch.**
-
-* **Epoch 1 — "warmup"**: nhóm `rest` **ramp tuyến tính theo BƯỚC** từ 0 lên
-  `lr` = 3e-5 trong `warmup_epochs` (1.0) epoch = 200/200 bước; backbone đã ở
-  1e-5 ngay từ bước 0. **Không còn epoch "norm"** của bản ResNet50: ViT không có
-  BatchNorm nên không có thống kê chạy nào cần kéo về phân phối ảnh CXR.
-* **Epoch 2–7 — "base"**: nhóm `rest` giữ **phẳng ở 3e-5**, backbone giữ 1e-5.
-  Warm-up chiếm **trọn** epoch đầu, nằm **ngoài** `max_epochs` —
-  `base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7`. Luôn lấy epoch cuối
-  (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay**.
-* **Epoch 8 — final weight** (`stage0.final_anneal`): chạy **nối tiếp** — giữ
-  nguyên **moment AdamW** đã tích trong phần base, và `lr_start: null` lấy đúng
-  **`stage0.lr` (3e-5)** làm điểm xuất phát, nên lr của `rest` **không nhảy nấc**
-  ở ranh giới epoch, nó chỉ bắt đầu đi xuống: **cosine 3e-5 → 1e-7** cập nhật
-  mỗi bước, **backbone vẫn phẳng ở 1e-5** -> `_stage0/final/`, đẩy Hub.
-  **Main stage dùng `final/`.** Đổi riêng khối `final_anneal` thì chỉ chạy lại
-  epoch 8 (base có vân tay riêng).
-* lr là **hàm thuần của số bước** (`base_lr_at` / `anneal_lr_at`), không phải
-  một đối tượng scheduler có trạng thái: chạy tiếp sau khi đứt chỉ cần biết đang
-  ở bước nào.
+* **Epoch 1 — "warmup"**: **cả hai nhóm** ramp tuyến tính **theo BƯỚC** từ 0 lên
+  1e-5 trong `warmup_epochs` (1.0) epoch = 200/200 bước. **Không còn epoch
+  "norm"** của bản ResNet50: ViT không có BatchNorm nên không có thống kê chạy
+  nào cần kéo về phân phối ảnh CXR.
+* **Epoch 2–51 — "base"**: lr **phẳng ở 1e-5**. `max_epochs` (50) là **trần**,
+  không phải số epoch sẽ chạy:
+  `base tối đa = ceil(warmup_epochs) + max_epochs = 1 + 50 = 51`.
+* **Dừng sớm** (`stage0.patience` = 5, `min_delta` = 0): sau mỗi epoch đo val;
+  **5 epoch liên tiếp** mà `val_score` = sqrt(F1_macro · Recall_macro) không
+  vượt kỷ lục cũ quá `min_delta` thì **dừng** phần base. Số epoch thật sự chạy
+  ghi ở `base_epochs_run` của `stage0_history.json`, cùng cờ `stopped_early`.
+* **Epoch đem đi = epoch TỐT NHẤT** (`stage0.select: best`), không phải epoch
+  cuối — `patience` + `select: last` bị **từ chối thẳng** ở `s0cfg`, vì dừng
+  *vì* val hết cải thiện rồi lại lấy đúng epoch cuối của cửa sổ chờ là tự phủ
+  định chính nó. Trọng số trong bộ nhớ lúc dừng là của epoch cuối, nên trước khi
+  ghi `final/` code **nạp lại `base/`** (epoch tốt nhất).
+* **`final_anneal.enabled: false`**: lr cố định suốt quá trình nên không có
+  epoch anneal nào. `_stage0/final/` = đúng checkpoint tốt nhất của phần base;
+  **main stage vẫn dùng `final/`** như cũ, và `base/` vẫn được **đẩy Hub ngay**
+  khi phần base xong.
+* **Val phải CỐ ĐỊNH** (`val_resample: false`) khi có early-stop: bốc lại tập val
+  mỗi epoch thì `patience` đang đếm cả nhiễu của việc đổi tập, không riêng việc
+  model hết tiến.
+* lr là **hàm thuần của số bước** (`base_lr_at`), không phải một đối tượng
+  scheduler có trạng thái: chạy tiếp sau khi đứt chỉ cần biết đang ở bước nào —
+  và cửa sổ chờ (`bad`) cũng được lưu trong `last/state.pt` nên nó chạy tiếp
+  đúng chỗ.
 * Batch hiệu dụng **32 — của riêng Stage 0**. Nó trùng 32 của main stage chỉ là
   trùng số: batch main stage bị khoá theo $1 (`train_batch` trong fixture, một
   phần lịch học của A), còn Stage 0 không dính gì tới A. Mảnh vật lý
@@ -192,8 +196,9 @@ trên 256 mẫu bốc lại mỗi 25 bước). Phần thêm:
 * Theo dõi `RMS(Q)/RMS(Z)` mỗi bước — độ lớn một chiều của Q so với một chiều
   của token ảnh, ghi vào `train_stats.json` cùng đường cong val.
 
-Không áp dụng cho §2.2 (các mục của lịch MoE): patience/early-stop, max 50 epoch,
-nhiễu Route, Route_Gate/Experts.
+Không áp dụng cho §2.2 (các mục của lịch MoE): nhiễu Route, Route_Gate/Experts.
+(Patience / early-stop / max 50 epoch **có** áp dụng — nhưng cho **Stage 0**,
+xem mục Lịch ở trên; main stage của B vẫn khoá cứng 1 epoch = 200 bước theo $1.)
 
 ## Kiểm định (`src/stats_ab.py`)
 
