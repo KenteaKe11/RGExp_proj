@@ -28,8 +28,8 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
    xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
    LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
-   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 128 learner), rồi phần văn bản.
-   So khối Q với khối Z là câu "decoder có thật sự đọc 128 vector mới không".
+   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 32 learner), rồi phần văn bản.
+   So khối Q với khối Z là câu "decoder có thật sự đọc 32 vector mới không".
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
    nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
@@ -251,7 +251,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
           "token_type_ids": batch.get("token_type_ids")}
     if q is not None:
         # Nối Q ngay SAU khối ảnh -> [Z ‖ Q ‖ T], đúng như lúc train. `labels`
-        # phải được nới theo (nếu không, y sẽ được tính lệch 128 vị trí), nhưng
+        # phải được nới theo (nếu không, y sẽ được tính lệch n_query vị trí), nhưng
         # KHÔNG đưa vào forward: y ở đây tính tay từ logits.
         at = recombiner.last_image_index(ids, img_tok) + 1
         w = recombiner.inject_tokens(
@@ -388,7 +388,7 @@ def _norm01(a: np.ndarray, pct: float) -> np.ndarray:
 def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
     """‖∂y/∂h‖ — trục Y là TOKEN, trục X là LỚP, trên đủ mọi lớp decoder.
 
-    Token nằm dọc vì chuỗi mới là chiều dài: `[Z(256) ‖ Q(128) ‖ text]` là hàng
+    Token nằm dọc vì chuỗi mới là chiều dài: `[Z(256) ‖ Q(32) ‖ text]` là hàng
     trăm vị trí, còn decoder chỉ có vài chục lớp. Xếp token theo chiều đứng (đọc
     từ trên xuống đúng thứ tự trong chuỗi, `origin="upper"`) thì ba vùng Z / Q /
     text thành ba khối liền nhau và so được bằng mắt; xếp ngang thì 776 cột bị

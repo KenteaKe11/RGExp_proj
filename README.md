@@ -2,8 +2,8 @@
 
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-cùng loader, cùng 3000 ảnh test), rồi **nối thêm 128 vector** từ một **encoder
-thị giác RIÊNG** — **Q = V-Extractor(ảnh 448²)** — ngay sau 256 token ảnh, thì
+cùng loader, cùng 3000 ảnh test), rồi **nối thêm 32 vector** từ một **encoder
+thị giác RIÊNG** — **Q = Aligner(V-Extractor(ảnh 448²))** — ngay sau 256 token ảnh, thì
 chất lượng báo cáo X-quang có đổi không?
 
 | candidate | nguồn | chuỗi vào decoder |
@@ -12,7 +12,7 @@ chất lượng báo cáo X-quang có đổi không?
 | **B** `qlora_r32_decoder_vextractor` | §2.2 — Stage 0 → main stage y hệt A + nhánh | `[Z ‖ Q ‖ text]` |
 
 **Biến duy nhất là chuỗi vào decoder.** Z (256 token ảnh) **không bị đụng vào**;
-B chỉ có thêm 128 vị trí nằm ngay sau khối ảnh. 128 vị trí ấy có nhãn `-100`,
+B chỉ có thêm 32 vị trí nằm ngay sau khối ảnh. 32 vị trí ấy có nhãn `-100`,
 `attention_mask = 1`, `token_type_ids = 0` — nên **số token vào CE không đổi** và
 CE của A với B vẫn là cùng một đại lượng. Q mang sẵn thông tin Stage 0 ngay từ
 bước đầu của main stage — đó chính là việc Stage 0 sinh ra để làm. Mọi khoá
@@ -38,34 +38,54 @@ kiểm, `train` dừng nếu lệch).
                          │
                       ViT-Small/16 (ImageNet-1k)   ─► forward_features, bỏ cls
                          │                            ─► (784, 384)
-                      Linear 384→2048 ─► RMSNorm(2048) ──────────────┐   (K, V)
+                      Linear 384→2560 ─► RMSNorm(2560) ──────────────┐   (K, V)
                                                                      │
-   128 learner Q ─► RMSNorm(2048) ─► Self-attn ─┬──────────────┐     │
-                                                │              │     │
-                                          RMSNorm(2048) ─► CrossAttn ┘
-                                                │              │
-                                                └──► (+) ◄─────┘   (skip từ Self-attn)
-                                                      │
-                                           MLP(GeLU) 2048→4096→2560
-                                                      │
-                                                      ▼   Q (128, 2560)
+    32 learner Q ─► RMSNorm(2560) ─► Self-attn ─┬─────────────────┐     │
+                          │                     │                 │     │
+                          │            MLP(GeLU) 2560→3072→2560    │     │
+                          │                     │                 │     │
+                          │                    (+) ◄──────────────┘     │
+                          │                     │   (skip từ Self-attn) │
+                          │              RMSNorm(2560) ─► CrossAttn ◄───┘
+                          │                                  │
+                          └──────────► (+) ◄─────────────────┘  (skip từ learner)
+                                        │
+                                        ▼   Q_raw (32, 2560)       ← hết KHỐI CAM
 
-Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
+Q_raw ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
+
+Q_raw ─► Aligner (CHỈ main stage, KHỐI VÀNG):
+             RMSNorm(2560) ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+) ─► Q (32, 2560)
+                                         └──────────── skip ───────────────┘
+
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**`n_query` là khoá khai tường minh** (`vextractor.vextractor.n_query = 128`) —
+**`n_query` là khoá khai tường minh** (`vextractor.vextractor.n_query = 32`) —
 khác bản ResNet50 cũ, nơi nó bị ép bằng `(image_size/32)²`. Lưới patch của ViT ở
 448² là **784 ô**, quá dài để nối vào chuỗi decoder, nên nó là **nguồn để hỏi**
-chứ không phải khối Q: 128 learner vector đi hỏi nó qua **Cross-Attn** và nén
+chứ không phải khối Q: 32 learner vector đi hỏi nó qua **Cross-Attn** và nén
 lại. Self-attn chạy **trước** Cross-Attn và trên **riêng** các learner vector —
-128 câu hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh. Residual cộng
-đầu ra Self-attn vào đầu ra Cross-Attn (đúng một dấu `+` trong hình).
+32 câu hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh.
 
-**Thân nhánh ở 2048, chỉ MLP cuối nở ra 2560.** `d_branch = 2048` giữ hai khối
-attention nhẹ (head_dim 128 → 16 head); **MLP(GeLU) 2048→4096→2560** là chỗ
-**duy nhất** đổi chiều sang `d_model` của decoder. Tham số nhánh để fp32, chạy
-dưới autocast bf16.
+**Hai residual, đúng hai dấu `+` trong hình**: một cộng đầu ra Self-attn vào đầu
+ra MLP (khối MLP nằm **giữa** hai attention), một cộng **thẳng learner Q** vào
+đầu ra Cross-Attn. Learner vì thế có đường gradient ngắn nhất về tới chính nó.
+
+**Thân nhánh chạy thẳng ở 2560.** Khoá `d_branch` của bố cục cũ (thân 2048, MLP
+cuối nở 2048→4096→2560) **không còn** — khai nó là lỗi. Linear vào nở
+384 → 2560 ngay, hai attention làm việc ở 2560 (head_dim 128 → **20 head**) và
+**MLP(GeLU) 2560→3072→2560** không đổi chiều, nên không chỗ nào trong nhánh bị
+bóp xuống dưới `d_model` của decoder. Tham số nhánh để fp32, chạy dưới autocast
+bf16.
+
+**Aligner — khối học được DUY NHẤT của nhánh ở main stage.** Stage 0 dạy khối
+cam trả lời một câu hỏi **phân loại**; main stage cần một khối token mà
+**decoder** đọc được. Hai yêu cầu ấy không giống nhau, nên giữa chúng có đúng
+một khối: `RMSNorm → Self-attn → MLP(GeLU) 2560→3072→2560`, residual từ đầu ra
+Self-attn. Aligner **không có mặt ở Stage 0** (Cls Head đọc thẳng `Q_raw`), nên
+nó vào main stage với trọng số ngẫu nhiên — và vì khối cam bị **đóng băng hoàn
+toàn**, nó là nơi **duy nhất** gradient của CE chạm vào nhánh.
 
 **Không còn BatchNorm → InstanceNorm.** ViT không có BatchNorm: chuẩn hoá của nó
 là LayerNorm, tính theo **từng token của từng ảnh**, không mang theo thống kê
@@ -85,18 +105,20 @@ trên một mẫu thật mỗi lần chạy.
 | khối | tham số |
 |---|---|
 | ViT-Small/16 @448 (cắt head) | 21,9 M |
-| `Linear 384→2048` | 788 K |
-| 128 learner Q | 262 K |
-| Self-attn @2048 | 16,8 M |
-| Cross-attn @2048 | 16,8 M |
-| `MLP(GeLU) 2048→4096→2560` | 18,9 M |
-| **V-Extractor** | **75,4 M** |
-| Cls Head (chỉ Stage 0) | 26,3 M |
-| **Stage 0 tổng** | **~102 M** |
+| `Linear 384→2560` | 986 K |
+| 32 learner Q | 81,9 K |
+| Self-attn @2560 | 26,2 M |
+| `MLP(GeLU) 2560→3072→2560` | 15,7 M |
+| Cross-attn @2560 | 26,2 M |
+| **V-Extractor (khối CAM)** | **91,1 M** |
+| Cls Head (CHỈ Stage 0) | 26,3 M |
+| **Stage 0 tổng** | **117,5 M** |
+| **Aligner (CHỈ main stage)** | **41,95 M** — *toàn bộ phần học được của nhánh* |
+| nhánh ở main stage (cam + vàng) | 133,1 M, trong đó **học được 41,95 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
-Đặt Q trước Z thì 128 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
+Đặt Q trước Z thì 32 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
 lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) và
 `recombiner.image_end_indices(ids) + 1` (khâu sinh, đệm trái — mỗi hàng một chỗ).
 
@@ -109,7 +131,8 @@ khối attention — rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn c�
 số).
 
 ```
-ảnh 448² (mean/std của checkpoint) ─► ViT-S ─► 128 learner Q ─► Cls Head ─► ASL (14 × 3)
+ảnh 448² (mean/std của checkpoint) ─► ViT-S ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
+                                                   (Aligner KHÔNG có mặt ở đây)
 ```
 
 Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main stage sẽ nối vào
@@ -117,7 +140,7 @@ chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor, khô
 patch thô rồi vứt đi.
 
 **Một lr duy nhất: `lr` = 1e-5, phẳng suốt Stage 0** (AdamW, wd 0.03). Optimizer
-vẫn giữ **hai nhóm** — `backbone` (ViT-Small/16) và `rest` (Linear vào · 128
+vẫn giữ **hai nhóm** — `backbone` (ViT-Small/16) và `rest` (Linear vào · 32
 learner Q · Self/Cross-attn · MLP · Cls Head) — để về sau tách ra được, nhưng
 `backbone_lr: null` nghĩa là nó **lấy theo `lr`**, nên hiện tại chỉ có đúng một
 con số. Thứ **duy nhất** làm lr đổi là epoch warm-up ở đầu: không anneal, không
@@ -125,8 +148,11 @@ one-cycle.
 
 **Lịch: 1 epoch warm-up + tối đa 50 epoch, dừng sớm theo `patience`.**
 
-* **Epoch 1 — "warmup"**: **cả hai nhóm** ramp tuyến tính **theo BƯỚC** từ 0 lên
-  1e-5 trong `warmup_epochs` (1.0) epoch = 200/200 bước. **Không còn epoch
+* **Epoch 1 — "warmup"**: **cả hai nhóm** ramp tuyến tính **theo BƯỚC** từ
+  `warmup_start_lr` = **1e-8** lên 1e-5 trong `warmup_epochs` (1.0) epoch =
+  200/200 bước. Nội suy trên **giá trị** lr, nên bước 1 có đúng 1e-8 thay vì
+  `lr/200`; đầu dốc do một khoá trong config quyết định, không do số bước mỗi
+  epoch. **Không còn epoch
   "norm"** của bản ResNet50: ViT không có BatchNorm nên không có thống kê chạy
   nào cần kéo về phân phối ảnh CXR.
 * **Epoch 2–51 — "base"**: lr **phẳng ở 1e-5**. `max_epochs` (50) là **trần**,
@@ -177,15 +203,20 @@ r32 của $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt 
 epoch = 200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo val (CE
 trên 256 mẫu bốc lại mỗi 25 bước). Phần thêm:
 
-* Cls Head **bị bỏ**. V-Extractor nạp **trọn vẹn** từ Stage 0 (`final/`) và
-  **đóng băng hoàn toàn trong 0.2 epoch đầu** (40/200 bước), sau đó **finetune**
-  ở lr cố định **1e-5**, wd 0.01. Autobatch dò VRAM ở trạng thái đã mở băng
-  (nặng nhất).
-* Nhánh chỉ có **một** nhóm tham số ở main stage — không còn phần nào của nó là
-  mới tinh sau Stage 0.
-* Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
+* Cls Head **bị bỏ**. V-Extractor (khối cam) nạp **trọn vẹn** từ Stage 0
+  (`final/`) và **đóng băng HOÀN TOÀN suốt main stage**: `requires_grad=False` +
+  `eval()` + forward trong `no_grad` + **không nằm trong optimizer**. Không còn
+  `freeze_vext_epochs`, không còn bước mở băng — 0 bước cập nhật, 0 gradient.
+* Nhánh có đúng **một** nhóm tham số học được: **Aligner**, lr **cố định 1e-5**
+  (`vextractor.main.align_lr`), wd 0.01, **phẳng** từ bước 0 tới bước cuối —
+  không warm-up, không anneal. LoRA của decoder vẫn chạy đúng one-cycle của $1.
+  Khai lại `vext_lr` / `vext_wd` / `freeze_vext_epochs` trong config sẽ bị **từ
+  chối ồn ào** thay vì bỏ qua im lặng.
+* Autobatch dò VRAM ở **đúng** trạng thái của vòng lặp (cam đóng băng nên ViT
+  không giữ activation nào).
+* Clip gradient **tách riêng** LoRA và Aligner, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: **128 token** thêm vào chuỗi **cộng** một lượt ViT-Small/16 ở
+* B nặng hơn A: **32 token** thêm vào chuỗi **cộng** một lượt ViT-Small/16 ở
   448² (784 patch) cho mỗi ảnh. Nhánh của §2.2 nặng hơn nhánh của §2.1 vì nó có
   encoder riêng chứ không đi nhờ đặc trưng đã tính sẵn. Nếu batch đã khoá không
   vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo
@@ -239,8 +270,8 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    heatmap: trục **Y là vị trí token** (đọc từ trên xuống đúng thứ tự trong
    chuỗi), trục **X là lớp** với chỉ số thật, trên **đủ mọi lớp** (34/34). Đường
    kẻ mờ + thanh màu bên trái chia ba vùng token: **Z** (xanh, 256 token ảnh),
-   **Q** (vàng, 128 vector của nhánh), rồi phần văn bản — so dải Q với dải Z là
-   câu hỏi chính: *decoder có thật sự đọc 128 vector mới không*. Kèm bảng 5 ô
+   **Q** (vàng, 32 vector của nhánh), rồi phần văn bản — so dải Q với dải Z là
+   câu hỏi chính: *decoder có thật sự đọc 32 vector mới không*. Kèm bảng 5 ô
    nhạy nhất (có nhãn `Z[i]` / `Q[k]` / `text`) và 8 vector Q được đọc nhiều nhất.
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token,
@@ -271,7 +302,7 @@ sánh định lượng (tương quan / IoU ở "Kiểm nhanh") gộp ô 4 về *
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
-chỉ vài trong 128 vector làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
+chỉ vài trong 32 vector làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
 encoder‖`, tương quan và IoU giữa hai bản đồ, cộng hai dòng về **hoạt độ đầu ra
 SigLIP** (max/mean, 10% patch nóng nhất gánh bao nhiêu) và tương quan của Z / Q
 với hoạt độ ấy.
@@ -339,7 +370,7 @@ adapters_vextractor/_stage0/                   PRETRAIN — để về sau đố
     last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
 adapters_vextractor/qlora_r32_decoder_vextractor/   MAIN STAGE
     adapter_model.safetensors, adapter_config.json   LoRA r32
-    vextractor_branch.safetensors|.json      V-Extractor (nạp trọn từ Stage 0)
+    vextractor_branch.safetensors|.json      V-Extractor (nạp trọn, đóng băng) + Aligner (đã học)
     vextractor_stage0.safetensors|.json      bản chép Stage 0 đã nạp (truy nguồn)
     train_stats.json                         batch/accum/mảnh, lr, val curve, RMS(Q)/RMS(Z), VRAM, phút
 runs/vextractor/                               REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
@@ -370,8 +401,9 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/vextractor.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/vextractor.py        V-Extractor (ViT-S/16 ImageNet-1k + Linear 384→2048 + 128 learner Q
-                         + Self-attn + CrossAttn + MLP 2048→2560) · vext_tensor (đường ảnh
+src/vextractor.py        V-Extractor (ViT-S/16 ImageNet-1k + Linear 384→2560 + 32 learner Q
+                         + Self-attn + MLP 2560→3072→2560 + CrossAttn) · Aligner (main
+                         stage) · vext_tensor (đường ảnh
                          riêng, mean/std của checkpoint) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_vextractor.py Stage 0 (KHÔNG nạp Gemma) + loader.json + nhãn chụp lại

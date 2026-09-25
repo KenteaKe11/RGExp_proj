@@ -99,13 +99,13 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = V-Extractor(ảnh 448²), Z giữ nguyên)"],
+         f"token, Q = Aligner(V-Extractor(ảnh 448²)), Z giữ nguyên)"],
         ["Stage 0", "—", f"V-Extractor + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
                           f"({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
-         f"V-Extractor nạp TRỌN từ Stage 0, đóng băng "
-         f"{zm.get('freeze_vext_epochs')} epoch đầu rồi lr cố định "
-         f"{zm.get('vext_lr')} wd {zm.get('vext_wd')} · Cls Head bỏ"],
+         f"V-Extractor nạp TRỌN từ Stage 0 và ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · "
+         f"Aligner MỚI, lr cố định {zm.get('align_lr')} wd {zm.get('align_wd')} "
+         f"· Cls Head bỏ"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
@@ -203,14 +203,20 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     L.append("- V-Extractor được Stage 0 dạy trên nhãn bệnh lý của 6400 ảnh train — một "
              "nguồn giám sát A không có. \"Biến duy nhất là chuỗi vào decoder\" "
              "nghĩa là đúng thế; Q mang theo cả thông tin do Stage 0 học.")
-    L.append("- B có chuỗi DÀI HƠN A đúng 128 token. Số token vào CE giữ nguyên "
-             "(128 vị trí ấy có nhãn −100), nhưng decoder của B có thêm 128 vị trí "
-             "để attention nhìn vào — đó là một phần của biến đang đo, không phải "
-             "một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
-    L.append(f"- V-Extractor đóng băng {zm.get('freeze_vext_epochs')} epoch đầu của "
-             f"main stage, sau đó học ở lr {zm.get('vext_lr')} — nhánh của B có thêm "
-             f"tham số học được mà A không có, kể từ bước "
-             f"{((st_b.get('vextractor') or {}).get('frozen_steps'), '?')[0]}.")
+    _nqb = _nq(st_b)
+    L.append(f"- B có chuỗi DÀI HƠN A đúng {_nqb} token. Số token vào CE giữ nguyên "
+             f"({_nqb} vị trí ấy có nhãn −100), nhưng decoder của B có thêm {_nqb} vị "
+             f"trí để attention nhìn vào — đó là một phần của biến đang đo, không phải "
+             f"một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
+    _np = (st_b.get("vextractor") or {}).get("n_params") or {}
+    L.append(f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage: 0 bước cập nhật, "
+             f"không có gradient nào chạm vào nó. Tham số học được mà A không có nằm "
+             f"TRỌN trong Aligner ({_np.get('aligner', '?'):,} tham số nếu là số) ở lr "
+             f"cố định {zm.get('align_lr')} — nên chênh lệch A/B là của một khối thị "
+             f"giác CỐ ĐỊNH cộng một phép xoay học được, không phải của một encoder "
+             f"được finetune thêm." if isinstance(_np.get("aligner"), int) else
+             f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
+             f"của nhánh nằm trọn trong Aligner, lr cố định {zm.get('align_lr')}.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")

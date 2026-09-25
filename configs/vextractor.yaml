@@ -3,7 +3,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 # QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 256 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 32 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
@@ -12,15 +12,15 @@
 #                                    -> main stage y hệt A + nhánh V-Extractor.
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = V-Extractor(ảnh 448²) — 128 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
-# 128 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
-# tạo 0: Q mang sẵn thông tin Stage 0 ngay từ bước 0 — đó chính là việc Stage 0
-# sinh ra để làm. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
+# với Q = Aligner(V-Extractor(ảnh 448²)) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# 32 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# tạo 0: Q_raw mang sẵn thông tin Stage 0 ngay từ bước 0 — đó chính là việc
+# Stage 0 sinh ra để làm; Aligner chỉ xoay nó về không gian embedding của Gemma. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
 # Holm trên các metric (`src/stats_ab.py`).
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ViT-Small/16 ăn ảnh 448²) — và chuỗi dài thêm 128.
+# đây nhánh có encoder RIÊNG (ViT-Small/16 ăn ảnh 448²) — và chuỗi dài thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
 # generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
@@ -306,38 +306,59 @@ labels:
 # quá dài để nối vào chuỗi decoder): `n_query` learner vector đi HỎI nó qua
 # Cross-Attn. Đường đi, đúng hình:
 #
-#   784 patch ─► Linear 384→2048 ─► RMSNorm(2048) ───┐
-#   128 learner Q ─► RMSNorm ─► Self-attn ─► RMSNorm ┴► CrossAttn ─► (+skip từ
-#   Self-attn) ─► MLP(GeLU) 2048→2560 ─► Q (128, 2560)
+#   KHỐI CAM (V-Extractor) — Stage 0 dạy, main stage ĐÓNG BĂNG HOÀN TOÀN:
+#     784 patch ─► Linear 384→2560 ─► RMSNorm(2560) ────────────────┐
+#     32 learner Q ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
+#                    │                      └──────── skip ────────────────┘
+#                    │                                    │
+#                    │                              RMSNorm(2560)
+#                    │                                    │
+#                    │                              CrossAttn ◄──────────────┘
+#                    └──────────── skip ────────────────► (+) ─► Q_raw (32, 2560)
 #
-# `n_query` là khoá KHAI TƯỜNG MINH (khác bản ResNet50 cũ, nơi nó bị ép bằng
-# (image_size/32)²). Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
-# `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint —
-# checkpoint ViT ImageNet-1k họ AugReg dùng 0.5/0.5 chứ không phải mean/std của
-# ImageNet, nên một cặp số gõ tay ở đây là sai lặng lẽ.
+#   KHỐI VÀNG (Aligner) — CHỈ main stage, khởi tạo ngẫu nhiên, THAM SỐ DUY NHẤT
+#   của nhánh được học:
+#     Q_raw ─► RMSNorm(2560) ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
+#                                          └──────── skip ─────────────────┘
+#                                                    ─► Q (32, 2560) ─► [Z ‖ Q ‖ T]
+#
+# Thân nhánh chạy THẲNG ở 2560 — bố cục cũ bóp về `d_branch` 2048 rồi mới nở ra
+# ở MLP cuối; khoá `d_branch` vì thế KHÔNG còn và khai nó là lỗi.
+#
+# `n_query` là khoá KHAI TƯỜNG MINH. Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi
+# từ `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi
+# checkpoint — checkpoint ViT ImageNet-1k họ AugReg dùng 0.5/0.5 chứ không phải
+# mean/std của ImageNet, nên một cặp số gõ tay ở đây là sai lặng lẽ.
 vextractor:
   n_labels: null            # null = theo labels.npz (14)
-  vextractor:               # ảnh (3, 448, 448) -> Q (128, 2560)
+  vextractor:               # KHỐI CAM: ảnh (3, 448, 448) -> Q_raw (32, 2560)
     image_size: 448         # PHẢI chia hết patch size (16). 448/16 = 28 -> 784 patch
     arch: vit_small_patch16_224.augreg_in1k   # timm; lần chạy đầu tải ~85 MB
     pretrained: true        # ImageNet-1k. false bị TỪ CHỐI (câu hỏi khác hẳn)
-    n_query: 128            # số learner vector = số token Q nối vào chuỗi decoder
-    d_branch: 2048          # chiều thân nhánh; chỉ MLP cuối nở ra d_model 2560
-    n_heads: 16             # Self/Cross-attn ở 2048: head_dim 128 (2048 = 16 × 128)
-    mlp_hidden: 4096        # MLP(GeLU) 2048 -> 4096 -> 2560
+    n_query: 32             # số learner vector = số token Q nối vào chuỗi decoder
+    n_heads: 20             # Self/Cross-attn ở 2560: head_dim 128 (2560 = 20 × 128)
+    mlp_hidden: 3072        # MLP(GeLU) GIỮA hai attn: 2560 -> 3072 -> 2560
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
+  aligner:                  # KHỐI VÀNG: CHỈ main stage (Stage 0 KHÔNG dựng nó)
+    n_heads: 20             # head_dim 128
+    mlp_hidden: 3072        # MLP(GeLU) 2560 -> 3072 -> 2560, skip từ Self-attn
+    dropout: 0.0
+  cls_head:                 # CHỈ Stage 0: đọc Q_raw -> RMSNorm(2560) -> Attn-Pooling -> 14·3
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
     dropout: 0.1
-  # Main stage — cả nhánh đã được Stage 0 dạy, nên chỉ MỘT nhóm tham số:
-  # đóng băng hoàn toàn 0.2 epoch đầu rồi học ở lr cố định. LoRA theo `train` ($1).
+  # ── Main stage ─────────────────────────────────────────────────────────
+  # ĐÚNG MỘT nhóm tham số học được trong nhánh: Aligner, lr CỐ ĐỊNH, PHẲNG từ
+  # bước 0 tới bước cuối. Khối cam đã được Stage 0 dạy xong và bị đóng băng
+  # HOÀN TOÀN (requires_grad=False + eval + chạy trong no_grad + KHÔNG nằm
+  # trong optimizer) — không còn `freeze_vext_epochs`, không còn bước mở băng.
+  # LoRA của decoder vẫn chạy ĐÚNG lịch one-cycle của $1 (khối `train`).
   main:
-    vext_lr: 1.0e-5         # sau khi mở băng, CỐ ĐỊNH (finetune phần đã pretrain)
-    vext_wd: 0.01
-    freeze_vext_epochs: 0.2 # đóng băng HOÀN TOÀN 0.2 epoch đầu (40/200 bước)
-    separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
+    align_lr: 1.0e-5        # lr CỐ ĐỊNH của Aligner (lr_fix)
+    align_wd: 0.01
+    separate_clip: true     # clip_grad_norm_ riêng LoRA / Aligner
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
+# Aligner KHÔNG có mặt ở đây: Cls Head đọc THẲNG Q_raw của khối cam.
 # KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-Small + hai khối
 # attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
@@ -350,10 +371,14 @@ stage0:
   lr: 1.0e-5                # lr của CẢ HAI nhóm, PHẲNG sau warm-up
   backbone_lr: null         # null = lấy theo `lr`. Khai số chỉ khi muốn tách ViT ra
   # ── epoch 1: "warmup" ──────────────────────────────────────────────────
-  # CẢ HAI nhóm ramp TUYẾN TÍNH THEO BƯỚC từ 0 lên `lr` trong `warmup_epochs`
+  # CẢ HAI nhóm ramp TUYẾN TÍNH THEO BƯỚC từ `warmup_start_lr` (1e-8) lên `lr`
+# trong `warmup_epochs`
   # epoch (1.0 epoch = 200/200 bước). KHÔNG còn epoch "norm" của bản ResNet50:
   # ViT không có BatchNorm nên không có thống kê chạy nào cần kéo về ảnh CXR.
   warmup_epochs: 1.0
+  # ĐẦU dốc warm-up. Không phải 0: một bước Adam ở lr = 0 chỉ nạp moment chứ
+  # không cập nhật gì. 1e-8 nhỏ hơn 1e-5 ba bậc nên bước đầu vẫn vô hại.
+  warmup_start_lr: 1.0e-8
   weight_decay: 0.03
   # ── epoch 2..51: "base", lr phẳng ──────────────────────────────────────
   # `max_epochs` là TRẦN, không phải số epoch sẽ chạy:
@@ -395,8 +420,8 @@ stage0:
                             # chỉ phụ thuộc seed. Bắt buộc khi có early-stop:
                             # bốc lại mỗi epoch thì `patience` đang đếm cả nhiễu
                             # của việc đổi tập, không riêng việc model hết tiến.
-  asl:                      # ASL one-hot 3 lớp
-    gamma_neg: {neg: 4.0, uncertain: 1.0, pos: 0.0}
+  asl:                      # ASL one-hot 3 lớp — γ = [3.0, 0.0, 0.0] (neg, unc, pos)
+    gamma_neg: {neg: 3.0, uncertain: 0.0, pos: 0.0}
     gamma_pos: 0.0
     clip: 0.05
     eps: 1.0e-8

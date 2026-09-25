@@ -1,34 +1,38 @@
-"""§2.2 V-Extractor — kiến trúc [Z ‖ Q ‖ T]: 128 vector từ MỘT encoder thị giác RIÊNG.
+"""§2.2 V-Extractor — kiến trúc [Z ‖ Q ‖ T]: 32 vector từ MỘT encoder thị giác RIÊNG.
 
-Sơ đồ (đúng hình "V-Extractor" + "Cls Head"):
+Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Aligner"):
 
     Image ─┬─► Vision Encoder (SigLIP, đóng băng) ─► Adapter ─► Z (256, 2560)
            │
-           └─► Resize 448×448 ─► ViT-Small/16 (ImageNet-1k)
-                                          │  (784, 384)
-                                          ▼
-                                 Linear 384→2048                128 Learner (Q)
-                                          │                            │
-                                   RMSNorm(2048)                 RMSNorm(2048)
-                                          │                            │
-                                          │                        Self-attn ──┐
-                                          │                            │       │
-                                          │                      RMSNorm(2048) │
-                                          └──────► CrossAttn ◄──────────┘      │ (skip)
-                                                       │                       │
-                                                      (+) ◄────────────────────┘
-                                                       │
-                                            MLP(GeLU) 2048→2560
-                                                       │
-                                                       ▼
-                                                  Q (128, 2560)
-                                                       │
-                                     ┌─────────────────┴───────┐
-                                     │                         ▼
-                                     │              Cls Head (CHỈ Stage 0)
-                                     │              RMSNorm(2560) -> Attn-Pooling
-                                     │              -> Linear 2560→14·3 -> ASL
-                                     ▼
+           └─► Resize 448×448 ─► ViT-Small/16 (ImageNet-1k) ─► (784, 384)
+                                          │
+                                 Linear 384→2560              32 Learner (Q)
+                                          │                          │
+                                   RMSNorm(2560)              RMSNorm(2560)
+                                          │                          │
+                                          │                      Self-attn ──┐
+                                          │                          │       │
+                                          │                MLP(GeLU) 2560→   │
+                                          │                     3072→2560    │
+                                          │                          │       │
+                                          │                         (+) ◄────┘
+                                          │                          │
+                                          │                   RMSNorm(2560)
+                                          └────► CrossAttn ◄──────────┘
+                                                      │
+                                                     (+) ◄──── 32 Learner (Q)
+                                                      │
+                                                 Q_raw (32, 2560)         ← hết khối CAM
+                                          ┌───────────┴───────────┐
+                                          ▼                       ▼
+                        Aligner (CHỈ main stage)        Cls Head (CHỈ Stage 0)
+                        RMSNorm(2560) ─► Self-attn ─┐   RMSNorm(2560)
+                                   │                │   ─► Attn-Pooling
+                        MLP(GeLU) 2560→3072→2560    │   ─► Linear 2560→14·3
+                                   └───► (+) ◄──────┘   ─► ASL
+                                          │
+                                     Q (32, 2560)
+                                          │
            [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
 Nhánh có encoder thị giác của RIÊNG nó — ViT-Small/16 ImageNet-1k ăn thẳng ảnh
@@ -37,14 +41,17 @@ resize 448², KHÔNG đọc X của SigLIP. Hệ quả:
   * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet-1k chứ không phải
     web-image–text, có mang vào thứ SigLIP không có không";
   * lưới patch của ViT (448/16 = 28 -> 28² = 784 ô) KHÔNG phải là khối Q: 784
-    quá dài để nối vào chuỗi decoder. `n_query` learner vector (mặc định 128)
-    đi HỎI 784 ô ấy qua Cross-Attn và nén lại — `n_query` vì thế là một khoá
-    khai tường minh, độc lập với `image_size`;
-  * Self-attn chạy TRƯỚC Cross-Attn và trên RIÊNG các learner vector: 128 câu
-    hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh. Residual cộng đầu
-    ra Self-attn vào đầu ra Cross-Attn (đúng một dấu `+` trong hình);
-  * MLP(GeLU) là chỗ DUY NHẤT đổi chiều 2048 -> 2560 (d_model của decoder):
-    thân nhánh làm việc ở 2048 cho nhẹ, chỉ đầu ra mới nở ra chiều embedding;
+    quá dài để nối vào chuỗi decoder. `n_query` learner vector (32) đi HỎI 784
+    ô ấy qua Cross-Attn và nén lại — `n_query` vì thế là một khoá khai tường
+    minh, độc lập với `image_size`;
+  * Self-attn chạy TRƯỚC Cross-Attn và trên RIÊNG các learner vector: 32 câu
+    hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh. HAI residual, đúng
+    hai dấu `+` trong hình: một quanh MLP (cộng đầu ra Self-attn), một quanh cả
+    khối (cộng THẲNG learner) — learner vì thế có đường gradient ngắn nhất;
+  * thân nhánh chạy THẲNG ở `d_model` = 2560. Bố cục cũ làm việc ở `d_branch`
+    2048 rồi mới nở ra 2560 ở MLP cuối; ở đây Linear vào nở 384 → 2560 ngay và
+    MLP(GeLU) 2560 → 3072 → 2560 KHÔNG còn đổi chiều, nên không có chỗ nào
+    trong nhánh bị bóp lại dưới chiều embedding của decoder;
   * đường ảnh THỨ HAI: batch phải mang thêm `vext_pixels` (3, 448, 448) chuẩn
     hoá theo ĐÚNG thống kê đi kèm trọng số ImageNet-1k của chính checkpoint ViT
     (`timm.pretrained_cfg.mean/std`, ghi vào `spec.vextractor.normalize`), độc
@@ -52,6 +59,14 @@ resize 448², KHÔNG đọc X của SigLIP. Hệ quả:
     chỗ DUY NHẤT dựng nó, và nó BẮT phải truyền mean/std — không có giá trị mặc
     định nào để lỡ tay pretrain trên một phép chuẩn hoá rồi fine-tune trên một
     phép khác mà không có exception nào báo.
+
+**Aligner — vì sao có, và vì sao nó KHÔNG ở Stage 0.** Stage 0 dạy khối CAM trả
+lời một câu hỏi PHÂN LOẠI (14 bệnh lý × 3 lớp, ASL), còn main stage cần một
+khối token mà DECODER đọc được. Hai yêu cầu ấy không giống nhau, và ở main stage
+khối CAM bị ĐÓNG BĂNG HOÀN TOÀN — nên phải có đúng một khối học được đứng giữa
+để xoay Q_raw về không gian embedding của Gemma: đó là Aligner. Nó KHÔNG có mặt
+ở Stage 0 (Cls Head đọc THẲNG Q_raw), nên nó vào main stage với trọng số ngẫu
+nhiên và là THAM SỐ DUY NHẤT của nhánh được cập nhật, ở lr CỐ ĐỊNH 1e-5.
 
 **Vì sao không còn BatchNorm→InstanceNorm.** ViT không có BatchNorm: chuẩn hoá
 của nó là LayerNorm, vốn tính theo TỪNG token của TỪNG ảnh và không mang theo
@@ -62,9 +77,9 @@ Thứ tự chuỗi giữ nguyên: Z **không bị đụng vào**, Q được N�
 ảnh (Z → Q → T), nhãn −100, attention_mask 1, token_type_ids 0 — số token vào CE
 không đổi nên CE của A và B vẫn so được.
 
-Stage 0 pretrain CHÍNH nhánh này (V-Extractor + Cls Head, ASL trên 14 bệnh lý ×
-3 lớp) rồi main stage nạp nguyên khối. Tham số nhánh để fp32, forward dưới
-autocast bf16 — ở lr 1e-5 một bước Adam nhỏ hơn eps tương đối của bf16.
+Stage 0 pretrain khối CAM (V-Extractor + Cls Head, ASL trên 14 bệnh lý × 3 lớp)
+rồi main stage nạp nguyên khối và đóng băng nó. Tham số nhánh để fp32, forward
+dưới autocast bf16 — ở lr 1e-5 một bước Adam nhỏ hơn eps tương đối của bf16.
 """
 from __future__ import annotations
 
@@ -93,12 +108,13 @@ BRANCH_META = "vextractor_branch.json"
 # phải mean/std của ImageNet, nên hard-code một cặp số ở đây là sai lặng lẽ.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-# /2 = ViT-Small/16 -> Linear 384→2048 -> (learner Q ► Self-attn ► CrossAttn
-# ► +res) -> MLP(GeLU) 2048→2560. Checkpoint /1 (ResNet50 + BN→InstanceNorm) là
-# một MẠNG KHÁC HẲN và phải bị từ chối ồn ào thay vì lệch khoá im lặng. Đổi
-# riêng image_size/n_query/n_heads thì KHÔNG cần đổi format: `spec` trong meta
-# được so từng khoá khi nạp (`load_stage0_into`).
-FORMAT = "rgexp.vextractor/2"
+# /3 = bố cục "32 Learner · thân ở 2560 · MLP giữa (3072) · hai residual" CỘNG
+# khối Aligner ở main stage. Checkpoint /2 (thân 2048, MLP cuối 2048→2560, một
+# residual, không Aligner) và /1 (ResNet50 + BN→InstanceNorm) là những MẠNG KHÁC
+# HẲN và phải bị từ chối ồn ào thay vì lệch khoá im lặng. Đổi riêng
+# image_size/n_query/n_heads thì KHÔNG cần đổi format: `spec` trong meta được so
+# từng khoá khi nạp (`load_stage0_into`).
+FORMAT = "rgexp.vextractor/3"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -237,49 +253,49 @@ def vit_body(arch: str, pretrained: bool, image_size: int):
 
 
 class VExtractor(nn.Module):
-    """Ảnh (B, 3, S, S) -> Q (B, n_query, d_model).
+    """Ảnh (B, 3, S, S) -> Q_raw (B, n_query, d_model). KHỐI MÀU CAM.
 
-        p  = ViT.forward_features(px)[:, n_prefix:]      (B, n_patch, d_feat)
-        kv = RMSNorm(Linear(p))                          d_feat → d_branch
-        s  = Self-attn(RMSNorm(learner))                 (B, n_query, d_branch)
-        y  = s + Cross-attn(RMSNorm(s), kv)              (residual cộng thẳng)
-        Q  = MLP_GeLU(y)                                 d_branch → d_model
+        p   = ViT.forward_features(px)[:, n_prefix:]     (B, n_patch, d_feat)
+        kv  = RMSNorm(Linear(p))                         d_feat → d_model
+        s   = Self-attn(RMSNorm(learner))                (B, n_query, d_model)
+        h   = s + MLP_GeLU(s)                            (+) quanh MLP
+        Q_raw = learner + Cross-attn(RMSNorm(h), kv)     (+) quanh cả khối
 
-    `n_query` là khoá KHAI TƯỜNG MINH (mặc định 128) — khác bản ResNet50 cũ nơi
-    nó bị ép bằng (image_size/32)². Lưới patch của ViT (784 ô ở 448²) chỉ là
-    NGUỒN để hỏi, không phải khối nối vào chuỗi decoder.
+    Thân nhánh chạy THẲNG ở `d_model` (2560) — không còn `d_branch` 2048 của bố
+    cục /2. MLP(GeLU) nằm GIỮA Self-attn và Cross-attn (2560 → `mlp_hidden`
+    3072 → 2560) và không đổi chiều, nên Cross-attn đọc ảnh ở đúng chiều
+    embedding của decoder.
 
-    Thân nhánh chạy ở `d_branch` = 2048; chỉ MLP cuối nở ra `d_model` = 2560 của
-    decoder.
+    `n_query` là khoá KHAI TƯỜNG MINH (32). Lưới patch của ViT (784 ô ở 448²)
+    chỉ là NGUỒN để hỏi, không phải khối nối vào chuỗi decoder.
     """
 
     def __init__(self, image_size: int = 448, d_model: int = 2560,
                  arch: str = "vit_small_patch16_224.augreg_in1k",
-                 pretrained: bool = True, n_query: int = 128,
-                 d_branch: int = 2048, n_heads: int = 16,
-                 mlp_hidden: int = 4096, dropout: float = 0.0,
-                 normalize: dict | None = None):
+                 pretrained: bool = True, n_query: int = 32,
+                 n_heads: int = 20, mlp_hidden: int = 3072,
+                 dropout: float = 0.0, normalize: dict | None = None):
         super().__init__()
         self.image_size = int(image_size)
         self.n_query = int(n_query)
-        self.d_branch = int(d_branch)
+        self.d_model = int(d_model)
         if self.n_query < 1:
             raise ValueError(f"n_query {n_query} phải >= 1")
         self.body, self.d_feat, self.n_patch = vit_body(arch, pretrained, self.image_size)
         self.n_prefix = int(getattr(self.body, "num_prefix_tokens", 1))
         self.mean, self.std = _check_normalize(self.body, arch, normalize)
-        self.inp = nn.Linear(self.d_feat, self.d_branch)          # 384 → 2048
-        self.inp_norm = RMSNorm(self.d_branch)
+        self.inp = nn.Linear(self.d_feat, self.d_model)           # 384 → 2560
+        self.inp_norm = RMSNorm(self.d_model)
         # Learner vector: khởi tạo normal(0, 0.02) như mọi tham số mới của Gemma 3.
         # `_init` chỉ chạm `nn.Linear` nên nó giữ nguyên khởi tạo ở đây.
-        self.learner = nn.Parameter(torch.randn(1, self.n_query, self.d_branch) * 0.02)
-        self.q_norm = RMSNorm(self.d_branch)
-        self.sattn = MultiHeadAttention(self.d_branch, n_heads, dropout)
-        self.x_norm = RMSNorm(self.d_branch)
-        self.xattn = MultiHeadAttention(self.d_branch, n_heads, dropout)
-        self.mlp = nn.Sequential(nn.Linear(self.d_branch, int(mlp_hidden)),
+        self.learner = nn.Parameter(torch.randn(1, self.n_query, self.d_model) * 0.02)
+        self.q_norm = RMSNorm(self.d_model)
+        self.sattn = MultiHeadAttention(self.d_model, n_heads, dropout)
+        self.mlp = nn.Sequential(nn.Linear(self.d_model, int(mlp_hidden)),
                                  nn.GELU(),
-                                 nn.Linear(int(mlp_hidden), int(d_model)))
+                                 nn.Linear(int(mlp_hidden), self.d_model))
+        self.x_norm = RMSNorm(self.d_model)
+        self.xattn = MultiHeadAttention(self.d_model, n_heads, dropout)
 
     # ── hai nhóm tham số của Stage 0 ──────────────────────────────────────
     def backbone_parameters(self):
@@ -289,8 +305,8 @@ class VExtractor(nn.Module):
     def head_parameters(self):
         """Phần NGOÀI ViT: Linear vào + RMSNorm + learner + Self/Cross-attn + MLP."""
         yield self.learner
-        for m in (self.inp, self.inp_norm, self.q_norm, self.sattn,
-                  self.x_norm, self.xattn, self.mlp):
+        for m in (self.inp, self.inp_norm, self.q_norm, self.sattn, self.mlp,
+                  self.x_norm, self.xattn):
             yield from m.parameters()
 
     def freeze_body(self, frozen: bool) -> int:
@@ -314,11 +330,38 @@ class VExtractor(nn.Module):
         return f
 
     def forward(self, px: torch.Tensor) -> torch.Tensor:
-        kv = self.inp_norm(self.inp(self.patches(px)))            # (B, n_patch, 2048)
-        q = self.learner.expand(px.shape[0], -1, -1).to(kv.dtype)
-        s = self.sattn(self.q_norm(q))                            # (B, n_query, 2048)
-        y = s + self.xattn(self.x_norm(s), kv)                    # skip từ Self-attn
-        return self.mlp(y)                                        # (B, n_query, 2560)
+        kv = self.inp_norm(self.inp(self.patches(px)))            # (B, n_patch, 2560)
+        q0 = self.learner.expand(px.shape[0], -1, -1).to(kv.dtype)
+        s = self.sattn(self.q_norm(q0))                           # (B, n_query, 2560)
+        h = s + self.mlp(s)                                       # skip quanh MLP
+        return q0 + self.xattn(self.x_norm(h), kv)                # skip từ learner
+
+
+class Aligner(nn.Module):
+    """Q_raw -> Q. KHỐI MÀU VÀNG — tham số DUY NHẤT của nhánh học ở main stage.
+
+        s = Self-attn(RMSNorm(inp))
+        Q = s + MLP_GeLU(s)                  d_model → mlp_hidden → d_model
+
+    Không có mặt ở Stage 0: Cls Head đọc THẲNG đầu ra của V-Extractor, nên khối
+    CAM được ASL dạy mà không đi qua đây. Ở main stage khối CAM bị đóng băng
+    hoàn toàn, và Aligner (khởi tạo ngẫu nhiên) là chỗ DUY NHẤT gradient của CE
+    chạm vào nhánh.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 20, mlp_hidden: int = 3072,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.norm = RMSNorm(self.d_model)
+        self.sattn = MultiHeadAttention(self.d_model, n_heads, dropout)
+        self.mlp = nn.Sequential(nn.Linear(self.d_model, int(mlp_hidden)),
+                                 nn.GELU(),
+                                 nn.Linear(int(mlp_hidden), self.d_model))
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        s = self.sattn(self.norm(q))
+        return s + self.mlp(s)
 
 
 def _check_normalize(net, arch: str, normalize: dict | None) -> tuple[tuple, tuple]:
@@ -404,9 +447,15 @@ def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
     `normalize` KHÔNG khai được trong config: nó được HỎI từ `pretrained_cfg`
     của `arch` (`arch_normalize`) rồi đóng vào spec, nên chỉ có MỘT nguồn sự
     thật cho phép chuẩn hoá và đổi `arch` là nó đi theo.
+
+    `aligner` nằm trong CÙNG spec dù Stage 0 không dựng nó: spec là bản mô tả
+    của KIẾN TRÚC nhánh, và `load_stage0_into` chỉ so các khoá mà Stage 0 thật
+    sự huấn luyện (`d_model`, `vextractor`) — đổi `aligner` vì thế KHÔNG buộc
+    chạy lại Stage 0, nhưng vẫn đổi `spec_fingerprint` nên `branch_stale` bắt
+    được weight main stage cũ.
     """
     z = dict(cfg.get("vextractor") or {})
-    rv, ch = (dict(z.get(k) or {}) for k in ("vextractor", "cls_head"))
+    rv, al, ch = (dict(z.get(k) or {}) for k in ("vextractor", "aligner", "cls_head"))
     arch = str(rv.get("arch", "vit_small_patch16_224.augreg_in1k"))
     mean, std = arch_normalize(arch)
     return {
@@ -416,12 +465,14 @@ def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
         "vextractor": {"image_size": int(rv.get("image_size", 448)),
                        "arch": arch,
                        "pretrained": bool(rv.get("pretrained", True)),
-                       "n_query": int(rv.get("n_query", 128)),
-                       "d_branch": int(rv.get("d_branch", 2048)),
-                       "n_heads": int(rv.get("n_heads", 16)),
-                       "mlp_hidden": int(rv.get("mlp_hidden", 4096)),
+                       "n_query": int(rv.get("n_query", 32)),
+                       "n_heads": int(rv.get("n_heads", 20)),
+                       "mlp_hidden": int(rv.get("mlp_hidden", 3072)),
                        "dropout": float(rv.get("dropout", 0.0)),
                        "normalize": {"mean": list(mean), "std": list(std)}},
+        "aligner": {"n_heads": int(al.get("n_heads", 20)),
+                    "mlp_hidden": int(al.get("mlp_hidden", 3072)),
+                    "dropout": float(al.get("dropout", 0.0))},
         "cls_head": {"n_heads": int(ch.get("n_heads", 20)),
                      "dropout": float(ch.get("dropout", 0.0))},
     }
@@ -438,8 +489,13 @@ def spec_fingerprint(spec: dict) -> str:
 def build_vextractor(spec: dict) -> VExtractor:
     r = spec["vextractor"]
     return VExtractor(r["image_size"], spec["d_model"], r["arch"], r["pretrained"],
-                      r["n_query"], r["d_branch"], r["n_heads"], r["mlp_hidden"],
-                      r["dropout"], r.get("normalize"))
+                      r["n_query"], r["n_heads"], r["mlp_hidden"], r["dropout"],
+                      r.get("normalize"))
+
+
+def build_aligner(spec: dict) -> Aligner:
+    a = spec["aligner"]
+    return Aligner(spec["d_model"], a["n_heads"], a["mlp_hidden"], a["dropout"])
 
 
 def build_cls_head(spec: dict) -> ClsHead:
@@ -482,12 +538,26 @@ class SupervisedBlock(nn.Module):
 
 
 class VExtractorBranch(nn.Module):
-    """Main stage: CHỈ V-Extractor (nạp từ Stage 0). Cls Head BỊ BỎ."""
+    """Main stage: V-Extractor (nạp từ Stage 0, ĐÓNG BĂNG) + Aligner (học).
+
+    Cls Head BỊ BỎ sau Stage 0. Hai khối bên trong có số phận khác hẳn nhau và
+    đó là toàn bộ ý của bố cục này:
+
+      * `vextractor` (CAM) — đã được Stage 0 dạy xong. `set_frozen(True)` đặt
+        requires_grad=False + eval() + chạy trong `no_grad`, nên nó không có
+        gradient, không tốn activation, và không có bước Adam nào;
+      * `aligner` (VÀNG) — khởi tạo ngẫu nhiên ở main stage, LUÔN học, ở lr cố
+        định. `aligner_parameters()` là thứ duy nhất đi vào optimizer của nhánh.
+
+    `set_frozen(False)` (Lens dùng) mở băng khối CAM để lấy gradient tới tận
+    pixel; Aligner không bị nó đụng tới.
+    """
 
     def __init__(self, spec: dict):
         super().__init__()
         self.spec = dict(spec)
         self.vextractor = build_vextractor(spec)
+        self.aligner = build_aligner(spec)
         _init(self)
         self.frozen = False
 
@@ -504,8 +574,17 @@ class VExtractorBranch(nn.Module):
         """(mean, std) của backbone — đối số cho `vext_tensor`."""
         return (tuple(self.vextractor.mean), tuple(self.vextractor.std))
 
+    def aligner_parameters(self):
+        """Tham số DUY NHẤT của nhánh được cập nhật ở main stage."""
+        yield from self.aligner.parameters()
+
     def set_frozen(self, frozen: bool) -> None:
-        """Đóng băng HOÀN TOÀN: requires_grad=False + eval() + chạy no_grad."""
+        """Đóng băng HOÀN TOÀN khối CAM: requires_grad=False + eval() + no_grad.
+
+        KHÔNG chạm Aligner: nó là khối học được của main stage, và một hàm tên
+        `set_frozen` tiện tay đóng băng luôn nó thì main stage không còn tham số
+        nào để học mà vẫn chạy hết 200 bước không báo gì.
+        """
         self.frozen = bool(frozen)
         for p in self.vextractor.parameters():
             p.requires_grad_(not frozen)
@@ -517,10 +596,16 @@ class VExtractorBranch(nn.Module):
         return self
 
     def forward(self, px: torch.Tensor) -> torch.Tensor:
-        """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model)."""
+        """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model).
+
+        Khối CAM chạy trong `no_grad` khi bị đóng băng; Aligner LUÔN chạy ngoài
+        context ấy, nên gradient của CE vẫn tới được nó dù Q_raw không có
+        gradient.
+        """
         ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
         with ctx:
-            return self.vextractor(px)
+            q = self.vextractor(px)
+        return self.aligner(q)
 
     def n_params(self) -> dict:
         c = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
@@ -528,18 +613,21 @@ class VExtractorBranch(nn.Module):
         return {"vextractor": c(v),
                 "backbone": sum(p.numel() for p in v.backbone_parameters()),
                 "head": sum(p.numel() for p in v.head_parameters()),
+                "aligner": c(self.aligner),
                 "trainable": sum(p.numel() for p in self.parameters() if p.requires_grad),
                 "total": c(self)}
 
     def describe(self) -> str:
         s = self.spec
-        r = s["vextractor"]
+        r, a = s["vextractor"], s["aligner"]
         v = self.vextractor
+        d = int(s["d_model"])
         return (f"V-Extractor: ảnh {r['image_size']}² -> {r['arch']} (ImageNet-1k) "
-                f"-> {v.n_patch} patch × {v.d_feat} -> Linear {v.d_feat}→"
-                f"{v.d_branch} -> RMSNorm ‖ {v.n_query} learner Q -> Self-attn "
-                f"-> CrossAttn ({r['n_heads']} head) (+res) -> MLP(GeLU) "
-                f"{v.d_branch}→{s['d_model']}")
+                f"-> {v.n_patch} patch × {v.d_feat} -> Linear {v.d_feat}→{d} "
+                f"-> RMSNorm ‖ {v.n_query} learner Q -> Self-attn -> MLP(GeLU) "
+                f"{d}→{r['mlp_hidden']}→{d} (+res) -> CrossAttn ({r['n_heads']} "
+                f"head) (+res learner) │ Aligner: RMSNorm -> Self-attn "
+                f"({a['n_heads']} head) -> MLP(GeLU) {d}→{a['mlp_hidden']}→{d} (+res)")
 
 
 # ══ ASL: γ theo TÊN lớp ═════════════════════════════════════════════════════

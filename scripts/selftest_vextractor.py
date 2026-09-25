@@ -73,8 +73,9 @@ def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q):
 
     cfg = {"vextractor": {"vextractor": {"image_size": image_size,
                                          "arch": SMALL_ARCH, "pretrained": False,
-                                         "n_query": n_query, "d_branch": 32,
+                                         "n_query": n_query,
                                          "mlp_hidden": 64, "n_heads": 4},
+                          "aligner": {"n_heads": 4, "mlp_hidden": 64},
                           "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, d_model, n_labels)
 
@@ -95,7 +96,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. V-Extractor: ảnh -> lưới patch ViT -> learner Q qua Self/Cross-attn")
+@check("2. V-Extractor (cam) -> Aligner (vàng): thân ở d_model, hai residual")
 def _():
     import torch
 
@@ -118,13 +119,31 @@ def _():
     p = vx.patches(x)
     assert p.shape == (2, vx.n_patch, vx.d_feat), p.shape
     assert vx.n_prefix >= 1
-    # đường đi đúng hình: Linear d_feat→d_branch, Self-attn RỒI Cross-attn,
-    # MLP là chỗ DUY NHẤT nở ra d_model
+    # đường đi đúng hình: Linear d_feat→d_model NGAY, thân chạy THẲNG ở d_model,
+    # MLP(GeLU) nằm GIỮA Self-attn và Cross-attn và KHÔNG đổi chiều
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == 32
-    assert vx.sattn.d == vx.xattn.d == vx.d_branch == 32
+    assert vx.sattn.d == vx.xattn.d == vx.d_model == 32
+    assert not hasattr(vx, "d_branch")           # khoá của bố cục /2: bỏ hẳn
     assert tuple(vx.learner.shape) == (1, SMALL_Q, 32)
     assert vx.mlp[0].in_features == 32 and vx.mlp[0].out_features == 64
-    assert vx.mlp[-1].out_features == 32                     # = d_model của spec
+    assert vx.mlp[-1].out_features == 32                     # về lại d_model
+    # HAI residual: (+) quanh MLP lấy đầu ra Self-attn, (+) quanh khối lấy learner
+    with torch.no_grad():
+        kv = vx.inp_norm(vx.inp(vx.patches(x)))
+        q0 = vx.learner.expand(2, -1, -1)
+        s = vx.sattn(vx.q_norm(q0))
+        h = s + vx.mlp(s)
+        want = q0 + vx.xattn(vx.x_norm(h), kv)
+        assert torch.allclose(vx(x), want, atol=1e-6)
+    # Aligner: CHỈ ở nhánh main, KHÔNG ở Supervised Block của Stage 0
+    al = br.aligner
+    assert al.sattn.d == 32 and al.mlp[0].out_features == 64
+    assert al.mlp[-1].out_features == 32
+    with torch.no_grad():
+        sa = al.sattn(al.norm(want))
+        assert torch.allclose(al(want), sa + al.mlp(sa), atol=1e-6)
+        assert torch.allclose(br(x), al(want), atol=1e-6)
+    assert not hasattr(R.SupervisedBlock(sp), "aligner")
     # ViT KHÔNG có BatchNorm nào để phải thay — khối InstanceNorm của bản cũ
     # phải biến mất hẳn, không còn treo lại dưới dạng API chết
     import torch.nn as nn
@@ -227,9 +246,11 @@ def _():
         assert not hasattr(br, "cls_head")
         br.set_frozen(False)
         br.eval()
-        # Q của main stage == Q mà Cls Head của Stage 0 đã nhìn thấy, TỪNG BIT
+        # Q_raw của main stage == Q_raw mà Cls Head của Stage 0 đã nhìn thấy,
+        # TỪNG BIT. Aligner đứng SAU đó và không có trong checkpoint Stage 0.
         with torch.no_grad():
-            assert torch.equal(blk.vextractor(x), br(x))
+            assert torch.equal(blk.vextractor(x), br.vextractor(x))
+            assert not torch.equal(br.vextractor(x), br(x))
         R.save_branch(br, Path(t) / "b", {})
         br2 = R.load_branch(Path(t) / "b")
         assert torch.equal(br(x), br2(x))
@@ -257,7 +278,8 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     g = R.asl_gammas(cfg["stage0"]["asl"])
-    want = {"neg": 4.0, "uncertain": 1.0, "pos": 0.0}
+    # γ = [3.0, 0.0, 0.0] theo thứ tự (neg, unc, pos) của tài liệu
+    want = {"neg": 3.0, "uncertain": 0.0, "pos": 0.0}
     assert g == [want[c] for c in CLASS_ORDER], (g, CLASS_ORDER)
     asl = R.build_asl(cfg["stage0"]["asl"])
     assert asl.clip == 0.05 and asl.gamma_pos == 0.0
@@ -368,12 +390,21 @@ def _():
     br.set_frozen(True)
     br.train()
     assert not br.vextractor.training          # eval ngay cả khi branch.train()
+    assert br.aligner.training                 # Aligner KHÔNG bị set_frozen đụng
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
-    q = br(x)
-    assert not q.requires_grad                 # forward chạy trong no_grad
+    with torch.no_grad():
+        assert not br.vextractor(x).requires_grad
     assert all(not p.requires_grad for p in br.vextractor.parameters())
-    assert torch.equal(br(x), q)               # eval: dropout tắt -> tái lập được
-    assert br.n_params()["trainable"] == 0
+    assert all(p.requires_grad for p in br.aligner_parameters())
+    # Đây là TRẠNG THÁI CỦA MAIN STAGE: học được đúng bằng Aligner, không hơn
+    npar = br.n_params()
+    assert npar["trainable"] == npar["aligner"] > 0
+    # gradient của CE vẫn tới được Aligner dù Q_raw không có gradient
+    br.eval()
+    br(x).sum().backward()
+    assert all(p.grad is not None for p in br.aligner_parameters())
+    assert all(p.grad is None for p in br.vextractor.parameters())
+    br.zero_grad(set_to_none=True)
     br.set_frozen(False)
     br.train()
     assert br.vextractor.training
@@ -555,7 +586,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best, val 256 CỐ ĐỊNH; main mở băng nhánh sau 0.2 epoch, lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn khối cam, chỉ Aligner học lr 1e-5; --retrain-all")
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
@@ -600,8 +631,16 @@ def _():
     assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in lrs)
     w = int(round(sc["warmup_epochs"] * spe))
     assert w == spe == 200
-    assert abs(s0.base_lr_at(0, sc, spe)["rest"] - sc["lr"] / w) < 1e-18
+    # Ramp TUYẾN TÍNH TỪ `warmup_start_lr` (1e-8), không phải từ 0 và không
+    # phải `lr · f` (vốn cho bước 1 = lr/200, tức đầu dốc do spe quyết định)
+    s_0 = sc["warmup_start_lr"]
+    assert s_0 == 1e-8 and 0 < s_0 < sc["lr"]
+    assert abs(s0.base_lr_at(0, sc, spe)["rest"]
+               - (s_0 + (sc["lr"] - s_0) / w)) < 1e-18
     assert abs(s0.base_lr_at(w - 1, sc, spe)["rest"] - sc["lr"]) < 1e-18
+    # điểm giữa dốc: nội suy trên GIÁ TRỊ lr
+    assert abs(s0.base_lr_at(w // 2 - 1, sc, spe)["rest"]
+               - (s_0 + (sc["lr"] - s_0) * 0.5)) < 1e-18
     # sau warm-up: PHẲNG tới tận bước cuối của trần 51 epoch — không anneal
     flat = [s0.base_lr_at(k, sc, spe)["rest"]
             for k in range(w, sc["base_epochs"] * spe, 101)]
@@ -622,9 +661,22 @@ def _():
     assert s0.CKPT == "final" and s0.BASE == "base"
     assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
     zc = zcfg(cfg)
-    assert zc["freeze_vext_epochs"] == 0.2 and int(round(0.2 * 200)) == 40
-    assert (zc["vext_lr"], zc["vext_wd"]) == (1e-5, 0.01)
+    # main stage: khối cam ĐÓNG BĂNG HOÀN TOÀN (không còn khoá nào để khai),
+    # Aligner học ở lr CỐ ĐỊNH 1e-5
+    assert (zc["align_lr"], zc["align_wd"]) == (1e-5, 0.01)
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
+    assert not (set(zc) & {"vext_lr", "vext_wd", "freeze_vext_epochs"})
+    # khoá của bố cục CŨ trong config phải bị TỪ CHỐI, không bỏ qua im lặng
+    for k in ("vext_lr", "vext_wd", "freeze_vext_epochs"):
+        bad = dict(cfg)
+        bad["vextractor"] = dict(cfg["vextractor"],
+                                 main=dict(cfg["vextractor"]["main"], **{k: 0.1}))
+        try:
+            zcfg(bad)
+        except Exception as e:
+            assert k in str(e), (k, e)
+        else:
+            raise AssertionError(f"khoá cũ {k} phải bị từ chối")
     assert cfg["vextractor_exp"]["retrain_all"] is False
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448 and int(rv["image_size"]) % 16 == 0
@@ -632,18 +684,29 @@ def _():
     assert rv["arch"] == "vit_small_patch16_224.augreg_in1k"
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 128 != (int(rv["image_size"]) // 16) ** 2
-    # Self/Cross-attn ở d_branch 2048: head_dim 128
-    assert int(rv["d_branch"]) == 2048
-    assert int(rv["d_branch"]) % int(rv["n_heads"]) == 0
-    assert int(rv["d_branch"]) // int(rv["n_heads"]) == 128
+    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
+    # thân nhánh chạy THẲNG ở d_model 2560: head_dim 128. `d_branch` bỏ hẳn.
+    assert "d_branch" not in rv
+    assert 2560 % int(rv["n_heads"]) == 0 and 2560 // int(rv["n_heads"]) == 128
+    # MLP(GeLU) nằm GIỮA hai attn và không đổi chiều
+    assert int(rv["mlp_hidden"]) == 3072
+    # Aligner: cùng d_model, cùng mlp_hidden, CHỈ ở main stage
+    al = cfg["vextractor"]["aligner"]
+    assert 2560 // int(al["n_heads"]) == 128 and int(al["mlp_hidden"]) == 3072
     # Cls Head ở d_model 2560: head_dim 128
     ch = cfg["vextractor"]["cls_head"]
     assert 2560 % int(ch["n_heads"]) == 0 and 2560 // int(ch["n_heads"]) == 128
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
     assert "normalize" not in rv and "mean" not in rv
-    # main stage: ft phần đã pretrain từ 0.2 epoch, lr CỐ ĐỊNH 1e-5
-    assert (zc["freeze_vext_epochs"], zc["vext_lr"]) == (0.2, 1e-5)
+    # main stage: khối cam đóng băng hoàn toàn, CHỈ Aligner học, lr CỐ ĐỊNH 1e-5
+    assert zc["align_lr"] == 1e-5
+    # Stage 0: ASL γ = [3.0, 0.0, 0.0] theo thứ tự (neg, unc, pos), clip 0.05
+    from src.vextractor import asl_gammas
+    from src.labels_cls import CLASS_ORDER
+    g = dict(zip(CLASS_ORDER, asl_gammas(cfg["stage0"]["asl"])))
+    assert (g["neg"], g["uncertain"], g["pos"]) == (3.0, 0.0, 0.0), g
+    assert float(cfg["stage0"]["asl"]["clip"]) == 0.05
+    assert (int(cfg["stage0"]["patience"]), int(cfg["stage0"]["max_epochs"])) == (5, 50)
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
     # warm-up chiếm TRỌN epoch đầu -> mọi chỗ đếm "số epoch của base" phải cộng
@@ -706,7 +769,7 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
                                         "pretrained": True, "n_query": SMALL_Q,
-                                        "d_branch": 32, "mlp_hidden": 64,
+                                        "mlp_hidden": 64,
                                         "n_heads": 4},
                          "cls_head": {"n_heads": 4}}
     # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
@@ -834,7 +897,7 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
                                         "pretrained": True, "n_query": SMALL_Q,
-                                        "d_branch": 32, "mlp_hidden": 64,
+                                        "mlp_hidden": 64,
                                         "n_heads": 4},
                          "cls_head": {"n_heads": 4}}
     # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
@@ -1001,8 +1064,12 @@ def _():
     spe = 200
     b = [s0.base_lr_at(k, scfg, spe) for k in (0, 99, 199, 200, 1399)]
     assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in b)   # một lr
-    assert abs(b[0]["rest"] - 1e-5 / spe) < 1e-18              # bước 0 của warm-up
-    assert abs(b[1]["rest"] - 1e-5 * 100 / spe) < 1e-18        # giữa warm-up
+    # ramp TUYẾN TÍNH từ warmup_start_lr (1e-8) lên lr (1e-5), nội suy trên GIÁ TRỊ
+    _s0, _hi = scfg["warmup_start_lr"], 1e-5
+    _at = lambda k: _s0 + (_hi - _s0) * (k + 1) / spe  # noqa: E731
+    assert _s0 == 1e-8
+    assert abs(b[0]["rest"] - _at(0)) < 1e-18                  # bước 0 của warm-up
+    assert abs(b[1]["rest"] - _at(99)) < 1e-18                 # giữa warm-up
     assert abs(b[2]["rest"] - 1e-5) < 1e-18                    # hết epoch 1 = đỉnh
     assert abs(b[3]["rest"] - 1e-5) < 1e-18 and abs(b[4]["rest"] - 1e-5) < 1e-18
     # warm-up chiếm TRỌN epoch đầu; trần = 1 + 50 = 51 epoch base

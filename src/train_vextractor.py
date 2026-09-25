@@ -1,8 +1,8 @@
 """Main stage của candidate B (`qlora_r32_decoder_vextractor`) — §2.2 V-Extractor.
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
-`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 128 vector
-Q = V-Extractor(ảnh 448²) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 32 vector
+Q = Aligner(V-Extractor(ảnh 448²)) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -15,11 +15,16 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                   với B vẫn là cùng một đại lượng;
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
-                 nhánh có AdamW RIÊNG, MỘT nhóm: cả V-Extractor đã được Stage 0
-                 dạy, nên nó bị đóng băng HOÀN TOÀN trong `freeze_vext_epochs`
-                 (0.2) epoch đầu = 40/200 bước, rồi FINETUNE ở lr CỐ ĐỊNH 1e-5,
-                 wd 0.01. Không còn nhóm "Main" riêng vì không còn phần nào của
-                 nhánh là mới tinh;
+                 nhánh có AdamW RIÊNG, MỘT nhóm — và nhóm ấy CHỈ chứa Aligner.
+                 Khối V-Extractor (màu cam) bị ĐÓNG BĂNG HOÀN TOÀN suốt main
+                 stage: requires_grad=False + eval() + chạy trong `no_grad`,
+                 KHÔNG có bước mở băng nào. Nó đã được Stage 0 dạy xong và câu
+                 hỏi của lần chạy này là "một Aligner học được, đứng giữa một
+                 khối thị giác CỐ ĐỊNH và decoder, đủ để đổi chất lượng báo cáo
+                 chưa" — mở băng nó giữa chừng là trộn hai biến vào một lượt.
+                 Aligner (khởi tạo ngẫu nhiên, không có ở Stage 0) học ở lr CỐ
+                 ĐỊNH `vextractor.main.align_lr` = 1e-5, wd 0.01, PHẲNG từ bước
+                 0 tới bước cuối — không warm-up, không anneal;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh. Clip chung
                  thì chuẩn gradient của nhánh kéo nhỏ bước cập nhật LoRA —
                  một khác biệt thứ hai so với A.
@@ -37,10 +42,10 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
-Chuỗi vào decoder DÀI THÊM `n_query` (128) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 128/(độ dài chuỗi) CỘNG một lượt ViT-Small/16 ở 448²
-cho mỗi ảnh — nhánh của §2.2 nặng hơn nhánh của §2.1 vì nó có encoder riêng chứ
-không đi nhờ đặc trưng đã tính sẵn.
+Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ViT-Small/16 ở 448²
+cho mỗi ảnh. Lượt ViT ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
+giữ activation nào — phần nặng còn lại của nhánh là Aligner trên đúng 32 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -69,12 +74,36 @@ from .config import Cfg, seed_everything
 from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 
 
+# Khoá của bố cục CŨ (V-Extractor được finetune sau một quãng đóng băng). Giữ
+# nguyên trong config bây giờ nghĩa là đang mô tả một lịch KHÔNG còn tồn tại —
+# và im lặng bỏ qua chúng là cách chắc chắn nhất để tưởng mình đang chạy lịch cũ.
+OBSOLETE_MAIN = {
+    "vext_lr": "đổi tên thành `align_lr` — lr bây giờ là của Aligner, không "
+               "phải của V-Extractor (khối cam đóng băng hoàn toàn).",
+    "vext_wd": "đổi tên thành `align_wd`.",
+    "freeze_vext_epochs": "bỏ hẳn: V-Extractor bị đóng băng SUỐT main stage, "
+                          "không còn bước mở băng nào để khai.",
+}
+
+
 def zcfg(cfg: Cfg) -> dict:
+    """`vextractor.main` — lịch của nhánh ở main stage.
+
+    Đúng MỘT nhóm tham số: Aligner, lr cố định `align_lr`. V-Extractor không có
+    lr vì nó không có bước cập nhật nào.
+    """
     m = dict(dict(cfg.get("vextractor") or {}).get("main") or {})
-    out = {"vext_lr": float(m.get("vext_lr", 1e-5)),
-           "vext_wd": float(m.get("vext_wd", 0.01)),
-           "freeze_vext_epochs": float(m.get("freeze_vext_epochs", 0.2)),
+    bad = [f"vextractor.main.{k}: {why}" for k, why in OBSOLETE_MAIN.items()
+           if k in m]
+    if bad:
+        raise TrainUnusable("config còn khoá của bố cục nhánh CŨ:\n    "
+                            + "\n    ".join(bad))
+    out = {"align_lr": float(m.get("align_lr", 1e-5)),
+           "align_wd": float(m.get("align_wd", 0.01)),
            "separate_clip": bool(m.get("separate_clip", True))}
+    if out["align_lr"] <= 0:
+        raise TrainUnusable(f"vextractor.main.align_lr {out['align_lr']} phải > 0 "
+                            f"— Aligner là tham số DUY NHẤT của nhánh được học.")
     return out
 
 
@@ -293,15 +322,20 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         branch = RCV.VExtractorBranch(spec)
         pre = RCV.load_stage0_into(branch, stage0_best)
     branch = branch.to(dev)                               # fp32, forward dưới autocast
-    frozen_until = float(zc["freeze_vext_epochs"])
-    branch.set_frozen(frozen_until > 0)
+    # ĐÓNG BĂNG HOÀN TOÀN, một lần, cho cả main stage. Không có `unfreeze_step`.
+    branch.set_frozen(True)
     nb = branch.n_params()
+    if nb["trainable"] != nb["aligner"]:
+        raise TrainUnusable(
+            f"nhánh có {nb['trainable']:,} tham số học được nhưng Aligner chỉ "
+            f"{nb['aligner']:,} — khối cam chưa bị đóng băng hết.")
     print(f"  nhánh: {branch.describe()}", flush=True)
     print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (ViT "
           f"{nb['backbone']:,}, ngoài ViT {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
           f"(epoch {pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
-          f"{pre['dropped']}) · {'ĐÓNG BĂNG' if frozen_until > 0 else 'học ngay'} "
-          f"{frozen_until:g} epoch đầu", flush=True)
+          f"{pre['dropped']}) · ĐÓNG BĂNG HOÀN TOÀN cả main stage │ Aligner "
+          f"{nb['aligner']:,} — MỚI (không có ở Stage 0), học ở lr cố định "
+          f"{zc['align_lr']:g}", flush=True)
 
     # ── dữ liệu: y như A ─────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
@@ -314,9 +348,6 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     steps_per_epoch = total_steps(n, bs, accum, 1)
     if max_steps_override:
         steps = int(max_steps_override)
-    unfreeze_step = int(round(frozen_until * steps_per_epoch))
-    will_unfreeze = frozen_until > 0 and unfreeze_step < steps
-
     # ── optimizer ────────────────────────────────────────────────────────
     lora = [p for p in model.parameters() if p.requires_grad]
     main_lr = float(tcfg["schedule"].get("max_lr", 1e-4))
@@ -324,16 +355,18 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                               "weight_decay": float(tcfg.get("weight_decay", 0.0)),
                               "name": "lora"}], betas=(0.9, 0.999), eps=1e-8)
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
-    rcv_p = list(branch.vextractor.parameters())
+    # CHỈ Aligner. `branch.vextractor` không có mặt ở đây: tham số bị đóng băng
+    # nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước dù grad là None.
+    align_p = list(branch.aligner_parameters())
     opt_b = torch.optim.AdamW(
-        [{"params": rcv_p, "lr": zc["vext_lr"], "weight_decay": zc["vext_wd"],
-          "name": "vextractor"}], betas=(0.9, 0.999), eps=1e-8)
+        [{"params": align_p, "lr": zc["align_lr"], "weight_decay": zc["align_wd"],
+          "name": "aligner"}], betas=(0.9, 0.999), eps=1e-8)
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
-          f"V-Extractor ĐÓNG BĂNG {frozen_until:g} epoch đầu ({unfreeze_step}/{steps} "
-          f"bước) rồi CỐ ĐỊNH {zc['vext_lr']:g} wd {zc['vext_wd']} · "
+          f"V-Extractor ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · Aligner lr CỐ ĐỊNH "
+          f"{zc['align_lr']:g} wd {zc['align_wd']} suốt {steps} bước · "
           f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}", flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
@@ -344,22 +377,15 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
 
     def _probe(k: int) -> None:
-        # Dò ở trạng thái NẶNG nhất sẽ gặp: khi V-Extractor được mở băng giữa
-        # chừng thì activation của ViT-Small ở 448² (784 patch) cũng phải vừa
-        # VRAM — và đó là phần nặng nhất của nhánh, nặng hơn hẳn 128 token thêm
-        # vào chuỗi.
-        was = branch.frozen
-        if will_unfreeze:
-            branch.set_frozen(False)
-        try:
-            model.train()
-            branch.train()
-            b = collate_vext([ds[i] for i in _heavy[:k]], pad_id, max_len)
-            b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
-            ce, _ = forward_ce(model, gemma, branch, b, dev)
-            ce.backward()
-        finally:
-            branch.set_frozen(was)
+        # Dò ở ĐÚNG trạng thái của vòng lặp: khối cam đóng băng (ViT chạy trong
+        # `no_grad`, không giữ activation), Aligner học. Không còn trạng thái
+        # "mở băng giữa chừng" nào nặng hơn để phải dò trước.
+        model.train()
+        branch.train()
+        b = collate_vext([ds[i] for i in _heavy[:k]], pad_id, max_len)
+        b = {kk: (v.to(dev) if hasattr(v, "to") else v) for kk, v in b.items()}
+        ce, _ = forward_ce(model, gemma, branch, b, dev)
+        ce.backward()
 
     ab_cfg = _C(dict(cfg, autobatch=dict(cfg.get("autobatch") or {}, enabled=True)))
     chunk, ab_rep = autobatch.autotune(ab_cfg, f"{aid}/chunk", bs, bs, _probe,
@@ -496,14 +522,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     first_loss = None
     step_ce = 0.0
     rel_last = 0.0
-    unfrozen_at = None
     for step in range(steps):
-        if branch.frozen and frozen_until > 0 and step >= unfreeze_step:
-            branch.set_frozen(False)
-            branch.train()
-            unfrozen_at = step
-            print(f"    [{aid}] bước {step}: mở băng V-Extractor "
-                  f"(lr {zc['vext_lr']:g})", flush=True)
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
         step_ce = 0.0
@@ -515,11 +534,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         if clip > 0:
             if zc["separate_clip"]:
                 gn_lora = float(torch.nn.utils.clip_grad_norm_(lora, clip))
-                bp = [p for p in branch.parameters() if p.requires_grad]
-                gn_br = float(torch.nn.utils.clip_grad_norm_(bp, clip)) if bp else 0.0
+                gn_br = float(torch.nn.utils.clip_grad_norm_(align_p, clip))
             else:
-                torch.nn.utils.clip_grad_norm_(
-                    lora + [p for p in branch.parameters() if p.requires_grad], clip)
+                torch.nn.utils.clip_grad_norm_(lora + align_p, clip)
         opt.step()
         opt_b.step()
         sched.step()
@@ -531,7 +548,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             lr_now = opt.param_groups[0]["lr"]
             print(f"    [{aid}] bước {step + 1}/{steps} · ce {step_ce:.4f} · "
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} nhánh "
-                  f"{gn_br or 0:.3f} · lr {lr_now:.2e}", flush=True)
+                  f"{gn_br or 0:.3f} (Aligner) · lr {lr_now:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
                              f"train/{aid}/lr": lr_now, f"train/{aid}/step": step + 1,
@@ -550,8 +567,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
 
     model.save_pretrained(str(out_dir), safe_serialization=True)
     processor.save_pretrained(str(out_dir))
-    RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps":
-                                      unfrozen_at if unfrozen_at is not None else steps})
+    RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps": steps,
+                                      "trained": "aligner"})
     for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
         shutil.copyfile(stage0_best / f, out_dir / f)
 
@@ -565,7 +582,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         **{k: v for k, v in pstats.items() if k not in ("method", "rank", "alpha")},
         "vextractor": {"spec": spec, "spec_fingerprint": RCV.spec_fingerprint(spec),
                        "n_params": nb, "main": zc, "stage0": pre,
-                       "frozen_steps": unfrozen_at if unfrozen_at is not None else steps},
+                       "trained": "aligner", "frozen_steps": steps},
         "autobatch_chunk": ab_rep, "physical_chunk": chunk,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,

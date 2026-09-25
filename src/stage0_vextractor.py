@@ -21,7 +21,8 @@ Thứ DUY NHẤT làm lr đổi là epoch warm-up ở đầu.
 Lịch (khối `stage0` của configs/vextractor.yaml) — 1 warm-up + tối đa 50 epoch,
 DỪNG SỚM theo `patience`:
 
-  * **epoch 1 — "warmup"**: CẢ HAI nhóm ramp tuyến tính theo BƯỚC từ 0 lên
+  * **epoch 1 — "warmup"**: CẢ HAI nhóm ramp tuyến tính theo BƯỚC từ
+    `warmup_start_lr` (1e-8) lên
     `lr` = 1e-5 trong `warmup_epochs` (1.0) epoch. KHÔNG còn epoch "norm" của
     bản ResNet50: ViT không có BatchNorm nên không có thống kê chạy nào cần kéo
     về phân phối ảnh CXR;
@@ -94,6 +95,12 @@ def s0cfg(cfg: Cfg) -> dict:
            # đơn vị = epoch. 1.0 epoch = 200/200 bước — đúng một epoch warmup.
            # Đây là thứ DUY NHẤT làm lr đổi.
            "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
+           # Đầu dốc warm-up. KHÔNG phải 0: một bước Adam ở lr đúng bằng 0 chỉ
+           # nạp moment chứ không cập nhật gì, còn 1e-8 là mức mà weight decay
+           # và moment cùng bắt đầu chạy ngay từ bước 1 trong khi bước cập nhật
+           # vẫn nhỏ hơn nhiễu khởi tạo ba bậc. Khai tường minh vì nó quyết định
+           # 200 bước đầu của MỌI lần Stage 0.
+           "warmup_start_lr": float(s.get("warmup_start_lr", 1e-8)),
            "weight_decay": float(s.get("weight_decay", 0.03)),
            # TRẦN, không phải số epoch sẽ chạy: `patience` quyết định lúc dừng.
            "max_epochs": int(s.get("max_epochs", 50)),  # epoch CHÍNH, sau warmup
@@ -136,6 +143,10 @@ def s0cfg(cfg: Cfg) -> dict:
             f"hoặc `patience: 0` nếu muốn chạy đủ max_epochs.")
     if out["warmup_epochs"] < 0:
         raise TrainUnusable(f"stage0.warmup_epochs {out['warmup_epochs']} phải >= 0.")
+    if out["warmup_start_lr"] <= 0 or out["warmup_start_lr"] > out["lr"]:
+        raise TrainUnusable(
+            f"stage0.warmup_start_lr {out['warmup_start_lr']} phải > 0 và <= "
+            f"stage0.lr {out['lr']} — đây là ĐẦU dốc warm-up, không phải đỉnh.")
     if out["backbone_lr"] <= 0:
         raise TrainUnusable(f"stage0.backbone_lr {out['backbone_lr']} phải > 0.")
     # Tổng phần base. `max_epochs` là số epoch CHÍNH; warm-up chiếm TRỌN các
@@ -158,13 +169,18 @@ def s0cfg(cfg: Cfg) -> dict:
 def base_lr_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
     """lr của HAI nhóm tại bước `step` (0-based, tính từ đầu phần base).
 
-        backbone (ViT, đã pretrain ImageNet-1k):  backbone_lr · min(1, t/w)
-        rest     (Linear, learner Q, attn, MLP, Cls Head):  lr · min(1, t/w)
+        f = min(1, (step + 1) / w)                       # w = warmup_epochs · 200
+        backbone = s0 + (backbone_lr − s0) · f           # s0 = warmup_start_lr
+        rest     = s0 + (lr − s0) · f
 
-    MỘT hệ số warm-up dùng chung cho cả hai nhóm, rồi PHẲNG mãi mãi: sau epoch
-    warm-up, lr không còn đổi nữa ở bất kỳ đâu trong Stage 0. `backbone_lr` mặc
-    định lấy theo `lr`, nên bình thường hai nhóm là cùng một con số — hai nhóm ở
-    đây là chỗ để tách khi cần, không phải hai lịch khác nhau.
+    Ramp TUYẾN TÍNH từ `warmup_start_lr` (1e-8) chứ không từ 0, rồi PHẲNG mãi
+    mãi: sau epoch warm-up, lr không còn đổi nữa ở bất kỳ đâu trong Stage 0.
+    Nội suy trên GIÁ TRỊ lr chứ không nhân hệ số, nên bước 1 có đúng 1e-8 —
+    nhân `lr · f` thì bước 1 ra 1e-5/200 = 5e-8, tức đầu dốc bị quyết định bởi
+    số bước mỗi epoch thay vì bởi một khoá trong config.
+
+    `backbone_lr` mặc định lấy theo `lr`, nên bình thường hai nhóm là cùng một
+    con số — hai nhóm ở đây là chỗ để tách khi cần, không phải hai lịch khác nhau.
 
     Warm-up tính theo BƯỚC chứ không theo epoch: 1.0 epoch = 200 bước ramp
     tuyến tính, còn theo epoch thì nó chỉ là một nấc duy nhất.
@@ -172,7 +188,9 @@ def base_lr_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
     """
     w = int(round(float(sc["warmup_epochs"]) * int(steps_per_epoch)))
     f = 1.0 if w <= 0 else min(1.0, (int(step) + 1) / w)
-    return {"backbone": float(sc["backbone_lr"]) * f, "rest": float(sc["lr"]) * f}
+    s0 = float(sc.get("warmup_start_lr", 1e-8))
+    lerp = lambda hi: s0 + (float(hi) - s0) * f  # noqa: E731
+    return {"backbone": lerp(sc["backbone_lr"]), "rest": lerp(sc["lr"])}
 
 
 def anneal_lr_at(step: int, n_total: int, fa: dict, backbone_lr: float) -> dict:
@@ -491,7 +509,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     _stop = (f"dừng sớm khi {sc['patience']} epoch liên tiếp val_score không vượt "
              f"kỷ lục quá {sc['min_delta']:g}"
              if sc["patience"] else "KHÔNG dừng sớm (patience 0)")
-    print(f"  Stage 0: MỘT lr {sc['lr']:g}{_lr2} — warm-up tuyến tính 0 -> lr "
+    print(f"  Stage 0: MỘT lr {sc['lr']:g}{_lr2} — warm-up tuyến tính "
+          f"{sc['warmup_start_lr']:g} -> lr "
           f"trong {sc['warmup_epochs']:g} epoch (epoch 1–{sc['n_warmup_epochs']}) "
           f"rồi PHẲNG, không anneal · wd {sc['weight_decay']} · TRẦN "
           f"{sc['n_warmup_epochs']}+{sc['max_epochs']} = {sc['base_epochs']} epoch, "
@@ -928,10 +947,12 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                      "lr_schedule": (
                          f"MỘT lr {sc['lr']:g} cho CẢ HAI nhóm (backbone_lr "
                          f"{sc['backbone_lr']:g}), warm-up tuyến tính theo bước "
-                         f"0 -> lr trong {sc['warmup_epochs']:g} epoch đầu rồi "
+                         f"{sc['warmup_start_lr']:g} -> lr trong "
+                         f"{sc['warmup_epochs']:g} epoch đầu rồi "
                          f"PHẲNG tới lúc dừng — không anneal, không one-cycle"),
                      "n_warmup_epochs": sc["n_warmup_epochs"],
                      "warmup_epochs": sc["warmup_epochs"],
+                     "warmup_start_lr": sc["warmup_start_lr"],
                      "weight_decay": sc["weight_decay"],
                      # `max_epochs`/`base_epochs` là TRẦN; số epoch thật sự chạy
                      # nằm ở `base_epochs_run` của history.
@@ -951,9 +972,12 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                    # ĐÚNG mean/std đi kèm trọng số ImageNet-1k của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
                    "normalize": dict(spec["vextractor"]["normalize"]),
-                   "d_branch": spec["vextractor"]["d_branch"],
+                   # Thân nhánh chạy THẲNG ở d_model (không còn `d_branch`).
                    "mlp_hidden": spec["vextractor"]["mlp_hidden"],
                    "n_query": Z.n_query_of(spec),
+                   # Aligner KHÔNG có ở Stage 0 (Cls Head đọc thẳng Q_raw);
+                   # ghi spec của nó để main stage đối chiếu.
+                   "aligner": dict(spec["aligner"]),
                    "note": "Stage 0 KHÔNG chạy Gemma; d_model đọc từ AutoConfig",
                    "decoder_hf_id": cfg["base"]["hf_id"],
                    "d_model": int(spec["d_model"])},
