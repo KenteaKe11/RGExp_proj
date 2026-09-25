@@ -28,8 +28,8 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
    xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
    LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
-   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 256 learner), rồi phần văn bản.
-   So khối Q với khối Z là câu "decoder có thật sự đọc 256 vector mới không".
+   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 128 learner), rồi phần văn bản.
+   So khối Q với khối Z là câu "decoder có thật sự đọc 128 vector mới không".
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
    nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
@@ -37,12 +37,12 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    token vô nghĩa.
 3. [Visual] BỐN ô đối chứng trên cùng một ảnh. Ở §2.2 hai nhánh KHÔNG còn
    chung đầu vào: đường Z đi qua SigLIP (4096 patch, lưới 64×64), đường Q đi
-   qua ResNet50 ăn thẳng ảnh 512×512. Bốn ô là: (1) ảnh gốc; (2) HOẠT ĐỘ đầu ra
+   qua ViT-Small/16 ăn thẳng ảnh 448×448. Bốn ô là: (1) ảnh gốc; (2) HOẠT ĐỘ đầu ra
    SigLIP `‖X_p − mean(X)‖` — không gradient, không dính decoder; (3)
    `‖∂y/∂X‖` qua `y -> Z -> projector -> X`; (4) `‖∂y/∂I‖` qua
-   `y -> Q -> V-Extractor -> I` với I là chính ảnh 512² (chuẩn trên 3 kênh).
+   `y -> Q -> V-Extractor -> I` với I là chính ảnh 448² (chuẩn trên 3 kênh).
    Ba câu hỏi xếp chồng: *đầu ra SigLIP có gì để học* -> *adapter rút được gì
-   qua đường cũ* -> *encoder RIÊNG của nhánh rút được gì*. Ô 4 mịn hơn hẳn (512²
+   qua đường cũ* -> *encoder RIÊNG của nhánh rút được gì*. Ô 4 mịn hơn hẳn (448²
    so với 64²) vì gradient về tới tận pixel chứ không dừng ở patch; để so số
    với ô 2/ô 3 nó được gộp về lưới 64×64 (`sal_vext_64`), và mọi tương quan /
    IoU ở mục "Kiểm nhanh" tính trên lưới chung ấy.
@@ -179,9 +179,9 @@ def encode(cfg: Cfg, processor, item: dict, image_size: int = 448,
 def pool_to(a, n: int):
     """Gộp TRUNG BÌNH một bản đồ (S, S) về lưới (n, n) — S chia hết n.
 
-    Để so `sal_vext` (512², gradient tới tận pixel) với `sal_z` (64², gradient
+    Để so `sal_vext` (448², gradient tới tận pixel) với `sal_z` (64², gradient
     dừng ở patch SigLIP) thì phải đưa về CÙNG một lưới trước. Gộp trung bình
-    chứ không lấy mẫu thưa: lấy mẫu thưa vứt đi 63/64 số điểm và biến một vùng
+    chứ không lấy mẫu thưa: lấy mẫu thưa vứt đi phần lớn số điểm và biến một vùng
     nhạy mảnh thành ngẫu nhiên có hay không.
     """
     if a is None:
@@ -204,9 +204,9 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     lá của cùng một X" nữa vì hai nhánh vốn đã không chung node nào:
 
       * `sal_z`    = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64;
-      * `sal_vext` = ‖∂y/∂I‖ trên chính ảnh 512×512 của nhánh, chuẩn trên 3
-        kênh -> lưới 512×512. Gradient về tới TẬN PIXEL: ResNet là conv, không
-        có bước "gộp thành patch" nào chặn đường.
+      * `sal_vext` = ‖∂y/∂I‖ trên chính ảnh 448×448 của nhánh, chuẩn trên 3
+        kênh -> lưới 448×448. Gradient về tới TẬN PIXEL: `patch_embed` của ViT
+        là một conv stride 16, nên đường về pixel không bị chặn ở đâu cả.
 
     `sal_vext_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
     tương quan / IoU đều tính trên lưới chung ấy, không phải trên hai lưới khác
@@ -238,7 +238,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
         branch.set_frozen(False)
         for p in branch.parameters():
             p.requires_grad_(False)
-        # LÁ gradient của đường Q là chính ẢNH 512² (không phải X của SigLIP).
+        # LÁ gradient của đường Q là chính ẢNH 448² (không phải X của SigLIP).
         leaf_r = batch["vext_pixels"].detach().clone().float().requires_grad_(True)
         with RCV.autocast(dev):
             q = branch(leaf_r)
@@ -388,7 +388,7 @@ def _norm01(a: np.ndarray, pct: float) -> np.ndarray:
 def plot_layers(res: dict, path: Path, cfg_l: dict) -> Path:
     """‖∂y/∂h‖ — trục Y là TOKEN, trục X là LỚP, trên đủ mọi lớp decoder.
 
-    Token nằm dọc vì chuỗi mới là chiều dài: `[Z(256) ‖ Q(256) ‖ text]` là hàng
+    Token nằm dọc vì chuỗi mới là chiều dài: `[Z(256) ‖ Q(128) ‖ text]` là hàng
     trăm vị trí, còn decoder chỉ có vài chục lớp. Xếp token theo chiều đứng (đọc
     từ trên xuống đúng thứ tự trong chuỗi, `origin="upper"`) thì ba vùng Z / Q /
     text thành ba khối liền nhau và so được bằng mắt; xếp ngang thì 776 cột bị
@@ -465,8 +465,8 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     3. **Z**: ‖∂y/∂X‖ theo đường `y → Z → projector → X` — đường cũ, đo xem
        decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Lưới 64².
     4. **Q**: ‖∂y/∂I‖ theo đường `y → Q → V-Extractor → I` — nhánh mới, với I
-       là chính ảnh 512² của nó. Lưới 512², tức MỊN HƠN ô 3 tám lần mỗi chiều:
-       ResNet là conv nên gradient về tới tận pixel, không dừng ở patch.
+       là chính ảnh 448² của nó. Lưới 448², tức MỊN HƠN ô 3 bảy lần mỗi chiều:
+       gradient về tới tận pixel qua `patch_embed`, không dừng ở patch.
 
     Ba câu hỏi xếp chồng: *có gì để học* (2) → *adapter học được gì qua đường cũ*
     (3) → *encoder riêng của nhánh học được gì* (4). Ô 2 KHÁC BẢN CHẤT hai ô sau
@@ -492,7 +492,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     panels = [("đầu ra SigLIP\n‖X_p − mean(X)‖ · hoạt độ, không gradient",
                res.get("act_siglip")),
               ("Z\ny → Z → projector → X", res.get("sal_z")),
-              ("Q\ny → Q → V-Extractor → ảnh 512²", res.get("sal_vext"))]
+              ("Q\ny → Q → V-Extractor → ảnh 448²", res.get("sal_vext"))]
     panels = [(t, m) for t, m in panels if m is not None]
     fig, axes = plt.subplots(1, 1 + len(panels), dpi=150,
                              figsize=(3.45 * (1 + len(panels)), 4.1))
@@ -633,7 +633,7 @@ def diagnostics(res: dict) -> dict:
     i, j = np.unravel_index(int(np.argmax(S)), S.shape)
     out["peak"] = {"layer": int(i + 1), "pos": int(j), "value": float(S[i, j]),
                    "where": _where(int(j), res)}
-    # So trên LƯỚI CHUNG 64²: `sal_vext` gốc là 512², `sal_z` là 64².
+    # So trên LƯỚI CHUNG 64²: `sal_vext` gốc là 448², `sal_z` là 64².
     m1, m2 = res.get("sal_vext_64"), res.get("sal_z")
     if m1 is not None and m2 is not None:
         x, y = np.asarray(m1).ravel(), np.asarray(m2).ravel()
@@ -859,7 +859,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
     L += [f"Chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị "
           f"{lc['percentile_clip']}). Ô 2 và ô 3 trên **4096 patch của SigLIP** "
-          f"(lưới 64×64); ô 4 trên **chính ảnh 512×512 của nhánh** — hai đường "
+          f"(lưới 64×64); ô 4 trên **chính ảnh 448×448 của nhánh** — hai đường "
           f"không còn chung đầu vào:\n",
           "| ô | đại lượng | hỏi gì |\n|---|---|---|",
           "| 1 | ảnh gốc | mốc để đọc ba ô còn lại |",
@@ -867,7 +867,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "SigLIP còn phân biệt được gì trên ảnh này |",
           "| 3 | `‖∂y/∂X‖` qua `y → Z → projector → X` · lưới 64² | adapter (LoRA "
           "đã finetune) rút được gì qua đường cũ |",
-          "| 4 | `‖∂y/∂I‖` qua `y → Q → V-Extractor → I` (I = ảnh 512²) | "
+          "| 4 | `‖∂y/∂I‖` qua `y → Q → V-Extractor → I` (I = ảnh 448²) | "
           "encoder RIÊNG của nhánh rút được gì |",
           "",
           "Ba câu hỏi **xếp chồng**: có gì để học (2) → đường cũ dùng được bao nhiêu "
@@ -875,8 +875,9 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "thành phần nền chung rất lớn ở mọi patch; giữ nguyên thì bản đồ phẳng lì "
           "vì cái nền ấy chứ không phải vì encoder mù.\n",
           "**Ô 2 khác BẢN CHẤT hai ô sau** (hoạt độ, không phải độ nhạy) và **ô 4 "
-          "khác ĐỘ PHÂN GIẢI hai ô kia** (512² so với 64²: ResNet là conv nên "
-          "gradient về tới tận pixel) — nên mỗi ô **tự chuẩn hoá [0,1]**. Chỉ so "
+          "khác ĐỘ PHÂN GIẢI hai ô kia** (448² so với 64²: `patch_embed` của ViT "
+          "là conv stride 16 nên gradient về tới tận pixel) — nên mỗi ô **tự chuẩn "
+          "hoá [0,1]**. Chỉ so "
           "**hình dạng** giữa các ô; so định lượng thì đọc mấy dòng tương quan / IoU "
           "ở mục Kiểm nhanh, vốn đã gộp ô 4 về lưới chung 64² trước khi so.\n",
           "**Đọc hình 3 thế nào.**\n",
@@ -898,10 +899,10 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "nhiễu — decoder chưa đọc Q, đọc bản đồ của nó là đọc số 0 phóng to.\n",
           "5. Sáng ở ô 3/ô 4 = y **nhạy** với patch đó, KHÔNG phải \"model nhìn vào "
           "đây\" theo nghĩa nhân quả, và cũng không phải phân đoạn tổn thương.\n",
-          "6. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 8 px của ảnh gốc "
-          "512). Đừng đọc chi tiết nhỏ hơn một ô.\n",
+          "6. Lưới 64×64 là **thô**: một ô ≈ 14 px của ảnh 896 (≈ 7 px của ảnh 448 "
+          "mà nhánh đọc). Đừng đọc chi tiết nhỏ hơn một ô.\n",
           "Số thô: `lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, "
-          "`sal_vext` 512², `sal_vext_64`), `lens.json`, `logit_lens.csv`.\n",
+          "`sal_vext` 448², `sal_vext_64`), `lens.json`, `logit_lens.csv`.\n",
           "## Giới hạn\n",
           "- Một ảnh, chọn vì nhiều `pos`/`uncertain` — MINH HOẠ, không phải bằng chứng "
           "thống kê. Kết luận A/B vẫn nằm ở `REPORT.md`.\n",

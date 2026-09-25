@@ -432,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                      "test": "$2.2_V-Extractor_Test",
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
-                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = V-Extractor(ảnh 512²) (B)"})
+                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = V-Extractor(ảnh 448²) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 

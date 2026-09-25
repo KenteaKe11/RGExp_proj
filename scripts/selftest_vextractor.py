@@ -555,7 +555,7 @@ def _():
     assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
 
 
-@check("14. lịch: Stage 0 = 1 norm(1e-4) + 4 main(1e-5) + 1 final = 6 epoch, val 256 CỐ ĐỊNH; main mở băng nhánh sau 0.2 epoch, lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warmup + 6 main + 1 final = 8 epoch, backbone 1e-5 phẳng | rest 3e-5, val 256 CỐ ĐỊNH; main mở băng nhánh sau 0.2 epoch, lr 1e-5; --retrain-all")
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
@@ -563,34 +563,38 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["weight_decay"], sc["max_epochs"], sc["select"]) == (1e-5, 0.03, 4, "last")
-    assert (sc["norm_epochs"], sc["norm_lr"]) == (1, 1e-4)
-    # epoch norm là epoch THÊM VÀO: base = norm + max_epochs; final cộng thêm 1
-    assert sc["base_epochs"] == 5 and sc["warmup_epochs"] == 0.25
-    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 6
+    assert (sc["lr"], sc["backbone_lr"]) == (3e-5, 1e-5)
+    assert (sc["weight_decay"], sc["max_epochs"], sc["select"]) == (0.03, 6, "last")
+    # warm-up chiếm TRỌN epoch đầu và nằm NGOÀI `max_epochs`:
+    # base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7; final cộng thêm 1
+    assert sc["warmup_epochs"] == 1.0 and sc["n_warmup_epochs"] == 1
+    assert sc["base_epochs"] == 7
+    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 8
+    # epoch "norm" của bản ResNet50 đã biến mất khỏi CẢ config lẫn sc
+    assert "norm_lr" not in sc and "norm_epochs" not in sc
+    assert "norm_lr" not in cfg["stage0"] and "norm_epochs" not in cfg["stage0"]
 
-    # ── lr theo BƯỚC: epoch norm 2 nhóm, rồi warm-up rồi phẳng ─────────────
+    # ── lr theo BƯỚC: backbone PHẲNG, `rest` warm-up rồi phẳng ─────────────
     from src.train_recomb import val_indices
 
     spe = 200                                   # bước mỗi epoch
-    n_norm = sc["norm_epochs"] * spe
     lrs = [s0.base_lr_at(k, sc, spe) for k in range(sc["base_epochs"] * spe)]
-    # epoch 1: norm ở norm_lr, phần còn lại ở lr — KHÔNG warm-up, KHÔNG đổi
-    assert all(x == {"norm": 1e-4, "rest": 1e-5} for x in lrs[:n_norm])
-    # từ epoch 2: hai nhóm CÙNG lr, warm-up tuyến tính 0.25 epoch = 50 bước
+    assert set(lrs[0]) == {"backbone", "rest"}              # hai nhóm, đúng tên
+    # backbone (ViT đã pretrain ImageNet-1k): 1e-5 ở MỌI bước của phần base —
+    # không warm-up (không có gì để warm lên), không đổi
+    assert all(abs(x["backbone"] - sc["backbone_lr"]) < 1e-15 for x in lrs)
+    # hai nhóm KHÔNG bao giờ gặp nhau ở vùng phẳng
+    assert lrs[-1]["backbone"] != lrs[-1]["rest"]
+    # `rest`: warm-up tuyến tính theo BƯỚC trong 1.0 epoch = 200 bước
     w = int(round(sc["warmup_epochs"] * spe))
-    assert w == 50
-    post = lrs[n_norm:]
-    assert all(x["norm"] == x["rest"] for x in post)        # về cùng một lr
-    assert abs(post[0]["rest"] - sc["lr"] / w) < 1e-15      # bước đầu tiên
-    assert abs(post[w - 1]["rest"] - sc["lr"]) < 1e-15      # chạm đỉnh cuối warm-up
-    assert all(abs(x["rest"] - sc["lr"]) < 1e-15 for x in post[w:])   # rồi PHẲNG
+    assert w == spe == 200
+    assert abs(lrs[0]["rest"] - sc["lr"] / w) < 1e-15       # bước đầu tiên
+    assert abs(lrs[w - 1]["rest"] - sc["lr"]) < 1e-15       # chạm đỉnh cuối epoch 1
+    assert all(abs(x["rest"] - sc["lr"]) < 1e-15 for x in lrs[w:])   # rồi PHẲNG
     assert all(a["rest"] <= b["rest"] + 1e-18
-               for a, b in zip(post[:w], post[1:w]))        # không tụt
-    # warmup_epochs = 0 -> vào thẳng lr đỉnh ngay bước đầu của phần main
-    assert s0.base_lr_at(n_norm, dict(sc, warmup_epochs=0.0), spe)["rest"] == sc["lr"]
-    # norm_epochs = 0 -> không có giai đoạn norm nào
-    assert s0.base_lr_at(0, dict(sc, norm_epochs=0), spe)["norm"] < 1e-4
+               for a, b in zip(lrs[:w], lrs[1:w]))          # không tụt
+    # warmup_epochs = 0 -> vào thẳng lr đỉnh ngay bước 0 (đường của dry-run)
+    assert s0.base_lr_at(0, dict(sc, warmup_epochs=0.0), spe)["rest"] == sc["lr"]
 
     # ── val CỐ ĐỊNH: mọi lần đo dùng chung một tập ─────────────────────────
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
@@ -621,13 +625,6 @@ def _():
     assert 2560 % int(ch["n_heads"]) == 0 and 2560 // int(ch["n_heads"]) == 128
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
     assert "normalize" not in rv and "mean" not in rv
-    # Stage 0: hai nhóm lr, epoch "norm" của bản ResNet50 đã biến mất
-    assert (sc["lr"], sc["backbone_lr"]) == (3e-5, 1e-5)
-    assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 6
-    assert sc["n_warmup_epochs"] == 1 and sc["base_epochs"] == 7
-    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 8
-    assert "norm_lr" not in sc and "norm_epochs" not in sc
-    assert "norm_lr" not in cfg["stage0"] and "norm_epochs" not in cfg["stage0"]
     # main stage: ft phần đã pretrain từ 0.2 epoch, lr CỐ ĐỊNH 1e-5
     assert (zc["freeze_vext_epochs"], zc["vext_lr"]) == (0.2, 1e-5)
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
@@ -984,7 +981,7 @@ def _():
     from src.config import load_config
 
     NV, DV, DM, NZ, V, L = 64, 8, 32, 4, 11, 3     # patch, d_vis, d_model, |Z|, vocab, lớp
-    NQ = (SMALL_IMG // 32) ** 2                     # số vector Q = lưới ResNet nhỏ
+    NQ = SMALL_Q                                    # số learner Q (khoá khai, không suy ra)
     IMG_TOK = V - 1
 
     class _Proj(nn.Module):                        # (1, NV, DV) -> (1, NZ, DM)
@@ -1067,7 +1064,8 @@ def _():
     assert ra["layer_sens"].shape == (L, T)                 # A: chuỗi gốc
     assert rb["layer_sens"].shape == (L, T + NQ)            # B: dài thêm đúng NQ
     assert ra["sal_vext"] is None and rb["sal_vext"] is not None
-    # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh)
+    # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh,
+    # SMALL_IMG=64 thay cho 448² của cấu hình thật)
     assert ra["sal_z"].shape == (8, 8)
     assert rb["sal_vext"].shape == (SMALL_IMG, SMALL_IMG), rb["sal_vext"].shape
     assert np.isfinite(rb["sal_vext"]).all() and rb["sal_vext"].sum() > 0
@@ -1130,7 +1128,7 @@ def _():
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
                      "hoạt độ", "đầu ra SigLIP", "act_siglip",
-                     "y → Q → V-Extractor → I", "`Q[0]`", "512²"):
+                     "y → Q → V-Extractor → I", "`Q[0]`", "448²"):
             assert need in doc, need
         # bốn ô, không còn OR/AND của §2.0
         assert "OR (cộng" not in doc and "AND (nhân" not in doc

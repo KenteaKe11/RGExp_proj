@@ -1,8 +1,8 @@
 """Main stage của candidate B (`qlora_r32_decoder_vextractor`) — §2.2 V-Extractor.
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
-`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 256 vector
-Q = V-Extractor(ảnh 512²) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 128 vector
+Q = V-Extractor(ảnh 448²) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -201,8 +201,8 @@ def forward_ce(model, gemma, branch, batch: dict, dev):
             dtype=recombiner.float_dtype(gemma, torch.float32)))
     if "vext_pixels" not in batch:
         raise TrainUnusable(
-            "batch thiếu `vext_pixels` — nhánh §2.2 có đường ảnh RIÊNG (512² "
-            "chuẩn hoá ImageNet) và không đọc được X của SigLIP. Dataset phải là "
+            "batch thiếu `vext_pixels` — nhánh §2.2 có đường ảnh RIÊNG (448², "
+            "mean/std của checkpoint ViT) và không đọc được X của SigLIP. Dataset phải là "
             "`VExtReportDataset` + `collate_vext`.")
     with RCV.autocast(dev):
         q = branch(batch["vext_pixels"].to(dev))
