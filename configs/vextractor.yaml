@@ -12,15 +12,15 @@
 #                                    -> main stage y hệt A + nhánh V-Extractor.
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = V-Extractor(ảnh 512²) — 256 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
-# 256 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# với Q = V-Extractor(ảnh 448²) — 128 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# 128 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
 # tạo 0: Q mang sẵn thông tin Stage 0 ngay từ bước 0 — đó chính là việc Stage 0
 # sinh ra để làm. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
 # Holm trên các metric (`src/stats_ab.py`).
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ResNet50 ăn ảnh 512²) — và chuỗi dài thêm 256.
+# đây nhánh có encoder RIÊNG (ViT-Small/16 ăn ảnh 448²) — và chuỗi dài thêm 128.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
 # generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
@@ -301,18 +301,30 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: ResNet50 ImageNet ăn thẳng ảnh gốc resize 512×512, BN
-# thay hết bằng InstanceNorm (giữ affine đã học). Lưới conv cuối 16×16 = 256 ô
-# CHÍNH LÀ 256 vector Q — không có learner vector, không Cross-Attn. Linear
-# 2048→2560 rồi MỘT khối Self-attn pre-norm với residual cộng thẳng.
-#   `n_query` KHÔNG khai được: nó là (image_size/32)² = 256.
+# Nhánh có ENCODER RIÊNG: ViT-Small/16 pretrain ImageNet-1k ăn thẳng ảnh gốc
+# resize 448×448 -> lưới 28×28 = 784 patch × 384. Lưới ấy KHÔNG phải khối Q (784
+# quá dài để nối vào chuỗi decoder): `n_query` learner vector đi HỎI nó qua
+# Cross-Attn. Đường đi, đúng hình:
+#
+#   784 patch ─► Linear 384→2048 ─► RMSNorm(2048) ───┐
+#   128 learner Q ─► RMSNorm ─► Self-attn ─► RMSNorm ┴► CrossAttn ─► (+skip từ
+#   Self-attn) ─► MLP(GeLU) 2048→2560 ─► Q (128, 2560)
+#
+# `n_query` là khoá KHAI TƯỜNG MINH (khác bản ResNet50 cũ, nơi nó bị ép bằng
+# (image_size/32)²). Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
+# `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint —
+# checkpoint ViT ImageNet-1k họ AugReg dùng 0.5/0.5 chứ không phải mean/std của
+# ImageNet, nên một cặp số gõ tay ở đây là sai lặng lẽ.
 vextractor:
   n_labels: null            # null = theo labels.npz (14)
-  vextractor:               # ảnh (3, 512, 512) -> Q (256, 2560)
-    image_size: 512         # PHẢI chia hết 32. Đổi nó là đổi cả số vector Q
-    arch: resnet50          # torchvision; lần chạy đầu tải ~100 MB
-    pretrained: true        # ImageNet. false = trả lời một câu hỏi KHÁC
-    n_heads: 20             # Self-attn ở 2560: head_dim 128 (2560 = 20 × 128)
+  vextractor:               # ảnh (3, 448, 448) -> Q (128, 2560)
+    image_size: 448         # PHẢI chia hết patch size (16). 448/16 = 28 -> 784 patch
+    arch: vit_small_patch16_224.augreg_in1k   # timm; lần chạy đầu tải ~85 MB
+    pretrained: true        # ImageNet-1k. false bị TỪ CHỐI (câu hỏi khác hẳn)
+    n_query: 128            # số learner vector = số token Q nối vào chuỗi decoder
+    d_branch: 2048          # chiều thân nhánh; chỉ MLP cuối nở ra d_model 2560
+    n_heads: 16             # Self/Cross-attn ở 2048: head_dim 128 (2048 = 16 × 128)
+    mlp_hidden: 4096        # MLP(GeLU) 2048 -> 4096 -> 2560
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   cls_head:                 # CHỈ Stage 0: đọc Q -> RMSNorm(2560) -> Attn-Pooling -> 14·3
     n_heads: 20             # head_dim 128 (2560 = 20 × 128)
@@ -326,33 +338,39 @@ vextractor:
     separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
-# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ResNet50 + một khối
-# attention. 1 + 4 + 1 = 6 epoch.
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-Small + hai khối
+# attention. 1 + 6 + 1 = 8 epoch.
+#
+# HAI nhóm tham số, KHÔNG dùng chung lr:
+#   backbone  ViT-Small (đã pretrain ImageNet-1k)   `backbone_lr` 1e-5, PHẲNG suốt
+#   rest      Linear vào · learner Q · Self/Cross-attn · MLP · Cls Head
+#                                                    `lr` 3e-5 lr_max, warm-up + anneal
+# Cho ViT đi cùng 3e-5 là đẩy một backbone đã hội tụ bằng gradient của một Cls
+# Head còn ngẫu nhiên; cho phần mới đi cùng 1e-5 là bắt nó học chậm gấp ba mà
+# không có lý do nào.
 stage0:
-  lr: 1.0e-5                # lr CHÍNH của cả nhánh (epoch 2 trở đi)
-  # ── epoch 1: "norm" ────────────────────────────────────────────────────
-  # conv/fc của ResNet ĐÓNG BĂNG, chỉ affine của InstanceNorm học ở `norm_lr`;
-  # phần NGOÀI ResNet (Linear, Self-attn, Cls Head) vẫn học ở `lr`. Việc của
-  # epoch này là kéo thống kê chuẩn hoá từ ImageNet về ảnh CXR — phép dịch/scale
-  # trên mỗi kênh, đi nhanh được vì nó không đụng đặc trưng conv.
-  #     base = norm_epochs + max_epochs = 1 + 4 = 5 epoch
-  norm_epochs: 1
-  norm_lr: 1.0e-4
-  # Từ epoch 2: mở băng TOÀN BỘ ResNet, cả hai nhóm về `lr`, có warm-up tuyến
-  # tính THEO BƯỚC trong 0.25 epoch đầu của phần này (50/200 bước) rồi phẳng.
-  warmup_epochs: 0.25
+  lr: 3.0e-5                # lr_max của nhóm `rest`
+  backbone_lr: 1.0e-5       # ViT-Small — fine-tune phần đã pretrain, PHẲNG suốt
+  # ── epoch 1: "warmup" ──────────────────────────────────────────────────
+  # Nhóm `rest` ramp TUYẾN TÍNH THEO BƯỚC từ 0 lên `lr` trong `warmup_epochs`
+  # epoch (1.0 epoch = 200/200 bước); backbone đã ở `backbone_lr` ngay bước 0.
+  # KHÔNG còn epoch "norm" của bản ResNet50: ViT không có BatchNorm nên không có
+  # thống kê chạy nào của ImageNet cần kéo về phân phối ảnh CXR.
+  #     base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7 epoch
+  warmup_epochs: 1.0
   weight_decay: 0.03
-  max_epochs: 4             # epoch CHÍNH (sau epoch norm)
+  max_epochs: 6             # epoch CHÍNH (sau epoch warmup), `rest` phẳng ở 3e-5
   select: last              # LUÔN lấy epoch cuối (best = theo val)
-  # ── epoch n+1 (= 6): "final weight" ─────────────────────────────────────
-  # Sau phần base (norm + max_epochs), base/ được ĐẨY Hub ngay. Rồi chạy thêm
-  # `epochs` epoch NỐI TIẾP: giữ nguyên moment AdamW đã tích trong phần base, lr
-  # cosine lr_start -> lr_end cập nhật mỗi bước -> final/. Main stage dùng final/.
+  # ── epoch n+1 (= 8): "final weight" ─────────────────────────────────────
+  # Sau phần base (warmup + max_epochs), base/ được ĐẨY Hub ngay. Rồi chạy thêm
+  # `epochs` epoch NỐI TIẾP: giữ nguyên moment AdamW đã tích trong phần base,
+  # nhóm `rest` cosine lr_start -> lr_end cập nhật mỗi bước (backbone VẪN phẳng
+  # ở `backbone_lr`) -> final/. Main stage dùng final/.
   final_anneal:
     enabled: true
     epochs: 1
-    lr_start: null          # null = `stage0.lr` -> lr không nhảy nấc ở ranh
-                            # giới epoch, chỉ bắt đầu đi xuống
+    lr_start: null          # null = `stage0.lr` -> lr của `rest` không nhảy nấc
+                            # ở ranh giới epoch, chỉ bắt đầu đi xuống
     lr_end: 1.0e-7
     schedule: cosine
     weight_decay: 0.03

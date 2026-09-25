@@ -151,7 +151,8 @@ class Gemma3VExtractorRunner(Gemma3AdapterRunner):
             from .. import vextractor as RCV
 
             out["vext_pixels"] = torch.cat(
-                [RCV.vext_tensor(it["image_path"], self.branch.image_size)
+                [RCV.vext_tensor(it["image_path"], self.branch.image_size,
+                                 *self.branch.normalize)
                  for it in batch], 0)
         if bool(io_opt(self.cfg, "pin_memory", False)) and torch.cuda.is_available():
             out = {k: (v.pin_memory() if torch.is_tensor(v) else v)

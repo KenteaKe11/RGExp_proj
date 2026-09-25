@@ -1,53 +1,66 @@
-"""§2.2 V-Extractor — kiến trúc [Z ‖ Q ‖ T]: 256 vector từ MỘT encoder thị giác RIÊNG.
+"""§2.2 V-Extractor — kiến trúc [Z ‖ Q ‖ T]: 128 vector từ MỘT encoder thị giác RIÊNG.
 
 Sơ đồ (đúng hình "V-Extractor" + "Cls Head"):
 
     Image ─┬─► Vision Encoder (SigLIP, đóng băng) ─► Adapter ─► Z (256, 2560)
-           │                                                        │
-           └─► Resize 512×512 ─► ResNet50 (ImageNet, BN→InstanceNorm)
-                                          │  [2048, 16, 16]
+           │
+           └─► Resize 448×448 ─► ViT-Small/16 (ImageNet-1k)
+                                          │  (784, 384)
                                           ▼
-                                 Flatten + Permute  (256, 2048)
-                                          │
-                                 Linear 2048→2560   ──────────┐  (skip)
-                                          │                   │
-                                 RMSNorm(2560) ─► Self-attn ──┴─► (+) ─► Q (256, 2560)
-                                                                          │
-                                                        ┌─────────────────┴───────┐
-                                                        │                         ▼
-                                                        │              Cls Head (CHỈ Stage 0)
-                                                        │              RMSNorm(2560) -> Attn-Pooling
-                                                        │              -> Linear 2560→14·3 -> ASL
-                                                        ▼
-                              [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
+                                 Linear 384→2048                128 Learner (Q)
+                                          │                            │
+                                   RMSNorm(2048)                 RMSNorm(2048)
+                                          │                            │
+                                          │                        Self-attn ──┐
+                                          │                            │       │
+                                          │                      RMSNorm(2048) │
+                                          └──────► CrossAttn ◄──────────┘      │ (skip)
+                                                       │                       │
+                                                      (+) ◄────────────────────┘
+                                                       │
+                                            MLP(GeLU) 2048→2560
+                                                       │
+                                                       ▼
+                                                  Q (128, 2560)
+                                                       │
+                                     ┌─────────────────┴───────┐
+                                     │                         ▼
+                                     │              Cls Head (CHỈ Stage 0)
+                                     │              RMSNorm(2560) -> Attn-Pooling
+                                     │              -> Linear 2560→14·3 -> ASL
+                                     ▼
+           [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
-KHÁC §2.1 Recovery ở ĐÚNG MỘT CHỖ, và nó là chỗ quan trọng nhất: nhánh KHÔNG
-còn đọc X của SigLIP. Nó có encoder thị giác của RIÊNG nó — ResNet50 ImageNet ăn
-thẳng ảnh gốc resize 512×512. Hệ quả:
+Nhánh có encoder thị giác của RIÊNG nó — ViT-Small/16 ImageNet-1k ăn thẳng ảnh
+resize 448², KHÔNG đọc X của SigLIP. Hệ quả:
 
-  * §2.1 hỏi "có rút thêm được gì từ X mà projector đã bỏ sót không"; §2.2 hỏi
-    "một encoder KHÁC, học từ ImageNet chứ không phải web-image–text, có mang
-    vào thứ SigLIP không có không". Hai câu hỏi khác nhau;
-  * không còn `learner` và Cross-Attn: lưới 16×16 = 256 ô của ResNet ĐÃ là 256
-    vector, đúng bằng `n_query` cần có. Cái thay chỗ chúng là chính ResNet;
-  * Q = z + Self-attn(RMSNorm(z)) với z = Linear(lưới). Một khối attention duy
-    nhất, pre-norm, residual cộng thẳng — 256 ô nói chuyện với nhau trước khi
-    vào decoder, vì lưới conv tự nó chỉ có trường nhìn cục bộ;
-  * đường ảnh THỨ HAI: batch phải mang thêm `vext_pixels` (3, 512, 512) chuẩn
-    hoá theo thống kê ImageNet, độc lập hoàn toàn với `pixel_values` 896 của
-    Gemma. `vext_tensor()` dưới đây là chỗ DUY NHẤT dựng nó.
+  * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet-1k chứ không phải
+    web-image–text, có mang vào thứ SigLIP không có không";
+  * lưới patch của ViT (448/16 = 28 -> 28² = 784 ô) KHÔNG phải là khối Q: 784
+    quá dài để nối vào chuỗi decoder. `n_query` learner vector (mặc định 128)
+    đi HỎI 784 ô ấy qua Cross-Attn và nén lại — `n_query` vì thế là một khoá
+    khai tường minh, độc lập với `image_size`;
+  * Self-attn chạy TRƯỚC Cross-Attn và trên RIÊNG các learner vector: 128 câu
+    hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh. Residual cộng đầu
+    ra Self-attn vào đầu ra Cross-Attn (đúng một dấu `+` trong hình);
+  * MLP(GeLU) là chỗ DUY NHẤT đổi chiều 2048 -> 2560 (d_model của decoder):
+    thân nhánh làm việc ở 2048 cho nhẹ, chỉ đầu ra mới nở ra chiều embedding;
+  * đường ảnh THỨ HAI: batch phải mang thêm `vext_pixels` (3, 448, 448) chuẩn
+    hoá theo ĐÚNG thống kê đi kèm trọng số ImageNet-1k của chính checkpoint ViT
+    (`timm.pretrained_cfg.mean/std`, ghi vào `spec.vextractor.normalize`), độc
+    lập hoàn toàn với `pixel_values` 896 của Gemma. `vext_tensor()` dưới đây là
+    chỗ DUY NHẤT dựng nó, và nó BẮT phải truyền mean/std — không có giá trị mặc
+    định nào để lỡ tay pretrain trên một phép chuẩn hoá rồi fine-tune trên một
+    phép khác mà không có exception nào báo.
 
-**BatchNorm → InstanceNorm.** Trọng số ImageNet đi kèm thống kê chạy của
-ImageNet, mà ảnh X-quang ngực không cùng phân phối với ảnh ImageNet. Giữ BN thì
-hai chuyện xấu cùng xảy ra: thống kê chạy cũ làm lệch mọi activation ngay ở bước
-0, và ở micro-batch nhỏ (VRAM của một nhánh chạy cạnh model 4B) thống kê theo
-batch lại quá nhiễu. InstanceNorm chuẩn hoá theo TỪNG ảnh, không có thống kê
-chạy, nên nó không mang theo ImageNet và không phụ thuộc kích thước batch. Phần
-affine (weight/bias) được CHÉP từ BN sang — nó vẫn là thứ ResNet đã học.
+**Vì sao không còn BatchNorm→InstanceNorm.** ViT không có BatchNorm: chuẩn hoá
+của nó là LayerNorm, vốn tính theo TỪNG token của TỪNG ảnh và không mang theo
+thống kê chạy của ImageNet. Toàn bộ khối `bn_to_instance` của bản ResNet50 —
+cùng epoch "norm" sinh ra để kéo thống kê ấy về ảnh CXR — vì thế biến mất.
 
-Thứ tự chuỗi giữ nguyên §2.1: Z **không bị đụng vào**, Q được NỐI ngay SAU 256
-token ảnh (Z → Q → T), nhãn −100, attention_mask 1, token_type_ids 0 — số token
-vào CE không đổi nên CE của A và B vẫn so được.
+Thứ tự chuỗi giữ nguyên: Z **không bị đụng vào**, Q được NỐI ngay SAU 256 token
+ảnh (Z → Q → T), nhãn −100, attention_mask 1, token_type_ids 0 — số token vào CE
+không đổi nên CE của A và B vẫn so được.
 
 Stage 0 pretrain CHÍNH nhánh này (V-Extractor + Cls Head, ASL trên 14 bệnh lý ×
 3 lớp) rồi main stage nạp nguyên khối. Tham số nhánh để fp32, forward dưới
@@ -73,17 +86,19 @@ STAGE0_META = "vextractor_stage0.json"
 BRANCH_FILE = "vextractor_branch.safetensors"
 BRANCH_META = "vextractor_branch.json"
 
-# Thống kê ImageNet — đi cùng trọng số ImageNet của ResNet50. KHÔNG dùng
-# mean/std của processor Gemma ở đây: hai đường ảnh độc lập, và trọng số
-# pretrain chỉ đúng với phân phối mà nó được học.
+# CHỈ là giá trị DỰ PHÒNG khi không hỏi được `timm.get_pretrained_cfg`. Thống kê
+# thật của checkpoint được ghi vào `spec.vextractor.normalize` lúc dựng spec và
+# được KIỂM lại với `pretrained_cfg` của model vừa dựng (`_check_normalize`):
+# nhiều checkpoint ViT ImageNet-1k (họ AugReg) dùng mean/std = 0.5 chứ KHÔNG
+# phải mean/std của ImageNet, nên hard-code một cặp số ở đây là sai lặng lẽ.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-# /1 = ResNet50 (BN→InstanceNorm) -> Linear 2048→d_model -> RMSNorm -> Self-attn
-# (+res). Checkpoint của §2.1 (`rgexp.recovery/*`) là một MẠNG KHÁC HẲN và phải
-# bị từ chối ồn ào thay vì lệch khoá im lặng. Đổi riêng image_size/n_heads thì
-# KHÔNG cần đổi format: `spec` trong meta được so từng khoá khi nạp
-# (`load_stage0_into`).
-FORMAT = "rgexp.vextractor/1"
+# /2 = ViT-Small/16 -> Linear 384→2048 -> (learner Q ► Self-attn ► CrossAttn
+# ► +res) -> MLP(GeLU) 2048→2560. Checkpoint /1 (ResNet50 + BN→InstanceNorm) là
+# một MẠNG KHÁC HẲN và phải bị từ chối ồn ào thay vì lệch khoá im lặng. Đổi
+# riêng image_size/n_query/n_heads thì KHÔNG cần đổi format: `spec` trong meta
+# được so từng khoá khi nạp (`load_stage0_into`).
+FORMAT = "rgexp.vextractor/2"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -133,10 +148,10 @@ class AttnPooling(nn.Module):
 class ClsHead(nn.Module):
     """Q -> RMSNorm -> Attn-Pooling -> Linear d_model → L·C. CHỈ dùng ở Stage 0.
 
-    Đọc ĐẦU RA của V-Extractor (256 × 2560), không đọc lưới ResNet thô: đó là
-    điều làm Stage 0 có nghĩa với main stage — thứ bị ép mang đủ thông tin bệnh
-    lý chính là khối Q mà decoder sẽ đọc, chứ không phải một biểu diễn trung gian
-    nào đó rồi bị vứt đi.
+    Đọc ĐẦU RA của V-Extractor (n_query × 2560), không đọc lưới patch thô của
+    ViT: đó là điều làm Stage 0 có nghĩa với main stage — thứ bị ép mang đủ
+    thông tin bệnh lý chính là khối Q mà decoder sẽ đọc, chứ không phải một biểu
+    diễn trung gian nào đó rồi bị vứt đi.
 
     `self.norm` là pre-norm CỦA RIÊNG khối Attn-Pooling ở đây, đúng quy ước
     pre-norm của một khối attention. Nó KHÔNG đụng tới Q: thứ main stage nối vào
@@ -161,150 +176,188 @@ class VExtractorUnusable(RuntimeError):
     """Không dựng được backbone — DỪNG, đừng pretrain trên đặc trưng ngẫu nhiên."""
 
 
-def bn_to_instance(module: nn.Module) -> int:
-    """Thay MỌI `BatchNorm2d` trong cây bằng `InstanceNorm2d`, GIỮ affine.
-
-    `affine=True` + chép `weight`/`bias` sang: phần ResNet đã học vẫn còn.
-    `track_running_stats=False`: không mang theo thống kê ImageNet, và forward
-    ở train và ở eval là cùng một phép tính — không còn cái bẫy "đổi `.eval()`
-    là đổi kết quả" mà BN mang lại khi micro-batch nhỏ.
-
-    -> số module đã thay (0 nghĩa là backbone không có BN, đáng nghi).
-    """
-    n = 0
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.BatchNorm2d):
-            inorm = nn.InstanceNorm2d(child.num_features, affine=True,
-                                      track_running_stats=False, eps=child.eps)
-            if child.affine:
-                with torch.no_grad():
-                    inorm.weight.copy_(child.weight)
-                    inorm.bias.copy_(child.bias)
-            setattr(module, name, inorm)
-            n += 1
-        else:
-            n += bn_to_instance(child)
-    return n
+# ══ Backbone: ViT-Small/16 ImageNet-1k (timm) ═══════════════════════════════
+def _timm():
+    try:
+        import timm
+    except Exception as e:  # pragma: no cover - môi trường thiếu timm
+        raise VExtractorUnusable(
+            "không import được timm — nhánh §2.2 dùng ViT-Small/16 ImageNet-1k "
+            "của timm.\n"
+            "    pip install timm") from e
+    return timm
 
 
-def resnet_body(arch: str, pretrained: bool) -> tuple[nn.Module, int]:
-    """ResNet của torchvision, CẮT avgpool + fc -> (body, d_feat).
+def arch_normalize(arch: str) -> tuple[tuple, tuple]:
+    """(mean, std) ĐÚNG của checkpoint `arch` — hỏi `pretrained_cfg`, không tải weight.
 
-    Cắt avgpool vì thứ cần ở đây là lưới KHÔNG GIAN (16×16 ở ảnh 512), không
-    phải một vector toàn cục: 256 ô lưới chính là 256 vector Q sẽ nối vào chuỗi.
+    Không đoán: họ AugReg (`*.augreg_in1k`) chuẩn hoá bằng 0.5/0.5 chứ không
+    phải mean/std của ImageNet, và một cặp số sai ở đây không làm chương trình
+    lỗi — nó chỉ làm mọi activation lệch ngay từ bước 0.
     """
     try:
-        import torchvision.models as tvm
-    except Exception as e:  # pragma: no cover - môi trường thiếu torchvision
+        pc = _timm().get_pretrained_cfg(str(arch))
+        mean, std = tuple(pc.mean), tuple(pc.std)
+    except Exception as e:  # noqa: BLE001
         raise VExtractorUnusable(
-            "không import được torchvision — nhánh §2.2 dùng ResNet50 ImageNet "
-            "của torchvision.\n"
-            "    pip install torchvision  (khớp bản torch đang cài)") from e
-    key = str(arch).strip().lower().replace("-", "")
-    fn = getattr(tvm, key, None)
-    if fn is None or not key.startswith("resnet"):
-        raise VExtractorUnusable(f"backbone không biết: {arch!r} (vd. resnet50).")
-    weights = None
-    if pretrained:
-        try:
-            weights = getattr(tvm, f"ResNet{key[6:]}_Weights").IMAGENET1K_V1
-        except Exception as e:  # noqa: BLE001
-            raise VExtractorUnusable(
-                f"không lấy được trọng số ImageNet cho {key}: {e!r}.\n"
-                "    Đây KHÔNG phải chỗ để rơi về khởi tạo ngẫu nhiên: cả điểm "
-                "của §2.2 là 'một encoder ĐÃ học từ ImageNet mang vào thứ SigLIP "
-                "không có'. ResNet ngẫu nhiên trả lời một câu hỏi khác.\n"
-                "    Lần chạy đầu tải ~100 MB từ download.pytorch.org.") from e
-    net = fn(weights=weights)
-    return nn.Sequential(*list(net.children())[:-2]), int(net.fc.in_features)
+            f"không đọc được `pretrained_cfg` của {arch!r} để lấy mean/std: {e!r}.\n"
+            f"    Đây KHÔNG phải chỗ để rơi về mean/std của ImageNet: checkpoint "
+            f"ViT ImageNet-1k họ AugReg chuẩn hoá bằng 0.5/0.5.") from e
+    return (tuple(float(x) for x in mean), tuple(float(x) for x in std))
+
+
+def vit_body(arch: str, pretrained: bool, image_size: int):
+    """ViT của timm ở độ phân giải `image_size`, CẮT head -> (body, d_feat, n_patch).
+
+    `num_classes=0, global_pool=""` bỏ head phân loại; `forward_features` trả
+    chuỗi token ĐÃ qua norm cuối, gồm cả prefix token (cls/reg) — `n_prefix`
+    dưới đây là số token bị cắt bỏ để còn ĐÚNG lưới patch. `img_size` khác
+    224 thì timm nội suy lại positional embedding của checkpoint.
+    """
+    timm = _timm()
+    # `pretrained=False` dựng được (selftest cần một ViT nhỏ, offline), nhưng
+    # một lượt Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn: backbone
+    # ngẫu nhiên trả lời một câu hỏi khác hẳn câu hỏi của §2.2.
+    try:
+        net = timm.create_model(str(arch), pretrained=bool(pretrained),
+                                num_classes=0, global_pool="",
+                                img_size=int(image_size))
+    except Exception as e:  # noqa: BLE001
+        raise VExtractorUnusable(
+            f"không dựng được backbone {arch!r} ở {image_size}²: {e!r}.\n"
+            f"    Lần chạy đầu tải checkpoint từ Hugging Face (~85 MB cho "
+            f"ViT-Small/16).") from e
+    pe = getattr(net, "patch_embed", None)
+    if pe is None or not hasattr(net, "forward_features"):
+        raise VExtractorUnusable(
+            f"{arch!r} không phải ViT của timm (thiếu `patch_embed`/"
+            f"`forward_features`) — nhánh cần lưới patch, không cần một vector.")
+    n_patch = int(pe.num_patches)
+    return net, int(net.num_features), n_patch
 
 
 class VExtractor(nn.Module):
     """Ảnh (B, 3, S, S) -> Q (B, n_query, d_model).
 
-        f = ResNet50_body(px)                    (B, 2048, S/32, S/32)
-        t = flatten + permute                    (B, n_query, 2048)
-        z = Linear(t)                            2048 → d_model
-        Q = z + Self-attn(RMSNorm(z))            (residual cộng thẳng)
+        p  = ViT.forward_features(px)[:, n_prefix:]      (B, n_patch, d_feat)
+        kv = RMSNorm(Linear(p))                          d_feat → d_branch
+        s  = Self-attn(RMSNorm(learner))                 (B, n_query, d_branch)
+        y  = s + Cross-attn(RMSNorm(s), kv)              (residual cộng thẳng)
+        Q  = MLP_GeLU(y)                                 d_branch → d_model
 
-    `n_query` KHÔNG phải tham số tự do: nó là (S/32)² = 256 ở ảnh 512 — số ô của
-    lưới conv cuối. Muốn đổi số vector thì đổi `image_size`, và đổi nó là đổi cả
-    trường nhìn của mỗi ô.
+    `n_query` là khoá KHAI TƯỜNG MINH (mặc định 128) — khác bản ResNet50 cũ nơi
+    nó bị ép bằng (image_size/32)². Lưới patch của ViT (784 ô ở 448²) chỉ là
+    NGUỒN để hỏi, không phải khối nối vào chuỗi decoder.
 
-    Không MLP, không Cross-Attn: khác §2.1, ở đây đặc trưng ĐÃ là hàm của ảnh
-    (ResNet làm việc ấy) nên không cần learner vector đi hỏi. Self-attn ở đây
-    chỉ để 256 ô — vốn chỉ thấy vùng lân cận của mình qua conv — nói chuyện được
-    với nhau trước khi decoder đọc.
+    Thân nhánh chạy ở `d_branch` = 2048; chỉ MLP cuối nở ra `d_model` = 2560 của
+    decoder.
     """
 
-    def __init__(self, image_size: int = 512, d_model: int = 2560,
-                 arch: str = "resnet50", pretrained: bool = True,
-                 n_heads: int = 20, dropout: float = 0.0):
+    def __init__(self, image_size: int = 448, d_model: int = 2560,
+                 arch: str = "vit_small_patch16_224.augreg_in1k",
+                 pretrained: bool = True, n_query: int = 128,
+                 d_branch: int = 2048, n_heads: int = 16,
+                 mlp_hidden: int = 4096, dropout: float = 0.0,
+                 normalize: dict | None = None):
         super().__init__()
         self.image_size = int(image_size)
-        if self.image_size % 32:
-            raise ValueError(f"image_size {image_size} phải chia hết 32 (stride "
-                             f"tổng của ResNet)")
-        self.n_query = (self.image_size // 32) ** 2
-        self.body, self.d_feat = resnet_body(arch, pretrained)
-        self.n_norm_swapped = bn_to_instance(self.body)
-        self.inp = nn.Linear(self.d_feat, d_model)
-        self.norm = RMSNorm(d_model)
-        self.sattn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.n_query = int(n_query)
+        self.d_branch = int(d_branch)
+        if self.n_query < 1:
+            raise ValueError(f"n_query {n_query} phải >= 1")
+        self.body, self.d_feat, self.n_patch = vit_body(arch, pretrained, self.image_size)
+        self.n_prefix = int(getattr(self.body, "num_prefix_tokens", 1))
+        self.mean, self.std = _check_normalize(self.body, arch, normalize)
+        self.inp = nn.Linear(self.d_feat, self.d_branch)          # 384 → 2048
+        self.inp_norm = RMSNorm(self.d_branch)
+        # Learner vector: khởi tạo normal(0, 0.02) như mọi tham số mới của Gemma 3.
+        # `_init` chỉ chạm `nn.Linear` nên nó giữ nguyên khởi tạo ở đây.
+        self.learner = nn.Parameter(torch.randn(1, self.n_query, self.d_branch) * 0.02)
+        self.q_norm = RMSNorm(self.d_branch)
+        self.sattn = MultiHeadAttention(self.d_branch, n_heads, dropout)
+        self.x_norm = RMSNorm(self.d_branch)
+        self.xattn = MultiHeadAttention(self.d_branch, n_heads, dropout)
+        self.mlp = nn.Sequential(nn.Linear(self.d_branch, int(mlp_hidden)),
+                                 nn.GELU(),
+                                 nn.Linear(int(mlp_hidden), int(d_model)))
 
-    # ── nhóm tham số: Stage 0 chạy epoch đầu CHỈ với norm của ResNet ──────
-    def norm_parameters(self):
-        """affine của MỌI InstanceNorm trong ResNet."""
-        for m in self.body.modules():
-            if isinstance(m, nn.InstanceNorm2d):
-                yield from (p for p in m.parameters(recurse=False))
-
-    def body_parameters(self, norms: bool = True):
-        """Tham số của ResNet; `norms=False` -> bỏ affine của InstanceNorm."""
-        skip = {id(p) for p in self.norm_parameters()} if not norms else set()
-        for p in self.body.parameters():
-            if id(p) not in skip:
-                yield p
+    # ── hai nhóm tham số của Stage 0 ──────────────────────────────────────
+    def backbone_parameters(self):
+        """Tham số của ViT — phần ĐÃ pretrain ImageNet-1k."""
+        yield from self.body.parameters()
 
     def head_parameters(self):
-        """Phần NGOÀI ResNet: Linear + RMSNorm + Self-attn."""
-        for m in (self.inp, self.norm, self.sattn):
+        """Phần NGOÀI ViT: Linear vào + RMSNorm + learner + Self/Cross-attn + MLP."""
+        yield self.learner
+        for m in (self.inp, self.inp_norm, self.q_norm, self.sattn,
+                  self.x_norm, self.xattn, self.mlp):
             yield from m.parameters()
 
-    def freeze_body(self, frozen: bool, keep_norm: bool = True) -> int:
-        """Đóng băng conv của ResNet, TRỪ affine của InstanceNorm (`keep_norm`).
-
-        -> số tham số còn học được trong ResNet.
-        """
+    def freeze_body(self, frozen: bool) -> int:
+        """Đóng băng/mở băng ViT. -> số tham số còn học được trong ViT."""
         for p in self.body.parameters():
             p.requires_grad_(not frozen)
-        if frozen and keep_norm:
-            for p in self.norm_parameters():
-                p.requires_grad_(True)
         return sum(p.numel() for p in self.body.parameters() if p.requires_grad)
 
-    def forward(self, px: torch.Tensor) -> torch.Tensor:
-        f = self.body(px)                                    # (B, C, H, W)
-        b, c, h, w = f.shape
-        if h * w != self.n_query:
+    def patches(self, px: torch.Tensor) -> torch.Tensor:
+        """Lưới patch ĐÃ bỏ prefix token -> (B, n_patch, d_feat)."""
+        f = self.body.forward_features(px)
+        if f.dim() != 3:
+            raise ValueError(f"forward_features trả {tuple(f.shape)}, cần (B, N, C) "
+                             f"— backbone phải dựng với global_pool=''.")
+        f = f[:, self.n_prefix:]
+        if f.shape[1] != self.n_patch:
             raise ValueError(
-                f"lưới {h}×{w} = {h * w} ô nhưng nhánh khai n_query="
-                f"{self.n_query}: ảnh vào phải là {self.image_size}×"
-                f"{self.image_size} (đang là {px.shape[-2]}×{px.shape[-1]}).")
-        z = self.inp(f.reshape(b, c, h * w).permute(0, 2, 1))
-        return z + self.sattn(self.norm(z))
+                f"lưới {f.shape[1]} patch nhưng nhánh khai n_patch={self.n_patch}: "
+                f"ảnh vào phải là {self.image_size}×{self.image_size} (đang là "
+                f"{px.shape[-2]}×{px.shape[-1]}).")
+        return f
+
+    def forward(self, px: torch.Tensor) -> torch.Tensor:
+        kv = self.inp_norm(self.inp(self.patches(px)))            # (B, n_patch, 2048)
+        q = self.learner.expand(px.shape[0], -1, -1).to(kv.dtype)
+        s = self.sattn(self.q_norm(q))                            # (B, n_query, 2048)
+        y = s + self.xattn(self.x_norm(s), kv)                    # skip từ Self-attn
+        return self.mlp(y)                                        # (B, n_query, 2560)
 
 
-def vext_tensor(image_path, image_size: int = 512) -> torch.Tensor:
-    """Đường ảnh THỨ HAI: file -> (1, 3, S, S) chuẩn hoá ImageNet.
+def _check_normalize(net, arch: str, normalize: dict | None) -> tuple[tuple, tuple]:
+    """mean/std của spec PHẢI trùng `pretrained_cfg` của checkpoint vừa dựng.
+
+    Spec ghi lại con số lúc dựng cấu hình; model mang con số thật của trọng số.
+    Hai nguồn ấy lệch nhau nghĩa là ảnh đang được chuẩn hoá khác cách checkpoint
+    được huấn luyện — không lỗi, chỉ sai. Nên nó bị bắt ở đây.
+    """
+    pc = dict(getattr(net, "pretrained_cfg", {}) or {})
+    mean = tuple(float(x) for x in (pc.get("mean") or IMAGENET_MEAN))
+    std = tuple(float(x) for x in (pc.get("std") or IMAGENET_STD))
+    if normalize:
+        want = (tuple(float(x) for x in normalize["mean"]),
+                tuple(float(x) for x in normalize["std"]))
+        if want != (mean, std):
+            raise VExtractorUnusable(
+                f"{arch}: spec khai chuẩn hoá {want} nhưng `pretrained_cfg` của "
+                f"checkpoint là {(mean, std)}. Checkpoint Stage 0 và cấu hình "
+                f"hiện tại không cùng một phép tiền xử lý — chạy lại Stage 0 "
+                f"(`--restage0`) hoặc trả `vextractor.vextractor.arch` về đúng "
+                f"checkpoint cũ.")
+    return mean, std
+
+
+def vext_tensor(image_path, image_size: int, mean, std) -> torch.Tensor:
+    """Đường ảnh THỨ HAI: file -> (1, 3, S, S) chuẩn hoá theo mean/std của backbone.
 
     Chỗ DUY NHẤT dựng đầu vào của nhánh — Stage 0, main stage, sinh và Lens đều
     gọi đúng hàm này. Hai bản sao của phép tiền xử lý là cách chắc chắn nhất để
     pretrain trên một phân phối ảnh rồi fine-tune trên một phân phối khác mà
     không có exception nào báo.
 
-    Ảnh xám -> `convert("RGB")` lặp thành 3 kênh giống nhau (ResNet ImageNet có
-    3 kênh vào). Resize BILINEAR về đúng ô vuông S×S: KHÔNG letterbox, không giữ
+    `mean`/`std` KHÔNG có giá trị mặc định: chúng là của CHECKPOINT (lấy từ
+    `spec.vextractor.normalize`, gốc là `timm.pretrained_cfg`), và một mặc định
+    ở đây chỉ để dành cho lần một call site quên truyền.
+
+    Ảnh xám -> `convert("RGB")` lặp thành 3 kênh giống nhau (ViT ImageNet có 3
+    kênh vào). Resize BILINEAR về đúng ô vuông S×S: KHÔNG letterbox, không giữ
     tỉ lệ — ảnh CXR vốn gần vuông, và Gemma cũng resize thẳng như vậy.
     """
     from PIL import Image
@@ -314,18 +367,24 @@ def vext_tensor(image_path, image_size: int = 512) -> torch.Tensor:
                                        Image.BILINEAR)
     a = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
     a = a.view(int(image_size), int(image_size), 3).permute(2, 0, 1).float() / 255.0
-    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
-    return ((a - mean) / std).unsqueeze(0)
+    m = torch.tensor([float(x) for x in mean]).view(3, 1, 1)
+    s = torch.tensor([float(x) for x in std]).view(3, 1, 1)
+    return ((a - m) / s).unsqueeze(0)
+
+
+def norm_of(spec: dict) -> tuple[tuple, tuple]:
+    """(mean, std) của spec — đối số cho `vext_tensor`."""
+    nz = dict(spec["vextractor"].get("normalize") or {})
+    return (tuple(float(x) for x in nz["mean"]), tuple(float(x) for x in nz["std"]))
 
 
 def _init(module: nn.Module) -> None:
     """normal(0, 0.02) cho Linear MỚI, bias 0 — quy ước của Gemma 3.
 
-    ResNet bị BỎ QUA hoàn toàn: trọng số của nó là ImageNet, khởi tạo đè lên là
-    vứt đi đúng cái thứ §2.2 đang mang vào. (Sau khi cắt `fc`, backbone không
-    còn `nn.Linear` nào, nên vòng lặp dưới đây vốn đã không chạm tới nó — chỗ
-    `skip` là để một lần đổi backbone sau này không lặng lẽ phá mất điều đó.)
+    ViT bị BỎ QUA hoàn toàn: trọng số của nó là ImageNet-1k, khởi tạo đè lên là
+    vứt đi đúng cái thứ §2.2 đang mang vào. Khác bản ResNet50 cũ, chỗ `skip`
+    này KHÔNG phải đề phòng: ViT có RẤT nhiều `nn.Linear` (qkv, proj, mlp của
+    12 block) và thiếu nó là xoá sạch backbone một cách im lặng.
     """
     skip = set()
     for m in module.modules():
@@ -342,30 +401,34 @@ def _init(module: nn.Module) -> None:
 def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
     """Khối `vextractor` đã giải quyết — ghi NGUYÊN VĂN vào meta mọi checkpoint.
 
-    `n_query` KHÔNG có ở đây: nó là (image_size/32)², suy ra từ kiến trúc chứ
-    không khai được. Khai nó thành một khoá riêng là mời hai nguồn sự thật vào
-    cùng một con số.
+    `normalize` KHÔNG khai được trong config: nó được HỎI từ `pretrained_cfg`
+    của `arch` (`arch_normalize`) rồi đóng vào spec, nên chỉ có MỘT nguồn sự
+    thật cho phép chuẩn hoá và đổi `arch` là nó đi theo.
     """
     z = dict(cfg.get("vextractor") or {})
     rv, ch = (dict(z.get(k) or {}) for k in ("vextractor", "cls_head"))
-    size = int(rv.get("image_size", 512))
+    arch = str(rv.get("arch", "vit_small_patch16_224.augreg_in1k"))
+    mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
         "n_labels": int(n_labels), "n_classes": len(CLASS_ORDER),
         "class_order": list(CLASS_ORDER),
-        "vextractor": {"image_size": size,
-                       "arch": str(rv.get("arch", "resnet50")),
+        "vextractor": {"image_size": int(rv.get("image_size", 448)),
+                       "arch": arch,
                        "pretrained": bool(rv.get("pretrained", True)),
-                       "norm": "instance",
-                       "n_heads": int(rv.get("n_heads", 20)),
-                       "dropout": float(rv.get("dropout", 0.0))},
+                       "n_query": int(rv.get("n_query", 128)),
+                       "d_branch": int(rv.get("d_branch", 2048)),
+                       "n_heads": int(rv.get("n_heads", 16)),
+                       "mlp_hidden": int(rv.get("mlp_hidden", 4096)),
+                       "dropout": float(rv.get("dropout", 0.0)),
+                       "normalize": {"mean": list(mean), "std": list(std)}},
         "cls_head": {"n_heads": int(ch.get("n_heads", 20)),
                      "dropout": float(ch.get("dropout", 0.0))},
     }
 
 
 def n_query_of(spec: dict) -> int:
-    return (int(spec["vextractor"]["image_size"]) // 32) ** 2
+    return int(spec["vextractor"]["n_query"])
 
 
 def spec_fingerprint(spec: dict) -> str:
@@ -374,8 +437,9 @@ def spec_fingerprint(spec: dict) -> str:
 
 def build_vextractor(spec: dict) -> VExtractor:
     r = spec["vextractor"]
-    return VExtractor(r["image_size"], spec["d_model"], r["arch"],
-                      r["pretrained"], r["n_heads"], r["dropout"])
+    return VExtractor(r["image_size"], spec["d_model"], r["arch"], r["pretrained"],
+                      r["n_query"], r["d_branch"], r["n_heads"], r["mlp_hidden"],
+                      r["dropout"], r.get("normalize"))
 
 
 def build_cls_head(spec: dict) -> ClsHead:
@@ -398,24 +462,22 @@ class SupervisedBlock(nn.Module):
         return self.cls_head(self.vextractor(px))
 
     # ── hai nhóm tham số cho lịch Stage 0 ─────────────────────────────────
-    def param_groups(self, lr: float, norm_lr: float) -> list[dict]:
-        """[{norm của ResNet @ norm_lr}, {phần còn lại @ lr}].
+    def param_groups(self, lr: float, backbone_lr: float) -> list[dict]:
+        """[{ViT @ backbone_lr}, {phần còn lại @ lr}].
 
-        Epoch 1 của Stage 0 chạy với conv của ResNet ĐÓNG BĂNG và chỉ affine của
-        InstanceNorm học, ở lr cao hơn hẳn (1e-4 so với 1e-5): việc của nó là
-        kéo thống kê chuẩn hoá từ ImageNet về ảnh CXR, một phép dịch/scale trên
-        mỗi kênh chứ không phải học đặc trưng mới — nó cần đi nhanh và nó đi an
-        toàn vì không đụng vào conv. Phần NGOÀI ResNet (Linear, Self-attn, Cls
-        Head) vẫn học ở lr chính trong epoch ấy, nếu không thì ASL đang dạy norm
-        qua một Cls Head ngẫu nhiên chưa biết gì.
+        ViT là phần ĐÃ pretrain ImageNet-1k: nó chỉ cần fine-tune, nên lr của nó
+        là `stage0.backbone_lr` (1e-5) và PHẲNG suốt Stage 0 — không warm-up,
+        không anneal (`base_lr_at` / `anneal_lr_at`). Phần còn lại (Linear vào,
+        learner Q, Self/Cross-attn, MLP, Cls Head) khởi tạo ngẫu nhiên nên nó
+        mới là phần đi theo lịch `stage0.lr` (lr_max 3e-5, warm-up rồi anneal).
 
-        Từ epoch 2 trở đi `lr` của CẢ HAI nhóm bị đặt về `lr` (xem
-        `stage0_vextractor.set_group_lrs`).
+        Một lr chung cho cả hai là cách chắc chắn nhất để hoặc ViT bị đẩy quá
+        mạnh (mất đặc trưng ImageNet), hoặc phần mới học quá chậm.
         """
-        nrm = list(self.vextractor.norm_parameters())
-        ids = {id(p) for p in nrm}
+        bb = list(self.vextractor.backbone_parameters())
+        ids = {id(p) for p in bb}
         rest = [p for p in self.parameters() if id(p) not in ids]
-        return [{"params": nrm, "lr": float(norm_lr), "name": "norm"},
+        return [{"params": bb, "lr": float(backbone_lr), "name": "backbone"},
                 {"params": rest, "lr": float(lr), "name": "rest"}]
 
 
@@ -437,6 +499,11 @@ class VExtractorBranch(nn.Module):
     def image_size(self) -> int:
         return int(self.vextractor.image_size)
 
+    @property
+    def normalize(self) -> tuple[tuple, tuple]:
+        """(mean, std) của backbone — đối số cho `vext_tensor`."""
+        return (tuple(self.vextractor.mean), tuple(self.vextractor.std))
+
     def set_frozen(self, frozen: bool) -> None:
         """Đóng băng HOÀN TOÀN: requires_grad=False + eval() + chạy no_grad."""
         self.frozen = bool(frozen)
@@ -450,7 +517,7 @@ class VExtractorBranch(nn.Module):
         return self
 
     def forward(self, px: torch.Tensor) -> torch.Tensor:
-        """px (B, 3, S, S) đã chuẩn hoá ImageNet -> Q (B, n_query, d_model)."""
+        """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model)."""
         ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
         with ctx:
             return self.vextractor(px)
@@ -458,8 +525,8 @@ class VExtractorBranch(nn.Module):
     def n_params(self) -> dict:
         c = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
         v = self.vextractor
-        return {"vextractor": c(v), "resnet": c(v.body),
-                "norm": sum(p.numel() for p in v.norm_parameters()),
+        return {"vextractor": c(v),
+                "backbone": sum(p.numel() for p in v.backbone_parameters()),
                 "head": sum(p.numel() for p in v.head_parameters()),
                 "trainable": sum(p.numel() for p in self.parameters() if p.requires_grad),
                 "total": c(self)}
@@ -468,11 +535,11 @@ class VExtractorBranch(nn.Module):
         s = self.spec
         r = s["vextractor"]
         v = self.vextractor
-        return (f"V-Extractor: ảnh {r['image_size']}² -> {r['arch']} "
-                f"(ImageNet, {v.n_norm_swapped} BN→InstanceNorm) -> lưới "
-                f"{r['image_size'] // 32}² = {v.n_query} ô × {v.d_feat} -> Linear "
-                f"{v.d_feat}→{s['d_model']} -> RMSNorm -> Self-attn "
-                f"({r['n_heads']} head) (+res)")
+        return (f"V-Extractor: ảnh {r['image_size']}² -> {r['arch']} (ImageNet-1k) "
+                f"-> {v.n_patch} patch × {v.d_feat} -> Linear {v.d_feat}→"
+                f"{v.d_branch} -> RMSNorm ‖ {v.n_query} learner Q -> Self-attn "
+                f"-> CrossAttn ({r['n_heads']} head) (+res) -> MLP(GeLU) "
+                f"{v.d_branch}→{s['d_model']}")
 
 
 # ══ ASL: γ theo TÊN lớp ═════════════════════════════════════════════════════

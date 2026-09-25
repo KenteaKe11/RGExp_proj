@@ -17,12 +17,12 @@ from . import vextractor as RCV
 
 
 def _nq(st_b: dict) -> int:
-    """Số vector Q = (image_size/32)² — suy từ spec, không có khoá riêng."""
+    """Số vector Q = `spec.vextractor.n_query` (khoá khai tường minh)."""
     sp = (st_b.get("vextractor") or {}).get("spec") or {}
     try:
         return RCV.n_query_of(sp)
     except Exception:  # noqa: BLE001
-        return 256
+        return 128
 
 
 def _f(x, nd: int = 4) -> str:
@@ -99,7 +99,7 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = V-Extractor(ảnh 512²), Z giữ nguyên)"],
+         f"token, Q = V-Extractor(ảnh 448²), Z giữ nguyên)"],
         ["Stage 0", "—", f"V-Extractor + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
                           f"({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
@@ -112,9 +112,13 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
 
     L.append("## Stage 0 — V-Extractor + Cls Head\n")
     if s0.get("history"):
-        L.append(f"lr cố định {s0.get('stage0', {}).get('lr')} · wd "
-                 f"{s0.get('stage0', {}).get('weight_decay')} · ≤ "
-                 f"{s0.get('stage0', {}).get('max_epochs')} epoch · ASL γ_neg "
+        L.append(f"backbone ViT lr {s0.get('stage0', {}).get('backbone_lr')} "
+                 f"(phẳng) · phần mới lr_max {s0.get('stage0', {}).get('lr')} "
+                 f"(warm-up {s0.get('stage0', {}).get('warmup_epochs')} epoch) · wd "
+                 f"{s0.get('stage0', {}).get('weight_decay')} · "
+                 f"{s0.get('stage0', {}).get('base_epochs')} epoch base + "
+                 f"{(s0.get('stage0', {}).get('final_anneal') or {}).get('epochs')} "
+                 f"final · ASL γ_neg "
                  f"{s0.get('stage0', {}).get('asl', {}).get('gamma_neg')} · clip "
                  f"{s0.get('stage0', {}).get('asl', {}).get('clip')} · epoch dùng: "
                  f"{s0.get('select', 'last')} · val {s0.get('stage0', {}).get('val_n_samples')} "
@@ -123,7 +127,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                        "sqrt(F1·R)", "phút"],
                       [[("**" + str(h["epoch"]) + "** ★") if h["epoch"] == s0.get("best_epoch")
                         else str(h["epoch"]),
-                        ("anneal (final)" if h.get("phase") == "anneal" else "lr cố định"),
+                        {"anneal": "anneal (final)", "warmup": "warm-up",
+                         "base": "lr_max phẳng"}.get(h.get("phase"), str(h.get("phase"))),
                         _f(h["train_asl"]), _f(h["val_asl"]),
                         _f(h["val_f1_macro"]), _f(h["val_recall_macro"]),
                         _f(h["val_score"]), _f(h.get("minutes"), 1)]

@@ -5,7 +5,7 @@
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
-  2. V-Extractor: ResNet BN→InstanceNorm, lưới -> Q, freeze_body chừa norm
+  2. V-Extractor: ViT -> lưới patch -> learner Q qua Self/Cross-attn -> Q
   3. Stage 0 -> main: nhánh nạp đúng (Q khớp TỪNG BIT với Stage 0), Cls Head bị
      bỏ, format checkpoint cũ bị từ chối; ghi/nạp nhánh khớp từng bit
   4. γ ASL theo TÊN lớp -> đúng thứ tự CLASS_ORDER (neg, pos, uncertain)
@@ -22,9 +22,9 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
  14. lịch Stage 0 / main hiện hành, cờ --retrain-all, và hai stage KHÔNG dùng
      chung khoá batch nào (micro + điểm đo riêng, không vào vân tay)
- 15. Stage 0 chạy thật trên mô hình giả: base (1 norm + 3 main) đẩy ngay,
+ 15. Stage 0 chạy thật trên mô hình giả: base (1 warmup + 3 main) đẩy ngay,
      epoch 5 anneal -> final; đổi lịch anneal thì chỉ chạy lại epoch 5
- 16. lịch lr: epoch norm (2 nhóm), warm-up theo bước, cosine của epoch cuối
+ 16. lịch lr: 2 nhóm (backbone phẳng | rest warm-up + cosine), cosine epoch cuối
  17. checkpoint bố cục CŨ (chỉ `final/` = epoch cuối của base) được nhận làm `base/`
  18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
  19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp có
@@ -60,18 +60,21 @@ def check(name: str):
     return deco
 
 
-# Nhánh THẬT nhưng nhỏ: resnet18 chưa pretrain, ảnh 64² -> lưới 2×2 = 4 vector.
-# Dùng ResNet thật (không giả) vì chính phép thay BN→InstanceNorm và cách cắt
-# avgpool/fc là thứ đáng kiểm; `pretrained: false` để selftest không tải mạng.
-SMALL_IMG, SMALL_ARCH = 64, "resnet18"
+# Nhánh THẬT nhưng nhỏ: ViT-Tiny/16 chưa pretrain, ảnh 64² -> lưới 4×4 = 16
+# patch, nén còn SMALL_Q = 6 learner vector. Dùng ViT thật của timm (không giả)
+# vì chính cách cắt prefix token và cách hỏi `pretrained_cfg` để lấy mean/std là
+# thứ đáng kiểm; `pretrained: false` để selftest không tải mạng (một lượt
+# Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn — xem check 14).
+SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "vit_tiny_patch16_224", 6
 
 
-def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32):
+def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q):
     from src import vextractor as R
 
     cfg = {"vextractor": {"vextractor": {"image_size": image_size,
                                          "arch": SMALL_ARCH, "pretrained": False,
-                                         "n_heads": 4},
+                                         "n_query": n_query, "d_branch": 32,
+                                         "mlp_hidden": 64, "n_heads": 4},
                           "cls_head": {"n_heads": 4}}}
     return R.spec_from_cfg(cfg, d_model, n_labels)
 
@@ -92,10 +95,9 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. V-Extractor: ảnh -> lưới ResNet -> Q, BN→InstanceNorm, freeze chừa norm")
+@check("2. V-Extractor: ảnh -> lưới patch ViT -> learner Q qua Self/Cross-attn")
 def _():
     import torch
-    import torch.nn as nn
 
     from src import vextractor as R
 
@@ -106,32 +108,42 @@ def _():
     vx = br.vextractor
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     q = br(x)
-    # n_query = (image_size/32)² — SUY RA, không khai
-    assert vx.n_query == (SMALL_IMG // 32) ** 2 == R.n_query_of(sp) == 4
-    assert q.shape == (2, vx.n_query, 32), q.shape
+    # n_query là khoá KHAI TƯỜNG MINH — KHÔNG còn suy từ image_size như bản
+    # ResNet50 cũ. Lưới patch (16 ô) và số vector Q (6) là hai con số khác nhau.
+    assert vx.n_query == R.n_query_of(sp) == SMALL_Q
+    assert vx.n_patch == (SMALL_IMG // 16) ** 2 == 16 != vx.n_query
+    assert q.shape == (2, SMALL_Q, 32), q.shape
     assert torch.isfinite(q).all() and q.abs().sum() > 0
-    # BN đã bị thay HẾT bằng InstanceNorm (affine), không còn thống kê chạy
-    assert not any(isinstance(m, nn.BatchNorm2d) for m in vx.body.modules())
-    inorms = [m for m in vx.body.modules() if isinstance(m, nn.InstanceNorm2d)]
-    assert len(inorms) == vx.n_norm_swapped > 0
-    assert all(m.affine and not m.track_running_stats for m in inorms)
-    # affine được CHÉP từ BN: resnet mới dựng có weight = 1, bias = 0
-    assert all(torch.allclose(m.weight, torch.ones_like(m.weight)) for m in inorms)
-    # KHÔNG còn learner / Cross-Attn của §2.1: lưới conv ĐÃ là n_query vector
-    assert not hasattr(vx, "learner") and not hasattr(vx, "xattn")
+    # lưới patch ĐÃ bỏ prefix token (cls) của ViT
+    p = vx.patches(x)
+    assert p.shape == (2, vx.n_patch, vx.d_feat), p.shape
+    assert vx.n_prefix >= 1
+    # đường đi đúng hình: Linear d_feat→d_branch, Self-attn RỒI Cross-attn,
+    # MLP là chỗ DUY NHẤT nở ra d_model
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == 32
-    assert vx.sattn.d == 32
+    assert vx.sattn.d == vx.xattn.d == vx.d_branch == 32
+    assert tuple(vx.learner.shape) == (1, SMALL_Q, 32)
+    assert vx.mlp[0].in_features == 32 and vx.mlp[0].out_features == 64
+    assert vx.mlp[-1].out_features == 32                     # = d_model của spec
+    # ViT KHÔNG có BatchNorm nào để phải thay — khối InstanceNorm của bản cũ
+    # phải biến mất hẳn, không còn treo lại dưới dạng API chết
+    import torch.nn as nn
+    assert not any(isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d))
+                   for m in vx.body.modules())
+    assert not hasattr(R, "bn_to_instance") and not hasattr(R, "resnet_body")
+    assert not hasattr(vx, "norm_parameters") and not hasattr(vx, "n_norm_swapped")
     # Q phụ thuộc ẢNH, không phải hằng số
     assert not torch.allclose(q[0], q[1])
-    # ── freeze_body: đóng băng conv nhưng CHỪA affine của InstanceNorm ────
-    n_live = vx.freeze_body(True, keep_norm=True)
-    norm_ids = {id(t) for t in vx.norm_parameters()}
-    assert n_live == sum(t.numel() for t in vx.norm_parameters()) > 0
-    assert all(t.requires_grad for t in vx.norm_parameters())
-    assert not any(t.requires_grad for t in vx.body.parameters()
-                   if id(t) not in norm_ids)
-    assert all(t.requires_grad for t in vx.head_parameters())   # ngoài ResNet: vẫn học
-    assert vx.freeze_body(False) == sum(t.numel() for t in vx.body.parameters())
+    # ── hai nhóm tham số của Stage 0: backbone (ViT) | rest ───────────────
+    bb = {id(t) for t in vx.backbone_parameters()}
+    hd = {id(t) for t in vx.head_parameters()}
+    assert bb and hd and not (bb & hd)
+    assert bb | hd == {id(t) for t in vx.parameters()}
+    assert id(vx.learner) in hd                    # learner Q thuộc nhóm `rest`
+    n_live = vx.freeze_body(True)
+    assert n_live == 0 and not any(t.requires_grad for t in vx.backbone_parameters())
+    assert all(t.requires_grad for t in vx.head_parameters())   # ngoài ViT: vẫn học
+    assert vx.freeze_body(False) == sum(t.numel() for t in vx.backbone_parameters())
     # ── học được ──────────────────────────────────────────────────────────
     before = br(x).detach().clone()
     opt = torch.optim.AdamW([t for t in br.parameters() if t.requires_grad], lr=1e-2)
@@ -141,13 +153,13 @@ def _():
     # ── ảnh sai kích thước thì DỪNG, không ra lưới khác số ô ──────────────
     try:
         br(torch.randn(1, 3, SMALL_IMG * 2, SMALL_IMG * 2))
-    except ValueError:
+    except Exception:
         pass
     else:
         raise AssertionError("ảnh sai kích thước phải DỪNG")
 
 
-@check("2b. vext_tensor: ảnh xám -> 3 kênh, resize S², chuẩn hoá ImageNet")
+@check("2b. vext_tensor: ảnh xám -> 3 kênh, resize S², chuẩn hoá theo pretrained_cfg")
 def _():
     import numpy as np
     import torch
@@ -155,20 +167,43 @@ def _():
 
     from src import vextractor as R
 
+    sp = small_spec()
+    mean, std = R.norm_of(sp)
+    # mean/std KHÔNG phải hằng số gõ tay: chúng đến từ `pretrained_cfg` của
+    # chính checkpoint (họ AugReg dùng 0.5/0.5, không phải mean/std ImageNet).
+    assert (mean, std) == R.arch_normalize(SMALL_ARCH)
+    assert len(mean) == len(std) == 3 and all(x > 0 for x in std)
     with tempfile.TemporaryDirectory() as t:
         f = Path(t) / "x.png"
         Image.fromarray((np.random.rand(37, 91) * 255).astype("uint8")).save(f)
-        a = R.vext_tensor(f, SMALL_IMG)
+        a = R.vext_tensor(f, SMALL_IMG, mean, std)
         assert a.shape == (1, 3, SMALL_IMG, SMALL_IMG), a.shape
         assert torch.isfinite(a).all()
         # ảnh xám -> ba kênh GIỐNG nhau trước khi chuẩn hoá
-        m = torch.tensor(R.IMAGENET_MEAN).view(3, 1, 1)
-        sd = torch.tensor(R.IMAGENET_STD).view(3, 1, 1)
+        m = torch.tensor(list(mean)).view(3, 1, 1)
+        sd = torch.tensor(list(std)).view(3, 1, 1)
         raw = a[0] * sd + m
         assert torch.allclose(raw[0], raw[1], atol=1e-5)
         assert torch.allclose(raw[1], raw[2], atol=1e-5)
         assert float(raw.min()) >= -1e-5 and float(raw.max()) <= 1 + 1e-5
-        assert not torch.allclose(a[0, 0], a[0, 1])     # đã chuẩn hoá thật
+        # mean/std KHÔNG có mặc định: quên truyền là TypeError, không phải một
+        # phép chuẩn hoá sai lặng lẽ
+        try:
+            R.vext_tensor(f, SMALL_IMG)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("vext_tensor phải BẮT truyền mean/std")
+        # spec khai mean/std KHÁC checkpoint -> DỪNG khi dựng nhánh
+        bad = dict(sp, vextractor=dict(sp["vextractor"],
+                                       normalize={"mean": [0.1, 0.2, 0.3],
+                                                  "std": [0.4, 0.5, 0.6]}))
+        try:
+            R.build_vextractor(bad)
+        except R.VExtractorUnusable as e:
+            assert "chuẩn hoá" in str(e)
+        else:
+            raise AssertionError("mean/std lệch pretrained_cfg phải DỪNG")
 
 
 @check("3. Stage 0 -> main: Q khớp từng bit, bỏ Cls Head, từ chối format cũ")
@@ -400,7 +435,8 @@ def _():
     r = (ROOT / "src/runners/gemma3_vextractor.py").read_text(encoding="utf-8")
     # nhánh §2.2 ăn ĐƯỜNG ẢNH RIÊNG, không phải X của SigLIP
     assert 'self.branch(inputs["vext_pixels"])' in r and "uses_vextractor" in r
-    assert 'RCV.vext_tensor(it["image_path"], self.branch.image_size)' in r
+    assert 'RCV.vext_tensor(it["image_path"], self.branch.image_size,' in r
+    assert "*self.branch.normalize" in r     # mean/std của checkpoint, không hằng số
     # sinh phải nối Q SAU khối ảnh, theo TỪNG HÀNG (đệm trái)
     assert "image_end_indices(ids, self._img_token_id) + 1" in r
 
@@ -570,21 +606,38 @@ def _():
     assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
     assert cfg["vextractor_exp"]["retrain_all"] is False
     rv = cfg["vextractor"]["vextractor"]
-    assert int(rv["image_size"]) == 512 and int(rv["image_size"]) % 32 == 0
-    assert (int(rv["image_size"]) // 32) ** 2 == 256            # n_query SUY RA
-    assert rv["arch"] == "resnet50" and rv["pretrained"] is True
-    # Self-attn ở d_model 2560: head_dim 128
-    assert 2560 % int(rv["n_heads"]) == 0 and 2560 // int(rv["n_heads"]) == 128
-    # KHÔNG còn learner / không gian d_learn của §2.1
-    assert not {"n_query", "d_learn", "x_heads", "hidden"} & set(rv)
+    assert int(rv["image_size"]) == 448 and int(rv["image_size"]) % 16 == 0
+    assert (int(rv["image_size"]) // 16) ** 2 == 784            # lưới patch ViT
+    assert rv["arch"] == "vit_small_patch16_224.augreg_in1k"
+    assert rv["pretrained"] is True
+    # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
+    assert int(rv["n_query"]) == 128 != (int(rv["image_size"]) // 16) ** 2
+    # Self/Cross-attn ở d_branch 2048: head_dim 128
+    assert int(rv["d_branch"]) == 2048
+    assert int(rv["d_branch"]) % int(rv["n_heads"]) == 0
+    assert int(rv["d_branch"]) // int(rv["n_heads"]) == 128
+    # Cls Head ở d_model 2560: head_dim 128
+    ch = cfg["vextractor"]["cls_head"]
+    assert 2560 % int(ch["n_heads"]) == 0 and 2560 // int(ch["n_heads"]) == 128
+    # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
+    assert "normalize" not in rv and "mean" not in rv
+    # Stage 0: hai nhóm lr, epoch "norm" của bản ResNet50 đã biến mất
+    assert (sc["lr"], sc["backbone_lr"]) == (3e-5, 1e-5)
+    assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 6
+    assert sc["n_warmup_epochs"] == 1 and sc["base_epochs"] == 7
+    assert sc["base_epochs"] + sc["final_anneal"]["epochs"] == 8
+    assert "norm_lr" not in sc and "norm_epochs" not in sc
+    assert "norm_lr" not in cfg["stage0"] and "norm_epochs" not in cfg["stage0"]
+    # main stage: ft phần đã pretrain từ 0.2 epoch, lr CỐ ĐỊNH 1e-5
+    assert (zc["freeze_vext_epochs"], zc["vext_lr"]) == (0.2, 1e-5)
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    # epoch NORM là epoch thêm vào -> mọi chỗ đếm "số epoch của base" phải cộng
-    # `norm_epochs`, không phải `warmup_epochs` (0.25, int() ra 0)
-    assert 'int(cfg["stage0"].get("norm_epochs", 0))' in src
-    assert 'get("warmup_epochs", 0))' not in src
-    # dry-run vẫn đi qua epoch norm + lúc mở băng ResNet
-    assert 'max_epochs=1, warmup_epochs=0.0' in src and "norm_epochs=0" not in src
+    # warm-up chiếm TRỌN epoch đầu -> mọi chỗ đếm "số epoch của base" phải cộng
+    # ceil(warmup_epochs), không phải int() (1.0 thì giống nhau, 0.25 thì không)
+    assert '_m.ceil(float(cfg["stage0"].get("warmup_epochs", 0.0)))' in src
+    assert "norm_epochs" not in src
+    # dry-run: warmup_epochs = 0 -> base rút còn đúng 1 epoch
+    assert 'max_epochs=1, warmup_epochs=0.0' in src
     assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
     # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
     assert "--refinal" in src and "restart_final=a.refinal" in src
@@ -638,18 +691,23 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
-                                        "pretrained": False, "n_heads": 4},
+                                        "pretrained": True, "n_query": SMALL_Q,
+                                        "d_branch": 32, "mlp_hidden": 64,
+                                        "n_heads": 4},
                          "cls_head": {"n_heads": 4}}
     cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
-                         norm_epochs=1, max_epochs=3)
+                         warmup_epochs=1.0, max_epochs=3)
     cfg["autobatch"] = {"enabled": False}
     rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
     lut = {k: np.eye(3, dtype=np.float32)[rng.integers(0, 3, L)] for k in keys}
     # Stage 0 của §2.2 KHÔNG nạp Gemma: chỉ cần thay `decoder_width` (vốn đọc
-    # AutoConfig từ Hub) và nguồn ảnh. ResNet trong nhánh là THẬT.
+    # AutoConfig từ Hub) và nguồn ảnh. ViT trong nhánh là THẬT — chỉ `pretrained`
+    # bị ép về False khi DỰNG để selftest không tải mạng, còn khoá trong config
+    # vẫn là True nên guard "pretrained phải bật" của `run` đi qua thật.
     orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-            s0.ImageOnlyDataset.pixels)
+            s0.ImageOnlyDataset.pixels, R.vit_body)
+    R.vit_body = lambda arch, pretrained, image_size: orig[4](arch, False, image_size)
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})
     s0.assert_same_pixels = lambda *_a, **_k: None
@@ -674,27 +732,24 @@ def _():
             assert pushed == ["base"], pushed
             assert h["finished"] and h["best_epoch"] == 5 and h["base_epoch"] == 4
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            assert ph == [(1, "norm")] + [(e, "base") for e in range(2, 5)] \
+            assert ph == [(1, "warmup")] + [(e, "base") for e in range(2, 5)] \
                 + [(5, "anneal")], ph
             m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
             assert m["phase"] == "anneal"
             # lr_start: null -> lấy lr đỉnh của base; và chạy NỐI TIẾP thật
-            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 1e-5
+            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 3e-5
             assert m["anneal"]["lr_start_from_base_lr"] is True
             assert m["anneal"]["reset_optimizer"] is False
             assert m["optimizer_continued"] is True
             from safetensors.torch import load_file
             b5 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            # epoch 1 (norm) chỉ được phép đổi affine của InstanceNorm trong
-            # ResNet — conv phải y nguyên sau epoch ấy. Kiểm bằng một lượt
-            # chạy riêng dừng sau epoch 1.
+            # KHÔNG còn epoch đóng băng nào: ViT học ngay từ bước 0, chỉ ở lr
+            # riêng (`backbone_lr`). Nên sau epoch 1 trọng số ViT đã phải đổi.
             blk0 = R.SupervisedBlock(R.spec_from_cfg(cfg, D_MOD, L))
-            w0 = {k: v.clone() for k, v in blk0.state_dict().items()}
-            nrm = {id(x) for x in blk0.vextractor.norm_parameters()}
-            names = {n for n, x in blk0.vextractor.body.named_parameters()
-                     if id(x) in nrm}
-            assert names and all(n.endswith((".weight", ".bias")) for n in names)
-            del blk0, w0
+            assert any(t.requires_grad for t in blk0.vextractor.backbone_parameters())
+            gnames = [g["name"] for g in blk0.param_groups(3e-5, 1e-5)]
+            assert gnames == ["backbone", "rest"], gnames
+            del blk0
             f6 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
             assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 5 đã học
             assert s0.finished(cfg) is not None
@@ -720,7 +775,7 @@ def _():
             assert m3["optimizer_continued"] is False
     finally:
         (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-         s0.ImageOnlyDataset.pixels) = orig
+         s0.ImageOnlyDataset.pixels, R.vit_body) = orig
 
 
 @check("15b. decoder_width: đọc hidden_size từ AutoConfig (không tải trọng số); mọi hf_token() gọi KHÔNG tham số")
@@ -782,7 +837,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. lịch epoch 6 (final): NỐI TIẾP, cosine 1e-5 -> 1e-7 trong 200 bước, giữ moment")
+@check("16. lịch epoch 8 (final): NỐI TIẾP, `rest` cosine 3e-5 -> 1e-7 / 200 bước, backbone phẳng")
 def _():
     import torch
 
@@ -791,7 +846,7 @@ def _():
 
     scfg = s0.s0cfg(load_config(ROOT / "configs/vextractor.yaml"))
     fa = scfg["final_anneal"]
-    assert fa == {"enabled": True, "epochs": 1, "lr_start": 1e-5,
+    assert fa == {"enabled": True, "epochs": 1, "lr_start": 3e-5,
                   "lr_start_from_base_lr": True, "lr_end": 1e-7,
                   "schedule": "cosine", "weight_decay": 0.03,
                   "reset_optimizer": False}, fa
@@ -802,8 +857,9 @@ def _():
     assert anneal_cfg({"lr": 5e-4, "final_anneal": {"lr_start": 2e-5}}
                       )["lr_start"] == 2e-5                       # khai tay thì giữ
     # cosine là hàm THUẦN của bước — cùng công thức CosineAnnealingLR
-    lrs = [s0.anneal_lr_at(k, 200, fa)["rest"] for k in range(201)]
-    assert abs(lrs[0] - 1e-5) < 1e-15 and abs(lrs[-1] - 1e-7) < 1e-15
+    lrs = [s0.anneal_lr_at(k, 200, fa, scfg["backbone_lr"])["rest"]
+           for k in range(201)]
+    assert abs(lrs[0] - 3e-5) < 1e-15 and abs(lrs[-1] - 1e-7) < 1e-15
     assert all(a >= b for a, b in zip(lrs, lrs[1:]))
     ref = torch.optim.lr_scheduler.CosineAnnealingLR(
         torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=fa["lr_start"]),
@@ -816,8 +872,22 @@ def _():
     assert all(abs(a - b) < 1e-15 for a, b in zip(lrs, got))
     # nối tiếp = lr KHÔNG nhảy nấc ở ranh giới epoch: bước cuối của base cũng 1e-5
     assert abs(lrs[0] - scfg["lr"]) < 1e-15
-    # cả HAI nhóm cùng đi xuống ở epoch final (norm không còn lr riêng)
-    assert s0.anneal_lr_at(7, 200, fa)["norm"] == s0.anneal_lr_at(7, 200, fa)["rest"]
+    # backbone KHÔNG tham gia anneal: 1e-5 phẳng ở MỌI bước của epoch final
+    bb = [s0.anneal_lr_at(k, 200, fa, scfg["backbone_lr"])["backbone"]
+          for k in (0, 7, 100, 200)]
+    assert bb == [scfg["backbone_lr"]] * 4 == [1e-5] * 4, bb
+
+    # ── phần base: backbone phẳng, `rest` ramp tuyến tính theo BƯỚC ────────
+    spe = 200
+    b = [s0.base_lr_at(k, scfg, spe) for k in (0, 99, 199, 200, 1399)]
+    assert all(abs(x["backbone"] - 1e-5) < 1e-15 for x in b)   # phẳng suốt base
+    assert abs(b[0]["rest"] - 3e-5 / spe) < 1e-15              # bước 0 của warm-up
+    assert abs(b[1]["rest"] - 3e-5 * 100 / spe) < 1e-15        # giữa warm-up
+    assert abs(b[2]["rest"] - 3e-5) < 1e-15                    # hết epoch 1 = đỉnh
+    assert abs(b[3]["rest"] - 3e-5) < 1e-15 and abs(b[4]["rest"] - 3e-5) < 1e-15
+    # warm-up chiếm TRỌN epoch đầu; 7 epoch base + 1 final = 8
+    assert scfg["n_warmup_epochs"] == 1 and scfg["base_epochs"] == 7
+    assert scfg["base_epochs"] + fa["epochs"] == 8
 
 
 @check("17. bố cục CŨ (chỉ có final/ = epoch cuối của base): nhận làm base/, không pretrain lại")

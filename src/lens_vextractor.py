@@ -151,12 +151,17 @@ def load_arm(cfg: Cfg, adapter_dir: Path):
     return model, processor, gemma, branch, stats
 
 
-def encode(cfg: Cfg, processor, item: dict, image_size: int = 512):
+def encode(cfg: Cfg, processor, item: dict, image_size: int = 448,
+           normalize=None):
     """Một mẫu: input_ids / labels / pixel_values / vext_pixels.
 
     Đúng đường của khâu train, CẢ HAI đường ảnh: `pixel_values` 896 cho Z và
-    `vext_pixels` 512² chuẩn hoá ImageNet cho nhánh.
+    `vext_pixels` 448² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh.
+    `normalize` = `branch.normalize`, tức mean/std ĐÚNG của checkpoint ViT.
     """
+    if normalize is None:
+        raise TrainUnusable("Lens cần `normalize=(mean, std)` của backbone — "
+                            "truyền `branch.normalize`.")
     df = pd.DataFrame([{"key": item["key"], "ref": item["ref"],
                         "image_path": item["image_path"]}])
     img_kw = imaging.configure_processor(processor, cfg, verify=False)
@@ -166,7 +171,8 @@ def encode(cfg: Cfg, processor, item: dict, image_size: int = 512):
     if enc is None:
         raise TrainUnusable("mẫu Lens không mã hoá được (prompt dài hơn max_seq_len?).")
     out = {k: (v.unsqueeze(0) if k != "pixel_values" else v) for k, v in enc.items()}
-    out["vext_pixels"] = RCV.vext_tensor(item["image_path"], int(image_size))
+    out["vext_pixels"] = RCV.vext_tensor(item["image_path"], int(image_size),
+                                         normalize[0], normalize[1])
     return out
 
 
@@ -563,7 +569,8 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
         raise TrainUnusable(
             f"{bid} không có nhánh V-Extractor (train_stats.uses_vextractor = false) — "
             f"Lens của §2.2 mổ chính Q, không có Q thì không có gì để mổ.")
-    batch = encode(cfg, processor, item, image_size=branch.image_size)
+    batch = encode(cfg, processor, item, image_size=branch.image_size,
+                   normalize=branch.normalize)
     res = analyze(cfg, model, gemma, branch, batch, lc["target"])
     tops = decode_top(processor, logit_lens(model, gemma, res["hidden_last"],
                                             lc["top_k"]))

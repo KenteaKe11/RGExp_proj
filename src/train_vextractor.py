@@ -37,10 +37,10 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
-Chuỗi vào decoder DÀI THÊM `n_query` (256) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 256/(độ dài chuỗi) CỘNG một lượt ResNet50 ở 512²
-cho mỗi ảnh — nhánh của §2.2 nặng hơn nhánh của §2.1 hẳn một bậc vì nó có
-encoder riêng chứ không đi nhờ đặc trưng đã tính sẵn.
+Chuỗi vào decoder DÀI THÊM `n_query` (128) token, nên B tốn VRAM và thời gian
+mỗi bước nhiều hơn A ở mức 128/(độ dài chuỗi) CỘNG một lượt ViT-Small/16 ở 448²
+cho mỗi ảnh — nhánh của §2.2 nặng hơn nhánh của §2.1 vì nó có encoder riêng chứ
+không đi nhờ đặc trưng đã tính sẵn.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -88,21 +88,28 @@ class VExtReportDataset(ClsReportDataset):
     """
 
     def __init__(self, df, processor, cfg, max_len, cls_pack, img_kw=None,
-                 image_size: int = 512):
+                 image_size: int = 448, normalize=None):
         super().__init__(df, processor, cfg, max_len, cls_pack, img_kw)
         self.image_size = int(image_size)
+        # (mean, std) của CHECKPOINT backbone — lấy từ `branch.normalize`, tức
+        # từ META của nhánh, chứ KHÔNG từ config hiện tại: ảnh lúc fine-tune
+        # phải chuẩn hoá y như ảnh lúc Stage 0 pretrain.
+        if normalize is None:
+            raise ValueError("VExtReportDataset cần `normalize=(mean, std)` của "
+                             "backbone — truyền `branch.normalize`.")
+        self.mean, self.std = (tuple(normalize[0]), tuple(normalize[1]))
 
     @staticmethod
-    def vext_of(image_path, image_size: int):
+    def vext_of(image_path, image_size: int, mean, std):
         """Điểm vào DUY NHẤT dựng ảnh của nhánh (Stage 0 gọi lại chính nó)."""
-        return RCV.vext_tensor(image_path, int(image_size))
+        return RCV.vext_tensor(image_path, int(image_size), mean, std)
 
     def _encode(self, i: int):
         item = super()._encode(i)
         if item is None:
             return item
         item["vext_pixels"] = self.vext_of(self.df.iloc[i]["image_path"],
-                                           self.image_size)[0]
+                                           self.image_size, self.mean, self.std)[0]
         return item
 
 
@@ -290,8 +297,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     branch.set_frozen(frozen_until > 0)
     nb = branch.n_params()
     print(f"  nhánh: {branch.describe()}", flush=True)
-    print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (ResNet "
-          f"{nb['resnet']:,}, ngoài ResNet {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
+    print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (ViT "
+          f"{nb['backbone']:,}, ngoài ViT {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
           f"(epoch {pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
           f"{pre['dropped']}) · {'ĐÓNG BĂNG' if frozen_until > 0 else 'học ngay'} "
           f"{frozen_until:g} epoch đầu", flush=True)
@@ -299,7 +306,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # ── dữ liệu: y như A ─────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
     ds = VExtReportDataset(train_df, processor, cfg, max_len, None, img_kw,
-                           image_size=branch.image_size)
+                           image_size=branch.image_size,
+                           normalize=branch.normalize)
     pad_id = int(processor.tokenizer.pad_token_id or 0)
     n = len(ds)
     steps = total_steps(n, bs, accum, int(tcfg.get("n_epochs", 1)))
@@ -337,8 +345,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
 
     def _probe(k: int) -> None:
         # Dò ở trạng thái NẶNG nhất sẽ gặp: khi V-Extractor được mở băng giữa
-        # chừng thì activation của ResNet50 ở 512² cũng phải vừa VRAM — và đó là
-        # phần nặng nhất của nhánh, nặng hơn hẳn 256 token thêm vào chuỗi.
+        # chừng thì activation của ViT-Small ở 448² (784 patch) cũng phải vừa
+        # VRAM — và đó là phần nặng nhất của nhánh, nặng hơn hẳn 128 token thêm
+        # vào chuỗi.
         was = branch.frozen
         if will_unfreeze:
             branch.set_frozen(False)
@@ -437,7 +446,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     vds = vpf = None
     if ev_on:
         vds = VExtReportDataset(val_df, processor, cfg, max_len, None, img_kw,
-                                image_size=branch.image_size)
+                                image_size=branch.image_size,
+                                normalize=branch.normalize)
         vpf = OrderedPrefetcher(vds.__getitem__, 1 if use_pf else 0, post=_post)
 
     def _run_eval(eval_idx: int, step_no: int) -> None:

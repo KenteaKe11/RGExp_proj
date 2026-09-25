@@ -20,7 +20,7 @@ Hai candidate:
      — chỉ khi TEM khớp (vân tay config, sha256 weight, batch sinh, đủ mẫu).
   B  `vextractor_exp.candidate` = A + V-Extractor: Stage 0 rồi main stage trên ĐÚNG
      fixture/lịch của A (`src/train_vextractor.py`), chuỗi vào decoder dài thêm
-     `vextractor.vextractor.image_size` (512² -> 256 ô) token.
+     `vextractor.vextractor.n_query` (128) token.
 
 Mã thoát: 0 xong · 1 thiếu kết quả · 2 cấu hình sai / fixture lệch · 3 train
           hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng
@@ -402,10 +402,9 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"]["n_test"], cfg["data"]["n_train"], cfg["data"]["n_val"] = 8, 16, 8
         cfg["train"]["eval"] = dict(cfg["train"].get("eval") or {}, n_samples=4,
                                     every_steps=2)
-        # Giữ NGUYÊN `norm_epochs`: epoch norm (ResNet đóng băng trừ InstanceNorm)
-        # rồi mở băng là đúng phần code mới nhất của §2.2 — dry-run phải đi qua
-        # nó. `warmup_epochs = 0` để lr không còn phụ thuộc số bước của lần chạy
-        # thật (dry-run chỉ chạy vài bước mỗi epoch).
+        # `warmup_epochs = 0` để lr không còn phụ thuộc số bước của lần chạy
+        # thật (dry-run chỉ chạy vài bước mỗi epoch) — và để phần base rút còn
+        # ĐÚNG 1 epoch: `base_epochs = ceil(warmup_epochs) + max_epochs`.
         cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, warmup_epochs=0.0)
         cfg["stats"] = dict(cfg["stats"], n_perm=200, n_boot=200)
         cfg["output"] = dict(cfg["output"], push=False, pull=False,
@@ -567,7 +566,8 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
             pull_stage0(cfg, base_only=True)
     if a.refinal and s0.base_finished(cfg) is None:
         # Dừng TRƯỚC khi nạp base 4B + dò autobatch (mất vài phút) thay vì sau.
-        _nb = (int(cfg["stage0"].get("norm_epochs", 0))
+        import math as _m
+        _nb = (_m.ceil(float(cfg["stage0"].get("warmup_epochs", 0.0)))
                + int(cfg["stage0"]["max_epochs"]))
         print(f"✗ `--refinal` cần base/ ({_nb} epoch) khớp vân "
               f"tay, nhưng máy này không có và cũng không kéo được từ Hub "

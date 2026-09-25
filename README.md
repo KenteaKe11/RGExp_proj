@@ -2,8 +2,8 @@
 
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-cùng loader, cùng 3000 ảnh test), rồi **nối thêm 256 vector** từ một **encoder
-thị giác RIÊNG** — **Q = V-Extractor(ảnh 512²)** — ngay sau 256 token ảnh, thì
+cùng loader, cùng 3000 ảnh test), rồi **nối thêm 128 vector** từ một **encoder
+thị giác RIÊNG** — **Q = V-Extractor(ảnh 448²)** — ngay sau 256 token ảnh, thì
 chất lượng báo cáo X-quang có đổi không?
 
 | candidate | nguồn | chuỗi vào decoder |
@@ -12,7 +12,7 @@ chất lượng báo cáo X-quang có đổi không?
 | **B** `qlora_r32_decoder_vextractor` | §2.2 — Stage 0 → main stage y hệt A + nhánh | `[Z ‖ Q ‖ text]` |
 
 **Biến duy nhất là chuỗi vào decoder.** Z (256 token ảnh) **không bị đụng vào**;
-B chỉ có thêm 256 vị trí nằm ngay sau khối ảnh. 256 vị trí ấy có nhãn `-100`,
+B chỉ có thêm 128 vị trí nằm ngay sau khối ảnh. 128 vị trí ấy có nhãn `-100`,
 `attention_mask = 1`, `token_type_ids = 0` — nên **số token vào CE không đổi** và
 CE của A với B vẫn là cùng một đại lượng. Q mang sẵn thông tin Stage 0 ngay từ
 bước đầu của main stage — đó chính là việc Stage 0 sinh ra để làm. Mọi khoá
@@ -24,9 +24,9 @@ kiểm, `train` dừng nếu lệch).
 > **Khác §2.1 Recovery ở đúng một chỗ, và nó là chỗ quan trọng nhất.** §2.1 rút
 > Q ra từ chính X của SigLIP, nên nó chỉ hỏi được *"có rút thêm được gì từ X mà
 > projector đã bỏ sót không"*. §2.2 cho nhánh một **encoder của riêng nó** —
-> ResNet50 ImageNet ăn thẳng ảnh gốc — nên câu hỏi thành: *một encoder học từ
-> ImageNet (chứ không phải từ web image–text) có mang vào thứ SigLIP không có
-> không*. §2.1 đã đóng: code ở `_archive/recovery/`, README ở
+> ViT-Small/16 pretrain ImageNet-1k ăn thẳng ảnh gốc — nên câu hỏi thành: *một
+> encoder học từ ImageNet-1k (chứ không phải từ web image–text) có mang vào thứ
+> SigLIP không có không*. §2.1 đã đóng: code ở `_archive/recovery/`, README ở
 > `_archive/README_2.1_Recovery.md`. §2.0 Recombiner ở `_archive/zrecomb/`.
 
 ## Kiến trúc (`src/vextractor.py`)
@@ -34,97 +34,117 @@ kiểm, `train` dừng nếu lệch).
 ```
                   ┌─► SigLIP (đóng băng) ─► projector ─► Z (256, 2560)   [đường của A]
 ảnh ──────────────┤
-                  └─► resize 512×512, chuẩn hoá ImageNet                 [đường RIÊNG của nhánh]
+                  └─► resize 448×448, chuẩn hoá theo pretrained_cfg  [đường RIÊNG của nhánh]
                          │
-                      ResNet50 (ImageNet, BN→InstanceNorm)  ─► (2048, 16, 16)
-                         │
-                      flatten + permute                     ─► (256, 2048)
-                         │
-                      z = Linear 2048→2560                  ──────────┐  (skip)
-                         │                                            │
-                      Q = z + Self-attn(RMSNorm(z))  ◄────────────────┘  -> (256, 2560)
+                      ViT-Small/16 (ImageNet-1k)   ─► forward_features, bỏ cls
+                         │                            ─► (784, 384)
+                      Linear 384→2048 ─► RMSNorm(2048) ──────────────┐   (K, V)
+                                                                     │
+   128 learner Q ─► RMSNorm(2048) ─► Self-attn ─┬──────────────┐     │
+                                                │              │     │
+                                          RMSNorm(2048) ─► CrossAttn ┘
+                                                │              │
+                                                └──► (+) ◄─────┘   (skip từ Self-attn)
+                                                      │
+                                           MLP(GeLU) 2048→4096→2560
+                                                      │
+                                                      ▼   Q (128, 2560)
 
 Q ─► Cls Head (CHỈ Stage 0): RMSNorm(2560) -> Attn-Pooling -> Linear 2560 → 14·3 -> ASL
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**`n_query` không khai được**: nó là `(image_size/32)² = 256` — số ô của lưới
-conv cuối. Lưới 16×16 ĐÃ là 256 vector, đúng bằng số cần có, nên §2.2 **không
-còn learner vector và không còn Cross-Attn**: cái thay chỗ chúng là chính ResNet.
-Self-attn ở đây chỉ để 256 ô — vốn chỉ thấy vùng lân cận của mình qua conv —
-nói chuyện được với nhau trước khi decoder đọc. Head_dim 128 (20 head ở 2560),
-không MLP, residual cộng thẳng. Tham số nhánh để fp32, chạy dưới autocast bf16.
+**`n_query` là khoá khai tường minh** (`vextractor.vextractor.n_query = 128`) —
+khác bản ResNet50 cũ, nơi nó bị ép bằng `(image_size/32)²`. Lưới patch của ViT ở
+448² là **784 ô**, quá dài để nối vào chuỗi decoder, nên nó là **nguồn để hỏi**
+chứ không phải khối Q: 128 learner vector đi hỏi nó qua **Cross-Attn** và nén
+lại. Self-attn chạy **trước** Cross-Attn và trên **riêng** các learner vector —
+128 câu hỏi thống nhất với nhau trước, rồi mới cùng đi đọc ảnh. Residual cộng
+đầu ra Self-attn vào đầu ra Cross-Attn (đúng một dấu `+` trong hình).
 
-**BatchNorm → InstanceNorm.** Trọng số ImageNet đi kèm **thống kê chạy của
-ImageNet**, mà ảnh X-quang ngực không cùng phân phối với ảnh ImageNet. Giữ BN
-thì hai chuyện xấu cùng xảy ra: thống kê cũ làm lệch mọi activation ngay ở bước
-0, và ở micro-batch nhỏ (một nhánh chạy cạnh model 4B) thống kê theo batch lại
-quá nhiễu. InstanceNorm chuẩn hoá **theo từng ảnh**, không có thống kê chạy, nên
-nó không mang theo ImageNet và không phụ thuộc kích thước batch; forward ở train
-và ở eval là cùng một phép tính. Phần **affine (weight/bias) được chép từ BN** —
-nó vẫn là thứ ResNet đã học.
+**Thân nhánh ở 2048, chỉ MLP cuối nở ra 2560.** `d_branch = 2048` giữ hai khối
+attention nhẹ (head_dim 128 → 16 head); **MLP(GeLU) 2048→4096→2560** là chỗ
+**duy nhất** đổi chiều sang `d_model` của decoder. Tham số nhánh để fp32, chạy
+dưới autocast bf16.
 
-**Đường ảnh thứ hai.** Mỗi batch mang thêm `vext_pixels` (3, 512, 512) chuẩn hoá
-theo **mean/std của ImageNet** (không phải của processor Gemma: trọng số pretrain
-chỉ đúng với phân phối nó được học). `vextractor.vext_tensor()` là chỗ **duy
-nhất** dựng nó — Stage 0, main stage, sinh và Lens đều gọi đúng hàm ấy, và
-`assert_same_pixels` kiểm lại trên một mẫu thật mỗi lần chạy.
+**Không còn BatchNorm → InstanceNorm.** ViT không có BatchNorm: chuẩn hoá của nó
+là LayerNorm, tính theo **từng token của từng ảnh**, không mang theo thống kê
+chạy của ImageNet. Toàn bộ khối `bn_to_instance` của bản ResNet50 — cùng **epoch
+"norm"** sinh ra để kéo thống kê ấy về ảnh CXR — vì thế biến mất khỏi §2.2.
+
+**Đường ảnh thứ hai, và mean/std ĐÚNG của checkpoint.** Mỗi batch mang thêm
+`vext_pixels` (3, 448, 448). Chuẩn hoá **không** phải mean/std của ImageNet gõ
+tay: nó được hỏi từ **`timm.get_pretrained_cfg(arch).mean/std`** rồi đóng vào
+`spec.vextractor.normalize` của mọi checkpoint — checkpoint ViT ImageNet-1k họ
+AugReg dùng **0.5/0.5**, nên một cặp số gõ tay ở đây là sai **lặng lẽ**, không
+có shape nào hỏng. `vextractor.vext_tensor()` là chỗ **duy nhất** dựng ảnh ấy và
+nó **bắt buộc** phải nhận mean/std (không có mặc định); `_check_normalize` so
+spec với `pretrained_cfg` của model vừa dựng, và `assert_same_pixels` kiểm lại
+trên một mẫu thật mỗi lần chạy.
 
 | khối | tham số |
 |---|---|
-| ResNet50 (cắt avgpool + fc, BN→InstanceNorm) | ~23,5 M |
-| ├─ affine của InstanceNorm (nhóm "norm" của Stage 0) | ~53 K |
-| `Linear 2048→2560` | 5,25 M |
-| Self-attn @2560 | 26,2 M |
-| **V-Extractor** | **~55 M** |
+| ViT-Small/16 @448 (cắt head) | 21,9 M |
+| `Linear 384→2048` | 788 K |
+| 128 learner Q | 262 K |
+| Self-attn @2048 | 16,8 M |
+| Cross-attn @2048 | 16,8 M |
+| `MLP(GeLU) 2048→4096→2560` | 18,9 M |
+| **V-Extractor** | **75,4 M** |
 | Cls Head (chỉ Stage 0) | 26,3 M |
-| **Stage 0 tổng** | **~81 M** |
+| **Stage 0 tổng** | **~102 M** |
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
-Đặt Q trước Z thì 256 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
+Đặt Q trước Z thì 128 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
 lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) và
 `recombiner.image_end_indices(ids) + 1` (khâu sinh, đệm trái — mỗi hàng một chỗ).
 
 ## Lịch
 
 **Stage 0: pretrain V-Extractor** (`src/stage0_vextractor.py`). **Không nạp
-Gemma**: nhánh có encoder riêng, nên cả lượt pretrain chỉ là ResNet50 + một khối
-attention — rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là `d_model`
-(2560) và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
+Gemma**: nhánh có encoder riêng, nên cả lượt pretrain chỉ là ViT-Small + hai
+khối attention — rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
+`d_model` (2560) và nó được đọc từ `AutoConfig` (một file json, không tải trọng
+số).
 
 ```
-ảnh 512² (ImageNet norm) ─► ResNet50 ─► Q ─► Cls Head ─► ASL (14 × 3)
+ảnh 448² (mean/std của checkpoint) ─► ViT-S ─► 128 learner Q ─► Cls Head ─► ASL (14 × 3)
 ```
 
 Thứ bị ép mang đủ thông tin bệnh lý là **chính khối Q** mà main stage sẽ nối vào
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor, không đọc lưới
-ResNet thô rồi vứt đi.
+patch thô rồi vứt đi.
 
-**Lịch: 1 + 4 + 1 = 6 epoch**, AdamW hai nhóm tham số (`norm` = affine của
-InstanceNorm trong ResNet; `rest` = mọi thứ còn lại), wd 0.03.
+**Hai nhóm tham số, và chúng KHÔNG dùng chung một lr** (AdamW, wd 0.03):
 
-* **Epoch 1 — "norm"**: conv/fc của ResNet **đóng băng**, chỉ affine của
-  InstanceNorm học, ở **`norm_lr` = 1e-4**. Phần **ngoài** ResNet (Linear,
-  Self-attn, Cls Head) vẫn học ở **`lr` = 1e-5**. Việc của epoch này là kéo
-  thống kê chuẩn hoá từ ImageNet về phân phối ảnh CXR — một phép dịch/scale trên
-  mỗi kênh, đi nhanh được vì nó không đụng tới đặc trưng conv. Không đóng băng
-  hẳn phần ngoài ResNet vì khi đó ASL đang dạy norm qua một Cls Head ngẫu nhiên
-  chưa biết gì.
-* **Epoch 2–5 — "base"**: mở băng **toàn bộ** ResNet. Cả hai nhóm về **cùng
-  `lr` = 1e-5**, có **warm-up tuyến tính theo BƯỚC** trong `warmup_epochs`
-  (0.25) epoch đầu của phần này = 50/200 bước, rồi giữ phẳng. `norm_lr` cao là
-  để norm đuổi kịp trong epoch đầu, không phải một lr vĩnh viễn: giữ 1e-4 trên
-  affine trong lúc conv học ở 1e-5 nghĩa là conv suốt ngày phải đuổi theo một
-  phép chuẩn hoá đang dịch dưới chân nó. Epoch norm nằm **ngoài** `max_epochs` —
-  `base = norm_epochs + max_epochs = 5`. Luôn lấy epoch cuối
+| nhóm | gồm | lr |
+|---|---|---|
+| `backbone` | ViT-Small/16 (đã pretrain ImageNet-1k) | **`backbone_lr` = 1e-5, PHẲNG suốt Stage 0** |
+| `rest` | Linear vào · 128 learner Q · Self/Cross-attn · MLP · Cls Head | **`lr` = 3e-5 lr_max**, warm-up rồi anneal |
+
+Cho ViT đi cùng 3e-5 là đẩy một backbone đã hội tụ bằng gradient của một Cls Head
+còn ngẫu nhiên; cho phần mới đi cùng 1e-5 là bắt nó học chậm gấp ba mà không có
+lý do nào. ViT chỉ **fine-tune phần đã pretrain**, nên nó không tham gia
+one-cycle nào cả — kể cả epoch final.
+
+**Lịch: 1 + 6 + 1 = 8 epoch.**
+
+* **Epoch 1 — "warmup"**: nhóm `rest` **ramp tuyến tính theo BƯỚC** từ 0 lên
+  `lr` = 3e-5 trong `warmup_epochs` (1.0) epoch = 200/200 bước; backbone đã ở
+  1e-5 ngay từ bước 0. **Không còn epoch "norm"** của bản ResNet50: ViT không có
+  BatchNorm nên không có thống kê chạy nào cần kéo về phân phối ảnh CXR.
+* **Epoch 2–7 — "base"**: nhóm `rest` giữ **phẳng ở 3e-5**, backbone giữ 1e-5.
+  Warm-up chiếm **trọn** epoch đầu, nằm **ngoài** `max_epochs` —
+  `base = ceil(warmup_epochs) + max_epochs = 1 + 6 = 7`. Luôn lấy epoch cuối
   (`stage0.select: last`) -> `_stage0/base/`, **đẩy Hub ngay**.
-* **Epoch 6 — final weight** (`stage0.final_anneal`): chạy **nối tiếp** — giữ
+* **Epoch 8 — final weight** (`stage0.final_anneal`): chạy **nối tiếp** — giữ
   nguyên **moment AdamW** đã tích trong phần base, và `lr_start: null` lấy đúng
-  **`stage0.lr` (1e-5)** làm điểm xuất phát, nên lr **không nhảy nấc** ở ranh
-  giới epoch, nó chỉ bắt đầu đi xuống: **cosine 1e-5 → 1e-7** cập nhật mỗi bước
-  -> `_stage0/final/`, đẩy Hub. **Main stage dùng `final/`.** Đổi riêng khối
-  `final_anneal` thì chỉ chạy lại epoch 6 (base có vân tay riêng).
+  **`stage0.lr` (3e-5)** làm điểm xuất phát, nên lr của `rest` **không nhảy nấc**
+  ở ranh giới epoch, nó chỉ bắt đầu đi xuống: **cosine 3e-5 → 1e-7** cập nhật
+  mỗi bước, **backbone vẫn phẳng ở 1e-5** -> `_stage0/final/`, đẩy Hub.
+  **Main stage dùng `final/`.** Đổi riêng khối `final_anneal` thì chỉ chạy lại
+  epoch 8 (base có vân tay riêng).
 * lr là **hàm thuần của số bước** (`base_lr_at` / `anneal_lr_at`), không phải
   một đối tượng scheduler có trạng thái: chạy tiếp sau khi đứt chỉ cần biết đang
   ở bước nào.
@@ -161,8 +181,8 @@ trên 256 mẫu bốc lại mỗi 25 bước). Phần thêm:
   mới tinh sau Stage 0.
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: **256 token** thêm vào chuỗi **cộng** một lượt ResNet50 ở 512²
-  cho mỗi ảnh. Nhánh của §2.2 nặng hơn nhánh của §2.1 hẳn một bậc vì nó có
+* B nặng hơn A: **128 token** thêm vào chuỗi **cộng** một lượt ViT-Small/16 ở
+  448² (784 patch) cho mỗi ảnh. Nhánh của §2.2 nặng hơn nhánh của §2.1 vì nó có
   encoder riêng chứ không đi nhờ đặc trưng đã tính sẵn. Nếu batch đã khoá không
   vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo
   token; kết quả đúng bằng con số HF tính trên cả micro-batch, nên gradient
@@ -214,8 +234,8 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    heatmap: trục **Y là vị trí token** (đọc từ trên xuống đúng thứ tự trong
    chuỗi), trục **X là lớp** với chỉ số thật, trên **đủ mọi lớp** (34/34). Đường
    kẻ mờ + thanh màu bên trái chia ba vùng token: **Z** (xanh, 256 token ảnh),
-   **Q** (vàng, 256 vector của nhánh), rồi phần văn bản — so dải Q với dải Z là
-   câu hỏi chính: *decoder có thật sự đọc 256 vector mới không*. Kèm bảng 5 ô
+   **Q** (vàng, 128 vector của nhánh), rồi phần văn bản — so dải Q với dải Z là
+   câu hỏi chính: *decoder có thật sự đọc 128 vector mới không*. Kèm bảng 5 ô
    nhạy nhất (có nhãn `Z[i]` / `Q[k]` / `text`) và 8 vector Q được đọc nhiều nhất.
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. **[Language] Logit lens** — `ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` → top-k token,
@@ -228,8 +248,9 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
    nhau: (1) **ảnh gốc**; (2) **hoạt độ đầu ra SigLIP** `‖X_p − mean(X)‖` —
    KHÔNG gradient, không dính decoder, lưới 64²; (3) **Z**, `‖∂y/∂X‖` qua
    `y → Z → projector → X`, lưới 64²; (4) **Q**, `‖∂y/∂I‖` qua
-   `y → Q → V-Extractor → I` với I là **chính ảnh 512² của nhánh** — lưới 512²,
-   mịn hơn ô 3 tám lần mỗi chiều vì ResNet là conv nên gradient về tới tận pixel.
+   `y → Q → V-Extractor → I` với I là **chính ảnh 448² của nhánh** — lưới 448²,
+   mịn hơn ô 3 bảy lần mỗi chiều vì gradient của ViT về tới tận pixel qua
+   `patch_embed`.
    Ba câu hỏi xếp chồng: *đầu ra SigLIP có gì để học* → *adapter rút được gì qua
    đường cũ* → *encoder riêng của nhánh rút được gì*. Ô 2 trừ patch trung bình
    vì X có thành phần nền chung rất lớn ở mọi patch.
@@ -245,14 +266,14 @@ sánh định lượng (tương quan / IoU ở "Kiểm nhanh") gộp ô 4 về *
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **Q**, **số vector Q gánh 50% độ nhạy** (nhỏ =
-chỉ vài trong 256 vector làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
+chỉ vài trong 128 vector làm việc, phần còn lại gần như chết), `‖bản đồ Q‖ / ‖bản đồ
 encoder‖`, tương quan và IoU giữa hai bản đồ, cộng hai dòng về **hoạt độ đầu ra
 SigLIP** (max/mean, 10% patch nóng nhất gánh bao nhiêu) và tương quan của Z / Q
 với hoạt độ ấy.
 
 Đầu ra `runs/<subdir>/Lens/`: `Lens_Explain.md` (giải thích + bảng + hình),
 `figures/lens_layers.png`, `figures/lens_visual.png`, `logit_lens.csv`,
-`lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, `sal_vext` 512²,
+`lens_maps.npz` (`layer_sens`, `act_siglip`, `sal_z`, `sal_vext` 448²,
 `sal_vext_64`), `lens.json`. Lens cần **weight của B** trên máy và cần GPU —
 không kéo weight của A về nữa.
 
@@ -344,8 +365,9 @@ quả của B nếu tem khớp, nên không phải chạy lại phần đã có.
 configs/vextractor.yaml · configs/gpu/rtx3060.yaml (thêm stage0.micro_batch)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
-src/vextractor.py        V-Extractor (ResNet50 ImageNet, BN→InstanceNorm + Linear 2048→2560 +
-                         Self-attn) · vext_tensor (đường ảnh riêng) · Cls Head (đọc Q) ·
+src/vextractor.py        V-Extractor (ViT-S/16 ImageNet-1k + Linear 384→2048 + 128 learner Q
+                         + Self-attn + CrossAttn + MLP 2048→2560) · vext_tensor (đường ảnh
+                         riêng, mean/std của checkpoint) · Cls Head (đọc Q) ·
                          ASL theo tên lớp · metric Stage 0 · ghi/nạp
 src/stage0_vextractor.py Stage 0 (KHÔNG nạp Gemma) + loader.json + nhãn chụp lại
 src/train_vextractor.py  main stage của B (vòng lặp chép từ train_recomb._train_once, nối Q)

@@ -1,29 +1,37 @@
 """Stage 0 — pretrain Supervised Block (V-Extractor + Cls Head) trước main stage.
 
-    ảnh 512² ─► ResNet50 (ImageNet, BN→InstanceNorm) ─► Q ─► Cls Head ─► ASL (14 × 3)
+    ảnh 448² ─► ViT-Small/16 (ImageNet-1k) ─► 128 learner Q ─► Cls Head ─► ASL (14 × 3)
 
 Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor. Main stage nạp
 nguyên `vextractor.*` và bỏ Cls Head.
 
 KHÁC §2.1: Stage 0 ở đây KHÔNG nạp Gemma. Nhánh có encoder thị giác của riêng
-nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ResNet50 +
-một khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
+nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ViT-Small/16 +
+hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
 `d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
 config, không tải trọng số).
 
-Lịch (khối `stage0` của configs/vextractor.yaml) — 1 + 4 + 1 = 6 epoch:
+HAI nhóm tham số, và chúng KHÔNG dùng chung một lr:
 
-  * **epoch 1 — "norm"**: conv/fc của ResNet ĐÓNG BĂNG, chỉ affine của
-    InstanceNorm học, ở `norm_lr` = 1e-4. Phần NGOÀI ResNet (Linear, Self-attn,
-    Cls Head) vẫn học ở `lr` = 1e-5. Việc của epoch này là kéo thống kê chuẩn
-    hoá từ ImageNet về phân phối ảnh CXR — một phép dịch/scale trên mỗi kênh, đi
-    nhanh được vì nó không đụng tới đặc trưng conv;
-  * **epoch 2–5 — "base"**: mở băng TOÀN BỘ ResNet. Cả hai nhóm về cùng `lr`
-    = 1e-5, có warm-up tuyến tính theo BƯỚC trong `warmup_epochs` (0.25) epoch
-    đầu của phần này rồi giữ phẳng. weight_decay 0.03;
-  * **epoch 6 — "anneal"**: chạy NỐI TIẾP (giữ moment AdamW), lr cosine từ `lr`
-    xuống `final_anneal.lr_end` (1e-7) -> `final/`;
+  * **backbone** — ViT-Small/16 đã pretrain ImageNet-1k. Nó chỉ cần fine-tune,
+    nên lr của nó là `stage0.backbone_lr` = 1e-5 và PHẲNG suốt Stage 0: không
+    warm-up (không có gì để warm lên), không anneal (nó vốn đã đi chậm);
+  * **rest** — Linear vào, 128 learner Q, Self-attn, Cross-attn, MLP, Cls Head:
+    khởi tạo ngẫu nhiên, nên đây mới là phần đi theo lịch `stage0.lr` (lr_max
+    3e-5) với warm-up rồi anneal.
+
+Lịch (khối `stage0` của configs/vextractor.yaml) — 1 + 6 + 1 = 8 epoch:
+
+  * **epoch 1 — "warmup"**: nhóm `rest` ramp tuyến tính theo BƯỚC từ 0 lên
+    `lr` = 3e-5 trong `warmup_epochs` (1.0) epoch; backbone đã ở 1e-5 ngay từ
+    bước 0. KHÔNG còn epoch "norm" của bản ResNet50: ViT không có BatchNorm nên
+    không có thống kê chạy nào cần kéo về phân phối ảnh CXR;
+  * **epoch 2–7 — "base"**: nhóm `rest` giữ phẳng ở `lr` = 3e-5, backbone giữ
+    1e-5. weight_decay 0.03;
+  * **epoch 8 — "anneal"**: chạy NỐI TIẾP (giữ moment AdamW), nhóm `rest` cosine
+    từ `lr` xuống `final_anneal.lr_end` (1e-7); backbone VẪN phẳng ở 1e-5
+    -> `final/`;
   * LUÔN lấy epoch CUỐI (`stage0.select: last`) — val chỉ để theo dõi;
   * sau MỖI epoch đo trên ĐÚNG MỘT tập 256 mẫu CỐ ĐỊNH bốc từ hồ val 2000
     (`stage0.val_n_samples`, `val_resample: false` — chỉ số chỉ phụ thuộc seed):
@@ -74,22 +82,21 @@ def stage0_dir(cfg: Cfg) -> Path:
 
 def s0cfg(cfg: Cfg) -> dict:
     s = dict(cfg.get("stage0") or {})
-    out = {"lr": float(s.get("lr", 1e-5)),          # lr CHÍNH của cả nhánh
-           # Epoch "norm": conv đóng băng, CHỈ affine của InstanceNorm học, ở lr
-           # riêng và cao hơn hẳn. Nằm NGOÀI `max_epochs` — base = norm + max.
-           "norm_epochs": int(s.get("norm_epochs", 1)),
-           "norm_lr": float(s.get("norm_lr", 1e-4)),
-           # Warm-up tuyến tính theo BƯỚC, tính từ đầu phần MAIN (sau epoch
-           # norm), đơn vị = epoch. 0.25 epoch = 50/200 bước.
-           "warmup_epochs": float(s.get("warmup_epochs", 0.25)),
+    out = {"lr": float(s.get("lr", 3e-5)),          # lr_max của nhóm `rest`
+           # ViT-Small đã pretrain ImageNet-1k: fine-tune ở lr RIÊNG, thấp hơn
+           # và PHẲNG suốt Stage 0 (không warm-up, không anneal).
+           "backbone_lr": float(s.get("backbone_lr", 1e-5)),
+           # Warm-up tuyến tính theo BƯỚC của nhóm `rest`, tính từ bước 0, đơn
+           # vị = epoch. 1.0 epoch = 200/200 bước — đúng một epoch warmup.
+           "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
            "weight_decay": float(s.get("weight_decay", 0.03)),
-           "max_epochs": int(s.get("max_epochs", 4)),   # epoch CHÍNH, sau epoch norm
+           "max_epochs": int(s.get("max_epochs", 6)),   # epoch CHÍNH, sau warmup
            "batch_size": int(s.get("batch_size", 32)),
            "micro_batch": int(s.get("micro_batch", 16) or 16),
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ResNet50), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
+           # NÀO CẢ (chỉ ViT-Small), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
            # quá nhỏ và luôn ra micro thấp hơn hẳn mức máy chịu được.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
@@ -103,14 +110,17 @@ def s0cfg(cfg: Cfg) -> dict:
            "asl": dict(s.get("asl") or {}),
            "final_anneal": anneal_cfg(s)}
     Z.asl_gammas(out["asl"])            # kiểm sớm
-    if out["norm_epochs"] < 0 or out["max_epochs"] < 1:
-        raise TrainUnusable(
-            f"stage0.norm_epochs {out['norm_epochs']} phải >= 0 và "
-            f"stage0.max_epochs {out['max_epochs']} phải >= 1.")
+    if out["max_epochs"] < 1:
+        raise TrainUnusable(f"stage0.max_epochs {out['max_epochs']} phải >= 1.")
     if out["warmup_epochs"] < 0:
         raise TrainUnusable(f"stage0.warmup_epochs {out['warmup_epochs']} phải >= 0.")
-    # Tổng phần base. `max_epochs` là số epoch CHÍNH; epoch norm cộng THÊM vào đầu.
-    out["base_epochs"] = out["norm_epochs"] + out["max_epochs"]
+    if out["backbone_lr"] <= 0:
+        raise TrainUnusable(f"stage0.backbone_lr {out['backbone_lr']} phải > 0.")
+    # Tổng phần base. `max_epochs` là số epoch CHÍNH; warm-up chiếm TRỌN các
+    # epoch đầu của nó (làm tròn LÊN: 1.0 -> 1 epoch) và cộng THÊM vào đầu, nên
+    # 1 warmup + 6 main = 7 epoch base. Warm-up vẫn ramp theo BƯỚC bên trong.
+    out["n_warmup_epochs"] = int(math.ceil(out["warmup_epochs"]))
+    out["base_epochs"] = out["n_warmup_epochs"] + out["max_epochs"]
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
         raise TrainUnusable(f"stage0.micro_batch {out['micro_batch']} không chia "
                             f"hết stage0.batch_size {out['batch_size']}")
@@ -126,31 +136,33 @@ def s0cfg(cfg: Cfg) -> dict:
 def base_lr_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
     """lr của HAI nhóm tại bước `step` (0-based, tính từ đầu phần base).
 
-        epoch norm  (step < norm_epochs × spe):  norm = norm_lr,  rest = lr
-        epoch main:                              cả hai = lr · min(1, t/w)
+        backbone (ViT, đã pretrain ImageNet-1k):  backbone_lr — PHẲNG
+        rest     (Linear, learner Q, attn, MLP, Cls Head):  lr · min(1, t/w)
 
-    Hai nhóm về CÙNG một lr ngay khi ResNet được mở băng: `norm_lr` cao là để
-    norm đuổi kịp trong epoch đầu, không phải một lr vĩnh viễn — giữ 1e-4 trên
-    affine trong lúc conv học ở 1e-5 nghĩa là conv suốt ngày phải đuổi theo một
-    phép chuẩn hoá đang dịch dưới chân nó.
+    Hai nhóm KHÔNG bao giờ gặp nhau ở một con số: ViT chỉ fine-tune, phần mới
+    thì phải học từ đầu. Cho ViT đi cùng lr_max 3e-5 là đẩy một backbone đã hội
+    tụ bằng gradient của một Cls Head còn ngẫu nhiên; cho phần mới đi cùng 1e-5
+    là bắt nó học chậm gấp ba mà không có lý do nào.
 
-    Warm-up tính theo BƯỚC chứ không theo epoch: 0.25 epoch = 50 bước, còn theo
-    epoch thì nó chỉ là một nấc duy nhất. `warmup_epochs = 0` -> phẳng ngay.
+    Warm-up tính theo BƯỚC chứ không theo epoch: 1.0 epoch = 200 bước ramp
+    tuyến tính, còn theo epoch thì nó chỉ là một nấc duy nhất.
+    `warmup_epochs = 0` -> phẳng ngay.
     """
-    n_norm = int(sc["norm_epochs"]) * int(steps_per_epoch)
-    if step < n_norm:
-        return {"norm": float(sc["norm_lr"]), "rest": float(sc["lr"])}
     w = int(round(float(sc["warmup_epochs"]) * int(steps_per_epoch)))
-    f = 1.0 if w <= 0 else min(1.0, (step - n_norm + 1) / w)
-    return {"norm": float(sc["lr"]) * f, "rest": float(sc["lr"]) * f}
+    f = 1.0 if w <= 0 else min(1.0, (int(step) + 1) / w)
+    return {"backbone": float(sc["backbone_lr"]), "rest": float(sc["lr"]) * f}
 
 
-def anneal_lr_at(step: int, n_total: int, fa: dict) -> dict:
-    """Cosine từ `lr_start` xuống `lr_end` trong `n_total` bước — cả hai nhóm."""
+def anneal_lr_at(step: int, n_total: int, fa: dict, backbone_lr: float) -> dict:
+    """Nhóm `rest` cosine `lr_start` -> `lr_end` trong `n_total` bước.
+
+    Backbone GIỮ NGUYÊN `backbone_lr`: nó không tham gia one-cycle nào cả, ở
+    epoch final cũng vậy — 1e-5 phẳng là toàn bộ lịch của nó.
+    """
     t = min(max(int(step), 0), int(n_total))
     v = fa["lr_end"] + 0.5 * (fa["lr_start"] - fa["lr_end"]) * (
         1.0 + math.cos(math.pi * t / max(1, int(n_total))))
-    return {"norm": v, "rest": v}
+    return {"backbone": float(backbone_lr), "rest": v}
 
 
 def set_group_lrs(opt, lrs: dict) -> float:
@@ -164,8 +176,8 @@ def anneal_cfg(s: dict) -> dict:
     """`stage0.final_anneal`: epoch n+1 (sau phần base) -> checkpoint `final/`.
 
     Mặc định chạy NỐI TIẾP phần base: `reset_optimizer: false` giữ nguyên moment
-    AdamW đã tích trong 4 epoch trước, và `lr_start: null` lấy đúng lr ĐỈNH của
-    phần base (`stage0.lr`) làm điểm xuất phát — tức lr không nhảy nấc ở ranh
+    AdamW đã tích trong 7 epoch trước, và `lr_start: null` lấy đúng lr ĐỈNH của
+    nhóm `rest` ở phần base (`stage0.lr`) làm điểm xuất phát — tức lr không nhảy nấc ở ranh
     giới epoch, nó chỉ bắt đầu đi xuống. Cosine từ `lr_start` tới `lr_end` trong
     `epochs` epoch, cập nhật MỖI BƯỚC.
 
@@ -178,7 +190,7 @@ def anneal_cfg(s: dict) -> dict:
            "epochs": int(a.get("epochs", 1)),
            # null -> lr đỉnh của phần base: đổi `stage0.lr` thì điểm xuất phát
            # của epoch final đi theo, không lệch thành hai con số rời nhau.
-           "lr_start": float(s.get("lr", 1e-5)) if ls is None else float(ls),
+           "lr_start": float(s.get("lr", 3e-5)) if ls is None else float(ls),
            "lr_start_from_base_lr": ls is None,
            "lr_end": float(a.get("lr_end", 1e-7)),
            "schedule": str(a.get("schedule", "cosine")).lower(),
@@ -289,9 +301,12 @@ class ImageOnlyDataset:
     """
 
     def __init__(self, df: pd.DataFrame, image_size: int, y: np.ndarray,
-                 mask: np.ndarray):
+                 mask: np.ndarray, mean, std):
         self.df = df.reset_index(drop=True)
         self.image_size = int(image_size)
+        # mean/std của CHECKPOINT ViT (spec.vextractor.normalize) — không phải
+        # một hằng số ImageNet nào đó: họ AugReg dùng 0.5/0.5.
+        self.mean, self.std = tuple(mean), tuple(std)
         self.y, self.m = np.asarray(y), np.asarray(mask)
         self.n_bad = 0
 
@@ -299,7 +314,8 @@ class ImageOnlyDataset:
         return len(self.df)
 
     def pixels(self, i: int):
-        return Z.vext_tensor(self.df.iloc[i]["image_path"], self.image_size)
+        return Z.vext_tensor(self.df.iloc[i]["image_path"], self.image_size,
+                             self.mean, self.std)
 
     def __getitem__(self, i: int) -> dict:
         import torch
@@ -330,9 +346,11 @@ def assert_same_pixels(ds: ImageOnlyDataset, cfg: Cfg) -> None:
 
     Ở §2.1 phép kiểm này so hai đường tiền xử lý khác nhau (image_processor và
     apply_chat_template). Ở đây cả hai bên gọi chung `Z.vext_tensor`, nên thứ nó
-    thật sự canh là **kích thước**: main stage dựng ảnh theo `image_size` đọc từ
-    META của nhánh, còn Stage 0 theo config. Hai số ấy lệch nhau thì lưới ResNet
-    ra khác số ô và `n_query` lệch — bắt ở đây rẻ hơn bắt ở forward.
+    thật sự canh là **kích thước và mean/std**: main stage dựng ảnh theo META
+    của nhánh, còn Stage 0 theo config. Lệch `image_size` thì lưới patch ra khác
+    số ô; lệch mean/std thì KHÔNG có shape nào sai cả, nhánh chỉ lặng lẽ được
+    pretrain trên một phép chuẩn hoá khác phép nó gặp lúc fine-tune — đúng loại
+    lỗi mà `torch.allclose` dưới đây sinh ra để bắt.
     """
     import torch
 
@@ -340,12 +358,13 @@ def assert_same_pixels(ds: ImageOnlyDataset, cfg: Cfg) -> None:
 
     row = ds.df.iloc[0]
     a = ds.pixels(0)
-    b = VExtReportDataset.vext_of(row["image_path"], ds.image_size)
+    b = VExtReportDataset.vext_of(row["image_path"], ds.image_size, ds.mean, ds.std)
     if a.shape != b.shape or not torch.allclose(a.float(), b.float(), atol=1e-6):
         raise TrainUnusable(
             f"ảnh vào nhánh ở Stage 0 {tuple(a.shape)} KHÁC main stage "
             f"{tuple(b.shape)} — nhánh sẽ được pretrain trên ảnh khác ảnh nó "
-            f"nhận lúc fine-tune. Kiểm `vextractor.vextractor.image_size`.")
+            f"nhận lúc fine-tune. Kiểm `vextractor.vextractor.image_size` và "
+            f"`spec.vextractor.normalize`.")
 
 
 def decoder_width(cfg: Cfg) -> int:
@@ -404,41 +423,52 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if val_df is None or val_df.empty:
         raise TrainUnusable("Stage 0 chọn epoch theo val — fixture không có mẫu val.")
 
-    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ResNet50.
+    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ViT-Small.
     # Thứ duy nhất cần từ model là d_model (2560) — đọc từ config, không tải
     # trọng số. Lệch con số này với model thật thì `load_stage0_into` ở main
     # stage ném spec mismatch, to và sớm.
     text_h = decoder_width(cfg)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = int(dict(dict(cfg.get("vextractor") or {}).get("vextractor") or {})
-                   .get("image_size", 512))
+    # spec dựng TRƯỚC dataset: `image_size` VÀ mean/std của ảnh vào nhánh đều
+    # nằm trong nó (mean/std được hỏi từ `pretrained_cfg` của `arch`), nên
+    # không có con số nào bị đọc từ hai nguồn.
+    spec = Z.spec_from_cfg(cfg, text_h, n_labels)
+    if not spec["vextractor"]["pretrained"]:
+        # Guard ở ĐÂY chứ không ở `vextractor.vit_body`: selftest cần dựng được
+        # một ViT nhỏ ngẫu nhiên OFFLINE, còn một lượt pretrain THẬT trên
+        # backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
+        raise TrainUnusable(
+            "vextractor.vextractor.pretrained = false: cả điểm của §2.2 là 'một "
+            "encoder ĐÃ học từ ImageNet-1k mang vào thứ SigLIP không có'. Một "
+            "ViT khởi tạo ngẫu nhiên không mang vào gì cả — Stage 0 DỪNG.")
+    img_size = int(spec["vextractor"]["image_size"])
+    nz_mean, nz_std = Z.norm_of(spec)
 
-    ds_tr = ImageOnlyDataset(train_df, img_size, y_tr, m_tr)
-    ds_va = ImageOnlyDataset(val_df, img_size, y_va, m_va)
+    ds_tr = ImageOnlyDataset(train_df, img_size, y_tr, m_tr, nz_mean, nz_std)
+    ds_va = ImageOnlyDataset(val_df, img_size, y_va, m_va, nz_mean, nz_std)
     assert_same_pixels(ds_tr, cfg)
 
-    spec = Z.spec_from_cfg(cfg, text_h, n_labels)
     block = Z.SupervisedBlock(spec).to(dev)                  # fp32 + autocast
     asl = Z.build_asl(sc["asl"])
-    opt = torch.optim.AdamW(block.param_groups(sc["lr"], sc["norm_lr"]),
+    opt = torch.optim.AdamW(block.param_groups(sc["lr"], sc["backbone_lr"]),
                             weight_decay=sc["weight_decay"], betas=(0.9, 0.999),
                             eps=1e-8)
     vx = block.vextractor
     n_par = sum(p.numel() for p in block.parameters())
-    n_norm = sum(p.numel() for p in vx.norm_parameters())
-    print(f"  Stage 0: Supervised Block {n_par:,} tham số · ResNet "
-          f"{sum(p.numel() for p in vx.body.parameters()):,} (norm {n_norm:,}, "
-          f"{vx.n_norm_swapped} BN→InstanceNorm) · Linear+Self-attn "
+    n_bb = sum(p.numel() for p in vx.backbone_parameters())
+    print(f"  Stage 0: Supervised Block {n_par:,} tham số · {spec['vextractor']['arch']} "
+          f"{n_bb:,} ({vx.n_patch} patch × {vx.d_feat}) · Linear+{vx.n_query} "
+          f"learner Q+Self/Cross-attn+MLP "
           f"{sum(p.numel() for p in vx.head_parameters()):,} · Cls Head "
           f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
-          f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn", flush=True)
+          f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn · chuẩn hoá "
+          f"mean {nz_mean} std {nz_std}", flush=True)
     fa = sc["final_anneal"]
-    print(f"  Stage 0: epoch 1–{sc['norm_epochs']} = NORM (ResNet đóng băng trừ "
-          f"InstanceNorm @ lr {sc['norm_lr']:g}; phần ngoài ResNet @ "
-          f"{sc['lr']:g}) -> epoch {sc['norm_epochs'] + 1}–{sc['base_epochs']} = "
-          f"mở băng TOÀN BỘ @ {sc['lr']:g} (warm-up tuyến tính "
-          f"{sc['warmup_epochs']:g} epoch đầu của phần này) · wd "
-          f"{sc['weight_decay']} · {sc['norm_epochs']}+{sc['max_epochs']} = "
+    print(f"  Stage 0: backbone ViT @ {sc['backbone_lr']:g} PHẲNG suốt · nhóm "
+          f"`rest` warm-up tuyến tính 0 -> {sc['lr']:g} trong "
+          f"{sc['warmup_epochs']:g} epoch (epoch 1–{sc['n_warmup_epochs']}) rồi "
+          f"phẳng tới epoch {sc['base_epochs']} · wd {sc['weight_decay']} · "
+          f"{sc['n_warmup_epochs']}+{sc['max_epochs']} = "
           f"{sc['base_epochs']} epoch ({sc['select']}) -> {BASE}/ · batch "
           f"{sc['batch_size']}"
           f" · ASL γ_neg {dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} "
@@ -447,9 +477,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if fa["enabled"]:
         print(f"  Stage 0 · epoch n+1: "
               f"{'optimizer MỚI (moment = 0)' if fa['reset_optimizer'] else 'NỐI TIẾP (giữ moment AdamW của base)'}"
-              f", cosine {fa['lr_start']:g}"
+              f", nhóm `rest` cosine {fa['lr_start']:g}"
               f"{' (= lr đỉnh của base)' if fa['lr_start_from_base_lr'] else ''} -> "
-              f"{fa['lr_end']:g} trong {fa['epochs']} epoch · wd {fa['weight_decay']} "
+              f"{fa['lr_end']:g} trong {fa['epochs']} epoch (backbone VẪN "
+              f"{sc['backbone_lr']:g}) · wd {fa['weight_decay']} "
               f"-> {CKPT}/ (main stage dùng bản này)", flush=True)
 
     def loss_of(b):
@@ -523,7 +554,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         g = torch.Generator().manual_seed(seed)
         for _ in range(sc["base_epochs"]):           # cùng Generator như lúc chạy base
             torch.randperm(n, generator=g)
-        history = [h for h in hb.get("history", []) if h.get("phase") in ("base", "norm")]
+        history = [h for h in hb.get("history", [])
+                   if h.get("phase") in ("base", "warmup", "norm")]
         best = {"epoch": hb.get("base_epoch"), "score": hb.get("base_score")}
         start_epoch = sc["base_epochs"] + 1
         print(f"  ⚙ base/ ({sc['base_epochs']} epoch) đã có — chỉ chạy epoch n+1", flush=True)
@@ -575,12 +607,14 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         r["n_val"] = len(vidx)
         return r
 
-    def set_phase(ep: int) -> str:
-        """Epoch <= norm_epochs -> đóng băng conv, chỉ InstanceNorm học."""
-        norm_only = ep <= sc["norm_epochs"]
-        n_live = block.vextractor.freeze_body(norm_only, keep_norm=True)
-        return (f"norm-only ({n_live:,}/{sum(p.numel() for p in block.vextractor.body.parameters()):,} "
-                f"tham số ResNet còn học)" if norm_only else "ResNet mở băng hoàn toàn")
+    def phase_of(ep: int) -> str:
+        """KHÔNG còn epoch đóng băng nào: ViT học từ bước 0, ở lr riêng của nó.
+
+        `warmup` chỉ nói về lr của nhóm `rest` (ramp 0 -> lr_max), không phải
+        một trạng thái đóng băng — bản ResNet50 cũ có epoch "norm" vì BatchNorm
+        mang theo thống kê ImageNet; ViT không có BatchNorm.
+        """
+        return "warmup" if ep <= sc["n_warmup_epochs"] else "base"
 
     def run_epoch(ep: int, opt_, lr_fn, step0: int = 0) -> float:
         block.train()
@@ -647,8 +681,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     for ep in range(start_epoch, sc["base_epochs"] + 1):
         t_ep = time.time()
-        phase = "norm" if ep <= sc["norm_epochs"] else "base"
-        print(f"  [stage0] epoch {ep} ({phase}): {set_phase(ep)}", flush=True)
+        phase = phase_of(ep)
+        lr0 = sched_base((ep - 1) * steps_per_epoch)
+        print(f"  [stage0] epoch {ep} ({phase}): backbone {lr0['backbone']:.2e} · "
+              f"rest {lr0['rest']:.2e} -> {sched_base(ep * steps_per_epoch - 1)['rest']:.2e}",
+              flush=True)
         run_loss = run_epoch(ep, opt, sched_base, (ep - 1) * steps_per_epoch)
         ev = record(ep, run_loss, t_ep, phase)
         base_opt_live = True          # optimizer này vừa chạy thật phần base
@@ -722,9 +759,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         n_tot = max(1, n_st * fa["epochs"])
 
         def sched_anneal(gstep: int) -> dict:
-            return anneal_lr_at(gstep, n_tot, fa)
+            return anneal_lr_at(gstep, n_tot, fa, sc["backbone_lr"])
 
-        set_phase(sc["base_epochs"] + 1)       # epoch final: ResNet mở băng
         for k in range(1, fa["epochs"] + 1):
             ep = ep_last + k
             t_ep = time.time()
@@ -811,16 +847,16 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                   "probe_sizes": sc["probe_sizes"],
                   "steps_per_epoch": int(steps_per_epoch),
                   "loss_average": "ASL trung bình trên mẫu có nhãn của CẢ batch"},
-        "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8), 2 nhóm: norm | rest",
-                     "lr": sc["lr"], "norm_lr": sc["norm_lr"],
+        "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8), 2 nhóm: backbone | rest",
+                     "lr": sc["lr"], "backbone_lr": sc["backbone_lr"],
                      "lr_schedule": (
-                         f"epoch 1–{sc['norm_epochs']}: ResNet đóng băng trừ "
-                         f"InstanceNorm (lr {sc['norm_lr']:g}), phần ngoài ResNet "
-                         f"lr {sc['lr']:g}; từ epoch {sc['norm_epochs'] + 1}: mở "
-                         f"băng toàn bộ, cả hai nhóm lr {sc['lr']:g} với warm-up "
-                         f"tuyến tính theo bước trong {sc['warmup_epochs']:g} epoch "
-                         f"đầu của phần này rồi phẳng"),
-                     "norm_epochs": sc["norm_epochs"],
+                         f"backbone (ViT, pretrain ImageNet-1k): lr "
+                         f"{sc['backbone_lr']:g} PHẲNG suốt Stage 0 (kể cả epoch "
+                         f"final_anneal); rest (Linear vào, learner Q, Self/Cross-"
+                         f"attn, MLP, Cls Head): warm-up tuyến tính theo bước 0 -> "
+                         f"{sc['lr']:g} trong {sc['warmup_epochs']:g} epoch đầu rồi "
+                         f"phẳng tới hết epoch {sc['base_epochs']}"),
+                     "n_warmup_epochs": sc["n_warmup_epochs"],
                      "warmup_epochs": sc["warmup_epochs"],
                      "weight_decay": sc["weight_decay"],
                      "max_epochs": sc["max_epochs"], "base_epochs": sc["base_epochs"],
@@ -829,10 +865,13 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
         "asl": sc["asl"], "spec": spec,
         "vision": {"branch_encoder": spec["vextractor"]["arch"],
                    "pretrained": spec["vextractor"]["pretrained"],
-                   "norm": "instance (BN thay hết, affine chép từ BN)",
+                   "norm": "LayerNorm của ViT (không có BatchNorm, không thống kê chạy)",
                    "image_size": spec["vextractor"]["image_size"],
-                   "normalize": {"mean": list(Z.IMAGENET_MEAN),
-                                 "std": list(Z.IMAGENET_STD)},
+                   # ĐÚNG mean/std đi kèm trọng số ImageNet-1k của checkpoint
+                   # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
+                   "normalize": dict(spec["vextractor"]["normalize"]),
+                   "d_branch": spec["vextractor"]["d_branch"],
+                   "mlp_hidden": spec["vextractor"]["mlp_hidden"],
                    "n_query": Z.n_query_of(spec),
                    "note": "Stage 0 KHÔNG chạy Gemma; d_model đọc từ AutoConfig",
                    "decoder_hf_id": cfg["base"]["hf_id"],

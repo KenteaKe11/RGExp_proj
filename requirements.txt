@@ -43,14 +43,21 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
-# §2.2 — nhánh V-Extractor LÀ một ResNet50 ImageNet của torchvision (và §2.5 cũ
-# dùng ResNet-101/152). Đây là phụ thuộc BẮT BUỘC của pipeline đang chạy, không
-# phải phụ thuộc phụ: thiếu nó thì Stage 0 không dựng được nhánh.
-# Lần chạy đầu tải ~100 MB trọng số ImageNet từ download.pytorch.org.
-# KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản torch đang cài (cùng lý do
-# torch không nằm trong file này), và pip tự giải quyết ràng buộc ấy khi cài
-# cạnh một torch đã có. Cài nhầm bản là lỗi "operator torchvision::nms does not
-# exist" ở lần forward đầu tiên, không phải lúc import.
+# §2.2 — nhánh V-Extractor LÀ một ViT-Small/16 pretrain ImageNet-1k của timm.
+# Đây là phụ thuộc BẮT BUỘC của pipeline đang chạy, không phải phụ thuộc phụ:
+# thiếu nó thì Stage 0 không dựng được nhánh.
+# Lần chạy đầu tải ~85 MB trọng số từ Hugging Face
+# (timm/vit_small_patch16_224.augreg_in1k).
+# timm cũng là nơi DUY NHẤT biết mean/std đúng của checkpoint
+# (`get_pretrained_cfg(arch).mean/std` — họ AugReg dùng 0.5/0.5, KHÔNG phải
+# mean/std của ImageNet): mã không hard-code cặp số ấy ở đâu cả.
+timm>=1.0.0
+
+# §2.5 cũ (`_archive/`) dùng ResNet-101/152 của torchvision. Pipeline §2.2 đang
+# chạy KHÔNG còn cần nó. KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản
+# torch đang cài (cùng lý do torch không nằm trong file này). Cài nhầm bản là
+# lỗi "operator torchvision::nms does not exist" ở lần forward đầu tiên, không
+# phải lúc import.
 torchvision
 
 # Metrics
