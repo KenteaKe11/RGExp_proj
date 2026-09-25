@@ -4,9 +4,9 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
 
     Image ─┬─► Vision Encoder (SigLIP, đóng băng) ─► Adapter ─► Z (256, 2560)
            │
-           └─► Resize 448×448 ─► ViT-L/16 ImageNet, 6 BLOCK ĐẦU ─► (784, 1024)
+           └─► Resize 448×448 ─► ViT-B/16 ImageNet, 8 BLOCK ĐẦU ─► (784, 768)
                                           │
-                                 Linear 1024→2560             32 Learner (Q)
+                                 Linear 768→2560              32 Learner (Q)
                                           │                          │
                                    RMSNorm(2560)              RMSNorm(2560)
                                           │                          │
@@ -35,16 +35,16 @@ Sơ đồ (đúng hình: khối CAM "V-Extractor" + "Cls Head", khối VÀNG "Al
                                           │
            [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
-Nhánh có encoder thị giác của RIÊNG nó — ViT-L/16 pretrain ImageNet
-(`augreg_in21k_ft_in1k`), CẮT còn 6 block đầu, ăn thẳng ảnh resize 448², KHÔNG
+Nhánh có encoder thị giác của RIÊNG nó — ViT-B/16 pretrain ImageNet
+(`augreg_in21k_ft_in1k`), CẮT còn 8 block đầu, ăn thẳng ảnh resize 448², KHÔNG
 đọc X của SigLIP. Hệ quả:
 
   * câu hỏi của §2.2: "một encoder KHÁC, học từ ImageNet chứ không phải
     web-image–text, có mang vào thứ SigLIP không có không";
-  * **6 block đầu, cắt THẬT** (`n_layers`): `net.blocks` bị thay bằng 6 block
-    đầu, nên 18 block còn lại không được dựng vào đồ thị, không nằm trong
+  * **8 block đầu, cắt THẬT** (`n_layers`): `net.blocks` bị thay bằng 8 block
+    đầu, nên 4 block còn lại không được dựng vào đồ thị, không nằm trong
     `state_dict`, không chiếm VRAM và không có tham số nào để optimizer chạm
-    vào — 304 M tham số của ViT-L đủ 24 block còn 77 M. Phần nhánh cần là biểu
+    vào — 86 M tham số của ViT-B đủ 12 block còn 58 M. Phần nhánh cần là biểu
     diễn THỊ GIÁC còn mang cấu trúc không gian, vốn nằm ở đầu ViT; đuôi của nó
     đã chuyên hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi;
   * lưới patch của ViT (448/16 = 28 -> 28² = 784 ô) KHÔNG phải là khối Q: 784
@@ -56,7 +56,7 @@ Nhánh có encoder thị giác của RIÊNG nó — ViT-L/16 pretrain ImageNet
     hai dấu `+` trong hình: một quanh MLP (cộng đầu ra Self-attn), một quanh cả
     khối (cộng THẲNG learner) — learner vì thế có đường gradient ngắn nhất;
   * thân nhánh chạy THẲNG ở `d_model` = 2560. Bố cục cũ làm việc ở `d_branch`
-    2048 rồi mới nở ra 2560 ở MLP cuối; ở đây Linear vào nở 1024 → 2560 ngay và
+    2048 rồi mới nở ra 2560 ở MLP cuối; ở đây Linear vào nở 768 → 2560 ngay và
     MLP(GeLU) 2560 → 3072 → 2560 KHÔNG còn đổi chiều, nên không có chỗ nào
     trong nhánh bị bóp lại dưới chiều embedding của decoder;
   * đường ảnh THỨ HAI: batch phải mang thêm `vext_pixels` (3, 448, 448) chuẩn
@@ -199,13 +199,13 @@ class VExtractorUnusable(RuntimeError):
     """Không dựng được backbone — DỪNG, đừng pretrain trên đặc trưng ngẫu nhiên."""
 
 
-# ══ Backbone: ViT-L/16 ImageNet (timm), CẮT còn `n_layers` block đầu ═════════
+# ══ Backbone: ViT-B/16 ImageNet (timm), CẮT còn `n_layers` block đầu ════════
 def _timm():
     try:
         import timm
     except Exception as e:  # pragma: no cover - môi trường thiếu timm
         raise VExtractorUnusable(
-            "không import được timm — nhánh §2.2 dùng ViT-L/16 pretrain ImageNet "
+            "không import được timm — nhánh §2.2 dùng ViT-B/16 pretrain ImageNet "
             "của timm.\n"
             "    pip install timm") from e
     return timm
@@ -243,10 +243,10 @@ def vit_body(arch: str, pretrained: bool, image_size: int,
     **`n_layers` cắt THẬT, không phải early-exit.** `net.blocks` bị thay bằng
     `n_layers` block ĐẦU, nên các block sau không được dựng vào đồ thị, không
     nằm trong `state_dict`, không chiếm VRAM và không có tham số nào để
-    optimizer chạm vào. ViT-L/16 đủ 24 block là 304 M tham số — quá nặng để
-    fine-tune ở Stage 0 cạnh mọi thứ khác, trong khi thứ nhánh cần là biểu diễn
-    THỊ GIÁC còn mang cấu trúc không gian, vốn nằm ở phần đầu của ViT; đuôi của
-    nó đã chuyên hoá cho bài toán phân loại 1000 lớp mà §2.2 không hỏi.
+    optimizer chạm vào. ViT-B/16 đủ 12 block là 86 M tham số; giữ 8 block đầu
+    còn 58 M — thứ nhánh cần là biểu diễn THỊ GIÁC còn mang cấu trúc không
+    gian, vốn nằm ở phần đầu của ViT, còn đuôi của nó đã chuyên hoá cho bài
+    toán phân loại 1000 lớp mà §2.2 không hỏi.
 
     Cắt rồi thì `net.norm` (LayerNorm cuối) vẫn chạy — nó là norm của đầu ra
     `forward_features`, không thuộc block nào.
@@ -262,8 +262,8 @@ def vit_body(arch: str, pretrained: bool, image_size: int,
     except Exception as e:  # noqa: BLE001
         raise VExtractorUnusable(
             f"không dựng được backbone {arch!r} ở {image_size}²: {e!r}.\n"
-            f"    Lần chạy đầu tải checkpoint từ Hugging Face (~1,2 GB cho "
-            f"ViT-L/16 — cả 24 block đều được tải về rồi mới cắt).") from e
+            f"    Lần chạy đầu tải checkpoint từ Hugging Face (~330 MB cho "
+            f"ViT-B/16 — cả 12 block đều được tải về rồi mới cắt).") from e
     pe = getattr(net, "patch_embed", None)
     blocks = getattr(net, "blocks", None)
     if pe is None or blocks is None or not hasattr(net, "forward_features"):
@@ -286,7 +286,7 @@ class VExtractor(nn.Module):
     """Ảnh (B, 3, S, S) -> Q_raw (B, n_query, d_model). KHỐI MÀU CAM.
 
         p   = ViT.forward_features(px)[:, n_prefix:]     (B, n_patch, d_feat)
-        kv  = RMSNorm(Linear(p))                         d_feat (1024) → d_model
+        kv  = RMSNorm(Linear(p))                         d_feat (768) → d_model
         s   = Self-attn(RMSNorm(learner))                (B, n_query, d_model)
         h   = s + MLP_GeLU(s)                            (+) quanh MLP
         Q_raw = learner + Cross-attn(RMSNorm(h), kv)     (+) quanh cả khối
@@ -301,8 +301,8 @@ class VExtractor(nn.Module):
     """
 
     def __init__(self, image_size: int = 448, d_model: int = 2560,
-                 arch: str = "vit_large_patch16_224.augreg_in21k_ft_in1k",
-                 pretrained: bool = True, n_layers: int | None = 6,
+                 arch: str = "vit_base_patch16_224.augreg_in21k_ft_in1k",
+                 pretrained: bool = True, n_layers: int | None = 8,
                  n_query: int = 32, n_heads: int = 20, mlp_hidden: int = 3072,
                  dropout: float = 0.0, normalize: dict | None = None):
         super().__init__()
@@ -316,7 +316,7 @@ class VExtractor(nn.Module):
         self.n_prefix = int(getattr(self.body, "num_prefix_tokens", 1))
         self.mean, self.std = _check_normalize(self.body, arch, normalize)
         # d_feat đến từ CHÍNH model (`num_features`), không gõ tay: đổi `arch`
-        # là chiều vào của Linear đi theo. ViT-L/16 -> 1024 → 2560.
+        # là chiều vào của Linear đi theo. ViT-B/16 -> 768 → 2560.
         self.inp = nn.Linear(self.d_feat, self.d_model)
         self.inp_norm = RMSNorm(self.d_model)
         # Learner vector: khởi tạo normal(0, 0.02) như mọi tham số mới của Gemma 3.
@@ -489,7 +489,7 @@ def spec_from_cfg(cfg, d_model: int, n_labels: int) -> dict:
     """
     z = dict(cfg.get("vextractor") or {})
     rv, al, ch = (dict(z.get(k) or {}) for k in ("vextractor", "aligner", "cls_head"))
-    arch = str(rv.get("arch", "vit_large_patch16_224.augreg_in21k_ft_in1k"))
+    arch = str(rv.get("arch", "vit_base_patch16_224.augreg_in21k_ft_in1k"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -756,10 +756,14 @@ class ClsCounter:
         score = sqrt(F1_macro · Recall_macro)
 
     macro trên các ô (bệnh lý × lớp ∈ `classes`) có ít nhất một mẫu vàng; mặc
-    định `classes` = (pos, uncertain) — lớp neg áp đảo nên không vào.
+    định `classes` = (pos,). Lớp neg áp đảo nên không vào; `uncertain` cũng
+    không, vì nó là nhãn của sự DO DỰ trong báo cáo gốc chứ không phải của một
+    tình trạng bệnh — gộp nó vào điểm chọn epoch là trộn "đoán đúng chỗ bác sĩ
+    viết mơ hồ" với "bắt đúng ca dương" thành một con số. ASL vẫn HỌC cả 3 lớp;
+    `classes` chỉ quyết định thứ được CHẤM.
     """
 
-    def __init__(self, n_labels: int, classes=("pos", "uncertain")):
+    def __init__(self, n_labels: int, classes=("pos",)):
         self.cls_idx = [CLASS_ORDER.index(c) for c in classes]
         self.classes = tuple(classes)
         self.tp = torch.zeros(n_labels, len(CLASS_ORDER), dtype=torch.float64)

@@ -298,11 +298,11 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     g = R.asl_gammas(cfg["stage0"]["asl"])
-    # γ = [3.0, 0.0, 0.0] theo thứ tự (neg, unc, pos) của tài liệu
-    want = {"neg": 3.0, "uncertain": 0.0, "pos": 0.0}
+    # γ = [4.0, 3.0, 0.0] theo thứ tự (neg, unc, pos) của tài liệu
+    want = {"neg": 4.0, "uncertain": 3.0, "pos": 0.0}
     assert g == [want[c] for c in CLASS_ORDER], (g, CLASS_ORDER)
     asl = R.build_asl(cfg["stage0"]["asl"])
-    assert asl.clip == 0.05 and asl.gamma_pos == 0.0
+    assert asl.clip == 0.02 and asl.gamma_pos == 0.0
     lg = torch.randn(4, 14, 3, requires_grad=True)
     y = torch.nn.functional.one_hot(torch.randint(0, 3, (4, 14)), 3).float()
     loss = asl(lg, y, torch.tensor([1., 1., 0., 1.]))
@@ -310,7 +310,7 @@ def _():
     assert torch.isfinite(loss) and lg.grad[2].abs().sum() == 0   # mẫu mask: 0 grad
 
 
-@check("5. metric Stage 0: sqrt(F1·Recall) macro trên pos + uncertain")
+@check("5. metric Stage 0: sqrt(F1·Recall) macro trên lớp pos")
 def _():
     import math
 
@@ -323,13 +323,26 @@ def _():
     pred = torch.tensor([1, 0, 2, 2])
     y = torch.nn.functional.one_hot(gold, 3).float().view(4, 1, 3)
     lg = torch.nn.functional.one_hot(pred, 3).float().view(4, 1, 3) * 5
-    c = R.ClsCounter(1, ("pos", "uncertain"))
+    # MẶC ĐỊNH giờ là CHỈ lớp `pos` — uncertain là nhãn của sự do dự trong báo
+    # cáo gốc, không phải của một tình trạng bệnh, nên nó không vào điểm chấm.
+    c = R.ClsCounter(1)
+    assert c.classes == ("pos",)
     c.update(lg, y, torch.ones(4))
     r = c.result()
-    # pos: tp1 fp0 fn1 -> F1 2/3, R 1/2 ; unc: tp1 fp1 fn0 -> F1 2/3, R 1
-    f1, rec = (2 / 3 + 2 / 3) / 2, (0.5 + 1.0) / 2
+    # pos: tp1 fp0 fn1 -> F1 2/3, R 1/2. Chỉ MỘT ô vào macro.
+    f1, rec = 2 / 3, 0.5
+    assert r["n_cells"] == 1
     assert abs(r["f1_macro"] - f1) < 1e-9 and abs(r["recall_macro"] - rec) < 1e-9, r
     assert abs(r["score"] - math.sqrt(f1 * rec)) < 1e-9
+    assert set(r["per_class"]) == {"pos"}
+    # khai tay hai lớp thì vẫn chạy — `classes` là khoá, không phải hằng số
+    c3 = R.ClsCounter(1, ("pos", "uncertain"))
+    c3.update(lg, y, torch.ones(4))
+    r3 = c3.result()
+    # unc: tp1 fp1 fn0 -> F1 2/3, R 1
+    assert r3["n_cells"] == 2
+    assert abs(r3["recall_macro"] - (0.5 + 1.0) / 2) < 1e-9
+    assert r3["score"] != r["score"]
     # ô không nhãn (one-hot 0) không được tính
     c2 = R.ClsCounter(1)
     c2.update(lg, torch.zeros(4, 1, 3), torch.ones(4))
@@ -728,10 +741,10 @@ def _():
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448 and int(rv["image_size"]) % 16 == 0
     assert (int(rv["image_size"]) // 16) ** 2 == 784            # lưới patch ViT
-    assert rv["arch"] == "vit_large_patch16_224.augreg_in21k_ft_in1k"
-    # ViT-L/16: 24 block, giữ 6 block ĐẦU. `n_layers` là khoá của spec nên đổi
+    assert rv["arch"] == "vit_base_patch16_224.augreg_in21k_ft_in1k"
+    # ViT-B/16: 12 block, giữ 8 block ĐẦU. `n_layers` là khoá của spec nên đổi
     # nó -> lệch `spec_fingerprint` -> `branch_stale` bắt được weight cũ.
-    assert int(rv["n_layers"]) == 6
+    assert int(rv["n_layers"]) == 8
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
     assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
@@ -754,9 +767,13 @@ def _():
     from src.vextractor import asl_gammas
     from src.labels_cls import CLASS_ORDER
     g = dict(zip(CLASS_ORDER, asl_gammas(cfg["stage0"]["asl"])))
-    assert (g["neg"], g["uncertain"], g["pos"]) == (3.0, 0.0, 0.0), g
-    assert float(cfg["stage0"]["asl"]["clip"]) == 0.05
+    assert (g["neg"], g["uncertain"], g["pos"]) == (4.0, 3.0, 0.0), g
+    assert float(cfg["stage0"]["asl"]["clip"]) == 0.02
     assert (int(cfg["stage0"]["patience"]), int(cfg["stage0"]["max_epochs"])) == (5, 50)
+    # val chấm CHỈ lớp pos (neg áp đảo; uncertain là do dự của báo cáo, không
+    # phải một tình trạng bệnh). ASL vẫn HỌC cả 3 lớp — hai chuyện khác nhau.
+    assert sc["val_classes"] == ["pos"]
+    assert set(g) == {"neg", "uncertain", "pos"}
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
     # warm-up chiếm TRỌN epoch đầu -> mọi chỗ đếm "số epoch của base" phải cộng
@@ -935,7 +952,7 @@ def _():
         kiểm được bằng một con số xác định, không phải bằng may rủi của
         gradient trên dữ liệu ngẫu nhiên."""
 
-        def __init__(self, n_labels, classes=("pos", "uncertain")):
+        def __init__(self, n_labels, classes=("pos",)):
             pass
 
         def update(self, *a, **k):

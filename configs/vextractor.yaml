@@ -20,7 +20,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ViT-L/16 ăn ảnh 448², 6 block đầu) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (ViT-B/16 ăn ảnh 448², 8 block đầu) — và chuỗi dài
 # thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -302,13 +302,13 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: ViT-L/16 pretrain ImageNet ăn thẳng ảnh gốc resize
-# 448×448 -> lưới 28×28 = 784 patch × 1024. Lưới ấy KHÔNG phải khối Q (784
+# Nhánh có ENCODER RIÊNG: ViT-B/16 pretrain ImageNet ăn thẳng ảnh gốc resize
+# 448×448 -> lưới 28×28 = 784 patch × 768. Lưới ấy KHÔNG phải khối Q (784
 # quá dài để nối vào chuỗi decoder): `n_query` learner vector đi HỎI nó qua
 # Cross-Attn. Đường đi, đúng hình:
 #
 #   KHỐI CAM (V-Extractor) — Stage 0 dạy, main stage ĐÓNG BĂNG HOÀN TOÀN:
-#     784 patch ─► Linear 1024→2560 ─► RMSNorm(2560) ───────────────┐
+#     784 patch ─► Linear 768→2560 ─► RMSNorm(2560) ────────────────┐
 #     32 learner Q ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
 #                    │                      └──────── skip ────────────────┘
 #                    │                                    │
@@ -334,19 +334,21 @@ vextractor:
   n_labels: null            # null = theo labels.npz (14)
   vextractor:               # KHỐI CAM: ảnh (3, 448, 448) -> Q_raw (32, 2560)
     image_size: 448         # PHẢI chia hết patch size (16). 448/16 = 28 -> 784 patch
-    # timm; lần chạy đầu tải ~1,2 GB (CẢ 24 block được tải rồi mới cắt).
-    # `augreg_in21k_ft_in1k` = pretrain ImageNet-21k, fine-tune ImageNet-1k —
-    # đây là checkpoint ImageNet chuẩn của ViT-L/16 (họ AugReg không có bản
-    # in1k thuần cho ViT-L). Chuẩn hoá của nó vẫn là 0.5/0.5 như bản ViT-S cũ.
-    arch: vit_large_patch16_224.augreg_in21k_ft_in1k
+    # timm; lần chạy đầu tải ~330 MB (CẢ 12 block được tải rồi mới cắt).
+    # `augreg_in21k_ft_in1k` = pretrain ImageNet-21k, fine-tune ImageNet-1k.
+    # Chuẩn hoá của nó là 0.5/0.5 (họ AugReg) — KHÔNG phải mean/std ImageNet,
+    # và con số ấy được HỎI từ `pretrained_cfg` chứ không gõ ở đây.
+    # Muốn ImageNet-1k thuần thì đổi sang `vit_base_patch16_224.augreg_in1k`
+    # (cùng 0.5/0.5, cùng 12 block) — đổi arch là phải chạy lại Stage 0.
+    arch: vit_base_patch16_224.augreg_in21k_ft_in1k
     pretrained: true        # ImageNet. false bị TỪ CHỐI (câu hỏi khác hẳn)
-    # Số block ĐẦU được giữ lại. CẮT THẬT: `net.blocks` bị thay bằng 6 block
-    # đầu, nên 18 block còn lại không vào đồ thị, không vào state_dict, không
-    # chiếm VRAM, không có tham số nào để optimizer chạm vào — ViT-L từ 304 M
-    # xuống 77 M. Phần nhánh cần là biểu diễn thị giác còn mang cấu trúc không
+    # Số block ĐẦU được giữ lại. CẮT THẬT: `net.blocks` bị thay bằng 8 block
+    # đầu, nên 4 block còn lại không vào đồ thị, không vào state_dict, không
+    # chiếm VRAM, không có tham số nào để optimizer chạm vào — ViT-B từ 86 M
+    # xuống 58 M. Phần nhánh cần là biểu diễn thị giác còn mang cấu trúc không
     # gian (nằm ở đầu ViT); đuôi của nó đã chuyên hoá cho phân loại 1000 lớp.
-    # null = dùng hết 24 block. `net.norm` (LayerNorm cuối) vẫn chạy sau khi cắt.
-    n_layers: 6
+    # null = dùng hết 12 block. `net.norm` (LayerNorm cuối) vẫn chạy sau khi cắt.
+    n_layers: 8
     n_query: 32             # số learner vector = số token Q nối vào chuỗi decoder
     n_heads: 20             # Self/Cross-attn ở 2560: head_dim 128 (2560 = 20 × 128)
     mlp_hidden: 3072        # MLP(GeLU) GIỮA hai attn: 2560 -> 3072 -> 2560
@@ -384,7 +386,7 @@ vextractor:
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
 # Aligner KHÔNG có mặt ở đây: Cls Head đọc THẲNG Q_raw của khối cam.
-# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy 6 block ViT-L + hai khối
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy 8 block ViT-B + hai khối
 # attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
 # MỘT lr cho TẤT CẢ: 1e-5, PHẲNG suốt quá trình. Optimizer vẫn giữ hai nhóm
@@ -438,17 +440,28 @@ stage0:
   batch_size: 32
   max_grad_norm: 1.0
   # val (theo dõi VÀ chọn epoch VÀ đếm patience): sqrt(F1_macro · Recall_macro),
-  # macro trên 14 bệnh lý × lớp này
-  val_classes: [pos, uncertain]
+  # macro trên 14 bệnh lý × lớp này.
+  # CHỈ `pos`: lớp neg áp đảo nên không vào, còn `uncertain` là nhãn của sự do
+  # dự trong báo cáo gốc chứ không phải của một tình trạng bệnh — kéo nó vào
+  # điểm chọn epoch nghĩa là chọn checkpoint theo khả năng đoán đúng chỗ bác sĩ
+  # viết mơ hồ, trộn vào cùng một con số với khả năng bắt đúng ca dương. ASL
+  # vẫn HỌC cả 3 lớp (γ_unc = 3.0); đây chỉ là thứ dùng để CHẤM.
+  val_classes: [pos]
   val_n_samples: 256        # 256 mẫu bốc từ hồ val 2000 (0 = cả hồ)
   val_resample: false       # CỐ ĐỊNH: mọi epoch đo trên ĐÚNG một tập, chỉ số
                             # chỉ phụ thuộc seed. Bắt buộc khi có early-stop:
                             # bốc lại mỗi epoch thì `patience` đang đếm cả nhiễu
                             # của việc đổi tập, không riêng việc model hết tiến.
-  asl:                      # ASL one-hot 3 lớp — γ = [3.0, 0.0, 0.0] (neg, unc, pos)
-    gamma_neg: {neg: 3.0, uncertain: 0.0, pos: 0.0}
+  asl:                      # ASL one-hot 3 lớp — γ = [4.0, 3.0, 0.0] (neg, unc, pos)
+    # γ của một lớp áp lên ô của lớp ĐÓ khi nhãn ô = 0. neg 4.0: lớp neg áp đảo
+    # nên ô âm của nó dễ đúng, focal phải dìm mạnh. unc 3.0: cũng dìm, nhưng
+    # nhẹ hơn. pos 0.0: KHÔNG dìm gì — ô âm của lớp pos là thứ đắt nhất, bỏ sót
+    # một ca dương tốn hơn hẳn một báo động giả.
+    gamma_neg: {neg: 4.0, uncertain: 3.0, pos: 0.0}
     gamma_pos: 0.0
-    clip: 0.05
+    # p_clip: dịch xác suất ô âm (q = q + clip, chặn ở 1) để ô âm gần như chắc
+    # chắn thôi đóng góp gradient. 0.02 chặt hơn 0.05 cũ — ít ô âm bị bỏ qua hơn.
+    clip: 0.02
     eps: 1.0e-8
 
 # ── Kiểm định: A vs B, ghép cặp theo ảnh (`src/stats_ab.compare_all`) ──────

@@ -48,7 +48,7 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt 6 block ViT-L/16 ở 448²
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt 8 block ViT-B/16 ở 448²
 cho mỗi ảnh. Lượt ViT ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
 giữ activation nào — phần nặng còn lại của nhánh là Aligner trên đúng 32 token.
 

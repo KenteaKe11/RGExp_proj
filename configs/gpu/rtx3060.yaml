@@ -36,9 +36,9 @@ set:
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
   # phép leo tới tận 32 nếu VRAM cho phép. §2.2: Stage 0 KHÔNG nạp Gemma (chỉ
-  # 6 block đầu của ViT-L/16 ở 448², 784 token), nên mảnh vật lý ở đây thường
-  # leo cao hơn hẳn §2.1 — nhưng ViT-L nặng hơn ViT-S cũ nhiều lần (77 M so với
-  # 22 M, d 1024 so với 384), nên 16 chỉ là KHỞI ĐIỂM và autobatch sẽ tự hạ.
+  # 8 block đầu của ViT-B/16 ở 448², 784 token), nên mảnh vật lý ở đây thường
+  # leo cao hơn hẳn §2.1 — nhưng ViT-B nặng hơn ViT-S cũ (58 M so với 22 M,
+  # d 768 so với 384), nên 16 chỉ là KHỞI ĐIỂM và autobatch sẽ tự hạ.
   stage0.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
