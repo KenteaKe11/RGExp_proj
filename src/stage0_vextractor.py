@@ -1,7 +1,7 @@
 """Stage 0 của §2.2 — TỰ GIÁM SÁT (DINO), KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = DINOv3 ViT-S+ + DINO head        ─┐
+            ─► student = DINOv3 ConvNeXt-S + DINO head    ─┐
             ─► teacher = EMA của student (no_grad)         ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là backbone.** Không có Cls Head, không ASL,
@@ -11,7 +11,7 @@ không `labels.npz`, không F1/Recall/sqrt(F1·R). Phần ngoài backbone của 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt pretrain chỉ là
-ViT-S+ (28,7 M) + một DINO head. Thứ duy nhất còn cần từ model là `d_model`
+ConvNeXt-S (49,5 M) + một DINO head. Thứ duy nhất còn cần từ model là `d_model`
 (2560) để ghi vào spec, và nó được đọc từ `AutoConfig` (một file json, không
 tải trọng số).
 
@@ -103,7 +103,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ViT-S+ + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
+           # NÀO CẢ (chỉ ConvNeXt-S + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
            # từ vùng quá nhỏ. Ngược lại multi-crop nhân số lượt forward lên
            # (2 + n_local) lần, nên đừng bất ngờ nếu micro ra nhỏ hơn §2.1.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
@@ -531,14 +531,14 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     # không có con số nào bị đọc từ hai nguồn.
     spec = Z.spec_from_cfg(cfg, text_h)
     if not spec["vextractor"]["pretrained"]:
-        # Guard ở ĐÂY chứ không ở `vextractor.backbone_body`: selftest cần dựng được
-        # một ViT nhỏ ngẫu nhiên OFFLINE, còn một lượt pretrain THẬT trên
-        # backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
+        # Guard ở ĐÂY chứ không ở `vextractor.backbone_body`: selftest cần dựng
+        # được một backbone nhỏ ngẫu nhiên OFFLINE, còn một lượt pretrain THẬT
+        # trên backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
         raise TrainUnusable(
             "vextractor.vextractor.pretrained = false: cả điểm của §2.2 là 'một "
-            "encoder ĐÃ học sẵn mang vào thứ SigLIP không có', và Stage 0 ở /5 "
-            "là TIẾP TỤC DINO từ trọng số ấy. Chưng cất từ một ViT ngẫu nhiên "
-            "chỉ ra một ViT ngẫu nhiên khác — Stage 0 DỪNG.")
+            "encoder ĐÃ học sẵn mang vào thứ SigLIP không có', và Stage 0 ở /6 "
+            "là CHẠY DINO tiếp từ trọng số ấy. Chưng cất từ một backbone ngẫu "
+            "nhiên chỉ ra một backbone ngẫu nhiên khác — Stage 0 DỪNG.")
     img_size = int(spec["vextractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 
@@ -548,9 +548,27 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     assert_same_pixels(ds_tr, cfg)
 
     # CHỈ backbone — không Extractor, không Aligner, không Cls Head.
-    body, d_feat, n_patch, n_use, kind = Z.build_backbone(spec)
+    body, d_feat, n_patch, n_use, kind, fmt, multi_res = Z.build_backbone(spec)
     n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 1))
-    block = D.DinoTrainer(body, d_feat, n_prefix, dc).to(dev)   # fp32 + autocast
+    # Hai điều kiện của backbone PHẢI hỏi TRƯỚC khi nạp dữ liệu và dựng
+    # optimizer, không phải ở lượt forward đầu tiên của epoch 1.
+    if kind == "conv" and dc["pool"] == "cls":
+        raise TrainUnusable(
+            f"stage0.dino.pool = 'cls' nhưng {spec['vextractor']['arch']!r} trả "
+            f"một LƯỚI ({fmt}) và KHÔNG có cls token nào. ConvNeXt và SwinV2 "
+            f"đều vậy — đặt `stage0.dino.pool: mean`.\n"
+            f"    Không tự rơi về 'mean': config nói một đằng mà chạy một nẻo "
+            f"là thứ không bao giờ tự lộ ra.")
+    if dc["n_local"] > 0 and not multi_res:
+        raise TrainUnusable(
+            f"{spec['vextractor']['arch']!r} KHÔNG chạy được ở "
+            f"{img_size // 2}² (nửa độ phân giải), nên multi-crop với "
+            f"{dc['n_local']} local crop {dc['local_size']}² sẽ chết ở lượt "
+            f"forward đầu tiên.\n"
+            f"    Backbone này chỉ nhận đúng một cỡ ảnh. Đặt "
+            f"`stage0.dino.n_local: 0` (tắt multi-crop, DINO chỉ còn 2 global "
+            f"view), hoặc đổi sang backbone chạy được nhiều độ phân giải.")
+    block = D.DinoTrainer(body, d_feat, n_prefix, dc, fmt).to(dev)  # fp32 + autocast
     opt = torch.optim.AdamW(block.param_groups(sc["lr"], sc["backbone_lr"]),
                             weight_decay=sc["weight_decay"], betas=(0.9, 0.999),
                             eps=1e-8)
@@ -558,7 +576,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     n_hd = sum(p.numel() for p in block.student_head.parameters())
     _nl = "" if n_use is None else f", {n_use} block"
     print(f"  Stage 0 (TỰ GIÁM SÁT, KHÔNG nhãn): {spec['vextractor']['arch']} "
-          f"({kind}{_nl}, {n_prefix} prefix) {n_bb:,} tham số · lưới {n_patch} × "
+          f"({kind}/{fmt}{_nl}, {n_prefix} prefix) {n_bb:,} tham số · lưới {n_patch} × "
           f"{d_feat} ở {img_size}² · DINO head {n_hd:,} ({dc['out_dim']} "
           f"prototype, pool {dc['pool']}) · teacher EMA {n_bb + n_hd:,} (KHÔNG "
           f"vào optimizer; CHÍNH nó là thứ được lưu ra base//final/) · chuẩn "
@@ -1091,7 +1109,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
         "spec": spec,
         "vision": {"branch_encoder": spec["vextractor"]["arch"],
                    "pretrained": spec["vextractor"]["pretrained"],
-                   "norm": "LayerNorm của ViT (không BatchNorm, không thống kê chạy)",
+                   "norm": "LayerNorm (không BatchNorm, không thống kê chạy)",
                    "image_size": spec["vextractor"]["image_size"],
                    # ĐÚNG mean/std đi kèm trọng số của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.

@@ -8,13 +8,13 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone DINOv3 học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone ConvNeXt-S học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# với Q = Aligner(Extractor(ConvNeXt-teacher(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
 # 32 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
 # tạo 0. Ở /5 Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
 # và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
@@ -23,7 +23,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (DINOv3 ViT-S+ ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (DINOv3 ConvNeXt-S ăn ảnh 448²) — và chuỗi dài
 # thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -307,28 +307,37 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: DINOv3 ViT-S+/16 ăn thẳng ảnh gốc resize 448×448 ->
-# lưới 28×28 = 784 ô × 384 (bỏ 5 prefix token: 1 cls + 4 register). Lưới ấy
-# KHÔNG phải khối Q: `n_query` learner vector đi HỎI nó qua Cross-attn.
+# Nhánh có ENCODER RIÊNG: DINOv3 ConvNeXt-S ăn thẳng ảnh gốc resize 448×448 ->
+# (768, 14, 14), Flatten + Permute -> lưới 196 ô × 768 (stride 32; KHÔNG có
+# prefix token nào). Lưới ấy KHÔNG phải khối Q: `n_query` learner vector đi HỎI
+# nó qua Cross-attn.
 #
 #   KHỐI CAM (backbone) — Stage 0 TỰ GIÁM SÁT dạy (lưu ra TEACHER/EMA);
 #   main stage chạy nó ở chế độ TEACHER INFERENCE, đóng băng hoàn toàn.
 #   KHỐI VÀNG (Extractor + Aligner) — KHÔNG có ở Stage 0, học ở MAIN STAGE:
 #
-#     784 ô ─► Linear 384→768 ─► RMSNorm(768) ─────────────────────┐
-#     32 learner ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) hidden 1024 ─► (+)
+#     (768,14,14) ─► Flatten + Permute ─► 196 ô
+#           │
+#     196 ô ─► Linear 768→1024 ─► RMSNorm(1024) ───────────────────┐
+#     32 learner ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) hidden 1152 ─► (+)
 #                  │                      └──────── skip ─────────────┘
 #                  │                                  │
-#                  │                            RMSNorm(768)
+#                  │                           RMSNorm(1024)
 #                  │                                  │
 #                  │                            Cross-attn ◄────────────┘
-#                  └────────── skip ──────────────► (+) ─► Q_raw (32, 768)
+#                  └────────── skip ──────────────► (+) ─► Q_raw (32, 1024)
 #                                                     │
-#                              MLP(GeLU) 768→1152→2560 ─► Q (32, 2560)   [Aligner]
+#                             MLP(GeLU) 1024→2048→2560 ─► Q (32, 2560)  [Aligner]
 #
-# HAI chiều, đừng lẫn: `d_branch` (768) là chiều làm việc của Extractor;
+# HAI chiều, đừng lẫn: `d_branch` (1024) là chiều làm việc của Extractor;
 # `d_model` (2560) là chiều embedding của decoder và CHỈ xuất hiện ở đầu ra
 # Aligner. Stage 0 không dùng cả hai — nó chỉ chạy backbone + một DINO head.
+#
+# Trọng số nền LÀ DINOv3 thật: `convnext_small.dinov3_lvd1689m` là một trong
+# các checkpoint Facebook phát hành cho DINOv3 (ViT-S/S+/B/L/H+/7B và
+# ConvNeXt-T/S/B/L — không có Swin, nên "DINOv3-SwinV2" là tên của một thứ
+# không tồn tại). Stage 0 vì thế là ĐÚNG nghĩa "chạy tiếp": cùng họ trọng số,
+# cùng hàm mục tiêu, chỉ đổi miền ảnh từ web sang CXR.
 #
 # Aligner ở /5 là MỘT MLP THUẦN, không norm/attn/residual: phần "suy nghĩ" đã
 # nằm trọn trong Extractor, và cả hai đều do main stage dạy, nên không còn lý do
@@ -337,23 +346,30 @@ labels:
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
 vextractor:
-  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (32, 768)
-    image_size: 448         # chia hết patch 16. 448/16 = 28 -> 784 ô
-    # timm; lần chạy đầu tải ~115 MB. DINOv3 ViT-S+ (d = 384, 12 block, 5 prefix
-    # token). `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của DINOv3 — Stage 0 ở
-    # đây chạy TIẾP chính hàm mục tiêu ấy trên ảnh CXR.
-    arch: vit_small_plus_patch16_dinov3.lvd1689m
-    pretrained: true        # false bị TỪ CHỐI: chưng cất từ ViT ngẫu nhiên là vô nghĩa
-    # Số block ĐẦU được giữ lại; null = DÙNG HẾT (12 block). Chỉ có nghĩa với
-    # họ ViT (`.blocks` phẳng); họ conv khai nó sẽ bị TỪ CHỐI.
+  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (32, 1024)
+    image_size: 448         # stride 32 của ConvNeXt. 448/32 = 14 -> 196 ô
+    # timm; lần chạy đầu tải ~200 MB. DINOv3 ConvNeXt-S: 49,5 M tham số, d = 768,
+    # 36 block (3+3+27+3) trên 4 stage, KHÔNG cls token, đầu ra NCHW
+    # (B, 768, 14, 14) -> `patches()` gộp bằng đúng "Flatten + Permute".
+    # `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của DINOv3 — Stage 0 ở đây chạy
+    # TIẾP chính hàm mục tiêu ấy trên ảnh CXR.
+    #
+    # ConvNeXt thuần tích chập nên nhận MỌI độ phân giải mà không cần khoá nào:
+    # không pos-embed để nội suy, không cửa sổ để đệm, không assert về cỡ ảnh.
+    # MỘT state_dict chạy ở 448² (main stage) lẫn 224² (local crop của Stage 0).
+    arch: convnext_small.dinov3_lvd1689m
+    pretrained: true        # false bị TỪ CHỐI: chưng cất từ backbone ngẫu nhiên là vô nghĩa
+    # Số block ĐẦU được giữ lại; null = DÙNG HẾT. Chỉ có nghĩa với họ ViT
+    # (`.blocks` phẳng); ConvNeXt và SwinV2 xếp block theo 4 stage với số kênh
+    # khác nhau nên khai số ở đây sẽ bị TỪ CHỐI. Với ConvNeXt PHẢI là null.
     n_layers: null
     n_query: 32             # số learner = số token Q nối vào chuỗi decoder
-    d_branch: 768           # chiều làm việc của Extractor
-    n_heads: 6              # Self/Cross-attn ở 768: head_dim 128 (768 = 6 × 128)
-    mlp_hidden: 1024        # MLP(GeLU) GIỮA hai attn: 768 -> 1024 -> 768
+    d_branch: 1024          # chiều làm việc của Extractor
+    n_heads: 8              # Self/Cross-attn ở 1024: head_dim 128 (1024 = 8 × 128)
+    mlp_hidden: 1152        # MLP(GeLU) GIỮA hai attn: 1024 -> 1152 -> 1024
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # MLP THUẦN, chỗ DUY NHẤT đổi chiều 768 -> 2560
-    mlp_hidden: 1152
+  aligner:                  # MLP THUẦN, chỗ DUY NHẤT đổi chiều 1024 -> 2560
+    mlp_hidden: 2048
     dropout: 0.0
   # ── Main stage ─────────────────────────────────────────────────────────
   # ĐÚNG MỘT nhóm tham số học được trong nhánh: Extractor (phần ngoài backbone)
@@ -380,7 +396,13 @@ vextractor:
 
 # ── Stage 0: TỰ GIÁM SÁT (DINO) — `src/stage0_vextractor.py`, `src/dino.py` ──
 # KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
-# huấn luyện là backbone DINOv3, bằng chính hàm mục tiêu nó được sinh ra với.
+# huấn luyện là backbone DINOv3 ConvNeXt-S, bằng chính hàm mục tiêu nó được
+# sinh ra với.
+#
+# MỌI siêu tham số dưới đây GIỮ NGUYÊN của bản ViT — τ_s/τ_t, centering, lịch
+# EMA, số prototype, multi-crop, lr, warm-up, weight decay. Đổi họ backbone mà
+# đổi luôn siêu tham số thì không còn nói được hiệu số đến từ đâu. Khoá DUY
+# NHẤT phải đổi là `pool` (ConvNeXt không có cls token).
 # Thứ được LƯU RA base//final/ là **teacher** (EMA), không phải student: teacher
 # mượt hơn, không mang nhiễu của bước Adam cuối, và chính nó là nhánh sinh mục
 # tiêu trong DINO — main stage vì thế chạy đúng chế độ teacher inference.
@@ -437,7 +459,8 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # chia hết patch 16. Backbone dựng dynamic_img_size
+    local_size: 224         # 224/32 = 7 ô. ConvNeXt nhận thẳng, không cần khoá
+                            # nào; backbone chỉ nhận MỘT cỡ thì n_local về 0
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
     # Số prototype. KHÔNG phải 65536 của DINO gốc: tập train ở đây 6400 ảnh, và
@@ -447,7 +470,11 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    pool: cls               # cls | mean. ViT có cls token; họ conv phải dùng mean
+    # cls | mean. ConvNeXt KHÔNG có cls token nào, nên phải là `mean` (trung
+    # bình 196 ô của lưới). `pool: cls` với backbone lưới bị TỪ CHỐI ngay lúc
+    # dựng backbone, không tự rơi về mean: config nói một đằng chạy một nẻo là
+    # thứ không bao giờ tự lộ ra.
+    pool: mean
     # τ_t PHẢI nhỏ hơn τ_s (sharpening) — đảo dấu bị TỪ CHỐI. Cùng với centering
     # đây là hai lực đẩy ngược nhau giữ DINO khỏi sụp.
     student_temp: 0.1

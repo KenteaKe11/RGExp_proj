@@ -1,9 +1,23 @@
 """DINO self-distillation cho Stage 0 của §2.2 — KHÔNG nhãn, KHÔNG ASL.
 
-Stage 0 ở bố cục /5 chỉ huấn luyện MỘT thứ: backbone DINOv3 ViT-S+, tiếp tục từ
-trọng số đã phát hành, bằng chính hàm mục tiêu nó được sinh ra với. Không có
+Stage 0 ở bố cục /6 chỉ huấn luyện MỘT thứ: backbone DINOv3 ConvNeXt-S, chạy
+tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng chính hàm mục tiêu
+nó được sinh ra với. Không có
 `labels.npz`, không Cls Head, không F1/Recall — epoch được chọn theo loss tự
 giám sát trên một tập val CỐ ĐỊNH.
+
+**Cấu hình huấn luyện giữ NGUYÊN của bản ViT** — τ_s/τ_t, centering, lịch EMA,
+số prototype, multi-crop, lr, warm-up: không khoá nào đổi theo backbone. Đổi họ
+backbone mà đổi luôn siêu tham số thì không còn nói được hiệu số đến từ đâu.
+
+Hai chỗ ConvNeXt khác ViT và Stage 0 phải biết:
+
+  * **không có cls token.** `pool` bắt buộc `mean`, và `stage0_vextractor` TỪ
+    CHỐI `pool: cls` với backbone lưới thay vì lặng lẽ rơi về mean;
+  * **đầu ra là một LƯỚI 4 chiều**, không phải chuỗi. ConvNeXt trả NCHW
+    (B, C, H, W); SwinV2 — cùng 4 chiều — lại trả NHWC. `pool_feature` vì thế
+    NHẬN `fmt` chứ không suy từ `f.dim()`: lấy trung bình nhầm trục cho ra một
+    vector dài H thay vì dài C, và DINO head vẫn nuốt được nó.
 
     student(view_s) ─► head ─► logits ─┐
                                         ├─► CE( softmax((t − center)/τ_t) ‖ log_softmax(s/τ_s) )
@@ -136,9 +150,9 @@ class DINOHead(nn.Module):
     nhất điều khiển độ nhọn của phân phối. Để `weight_g` học được thì nó tự
     nhân vào τ và hai siêu tham số đánh nhau.
 
-    Đọc vector nào của backbone: `cls` (token đầu) là mặc định — DINO gốc chưng
-    cất trên CLS. `mean` (trung bình các patch, đã bỏ prefix) có cho họ conv,
-    vốn không có CLS token nào.
+    Đọc vector nào của backbone: `cls` (token đầu) — DINO gốc chưng cất trên
+    CLS. `mean` (trung bình các patch, đã bỏ prefix) cho họ lưới (ConvNeXt,
+    SwinV2), vốn không có CLS token nào; đó là chế độ của /6.
     """
 
     def __init__(self, d_feat: int, out_dim: int = 4096, hidden: int = 2048,
@@ -168,10 +182,23 @@ class DINOHead(nn.Module):
         return self.last(F.normalize(x, dim=-1, p=2))
 
 
-def pool_feature(f: torch.Tensor, n_prefix: int, mode: str) -> torch.Tensor:
-    """Lưới đặc trưng của backbone -> MỘT vector mỗi ảnh, cho DINO head."""
-    if f.dim() == 4:                      # (B, C, H, W) — họ conv: không có CLS
-        return f.mean(dim=(2, 3))
+def pool_feature(f: torch.Tensor, n_prefix: int, mode: str,
+                 fmt: str = "NCHW") -> torch.Tensor:
+    """Lưới đặc trưng của backbone -> MỘT vector mỗi ảnh, cho DINO head.
+
+    `fmt` KHÔNG có mặc định an toàn nào: NCHW và NHWC cùng 4 chiều, nên lấy
+    trung bình nhầm trục không ném lỗi — ở 448² nó trả một vector dài 14 thay vì
+    dài 768, `DINOHead` nuốt được (Linear của nó nhận d_feat,
+    và d_feat cũng đã đọc sai từ cùng một chỗ), và Stage 0 chạy hết 51 epoch để
+    chưng cất một thứ vô nghĩa. Giá trị thật đến từ `output_fmt` của model, đo
+    một lần ở `vextractor.backbone_body`.
+    """
+    if f.dim() == 4:                      # họ lưới: không có CLS token nào
+        if mode == "cls":
+            raise ValueError(
+                "stage0.dino.pool = 'cls' nhưng backbone trả một LƯỚI "
+                "(ConvNeXt/SwinV2) — không có cls token. Đặt `pool: mean`.")
+        return f.mean(dim=(1, 2)) if str(fmt).upper() == "NHWC" else f.mean(dim=(2, 3))
     if mode == "cls":
         if n_prefix < 1:
             raise ValueError("stage0.dino.pool = 'cls' nhưng backbone không có "
@@ -189,12 +216,17 @@ class DinoTrainer(nn.Module):
     `student_body` (xem `vextractor.save_stage0`).
     """
 
-    def __init__(self, body: nn.Module, d_feat: int, n_prefix: int, dc: dict):
+    def __init__(self, body: nn.Module, d_feat: int, n_prefix: int, dc: dict,
+                 fmt: str = "NCHW"):
         super().__init__()
         import copy
 
         self.n_prefix = int(n_prefix)
         self.pool = str(dc.get("pool", "cls"))
+        # Bố cục trục của `forward_features` — xem `pool_feature`. Không phải
+        # buffer: nó tả KIẾN TRÚC, và `state_dict` của Stage 0 phải nạp được
+        # vào `VExtractor.body` mà không mang theo khoá lạ.
+        self.fmt = str(fmt).upper()
         self.student_body = body
         self.student_head = DINOHead(d_feat, dc["out_dim"], dc["hidden"],
                                      dc["bottleneck"], dc["head_layers"])
@@ -229,12 +261,14 @@ class DinoTrainer(nn.Module):
     # ── forward ───────────────────────────────────────────────────────────
     def _student(self, x: torch.Tensor) -> torch.Tensor:
         f = self.student_body.forward_features(x)
-        return self.student_head(pool_feature(f, self.n_prefix, self.pool))
+        return self.student_head(
+            pool_feature(f, self.n_prefix, self.pool, self.fmt))
 
     @torch.no_grad()
     def _teacher(self, x: torch.Tensor) -> torch.Tensor:
         f = self.teacher_body.forward_features(x)
-        return self.teacher_head(pool_feature(f, self.n_prefix, self.pool))
+        return self.teacher_head(
+            pool_feature(f, self.n_prefix, self.pool, self.fmt))
 
     def loss(self, views: list[torch.Tensor], teacher_temp: float,
              update_center: bool = True) -> torch.Tensor:

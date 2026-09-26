@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# setup.sh — dựng môi trường cho §2.3. Chạy MỘT LẦN.
+# setup.sh — dựng môi trường cho §2.2 V-Extractor. Chạy MỘT LẦN.
 #
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
@@ -8,13 +8,12 @@
 #
 # MỘT môi trường duy nhất: transformers 4.51/4.52 cho Gemma 3, cộng
 # peft + bitsandbytes cho adapter (requirements-adapters.txt —
-# scripts/run_recomb.sh tự cài phần đó nếu thiếu).
+# scripts/run_vextractor.sh tự cài phần đó nếu thiếu).
 #
-# Repo này chỉ còn §2.3. §2.0/§2.1 (zero-shot, các model không phải Gemma) và
-# §2.2 (tám biến thể adapter + Friedman) nằm trong _archive/. Chúng cần
-# transformers 4.36/4.37 trong một venv cô lập, và giữ lại phần dựng venv đó ở
-# đây nghĩa là mỗi lần setup phải trả ~10 phút cho một thứ không lần chạy nào
-# dùng tới.
+# Repo này chỉ còn §2.2 V-Extractor. §2.0/§2.1 và $1 nằm trong _archive/.
+# Chúng cần transformers 4.36/4.37 trong một venv cô lập, và giữ lại phần dựng
+# venv đó ở đây nghĩa là mỗi lần setup phải trả ~10 phút cho một thứ không lần
+# chạy nào dùng tới.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -24,7 +23,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.3 Nhánh Recombinator — setup ═══"
+echo "═══ §2.2 V-Extractor (DINOv3 ConvNeXt-S) — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -178,20 +177,13 @@ else
 fi
 
 # ── 5. requirements ─────────────────────────────────────────────────────────
-# File BẮT BUỘC của §2.3. `configs/adapters.yaml` và `src/run_adapters.py`
-# KHÔNG còn trong danh sách: chúng thuộc §2.2 và đã sang _archive/ (xem
-# scripts/archive_2.2.sh). Đòi chúng ở đây là chặn setup vì một thứ repo đã cố
-# ý bỏ đi.
+# File BẮT BUỘC của §2.2. Config/script của $1 và §2.0/§2.1 KHÔNG có trong
+# danh sách: chúng đã sang _archive/, và đòi chúng ở đây là chặn setup vì một
+# thứ repo đã cố ý bỏ đi.
 for f in requirements.txt configs/vextractor.yaml configs/gpu/rtx3060.yaml \
          src/run_vextractor.py src/train_recomb.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
-# Nếu §2.2 vẫn còn ở src/, nhắc — nhưng KHÔNG chặn: setup không phải chỗ ép
-# người ta dọn repo.
-if [ -f "src/train.py" ] || [ -f "configs/vextractor.yaml" ]; then
-    echo "⚙ §2.2 (và bản §2.3 đời trước) vẫn còn trong repo."
-    echo "  Chuyển đi trước khi chạy thật:  bash scripts/archive_2.2.sh --apply"
-fi
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
@@ -246,7 +238,7 @@ p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
 if p.total_memory / 1024**3 < 16:
-    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.3 KHÔNG dò batch. "
+    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — main stage KHÔNG dò batch. "
           "Hết VRAM thì hạ, theo thứ tự,")
     print("  train.max_seq_len (configs/vextractor.yaml) hoặc "
           "train.per_device_batch_size (configs/gpu/<card>.yaml)")
@@ -285,13 +277,13 @@ echo "  2. Tự kiểm chứng (vài giây, không cần GPU):"
 echo "       python scripts/selftest_vextractor.py   # phải qua HẾT"
 echo
 echo "  3. Thử đường ống + VRAM đỉnh (config: configs/vextractor.yaml + configs/gpu/):"
-echo "       bash scripts/run_vextractor.sh --dry-run"
+echo "       bash scripts/run_vextractor.sh train --dry-run"
 echo
 echo "  4. CHẠY THẬT:"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run_vextractor.sh --detach"
+    echo "       bash scripts/run_vextractor.sh train --detach"
     echo "       # chạy nền, trả lại shell ngay, in link W&B."
 else
-    echo "       bash scripts/run_vextractor.sh"
+    echo "       bash scripts/run_vextractor.sh train"
 fi
 echo
