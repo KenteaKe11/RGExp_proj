@@ -99,11 +99,13 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = Aligner(Extractor(DINOv3(ảnh 448²))), Z giữ nguyên)"],
+         f"token, Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²))), Z giữ nguyên)"],
         ["Stage 0", "—", f"backbone TỰ GIÁM SÁT (DINO, KHÔNG nhãn), dùng epoch "
-                          f"{s0.get('best_epoch', '?')} ({s0.get('select', 'last')})"],
+                          f"{s0.get('best_epoch', '?')} ({s0.get('select', 'last')}) "
+                          f"— checkpoint là bản TEACHER (EMA)"],
         ["nhánh ở main stage", "—",
-         f"backbone nạp từ Stage 0 và ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · "
+         f"backbone = TEACHER (EMA) của Stage 0, chạy TEACHER INFERENCE "
+         f"(eval + no_grad, 0 bước học) · "
          f"Extractor + Aligner MỚI, warm-up {zm.get('align_warmup_steps')} bước "
          f"từ {zm.get('align_warmup_start_lr')} rồi lr cố định "
          f"{zm.get('align_lr')} wd {zm.get('align_wd')}"],
@@ -111,7 +113,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     ]))
     L.append("")
 
-    L.append("## Stage 0 — backbone, TỰ GIÁM SÁT (DINO, KHÔNG nhãn)\n")
+    L.append("## Stage 0 — backbone DINOv3, TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
+             "checkpoint = TEACHER (EMA)\n")
     if s0.get("history"):
         sc0 = s0.get("stage0", {}) or {}
         fa0 = sc0.get("final_anneal") or {}
@@ -209,6 +212,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              "đã khoá). Đây là nhiễu hạt giống, không phải một biến có hệ thống.")
     L.append("- Backbone của B được Stage 0 dạy TỰ GIÁM SÁT (DINO) trên 6400 ảnh "
              "train — KHÔNG nhãn nào, nên B không có nguồn giám sát nào A thiếu; "
+             "bản mang sang main stage là TEACHER (EMA), đúng thứ đã sinh mục tiêu "
+             "trong Stage 0; "
              "thứ nó thêm là một biểu diễn thị giác của chính miền ảnh CXR.")
     _nqb = _nq(st_b)
     L.append(f"- B có chuỗi DÀI HƠN A đúng {_nqb} token. Số token vào CE giữ nguyên "
@@ -217,7 +222,8 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              f"một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
     _np = (st_b.get("vextractor") or {}).get("n_params") or {}
     _lm = _np.get("learnable_main")
-    L.append(f"- BACKBONE ĐÓNG BĂNG HOÀN TOÀN suốt main stage: 0 bước cập nhật, "
+    L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và chạy ở chế độ "
+             f"TEACHER INFERENCE suốt main stage: 0 bước cập nhật, "
              f"không có gradient nào chạm vào nó. Tham số học được mà A không có "
              f"nằm TRỌN trong Extractor + Aligner "
              f"({_lm:,} tham số) ở lr {zm.get('align_lr')} (warm-up "

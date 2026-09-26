@@ -8,11 +8,13 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (pretrain V-Extractor + Cls Head, ASL)
-#                                    -> main stage y hệt A + nhánh V-Extractor.
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone DINOv3 học TỰ GIÁM SÁT
+#                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
+#                                    bản TEACHER/EMA) -> main stage y hệt A +
+#                                    nhánh V-Extractor (backbone teacher infer).
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Aligner(Extractor(DINOv3(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# với Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
 # 32 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
 # tạo 0. Ở /5 Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
 # và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn

@@ -432,7 +432,8 @@ def main(argv: list[str] | None = None) -> int:
                      "test": "$2.2_V-Extractor_Test",
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
-                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = V-Extractor(ảnh 448²) (B)"})
+                     "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], "
+                                 "Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²))) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 
@@ -443,7 +444,8 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     print(f"\n═══ §2.2 V-Extractor — lệnh `{a.command}` ({', '.join(stages)}) ═══", flush=True)
     print(f"  A {A['id']:<26} {A['source']} (không huấn luyện lại)\n"
-          f"  B {B['id']:<26} A + V-Extractor (Stage 0 -> Q, chuỗi [Z ‖ Q ‖ T])",
+          f"  B {B['id']:<26} A + V-Extractor (backbone = teacher EMA của Stage 0 "
+          f"-> Extractor+Aligner -> Q; chuỗi [Z ‖ Q ‖ T])",
           flush=True)
     rc = 0
     if set(stages) & set(COMMANDS["train"]):
@@ -578,7 +580,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal
-        _hr("Stage 0 — pretrain V-Extractor + Cls Head (ASL)")
+        _hr("Stage 0 — backbone DINOv3, TỰ GIÁM SÁT (DINO, KHÔNG nhãn, KHÔNG Gemma)")
         try:
             def _base_done() -> None:
                 # base xong -> đẩy base/ + history + loader NGAY, trước epoch n+1
@@ -770,7 +772,7 @@ def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
     if not lens.lcfg(cfg)["enabled"]:
         print("⊘ lens.enabled = false — bỏ qua", flush=True)
         return 0
-    _hr("Lens — mổ khối Q trên một ảnh tiêu biểu (Jacobian · logit lens · chain rule)")
+    _hr("Lens — mổ khối Q trên một ảnh (token×lớp · logit lens · 3 ô về pixel)")
     n_test = int(cfg["data"].get("n_test") or 0)
     pull = bool(cfg["output"].get("pull", True)) and not a.no_pull
     if not fx_mod.exists(fx):

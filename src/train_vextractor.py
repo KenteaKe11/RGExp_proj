@@ -10,7 +10,7 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                   inject_tokens(build_inputs_embeds(ids, Z), Q) — thứ tự
                   [Z ‖ Q ‖ T], tức Q nằm SAU token ảnh nên mọi vị trí của Q đều
                   đọc được toàn bộ Z bằng attention nhân quả;
-                  256 vị trí thêm vào có nhãn −100, attention_mask 1,
+                  32 vị trí (`n_query`) thêm vào có nhãn −100, attention_mask 1,
                   token_type_ids 0, nên SỐ TOKEN VÀO CE không đổi và CE của A
                   với B vẫn là cùng một đại lượng;
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
@@ -34,8 +34,9 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                  một khác biệt thứ hai so với A.
 
 ĐƯỜNG ẢNH THỨ HAI. Khác §2.1, nhánh ở đây không đọc X của SigLIP mà có encoder
-riêng, nên mỗi batch phải mang THÊM `vext_pixels` (B, 3, 512, 512) chuẩn hoá
-ImageNet. `VExtReportDataset` gắn nó vào đúng chỗ `ClsReportDataset` mã hoá mẫu
+riêng, nên mỗi batch phải mang THÊM `vext_pixels` (B, 3, 448, 448) chuẩn hoá
+bằng ĐÚNG mean/std của checkpoint backbone (đọc từ `timm.pretrained_cfg` —
+DINOv3 là 0.5/0.5, KHÔNG phải một hằng ImageNet gõ tay). `VExtReportDataset` gắn nó vào đúng chỗ `ClsReportDataset` mã hoá mẫu
 (theo chỉ số THẬT, không theo i — xem docstring lớp cha), và `collate_vext`
 xếp chồng. Một batch thiếu trường ấy DỪNG ngay ở `forward_ce` thay vì lặng lẽ
 huấn luyện với Q của ảnh khác.
@@ -44,7 +45,8 @@ Giữ nguyên so với A (đọc từ fixture $1 / config chung): 6400 mẫu tra
 torch.randperm(Generator(seed)), batch mỗi lượt đã khoá (`train_batch`),
 grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear của
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
-Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
+KHÔNG còn Cls Head / ASL / nhãn ở bất kỳ đâu; DINO head của Stage 0 cũng chỉ là
+giàn giáo tự giám sát và bị bỏ lại cùng student sau Stage 0.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
 mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt DINOv3 ViT-S+ ở 448²
@@ -431,7 +433,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
           f"wd {zc['align_wd']} · "
           f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}", flush=True)
     if 0 < _aw >= steps:
-        print(f"  ⚠ align_warmup_steps {_aw} >= tổng {steps} bước: Aligner KHÔNG "
+        print(f"  ⚠ align_warmup_steps {_aw} >= tổng {steps} bước: Extractor+Aligner "
+              f"KHÔNG "
               f"bao giờ chạm {zc['align_lr']:g}.", flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────

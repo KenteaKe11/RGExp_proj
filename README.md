@@ -3,7 +3,8 @@
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
 cùng loader, cùng 3000 ảnh test), rồi **nối thêm 32 vector** từ một **encoder
-thị giác RIÊNG** — **Q = Aligner(Extractor(DINOv3(ảnh 448²)))** — ngay sau 256 token ảnh, thì
+thị giác RIÊNG** — **Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²)))** — ngay sau 256 token
+ảnh, thì
 chất lượng báo cáo X-quang có đổi không?
 
 | candidate | nguồn | chuỗi vào decoder |
@@ -36,7 +37,7 @@ kiểm, `train` dừng nếu lệch).
 ảnh ──────────────┤
                   └─► resize 448×448, chuẩn hoá theo pretrained_cfg  [đường RIÊNG của nhánh]
                          │
-                      DINOv3 ViT-S+/16 ─► forward_features, bỏ 5 prefix
+       DINOv3 ViT-S+/16 (main stage: TEACHER EMA, eval + no_grad) ─► forward_features, bỏ 5 prefix
                          │                ─► (784, 384)
                       Linear 384→768 ─► RMSNorm(768) ────────────────┐   (K, V)
                                                                      │
@@ -117,7 +118,7 @@ trên một mẫu thật mỗi lần chạy.
 
 | khối | tham số |
 |---|---|
-| **backbone** DINOv3 ViT-S+/16 @448 → lưới 784 × 384 | **28,7 M** — *Stage 0 dạy, main stage đóng băng* |
+| **backbone** DINOv3 ViT-S+/16 @448 → lưới 784 × 384 | **28,7 M** — *Stage 0 dạy; main stage dùng bản TEACHER (EMA), teacher inference* |
 | `Linear 384→768` | 295 K |
 | 32 learner | 24,6 K |
 | Self-attn @768 | 2,36 M |
@@ -352,7 +353,7 @@ export WANDB_API_KEY=xxxxxxxx
 python scripts/selftest_vextractor.py             # vài giây, không cần GPU
 bash scripts/run_vextractor.sh train --dry-run    # 8 ảnh, 16 mẫu, Stage 0 ≤2 bước, main 4 bước
 
-bash scripts/run_vextractor.sh train --detach     # 1. kéo A -> Stage 0 (1 norm + 4 main -> base, epoch 6 -> final) -> main B -> sinh -> chấm
+bash scripts/run_vextractor.sh train --detach     # 1. kéo A -> Stage 0 DINO (1 warm-up + ≤50 base -> base/, epoch n+1 -> final/) -> main B -> sinh -> chấm
 bash scripts/run_vextractor.sh stats              # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
 bash scripts/run_vextractor.sh lens               # 3. mổ khối Q trên 1 ảnh -> Lens/Lens_Explain.md (ghi đè)
 bash scripts/run_vextractor.sh push               # 4. -> current/$2.2_V-Extractor_Test/ (kèm Reports/Lens/)
@@ -374,14 +375,16 @@ Các cờ:
 
 * `--retrain-all` (hoặc `vextractor_exp.retrain_all: true`): huấn luyện lại **toàn bộ B**
   — Stage 0, main stage, sinh, chấm — bỏ qua mọi thứ đã có cục bộ lẫn trên Hub. A ($1) không đổi.
-* `--restage0`: pretrain lại cả 5 epoch, kéo theo `--retrain`.
+* `--restage0`: chạy lại TOÀN BỘ Stage 0 (warm-up + base + epoch n+1), kéo theo
+  `--retrain`.
 * `--refinal`: **chỉ chạy lại epoch n+1** (final_anneal), giữ nguyên `base/`; kéo theo
   `--retrain`. Máy chưa có `base/` thì **kéo `base/` từ Hub** (`stage0/base/`, chỉ khi
   vân tay base khớp) rồi chạy epoch n+1; không có ở đâu cả thì dừng và bảo dùng `--restage0`.
   Checkpoint **bố cục cũ** (chỉ có `stage0/final/` = epoch cuối của phần base) được
   **nhận làm `base/`** khi vân tay base khớp — cục bộ lẫn trên Hub — nên không phải
   pretrain lại phần base.
-* `--stages data,stage0`: chỉ chạy Stage 0 (base 4 epoch + epoch 5), không đụng main stage.
+* `--stages data,stage0`: chỉ chạy Stage 0 (warm-up + base + epoch n+1), không
+  đụng main stage.
 * `--retrain`: chỉ main stage.
 * `--stages infer,score`.
 * `--no-pull`.
@@ -391,16 +394,15 @@ Các cờ:
 ```
 adapters_vextractor/_fixture/                  = fixture của $1 (vân tay trùng) + sha weight của B
 adapters_vextractor/_stage0/                   PRETRAIN — để về sau đối chứng SoTA
-    base/vextractor_stage0.safetensors|.json TRỌNG SỐ BACKBONE sau 1 warm-up + n base epoch
-    final/vextractor_stage0.safetensors|.json sau epoch 6 (cosine 1e-5 → 1e-7) — main stage dùng bản này
-    loader.json                              fixture + sha key, nhãn (npz, mã hoá, tỉ lệ lớp), thứ tự,
-                                             batch/micro, lịch, khối `dino`, spec, vân tay, sha256 weight
-    stage0_labels.npz                        nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
+    base/vextractor_stage0.safetensors|.json TRỌNG SỐ BACKBONE — bản TEACHER (EMA), sau 1 warm-up + n base epoch
+    final/vextractor_stage0.safetensors|.json teacher EMA sau epoch n+1 (anneal đang TẮT nên trùng base/) — main stage dùng bản này
+    loader.json                              fixture + sha key, `labels: null` (TỰ GIÁM SÁT), thứ tự,
+                                             batch/micro, lịch, khối `augment` + `dino`, spec, vân tay, sha256 weight
     stage0_history.json                      từng epoch: train/val loss DINO, val_score
     last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
 adapters_vextractor/qlora_r32_decoder_vextractor/   MAIN STAGE
     adapter_model.safetensors, adapter_config.json   LoRA r32
-    vextractor_branch.safetensors|.json      V-Extractor (nạp trọn, đóng băng) + Aligner (đã học)
+    vextractor_branch.safetensors|.json      TRỌN nhánh: backbone teacher (đóng băng) + Extractor + Aligner (đã học)
     vextractor_stage0.safetensors|.json      bản chép Stage 0 đã nạp (truy nguồn)
     train_stats.json                         batch/accum/mảnh, lr, val curve, RMS(Q)/RMS(Z), VRAM, phút
 runs/vextractor/                               REPORT.md, manifest.json, predictions/, metrics/, arms/ (tem), stage0/
@@ -411,7 +413,7 @@ Trên Hub (`RGExp123/Research_results`):
 ```
 current/$2.2_V-Extractor_Test/Reports/                 REPORT.md, manifest, metrics/, predictions/ (A + B), arms/, stage0/
 current/$2.2_V-Extractor_Test/fixture/                 loader.json + split (= $1, thêm sha weight B)
-current/$2.2_V-Extractor_Test/stage0/                  base/, final/, loader.json, stage0_labels.npz, stage0_history.json
+current/$2.2_V-Extractor_Test/stage0/                  base/, final/, loader.json, stage0_history.json
 current/$2.2_V-Extractor_Test/weights/qlora_r32_decoder_vextractor/
 ```
 
@@ -419,7 +421,8 @@ Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
 Hai lần đẩy tự động trong lúc `train`:
 
-* Stage 0: `base/` được đẩy ngay khi phần base xong, `final/` được đẩy khi epoch 5 xong (kèm fixture).
+* Stage 0: `base/` được đẩy ngay khi phần base xong, `final/` được đẩy khi epoch
+  n+1 xong (kèm fixture). Cả hai là trọng số TEACHER (EMA).
 * B được đẩy riêng ngay khi sinh xong, và lại sau khi chấm xong.
 
 Trên máy mới, `train` kéo Stage 0 từ Hub nếu vân tay khớp, rồi kéo weight và kết
@@ -443,7 +446,7 @@ src/lens_vextractor.py   Lens (CHỈ B): heatmap token×lớp · logit lens · 3
 src/report_vextractor.py REPORT.md
 src/stats_ab.py          bootstrap ghép cặp (BCa) + permutation, Holm
 src/runners/gemma3_vextractor.py sinh: A = [Z ‖ text], B = [Z ‖ Q ‖ text] (cùng đường)
-src/recombiner.py        RMSNorm, ASL, encode_vision, build_inputs_embeds, inject_tokens,
+src/recombiner.py        RMSNorm, encode_vision, build_inputs_embeds, inject_tokens,
                          image_end_indices / last_image_index (chỗ nối Q)
 src/fixture.py · hub_sync.py · push.py · train_recomb.py · backbone.py …
 ```

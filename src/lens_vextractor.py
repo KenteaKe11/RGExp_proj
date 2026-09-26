@@ -606,7 +606,8 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
             f"        bash scripts/run_vextractor.sh train --retrain --detach")
     item = pick_sample(cfg, test_df)
     print(f"  ⚙ Lens dùng ảnh {item['key']} · {item['n_pos']} pos · {item['n_unc']} "
-          f"uncertain · {item['n_labelled']}/14 nhãn có mặt", flush=True)
+          f"uncertain · {item['n_labelled']}/14 nhãn có mặt (nhãn CHỈ dùng để CHỌN "
+          f"ảnh — không vào loss, không vào bản đồ nào)", flush=True)
 
     print(f"  ── {bid} ──", flush=True)
     model, processor, gemma, branch, st = load_arm(cfg, adir)
@@ -654,7 +655,8 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
     (d / "lens.json").write_text(json.dumps(out, indent=2, ensure_ascii=False,
                                             default=str), encoding="utf-8")
     write_doc(cfg, d, A, B, item, res, tops, figs, out)
-    print(f"  ✓ Lens xong sau {out['minutes']} phút -> {d / DOC}", flush=True)
+    print(f"  ✓ Lens xong sau {out['minutes']} phút · 3 ô (gốc · Z · khối Q) "
+          f"-> {d / DOC}", flush=True)
     return out
 
 

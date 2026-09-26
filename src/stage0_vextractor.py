@@ -912,7 +912,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                      steps_per_epoch, spec, best)
         tail = f" (dừng sớm, trần {sc['base_epochs']})" if stopped_early else ""
         print(f"  ✓ Stage 0 base: {ep_ran} epoch{tail} xong · best = epoch "
-              f"{best['epoch']} -> {d / BASE}", flush=True)
+              f"{best['epoch']} · lưu TEACHER EMA -> {d / BASE}", flush=True)
         if on_base_done is not None:
             on_base_done()
 
@@ -1005,8 +1005,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     block = opt = None                  # nhả VRAM trước free_vram
     free_vram()
     print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · final = epoch "
-          f"{best['epoch']} (val DINO = {-float(best['score']):.4f}) -> "
-          f"{d / CKPT}", flush=True)
+          f"{best['epoch']} (val DINO = {-float(best['score']):.4f}) · lưu "
+          f"TEACHER EMA -> {d / CKPT}", flush=True)
     return out
 
 
