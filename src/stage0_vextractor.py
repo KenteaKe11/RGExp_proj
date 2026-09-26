@@ -1,54 +1,44 @@
-"""Stage 0 — pretrain Supervised Block (V-Extractor + Cls Head) trước main stage.
+"""Stage 0 của §2.2 — TỰ GIÁM SÁT (DINO), KHÔNG nhãn.
 
-    ảnh 448² ─► ConvNeXt-S (ImageNet-1k) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
+    ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
+            ─► student = DINOv3 ViT-S+ + DINO head        ─┐
+            ─► teacher = EMA của student (no_grad)         ┴─► CE(t ‖ s) = loss
 
-Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
-chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor. Main stage nạp
-nguyên `vextractor.*` và bỏ Cls Head.
+**Thứ DUY NHẤT được huấn luyện là backbone.** Không có Cls Head, không ASL,
+không `labels.npz`, không F1/Recall/sqrt(F1·R). Phần ngoài backbone của nhánh
+(Linear vào, 32 learner, Self/Cross-attn, MLP) và Aligner đều KHÔNG có mặt ở
+đây — chúng là của main stage. Xem `src/dino.py` cho hàm mục tiêu và
+`src/vextractor.py` cho bố cục.
 
-KHÁC §2.1: Stage 0 ở đây KHÔNG nạp Gemma. Nhánh có encoder thị giác của riêng
-nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ConvNeXt-S +
-hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
-`d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
-config, không tải trọng số).
+**Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt pretrain chỉ là
+ViT-S+ (28,7 M) + một DINO head. Thứ duy nhất còn cần từ model là `d_model`
+(2560) để ghi vào spec, và nó được đọc từ `AutoConfig` (một file json, không
+tải trọng số).
 
-MỘT lr cho TẤT CẢ: `stage0.lr` = 1e-5, PHẲNG suốt Stage 0. Optimizer vẫn giữ
-hai nhóm (`backbone` = ConvNeXt, `rest` = Linear vào · 32 learner Q · Self-attn ·
-Cross-attn · MLP · Cls Head) để về sau tách ra được, nhưng `stage0.backbone_lr`
-mặc định LẤY THEO `stage0.lr`, nên khai một số là cả hai nhóm đi cùng một số.
-Thứ DUY NHẤT làm lr đổi là epoch warm-up ở đầu.
-
-Lịch (khối `stage0` của configs/vextractor.yaml) — 1 warm-up + tối đa 50 epoch,
-DỪNG SỚM theo `patience`:
-
-  * **epoch 1 — "warmup"**: CẢ HAI nhóm ramp tuyến tính theo BƯỚC từ
-    `warmup_start_lr` (1e-8) lên
-    `lr` = 1e-5 trong `warmup_epochs` (1.0) epoch. KHÔNG còn epoch "norm" của
-    bản ResNet50: ViT không có BatchNorm nên không có thống kê chạy nào cần kéo
-    về phân phối ảnh CXR;
-  * **epoch 2–51 — "base"**: lr PHẲNG ở 1e-5, weight_decay 0.03. `max_epochs`
-    (50) là TRẦN, không phải số epoch sẽ chạy;
-  * **dừng sớm**: sau mỗi epoch đo val; `patience` (5) epoch LIÊN TIẾP không cải
-    thiện `val_score` quá `min_delta` thì DỪNG phần base. Checkpoint đem đi là
-    epoch TỐT NHẤT (`stage0.select: best`) chứ không phải epoch cuối — patience
-    mà vẫn lấy epoch cuối thì nó chỉ còn là một cách tiết kiệm giờ GPU;
-  * **`final_anneal.enabled: false`**: lr cố định suốt quá trình nên không có
-    epoch anneal nào. `final/` = đúng checkpoint tốt nhất của phần base, và main
-    stage vẫn nạp `final/` như cũ;
-  * sau MỖI epoch đo trên ĐÚNG MỘT tập 256 mẫu CỐ ĐỊNH bốc từ hồ val 2000
-    (`stage0.val_n_samples`, `val_resample: false` — chỉ số chỉ phụ thuộc seed):
-    ASL, F1, Recall, sqrt(F1·Recall) macro trên (14 bệnh lý × lớp ∈ {pos,
-    uncertain});
-  * ASL one-hot 3 lớp: γ_neg theo tên lớp neg 4.0 · uncertain 1.0 · pos 0.0,
-    γ_pos 0, clip 0.05.
+**Epoch được chọn theo LOSS TỰ GIÁM SÁT trên val CỐ ĐỊNH.** Không còn nhãn để
+chấm, nên `val_score = −val_loss`: dấu trừ giữ nguyên quy ước "cao hơn = tốt
+hơn" của toàn bộ phần best/patience bên dưới, và số thật vẫn được in ra dưới
+tên `val_loss`. Tập val cố định (`val_resample: false`) là BẮT BUỘC khi có
+early-stop; ở đây còn thêm một lý do: tăng cường ngẫu nhiên của DINO vốn đã ồn,
+bốc lại tập nữa thì `patience` đang đếm ba nguồn nhiễu chồng lên nhau. Lượt val
+dùng RNG tăng cường CỐ ĐỊNH theo (seed, chỉ số mẫu), không theo epoch.
 
 lr là hàm THUẦN của số bước (`base_lr_at` / `anneal_lr_at`) chứ không phải một
-đối tượng scheduler có trạng thái: chạy tiếp sau khi dừng giữa chừng chỉ cần
-biết đang ở bước nào, không phải tua lại lịch sử.
+đối tượng scheduler mang trạng thái, nên chạy tiếp từ epoch k chỉ cần biết k.
 
-Checkpoint đem sang main stage ở `<adapter_dir>/_stage0/final/`, trạng thái để
-CHẠY TIẾP ở `<adapter_dir>/_stage0/last/state.pt` (không đẩy Hub).
+  * **epoch 1 — "warmup"**: CẢ HAI nhóm (backbone · DINO head) ramp tuyến tính
+    theo BƯỚC từ `warmup_start_lr` lên `lr`. Momentum EMA của teacher và nhiệt
+    độ teacher có lịch RIÊNG, theo bước, xem `dino.momentum_at` /
+    `dino.teacher_temp_at`;
+  * **epoch 2.. — "base"**: lr PHẲNG, dừng sớm theo `patience`;
+  * **epoch n+1 — "final anneal"** (mặc định TẮT): cosine về `lr_end`.
+
+Bố cục trên đĩa và trên Hub giữ nguyên (`base/`, `final/`, `loader.json`,
+`stage0_history.json`, `last/state.pt`), nên mọi thứ ở `run_vextractor.py` và
+`push.py` không phải đổi. Khác một chỗ: `stage0_labels.npz` biến mất — không
+còn nhãn nào để chụp lại.
 """
+
 from __future__ import annotations
 
 import json
@@ -60,7 +50,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import labels_cls
+from . import dino as D
 from . import vextractor as Z
 from .backbone import TrainUnusable, free_vram
 from .config import Cfg, seed_everything
@@ -68,14 +58,14 @@ from .config import Cfg, seed_everything
 DIRNAME = "_stage0"
 HISTORY = "stage0_history.json"
 LOADER = "loader.json"                  # như _fixture/loader.json của $1
-LABELS = "stage0_labels.npz"            # nhãn ĐÚNG như Stage 0 đã thấy (key + one-hot + mask)
+# KHÔNG còn `stage0_labels.npz`: Stage 0 của /5 không đọc nhãn nào.
 # Những gì của Stage 0 được giữ lại + đẩy Hub (`<hub_base>/stage0/`) — để về sau
 # dùng lại V-Extractor đã pretrain (vd. đối chứng SoTA) mà không phải chạy lại.
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
 BASE = "base"                         # sau epoch norm + `max_epochs` epoch — đẩy Hub ngay
 CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
 KEEP = (f"{BASE}/{Z.STAGE0_FILE}", f"{BASE}/{Z.STAGE0_META}",
-        f"{CKPT}/{Z.STAGE0_FILE}", f"{CKPT}/{Z.STAGE0_META}", HISTORY, LOADER, LABELS)
+        f"{CKPT}/{Z.STAGE0_FILE}", f"{CKPT}/{Z.STAGE0_META}", HISTORY, LOADER)
 
 
 def stage0_dir(cfg: Cfg) -> Path:
@@ -113,11 +103,11 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ConvNeXt-S), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
-           # quá nhỏ và luôn ra micro thấp hơn hẳn mức máy chịu được.
+           # NÀO CẢ (chỉ ViT-S+ + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
+           # từ vùng quá nhỏ. Ngược lại multi-crop nhân số lượt forward lên
+           # (2 + n_local) lần, nên đừng bất ngờ nếu micro ra nhỏ hơn §2.1.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
-           "val_classes": list(s.get("val_classes") or ["pos"]),
            # epoch đem sang main stage: best (theo val) | last (luôn epoch cuối).
            # Có `patience` thì phải là `best`: dừng vì val hết cải thiện rồi lại
            # lấy đúng epoch tệ nhất trong cửa sổ chờ là tự phủ định chính nó.
@@ -126,9 +116,8 @@ def s0cfg(cfg: Cfg) -> dict:
            # -> MỌI epoch dùng chung một tập, chỉ số chỉ phụ thuộc seed.
            "val_n_samples": int(s.get("val_n_samples", 256) or 0),
            "val_resample": bool(s.get("val_resample", True)),
-           "asl": dict(s.get("asl") or {}),
+           "dino": dino_cfg(s),
            "final_anneal": anneal_cfg(s)}
-    Z.asl_gammas(out["asl"])            # kiểm sớm
     if out["max_epochs"] < 1:
         raise TrainUnusable(f"stage0.max_epochs {out['max_epochs']} phải >= 1.")
     if out["patience"] < 0:
@@ -163,6 +152,68 @@ def s0cfg(cfg: Cfg) -> dict:
         raise TrainUnusable(
             f"stage0.probe_sizes {out['probe_sizes']} không có số nào chia hết "
             f"stage0.batch_size {out['batch_size']} — autobatch sẽ dò ở bs 1.")
+    return out
+
+
+def dino_cfg(s: dict) -> dict:
+    """`stage0.dino` — hàm mục tiêu tự giám sát. MỌI khoá đều có mặc định.
+
+    `out_dim` 4096 (không phải 65536 của DINO gốc): tập train ở đây là 6400
+    ảnh, và số prototype lớn hơn số ảnh chỉ làm phân phối teacher thưa hơn chứ
+    không mang thêm thông tin nào.
+    """
+    d = dict(s.get("dino") or {})
+    a = dict(d.get("aug") or {})
+    out = {
+        "global_size": int(d.get("global_size", 448)),
+        "local_size": int(d.get("local_size", 224)),
+        "n_local": int(d.get("n_local", 6)),
+        "global_scale": [float(x) for x in (d.get("global_scale") or [0.4, 1.0])],
+        "local_scale": [float(x) for x in (d.get("local_scale") or [0.05, 0.4])],
+        "out_dim": int(d.get("out_dim", 4096)),
+        "hidden": int(d.get("hidden", 2048)),
+        "bottleneck": int(d.get("bottleneck", 256)),
+        "head_layers": int(d.get("head_layers", 3)),
+        "pool": str(d.get("pool", "cls")),
+        "student_temp": float(d.get("student_temp", 0.1)),
+        "teacher_temp": float(d.get("teacher_temp", 0.04)),
+        "teacher_temp_start": float(d.get("teacher_temp_start", 0.04)),
+        "teacher_temp_warmup_epochs": float(d.get("teacher_temp_warmup_epochs", 0.0)),
+        "center_momentum": float(d.get("center_momentum", 0.9)),
+        "momentum_start": float(d.get("momentum_start", 0.996)),
+        "momentum_end": float(d.get("momentum_end", 1.0)),
+        "freeze_last_layer_epochs": float(d.get("freeze_last_layer_epochs", 1.0)),
+        "aug": {"ratio": [float(x) for x in (a.get("ratio") or [0.75, 1.3333])],
+                "hflip": float(a.get("hflip", 0.0)),
+                "jitter_p": float(a.get("jitter_p", 0.8)),
+                "brightness": float(a.get("brightness", 0.3)),
+                "contrast": float(a.get("contrast", 0.3)),
+                "blur_p": float(a.get("blur_p", 0.5)),
+                "blur_sigma": [float(x) for x in (a.get("blur_sigma") or [0.1, 2.0])],
+                "solarize_p": float(a.get("solarize_p", 0.0)),
+                "solarize_thr": int(a.get("solarize_thr", 128))},
+    }
+    if out["n_local"] < 0:
+        raise TrainUnusable(f"stage0.dino.n_local {out['n_local']} phải >= 0.")
+    if out["pool"] not in ("cls", "mean"):
+        raise TrainUnusable(f"stage0.dino.pool {out['pool']!r} chỉ nhận cls | mean.")
+    if not 0 < out["teacher_temp"] < out["student_temp"]:
+        raise TrainUnusable(
+            f"stage0.dino: teacher_temp {out['teacher_temp']} phải > 0 và NHỎ "
+            f"HƠN student_temp {out['student_temp']} — sharpening là một trong "
+            f"hai lực giữ DINO khỏi sụp, đảo dấu nó là tắt lực ấy.")
+    if not 0 <= out["momentum_start"] <= out["momentum_end"] <= 1:
+        raise TrainUnusable(
+            f"stage0.dino: cần 0 <= momentum_start {out['momentum_start']} <= "
+            f"momentum_end {out['momentum_end']} <= 1.")
+    if not 0 <= out["center_momentum"] < 1:
+        raise TrainUnusable(
+            f"stage0.dino.center_momentum {out['center_momentum']} phải trong [0, 1).")
+    if out["aug"]["hflip"] > 0:
+        print(f"  ⚠ stage0.dino.aug.hflip = {out['aug']['hflip']}: ảnh CXR có "
+              f"chiều (tim bên trái; dextrocardia là chẩn đoán, không phải "
+              f"augmentation). Bật lật ngang là dạy encoder bỏ qua trái/phải.",
+              flush=True)
     return out
 
 
@@ -315,9 +366,11 @@ def config_fingerprint(cfg: Cfg) -> str:
     đang chạy, không đổi thí nghiệm, nên không vào vân tay."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
          if k not in ("micro_batch", "probe_sizes")}
+    # KHÔNG còn khối `labels`: Stage 0 của /5 là tự giám sát và không đọc nhãn
+    # nào, nên đổi `labels` (vốn giờ chỉ phục vụ Lens) không được bắt chạy lại
+    # một lượt DINO.
     return Z.spec_fingerprint({"stage0": s, "vextractor": dict(cfg.get("vextractor") or {}),
-                               "seed": int(cfg.get("seed", 42)),
-                               "labels": dict(cfg.get("labels") or {})})
+                               "seed": int(cfg.get("seed", 42))})
 
 
 def base_fingerprint(cfg: Cfg) -> str:
@@ -326,59 +379,72 @@ def base_fingerprint(cfg: Cfg) -> str:
     cả phần base."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
          if k not in ("micro_batch", "probe_sizes", "final_anneal")}
+    # KHÔNG còn khối `labels`: Stage 0 của /5 là tự giám sát và không đọc nhãn
+    # nào, nên đổi `labels` (vốn giờ chỉ phục vụ Lens) không được bắt chạy lại
+    # một lượt DINO.
     return Z.spec_fingerprint({"stage0": s, "vextractor": dict(cfg.get("vextractor") or {}),
-                               "seed": int(cfg.get("seed", 42)),
-                               "labels": dict(cfg.get("labels") or {})})
+                               "seed": int(cfg.get("seed", 42))})
 
 
-# ── dữ liệu: chỉ ảnh + nhãn ───────────────────────────────────────────────
+# ── dữ liệu: CHỈ ảnh (không nhãn) ─────────────────────────────────────────
 class ImageOnlyDataset:
-    """[image_path] -> vext_pixels (1,3,S,S), cls_y, cls_mask.
+    """[image_path] -> multi-crop của DINO. KHÔNG nhãn.
 
-    Không đụng tới processor của Gemma: nhánh §2.2 có đường ảnh riêng, và
-    `Z.vext_tensor` là chỗ DUY NHẤT dựng nó — Stage 0, main stage, sinh và Lens
-    đều gọi đúng hàm ấy (`assert_same_pixels` kiểm lại trên một mẫu thật).
+    `pixels(i)` vẫn dựng ảnh 448² KHÔNG tăng cường bằng `Z.vext_tensor` — đó là
+    thứ `assert_same_pixels` so với main stage, và là chỗ duy nhất phép chuẩn
+    hoá của hai giai đoạn gặp nhau.
+
+    **RNG tăng cường là hàm THUẦN của (seed, epoch, chỉ số mẫu)**, không phải
+    một `random` toàn cục: dataset chạy trong nhiều luồng nền (`OrderedPrefetcher`),
+    nên một RNG dùng chung sẽ cho kết quả phụ thuộc thứ tự luồng — chạy lại cùng
+    seed ra một lượt tăng cường khác. `set_epoch()` là chỗ duy nhất đổi nó.
     """
 
-    def __init__(self, df: pd.DataFrame, image_size: int, y: np.ndarray,
-                 mask: np.ndarray, mean, std):
+    def __init__(self, df: pd.DataFrame, image_size: int, mean, std, dc: dict,
+                 seed: int, epoch: int = 0):
         self.df = df.reset_index(drop=True)
         self.image_size = int(image_size)
-        # mean/std của CHECKPOINT ViT (spec.vextractor.normalize) — không phải
-        # một hằng số ImageNet nào đó: họ AugReg dùng 0.5/0.5.
+        # mean/std của CHECKPOINT (spec.vextractor.normalize) — không phải một
+        # hằng số ImageNet nào đó: mỗi họ checkpoint chuẩn hoá một kiểu.
         self.mean, self.std = tuple(mean), tuple(std)
-        self.y, self.m = np.asarray(y), np.asarray(mask)
+        self.dc = dict(dc)
+        self.seed = int(seed)
+        self.epoch = int(epoch)
         self.n_bad = 0
 
     def __len__(self) -> int:
         return len(self.df)
 
+    def set_epoch(self, ep: int) -> None:
+        self.epoch = int(ep)
+
     def pixels(self, i: int):
+        """Ảnh 448² KHÔNG tăng cường — chỉ để `assert_same_pixels` đối chiếu."""
         return Z.vext_tensor(self.df.iloc[i]["image_path"], self.image_size,
                              self.mean, self.std)
 
-    def __getitem__(self, i: int) -> dict:
-        import torch
+    def _rng(self, j: int):
+        import random
 
+        return random.Random((self.seed * 1_000_003 + self.epoch * 7919 + j)
+                             & 0x7FFFFFFF)
+
+    def __getitem__(self, i: int) -> list:
         n = len(self.df)
         for off in range(n):
             j = (i + off) % n
             try:
-                pv = self.pixels(j)
+                return D.make_views(self.df.iloc[j]["image_path"], self.dc,
+                                    self.mean, self.std, self._rng(j))
             except Exception:  # noqa: BLE001
                 self.n_bad += 1
                 continue
-            return {"vext_pixels": pv, "cls_y": torch.from_numpy(self.y[j]).float(),
-                    "cls_mask": torch.tensor(float(self.m[j]))}
         raise TrainUnusable("không ảnh nào của tập Stage 0 mở được.")
 
 
-def collate(rows: list[dict]) -> dict:
-    import torch
-
-    return {"vext_pixels": torch.cat([r["vext_pixels"] for r in rows], 0),
-            "cls_y": torch.stack([r["cls_y"] for r in rows]),
-            "cls_mask": torch.stack([r["cls_mask"] for r in rows])}
+def collate(rows: list) -> dict:
+    """[mẫu][view] -> {"views": [ (B,3,S,S) theo VIEW ]}."""
+    return {"views": D.collate_views(rows)}
 
 
 def assert_same_pixels(ds: ImageOnlyDataset, cfg: Cfg) -> None:
@@ -431,11 +497,6 @@ def decoder_width(cfg: Cfg) -> int:
         f"nhánh cần biết chiều embedding của decoder để dựng Linear cuối.")
 
 
-def labels_for(cfg: Cfg, df: pd.DataFrame, lut: dict, n_labels: int, name: str):
-    y, m, st = labels_cls.attach(cfg, df["key"].astype(str).tolist(), lut, n_labels, name)
-    return y, m, st
-
-
 # ── chạy ───────────────────────────────────────────────────────────────────
 def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         max_steps: int | None = None, restart: bool = False,
@@ -456,14 +517,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     seed_everything(seed)
     t0 = time.time()
 
-    lut, info = labels_cls.load_map(cfg, verbose=True)
-    n_labels = int(dict(cfg.get("vextractor") or {}).get("n_labels") or info["n_labels"])
-    y_tr, m_tr, st_tr = labels_for(cfg, train_df, lut, n_labels, "stage0/train")
-    y_va, m_va, st_va = labels_for(cfg, val_df, lut, n_labels, "stage0/val")
     if val_df is None or val_df.empty:
         raise TrainUnusable("Stage 0 chọn epoch theo val — fixture không có mẫu val.")
 
-    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ConvNeXt-S.
+    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy backbone.
     # Thứ duy nhất cần từ model là d_model (2560) — đọc từ config, không tải
     # trọng số. Lệch con số này với model thật thì `load_stage0_into` ở main
     # stage ném spec mismatch, to và sớm.
@@ -472,38 +529,47 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     # spec dựng TRƯỚC dataset: `image_size` VÀ mean/std của ảnh vào nhánh đều
     # nằm trong nó (mean/std được hỏi từ `pretrained_cfg` của `arch`), nên
     # không có con số nào bị đọc từ hai nguồn.
-    spec = Z.spec_from_cfg(cfg, text_h, n_labels)
+    spec = Z.spec_from_cfg(cfg, text_h)
     if not spec["vextractor"]["pretrained"]:
         # Guard ở ĐÂY chứ không ở `vextractor.backbone_body`: selftest cần dựng được
         # một ViT nhỏ ngẫu nhiên OFFLINE, còn một lượt pretrain THẬT trên
         # backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
         raise TrainUnusable(
             "vextractor.vextractor.pretrained = false: cả điểm của §2.2 là 'một "
-            "encoder ĐÃ học từ ImageNet mang vào thứ SigLIP không có'. Một "
-            "ViT khởi tạo ngẫu nhiên không mang vào gì cả — Stage 0 DỪNG.")
+            "encoder ĐÃ học sẵn mang vào thứ SigLIP không có', và Stage 0 ở /5 "
+            "là TIẾP TỤC DINO từ trọng số ấy. Chưng cất từ một ViT ngẫu nhiên "
+            "chỉ ra một ViT ngẫu nhiên khác — Stage 0 DỪNG.")
     img_size = int(spec["vextractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 
-    ds_tr = ImageOnlyDataset(train_df, img_size, y_tr, m_tr, nz_mean, nz_std)
-    ds_va = ImageOnlyDataset(val_df, img_size, y_va, m_va, nz_mean, nz_std)
+    dc = sc["dino"]
+    ds_tr = ImageOnlyDataset(train_df, img_size, nz_mean, nz_std, dc, seed)
+    ds_va = ImageOnlyDataset(val_df, img_size, nz_mean, nz_std, dc, seed)
     assert_same_pixels(ds_tr, cfg)
 
-    block = Z.SupervisedBlock(spec).to(dev)                  # fp32 + autocast
-    asl = Z.build_asl(sc["asl"])
+    # CHỈ backbone — không Extractor, không Aligner, không Cls Head.
+    body, d_feat, n_patch, n_use, kind = Z.build_backbone(spec)
+    n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 1))
+    block = D.DinoTrainer(body, d_feat, n_prefix, dc).to(dev)   # fp32 + autocast
     opt = torch.optim.AdamW(block.param_groups(sc["lr"], sc["backbone_lr"]),
                             weight_decay=sc["weight_decay"], betas=(0.9, 0.999),
                             eps=1e-8)
-    vx = block.vextractor
-    n_par = sum(p.numel() for p in block.parameters())
-    n_bb = sum(p.numel() for p in vx.backbone_parameters())
-    print(f"  Stage 0: Supervised Block {n_par:,} tham số · {spec['vextractor']['arch']} "
-          f"{n_bb:,} ({vx.n_layers} block đầu, {vx.n_patch} patch × "
-          f"{vx.d_feat}) · Linear+{vx.n_query} "
-          f"learner Q+Self/Cross-attn+MLP "
-          f"{sum(p.numel() for p in vx.head_parameters()):,} · Cls Head "
-          f"{sum(p.numel() for p in block.cls_head.parameters()):,} · "
-          f"{n_labels}×{len(labels_cls.CLASS_ORDER)} nhãn · chuẩn hoá "
-          f"mean {nz_mean} std {nz_std}", flush=True)
+    n_bb = sum(p.numel() for p in block.student_body.parameters())
+    n_hd = sum(p.numel() for p in block.student_head.parameters())
+    _nl = "" if n_use is None else f", {n_use} block"
+    print(f"  Stage 0 (TỰ GIÁM SÁT, KHÔNG nhãn): {spec['vextractor']['arch']} "
+          f"({kind}{_nl}, {n_prefix} prefix) {n_bb:,} tham số · lưới {n_patch} × "
+          f"{d_feat} ở {img_size}² · DINO head {n_hd:,} ({dc['out_dim']} "
+          f"prototype, pool {dc['pool']}) · teacher EMA {n_bb + n_hd:,} (KHÔNG "
+          f"vào optimizer; CHÍNH nó là thứ được lưu ra base//final/) · chuẩn "
+          f"hoá mean {nz_mean} std {nz_std}", flush=True)
+    print(f"  Stage 0 · multi-crop: 2 global {dc['global_size']}² "
+          f"scale {dc['global_scale']} + {dc['n_local']} local "
+          f"{dc['local_size']}² scale {dc['local_scale']} · τ_s "
+          f"{dc['student_temp']} τ_t {dc['teacher_temp_start']}->"
+          f"{dc['teacher_temp']} · center m {dc['center_momentum']} · EMA "
+          f"{dc['momentum_start']}->{dc['momentum_end']} · lật ngang "
+          f"{dc['aug']['hflip']:g}", flush=True)
     fa = sc["final_anneal"]
     _lr2 = ("" if abs(sc["backbone_lr"] - sc["lr"]) < 1e-15
             else f" (backbone {sc['backbone_lr']:g})")
@@ -517,8 +583,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
           f"{sc['n_warmup_epochs']}+{sc['max_epochs']} = {sc['base_epochs']} epoch, "
           f"{_stop} · epoch đem đi: {sc['select']} -> {BASE}/ · batch "
           f"{sc['batch_size']}"
-          f" · ASL γ_neg {dict(zip(labels_cls.CLASS_ORDER, Z.asl_gammas(sc['asl'])))} "
-          f"clip {sc['asl'].get('clip', 0.05)} · val {sc['val_n_samples']} mẫu "
+          f" · val {sc['val_n_samples']} mẫu "
           f"{'bốc lại mỗi epoch' if sc['val_resample'] else 'CỐ ĐỊNH'}", flush=True)
     if fa["enabled"]:
         print(f"  Stage 0 · epoch n+1: "
@@ -529,10 +594,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
               f"{sc['backbone_lr']:g}) · wd {fa['weight_decay']} "
               f"-> {CKPT}/ (main stage dùng bản này)", flush=True)
 
-    def loss_of(b):
+    def loss_of(b, t_temp: float, update_center: bool = True):
+        views = [v.to(dev, non_blocking=True) for v in b["views"]]
         with Z.autocast(dev):
-            logits = block(b["vext_pixels"].to(dev))
-        return asl(logits.float(), b["cls_y"].to(dev), b["cls_mask"].to(dev)), logits
+            loss = block.loss(views, t_temp, update_center=update_center)
+        return loss.float()
 
     # ── micro-batch theo VRAM (batch hiệu dụng giữ nguyên) ────────────────
     from . import autobatch
@@ -540,10 +606,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     bs_eff = sc["batch_size"]
 
     def _probe(k: int) -> None:
+        # Dò ở ĐÚNG trạng thái của vòng lặp: student có gradient trên CẢ
+        # (2 + n_local) view, teacher chạy no_grad trên 2 global. Dò bằng một
+        # view là ngoại suy từ một phần rất nhỏ của bộ nhớ thật.
         block.train()
         b = collate([ds_tr[i] for i in range(k)])
-        loss, _ = loss_of(b)
-        loss.backward()
+        loss_of(b, dc["teacher_temp"], update_center=False).backward()
 
     # Dò bằng điểm đo của RIÊNG Stage 0 (`stage0.probe_sizes`), không phải
     # `autobatch.probe_sizes` của main stage.
@@ -558,7 +626,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     g = torch.Generator().manual_seed(seed)
     history: list[dict] = []
     start_epoch = 1
-    best = {"epoch": None, "score": -1.0}
+    # `score` = −loss DINO nên nó ÂM: khởi tạo -1.0 như bản cũ thì epoch đầu
+    # không bao giờ "vượt kỷ lục" và `best` đứng ở None mãi.
+    best = {"epoch": None, "score": None}
     bad = 0                 # số epoch LIÊN TIẾP không cải thiện (đếm cho patience)
     last = d / "last" / "state.pt"
     # Epoch final chạy NỐI TIẾP thì phải có moment AdamW THẬT của phần base.
@@ -598,7 +668,11 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if hb is not None and (restart_final or start_epoch <= sc["base_epochs"]):
         from safetensors.torch import load_file
 
-        block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
+        # base/ chỉ có backbone TEACHER; nạp vào cả hai (momentum -> 1 nên cuối
+        # phần base student và teacher vốn đã gần trùng nhau).
+        _sd0 = load_file(str(d / BASE / Z.STAGE0_FILE))
+        block.teacher_body.load_state_dict(_sd0)
+        block.student_body.load_state_dict(_sd0)
         g = torch.Generator().manual_seed(seed)
         # Phần base có `patience` nên nó DỪNG SỚM được: số epoch thật sự đã chạy
         # nằm ở `base_epochs_run`, KHÔNG phải `max_epochs`. Tua Generator sai số
@@ -643,34 +717,51 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     @torch.no_grad()
     def evaluate(ep: int) -> dict:
+        """Loss DINO trên val. KHÔNG cập nhật center, KHÔNG cập nhật EMA.
+
+        Cập nhật center ở đây là để tập val lặng lẽ dạy model một thứ (vector
+        center đi thẳng vào loss của bước train tiếp theo) — đúng nghĩa rò rỉ,
+        dù không có nhãn nào.
+
+        τ_t lấy giá trị CUỐI (`teacher_temp`), không phải giá trị theo lịch
+        warm-up: đường val giữa các epoch phải so được với nhau, mà τ đổi thì
+        chính thang đo của loss đổi.
+        """
         block.eval()
-        cnt = Z.ClsCounter(n_labels, sc["val_classes"])
+        ds_va.set_epoch(0)              # tăng cường val CỐ ĐỊNH theo (seed, mẫu)
         tot, w = 0.0, 0.0
         k_val = sc["val_n_samples"] or len(ds_va)
         vidx = val_indices(seed, ep, len(ds_va), k_val, sc["val_resample"])
         for b in stream(pf_va, [vidx[s:s + micro] for s in range(0, len(vidx), micro)]):
-            loss, logits = loss_of(b)
-            k = float(b["cls_mask"].sum())
-            tot += float(loss) * k
+            k = float(b["views"][0].shape[0])
+            tot += float(loss_of(b, dc["teacher_temp"], update_center=False)) * k
             w += k
-            cnt.update(logits, b["cls_y"], b["cls_mask"])
         block.train()
-        r = cnt.result()
-        r["asl"] = tot / max(w, 1e-9)
-        r["n_val"] = len(vidx)
-        return r
+        loss = tot / max(w, 1e-9)
+        # `score` cao hơn = tốt hơn (quy ước của toàn bộ phần best/patience).
+        # Không còn nhãn để chấm, nên nó chỉ là dấu trừ của loss.
+        return {"loss": loss, "score": -loss, "n_val": len(vidx)}
 
     def phase_of(ep: int) -> str:
-        """KHÔNG còn epoch đóng băng nào: ViT học từ bước 0, ở lr riêng của nó.
+        """`warmup` chỉ nói về lr, không phải một trạng thái đóng băng.
 
-        `warmup` chỉ nói về lr của nhóm `rest` (ramp 0 -> lr_max), không phải
-        một trạng thái đóng băng — bản ResNet50 cũ có epoch "norm" vì BatchNorm
-        mang theo thống kê ImageNet; ViT không có BatchNorm.
+        KHÔNG còn epoch "norm" của bản ResNet50 (ViT không có BatchNorm nên
+        không có thống kê chạy nào phải kéo về ảnh CXR), và cũng không còn epoch
+        đóng băng nào: backbone học từ bước 0.
         """
         return "warmup" if ep <= sc["n_warmup_epochs"] else "base"
 
+    # Lịch RIÊNG của DINO, theo BƯỚC — độc lập với lịch lr.
+    total_steps = max(1, sc["base_epochs"] * steps_per_epoch)
+    tt_warm = int(round(float(dc["teacher_temp_warmup_epochs"]) * steps_per_epoch))
+    # `freeze_last_layer`: lớp prototype cuối bị giữ nguyên trong ngần này epoch
+    # đầu. Nó là thứ dễ sụp nhất (K vector cạnh tranh nhau ngay từ bước 1), và
+    # DINO gốc đóng băng nó đúng vì thế.
+    frz_last = int(round(float(dc["freeze_last_layer_epochs"]) * steps_per_epoch))
+
     def run_epoch(ep: int, opt_, lr_fn, step0: int = 0) -> float:
         block.train()
+        ds_tr.set_epoch(ep)               # tăng cường đổi theo epoch, tái lập được
         order = torch.randperm(n, generator=g).tolist()
         run_loss = 0.0
         n_steps = steps_per_epoch if max_steps is None else min(steps_per_epoch, max_steps)
@@ -679,56 +770,62 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             idx = order[step * bs_eff:(step + 1) * bs_eff]
             chunks += [(step, idx[c:c + micro]) for c in range(0, len(idx), micro)]
         mb = stream(pf_tr, [c for _, c in chunks])
-        n_lab_of = {}
-        for step, c in chunks:
-            n_lab_of[step] = n_lab_of.get(step, 0.0) + float(
-                sum(float(ds_tr.m[i]) for i in c))
         per_step = {}
         for step, _c in chunks:
             per_step[step] = per_step.get(step, 0) + 1
         for step in range(n_steps):
-            n_lab = max(1.0, n_lab_of[step])
+            gstep = step0 + step
+            t_temp = D.teacher_temp_at(gstep, tt_warm, dc["teacher_temp_start"],
+                                       dc["teacher_temp"])
             opt.zero_grad(set_to_none=True)
             step_loss = 0.0
-            for _ in range(per_step[step]):
+            n_mb = per_step[step]
+            for _ in range(n_mb):
                 b = next(mb)
-                loss, _ = loss_of(b)
-                # ASL là trung bình trên mẫu CÓ nhãn của micro-batch -> đổi về
-                # trung bình trên cả batch hiệu dụng (không phụ thuộc micro).
-                wgt = float(b["cls_mask"].sum()) / n_lab
-                (loss * wgt).backward()
-                step_loss += float(loss.detach()) * wgt
-            lr_now = set_group_lrs(opt_, lr_fn(step0 + step))
+                # Loss của DINO là trung bình trên MẪU, nên chia đều theo số
+                # micro-batch là đúng bằng con số tính trên cả batch hiệu dụng
+                # (mọi micro ở đây cùng cỡ trừ micro cuối — sai số ấy nhỏ hơn
+                # nhiễu của chính phép tăng cường).
+                loss = loss_of(b, t_temp) / n_mb
+                loss.backward()
+                step_loss += float(loss.detach())
+            lr_now = set_group_lrs(opt_, lr_fn(gstep))
+            if gstep < frz_last:          # giữ nguyên lớp prototype cuối
+                for q in block.student_head.last.parameters():
+                    q.grad = None
             if sc["max_grad_norm"] > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [q for q in block.parameters() if q.requires_grad],
                     sc["max_grad_norm"])
             opt_.step()
+            # EMA teacher SAU bước Adam — teacher phải là trung bình trượt của
+            # student ĐÃ cập nhật, không phải của student trước đó.
+            m_now = D.momentum_at(gstep, total_steps, dc["momentum_start"],
+                                  dc["momentum_end"])
+            block.ema_update(m_now)
             run_loss += step_loss
             if (step + 1) % 20 == 0 or step == steps_per_epoch - 1:
                 print(f"    [stage0] epoch {ep} bước {step + 1}/{steps_per_epoch} · "
-                      f"ASL {step_loss:.4f} · lr {lr_now:.2e}", flush=True)
+                      f"DINO {step_loss:.4f} · lr {lr_now:.2e} · τ_t {t_temp:.3f} "
+                      f"· m {m_now:.4f}", flush=True)
                 if tracker is not None:
-                    tracker.log({"stage0/asl": step_loss, "stage0/epoch": ep,
-                                 "stage0/lr": lr_now,
+                    tracker.log({"stage0/dino_loss": step_loss, "stage0/epoch": ep,
+                                 "stage0/lr": lr_now, "stage0/teacher_temp": t_temp,
+                                 "stage0/ema_m": m_now,
                                  "stage0/step": (ep - 1) * steps_per_epoch + step + 1})
         return run_loss
 
     def record(ep: int, run_loss: float, t_ep: float, phase: str) -> dict:
         ev = evaluate(ep)
-        rec = {"epoch": ep, "train_asl": run_loss / max(1, steps_per_epoch),
-               "val_asl": ev["asl"], "val_f1_macro": ev["f1_macro"],
-               "val_recall_macro": ev["recall_macro"], "val_score": ev["score"],
-               "val_per_class": ev["per_class"], "n_cells": ev["n_cells"],
+        rec = {"epoch": ep, "train_loss": run_loss / max(1, steps_per_epoch),
+               "val_loss": ev["loss"], "val_score": ev["score"],
                "n_val": ev["n_val"], "phase": phase,
                "minutes": round((time.time() - t_ep) / 60, 2)}
         history.append(rec)
-        print(f"  [stage0] epoch {ep} ({phase}): val ASL {ev['asl']:.4f} · F1 "
-              f"{ev['f1_macro']:.4f} · Recall {ev['recall_macro']:.4f} · sqrt(F1·R) "
-              f"{ev['score']:.4f}", flush=True)
+        print(f"  [stage0] epoch {ep} ({phase}): val DINO {ev['loss']:.4f} "
+              f"(score {ev['score']:+.4f})", flush=True)
         if tracker is not None:
-            tracker.log({"stage0/val_asl": ev["asl"], "stage0/val_f1": ev["f1_macro"],
-                         "stage0/val_recall": ev["recall_macro"],
+            tracker.log({"stage0/val_loss": ev["loss"],
                          "stage0/val_score": ev["score"], "stage0/epoch": ep})
         return ev
 
@@ -749,16 +846,19 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         ev = record(ep, run_loss, t_ep, phase)
         ep_ran = ep
         base_opt_live = True          # optimizer này vừa chạy thật phần base
-        # "Cải thiện" đo trên val_score (sqrt(F1·Recall) macro), CÙNG một đại
-        # lượng mà `select: best` dùng — nếu không thì cửa sổ chờ đang đếm một
-        # thứ, còn checkpoint lại chọn theo một thứ khác.
-        improved = float(ev["score"]) > float(best.get("score") or -1.0) + sc["min_delta"]
+        # "Cải thiện" đo trên val_score (= −loss DINO trên val cố định), CÙNG
+        # một đại lượng mà `select: best` dùng — nếu không thì cửa sổ chờ đang
+        # đếm một thứ, còn checkpoint lại chọn theo một thứ khác.
+        _prev = best.get("score")
+        improved = (_prev is None
+                    or float(ev["score"]) > float(_prev) + sc["min_delta"])
         better = (ep == sc["base_epochs"] or (max_steps is not None)) \
             if sc["select"] == "last" else improved
         if better:
             best = {"epoch": ep, "score": ev["score"]}
-            Z.save_stage0(block, d / BASE, {"select": sc["select"], "phase": "base",
+            Z.save_stage0(block.teacher_body, spec, d / BASE, {"select": sc["select"], "phase": "base",
                 "best_epoch": ep, "best_score": ev["score"], "val": ev,
+                "best_val_loss": ev["loss"], "weights": "teacher_ema",
                 "base_fingerprint": base_fingerprint(cfg)})
         bad = 0 if improved else bad + 1
         last.parent.mkdir(parents=True, exist_ok=True)
@@ -772,7 +872,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             stopped_early = True
             print(f"  ⏹ Stage 0 DỪNG SỚM ở epoch {ep}/{sc['base_epochs']}: "
                   f"{bad} epoch LIÊN TIẾP val_score không vượt "
-                  f"{float(best.get('score') or 0.0):.4f}"
+                  f"{float(best.get('score') or 0.0):+.4f}"
                   + (f" + {sc['min_delta']:g}" if sc["min_delta"] else "")
                   + f" (patience {sc['patience']}). Checkpoint đem đi: epoch "
                   f"{best['epoch']}.", flush=True)
@@ -780,10 +880,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     if best["epoch"] is None:          # select=last mà vòng dừng sớm: lấy epoch cuối đã chạy
         best = {"epoch": history[-1]["epoch"], "score": history[-1]["val_score"]}
-        Z.save_stage0(block, d / BASE, {"select": sc["select"], "phase": "base",
-                                        "best_epoch": best["epoch"],
-                                        "best_score": best["score"],
-                                        "base_fingerprint": base_fingerprint(cfg)})
+        Z.save_stage0(block.teacher_body, spec, d / BASE,
+                      {"select": sc["select"], "phase": "base",
+                       "best_epoch": best["epoch"], "best_score": best["score"],
+                       "best_val_loss": -float(best["score"]),
+                       "weights": "teacher_ema",
+                       "base_fingerprint": base_fingerprint(cfg)})
     base = dict(best)
 
     def summary(done: bool) -> dict:
@@ -794,9 +896,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
              "history": history, "stage0": {k: v for k, v in sc.items()},
              "micro_batch": micro, "autobatch": ab_rep,
              "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
-             "label_stats": {"train": st_tr, "val": st_va,
-                             "class_frac": info.get("class_frac"),
-                             "label_names": info.get("label_names")},
              "spec": spec, "base_fingerprint": base_fingerprint(cfg),
              "config_fingerprint": config_fingerprint(cfg),
              "minutes": round((time.time() - t0) / 60, 1),
@@ -809,7 +908,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if base_finished(cfg) is None or restart or hb is None:
         (d / HISTORY).write_text(json.dumps(summary(False), indent=2, ensure_ascii=False,
                                             default=str), encoding="utf-8")
-        write_loader(cfg, d, train_df, val_df, y_tr, m_tr, y_va, m_va, info, sc, micro,
+        write_loader(cfg, d, train_df, val_df, sc, micro,
                      steps_per_epoch, spec, best)
         tail = f" (dừng sớm, trần {sc['base_epochs']})" if stopped_early else ""
         print(f"  ✓ Stage 0 base: {ep_ran} epoch{tail} xong · best = epoch "
@@ -826,7 +925,15 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if sc["select"] == "best" and best["epoch"] is not None and best["epoch"] != ep_ran:
         from safetensors.torch import load_file
 
-        block.load_state_dict(load_file(str(d / BASE / Z.STAGE0_FILE)))
+        # File này chỉ chứa backbone TEACHER (xem `Z.save_stage0`). Nạp nó vào
+        # CẢ teacher lẫn student: ở cuối phần base momentum đã gần 1 nên hai
+        # bên vốn sát nhau, và đó là trạng thái gần nhất tái lập được từ một
+        # file chỉ có teacher. DINO head thì vẫn của epoch cuối — với
+        # `final_anneal` TẮT (mặc định) không sao, vì thứ duy nhất ghi ra
+        # `final/` là backbone teacher.
+        _sd = load_file(str(d / BASE / Z.STAGE0_FILE))
+        block.teacher_body.load_state_dict(_sd)
+        block.student_body.load_state_dict(_sd)
         # Moment AdamW đang là của epoch cuối, không khớp trọng số vừa nạp —
         # epoch anneal (nếu bật) vì thế KHÔNG còn là "chạy nối tiếp" nữa.
         base_opt_live = False
@@ -862,14 +969,18 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             run_loss = run_epoch(ep, opt, sched_anneal, (k - 1) * n_st)
             ev = record(ep, run_loss, t_ep, "anneal")
         best = {"epoch": ep, "score": ev["score"]}
-        Z.save_stage0(block, d / CKPT, {
+        Z.save_stage0(block.teacher_body, spec, d / CKPT, {
             "phase": "anneal", "best_epoch": ep, "best_score": ev["score"], "val": ev,
+            "best_val_loss": ev["loss"], "weights": "teacher_ema",
             "from": f"{BASE}/ (epoch {base['epoch']})", "anneal": fa,
             "optimizer_continued": bool(not fa["reset_optimizer"] and base_opt_live),
             "config_fingerprint": config_fingerprint(cfg)})
     else:
-        Z.save_stage0(block, d / CKPT, {
+        Z.save_stage0(block.teacher_body, spec, d / CKPT, {
             "phase": "base", "best_epoch": base["epoch"], "best_score": base["score"],
+            "best_val_loss": (None if base["score"] is None
+                              else -float(base["score"])),
+            "weights": "teacher_ema",
             "config_fingerprint": config_fingerprint(cfg)})
 
     pf_tr.close()
@@ -880,9 +991,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
            "history": history, "stage0": {k: v for k, v in sc.items()},
            "micro_batch": micro, "autobatch": ab_rep,
            "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
-           "label_stats": {"train": st_tr, "val": st_va,
-                           "class_frac": info.get("class_frac"),
-                           "label_names": info.get("label_names")},
            "spec": spec, "config_fingerprint": config_fingerprint(cfg),
            "base_finished": True, "base_epoch": base["epoch"], "base_score": base["score"],
            "base_fingerprint": base_fingerprint(cfg), "final_anneal": fa,
@@ -892,58 +1000,75 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         out["dry_run"] = True
     (d / HISTORY).write_text(json.dumps(out, indent=2, ensure_ascii=False, default=str),
                              encoding="utf-8")
-    write_loader(cfg, d, train_df, val_df, y_tr, m_tr, y_va, m_va, info, sc, micro,
+    write_loader(cfg, d, train_df, val_df, sc, micro,
                  steps_per_epoch, spec, best)
     block = opt = None                  # nhả VRAM trước free_vram
     free_vram()
-    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · final = epoch {best['epoch']} "
-          f"(sqrt(F1·R) = {best['score']:.4f}) -> {d / CKPT}", flush=True)
+    print(f"  ✓ Stage 0 xong sau {out['minutes']} phút · final = epoch "
+          f"{best['epoch']} (val DINO = {-float(best['score']):.4f}) -> "
+          f"{d / CKPT}", flush=True)
     return out
 
 
-def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, info,
+def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                  sc: dict, micro: int, steps_per_epoch: int, spec: dict,
                  best: dict) -> Path:
     """Loader-setup của Stage 0, cùng tinh thần `_fixture/loader.json` của $1:
-    dữ liệu (fixture + sha key), nhãn (file npz + mã hoá + tỉ lệ lớp, và BẢN
-    CHỤP nhãn đã dùng), batch/micro, thứ tự, lịch, vân tay, sha256 weight."""
+    dữ liệu (fixture + sha key), hàm mục tiêu TỰ GIÁM SÁT (multi-crop, nhiệt độ,
+    EMA), batch/micro, thứ tự, lịch, vân tay, sha256 weight.
+
+    KHÔNG còn khối `labels` và không còn `stage0_labels.npz`: Stage 0 của /5
+    không đọc nhãn nào, nên không có gì để chụp lại.
+    """
     from datetime import datetime, timezone
 
     from . import fixture as fx_mod
 
-    np.savez_compressed(
-        d / LABELS,
-        train_keys=np.asarray(train_df["key"].astype(str).tolist()),
-        train_y=np.asarray(y_tr, dtype=np.float32), train_mask=np.asarray(m_tr, np.float32),
-        val_keys=np.asarray(val_df["key"].astype(str).tolist()),
-        val_y=np.asarray(y_va, dtype=np.float32), val_mask=np.asarray(m_va, np.float32),
-        class_order=np.asarray(labels_cls.CLASS_ORDER))
+    dc = sc["dino"]
     fx = fx_mod.fixture_dir(cfg)
     fl = fx_mod.load_loader(fx) if fx_mod.exists(fx) else {}
     files = {f: fx_mod.sha256_file(d / f) for f in KEEP if (d / f).exists() and f != LOADER}
     loader = {
-        "version": 1, "stage": "stage0",
+        "version": 2, "stage": "stage0", "objective": "dino_self_distillation",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config_fingerprint": config_fingerprint(cfg),
         "fixture": {"dir": str(fx), "fingerprint": fl.get("fingerprint"),
                     "keys_sha256": fl.get("keys_sha256"),
                     "splits": {"train": "trainset.jsonl", "val": "valset.jsonl"}},
         "n": {"train": len(train_df), "val": len(val_df)},
-        "labels": {"npz": str(dict(cfg.get("labels") or {}).get("npz")),
-                   "encoding": dict(cfg.get("labels") or {}).get("encoding"),
-                   "class_order": list(labels_cls.CLASS_ORDER),
-                   "n_labels": int(spec["n_labels"]),
-                   "label_names": info.get("label_names"),
-                   "class_frac": info.get("class_frac"), "snapshot": LABELS},
+        "labels": None,     # TỰ GIÁM SÁT: Stage 0 không đọc nhãn nào
         "train_order": {"seed": int(cfg.get("seed", 42)),
                         "rule": "g = Generator().manual_seed(seed); mỗi epoch "
                                 "torch.randperm(n_train, generator=g) trên thứ tự dòng "
                                 "của trainset.jsonl; batch = lát liên tiếp"},
+        "augment": {"rule": "RNG tăng cường = hàm thuần của (seed, epoch, chỉ số "
+                            "mẫu) — không phải random toàn cục, vì dataset chạy "
+                            "nhiều luồng nền",
+                    "val": "epoch cố định 0 -> tăng cường val KHÔNG đổi giữa các epoch",
+                    **dc["aug"]},
+        "dino": {"global": {"n": 2, "size": dc["global_size"],
+                            "scale": dc["global_scale"]},
+                 "local": {"n": dc["n_local"], "size": dc["local_size"],
+                           "scale": dc["local_scale"]},
+                 "head": {"out_dim": dc["out_dim"], "hidden": dc["hidden"],
+                          "bottleneck": dc["bottleneck"],
+                          "layers": dc["head_layers"], "pool": dc["pool"],
+                          "freeze_last_layer_epochs": dc["freeze_last_layer_epochs"]},
+                 "temp": {"student": dc["student_temp"],
+                          "teacher": dc["teacher_temp"],
+                          "teacher_start": dc["teacher_temp_start"],
+                          "teacher_warmup_epochs": dc["teacher_temp_warmup_epochs"]},
+                 "center_momentum": dc["center_momentum"],
+                 "ema": {"start": dc["momentum_start"], "end": dc["momentum_end"],
+                         "schedule": "cosine theo BƯỚC trên toàn bộ base_epochs"},
+                 "pairs": "teacher CHỈ thấy 2 global; student thấy tất cả; cặp "
+                          "trùng view bị bỏ"},
         "batch": {"batch_size": sc["batch_size"], "micro_batch": int(micro),
                   "probe_sizes": sc["probe_sizes"],
                   "steps_per_epoch": int(steps_per_epoch),
-                  "loss_average": "ASL trung bình trên mẫu có nhãn của CẢ batch"},
-        "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8), 2 nhóm: backbone | rest",
+                  "loss_average": "loss DINO trung bình trên mẫu; micro-batch "
+                                  "chia đều theo số mảnh"},
+        "schedule": {"optimizer": "AdamW(0.9, 0.999, eps 1e-8), 2 nhóm: backbone | rest (DINO head)",
                      "lr": sc["lr"], "backbone_lr": sc["backbone_lr"],
                      "lr_schedule": (
                          f"MỘT lr {sc['lr']:g} cho CẢ HAI nhóm (backbone_lr "
@@ -958,29 +1083,26 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
                      # `max_epochs`/`base_epochs` là TRẦN; số epoch thật sự chạy
                      # nằm ở `base_epochs_run` của history.
                      "max_epochs": sc["max_epochs"], "base_epochs": sc["base_epochs"],
-                     # Số epoch THẬT SỰ chạy nằm ở `base_epochs_run` của
-                     # stage0_history.json, không lặp lại ở đây.
                      "early_stop": {"patience": sc["patience"],
                                     "min_delta": sc["min_delta"],
-                                    "monitor": "val_score = sqrt(F1_macro·Recall_macro)"},
+                                    "monitor": "val_score = −loss DINO trên val CỐ ĐỊNH"},
                      "max_grad_norm": sc["max_grad_norm"],
-                     "select": f"{sc['select']} theo sqrt(F1_macro·Recall_macro) trên val, lớp {sc['val_classes']}"},
-        "asl": sc["asl"], "spec": spec,
+                     "select": f"{sc['select']} theo −loss DINO trên val cố định"},
+        "spec": spec,
         "vision": {"branch_encoder": spec["vextractor"]["arch"],
                    "pretrained": spec["vextractor"]["pretrained"],
-                   "norm": "LayerNorm của ConvNeXt (không có BatchNorm, không thống kê chạy)",
+                   "norm": "LayerNorm của ViT (không BatchNorm, không thống kê chạy)",
                    "image_size": spec["vextractor"]["image_size"],
-                   # ĐÚNG mean/std đi kèm trọng số ImageNet của checkpoint
+                   # ĐÚNG mean/std đi kèm trọng số của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
                    "normalize": dict(spec["vextractor"]["normalize"]),
-                   # Khối cam làm việc ở d_branch; d_model CHỈ ở đầu ra Aligner.
                    "d_branch": spec["vextractor"]["d_branch"],
                    "mlp_hidden": spec["vextractor"]["mlp_hidden"],
                    "n_query": Z.n_query_of(spec),
-                   # Aligner KHÔNG có ở Stage 0 (Cls Head đọc thẳng Q_raw);
-                   # ghi spec của nó để main stage đối chiếu.
                    "aligner": dict(spec["aligner"]),
-                   "note": "Stage 0 KHÔNG chạy Gemma; d_model đọc từ AutoConfig",
+                   "note": "Stage 0 CHỈ huấn luyện backbone (tự giám sát). "
+                           "Extractor + Aligner là của MAIN STAGE. Stage 0 "
+                           "KHÔNG nạp Gemma; d_model đọc từ AutoConfig",
                    "decoder_hf_id": cfg["base"]["hf_id"],
                    "d_model": int(spec["d_model"])},
         "best": best, "weights": files,

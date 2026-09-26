@@ -2,7 +2,7 @@
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
 `train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 32 vector
-Q = Aligner(V-Extractor(ảnh 448²)) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+Q = Aligner(Extractor(DINOv3(ảnh 448²))) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -15,21 +15,20 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                   với B vẫn là cùng một đại lượng;
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
-                 nhánh có AdamW RIÊNG, MỘT nhóm — và nhóm ấy CHỈ chứa Aligner.
-                 Khối V-Extractor (màu cam) bị ĐÓNG BĂNG HOÀN TOÀN suốt main
-                 stage: requires_grad=False + eval() + chạy trong `no_grad`,
-                 KHÔNG có bước mở băng nào. Nó đã được Stage 0 dạy xong và câu
-                 hỏi của lần chạy này là "một Aligner học được, đứng giữa một
-                 khối thị giác CỐ ĐỊNH và decoder, đủ để đổi chất lượng báo cáo
-                 chưa" — mở băng nó giữa chừng là trộn hai biến vào một lượt.
-                 Aligner (khởi tạo ngẫu nhiên, không có ở Stage 0) học ở lr
-                 `vextractor.main.align_lr` = 1e-5, wd 0.01: warm-up TUYẾN TÍNH
-                 theo BƯỚC từ 1e-8 trong `align_warmup_steps` = 20/200 bước rồi
-                 PHẲNG tới bước cuối — không anneal. 20 bước warm-up vì Aligner
-                 là khối DUY NHẤT khởi tạo ngẫu nhiên, kẹp giữa một khối thị
-                 giác đã dạy xong và một decoder đã dạy xong: một bước Adam ở lr
-                 đầy đủ trên ma trận ngẫu nhiên là cách chắc nhất để Q lệch khỏi
-                 phân phối mà LoRA đang học cùng lúc;
+                 nhánh có AdamW RIÊNG, MỘT nhóm: **Extractor + Aligner**.
+                 Chỉ BACKBONE (DINOv3 — trọng số TEACHER/EMA của Stage 0) chạy
+                 ở chế độ TEACHER INFERENCE suốt main stage: requires_grad=False
+                 + eval() + chạy trong `no_grad`, KHÔNG có bước mở băng nào. Đó
+                 đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
+                 dropout, không stochastic depth, không gradient. Phần ngoài backbone
+                 (Linear vào, 32 learner, Self/Cross-attn, MLP) và Aligner đều
+                 KHỞI TẠO NGẪU NHIÊN ở đây — Stage 0 không dựng chúng — và học ở
+                 lr `vextractor.main.align_lr` = 1e-5, wd 0.01: warm-up TUYẾN
+                 TÍNH theo BƯỚC từ 1e-8 trong `align_warmup_steps` = 20/200 bước
+                 rồi PHẲNG tới bước cuối, không anneal. Warm-up vì cả nhóm này
+                 là ma trận ngẫu nhiên kẹp giữa một encoder đã dạy xong và một
+                 decoder đã dạy xong: một bước Adam ở lr đầy đủ là cách chắc
+                 nhất để Q lệch khỏi phân phối mà LoRA đang học cùng lúc;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh. Clip chung
                  thì chuẩn gradient của nhánh kéo nhỏ bước cập nhật LoRA —
                  một khác biệt thứ hai so với A.
@@ -48,9 +47,10 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-S ở 448²
-cho mỗi ảnh. Lượt ConvNeXt ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
-giữ activation nào — phần nặng còn lại của nhánh là Aligner trên đúng 32 token.
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt DINOv3 ViT-S+ ở 448²
+cho mỗi ảnh. Lượt ViT-S+ ấy chạy trong `no_grad` (backbone đóng băng) nên nó
+không giữ activation nào — phần nặng còn lại là Cross-attn của 32 learner trên
+784 ô và Aligner trên đúng 32 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -83,10 +83,10 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 # nguyên trong config bây giờ nghĩa là đang mô tả một lịch KHÔNG còn tồn tại —
 # và im lặng bỏ qua chúng là cách chắc chắn nhất để tưởng mình đang chạy lịch cũ.
 OBSOLETE_MAIN = {
-    "vext_lr": "đổi tên thành `align_lr` — lr bây giờ là của Aligner, không "
-               "phải của V-Extractor (khối cam đóng băng hoàn toàn).",
+    "vext_lr": "đổi tên thành `align_lr` — lr bây giờ là của Extractor + "
+               "Aligner, không phải của backbone (backbone đóng băng hoàn toàn).",
     "vext_wd": "đổi tên thành `align_wd`.",
-    "freeze_vext_epochs": "bỏ hẳn: V-Extractor bị đóng băng SUỐT main stage, "
+    "freeze_vext_epochs": "bỏ hẳn: backbone bị đóng băng SUỐT main stage, "
                           "không còn bước mở băng nào để khai.",
 }
 
@@ -94,8 +94,9 @@ OBSOLETE_MAIN = {
 def zcfg(cfg: Cfg) -> dict:
     """`vextractor.main` — lịch của nhánh ở main stage.
 
-    Đúng MỘT nhóm tham số: Aligner, lr cố định `align_lr`. V-Extractor không có
-    lr vì nó không có bước cập nhật nào.
+    Đúng MỘT nhóm tham số: Extractor (phần ngoài backbone) + Aligner, lr cố
+    định `align_lr` sau warm-up. Backbone không có lr vì nó không có bước cập
+    nhật nào.
     """
     m = dict(dict(cfg.get("vextractor") or {}).get("main") or {})
     bad = [f"vextractor.main.{k}: {why}" for k, why in OBSOLETE_MAIN.items()
@@ -112,7 +113,8 @@ def zcfg(cfg: Cfg) -> dict:
            "separate_clip": bool(m.get("separate_clip", True))}
     if out["align_lr"] <= 0:
         raise TrainUnusable(f"vextractor.main.align_lr {out['align_lr']} phải > 0 "
-                            f"— Aligner là tham số DUY NHẤT của nhánh được học.")
+                            f"— Extractor + Aligner là tham số DUY NHẤT của "
+                            f"nhánh được học.")
     if out["align_warmup_steps"] < 0:
         raise TrainUnusable(f"vextractor.main.align_warmup_steps "
                             f"{out['align_warmup_steps']} phải >= 0 (0 = tắt).")
@@ -135,9 +137,9 @@ def align_lr_at(step: int, zc: dict) -> float:
     `align_warmup_start_lr`. Nhân `align_lr · f` thì bước 1 ra align_lr/20, tức
     đầu dốc bị quyết định bởi số bước warm-up thay vì bởi một khoá trong config.
 
-    Vì sao Aligner cần warm-up dù chỉ có 20 bước: nó là khối DUY NHẤT của nhánh
-    khởi tạo ngẫu nhiên, và ở bước 0 nó đứng giữa một khối thị giác đã được dạy
-    xong và một decoder đã được dạy xong. Bước Adam đầu tiên ở lr đầy đủ trên
+    Vì sao cần warm-up dù chỉ có 20 bước: Extractor + Aligner là phần DUY NHẤT
+    của nhánh khởi tạo ngẫu nhiên, và ở bước 0 chúng đứng giữa một encoder đã
+    được dạy xong (Stage 0) và một decoder đã được dạy xong ($1). Bước Adam đầu tiên ở lr đầy đủ trên
     một ma trận ngẫu nhiên là cách chắc chắn nhất để Q lệch hẳn khỏi phân phối
     mà LoRA đang học cùng lúc — 20 bước = 10% của 200 bước, đủ để moment của
     AdamW ổn định trước khi bước cập nhật lớn dần.
@@ -370,17 +372,27 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # ĐÓNG BĂNG HOÀN TOÀN, một lần, cho cả main stage. Không có `unfreeze_step`.
     branch.set_frozen(True)
     nb = branch.n_params()
-    if nb["trainable"] != nb["aligner"]:
+    if nb["trainable"] != nb["learnable_main"]:
         raise TrainUnusable(
-            f"nhánh có {nb['trainable']:,} tham số học được nhưng Aligner chỉ "
-            f"{nb['aligner']:,} — khối cam chưa bị đóng băng hết.")
+            f"nhánh có {nb['trainable']:,} tham số học được nhưng Extractor + "
+            f"Aligner chỉ {nb['learnable_main']:,} — backbone chưa bị đóng băng "
+            f"hết.")
+    _vl = pre.get("val_loss")
+    _vs = (f"val DINO {float(_vl):.4f}" if _vl is not None
+           else f"score {pre.get('best_score')}")
     print(f"  nhánh: {branch.describe()}", flush=True)
-    print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (backbone "
-          f"{nb['backbone']:,}, ngoài backbone {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
-          f"(epoch {pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
-          f"{pre['dropped']}) · ĐÓNG BĂNG HOÀN TOÀN cả main stage │ Aligner "
-          f"{nb['aligner']:,} — MỚI (không có ở Stage 0), học ở lr cố định "
+    _w = pre.get("weights") or "?"
+    print(f"  tham số nhánh: backbone {nb['backbone']:,} — NẠP từ Stage 0 TỰ "
+          f"GIÁM SÁT (epoch {pre['best_epoch']}, {_vs}, "
+          f"{pre['n_backbone_tensors']} tensor, trọng số {_w}) · chạy ở chế độ "
+          f"TEACHER INFERENCE (eval + no_grad + đóng băng hoàn toàn) │ "
+          f"Extractor {nb['head']:,} + Aligner {nb['aligner']:,} = "
+          f"{nb['learnable_main']:,} — MỚI (không có ở Stage 0), học ở lr "
           f"{zc['align_lr']:g}", flush=True)
+    if _w != "teacher_ema":
+        print(f"  ⚠ checkpoint Stage 0 không ghi `weights: teacher_ema` — nó "
+              f"đến từ một bản cũ hơn. Main stage vẫn chạy được, nhưng backbone "
+              f"đang là student chứ không phải teacher EMA.", flush=True)
 
     # ── dữ liệu: y như A ─────────────────────────────────────────────────
     max_len = int(tcfg.get("max_seq_len", 1024))
@@ -400,12 +412,13 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                               "weight_decay": float(tcfg.get("weight_decay", 0.0)),
                               "name": "lora"}], betas=(0.9, 0.999), eps=1e-8)
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
-    # CHỈ Aligner. `branch.vextractor` không có mặt ở đây: tham số bị đóng băng
-    # nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước dù grad là None.
-    align_p = list(branch.aligner_parameters())
+    # Extractor (ngoài backbone) + Aligner. Backbone KHÔNG có mặt ở đây: tham
+    # số bị đóng băng nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước
+    # dù grad là None.
+    align_p = list(branch.trainable_parameters())
     opt_b = torch.optim.AdamW(
         [{"params": align_p, "lr": align_lr_at(0, zc), "weight_decay": zc["align_wd"],
-          "name": "aligner"}], betas=(0.9, 0.999), eps=1e-8)
+          "name": "branch"}], betas=(0.9, 0.999), eps=1e-8)
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
@@ -414,7 +427,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                f"warm-up tuyến tính {zc['align_warmup_start_lr']:g} -> "
                f"{zc['align_lr']:g} trong {_aw}/{steps} bước rồi CỐ ĐỊNH")
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
-          f"V-Extractor ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · Aligner {_asched} "
+          f"backbone TEACHER INFER (0 bước học) · Extractor+Aligner {_asched} "
           f"wd {zc['align_wd']} · "
           f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'}", flush=True)
     if 0 < _aw >= steps:
@@ -429,9 +442,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
 
     def _probe(k: int) -> None:
-        # Dò ở ĐÚNG trạng thái của vòng lặp: khối cam đóng băng (backbone chạy trong
-        # `no_grad`, không giữ activation), Aligner học. Không còn trạng thái
-        # "mở băng giữa chừng" nào nặng hơn để phải dò trước.
+        # Dò ở ĐÚNG trạng thái của vòng lặp: backbone đóng băng (chạy trong
+        # `no_grad`, không giữ activation), Extractor + Aligner học. Không còn
+        # trạng thái "mở băng giữa chừng" nào nặng hơn để phải dò trước.
         model.train()
         branch.train()
         b = collate_vext([ds[i] for i in _heavy[:k]], pad_id, max_len)
@@ -604,7 +617,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             lr_now = opt.param_groups[0]["lr"]
             print(f"    [{aid}] bước {step + 1}/{steps} · ce {step_ce:.4f} · "
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} nhánh "
-                  f"{gn_br or 0:.3f} (Aligner) · lr {lr_now:.2e} · lr_align "
+                  f"{gn_br or 0:.3f} (nhánh) · lr {lr_now:.2e} · lr_branch "
                   f"{alr:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
@@ -627,7 +640,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     model.save_pretrained(str(out_dir), safe_serialization=True)
     processor.save_pretrained(str(out_dir))
     RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps": steps,
-                                      "trained": "aligner"})
+                                      "trained": "extractor+aligner"})
     for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
         shutil.copyfile(stage0_best / f, out_dir / f)
 
@@ -641,7 +654,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         **{k: v for k, v in pstats.items() if k not in ("method", "rank", "alpha")},
         "vextractor": {"spec": spec, "spec_fingerprint": RCV.spec_fingerprint(spec),
                        "n_params": nb, "main": zc, "stage0": pre,
-                       "trained": "aligner", "frozen_steps": steps},
+                       "trained": "extractor+aligner", "frozen_steps": steps},
         "autobatch_chunk": ab_rep, "physical_chunk": chunk,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,

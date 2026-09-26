@@ -8,7 +8,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
   2. V-Extractor: ViT -> lưới patch -> learner Q qua Self/Cross-attn -> Q
   3. Stage 0 -> main: nhánh nạp đúng (Q khớp TỪNG BIT với Stage 0), Cls Head bị
      bỏ, format checkpoint cũ bị từ chối; ghi/nạp nhánh khớp từng bit
-  4. γ ASL theo TÊN lớp -> đúng thứ tự CLASS_ORDER (neg, pos, uncertain)
+  4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA/center đổi đúng hướng
   5. metric chọn epoch Stage 0 (sqrt(F1·Recall) macro pos+unc) trên ví dụ tay
   6. CE ghép theo token qua các mảnh == CE trung bình token của cả micro-batch
   7. đóng băng nhánh: không grad, eval, forward chạy trong no_grad
@@ -78,8 +78,7 @@ SMALL_CONV = "convnext_atto"
 SMALL_DB = 16
 
 
-def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q,
-               d_branch=None):
+def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_branch=None):
     from src import vextractor as R
 
     cfg = {"vextractor": {"vextractor": {"image_size": image_size,
@@ -87,9 +86,8 @@ def small_spec(n_labels=14, image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q,
                                          "n_layers": SMALL_NL, "n_query": n_query,
                                          "d_branch": int(d_branch or SMALL_DB),
                                          "mlp_hidden": 64, "n_heads": 4},
-                          "aligner": {"n_heads": 4, "mlp_hidden": 64},
-                          "cls_head": {"n_heads": 4}}}
-    return R.spec_from_cfg(cfg, d_model, n_labels)
+                          "aligner": {"mlp_hidden": 64}}}
+    return R.spec_from_cfg(cfg, d_model)
 
 
 print("═══ selftest §2.2 V-Extractor ═══")
@@ -108,7 +106,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. V-Extractor (cam) -> Aligner (vàng): thân ở d_model, hai residual")
+@check("2. Extractor @d_branch (hai residual) -> Aligner (MLP thuần đổi chiều)")
 def _():
     import torch
 
@@ -171,22 +169,18 @@ def _():
         h = s + vx.mlp(s)
         want = q0 + vx.xattn(vx.x_norm(h), kv)
         assert torch.allclose(vx(x), want, atol=1e-6)
-    # Aligner: CHỈ ở nhánh main, KHÔNG ở Supervised Block của Stage 0.
-    # MLP đứng TRƯỚC (chỗ DUY NHẤT đổi chiều d_branch -> d_model), residual
-    # cộng từ ĐẦU RA MLP.
+    # Aligner ở /5 là MỘT MLP THUẦN: không norm, không attention, không residual
     al = br.aligner
     assert al.mlp[0].in_features == SMALL_DB and al.mlp[0].out_features == 64
     assert al.mlp[-1].out_features == 32                     # = d_model
-    assert al.sattn.d == 32 and al.norm.weight.numel() == 32
+    assert not hasattr(al, "sattn") and not hasattr(al, "norm")
     with torch.no_grad():
-        h = al.mlp(want)
-        assert torch.allclose(al(want), h + al.sattn(al.norm(h)), atol=1e-6)
+        assert torch.allclose(al(want), al.mlp(want), atol=1e-6)
         assert torch.allclose(br(x), al(want), atol=1e-6)
-    # Cls Head đọc Q_raw ở d_branch, KHÔNG ở d_model
-    blk0 = R.SupervisedBlock(sp)
-    assert not hasattr(blk0, "aligner")
-    assert blk0.cls_head.fc.in_features == SMALL_DB
-    assert blk0.cls_head.pool.attn.d == SMALL_DB
+    # Cls Head / ASL / SupervisedBlock BỊ BỎ HẲN — Stage 0 là tự giám sát
+    for gone in ("SupervisedBlock", "ClsHead", "ClsCounter", "CellMaskedASL",
+                 "build_asl", "asl_gammas", "build_cls_head", "AttnPooling"):
+        assert not hasattr(R, gone), gone
     # ViT KHÔNG có BatchNorm nào để phải thay — khối InstanceNorm của bản cũ
     # phải biến mất hẳn, không còn treo lại dưới dạng API chết
     import torch.nn as nn
@@ -202,10 +196,12 @@ def _():
     assert bb and hd and not (bb & hd)
     assert bb | hd == {id(t) for t in vx.parameters()}
     assert id(vx.learner) in hd                    # learner Q thuộc nhóm `rest`
-    n_live = vx.freeze_body(True)
+    vx.set_body_frozen(True)
+    n_live = sum(1 for q in vx.body.parameters() if q.requires_grad)
     assert n_live == 0 and not any(t.requires_grad for t in vx.backbone_parameters())
     assert all(t.requires_grad for t in vx.head_parameters())   # ngoài ViT: vẫn học
-    assert vx.freeze_body(False) == sum(t.numel() for t in vx.backbone_parameters())
+    vx.set_body_frozen(False)
+    assert all(q.requires_grad for q in vx.backbone_parameters())
     # ── học được ──────────────────────────────────────────────────────────
     before = br(x).detach().clone()
     opt = torch.optim.AdamW([t for t in br.parameters() if t.requires_grad], lr=1e-2)
@@ -250,9 +246,8 @@ def _():
                                          "arch": SMALL_CONV, "pretrained": False,
                                          "n_query": SMALL_Q, "d_branch": SMALL_DB,
                                          "mlp_hidden": 64, "n_heads": 4},
-                          "aligner": {"n_heads": 4, "mlp_hidden": 64},
-                          "cls_head": {"n_heads": 4}}}
-    sp = R.spec_from_cfg(cfg, 32, 14)
+                          "aligner": {"mlp_hidden": 64}}}
+    sp = R.spec_from_cfg(cfg, 32)
     br = R.VExtractorBranch(sp)
     vx = br.vextractor
     assert vx.kind == "conv" and vx.n_prefix == 0 and vx.n_patch == n_patch
@@ -325,43 +320,60 @@ def _():
             raise AssertionError("mean/std lệch pretrained_cfg phải DỪNG")
 
 
-@check("3. Stage 0 -> main: Q khớp từng bit, bỏ Cls Head, từ chối format cũ")
+@check("3. Stage 0 -> main: checkpoint CHỈ backbone, nạp đúng, từ chối format cũ")
 def _():
+    import json
+
     import torch
 
     from src import vextractor as R
 
-    import json
-
     sp = small_spec()
-    blk = R.SupervisedBlock(sp).eval()
+    body, d_feat, n_patch, n_use, kind = R.build_backbone(sp)
     x = torch.randn(1, 3, SMALL_IMG, SMALL_IMG)
     with tempfile.TemporaryDirectory() as t:
-        R.save_stage0(blk, Path(t) / "s0", {"best_epoch": 3, "best_score": 0.5})
+        R.save_stage0(body, sp, Path(t) / "s0",
+                      {"best_epoch": 3, "best_score": -0.5, "best_val_loss": 0.5})
+        # File chứa ĐÚNG backbone, không gì khác
+        from safetensors.torch import load_file
+
+        sd = load_file(str(Path(t) / "s0" / R.STAGE0_FILE))
+        assert set(sd) == set(body.state_dict()), "checkpoint /5 phải là backbone THUẦN"
+        assert not any(k.startswith(("inp.", "learner", "sattn.", "aligner"))
+                       for k in sd)
         br = R.VExtractorBranch(sp)
-        rep = R.load_stage0_into(br, Path(t) / "s0")
-        assert rep["dropped"] == ["cls_head"], rep
-        for k, v in blk.vextractor.state_dict().items():
-            assert torch.equal(v, br.vextractor.state_dict()[k]), k
+        before = {k: v.clone() for k, v in br.vextractor.body.state_dict().items()}
+        rep_ = R.load_stage0_into(br, Path(t) / "s0")
+        assert rep_["n_backbone_tensors"] == len(sd) and rep_["val_loss"] == 0.5
+        for k, v in body.state_dict().items():
+            assert torch.equal(v, br.vextractor.body.state_dict()[k]), k
+        assert any(not torch.equal(before[k], br.vextractor.body.state_dict()[k])
+                   for k in before), "nạp xong mà backbone không đổi gì?"
+        # Phần NGOÀI backbone KHÔNG có trong checkpoint -> vẫn là khởi tạo mới
         assert not hasattr(br, "cls_head")
-        br.set_frozen(False)
-        br.eval()
-        # Q_raw của main stage == Q_raw mà Cls Head của Stage 0 đã nhìn thấy,
-        # TỪNG BIT. Aligner đứng SAU đó và không có trong checkpoint Stage 0.
-        with torch.no_grad():
-            assert torch.equal(blk.vextractor(x), br.vextractor(x))
-            # Q_raw ở d_branch, Q ở d_model -> không thể so bằng nhau được
-            assert br.vextractor(x).shape[-1] == SMALL_DB
-            assert br(x).shape[-1] == 32
         R.save_branch(br, Path(t) / "b", {})
         br2 = R.load_branch(Path(t) / "b")
-        assert torch.equal(br(x), br2(x))
+        br.set_frozen(True), br.eval(), br2.eval()
+        with torch.no_grad():
+            assert torch.equal(br(x), br2(x))
         assert br2.frozen and br2.n_query == R.n_query_of(sp)
-        # checkpoint của §2.1 (`rgexp.recovery/*`) phải bị TỪ CHỐI, không phải
-        # lệch khoá im lặng
+        # `backbone_spec` KHÔNG gồm d_branch/n_query/aligner/d_model: đổi chúng
+        # thì checkpoint Stage 0 vẫn dùng được (Stage 0 không dựng chúng).
+        sp2 = small_spec(d_model=64, n_query=SMALL_Q + 1)
+        R.load_stage0_into(R.VExtractorBranch(sp2), Path(t) / "s0")
+        # ...nhưng đổi `arch`/`n_layers`/chuẩn hoá thì KHÔNG
+        bad = dict(sp, vextractor=dict(sp["vextractor"], n_layers=SMALL_NL + 1))
+        try:
+            R.load_stage0_into(R.VExtractorBranch(bad), Path(t) / "s0")
+        except RuntimeError as e:
+            assert "backbone" in str(e)
+        else:
+            raise AssertionError("đổi n_layers phải bị từ chối")
+        # checkpoint bố cục CŨ (/4 lưu cả Extractor + Cls Head) phải bị TỪ CHỐI
         m = Path(t) / "s0" / R.STAGE0_META
         meta = json.loads(m.read_text(encoding="utf-8"))
-        m.write_text(json.dumps(dict(meta, format="rgexp.recovery/1")), encoding="utf-8")
+        m.write_text(json.dumps(dict(meta, format="rgexp.vextractor/4")),
+                     encoding="utf-8")
         try:
             R.load_stage0_into(R.VExtractorBranch(sp), Path(t) / "s0")
         except RuntimeError as e:
@@ -370,65 +382,143 @@ def _():
             raise AssertionError("format cũ phải bị từ chối")
 
 
-@check("4. γ ASL theo tên lớp -> thứ tự CLASS_ORDER")
+@check("4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA + center đổi đúng hướng")
 def _():
     import torch
 
+    from src import dino as D
     from src import vextractor as R
-    from src.config import load_config
-    from src.labels_cls import CLASS_ORDER
 
-    cfg = load_config(ROOT / "configs/vextractor.yaml")
-    g = R.asl_gammas(cfg["stage0"]["asl"])
-    # γ = [4.0, 3.0, 0.0] theo thứ tự (neg, unc, pos) của tài liệu
-    want = {"neg": 4.0, "uncertain": 3.0, "pos": 0.0}
-    assert g == [want[c] for c in CLASS_ORDER], (g, CLASS_ORDER)
-    asl = R.build_asl(cfg["stage0"]["asl"])
-    assert asl.clip == 0.02 and asl.gamma_pos == 0.0
-    lg = torch.randn(4, 14, 3, requires_grad=True)
-    y = torch.nn.functional.one_hot(torch.randint(0, 3, (4, 14)), 3).float()
-    loss = asl(lg, y, torch.tensor([1., 1., 0., 1.]))
+    torch.manual_seed(0)
+    sp = small_spec()
+    body, d_feat, n_patch, n_use, kind = R.build_backbone(sp)
+    dc = {"out_dim": 64, "hidden": 32, "bottleneck": 16, "head_layers": 3,
+          "pool": "cls", "student_temp": 0.1, "teacher_temp": 0.04,
+          "center_momentum": 0.9}
+    tr = D.DinoTrainer(body, d_feat, 1, dc)
+    gl = [torch.randn(2, 3, SMALL_IMG, SMALL_IMG) for _ in range(2)]
+    lo = [torch.randn(2, 3, SMALL_IMG // 2, SMALL_IMG // 2) for _ in range(2)]
+    loss = tr.loss(gl + lo, 0.04)
+    assert torch.isfinite(loss) and loss.item() > 0
     loss.backward()
-    assert torch.isfinite(loss) and lg.grad[2].abs().sum() == 0   # mẫu mask: 0 grad
+    # student nhận gradient; teacher TUYỆT ĐỐI không (nó là EMA, không có bước Adam)
+    assert any(q.grad is not None for q in tr.student_parameters())
+    assert all(q.grad is None for q in tr.teacher_parameters())
+    assert all(not q.requires_grad for q in tr.teacher_parameters())
+    # teacher KHÔNG nằm trong optimizer: weight decay sẽ ăn mòn nó dù grad None
+    gp = tr.param_groups(1e-5, 1e-5)
+    ids = {id(q) for g in gp for q in g["params"]}
+    assert not (ids & {id(q) for q in tr.teacher_parameters()})
+    assert [g["name"] for g in gp] == ["backbone", "rest"]
+    # số cặp: teacher 2 global × student 4 view, BỎ 2 cặp trùng -> 6
+    tr.zero_grad(set_to_none=True)
+    n_pair = []
+    orig = torch.nn.functional.log_softmax
+
+    def spy(*a_, **k_):
+        n_pair.append(1)
+        return orig(*a_, **k_)
+    torch.nn.functional.log_softmax = spy
+    try:
+        tr.loss(gl + lo, 0.04, update_center=False)
+    finally:
+        torch.nn.functional.log_softmax = orig
+    assert sum(n_pair) == 2 * 4 - 2 == 6, sum(n_pair)
+    # center: EMA, chỉ đổi khi update_center=True
+    c0 = tr.center.clone()
+    tr.loss(gl + lo, 0.04, update_center=False)
+    assert torch.equal(tr.center, c0)
+    tr.loss(gl + lo, 0.04, update_center=True)
+    assert not torch.equal(tr.center, c0)
+    # EMA: m = 1 -> teacher đứng yên; m = 0 -> teacher = student
+    with torch.no_grad():
+        for q in tr.student_body.parameters():
+            q.add_(0.1)
+    t0 = next(iter(tr.teacher_body.parameters())).clone()
+    tr.ema_update(1.0)
+    assert torch.equal(next(iter(tr.teacher_body.parameters())), t0)
+    tr.ema_update(0.0)
+    for a_, b_ in zip(tr.teacher_body.parameters(), tr.student_body.parameters()):
+        assert torch.allclose(a_, b_, atol=1e-6)
+    # 1 view -> DỪNG (DINO cần ít nhất 2 global)
+    try:
+        tr.loss(gl[:1], 0.04)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("1 view phải bị từ chối")
 
 
-@check("5. metric Stage 0: sqrt(F1·Recall) macro trên lớp pos")
+@check("5. lịch DINO: τ_t ramp rồi phẳng, momentum cosine m0 -> 1, τ_t < τ_s bị ép")
 def _():
-    import math
+    from src import dino as D
+    from src import stage0_vextractor as s0
+    from src.backbone import TrainUnusable
 
+    # τ_t: ramp TUYẾN TÍNH trong `warm` bước rồi PHẲNG
+    assert abs(D.teacher_temp_at(0, 10, 0.02, 0.06) - (0.02 + 0.004)) < 1e-12
+    assert abs(D.teacher_temp_at(9, 10, 0.02, 0.06) - 0.06) < 1e-12
+    assert abs(D.teacher_temp_at(99, 10, 0.02, 0.06) - 0.06) < 1e-12
+    assert D.teacher_temp_at(0, 0, 0.02, 0.06) == 0.06        # warm = 0 -> phẳng ngay
+    ramp = [D.teacher_temp_at(k, 10, 0.02, 0.06) for k in range(10)]
+    assert all(x <= y + 1e-18 for x, y in zip(ramp, ramp[1:]))
+    # momentum: cosine m0 -> m1, đơn điệu tăng, chạm đúng hai đầu
+    assert abs(D.momentum_at(0, 100, 0.996) - 0.996) < 1e-9
+    assert abs(D.momentum_at(100, 100, 0.996) - 1.0) < 1e-9
+    ms = [D.momentum_at(k, 100, 0.996) for k in range(101)]
+    assert all(x <= y + 1e-15 for x, y in zip(ms, ms[1:]))
+    # sharpening là BẮT BUỘC: τ_t >= τ_s bị từ chối
+    base = {"stage0": {"dino": {"student_temp": 0.1, "teacher_temp": 0.2}}}
+    try:
+        s0.dino_cfg(base["stage0"])
+    except TrainUnusable as e:
+        assert "student_temp" in str(e)
+    else:
+        raise AssertionError("τ_t >= τ_s phải bị từ chối")
+    for bad in ({"pool": "avg"}, {"n_local": -1}, {"momentum_start": 1.2},
+                {"center_momentum": 1.0}):
+        try:
+            s0.dino_cfg({"dino": bad})
+        except TrainUnusable:
+            pass
+        else:
+            raise AssertionError(f"{bad} phải bị từ chối")
+
+
+@check("5b. multi-crop: 2 global + n local, đúng cỡ, collate xếp theo VIEW")
+def _():
+    import random
+
+    import numpy as np
     import torch
+    from PIL import Image
 
-    from src import vextractor as R
+    from src import dino as D
+    from src import stage0_vextractor as s0
 
-    # 1 bệnh lý, 4 mẫu. CLASS_ORDER = neg(0), pos(1), uncertain(2)
-    gold = torch.tensor([1, 1, 2, 0])
-    pred = torch.tensor([1, 0, 2, 2])
-    y = torch.nn.functional.one_hot(gold, 3).float().view(4, 1, 3)
-    lg = torch.nn.functional.one_hot(pred, 3).float().view(4, 1, 3) * 5
-    # MẶC ĐỊNH giờ là CHỈ lớp `pos` — uncertain là nhãn của sự do dự trong báo
-    # cáo gốc, không phải của một tình trạng bệnh, nên nó không vào điểm chấm.
-    c = R.ClsCounter(1)
-    assert c.classes == ("pos",)
-    c.update(lg, y, torch.ones(4))
-    r = c.result()
-    # pos: tp1 fp0 fn1 -> F1 2/3, R 1/2. Chỉ MỘT ô vào macro.
-    f1, rec = 2 / 3, 0.5
-    assert r["n_cells"] == 1
-    assert abs(r["f1_macro"] - f1) < 1e-9 and abs(r["recall_macro"] - rec) < 1e-9, r
-    assert abs(r["score"] - math.sqrt(f1 * rec)) < 1e-9
-    assert set(r["per_class"]) == {"pos"}
-    # khai tay hai lớp thì vẫn chạy — `classes` là khoá, không phải hằng số
-    c3 = R.ClsCounter(1, ("pos", "uncertain"))
-    c3.update(lg, y, torch.ones(4))
-    r3 = c3.result()
-    # unc: tp1 fp1 fn0 -> F1 2/3, R 1
-    assert r3["n_cells"] == 2
-    assert abs(r3["recall_macro"] - (0.5 + 1.0) / 2) < 1e-9
-    assert r3["score"] != r["score"]
-    # ô không nhãn (one-hot 0) không được tính
-    c2 = R.ClsCounter(1)
-    c2.update(lg, torch.zeros(4, 1, 3), torch.ones(4))
-    assert c2.result()["n_cells"] == 0
+    dc = s0.dino_cfg({"dino": {"global_size": 64, "local_size": 32, "n_local": 3}})
+    assert dc["aug"]["hflip"] == 0.0, "ảnh CXR có chiều — lật ngang phải TẮT mặc định"
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "x.png"
+        Image.fromarray((np.random.rand(80, 90) * 255).astype("uint8")).save(f)
+        v = D.make_views(f, dc, (0.5,) * 3, (0.5,) * 3, random.Random(0))
+        assert len(v) == 2 + 3
+        assert all(tuple(x.shape) == (3, 64, 64) for x in v[:2])     # global TRƯỚC
+        assert all(tuple(x.shape) == (3, 32, 32) for x in v[2:])
+        assert all(torch.isfinite(x).all() for x in v)
+        assert not torch.equal(v[0], v[1])          # hai global crop khác nhau
+        # cùng RNG -> cùng view (tái lập được)
+        v2 = D.make_views(f, dc, (0.5,) * 3, (0.5,) * 3, random.Random(0))
+        assert all(torch.equal(a, b) for a, b in zip(v, v2))
+        b = D.collate_views([v, v2])
+        assert len(b) == 5 and tuple(b[0].shape) == (2, 3, 64, 64)
+        assert tuple(b[-1].shape) == (2, 3, 32, 32)
+        try:
+            D.collate_views([v, v[:2]])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("số view lệch phải bị từ chối")
 
 
 @check("6. CE ghép theo token qua mảnh == CE của cả micro-batch (kiểu HF)")
@@ -493,7 +583,7 @@ def _():
     assert src.count("VExtReportDataset(") >= 2      # train + val
 
 
-@check("7. nhánh đóng băng: requires_grad=False, eval, forward trong no_grad")
+@check("7. đóng băng CHỈ backbone: Extractor + Aligner vẫn học ở main stage")
 def _():
     import torch
 
@@ -504,27 +594,27 @@ def _():
     br = R.VExtractorBranch(sp)
     br.set_frozen(True)
     br.train()
-    assert not br.vextractor.training          # eval ngay cả khi branch.train()
-    assert br.aligner.training                 # Aligner KHÔNG bị set_frozen đụng
-    x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
-    with torch.no_grad():
-        assert not br.vextractor(x).requires_grad
-    assert all(not p.requires_grad for p in br.vextractor.parameters())
-    assert all(p.requires_grad for p in br.aligner_parameters())
-    # Đây là TRẠNG THÁI CỦA MAIN STAGE: học được đúng bằng Aligner, không hơn
+    # backbone eval + không grad; PHẦN CÒN LẠI vẫn train
+    assert not br.vextractor.body.training
+    assert br.vextractor.training and br.aligner.training
+    assert all(not q.requires_grad for q in br.vextractor.body.parameters())
+    assert all(q.requires_grad for q in br.trainable_parameters())
     npar = br.n_params()
-    assert npar["trainable"] == npar["aligner"] > 0
-    # gradient của CE vẫn tới được Aligner dù Q_raw không có gradient
+    assert npar["trainable"] == npar["learnable_main"] == npar["head"] + npar["aligner"]
+    assert npar["learnable_main"] > 0 and npar["backbone"] > 0
+    # gradient của CE tới được Extractor + Aligner, KHÔNG tới backbone
+    x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     br.eval()
     br(x).sum().backward()
-    assert all(p.grad is not None for p in br.aligner_parameters())
-    assert all(p.grad is None for p in br.vextractor.parameters())
+    assert all(q.grad is not None for q in br.trainable_parameters())
+    assert all(q.grad is None for q in br.vextractor.body.parameters())
     br.zero_grad(set_to_none=True)
+    # mở băng (Lens dùng) -> backbone có gradient trở lại
     br.set_frozen(False)
     br.train()
-    assert br.vextractor.training
+    assert br.vextractor.body.training
     br(x).sum().backward()
-    assert all(p.grad is not None for p in br.vextractor.parameters())
+    assert all(q.grad is not None for q in br.vextractor.body.parameters())
     assert br.n_params()["trainable"] == br.n_params()["total"]
 
 
@@ -626,9 +716,9 @@ def _():
         cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
         d = Path(t) / "ad" / "_stage0"
         sp = small_spec()
-        R.save_stage0(R.SupervisedBlock(sp), d / s0.CKPT, {})
-        R.save_stage0(R.SupervisedBlock(sp), d / s0.BASE, {})
-        for f in (s0.HISTORY, s0.LOADER, s0.LABELS):
+        R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.CKPT, {})
+        R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.BASE, {})
+        for f in (s0.HISTORY, s0.LOADER, s0.LOADER):
             (d / f).write_text("{}")
         (d / "last").mkdir()
         (d / "last" / "state.pt").write_text("x")
@@ -669,18 +759,16 @@ def _():
         # đổi image_size -> n_query đổi theo -> spec khác
         sp2 = small_spec(image_size=SMALL_IMG * 2)
         assert R.spec_fingerprint(sp2) != R.spec_fingerprint(sp)
-        R.save_stage0(R.SupervisedBlock(sp2), s0ck, {})
+        R.save_stage0(R.build_backbone(sp2)[0], sp2, s0ck, {})
         assert "spec" in (branch_stale(bdir, s0ck) or "")
         assert already_trained(bdir, s0ck) is False
     _ = torch
 
 
-@check("13. labels.npz: 0=pos, 1=neg, 2=unc, 3=blank -> ô TOÀN 0, bị mask khỏi ASL")
+@check("13. labels.npz (CHỈ cho Lens): 0=pos, 1=neg, 2=unc, 3=blank -> ô TOÀN 0")
 def _():
     import numpy as np
-    import torch
 
-    from src import vextractor as R
     from src.config import load_config
     from src.labels_cls import CLASS_ORDER, resolve_encoding, to_onehot
 
@@ -694,14 +782,17 @@ def _():
     for j, c in enumerate(want):
         assert oh[j].argmax() == CLASS_ORDER.index(c) and oh[j].sum() == 1, (j, oh[j])
     assert oh[3].sum() == 0                              # blank: toàn 0
-    asl = R.build_asl(cfg["stage0"]["asl"])
-    y = torch.from_numpy(oh).view(1, 4, 3)
-    lg = torch.randn(1, 4, 3, requires_grad=True)
-    asl(lg, y, torch.ones(1)).backward()
-    assert lg.grad[0, 3].abs().sum() == 0 and lg.grad[0, :3].abs().sum() > 0
+    # Khối `labels` KHÔNG còn vào Stage 0: nó chỉ phục vụ Lens, và vì thế cũng
+    # không vào vân tay Stage 0 (đổi nhãn không được bắt chạy lại một lượt DINO).
+    from src import stage0_vextractor as s0
+
+    c2 = load_config(ROOT / "configs/vextractor.yaml")
+    c2["labels"] = dict(lc, max_missing_frac=0.99)
+    assert s0.config_fingerprint(c2) == s0.config_fingerprint(cfg)
+    assert "asl" not in cfg["stage0"] and "val_classes" not in cfg["stage0"]
 
 
-@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn khối cam, chỉ Aligner học lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best theo −loss DINO, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn BACKBONE, Extractor+Aligner học lr 1e-5; --retrain-all")
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
@@ -823,46 +914,53 @@ def _():
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448
     assert int(rv["image_size"]) % 32 == 0                      # chia hết stride 32
-    assert rv["arch"] == "convnext_small.fb_in1k"
-    # ConvNeXt-S: stride tổng 32 -> lưới 14×14 = 196 ô × 768 ở 448²
-    assert (int(rv["image_size"]) // 32) ** 2 == 196
-    # ĐỦ 12 block của ViT-B/16: `n_layers: null`. Khoá vẫn phải CÓ MẶT trong
-    # spec (giá trị None) — nó nằm trong `spec_fingerprint`, nên bật/tắt việc
-    # cắt là checkpoint Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
+    assert rv["arch"] == "vit_small_plus_patch16_dinov3.lvd1689m"
+    # DINOv3 ViT-S+/16: patch 16 -> 448/16 = 28 -> 784 ô × 384 (5 prefix token)
+    assert (int(rv["image_size"]) // 16) ** 2 == 784
     from src import vextractor as R
 
-    # ConvNeXt: `n_layers` phải là null (họ conv không cắt block được)
+    # `n_layers: null` = dùng hết 12 block. Khoá vẫn phải CÓ MẶT trong spec
+    # (giá trị None) — nó nằm trong `backbone_spec`, nên bật/tắt việc cắt là
+    # checkpoint Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
     assert rv["n_layers"] is None
-    assert "n_layers" in R.spec_from_cfg(cfg, 2560, 14)["vextractor"]
+    sp14 = R.spec_from_cfg(cfg, 2560)
+    assert "n_layers" in sp14["vextractor"]
+    assert set(R.backbone_spec(sp14)) == {"arch", "pretrained", "n_layers",
+                                          "normalize"}
+    # KHÔNG còn n_labels / n_classes / class_order: Stage 0 là tự giám sát
+    assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 32) ** 2
-    # khối cam chạy ở d_branch 1024 (KHÁC d_model 2560): head_dim 128
-    assert int(rv["d_branch"]) == 1024 != 2560
-    assert 1024 % int(rv["n_heads"]) == 0 and 1024 // int(rv["n_heads"]) == 128
+    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
+    # Extractor chạy ở d_branch 768 (KHÁC d_model 2560): head_dim 128
+    assert int(rv["d_branch"]) == 768 != 2560
+    assert 768 % int(rv["n_heads"]) == 0 and 768 // int(rv["n_heads"]) == 128
     # MLP(GeLU) nằm GIỮA hai attn và không đổi chiều
-    assert int(rv["mlp_hidden"]) == 2048
-    # Aligner: chỗ DUY NHẤT đổi chiều 1024 -> 2560, attn ở 2560
+    assert int(rv["mlp_hidden"]) == 1024
+    # Aligner: MLP THUẦN, chỗ DUY NHẤT đổi chiều 768 -> 2560 (không attn)
     al = cfg["vextractor"]["aligner"]
-    assert 2560 // int(al["n_heads"]) == 128 and int(al["mlp_hidden"]) == 2560
-    # Cls Head đọc Q_raw ở d_branch 1024 (KHÔNG ở 2560): head_dim 128
-    ch = cfg["vextractor"]["cls_head"]
-    assert 1024 % int(ch["n_heads"]) == 0 and 1024 // int(ch["n_heads"]) == 128
+    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 1152
+    # Cls Head bị BỎ HẲN khỏi config
+    assert "cls_head" not in cfg["vextractor"] and "n_labels" not in cfg["vextractor"]
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
     assert "normalize" not in rv and "mean" not in rv
-    # main stage: khối cam đóng băng hoàn toàn, CHỈ Aligner học, lr CỐ ĐỊNH 1e-5
+    # main stage: BACKBONE đóng băng hoàn toàn, Extractor + Aligner học, lr 1e-5
     assert zc["align_lr"] == 1e-5
-    # Stage 0: ASL γ = [3.0, 0.0, 0.0] theo thứ tự (neg, unc, pos), clip 0.05
-    from src.vextractor import asl_gammas
-    from src.labels_cls import CLASS_ORDER
-    g = dict(zip(CLASS_ORDER, asl_gammas(cfg["stage0"]["asl"])))
-    assert (g["neg"], g["uncertain"], g["pos"]) == (4.0, 3.0, 0.0), g
-    assert float(cfg["stage0"]["asl"]["clip"]) == 0.02
+    # Stage 0 TỰ GIÁM SÁT: KHÔNG còn ASL / val_classes / n_labels
+    assert not ({"asl", "val_classes", "n_labels"} & set(cfg["stage0"]))
     assert (int(cfg["stage0"]["patience"]), int(cfg["stage0"]["max_epochs"])) == (5, 50)
-    # val chấm CHỈ lớp pos (neg áp đảo; uncertain là do dự của báo cáo, không
-    # phải một tình trạng bệnh). ASL vẫn HỌC cả 3 lớp — hai chuyện khác nhau.
-    assert sc["val_classes"] == ["pos"]
-    assert set(g) == {"neg", "uncertain", "pos"}
+    dc = sc["dino"]
+    # teacher CHỈ thấy global; local phải NHỎ hơn global — đó là chỗ "local đoán
+    # global" sinh ra tính bất biến theo tỉ lệ
+    assert dc["global_size"] == int(rv["image_size"]) == 448
+    assert 0 < dc["local_size"] < dc["global_size"] and dc["local_size"] % 16 == 0
+    assert dc["n_local"] >= 1
+    # sharpening: τ_t < τ_s; centering bật; EMA tiến về 1
+    assert 0 < dc["teacher_temp"] < dc["student_temp"]
+    assert 0 <= dc["center_momentum"] < 1
+    assert dc["momentum_start"] < dc["momentum_end"] == 1.0
+    # ảnh CXR có chiều -> lật ngang PHẢI tắt
+    assert dc["aug"]["hflip"] == 0.0
     assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
     # warm-up chiếm TRỌN epoch đầu -> mọi chỗ đếm "số epoch của base" phải cộng
@@ -908,7 +1006,7 @@ def _():
         raise AssertionError("stage0.probe_sizes lệch batch_size phải DỪNG")
 
 
-@check("15. Stage 0 chạy thật (ResNet nhỏ, KHÔNG Gemma): 1 norm + 3 main -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP 1e-5→1e-7 -> final/; chạy lại chỉ epoch 5")
+@check("15. Stage 0 DINO chạy thật (ViT nhỏ, KHÔNG Gemma, KHÔNG nhãn): 1 warm-up + 3 base -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP -> final/; chạy lại chỉ epoch 5")
 def _():
     import json
 
@@ -916,11 +1014,12 @@ def _():
     import pandas as pd
     import torch
 
+    from src import dino as DN
     from src import vextractor as R
     from src import stage0_vextractor as s0
     from src.config import load_config
 
-    D_MOD, L = 32, 14
+    D_MOD = 32
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
@@ -931,29 +1030,38 @@ def _():
                          "cls_head": {"n_heads": 4}}
     # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
     # thật đã tắt) và TẮT patience + `select: last` để số epoch cố định 4.
-    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
+    cfg["stage0"] = dict(cfg["stage0"],
+                         dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
+                                   local_size=SMALL_IMG // 2, n_local=2,
+                                   out_dim=64, hidden=32, bottleneck=16),
+                         batch_size=4, micro_batch=2,
                          warmup_epochs=1.0, max_epochs=3, patience=0,
                          select="last",
                          final_anneal=dict(cfg["stage0"]["final_anneal"],
                                            enabled=True))
     cfg["autobatch"] = {"enabled": False}
-    rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
-    lut = {k: np.eye(3, dtype=np.float32)[rng.integers(0, 3, L)] for k in keys}
     # Stage 0 của §2.2 KHÔNG nạp Gemma: chỉ cần thay `decoder_width` (vốn đọc
     # AutoConfig từ Hub) và nguồn ảnh. ViT trong nhánh là THẬT — chỉ `pretrained`
     # bị ép về False khi DỰNG để selftest không tải mạng, còn khoá trong config
     # vẫn là True nên guard "pretrained phải bật" của `run` đi qua thật.
-    orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-            s0.ImageOnlyDataset.pixels, R.backbone_body)
+    # `__getitem__` trả multi-crop GIẢ (không đọc ảnh thật): 2 global + n local,
+    # phụ thuộc chỉ số mẫu VÀ epoch, đúng như dataset thật.
+    def _views(self, i):
+        d_ = self.dc
+        gen = torch.Generator().manual_seed(i * 131 + self.epoch)
+        return ([torch.randn(3, d_["global_size"], d_["global_size"], generator=gen)
+                 for _ in range(2)]
+                + [torch.randn(3, d_["local_size"], d_["local_size"], generator=gen)
+                   for _ in range(int(d_["n_local"]))])
+
+    orig = (s0.decoder_width, s0.assert_same_pixels,
+            s0.ImageOnlyDataset.__getitem__, R.backbone_body)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None:
-                       orig[4](arch, False, image_size, n_layers))
+                       orig[3](arch, False, image_size, n_layers))
     s0.decoder_width = lambda *_a, **_k: D_MOD
-    s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})
     s0.assert_same_pixels = lambda *_a, **_k: None
-    s0.ImageOnlyDataset.pixels = lambda self, i: torch.randn(
-        1, 3, self.image_size, self.image_size,
-        generator=torch.Generator().manual_seed(i))
+    s0.ImageOnlyDataset.__getitem__ = _views
     pushed = []
     try:
         with tempfile.TemporaryDirectory() as t:
@@ -985,11 +1093,13 @@ def _():
             b5 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
             # KHÔNG còn epoch đóng băng nào: ViT học ngay từ bước 0, chỉ ở lr
             # riêng (`backbone_lr`). Nên sau epoch 1 trọng số ViT đã phải đổi.
-            blk0 = R.SupervisedBlock(R.spec_from_cfg(cfg, D_MOD, L))
-            assert any(t.requires_grad for t in blk0.vextractor.backbone_parameters())
-            gnames = [g["name"] for g in blk0.param_groups(3e-5, 1e-5)]
+            sp0 = R.spec_from_cfg(cfg, D_MOD)
+            bd0, df0, _np0, _nl0, _k0 = R.build_backbone(sp0)
+            tr0 = DN.DinoTrainer(bd0, df0, 1, s0.s0cfg(cfg)["dino"])
+            gnames = [g["name"] for g in tr0.param_groups(3e-5, 1e-5)]
             assert gnames == ["backbone", "rest"], gnames
-            del blk0
+            assert all(q.requires_grad for q in tr0.student_body.parameters())
+            del tr0, bd0
             f6 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
             assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 5 đã học
             assert s0.finished(cfg) is not None
@@ -1014,8 +1124,8 @@ def _():
             assert m3["anneal"]["reset_optimizer"] is False
             assert m3["optimizer_continued"] is False
     finally:
-        (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-         s0.ImageOnlyDataset.pixels, R.backbone_body) = orig
+        (s0.decoder_width, s0.assert_same_pixels,
+         s0.ImageOnlyDataset.__getitem__, R.backbone_body) = orig
 
 
 @check("15c. dừng sớm: patience đếm epoch val không cải thiện, DỪNG, và `final/` mang trọng số epoch TỐT NHẤT (không phải epoch cuối)")
@@ -1026,31 +1136,29 @@ def _():
     import pandas as pd
     import torch
 
+    from src import dino as DN
     from src import vextractor as R
     from src import stage0_vextractor as s0
     from src.config import load_config
 
-    D_MOD, L = 32, 14
+    D_MOD = 32
     # val_score kịch bản sẵn: tăng ở epoch 2 rồi ĐỨNG YÊN. patience = 2 nên
     # epoch 3 (bad=1), epoch 4 (bad=2) -> DỪNG ở epoch 4, best = epoch 2.
     SCORES = [0.50, 0.60, 0.55, 0.55] + [0.10] * 20
     it = iter(SCORES)
 
-    class FakeCounter:
-        """Thay `ClsCounter` để val_score là một dãy ĐÃ BIẾT — dừng sớm phải
-        kiểm được bằng một con số xác định, không phải bằng may rủi của
-        gradient trên dữ liệu ngẫu nhiên."""
+    # Val của /5 là chính loss DINO, nên chỗ duy nhất tiêm được một dãy
+    # val_score ĐÃ BIẾT là `DinoTrainer.loss`, phân biệt train/val bằng cờ
+    # `update_center` (val gọi với False, đúng theo `evaluate`).
+    _real_loss = DN.DinoTrainer.loss
 
-        def __init__(self, n_labels, classes=("pos",)):
-            pass
-
-        def update(self, *a, **k):
-            pass
-
-        def result(self):
-            v = float(next(it))
-            return {"f1_macro": v, "recall_macro": v, "score": v,
-                    "n_cells": 1, "per_class": {}}
+    def fake_loss(self, views, teacher_temp, update_center=True):
+        # `evaluate` gọi sau `block.eval()`; đường train VÀ lượt dò autobatch
+        # đều ở `train()` — không phân biệt thì lượt dò tiêu mất một phần tử của
+        # dãy và cả kịch bản dừng sớm lệch một epoch.
+        if update_center or self.training:      # TRAIN / probe: chạy thật
+            return _real_loss(self, views, teacher_temp, update_center)
+        return torch.tensor(-float(next(it)))   # VAL: score = −loss
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
@@ -1058,29 +1166,41 @@ def _():
                                         "n_query": SMALL_Q, "d_branch": SMALL_DB,
                                         "mlp_hidden": 64, "n_heads": 4},
                          "aligner": {"n_heads": 4, "mlp_hidden": 64},
-                         "cls_head": {"n_heads": 4}}
+}
     # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
-    cfg["stage0"] = dict(cfg["stage0"], batch_size=4, micro_batch=2,
+    cfg["stage0"] = dict(cfg["stage0"],
+                         dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
+                                   local_size=SMALL_IMG // 2, n_local=2,
+                                   out_dim=64, hidden=32, bottleneck=16),
+                         batch_size=4, micro_batch=2,
+                         # val đúng MỘT micro-batch: `evaluate` gọi loss một
+                         # lần mỗi epoch, nên dãy val_score kịch bản sẵn được
+                         # tiêu đúng một phần tử cho mỗi epoch.
+                         val_n_samples=2,
                          warmup_epochs=1.0, max_epochs=8, patience=2,
                          min_delta=0.0, select="best")
     cfg["autobatch"] = {"enabled": False}
     assert s0.s0cfg(cfg)["base_epochs"] == 9
     assert s0.s0cfg(cfg)["final_anneal"]["enabled"] is False   # không anneal
 
-    rng = np.random.default_rng(0)
     keys = [f"k{i}" for i in range(12)]
-    lut = {k: np.eye(3, dtype=np.float32)[rng.integers(0, 3, L)] for k in keys}
-    orig = (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-            s0.ImageOnlyDataset.pixels, R.backbone_body, R.ClsCounter)
+
+    def _views(self, i):
+        d_ = self.dc
+        gen = torch.Generator().manual_seed(i * 131 + self.epoch)
+        return ([torch.randn(3, d_["global_size"], d_["global_size"], generator=gen)
+                 for _ in range(2)]
+                + [torch.randn(3, d_["local_size"], d_["local_size"], generator=gen)
+                   for _ in range(int(d_["n_local"]))])
+
+    orig = (s0.decoder_width, s0.assert_same_pixels,
+            s0.ImageOnlyDataset.__getitem__, R.backbone_body, DN.DinoTrainer.loss)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None:
-                       orig[4](arch, False, image_size, n_layers))
-    R.ClsCounter = FakeCounter
+                       orig[3](arch, False, image_size, n_layers))
     s0.decoder_width = lambda *_a, **_k: D_MOD
-    s0.labels_cls.load_map = lambda *_a, **_k: (lut, {"n_labels": L})
+    DN.DinoTrainer.loss = fake_loss
     s0.assert_same_pixels = lambda *_a, **_k: None
-    s0.ImageOnlyDataset.pixels = lambda self, i: torch.randn(
-        1, 3, self.image_size, self.image_size,
-        generator=torch.Generator().manual_seed(i))
+    s0.ImageOnlyDataset.__getitem__ = _views
     try:
         with tempfile.TemporaryDirectory() as t:
             cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
@@ -1096,7 +1216,8 @@ def _():
             assert [x["phase"] for x in h["history"]] == ["warmup"] + ["base"] * 3
             assert [round(x["val_score"], 2) for x in h["history"]] == SCORES[:4]
             # epoch đem đi là epoch TỐT NHẤT (2), không phải epoch cuối (4)
-            assert h["best_epoch"] == 2 and abs(h["best_score"] - 0.60) < 1e-9
+            # 1e-6 chứ không 1e-9: val_score đi qua một tensor float32
+            assert h["best_epoch"] == 2 and abs(h["best_score"] - 0.60) < 1e-6
             assert h["base_epoch"] == 2
 
             # ── `final/` phải mang ĐÚNG trọng số của epoch 2 ───────────────
@@ -1116,8 +1237,9 @@ def _():
             sc0 = s0.s0cfg({"stage0": dict(cfg["stage0"], patience=0)})
             assert sc0["patience"] == 0
     finally:
-        (s0.decoder_width, s0.labels_cls.load_map, s0.assert_same_pixels,
-         s0.ImageOnlyDataset.pixels, R.backbone_body, R.ClsCounter) = orig
+        (s0.decoder_width, s0.assert_same_pixels,
+         s0.ImageOnlyDataset.__getitem__, R.backbone_body,
+         DN.DinoTrainer.loss) = orig
 
 
 @check("15b. decoder_width: đọc hidden_size từ AutoConfig (không tải trọng số); mọi hf_token() gọi KHÔNG tham số")
@@ -1248,7 +1370,7 @@ def _():
     with tempfile.TemporaryDirectory() as t:
         cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
         d = s0.stage0_dir(cfg)
-        R.save_stage0(R.SupervisedBlock(small_spec()), d / s0.CKPT,
+        R.save_stage0(R.build_backbone(small_spec())[0], small_spec(), d / s0.CKPT,
                       {"select": "last", "best_epoch": 5})
         # history kiểu cũ: config_fingerprint tính KHÔNG có final_anneal == base_fingerprint
         (d / s0.HISTORY).write_text(json.dumps({
@@ -1289,14 +1411,14 @@ def _():
         cfg["output"] = dict(cfg["output"], adapter_dir=str(t / "ad"))
         base = hub_base(cfg)
         hub = t / "hub"                       # "Hub" giả: bố cục CŨ, chỉ có final/
-        R.save_stage0(R.SupervisedBlock(small_spec()), hub / s0.CKPT,
+        R.save_stage0(R.build_backbone(small_spec())[0], small_spec(), hub / s0.CKPT,
                       {"select": "last", "best_epoch": 5})
         (hub / s0.HISTORY).write_text(json.dumps({
             "finished": True, "select": "last", "best_epoch": 5, "best_score": 0.37,
             "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 6)],
             "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
         (hub / s0.LOADER).write_text("{}", encoding="utf-8")
-        (hub / s0.LABELS).write_bytes(b"npz")
+        (hub / s0.LOADER).write_bytes(b"npz")
         remote = {f"{base}/stage0/{r}": {} for r in s0.KEEP if (hub / r).exists()}
         orig = (hub_sync._api_and_index, hub_sync._download)
         hub_sync._api_and_index = lambda _c: ("api", "repo", "dataset", remote)
@@ -1314,7 +1436,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), hình 3 gồm 4 ô (gốc / Z / Q_raw về pixel / Q sau Aligner về pixel), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), hình 3 gồm 3 ô (gốc / Z / khối Q truy ngược qua teacher DINOv3 về pixel), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1412,33 +1534,31 @@ def _():
     T = int(ids.shape[1])
     assert ra["layer_sens"].shape == (L, T)                 # A: chuỗi gốc
     assert rb["layer_sens"].shape == (L, T + NQ)            # B: dài thêm đúng NQ
-    assert ra["sal_vext"] is None and rb["sal_vext"] is not None
+    # CHỈ CÒN BA Ô: gốc / Z / khối Q. Mọi bản đồ cũ đã bỏ hẳn.
+    for r in (ra, rb):
+        for gone in ("act_siglip", "sal_vext", "sal_vext_64", "sal_vext_act",
+                     "sal_vext_act_64", "sal_vext_pre"):
+            assert gone not in r, gone
     # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh,
     # SMALL_IMG=64 thay cho 448² của cấu hình thật)
     assert ra["sal_z"].shape == (8, 8)
-    assert rb["sal_vext"].shape == (SMALL_IMG, SMALL_IMG), rb["sal_vext"].shape
-    assert np.isfinite(rb["sal_vext"]).all() and rb["sal_vext"].sum() > 0
+    # Ô 3 CHỈ có ở lượt CÓ nhánh: nó là bản đồ của chính khối Q
+    assert ra.get("sal_q") is None and rb["sal_q"] is not None
+    assert rb["sal_q"].shape == (SMALL_IMG, SMALL_IMG), rb["sal_q"].shape
+    assert np.isfinite(rb["sal_q"]).all() and rb["sal_q"].sum() > 0
     # bản gộp về lưới chung để so số
-    assert rb["sal_vext_64"].shape == (8, 8)
-    assert np.isclose(rb["sal_vext_64"].mean(), rb["sal_vext"].mean(), rtol=1e-5)
+    assert rb["sal_q_64"].shape == (8, 8)
+    assert np.isclose(rb["sal_q_64"].mean(), rb["sal_q"].mean(), rtol=1e-5)
     assert LZ.pool_to(np.ones((8, 8)), 8).shape == (8, 8)
     assert LZ.pool_to(np.ones((9, 9)), 8) is None            # không chia hết -> None
-    # Ô "output vision encoder" (hoạt độ SigLIP) đã BỎ hẳn — panel lẫn số liệu
-    for r in (ra, rb):
-        assert "act_siglip" not in r
-    # Ô 3: đầu ra V-Extractor về THẲNG ảnh gốc, Jacobian(Aligner) := identity.
-    # Chỉ có ở lượt CÓ nhánh, cùng lưới pixel với ô 4, và KHÁC ô 4 (nếu trùng
-    # từng bit thì việc đè Jacobian đã không xảy ra).
-    assert ra.get("sal_vext_act") is None
-    assert rb["sal_vext_act"].shape == (SMALL_IMG, SMALL_IMG)
-    assert np.isfinite(rb["sal_vext_act"]).all() and rb["sal_vext_act"].sum() > 0
-    # hoạt độ KHÔNG dính decoder -> khác hẳn bản đồ độ nhạy của ô 4
-    assert not np.allclose(rb["sal_vext_act"], rb["sal_vext"])
-    assert rb["sal_vext_act_64"].shape == (8, 8)
-    assert np.isclose(rb["sal_vext_act_64"].mean(), rb["sal_vext_act"].mean(),
-                      rtol=1e-5)
-    # Lens KHÔNG được để lại dấu vết trên nhánh: trọng số đóng băng, cờ như cũ
+    # Ô 3 KHÔNG dính decoder: nó dựng được cả khi `y` không tồn tại. Kiểm bằng
+    # cách gọi thẳng `_q_saliency_map` — cùng kết quả, không cần model nào.
+    direct = LZ._q_saliency_map(branch, batch["vext_pixels"], torch.device("cpu"))
+    assert np.allclose(direct, rb["sal_q"], atol=1e-5)
+    # Lens KHÔNG được để lại dấu vết trên nhánh: trọng số đóng băng, cờ như cũ,
+    # và backbone vẫn ở chế độ teacher inference (eval)
     assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
+    assert not branch.vextractor.body.training
     # Q nằm SAU khối ảnh -> vị trí của token ảnh KHÔNG đổi
     assert ra["image_span"] == rb["image_span"] == [2, 1 + NZ]
     assert rb["insert_span"] == [2 + NZ, 2 + NZ + NQ], rb["insert_span"]
@@ -1472,13 +1592,13 @@ def _():
         assert 1 <= dg["q_vector_share"]["n_active_50pct"] <= NQ
         assert 1 <= dg["peak"]["layer"] <= L
         assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["vext_energy_ratio"] > 0
-        assert "siglip_activity" not in dg and "siglip_corr" not in dg
-        al = dg["vext_self"]
-        assert -1.0 <= al["corr"] <= 1.0
-        assert 0.0 <= al["top10_iou"] <= 1.0
-        assert al["act_max_over_mean"] >= 1.0
-        assert 0.0 <= al["act_top10_share"] <= 1.0
-        assert "aligner_shift" not in dg
+        # None hợp lệ: bản đồ hằng (std = 0) thì tương quan không định nghĩa
+        assert dg["saliency_corr"] is None or -1.0 <= dg["saliency_corr"] <= 1.0
+        qm = dg["q_map"]
+        assert qm["max_over_mean"] >= 1.0 and 0.0 <= qm["top10_share"] <= 1.0
+        for gone in ("siglip_activity", "siglip_corr", "vext_self",
+                     "aligner_shift"):
+            assert gone not in dg, gone
         out = {"lens": lc, "diagnostics": dg, "reference_arm": "a",
                "arm": {"id": "b", "y": rb["y"], "n_tokens": T + NQ, "layers": L,
                        "image_span": rb["image_span"],
@@ -1491,14 +1611,15 @@ def _():
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc hình 1 thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "hoạt độ", "KHÔNG dính decoder", "Q_raw",
-                     "y → Q → Aligner → V-Extractor → I", "`Q[0]`", "448²"):
+                     "KHÔNG dính decoder", "teacher", "32 High-Q token",
+                     "Q → Aligner → Extractor → teacher (DINOv3) → I",
+                     "`Q[0]`", "448²"):
             assert need in doc, need
-        # bốn ô, không còn OR/AND của §2.0
+        # ba ô, không còn OR/AND của §2.0
         assert "OR (cộng" not in doc and "AND (nhân" not in doc
-        assert "`sal_z`" in doc and "`sal_vext`" in doc
-        assert "`sal_vext_act`" in doc and "sal_vext_pre" not in doc
-        assert "act_siglip" not in doc and "SigLIP còn phân biệt" not in doc
+        assert "`sal_z`" in doc and "`sal_q`" in doc
+        for gone in ("sal_vext", "sal_vext_act", "sal_vext_pre", "act_siglip"):
+            assert gone not in doc, gone
         assert json.dumps(out, default=str)
 
 

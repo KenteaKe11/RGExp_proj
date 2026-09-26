@@ -99,19 +99,19 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = Aligner(V-Extractor(ảnh 448²)), Z giữ nguyên)"],
-        ["Stage 0", "—", f"V-Extractor + Cls Head, ASL, dùng epoch {s0.get('best_epoch', '?')} "
-                          f"({s0.get('select', 'last')})"],
+         f"token, Q = Aligner(Extractor(DINOv3(ảnh 448²))), Z giữ nguyên)"],
+        ["Stage 0", "—", f"backbone TỰ GIÁM SÁT (DINO, KHÔNG nhãn), dùng epoch "
+                          f"{s0.get('best_epoch', '?')} ({s0.get('select', 'last')})"],
         ["nhánh ở main stage", "—",
-         f"V-Extractor nạp TRỌN từ Stage 0 và ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · "
-         f"Aligner MỚI, warm-up {zm.get('align_warmup_steps')} bước từ "
-         f"{zm.get('align_warmup_start_lr')} rồi lr cố định {zm.get('align_lr')} "
-         f"wd {zm.get('align_wd')} · Cls Head bỏ"],
+         f"backbone nạp từ Stage 0 và ĐÓNG BĂNG HOÀN TOÀN (0 bước học) · "
+         f"Extractor + Aligner MỚI, warm-up {zm.get('align_warmup_steps')} bước "
+         f"từ {zm.get('align_warmup_start_lr')} rồi lr cố định "
+         f"{zm.get('align_lr')} wd {zm.get('align_wd')}"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
 
-    L.append("## Stage 0 — V-Extractor + Cls Head\n")
+    L.append("## Stage 0 — backbone, TỰ GIÁM SÁT (DINO, KHÔNG nhãn)\n")
     if s0.get("history"):
         sc0 = s0.get("stage0", {}) or {}
         fa0 = sc0.get("final_anneal") or {}
@@ -124,19 +124,25 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                  f"{' — DỪNG SỚM' if s0.get('stopped_early') else ''} "
                  f"(patience {sc0.get('patience')}, min_delta {sc0.get('min_delta')})"
                  f"{ann}"
-                 f" · ASL γ_neg {sc0.get('asl', {}).get('gamma_neg')} · clip "
-                 f"{sc0.get('asl', {}).get('clip')} · epoch dùng: "
+                 f" · epoch dùng: "
                  f"{s0.get('select', 'best')} · val {sc0.get('val_n_samples')} "
-                 f"mẫu CỐ ĐỊNH, sqrt(F1·Recall) macro {sc0.get('val_classes')}\n")
-        L.append(_tbl(["epoch", "pha", "train ASL", "val ASL", "F1 macro", "Recall macro",
-                       "sqrt(F1·R)", "phút"],
+                 f"mẫu CỐ ĐỊNH, −loss DINO (KHÔNG nhãn)\n")
+        _dc = dict(sc0.get("dino") or {})
+        L.append(f"Hàm mục tiêu: **DINO self-distillation**, 2 global "
+                 f"{_dc.get('global_size')}² + {_dc.get('n_local')} local "
+                 f"{_dc.get('local_size')}² · τ_s {_dc.get('student_temp')} / "
+                 f"τ_t {_dc.get('teacher_temp')} · center m "
+                 f"{_dc.get('center_momentum')} · EMA "
+                 f"{_dc.get('momentum_start')}→{_dc.get('momentum_end')} · "
+                 f"{_dc.get('out_dim')} prototype · lật ngang "
+                 f"{(_dc.get('aug') or {}).get('hflip')}\n")
+        L.append(_tbl(["epoch", "pha", "train DINO", "val DINO", "val_score", "phút"],
                       [[("**" + str(h["epoch"]) + "** ★") if h["epoch"] == s0.get("best_epoch")
                         else str(h["epoch"]),
                         {"anneal": "anneal (final)", "warmup": "warm-up",
                          "base": "lr phẳng"}.get(h.get("phase"), str(h.get("phase"))),
-                        _f(h["train_asl"]), _f(h["val_asl"]),
-                        _f(h["val_f1_macro"]), _f(h["val_recall_macro"]),
-                        _f(h["val_score"]), _f(h.get("minutes"), 1)]
+                        _f(h.get("train_loss")), _f(h.get("val_loss")),
+                        _f(h.get("val_score")), _f(h.get("minutes"), 1)]
                        for h in s0["history"]]))
     else:
         L.append("_chưa có stage0_history.json_")
@@ -201,24 +207,27 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              "và khởi tạo LoRA của B trùng A, nhưng mặt nạ dropout LoRA không trùng "
              "từng bit (lượt dò autobatch của A trong $1 tiêu RNG; B không dò ở batch "
              "đã khoá). Đây là nhiễu hạt giống, không phải một biến có hệ thống.")
-    L.append("- V-Extractor được Stage 0 dạy trên nhãn bệnh lý của 6400 ảnh train — một "
-             "nguồn giám sát A không có. \"Biến duy nhất là chuỗi vào decoder\" "
-             "nghĩa là đúng thế; Q mang theo cả thông tin do Stage 0 học.")
+    L.append("- Backbone của B được Stage 0 dạy TỰ GIÁM SÁT (DINO) trên 6400 ảnh "
+             "train — KHÔNG nhãn nào, nên B không có nguồn giám sát nào A thiếu; "
+             "thứ nó thêm là một biểu diễn thị giác của chính miền ảnh CXR.")
     _nqb = _nq(st_b)
     L.append(f"- B có chuỗi DÀI HƠN A đúng {_nqb} token. Số token vào CE giữ nguyên "
              f"({_nqb} vị trí ấy có nhãn −100), nhưng decoder của B có thêm {_nqb} vị "
              f"trí để attention nhìn vào — đó là một phần của biến đang đo, không phải "
              f"một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
     _np = (st_b.get("vextractor") or {}).get("n_params") or {}
-    L.append(f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage: 0 bước cập nhật, "
-             f"không có gradient nào chạm vào nó. Tham số học được mà A không có nằm "
-             f"TRỌN trong Aligner ({_np.get('aligner', '?'):,} tham số nếu là số) ở lr "
-             f"cố định {zm.get('align_lr')} (warm-up {zm.get('align_warmup_steps')} "
-             f"bước đầu) — nên chênh lệch A/B là của một khối thị "
-             f"giác CỐ ĐỊNH cộng một phép xoay học được, không phải của một encoder "
-             f"được finetune thêm." if isinstance(_np.get("aligner"), int) else
-             f"- V-Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
-             f"của nhánh nằm trọn trong Aligner, lr cố định {zm.get('align_lr')}.")
+    _lm = _np.get("learnable_main")
+    L.append(f"- BACKBONE ĐÓNG BĂNG HOÀN TOÀN suốt main stage: 0 bước cập nhật, "
+             f"không có gradient nào chạm vào nó. Tham số học được mà A không có "
+             f"nằm TRỌN trong Extractor + Aligner "
+             f"({_lm:,} tham số) ở lr {zm.get('align_lr')} (warm-up "
+             f"{zm.get('align_warmup_steps')} bước đầu) — chênh lệch A/B vì thế "
+             f"là của một ENCODER CỐ ĐỊNH cộng một khối nén học được, không "
+             f"phải của một encoder được finetune cùng decoder."
+             if isinstance(_lm, int) else
+             f"- Backbone ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
+             f"của nhánh nằm trọn trong Extractor + Aligner, lr "
+             f"{zm.get('align_lr')}.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")
