@@ -1,19 +1,19 @@
 """Stage 0 — pretrain Supervised Block (V-Extractor + Cls Head) trước main stage.
 
-    ảnh 448² ─► ViT-B/16 ImageNet (đủ 12 block) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
+    ảnh 448² ─► ConvNeXt-S (ImageNet-1k) ─► 32 learner Q ─► Cls Head ─► ASL (14 × 3)
 
 Thứ bị ép mang đủ thông tin bệnh lý là CHÍNH khối Q mà main stage sẽ nối vào
 chuỗi của decoder — Cls Head đọc đầu ra 2560 của V-Extractor. Main stage nạp
 nguyên `vextractor.*` và bỏ Cls Head.
 
 KHÁC §2.1: Stage 0 ở đây KHÔNG nạp Gemma. Nhánh có encoder thị giác của riêng
-nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ViT-B/16 +
+nó, nên không có gì cần chạy qua SigLIP — cả lượt pretrain chỉ là ConvNeXt-S +
 hai khối attention, rẻ hơn §2.1 hẳn một bậc. Thứ duy nhất còn cần từ model là
 `d_model` (2560) để biết chiều đầu ra, và nó được đọc từ `AutoConfig` (chỉ file
 config, không tải trọng số).
 
 MỘT lr cho TẤT CẢ: `stage0.lr` = 1e-5, PHẲNG suốt Stage 0. Optimizer vẫn giữ
-hai nhóm (`backbone` = ViT, `rest` = Linear vào · 128 learner Q · Self-attn ·
+hai nhóm (`backbone` = ConvNeXt, `rest` = Linear vào · 32 learner Q · Self-attn ·
 Cross-attn · MLP · Cls Head) để về sau tách ra được, nhưng `stage0.backbone_lr`
 mặc định LẤY THEO `stage0.lr`, nên khai một số là cả hai nhóm đi cùng một số.
 Thứ DUY NHẤT làm lr đổi là epoch warm-up ở đầu.
@@ -113,7 +113,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ViT-B), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
+           # NÀO CẢ (chỉ ConvNeXt-S), nên đo nó ở [2, 4, 8] là ngoại suy từ vùng
            # quá nhỏ và luôn ra micro thấp hơn hẳn mức máy chịu được.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
            "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
@@ -463,7 +463,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if val_df is None or val_df.empty:
         raise TrainUnusable("Stage 0 chọn epoch theo val — fixture không có mẫu val.")
 
-    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ViT-B.
+    # KHÔNG nạp Gemma: nhánh §2.2 có encoder riêng, Stage 0 chỉ chạy ConvNeXt-S.
     # Thứ duy nhất cần từ model là d_model (2560) — đọc từ config, không tải
     # trọng số. Lệch con số này với model thật thì `load_stage0_into` ở main
     # stage ném spec mismatch, to và sớm.
@@ -474,7 +474,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     # không có con số nào bị đọc từ hai nguồn.
     spec = Z.spec_from_cfg(cfg, text_h, n_labels)
     if not spec["vextractor"]["pretrained"]:
-        # Guard ở ĐÂY chứ không ở `vextractor.vit_body`: selftest cần dựng được
+        # Guard ở ĐÂY chứ không ở `vextractor.backbone_body`: selftest cần dựng được
         # một ViT nhỏ ngẫu nhiên OFFLINE, còn một lượt pretrain THẬT trên
         # backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
         raise TrainUnusable(
@@ -968,12 +968,13 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df, y_tr, m_tr, y_va, m_va, in
         "asl": sc["asl"], "spec": spec,
         "vision": {"branch_encoder": spec["vextractor"]["arch"],
                    "pretrained": spec["vextractor"]["pretrained"],
-                   "norm": "LayerNorm của ViT (không có BatchNorm, không thống kê chạy)",
+                   "norm": "LayerNorm của ConvNeXt (không có BatchNorm, không thống kê chạy)",
                    "image_size": spec["vextractor"]["image_size"],
                    # ĐÚNG mean/std đi kèm trọng số ImageNet của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
                    "normalize": dict(spec["vextractor"]["normalize"]),
-                   # Thân nhánh chạy THẲNG ở d_model (không còn `d_branch`).
+                   # Khối cam làm việc ở d_branch; d_model CHỈ ở đầu ra Aligner.
+                   "d_branch": spec["vextractor"]["d_branch"],
                    "mlp_hidden": spec["vextractor"]["mlp_hidden"],
                    "n_query": Z.n_query_of(spec),
                    # Aligner KHÔNG có ở Stage 0 (Cls Head đọc thẳng Q_raw);

@@ -48,8 +48,8 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 Cls Head KHÔNG có mặt ở main stage (bỏ sau Stage 0).
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ViT-B/16 ở 448²
-cho mỗi ảnh. Lượt ViT ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-S ở 448²
+cho mỗi ảnh. Lượt ConvNeXt ấy chạy trong `no_grad` (khối cam đóng băng) nên nó không
 giữ activation nào — phần nặng còn lại của nhánh là Aligner trên đúng 32 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
@@ -276,7 +276,7 @@ def forward_ce(model, gemma, branch, batch: dict, dev):
     if "vext_pixels" not in batch:
         raise TrainUnusable(
             "batch thiếu `vext_pixels` — nhánh §2.2 có đường ảnh RIÊNG (448², "
-            "mean/std của checkpoint ViT) và không đọc được X của SigLIP. Dataset phải là "
+            "mean/std của checkpoint) và không đọc được X của SigLIP. Dataset phải là "
             "`VExtReportDataset` + `collate_vext`.")
     with RCV.autocast(dev):
         q = branch(batch["vext_pixels"].to(dev))
@@ -375,8 +375,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             f"nhánh có {nb['trainable']:,} tham số học được nhưng Aligner chỉ "
             f"{nb['aligner']:,} — khối cam chưa bị đóng băng hết.")
     print(f"  nhánh: {branch.describe()}", flush=True)
-    print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (ViT "
-          f"{nb['backbone']:,}, ngoài ViT {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
+    print(f"  tham số nhánh: V-Extractor {nb['vextractor']:,} (backbone "
+          f"{nb['backbone']:,}, ngoài backbone {nb['head']:,}) — NẠP TRỌN từ Stage 0 "
           f"(epoch {pre['best_epoch']}, sqrt(F1·R) {pre['best_score']:.4f}; bỏ "
           f"{pre['dropped']}) · ĐÓNG BĂNG HOÀN TOÀN cả main stage │ Aligner "
           f"{nb['aligner']:,} — MỚI (không có ở Stage 0), học ở lr cố định "
@@ -429,7 +429,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         -train_df["ref"].astype(str).str.len().to_numpy(), kind="stable")]
 
     def _probe(k: int) -> None:
-        # Dò ở ĐÚNG trạng thái của vòng lặp: khối cam đóng băng (ViT chạy trong
+        # Dò ở ĐÚNG trạng thái của vòng lặp: khối cam đóng băng (backbone chạy trong
         # `no_grad`, không giữ activation), Aligner học. Không còn trạng thái
         # "mở băng giữa chừng" nào nặng hơn để phải dò trước.
         model.train()

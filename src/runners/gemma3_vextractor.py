@@ -43,7 +43,7 @@ from .gemma3_adapter import Gemma3AdapterRunner
 class Gemma3VExtractorRunner(Gemma3AdapterRunner):
     name = "gemma3_vextractor"
 
-    branch = None           # §2.2: ảnh 448² -> ViT-B/16 -> Q (src/vextractor.py)
+    branch = None           # §2.2: ảnh 448² -> ConvNeXt-S -> Q (src/vextractor.py)
     _gemma = None
     _img_token_id = None
 
@@ -194,7 +194,7 @@ class Gemma3VExtractorRunner(Gemma3AdapterRunner):
                 if "vext_pixels" not in inputs:
                     raise RunnerUnusable(
                         "batch thiếu `vext_pixels` — nhánh §2.2 có đường ảnh "
-                        "riêng (448², mean/std của checkpoint ViT), không đọc X "
+                        "riêng (448², mean/std của checkpoint), không đọc X "
                         "của SigLIP.")
                 with RCV.autocast(aligned.device):
                     q = self.branch(inputs["vext_pixels"])

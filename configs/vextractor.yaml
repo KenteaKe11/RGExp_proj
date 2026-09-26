@@ -20,7 +20,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (ViT-B/16 ĐỦ 12 block ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (ConvNeXt-S ăn ảnh 448²) — và chuỗi dài
 # thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -302,63 +302,69 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: ViT-B/16 pretrain ImageNet ăn thẳng ảnh gốc resize
-# 448×448 -> lưới 28×28 = 784 patch × 768. Lưới ấy KHÔNG phải khối Q (784
-# quá dài để nối vào chuỗi decoder): `n_query` learner vector đi HỎI nó qua
-# Cross-Attn. Đường đi, đúng hình:
+# Nhánh có ENCODER RIÊNG: ConvNeXt-S pretrain ImageNet-1k ăn thẳng ảnh gốc
+# resize 448×448. ConvNeXt trả một BẢN ĐỒ ĐẶC TRƯNG (C, H, W) chứ không phải
+# chuỗi token: stride tổng 32 -> (768, 14, 14), rồi `flatten(2).transpose(1, 2)`
+# thành 196 ô × 768 (hộp "Flatten + Permute" trong hình). Lưới ấy KHÔNG phải
+# khối Q: `n_query` learner vector đi HỎI nó qua Cross-Attn. Đường đi, đúng hình:
 #
-#   KHỐI CAM (V-Extractor) — Stage 0 dạy, main stage ĐÓNG BĂNG HOÀN TOÀN:
-#     784 patch ─► Linear 768→2560 ─► RMSNorm(2560) ────────────────┐
-#     32 learner Q ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
+#   KHỐI CAM (V-Extractor) @ d_branch 1024 — Stage 0 dạy, main stage ĐÓNG BĂNG:
+#     196 ô ─► Linear 768→1024 ─► RMSNorm(1024) ───────────────────┐
+#     32 learner Q ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) 1024→2048→1024 ─► (+)
 #                    │                      └──────── skip ────────────────┘
 #                    │                                    │
-#                    │                              RMSNorm(2560)
+#                    │                              RMSNorm(1024)
 #                    │                                    │
 #                    │                              CrossAttn ◄──────────────┘
-#                    └──────────── skip ────────────────► (+) ─► Q_raw (32, 2560)
+#                    └──────────── skip ────────────────► (+) ─► Q_raw (32, 1024)
 #
-#   KHỐI VÀNG (Aligner) — CHỈ main stage, khởi tạo ngẫu nhiên, THAM SỐ DUY NHẤT
-#   của nhánh được học:
-#     Q_raw ─► RMSNorm(2560) ─► Self-attn ─┬─► MLP(GeLU) 2560→3072→2560 ─► (+)
-#                                          └──────── skip ─────────────────┘
+#   KHỐI VÀNG (Aligner) @ d_model 2560 — CHỈ main stage, khởi tạo ngẫu nhiên,
+#   THAM SỐ DUY NHẤT của nhánh được học, và là chỗ DUY NHẤT đổi chiều:
+#     Q_raw ─► MLP(GeLU) 1024→2560→2560 ─┬─► RMSNorm(2560) ─► Self-attn ─► (+)
+#                                        └──────────── skip ───────────────┘
 #                                                    ─► Q (32, 2560) ─► [Z ‖ Q ‖ T]
 #
-# Thân nhánh chạy THẲNG ở 2560 — bố cục cũ bóp về `d_branch` 2048 rồi mới nở ra
-# ở MLP cuối; khoá `d_branch` vì thế KHÔNG còn và khai nó là lỗi.
+# HAI chiều, đừng lẫn: `d_branch` (1024) là chiều làm việc của khối cam VÀ của
+# Cls Head; `d_model` (2560) là chiều embedding của decoder và CHỈ xuất hiện ở
+# đầu ra Aligner. Stage 0 không dùng `d_model` ở bất cứ đâu — nhờ thế
+# Attn-Pooling của Cls Head rẻ hơn 6 lần so với cùng khối ấy ở 2560.
+#
+# MLP của Aligner đứng TRƯỚC attention (khác bố cục /3): phép nở chiều phải xảy
+# ra trước để residual và attention cùng làm việc ở đúng không gian embedding
+# của decoder. Đặt MLP sau thì residual lệch chiều, phải chèn thêm một phép
+# chiếu nữa chỉ để vá.
 #
 # `n_query` là khoá KHAI TƯỜNG MINH. Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi
 # từ `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi
-# checkpoint — checkpoint ViT họ AugReg dùng 0.5/0.5 chứ không phải
-# mean/std của ImageNet, nên một cặp số gõ tay ở đây là sai lặng lẽ.
+# checkpoint — ConvNeXt fb dùng mean/std ImageNet còn ViT AugReg dùng 0.5/0.5,
+# nên một cặp số gõ tay ở đây là sai lặng lẽ.
 vextractor:
   n_labels: null            # null = theo labels.npz (14)
-  vextractor:               # KHỐI CAM: ảnh (3, 448, 448) -> Q_raw (32, 2560)
-    image_size: 448         # PHẢI chia hết patch size (16). 448/16 = 28 -> 784 patch
-    # timm; lần chạy đầu tải ~330 MB (CẢ 12 block được tải rồi mới cắt).
-    # `augreg_in21k_ft_in1k` = pretrain ImageNet-21k, fine-tune ImageNet-1k.
-    # Chuẩn hoá của nó là 0.5/0.5 (họ AugReg) — KHÔNG phải mean/std ImageNet,
-    # và con số ấy được HỎI từ `pretrained_cfg` chứ không gõ ở đây.
-    # Muốn ImageNet-1k thuần thì đổi sang `vit_base_patch16_224.augreg_in1k`
-    # (cùng 0.5/0.5, cùng 12 block) — đổi arch là phải chạy lại Stage 0.
-    arch: vit_base_patch16_224.augreg_in21k_ft_in1k
-    pretrained: true        # ImageNet. false bị TỪ CHỐI (câu hỏi khác hẳn)
-    # Số block ĐẦU được giữ lại; null = DÙNG HẾT (ở đây: đủ 12 block của
-    # ViT-B/16, 86 M tham số). Khai một số thì `net.blocks` bị thay bằng đúng
-    # ngần ấy block đầu — CẮT THẬT: phần còn lại không vào đồ thị, không vào
-    # state_dict, không chiếm VRAM, không có tham số nào để optimizer chạm vào.
-    # Khoá này nằm trong spec, nên đổi nó -> lệch spec_fingerprint -> checkpoint
-    # Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
+  vextractor:               # KHỐI CAM: ảnh (3, 448, 448) -> Q_raw (32, 1024)
+    image_size: 448         # chia hết stride 32 của ConvNeXt. 448/32 = 14 -> 196 ô
+    # timm; lần chạy đầu tải ~200 MB. `fb_in1k` = bản gốc của Facebook,
+    # pretrain ImageNet-1k THUẦN. Chuẩn hoá của nó là mean/std ImageNet
+    # (0.485/0.456/0.406) — KHÁC hẳn 0.5/0.5 của họ ViT AugReg, và con số ấy
+    # được HỎI từ `pretrained_cfg` chứ không gõ ở đây.
+    arch: convnext_small.fb_in1k
+    pretrained: true        # ImageNet-1k. false bị TỪ CHỐI (câu hỏi khác hẳn)
+    # Số block ĐẦU được giữ lại; null = DÙNG HẾT. ConvNeXt KHÔNG cắt được theo
+    # khoá này (nó xếp block theo 4 stage với số kênh khác nhau, "n block đầu"
+    # không phải một lát cắt hợp lệ) — khai một số ở đây sẽ bị TỪ CHỐI. Khoá
+    # vẫn nằm trong spec cho backbone họ ViT, và nó vào spec_fingerprint nên
+    # đổi là checkpoint Stage 0 cũ bị từ chối chứ không lệch khoá im lặng.
     n_layers: null
     n_query: 32             # số learner vector = số token Q nối vào chuỗi decoder
-    n_heads: 20             # Self/Cross-attn ở 2560: head_dim 128 (2560 = 20 × 128)
-    mlp_hidden: 3072        # MLP(GeLU) GIỮA hai attn: 2560 -> 3072 -> 2560
+    d_branch: 1024          # chiều làm việc của CẢ khối cam VÀ Cls Head
+    n_heads: 8              # Self/Cross-attn ở 1024: head_dim 128 (1024 = 8 × 128)
+    mlp_hidden: 2048        # MLP(GeLU) GIỮA hai attn: 1024 -> 2048 -> 1024
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   aligner:                  # KHỐI VÀNG: CHỈ main stage (Stage 0 KHÔNG dựng nó)
-    n_heads: 20             # head_dim 128
-    mlp_hidden: 3072        # MLP(GeLU) 2560 -> 3072 -> 2560, skip từ Self-attn
+    n_heads: 20             # Self-attn ở 2560: head_dim 128 (2560 = 20 × 128)
+    mlp_hidden: 2560        # MLP(GeLU) 1024 -> 2560 -> 2560, ĐỨNG TRƯỚC attn
     dropout: 0.0
-  cls_head:                 # CHỈ Stage 0: đọc Q_raw -> RMSNorm(2560) -> Attn-Pooling -> 14·3
-    n_heads: 20             # head_dim 128 (2560 = 20 × 128)
+  cls_head:                 # CHỈ Stage 0: đọc Q_raw -> RMSNorm(1024) -> Attn-Pooling -> 14·3
+    n_heads: 8              # head_dim 128 (1024 = 8 × 128)
     dropout: 0.1
   # ── Main stage ─────────────────────────────────────────────────────────
   # ĐÚNG MỘT nhóm tham số học được trong nhánh: Aligner. Khối cam đã được
@@ -386,7 +392,7 @@ vextractor:
 
 # ── Stage 0: pretrain V-Extractor + Cls Head (`src/stage0_vextractor.py`) ──
 # Aligner KHÔNG có mặt ở đây: Cls Head đọc THẲNG Q_raw của khối cam.
-# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ViT-B + hai khối
+# KHÔNG nạp Gemma: nhánh có encoder riêng, Stage 0 chỉ chạy ConvNeXt-S + hai khối
 # attention. 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`.
 #
 # MỘT lr cho TẤT CẢ: 1e-5, PHẲNG suốt quá trình. Optimizer vẫn giữ hai nhóm
