@@ -255,14 +255,17 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
     for r in have:
         _download(api, repo_id, repo_type, f"{base}/stage0/{r}", tmp / r)
     h = json.loads((tmp / s0.HISTORY).read_text(encoding="utf-8"))
+    # So NỘI DUNG (`diff_inputs`), không so hash: phạm vi vân tay đã từng sai
+    # và phải sửa, còn hash đã ghi trên Hub thì không sửa được — so hash là
+    # vứt mọi checkpoint đẩy lên trước lần sửa ấy.
     full = (not base_only and h.get("finished")
-            and h.get("config_fingerprint") == s0.config_fingerprint(cfg))
+            and not s0.diff_inputs(tmp, h, cfg, True))
     base_ok = bool(h.get("base_finished")
-                   and h.get("base_fingerprint") == s0.base_fingerprint(cfg))
+                   and not s0.diff_inputs(tmp, h, cfg, False))
     # Bố cục CŨ trên Hub (chỉ có `final/` = epoch cuối của n epoch lr cố định):
     # nhận làm base/ khi vân tay base khớp. Phải xét TRƯỚC cổng dưới, nếu không
     # thì `base_finished` (khoá chỉ bản mới ghi) làm nó rớt ngay.
-    legacy = (not full and not base_ok and s0.legacy_base(h, cfg)
+    legacy = (not full and not base_ok and s0.legacy_base(h, cfg, tmp)
               and any(r.startswith(s0.CKPT + "/") for r in have))
     if legacy:
         for r in have:
@@ -277,9 +280,8 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
                  adopted_from="stage0/final (bố cục cũ trên Hub)")
         base_ok = True
     if not (full or base_ok):
-        print(f"  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng "
-              f"(vân tay base của máy này {s0.base_fingerprint(cfg)[:12]}, "
-              f"của Hub {str(h.get('base_fingerprint') or h.get('config_fingerprint'))[:12]})",
+        print(f"  ⊘ Stage 0 trên Hub chạy với cấu hình khác — không dùng. "
+              f"Chỗ lệch: {'; '.join(s0.diff_inputs(tmp, h, cfg, False))}",
               flush=True)
         shutil.rmtree(tmp, ignore_errors=True)
         return False

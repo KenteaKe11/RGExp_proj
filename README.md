@@ -341,6 +341,18 @@ trong khi `load_stage0_into` sẽ vui vẻ nạp đúng checkpoint ấy. Hai c�
 đồng, và cái nghiêm hơn thắng: vài giờ GPU cho một backbone **y hệt**. Giờ cả
 hai đọc chung `vextractor.BACKBONE_CFG_KEYS`.
 
+**Và cổng ấy so NỘI DUNG, không so hash.** Sửa phạm vi vân tay là cần, nhưng nó
+**không hồi tố** được con số đã nằm trong `stage0_history.json` của lượt đã
+chạy: hash cũ tính bằng hàm cũ, hash mới bằng hàm mới, nên nếu cổng so hash thì
+**mọi** checkpoint ghi trước lần sửa vẫn bị vứt — đúng thứ lần sửa sinh ra để
+tránh. `diff_inputs` vì thế dựng lại bộ đầu vào **từ những gì history đã ghi**
+(`h["stage0"]` là khối stage0 đã giải quyết, `h["spec"]` có backbone,
+`loader.json` có `seed`) rồi so từng khoá với cấu hình hiện tại. Không có bước
+di trú nào, file cũ lẫn file mới đều được xử đúng, và history nào thiếu
+`spec`/`seed` thì **rơi về so vân tay** chứ không đoán. Thông báo cũng in ra
+**chỗ nào lệch** thay vì hai chuỗi băm. Cùng một hàm dùng cho cả checkpoint trên
+máy lẫn checkpoint kéo từ Hub.
+
 **Format checkpoint Stage 0 cũng không còn bị đòi bằng đúng `FORMAT`.** `FORMAT`
 bump mỗi lần Extractor/Aligner đổi bố cục — /7 → /8 chỉ đổi `d_branch`, số
 learner và kiểu Aligner, backbone y nguyên — nên đòi bằng đúng nó là vứt một

@@ -1566,7 +1566,7 @@ def _():
         assert s0.base_fingerprint(cfg2) != s0.base_fingerprint(cfg)
         assert s0.base_finished(cfg2) is None
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    assert "s0.legacy_base(h, cfg)" in src        # Hub bố cục cũ cũng nhận được
+    assert "s0.legacy_base(h, cfg, tmp)" in src   # Hub bố cục cũ cũng nhận được
 
 
 @check("18. kéo Stage 0 từ Hub (giả lập): bố cục cũ chỉ có final/ -> về máy thành base/")
@@ -2079,6 +2079,86 @@ def _():
         else:
             raise AssertionError("format quá cũ phải bị từ chối")
     del torch
+
+
+@check("24. Stage 0 cũ vẫn dùng được sau khi SỬA phạm vi vân tay: cổng so NỘI "
+       "DUNG đã ghi, không so hash (hash cũ không hồi tố được)")
+def _():
+    """Ca thật, đã gặp: phạm vi vân tay sai -> sửa hàm -> checkpoint vẫn bị vứt.
+
+    `config_fingerprint` từng băm cả `d_branch`/`n_query`/`aligner`. Sửa nó cho
+    đúng phạm vi là cần, NHƯNG hash đã nằm trong `stage0_history.json` của lượt
+    đã chạy thì không sửa theo được. Nếu cổng so hash, MỌI checkpoint ghi trước
+    lần sửa đều bị tuyên "cấu hình KHÁC" và người chạy mất vài giờ GPU cho một
+    backbone y hệt — đúng thứ lần sửa ấy sinh ra để tránh.
+
+    Nên cổng so NỘI DUNG: history ghi cả khối `stage0` đã giải quyết lẫn
+    `spec`, `loader.json` ghi `seed`, nên dựng lại được đúng bộ đầu vào.
+    """
+    import json
+    import tempfile
+
+    from src import stage0_vextractor as s0
+    from src import vextractor as R
+    from src.config import Cfg
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Cfg(json.loads(json.dumps({
+            "seed": 42,
+            "stage0": {"lr": 1e-5, "max_epochs": 3, "micro_batch": 8},
+            "vextractor": {"vextractor": {"image_size": SMALL_IMG,
+                                          "arch": SMALL_ARCH, "pretrained": False,
+                                          "n_layers": SMALL_NL, "n_query": SMALL_Q,
+                                          "d_branch": SMALL_DB, "head_dim": 4},
+                           "aligner": {"mlp_hidden": 64}},
+            "output": {"adapter_dir": td}})))
+        d = s0.stage0_dir(cfg)
+        d.mkdir(parents=True, exist_ok=True)
+        sc = s0.s0cfg(cfg)
+        sp = R.spec_from_cfg(cfg, 32)
+        # history của lượt ĐÃ CHẠY, mang hash của hàm băm CŨ (băm cả khối
+        # vextractor) — giá trị nào cũng được, miễn là KHÁC hash bây giờ.
+        h = {"finished": True, "base_finished": True, "best_epoch": 2,
+             "base_epoch": 2, "stage0": dict(sc), "spec": sp, "seed": 42,
+             "config_fingerprint": "hash_cua_ham_bam_CU",
+             "base_fingerprint": "hash_cua_ham_bam_CU_base"}
+        (d / s0.HISTORY).write_text(json.dumps(h, default=str), encoding="utf-8")
+        for sub in (s0.CKPT, s0.BASE):
+            R.save_stage0(R.build_backbone(sp)[0], sp, d / sub, {"best_epoch": 2})
+
+        assert s0.diff_inputs(d, h, cfg, True) == [], "hash cũ KHÔNG được chặn"
+        assert s0.finished(cfg) is not None, "Stage 0 cũ phải dùng lại được"
+        assert s0.base_finished(cfg) is not None
+
+        # ĐỔI phần ngoài backbone -> vẫn dùng lại được (đó là cả điểm của fix)
+        for key, val in (("d_branch", 32), ("n_query", 3), ("head_dim", 8)):
+            c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+            c2["vextractor"]["vextractor"][key] = val
+            assert s0.finished(c2) is not None, f"đổi {key} không được bắt chạy lại"
+
+        # ĐỔI backbone / stage0 / seed -> PHẢI bắt chạy lại, và nói rõ chỗ lệch
+        c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+        c2["vextractor"]["vextractor"]["arch"] = SMALL_CONV
+        assert s0.finished(c2) is None
+        assert any("backbone" in x for x in s0.diff_inputs(d, h, c2, True))
+        c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+        c2["stage0"]["lr"] = 3e-5
+        assert s0.finished(c2) is None
+        assert any("stage0.lr" in x for x in s0.diff_inputs(d, h, c2, True))
+        c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+        c2["seed"] = 7
+        assert s0.finished(c2) is None
+        assert any("seed" in x for x in s0.diff_inputs(d, h, c2, True))
+        # `micro_batch` chỉ nói chuyện VRAM -> KHÔNG bắt chạy lại
+        c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+        c2["stage0"]["micro_batch"] = 2
+        assert s0.finished(c2) is not None
+
+        # history THIẾU spec/seed -> rơi về so vân tay, không đoán bừa
+        h2 = {k: v for k, v in h.items() if k not in ("spec", "seed")}
+        (d / s0.HISTORY).write_text(json.dumps(h2, default=str), encoding="utf-8")
+        assert s0.history_inputs(d, h2) is None
+        assert s0.diff_inputs(d, h2, cfg, True) != [], "thiếu spec phải rơi về hash"
 
 
 print()

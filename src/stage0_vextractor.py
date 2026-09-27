@@ -295,17 +295,24 @@ def anneal_cfg(s: dict) -> dict:
     return out
 
 
-def legacy_base(h: dict, cfg: Cfg) -> bool:
+def legacy_base(h: dict, cfg: Cfg, d: Path | None = None) -> bool:
     """History kiểu CŨ (trước khi tách base/final) có dùng lại làm base được không?
 
-    Bản cũ chạy đúng phần base rồi ghi checkpoint cuối vào
-    `final/`, và `config_fingerprint` của nó tính trên KHỐI stage0 CHƯA có
-    `final_anneal` — tức là ĐÚNG công thức `base_fingerprint` bây giờ. Nên chỉ
-    nhận khi vân tay ấy khớp và history không có epoch anneal nào.
+    Bản cũ chạy đúng phần base rồi ghi checkpoint cuối vào `final/`, và cấu
+    hình của nó KHÔNG có `final_anneal` — tức là đúng phạm vi mà
+    `base_fingerprint` canh bây giờ. Nên chỉ nhận khi phần ấy khớp và history
+    không có epoch anneal nào.
+
+    `d` (thư mục chứa history) -> so NỘI DUNG qua `diff_inputs`; thiếu nó thì
+    rơi về so vân tay như cũ. Xem `diff_inputs` về việc vì sao so hash không đủ.
     """
-    return bool(h and not h.get("base_finished")
-                and h.get("config_fingerprint") == base_fingerprint(cfg)
-                and not any(x.get("phase") == "anneal" for x in h.get("history") or []))
+    if not h or h.get("base_finished"):
+        return False
+    if any(x.get("phase") == "anneal" for x in h.get("history") or []):
+        return False
+    if d is not None:
+        return not diff_inputs(d, h, cfg, False)
+    return h.get("config_fingerprint") == base_fingerprint(cfg)
 
 
 def adopt_legacy_base(cfg: Cfg) -> dict | None:
@@ -315,7 +322,7 @@ def adopt_legacy_base(cfg: Cfg) -> dict | None:
     if base_finished(cfg) is not None or not (p.exists() and Z.stage0_exists(d / CKPT)):
         return None
     h = json.loads(p.read_text(encoding="utf-8"))
-    if not legacy_base(h, cfg):
+    if not legacy_base(h, cfg, d):
         return None
     (d / BASE).mkdir(parents=True, exist_ok=True)
     for f in (Z.STAGE0_FILE, Z.STAGE0_META):
@@ -336,7 +343,7 @@ def base_finished(cfg: Cfg) -> dict | None:
     if not (p.exists() and Z.stage0_exists(d / BASE)):
         return None
     h = json.loads(p.read_text(encoding="utf-8"))
-    if not h.get("base_finished") or h.get("base_fingerprint") != base_fingerprint(cfg):
+    if not h.get("base_finished") or diff_inputs(d, h, cfg, False):
         return None
     return h
 
@@ -350,19 +357,18 @@ def finished(cfg: Cfg) -> dict | None:
     h = json.loads(p.read_text(encoding="utf-8"))
     if not h.get("finished"):
         return None
-    if h.get("config_fingerprint") != config_fingerprint(cfg):
-        if h.get("base_fingerprint") == base_fingerprint(cfg):
+    bad = diff_inputs(d, h, cfg, True)
+    if bad:
+        if not diff_inputs(d, h, cfg, False):
             print(f"  ⚙ Stage 0 ở {d}: base/ còn khớp, chỉ `final_anneal` đổi — chạy "
                   f"lại epoch n+1", flush=True)
         else:
             print(f"  ⚠ Stage 0 ở {d} chạy với cấu hình KHÁC — cần chạy lại: "
-                  f"`--restage0`.\n"
-                  f"    Vân tay Stage 0 gồm: khối `stage0` (trừ micro_batch / "
+                  f"`--restage0`. Chỗ lệch: {'; '.join(bad)}.\n"
+                  f"    Stage 0 phụ thuộc: khối `stage0` (trừ micro_batch / "
                   f"probe_sizes), phần BACKBONE của khối `vextractor` "
-                  f"({', '.join(Z.BACKBONE_CFG_KEYS)}) và `seed`.\n"
-                  f"    KHÔNG gồm d_branch / n_query / head_dim / aligner / "
-                  f"main — đổi chúng là đổi Extractor+Aligner, và Stage 0 "
-                  f"không dựng những thứ ấy.", flush=True)
+                  f"({', '.join(Z.BACKBONE_CFG_KEYS)}) và `seed`. KHÔNG gồm "
+                  f"d_branch / n_query / head_dim / aligner / main.", flush=True)
         return None
     return h
 
@@ -388,6 +394,94 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     """
     rv = dict((dict(cfg.get("vextractor") or {})).get("vextractor") or {})
     return {k: rv.get(k) for k in Z.BACKBONE_CFG_KEYS}
+
+
+def _s0_comparable(s: dict, with_anneal: bool) -> dict:
+    """Khối stage0 ĐÃ GIẢI QUYẾT, bỏ khoá chỉ nói chuyện phần cứng."""
+    drop = {"micro_batch", "probe_sizes"}
+    if not with_anneal:
+        drop.add("final_anneal")
+    return {k: v for k, v in dict(s or {}).items() if k not in drop}
+
+
+def cfg_inputs(cfg: Cfg, with_anneal: bool = True) -> dict:
+    """ĐÚNG những thứ quyết định trọng số Stage 0, lấy từ config hiện tại."""
+    return {"stage0": _s0_comparable(s0cfg(cfg), with_anneal),
+            "backbone": _backbone_cfg(cfg),
+            "seed": int(cfg.get("seed", 42))}
+
+
+def _recorded_seed(d: Path, h: dict):
+    """Seed của lượt đã chạy. History mới ghi thẳng; bản cũ thì `loader.json`
+    có ở `train_order.seed`. Không tìm được -> None (KHÔNG đoán 42)."""
+    if h.get("seed") is not None:
+        return int(h["seed"])
+    p = Path(d) / LOADER
+    if p.exists():
+        try:
+            lo = json.loads(p.read_text(encoding="utf-8"))
+            s = (lo.get("train_order") or {}).get("seed")
+            if s is not None:
+                return int(s)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def history_inputs(d: Path, h: dict, with_anneal: bool = True):
+    """Cùng bộ đầu vào ấy, nhưng dựng lại TỪ history của lượt đã chạy.
+
+    History ghi cả khối `stage0` đã giải quyết lẫn `spec`, nên so được từng
+    khoá thay vì so hai chuỗi băm. Thiếu thứ gì -> None, và người gọi rơi về
+    so vân tay như cũ chứ không đoán.
+    """
+    sp = dict((h.get("spec") or {}).get("vextractor") or {})
+    s = h.get("stage0")
+    seed = _recorded_seed(d, h)
+    if not sp or not s or seed is None:
+        return None
+    return {"stage0": _s0_comparable(s, with_anneal),
+            "backbone": {k: sp.get(k) for k in Z.BACKBONE_CFG_KEYS},
+            "seed": int(seed)}
+
+
+def diff_inputs(d: Path, h: dict, cfg: Cfg, with_anneal: bool = True):
+    """[] nếu lượt đã chạy khớp cấu hình hiện tại; danh sách chỗ lệch nếu không.
+
+    **So NỘI DUNG, không so hash.** Hai chuỗi băm chỉ bằng nhau khi hàm băm
+    KHÔNG đổi — nhưng phạm vi vân tay đã từng sai (nó băm cả `d_branch` /
+    `n_query` / `aligner`, những thứ Stage 0 không dựng) và phải sửa. Sửa hàm
+    băm không hồi tố được cái hash đã ghi trong `stage0_history.json`, nên nếu
+    cổng này so hash thì MỌI checkpoint cũ bị tuyên "cấu hình khác" và người
+    chạy mất vài giờ GPU cho một backbone y hệt. So nội dung thì không có vấn
+    đề di trú nào cả: file cũ ghi đủ thứ để dựng lại đúng bộ đầu vào.
+
+    `None` (không dựng lại được từ history) -> rơi về so vân tay như cũ.
+    """
+    rec = history_inputs(d, h, with_anneal)
+    if rec is None:
+        # Không dựng lại được nội dung -> so vân tay như cũ.
+        if with_anneal:
+            want, got = config_fingerprint(cfg), h.get("config_fingerprint")
+        else:
+            want = base_fingerprint(cfg)
+            # History kiểu CŨ (trước khi tách base/final) không có
+            # `base_fingerprint`: nó cất hash phạm vi-base dưới tên
+            # `config_fingerprint`, vì hồi đó chưa có `final_anneal` để tách.
+            got = h.get("base_fingerprint")
+            if got is None:
+                got = h.get("config_fingerprint")
+        return [] if got == want else ["vân tay (history thiếu spec/stage0/seed)"]
+    cur = cfg_inputs(cfg, with_anneal)
+    out = []
+    for part in ("backbone", "seed"):
+        if rec[part] != cur[part]:
+            out.append(f"{part}: đã chạy {rec[part]!r} ≠ hiện tại {cur[part]!r}")
+    ks = set(rec["stage0"]) | set(cur["stage0"])
+    bad = sorted(k for k in ks if rec["stage0"].get(k) != cur["stage0"].get(k))
+    if bad:
+        out.append("stage0." + ", stage0.".join(bad))
+    return out
 
 
 def config_fingerprint(cfg: Cfg) -> str:
@@ -949,7 +1043,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
              "history": history, "stage0": {k: v for k, v in sc.items()},
              "micro_batch": micro, "autobatch": ab_rep,
              "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
-             "spec": spec, "base_fingerprint": base_fingerprint(cfg),
+             "spec": spec, "seed": int(cfg.get("seed", 42)),
+             "base_fingerprint": base_fingerprint(cfg),
              "config_fingerprint": config_fingerprint(cfg),
              "minutes": round((time.time() - t0) / 60, 1),
              "n_bad_images": ds_tr.n_bad + ds_va.n_bad}
@@ -1044,7 +1139,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
            "history": history, "stage0": {k: v for k, v in sc.items()},
            "micro_batch": micro, "autobatch": ab_rep,
            "steps_per_epoch": steps_per_epoch, "n_train": n, "n_val": len(ds_va),
-           "spec": spec, "config_fingerprint": config_fingerprint(cfg),
+           "spec": spec, "seed": int(cfg.get("seed", 42)),
+           "config_fingerprint": config_fingerprint(cfg),
            "base_finished": True, "base_epoch": base["epoch"], "base_score": base["score"],
            "base_fingerprint": base_fingerprint(cfg), "final_anneal": fa,
            "minutes": round((time.time() - t0) / 60, 1),
