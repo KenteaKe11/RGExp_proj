@@ -201,7 +201,26 @@ def collate_vext(batch: list[dict], pad_id: int, pad_to: int | None = None) -> d
     return out
 
 
-def branch_stale(out_dir: Path, stage0_dir: Path | None = None) -> str | None:
+def _spec_diff(want: dict, have: dict, pre: str = "") -> list[str]:
+    """Danh sách khoá LÁ lệch nhau, dạng `vextractor.n_query: 16 -> 32`.
+
+    So tới lá chứ không dừng ở khối: "lệch ở ['vextractor']" không nói được
+    người đọc phải sửa gì, mà đây đúng là lúc họ cần biết.
+    """
+    out = []
+    for k in sorted(set(want) | set(have)):
+        a, b = want.get(k), have.get(k)
+        if a == b:
+            continue
+        if isinstance(a, dict) and isinstance(b, dict):
+            out += _spec_diff(a, b, f"{pre}{k}.")
+        else:
+            out.append(f"{pre}{k}: {b!r} -> {a!r}")
+    return out
+
+
+def branch_stale(out_dir: Path, stage0_dir: Path | None = None,
+                 cfg: Cfg | None = None) -> str | None:
     """Weight của B đã có nhưng KHÔNG còn dùng được? -> câu giải thích, hoặc None.
 
     "Đã có weight" KHÔNG đồng nghĩa "đã huấn luyện cho lần chạy NÀY". Đổi kiến
@@ -212,10 +231,22 @@ def branch_stale(out_dir: Path, stage0_dir: Path | None = None) -> str | None:
     file — hai kiến trúc bị chấm chung thành một candidate. Lỗi ấy chỉ lộ ra khi
     `load_branch` ném format, tức là SAU khi đã tốn cả lượt Stage 0.
 
-    Hai thứ được đối chiếu:
+    BA phép so, và mỗi phép hỏi một câu KHÁC nhau — đây là chỗ đã sai một lần
+    vì gộp chúng làm một:
+
       * `format` của meta nhánh so với `vextractor.FORMAT` của code đang chạy;
-      * `spec_fingerprint` của nhánh so với spec mà Stage 0 hiện tại sẽ dựng —
-        bắt được cả trường hợp format không đổi nhưng image_size/n_heads/... đổi.
+      * spec của nhánh so với spec mà CONFIG HIỆN TẠI dựng. Đây mới là câu
+        "nhánh này có phải kiến trúc đang chạy không". So với spec chép trong
+        meta Stage 0 là SAI: meta ấy là ảnh chụp lúc Stage 0 chạy, có thể là
+        nhiều bố cục trước, và nó mang cả `n_query` / `d_branch` / `aligner` —
+        những thứ Stage 0 không hề dựng. Phép so ấy chỉ đúng khi nhánh được
+        dựng TỪ meta Stage 0; từ khi nhánh dựng từ config, nó không bao giờ
+        khớp nữa, kể cả với một nhánh vừa huấn luyện xong;
+      * `backbone_spec` của nhánh so với `backbone_spec` của Stage 0 hiện tại —
+        ĐÚNG phạm vi Stage 0 dựng, cùng luật với `load_stage0_into`.
+
+    `d_model` lấy từ chính meta nhánh (nó là chiều của decoder, không khai
+    trong config): lệch `d_model` đã bị bắt ở `build_aligner` lúc huấn luyện.
     """
     d = Path(out_dir)
     if not RCV.branch_exists(d):
@@ -227,23 +258,33 @@ def branch_stale(out_dir: Path, stage0_dir: Path | None = None) -> str | None:
     if meta.get("format") != RCV.FORMAT:
         return (f"nhánh ghi ở format {meta.get('format')!r}, code hiện tại dựng "
                 f"{RCV.FORMAT!r} — kiến trúc đã đổi")
-    if stage0_dir is not None and RCV.stage0_exists(Path(stage0_dir)):
+    have_spec = dict(meta.get("spec") or {})
+    if cfg is not None and have_spec:
+        try:
+            want_spec = RCV.spec_from_cfg(cfg, int(have_spec.get("d_model", 0)))
+        except Exception as e:  # noqa: BLE001 — config hỏng: nói ra, đừng vỡ
+            return f"config hiện tại không dựng được spec ({e})"
+        if want_spec != have_spec:
+            return (f"nhánh dựng theo một kiến trúc khác config hiện tại — lệch "
+                    f"ở {_spec_diff(want_spec, have_spec)} (đang có -> cần)")
+    if (stage0_dir is not None and have_spec
+            and RCV.stage0_exists(Path(stage0_dir))):
         s0 = json.loads((Path(stage0_dir) / RCV.STAGE0_META).read_text(encoding="utf-8"))
-        want = RCV.spec_fingerprint(dict(s0["spec"]))
-        have = str(meta.get("spec_fingerprint") or "")
-        if want != have:
-            return (f"nhánh dựng theo spec {have[:12] or '?'}, Stage 0 hiện tại là "
-                    f"{want[:12]}")
+        want = s0.get("backbone_spec") or RCV.backbone_spec(dict(s0["spec"]))
+        if want != RCV.backbone_spec(have_spec):
+            return (f"nhánh dựng trên backbone {RCV.backbone_spec(have_spec)}, "
+                    f"Stage 0 hiện tại là {want}")
     return None
 
 
-def already_trained(out_dir: Path, stage0_dir: Path | None = None) -> bool:
-    """Có weight B dùng được NGAY cho lần chạy này? (`stage0_dir` -> kiểm cả spec)."""
+def already_trained(out_dir: Path, stage0_dir: Path | None = None,
+                    cfg: Cfg | None = None) -> bool:
+    """Có weight B dùng được NGAY cho lần chạy này? (`cfg` -> kiểm cả kiến trúc)."""
     d = Path(out_dir)
     if not ((d / "adapter_model.safetensors").exists()
             and (d / "train_stats.json").exists() and RCV.branch_exists(d)):
         return False
-    return branch_stale(d, stage0_dir) is None
+    return branch_stale(d, stage0_dir, cfg) is None
 
 
 def _ntok(labels, attention_mask) -> int:

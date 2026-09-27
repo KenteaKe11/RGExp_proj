@@ -85,21 +85,29 @@ SMALL_SWIN = "swinv2_tiny_window8_256"
 SMALL_DB = 16
 
 
+def small_cfg(image_size=SMALL_IMG, n_query=SMALL_Q, d_branch=None, n_layers=SMALL_NL):
+    """Khối `vextractor` của một config tí hon — NGUỒN của `small_spec`.
+
+    Trả về CONFIG chứ không phải spec, vì `branch_stale` hỏi "nhánh này có phải
+    kiến trúc mà CONFIG HIỆN TẠI dựng không", nên bài kiểm ấy cần config.
+    """
+    return {"vextractor": {"vextractor": {"image_size": image_size,
+                                          "arch": SMALL_ARCH, "pretrained": False,
+                                          "n_layers": n_layers, "n_query": n_query,
+                                          "d_branch": int(d_branch or SMALL_DB),
+                                          "head_dim": 4,
+                                          # KHÁC aligner.mlp_hidden (64) một
+                                          # cách CỐ Ý: hai khối SwiGLU ở hai chỗ
+                                          # khác nhau, và một bản đọc nhầm khoá
+                                          # chỉ lộ ra khi hai số khác nhau.
+                                          "mlp_hidden": 24},
+                           "aligner": {"mlp_hidden": 64}}}
+
+
 def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_branch=None):
     from src import vextractor as R
 
-    cfg = {"vextractor": {"vextractor": {"image_size": image_size,
-                                         "arch": SMALL_ARCH, "pretrained": False,
-                                         "n_layers": SMALL_NL, "n_query": n_query,
-                                         "d_branch": int(d_branch or SMALL_DB),
-                                         "head_dim": 4,
-                                         # KHÁC aligner.mlp_hidden (64) một
-                                         # cách CỐ Ý: hai khối SwiGLU ở hai chỗ
-                                         # khác nhau, và một bản đọc nhầm khoá
-                                         # chỉ lộ ra khi hai số khác nhau.
-                                         "mlp_hidden": 24},
-                          "aligner": {"mlp_hidden": 64}}}
-    return R.spec_from_cfg(cfg, d_model)
+    return R.spec_from_cfg(small_cfg(image_size, n_query, d_branch), d_model)
 
 
 print("═══ selftest §2.2 V-Extractor ═══")
@@ -855,7 +863,7 @@ def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
     from src.fixture import WEIGHT_FILES
-    from src.push import local_plan
+    from src.push import decide, local_plan
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     aid = cfg["vextractor_exp"]["candidate"]["id"]
@@ -883,6 +891,28 @@ def _():
             assert f"{base}/weights/{aid}/{f}" in plan, f
         assert "vextractor_branch.safetensors" in WEIGHT_FILES
 
+        # ── weight và KẾT QUẢ sinh ra từ nó phải đi CÙNG một commit ────────
+        # Repo có weight cũ + kết quả mới là trạng thái không ai đọc ra được:
+        # bảng kết quả mất gốc đúng theo cái cách mà cổng "giữ bản repo" sinh
+        # ra để chặn. Đã xảy ra thật sau một lần đổi kiến trúc.
+        run = Path(t) / "run"
+        (run / "predictions").mkdir(parents=True, exist_ok=True)
+        (run / "predictions" / f"{aid}.jsonl").write_text("{}\n", encoding="utf-8")
+        full = local_plan(cfg, run, [aid])
+        wpath = f"{base}/weights/{aid}/adapter_model.safetensors"
+        remote = {wpath: {"sha256": "0" * 64}}          # repo có bản KHÁC
+        todo, plog = decide(full, remote)
+        assert wpath in {q for q, _f, _k in todo}, plog
+        assert any("KẾT QUẢ mới của arm" in x for x in plog), plog
+        # còn khi commit KHÔNG mang kết quả của arm ấy thì vẫn giữ bản repo
+        no_res = [x for x in full if x[2] != "result"]
+        todo2, plog2 = decide(no_res, remote)
+        assert wpath not in {q for q, _f, _k in todo2}
+        assert any("GIỮ bản repo" in x for x in plog2), plog2
+        # và `--force-weights` vẫn ghi đè được trong cả hai trường hợp
+        todo3, _ = decide(no_res, remote, force_weights=True)
+        assert wpath in {q for q, _f, _k in todo3}
+
         # ── weight B CŨ của một kiến trúc khác phải bị phát hiện ───────────
         # Không bắt ở đây thì `train` bỏ qua main stage, nhảy sang sinh với
         # nhánh cũ và NỐI TIẾP dự đoán của mạng cũ vào cùng một file.
@@ -891,8 +921,14 @@ def _():
         from src.train_vextractor import already_trained, branch_stale
 
         s0ck = d / s0.CKPT
+        scfg = small_cfg()
+        # HỒI QUY: một nhánh vừa dựng TỪ CHÍNH config ấy KHÔNG được coi là cũ.
+        # Cổng này đã từng so spec nhánh với spec chép trong meta Stage 0 — một
+        # ảnh chụp mang cả `n_query`/`d_branch`/`aligner`, thứ Stage 0 không
+        # dựng — nên từ khi nhánh dựng từ config, KHÔNG nhánh nào khớp được nữa.
+        assert branch_stale(bdir, s0ck, scfg) is None
         assert branch_stale(bdir, s0ck) is None
-        assert already_trained(bdir, s0ck) is True
+        assert already_trained(bdir, s0ck, scfg) is True
         # (a) format cũ -> stale
         mp = bdir / R.BRANCH_META
         meta = _json.loads(mp.read_text(encoding="utf-8"))
@@ -901,13 +937,22 @@ def _():
         assert already_trained(bdir, s0ck) is False
         assert already_trained(bdir) is False          # không cần Stage 0 để thấy
         mp.write_text(_json.dumps(meta), encoding="utf-8")
-        assert already_trained(bdir, s0ck) is True
-        # (b) format khớp nhưng Stage 0 dựng spec KHÁC -> vẫn stale
-        # đổi image_size -> n_query đổi theo -> spec khác
-        sp2 = small_spec(image_size=SMALL_IMG * 2)
-        assert R.spec_fingerprint(sp2) != R.spec_fingerprint(sp)
+        assert already_trained(bdir, s0ck, scfg) is True
+        # (b) format khớp nhưng CONFIG đã đổi kiến trúc -> stale, và nói RÕ
+        # khoá nào lệch (đổi `n_query` KHÔNG đụng backbone)
+        why_b = branch_stale(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) or ""
+        # và nó phải nói ĐÚNG khoá lá, không dừng ở tên khối
+        assert "config hiện tại" in why_b, why_b
+        assert f"vextractor.n_query: {SMALL_Q} -> {SMALL_Q + 1}" in why_b, why_b
+        assert already_trained(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) is False
+        # ...nhưng Stage 0 thì KHÔNG bị đụng: đổi Extractor không phải pretrain lại
+        assert branch_stale(bdir, s0ck) is None
+        # (c) BACKBONE của Stage 0 khác -> stale, và đây mới là việc của Stage 0
+        sp2 = R.spec_from_cfg(small_cfg(n_layers=SMALL_NL - 1), 32)
+        assert R.backbone_spec(sp2) != R.backbone_spec(sp)
         R.save_stage0(R.build_backbone(sp2)[0], sp2, s0ck, {})
-        assert "spec" in (branch_stale(bdir, s0ck) or "")
+        why_c = branch_stale(bdir, s0ck) or ""
+        assert "backbone" in why_c, why_c
         assert already_trained(bdir, s0ck) is False
     _ = torch
 

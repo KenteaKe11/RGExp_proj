@@ -17,9 +17,16 @@ rỗng, nên kèm `Reports/.keep` khi commit chưa có file kết quả nào).
 MỘT commit cho mọi thứ, và chỉ những file THẬT SỰ mới/đổi:
 
   * Weight — kiểm trùng trước: repo đã có `weights/<arm>/adapter_model.safetensors`
-    thì so sha256 (LFS). Trùng -> bỏ qua. Khác -> KHÔNG ghi đè, cảnh báo;
-    ghi đè chỉ khi `--force-weights` (weight trên repo là thứ bảng kết quả đã
-    dựa vào, lặng lẽ thay nó là làm bảng cũ mất gốc).
+    thì so sha256 (LFS). Trùng -> bỏ qua. Khác -> tuỳ commit này có mang KẾT
+    QUẢ của chính arm ấy hay không:
+
+      - CÓ: weight đi CÙNG kết quả. Đây là bất biến của repo — bảng kết quả
+        phải luôn là của weight nằm cạnh nó. Giữ bản repo ở đây là để lại
+        repo với weight của kiến trúc CŨ và kết quả của kiến trúc MỚI, một
+        trạng thái không ai đọc ra được và không có gì báo;
+      - KHÔNG: KHÔNG ghi đè, cảnh báo; ghi đè chỉ khi `--force-weights`
+        (weight trên repo là thứ bảng kết quả đã dựa vào, lặng lẽ thay nó là
+        làm bảng cũ mất gốc).
   * Kết quả + fixture — file nào nội dung giống hệt bản trên repo (sha256 LFS
     hoặc git blob sha1) thì bỏ qua; khác thì cập nhật (REPORT luôn là bản mới
     nhất của lệnh `stats`).
@@ -208,8 +215,11 @@ def decide(plan: list[tuple[str, Path, str]], remote: dict[str, dict],
 
     Trả (cần đẩy [(path_in_repo, file, loại)], dòng log).
     Weight của một candidate đi TRỌN BỘ: arm nào đã có safetensors trên repo
-    (dù trùng hay khác) thì không đẩy file nào của arm đó — trừ khi
-    `force_weights` và nội dung khác.
+    (dù trùng hay khác) thì không đẩy file nào của arm đó — trừ khi nội dung
+    khác VÀ (`force_weights`, hoặc commit này mang kết quả mới của chính arm
+    ấy). Vế sau là bất biến "kết quả và weight sinh ra nó đi cùng nhau": bỏ nó
+    thì repo giữ weight cũ bên cạnh kết quả mới, và bảng kết quả mất gốc đúng
+    theo cái cách mà cổng này sinh ra để chặn.
     """
     todo, log = [], []
     by_arm: dict[str, list] = {}
@@ -222,7 +232,10 @@ def decide(plan: list[tuple[str, Path, str]], remote: dict[str, dict],
         if r and _same(f, r):
             continue
         todo.append(item)
+    # Kết quả nào đang được đẩy trong chính commit này (tên file mang `aid`).
+    pushed_results = [Path(x[0]).name for x in todo if x[2] == "result"]
     for aid, items in by_arm.items():
+        with_result = any(aid in name for name in pushed_results)
         st = next((x for x in items if x[0].endswith("adapter_model.safetensors")), None)
         if st is None:
             log.append(f"⊘ {aid}: không có adapter_model.safetensors cục bộ — bỏ qua")
@@ -236,6 +249,10 @@ def decide(plan: list[tuple[str, Path, str]], remote: dict[str, dict],
         elif force_weights:
             todo.extend(items)
             log.append(f"! {aid}: weight KHÁC bản trên repo -> GHI ĐÈ (--force-weights)")
+        elif with_result:
+            todo.extend(items)
+            log.append(f"! {aid}: commit này mang KẾT QUẢ mới của arm -> weight đi "
+                       f"CÙNG (giữ bản repo là để lại weight cũ cạnh kết quả mới)")
         else:
             log.append(f"⚠ {aid}: weight trên repo KHÁC bản cục bộ -> GIỮ bản repo "
                        f"(ghi đè: push --force-weights)")

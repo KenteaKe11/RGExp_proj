@@ -690,7 +690,7 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
     # trong ruột sau khi đã nạp xong model 4B.
     from .train_vextractor import branch_stale
 
-    why = branch_stale(adir, stage0_dir(cfg) / STAGE0_CKPT)
+    why = branch_stale(adir, stage0_dir(cfg) / STAGE0_CKPT, cfg)
     if why:
         raise TrainUnusable(
             f"weight của {bid} ở {adir} KHÔNG dùng được với code hiện tại: {why}.\n"
