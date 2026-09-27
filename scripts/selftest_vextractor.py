@@ -67,21 +67,21 @@ def check(name: str):
 # Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn — xem check 14).
 SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "vit_tiny_patch16_224", 6
 SMALL_NL = 3          # ViT-Tiny có 12 block; giữ 3 block đầu để KIỂM việc cắt
-# Backbone THẬT của config là họ conv (ConvNeXt), đường đi khác hẳn họ ViT
+# Backbone THẬT của config là họ ViT (DINOv3 ViT-B/16). Họ conv đi đường khác
 # (forward_features trả (B, C, H, W), không nhận `img_size`, không cắt block
 # được) — check 2b dựng một ConvNeXt tí hon để kiểm ĐÚNG đường ấy.
 SMALL_CONV = "convnext_atto"
-# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone đang dùng (ConvNeXt-B là
-# NCHW) — nó ở đây canh nhánh NHWC: cùng số chiều đầu ra (4) với
-# ConvNeXt nhưng trục kênh ở CUỐI, và một phép flatten viết cho NCHW chạy trót
-# lọt trên nó mà cho ra rác. Nhánh ấy phải còn đúng kể cả khi không ai dùng.
+# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone đang dùng (ViT-B/16 trả
+# NLC) — nó ở đây canh nhánh NHWC: cùng số chiều đầu ra (4) với ConvNeXt nhưng
+# trục kênh ở CUỐI, và một phép flatten viết cho NCHW chạy trót lọt trên nó mà
+# cho ra rác. Nhánh ấy phải còn đúng kể cả khi không ai dùng.
 SMALL_SWIN = "swinv2_tiny_window8_256"
 
 
-# d_branch (16) KHÁC d_model (32) một cách CỐ Ý, DÙ cấu hình thật đặt chúng
-# bằng nhau (2560): hai số bằng nhau thì mọi lỗi lẫn chiều — Linear nối nhầm
-# đầu, Aligner đọc nhầm khoá — đều lọt qua vì shape tình cờ khớp. Selftest giữ
-# chúng khác nhau để `build_aligner` nối `d_branch` -> `d_model` còn kiểm được.
+# d_branch (16) KHÁC d_model (32), y như cấu hình thật (2048 vs 2560): hai số
+# BẰNG nhau thì mọi lỗi lẫn chiều — Linear nối nhầm đầu, Aligner đọc nhầm khoá
+# — đều lọt qua vì shape tình cờ khớp. Giữ chúng khác nhau để `build_aligner`
+# nối `d_branch` -> `d_model` còn kiểm được.
 SMALL_DB = 16
 
 
@@ -1105,22 +1105,21 @@ def _():
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448
     assert int(rv["image_size"]) % 32 == 0                      # chia hết stride 32
-    assert rv["arch"] == "convnext_base.dinov3_lvd1689m"
-    # DINOv3 ConvNeXt-B CẮT SAU STAGE 3: stride 16 -> 448/16 = 28 -> 784 ô ×
-    # 512, KHÔNG prefix token. `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của
-    # DINOv3, nên Stage 0 chạy TIẾP đúng hàm mục tiêu ấy (không đổi loại mục
-    # tiêu giữa chừng).
-    assert int(rv["n_stages"]) == 3
+    assert rv["arch"] == "vit_base_patch16_dinov3.lvd1689m"
+    # DINOv3 ViT-B/16: stride 16 -> 448/16 = 28 -> 784 ô × 768, CỘNG 5 prefix
+    # token (1 cls + 4 register) bị BỎ ở `patches()`. `lvd1689m` là bộ pretrain
+    # TỰ GIÁM SÁT gốc của DINOv3, nên Stage 0 chạy TIẾP đúng hàm mục tiêu ấy
+    # (không đổi loại mục tiêu giữa chừng).
+    assert rv["n_stages"] is None
     assert (int(rv["image_size"]) // 16) ** 2 == 784
     assert "dinov3" in rv["arch"]
     from src import vextractor as R
 
-    # `n_layers: null` = dùng hết. Với ConvNeXt nó BẮT BUỘC là null (không có
-    # `.blocks` phẳng để cắt — block xếp theo stage khác số kênh); lát cắt của
-    # họ phân cấp là `n_stages`, và nó PHẢI nằm trong `backbone_spec` vì nó
-    # quyết định chính những tensor Stage 0 lưu ra. Khoá vẫn phải CÓ MẶT trong spec (giá trị None) —
-    # nó nằm trong `backbone_spec`, nên bật/tắt việc cắt là checkpoint Stage 0
-    # cũ bị từ chối chứ không lệch khoá im lặng.
+    # `n_layers: null` = dùng hết 12 block của ViT-B. `n_stages` là lát cắt
+    # của họ PHÂN CẤP (ConvNeXt/SwinV2) nên với ViT phải là null. CẢ HAI khoá
+    # vẫn phải CÓ MẶT trong spec (giá trị None) vì chúng nằm trong
+    # `backbone_spec`: bật/tắt việc cắt là checkpoint Stage 0 cũ bị từ chối
+    # ồn ào chứ không lệch khoá im lặng.
     assert rv["n_layers"] is None
     sp14 = R.spec_from_cfg(cfg, 2560)
     assert "n_layers" in sp14["vextractor"]
@@ -1130,16 +1129,18 @@ def _():
     assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
+    assert int(rv["n_query"]) == 16 != (int(rv["image_size"]) // 16) ** 2
     # HAI khoá mlp_hidden, KHÔNG dùng chung: MLP giữa hai attention và FFN
     # của Aligner là hai khối khác nhau.
-    assert int(rv["mlp_hidden"]) == 2048 == int(sp14["aligner"]["mlp_hidden"])
-    # Extractor chạy ở d_branch = d_model = 2560: head_dim 128
-    assert int(rv["d_branch"]) == 2560
+    assert int(rv["mlp_hidden"]) == 3072 != int(sp14["aligner"]["mlp_hidden"]) == 4096
+    # Thân nhánh chạy ở d_branch 2048, KHÁC d_model 2560 — Aligner là chỗ DUY
+    # NHẤT đổi chiều. HAI số GẦN nhau (2048 vs 2560), nên chỉ shape mới bắt
+    # được nếu ai đó lẫn chúng.
+    assert int(rv["d_branch"]) == 2048 != int(sp14["d_model"]) == 2560
     # `head_dim` là khoá KHAI, `n_heads` SUY RA — khai n_heads bị TỪ CHỐI.
     assert int(rv["head_dim"]) == 128 and "n_heads" not in rv
     assert int(rv["d_branch"]) % int(rv["head_dim"]) == 0
-    assert int(rv["d_branch"]) // int(rv["head_dim"]) == 20
+    assert int(rv["d_branch"]) // int(rv["head_dim"]) == 16
     # Khoá LẠ ở cả hai khối bị TỪ CHỐI ồn ào — `n_heads` chỉ là một ca của nó.
     assert set(rv) <= set(R.VEXT_CFG_KEYS)
     assert set(cfg["vextractor"]["aligner"]) <= set(R.ALIGNER_CFG_KEYS)
@@ -1162,7 +1163,7 @@ def _():
                                vextractor=dict(rv, mlp_hidden=1024))
     sp_o = R.spec_from_cfg(other, 2560)
     assert int(sp_o["vextractor"]["mlp_hidden"]) == 1024
-    assert int(sp_o["aligner"]["mlp_hidden"]) == 2048 == int(
+    assert int(sp_o["aligner"]["mlp_hidden"]) == 4096 == int(
         cfg["vextractor"]["aligner"]["mlp_hidden"])
     # và ngược lại: đổi aligner.mlp_hidden KHÔNG đụng vào MLP của Extractor
     other2 = dict(cfg)
@@ -1171,12 +1172,13 @@ def _():
                                              mlp_hidden=512))
     sp_o2 = R.spec_from_cfg(other2, 2560)
     assert int(sp_o2["aligner"]["mlp_hidden"]) == 512
-    assert int(sp_o2["vextractor"]["mlp_hidden"]) == int(rv["mlp_hidden"]) == 2048
-    # Aligner: SwiGLU THUẦN sau residual thứ BA, KHÔNG đổi chiều (2560 -> 2560)
+    assert int(sp_o2["vextractor"]["mlp_hidden"]) == int(rv["mlp_hidden"]) == 3072
+    # Aligner: SwiGLU sau residual thứ BA, và là chỗ DUY NHẤT đổi chiều
+    # (2048 -> 4096 -> 2560)
     al = cfg["vextractor"]["aligner"]
-    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 2048
-    # và 2048 < d_branch 2560: NÚT THẮT có chủ ý, không phải gõ nhầm
-    assert int(al["mlp_hidden"]) < int(rv["d_branch"])
+    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 4096
+    # và 4096 > d_branch 2048: NỞ RA có chủ ý, cùng hướng với FFN của decoder
+    assert int(al["mlp_hidden"]) > int(rv["d_branch"])
     # Cls Head bị BỎ HẲN khỏi config
     assert "cls_head" not in cfg["vextractor"] and "n_labels" not in cfg["vextractor"]
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
@@ -1682,7 +1684,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt-B về pixel / đầu ra DINOv3), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ViT-B/16 về pixel / đầu ra DINOv3), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1880,7 +1882,7 @@ def _():
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
                      "KHÔNG dính decoder", "teacher",
                      f"{cfg['vextractor']['vextractor']['n_query']} High-Q token",
-                     "Q → Aligner → Extractor → teacher (ConvNeXt-B) → I",
+                     "Q → Aligner → Extractor → teacher (ViT-B/16) → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
         assert "`sal_z`" in doc and "`sal_q`" in doc
@@ -2026,8 +2028,10 @@ def _():
     def wrong(v):
         return [x for x in (v // 2, v * 2, 64, 768, 1024) if x != v]
 
+    # KHÔNG soi "<k> vector Q": đặc tả có câu hợp lệ "8 vector Q được đọc nhiều
+    # nhất" (top-k của Lens), và một phép so CHUỖI không phân biệt được nó với
+    # `n_query` cũ. "<k> learner" và "<k> High-Q token" đã phủ đúng chỗ ấy rồi.
     stale = [f"{k} learner" for k in wrong(vx.n_query)]
-    stale += [f"{k} vector Q" for k in wrong(vx.n_query)]
     stale += [f"{k} High-Q token" for k in wrong(vx.n_query)]
     stale += [f"`d_branch` = {k}" for k in wrong(vx.d_branch)]
     stale += [f"SwiGLU {vx.d_branch}→{k}→{vx.d_branch}"

@@ -1,17 +1,17 @@
 """Stage 0 của §2.2 — TỰ GIÁM SÁT (DINO), KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = DINOv3 ConvNeXt-B (3 stage) + head ─┐
+            ─► student = DINOv3 ViT-B/16 + head             ─┐
             ─► teacher = EMA của student (no_grad)         ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là backbone.** Không có Cls Head, không ASL,
 không `labels.npz`, không F1/Recall/sqrt(F1·R). Phần ngoài backbone của nhánh
-(Linear vào, 32 learner, Self/Cross-attn, MLP) và Aligner đều KHÔNG có mặt ở
+(Linear vào, 16 learner, Self/Cross-attn, MLP) và Aligner đều KHÔNG có mặt ở
 đây — chúng là của main stage. Xem `src/dino.py` cho hàm mục tiêu và
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt pretrain chỉ là
-ConvNeXt-B đã cắt sau stage 3 (60,1 M — stage 4 nặng 27,4 M không được dựng) +
+ViT-B/16 (85,6 M) +
 một DINO head. Thứ duy nhất còn cần từ model là `d_model`
 (2560) để ghi vào spec, và nó được đọc từ `AutoConfig` (một file json, không
 tải trọng số).
@@ -104,7 +104,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ConvNeXt-B + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
+           # NÀO CẢ (chỉ ViT-B/16 + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
            # từ vùng quá nhỏ. Ngược lại multi-crop nhân số lượt forward lên
            # (2 + n_local) lần, nên đừng bất ngờ nếu micro ra nhỏ hơn §2.1.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],

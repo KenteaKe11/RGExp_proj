@@ -23,7 +23,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.2 V-Extractor (DINOv3 ConvNeXt-S) — setup ═══"
+echo "═══ §2.2 V-Extractor (DINOv3 ViT-B/16) — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 

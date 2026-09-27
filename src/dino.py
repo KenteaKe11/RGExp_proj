@@ -1,7 +1,6 @@
 """DINO self-distillation cho Stage 0 của §2.2 — KHÔNG nhãn, KHÔNG ASL.
 
-Stage 0 chỉ huấn luyện MỘT thứ: backbone DINOv3 ConvNeXt-B đã cắt
-sau stage 3, chạy tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng
+Stage 0 chỉ huấn luyện MỘT thứ: backbone DINOv3 ViT-B/16, chạy tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng
 chính hàm mục tiêu nó được sinh ra với. Không có
 `labels.npz`, không Cls Head, không F1/Recall — epoch được chọn theo loss tự
 giám sát trên một tập val CỐ ĐỊNH.

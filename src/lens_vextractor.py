@@ -28,8 +28,8 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
    xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
    LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
-   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 32 learner), rồi phần văn bản.
-   So khối Q với khối Z là câu "decoder có thật sự đọc 32 vector mới không".
+   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 16 learner), rồi phần văn bản.
+   So khối Q với khối Z là câu "decoder có thật sự đọc 16 vector mới không".
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
    nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
@@ -37,9 +37,9 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    token vô nghĩa.
 3. [Visual] BA ô trên cùng một ảnh:
    (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
-   ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính 32 High-Q token**:
+   ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính 16 High-Q token**:
    `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> Aligner -> Extractor -> teacher
-   (ConvNeXt-B) -> I` về TẬN PIXEL của ảnh 448².
+   (ViT-B/16) -> I` về TẬN PIXEL của ảnh 448².
 
    **Ô 3 lấy TARGET là khối Q, không phải `y`.** Đó là khác biệt với mọi bản
    trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi tự nhiên là *32
@@ -48,7 +48,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    được — kể cả khi decoder chưa đọc Q chút nào.
 
    Đường truy ngược chạy qua backbone ở đúng chế độ main stage: **teacher
-   (ConvNeXt-B) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
+   (ViT-B/16) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
    gradient (trọng số vẫn `requires_grad=False`, `eval()` nên không dropout /
    stochastic depth), rồi trả cờ cũ về nguyên trạng.
 
@@ -216,8 +216,8 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     lá của cùng một X" nữa vì hai nhánh vốn đã không chung node nào:
 
       * `sal_z` = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64 (dính decoder);
-      * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính 32 High-Q token, truy ngược
-        qua Aligner -> Extractor -> teacher (ConvNeXt-B) về TẬN PIXEL của ảnh 448²,
+      * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính 16 High-Q token, truy ngược
+        qua Aligner -> Extractor -> teacher (ViT-B/16) về TẬN PIXEL của ảnh 448²,
         chuẩn trên 3 kênh. KHÔNG dính decoder. Xem `_q_saliency_map`.
 
     `sal_q_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
@@ -348,11 +348,11 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
 
 def _q_saliency_map(branch, px, dev):
-    """Bản đồ của 32 High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
+    """Bản đồ của 16 High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
 
-    TARGET là khối Q — đầu ra của cả nhánh (teacher ConvNeXt-B -> Extractor ->
+    TARGET là khối Q — đầu ra của cả nhánh (teacher ViT-B/16 -> Extractor ->
     Aligner) — chứ KHÔNG phải `y` của decoder. Vô hướng được đạo hàm là
-    `s = Σ Q²`, nên bản đồ trả lời *32 vector §2.2 thêm vào được dựng từ vùng
+    `s = Σ Q²`, nên bản đồ trả lời *16 vector §2.2 thêm vào được dựng từ vùng
     nào của ảnh*, không phải *decoder đòi ảnh ở đâu*. Không dính decoder, không
     dính LoRA, dựng được kể cả khi decoder chưa đọc Q chút nào.
 
@@ -589,7 +589,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
        đo xem decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Dừng ở
        ĐẦU RA encoder, lưới 64².
     3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
-       token, truy ngược `Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` về
+       token, truy ngược `Q → Aligner → Extractor → teacher (ViT-B/16) → I` về
        tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
     4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (28×28 ở cấu hình hiện
        tại) — backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó.
@@ -628,7 +628,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     panels = [("Z · GRADIENT\ny → Z → adapter → vision encoder (X)\n"
                "lưới 64², DỪNG ở đầu ra encoder", res.get("sal_z")),
               ("khối Q · GRADIENT\n‖∂‖Q‖²/∂I‖ · Q → Aligner → Extractor\n"
-               "→ teacher ConvNeXt-B → ảnh 448²", res.get("sal_q")),
+               "→ teacher ViT-B/16 → ảnh 448²", res.get("sal_q")),
               ("đầu ra DINOv3 · ĐỘ LỚN\n‖feature‖₂ lưới teacher — KHÔNG phải gradient\n"
                "backbone mã hoá gì, trước khi bị hỏi",
                res.get("teacher_feature_norm"))]
@@ -954,7 +954,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "ở mục Kiểm nhanh.\n",
           "1. **Ô Q có cấu trúc không.** Vài hàng sáng rõ trên nền tối = một nhúm "
           "learner làm việc, phần còn lại ngồi không (đối chiếu dòng \"số vector Q gánh "
-          "50%\" ở Kiểm nhanh). Sáng đều = 32 vector chia nhau tải. **Phẳng lì và tối "
+          "50%\" ở Kiểm nhanh). Sáng đều = 16 vector chia nhau tải. **Phẳng lì và tối "
           "ĐỀU ngay trong thang riêng của nó** — tức là ngay cả khi đã tự chuẩn hoá mà "
           "vẫn không có hàng nào nổi lên — mới là dấu hiệu thật của việc nhánh bị bỏ "
           "qua; đó chính là thứ hình gộp cũ không phân biệt được.\n",
@@ -1017,7 +1017,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
           "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
           f"| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính {nq} High-Q token**, truy ngược "
-          "`Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` · lưới 448² | "
+          "`Q → Aligner → Extractor → teacher (ViT-B/16) → I` · lưới 448² | "
           f"{nq} vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
           "| 4 | **ĐỘ LỚN** `‖feature‖₂` của lưới teacher · lưới 28² | "
           "backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó |",
@@ -1039,7 +1039,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "
           "khối Q\" ở mục Kiểm nhanh, hoặc ba hình ở mục 1.\n",
           "**Đường truy ngược chạy ở đúng chế độ main stage: teacher "
-          "(ConvNeXt-B) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
+          "(ViT-B/16) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
           "thị gradient — `requires_grad` của mọi tham số vẫn bị ép về False, "
           "`eval()` giữ nó không dropout / stochastic depth, và cờ cũ được trả "
           "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",

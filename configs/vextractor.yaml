@@ -3,19 +3,19 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 # QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 32 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 16 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone ConvNeXt-B học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone ViT-B/16 học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Aligner(Extractor(ConvNeXt-B-teacher(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
-# 32 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# với Q = Aligner(Extractor(ViT-B/16-teacher(ảnh 448²))) — 16 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
+# 16 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
 # tạo 0. Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
 # và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
 # thông tin là các đặc trưng thị giác nó đọc. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
@@ -23,7 +23,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (DINOv3 ConvNeXt-B ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (DINOv3 ViT-B/16 ăn ảnh 448²) — và chuỗi dài
 # thêm 32.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -310,74 +310,67 @@ labels:
   max_missing_frac: 0.20
 
 # ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: DINOv3 ConvNeXt-B, CẮT SAU STAGE 3, ăn thẳng ảnh gốc
-# resize 448×448 -> (512, 28, 28), Flatten + Permute -> lưới 784 ô × 512
-# (stride 16; KHÔNG có prefix token nào). Lưới ấy KHÔNG phải khối Q: `n_query`
-# learner vector đi HỎI nó qua Cross-attn.
+# Nhánh có ENCODER RIÊNG: DINOv3 ViT-B/16, ăn thẳng ảnh gốc resize 448×448 ->
+# 789 token (5 prefix: 1 cls + 4 register) × 768; bỏ prefix còn lưới 784 ô ×
+# 768 (stride 16). Lưới ấy KHÔNG phải khối Q: `n_query` learner vector đi HỎI
+# nó qua Cross-attn.
 #
 #   KHỐI CAM (backbone) — Stage 0 TỰ GIÁM SÁT dạy (lưu ra TEACHER/EMA);
 #   main stage chạy nó ở chế độ TEACHER INFERENCE, đóng băng hoàn toàn.
 #   KHỐI VÀNG (Extractor + Aligner) — KHÔNG có ở Stage 0, học ở MAIN STAGE:
 #
-#     (512,28,28) ─► Flatten + Permute ─► 784 ô
+#     (789, 768) ─► bỏ 5 prefix ─► Flatten + Permute ─► 784 ô
 #           │
-#     784 ô ─► Linear 512→2560 ─► RMSNorm(2560) ───────────────────┐
-#     32 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
+#     784 ô ─► Linear 768→2048 ─► RMSNorm(2048) ───────────────────┐
+#     16 learner ─┬─► RMSNorm(2048) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
 #                 │                                  │             │
-#                 │                           RMSNorm(2560)        │
+#                 │                           RMSNorm(2048)        │
 #                 │                                  │             │
-#                 │                      SwiGLU 2560→2048→2560     │
+#                 │                      SwiGLU 2048→3072→2048     │
 #                 │                                  │             │
 #                 │                                 (+) ◄─ skip ─┐ │  (quanh MLP)
 #                 │                                  │           │ │
-#                 │                           RMSNorm(2560)      │ │
+#                 │                           RMSNorm(2048)      │ │
 #                 │                                  │           │ │
 #                 │                            Cross-attn ◄──────┼─┘
-#                 └────────── skip ──────────────► (+) ─► Q_raw (32, 2560)
+#                 └────────── skip ──────────────► (+) ─► Q_raw (16, 2048)
 #                                                     │
-#                                             RMSNorm(2560)        [Aligner]
+#                                             RMSNorm(2048)        [Aligner]
 #                                                     │
-#                             SwiGLU 2560→2048→2560 ─► Q (32, 2560)
+#                             SwiGLU 2048→4096→2560 ─► Q (16, 2560)
 #
 # BA residual: hai cái NGOÀI CÙNG đều từ `learner` — đúng hai mũi tên đi thẳng
-# từ khối "32 Learners" trong sơ đồ — còn cái ở GIỮA vòng quanh riêng MLP.
+# từ khối "16 Learners" trong sơ đồ — còn cái ở GIỮA vòng quanh riêng MLP.
 # HAI khối SwiGLU, HAI khoá khai riêng: `vextractor.mlp_hidden` (giữa hai
 # attention) và `aligner.mlp_hidden` (FFN sau residual thứ ba).
 #
-# `d_branch` = `d_model` = 2560: `Linear 512→2560` ngay sau backbone đã đổi
-# chiều, nên KHÔNG có chỗ nào nở ra ở cuối, và Aligner là một FFN thuần. Vẫn
-# là HAI khoá riêng (`d_model` đọc từ AutoConfig của decoder), nên đổi base
-# sang decoder khác chiều sẽ lộ ra chứ không lặng lẽ. Stage 0 không dùng cả
-# hai — nó chỉ chạy backbone + một DINO head.
+# `d_branch` 2048 KHÁC `d_model` 2560: thân nhánh chạy ở 2048 và `Aligner` là
+# chỗ DUY NHẤT đổi chiều lên không gian embedding của decoder. `d_model` đọc
+# từ AutoConfig của decoder, `d_branch` khai ở đây, nên đổi base sang decoder
+# khác chiều sẽ lộ ra chứ không lặng lẽ. Stage 0 không dùng cả hai — nó chỉ
+# chạy backbone + một DINO head.
 #
-# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2560. Mỗi khối attention là 4 × 2560² = 26,2 M tham số,
-# nên riêng Self + Cross đã 52,4 M, và MLP giữa chúng thêm 15,73 M nữa. Nếu hết
-# VRAM ở main stage thì đây là chỗ nhìn trước, không phải `train.max_seq_len`.
+# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2048. Mỗi khối attention là 4 × 2048² = 16,78 M tham số,
+# nên riêng Self + Cross là 33,55 M, MLP giữa chúng 18,87 M, và Aligner 27,27 M.
+# Attention tỉ lệ với d², nên đây là con số đổi nhanh nhất khi `d_branch` đổi.
 #
-# Trọng số nền LÀ DINOv3 thật: `convnext_base.dinov3_lvd1689m` là một trong
+# Trọng số nền LÀ DINOv3 thật: `vit_base_patch16_dinov3.lvd1689m` là một trong
 # các checkpoint Facebook phát hành cho DINOv3 (ViT-S/S+/B/L/H+/7B và
 # ConvNeXt-T/S/B/L — không có Swin, nên "DINOv3-SwinV2" là tên của một thứ
 # không tồn tại). Stage 0 vì thế là ĐÚNG nghĩa "chạy tiếp": cùng họ trọng số,
 # cùng hàm mục tiêu, chỉ đổi miền ảnh từ web sang CXR.
 #
-# ⚠ CẮT SAU STAGE 3 là một ĐÁNH ĐỔI, không phải tối ưu hoá. ConvNeXt-B có 4
-# stage: (128, 256, 512, 1024) kênh ở stride (4, 8, 16, 32).
-#   ĐƯỢC : lưới 784 ô thay vì 196 — mịn gấp 4× cho Cross-attn và cho bản đồ
-#          saliency của Lens; và 27,4 M tham số của stage 4 biến mất HẲN khỏi
-#          state_dict / VRAM / optimizer (87,6 M -> 60,1 M).
-#   MẤT  : tầng ngữ nghĩa CAO NHẤT của backbone.
-# Vì `n_stages` quyết định chính những tensor Stage 0 lưu ra, nó nằm TRONG
-# `backbone_spec`: đổi nó là checkpoint Stage 0 cũ bị từ chối ồn ào.
+# ⚠ 5 PREFIX TOKEN, không phải 1. DINOv3 ViT mang 1 cls + 4 REGISTER token.
+# `patches()` bỏ đúng `num_prefix_tokens` HỎI TỪ MODEL, không gõ tay 1 — bỏ
+# nhầm 1 thì 4 register lọt vào lưới và Cross-attn đọc chúng như ô ảnh.
 #
-# Aligner là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
-# sau residual thứ BA, không attn/residual nào thêm. Nó KHÔNG đổi chiều
-# (việc ấy đã xong ở `Linear 512→2560`), nên vai trò của nó là trộn lại 32
-# vector sau khi chúng đã đọc xong ảnh.
+# Aligner là RMSNorm(2048) + SwiGLU 2048→4096→2560, đứng sau residual thứ BA,
+# không attn/residual nào thêm. Nó vừa trộn lại 16 vector sau khi chúng đã đọc
+# xong ảnh, vừa là chỗ DUY NHẤT đưa nhánh lên chiều embedding của decoder.
 #
-# `mlp_hidden` 2048 NHỎ HƠN `d_branch` 2560 — một nút THẮT có chủ ý. Mọi FFN
-# của decoder nở RA ở giữa (Gemma 3: 2560 → 10240); khối này làm ngược lại, ép
-# 2560 chiều qua 2048 rồi mở lại, nên nó không thể chép nguyên đầu vào sang
-# đầu ra. Muốn nó là FFN "bình thường" thì đặt mlp_hidden > 2560 — cả hai đều
+# `aligner.mlp_hidden` 4096 NỞ RA so với `d_branch` 2048 — cùng hướng với FFN
+# của decoder (Gemma 3: 2560 → 10240), y như khối SwiGLU giữa hai attention
+# (3072 quanh 2048). Muốn một nút THẮT thì đặt nó nhỏ hơn 2048 — cả hai đều
 # chạy, nhưng hỏi hai câu khác nhau.
 #
 # RMSNorm ở đầu Aligner là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN,
@@ -391,49 +384,47 @@ labels:
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
 vextractor:
-  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (32, 2560)
-    image_size: 448         # stride 16 sau khi cắt. 448/16 = 28 -> 784 ô
-    # timm; lần chạy đầu tải ~350 MB (tải CẢ 4 stage rồi mới cắt). DINOv3
-    # ConvNeXt-B: 87,6 M tham số / 36 block (3+3+27+3) trên 4 stage; cắt còn 3
-    # stage -> 60,1 M, d = 512, KHÔNG cls token, đầu ra NCHW (B, 512, 28, 28)
-    # -> `patches()` gộp bằng đúng "Flatten + Permute".
+  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (16, 2048)
+    image_size: 448         # stride 16. 448/16 = 28 -> 784 ô (+ 5 prefix bị bỏ)
+    # timm; lần chạy đầu tải ~340 MB. DINOv3 ViT-B/16: 85,6 M tham số / 12
+    # block, d = 768, 5 prefix token (1 cls + 4 register) bị BỎ ở `patches()`,
+    # đầu ra NLC (B, 789, 768).
     # `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của DINOv3 — Stage 0 ở đây chạy
     # TIẾP chính hàm mục tiêu ấy trên ảnh CXR.
     #
-    # ConvNeXt thuần tích chập nên nhận MỌI độ phân giải mà không cần khoá nào:
-    # không pos-embed để nội suy, không cửa sổ để đệm, không assert về cỡ ảnh.
-    # MỘT state_dict chạy ở 448² (main stage) lẫn 224² (local crop của Stage 0).
-    arch: convnext_base.dinov3_lvd1689m
+    # Họ ViT nhận nhiều độ phân giải nhờ `dynamic_img_size=True` (nội suy
+    # pos-embed): MỘT state_dict chạy ở 448² (main stage) lẫn 224² (local crop
+    # của Stage 0). `backbone_body` dựng VÀ probe forward thật để chắc điều đó.
+    arch: vit_base_patch16_dinov3.lvd1689m
     pretrained: true        # false bị TỪ CHỐI: chưng cất từ backbone ngẫu nhiên là vô nghĩa
-    # Số block ĐẦU được giữ lại; null = DÙNG HẾT. Chỉ có nghĩa với họ ViT
-    # (`.blocks` phẳng); ConvNeXt và SwinV2 xếp block theo stage với số kênh
-    # khác nhau nên khai số ở đây sẽ bị TỪ CHỐI. Với ConvNeXt PHẢI là null —
-    # lát cắt của họ phân cấp là `n_stages` ngay dưới.
+    # Số block ĐẦU được giữ lại; null = DÙNG HẾT (12). Đây là lát cắt của họ
+    # ViT (`.blocks` phẳng) và nó cắt THẬT: block bỏ đi không có trong
+    # state_dict. null = giữ cả 12 block của ViT-B.
     n_layers: null
-    # Số stage ĐẦU được giữ lại; null = DÙNG HẾT (4). 3 = dừng ở stride 16 /
-    # 512 kênh. Khai CẢ n_layers lẫn n_stages bị TỪ CHỐI. Xem ⚠ ở trên về đánh
-    # đổi; khoá này nằm trong `backbone_spec` nên đổi nó = chạy lại Stage 0.
-    n_stages: 3
-    n_query: 32             # số learner = số token Q nối vào chuỗi decoder
-    d_branch: 2560          # = d_model. Linear 512→2560 đã đổi chiều ngay đầu
+    # Lát cắt của họ PHÂN CẤP (ConvNeXt/SwinV2). ViT KHÔNG có `.stages` nên
+    # PHẢI là null; khai số ở đây sẽ bị TỪ CHỐI.
+    n_stages: null
+    n_query: 16             # số learner = số token Q nối vào chuỗi decoder
+    d_branch: 2048          # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
     # MỌI attention của nhánh (Self + Cross) chạy ở head_dim CỐ ĐỊNH này; số
-    # head được SUY RA = d_branch // head_dim (2560 // 128 = 20).
+    # head được SUY RA = d_branch // head_dim (2048 // 128 = 16).
     #
     # Vì sao khai head_dim chứ không khai n_heads: mỗi lần ai đó sửa
     # `d_branch`, head_dim sẽ rơi ra một giá trị khác mà không ai để ý —
-    # 2560/20 = 128 nhưng 2048/20 = 102,4 và 1024/20 không chia hết. Khai cái
+    # 2048/16 = 128 nhưng 2560/16 = 160 và 768/16 = 48. Khai cái
     # BẤT BIẾN, suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì
     # DỪNG. Khai `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
     head_dim: 128
     # Bề rộng MLP GIỮA Self-attn và Cross-attn (SwiGLU, residual vòng quanh
     # RIÊNG nó). KHÁC `aligner.mlp_hidden` bên dưới — đó là FFN SAU residual
     # thứ ba. HAI khối, HAI khoá: đọc nhầm khoá là đổi sai khối.
-    mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560 (giữa hai attention)
+    mlp_hidden: 3072        # SwiGLU 2048 -> 3072 -> 2048 (giữa hai attention)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # FFN THUẦN sau residual thứ BA; KHÔNG đổi chiều
+  aligner:                  # FFN sau residual thứ BA; và là chỗ ĐỔI CHIỀU
     # SwiGLU: down( SiLU(gate(x)) ⊙ up(x) ), bias=False cả ba, init 1/√fan_in.
-    # 2048 < d_branch 2560 = nút THẮT có chủ ý (xem ghi chú ở trên).
-    mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560
+    # 4096 > d_branch 2048: NỞ RA ở giữa như FFN của decoder, rồi `down` đưa
+    # thẳng lên d_model 2560. Đây là chỗ DUY NHẤT chiều của nhánh đổi.
+    mlp_hidden: 4096        # SwiGLU 2048 -> 4096 -> 2560
     dropout: 0.0
   # ── Main stage ─────────────────────────────────────────────────────────
   # ĐÚNG MỘT nhóm tham số học được trong nhánh: Extractor (phần ngoài backbone)
@@ -460,13 +451,13 @@ vextractor:
 
 # ── Stage 0: TỰ GIÁM SÁT (DINO) — `src/stage0_vextractor.py`, `src/dino.py` ──
 # KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
-# huấn luyện là backbone DINOv3 ConvNeXt-B (đã cắt sau stage 3), bằng chính hàm
-# mục tiêu nó được sinh ra với.
+# huấn luyện là backbone DINOv3 ViT-B/16, bằng chính hàm mục tiêu nó được sinh
+# ra với.
 #
-# MỌI siêu tham số dưới đây GIỮ NGUYÊN của bản ViT — τ_s/τ_t, centering, lịch
-# EMA, số prototype, multi-crop, lr, warm-up, weight decay. Đổi họ backbone mà
-# đổi luôn siêu tham số thì không còn nói được hiệu số đến từ đâu. Khoá DUY
-# NHẤT phải đổi là `pool` (ConvNeXt không có cls token).
+# MỌI siêu tham số dưới đây GIỮ NGUYÊN qua các lần đổi họ backbone — τ_s/τ_t,
+# centering, lịch EMA, số prototype, multi-crop, lr, warm-up, weight decay, và
+# CẢ `pool`. Đổi họ backbone mà đổi luôn siêu tham số thì không còn nói được
+# hiệu số đến từ đâu.
 # Thứ được LƯU RA base//final/ là **teacher** (EMA), không phải student: teacher
 # mượt hơn, không mang nhiễu của bước Adam cuối, và chính nó là nhánh sinh mục
 # tiêu trong DINO — main stage vì thế chạy đúng chế độ teacher inference.
@@ -523,8 +514,9 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # 224/16 = 14 -> 196 ô. ConvNeXt nhận thẳng, không
-                            # cần khoá nào; backbone chỉ nhận MỘT cỡ -> n_local 0
+    local_size: 224         # 224/16 = 14 -> 196 ô. ViT nhận cỡ này nhờ
+                            # `dynamic_img_size` (nội suy pos-embed); backbone
+                            # chỉ nhận MỘT cỡ -> đặt n_local 0
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
     # Số prototype. KHÔNG phải 65536 của DINO gốc: tập train ở đây 6400 ảnh, và
@@ -534,10 +526,13 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. ConvNeXt KHÔNG có cls token nào, nên phải là `mean` (trung
-    # bình 784 ô của lưới). `pool: cls` với backbone lưới bị TỪ CHỐI ngay lúc
-    # dựng backbone, không tự rơi về mean: config nói một đằng chạy một nẻo là
-    # thứ không bao giờ tự lộ ra.
+    # cls | mean. ViT-B/16 CÓ cls token, nên `cls` chạy được — và đó là thứ
+    # DINOv3 gốc dùng. Ở đây vẫn để `mean` (trung bình 784 ô của lưới) vì mọi
+    # siêu tham số Stage 0 được giữ nguyên qua các lần đổi backbone; đổi sang
+    # `cls` là một thí nghiệm RIÊNG, và nó nằm trong `backbone_spec` nên sẽ bắt
+    # chạy lại Stage 0. `pool: cls` với backbone KHÔNG có cls (ConvNeXt,
+    # SwinV2) bị TỪ CHỐI ngay lúc dựng, không tự rơi về mean: config nói một
+    # đằng chạy một nẻo là thứ không bao giờ tự lộ ra.
     pool: mean
     # τ_t PHẢI nhỏ hơn τ_s (sharpening) — đảo dấu bị TỪ CHỐI. Cùng với centering
     # đây là hai lực đẩy ngược nhau giữ DINO khỏi sụp.

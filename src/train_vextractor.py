@@ -1,8 +1,8 @@
 """Main stage của candidate B (`qlora_r32_decoder_vextractor`) — §2.2 V-Extractor.
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
-`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 32 vector
-Q = Aligner(Extractor(ConvNeXt-B(ảnh 448²))) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+`train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 16 vector
+Q = Aligner(Extractor(ViT-B/16(ảnh 448²))) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -10,18 +10,18 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
                   inject_tokens(build_inputs_embeds(ids, Z), Q) — thứ tự
                   [Z ‖ Q ‖ T], tức Q nằm SAU token ảnh nên mọi vị trí của Q đều
                   đọc được toàn bộ Z bằng attention nhân quả;
-                  32 vị trí (`n_query`) thêm vào có nhãn −100, attention_mask 1,
+                  16 vị trí (`n_query`) thêm vào có nhãn −100, attention_mask 1,
                   token_type_ids 0, nên SỐ TOKEN VÀO CE không đổi và CE của A
                   với B vẫn là cùng một đại lượng;
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
                  nhánh có AdamW RIÊNG, MỘT nhóm: **Extractor + Aligner**.
-                 Chỉ BACKBONE (ConvNeXt-B — trọng số TEACHER/EMA của Stage 0) chạy
+                 Chỉ BACKBONE (ViT-B/16 — trọng số TEACHER/EMA của Stage 0) chạy
                  ở chế độ TEACHER INFERENCE suốt main stage: requires_grad=False
                  + eval() + chạy trong `no_grad`, KHÔNG có bước mở băng nào. Đó
                  đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
                  dropout, không stochastic depth, không gradient. Phần ngoài backbone
-                 (Linear vào, 32 learner, Self/Cross-attn, MLP) và Aligner đều
+                 (Linear vào, 16 learner, Self/Cross-attn, MLP) và Aligner đều
                  KHỞI TẠO NGẪU NHIÊN ở đây — Stage 0 không dựng chúng — và học ở
                  lr `vextractor.main.align_lr` = 1e-5, wd 0.01: warm-up TUYẾN
                  TÍNH theo BƯỚC từ 1e-8 trong `align_warmup_steps` = 20/200 bước
@@ -51,10 +51,10 @@ KHÔNG còn Cls Head / ASL / nhãn ở bất kỳ đâu; DINO head của Stage 0
 giàn giáo tự giám sát và bị bỏ lại cùng student sau Stage 0.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-B (3 stage)
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ViT-B/16
 ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` (backbone đóng băng) nên nó
-không giữ activation nào — phần nặng còn lại là Cross-attn của 32 learner trên
-784 ô và Aligner (SwiGLU, khối lớn nhất của phần học được) trên đúng 32 token.
+không giữ activation nào — phần nặng còn lại là Cross-attn của 16 learner trên
+784 ô và Aligner (SwiGLU, khối lớn nhất của phần học được) trên đúng 16 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -408,7 +408,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # Meta ấy chụp lại spec lúc Stage 0 chạy — có thể là nhiều bố cục trước.
     # Lấy nguyên nó về nghĩa là Extractor + Aligner được dựng theo bố cục CŨ
     # trong khi config nói bố cục MỚI, và không có gì báo: ở /7 -> /8 nó sẽ
-    # lặng lẽ dựng d_branch 768 / 32 learner / SwiGLU 4096 rồi huấn luyện suốt
+    # lặng lẽ dựng d_branch 768 / 16 learner / SwiGLU 4096 rồi huấn luyện suốt
     # 200 bước, trong khi người chạy tin mình đang đo 2560 / 16 learner. Lần
     # này nó chỉ lộ ra vì khoá `head_dim` chưa tồn tại ở /7 và ném KeyError.
     #
