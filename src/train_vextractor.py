@@ -2,7 +2,7 @@
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
 `train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: 32 vector
-Q = Aligner(Extractor(ConvNeXt-S(ảnh 448²))) được NỐI vào chuỗi ngay SAU 256 token ảnh.
+Q = Aligner(Extractor(ConvNeXt-B(ảnh 448²))) được NỐI vào chuỗi ngay SAU 256 token ảnh.
 Vòng lặp dưới đây vì thế chép lại từng bước của `_train_once` ở nhánh
 không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
@@ -16,7 +16,7 @@ không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
   2. optimizer:  AdamW của LoRA + LambdaLR one-cycle GIỐNG HỆT A (một nhóm,
                  lr đỉnh `train.schedule.max_lr` 1e-4, wd `train.weight_decay`);
                  nhánh có AdamW RIÊNG, MỘT nhóm: **Extractor + Aligner**.
-                 Chỉ BACKBONE (ConvNeXt-S — trọng số TEACHER/EMA của Stage 0) chạy
+                 Chỉ BACKBONE (ConvNeXt-B — trọng số TEACHER/EMA của Stage 0) chạy
                  ở chế độ TEACHER INFERENCE suốt main stage: requires_grad=False
                  + eval() + chạy trong `no_grad`, KHÔNG có bước mở băng nào. Đó
                  đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
@@ -51,10 +51,10 @@ KHÔNG còn Cls Head / ASL / nhãn ở bất kỳ đâu; DINO head của Stage 0
 giàn giáo tự giám sát và bị bỏ lại cùng student sau Stage 0.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-S ở 448²
-cho mỗi ảnh. Lượt ConvNeXt-S ấy chạy trong `no_grad` (backbone đóng băng) nên nó
+mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-B (3 stage)
+ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` (backbone đóng băng) nên nó
 không giữ activation nào — phần nặng còn lại là Cross-attn của 32 learner trên
-196 ô và Aligner trên đúng 32 token.
+784 ô và Aligner (SwiGLU, khối lớn nhất của phần học được) trên đúng 32 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:

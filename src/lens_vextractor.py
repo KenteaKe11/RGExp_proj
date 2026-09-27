@@ -39,7 +39,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
    ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính 32 High-Q token**:
    `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> Aligner -> Extractor -> teacher
-   (ConvNeXt-S) -> I` về TẬN PIXEL của ảnh 448².
+   (ConvNeXt-B) -> I` về TẬN PIXEL của ảnh 448².
 
    **Ô 3 lấy TARGET là khối Q, không phải `y`.** Đó là khác biệt với mọi bản
    trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi tự nhiên là *32
@@ -48,7 +48,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    được — kể cả khi decoder chưa đọc Q chút nào.
 
    Đường truy ngược chạy qua backbone ở đúng chế độ main stage: **teacher
-   (ConvNeXt-S) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
+   (ConvNeXt-B) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
    gradient (trọng số vẫn `requires_grad=False`, `eval()` nên không dropout /
    stochastic depth), rồi trả cờ cũ về nguyên trạng.
 
@@ -217,7 +217,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
       * `sal_z` = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64 (dính decoder);
       * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính 32 High-Q token, truy ngược
-        qua Aligner -> Extractor -> teacher (ConvNeXt-S) về TẬN PIXEL của ảnh 448²,
+        qua Aligner -> Extractor -> teacher (ConvNeXt-B) về TẬN PIXEL của ảnh 448²,
         chuẩn trên 3 kênh. KHÔNG dính decoder. Xem `_q_saliency_map`.
 
     `sal_q_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
@@ -328,7 +328,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 def _q_saliency_map(branch, px, dev):
     """Bản đồ của 32 High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
 
-    TARGET là khối Q — đầu ra của cả nhánh (teacher ConvNeXt-S -> Extractor ->
+    TARGET là khối Q — đầu ra của cả nhánh (teacher ConvNeXt-B -> Extractor ->
     Aligner) — chứ KHÔNG phải `y` của decoder. Vô hướng được đạo hàm là
     `s = Σ Q²`, nên bản đồ trả lời *32 vector §2.2 thêm vào được dựng từ vùng
     nào của ảnh*, không phải *decoder đòi ảnh ở đâu*. Không dính decoder, không
@@ -581,7 +581,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
        đo xem decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Dừng ở
        ĐẦU RA encoder, lưới 64².
     3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính 32 High-Q
-       token, truy ngược `Q → Aligner → Extractor → teacher (ConvNeXt-S) → I` về
+       token, truy ngược `Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` về
        tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
 
     **Ô 2 và ô 3 KHÔNG cùng đại lượng**: ô 2 là *nhu cầu của decoder* trên
@@ -609,7 +609,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     panels = [("Z\ny → Z → adapter → vision encoder (X)\nlưới 64², DỪNG ở đầu ra encoder",
                res.get("sal_z")),
               ("32 High-Q token (Q)\n‖∂‖Q‖²/∂I‖ · Q → Aligner → Extractor\n"
-               "→ teacher ConvNeXt-S → ảnh 448²", res.get("sal_q"))]
+               "→ teacher ConvNeXt-B → ảnh 448²", res.get("sal_q"))]
     panels = [(t, m) for t, m in panels if m is not None]
     fig, axes = plt.subplots(1, 1 + len(panels), dpi=150,
                              figsize=(3.45 * (1 + len(panels)), 4.1))
@@ -991,7 +991,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
           "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
           "| 3 | `‖∂‖Q‖²/∂I‖` — target là **chính 32 High-Q token**, truy ngược "
-          "`Q → Aligner → Extractor → teacher (ConvNeXt-S) → I` · lưới 448² | "
+          "`Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` · lưới 448² | "
           "32 vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
           "",
           "**Ô 3 lấy target là khối Q, KHÔNG phải `y`.** Đó là khác biệt với "
@@ -1002,7 +1002,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "
           "khối Q\" ở mục Kiểm nhanh, hoặc ba hình ở mục 1.\n",
           "**Đường truy ngược chạy ở đúng chế độ main stage: teacher "
-          "(ConvNeXt-S) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
+          "(ConvNeXt-B) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
           "thị gradient — `requires_grad` của mọi tham số vẫn bị ép về False, "
           "`eval()` giữ nó không dropout / stochastic depth, và cờ cũ được trả "
           "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",

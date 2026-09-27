@@ -1,7 +1,7 @@
 """Stage 0 của §2.2 — TỰ GIÁM SÁT (DINO), KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = DINOv3 ConvNeXt-S + DINO head    ─┐
+            ─► student = DINOv3 ConvNeXt-B (3 stage) + head ─┐
             ─► teacher = EMA của student (no_grad)         ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là backbone.** Không có Cls Head, không ASL,
@@ -11,7 +11,8 @@ không `labels.npz`, không F1/Recall/sqrt(F1·R). Phần ngoài backbone của 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt pretrain chỉ là
-ConvNeXt-S (49,5 M) + một DINO head. Thứ duy nhất còn cần từ model là `d_model`
+ConvNeXt-B đã cắt sau stage 3 (60,1 M — stage 4 nặng 27,4 M không được dựng) +
+một DINO head. Thứ duy nhất còn cần từ model là `d_model`
 (2560) để ghi vào spec, và nó được đọc từ `AutoConfig` (một file json, không
 tải trọng số).
 
@@ -103,7 +104,7 @@ def s0cfg(cfg: Cfg) -> dict:
            # Điểm ĐO của autobatch cho RIÊNG Stage 0 — không dùng chung
            # `autobatch.probe_sizes` (điểm đo của main stage). Hai pipeline có
            # hai đường peak(bs) khác hẳn nhau: Stage 0 ở đây không có decoder 4B
-           # NÀO CẢ (chỉ ConvNeXt-S + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
+           # NÀO CẢ (chỉ ConvNeXt-B + DINO head), nên đo nó ở [2, 4, 8] là ngoại suy
            # từ vùng quá nhỏ. Ngược lại multi-crop nhân số lượt forward lên
            # (2 + n_local) lần, nên đừng bất ngờ nếu micro ra nhỏ hơn §2.1.
            "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
@@ -548,7 +549,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     assert_same_pixels(ds_tr, cfg)
 
     # CHỈ backbone — không Extractor, không Aligner, không Cls Head.
-    body, d_feat, n_patch, n_use, kind, fmt, multi_res = Z.build_backbone(spec)
+    (body, d_feat, n_patch, n_use, kind, fmt, multi_res,
+     n_stage_use) = Z.build_backbone(spec)
     n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 1))
     # Hai điều kiện của backbone PHẢI hỏi TRƯỚC khi nạp dữ liệu và dựng
     # optimizer, không phải ở lượt forward đầu tiên của epoch 1.
@@ -575,6 +577,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     n_bb = sum(p.numel() for p in block.student_body.parameters())
     n_hd = sum(p.numel() for p in block.student_head.parameters())
     _nl = "" if n_use is None else f", {n_use} block"
+    if n_stage_use is not None:
+        _nl += f", {n_stage_use} stage"
     print(f"  Stage 0 (TỰ GIÁM SÁT, KHÔNG nhãn): {spec['vextractor']['arch']} "
           f"({kind}/{fmt}{_nl}, {n_prefix} prefix) {n_bb:,} tham số · lưới {n_patch} × "
           f"{d_feat} ở {img_size}² · DINO head {n_hd:,} ({dc['out_dim']} "
@@ -1114,6 +1118,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                    # ĐÚNG mean/std đi kèm trọng số của checkpoint
                    # (`timm.pretrained_cfg`), không phải một hằng số ImageNet.
                    "normalize": dict(spec["vextractor"]["normalize"]),
+                   "n_stages": spec["vextractor"].get("n_stages"),
                    "d_branch": spec["vextractor"]["d_branch"],
                    "mlp_hidden": spec["vextractor"]["mlp_hidden"],
                    "n_query": Z.n_query_of(spec),

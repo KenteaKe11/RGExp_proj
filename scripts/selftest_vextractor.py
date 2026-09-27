@@ -71,7 +71,7 @@ SMALL_NL = 3          # ViT-Tiny có 12 block; giữ 3 block đầu để KIỂM
 # (forward_features trả (B, C, H, W), không nhận `img_size`, không cắt block
 # được) — check 2b dựng một ConvNeXt tí hon để kiểm ĐÚNG đường ấy.
 SMALL_CONV = "convnext_atto"
-# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone của /6 (đó là ConvNeXt-S,
+# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone của /7 (đó là ConvNeXt-B,
 # NCHW) — nó ở đây làm test HỒI QUY cho nhánh NHWC: cùng số chiều đầu ra (4) với
 # ConvNeXt nhưng trục kênh ở CUỐI, và một phép flatten viết cho NCHW chạy trót
 # lọt trên nó mà cho ra rác. Nhánh ấy phải còn đúng kể cả khi không ai dùng.
@@ -111,10 +111,13 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. Extractor @d_branch (hai residual) -> Aligner (MLP thuần đổi chiều)")
+@check("2. Extractor @d_branch (hai residual) -> Aligner (RMSNorm + SwiGLU đổi chiều)")
 def _():
+    import math
+
     import torch
 
+    from src import recombiner
     from src import vextractor as R
 
     torch.manual_seed(0)
@@ -149,6 +152,7 @@ def _():
     full = R.backbone_body(SMALL_ARCH, False, SMALL_IMG, None)
     assert full[3] > SMALL_NL and full[1] == vx.d_feat      # d_feat không đổi
     assert full[4] == "vit" and full[5] == "NLC" and full[6] is True
+    assert full[7] is None                      # ViT không có `.stages`
     assert (sum(q.numel() for q in vx.backbone_parameters())
             < sum(q.numel() for q in full[0].parameters()))
     # cắt quá số block có thật -> DỪNG, không lặng lẽ dùng hết
@@ -174,14 +178,29 @@ def _():
         h = s + vx.mlp(s)
         want = q0 + vx.xattn(vx.x_norm(h), kv)
         assert torch.allclose(vx(x), want, atol=1e-6)
-    # Aligner ở /5 là MỘT MLP THUẦN: không norm, không attention, không residual
+    # Aligner = RMSNorm + SwiGLU: không attention, không residual
     al = br.aligner
-    assert al.mlp[0].in_features == SMALL_DB and al.mlp[0].out_features == 64
-    assert al.mlp[-1].out_features == 32                     # = d_model
-    assert not hasattr(al, "sattn") and not hasattr(al, "norm")
+    for lin, i, o in ((al.gate, SMALL_DB, 64), (al.up, SMALL_DB, 64),
+                      (al.down, 64, 32)):
+        assert (lin.in_features, lin.out_features) == (i, o)
+        assert lin.bias is None                  # quy ước Gemma 3 / LLaMA
+    assert not hasattr(al, "sattn") and not hasattr(al, "mlp")
+    assert isinstance(al.norm, recombiner.RMSNorm)
     with torch.no_grad():
-        assert torch.allclose(al(want), al.mlp(want), atol=1e-6)
+        nq = al.norm(want)
+        ref = al.down(torch.nn.functional.silu(al.gate(nq)) * al.up(nq))
+        assert torch.allclose(al(want), ref, atol=1e-6)
         assert torch.allclose(br(x), al(want), atol=1e-6)
+        # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — đó là cả lý do nó ở đây
+        assert abs(float(nq.pow(2).mean().sqrt()) - 1.0) < 0.05
+        # `_init` KHÔNG được đè normal(0, 0.02) lên ba ma trận có cổng: chúng
+        # dùng 1/√fan_in, và đè 0.02 lên là quay lại ca Q ≈ 0 ở bước 0.
+        for lin in (al.gate, al.up, al.down):
+            want_std = 1.0 / math.sqrt(lin.in_features)
+            got = float(lin.weight.std())
+            assert abs(got - want_std) / want_std < 0.25, (got, want_std)
+        # và Q ở bước 0 KHÔNG được bé đến mức vô nghĩa
+        assert float(al(want).pow(2).mean().sqrt()) > 1e-3
     # Cls Head / ASL / SupervisedBlock BỊ BỎ HẲN — Stage 0 là tự giám sát
     for gone in ("SupervisedBlock", "ClsHead", "ClsCounter", "CellMaskedASL",
                  "build_asl", "asl_gammas", "build_cls_head", "AttnPooling"):
@@ -231,9 +250,10 @@ def _():
 
     torch.manual_seed(0)
     # ConvNeXt: stride tổng 32 -> ảnh 64² cho lưới 2×2 = 4 ô.
-    net, d_feat, n_patch, n_use, kind, fmt, mres = R.backbone_body(
+    net, d_feat, n_patch, n_use, kind, fmt, mres, nst = R.backbone_body(
         SMALL_CONV, False, SMALL_IMG)
     assert kind == "conv" and n_use is None        # không có `.blocks` phẳng
+    assert nst == 4                                # 4 stage, dùng hết
     assert fmt == "NCHW", fmt
     assert n_patch == (SMALL_IMG // 32) ** 2 == 4, n_patch
     assert not hasattr(net, "blocks") and hasattr(net, "stages")
@@ -248,6 +268,36 @@ def _():
         assert "n_layers" in str(e) and "stage" in str(e)
     else:
         raise AssertionError("n_layers trên họ conv phải bị từ chối")
+    # ── n_stages: LÁT CẮT của họ phân cấp ─────────────────────────────────
+    n3, d3, np3, _nu3, _k3, _f3, _m3, nst3 = R.backbone_body(
+        SMALL_CONV, False, SMALL_IMG, None, 3)
+    assert nst3 == 3 and len(n3.stages) == 3
+    # dừng sớm một stage = ÍT kênh hơn nhưng lưới MỊN hơn (stride /2)
+    assert d3 < d_feat and np3 == n_patch * 4, (d3, d_feat, np3, n_patch)
+    # stage cuối biến mất HẲN khỏi state_dict, không chỉ bị bỏ qua lúc forward
+    assert not any(k.startswith("stages.3.") for k in n3.state_dict())
+    assert (sum(q.numel() for q in n3.parameters())
+            < sum(q.numel() for q in net.parameters()))
+    for bad in (0, 5):
+        try:
+            R.backbone_body(SMALL_CONV, False, SMALL_IMG, None, bad)
+        except R.VExtractorUnusable as e:
+            assert "n_stages" in str(e)
+        else:
+            raise AssertionError(f"n_stages = {bad} phải bị từ chối")
+    # n_stages trên họ ViT -> TỪ CHỐI; khai CẢ HAI -> TỪ CHỐI
+    try:
+        R.backbone_body(SMALL_ARCH, False, SMALL_IMG, None, 2)
+    except R.VExtractorUnusable as e:
+        assert "n_stages" in str(e) and "n_layers" in str(e)
+    else:
+        raise AssertionError("n_stages trên họ ViT phải bị từ chối")
+    try:
+        R.backbone_body(SMALL_CONV, False, SMALL_IMG, 2, 3)
+    except R.VExtractorUnusable as e:
+        assert "n_layers" in str(e) and "n_stages" in str(e)
+    else:
+        raise AssertionError("khai CẢ n_layers lẫn n_stages phải bị từ chối")
     # ── cả nhánh chạy được trên backbone conv, và `patches` làm phẳng ĐÚNG ──
     cfg = {"vextractor": {"vextractor": {"image_size": SMALL_IMG,
                                          "arch": SMALL_CONV, "pretrained": False,
@@ -291,7 +341,7 @@ def _():
     torch.manual_seed(0)
     # SwinV2 mặc định `assert` đầu vào đúng 256²; qua được 64² là nhờ ladder đã
     # thử `strict_img_size=False` VÀ probe bằng forward thật.
-    net, d_feat, n_patch, n_use, kind, fmt, mres = R.backbone_body(
+    net, d_feat, n_patch, n_use, kind, fmt, mres, _nst = R.backbone_body(
         SMALL_SWIN, False, SMALL_IMG)
     assert kind == "conv" and fmt == "NHWC" and n_use is None
     assert n_patch == (SMALL_IMG // 32) ** 2 == 4, n_patch
@@ -402,7 +452,7 @@ def _():
     from src import vextractor as R
 
     sp = small_spec()
-    body, d_feat, n_patch, n_use, kind, fmt, mres = R.build_backbone(sp)
+    body, d_feat, n_patch, n_use, kind, fmt, mres, _nst = R.build_backbone(sp)
     x = torch.randn(1, 3, SMALL_IMG, SMALL_IMG)
     with tempfile.TemporaryDirectory() as t:
         R.save_stage0(body, sp, Path(t) / "s0",
@@ -464,7 +514,7 @@ def _():
 
     torch.manual_seed(0)
     sp = small_spec()
-    body, d_feat, n_patch, n_use, kind, fmt, mres = R.build_backbone(sp)
+    body, d_feat, n_patch, n_use, kind, fmt, mres, _nst = R.build_backbone(sp)
     dc = {"out_dim": 64, "hidden": 32, "bottleneck": 16, "head_layers": 3,
           "pool": "cls", "student_temp": 0.1, "teacher_temp": 0.04,
           "center_momentum": 0.9}
@@ -987,36 +1037,40 @@ def _():
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448
     assert int(rv["image_size"]) % 32 == 0                      # chia hết stride 32
-    assert rv["arch"] == "convnext_small.dinov3_lvd1689m"
-    # DINOv3 ConvNeXt-S: stride tổng 32 -> 448/32 = 14 -> 196 ô × 768, KHÔNG
-    # prefix token. `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của DINOv3, nên
-    # Stage 0 chạy TIẾP đúng hàm mục tiêu ấy (không đổi loại mục tiêu giữa chừng).
-    assert (int(rv["image_size"]) // 32) ** 2 == 196
+    assert rv["arch"] == "convnext_base.dinov3_lvd1689m"
+    # DINOv3 ConvNeXt-B CẮT SAU STAGE 3: stride 16 -> 448/16 = 28 -> 784 ô ×
+    # 512, KHÔNG prefix token. `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của
+    # DINOv3, nên Stage 0 chạy TIẾP đúng hàm mục tiêu ấy (không đổi loại mục
+    # tiêu giữa chừng).
+    assert int(rv["n_stages"]) == 3
+    assert (int(rv["image_size"]) // 16) ** 2 == 784
     assert "dinov3" in rv["arch"]
     from src import vextractor as R
 
     # `n_layers: null` = dùng hết. Với ConvNeXt nó BẮT BUỘC là null (không có
-    # `.blocks` phẳng để cắt — 36 block xếp theo 4 stage khác số kênh). Khoá vẫn phải CÓ MẶT trong spec (giá trị None) —
+    # `.blocks` phẳng để cắt — block xếp theo stage khác số kênh); lát cắt của
+    # họ phân cấp là `n_stages`, và nó PHẢI nằm trong `backbone_spec` vì nó
+    # quyết định chính những tensor Stage 0 lưu ra. Khoá vẫn phải CÓ MẶT trong spec (giá trị None) —
     # nó nằm trong `backbone_spec`, nên bật/tắt việc cắt là checkpoint Stage 0
     # cũ bị từ chối chứ không lệch khoá im lặng.
     assert rv["n_layers"] is None
     sp14 = R.spec_from_cfg(cfg, 2560)
     assert "n_layers" in sp14["vextractor"]
     assert set(R.backbone_spec(sp14)) == {"arch", "pretrained", "n_layers",
-                                          "normalize"}
+                                          "n_stages", "normalize"}
     # KHÔNG còn n_labels / n_classes / class_order: Stage 0 là tự giám sát
     assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 32) ** 2
-    # Extractor chạy ở d_branch 1024 (KHÁC d_model 2560): head_dim 128
-    assert int(rv["d_branch"]) == 1024 != 2560
-    assert 1024 % int(rv["n_heads"]) == 0 and 1024 // int(rv["n_heads"]) == 128
+    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
+    # Extractor chạy ở d_branch 768 (KHÁC d_model 2560): head_dim 128
+    assert int(rv["d_branch"]) == 768 != 2560
+    assert 768 % int(rv["n_heads"]) == 0 and 768 // int(rv["n_heads"]) == 128
     # MLP(GeLU) nằm GIỮA hai attn và không đổi chiều
-    assert int(rv["mlp_hidden"]) == 1152
-    # Aligner: MLP THUẦN, chỗ DUY NHẤT đổi chiều 1024 -> 2560 (không attn)
+    assert int(rv["mlp_hidden"]) == 1024
+    # Aligner: SwiGLU THUẦN, chỗ DUY NHẤT đổi chiều 768 -> 2560 (không attn)
     al = cfg["vextractor"]["aligner"]
-    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 2048
+    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 4096
     # Cls Head bị BỎ HẲN khỏi config
     assert "cls_head" not in cfg["vextractor"] and "n_labels" not in cfg["vextractor"]
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
@@ -1137,8 +1191,9 @@ def _():
 
     orig = (s0.decoder_width, s0.assert_same_pixels,
             s0.ImageOnlyDataset.__getitem__, R.backbone_body)
-    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None:
-                       orig[3](arch, False, image_size, n_layers))
+    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
+                       n_stages=None:
+                       orig[3](arch, False, image_size, n_layers, n_stages))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.assert_same_pixels = lambda *_a, **_k: None
     s0.ImageOnlyDataset.__getitem__ = _views
@@ -1174,7 +1229,7 @@ def _():
             # KHÔNG còn epoch đóng băng nào: ViT học ngay từ bước 0, chỉ ở lr
             # riêng (`backbone_lr`). Nên sau epoch 1 trọng số ViT đã phải đổi.
             sp0 = R.spec_from_cfg(cfg, D_MOD)
-            bd0, df0, _np0, _nl0, _k0, _f0, _m0 = R.build_backbone(sp0)
+            bd0, df0, _np0, _nl0, _k0, _f0, _m0, _s0 = R.build_backbone(sp0)
             tr0 = DN.DinoTrainer(bd0, df0, 1, s0.s0cfg(cfg)["dino"], _f0)
             gnames = [g["name"] for g in tr0.param_groups(3e-5, 1e-5)]
             assert gnames == ["backbone", "rest"], gnames
@@ -1275,8 +1330,9 @@ def _():
 
     orig = (s0.decoder_width, s0.assert_same_pixels,
             s0.ImageOnlyDataset.__getitem__, R.backbone_body, DN.DinoTrainer.loss)
-    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None:
-                       orig[3](arch, False, image_size, n_layers))
+    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
+                       n_stages=None:
+                       orig[3](arch, False, image_size, n_layers, n_stages))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     DN.DinoTrainer.loss = fake_loss
     s0.assert_same_pixels = lambda *_a, **_k: None
@@ -1516,7 +1572,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra BA hình riêng (Z/Q/T, thang màu riêng), hình 3 gồm 3 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt-S về pixel), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra BA hình riêng (Z/Q/T, thang màu riêng), hình 3 gồm 3 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt-B về pixel), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1706,7 +1762,7 @@ def _():
                      "Kiểm nhanh trước khi tin hình", "Đọc ba hình thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
                      "KHÔNG dính decoder", "teacher", "32 High-Q token",
-                     "Q → Aligner → Extractor → teacher (ConvNeXt-S) → I",
+                     "Q → Aligner → Extractor → teacher (ConvNeXt-B) → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
         # ba ô, không còn OR/AND của §2.0

@@ -433,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
                      "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], "
-                                 "Q = Aligner(Extractor(ConvNeXt-teacher(ảnh 448²))) (B)"})
+                                 "Q = Aligner(Extractor(ConvNeXt-B-teacher(ảnh 448²))) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 
@@ -580,7 +580,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0 or a.refinal
-        _hr("Stage 0 — backbone DINOv3 ConvNeXt-S, TỰ GIÁM SÁT (DINO, KHÔNG nhãn, KHÔNG Gemma)")
+        _hr("Stage 0 — backbone DINOv3 ConvNeXt-B (3 stage), TỰ GIÁM SÁT (DINO, KHÔNG nhãn, KHÔNG Gemma)")
         try:
             def _base_done() -> None:
                 # base xong -> đẩy base/ + history + loader NGAY, trước epoch n+1

@@ -1,8 +1,8 @@
 """DINO self-distillation cho Stage 0 của §2.2 — KHÔNG nhãn, KHÔNG ASL.
 
-Stage 0 ở bố cục /6 chỉ huấn luyện MỘT thứ: backbone DINOv3 ConvNeXt-S, chạy
-tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng chính hàm mục tiêu
-nó được sinh ra với. Không có
+Stage 0 ở bố cục /7 chỉ huấn luyện MỘT thứ: backbone DINOv3 ConvNeXt-B đã cắt
+sau stage 3, chạy tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng
+chính hàm mục tiêu nó được sinh ra với. Không có
 `labels.npz`, không Cls Head, không F1/Recall — epoch được chọn theo loss tự
 giám sát trên một tập val CỐ ĐỊNH.
 
@@ -152,7 +152,7 @@ class DINOHead(nn.Module):
 
     Đọc vector nào của backbone: `cls` (token đầu) — DINO gốc chưng cất trên
     CLS. `mean` (trung bình các patch, đã bỏ prefix) cho họ lưới (ConvNeXt,
-    SwinV2), vốn không có CLS token nào; đó là chế độ của /6.
+    SwinV2), vốn không có CLS token nào; đó là chế độ của /7.
     """
 
     def __init__(self, d_feat: int, out_dim: int = 4096, hidden: int = 2048,
