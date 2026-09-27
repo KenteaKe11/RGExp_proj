@@ -313,7 +313,19 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
     sal_q = (_q_saliency_map(branch, batch["vext_pixels"], dev)
              if branch is not None else None)
+    # Lưu đầu ra không gian của backbone teacher ở đúng lượt Lens:
+    # (B, N, C) -> chuẩn L2 mỗi vị trí -> lưới H×W. Backbone frozen nên
+    # patches() chạy trong no_grad, đúng chế độ teacher inference.
+    with RCV.autocast(dev):
+        teacher_tokens = branch.vextractor.patches(batch["vext_pixels"].to(dev))
+    teacher_norm = teacher_tokens.float().norm(dim=-1)[0].detach().cpu().numpy()
+    gh = gw = int(round(math.sqrt(teacher_norm.size)))
+    if gh * gw != teacher_norm.size:
+        raise TrainUnusable(f"lưới teacher không vuông: {teacher_norm.size} token")
+    teacher_norm = teacher_norm.reshape(gh, gw)
+
     out_d = {"layer_sens": sens, "sal_z": grid(leaf_z),
+             "teacher_feature_norm": teacher_norm,
              "hidden_last": np.stack([h[0, -1].float().detach().cpu().numpy()
                                       for h in hs[1:]]),
              "y": float(y.detach()), "target": tgt_info,
@@ -369,6 +381,42 @@ def _q_saliency_map(branch, px, dev):
     return g
 
 
+def plot_teacher_infer(item: dict, res: dict, path: Path) -> Path:
+    """Ảnh thứ tư: X-ray gốc cạnh đầu ra không gian của DINOv3 teacher.
+
+    Dùng chuẩn L2 theo kênh tại mỗi ô để biểu diễn cường độ đặc trưng; đây
+    không phải xác suất hay bản đồ phân đoạn tổn thương.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    with Image.open(item["image_path"]) as im:
+        img = np.asarray(im.convert("L"), dtype=float) / 255.0
+    feat = np.asarray(res["teacher_feature_norm"], dtype=float)
+    vmax = float(np.nanpercentile(feat, 99.0))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanmax(feat)) or 1.0
+    fig, axes = plt.subplots(1, 2, dpi=150, figsize=(8.2, 4.2))
+    axes[0].imshow(img, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("1. Ảnh X-ray đầu vào gốc", fontsize=9)
+    axes[0].axis("off")
+    im = axes[1].imshow(feat, cmap="inferno", interpolation="nearest",
+                        vmin=0, vmax=vmax)
+    axes[1].set_title(
+        f"2. DINOv3 teacher inference · ‖feature‖₂ · lưới {feat.shape[0]}×{feat.shape[1]}",
+        fontsize=8.5)
+    axes[1].axis("off")
+    cb = fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+    cb.set_label("chuẩn L2 theo kênh (độ lớn đặc trưng)", fontsize=7)
+    fig.suptitle(f"Teacher output · {item['key']}", fontsize=10)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def last_layers(n_layers: int, frac: float) -> list[int]:
     """Chỉ số (1-based) của `frac` lớp CUỐI — mặc định 1/4.
 
@@ -420,7 +468,7 @@ def logit_lens(model, gemma, hidden_last: np.ndarray, k: int) -> list[dict]:
 def decode_top(processor, rows: list[dict]) -> list[dict]:
     tk = processor.tokenizer
     for r in rows:
-        r["tokens"] = [tk.decode([i]).replace("\n", "\\n") for i in r["ids"]]
+        r["tokens"] = [tk.decode([i]).replace("\n", "\n") for i in r["ids"]]
     return rows
 
 
@@ -703,12 +751,14 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
         figs.update(plot_layers(res, d / "figures" / "lens_layers.png", lc))
         figs["visual"] = plot_visual(item, res,
                                      d / "figures" / "lens_visual.png", lc)
+        figs["teacher_infer"] = plot_teacher_infer(
+            item, res, d / "figures" / "lens_teacher_infer.png")
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ vẽ hình hỏng: {e!r}", flush=True)
 
     # ── số liệu thô ────────────────────────────────────────────────────────
     raw = {"layer_sens": res["layer_sens"]}
-    for k in ("sal_q", "sal_q_64", "sal_z"):
+    for k in ("sal_q", "sal_q_64", "sal_z", "teacher_feature_norm"):
         if res.get(k) is not None:
             raw[k] = res[k]
     np.savez_compressed(d / "lens_maps.npz", **raw)
@@ -727,7 +777,8 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
     (d / "lens.json").write_text(json.dumps(out, indent=2, ensure_ascii=False,
                                             default=str), encoding="utf-8")
     write_doc(cfg, d, A, B, item, res, tops, figs, out)
-    print(f"  ✓ Lens xong sau {out['minutes']} phút · 3 ô (gốc · Z · khối Q) "
+    print(f"  ✓ Lens xong sau {out['minutes']} phút · đã lưu ảnh teacher inference "
+          f"cùng ảnh gốc · visual 3 ô (gốc · Z · khối Q) "
           f"-> {d / DOC}", flush=True)
     return out
 
@@ -983,6 +1034,13 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
     L.append("## 3. [Visual] Ba ô — ảnh gốc · Z · khối Q\n")
     if figs.get("visual"):
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
+    if figs.get("teacher_infer"):
+        L += ["### 4. DINOv3 teacher inference output\n",
+              f"![DINOv3 teacher inference on the original X-ray](figures/{Path(figs['teacher_infer']).name})\n",
+              "This uses the exact Lens-selected image and branch preprocessing. "
+              "The color map shows per-location L2 feature magnitude on the output "
+              "grid (28x28 in the current configuration); it is not a probability "
+              "map or lesion segmentation.\n"]
     L += [f"Chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi ở phân vị "
           f"{lc['percentile_clip']}).\n",
           "| ô | đại lượng | hỏi gì |\n|---|---|---|",
