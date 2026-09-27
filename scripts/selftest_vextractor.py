@@ -1998,7 +1998,7 @@ def _():
     rd = (ROOT / "README.md").read_text(encoding="utf-8")
     need = [
         (str(sp["vextractor"]["arch"]), "arch"),
-        (f"Linear 512→{vx.d_branch}", "Linear vào"),
+        (f"Linear {vx.d_feat}→{vx.d_branch}", "Linear vào"),
         (f"SwiGLU {al.d_branch}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
         (f"`head_dim` = {vx.head_dim}", "head_dim khai"),
         (f"{vx.n_query} learner", "n_query"),
