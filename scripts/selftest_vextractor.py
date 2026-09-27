@@ -78,8 +78,10 @@ SMALL_CONV = "convnext_atto"
 SMALL_SWIN = "swinv2_tiny_window8_256"
 
 
-# d_branch (16) KHÁC d_model (32) một cách CỐ Ý: bố cục /4 làm việc ở d_branch
-# và chỉ Aligner nở ra d_model, nên hai số bằng nhau là ẩn mất mọi lỗi lẫn chiều.
+# d_branch (16) KHÁC d_model (32) một cách CỐ Ý, DÙ bố cục /8 thật sự đặt chúng
+# bằng nhau (2560): hai số bằng nhau thì mọi lỗi lẫn chiều — Linear nối nhầm
+# đầu, Aligner đọc nhầm khoá — đều lọt qua vì shape tình cờ khớp. Selftest giữ
+# chúng khác nhau để `build_aligner` nối `d_branch` -> `d_model` còn kiểm được.
 SMALL_DB = 16
 
 
@@ -90,7 +92,7 @@ def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_branch=None)
                                          "arch": SMALL_ARCH, "pretrained": False,
                                          "n_layers": SMALL_NL, "n_query": n_query,
                                          "d_branch": int(d_branch or SMALL_DB),
-                                         "mlp_hidden": 64, "n_heads": 4},
+                                         "head_dim": 4},
                           "aligner": {"mlp_hidden": 64}}}
     return R.spec_from_cfg(cfg, d_model)
 
@@ -111,7 +113,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. Extractor @d_branch (hai residual) -> Aligner (RMSNorm + SwiGLU đổi chiều)")
+@check("2. Extractor @d_branch (HAI residual, cả hai TỪ learner) -> Aligner (RMSNorm + SwiGLU)")
 def _():
     import math
 
@@ -164,34 +166,48 @@ def _():
         else:
             raise AssertionError(f"n_layers = {bad} phải bị từ chối")
     # đường đi đúng hình: Linear d_feat→d_branch, thân chạy THẲNG ở d_branch,
-    # MLP(GeLU) nằm GIỮA Self-attn và Cross-attn và KHÔNG đổi chiều
+    # và Extractor KHÔNG còn MLP nào (từ /8 nó nằm trong Aligner)
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == SMALL_DB
     assert vx.sattn.d == vx.xattn.d == vx.d_branch == SMALL_DB
+    # MỌI attention cùng MỘT head_dim, và nó là khoá KHAI — số head suy ra
+    assert vx.head_dim == 4 and vx.n_heads == SMALL_DB // 4
+    assert vx.sattn.h == vx.xattn.h == vx.n_heads
+    assert vx.sattn.d // vx.sattn.h == vx.xattn.d // vx.xattn.h == vx.head_dim
+    # d_branch không chia hết head_dim -> DỪNG, không làm tròn
+    try:
+        R.VExtractor(SMALL_IMG, 18, SMALL_ARCH, False, SMALL_NL, SMALL_Q, 4)
+    except ValueError as e:
+        assert "head_dim" in str(e)
+    else:
+        raise AssertionError("d_branch không chia hết head_dim phải bị từ chối")
     assert tuple(vx.learner.shape) == (1, SMALL_Q, SMALL_DB)
-    assert vx.mlp[0].in_features == SMALL_DB and vx.mlp[0].out_features == 64
-    assert vx.mlp[-1].out_features == SMALL_DB               # về lại d_branch
-    # HAI residual: (+) quanh MLP lấy đầu ra Self-attn, (+) quanh khối lấy learner
+    assert not hasattr(vx, "mlp"), "Extractor /8 không có MLP"
+    # HAI residual, và CẢ HAI đều từ learner — đúng hai mũi tên trong hình.
     with torch.no_grad():
         kv = vx.inp_norm(vx.inp(vx.patches(x)))
         q0 = vx.learner.expand(2, -1, -1)
-        s = vx.sattn(vx.q_norm(q0))
-        h = s + vx.mlp(s)
+        h = q0 + vx.sattn(vx.q_norm(q0))
         want = q0 + vx.xattn(vx.x_norm(h), kv)
         assert torch.allclose(vx(x), want, atol=1e-6)
+        # và KHÁC hẳn bố cục /7 (`s + mlp(s)`): nếu ai đó lỡ trả residual thứ
+        # nhất về đầu ra Self-attn thì phép so này bắt được.
+        s_only = vx.sattn(vx.q_norm(q0))
+        assert not torch.allclose(h, s_only, atol=1e-6)
     # Aligner = RMSNorm + SwiGLU: không attention, không residual
     al = br.aligner
+    assert not hasattr(al, "sattn") and not hasattr(al, "mlp")
+    assert isinstance(al.norm, recombiner.RMSNorm)
     for lin, i, o in ((al.gate, SMALL_DB, 64), (al.up, SMALL_DB, 64),
                       (al.down, 64, 32)):
         assert (lin.in_features, lin.out_features) == (i, o)
         assert lin.bias is None                  # quy ước Gemma 3 / LLaMA
-    assert not hasattr(al, "sattn") and not hasattr(al, "mlp")
-    assert isinstance(al.norm, recombiner.RMSNorm)
     with torch.no_grad():
         nq = al.norm(want)
         ref = al.down(torch.nn.functional.silu(al.gate(nq)) * al.up(nq))
         assert torch.allclose(al(want), ref, atol=1e-6)
         assert torch.allclose(br(x), al(want), atol=1e-6)
-        # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — đó là cả lý do nó ở đây
+        # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — với một khối có CỔNG
+        # NHÂN đó không phải thẩm mỹ: đầu vào nhỏ thì cổng bình phương nó.
         assert abs(float(nq.pow(2).mean().sqrt()) - 1.0) < 0.05
         # `_init` KHÔNG được đè normal(0, 0.02) lên ba ma trận có cổng: chúng
         # dùng 1/√fan_in, và đè 0.02 lên là quay lại ca Q ≈ 0 ở bước 0.
@@ -302,7 +318,7 @@ def _():
     cfg = {"vextractor": {"vextractor": {"image_size": SMALL_IMG,
                                          "arch": SMALL_CONV, "pretrained": False,
                                          "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                         "mlp_hidden": 64, "n_heads": 4},
+                                         "head_dim": 4},
                           "aligner": {"mlp_hidden": 64}}}
     sp = R.spec_from_cfg(cfg, 32)
     br = R.VExtractorBranch(sp)
@@ -364,7 +380,7 @@ def _():
     cfg = {"vextractor": {"vextractor": {"image_size": SMALL_IMG,
                                          "arch": SMALL_SWIN, "pretrained": False,
                                          "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                         "mlp_hidden": 64, "n_heads": 4},
+                                         "head_dim": 4},
                           "aligner": {"mlp_hidden": 64}}}
     sp = R.spec_from_cfg(cfg, 32)
     br = R.VExtractorBranch(sp)
@@ -1062,15 +1078,39 @@ def _():
     assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
-    # Extractor chạy ở d_branch 768 (KHÁC d_model 2560): head_dim 128
-    assert int(rv["d_branch"]) == 768 != 2560
-    assert 768 % int(rv["n_heads"]) == 0 and 768 // int(rv["n_heads"]) == 128
-    # MLP(GeLU) nằm GIỮA hai attn và không đổi chiều
-    assert int(rv["mlp_hidden"]) == 1024
-    # Aligner: SwiGLU THUẦN, chỗ DUY NHẤT đổi chiều 768 -> 2560 (không attn)
+    assert int(rv["n_query"]) == 16 != (int(rv["image_size"]) // 16) ** 2
+    # Từ /8 Extractor chạy ở d_branch = d_model = 2560: head_dim 128
+    assert int(rv["d_branch"]) == 2560
+    # `head_dim` là khoá KHAI, `n_heads` SUY RA — khai n_heads bị TỪ CHỐI.
+    assert int(rv["head_dim"]) == 128 and "n_heads" not in rv
+    assert int(rv["d_branch"]) % int(rv["head_dim"]) == 0
+    assert int(rv["d_branch"]) // int(rv["head_dim"]) == 20
+    bad_nh = dict(cfg)
+    bad_nh["vextractor"] = dict(cfg["vextractor"],
+                                vextractor=dict(rv, n_heads=20))
+    try:
+        R.spec_from_cfg(bad_nh, 2560)
+    except R.VExtractorUnusable as e:
+        assert "n_heads" in str(e) and "head_dim" in str(e)
+    else:
+        raise AssertionError("vextractor.n_heads phải bị từ chối ở /8")
+    # `mlp_hidden` KHÔNG còn ở khối vextractor — khai lại bị TỪ CHỐI ồn ào,
+    # chứ không bỏ qua im lặng (bỏ qua thì người khai tưởng vừa đặt bề rộng FFN)
+    assert "mlp_hidden" not in rv
+    bad_mlp = dict(cfg)
+    bad_mlp["vextractor"] = dict(cfg["vextractor"],
+                                 vextractor=dict(rv, mlp_hidden=1024))
+    try:
+        R.spec_from_cfg(bad_mlp, 2560)
+    except R.VExtractorUnusable as e:
+        assert "mlp_hidden" in str(e)
+    else:
+        raise AssertionError("vextractor.mlp_hidden phải bị từ chối ở /8")
+    # Aligner: SwiGLU THUẦN sau residual thứ hai, KHÔNG đổi chiều (2560 -> 2560)
     al = cfg["vextractor"]["aligner"]
-    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 4096
+    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 2048
+    # và 2048 < d_branch 2560: NÚT THẮT có chủ ý, không phải gõ nhầm
+    assert int(al["mlp_hidden"]) < int(rv["d_branch"])
     # Cls Head bị BỎ HẲN khỏi config
     assert "cls_head" not in cfg["vextractor"] and "n_labels" not in cfg["vextractor"]
     # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
@@ -1159,8 +1199,8 @@ def _():
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
                                         "pretrained": True, "n_layers": SMALL_NL,
                                         "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                        "mlp_hidden": 64, "n_heads": 4},
-                         "aligner": {"n_heads": 4, "mlp_hidden": 64},
+                                        "head_dim": 4},
+                         "aligner": {"mlp_hidden": 64},
                          "cls_head": {"n_heads": 4}}
     # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
     # thật đã tắt) và TẮT patience + `select: last` để số epoch cố định 4.
@@ -1299,8 +1339,8 @@ def _():
     cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
                                         "pretrained": True, "n_layers": SMALL_NL,
                                         "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                        "mlp_hidden": 64, "n_heads": 4},
-                         "aligner": {"n_heads": 4, "mlp_hidden": 64},
+                                        "head_dim": 4},
+                         "aligner": {"mlp_hidden": 64},
 }
     # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
     cfg["stage0"] = dict(cfg["stage0"],
@@ -1572,7 +1612,7 @@ def _():
         assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra BA hình riêng (Z/Q/T, thang màu riêng), hình 3 gồm 3 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt-B về pixel), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt-B về pixel / đầu ra DINOv3), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1666,6 +1706,11 @@ def _():
              "vext_pixels": torch.randn(1, 3, SMALL_IMG, SMALL_IMG)}
 
     ra = LZ.analyze(cfg, fake, fake, None, batch, "ref_logprob")   # không nhánh
+    # Arm KHÔNG có nhánh: không backbone nào để hỏi, nên không có bản đồ
+    # teacher — và `analyze` phải TRẢ VỀ chứ không chết giữa chừng bằng
+    # AttributeError sau khi đã chạy xong cả một lượt backward.
+    assert ra.get("teacher_feature_norm") is None
+    assert ra.get("sal_q") is None and ra["sal_z"] is not None
     rb = LZ.analyze(cfg, fake, fake, branch, batch, "ref_logprob")
     T = int(ids.shape[1])
     assert ra["layer_sens"].shape == (L, T)                 # A: chuỗi gốc
@@ -1721,8 +1766,10 @@ def _():
         figs["visual"] = LZ.plot_visual(item, rb,
                                         t / "figures" / "lens_visual.png", lc)
         # BA hình riêng, không phải một — và mỗi hình phải THẬT SỰ ra file.
-        assert set(figs) == {"layers_z", "layers_q", "layers_t", "visual"}, set(figs)
-        for k in ("layers_z", "layers_q", "layers_t"):
+        # MỘT file cho dải layers, MỘT file cho dải visual — tách THANG MÀU
+        # chứ không tách file (xem docstring plot_layers).
+        assert set(figs) == {"layers", "visual"}, set(figs)
+        for k in ("layers", "visual"):
             assert Path(figs[k]).exists() and Path(figs[k]).stat().st_size > 0, k
         # Ba vùng phải RỜI NHAU và PHỦ KÍN chuỗi: T là phần bù, không phải đuôi.
         regs = LZ._regions(rb, T + NQ)
@@ -1755,13 +1802,13 @@ def _():
         # Doc phải nhúng ĐỦ ba hình và phải NÓI RA rằng thang màu khác nhau —
         # một người đọc so độ sáng giữa hai hình là đọc sai, và chỉ có dòng chữ
         # ấy chặn được.
-        assert "KHÔNG so được độ sáng giữa ba hình" in doc
-        for need in ("## 1.", "## 2.", "## 3.", "lens_layers_z.png",
-                     "lens_layers_q.png", "lens_layers_t.png", "lens_visual.png",
+        assert "KHÔNG so được độ sáng giữa ba ô" in doc
+        for need in ("## 1.", "## 2.", "## 3.", "lens_layers.png",
+                     "lens_visual.png",
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
-                     "Kiểm nhanh trước khi tin hình", "Đọc ba hình thế nào",
+                     "Kiểm nhanh trước khi tin hình", "Đọc ba ô thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "KHÔNG dính decoder", "teacher", "32 High-Q token",
+                     "KHÔNG dính decoder", "teacher", "16 High-Q token",
                      "Q → Aligner → Extractor → teacher (ConvNeXt-B) → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
@@ -1849,6 +1896,81 @@ def _():
         raise AssertionError("last_image_index phải DỪNG khi các hàng lệch chỗ")
     assert rc.image_end_indices(shifted, IMG).tolist() == [2 + NZ, 3 + NZ]
     _ = left
+
+
+@check("22. ĐẶC TẢ khớp spec sống: mọi con số kiến trúc trong README, config "
+       "và docstring được dựng lại từ code, không phải chép tay")
+def _():
+    """README trôi khỏi code ở MỖI lần đổi kiến trúc, và nó trôi IM LẶNG.
+
+    Bố cục đã đi /5 -> /6 -> /7 -> /8 và mỗi bước đổi `d_branch`, `n_query`,
+    số tham số, kiểu Aligner. Không có gì buộc README đi theo, nên cách duy
+    nhất nó sai là sai âm thầm: người đọc tin một bảng tham số của hai bố cục
+    trước. Bài này dựng nhánh THẬT từ `configs/vextractor.yaml` rồi đòi README
+    chứa đúng những con số ấy.
+
+    `pretrained=False`: số tham số không phụ thuộc trọng số, nên bài này chạy
+    OFFLINE và không tải gì.
+    """
+    from src import dino as DN
+    from src import vextractor as R
+    from src.config import load_config
+
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    sp = R.spec_from_cfg(cfg, 2560)
+    sp["vextractor"]["pretrained"] = False
+    br = R.VExtractorBranch(sp)
+    vx, al = br.vextractor, br.aligner
+    dc = cfg["stage0"]["dino"]
+    head = DN.DINOHead(vx.d_feat, dc["out_dim"], dc["hidden"], dc["bottleneck"],
+                       dc["head_layers"])
+    n = lambda m: sum(q.numel() for q in m.parameters())    # noqa: E731
+    # README viết số thập phân theo kiểu Việt (dấu phẩy) — so đúng dạng ấy.
+    m = lambda v: f"{v / 1e6:.2f}".replace(".", ",") + " M"  # noqa: E731
+
+    rd = (ROOT / "README.md").read_text(encoding="utf-8")
+    need = [
+        (str(sp["vextractor"]["arch"]), "arch"),
+        (f"Linear 512→{vx.d_branch}", "Linear vào"),
+        (f"SwiGLU {al.d_branch}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
+        (f"`head_dim` = {vx.head_dim}", "head_dim khai"),
+        (f"{vx.n_query} learner", "n_query"),
+        (f"{vx.n_patch} ô", "lưới"),
+        (m(n(vx.body)), "tham số backbone"),
+        (m(sum(q.numel() for q in vx.head_parameters())), "tham số Extractor"),
+        (m(n(al)), "tham số Aligner"),
+        (m(n(br)), "tham số nhánh"),
+        (m(sum(q.numel() for q in br.trainable_parameters())), "phần học được"),
+        (m(n(head)), "DINO head"),
+        (m(n(vx.body) + n(head)), "Stage 0 student"),
+    ]
+    miss = [f"{name} ({s!r})" for s, name in need if s not in rd]
+    assert not miss, ("README KHÔNG còn khớp spec sống — sửa README, đừng nới "
+                      f"bài kiểm: {miss}")
+
+    # Và số của BỐ CỤC CŨ không được còn sót — ở BA bề mặt đặc tả, không chỉ
+    # README: config và docstring của `vextractor.py` cũng là nơi người ta đọc
+    # để biết nhánh làm gì, và chúng trôi y hệt. (Bảng so sánh lịch sử được
+    # phép nhắc bố cục cũ, nên chỉ soi những chuỗi chỉ xuất hiện khi ai đó
+    # quên cập nhật — `n_query` cũ, kiểu Aligner cũ, tên file hình cũ.)
+    stale = [f"{k} learner" for k in (32, 64) if k != vx.n_query]
+    stale += [f"{k} vector Q" for k in (32, 64) if k != vx.n_query]
+    stale += ["32 High-Q token", "`d_branch` = 768", "SwiGLU 768→4096→2560",
+              "MLP(GeLU) 2560→3072→2560", "lens_layers_z.png"]
+    surfaces = {
+        "README.md": rd,
+        "configs/vextractor.yaml": (ROOT / "configs/vextractor.yaml").read_text(
+            encoding="utf-8"),
+        # CHỈ docstring của module, không cả file: phần thân có chuỗi lịch sử
+        # ("/7 = ... 768→4096→2560") và đó là chú thích ĐÚNG, không phải drift.
+        "src/vextractor.py (docstring)": (
+            (ROOT / "src/vextractor.py").read_text(encoding="utf-8")
+            .split('"""')[1]),
+    }
+    left = {f: [s for s in stale if s in body]
+            for f, body in surfaces.items()}
+    left = {f: v for f, v in left.items() if v}
+    assert not left, f"đặc tả còn số của bố cục CŨ: {left}"
 
 
 print()

@@ -1120,7 +1120,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                    "normalize": dict(spec["vextractor"]["normalize"]),
                    "n_stages": spec["vextractor"].get("n_stages"),
                    "d_branch": spec["vextractor"]["d_branch"],
-                   "mlp_hidden": spec["vextractor"]["mlp_hidden"],
+                   # Extractor của /8 KHÔNG có MLP; bề rộng FFN nằm ở aligner.
                    "n_query": Z.n_query_of(spec),
                    "aligner": dict(spec["aligner"]),
                    "note": "Stage 0 CHỈ huấn luyện backbone (tự giám sát). "

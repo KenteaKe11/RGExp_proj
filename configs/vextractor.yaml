@@ -3,7 +3,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 # QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 32 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 16 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
@@ -318,20 +318,32 @@ labels:
 #
 #     (512,28,28) ─► Flatten + Permute ─► 784 ô
 #           │
-#     784 ô ─► Linear 512→768 ─► RMSNorm(768) ─────────────────────┐
-#     32 learner ─► RMSNorm ─► Self-attn ─┬─► MLP(GeLU) hidden 1024 ─► (+)
-#                  │                      └──────── skip ─────────────┘
-#                  │                                  │
-#                  │                            RMSNorm(768)
-#                  │                                  │
-#                  │                            Cross-attn ◄────────────┘
-#                  └────────── skip ──────────────► (+) ─► Q_raw (32, 768)
+#     784 ô ─► Linear 512→2560 ─► RMSNorm(2560) ───────────────────┐
+#     16 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
+#                 │                                  │             │
+#                 │                           RMSNorm(2560)        │
+#                 │                                  │             │
+#                 │                            Cross-attn ◄────────┘
+#                 └────────── skip ──────────────► (+) ─► Q_raw (16, 2560)
 #                                                     │
-#                                SwiGLU 768→4096→2560 ─► Q (32, 2560)   [Aligner]
+#                                             RMSNorm(2560)        [Aligner]
+#                                                     │
+#                             SwiGLU 2560→2048→2560 ─► Q (16, 2560)
 #
-# HAI chiều, đừng lẫn: `d_branch` (768) là chiều làm việc của Extractor;
-# `d_model` (2560) là chiều embedding của decoder và CHỈ xuất hiện ở đầu ra
-# Aligner. Stage 0 không dùng cả hai — nó chỉ chạy backbone + một DINO head.
+# HAI residual, và CẢ HAI đều từ `learner` — đúng hai mũi tên đi thẳng từ khối
+# "16 Learners" trong sơ đồ. Bố cục /7 khác ở đây: residual thứ nhất của nó
+# vòng quanh MLP.
+#
+# `d_branch` = `d_model` = 2560: `Linear 512→2560` ngay sau backbone đã đổi
+# chiều, nên KHÔNG còn chỗ nào nở ra ở cuối, và Aligner là một FFN thuần. Vẫn
+# là HAI khoá riêng (`d_model` đọc từ AutoConfig của decoder), nên đổi base
+# sang decoder khác chiều sẽ lộ ra chứ không lặng lẽ. Stage 0 không dùng cả
+# hai — nó chỉ chạy backbone + một DINO head.
+#
+# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2560. Mỗi khối attention là 4 × 2560² = 26,2 M tham số
+# (ở 768 chỉ 2,36 M), nên riêng Self + Cross đã 52,4 M và phần HỌC ĐƯỢC của
+# nhánh phình lên ~3× so với /7. Backbone và Stage 0 KHÔNG đổi gì. Nếu hết
+# VRAM ở main stage thì đây là chỗ nhìn trước, không phải `train.max_seq_len`.
 #
 # Trọng số nền LÀ DINOv3 thật: `convnext_base.dinov3_lvd1689m` là một trong
 # các checkpoint Facebook phát hành cho DINOv3 (ViT-S/S+/B/L/H+/7B và
@@ -348,21 +360,29 @@ labels:
 # Vì `n_stages` quyết định chính những tensor Stage 0 lưu ra, nó nằm TRONG
 # `backbone_spec`: đổi nó là checkpoint Stage 0 cũ bị từ chối ồn ào.
 #
-# Aligner là MỘT khối SwiGLU THUẦN, không norm/attn/residual: phần "suy nghĩ"
-# đã nằm trọn trong Extractor, và cả hai đều do main stage dạy, nên không còn lý
-# do nhân đôi attention. Việc duy nhất của nó là đổi chiều.
+# Aligner ở /8 là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
+# sau residual thứ hai, không attn/residual nào thêm. Nó KHÔNG còn đổi chiều
+# (việc ấy đã xong ở `Linear 512→2560`), nên vai trò của nó là trộn lại 16
+# vector sau khi chúng đã đọc xong ảnh.
 #
-# SwiGLU = down( SiLU(gate(x)) ⊙ up(x) ), bias=False cả ba (quy ước Gemma 3 /
-# LLaMA). Cổng nhân cho một phép biến đổi PHỤ THUỘC ĐẦU VÀO thay vì một affine
-# cố định rồi bóp phi tuyến. Cái giá là BA ma trận thay vì hai: 16,78 M tham số
-# — khối LỚN NHẤT trong phần học được của nhánh.
-# (Ghi chú: FFN của Gemma 3 thực ra là GeGLU `gelu_pytorch_tanh`, không phải
-# SwiGLU. Ở đây dùng SiLU đúng như sơ đồ.)
+# `mlp_hidden` 2048 NHỎ HƠN `d_branch` 2560 — một nút THẮT có chủ ý. Mọi FFN
+# của decoder nở RA ở giữa (Gemma 3: 2560 → 10240); khối này làm ngược lại, ép
+# 2560 chiều qua 2048 rồi mở lại, nên nó không thể chép nguyên đầu vào sang
+# đầu ra. Muốn nó là FFN "bình thường" thì đặt mlp_hidden > 2560 — cả hai đều
+# chạy, nhưng hỏi hai câu khác nhau.
+#
+# RMSNorm ở đầu Aligner là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN,
+# và một cổng nhân ăn đầu vào nhỏ thì BÌNH PHƯƠNG cái nhỏ ấy. Q_raw tới với RMS
+# ~0,1 (learner khởi tạo 0,02, residual do nó chi phối). Đo trên bố cục /7 —
+# cùng cấu trúc, KHÔNG có RMSNorm: RMS(Q) ở bước 0 rơi xuống 1,07e-4, và trên
+# model đồ chơi của selftest nó underflow HẲN về 0 (bản đồ saliency của Lens
+# thành ma trận không). Vì cùng lý do, ba ma trận này init `1/√fan_in` và
+# `_init` PHẢI bỏ qua chúng — đè normal(0, 0.02) lên là quay lại đúng ca ấy.
 #
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
 vextractor:
-  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (32, 768)
+  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (16, 2560)
     image_size: 448         # stride 16 sau khi cắt. 448/16 = 28 -> 784 ô
     # timm; lần chạy đầu tải ~350 MB (tải CẢ 4 stage rồi mới cắt). DINOv3
     # ConvNeXt-B: 87,6 M tham số / 36 block (3+3+27+3) trên 4 stage; cắt còn 3
@@ -385,13 +405,26 @@ vextractor:
     # 512 kênh. Khai CẢ n_layers lẫn n_stages bị TỪ CHỐI. Xem ⚠ ở trên về đánh
     # đổi; khoá này nằm trong `backbone_spec` nên đổi nó = chạy lại Stage 0.
     n_stages: 3
-    n_query: 32             # số learner = số token Q nối vào chuỗi decoder
-    d_branch: 768           # chiều làm việc của Extractor
-    n_heads: 6              # Self/Cross-attn ở 768: head_dim 128 (768 = 6 × 128)
-    mlp_hidden: 1024        # MLP(GeLU) GIỮA hai attn: 768 -> 1024 -> 768
+    n_query: 16             # số learner = số token Q nối vào chuỗi decoder
+    d_branch: 2560          # = d_model. Linear 512→2560 đã đổi chiều ngay đầu
+    # MỌI attention của nhánh (Self + Cross) chạy ở head_dim CỐ ĐỊNH này; số
+    # head được SUY RA = d_branch // head_dim (2560 // 128 = 20).
+    #
+    # Vì sao khai head_dim chứ không khai n_heads: `d_branch` đã đổi ba lần từ
+    # /5 tới /8 (768 -> 1024 -> 768 -> 2560). Khai n_heads thì mỗi lần ấy
+    # head_dim rơi ra một giá trị khác mà không ai để ý — 768/6 = 128 nhưng
+    # 1024/6 = 170,7 (không chia hết) và 2048/20 = 102,4. Khai cái BẤT BIẾN,
+    # suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì DỪNG.
+    # Khai `n_heads` ở đây bị TỪ CHỐI ồn ào.
+    head_dim: 128
+    # KHÔNG còn `mlp_hidden` ở đây: từ /8 Extractor không có MLP nào (nó nằm
+    # trong `aligner` bên dưới). Khai lại khoá ấy sẽ bị TỪ CHỐI ồn ào thay vì
+    # bỏ qua im lặng — bỏ qua thì người khai tưởng vừa đặt bề rộng FFN mà không.
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # SwiGLU THUẦN, chỗ DUY NHẤT đổi chiều 768 -> 2560
-    mlp_hidden: 4096        # chiều TRUNG GIAN của SwiGLU (gate/up đều 768→4096)
+  aligner:                  # FFN THUẦN sau residual thứ hai; KHÔNG đổi chiều
+    # SwiGLU: down( SiLU(gate(x)) ⊙ up(x) ), bias=False cả ba, init 1/√fan_in.
+    # 2048 < d_branch 2560 = nút THẮT có chủ ý (xem ghi chú ở trên).
+    mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560
     dropout: 0.0
   # ── Main stage ─────────────────────────────────────────────────────────
   # ĐÚNG MỘT nhóm tham số học được trong nhánh: Extractor (phần ngoài backbone)
@@ -557,7 +590,8 @@ lens:
   layer_frac: 0.25          # CHỈ cho bảng top-k của logit lens (1/4 lớp cuối).
                             # Heatmap token × lớp vẽ ĐỦ mọi lớp.
   layer_marks: 6            # số lớp mốc in trong bảng (đầy đủ ở logit_lens.csv)
-  overlay_alpha: 0.45       # độ mờ của heatmap chồng lên ảnh gốc
+  overlay_alpha: 0.70       # độ mờ của heatmap chồng lên ảnh gốc (alpha = 0.70 × giá trị
+                            # điểm, nên chỗ yếu vẫn gần trong suốt)
   percentile_clip: 99.0     # cắt đuôi trước khi chuẩn hoá màu
   cmap: inferno
   dir: Lens
