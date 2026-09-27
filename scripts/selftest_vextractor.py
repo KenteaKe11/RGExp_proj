@@ -1567,6 +1567,12 @@ def _():
         assert s0.base_finished(cfg2) is None
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
     assert "s0.legacy_base(h, cfg, tmp)" in src   # Hub bố cục cũ cũng nhận được
+    # Spec NHÁNH phải dựng từ CONFIG, không chép từ meta Stage 0: meta ấy chụp
+    # bố cục lúc Stage 0 chạy (có thể nhiều bố cục trước), nên chép nó về là
+    # lặng lẽ huấn luyện Extractor+Aligner của bố cục CŨ.
+    tv = (ROOT / "src/train_vextractor.py").read_text(encoding="utf-8")
+    assert "RCV.spec_from_cfg(cfg," in tv
+    assert 'spec = dict(s0meta["spec"])' not in tv
 
 
 @check("18. kéo Stage 0 từ Hub (giả lập): bố cục cũ chỉ có final/ -> về máy thành base/")

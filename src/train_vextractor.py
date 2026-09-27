@@ -365,8 +365,18 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     dev = next(p for p in model.parameters() if p.device.type != "meta").device
 
     # ── nhánh: KHÔNG tiêu RNG của phần còn lại (dropout LoRA, …) ─────────
-    s0meta = json.loads((stage0_best / RCV.STAGE0_META).read_text(encoding="utf-8"))
-    spec = dict(s0meta["spec"])
+    # Spec của nhánh dựng từ CONFIG HIỆN TẠI, không phải từ meta Stage 0.
+    #
+    # Meta ấy chụp lại spec lúc Stage 0 chạy — có thể là nhiều bố cục trước.
+    # Lấy nguyên nó về nghĩa là Extractor + Aligner được dựng theo bố cục CŨ
+    # trong khi config nói bố cục MỚI, và không có gì báo: ở /7 -> /8 nó sẽ
+    # lặng lẽ dựng d_branch 768 / 32 learner / SwiGLU 4096 rồi huấn luyện suốt
+    # 200 bước, trong khi người chạy tin mình đang đo 2560 / 16 learner. Lần
+    # này nó chỉ lộ ra vì khoá `head_dim` chưa tồn tại ở /7 và ném KeyError.
+    #
+    # Phần backbone thì vẫn phải khớp checkpoint — và `load_stage0_into` so
+    # đúng `backbone_spec` ngay dưới, nên nhầm lẫn ở đó vẫn bị chặn ồn ào.
+    spec = RCV.spec_from_cfg(cfg, recombiner.vision_and_text_dims(model)[0])
     fork_dev = [dev] if dev.type == "cuda" else []
     with torch.random.fork_rng(devices=fork_dev):
         torch.manual_seed(seed + 1)
