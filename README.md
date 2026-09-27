@@ -330,8 +330,26 @@ hơn, và **chính nó** là thứ sinh target suốt Stage 0 — dùng student 
 stage là dùng bản nhiễu hơn của cùng một encoder. DINO head thì bị bỏ, y như
 cách Cls Head bị bỏ ở bản trước.
 `load_stage0_into` vì thế chỉ so `backbone_spec` = {`arch`, `pretrained`,
-`n_layers`, `normalize`}: đổi `d_branch` / `n_query` / `aligner` / `d_model`
-**không** buộc chạy lại một lượt DINO.
+`n_layers`, `n_stages`, `normalize`}: đổi `d_branch` / `n_query` / `head_dim` /
+`aligner` / `main` / `d_model` **không** buộc chạy lại một lượt DINO.
+
+**Và vân tay quyết định "có phải chạy lại không" dùng ĐÚNG tập khoá ấy.** Điều
+này từng không đúng: `config_fingerprint` băm **cả** khối `vextractor` — gồm
+`d_branch`, `n_query`, `head_dim`, `aligner`, `main` — nên đổi bất kỳ khoá nào
+của Extractor/Aligner là Stage 0 bị tuyên "cấu hình KHÁC, cần `--restage0`",
+trong khi `load_stage0_into` sẽ vui vẻ nạp đúng checkpoint ấy. Hai cổng bất
+đồng, và cái nghiêm hơn thắng: vài giờ GPU cho một backbone **y hệt**. Giờ cả
+hai đọc chung `vextractor.BACKBONE_CFG_KEYS`.
+
+**Format checkpoint Stage 0 cũng không còn bị đòi bằng đúng `FORMAT`.** `FORMAT`
+bump mỗi lần Extractor/Aligner đổi bố cục — /7 → /8 chỉ đổi `d_branch`, số
+learner và kiểu Aligner, backbone y nguyên — nên đòi bằng đúng nó là vứt một
+checkpoint hoàn toàn dùng được. Thứ thật sự phải khớp là `backbone_spec` (so
+ngay sau đó) và `load_state_dict(strict=True)`; `format` chỉ còn canh một việc
+hai phép kia không canh được: checkpoint /4 trở về trước chứa **cả**
+`SupervisedBlock` + Cls Head, một tập tensor khác hẳn. Selftest 23 khoá cả hai
+hành vi, ở cả hai chiều (đổi Extractor → vân tay **không** đổi; đổi backbone →
+vân tay **phải** đổi).
 
 **Một lr duy nhất: `lr` = 1e-5, phẳng suốt Stage 0** (AdamW, wd 0.03). Optimizer
 giữ **hai nhóm** — `backbone` (ConvNeXt-B) và `rest` (DINO head) — nhưng

@@ -1973,6 +1973,114 @@ def _():
     assert not left, f"đặc tả còn số của bố cục CŨ: {left}"
 
 
+@check("23. vân tay Stage 0 chỉ phụ thuộc BACKBONE: đổi Extractor/Aligner KHÔNG "
+       "bắt pretrain lại; checkpoint Stage 0 sống qua một lần bump FORMAT")
+def _():
+    """Hai cổng từng bắt chạy lại một lượt DINO nhiều giờ mà KHÔNG có lý do.
+
+    1. `config_fingerprint` băm CẢ khối `vextractor` — gồm `d_branch`,
+       `n_query`, `head_dim`, `aligner`, `main`. Không thứ nào trong đó có mặt ở
+       Stage 0 (nó chỉ dựng backbone + DINO head), nên đổi chúng làm vân tay
+       đổi và người chạy bị bảo `--restage0` cho một backbone y hệt.
+    2. `load_stage0_into` đòi `format` BẰNG ĐÚNG `FORMAT`. Nhưng `FORMAT` bump
+       mỗi lần Extractor/Aligner đổi bố cục (/7 -> /8 đổi d_branch, số learner
+       và kiểu Aligner; backbone y nguyên), nên một checkpoint hoàn toàn dùng
+       được bị vứt.
+
+    Cả hai đều mâu thuẫn với docstring của `backbone_spec` và với README. Bài
+    này khoá cả hai lại.
+    """
+    import json
+    import tempfile
+
+    import torch
+
+    from src import stage0_vextractor as s0
+    from src import vextractor as R
+
+    base = small_spec()
+
+    def cfg_of(**over):
+        rv = {"image_size": SMALL_IMG, "arch": SMALL_ARCH, "pretrained": False,
+              "n_layers": SMALL_NL, "n_query": SMALL_Q, "d_branch": SMALL_DB,
+              "head_dim": 4}
+        rv.update(over.pop("rv", {}))
+        vx = {"vextractor": rv, "aligner": {"mlp_hidden": 64},
+              "main": {"align_lr": 1e-5}}
+        vx.update(over.pop("vx", {}))
+        return {"seed": 42, "stage0": {"lr": 1e-5, "max_epochs": 3},
+                "vextractor": vx}
+
+    ref = s0.config_fingerprint(cfg_of())
+    ref_b = s0.base_fingerprint(cfg_of())
+
+    # ── đổi phần NGOÀI backbone -> vân tay KHÔNG được đổi ──────────────────
+    same = {
+        "d_branch": cfg_of(rv={"d_branch": 32}),
+        "n_query": cfg_of(rv={"n_query": 3}),
+        "head_dim": cfg_of(rv={"head_dim": 8}),
+        "dropout": cfg_of(rv={"dropout": 0.1}),
+        "image_size": cfg_of(rv={"image_size": SMALL_IMG * 2}),
+        "aligner": cfg_of(vx={"aligner": {"mlp_hidden": 999}}),
+        "main": cfg_of(vx={"main": {"align_lr": 0.5}}),
+    }
+    drift = [k for k, c in same.items() if s0.config_fingerprint(c) != ref]
+    assert not drift, (
+        f"đổi {drift} làm vân tay Stage 0 đổi — những khoá ấy tả "
+        f"Extractor/Aligner, Stage 0 không dựng chúng, và bắt pretrain lại vì "
+        f"chúng là bắt trả vài giờ GPU cho một backbone y hệt.")
+    drift_b = [k for k, c in same.items() if s0.base_fingerprint(c) != ref_b]
+    assert not drift_b, f"base_fingerprint: {drift_b}"
+
+    # ── đổi BACKBONE -> vân tay PHẢI đổi (cổng vẫn còn răng) ───────────────
+    for key, c in (("arch", cfg_of(rv={"arch": SMALL_CONV})),
+                   ("n_layers", cfg_of(rv={"n_layers": 2})),
+                   ("n_stages", cfg_of(rv={"n_stages": 2})),
+                   ("pretrained", cfg_of(rv={"pretrained": True}))):
+        assert s0.config_fingerprint(c) != ref, f"đổi {key} PHẢI đổi vân tay"
+    # khối stage0 và seed vẫn vào vân tay
+    c = cfg_of(); c["stage0"]["lr"] = 3e-5
+    assert s0.config_fingerprint(c) != ref
+    c = cfg_of(); c["seed"] = 7
+    assert s0.config_fingerprint(c) != ref
+    # `final_anneal` vào config_fingerprint nhưng KHÔNG vào base_fingerprint
+    c = cfg_of(); c["stage0"]["final_anneal"] = {"enabled": True}
+    assert s0.config_fingerprint(c) != ref and s0.base_fingerprint(c) == ref_b
+
+    # ── checkpoint Stage 0 sống qua một lần bump FORMAT ────────────────────
+    body = R.build_backbone(base)[0]
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "s0"
+        R.save_stage0(body, base, d, {"best_epoch": 1})
+        meta_p = d / R.STAGE0_META
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        # giả lập: checkpoint ghi ở thế hệ TRƯỚC, backbone y hệt
+        gen = R.format_gen(R.FORMAT)
+        meta["format"] = f"rgexp.vextractor/{gen - 1}"
+        meta_p.write_text(json.dumps(meta), encoding="utf-8")
+        br = R.VExtractorBranch(base)
+        R.load_stage0_into(br, d)          # phải NẠP ĐƯỢC, không ném
+        # nhưng backbone KHÁC thì vẫn bị chặn
+        meta["backbone_spec"] = dict(meta["backbone_spec"], arch="khac_hoan_toan")
+        meta_p.write_text(json.dumps(meta), encoding="utf-8")
+        try:
+            R.load_stage0_into(R.VExtractorBranch(base), d)
+        except RuntimeError as e:
+            assert "backbone" in str(e) or "restage0" in str(e)
+        else:
+            raise AssertionError("backbone khác phải bị chặn")
+        # và bố cục /4 trở về trước (lưu cả SupervisedBlock) vẫn bị từ chối
+        meta["format"] = f"rgexp.vextractor/{R.STAGE0_MIN_GEN - 1}"
+        meta_p.write_text(json.dumps(meta), encoding="utf-8")
+        try:
+            R.load_stage0_into(R.VExtractorBranch(base), d)
+        except RuntimeError as e:
+            assert "restage0" in str(e)
+        else:
+            raise AssertionError("format quá cũ phải bị từ chối")
+    del torch
+
+
 print()
 if FAILS:
     print(f"✗ {len(FAILS)} kiểm tra HỎNG: {FAILS}")

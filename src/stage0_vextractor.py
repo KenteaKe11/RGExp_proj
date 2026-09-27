@@ -355,22 +355,53 @@ def finished(cfg: Cfg) -> dict | None:
             print(f"  ⚙ Stage 0 ở {d}: base/ còn khớp, chỉ `final_anneal` đổi — chạy "
                   f"lại epoch n+1", flush=True)
         else:
-            print(f"  ⚠ Stage 0 ở {d} chạy với cấu hình KHÁC (khối stage0/vextractor) — "
-                  f"cần chạy lại: `--restage0`", flush=True)
+            print(f"  ⚠ Stage 0 ở {d} chạy với cấu hình KHÁC — cần chạy lại: "
+                  f"`--restage0`.\n"
+                  f"    Vân tay Stage 0 gồm: khối `stage0` (trừ micro_batch / "
+                  f"probe_sizes), phần BACKBONE của khối `vextractor` "
+                  f"({', '.join(Z.BACKBONE_CFG_KEYS)}) và `seed`.\n"
+                  f"    KHÔNG gồm d_branch / n_query / head_dim / aligner / "
+                  f"main — đổi chúng là đổi Extractor+Aligner, và Stage 0 "
+                  f"không dựng những thứ ấy.", flush=True)
         return None
     return h
 
 
+def _backbone_cfg(cfg: Cfg) -> dict:
+    """Phần của khối `vextractor` mà Stage 0 THẬT SỰ phụ thuộc vào.
+
+    Stage 0 chỉ dựng backbone + một DINO head; Extractor và Aligner không có
+    mặt ở đây. Nên `d_branch`, `n_query`, `head_dim`, `dropout`, cả khối
+    `aligner` lẫn khối `main` KHÔNG được vào vân tay: đổi chúng mà bắt chạy lại
+    một lượt DINO nhiều giờ là bắt trả tiền cho một thứ không đổi một tensor
+    nào. Đó chính xác là điều `backbone_spec` đã nói, và là điều
+    `load_stage0_into` đã làm — hàm này tồn tại để cổng "có phải chạy lại
+    không" ĐỒNG Ý với cổng "nạp được không", thay vì nghiêm hơn nó.
+
+    Danh sách khoá đọc từ `vextractor.BACKBONE_CFG_KEYS` — MỘT nguồn sự thật.
+    `normalize` không có trong config (nó được hỏi từ `pretrained_cfg` của
+    `arch`), nên `arch` đã phủ nó.
+
+    `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
+    / `local_size`, và `vextractor.image_size` chỉ đi tới `assert_same_pixels`.
+    Trọng số backbone không phụ thuộc độ phân giải (xem `backbone_spec`).
+    """
+    rv = dict((dict(cfg.get("vextractor") or {})).get("vextractor") or {})
+    return {k: rv.get(k) for k in Z.BACKBONE_CFG_KEYS}
+
+
 def config_fingerprint(cfg: Cfg) -> str:
     """Vân tay của CẢ Stage 0 (base + anneal): khối stage0 (trừ khoá phần cứng)
-    + vextractor + seed. `micro_batch` và `probe_sizes` chỉ nói chuyện VRAM của máy
-    đang chạy, không đổi thí nghiệm, nên không vào vân tay."""
+    + phần BACKBONE của khối vextractor + seed. `micro_batch` và `probe_sizes`
+    chỉ nói chuyện VRAM của máy đang chạy, không đổi thí nghiệm, nên không vào
+    vân tay; `d_branch`/`n_query`/`head_dim`/`aligner`/`main` cũng không, vì
+    Stage 0 không dựng những thứ ấy (xem `_backbone_cfg`)."""
     s = {k: v for k, v in dict(cfg.get("stage0") or {}).items()
          if k not in ("micro_batch", "probe_sizes")}
     # KHÔNG còn khối `labels`: Stage 0 của /5 là tự giám sát và không đọc nhãn
     # nào, nên đổi `labels` (vốn giờ chỉ phục vụ Lens) không được bắt chạy lại
     # một lượt DINO.
-    return Z.spec_fingerprint({"stage0": s, "vextractor": dict(cfg.get("vextractor") or {}),
+    return Z.spec_fingerprint({"stage0": s, "vextractor": _backbone_cfg(cfg),
                                "seed": int(cfg.get("seed", 42))})
 
 
@@ -383,7 +414,7 @@ def base_fingerprint(cfg: Cfg) -> str:
     # KHÔNG còn khối `labels`: Stage 0 của /5 là tự giám sát và không đọc nhãn
     # nào, nên đổi `labels` (vốn giờ chỉ phục vụ Lens) không được bắt chạy lại
     # một lượt DINO.
-    return Z.spec_fingerprint({"stage0": s, "vextractor": dict(cfg.get("vextractor") or {}),
+    return Z.spec_fingerprint({"stage0": s, "vextractor": _backbone_cfg(cfg),
                                "seed": int(cfg.get("seed", 42))})
 
 

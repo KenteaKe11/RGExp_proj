@@ -126,6 +126,7 @@ import contextlib
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -133,6 +134,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .recombiner import RMSNorm
+
+# Khoá của khối `vextractor.vextractor` QUYẾT ĐỊNH trọng số backbone — tức là
+# quyết định chính những tensor Stage 0 huấn luyện và lưu ra. MỌI nơi hỏi "Stage
+# 0 có phải chạy lại không" phải đọc ĐÚNG danh sách này, không tự dựng lại một
+# danh sách riêng: `backbone_spec` dùng nó, và `stage0_vextractor.*_fingerprint`
+# cũng vậy. Hai danh sách trôi khỏi nhau là cách một lượt DINO nhiều giờ bị bắt
+# chạy lại vì một khoá không liên quan (xem docstring `backbone_spec`).
+BACKBONE_CFG_KEYS = ("arch", "pretrained", "n_layers", "n_stages")
+
+# Từ /5, checkpoint Stage 0 chỉ chứa TRỌNG SỐ BACKBONE. /4 trở về trước lưu cả
+# `SupervisedBlock` + Cls Head vào cùng file, nên tập tensor khác hẳn.
+STAGE0_MIN_GEN = 5
 
 STAGE0_FILE = "vextractor_stage0.safetensors"
 STAGE0_META = "vextractor_stage0.json"
@@ -892,8 +905,7 @@ def backbone_spec(spec: dict) -> dict:
     nạp lại checkpoint cũ là nạp trọng số của một backbone khác.
     """
     v = spec["vextractor"]
-    return {k: v[k] for k in ("arch", "pretrained", "n_layers", "n_stages",
-                              "normalize")}
+    return {k: v[k] for k in (*BACKBONE_CFG_KEYS, "normalize")}
 
 
 def spec_fingerprint(spec: dict) -> str:
@@ -1047,6 +1059,12 @@ def save_stage0(body: nn.Module, spec: dict, out_dir: Path, extra: dict) -> Path
     return out_dir / STAGE0_FILE
 
 
+def format_gen(s) -> int:
+    """`"rgexp.vextractor/8"` -> 8; -1 nếu không đọc được số thế hệ."""
+    m = re.search(r"/(\d+)$", str(s or ""))
+    return int(m.group(1)) if m else -1
+
+
 def stage0_exists(d: Path) -> bool:
     d = Path(d)
     return (d / STAGE0_FILE).exists() and (d / STAGE0_META).exists()
@@ -1056,19 +1074,31 @@ def load_stage0_into(branch: VExtractorBranch, d: Path) -> dict:
     """Nạp trọng số backbone từ checkpoint Stage 0 vào nhánh main.
 
     CHỈ so `backbone_spec`: Stage 0 không dựng Extractor lẫn Aligner, nên đổi
-    `d_branch`/`n_query`/`aligner`/`d_model` KHÔNG buộc chạy lại một lượt DINO.
-    Đổi `arch`/`n_layers`/chuẩn hoá thì có — và bị bắt ở đây.
+    `d_branch`/`n_query`/`head_dim`/`aligner`/`d_model` KHÔNG buộc chạy lại một
+    lượt DINO. Đổi `arch`/`n_layers`/`n_stages`/chuẩn hoá thì có — và bị bắt ở
+    đây.
+
+    **`format` KHÔNG bị đòi bằng đúng `FORMAT`, và đó là một sửa lỗi.** `FORMAT`
+    bump mỗi lần Extractor hoặc Aligner đổi bố cục — /7 -> /8 chẳng hạn chỉ đổi
+    `d_branch`, số learner và kiểu Aligner, backbone thì y nguyên. Đòi bằng
+    đúng `FORMAT` nghĩa là một checkpoint Stage 0 HOÀN TOÀN dùng được bị vứt đi
+    và người chạy phải trả lại vài giờ GPU cho một lượt DINO không đổi gì.
+    Thứ thật sự phải khớp là `backbone_spec` — và nó được so ngay dưới đây, rồi
+    `load_state_dict(strict=True)` bắt nốt mọi lệch khoá còn lại. `format` chỉ
+    còn canh một việc mà hai phép kia không canh được: checkpoint của /4 trở về
+    trước chứa CẢ `SupervisedBlock` + Cls Head, một tập tensor khác hẳn.
     """
     from safetensors.torch import load_file
 
     d = Path(d)
     meta = json.loads((d / STAGE0_META).read_text(encoding="utf-8"))
-    if meta.get("format") != FORMAT:
-        raise RuntimeError(f"{d / STAGE0_META}: format {meta.get('format')!r} ≠ "
-                           f"{FORMAT!r} — checkpoint của một bố cục nhánh cũ "
-                           f"(bản trước lưu CẢ Extractor + Cls Head vào file "
-                           f"này; /5 chỉ lưu backbone). Chạy lại Stage 0 "
-                           f"(`--restage0`).")
+    gen = format_gen(meta.get("format"))
+    if gen < STAGE0_MIN_GEN:
+        raise RuntimeError(f"{d / STAGE0_META}: format {meta.get('format')!r} là "
+                           f"bố cục /{gen if gen > 0 else '?'} — từ /"
+                           f"{STAGE0_MIN_GEN} checkpoint Stage 0 chỉ chứa trọng "
+                           f"số backbone, bản cũ lưu CẢ Extractor + Cls Head "
+                           f"vào file này. Chạy lại Stage 0 (`--restage0`).")
     sp_a = meta.get("backbone_spec") or backbone_spec(meta["spec"])
     sp_b = backbone_spec(branch.spec)
     if sp_a != sp_b:
