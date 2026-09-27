@@ -599,6 +599,25 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     branch.train()
     clip = float(tcfg.get("max_grad_norm", 1.0))
     log_every = max(1, int(tcfg.get("logging_steps", 10)))
+    # Lưu ĐỊNH KỲ. 200 bước ở đây là ~3 giờ, và trước bản này weight chỉ được
+    # ghi MỘT lần, sau cả vòng lặp lẫn lần val cuối — nên bất cứ thứ gì làm
+    # chết tiến trình ở bước 199 cũng xoá sạch 3 giờ. Đã xảy ra thật:
+    # `cudaErrorLaunchTimeout` trong `_run_eval` của bước cuối, khi 200 bước
+    # đã chạy xong và trọng số đã nằm trong RAM.
+    #
+    # Lỗi CUDA kiểu ấy giết luôn context, nên `try/except` quanh lần val KHÔNG
+    # cứu được: mọi lời gọi CUDA sau đó, kể cả `save_pretrained`, đều hỏng
+    # theo. Thứ duy nhất có tác dụng là đã có sẵn một bản trên ĐĨA.
+    save_every = int(tcfg.get("save_every_steps", 25) or 0)
+
+    def _save_weights(tag: str) -> None:
+        model.save_pretrained(str(out_dir), safe_serialization=True)
+        processor.save_pretrained(str(out_dir))
+        RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps": steps,
+                                          "trained": "extractor+aligner",
+                                          "saved_at": tag})
+        for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
+            shutil.copyfile(stage0_best / f, out_dir / f)
     first_loss = None
     step_ce = 0.0
     rel_last = 0.0
@@ -624,8 +643,12 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         opt.step()
         opt_b.step()
         sched.step()
-        if ev_on and ((step + 1) % ev["every_steps"] == 0 or step == steps - 1):
+        # Val ở bước CUỐI đã chuyển ra NGOÀI vòng lặp — nó là phép ĐO, và một
+        # phép đo không được đứng giữa "đã huấn luyện xong" và "đã ghi ra đĩa".
+        if ev_on and (step + 1) % ev["every_steps"] == 0 and step != steps - 1:
             _run_eval(len(val_curve), step + 1)
+        if save_every and (step + 1) % save_every == 0 and step != steps - 1:
+            _save_weights(f"step {step + 1}/{steps}")
         if first_loss is None:
             first_loss = step_ce
         if (step + 1) % log_every == 0 or step == steps - 1:
@@ -652,12 +675,13 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     peak = (torch.cuda.max_memory_allocated() / 1024 ** 3
             if torch.cuda.is_available() else 0.0)
 
-    model.save_pretrained(str(out_dir), safe_serialization=True)
-    processor.save_pretrained(str(out_dir))
-    RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps": steps,
-                                      "trained": "extractor+aligner"})
-    for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
-        shutil.copyfile(stage0_best / f, out_dir / f)
+    # LƯU TRƯỚC, ĐO SAU. Vòng lặp đã chạy hết `steps` bước tối ưu hoá, nên
+    # trọng số ở đây đã là trọng số CUỐI CÙNG — không có gì sau đây làm nó đổi
+    # nữa. Lần val cuối chỉ ghi thêm một điểm vào đường cong; để nó chạy trước
+    # lần ghi là đặt 3 giờ huấn luyện sau một phép đo 10 phút không sửa gì.
+    _save_weights(f"xong {steps}/{steps} bước, TRƯỚC lần val cuối")
+    if ev_on:
+        _run_eval(len(val_curve), steps)
 
     stats = {
         "arm_id": aid, "name": arm.get("name", aid),

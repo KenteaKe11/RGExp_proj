@@ -2,7 +2,7 @@
 
 Câu hỏi: lấy **đúng** candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-cùng loader, cùng 3000 ảnh test), rồi **nối thêm 16 vector** từ một **encoder
+cùng loader, cùng 3000 ảnh test), rồi **nối thêm 32 vector** từ một **encoder
 thị giác RIÊNG** — **Q = Aligner(Extractor(DINOv3-teacher(ảnh 448²)))** — ngay sau 256 token
 ảnh, thì
 chất lượng báo cáo X-quang có đổi không?
@@ -44,19 +44,25 @@ kiểm, `train` dừng nếu lệch).
                          │
                      Linear 512→2560 ─► RMSNorm(2560) ─────────────┐   (K, V)
                                                                      │
-   16 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┐    │
+   32 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┐    │
                │                                  │             │    │
                │                           RMSNorm(2560)        │    │
                │                                  │             │    │
-               │                            Cross-attn ◄────────┼────┘
-               │                                  │             │
-               └──────────── skip ──────────────►(+)◄───────────┘
-                                        │      (CẢ HAI skip đều TỪ learner)
-                                   Q_raw (16, 2560)   ← hết phần Extractor
+               │                      SwiGLU 2560→2048→2560     │    │
+               │                                  │             │    │
+               │                                 (+) ◄─ skip ─┐ │    │   (quanh MLP)
+               │                                  │           │ │    │
+               │                           RMSNorm(2560)      │ │    │
+               │                                  │           │ │    │
+               │                            Cross-attn ◄──────┼─┼────┘
+               │                                  │           │ │
+               └──────────── skip ──────────────►(+)◄─────────┴─┘
+                                        │   (skip NGOÀI CÙNG đều TỪ learner)
+                                   Q_raw (32, 2560)   ← hết phần Extractor
                                         │
                                   RMSNorm(2560)                      [Aligner]
                                         │
-                        SwiGLU 2560→2048→2560 ─► Q (16, 2560)
+                        SwiGLU 2560→2048→2560 ─► Q (32, 2560)
 
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
@@ -67,13 +73,19 @@ kiểm, `train` dừng nếu lệch).
 toàn. Khối vàng (Extractor + Aligner) **không có mặt ở Stage 0** — nó khởi tạo
 ngẫu nhiên và học cùng LoRA của decoder bằng CE.
 
-**`n_query` là khoá khai tường minh** (`vextractor.vextractor.n_query = 16`).
+**`n_query` là khoá khai tường minh** (`vextractor.vextractor.n_query = 32`).
 Lưới của backbone (**784 ô** ở 448², stride 16 sau khi cắt, không prefix token
-nào) là **nguồn để hỏi**, không phải khối Q: 16 learner vector đi hỏi nó
+nào) là **nguồn để hỏi**, không phải khối Q: 32 learner vector đi hỏi nó
 qua **Cross-attn** và nén lại. Self-attn chạy **trước** Cross-attn và trên
-**riêng** các learner — 32 câu hỏi thống nhất với nhau trước, rồi mới cùng đi
-đọc ảnh. **Hai residual**, đúng hai dấu `+` trong hình: một quanh MLP (cộng đầu
-ra Self-attn), một quanh cả khối (cộng **thẳng** learner).
+**riêng** các learner — 32 câu hỏi thống nhất với nhau trước, rồi qua một
+**MLP** (SwiGLU 2560→2048→2560, residual vòng quanh **riêng** nó) trước khi
+cùng đi đọc ảnh. **Ba residual**, đúng ba dấu `+` trong hình: hai cái ngoài
+cùng cộng **thẳng** learner, cái ở giữa vòng quanh riêng MLP.
+
+**HAI khối SwiGLU, hai khoá khai riêng.** `vextractor.vextractor.mlp_hidden`
+(2048) là bề rộng MLP **giữa hai attention**; `vextractor.aligner.mlp_hidden`
+(2048) là bề rộng FFN **sau residual thứ ba**. Cả hai đều 2048 < `d_branch`
+2560 — nút **thắt** có chủ ý, ngược với FFN của decoder vốn nở ra ở giữa.
 
 **Backbone: DINOv3 ConvNeXt-B, cắt sau stage 3**
 (`convnext_base.dinov3_lvd1689m`, `n_stages: 3`). `lvd1689m` là bộ pretrain
@@ -143,11 +155,12 @@ mỗi lần ai đó sửa `d_branch`, và `d_branch` đã đổi **ba lần** t�
 cái phụ thuộc; `d_branch` không chia hết `head_dim` thì **dừng**, không làm
 tròn. Khai `vextractor.n_heads` trong config bị **từ chối ồn ào**.
 
-**Hai residual, và CẢ HAI đều từ `learner`** — đúng hai mũi tên đi thẳng từ khối
-"16 Learners" trong sơ đồ: `h = q0 + Self-attn(RMSNorm(q0))`, rồi
-`Q_raw = q0 + Cross-attn(RMSNorm(h), kv)`. Ở /7 residual thứ nhất vòng quanh MLP
-(`s + mlp(s)`), tức là nó KHÔNG quay về learner; selftest so thẳng hai công thức
-nên nhầm lẫn giữa chúng không lọt được.
+**Ba residual, và hai cái NGOÀI CÙNG đều từ `learner`** — đúng hai mũi tên đi
+thẳng từ khối "32 Learners" trong sơ đồ: `h = q0 + Self-attn(RMSNorm(q0))`,
+`h = h + SwiGLU(RMSNorm(h))`, rồi `Q_raw = q0 + Cross-attn(RMSNorm(h), kv)`.
+Dấu `+` ở giữa vòng quanh **riêng** MLP. Ở /7 residual thứ nhất cũng vòng quanh
+MLP, tức là nó KHÔNG quay về learner; selftest so thẳng cả ba công thức nên
+nhầm lẫn giữa chúng không lọt được.
 
 **Hai khoá vẫn RIÊNG dù giá trị trùng nhau.** `d_model` đọc từ `AutoConfig` của
 decoder, `d_branch` khai trong config, và `build_aligner` vẫn nối chúng — nên
@@ -156,21 +169,21 @@ không dùng cả hai.
 
 > **⚠ Giá của việc chạy ở 2560.** Mỗi khối attention là 4 × 2560² = **26,2 M**
 > tham số (ở 768 chỉ 2,36 M), nên riêng Self + Cross đã **52,4 M** và phần học
-> được của nhánh phình lên **~3×** so với /7 (23,49 → 69,52 M). Backbone và
+> được của nhánh phình lên **~3,6×** so với /7 (23,49 → 85,29 M). Backbone và
 > Stage 0 **không đổi gì**. Hết VRAM ở main stage thì đây là chỗ nhìn trước,
 > không phải `train.max_seq_len`.
 
 **Aligner là một MLP thuần**, không norm / attention / residual: phần "suy nghĩ"
 đã nằm trọn trong Extractor, và **cả hai đều do main stage dạy**, nên không còn
 lý do nhân đôi attention. Ở /8 nó **không còn đổi chiều** (việc ấy xong ở
-`Linear 512→2560`), nên vai trò còn lại là **trộn lại 16 vector sau khi chúng đã
+`Linear 512→2560`), nên vai trò còn lại là **trộn lại 32 vector sau khi chúng đã
 đọc xong ảnh**: **RMSNorm(2560) rồi một khối SwiGLU 2560→2048→2560**
 (`down(SiLU(gate(x)) ⊙ up(x))`, `bias=False` cả ba theo quy ước Gemma 3 / LLaMA).
 
 **`mlp_hidden` 2048 < `d_branch` 2560 — một nút THẮT, có chủ ý.** Mọi FFN của
 decoder nở **ra** ở giữa (Gemma 3: 2560 → 10240); khối này làm ngược lại, ép
 2560 chiều qua 2048 rồi mở lại, nên nó **không thể chép nguyên** đầu vào sang
-đầu ra — 16 vector buộc phải bỏ bớt thứ gì đó. Muốn nó là một FFN "bình thường"
+đầu ra — 32 vector buộc phải bỏ bớt thứ gì đó. Muốn nó là một FFN "bình thường"
 thì đặt `aligner.mlp_hidden` > 2560; cả hai đều chạy, nhưng hỏi hai câu khác
 nhau.
 
@@ -226,37 +239,40 @@ trên một mẫu thật mỗi lần chạy.
 |---|---|
 | **backbone** DINOv3 ConvNeXt-B **3 stage** @448 → `(512,28,28)` → lưới 784 × 512 | **60,12 M** — *Stage 0 dạy; main stage dùng bản TEACHER (EMA), teacher inference* |
 | `Linear 512→2560` | 1,31 M |
-| 16 learner @2560 | 41,0 K |
+| 32 learner @2560 | 81,9 K |
 | Self-attn @2560 | **26,21 M** |
+| `SwiGLU 2560→2048→2560` (giữa hai attention) | **15,73 M** |
 | Cross-attn @2560 | **26,21 M** |
-| 3 × RMSNorm(2560) | 7,7 K |
-| **Extractor** (ngoài backbone) → Q_raw (16, 2560) | **53,79 M** — *main stage dạy* |
-| **Aligner** `RMSNorm(2560)` + `SwiGLU 2560→2048→2560` → Q (16, 2560) | **15,73 M** — *main stage dạy* |
-| **nhánh ở main stage** | **129,65 M**, trong đó **học được 69,52 M** |
+| 4 × RMSNorm(2560) | 10,2 K |
+| **Extractor** (ngoài backbone) → Q_raw (32, 2560) | **69,56 M** — *main stage dạy* |
+| **Aligner** `RMSNorm(2560)` + `SwiGLU 2560→2048→2560` → Q (32, 2560) | **15,73 M** — *main stage dạy* |
+| **nhánh ở main stage** | **145,42 M**, trong đó **học được 85,29 M** |
 | DINO head (CHỈ Stage 0, bị bỏ sau đó) | 6,82 M |
 | **Stage 0**: student (backbone + head) | **66,95 M** *(+ teacher EMA 66,95 M nữa trong VRAM)* |
 
 > **Bốn bố cục, để thấy cái gì đổi theo cái gì.**
 >
-> | | /5 ViT-S+/16 | /6 ConvNeXt-S | /7 ConvNeXt-B 3st | **/8 ConvNeXt-B 3st** |
+> | | /6 ConvNeXt-S | /7 ConvNeXt-B 3st | /8 ConvNeXt-B 3st | **/9 ConvNeXt-B 3st** |
 > |---|---|---|---|---|
-> | lưới @448 | 784 × 384 | 196 × 768 | 784 × 512 | **784 × 512** |
-> | backbone | 28,68 M | 49,45 M | 60,12 M | **60,12 M** |
-> | `n_query` | 32 | 32 | 32 | **16** |
-> | `d_branch` | 768 | 1024 | 768 | **2560** (= d_model) |
-> | Extractor | 6,62 M | 11,57 M | 6,71 M | **53,79 M** |
-> | Aligner | 3,84 M | 7,34 M | 16,78 M | **15,73 M** |
-> | nhánh (học được) | 39,14 M (10,45 M) | 68,37 M (18,92 M) | 83,61 M (23,49 M) | **129,65 M (69,52 M)** |
+> | lưới @448 | 196 × 768 | 784 × 512 | 784 × 512 | **784 × 512** |
+> | backbone | 49,45 M | 60,12 M | 60,12 M | **60,12 M** |
+> | `n_query` | 32 | 32 | 16 | **32** |
+> | `d_branch` | 1024 | 768 | 2560 | **2560** (= d_model) |
+> | MLP giữa hai attn | MLP(GeLU) | MLP(GeLU) | *không có* | **SwiGLU 2048** |
+> | Extractor | 11,57 M | 6,71 M | 53,79 M | **69,56 M** |
+> | Aligner | 7,34 M | 16,78 M | 15,73 M | **15,73 M** |
+> | nhánh (học được) | 68,37 M (18,92 M) | 83,61 M (23,49 M) | 129,65 M (69,52 M) | **145,42 M (85,29 M)** |
 >
-> Backbone đứng yên từ /7; **toàn bộ chênh lệch /7 → /8 nằm ở Extractor**, và
+> Backbone đứng yên từ /7; **toàn bộ chênh lệch /7 → /9 nằm ở Extractor**, và
 > nó đến từ đúng một quyết định: chạy thân ở 2560 thay vì 768. Attention tỉ lệ
-> với d², nên 2,36 M → 26,21 M mỗi khối, và 6,71 M → **53,79 M** cho cả
-> Extractor. Số learner giảm một nửa (32 → 16) **không** bù lại được: learner
-> chỉ là 41 K, còn chi phí nằm ở ma trận chiếu vốn không phụ thuộc `n_query`.
+> với d², nên 2,36 M → 26,21 M mỗi khối; /8 đã lên **53,79 M**, và /9 thêm
+> **15,73 M** nữa cho MLP giữa hai attention → **69,56 M**. `n_query` gần như
+> không đổi gì trong bảng này: 32 learner chỉ là **82 K**, còn chi phí nằm ở
+> ma trận chiếu vốn không phụ thuộc `n_query`.
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
-Đặt Q trước Z thì 16 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
+Đặt Q trước Z thì 32 vector ấy chỉ nhìn thấy BOS + câu lệnh hệ thống. Chỗ nối
 lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) và
 `recombiner.image_end_indices(ids) + 1` (khâu sinh, đệm trái — mỗi hàng một chỗ).
 
@@ -390,7 +406,7 @@ trên 256 mẫu bốc lại mỗi 25 bước). Phần thêm:
   trong optimizer**. Không còn `freeze_vext_epochs`, không còn bước mở
   băng — 0 bước cập nhật, 0 gradient.
 * Nhánh có đúng **một** nhóm tham số học được: **Extractor + Aligner** (cả hai
-  khởi tạo ngẫu nhiên ở đây — Stage 0 không dựng chúng; **69,52 M** ở /8), wd 0.01, lr
+  khởi tạo ngẫu nhiên ở đây — Stage 0 không dựng chúng; **85,29 M** ở /9), wd 0.01, lr
   **warm-up tuyến tính theo bước** từ `align_warmup_start_lr` = 1e-8 lên
   `align_lr` = 1e-5 trong `align_warmup_steps` = **20/200 bước**, rồi **phẳng**
   tới bước cuối — không anneal. Nội suy trên *giá trị* lr (cùng quy ước với
@@ -459,7 +475,7 @@ nên chỉ tốn một lượt backward (Jacobian đầy đủ 2560 × số vị
 nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 
 1. **[Language] Độ nhạy token × lớp** — `S[ℓ,t] = ‖∂y/∂h_(ℓ,t)‖₂`, **MỘT dải
-   ngang ba ô** (`lens_layers.png`): **Z** (256 token ảnh) · **Q** (16 learner,
+   ngang ba ô** (`lens_layers.png`): **Z** (256 token ảnh) · **Q** (32 learner,
    đánh dấu **từng `Q[k]`**) · **T** (phần văn bản). Trục
    **Y là vị trí token** với **chỉ số thật trong chuỗi** (đọc từ trên xuống),
    trục **X là lớp** với chỉ số thật, trên **đủ mọi lớp** (34/34). Kèm bảng 5 ô
@@ -500,7 +516,7 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 3. **[Visual] Bốn ô trên MỘT dải ngang — ảnh gốc · Z · khối Q · đầu ra
    DINOv3**, cả ba bản đồ chồng lên ảnh gốc: (1) **ảnh gốc**; (2) **Z**,
    `‖∂y/∂X‖` qua `y → Z → adapter → vision encoder`, **dừng ở đầu ra encoder**,
-   lưới 64²; (3) **khối Q**, `‖∂‖Q‖²/∂I‖` — target là **chính 16 High-Q
+   lưới 64²; (3) **khối Q**, `‖∂‖Q‖²/∂I‖` — target là **chính 32 High-Q
    token**, truy ngược `Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` về
    tận pixel của ảnh 448²; (4) **đầu ra DINOv3**, `‖feature‖₂` của lưới teacher
    (28²) — backbone đang **mã hoá gì**, trước khi Extractor hỏi nó.
@@ -539,7 +555,7 @@ nổi; một hàng của nó đã trả lời "đổi ở đâu thì y đổi").
 
 Mục "Kiểm nhanh" đầu tài liệu cho mấy con số phải liếc trước khi tin hình: phần
 độ nhạy nằm trên Z, phần nằm trên **khối Q**, **số vector Q gánh 50% độ nhạy**
-(nhỏ = chỉ vài trong 16 vector làm việc, cực đoan là một mình `Q[0]` gánh hết),
+(nhỏ = chỉ vài trong 32 vector làm việc, cực đoan là một mình `Q[0]` gánh hết),
 hai dòng về **bản đồ Q** — max/mean và 10% vùng nóng nhất gánh bao nhiêu (nó còn
 phân biệt được vùng nào trên ảnh này không) — rồi `‖bản đồ Q‖ / ‖bản đồ Z‖`,
 tương quan và IoU giữa hai bản đồ. Ba dòng cuối so **hai đại lượng khác nhau**
@@ -667,9 +683,9 @@ scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → main B → sinh → chấm) · stats · lens · push
 src/vextractor.py        backbone (DINOv3 ConvNeXt-B cắt sau stage 3 qua
                          `n_stages`; ladder dựng model có probe forward thật;
-                         NCHW/NHWC/NLC) + Extractor (Linear 512→2560 + 16
-                         learner + Self/Cross-attn @2560, HAI residual đều từ
-                         learner) + Aligner (RMSNorm + SwiGLU 2560→2048→2560,
+                         NCHW/NHWC/NLC) + Extractor (Linear 512→2560 + 32
+                         learner + Self/Cross-attn @2560 + SwiGLU 2048 ở giữa,
+                         BA residual, hai cái ngoài cùng từ learner) + Aligner (RMSNorm + SwiGLU 2560→2048→2560,
                          init 1/√fan_in) · vext_tensor · ghi/nạp checkpoint
 src/dino.py              DINO: multi-crop (PIL), DINO head, teacher EMA, center,
                          lịch τ_t / momentum

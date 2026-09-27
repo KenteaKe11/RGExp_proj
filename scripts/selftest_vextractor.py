@@ -92,7 +92,12 @@ def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_branch=None)
                                          "arch": SMALL_ARCH, "pretrained": False,
                                          "n_layers": SMALL_NL, "n_query": n_query,
                                          "d_branch": int(d_branch or SMALL_DB),
-                                         "head_dim": 4},
+                                         "head_dim": 4,
+                                         # KHÁC aligner.mlp_hidden (64) một
+                                         # cách CỐ Ý: hai khối SwiGLU ở hai chỗ
+                                         # khác nhau, và một bản đọc nhầm khoá
+                                         # chỉ lộ ra khi hai số khác nhau.
+                                         "mlp_hidden": 24},
                           "aligner": {"mlp_hidden": 64}}}
     return R.spec_from_cfg(cfg, d_model)
 
@@ -113,7 +118,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. Extractor @d_branch (HAI residual, cả hai TỪ learner) -> Aligner (RMSNorm + SwiGLU)")
+@check("2. Extractor @d_branch (BA residual: hai TỪ learner, một quanh MLP) -> Aligner (RMSNorm + SwiGLU)")
 def _():
     import math
 
@@ -166,7 +171,7 @@ def _():
         else:
             raise AssertionError(f"n_layers = {bad} phải bị từ chối")
     # đường đi đúng hình: Linear d_feat→d_branch, thân chạy THẲNG ở d_branch,
-    # và Extractor KHÔNG còn MLP nào (từ /8 nó nằm trong Aligner)
+    # và GIỮA hai attention có MỘT khối SwiGLU (từ /9), khai bằng khoá RIÊNG
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == SMALL_DB
     assert vx.sattn.d == vx.xattn.d == vx.d_branch == SMALL_DB
     # MỌI attention cùng MỘT head_dim, và nó là khoá KHAI — số head suy ra
@@ -181,18 +186,32 @@ def _():
     else:
         raise AssertionError("d_branch không chia hết head_dim phải bị từ chối")
     assert tuple(vx.learner.shape) == (1, SMALL_Q, SMALL_DB)
-    assert not hasattr(vx, "mlp"), "Extractor /8 không có MLP"
-    # HAI residual, và CẢ HAI đều từ learner — đúng hai mũi tên trong hình.
+    # MLP giữa hai attention: khoá KHAI riêng, KHÔNG dùng chung với Aligner
+    assert vx.mlp_hidden == 24 != br.aligner.mlp_hidden
+    assert isinstance(vx.mlp, R.SwiGLU)
+    for lin, i, o in ((vx.mlp.gate, SMALL_DB, 24), (vx.mlp.up, SMALL_DB, 24),
+                      (vx.mlp.down, 24, SMALL_DB)):
+        assert (lin.in_features, lin.out_features) == (i, o)
+        assert lin.bias is None                  # quy ước Gemma 3 / LLaMA
+        # `_init` KHÔNG được đè normal(0, 0.02) lên khối có CỔNG
+        want_std = 1.0 / math.sqrt(lin.in_features)
+        assert abs(float(lin.weight.std()) - want_std) / want_std < 0.25
+    # BA residual: hai cái NGOÀI CÙNG từ learner, cái GIỮA quanh riêng MLP.
     with torch.no_grad():
         kv = vx.inp_norm(vx.inp(vx.patches(x)))
         q0 = vx.learner.expand(2, -1, -1)
-        h = q0 + vx.sattn(vx.q_norm(q0))
-        want = q0 + vx.xattn(vx.x_norm(h), kv)
+        h1 = q0 + vx.sattn(vx.q_norm(q0))
+        h2 = h1 + vx.mlp(vx.m_norm(h1))
+        want = q0 + vx.xattn(vx.x_norm(h2), kv)
         assert torch.allclose(vx(x), want, atol=1e-6)
-        # và KHÁC hẳn bố cục /7 (`s + mlp(s)`): nếu ai đó lỡ trả residual thứ
-        # nhất về đầu ra Self-attn thì phép so này bắt được.
+        # residual thứ nhất về LEARNER, không phải về đầu ra Self-attn
         s_only = vx.sattn(vx.q_norm(q0))
-        assert not torch.allclose(h, s_only, atol=1e-6)
+        assert not torch.allclose(h1, s_only, atol=1e-6)
+        # residual GIỮA vòng quanh RIÊNG MLP — KHÔNG quay về learner. Nếu ai đó
+        # viết `q0 + mlp(...)` thì phép so này bắt được.
+        assert not torch.allclose(h2, q0 + vx.mlp(vx.m_norm(h1)), atol=1e-6)
+        # và MLP thật sự đổi thứ gì đó (không phải một khối chết)
+        assert not torch.allclose(h2, h1, atol=1e-6)
     # Aligner = RMSNorm + SwiGLU: không attention, không residual
     al = br.aligner
     assert not hasattr(al, "sattn") and not hasattr(al, "mlp")
@@ -1078,7 +1097,10 @@ def _():
     assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
     assert rv["pretrained"] is True
     # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 16 != (int(rv["image_size"]) // 16) ** 2
+    assert int(rv["n_query"]) == 32 != (int(rv["image_size"]) // 16) ** 2
+    # HAI khoá mlp_hidden, KHÔNG dùng chung: MLP giữa hai attention và FFN
+    # của Aligner là hai khối khác nhau.
+    assert int(rv["mlp_hidden"]) == 2048 == int(sp14["aligner"]["mlp_hidden"])
     # Từ /8 Extractor chạy ở d_branch = d_model = 2560: head_dim 128
     assert int(rv["d_branch"]) == 2560
     # `head_dim` là khoá KHAI, `n_heads` SUY RA — khai n_heads bị TỪ CHỐI.
@@ -1814,7 +1836,8 @@ def _():
                      "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
                      "Kiểm nhanh trước khi tin hình", "Đọc ba ô thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "KHÔNG dính decoder", "teacher", "16 High-Q token",
+                     "KHÔNG dính decoder", "teacher",
+                     f"{cfg['vextractor']['vextractor']['n_query']} High-Q token",
                      "Q → Aligner → Extractor → teacher (ConvNeXt-B) → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
@@ -1941,6 +1964,11 @@ def _():
         (f"SwiGLU {al.d_branch}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
         (f"`head_dim` = {vx.head_dim}", "head_dim khai"),
         (f"{vx.n_query} learner", "n_query"),
+        # HAI khối SwiGLU, HAI khoá — README phải nói cả hai, nếu không người
+        # đọc tưởng `aligner.mlp_hidden` điều khiển cả khối giữa hai attention.
+        ("`vextractor.vextractor.mlp_hidden`", "mlp_hidden của Extractor"),
+        ("`vextractor.aligner.mlp_hidden`", "mlp_hidden của Aligner"),
+        (f"SwiGLU {vx.d_branch}→{vx.mlp_hidden}→{vx.d_branch}", "MLP giữa hai attn"),
         (f"{vx.n_patch} ô", "lưới"),
         (m(n(vx.body)), "tham số backbone"),
         (m(sum(q.numel() for q in vx.head_parameters())), "tham số Extractor"),
@@ -1959,9 +1987,10 @@ def _():
     # để biết nhánh làm gì, và chúng trôi y hệt. (Bảng so sánh lịch sử được
     # phép nhắc bố cục cũ, nên chỉ soi những chuỗi chỉ xuất hiện khi ai đó
     # quên cập nhật — `n_query` cũ, kiểu Aligner cũ, tên file hình cũ.)
-    stale = [f"{k} learner" for k in (32, 64) if k != vx.n_query]
-    stale += [f"{k} vector Q" for k in (32, 64) if k != vx.n_query]
-    stale += ["32 High-Q token", "`d_branch` = 768", "SwiGLU 768→4096→2560",
+    stale = [f"{k} learner" for k in (16, 32, 64) if k != vx.n_query]
+    stale += [f"{k} vector Q" for k in (16, 32, 64) if k != vx.n_query]
+    stale += [f"{k} High-Q token" for k in (16, 32, 64) if k != vx.n_query]
+    stale += ["`d_branch` = 768", "SwiGLU 768→4096→2560",
               "MLP(GeLU) 2560→3072→2560", "lens_layers_z.png"]
     surfaces = {
         "README.md": rd,

@@ -537,7 +537,7 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> dict:
         ax.set_xlabel("lớp decoder (chỉ số thật)", fontsize=8)
 
         # Nhãn Y = chỉ số token THẬT. Vùng nhỏ (Q) đánh dấu TỪNG token và ghi
-        # kèm Q[k] — 16 learner là thứ đáng đọc từng cái một.
+        # kèm Q[k] — mỗi learner là một thứ đáng đọc từng cái một.
         if n <= 48:
             yt = list(range(n))
             ylab = [(f"{rows[k]} · Q[{rows[k] - reg['base']}]" if reg["base"] is not None
@@ -588,7 +588,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     2. **Z**: ‖∂y/∂X‖ theo đường `y → Z → adapter → vision encoder` — đường CŨ,
        đo xem decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Dừng ở
        ĐẦU RA encoder, lưới 64².
-    3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính 16 High-Q
+    3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
        token, truy ngược `Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` về
        tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
     4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (28×28 ở cấu hình hiện
@@ -600,7 +600,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     ở đó, KHÔNG nghĩa là đổi vùng ấy thì Q đổi theo. Đừng đọc ô 4 như ô 3.
 
     Cặp đáng đọc nhất là **ô 4 so ô 3**: backbone mã hoá cả ảnh, còn Extractor
-    chỉ hỏi một phần — chênh lệch giữa hai ô là *phần backbone có mà 16 learner
+    chỉ hỏi một phần — chênh lệch giữa hai ô là *phần backbone có mà learner
     không lấy*. Cặp **ô 2 so ô 3** trả lời câu khác: "Q được dựng từ đúng vùng
     decoder vốn đã đòi qua Z không".
 
@@ -1002,6 +1002,9 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "cuối, nơi mọi đường đã trộn vào nhau. Câu \"Q có được đọc không\" trả lời ở "
           "ba hình ở mục 1, không phải ở đây.\n"]
 
+    # Số learner đọc TỪ config, không gõ tay: nó đã đổi 32 -> 16 -> 32 qua
+    # ba bố cục, và mỗi lần một con số chép tay ở đây lại tả sai hình.
+    nq = int(cfg["vextractor"]["vextractor"]["n_query"])
     L.append("## 3. [Visual] Bốn ô — ảnh gốc · Z · khối Q · đầu ra DINOv3\n")
     if figs.get("visual"):
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
@@ -1013,9 +1016,9 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "| 2 | **gradient** `‖∂y/∂X‖` qua `y → Z → adapter → vision encoder` · lưới 64² | "
           "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
           "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
-          "| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính 16 High-Q token**, truy ngược "
+          f"| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính {nq} High-Q token**, truy ngược "
           "`Q → Aligner → Extractor → teacher (ConvNeXt-B) → I` · lưới 448² | "
-          "16 vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
+          f"{nq} vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
           "| 4 | **ĐỘ LỚN** `‖feature‖₂` của lưới teacher · lưới 28² | "
           "backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó |",
           "",
@@ -1025,7 +1028,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đại lượng.\n",
           "**Cặp đáng đọc nhất là ô 4 so ô 3.** Backbone mã hoá cả ảnh, còn "
           "Extractor chỉ hỏi một phần: chênh lệch giữa hai ô chính là *phần "
-          "backbone có mà 16 learner không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
+          f"backbone có mà {nq} learner không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
           "thông tin bị bỏ lại; trùng khít = Extractor lấy gần hết những gì "
           "backbone nhấn mạnh.\n",
           "**Ô 3 lấy target là khối Q, KHÔNG phải `y`.** Đó là khác biệt với "

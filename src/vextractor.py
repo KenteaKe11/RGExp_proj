@@ -8,7 +8,7 @@ Sơ đồ (đúng hình "Extractor + Aligner"):
                                           │        ─► (512, 28, 28)
                               Flatten + Permute ─► (784, 512)
                                           │
-                                Linear 512→2560              16 Learners ─┐
+                                Linear 512→2560              32 Learners ─┐
                                           │                        │       │
                                   RMSNorm(2560)             RMSNorm(2560)   │
                                           │                        │       │
@@ -17,7 +17,13 @@ Sơ đồ (đúng hình "Extractor + Aligner"):
                                           │                       (+) ◄────┤
                                           │                        │       │
                                           │                 RMSNorm(2560)  │
-                                          └────► Cross-attn ◄───────┘       │
+                                          │                        │       │
+                                          │             SwiGLU 2560→2048   │
+                                          │                        │       │
+                                          │                       (+)      │
+                                          │                        │       │
+                                          │                 RMSNorm(2560)  │
+                                          └────► Cross-attn ◄───────┘      │
                                                       │                    │
                                                      (+) ◄─────────────────┘
                                                       │
@@ -25,7 +31,7 @@ Sơ đồ (đúng hình "Extractor + Aligner"):
                                                       │
                                           SwiGLU 2560→2048→2560
                                                       │
-                                                 Q (16, 2560)
+                                                 Q (32, 2560)
                                                       │
            [Z ‖ Q ‖ T] ─► Gemma Decoder (QLoRA r32) ─► CE
 
@@ -40,7 +46,7 @@ Sơ đồ (đúng hình "Extractor + Aligner"):
     khỏi Stage 0. Epoch được chọn theo LOSS TỰ GIÁM SÁT trên một tập val cố định.
   * **Main stage — DECODER FT.** Backbone chạy ở chế độ **TEACHER INFERENCE**
     (trọng số teacher của Stage 0, eval + no_grad, đóng băng hoàn toàn), còn TẤT CẢ
-    phần còn lại (Linear vào, 16 learner, Self/Cross-attn, và Aligner) được
+    phần còn lại (Linear vào, 32 learner, Self/Cross-attn, MLP, và Aligner) được
     huấn luyện CÙNG LoRA của decoder bằng CE. Đây là khác biệt lớn nhất so
     với bản trước: ở đó Stage 0 dạy cả Extractor còn main stage chỉ dạy Aligner;
     ở đây Stage 0 chỉ dạy ENCODER, còn cả Extractor lẫn Aligner là của main stage.
@@ -77,27 +83,27 @@ Các điểm khác giữ nguyên:
   * câu hỏi của §2.2: "một encoder KHÁC, KHÔNG học từ web-image–text, có mang
     vào thứ SigLIP không có không";
   * lưới của backbone (784 ô ở 448², stride 16 sau khi cắt) KHÔNG phải khối Q:
-    16 learner vector đi HỎI nó qua Cross-attn và nén lại. `n_query` là khoá khai tường
+    32 learner vector đi HỎI nó qua Cross-attn và nén lại. `n_query` là khoá khai tường
     minh, độc lập với `image_size` và với backbone;
-  * Self-attn chạy TRƯỚC Cross-attn và trên RIÊNG các learner. HAI residual,
-    đúng hai dấu `+` trong hình: một quanh MLP (cộng đầu ra Self-attn), một
-    quanh cả khối (cộng THẲNG learner);
+  * Self-attn chạy TRƯỚC Cross-attn và trên RIÊNG các learner, và GIỮA hai
+    attention là một MLP. BA dấu `+` trong hình: hai cái ngoài cùng cộng THẲNG
+    learner, cái ở giữa vòng quanh riêng MLP;
   * **mọi attention của nhánh chạy ở `head_dim` = 128, và đó là khoá KHAI.**
     Số head được SUY RA (`n_heads = d_branch // head_dim` = 20 ở 2560). Chiều
     ngược lại — khai `n_heads` rồi để `head_dim` rơi ra — là cách head_dim đổi
     lặng lẽ mỗi lần ai đó sửa `d_branch`, và `d_branch` đã đổi ba lần từ /5 tới
-    /8 (768 → 1024 → 768 → 2560). Khai `n_heads` trong config bị TỪ CHỐI;
+    /9 (768 → 1024 → 768 → 2560). Khai `n_heads` trong config bị TỪ CHỐI;
 
   * **thân khối chạy THẲNG ở `d_branch` = `d_model` = 2560**: `Linear 512 →
     2560` ngay sau backbone đã đổi chiều, nên KHÔNG còn chỗ nào "nở ra" ở cuối.
     `Aligner` vì thế là một FFN thuần — RMSNorm(2560) rồi SwiGLU
-    2560→2048→2560 — đứng sau residual thứ hai, chứ không phải chỗ đổi chiều
+    2560→2048→2560 — đứng sau residual thứ BA, chứ không phải chỗ đổi chiều
     như /5–/7. `mlp_hidden` 2048 < 2560 là một nút THẮT có chủ ý: khối này ép
     chiều lại chứ không nở ra như FFN của decoder. RMSNorm ở đó là BẮT BUỘC,
     không phải trang trí — SwiGLU có cổng nhân, và một cổng nhân ăn đầu vào nhỏ
     thì bình phương cái nhỏ ấy (xem docstring `Aligner`);
-  * **HAI residual, cả hai đều TỪ learner** — đúng hai mũi tên đi thẳng từ khối
-    "16 Learners" trong hình. Ở /7 residual thứ nhất vòng quanh MLP; ở /8 nó
+  * **HAI trong BA residual đều TỪ learner** — đúng hai mũi tên đi thẳng từ
+    khối "32 Learners" trong hình; dấu `+` còn lại vòng quanh riêng MLP. Ở /7 nó
     quay về learner, và MLP chuyển hẳn sang Aligner; Không norm, không attention,
     không residual — nó làm đúng một việc là đưa Q_raw về không gian embedding
     của decoder;
@@ -159,16 +165,29 @@ BRANCH_META = "vextractor_branch.json"
 # dùng 0.5/0.5 — hard-code một cặp số ở đây là sai lặng lẽ khi đổi họ.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+# /9 = /8 với backbone y NGUYÊN và Stage 0 y nguyên (vân tay Stage 0 chỉ phụ
+# thuộc BACKBONE — xem `backbone_spec`), Extractor đổi HAI chỗ:
+#
+#   * `n_query` 16 -> **32** learner;
+#   * MLP QUAY LẠI giữa Self-attn và Cross-attn, lần này là **SwiGLU
+#     2560→2048→2560** sau RMSNorm(2560), residual vòng quanh RIÊNG nó
+#     (`h + mlp(norm(h))`). `Aligner` giữ nguyên khối SwiGLU của nó, nên /9 có
+#     HAI khối SwiGLU ở hai chỗ khác nhau và HAI khoá khai riêng:
+#     `vextractor.mlp_hidden` và `aligner.mlp_hidden`.
+#
+# Checkpoint /8 nạp vào /9 lệch cả shape `learner` (16 -> 32) lẫn khoá (`mlp.*`
+# mới), nên ranh giới lại đặt ở format.
+#
 # /8 = /7 với backbone y NGUYÊN (DINOv3 ConvNeXt-B cắt sau stage 3: 512 kênh,
 # stride 16, NCHW, không cls token) và Stage 0 y nguyên, nhưng Extractor +
 # Aligner đổi hẳn:
 #
 #   * `d_branch` 768 -> **2560 = d_model**. `Linear 512 → 2560` ngay sau
 #     backbone đã đổi chiều, nên KHÔNG còn chỗ nào "nở ra" ở cuối;
-#   * `n_query` 32 -> **16** learner;
+#   * `n_query` 32 -> 16 learner (/9 đưa về lại 32);
 #   * `head_dim` (128) thành khoá KHAI, `n_heads` được suy ra và khai nó bị
 #     TỪ CHỐI;
-#   * HAI residual giờ đều TỪ learner (`q0 + sattn(...)`, rồi `q0 + xattn(...)`);
+#   * hai residual ngoài cùng đều TỪ learner (`q0 + sattn(...)`, `q0 + xattn(...)`);
 #     ở /7 residual thứ nhất vòng quanh MLP;
 #   * MLP rời khỏi giữa hai attention, sang `Aligner`, thành FFN thuần
 #     **SwiGLU 2560→2048→2560** sau RMSNorm(2560). `mlp_hidden` (2048) NHỎ HƠN
@@ -194,7 +213,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 #      nhiên. Nên ranh giới được đặt ở format, chứ không ở shape.
 #
 # /6, /5, /4, /3, /2, /1 đều bị từ chối ồn ào.
-FORMAT = "rgexp.vextractor/8"
+FORMAT = "rgexp.vextractor/9"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -481,19 +500,55 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     return net, d_feat, n_patch, n_use, kind, fmt, multi_res, n_stage_use
 
 
+class SwiGLU(nn.Module):
+    """`down( SiLU(gate(x)) ⊙ up(x) )` — d_in → hidden → d_out, `bias=False`.
+
+    Khối có CỔNG, và cổng ấy đặt hai điều kiện lên nơi dùng nó:
+
+      * đầu vào phải đã qua RMSNorm (RMS ≈ 1). Một cổng NHÂN ăn đầu vào nhỏ thì
+        **bình phương** cái nhỏ ấy — đo trên bố cục /7 (cùng cấu trúc, không có
+        RMSNorm): RMS(Q) ở bước 0 rơi xuống 1,07e-4 và underflow HẲN về 0 trên
+        model đồ chơi của selftest;
+      * init `1/√fan_in` cho cả ba, KHÔNG phải normal(0, 0.02) của Gemma 3.
+        `_init` vì thế bỏ qua mọi `SwiGLU` — xem docstring của nó.
+
+    `bias=False` theo quy ước Gemma 3 / LLaMA: với một cổng nhân, bias của
+    nhánh `gate` chỉ dịch điểm bão hoà của SiLU — khó đọc, dễ trôi, không họ
+    nào giữ.
+    """
+
+    def __init__(self, d_in: int, hidden: int, d_out: int):
+        super().__init__()
+        self.d_in, self.hidden, self.d_out = int(d_in), int(hidden), int(d_out)
+        self.gate = nn.Linear(self.d_in, self.hidden, bias=False)
+        self.up = nn.Linear(self.d_in, self.hidden, bias=False)
+        self.down = nn.Linear(self.hidden, self.d_out, bias=False)
+        self.reset_projections()
+
+    @torch.no_grad()
+    def reset_projections(self) -> None:
+        for lin in (self.gate, self.up, self.down):
+            nn.init.normal_(lin.weight, mean=0.0,
+                            std=1.0 / math.sqrt(lin.in_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
 class VExtractor(nn.Module):
     """Ảnh (B, 3, S, S) -> Q_raw (B, n_query, d_branch). Backbone + Extractor.
 
         p     = flatten(backbone.forward_features(px))   (B, n_patch, d_feat)
         kv    = RMSNorm(Linear(p))                  d_feat (512) → d_branch (2560)
-        h     = learner + Self-attn(RMSNorm(learner))    (+) thứ NHẤT, từ learner
-        Q_raw = learner + Cross-attn(RMSNorm(h), kv)     (+) thứ HAI, từ learner
+        h     = learner + Self-attn(RMSNorm(learner))    (+) NHẤT, từ learner
+        h     = h + SwiGLU(RMSNorm(h))                   (+) HAI, quanh MLP
+        Q_raw = learner + Cross-attn(RMSNorm(h), kv)     (+) BA, từ learner
 
-    **HAI residual, và CẢ HAI đều xuất phát từ `learner`** — đúng hai dấu `+`
-    trong hình, cả hai nhận mũi tên đi thẳng từ khối "16 Learners". Bố cục /7
-    khác ở chỗ này: ở đó residual thứ nhất vòng quanh MLP (`s + mlp(s)`) chứ
-    không quay về learner. Đổi lại, MLP không còn nằm giữa hai attention — nó
-    chuyển hẳn sang `Aligner`, sau residual thứ hai.
+    **BA residual, và HAI trong đó xuất phát từ `learner`** — đúng ba dấu `+`
+    trong hình: hai cái ngoài cùng nhận mũi tên đi thẳng từ khối "32 Learners",
+    cái ở giữa vòng quanh RIÊNG MLP. Bố cục /8 không có dấu `+` giữa ấy (không
+    có MLP nào trong Extractor); /7 có MLP nhưng residual thứ nhất của nó vòng
+    quanh MLP thay vì quay về learner.
 
     HAI phần với HAI số phận khác nhau, và đó là toàn bộ ý của bố cục /5:
 
@@ -504,14 +559,14 @@ class VExtractor(nn.Module):
         `forward_features` trong `no_grad`. Không dropout, không stochastic
         depth, không gradient, không bước Adam — y như lúc teacher sinh mục tiêu
         trong Stage 0;
-      * phần còn lại (`head_parameters`: Linear vào, learner, Self/Cross-attn)
+      * phần còn lại (`head_parameters`: Linear vào, learner, Self/Cross-attn, MLP)
         — KHÔNG có ở Stage 0, khởi tạo ngẫu nhiên và học ở MAIN STAGE cùng
         Aligner và LoRA.
 
     **`d_branch` = `d_model` = 2560, và đó là thay đổi lớn nhất của /8.** Phép
     đổi chiều không còn nằm ở cuối nữa: `Linear 512 → 2560` ngay sau backbone đã
     đưa lưới lên thẳng không gian embedding của decoder, nên toàn bộ thân —
-    learner, hai attention, MLP của Aligner — chạy ở 2560. Ở /7 thân chạy ở 768
+    learner, hai attention, MLP giữa chúng, MLP của Aligner — chạy ở 2560. Ở /7 thân chạy ở 768
     và `Aligner` là chỗ duy nhất nở ra 2560.
 
     Cái giá là attention: ở 2560 mỗi khối attention là 4 × 2560² = **26,2 M**
@@ -519,16 +574,16 @@ class VExtractor(nn.Module):
     phần học được của nhánh vì thế phình lên ~3× so với /7 — xem bảng trong
     README trước khi kết luận về VRAM hay thời gian mỗi bước.
 
-    `n_query` là khoá KHAI TƯỜNG MINH (16) — lưới của backbone (784 ô ở 448²,
+    `n_query` là khoá KHAI TƯỜNG MINH (32) — lưới của backbone (784 ô ở 448²,
     stride 16 sau khi cắt stage 4) chỉ là NGUỒN để hỏi.
     """
 
     def __init__(self, image_size: int = 448, d_branch: int = 2560,
                  arch: str = "convnext_base.dinov3_lvd1689m",
                  pretrained: bool = True, n_layers: int | None = None,
-                 n_query: int = 16, head_dim: int = 128,
+                 n_query: int = 32, head_dim: int = 128,
                  dropout: float = 0.0, normalize: dict | None = None,
-                 n_stages: int | None = 3):
+                 n_stages: int | None = 3, mlp_hidden: int = 2048):
         super().__init__()
         self.image_size = int(image_size)
         self.n_query = int(n_query)
@@ -564,6 +619,11 @@ class VExtractor(nn.Module):
         self.learner = nn.Parameter(torch.randn(1, self.n_query, self.d_branch) * 0.02)
         self.q_norm = RMSNorm(self.d_branch)
         self.sattn = MultiHeadAttention(self.d_branch, self.n_heads, dropout)
+        # MLP GIỮA hai attention — residual của nó vòng quanh CHÍNH nó
+        # (`h + mlp(norm(h))`), khác hai residual kia vốn quay về learner.
+        self.mlp_hidden = int(mlp_hidden)
+        self.m_norm = RMSNorm(self.d_branch)
+        self.mlp = SwiGLU(self.d_branch, self.mlp_hidden, self.d_branch)
         self.x_norm = RMSNorm(self.d_branch)
         self.xattn = MultiHeadAttention(self.d_branch, self.n_heads, dropout)
 
@@ -575,14 +635,15 @@ class VExtractor(nn.Module):
     def head_parameters(self):
         """Phần NGOÀI backbone: Linear vào + RMSNorm + learner + hai attention.
 
-        KHÔNG còn MLP: từ /8 nó nằm trong `Aligner`, sau residual thứ hai.
+        Từ /9 có LẠI một MLP giữa hai attention (`m_norm` + `mlp`), bên cạnh
+        khối SwiGLU của `Aligner` — hai khối khác nhau, hai khoá khai riêng.
 
         KHÔNG có ở Stage 0 (Stage 0 chỉ chạy backbone + DINO head), nên nhóm
         này khởi tạo ngẫu nhiên và học ở MAIN STAGE.
         """
         yield self.learner
         for m in (self.inp, self.inp_norm, self.q_norm, self.sattn,
-                  self.x_norm, self.xattn):
+                  self.m_norm, self.mlp, self.x_norm, self.xattn):
             yield from m.parameters()
 
     def set_body_frozen(self, frozen: bool) -> None:
@@ -645,8 +706,9 @@ class VExtractor(nn.Module):
     def forward(self, px: torch.Tensor) -> torch.Tensor:
         kv = self.inp_norm(self.inp(self.patches(px)))           # (B, n_patch, 2560)
         q0 = self.learner.expand(px.shape[0], -1, -1).to(kv.dtype)
-        h = q0 + self.sattn(self.q_norm(q0))                     # (+) thứ NHẤT
-        return q0 + self.xattn(self.x_norm(h), kv)               # (+) thứ HAI
+        h = q0 + self.sattn(self.q_norm(q0))                     # (+) NHẤT, từ learner
+        h = h + self.mlp(self.m_norm(h))                         # (+) HAI, quanh MLP
+        return q0 + self.xattn(self.x_norm(h), kv)               # (+) BA, từ learner
 class Aligner(nn.Module):
     """Q_raw (d_branch) -> Q (d_model). RMSNorm + MỘT khối SwiGLU.
 
@@ -656,12 +718,12 @@ class Aligner(nn.Module):
     Không attention, không residual, và ở /8 cũng **không còn đổi chiều**:
     `d_branch` = `d_model` = 2560, vì `Linear 512 → 2560` ngay sau backbone đã
     làm việc ấy. Nên `Aligner` ở đây là một **FFN thuần** đứng sau residual thứ
-    hai của Extractor, chứ không phải "chỗ đổi chiều" như /5–/7.
+    BA của Extractor, chứ không phải "chỗ đổi chiều" như /5–/7.
 
     **`mlp_hidden` 2048 < `d_branch` 2560 — đây là một nút THẮT, có chủ ý.**
     Mọi FFN của decoder nở RA ở giữa (Gemma 3: 2560 → 10240). Khối này làm
     ngược lại: nó ép 2560 chiều qua 2048 rồi mở lại, nên nó không thể chép
-    nguyên đầu vào sang đầu ra — 16 vector buộc phải bỏ bớt thứ gì đó. Nếu về
+    nguyên đầu vào sang đầu ra — 32 vector buộc phải bỏ bớt thứ gì đó. Nếu về
     sau muốn nó là một FFN "bình thường" thì tăng `aligner.mlp_hidden` lên trên
     2560; cả hai đều chạy, nhưng chúng hỏi hai câu khác nhau.
 
@@ -788,6 +850,8 @@ def _init(module: nn.Module) -> None:
     for m in module.modules():
         if isinstance(m, VExtractor):
             skip |= {id(x) for x in m.body.modules()}
+        elif isinstance(m, SwiGLU):
+            skip |= {id(m.gate), id(m.up), id(m.down)}
         elif isinstance(m, Aligner):
             # Ba ma trận của SwiGLU dùng `1/√fan_in` (xem `Aligner`), không
             # phải 0.02. Đè 0.02 lên chúng là quay lại đúng ca Q ≈ 0 ở bước 0
@@ -824,9 +888,9 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
     z = dict(cfg.get("vextractor") or {})
     rv, al = (dict(z.get(k) or {}) for k in ("vextractor", "aligner"))
     arch = str(rv.get("arch", "convnext_base.dinov3_lvd1689m"))
-    # `vextractor.mlp_hidden` là khoá của /5-/7 (MLP GIỮA hai attention). Từ /8
-    # MLP nằm trong `Aligner`, nên khoá ấy không còn điều khiển gì — bỏ qua nó
-    # trong im lặng là để người khai tưởng mình vừa đặt bề rộng FFN mà không.
+    # `vextractor.mlp_hidden` (2048) = bề rộng MLP GIỮA hai attention;
+    # `aligner.mlp_hidden` (2048) = bề rộng FFN SAU residual thứ ba. HAI khối
+    # khác nhau, hai khoá khác nhau — /8 chỉ có khối thứ hai, /9 có cả hai.
     if "n_heads" in rv:
         raise VExtractorUnusable(
             "vextractor.vextractor.n_heads không còn là khoá khai: mọi "
@@ -834,12 +898,6 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
             "được SUY RA = d_branch // head_dim. Khai n_heads là để head_dim "
             "đổi lặng lẽ mỗi lần d_branch đổi — đúng thứ khoá này sinh ra để "
             "chặn. Dùng `vextractor.vextractor.head_dim`.")
-    if "mlp_hidden" in rv:
-        raise VExtractorUnusable(
-            "vextractor.vextractor.mlp_hidden là khoá của bố cục /5-/7, nơi "
-            "MLP(GeLU) nằm GIỮA Self-attn và Cross-attn. Từ /8 Extractor không "
-            "còn MLP nào: nó chuyển sang `Aligner` (FFN sau residual thứ hai). "
-            "Bề rộng FFN khai ở `vextractor.aligner.mlp_hidden`.")
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -854,10 +912,12 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                        # 3 = dừng ở stride 16 / 512 kênh của ConvNeXt-B.
                        "n_stages": (None if rv.get("n_stages") is None
                                     else int(rv["n_stages"])),
-                       "n_query": int(rv.get("n_query", 16)),
+                       "n_query": int(rv.get("n_query", 32)),
                        "d_branch": int(rv.get("d_branch", 2560)),
                        # KHAI `head_dim`, KHÔNG khai `n_heads` — xem `VExtractor`.
                        "head_dim": int(rv.get("head_dim", 128)),
+                       # MLP giữa Self-attn và Cross-attn (KHÁC aligner.mlp_hidden)
+                       "mlp_hidden": int(rv.get("mlp_hidden", 2048)),
                        "dropout": float(rv.get("dropout", 0.0)),
                        "normalize": {"mean": list(mean), "std": list(std)}},
         "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 2048)),
@@ -916,7 +976,8 @@ def build_vextractor(spec: dict) -> VExtractor:
     r = spec["vextractor"]
     return VExtractor(r["image_size"], r["d_branch"], r["arch"], r["pretrained"],
                       r.get("n_layers"), r["n_query"], r["head_dim"],
-                      r["dropout"], r.get("normalize"), r.get("n_stages"))
+                      r["dropout"], r.get("normalize"), r.get("n_stages"),
+                      mlp_hidden=r.get("mlp_hidden", 2048))
 
 
 def build_backbone(spec: dict):
@@ -1023,6 +1084,7 @@ class VExtractorBranch(nn.Module):
                 f"RMSNorm ‖ {v.n_query} "
                 f"learner -> Self-attn ({db // r['head_dim']} head × "
                 f"head_dim {r['head_dim']}, +res learner) -> "
+                f"RMSNorm -> SwiGLU {db}→{v.mlp_hidden}→{db} (+res) -> "
                 f"Cross-attn (+res learner) │ Aligner: RMSNorm -> SwiGLU "
                 f"{db}→{a['mlp_hidden']}→{d}")
 
@@ -1060,7 +1122,7 @@ def save_stage0(body: nn.Module, spec: dict, out_dir: Path, extra: dict) -> Path
 
 
 def format_gen(s) -> int:
-    """`"rgexp.vextractor/8"` -> 8; -1 nếu không đọc được số thế hệ."""
+    """`"rgexp.vextractor/9"` -> 9; -1 nếu không đọc được số thế hệ."""
     m = re.search(r"/(\d+)$", str(s or ""))
     return int(m.group(1)) if m else -1
 
@@ -1079,7 +1141,7 @@ def load_stage0_into(branch: VExtractorBranch, d: Path) -> dict:
     đây.
 
     **`format` KHÔNG bị đòi bằng đúng `FORMAT`, và đó là một sửa lỗi.** `FORMAT`
-    bump mỗi lần Extractor hoặc Aligner đổi bố cục — /7 -> /8 chẳng hạn chỉ đổi
+    bump mỗi lần Extractor hoặc Aligner đổi bố cục — /8 -> /9 chẳng hạn chỉ đổi
     `d_branch`, số learner và kiểu Aligner, backbone thì y nguyên. Đòi bằng
     đúng `FORMAT` nghĩa là một checkpoint Stage 0 HOÀN TOÀN dùng được bị vứt đi
     và người chạy phải trả lại vài giờ GPU cho một lượt DINO không đổi gì.

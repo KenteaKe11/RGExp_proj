@@ -3,7 +3,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
 # QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 16 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 32 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
@@ -156,6 +156,9 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
+  # Ghi trọng số ra đĩa mỗi bao nhiêu bước. 0 = tắt (chỉ ghi 1 lần ở cuối).
+  # Mốc này tồn tại vì một lần chết CUDA ở bước cuối đã xoá sạch 3 giờ.
+  save_every_steps: 25
 
   # ── Đo trên val — CHỈ để nhìn, KHÔNG chạm vào trọng số ──────────────────
   # Mỗi `every_steps` bước (và ở bước cuối), bốc NGẪU NHIÊN `n_samples` = 256
@@ -319,20 +322,26 @@ labels:
 #     (512,28,28) ─► Flatten + Permute ─► 784 ô
 #           │
 #     784 ô ─► Linear 512→2560 ─► RMSNorm(2560) ───────────────────┐
-#     16 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
+#     32 learner ─┬─► RMSNorm(2560) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
 #                 │                                  │             │
 #                 │                           RMSNorm(2560)        │
 #                 │                                  │             │
-#                 │                            Cross-attn ◄────────┘
-#                 └────────── skip ──────────────► (+) ─► Q_raw (16, 2560)
+#                 │                      SwiGLU 2560→2048→2560     │
+#                 │                                  │             │
+#                 │                                 (+) ◄─ skip ─┐ │  (quanh MLP)
+#                 │                                  │           │ │
+#                 │                           RMSNorm(2560)      │ │
+#                 │                                  │           │ │
+#                 │                            Cross-attn ◄──────┼─┘
+#                 └────────── skip ──────────────► (+) ─► Q_raw (32, 2560)
 #                                                     │
 #                                             RMSNorm(2560)        [Aligner]
 #                                                     │
-#                             SwiGLU 2560→2048→2560 ─► Q (16, 2560)
+#                             SwiGLU 2560→2048→2560 ─► Q (32, 2560)
 #
-# HAI residual, và CẢ HAI đều từ `learner` — đúng hai mũi tên đi thẳng từ khối
-# "16 Learners" trong sơ đồ. Bố cục /7 khác ở đây: residual thứ nhất của nó
-# vòng quanh MLP.
+# BA residual: hai cái NGOÀI CÙNG đều từ `learner` — đúng hai mũi tên đi thẳng
+# từ khối "32 Learners" trong sơ đồ — còn cái ở GIỮA vòng quanh riêng MLP.
+# Bố cục /8 không có dấu `+` giữa ấy (Extractor /8 không có MLP nào).
 #
 # `d_branch` = `d_model` = 2560: `Linear 512→2560` ngay sau backbone đã đổi
 # chiều, nên KHÔNG còn chỗ nào nở ra ở cuối, và Aligner là một FFN thuần. Vẫn
@@ -360,9 +369,9 @@ labels:
 # Vì `n_stages` quyết định chính những tensor Stage 0 lưu ra, nó nằm TRONG
 # `backbone_spec`: đổi nó là checkpoint Stage 0 cũ bị từ chối ồn ào.
 #
-# Aligner ở /8 là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
-# sau residual thứ hai, không attn/residual nào thêm. Nó KHÔNG còn đổi chiều
-# (việc ấy đã xong ở `Linear 512→2560`), nên vai trò của nó là trộn lại 16
+# Aligner ở /9 là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
+# sau residual thứ BA, không attn/residual nào thêm. Nó KHÔNG còn đổi chiều
+# (việc ấy đã xong ở `Linear 512→2560`), nên vai trò của nó là trộn lại 32
 # vector sau khi chúng đã đọc xong ảnh.
 #
 # `mlp_hidden` 2048 NHỎ HƠN `d_branch` 2560 — một nút THẮT có chủ ý. Mọi FFN
@@ -382,7 +391,7 @@ labels:
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
 vextractor:
-  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (16, 2560)
+  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (32, 2560)
     image_size: 448         # stride 16 sau khi cắt. 448/16 = 28 -> 784 ô
     # timm; lần chạy đầu tải ~350 MB (tải CẢ 4 stage rồi mới cắt). DINOv3
     # ConvNeXt-B: 87,6 M tham số / 36 block (3+3+27+3) trên 4 stage; cắt còn 3
@@ -405,7 +414,7 @@ vextractor:
     # 512 kênh. Khai CẢ n_layers lẫn n_stages bị TỪ CHỐI. Xem ⚠ ở trên về đánh
     # đổi; khoá này nằm trong `backbone_spec` nên đổi nó = chạy lại Stage 0.
     n_stages: 3
-    n_query: 16             # số learner = số token Q nối vào chuỗi decoder
+    n_query: 32             # số learner = số token Q nối vào chuỗi decoder
     d_branch: 2560          # = d_model. Linear 512→2560 đã đổi chiều ngay đầu
     # MỌI attention của nhánh (Self + Cross) chạy ở head_dim CỐ ĐỊNH này; số
     # head được SUY RA = d_branch // head_dim (2560 // 128 = 20).
@@ -417,11 +426,12 @@ vextractor:
     # suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì DỪNG.
     # Khai `n_heads` ở đây bị TỪ CHỐI ồn ào.
     head_dim: 128
-    # KHÔNG còn `mlp_hidden` ở đây: từ /8 Extractor không có MLP nào (nó nằm
-    # trong `aligner` bên dưới). Khai lại khoá ấy sẽ bị TỪ CHỐI ồn ào thay vì
-    # bỏ qua im lặng — bỏ qua thì người khai tưởng vừa đặt bề rộng FFN mà không.
+    # Bề rộng MLP GIỮA Self-attn và Cross-attn (SwiGLU, residual vòng quanh
+    # RIÊNG nó). KHÁC `aligner.mlp_hidden` bên dưới — đó là FFN SAU residual
+    # thứ ba. Hai khối, hai khoá; /8 chỉ có khối thứ hai, /9 có cả hai.
+    mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560 (giữa hai attention)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # FFN THUẦN sau residual thứ hai; KHÔNG đổi chiều
+  aligner:                  # FFN THUẦN sau residual thứ BA; KHÔNG đổi chiều
     # SwiGLU: down( SiLU(gate(x)) ⊙ up(x) ), bias=False cả ba, init 1/√fan_in.
     # 2048 < d_branch 2560 = nút THẮT có chủ ý (xem ghi chú ở trên).
     mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560
