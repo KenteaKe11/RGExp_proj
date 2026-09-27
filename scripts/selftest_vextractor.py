@@ -71,14 +71,14 @@ SMALL_NL = 3          # ViT-Tiny có 12 block; giữ 3 block đầu để KIỂM
 # (forward_features trả (B, C, H, W), không nhận `img_size`, không cắt block
 # được) — check 2b dựng một ConvNeXt tí hon để kiểm ĐÚNG đường ấy.
 SMALL_CONV = "convnext_atto"
-# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone của /7 (đó là ConvNeXt-B,
-# NCHW) — nó ở đây làm test HỒI QUY cho nhánh NHWC: cùng số chiều đầu ra (4) với
+# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone đang dùng (ConvNeXt-B là
+# NCHW) — nó ở đây canh nhánh NHWC: cùng số chiều đầu ra (4) với
 # ConvNeXt nhưng trục kênh ở CUỐI, và một phép flatten viết cho NCHW chạy trót
 # lọt trên nó mà cho ra rác. Nhánh ấy phải còn đúng kể cả khi không ai dùng.
 SMALL_SWIN = "swinv2_tiny_window8_256"
 
 
-# d_branch (16) KHÁC d_model (32) một cách CỐ Ý, DÙ bố cục /8 thật sự đặt chúng
+# d_branch (16) KHÁC d_model (32) một cách CỐ Ý, DÙ cấu hình thật đặt chúng
 # bằng nhau (2560): hai số bằng nhau thì mọi lỗi lẫn chiều — Linear nối nhầm
 # đầu, Aligner đọc nhầm khoá — đều lọt qua vì shape tình cờ khớp. Selftest giữ
 # chúng khác nhau để `build_aligner` nối `d_branch` -> `d_model` còn kiểm được.
@@ -171,7 +171,7 @@ def _():
         else:
             raise AssertionError(f"n_layers = {bad} phải bị từ chối")
     # đường đi đúng hình: Linear d_feat→d_branch, thân chạy THẲNG ở d_branch,
-    # và GIỮA hai attention có MỘT khối SwiGLU (từ /9), khai bằng khoá RIÊNG
+    # và GIỮA hai attention có MỘT khối SwiGLU, khai bằng khoá RIÊNG
     assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == SMALL_DB
     assert vx.sattn.d == vx.xattn.d == vx.d_branch == SMALL_DB
     # MỌI attention cùng MỘT head_dim, và nó là khoá KHAI — số head suy ra
@@ -236,17 +236,6 @@ def _():
             assert abs(got - want_std) / want_std < 0.25, (got, want_std)
         # và Q ở bước 0 KHÔNG được bé đến mức vô nghĩa
         assert float(al(want).pow(2).mean().sqrt()) > 1e-3
-    # Cls Head / ASL / SupervisedBlock BỊ BỎ HẲN — Stage 0 là tự giám sát
-    for gone in ("SupervisedBlock", "ClsHead", "ClsCounter", "CellMaskedASL",
-                 "build_asl", "asl_gammas", "build_cls_head", "AttnPooling"):
-        assert not hasattr(R, gone), gone
-    # ViT KHÔNG có BatchNorm nào để phải thay — khối InstanceNorm của bản cũ
-    # phải biến mất hẳn, không còn treo lại dưới dạng API chết
-    import torch.nn as nn
-    assert not any(isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d))
-                   for m in vx.body.modules())
-    assert not hasattr(R, "bn_to_instance") and not hasattr(R, "resnet_body")
-    assert not hasattr(vx, "norm_parameters") and not hasattr(vx, "n_norm_swapped")
     # Q phụ thuộc ẢNH, không phải hằng số
     assert not torch.allclose(q[0], q[1])
     # ── hai nhóm tham số của Stage 0: backbone (ViT) | rest ───────────────
@@ -971,9 +960,6 @@ def _():
     assert sc["base_epochs"] == 51
     # lr cố định suốt quá trình -> KHÔNG có epoch anneal
     assert sc["final_anneal"]["enabled"] is False
-    # epoch "norm" của bản ResNet50 đã biến mất khỏi CẢ config lẫn sc
-    assert "norm_lr" not in sc and "norm_epochs" not in sc
-    assert "norm_lr" not in cfg["stage0"] and "norm_epochs" not in cfg["stage0"]
     # patience mà vẫn `select: last` là tự phủ định -> phải bị TỪ CHỐI
     try:
         s0.s0cfg({"stage0": dict(cfg["stage0"], select="last")})
@@ -1055,19 +1041,21 @@ def _():
             assert "align_warmup" in str(e), (bad, e)
         else:
             raise AssertionError(f"{bad} phải bị từ chối")
-    assert "recomb_lr" not in zc and "recomb_wd" not in zc   # một nhóm tham số
-    assert not (set(zc) & {"vext_lr", "vext_wd", "freeze_vext_epochs"})
-    # khoá của bố cục CŨ trong config phải bị TỪ CHỐI, không bỏ qua im lặng
-    for k in ("vext_lr", "vext_wd", "freeze_vext_epochs"):
+    # Khoá LẠ trong `vextractor.main` bị TỪ CHỐI, không bỏ qua im lặng: một
+    # khoá không ai đọc nghĩa là người khai tưởng vừa đặt một lịch mà không.
+    from src.train_vextractor import MAIN_CFG_KEYS
+
+    assert set(zc) == set(MAIN_CFG_KEYS)
+    for k in ("align_Ir", "vext_lr", "freeze_vext_epochs"):
         bad = dict(cfg)
         bad["vextractor"] = dict(cfg["vextractor"],
                                  main=dict(cfg["vextractor"]["main"], **{k: 0.1}))
         try:
             zcfg(bad)
         except Exception as e:
-            assert k in str(e), (k, e)
+            assert k in str(e) and "khoá lạ" in str(e), (k, e)
         else:
-            raise AssertionError(f"khoá cũ {k} phải bị từ chối")
+            raise AssertionError(f"khoá lạ {k} phải bị từ chối")
     assert cfg["vextractor_exp"]["retrain_all"] is False
     rv = cfg["vextractor"]["vextractor"]
     assert int(rv["image_size"]) == 448
@@ -1101,34 +1089,45 @@ def _():
     # HAI khoá mlp_hidden, KHÔNG dùng chung: MLP giữa hai attention và FFN
     # của Aligner là hai khối khác nhau.
     assert int(rv["mlp_hidden"]) == 2048 == int(sp14["aligner"]["mlp_hidden"])
-    # Từ /8 Extractor chạy ở d_branch = d_model = 2560: head_dim 128
+    # Extractor chạy ở d_branch = d_model = 2560: head_dim 128
     assert int(rv["d_branch"]) == 2560
     # `head_dim` là khoá KHAI, `n_heads` SUY RA — khai n_heads bị TỪ CHỐI.
     assert int(rv["head_dim"]) == 128 and "n_heads" not in rv
     assert int(rv["d_branch"]) % int(rv["head_dim"]) == 0
     assert int(rv["d_branch"]) // int(rv["head_dim"]) == 20
-    bad_nh = dict(cfg)
-    bad_nh["vextractor"] = dict(cfg["vextractor"],
-                                vextractor=dict(rv, n_heads=20))
-    try:
-        R.spec_from_cfg(bad_nh, 2560)
-    except R.VExtractorUnusable as e:
-        assert "n_heads" in str(e) and "head_dim" in str(e)
-    else:
-        raise AssertionError("vextractor.n_heads phải bị từ chối ở /8")
-    # `mlp_hidden` KHÔNG còn ở khối vextractor — khai lại bị TỪ CHỐI ồn ào,
-    # chứ không bỏ qua im lặng (bỏ qua thì người khai tưởng vừa đặt bề rộng FFN)
-    assert "mlp_hidden" not in rv
-    bad_mlp = dict(cfg)
-    bad_mlp["vextractor"] = dict(cfg["vextractor"],
-                                 vextractor=dict(rv, mlp_hidden=1024))
-    try:
-        R.spec_from_cfg(bad_mlp, 2560)
-    except R.VExtractorUnusable as e:
-        assert "mlp_hidden" in str(e)
-    else:
-        raise AssertionError("vextractor.mlp_hidden phải bị từ chối ở /8")
-    # Aligner: SwiGLU THUẦN sau residual thứ hai, KHÔNG đổi chiều (2560 -> 2560)
+    # Khoá LẠ ở cả hai khối bị TỪ CHỐI ồn ào — `n_heads` chỉ là một ca của nó.
+    assert set(rv) <= set(R.VEXT_CFG_KEYS)
+    assert set(cfg["vextractor"]["aligner"]) <= set(R.ALIGNER_CFG_KEYS)
+    for blk, k in (("vextractor", "n_heads"), ("vextractor", "mlp_hiden"),
+                   ("aligner", "n_query")):
+        bad_k = dict(cfg)
+        bad_k["vextractor"] = dict(
+            cfg["vextractor"], **{blk: dict(cfg["vextractor"][blk], **{k: 20})})
+        try:
+            R.spec_from_cfg(bad_k, 2560)
+        except R.VExtractorUnusable as e:
+            assert k in str(e) and "khoá lạ" in str(e), (blk, k, e)
+        else:
+            raise AssertionError(f"vextractor.{blk}.{k} phải bị từ chối")
+    # HAI khoá `mlp_hidden` phải ĐỘC LẬP: mỗi cái điều khiển ĐÚNG khối của nó.
+    # Dùng chung một giá trị thì một bên đổi lặng lẽ theo bên kia, và không ai
+    # thấy cho tới khi đếm tham số.
+    other = dict(cfg)
+    other["vextractor"] = dict(cfg["vextractor"],
+                               vextractor=dict(rv, mlp_hidden=1024))
+    sp_o = R.spec_from_cfg(other, 2560)
+    assert int(sp_o["vextractor"]["mlp_hidden"]) == 1024
+    assert int(sp_o["aligner"]["mlp_hidden"]) == 2048 == int(
+        cfg["vextractor"]["aligner"]["mlp_hidden"])
+    # và ngược lại: đổi aligner.mlp_hidden KHÔNG đụng vào MLP của Extractor
+    other2 = dict(cfg)
+    other2["vextractor"] = dict(cfg["vextractor"],
+                                aligner=dict(cfg["vextractor"]["aligner"],
+                                             mlp_hidden=512))
+    sp_o2 = R.spec_from_cfg(other2, 2560)
+    assert int(sp_o2["aligner"]["mlp_hidden"]) == 512
+    assert int(sp_o2["vextractor"]["mlp_hidden"]) == int(rv["mlp_hidden"]) == 2048
+    # Aligner: SwiGLU THUẦN sau residual thứ BA, KHÔNG đổi chiều (2560 -> 2560)
     al = cfg["vextractor"]["aligner"]
     assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 2048
     # và 2048 < d_branch 2560: NÚT THẮT có chủ ý, không phải gõ nhầm
@@ -1177,8 +1176,6 @@ def _():
     # ── hai stage KHÔNG dùng chung khoá batch nào ──────────────────────────
     import src.autobatch as ab
 
-    # di tích của thời hai stage bị ép dùng chung một micro — phải biến mất
-    assert not hasattr(ab, "shared_cands")
     gcfg = load_config(ROOT / "configs/vextractor.yaml", gpu="rtx3060")
     gsc = s0.s0cfg(gcfg)
     assert gsc["probe_sizes"] != gcfg["autobatch"]["probe_sizes"], (
@@ -1841,11 +1838,7 @@ def _():
                      "Q → Aligner → Extractor → teacher (ConvNeXt-B) → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
-        # ba ô, không còn OR/AND của §2.0
-        assert "OR (cộng" not in doc and "AND (nhân" not in doc
         assert "`sal_z`" in doc and "`sal_q`" in doc
-        for gone in ("sal_vext", "sal_vext_act", "sal_vext_pre", "act_siglip"):
-            assert gone not in doc, gone
         assert json.dumps(out, default=str)
 
 
@@ -1932,11 +1925,9 @@ def _():
 def _():
     """README trôi khỏi code ở MỖI lần đổi kiến trúc, và nó trôi IM LẶNG.
 
-    Bố cục đã đi /5 -> /6 -> /7 -> /8 và mỗi bước đổi `d_branch`, `n_query`,
-    số tham số, kiểu Aligner. Không có gì buộc README đi theo, nên cách duy
-    nhất nó sai là sai âm thầm: người đọc tin một bảng tham số của hai bố cục
-    trước. Bài này dựng nhánh THẬT từ `configs/vextractor.yaml` rồi đòi README
-    chứa đúng những con số ấy.
+    Không có gì buộc đặc tả đi theo code, nên cách duy nhất nó sai là sai âm
+    thầm: người đọc tin một bảng tham số không còn đúng. Bài này dựng nhánh
+    THẬT từ `configs/vextractor.yaml` rồi đòi đặc tả chứa đúng những con số ấy.
 
     `pretrained=False`: số tham số không phụ thuộc trọng số, nên bài này chạy
     OFFLINE và không tải gì.
@@ -1984,20 +1975,24 @@ def _():
 
     # Và số của BỐ CỤC CŨ không được còn sót — ở BA bề mặt đặc tả, không chỉ
     # README: config và docstring của `vextractor.py` cũng là nơi người ta đọc
-    # để biết nhánh làm gì, và chúng trôi y hệt. (Bảng so sánh lịch sử được
-    # phép nhắc bố cục cũ, nên chỉ soi những chuỗi chỉ xuất hiện khi ai đó
-    # quên cập nhật — `n_query` cũ, kiểu Aligner cũ, tên file hình cũ.)
-    stale = [f"{k} learner" for k in (16, 32, 64) if k != vx.n_query]
-    stale += [f"{k} vector Q" for k in (16, 32, 64) if k != vx.n_query]
-    stale += [f"{k} High-Q token" for k in (16, 32, 64) if k != vx.n_query]
-    stale += ["`d_branch` = 768", "SwiGLU 768→4096→2560",
-              "MLP(GeLU) 2560→3072→2560", "lens_layers_z.png"]
+    # để biết nhánh làm gì, và chúng trôi y hệt. Mọi chuỗi ở đây SUY RA từ spec
+    # sống: không có danh sách "số của bố cục cũ" nào gõ tay, nên bài này không
+    # phải sửa mỗi lần kiến trúc đổi.
+    def wrong(v):
+        return [x for x in (v // 2, v * 2, 64, 768, 1024) if x != v]
+
+    stale = [f"{k} learner" for k in wrong(vx.n_query)]
+    stale += [f"{k} vector Q" for k in wrong(vx.n_query)]
+    stale += [f"{k} High-Q token" for k in wrong(vx.n_query)]
+    stale += [f"`d_branch` = {k}" for k in wrong(vx.d_branch)]
+    stale += [f"SwiGLU {vx.d_branch}→{k}→{vx.d_branch}"
+              for k in wrong(vx.mlp_hidden)]
     surfaces = {
         "README.md": rd,
         "configs/vextractor.yaml": (ROOT / "configs/vextractor.yaml").read_text(
             encoding="utf-8"),
-        # CHỈ docstring của module, không cả file: phần thân có chuỗi lịch sử
-        # ("/7 = ... 768→4096→2560") và đó là chú thích ĐÚNG, không phải drift.
+        # CHỈ docstring của module, không cả file: phần thân có thông báo lỗi
+        # nhắc tới giá trị sai, và đó là chuỗi ĐÚNG, không phải drift.
         "src/vextractor.py (docstring)": (
             (ROOT / "src/vextractor.py").read_text(encoding="utf-8")
             .split('"""')[1]),
@@ -2005,7 +2000,7 @@ def _():
     left = {f: [s for s in stale if s in body]
             for f, body in surfaces.items()}
     left = {f: v for f, v in left.items() if v}
-    assert not left, f"đặc tả còn số của bố cục CŨ: {left}"
+    assert not left, f"đặc tả còn con số KHÔNG khớp spec sống: {left}"
 
 
 @check("23. vân tay Stage 0 chỉ phụ thuộc BACKBONE: đổi Extractor/Aligner KHÔNG "
@@ -2018,9 +2013,8 @@ def _():
        Stage 0 (nó chỉ dựng backbone + DINO head), nên đổi chúng làm vân tay
        đổi và người chạy bị bảo `--restage0` cho một backbone y hệt.
     2. `load_stage0_into` đòi `format` BẰNG ĐÚNG `FORMAT`. Nhưng `FORMAT` bump
-       mỗi lần Extractor/Aligner đổi bố cục (/7 -> /8 đổi d_branch, số learner
-       và kiểu Aligner; backbone y nguyên), nên một checkpoint hoàn toàn dùng
-       được bị vứt.
+       mỗi lần Extractor/Aligner đổi bố cục, trong khi backbone y nguyên, nên
+       một checkpoint hoàn toàn dùng được bị vứt.
 
     Cả hai đều mâu thuẫn với docstring của `backbone_spec` và với README. Bài
     này khoá cả hai lại.
@@ -2104,7 +2098,7 @@ def _():
             assert "backbone" in str(e) or "restage0" in str(e)
         else:
             raise AssertionError("backbone khác phải bị chặn")
-        # và bố cục /4 trở về trước (lưu cả SupervisedBlock) vẫn bị từ chối
+        # và thế hệ trước /5 (lưu cả một Cls Head có giám sát) vẫn bị từ chối
         meta["format"] = f"rgexp.vextractor/{R.STAGE0_MIN_GEN - 1}"
         meta_p.write_text(json.dumps(meta), encoding="utf-8")
         try:

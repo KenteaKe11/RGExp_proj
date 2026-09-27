@@ -37,9 +37,9 @@ set:
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
   # phép leo tới tận 32 nếu VRAM cho phép. §2.2: Stage 0 KHÔNG nạp Gemma (chỉ
   # ConvNeXt-B cắt sau stage 3, ở 448², lưới 28×28 = 784 ô), nên mảnh vật lý ở
-  # đây thường leo cao hơn hẳn §2.1. Nhưng ĐỪNG lấy con số của bố cục /6 sang:
-  # backbone giờ 60,1 M tham số VÀ lưới 784 ô (thay vì 49,5 M / 196 ô), nên
-  # activation của Stage 0 nặng hơn rõ. 16 chỉ là KHỞI ĐIỂM, autobatch dò lại.
+  # đây thường leo cao hơn hẳn §2.1. Nhưng backbone 60,1 M tham số VỚI lưới
+  # 784 ô làm activation của Stage 0 nặng rõ, nên 16 chỉ là KHỞI ĐIỂM —
+  # autobatch dò lại.
   stage0.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng

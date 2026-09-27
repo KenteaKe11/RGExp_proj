@@ -1031,9 +1031,9 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           f"backbone có mà {nq} learner không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
           "thông tin bị bỏ lại; trùng khít = Extractor lấy gần hết những gì "
           "backbone nhấn mạnh.\n",
-          "**Ô 3 lấy target là khối Q, KHÔNG phải `y`.** Đó là khác biệt với "
-          "mọi bản trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi "
-          "tự nhiên là *32 vector ấy được dựng từ đâu*, chứ không phải *decoder "
+          "**Ô 3 lấy target là khối Q, KHÔNG phải `y`**, và đó là chủ ý: "
+          "khối Q là thứ §2.2 thêm vào, nên câu hỏi "
+          f"tự nhiên là *{nq} vector ấy được dựng từ đâu*, chứ không phải *decoder "
           "đòi ảnh ở đâu*. Bản đồ này vì thế **KHÔNG dính decoder, KHÔNG dính "
           "LoRA**, và dựng được kể cả khi decoder chưa đọc Q chút nào — muốn "
           "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "

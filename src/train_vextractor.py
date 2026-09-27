@@ -83,16 +83,12 @@ from .config import Cfg, seed_everything
 from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 
 
-# Khoá của bố cục CŨ (V-Extractor được finetune sau một quãng đóng băng). Giữ
-# nguyên trong config bây giờ nghĩa là đang mô tả một lịch KHÔNG còn tồn tại —
-# và im lặng bỏ qua chúng là cách chắc chắn nhất để tưởng mình đang chạy lịch cũ.
-OBSOLETE_MAIN = {
-    "vext_lr": "đổi tên thành `align_lr` — lr bây giờ là của Extractor + "
-               "Aligner, không phải của backbone (backbone đóng băng hoàn toàn).",
-    "vext_wd": "đổi tên thành `align_wd`.",
-    "freeze_vext_epochs": "bỏ hẳn: backbone bị đóng băng SUỐT main stage, "
-                          "không còn bước mở băng nào để khai.",
-}
+# MỌI khoá khai được của `vextractor.main`, và KHÔNG khoá nào khác. Một khoá
+# không ai đọc là im lặng tuyệt đối: người khai tin mình vừa đặt một lịch, rồi
+# chạy hết 200 bước với giá trị mặc định. `zcfg` là chỗ DUY NHẤT đọc khối này,
+# nên cũng là chỗ duy nhất biết khoá nào có thật.
+MAIN_CFG_KEYS = ("align_lr", "align_wd", "align_warmup_steps",
+                 "align_warmup_start_lr", "separate_clip")
 
 
 def zcfg(cfg: Cfg) -> dict:
@@ -103,11 +99,12 @@ def zcfg(cfg: Cfg) -> dict:
     nhật nào.
     """
     m = dict(dict(cfg.get("vextractor") or {}).get("main") or {})
-    bad = [f"vextractor.main.{k}: {why}" for k, why in OBSOLETE_MAIN.items()
-           if k in m]
-    if bad:
-        raise TrainUnusable("config còn khoá của bố cục nhánh CŨ:\n    "
-                            + "\n    ".join(bad))
+    odd = sorted(set(m) - set(MAIN_CFG_KEYS))
+    if odd:
+        raise TrainUnusable(
+            f"vextractor.main: khoá lạ {odd} — không khoá nào trong số ấy được "
+            f"đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
+            f"{list(MAIN_CFG_KEYS)}.")
     out = {"align_lr": float(m.get("align_lr", 1e-5)),
            "align_wd": float(m.get("align_wd", 0.01)),
            # Warm-up theo BƯỚC (không theo epoch: main stage chỉ có 1 epoch =

@@ -892,9 +892,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     def phase_of(ep: int) -> str:
         """`warmup` chỉ nói về lr, không phải một trạng thái đóng băng.
 
-        KHÔNG còn epoch "norm" của bản ResNet50 (ViT không có BatchNorm nên
-        không có thống kê chạy nào phải kéo về ảnh CXR), và cũng không còn epoch
-        đóng băng nào: backbone học từ bước 0.
+        Chỉ có hai pha: `warmup` rồi `base`. Không có epoch đóng băng nào —
+        backbone học từ bước 0.
         """
         return "warmup" if ep <= sc["n_warmup_epochs"] else "base"
 

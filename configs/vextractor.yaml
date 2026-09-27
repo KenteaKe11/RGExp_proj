@@ -16,7 +16,7 @@
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
 # với Q = Aligner(Extractor(ConvNeXt-B-teacher(ảnh 448²))) — 32 vector MỚI; Z (256 token ảnh) KHÔNG bị đụng vào.
 # 32 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
-# tạo 0. Ở /5 Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
+# tạo 0. Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
 # và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
 # thông tin là các đặc trưng thị giác nó đọc. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
 # Holm trên các metric (`src/stats_ab.py`).
@@ -287,7 +287,7 @@ vextractor_exp:
     name: "QLoRA r=32 · full decoder + V-Extractor (Q)"
 
 # ── Nhãn bệnh lý — CHỈ CHO LENS (csv_helper/labels.npz, `src/labels_cls.py`) ──
-# Từ bố cục /5, Stage 0 là TỰ GIÁM SÁT và KHÔNG đọc nhãn nào. Khối này chỉ còn
+# Stage 0 là TỰ GIÁM SÁT và KHÔNG đọc nhãn nào. Khối này chỉ còn
 # phục vụ `lens`: chọn ảnh minh hoạ (nhiều pos + uncertain nhất) và in bảng 14
 # nhãn của ảnh ấy. Nó KHÔNG vào vân tay Stage 0 và KHÔNG vào loss nào cả.
 labels:
@@ -341,17 +341,17 @@ labels:
 #
 # BA residual: hai cái NGOÀI CÙNG đều từ `learner` — đúng hai mũi tên đi thẳng
 # từ khối "32 Learners" trong sơ đồ — còn cái ở GIỮA vòng quanh riêng MLP.
-# Bố cục /8 không có dấu `+` giữa ấy (Extractor /8 không có MLP nào).
+# HAI khối SwiGLU, HAI khoá khai riêng: `vextractor.mlp_hidden` (giữa hai
+# attention) và `aligner.mlp_hidden` (FFN sau residual thứ ba).
 #
 # `d_branch` = `d_model` = 2560: `Linear 512→2560` ngay sau backbone đã đổi
-# chiều, nên KHÔNG còn chỗ nào nở ra ở cuối, và Aligner là một FFN thuần. Vẫn
+# chiều, nên KHÔNG có chỗ nào nở ra ở cuối, và Aligner là một FFN thuần. Vẫn
 # là HAI khoá riêng (`d_model` đọc từ AutoConfig của decoder), nên đổi base
 # sang decoder khác chiều sẽ lộ ra chứ không lặng lẽ. Stage 0 không dùng cả
 # hai — nó chỉ chạy backbone + một DINO head.
 #
-# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2560. Mỗi khối attention là 4 × 2560² = 26,2 M tham số
-# (ở 768 chỉ 2,36 M), nên riêng Self + Cross đã 52,4 M và phần HỌC ĐƯỢC của
-# nhánh phình lên ~3× so với /7. Backbone và Stage 0 KHÔNG đổi gì. Nếu hết
+# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2560. Mỗi khối attention là 4 × 2560² = 26,2 M tham số,
+# nên riêng Self + Cross đã 52,4 M, và MLP giữa chúng thêm 15,73 M nữa. Nếu hết
 # VRAM ở main stage thì đây là chỗ nhìn trước, không phải `train.max_seq_len`.
 #
 # Trọng số nền LÀ DINOv3 thật: `convnext_base.dinov3_lvd1689m` là một trong
@@ -369,8 +369,8 @@ labels:
 # Vì `n_stages` quyết định chính những tensor Stage 0 lưu ra, nó nằm TRONG
 # `backbone_spec`: đổi nó là checkpoint Stage 0 cũ bị từ chối ồn ào.
 #
-# Aligner ở /9 là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
-# sau residual thứ BA, không attn/residual nào thêm. Nó KHÔNG còn đổi chiều
+# Aligner là RMSNorm(2560) + SwiGLU 2560→2048→2560 — một FFN THUẦN đứng
+# sau residual thứ BA, không attn/residual nào thêm. Nó KHÔNG đổi chiều
 # (việc ấy đã xong ở `Linear 512→2560`), nên vai trò của nó là trộn lại 32
 # vector sau khi chúng đã đọc xong ảnh.
 #
@@ -382,8 +382,8 @@ labels:
 #
 # RMSNorm ở đầu Aligner là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN,
 # và một cổng nhân ăn đầu vào nhỏ thì BÌNH PHƯƠNG cái nhỏ ấy. Q_raw tới với RMS
-# ~0,1 (learner khởi tạo 0,02, residual do nó chi phối). Đo trên bố cục /7 —
-# cùng cấu trúc, KHÔNG có RMSNorm: RMS(Q) ở bước 0 rơi xuống 1,07e-4, và trên
+# ~0,1 (learner khởi tạo 0,02, residual do nó chi phối). Đo trên chính khối
+# này khi BỎ RMSNorm: RMS(Q) ở bước 0 rơi xuống 1,07e-4, và trên
 # model đồ chơi của selftest nó underflow HẲN về 0 (bản đồ saliency của Lens
 # thành ma trận không). Vì cùng lý do, ba ma trận này init `1/√fan_in` và
 # `_init` PHẢI bỏ qua chúng — đè normal(0, 0.02) lên là quay lại đúng ca ấy.
@@ -419,16 +419,15 @@ vextractor:
     # MỌI attention của nhánh (Self + Cross) chạy ở head_dim CỐ ĐỊNH này; số
     # head được SUY RA = d_branch // head_dim (2560 // 128 = 20).
     #
-    # Vì sao khai head_dim chứ không khai n_heads: `d_branch` đã đổi ba lần từ
-    # /5 tới /8 (768 -> 1024 -> 768 -> 2560). Khai n_heads thì mỗi lần ấy
-    # head_dim rơi ra một giá trị khác mà không ai để ý — 768/6 = 128 nhưng
-    # 1024/6 = 170,7 (không chia hết) và 2048/20 = 102,4. Khai cái BẤT BIẾN,
-    # suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì DỪNG.
-    # Khai `n_heads` ở đây bị TỪ CHỐI ồn ào.
+    # Vì sao khai head_dim chứ không khai n_heads: mỗi lần ai đó sửa
+    # `d_branch`, head_dim sẽ rơi ra một giá trị khác mà không ai để ý —
+    # 2560/20 = 128 nhưng 2048/20 = 102,4 và 1024/20 không chia hết. Khai cái
+    # BẤT BIẾN, suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì
+    # DỪNG. Khai `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
     head_dim: 128
     # Bề rộng MLP GIỮA Self-attn và Cross-attn (SwiGLU, residual vòng quanh
     # RIÊNG nó). KHÁC `aligner.mlp_hidden` bên dưới — đó là FFN SAU residual
-    # thứ ba. Hai khối, hai khoá; /8 chỉ có khối thứ hai, /9 có cả hai.
+    # thứ ba. HAI khối, HAI khoá: đọc nhầm khoá là đổi sai khối.
     mlp_hidden: 2048        # SwiGLU 2560 -> 2048 -> 2560 (giữa hai attention)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   aligner:                  # FFN THUẦN sau residual thứ BA; KHÔNG đổi chiều
