@@ -22,8 +22,9 @@ của đích chứ không còn chống sụp (xem `dino.CompressorTransferTraine
 
 ═══ HAI nhóm lr, và đó là điểm riêng của Stage 1 ══════════════════════════════
 
-Cả hai chạy lịch CHUNG 25/50/25 của `src/schedule.py`, nhưng trên hai bộ ba số
-khác nhau:
+Cả hai chạy lịch CHUNG của `src/schedule.py` — ba chặng đầu gói TRỌN trong
+`sched_epochs` epoch ĐẦU (mặc định **1**), rồi PHẲNG `lr_main` trên mọi epoch
+còn lại — nhưng trên hai bộ ba số khác nhau:
 
     Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 7e-5 -> 1e-5
     FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4 -> 3e-5
@@ -102,7 +103,9 @@ def s1cfg(cfg: Cfg) -> dict:
         "ffn_lr_min": float(s.get("ffn_lr_min", 1e-7)),
         "ffn_lr_max": float(s.get("ffn_lr_max", 1e-4)),
         "ffn_lr_main": float(s.get("ffn_lr_main", 3e-5)),
-        "sched_epochs": int(s.get("sched_epochs", s.get("max_epochs", 20))),
+        # CỬA SỔ của ba chặng đầu, tính bằng EPOCH. KHÔNG phải độ dài giai
+        # đoạn — đó là `max_epochs`.
+        "sched_epochs": int(s.get("sched_epochs", 1)),
         "max_epochs": int(s.get("max_epochs", 20)),
         "tail_epochs": int(s.get("tail_epochs", 1)),
         "patience": int(s.get("patience", 2)),
@@ -136,7 +139,11 @@ def s1cfg(cfg: Cfg) -> dict:
 
 
 def lrs_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
-    """lr của HAI nhóm tại bước `step` — cùng lịch 25/50/25, hai bộ ba số."""
+    """lr của HAI nhóm tại bước `step` — cùng lịch 25/50/25, hai bộ ba số.
+
+    Cửa sổ của ba chặng đầu là `sched_epochs` epoch (mặc định 1); từ bước
+    `sched_epochs × steps_per_epoch` trở đi cả hai nhóm chạy phẳng `lr_main`.
+    """
     n = max(1, int(sc["sched_epochs"]) * int(steps_per_epoch))
     return {"attn": SCH.staged_lr(step, n, sc["attn_lr_min"], sc["attn_lr_max"],
                                   sc["attn_lr_main"]),
@@ -291,15 +298,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
           f"{n_hd:,} (bỏ sau Stage 1) · Extractor "
           f"{sum(p.numel() for p in ex.parameters()):,} ĐỨNG YÊN · pool "
           f"{dc['pool']} · {dc['out_dim']} prototype", flush=True)
-    print(f"  Stage 1 · lịch chung 25/50/25 trên {sc['sched_epochs']} epoch · "
-          f"attn {sc['attn_lr_min']:g} -> {sc['attn_lr_max']:g} -> "
-          f"{sc['attn_lr_main']:g} │ ffn {sc['ffn_lr_min']:g} -> "
-          f"{sc['ffn_lr_max']:g} -> {sc['ffn_lr_main']:g} · wd "
-          f"{sc['weight_decay']} · TRẦN {sc['max_epochs']} epoch, patience "
-          f"{sc['patience']} (+{sc['tail_epochs']} epoch đuôi cosine về lr_min) "
-          f"· batch {sc['batch_size']} · val {sc['val_n_samples']} mẫu",
-          flush=True)
-
     mean = spec["extractor"]["normalize"]["mean"]
     std = spec["extractor"]["normalize"]["std"]
     ds = S0.ImageOnlyDataset(train_df, ex.image_size, mean, std, dc, seed)
@@ -319,6 +317,16 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             f"stage1.micro_batch {micro} phải là ước của batch_size "
             f"{sc['batch_size']}.")
     steps_per_epoch = max(1, len(ds) // int(sc["batch_size"]))
+    _b = SCH.phase_bounds(sc["sched_epochs"] * steps_per_epoch)
+    print(f"  Stage 1 · lịch chung 25/50/25 gói trong {sc['sched_epochs']} epoch "
+          f"ĐẦU ({_b['warmup']}+{_b['hold']}+{_b['decay']} bước) rồi PHẲNG · "
+          f"attn {sc['attn_lr_min']:g} -> {sc['attn_lr_max']:g} -> "
+          f"{sc['attn_lr_main']:g} │ ffn {sc['ffn_lr_min']:g} -> "
+          f"{sc['ffn_lr_max']:g} -> {sc['ffn_lr_main']:g} · wd "
+          f"{sc['weight_decay']} · TRẦN {sc['max_epochs']} epoch, patience "
+          f"{sc['patience']} (+{sc['tail_epochs']} epoch đuôi cosine về lr_min) "
+          f"· batch {sc['batch_size']} · val {sc['val_n_samples']} mẫu",
+          flush=True)
     accum = int(sc["batch_size"]) // micro
     opt = torch.optim.AdamW(
         tr.param_groups(sc["attn_lr_min"], sc["ffn_lr_min"]),
@@ -406,7 +414,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     lrs_last = lrs_at(0, sc, steps_per_epoch)
     for ep in range(1, sc["max_epochs"] + 1):
         s_first = (ep - 1) * steps_per_epoch
-        phase = SCH.phase_name(s_first, sc["sched_epochs"] * steps_per_epoch)
+        phase = SCH.phase_span(s_first, ep * steps_per_epoch - 1,
+                               sc["sched_epochs"] * steps_per_epoch)
         ds.set_epoch(ep)
         tl, lrs_last = run_epoch(ep, lambda gs: lrs_at(gs, sc, steps_per_epoch),
                                  s_first)

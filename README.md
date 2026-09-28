@@ -257,12 +257,30 @@ lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) v
 
 ## 2.0. Lịch CHUNG (`src/schedule.py`)
 
-Stage 0 và Stage 1 dùng **cùng một hàm**, trải trên `sched_epochs` epoch:
+Stage 0 và Stage 1 dùng **cùng một hàm**. Ba chặng đầu gói **trọn trong
+`sched_epochs` epoch ĐẦU** (mặc định **1**); chặng thứ tư phủ **mọi epoch còn
+lại**:
 
-1. **warm-up** tuyến tính `lr_min` → `lr_max` — **25%** đầu
-2. **giữ phẳng** `lr_max` — **50%** kế
-3. **cosine decay** `lr_max` → `lr_main` — **25%** kế
-4. **phẳng** `lr_main` — phần còn lại
+1. **warm-up** tuyến tính `lr_min` → `lr_max` — **25%** của epoch đầu
+2. **giữ phẳng** `lr_max` — **50%** kế (vẫn trong epoch đầu)
+3. **cosine decay** `lr_max` → `lr_main` — **25%** kế (hết epoch đầu)
+4. **phẳng** `lr_main` — **mọi epoch còn lại**
+
+Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**, trần 50 epoch): warm-up
+**50 bước**, giữ đỉnh **100 bước**, cosine **50 bước** — rồi **49 epoch chạy
+phẳng `lr_main`**. Đó là ý của "Fixed `lr_main` (the rest)": *the rest* là phần
+còn lại của **cả giai đoạn**, không phải một mẩu dư của phép làm tròn.
+
+> **`sched_epochs` là CỬA SỔ của ba chặng đầu, không phải độ dài giai đoạn** —
+> đó là `max_epochs`. Đọc nhầm hai khoá ấy thành một cho một đường lr khác hẳn
+> (warm-up kéo 12,5 epoch, chặng 4 rỗng), và **cả hai cách đều chạy trót lọt**
+> mà không có gì trong loss báo ra chỗ khác nhau. Selftest khoá đúng chỗ này:
+> nó đòi mọi epoch từ epoch 2 trở đi phải đã phẳng ở `lr_main`.
+
+Ba siêu tham số **khác** có đơn vị epoch và **không** đi theo cửa sổ ấy:
+momentum EMA của teacher (cosine trên **toàn** giai đoạn, `max_epochs`),
+`teacher_temp_warmup_epochs` và `freeze_last_layer_epochs` — chúng tả hàm mục
+tiêu DINO chứ không tả lịch lr.
 
 lr là hàm **thuần của số bước**, không phải một đối tượng scheduler mang trạng
 thái, nên chạy tiếp từ epoch k chỉ cần biết k. Nội suy trên **giá trị** lr chứ
@@ -287,7 +305,7 @@ tay: nếu giai đoạn dừng sớm ở giữa chặng `hold` thì lr đang là
 |---|---|
 | Mục tiêu | Biến Extractor thành module học đặc trưng chất lượng cao trên miền CXR |
 | lr | `lr_min=1e-7` · `lr_max=1e-4` · `lr_main=3e-5` |
-| Epoch | `50` (lịch 25/50/25 trải trọn ngần này) |
+| Epoch | `50` (trần); lịch 25/50/25 gói trong **epoch đầu**, 49 epoch sau phẳng `lr_main` |
 | Patience | `4` — đạt patience thì cosine decay về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Điểm xuất phát | Nạp lại trọng số pretrain DINOv3 rồi finetune tiếp |
 
@@ -354,7 +372,7 @@ dùng bản này. Không có đuôi thì `final/` trùng `base/` từng bit.
 | Mục tiêu | Làm giàu không gian Compressor trước khi đưa vào Aligner → Concat |
 | lr (Attn) | `lr_min=1e-8` · `lr_max=7e-5` · `lr_main=1e-5` |
 | lr (FFN) | `lr_min=1e-7` · `lr_max=1e-4` · `lr_main=3e-5` |
-| Epoch | `20` (lịch 25/50/25 trải trọn ngần này) |
+| Epoch | `20` (trần); lịch 25/50/25 gói trong **epoch đầu**, các epoch sau phẳng `lr_main` |
 | Patience | `2` — đạt patience thì cosine decay về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Nhãn | DINOv3 Teacher (Extractor Stage 0) + Head Infer (Stage 0) sinh nhãn chuẩn DINOv3 |
 
@@ -584,7 +602,8 @@ adapters_vextractor/_stage0/                   STAGE 0 — DINOv3 finetune
     base/dino_head.safetensors               DINO head TEACHER (Stage 1 cần)
     final/…                                  tốt nhất sau epoch đuôi — Stage 1 + main stage dùng bản này
     loader.json                              fixture + sha key, `labels: null` (TỰ GIÁM SÁT), thứ tự,
-                                             batch/micro, lịch 25/50/25, khối `augment` + `dino`, spec, vân tay
+                                             batch/micro, lịch 25/50/25 (kèm MỐC BƯỚC thật của từng
+                                             chặng), khối `augment` + `dino`, spec, vân tay
     stage0_history.json                      từng epoch: train/val loss DINO, val_score, phase
     last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
 adapters_vextractor/_stage1/                   STAGE 1 — chuyển giao Compressor
@@ -626,8 +645,9 @@ history, nên so hash là vứt mọi checkpoint đẩy lên trước lần sử
 configs/vextractor.yaml · configs/gpu/rtx3060.yaml (stage0/stage1 micro_batch + probe_sizes)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → Stage 1 → main B → sinh → chấm) · stats · lens · push
-src/schedule.py          LỊCH DÙNG CHUNG: staged_lr 25/50/25 · tail_lr · warmup_flat ·
-                         frozen_warmup_flat — một chỗ duy nhất viết công thức
+src/schedule.py          LỊCH DÙNG CHUNG: staged_lr (25/50/25 trong epoch ĐẦU, rồi phẳng) ·
+                         phase_span · tail_lr · warmup_flat · frozen_warmup_flat
+                         — một chỗ duy nhất viết công thức
 src/vextractor.py        Extractor (ConvNeXt DINOv3, ladder dựng model có probe forward thật,
                          NCHW/NHWC/NLC, cắt stage) + Compressor (QFormer: 32 latent @1024,
                          N nhóm × [SelfAttn → CrossAttn → SwiGLU │ SelfAttn → SwiGLU],

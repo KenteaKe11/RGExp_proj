@@ -24,15 +24,24 @@ hẳn.
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
-Lịch CHUNG của `src/schedule.py`, trải trên `sched_epochs` (50) epoch:
+Lịch CHUNG của `src/schedule.py`. Ba chặng đầu gói TRỌN trong `sched_epochs`
+epoch ĐẦU (mặc định **1**), chặng thứ tư phủ mọi epoch còn lại:
 
-    1. warm-up tuyến tính `lr_min` (1e-7) -> `lr_max` (1e-4)   25% đầu
+    1. warm-up tuyến tính `lr_min` (1e-7) -> `lr_max` (1e-4)   25% của epoch đầu
     2. giữ phẳng `lr_max`                                       50% kế
     3. cosine decay `lr_max` -> `lr_main` (3e-5)                25% kế
-    4. phẳng `lr_main`                                          phần còn lại
+    4. phẳng `lr_main` (3e-5)                                   49 epoch còn lại
+
+Với 6400 mẫu và batch 32 (200 bước/epoch): warm-up 50 bước, giữ đỉnh 100 bước,
+cosine 50 bước, rồi phẳng 3e-5 tới lúc dừng. "Fixed `lr_main` (the rest)" của
+đặc tả là **phần còn lại của cả giai đoạn**, không phải một mẩu dư.
 
 lr là hàm THUẦN của số bước, không phải một đối tượng scheduler mang trạng
 thái, nên chạy tiếp từ epoch k chỉ cần biết k.
+
+**`sched_epochs` KHÔNG phải độ dài giai đoạn** — đó là `max_epochs`. Nó là cửa
+sổ của ba chặng đầu, và đọc nhầm hai khoá ấy thành một cho hai đường lr khác
+hẳn nhau mà không có gì báo (xem docstring `src/schedule.py`).
 
 **Dừng sớm, và cái ĐUÔI của nó.** `patience` = 4 epoch LIÊN TIẾP val không cải
 thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc: nó chạy THÊM một
@@ -119,10 +128,11 @@ def s0cfg(cfg: Cfg) -> dict:
         "lr_min": float(s.get("lr_min", 1e-7)),
         "lr_max": float(s.get("lr_max", 1e-4)),
         "lr_main": float(s.get("lr_main", 3e-5)),
-        # Lịch 25/50/25 TRẢI trên ngần này epoch. Tách khỏi `max_epochs` để
-        # nâng trần chạy mà KHÔNG đổi hình dạng lịch (phần dôi ra chạy phẳng
-        # `lr_main`); mặc định hai số bằng nhau như đặc tả.
-        "sched_epochs": int(s.get("sched_epochs", s.get("max_epochs", 50))),
+        # CỬA SỔ của ba chặng đầu (warm-up + giữ đỉnh + cosine), tính bằng
+        # EPOCH. Mặc định 1: cả ba chặng gói trọn trong epoch ĐẦU, rồi mọi
+        # epoch sau chạy phẳng `lr_main`. KHÔNG phải độ dài giai đoạn — đó là
+        # `max_epochs`, và gộp hai khoá này là đổi hẳn hình dạng đường lr.
+        "sched_epochs": int(s.get("sched_epochs", 1)),
         "max_epochs": int(s.get("max_epochs", 50)),
         # Epoch "hạ cánh" sau khi patience hết: cosine về lr_min.
         "tail_epochs": int(s.get("tail_epochs", 1)),
@@ -260,6 +270,10 @@ def dino_cfg(s: dict) -> dict:
 # ── lịch lr ────────────────────────────────────────────────────────────────
 def sched_lr_at(step: int, sc: dict, steps_per_epoch: int) -> float:
     """lr tại bước `step` (0-based, tính từ đầu Stage 0) — lịch CHUNG 25/50/25.
+
+    Cửa sổ của ba chặng đầu là `sched_epochs` epoch (mặc định 1), nên với 200
+    bước/epoch: warm-up [0, 50), giữ đỉnh [50, 150), cosine [150, 200), rồi
+    PHẲNG `lr_main` từ bước 200 tới hết.
 
     Một con số cho MỌI nhóm tham số (Extractor và DINO head): đặc tả Stage 0
     khai đúng một bộ ba lr, nên tách nhóm ở đây là tự thêm một siêu tham số
@@ -586,6 +600,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     ds_tr = ImageOnlyDataset(train_df, img_size, nz_mean, nz_std, dc, seed)
     ds_va = ImageOnlyDataset(val_df, img_size, nz_mean, nz_std, dc, seed)
     assert_same_pixels(ds_tr, cfg)
+    # Tính TRƯỚC mọi dòng in lịch: cả hai chỉ phụ thuộc tập train và batch hiệu
+    # dụng, và lịch lr được mô tả bằng SỐ BƯỚC nên nó cần `steps_per_epoch` để
+    # nói ra được mốc thật của từng chặng.
+    n = len(ds_tr)
+    bs_eff = sc["batch_size"]
+    steps_per_epoch = math.ceil(n / bs_eff)
 
     # CHỈ Extractor — không Compressor, không Aligner, không Cls Head.
     (body, d_feat, n_patch, n_use, kind, fmt, multi_res,
@@ -635,10 +655,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
              f"kỷ lục quá {sc['min_delta']:g}, rồi chạy thêm "
              f"{sc['tail_epochs']} epoch cosine về {sc['lr_min']:g}"
              if sc["patience"] else "KHÔNG dừng sớm (patience 0)")
-    print(f"  Stage 0 · lịch chung 25/50/25 trên {sc['sched_epochs']} epoch: "
-          f"warm-up {sc['lr_min']:g} -> {sc['lr_max']:g} (25%) · giữ "
-          f"{sc['lr_max']:g} (50%) · cosine -> {sc['lr_main']:g} (25%) · phẳng "
-          f"{sc['lr_main']:g} · wd {sc['weight_decay']} · TRẦN "
+    _b = SCH.phase_bounds(sc["sched_epochs"] * steps_per_epoch)
+    print(f"  Stage 0 · lịch chung 25/50/25 gói trong {sc['sched_epochs']} epoch "
+          f"ĐẦU ({_b['n_sched']} bước): warm-up {sc['lr_min']:g} -> "
+          f"{sc['lr_max']:g} ({_b['warmup']} bước) · giữ {sc['lr_max']:g} "
+          f"({_b['hold']} bước) · cosine -> {sc['lr_main']:g} ({_b['decay']} "
+          f"bước) · rồi PHẲNG {sc['lr_main']:g} tới hết · wd "
+          f"{sc['weight_decay']} · TRẦN "
           f"{sc['max_epochs']} epoch, {_stop} · epoch đem đi: {sc['select']} · "
           f"batch {sc['batch_size']} · val {sc['val_n_samples']} mẫu "
           f"{'bốc lại mỗi epoch' if sc['val_resample'] else 'CỐ ĐỊNH'}",
@@ -652,8 +675,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
 
     # ── micro-batch theo VRAM (batch hiệu dụng giữ nguyên) ────────────────
     from . import autobatch
-
-    bs_eff = sc["batch_size"]
 
     def _probe(k: int) -> None:
         # Dò ở ĐÚNG trạng thái của vòng lặp: student có gradient trên CẢ
@@ -689,9 +710,6 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             start_epoch = int(st["epoch"]) + 1
             print(f"  ⚙ Stage 0 chạy TIẾP từ epoch {start_epoch} (best đang là "
                   f"epoch {best['epoch']})", flush=True)
-
-    n = len(ds_tr)
-    steps_per_epoch = math.ceil(n / bs_eff)
 
     # ── nạp ảnh trong luồng nền ───────────────────────────────────────────
     from collections import deque
@@ -746,8 +764,12 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
         # `score` cao hơn = tốt hơn (quy ước của toàn bộ phần best/patience).
         return {"loss": loss, "score": -loss, "n_val": len(vidx)}
 
-    # Lịch RIÊNG của DINO, theo BƯỚC — độc lập với lịch lr.
-    total_steps = max(1, sc["sched_epochs"] * steps_per_epoch)
+    # Lịch RIÊNG của DINO, theo BƯỚC — độc lập với lịch lr. Momentum EMA
+    # cosine 0.996 -> 1 phải trải trên TOÀN giai đoạn (`max_epochs`), KHÔNG
+    # theo cửa sổ `sched_epochs` của lịch lr: hai thứ ấy trả lời hai câu khác
+    # nhau, và buộc chúng chung một mẫu số là để teacher đứng yên hẳn từ cuối
+    # epoch 1.
+    total_steps = max(1, sc["max_epochs"] * steps_per_epoch)
     tt_warm = int(round(float(dc["teacher_temp_warmup_epochs"]) * steps_per_epoch))
     # `freeze_last_layer`: lớp prototype cuối bị giữ nguyên trong ngần này epoch
     # đầu. Nó là thứ dễ sụp nhất (K vector cạnh tranh nhau ngay từ bước 1).
@@ -857,7 +879,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     for ep in range(start_epoch, sc["max_epochs"] + 1):
         t_ep = time.time()
         s_first = (ep - 1) * steps_per_epoch
-        phase = SCH.phase_name(s_first, sc["sched_epochs"] * steps_per_epoch)
+        # Nhãn pha của CẢ epoch: epoch đầu đi qua cả ba chặng, nên một nhãn
+        # lấy ở bước đầu sẽ giấu mất hai chặng kia.
+        phase = SCH.phase_span(s_first, ep * steps_per_epoch - 1,
+                               sc["sched_epochs"] * steps_per_epoch)
         lr0 = sched_lr_at(s_first, sc, steps_per_epoch)
         lr1 = sched_lr_at(ep * steps_per_epoch - 1, sc, steps_per_epoch)
         wait = (f" · chờ {bad}/{sc['patience']}" if sc["patience"] and bad else "")
@@ -1045,7 +1070,8 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                           "teacher_warmup_epochs": dc["teacher_temp_warmup_epochs"]},
                  "center_momentum": dc["center_momentum"],
                  "ema": {"start": dc["momentum_start"], "end": dc["momentum_end"],
-                         "schedule": "cosine theo BƯỚC trên toàn bộ sched_epochs"},
+                         "schedule": "cosine theo BƯỚC trên toàn bộ max_epochs "
+                                     "(KHÔNG theo cửa sổ sched_epochs của lịch lr)"},
                  "pairs": "teacher CHỈ thấy 2 global; student thấy tất cả; cặp "
                           "trùng view bị bỏ"},
         "batch": {"batch_size": sc["batch_size"], "micro_batch": int(micro),
@@ -1059,13 +1085,17 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                      "lr_min": sc["lr_min"], "lr_max": sc["lr_max"],
                      "lr_main": sc["lr_main"],
                      "sched_epochs": sc["sched_epochs"],
+                     "sched_epochs_note": ("CỬA SỔ của ba chặng đầu, KHÔNG phải "
+                                           "độ dài giai đoạn (đó là max_epochs)"),
                      "phase_steps": bounds,
                      "lr_schedule": (
-                         f"warm-up tuyến tính {sc['lr_min']:g} -> "
-                         f"{sc['lr_max']:g} trong 25% của "
-                         f"{sc['sched_epochs']} epoch · giữ {sc['lr_max']:g} "
-                         f"50% · cosine -> {sc['lr_main']:g} 25% · phẳng "
-                         f"{sc['lr_main']:g} phần còn lại"),
+                         f"ba chặng đầu gói trong {sc['sched_epochs']} epoch ĐẦU "
+                         f"({bounds['n_sched']} bước): warm-up tuyến tính "
+                         f"{sc['lr_min']:g} -> {sc['lr_max']:g} "
+                         f"({bounds['warmup']} bước) · giữ {sc['lr_max']:g} "
+                         f"({bounds['hold']} bước) · cosine -> "
+                         f"{sc['lr_main']:g} ({bounds['decay']} bước) · rồi "
+                         f"PHẲNG {sc['lr_main']:g} trên MỌI epoch còn lại"),
                      "weight_decay": sc["weight_decay"],
                      "max_epochs": sc["max_epochs"],
                      "early_stop": {"patience": sc["patience"],

@@ -489,7 +489,9 @@ vextractor:
 # `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức khác
 # nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
 #
-# HAI nhóm lr, cùng lịch chung 25/50/25 nhưng hai bộ ba số. Ma trận attention
+# HAI nhóm lr, cùng lịch chung nhưng hai bộ ba số. Ba chặng đầu (warm-up + giữ
+# đỉnh + cosine) gói TRỌN trong `sched_epochs` epoch ĐẦU; mọi epoch sau chạy
+# phẳng `lr_main`. Ma trận attention
 # quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
 # bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
 # lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
@@ -502,7 +504,10 @@ stage1:
   ffn_lr_min: 1.0e-7
   ffn_lr_max: 1.0e-4
   ffn_lr_main: 3.0e-5
-  sched_epochs: 20        # lịch 25/50/25 TRẢI trên ngần này epoch
+  # CỬA SỔ của ba chặng đầu, tính bằng EPOCH. 1 = warm-up/giữ đỉnh/cosine gói
+  # trọn trong epoch ĐẦU rồi phẳng `lr_main` tới hết. KHÔNG phải độ dài giai
+  # đoạn — đó là `max_epochs` bên dưới.
+  sched_epochs: 1
   max_epochs: 20          # TRẦN, không phải số epoch sẽ chạy — patience quyết
   patience: 2             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
   tail_epochs: 1          # rồi chạy thêm ngần này epoch cosine về lr_min của
@@ -536,11 +541,20 @@ stage1:
 # tiêu trong DINO — Stage 1 và main stage vì thế chạy Extractor ở đúng chế độ
 # teacher inference.
 #
-# LỊCH CHUNG (`src/schedule.py`), trải trên `sched_epochs` = 50 epoch:
-#   1. warm-up tuyến tính 1e-7 -> 1e-4   25% đầu
-#   2. giữ phẳng 1e-4                     50% kế
-#   3. cosine decay 1e-4 -> 3e-5          25% kế
-#   4. phẳng 3e-5                         phần còn lại
+# LỊCH CHUNG (`src/schedule.py`). Ba chặng đầu gói TRỌN trong `sched_epochs`
+# epoch ĐẦU (= 1), chặng thứ tư phủ mọi epoch còn lại:
+#   1. warm-up tuyến tính 1e-7 -> 1e-4   25% của epoch ĐẦU   (50/200 bước)
+#   2. giữ phẳng 1e-4                     50% kế             (100/200 bước)
+#   3. cosine decay 1e-4 -> 3e-5          25% kế             (50/200 bước)
+#   4. phẳng 3e-5                         49 EPOCH CÒN LẠI
+#
+# Với 6400 mẫu và batch 32 thì một epoch = 200 bước, nên ba chặng đầu là
+# 50 + 100 + 50 bước. "Fixed lr_main (the rest)" của đặc tả là phần còn lại của
+# CẢ GIAI ĐOẠN, không phải một mẩu dư của phép làm tròn.
+#
+# ⚠ `sched_epochs` KHÔNG phải độ dài giai đoạn — đó là `max_epochs`. Đọc nhầm
+# hai khoá ấy thành một cho một đường lr khác hẳn (warm-up kéo 12,5 epoch,
+# chặng 4 rỗng), và cả hai cách đều chạy trót lọt mà không có gì báo.
 #
 # DỪNG SỚM và cái ĐUÔI của nó: `patience` = 4 epoch LIÊN TIẾP val không cải
 # thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc, nó chạy THÊM
@@ -558,8 +572,8 @@ stage0:
   lr_min: 1.0e-7            # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này) và ĐÁY của đuôi
   lr_max: 1.0e-4            # ĐỈNH, giữ phẳng 50% lịch
   lr_main: 3.0e-5           # mức chạy sau cosine decay
-  sched_epochs: 50          # lịch 25/50/25 TRẢI trên ngần này epoch
-  max_epochs: 50            # TRẦN thật sự; = sched_epochs nên chặng 4 rỗng
+  sched_epochs: 1           # CỬA SỔ của ba chặng đầu (epoch). Xem chú thích trên.
+  max_epochs: 50            # TRẦN thật sự của giai đoạn
   weight_decay: 0.03
   # ── dừng sớm ───────────────────────────────────────────────────────────
   # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`

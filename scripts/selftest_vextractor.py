@@ -965,6 +965,8 @@ def _():
     from src.train_vextractor import MAIN_CFG_KEYS, zcfg
 
     # ── hình dạng lịch: bốn chặng, mốc đúng tỉ lệ ──────────────────────────
+    # `n` = cửa sổ của BA CHẶNG ĐẦU = MỘT epoch (200 bước với 6400 mẫu / batch
+    # 32), KHÔNG phải cả giai đoạn.
     n = 200
     b = S.phase_bounds(n)
     assert (b["warmup"], b["hold"], b["decay"]) == (50, 100, 50)
@@ -998,19 +1000,44 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
     assert (sc["lr_min"], sc["lr_max"], sc["lr_main"]) == (1e-7, 1e-4, 3e-5)
-    assert sc["sched_epochs"] == sc["max_epochs"] == 50
+    # CỬA SỔ của ba chặng đầu là MỘT epoch; TRẦN của giai đoạn là 50 epoch.
+    # Gộp hai khoá này (sched_epochs = max_epochs) cho một đường lr KHÁC HẲN —
+    # warm-up kéo 12,5 epoch và chặng 4 rỗng — mà không có gì báo.
+    assert sc["sched_epochs"] == 1 and sc["max_epochs"] == 50
     assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
     assert (s1c["attn_lr_min"], s1c["attn_lr_max"], s1c["attn_lr_main"]) == (1e-8, 7e-5, 1e-5)
     assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"], s1c["ffn_lr_main"]) == (1e-7, 1e-4, 3e-5)
-    assert s1c["sched_epochs"] == s1c["max_epochs"] == 20 and s1c["patience"] == 2
+    assert s1c["sched_epochs"] == 1 and s1c["max_epochs"] == 20
+    assert s1c["patience"] == 2
     zc = zcfg(cfg)
     assert set(zc) == set(MAIN_CFG_KEYS)
     assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
     assert zc["align_warmup_frac"] == 0.10
     assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 1e-5)
     assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
+
+    # ── chặng 4 PHỦ phần lớn giai đoạn, không phải một mẩu dư ────────────
+    # Đây là bài kiểm chống ĐÚNG cách đọc sai đã xảy ra một lần: hiểu "25%
+    # epoch" thành "25% tổng số epoch". Với cách đọc ấy, lr ở giữa giai đoạn
+    # (epoch 25/50) vẫn đang ở ĐỈNH; với cách đọc đúng, mọi epoch từ epoch 2
+    # trở đi đã phẳng ở `lr_main`.
+    spe = 200                                   # 6400 mẫu / batch 32
+    win = sc["sched_epochs"] * spe
+    assert win == spe, "cửa sổ lịch phải là ĐÚNG một epoch"
+    for ep in range(2, sc["max_epochs"] + 1):   # epoch 2..50: PHẲNG lr_main
+        for k in ((ep - 1) * spe, ep * spe - 1):
+            assert s0.sched_lr_at(k, sc, spe) == sc["lr_main"], (ep, k)
+    # epoch 1 thì đi qua CẢ BA chặng
+    assert S.phase_span(0, spe - 1, win) == "warmup→decay"
+    assert S.phase_span(spe, 2 * spe - 1, win) == "flat"
+    assert s0.sched_lr_at(0, sc, spe) == sc["lr_min"]
+    assert s0.sched_lr_at(spe // 4, sc, spe) == sc["lr_max"]
+    # Stage 1 cũng vậy — hai nhóm, cùng một cửa sổ
+    for k in (s1c["sched_epochs"] * spe, 10 * spe):
+        assert s1.lrs_at(k, s1c, spe) == {"attn": s1c["attn_lr_main"],
+                                          "ffn": s1c["ffn_lr_main"]}
 
     # ── ba đỉnh phải theo thứ tự, và khoá LẠ bị từ chối ───────────────────
     for blk, mod, bad in (("stage0", s0.s0cfg, {"lr_min": 1e-3}),
@@ -1079,7 +1106,7 @@ def _():
                                    local_size=SMALL_IMG // 2, n_local=2,
                                    out_dim=64, hidden=32, bottleneck=16),
                          batch_size=4, micro_batch=2, probe_sizes=[2, 4],
-                         sched_epochs=8, max_epochs=8, patience=2, tail_epochs=1)
+                         sched_epochs=1, max_epochs=8, patience=2, tail_epochs=1)
     cfg["autobatch"] = {"enabled": False}
     keys = [f"k{i}" for i in range(12)]
 
@@ -1129,10 +1156,11 @@ def _():
             assert pushed == ["base"], pushed
             assert h["finished"] and h["base_finished"]
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            # lịch 25/50/25 trên 8 epoch: 2 warmup, 4 hold, 2 decay
-            want_ph = [SCH.phase_name((e - 1) * h["steps_per_epoch"],
-                                      8 * h["steps_per_epoch"])
+            # cửa sổ MỘT epoch: epoch 1 đi qua cả ba chặng, epoch 2+ PHẲNG
+            spe_ = h["steps_per_epoch"]
+            want_ph = [SCH.phase_span((e - 1) * spe_, e * spe_ - 1, spe_)
                        for e in range(1, h["base_epochs_run"] + 1)]
+            assert want_ph[0] != "flat" and set(want_ph[1:]) <= {"flat"}, want_ph
             assert [p for _e, p in ph[:len(want_ph)]] == want_ph, ph
             # ĐUÔI chỉ chạy khi dừng sớm
             tails = [e for e, p in ph if p == "tail"]

@@ -7,16 +7,29 @@ không có gì trong loss báo ra điều đó.
 
 ═══ Lịch CHUNG (Stage 0, Stage 1) — `staged_lr` ═══════════════════════════════
 
-Bốn chặng, tính trên `n_sched` bước (= `sched_epochs` × bước mỗi epoch):
+Bốn chặng. Ba chặng đầu gói TRỌN trong `n_sched` bước — mặc định là **ĐÚNG MỘT
+EPOCH** (`sched_epochs: 1`) — còn chặng 4 phủ toàn bộ phần còn lại của giai
+đoạn:
 
-    1. warm-up tuyến tính `lr_min` -> `lr_max`      25% đầu
-    2. giữ phẳng `lr_max`                           50% kế
-    3. cosine decay `lr_max` -> `lr_main`           25% kế
-    4. phẳng `lr_main`                              phần còn lại
+    1. warm-up tuyến tính `lr_min` -> `lr_max`      25% của epoch ĐẦU
+    2. giữ phẳng `lr_max`                           50% kế (vẫn trong epoch đầu)
+    3. cosine decay `lr_max` -> `lr_main`           25% kế (hết epoch đầu)
+    4. phẳng `lr_main`                              MỌI epoch còn lại
 
-Chặng 4 chỉ tồn tại khi vòng lặp chạy QUÁ `n_sched` bước (ví dụ: epoch đuôi sau
-khi patience hết, hoặc `max_epochs` bị nâng mà không muốn đổi hình dạng lịch).
-Với `sched_epochs == max_epochs` thì ba chặng đầu phủ kín và chặng 4 rỗng.
+Với Stage 0 (6400 mẫu, batch 32 -> 200 bước/epoch, trần 50 epoch): warm-up 50
+bước, giữ đỉnh 100 bước, cosine 50 bước — rồi **49 epoch chạy phẳng
+`lr_main`**. Đó là ý của "Fixed `lr_main` (the rest)" trong đặc tả: "the rest"
+là phần còn lại của CẢ GIAI ĐOẠN, không phải một mẩu dư của phép làm tròn.
+
+> **`n_sched` là cửa sổ của ba chặng đầu, KHÔNG phải độ dài giai đoạn.** Đọc
+> nhầm nó thành "toàn bộ 50 epoch" cho một đường lr khác hẳn: warm-up kéo 12,5
+> epoch và chặng 4 rỗng. Hai cách đọc đều chạy trót lọt và không có gì trong
+> loss báo ra chỗ khác nhau — nên `sched_epochs` được khai TƯỜNG MINH trong
+> config, và `write_loader` ghi lại mốc bước thật của từng chặng.
+
+Ba siêu tham số KHÁC có đơn vị epoch và KHÔNG đi theo `n_sched`: momentum EMA
+của teacher (cosine trên TOÀN giai đoạn), `teacher_temp_warmup_epochs` và
+`freeze_last_layer_epochs`. Chúng tả hàm mục tiêu DINO chứ không tả lịch lr.
 
 **Nội suy trên GIÁ TRỊ lr, không nhân hệ số.** `lr_max · f` thì điểm xuất phát
 do SỐ BƯỚC mỗi epoch quyết định chứ không do `lr_min` trong config — đổi
@@ -125,6 +138,20 @@ def phase_name(step: int, n_sched: int, warmup: float = WARMUP_FRAC,
     if d > 0 and s < w + h + d:
         return "decay"
     return "flat"
+
+
+def phase_span(step_a: int, step_b: int, n_sched: int,
+               warmup: float = WARMUP_FRAC, hold: float = HOLD_FRAC,
+               decay: float = DECAY_FRAC) -> str:
+    """Nhãn pha cho MỘT epoch, từ bước đầu tới bước cuối của nó.
+
+    Với cửa sổ một epoch, epoch ĐẦU đi qua cả ba chặng — `phase_name` của riêng
+    bước đầu sẽ gọi nó là "warmup" và giấu mất hai chặng kia. Nhãn ở đây ghi cả
+    hai đầu (`warmup→decay`) để history và log nói đúng thứ đã chạy.
+    """
+    a = phase_name(step_a, n_sched, warmup, hold, decay)
+    b = phase_name(step_b, n_sched, warmup, hold, decay)
+    return a if a == b else f"{a}→{b}"
 
 
 def tail_lr(step: int, n_tail: int, lr_from: float, lr_min: float) -> float:

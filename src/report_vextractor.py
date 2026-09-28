@@ -122,10 +122,11 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         tail = (f" + {sc0.get('tail_epochs')} epoch ĐUÔI cosine về "
                 f"{sc0.get('lr_min')}" if s0.get("ran_tail")
                 else " · không chạy epoch đuôi")
-        L.append(f"lịch chung 25/50/25 trên {sc0.get('sched_epochs')} epoch: "
-                 f"warm-up {sc0.get('lr_min')} → {sc0.get('lr_max')} (25%) · "
+        L.append(f"lịch chung 25/50/25 gói trong {sc0.get('sched_epochs')} epoch "
+                 f"ĐẦU: warm-up {sc0.get('lr_min')} → {sc0.get('lr_max')} (25%) · "
                  f"giữ {sc0.get('lr_max')} (50%) · cosine → {sc0.get('lr_main')} "
-                 f"(25%) · wd {sc0.get('weight_decay')} · chạy "
+                 f"(25%) · rồi PHẲNG {sc0.get('lr_main')} trên mọi epoch còn lại "
+                 f"· wd {sc0.get('weight_decay')} · chạy "
                  f"**{s0.get('base_epochs_run', '?')}**/{sc0.get('max_epochs')} epoch"
                  f"{' — DỪNG SỚM' if s0.get('stopped_early') else ''} "
                  f"(patience {sc0.get('patience')}, min_delta {sc0.get('min_delta')})"
