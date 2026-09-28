@@ -862,6 +862,8 @@ def _():
     from src import vextractor as R
     from src import stage0_vextractor as s0
     from src.config import load_config
+    from src import dino as DN
+    from src import stage02_vextractor as s02
     from src.fixture import WEIGHT_FILES
     from src.push import decide, local_plan
 
@@ -873,10 +875,17 @@ def _():
         sp = small_spec()
         R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.CKPT, {})
         R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.BASE, {})
+        # DINO head TEACHER đi CÙNG checkpoint 0.1 — Stage 0.2 chưng cất từ
+        # ĐÚNG phân phối prototype ấy, nên nó phải lên Hub cùng backbone.
+        R.save_dino_head(DN.DINOHead(4, 8, 8, 4, 2), d / s0.CKPT)
         for f in (s0.HISTORY, s0.LOADER, s0.LOADER):
             (d / f).write_text("{}")
         (d / "last").mkdir()
         (d / "last" / "state.pt").write_text("x")
+        # Stage 0.2: checkpoint Extractor + history, trong plan đẩy Hub
+        s02d = Path(t) / "ad" / "_stage02"
+        R.save_extractor(R.VExtractorBranch(sp), s02d / s02.CKPT, {"best_epoch": 1})
+        (s02d / s02.HISTORY).write_text("{}")
         bdir = Path(t) / "ad" / aid
         R.save_branch(R.VExtractorBranch(sp), bdir, {})
         for f in ("adapter_model.safetensors", "adapter_config.json", "train_stats.json"):
@@ -885,6 +894,11 @@ def _():
         base = "current/$2.2_V-Extractor_Test"
         for r in s0.KEEP:
             assert f"{base}/stage0/{r}" in plan, r
+        for r in s02.KEEP:
+            assert f"{base}/stage02/{r}" in plan, r
+        # HAI thư mục RIÊNG: gộp chúng là mất khả năng dùng lại 0.1 khi chỉ 0.2
+        # phải chạy lại.
+        assert not any(p.startswith(f"{base}/stage0/{s02.CKPT}/") for p in plan)
         assert not any("state.pt" in p for p in plan)
         for f in ("adapter_model.safetensors", "vextractor_branch.safetensors",
                   "vextractor_branch.json", "train_stats.json"):
@@ -984,7 +998,7 @@ def _():
     assert "asl" not in cfg["stage0"] and "val_classes" not in cfg["stage0"]
 
 
-@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best theo −loss DINO, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn BACKBONE, Extractor+Aligner học lr 1e-5; --retrain-all")
+@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best theo −loss DINO, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn BACKBONE, Aligner học lr 1e-5 và Extractor 3e-6 sau bước 40; --retrain-all")
 def _():
     from src import stage0_vextractor as s0
     from src.config import load_config
@@ -1211,7 +1225,10 @@ def _():
     assert "norm_epochs" not in src
     # dry-run: warmup_epochs = 0 -> base rút còn đúng 1 epoch
     assert 'max_epochs=1, warmup_epochs=0.0' in src
-    assert "--retrain-all" in src and "a.restage0 = a.retrain = a.rescore = True" in src
+    # `--retrain-all` phải kéo theo CẢ Stage 0.2: đổi 0.1 là đổi NHÃN của 0.2,
+    # nên một Extractor học từ teacher cũ không còn nghĩa gì.
+    assert "--retrain-all" in src
+    assert "a.restage0 = a.restage02 = a.retrain = a.rescore = True" in src
     # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
     assert "--refinal" in src and "restart_final=a.refinal" in src
     assert "pull_stage0(cfg, base_only=a.refinal)" in src     # --refinal: base thiếu -> kéo Hub
