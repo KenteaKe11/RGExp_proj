@@ -191,7 +191,10 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
         for f in sorted(fx.iterdir()):
             if f.is_file() and not f.name.endswith(".tmp"):
                 out.append((f"{base}/fixture/{f.name}", f, "fixture"))
-    # §2.1: Stage 0 (Recovery + Cls Head đã pretrain) + loader của nó, cạnh fixture.
+    # Stage 0.1 (backbone teacher + DINO head + loader) và Stage 0.2 (Extractor
+    # đã chưng cất), cạnh fixture. HAI thư mục riêng vì chúng là HAI checkpoint
+    # với hai vân tay riêng — gộp chúng là mất khả năng dùng lại 0.1 khi chỉ 0.2
+    # phải chạy lại.
     s0 = Path(o["adapter_dir"]) / "_stage0"
     if s0.exists():
         from .stage0_vextractor import KEEP
@@ -200,6 +203,14 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
             f = s0 / rel
             if f.is_file():
                 out.append((f"{base}/stage0/{rel}", f, "stage0"))
+    s02 = Path(o["adapter_dir"]) / "_stage02"
+    if s02.exists():
+        from .stage02_vextractor import KEEP as KEEP02
+
+        for rel in KEEP02:
+            f = s02 / rel
+            if f.is_file():
+                out.append((f"{base}/stage02/{rel}", f, "stage0"))
     root = Path(o["adapter_dir"])
     for aid in arms:
         for name in WEIGHT_FILES:

@@ -427,17 +427,20 @@ vextractor:
     mlp_hidden: 4096        # SwiGLU 2048 -> 4096 -> 2560
     dropout: 0.0
   # ── Main stage ─────────────────────────────────────────────────────────
-  # ĐÚNG MỘT nhóm tham số học được trong nhánh: Extractor (phần ngoài backbone)
-  # + Aligner. Backbone nạp TRỌNG SỐ TEACHER (EMA) của Stage 0 và chạy ở chế độ
-  # TEACHER INFERENCE: requires_grad=False + eval + trong no_grad + KHÔNG nằm
-  # trong optimizer — đúng chế độ teacher đã sinh mục tiêu ở Stage 0 (không
-  # dropout, không stochastic depth, không gradient). LoRA của decoder vẫn chạy
-  # ĐÚNG lịch one-cycle của $1.
+  # HAI nhóm tham số học được trong nhánh, hai số phận:
   #
-  # Lịch lr: warm-up TUYẾN TÍNH theo BƯỚC 20/200 rồi PHẲNG 1e-5 tới bước cuối.
-  # Không anneal. lr là hàm THUẦN của số bước (`align_lr_at`).
+  #   * `Aligner` — khối MỚI của main stage, khởi tạo ngẫu nhiên: warm-up
+  #     TUYẾN TÍNH theo BƯỚC 20/200 rồi PHẲNG `align_lr` tới bước cuối;
+  #   * `Extractor` — đến từ Stage 0.2, đã ở một điểm dùng được: ĐÓNG BĂNG
+  #     HOÀN TOÀN `extractor_unfreeze_steps` bước đầu (requires_grad=False,
+  #     cắt hẳn backward dưới Aligner) rồi mở ra ở `extractor_lr` CỐ ĐỊNH.
+  #
+  # Backbone thì KHÔNG BAO GIỜ mở: nó nạp TRỌNG SỐ TEACHER (EMA) của Stage 0.1
+  # và chạy ở chế độ TEACHER INFERENCE (requires_grad=False + eval + no_grad +
+  # KHÔNG nằm trong optimizer) suốt cả main stage. LoRA của decoder vẫn chạy
+  # ĐÚNG lịch one-cycle của $1.
   main:
-    align_lr: 1.0e-5        # lr CỐ ĐỊNH sau warm-up (Extractor + Aligner)
+    align_lr: 1.0e-5        # lr CỐ ĐỊNH sau warm-up (RIÊNG Aligner)
     align_wd: 0.01
     # Cả Extractor lẫn Aligner khởi tạo NGẪU NHIÊN, kẹp giữa một encoder đã dạy
     # xong (Stage 0) và một decoder đã dạy xong ($1). Một bước Adam ở lr đầy đủ
@@ -448,8 +451,54 @@ vextractor:
     # lr nên bước 1 có ĐÚNG 1e-8, không phải align_lr/20.
     align_warmup_start_lr: 1.0e-8
     separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
+    # Extractor: 0 trong `extractor_unfreeze_steps` bước rồi `extractor_lr`
+    # PHẲNG. KHÔNG warm-up — Aligner cần dốc vì nó ngẫu nhiên, Extractor thì
+    # không, và 3e-6 vốn đã nhỏ hơn align_lr hơn ba lần.
+    #
+    # Vì sao đóng băng 40 bước đầu: ở bước 0, LoRA và Aligner là thứ DUY NHẤT
+    # chưa biết gì. Để cả ba cùng động thì Extractor bị kéo theo nhiễu của hai
+    # khối kia thay vì giữ thứ Stage 0.2 đã dạy. 40 = 20% của 200 bước.
+    # 0 = mở ngay từ bước 1; `extractor_lr: 0` = đóng băng suốt main stage.
+    extractor_lr: 3.0e-6
+    extractor_unfreeze_steps: 40
 
-# ── Stage 0: TỰ GIÁM SÁT (DINO) — `src/stage0_vextractor.py`, `src/dino.py` ──
+# ── Stage 0.2: CHUYỂN GIAO — `src/stage02_vextractor.py` ────────────────────
+# Extractor học từ teacher của Stage 0.1, teacher ĐÓNG BĂNG HOÀN TOÀN và sinh
+# nhãn:
+#
+#   view_t ─► backbone(0.1) ─► pool ─► DINO head(0.1) ─────────► t_raw   [ĐỨNG YÊN]
+#   view_s ─► backbone(0.1) ─► Extractor ─► mean(Q) ─► head MỚI ─► s_raw
+#   loss = CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
+#
+# KHÔNG có EMA ở đây. Ở 0.1 teacher là trung bình trượt của student và cặp
+# EMA + centering giữ DINO khỏi sụp; ở 0.2 teacher là một CHECKPOINT, nên với
+# một ảnh thì đích KHÔNG ĐỔI suốt giai đoạn và không có gì để sụp. Centering và
+# sharpening vẫn giữ, nhưng để định HÌNH DẠNG của đích, không còn để chống sụp.
+#
+# HAI view, và đúng hai: teacher một global 448², student một global 448² KHÁC
+# (augment khác). Multi-crop của 0.1 vô nghĩa ở đây — teacher đứng yên nên thêm
+# view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô nên local
+# crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới 196 ô.
+#
+# MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN
+# của `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức
+# khác nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
+stage02:
+  lr: 1.0e-4              # Extractor + head mới. Lớn hơn 0.1 vì cả hai đều MỚI
+  weight_decay: 0.03
+  warmup_steps: 100       # warm-up TUYẾN TÍNH theo bước rồi PHẲNG, không anneal
+  warmup_start_lr: 1.0e-8
+  max_epochs: 20          # TRẦN, không phải số epoch sẽ chạy — patience quyết
+  patience: 3             # epoch LIÊN TIẾP val không cải thiện thì dừng
+  min_delta: 0.0
+  batch_size: 32          # batch hiệu dụng (= micro × accum)
+  micro_batch: 16         # khởi điểm; PHẢI là ước của batch_size
+  probe_sizes: [4, 8, 16]
+  max_grad_norm: 1.0
+  val_n_samples: 256      # val CỐ ĐỊNH (val_resample: false) -> đường val chỉ
+  val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
+
+# ── Stage 0.1: TỰ GIÁM SÁT (DINO) — `src/stage0_vextractor.py`, `src/dino.py` ──
 # KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
 # huấn luyện là backbone DINOv3 ViT-B/16, bằng chính hàm mục tiêu nó được sinh
 # ra với.

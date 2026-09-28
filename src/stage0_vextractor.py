@@ -65,8 +65,13 @@ LOADER = "loader.json"                  # như _fixture/loader.json của $1
 # `last/state.pt` (optimizer, để chạy tiếp) KHÔNG đẩy.
 BASE = "base"                         # sau epoch norm + `max_epochs` epoch — đẩy Hub ngay
 CKPT = "final"                        # sau epoch n+1 (anneal cosine) — main stage dùng bản NÀY
+# `dino_head.safetensors` ĐI CÙNG: Stage 0.2 chưng cất từ ĐÚNG phân phối
+# prototype mà 0.1 đã dạy, và phân phối ấy là head(pool(backbone(x))). Thiếu nó
+# trên một máy khác thì 0.2 ở đó chạy với một head ngẫu nhiên — vẫn học được,
+# nhưng không còn là cùng một thí nghiệm.
 KEEP = (f"{BASE}/{Z.STAGE0_FILE}", f"{BASE}/{Z.STAGE0_META}",
-        f"{CKPT}/{Z.STAGE0_FILE}", f"{CKPT}/{Z.STAGE0_META}", HISTORY, LOADER)
+        f"{CKPT}/{Z.STAGE0_FILE}", f"{CKPT}/{Z.STAGE0_META}",
+        f"{CKPT}/{Z.DINO_HEAD_FILE}", HISTORY, LOADER)
 
 
 def stage0_dir(cfg: Cfg) -> Path:
@@ -1006,6 +1011,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                 "best_epoch": ep, "best_score": ev["score"], "val": ev,
                 "best_val_loss": ev["loss"], "weights": "teacher_ema",
                 "base_fingerprint": base_fingerprint(cfg)})
+            # DINO head TEACHER đi CÙNG checkpoint: Stage 0.2 cần đúng
+            # phân phối prototype mà 0.1 đã dạy (xem `save_dino_head`).
+            Z.save_dino_head(block.teacher_head, d / BASE)
         bad = 0 if improved else bad + 1
         last.parent.mkdir(parents=True, exist_ok=True)
         tmp = last.with_suffix(".tmp")
@@ -1032,6 +1040,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                        "best_val_loss": -float(best["score"]),
                        "weights": "teacher_ema",
                        "base_fingerprint": base_fingerprint(cfg)})
+        # DINO head TEACHER đi CÙNG checkpoint: Stage 0.2 cần đúng
+        # phân phối prototype mà 0.1 đã dạy (xem `save_dino_head`).
+        Z.save_dino_head(block.teacher_head, d / BASE)
     base = dict(best)
 
     def summary(done: bool) -> dict:
@@ -1122,6 +1133,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             "from": f"{BASE}/ (epoch {base['epoch']})", "anneal": fa,
             "optimizer_continued": bool(not fa["reset_optimizer"] and base_opt_live),
             "config_fingerprint": config_fingerprint(cfg)})
+        # DINO head TEACHER đi CÙNG checkpoint: Stage 0.2 cần đúng
+        # phân phối prototype mà 0.1 đã dạy (xem `save_dino_head`).
+        Z.save_dino_head(block.teacher_head, d / CKPT)
     else:
         Z.save_stage0(block.teacher_body, spec, d / CKPT, {
             "phase": "base", "best_epoch": base["epoch"], "best_score": base["score"],
@@ -1129,6 +1143,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                               else -float(base["score"])),
             "weights": "teacher_ema",
             "config_fingerprint": config_fingerprint(cfg)})
+        # DINO head TEACHER đi CÙNG checkpoint: Stage 0.2 cần đúng
+        # phân phối prototype mà 0.1 đã dạy (xem `save_dino_head`).
+        Z.save_dino_head(block.teacher_head, d / CKPT)
 
     pf_tr.close()
     pf_va.close()

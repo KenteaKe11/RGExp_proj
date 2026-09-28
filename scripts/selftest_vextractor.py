@@ -2239,6 +2239,143 @@ def _():
         assert s0.diff_inputs(d, h2, cfg, True) != [], "thiếu spec phải rơi về hash"
 
 
+
+@check("25. BA giai đoạn: 0.1 dạy backbone · 0.2 chưng cất Extractor từ teacher "
+       "ĐÓNG BĂNG · main dạy Aligner + LoRA, mở băng Extractor ở bước 40")
+def _():
+    """Mỗi giai đoạn dạy ĐÚNG MỘT khối, và ranh giới phải kiểm được.
+
+    Ba chỗ dễ lệch lặng lẽ, và bài này khoá cả ba:
+
+      1. 0.2 vô tình cập nhật backbone (teacher phải ĐỨNG YÊN — nó đang sinh
+         nhãn cho chính mình thì phép chưng cất không còn nghĩa gì);
+      2. checkpoint 0.2 mang theo backbone hoặc Aligner — hai bản của cùng một
+         tensor, hoặc một Aligner đã học đè lên một Aligner phải ngẫu nhiên;
+      3. main stage quên mở băng Extractor, hoặc mở sai bước.
+    """
+    import json as _json
+
+    import torch
+
+    from src import dino as D
+    from src import vextractor as R
+    from src.config import Cfg, load_config
+    from src.train_vextractor import (MAIN_CFG_KEYS, align_lr_at,
+                                      extractor_lr_at, zcfg)
+
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    zc = zcfg(cfg)
+    assert set(zc) == set(MAIN_CFG_KEYS)
+    # ── lịch main stage: Extractor 0 rồi PHẲNG, Aligner warm-up rồi PHẲNG ──
+    u = int(zc["extractor_unfreeze_steps"])
+    assert u == 40 and zc["extractor_lr"] == 3e-6
+    assert extractor_lr_at(u - 1, zc) == 0.0            # bước 40 (0-based 39)
+    assert extractor_lr_at(u, zc) == zc["extractor_lr"] # bước 41
+    assert extractor_lr_at(199, zc) == zc["extractor_lr"]
+    # KHÔNG có dốc nào cho Extractor: hai bước liên tiếp sau mốc phải BẰNG nhau
+    assert extractor_lr_at(u, zc) == extractor_lr_at(u + 1, zc)
+    # còn Aligner thì CÓ dốc, và hai lịch KHÁC nhau ở bước 1
+    assert align_lr_at(0, zc) != align_lr_at(int(zc["align_warmup_steps"]), zc)
+    assert align_lr_at(0, zc) != extractor_lr_at(0, zc)
+
+    # ── config Stage 0.2 mượn DINO của 0.1, và ép n_local = 0 ─────────────
+    from src import stage02_vextractor as s02
+
+    sc = s02.s02cfg(cfg)
+    dc0 = cfg["stage0"]["dino"]
+    assert sc["dino"]["n_local"] == 0 != int(dc0["n_local"])
+    for k in ("teacher_temp", "student_temp", "center_momentum", "out_dim", "pool"):
+        assert sc["dino"][k] == dc0[k], k     # KHÔNG được lệch công thức DINO
+    for bad in ("n_local", "pool", "out_dim", "dino"):
+        b = Cfg(_json.loads(_json.dumps(dict(cfg))))
+        b["stage02"] = dict(b["stage02"], **{bad: 1})
+        try:
+            s02.s02cfg(b)
+        except Exception as e:  # noqa: BLE001
+            assert "khoá lạ" in str(e), (bad, e)
+        else:
+            raise AssertionError(f"stage02.{bad} phải bị từ chối")
+    # ── vân tay 0.2: có backbone + hình dạng Extractor + 0.1, KHÔNG có Aligner ──
+    ins = s02.cfg_inputs(cfg)
+    assert set(ins) == {"stage02", "backbone", "extractor_shape", "seed", "stage01"}
+    assert set(ins["extractor_shape"]) == {"d_branch", "n_query", "head_dim",
+                                           "mlp_hidden"}
+    f0 = s02.config_fingerprint(cfg)
+    c2 = Cfg(_json.loads(_json.dumps(dict(cfg))))
+    c2["vextractor"]["aligner"] = dict(c2["vextractor"]["aligner"], mlp_hidden=512)
+    assert s02.config_fingerprint(c2) == f0, "đổi Aligner KHÔNG được bắt chạy lại 0.2"
+    c3 = Cfg(_json.loads(_json.dumps(dict(cfg))))
+    c3["vextractor"]["vextractor"] = dict(c3["vextractor"]["vextractor"], n_query=8)
+    assert s02.config_fingerprint(c3) != f0, "đổi Extractor PHẢI bắt chạy lại 0.2"
+    c4 = Cfg(_json.loads(_json.dumps(dict(cfg))))
+    c4["stage0"] = dict(c4["stage0"], lr=1e-4)
+    assert s02.config_fingerprint(c4) != f0, "đổi 0.1 PHẢI bắt chạy lại 0.2"
+
+    # ── TransferTrainer: teacher ĐỨNG YÊN, gradient CHỈ tới Extractor ─────
+    torch.manual_seed(0)
+    sp = small_spec()
+    br = R.VExtractorBranch(sp)
+    vx = br.vextractor
+    dc = dict(sc["dino"])
+    th = D.DINOHead(vx.d_feat, 32, 16, 8, 2)
+    dc = dict(dc, out_dim=32, hidden=16, bottleneck=8, head_layers=2)
+    tr = D.TransferTrainer(vx, th, dc, vx.d_branch)
+    assert not any(p.requires_grad for p in tr.teacher_head.parameters())
+    assert not any(p.requires_grad for p in vx.body.parameters())
+    assert vx.body_frozen
+    x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
+    tr.loss([x, torch.randn_like(x)], dc["teacher_temp"]).backward()
+    assert all(p.grad is None for p in vx.body.parameters()), "backbone KHÔNG được có grad"
+    assert all(p.grad is None for p in tr.teacher_head.parameters())
+    assert any(p.grad is not None for p in vx.head_parameters())
+    # KHÔNG có EMA ở 0.2: teacher là checkpoint, không phải trung bình trượt
+    assert not hasattr(tr, "ema_update") and not hasattr(tr, "teacher_body")
+
+    # ── checkpoint 0.2: CHỈ Extractor ─────────────────────────────────────
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        R.save_extractor(br, t, {"best_epoch": 1})
+        sd_keys = set(R._extractor_state(vx))
+        assert not any(k.startswith("body.") for k in sd_keys)
+        assert not any(k.startswith("aligner") for k in sd_keys)
+        assert sd_keys and all(hasattr(vx, k.split(".")[0]) for k in sd_keys)
+        br2 = R.VExtractorBranch(sp)
+        al_before = br2.aligner.gate.weight.clone()
+        bb_before = next(iter(br2.vextractor.body.parameters())).clone()
+        R.load_extractor_into(br2, t)
+        assert torch.allclose(br2.vextractor.inp.weight, vx.inp.weight)
+        assert torch.allclose(br2.aligner.gate.weight, al_before), "Aligner bị ghi đè"
+        assert torch.allclose(next(iter(br2.vextractor.body.parameters())), bb_before)
+        # format lệch -> TỪ CHỐI (ở đây thứ được lưu CHÍNH LÀ Extractor)
+        mp = t / R.EXTRACTOR_META
+        meta = _json.loads(mp.read_text(encoding="utf-8"))
+        mp.write_text(_json.dumps(dict(meta, format="rgexp.vextractor/1")),
+                      encoding="utf-8")
+        try:
+            R.load_extractor_into(R.VExtractorBranch(sp), t)
+        except RuntimeError as e:
+            assert "format" in str(e)
+        else:
+            raise AssertionError("format cũ của Stage 0.2 phải bị từ chối")
+
+    # ── đóng băng / mở băng RIÊNG Extractor ───────────────────────────────
+    br.set_extractor_frozen(True)
+    assert not any(p.requires_grad for p in vx.head_parameters())
+    assert all(p.requires_grad for p in br.aligner.parameters()), "Aligner KHÔNG bị chạm"
+    br.set_extractor_frozen(False)
+    assert all(p.requires_grad for p in vx.head_parameters())
+
+    # ── pipeline: 0.2 nằm GIỮA 0.1 và main, và cờ kéo theo nhau ───────────
+    from src.run_vextractor import COMMANDS
+
+    st = COMMANDS["train"]
+    assert st.index("stage0") < st.index("stage02") < st.index("train")
+    rsrc = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
+    assert '"--restage02"' in rsrc
+    assert "a.restage02 = a.retrain = True" in rsrc    # --restage0 kéo theo 0.2
+    assert "stage02_dir=s02dir / s02.CKPT" in rsrc
+
+
 print()
 if FAILS:
     print(f"✗ {len(FAILS)} kiểm tra HỎNG: {FAILS}")

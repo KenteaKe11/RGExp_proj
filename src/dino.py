@@ -314,6 +314,96 @@ class DinoTrainer(nn.Module):
             t.copy_(s)
 
 
+# ══ Stage 0.2: chuyển giao từ teacher ĐÓNG BĂNG ═════════════════════════════
+class TransferTrainer(nn.Module):
+    """Stage 0.2 — Extractor học từ teacher của Stage 0.1, teacher ĐỨNG YÊN.
+
+        teacher:  ảnh_t ─► backbone(0.1) ─► pool ─► DINO head(0.1) ─► t_raw
+        student:  ảnh_s ─► backbone(0.1) ─► Extractor ─► mean(Q_raw) ─► head MỚI ─► s_raw
+        loss   =  CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
+
+    **KHÁC Stage 0.1 ở đúng một chỗ, và đó là chỗ quan trọng: KHÔNG có EMA.**
+    Teacher ở đây không phải trung bình trượt của student — nó là checkpoint
+    0.1, đóng băng hoàn toàn (`requires_grad=False` + `eval()` + `no_grad`).
+    Mục tiêu vì thế CỐ ĐỊNH: với một ảnh, phân phối đích không đổi suốt 0.2.
+    Sụp về một điểm (thứ EMA + centering sinh ra để chặn) không xảy ra được, vì
+    student không kéo được teacher theo mình.
+
+    **Centering và sharpening vẫn giữ**, dù lý do đã hẹp lại: chúng không còn
+    chống sụp, chúng định HÌNH DẠNG của đích. Bỏ centering là để vài prototype
+    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 16 vector
+    không phải nén gì cả.
+
+    **CÙNG một backbone cho cả hai nhánh.** `extractor.body` CHÍNH LÀ `body`
+    của teacher — một object, không phải bản sao — nên không có cách nào để hai
+    bên lệch trọng số. Thứ duy nhất khác giữa hai nhánh là AUGMENT: teacher ăn
+    một global view, student ăn một global view KHÁC của cùng ảnh.
+
+    `student_head` là giàn giáo của riêng 0.2 (2048 → … → 4096 prototype) và bị
+    BỎ sau đó, y như DINO head của 0.1 bị bỏ sau 0.1.
+    """
+
+    def __init__(self, extractor: nn.Module, teacher_head: nn.Module, dc: dict,
+                 d_branch: int):
+        super().__init__()
+        self.extractor = extractor
+        self.teacher_head = teacher_head
+        self.n_prefix = int(getattr(extractor, "n_prefix", 0))
+        self.pool = str(dc.get("pool", "mean"))
+        self.fmt = str(getattr(extractor, "fmt", "NCHW")).upper()
+        self.student_head = DINOHead(int(d_branch), dc["out_dim"], dc["hidden"],
+                                     dc["bottleneck"], dc["head_layers"])
+        # Teacher ĐÓNG BĂNG HOÀN TOÀN: backbone (dùng chung với student) và
+        # head 0.1. Không nhóm optimizer nào chạm tới chúng.
+        for p in self.teacher_head.parameters():
+            p.requires_grad_(False)
+        self.extractor.set_body_frozen(True)
+        self.register_buffer("center", torch.zeros(1, int(dc["out_dim"])))
+        self.center_m = float(dc["center_momentum"])
+        self.t_student = float(dc["student_temp"])
+
+    # ── nhóm tham số: CHỈ Extractor + head mới ────────────────────────────
+    def student_parameters(self):
+        yield from self.extractor.head_parameters()
+        yield from self.student_head.parameters()
+
+    def param_groups(self, lr: float) -> list[dict]:
+        ex = [p for p in self.extractor.head_parameters() if p.requires_grad]
+        hd = [p for p in self.student_head.parameters() if p.requires_grad]
+        return [{"params": ex, "lr": float(lr), "name": "extractor"},
+                {"params": hd, "lr": float(lr), "name": "head"}]
+
+    @torch.no_grad()
+    def _teacher(self, x: torch.Tensor) -> torch.Tensor:
+        f = self.extractor.patches_raw(x)
+        return self.teacher_head(pool_feature(f, self.n_prefix, self.pool, self.fmt))
+
+    def _student(self, x: torch.Tensor) -> torch.Tensor:
+        # `extractor(x)` chạy backbone trong `no_grad` (đã `set_body_frozen`),
+        # nên gradient chỉ tới phần ngoài backbone.
+        return self.student_head(self.extractor(x).mean(dim=1))
+
+    def loss(self, views: list[torch.Tensor], teacher_temp: float,
+             update_center: bool = True) -> torch.Tensor:
+        """`views[0]` cho teacher, `views[1]` cho student — HAI augment KHÁC nhau.
+
+        Không có vòng lặp cặp như 0.1: teacher đứng yên nên nhiều view chỉ là
+        nhiều lần tính cùng một đích, không thêm tín hiệu nào.
+        """
+        if len(views) < 2:
+            raise ValueError("Stage 0.2 cần 2 view (teacher + student)")
+        t_raw = self._teacher(views[0]).float()
+        s_raw = self._student(views[1]).float()
+        t_p = F.softmax((t_raw - self.center) / float(teacher_temp), dim=-1).detach()
+        loss = torch.sum(-t_p * F.log_softmax(s_raw / self.t_student, dim=-1),
+                         dim=-1).mean()
+        if update_center:
+            c = t_raw.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                self.center.mul_(self.center_m).add_(c, alpha=1.0 - self.center_m)
+        return loss
+
+
 # ══ Lịch ════════════════════════════════════════════════════════════════════
 def momentum_at(step: int, total: int, m0: float, m1: float = 1.0) -> float:
     """Momentum EMA của teacher: cosine `m0` -> `m1` trong `total` bước.

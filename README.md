@@ -67,7 +67,42 @@ kiểm, `train` dừng nếu lệch).
 [Z ‖ Q ‖ text] ─► Gemma decoder (QLoRA r32) ─► CE
 ```
 
-**Hai giai đoạn, ranh giới nằm ở BACKBONE.** Khối cam (DINOv3 ViT-B/16) là thứ
+**BA giai đoạn, và mỗi giai đoạn dạy ĐÚNG MỘT khối.**
+
+| | dạy | đứng yên | hàm mục tiêu |
+|---|---|---|---|
+| **0.1** | backbone ViT-B/16 (**85,64 M**) | — | DINO tự giám sát, teacher = EMA, multi-crop |
+| **0.2** | **Extractor** (**54,04 M**) | backbone (teacher 0.1) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
+| **main** | Aligner (**27,27 M**) + LoRA | backbone; Extractor 40 bước đầu | CE trên báo cáo thật |
+
+Thứ 0.1 lưu ra là **teacher (EMA)** cùng **DINO head** của nó. 0.2 dùng đúng
+cặp ấy để sinh nhãn: `t_raw = head(pool(backbone(view_t)))`, còn student là
+`head_mới(mean(Extractor(view_s)))` — hai **augment khác nhau** của cùng ảnh,
+cùng ở 448². Loss là CE giữa `softmax((t_raw − center)/τ_t)` và
+`log_softmax(s_raw/τ_s)`.
+
+> **KHÔNG có EMA ở 0.2, và đó là khác biệt đáng đọc kỹ.** Ở 0.1 teacher là
+> trung bình trượt của student, nên cặp EMA + centering là thứ giữ DINO khỏi
+> sụp về một điểm. Ở 0.2 teacher là một **checkpoint**: với một ảnh, đích
+> không đổi suốt cả giai đoạn, và student không kéo được teacher theo mình —
+> sụp không xảy ra được. Centering và sharpening **vẫn giữ**, nhưng lý do đã
+> hẹp lại: chúng định *hình dạng* của đích chứ không còn chống sụp. Bỏ
+> centering là để vài prototype thống trị mọi ảnh; bỏ sharpening là học một
+> phân phối gần đều, và 16 vector không phải nén gì cả.
+
+**Cái giá của 0.2, và nó có thật.** Nó chỉ dạy Extractor bắt chước một phép
+pool của teacher, nên nó **không** biết gì về báo cáo và không trả lời được
+"16 vector ấy có mang thông tin bệnh lý chưa". Thứ nó mua là một điểm khởi đầu
+**không ngẫu nhiên** cho Extractor, để 200 bước của main stage không phải vừa
+học nén ảnh vừa học viết báo cáo cùng lúc.
+
+**Main stage mở băng Extractor ở bước 40**, không sớm hơn: ở bước 0, LoRA và
+Aligner là thứ duy nhất chưa biết gì, nên để cả ba cùng động là Extractor bị
+kéo theo nhiễu của hai khối kia thay vì giữ thứ 0.2 đã dạy. Sau mốc ấy nó chạy
+ở **`extractor_lr` = 3e-6 cố định**, không warm-up — Aligner cần dốc vì nó
+ngẫu nhiên, Extractor thì không. **Backbone không bao giờ mở.**
+
+**Ranh giới giữa 0.1 và phần còn lại nằm ở BACKBONE.** Khối cam (DINOv3 ViT-B/16) là thứ
 **duy nhất** Stage 0 huấn luyện, tự giám sát và không nhãn; ở main stage bản
 **teacher (EMA)** của nó chạy ở **chế độ teacher inference**, đóng băng hoàn
 toàn. Khối vàng (Extractor + Aligner) **không có mặt ở Stage 0** — nó khởi tạo

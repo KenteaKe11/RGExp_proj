@@ -88,7 +88,8 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 # chạy hết 200 bước với giá trị mặc định. `zcfg` là chỗ DUY NHẤT đọc khối này,
 # nên cũng là chỗ duy nhất biết khoá nào có thật.
 MAIN_CFG_KEYS = ("align_lr", "align_wd", "align_warmup_steps",
-                 "align_warmup_start_lr", "separate_clip")
+                 "align_warmup_start_lr", "separate_clip",
+                 "extractor_lr", "extractor_unfreeze_steps")
 
 
 def zcfg(cfg: Cfg) -> dict:
@@ -111,11 +112,24 @@ def zcfg(cfg: Cfg) -> dict:
            # 200 bước, nên đơn vị epoch ở đây là một nấc duy nhất).
            "align_warmup_steps": int(m.get("align_warmup_steps", 20)),
            "align_warmup_start_lr": float(m.get("align_warmup_start_lr", 1e-8)),
-           "separate_clip": bool(m.get("separate_clip", True))}
+           "separate_clip": bool(m.get("separate_clip", True)),
+           # Extractor đã học xong ở Stage 0.2, nên main stage ĐÓNG BĂNG nó
+           # `extractor_unfreeze_steps` bước đầu rồi mở ra ở MỘT lr nhỏ, CỐ
+           # ĐỊNH — khác hẳn `align_lr` của Aligner (khối MỚI, phải học từ
+           # ngẫu nhiên). Hai khối hai số phận, hai khoá.
+           "extractor_lr": float(m.get("extractor_lr", 3e-6)),
+           "extractor_unfreeze_steps": int(m.get("extractor_unfreeze_steps", 40))}
     if out["align_lr"] <= 0:
         raise TrainUnusable(f"vextractor.main.align_lr {out['align_lr']} phải > 0 "
                             f"— Extractor + Aligner là tham số DUY NHẤT của "
                             f"nhánh được học.")
+    if out["extractor_lr"] < 0:
+        raise TrainUnusable(f"vextractor.main.extractor_lr {out['extractor_lr']} "
+                            f"phải >= 0 (0 = đóng băng Extractor suốt main stage).")
+    if out["extractor_unfreeze_steps"] < 0:
+        raise TrainUnusable(
+            f"vextractor.main.extractor_unfreeze_steps "
+            f"{out['extractor_unfreeze_steps']} phải >= 0 (0 = mở ngay từ bước 1).")
     if out["align_warmup_steps"] < 0:
         raise TrainUnusable(f"vextractor.main.align_warmup_steps "
                             f"{out['align_warmup_steps']} phải >= 0 (0 = tắt).")
@@ -125,6 +139,25 @@ def zcfg(cfg: Cfg) -> dict:
             f"vextractor.main.align_warmup_start_lr {s0} phải > 0 và <= "
             f"align_lr {hi} — đây là ĐẦU dốc warm-up, không phải đỉnh.")
     return out
+
+
+def extractor_lr_at(step: int, zc: dict) -> float:
+    """lr của Extractor tại bước `step` (0-based): 0 rồi PHẲNG, không dốc nào.
+
+        step <  extractor_unfreeze_steps  ->  0.0   (đóng băng hoàn toàn)
+        step >= extractor_unfreeze_steps  ->  extractor_lr
+
+    Vì sao KHÔNG warm-up như Aligner: Aligner khởi tạo NGẪU NHIÊN nên bước Adam
+    đầu ở lr đầy đủ đẩy nó lệch khỏi phân phối mà LoRA đang học cùng lúc.
+    Extractor thì ngược lại — nó đến từ Stage 0.2, đã ở một điểm dùng được, và
+    `extractor_lr` (3e-6) vốn đã nhỏ hơn `align_lr` gần bốn lần. Một dốc nữa ở
+    đây chỉ thêm một siêu tham số không trả lời câu nào.
+
+    Mốc đóng băng là để LoRA + Aligner BẮT KỊP trước: ở bước 0 chúng là thứ duy
+    nhất chưa biết gì, và để cả ba cùng động thì Extractor bị kéo theo nhiễu
+    của hai khối kia thay vì giữ thứ 0.2 đã dạy.
+    """
+    return 0.0 if step < int(zc["extractor_unfreeze_steps"]) else float(zc["extractor_lr"])
 
 
 def align_lr_at(step: int, zc: dict) -> float:
@@ -349,7 +382,8 @@ def _rows(b: dict, s: int, e: int) -> dict:
 def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
               out_dir: Path, stage0_best: Path, tracker=None,
               max_steps_override: int | None = None,
-              val_df: pd.DataFrame | None = None) -> dict:
+              val_df: pd.DataFrame | None = None,
+              stage02_dir: Path | None = None) -> dict:
     aid = arm["id"]
     tcfg = dict(cfg["train"])
     zc = zcfg(cfg)
@@ -359,7 +393,8 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     accum = int(tcfg.get("grad_accum", 32))
     try:
         return _train_once(cfg, arm, preset, train_df, out_dir, Path(stage0_best),
-                           tracker, max_steps_override, val_df, bs, accum, tcfg, zc)
+                           tracker, max_steps_override, val_df, bs, accum, tcfg, zc,
+                           None if stage02_dir is None else Path(stage02_dir))
     except Exception as e:
         oom = is_oom(e)
         note = f"{type(e).__name__}: {e}"[:200]
@@ -375,7 +410,8 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
 
 
 def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
-                max_steps_override, val_df, bs, accum, tcfg, zc):
+                max_steps_override, val_df, bs, accum, tcfg, zc,
+                stage02_dir=None):
     import torch
 
     aid = arm["id"]
@@ -420,6 +456,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         torch.manual_seed(seed + 1)
         branch = RCV.VExtractorBranch(spec)
         pre = RCV.load_stage0_into(branch, stage0_best)
+        # Stage 0.2: Extractor đã được chưng cất từ teacher 0.1. Nạp SAU
+        # backbone và KHÔNG chạm backbone — hai checkpoint, hai phạm vi.
+        pre02 = (RCV.load_extractor_into(branch, Path(stage02_dir))
+                 if stage02_dir is not None else None)
     branch = branch.to(dev)                               # fp32, forward dưới autocast
     # ĐÓNG BĂNG HOÀN TOÀN, một lần, cho cả main stage. Không có `unfreeze_step`.
     branch.set_frozen(True)
@@ -467,10 +507,18 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # Extractor (ngoài backbone) + Aligner. Backbone KHÔNG có mặt ở đây: tham
     # số bị đóng băng nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước
     # dù grad là None.
-    align_p = list(branch.trainable_parameters())
+    # HAI nhóm riêng, vì hai khối có hai số phận: `Aligner` MỚI (warm-up ->
+    # align_lr), `Extractor` đến từ Stage 0.2 (0 trong `extractor_unfreeze_steps`
+    # bước, rồi extractor_lr CỐ ĐỊNH). Gộp chúng là mất đúng phân biệt ấy.
+    ext_p = list(branch.vextractor.head_parameters())
+    align_p = list(branch.aligner.parameters())
+    branch.set_extractor_frozen(int(zc["extractor_unfreeze_steps"]) > 0)
     opt_b = torch.optim.AdamW(
         [{"params": align_p, "lr": align_lr_at(0, zc), "weight_decay": zc["align_wd"],
-          "name": "branch"}], betas=(0.9, 0.999), eps=1e-8)
+          "name": "aligner"},
+         {"params": ext_p, "lr": extractor_lr_at(0, zc), "weight_decay": zc["align_wd"],
+          "name": "extractor"}], betas=(0.9, 0.999), eps=1e-8)
+    branch_p = align_p + ext_p
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
@@ -651,7 +699,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     def _save_weights(tag: str) -> None:
         model.save_pretrained(str(out_dir), safe_serialization=True)
         processor.save_pretrained(str(out_dir))
-        RCV.save_branch(branch, out_dir, {"stage0": pre, "frozen_steps": steps,
+        RCV.save_branch(branch, out_dir, {"stage0": pre, "stage02": pre02,
+                                          "frozen_steps": steps,
                                           "trained": "extractor+aligner",
                                           "saved_at": tag})
         for f in (RCV.STAGE0_FILE, RCV.STAGE0_META):
@@ -663,7 +712,16 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         # lr của Aligner là hàm THUẦN của số bước — không có scheduler nào giữ
         # trạng thái, nên nó tái lập được và không lệch khi `steps` bị override.
         alr = align_lr_at(step, zc)
+        xlr = extractor_lr_at(step, zc)
         opt_b.param_groups[0]["lr"] = alr
+        opt_b.param_groups[1]["lr"] = xlr
+        # Mở băng ĐÚNG một lần, ở đúng bước. `requires_grad` chứ không phải
+        # lr = 0: Extractor là khối học được đầu tiên sau backbone, nên tắt grad
+        # ở đây cắt hẳn phần backward dưới Aligner.
+        if branch.extractor_frozen and xlr > 0:
+            branch.set_extractor_frozen(False)
+            print(f"    [{aid}] bước {step + 1}/{steps} · MỞ BĂNG Extractor "
+                  f"(Stage 0.2) · lr {xlr:.2e} CỐ ĐỊNH tới hết", flush=True)
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
         step_ce = 0.0
@@ -675,9 +733,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         if clip > 0:
             if zc["separate_clip"]:
                 gn_lora = float(torch.nn.utils.clip_grad_norm_(lora, clip))
-                gn_br = float(torch.nn.utils.clip_grad_norm_(align_p, clip))
+                gn_br = float(torch.nn.utils.clip_grad_norm_(branch_p, clip))
             else:
-                torch.nn.utils.clip_grad_norm_(lora + align_p, clip)
+                torch.nn.utils.clip_grad_norm_(lora + branch_p, clip)
         opt.step()
         opt_b.step()
         sched.step()
@@ -693,12 +751,13 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
             lr_now = opt.param_groups[0]["lr"]
             print(f"    [{aid}] bước {step + 1}/{steps} · ce {step_ce:.4f} · "
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} nhánh "
-                  f"{gn_br or 0:.3f} (nhánh) · lr {lr_now:.2e} · lr_branch "
-                  f"{alr:.2e}", flush=True)
+                  f"{gn_br or 0:.3f} (nhánh) · lr {lr_now:.2e} · lr_aligner "
+                  f"{alr:.2e} · lr_extractor {xlr:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
                              f"train/{aid}/lr": lr_now,
                              f"train/{aid}/lr_aligner": alr,
+                             f"train/{aid}/lr_extractor": xlr,
                              f"train/{aid}/step": step + 1,
                              f"train/{aid}/q_rms_rel": rel_last,
                              f"train/{aid}/grad_norm_lora": gn_lora,
@@ -731,6 +790,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         **{k: v for k, v in pstats.items() if k not in ("method", "rank", "alpha")},
         "vextractor": {"spec": spec, "spec_fingerprint": RCV.spec_fingerprint(spec),
                        "n_params": nb, "main": zc, "stage0": pre,
+                       "stage02": pre02,
                        "trained": "extractor+aligner", "frozen_steps": steps},
         "autobatch_chunk": ab_rep, "physical_chunk": chunk,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,

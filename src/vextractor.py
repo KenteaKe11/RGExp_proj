@@ -165,6 +165,11 @@ STAGE0_FILE = "vextractor_stage0.safetensors"
 STAGE0_META = "vextractor_stage0.json"
 BRANCH_FILE = "vextractor_branch.safetensors"
 BRANCH_META = "vextractor_branch.json"
+# Stage 0.2 lưu RIÊNG phần ngoài backbone của `VExtractor` (`head_parameters`):
+# backbone đã nằm trong checkpoint Stage 0.1 và KHÔNG được chép lại lần hai —
+# hai bản của cùng một tensor là hai bản có thể lệch nhau.
+EXTRACTOR_FILE = "vextractor_extractor.safetensors"
+EXTRACTOR_META = "vextractor_extractor.json"
 
 # CHỈ là giá trị DỰ PHÒNG khi không hỏi được `timm.get_pretrained_cfg`. Thống kê
 # thật của checkpoint được ghi vào `spec.vextractor.normalize` lúc dựng spec và
@@ -183,7 +188,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số BACKBONE, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì Extractor/Aligner KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/11"
+FORMAT = "rgexp.vextractor/12"
 
 
 # ══ Khối cơ bản ═════════════════════════════════════════════════════════════
@@ -670,6 +675,17 @@ class VExtractor(nn.Module):
                 f"{px.shape[-2]}×{px.shape[-1]}).")
         return f
 
+    def patches_raw(self, px: torch.Tensor) -> torch.Tensor:
+        """`forward_features` NGUYÊN VĂN — CÒN prefix token, chưa gộp trục.
+
+        Stage 0.2 cần bản này cho nhánh teacher: `dino.pool_feature` phải tự
+        quyết `cls` hay `mean`, mà `patches()` đã cắt prefix mất rồi. Trả đúng
+        thứ backbone trả, để MỘT chỗ duy nhất (`pool_feature`) biết cách đọc.
+        """
+        ctx = torch.no_grad() if self.body_frozen else contextlib.nullcontext()
+        with ctx:
+            return self.body.forward_features(px)
+
     def forward(self, px: torch.Tensor) -> torch.Tensor:
         kv = self.inp_norm(self.inp(self.patches(px)))           # (B, n_patch, 2048)
         q0 = self.learner.expand(px.shape[0], -1, -1).to(kv.dtype)
@@ -999,6 +1015,7 @@ class VExtractorBranch(nn.Module):
         self.aligner = build_aligner(spec)
         _init(self)
         self.frozen = False
+        self.extractor_frozen = False
 
     @property
     def n_query(self) -> int:
@@ -1027,6 +1044,21 @@ class VExtractorBranch(nn.Module):
         """
         self.frozen = bool(frozen)
         self.vextractor.set_body_frozen(frozen)
+
+    def set_extractor_frozen(self, frozen: bool) -> None:
+        """Đóng băng RIÊNG Extractor (ngoài backbone). KHÔNG chạm Aligner.
+
+        Main stage mở băng nó ở bước `extractor_unfreeze_steps`: trước mốc ấy
+        Extractor đã học xong ở Stage 0.2 và chỉ LoRA + Aligner phải bắt kịp
+        nó; sau mốc ấy nó được tinh chỉnh ở một lr nhỏ riêng.
+
+        `requires_grad_(False)` chứ không phải lr = 0: Extractor là khối học
+        được ĐẦU TIÊN sau backbone, nên tắt grad ở đây cắt hẳn phần backward
+        dưới `Aligner` — tiết kiệm thật, không chỉ là không cập nhật.
+        """
+        self.extractor_frozen = bool(frozen)
+        for p in self.vextractor.head_parameters():
+            p.requires_grad_(not frozen)
 
     def forward(self, px: torch.Tensor) -> torch.Tensor:
         """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model)."""
@@ -1071,6 +1103,24 @@ def _save(sd: dict, path: Path) -> None:
               str(path))
 
 
+DINO_HEAD_FILE = "dino_head.safetensors"
+
+
+def save_dino_head(head: nn.Module, out_dir: Path) -> Path:
+    """DINO head TEACHER của Stage 0.1, cạnh checkpoint backbone.
+
+    0.1 không cần nó (head bị bỏ khi 0.1 xong), nhưng **0.2 thì cần**: mục tiêu
+    của 0.2 là ĐÚNG phân phối prototype mà 0.1 đã dạy, và phân phối ấy là
+    `head(pool(backbone(x)))`. Thiếu file này thì 0.2 phải dựng một head ngẫu
+    nhiên — vẫn cho mục tiêu cố định, nhưng là mục tiêu của một phép chiếu
+    ngẫu nhiên, không phải của 0.1.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _save(dict(head.state_dict()), out_dir / DINO_HEAD_FILE)
+    return out_dir / DINO_HEAD_FILE
+
+
 def save_stage0(body: nn.Module, spec: dict, out_dir: Path, extra: dict) -> Path:
     """Checkpoint Stage 0 = TRỌNG SỐ BACKBONE **TEACHER**, không gì khác.
 
@@ -1094,7 +1144,7 @@ def save_stage0(body: nn.Module, spec: dict, out_dir: Path, extra: dict) -> Path
 
 
 def format_gen(s) -> int:
-    """`"rgexp.vextractor/11"` -> 11; -1 nếu không đọc được số thế hệ."""
+    """`"rgexp.vextractor/12"` -> 12; -1 nếu không đọc được số thế hệ."""
     m = re.search(r"/(\d+)$", str(s or ""))
     return int(m.group(1)) if m else -1
 
@@ -1157,6 +1207,76 @@ def save_branch(branch: VExtractorBranch, out_dir: Path, extra: dict) -> Path:
          "n_params": branch.n_params(), **extra},
         indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     return out_dir / BRANCH_FILE
+
+
+def _extractor_state(v: VExtractor) -> dict:
+    """`state_dict` CHỈ phần ngoài backbone, khoá giữ nguyên tên trong `VExtractor`."""
+    keep = ("inp.", "inp_norm.", "learner", "q_norm.", "sattn.", "m_norm.",
+            "mlp.", "x_norm.", "xattn.")
+    return {k: t for k, t in v.state_dict().items()
+            if k.startswith(keep) and not k.startswith("body.")}
+
+
+def save_extractor(branch: VExtractorBranch, out_dir: Path, extra: dict) -> Path:
+    """Checkpoint Stage 0.2 = Extractor (ngoài backbone), KHÔNG kèm backbone.
+
+    Backbone đến từ Stage 0.1 và được nạp riêng; chép nó vào đây lần nữa là tạo
+    ra hai bản của cùng một tensor, và hai bản thì lệch được. `Aligner` cũng
+    KHÔNG ở đây: nó là khối của main stage, khởi tạo ngẫu nhiên ở đó.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sd = _extractor_state(branch.vextractor)
+    _save(sd, out_dir / EXTRACTOR_FILE)
+    (out_dir / EXTRACTOR_META).write_text(json.dumps(
+        {"format": FORMAT, "spec": branch.spec,
+         "spec_fingerprint": spec_fingerprint(branch.spec),
+         "backbone_spec": backbone_spec(branch.spec),
+         "n_tensors": len(sd),
+         "n_params": sum(int(t.numel()) for t in sd.values()), **extra},
+        indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return out_dir / EXTRACTOR_FILE
+
+
+def extractor_exists(d: Path) -> bool:
+    d = Path(d)
+    return (d / EXTRACTOR_FILE).exists() and (d / EXTRACTOR_META).exists()
+
+
+def load_extractor_into(branch: VExtractorBranch, d: Path) -> dict:
+    """Nạp Extractor của Stage 0.2 vào `branch.vextractor`. KHÔNG chạm backbone.
+
+    Cổng: `format` BẰNG ĐÚNG `FORMAT` (khác Stage 0.1 — ở đây thứ được lưu CHÍNH
+    LÀ Extractor, nên bố cục đổi là trọng số vô nghĩa), spec khớp, và
+    `load_state_dict(strict=False)` phải nạp ĐỦ mọi khoá đã ghi, không thừa
+    không thiếu.
+    """
+    from safetensors.torch import load_file
+
+    d = Path(d)
+    meta = json.loads((d / EXTRACTOR_META).read_text(encoding="utf-8"))
+    if meta.get("format") != FORMAT:
+        raise RuntimeError(
+            f"{d / EXTRACTOR_META}: format {meta.get('format')!r} != {FORMAT!r} "
+            f"— Extractor đổi bố cục thì trọng số Stage 0.2 cũ vô nghĩa. Chạy "
+            f"lại Stage 0.2 (`--restage02`).")
+    if meta.get("spec_fingerprint") != spec_fingerprint(branch.spec):
+        raise RuntimeError(
+            f"Stage 0.2 ở {d} dựng theo spec khác nhánh main. Chạy lại "
+            f"(`--restage02`).")
+    sd = load_file(str(d / EXTRACTOR_FILE))
+    want = set(_extractor_state(branch.vextractor))
+    if set(sd) != want:
+        raise RuntimeError(
+            f"Stage 0.2 ở {d} lệch khoá: thừa {sorted(set(sd) - want)}, thiếu "
+            f"{sorted(want - set(sd))}.")
+    missing, unexpected = branch.vextractor.load_state_dict(sd, strict=False)
+    assert not unexpected, unexpected
+    assert all(k.startswith("body.") for k in missing), missing
+    return {"stage02_dir": str(d), "n_tensors": len(sd),
+            "n_params": int(meta.get("n_params", 0)),
+            "best_epoch": meta.get("best_epoch"),
+            "best_score": meta.get("best_score")}
 
 
 def branch_exists(d: Path) -> bool:
