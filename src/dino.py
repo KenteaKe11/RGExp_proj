@@ -1,15 +1,14 @@
-"""DINO self-distillation cho Stage 0 của §2.2 — KHÔNG nhãn, KHÔNG ASL.
+"""DINO self-distillation — hàm mục tiêu tự giám sát của Stage 0 và Stage 1.
 
-Stage 0 chỉ huấn luyện MỘT thứ: backbone DINOv3 ViT-B/16, chạy tiếp từ chính trọng số tự giám sát DINOv3 đã phát hành, bằng
-chính hàm mục tiêu nó được sinh ra với. Không có
-`labels.npz`, không Cls Head, không F1/Recall — epoch được chọn theo loss tự
-giám sát trên một tập val CỐ ĐỊNH.
+**Stage 0** huấn luyện MỘT thứ: Extractor (ConvNeXt-Base, trọng số DINOv3), chạy
+tiếp chính hàm mục tiêu nó được sinh ra với, trên ảnh CXR. Không `labels.npz`,
+không Cls Head, không F1/Recall — epoch được chọn theo loss tự giám sát trên một
+tập val CỐ ĐỊNH.
 
-**Cấu hình huấn luyện giữ NGUYÊN của bản ViT** — τ_s/τ_t, centering, lịch EMA,
-số prototype, multi-crop, lr, warm-up: không khoá nào đổi theo backbone. Đổi họ
-backbone mà đổi luôn siêu tham số thì không còn nói được hiệu số đến từ đâu.
+**Stage 1** (`CompressorTransferTrainer`, cuối file) dùng lại ĐÚNG bộ siêu tham
+số ấy nhưng đổi vai: teacher là một CHECKPOINT đóng băng, student là Compressor.
 
-Hai chỗ ConvNeXt khác ViT và Stage 0 phải biết:
+Hai chỗ ConvNeXt khác ViT và cả hai giai đoạn phải biết:
 
   * **không có cls token.** `pool` bắt buộc `mean`, và `stage0_vextractor` TỪ
     CHỐI `pool: cls` với backbone lưới thay vì lặng lẽ rơi về mean;
@@ -34,11 +33,13 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
   4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     phải đoán được global" sinh ra tính bất biến theo tỉ lệ.
+     phải đoán được global" sinh ra tính bất biến theo tỉ lệ. ConvNeXt nuốt cả
+     hai cỡ trên đúng MỘT `state_dict` vì nó thuần tích chập.
 
 **Tăng cường ảnh viết bằng PIL**, không kéo thêm torchvision: cùng đường với
-`vextractor.vext_tensor` (PIL -> uint8 -> tensor -> (x−mean)/std), nên ảnh Stage
-0 và ảnh main stage không thể lệch nhau vì hai thư viện resize khác nhau.
+`vextractor.vext_tensor` (PIL -> uint8 -> tensor -> (x−mean)/std), nên ảnh của
+Stage 0 và ảnh của main stage không thể lệch nhau vì hai thư viện resize khác
+nhau.
 
 **Lật ngang MẶC ĐỊNH TẮT.** Ảnh CXR có chiều: tim nằm bên trái bệnh nhân, và
 `dextrocardia` là một chẩn đoán chứ không phải một augmentation. Bật nó là dạy
@@ -314,64 +315,80 @@ class DinoTrainer(nn.Module):
             t.copy_(s)
 
 
-# ══ Stage 0.2: chuyển giao từ teacher ĐÓNG BĂNG ═════════════════════════════
-class TransferTrainer(nn.Module):
-    """Stage 0.2 — Extractor học từ teacher của Stage 0.1, teacher ĐỨNG YÊN.
+# ══ Stage 1: chuyển giao sang Compressor, teacher ĐÓNG BĂNG ════════════════
+class CompressorTransferTrainer(nn.Module):
+    """Stage 1 — Compressor học từ teacher của Stage 0, teacher ĐỨNG YÊN.
 
-        teacher:  ảnh_t ─► backbone(0.1) ─► pool ─► DINO head(0.1) ─► t_raw
-        student:  ảnh_s ─► backbone(0.1) ─► Extractor ─► mean(Q_raw) ─► head MỚI ─► s_raw
+        teacher:  ảnh_t ─► Extractor(0) ─► pool ─► DINO head(0) ──────► t_raw
+        student:  ảnh_s ─► Extractor(0) ─► Compressor ─► mean(V_c) ─► head MỚI ─► s_raw
         loss   =  CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
 
-    **KHÁC Stage 0.1 ở đúng một chỗ, và đó là chỗ quan trọng: KHÔNG có EMA.**
+    **KHÁC Stage 0 ở đúng một chỗ, và đó là chỗ quan trọng: KHÔNG có EMA.**
     Teacher ở đây không phải trung bình trượt của student — nó là checkpoint
-    0.1, đóng băng hoàn toàn (`requires_grad=False` + `eval()` + `no_grad`).
-    Mục tiêu vì thế CỐ ĐỊNH: với một ảnh, phân phối đích không đổi suốt 0.2.
+    Stage 0, đóng băng hoàn toàn (`requires_grad=False` + `eval()` + `no_grad`).
+    Mục tiêu vì thế CỐ ĐỊNH: với một ảnh, phân phối đích không đổi suốt Stage 1.
     Sụp về một điểm (thứ EMA + centering sinh ra để chặn) không xảy ra được, vì
     student không kéo được teacher theo mình.
 
     **Centering và sharpening vẫn giữ**, dù lý do đã hẹp lại: chúng không còn
     chống sụp, chúng định HÌNH DẠNG của đích. Bỏ centering là để vài prototype
-    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 16 vector
+    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 32 vector
     không phải nén gì cả.
 
-    **CÙNG một backbone cho cả hai nhánh.** `extractor.body` CHÍNH LÀ `body`
-    của teacher — một object, không phải bản sao — nên không có cách nào để hai
-    bên lệch trọng số. Thứ duy nhất khác giữa hai nhánh là AUGMENT: teacher ăn
-    một global view, student ăn một global view KHÁC của cùng ảnh.
+    **CÙNG một Extractor cho cả hai nhánh.** `extractor` là MỘT object, không
+    phải bản sao, nên không có cách nào để hai bên lệch trọng số. Thứ duy nhất
+    khác giữa hai nhánh là AUGMENT: teacher ăn một global view, student ăn một
+    global view KHÁC của cùng ảnh.
 
-    `student_head` là giàn giáo của riêng 0.2 (2048 → … → 4096 prototype) và bị
-    BỎ sau đó, y như DINO head của 0.1 bị bỏ sau 0.1.
+    `student_head` là giàn giáo của riêng Stage 1 (1024 → … → K prototype) và bị
+    BỎ sau đó, y như DINO head của Stage 0 bị bỏ sau Stage 0.
+
+    **`mean(V_c)` — trung bình 32 vector.** DINO head cần MỘT vector mỗi ảnh, và
+    32 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong
+    đó). Lấy vector đầu là chọn bừa một trong 32; lấy trung bình là hỏi "cả cụm
+    32 vector, gộp lại, có mang đúng thứ teacher mang không".
     """
 
-    def __init__(self, extractor: nn.Module, teacher_head: nn.Module, dc: dict,
-                 d_branch: int):
+    def __init__(self, extractor: nn.Module, compressor: nn.Module,
+                 teacher_head: nn.Module, dc: dict, d_latent: int):
         super().__init__()
         self.extractor = extractor
+        self.compressor = compressor
         self.teacher_head = teacher_head
         self.n_prefix = int(getattr(extractor, "n_prefix", 0))
         self.pool = str(dc.get("pool", "mean"))
         self.fmt = str(getattr(extractor, "fmt", "NCHW")).upper()
-        self.student_head = DINOHead(int(d_branch), dc["out_dim"], dc["hidden"],
+        self.student_head = DINOHead(int(d_latent), dc["out_dim"], dc["hidden"],
                                      dc["bottleneck"], dc["head_layers"])
-        # Teacher ĐÓNG BĂNG HOÀN TOÀN: backbone (dùng chung với student) và
-        # head 0.1. Không nhóm optimizer nào chạm tới chúng.
+        # Teacher ĐÓNG BĂNG HOÀN TOÀN: Extractor (dùng chung với student) và
+        # head của Stage 0. Không nhóm optimizer nào chạm tới chúng.
         for p in self.teacher_head.parameters():
             p.requires_grad_(False)
-        self.extractor.set_body_frozen(True)
+        self.extractor.set_frozen(True)
         self.register_buffer("center", torch.zeros(1, int(dc["out_dim"])))
         self.center_m = float(dc["center_momentum"])
         self.t_student = float(dc["student_temp"])
 
-    # ── nhóm tham số: CHỈ Extractor + head mới ────────────────────────────
+    # ── nhóm tham số: Compressor (attn | ffn) + head mới ──────────────────
     def student_parameters(self):
-        yield from self.extractor.head_parameters()
+        yield from self.compressor.parameters()
         yield from self.student_head.parameters()
 
-    def param_groups(self, lr: float) -> list[dict]:
-        ex = [p for p in self.extractor.head_parameters() if p.requires_grad]
+    def param_groups(self, lr_attn: float, lr_ffn: float) -> list[dict]:
+        """BA nhóm, và hai trong số đó có lịch lr KHÁC nhau.
+
+        Đặc tả Stage 1 khai hai lr: `Attn` (đỉnh 7e-5) và `FFN` (đỉnh 1e-4).
+        `latent` + mọi RMSNorm đi theo nhóm FFN (xem
+        `vextractor.Compressor.ffn_parameters`), còn DINO head MỚI — giàn giáo
+        của riêng Stage 1 — cũng chạy ở lr của nhóm FFN: nó khởi tạo ngẫu nhiên
+        như phần FFN và bị bỏ sau đó, nên không có lý do cho nó một lịch thứ ba.
+        """
+        at = [p for p in self.compressor.attn_parameters() if p.requires_grad]
+        fp = [p for p in self.compressor.ffn_parameters() if p.requires_grad]
         hd = [p for p in self.student_head.parameters() if p.requires_grad]
-        return [{"params": ex, "lr": float(lr), "name": "extractor"},
-                {"params": hd, "lr": float(lr), "name": "head"}]
+        return [{"params": at, "lr": float(lr_attn), "name": "attn"},
+                {"params": fp, "lr": float(lr_ffn), "name": "ffn"},
+                {"params": hd, "lr": float(lr_ffn), "name": "head"}]
 
     @torch.no_grad()
     def _teacher(self, x: torch.Tensor) -> torch.Tensor:
@@ -379,19 +396,19 @@ class TransferTrainer(nn.Module):
         return self.teacher_head(pool_feature(f, self.n_prefix, self.pool, self.fmt))
 
     def _student(self, x: torch.Tensor) -> torch.Tensor:
-        # `extractor(x)` chạy backbone trong `no_grad` (đã `set_body_frozen`),
-        # nên gradient chỉ tới phần ngoài backbone.
-        return self.student_head(self.extractor(x).mean(dim=1))
+        # `extractor(x)` chạy backbone trong `no_grad` (đã `set_frozen`), nên
+        # gradient chỉ tới Compressor.
+        return self.student_head(self.compressor(self.extractor(x)).mean(dim=1))
 
     def loss(self, views: list[torch.Tensor], teacher_temp: float,
              update_center: bool = True) -> torch.Tensor:
         """`views[0]` cho teacher, `views[1]` cho student — HAI augment KHÁC nhau.
 
-        Không có vòng lặp cặp như 0.1: teacher đứng yên nên nhiều view chỉ là
-        nhiều lần tính cùng một đích, không thêm tín hiệu nào.
+        Không có vòng lặp cặp như Stage 0: teacher đứng yên nên nhiều view chỉ
+        là nhiều lần tính cùng một đích, không thêm tín hiệu nào.
         """
         if len(views) < 2:
-            raise ValueError("Stage 0.2 cần 2 view (teacher + student)")
+            raise ValueError("Stage 1 cần 2 view (teacher + student)")
         t_raw = self._teacher(views[0]).float()
         s_raw = self._student(views[1]).float()
         t_p = F.softmax((t_raw - self.center) / float(teacher_temp), dim=-1).detach()

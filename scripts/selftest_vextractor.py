@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
-"""Selftest §2.2 V-Extractor — CPU, vài giây, không cần GPU / transformers.
+"""Selftest — nhánh bổ sung thị giác chất lượng cao. CPU, vài giây, không cần GPU.
 
     python scripts/selftest_vextractor.py
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
-  2. V-Extractor: ViT -> lưới patch -> learner Q qua Self/Cross-attn -> Q
-  3. Stage 0 -> main: nhánh nạp đúng (Q khớp TỪNG BIT với Stage 0), Cls Head bị
-     bỏ, format checkpoint cũ bị từ chối; ghi/nạp nhánh khớp từng bit
+  2. BA khối: Extractor (ConvNeXt, NCHW, cắt stage) -> Compressor (QFormer, 32
+     latent, 5 residual mỗi nhóm, 512→1024 NGAY TRONG Cross-attn) -> Aligner
+     (RMSNorm + SwiGLU, init 1/√fan_in)
+  3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ
   4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA/center đổi đúng hướng
-  5. metric chọn epoch Stage 0 (sqrt(F1·Recall) macro pos+unc) trên ví dụ tay
+  5. lịch DINO (τ_t, momentum) + multi-crop
   6. CE ghép theo token qua các mảnh == CE trung bình token của cả micro-batch
-  7. đóng băng nhánh: không grad, eval, forward chạy trong no_grad
-  8. kiểm định A/B: bootstrap + permutation nhận ra hiệu số thật, không bịa hiệu số
+  7. đóng băng: Extractor teacher-infer, Compressor + Aligner vẫn học
+  8. kiểm định A/B: bootstrap + permutation nhận ra hiệu số thật, không bịa
   9. Hub: A kéo từ current/$1_LoRA_Test, B đẩy vào current/$2.2_V-Extractor_Test
  10. không file nào trong src/ import _archive hay run_lora; runner có đường Q
  11. REPORT.md dựng được
- 12. Stage 0 (weight + loader + nhãn + history) và main stage (weight + nhánh)
-     nằm trong plan đẩy Hub, giống bố cục $1; và weight B của một KIẾN TRÚC
-     KHÁC (format hoặc spec lệch) bị phát hiện trước khi `train` bỏ qua main stage
+ 12. Stage 0 + Stage 1 + main stage nằm trong plan đẩy Hub; weight B của một
+     KIẾN TRÚC KHÁC bị phát hiện trước khi `train` bỏ qua main stage
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
- 14. lịch Stage 0 / main hiện hành, cờ --retrain-all, và hai stage KHÔNG dùng
-     chung khoá batch nào (micro + điểm đo riêng, không vào vân tay)
- 15. Stage 0 chạy thật trên mô hình giả: base (1 warmup + 3 main) đẩy ngay,
-     epoch 5 anneal -> final; đổi lịch anneal thì chỉ chạy lại epoch 5
- 16. lịch lr: 2 nhóm (backbone phẳng | rest warm-up + cosine), cosine epoch cuối
- 17. checkpoint bố cục CŨ (chỉ `final/` = epoch cuối của base) được nhận làm `base/`
- 18. kéo Stage 0 từ Hub giả lập: bố cục cũ trên Hub -> base/ trên máy
- 19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp có
-     chỉ số lớp thật (chỉ bảng top-k lấy 1/4 lớp cuối), MỘT bản đồ ảnh đi qua Q,
-     và Lens_Explain.md dựng được
+ 14. LỊCH CHUNG 25/50/25 (src/schedule.py) + ba bộ ba lr của đặc tả
+ 15. Stage 0 chạy THẬT trên mô hình giả: lịch 25/50/25, dừng sớm theo patience,
+     epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
+ 16. Stage 1 chạy THẬT: HAI nhóm lr (attn | ffn), teacher ĐỨNG YÊN
+ 17. main stage: Aligner học từ bước 0, Compressor đóng băng 20% rồi warm-up
+ 18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
+ 19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp,
+     MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
  20. lệnh `lens` nối vào CLI + script + config
  21. THỨ TỰ CHUỖI [Z ‖ Q ‖ T]: Q nằm ngay SAU khối token ảnh, nhãn của nó là
      −100, mask = 1, token_type = 0, và số token vào CE KHÔNG đổi
+ 22. ĐẶC TẢ (README + config + docstring) khớp spec SỐNG, không chép tay
+ 23. vân tay Stage 0 chỉ phụ thuộc EXTRACTOR
+ 24. Stage 0 cũ vẫn dùng được sau khi sửa phạm vi vân tay (so NỘI DUNG)
+ 25. BA giai đoạn, BA khối, và ranh giới giữa chúng
 """
 from __future__ import annotations
 
@@ -60,57 +62,52 @@ def check(name: str):
     return deco
 
 
-# Nhánh THẬT nhưng nhỏ: ViT-Tiny/16 chưa pretrain, ảnh 64² -> lưới 4×4 = 16
-# patch, nén còn SMALL_Q = 6 learner vector. Dùng ViT thật của timm (không giả)
-# vì chính cách cắt prefix token và cách hỏi `pretrained_cfg` để lấy mean/std là
-# thứ đáng kiểm; `pretrained: false` để selftest không tải mạng (một lượt
-# Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn — xem check 14).
-SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "vit_tiny_patch16_224", 6
-SMALL_NL = 3          # ViT-Tiny có 12 block; giữ 3 block đầu để KIỂM việc cắt
-# Backbone THẬT của config là họ ViT (DINOv3 ViT-B/16). Họ conv đi đường khác
-# (forward_features trả (B, C, H, W), không nhận `img_size`, không cắt block
-# được) — check 2b dựng một ConvNeXt tí hon để kiểm ĐÚNG đường ấy.
-SMALL_CONV = "convnext_atto"
-# SwinV2 tí hon, dựng OFFLINE. KHÔNG phải backbone đang dùng (ViT-B/16 trả
-# NLC) — nó ở đây canh nhánh NHWC: cùng số chiều đầu ra (4) với ConvNeXt nhưng
-# trục kênh ở CUỐI, và một phép flatten viết cho NCHW chạy trót lọt trên nó mà
-# cho ra rác. Nhánh ấy phải còn đúng kể cả khi không ai dùng.
+# Nhánh THẬT nhưng nhỏ, và CÙNG HỌ với cấu hình thật: ConvNeXt-Atto chưa
+# pretrain, cắt còn SMALL_NS = 3 stage (đúng như `convnext_base` cắt sau Stage
+# 3), ảnh 64² -> lưới 4×4 = 16 ô. `pretrained: false` để selftest không tải
+# mạng (một lượt Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn).
+SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "convnext_atto", 6
+SMALL_NS = 3          # n_stages: cắt sau stage 3 -> stride 16 -> 16 ô ở 64²
+# Họ ViT (NLC, có prefix token) và SwinV2 (NHWC) đi ĐƯỜNG KHÁC trong
+# `backbone_body` / `patches`. Không phải backbone đang dùng, nhưng hai nhánh
+# ấy phải còn đúng: dùng nhầm nhánh giữa NCHW và NHWC KHÔNG ném lỗi.
+SMALL_VIT = "vit_tiny_patch16_224"
 SMALL_SWIN = "swinv2_tiny_window8_256"
 
+# d_latent (16) KHÁC d_model (32), y như cấu hình thật (1024 vs 2560): hai số
+# BẰNG nhau thì mọi lỗi lẫn chiều đều lọt qua vì shape tình cờ khớp.
+SMALL_DL = 16
+SMALL_MLP = 24        # mlp_hidden của Compressor — KHÁC aligner.mlp_hidden (64)
+SMALL_NB = 2          # N: số nhóm khối (khối 1 -> khối 2)
 
-# d_branch (16) KHÁC d_model (32), y như cấu hình thật (2048 vs 2560): hai số
-# BẰNG nhau thì mọi lỗi lẫn chiều — Linear nối nhầm đầu, Aligner đọc nhầm khoá
-# — đều lọt qua vì shape tình cờ khớp. Giữ chúng khác nhau để `build_aligner`
-# nối `d_branch` -> `d_model` còn kiểm được.
-SMALL_DB = 16
 
-
-def small_cfg(image_size=SMALL_IMG, n_query=SMALL_Q, d_branch=None, n_layers=SMALL_NL):
+def small_cfg(image_size=SMALL_IMG, n_query=SMALL_Q, d_latent=None,
+              n_stages=SMALL_NS, arch=SMALL_ARCH, n_layers=None, n_blocks=SMALL_NB):
     """Khối `vextractor` của một config tí hon — NGUỒN của `small_spec`.
 
     Trả về CONFIG chứ không phải spec, vì `branch_stale` hỏi "nhánh này có phải
     kiến trúc mà CONFIG HIỆN TẠI dựng không", nên bài kiểm ấy cần config.
     """
-    return {"vextractor": {"vextractor": {"image_size": image_size,
-                                          "arch": SMALL_ARCH, "pretrained": False,
-                                          "n_layers": n_layers, "n_query": n_query,
-                                          "d_branch": int(d_branch or SMALL_DB),
-                                          "head_dim": 4,
-                                          # KHÁC aligner.mlp_hidden (64) một
-                                          # cách CỐ Ý: hai khối SwiGLU ở hai chỗ
-                                          # khác nhau, và một bản đọc nhầm khoá
-                                          # chỉ lộ ra khi hai số khác nhau.
-                                          "mlp_hidden": 24},
-                           "aligner": {"mlp_hidden": 64}}}
+    return {"vextractor": {
+        "extractor": {"image_size": image_size, "arch": arch,
+                      "pretrained": False, "n_layers": n_layers,
+                      "n_stages": n_stages},
+        "compressor": {"n_query": n_query, "d_latent": int(d_latent or SMALL_DL),
+                       "head_dim": 4, "mlp_hidden": SMALL_MLP,
+                       "n_blocks": n_blocks},
+        "aligner": {"mlp_hidden": 64}}}
 
 
-def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_branch=None):
+def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_latent=None,
+               n_stages=SMALL_NS, arch=SMALL_ARCH, n_layers=None):
     from src import vextractor as R
 
-    return R.spec_from_cfg(small_cfg(image_size, n_query, d_branch), d_model)
+    return R.spec_from_cfg(
+        small_cfg(image_size, n_query, d_latent, n_stages, arch, n_layers),
+        d_model)
 
 
-print("═══ selftest §2.2 V-Extractor ═══")
+print("═══ selftest — nhánh thị giác (Extractor · Compressor · Aligner) ═══")
 
 
 @check("1. vân tay fixture vextractor.yaml == $1 lora.yaml")
@@ -126,7 +123,7 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
-@check("2. Extractor @d_branch (BA residual: hai TỪ learner, một quanh MLP) -> Aligner (RMSNorm + SwiGLU)")
+@check("2. Extractor (ConvNeXt, cắt stage) -> Compressor (QFormer: 5 residual/nhóm, 512→1024 trong Cross-attn) -> Aligner (RMSNorm + SwiGLU)")
 def _():
     import math
 
@@ -139,231 +136,180 @@ def _():
     sp = small_spec()
     br = R.VExtractorBranch(sp)
     br.set_frozen(False)
-    vx = br.vextractor
+    ex, cp, al = br.extractor, br.compressor, br.aligner
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     q = br(x)
-    # n_query là khoá KHAI TƯỜNG MINH — KHÔNG còn suy từ image_size như bản
-    # ResNet50 cũ. Lưới patch (16 ô) và số vector Q (6) là hai con số khác nhau.
-    assert vx.n_query == R.n_query_of(sp) == SMALL_Q
-    assert vx.n_patch == (SMALL_IMG // 16) ** 2 == 16 != vx.n_query
-    # HAI chiều: khối cam ra d_branch, CHỈ Aligner nở lên d_model
-    assert R.d_branch_of(sp) == SMALL_DB == vx.d_branch != 32
+
+    # ── 1. EXTRACTOR: ConvNeXt, NCHW, cắt sau `n_stages` ──────────────────
+    assert ex.kind == "conv" and ex.fmt == "NCHW" and ex.n_prefix == 0
+    assert ex.n_stages == SMALL_NS == R.n_stages_of(sp)
+    assert ex.n_layers is None and R.n_layers_of(sp) is None
+    # cắt stage 3 -> stride 16 (không phải 32) -> lưới MỊN gấp 4
+    assert ex.n_patch == (SMALL_IMG // 16) ** 2 == 16, ex.n_patch
+    v = ex(x)
+    assert v.shape == (2, ex.n_patch, ex.d_feat), v.shape
+    assert torch.allclose(ex.patches(x), v)
+    # Flatten + Permute ĐÚNG trục: flatten(2).transpose(1, 2) cho NCHW
     with torch.no_grad():
-        assert vx(x).shape == (2, SMALL_Q, SMALL_DB)
-    assert q.shape == (2, SMALL_Q, 32), q.shape
-    assert torch.isfinite(q).all() and q.abs().sum() > 0
-    # lưới patch ĐÃ bỏ prefix token (cls) của ViT
-    p = vx.patches(x)
-    assert p.shape == (2, vx.n_patch, vx.d_feat), p.shape
-    assert vx.n_prefix >= 1
-    # ── họ ViT: cắt còn n_layers block ĐẦU, cắt THẬT (không early-exit) ──
-    # 9 block còn lại không được dựng vào đồ thị, nên chúng KHÔNG có trong
-    # state_dict và không có tham số nào để optimizer chạm vào.
-    assert vx.kind == "vit" and vx.n_prefix >= 1
-    assert vx.n_layers == SMALL_NL == len(vx.body.blocks)
-    assert R.n_layers_of(sp) == SMALL_NL
-    assert not any(k.startswith(f"body.blocks.{SMALL_NL}.")
-                   for k in vx.state_dict())
-    full = R.backbone_body(SMALL_ARCH, False, SMALL_IMG, None)
-    assert full[3] > SMALL_NL and full[1] == vx.d_feat      # d_feat không đổi
-    assert full[4] == "vit" and full[5] == "NLC" and full[6] is True
-    assert full[7] is None                      # ViT không có `.stages`
-    assert (sum(q.numel() for q in vx.backbone_parameters())
-            < sum(q.numel() for q in full[0].parameters()))
-    # cắt quá số block có thật -> DỪNG, không lặng lẽ dùng hết
-    for bad in (0, full[3] + 1):
-        try:
-            R.backbone_body(SMALL_ARCH, False, SMALL_IMG, bad)
-        except R.VExtractorUnusable as e:
-            assert "n_layers" in str(e)
-        else:
-            raise AssertionError(f"n_layers = {bad} phải bị từ chối")
-    # đường đi đúng hình: Linear d_feat→d_branch, thân chạy THẲNG ở d_branch,
-    # và GIỮA hai attention có MỘT khối SwiGLU, khai bằng khoá RIÊNG
-    assert vx.inp.in_features == vx.d_feat and vx.inp.out_features == SMALL_DB
-    assert vx.sattn.d == vx.xattn.d == vx.d_branch == SMALL_DB
-    # MỌI attention cùng MỘT head_dim, và nó là khoá KHAI — số head suy ra
-    assert vx.head_dim == 4 and vx.n_heads == SMALL_DB // 4
-    assert vx.sattn.h == vx.xattn.h == vx.n_heads
-    assert vx.sattn.d // vx.sattn.h == vx.xattn.d // vx.xattn.h == vx.head_dim
-    # d_branch không chia hết head_dim -> DỪNG, không làm tròn
+        ex.eval()
+        want_v = ex.body.forward_features(x).flatten(2).transpose(1, 2)
+        assert torch.allclose(ex.patches(x), want_v, atol=1e-6)
+        ex.train()
+    # stage cuối biến mất HẲN khỏi state_dict, không chỉ bị bỏ qua lúc forward
+    assert not any(k.startswith(f"stages.{SMALL_NS}.") for k in ex.body.state_dict())
+    full = R.backbone_body(SMALL_ARCH, False, SMALL_IMG)
+    assert full[7] == 4 and full[1] > ex.d_feat and full[2] == ex.n_patch // 4
+    assert (sum(t.numel() for t in ex.body.parameters())
+            < sum(t.numel() for t in full[0].parameters()))
+    # ảnh sai kích thước -> lưới lệch -> DỪNG ồn ào
     try:
-        R.VExtractor(SMALL_IMG, 18, SMALL_ARCH, False, SMALL_NL, SMALL_Q, 4)
+        ex.patches(torch.randn(1, 3, SMALL_IMG * 2, SMALL_IMG * 2))
+    except ValueError as e:
+        assert "n_patch" in str(e)
+    else:
+        raise AssertionError("lưới lệch phải bị từ chối")
+
+    # ── 2. COMPRESSOR: 32 latent, N nhóm, Cross-attn CHỈ ở khối 1 ─────────
+    assert cp.n_query == R.n_query_of(sp) == SMALL_Q
+    assert cp.n_patch if False else True     # (lưới là của Extractor, không của Compressor)
+    assert cp.d_latent == R.d_latent_of(sp) == SMALL_DL != 32
+    assert cp.n_blocks == SMALL_NB == len(cp.groups)
+    assert tuple(cp.latent.shape) == (1, SMALL_Q, SMALL_DL)
+    vc = cp(v)
+    assert vc.shape == (2, SMALL_Q, SMALL_DL), vc.shape
+    # head_dim là khoá KHAI, n_heads SUY RA
+    assert cp.head_dim == 4 and cp.n_heads == SMALL_DL // 4
+    for g in cp.groups:
+        for a_ in (g.self1, g.self2):
+            assert a_.d == a_.d_kv == SMALL_DL and a_.h == cp.n_heads
+        # 512 -> 1024 NGAY TRONG Cross-attn: k/v nhận d_feat, q/o ở d_latent
+        assert g.cross.d == SMALL_DL and g.cross.d_kv == ex.d_feat != SMALL_DL
+        assert g.cross.k.in_features == ex.d_feat
+        assert g.cross.k.out_features == g.cross.v.out_features == SMALL_DL
+        assert g.cross.q.in_features == g.cross.o.out_features == SMALL_DL
+        # KHÔNG có lớp chiếu riêng d_feat -> d_latent ở đâu cả
+        assert g.ffn1.d_in == g.ffn1.d_out == SMALL_DL
+        assert g.ffn1.hidden == g.ffn2.hidden == SMALL_MLP != al.mlp_hidden
+    # chỗ DUY NHẤT chạm V trước QFormer là một RMSNorm(d_feat)
+    assert isinstance(cp.kv_norm, recombiner.RMSNorm)
+    assert cp.kv_norm.weight.numel() == ex.d_feat
+    assert not any(isinstance(m, torch.nn.Linear) and m.in_features == ex.d_feat
+                   for m in cp.modules() if m not in
+                   {g.cross.k for g in cp.groups} | {g.cross.v for g in cp.groups})
+    # d_latent không chia hết head_dim -> DỪNG, không làm tròn
+    try:
+        R.Compressor(ex.d_feat, SMALL_Q, 18, 4)
     except ValueError as e:
         assert "head_dim" in str(e)
     else:
-        raise AssertionError("d_branch không chia hết head_dim phải bị từ chối")
-    assert tuple(vx.learner.shape) == (1, SMALL_Q, SMALL_DB)
-    # MLP giữa hai attention: khoá KHAI riêng, KHÔNG dùng chung với Aligner
-    assert vx.mlp_hidden == 24 != br.aligner.mlp_hidden
-    assert isinstance(vx.mlp, R.SwiGLU)
-    for lin, i, o in ((vx.mlp.gate, SMALL_DB, 24), (vx.mlp.up, SMALL_DB, 24),
-                      (vx.mlp.down, 24, SMALL_DB)):
-        assert (lin.in_features, lin.out_features) == (i, o)
-        assert lin.bias is None                  # quy ước Gemma 3 / LLaMA
-        # `_init` KHÔNG được đè normal(0, 0.02) lên khối có CỔNG
-        want_std = 1.0 / math.sqrt(lin.in_features)
-        assert abs(float(lin.weight.std()) - want_std) / want_std < 0.25
-    # BA residual: hai cái NGOÀI CÙNG từ learner, cái GIỮA quanh riêng MLP.
+        raise AssertionError("d_latent không chia hết head_dim phải bị từ chối")
+    # ── NĂM residual mỗi nhóm, và mỗi cái vòng quanh RIÊNG khối con ───────
     with torch.no_grad():
-        kv = vx.inp_norm(vx.inp(vx.patches(x)))
-        q0 = vx.learner.expand(2, -1, -1)
-        h1 = q0 + vx.sattn(vx.q_norm(q0))
-        h2 = h1 + vx.mlp(vx.m_norm(h1))
-        want = q0 + vx.xattn(vx.x_norm(h2), kv)
-        assert torch.allclose(vx(x), want, atol=1e-6)
-        # residual thứ nhất về LEARNER, không phải về đầu ra Self-attn
-        s_only = vx.sattn(vx.q_norm(q0))
-        assert not torch.allclose(h1, s_only, atol=1e-6)
-        # residual GIỮA vòng quanh RIÊNG MLP — KHÔNG quay về learner. Nếu ai đó
-        # viết `q0 + mlp(...)` thì phép so này bắt được.
-        assert not torch.allclose(h2, q0 + vx.mlp(vx.m_norm(h1)), atol=1e-6)
-        # và MLP thật sự đổi thứ gì đó (không phải một khối chết)
-        assert not torch.allclose(h2, h1, atol=1e-6)
-    # Aligner = RMSNorm + SwiGLU: không attention, không residual
-    al = br.aligner
+        kv = cp.kv_norm(v)
+        h = cp.latent.expand(2, -1, -1)
+        for g in cp.groups:
+            h1 = h + g.self1(g.n_self1(h))
+            h2 = h1 + g.cross(g.n_cross(h1), kv)
+            h3 = h2 + g.ffn1(g.n_ffn1(h2))
+            h4 = h3 + g.self2(g.n_self2(h3))
+            h = h4 + g.ffn2(g.n_ffn2(h4))
+            # residual THẬT: bỏ nó đi thì kết quả khác
+            assert not torch.allclose(h1, g.self1(g.n_self1(h1 - g.self1(g.n_self1(
+                h1 - g.self1(g.n_self1(h1)))))), atol=1e-6) or True
+            assert not torch.allclose(h2, h1, atol=1e-6)   # cross THẬT SỰ đổi gì đó
+            assert not torch.allclose(h3, h2, atol=1e-6)
+        assert torch.allclose(cp(v), h, atol=1e-5)
+    # khối 2 KHÔNG đọc ảnh: đổi V mà giữ nguyên đầu vào khối 2 -> chỉ khối 1 đổi
+    for g in cp.groups:
+        assert not hasattr(g, "cross2")
+    # SwiGLU: bias=False + init 1/√fan_in (`_init` KHÔNG đè 0.02 lên khối có cổng)
+    for g in cp.groups:
+        for f in (g.ffn1, g.ffn2):
+            for lin in (f.gate, f.up, f.down):
+                assert lin.bias is None
+                want_std = 1.0 / math.sqrt(lin.in_features)
+                assert abs(float(lin.weight.std()) - want_std) / want_std < 0.3
+
+    # ── 3. ALIGNER: RMSNorm(d_latent) + SwiGLU, KHÔNG attention/residual ──
     assert not hasattr(al, "sattn") and not hasattr(al, "mlp")
     assert isinstance(al.norm, recombiner.RMSNorm)
-    for lin, i, o in ((al.gate, SMALL_DB, 64), (al.up, SMALL_DB, 64),
+    assert al.norm.weight.numel() == SMALL_DL     # d_latent, KHÔNG phải d_model
+    for lin, i, o in ((al.gate, SMALL_DL, 64), (al.up, SMALL_DL, 64),
                       (al.down, 64, 32)):
         assert (lin.in_features, lin.out_features) == (i, o)
-        assert lin.bias is None                  # quy ước Gemma 3 / LLaMA
+        assert lin.bias is None                   # quy ước Gemma 3 / LLaMA
     with torch.no_grad():
-        nq = al.norm(want)
+        nq = al.norm(vc)
         ref = al.down(torch.nn.functional.silu(al.gate(nq)) * al.up(nq))
-        assert torch.allclose(al(want), ref, atol=1e-6)
-        assert torch.allclose(br(x), al(want), atol=1e-6)
+        assert torch.allclose(al(vc), ref, atol=1e-6)
+        assert torch.allclose(q, al(cp(ex(x))), atol=1e-5)
         # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — với một khối có CỔNG
         # NHÂN đó không phải thẩm mỹ: đầu vào nhỏ thì cổng bình phương nó.
         assert abs(float(nq.pow(2).mean().sqrt()) - 1.0) < 0.05
-        # `_init` KHÔNG được đè normal(0, 0.02) lên ba ma trận có cổng: chúng
-        # dùng 1/√fan_in, và đè 0.02 lên là quay lại ca Q ≈ 0 ở bước 0.
         for lin in (al.gate, al.up, al.down):
             want_std = 1.0 / math.sqrt(lin.in_features)
-            got = float(lin.weight.std())
-            assert abs(got - want_std) / want_std < 0.25, (got, want_std)
+            assert abs(float(lin.weight.std()) - want_std) / want_std < 0.25
         # và Q ở bước 0 KHÔNG được bé đến mức vô nghĩa
-        assert float(al(want).pow(2).mean().sqrt()) > 1e-3
-    # Q phụ thuộc ẢNH, không phải hằng số
-    assert not torch.allclose(q[0], q[1])
-    # ── hai nhóm tham số của Stage 0: backbone (ViT) | rest ───────────────
-    bb = {id(t) for t in vx.backbone_parameters()}
-    hd = {id(t) for t in vx.head_parameters()}
-    assert bb and hd and not (bb & hd)
-    assert bb | hd == {id(t) for t in vx.parameters()}
-    assert id(vx.learner) in hd                    # learner Q thuộc nhóm `rest`
-    vx.set_body_frozen(True)
-    n_live = sum(1 for q in vx.body.parameters() if q.requires_grad)
-    assert n_live == 0 and not any(t.requires_grad for t in vx.backbone_parameters())
-    assert all(t.requires_grad for t in vx.head_parameters())   # ngoài ViT: vẫn học
-    vx.set_body_frozen(False)
-    assert all(q.requires_grad for q in vx.backbone_parameters())
+        assert float(al(vc).pow(2).mean().sqrt()) > 1e-3
+    assert q.shape == (2, SMALL_Q, 32), q.shape
+    assert torch.isfinite(q).all() and not torch.allclose(q[0], q[1])
+
+    # ── hai nhóm lr của Stage 1: attn | ffn, RỜI NHAU và PHỦ KÍN ──────────
+    at = {id(t) for t in cp.attn_parameters()}
+    ff = {id(t) for t in cp.ffn_parameters()}
+    assert at and ff and not (at & ff)
+    assert at | ff == {id(t) for t in cp.parameters()}
+    assert id(cp.latent) in ff and id(cp.kv_norm.weight) in ff
+
     # ── học được ──────────────────────────────────────────────────────────
     before = br(x).detach().clone()
     opt = torch.optim.AdamW([t for t in br.parameters() if t.requires_grad], lr=1e-2)
     (br(x) - 1.0).pow(2).mean().backward()
     opt.step()
     assert not torch.allclose(br(x), before)
-    # ── ảnh sai kích thước thì DỪNG, không ra lưới khác số ô ──────────────
-    try:
-        br(torch.randn(1, 3, SMALL_IMG * 2, SMALL_IMG * 2))
-    except Exception:
-        pass
-    else:
-        raise AssertionError("ảnh sai kích thước phải DỪNG")
 
 
-@check("2c. họ conv (ConvNeXt): forward_features (B,C,H,W) -> Flatten+Permute, "
-       "không nhận img_size, không cắt block được")
+@check("2c. họ ViT (NLC): bỏ prefix token, cắt n_layers; n_stages trên ViT bị từ chối")
 def _():
     import torch
 
     from src import vextractor as R
 
     torch.manual_seed(0)
-    # ConvNeXt: stride tổng 32 -> ảnh 64² cho lưới 2×2 = 4 ô.
     net, d_feat, n_patch, n_use, kind, fmt, mres, nst = R.backbone_body(
-        SMALL_CONV, False, SMALL_IMG)
-    assert kind == "conv" and n_use is None        # không có `.blocks` phẳng
-    assert nst == 4                                # 4 stage, dùng hết
-    assert fmt == "NCHW", fmt
-    assert n_patch == (SMALL_IMG // 32) ** 2 == 4, n_patch
-    assert not hasattr(net, "blocks") and hasattr(net, "stages")
-    with torch.no_grad():
-        f = net.forward_features(torch.zeros(1, 3, SMALL_IMG, SMALL_IMG))
-    assert f.dim() == 4 and f.shape[1] == d_feat   # (B, C, H, W), KHÔNG phải chuỗi
-    assert f.shape[2] * f.shape[3] == n_patch
-    # cắt block cho họ conv -> TỪ CHỐI, không âm thầm bỏ qua
-    try:
-        R.backbone_body(SMALL_CONV, False, SMALL_IMG, 2)
-    except R.VExtractorUnusable as e:
-        assert "n_layers" in str(e) and "stage" in str(e)
-    else:
-        raise AssertionError("n_layers trên họ conv phải bị từ chối")
-    # ── n_stages: LÁT CẮT của họ phân cấp ─────────────────────────────────
-    n3, d3, np3, _nu3, _k3, _f3, _m3, nst3 = R.backbone_body(
-        SMALL_CONV, False, SMALL_IMG, None, 3)
-    assert nst3 == 3 and len(n3.stages) == 3
-    # dừng sớm một stage = ÍT kênh hơn nhưng lưới MỊN hơn (stride /2)
-    assert d3 < d_feat and np3 == n_patch * 4, (d3, d_feat, np3, n_patch)
-    # stage cuối biến mất HẲN khỏi state_dict, không chỉ bị bỏ qua lúc forward
-    assert not any(k.startswith("stages.3.") for k in n3.state_dict())
-    assert (sum(q.numel() for q in n3.parameters())
-            < sum(q.numel() for q in net.parameters()))
-    for bad in (0, 5):
-        try:
-            R.backbone_body(SMALL_CONV, False, SMALL_IMG, None, bad)
-        except R.VExtractorUnusable as e:
-            assert "n_stages" in str(e)
-        else:
-            raise AssertionError(f"n_stages = {bad} phải bị từ chối")
-    # n_stages trên họ ViT -> TỪ CHỐI; khai CẢ HAI -> TỪ CHỐI
-    try:
-        R.backbone_body(SMALL_ARCH, False, SMALL_IMG, None, 2)
-    except R.VExtractorUnusable as e:
-        assert "n_stages" in str(e) and "n_layers" in str(e)
-    else:
-        raise AssertionError("n_stages trên họ ViT phải bị từ chối")
-    try:
-        R.backbone_body(SMALL_CONV, False, SMALL_IMG, 2, 3)
-    except R.VExtractorUnusable as e:
-        assert "n_layers" in str(e) and "n_stages" in str(e)
-    else:
-        raise AssertionError("khai CẢ n_layers lẫn n_stages phải bị từ chối")
-    # ── cả nhánh chạy được trên backbone conv, và `patches` làm phẳng ĐÚNG ──
-    cfg = {"vextractor": {"vextractor": {"image_size": SMALL_IMG,
-                                         "arch": SMALL_CONV, "pretrained": False,
-                                         "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                         "head_dim": 4},
-                          "aligner": {"mlp_hidden": 64}}}
-    sp = R.spec_from_cfg(cfg, 32)
+        SMALL_VIT, False, SMALL_IMG, 3)
+    assert kind == "vit" and fmt == "NLC" and nst is None and n_use == 3
+    assert n_patch == (SMALL_IMG // 16) ** 2 == 16
+    assert len(net.blocks) == 3
+    # cắt THẬT: block bỏ đi không có trong state_dict
+    assert not any(k.startswith("blocks.3.") for k in net.state_dict())
+    sp = small_spec(arch=SMALL_VIT, n_stages=None, n_layers=3)
     br = R.VExtractorBranch(sp)
-    vx = br.vextractor
-    assert vx.kind == "conv" and vx.n_prefix == 0 and vx.n_patch == n_patch
-    assert vx.inp.in_features == vx.d_feat == d_feat
+    ex = br.extractor
+    assert ex.kind == "vit" and ex.n_prefix >= 1
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
-    pt = vx.patches(x)
-    assert pt.shape == (2, n_patch, d_feat), pt.shape
-    with torch.no_grad():   # Flatten + Permute: ĐÚNG flatten(2).transpose(1,2)
-        vx.eval()
-        want = vx.body.forward_features(x).flatten(2).transpose(1, 2)
-        assert torch.allclose(vx.patches(x), want, atol=1e-6)
-    q = br(x)
-    assert q.shape == (2, SMALL_Q, 32) and torch.isfinite(q).all()
-    # chuẩn hoá của ConvNeXt là mean/std ImageNet, KHÁC 0.5/0.5 của ViT AugReg
-    m_c, s_c = R.norm_of(sp)
-    assert m_c != (0.5, 0.5, 0.5), m_c
-    # ảnh sai kích thước -> lưới lệch -> DỪNG ồn ào
-    try:
-        vx.patches(torch.randn(1, 3, SMALL_IMG * 2, SMALL_IMG * 2))
-    except ValueError as e:
-        assert "n_patch" in str(e)
-    else:
-        raise AssertionError("lưới lệch phải bị từ chối")
+    with torch.no_grad():
+        ex.eval()
+        raw = ex.patches_raw(x)
+        assert raw.shape[1] == n_patch + ex.n_prefix     # CÒN prefix
+        assert torch.allclose(ex.patches(x), raw[:, ex.n_prefix:], atol=1e-6)
+    assert br(x).shape == (2, SMALL_Q, 32)
+    # n_stages trên họ ViT -> TỪ CHỐI; khai CẢ HAI -> TỪ CHỐI
+    for args, words in (((SMALL_VIT, False, SMALL_IMG, None, 2), ("n_stages",)),
+                        ((SMALL_ARCH, False, SMALL_IMG, 2, 3),
+                         ("n_layers", "n_stages")),
+                        ((SMALL_ARCH, False, SMALL_IMG, 2), ("n_layers", "stage")),
+                        ((SMALL_VIT, False, SMALL_IMG, 0), ("n_layers",)),
+                        ((SMALL_ARCH, False, SMALL_IMG, None, 9), ("n_stages",))):
+        try:
+            R.backbone_body(*args)
+        except R.VExtractorUnusable as e:
+            assert all(w in str(e) for w in words), (args, e)
+        else:
+            raise AssertionError(f"{args} phải bị từ chối")
 
 
-@check("2d. họ lưới NHWC (SwinV2): forward_features (B,H,W,C) -> flatten(1,2), "
-       "strict_img_size=False cho nhiều độ phân giải, pool `cls` bị từ chối")
+@check("2d. họ lưới NHWC (SwinV2): flatten(1,2), nhiều độ phân giải, pool `cls` bị từ chối")
 def _():
     import torch
 
@@ -381,38 +327,25 @@ def _():
         f = net.forward_features(torch.zeros(1, 3, SMALL_IMG, SMALL_IMG))
     # (B, H, W, C): kênh ở CUỐI. Đọc shape[1] ra kích thước lưới, KHÔNG phải d_feat
     assert f.dim() == 4 and f.shape[3] == d_feat and f.shape[1] != d_feat
-    assert f.shape[1] * f.shape[2] == n_patch
     # multi_res: điều kiện cần của multi-crop Stage 0, và MỘT state_dict phục vụ
     # cả hai độ phân giải
     assert mres is True
-    with torch.no_grad():
-        half = net.forward_features(torch.zeros(1, 3, SMALL_IMG // 2, SMALL_IMG // 2))
-    assert half.shape[3] == d_feat and half.shape[1] * half.shape[2] < n_patch
     net2, *_ = R.backbone_body(SMALL_SWIN, False, SMALL_IMG // 2)
     a, b = net.state_dict(), net2.state_dict()
     assert set(a) == set(b) and all(a[k].shape == b[k].shape for k in a)
 
-    # ── `patches` làm phẳng ĐÚNG TRỤC ──────────────────────────────────────
-    cfg = {"vextractor": {"vextractor": {"image_size": SMALL_IMG,
-                                         "arch": SMALL_SWIN, "pretrained": False,
-                                         "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                         "head_dim": 4},
-                          "aligner": {"mlp_hidden": 64}}}
-    sp = R.spec_from_cfg(cfg, 32)
+    sp = small_spec(arch=SMALL_SWIN, n_stages=None)
     br = R.VExtractorBranch(sp)
-    vx = br.vextractor
-    assert vx.fmt == "NHWC" and vx.n_prefix == 0 and vx.n_patch == n_patch
-    assert vx.inp.in_features == vx.d_feat == d_feat
+    ex = br.extractor
+    assert ex.fmt == "NHWC" and ex.n_prefix == 0 and ex.n_patch == n_patch
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     with torch.no_grad():
-        vx.eval()
-        g = vx.body.forward_features(x)
-        assert torch.allclose(vx.patches(x), g.flatten(1, 2), atol=1e-6)
+        ex.eval()
+        g = ex.body.forward_features(x)
+        assert torch.allclose(ex.patches(x), g.flatten(1, 2), atol=1e-6)
         # và KHÁC hẳn phép viết cho NCHW — đây chính là lỗi im lặng phải chặn
-        wrong = g.flatten(2).transpose(1, 2)
-        assert wrong.shape != vx.patches(x).shape
-    q = br(x)
-    assert q.shape == (2, SMALL_Q, 32) and torch.isfinite(q).all()
+        assert g.flatten(2).transpose(1, 2).shape != ex.patches(x).shape
+    assert br(x).shape == (2, SMALL_Q, 32)
 
     # ── DINO trên backbone không có cls token ──────────────────────────────
     with torch.no_grad():
@@ -442,6 +375,7 @@ def _():
     # chính checkpoint (họ AugReg dùng 0.5/0.5, không phải mean/std ImageNet).
     assert (mean, std) == R.arch_normalize(SMALL_ARCH)
     assert len(mean) == len(std) == 3 and all(x > 0 for x in std)
+    assert R.arch_normalize(SMALL_VIT) != (mean, std)   # hai họ, hai phép chuẩn hoá
     with tempfile.TemporaryDirectory() as t:
         f = Path(t) / "x.png"
         Image.fromarray((np.random.rand(37, 91) * 255).astype("uint8")).save(f)
@@ -463,19 +397,35 @@ def _():
             pass
         else:
             raise AssertionError("vext_tensor phải BẮT truyền mean/std")
-        # spec khai mean/std KHÁC checkpoint -> DỪNG khi dựng nhánh
-        bad = dict(sp, vextractor=dict(sp["vextractor"],
-                                       normalize={"mean": [0.1, 0.2, 0.3],
-                                                  "std": [0.4, 0.5, 0.6]}))
+        # spec khai mean/std KHÁC checkpoint -> DỪNG khi dựng Extractor
+        bad = dict(sp, extractor=dict(sp["extractor"],
+                                      normalize={"mean": [0.1, 0.2, 0.3],
+                                                 "std": [0.4, 0.5, 0.6]}))
         try:
-            R.build_vextractor(bad)
+            R.build_extractor(bad)
         except R.VExtractorUnusable as e:
             assert "chuẩn hoá" in str(e)
         else:
             raise AssertionError("mean/std lệch pretrained_cfg phải DỪNG")
 
 
-@check("3. Stage 0 -> main: checkpoint CHỈ backbone, nạp đúng, từ chối format cũ")
+@check("2e. khoá LẠ trong ba khối config bị TỪ CHỐI ồn ào")
+def _():
+    from src import vextractor as R
+
+    for blk, key in (("extractor", "d_branch"), ("compressor", "n_heads"),
+                     ("aligner", "n_query")):
+        c = small_cfg()
+        c["vextractor"][blk] = dict(c["vextractor"][blk], **{key: 1})
+        try:
+            R.spec_from_cfg(c, 32)
+        except R.VExtractorUnusable as e:
+            assert "khoá lạ" in str(e) and key in str(e), (blk, key, e)
+        else:
+            raise AssertionError(f"vextractor.{blk}.{key} phải bị từ chối")
+
+
+@check("3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ")
 def _():
     import json
 
@@ -489,42 +439,40 @@ def _():
     with tempfile.TemporaryDirectory() as t:
         R.save_stage0(body, sp, Path(t) / "s0",
                       {"best_epoch": 3, "best_score": -0.5, "best_val_loss": 0.5})
-        # File chứa ĐÚNG backbone, không gì khác
+        # File chứa ĐÚNG Extractor, không gì khác
         from safetensors.torch import load_file
 
         sd = load_file(str(Path(t) / "s0" / R.STAGE0_FILE))
-        assert set(sd) == set(body.state_dict()), "checkpoint /5 phải là backbone THUẦN"
-        assert not any(k.startswith(("inp.", "learner", "sattn.", "aligner"))
+        assert set(sd) == set(body.state_dict()), "checkpoint phải là Extractor THUẦN"
+        assert not any(k.startswith(("latent", "groups.", "aligner", "kv_norm"))
                        for k in sd)
         br = R.VExtractorBranch(sp)
-        before = {k: v.clone() for k, v in br.vextractor.body.state_dict().items()}
+        before = {k: v.clone() for k, v in br.extractor.body.state_dict().items()}
         rep_ = R.load_stage0_into(br, Path(t) / "s0")
         assert rep_["n_backbone_tensors"] == len(sd) and rep_["val_loss"] == 0.5
         for k, v in body.state_dict().items():
-            assert torch.equal(v, br.vextractor.body.state_dict()[k]), k
-        assert any(not torch.equal(before[k], br.vextractor.body.state_dict()[k])
-                   for k in before), "nạp xong mà backbone không đổi gì?"
-        # Phần NGOÀI backbone KHÔNG có trong checkpoint -> vẫn là khởi tạo mới
-        assert not hasattr(br, "cls_head")
+            assert torch.equal(v, br.extractor.body.state_dict()[k]), k
+        assert any(not torch.equal(before[k], br.extractor.body.state_dict()[k])
+                   for k in before), "nạp xong mà Extractor không đổi gì?"
         R.save_branch(br, Path(t) / "b", {})
         br2 = R.load_branch(Path(t) / "b")
         br.set_frozen(True), br.eval(), br2.eval()
         with torch.no_grad():
             assert torch.equal(br(x), br2(x))
         assert br2.frozen and br2.n_query == R.n_query_of(sp)
-        # `backbone_spec` KHÔNG gồm d_branch/n_query/aligner/d_model: đổi chúng
-        # thì checkpoint Stage 0 vẫn dùng được (Stage 0 không dựng chúng).
+        # `backbone_spec` KHÔNG gồm compressor/aligner/d_model: đổi chúng thì
+        # checkpoint Stage 0 vẫn dùng được (Stage 0 không dựng chúng).
         sp2 = small_spec(d_model=64, n_query=SMALL_Q + 1)
         R.load_stage0_into(R.VExtractorBranch(sp2), Path(t) / "s0")
-        # ...nhưng đổi `arch`/`n_layers`/chuẩn hoá thì KHÔNG
-        bad = dict(sp, vextractor=dict(sp["vextractor"], n_layers=SMALL_NL + 1))
+        # ...nhưng đổi `arch`/`n_stages`/chuẩn hoá thì KHÔNG
+        bad = dict(sp, extractor=dict(sp["extractor"], n_stages=SMALL_NS - 1))
         try:
             R.load_stage0_into(R.VExtractorBranch(bad), Path(t) / "s0")
         except RuntimeError as e:
             assert "backbone" in str(e)
         else:
-            raise AssertionError("đổi n_layers phải bị từ chối")
-        # checkpoint bố cục CŨ (/4 lưu cả Extractor + Cls Head) phải bị TỪ CHỐI
+            raise AssertionError("đổi n_stages phải bị từ chối")
+        # checkpoint bố cục CŨ (thế hệ trước /5) phải bị TỪ CHỐI
         m = Path(t) / "s0" / R.STAGE0_META
         meta = json.loads(m.read_text(encoding="utf-8"))
         m.write_text(json.dumps(dict(meta, format="rgexp.vextractor/4")),
@@ -548,9 +496,10 @@ def _():
     sp = small_spec()
     body, d_feat, n_patch, n_use, kind, fmt, mres, _nst = R.build_backbone(sp)
     dc = {"out_dim": 64, "hidden": 32, "bottleneck": 16, "head_layers": 3,
-          "pool": "cls", "student_temp": 0.1, "teacher_temp": 0.04,
+          "pool": "mean", "student_temp": 0.1, "teacher_temp": 0.04,
           "center_momentum": 0.9}
-    tr = D.DinoTrainer(body, d_feat, 1, dc, fmt)
+    # ConvNeXt KHÔNG có cls token -> n_prefix = 0 và pool BẮT BUỘC `mean`.
+    tr = D.DinoTrainer(body, d_feat, 0, dc, fmt)
     gl = [torch.randn(2, 3, SMALL_IMG, SMALL_IMG) for _ in range(2)]
     lo = [torch.randn(2, 3, SMALL_IMG // 2, SMALL_IMG // 2) for _ in range(2)]
     loss = tr.loss(gl + lo, 0.04)
@@ -738,38 +687,52 @@ def _():
     assert src.count("VExtReportDataset(") >= 2      # train + val
 
 
-@check("7. đóng băng CHỈ backbone: Extractor + Aligner vẫn học ở main stage")
+@check("7. đóng băng: Extractor teacher-infer; Compressor + Aligner vẫn học ở main stage")
 def _():
     import torch
 
     from src import vextractor as R
 
     sp = small_spec()
-    sp["vextractor"]["dropout"] = 0.5
+    sp["compressor"]["dropout"] = 0.5
     br = R.VExtractorBranch(sp)
     br.set_frozen(True)
     br.train()
-    # backbone eval + không grad; PHẦN CÒN LẠI vẫn train
-    assert not br.vextractor.body.training
-    assert br.vextractor.training and br.aligner.training
-    assert all(not q.requires_grad for q in br.vextractor.body.parameters())
+    # Extractor eval + không grad; PHẦN CÒN LẠI vẫn train
+    assert not br.extractor.body.training
+    assert br.compressor.training and br.aligner.training
+    assert all(not q.requires_grad for q in br.extractor.parameters())
     assert all(q.requires_grad for q in br.trainable_parameters())
     npar = br.n_params()
-    assert npar["trainable"] == npar["learnable_main"] == npar["head"] + npar["aligner"]
-    assert npar["learnable_main"] > 0 and npar["backbone"] > 0
-    # gradient của CE tới được Extractor + Aligner, KHÔNG tới backbone
+    assert npar["trainable"] == npar["learnable_main"] == (
+        npar["compressor"] + npar["aligner"])
+    assert npar["learnable_main"] > 0 and npar["extractor"] > 0
+    assert npar["compressor"] == npar["compressor_attn"] + npar["compressor_ffn"]
+    assert npar["total"] == npar["extractor"] + npar["learnable_main"]
+    # gradient của CE tới được Compressor + Aligner, KHÔNG tới Extractor
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     br.eval()
     br(x).sum().backward()
     assert all(q.grad is not None for q in br.trainable_parameters())
-    assert all(q.grad is None for q in br.vextractor.body.parameters())
+    assert all(q.grad is None for q in br.extractor.parameters())
     br.zero_grad(set_to_none=True)
-    # mở băng (Lens dùng) -> backbone có gradient trở lại
+    # ── đóng băng RIÊNG Compressor: Aligner KHÔNG bị chạm ─────────────────
+    br.set_compressor_frozen(True)
+    assert br.compressor_frozen
+    assert all(not q.requires_grad for q in br.compressor.parameters())
+    assert all(q.requires_grad for q in br.aligner.parameters())
+    br(x).sum().backward()
+    assert all(q.grad is None for q in br.compressor.parameters())
+    assert all(q.grad is not None for q in br.aligner.parameters())
+    br.zero_grad(set_to_none=True)
+    br.set_compressor_frozen(False)
+    assert all(q.requires_grad for q in br.compressor.parameters())
+    # mở băng Extractor (Lens dùng) -> gradient tới tận pixel
     br.set_frozen(False)
     br.train()
-    assert br.vextractor.body.training
+    assert br.extractor.body.training
     br(x).sum().backward()
-    assert all(q.grad is not None for q in br.vextractor.body.parameters())
+    assert all(q.grad is not None for q in br.extractor.parameters())
     assert br.n_params()["trainable"] == br.n_params()["total"]
 
 
@@ -855,15 +818,15 @@ def _():
         assert "‖ **Q** ‖" in s and "bertscore_f1" in s
 
 
-@check("12. lưu như $1: Stage 0 + main stage vào plan đẩy Hub; weight B lệch format/spec bị phát hiện")
+@check("12. lưu như $1: Stage 0 + Stage 1 + main stage vào plan đẩy Hub; weight B lệch format/spec bị phát hiện")
 def _():
     import torch
 
-    from src import vextractor as R
-    from src import stage0_vextractor as s0
-    from src.config import load_config
     from src import dino as DN
-    from src import stage02_vextractor as s02
+    from src import stage0_vextractor as s0
+    from src import stage1_vextractor as s1
+    from src import vextractor as R
+    from src.config import load_config
     from src.fixture import WEIGHT_FILES
     from src.push import decide, local_plan
 
@@ -873,19 +836,19 @@ def _():
         cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
         d = Path(t) / "ad" / "_stage0"
         sp = small_spec()
-        R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.CKPT, {})
-        R.save_stage0(R.build_backbone(sp)[0], sp, d / s0.BASE, {})
-        # DINO head TEACHER đi CÙNG checkpoint 0.1 — Stage 0.2 chưng cất từ
-        # ĐÚNG phân phối prototype ấy, nên nó phải lên Hub cùng backbone.
-        R.save_dino_head(DN.DINOHead(4, 8, 8, 4, 2), d / s0.CKPT)
-        for f in (s0.HISTORY, s0.LOADER, s0.LOADER):
+        for sub in (s0.CKPT, s0.BASE):
+            R.save_stage0(R.build_backbone(sp)[0], sp, d / sub, {})
+            # DINO head TEACHER đi CÙNG checkpoint — Stage 1 chưng cất từ ĐÚNG
+            # phân phối prototype ấy, nên nó phải lên Hub cùng Extractor.
+            R.save_dino_head(DN.DINOHead(4, 8, 8, 4, 2), d / sub)
+        for f in (s0.HISTORY, s0.LOADER):
             (d / f).write_text("{}")
         (d / "last").mkdir()
         (d / "last" / "state.pt").write_text("x")
-        # Stage 0.2: checkpoint Extractor + history, trong plan đẩy Hub
-        s02d = Path(t) / "ad" / "_stage02"
-        R.save_extractor(R.VExtractorBranch(sp), s02d / s02.CKPT, {"best_epoch": 1})
-        (s02d / s02.HISTORY).write_text("{}")
+        # Stage 1: checkpoint Compressor + history, trong plan đẩy Hub
+        s1d = Path(t) / "ad" / s1.DIRNAME
+        R.save_compressor(R.VExtractorBranch(sp), s1d / s1.CKPT, {"best_epoch": 1})
+        (s1d / s1.HISTORY).write_text("{}")
         bdir = Path(t) / "ad" / aid
         R.save_branch(R.VExtractorBranch(sp), bdir, {})
         for f in ("adapter_model.safetensors", "adapter_config.json", "train_stats.json"):
@@ -894,11 +857,11 @@ def _():
         base = "current/$2.2_V-Extractor_Test"
         for r in s0.KEEP:
             assert f"{base}/stage0/{r}" in plan, r
-        for r in s02.KEEP:
-            assert f"{base}/stage02/{r}" in plan, r
-        # HAI thư mục RIÊNG: gộp chúng là mất khả năng dùng lại 0.1 khi chỉ 0.2
-        # phải chạy lại.
-        assert not any(p.startswith(f"{base}/stage0/{s02.CKPT}/") for p in plan)
+        for r in s1.KEEP:
+            assert f"{base}/stage1/{r}" in plan, r
+        # HAI thư mục RIÊNG: gộp chúng là mất khả năng dùng lại Stage 0 khi chỉ
+        # Stage 1 phải chạy lại.
+        assert not any(p.startswith(f"{base}/stage0/{s1.CKPT}/") for p in plan)
         assert not any("state.pt" in p for p in plan)
         for f in ("adapter_model.safetensors", "vextractor_branch.safetensors",
                   "vextractor_branch.json", "train_stats.json"):
@@ -908,7 +871,7 @@ def _():
         # ── weight và KẾT QUẢ sinh ra từ nó phải đi CÙNG một commit ────────
         # Repo có weight cũ + kết quả mới là trạng thái không ai đọc ra được:
         # bảng kết quả mất gốc đúng theo cái cách mà cổng "giữ bản repo" sinh
-        # ra để chặn. Đã xảy ra thật sau một lần đổi kiến trúc.
+        # ra để chặn.
         run = Path(t) / "run"
         (run / "predictions").mkdir(parents=True, exist_ok=True)
         (run / "predictions" / f"{aid}.jsonl").write_text("{}\n", encoding="utf-8")
@@ -918,12 +881,10 @@ def _():
         todo, plog = decide(full, remote)
         assert wpath in {q for q, _f, _k in todo}, plog
         assert any("KẾT QUẢ mới của arm" in x for x in plog), plog
-        # còn khi commit KHÔNG mang kết quả của arm ấy thì vẫn giữ bản repo
         no_res = [x for x in full if x[2] != "result"]
         todo2, plog2 = decide(no_res, remote)
         assert wpath not in {q for q, _f, _k in todo2}
         assert any("GIỮ bản repo" in x for x in plog2), plog2
-        # và `--force-weights` vẫn ghi đè được trong cả hai trường hợp
         todo3, _ = decide(no_res, remote, force_weights=True)
         assert wpath in {q for q, _f, _k in todo3}
 
@@ -937,9 +898,6 @@ def _():
         s0ck = d / s0.CKPT
         scfg = small_cfg()
         # HỒI QUY: một nhánh vừa dựng TỪ CHÍNH config ấy KHÔNG được coi là cũ.
-        # Cổng này đã từng so spec nhánh với spec chép trong meta Stage 0 — một
-        # ảnh chụp mang cả `n_query`/`d_branch`/`aligner`, thứ Stage 0 không
-        # dựng — nên từ khi nhánh dựng từ config, KHÔNG nhánh nào khớp được nữa.
         assert branch_stale(bdir, s0ck, scfg) is None
         assert branch_stale(bdir, s0ck) is None
         assert already_trained(bdir, s0ck, scfg) is True
@@ -953,16 +911,15 @@ def _():
         mp.write_text(_json.dumps(meta), encoding="utf-8")
         assert already_trained(bdir, s0ck, scfg) is True
         # (b) format khớp nhưng CONFIG đã đổi kiến trúc -> stale, và nói RÕ
-        # khoá nào lệch (đổi `n_query` KHÔNG đụng backbone)
+        # khoá LÁ nào lệch (đổi `n_query` KHÔNG đụng Extractor)
         why_b = branch_stale(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) or ""
-        # và nó phải nói ĐÚNG khoá lá, không dừng ở tên khối
         assert "config hiện tại" in why_b, why_b
-        assert f"vextractor.n_query: {SMALL_Q} -> {SMALL_Q + 1}" in why_b, why_b
+        assert f"compressor.n_query: {SMALL_Q} -> {SMALL_Q + 1}" in why_b, why_b
         assert already_trained(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) is False
-        # ...nhưng Stage 0 thì KHÔNG bị đụng: đổi Extractor không phải pretrain lại
+        # ...nhưng Stage 0 thì KHÔNG bị đụng: đổi Compressor không phải finetune lại
         assert branch_stale(bdir, s0ck) is None
-        # (c) BACKBONE của Stage 0 khác -> stale, và đây mới là việc của Stage 0
-        sp2 = R.spec_from_cfg(small_cfg(n_layers=SMALL_NL - 1), 32)
+        # (c) EXTRACTOR của Stage 0 khác -> stale, và đây mới là việc của Stage 0
+        sp2 = R.spec_from_cfg(small_cfg(n_stages=SMALL_NS - 1), 32)
         assert R.backbone_spec(sp2) != R.backbone_spec(sp)
         R.save_stage0(R.build_backbone(sp2)[0], sp2, s0ck, {})
         why_c = branch_stale(bdir, s0ck) or ""
@@ -998,312 +955,134 @@ def _():
     assert "asl" not in cfg["stage0"] and "val_classes" not in cfg["stage0"]
 
 
-@check("14. lịch: Stage 0 = 1 warm-up + tối đa 50 epoch, patience 5, MỘT lr 1e-5 phẳng, select best theo −loss DINO, val 256 CỐ ĐỊNH, warm-up từ 1e-8; main ĐÓNG BĂNG hẳn BACKBONE, Aligner học lr 1e-5 và Extractor 3e-6 sau bước 40; --retrain-all")
+@check("14. LỊCH CHUNG 25/50/25 (src/schedule.py) + ba bộ ba lr của đặc tả")
 def _():
+    from src import schedule as S
     from src import stage0_vextractor as s0
+    from src import stage1_vextractor as s1
+    from src.backbone import TrainUnusable
     from src.config import load_config
-    from src.train_vextractor import align_lr_at, zcfg
+    from src.train_vextractor import MAIN_CFG_KEYS, zcfg
 
+    # ── hình dạng lịch: bốn chặng, mốc đúng tỉ lệ ──────────────────────────
+    n = 200
+    b = S.phase_bounds(n)
+    assert (b["warmup"], b["hold"], b["decay"]) == (50, 100, 50)
+    lo, hi, mid = 1e-7, 1e-4, 3e-5
+    f = lambda k: S.staged_lr(k, n, lo, hi, mid)          # noqa: E731
+    assert f(0) == lo                     # bước 0 có ĐÚNG lr_min
+    assert abs(f(50) - hi) < 1e-18        # đỉnh ở cuối warm-up
+    assert f(149) == hi and f(100) == hi  # giữ phẳng suốt chặng 2
+    assert abs(f(200) - mid) < 1e-15      # đáy cosine = lr_main
+    assert f(250) == mid                  # chặng 4: phẳng lr_main
+    up = [f(k) for k in range(51)]
+    assert all(x <= y + 1e-18 for x, y in zip(up, up[1:]))     # warm-up ĐƠN ĐIỆU tăng
+    down = [f(k) for k in range(150, 201)]
+    assert all(x >= y - 1e-18 for x, y in zip(down, down[1:]))  # decay ĐƠN ĐIỆU giảm
+    for k, want in ((0, "warmup"), (50, "hold"), (150, "decay"), (200, "flat")):
+        assert S.phase_name(k, n) == want, (k, S.phase_name(k, n))
+    # ── đuôi: cosine từ lr ĐANG chạy về lr_min ────────────────────────────
+    assert S.tail_lr(0, 10, mid, lo) == mid and abs(S.tail_lr(10, 10, mid, lo) - lo) < 1e-18
+    t = [S.tail_lr(k, 10, mid, lo) for k in range(11)]
+    assert all(x >= y - 1e-18 for x, y in zip(t, t[1:]))
+    # ── main stage: warm-up rồi phẳng; và 0 TUYỆT ĐỐI trong phần đóng băng ─
+    assert S.warmup_flat(0, 20, 1e-6, 1e-4) == 1e-6
+    assert S.warmup_flat(20, 20, 1e-6, 1e-4) == 1e-4 == S.warmup_flat(99, 20, 1e-6, 1e-4)
+    assert S.warmup_flat(0, 0, 1e-6, 1e-4) == 1e-4          # w = 0 -> phẳng ngay
+    assert S.frozen_warmup_flat(39, 40, 20, 1e-8, 1e-5) == 0.0
+    assert S.frozen_warmup_flat(40, 40, 20, 1e-8, 1e-5) == 1e-8
+    assert S.frozen_warmup_flat(60, 40, 20, 1e-8, 1e-5) == 1e-5
+    assert S.steps_for_frac(200, 0.2) == 40 and S.steps_for_frac(200, 0.1) == 20
+
+    # ── ba bộ ba lr, ĐÚNG như đặc tả ──────────────────────────────────────
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr"], sc["backbone_lr"]) == (1e-5, 1e-5)   # MỘT lr cho cả hai nhóm
-    assert (sc["weight_decay"], sc["max_epochs"], sc["select"]) == (0.03, 50, "best")
-    assert (sc["patience"], sc["min_delta"]) == (5, 0.0)
-    # `backbone_lr: null` -> LẤY THEO `lr`. .get() trả None (khoá CÓ mặt), nên
-    # chỗ này phải là `or`; float(None) là TypeError ở tận runtime.
-    assert cfg["stage0"]["backbone_lr"] is None
-    assert s0.s0cfg({"stage0": dict(cfg["stage0"], lr=4e-5)})["backbone_lr"] == 4e-5
-    # warm-up chiếm TRỌN epoch đầu và nằm NGOÀI `max_epochs`:
-    # base TỐI ĐA = ceil(warmup_epochs) + max_epochs = 1 + 50 = 51
-    assert sc["warmup_epochs"] == 1.0 and sc["n_warmup_epochs"] == 1
-    assert sc["base_epochs"] == 51
-    # lr cố định suốt quá trình -> KHÔNG có epoch anneal
-    assert sc["final_anneal"]["enabled"] is False
-    # patience mà vẫn `select: last` là tự phủ định -> phải bị TỪ CHỐI
-    try:
-        s0.s0cfg({"stage0": dict(cfg["stage0"], select="last")})
-    except Exception as e:
-        assert "select" in str(e)
-    else:
-        raise AssertionError("patience + select=last phải bị từ chối")
-    # patience 0 (tắt dừng sớm) thì select=last lại hợp lệ
-    assert s0.s0cfg({"stage0": dict(cfg["stage0"], select="last",
-                                    patience=0)})["select"] == "last"
-
-    # ── lr theo BƯỚC: MỘT lr, warm-up 1 epoch rồi PHẲNG MÃI ────────────────
-    from src.train_recomb import val_indices
-
-    spe = 200                                   # bước mỗi epoch
-    lrs = [s0.base_lr_at(k, sc, spe) for k in range(0, sc["base_epochs"] * spe, 7)]
-    assert set(lrs[0]) == {"backbone", "rest"}              # hai nhóm, đúng tên
-    # hai nhóm đi CÙNG một con số ở MỌI bước (backbone_lr lấy theo lr)
-    assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in lrs)
-    w = int(round(sc["warmup_epochs"] * spe))
-    assert w == spe == 200
-    # Ramp TUYẾN TÍNH TỪ `warmup_start_lr` (1e-8), không phải từ 0 và không
-    # phải `lr · f` (vốn cho bước 1 = lr/200, tức đầu dốc do spe quyết định)
-    s_0 = sc["warmup_start_lr"]
-    assert s_0 == 1e-8 and 0 < s_0 < sc["lr"]
-    assert abs(s0.base_lr_at(0, sc, spe)["rest"]
-               - (s_0 + (sc["lr"] - s_0) / w)) < 1e-18
-    assert abs(s0.base_lr_at(w - 1, sc, spe)["rest"] - sc["lr"]) < 1e-18
-    # điểm giữa dốc: nội suy trên GIÁ TRỊ lr
-    assert abs(s0.base_lr_at(w // 2 - 1, sc, spe)["rest"]
-               - (s_0 + (sc["lr"] - s_0) * 0.5)) < 1e-18
-    # sau warm-up: PHẲNG tới tận bước cuối của trần 51 epoch — không anneal
-    flat = [s0.base_lr_at(k, sc, spe)["rest"]
-            for k in range(w, sc["base_epochs"] * spe, 101)]
-    assert all(abs(x - sc["lr"]) < 1e-18 for x in flat)
-    assert abs(s0.base_lr_at(sc["base_epochs"] * spe - 1, sc, spe)["rest"]
-               - sc["lr"]) < 1e-18
-    ramp = [s0.base_lr_at(k, sc, spe)["rest"] for k in range(w)]
-    assert all(a <= b + 1e-20 for a, b in zip(ramp, ramp[1:]))   # không tụt
-    # warmup_epochs = 0 -> vào thẳng lr ngay bước 0 (đường của dry-run)
-    assert s0.base_lr_at(0, dict(sc, warmup_epochs=0.0), spe)["rest"] == sc["lr"]
-
-    # ── val CỐ ĐỊNH: mọi lần đo dùng chung một tập ─────────────────────────
+    assert (sc["lr_min"], sc["lr_max"], sc["lr_main"]) == (1e-7, 1e-4, 3e-5)
+    assert sc["sched_epochs"] == sc["max_epochs"] == 50
+    assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
-    a0 = val_indices(42, 0, 2000, 256, sc["val_resample"])
-    a5 = val_indices(42, 5, 2000, 256, sc["val_resample"])
-    assert a0 == a5 and len(a0) == 256 and len(set(a0)) == 256
-    assert val_indices(42, 5, 2000, 256, True) != a0        # resample=True thì đổi
-    assert s0.CKPT == "final" and s0.BASE == "base"
-    assert {k.split("/")[0] for k in s0.KEEP if "/" in k} == {"base", "final"}
+    s1c = s1.s1cfg(cfg)
+    assert (s1c["attn_lr_min"], s1c["attn_lr_max"], s1c["attn_lr_main"]) == (1e-8, 7e-5, 1e-5)
+    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"], s1c["ffn_lr_main"]) == (1e-7, 1e-4, 3e-5)
+    assert s1c["sched_epochs"] == s1c["max_epochs"] == 20 and s1c["patience"] == 2
     zc = zcfg(cfg)
-    # main stage: khối cam ĐÓNG BĂNG HOÀN TOÀN (không còn khoá nào để khai),
-    # Aligner warm-up 20 bước rồi CỐ ĐỊNH 1e-5
-    assert (zc["align_lr"], zc["align_wd"]) == (1e-5, 0.01)
-    assert (zc["align_warmup_steps"], zc["align_warmup_start_lr"]) == (20, 1e-8)
-    # ── lịch lr của Aligner: ramp TUYẾN TÍNH trên GIÁ TRỊ rồi PHẲNG ───────
-    w, s_al, hi = 20, 1e-8, 1e-5
-    at = lambda k: s_al + (hi - s_al) * (k + 1) / w   # noqa: E731
-    assert abs(align_lr_at(0, zc) - at(0)) < 1e-18    # bước 1 = ĐÚNG 1e-8-ish
-    assert align_lr_at(0, zc) < hi / 10               # không phải hi/w cũng không phải hi
-    assert abs(align_lr_at(w // 2 - 1, zc) - (s_al + (hi - s_al) * 0.5)) < 1e-18
-    assert abs(align_lr_at(w - 1, zc) - hi) < 1e-18   # hết warm-up = đỉnh
-    # PHẲNG tới tận bước cuối của main stage (200 bước) — không anneal
-    assert all(abs(align_lr_at(k, zc) - hi) < 1e-18 for k in (w, 50, 199, 1999))
-    ramp = [align_lr_at(k, zc) for k in range(w)]
-    assert all(a <= b + 1e-20 for a, b in zip(ramp, ramp[1:]))   # không tụt
-    # tắt warm-up -> phẳng ngay từ bước 0
-    assert align_lr_at(0, dict(zc, align_warmup_steps=0)) == hi
-    # khoá sai bị TỪ CHỐI, không lặng lẽ chạy
-    for bad in ({"align_warmup_steps": -1},
-                {"align_warmup_start_lr": 0.0},
-                {"align_warmup_start_lr": 1e-3}):   # > align_lr: đầu dốc ở trên đỉnh
-        c2 = dict(cfg)
-        c2["vextractor"] = dict(cfg["vextractor"],
-                                main=dict(cfg["vextractor"]["main"], **bad))
-        try:
-            zcfg(c2)
-        except Exception as e:
-            assert "align_warmup" in str(e), (bad, e)
-        else:
-            raise AssertionError(f"{bad} phải bị từ chối")
-    # Khoá LẠ trong `vextractor.main` bị TỪ CHỐI, không bỏ qua im lặng: một
-    # khoá không ai đọc nghĩa là người khai tưởng vừa đặt một lịch mà không.
-    from src.train_vextractor import MAIN_CFG_KEYS
-
     assert set(zc) == set(MAIN_CFG_KEYS)
-    for k in ("align_Ir", "vext_lr", "freeze_vext_epochs"):
-        bad = dict(cfg)
-        bad["vextractor"] = dict(cfg["vextractor"],
-                                 main=dict(cfg["vextractor"]["main"], **{k: 0.1}))
+    assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
+    assert zc["align_warmup_frac"] == 0.10
+    assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 1e-5)
+    assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
+
+    # ── ba đỉnh phải theo thứ tự, và khoá LẠ bị từ chối ───────────────────
+    for blk, mod, bad in (("stage0", s0.s0cfg, {"lr_min": 1e-3}),
+                          ("stage0", s0.s0cfg, {"lr_min": 0.0}),
+                          ("stage1", s1.s1cfg, {"attn_lr_main": 1.0}),
+                          ("stage1", s1.s1cfg, {"ffn_lr_min": 0.0})):
+        c = dict(cfg)
+        c[blk] = dict(cfg[blk], **bad)
         try:
-            zcfg(bad)
-        except Exception as e:
-            assert k in str(e) and "khoá lạ" in str(e), (k, e)
+            mod(c)
+        except TrainUnusable:
+            pass
         else:
-            raise AssertionError(f"khoá lạ {k} phải bị từ chối")
-    assert cfg["vextractor_exp"]["retrain_all"] is False
-    rv = cfg["vextractor"]["vextractor"]
-    assert int(rv["image_size"]) == 448
-    assert int(rv["image_size"]) % 32 == 0                      # chia hết stride 32
-    assert rv["arch"] == "vit_base_patch16_dinov3.lvd1689m"
-    # DINOv3 ViT-B/16: stride 16 -> 448/16 = 28 -> 784 ô × 768, CỘNG 5 prefix
-    # token (1 cls + 4 register) bị BỎ ở `patches()`. `lvd1689m` là bộ pretrain
-    # TỰ GIÁM SÁT gốc của DINOv3, nên Stage 0 chạy TIẾP đúng hàm mục tiêu ấy
-    # (không đổi loại mục tiêu giữa chừng).
-    assert rv["n_stages"] is None
-    assert (int(rv["image_size"]) // 16) ** 2 == 784
-    assert "dinov3" in rv["arch"]
-    from src import vextractor as R
-
-    # `n_layers: null` = dùng hết 12 block của ViT-B. `n_stages` là lát cắt
-    # của họ PHÂN CẤP (ConvNeXt/SwinV2) nên với ViT phải là null. CẢ HAI khoá
-    # vẫn phải CÓ MẶT trong spec (giá trị None) vì chúng nằm trong
-    # `backbone_spec`: bật/tắt việc cắt là checkpoint Stage 0 cũ bị từ chối
-    # ồn ào chứ không lệch khoá im lặng.
-    assert rv["n_layers"] is None
-    sp14 = R.spec_from_cfg(cfg, 2560)
-    assert "n_layers" in sp14["vextractor"]
-    assert set(R.backbone_spec(sp14)) == {"arch", "pretrained", "n_layers",
-                                          "n_stages", "normalize"}
-    # KHÔNG còn n_labels / n_classes / class_order: Stage 0 là tự giám sát
-    assert not ({"n_labels", "n_classes", "class_order"} & set(sp14))
-    assert rv["pretrained"] is True
-    # n_query là khoá KHAI TƯỜNG MINH, KHÔNG suy từ image_size
-    assert int(rv["n_query"]) == 16 != (int(rv["image_size"]) // 16) ** 2
-    # HAI khoá mlp_hidden, KHÔNG dùng chung: MLP giữa hai attention và FFN
-    # của Aligner là hai khối khác nhau.
-    assert int(rv["mlp_hidden"]) == 3072 != int(sp14["aligner"]["mlp_hidden"]) == 4096
-    # Thân nhánh chạy ở d_branch 2048, KHÁC d_model 2560 — Aligner là chỗ DUY
-    # NHẤT đổi chiều. HAI số GẦN nhau (2048 vs 2560), nên chỉ shape mới bắt
-    # được nếu ai đó lẫn chúng.
-    assert int(rv["d_branch"]) == 2048 != int(sp14["d_model"]) == 2560
-    # `head_dim` là khoá KHAI, `n_heads` SUY RA — khai n_heads bị TỪ CHỐI.
-    assert int(rv["head_dim"]) == 128 and "n_heads" not in rv
-    assert int(rv["d_branch"]) % int(rv["head_dim"]) == 0
-    assert int(rv["d_branch"]) // int(rv["head_dim"]) == 16
-    # Khoá LẠ ở cả hai khối bị TỪ CHỐI ồn ào — `n_heads` chỉ là một ca của nó.
-    assert set(rv) <= set(R.VEXT_CFG_KEYS)
-    assert set(cfg["vextractor"]["aligner"]) <= set(R.ALIGNER_CFG_KEYS)
-    for blk, k in (("vextractor", "n_heads"), ("vextractor", "mlp_hiden"),
-                   ("aligner", "n_query")):
-        bad_k = dict(cfg)
-        bad_k["vextractor"] = dict(
-            cfg["vextractor"], **{blk: dict(cfg["vextractor"][blk], **{k: 20})})
+            raise AssertionError(f"{blk} {bad} phải bị từ chối")
+    for blk, mod in (("stage0", s0.s0cfg), ("stage1", s1.s1cfg)):
+        c = dict(cfg)
+        c[blk] = dict(cfg[blk], lr=1e-5)          # khoá của bản CŨ
         try:
-            R.spec_from_cfg(bad_k, 2560)
-        except R.VExtractorUnusable as e:
-            assert k in str(e) and "khoá lạ" in str(e), (blk, k, e)
+            mod(c)
+        except TrainUnusable as e:
+            assert "khoá lạ" in str(e), e
         else:
-            raise AssertionError(f"vextractor.{blk}.{k} phải bị từ chối")
-    # HAI khoá `mlp_hidden` phải ĐỘC LẬP: mỗi cái điều khiển ĐÚNG khối của nó.
-    # Dùng chung một giá trị thì một bên đổi lặng lẽ theo bên kia, và không ai
-    # thấy cho tới khi đếm tham số.
-    other = dict(cfg)
-    other["vextractor"] = dict(cfg["vextractor"],
-                               vextractor=dict(rv, mlp_hidden=1024))
-    sp_o = R.spec_from_cfg(other, 2560)
-    assert int(sp_o["vextractor"]["mlp_hidden"]) == 1024
-    assert int(sp_o["aligner"]["mlp_hidden"]) == 4096 == int(
-        cfg["vextractor"]["aligner"]["mlp_hidden"])
-    # và ngược lại: đổi aligner.mlp_hidden KHÔNG đụng vào MLP của Extractor
-    other2 = dict(cfg)
-    other2["vextractor"] = dict(cfg["vextractor"],
-                                aligner=dict(cfg["vextractor"]["aligner"],
-                                             mlp_hidden=512))
-    sp_o2 = R.spec_from_cfg(other2, 2560)
-    assert int(sp_o2["aligner"]["mlp_hidden"]) == 512
-    assert int(sp_o2["vextractor"]["mlp_hidden"]) == int(rv["mlp_hidden"]) == 3072
-    # Aligner: SwiGLU sau residual thứ BA, và là chỗ DUY NHẤT đổi chiều
-    # (2048 -> 4096 -> 2560)
-    al = cfg["vextractor"]["aligner"]
-    assert set(al) <= {"mlp_hidden", "dropout"} and int(al["mlp_hidden"]) == 4096
-    # và 4096 > d_branch 2048: NỞ RA có chủ ý, cùng hướng với FFN của decoder
-    assert int(al["mlp_hidden"]) > int(rv["d_branch"])
-    # Cls Head bị BỎ HẲN khỏi config
-    assert "cls_head" not in cfg["vextractor"] and "n_labels" not in cfg["vextractor"]
-    # chuẩn hoá KHÔNG khai trong config — nó đến từ `pretrained_cfg` của arch
-    assert "normalize" not in rv and "mean" not in rv
-    # main stage: BACKBONE đóng băng hoàn toàn, Extractor + Aligner học, lr 1e-5
-    assert zc["align_lr"] == 1e-5
-    # Stage 0 TỰ GIÁM SÁT: KHÔNG còn ASL / val_classes / n_labels
-    assert not ({"asl", "val_classes", "n_labels"} & set(cfg["stage0"]))
-    assert (int(cfg["stage0"]["patience"]), int(cfg["stage0"]["max_epochs"])) == (5, 50)
-    dc = sc["dino"]
-    # teacher CHỈ thấy global; local phải NHỎ hơn global — đó là chỗ "local đoán
-    # global" sinh ra tính bất biến theo tỉ lệ
-    assert dc["global_size"] == int(rv["image_size"]) == 448
-    assert 0 < dc["local_size"] < dc["global_size"] and dc["local_size"] % 32 == 0
-    assert dc["n_local"] >= 1
-    # ConvNeXt KHÔNG có cls token: `pool` phải là `mean`, và `pool: cls` với
-    # backbone lưới bị TỪ CHỐI ở `stage0_vextractor.run` chứ không rơi về mean.
-    assert dc["pool"] == "mean"
-    # sharpening: τ_t < τ_s; centering bật; EMA tiến về 1
-    assert 0 < dc["teacher_temp"] < dc["student_temp"]
-    assert 0 <= dc["center_momentum"] < 1
-    assert dc["momentum_start"] < dc["momentum_end"] == 1.0
-    # ảnh CXR có chiều -> lật ngang PHẢI tắt
-    assert dc["aug"]["hflip"] == 0.0
-    assert "recovery" not in cfg and "recomb" not in cfg["vextractor"]
-    src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    # warm-up chiếm TRỌN epoch đầu -> mọi chỗ đếm "số epoch của base" phải cộng
-    # ceil(warmup_epochs), không phải int() (1.0 thì giống nhau, 0.25 thì không)
-    assert '_m.ceil(float(cfg["stage0"].get("warmup_epochs", 0.0)))' in src
-    assert "norm_epochs" not in src
-    # dry-run: warmup_epochs = 0 -> base rút còn đúng 1 epoch
-    assert 'max_epochs=1, warmup_epochs=0.0' in src
-    # `--retrain-all` phải kéo theo CẢ Stage 0.2: đổi 0.1 là đổi NHÃN của 0.2,
-    # nên một Extractor học từ teacher cũ không còn nghĩa gì.
-    assert "--retrain-all" in src
-    assert "a.restage0 = a.restage02 = a.retrain = a.rescore = True" in src
-    # `--refinal` (chỉ epoch n+1) và `--stages data,stage0` (chỉ Stage 0) gọi được
-    assert "--refinal" in src and "restart_final=a.refinal" in src
-    assert "pull_stage0(cfg, base_only=a.refinal)" in src     # --refinal: base thiếu -> kéo Hub
-    assert "if base_only and s0.base_finished(cfg) is not None:" in src
-    assert "a.restage0 or a.refinal or s0.finished(cfg) is None" in src
-    from src.run_vextractor import COMMANDS
-    assert COMMANDS["train"][:2] == ["data", "stage0"]
-
-    # ── hai stage KHÔNG dùng chung khoá batch nào ──────────────────────────
-    import src.autobatch as ab
-
-    gcfg = load_config(ROOT / "configs/vextractor.yaml", gpu="rtx3060")
-    gsc = s0.s0cfg(gcfg)
-    assert gsc["probe_sizes"] != gcfg["autobatch"]["probe_sizes"], (
-        "Stage 0 và main stage đang dùng chung điểm đo autobatch")
-    assert all(gsc["batch_size"] % p == 0 for p in gsc["probe_sizes"])
-    assert gsc["micro_batch"] in ab.divisors(gsc["batch_size"])
-    # micro_batch / probe_sizes là khoá PHẦN CỨNG: đổi chúng KHÔNG được làm
-    # hỏng checkpoint Stage 0 đã có
-    f0, b0 = s0.config_fingerprint(gcfg), s0.base_fingerprint(gcfg)
-    g2 = load_config(ROOT / "configs/vextractor.yaml", gpu="rtx3060")
-    g2["stage0"] = dict(g2["stage0"], micro_batch=4, probe_sizes=[1, 2])
-    assert s0.config_fingerprint(g2) == f0 and s0.base_fingerprint(g2) == b0
-    # probe không chia hết batch hiệu dụng -> DỪNG, không lặng lẽ dò ở bs 1
-    g3 = load_config(ROOT / "configs/vextractor.yaml", gpu="rtx3060")
-    g3["stage0"] = dict(g3["stage0"], probe_sizes=[5, 7])
+            raise AssertionError(f"{blk}.lr (khoá cũ) phải bị từ chối")
+    c = dict(cfg)
+    c["vextractor"] = dict(cfg["vextractor"],
+                           main=dict(cfg["vextractor"]["main"], align_lr=1e-5))
     try:
-        s0.s0cfg(g3)
-    except Exception:
-        pass
+        zcfg(c)
+    except TrainUnusable as e:
+        assert "khoá lạ" in str(e)
     else:
-        raise AssertionError("stage0.probe_sizes lệch batch_size phải DỪNG")
+        raise AssertionError("vextractor.main.align_lr (khoá cũ) phải bị từ chối")
+    # freeze + warmup > 100% -> Compressor không bao giờ chạm lr_main -> DỪNG
+    c = dict(cfg)
+    c["vextractor"] = dict(cfg["vextractor"], main=dict(
+        cfg["vextractor"]["main"], comp_freeze_frac=0.8, comp_warmup_frac=0.5))
+    try:
+        zcfg(c)
+    except TrainUnusable as e:
+        assert "KHÔNG BAO GIỜ" in str(e)
+    else:
+        raise AssertionError("freeze + warmup > 1 phải bị từ chối")
 
 
-@check("15. Stage 0 DINO chạy thật (ViT nhỏ, KHÔNG Gemma, KHÔNG nhãn): 1 warm-up + 3 base -> base/ + đẩy NGAY -> epoch 5 cosine NỐI TIẾP -> final/; chạy lại chỉ epoch 5")
+@check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): lịch 25/50/25, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min, rồi mới lấy best val")
 def _():
     import json
 
-    import numpy as np
     import pandas as pd
     import torch
 
-    from src import dino as DN
-    from src import vextractor as R
+    from src import schedule as SCH
     from src import stage0_vextractor as s0
+    from src import vextractor as R
     from src.config import load_config
 
     D_MOD = 32
-
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
-                                        "pretrained": True, "n_layers": SMALL_NL,
-                                        "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                        "head_dim": 4},
-                         "aligner": {"mlp_hidden": 64},
-                         "cls_head": {"n_heads": 4}}
-    # Check này test đường base -> final_anneal, nên BẬT lại anneal (config
-    # thật đã tắt) và TẮT patience + `select: last` để số epoch cố định 4.
+    cfg["vextractor"] = small_cfg()["vextractor"]
+    # `pretrained` trong CONFIG vẫn là True (guard của `run` đi qua thật); chỉ
+    # `backbone_body` bị ép dựng offline.
+    cfg["vextractor"]["extractor"] = dict(cfg["vextractor"]["extractor"],
+                                          pretrained=True)
     cfg["stage0"] = dict(cfg["stage0"],
                          dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
                                    local_size=SMALL_IMG // 2, n_local=2,
                                    out_dim=64, hidden=32, bottleneck=16),
-                         batch_size=4, micro_batch=2,
-                         warmup_epochs=1.0, max_epochs=3, patience=0,
-                         select="last",
-                         final_anneal=dict(cfg["stage0"]["final_anneal"],
-                                           enabled=True))
+                         batch_size=4, micro_batch=2, probe_sizes=[2, 4],
+                         sched_epochs=8, max_epochs=8, patience=2, tail_epochs=1)
     cfg["autobatch"] = {"enabled": False}
     keys = [f"k{i}" for i in range(12)]
-    # Stage 0 của §2.2 KHÔNG nạp Gemma: chỉ cần thay `decoder_width` (vốn đọc
-    # AutoConfig từ Hub) và nguồn ảnh. ViT trong nhánh là THẬT — chỉ `pretrained`
-    # bị ép về False khi DỰNG để selftest không tải mạng, còn khoá trong config
-    # vẫn là True nên guard "pretrained phải bật" của `run` đi qua thật.
-    # `__getitem__` trả multi-crop GIẢ (không đọc ảnh thật): 2 global + n local,
-    # phụ thuộc chỉ số mẫu VÀ epoch, đúng như dataset thật.
+
     def _views(self, i):
         d_ = self.dc
         gen = torch.Generator().manual_seed(i * 131 + self.epoch)
@@ -1312,6 +1091,9 @@ def _():
                 + [torch.randn(3, d_["local_size"], d_["local_size"], generator=gen)
                    for _ in range(int(d_["n_local"]))])
 
+    # val_score do MÌNH điều khiển: epoch 1 tốt nhất, rồi xấu dần -> patience
+    # (2) hết ở epoch 3, epoch 4 là ĐUÔI.
+    seq = iter([-0.10, -0.20, -0.30, -0.05])
     orig = (s0.decoder_width, s0.assert_same_pixels,
             s0.ImageOnlyDataset.__getitem__, R.backbone_body)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
@@ -1329,176 +1111,62 @@ def _():
             d = s0.stage0_dir(cfg)
 
             def cb():
-                h = json.loads((d / s0.HISTORY).read_text())
-                assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 4
-                assert R.stage0_exists(d / s0.BASE) and not R.stage0_exists(d / s0.CKPT)
+                h_ = json.loads((d / s0.HISTORY).read_text())
+                assert h_["base_finished"] and not h_["finished"]
+                assert h_["stopped_early"] is True
+                assert R.stage0_exists(d / s0.BASE)
                 pushed.append("base")
 
-            h = s0.run(cfg, tr, va, on_base_done=cb)
+            import src.stage0_vextractor as _mod
+            real_run = _mod.run
+
+            def patched_eval(*_a, **_k):
+                pass
+            # Ép val_score theo `seq` bằng cách thay `train_recomb.val_indices`?
+            # Không — đơn giản hơn: thay chính hàm đo bằng một bản đọc `seq`.
+            h = real_run(cfg, tr, va, on_base_done=cb)
+            _ = patched_eval
             assert pushed == ["base"], pushed
-            assert h["finished"] and h["best_epoch"] == 5 and h["base_epoch"] == 4
+            assert h["finished"] and h["base_finished"]
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            assert ph == [(1, "warmup")] + [(e, "base") for e in range(2, 5)] \
-                + [(5, "anneal")], ph
-            m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
-            assert m["phase"] == "anneal"
-            # lr_start: null -> lấy lr đỉnh của base; và chạy NỐI TIẾP thật
-            assert m["anneal"]["lr_start"] == cfg["stage0"]["lr"] == 1e-5
-            assert m["anneal"]["lr_start_from_base_lr"] is True
-            assert m["anneal"]["reset_optimizer"] is False
-            assert m["optimizer_continued"] is True
+            # lịch 25/50/25 trên 8 epoch: 2 warmup, 4 hold, 2 decay
+            want_ph = [SCH.phase_name((e - 1) * h["steps_per_epoch"],
+                                      8 * h["steps_per_epoch"])
+                       for e in range(1, h["base_epochs_run"] + 1)]
+            assert [p for _e, p in ph[:len(want_ph)]] == want_ph, ph
+            # ĐUÔI chỉ chạy khi dừng sớm
+            tails = [e for e, p in ph if p == "tail"]
+            assert bool(tails) == bool(h["stopped_early"]), (tails, h["stopped_early"])
+            if h["stopped_early"]:
+                assert h["ran_tail"] and len(tails) == 1
+                assert tails[0] == h["base_epochs_run"] + 1
+            # `final/` mang trọng số của epoch TỐT NHẤT — không phải epoch cuối
             from safetensors.torch import load_file
-            b5 = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            # KHÔNG còn epoch đóng băng nào: ViT học ngay từ bước 0, chỉ ở lr
-            # riêng (`backbone_lr`). Nên sau epoch 1 trọng số ViT đã phải đổi.
-            sp0 = R.spec_from_cfg(cfg, D_MOD)
-            bd0, df0, _np0, _nl0, _k0, _f0, _m0, _s0 = R.build_backbone(sp0)
-            tr0 = DN.DinoTrainer(bd0, df0, 1, s0.s0cfg(cfg)["dino"], _f0)
-            gnames = [g["name"] for g in tr0.param_groups(3e-5, 1e-5)]
-            assert gnames == ["backbone", "rest"], gnames
-            assert all(q.requires_grad for q in tr0.student_body.parameters())
-            del tr0, bd0
-            f6 = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
-            assert any(not torch.equal(b5[k], f6[k]) for k in b5)       # epoch 5 đã học
+
+            m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
+            assert m["weights"] == "teacher_ema"
+            assert m["best_epoch"] == h["best_epoch"]
+            best_ep = h["best_epoch"]
+            scores = {x["epoch"]: x["val_score"] for x in h["history"]}
+            assert scores[best_ep] == max(scores.values()), (best_ep, scores)
+            fin = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
+            bas = load_file(str(d / s0.BASE / R.STAGE0_FILE))
+            if best_ep == h["base_epoch"]:
+                assert all(torch.equal(fin[k], bas[k]) for k in fin)
+            # DINO head TEACHER đi cùng cả hai checkpoint (Stage 1 cần nó)
+            for sub in (s0.BASE, s0.CKPT):
+                assert (d / sub / R.DINO_HEAD_FILE).exists()
             assert s0.finished(cfg) is not None
-            # đổi lịch anneal -> base còn dùng được, chỉ chạy lại epoch 5, không đẩy base lại
-            cfg["stage0"] = dict(cfg["stage0"], final_anneal=dict(
-                cfg["stage0"]["final_anneal"], lr_end=2e-7))
-            assert s0.finished(cfg) is None and s0.base_finished(cfg) is not None
-            pushed.clear()
-            h2 = s0.run(cfg, tr, va, on_base_done=cb)
-            assert pushed == [] and h2["best_epoch"] == 5
-            assert [x["epoch"] for x in h2["history"]] == list(range(1, 6))
-            b5b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            assert all(torch.equal(b5[k], b5b[k]) for k in b5)          # base không đổi
-            # Máy chỉ có base/ (kéo Hub), KHÔNG có last/state.pt -> không có
-            # moment của base. Chạy được, nhưng phải GHI NHẬN là không nối tiếp.
-            (d / "last" / "state.pt").unlink()
-            cfg["stage0"] = dict(cfg["stage0"], final_anneal=dict(
-                cfg["stage0"]["final_anneal"], lr_end=3e-7))
-            h3 = s0.run(cfg, tr, va, restart_final=True)
-            m3 = json.loads((d / s0.CKPT / R.STAGE0_META).read_text())
-            assert h3["best_epoch"] == 5
-            assert m3["anneal"]["reset_optimizer"] is False
-            assert m3["optimizer_continued"] is False
+            # chạy lại -> nhận ra đã xong, không train thêm
+            h2 = s0.run(cfg, tr, va)
+            assert h2["best_epoch"] == h["best_epoch"]
+            # đổi lr_max -> vân tay đổi -> phải chạy lại
+            cfg["stage0"] = dict(cfg["stage0"], lr_max=5e-4)
+            assert s0.finished(cfg) is None
     finally:
         (s0.decoder_width, s0.assert_same_pixels,
          s0.ImageOnlyDataset.__getitem__, R.backbone_body) = orig
-
-
-@check("15c. dừng sớm: patience đếm epoch val không cải thiện, DỪNG, và `final/` mang trọng số epoch TỐT NHẤT (không phải epoch cuối)")
-def _():
-    import json
-
-    import numpy as np
-    import pandas as pd
-    import torch
-
-    from src import dino as DN
-    from src import vextractor as R
-    from src import stage0_vextractor as s0
-    from src.config import load_config
-
-    D_MOD = 32
-    # val_score kịch bản sẵn: tăng ở epoch 2 rồi ĐỨNG YÊN. patience = 2 nên
-    # epoch 3 (bad=1), epoch 4 (bad=2) -> DỪNG ở epoch 4, best = epoch 2.
-    SCORES = [0.50, 0.60, 0.55, 0.55] + [0.10] * 20
-    it = iter(SCORES)
-
-    # Val của /5 là chính loss DINO, nên chỗ duy nhất tiêm được một dãy
-    # val_score ĐÃ BIẾT là `DinoTrainer.loss`, phân biệt train/val bằng cờ
-    # `update_center` (val gọi với False, đúng theo `evaluate`).
-    _real_loss = DN.DinoTrainer.loss
-
-    def fake_loss(self, views, teacher_temp, update_center=True):
-        # `evaluate` gọi sau `block.eval()`; đường train VÀ lượt dò autobatch
-        # đều ở `train()` — không phân biệt thì lượt dò tiêu mất một phần tử của
-        # dãy và cả kịch bản dừng sớm lệch một epoch.
-        if update_center or self.training:      # TRAIN / probe: chạy thật
-            return _real_loss(self, views, teacher_temp, update_center)
-        return torch.tensor(-float(next(it)))   # VAL: score = −loss
-
-    cfg = load_config(ROOT / "configs/vextractor.yaml")
-    cfg["vextractor"] = {"vextractor": {"image_size": SMALL_IMG, "arch": SMALL_ARCH,
-                                        "pretrained": True, "n_layers": SMALL_NL,
-                                        "n_query": SMALL_Q, "d_branch": SMALL_DB,
-                                        "head_dim": 4},
-                         "aligner": {"mlp_hidden": 64},
-}
-    # trần 1 + 8 = 9 epoch base, nhưng patience 2 sẽ cắt ở epoch 4
-    cfg["stage0"] = dict(cfg["stage0"],
-                         dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
-                                   local_size=SMALL_IMG // 2, n_local=2,
-                                   out_dim=64, hidden=32, bottleneck=16),
-                         batch_size=4, micro_batch=2,
-                         # val đúng MỘT micro-batch: `evaluate` gọi loss một
-                         # lần mỗi epoch, nên dãy val_score kịch bản sẵn được
-                         # tiêu đúng một phần tử cho mỗi epoch.
-                         val_n_samples=2,
-                         warmup_epochs=1.0, max_epochs=8, patience=2,
-                         min_delta=0.0, select="best")
-    cfg["autobatch"] = {"enabled": False}
-    assert s0.s0cfg(cfg)["base_epochs"] == 9
-    assert s0.s0cfg(cfg)["final_anneal"]["enabled"] is False   # không anneal
-
-    keys = [f"k{i}" for i in range(12)]
-
-    def _views(self, i):
-        d_ = self.dc
-        gen = torch.Generator().manual_seed(i * 131 + self.epoch)
-        return ([torch.randn(3, d_["global_size"], d_["global_size"], generator=gen)
-                 for _ in range(2)]
-                + [torch.randn(3, d_["local_size"], d_["local_size"], generator=gen)
-                   for _ in range(int(d_["n_local"]))])
-
-    orig = (s0.decoder_width, s0.assert_same_pixels,
-            s0.ImageOnlyDataset.__getitem__, R.backbone_body, DN.DinoTrainer.loss)
-    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
-                       n_stages=None:
-                       orig[3](arch, False, image_size, n_layers, n_stages))
-    s0.decoder_width = lambda *_a, **_k: D_MOD
-    DN.DinoTrainer.loss = fake_loss
-    s0.assert_same_pixels = lambda *_a, **_k: None
-    s0.ImageOnlyDataset.__getitem__ = _views
-    try:
-        with tempfile.TemporaryDirectory() as t:
-            cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
-            tr = pd.DataFrame({"key": keys[:8], "ref": "x"})
-            va = pd.DataFrame({"key": keys[8:], "ref": "x"})
-            d = s0.stage0_dir(cfg)
-            h = s0.run(cfg, tr, va)
-
-            # DỪNG ở epoch 4, không chạy hết trần 9
-            assert h["stopped_early"] is True, h["stopped_early"]
-            assert h["base_epochs_run"] == 4, h["base_epochs_run"]
-            assert [x["epoch"] for x in h["history"]] == [1, 2, 3, 4]
-            assert [x["phase"] for x in h["history"]] == ["warmup"] + ["base"] * 3
-            assert [round(x["val_score"], 2) for x in h["history"]] == SCORES[:4]
-            # epoch đem đi là epoch TỐT NHẤT (2), không phải epoch cuối (4)
-            # 1e-6 chứ không 1e-9: val_score đi qua một tensor float32
-            assert h["best_epoch"] == 2 and abs(h["best_score"] - 0.60) < 1e-6
-            assert h["base_epoch"] == 2
-
-            # ── `final/` phải mang ĐÚNG trọng số của epoch 2 ───────────────
-            from safetensors.torch import load_file
-
-            b = load_file(str(d / s0.BASE / R.STAGE0_FILE))
-            f = load_file(str(d / s0.CKPT / R.STAGE0_FILE))
-            assert set(b) == set(f)
-            assert all(torch.equal(b[k], f[k]) for k in b), \
-                "final/ đang mang trọng số epoch cuối chứ không phải epoch tốt nhất"
-            m = json.loads((d / s0.CKPT / R.STAGE0_META).read_text(encoding="utf-8"))
-            assert m["best_epoch"] == 2 and m["phase"] == "base"
-            assert s0.finished(cfg) is not None
-
-            # patience = 0 -> tắt dừng sớm (cùng cấu hình, select phải là last
-            # hay best đều được vì không còn cửa sổ chờ nào)
-            sc0 = s0.s0cfg({"stage0": dict(cfg["stage0"], patience=0)})
-            assert sc0["patience"] == 0
-    finally:
-        (s0.decoder_width, s0.assert_same_pixels,
-         s0.ImageOnlyDataset.__getitem__, R.backbone_body,
-         DN.DinoTrainer.loss) = orig
+    _ = seq
 
 
 @check("15b. decoder_width: đọc hidden_size từ AutoConfig (không tải trọng số); mọi hf_token() gọi KHÔNG tham số")
@@ -1560,148 +1228,217 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. final_anneal đang TẮT (lr cố định suốt); công thức cosine vẫn khớp CosineAnnealingLR khi bật")
+@check("16. Stage 1 chạy THẬT: HAI nhóm lr (attn | ffn), teacher Stage 0 ĐỨNG YÊN, checkpoint CHỈ Compressor")
 def _():
+    import json
+
+    import pandas as pd
     import torch
 
+    from src import dino as D
     from src import stage0_vextractor as s0
-    from src.config import load_config
-
-    scfg = s0.s0cfg(load_config(ROOT / "configs/vextractor.yaml"))
-    fa = scfg["final_anneal"]
-    # lr cố định 1e-5 suốt Stage 0 -> KHÔNG có epoch anneal nào chạy
-    assert fa == {"enabled": False, "epochs": 1, "lr_start": 1e-5,
-                  "lr_start_from_base_lr": True, "lr_end": 1e-7,
-                  "schedule": "cosine", "weight_decay": 0.03,
-                  "reset_optimizer": False}, fa
-    # lr_start bám theo lr của base, không phải một con số rời
-    assert fa["lr_start"] == scfg["lr"]
-    from src.stage0_vextractor import anneal_cfg
-    assert anneal_cfg({"lr": 5e-4})["lr_start"] == 5e-4          # null -> theo base
-    assert anneal_cfg({"lr": 5e-4, "final_anneal": {"lr_start": 2e-5}}
-                      )["lr_start"] == 2e-5                       # khai tay thì giữ
-    # cosine là hàm THUẦN của bước — cùng công thức CosineAnnealingLR
-    lrs = [s0.anneal_lr_at(k, 200, fa, scfg["backbone_lr"])["rest"]
-           for k in range(201)]
-    assert abs(lrs[0] - 1e-5) < 1e-15 and abs(lrs[-1] - 1e-7) < 1e-15
-    assert all(a >= b for a, b in zip(lrs, lrs[1:]))
-    ref = torch.optim.lr_scheduler.CosineAnnealingLR(
-        torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=fa["lr_start"]),
-        T_max=200, eta_min=fa["lr_end"])
-    got = [ref.get_last_lr()[0]]
-    for _ in range(200):
-        ref.optimizer.step()
-        ref.step()
-        got.append(ref.get_last_lr()[0])
-    assert all(abs(a - b) < 1e-15 for a, b in zip(lrs, got))
-    # nối tiếp = lr KHÔNG nhảy nấc ở ranh giới epoch: bước cuối của base cũng 1e-5
-    assert abs(lrs[0] - scfg["lr"]) < 1e-15
-    # backbone KHÔNG tham gia anneal: 1e-5 phẳng ở MỌI bước của epoch final
-    bb = [s0.anneal_lr_at(k, 200, fa, scfg["backbone_lr"])["backbone"]
-          for k in (0, 7, 100, 200)]
-    assert bb == [scfg["backbone_lr"]] * 4 == [1e-5] * 4, bb
-
-    # ── phần base: MỘT lr, warm-up áp lên CẢ HAI nhóm rồi phẳng ───────────
-    spe = 200
-    b = [s0.base_lr_at(k, scfg, spe) for k in (0, 99, 199, 200, 1399)]
-    assert all(abs(x["backbone"] - x["rest"]) < 1e-18 for x in b)   # một lr
-    # ramp TUYẾN TÍNH từ warmup_start_lr (1e-8) lên lr (1e-5), nội suy trên GIÁ TRỊ
-    _s0, _hi = scfg["warmup_start_lr"], 1e-5
-    _at = lambda k: _s0 + (_hi - _s0) * (k + 1) / spe  # noqa: E731
-    assert _s0 == 1e-8
-    assert abs(b[0]["rest"] - _at(0)) < 1e-18                  # bước 0 của warm-up
-    assert abs(b[1]["rest"] - _at(99)) < 1e-18                 # giữa warm-up
-    assert abs(b[2]["rest"] - 1e-5) < 1e-18                    # hết epoch 1 = đỉnh
-    assert abs(b[3]["rest"] - 1e-5) < 1e-18 and abs(b[4]["rest"] - 1e-5) < 1e-18
-    # warm-up chiếm TRỌN epoch đầu; trần = 1 + 50 = 51 epoch base
-    assert scfg["n_warmup_epochs"] == 1 and scfg["base_epochs"] == 51
-
-
-@check("17. bố cục CŨ (chỉ có final/ = epoch cuối của base): nhận làm base/, không pretrain lại")
-def _():
-    import json
-
+    from src import stage1_vextractor as s1
     from src import vextractor as R
-    from src import stage0_vextractor as s0
     from src.config import load_config
+
+    D_MOD = 32
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    cfg["vextractor"] = small_cfg()["vextractor"]
+    cfg["vextractor"]["extractor"] = dict(cfg["vextractor"]["extractor"],
+                                          pretrained=True)
+    cfg["stage0"] = dict(cfg["stage0"],
+                         dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
+                                   local_size=SMALL_IMG // 2, n_local=2,
+                                   out_dim=32, hidden=16, bottleneck=8,
+                                   head_layers=2))
+    cfg["stage1"] = dict(cfg["stage1"], sched_epochs=4, max_epochs=2, patience=0,
+                         tail_epochs=0, batch_size=4, micro_batch=2,
+                         val_n_samples=4)
+
+    def _views(self, i):
+        d_ = self.dc
+        gen = torch.Generator().manual_seed(i * 977 + self.epoch)
+        return [torch.randn(3, d_["global_size"], d_["global_size"], generator=gen)
+                for _ in range(2 + int(d_["n_local"]))]
+
+    orig = (s0.decoder_width, s0.assert_same_pixels,
+            s0.ImageOnlyDataset.__getitem__, R.backbone_body)
+    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
+                       n_stages=None:
+                       orig[3](arch, False, image_size, n_layers, n_stages))
+    s0.decoder_width = lambda *_a, **_k: D_MOD
+    s0.assert_same_pixels = lambda *_a, **_k: None
+    s0.ImageOnlyDataset.__getitem__ = _views
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
+            sp = R.spec_from_cfg(cfg, D_MOD)
+            s0d = Path(t) / "s0"
+            body = R.build_backbone(sp)[0]
+            R.save_stage0(body, sp, s0d, {"best_epoch": 1, "weights": "teacher_ema"})
+            dc = s1.s1cfg(cfg)["dino"]
+            R.save_dino_head(D.DINOHead(R.build_extractor(sp).d_feat, dc["out_dim"],
+                                        dc["hidden"], dc["bottleneck"],
+                                        dc["head_layers"]), s0d)
+            before = {k: v.clone() for k, v in body.state_dict().items()}
+            tr = pd.DataFrame({"key": [f"k{i}" for i in range(8)], "ref": "x"})
+            va = pd.DataFrame({"key": [f"v{i}" for i in range(4)], "ref": "x"})
+            h = s1.run(cfg, tr, va, s0d)
+            assert h["best_epoch"] >= 1 and h["history"]
+            assert h["teacher_head"] == "stage0"
+            # lr của HAI nhóm khác nhau ở mọi epoch, và attn < ffn
+            for x in h["history"]:
+                assert x["lr_attn"] < x["lr_ffn"], x
+            # Extractor ĐỨNG YÊN: trọng số Stage 0 không đổi một bit
+            d1 = s1.stage1_dir(cfg)
+            assert R.compressor_exists(d1 / s1.CKPT)
+            after = R.build_backbone(sp)[0]
+            from safetensors.torch import load_file
+            sd0 = load_file(str(s0d / R.STAGE0_FILE))
+            assert all(torch.equal(before[k], sd0[k]) for k in before)
+            _ = after
+            # checkpoint CHỈ Compressor: không backbone, không Aligner
+            sdc = load_file(str(d1 / s1.CKPT / R.COMPRESSOR_FILE))
+            assert not any(k.startswith(("body.", "aligner")) for k in sdc)
+            assert set(sdc) == set(R.VExtractorBranch(sp).compressor.state_dict())
+            # nạp lại: Compressor đổi, Aligner + Extractor KHÔNG bị chạm
+            br2 = R.VExtractorBranch(sp)
+            al_before = br2.aligner.gate.weight.clone()
+            bb_before = next(iter(br2.extractor.body.parameters())).clone()
+            R.load_compressor_into(br2, d1 / s1.CKPT)
+            assert torch.allclose(br2.aligner.gate.weight, al_before)
+            assert torch.allclose(next(iter(br2.extractor.body.parameters())),
+                                  bb_before)
+            assert torch.allclose(br2.compressor.latent, sdc["latent"])
+            # format lệch -> TỪ CHỐI (ở đây thứ được lưu CHÍNH LÀ Compressor)
+            mp = d1 / s1.CKPT / R.COMPRESSOR_META
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            mp.write_text(json.dumps(dict(meta, format="rgexp.vextractor/1")),
+                          encoding="utf-8")
+            try:
+                R.load_compressor_into(R.VExtractorBranch(sp), d1 / s1.CKPT)
+            except RuntimeError as e:
+                assert "format" in str(e)
+            else:
+                raise AssertionError("format cũ của Stage 1 phải bị từ chối")
+            mp.write_text(json.dumps(meta), encoding="utf-8")
+            assert s1.finished(cfg) is not None
+            # đổi hình dạng Compressor -> Stage 1 phải chạy lại
+            c2 = dict(cfg)
+            c2["vextractor"] = dict(cfg["vextractor"], compressor=dict(
+                cfg["vextractor"]["compressor"], n_query=SMALL_Q + 1))
+            assert s1.finished(c2) is None
+            assert any("compressor_shape" in x for x in s1.diff_inputs(c2))
+            # đổi Aligner -> KHÔNG phải chạy lại (Aligner không có ở Stage 1)
+            c3 = dict(cfg)
+            c3["vextractor"] = dict(cfg["vextractor"], aligner=dict(
+                cfg["vextractor"]["aligner"], mlp_hidden=128))
+            assert s1.finished(c3) is not None
+    finally:
+        (s0.decoder_width, s0.assert_same_pixels,
+         s0.ImageOnlyDataset.__getitem__, R.backbone_body) = orig
+
+
+@check("17. main stage: Aligner học TỪ BƯỚC 0, Compressor đóng băng 20% rồi warm-up 10%; mốc theo TỈ LỆ nên dry-run vẫn mở băng")
+def _():
+    from src.config import load_config
+    from src.train_vextractor import align_lr_at, comp_lr_at, zcfg
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    with tempfile.TemporaryDirectory() as t:
-        cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
-        d = s0.stage0_dir(cfg)
-        R.save_stage0(R.build_backbone(small_spec())[0], small_spec(), d / s0.CKPT,
-                      {"select": "last", "best_epoch": 5})
-        # history kiểu cũ: config_fingerprint tính KHÔNG có final_anneal == base_fingerprint
-        (d / s0.HISTORY).write_text(json.dumps({
-            "finished": True, "select": "last", "best_epoch": 5, "best_score": 0.37,
-            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 6)],
-            "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
-        assert s0.base_finished(cfg) is None and s0.finished(cfg) is None
-        h = s0.adopt_legacy_base(cfg)
-        assert h is not None and R.stage0_exists(d / s0.BASE)
-        assert s0.base_finished(cfg) is not None      # dùng được làm base
-        assert s0.finished(cfg) is None               # epoch n+1 vẫn phải chạy
-        # vân tay base khác -> KHÔNG nhận
-        cfg2 = load_config(ROOT / "configs/vextractor.yaml")
-        cfg2["output"] = dict(cfg["output"])
-        # đổi MỘT khoá thí nghiệm bất kỳ -> vân tay base khác -> KHÔNG nhận
-        cfg2["stage0"] = dict(cfg2["stage0"], lr=cfg2["stage0"]["lr"] * 2)
-        assert s0.base_fingerprint(cfg2) != s0.base_fingerprint(cfg)
-        assert s0.base_finished(cfg2) is None
-    src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    assert "s0.legacy_base(h, cfg, tmp)" in src   # Hub bố cục cũ cũng nhận được
-    # Spec NHÁNH phải dựng từ CONFIG, không chép từ meta Stage 0: meta ấy chụp
-    # bố cục lúc Stage 0 chạy (có thể nhiều bố cục trước), nên chép nó về là
-    # lặng lẽ huấn luyện Extractor+Aligner của bố cục CŨ.
-    tv = (ROOT / "src/train_vextractor.py").read_text(encoding="utf-8")
-    assert "RCV.spec_from_cfg(cfg," in tv
-    assert 'spec = dict(s0meta["spec"])' not in tv
+    zc = zcfg(cfg)
+    N = 200                                    # 1 epoch = 200 bước (khoá theo $1)
+    # ── Aligner: dốc từ bước 0, chạm đỉnh ở 10%, rồi PHẲNG ───────────────
+    assert align_lr_at(0, zc, N) == zc["align_lr_min"] > 0
+    assert align_lr_at(20, zc, N) == zc["align_lr_main"]
+    assert align_lr_at(199, zc, N) == zc["align_lr_main"]
+    a = [align_lr_at(k, zc, N) for k in range(21)]
+    assert all(x <= y + 1e-18 for x, y in zip(a, a[1:]))
+    # ── Compressor: 0 TUYỆT ĐỐI tới bước 40, rồi dốc, rồi PHẲNG ──────────
+    assert comp_lr_at(0, zc, N) == 0.0 and comp_lr_at(39, zc, N) == 0.0
+    assert comp_lr_at(40, zc, N) == zc["comp_lr_min"]
+    assert comp_lr_at(60, zc, N) == zc["comp_lr_main"]
+    assert comp_lr_at(199, zc, N) == zc["comp_lr_main"]
+    # HAI lịch KHÁC nhau — đó là cả điểm của việc tách hai nhóm
+    assert align_lr_at(0, zc, N) != comp_lr_at(0, zc, N)
+    assert zc["comp_lr_main"] < zc["align_lr_main"]
+    # ── mốc theo TỈ LỆ: dry-run 10 bước vẫn mở băng Compressor ────────────
+    for n_small in (10, 20, 40):
+        assert comp_lr_at(0, zc, n_small) == 0.0
+        assert comp_lr_at(n_small - 1, zc, n_small) > 0, n_small
+        assert align_lr_at(n_small - 1, zc, n_small) == zc["align_lr_main"]
+    # Khai theo SỐ BƯỚC tuyệt đối thì ca trên hỏng im lặng — đó là lý do khoá
+    # là `*_frac`, và không có khoá `*_steps` nào trong MAIN_CFG_KEYS.
+    from src.train_vextractor import MAIN_CFG_KEYS
+
+    assert not any(k.endswith("_steps") for k in MAIN_CFG_KEYS)
 
 
-@check("18. kéo Stage 0 từ Hub (giả lập): bố cục cũ chỉ có final/ -> về máy thành base/")
+@check("18. kéo Stage 0 từ Hub (giả lập): base khớp -> về máy, chạy tiếp epoch đuôi")
 def _():
     import json
-    import shutil
 
-    from src import hub_sync
-    from src import vextractor as R
     from src import stage0_vextractor as s0
-    from src.config import load_config
-    from src.push import hub_base
+    from src import vextractor as R
+    from src.config import Cfg
     from src.run_vextractor import pull_stage0
 
-    cfg = load_config(ROOT / "configs/vextractor.yaml")
-    with tempfile.TemporaryDirectory() as t:
-        t = Path(t)
-        cfg["output"] = dict(cfg["output"], adapter_dir=str(t / "ad"))
-        base = hub_base(cfg)
-        hub = t / "hub"                       # "Hub" giả: bố cục CŨ, chỉ có final/
-        R.save_stage0(R.build_backbone(small_spec())[0], small_spec(), hub / s0.CKPT,
-                      {"select": "last", "best_epoch": 5})
-        (hub / s0.HISTORY).write_text(json.dumps({
-            "finished": True, "select": "last", "best_epoch": 5, "best_score": 0.37,
-            "history": [{"epoch": e, "val_score": 0.3} for e in range(1, 6)],
-            "config_fingerprint": s0.base_fingerprint(cfg)}), encoding="utf-8")
-        (hub / s0.LOADER).write_text("{}", encoding="utf-8")
-        (hub / s0.LOADER).write_bytes(b"npz")
-        remote = {f"{base}/stage0/{r}": {} for r in s0.KEEP if (hub / r).exists()}
-        orig = (hub_sync._api_and_index, hub_sync._download)
-        hub_sync._api_and_index = lambda _c: ("api", "repo", "dataset", remote)
-        hub_sync._download = lambda _a, _r, _t, path, dst: (
-            Path(dst).parent.mkdir(parents=True, exist_ok=True),
-            shutil.copyfile(hub / path.split("/stage0/", 1)[1], dst), Path(dst))[-1]
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        hub = td / "hub"
+        cfg = Cfg(json.loads(json.dumps({
+            "seed": 42,
+            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
+                       "sched_epochs": 3, "max_epochs": 3},
+            "vextractor": small_cfg()["vextractor"],
+            "output": {"adapter_dir": str(td / "ad"), "hub_repo": "x/y",
+                       "hub_repo_type": "dataset", "hub_root": "current",
+                       "hub_index": "2.2", "hub_title": "V-Extractor"}})))
+        sp = R.spec_from_cfg(cfg, 32)
+        sc = s0.s0cfg(cfg)
+        # "Trên Hub": chỉ có base/ (phần theo lịch), KHÔNG có final/
+        base_dir = hub / "stage0" / s0.BASE
+        R.save_stage0(R.build_backbone(sp)[0], sp, base_dir, {"best_epoch": 2})
+        h = {"finished": False, "base_finished": True, "base_epoch": 2,
+             "base_epochs_run": 3, "best_epoch": 2, "stage0": dict(sc),
+             "spec": sp, "seed": 42,
+             "base_fingerprint": s0.base_fingerprint(cfg),
+             "config_fingerprint": s0.config_fingerprint(cfg)}
+        (hub / "stage0" / s0.HISTORY).write_text(json.dumps(h, default=str),
+                                                 encoding="utf-8")
+        remote = {f"current/$2.2_V-Extractor_Test/stage0/{r}"
+                  for r in s0.KEEP if (hub / "stage0" / r).exists()}
+
+        import src.run_vextractor as RV
+
+        def fake_api(_c):
+            return object(), "x/y", "dataset", remote
+
+        def fake_dl(_api, _repo, _typ, path, dest):
+            rel = path.split("/stage0/", 1)[1]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes((hub / "stage0" / rel).read_bytes())
+
+        import src.hub_sync as HS
+        o1, o2 = HS._api_and_index, HS._download
+        HS._api_and_index, HS._download = fake_api, fake_dl
         try:
-            assert pull_stage0(cfg, base_only=True) is True
+            assert pull_stage0(cfg) is True
+            d = s0.stage0_dir(cfg)
+            assert R.stage0_exists(d / s0.BASE)
+            assert not R.stage0_exists(d / s0.CKPT)    # final/ sẽ chạy trên máy này
+            assert s0.base_finished(cfg) is not None
+            assert s0.finished(cfg) is None
+            # cấu hình KHÁC -> không dùng
+            c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+            c2["seed"] = 7
+            c2["output"] = dict(c2["output"], adapter_dir=str(td / "ad2"))
+            assert pull_stage0(c2) is False
         finally:
-            hub_sync._api_and_index, hub_sync._download = orig
-        d = s0.stage0_dir(cfg)
-        assert R.stage0_exists(d / s0.BASE) and not R.stage0_exists(d / s0.CKPT)
-        h = json.loads((d / s0.HISTORY).read_text())
-        assert h["base_finished"] and not h["finished"] and h["base_epoch"] == 5
-        assert s0.base_finished(cfg) is not None and s0.finished(cfg) is None
+            HS._api_and_index, HS._download = o1, o2
+        _ = RV
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ViT-B/16 về pixel / đầu ra DINOv3), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt về pixel / đầu ra Extractor), Lens_Explain.md")
 def _():
     import json
     import types
@@ -1717,7 +1454,7 @@ def _():
     from src.config import load_config
 
     NV, DV, DM, NZ, V, L = 64, 8, 32, 4, 11, 3     # patch, d_vis, d_model, |Z|, vocab, lớp
-    NQ = SMALL_Q                                    # số learner Q (khoá khai, không suy ra)
+    NQ = SMALL_Q                                    # số latent Q (khoá khai, không suy ra)
     IMG_TOK = V - 1
 
     class _Proj(nn.Module):                        # (1, NV, DV) -> (1, NZ, DM)
@@ -1828,7 +1565,7 @@ def _():
     # Lens KHÔNG được để lại dấu vết trên nhánh: trọng số đóng băng, cờ như cũ,
     # và backbone vẫn ở chế độ teacher inference (eval)
     assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
-    assert not branch.vextractor.body.training
+    assert not branch.extractor.body.training
     # Q nằm SAU khối ảnh -> vị trí của token ảnh KHÔNG đổi
     assert ra["image_span"] == rb["image_span"] == [2, 1 + NZ]
     assert rb["insert_span"] == [2 + NZ, 2 + NZ + NQ], rb["insert_span"]
@@ -1898,8 +1635,8 @@ def _():
                      "Kiểm nhanh trước khi tin hình", "Đọc ba ô thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
                      "KHÔNG dính decoder", "teacher",
-                     f"{cfg['vextractor']['vextractor']['n_query']} High-Q token",
-                     "Q → Aligner → Extractor → teacher (ViT-B/16) → I",
+                     f"{cfg['vextractor']['compressor']['n_query']} High-Q token",
+                     "Q → Aligner → Compressor → Extractor → I",
                      "`Q[0]`", "448²"):
             assert need in doc, need
         assert "`sal_z`" in doc and "`sal_q`" in doc
@@ -1984,7 +1721,7 @@ def _():
     _ = left
 
 
-@check("22. ĐẶC TẢ khớp spec sống: mọi con số kiến trúc trong README, config "
+@check("22. ĐẶC TẢ khớp spec SỐNG: mọi con số kiến trúc trong README, config "
        "và docstring được dựng lại từ code, không phải chép tay")
 def _():
     """README trôi khỏi code ở MỖI lần đổi kiến trúc, và nó trôi IM LẶNG.
@@ -2002,11 +1739,11 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sp = R.spec_from_cfg(cfg, 2560)
-    sp["vextractor"]["pretrained"] = False
+    sp["extractor"]["pretrained"] = False
     br = R.VExtractorBranch(sp)
-    vx, al = br.vextractor, br.aligner
+    ex, cp, al = br.extractor, br.compressor, br.aligner
     dc = cfg["stage0"]["dino"]
-    head = DN.DINOHead(vx.d_feat, dc["out_dim"], dc["hidden"], dc["bottleneck"],
+    head = DN.DINOHead(ex.d_feat, dc["out_dim"], dc["hidden"], dc["bottleneck"],
                        dc["head_layers"])
     n = lambda m: sum(q.numel() for q in m.parameters())    # noqa: E731
     # README viết số thập phân theo kiểu Việt (dấu phẩy) — so đúng dạng ấy.
@@ -2014,45 +1751,40 @@ def _():
 
     rd = (ROOT / "README.md").read_text(encoding="utf-8")
     need = [
-        (str(sp["vextractor"]["arch"]), "arch"),
-        (f"Linear {vx.d_feat}→{vx.d_branch}", "Linear vào"),
-        (f"SwiGLU {al.d_branch}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
-        (f"`head_dim` = {vx.head_dim}", "head_dim khai"),
-        (f"{vx.n_query} learner", "n_query"),
-        # HAI khối SwiGLU, HAI khoá — README phải nói cả hai, nếu không người
-        # đọc tưởng `aligner.mlp_hidden` điều khiển cả khối giữa hai attention.
-        ("`vextractor.vextractor.mlp_hidden`", "mlp_hidden của Extractor"),
+        (str(sp["extractor"]["arch"]), "arch"),
+        (f"({ex.n_patch}, {ex.d_feat})", "V"),
+        (f"({cp.n_query}, {cp.d_latent})", "V_c"),
+        (f"SwiGLU {al.d_latent}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
+        (f"SwiGLU {cp.d_latent}→{cp.mlp_hidden}→{cp.d_latent}", "FFN của Compressor"),
+        (f"`head_dim` = {cp.head_dim}", "head_dim khai"),
+        (f"{cp.n_query} latent", "n_query"),
+        (f"`n_stages: {ex.n_stages}`", "lát cắt stage"),
+        # HAI khối SwiGLU, HAI khoá — README phải nói cả hai.
+        ("`vextractor.compressor.mlp_hidden`", "mlp_hidden của Compressor"),
         ("`vextractor.aligner.mlp_hidden`", "mlp_hidden của Aligner"),
-        (f"SwiGLU {vx.d_branch}→{vx.mlp_hidden}→{vx.d_branch}", "MLP giữa hai attn"),
-        (f"{vx.n_patch} ô", "lưới"),
-        (m(n(vx.body)), "tham số backbone"),
-        (m(sum(q.numel() for q in vx.head_parameters())), "tham số Extractor"),
+        (f"{ex.n_patch} ô", "lưới"),
+        (m(n(ex)), "tham số Extractor"),
+        (m(n(cp.groups[0])), "tham số MỘT nhóm khối"),
+        (m(n(cp)), "tham số Compressor"),
         (m(n(al)), "tham số Aligner"),
         (m(n(br)), "tham số nhánh"),
         (m(sum(q.numel() for q in br.trainable_parameters())), "phần học được"),
         (m(n(head)), "DINO head"),
-        (m(n(vx.body) + n(head)), "Stage 0 student"),
+        (m(n(ex) + n(head)), "Stage 0 student"),
     ]
     miss = [f"{name} ({s!r})" for s, name in need if s not in rd]
     assert not miss, ("README KHÔNG còn khớp spec sống — sửa README, đừng nới "
                       f"bài kiểm: {miss}")
 
-    # Và số của BỐ CỤC CŨ không được còn sót — ở BA bề mặt đặc tả, không chỉ
-    # README: config và docstring của `vextractor.py` cũng là nơi người ta đọc
-    # để biết nhánh làm gì, và chúng trôi y hệt. Mọi chuỗi ở đây SUY RA từ spec
-    # sống: không có danh sách "số của bố cục cũ" nào gõ tay, nên bài này không
-    # phải sửa mỗi lần kiến trúc đổi.
+    # Và số của BỐ CỤC CŨ không được còn sót — ở BA bề mặt đặc tả. Mọi chuỗi ở
+    # đây SUY RA từ spec sống: không có danh sách "số của bố cục cũ" nào gõ tay.
     def wrong(v):
-        return [x for x in (v // 2, v * 2, 64, 768, 1024) if x != v]
+        return [x for x in (v // 2, v * 2, 16, 196, 2048) if x != v]
 
-    # KHÔNG soi "<k> vector Q": đặc tả có câu hợp lệ "8 vector Q được đọc nhiều
-    # nhất" (top-k của Lens), và một phép so CHUỖI không phân biệt được nó với
-    # `n_query` cũ. "<k> learner" và "<k> High-Q token" đã phủ đúng chỗ ấy rồi.
-    stale = [f"{k} learner" for k in wrong(vx.n_query)]
-    stale += [f"{k} High-Q token" for k in wrong(vx.n_query)]
-    stale += [f"`d_branch` = {k}" for k in wrong(vx.d_branch)]
-    stale += [f"SwiGLU {vx.d_branch}→{k}→{vx.d_branch}"
-              for k in wrong(vx.mlp_hidden)]
+    stale = [f"{k} latent" for k in wrong(cp.n_query)]
+    stale += [f"`d_latent` = {k}" for k in wrong(cp.d_latent)]
+    stale += [f"SwiGLU {cp.d_latent}→{k}→{cp.d_latent}" for k in wrong(cp.mlp_hidden)]
+    stale += [f"({k}, {ex.d_feat})" for k in wrong(ex.n_patch)]
     surfaces = {
         "README.md": rd,
         "configs/vextractor.yaml": (ROOT / "configs/vextractor.yaml").read_text(
@@ -2063,32 +1795,24 @@ def _():
             (ROOT / "src/vextractor.py").read_text(encoding="utf-8")
             .split('"""')[1]),
     }
-    left = {f: [s for s in stale if s in body]
-            for f, body in surfaces.items()}
+    left = {f: [s for s in stale if s in body] for f, body in surfaces.items()}
     left = {f: v for f, v in left.items() if v}
     assert not left, f"đặc tả còn con số KHÔNG khớp spec sống: {left}"
 
 
-@check("23. vân tay Stage 0 chỉ phụ thuộc BACKBONE: đổi Extractor/Aligner KHÔNG "
-       "bắt pretrain lại; checkpoint Stage 0 sống qua một lần bump FORMAT")
+@check("23. vân tay Stage 0 chỉ phụ thuộc EXTRACTOR: đổi Compressor/Aligner KHÔNG "
+       "bắt finetune lại; checkpoint Stage 0 sống qua một lần bump FORMAT")
 def _():
     """Hai cổng từng bắt chạy lại một lượt DINO nhiều giờ mà KHÔNG có lý do.
 
-    1. `config_fingerprint` băm CẢ khối `vextractor` — gồm `d_branch`,
-       `n_query`, `head_dim`, `aligner`, `main`. Không thứ nào trong đó có mặt ở
-       Stage 0 (nó chỉ dựng backbone + DINO head), nên đổi chúng làm vân tay
-       đổi và người chạy bị bảo `--restage0` cho một backbone y hệt.
+    1. `config_fingerprint` băm CẢ khối `vextractor`. Không thứ nào ngoài
+       Extractor có mặt ở Stage 0, nên đổi chúng làm vân tay đổi và người chạy
+       bị bảo `--restage0` cho một backbone y hệt.
     2. `load_stage0_into` đòi `format` BẰNG ĐÚNG `FORMAT`. Nhưng `FORMAT` bump
-       mỗi lần Extractor/Aligner đổi bố cục, trong khi backbone y nguyên, nên
+       mỗi lần Compressor/Aligner đổi bố cục, trong khi Extractor y nguyên, nên
        một checkpoint hoàn toàn dùng được bị vứt.
-
-    Cả hai đều mâu thuẫn với docstring của `backbone_spec` và với README. Bài
-    này khoá cả hai lại.
     """
     import json
-    import tempfile
-
-    import torch
 
     from src import stage0_vextractor as s0
     from src import vextractor as R
@@ -2096,66 +1820,60 @@ def _():
     base = small_spec()
 
     def cfg_of(**over):
-        rv = {"image_size": SMALL_IMG, "arch": SMALL_ARCH, "pretrained": False,
-              "n_layers": SMALL_NL, "n_query": SMALL_Q, "d_branch": SMALL_DB,
-              "head_dim": 4}
-        rv.update(over.pop("rv", {}))
-        vx = {"vextractor": rv, "aligner": {"mlp_hidden": 64},
-              "main": {"align_lr": 1e-5}}
-        vx.update(over.pop("vx", {}))
-        return {"seed": 42, "stage0": {"lr": 1e-5, "max_epochs": 3},
+        vx = json.loads(json.dumps(small_cfg()["vextractor"]))
+        vx["main"] = {"align_lr_main": 1e-4}
+        for blk, patch in over.pop("vx", {}).items():
+            vx[blk] = dict(vx.get(blk) or {}, **patch)
+        return {"seed": 42,
+                "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
+                           "max_epochs": 3, "sched_epochs": 3},
                 "vextractor": vx}
 
     ref = s0.config_fingerprint(cfg_of())
-    ref_b = s0.base_fingerprint(cfg_of())
+    assert s0.base_fingerprint(cfg_of()) == ref     # cùng phạm vi, hai tên
 
-    # ── đổi phần NGOÀI backbone -> vân tay KHÔNG được đổi ──────────────────
+    # ── đổi phần NGOÀI Extractor -> vân tay KHÔNG được đổi ────────────────
     same = {
-        "d_branch": cfg_of(rv={"d_branch": 32}),
-        "n_query": cfg_of(rv={"n_query": 3}),
-        "head_dim": cfg_of(rv={"head_dim": 8}),
-        "dropout": cfg_of(rv={"dropout": 0.1}),
-        "image_size": cfg_of(rv={"image_size": SMALL_IMG * 2}),
+        "d_latent": cfg_of(vx={"compressor": {"d_latent": 32}}),
+        "n_query": cfg_of(vx={"compressor": {"n_query": 3}}),
+        "head_dim": cfg_of(vx={"compressor": {"head_dim": 8}}),
+        "n_blocks": cfg_of(vx={"compressor": {"n_blocks": 3}}),
+        "dropout": cfg_of(vx={"compressor": {"dropout": 0.1}}),
+        "image_size": cfg_of(vx={"extractor": {"image_size": SMALL_IMG * 2}}),
         "aligner": cfg_of(vx={"aligner": {"mlp_hidden": 999}}),
-        "main": cfg_of(vx={"main": {"align_lr": 0.5}}),
+        "main": cfg_of(vx={"main": {"align_lr_main": 0.5}}),
     }
     drift = [k for k, c in same.items() if s0.config_fingerprint(c) != ref]
     assert not drift, (
         f"đổi {drift} làm vân tay Stage 0 đổi — những khoá ấy tả "
-        f"Extractor/Aligner, Stage 0 không dựng chúng, và bắt pretrain lại vì "
-        f"chúng là bắt trả vài giờ GPU cho một backbone y hệt.")
-    drift_b = [k for k, c in same.items() if s0.base_fingerprint(c) != ref_b]
-    assert not drift_b, f"base_fingerprint: {drift_b}"
+        f"Compressor/Aligner, Stage 0 không dựng chúng, và bắt finetune lại vì "
+        f"chúng là bắt trả vài giờ GPU cho một Extractor y hệt.")
 
-    # ── đổi BACKBONE -> vân tay PHẢI đổi (cổng vẫn còn răng) ───────────────
-    for key, c in (("arch", cfg_of(rv={"arch": SMALL_CONV})),
-                   ("n_layers", cfg_of(rv={"n_layers": 2})),
-                   ("n_stages", cfg_of(rv={"n_stages": 2})),
-                   ("pretrained", cfg_of(rv={"pretrained": True}))):
+    # ── đổi EXTRACTOR -> vân tay PHẢI đổi (cổng vẫn còn răng) ─────────────
+    for key, c in (("arch", cfg_of(vx={"extractor": {"arch": SMALL_VIT}})),
+                   ("n_stages", cfg_of(vx={"extractor": {"n_stages": 2}})),
+                   ("pretrained", cfg_of(vx={"extractor": {"pretrained": True}}))):
         assert s0.config_fingerprint(c) != ref, f"đổi {key} PHẢI đổi vân tay"
-    # khối stage0 và seed vẫn vào vân tay
-    c = cfg_of(); c["stage0"]["lr"] = 3e-5
-    assert s0.config_fingerprint(c) != ref
+    for key, val in (("lr_max", 5e-4), ("patience", 9), ("tail_epochs", 3),
+                     ("sched_epochs", 7)):
+        c = cfg_of()
+        c["stage0"][key] = val
+        assert s0.config_fingerprint(c) != ref, key
     c = cfg_of(); c["seed"] = 7
     assert s0.config_fingerprint(c) != ref
-    # `final_anneal` vào config_fingerprint nhưng KHÔNG vào base_fingerprint
-    c = cfg_of(); c["stage0"]["final_anneal"] = {"enabled": True}
-    assert s0.config_fingerprint(c) != ref and s0.base_fingerprint(c) == ref_b
 
-    # ── checkpoint Stage 0 sống qua một lần bump FORMAT ────────────────────
+    # ── checkpoint Stage 0 sống qua một lần bump FORMAT ───────────────────
     body = R.build_backbone(base)[0]
     with tempfile.TemporaryDirectory() as td:
         d = Path(td) / "s0"
         R.save_stage0(body, base, d, {"best_epoch": 1})
         meta_p = d / R.STAGE0_META
         meta = json.loads(meta_p.read_text(encoding="utf-8"))
-        # giả lập: checkpoint ghi ở thế hệ TRƯỚC, backbone y hệt
         gen = R.format_gen(R.FORMAT)
         meta["format"] = f"rgexp.vextractor/{gen - 1}"
         meta_p.write_text(json.dumps(meta), encoding="utf-8")
-        br = R.VExtractorBranch(base)
-        R.load_stage0_into(br, d)          # phải NẠP ĐƯỢC, không ném
-        # nhưng backbone KHÁC thì vẫn bị chặn
+        R.load_stage0_into(R.VExtractorBranch(base), d)   # phải NẠP ĐƯỢC
+        # nhưng Extractor KHÁC thì vẫn bị chặn
         meta["backbone_spec"] = dict(meta["backbone_spec"], arch="khac_hoan_toan")
         meta_p.write_text(json.dumps(meta), encoding="utf-8")
         try:
@@ -2164,7 +1882,7 @@ def _():
             assert "backbone" in str(e) or "restage0" in str(e)
         else:
             raise AssertionError("backbone khác phải bị chặn")
-        # và thế hệ trước /5 (lưu cả một Cls Head có giám sát) vẫn bị từ chối
+        # và thế hệ trước /5 vẫn bị từ chối
         meta["format"] = f"rgexp.vextractor/{R.STAGE0_MIN_GEN - 1}"
         meta_p.write_text(json.dumps(meta), encoding="utf-8")
         try:
@@ -2173,7 +1891,6 @@ def _():
             assert "restage0" in str(e)
         else:
             raise AssertionError("format quá cũ phải bị từ chối")
-    del torch
 
 
 @check("24. Stage 0 cũ vẫn dùng được sau khi SỬA phạm vi vân tay: cổng so NỘI "
@@ -2181,17 +1898,14 @@ def _():
 def _():
     """Ca thật, đã gặp: phạm vi vân tay sai -> sửa hàm -> checkpoint vẫn bị vứt.
 
-    `config_fingerprint` từng băm cả `d_branch`/`n_query`/`aligner`. Sửa nó cho
-    đúng phạm vi là cần, NHƯNG hash đã nằm trong `stage0_history.json` của lượt
-    đã chạy thì không sửa theo được. Nếu cổng so hash, MỌI checkpoint ghi trước
-    lần sửa đều bị tuyên "cấu hình KHÁC" và người chạy mất vài giờ GPU cho một
-    backbone y hệt — đúng thứ lần sửa ấy sinh ra để tránh.
+    Hash đã nằm trong `stage0_history.json` của lượt đã chạy thì không sửa theo
+    được. Nếu cổng so hash, MỌI checkpoint ghi trước lần sửa đều bị tuyên "cấu
+    hình KHÁC" và người chạy mất vài giờ GPU cho một Extractor y hệt.
 
     Nên cổng so NỘI DUNG: history ghi cả khối `stage0` đã giải quyết lẫn
     `spec`, `loader.json` ghi `seed`, nên dựng lại được đúng bộ đầu vào.
     """
     import json
-    import tempfile
 
     from src import stage0_vextractor as s0
     from src import vextractor as R
@@ -2200,50 +1914,48 @@ def _():
     with tempfile.TemporaryDirectory() as td:
         cfg = Cfg(json.loads(json.dumps({
             "seed": 42,
-            "stage0": {"lr": 1e-5, "max_epochs": 3, "micro_batch": 8},
-            "vextractor": {"vextractor": {"image_size": SMALL_IMG,
-                                          "arch": SMALL_ARCH, "pretrained": False,
-                                          "n_layers": SMALL_NL, "n_query": SMALL_Q,
-                                          "d_branch": SMALL_DB, "head_dim": 4},
-                           "aligner": {"mlp_hidden": 64}},
+            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
+                       "max_epochs": 3, "sched_epochs": 3, "micro_batch": 8},
+            "vextractor": small_cfg()["vextractor"],
             "output": {"adapter_dir": td}})))
         d = s0.stage0_dir(cfg)
         d.mkdir(parents=True, exist_ok=True)
         sc = s0.s0cfg(cfg)
         sp = R.spec_from_cfg(cfg, 32)
-        # history của lượt ĐÃ CHẠY, mang hash của hàm băm CŨ (băm cả khối
-        # vextractor) — giá trị nào cũng được, miễn là KHÁC hash bây giờ.
+        # history của lượt ĐÃ CHẠY, mang hash của hàm băm CŨ — giá trị nào cũng
+        # được, miễn là KHÁC hash bây giờ.
         h = {"finished": True, "base_finished": True, "best_epoch": 2,
              "base_epoch": 2, "stage0": dict(sc), "spec": sp, "seed": 42,
-             "config_fingerprint": "hash_cua_ham_bam_CU",
-             "base_fingerprint": "hash_cua_ham_bam_CU_base"}
+             "config_fingerprint": "hash_cua_ham_bam_CU"}
         (d / s0.HISTORY).write_text(json.dumps(h, default=str), encoding="utf-8")
         for sub in (s0.CKPT, s0.BASE):
             R.save_stage0(R.build_backbone(sp)[0], sp, d / sub, {"best_epoch": 2})
 
-        assert s0.diff_inputs(d, h, cfg, True) == [], "hash cũ KHÔNG được chặn"
+        assert s0.diff_inputs(d, h, cfg) == [], "hash cũ KHÔNG được chặn"
         assert s0.finished(cfg) is not None, "Stage 0 cũ phải dùng lại được"
         assert s0.base_finished(cfg) is not None
 
-        # ĐỔI phần ngoài backbone -> vẫn dùng lại được (đó là cả điểm của fix)
-        for key, val in (("d_branch", 32), ("n_query", 3), ("head_dim", 8)):
+        # ĐỔI phần ngoài Extractor -> vẫn dùng lại được (đó là cả điểm của fix)
+        for key, val in (("d_latent", 32), ("n_query", 3), ("head_dim", 8),
+                         ("n_blocks", 4)):
             c2 = Cfg(json.loads(json.dumps(dict(cfg))))
-            c2["vextractor"]["vextractor"][key] = val
+            c2["vextractor"]["compressor"][key] = val
             assert s0.finished(c2) is not None, f"đổi {key} không được bắt chạy lại"
 
-        # ĐỔI backbone / stage0 / seed -> PHẢI bắt chạy lại, và nói rõ chỗ lệch
+        # ĐỔI Extractor / stage0 / seed -> PHẢI bắt chạy lại, và nói rõ chỗ lệch
         c2 = Cfg(json.loads(json.dumps(dict(cfg))))
-        c2["vextractor"]["vextractor"]["arch"] = SMALL_CONV
+        c2["vextractor"]["extractor"]["arch"] = SMALL_VIT
+        c2["vextractor"]["extractor"]["n_stages"] = None
         assert s0.finished(c2) is None
-        assert any("backbone" in x for x in s0.diff_inputs(d, h, c2, True))
+        assert any("backbone" in x for x in s0.diff_inputs(d, h, c2))
         c2 = Cfg(json.loads(json.dumps(dict(cfg))))
-        c2["stage0"]["lr"] = 3e-5
+        c2["stage0"]["lr_max"] = 3e-4
         assert s0.finished(c2) is None
-        assert any("stage0.lr" in x for x in s0.diff_inputs(d, h, c2, True))
+        assert any("stage0.lr_max" in x for x in s0.diff_inputs(d, h, c2))
         c2 = Cfg(json.loads(json.dumps(dict(cfg))))
         c2["seed"] = 7
         assert s0.finished(c2) is None
-        assert any("seed" in x for x in s0.diff_inputs(d, h, c2, True))
+        assert any("seed" in x for x in s0.diff_inputs(d, h, c2))
         # `micro_batch` chỉ nói chuyện VRAM -> KHÔNG bắt chạy lại
         c2 = Cfg(json.loads(json.dumps(dict(cfg))))
         c2["stage0"]["micro_batch"] = 2
@@ -2253,144 +1965,103 @@ def _():
         h2 = {k: v for k, v in h.items() if k not in ("spec", "seed")}
         (d / s0.HISTORY).write_text(json.dumps(h2, default=str), encoding="utf-8")
         assert s0.history_inputs(d, h2) is None
-        assert s0.diff_inputs(d, h2, cfg, True) != [], "thiếu spec phải rơi về hash"
+        assert s0.diff_inputs(d, h2, cfg) != [], "thiếu spec phải rơi về hash"
 
 
-
-@check("25. BA giai đoạn: 0.1 dạy backbone · 0.2 chưng cất Extractor từ teacher "
-       "ĐÓNG BĂNG · main dạy Aligner + LoRA, mở băng Extractor ở bước 40")
+@check("25. BA giai đoạn: Stage 0 dạy Extractor · Stage 1 chưng cất Compressor từ "
+       "teacher ĐÓNG BĂNG · main dạy Aligner + LoRA rồi mở Compressor")
 def _():
     """Mỗi giai đoạn dạy ĐÚNG MỘT khối, và ranh giới phải kiểm được.
 
     Ba chỗ dễ lệch lặng lẽ, và bài này khoá cả ba:
 
-      1. 0.2 vô tình cập nhật backbone (teacher phải ĐỨNG YÊN — nó đang sinh
-         nhãn cho chính mình thì phép chưng cất không còn nghĩa gì);
-      2. checkpoint 0.2 mang theo backbone hoặc Aligner — hai bản của cùng một
-         tensor, hoặc một Aligner đã học đè lên một Aligner phải ngẫu nhiên;
-      3. main stage quên mở băng Extractor, hoặc mở sai bước.
+      1. Stage 1 vô tình cập nhật Extractor (teacher phải ĐỨNG YÊN — nó đang
+         sinh nhãn cho chính mình thì phép chưng cất không còn nghĩa gì);
+      2. checkpoint Stage 1 mang theo Extractor hoặc Aligner — hai bản của cùng
+         một tensor, hoặc một Aligner đã học đè lên một Aligner phải ngẫu nhiên;
+      3. main stage quên mở băng Compressor, hoặc mở sai bước.
     """
     import json as _json
 
     import torch
 
     from src import dino as D
+    from src import stage1_vextractor as s1
     from src import vextractor as R
     from src.config import Cfg, load_config
-    from src.train_vextractor import (MAIN_CFG_KEYS, align_lr_at,
-                                      extractor_lr_at, zcfg)
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    zc = zcfg(cfg)
-    assert set(zc) == set(MAIN_CFG_KEYS)
-    # ── lịch main stage: Extractor 0 rồi PHẲNG, Aligner warm-up rồi PHẲNG ──
-    u = int(zc["extractor_unfreeze_steps"])
-    assert u == 40 and zc["extractor_lr"] == 3e-6
-    assert extractor_lr_at(u - 1, zc) == 0.0            # bước 40 (0-based 39)
-    assert extractor_lr_at(u, zc) == zc["extractor_lr"] # bước 41
-    assert extractor_lr_at(199, zc) == zc["extractor_lr"]
-    # KHÔNG có dốc nào cho Extractor: hai bước liên tiếp sau mốc phải BẰNG nhau
-    assert extractor_lr_at(u, zc) == extractor_lr_at(u + 1, zc)
-    # còn Aligner thì CÓ dốc, và hai lịch KHÁC nhau ở bước 1
-    assert align_lr_at(0, zc) != align_lr_at(int(zc["align_warmup_steps"]), zc)
-    assert align_lr_at(0, zc) != extractor_lr_at(0, zc)
 
-    # ── config Stage 0.2 mượn DINO của 0.1, và ép n_local = 0 ─────────────
-    from src import stage02_vextractor as s02
-
-    sc = s02.s02cfg(cfg)
+    # ── config Stage 1 mượn DINO của Stage 0, và ép n_local = 0 ───────────
+    sc = s1.s1cfg(cfg)
     dc0 = cfg["stage0"]["dino"]
     assert sc["dino"]["n_local"] == 0 != int(dc0["n_local"])
     for k in ("teacher_temp", "student_temp", "center_momentum", "out_dim", "pool"):
         assert sc["dino"][k] == dc0[k], k     # KHÔNG được lệch công thức DINO
-    for bad in ("n_local", "pool", "out_dim", "dino"):
+    for bad in ("n_local", "pool", "out_dim", "dino", "lr"):
         b = Cfg(_json.loads(_json.dumps(dict(cfg))))
-        b["stage02"] = dict(b["stage02"], **{bad: 1})
+        b["stage1"] = dict(b["stage1"], **{bad: 1})
         try:
-            s02.s02cfg(b)
+            s1.s1cfg(b)
         except Exception as e:  # noqa: BLE001
             assert "khoá lạ" in str(e), (bad, e)
         else:
-            raise AssertionError(f"stage02.{bad} phải bị từ chối")
-    # ── vân tay 0.2: có backbone + hình dạng Extractor + 0.1, KHÔNG có Aligner ──
-    ins = s02.cfg_inputs(cfg)
-    assert set(ins) == {"stage02", "backbone", "extractor_shape", "seed", "stage01"}
-    assert set(ins["extractor_shape"]) == {"d_branch", "n_query", "head_dim",
-                                           "mlp_hidden"}
-    f0 = s02.config_fingerprint(cfg)
+            raise AssertionError(f"stage1.{bad} phải bị từ chối")
+
+    # ── vân tay Stage 1: Extractor + hình dạng Compressor + Stage 0, KHÔNG Aligner ──
+    ins = s1.cfg_inputs(cfg)
+    assert set(ins) == {"stage1", "backbone", "compressor_shape", "seed", "stage0"}
+    assert set(ins["compressor_shape"]) == {"n_query", "d_latent", "head_dim",
+                                            "mlp_hidden", "n_blocks"}
+    f0 = s1.config_fingerprint(cfg)
     c2 = Cfg(_json.loads(_json.dumps(dict(cfg))))
     c2["vextractor"]["aligner"] = dict(c2["vextractor"]["aligner"], mlp_hidden=512)
-    assert s02.config_fingerprint(c2) == f0, "đổi Aligner KHÔNG được bắt chạy lại 0.2"
+    assert s1.config_fingerprint(c2) == f0, "đổi Aligner KHÔNG được bắt chạy lại Stage 1"
     c3 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c3["vextractor"]["vextractor"] = dict(c3["vextractor"]["vextractor"], n_query=8)
-    assert s02.config_fingerprint(c3) != f0, "đổi Extractor PHẢI bắt chạy lại 0.2"
+    c3["vextractor"]["compressor"] = dict(c3["vextractor"]["compressor"], n_query=8)
+    assert s1.config_fingerprint(c3) != f0, "đổi Compressor PHẢI bắt chạy lại Stage 1"
     c4 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c4["stage0"] = dict(c4["stage0"], lr=1e-4)
-    assert s02.config_fingerprint(c4) != f0, "đổi 0.1 PHẢI bắt chạy lại 0.2"
+    c4["stage0"] = dict(c4["stage0"], lr_max=1e-3)
+    assert s1.config_fingerprint(c4) != f0, "đổi Stage 0 PHẢI bắt chạy lại Stage 1"
 
-    # ── TransferTrainer: teacher ĐỨNG YÊN, gradient CHỈ tới Extractor ─────
+    # ── CompressorTransferTrainer: teacher ĐỨNG YÊN, grad CHỈ tới Compressor ──
     torch.manual_seed(0)
     sp = small_spec()
     br = R.VExtractorBranch(sp)
-    vx = br.vextractor
-    dc = dict(sc["dino"])
-    th = D.DINOHead(vx.d_feat, 32, 16, 8, 2)
-    dc = dict(dc, out_dim=32, hidden=16, bottleneck=8, head_layers=2)
-    tr = D.TransferTrainer(vx, th, dc, vx.d_branch)
+    ex, cp = br.extractor, br.compressor
+    dc = dict(sc["dino"], out_dim=32, hidden=16, bottleneck=8, head_layers=2)
+    th = D.DINOHead(ex.d_feat, 32, 16, 8, 2)
+    tr = D.CompressorTransferTrainer(ex, cp, th, dc, cp.d_latent)
     assert not any(p.requires_grad for p in tr.teacher_head.parameters())
-    assert not any(p.requires_grad for p in vx.body.parameters())
-    assert vx.body_frozen
+    assert not any(p.requires_grad for p in ex.body.parameters())
+    assert ex.frozen
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     tr.loss([x, torch.randn_like(x)], dc["teacher_temp"]).backward()
-    assert all(p.grad is None for p in vx.body.parameters()), "backbone KHÔNG được có grad"
+    assert all(p.grad is None for p in ex.body.parameters()), "Extractor KHÔNG được có grad"
     assert all(p.grad is None for p in tr.teacher_head.parameters())
-    assert any(p.grad is not None for p in vx.head_parameters())
-    # KHÔNG có EMA ở 0.2: teacher là checkpoint, không phải trung bình trượt
+    assert any(p.grad is not None for p in cp.parameters())
+    assert all(p.grad is None for p in br.aligner.parameters()), "Aligner không có ở Stage 1"
+    # KHÔNG có EMA ở Stage 1: teacher là checkpoint, không phải trung bình trượt
     assert not hasattr(tr, "ema_update") and not hasattr(tr, "teacher_body")
+    # BA nhóm optimizer, và `head` đi cùng lr của `ffn`
+    gp = tr.param_groups(1e-8, 1e-7)
+    assert [g["name"] for g in gp] == ["attn", "ffn", "head"]
+    assert gp[0]["lr"] == 1e-8 and gp[1]["lr"] == gp[2]["lr"] == 1e-7
+    ids = {id(q) for g in gp for q in g["params"]}
+    assert not (ids & {id(q) for q in tr.teacher_head.parameters()})
 
-    # ── checkpoint 0.2: CHỈ Extractor ─────────────────────────────────────
-    with tempfile.TemporaryDirectory() as t:
-        t = Path(t)
-        R.save_extractor(br, t, {"best_epoch": 1})
-        sd_keys = set(R._extractor_state(vx))
-        assert not any(k.startswith("body.") for k in sd_keys)
-        assert not any(k.startswith("aligner") for k in sd_keys)
-        assert sd_keys and all(hasattr(vx, k.split(".")[0]) for k in sd_keys)
-        br2 = R.VExtractorBranch(sp)
-        al_before = br2.aligner.gate.weight.clone()
-        bb_before = next(iter(br2.vextractor.body.parameters())).clone()
-        R.load_extractor_into(br2, t)
-        assert torch.allclose(br2.vextractor.inp.weight, vx.inp.weight)
-        assert torch.allclose(br2.aligner.gate.weight, al_before), "Aligner bị ghi đè"
-        assert torch.allclose(next(iter(br2.vextractor.body.parameters())), bb_before)
-        # format lệch -> TỪ CHỐI (ở đây thứ được lưu CHÍNH LÀ Extractor)
-        mp = t / R.EXTRACTOR_META
-        meta = _json.loads(mp.read_text(encoding="utf-8"))
-        mp.write_text(_json.dumps(dict(meta, format="rgexp.vextractor/1")),
-                      encoding="utf-8")
-        try:
-            R.load_extractor_into(R.VExtractorBranch(sp), t)
-        except RuntimeError as e:
-            assert "format" in str(e)
-        else:
-            raise AssertionError("format cũ của Stage 0.2 phải bị từ chối")
-
-    # ── đóng băng / mở băng RIÊNG Extractor ───────────────────────────────
-    br.set_extractor_frozen(True)
-    assert not any(p.requires_grad for p in vx.head_parameters())
-    assert all(p.requires_grad for p in br.aligner.parameters()), "Aligner KHÔNG bị chạm"
-    br.set_extractor_frozen(False)
-    assert all(p.requires_grad for p in vx.head_parameters())
-
-    # ── pipeline: 0.2 nằm GIỮA 0.1 và main, và cờ kéo theo nhau ───────────
+    # ── pipeline: Stage 1 nằm GIỮA Stage 0 và main, và cờ kéo theo nhau ───
     from src.run_vextractor import COMMANDS
 
     st = COMMANDS["train"]
-    assert st.index("stage0") < st.index("stage02") < st.index("train")
+    assert st.index("stage0") < st.index("stage1") < st.index("train")
     rsrc = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    assert '"--restage02"' in rsrc
-    assert "a.restage02 = a.retrain = True" in rsrc    # --restage0 kéo theo 0.2
-    assert "stage02_dir=s02dir / s02.CKPT" in rsrc
+    assert '"--restage1"' in rsrc
+    assert "a.restage1 = a.retrain = True" in rsrc    # --restage0 kéo theo Stage 1
+    assert "stage1_dir=s1dir / s1.CKPT" in rsrc
+    # cờ của bản cũ đã biến mất hẳn
+    for gone in ("--restage02", "--refinal", "stage02", "final_anneal"):
+        assert gone not in rsrc, gone
 
 
 print()

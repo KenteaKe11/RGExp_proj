@@ -28,7 +28,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
    xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
    LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
-   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 16 learner), rồi phần văn bản.
+   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 16 latent), rồi phần văn bản.
    So khối Q với khối Z là câu "decoder có thật sự đọc 16 vector mới không".
    Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
 2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
@@ -37,9 +37,9 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    token vô nghĩa.
 3. [Visual] BA ô trên cùng một ảnh:
    (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
-   ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính 16 High-Q token**:
-   `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> Aligner -> Extractor -> teacher
-   (ViT-B/16) -> I` về TẬN PIXEL của ảnh 448².
+   ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính n_query High-Q token**:
+   `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> Aligner -> Compressor -> Extractor
+   (ConvNeXt-Base) -> I` về TẬN PIXEL của ảnh 448².
 
    **Ô 3 lấy TARGET là khối Q, không phải `y`.** Đó là khác biệt với mọi bản
    trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi tự nhiên là *32
@@ -48,7 +48,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    được — kể cả khi decoder chưa đọc Q chút nào.
 
    Đường truy ngược chạy qua backbone ở đúng chế độ main stage: **teacher
-   (ViT-B/16) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
+   (ConvNeXt-Base) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
    gradient (trọng số vẫn `requires_grad=False`, `eval()` nên không dropout /
    stochastic depth), rồi trả cờ cũ về nguyên trạng.
 
@@ -216,8 +216,8 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     lá của cùng một X" nữa vì hai nhánh vốn đã không chung node nào:
 
       * `sal_z` = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64 (dính decoder);
-      * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính 16 High-Q token, truy ngược
-        qua Aligner -> Extractor -> teacher (ViT-B/16) về TẬN PIXEL của ảnh 448²,
+      * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính n_query High-Q token, truy ngược
+        qua Aligner -> Compressor -> Extractor về TẬN PIXEL của ảnh 448²,
         chuẩn trên 3 kênh. KHÔNG dính decoder. Xem `_q_saliency_map`.
 
     `sal_q_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
@@ -324,7 +324,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     teacher_norm = None
     if branch is not None:
         with RCV.autocast(dev):
-            teacher_tokens = branch.vextractor.patches(
+            teacher_tokens = branch.extractor.patches(
                 batch["vext_pixels"].to(dev))
         teacher_norm = teacher_tokens.float().norm(dim=-1)[0].detach().cpu().numpy()
         gh = gw = int(round(math.sqrt(teacher_norm.size)))
@@ -348,9 +348,9 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
 
 def _q_saliency_map(branch, px, dev):
-    """Bản đồ của 16 High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
+    """Bản đồ của n_query High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
 
-    TARGET là khối Q — đầu ra của cả nhánh (teacher ViT-B/16 -> Extractor ->
+    TARGET là khối Q — đầu ra của cả nhánh (Extractor (teacher) -> Extractor ->
     Aligner) — chứ KHÔNG phải `y` của decoder. Vô hướng được đạo hàm là
     `s = Σ Q²`, nên bản đồ trả lời *16 vector §2.2 thêm vào được dựng từ vùng
     nào của ảnh*, không phải *decoder đòi ảnh ở đâu*. Không dính decoder, không
@@ -453,7 +453,7 @@ def _norm01(a: np.ndarray, pct: float) -> np.ndarray:
     return np.clip((a - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
 
 def _regions(res: dict, n_tok: int) -> list[dict]:
-    """Chuỗi -> BA vùng token rời nhau: Z (ảnh), Q (learner), T (văn bản).
+    """Chuỗi -> BA vùng token rời nhau: Z (ảnh), Q (latent), T (văn bản).
 
     T là PHẦN BÙ, không phải "đuôi": trong chuỗi của Gemma 3 có văn bản ở CẢ
     HAI phía — BOS + system prompt nằm TRƯỚC 256 token ảnh, câu hỏi + báo cáo
@@ -474,7 +474,7 @@ def _regions(res: dict, n_tok: int) -> list[dict]:
     out = [{"key": "z", "label": "Z · token ảnh", "color": "#2a78d6",
             "rows": z, "cuts": [], "base": None}]
     if q:
-        out.append({"key": "q", "label": "Q · learner", "color": "#e8a317",
+        out.append({"key": "q", "label": "Q · latent", "color": "#e8a317",
                     "rows": q, "cuts": [], "base": int(ins[0])})
     out.append({"key": "t", "label": "T · văn bản", "color": "#7a7a7a",
                 "rows": t, "cuts": cuts, "base": None})
@@ -487,7 +487,7 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> dict:
 
     **Vì sao ba ô, và vì sao ba thang màu.** Bản đầu vẽ cả chuỗi lên một
     heatmap với MỘT `vmax` lấy ở phân vị 99 của toàn ma trận. Phần văn bản nhạy
-    hơn phần thị giác hàng bậc nên nó định `vmax`, và dải learner nằm ở đáy
+    hơn phần thị giác hàng bậc nên nó định `vmax`, và dải latent nằm ở đáy
     thang ấy → ra **đen tuyền**. Đọc hình đó, kết luận tự nhiên là *"decoder
     không đọc Q"* — trong khi cái thật sự xảy ra chỉ là một phép chuẩn hoá màu.
     Tức là hình trả lời SAI đúng câu hỏi nó sinh ra để trả lời.
@@ -537,7 +537,7 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> dict:
         ax.set_xlabel("lớp decoder (chỉ số thật)", fontsize=8)
 
         # Nhãn Y = chỉ số token THẬT. Vùng nhỏ (Q) đánh dấu TỪNG token và ghi
-        # kèm Q[k] — mỗi learner là một thứ đáng đọc từng cái một.
+        # kèm Q[k] — mỗi latent là một thứ đáng đọc từng cái một.
         if n <= 48:
             yt = list(range(n))
             ylab = [(f"{rows[k]} · Q[{rows[k] - reg['base']}]" if reg["base"] is not None
@@ -582,14 +582,14 @@ def plot_layers(res: dict, path: Path, cfg_l: dict) -> dict:
 
 
 def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
-    """BỐN ô trên MỘT dải ngang — ảnh gốc · Z · khối Q · đầu ra DINOv3.
+    """BỐN ô trên MỘT dải ngang — ảnh gốc · Z · khối Q · đầu ra Extractor.
 
     1. **ảnh gốc** — mốc để đọc ba ô còn lại.
     2. **Z**: ‖∂y/∂X‖ theo đường `y → Z → adapter → vision encoder` — đường CŨ,
        đo xem decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Dừng ở
        ĐẦU RA encoder, lưới 64².
     3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
-       token, truy ngược `Q → Aligner → Extractor → teacher (ViT-B/16) → I` về
+       token, truy ngược `Q → Aligner → Compressor → Extractor → I` về
        tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
     4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (28×28 ở cấu hình hiện
        tại) — backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó.
@@ -600,7 +600,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     ở đó, KHÔNG nghĩa là đổi vùng ấy thì Q đổi theo. Đừng đọc ô 4 như ô 3.
 
     Cặp đáng đọc nhất là **ô 4 so ô 3**: backbone mã hoá cả ảnh, còn Extractor
-    chỉ hỏi một phần — chênh lệch giữa hai ô là *phần backbone có mà learner
+    chỉ hỏi một phần — chênh lệch giữa hai ô là *phần backbone có mà latent
     không lấy*. Cặp **ô 2 so ô 3** trả lời câu khác: "Q được dựng từ đúng vùng
     decoder vốn đã đòi qua Z không".
 
@@ -627,9 +627,9 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     cmap = plt.get_cmap(cfg_l["cmap"])
     panels = [("Z · GRADIENT\ny → Z → adapter → vision encoder (X)\n"
                "lưới 64², DỪNG ở đầu ra encoder", res.get("sal_z")),
-              ("khối Q · GRADIENT\n‖∂‖Q‖²/∂I‖ · Q → Aligner → Extractor\n"
-               "→ teacher ViT-B/16 → ảnh 448²", res.get("sal_q")),
-              ("đầu ra DINOv3 · ĐỘ LỚN\n‖feature‖₂ lưới teacher — KHÔNG phải gradient\n"
+              ("khối Q · GRADIENT\n‖∂‖Q‖²/∂I‖ · Q → Aligner → Compressor\n"
+               "→ Extractor (teacher) → ảnh 448²", res.get("sal_q")),
+              ("đầu ra Extractor · ĐỘ LỚN\n‖feature‖₂ lưới teacher — KHÔNG phải gradient\n"
                "backbone mã hoá gì, trước khi bị hỏi",
                res.get("teacher_feature_norm"))]
     panels = [(t, m) for t, m in panels if m is not None]
@@ -749,7 +749,7 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
                                             default=str), encoding="utf-8")
     write_doc(cfg, d, A, B, item, res, tops, figs, out)
     print(f"  ✓ Lens xong sau {out['minutes']} phút · layers 3 ô (Z · Q · T) · "
-          f"visual 4 ô (gốc · Z · khối Q · đầu ra DINOv3) "
+          f"visual 4 ô (gốc · Z · khối Q · đầu ra Extractor) "
           f"-> {d / DOC}", flush=True)
     return out
 
@@ -838,12 +838,12 @@ def reading_guide(out: dict, res: dict) -> list[str]:
     if dg.get("q_token_share") is not None:
         rows.append(["phần độ nhạy nằm trên khối Q",
                      f"{100 * dg['q_token_share']:.1f}%",
-                     "≈0 = decoder bỏ qua khối learner (nhánh chưa nói gì); "
+                     "≈0 = decoder bỏ qua khối latent (nhánh chưa nói gì); "
                      "cao = nó đang đọc Q thật"])
     if qv:
         rows.append([f"số vector Q gánh 50% độ nhạy (trên {qv.get('n')})",
                      str(qv.get("n_active_50pct")),
-                     "nhỏ = chỉ vài learner vector làm việc (cực đoan: một "
+                     "nhỏ = chỉ vài latent vector làm việc (cực đoan: một "
                      "mình `Q[0]` gánh hết), phần còn lại gần như chết; "
                      "≈ một nửa = tải trải đều"])
     qm = dict(dg.get("q_map") or {})
@@ -908,14 +908,14 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           f"{n_layers} lớp**.\n",
           f"**Ba ô trên MỘT dải ngang**: **Z** (256 token ảnh, token "
           f"{out['arm']['image_span'][0]}–{out['arm']['image_span'][1]})"
-          + (f" · **Q** ({ins[1] - ins[0]} learner, token {ins[0]}–{ins[1] - 1}, "
+          + (f" · **Q** ({ins[1] - ins[0]} latent, token {ins[0]}–{ins[1] - 1}, "
              f"đánh dấu từng `Q[k]`)" if ins else " · **Q**")
           + " · **T** (phần văn bản — đây là PHẦN BÙ, ghép từ HAI mảnh không liền "
             "nhau: BOS + system prompt TRƯỚC khối ảnh, câu hỏi + báo cáo SAU khối Q; "
             "chỗ nối có đường đứt và nhãn `↕ nhảy`).\n",
           "**Mỗi ô MỘT thang màu riêng.** Bản đầu vẽ cả chuỗi lên một heatmap với một "
           "`vmax` chung: phần văn bản nhạy hơn phần thị giác hàng bậc nên nó định "
-          "`vmax`, và dải learner ra **đen tuyền**. Đọc hình đó thì kết luận tự nhiên "
+          "`vmax`, và dải latent ra **đen tuyền**. Đọc hình đó thì kết luận tự nhiên "
           "là \"decoder không đọc Q\" — trong khi cái thật sự xảy ra chỉ là một phép "
           "chuẩn hoá màu, tức là hình trả lời SAI đúng câu hỏi nó sinh ra để trả lời.\n",
           "Tách **thang màu** là thứ chữa được cái sụp ấy; tách **file** thì không "
@@ -941,7 +941,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
     if ins:
         q = S[:, ins[0]:ins[1]].sum(axis=0)
         top = np.argsort(-q)[:8]
-        L.append("Tám learner vector được đọc nhiều nhất (tổng trên MỌI lớp):\n")
+        L.append("Tám latent vector được đọc nhiều nhất (tổng trên MỌI lớp):\n")
         L.append("| Q[k] | " + " | ".join(f"`Q[{int(k)}]`" for k in top) + " |")
         L.append("|---|" + "---|" * len(top))
         L.append("| độ nhạy | " + " | ".join(f"{q[int(k)]:.3g}" for k in top) + " |")
@@ -953,7 +953,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "thì đọc năm ô nhạy nhất ở bảng trên và dòng \"phần độ nhạy nằm trên khối Q\" "
           "ở mục Kiểm nhanh.\n",
           "1. **Ô Q có cấu trúc không.** Vài hàng sáng rõ trên nền tối = một nhúm "
-          "learner làm việc, phần còn lại ngồi không (đối chiếu dòng \"số vector Q gánh "
+          "latent làm việc, phần còn lại ngồi không (đối chiếu dòng \"số vector Q gánh "
           "50%\" ở Kiểm nhanh). Sáng đều = 16 vector chia nhau tải. **Phẳng lì và tối "
           "ĐỀU ngay trong thang riêng của nó** — tức là ngay cả khi đã tự chuẩn hoá mà "
           "vẫn không có hàng nào nổi lên — mới là dấu hiệu thật của việc nhánh bị bỏ "
@@ -1002,10 +1002,10 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "cuối, nơi mọi đường đã trộn vào nhau. Câu \"Q có được đọc không\" trả lời ở "
           "ba hình ở mục 1, không phải ở đây.\n"]
 
-    # Số learner đọc TỪ config, không gõ tay: nó đã đổi 32 -> 16 -> 32 qua
+    # Số latent đọc TỪ config, không gõ tay: nó đã đổi 32 -> 16 -> 32 qua
     # ba bố cục, và mỗi lần một con số chép tay ở đây lại tả sai hình.
-    nq = int(cfg["vextractor"]["vextractor"]["n_query"])
-    L.append("## 3. [Visual] Bốn ô — ảnh gốc · Z · khối Q · đầu ra DINOv3\n")
+    nq = int(cfg["vextractor"]["compressor"]["n_query"])
+    L.append("## 3. [Visual] Bốn ô — ảnh gốc · Z · khối Q · đầu ra Extractor\n")
     if figs.get("visual"):
         L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
     L += [f"Cả ba bản đồ chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi "
@@ -1017,7 +1017,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
           "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
           f"| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính {nq} High-Q token**, truy ngược "
-          "`Q → Aligner → Extractor → teacher (ViT-B/16) → I` · lưới 448² | "
+          "`Q → Aligner → Compressor → Extractor → I` · lưới 448² | "
           f"{nq} vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
           "| 4 | **ĐỘ LỚN** `‖feature‖₂` của lưới teacher · lưới 28² | "
           "backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó |",
@@ -1028,7 +1028,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đại lượng.\n",
           "**Cặp đáng đọc nhất là ô 4 so ô 3.** Backbone mã hoá cả ảnh, còn "
           "Extractor chỉ hỏi một phần: chênh lệch giữa hai ô chính là *phần "
-          f"backbone có mà {nq} learner không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
+          f"backbone có mà {nq} latent không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
           "thông tin bị bỏ lại; trùng khít = Extractor lấy gần hết những gì "
           "backbone nhấn mạnh.\n",
           "**Ô 3 lấy target là khối Q, KHÔNG phải `y`**, và đó là chủ ý: "
@@ -1039,7 +1039,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "
           "khối Q\" ở mục Kiểm nhanh, hoặc ba hình ở mục 1.\n",
           "**Đường truy ngược chạy ở đúng chế độ main stage: teacher "
-          "(ViT-B/16) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
+          "(ConvNeXt-Base) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
           "thị gradient — `requires_grad` của mọi tham số vẫn bị ép về False, "
           "`eval()` giữ nó không dropout / stochastic depth, và cờ cũ được trả "
           "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",

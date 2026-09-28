@@ -309,250 +309,273 @@ labels:
   blank_policy: ignore
   max_missing_frac: 0.20
 
-# ── Kiến trúc (`src/vextractor.py`) ─────────────────────────────────────────
-# Nhánh có ENCODER RIÊNG: DINOv3 ViT-B/16, ăn thẳng ảnh gốc resize 448×448 ->
-# 789 token (5 prefix: 1 cls + 4 register) × 768; bỏ prefix còn lưới 784 ô ×
-# 768 (stride 16). Lưới ấy KHÔNG phải khối Q: `n_query` learner vector đi HỎI
-# nó qua Cross-attn.
+# ═════════════════════════════════════════════════════════════════════════════
+# NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
+# ═════════════════════════════════════════════════════════════════════════════
 #
-#   KHỐI CAM (backbone) — Stage 0 TỰ GIÁM SÁT dạy (lưu ra TEACHER/EMA);
-#   main stage chạy nó ở chế độ TEACHER INFERENCE, đóng băng hoàn toàn.
-#   KHỐI VÀNG (Extractor + Aligner) — KHÔNG có ở Stage 0, học ở MAIN STAGE:
+#   ảnh 448² ─► 1. EXTRACTOR  ConvNeXt-Base (DINOv3), cắt sau Stage 3
+#                             (B,3,448,448) -> (B,512,28,28) -> V (B,784,512)
+#            ─► 2. COMPRESSOR QFormer, 32 latent @1024, N = 2 nhóm khối
+#                             -> V_c (B,32,1024)
+#            ─► 3. ALIGNER    RMSNorm(1024) + SwiGLU 1024→4096→2560
+#                             -> Q (B,32,2560)
 #
-#     (789, 768) ─► bỏ 5 prefix ─► Flatten + Permute ─► 784 ô
-#           │
-#     784 ô ─► Linear 768→2048 ─► RMSNorm(2048) ───────────────────┐
-#     16 learner ─┬─► RMSNorm(2048) ─► Self-attn ─► (+) ◄── skip ──┤(từ learner)
-#                 │                                  │             │
-#                 │                           RMSNorm(2048)        │
-#                 │                                  │             │
-#                 │                      SwiGLU 2048→3072→2048     │
-#                 │                                  │             │
-#                 │                                 (+) ◄─ skip ─┐ │  (quanh MLP)
-#                 │                                  │           │ │
-#                 │                           RMSNorm(2048)      │ │
-#                 │                                  │           │ │
-#                 │                            Cross-attn ◄──────┼─┘
-#                 └────────── skip ──────────────► (+) ─► Q_raw (16, 2048)
-#                                                     │
-#                                             RMSNorm(2048)        [Aligner]
-#                                                     │
-#                             SwiGLU 2048→4096→2560 ─► Q (16, 2560)
+#   [Z ‖ Q ‖ T] ─► Gemma decoder (QLoRA r32) ─► CE
 #
-# BA residual: hai cái NGOÀI CÙNG đều từ `learner` — đúng hai mũi tên đi thẳng
-# từ khối "16 Learners" trong sơ đồ — còn cái ở GIỮA vòng quanh riêng MLP.
-# HAI khối SwiGLU, HAI khoá khai riêng: `vextractor.mlp_hidden` (giữa hai
-# attention) và `aligner.mlp_hidden` (FFN sau residual thứ ba).
+# BA khối, BA giai đoạn, mỗi giai đoạn dạy ĐÚNG MỘT khối:
 #
-# `d_branch` 2048 KHÁC `d_model` 2560: thân nhánh chạy ở 2048 và `Aligner` là
-# chỗ DUY NHẤT đổi chiều lên không gian embedding của decoder. `d_model` đọc
-# từ AutoConfig của decoder, `d_branch` khai ở đây, nên đổi base sang decoder
-# khác chiều sẽ lộ ra chứ không lặng lẽ. Stage 0 không dùng cả hai — nó chỉ
-# chạy backbone + một DINO head.
+#   Stage 0  Extractor   DINOv3 finetune (tự giám sát, DINO, EMA, multi-crop)
+#   Stage 1  Compressor  chưng cất từ teacher Stage 0 ĐÓNG BĂNG
+#   main     Aligner + LoRA (từ bước 0), rồi Compressor (sau 20% bước)
 #
-# ⚠ GIÁ CỦA VIỆC CHẠY Ở 2048. Mỗi khối attention là 4 × 2048² = 16,78 M tham số,
-# nên riêng Self + Cross là 33,55 M, MLP giữa chúng 18,87 M, và Aligner 27,27 M.
-# Attention tỉ lệ với d², nên đây là con số đổi nhanh nhất khi `d_branch` đổi.
+# ── 1. EXTRACTOR ─────────────────────────────────────────────────────────────
+# `convnext_base.dinov3_lvd1689m` là CHECKPOINT DINOv3 THẬT của Facebook cho họ
+# ConvNeXt (họ phát hành ViT-S/S+/B/L/H+/7B và ConvNeXt-T/S/B/L — KHÔNG có Swin).
+# Stage 0 vì thế là ĐÚNG nghĩa "chạy tiếp": cùng họ trọng số, cùng hàm mục tiêu,
+# chỉ đổi miền ảnh từ web sang CXR.
 #
-# Trọng số nền LÀ DINOv3 thật: `vit_base_patch16_dinov3.lvd1689m` là một trong
-# các checkpoint Facebook phát hành cho DINOv3 (ViT-S/S+/B/L/H+/7B và
-# ConvNeXt-T/S/B/L — không có Swin, nên "DINOv3-SwinV2" là tên của một thứ
-# không tồn tại). Stage 0 vì thế là ĐÚNG nghĩa "chạy tiếp": cùng họ trọng số,
-# cùng hàm mục tiêu, chỉ đổi miền ảnh từ web sang CXR.
+# `n_stages: 3` — dừng ở stride 16 / 512 kênh. Stage 4 (1024 kênh, stride 32)
+# biến mất hẳn: 27,4 M tham số khỏi state_dict, khỏi VRAM, khỏi optimizer; đổi
+# lại lưới mịn gấp 4× (28×28 = 784 ô thay vì 14×14 ở 448²). Mất tầng ngữ nghĩa
+# cao nhất, được độ phân giải không gian mà Cross-attn và Lens dùng trực tiếp.
 #
-# ⚠ 5 PREFIX TOKEN, không phải 1. DINOv3 ViT mang 1 cls + 4 REGISTER token.
-# `patches()` bỏ đúng `num_prefix_tokens` HỎI TỪ MODEL, không gõ tay 1 — bỏ
-# nhầm 1 thì 4 register lọt vào lưới và Cross-attn đọc chúng như ô ảnh.
+# ⚠ Ở 448² lưới là 28×28 = 784 ô, KHÔNG phải 14×14. ConvNeXt có stem stride 4
+# rồi ba lần stride 2; 14×14 chỉ xảy ra ở ảnh 224² hoặc ở Stage 4. `n_patch`
+# đến từ MỘT lượt forward THẬT (`vextractor.backbone_body`), không từ một công
+# thức gõ tay, nên nó không thể lệch với model.
 #
-# Aligner là RMSNorm(2048) + SwiGLU 2048→4096→2560, đứng sau residual thứ BA,
-# không attn/residual nào thêm. Nó vừa trộn lại 16 vector sau khi chúng đã đọc
-# xong ảnh, vừa là chỗ DUY NHẤT đưa nhánh lên chiều embedding của decoder.
-#
-# `aligner.mlp_hidden` 4096 NỞ RA so với `d_branch` 2048 — cùng hướng với FFN
-# của decoder (Gemma 3: 2560 → 10240), y như khối SwiGLU giữa hai attention
-# (3072 quanh 2048). Muốn một nút THẮT thì đặt nó nhỏ hơn 2048 — cả hai đều
-# chạy, nhưng hỏi hai câu khác nhau.
-#
-# RMSNorm ở đầu Aligner là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN,
-# và một cổng nhân ăn đầu vào nhỏ thì BÌNH PHƯƠNG cái nhỏ ấy. Q_raw tới với RMS
-# ~0,1 (learner khởi tạo 0,02, residual do nó chi phối). Đo trên chính khối
-# này khi BỎ RMSNorm: RMS(Q) ở bước 0 rơi xuống 1,07e-4, và trên
-# model đồ chơi của selftest nó underflow HẲN về 0 (bản đồ saliency của Lens
-# thành ma trận không). Vì cùng lý do, ba ma trận này init `1/√fan_in` và
-# `_init` PHẢI bỏ qua chúng — đè normal(0, 0.02) lên là quay lại đúng ca ấy.
+# ConvNeXt thuần tích chập: không pos-embed để nội suy, không cửa sổ để đệm,
+# không BatchNorm nào mang thống kê chạy. MỘT state_dict chạy cả 448² (global)
+# lẫn 224² (local crop của Stage 0). Và nó KHÔNG có cls token -> `stage0.dino.
+# pool` bắt buộc `mean`, `cls` bị TỪ CHỐI ngay lúc dựng backbone.
 #
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
-vextractor:
-  vextractor:               # backbone + Extractor: ảnh (3,448,448) -> Q_raw (16, 2048)
-    image_size: 448         # stride 16. 448/16 = 28 -> 784 ô (+ 5 prefix bị bỏ)
-    # timm; lần chạy đầu tải ~340 MB. DINOv3 ViT-B/16: 85,6 M tham số / 12
-    # block, d = 768, 5 prefix token (1 cls + 4 register) bị BỎ ở `patches()`,
-    # đầu ra NLC (B, 789, 768).
-    # `lvd1689m` là bộ pretrain TỰ GIÁM SÁT gốc của DINOv3 — Stage 0 ở đây chạy
-    # TIẾP chính hàm mục tiêu ấy trên ảnh CXR.
-    #
-    # Họ ViT nhận nhiều độ phân giải nhờ `dynamic_img_size=True` (nội suy
-    # pos-embed): MỘT state_dict chạy ở 448² (main stage) lẫn 224² (local crop
-    # của Stage 0). `backbone_body` dựng VÀ probe forward thật để chắc điều đó.
-    arch: vit_base_patch16_dinov3.lvd1689m
-    pretrained: true        # false bị TỪ CHỐI: chưng cất từ backbone ngẫu nhiên là vô nghĩa
-    # Số block ĐẦU được giữ lại; null = DÙNG HẾT (12). Đây là lát cắt của họ
-    # ViT (`.blocks` phẳng) và nó cắt THẬT: block bỏ đi không có trong
-    # state_dict. null = giữ cả 12 block của ViT-B.
-    n_layers: null
-    # Lát cắt của họ PHÂN CẤP (ConvNeXt/SwinV2). ViT KHÔNG có `.stages` nên
-    # PHẢI là null; khai số ở đây sẽ bị TỪ CHỐI.
-    n_stages: null
-    n_query: 16             # số learner = số token Q nối vào chuỗi decoder
-    d_branch: 2048          # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
-    # MỌI attention của nhánh (Self + Cross) chạy ở head_dim CỐ ĐỊNH này; số
-    # head được SUY RA = d_branch // head_dim (2048 // 128 = 16).
-    #
-    # Vì sao khai head_dim chứ không khai n_heads: mỗi lần ai đó sửa
-    # `d_branch`, head_dim sẽ rơi ra một giá trị khác mà không ai để ý —
-    # 2048/16 = 128 nhưng 2560/16 = 160 và 768/16 = 48. Khai cái
-    # BẤT BIẾN, suy ra cái phụ thuộc; `d_branch` không chia hết head_dim thì
-    # DỪNG. Khai `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
-    head_dim: 128
-    # Bề rộng MLP GIỮA Self-attn và Cross-attn (SwiGLU, residual vòng quanh
-    # RIÊNG nó). KHÁC `aligner.mlp_hidden` bên dưới — đó là FFN SAU residual
-    # thứ ba. HAI khối, HAI khoá: đọc nhầm khoá là đổi sai khối.
-    mlp_hidden: 3072        # SwiGLU 2048 -> 3072 -> 2048 (giữa hai attention)
-    dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # FFN sau residual thứ BA; và là chỗ ĐỔI CHIỀU
-    # SwiGLU: down( SiLU(gate(x)) ⊙ up(x) ), bias=False cả ba, init 1/√fan_in.
-    # 4096 > d_branch 2048: NỞ RA ở giữa như FFN của decoder, rồi `down` đưa
-    # thẳng lên d_model 2560. Đây là chỗ DUY NHẤT chiều của nhánh đổi.
-    mlp_hidden: 4096        # SwiGLU 2048 -> 4096 -> 2560
-    dropout: 0.0
-  # ── Main stage ─────────────────────────────────────────────────────────
-  # HAI nhóm tham số học được trong nhánh, hai số phận:
-  #
-  #   * `Aligner` — khối MỚI của main stage, khởi tạo ngẫu nhiên: warm-up
-  #     TUYẾN TÍNH theo BƯỚC 20/200 rồi PHẲNG `align_lr` tới bước cuối;
-  #   * `Extractor` — đến từ Stage 0.2, đã ở một điểm dùng được: ĐÓNG BĂNG
-  #     HOÀN TOÀN `extractor_unfreeze_steps` bước đầu (requires_grad=False,
-  #     cắt hẳn backward dưới Aligner) rồi mở ra ở `extractor_lr` CỐ ĐỊNH.
-  #
-  # Backbone thì KHÔNG BAO GIỜ mở: nó nạp TRỌNG SỐ TEACHER (EMA) của Stage 0.1
-  # và chạy ở chế độ TEACHER INFERENCE (requires_grad=False + eval + no_grad +
-  # KHÔNG nằm trong optimizer) suốt cả main stage. LoRA của decoder vẫn chạy
-  # ĐÚNG lịch one-cycle của $1.
-  main:
-    align_lr: 1.0e-5        # lr CỐ ĐỊNH sau warm-up (RIÊNG Aligner)
-    align_wd: 0.01
-    # Cả Extractor lẫn Aligner khởi tạo NGẪU NHIÊN, kẹp giữa một encoder đã dạy
-    # xong (Stage 0) và một decoder đã dạy xong ($1). Một bước Adam ở lr đầy đủ
-    # trên ma trận ngẫu nhiên là cách chắc nhất để Q lệch khỏi phân phối mà
-    # LoRA đang học cùng lúc. 20 = 10% của 200 bước. 0 = tắt.
-    align_warmup_steps: 20
-    # ĐẦU dốc, cùng quy ước với `stage0.warmup_start_lr`: nội suy trên GIÁ TRỊ
-    # lr nên bước 1 có ĐÚNG 1e-8, không phải align_lr/20.
-    align_warmup_start_lr: 1.0e-8
-    separate_clip: true     # clip_grad_norm_ riêng LoRA / nhánh
-    # Extractor: 0 trong `extractor_unfreeze_steps` bước rồi `extractor_lr`
-    # PHẲNG. KHÔNG warm-up — Aligner cần dốc vì nó ngẫu nhiên, Extractor thì
-    # không, và 3e-6 vốn đã nhỏ hơn align_lr hơn ba lần.
-    #
-    # Vì sao đóng băng 40 bước đầu: ở bước 0, LoRA và Aligner là thứ DUY NHẤT
-    # chưa biết gì. Để cả ba cùng động thì Extractor bị kéo theo nhiễu của hai
-    # khối kia thay vì giữ thứ Stage 0.2 đã dạy. 40 = 20% của 200 bước.
-    # 0 = mở ngay từ bước 1; `extractor_lr: 0` = đóng băng suốt main stage.
-    extractor_lr: 3.0e-6
-    extractor_unfreeze_steps: 40
-
-# ── Stage 0.2: CHUYỂN GIAO — `src/stage02_vextractor.py` ────────────────────
-# Extractor học từ teacher của Stage 0.1, teacher ĐÓNG BĂNG HOÀN TOÀN và sinh
-# nhãn:
 #
-#   view_t ─► backbone(0.1) ─► pool ─► DINO head(0.1) ─────────► t_raw   [ĐỨNG YÊN]
-#   view_s ─► backbone(0.1) ─► Extractor ─► mean(Q) ─► head MỚI ─► s_raw
+# ── 2. COMPRESSOR ────────────────────────────────────────────────────────────
+#   kv = RMSNorm(V)                                   512, MỘT lần, ngoài mọi nhóm
+#   q  = 32 latent @1024
+#   N × [ khối 1:  q += SelfAttn(N(q))
+#                  q += CrossAttn(N(q), kv)           <- chỗ DUY NHẤT đọc V
+#                  q += SwiGLU(N(q))
+#         khối 2:  q += SelfAttn(N(q))
+#                  q += SwiGLU(N(q))                ]
+#
+# 512 -> 1024 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 512, trả
+# 1024). KHÔNG có `Linear 512→1024` đứng trước: một lớp chiếu riêng thêm 0,53 M
+# tham số mà không thêm sức biểu diễn nào (nó chỉ gộp được vào k/v phía sau).
+#
+# `head_dim` là khoá KHAI, `n_heads` được SUY RA (1024 // 128 = 8). Chiều ngược
+# lại — khai n_heads rồi để head_dim rơi ra — là cách head_dim đổi LẶNG LẼ mỗi
+# lần ai đó sửa `d_latent`. Khai cái BẤT BIẾN, suy ra cái phụ thuộc; khai
+# `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
+#
+# Khối 2 KHÔNG có Cross-attn, và đó là chủ ý: nó để 32 vector thống nhất lại
+# với nhau sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp.
+#
+# Tham số MỘT nhóm khối ở 1024 / kv 512 / hidden 2048:
+#   SelfAttn 4×1024² = 4,19 M (×2) · CrossAttn 2×1024² + 2×512×1024 = 3,15 M
+#   SwiGLU 3×1024×2048 = 6,29 M (×2) · 5 × RMSNorm(1024) = 5 120
+#   => 24,12 M mỗi nhóm; N = 2 -> 48,28 M.
+#
+# Chi phí nằm ở `d_latent` (theo d²), KHÔNG ở `n_query`: 32 latent chỉ là 32 768
+# tham số. Đổi `n_query` đụng tới THỜI GIAN và độ dài chuỗi decoder, không tới
+# bảng tham số.
+#
+# ── 3. ALIGNER ───────────────────────────────────────────────────────────────
+# RMSNorm(1024) + MỘT khối SwiGLU 1024→4096→2560 (`down(SiLU(gate(x)) ⊙ up(x))`,
+# bias=False cả ba theo quy ước Gemma 3 / LLaMA, init 1/√fan_in). Không
+# attention, không residual: phần "suy nghĩ" nằm trọn trong Compressor, và đây
+# là chỗ DUY NHẤT nhánh đổi chiều lên không gian embedding của decoder.
+#
+# RMSNorm ở đầu là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN, và một
+# cổng nhân ăn đầu vào nhỏ thì BÌNH PHƯƠNG cái nhỏ ấy. Bỏ nó thì RMS(Q) ở bước
+# 0 rơi xuống ~1e-4, và trên model đồ chơi của selftest nó underflow HẲN về 0
+# (bản đồ saliency của Lens thành ma trận không). Giá: 1024 tham số. Vì cùng lý
+# do, ba ma trận có cổng init `1/√fan_in` và `_init` PHẢI bỏ qua chúng.
+#
+# `mlp_hidden` 4096 > `d_latent` 1024 — NỞ RA, cùng hướng với FFN của decoder
+# (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 1024; cả hai đều
+# chạy, nhưng hỏi hai câu khác nhau.
+#
+# `d_latent` 1024 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
+# `d_latent` khai ở đây, và `build_aligner` nối chúng — nên đổi base sang một
+# decoder khác chiều sẽ lộ ra chứ không lặng lẽ.
+vextractor:
+  extractor:                # ảnh (3,448,448) -> V (784, 512)
+    image_size: 448         # stem/4 rồi 3 × /2 -> stride 16; 448/16 = 28 -> 784 ô
+    # timm; lần chạy đầu tải ~350 MB. ConvNeXt-Base DINOv3, cắt còn 3 stage:
+    # ~60,1 M tham số (đặc tả ghi ~59,39 M — con số ĐO ĐƯỢC là 60,12 M).
+    arch: convnext_base.dinov3_lvd1689m
+    pretrained: true        # false bị TỪ CHỐI: "DINOv3 finetuning" từ trọng số
+                            # ngẫu nhiên chỉ ra một backbone ngẫu nhiên khác
+    # Lát cắt của họ PHẲNG (ViT `.blocks`). ConvNeXt KHÔNG có — phải là null,
+    # khai số ở đây sẽ bị TỪ CHỐI.
+    n_layers: null
+    # Lát cắt của họ PHÂN CẤP (`.stages`). 3 = giữ Stage 1–3 -> 512 kênh.
+    n_stages: 3
+  compressor:               # QFormer: V (784, 512) -> V_c (32, 1024)
+    n_query: 32             # số latent = số token Q nối vào chuỗi decoder
+    d_latent: 1024          # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
+    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 8
+    mlp_hidden: 2048        # SwiGLU 1024 -> 2048 -> 1024 (mỗi khối)
+    n_blocks: 2             # N: số lần lặp (khối 1 -> khối 2)
+    dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
+  aligner:                  # V_c (32, 1024) -> Q (32, 2560)
+    mlp_hidden: 4096        # SwiGLU 1024 -> 4096 -> 2560
+    dropout: 0.0
+
+  # ── Main stage: HAI nhóm, HAI lịch (`src/train_vextractor.py`) ──────────
+  # Mốc khai theo TỈ LỆ tổng số bước, không theo số bước tuyệt đối: main stage
+  # khoá 1 epoch = 200 bước theo $1, nhưng `--dry-run` và mọi lần đổi
+  # `train_batch` đổi con số ấy. Khai "40 bước" thì với một lần chạy 4 bước,
+  # Compressor không bao giờ mở.
+  #
+  #   Aligner     warm-up 1e-6 -> 1e-4 trong 10% bước, rồi PHẲNG.
+  #               HỌC CÙNG LoRA NGAY TỪ BƯỚC 0 — mục tiêu của nó là học cách
+  #               biến tín hiệu đặc trưng thị giác sang không gian ngữ nghĩa,
+  #               và nó không làm được việc ấy nếu bị đóng băng lúc LoRA đang
+  #               định hình.
+  #
+  #   Compressor  ĐÓNG BĂNG HOÀN TOÀN 20% bước đầu, rồi warm-up 1e-8 -> 1e-5
+  #               trong 10% bước, rồi PHẲNG. Mục tiêu của nó ở đây KHÁC Stage 1:
+  #               học cách xử lý đặc trưng đã có THEO tín hiệu từ LoRA →
+  #               Aligner. Tín hiệu ấy chưa tồn tại ở bước 0 (Aligner còn ngẫu
+  #               nhiên, LoRA chưa đi được đâu), nên 20% bước đầu là thời gian
+  #               để nó xuất hiện. `requires_grad=False` chứ không phải lr = 0:
+  #               Compressor là khối học được ĐẦU TIÊN sau Extractor, nên tắt
+  #               grad ở đó cắt hẳn phần backward bên dưới Aligner.
+  #
+  #   Extractor   KHÔNG BAO GIỜ mở. Nó nạp trọng số TEACHER (EMA) của Stage 0 và
+  #               chạy ở chế độ TEACHER INFERENCE (requires_grad=False + eval +
+  #               no_grad + KHÔNG nằm trong optimizer) suốt main stage.
+  #
+  # LoRA của decoder vẫn chạy ĐÚNG lịch one-cycle của $1 (khối `train.schedule`).
+  main:
+    align_lr_min: 1.0e-6      # ĐẦU dốc warm-up của Aligner (bước 0 có ĐÚNG số này)
+    align_lr_main: 1.0e-4     # lr PHẲNG sau warm-up
+    align_warmup_frac: 0.10   # 10% tổng bước (= 20/200)
+    align_wd: 0.01
+    comp_lr_min: 1.0e-8
+    comp_lr_main: 1.0e-5
+    comp_freeze_frac: 0.20    # 20% tổng bước ĐÓNG BĂNG (= 40/200)
+    comp_warmup_frac: 0.10    # rồi 10% tổng bước warm-up (= 20/200)
+    comp_wd: 0.01
+    separate_clip: true       # clip_grad_norm_ riêng LoRA / nhánh
+
+# ── Stage 1: COMPRESSOR TRANSFER LEARNING — `src/stage1_vextractor.py` ───────
+# Compressor học từ teacher của Stage 0, teacher ĐÓNG BĂNG HOÀN TOÀN và sinh
+# nhãn chuẩn DINOv3:
+#
+#   view_t ─► Extractor(0) ─► pool ─► DINO head(0) ───────────► t_raw   [ĐỨNG YÊN]
+#   view_s ─► Extractor(0) ─► Compressor ─► mean(V_c) ─► head MỚI ─► s_raw
 #   loss = CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
 #
-# KHÔNG có EMA ở đây. Ở 0.1 teacher là trung bình trượt của student và cặp
-# EMA + centering giữ DINO khỏi sụp; ở 0.2 teacher là một CHECKPOINT, nên với
-# một ảnh thì đích KHÔNG ĐỔI suốt giai đoạn và không có gì để sụp. Centering và
-# sharpening vẫn giữ, nhưng để định HÌNH DẠNG của đích, không còn để chống sụp.
+# Mục tiêu: LÀM GIÀU không gian Compressor TRƯỚC khi đưa vào Aligner. Ở main
+# stage ba khối cùng động; nếu Compressor còn ngẫu nhiên ở bước 0 thì 200 bước
+# của main stage phải vừa học nén ảnh vừa học viết báo cáo.
+#
+# KHÔNG có EMA ở đây. Ở Stage 0 teacher là trung bình trượt của student và cặp
+# EMA + centering giữ DINO khỏi sụp; ở Stage 1 teacher là một CHECKPOINT, nên
+# với một ảnh thì đích KHÔNG ĐỔI suốt giai đoạn và không có gì để sụp. Centering
+# và sharpening vẫn giữ, nhưng để định HÌNH DẠNG của đích.
 #
 # HAI view, và đúng hai: teacher một global 448², student một global 448² KHÁC
-# (augment khác). Multi-crop của 0.1 vô nghĩa ở đây — teacher đứng yên nên thêm
-# view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô nên local
-# crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới 196 ô.
+# (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên nên
+# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô nên
+# local crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới 196 ô.
 #
-# MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN
-# của `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức
-# khác nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
-stage02:
-  lr: 1.0e-4              # Extractor + head mới. Lớn hơn 0.1 vì cả hai đều MỚI
-  weight_decay: 0.03
-  warmup_steps: 100       # warm-up TUYẾN TÍNH theo bước rồi PHẲNG, không anneal
-  warmup_start_lr: 1.0e-8
+# MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN của
+# `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức khác
+# nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
+#
+# HAI nhóm lr, cùng lịch chung 25/50/25 nhưng hai bộ ba số. Ma trận attention
+# quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
+# bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
+# lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
+# `latent` + mọi RMSNorm + DINO head mới đi theo nhóm FFN (xem
+# `vextractor.Compressor.ffn_parameters`).
+stage1:
+  attn_lr_min: 1.0e-8
+  attn_lr_max: 7.0e-5
+  attn_lr_main: 1.0e-5
+  ffn_lr_min: 1.0e-7
+  ffn_lr_max: 1.0e-4
+  ffn_lr_main: 3.0e-5
+  sched_epochs: 20        # lịch 25/50/25 TRẢI trên ngần này epoch
   max_epochs: 20          # TRẦN, không phải số epoch sẽ chạy — patience quyết
-  patience: 3             # epoch LIÊN TIẾP val không cải thiện thì dừng
+  patience: 2             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
+  tail_epochs: 1          # rồi chạy thêm ngần này epoch cosine về lr_min của
+                          # TỪNG nhóm, RỒI MỚI lấy best val
   min_delta: 0.0
-  batch_size: 32          # batch hiệu dụng (= micro × accum)
-  micro_batch: 16         # khởi điểm; PHẢI là ước của batch_size
-  probe_sizes: [4, 8, 16]
+  weight_decay: 0.03
+  # batch HIỆU DỤNG (của riêng Stage 1). `micro_batch` / `probe_sizes` là khoá
+  # PHẦN CỨNG và nằm ở configs/gpu/<card>.yaml — khai chúng ở đây thì bị config
+  # GPU đè im lặng, nên `load_config` DỪNG.
+  batch_size: 32
   max_grad_norm: 1.0
   val_n_samples: 256      # val CỐ ĐỊNH (val_resample: false) -> đường val chỉ
   val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
 
-# ── Stage 0.1: TỰ GIÁM SÁT (DINO) — `src/stage0_vextractor.py`, `src/dino.py` ──
+# ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
 # KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
-# huấn luyện là backbone DINOv3 ViT-B/16, bằng chính hàm mục tiêu nó được sinh
-# ra với.
-#
-# MỌI siêu tham số dưới đây GIỮ NGUYÊN qua các lần đổi họ backbone — τ_s/τ_t,
-# centering, lịch EMA, số prototype, multi-crop, lr, warm-up, weight decay, và
-# CẢ `pool`. Đổi họ backbone mà đổi luôn siêu tham số thì không còn nói được
-# hiệu số đến từ đâu.
-# Thứ được LƯU RA base//final/ là **teacher** (EMA), không phải student: teacher
-# mượt hơn, không mang nhiễu của bước Adam cuối, và chính nó là nhánh sinh mục
-# tiêu trong DINO — main stage vì thế chạy đúng chế độ teacher inference.
+# huấn luyện là Extractor (ConvNeXt-Base, trọng số DINOv3), bằng chính hàm mục
+# tiêu nó được sinh ra với.
 #
 #   student(view) ─► DINO head ─┐
 #                                ├─ CE( softmax((t − center)/τ_t) ‖ log_softmax(s/τ_s) )
 #   teacher = EMA(student) ─────┘   teacher CHỈ thấy 2 global; student thấy tất cả
 #
-# 1 epoch warm-up + TỐI ĐA 50 epoch, dừng sớm theo `patience`. MỘT lr cho cả
-# hai nhóm (backbone · DINO head), PHẲNG sau warm-up.
+# "Load lại training state của pretrain rồi finetune tiếp": checkpoint DINOv3
+# công bố chỉ có TRỌNG SỐ — không optimizer, không center, không teacher EMA
+# riêng. Nên ở đây nó nghĩa là nạp trọng số ấy vào CẢ student lẫn teacher, dựng
+# DINO head / optimizer / center mới, rồi chạy tiếp DINO trên miền ảnh CXR.
+#
+# Thứ được LƯU RA base//final/ là **teacher** (EMA), không phải student: teacher
+# mượt hơn, không mang nhiễu của bước Adam cuối, và chính nó là nhánh sinh mục
+# tiêu trong DINO — Stage 1 và main stage vì thế chạy Extractor ở đúng chế độ
+# teacher inference.
+#
+# LỊCH CHUNG (`src/schedule.py`), trải trên `sched_epochs` = 50 epoch:
+#   1. warm-up tuyến tính 1e-7 -> 1e-4   25% đầu
+#   2. giữ phẳng 1e-4                     50% kế
+#   3. cosine decay 1e-4 -> 3e-5          25% kế
+#   4. phẳng 3e-5                         phần còn lại
+#
+# DỪNG SỚM và cái ĐUÔI của nó: `patience` = 4 epoch LIÊN TIẾP val không cải
+# thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc, nó chạy THÊM
+# `tail_epochs` epoch "hạ cánh" cosine từ lr ĐANG chạy về `lr_min`, RỒI MỚI lấy
+# checkpoint tốt nhất theo val. Điểm val của epoch đuôi vẫn được đem so với kỷ
+# lục cũ, nên nếu nó tệ hơn thì `best` vẫn là epoch cũ và không mất gì.
+#
+# MỌI siêu tham số DINO dưới đây GIỮ NGUYÊN qua các lần đổi họ backbone — τ_s/
+# τ_t, centering, lịch EMA, số prototype, multi-crop, weight decay, và CẢ `pool`.
+# Đổi họ backbone mà đổi luôn siêu tham số thì không còn nói được hiệu số đến từ
+# đâu.
 stage0:
-  lr: 1.0e-5                # lr của CẢ HAI nhóm, PHẲNG sau warm-up
-  backbone_lr: null         # null = lấy theo `lr`. Khai số chỉ khi muốn tách backbone ra
-  # ── epoch 1: "warmup" ──────────────────────────────────────────────────
-  # CẢ HAI nhóm ramp TUYẾN TÍNH THEO BƯỚC từ `warmup_start_lr` (1e-8) lên `lr`
-  # trong `warmup_epochs` epoch (1.0 epoch = 200/200 bước).
-  warmup_epochs: 1.0
-  # ĐẦU dốc warm-up. Không phải 0: một bước Adam ở lr = 0 chỉ nạp moment chứ
-  # không cập nhật gì. 1e-8 nhỏ hơn 1e-5 ba bậc nên bước đầu vẫn vô hại.
-  warmup_start_lr: 1.0e-8
+  # Ba đỉnh của lịch chung. KHAI CẢ BA: đoán một cái từ hai cái kia là đưa một
+  # hằng số vào giữa một lịch mà người chạy tin là mình đã khai đủ.
+  lr_min: 1.0e-7            # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này) và ĐÁY của đuôi
+  lr_max: 1.0e-4            # ĐỈNH, giữ phẳng 50% lịch
+  lr_main: 3.0e-5           # mức chạy sau cosine decay
+  sched_epochs: 50          # lịch 25/50/25 TRẢI trên ngần này epoch
+  max_epochs: 50            # TRẦN thật sự; = sched_epochs nên chặng 4 rỗng
   weight_decay: 0.03
-  # ── epoch 2..51: "base", lr phẳng ──────────────────────────────────────
-  # `max_epochs` là TRẦN: base tối đa = ceil(warmup_epochs) + max_epochs = 51
-  max_epochs: 50
   # ── dừng sớm ───────────────────────────────────────────────────────────
   # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`
-  # (= −loss DINO trên val cố định) không vượt kỷ lục quá `min_delta` thì DỪNG.
-  # 0 = tắt (chạy đủ `max_epochs`).
-  patience: 5
+  # (= −loss DINO trên val cố định) không vượt kỷ lục quá `min_delta` thì DỪNG
+  # phần theo lịch. 0 = tắt (chạy đủ `max_epochs`, không có đuôi).
+  patience: 4
+  tail_epochs: 1            # epoch cosine về lr_min sau khi patience hết
   min_delta: 0.0
-  # Checkpoint đem sang main stage = epoch TỐT NHẤT theo val. `patience` +
+  # Checkpoint đem sang Stage 1 = epoch TỐT NHẤT theo val. `patience` +
   # `select: last` bị TỪ CHỐI: dừng vì val hết cải thiện rồi lại lấy đúng epoch
   # cuối của cửa sổ chờ là tự phủ định chính nó.
   select: best
-  # ── epoch anneal: TẮT ──────────────────────────────────────────────────
-  final_anneal:
-    enabled: false
-    epochs: 1
-    lr_start: null          # null = `stage0.lr`
-    lr_end: 1.0e-7
-    schedule: cosine
-    weight_decay: 0.03
-    reset_optimizer: false
   # Batch hiệu dụng RIÊNG của Stage 0. LƯU Ý: multi-crop nhân số lượt forward
   # lên (2 + n_local) lần cho student, cộng 2 lượt no_grad cho teacher — mảnh
   # vật lý ở `configs/gpu/<card>.yaml` chỉ là khởi điểm, autobatch dò lại.
+  # `micro_batch` / `probe_sizes` là khoá PHẦN CỨNG -> configs/gpu/<card>.yaml.
   batch_size: 32
   max_grad_norm: 1.0
   val_n_samples: 256        # 256 mẫu bốc từ hồ val 2000 (0 = cả hồ)
@@ -563,9 +586,8 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # 224/16 = 14 -> 196 ô. ViT nhận cỡ này nhờ
-                            # `dynamic_img_size` (nội suy pos-embed); backbone
-                            # chỉ nhận MỘT cỡ -> đặt n_local 0
+    local_size: 224         # ConvNeXt nuốt cỡ này trên ĐÚNG một state_dict
+                            # (thuần tích chập, không pos-embed để nội suy)
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
     # Số prototype. KHÔNG phải 65536 của DINO gốc: tập train ở đây 6400 ảnh, và
@@ -575,13 +597,10 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. ViT-B/16 CÓ cls token, nên `cls` chạy được — và đó là thứ
-    # DINOv3 gốc dùng. Ở đây vẫn để `mean` (trung bình 784 ô của lưới) vì mọi
-    # siêu tham số Stage 0 được giữ nguyên qua các lần đổi backbone; đổi sang
-    # `cls` là một thí nghiệm RIÊNG, và nó nằm trong `backbone_spec` nên sẽ bắt
-    # chạy lại Stage 0. `pool: cls` với backbone KHÔNG có cls (ConvNeXt,
-    # SwinV2) bị TỪ CHỐI ngay lúc dựng, không tự rơi về mean: config nói một
-    # đằng chạy một nẻo là thứ không bao giờ tự lộ ra.
+    # cls | mean. ConvNeXt KHÔNG có cls token -> `mean` (trung bình 784 ô) là
+    # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
+    # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
+    # không bao giờ tự lộ ra.
     pool: mean
     # τ_t PHẢI nhỏ hơn τ_s (sharpening) — đảo dấu bị TỪ CHỐI. Cùng với centering
     # đây là hai lực đẩy ngược nhau giữ DINO khỏi sụp.

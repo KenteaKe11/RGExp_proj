@@ -99,34 +99,37 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = Aligner(Extractor(ViT-B/16-teacher(ảnh 448²))), Z giữ nguyên)"],
+         f"token, Q = Aligner(Compressor(Extractor(ảnh 448²))), Z giữ nguyên)"],
         ["Stage 0", "—", f"backbone TỰ GIÁM SÁT (DINO, KHÔNG nhãn), dùng epoch "
                           f"{s0.get('best_epoch', '?')} ({s0.get('select', 'last')}) "
                           f"— checkpoint là bản TEACHER (EMA)"],
         ["nhánh ở main stage", "—",
          f"backbone = TEACHER (EMA) của Stage 0, chạy TEACHER INFERENCE "
          f"(eval + no_grad, 0 bước học) · "
-         f"Extractor + Aligner MỚI, warm-up {zm.get('align_warmup_steps')} bước "
-         f"từ {zm.get('align_warmup_start_lr')} rồi lr cố định "
-         f"{zm.get('align_lr')} wd {zm.get('align_wd')}"],
+         f"Compressor + Aligner, Aligner warm-up {zm.get('align_warmup_frac')} tổng bước "
+         f"từ {zm.get('align_lr_min')} rồi phẳng {zm.get('align_lr_main')} "
+         f"(wd {zm.get('align_wd')}); Compressor đóng băng "
+         f"{zm.get('comp_freeze_frac')} tổng bước rồi warm-up "
+         f"{zm.get('comp_warmup_frac')} tới {zm.get('comp_lr_main')}"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
 
-    L.append("## Stage 0 — backbone DINOv3 ViT-B/16, TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
+    L.append("## Stage 0 — backbone DINOv3 ConvNeXt-Base, TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
              "checkpoint = TEACHER (EMA)\n")
     if s0.get("history"):
         sc0 = s0.get("stage0", {}) or {}
-        fa0 = sc0.get("final_anneal") or {}
-        ann = (f" + {fa0.get('epochs')} epoch anneal" if fa0.get("enabled")
-               else " · không anneal (lr cố định)")
-        L.append(f"lr {sc0.get('lr')} PHẲNG (warm-up {sc0.get('warmup_epochs')} "
-                 f"epoch; backbone_lr {sc0.get('backbone_lr')}) · wd "
-                 f"{sc0.get('weight_decay')} · chạy "
-                 f"**{s0.get('base_epochs_run', '?')}**/{sc0.get('base_epochs')} epoch"
+        tail = (f" + {sc0.get('tail_epochs')} epoch ĐUÔI cosine về "
+                f"{sc0.get('lr_min')}" if s0.get("ran_tail")
+                else " · không chạy epoch đuôi")
+        L.append(f"lịch chung 25/50/25 trên {sc0.get('sched_epochs')} epoch: "
+                 f"warm-up {sc0.get('lr_min')} → {sc0.get('lr_max')} (25%) · "
+                 f"giữ {sc0.get('lr_max')} (50%) · cosine → {sc0.get('lr_main')} "
+                 f"(25%) · wd {sc0.get('weight_decay')} · chạy "
+                 f"**{s0.get('base_epochs_run', '?')}**/{sc0.get('max_epochs')} epoch"
                  f"{' — DỪNG SỚM' if s0.get('stopped_early') else ''} "
                  f"(patience {sc0.get('patience')}, min_delta {sc0.get('min_delta')})"
-                 f"{ann}"
+                 f"{tail}"
                  f" · epoch dùng: "
                  f"{s0.get('select', 'best')} · val {sc0.get('val_n_samples')} "
                  f"mẫu CỐ ĐỊNH, −loss DINO (KHÔNG nhãn)\n")
@@ -159,7 +162,7 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
          f"{st_b.get('trainable_params', '—'):,}"
          if isinstance(st_b.get("trainable_params"), int) else "—"],
         ["tham số nhánh", "—",
-         f"{((st_b.get('vextractor') or {}).get('n_params') or {}).get('vextractor', '—')} (V-Extractor)"],
+         f"{((st_b.get('vextractor') or {}).get('n_params') or {}).get('total', '—')} (V-Extractor)"],
         ["CE train cuối", _f(st_a.get("ce_last")), _f(st_b.get("ce_last"))],
         ["val CE cuối (256 mẫu)", _f(st_a.get("val_loss_last")), _f(st_b.get("val_loss_last"))],
         ["RMS(Q)/RMS(Z) cuối", "—", _f(st_b.get("q_rms_rel_last"))],
@@ -225,15 +228,17 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và chạy ở chế độ "
              f"TEACHER INFERENCE suốt main stage: 0 bước cập nhật, "
              f"không có gradient nào chạm vào nó. Tham số học được mà A không có "
-             f"nằm TRỌN trong Extractor + Aligner "
-             f"({_lm:,} tham số) ở lr {zm.get('align_lr')} (warm-up "
-             f"{zm.get('align_warmup_steps')} bước đầu) — chênh lệch A/B vì thế "
+             f"nằm TRỌN trong Compressor + Aligner "
+             f"({_lm:,} tham số): Aligner ở lr {zm.get('align_lr_main')} "
+             f"(warm-up {zm.get('align_warmup_frac')} tổng bước), Compressor ở "
+             f"{zm.get('comp_lr_main')} sau {zm.get('comp_freeze_frac')} bước "
+             f"đóng băng — chênh lệch A/B vì thế "
              f"là của một ENCODER CỐ ĐỊNH cộng một khối nén học được, không "
              f"phải của một encoder được finetune cùng decoder."
              if isinstance(_lm, int) else
              f"- Backbone ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
-             f"của nhánh nằm trọn trong Extractor + Aligner, lr "
-             f"{zm.get('align_lr')}.")
+             f"của nhánh nằm trọn trong Compressor + Aligner, lr "
+             f"{zm.get('align_lr_main')}.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")
