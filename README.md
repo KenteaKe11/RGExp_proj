@@ -271,7 +271,7 @@ Stage 0 và Stage 1 dùng **cùng một hàm**. Hai chặng, cộng một hệ s
 1. **warm-up** tuyến tính `lr_min` → `lr_max` — trong `warmup_epochs` (**1**) epoch
 2. **giữ** `lr_max` — **mọi epoch còn lại**
 5. **mỗi epoch val không cải thiện** → chia lr hiện tại cho `plateau_gamma`
-   (**3**), sàn `lr_min`; val cải thiện thì **giữ nguyên** lr
+   (**1,5**), sàn `lr_min`; val cải thiện thì **giữ nguyên** lr
 
 Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**): dốc 200 bước từ 1e-8 lên
 1e-5, rồi giữ 1e-5 cho tới lúc dừng.
@@ -286,11 +286,11 @@ warm-up, **sàn** của chặng 5, và **đáy** của epoch đuôi. Nên đừn
 như "lr nhỏ nhất" — đổi nó là đổi cả ba.
 
 **Chặng 5 là một hệ số NHÂN, không phải một chặng thứ ba trên trục thời gian.**
-Nó chia đường lr trên cho `3^n_decays`, trong đó `n_decays` là **tổng số epoch
-val không cải thiện** từ đầu giai đoạn. Ba tính chất, cả ba đều là lựa chọn có
-hệ quả:
+Nó chia đường lr trên cho `1,5^n_decays`, trong đó `n_decays` là **tổng số
+epoch val không cải thiện** từ đầu giai đoạn. Ba tính chất, cả ba đều là lựa
+chọn có hệ quả:
 
-* **cộng dồn, không reset.** "decay 3 lần lr *hiện tại*" rồi "duy trì lr" nghĩa
+* **cộng dồn, không reset.** "decay lr *hiện tại*" rồi "duy trì lr" nghĩa
   là một lần tụt là tụt hẳn: val khá lên trở lại thì lr đứng yên ở mức đã tụt
   chứ không leo lại. Đường lr vì thế **đơn điệu giảm** kể từ epoch 2.
 * **`patience` và chặng 5 là HAI bộ đếm.** `bad` đếm chuỗi hỏng **liên tiếp**,
@@ -298,15 +298,23 @@ hệ quả:
   **tổng** số epoch hỏng, không bao giờ reset, và quyết định **lr**. Gộp chúng
   là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ. Muốn
   tắt chặng 5 thì đặt `plateau_gamma: 1.0`, **không phải** `patience: 0`.
-* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-5 → 1e-8 là 7 lần), lr sẽ chui
+* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-5 → 1e-8 là **18** lần), lr sẽ chui
   xuống dưới `lr_min`; lúc ấy epoch đuôi — vốn cosine *về* `lr_min` — thành một
   cú **tăng** lr, ngược hẳn với ý của nó.
 
+**Vì sao 1,5 chứ không phải 3.** Hệ số nhỏ chia quãng đường tới sàn thành
+**nhiều nấc**: 1e-5 → 1e-8 là **18** lần chia thay vì 7, nên lr hạ dần theo
+đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại, một chuỗi
+hỏng ngắn gần như không đụng tới lr — với `patience` = 3 (đồng bộ cho cả hai
+giai đoạn) thì tới lúc **dừng** lr mới chỉ còn `1/1,5³ ≈ 30%` mức chạy, so với
+`1/3³ ≈ 3,7%` ở hệ số 3. Chặng 5 vì thế là một cái **phanh mềm**, không phải
+một cái công tắc.
+
 Ví dụ với Stage 0 (`lr_max = 1e-5`, `lr_min = 1e-8`):
 
-| số epoch val hỏng | 0 | 1 | 2 | 3 | 4 | 5 | 6 | ≥ 7 |
+| số epoch val hỏng | 0 | 1 | 2 | 3 | 5 | 8 | 12 | ≥ 18 |
 |---|---|---|---|---|---|---|---|---|
-| lr | 1,0e-5 | 3,3e-6 | 1,1e-6 | 3,7e-7 | 1,2e-7 | 4,1e-8 | 1,4e-8 | 1,0e-8 (sàn) |
+| lr | 1,0e-5 | 6,7e-6 | 4,4e-6 | 3,0e-6 | 1,3e-6 | 3,9e-7 | 7,7e-8 | 1,0e-8 (sàn) |
 
 Stage 1 dùng **một bộ đếm chung cho cả hai nhóm** (attn và ffn), vì val là
 **một** con số — không có cách nào nói nhóm nào làm nó xấu đi, nên tách hai bộ
@@ -337,7 +345,7 @@ xuống, đúng ngược với ý "hạ cánh".
 | lr | `lr_min=1e-8` · `lr_max=1e-5` (warm-up 1 epoch rồi **giữ** `lr_max`) |
 | Epoch | `50` (trần) |
 | Chặng 5 | mỗi epoch val không cải thiện → lr ÷ `3` (sàn `lr_min`), val khá lên thì giữ nguyên |
-| Patience | `5` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
+| Patience | `3` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Điểm xuất phát | Nạp lại trọng số pretrain DINOv3 rồi finetune tiếp |
 
 ```
@@ -680,7 +688,7 @@ configs/vextractor.yaml · configs/gpu/rtx3060.yaml (stage0/stage1 micro_batch +
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → Stage 1 → main B → sinh → chấm) · stats · lens · push
 src/schedule.py          LỊCH DÙNG CHUNG: warmup_flat (dốc 1 epoch rồi GIỮ lr_max) ·
-                         plateau_lr (chặng 5: ÷3 mỗi epoch val hỏng, sàn lr_min) ·
+                         plateau_lr (chặng 5: ÷1,5 mỗi epoch val hỏng, sàn lr_min) ·
                          phase_of/phase_span · tail_lr · frozen_warmup_flat
                          — một chỗ duy nhất viết công thức
 src/vextractor.py        Extractor (ConvNeXt DINOv3, ladder dựng model có probe forward thật,

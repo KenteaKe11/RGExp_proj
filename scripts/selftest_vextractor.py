@@ -1006,13 +1006,14 @@ def _():
     assert (sc["lr_min"], sc["lr_max"]) == (1e-8, 1e-5)
     assert "lr_main" not in sc and "sched_epochs" not in sc
     assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
-    assert sc["patience"] == 5 and sc["tail_epochs"] == 1 and sc["select"] == "best"
+    # patience ĐỒNG BỘ: cả hai giai đoạn cùng chờ 3 epoch.
+    assert sc["patience"] == 3 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
     assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 1e-5)
     assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 1e-4)
     assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 20
-    assert s1c["patience"] == 3
+    assert s1c["patience"] == sc["patience"] == 3
     zc = zcfg(cfg)
     assert set(zc) == set(MAIN_CFG_KEYS)
     assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
@@ -1034,16 +1035,26 @@ def _():
                                                "ffn": s1c["ffn_lr_max"]}
 
     # ── CHẶNG 5: ÷gamma mỗi lần patience tăng, sàn lr_min, KHÔNG leo lại ──
-    assert S.PLATEAU_GAMMA == 3.0
-    assert sc["plateau_gamma"] == s1c["plateau_gamma"] == 3.0
+    G = 1.5
+    assert S.PLATEAU_GAMMA == G
+    assert sc["plateau_gamma"] == s1c["plateau_gamma"] == G
     assert S.plateau_lr(hi, 0, lo) == hi
-    assert abs(S.plateau_lr(hi, 1, lo) - hi / 3) < 1e-20
-    assert abs(S.plateau_lr(hi, 2, lo) - hi / 9) < 1e-20
+    assert abs(S.plateau_lr(hi, 1, lo) - hi / G) < 1e-20
+    assert abs(S.plateau_lr(hi, 2, lo) - hi / G ** 2) < 1e-20
     # SÀN ở lr_min: không có sàn thì epoch ĐUÔI (cosine *về* lr_min) thành một
-    # cú TĂNG lr, đúng ngược với ý của nó. 1e-5 -> 1e-8 là 7 lần chia.
-    assert S.plateau_lr(hi, 6, lo) > lo and S.plateau_lr(hi, 7, lo) == lo
+    # cú TĂNG lr, đúng ngược với ý của nó. Với gamma 1,5 thì 1e-5 -> 1e-8 là
+    # 18 lần chia (log(1000)/log(1,5) ≈ 17,04), so với 7 lần ở gamma 3 — lr hạ
+    # theo NHIỀU nấc nhỏ thay vì rơi hẳn sau vài epoch hỏng.
+    import math as _m
+    n_floor = _m.ceil(_m.log(hi / lo) / _m.log(G))
+    assert n_floor == 18, n_floor
+    assert S.plateau_lr(hi, n_floor - 1, lo) > lo
+    assert S.plateau_lr(hi, n_floor, lo) == lo
     assert S.plateau_lr(hi, 99, lo) == lo
-    ladder = [S.plateau_lr(hi, k, lo) for k in range(12)]
+    # `patience` = 3: tới lúc dừng lr mới chỉ còn ~30% mức chạy, KHÔNG phải
+    # ~3,7% như gamma 3. Đây là cả điểm của việc hạ hệ số xuống.
+    assert 0.29 < S.plateau_lr(hi, sc["patience"], lo) / hi < 0.30
+    ladder = [S.plateau_lr(hi, k, lo) for k in range(22)]
     assert all(x >= y for x, y in zip(ladder, ladder[1:]))      # ĐƠN ĐIỆU giảm
     # gamma = 1.0 TẮT hẳn chặng 5 — và đó mới là khoá để tắt, KHÔNG phải
     # `patience: 0` (patience chỉ gác việc DỪNG).
@@ -1061,10 +1072,10 @@ def _():
     # bộ đếm (val là MỘT con số), nhưng sàn thì RIÊNG của từng nhóm.
     flat = 5 * spe
     assert s0.sched_lr_at(flat, sc, spe, 0) == sc["lr_max"]
-    assert abs(s0.sched_lr_at(flat, sc, spe, 1) - sc["lr_max"] / 3) < 1e-18
+    assert abs(s0.sched_lr_at(flat, sc, spe, 1) - sc["lr_max"] / G) < 1e-18
     l0, l1 = s1.lrs_at(flat, s1c, spe, 0), s1.lrs_at(flat, s1c, spe, 1)
-    assert abs(l1["attn"] - l0["attn"] / 3) < 1e-18
-    assert abs(l1["ffn"] - l0["ffn"] / 3) < 1e-18
+    assert abs(l1["attn"] - l0["attn"] / G) < 1e-18
+    assert abs(l1["ffn"] - l0["ffn"] / G) < 1e-18
     deep = s1.lrs_at(flat, s1c, spe, 99)
     assert deep["attn"] == s1c["attn_lr_min"] and deep["ffn"] == s1c["ffn_lr_min"]
 

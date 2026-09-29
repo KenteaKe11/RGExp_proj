@@ -28,7 +28,7 @@ Lịch CHUNG của `src/schedule.py` — HAI chặng, cộng một hệ số nh�
 
     1. warm-up tuyến tính `lr_min` (1e-8) -> `lr_max` (1e-5)   1 epoch ĐẦU
     2. GIỮ `lr_max`                                            49 epoch còn lại
-    5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (3),
+    5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (1,5),
        sàn `lr_min`; val cải thiện thì GIỮ NGUYÊN (không leo lại)
 
 Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-8 lên 1e-5, rồi
@@ -45,7 +45,7 @@ hỏng LIÊN TIẾP và reset mỗi lần val khá lên — nó quyết định 
 Gộp chúng là để lr leo lại mỗi lần val khá lên, đúng thứ "duy trì lr" loại bỏ.
 Muốn tắt chặng 5 thì đặt `plateau_gamma: 1.0`, không phải `patience: 0`.
 
-**Dừng sớm, và cái ĐUÔI của nó.** `patience` = 5 epoch LIÊN TIẾP val không cải
+**Dừng sớm, và cái ĐUÔI của nó.** `patience` = 3 epoch LIÊN TIẾP val không cải
 thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc: nó chạy THÊM một
 epoch "hạ cánh", cosine từ lr ĐANG chạy (tức đã gồm mọi lần chia của chặng 5)
 về `lr_min`, rồi MỚI lấy checkpoint tốt nhất theo val. Epoch đuôi ấy cho trọng
@@ -139,7 +139,7 @@ def s0cfg(cfg: Cfg) -> dict:
         "plateau_gamma": float(s.get("plateau_gamma", SCH.PLATEAU_GAMMA)),
         # Epoch "hạ cánh" sau khi patience hết: cosine về lr_min.
         "tail_epochs": int(s.get("tail_epochs", 1)),
-        "patience": int(s.get("patience", 5)),
+        "patience": int(s.get("patience", 3)),
         "min_delta": float(s.get("min_delta", 0.0)),
         "weight_decay": float(s.get("weight_decay", 0.03)),
         "batch_size": int(s.get("batch_size", 32)),
@@ -940,7 +940,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             save_ckpt(d / BASE, ep, ev, phase,
                       {"select": sc["select"],
                        "base_fingerprint": base_fingerprint(cfg)})
-        # CHẶNG 5: "Nếu patient tăng 1, decay 3 lần lr hiện tại. Nếu không thì
+        # CHẶNG 5: "Nếu patient tăng 1, decay lr hiện tại. Nếu không thì
         # duy trì lr." Bộ đếm patience tăng đúng ở những epoch val không cải
         # thiện, nên `n_decays` đi cùng nhịp với nó — chỉ khác ở chỗ nó KHÔNG
         # reset khi val khá lên (lr đã tụt thì giữ nguyên mức đã tụt).

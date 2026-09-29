@@ -36,7 +36,7 @@ một mức cao hơn — ở đây cao hơn **10 lần** (1e-4 so với 1e-5), k
 1,4 lần như bản trước.
 
 **Chặng 5** giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
-chia cho `plateau_gamma` (3), sàn là `lr_min` của từng nhóm, và val khá lên thì
+chia cho `plateau_gamma` (1,5), sàn là `lr_min` của từng nhóm, và val khá lên thì
 GIỮ NGUYÊN mức đã tụt. Một bộ đếm chung cho hai nhóm, vì val là MỘT con số —
 không có cách nào nói nhóm nào làm nó xấu đi.
 

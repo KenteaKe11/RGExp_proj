@@ -513,7 +513,7 @@ stage1:
   # (attn và ffn) chia cho số này, sàn là `lr_min` của từng nhóm. MỘT bộ đếm
   # chung cho hai nhóm, vì val là MỘT con số — không có cách nào nói nhóm nào
   # làm nó xấu đi, nên tách hai bộ đếm là bịa ra một tín hiệu không tồn tại.
-  plateau_gamma: 3.0
+  plateau_gamma: 1.5
   patience: 3             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
   tail_epochs: 1          # rồi chạy thêm ngần này epoch cosine về lr_min của
                           # TỪNG nhóm, RỒI MỚI lấy best val
@@ -549,7 +549,7 @@ stage1:
 # LỊCH CHUNG (`src/schedule.py`) — HAI chặng, cộng một hệ số nhân:
 #   1. warm-up tuyến tính 1e-8 -> 1e-5   `warmup_epochs` (1) epoch ĐẦU (200 bước)
 #   2. GIỮ 1e-5                          49 EPOCH CÒN LẠI
-#   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (3),
+#   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (1,5),
 #                                           sàn `lr_min`; val cải thiện thì
 #                                           GIỮ NGUYÊN (không leo lại)
 #
@@ -560,7 +560,7 @@ stage1:
 #
 # ⚠ `warmup_epochs` KHÔNG phải độ dài giai đoạn — đó là `max_epochs`.
 #
-# DỪNG SỚM và cái ĐUÔI của nó: `patience` = 4 epoch LIÊN TIẾP val không cải
+# DỪNG SỚM và cái ĐUÔI của nó: `patience` = 3 epoch LIÊN TIẾP val không cải
 # thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc, nó chạy THÊM
 # `tail_epochs` epoch "hạ cánh" cosine từ lr ĐANG chạy về `lr_min`, RỒI MỚI lấy
 # checkpoint tốt nhất theo val. Điểm val của epoch đuôi vẫn được đem so với kỷ
@@ -579,7 +579,7 @@ stage0:
   lr_max: 1.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
   warmup_epochs: 1.0        # độ dài dốc warm-up (epoch). Xem chú thích trên.
   max_epochs: 50            # TRẦN thật sự của giai đoạn
-  # CHẶNG 5 — "Nếu patient tăng 1, decay 3 lần lr hiện tại. Nếu không thì duy
+  # CHẶNG 5 — "Nếu patient tăng 1, decay lr hiện tại. Nếu không thì duy
   # trì lr." Mỗi epoch val không cải thiện thì lr HIỆN TẠI bị chia cho số này,
   # kẹp sàn ở `lr_min`. Val khá lên thì lr GIỮ NGUYÊN mức đã tụt — không leo
   # lại, nên đường lr đơn điệu giảm sau epoch đầu.
@@ -589,15 +589,22 @@ stage0:
   # đếm TỔNG số epoch hỏng và không bao giờ reset (nó quyết định LR). Gộp chúng
   # là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ.
   #
+  # 1,5 là một bước NHỎ, và đó là chủ ý: nó chia quãng đường tới sàn thành
+  # NHIỀU nấc (1e-5 -> 1e-8 là 18 lần chia, thay vì 7 lần ở hệ số 3), nên lr hạ
+  # dần theo đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại,
+  # một chuỗi hỏng ngắn gần như không đụng tới lr — với `patience` = 3 thì tới
+  # lúc dừng lr mới chỉ còn 1/1,5³ ≈ 30% mức chạy (hệ số 3 cho 3,7%).
+  #
   # 1.0 = TẮT chặng 5. Đây mới là khoá để tắt nó, KHÔNG phải `patience: 0`
   # (patience chỉ gác việc dừng sớm).
-  plateau_gamma: 3.0
+  plateau_gamma: 1.5
   weight_decay: 0.03
   # ── dừng sớm ───────────────────────────────────────────────────────────
   # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`
   # (= −loss DINO trên val cố định) không vượt kỷ lục quá `min_delta` thì DỪNG
   # phần theo lịch. 0 = tắt (chạy đủ `max_epochs`, không có đuôi).
-  patience: 5
+  # ĐỒNG BỘ với stage1: cả hai giai đoạn cùng chờ 3 epoch.
+  patience: 3
   tail_epochs: 1            # epoch cosine về lr_min sau khi patience hết
   min_delta: 0.0
   # Checkpoint đem sang Stage 1 = epoch TỐT NHẤT theo val. `patience` +

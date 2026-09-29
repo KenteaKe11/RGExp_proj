@@ -12,7 +12,7 @@ Hai chặng, cộng một hệ số nhân:
     1. warm-up tuyến tính `lr_min` -> `lr_max`   trong `warmup_epochs` (1) epoch
     2. GIỮ `lr_max`                              mọi epoch còn lại
     5. mỗi epoch val KHÔNG cải thiện             -> lr hiện tại ÷ `plateau_gamma`
-                                                    (3), sàn `lr_min`
+                                                    (1,5), sàn `lr_min`
 
 Chặng 1 + 2 là `warmup_flat`; chặng 5 là `plateau_lr` nhân lên trên nó. Không
 có chặng "cosine về lr_main" nào trong lịch chung: **`lr_max` là mức chạy**, và
@@ -34,7 +34,7 @@ batch_size là đổi luôn lr của bước đầu, lặng lẽ.
 **tổng số epoch val không cải thiện** từ đầu giai đoạn. Ba tính chất của nó
 đáng nói ra, vì cả ba đều là lựa chọn:
 
-  * **cộng dồn, không reset.** "decay 3 lần lr HIỆN TẠI" rồi "duy trì lr" nghĩa
+  * **cộng dồn, không reset.** "decay lr HIỆN TẠI" rồi "duy trì lr" nghĩa
     là một lần tụt là tụt hẳn: val cải thiện trở lại thì lr đứng yên ở mức đã
     tụt chứ không leo lại. Nên `n_decays` đếm TỔNG số epoch hỏng, không phải
     chuỗi hỏng liên tiếp hiện hành (thứ mà `patience` đếm);
@@ -85,9 +85,16 @@ from __future__ import annotations
 
 import math
 
-# Chặng 5: "decay 3 lần lr hiện tại" mỗi khi bộ đếm patience tăng 1.
+# Chặng 5: chia lr hiện tại cho ngần này mỗi khi bộ đếm patience tăng 1.
+#
+# 1,5 là một bước NHỎ, và đó là chủ ý: nó chia đôi quãng đường tới sàn thành
+# nhiều nấc (1e-5 -> 1e-8 là 18 lần chia thay vì 7 lần ở hệ số 3), nên lr hạ
+# dần theo đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại,
+# một chuỗi hỏng ngắn gần như không đụng tới lr — với `patience` = 3 thì tới
+# lúc dừng lr mới chỉ còn 1/1,5³ ≈ 30% mức chạy, so với 1/3³ ≈ 3,7%.
+#
 # `1.0` = TẮT chặng 5 (chia cho 1 là không đổi gì).
-PLATEAU_GAMMA = 3.0
+PLATEAU_GAMMA = 1.5
 
 
 def warmup_flat(step: int, n_warmup: int, lr_min: float, lr_top: float) -> float:
@@ -133,8 +140,8 @@ def plateau_lr(lr: float, n_decays: int, lr_min: float,
     """Chặng 5 — `lr / gamma**n_decays`, kẹp sàn ở `lr_min`.
 
         n_decays = 0  ->  lr                (val vừa cải thiện, hoặc chưa hỏng lần nào)
-        n_decays = 1  ->  lr / 3
-        n_decays = k  ->  lr / 3**k         (không bao giờ dưới lr_min)
+        n_decays = 1  ->  lr / 1,5
+        n_decays = k  ->  lr / 1,5**k       (không bao giờ dưới lr_min)
 
     `n_decays` là **tổng** số epoch val không cải thiện từ đầu giai đoạn —
     KHÁC bộ đếm `patience`, vốn reset mỗi lần val khá lên. Một lần tụt là tụt
