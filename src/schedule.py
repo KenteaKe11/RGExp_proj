@@ -5,55 +5,66 @@ giai đoạn tự cài: lịch ở đây là hàm THUẦN của số bước, n�
 không bao giờ ném lỗi khi lệch nhau — chúng chỉ cho hai đường lr khác nhau, và
 không có gì trong loss báo ra điều đó.
 
-═══ Lịch CHUNG (Stage 0, Stage 1) — `staged_lr` ═══════════════════════════════
+═══ Lịch CHUNG (Stage 0, Stage 1) ═════════════════════════════════════════════
 
-Bốn chặng. Ba chặng đầu gói TRỌN trong `n_sched` bước — mặc định là **ĐÚNG MỘT
-EPOCH** (`sched_epochs: 1`) — còn chặng 4 phủ toàn bộ phần còn lại của giai
-đoạn:
+Hai chặng, cộng một hệ số nhân:
 
-    1. warm-up tuyến tính `lr_min` -> `lr_max`      25% của epoch ĐẦU
-    2. giữ phẳng `lr_max`                           50% kế (vẫn trong epoch đầu)
-    3. cosine decay `lr_max` -> `lr_main`           25% kế (hết epoch đầu)
-    4. phẳng `lr_main`                              MỌI epoch còn lại
+    1. warm-up tuyến tính `lr_min` -> `lr_max`   trong `warmup_epochs` (1) epoch
+    2. GIỮ `lr_max`                              mọi epoch còn lại
+    5. mỗi epoch val KHÔNG cải thiện             -> lr hiện tại ÷ `plateau_gamma`
+                                                    (3), sàn `lr_min`
 
-Với Stage 0 (6400 mẫu, batch 32 -> 200 bước/epoch, trần 50 epoch): warm-up 50
-bước, giữ đỉnh 100 bước, cosine 50 bước — rồi **49 epoch chạy phẳng
-`lr_main`**. Đó là ý của "Fixed `lr_main` (the rest)" trong đặc tả: "the rest"
-là phần còn lại của CẢ GIAI ĐOẠN, không phải một mẩu dư của phép làm tròn.
+Chặng 1 + 2 là `warmup_flat`; chặng 5 là `plateau_lr` nhân lên trên nó. Không
+có chặng "cosine về lr_main" nào trong lịch chung: **`lr_max` là mức chạy**, và
+thứ duy nhất kéo nó xuống là chặng 5 — tức là chính đường val, chứ không phải
+một lịch định trước. Một đường lr do val điều khiển thì không cần đoán trước
+lúc nào nên hạ.
 
-> **`n_sched` là cửa sổ của ba chặng đầu, KHÔNG phải độ dài giai đoạn.** Đọc
-> nhầm nó thành "toàn bộ 50 epoch" cho một đường lr khác hẳn: warm-up kéo 12,5
-> epoch và chặng 4 rỗng. Hai cách đọc đều chạy trót lọt và không có gì trong
-> loss báo ra chỗ khác nhau — nên `sched_epochs` được khai TƯỜNG MINH trong
-> config, và `write_loader` ghi lại mốc bước thật của từng chặng.
-
-Ba siêu tham số KHÁC có đơn vị epoch và KHÔNG đi theo `n_sched`: momentum EMA
-của teacher (cosine trên TOÀN giai đoạn), `teacher_temp_warmup_epochs` và
-`freeze_last_layer_epochs`. Chúng tả hàm mục tiêu DINO chứ không tả lịch lr.
+**Bước 0 có ĐÚNG `lr_min`** (`f = step / w`, không phải `(step+1) / w`).
+"Warm-up tuyến tính TỪ lr_min" đọc đúng nghĩa thì bước đầu tiên phải ở lr_min.
+`lr_min` không phải 0 nên bước Adam đầu tiên vẫn cập nhật thật (và vẫn nhỏ hơn
+nhiễu khởi tạo vài bậc), khác hẳn `lr = 0` vốn chỉ nạp moment.
 
 **Nội suy trên GIÁ TRỊ lr, không nhân hệ số.** `lr_max · f` thì điểm xuất phát
 do SỐ BƯỚC mỗi epoch quyết định chứ không do `lr_min` trong config — đổi
-batch_size là đổi luôn lr của bước đầu, lặng lẽ. Ở đây `f` chỉ nội suy giữa hai
-con số được khai.
+batch_size là đổi luôn lr của bước đầu, lặng lẽ.
 
-**Bước 0 có ĐÚNG `lr_min`** (`f = step / w`, không phải `(step+1) / w`). Đây là
-một lựa chọn, và nó khác quy ước cũ của repo: "warm-up tuyến tính TỪ lr_min"
-đọc đúng nghĩa thì bước đầu tiên phải ở lr_min. `lr_min` không phải 0 nên bước
-Adam đầu tiên vẫn cập nhật thật (và vẫn nhỏ hơn nhiễu khởi tạo vài bậc), khác
-hẳn `lr = 0` vốn chỉ nạp moment.
+**Chặng 5 là một hệ số NHÂN, không phải một chặng thứ ba trên trục thời gian.**
+`plateau_lr` chia đường lr trên cho `gamma**n_decays`, trong đó `n_decays` là
+**tổng số epoch val không cải thiện** từ đầu giai đoạn. Ba tính chất của nó
+đáng nói ra, vì cả ba đều là lựa chọn:
+
+  * **cộng dồn, không reset.** "decay 3 lần lr HIỆN TẠI" rồi "duy trì lr" nghĩa
+    là một lần tụt là tụt hẳn: val cải thiện trở lại thì lr đứng yên ở mức đã
+    tụt chứ không leo lại. Nên `n_decays` đếm TỔNG số epoch hỏng, không phải
+    chuỗi hỏng liên tiếp hiện hành (thứ mà `patience` đếm);
+  * **`patience` chỉ gác việc DỪNG, không gác việc decay.** Hai bộ đếm khác
+    nhau: `bad` reset mỗi lần val khá lên và quyết định lúc nào dừng sớm;
+    `n_decays` không bao giờ reset và quyết định lr. Muốn TẮT chặng 5 thì đặt
+    `plateau_gamma: 1.0` — đó là khoá thật, không phải `patience: 0`;
+  * **sàn ở `lr_min`.** Sau đủ nhiều lần chia, lr sẽ chui xuống dưới `lr_min`;
+    lúc ấy epoch ĐUÔI (cosine *về* `lr_min`) sẽ thành một cú TĂNG lr, đúng
+    ngược với ý của nó. Kẹp sàn ở `lr_min` giữ hai cơ chế nói cùng một ngôn
+    ngữ.
+
+Ba siêu tham số KHÁC có đơn vị epoch và KHÔNG đi theo `warmup_epochs`: momentum
+EMA của teacher (cosine trên TOÀN giai đoạn), `teacher_temp_warmup_epochs` và
+`freeze_last_layer_epochs`. Chúng tả hàm mục tiêu DINO chứ không tả lịch lr.
 
 ═══ Lịch ĐUÔI sau patience — `tail_lr` ════════════════════════════════════════
 
 Khi `patience` epoch liên tiếp val không cải thiện, giai đoạn KHÔNG dừng ngay:
-nó chạy THÊM một epoch với cosine từ lr hiện hành về `lr_min`, rồi mới lấy
-checkpoint tốt nhất theo val. Epoch ấy là một lần "hạ cánh": nó cho phép trọng
-số rơi vào đáy gần nhất của vùng nó đang ở, và điểm val của nó vẫn được đem so
-với kỷ lục cũ — nên nếu nó tệ hơn thì `best` vẫn là epoch cũ, không mất gì.
+nó chạy THÊM một epoch với cosine từ lr hiện hành (đã gồm mọi lần chia của
+chặng 5) về `lr_min`, rồi mới lấy checkpoint tốt nhất theo val. Epoch ấy là một
+lần "hạ cánh": nó cho phép trọng số rơi vào đáy gần nhất của vùng nó đang ở, và
+điểm val của nó vẫn được đem so với kỷ lục cũ — nên nếu nó tệ hơn thì `best`
+vẫn là epoch cũ, không mất gì.
 
 ═══ Lịch MAIN STAGE — `warmup_flat`, `frozen_warmup_flat` ═════════════════════
 
-Main stage chỉ có 1 epoch (200 bước, khoá theo $1), nên đơn vị là BƯỚC và
-không có chặng "giữ đỉnh" nào: một khối mới chỉ cần dốc lên rồi chạy phẳng.
+Main stage chỉ có 1 epoch (200 bước, khoá theo $1), nên đơn vị là BƯỚC chứ
+không phải epoch, và KHÔNG có chặng 5 (không có đường val nào để nó đọc — val
+của main stage chỉ để nhìn, không chạm vào trọng số).
 
   * `warmup_flat` — Aligner: dốc `lr_min` -> `lr_main` trong `n_warmup` bước
     (10% tổng) rồi PHẲNG. Aligner khởi tạo ngẫu nhiên và học CÙNG LoRA từ bước
@@ -61,97 +72,84 @@ không có chặng "giữ đỉnh" nào: một khối mới chỉ cần dốc l�
   * `frozen_warmup_flat` — Compressor: trả **0** trong `n_freeze` bước đầu
     (20% tổng), rồi dốc `lr_min` -> `lr_main` trong `n_warmup` bước (10%), rồi
     PHẲNG. `0` ở đây là tín hiệu để người gọi đặt `requires_grad=False` —
-    Compressor là khối học được đầu tiên sau backbone nên tắt grad ở đó cắt
+    Compressor là khối học được đầu tiên sau Extractor nên tắt grad ở đó cắt
     hẳn phần backward bên dưới Aligner, tiết kiệm thật chứ không chỉ là không
     cập nhật.
+
+`warmup_flat` phục vụ CẢ HAI chỗ: chặng 1+2 của lịch chung (đơn vị epoch, đỉnh
+là `lr_max`) và dốc của Aligner (đơn vị bước, đỉnh là `lr_main`). Cùng một
+công thức, hai cách khai — và đó là lý do nó chỉ nhận SỐ BƯỚC, để người gọi
+phải tự quy đổi và nói ra mình đang dùng đơn vị nào.
 """
 from __future__ import annotations
 
 import math
 
-# Ba chặng đầu của `staged_lr`, theo tỉ lệ của `n_sched`. Khai ở đây chứ không
-# rải trong ba file gọi: ba bản sao của cùng một bộ số là ba đường lr có thể
-# lệch nhau mà không có exception nào.
-WARMUP_FRAC = 0.25
-HOLD_FRAC = 0.50
-DECAY_FRAC = 0.25
+# Chặng 5: "decay 3 lần lr hiện tại" mỗi khi bộ đếm patience tăng 1.
+# `1.0` = TẮT chặng 5 (chia cho 1 là không đổi gì).
+PLATEAU_GAMMA = 3.0
 
 
-def phase_bounds(n_sched: int, warmup: float = WARMUP_FRAC,
-                 hold: float = HOLD_FRAC, decay: float = DECAY_FRAC) -> dict:
-    """Mốc BƯỚC của bốn chặng. -> {"warmup", "hold", "decay", "n_sched"}.
+def warmup_flat(step: int, n_warmup: int, lr_min: float, lr_top: float) -> float:
+    """Dốc tuyến tính `lr_min` -> `lr_top` trong `n_warmup` bước rồi PHẲNG.
 
-    Làm tròn từng mốc rồi cộng dồn, nên tổng ba chặng luôn <= `n_sched` và
-    chặng cuối không bị lẹm vì ba phép làm tròn độc lập.
+        step = 0          -> ĐÚNG lr_min
+        step = n_warmup   -> lr_top
+        step > n_warmup   -> lr_top  (giữ, không hạ)
+
+    `n_warmup = 0` -> phẳng `lr_top` ngay từ bước 0.
+
+    Dùng ở HAI chỗ với hai đơn vị khác nhau, nên nó chỉ nhận SỐ BƯỚC và để
+    người gọi quy đổi: lịch chung của Stage 0/1 truyền `warmup_epochs × bước
+    mỗi epoch` (đỉnh là `lr_max`), còn Aligner của main stage truyền `10% tổng
+    bước` (đỉnh là `lr_main`).
     """
-    n = max(1, int(n_sched))
-    w = int(round(float(warmup) * n))
-    h = int(round(float(hold) * n))
-    d = int(round(float(decay) * n))
-    # Trần: ba chặng không được vượt quá n_sched (làm tròn có thể đẩy lên).
-    if w + h + d > n:
-        d = max(0, n - w - h)
-        if w + h > n:
-            h = max(0, n - w)
-            w = min(w, n)
-    return {"warmup": w, "hold": h, "decay": d, "n_sched": n}
+    w = int(n_warmup)
+    if w <= 0:
+        return float(lr_top)
+    lo, hi = float(lr_min), float(lr_top)
+    return lo + (hi - lo) * min(1.0, max(0, int(step)) / w)
 
 
-def staged_lr(step: int, n_sched: int, lr_min: float, lr_max: float,
-              lr_main: float, warmup: float = WARMUP_FRAC,
-              hold: float = HOLD_FRAC, decay: float = DECAY_FRAC) -> float:
-    """lr tại bước `step` (0-based) theo lịch chung 25/50/25/phẳng.
-
-        step = 0              -> ĐÚNG lr_min
-        step = w              -> lr_max        (đỉnh, đầu chặng giữ)
-        step = w + h          -> lr_max        (đầu cosine)
-        step = w + h + d      -> lr_main       (đáy cosine)
-        step > w + h + d      -> lr_main       (phẳng)
-
-    `lr_min <= lr_main <= lr_max` KHÔNG bị ép ở đây (người gọi kiểm lúc đọc
-    config, nơi báo lỗi còn nói được tên khoá); công thức vẫn chạy nếu đảo.
-    """
-    b = phase_bounds(n_sched, warmup, hold, decay)
-    w, h, d = b["warmup"], b["hold"], b["decay"]
-    s = max(0, int(step))
-    lo, hi, mid = float(lr_min), float(lr_max), float(lr_main)
-    if w > 0 and s < w:
-        return lo + (hi - lo) * (s / w)
-    if s < w + h:
-        return hi
-    if d > 0 and s < w + h + d:
-        t = (s - w - h) / d
-        return mid + 0.5 * (hi - mid) * (1.0 + math.cos(math.pi * t))
-    return mid
+def phase_of(step: int, n_warmup: int) -> str:
+    """`warmup` | `hold` — chỉ để in ra và ghi history, không vào loss."""
+    return "warmup" if int(n_warmup) > 0 and int(step) < int(n_warmup) else "hold"
 
 
-def phase_name(step: int, n_sched: int, warmup: float = WARMUP_FRAC,
-               hold: float = HOLD_FRAC, decay: float = DECAY_FRAC) -> str:
-    """`warmup` | `hold` | `decay` | `flat` — chỉ để in ra, không vào loss."""
-    b = phase_bounds(n_sched, warmup, hold, decay)
-    w, h, d = b["warmup"], b["hold"], b["decay"]
-    s = max(0, int(step))
-    if w > 0 and s < w:
-        return "warmup"
-    if s < w + h:
-        return "hold"
-    if d > 0 and s < w + h + d:
-        return "decay"
-    return "flat"
-
-
-def phase_span(step_a: int, step_b: int, n_sched: int,
-               warmup: float = WARMUP_FRAC, hold: float = HOLD_FRAC,
-               decay: float = DECAY_FRAC) -> str:
+def phase_span(step_a: int, step_b: int, n_warmup: int) -> str:
     """Nhãn pha cho MỘT epoch, từ bước đầu tới bước cuối của nó.
 
-    Với cửa sổ một epoch, epoch ĐẦU đi qua cả ba chặng — `phase_name` của riêng
-    bước đầu sẽ gọi nó là "warmup" và giấu mất hai chặng kia. Nhãn ở đây ghi cả
-    hai đầu (`warmup→decay`) để history và log nói đúng thứ đã chạy.
+    Với `warmup_epochs` nguyên, epoch nào cũng nằm gọn trong một pha và nhãn
+    này trùng `phase_of`. Nó tồn tại cho trường hợp `warmup_epochs` lẻ (0.5
+    chẳng hạn), nơi một epoch bắc qua ranh giới — lúc ấy một nhãn lấy ở bước
+    đầu sẽ giấu mất nửa còn lại.
     """
-    a = phase_name(step_a, n_sched, warmup, hold, decay)
-    b = phase_name(step_b, n_sched, warmup, hold, decay)
+    a, b = phase_of(step_a, n_warmup), phase_of(step_b, n_warmup)
     return a if a == b else f"{a}→{b}"
+
+
+def plateau_lr(lr: float, n_decays: int, lr_min: float,
+               gamma: float = PLATEAU_GAMMA) -> float:
+    """Chặng 5 — `lr / gamma**n_decays`, kẹp sàn ở `lr_min`.
+
+        n_decays = 0  ->  lr                (val vừa cải thiện, hoặc chưa hỏng lần nào)
+        n_decays = 1  ->  lr / 3
+        n_decays = k  ->  lr / 3**k         (không bao giờ dưới lr_min)
+
+    `n_decays` là **tổng** số epoch val không cải thiện từ đầu giai đoạn —
+    KHÁC bộ đếm `patience`, vốn reset mỗi lần val khá lên. Một lần tụt là tụt
+    hẳn: "duy trì lr" trong đặc tả nghĩa là giữ nguyên mức đã tụt, không leo
+    lại.
+
+    `gamma = 1.0` tắt hẳn chặng 5 và trả về `lr` nguyên vẹn (vẫn kẹp sàn, nhưng
+    `warmup_flat` không bao giờ trả dưới `lr_min` nên phép kẹp là phép đồng
+    nhất).
+    """
+    g = float(gamma)
+    k = max(0, int(n_decays))
+    if g <= 0:
+        raise ValueError(f"plateau gamma {gamma} phải > 0 (1.0 = tắt chặng 5)")
+    return max(float(lr_min), float(lr) / (g ** k))
 
 
 def tail_lr(step: int, n_tail: int, lr_from: float, lr_min: float) -> float:
@@ -160,26 +158,14 @@ def tail_lr(step: int, n_tail: int, lr_from: float, lr_min: float) -> float:
         step = 0        -> lr_from
         step = n_tail   -> lr_min
 
-    `lr_from` là lr THẬT của bước cuối cùng đã chạy (`staged_lr` tại bước ấy),
-    không phải `lr_main` gõ tay: nếu giai đoạn dừng sớm ở giữa chặng `hold`
-    thì lr đang là `lr_max`, và bắt đầu đuôi từ `lr_main` là một cú tụt nấc.
+    `lr_from` là lr THẬT của bước cuối cùng đã chạy — tức đã gồm mọi lần chia
+    của chặng 5. Lấy `lr_max` gõ tay là để lr nhảy LÊN mấy nấc rồi mới đi
+    xuống, đúng ngược với ý "hạ cánh".
     """
     n = max(1, int(n_tail))
     t = min(max(int(step), 0), n) / n
     lo, hi = float(lr_min), float(lr_from)
     return lo + 0.5 * (hi - lo) * (1.0 + math.cos(math.pi * t))
-
-
-def warmup_flat(step: int, n_warmup: int, lr_min: float, lr_main: float) -> float:
-    """Dốc tuyến tính `lr_min` -> `lr_main` trong `n_warmup` bước rồi PHẲNG.
-
-    `n_warmup = 0` -> phẳng `lr_main` ngay từ bước 0.
-    """
-    w = int(n_warmup)
-    if w <= 0:
-        return float(lr_main)
-    lo, hi = float(lr_min), float(lr_main)
-    return lo + (hi - lo) * min(1.0, max(0, int(step)) / w)
 
 
 def frozen_warmup_flat(step: int, n_freeze: int, n_warmup: int,

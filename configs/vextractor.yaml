@@ -354,18 +354,18 @@ labels:
 #
 # ── 2. COMPRESSOR ────────────────────────────────────────────────────────────
 #   kv = RMSNorm(V)                                   512, MỘT lần, ngoài mọi nhóm
-#   q  = 32 latent @1024
+#   q  = 32 latent @768
 #   N × [ khối 1:  q += SelfAttn(N(q))
 #                  q += CrossAttn(N(q), kv)           <- chỗ DUY NHẤT đọc V
 #                  q += SwiGLU(N(q))
 #         khối 2:  q += SelfAttn(N(q))
 #                  q += SwiGLU(N(q))                ]
 #
-# 512 -> 1024 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 512, trả
-# 1024). KHÔNG có `Linear 512→1024` đứng trước: một lớp chiếu riêng thêm 0,53 M
+# 512 -> 768 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 512, trả
+# 768). KHÔNG có `Linear 512→768` đứng trước: một lớp chiếu riêng thêm 0,39 M
 # tham số mà không thêm sức biểu diễn nào (nó chỉ gộp được vào k/v phía sau).
 #
-# `head_dim` là khoá KHAI, `n_heads` được SUY RA (1024 // 128 = 8). Chiều ngược
+# `head_dim` là khoá KHAI, `n_heads` được SUY RA (768 // 128 = 6). Chiều ngược
 # lại — khai n_heads rồi để head_dim rơi ra — là cách head_dim đổi LẶNG LẼ mỗi
 # lần ai đó sửa `d_latent`. Khai cái BẤT BIẾN, suy ra cái phụ thuộc; khai
 # `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
@@ -373,17 +373,24 @@ labels:
 # Khối 2 KHÔNG có Cross-attn, và đó là chủ ý: nó để 32 vector thống nhất lại
 # với nhau sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp.
 #
-# Tham số MỘT nhóm khối ở 1024 / kv 512 / hidden 2048:
-#   SelfAttn 4×1024² = 4,19 M (×2) · CrossAttn 2×1024² + 2×512×1024 = 3,15 M
-#   SwiGLU 3×1024×2048 = 6,29 M (×2) · 5 × RMSNorm(1024) = 5 120
-#   => 24,12 M mỗi nhóm; N = 2 -> 48,28 M.
+# Tham số ở 768 / kv 512 / hidden 1024:
+#   SelfAttn 4×768² = 2,36 M · CrossAttn 2×768² + 2×512×768 = 1,97 M
+#   SwiGLU 3×768×1024 = 2,36 M · 5 × RMSNorm(768) = 3 840
+#   => KHỐI 1 (self+cross+ffn) 6,69 M · KHỐI 2 (self+ffn) 4,72 M
+#   => MỘT nhóm 11,41 M; N = 5 -> 57,06 M.
 #
-# Chi phí nằm ở `d_latent` (theo d²), KHÔNG ở `n_query`: 32 latent chỉ là 32 768
+# ⚠ Đặc tả ghi `~6.71M (xN)`. Con số ấy khớp KHỐI 1 (6,69 M), KHÔNG khớp cả
+# nhóm (11,41 M) — nên tổng Compressor là 57,06 M, không phải 33,6 M. Không có
+# lựa chọn kiến trúc nào ẩn trong chỗ lệch: bảng khối, `d_latent` và
+# `mlp_hidden` đều khai tường minh và chúng định đoạt hoàn toàn số tham số.
+#
+# Chi phí nằm ở `d_latent` (theo d²) và `n_blocks` (tuyến tính), KHÔNG ở
+# `n_query`: 32 latent chỉ là 24 576
 # tham số. Đổi `n_query` đụng tới THỜI GIAN và độ dài chuỗi decoder, không tới
 # bảng tham số.
 #
 # ── 3. ALIGNER ───────────────────────────────────────────────────────────────
-# RMSNorm(1024) + MỘT khối SwiGLU 1024→4096→2560 (`down(SiLU(gate(x)) ⊙ up(x))`,
+# RMSNorm(768) + MỘT khối SwiGLU 768→4096→2560 (`down(SiLU(gate(x)) ⊙ up(x))`,
 # bias=False cả ba theo quy ước Gemma 3 / LLaMA, init 1/√fan_in). Không
 # attention, không residual: phần "suy nghĩ" nằm trọn trong Compressor, và đây
 # là chỗ DUY NHẤT nhánh đổi chiều lên không gian embedding của decoder.
@@ -394,11 +401,15 @@ labels:
 # (bản đồ saliency của Lens thành ma trận không). Giá: 1024 tham số. Vì cùng lý
 # do, ba ma trận có cổng init `1/√fan_in` và `_init` PHẢI bỏ qua chúng.
 #
-# `mlp_hidden` 4096 > `d_latent` 1024 — NỞ RA, cùng hướng với FFN của decoder
-# (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 1024; cả hai đều
+# `mlp_hidden` 4096 > `d_latent` 768 — NỞ RA, cùng hướng với FFN của decoder
+# (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 768; cả hai đều
 # chạy, nhưng hỏi hai câu khác nhau.
 #
-# `d_latent` 1024 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
+# ⚠ Đặc tả ghi Aligner `~18.89M`. Đó là con số của đầu vào 1024; với `d_latent`
+# = 768 (chiều thật của V_c) nó là **16,78 M**. Aligner ăn V_c NGUYÊN chiều —
+# không có lớp chiếu 768→1024 nào chen vào chỉ để khớp một con số.
+#
+# `d_latent` 768 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
 # `d_latent` khai ở đây, và `build_aligner` nối chúng — nên đổi base sang một
 # decoder khác chiều sẽ lộ ra chứ không lặng lẽ.
 vextractor:
@@ -414,15 +425,15 @@ vextractor:
     n_layers: null
     # Lát cắt của họ PHÂN CẤP (`.stages`). 3 = giữ Stage 1–3 -> 512 kênh.
     n_stages: 3
-  compressor:               # QFormer: V (784, 512) -> V_c (32, 1024)
+  compressor:               # QFormer: V (784, 512) -> V_c (32, 768)
     n_query: 32             # số latent = số token Q nối vào chuỗi decoder
-    d_latent: 1024          # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
-    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 8
-    mlp_hidden: 2048        # SwiGLU 1024 -> 2048 -> 1024 (mỗi khối)
-    n_blocks: 2             # N: số lần lặp (khối 1 -> khối 2)
+    d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
+    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
+    mlp_hidden: 1024        # SwiGLU 768 -> 1024 -> 768 (mỗi khối)
+    n_blocks: 5             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (32, 1024) -> Q (32, 2560)
-    mlp_hidden: 4096        # SwiGLU 1024 -> 4096 -> 2560
+  aligner:                  # V_c (32, 768) -> Q (32, 2560)
+    mlp_hidden: 4096        # SwiGLU 768 -> 4096 -> 2560 (16,78 M)
     dropout: 0.0
 
   # ── Main stage: HAI nhóm, HAI lịch (`src/train_vextractor.py`) ──────────
@@ -489,9 +500,8 @@ vextractor:
 # `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức khác
 # nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
 #
-# HAI nhóm lr, cùng lịch chung nhưng hai bộ ba số. Ba chặng đầu (warm-up + giữ
-# đỉnh + cosine) gói TRỌN trong `sched_epochs` epoch ĐẦU; mọi epoch sau chạy
-# phẳng `lr_main`. Ma trận attention
+# HAI nhóm lr, cùng lịch chung nhưng hai CẶP số: warm-up tuyến tính trong
+# `warmup_epochs` epoch rồi GIỮ `lr_max` của từng nhóm tới hết. Ma trận attention
 # quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
 # bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
 # lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
@@ -499,17 +509,17 @@ vextractor:
 # `vextractor.Compressor.ffn_parameters`).
 stage1:
   attn_lr_min: 1.0e-8
-  attn_lr_max: 7.0e-5
-  attn_lr_main: 1.0e-5
+  attn_lr_max: 7.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
   ffn_lr_min: 1.0e-7
-  ffn_lr_max: 1.0e-4
-  ffn_lr_main: 3.0e-5
-  # CỬA SỔ của ba chặng đầu, tính bằng EPOCH. 1 = warm-up/giữ đỉnh/cosine gói
-  # trọn trong epoch ĐẦU rồi phẳng `lr_main` tới hết. KHÔNG phải độ dài giai
-  # đoạn — đó là `max_epochs` bên dưới.
-  sched_epochs: 1
+  ffn_lr_max: 1.0e-4      # MỨC CHẠY của nhóm ffn
+  warmup_epochs: 1.0      # độ dài dốc warm-up (epoch), rồi GIỮ lr_max tới hết
   max_epochs: 20          # TRẦN, không phải số epoch sẽ chạy — patience quyết
-  patience: 2             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
+  # CHẶNG 5, giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
+  # (attn và ffn) chia cho số này, sàn là `lr_min` của từng nhóm. MỘT bộ đếm
+  # chung cho hai nhóm, vì val là MỘT con số — không có cách nào nói nhóm nào
+  # làm nó xấu đi, nên tách hai bộ đếm là bịa ra một tín hiệu không tồn tại.
+  plateau_gamma: 3.0
+  patience: 3             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
   tail_epochs: 1          # rồi chạy thêm ngần này epoch cosine về lr_min của
                           # TỪNG nhóm, RỒI MỚI lấy best val
   min_delta: 0.0
@@ -541,20 +551,19 @@ stage1:
 # tiêu trong DINO — Stage 1 và main stage vì thế chạy Extractor ở đúng chế độ
 # teacher inference.
 #
-# LỊCH CHUNG (`src/schedule.py`). Ba chặng đầu gói TRỌN trong `sched_epochs`
-# epoch ĐẦU (= 1), chặng thứ tư phủ mọi epoch còn lại:
-#   1. warm-up tuyến tính 1e-7 -> 1e-4   25% của epoch ĐẦU   (50/200 bước)
-#   2. giữ phẳng 1e-4                     50% kế             (100/200 bước)
-#   3. cosine decay 1e-4 -> 3e-5          25% kế             (50/200 bước)
-#   4. phẳng 3e-5                         49 EPOCH CÒN LẠI
+# LỊCH CHUNG (`src/schedule.py`) — HAI chặng, cộng một hệ số nhân:
+#   1. warm-up tuyến tính 1e-7 -> 1e-4   `warmup_epochs` (1) epoch ĐẦU (200 bước)
+#   2. GIỮ 1e-4                          49 EPOCH CÒN LẠI
+#   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (3),
+#                                           sàn `lr_min`; val cải thiện thì
+#                                           GIỮ NGUYÊN (không leo lại)
 #
-# Với 6400 mẫu và batch 32 thì một epoch = 200 bước, nên ba chặng đầu là
-# 50 + 100 + 50 bước. "Fixed lr_main (the rest)" của đặc tả là phần còn lại của
-# CẢ GIAI ĐOẠN, không phải một mẩu dư của phép làm tròn.
+# `lr_max` là MỨC CHẠY, không phải một đỉnh tạm rồi hạ: không còn `lr_main`,
+# không còn chặng cosine nào trong lịch chung. Thứ DUY NHẤT kéo lr xuống là
+# chặng 5 — tức chính đường val, chứ không phải một lịch định trước. Một đường
+# lr do val điều khiển thì không cần đoán trước lúc nào nên hạ.
 #
-# ⚠ `sched_epochs` KHÔNG phải độ dài giai đoạn — đó là `max_epochs`. Đọc nhầm
-# hai khoá ấy thành một cho một đường lr khác hẳn (warm-up kéo 12,5 epoch,
-# chặng 4 rỗng), và cả hai cách đều chạy trót lọt mà không có gì báo.
+# ⚠ `warmup_epochs` KHÔNG phải độ dài giai đoạn — đó là `max_epochs`.
 #
 # DỪNG SỚM và cái ĐUÔI của nó: `patience` = 4 epoch LIÊN TIẾP val không cải
 # thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc, nó chạy THÊM
@@ -569,17 +578,31 @@ stage1:
 stage0:
   # Ba đỉnh của lịch chung. KHAI CẢ BA: đoán một cái từ hai cái kia là đưa một
   # hằng số vào giữa một lịch mà người chạy tin là mình đã khai đủ.
-  lr_min: 1.0e-7            # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này) và ĐÁY của đuôi
-  lr_max: 1.0e-4            # ĐỈNH, giữ phẳng 50% lịch
-  lr_main: 3.0e-5           # mức chạy sau cosine decay
-  sched_epochs: 1           # CỬA SỔ của ba chặng đầu (epoch). Xem chú thích trên.
+  # lr_min là BA thứ cùng lúc, nên đừng đọc nó chỉ như "lr nhỏ nhất": đầu dốc
+  # warm-up (bước 0 có ĐÚNG số này), SÀN của chặng 5, và ĐÁY của epoch đuôi.
+  lr_min: 1.0e-7
+  lr_max: 1.0e-4            # MỨC CHẠY sau warm-up (giữ tới hết)
+  warmup_epochs: 1.0        # độ dài dốc warm-up (epoch). Xem chú thích trên.
   max_epochs: 50            # TRẦN thật sự của giai đoạn
+  # CHẶNG 5 — "Nếu patient tăng 1, decay 3 lần lr hiện tại. Nếu không thì duy
+  # trì lr." Mỗi epoch val không cải thiện thì lr HIỆN TẠI bị chia cho số này,
+  # kẹp sàn ở `lr_min`. Val khá lên thì lr GIỮ NGUYÊN mức đã tụt — không leo
+  # lại, nên đường lr đơn điệu giảm sau epoch đầu.
+  #
+  # HAI bộ đếm, và chúng KHÔNG gộp được: `patience` đếm chuỗi hỏng LIÊN TIẾP và
+  # reset mỗi lần val khá lên (nó quyết định lúc nào DỪNG); bộ đếm của chặng 5
+  # đếm TỔNG số epoch hỏng và không bao giờ reset (nó quyết định LR). Gộp chúng
+  # là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ.
+  #
+  # 1.0 = TẮT chặng 5. Đây mới là khoá để tắt nó, KHÔNG phải `patience: 0`
+  # (patience chỉ gác việc dừng sớm).
+  plateau_gamma: 3.0
   weight_decay: 0.03
   # ── dừng sớm ───────────────────────────────────────────────────────────
   # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`
   # (= −loss DINO trên val cố định) không vượt kỷ lục quá `min_delta` thì DỪNG
   # phần theo lịch. 0 = tắt (chạy đủ `max_epochs`, không có đuôi).
-  patience: 4
+  patience: 5
   tail_epochs: 1            # epoch cosine về lr_min sau khi patience hết
   min_delta: 0.0
   # Checkpoint đem sang Stage 1 = epoch TỐT NHẤT theo val. `patience` +

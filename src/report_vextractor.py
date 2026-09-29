@@ -122,18 +122,20 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         tail = (f" + {sc0.get('tail_epochs')} epoch ĐUÔI cosine về "
                 f"{sc0.get('lr_min')}" if s0.get("ran_tail")
                 else " · không chạy epoch đuôi")
-        L.append(f"lịch chung 25/50/25 gói trong {sc0.get('sched_epochs')} epoch "
-                 f"ĐẦU: warm-up {sc0.get('lr_min')} → {sc0.get('lr_max')} (25%) · "
-                 f"giữ {sc0.get('lr_max')} (50%) · cosine → {sc0.get('lr_main')} "
-                 f"(25%) · rồi PHẲNG {sc0.get('lr_main')} trên mọi epoch còn lại "
+        L.append(f"lịch chung: warm-up tuyến tính {sc0.get('lr_min')} → "
+                 f"{sc0.get('lr_max')} trong {sc0.get('warmup_epochs')} epoch "
+                 f"rồi GIỮ {sc0.get('lr_max')} tới hết · chặng 5: lr ÷"
+                 f"{sc0.get('plateau_gamma')} mỗi epoch val không cải thiện "
+                 f"(đã chia {s0.get('n_decays', 0)} lần, sàn {sc0.get('lr_min')}) "
                  f"· wd {sc0.get('weight_decay')} · chạy "
                  f"**{s0.get('base_epochs_run', '?')}**/{sc0.get('max_epochs')} epoch"
                  f"{' — DỪNG SỚM' if s0.get('stopped_early') else ''} "
                  f"(patience {sc0.get('patience')}, min_delta {sc0.get('min_delta')})"
-                 f"{tail}"
-                 f" · epoch dùng: "
-                 f"{s0.get('select', 'best')} · val {sc0.get('val_n_samples')} "
-                 f"mẫu CỐ ĐỊNH, −loss DINO (KHÔNG nhãn)\n")
+                 + (f" + {sc0.get('tail_epochs')} epoch ĐUÔI cosine về "
+                    f"{sc0.get('lr_min')}" if s0.get("ran_tail")
+                    else " · không chạy epoch đuôi")
+                 + f" · epoch dùng: {s0.get('select', 'best')} · val "
+                 f"{sc0.get('val_n_samples')} mẫu CỐ ĐỊNH, −loss DINO (KHÔNG nhãn)\n")
         _dc = dict(sc0.get("dino") or {})
         L.append(f"Hàm mục tiêu: **DINO self-distillation**, 2 global "
                  f"{_dc.get('global_size')}² + {_dc.get('n_local')} local "

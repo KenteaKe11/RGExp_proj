@@ -35,20 +35,20 @@ lệch).
    └─────────────────────┬───────────────────────────────────┘
                          │ V
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 2. COMPRESSOR — QFormer, 32 latent @1024, N = 2 nhóm     │  Stage 1 dạy
+   │ 2. COMPRESSOR — QFormer, 32 latent @768, N = 5 nhóm      │  Stage 1 dạy
    │                                                          │
    │    kv = RMSNorm(V)                          512          │
-   │    q  = 32 latent @1024                                  │
+   │    q  = 32 latent @768                                   │
    │    N × [ khối 1:  q += SelfAttn(N(q))                    │
    │                   q += CrossAttn(N(q), kv)   ◄─ đọc V    │
    │                   q += SwiGLU(N(q))                      │
    │          khối 2:  q += SelfAttn(N(q))                    │
    │                   q += SwiGLU(N(q))         ]            │
-   │    ─► V_c = (32, 1024)                                   │
+   │    ─► V_c = (32, 768)                                    │
    └─────────────────────┬───────────────────────────────────┘
                          │ V_c
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 3. ALIGNER — RMSNorm(1024) + SwiGLU 1024→4096→2560       │  Main stage dạy
+   │ 3. ALIGNER — RMSNorm(768) + SwiGLU 768→4096→2560         │  Main stage dạy
    │    ─► Q (32, 2560)                                       │
    └─────────────────────┬───────────────────────────────────┘
                          │
@@ -60,8 +60,8 @@ lệch).
 | | dạy | đứng yên | hàm mục tiêu |
 |---|---|---|---|
 | **Stage 0** | Extractor (**60,12 M**) | — | DINOv3 finetune: DINO tự giám sát, teacher = EMA, multi-crop |
-| **Stage 1** | Compressor (**48,28 M**) | Extractor (teacher Stage 0) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
-| **main** | Aligner (**18,88 M**) + LoRA từ bước 0; Compressor sau 20% bước | Extractor | CE trên báo cáo thật |
+| **Stage 1** | Compressor (**57,06 M**) | Extractor (teacher Stage 0) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
+| **main** | Aligner (**16,78 M**) + LoRA từ bước 0; Compressor sau 20% bước | Extractor | CE trên báo cáo thật |
 
 ---
 
@@ -131,15 +131,15 @@ sai **lặng lẽ**, không có shape nào hỏng. `vextractor.vext_tensor()` l�
 định); `_check_normalize` so spec với `pretrained_cfg` của model vừa dựng, và
 `assert_same_pixels` kiểm lại trên một mẫu thật mỗi lần chạy.
 
-## 1.2. Compressor — QFormer, 32 latent @1024, N = 2
+## 1.2. Compressor — QFormer, 32 latent @768, N = 5
 
 **32 latent là khoá KHAI tường minh** (`vextractor.compressor.n_query`). Lưới
 của Extractor (**784 ô** ở 448²) là **nguồn để hỏi**, không phải khối Q: 32
 vector đi hỏi nó qua **Cross-attn** và nén lại.
 
-**512 → 1024 xảy ra NGAY TRONG Cross-attn.** `k_proj`/`v_proj` nhận 512 và trả
-1024; `q_proj`/`o_proj` ở 1024. **Không có `Linear 512→1024` đứng trước** — một
-lớp chiếu riêng sẽ thêm 0,53 M tham số mà không thêm sức biểu diễn nào (nó chỉ
+**512 → 768 xảy ra NGAY TRONG Cross-attn.** `k_proj`/`v_proj` nhận 512 và trả
+768; `q_proj`/`o_proj` ở 768. **Không có `Linear 512→768` đứng trước** — một
+lớp chiếu riêng sẽ thêm 0,39 M tham số mà không thêm sức biểu diễn nào (nó chỉ
 gộp được vào `k`/`v` phía sau). Thứ **duy nhất** đứng trước Cross-attn là
 `RMSNorm(512)` trên V (512 tham số): nó đưa key/value về RMS ≈ 1, thang mà mọi
 phép attention bên trên được thiết kế cho.
@@ -147,7 +147,7 @@ phép attention bên trên được thiết kế cho.
 **Khối 2 KHÔNG có Cross-attn, và đó là chủ ý.** Nó để 32 vector *thống nhất lại
 với nhau* sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp. Một
 Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một bộ câu hỏi
-vừa được cập nhật nửa vời. Với `N = 2` thì cả cụm đọc ảnh đúng **hai** lần, xen
+vừa được cập nhật nửa vời. Với `N = 5` thì cả cụm đọc ảnh đúng **năm** lần, xen
 giữa là hai lượt tự-trộn.
 
 **Pre-norm + residual quanh TỪNG khối con** — năm dấu `+` và năm RMSNorm mỗi
@@ -155,30 +155,38 @@ nhóm, đúng quy ước Gemma 3. Selftest so **thẳng** năm công thức ấy
 một residual sẽ bị bắt ngay.
 
 **Mọi attention chạy ở `head_dim` = 128, và đó là khoá KHAI.** Số head được
-**suy ra**: `n_heads = d_latent // head_dim` = **8** ở 1024. Chiều ngược lại —
+**suy ra**: `n_heads = d_latent // head_dim` = **6** ở 768. Chiều ngược lại —
 khai `n_heads` rồi để `head_dim` rơi ra — là cách head_dim đổi **lặng lẽ** mỗi
 lần ai đó sửa `d_latent`. Khai cái **bất biến**, suy ra cái phụ thuộc;
 `d_latent` không chia hết `head_dim` thì **dừng**, không làm tròn.
 
 **HAI khối SwiGLU, hai khoá khai riêng.** `vextractor.compressor.mlp_hidden`
-(2048) là bề rộng FFN **bên trong Compressor**; `vextractor.aligner.mlp_hidden`
+(1024) là bề rộng FFN **bên trong Compressor**; `vextractor.aligner.mlp_hidden`
 (4096) là bề rộng FFN của **Aligner** — và khối ấy cũng là chỗ **duy nhất** nhánh
-đổi chiều, từ 1024 lên `d_model` 2560.
+đổi chiều, từ 768 lên `d_model` 2560.
 
 | khối con (mỗi nhóm) | tham số |
 |---|---|
-| Self-attn @1024 (×2) | 4,19 M mỗi cái |
-| Cross-attn (q/o @1024, k/v 512→1024) | 3,15 M |
-| `SwiGLU 1024→2048→1024` (×2) | 6,29 M mỗi cái |
-| 5 × RMSNorm(1024) | 5 120 |
-| **MỘT nhóm khối** | **24,12 M** |
+| Self-attn @768 (×2) | 2,36 M mỗi cái |
+| Cross-attn (q/o @768, k/v 512→768) | 1,97 M |
+| `SwiGLU 768→1024→768` (×2) | 2,36 M mỗi cái |
+| 5 × RMSNorm(768) | 3 840 |
+| **khối 1** (self + cross + ffn) | **6,69 M** |
+| **khối 2** (self + ffn) | **4,72 M** |
+| **MỘT nhóm khối** (khối 1 → khối 2) | **11,41 M** |
+
+> Đặc tả ghi `~6.71M (xN)`. Con số ấy khớp **khối 1** (6,69 M), không khớp cả
+> nhóm (11,41 M) — nên tổng Compressor ở `N = 5` là **57,06 M**, không phải
+> 33,6 M. Không có lựa chọn kiến trúc nào ẩn trong chỗ lệch này: bảng khối,
+> `d_latent` và `mlp_hidden` đều được khai tường minh và chúng định đoạt hoàn
+> toàn số tham số.
 
 **Chi phí nằm ở `d_latent`, không ở `n_query`.** 32 latent chỉ là **32 768**
-tham số, trong khi mỗi Self-attn @1024 là 4,19 M. Đổi `n_query` gần như không
+tham số, trong khi mỗi Self-attn @768 là 2,36 M. Đổi `n_query` gần như không
 đụng tới bảng trên (nó đụng tới *thời gian* và tới độ dài chuỗi decoder); đổi
 `d_latent` thì đụng tới tất cả, theo d².
 
-## 1.3. Aligner — `RMSNorm(1024)` + `SwiGLU 1024→4096→2560`
+## 1.3. Aligner — `RMSNorm(768)` + `SwiGLU 768→4096→2560`
 
 **Aligner là một FFN thuần**, không attention / residual: phần "suy nghĩ" nằm
 trọn trong Compressor. Nó vừa **trộn lại 32 vector sau khi chúng đã đọc xong
@@ -186,7 +194,7 @@ trọn trong Compressor. Nó vừa **trộn lại 32 vector sau khi chúng đã 
 decoder (`down(SiLU(gate(x)) ⊙ up(x))`, `bias=False` cả ba theo quy ước Gemma 3
 / LLaMA).
 
-**RMSNorm ở đây là RMSNorm(1024), không phải 2560.** Thứ đi vào là `V_c`, ra từ
+**RMSNorm ở đây là RMSNorm(768), không phải 2560.** Thứ đi vào là `V_c`, ra từ
 residual cuối của Compressor, nên nó vẫn ở `d_latent`; chỉ `down` mới nâng lên
 2560. Hai số xa nhau nên lỗi ấy hỏng ngay ở shape — nhưng đổi `d_latent` thành
 2560 thì nó im lặng, và đó là lý do hai khoá vẫn RIÊNG dù có lúc trùng nhau.
@@ -209,8 +217,12 @@ selftest nó **underflow hẳn về 0**, và bản đồ saliency của Lens th�
 trận không. Nhân init lên để bù thì chữa *triệu chứng* — con số bù suy từ RMS
 đo được chứ không từ nguyên tắc nào, và nó trôi ngay khi Compressor đổi.
 RMSNorm chữa *nguyên nhân*: nó đặt đầu vào của SwiGLU lên đúng thang mà SwiGLU
-được thiết kế cho, nên `1/√fan_in` — init chuẩn — lại có nghĩa. Giá: **1024
+được thiết kế cho, nên `1/√fan_in` — init chuẩn — lại có nghĩa. Giá: **768
 tham số**.
+
+> Đặc tả ghi Aligner `~18.89M`. Đó là con số của đầu vào 1024; với `d_latent` =
+> **768** (chiều thật của `V_c`) nó là **16,78 M**. Aligner ăn `V_c` nguyên
+> chiều — không có lớp chiếu 768→1024 nào chen vào chỉ để khớp một con số.
 
 `_init` (normal(0, 0.02) cho mọi `nn.Linear` mới) **bỏ qua** mọi ma trận có
 cổng, y như nó bỏ qua Extractor — đè 0,02 lên chúng là quay lại đúng hàng giữa
@@ -226,9 +238,9 @@ Một khác biệt đáng biết nếu muốn khớp decoder cho bằng: FFN c�
 là **GeGLU** (`gelu_pytorch_tanh`), không phải SwiGLU; ở đây dùng SiLU đúng như
 đặc tả.
 
-`aligner.mlp_hidden` 4096 > 1024 — một chỗ **nở ra**, cùng hướng với FFN của
+`aligner.mlp_hidden` 4096 > 768 — một chỗ **nở ra**, cùng hướng với FFN của
 decoder (Gemma 3: 2560 → 10240). Muốn một **nút thắt** (ép chiều lại, buộc 32
-vector bỏ bớt thứ gì đó) thì đặt nó dưới 1024; cả hai đều chạy, nhưng hỏi hai
+vector bỏ bớt thứ gì đó) thì đặt nó dưới 768; cả hai đều chạy, nhưng hỏi hai
 câu khác nhau.
 
 ## 1.4. Bảng tham số
@@ -237,11 +249,11 @@ câu khác nhau.
 |---|---|
 | **Extractor** ConvNeXt-Base @448 → `(784, 512)`, `n_stages: 3` | **60,12 M** — *Stage 0 dạy; sau đó teacher inference* |
 | RMSNorm(512) trên V | 512 |
-| 32 latent @1024 | 32 768 |
-| **1 nhóm khối** (Self ×2 + Cross + SwiGLU ×2 + 5 norm) | **24,12 M** |
-| **Compressor** (N = 2) → `(32, 1024)` | **48,28 M** — *Stage 1 dạy* |
-| **Aligner** `RMSNorm(1024)` + `SwiGLU 1024→4096→2560` → Q (32, 2560) | **18,88 M** — *main stage dạy* |
-| **nhánh ở main stage** | **127,27 M**, trong đó **học được 67,15 M** |
+| 32 latent @768 | 24 576 |
+| **1 nhóm khối** (Self ×2 + Cross + SwiGLU ×2 + 5 norm) | **11,41 M** |
+| **Compressor** (N = 5) → `(32, 768)` | **57,06 M** — *Stage 1 dạy* |
+| **Aligner** `RMSNorm(768)` + `SwiGLU 768→4096→2560` → Q (32, 2560) | **16,78 M** — *main stage dạy* |
+| **nhánh ở main stage** | **133,96 M**, trong đó **học được 73,84 M** |
 | DINO head (CHỈ Stage 0 / Stage 1, bị bỏ sau đó) | **6,82 M** |
 | **Stage 0**: student (Extractor + head) | **66,95 M** *(+ teacher EMA 66,95 M nữa trong VRAM)* |
 
@@ -257,56 +269,78 @@ lấy từ `recombiner.last_image_index(ids) + 1` (khâu train, đệm phải) v
 
 ## 2.0. Lịch CHUNG (`src/schedule.py`)
 
-Stage 0 và Stage 1 dùng **cùng một hàm**. Ba chặng đầu gói **trọn trong
-`sched_epochs` epoch ĐẦU** (mặc định **1**); chặng thứ tư phủ **mọi epoch còn
-lại**:
+Stage 0 và Stage 1 dùng **cùng một hàm**. Hai chặng, cộng một hệ số nhân:
 
-1. **warm-up** tuyến tính `lr_min` → `lr_max` — **25%** của epoch đầu
-2. **giữ phẳng** `lr_max` — **50%** kế (vẫn trong epoch đầu)
-3. **cosine decay** `lr_max` → `lr_main` — **25%** kế (hết epoch đầu)
-4. **phẳng** `lr_main` — **mọi epoch còn lại**
+1. **warm-up** tuyến tính `lr_min` → `lr_max` — trong `warmup_epochs` (**1**) epoch
+2. **giữ** `lr_max` — **mọi epoch còn lại**
+5. **mỗi epoch val không cải thiện** → chia lr hiện tại cho `plateau_gamma`
+   (**3**), sàn `lr_min`; val cải thiện thì **giữ nguyên** lr
 
-Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**, trần 50 epoch): warm-up
-**50 bước**, giữ đỉnh **100 bước**, cosine **50 bước** — rồi **49 epoch chạy
-phẳng `lr_main`**. Đó là ý của "Fixed `lr_main` (the rest)": *the rest* là phần
-còn lại của **cả giai đoạn**, không phải một mẩu dư của phép làm tròn.
+Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**): dốc 200 bước từ 1e-7 lên
+1e-4, rồi giữ 1e-4 cho tới lúc dừng.
 
-> **`sched_epochs` là CỬA SỔ của ba chặng đầu, không phải độ dài giai đoạn** —
-> đó là `max_epochs`. Đọc nhầm hai khoá ấy thành một cho một đường lr khác hẳn
-> (warm-up kéo 12,5 epoch, chặng 4 rỗng), và **cả hai cách đều chạy trót lọt**
-> mà không có gì trong loss báo ra chỗ khác nhau. Selftest khoá đúng chỗ này:
-> nó đòi mọi epoch từ epoch 2 trở đi phải đã phẳng ở `lr_main`.
+> **`lr_max` là MỨC CHẠY, không phải một đỉnh tạm rồi hạ.** Không còn `lr_main`,
+> không còn chặng cosine nào trong lịch chung. Thứ **duy nhất** kéo lr xuống là
+> chặng 5 — tức chính **đường val**, chứ không phải một lịch định trước. Một
+> đường lr do val điều khiển thì không cần đoán trước lúc nào nên hạ.
 
-Ba siêu tham số **khác** có đơn vị epoch và **không** đi theo cửa sổ ấy:
+**Bước 0 có đúng `lr_min`**, và `lr_min` là **ba thứ cùng lúc**: đầu dốc
+warm-up, **sàn** của chặng 5, và **đáy** của epoch đuôi. Nên đừng đọc nó chỉ
+như "lr nhỏ nhất" — đổi nó là đổi cả ba.
+
+**Chặng 5 là một hệ số NHÂN, không phải một chặng thứ ba trên trục thời gian.**
+Nó chia đường lr trên cho `3^n_decays`, trong đó `n_decays` là **tổng số epoch
+val không cải thiện** từ đầu giai đoạn. Ba tính chất, cả ba đều là lựa chọn có
+hệ quả:
+
+* **cộng dồn, không reset.** "decay 3 lần lr *hiện tại*" rồi "duy trì lr" nghĩa
+  là một lần tụt là tụt hẳn: val khá lên trở lại thì lr đứng yên ở mức đã tụt
+  chứ không leo lại. Đường lr vì thế **đơn điệu giảm** kể từ epoch 2.
+* **`patience` và chặng 5 là HAI bộ đếm.** `bad` đếm chuỗi hỏng **liên tiếp**,
+  reset mỗi lần val khá lên, và quyết định lúc nào **dừng**. `n_decays` đếm
+  **tổng** số epoch hỏng, không bao giờ reset, và quyết định **lr**. Gộp chúng
+  là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ. Muốn
+  tắt chặng 5 thì đặt `plateau_gamma: 1.0`, **không phải** `patience: 0`.
+* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-4 → 1e-7 là 7 lần), lr sẽ chui
+  xuống dưới `lr_min`; lúc ấy epoch đuôi — vốn cosine *về* `lr_min` — thành một
+  cú **tăng** lr, ngược hẳn với ý của nó.
+
+Ví dụ với Stage 0 (`lr_max = 1e-4`, `lr_min = 1e-7`):
+
+| số epoch val hỏng | 0 | 1 | 2 | 3 | 4 | 5 | 6 | ≥ 7 |
+|---|---|---|---|---|---|---|---|---|
+| lr | 1,0e-4 | 3,3e-5 | 1,1e-5 | 3,7e-6 | 1,2e-6 | 4,1e-7 | 1,4e-7 | 1,0e-7 (sàn) |
+
+Stage 1 dùng **một bộ đếm chung cho cả hai nhóm** (attn và ffn), vì val là
+**một** con số — không có cách nào nói nhóm nào làm nó xấu đi, nên tách hai bộ
+đếm là bịa ra một tín hiệu không tồn tại. Sàn thì riêng: mỗi nhóm kẹp ở `lr_min`
+của chính nó.
+
+Ba siêu tham số **khác** có đơn vị epoch và **không** đi theo `warmup_epochs`:
 momentum EMA của teacher (cosine trên **toàn** giai đoạn, `max_epochs`),
 `teacher_temp_warmup_epochs` và `freeze_last_layer_epochs` — chúng tả hàm mục
 tiêu DINO chứ không tả lịch lr.
 
-lr là hàm **thuần của số bước**, không phải một đối tượng scheduler mang trạng
-thái, nên chạy tiếp từ epoch k chỉ cần biết k. Nội suy trên **giá trị** lr chứ
-không nhân hệ số, nên bước 0 có **đúng** `lr_min` — nhân `lr_max · f` thì điểm
-xuất phát bị quyết định bởi *số bước mỗi epoch* thay vì bởi một khoá trong
-config, và đổi batch_size là đổi luôn lr của bước đầu, lặng lẽ.
-
 **Cái ĐUÔI sau patience.** Khi `patience` epoch liên tiếp val không cải thiện,
 giai đoạn **không dừng ngay**: nó chạy thêm `tail_epochs` epoch với **cosine từ
-lr đang chạy về `lr_min`**, rồi mới lấy checkpoint tốt nhất theo val. Epoch ấy
+lr đang chạy (đã gồm mọi lần chia của chặng 5) về `lr_min`**, rồi mới lấy checkpoint tốt nhất theo val. Epoch ấy
 là một lần "hạ cánh": nó cho phép trọng số rơi vào đáy gần nhất của vùng nó đang
 ở, và điểm val của nó vẫn được đem so với kỷ lục cũ — nên nếu nó tệ hơn thì
 `best` vẫn là epoch cũ, không mất gì.
 
-`lr_from` của đuôi là lr **thật** của bước cuối đã chạy, không phải `lr_main` gõ
-tay: nếu giai đoạn dừng sớm ở giữa chặng `hold` thì lr đang là `lr_max`, và bắt
-đầu đuôi từ `lr_main` là một cú tụt nấc.
+`lr_from` của đuôi là lr **thật** của bước cuối đã chạy — tức đã gồm mọi lần
+chia của chặng 5. Lấy `lr_max` gõ tay là để lr nhảy **lên** mấy nấc rồi mới đi
+xuống, đúng ngược với ý "hạ cánh".
 
 ## 2.1. Stage 0 — DINOv3 finetuning (`src/stage0_vextractor.py`, `src/dino.py`)
 
 | Mô tả | Chỉ huấn luyện **Extractor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Biến Extractor thành module học đặc trưng chất lượng cao trên miền CXR |
-| lr | `lr_min=1e-7` · `lr_max=1e-4` · `lr_main=3e-5` |
-| Epoch | `50` (trần); lịch 25/50/25 gói trong **epoch đầu**, 49 epoch sau phẳng `lr_main` |
-| Patience | `4` — đạt patience thì cosine decay về `lr_min` thêm 1 epoch rồi mới lấy best val |
+| lr | `lr_min=1e-7` · `lr_max=1e-4` (warm-up 1 epoch rồi **giữ** `lr_max`) |
+| Epoch | `50` (trần) |
+| Chặng 5 | mỗi epoch val không cải thiện → lr ÷ `3` (sàn `lr_min`), val khá lên thì giữ nguyên |
+| Patience | `5` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Điểm xuất phát | Nạp lại trọng số pretrain DINOv3 rồi finetune tiếp |
 
 ```
@@ -370,10 +404,11 @@ dùng bản này. Không có đuôi thì `final/` trùng `base/` từng bit.
 | Mô tả | Chỉ huấn luyện **Compressor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Làm giàu không gian Compressor trước khi đưa vào Aligner → Concat |
-| lr (Attn) | `lr_min=1e-8` · `lr_max=7e-5` · `lr_main=1e-5` |
-| lr (FFN) | `lr_min=1e-7` · `lr_max=1e-4` · `lr_main=3e-5` |
-| Epoch | `20` (trần); lịch 25/50/25 gói trong **epoch đầu**, các epoch sau phẳng `lr_main` |
-| Patience | `2` — đạt patience thì cosine decay về `lr_min` thêm 1 epoch rồi mới lấy best val |
+| lr (Attn) | `lr_min=1e-8` · `lr_max=7e-5` |
+| lr (FFN) | `lr_min=1e-7` · `lr_max=1e-4` |
+| Epoch | `20` (trần); warm-up 1 epoch rồi **giữ** `lr_max` của từng nhóm |
+| Chặng 5 | mỗi epoch val không cải thiện → **cả hai nhóm** ÷ `3` (sàn `lr_min` của từng nhóm) |
+| Patience | `3` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Nhãn | DINOv3 Teacher (Extractor Stage 0) + Head Infer (Stage 0) sinh nhãn chuẩn DINOv3 |
 
 ```
@@ -602,13 +637,14 @@ adapters_vextractor/_stage0/                   STAGE 0 — DINOv3 finetune
     base/dino_head.safetensors               DINO head TEACHER (Stage 1 cần)
     final/…                                  tốt nhất sau epoch đuôi — Stage 1 + main stage dùng bản này
     loader.json                              fixture + sha key, `labels: null` (TỰ GIÁM SÁT), thứ tự,
-                                             batch/micro, lịch 25/50/25 (kèm MỐC BƯỚC thật của từng
-                                             chặng), khối `augment` + `dino`, spec, vân tay
-    stage0_history.json                      từng epoch: train/val loss DINO, val_score, phase
+                                             batch/micro, lịch (warm-up + GIỮ lr_max, kèm số bước thật
+                                             + khối `plateau` của chặng 5), `augment` + `dino`,
+                                             spec, vân tay
+    stage0_history.json                      từng epoch: train/val loss DINO, val_score, phase, lr, n_decays
     last/state.pt                            chỉ để chạy tiếp (không đẩy Hub)
 adapters_vextractor/_stage1/                   STAGE 1 — chuyển giao Compressor
     compressor/vextractor_compressor.safetensors|.json   CHỈ Compressor (không Extractor, không Aligner)
-    stage1_history.json                      từng epoch: val loss, lr_attn, lr_ffn, phase
+    stage1_history.json                      từng epoch: val loss, lr_attn, lr_ffn, phase, n_decays
 adapters_vextractor/qlora_r32_decoder_vextractor/   MAIN STAGE
     adapter_model.safetensors, adapter_config.json   LoRA r32
     vextractor_branch.safetensors|.json      TRỌN nhánh: Extractor (đóng băng) + Compressor + Aligner
@@ -645,14 +681,15 @@ history, nên so hash là vứt mọi checkpoint đẩy lên trước lần sử
 configs/vextractor.yaml · configs/gpu/rtx3060.yaml (stage0/stage1 micro_batch + probe_sizes)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → Stage 1 → main B → sinh → chấm) · stats · lens · push
-src/schedule.py          LỊCH DÙNG CHUNG: staged_lr (25/50/25 trong epoch ĐẦU, rồi phẳng) ·
-                         phase_span · tail_lr · warmup_flat · frozen_warmup_flat
+src/schedule.py          LỊCH DÙNG CHUNG: warmup_flat (dốc 1 epoch rồi GIỮ lr_max) ·
+                         plateau_lr (chặng 5: ÷3 mỗi epoch val hỏng, sàn lr_min) ·
+                         phase_of/phase_span · tail_lr · frozen_warmup_flat
                          — một chỗ duy nhất viết công thức
 src/vextractor.py        Extractor (ConvNeXt DINOv3, ladder dựng model có probe forward thật,
-                         NCHW/NHWC/NLC, cắt stage) + Compressor (QFormer: 32 latent @1024,
+                         NCHW/NHWC/NLC, cắt stage) + Compressor (QFormer: 32 latent @768,
                          N nhóm × [SelfAttn → CrossAttn → SwiGLU │ SelfAttn → SwiGLU],
-                         kv 512→1024 trong Cross-attn) + Aligner (RMSNorm(1024) +
-                         SwiGLU 1024→4096→2560, init 1/√fan_in) · vext_tensor · ghi/nạp checkpoint
+                         kv 512→768 trong Cross-attn) + Aligner (RMSNorm(768) +
+                         SwiGLU 768→4096→2560, init 1/√fan_in) · vext_tensor · ghi/nạp checkpoint
 src/dino.py              DINO: multi-crop (PIL), DINO head, teacher EMA, center,
                          lịch τ_t / momentum · CompressorTransferTrainer (Stage 1)
 src/stage0_vextractor.py Stage 0 — DINOv3 finetune (KHÔNG nạp Gemma, KHÔNG nhãn) + loader.json

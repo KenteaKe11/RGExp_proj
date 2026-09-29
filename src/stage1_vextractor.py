@@ -22,20 +22,26 @@ của đích chứ không còn chống sụp (xem `dino.CompressorTransferTraine
 
 ═══ HAI nhóm lr, và đó là điểm riêng của Stage 1 ══════════════════════════════
 
-Cả hai chạy lịch CHUNG của `src/schedule.py` — ba chặng đầu gói TRỌN trong
-`sched_epochs` epoch ĐẦU (mặc định **1**), rồi PHẲNG `lr_main` trên mọi epoch
-còn lại — nhưng trên hai bộ ba số khác nhau:
+Cả hai chạy lịch CHUNG của `src/schedule.py` — warm-up tuyến tính trong
+`warmup_epochs` (1) epoch rồi GIỮ `lr_max` tới hết — nhưng trên hai cặp số
+khác nhau:
 
-    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 7e-5 -> 1e-5
-    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4 -> 3e-5
+    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 7e-5
+    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4
 
 Ma trận attention quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
-một dốc cao hơn.
+một mức cao hơn.
 
-`patience` = 2, và khi nó hết thì Stage 1 chạy thêm `tail_epochs` epoch cosine
-về `lr_min` của TỪNG nhóm rồi mới lấy best val — cùng quy ước với Stage 0.
+**Chặng 5** giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
+chia cho `plateau_gamma` (3), sàn là `lr_min` của từng nhóm, và val khá lên thì
+GIỮ NGUYÊN mức đã tụt. Một bộ đếm chung cho hai nhóm, vì val là MỘT con số —
+không có cách nào nói nhóm nào làm nó xấu đi.
+
+`patience` = 3, và khi nó hết thì Stage 1 chạy thêm `tail_epochs` epoch cosine
+từ lr HIỆN TẠI (đã gồm mọi lần chia) về `lr_min` của TỪNG nhóm rồi mới lấy best
+val — cùng quy ước với Stage 0.
 
 **HAI view, và đúng hai**: teacher một global 448², student một global 448²
 KHÁC (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên
@@ -69,9 +75,9 @@ DIRNAME = "_stage1"
 CKPT = "compressor"                   # thư mục con: _stage1/compressor/
 KEEP = (f"{CKPT}/{Z.COMPRESSOR_FILE}", f"{CKPT}/{Z.COMPRESSOR_META}", HISTORY)
 
-S1_CFG_KEYS = ("attn_lr_min", "attn_lr_max", "attn_lr_main",
-               "ffn_lr_min", "ffn_lr_max", "ffn_lr_main",
-               "sched_epochs", "max_epochs", "tail_epochs", "patience",
+S1_CFG_KEYS = ("attn_lr_min", "attn_lr_max",
+               "ffn_lr_min", "ffn_lr_max", "plateau_gamma",
+               "warmup_epochs", "max_epochs", "tail_epochs", "patience",
                "min_delta", "weight_decay", "batch_size", "micro_batch",
                "probe_sizes", "max_grad_norm", "val_n_samples", "val_resample")
 
@@ -99,16 +105,17 @@ def s1cfg(cfg: Cfg) -> dict:
     out = {
         "attn_lr_min": float(s.get("attn_lr_min", 1e-8)),
         "attn_lr_max": float(s.get("attn_lr_max", 7e-5)),
-        "attn_lr_main": float(s.get("attn_lr_main", 1e-5)),
         "ffn_lr_min": float(s.get("ffn_lr_min", 1e-7)),
         "ffn_lr_max": float(s.get("ffn_lr_max", 1e-4)),
-        "ffn_lr_main": float(s.get("ffn_lr_main", 3e-5)),
-        # CỬA SỔ của ba chặng đầu, tính bằng EPOCH. KHÔNG phải độ dài giai
-        # đoạn — đó là `max_epochs`.
-        "sched_epochs": int(s.get("sched_epochs", 1)),
+        # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —
+        # đó là `max_epochs`.
+        "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
         "max_epochs": int(s.get("max_epochs", 20)),
+        # CHẶNG 5: mỗi epoch val không cải thiện -> CẢ HAI nhóm chia cho ngần
+        # này (sàn `lr_min` của từng nhóm). 1.0 = tắt.
+        "plateau_gamma": float(s.get("plateau_gamma", SCH.PLATEAU_GAMMA)),
         "tail_epochs": int(s.get("tail_epochs", 1)),
-        "patience": int(s.get("patience", 2)),
+        "patience": int(s.get("patience", 3)),
         "min_delta": float(s.get("min_delta", 0.0)),
         "weight_decay": float(s.get("weight_decay", 0.03)),
         "batch_size": int(s.get("batch_size", 32)),
@@ -119,17 +126,20 @@ def s1cfg(cfg: Cfg) -> dict:
         "val_resample": bool(s.get("val_resample", False)),
         "dino": dc,
     }
-    S0._check_lr_triple("stage1 (attn)", out["attn_lr_min"], out["attn_lr_max"],
-                        out["attn_lr_main"])
-    S0._check_lr_triple("stage1 (ffn)", out["ffn_lr_min"], out["ffn_lr_max"],
-                        out["ffn_lr_main"])
-    for k in ("sched_epochs", "max_epochs"):
-        if out[k] < 1:
-            raise TrainUnusable(f"stage1.{k} {out[k]} phải >= 1.")
+    S0._check_lr_pair("stage1 (attn)", out["attn_lr_min"], out["attn_lr_max"])
+    S0._check_lr_pair("stage1 (ffn)", out["ffn_lr_min"], out["ffn_lr_max"])
+    if out["max_epochs"] < 1:
+        raise TrainUnusable(f"stage1.max_epochs {out['max_epochs']} phải >= 1.")
+    if out["warmup_epochs"] < 0:
+        raise TrainUnusable(f"stage1.warmup_epochs {out['warmup_epochs']} phải >= 0.")
     if out["patience"] < 0:
         raise TrainUnusable(f"stage1.patience {out['patience']} phải >= 0.")
     if out["tail_epochs"] < 0:
         raise TrainUnusable(f"stage1.tail_epochs {out['tail_epochs']} phải >= 0.")
+    if out["plateau_gamma"] < 1.0:
+        raise TrainUnusable(
+            f"stage1.plateau_gamma {out['plateau_gamma']} phải >= 1 (1.0 = tắt "
+            f"chặng 5) — hệ số dưới 1 sẽ TĂNG lr đúng lúc val đang xấu đi.")
     if out["batch_size"] % min(out["micro_batch"], out["batch_size"]):
         raise TrainUnusable(f"stage1.micro_batch {out['micro_batch']} phải là "
                             f"ước của stage1.batch_size {out['batch_size']} — "
@@ -138,17 +148,23 @@ def s1cfg(cfg: Cfg) -> dict:
     return out
 
 
-def lrs_at(step: int, sc: dict, steps_per_epoch: int) -> dict:
-    """lr của HAI nhóm tại bước `step` — cùng lịch 25/50/25, hai bộ ba số.
+def lrs_at(step: int, sc: dict, steps_per_epoch: int, n_decays: int = 0) -> dict:
+    """lr của HAI nhóm tại bước `step` — hai chặng + chặng 5, hai cặp số.
 
-    Cửa sổ của ba chặng đầu là `sched_epochs` epoch (mặc định 1); từ bước
-    `sched_epochs × steps_per_epoch` trở đi cả hai nhóm chạy phẳng `lr_main`.
+    Dốc warm-up dài `warmup_epochs × steps_per_epoch` bước; sau đó mỗi nhóm
+    GIỮ `lr_max` của chính nó tới hết.
+
+    Chặng 5 chia CẢ HAI nhóm cho `plateau_gamma**n_decays` — một bộ đếm chung,
+    vì val là MỘT con số: không có cách nào nói nhóm nào làm val xấu đi, nên
+    tách hai bộ đếm ở đây là bịa ra một tín hiệu không tồn tại. Sàn của từng
+    nhóm là `lr_min` của chính nó.
     """
-    n = max(1, int(sc["sched_epochs"]) * int(steps_per_epoch))
-    return {"attn": SCH.staged_lr(step, n, sc["attn_lr_min"], sc["attn_lr_max"],
-                                  sc["attn_lr_main"]),
-            "ffn": SCH.staged_lr(step, n, sc["ffn_lr_min"], sc["ffn_lr_max"],
-                                 sc["ffn_lr_main"])}
+    w = S0.warmup_steps(sc, steps_per_epoch)
+    g = sc["plateau_gamma"]
+    def _one(lo, hi):
+        return SCH.plateau_lr(SCH.warmup_flat(step, w, lo, hi), n_decays, lo, g)
+    return {"attn": _one(sc["attn_lr_min"], sc["attn_lr_max"]),
+            "ffn": _one(sc["ffn_lr_min"], sc["ffn_lr_max"])}
 
 
 def tail_lrs_at(step: int, n_tail: int, frm: dict, sc: dict) -> dict:
@@ -317,13 +333,15 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             f"stage1.micro_batch {micro} phải là ước của batch_size "
             f"{sc['batch_size']}.")
     steps_per_epoch = max(1, len(ds) // int(sc["batch_size"]))
-    _b = SCH.phase_bounds(sc["sched_epochs"] * steps_per_epoch)
-    print(f"  Stage 1 · lịch chung 25/50/25 gói trong {sc['sched_epochs']} epoch "
-          f"ĐẦU ({_b['warmup']}+{_b['hold']}+{_b['decay']} bước) rồi PHẲNG · "
-          f"attn {sc['attn_lr_min']:g} -> {sc['attn_lr_max']:g} -> "
-          f"{sc['attn_lr_main']:g} │ ffn {sc['ffn_lr_min']:g} -> "
-          f"{sc['ffn_lr_max']:g} -> {sc['ffn_lr_main']:g} · wd "
-          f"{sc['weight_decay']} · TRẦN {sc['max_epochs']} epoch, patience "
+    _w = S0.warmup_steps(sc, steps_per_epoch)
+    print(f"  Stage 1 · lịch chung: warm-up {sc['warmup_epochs']:g} epoch "
+          f"({_w} bước) rồi GIỮ · "
+          f"attn {sc['attn_lr_min']:g} -> {sc['attn_lr_max']:g} │ "
+          f"ffn {sc['ffn_lr_min']:g} -> {sc['ffn_lr_max']:g} · wd "
+          f"{sc['weight_decay']} · chặng 5: mỗi epoch val không cải thiện thì "
+          f"CẢ HAI nhóm ÷{sc['plateau_gamma']:g}"
+          + (" (TẮT)" if sc['plateau_gamma'] == 1.0 else "")
+          + f" · TRẦN {sc['max_epochs']} epoch, patience "
           f"{sc['patience']} (+{sc['tail_epochs']} epoch đuôi cosine về lr_min) "
           f"· batch {sc['batch_size']} · val {sc['val_n_samples']} mẫu",
           flush=True)
@@ -386,15 +404,19 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
 
     hist: list[dict] = []
     best, best_ep, wait, best_sd = None, 0, 0, None
+    # CHẶNG 5 — TỔNG số epoch val không cải thiện. KHÔNG reset khi val khá lên
+    # (khác `wait`, vốn đếm chuỗi liên tiếp và quyết định lúc nào dừng).
+    n_decays = 0
     t0 = time.time()
     stopped_early = False
 
-    def _record(ep: int, tl: float, lrs: dict, phase: str) -> float:
+    def _record(ep: int, tl: float, lrs: dict, phase: str) -> bool:
+        """-> `improved`. CHẶNG 5 ở người gọi, vì nó đổi lr của epoch SAU."""
         nonlocal best, best_ep, wait, best_sd
         v = _val()
         score = -v
         hist.append({"epoch": ep, "train_loss": tl, "val_loss": v,
-                     "score": score, "phase": phase,
+                     "score": score, "phase": phase, "n_decays": n_decays,
                      "lr_attn": lrs["attn"], "lr_ffn": lrs["ffn"]})
         print(f"  [stage1] epoch {ep}/{sc['max_epochs']} ({phase}): val {v:.4f} "
               f"(score {score:+.4f})", flush=True)
@@ -406,20 +428,26 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             best, best_ep, wait = score, ep, 0
             best_sd = {k: t.detach().to("cpu").clone()
                        for k, t in cp.state_dict().items()}
-        else:
-            wait += 1
-        return score
+            return True
+        wait += 1
+        return False
 
     ep = 0
     lrs_last = lrs_at(0, sc, steps_per_epoch)
     for ep in range(1, sc["max_epochs"] + 1):
         s_first = (ep - 1) * steps_per_epoch
         phase = SCH.phase_span(s_first, ep * steps_per_epoch - 1,
-                               sc["sched_epochs"] * steps_per_epoch)
+                               S0.warmup_steps(sc, steps_per_epoch))
         ds.set_epoch(ep)
-        tl, lrs_last = run_epoch(ep, lambda gs: lrs_at(gs, sc, steps_per_epoch),
-                                 s_first)
-        _record(ep, tl, lrs_last, phase)
+        _nd = n_decays          # hằng số TRONG epoch này
+        tl, lrs_last = run_epoch(
+            ep, lambda gs: lrs_at(gs, sc, steps_per_epoch, _nd), s_first)
+        if not _record(ep, tl, lrs_last, phase):
+            n_decays += 1
+            _now = lrs_at(ep * steps_per_epoch, sc, steps_per_epoch, n_decays)
+            print(f"    [stage1] val không cải thiện -> chặng 5: lr ÷"
+                  f"{sc['plateau_gamma']:g} (lần {n_decays}) -> attn "
+                  f"{_now['attn']:.2e} · ffn {_now['ffn']:.2e}", flush=True)
         if sc["patience"] and wait >= sc["patience"]:
             stopped_early = True
             print(f"  ⏹ Stage 1 DỪNG SỚM ở epoch {ep}/{sc['max_epochs']}: "
@@ -432,7 +460,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     ran_tail = False
     if stopped_early and sc["tail_epochs"] > 0:
         n_tot = max(1, steps_per_epoch * sc["tail_epochs"])
-        frm = dict(lrs_last)
+        # Điểm xuất phát của đuôi là lr **hiện tại** — đã gồm lần chia vừa xảy
+        # ra ở epoch cuối. Dùng `lrs_last` (giá trị TRƯỚC lần chia) là để lr
+        # nhảy LÊN một nấc rồi mới đi xuống.
+        frm = lrs_at(ep * steps_per_epoch, sc, steps_per_epoch, n_decays)
+        print(f"  [stage1] epoch đuôi: cosine attn {frm['attn']:.2e} · ffn "
+              f"{frm['ffn']:.2e} -> lr_min trong {sc['tail_epochs']} epoch",
+              flush=True)
         for k in range(1, sc["tail_epochs"] + 1):
             ep_t = ep + k
             ds.set_epoch(ep_t)
@@ -451,6 +485,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     h = {"inputs": cfg_inputs(cfg), "fingerprint": config_fingerprint(cfg),
          "best_epoch": best_ep, "best_score": best, "history": hist,
          "stopped_early": stopped_early, "ran_tail": ran_tail,
+         "n_decays": n_decays,
          "n_params": {"attn": n_at, "ffn": n_ff, "total": n_at + n_ff},
          "steps_per_epoch": steps_per_epoch, "micro_batch": micro,
          "minutes": (time.time() - t0) / 60, "teacher_head": head_src,

@@ -20,8 +20,8 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  12. Stage 0 + Stage 1 + main stage nằm trong plan đẩy Hub; weight B của một
      KIẾN TRÚC KHÁC bị phát hiện trước khi `train` bỏ qua main stage
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
- 14. LỊCH CHUNG 25/50/25 (src/schedule.py) + ba bộ ba lr của đặc tả
- 15. Stage 0 chạy THẬT trên mô hình giả: lịch 25/50/25, dừng sớm theo patience,
+ 14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, + chặng 5) và hai cặp lr
+ 15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
  16. Stage 1 chạy THẬT: HAI nhóm lr (attn | ffn), teacher ĐỨNG YÊN
  17. main stage: Aligner học từ bước 0, Compressor đóng băng 20% rồi warm-up
@@ -78,7 +78,10 @@ SMALL_SWIN = "swinv2_tiny_window8_256"
 # BẰNG nhau thì mọi lỗi lẫn chiều đều lọt qua vì shape tình cờ khớp.
 SMALL_DL = 16
 SMALL_MLP = 24        # mlp_hidden của Compressor — KHÁC aligner.mlp_hidden (64)
-SMALL_NB = 2          # N: số nhóm khối (khối 1 -> khối 2)
+# N của config thật là 5; selftest giữ 2 cho nhanh — `n_blocks` được kiểm
+# riêng ở check 2 (len(cp.groups) == N) và ở check 22 (số tham số dựng lại từ
+# CONFIG THẬT, nên N = 5 vẫn bị khoá).
+SMALL_NB = 2
 
 
 def small_cfg(image_size=SMALL_IMG, n_query=SMALL_Q, d_latent=None,
@@ -955,7 +958,7 @@ def _():
     assert "asl" not in cfg["stage0"] and "val_classes" not in cfg["stage0"]
 
 
-@check("14. LỊCH CHUNG 25/50/25 (src/schedule.py) + ba bộ ba lr của đặc tả")
+@check("14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, + chặng 5) và hai cặp lr của đặc tả")
 def _():
     from src import schedule as S
     from src import stage0_vextractor as s0
@@ -964,53 +967,52 @@ def _():
     from src.config import load_config
     from src.train_vextractor import MAIN_CFG_KEYS, zcfg
 
-    # ── hình dạng lịch: bốn chặng, mốc đúng tỉ lệ ──────────────────────────
-    # `n` = cửa sổ của BA CHẶNG ĐẦU = MỘT epoch (200 bước với 6400 mẫu / batch
-    # 32), KHÔNG phải cả giai đoạn.
-    n = 200
-    b = S.phase_bounds(n)
-    assert (b["warmup"], b["hold"], b["decay"]) == (50, 100, 50)
-    lo, hi, mid = 1e-7, 1e-4, 3e-5
-    f = lambda k: S.staged_lr(k, n, lo, hi, mid)          # noqa: E731
-    assert f(0) == lo                     # bước 0 có ĐÚNG lr_min
-    assert abs(f(50) - hi) < 1e-18        # đỉnh ở cuối warm-up
-    assert f(149) == hi and f(100) == hi  # giữ phẳng suốt chặng 2
-    assert abs(f(200) - mid) < 1e-15      # đáy cosine = lr_main
-    assert f(250) == mid                  # chặng 4: phẳng lr_main
-    up = [f(k) for k in range(51)]
-    assert all(x <= y + 1e-18 for x, y in zip(up, up[1:]))     # warm-up ĐƠN ĐIỆU tăng
-    down = [f(k) for k in range(150, 201)]
-    assert all(x >= y - 1e-18 for x, y in zip(down, down[1:]))  # decay ĐƠN ĐIỆU giảm
-    for k, want in ((0, "warmup"), (50, "hold"), (150, "decay"), (200, "flat")):
-        assert S.phase_name(k, n) == want, (k, S.phase_name(k, n))
-    # ── đuôi: cosine từ lr ĐANG chạy về lr_min ────────────────────────────
-    assert S.tail_lr(0, 10, mid, lo) == mid and abs(S.tail_lr(10, 10, mid, lo) - lo) < 1e-18
-    t = [S.tail_lr(k, 10, mid, lo) for k in range(11)]
+    # ── hình dạng lịch: dốc rồi GIỮ, KHÔNG có chặng hạ nào ────────────────
+    w = 200                                   # 1 epoch = 200 bước
+    lo, hi = 1e-7, 1e-4
+    f = lambda k: S.warmup_flat(k, w, lo, hi)             # noqa: E731
+    assert f(0) == lo                         # bước 0 có ĐÚNG lr_min
+    assert f(w) == hi and f(10 * w) == hi     # chạm đỉnh rồi GIỮ, không hạ
+    up = [f(k) for k in range(w + 1)]
+    assert all(x <= y + 1e-18 for x, y in zip(up, up[1:]))     # ĐƠN ĐIỆU tăng
+    assert abs(f(w // 2) - (lo + hi) / 2) < 1e-9               # TUYẾN TÍNH
+    assert S.warmup_flat(0, 0, lo, hi) == hi                   # w = 0 -> vào thẳng
+    assert S.phase_of(0, w) == "warmup" and S.phase_of(w, w) == "hold"
+    assert S.phase_span(0, w - 1, w) == "warmup"
+    assert S.phase_span(w, 2 * w - 1, w) == "hold"
+    assert S.phase_span(w - 1, w, w) == "warmup→hold"          # epoch bắc qua ranh
+    # Lịch cũ đã BIẾN MẤT hẳn: không còn chặng giữ đỉnh + cosine về lr_main.
+    for gone in ("staged_lr", "phase_bounds", "WARMUP_FRAC", "HOLD_FRAC",
+                 "DECAY_FRAC", "phase_name"):
+        assert not hasattr(S, gone), gone
+
+    # ── ĐUÔI: cosine từ lr ĐANG chạy về lr_min ────────────────────────────
+    assert S.tail_lr(0, 10, 3e-5, lo) == 3e-5
+    assert abs(S.tail_lr(10, 10, 3e-5, lo) - lo) < 1e-18
+    t = [S.tail_lr(k, 10, 3e-5, lo) for k in range(11)]
     assert all(x >= y - 1e-18 for x, y in zip(t, t[1:]))
-    # ── main stage: warm-up rồi phẳng; và 0 TUYỆT ĐỐI trong phần đóng băng ─
+
+    # ── main stage: dốc theo BƯỚC, và 0 TUYỆT ĐỐI trong phần đóng băng ────
     assert S.warmup_flat(0, 20, 1e-6, 1e-4) == 1e-6
     assert S.warmup_flat(20, 20, 1e-6, 1e-4) == 1e-4 == S.warmup_flat(99, 20, 1e-6, 1e-4)
-    assert S.warmup_flat(0, 0, 1e-6, 1e-4) == 1e-4          # w = 0 -> phẳng ngay
     assert S.frozen_warmup_flat(39, 40, 20, 1e-8, 1e-5) == 0.0
     assert S.frozen_warmup_flat(40, 40, 20, 1e-8, 1e-5) == 1e-8
     assert S.frozen_warmup_flat(60, 40, 20, 1e-8, 1e-5) == 1e-5
     assert S.steps_for_frac(200, 0.2) == 40 and S.steps_for_frac(200, 0.1) == 20
 
-    # ── ba bộ ba lr, ĐÚNG như đặc tả ──────────────────────────────────────
+    # ── hai CẶP lr, ĐÚNG như đặc tả ───────────────────────────────────────
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr_min"], sc["lr_max"], sc["lr_main"]) == (1e-7, 1e-4, 3e-5)
-    # CỬA SỔ của ba chặng đầu là MỘT epoch; TRẦN của giai đoạn là 50 epoch.
-    # Gộp hai khoá này (sched_epochs = max_epochs) cho một đường lr KHÁC HẲN —
-    # warm-up kéo 12,5 epoch và chặng 4 rỗng — mà không có gì báo.
-    assert sc["sched_epochs"] == 1 and sc["max_epochs"] == 50
-    assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
+    assert (sc["lr_min"], sc["lr_max"]) == (1e-7, 1e-4)
+    assert "lr_main" not in sc and "sched_epochs" not in sc
+    assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
+    assert sc["patience"] == 5 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
-    assert (s1c["attn_lr_min"], s1c["attn_lr_max"], s1c["attn_lr_main"]) == (1e-8, 7e-5, 1e-5)
-    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"], s1c["ffn_lr_main"]) == (1e-7, 1e-4, 3e-5)
-    assert s1c["sched_epochs"] == 1 and s1c["max_epochs"] == 20
-    assert s1c["patience"] == 2
+    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 7e-5)
+    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 1e-4)
+    assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 20
+    assert s1c["patience"] == 3
     zc = zcfg(cfg)
     assert set(zc) == set(MAIN_CFG_KEYS)
     assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
@@ -1018,31 +1020,57 @@ def _():
     assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 1e-5)
     assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
 
-    # ── chặng 4 PHỦ phần lớn giai đoạn, không phải một mẩu dư ────────────
-    # Đây là bài kiểm chống ĐÚNG cách đọc sai đã xảy ra một lần: hiểu "25%
-    # epoch" thành "25% tổng số epoch". Với cách đọc ấy, lr ở giữa giai đoạn
-    # (epoch 25/50) vẫn đang ở ĐỈNH; với cách đọc đúng, mọi epoch từ epoch 2
-    # trở đi đã phẳng ở `lr_main`.
+    # ── `lr_max` là MỨC CHẠY: mọi epoch sau epoch 1 đều ở đó ──────────────
+    # Bài kiểm này chống đúng cách đọc sai đã xảy ra: hiểu `lr_max` là một đỉnh
+    # tạm rồi hạ về một `lr_main` nào đó. Không có `lr_main` trong lịch chung.
     spe = 200                                   # 6400 mẫu / batch 32
-    win = sc["sched_epochs"] * spe
-    assert win == spe, "cửa sổ lịch phải là ĐÚNG một epoch"
-    for ep in range(2, sc["max_epochs"] + 1):   # epoch 2..50: PHẲNG lr_main
+    assert s0.warmup_steps(sc, spe) == spe
+    for ep in range(2, sc["max_epochs"] + 1):
         for k in ((ep - 1) * spe, ep * spe - 1):
-            assert s0.sched_lr_at(k, sc, spe) == sc["lr_main"], (ep, k)
-    # epoch 1 thì đi qua CẢ BA chặng
-    assert S.phase_span(0, spe - 1, win) == "warmup→decay"
-    assert S.phase_span(spe, 2 * spe - 1, win) == "flat"
+            assert s0.sched_lr_at(k, sc, spe) == sc["lr_max"], (ep, k)
     assert s0.sched_lr_at(0, sc, spe) == sc["lr_min"]
-    assert s0.sched_lr_at(spe // 4, sc, spe) == sc["lr_max"]
-    # Stage 1 cũng vậy — hai nhóm, cùng một cửa sổ
-    for k in (s1c["sched_epochs"] * spe, 10 * spe):
-        assert s1.lrs_at(k, s1c, spe) == {"attn": s1c["attn_lr_main"],
-                                          "ffn": s1c["ffn_lr_main"]}
+    for k in (s1c["warmup_epochs"] * spe, 10 * spe):
+        assert s1.lrs_at(int(k), s1c, spe) == {"attn": s1c["attn_lr_max"],
+                                               "ffn": s1c["ffn_lr_max"]}
 
-    # ── ba đỉnh phải theo thứ tự, và khoá LẠ bị từ chối ───────────────────
+    # ── CHẶNG 5: ÷gamma mỗi lần patience tăng, sàn lr_min, KHÔNG leo lại ──
+    assert S.PLATEAU_GAMMA == 3.0
+    assert sc["plateau_gamma"] == s1c["plateau_gamma"] == 3.0
+    assert S.plateau_lr(3e-5, 0, 1e-7) == 3e-5
+    assert abs(S.plateau_lr(3e-5, 1, 1e-7) - 1e-5) < 1e-18
+    assert abs(S.plateau_lr(3e-5, 2, 1e-7) - 3e-5 / 9) < 1e-18
+    # SÀN ở lr_min: không có sàn thì epoch ĐUÔI (cosine *về* lr_min) thành một
+    # cú TĂNG lr, đúng ngược với ý của nó.
+    assert S.plateau_lr(3e-5, 99, 1e-7) == 1e-7
+    ladder = [S.plateau_lr(3e-5, k, 1e-7) for k in range(10)]
+    assert all(x >= y for x, y in zip(ladder, ladder[1:]))      # ĐƠN ĐIỆU giảm
+    # gamma = 1.0 TẮT hẳn chặng 5 — và đó mới là khoá để tắt, KHÔNG phải
+    # `patience: 0` (patience chỉ gác việc DỪNG).
+    assert S.plateau_lr(3e-5, 5, 1e-7, gamma=1.0) == 3e-5
+    for blk, mod in (("stage0", s0.s0cfg), ("stage1", s1.s1cfg)):
+        c = dict(cfg)
+        c[blk] = dict(cfg[blk], plateau_gamma=0.5)
+        try:
+            mod(c)
+        except TrainUnusable as e:
+            assert "plateau_gamma" in str(e), e
+        else:
+            raise AssertionError(f"{blk}.plateau_gamma < 1 phải bị từ chối")
+    # áp lên CẢ đường lr của hai giai đoạn; hai nhóm của Stage 1 dùng CHUNG một
+    # bộ đếm (val là MỘT con số), nhưng sàn thì RIÊNG của từng nhóm.
+    flat = 5 * spe
+    assert s0.sched_lr_at(flat, sc, spe, 0) == sc["lr_max"]
+    assert abs(s0.sched_lr_at(flat, sc, spe, 1) - sc["lr_max"] / 3) < 1e-18
+    l0, l1 = s1.lrs_at(flat, s1c, spe, 0), s1.lrs_at(flat, s1c, spe, 1)
+    assert abs(l1["attn"] - l0["attn"] / 3) < 1e-18
+    assert abs(l1["ffn"] - l0["ffn"] / 3) < 1e-18
+    deep = s1.lrs_at(flat, s1c, spe, 99)
+    assert deep["attn"] == s1c["attn_lr_min"] and deep["ffn"] == s1c["ffn_lr_min"]
+
+    # ── lr_min <= lr_max, và khoá của bản CŨ bị từ chối ───────────────────
     for blk, mod, bad in (("stage0", s0.s0cfg, {"lr_min": 1e-3}),
                           ("stage0", s0.s0cfg, {"lr_min": 0.0}),
-                          ("stage1", s1.s1cfg, {"attn_lr_main": 1.0}),
+                          ("stage1", s1.s1cfg, {"attn_lr_max": 1e-12}),
                           ("stage1", s1.s1cfg, {"ffn_lr_min": 0.0})):
         c = dict(cfg)
         c[blk] = dict(cfg[blk], **bad)
@@ -1052,15 +1080,19 @@ def _():
             pass
         else:
             raise AssertionError(f"{blk} {bad} phải bị từ chối")
-    for blk, mod in (("stage0", s0.s0cfg), ("stage1", s1.s1cfg)):
+    for blk, mod, stale in (("stage0", s0.s0cfg, "lr_main"),
+                            ("stage0", s0.s0cfg, "sched_epochs"),
+                            ("stage0", s0.s0cfg, "lr"),
+                            ("stage1", s1.s1cfg, "attn_lr_main"),
+                            ("stage1", s1.s1cfg, "sched_epochs")):
         c = dict(cfg)
-        c[blk] = dict(cfg[blk], lr=1e-5)          # khoá của bản CŨ
+        c[blk] = dict(cfg[blk], **{stale: 1e-5})
         try:
             mod(c)
         except TrainUnusable as e:
-            assert "khoá lạ" in str(e), e
+            assert "khoá lạ" in str(e), (blk, stale, e)
         else:
-            raise AssertionError(f"{blk}.lr (khoá cũ) phải bị từ chối")
+            raise AssertionError(f"{blk}.{stale} (khoá cũ) phải bị từ chối")
     c = dict(cfg)
     c["vextractor"] = dict(cfg["vextractor"],
                            main=dict(cfg["vextractor"]["main"], align_lr=1e-5))
@@ -1082,7 +1114,7 @@ def _():
         raise AssertionError("freeze + warmup > 1 phải bị từ chối")
 
 
-@check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): lịch 25/50/25, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min, rồi mới lấy best val")
+@check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): warm-up 1 epoch rồi GIỮ lr_max, chặng 5 ÷3, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min")
 def _():
     import json
 
@@ -1106,7 +1138,8 @@ def _():
                                    local_size=SMALL_IMG // 2, n_local=2,
                                    out_dim=64, hidden=32, bottleneck=16),
                          batch_size=4, micro_batch=2, probe_sizes=[2, 4],
-                         sched_epochs=1, max_epochs=8, patience=2, tail_epochs=1)
+                         warmup_epochs=1.0, max_epochs=8, patience=2,
+                         tail_epochs=1)
     cfg["autobatch"] = {"enabled": False}
     keys = [f"k{i}" for i in range(12)]
 
@@ -1156,11 +1189,11 @@ def _():
             assert pushed == ["base"], pushed
             assert h["finished"] and h["base_finished"]
             ph = [(x["epoch"], x["phase"]) for x in h["history"]]
-            # cửa sổ MỘT epoch: epoch 1 đi qua cả ba chặng, epoch 2+ PHẲNG
+            # warm-up ĐÚNG một epoch: epoch 1 là "warmup", epoch 2+ là "hold"
             spe_ = h["steps_per_epoch"]
             want_ph = [SCH.phase_span((e - 1) * spe_, e * spe_ - 1, spe_)
                        for e in range(1, h["base_epochs_run"] + 1)]
-            assert want_ph[0] != "flat" and set(want_ph[1:]) <= {"flat"}, want_ph
+            assert want_ph[0] == "warmup" and set(want_ph[1:]) <= {"hold"}, want_ph
             assert [p for _e, p in ph[:len(want_ph)]] == want_ph, ph
             # ĐUÔI chỉ chạy khi dừng sớm
             tails = [e for e, p in ph if p == "tail"]
@@ -1168,6 +1201,41 @@ def _():
             if h["stopped_early"]:
                 assert h["ran_tail"] and len(tails) == 1
                 assert tails[0] == h["base_epochs_run"] + 1
+            # ── CHẶNG 5 trên lượt chạy THẬT ──────────────────────────────
+            sc_live = s0.s0cfg(cfg)
+            spe_ = h["steps_per_epoch"]
+            sched = [x for x in h["history"] if x["phase"] != "tail"]
+            scores = [x["val_score"] for x in sched]
+            got_nd = [x["n_decays"] for x in sched]
+            # `n_decays` = TỔNG số epoch val không cải thiện, tính lại từ chính
+            # đường val đã ghi. Đây là bài kiểm thật: nó bắt được cả việc quên
+            # tăng bộ đếm lẫn việc RESET nó khi val khá lên.
+            want_nd, run_best, k = [], None, 0
+            for v in scores:
+                if run_best is None or v > run_best:
+                    run_best = v
+                else:
+                    k += 1
+                want_nd.append(k)
+            assert got_nd == want_nd, (got_nd, want_nd)
+            assert got_nd == sorted(got_nd)              # KHÔNG BAO GIỜ giảm
+            assert got_nd[-1] == h["n_decays"] >= 1, (got_nd, h["n_decays"])
+            # lr của MỖI epoch = lịch tại bước cuối epoch ấy, chia theo bộ đếm
+            # ở ĐẦU epoch (tức trước lần chia của chính nó).
+            for i, x in enumerate(sched, start=1):
+                nd_in = 0 if i == 1 else got_nd[i - 2]
+                want_lr = s0.sched_lr_at(i * spe_ - 1, sc_live, spe_, nd_in)
+                assert abs(x["lr"] - want_lr) < 1e-18, (i, x["lr"], want_lr, nd_in)
+            # val khá lên thì lr GIỮ NGUYÊN, không leo lại -> đơn điệu giảm kể
+            # từ epoch 2 (epoch 1 còn đang warm-up đi LÊN).
+            lrs_ = [x["lr"] for x in sched][1:]
+            assert all(y <= x + 1e-18 for x, y in zip(lrs_, lrs_[1:])), lrs_
+            # `last/state.pt` phải mang `n_decays`: thiếu nó thì chạy tiếp sau
+            # khi đứt sẽ khôi phục lr về mức CHƯA chia, và không có gì báo.
+            st_ = torch.load(d / "last" / "state.pt", map_location="cpu",
+                             weights_only=False)
+            assert st_["n_decays"] == h["n_decays"], st_["n_decays"]
+
             # `final/` mang trọng số của epoch TỐT NHẤT — không phải epoch cuối
             from safetensors.torch import load_file
 
@@ -1279,8 +1347,8 @@ def _():
                                    local_size=SMALL_IMG // 2, n_local=2,
                                    out_dim=32, hidden=16, bottleneck=8,
                                    head_layers=2))
-    cfg["stage1"] = dict(cfg["stage1"], sched_epochs=4, max_epochs=2, patience=0,
-                         tail_epochs=0, batch_size=4, micro_batch=2,
+    cfg["stage1"] = dict(cfg["stage1"], warmup_epochs=1.0, max_epochs=2,
+                         patience=0, tail_epochs=0, batch_size=4, micro_batch=2,
                          val_n_samples=4)
 
     def _views(self, i):
@@ -1317,6 +1385,12 @@ def _():
             # lr của HAI nhóm khác nhau ở mọi epoch, và attn < ffn
             for x in h["history"]:
                 assert x["lr_attn"] < x["lr_ffn"], x
+            # `lr_max` là MỨC CHẠY: sau warm-up cả hai nhóm GIỮ nguyên ở đó
+            s1c_ = s1.s1cfg(cfg)
+            spe1 = h["steps_per_epoch"]
+            after = s1.lrs_at(s1.S0.warmup_steps(s1c_, spe1), s1c_, spe1)
+            assert after == {"attn": s1c_["attn_lr_max"],
+                             "ffn": s1c_["ffn_lr_max"]}, after
             # Extractor ĐỨNG YÊN: trọng số Stage 0 không đổi một bit
             d1 = s1.stage1_dir(cfg)
             assert R.compressor_exists(d1 / s1.CKPT)
@@ -1415,8 +1489,8 @@ def _():
         hub = td / "hub"
         cfg = Cfg(json.loads(json.dumps({
             "seed": 42,
-            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
-                       "sched_epochs": 3, "max_epochs": 3},
+            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4,
+                       "warmup_epochs": 1.0, "max_epochs": 3},
             "vextractor": small_cfg()["vextractor"],
             "output": {"adapter_dir": str(td / "ad"), "hub_repo": "x/y",
                        "hub_repo_type": "dataset", "hub_root": "current",
@@ -1853,8 +1927,8 @@ def _():
         for blk, patch in over.pop("vx", {}).items():
             vx[blk] = dict(vx.get(blk) or {}, **patch)
         return {"seed": 42,
-                "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
-                           "max_epochs": 3, "sched_epochs": 3},
+                "stage0": {"lr_min": 1e-7, "lr_max": 1e-4,
+                           "warmup_epochs": 1.0, "max_epochs": 3},
                 "vextractor": vx}
 
     ref = s0.config_fingerprint(cfg_of())
@@ -1883,7 +1957,7 @@ def _():
                    ("pretrained", cfg_of(vx={"extractor": {"pretrained": True}}))):
         assert s0.config_fingerprint(c) != ref, f"đổi {key} PHẢI đổi vân tay"
     for key, val in (("lr_max", 5e-4), ("patience", 9), ("tail_epochs", 3),
-                     ("sched_epochs", 7)):
+                     ("warmup_epochs", 2.0), ("plateau_gamma", 5.0)):
         c = cfg_of()
         c["stage0"][key] = val
         assert s0.config_fingerprint(c) != ref, key
@@ -1942,8 +2016,8 @@ def _():
     with tempfile.TemporaryDirectory() as td:
         cfg = Cfg(json.loads(json.dumps({
             "seed": 42,
-            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "lr_main": 3e-5,
-                       "max_epochs": 3, "sched_epochs": 3, "micro_batch": 8},
+            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4, "warmup_epochs": 1.0,
+                       "max_epochs": 3, "micro_batch": 8},
             "vextractor": small_cfg()["vextractor"],
             "output": {"adapter_dir": td}})))
         d = s0.stage0_dir(cfg)

@@ -390,10 +390,10 @@ def main(argv: list[str] | None = None) -> int:
         # `warmup_epochs = 0` để lr không còn phụ thuộc số bước của lần chạy
         # thật (dry-run chỉ chạy vài bước mỗi epoch) — và để phần base rút còn
         # ĐÚNG 1 epoch: `base_epochs = ceil(warmup_epochs) + max_epochs`.
-        cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, sched_epochs=1,
+        cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, warmup_epochs=1.0,
                              patience=0, tail_epochs=0)
         cfg["stage1"] = dict(cfg.get("stage1") or {}, max_epochs=1,
-                             sched_epochs=1, patience=0, tail_epochs=0)
+                             warmup_epochs=1.0, patience=0, tail_epochs=0)
         cfg["stats"] = dict(cfg["stats"], n_perm=200, n_boot=200)
         cfg["output"] = dict(cfg["output"], push=False, pull=False,
                              subdir=cfg["output"]["subdir"] + "_dryrun",

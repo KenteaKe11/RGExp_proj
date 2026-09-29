@@ -10,14 +10,14 @@
             └───────┬──────────────────────────────────────────┘
                     │ V
             ┌───────▼──────────────────────────────────────────┐
-            │ 2. COMPRESSOR — QFormer, 32 latent @ 1024, N = 2  │  Stage 1 dạy
+            │ 2. COMPRESSOR — QFormer, 32 latent @ 768, N = 5   │  Stage 1 dạy
             │    khối 1: Q -> SelfAttn -> CrossAttn(Q, V) -> FFN│
             │    khối 2: Q -> SelfAttn -> FFN                   │
-            │    -> V_c (B, 32, 1024)                           │
+            │    -> V_c (B, 32, 768)                            │
             └───────┬──────────────────────────────────────────┘
                     │ V_c
             ┌───────▼──────────────────────────────────────────┐
-            │ 3. ALIGNER — RMSNorm(1024) + SwiGLU 1024→4096→2560│  Main stage dạy
+            │ 3. ALIGNER — RMSNorm(768) + SwiGLU 768→4096→2560  │  Main stage dạy
             │    -> Q (B, 32, 2560)                             │
             └───────┬──────────────────────────────────────────┘
                     │
@@ -64,7 +64,7 @@ ngay lúc dựng backbone.
 
 ═══ 2. COMPRESSOR ═════════════════════════════════════════════════════════════
 
-QFormer: **32 latent vector học được @ 1024**, `N = 2` nhóm khối, mỗi nhóm gồm
+QFormer: **32 latent vector học được @ 768**, `N = 5` nhóm khối, mỗi nhóm gồm
 HAI khối:
 
     khối 1:  Q ─► SelfAttn ─► CrossAttn(Q, V) ─► FFN ─► Q'
@@ -73,25 +73,26 @@ HAI khối:
 Pre-norm + residual quanh TỪNG khối con (RMSNorm trước, cộng sau), đúng quy ước
 của Gemma 3.
 
-**512 -> 1024 xảy ra NGAY TRONG Cross-attn**, không có `Linear 512→1024` đứng
-trước. `k_proj` và `v_proj` nhận 512 và trả 1024; `q_proj`/`o_proj` ở 1024. Đây
-là lựa chọn có hệ quả đếm được: một lớp chiếu riêng sẽ thêm 0,53 M tham số và
-đẩy mỗi nhóm khối lệch khỏi con số đặc tả. Thứ DUY NHẤT đứng trước Cross-attn
-là `RMSNorm(512)` trên V (512 tham số) — nó đưa key/value về RMS ≈ 1, thang mà
-mọi phép attention bên trên được thiết kế cho.
+**512 -> 768 xảy ra NGAY TRONG Cross-attn**, không có `Linear 512→768` đứng
+trước. `k_proj` và `v_proj` nhận 512 và trả 768; `q_proj`/`o_proj` ở 768. Đây
+là lựa chọn có hệ quả đếm được: một lớp chiếu riêng sẽ thêm 0,39 M tham số mà
+không thêm sức biểu diễn nào — nó chỉ gộp được vào `k`/`v` phía sau. Thứ DUY
+NHẤT đứng trước Cross-attn là `RMSNorm(512)` trên V (512 tham số) — nó đưa
+key/value về RMS ≈ 1, thang mà mọi phép attention bên trên được thiết kế cho.
 
 **`head_dim` = 128 là khoá KHAI, `n_heads` được SUY RA** (`d_latent // head_dim`
-= 8 ở 1024). Chiều ngược lại — khai `n_heads` rồi để `head_dim` rơi ra — là
-cách head_dim đổi lặng lẽ mỗi lần ai đó sửa `d_latent`: 1024/8 = 128, nhưng
-2048/8 = 256. Khai cái BẤT BIẾN, suy ra cái phụ thuộc.
+= **6** ở 768). Chiều ngược lại — khai `n_heads` rồi để `head_dim` rơi ra — là
+cách head_dim đổi lặng lẽ mỗi lần ai đó sửa `d_latent`: 6 head cho đúng 128 ở
+768, nhưng cùng 6 head ở 1024 ra 170,67 và không chia hết. Khai cái BẤT BIẾN,
+suy ra cái phụ thuộc; `d_latent` không chia hết `head_dim` thì DỪNG.
 
 **Cross-attn CHỈ có ở khối 1 của mỗi nhóm.** Khối 2 không đọc ảnh — nó để 32
-vector *thống nhất lại với nhau* sau khi vừa đọc xong. Với `N = 2` thì cả cụm
-đọc ảnh đúng HAI lần, xen giữa là hai lượt tự-trộn.
+vector *thống nhất lại với nhau* sau khi vừa đọc xong. Với `N = 5` thì cả cụm
+đọc ảnh đúng NĂM lần, xen giữa là năm lượt tự-trộn.
 
 ═══ 3. ALIGNER ════════════════════════════════════════════════════════════════
 
-`RMSNorm(1024)` + MỘT khối `SwiGLU 1024 → 4096 → 2560`. Không attention, không
+`RMSNorm(768)` + MỘT khối `SwiGLU 768 → 4096 → 2560`. Không attention, không
 residual: phần "suy nghĩ" nằm trọn trong Compressor, và đây là chỗ **DUY NHẤT**
 nhánh đổi chiều lên không gian embedding của decoder.
 
@@ -101,10 +102,10 @@ này khi BỎ RMSNorm: RMS(Q) ở bước 0 rơi xuống ~1e-4, và trên model 
 selftest nó underflow HẲN về 0 — bản đồ saliency của Lens thành một ma trận
 không. Nhân init lên để bù thì chữa *triệu chứng*; RMSNorm chữa *nguyên nhân*,
 và nhờ nó init `1/√fan_in` (init chuẩn của khối có cổng) mới có nghĩa. Giá:
-1024 tham số.
+768 tham số.
 
-**`mlp_hidden` 4096 > `d_latent` 1024 — một chỗ NỞ RA**, cùng hướng với FFN của
-decoder (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 1024; cả hai
+**`mlp_hidden` 4096 > `d_latent` 768 — một chỗ NỞ RA**, cùng hướng với FFN của
+decoder (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 768; cả hai
 đều chạy, nhưng hỏi hai câu khác nhau.
 
 ═══ Vì sao Q đứng SAU Z ═══════════════════════════════════════════════════════
@@ -184,7 +185,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì Compressor/Aligner KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/13"
+FORMAT = "rgexp.vextractor/14"
 
 
 class VExtractorUnusable(RuntimeError):
@@ -195,7 +196,7 @@ class VExtractorUnusable(RuntimeError):
 class MultiHeadAttention(nn.Module):
     """Attention nhiều head dùng `scaled_dot_product_attention` (flash/mem-eff).
 
-    `d_kv` KHÁC `d_model` là chỗ Compressor đổi chiều 512 -> 1024: `k`/`v` nhận
+    `d_kv` KHÁC `d_model` là chỗ Compressor đổi chiều 512 -> 768: `k`/`v` nhận
     `d_kv` và trả `d_model`, còn `q`/`o` ở `d_model`. `d_kv = None` -> tự-chú ý
     (mọi chiếu đều `d_model → d_model`).
 
@@ -661,14 +662,22 @@ class QFormerGroup(nn.Module):
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
 
-    Tham số ở `d_latent` = 1024, `d_kv` = 512, `mlp_hidden` = 2048:
+    Tham số ở `d_latent` = 768, `d_kv` = 512, `mlp_hidden` = 1024:
 
-        SelfAttn  4 × 1024²             = 4 194 304   (×2)
-        CrossAttn 2 × 1024² + 2×512×1024 = 3 145 728
-        SwiGLU    3 × 1024 × 2048        = 6 291 456   (×2)
-        5 × RMSNorm(1024)                =     5 120
-        ────────────────────────────────────────────
-        MỘT nhóm                         ≈ 24,12 M
+        SelfAttn  4 × 768²             = 2 359 296   (×2)
+        CrossAttn 2 × 768² + 2×512×768 = 1 966 080
+        SwiGLU    3 × 768 × 1024       = 2 359 296   (×2)
+        5 × RMSNorm(768)               =     3 840
+        ───────────────────────────────────────────
+        KHỐI 1 (self + cross + ffn)    ≈  6,69 M
+        KHỐI 2 (self + ffn)            ≈  4,72 M
+        MỘT nhóm (khối 1 → khối 2)     ≈ 11,41 M
+
+    > Đặc tả ghi `~6.71M (xN)`. Con số ấy khớp **KHỐI 1** (6,69 M), không khớp
+    > cả nhóm (11,41 M) — nên tổng Compressor ở `N = 5` là **57,06 M**, không
+    > phải 33,6 M. Không có lựa chọn kiến trúc nào ẩn trong chỗ lệch này: bảng
+    > khối, `d_latent` và `mlp_hidden` đều được khai tường minh và chúng định
+    > đoạt hoàn toàn số tham số.
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
@@ -711,25 +720,25 @@ class Compressor(nn.Module):
     """V (B, n_patch, d_feat) -> V_c (B, n_query, d_latent). QFormer, N nhóm khối.
 
         kv  = RMSNorm(V)                        512, MỘT lần, ngoài mọi nhóm
-        q   = latent.expand(B)                  (B, 32, 1024)
+        q   = latent.expand(B)                  (B, 32, 768)
         q   = group_i(q, kv)   với i = 1..N     mỗi nhóm = khối 1 + khối 2
 
     **32 latent là khoá KHAI** (`n_query`) — lưới của Extractor (784 ô ở 448²)
     chỉ là NGUỒN để hỏi, không phải khối Q.
 
     **`RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer.**
-    Không có `Linear 512→1024`: phép đổi chiều nằm trong `k_proj`/`v_proj` của
-    Cross-attn. Lý do là đếm được — một lớp chiếu riêng thêm 0,53 M tham số mà
+    Không có `Linear 512→768`: phép đổi chiều nằm trong `k_proj`/`v_proj` của
+    Cross-attn. Lý do là đếm được — một lớp chiếu riêng thêm 0,39 M tham số mà
     không thêm sức biểu diễn nào (nó chỉ gộp được vào `k`/`v` phía sau).
 
     **Chi phí nằm ở `d_latent`, không ở `n_query`.** 32 latent là 32 768 tham
-    số; mỗi SelfAttn @1024 là 4,19 M. Đổi `n_query` gần như không đụng tới bảng
+    số; mỗi SelfAttn @768 là 2,36 M. Đổi `n_query` gần như không đụng tới bảng
     tham số (nó đụng tới THỜI GIAN và tới độ dài chuỗi decoder); đổi `d_latent`
     thì đụng tới tất cả, theo d².
     """
 
-    def __init__(self, d_feat: int, n_query: int = 32, d_latent: int = 1024,
-                 head_dim: int = 128, mlp_hidden: int = 2048, n_blocks: int = 2,
+    def __init__(self, d_feat: int, n_query: int = 32, d_latent: int = 768,
+                 head_dim: int = 128, mlp_hidden: int = 1024, n_blocks: int = 5,
                  dropout: float = 0.0):
         super().__init__()
         self.d_feat = int(d_feat)
@@ -813,7 +822,7 @@ class Aligner(nn.Module):
         x = RMSNorm(V_c)                              1024  (= d_latent)
         Q = down( SiLU(gate(x)) ⊙ up(x) )   1024 → mlp_hidden (4096) → 2560
 
-    **RMSNorm ở đây là RMSNorm(`d_latent`) = 1024, KHÔNG phải 2560.** Thứ đi vào
+    **RMSNorm ở đây là RMSNorm(`d_latent`) = 768, KHÔNG phải 2560.** Thứ đi vào
     là `V_c`, ra từ residual cuối của Compressor — vẫn ở 1024. Chỉ `down` mới
     nâng lên `d_model`; một RMSNorm 2560 ở đây sẽ không khớp shape ngay ở
     forward đầu tiên.
@@ -828,7 +837,7 @@ class Aligner(nn.Module):
     """
 
     def __init__(self, d_latent: int, d_model: int, mlp_hidden: int = 4096,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0):   # d_latent = 768 (chiều của V_c)
         super().__init__()
         self.d_latent, self.d_model = int(d_latent), int(d_model)
         self.mlp_hidden = int(mlp_hidden)
@@ -968,10 +977,10 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                                    else int(ex["n_stages"])),
                       "normalize": {"mean": list(mean), "std": list(std)}},
         "compressor": {"n_query": int(cp.get("n_query", 32)),
-                       "d_latent": int(cp.get("d_latent", 1024)),
+                       "d_latent": int(cp.get("d_latent", 768)),
                        "head_dim": int(cp.get("head_dim", 128)),
-                       "mlp_hidden": int(cp.get("mlp_hidden", 2048)),
-                       "n_blocks": int(cp.get("n_blocks", 2)),
+                       "mlp_hidden": int(cp.get("mlp_hidden", 1024)),
+                       "n_blocks": int(cp.get("n_blocks", 5)),
                        "dropout": float(cp.get("dropout", 0.0))},
         "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 4096)),
                     "dropout": float(al.get("dropout", 0.0))},
