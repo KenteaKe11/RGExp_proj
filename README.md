@@ -175,11 +175,8 @@ lần ai đó sửa `d_latent`. Khai cái **bất biến**, suy ra cái phụ th
 | **khối 2** (self + ffn) | **4,72 M** |
 | **MỘT nhóm khối** (khối 1 → khối 2) | **11,41 M** |
 
-> Đặc tả ghi `~6.71M (xN)`. Con số ấy khớp **khối 1** (6,69 M), không khớp cả
-> nhóm (11,41 M) — nên tổng Compressor ở `N = 5` là **57,06 M**, không phải
-> 33,6 M. Không có lựa chọn kiến trúc nào ẩn trong chỗ lệch này: bảng khối,
-> `d_latent` và `mlp_hidden` đều được khai tường minh và chúng định đoạt hoàn
-> toàn số tham số.
+> `~11,41 M (xN)` của đặc tả khớp **đúng** số đo cho MỘT nhóm khối, nên tổng
+> Compressor ở `N = 5` là **57,06 M**.
 
 **Chi phí nằm ở `d_latent`, không ở `n_query`.** 32 latent chỉ là **32 768**
 tham số, trong khi mỗi Self-attn @768 là 2,36 M. Đổi `n_query` gần như không
@@ -276,8 +273,8 @@ Stage 0 và Stage 1 dùng **cùng một hàm**. Hai chặng, cộng một hệ s
 5. **mỗi epoch val không cải thiện** → chia lr hiện tại cho `plateau_gamma`
    (**3**), sàn `lr_min`; val cải thiện thì **giữ nguyên** lr
 
-Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**): dốc 200 bước từ 1e-7 lên
-1e-4, rồi giữ 1e-4 cho tới lúc dừng.
+Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**): dốc 200 bước từ 1e-8 lên
+1e-5, rồi giữ 1e-5 cho tới lúc dừng.
 
 > **`lr_max` là MỨC CHẠY, không phải một đỉnh tạm rồi hạ.** Không còn `lr_main`,
 > không còn chặng cosine nào trong lịch chung. Thứ **duy nhất** kéo lr xuống là
@@ -301,15 +298,15 @@ hệ quả:
   **tổng** số epoch hỏng, không bao giờ reset, và quyết định **lr**. Gộp chúng
   là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ. Muốn
   tắt chặng 5 thì đặt `plateau_gamma: 1.0`, **không phải** `patience: 0`.
-* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-4 → 1e-7 là 7 lần), lr sẽ chui
+* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-5 → 1e-8 là 7 lần), lr sẽ chui
   xuống dưới `lr_min`; lúc ấy epoch đuôi — vốn cosine *về* `lr_min` — thành một
   cú **tăng** lr, ngược hẳn với ý của nó.
 
-Ví dụ với Stage 0 (`lr_max = 1e-4`, `lr_min = 1e-7`):
+Ví dụ với Stage 0 (`lr_max = 1e-5`, `lr_min = 1e-8`):
 
 | số epoch val hỏng | 0 | 1 | 2 | 3 | 4 | 5 | 6 | ≥ 7 |
 |---|---|---|---|---|---|---|---|---|
-| lr | 1,0e-4 | 3,3e-5 | 1,1e-5 | 3,7e-6 | 1,2e-6 | 4,1e-7 | 1,4e-7 | 1,0e-7 (sàn) |
+| lr | 1,0e-5 | 3,3e-6 | 1,1e-6 | 3,7e-7 | 1,2e-7 | 4,1e-8 | 1,4e-8 | 1,0e-8 (sàn) |
 
 Stage 1 dùng **một bộ đếm chung cho cả hai nhóm** (attn và ffn), vì val là
 **một** con số — không có cách nào nói nhóm nào làm nó xấu đi, nên tách hai bộ
@@ -337,7 +334,7 @@ xuống, đúng ngược với ý "hạ cánh".
 | Mô tả | Chỉ huấn luyện **Extractor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Biến Extractor thành module học đặc trưng chất lượng cao trên miền CXR |
-| lr | `lr_min=1e-7` · `lr_max=1e-4` (warm-up 1 epoch rồi **giữ** `lr_max`) |
+| lr | `lr_min=1e-8` · `lr_max=1e-5` (warm-up 1 epoch rồi **giữ** `lr_max`) |
 | Epoch | `50` (trần) |
 | Chặng 5 | mỗi epoch val không cải thiện → lr ÷ `3` (sàn `lr_min`), val khá lên thì giữ nguyên |
 | Patience | `5` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
@@ -404,7 +401,7 @@ dùng bản này. Không có đuôi thì `final/` trùng `base/` từng bit.
 | Mô tả | Chỉ huấn luyện **Compressor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Làm giàu không gian Compressor trước khi đưa vào Aligner → Concat |
-| lr (Attn) | `lr_min=1e-8` · `lr_max=7e-5` |
+| lr (Attn) | `lr_min=1e-8` · `lr_max=1e-5` |
 | lr (FFN) | `lr_min=1e-7` · `lr_max=1e-4` |
 | Epoch | `20` (trần); warm-up 1 epoch rồi **giữ** `lr_max` của từng nhóm |
 | Chặng 5 | mỗi epoch val không cải thiện → **cả hai nhóm** ÷ `3` (sàn `lr_min` của từng nhóm) |
@@ -429,7 +426,8 @@ phải nén gì cả.
 **HAI nhóm lr, và đó là điểm riêng của Stage 1.** Ma trận attention quyết định
 32 vector **đọc ở đâu** trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi bị đẩy
 nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay lại. FFN
-thì chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn. `latent` +
+thì chỉ biến đổi thứ đã đọc được, nên nó chịu được một mức cao hơn — ở đây cao
+hơn **10 lần** (1e-4 so với 1e-5), không phải 1,4 lần như bản trước. `latent` +
 mọi RMSNorm + DINO head mới đi theo **nhóm FFN** — đặc tả chỉ khai hai nhóm, nên
 chỗ để chúng phải nói ra chứ không để ngầm.
 
@@ -477,7 +475,7 @@ học cùng lúc — nên nó cần dốc, dù chỉ 20 bước.
 
 | Mục tiêu | Học cách xử lý đặc trưng đã có theo tín hiệu từ LoRA → Aligner |
 |---|---|
-| lr | `lr_min=1e-8` → `lr_main=1e-5` |
+| lr | `lr_min=1e-8` → `lr_main=7e-6` |
 | Lịch trình | 1. Freeze hoàn toàn trong **20%** step đầu. 2. Unfreeze và warm-up trong **10%** step rồi fix cứng `lr_main` |
 
 Tín hiệu mà Compressor phải học *theo* chưa tồn tại ở bước 0 — Aligner còn ngẫu

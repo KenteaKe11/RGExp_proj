@@ -26,13 +26,14 @@ Cả hai chạy lịch CHUNG của `src/schedule.py` — warm-up tuyến tính t
 `warmup_epochs` (1) epoch rồi GIỮ `lr_max` tới hết — nhưng trên hai cặp số
 khác nhau:
 
-    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 7e-5
+    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 1e-5
     FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4
 
 Ma trận attention quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
-một mức cao hơn.
+một mức cao hơn — ở đây cao hơn **10 lần** (1e-4 so với 1e-5), không phải
+1,4 lần như bản trước.
 
 **Chặng 5** giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
 chia cho `plateau_gamma` (3), sàn là `lr_min` của từng nhóm, và val khá lên thì
@@ -104,7 +105,7 @@ def s1cfg(cfg: Cfg) -> dict:
     dc["n_local"] = 0
     out = {
         "attn_lr_min": float(s.get("attn_lr_min", 1e-8)),
-        "attn_lr_max": float(s.get("attn_lr_max", 7e-5)),
+        "attn_lr_max": float(s.get("attn_lr_max", 1e-5)),
         "ffn_lr_min": float(s.get("ffn_lr_min", 1e-7)),
         "ffn_lr_max": float(s.get("ffn_lr_max", 1e-4)),
         # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —

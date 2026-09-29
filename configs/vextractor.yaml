@@ -377,12 +377,7 @@ labels:
 #   SelfAttn 4×768² = 2,36 M · CrossAttn 2×768² + 2×512×768 = 1,97 M
 #   SwiGLU 3×768×1024 = 2,36 M · 5 × RMSNorm(768) = 3 840
 #   => KHỐI 1 (self+cross+ffn) 6,69 M · KHỐI 2 (self+ffn) 4,72 M
-#   => MỘT nhóm 11,41 M; N = 5 -> 57,06 M.
-#
-# ⚠ Đặc tả ghi `~6.71M (xN)`. Con số ấy khớp KHỐI 1 (6,69 M), KHÔNG khớp cả
-# nhóm (11,41 M) — nên tổng Compressor là 57,06 M, không phải 33,6 M. Không có
-# lựa chọn kiến trúc nào ẩn trong chỗ lệch: bảng khối, `d_latent` và
-# `mlp_hidden` đều khai tường minh và chúng định đoạt hoàn toàn số tham số.
+#   => MỘT nhóm 11,41 M (khớp `~11.41M (xN)` của đặc tả); N = 5 -> 57,06 M.
 #
 # Chi phí nằm ở `d_latent` (theo d²) và `n_blocks` (tuyến tính), KHÔNG ở
 # `n_query`: 32 latent chỉ là 24 576
@@ -468,7 +463,7 @@ vextractor:
     align_warmup_frac: 0.10   # 10% tổng bước (= 20/200)
     align_wd: 0.01
     comp_lr_min: 1.0e-8
-    comp_lr_main: 1.0e-5
+    comp_lr_main: 7.0e-6
     comp_freeze_frac: 0.20    # 20% tổng bước ĐÓNG BĂNG (= 40/200)
     comp_warmup_frac: 0.10    # rồi 10% tổng bước warm-up (= 20/200)
     comp_wd: 0.01
@@ -509,7 +504,7 @@ vextractor:
 # `vextractor.Compressor.ffn_parameters`).
 stage1:
   attn_lr_min: 1.0e-8
-  attn_lr_max: 7.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
+  attn_lr_max: 1.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
   ffn_lr_min: 1.0e-7
   ffn_lr_max: 1.0e-4      # MỨC CHẠY của nhóm ffn
   warmup_epochs: 1.0      # độ dài dốc warm-up (epoch), rồi GIỮ lr_max tới hết
@@ -552,8 +547,8 @@ stage1:
 # teacher inference.
 #
 # LỊCH CHUNG (`src/schedule.py`) — HAI chặng, cộng một hệ số nhân:
-#   1. warm-up tuyến tính 1e-7 -> 1e-4   `warmup_epochs` (1) epoch ĐẦU (200 bước)
-#   2. GIỮ 1e-4                          49 EPOCH CÒN LẠI
+#   1. warm-up tuyến tính 1e-8 -> 1e-5   `warmup_epochs` (1) epoch ĐẦU (200 bước)
+#   2. GIỮ 1e-5                          49 EPOCH CÒN LẠI
 #   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (3),
 #                                           sàn `lr_min`; val cải thiện thì
 #                                           GIỮ NGUYÊN (không leo lại)
@@ -580,8 +575,8 @@ stage0:
   # hằng số vào giữa một lịch mà người chạy tin là mình đã khai đủ.
   # lr_min là BA thứ cùng lúc, nên đừng đọc nó chỉ như "lr nhỏ nhất": đầu dốc
   # warm-up (bước 0 có ĐÚNG số này), SÀN của chặng 5, và ĐÁY của epoch đuôi.
-  lr_min: 1.0e-7
-  lr_max: 1.0e-4            # MỨC CHẠY sau warm-up (giữ tới hết)
+  lr_min: 1.0e-8
+  lr_max: 1.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
   warmup_epochs: 1.0        # độ dài dốc warm-up (epoch). Xem chú thích trên.
   max_epochs: 50            # TRẦN thật sự của giai đoạn
   # CHẶNG 5 — "Nếu patient tăng 1, decay 3 lần lr hiện tại. Nếu không thì duy

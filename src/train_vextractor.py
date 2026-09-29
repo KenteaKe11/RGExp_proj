@@ -38,7 +38,7 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
   * **Compressor** — đến từ Stage 1, đã ở một điểm dùng được. **ĐÓNG BĂNG HOÀN
     TOÀN trong `comp_freeze_frac` (20%) số bước đầu**, rồi warm-up
-    `comp_lr_min` (1e-8) -> `comp_lr_main` (1e-5) trong `comp_warmup_frac`
+    `comp_lr_min` (1e-8) -> `comp_lr_main` (7e-6) trong `comp_warmup_frac`
     (10%) số bước, rồi PHẲNG. Mục tiêu của nó ở đây khác Stage 1: *học cách xử
     lý đặc trưng đã có THEO tín hiệu từ LoRA → Aligner*. Tín hiệu ấy chưa tồn
     tại ở bước 0 — Aligner còn ngẫu nhiên và LoRA chưa đi được đâu — nên 20%
@@ -134,7 +134,7 @@ def zcfg(cfg: Cfg) -> dict:
            "align_warmup_frac": float(m.get("align_warmup_frac", 0.10)),
            "align_wd": float(m.get("align_wd", 0.01)),
            "comp_lr_min": float(m.get("comp_lr_min", 1e-8)),
-           "comp_lr_main": float(m.get("comp_lr_main", 1e-5)),
+           "comp_lr_main": float(m.get("comp_lr_main", 7e-6)),
            "comp_freeze_frac": float(m.get("comp_freeze_frac", 0.20)),
            "comp_warmup_frac": float(m.get("comp_warmup_frac", 0.10)),
            "comp_wd": float(m.get("comp_wd", 0.01)),

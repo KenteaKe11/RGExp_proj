@@ -26,13 +26,13 @@ hẳn.
 
 Lịch CHUNG của `src/schedule.py` — HAI chặng, cộng một hệ số nhân:
 
-    1. warm-up tuyến tính `lr_min` (1e-7) -> `lr_max` (1e-4)   1 epoch ĐẦU
+    1. warm-up tuyến tính `lr_min` (1e-8) -> `lr_max` (1e-5)   1 epoch ĐẦU
     2. GIỮ `lr_max`                                            49 epoch còn lại
     5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (3),
        sàn `lr_min`; val cải thiện thì GIỮ NGUYÊN (không leo lại)
 
-Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-7 lên 1e-4, rồi
-giữ 1e-4 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
+Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-8 lên 1e-5, rồi
+giữ 1e-5 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
 xuống là chặng 5 — tức là chính đường val, không phải một lịch định trước.
 Không có `lr_main` nào trong lịch chung nữa.
 
@@ -128,8 +128,8 @@ def s0cfg(cfg: Cfg) -> dict:
     out = {
         # HAI đỉnh của lịch chung (src/schedule.py). `lr_max` là MỨC CHẠY, không
         # phải một đỉnh tạm rồi hạ: thứ duy nhất kéo nó xuống là chặng 5.
-        "lr_min": float(s.get("lr_min", 1e-7)),
-        "lr_max": float(s.get("lr_max", 1e-4)),
+        "lr_min": float(s.get("lr_min", 1e-8)),
+        "lr_max": float(s.get("lr_max", 1e-5)),
         # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —
         # đó là `max_epochs`.
         "warmup_epochs": float(s.get("warmup_epochs", 1.0)),

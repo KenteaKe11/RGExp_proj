@@ -969,7 +969,7 @@ def _():
 
     # ── hình dạng lịch: dốc rồi GIỮ, KHÔNG có chặng hạ nào ────────────────
     w = 200                                   # 1 epoch = 200 bước
-    lo, hi = 1e-7, 1e-4
+    lo, hi = 1e-8, 1e-5
     f = lambda k: S.warmup_flat(k, w, lo, hi)             # noqa: E731
     assert f(0) == lo                         # bước 0 có ĐÚNG lr_min
     assert f(w) == hi and f(10 * w) == hi     # chạm đỉnh rồi GIỮ, không hạ
@@ -987,9 +987,9 @@ def _():
         assert not hasattr(S, gone), gone
 
     # ── ĐUÔI: cosine từ lr ĐANG chạy về lr_min ────────────────────────────
-    assert S.tail_lr(0, 10, 3e-5, lo) == 3e-5
-    assert abs(S.tail_lr(10, 10, 3e-5, lo) - lo) < 1e-18
-    t = [S.tail_lr(k, 10, 3e-5, lo) for k in range(11)]
+    assert S.tail_lr(0, 10, 1e-6, lo) == 1e-6
+    assert abs(S.tail_lr(10, 10, 1e-6, lo) - lo) < 1e-18
+    t = [S.tail_lr(k, 10, 1e-6, lo) for k in range(11)]
     assert all(x >= y - 1e-18 for x, y in zip(t, t[1:]))
 
     # ── main stage: dốc theo BƯỚC, và 0 TUYỆT ĐỐI trong phần đóng băng ────
@@ -1003,13 +1003,13 @@ def _():
     # ── hai CẶP lr, ĐÚNG như đặc tả ───────────────────────────────────────
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr_min"], sc["lr_max"]) == (1e-7, 1e-4)
+    assert (sc["lr_min"], sc["lr_max"]) == (1e-8, 1e-5)
     assert "lr_main" not in sc and "sched_epochs" not in sc
     assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
     assert sc["patience"] == 5 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
-    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 7e-5)
+    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 1e-5)
     assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 1e-4)
     assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 20
     assert s1c["patience"] == 3
@@ -1017,7 +1017,7 @@ def _():
     assert set(zc) == set(MAIN_CFG_KEYS)
     assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
     assert zc["align_warmup_frac"] == 0.10
-    assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 1e-5)
+    assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 7e-6)
     assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
 
     # ── `lr_max` là MỨC CHẠY: mọi epoch sau epoch 1 đều ở đó ──────────────
@@ -1036,17 +1036,18 @@ def _():
     # ── CHẶNG 5: ÷gamma mỗi lần patience tăng, sàn lr_min, KHÔNG leo lại ──
     assert S.PLATEAU_GAMMA == 3.0
     assert sc["plateau_gamma"] == s1c["plateau_gamma"] == 3.0
-    assert S.plateau_lr(3e-5, 0, 1e-7) == 3e-5
-    assert abs(S.plateau_lr(3e-5, 1, 1e-7) - 1e-5) < 1e-18
-    assert abs(S.plateau_lr(3e-5, 2, 1e-7) - 3e-5 / 9) < 1e-18
+    assert S.plateau_lr(hi, 0, lo) == hi
+    assert abs(S.plateau_lr(hi, 1, lo) - hi / 3) < 1e-20
+    assert abs(S.plateau_lr(hi, 2, lo) - hi / 9) < 1e-20
     # SÀN ở lr_min: không có sàn thì epoch ĐUÔI (cosine *về* lr_min) thành một
-    # cú TĂNG lr, đúng ngược với ý của nó.
-    assert S.plateau_lr(3e-5, 99, 1e-7) == 1e-7
-    ladder = [S.plateau_lr(3e-5, k, 1e-7) for k in range(10)]
+    # cú TĂNG lr, đúng ngược với ý của nó. 1e-5 -> 1e-8 là 7 lần chia.
+    assert S.plateau_lr(hi, 6, lo) > lo and S.plateau_lr(hi, 7, lo) == lo
+    assert S.plateau_lr(hi, 99, lo) == lo
+    ladder = [S.plateau_lr(hi, k, lo) for k in range(12)]
     assert all(x >= y for x, y in zip(ladder, ladder[1:]))      # ĐƠN ĐIỆU giảm
     # gamma = 1.0 TẮT hẳn chặng 5 — và đó mới là khoá để tắt, KHÔNG phải
     # `patience: 0` (patience chỉ gác việc DỪNG).
-    assert S.plateau_lr(3e-5, 5, 1e-7, gamma=1.0) == 3e-5
+    assert S.plateau_lr(hi, 5, lo, gamma=1.0) == hi
     for blk, mod in (("stage0", s0.s0cfg), ("stage1", s1.s1cfg)):
         c = dict(cfg)
         c[blk] = dict(cfg[blk], plateau_gamma=0.5)
