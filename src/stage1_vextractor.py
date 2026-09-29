@@ -7,10 +7,10 @@
 **Mục tiêu: làm giàu không gian Compressor TRƯỚC khi đưa vào Aligner.** Ở main
 stage, Compressor + Aligner + LoRA cùng động; nếu Compressor còn ngẫu nhiên ở
 bước 0 thì 200 bước của main stage phải vừa học nén ảnh vừa học viết báo cáo.
-Stage 1 mua một điểm khởi đầu KHÔNG ngẫu nhiên cho 32 latent.
+Stage 1 mua một điểm khởi đầu KHÔNG ngẫu nhiên cho 8 latent.
 
 **Cái giá, và nó có thật.** Stage 1 chỉ dạy Compressor bắt chước một phép pool
-của teacher. Nó KHÔNG biết gì về báo cáo, nên nó không thể nói 32 vector ấy có
+của teacher. Nó KHÔNG biết gì về báo cáo, nên nó không thể nói 8 vector ấy có
 mang thông tin bệnh lý hay không — câu ấy vẫn để main stage trả lời.
 
 **Vì sao teacher không phải EMA ở đây.** Ở Stage 0 teacher là trung bình trượt
@@ -29,7 +29,7 @@ khác nhau:
     Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 1e-5
     FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4
 
-Ma trận attention quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
+Ma trận attention quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
 một mức cao hơn — ở đây cao hơn **10 lần** (1e-4 so với 1e-5), không phải

@@ -336,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stages", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restage0", action="store_true",
-                    help="chạy lại Stage 0 — DINOv3 finetune (+ --restage1 + --retrain)")
+                    help="chạy lại Stage 0 — DINO tự giám sát (+ --restage1 + --retrain)")
     ap.add_argument("--restage1", action="store_true",
                     help="chạy lại Stage 1 — chuyển giao Compressor (+ --retrain)")
     ap.add_argument("--retrain-all", action="store_true",
@@ -560,7 +560,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     ran_stage0 = False
     if need_stage0 or (need_train and s0.finished(cfg) is None):
         ran_stage0 = s0.finished(cfg) is None or a.restage0
-        _hr("Stage 0 — EXTRACTOR: DINOv3 finetune (tự giám sát, KHÔNG nhãn, KHÔNG Gemma)")
+        _hr("Stage 0 — EXTRACTOR: DINO tự giám sát (KHÔNG nhãn, KHÔNG Gemma)")
         try:
             def _base_done() -> None:
                 # base xong -> đẩy base/ + history + loader NGAY, trước epoch n+1

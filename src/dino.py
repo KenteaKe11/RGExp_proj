@@ -1,6 +1,6 @@
 """DINO self-distillation — hàm mục tiêu tự giám sát của Stage 0 và Stage 1.
 
-**Stage 0** huấn luyện MỘT thứ: Extractor (ConvNeXt-Base, trọng số DINOv3), chạy
+**Stage 0** huấn luyện MỘT thứ: Extractor (FocalNet-Small LRF, init ImageNet-1k), chạy
 tiếp chính hàm mục tiêu nó được sinh ra với, trên ảnh CXR. Không `labels.npz`,
 không Cls Head, không F1/Recall — epoch được chọn theo loss tự giám sát trên một
 tập val CỐ ĐỊNH.
@@ -8,11 +8,11 @@ tập val CỐ ĐỊNH.
 **Stage 1** (`CompressorTransferTrainer`, cuối file) dùng lại ĐÚNG bộ siêu tham
 số ấy nhưng đổi vai: teacher là một CHECKPOINT đóng băng, student là Compressor.
 
-Hai chỗ ConvNeXt khác ViT và cả hai giai đoạn phải biết:
+Hai chỗ họ LƯỚI (FocalNet/ConvNeXt) khác ViT và cả hai giai đoạn phải biết:
 
   * **không có cls token.** `pool` bắt buộc `mean`, và `stage0_vextractor` TỪ
     CHỐI `pool: cls` với backbone lưới thay vì lặng lẽ rơi về mean;
-  * **đầu ra là một LƯỚI 4 chiều**, không phải chuỗi. ConvNeXt trả NCHW
+  * **đầu ra là một LƯỚI 4 chiều**, không phải chuỗi. FocalNet trả NCHW
     (B, C, H, W); SwinV2 — cùng 4 chiều — lại trả NHWC. `pool_feature` vì thế
     NHẬN `fmt` chứ không suy từ `f.dim()`: lấy trung bình nhầm trục cho ra một
     vector dài H thay vì dài C, và DINO head vẫn nuốt được nó.
@@ -33,7 +33,7 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
   4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     phải đoán được global" sinh ra tính bất biến theo tỉ lệ. ConvNeXt nuốt cả
+     phải đoán được global" sinh ra tính bất biến theo tỉ lệ. FocalNet nuốt cả
      hai cỡ trên đúng MỘT `state_dict` vì nó thuần tích chập.
 
 **Tăng cường ảnh viết bằng PIL**, không kéo thêm torchvision: cùng đường với
@@ -332,7 +332,7 @@ class CompressorTransferTrainer(nn.Module):
 
     **Centering và sharpening vẫn giữ**, dù lý do đã hẹp lại: chúng không còn
     chống sụp, chúng định HÌNH DẠNG của đích. Bỏ centering là để vài prototype
-    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 32 vector
+    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 8 vector
     không phải nén gì cả.
 
     **CÙNG một Extractor cho cả hai nhánh.** `extractor` là MỘT object, không
@@ -343,10 +343,10 @@ class CompressorTransferTrainer(nn.Module):
     `student_head` là giàn giáo của riêng Stage 1 (1024 → … → K prototype) và bị
     BỎ sau đó, y như DINO head của Stage 0 bị bỏ sau Stage 0.
 
-    **`mean(V_c)` — trung bình 32 vector.** DINO head cần MỘT vector mỗi ảnh, và
-    32 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong
+    **`mean(V_c)` — trung bình 8 vector.** DINO head cần MỘT vector mỗi ảnh, và
+    8 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong
     đó). Lấy vector đầu là chọn bừa một trong 32; lấy trung bình là hỏi "cả cụm
-    32 vector, gộp lại, có mang đúng thứ teacher mang không".
+    8 vector, gộp lại, có mang đúng thứ teacher mang không".
     """
 
     def __init__(self, extractor: nn.Module, compressor: nn.Module,

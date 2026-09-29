@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = ConvNeXt-Base (DINOv3) + DINO head   ─┐
+            ─► student = FocalNet-S LRF (IN-1k) + DINO head    ─┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,7 +10,7 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-ConvNeXt-Base 3 stage (~60,1 M) + một DINO head, cộng một bản teacher EMA đầy
+FocalNet-Small LRF (49,57 M) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
@@ -232,7 +232,7 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # ConvNeXt KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
+        # FocalNet KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
         # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
         "pool": str(d.get("pool", "mean")),
         "student_temp": float(d.get("student_temp", 0.1)),
@@ -338,7 +338,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số ConvNeXt không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số FocalNet không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}
@@ -1181,7 +1181,7 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
                    "n_stages": spec["extractor"].get("n_stages"),
                    "compressor": dict(spec["compressor"]),
                    "aligner": dict(spec["aligner"]),
-                   "note": "Stage 0 CHỈ huấn luyện Extractor (DINOv3 finetune, "
+                   "note": "Stage 0 CHỈ huấn luyện Extractor (DINO tự giám sát, "
                            "tự giám sát). Compressor là của Stage 1, Aligner là "
                            "của MAIN STAGE. Stage 0 KHÔNG nạp Gemma; d_model "
                            "đọc từ AutoConfig",

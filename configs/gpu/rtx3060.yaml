@@ -36,7 +36,7 @@ set:
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
   # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor 60,1 M tham số VỚI
-  # lưới 784 ô, nhân thêm (2 + n_local) lượt forward của multi-crop, làm
+  # lưới 196 ô, nhân thêm (2 + n_local) lượt forward của multi-crop, làm
   # activation của Stage 0 nặng rõ — nên 16 chỉ là KHỞI ĐIỂM, autobatch dò lại.
   # Stage 1 nhẹ hơn hẳn (Extractor chạy no_grad, chỉ Compressor có gradient) và
   # đọc khoá riêng `stage1.micro_batch` ở configs/vextractor.yaml.

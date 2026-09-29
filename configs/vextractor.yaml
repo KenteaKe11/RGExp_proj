@@ -313,9 +313,9 @@ labels:
 # NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-#   ảnh 448² ─► 1. EXTRACTOR  ConvNeXt-Base (DINOv3), cắt sau Stage 3
-#                             (B,3,448,448) -> (B,512,28,28) -> V (B,784,512)
-#            ─► 2. COMPRESSOR QFormer, 32 latent @1024, N = 2 nhóm khối
+#   ảnh 448² ─► 1. EXTRACTOR  FocalNet-Small LRF (ImageNet-1k), ĐỦ 4 stage
+#                             (B,3,448,448) -> (B,768,14,14) -> V (B,196,768)
+#            ─► 2. COMPRESSOR QFormer, 8 latent @1024, N = 3 nhóm khối
 #                             -> V_c (B,32,1024)
 #            ─► 3. ALIGNER    RMSNorm(1024) + SwiGLU 1024→4096→2560
 #                             -> Q (B,32,2560)
@@ -324,68 +324,84 @@ labels:
 #
 # BA khối, BA giai đoạn, mỗi giai đoạn dạy ĐÚNG MỘT khối:
 #
-#   Stage 0  Extractor   DINOv3 finetune (tự giám sát, DINO, EMA, multi-crop)
+#   Stage 0  Extractor   DINO tự giám sát (EMA, multi-crop) từ init CÓ GIÁM SÁT
 #   Stage 1  Compressor  chưng cất từ teacher Stage 0 ĐÓNG BĂNG
 #   main     Aligner + LoRA (từ bước 0), rồi Compressor (sau 20% bước)
 #
 # ── 1. EXTRACTOR ─────────────────────────────────────────────────────────────
-# `convnext_base.dinov3_lvd1689m` là CHECKPOINT DINOv3 THẬT của Facebook cho họ
-# ConvNeXt (họ phát hành ViT-S/S+/B/L/H+/7B và ConvNeXt-T/S/B/L — KHÔNG có Swin).
-# Stage 0 vì thế là ĐÚNG nghĩa "chạy tiếp": cùng họ trọng số, cùng hàm mục tiêu,
-# chỉ đổi miền ảnh từ web sang CXR.
+# `focalnet_small_lrf.ms_in1k` — **FocalNet-Small, bản LRF (long-range focal)**,
+# 49 573 440 tham số ĐO ĐƯỢC.
 #
-# `n_stages: 3` — dừng ở stride 16 / 512 kênh. Stage 4 (1024 kênh, stride 32)
-# biến mất hẳn: 27,4 M tham số khỏi state_dict, khỏi VRAM, khỏi optimizer; đổi
-# lại lưới mịn gấp 4× (28×28 = 784 ô thay vì 14×14 ở 448²). Mất tầng ngữ nghĩa
-# cao nhất, được độ phân giải không gian mà Cross-attn và Lens dùng trực tiếp.
+# ⚠ ĐÂY LÀ FocalNet, KHÔNG PHẢI Focal Transformer. Hai bài khác nhau của cùng
+# nhóm Microsoft: Focal Transformer (NeurIPS 2021) dùng *focal self-attention*;
+# FocalNet (NeurIPS 2022) BỎ HẲN self-attention, thay bằng *focal modulation*
+# (một chồng depth-wise conv + gating). timm chỉ có FocalNet. Muốn đúng bài
+# 2021 thì phải vendor code từ `microsoft/Focal-Transformer` — `backbone_body`
+# hiện chỉ dựng model qua timm.
 #
-# ⚠ Ở 448² lưới là 28×28 = 784 ô, KHÔNG phải 14×14. ConvNeXt có stem stride 4
-# rồi ba lần stride 2; 14×14 chỉ xảy ra ở ảnh 224² hoặc ở Stage 4. `n_patch`
-# đến từ MỘT lượt forward THẬT (`vextractor.backbone_body`), không từ một công
-# thức gõ tay, nên nó không thể lệch với model.
+# ⚠ `ms_in1k` là trọng số CÓ GIÁM SÁT trên ImageNet-1k, KHÔNG phải tự giám sát.
+# Nên Stage 0 ở đây KHÔNG còn là "chạy tiếp đúng hàm mục tiêu" như với một
+# checkpoint DINOv3: nó là **DINO self-distillation khởi đi từ một init có giám
+# sát**. Đó là một lựa chọn có đánh đổi thật — được một backbone mạnh và rẻ,
+# mất tính liên tục của hàm mục tiêu — và đừng đọc đường loss của Stage 0 như
+# thể nó tiếp nối một lượt pretrain tự giám sát nào.
 #
-# ConvNeXt thuần tích chập: không pos-embed để nội suy, không cửa sổ để đệm,
-# không BatchNorm nào mang thống kê chạy. MỘT state_dict chạy cả 448² (global)
-# lẫn 224² (local crop của Stage 0). Và nó KHÔNG có cls token -> `stage0.dino.
-# pool` bắt buộc `mean`, `cls` bị TỪ CHỐI ngay lúc dựng backbone.
+# `n_stages: null` — ĐỦ bốn stage, dừng ở stride 32 / 768 kênh. Ở 448² lưới là
+# 14×14 = 196 ô × 768 (stem /4 rồi ba lần /2 -> 448/32 = 14). Tầng ngữ nghĩa
+# CAO NHẤT của backbone được giữ; cái giá là lưới thô hơn 4× so với một bản cắt
+# ở Stage 3 — Cross-attn và Lens đều đọc trực tiếp lưới ấy.
+#
+# `n_patch` và `d_feat` đến từ MỘT lượt forward THẬT
+# (`vextractor.backbone_body`), không từ một công thức gõ tay, nên chúng không
+# thể lệch với model.
+#
+# FocalNet thuần tích chập + gating: không pos-embed để nội suy, không cửa sổ
+# để đệm, không BatchNorm nào mang thống kê chạy. MỘT state_dict chạy cả 448²
+# (global, lưới 14×14) lẫn 224² (local crop của Stage 0, lưới 7×7) — đã probe
+# THẬT ở nửa độ phân giải lúc dựng (`multi_res`). Và nó KHÔNG có cls token ->
+# `stage0.dino.pool` bắt buộc `mean`, `cls` bị TỪ CHỐI ngay lúc dựng backbone.
 #
 # Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ
 # `timm.get_pretrained_cfg(arch).mean/std` và đóng vào spec của mọi checkpoint.
 #
 # ── 2. COMPRESSOR ────────────────────────────────────────────────────────────
-#   kv = RMSNorm(V)                                   512, MỘT lần, ngoài mọi nhóm
-#   q  = 32 latent @768
+#   kv = RMSNorm(V)                                   768, MỘT lần, ngoài mọi nhóm
+#   q  = 8 latent @1024
 #   N × [ khối 1:  q += SelfAttn(N(q))
 #                  q += CrossAttn(N(q), kv)           <- chỗ DUY NHẤT đọc V
 #                  q += SwiGLU(N(q))
 #         khối 2:  q += SelfAttn(N(q))
 #                  q += SwiGLU(N(q))                ]
 #
-# 512 -> 768 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 512, trả
-# 768). KHÔNG có `Linear 512→768` đứng trước: một lớp chiếu riêng thêm 0,39 M
-# tham số mà không thêm sức biểu diễn nào (nó chỉ gộp được vào k/v phía sau).
+# 768 -> 1024 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 768, trả
+# 1024). KHÔNG có `Linear 768→1024` đứng trước: một lớp chiếu riêng thêm 0,79 M
+# tham số mà không thêm sức biểu diễn nào (nó chỉ gộp được vào k/v phía sau),
+# và nó buộc cả ba nhóm dùng chung MỘT bản 1024 chiều của lưới.
 #
-# `head_dim` là khoá KHAI, `n_heads` được SUY RA (768 // 128 = 6). Chiều ngược
+# `head_dim` là khoá KHAI, `n_heads` được SUY RA (1024 // 128 = 8). Chiều ngược
 # lại — khai n_heads rồi để head_dim rơi ra — là cách head_dim đổi LẶNG LẼ mỗi
 # lần ai đó sửa `d_latent`. Khai cái BẤT BIẾN, suy ra cái phụ thuộc; khai
 # `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác.
 #
-# Khối 2 KHÔNG có Cross-attn, và đó là chủ ý: nó để 32 vector thống nhất lại
+# Khối 2 KHÔNG có Cross-attn, và đó là chủ ý: nó để 8 vector thống nhất lại
 # với nhau sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp.
 #
-# Tham số ở 768 / kv 512 / hidden 1024:
-#   SelfAttn 4×768² = 2,36 M · CrossAttn 2×768² + 2×512×768 = 1,97 M
-#   SwiGLU 3×768×1024 = 2,36 M · 5 × RMSNorm(768) = 3 840
-#   => KHỐI 1 (self+cross+ffn) 6,69 M · KHỐI 2 (self+ffn) 4,72 M
-#   => MỘT nhóm 11,41 M (khớp `~11.41M (xN)` của đặc tả); N = 5 -> 57,06 M.
+# Tham số ở 1024 / kv 768 / hidden 1024:
+#   SelfAttn 4×1024² = 4,19 M · CrossAttn 2×1024² + 2×768×1024 = 3,67 M
+#   SwiGLU 3×1024×1024 = 3,15 M · 5 × RMSNorm(1024) = 5 120
+#   => KHỐI 1 (self+cross+ffn) 11,01 M · KHỐI 2 (self+ffn) 7,34 M
+#   => MỘT nhóm 18,36 M; N = 3 -> 55,07 M (kèm latent + RMSNorm(V)).
+#   ⚠ Đặc tả ghi ~17.84 M mỗi nhóm — số ĐO ĐƯỢC là 18,36 M (lệch 0,51 M).
+#     Aligner thì khớp tuyệt đối (18,88 vs ~18.89 M), nên quy ước đếm giống
+#     nhau; chênh lệch nằm ở phép nhẩm của đặc tả, không ở kiến trúc.
 #
 # Chi phí nằm ở `d_latent` (theo d²) và `n_blocks` (tuyến tính), KHÔNG ở
-# `n_query`: 32 latent chỉ là 24 576
+# `n_query`: 8 latent chỉ là 8 192
 # tham số. Đổi `n_query` đụng tới THỜI GIAN và độ dài chuỗi decoder, không tới
 # bảng tham số.
 #
 # ── 3. ALIGNER ───────────────────────────────────────────────────────────────
-# RMSNorm(768) + MỘT khối SwiGLU 768→4096→2560 (`down(SiLU(gate(x)) ⊙ up(x))`,
+# RMSNorm(1024) + MỘT khối SwiGLU 1024→4096→2560 (`down(SiLU(gate(x)) ⊙ up(x))`,
 # bias=False cả ba theo quy ước Gemma 3 / LLaMA, init 1/√fan_in). Không
 # attention, không residual: phần "suy nghĩ" nằm trọn trong Compressor, và đây
 # là chỗ DUY NHẤT nhánh đổi chiều lên không gian embedding của decoder.
@@ -396,7 +412,7 @@ labels:
 # (bản đồ saliency của Lens thành ma trận không). Giá: 1024 tham số. Vì cùng lý
 # do, ba ma trận có cổng init `1/√fan_in` và `_init` PHẢI bỏ qua chúng.
 #
-# `mlp_hidden` 4096 > `d_latent` 768 — NỞ RA, cùng hướng với FFN của decoder
+# `mlp_hidden` 4096 > `d_latent` 1024 — NỞ RA, cùng hướng với FFN của decoder
 # (Gemma 3: 2560 → 10240). Muốn một nút THẮT thì đặt nó dưới 768; cả hai đều
 # chạy, nhưng hỏi hai câu khác nhau.
 #
@@ -404,31 +420,34 @@ labels:
 # = 768 (chiều thật của V_c) nó là **16,78 M**. Aligner ăn V_c NGUYÊN chiều —
 # không có lớp chiếu 768→1024 nào chen vào chỉ để khớp một con số.
 #
-# `d_latent` 768 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
+# `d_latent` 1024 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
 # `d_latent` khai ở đây, và `build_aligner` nối chúng — nên đổi base sang một
 # decoder khác chiều sẽ lộ ra chứ không lặng lẽ.
 vextractor:
-  extractor:                # ảnh (3,448,448) -> V (784, 512)
-    image_size: 448         # stem/4 rồi 3 × /2 -> stride 16; 448/16 = 28 -> 784 ô
-    # timm; lần chạy đầu tải ~350 MB. ConvNeXt-Base DINOv3, cắt còn 3 stage:
-    # ~60,1 M tham số (đặc tả ghi ~59,39 M — con số ĐO ĐƯỢC là 60,12 M).
-    arch: convnext_base.dinov3_lvd1689m
-    pretrained: true        # false bị TỪ CHỐI: "DINOv3 finetuning" từ trọng số
-                            # ngẫu nhiên chỉ ra một backbone ngẫu nhiên khác
-    # Lát cắt của họ PHẲNG (ViT `.blocks`). ConvNeXt KHÔNG có — phải là null,
+  extractor:                # ảnh (3,448,448) -> V (196, 768)
+    image_size: 448         # stem/4 rồi 3 × /2 -> stride 32; 448/32 = 14 -> 196 ô
+    # timm; lần chạy đầu tải ~200 MB. FocalNet-Small LRF, ĐỦ 4 stage:
+    # 49 573 440 tham số ĐO ĐƯỢC (đặc tả ghi ~50 M). Xem ⚠ ở trên: đây là
+    # FocalNet (2022), không phải Focal Transformer (2021), và trọng số nền là
+    # CÓ GIÁM SÁT ImageNet-1k.
+    arch: focalnet_small_lrf.ms_in1k
+    pretrained: true        # false bị TỪ CHỐI: chạy DINO từ trọng số ngẫu nhiên
+                            # chỉ ra một backbone ngẫu nhiên khác
+    # Lát cắt của họ PHẲNG (ViT `.blocks`). FocalNet KHÔNG có — phải là null,
     # khai số ở đây sẽ bị TỪ CHỐI.
     n_layers: null
-    # Lát cắt của họ PHÂN CẤP (`.stages`). 3 = giữ Stage 1–3 -> 512 kênh.
-    n_stages: 3
-  compressor:               # QFormer: V (784, 512) -> V_c (32, 768)
-    n_query: 32             # số latent = số token Q nối vào chuỗi decoder
-    d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
-    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
-    mlp_hidden: 1024        # SwiGLU 768 -> 1024 -> 768 (mỗi khối)
-    n_blocks: 5             # N: số lần lặp (khối 1 -> khối 2)
+    # Lát cắt của họ PHÂN CẤP (`.stages`). FocalNet của timm KHÔNG phơi
+    # `.stages`, nên khai số ở đây cũng bị TỪ CHỐI — phải là null.
+    n_stages: null
+  compressor:               # QFormer: V (196, 768) -> V_c (8, 1024)
+    n_query: 8              # số latent = số token Q nối vào chuỗi decoder
+    d_latent: 1024          # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
+    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 8
+    mlp_hidden: 1024        # SwiGLU 1024 -> 1024 -> 1024 (mỗi khối)
+    n_blocks: 3             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (32, 768) -> Q (32, 2560)
-    mlp_hidden: 4096        # SwiGLU 768 -> 4096 -> 2560 (16,78 M)
+  aligner:                  # V_c (8, 1024) -> Q (8, 2560)
+    mlp_hidden: 4096        # SwiGLU 1024 -> 4096 -> 2560 (18,88 M)
     dropout: 0.0
 
   # ── Main stage: HAI nhóm, HAI lịch (`src/train_vextractor.py`) ──────────
@@ -463,7 +482,7 @@ vextractor:
     align_warmup_frac: 0.10   # 10% tổng bước (= 20/200)
     align_wd: 0.01
     comp_lr_min: 1.0e-8
-    comp_lr_main: 7.0e-6
+    comp_lr_main: 3.0e-6
     comp_freeze_frac: 0.20    # 20% tổng bước ĐÓNG BĂNG (= 40/200)
     comp_warmup_frac: 0.10    # rồi 10% tổng bước warm-up (= 20/200)
     comp_wd: 0.01
@@ -488,7 +507,7 @@ vextractor:
 #
 # HAI view, và đúng hai: teacher một global 448², student một global 448² KHÁC
 # (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên nên
-# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô nên
+# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 196 ô nên
 # local crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới 196 ô.
 #
 # MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN của
@@ -497,16 +516,16 @@ vextractor:
 #
 # HAI nhóm lr, cùng lịch chung nhưng hai CẶP số: warm-up tuyến tính trong
 # `warmup_epochs` epoch rồi GIỮ `lr_max` của từng nhóm tới hết. Ma trận attention
-# quyết định 32 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
+# quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ dễ hỏng nhất khi
 # bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
 # lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
 # `latent` + mọi RMSNorm + DINO head mới đi theo nhóm FFN (xem
 # `vextractor.Compressor.ffn_parameters`).
 stage1:
   attn_lr_min: 1.0e-8
-  attn_lr_max: 1.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
+  attn_lr_max: 3.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
   ffn_lr_min: 1.0e-7
-  ffn_lr_max: 1.0e-4      # MỨC CHẠY của nhóm ffn
+  ffn_lr_max: 3.0e-4      # MỨC CHẠY của nhóm ffn
   warmup_epochs: 1.0      # độ dài dốc warm-up (epoch), rồi GIỮ lr_max tới hết
   max_epochs: 20          # TRẦN, không phải số epoch sẽ chạy — patience quyết
   # CHẶNG 5, giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
@@ -529,7 +548,7 @@ stage1:
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
 # KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
-# huấn luyện là Extractor (ConvNeXt-Base, trọng số DINOv3), bằng chính hàm mục
+# huấn luyện là Extractor (FocalNet-Small LRF, init ImageNet-1k), bằng hàm mục
 # tiêu nó được sinh ra với.
 #
 #   student(view) ─► DINO head ─┐
@@ -576,7 +595,7 @@ stage0:
   # lr_min là BA thứ cùng lúc, nên đừng đọc nó chỉ như "lr nhỏ nhất": đầu dốc
   # warm-up (bước 0 có ĐÚNG số này), SÀN của chặng 5, và ĐÁY của epoch đuôi.
   lr_min: 1.0e-8
-  lr_max: 1.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
+  lr_max: 3.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
   warmup_epochs: 1.0        # độ dài dốc warm-up (epoch). Xem chú thích trên.
   max_epochs: 50            # TRẦN thật sự của giai đoạn
   # CHẶNG 5 — "Nếu patient tăng 1, decay lr hiện tại. Nếu không thì duy
@@ -625,7 +644,7 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # ConvNeXt nuốt cỡ này trên ĐÚNG một state_dict
+    local_size: 224         # FocalNet nuốt cỡ này trên ĐÚNG một state_dict
                             # (thuần tích chập, không pos-embed để nội suy)
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
@@ -636,7 +655,7 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. ConvNeXt KHÔNG có cls token -> `mean` (trung bình 784 ô) là
+    # cls | mean. FocalNet KHÔNG có cls token -> `mean` (trung bình 196 ô) là
     # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
     # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
     # không bao giờ tự lộ ra.

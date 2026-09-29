@@ -22,7 +22,7 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
 ═══ BA khối, BA số phận ở main stage ══════════════════════════════════════════
 
-  * **Extractor** (ConvNeXt, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
+  * **Extractor** (FocalNet, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
     **TEACHER INFERENCE** suốt main stage: `requires_grad=False` + `eval()` +
     forward trong `no_grad`, KHÔNG nằm trong optimizer, KHÔNG có bước mở băng
     nào. Đó đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
@@ -63,10 +63,10 @@ torch.randperm(Generator(seed)), batch mỗi lượt đã khoá (`train_batch`),
 grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear của
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
-Chuỗi vào decoder DÀI THÊM `n_query` (32) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 32/(độ dài chuỗi) CỘNG một lượt ConvNeXt-Base 3
-stage ở 448² cho mỗi ảnh. Phần nặng còn lại là Cross-attn của 32 latent trên
-784 ô.
+Chuỗi vào decoder DÀI THÊM `n_query` (8) token, nên B tốn VRAM và thời gian
+mỗi bước nhiều hơn A ở mức 8/(độ dài chuỗi) CỘNG một lượt FocalNet-Small (đủ 4
+stage) ở 448² cho mỗi ảnh. Phần nặng còn lại là Cross-attn của 8 latent trên
+196 ô.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
