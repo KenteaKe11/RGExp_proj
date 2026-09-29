@@ -1003,22 +1003,30 @@ def _():
     # ── hai CẶP lr, ĐÚNG như đặc tả ───────────────────────────────────────
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     sc = s0.s0cfg(cfg)
-    assert (sc["lr_min"], sc["lr_max"]) == (1e-8, 1e-5)
+    assert (sc["lr_min"], sc["lr_max"]) == (1e-8, 3e-5)
     assert "lr_main" not in sc and "sched_epochs" not in sc
     assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
     # patience ĐỒNG BỘ: cả hai giai đoạn cùng chờ 3 epoch.
     assert sc["patience"] == 3 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
-    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 1e-5)
-    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 1e-4)
+    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 3e-5)
+    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 3e-4)
+    # FFN chịu được dốc CAO HƠN attn: ma trận attention quyết định 8 vector
+    # ĐỌC Ở ĐÂU trên lưới, và một bước lớn làm phân phối ấy sụp về vài ô rồi
+    # không quay lại. Quan hệ ấy phải còn đúng, không chỉ hai con số rời.
+    assert s1c["ffn_lr_max"] > s1c["attn_lr_max"]
+    assert s1c["attn_lr_max"] == sc["lr_max"]      # attn đi cùng mức với Stage 0
     assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 20
     assert s1c["patience"] == sc["patience"] == 3
     zc = zcfg(cfg)
     assert set(zc) == set(MAIN_CFG_KEYS)
     assert (zc["align_lr_min"], zc["align_lr_main"]) == (1e-6, 1e-4)
     assert zc["align_warmup_frac"] == 0.10
-    assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 7e-6)
+    assert (zc["comp_lr_min"], zc["comp_lr_main"]) == (1e-8, 3e-6)
+    # Compressor đã học ở Stage 1 nên main stage chỉ tinh chỉnh NHẸ: mức của
+    # nó phải nhỏ hơn hẳn Aligner (khối MỚI, phải học từ ngẫu nhiên).
+    assert zc["comp_lr_main"] < zc["align_lr_main"]
     assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
 
     # ── `lr_max` là MỨC CHẠY: mọi epoch sau epoch 1 đều ở đó ──────────────
@@ -2128,14 +2136,21 @@ def _():
     assert set(ins["compressor_shape"]) == {"n_query", "d_latent", "head_dim",
                                             "mlp_hidden", "n_blocks"}
     f0 = s1.config_fingerprint(cfg)
+    # Giá trị "khác" phải SUY RA từ cấu hình sống, không gõ tay: một hằng số
+    # gõ tay có ngày TRÙNG với cấu hình thật, và lúc ấy phép thử thành no-op —
+    # bài kiểm vẫn xanh trong khi nó không còn thử gì. Đã xảy ra: `n_query=8`
+    # từng là "khác", rồi `n_query` thật đổi thành 8.
+    _al = cfg["vextractor"]["aligner"]["mlp_hidden"]
+    _nq = cfg["vextractor"]["compressor"]["n_query"]
+    _lr = cfg["stage0"]["lr_max"]
     c2 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c2["vextractor"]["aligner"] = dict(c2["vextractor"]["aligner"], mlp_hidden=512)
+    c2["vextractor"]["aligner"] = dict(c2["vextractor"]["aligner"], mlp_hidden=_al * 2)
     assert s1.config_fingerprint(c2) == f0, "đổi Aligner KHÔNG được bắt chạy lại Stage 1"
     c3 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c3["vextractor"]["compressor"] = dict(c3["vextractor"]["compressor"], n_query=8)
+    c3["vextractor"]["compressor"] = dict(c3["vextractor"]["compressor"], n_query=_nq + 1)
     assert s1.config_fingerprint(c3) != f0, "đổi Compressor PHẢI bắt chạy lại Stage 1"
     c4 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c4["stage0"] = dict(c4["stage0"], lr_max=1e-3)
+    c4["stage0"] = dict(c4["stage0"], lr_max=_lr * 10)
     assert s1.config_fingerprint(c4) != f0, "đổi Stage 0 PHẢI bắt chạy lại Stage 1"
 
     # ── CompressorTransferTrainer: teacher ĐỨNG YÊN, grad CHỈ tới Compressor ──
