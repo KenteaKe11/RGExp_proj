@@ -15,7 +15,7 @@ Nhánh thị giác bổ sung 8 token ảnh vào đầu vào Gemma 3. Ảnh cũng
 - **Extractor:** FocalNet-B LRF Stage 3 (`focalnet_base_lrf`), cấu hình cắt là `n_stages: 3`. Bảng đặc tả khai khoảng **88,1 M** cho backbone; extractor đang giữ ba stage đầu để xuất feature map 512 kênh có **60,25 M** tham số. Đầu vào global `B×3×448×448`, đặc trưng `B×512×28×28`, 784 ô thành `V (784, 512)`. Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained Base LRF. Các stage sau dùng teacher EMA được chọn theo validation.
 - **Compressor:** 8 latent vector học được với kích thước 768, RMSNorm, 4 nhóm block. Mỗi nhóm gồm block đầu `SelfAttn → CrossAttn(Q,V) → SwiGLU` và block sau `SelfAttn → SwiGLU`. `V_c (8, 768)`; SwiGLU 768→512→768. Với V có 512 kênh, mỗi nhóm có khoảng **9,05 M** tham số, toàn Compressor khoảng **36,20 M**; `head_dim` = 128; cấu hình FFN là `vextractor.compressor.mlp_hidden`.
 - **Aligner:** khoảng **10,75 M** tham số; MHAttn trên 8 token nén, rồi `SwiGLU 768→2048→2560`, RMSNorm; cấu hình FFN là `vextractor.aligner.mlp_hidden`.
-- **Tổng tham số:** khoảng **107,20 M** cho nhánh; **46,95 M** được học ở main stage (Compressor và Aligner). DINO head có **2,63 M**; student Stage 0 có khoảng **62,88 M**.
+- **Tổng tham số:** khoảng **107,20 M** cho nhánh; **46,95 M** được học ở main stage (Compressor và Aligner). DINO head có **6,82 M**; student Stage 0 có khoảng **67,08 M**.
 - **Đầu vào decoder:** nối 8 token đã căn chỉnh sau token ảnh gốc `Z`; các vị trí token mới có nhãn `-100` cho CE.
 
 ## Lịch huấn luyện
