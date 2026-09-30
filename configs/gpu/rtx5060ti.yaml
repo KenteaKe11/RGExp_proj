@@ -80,8 +80,12 @@ set:
   # Vẫn OOM thì bật `vextractor.extractor.with_cp: true` (gradient checkpointing
   # trong từng InternImageLayer) — nó KHÔNG vào vân tay Stage 0, nên bật/tắt
   # không bắt chạy lại một lượt DINO nhiều giờ.
-  stage0.micro_batch: 8           # khởi điểm; autobatch dò lại (ước của 32)
-  stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
+  # 4, không 8: với `with_cp: true` thì 8 còn có thể vừa, nhưng KHỞI ĐIỂM quá
+  # cao là một lượt OOM trước khi autobatch kịp dò. Và `probe_sizes` phải CÓ
+  # mốc 1: nếu mốc nhỏ nhất của nó OOM thì autobatch dò XUỐNG dưới mốc ấy —
+  # trước đây nó giữ lại `micro_batch` (tức số LỚN HƠN) và chết ở epoch 1.
+  stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
+  stage0.probe_sizes: [1, 2, 4]   # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy mới đúng.
   # Stage 1 nhẹ hơn Stage 0 hẳn một bậc: Extractor chạy `no_grad` (không giữ

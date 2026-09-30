@@ -159,10 +159,19 @@ checkpoint khác của cùng họ sẽ đi qua cổng kiểm mà không ai thấ
 buộc** phải nhận mean/std (không có mặc định); `assert_same_pixels` kiểm lại
 trên một mẫu thật mỗi lần chạy.
 
-**`with_cp` là khoá DUY NHẤT của khối `extractor` không vào vân tay Stage 0.**
-Nó bật `torch.utils.checkpoint` trong từng `InternImageLayer`: đổi **chi phí**
-của lượt forward, không đổi một tensor nào — nên bật/tắt nó không bắt chạy lại
-một lượt DINO nhiều giờ. Khai `with_cp: true` với một `arch` của timm bị **từ
+**`with_cp: true` là MẶC ĐỊNH, và đó là con số đo được.** Nó bật
+`torch.utils.checkpoint` trong từng `InternImageLayer`. `dcnv3_core_pytorch`
+giữ một tensor `(N·group, H·W, group_channels, 9)` **mỗi block** để backward —
+ở 448² với InternImage-L là ~72 MB cho mỗi block của level 0 (112×112,
+group 10), nhân **32 block**, rồi nhân **8 view** mà `dino.loss` giữ sống cùng
+lúc. Tắt khoá này thì Stage 0 OOM ngay ở mảnh vật lý 4 trên một card 16 GB. Vì
+kernel CUDA của DCNv3 **không bao giờ** được dùng, bản PyTorch là bản duy nhất
+từng chạy — nên đây là ca THƯỜNG, không phải ngoại lệ của một máy. Giá: ~30%
+thời gian Stage 0.
+
+Nó cũng là khoá DUY NHẤT của khối `extractor` **không** vào vân tay Stage 0:
+nó đổi **chi phí** của lượt forward, không đổi một tensor nào — nên bật/tắt
+không bắt chạy lại một lượt DINO nhiều giờ. Khai `with_cp: true` với một `arch` của timm bị **từ
 chối ồn ào**: model của timm không đọc khoá ấy, và một khoá không ai đọc là im
 lặng tuyệt đối.
 
@@ -425,10 +434,16 @@ số).
 > Multi-crop nhân số lượt forward lên `2 + n_local` = **8** cho student cộng 2
 > lượt `no_grad` cho teacher, trên một backbone **2,3× lớn hơn** FocalNet-Small
 > và chạy DCNv3 bằng **PyTorch thuần** (9 điểm `grid_sample` mỗi vị trí). Hai
-> khoá để trả giá: `configs/gpu/<card>.yaml` → `stage0.micro_batch` (autobatch
-> dò lại từ đó), và `vextractor.extractor.with_cp: true` (gradient
-> checkpointing trong từng `InternImageLayer` — đổi ~30% thời gian lấy phần lớn
-> activation).
+> khoá để trả giá: `vextractor.extractor.with_cp` (MẶC ĐỊNH `true` — gradient
+> checkpointing trong từng `InternImageLayer`, đổi ~30% thời gian lấy phần lớn
+> activation; xem §1.1) và `configs/gpu/<card>.yaml` → `stage0.micro_batch`
+> (khởi điểm **4**; autobatch dò lại từ đó).
+>
+> **`probe_sizes` của Stage 0 phải chứa mốc 1.** Nếu mốc NHỎ NHẤT của nó OOM,
+> `autobatch` dò **xuống** dưới mốc ấy rồi chọn mảnh lớn nhất còn vừa; OOM ở
+> mọi mảnh thì nó **DỪNG** và chỉ ra `with_cp`. Bản trước giữ lại
+> `micro_batch` — tức một số LỚN HƠN mốc vừa OOM — và chết ở bước đầu của
+> epoch 1 sau khi đã nạp xong dữ liệu lẫn trọng số.
 
 **`pool: mean`.** InternImage không có cls token, nên DINO head đọc **trung bình
 784 ô** của lưới. `pool: cls` bị **từ chối ngay lúc dựng backbone**, không lặng

@@ -475,7 +475,19 @@ vextractor:
     # DINO. Bật khi Stage 0 hết VRAM (multi-crop × 8 view × DCNv3 PyTorch là
     # chỗ nặng nhất của cả thí nghiệm); giá ~30% thời gian. Khai `true` với một
     # `arch` của timm bị TỪ CHỐI: model của timm không đọc khoá ấy.
-    with_cp: false
+    #
+    # BẬT, và đây là con số ĐO ĐƯỢC chứ không phải đề phòng. `dcnv3_core_pytorch`
+    # giữ một tensor (N·group, H·W, group_channels, 9) MỖI block để backward; ở
+    # 448² với InternImage-L đó là ~72 MB cho mỗi block của level 0 (112×112,
+    # group 10) — nhân 32 block, rồi nhân (2 global + 6 local) view mà
+    # `dino.loss` giữ SỐNG CÙNG LÚC. Trên card 16 GB, Stage 0 OOM ngay ở mảnh
+    # vật lý 4 khi khoá này tắt. Vì kernel CUDA của DCNv3 KHÔNG BAO GIỜ được
+    # dùng (xem ⚠ ở trên), bản PyTorch là bản duy nhất từng chạy — nên đây
+    # không phải một ca ngoại lệ của một máy, nó là ca THƯỜNG.
+    #
+    # Giá: ~30% thời gian Stage 0. Nó KHÔNG vào vân tay Stage 0 (`with_cp` đổi
+    # CHI PHÍ, không đổi một tensor nào), nên tắt/bật không bắt chạy lại DINO.
+    with_cp: true
   compressor:               # QFormer: V (784, 640) -> V_c (8, 768)
     n_query: 8              # số latent = số token Q nối vào chuỗi decoder
     d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều

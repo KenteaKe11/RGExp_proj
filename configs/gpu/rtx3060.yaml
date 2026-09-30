@@ -45,8 +45,8 @@ set:
   # nhiều activation hơn hẳn. Đây chỉ là KHỞI ĐIỂM — autobatch dò lại — nhưng
   # khởi điểm quá cao là một lượt OOM trước khi nó dò được.
   # Vẫn OOM thì bật `vextractor.extractor.with_cp: true`.
-  stage0.micro_batch: 8           # khởi điểm; autobatch dò lại (ước của 32)
-  stage0.probe_sizes: [2, 4, 8]   # điểm ĐO riêng của Stage 0 (main stage dùng
+  stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
+  stage0.probe_sizes: [1, 2, 4]   # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy tới 16/32 mới
                                   # đúng; dùng chung [2,4,8] là luôn ra micro thấp.

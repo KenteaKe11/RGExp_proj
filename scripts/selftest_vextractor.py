@@ -194,6 +194,88 @@ def _():
         f"VRAM — card to hơn nâng mảnh VẬT LÝ, không nâng số này.")
 
 
+@check("1c. autobatch: probe nhỏ nhất OOM -> dò XUỐNG (không bao giờ giữ lại một "
+       "mảnh LỚN HƠN); OOM ở mọi bs -> DỪNG và chỉ ra `with_cp`")
+def _():
+    """Bài này chốt một lỗi ĐÃ làm chết một lượt Stage 0, và nó chết muộn.
+
+    `autotune` dò `probe_sizes` từ nhỏ lên. Khi mốc NHỎ NHẤT đã OOM, bản trước
+    trả về `current` — tức `stage0.micro_batch` của config, thường LỚN HƠN mốc
+    vừa OOM. Log nói ra đúng điều đó trong một dòng mà không ai đọc như một
+    lỗi:
+
+        ⚠ autobatch[stage0]: OOM ngay ở bs 4 — giữ 8
+
+    ...rồi vòng huấn luyện OOM lại ở bước đầu của epoch 1, sau khi đã nạp xong
+    11 400 ảnh và 115,7 M trọng số. Không exception nào ở chỗ sai; chỗ sai chỉ
+    là một con số bị giữ lại.
+
+    GPU được thay bằng `measure_fn` giả nên bài chạy trên CPU.
+    """
+    from src.autobatch import autotune, divisors
+    from src.backbone import TrainUnusable
+    from src.config import Cfg
+
+    GIB = 1024 ** 3
+    TOTAL = 16.0 * GIB
+    cfg = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80,
+                             "probe_sizes": [4, 8, 16]}})
+    assert divisors(32) == [1, 2, 4, 8, 16, 32], divisors(32)
+
+    def cost(limit):
+        """OOM (None) từ `limit` trở lên; dưới đó tuyến tính 1 + 0.5·bs GiB."""
+        return lambda bs: None if bs >= limit else (1.0 + 0.5 * bs) * GIB
+
+    # ── ca đã hỏng: mốc nhỏ nhất của probe (4) OOM, current = 8 ──────────
+    got, rep = autotune(cfg, "stage0", 32, 8, None, cands=divisors(32),
+                        measure_fn=cost(4), total_bytes=TOTAL)
+    assert rep.get("probe_oom_at") == 4, rep
+    assert got < 4, f"giữ lại mảnh >= mốc vừa OOM: {got}"
+    assert got != 8, "giữ lại ĐÚNG con số của config — đây là lỗi cũ"
+    assert got == 2, (got, rep)
+    assert rep["accum"] == 16 and rep["chosen"] * rep["accum"] == 32, rep
+
+    # ...và batch HIỆU DỤNG không bao giờ đổi, dù mảnh vật lý đổi
+    for lim, want in ((4, 2), (2, 1), (9, 8)):
+        got, rep = autotune(cfg, "stage0", 32, 8, None, cands=divisors(32),
+                            measure_fn=cost(lim), total_bytes=TOTAL)
+        assert got == want, (lim, got, want)
+        assert rep["chosen"] * rep["accum"] == 32, rep
+
+    # ── ca thường: probe [1,2,4] đo được, chọn ước LỚN NHẤT vừa ngân sách ─
+    ok = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80,
+                            "probe_sizes": [1, 2, 4]}})
+    got, rep = autotune(ok, "stage0", 32, 4, None, cands=divisors(32),
+                        measure_fn=cost(64), total_bytes=TOTAL)
+    assert got == 16 and rep["accum"] == 2, rep      # 1 + 0.5·16 = 9 <= 12.8
+    assert "probe_oom_at" not in rep, rep
+
+    # ── OOM ở MỌI bs -> DỪNG, và nói ra `with_cp` ────────────────────────
+    try:
+        autotune(cfg, "stage0", 32, 8, None, cands=divisors(32),
+                 measure_fn=cost(0), total_bytes=TOTAL)
+    except TrainUnusable as e:
+        msg = str(e)
+        assert "with_cp" in msg, msg          # khoá ĐÚNG cho ca DCNv3 PyTorch
+        assert "n_local" in msg and "target_frac" in msg, msg
+    else:
+        raise AssertionError("OOM ở mọi bs phải DỪNG, không giữ số của config")
+    # nhãn khác stage0 thì KHÔNG khuyên `with_cp` của Extractor
+    try:
+        autotune(cfg, "main", 1, 1, None, cands=[1],
+                 measure_fn=cost(0), total_bytes=TOTAL)
+    except TrainUnusable as e:
+        assert "with_cp" not in str(e), str(e)
+    else:
+        raise AssertionError("OOM ở bs 1 của main stage phải DỪNG")
+
+    # ── autobatch TẮT -> không đo gì, giữ nguyên config ──────────────────
+    off = Cfg({"autobatch": {"enabled": False, "probe_sizes": [1]}})
+    got, rep = autotune(off, "stage0", 32, 8, None, cands=divisors(32),
+                        measure_fn=cost(0), total_bytes=TOTAL)
+    assert got == 8 and rep["enabled"] is False
+
+
 @check("2. Extractor (cắt stage) -> Compressor (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn) -> Aligner (RMSNorm + MHAttn + SwiGLU)")
 def _():
     import math

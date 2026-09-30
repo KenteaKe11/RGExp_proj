@@ -184,9 +184,56 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
         if pk > budget:
             break
     if not pts:
-        rep.update(error=f"OOM ngay ở bs {sizes[0]} — giữ {current}")
-        print(f"  ⚠ autobatch[{label}]: {rep['error']}", flush=True)
-        return int(current), rep
+        # `probe_sizes` NHỎ NHẤT đã OOM. Trả `current` ở đây là SAI mỗi khi
+        # `current >= sizes[0]`: đó đúng là con số vừa được CHỨNG MINH không
+        # vừa VRAM, nên vòng huấn luyện OOM lại ngay ở bước đầu. Lỗi ấy đã xảy
+        # ra thật, và nó tự tố cáo mình trong đúng một dòng log:
+        #     ⚠ autobatch[stage0]: OOM ngay ở bs 4 — giữ 8
+        # rồi chết ở epoch 1. Nên hạ xuống các ứng viên NHỎ HƠN và ĐO tiếp
+        # (lớn trước), cho tới khi có một điểm vừa ngân sách.
+        rep["probe_oom_at"] = int(sizes[0])
+        for c in (c for c in sorted(cands, reverse=True) if c < sizes[0]):
+            pk = measure_fn(c)
+            if pk is None:
+                oom_at = c
+                continue
+            pts.append((c, pk))
+            if pk <= budget:
+                break
+        if pts:
+            print(f"  ⚠ autobatch[{label}]: OOM ở bs {sizes[0]} (nhỏ nhất của "
+                  f"probe_sizes) -> dò XUỐNG, đo được "
+                  f"{[[x, round(y / 1024 ** 3, 2)] for x, y in pts]} GiB",
+                  flush=True)
+    if not pts:
+        # Kể cả mảnh nhỏ nhất cũng không vừa. Giữ `current` ở đây là hoãn ĐÚNG
+        # cùng một lỗi tới bước đầu của epoch 1 — sau khi đã nạp xong dữ liệu
+        # và trọng số. DỪNG, và nói ra chỗ để hạ chi phí.
+        from .backbone import TrainUnusable
+
+        if label == "stage0":
+            tips = (
+                "    Ba chỗ hạ chi phí, theo thứ tự nên thử:\n"
+                "      1. `vextractor.extractor.with_cp: true` — gradient "
+                "checkpointing trong TỪNG `InternImageLayer`. DCNv3 bản PyTorch "
+                "giữ một tensor (N·group, H·W, group_channels, 9) mỗi block để "
+                "backward; checkpointing TÍNH LẠI thay vì giữ. Đây là khoá đúng "
+                "cho ca này, và nó KHÔNG vào vân tay Stage 0 nên không bắt chạy "
+                "lại gì.\n"
+                "      2. `stage0.dino.n_local` — mỗi local crop là MỘT lượt "
+                "forward CÓ gradient nữa, và cả (2 + n_local) view sống cùng lúc "
+                "trong `dino.loss`. Nhưng nó là siêu tham số của HÀM MỤC TIÊU và "
+                "CÓ trong vân tay Stage 0: đổi nó là đổi thí nghiệm.\n"
+                "      3. `autobatch.target_frac` — chỉ nới được vài phần trăm, "
+                "và nới quá thì OOM rơi vào giữa epoch thay vì lúc dò.")
+        else:
+            tips = ("    Hạ `autobatch.target_frac`, tắt tiến trình khác trên "
+                    "card, hoặc bật gradient checkpointing của khối nặng nhất.")
+        rep.update(error=f"OOM ở MỌI bs, xuống tới {min(cands)}")
+        raise TrainUnusable(
+            f"autobatch[{label}]: OOM ở MỌI mảnh vật lý, xuống tới bs "
+            f"{min(cands)} — không con số nào chạy được trên card này.\n"
+            f"{tips}")
     a, b, r2 = fit_line(pts)
     chosen, verified = None, None
     for c in choose(cands, a, b, budget):
