@@ -58,6 +58,7 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
+  n_train: 6400
   val_split_csv: split_ref/val_split.csv
   # HỒ val: 2000 mẫu được tải về và giữ trong cache. Mỗi lần eval bốc RANDOM
   # `train.eval.n_samples` (256) trong hồ này — xem khối `train.eval`.

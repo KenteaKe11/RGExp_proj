@@ -169,6 +169,17 @@ def arch_normalize(arch: str) -> tuple[tuple, tuple]:
     except Exception as e:  # noqa: BLE001
         raise VExtractorUnusable(f"cannot read pretrained_cfg for {arch!r}: {e!r}") from e
 
+def _probe_features(net: nn.Module, image_size: int) -> torch.Tensor:
+    """Probe a timm backbone without changing RNG or its train/eval state."""
+    was_training = bool(net.training)
+    net.eval()
+    try:
+        with torch.random.fork_rng(devices=[]), torch.no_grad():
+            px = torch.zeros(1, 3, int(image_size), int(image_size))
+            return net.forward_features(px)
+    finally:
+        net.train(was_training)
+
 def backbone_body(arch: str, pretrained: bool, image_size: int,
                   n_layers: int | None = None, n_stages: int | None = None):
     """Backbone của timm, CẮT head -> (body, d_feat, n_patch, n_used, kind, fmt,
