@@ -433,6 +433,84 @@ class InternImageBody(nn.Module):
         return self.forward_features(px)
 
 
+def _no_hf_init(self, *args, **kwargs) -> None:
+    """No-op thay cho `PreTrainedModel._initialize_weights`. Xem `_hf_model_class`.
+
+    Nhận `*args` vì chữ ký của `fn` trong `smart_apply` ĐÃ ĐỔI giữa các bản
+    transformers: bản cũ gọi `fn(module)`, bản mới gọi `fn(module, is_custom_code)`.
+    Một no-op khai đúng một tham số là cách bài vá này hỏng ở bản sau.
+    """
+    return None
+
+
+def _hf_model_class(arch: str, conf) -> tuple[type, list[str]]:
+    """Lớp model của repo `trust_remote_code`, ĐÃ VÁ cho init của transformers.
+
+    **Vì sao phải vá, và vì sao không vá là một AttributeError giữa lúc nạp.**
+    `PreTrainedModel.initialize_weights()` đi cây module bằng `smart_apply`, và
+    ở mỗi con nó hỏi "đây có phải một SUB-MODEL mang hàm init RIÊNG không?".
+    Bản transformers gần đây trả lời câu ấy bằng sự có mặt của `_init_weights`,
+    rồi gọi:
+
+        module.smart_apply(module._initialize_weights)
+
+    `InternImage` của OpenGVLab **có** `_init_weights` (nó tự init trong
+    `__init__`: `self.apply(self._init_weights)` + `self.apply(
+    self._init_deform_weights)`) nhưng là `nn.Module` THUẦN, không phải
+    `PreTrainedModel` — nên nó không có `_initialize_weights`, và lượt nạp chết
+    bằng:
+
+        AttributeError: 'InternImage' object has no attribute '_initialize_weights'
+
+    Nó chết ở CẢ HAI đường: `from_pretrained` (qua `_initialize_missing_keys`)
+    và dựng từ config (qua `post_init`). Nên chỗ vá phải là LỚP, trước mọi lượt
+    dựng — không phải một `try/except` quanh một trong hai đường.
+
+    **No-op là câu trả lời ĐÚNG, không phải một cách làm câm lỗi.** Nhánh ấy
+    nghĩa là "dùng hàm init của chính sub-model này cho cả cây con của nó", và
+    cây con ấy ĐÃ được init xong trong `InternImage.__init__`. Nối
+    `_init_weights` vào đó thì còn TỆ HƠN im lặng: `_init_weights` đặt
+    `trunc_normal_` lên mọi `nn.Linear`, mà DCNv3 đòi `offset`/`mask` khởi tạo
+    bằng **0** (`_init_deform_weights` -> `_reset_parameters`) — đè lên chúng là
+    cho mỗi vị trí một offset ngẫu nhiên ngay ở bước 0. Với `pretrained=True`
+    thì checkpoint ghi đè tất cả và điều này không quan trọng; với
+    `pretrained=False` (selftest) thì nó là khác biệt giữa một backbone ngẫu
+    nhiên HỢP LỆ và một backbone sai.
+
+    Lớp được lấy theo `auto_map` của config chứ không theo tên file gõ tay, nên
+    một repo InternImage khác đặt tên module khác vẫn đi đúng đường.
+    """
+    import sys
+
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except Exception as e:  # noqa: BLE001
+        raise VExtractorUnusable(
+            f"không import được `get_class_from_dynamic_module` của "
+            f"transformers: {e!r}. Nhánh cần nó để lấy LỚP model của "
+            f"{arch!r} rồi vá giao thức init TRƯỚC khi dựng.") from e
+    ref = (dict(getattr(conf, "auto_map", None) or {})).get("AutoModel")
+    if not ref:
+        raise VExtractorUnusable(
+            f"config của {arch!r} không khai `auto_map.AutoModel` — không biết "
+            f"lớp nào dựng backbone. Đây phải là một repo "
+            f"`trust_remote_code` của InternImage.")
+    klass = get_class_from_dynamic_module(str(ref), str(arch))
+    mod = sys.modules.get(klass.__module__)
+    patched: list[str] = []
+    for obj in list(vars(mod).values()) if mod is not None else ():
+        # `not hasattr(_initialize_weights)` làm luôn việc loại
+        # `PreTrainedModel` (chúng thừa kế method ấy): thứ còn lại đúng là các
+        # `nn.Module` thuần mang hàm init riêng — tức đúng thứ `smart_apply`
+        # nhận nhầm là sub-model.
+        if (isinstance(obj, type) and issubclass(obj, nn.Module)
+                and hasattr(obj, "_init_weights")
+                and not hasattr(obj, "_initialize_weights")):
+            obj._initialize_weights = _no_hf_init
+            patched.append(obj.__name__)
+    return klass, patched
+
+
 def internimage_body(arch: str, pretrained: bool, image_size: int,
                      n_layers: int | None = None, n_stages: int | None = None,
                      with_cp: bool = False):
@@ -441,16 +519,21 @@ def internimage_body(arch: str, pretrained: bool, image_size: int,
     Cùng 8-tuple như `backbone_body` của họ timm, vì mọi nơi gọi nó đọc đúng
     tám thứ ấy.
 
-    `pretrained=False` dựng từ MỘT file `config.json` (`AutoConfig` +
-    `from_config`) nên nó **không tải trọng số** — 1,05 GB của InternImage-L chỉ
-    về máy khi `pretrained=True`. Selftest và bảng tham số vì thế chạy được gần
-    như offline: thứ duy nhất cần mạng lần đầu là ba file `.py` của
-    `trust_remote_code` (~60 KB, có cache).
+    `pretrained=False` dựng từ MỘT file `config.json` nên nó **không tải trọng
+    số** — 1,05 GB của InternImage-L chỉ về máy khi `pretrained=True`. Selftest
+    và bảng tham số vì thế chạy được gần như offline: thứ duy nhất cần mạng lần
+    đầu là ba file `.py` của `trust_remote_code` (~60 KB, có cache).
 
-    `AutoModel` map tới `InternImageModel`, và nó dựng thân với
-    `num_classes=0`: **không `conv_head`, không `head`**. Nên trọng số phân
-    loại 21 841 lớp của checkpoint 22k là khoá THỪA lúc nạp (transformers cảnh
-    báo rồi bỏ) chứ không phải 43 M tham số chết đi vào optimizer.
+    **KHÔNG đi qua `AutoModel`**, mà qua lớp đã lấy sẵn từ `auto_map`
+    (`_hf_model_class`): lớp ấy phải được VÁ trước khi dựng, vì
+    `InternImage` là `nn.Module` thuần mang `_init_weights` và
+    `smart_apply` của transformers gọi vào một method nó không có. Đọc
+    `_hf_model_class` cho toàn bộ lý do — đó là chỗ duy nhất biết vì sao.
+
+    `InternImageModel` dựng thân với `num_classes=0`: **không `conv_head`,
+    không `head`**. Nên trọng số phân loại 21 841 lớp của checkpoint 22k là
+    khoá THỪA lúc nạp (transformers cảnh báo rồi bỏ) chứ không phải 43 M tham
+    số chết đi vào optimizer.
 
     `n_layers` bị TỪ CHỐI: InternImage là họ PHÂN CẤP (bốn level, mỗi level một
     số kênh), nên "n block đầu" không phải một lát cắt hợp lệ — `n_stages` là
@@ -463,25 +546,32 @@ def internimage_body(arch: str, pretrained: bool, image_size: int,
             f"phải một lát cắt hợp lệ. Đặt `n_layers: null` và cắt bằng "
             f"`n_stages`.")
     try:
-        from transformers import AutoConfig, AutoModel
+        from transformers import AutoConfig
     except Exception as e:  # noqa: BLE001
         raise VExtractorUnusable(
             "không import được transformers — Extractor InternImage nạp qua "
-            "`AutoModel` + `trust_remote_code`.\n"
+            "`trust_remote_code`.\n"
             "    pip install transformers") from e
     try:
         conf = AutoConfig.from_pretrained(str(arch), trust_remote_code=True)
         conf.with_cp = bool(with_cp)
-        if bool(pretrained):
-            net = AutoModel.from_pretrained(str(arch), config=conf,
-                                            trust_remote_code=True)
-        else:
-            net = AutoModel.from_config(conf, trust_remote_code=True)
+        klass, patched = _hf_model_class(arch, conf)
+        net = (klass.from_pretrained(str(arch), config=conf)
+               if bool(pretrained) else klass(conf))
+    except VExtractorUnusable:
+        raise
     except Exception as e:  # noqa: BLE001
+        hint = ""
+        if "_initialize_weights" in repr(e):
+            hint = ("\n    Đây là giao thức init của transformers gọi vào một "
+                    "method mà model `trust_remote_code` không có — "
+                    "`_hf_model_class` có nhiệm vụ vá đúng chỗ ấy, nên nếu lỗi "
+                    "vẫn còn thì bản transformers này tìm sub-model theo một "
+                    "dấu hiệu KHÁC `_init_weights`.")
         raise VExtractorUnusable(
             f"không dựng được backbone {arch!r} ở {image_size}²: {e!r}.\n"
             f"    Lần chạy đầu tải code (`trust_remote_code`) và, với "
-            f"`pretrained: true`, cả trọng số từ Hugging Face.") from e
+            f"`pretrained: true`, cả trọng số từ Hugging Face.{hint}") from e
     body = InternImageBody(net, n_stages)
     # `_check_normalize` đọc `pretrained_cfg` của model vừa dựng. Không gắn nó
     # ở đây thì nó rơi về hằng IMAGENET_* — và với InternImage-L cặp số ấy

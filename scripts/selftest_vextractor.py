@@ -602,6 +602,103 @@ def _():
     assert "with_cp" in R.EXT_CFG_KEYS and "with_cp" not in R.BACKBONE_CFG_KEYS
 
 
+@check("2g. vá giao thức init của transformers: nn.Module THUẦN mang `_init_weights` "
+       "được cấp `_initialize_weights` no-op, PreTrainedModel thì KHÔNG bị chạm")
+def _():
+    """Bài này chốt một lỗi ĐÃ XẢY RA, và nó không tự lộ ra ở đâu khác.
+
+    `PreTrainedModel.initialize_weights()` đi cây module bằng `smart_apply` và
+    ở mỗi con hỏi "đây có phải sub-model mang hàm init RIÊNG không?". Bản
+    transformers gần đây trả lời bằng sự CÓ MẶT của `_init_weights` rồi gọi
+    `module.smart_apply(module._initialize_weights)`. `InternImage` của
+    OpenGVLab có `_init_weights` nhưng là `nn.Module` thuần, nên lượt nạp chết
+    bằng `AttributeError: 'InternImage' object has no attribute
+    '_initialize_weights'` — ở CẢ `from_pretrained` lẫn dựng-từ-config.
+
+    Kiểm bằng một module GIẢ nên nó chạy OFFLINE: thứ được kiểm là LUẬT CHỌN
+    lớp để vá, không phải repo InternImage.
+    """
+    import sys
+    import types
+
+    import torch.nn as nn
+    from transformers import PreTrainedModel
+    from transformers import dynamic_module_utils as DMU
+
+    from src import vextractor as R
+
+    mod = types.ModuleType("rgexp_fake_remote_code")
+
+    class Inner(nn.Module):
+        """nn.Module THUẦN tự init — đúng hình dạng `InternImage`."""
+
+        def _init_weights(self, m):
+            return None
+
+    class Wrapper(nn.Module):
+        """Đã có cả hai -> KHÔNG được vá lại."""
+
+        def _init_weights(self, m):
+            return None
+
+        def _initialize_weights(self, m):
+            return "san co"
+
+    class Plain(nn.Module):
+        """Không có `_init_weights` -> `smart_apply` không nhận nhầm -> bỏ qua."""
+
+    for k in (Inner, Wrapper, Plain):
+        k.__module__ = mod.__name__
+    # Một PreTrainedModel THẬT trong cùng module: nó có `_init_weights` nhưng
+    # cũng thừa kế `_initialize_weights`, nên luật vá phải bỏ qua nó.
+    mod.Inner, mod.Wrapper, mod.Plain = Inner, Wrapper, Plain
+    mod.PreTrainedModel, mod.nn, mod.NOTACLASS = PreTrainedModel, nn, 42
+    sys.modules[mod.__name__] = mod
+    orig = DMU.get_class_from_dynamic_module
+    seen = {}
+
+    def fake_get(ref, path, **kw):
+        seen["ref"], seen["path"] = ref, path
+        return Inner                      # __module__ trỏ về mod
+
+    DMU.get_class_from_dynamic_module = fake_get
+    try:
+        conf = types.SimpleNamespace(
+            auto_map={"AutoConfig": "configuration_x.C",
+                      "AutoModel": "modeling_x.Wrapper"})
+        klass, patched = R._hf_model_class("fake/repo", conf)
+        # lớp lấy theo `auto_map`, KHÔNG theo tên file gõ tay
+        assert seen == {"ref": "modeling_x.Wrapper", "path": "fake/repo"}, seen
+        assert klass is Inner
+        assert patched == ["Inner"], patched
+        assert Inner._initialize_weights is R._no_hf_init
+        # ...và KHÔNG chạm ba thứ còn lại
+        assert Wrapper._initialize_weights is not R._no_hf_init
+        assert Wrapper()._initialize_weights(None) == "san co"
+        assert not hasattr(Plain, "_initialize_weights")
+        assert (PreTrainedModel._initialize_weights
+                is not R._no_hf_init), "vá đè lên PreTrainedModel là vá cả transformers"
+        # no-op phải chịu CẢ HAI chữ ký: bản cũ gọi fn(module), bản mới gọi
+        # fn(module, is_custom_code). Khai đúng một tham số là cách bài vá này
+        # hỏng ở bản transformers sau.
+        it = Inner()
+        assert it._initialize_weights(it) is None
+        assert it._initialize_weights(it, False) is None
+        # chạy lại: idempotent, không nhân thêm tên vào danh sách
+        _k2, again = R._hf_model_class("fake/repo", conf)
+        assert again == [], again
+        # `auto_map` thiếu AutoModel -> DỪNG ồn ào, không đoán tên module
+        try:
+            R._hf_model_class("fake/repo", types.SimpleNamespace(auto_map={}))
+        except R.VExtractorUnusable as e:
+            assert "auto_map" in str(e)
+        else:
+            raise AssertionError("auto_map thiếu AutoModel phải bị từ chối")
+    finally:
+        DMU.get_class_from_dynamic_module = orig
+        sys.modules.pop(mod.__name__, None)
+
+
 @check("3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ")
 def _():
     import json
