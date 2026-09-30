@@ -89,6 +89,20 @@ rgexp_enable_fast_download() {
     fi
 }
 
+# ── Toolkit CUDA của venv (do scripts/setup_dcnv4.sh dựng) ──────────────────
+# CHỈ lượt BUILD của một extension CUDA cần nvcc; `import DCNv4` sau đó thì
+# KHÔNG. Export ở đây vì hai lý do: `setup_dcnv4.sh` chạy lại được mà không
+# phải nhớ sáu dòng symlink, và một `pip install` extension khác cũng thấy
+# toolkit. Máy có toolkit hệ thống thì `${CUDA_HOME:-}` đã có sẵn và dòng dưới
+# KHÔNG ghi đè nó.
+if [ -x "$VENV/cuda/bin/nvcc" ]; then
+    export CUDA_HOME="${CUDA_HOME:-$VENV/cuda}"
+    case ":$PATH:" in
+        *":$CUDA_HOME/bin:"*) ;;
+        *) export PATH="$CUDA_HOME/bin:$PATH" ;;
+    esac
+fi
+
 # ── Kích hoạt python ────────────────────────────────────────────────────────
 # $1 = "allow-missing" -> không lỗi khi chưa có venv (setup.sh sẽ tạo)
 rgexp_activate_py() {

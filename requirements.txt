@@ -66,26 +66,17 @@ tqdm>=4.66.0
 # để kiểm bố cục NCHW/NHWC/NLC mà không cần mạng).
 timm>=1.0.0
 
-# ── DCNv4 — KHÔNG ghim ở file này, và đó là CÓ CHỦ Ý ────────────────────────
-# `vextractor.extractor.arch: flash_intern_image_*` cần toán tử DCNv4. Nó là
-# một extension CUDA: PyPI CHỈ có sdist (1.0.0.post2, 01/2024), `setup.py` raise
-# nếu thiếu `CUDA_HOME`, và KHÔNG có đường lùi PyTorch — thiếu nó thì
-# `import DCNv4` chết ngay lúc import.
+# ── DCNv4 — Ở FILE RIÊNG, và đó là CÓ CHỦ Ý ─────────────────────────────────
+# `vextractor.extractor.arch: flash_intern_image_*` cần toán tử DCNv4 — một
+# extension CUDA phải BIÊN DỊCH. Ghim nó ở ĐÂY nghĩa là `pip install -r
+# requirements.txt` cố dịch trên MỌI máy và hỏng trên mọi máy không có nvcc, kể
+# cả máy chỉ chạy `stats`/`lens`/selftest hoặc chạy đường DCNv3.
 #
-# Để nó ở đây thì `pip install -r requirements.txt` sẽ cố BIÊN DỊCH trên mọi
-# máy, và hỏng trên mọi máy không có nvcc — kể cả máy chỉ chạy `stats`/`lens`
-# hoặc chỉ chạy đường DCNv3. Nên nó là MỘT BƯỚC RIÊNG, chạy một lần mỗi máy:
+#     -> requirements-dcnv4.txt  +  bash scripts/setup_dcnv4.sh
 #
-#     TORCH_CUDA_ARCH_LIST=<sm của card, vd 12.0 cho Blackwell> \
-#     pip install --no-build-isolation DCNv4==1.0.0.post2
-#
-# `--no-build-isolation` BẮT BUỘC: setup.py của nó `import torch` lúc build, mà
-# build isolation dựng một env trống không có torch.
-#
-# Không build được thì trả `arch` về `OpenGVLab/internimage_l_22k_384`: đường
-# DCNv3 (`trust_remote_code`) vẫn còn nguyên trong `src/vextractor.py` và chạy ở
-# MỌI máy — kiến trúc y hệt, V vẫn (784, 640), chênh 24 930 tham số (0,02%).
-# Code model FlashInternImage KHÔNG đến từ pip: xem `src/vendor/NOTICE.md`.
+# `scripts/setup.sh` TỰ gọi script ấy khi config đang dùng `flash_intern_image_*`
+# và máy có GPU (bỏ qua: RGEXP_SKIP_DCNV4=1). Lý do đầy đủ nằm ở đầu
+# requirements-dcnv4.txt; code model thì xem src/vendor/NOTICE.md.
 
 # §2.5 cũ (`_archive/`) dùng ResNet-101/152 của torchvision. Pipeline §2.2 đang
 # chạy KHÔNG còn cần nó. KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản

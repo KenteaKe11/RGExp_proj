@@ -102,11 +102,20 @@ vector, không phải một lưới).
 > ~1,5 năm), `setup.py` raise nếu thiếu `CUDA_HOME`, và sm_120 cần nvcc ≥ 12.8:
 >
 > ```bash
-> TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation DCNv4==1.0.0.post2
+> bash scripts/setup_dcnv4.sh      # `scripts/setup.sh` cũng TỰ gọi nó
 > ```
 >
-> `--no-build-isolation` là **bắt buộc**: `setup.py` của nó `import torch` ngay
-> lúc build. Không build được thì trả `vextractor.extractor.arch` về
+> Script ấy làm sáu việc mà một dòng `pip install` không làm được: kiểm chính
+> **torch** có cubin cho card này chưa (không thì dịch DCNv4 là vô nghĩa), dựng
+> một `CUDA_HOME` tối thiểu từ wheel `nvidia-cuda-nvcc-cu12` khi box không có
+> toolkit (~150 MB, không cần `sudo`), chặn trước ca `nvcc < 12.8` với sm_120,
+> đặt `TORCH_CUDA_ARCH_LIST` theo compute cap ĐO ĐƯỢC, thêm
+> `--no-build-isolation` (`setup.py` của DCNv4 `import torch` ngay lúc build),
+> và cuối cùng **chạy thật kernel ở fp32/bf16/fp16** — vì "pip install xong"
+> không bằng "kernel chạy trên card này". Vì sao nó không thể là một dòng trong
+> `requirements.txt`: xem đầu `requirements-dcnv4.txt`.
+>
+> Không build được thì trả `vextractor.extractor.arch` về
 > `OpenGVLab/internimage_l_22k_384` — **đường DCNv3 vẫn còn nguyên trong code**
 > và chạy ở mọi máy; kiến trúc y hệt, `V` vẫn `(784, 640)`, chênh đúng 24 930
 > tham số (0,02%).
@@ -748,13 +757,20 @@ RGEXP_REMOTE=1 bash scripts/setup.sh        # ép chế độ container (không 
 RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh # nâng torch (~2.5 GB) thay vì ghim transformers
 ```
 
-Lần chạy đầu còn tải thêm `flash_intern_image_l_22k_384.pth` (~1,25 GB) từ
-`OpenGVLab/DCNv4`. **Và phải biên dịch toán tử DCNv4 MỘT LẦN trên mỗi máy** —
-không có đường lùi PyTorch (xem §1.1):
+`setup.sh` tự lo cả toán tử DCNv4: khi `vextractor.extractor.arch` là
+`flash_intern_image_*` **và** máy có GPU, nó gọi `scripts/setup_dcnv4.sh`
+(dựng `CUDA_HOME` từ wheel nếu box không có toolkit, dịch cho đúng compute cap,
+rồi chạy thật kernel ở fp32/bf16/fp16). Bỏ qua bước ấy: `RGEXP_SKIP_DCNV4=1`.
+Chạy lại một mình:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation DCNv4==1.0.0.post2
+bash scripts/setup_dcnv4.sh
 ```
+
+Lần chạy đầu còn tải `flash_intern_image_l_22k_384.pth` (~1,25 GB) từ
+`OpenGVLab/DCNv4`. **Toán tử DCNv4 là bắt buộc — không có đường lùi PyTorch**
+(xem §1.1); không dịch được thì đổi `arch` về `OpenGVLab/internimage_l_22k_384`
+và mọi thứ chạy tiếp trên đường DCNv3.
 
 ### 1–4. Thí nghiệm
 
@@ -843,7 +859,10 @@ history, nên so hash là vứt mọi checkpoint đẩy lên trước lần sử
 
 ```
 configs/vextractor.yaml · configs/gpu/{rtx3060,rtx5060ti}.yaml (stage0/stage1 micro_batch + probe_sizes)
-scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
+requirements.txt · requirements-dcnv4.txt (toán tử DCNv4 — vì sao ở file riêng: đọc đầu file)
+scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · setup_dcnv4.sh · _env.sh
+src/vendor/             flash_intern_image.py NGUYÊN VĂN @ commit 4b848f7 (sha256 trong NOTICE.md)
+                        — code model không có trong package pip; ĐỪNG sửa file trong đó
 src/run_vextractor.py    train (kéo A → Stage 0 → Stage 1 → main B → sinh → chấm) · stats · lens · push
 src/schedule.py          LỊCH DÙNG CHUNG: warmup_flat (dốc 1 epoch rồi GIỮ lr_max) ·
                          plateau_lr (chặng 5: ÷1,5 mỗi epoch val hỏng, sàn lr_min) ·

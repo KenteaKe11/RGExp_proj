@@ -1,0 +1,53 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Toán tử DCNv4 — PHỤ THUỘC RIÊNG. **ĐỪNG `-r` file này từ requirements.txt.**
+#
+#     bash scripts/setup_dcnv4.sh        <- cách DUY NHẤT đúng
+#
+# Vì sao không gộp vào requirements.txt, dù như thế tiện hơn:
+#
+#   1. `DCNv4` là một **extension CUDA**, PyPI chỉ có sdist. `pip install` nó
+#      nghĩa là BIÊN DỊCH bằng nvcc, tại chỗ. Máy nào không có toolkit thì
+#      `setup.py` của nó raise `NotImplementedError('Cuda is not available')` —
+#      và vì nó nằm trong requirements.txt, **cả lượt setup chết theo**, kể cả
+#      trên máy chỉ chạy `stats` / `lens` / selftest, hoặc chạy đường DCNv3.
+#
+#   2. Lượt build cần HAI thứ mà **không định dạng requirements nào khai được**:
+#        * biến môi trường `CUDA_HOME` và `TORCH_CUDA_ARCH_LIST=<sm của card>`;
+#        * cờ `--no-build-isolation` (setup.py của nó `import torch` ngay lúc
+#          build, mà build isolation dựng một env trống không có torch).
+#      Hai thứ ấy là việc của một script, không phải của một danh sách pin.
+#
+#   3. Nó chỉ cần khi `vextractor.extractor.arch` là `flash_intern_image_*`.
+#      Đổi khoá ấy về `OpenGVLab/internimage_l_22k_384` là đường DCNv3, chạy ở
+#      MỌI máy mà không cần gì ở file này.
+#
+# `scripts/setup.sh` TỰ gọi `setup_dcnv4.sh` khi (a) config đang dùng
+# `flash_intern_image_*` và (b) máy có GPU. Bỏ qua: `RGEXP_SKIP_DCNV4=1`.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── 1. nvcc + header/lib của CUDA runtime, dạng WHEEL ───────────────────────
+# Box thuê thường chỉ có DRIVER và một torch pip (mang theo CUDA runtime riêng)
+# — không có toolkit, nên `which nvcc` rỗng và `torch.utils.cpp_extension.
+# CUDA_HOME` là None. Hai wheel này là toolkit "vừa đủ để build": ~150 MB thay
+# vì ~4 GB của `cuda-toolkit-12-8`, không cần `sudo`, và nằm trong venv nên xoá
+# venv là sạch.
+#
+# ⚠ MINOR PHẢI KHỚP `torch.version.cuda`. `setup_dcnv4.sh` ĐỌC con số ấy từ
+# torch và ghi đè pin dưới đây, nên hai dòng này chỉ là mặc định cho torch
+# cu128 (bản đang dùng: torch 2.11.0+cu128). Sai minor thì nvcc sinh cubin mà
+# torch không nạp được, và lỗi rơi vào lượt forward đầu chứ không phải lúc cài.
+#
+# ⚠ sm_120 (Blackwell, RTX 50xx) cần nvcc >= 12.8. Bản 12.6 dịch được mọi thứ
+# khác nhưng chết ở `Unsupported gpu architecture 'compute_120'`.
+nvidia-cuda-nvcc-cu12==12.8.*
+nvidia-cuda-runtime-cu12==12.8.*
+
+# ── 2. Toán tử — cài ở bước RIÊNG, xem đầu file ─────────────────────────────
+# Dòng dưới KHÔNG phải một requirement: `pip install -r` sẽ cài nó mà không có
+# `CUDA_HOME` lẫn `--no-build-isolation`, tức hỏng. `setup_dcnv4.sh` đọc pin từ
+# đúng dòng này (một nguồn sự thật cho số phiên bản) rồi tự thêm env + cờ.
+#
+# RGEXP_DCNV4_PIN: DCNv4==1.0.0.post2
+#
+# Code MODEL FlashInternImage không đến từ pip — package trên PyPI chỉ có toán
+# tử. Nó được vendor nguyên văn vào `src/vendor/`; xem `src/vendor/NOTICE.md`.
