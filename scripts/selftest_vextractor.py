@@ -204,7 +204,7 @@ def _():
         ⚠ autobatch[stage0]: OOM ngay ở bs 4 — giữ 8
 
     ...rồi vòng huấn luyện OOM lại ở bước đầu của epoch 1, sau khi đã nạp xong
-    11 400 ảnh và khoảng 135,89 M trọng số. Không exception nào ở chỗ sai; chỗ sai chỉ
+    11 400 ảnh và khoảng 60,25 M trọng số. Không exception nào ở chỗ sai; chỗ sai chỉ
     là một con số bị giữ lại.
 
     GPU được thay bằng `measure_fn` giả nên bài chạy trên CPU.

@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = FocalNet-L (IN-22k, stage 3) + DINO head ─┐
+            ─► student = FocalNet-B LRF (stage 3) + DINO head ─────┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,11 +10,12 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-FocalNet-L cắt stage 3 (135,89 M) + một DINO head, cộng một bản teacher EMA đầy
+Đặc tả backbone FocalNet-Base LRF khai ~88,1 M; Extractor cắt tại stage 3 còn
+60,25 M trọng số + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số FocalNet Large Stage 3; các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
+**Điểm xuất phát:** `pretrained: true` tải trọng số FocalNet-Base LRF; các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
@@ -607,7 +608,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not spec["extractor"]["pretrained"]:
         raise TrainUnusable(
             "vextractor.extractor.pretrained = false: Stage 0 requires "
-            "pretrained FocalNet Large Stage 3 weights.")
+            "pretrained FocalNet-Base LRF weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 

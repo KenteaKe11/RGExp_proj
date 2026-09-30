@@ -7,7 +7,7 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone FocalNet-L học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone FocalNet-B học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
@@ -22,7 +22,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (FocalNet-L ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (FocalNet-B ăn ảnh 448²) — và chuỗi dài
 # thêm 8.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -315,13 +315,13 @@ labels:
 # FocalNet Stage 3 -> QFormer compressor -> vision-language aligner.
 # Stage 0: DINO self-supervised fine-tuning; Stage 1: compressor transfer.
 vextractor:
-  extractor:                # FocalNet Stage 3: (B,3,448,448) -> (B,768,28,28)
+  extractor:                # FocalNet-B LRF Stage 3: (B,3,448,448) -> (B,512,28,28)
     image_size: 448
-    arch: focalnet_large_fl3
+    arch: focalnet_base_lrf
     pretrained: true
     n_layers: null
     n_stages: 3
-  compressor:               # QFormer: V (784, 768) -> V_c (8, 768)
+  compressor:               # QFormer: V (784, 512) -> V_c (8, 768)
     n_query: 8              # số latent = số token Q nối vào chuỗi decoder
     d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
     head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
@@ -448,7 +448,7 @@ stage1:
   val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
-# Chỉ fine-tune FocalNet Large Stage 3 trên ảnh MIMIC-CXR bằng loss tự giám sát.
+# Chỉ fine-tune FocalNet-Base LRF Stage 3 trên ảnh MIMIC-CXR bằng loss tự giám sát.
 # `pretrained: true` nạp trọng số backbone; DINO head, optimizer và center tạo mới.
 # Student xem global + local crops; teacher EMA chỉ xem hai global crops.
 # Checkpoint lưu ra là teacher EMA được chọn theo validation.
@@ -541,7 +541,7 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. FocalNet KHÔNG có cls token -> `mean` (trung bình 784 ô) là
+    # cls | mean. FocalNet KHÔNG có cls token -> `mean` (trung bình lưới) là
     # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
     # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
     # không bao giờ tự lộ ra.
@@ -620,7 +620,7 @@ wandb:
   group: "vextractor-q"
   resume_same_run: false
   mode: online
-  tags: [vextractor, focalnet-large, qlora, r32, mimic-cxr]
+  tags: [vextractor, focalnet-base-lrf, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20

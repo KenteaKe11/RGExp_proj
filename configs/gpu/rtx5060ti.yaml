@@ -69,7 +69,8 @@ set:
   # Đây mới là chỗ 4 GB thừa có nghĩa: hai giai đoạn này KHÔNG có ràng buộc nào
   # từ A, nên mảnh vật lý được phép leo tới tận `batch_size` = 32.
   #
-  # Stage 0 giữ student và teacher FocalNet (~135,89 M mỗi nhánh) cùng DINO head.
+  # Stage 0 giữ student và teacher Extractor FocalNet-Base LRF (60,25 M mỗi nhánh)
+  # cùng DINO head (2,63 M mỗi nhánh).
   # Batch dò tự động theo VRAM; giảm local crop nếu thiết bị không đủ bộ nhớ.
   stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [1, 2, 4]   # điểm ĐO riêng của Stage 0 (main stage dùng

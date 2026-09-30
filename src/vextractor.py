@@ -1,6 +1,6 @@
 """FocalNet extractor, QFormer compressor, and vision-language aligner.
 
-FocalNet Stage 3 maps 448x448 images to 768 channels at 28x28. The feature
+FocalNet-Base LRF Stage 3 maps 448x448 images to 512 channels at 28x28. The feature
 grid is flattened to 784 tokens before compression to eight latent vectors.
 """
 from __future__ import annotations
@@ -449,12 +449,12 @@ class Extractor(nn.Module):
     Stage 0. **Backbone không bao giờ mở lại** (trừ Lens, để nối đồ thị
     gradient tới tận pixel; xem `lens_vextractor`).
 
-    Với FocalNet Stage 3 at 448²:
-    `(B, 768, 28, 28)` -> `V = (B, 784, 768)`.
+    Với FocalNet-Base LRF Stage 3 at 448²:
+    `(B, 512, 28, 28)` -> `V = (B, 784, 512)`.
     """
 
     def __init__(self, image_size: int = 448,
-                 arch: str = "focalnet_large_fl3",
+                 arch: str = "focalnet_base_lrf",
                  pretrained: bool = True, n_layers: int | None = None,
                  n_stages: int | None = 3, normalize: dict | None = None):
         super().__init__()
@@ -556,20 +556,20 @@ class QFormerGroup(nn.Module):
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
 
-    Tham số ở `d_latent` = 768, `d_kv` = 768, `mlp_hidden` = 512:
+    Tham số ở `d_latent` = 768, `d_kv` = 512 (FocalNet-Base), `mlp_hidden` = 512:
 
         SelfAttn  4 × 768²             = 2 359 296   (×2)
-        CrossAttn 2 × 768² + 2×768×768 = 2 359 296
+        CrossAttn 2 × 768² + 2×512×768 = 1 966 080
         SwiGLU    3 × 768 × 512        = 1 179 648   (×2)
         5 × RMSNorm(768)               =     3 840
         ───────────────────────────────────────────
-        KHỐI 1 (self + cross + ffn)    = 5 900 544
+        KHỐI 1 (self + cross + ffn)    = 5 507 328
         KHỐI 2 (self + ffn)            = 3 540 480
-        MỘT nhóm (khối 1 → khối 2)     = 9 441 024
+        MỘT nhóm (khối 1 → khối 2)     = 9 047 808
 
-    > Đặc tả ghi `~9.44M (xN)` và số ĐO ĐƯỢC khớp. Tổng Compressor ở `N = 4` là
-    > **37 771 008**: đặc tả ghi ~37.76M = 4 × 9,44 và bỏ đúng hai thứ nằm
-    > NGOÀI mọi nhóm khối — `latent` (8 × 768 = 6 144) và `RMSNorm(V)` (768).
+    > Mỗi nhóm có **9 047 808** tham số. Tổng Compressor ở `N = 4` là
+    > **36 197 888**, cộng `latent` (8 × 768 = 6 144) và `RMSNorm(V)` (512)
+    > ngoài bốn nhóm khối.
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
@@ -919,7 +919,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 f"vextractor.{blk}: khoá lạ {odd} — không khoá nào trong số ấy "
                 f"được đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
                 f"{list(keys)}.")
-    arch = str(ex.get("arch", "focalnet_large_fl3"))
+    arch = str(ex.get("arch", "focalnet_base_lrf"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -931,7 +931,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                       "n_layers": (None if ex.get("n_layers") is None
                                    else int(ex["n_layers"])),
                       # Lát cắt của họ PHÂN CẤP: giữ `n_stages` stage ĐẦU.
-                      # FocalNet Large: 3 -> stride 16 / 768 kênh.
+                      # FocalNet-Base LRF: 3 -> stride 16 / 512 kênh.
                       "n_stages": (None if ex.get("n_stages") is None
                                    else int(ex["n_stages"])),
 
