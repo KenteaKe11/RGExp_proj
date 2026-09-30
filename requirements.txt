@@ -43,14 +43,22 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
-# §2.2 — nhánh V-Extractor LÀ một ViT-Small/16 pretrain ImageNet-1k của timm.
-# Đây là phụ thuộc BẮT BUỘC của pipeline đang chạy, không phải phụ thuộc phụ:
-# thiếu nó thì Stage 0 không dựng được nhánh.
-# Lần chạy đầu tải ~85 MB trọng số từ Hugging Face
-# (timm/vit_small_patch16_224.augreg_in1k).
-# timm cũng là nơi DUY NHẤT biết mean/std đúng của checkpoint
-# (`get_pretrained_cfg(arch).mean/std` — họ AugReg dùng 0.5/0.5, KHÔNG phải
-# mean/std của ImageNet): mã không hard-code cặp số ấy ở đâu cả.
+# §2.2 — Extractor của nhánh là InternImage-L cắt ở stage 3
+# (OpenGVLab/internimage_l_22k_384, ~1,05 GB trọng số ở lần chạy đầu). Nó
+# KHÔNG có trong timm: nó nạp qua `transformers.AutoModel` +
+# `trust_remote_code=True`, tức ba file .py của OpenGVLab (~60 KB) được tải và
+# CHẠY — `huggingface_hub` là nơi đọc `preprocessor_config.json` để lấy
+# mean/std (mã không hard-code cặp số ấy ở đâu cả).
+#
+# KHÔNG cần biên dịch extension `DCNv3` nào: trong `dcnv3_func.py` của
+# OpenGVLab, `pkg_resources` được import SAU khối try đã dùng nó, nên
+# `has_cuda_kernel` luôn False và model luôn chạy `DCNv3_pytorch`. Chậm hơn và
+# ngốn activation hơn — xem `vextractor.extractor.with_cp`.
+#
+# timm VẪN bắt buộc, vì hai lý do: code InternImage của OpenGVLab import
+# `timm.models.layers` (DropPath, trunc_normal_), và `backbone_body` giữ đường
+# dựng timm cho mọi họ backbone khác (selftest dùng nó để kiểm bố cục
+# NCHW/NHWC/NLC mà không cần mạng).
 timm>=1.0.0
 
 # §2.5 cũ (`_archive/`) dùng ResNet-101/152 của torchvision. Pipeline §2.2 đang

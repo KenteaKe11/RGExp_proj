@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = FocalNet-S LRF (IN-1k) + DINO head    ─┐
+            ─► student = InternImage-L (IN-22k, stage 3) + DINO head ─┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,7 +10,7 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-FocalNet-Small LRF (49,57 M) + một DINO head, cộng một bản teacher EMA đầy
+InternImage-L cắt stage 3 (115,66 M) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
@@ -26,13 +26,13 @@ hẳn.
 
 Lịch CHUNG của `src/schedule.py` — HAI chặng, cộng một hệ số nhân:
 
-    1. warm-up tuyến tính `lr_min` (1e-8) -> `lr_max` (1e-5)   1 epoch ĐẦU
+    1. warm-up tuyến tính `lr_min` (1e-8) -> `lr_max` (2e-5)   1 epoch ĐẦU
     2. GIỮ `lr_max`                                            49 epoch còn lại
     5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (1,5),
        sàn `lr_min`; val cải thiện thì GIỮ NGUYÊN (không leo lại)
 
-Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-8 lên 1e-5, rồi
-giữ 1e-5 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
+Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-8 lên 2e-5, rồi
+giữ 2e-5 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
 xuống là chặng 5 — tức là chính đường val, không phải một lịch định trước.
 Không có `lr_main` nào trong lịch chung nữa.
 
@@ -129,7 +129,7 @@ def s0cfg(cfg: Cfg) -> dict:
         # HAI đỉnh của lịch chung (src/schedule.py). `lr_max` là MỨC CHẠY, không
         # phải một đỉnh tạm rồi hạ: thứ duy nhất kéo nó xuống là chặng 5.
         "lr_min": float(s.get("lr_min", 1e-8)),
-        "lr_max": float(s.get("lr_max", 1e-5)),
+        "lr_max": float(s.get("lr_max", 2e-5)),
         # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —
         # đó là `max_epochs`.
         "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
@@ -139,7 +139,7 @@ def s0cfg(cfg: Cfg) -> dict:
         "plateau_gamma": float(s.get("plateau_gamma", SCH.PLATEAU_GAMMA)),
         # Epoch "hạ cánh" sau khi patience hết: cosine về lr_min.
         "tail_epochs": int(s.get("tail_epochs", 1)),
-        "patience": int(s.get("patience", 3)),
+        "patience": int(s.get("patience", 4)),
         "min_delta": float(s.get("min_delta", 0.0)),
         "weight_decay": float(s.get("weight_decay", 0.03)),
         "batch_size": int(s.get("batch_size", 32)),
@@ -232,7 +232,7 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # FocalNet KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
+        # InternImage KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
         # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
         "pool": str(d.get("pool", "mean")),
         "student_temp": float(d.get("student_temp", 0.1)),
@@ -338,7 +338,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số FocalNet không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số InternImage không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}

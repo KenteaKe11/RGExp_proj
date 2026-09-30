@@ -22,7 +22,7 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 
 ═══ BA khối, BA số phận ở main stage ══════════════════════════════════════════
 
-  * **Extractor** (FocalNet, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
+  * **Extractor** (InternImage-L, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
     **TEACHER INFERENCE** suốt main stage: `requires_grad=False` + `eval()` +
     forward trong `no_grad`, KHÔNG nằm trong optimizer, KHÔNG có bước mở băng
     nào. Đó đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
@@ -30,29 +30,33 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
     activation nào, nên nó gần như không thêm VRAM;
 
   * **Aligner** — khối MỚI, khởi tạo ngẫu nhiên, **học CÙNG LoRA ngay từ bước
-    0**: warm-up tuyến tính `align_lr_min` (1e-6) -> `align_lr_main` (1e-4)
-    trong `align_warmup_frac` (10%) tổng số bước, rồi PHẲNG tới bước cuối.
-    Mục tiêu của nó là *học cách biến tín hiệu đặc trưng thị giác sang không
-    gian ngữ nghĩa*, và nó không làm được việc ấy nếu bị đóng băng lúc LoRA
-    đang định hình;
+    0**: warm-up tuyến tính trong `align_warmup_frac` (10%) tổng số bước rồi
+    PHẲNG tới bước cuối, với HAI nhóm — `align_ffn_lr_min` (1e-6) ->
+    `align_ffn_lr_main` (1e-4) cho SwiGLU + hai RMSNorm, và
+    `align_attn_lr_min` (1e-7) -> `align_attn_lr_main` (1e-5) cho bốn chiếu của
+    MHAttn. Mục tiêu của nó là *học cách biến tín hiệu đặc trưng thị giác sang
+    không gian ngữ nghĩa*, và nó không làm được việc ấy nếu bị đóng băng lúc
+    LoRA đang định hình;
 
   * **Compressor** — đến từ Stage 1, đã ở một điểm dùng được. **ĐÓNG BĂNG HOÀN
     TOÀN trong `comp_freeze_frac` (20%) số bước đầu**, rồi warm-up
-    `comp_lr_min` (1e-8) -> `comp_lr_main` (7e-6) trong `comp_warmup_frac`
-    (10%) số bước, rồi PHẲNG. Mục tiêu của nó ở đây khác Stage 1: *học cách xử
+    trong `comp_warmup_frac` (10%) số bước rồi PHẲNG, cũng HAI nhóm:
+    `comp_ffn_lr_min` (1e-7) -> `comp_ffn_lr_main` (1e-5) và
+    `comp_attn_lr_min` (1e-8) -> `comp_attn_lr_main` (1e-6). Mục tiêu của nó ở đây khác Stage 1: *học cách xử
     lý đặc trưng đã có THEO tín hiệu từ LoRA → Aligner*. Tín hiệu ấy chưa tồn
     tại ở bước 0 — Aligner còn ngẫu nhiên và LoRA chưa đi được đâu — nên 20%
     bước đầu là thời gian để nó xuất hiện. `requires_grad=False` chứ không phải
     lr = 0: Compressor là khối học được đầu tiên sau Extractor, nên tắt grad ở
     đó cắt hẳn phần backward bên dưới Aligner.
 
-Hai lịch ấy là hàm THUẦN của số bước (`src/schedule.py`), không có scheduler
+Bốn lịch ấy là hàm THUẦN của số bước (`src/schedule.py`), không có scheduler
 nào giữ trạng thái, nên chúng tái lập được và không lệch khi `steps` bị
 override.
 
 ĐƯỜNG ẢNH THỨ HAI. Nhánh có encoder riêng, nên mỗi batch phải mang THÊM
 `vext_pixels` (B, 3, 448, 448) chuẩn hoá bằng ĐÚNG mean/std của checkpoint
-Extractor (đọc từ `timm.pretrained_cfg`, KHÔNG phải một cặp hằng gõ tay).
+Extractor (đọc từ `preprocessor_config.json` của checkpoint, KHÔNG phải một
+cặp hằng gõ tay).
 `VExtReportDataset` gắn nó vào đúng chỗ `ClsReportDataset` mã hoá mẫu (theo chỉ
 số THẬT, không theo i — xem docstring lớp cha), và `collate_vext` xếp chồng.
 Một batch thiếu trường ấy DỪNG ngay ở `forward_ce` thay vì lặng lẽ huấn luyện
@@ -64,9 +68,9 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (8) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 8/(độ dài chuỗi) CỘNG một lượt FocalNet-Small (đủ 4
-stage) ở 448² cho mỗi ảnh. Phần nặng còn lại là Cross-attn của 8 latent trên
-196 ô.
+mỗi bước nhiều hơn A ở mức 8/(độ dài chuỗi) CỘNG một lượt InternImage-L (cắt
+ở stage 3, DCNv3 bản PyTorch) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad`,
+nên phần nặng còn lại là Cross-attn của 8 latent trên 784 ô.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -100,20 +104,36 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 # không ai đọc là im lặng tuyệt đối: người khai tin mình vừa đặt một lịch, rồi
 # chạy hết 200 bước với giá trị mặc định. `zcfg` là chỗ DUY NHẤT đọc khối này,
 # nên cũng là chỗ duy nhất biết khoá nào có thật.
-MAIN_CFG_KEYS = ("align_lr_min", "align_lr_main", "align_warmup_frac", "align_wd",
-                 "comp_lr_min", "comp_lr_main", "comp_freeze_frac",
-                 "comp_warmup_frac", "comp_wd", "separate_clip")
+MAIN_CFG_KEYS = ("align_ffn_lr_min", "align_ffn_lr_main",
+                 "align_attn_lr_min", "align_attn_lr_main",
+                 "align_warmup_frac", "align_wd",
+                 "comp_ffn_lr_min", "comp_ffn_lr_main",
+                 "comp_attn_lr_min", "comp_attn_lr_main",
+                 "comp_freeze_frac", "comp_warmup_frac", "comp_wd",
+                 "separate_clip")
+
+# BỐN nhóm tham số của nhánh ở main stage, và tên của chúng là KHOÁ: optimizer
+# đặt lr theo tên chứ theo chỉ số, vì chỉ số đổi im lặng mỗi lần ai đó chèn một
+# nhóm vào giữa. Thứ tự dưới đây là thứ tự nhóm trong `opt_b.param_groups`.
+BRANCH_GROUPS = ("aligner_ffn", "aligner_attn",
+                 "compressor_ffn", "compressor_attn")
 
 
 def zcfg(cfg: Cfg) -> dict:
     """`vextractor.main` — lịch của nhánh ở main stage.
 
-    HAI nhóm tham số, HAI số phận (xem docstring đầu file):
+HAI khối, BỐN nhóm lr (xem docstring đầu file):
 
-      * `Aligner` — warm-up `align_warmup_frac` (10%) tổng bước rồi PHẲNG
-        `align_lr_main`. Học CÙNG LoRA từ bước 0;
+      * `Aligner` — warm-up `align_warmup_frac` (10%) tổng bước rồi PHẲNG.
+        Học CÙNG LoRA từ bước 0. FFN 1e-6 -> 1e-4, Attn 1e-7 -> 1e-5;
       * `Compressor` — 0 trong `comp_freeze_frac` (20%) bước đầu, rồi warm-up
-        `comp_warmup_frac` (10%) bước, rồi PHẲNG `comp_lr_main`.
+        `comp_warmup_frac` (10%) bước, rồi PHẲNG. FFN 1e-7 -> 1e-5,
+        Attn 1e-8 -> 1e-6.
+
+    **Vì sao Attn thấp hơn FFN 10 lần ở CẢ HAI khối.** Ma trận attention quyết
+    định 8 vector đọc/trộn Ở ĐÂU, và một bước lớn làm phân phối ấy sụp về vài
+    vị trí rồi không quay lại; FFN chỉ biến đổi thứ đã đọc xong. Cùng lý do đã
+    tách hai nhóm ở Stage 1, dịch nguyên sang main stage.
 
     Mốc khai theo **TỈ LỆ** chứ không theo số bước: main stage khoá 1 epoch =
     200 bước theo $1, nhưng `--dry-run` và mọi lần đổi `train_batch` đổi con số
@@ -129,18 +149,22 @@ def zcfg(cfg: Cfg) -> dict:
             f"    (Các khoá `align_lr`, `align_warmup_steps`, "
             f"`align_warmup_start_lr`, `extractor_lr`, "
             f"`extractor_unfreeze_steps` của bản cũ KHÔNG còn được đọc.)")
-    out = {"align_lr_min": float(m.get("align_lr_min", 1e-6)),
-           "align_lr_main": float(m.get("align_lr_main", 1e-4)),
+    out = {"align_ffn_lr_min": float(m.get("align_ffn_lr_min", 1e-6)),
+           "align_ffn_lr_main": float(m.get("align_ffn_lr_main", 1e-4)),
+           "align_attn_lr_min": float(m.get("align_attn_lr_min", 1e-7)),
+           "align_attn_lr_main": float(m.get("align_attn_lr_main", 1e-5)),
            "align_warmup_frac": float(m.get("align_warmup_frac", 0.10)),
            "align_wd": float(m.get("align_wd", 0.01)),
-           "comp_lr_min": float(m.get("comp_lr_min", 1e-8)),
-           "comp_lr_main": float(m.get("comp_lr_main", 7e-6)),
+           "comp_ffn_lr_min": float(m.get("comp_ffn_lr_min", 1e-7)),
+           "comp_ffn_lr_main": float(m.get("comp_ffn_lr_main", 1e-5)),
+           "comp_attn_lr_min": float(m.get("comp_attn_lr_min", 1e-8)),
+           "comp_attn_lr_main": float(m.get("comp_attn_lr_main", 1e-6)),
            "comp_freeze_frac": float(m.get("comp_freeze_frac", 0.20)),
            "comp_warmup_frac": float(m.get("comp_warmup_frac", 0.10)),
            "comp_wd": float(m.get("comp_wd", 0.01)),
            "separate_clip": bool(m.get("separate_clip", True))}
-    for who, lo, hi in (("align", out["align_lr_min"], out["align_lr_main"]),
-                        ("comp", out["comp_lr_min"], out["comp_lr_main"])):
+    for who in ("align_ffn", "align_attn", "comp_ffn", "comp_attn"):
+        lo, hi = out[f"{who}_lr_min"], out[f"{who}_lr_main"]
         if not lo > 0:
             raise TrainUnusable(
                 f"vextractor.main.{who}_lr_min {lo} phải > 0 — đây là ĐẦU dốc "
@@ -149,6 +173,13 @@ def zcfg(cfg: Cfg) -> dict:
             raise TrainUnusable(
                 f"vextractor.main: cần {who}_lr_min {lo} <= {who}_lr_main {hi} "
                 f"— warm-up đi LÊN.")
+    for blk in ("align", "comp"):
+        if not out[f"{blk}_attn_lr_main"] <= out[f"{blk}_ffn_lr_main"]:
+            raise TrainUnusable(
+                f"vextractor.main: cần {blk}_attn_lr_main "
+                f"{out[f'{blk}_attn_lr_main']} <= {blk}_ffn_lr_main "
+                f"{out[f'{blk}_ffn_lr_main']} — nhóm attention là nhóm CHẬM "
+                f"hơn ở cả hai khối; đảo lại là đảo đúng lý do tách nhóm.")
     for k in ("align_warmup_frac", "comp_freeze_frac", "comp_warmup_frac"):
         if not 0.0 <= out[k] <= 1.0:
             raise TrainUnusable(f"vextractor.main.{k} {out[k]} phải trong [0, 1].")
@@ -156,18 +187,23 @@ def zcfg(cfg: Cfg) -> dict:
         raise TrainUnusable(
             f"vextractor.main: comp_freeze_frac {out['comp_freeze_frac']} + "
             f"comp_warmup_frac {out['comp_warmup_frac']} > 1 — Compressor sẽ "
-            f"KHÔNG BAO GIỜ chạm comp_lr_main.")
+            f"KHÔNG BAO GIỜ chạm `comp_*_lr_main`.")
     return out
 
 
-def align_lr_at(step: int, zc: dict, total_steps: int) -> float:
+def align_lr_at(step: int, zc: dict, total_steps: int) -> dict:
     """lr của Aligner tại bước `step` (0-based) — dốc TUYẾN TÍNH rồi PHẲNG.
 
-        w  = round(align_warmup_frac · total_steps)
-        lr = align_lr_min + (align_lr_main − align_lr_min) · min(1, step / w)
+    Trả `{"ffn": …, "attn": …}`: HAI nhóm, cùng MỘT dốc (cùng
+    `align_warmup_frac`), hai cặp số. Cùng một dốc vì cả hai nhóm nằm trong
+    cùng một khối ngẫu nhiên và phải đi vào cùng một lúc; hai cặp số vì
+    attention chịu được ít hơn FFN 10 lần.
 
-    Nội suy trên GIÁ TRỊ lr, nên bước 0 có ĐÚNG `align_lr_min`. Nhân
-    `align_lr_main · f` thì đầu dốc bị quyết định bởi SỐ BƯỚC warm-up thay vì
+        w  = round(align_warmup_frac · total_steps)
+        lr = lr_min + (lr_main − lr_min) · min(1, step / w)
+
+    Nội suy trên GIÁ TRỊ lr, nên bước 0 có ĐÚNG `align_*_lr_min`. Nhân
+    `align_*_lr_main · f` thì đầu dốc bị quyết định bởi SỐ BƯỚC warm-up thay vì
     bởi một khoá trong config.
 
     Vì sao cần dốc dù chỉ 20 bước: Aligner là ma trận ngẫu nhiên kẹp giữa một
@@ -176,15 +212,21 @@ def align_lr_at(step: int, zc: dict, total_steps: int) -> float:
     chắn nhất để Q lệch hẳn khỏi phân phối mà LoRA đang học cùng lúc.
     """
     w = SCH.steps_for_frac(total_steps, zc["align_warmup_frac"])
-    return SCH.warmup_flat(step, w, zc["align_lr_min"], zc["align_lr_main"])
+    return {g: SCH.warmup_flat(step, w, zc[f"align_{g}_lr_min"],
+                               zc[f"align_{g}_lr_main"])
+            for g in ("ffn", "attn")}
 
 
-def comp_lr_at(step: int, zc: dict, total_steps: int) -> float:
+def comp_lr_at(step: int, zc: dict, total_steps: int) -> dict:
     """lr của Compressor tại bước `step` (0-based): **0** -> dốc -> PHẲNG.
 
+    Trả `{"ffn": …, "attn": …}` — hai nhóm, MỘT mốc đóng băng và MỘT dốc dùng
+    chung: `requires_grad=False` tắt grad của cả khối, nên hai nhóm không thể
+    mở ở hai thời điểm khác nhau dù có muốn.
+
         step < f                 ->  0.0                 (đóng băng hoàn toàn)
-        f <= step < f + w        ->  dốc comp_lr_min -> comp_lr_main
-        step >= f + w            ->  comp_lr_main
+        f <= step < f + w        ->  dốc lr_min -> lr_main
+        step >= f + w            ->  lr_main
 
     với `f = comp_freeze_frac · total` (20%) và `w = comp_warmup_frac · total`
     (10%).
@@ -194,7 +236,9 @@ def comp_lr_at(step: int, zc: dict, total_steps: int) -> float:
     """
     f = SCH.steps_for_frac(total_steps, zc["comp_freeze_frac"])
     w = SCH.steps_for_frac(total_steps, zc["comp_warmup_frac"])
-    return SCH.frozen_warmup_flat(step, f, w, zc["comp_lr_min"], zc["comp_lr_main"])
+    return {g: SCH.frozen_warmup_flat(step, f, w, zc[f"comp_{g}_lr_min"],
+                                      zc[f"comp_{g}_lr_main"])
+            for g in ("ffn", "attn")}
 
 
 class VExtReportDataset(ClsReportDataset):
@@ -521,30 +565,55 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     # rồi phẳng, học cùng LoRA từ bước 0), `Compressor` đến từ Stage 1 (0 trong
     # 20% bước đầu, rồi warm-up 10% rồi phẳng). Gộp chúng là mất đúng phân biệt
     # ấy — và mất cả lý do: hai khối học HAI THỨ khác nhau ở main stage.
-    comp_p = list(branch.compressor.parameters())
-    align_p = list(branch.aligner.parameters())
+    # BỐN danh sách, và chúng PHỦ KÍN hai khối: `attn_parameters` +
+    # `ffn_parameters` của mỗi khối là một PHÂN HOẠCH (selftest kiểm bằng
+    # `id()`), nên không tham số nào bị bỏ ngoài optimizer — một tham số học
+    # được nằm ngoài optimizer là một tensor đứng yên suốt 200 bước mà không
+    # có gì báo.
+    pg = {"aligner_ffn": list(branch.aligner.ffn_parameters()),
+          "aligner_attn": list(branch.aligner.attn_parameters()),
+          "compressor_ffn": list(branch.compressor.ffn_parameters()),
+          "compressor_attn": list(branch.compressor.attn_parameters())}
+    comp_p = pg["compressor_ffn"] + pg["compressor_attn"]
+    align_p = pg["aligner_ffn"] + pg["aligner_attn"]
+    n_cover = sum(len(v) for v in pg.values())
+    n_have = len(list(branch.compressor.parameters())) + \
+        len(list(branch.aligner.parameters()))
+    if n_cover != n_have:
+        raise TrainUnusable(
+            f"bốn nhóm lr phủ {n_cover} tensor nhưng Compressor + Aligner có "
+            f"{n_have} — một tensor học được nằm ngoài optimizer là một tensor "
+            f"đứng yên suốt {steps} bước mà không có gì báo.")
     # Mốc theo TỈ LỆ -> số bước THẬT của lần chạy này (dry-run đổi `steps`).
     n_freeze = SCH.steps_for_frac(steps, zc["comp_freeze_frac"])
     n_cwarm = SCH.steps_for_frac(steps, zc["comp_warmup_frac"])
     n_awarm = SCH.steps_for_frac(steps, zc["align_warmup_frac"])
     branch.set_compressor_frozen(n_freeze > 0)
+    _a0, _c0 = align_lr_at(0, zc, steps), comp_lr_at(0, zc, steps)
+    _lr0 = {"aligner_ffn": _a0["ffn"], "aligner_attn": _a0["attn"],
+            "compressor_ffn": _c0["ffn"], "compressor_attn": _c0["attn"]}
+    _wd = {"aligner_ffn": zc["align_wd"], "aligner_attn": zc["align_wd"],
+           "compressor_ffn": zc["comp_wd"], "compressor_attn": zc["comp_wd"]}
     opt_b = torch.optim.AdamW(
-        [{"params": align_p, "lr": align_lr_at(0, zc, steps),
-          "weight_decay": zc["align_wd"], "name": "aligner"},
-         {"params": comp_p, "lr": comp_lr_at(0, zc, steps),
-          "weight_decay": zc["comp_wd"], "name": "compressor"}],
+        [{"params": pg[g], "lr": _lr0[g], "weight_decay": _wd[g], "name": g}
+         for g in BRANCH_GROUPS],
         betas=(0.9, 0.999), eps=1e-8)
     branch_p = align_p + comp_p
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
                               float(tcfg["schedule"].get("final_div_factor", 100.0)),
                               int(tcfg["schedule"].get("round_down_sig", 0) or 0))
-    _asched = (f"CỐ ĐỊNH {zc['align_lr_main']:g} suốt {steps} bước"
+    _apair = (f"ffn {zc['align_ffn_lr_min']:g} -> "
+              f"{zc['align_ffn_lr_main']:g} │ attn "
+              f"{zc['align_attn_lr_min']:g} -> {zc['align_attn_lr_main']:g}")
+    _cpair = (f"ffn {zc['comp_ffn_lr_min']:g} -> {zc['comp_ffn_lr_main']:g} │ "
+              f"attn {zc['comp_attn_lr_min']:g} -> "
+              f"{zc['comp_attn_lr_main']:g}")
+    _asched = (f"CỐ ĐỊNH (ffn {zc['align_ffn_lr_main']:g} │ attn "
+               f"{zc['align_attn_lr_main']:g}) suốt {steps} bước"
                if n_awarm <= 0 else
-               f"warm-up {zc['align_lr_min']:g} -> {zc['align_lr_main']:g} "
-               f"trong {n_awarm}/{steps} bước rồi PHẲNG")
-    _csched = (f"ĐÓNG BĂNG {n_freeze}/{steps} bước, rồi warm-up "
-               f"{zc['comp_lr_min']:g} -> {zc['comp_lr_main']:g} trong "
-               f"{n_cwarm} bước rồi PHẲNG")
+               f"warm-up [{_apair}] trong {n_awarm}/{steps} bước rồi PHẲNG")
+    _csched = (f"ĐÓNG BĂNG {n_freeze}/{steps} bước, rồi warm-up [{_cpair}] "
+               f"trong {n_cwarm} bước rồi PHẲNG")
     print(f"  lr: LoRA one-cycle {s_:.0e} -> {main_lr:.0e} -> {_pk:.0e} (= A) · "
           f"Extractor TEACHER INFER (0 bước học) · Aligner {_asched} (wd "
           f"{zc['align_wd']}) · Compressor {_csched} (wd {zc['comp_wd']}) · "
@@ -553,10 +622,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     if n_freeze + n_cwarm >= steps:
         print(f"  ⚠ Compressor: {n_freeze} bước đóng băng + {n_cwarm} bước "
               f"warm-up >= tổng {steps} bước — nó KHÔNG bao giờ chạm "
-              f"{zc['comp_lr_main']:g}.", flush=True)
+              f"{zc['comp_ffn_lr_main']:g}.", flush=True)
     if 0 < n_awarm >= steps:
         print(f"  ⚠ Aligner warm-up {n_awarm} >= tổng {steps} bước: nó KHÔNG "
-              f"bao giờ chạm {zc['align_lr_main']:g}.", flush=True)
+              f"bao giờ chạm {zc['align_ffn_lr_main']:g}.", flush=True)
 
     # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
     from . import autobatch
@@ -734,10 +803,15 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     for step in range(steps):
         # lr của Aligner là hàm THUẦN của số bước — không có scheduler nào giữ
         # trạng thái, nên nó tái lập được và không lệch khi `steps` bị override.
-        alr = align_lr_at(step, zc, steps)
-        clr = comp_lr_at(step, zc, steps)
-        opt_b.param_groups[0]["lr"] = alr
-        opt_b.param_groups[1]["lr"] = clr
+        _a = align_lr_at(step, zc, steps)
+        _c = comp_lr_at(step, zc, steps)
+        lrs = {"aligner_ffn": _a["ffn"], "aligner_attn": _a["attn"],
+               "compressor_ffn": _c["ffn"], "compressor_attn": _c["attn"]}
+        # Theo TÊN, không theo chỉ số: chèn một nhóm vào giữa thì chỉ số đổi
+        # im lặng và hai khối đổi lịch cho nhau mà không có gì báo.
+        for grp in opt_b.param_groups:
+            grp["lr"] = lrs[grp["name"]]
+        alr, clr = _a["ffn"], _c["ffn"]
         # Mở băng ĐÚNG một lần, ở đúng bước. `requires_grad` chứ không phải
         # lr = 0: Extractor là khối học được đầu tiên sau backbone, nên tắt grad
         # ở đây cắt hẳn phần backward dưới Aligner.
@@ -747,7 +821,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         if branch.compressor_frozen and clr > 0:
             branch.set_compressor_frozen(False)
             print(f"    [{aid}] bước {step + 1}/{steps} · MỞ BĂNG Compressor "
-                  f"(Stage 1) · warm-up -> {zc['comp_lr_main']:.2e}", flush=True)
+                  f"(Stage 1) · warm-up -> ffn {zc['comp_ffn_lr_main']:.2e} │ "
+                  f"attn {zc['comp_attn_lr_main']:.2e}", flush=True)
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
         step_ce = 0.0

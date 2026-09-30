@@ -26,21 +26,20 @@ Cả hai chạy lịch CHUNG của `src/schedule.py` — warm-up tuyến tính t
 `warmup_epochs` (1) epoch rồi GIỮ `lr_max` tới hết — nhưng trên hai cặp số
 khác nhau:
 
-    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 1e-5
-    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 1e-4
+    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 3e-5
+    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 3e-4
 
-Ma trận attention quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ
+Ma trận attention quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
-một mức cao hơn — ở đây cao hơn **10 lần** (1e-4 so với 1e-5), không phải
-1,4 lần như bản trước.
+một mức cao hơn — ở đây cao hơn **10 lần** (3e-4 so với 3e-5).
 
 **Chặng 5** giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
 chia cho `plateau_gamma` (1,5), sàn là `lr_min` của từng nhóm, và val khá lên thì
 GIỮ NGUYÊN mức đã tụt. Một bộ đếm chung cho hai nhóm, vì val là MỘT con số —
 không có cách nào nói nhóm nào làm nó xấu đi.
 
-`patience` = 3, và khi nó hết thì Stage 1 chạy thêm `tail_epochs` epoch cosine
+`patience` = 4, và khi nó hết thì Stage 1 chạy thêm `tail_epochs` epoch cosine
 từ lr HIỆN TẠI (đã gồm mọi lần chia) về `lr_min` của TỪNG nhóm rồi mới lấy best
 val — cùng quy ước với Stage 0.
 
@@ -48,7 +47,7 @@ val — cùng quy ước với Stage 0.
 KHÁC (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên
 nên thêm view chỉ là tính lại cùng một đích; và `Extractor.patches()` đòi đúng
 `n_patch` ô nên local crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên
-lưới 196 ô.
+lưới 196 ô của nửa độ phân giải.
 
 **MỌI siêu tham số DINO** (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN
 của `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức khác
@@ -105,18 +104,18 @@ def s1cfg(cfg: Cfg) -> dict:
     dc["n_local"] = 0
     out = {
         "attn_lr_min": float(s.get("attn_lr_min", 1e-8)),
-        "attn_lr_max": float(s.get("attn_lr_max", 1e-5)),
+        "attn_lr_max": float(s.get("attn_lr_max", 3e-5)),
         "ffn_lr_min": float(s.get("ffn_lr_min", 1e-7)),
-        "ffn_lr_max": float(s.get("ffn_lr_max", 1e-4)),
+        "ffn_lr_max": float(s.get("ffn_lr_max", 3e-4)),
         # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —
         # đó là `max_epochs`.
         "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
-        "max_epochs": int(s.get("max_epochs", 20)),
+        "max_epochs": int(s.get("max_epochs", 30)),
         # CHẶNG 5: mỗi epoch val không cải thiện -> CẢ HAI nhóm chia cho ngần
         # này (sàn `lr_min` của từng nhóm). 1.0 = tắt.
         "plateau_gamma": float(s.get("plateau_gamma", SCH.PLATEAU_GAMMA)),
         "tail_epochs": int(s.get("tail_epochs", 1)),
-        "patience": int(s.get("patience", 3)),
+        "patience": int(s.get("patience", 4)),
         "min_delta": float(s.get("min_delta", 0.0)),
         "weight_decay": float(s.get("weight_decay", 0.03)),
         "batch_size": int(s.get("batch_size", 32)),

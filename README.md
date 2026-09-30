@@ -12,7 +12,7 @@ token ảnh, thì chất lượng báo cáo X-quang có đổi không?
 | **B** `qlora_r32_decoder_vextractor` | §2.2 — Stage 0 → Stage 1 → main stage y hệt A + nhánh | `[Z ‖ Q ‖ text]` |
 
 **Biến duy nhất là chuỗi vào decoder.** Z (256 token ảnh) **không bị đụng vào**;
-B chỉ có thêm 32 vị trí nằm ngay sau khối ảnh. 32 vị trí ấy có nhãn `-100`,
+B chỉ có thêm 8 vị trí nằm ngay sau khối ảnh. 8 vị trí ấy có nhãn `-100`,
 `attention_mask = 1`, `token_type_ids = 0` — nên **số token vào CE không đổi** và
 CE của A với B vẫn là cùng một đại lượng. Mọi khoá quyết định kết quả của A
 (`seed`, `data`, `image_policy`, `base`, `prompt`, `generate`, `train`,
@@ -27,28 +27,28 @@ lệch).
 ```
                   ┌─► SigLIP (đóng băng) ─► projector ─► Z (256, 2560)   [đường của A]
 ảnh ──────────────┤
-                  └─► resize 448×448, chuẩn hoá theo pretrained_cfg  [đường RIÊNG]
+                  └─► resize 448×448, chuẩn hoá theo preprocessor_config  [đường RIÊNG]
                          │
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 1. EXTRACTOR — FocalNet-Small LRF (IN-1k), ĐỦ 4 stage    │  Stage 0 dạy
-   │    (B,3,448,448) ─► (B,768,14,14) ─► V = (196, 768)      │
+   │ 1. EXTRACTOR — InternImage-L (IN-22k), CẮT ở stage 3     │  Stage 0 dạy
+   │    (B,3,448,448) ─► (B,28,28,640) ─► V = (784, 640)      │
    └─────────────────────┬───────────────────────────────────┘
                          │ V
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 2. COMPRESSOR — QFormer, 8 latent @1024, N = 3 nhóm      │  Stage 1 dạy
+   │ 2. COMPRESSOR — QFormer, 8 latent @768, N = 4 nhóm       │  Stage 1 dạy
    │                                                          │
-   │    kv = RMSNorm(V)                          768          │
-   │    q  = 8 latent @1024                                   │
+   │    kv = RMSNorm(V)                          640          │
+   │    q  = 8 latent @768                                    │
    │    N × [ khối 1:  q += SelfAttn(N(q))                    │
    │                   q += CrossAttn(N(q), kv)   ◄─ đọc V    │
    │                   q += SwiGLU(N(q))                      │
    │          khối 2:  q += SelfAttn(N(q))                    │
    │                   q += SwiGLU(N(q))         ]            │
-   │    ─► V_c = (8, 1024)                                    │
+   │    ─► V_c = (8, 768)                                     │
    └─────────────────────┬───────────────────────────────────┘
                          │ V_c
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 3. ALIGNER — RMSNorm(1024) + SwiGLU 1024→4096→2560       │  Main stage dạy
+   │ 3. ALIGNER — MHAttn(768) ‖ SwiGLU 768→2048→2560          │  Main stage dạy
    │    ─► Q (8, 2560)                                        │
    └─────────────────────┬───────────────────────────────────┘
                          │
@@ -59,155 +59,194 @@ lệch).
 
 | | dạy | đứng yên | hàm mục tiêu |
 |---|---|---|---|
-| **Stage 0** | Extractor (**49,57 M**) | — | DINO tự giám sát (teacher = EMA, multi-crop) từ init ImageNet-1k |
-| **Stage 1** | Compressor (**55,07 M**) | Extractor (teacher Stage 0) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
-| **main** | Aligner (**18,88 M**) + LoRA từ bước 0; Compressor sau 20% bước | Extractor | CE trên báo cáo thật |
+| **Stage 0** | Extractor (**115,66 M**) | — | DINO tự giám sát (teacher = EMA, multi-crop) từ init ImageNet-22k |
+| **Stage 1** | Compressor (**36,98 M**) | Extractor (teacher Stage 0) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
+| **main** | Aligner (**10,75 M**) + LoRA từ bước 0; Compressor sau 20% bước | Extractor | CE trên báo cáo thật |
 
 ---
 
-## 1.1. Extractor — `focalnet_small_lrf.ms_in1k`
+## 1.1. Extractor — `OpenGVLab/internimage_l_22k_384`, `n_stages: 3`
 
-> **⚠ Đây là FocalNet, KHÔNG phải Focal Transformer.** Hai bài khác nhau của
-> cùng nhóm Microsoft: **Focal Transformer** (NeurIPS 2021) dùng *focal
-> self-attention*; **FocalNet** (NeurIPS 2022) bỏ hẳn self-attention, thay bằng
-> *focal modulation* — một chồng depth-wise conv + gating. `timm` chỉ có
-> FocalNet. Muốn đúng bài 2021 thì phải vendor code từ
-> `microsoft/Focal-Transformer`, vì `backbone_body` chỉ dựng model qua timm.
+**InternImage là một CNN, không phải một transformer.** Lõi của nó là **DCNv3**
+— deformable convolution v3: mỗi vị trí học `group × 9` cặp *offset* và một
+*mask* softmax, rồi lấy mẫu lưới bằng `grid_sample`. Nên nó có trường thu nhận
+thích nghi như attention nhưng chi phí tuyến tính theo số ô, và nó **không có
+pos-embed để nội suy, không có cửa sổ để đệm, không có cls token**.
 
-> **⚠ `ms_in1k` là trọng số CÓ GIÁM SÁT trên ImageNet-1k**, không phải tự giám
-> sát. Nên Stage 0 ở đây **không** phải "chạy tiếp đúng hàm mục tiêu" như với
-> một checkpoint DINOv3: nó là DINO self-distillation **khởi đi từ một init có
-> giám sát**. Được một backbone mạnh và rẻ, mất tính liên tục của hàm mục tiêu
-> — và đừng đọc đường loss của Stage 0 như thể nó nối tiếp một lượt pretrain tự
-> giám sát nào.
+> **⚠ Backbone này KHÔNG nạp qua timm.** timm không có InternImage. Nó đến từ
+> Hugging Face bằng `trust_remote_code=True` (`AutoModel` -> `InternImageModel`),
+> tức ba file `.py` của OpenGVLab được tải và **chạy**. `backbone_body` vì thế
+> có HAI đường: `is_internimage(arch)` chọn `internimage_body` (HF), còn lại đi
+> đường timm cũ. Hai họ, hai cách cắt: `.model.levels` so với `.stages`.
 
-**`n_stages: null` — ĐỦ bốn stage, dừng ở stride 32 / 768 kênh.** Ở 448² lưới là
-**14×14 = 196 ô × 768**, đúng như đặc tả: FocalNet có stem stride 4 rồi ba lần
-stride 2, nên 448/32 = 14. Tầng ngữ nghĩa **cao nhất** của backbone được giữ
-nguyên; cái giá là lưới thô hơn 4× so với một bản cắt ở Stage 3 — Cross-attn
-của Compressor và bản đồ saliency của Lens đều đọc trực tiếp lưới ấy.
+> **⚠ Kernel CUDA của DCNv3 KHÔNG bao giờ được dùng, và đó là tin tốt lẫn tin
+> xấu.** Trong `dcnv3_func.py` của OpenGVLab, `pkg_resources` được `import`
+> **sau** khối `try` đã dùng nó, nên nhánh "có kernel" luôn ném `NameError` và
+> bị `except:` bắt: `has_cuda_kernel` **luôn** là `False` và model luôn chạy
+> `DCNv3_pytorch`. Tin tốt: không phải biên dịch extension nào (đúng thứ hay
+> chết trên Windows). Tin xấu: bản PyTorch trải 9 điểm lấy mẫu bằng
+> `grid_sample`, nên nó chậm hơn và ngốn activation hơn — `stage0.micro_batch`
+> và `vextractor.extractor.with_cp` là hai chỗ để trả giá đó.
 
-> `n_patch` và `d_feat` ở đây đến từ **một lượt forward THẬT** với tensor 0
-> (trong `eval()` + `no_grad()` + `fork_rng`, nên không tiêu RNG), không từ một
-> công thức stride gõ tay — chúng không thể lệch với model.
+> **⚠ `_22k_384` là trọng số CÓ GIÁM SÁT trên ImageNet-22k**, không phải tự
+> giám sát. Nên Stage 0 ở đây **không** phải "chạy tiếp đúng hàm mục tiêu" như
+> với một checkpoint DINOv3: nó là DINO self-distillation **khởi đi từ một init
+> có giám sát**. Được một backbone mạnh, mất tính liên tục của hàm mục tiêu —
+> và đừng đọc đường loss của Stage 0 như thể nó nối tiếp một lượt pretrain tự
+> giám sát nào. (HF không phát hành bản `l_1k_224`: họ L chỉ có `22k_384` và
+> `22kto1k_384`.)
 
-**Không có BatchNorm nào để phải xử lý.** ConvNeXt chuẩn hoá bằng LayerNorm,
-tính theo **từng vị trí của từng ảnh**, không mang theo thống kê chạy nào — nên
-Stage 0 không cần epoch nào để kéo thống kê về ảnh CXR.
+**`n_stages: 3` — cắt SAU stage 3, dừng ở stride 16 / 640 kênh.** InternImage-L
+có `channels: 160`, `depths: [5, 5, 22, 5]`, nên bốn stage chạy ở 160 · 320 ·
+**640** · 1280 kênh. Ở 448² (stem /4 rồi hai lần /2 trước khi tới stage 3) lưới
+là **28×28 = 784 ô × 640** — đây là `V`. Lát cắt ấy là một lựa chọn có hai mặt:
+bỏ tầng ngữ nghĩa cao nhất, đổi lấy một lưới **mịn gấp 4 lần** so với 14×14 của
+đủ bốn stage, và Cross-attn của Compressor cùng bản đồ saliency của Lens đều
+đọc trực tiếp lưới ấy. Nó cũng là chỗ **22 trong 37 block** của backbone nằm,
+nên nó không phải một lát cắt "cho rẻ".
 
-**Multi-crop dùng chung MỘT `state_dict`** vì ConvNeXt thuần tích chập: không
-tham số nào gắn với cỡ ảnh, nên 448² (global, main stage) và 224² (local) đi qua
-đúng cùng bộ trọng số, không phải nhờ nội suy hay đệm gì. `backbone_body` còn
-**probe ở nửa độ phân giải** ngay lúc dựng và trả cờ `multi_res`; `n_local > 0`
-với một backbone chỉ nhận một cỡ ảnh bị **dừng ở đó**, thay vì chết ở lượt
-forward local crop đầu tiên sau khi đã nạp xong dữ liệu lẫn trọng số.
+**Cắt stage là HAI việc, và cả hai đều cần.** `levels[i]` chạy `depths[i]` block
+ở `160·2^i` kênh **rồi mới** downsample; nên (1) `downsample` của level cuối còn
+lại bị **bỏ** — giữ nó là trả về lưới của stage SAU, nửa độ phân giải và gấp đôi
+kênh; (2) `levels[3]` bị **xoá khỏi `ModuleList`**, không chỉ bỏ không gọi. Tham
+số của một level chết vẫn nằm trong `state_dict`, vẫn đi vào optimizer của
+Stage 0, vẫn được ghi vào checkpoint — và với InternImage-L đó là **95,9 M**
+tham số, nhiều hơn Compressor và Aligner cộng lại.
 
-**Không prefix token.** ConvNeXt trả một **LƯỚI** `(B, C, H, W)`, không có cls
-token nào, nên `stage0.dino.pool` bắt buộc `mean` và `pool: cls` bị **từ chối
-ngay lúc dựng backbone** — trước khi nạp dữ liệu, trước khi dựng optimizer — chứ
-không lặng lẽ rơi về `mean`.
+**`AutoModel` dựng thân với `num_classes=0`**, nên `conv_head` và `head` không
+tồn tại: 43 M trọng số phân loại 21 841 lớp của checkpoint 22k là khoá **thừa**
+lúc nạp (transformers cảnh báo rồi bỏ), không phải tham số chết đi vào
+optimizer.
 
-**`backbone_body` nhận BA bố cục trục, và trục kênh được HỎI từ `output_fmt`**
-chứ không suy từ `f.dim()`: **`NCHW` (ConvNeXt — bố cục đang dùng)**, gộp bằng
-đúng "Flatten + Permute" `flatten(2).transpose(1, 2)` · `NHWC` (SwinV2), gộp
-bằng `flatten(1, 2)` · `NLC` (ViT, cắt prefix). Hai bố cục 4 chiều **không phân
-biệt được bằng số chiều**, và dùng nhầm nhánh giữa chúng *không ném lỗi*: nó trả
-`(B, W·C, H)`, `d_feat` đọc ra **28** thay vì 512, và cả đường ống chạy hết trên
-rác.
+> `n_patch` (784) và `d_feat` (640) đến từ **một lượt forward THẬT** với tensor
+> 0 (trong `eval()` + `no_grad()` + `fork_rng`, nên không tiêu RNG), không từ
+> một công thức stride gõ tay — chúng không thể lệch với model.
 
-**Ladder dựng backbone được kiểm bằng forward THẬT, không chỉ bằng `TypeError`.**
-Một model có thể *nhận* khoá mà không kêu gì rồi mới chết ở lượt forward đầu
-tiên. Mỗi tổ hợp vì thế được dựng **và** probe; hỏng thì rơi xuống tổ hợp sau,
-và chỉ khi hết ladder mới báo lỗi, kèm lý do của **từng** nấc.
+**MỘT `state_dict` chạy cả 448² lẫn 224².** DCNv3 lấy mẫu bằng `grid_sample` nên
+không tham số nào gắn với cỡ ảnh: 448² -> 28×28, 224² -> 14×14, cùng một bộ
+trọng số. Điều kiện bắt buộc của multi-crop Stage 0 — và nó được **probe THẬT**
+ở nửa độ phân giải ngay lúc dựng (`multi_res`), không được tin vì nó đúng về
+nguyên tắc. `n_local > 0` với một backbone chỉ nhận một cỡ ảnh bị **dừng ở
+đó**, thay vì chết ở lượt forward local crop đầu tiên sau khi đã nạp xong dữ
+liệu lẫn trọng số.
 
-**Cắt stage thì `head` là một tensor CHẾT, và nó bị bỏ.** `head.norm` của
-ConvNeXt được dựng theo số kênh của stage **cuối** (1024). Cắt còn 3 stage thì
-nó không bao giờ được gọi nữa (`forward_features` dừng ở `norm_pre`), nhưng tham
-số của nó vẫn nằm trong `state_dict`, vẫn đi vào optimizer của Stage 0, và vẫn
-được ghi vào checkpoint — làm bảng tham số lệch mà không có gì báo. `backbone_body`
-thay nó bằng `nn.Identity()`.
+**Không prefix token.** InternImage trả một **LƯỚI**, không có cls token nào, nên
+`stage0.dino.pool` bắt buộc `mean` (trung bình **784 ô**) và `pool: cls` bị **từ
+chối ngay lúc dựng backbone** — trước khi nạp dữ liệu, trước khi dựng optimizer
+— chứ không lặng lẽ rơi về `mean`.
 
-**Chuẩn hoá ảnh mean/std ĐÚNG của checkpoint.** Không phải mean/std ImageNet gõ
-tay: nó được hỏi từ **`timm.get_pretrained_cfg(arch).mean/std`** rồi đóng vào
-`spec.extractor.normalize` của mọi checkpoint — DINOv3 dùng mean/std ImageNet
-nhưng checkpoint ViT họ AugReg dùng **0.5/0.5**, nên một cặp số gõ tay ở đây là
-sai **lặng lẽ**, không có shape nào hỏng. `vextractor.vext_tensor()` là chỗ
-**duy nhất** dựng ảnh ấy và nó **bắt buộc** phải nhận mean/std (không có mặc
-định); `_check_normalize` so spec với `pretrained_cfg` của model vừa dựng, và
-`assert_same_pixels` kiểm lại trên một mẫu thật mỗi lần chạy.
+**Bố cục trục là `NHWC`, và nó được HỎI chứ không đoán.** DCNv3 làm việc trên
+`(N, H, W, C)`, nên `InternImageBody.forward_features` trả đúng bố cục ấy —
+không permute thêm lần nào — và `output_fmt = "NHWC"` nói ra điều đó.
+`patches()` gộp bằng `flatten(1, 2)`. Dùng nhầm nhánh NCHW cho nó **không ném
+lỗi**: nó trả `(B, W·C, H)`, `d_feat` đọc ra **28** thay vì 640, `Linear(28, …)`
+dựng được, và cả đường ống chạy hết trên rác. Đó là lý do trục kênh đến từ
+`output_fmt`, không từ `f.dim()`: NCHW và NHWC **cùng 4 chiều**.
 
-## 1.2. Compressor — QFormer, 8 latent @1024, N = 3
+**Không có BatchNorm nào để phải xử lý.** InternImage chuẩn hoá bằng LayerNorm
+(`norm_layer: LN` ở cả stem, downsample và mọi block), tính theo từng vị trí của
+từng ảnh, không mang theo thống kê chạy nào — nên Stage 0 không cần epoch nào
+để kéo thống kê về ảnh CXR.
+
+**Chuẩn hoá ảnh mean/std ĐÚNG của checkpoint**, đọc từ
+`preprocessor_config.json` của repo (`_internimage_normalize`) — vai của
+`timm.get_pretrained_cfg` ở họ kia. InternImage-L dùng mean/std ImageNet, nhưng
+đó là điều **đọc được**, không phải điều giả định: `body.pretrained_cfg` được
+gắn từ chính nguồn ấy, vì không gắn thì `_check_normalize` rơi về hằng
+`IMAGENET_*` — và cặp số ấy **tình cờ đúng** với checkpoint này, nên một
+checkpoint khác của cùng họ sẽ đi qua cổng kiểm mà không ai thấy.
+`vextractor.vext_tensor()` là chỗ **duy nhất** dựng ảnh của nhánh và nó **bắt
+buộc** phải nhận mean/std (không có mặc định); `assert_same_pixels` kiểm lại
+trên một mẫu thật mỗi lần chạy.
+
+**`with_cp` là khoá DUY NHẤT của khối `extractor` không vào vân tay Stage 0.**
+Nó bật `torch.utils.checkpoint` trong từng `InternImageLayer`: đổi **chi phí**
+của lượt forward, không đổi một tensor nào — nên bật/tắt nó không bắt chạy lại
+một lượt DINO nhiều giờ. Khai `with_cp: true` với một `arch` của timm bị **từ
+chối ồn ào**: model của timm không đọc khoá ấy, và một khoá không ai đọc là im
+lặng tuyệt đối.
+
+## 1.2. Compressor — QFormer, 8 latent @768, N = 4
 
 **8 latent là khoá KHAI tường minh** (`vextractor.compressor.n_query`). Lưới
-của Extractor (**196 ô** ở 448²) là **nguồn để hỏi**, không phải khối Q: 8
+của Extractor (**784 ô** ở 448²) là **nguồn để hỏi**, không phải khối Q: 8
 vector đi hỏi nó qua **Cross-attn** và nén lại.
 
-**768 → 1024 xảy ra NGAY TRONG Cross-attn.** `k_proj`/`v_proj` nhận 768 và trả
-1024; `q_proj`/`o_proj` ở 1024. **Không có `Linear 768→1024` đứng trước** — một
-lớp chiếu riêng sẽ thêm 0,79 M tham số mà không thêm sức biểu diễn nào (nó chỉ
-gộp được vào `k`/`v` phía sau), và nó buộc cả ba nhóm dùng chung MỘT bản 1024
+**640 → 768 xảy ra NGAY TRONG Cross-attn.** `k_proj`/`v_proj` nhận 640 và trả
+768; `q_proj`/`o_proj` ở 768. **Không có `Linear 640→768` đứng trước** — một
+lớp chiếu riêng sẽ thêm 0,49 M tham số mà không thêm sức biểu diễn nào (nó chỉ
+gộp được vào `k`/`v` phía sau), và nó buộc cả bốn nhóm dùng chung MỘT bản 768
 chiều của lưới thay vì để mỗi nhóm tự chiếu lấy thứ nó cần. Thứ **duy nhất**
-đứng trước Cross-attn là `RMSNorm(768)` trên V (768 tham số): nó đưa key/value
+đứng trước Cross-attn là `RMSNorm(640)` trên V (640 tham số): nó đưa key/value
 về RMS ≈ 1, thang mà mọi phép attention bên trên được thiết kế cho.
 
 **Khối 2 KHÔNG có Cross-attn, và đó là chủ ý.** Nó để 8 vector *thống nhất lại
 với nhau* sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp. Một
 Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một bộ câu hỏi
-vừa được cập nhật nửa vời. Với `N = 3` thì cả cụm đọc ảnh đúng **ba** lần, xen
-giữa là hai lượt tự-trộn.
+vừa được cập nhật nửa vời. Với `N = 4` thì cả cụm đọc ảnh đúng **bốn** lần, xen
+giữa là ba lượt tự-trộn.
 
 **Pre-norm + residual quanh TỪNG khối con** — năm dấu `+` và năm RMSNorm mỗi
 nhóm, đúng quy ước Gemma 3. Selftest so **thẳng** năm công thức ấy, nên trả nhầm
 một residual sẽ bị bắt ngay.
 
 **Mọi attention chạy ở `head_dim` = 128, và đó là khoá KHAI.** Số head được
-**suy ra**: `n_heads = d_latent // head_dim` = **8** ở 1024. Chiều ngược lại —
+**suy ra**: `n_heads = d_latent // head_dim` = **6** ở 768. Chiều ngược lại —
 khai `n_heads` rồi để `head_dim` rơi ra — là cách head_dim đổi **lặng lẽ** mỗi
-lần ai đó sửa `d_latent`. Khai cái **bất biến**, suy ra cái phụ thuộc;
-`d_latent` không chia hết `head_dim` thì **dừng**, không làm tròn.
+lần ai đó sửa `d_latent`: 8 head cho đúng 128 ở 1 024, nhưng cùng 8 head ở 768
+ra 96. Khai cái **bất biến**, suy ra cái phụ thuộc; `d_latent` không chia hết
+`head_dim` thì **dừng**, không làm tròn. Cùng `head_dim` ấy được **dùng lại**
+cho MHAttn của Aligner, không khai lại — một khoá thứ hai cho cùng con số là
+một khoá có thể lệch.
 
 **HAI khối SwiGLU, hai khoá khai riêng.** `vextractor.compressor.mlp_hidden`
-(1024) là bề rộng FFN **bên trong Compressor**; `vextractor.aligner.mlp_hidden`
-(4096) là bề rộng FFN của **Aligner** — và khối ấy cũng là chỗ **duy nhất** nhánh
-đổi chiều, từ 1024 lên `d_model` 2560.
+(512) là bề rộng FFN **bên trong Compressor** — một **nút THẮT** (`SwiGLU
+768→512→768`, hẹp hơn `d_latent`): mỗi lượt FFN buộc 8 vector bỏ bớt thứ gì đó
+thay vì nở ra. `vextractor.aligner.mlp_hidden` (2048) là bề rộng FFN của
+**Aligner**, và khối ấy đi hướng ngược lại.
 
 | khối con (mỗi nhóm) | tham số |
 |---|---|
-| Self-attn @1024 (×2) | 4,19 M mỗi cái |
-| Cross-attn (q/o @1024, k/v 768→1024) | 3,67 M |
-| `SwiGLU 1024→1024→1024` (×2) | 3,15 M mỗi cái |
-| 5 × RMSNorm(1024) | 5 120 |
-| **khối 1** (self + cross + ffn) | **11,01 M** |
-| **khối 2** (self + ffn) | **7,34 M** |
-| **MỘT nhóm khối** (khối 1 → khối 2) | **18,36 M** |
+| Self-attn @768 (×2) | 2 359 296 mỗi cái |
+| Cross-attn (q/o @768, k/v 640→768) | 2 162 688 |
+| `SwiGLU 768→512→768` (×2) | 1 179 648 mỗi cái |
+| 5 × RMSNorm(768) | 3 840 |
+| **khối 1** (self + cross + ffn) | **5 703 936** |
+| **khối 2** (self + ffn) | **3 540 480** |
+| **MỘT nhóm khối** (khối 1 → khối 2) | **9,24 M** |
 
-> ⚠ Đặc tả ghi `~17.84M (xN)`; số ĐO được cho một nhóm là **18,36 M** — lệch
-> **0,51 M** (2,9%). Bảng trên là số đo trên model thật, và nó cộng đúng:
-> 2 × 4,19 + 3,67 + 2 × 3,15 + 0,005. Con số của Aligner thì khớp đặc tả tuyệt
-> đối (18,88 vs ~18.89 M), nên quy ước đếm ở đây là cùng một quy ước — chênh
-> lệch là ở phép nhẩm của đặc tả, không ở kiến trúc.
+> Đặc tả ghi `~9.24M (xN)` — số ĐO được cho một nhóm là **9 244 416**, khớp.
+> Tổng Compressor ở `N = 4` thì đặc tả ghi `~36.96M` (= 4 × 9,24) còn số đo là
+> **36,98 M**: chênh lệch là `8 × 768` của `latent` cộng `640` của
+> `RMSNorm(V)` — hai thứ nằm NGOÀI mọi nhóm khối.
 
-**Chi phí nằm ở `d_latent`, không ở `n_query`.** 8 latent chỉ là **8 192**
-tham số, trong khi mỗi Self-attn @1024 là 4,19 M. Đổi `n_query` gần như không
+**Chi phí nằm ở `d_latent`, không ở `n_query`.** 8 latent chỉ là **6 144**
+tham số, trong khi mỗi Self-attn @768 là 2,36 M. Đổi `n_query` gần như không
 đụng tới bảng trên (nó đụng tới *thời gian* và tới độ dài chuỗi decoder); đổi
 `d_latent` thì đụng tới tất cả, theo d².
 
-## 1.3. Aligner — `RMSNorm(1024)` + `SwiGLU 1024→4096→2560`
+## 1.3. Aligner — `MHAttn(768)` + `SwiGLU 768→2048→2560`
 
-**Aligner là một FFN thuần**, không attention / residual: phần "suy nghĩ" nằm
-trọn trong Compressor. Nó vừa **trộn lại 8 vector sau khi chúng đã đọc xong
-ảnh**, vừa là chỗ **duy nhất** nhánh đổi chiều lên không gian embedding của
-decoder (`down(SiLU(gate(x)) ⊙ up(x))`, `bias=False` cả ba theo quy ước Gemma 3
-/ LLaMA).
+**HAI khối con, và chỉ khối sau đổi chiều:**
 
-**RMSNorm ở đây là RMSNorm(768), không phải 2560.** Thứ đi vào là `V_c`, ra từ
-residual cuối của Compressor, nên nó vẫn ở `d_latent`; chỉ `down` mới nâng lên
-2560. Hai số xa nhau nên lỗi ấy hỏng ngay ở shape — nhưng đổi `d_latent` thành
-2560 thì nó im lặng, và đó là lý do hai khoá vẫn RIÊNG dù có lúc trùng nhau.
+    x = V_c + MHAttn(RMSNorm(V_c))
+    Q = down( SiLU(gate(y)) ⊙ up(y) ),   y = RMSNorm(x)
 
-**RMSNorm ở đó không phải trang trí, và đây là chỗ đáng đọc kỹ.** SwiGLU được
-mượn từ FFN của decoder, nơi đầu vào **luôn** đã qua RMSNorm — RMS ≈ 1 là một
-giả định ngầm của cả thiết kế. `V_c` thì không: nó tới Aligner với RMS nhỏ
+**MHAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt **tự**-chú ý trên đúng 8 vector
+của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới. Nên nó không
+thêm một bit thông tin thị giác nào — việc của nó là trộn 8 vector MỘT lần nữa
+ngay tại ranh giới ngữ nghĩa, sau khi Compressor đã nén xong và trước khi `down`
+đưa chúng sang không gian embedding của decoder. Đó cũng là khác biệt duy nhất
+về *bố cục* so với bản trước, nơi Aligner là một FFN thuần.
+
+**Residual quanh MHAttn, KHÔNG quanh SwiGLU.** Khối attention giữ nguyên chiều
+nên dấu `+` có nghĩa; khối SwiGLU đổi 768 → 2560 nên không có gì để cộng vào —
+và đó là lý do Aligner không phải một block transformer đầy đủ: nửa sau của nó
+là một phép **đổi không gian**, không phải một lượt tinh chỉnh.
+
+**RMSNorm trước SwiGLU không phải trang trí, và đây là chỗ đáng đọc kỹ.** SwiGLU
+được mượn từ FFN của decoder, nơi đầu vào **luôn** đã qua RMSNorm — RMS ≈ 1 là
+một giả định ngầm của cả thiết kế. `V_c` thì không: nó tới Aligner với RMS nhỏ
 (latent khởi tạo ở 0,02, và residual do latent chi phối). Một khối có **cổng
 nhân**, ăn đầu vào nhỏ, ở init nhỏ, thì **bình phương** cái nhỏ ấy. Đo thật,
 trên chính khối này với ba cách khởi tạo:
@@ -216,7 +255,7 @@ trên chính khối này với ba cách khởi tạo:
 |---|---|
 | MLP(GeLU) không cổng, std 0,02 | ~6e-3 |
 | SwiGLU, cả ba ma trận std 0,02, **không norm** | **~1e-4** |
-| **RMSNorm + SwiGLU, init `1/√fan_in`** | **~6e-1** |
+| **RMSNorm + SwiGLU, init `1/√fan_in`** | **~5,8e-1** |
 
 Bản giữa là hỏng thật, không phải chuyện thẩm mỹ: trên model đồ chơi của
 selftest nó **underflow hẳn về 0**, và bản đồ saliency của Lens thành một ma
@@ -224,44 +263,50 @@ trận không. Nhân init lên để bù thì chữa *triệu chứng* — con s
 đo được chứ không từ nguyên tắc nào, và nó trôi ngay khi Compressor đổi.
 RMSNorm chữa *nguyên nhân*: nó đặt đầu vào của SwiGLU lên đúng thang mà SwiGLU
 được thiết kế cho, nên `1/√fan_in` — init chuẩn — lại có nghĩa. Giá: **768
-tham số**.
+tham số** mỗi norm, và Aligner có hai.
 
-> Đặc tả ghi Aligner `~18.89M`. Đó là con số của đầu vào 1024; với `d_latent` =
-> **768** (chiều thật của `V_c`) nó là **16,78 M**. Aligner ăn `V_c` nguyên
-> chiều — không có lớp chiếu 768→1024 nào chen vào chỉ để khớp một con số.
+`_init` (normal(0, 0.02) cho mọi `nn.Linear` mới) **bỏ qua** ba ma trận có cổng,
+y như nó bỏ qua Extractor — đè 0,02 lên chúng là quay lại đúng hàng giữa của
+bảng trên, và im lặng. Nhưng nó **vẫn chạm** bốn chiếu của MHAttn: attention
+không có cổng, và nó đi theo đúng quy ước của Compressor.
 
-`_init` (normal(0, 0.02) cho mọi `nn.Linear` mới) **bỏ qua** mọi ma trận có
-cổng, y như nó bỏ qua Extractor — đè 0,02 lên chúng là quay lại đúng hàng giữa
-của bảng trên, và im lặng.
+> Chỗ `skip` cho Extractor **không** phải đề phòng: mỗi `InternImageLayer` cài
+> `offset`, `mask`, `input_proj`, `output_proj` và hai lớp MLP bằng `nn.Linear`
+> trên tensor NHWC, nên InternImage-L cắt còn 3 stage vẫn có **192**
+> `nn.Linear` (32 block × 6). Thiếu `skip` là xoá sạch Extractor một cách im
+> lặng.
 
-> Chỗ `skip` cho Extractor **không** phải đề phòng: timm cài hai lớp point-wise
-> của mỗi block ConvNeXt (`mlp.fc1`, `mlp.fc2`) bằng `nn.Linear` trên tensor
-> NHWC chứ không bằng Conv2d 1×1, nên FocalNet-Small đủ 4 stage vẫn có
-> **66** `nn.Linear` (33 block: 3+3+27). Thiếu `skip` là xoá sạch Extractor một
-> cách im lặng.
+`aligner.mlp_hidden` 2048 > 768 — một chỗ **nở ra**, cùng hướng với FFN của
+decoder (Gemma 3: 2560 → 10240) và ngược hướng với nút thắt 512 bên trong
+Compressor. Hai khối SwiGLU, hai khoá, hai hướng — và đó là chủ ý: Compressor
+*nén*, Aligner *dịch*.
 
 Một khác biệt đáng biết nếu muốn khớp decoder cho bằng: FFN của Gemma 3 thực ra
 là **GeGLU** (`gelu_pytorch_tanh`), không phải SwiGLU; ở đây dùng SiLU đúng như
 đặc tả.
 
-`aligner.mlp_hidden` 4096 > 768 — một chỗ **nở ra**, cùng hướng với FFN của
-decoder (Gemma 3: 2560 → 10240). Muốn một **nút thắt** (ép chiều lại, buộc 32
-vector bỏ bớt thứ gì đó) thì đặt nó dưới 768; cả hai đều chạy, nhưng hỏi hai
-câu khác nhau.
-
 ## 1.4. Bảng tham số
+
+Mọi con số dưới đây là **số ĐO ĐƯỢC** trên model thật (selftest dựng lại nhánh
+từ `configs/vextractor.yaml` rồi đòi đúng những chuỗi này có trong README —
+xem bài 22).
 
 | khối | tham số |
 |---|---|
-| **Extractor** FocalNet-Small LRF @448 → `(196, 768)`, `n_stages: None` | **49,57 M** — *Stage 0 dạy; sau đó teacher inference* |
-| RMSNorm(768) trên V | 768 |
-| 8 latent @1024 | 8 192 |
-| **1 nhóm khối** (Self ×2 + Cross + SwiGLU ×2 + 5 norm) | **18,36 M** |
-| **Compressor** (N = 3) → `(8, 1024)` | **55,07 M** — *Stage 1 dạy* |
-| **Aligner** `RMSNorm(1024)` + `SwiGLU 1024→4096→2560` → Q (8, 2560) | **18,88 M** — *main stage dạy* |
-| **nhánh ở main stage** | **123,52 M**, trong đó **học được 73,95 M** |
-| DINO head (CHỈ Stage 0 / Stage 1, bị bỏ sau đó) | **7,35 M** |
-| **Stage 0**: student (Extractor + head) | **56,92 M** *(+ teacher EMA 56,92 M nữa trong VRAM)* |
+| **Extractor** InternImage-L @448 → `(784, 640)`, `n_stages: 3` | **115,66 M** — *Stage 0 dạy; sau đó teacher inference* |
+| RMSNorm(640) trên V | 640 |
+| 8 latent @768 | 6 144 |
+| **1 nhóm khối** (Self ×2 + Cross + SwiGLU ×2 + 5 norm) | **9,24 M** |
+| **Compressor** (N = 4) → `(8, 768)` | **36,98 M** — *Stage 1 dạy* |
+| **Aligner** `MHAttn(768)` + `SwiGLU 768→2048→2560` → Q (8, 2560) | **10,75 M** — *main stage dạy* |
+| **nhánh ở main stage** | **163,40 M**, trong đó **học được 47,73 M** |
+| DINO head (CHỈ Stage 0 / Stage 1, bị bỏ sau đó) | **7,09 M** |
+| **Stage 0**: student (Extractor + head) | **122,75 M** *(+ teacher EMA 122,75 M nữa trong VRAM)* |
+
+> ⚠ Đặc tả ghi Extractor `~115.57M`; số đo được là **115 662 210**. Lệch
+> **0,09 M** (0,08%) — đúng phần biases của LayerNorm/conv mà một phép nhẩm hay
+> bỏ. Aligner thì khớp tuyệt đối: MHAttn **2 359 296** (đặc tả ~2.36M) +
+> SwiGLU **8 388 608** (~8.39M) + hai RMSNorm 1 536 = **10 749 440** (~10.75M).
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
 đọc được toàn bộ 256 token ảnh, còn phần văn bản phía sau đọc được cả Z lẫn Q.
@@ -283,7 +328,7 @@ Stage 0 và Stage 1 dùng **cùng một hàm**. Hai chặng, cộng một hệ s
    (**1,5**), sàn `lr_min`; val cải thiện thì **giữ nguyên** lr
 
 Với Stage 0 (6400 mẫu, batch 32 → **200 bước/epoch**): dốc 200 bước từ 1e-8 lên
-1e-5, rồi giữ 1e-5 cho tới lúc dừng.
+2e-5, rồi giữ 2e-5 cho tới lúc dừng.
 
 > **`lr_max` là MỨC CHẠY, không phải một đỉnh tạm rồi hạ.** Không còn `lr_main`,
 > không còn chặng cosine nào trong lịch chung. Thứ **duy nhất** kéo lr xuống là
@@ -307,23 +352,23 @@ chọn có hệ quả:
   **tổng** số epoch hỏng, không bao giờ reset, và quyết định **lr**. Gộp chúng
   là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ. Muốn
   tắt chặng 5 thì đặt `plateau_gamma: 1.0`, **không phải** `patience: 0`.
-* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (1e-5 → 1e-8 là **18** lần), lr sẽ chui
-  xuống dưới `lr_min`; lúc ấy epoch đuôi — vốn cosine *về* `lr_min` — thành một
-  cú **tăng** lr, ngược hẳn với ý của nó.
+* **sàn ở `lr_min`.** Sau đủ nhiều lần chia (2e-5 → 1e-8 là **19** lần), lr sẽ
+  chui xuống dưới `lr_min`; lúc ấy epoch đuôi — vốn cosine *về* `lr_min` —
+  thành một cú **tăng** lr, ngược hẳn với ý của nó.
 
 **Vì sao 1,5 chứ không phải 3.** Hệ số nhỏ chia quãng đường tới sàn thành
-**nhiều nấc**: 1e-5 → 1e-8 là **18** lần chia thay vì 7, nên lr hạ dần theo
+**nhiều nấc**: 2e-5 → 1e-8 là **19** lần chia thay vì 7, nên lr hạ dần theo
 đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại, một chuỗi
-hỏng ngắn gần như không đụng tới lr — với `patience` = 3 (đồng bộ cho cả hai
-giai đoạn) thì tới lúc **dừng** lr mới chỉ còn `1/1,5³ ≈ 30%` mức chạy, so với
-`1/3³ ≈ 3,7%` ở hệ số 3. Chặng 5 vì thế là một cái **phanh mềm**, không phải
+hỏng ngắn gần như không đụng tới lr — với `patience` = 4 (đồng bộ cho cả hai
+giai đoạn) thì tới lúc **dừng** lr mới chỉ còn `1/1,5⁴ ≈ 20%` mức chạy, so với
+`1/3⁴ ≈ 1,2%` ở hệ số 3. Chặng 5 vì thế là một cái **phanh mềm**, không phải
 một cái công tắc.
 
-Ví dụ với Stage 0 (`lr_max = 1e-5`, `lr_min = 1e-8`):
+Ví dụ với Stage 0 (`lr_max = 2e-5`, `lr_min = 1e-8`):
 
-| số epoch val hỏng | 0 | 1 | 2 | 3 | 5 | 8 | 12 | ≥ 18 |
-|---|---|---|---|---|---|---|---|---|
-| lr | 1,0e-5 | 6,7e-6 | 4,4e-6 | 3,0e-6 | 1,3e-6 | 3,9e-7 | 7,7e-8 | 1,0e-8 (sàn) |
+| số epoch val hỏng | 0 | 1 | 2 | 3 | 4 | 6 | 9 | 13 | ≥ 19 |
+|---|---|---|---|---|---|---|---|---|---|
+| lr | 2,0e-5 | 1,3e-5 | 8,9e-6 | 5,9e-6 | 4,0e-6 | 1,8e-6 | 5,2e-7 | 1,0e-7 | 1,0e-8 (sàn) |
 
 Stage 1 dùng **một bộ đếm chung cho cả hai nhóm** (attn và ffn), vì val là
 **một** con số — không có cách nào nói nhóm nào làm nó xấu đi, nên tách hai bộ
@@ -337,10 +382,10 @@ tiêu DINO chứ không tả lịch lr.
 
 **Cái ĐUÔI sau patience.** Khi `patience` epoch liên tiếp val không cải thiện,
 giai đoạn **không dừng ngay**: nó chạy thêm `tail_epochs` epoch với **cosine từ
-lr đang chạy (đã gồm mọi lần chia của chặng 5) về `lr_min`**, rồi mới lấy checkpoint tốt nhất theo val. Epoch ấy
-là một lần "hạ cánh": nó cho phép trọng số rơi vào đáy gần nhất của vùng nó đang
-ở, và điểm val của nó vẫn được đem so với kỷ lục cũ — nên nếu nó tệ hơn thì
-`best` vẫn là epoch cũ, không mất gì.
+lr đang chạy (đã gồm mọi lần chia của chặng 5) về `lr_min`**, rồi mới lấy
+checkpoint tốt nhất theo val. Epoch ấy là một lần "hạ cánh": nó cho phép trọng
+số rơi vào đáy gần nhất của vùng nó đang ở, và điểm val của nó vẫn được đem so
+với kỷ lục cũ — nên nếu nó tệ hơn thì `best` vẫn là epoch cũ, không mất gì.
 
 `lr_from` của đuôi là lr **thật** của bước cuối đã chạy — tức đã gồm mọi lần
 chia của chặng 5. Lấy `lr_max` gõ tay là để lr nhảy **lên** mấy nấc rồi mới đi
@@ -351,34 +396,44 @@ xuống, đúng ngược với ý "hạ cánh".
 | Mô tả | Chỉ huấn luyện **Extractor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Biến Extractor thành module học đặc trưng chất lượng cao trên miền CXR |
-| lr | `lr_min=1e-8` · `lr_max=1e-5` (warm-up 1 epoch rồi **giữ** `lr_max`) |
+| lr | `lr_min=1e-8` · `lr_max=2e-5` (warm-up 1 epoch rồi **giữ** `lr_max`) |
 | Epoch | `50` (trần) |
-| Chặng 5 | mỗi epoch val không cải thiện → lr ÷ `3` (sàn `lr_min`), val khá lên thì giữ nguyên |
-| Patience | `3` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
-| Điểm xuất phát | Nạp lại trọng số pretrain DINOv3 rồi finetune tiếp |
+| Chặng 5 | mỗi epoch val không cải thiện → lr ÷ `1,5` (sàn `lr_min`), val khá lên thì giữ nguyên |
+| Patience | `4` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
+| Điểm xuất phát | Nạp lại trọng số pretrain rồi finetune tiếp |
 
 ```
 ảnh CXR ─► multi-crop: 2 global 448² (→ 28×28) + 6 local 224² (→ 14×14)
-        ─► student = FocalNet-Small LRF (IN-1k) + DINO head ─┐
-        ─► teacher = EMA(student), CHỈ thấy 2 global      ┴─► CE(t ‖ s) = loss
+        ─► student = InternImage-L (IN-22k, stage 3) + DINO head ─┐
+        ─► teacher = EMA(student), CHỈ thấy 2 global            ┴─► CE(t ‖ s) = loss
 ```
 
-**"Load lại training state của pretrain" nghĩa là gì ở đây.** Checkpoint DINOv3
-mà Facebook phát hành chỉ có **trọng số** — không optimizer, không center, không
+**"Load lại training state của pretrain" nghĩa là gì ở đây.** Checkpoint mà
+OpenGVLab phát hành chỉ có **trọng số** — không optimizer, không center, không
 teacher EMA riêng. Nên Stage 0 nạp trọng số ấy vào **cả student lẫn teacher**,
-dựng DINO head / optimizer / center mới, rồi chạy tiếp **chính hàm mục tiêu
-DINO** trên miền ảnh CXR. `pretrained: false` bị **từ chối** — finetune một
-backbone ngẫu nhiên trả lời một câu hỏi khác hẳn.
+dựng DINO head / optimizer / center mới, rồi chạy **hàm mục tiêu DINO** trên
+miền ảnh CXR. `pretrained: false` bị **từ chối** — finetune một backbone ngẫu
+nhiên trả lời một câu hỏi khác hẳn.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor (**60,12 M**) + một DINO head (**6,82 M**) = **66,95 M**, và **teacher
-EMA là một bản sao đầy đủ nữa trong VRAM**. Thứ duy nhất còn cần từ model là
-`d_model` (2560), đọc từ `AutoConfig` (một file json, không tải trọng số).
+Extractor (**115,66 M**) + một DINO head (**7,09 M**) = **122,75 M**, và
+**teacher EMA là một bản sao đầy đủ nữa trong VRAM**. Thứ duy nhất còn cần từ
+model là `d_model` (2560), đọc từ `AutoConfig` (một file json, không tải trọng
+số).
 
-**`pool: mean`.** ConvNeXt không có cls token, nên DINO head đọc **trung bình
-196 ô** của lưới. `pool: cls` bị **từ chối ngay lúc dựng backbone**, không lặng
+> **Đây là giai đoạn ĐẮT NHẤT của cả thí nghiệm, và nó đắt hơn bản trước.**
+> Multi-crop nhân số lượt forward lên `2 + n_local` = **8** cho student cộng 2
+> lượt `no_grad` cho teacher, trên một backbone **2,3× lớn hơn** FocalNet-Small
+> và chạy DCNv3 bằng **PyTorch thuần** (9 điểm `grid_sample` mỗi vị trí). Hai
+> khoá để trả giá: `configs/gpu/<card>.yaml` → `stage0.micro_batch` (autobatch
+> dò lại từ đó), và `vextractor.extractor.with_cp: true` (gradient
+> checkpointing trong từng `InternImageLayer` — đổi ~30% thời gian lấy phần lớn
+> activation).
+
+**`pool: mean`.** InternImage không có cls token, nên DINO head đọc **trung bình
+784 ô** của lưới. `pool: cls` bị **từ chối ngay lúc dựng backbone**, không lặng
 lẽ rơi về `mean`: config nói một đằng chạy một nẻo là thứ không bao giờ tự lộ
-ra. `pool_feature` cũng **nhận `fmt`** thay vì đoán từ `f.dim()`.
+ra. `pool_feature` cũng **nhận `fmt`** (`NHWC`) thay vì đoán từ `f.dim()`.
 
 **Bốn thứ giữ DINO khỏi sụp về một điểm**, và cả bốn đều phải có: (1) teacher là
 **EMA** của student, momentum cosine 0.996 → 1, không nhận gradient; (2)
@@ -418,11 +473,11 @@ dùng bản này. Không có đuôi thì `final/` trùng `base/` từng bit.
 | Mô tả | Chỉ huấn luyện **Compressor** với dữ liệu MIMIC-CXR hiện tại |
 |---|---|
 | Mục tiêu | Làm giàu không gian Compressor trước khi đưa vào Aligner → Concat |
-| lr (Attn) | `lr_min=1e-8` · `lr_max=1e-5` |
-| lr (FFN) | `lr_min=1e-7` · `lr_max=1e-4` |
-| Epoch | `20` (trần); warm-up 1 epoch rồi **giữ** `lr_max` của từng nhóm |
-| Chặng 5 | mỗi epoch val không cải thiện → **cả hai nhóm** ÷ `3` (sàn `lr_min` của từng nhóm) |
-| Patience | `3` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
+| lr (Attn) | `lr_min=1e-8` · `lr_max=3e-5` |
+| lr (FFN) | `lr_min=1e-7` · `lr_max=3e-4` |
+| Epoch | `30` (trần); warm-up 1 epoch rồi **giữ** `lr_max` của từng nhóm |
+| Chặng 5 | mỗi epoch val không cải thiện → **cả hai nhóm** ÷ `1,5` (sàn `lr_min` của từng nhóm) |
+| Patience | `4` — đạt patience thì cosine decay từ lr **hiện tại** về `lr_min` thêm 1 epoch rồi mới lấy best val |
 | Nhãn | DINOv3 Teacher (Extractor Stage 0) + Head Infer (Stage 0) sinh nhãn chuẩn DINOv3 |
 
 ```
@@ -441,18 +496,20 @@ thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đ
 phải nén gì cả.
 
 **HAI nhóm lr, và đó là điểm riêng của Stage 1.** Ma trận attention quyết định
-8 vector **đọc ở đâu** trên lưới 196 ô, và đó là thứ dễ hỏng nhất khi bị đẩy
+8 vector **đọc ở đâu** trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi bị đẩy
 nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay lại. FFN
 thì chỉ biến đổi thứ đã đọc được, nên nó chịu được một mức cao hơn — ở đây cao
-hơn **10 lần** (1e-4 so với 1e-5), không phải 1,4 lần như bản trước. `latent` +
-mọi RMSNorm + DINO head mới đi theo **nhóm FFN** — đặc tả chỉ khai hai nhóm, nên
-chỗ để chúng phải nói ra chứ không để ngầm.
+hơn **10 lần** (3e-4 so với 3e-5). `latent` + mọi RMSNorm + DINO head mới đi
+theo **nhóm FFN**: đặc tả chỉ khai hai nhóm, nên chỗ để chúng phải nói ra chứ
+không để ngầm. Ở `N = 4` hai nhóm lệch nhau khá xa về khối lượng —
+**27,53 M** attn so với **9,46 M** ffn — nên "hai nhóm" ở đây không phải hai
+nửa bằng nhau.
 
 **HAI view, và đúng hai**: teacher một global 448², student một global 448²
 **khác** (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng
-yên nên thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 196 ô
-nên local crop 224² sẽ bị **từ chối ồn ào** chứ không lặng lẽ chạy trên lưới mịn
-hơn.
+yên nên thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô
+nên local crop 224² sẽ bị **từ chối ồn ào** chứ không lặng lẽ chạy trên lưới
+thô hơn.
 
 **`mean(V_c)` — trung bình 8 vector.** DINO head cần một vector mỗi ảnh, và 8
 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong đó). Lấy
@@ -464,7 +521,7 @@ của `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy h
 nhau mà không ai thấy. Khối `stage1` chỉ khai **lịch học**.
 
 **Cái giá của Stage 1, và nó có thật.** Nó chỉ dạy Compressor bắt chước một phép
-pool của teacher, nên nó **không** biết gì về báo cáo và không trả lời được "32
+pool của teacher, nên nó **không** biết gì về báo cáo và không trả lời được "8
 vector ấy có mang thông tin bệnh lý chưa". Thứ nó mua là một điểm khởi đầu
 **không ngẫu nhiên** cho Compressor, để 200 bước của main stage không phải vừa
 học nén ảnh vừa học viết báo cáo cùng lúc.
@@ -474,32 +531,53 @@ học nén ảnh vừa học viết báo cáo cùng lúc.
 Dùng **lịch r32 của $1**: cùng fixture, thứ tự `randperm(seed)`, batch mỗi lượt
 đã khoá, 1 epoch = 200 bước, LoRA one-cycle đỉnh 1e-4, wd 0.01, và cùng cách đo
 val (CE trên 256 mẫu bốc lại mỗi 25 bước). **Riêng LoRA giữ nguyên cấu hình hiện
-tại.** Phần thêm:
+tại.** Phần thêm là **BỐN nhóm lr** trên hai khối:
+
+| nhóm | lr | mốc |
+|---|---|---|
+| Aligner · FFN (SwiGLU + 2 RMSNorm) | `1e-6` → `1e-4` | warm-up 10% tổng bước rồi PHẲNG |
+| Aligner · Attn (4 chiếu MHAttn) | `1e-7` → `1e-5` | warm-up 10% tổng bước rồi PHẲNG |
+| Compressor · FFN | `1e-7` → `1e-5` | freeze 20% → warm-up 10% → PHẲNG |
+| Compressor · Attn | `1e-8` → `1e-6` | freeze 20% → warm-up 10% → PHẲNG |
+
+**Attn thấp hơn FFN đúng 10 lần ở CẢ HAI khối**, và lý do là một: ma trận
+attention quyết định 8 vector đọc/trộn **ở đâu**, còn FFN chỉ biến đổi thứ đã
+đọc xong. Đó chính là lý do đã tách hai nhóm ở Stage 1, dịch nguyên sang main
+stage — `zcfg` **từ chối** cấu hình đảo dấu (`attn_lr_main > ffn_lr_main`), vì
+đảo lại là đảo đúng lý do tách nhóm.
+
+**Bốn nhóm ấy PHỦ KÍN hai khối.** `attn_parameters()` + `ffn_parameters()` của
+mỗi khối là một **phân hoạch** (selftest so bằng `id()`), và `train` **dừng**
+nếu tổng số tensor của bốn nhóm không bằng số tensor của Compressor + Aligner:
+một tham số học được nằm ngoài optimizer là một tensor đứng yên suốt 200 bước
+mà không có gì báo. Optimizer cũng đặt lr **theo TÊN nhóm**, không theo chỉ số
+— chèn một nhóm vào giữa thì chỉ số đổi im lặng và hai khối đổi lịch cho nhau.
 
 ### a. Aligner
 
 | Mục tiêu | Học cách biến tín hiệu đặc trưng thị giác sang không gian ngữ nghĩa |
 |---|---|
-| lr | `lr_min=1e-6` → `lr_main=1e-4`, warm-up trong **10%** tổng step rồi PHẲNG |
 | Lịch trình | Training **đồng thời với LoRA từ đầu** |
 
 Aligner là ma trận ngẫu nhiên kẹp giữa một encoder đã dạy xong (Stage 0 + Stage
 1) và một decoder đã dạy xong ($1). Bước Adam đầu tiên ở lr đầy đủ trên một ma
 trận ngẫu nhiên là cách chắc chắn nhất để Q lệch hẳn khỏi phân phối mà LoRA đang
-học cùng lúc — nên nó cần dốc, dù chỉ 20 bước.
+học cùng lúc — nên nó cần dốc, dù chỉ 20 bước. Cả hai nhóm của nó dùng **cùng
+một dốc** (`align_warmup_frac`): chúng nằm trong cùng một khối ngẫu nhiên và
+phải đi vào cùng một lúc.
 
 ### b. Compressor
 
 | Mục tiêu | Học cách xử lý đặc trưng đã có theo tín hiệu từ LoRA → Aligner |
 |---|---|
-| lr | `lr_min=1e-8` → `lr_main=7e-6` |
 | Lịch trình | 1. Freeze hoàn toàn trong **20%** step đầu. 2. Unfreeze và warm-up trong **10%** step rồi fix cứng `lr_main` |
 
 Tín hiệu mà Compressor phải học *theo* chưa tồn tại ở bước 0 — Aligner còn ngẫu
 nhiên và LoRA chưa đi được đâu — nên 20% bước đầu là thời gian để nó xuất hiện.
 `requires_grad=False` chứ không phải lr = 0: Compressor là khối học được **đầu
 tiên** sau Extractor, nên tắt grad ở đó **cắt hẳn** phần backward bên dưới
-Aligner — tiết kiệm thật, không chỉ là không cập nhật.
+Aligner — tiết kiệm thật, không chỉ là không cập nhật. Vì `requires_grad` tắt cả
+khối, hai nhóm của nó **không thể** mở ở hai thời điểm khác nhau dù có muốn.
 
 **Mốc khai theo TỈ LỆ, không theo số bước tuyệt đối.** Main stage khoá 1 epoch =
 200 bước theo $1, nhưng `--dry-run` và mọi lần đổi `train_batch` đổi con số ấy.
@@ -518,11 +596,12 @@ nằm trong optimizer**. 0 bước cập nhật, 0 gradient, 0 activation đư�
 * Autobatch dò VRAM ở **đúng** trạng thái của vòng lặp.
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: **8 token** thêm vào chuỗi **cộng** một lượt FocalNet-Small 4
-  stage ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` nên phần nặng còn lại
-  là Cross-attn của 8 latent trên **196 ô**. Nếu batch đã khoá không vừa VRAM,
-  micro-batch được chạy thành từng mảnh và CE được ghép lại theo token; kết quả
-  đúng bằng con số HF tính trên cả micro-batch, nên gradient không đổi.
+* B nặng hơn A: **8 token** thêm vào chuỗi **cộng** một lượt InternImage-L
+  (3 stage, DCNv3 PyTorch) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` nên
+  phần nặng còn lại là Cross-attn của 8 latent trên **784 ô**. Nếu batch đã khoá
+  không vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo
+  token; kết quả đúng bằng con số HF tính trên cả micro-batch, nên gradient
+  không đổi.
 * **Stage 0 thì ngược lại nặng hơn hẳn**: multi-crop nhân số lượt forward lên
   (2 + `n_local`) cho student cộng 2 lượt `no_grad` cho teacher, nên
   `stage0.micro_batch` ở config GPU chỉ là khởi điểm.
@@ -607,7 +686,9 @@ RGEXP_REMOTE=1 bash scripts/setup.sh        # ép chế độ container (không 
 RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh # nâng torch (~2.5 GB) thay vì ghim transformers
 ```
 
-Lần chạy đầu còn tải thêm `focalnet_small_lrf.ms_in1k` (~200 MB) từ HF.
+Lần chạy đầu còn tải thêm `OpenGVLab/internimage_l_22k_384` (~1,05 GB) từ HF,
+kèm ba file `.py` của `trust_remote_code` (~60 KB). Không phải biên dịch
+extension DCNv3 nào: bản PyTorch luôn được dùng (xem §1.1).
 
 ### 1–4. Thí nghiệm
 
@@ -681,7 +762,8 @@ current/$2.2_V-Extractor_Test/weights/qlora_r32_decoder_vextractor/
 Weight của A vẫn ở `current/$1_LoRA_Test/weights/qlora_r32_decoder/`.
 
 **Hai vân tay, hai phạm vi.** Vân tay Stage 0 chỉ đọc `vextractor.extractor`
-(`arch`, `pretrained`, `n_layers`, `n_stages` + phép chuẩn hoá suy từ `arch`),
+(`arch`, `pretrained`, `n_layers`, `n_stages` + phép chuẩn hoá suy từ `arch`;
+`with_cp` và `image_size` KHÔNG vào — chúng đổi chi phí, không đổi tensor nào),
 khối `stage0` và `seed` — **không** gồm `compressor` / `aligner` / `main`, vì
 Stage 0 không dựng những thứ ấy. Vân tay Stage 1 thêm **hình dạng Compressor**
 và **vân tay Stage 0** (đổi teacher là đổi nhãn). Và cả hai cổng so **nội dung**
@@ -700,11 +782,12 @@ src/schedule.py          LỊCH DÙNG CHUNG: warmup_flat (dốc 1 epoch rồi GI
                          plateau_lr (chặng 5: ÷1,5 mỗi epoch val hỏng, sàn lr_min) ·
                          phase_of/phase_span · tail_lr · frozen_warmup_flat
                          — một chỗ duy nhất viết công thức
-src/vextractor.py        Extractor (ConvNeXt DINOv3, ladder dựng model có probe forward thật,
-                         NCHW/NHWC/NLC, cắt stage) + Compressor (QFormer: 8 latent @1024,
+src/vextractor.py        Extractor — HAI đường dựng: InternImage (HF, trust_remote_code,
+                         cắt .model.levels, NHWC) hoặc timm (ladder có probe forward thật,
+                         NCHW/NHWC/NLC, cắt .stages) + Compressor (QFormer: 8 latent @768,
                          N nhóm × [SelfAttn → CrossAttn → SwiGLU │ SelfAttn → SwiGLU],
-                         kv 512→768 trong Cross-attn) + Aligner (RMSNorm(768) +
-                         SwiGLU 1024→4096→2560, init 1/√fan_in) · vext_tensor · ghi/nạp checkpoint
+                         kv 640→768 trong Cross-attn) + Aligner (MHAttn(768) +
+                         SwiGLU 768→2048→2560, init 1/√fan_in) · vext_tensor · ghi/nạp checkpoint
 src/dino.py              DINO: multi-crop (PIL), DINO head, teacher EMA, center,
                          lịch τ_t / momentum · CompressorTransferTrainer (Stage 1)
 src/stage0_vextractor.py Stage 0 — DINO tự giám sát (KHÔNG nạp Gemma, KHÔNG nhãn) + loader.json

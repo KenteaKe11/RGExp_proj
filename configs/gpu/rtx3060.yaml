@@ -35,13 +35,18 @@ set:
   # nâng (nó là một phần lịch học của A). Stage 0 thì không có decoder, không
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
-  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor 60,1 M tham số VỚI
-  # lưới 196 ô, nhân thêm (2 + n_local) lượt forward của multi-crop, làm
+  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor 115,7 M tham số VỚI
+  # lưới 784 ô (và DCNv3 bản PyTorch trải 9 điểm `grid_sample` mỗi vị trí),
+  # nhân thêm (2 + n_local) lượt forward của multi-crop, làm
   # activation của Stage 0 nặng rõ — nên 16 chỉ là KHỞI ĐIỂM, autobatch dò lại.
   # Stage 1 nhẹ hơn hẳn (Extractor chạy no_grad, chỉ Compressor có gradient) và
   # đọc khoá riêng `stage1.micro_batch` ở configs/vextractor.yaml.
-  stage0.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
-  stage0.probe_sizes: [4, 8, 16]  # điểm ĐO riêng của Stage 0 (main stage dùng
+  # 8, không 16: backbone nặng hơn ~2,3× bản trước và DCNv3 bản PyTorch giữ
+  # nhiều activation hơn hẳn. Đây chỉ là KHỞI ĐIỂM — autobatch dò lại — nhưng
+  # khởi điểm quá cao là một lượt OOM trước khi nó dò được.
+  # Vẫn OOM thì bật `vextractor.extractor.with_cp: true`.
+  stage0.micro_batch: 8           # khởi điểm; autobatch dò lại (ước của 32)
+  stage0.probe_sizes: [2, 4, 8]   # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy tới 16/32 mới
                                   # đúng; dùng chung [2,4,8] là luôn ra micro thấp.
