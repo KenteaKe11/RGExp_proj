@@ -781,6 +781,128 @@ def _():
         sys.modules.pop(mod.__name__, None)
 
 
+@check("2h. đường FlashInternImage (DCNv4): nhận diện arch, biến thể phải ĐỌC từ "
+       "config, cắt .levels (chuỗi) + BỎ conv_head, và thiếu toán tử thì DỪNG có chỉ dẫn")
+def _():
+    """Đường backbone THỨ BA, và nó khác hai đường kia ở mọi khâu.
+
+    Bài này chạy OFFLINE và KHÔNG cần toán tử DCNv4 (container/CI không biên
+    dịch được nó). Thứ được kiểm là phần có thể kiểm mà không cần kernel:
+
+      * `arch` chọn đúng đường nào — `flash_intern_image_*` KHÔNG được rơi vào
+        nhánh `is_internimage` và ngược lại;
+      * mean/std: đường này là chỗ DUY NHẤT gõ tay một cặp số (checkpoint là
+        `.pth` TRẦN), nên `arch_normalize` phải trả đúng hằng đã ghi nguồn;
+      * biến thể chưa ĐỌC config thì DỪNG — "suy từ họ InternImage" là cách một
+        con số sai đi vào mà không ai thấy;
+      * lát cắt trên model CHUỖI: `levels` bị cắt, `downsample` cuối bị bỏ, và
+        `conv_head` bị bỏ (FlashInternImage dựng nó DÙ `num_classes=0`);
+      * thiếu toán tử -> `VExtractorUnusable` có LỆNH CÀI, không phải một
+        ImportError trần giữa lúc nạp Stage 0.
+    """
+    import torch
+    import torch.nn as nn
+
+    from src import vextractor as R
+
+    A = "flash_intern_image_l_22k_384"
+    assert R.is_flash_internimage(A)
+    assert R.is_flash_internimage("flash_intern_image_b_1k_224")
+    # HAI predicate phải RỜI NHAU: "flash_intern_image" không chứa "internimage"
+    assert not R.is_internimage(A)
+    assert not R.is_flash_internimage("OpenGVLab/internimage_l_22k_384")
+    assert not R.is_flash_internimage(SMALL_ARCH)
+
+    # mean/std: hằng có nguồn, và `arch_normalize` đi đúng nhánh
+    assert R.arch_normalize(A) == R.FLASH_II_NORMALIZE
+    assert R._flash_internimage_normalize(A) == R.FLASH_II_NORMALIZE
+
+    # biến thể: chỉ `l` đã đọc config thật
+    assert R._flash_ii_variant(A) == (160, [5, 5, 22, 5], [10, 20, 40, 80])
+    for unread in ("flash_intern_image_b_1k_224", "flash_intern_image_t_1k_224",
+                   "flash_intern_image"):
+        try:
+            R._flash_ii_variant(unread)
+        except R.VExtractorUnusable as e:
+            assert "biến thể" in str(e) and "GROUPS" in str(e), e
+        else:
+            raise AssertionError(f"{unread}: biến thể chưa khai phải bị từ chối")
+
+    # ── lát cắt trên một model CHUỖI giả (không cần DCNv4) ────────────────
+    class Level(nn.Module):
+        def __init__(self, c, depth, down):
+            super().__init__()
+            self.blocks = nn.ModuleList([nn.Linear(c, c) for _ in range(depth)])
+            self.downsample = (nn.Linear(c, 2 * c) if down else None)
+
+        def forward(self, x, return_wo_downsample=False, shape=None):
+            for b in self.blocks:
+                x = b(x)
+            x_ = x
+            if self.downsample is not None:
+                n, ll, c = x.shape
+                h, w = shape
+                x = self.downsample(x).view(n, ll, 2 * c)
+                x = x.view(n, h // 2, w // 2, -1).reshape(n, ll // 4, -1) \
+                    if False else x[:, :ll // 4].contiguous()
+                shape = (h // 2, w // 2)
+            return (x, x_, shape) if return_wo_downsample else (x, shape)
+
+    C, NL = 8, 4
+    net = nn.Module()
+    net.patch_embed = (lambda: None)          # thay ngay dưới
+    _pe = nn.Conv2d(3, C, 4, stride=4)
+    net.patch_embed = type("PE", (nn.Module,), {
+        "forward": lambda self, x: _pe(x).permute(0, 2, 3, 1)})()
+    net.patch_embed.conv = _pe
+    net.levels = nn.ModuleList([Level(C * 2 ** i, 2, i < NL - 1)
+                                for i in range(NL)])
+    net.num_levels = NL
+    net.conv_head = nn.Sequential(nn.Conv2d(C * 2 ** (NL - 1), 16, 1))
+    n_full = sum(p.numel() for p in net.parameters())
+
+    body = R.FlashInternImageBody(net, 3)
+    assert body.output_fmt == "NHWC" and body.n_stages_used == 3
+    assert len(body.net.levels) == 3
+    assert body.net.levels[-1].downsample is None          # (1) không hạ nữa
+    keys = " ".join(k for k, _ in body.named_parameters())
+    assert "levels.3" not in keys                           # (2) XOÁ, không bỏ không gọi
+    assert "conv_head" not in keys                          # (3) và conv_head cũng vậy
+    assert sum(p.numel() for p in body.parameters()) < n_full
+    with torch.no_grad():
+        f = body.forward_features(torch.zeros(1, 3, 64, 64))
+    assert f.dim() == 4 and f.shape[-1] == C * 4, tuple(f.shape)
+
+    for n_bad in (0, 5):
+        try:
+            R.FlashInternImageBody(nn.Module(), n_bad)
+        except R.VExtractorUnusable as e:
+            assert "levels" in str(e) or "stage" in str(e)
+        else:
+            raise AssertionError(f"n_stages = {n_bad} phải bị từ chối")
+
+    # ── thiếu toán tử -> DỪNG với LỆNH CÀI ───────────────────────────────
+    try:
+        import DCNv4  # noqa: F401
+    except Exception:
+        try:
+            R.flash_internimage_body(A, False, 448, None, 3, True)
+        except R.VExtractorUnusable as e:
+            msg = str(e)
+            assert "DCNv4" in msg and "no-build-isolation" in msg, msg
+            # và phải chỉ ra ĐƯỜNG LÙI, vì đường DCNv3 vẫn còn trong code
+            assert "internimage_l_22k_384" in msg, msg
+        else:
+            raise AssertionError("thiếu DCNv4 mà vẫn dựng được?!")
+    # `n_layers` bị từ chối TRƯỚC cả khi cần tới toán tử
+    try:
+        R.flash_internimage_body(A, False, 448, 3, 3, False)
+    except R.VExtractorUnusable as e:
+        assert "n_layers" in str(e), e
+    else:
+        raise AssertionError("n_layers phải bị từ chối")
+
+
 @check("3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ")
 def _():
     import json
@@ -2249,9 +2371,11 @@ def _():
         raise AssertionError(
             "không dựng được nhánh từ configs/vextractor.yaml, nên bài này "
             "KHÔNG nói được README có khớp code hay không. Extractor "
-            "InternImage nạp qua `trust_remote_code`: với `pretrained=False` "
-            "nó chỉ cần `config.json` + ba file .py (~60 KB, có cache), nhưng "
-            "LẦN ĐẦU vẫn cần mạng.\n"
+            "backbone của config này có thể cần: (a) toán tử DCNv4 đã BIÊN "
+            "DỊCH nếu `arch` là `flash_intern_image_*` — không có đường lùi "
+            "PyTorch nào; hoặc (b) mạng ở LẦN ĐẦU nếu `arch` là một repo "
+            "`trust_remote_code` (`config.json` + ba file .py, ~60 KB, sau đó "
+            "có cache).\n"
             f"    Lý do thật: {e}") from e
     ex, cp, al = br.extractor, br.compressor, br.aligner
     dc = cfg["stage0"]["dino"]

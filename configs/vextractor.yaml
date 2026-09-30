@@ -313,7 +313,7 @@ labels:
 # NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-#   ảnh 448² ─► 1. EXTRACTOR  InternImage-L (ImageNet-22k), CẮT ở stage 3
+#   ảnh 448² ─► 1. EXTRACTOR  FlashInternImage-L (DCNv4, IN-22k), CẮT stage 3
 #                             (B,3,448,448) -> (B,28,28,640) -> V (B,784,640)
 #            ─► 2. COMPRESSOR QFormer, 8 latent @768, N = 4 nhóm khối
 #                             -> V_c (B,8,768)
@@ -329,9 +329,10 @@ labels:
 #   main     Aligner + LoRA (từ bước 0), rồi Compressor (sau 20% bước)
 #
 # ── 1. EXTRACTOR ─────────────────────────────────────────────────────────────
-# `OpenGVLab/internimage_l_22k_384` cắt ở stage 3 — **115 662 210 tham số ĐO
-# ĐƯỢC** (đặc tả ghi ~115.57M; lệch 0,09 M là phần bias của LayerNorm/conv mà
-# một phép nhẩm hay bỏ).
+# `flash_intern_image_l_22k_384` cắt ở stage 3 — **115 637 280 tham số ĐO ĐƯỢC**
+# (đặc tả ghi ~115.57M; lệch 0,07 M là phần bias của LayerNorm/conv mà một phép
+# nhẩm hay bỏ). Đường DCNv3 cũ là 115 662 210: hai họ chênh đúng 24 930 tham số,
+# vì DCNv4 gộp offset+mask vào một Linear và bỏ LayerNorm + GELU trong dw_conv.
 #
 # ⚠ InternImage là một CNN, KHÔNG phải transformer: lõi là DCNv3 (deformable
 # conv v3) — mỗi vị trí học group × 9 cặp offset + một mask softmax rồi lấy mẫu
@@ -454,11 +455,27 @@ labels:
 vextractor:
   extractor:                # ảnh (3,448,448) -> V (784, 640)
     image_size: 448         # stem/4 rồi 2 × /2 trước stage 3 -> stride 16; 448/16 = 28 -> 784 ô
-    # Hugging Face + trust_remote_code; lần chạy đầu tải ~1,05 GB trọng số và
-    # ~60 KB code. InternImage-L cắt ở stage 3: 115 662 210 tham số ĐO ĐƯỢC.
-    # Xem ⚠ ở trên: đây là CNN (DCNv3), không phải transformer; kernel CUDA
-    # không bao giờ được dùng; và trọng số nền là CÓ GIÁM SÁT ImageNet-22k.
-    arch: OpenGVLab/internimage_l_22k_384
+    # FlashInternImage-L (DCNv4) cắt ở stage 3: 115 637 280 tham số ĐO ĐƯỢC.
+    # `arch` CHÍNH LÀ tên file checkpoint trên `OpenGVLab/DCNv4`
+    # (-> `flash_intern_image_l_22k_384.pth`, ~1,25 GB ở lần chạy đầu), còn code
+    # model là bản VENDOR ghim commit ở `src/vendor/` (xem NOTICE.md ở đó).
+    #
+    # ⚠⚠ KHÁC DCNv3 Ở MỘT ĐIỂM SỐNG CÒN: **không có đường lùi PyTorch.**
+    # `flash_intern_image.py` `import DCNv4` TRẦN và `dcnv4_func.py` lại
+    # `from DCNv4 import ext` ở tầng module, nên thiếu extension CUDA đã biên
+    # dịch thì nó chết ngay lúc IMPORT. PyPI chỉ có sdist (1.0.0.post2,
+    # 01/2024), phải build bằng nvcc:
+    #     TORCH_CUDA_ARCH_LIST=<sm của card> pip install --no-build-isolation DCNv4==1.0.0.post2
+    # (`--no-build-isolation` BẮT BUỘC: setup.py của nó `import torch` lúc build)
+    #
+    # Cái mua được: DCNv4 là kernel FUSED — nó KHÔNG materialize tensor
+    # (N·group, H·W, group_channels, 9) mà bản PyTorch của DCNv3 giữ cho
+    # backward ở MỖI block, tức đúng thứ làm Stage 0 hết 16 GB VRAM.
+    #
+    # Không build được? Trả khoá này về `OpenGVLab/internimage_l_22k_384`:
+    # đường DCNv3 (trust_remote_code) vẫn còn nguyên và chạy ở MỌI máy — kiến
+    # trúc y hệt, V vẫn (784, 640), chỉ chênh 24 930 tham số (0,02%).
+    arch: flash_intern_image_l_22k_384
     pretrained: true        # false bị TỪ CHỐI ở `stage0.run`: chạy DINO từ trọng
                             # số ngẫu nhiên chỉ ra một backbone ngẫu nhiên khác.
                             # (false VẪN dựng được — và dựng CHỈ từ config.json,

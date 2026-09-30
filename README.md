@@ -30,7 +30,7 @@ lệch).
                   └─► resize 448×448, chuẩn hoá theo preprocessor_config  [đường RIÊNG]
                          │
    ┌─────────────────────▼───────────────────────────────────┐
-   │ 1. EXTRACTOR — InternImage-L (IN-22k), CẮT ở stage 3     │  Stage 0 dạy
+   │ 1. EXTRACTOR — FlashInternImage-L (DCNv4), CẮT stage 3     │  Stage 0 dạy
    │    (B,3,448,448) ─► (B,28,28,640) ─► V = (784, 640)      │
    └─────────────────────┬───────────────────────────────────┘
                          │ V
@@ -59,28 +59,64 @@ lệch).
 
 | | dạy | đứng yên | hàm mục tiêu |
 |---|---|---|---|
-| **Stage 0** | Extractor (**115,66 M**) | — | DINO tự giám sát (teacher = EMA, multi-crop) từ init ImageNet-22k |
+| **Stage 0** | Extractor (**115,64 M**) | — | DINO tự giám sát (teacher = EMA, multi-crop) từ init ImageNet-22k |
 | **Stage 1** | Compressor (**36,98 M**) | Extractor (teacher Stage 0) | CE với phân phối prototype của teacher — teacher **đóng băng hoàn toàn** |
 | **main** | Aligner (**10,75 M**) + LoRA từ bước 0; Compressor sau 20% bước | Extractor | CE trên báo cáo thật |
 
 ---
 
-## 1.1. Extractor — `OpenGVLab/internimage_l_22k_384`, `n_stages: 3`
+## 1.1. Extractor — `flash_intern_image_l_22k_384`, `n_stages: 3`
 
-**InternImage là một CNN, không phải một transformer.** Lõi của nó là **DCNv3**
-— deformable convolution v3: mỗi vị trí học `group × 9` cặp *offset* và một
-*mask* softmax, rồi lấy mẫu lưới bằng `grid_sample`. Nên nó có trường thu nhận
-thích nghi như attention nhưng chi phí tuyến tính theo số ô, và nó **không có
-pos-embed để nội suy, không có cửa sổ để đệm, không có cls token**.
+**FlashInternImage là một CNN, không phải một transformer.** Lõi của nó là
+**DCNv4** — deformable convolution v4: mỗi vị trí học `group × 9` *offset* và
+*mask* (gộp vào MỘT `Linear`, và **bỏ softmax** trên mask của DCNv3), rồi lấy
+mẫu lưới trong một kernel FUSED. Nên nó có trường thu nhận thích nghi như
+attention nhưng chi phí tuyến tính theo số ô, và nó **không có pos-embed để nội
+suy, không có cửa sổ để đệm, không có cls token**.
 
-> **⚠ Backbone này KHÔNG nạp qua timm.** timm không có InternImage. Nó đến từ
-> Hugging Face bằng `trust_remote_code=True` (`AutoModel` -> `InternImageModel`),
-> tức ba file `.py` của OpenGVLab được tải và **chạy**. `backbone_body` vì thế
-> có HAI đường: `is_internimage(arch)` chọn `internimage_body` (HF), còn lại đi
-> đường timm cũ. Hai họ, hai cách cắt: `.model.levels` so với `.stages`.
+**Thân của nó chạy trên CHUỖI, không trên lưới.** DCNv4 nhận `(N, L, C)` cộng
+`shape = (H, W)` RỜI, nên `FlashInternImageBody` làm phẳng lưới ngay sau
+`patch_embed` rồi luồn `shape` qua từng level; mỗi `downsample` trả về `shape`
+mới. Đó là khác biệt bố cục lớn nhất so với đường DCNv3 — và là lý do lát cắt
+phải chép đúng vòng lặp của upstream thay vì gọi `forward_features` (bản
+upstream chạy hết bốn level rồi qua `conv_head` + `avgpool` và trả về MỘT
+vector, không phải một lưới).
 
-> **⚠ Kernel CUDA của DCNv3 KHÔNG bao giờ được dùng, và đó là tin tốt lẫn tin
-> xấu.** Trong `dcnv3_func.py` của OpenGVLab, `pkg_resources` được `import`
+> **⚠ Backbone này KHÔNG nạp qua timm, cũng KHÔNG qua `trust_remote_code`.**
+> Code model không nằm trong package pip (PyPI chỉ có *toán tử* DCNv4) mà ở
+> thư mục `classification/` của repo GitHub, vốn không phải một package cài
+> được — nên nó được **VENDOR** nguyên văn vào `src/vendor/flash_intern_image.py`
+> (commit `4b848f7`, sha256 ghim trong `src/vendor/NOTICE.md`). Trọng số là một
+> `.pth` **trần** tải bằng `hf_hub_download` từ `OpenGVLab/DCNv4`.
+>
+> `backbone_body` vì thế có **BA** đường, và `arch` chọn đúng một:
+> `flash_intern_image_*` -> vendor + `.pth`; `*internimage*` ->
+> `trust_remote_code` (DCNv3); còn lại -> timm. Ba họ, ba cách cắt: `.levels`
+> (chuỗi) · `.model.levels` (lưới NHWC) · `.stages`.
+
+> **⚠⚠ KHÔNG có đường lùi PyTorch — và đây là rủi ro vận hành duy nhất của
+> lần đổi này.** `flash_intern_image.py` `import DCNv4` **trần**, và
+> `DCNv4/functions/dcnv4_func.py` lại `from DCNv4 import ext` ở tầng module:
+> thiếu extension CUDA đã biên dịch thì nó chết ngay lúc **import**, không phải
+> lúc forward. PyPI chỉ có **sdist** (1.0.0.post2, 01/2024 — trước Blackwell
+> ~1,5 năm), `setup.py` raise nếu thiếu `CUDA_HOME`, và sm_120 cần nvcc ≥ 12.8:
+>
+> ```bash
+> TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation DCNv4==1.0.0.post2
+> ```
+>
+> `--no-build-isolation` là **bắt buộc**: `setup.py` của nó `import torch` ngay
+> lúc build. Không build được thì trả `vextractor.extractor.arch` về
+> `OpenGVLab/internimage_l_22k_384` — **đường DCNv3 vẫn còn nguyên trong code**
+> và chạy ở mọi máy; kiến trúc y hệt, `V` vẫn `(784, 640)`, chênh đúng 24 930
+> tham số (0,02%).
+>
+> **Cái mua được**: DCNv4 là kernel **fused** — nó không materialize tensor
+> `(N·group, H·W, group_channels, 9)` mà bản PyTorch của DCNv3 giữ cho backward
+> ở **mỗi** block. Đó đúng là thứ đã làm Stage 0 hết 16 GB VRAM.
+>
+> Để so sánh, đường DCNv3 thì ngược lại: **kernel CUDA của nó KHÔNG bao giờ
+> được dùng.** Trong `dcnv3_func.py` của OpenGVLab, `pkg_resources` được `import`
 > **sau** khối `try` đã dùng nó, nên nhánh "có kernel" luôn ném `NameError` và
 > bị `except:` bắt: `has_cuda_kernel` **luôn** là `False` và model luôn chạy
 > `DCNv3_pytorch`. Tin tốt: không phải biên dịch extension nào (đúng thứ hay
@@ -96,7 +132,7 @@ pos-embed để nội suy, không có cửa sổ để đệm, không có cls to
 > giám sát nào. (HF không phát hành bản `l_1k_224`: họ L chỉ có `22k_384` và
 > `22kto1k_384`.)
 
-**`n_stages: 3` — cắt SAU stage 3, dừng ở stride 16 / 640 kênh.** InternImage-L
+**`n_stages: 3` — cắt SAU stage 3, dừng ở stride 16 / 640 kênh.** FlashInternImage-L
 có `channels: 160`, `depths: [5, 5, 22, 5]`, nên bốn stage chạy ở 160 · 320 ·
 **640** · 1280 kênh. Ở 448² (stem /4 rồi hai lần /2 trước khi tới stage 3) lưới
 là **28×28 = 784 ô × 640** — đây là `V`. Lát cắt ấy là một lựa chọn có hai mặt:
@@ -110,8 +146,13 @@ nên nó không phải một lát cắt "cho rẻ".
 lại bị **bỏ** — giữ nó là trả về lưới của stage SAU, nửa độ phân giải và gấp đôi
 kênh; (2) `levels[3]` bị **xoá khỏi `ModuleList`**, không chỉ bỏ không gọi. Tham
 số của một level chết vẫn nằm trong `state_dict`, vẫn đi vào optimizer của
-Stage 0, vẫn được ghi vào checkpoint — và với InternImage-L đó là **95,9 M**
-tham số, nhiều hơn Compressor và Aligner cộng lại.
+Stage 0, vẫn được ghi vào checkpoint — và với FlashInternImage-L đó là
+**95,9 M** tham số, nhiều hơn Compressor và Aligner cộng lại.
+
+**Và `conv_head` cũng phải bị bỏ** — chỗ này FlashInternImage khác
+`InternImageModel` của HF: nó dựng `conv_head` **dù `num_classes=0`** (chỉ
+`head` mới rơi về `nn.Identity`), nên bỏ không gọi là để lại thêm **2,5 M**
+tham số chết (Conv 1280→1920 + BN) đi vào optimizer và vào checkpoint.
 
 **`AutoModel` dựng thân với `num_classes=0`**, nên `conv_head` và `head` không
 tồn tại: 43 M trọng số phân loại 21 841 lớp của checkpoint 22k là khoá **thừa**
@@ -148,13 +189,17 @@ dựng được, và cả đường ống chạy hết trên rác. Đó là lý 
 từng ảnh, không mang theo thống kê chạy nào — nên Stage 0 không cần epoch nào
 để kéo thống kê về ảnh CXR.
 
-**Chuẩn hoá ảnh mean/std ĐÚNG của checkpoint**, đọc từ
-`preprocessor_config.json` của repo (`_internimage_normalize`) — vai của
-`timm.get_pretrained_cfg` ở họ kia. InternImage-L dùng mean/std ImageNet, nhưng
-đó là điều **đọc được**, không phải điều giả định: `body.pretrained_cfg` được
-gắn từ chính nguồn ấy, vì không gắn thì `_check_normalize` rơi về hằng
-`IMAGENET_*` — và cặp số ấy **tình cờ đúng** với checkpoint này, nên một
-checkpoint khác của cùng họ sẽ đi qua cổng kiểm mà không ai thấy.
+**Chuẩn hoá ảnh: đây là chỗ DUY NHẤT của cả nhánh phải GÕ TAY một cặp số, và
+lý do thì đáng nói ra.** Checkpoint là một `.pth` **trần** — nó không mang
+`preprocessor_config.json` nào (đường DCNv3 có), không mang `pretrained_cfg`
+nào (đường timm có). Nên `FLASH_II_NORMALIZE` ghi thẳng cặp số, kèm nguồn chính
+xác: `classification/config.py` @ `4b848f7` dòng 187-188 (`_C.AUG.MEAN` /
+`_C.AUG.STD` = mean/std ImageNet), và `flash_intern_image_l_22kto1k_384.yaml`
+**không** ghi đè hai khoá ấy (`dataset/build.py` gọi
+`transforms.Normalize(AUG.MEAN, AUG.STD)`). `body.pretrained_cfg` vẫn được gắn
+từ chính hằng ấy, để `_check_normalize` so với MỘT nguồn chứ không rơi về
+`IMAGENET_*` — hai cặp số tình cờ bằng nhau là đúng ca mà một cổng kiểm im
+lặng.
 `vextractor.vext_tensor()` là chỗ **duy nhất** dựng ảnh của nhánh và nó **bắt
 buộc** phải nhận mean/std (không có mặc định); `assert_same_pixels` kiểm lại
 trên một mẫu thật mỗi lần chạy.
@@ -302,19 +347,21 @@ xem bài 22).
 
 | khối | tham số |
 |---|---|
-| **Extractor** InternImage-L @448 → `(784, 640)`, `n_stages: 3` | **115,66 M** — *Stage 0 dạy; sau đó teacher inference* |
+| **Extractor** FlashInternImage-L @448 → `(784, 640)`, `n_stages: 3` | **115,64 M** — *Stage 0 dạy; sau đó teacher inference* |
 | RMSNorm(640) trên V | 640 |
 | 8 latent @768 | 6 144 |
 | **1 nhóm khối** (Self ×2 + Cross + SwiGLU ×2 + 5 norm) | **9,24 M** |
 | **Compressor** (N = 4) → `(8, 768)` | **36,98 M** — *Stage 1 dạy* |
 | **Aligner** `MHAttn(768)` + `SwiGLU 768→2048→2560` → Q (8, 2560) | **10,75 M** — *main stage dạy* |
-| **nhánh ở main stage** | **163,40 M**, trong đó **học được 47,73 M** |
+| **nhánh ở main stage** | **163,37 M**, trong đó **học được 47,73 M** |
 | DINO head (CHỈ Stage 0 / Stage 1, bị bỏ sau đó) | **7,09 M** |
-| **Stage 0**: student (Extractor + head) | **122,75 M** *(+ teacher EMA 122,75 M nữa trong VRAM)* |
+| **Stage 0**: student (Extractor + head) | **122,72 M** *(+ teacher EMA 122,72 M nữa trong VRAM)* |
 
-> ⚠ Đặc tả ghi Extractor `~115.57M`; số đo được là **115 662 210**. Lệch
-> **0,09 M** (0,08%) — đúng phần biases của LayerNorm/conv mà một phép nhẩm hay
-> bỏ. Aligner thì khớp tuyệt đối: MHAttn **2 359 296** (đặc tả ~2.36M) +
+> ⚠ Đặc tả ghi Extractor `~115.57M`; số đo được là **115 637 280**. Lệch
+> **0,07 M** (0,06%) — đúng phần biases của LayerNorm/conv mà một phép nhẩm hay
+> bỏ. (Đường DCNv3 là **115 662 210**: hai họ chênh nhau đúng **24 930** tham
+> số, vì DCNv4 gộp `offset`+`mask` vào một `Linear` và bỏ `LayerNorm` + `GELU`
+> trong `dw_conv`.) Aligner thì khớp tuyệt đối: MHAttn **2 359 296** (đặc tả ~2.36M) +
 > SwiGLU **8 388 608** (~8.39M) + hai RMSNorm 1 536 = **10 749 440** (~10.75M).
 
 **Vì sao Q đứng SAU Z**: attention của decoder là nhân quả, nên mọi vị trí của Q
@@ -413,7 +460,7 @@ xuống, đúng ngược với ý "hạ cánh".
 
 ```
 ảnh CXR ─► multi-crop: 2 global 448² (→ 28×28) + 6 local 224² (→ 14×14)
-        ─► student = InternImage-L (IN-22k, stage 3) + DINO head ─┐
+        ─► student = FlashInternImage-L (stage 3) + DINO head ─┐
         ─► teacher = EMA(student), CHỈ thấy 2 global            ┴─► CE(t ‖ s) = loss
 ```
 
@@ -425,7 +472,7 @@ miền ảnh CXR. `pretrained: false` bị **từ chối** — finetune một ba
 nhiên trả lời một câu hỏi khác hẳn.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor (**115,66 M**) + một DINO head (**7,09 M**) = **122,75 M**, và
+Extractor (**115,64 M**) + một DINO head (**7,09 M**) = **122,72 M**, và
 **teacher EMA là một bản sao đầy đủ nữa trong VRAM**. Thứ duy nhất còn cần từ
 model là `d_model` (2560), đọc từ `AutoConfig` (một file json, không tải trọng
 số).
@@ -611,8 +658,8 @@ nằm trong optimizer**. 0 bước cập nhật, 0 gradient, 0 activation đư�
 * Autobatch dò VRAM ở **đúng** trạng thái của vòng lặp.
 * Clip gradient **tách riêng** LoRA và nhánh, để nhánh mới không làm nhỏ bước
   cập nhật của LoRA so với A.
-* B nặng hơn A: **8 token** thêm vào chuỗi **cộng** một lượt InternImage-L
-  (3 stage, DCNv3 PyTorch) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` nên
+* B nặng hơn A: **8 token** thêm vào chuỗi **cộng** một lượt
+  FlashInternImage-L (3 stage, DCNv4) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad` nên
   phần nặng còn lại là Cross-attn của 8 latent trên **784 ô**. Nếu batch đã khoá
   không vừa VRAM, micro-batch được chạy thành từng mảnh và CE được ghép lại theo
   token; kết quả đúng bằng con số HF tính trên cả micro-batch, nên gradient
@@ -701,9 +748,13 @@ RGEXP_REMOTE=1 bash scripts/setup.sh        # ép chế độ container (không 
 RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh # nâng torch (~2.5 GB) thay vì ghim transformers
 ```
 
-Lần chạy đầu còn tải thêm `OpenGVLab/internimage_l_22k_384` (~1,05 GB) từ HF,
-kèm ba file `.py` của `trust_remote_code` (~60 KB). Không phải biên dịch
-extension DCNv3 nào: bản PyTorch luôn được dùng (xem §1.1).
+Lần chạy đầu còn tải thêm `flash_intern_image_l_22k_384.pth` (~1,25 GB) từ
+`OpenGVLab/DCNv4`. **Và phải biên dịch toán tử DCNv4 MỘT LẦN trên mỗi máy** —
+không có đường lùi PyTorch (xem §1.1):
+
+```bash
+TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation DCNv4==1.0.0.post2
+```
 
 ### 1–4. Thí nghiệm
 

@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = InternImage-L (IN-22k, stage 3) + DINO head ─┐
+            ─► student = FlashInternImage-L (IN-22k, stage 3) + DINO head ─┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,7 +10,7 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-InternImage-L cắt stage 3 (115,66 M) + một DINO head, cộng một bản teacher EMA đầy
+FlashInternImage-L cắt stage 3 (115,64 M) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 

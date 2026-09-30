@@ -5,7 +5,7 @@
            └─► resize 448×448
                     │
             ┌───────▼───────────────────────────────────────────┐
-            │ 1. EXTRACTOR — InternImage-L (IN-22k), CẮT stage 3 │  Stage 0 dạy
+            │ 1. EXTRACTOR — FlashInternImage-L, CẮT stage 3     │  Stage 0 dạy
             │    (B,3,448,448) -> (B,28,28,640) -> V (B,784,640) │
             └───────┬───────────────────────────────────────────┘
                     │ V
@@ -27,46 +27,63 @@
 
 | | dạy | đứng yên | hàm mục tiêu |
 |---|---|---|---|
-| **Stage 0** | Extractor (InternImage) | — | DINO tự giám sát, teacher = EMA, multi-crop |
+| **Stage 0** | Extractor (FlashInternImage) | — | DINO tự giám sát, teacher = EMA, multi-crop |
 | **Stage 1** | Compressor (QFormer) | Extractor (teacher 0) | CE với phân phối prototype của teacher |
 | **main** | Aligner + LoRA, rồi Compressor | Extractor | CE trên báo cáo thật |
 
 ═══ 1. EXTRACTOR ══════════════════════════════════════════════════════════════
 
-`OpenGVLab/internimage_l_22k_384` cắt ở stage 3 — **115 662 210 tham số đo
-được** (đặc tả ghi ~115.57M; 0,09 M lệch là phần bias của LayerNorm/conv).
+`flash_intern_image_l_22k_384` cắt ở stage 3 — **115 637 280 tham số đo được**
+(đặc tả ghi ~115.57M; 0,07 M lệch là phần bias của LayerNorm/conv).
 
-**InternImage là một CNN, KHÔNG phải transformer.** Lõi là **DCNv3** (deformable
-conv v3): mỗi vị trí học `group × 9` cặp offset + một mask softmax rồi lấy mẫu
-lưới bằng `grid_sample`. Trường thu nhận thích nghi như attention, chi phí tuyến
-tính theo số ô, và **không** pos-embed, **không** cửa sổ, **không** cls token.
+**FlashInternImage là một CNN, KHÔNG phải transformer.** Lõi là **DCNv4**
+(deformable conv v4): mỗi vị trí học `group × 9` offset + mask, gộp vào MỘT
+`Linear` và **bỏ softmax** trên mask của DCNv3, rồi lấy mẫu lưới trong một
+kernel FUSED. Trường thu nhận thích nghi như attention, chi phí tuyến tính theo
+số ô, và **không** pos-embed, **không** cửa sổ, **không** cls token.
 
-**Backbone này KHÔNG nạp qua timm** — timm không có InternImage. Nó đến từ
-Hugging Face bằng `trust_remote_code=True` (`AutoModel` -> `InternImageModel`),
-nên `backbone_body` có HAI đường: `is_internimage(arch)` chọn `internimage_body`
-(cắt `.model.levels`), còn lại đi đường timm cũ (cắt `.stages`).
+**Thân của nó chạy trên CHUỖI, không trên lưới.** DCNv4 nhận `(N, L, C)` cộng
+`shape = (H, W)` RỜI, nên `FlashInternImageBody` làm phẳng lưới ngay sau
+`patch_embed` rồi luồn `shape` qua từng level. Đó là khác biệt bố cục lớn nhất
+so với đường DCNv3 (làm việc thẳng trên `(N, H, W, C)`).
 
-**Kernel CUDA của DCNv3 không bao giờ được dùng.** Trong `dcnv3_func.py` của
-OpenGVLab, `pkg_resources` được import SAU khối `try` đã dùng nó, nên nhánh "có
-kernel" luôn ném `NameError` và bị `except:` bắt — `has_cuda_kernel` luôn
-`False`. Không phải biên dịch extension nào; đổi lại bản PyTorch trải 9 điểm lấy
-mẫu bằng `grid_sample`, chậm hơn và ngốn activation hơn. Hai chỗ trả giá:
-`stage0.micro_batch` và `vextractor.extractor.with_cp`.
+**BA đường dựng backbone, và `arch` chọn đúng một.** `flash_intern_image_*` ->
+code VENDOR ở `src/vendor/` + `.pth` từ `OpenGVLab/DCNv4` (đường đang dùng);
+`*internimage*` -> `trust_remote_code` của HF (DCNv3); còn lại -> timm. Ba họ,
+ba cách cắt: `.levels` (chuỗi) · `.model.levels` (lưới NHWC) · `.stages`.
+
+**KHÔNG có đường lùi PyTorch — rủi ro vận hành duy nhất của đường này.**
+`src/vendor/flash_intern_image.py` `import DCNv4` TRẦN và `dcnv4_func.py` lại
+`from DCNv4 import ext` ở tầng module, nên thiếu extension CUDA đã biên dịch thì
+nó chết ngay lúc IMPORT. PyPI chỉ có sdist; `setup.py` raise nếu thiếu
+`CUDA_HOME`:
+
+    TORCH_CUDA_ARCH_LIST=<sm> pip install --no-build-isolation DCNv4==1.0.0.post2
+
+Cái mua được: kernel FUSED không materialize tensor
+`(N·group, H·W, group_channels, 9)` mà bản PyTorch của DCNv3 giữ cho backward ở
+MỖI block — đúng thứ đã làm Stage 0 hết 16 GB VRAM. Không build được thì trả
+`arch` về `OpenGVLab/internimage_l_22k_384`: đường DCNv3 vẫn còn nguyên, chạy ở
+mọi máy (ở đó kernel CUDA của DCNv3 **không bao giờ** được dùng — một lỗi import
+của upstream làm `has_cuda_kernel` luôn `False` — nên nó luôn chạy bản PyTorch,
+chỉ chậm và ngốn activation).
 
 **`_22k_384` là trọng số CÓ GIÁM SÁT** trên ImageNet-22k, không phải tự giám
 sát. Stage 0 vì thế KHÔNG phải "chạy tiếp đúng hàm mục tiêu" như với một
 checkpoint DINOv3: nó là DINO self-distillation **khởi đi từ một init có giám
 sát**. Được một backbone mạnh, mất tính liên tục của hàm mục tiêu.
 
-**`n_stages: 3` — dừng ở stride 16 / 640 kênh.** InternImage-L có
+**`n_stages: 3` — dừng ở stride 16 / 640 kênh.** FlashInternImage-L có
 `channels: 160`, `depths: [5, 5, 22, 5]`, nên bốn stage chạy ở 160 · 320 ·
 **640** · 1280 kênh; ở 448² lưới là **28×28 = 784 ô × 640**. Lưới mịn gấp 4 so
 với 14×14 của đủ bốn level, đổi lại bỏ tầng ngữ nghĩa cao nhất — và 22 trong 37
 block của backbone nằm đúng ở stage này.
 
-Cắt là HAI việc: BỎ `downsample` của level cuối còn lại (giữ nó là trả về lưới
-của stage SAU), và XOÁ `levels[3]` khỏi `ModuleList` — 95,9 M tham số chết vẫn
-đi vào optimizer của Stage 0 và vào checkpoint.
+Cắt là BA việc: BỎ `downsample` của level cuối còn lại (giữ nó là trả về lưới
+của stage SAU); XOÁ `levels[3]` khỏi `ModuleList` (95,9 M tham số chết); và BỎ
+`conv_head` — chỗ này FlashInternImage khác `InternImageModel` của HF, nó dựng
+`conv_head` DÙ `num_classes=0` (chỉ `head` mới rơi về `nn.Identity`), tức thêm
+2,5 M tham số chết nữa đi vào optimizer của Stage 0 và vào checkpoint.
 
 > `n_patch` (784) và `d_feat` (640) đến từ MỘT lượt forward THẬT (trong `eval()`
 > + `no_grad()` + `fork_rng`, nên không tiêu RNG), không từ một công thức stride
@@ -74,12 +91,18 @@ của stage SAU), và XOÁ `levels[3]` khỏi `ModuleList` — 95,9 M tham số 
 
 **KHÔNG có BatchNorm nào để phải xử lý** (`norm_layer: LN` ở stem, downsample và
 mọi block), nên Stage 0 không cần epoch nào để kéo thống kê về ảnh CXR. Và MỘT
-`state_dict` chạy cả 448² lẫn 224²: `grid_sample` không gắn với cỡ ảnh — đã
-probe THẬT ở nửa độ phân giải lúc dựng (`multi_res`).
+`state_dict` chạy cả 448² lẫn 224²: không tham số nào gắn với cỡ ảnh, `shape`
+được luồn theo từng lượt — đã probe THẬT ở nửa độ phân giải lúc dựng
+(`multi_res`).
 
-**Không prefix token.** InternImage trả một LƯỚI, nên `stage0.dino.pool` bắt
-buộc `mean` và `pool: cls` bị TỪ CHỐI ngay lúc dựng backbone. Bố cục trục là
-**NHWC** (DCNv3 làm việc trên `(N, H, W, C)`) và được HỎI từ `output_fmt`, không
+**Chuẩn hoá ảnh là chỗ DUY NHẤT của cả nhánh phải GÕ TAY một cặp số**
+(`FLASH_II_NORMALIZE`), vì checkpoint là một `.pth` TRẦN: không
+`preprocessor_config.json` (đường DCNv3 có), không `pretrained_cfg` (đường timm
+có). Nguồn ghi rõ trong hằng ấy.
+
+**Không prefix token.** Nó trả một LƯỚI, nên `stage0.dino.pool` bắt buộc
+`mean` và `pool: cls` bị TỪ CHỐI ngay lúc dựng backbone. Bố cục trục sau khi
+`FlashInternImageBody` reshape lại là **NHWC**, và được HỎI từ `output_fmt`, không
 đoán từ `f.dim()`: NCHW và NHWC cùng 4 chiều, và dùng nhầm nhánh KHÔNG ném lỗi —
 nó trả `(B, W·C, H)` và `d_feat` đọc ra 28 thay vì 640.
 
@@ -600,6 +623,275 @@ def internimage_body(arch: str, pretrained: bool, image_size: int,
             body.n_stages_used)
 
 
+FLASH_II_RE = re.compile(r"^flash_intern_image_", re.I)
+
+# Repo Hugging Face chứa checkpoint `.pth` của FlashInternImage. `arch` CHÍNH LÀ
+# tên file (không đuôi), nên không có bảng tra tên nào để lệch:
+# `arch: flash_intern_image_l_22k_384` -> `flash_intern_image_l_22k_384.pth`.
+FLASH_II_REPO = "OpenGVLab/DCNv4"
+
+# (channels, depths, groups) — ĐỌC TỪ config chính thức, KHÔNG suy từ tên biến
+# thể. Chỉ khai biến thể đã đọc thật: `flash_intern_image_l_22kto1k_384.yaml`
+# @ 4b848f7 (khối kiến trúc của bản 22k và 22kto1k giống nhau, chỉ khác số lớp
+# của `head` — mà `head` bị bỏ). Thêm t/s/b thì phải MỞ config của nó ra đọc:
+# "suy từ họ InternImage" là cách một con số sai đi vào mà không ai thấy.
+FLASH_II_VARIANTS = {"l": (160, [5, 5, 22, 5], [10, 20, 40, 80])}
+
+# Mean/std của FlashInternImage. Đây là chỗ DUY NHẤT trong nhánh phải GÕ TAY
+# một cặp số chuẩn hoá, và lý do đáng đọc: checkpoint là một `.pth` TRẦN — nó
+# không mang `preprocessor_config.json` nào, không mang `pretrained_cfg` nào.
+# Nguồn: `classification/config.py` @ 4b848f7, dòng 187-188
+#     _C.AUG.MEAN = (0.485, 0.456, 0.406)
+#     _C.AUG.STD  = (0.229, 0.224, 0.225)
+# và `configs/flash_intern_image_l_22kto1k_384.yaml` KHÔNG ghi đè hai khoá ấy
+# (`dataset/build.py` gọi `transforms.Normalize(AUG.MEAN, AUG.STD)`).
+FLASH_II_NORMALIZE = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
+
+def is_flash_internimage(arch: str) -> bool:
+    """`arch` là checkpoint FlashInternImage (DCNv4) của OpenGVLab?
+
+    Đường thứ BA của `backbone_body`, và nó khác hai đường kia ở mọi khâu:
+    model không đến từ timm (timm không có), cũng không từ `trust_remote_code`
+    (`OpenGVLab/DCNv4` không phải repo model của HF) — nó là code đã VENDOR ở
+    `src/vendor/flash_intern_image.py`, còn trọng số là một `.pth` trần tải
+    bằng `hf_hub_download`.
+    """
+    return bool(FLASH_II_RE.match(str(arch)))
+
+
+def _flash_internimage_normalize(arch: str) -> tuple[tuple, tuple]:
+    """(mean, std) của FlashInternImage — xem `FLASH_II_NORMALIZE`."""
+    mean, std = FLASH_II_NORMALIZE
+    return (tuple(float(x) for x in mean), tuple(float(x) for x in std))
+
+
+def _flash_ii_variant(arch: str) -> tuple[int, list[int], list[int]]:
+    """`flash_intern_image_l_22k_384` -> (channels, depths, groups)."""
+    parts = str(arch).split("_")
+    key = parts[3].lower() if len(parts) > 3 else ""
+    if key not in FLASH_II_VARIANTS:
+        raise VExtractorUnusable(
+            f"không biết biến thể {key!r} của {arch!r}. Đã khai: "
+            f"{sorted(FLASH_II_VARIANTS)}.\n"
+            f"    Thêm một biến thể là MỞ config của nó ở "
+            f"`classification/configs/` của OpenGVLab/DCNv4 rồi chép ba con số "
+            f"(CHANNELS, DEPTHS, GROUPS) — KHÔNG suy từ họ InternImage.")
+    ch, dep, gr = FLASH_II_VARIANTS[key]
+    return int(ch), list(dep), list(gr)
+
+
+class FlashInternImageBody(nn.Module):
+    """FlashInternImage (DCNv4, code vendor) CẮT ở stage `n_stages` -> lưới NHWC.
+
+    Bọc lại vì phần còn lại của nhánh chỉ biết MỘT giao diện backbone:
+    `.forward_features(px)` trả một LƯỚI, `.output_fmt` nói trục kênh ở đâu,
+    `.pretrained_cfg` mang mean/std.
+
+    **Thân của FlashInternImage chạy trên CHUỖI, không trên lưới.** DCNv4 nhận
+    `(N, L, C)` cộng `shape=(H, W)` RỜI, nên upstream làm phẳng lưới ngay sau
+    `patch_embed` rồi luồn `shape` qua từng level; mỗi `downsample` trả về
+    `shape` MỚI. Đó là khác biệt lớn nhất so với `InternImageBody` (DCNv3 làm
+    việc thẳng trên `(N, H, W, C)`), và là lý do hàm dưới đây chép đúng vòng
+    lặp của upstream thay vì gọi `forward_features`: bản upstream chạy hết bốn
+    level rồi đi qua `conv_head` + `avgpool` và trả về MỘT VECTOR.
+
+    Lát cắt là HAI việc, y như ở DCNv3:
+
+      * BỎ `downsample` của level cuối còn lại — giữ nó là trả về lưới của
+        stage SAU (nửa độ phân giải, gấp đôi kênh);
+      * XOÁ `levels[3]` khỏi `ModuleList` **và `conv_head`**. `conv_head` là
+        chỗ FlashInternImage khác `InternImageModel` của HF: nó được dựng **dù
+        `num_classes=0`** (chỉ `head` mới rơi về `nn.Identity`), nên bỏ không
+        gọi là để lại 2,5 M tham số chết đi vào optimizer của Stage 0 và vào
+        checkpoint.
+    """
+
+    output_fmt = "NHWC"
+
+    def __init__(self, net: nn.Module, n_stages: int | None):
+        super().__init__()
+        levels = getattr(net, "levels", None)
+        if levels is None:
+            raise VExtractorUnusable(
+                "model FlashInternImage không phơi `.levels` — bản vendor ở "
+                "`src/vendor/flash_intern_image.py` đã lệch khỏi bản đang được "
+                "đọc ở đây; đừng huấn luyện trên nó.")
+        n_have = len(levels)
+        n_use = n_have if n_stages is None else int(n_stages)
+        if not 1 <= n_use <= n_have:
+            raise VExtractorUnusable(
+                f"n_stages = {n_stages} nhưng model chỉ có {n_have} stage "
+                f"(hợp lệ 1..{n_have}; null = dùng hết).")
+        net.levels = nn.ModuleList(list(levels)[:n_use])
+        net.levels[-1].downsample = None
+        net.num_levels = n_use
+        # `conv_head` dựng theo số kênh của stage CUỐI (1280 × cls_scale 1.5 =
+        # 1920 với L) và không bao giờ được gọi nữa sau lát cắt.
+        if getattr(net, "conv_head", None) is not None:
+            net.conv_head = nn.Identity()
+        self.net = net
+        self.n_stages_used = n_use
+
+    def forward_features(self, px: torch.Tensor) -> torch.Tensor:
+        m = self.net
+        x = m.patch_embed(px)                      # (N, H, W, C)
+        n, h, w, c = x.shape
+        x = x.view(n, h * w, c)                    # DCNv4 làm việc trên (N, L, C)
+        shape = (h, w)
+        for level in m.levels:
+            x, shape = level(x, shape=shape)
+        return x.view(n, shape[0], shape[1], -1)   # -> NHWC
+
+    def forward(self, px: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(px)
+
+
+def _flash_ii_load(net: nn.Module, arch: str, n_use: int, n_have: int) -> dict:
+    """Nạp `.pth` của upstream vào model đã CẮT, và DỪNG nếu có khoá thiếu.
+
+    `load_state_dict(strict=False)` là con dao hai lưỡi ở đây: nó CẦN THIẾT
+    (checkpoint có `levels[3]`, `conv_head`, `head` mà model đã cắt bỏ) nhưng
+    cũng nuốt im lặng đúng ca tệ nhất — tên khoá lệch hoàn toàn thì nó nạp **0
+    tensor**, trả về một danh sách mà không ai đọc, rồi Stage 0 chạy 50 epoch
+    trên trọng số ngẫu nhiên. Nên ở đây `missing` phải RỖNG, và mọi khoá
+    `unexpected` phải nằm trong đúng các tiền tố đã bị cắt.
+    """
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(FLASH_II_REPO, f"{arch}.pth")
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:  # noqa: BLE001
+        # Checkpoint của repo classification gói kèm `config` (một CfgNode của
+        # yacs), tức một lớp Python -> `weights_only=True` từ chối. Rơi về
+        # `False` mở lại đường unpickle tuỳ ý, nhưng ranh giới tin cậy đã bị
+        # vượt từ trước: `pip install DCNv4` biên dịch và CHẠY code của cùng tổ
+        # chức ấy.
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    sd = blob.get("model", blob) if isinstance(blob, dict) else blob
+    if not isinstance(sd, dict) or not sd:
+        raise VExtractorUnusable(
+            f"{arch}.pth không chứa `state_dict` đọc được (kiểu "
+            f"{type(sd).__name__}).")
+    for pre in ("module.", "model."):               # DDP / bọc thêm một tầng
+        if all(k.startswith(pre) for k in sd):
+            sd = {k[len(pre):]: v for k, v in sd.items()}
+    missing, unexpected = net.load_state_dict(sd, strict=False)
+    cut = tuple(f"levels.{i}." for i in range(n_use, n_have)) + ("conv_head.",
+                                                                 "head.")
+    odd = [k for k in unexpected if not k.startswith(cut)]
+    if missing or odd:
+        raise VExtractorUnusable(
+            f"nạp {arch}.pth KHÔNG khớp model đã cắt.\n"
+            f"    thiếu {len(missing)} khoá (5 đầu: {list(missing)[:5]})\n"
+            f"    thừa NGOÀI phần đã cắt {len(odd)} khoá (5 đầu: {odd[:5]})\n"
+            f"    Bản vendor `src/vendor/flash_intern_image.py` và checkpoint "
+            f"phải cùng một bố cục; `strict=False` ở đây CHỈ để bỏ qua {cut}.")
+    return {"path": path, "n_loaded": len(sd) - len(unexpected),
+            "n_cut": len(unexpected)}
+
+
+def flash_internimage_body(arch: str, pretrained: bool, image_size: int,
+                           n_layers: int | None = None,
+                           n_stages: int | None = None,
+                           with_cp: bool = False):
+    """FlashInternImage -> (body, d_feat, n_patch, n_used, kind, fmt, multi_res, n_st).
+
+    Cùng 8-tuple như hai đường kia.
+
+    **Không có đường lùi PyTorch, và đó là khác biệt đáng đọc kỹ nhất so với
+    DCNv3.** `src/vendor/flash_intern_image.py` `import DCNv4` TRẦN, và
+    `DCNv4/functions/dcnv4_func.py` lại `from DCNv4 import ext` ở tầng module —
+    nên thiếu extension CUDA đã biên dịch thì nó chết ngay lúc IMPORT, không
+    phải lúc forward. Ngược lại InternImage/DCNv3 luôn rơi về bản PyTorch
+    (`has_cuda_kernel` luôn False vì một lỗi import của upstream) nên nó chạy ở
+    mọi máy — chỉ chậm và ngốn activation.
+
+    Cái mua được: DCNv4 là kernel FUSED. Nó KHÔNG materialize tensor
+    `(N·group, H·W, group_channels, 9)` mà bản PyTorch của DCNv3 giữ cho
+    backward ở MỖI block — đúng thứ làm Stage 0 hết 16 GB VRAM.
+
+    `pretrained=False` **không tải gì cả**: bố cục đến từ `FLASH_II_VARIANTS`,
+    không từ một file config trên Hub. Nên selftest và bảng tham số chạy hoàn
+    toàn OFFLINE — khác đường DCNv3, vốn còn cần `config.json` +
+    `trust_remote_code` ở lần đầu.
+    """
+    if n_layers is not None:
+        raise VExtractorUnusable(
+            f"khai n_layers = {n_layers} với {arch!r}: FlashInternImage là họ "
+            f"PHÂN CẤP (4 level, mỗi level một số kênh). Đặt `n_layers: null` "
+            f"và cắt bằng `n_stages`.")
+    try:
+        from .vendor.flash_intern_image import FlashInternImage
+    except Exception as e:  # noqa: BLE001
+        raise VExtractorUnusable(
+            f"không import được `src/vendor/flash_intern_image.py`: {e!r}.\n"
+            f"    File ấy `import DCNv4` TRẦN, và toán tử DCNv4 là một "
+            f"extension CUDA phải BIÊN DỊCH — PyPI chỉ có sdist, và KHÔNG có "
+            f"đường lùi PyTorch nào.\n"
+            f"        TORCH_CUDA_ARCH_LIST=<sm của card, vd 12.0> "
+            f"pip install --no-build-isolation DCNv4==1.0.0.post2\n"
+            f"    (`--no-build-isolation` là BẮT BUỘC: setup.py của nó "
+            f"`import torch` ngay lúc build.)\n"
+            f"    Không build được thì trả `vextractor.extractor.arch` về "
+            f"`OpenGVLab/internimage_l_22k_384` — đường DCNv3 chạy ở mọi "
+            f"máy.") from e
+    channels, depths, groups = _flash_ii_variant(arch)
+    n_have = len(depths)
+    n_use = n_have if n_stages is None else int(n_stages)
+    try:
+        net = FlashInternImage(
+            core_op="DCNv4", channels=channels, depths=depths, groups=groups,
+            num_classes=0, mlp_ratio=4.0,
+            # Stochastic depth TẮT. Config finetune của upstream dùng 0.1,
+            # nhưng ở đây hàm mục tiêu là DINO chứ không phải phân loại 22k —
+            # và backbone TRƯỚC (InternImage qua HF) chạy ở 0.0. Giữ 0.0 là giữ
+            # Stage 0 so được với lượt đã chạy; đổi nó là thêm một siêu tham số
+            # chưa ai đo vào giữa một phép so sánh.
+            drop_rate=0.0, drop_path_rate=0.0,
+            act_layer="GELU", norm_layer="LN",
+            # SÁU khoá dưới đây đến từ config CHÍNH THỨC của L, không từ mặc
+            # định của lớp — mặc định là `dw_kernel_size=None`, hai bias
+            # `False`, `offset_scale=0.5`, tức một model KHÁC, và checkpoint sẽ
+            # không khớp ngay ở shape của `offset_mask`.
+            layer_scale=1e-5, offset_scale=2.0, post_norm=True,
+            dw_kernel_size=3, dcn_output_bias=True, mlp_fc2_bias=True,
+            with_cp=bool(with_cp))
+    except Exception as e:  # noqa: BLE001
+        raise VExtractorUnusable(
+            f"không dựng được backbone {arch!r} ở {image_size}²: {e!r}") from e
+    body = FlashInternImageBody(net, n_stages)
+    if bool(pretrained):
+        try:
+            rec = _flash_ii_load(net, arch, n_use, n_have)
+        except VExtractorUnusable:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise VExtractorUnusable(
+                f"không tải/nạp được {arch}.pth từ {FLASH_II_REPO!r}: "
+                f"{e!r}") from e
+        print(f"  ✓ {arch}.pth: nạp {rec['n_loaded']} tensor, bỏ "
+              f"{rec['n_cut']} khoá của phần đã cắt", flush=True)
+    _m, _s = _flash_internimage_normalize(arch)
+    body.pretrained_cfg = {"mean": _m, "std": _s}
+    f = _probe_features(body, image_size)
+    if f.dim() != 4:
+        raise VExtractorUnusable(
+            f"{arch!r}: lát cắt stage trả {tuple(f.shape)} — cần (B, H, W, C).")
+    d_feat, n_patch = int(f.shape[3]), int(f.shape[1] * f.shape[2])
+    if n_patch < 1:
+        raise VExtractorUnusable(
+            f"{arch!r} ở {image_size}² cho lưới {n_patch} ô — ảnh vào quá nhỏ.")
+    try:
+        _probe_features(body, max(1, int(image_size) // 2))
+        multi_res = True
+    except Exception:  # noqa: BLE001
+        multi_res = False
+    return (body, d_feat, n_patch, None, "conv", "NHWC", multi_res,
+            body.n_stages_used)
+
+
 def arch_normalize(arch: str) -> tuple[tuple, tuple]:
     """(mean, std) ĐÚNG của checkpoint `arch` — hỏi `pretrained_cfg`, không tải weight.
 
@@ -608,6 +900,8 @@ def arch_normalize(arch: str) -> tuple[tuple, tuple]:
     0.5/0.5. Gõ nhầm cặp nào ở đây cũng không làm chương trình lỗi — nó chỉ làm
     mọi activation lệch ngay từ bước 0.
     """
+    if is_flash_internimage(arch):
+        return _flash_internimage_normalize(arch)
     if is_internimage(arch):
         return _internimage_normalize(arch)
     try:
@@ -682,6 +976,9 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     của stage CUỐI, nên để lại thì lượt forward chết vì lệch kênh, hoặc tệ hơn
     là khớp tình cờ và chuẩn hoá sai chỗ. Trường hợp đó bị TỪ CHỐI ồn ào.
     """
+    if is_flash_internimage(arch):
+        return flash_internimage_body(arch, pretrained, image_size, n_layers,
+                                      n_stages, with_cp)
     if is_internimage(arch):
         return internimage_body(arch, pretrained, image_size, n_layers,
                                 n_stages, with_cp)
