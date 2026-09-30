@@ -13,7 +13,7 @@ Nhánh thị giác bổ sung 8 token ảnh vào đầu vào Gemma 3. Ảnh cũng
 ## Kiến trúc
 
 - **Extractor:** FocalNet Large Stage 3 (`focalnet_large_fl3`), khoảng **137,78 M** tham số; cấu hình cắt là `n_stages: 3`. Đầu vào toàn cục `B×3×448×448`, đặc trưng `B×768×28×28`, 784 ô thành `V (784, 768)`. Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained Large Stage 3. Các stage sau dùng teacher EMA được chọn theo validation.
-- **Compressor:** 8 latent vector học được, RMSNorm, 4 nhóm block. Mỗi nhóm gồm block đầu `SelfAttn → CrossAttn(Q,V) → SwiGLU` và block sau `SelfAttn → SwiGLU`. `V_c (8, 768)`; SwiGLU `768→512→768`. Mỗi nhóm khoảng **9,44 M** tham số, toàn Compressor khoảng **37,77 M**; `head_dim` = 128; cấu hình FFN là `vextractor.compressor.mlp_hidden`.
+- **Compressor:** 8 latent vector học được, RMSNorm, 4 nhóm block. Mỗi nhóm gồm block đầu `SelfAttn → CrossAttn(Q,V) → SwiGLU` và block sau `SelfAttn → SwiGLU`. `V_c (8, 768)`; SwiGLU 768→512→768. Mỗi nhóm khoảng **9,44 M** tham số, toàn Compressor khoảng **37,77 M**; `head_dim` = 128; cấu hình FFN là `vextractor.compressor.mlp_hidden`.
 - **Aligner:** khoảng **10,75 M** tham số; MHAttn trên 8 token nén, rồi `SwiGLU 768→2048→2560`, RMSNorm; cấu hình FFN là `vextractor.aligner.mlp_hidden`.
 - **Tổng tham số:** khoảng **186,30 M** cho nhánh; **48,52 M** được học ở main stage (Compressor và Aligner). DINO head có **7,35 M**; student Stage 0 có khoảng **145,13 M**.
 - **Đầu vào decoder:** nối 8 token đã căn chỉnh sau token ảnh gốc `Z`; các vị trí token mới có nhãn `-100` cho CE.
