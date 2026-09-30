@@ -12,7 +12,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
   4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA/center đổi đúng hướng
   5. lịch DINO (τ_t, momentum) + multi-crop
   6. CE ghép theo token qua các mảnh == CE trung bình token của cả micro-batch
-  7. đóng băng: Extractor teacher-infer, Compressor + Aligner vẫn học
+  7. đóng băng: ở main stage Extractor VÀ Compressor đều infer, CHỈ Aligner học
   8. kiểm định A/B: bootstrap + permutation nhận ra hiệu số thật, không bịa
   9. Hub: A kéo từ current/$1_LoRA_Test, B đẩy vào current/$2.2_V-Extractor_Test
  10. không file nào trong src/ import _archive hay run_lora; runner có đường Q
@@ -318,7 +318,7 @@ def _():
     else:
         raise AssertionError("lưới lệch phải bị từ chối")
 
-    # ── 2. COMPRESSOR: 32 latent, N nhóm, Cross-attn CHỈ ở khối 1 ─────────
+    # ── 2. COMPRESSOR: n_query latent, N nhóm, Cross-attn CHỈ ở khối 1 ────
     assert cp.n_query == R.n_query_of(sp) == SMALL_Q
     assert cp.n_patch if False else True     # (lưới là của Extractor, không của Compressor)
     assert cp.d_latent == R.d_latent_of(sp) == SMALL_DL != 32
@@ -853,7 +853,7 @@ def _():
     assert src.count("VExtReportDataset(") >= 2      # train + val
 
 
-@check("7. đóng băng: Extractor teacher-infer; Compressor + Aligner vẫn học ở main stage")
+@check("7. đóng băng: ở main stage Extractor VÀ Compressor đều infer; CHỈ Aligner học")
 def _():
     import torch
 
@@ -864,31 +864,47 @@ def _():
     br = R.VExtractorBranch(sp)
     br.set_frozen(True)
     br.train()
-    # Extractor eval + không grad; PHẦN CÒN LẠI vẫn train
+    # Extractor eval + không grad; Compressor CHƯA bị đóng băng thì vẫn train
     assert not br.extractor.body.training
     assert br.compressor.training and br.aligner.training
     assert all(not q.requires_grad for q in br.extractor.parameters())
     assert all(q.requires_grad for q in br.trainable_parameters())
+    # `trainable_parameters` = ĐÚNG Aligner. Compressor học ở Stage 1, không ở
+    # đây, nên nó không được có mặt trong optimizer của main stage.
+    assert ([id(q) for q in br.trainable_parameters()]
+            == [id(q) for q in br.aligner.parameters()])
     npar = br.n_params()
-    assert npar["trainable"] == npar["learnable_main"] == (
-        npar["compressor"] + npar["aligner"])
-    assert npar["learnable_main"] > 0 and npar["extractor"] > 0
+    assert npar["learnable_main"] == npar["aligner"] > 0
+    assert npar["learnable_stage1"] == npar["compressor"] > 0
+    assert npar["extractor"] > 0
     assert npar["compressor"] == npar["compressor_attn"] + npar["compressor_ffn"]
-    assert npar["total"] == npar["extractor"] + npar["learnable_main"]
-    # gradient của CE tới được Compressor + Aligner, KHÔNG tới Extractor
+    assert npar["total"] == (npar["extractor"] + npar["learnable_stage1"]
+                             + npar["learnable_main"])
+    # gradient của CE tới được Compressor + Aligner khi Compressor CÒN mở
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     br.eval()
     br(x).sum().backward()
     assert all(q.grad is not None for q in br.trainable_parameters())
+    assert all(q.grad is not None for q in br.compressor.parameters())
     assert all(q.grad is None for q in br.extractor.parameters())
     br.zero_grad(set_to_none=True)
-    # ── đóng băng RIÊNG Compressor: Aligner KHÔNG bị chạm ─────────────────
+    # ── TRẠNG THÁI CỦA MAIN STAGE: Extractor + Compressor đóng băng ───────
     br.set_compressor_frozen(True)
     assert br.compressor_frozen
     assert all(not q.requires_grad for q in br.compressor.parameters())
     assert all(q.requires_grad for q in br.aligner.parameters())
+    # `trainable` (đọc requires_grad) nay khớp ĐÚNG `learnable_main`: đó là bất
+    # biến `train_vextractor` kiểm trước khi dựng optimizer.
+    npar = br.n_params()
+    assert npar["trainable"] == npar["learnable_main"] == npar["aligner"]
+    # đóng băng thì cũng phải ở `eval` — và `train()` KHÔNG được kéo nó về train
+    br.train()
+    assert not br.compressor.training and not br.extractor.body.training
+    assert br.aligner.training
+    br.eval()
     br(x).sum().backward()
     assert all(q.grad is None for q in br.compressor.parameters())
+    assert all(q.grad is None for q in br.extractor.parameters())
     assert all(q.grad is not None for q in br.aligner.parameters())
     br.zero_grad(set_to_none=True)
     br.set_compressor_frozen(False)
@@ -1175,7 +1191,7 @@ def _():
     s1c = s1.s1cfg(cfg)
     assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 3e-5)
     assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 3e-4)
-    # FFN chịu được dốc CAO HƠN attn: ma trận attention quyết định 8 vector
+    # FFN chịu được dốc CAO HƠN attn: ma trận attention quyết định 16 vector
     # ĐỌC Ở ĐÂU trên lưới, và một bước lớn làm phân phối ấy sụp về vài ô rồi
     # không quay lại. Quan hệ ấy phải còn đúng, không chỉ hai con số rời.
     assert s1c["ffn_lr_max"] > s1c["attn_lr_max"]
@@ -1189,18 +1205,15 @@ def _():
     assert (zc["align_ffn_lr_min"], zc["align_ffn_lr_main"]) == (1e-6, 1e-4)
     assert (zc["align_attn_lr_min"], zc["align_attn_lr_main"]) == (1e-7, 1e-5)
     assert zc["align_warmup_frac"] == 0.10
-    assert (zc["comp_ffn_lr_min"], zc["comp_ffn_lr_main"]) == (1e-7, 1e-5)
-    assert (zc["comp_attn_lr_min"], zc["comp_attn_lr_main"]) == (1e-8, 1e-6)
-    # Compressor đã học ở Stage 1 nên main stage chỉ tinh chỉnh NHẸ: mức của
-    # nó phải nhỏ hơn hẳn Aligner (khối MỚI, phải học từ ngẫu nhiên).
-    # Và Attn chậm hơn FFN đúng 10× ở CẢ HAI khối — `zcfg` từ chối đảo dấu.
-    for _b in ("align", "comp"):
-        # so theo TỈ LỆ với sai số: 1e-4 / 10 trong float là 1.0000000000000002e-05
-        assert abs(zc[f"{_b}_ffn_lr_main"] / zc[f"{_b}_attn_lr_main"] - 10) < 1e-9
-        assert zc[f"{_b}_attn_lr_min"] < zc[f"{_b}_ffn_lr_min"]
-    assert zc["comp_ffn_lr_main"] < zc["align_ffn_lr_main"]
-    assert zc["comp_attn_lr_main"] < zc["align_attn_lr_main"]
-    assert (zc["comp_freeze_frac"], zc["comp_warmup_frac"]) == (0.20, 0.10)
+    # Compressor KHÔNG còn nhóm lr nào ở main stage: nó đóng băng hoàn toàn,
+    # nên mọi khoá `comp_*` phải BIẾN MẤT khỏi khối — còn một khoá là còn một
+    # con số người khai tin là đang có tác dụng.
+    assert not any(k.startswith("comp_") for k in MAIN_CFG_KEYS)
+    assert not any(k.startswith("comp_") for k in zc)
+    # Attn chậm hơn FFN đúng 10× — `zcfg` từ chối đảo dấu.
+    # so theo TỈ LỆ với sai số: 1e-4 / 10 trong float là 1.0000000000000002e-05
+    assert abs(zc["align_ffn_lr_main"] / zc["align_attn_lr_main"] - 10) < 1e-9
+    assert zc["align_attn_lr_min"] < zc["align_ffn_lr_min"]
 
     # ── `lr_max` là MỨC CHẠY: mọi epoch sau epoch 1 đều ở đó ──────────────
     # Bài kiểm này chống đúng cách đọc sai đã xảy ra: hiểu `lr_max` là một đỉnh
@@ -1287,8 +1300,14 @@ def _():
         else:
             raise AssertionError(f"{blk}.{stale} (khoá cũ) phải bị từ chối")
     c = dict(cfg)
+    # Cả họ `comp_*` nay là khoá CŨ: Compressor đóng băng hoàn toàn ở main
+    # stage, nên khai lr / mốc đóng băng / wd cho nó là khai một con số không
+    # ai đọc — `zcfg` phải DỪNG chứ không bỏ qua.
     for _stale in ("align_lr", "align_lr_min", "align_lr_main",
-                   "comp_lr_min", "comp_lr_main"):
+                   "comp_lr_min", "comp_lr_main",
+                   "comp_ffn_lr_min", "comp_ffn_lr_main",
+                   "comp_attn_lr_min", "comp_attn_lr_main",
+                   "comp_freeze_frac", "comp_warmup_frac", "comp_wd"):
         c = dict(cfg)
         c["vextractor"] = dict(cfg["vextractor"], main=dict(
             cfg["vextractor"]["main"], **{_stale: 1e-5}))
@@ -1300,16 +1319,27 @@ def _():
             raise AssertionError(
                 f"vextractor.main.{_stale} (khoá cũ, nay tách attn/ffn) phải "
                 f"bị từ chối")
-    # freeze + warmup > 100% -> Compressor không bao giờ chạm lr_main -> DỪNG
+    # warm-up ngoài [0, 1] -> DỪNG
+    for _bad in (-0.1, 1.5):
+        c = dict(cfg)
+        c["vextractor"] = dict(cfg["vextractor"], main=dict(
+            cfg["vextractor"]["main"], align_warmup_frac=_bad))
+        try:
+            zcfg(c)
+        except TrainUnusable as e:
+            assert "[0, 1]" in str(e), e
+        else:
+            raise AssertionError(f"align_warmup_frac {_bad} phải bị từ chối")
+    # attn NHANH hơn ffn -> đảo đúng lý do tách nhóm -> DỪNG
     c = dict(cfg)
     c["vextractor"] = dict(cfg["vextractor"], main=dict(
-        cfg["vextractor"]["main"], comp_freeze_frac=0.8, comp_warmup_frac=0.5))
+        cfg["vextractor"]["main"], align_attn_lr_main=1e-3))
     try:
         zcfg(c)
     except TrainUnusable as e:
-        assert "KHÔNG BAO GIỜ" in str(e)
+        assert "CHẬM" in str(e), e
     else:
-        raise AssertionError("freeze + warmup > 1 phải bị từ chối")
+        raise AssertionError("align_attn_lr_main > align_ffn_lr_main phải bị từ chối")
 
 
 @check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): warm-up 1 epoch rồi GIỮ lr_max, chặng 5 ÷1,5, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min")
@@ -1641,16 +1671,21 @@ def _():
          s0.ImageOnlyDataset.__getitem__, R.backbone_body) = orig
 
 
-@check("17. main stage: Aligner học TỪ BƯỚC 0, Compressor đóng băng 20% rồi warm-up 10%; mốc theo TỈ LỆ nên dry-run vẫn mở băng")
+@check("17. main stage: CHỈ Aligner học (warm-up 10% từ bước 0 rồi phẳng); Compressor KHÔNG có nhóm lr nào; mốc theo TỈ LỆ nên dry-run vẫn đúng")
 def _():
+    import src.train_vextractor as TV
     from src.config import load_config
-    from src.train_vextractor import align_lr_at, comp_lr_at, zcfg
+    from src.train_vextractor import BRANCH_GROUPS, align_lr_at, zcfg
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     zc = zcfg(cfg)
     N = 200                                    # 1 epoch = 200 bước (khoá theo $1)
-    # BỐN nhóm, hai hàm, mỗi hàm trả {"ffn", "attn"} ─────────────────────
-    assert set(align_lr_at(0, zc, N)) == set(comp_lr_at(0, zc, N)) == {"ffn", "attn"}
+    # HAI nhóm, MỘT hàm lịch, trả {"ffn", "attn"} ────────────────────────
+    assert set(align_lr_at(0, zc, N)) == {"ffn", "attn"}
+    assert BRANCH_GROUPS == ("aligner_ffn", "aligner_attn")
+    # Compressor không còn lịch: hàm `comp_lr_at` PHẢI biến mất, vì một hàm
+    # lịch còn đó là một hàm ai đó gọi lại được mà không có khoá nào nuôi nó.
+    assert not hasattr(TV, "comp_lr_at")
     # ── Aligner: dốc từ bước 0, chạm đỉnh ở 10%, rồi PHẲNG ───────────────
     for grp in ("ffn", "attn"):
         lo_k, hi_k = f"align_{grp}_lr_min", f"align_{grp}_lr_main"
@@ -1662,21 +1697,8 @@ def _():
     # CÙNG một dốc cho hai nhóm: chúng ở trong cùng một khối ngẫu nhiên
     assert (align_lr_at(10, zc, N)["ffn"] / zc["align_ffn_lr_main"]
             - align_lr_at(10, zc, N)["attn"] / zc["align_attn_lr_main"]) < 1e-9
-    # ── Compressor: 0 TUYỆT ĐỐI tới bước 40, rồi dốc, rồi PHẲNG ──────────
-    for grp in ("ffn", "attn"):
-        lo_k, hi_k = f"comp_{grp}_lr_min", f"comp_{grp}_lr_main"
-        assert comp_lr_at(0, zc, N)[grp] == 0.0
-        assert comp_lr_at(39, zc, N)[grp] == 0.0
-        assert comp_lr_at(40, zc, N)[grp] == zc[lo_k]
-        assert comp_lr_at(60, zc, N)[grp] == zc[hi_k]
-        assert comp_lr_at(199, zc, N)[grp] == zc[hi_k]
-        # HAI lịch KHÁC nhau — đó là cả điểm của việc tách hai khối
-        assert align_lr_at(0, zc, N)[grp] != comp_lr_at(0, zc, N)[grp]
-        assert zc[f"comp_{grp}_lr_main"] < zc[f"align_{grp}_lr_main"]
-    # ── mốc theo TỈ LỆ: dry-run 10 bước vẫn mở băng Compressor ────────────
+    # ── mốc theo TỈ LỆ: dry-run vài bước vẫn chạm được lr_main ────────────
     for n_small in (10, 20, 40):
-        assert comp_lr_at(0, zc, n_small)["ffn"] == 0.0
-        assert comp_lr_at(n_small - 1, zc, n_small)["ffn"] > 0, n_small
         assert (align_lr_at(n_small - 1, zc, n_small)["ffn"]
                 == zc["align_ffn_lr_main"])
     # Khai theo SỐ BƯỚC tuyệt đối thì ca trên hỏng im lặng — đó là lý do khoá
@@ -2290,7 +2312,7 @@ def _():
 
 
 @check("25. BA giai đoạn: Stage 0 dạy Extractor · Stage 1 chưng cất Compressor từ "
-       "teacher ĐÓNG BĂNG · main dạy Aligner + LoRA rồi mở Compressor")
+       "teacher ĐÓNG BĂNG · main dạy ĐÚNG Aligner + LoRA")
 def _():
     """Mỗi giai đoạn dạy ĐÚNG MỘT khối, và ranh giới phải kiểm được.
 
@@ -2300,7 +2322,10 @@ def _():
          sinh nhãn cho chính mình thì phép chưng cất không còn nghĩa gì);
       2. checkpoint Stage 1 mang theo Extractor hoặc Aligner — hai bản của cùng
          một tensor, hoặc một Aligner đã học đè lên một Aligner phải ngẫu nhiên;
-      3. main stage quên mở băng Compressor, hoặc mở sai bước.
+      3. main stage vô tình để Compressor học tiếp — Stage 1 là giai đoạn DUY
+         NHẤT của nó, nên một nhóm lr sót lại ở `vextractor.main` là một khối
+         đang đổi trong khi bảng đặc tả nói nó đứng yên (bài 7 và 17 khoá chỗ
+         này từ hai phía: trạng thái của nhánh, và khối config).
     """
     import json as _json
 

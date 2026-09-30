@@ -180,8 +180,12 @@ def frozen_warmup_flat(step: int, n_freeze: int, n_warmup: int,
     """**0** trong `n_freeze` bước đầu, rồi `warmup_flat` tính từ mốc ấy.
 
     Trả về đúng `0.0` chứ không phải một lr rất nhỏ: 0 là thứ người gọi so để
-    biết lúc nào gọi `set_compressor_frozen(False)`. Một lr 1e-30 vẫn khiến
-    backward chạy đủ (và tốn đủ) trong khi không cập nhật gì.
+    biết khối còn đóng băng hay không. Một lr 1e-30 vẫn khiến backward chạy đủ
+    (và tốn đủ) trong khi không cập nhật gì.
+
+    KHÔNG còn ai gọi hàm này trong đường chạy chính: main stage đóng băng
+    Compressor HOÀN TOÀN nên không có mốc mở băng nào nữa. Giữ lại vì nó là một
+    hàm lịch THUẦN và selftest còn kiểm nó như một mảnh của `schedule`.
     """
     f = max(0, int(n_freeze))
     if int(step) < f:

@@ -20,7 +20,7 @@ Hai candidate:
      — chỉ khi TEM khớp (vân tay config, sha256 weight, batch sinh, đủ mẫu).
   B  `vextractor_exp.candidate` = A + V-Extractor: Stage 0 rồi main stage trên ĐÚNG
      fixture/lịch của A (`src/train_vextractor.py`), chuỗi vào decoder dài thêm
-     `vextractor.vextractor.n_query` (128) token.
+     `vextractor.vextractor.n_query` (16) token.
 
 Mã thoát: 0 xong · 1 thiếu kết quả · 2 cấu hình sai / fixture lệch · 3 train
           hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng

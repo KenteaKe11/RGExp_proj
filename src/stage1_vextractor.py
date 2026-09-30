@@ -4,14 +4,15 @@
          └─► view_s ─► Extractor(0) ─► Compressor ─► mean(V_c) ─► head MỚI ─► s_raw
                  loss = CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
 
-**Mục tiêu: làm giàu không gian Compressor TRƯỚC khi đưa vào Aligner.** Ở main
-stage, Compressor + Aligner + LoRA cùng động; nếu Compressor còn ngẫu nhiên ở
-bước 0 thì 200 bước của main stage phải vừa học nén ảnh vừa học viết báo cáo.
-Stage 1 mua một điểm khởi đầu KHÔNG ngẫu nhiên cho 8 latent.
+**Mục tiêu: làm giàu không gian Compressor TRƯỚC khi đưa vào Aligner.** Stage 1
+là giai đoạn DUY NHẤT Compressor học: ở main stage nó ĐÓNG BĂNG HOÀN TOÀN, chỉ
+Aligner và LoRA còn động. Nên 16 latent phải rời Stage 1 ở một điểm dùng được —
+không có 200 bước nào sau đó để sửa chúng.
 
 **Cái giá, và nó có thật.** Stage 1 chỉ dạy Compressor bắt chước một phép pool
-của teacher. Nó KHÔNG biết gì về báo cáo, nên nó không thể nói 8 vector ấy có
-mang thông tin bệnh lý hay không — câu ấy vẫn để main stage trả lời.
+của teacher. Nó KHÔNG biết gì về báo cáo, nên nó không thể nói 16 vector ấy có
+mang thông tin bệnh lý hay không — và vì Compressor không còn học ở main stage,
+câu ấy được trả lời bởi Aligner chứ không bởi một lượt finetune của chính nó.
 
 **Vì sao teacher không phải EMA ở đây.** Ở Stage 0 teacher là trung bình trượt
 của student, và cặp EMA + centering là thứ giữ DINO khỏi sụp về một điểm. Ở
@@ -29,7 +30,7 @@ khác nhau:
     Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 3e-5
     FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 3e-4
 
-Ma trận attention quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
+Ma trận attention quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
 một mức cao hơn — ở đây cao hơn **10 lần** (3e-4 so với 3e-5).

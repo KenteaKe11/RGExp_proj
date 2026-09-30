@@ -1,7 +1,7 @@
 """FocalNet extractor, QFormer compressor, and vision-language aligner.
 
 FocalNet-Base LRF Stage 3 maps 448x448 images to 512 channels at 28x28. The feature
-grid is flattened to 784 tokens before compression to eight latent vectors.
+grid is flattened to 784 tokens before compression to sixteen latent vectors.
 """
 from __future__ import annotations
 
@@ -551,7 +551,7 @@ class QFormerGroup(nn.Module):
     riêng khối con ngay trước nó. Năm dấu `+`, năm RMSNorm — selftest so THẲNG
     năm công thức trên, nên trả nhầm một residual sẽ bị bắt ngay.
 
-    **Khối 2 không có Cross-attn, và đó là chủ ý.** Nó để 8 vector *thống nhất
+    **Khối 2 không có Cross-attn, và đó là chủ ý.** Nó để 16 vector *thống nhất
     lại với nhau* sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp.
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
@@ -568,8 +568,8 @@ class QFormerGroup(nn.Module):
         MỘT nhóm (khối 1 → khối 2)     = 9 047 808
 
     > Mỗi nhóm có **9 047 808** tham số. Tổng Compressor ở `N = 4` là
-    > **36 197 888**, cộng `latent` (8 × 768 = 6 144) và `RMSNorm(V)` (512)
-    > ngoài bốn nhóm khối.
+    > **36 204 032** = 4 × 9 047 808, cộng `latent` (16 × 768 = 12 288) và
+    > `RMSNorm(V)` (512) ngoài bốn nhóm khối.
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
@@ -612,10 +612,10 @@ class Compressor(nn.Module):
     """V (B, n_patch, d_feat) -> V_c (B, n_query, d_latent). QFormer, N nhóm khối.
 
         kv  = RMSNorm(V)                        768, MỘT lần, ngoài mọi nhóm
-        q   = latent.expand(B)                  (B, 8, 768)
+        q   = latent.expand(B)                  (B, 16, 768)
         q   = group_i(q, kv)   với i = 1..N     mỗi nhóm = khối 1 + khối 2
 
-    **8 latent là khoá KHAI** (`n_query`) — lưới của Extractor (784 ô ở 448²)
+    **16 latent là khoá KHAI** (`n_query`) — lưới của Extractor (784 ô ở 448²)
     chỉ là NGUỒN để hỏi, không phải khối Q.
 
     **`RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer.**
@@ -623,13 +623,13 @@ class Compressor(nn.Module):
     Cross-attn. Lý do là đếm được — một lớp chiếu riêng thêm 0,49 M tham số mà
     không thêm sức biểu diễn nào (nó chỉ gộp được vào `k`/`v` phía sau).
 
-    **Chi phí nằm ở `d_latent`, không ở `n_query`.** 8 latent là 6 144 tham
+    **Chi phí nằm ở `d_latent`, không ở `n_query`.** 16 latent là 12 288 tham
     số; mỗi SelfAttn @768 là 2,36 M. Đổi `n_query` gần như không đụng tới bảng
     tham số (nó đụng tới THỜI GIAN và tới độ dài chuỗi decoder); đổi `d_latent`
     thì đụng tới tất cả, theo d².
     """
 
-    def __init__(self, d_feat: int, n_query: int = 8, d_latent: int = 768,
+    def __init__(self, d_feat: int, n_query: int = 16, d_latent: int = 768,
                  head_dim: int = 128, mlp_hidden: int = 512, n_blocks: int = 4,
                  dropout: float = 0.0):
         super().__init__()
@@ -665,7 +665,7 @@ class Compressor(nn.Module):
         """Tham số của MỌI attention (Self ×2 + Cross ×1, mỗi nhóm khối).
 
         Stage 1 chạy nhóm này ở lr THẤP HƠN nhóm FFN (7e-5 so với 1e-4): ma
-        trận attention quyết định 8 vector ĐỌC Ở ĐÂU trên lưới, và đó là thứ
+        trận attention quyết định 16 vector ĐỌC Ở ĐÂU trên lưới, và đó là thứ
         dễ hỏng nhất khi bị đẩy nhanh — một bước lớn làm phân phối attention
         sụp về vài ô rồi không quay lại.
         """
@@ -677,7 +677,7 @@ class Compressor(nn.Module):
         """SwiGLU + RMSNorm + latent — mọi thứ KHÔNG phải attention.
 
         `latent` và các RMSNorm đi cùng nhóm này (lr cao hơn) vì chúng là phần
-        "nội dung" của khối: latent là 32 câu hỏi, RMSNorm là thang đo. Đặc tả
+        "nội dung" của khối: latent là 16 câu hỏi, RMSNorm là thang đo. Đặc tả
         chỉ khai HAI nhóm, nên chỗ để chúng phải nói ra chứ không để ngầm.
         """
         yield self.latent
@@ -715,9 +715,9 @@ class Aligner(nn.Module):
         y = RMSNorm(x)
         Q = down( SiLU(gate(y)) ⊙ up(y) )    768 -> mlp_hidden (2048) -> 2560
 
-    **MHAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt TỰ-chú ý trên đúng 8 vector
+    **MHAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt TỰ-chú ý trên đúng 16 vector
     của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới. Nên nó
-    không thêm một bit thông tin thị giác nào — việc của nó là trộn 8 vector
+    không thêm một bit thông tin thị giác nào — việc của nó là trộn 16 vector
     MỘT lần nữa ngay tại ranh giới ngữ nghĩa, sau khi Compressor đã nén xong và
     trước khi `down` đưa chúng sang không gian embedding của decoder.
 
@@ -794,7 +794,7 @@ class Aligner(nn.Module):
         """Bốn chiếu của MHAttn — nhóm lr RIÊNG (1e-7 -> 1e-5).
 
         Cùng lý do như ở Stage 1 của Compressor, dịch sang chỗ này: ma trận
-        attention quyết định 8 vector TRỘN VỚI NHAU thế nào, và một bước lớn
+        attention quyết định 16 vector TRỘN VỚI NHAU thế nào, và một bước lớn
         làm phân phối ấy sụp về một vector rồi không quay lại. FFN chỉ biến đổi
         thứ đã trộn xong, nên nó chịu được mức cao hơn **10 lần**.
         """
@@ -1030,21 +1030,24 @@ def build_aligner(spec: dict) -> Aligner:
 
 # ══ Nhánh hoàn chỉnh ════════════════════════════════════════════════════════
 class VExtractorBranch(nn.Module):
-    """Extractor (đóng băng) + Compressor + Aligner -> Q (B, n_query, d_model).
+    """Extractor (đóng băng) + Compressor (đóng băng) + Aligner -> Q (B, n_query, d_model).
 
-    BA phần, BA số phận ở main stage:
+    BA phần, và ở main stage chỉ MỘT phần học:
 
-      * `extractor` — ConvNeXt **TEACHER (EMA)** do Stage 0 tự giám sát dạy.
+      * `extractor` — FocalNet **TEACHER (EMA)** do Stage 0 tự giám sát dạy.
         `set_frozen(True)` đưa nó về đúng chế độ **teacher inference**:
         requires_grad=False + eval() + chạy trong `no_grad`, nên nó không có
         gradient, không tốn activation, không có bước Adam nào;
-      * `compressor` — đến từ Stage 1, ĐÓNG BĂNG 20% bước đầu rồi mở ở một lr
-        nhỏ (1e-5) sau một dốc ngắn;
-      * `aligner` — MỚI, khởi tạo ngẫu nhiên, học CÙNG LoRA từ bước 0.
+      * `compressor` — đến từ Stage 1, và **cũng đóng băng hoàn toàn** ở main
+        stage: `set_compressor_frozen(True)` một lần, không có mốc mở băng nào.
+        Stage 1 là giai đoạn DUY NHẤT nó học; ở main stage nó là một hàm cố
+        định biến V thành V_c;
+      * `aligner` — MỚI, khởi tạo ngẫu nhiên, **khối DUY NHẤT học ở main
+        stage**, và học CÙNG LoRA từ bước 0.
 
-    `trainable_parameters()` gộp đúng hai nhóm sau và là thứ duy nhất đi vào
-    optimizer của nhánh. `set_frozen(False)` (Lens dùng) mở băng Extractor để
-    lấy gradient tới tận pixel.
+    `trainable_parameters()` vì thế trả ĐÚNG tham số của Aligner và là thứ duy
+    nhất đi vào optimizer của nhánh. `set_frozen(False)` (Lens dùng) mở băng
+    Extractor để lấy gradient tới tận pixel.
     """
 
     def __init__(self, spec: dict):
@@ -1077,8 +1080,13 @@ class VExtractorBranch(nn.Module):
 
     # ── nhóm tham số ──────────────────────────────────────────────────────
     def trainable_parameters(self):
-        """Compressor + Aligner — hai nhóm DUY NHẤT của main stage."""
-        yield from self.compressor.parameters()
+        """Aligner — khối DUY NHẤT học ở main stage.
+
+        Compressor KHÔNG ở đây: nó đến từ Stage 1 và đóng băng hoàn toàn ở main
+        stage. Một tham số đóng băng nằm trong optimizer vẫn bị weight decay ăn
+        mòn mỗi bước dù grad là None, nên "đóng băng" và "có mặt trong
+        optimizer" không đi cùng nhau được.
+        """
         yield from self.aligner.parameters()
 
     def set_frozen(self, frozen: bool) -> None:
@@ -1094,17 +1102,47 @@ class VExtractorBranch(nn.Module):
     def set_compressor_frozen(self, frozen: bool) -> None:
         """Đóng băng RIÊNG Compressor. KHÔNG chạm Aligner.
 
-        `requires_grad_(False)` chứ không phải lr = 0: Compressor là khối học
-        được ĐẦU TIÊN sau Extractor, nên tắt grad ở đây cắt hẳn phần backward
-        dưới `Aligner` — tiết kiệm thật, không chỉ là không cập nhật.
+        Main stage gọi nó ĐÚNG MỘT LẦN với `True` và không bao giờ gọi lại:
+        Compressor học ở Stage 1 và chỉ ở đó. `requires_grad_(False)` chứ không
+        phải lr = 0 — Compressor là khối học được đầu tiên sau Extractor, nên
+        tắt grad ở đây cắt hẳn phần backward bên dưới `Aligner`, tiết kiệm
+        thật chứ không chỉ là không cập nhật.
+
+        `eval()` đi kèm vì cùng một lý do với Extractor: một khối đóng băng
+        chạy ở chế độ train vẫn tiêu dropout (và tiêu RNG) trong khi trọng số
+        của nó không đổi.
         """
         self.compressor_frozen = bool(frozen)
         for p in self.compressor.parameters():
             p.requires_grad_(not frozen)
+        self.compressor.train(self.training and not frozen)
+
+    def train(self, mode: bool = True):
+        """`nn.Module.train` cộng việc GIỮ hai khối đóng băng ở `eval`.
+
+        `super().train()` đệ quy xuống mọi con, nên nếu không áp lại ở đây thì
+        mỗi lần vòng lặp gọi `branch.train()` là Compressor lặng lẽ quay về chế
+        độ train. `Extractor` tự lo phần của nó trong `Extractor.train`.
+        """
+        super().train(mode)
+        self.compressor.train(mode and not self.compressor_frozen)
+        return self
 
     def forward(self, px: torch.Tensor) -> torch.Tensor:
-        """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model)."""
-        return self.aligner(self.compressor(self.extractor(px)))
+        """px (B, 3, S, S) đã chuẩn hoá theo backbone -> Q (B, n_query, d_model).
+
+        Compressor chạy trong `no_grad` khi CẢ nó VÀ Extractor đều đóng băng —
+        lúc ấy không còn gì bên dưới `Aligner` cần gradient, nên giữ activation
+        của 784 ô × 4 nhóm khối là trả tiền VRAM cho một đồ thị không ai dùng.
+        Điều kiện phải gồm cả `self.frozen`: Lens mở băng Extractor để truy
+        ngược tới pixel, và đồ thị ấy đi XUYÊN QUA Compressor.
+        """
+        v = self.extractor(px)
+        ctx = (torch.no_grad() if (self.compressor_frozen and self.frozen)
+               else contextlib.nullcontext())
+        with ctx:
+            vc = self.compressor(v)
+        return self.aligner(vc)
 
     def n_params(self) -> dict:
         c = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
@@ -1120,7 +1158,10 @@ class VExtractorBranch(nn.Module):
                                     for p in self.aligner.attn_parameters()),
                 "aligner_ffn": sum(p.numel()
                                    for p in self.aligner.ffn_parameters()),
-                "learnable_main": cmp_ + al,
+                # HỌC ở main stage = ĐÚNG Aligner. Compressor học ở Stage 1
+                # và đóng băng từ đó, nên nó ở khoá riêng.
+                "learnable_main": al,
+                "learnable_stage1": cmp_,
                 "trainable": sum(p.numel() for p in self.parameters()
                                  if p.requires_grad),
                 "total": ext + cmp_ + al}

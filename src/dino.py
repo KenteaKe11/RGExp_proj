@@ -330,7 +330,7 @@ class CompressorTransferTrainer(nn.Module):
 
     **Centering và sharpening vẫn giữ**, dù lý do đã hẹp lại: chúng không còn
     chống sụp, chúng định HÌNH DẠNG của đích. Bỏ centering là để vài prototype
-    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 8 vector
+    thống trị mọi ảnh; bỏ sharpening là học một phân phối gần đều, và 16 vector
     không phải nén gì cả.
 
     **CÙNG một Extractor cho cả hai nhánh.** `extractor` là MỘT object, không
@@ -341,10 +341,10 @@ class CompressorTransferTrainer(nn.Module):
     `student_head` là giàn giáo của riêng Stage 1 (1024 → … → K prototype) và bị
     BỎ sau đó, y như DINO head của Stage 0 bị bỏ sau Stage 0.
 
-    **`mean(V_c)` — trung bình 8 vector.** DINO head cần MỘT vector mỗi ảnh, và
-    8 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong
-    đó). Lấy vector đầu là chọn bừa một trong 32; lấy trung bình là hỏi "cả cụm
-    8 vector, gộp lại, có mang đúng thứ teacher mang không".
+    **`mean(V_c)` — trung bình 16 vector.** DINO head cần MỘT vector mỗi ảnh, và
+    16 latent là một tập không có thứ tự ưu tiên nào (không có cls token trong
+    đó). Lấy vector đầu là chọn bừa một trong 16; lấy trung bình là hỏi "cả cụm
+    16 vector, gộp lại, có mang đúng thứ teacher mang không".
     """
 
     def __init__(self, extractor: nn.Module, compressor: nn.Module,

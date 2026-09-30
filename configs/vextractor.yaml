@@ -2,7 +2,7 @@
 # §2.2 V-EXTRACTOR — [Z ‖ T] vs [Z ‖ Q ‖ T] — CONFIG NỘI DUNG
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
-# cùng loader, cùng 3000 ảnh test), NỐI thêm 8 learner vector Q ngay sau 256
+# cùng loader, cùng 3000 ảnh test), NỐI thêm 16 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
@@ -13,8 +13,8 @@
 #                                    nhánh V-Extractor (backbone teacher infer).
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Aligner(Compressor(Extractor(ảnh 448²))) — 8 vector MỚI; Z (256 token
-# ảnh) KHÔNG bị đụng vào. 8 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
+# với Q = Aligner(Compressor(Extractor(ảnh 448²))) — 16 vector MỚI; Z (256 token
+# ảnh) KHÔNG bị đụng vào. 16 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
 # tạo 0. Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
 # và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
 # thông tin là các đặc trưng thị giác nó đọc. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
@@ -23,7 +23,7 @@
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
 # đây nhánh có encoder RIÊNG (FocalNet-B ăn ảnh 448²) — và chuỗi dài
-# thêm 8.
+# thêm 16.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
 # generate, train, metrics) được chép NGUYÊN VĂN từ configs/lora.yaml của $1
@@ -321,53 +321,51 @@ vextractor:
     pretrained: true
     n_layers: null
     n_stages: 3
-  compressor:               # QFormer: V (784, 512) -> V_c (8, 768)
-    n_query: 8              # số latent = số token Q nối vào chuỗi decoder
+  compressor:               # QFormer: V (784, 512) -> V_c (16, 768)
+    n_query: 16             # số latent = số token Q nối vào chuỗi decoder
     d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
     head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
     mlp_hidden: 512         # SwiGLU bottleneck
     n_blocks: 4             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (8, 768) -> Q (8, 2560)
+  aligner:                  # V_c (16, 768) -> Q (16, 2560)
     mlp_hidden: 2048        # SwiGLU 768→2048→2560 (8 388 608); NỞ RA
     dropout: 0.0
 
-  # ── Main stage: HAI khối, BỐN nhóm lr (`src/train_vextractor.py`) ───────
+  # ── Main stage: MỘT khối học được, HAI nhóm lr (`src/train_vextractor.py`) ─
   # Mốc khai theo TỈ LỆ tổng số bước, không theo số bước tuyệt đối: main stage
   # khoá 1 epoch = 200 bước theo $1, nhưng `--dry-run` và mọi lần đổi
-  # `train_batch` đổi con số ấy. Khai "40 bước" thì với một lần chạy 4 bước,
-  # Compressor không bao giờ mở.
+  # `train_batch` đổi con số ấy. Khai "20 bước" thì với một lần chạy 4 bước,
+  # warm-up đã xong trước khi Aligner kịp đi bước nào ở lr đầy đủ.
   #
-  #   Aligner     HỌC CÙNG LoRA NGAY TỪ BƯỚC 0 — mục tiêu của nó là học cách
-  #               biến tín hiệu đặc trưng thị giác sang không gian ngữ nghĩa,
-  #               và nó không làm được việc ấy nếu bị đóng băng lúc LoRA đang
-  #               định hình. warm-up 10% bước rồi PHẲNG, HAI nhóm:
+  #   Aligner     KHỐI DUY NHẤT học ở main stage, và nó HỌC CÙNG LoRA NGAY TỪ
+  #               BƯỚC 0 — mục tiêu của nó là học cách biến tín hiệu đặc trưng
+  #               thị giác sang không gian ngữ nghĩa, và nó không làm được việc
+  #               ấy nếu bị đóng băng lúc LoRA đang định hình. warm-up 10% bước
+  #               rồi PHẲNG, HAI nhóm:
   #                 ffn  (SwiGLU + 2 RMSNorm)  1e-6 -> 1e-4
   #                 attn (4 chiếu MHAttn)      1e-7 -> 1e-5
   #               Cùng MỘT dốc cho cả hai: chúng nằm trong cùng một khối ngẫu
   #               nhiên và phải đi vào cùng một lúc.
   #
-  #   Compressor  ĐÓNG BĂNG HOÀN TOÀN 20% bước đầu, rồi warm-up 10% bước, rồi
-  #               PHẲNG. Mục tiêu của nó ở đây KHÁC Stage 1: học cách xử lý đặc
-  #               trưng đã có THEO tín hiệu từ LoRA → Aligner. Tín hiệu ấy chưa
-  #               tồn tại ở bước 0, nên 20% bước đầu là thời gian để nó xuất
-  #               hiện. HAI nhóm:
-  #                 ffn   1e-7 -> 1e-5
-  #                 attn  1e-8 -> 1e-6
-  #               `requires_grad=False` chứ không phải lr = 0: Compressor là
-  #               khối học được ĐẦU TIÊN sau Extractor, nên tắt grad ở đó cắt
-  #               hẳn phần backward bên dưới Aligner. Vì nó tắt cả khối, hai
-  #               nhóm KHÔNG THỂ mở ở hai thời điểm khác nhau.
+  #   Compressor  KHÔNG BAO GIỜ mở. Nó nạp checkpoint Stage 1 rồi chạy ở chế độ
+  #               INFERENCE (requires_grad=False + eval + no_grad + KHÔNG nằm
+  #               trong optimizer) suốt main stage. Stage 1 là chỗ DUY NHẤT nó
+  #               học; ở đây nó là một hàm cố định biến V thành V_c, nên 16
+  #               vector Q chỉ đổi qua Aligner.
   #
   #   Extractor   KHÔNG BAO GIỜ mở. Nó nạp trọng số TEACHER (EMA) của Stage 0 và
   #               chạy ở chế độ TEACHER INFERENCE (requires_grad=False + eval +
   #               no_grad + KHÔNG nằm trong optimizer) suốt main stage.
   #
-  # Attn thấp hơn FFN đúng 10 lần ở CẢ HAI khối, cùng một lý do đã tách hai nhóm
-  # ở Stage 1: ma trận attention quyết định 8 vector đọc/trộn Ở ĐÂU, còn FFN chỉ
-  # biến đổi thứ đã đọc xong. `zcfg` TỪ CHỐI cấu hình đảo dấu.
+  # Nói cách khác: main stage học ĐÚNG hai thứ — LoRA của decoder và Aligner.
+  # Mọi module khác của nhánh đóng băng hoàn toàn.
   #
-  # Bốn nhóm PHỦ KÍN hai khối (`attn_parameters` + `ffn_parameters` là một PHÂN
+  # Attn thấp hơn FFN đúng 10 lần, cùng một lý do đã tách hai nhóm ở Stage 1:
+  # ma trận attention quyết định 16 vector TRỘN VỚI NHAU thế nào, còn FFN chỉ
+  # biến đổi thứ đã trộn xong. `zcfg` TỪ CHỐI cấu hình đảo dấu.
+  #
+  # HAI nhóm PHỦ KÍN Aligner (`attn_parameters` + `ffn_parameters` là một PHÂN
   # HOẠCH), và `train` DỪNG nếu không: một tham số học được nằm ngoài optimizer
   # là một tensor đứng yên suốt 200 bước mà không có gì báo. Optimizer đặt lr
   # theo TÊN nhóm, không theo chỉ số.
@@ -380,13 +378,6 @@ vextractor:
     align_attn_lr_main: 1.0e-5
     align_warmup_frac: 0.10     # 10% tổng bước (= 20/200), dùng cho CẢ hai nhóm
     align_wd: 0.01
-    comp_ffn_lr_min: 1.0e-7
-    comp_ffn_lr_main: 1.0e-5
-    comp_attn_lr_min: 1.0e-8
-    comp_attn_lr_main: 1.0e-6
-    comp_freeze_frac: 0.20      # 20% tổng bước ĐÓNG BĂNG (= 40/200)
-    comp_warmup_frac: 0.10      # rồi 10% tổng bước warm-up (= 20/200)
-    comp_wd: 0.01
     separate_clip: true         # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 1: COMPRESSOR TRANSFER LEARNING — `src/stage1_vextractor.py` ───────
@@ -417,7 +408,7 @@ vextractor:
 #
 # HAI nhóm lr, cùng lịch chung nhưng hai CẶP số: warm-up tuyến tính trong
 # `warmup_epochs` epoch rồi GIỮ `lr_max` của từng nhóm tới hết. Ma trận attention
-# quyết định 8 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
+# quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
 # bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
 # lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
 # `latent` + mọi RMSNorm + DINO head mới đi theo nhóm FFN (xem

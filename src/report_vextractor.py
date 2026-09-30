@@ -105,14 +105,12 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
                           f"— checkpoint là bản TEACHER (EMA)"],
         ["nhánh ở main stage", "—",
          f"backbone = TEACHER (EMA) của Stage 0, chạy TEACHER INFERENCE "
-         f"(eval + no_grad, 0 bước học) · "
-         f"Compressor + Aligner, Aligner warm-up {zm.get('align_warmup_frac')} tổng bước "
+         f"(eval + no_grad, 0 bước học) · Compressor = checkpoint Stage 1, "
+         f"ĐÓNG BĂNG HOÀN TOÀN (eval + no_grad, 0 bước học) · "
+         f"CHỈ Aligner học, warm-up {zm.get('align_warmup_frac')} tổng bước "
          f"(ffn {zm.get('align_ffn_lr_min')} -> {zm.get('align_ffn_lr_main')} │ "
          f"attn {zm.get('align_attn_lr_min')} -> {zm.get('align_attn_lr_main')}) "
-         f"rồi phẳng (wd {zm.get('align_wd')}); Compressor đóng băng "
-         f"{zm.get('comp_freeze_frac')} tổng bước rồi warm-up "
-         f"{zm.get('comp_warmup_frac')} tới ffn {zm.get('comp_ffn_lr_main')} │ "
-         f"attn {zm.get('comp_attn_lr_main')}"],
+         f"rồi phẳng (wd {zm.get('align_wd')})"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
@@ -230,21 +228,22 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              f"một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
     _np = (st_b.get("vextractor") or {}).get("n_params") or {}
     _lm = _np.get("learnable_main")
-    L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và chạy ở chế độ "
-             f"TEACHER INFERENCE suốt main stage: 0 bước cập nhật, "
-             f"không có gradient nào chạm vào nó. Tham số học được mà A không có "
-             f"nằm TRỌN trong Compressor + Aligner "
-             f"({_lm:,} tham số): Aligner ở lr ffn {zm.get('align_ffn_lr_main')} │ "
+    _ls1 = _np.get("learnable_stage1")
+    L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và COMPRESSOR là "
+             f"checkpoint của Stage 1; cả hai chạy ở chế độ INFERENCE suốt main "
+             f"stage: 0 bước cập nhật, không có gradient nào chạm vào chúng. "
+             f"Tham số học được mà A không có nằm TRỌN trong Aligner "
+             f"({_lm:,} tham số"
+             f"{f'; Compressor {_ls1:,} tham số đóng băng' if isinstance(_ls1, int) else ''}"
+             f"): ffn {zm.get('align_ffn_lr_main')} │ "
              f"attn {zm.get('align_attn_lr_main')} "
-             f"(warm-up {zm.get('align_warmup_frac')} tổng bước), Compressor ở "
-             f"ffn {zm.get('comp_ffn_lr_main')} │ attn {zm.get('comp_attn_lr_main')} "
-             f"sau {zm.get('comp_freeze_frac')} bước "
-             f"đóng băng — chênh lệch A/B vì thế "
-             f"là của một ENCODER CỐ ĐỊNH cộng một khối nén học được, không "
-             f"phải của một encoder được finetune cùng decoder."
+             f"(warm-up {zm.get('align_warmup_frac')} tổng bước) — chênh lệch "
+             f"A/B vì thế là của một ENCODER CỐ ĐỊNH (Extractor + Compressor) "
+             f"cộng một phép căn chỉnh học được, không phải của một encoder "
+             f"được finetune cùng decoder."
              if isinstance(_lm, int) else
-             f"- Backbone ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
-             f"của nhánh nằm trọn trong Compressor + Aligner, lr "
+             f"- Extractor và Compressor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; "
+             f"tham số học được của nhánh nằm trọn trong Aligner, lr "
              f"{zm.get('align_ffn_lr_main')}.")
     L.append("")
     out = run_dir / "REPORT.md"
