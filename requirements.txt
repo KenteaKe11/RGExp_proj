@@ -37,6 +37,11 @@ qwen-vl-utils>=0.0.8
 huggingface_hub>=0.26.0
 # Tải đa kết nối (mạng máy thuê ~5 Gbps): scripts/_env.sh chỉ bật khi có gói này
 hf_transfer>=0.1.6
+# hf_xet: đường tải MỚI của Hub (chunk-level dedup + nhiều kết nối). `_env.sh`
+# đã export `HF_XET_HIGH_PERFORMANCE=1` — biến ấy KHÔNG làm gì nếu thiếu gói
+# này, nên khai thẳng. huggingface_hub 1.x kéo nó theo như phụ thuộc lõi; khai
+# ở đây để một lần ghim hub xuống 0.3x cũng không lặng lẽ mất đường nhanh.
+hf_xet>=1.0.0
 pandas>=2.0.0
 numpy>=1.26.0
 pillow>=10.0.0

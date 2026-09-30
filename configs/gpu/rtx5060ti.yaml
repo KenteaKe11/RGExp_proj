@@ -9,6 +9,11 @@
 # batch HIỆU DỤNG) ở configs/vextractor.yaml. grad_accum được suy ra:
 #     32 / 1 = 32
 #
+# Máy đích: Windows 11 · i7-12700K (8P + 4E = 20 luồng) · 28 GB RAM ·
+# NVMe 1600 GB · 1× RTX 5060 Ti 16 GB. Ba con số ngoài GPU quyết định khối
+# `io.*` bên dưới: 20 luồng (giải nén), 28 GB RAM (prefetch), và 1600 GB đĩa
+# (tải TRỌN zip thay vì stream).
+#
 # ⚠ ĐỔI CARD KHÔNG ĐƯỢC ĐỔI KẾT QUẢ. File này chỉ nói "chạy thế nào", nên thứ
 # duy nhất nó được phép đụng tới là TỐC ĐỘ và VRAM. Cụ thể: 4 GB thừa so với
 # RTX 3060 đi vào Stage 0 / Stage 1 / sinh — KHÔNG đi vào `train.
@@ -108,13 +113,44 @@ set:
   autobatch.infer_max_bs: 16
 
   # ── I/O (src/hw.py, src/data.py, src/prefetch.py) ───────────────────────
-  # `content` = KHÔNG quyết ở đây, để `data.zip_mode` (auto) quyết: auto stream
-  # trước rồi tự chuyển sang tải trọn zip nếu stream quá chậm
-  # (`data.zip_stream_min_rate`). rtx3060 khai thẳng `download` vì máy ấy có
-  # số ĐO: mạng ~5 Gbps + đĩa 100 GB. Card này không đi kèm một máy cố định
-  # nào, nên khai `download` ở đây là khai một giả định về mạng và 17,7 GB đĩa
-  # trống mà file config GPU không có cách nào biết.
-  io.workers: auto
-  io.prefetch_depth: 3            # số micro-batch dựng sẵn trước GPU
+  # 20, không `auto`. `auto` = `hw.cpu_budget()`, và trên Windows nó rơi về
+  # `os.cpu_count()` (`os.sched_getaffinity` không có) = 20 — nên hai giá trị
+  # TRÙNG NHAU ở đây. Khai thẳng số vì máy đã biết: `auto` là câu trả lời cho
+  # "container được cấp bao nhiêu vCPU", một câu hỏi không tồn tại trên máy này.
+  #
+  # 20 luồng ấy đi vào `_extract`: mỗi luồng nhận một đoạn LIỀN KỀ của zip, mở
+  # handle riêng, rồi inflate + decode JPEG + resize + nén lại. PIL và zlib nhả
+  # GIL nên nó scale thật trên 20 luồng logic.
+  io.workers: 20
+  # 4, không 3: 28 GB RAM và `train.per_device_batch_size` = 1, nên mỗi
+  # micro-batch dựng sẵn chỉ là một ảnh (448² cho nhánh + 896² cho processor của
+  # Gemma) — thêm một bậc queue gần như miễn phí và che được độ trễ đọc đĩa.
+  io.prefetch_depth: 4            # số micro-batch dựng sẵn trước GPU
   io.pin_memory: true             # CPU->GPU không chặn (pinned + non_blocking)
-  io.zip_mode: content
+  # ── `download`, KHÔNG `content`/`auto` — và đây là phép tính, không phải
+  #    sở thích ────────────────────────────────────────────────────────────
+  # `auto` (mặc định của `data.zip_mode`) stream trước: đọc central directory
+  # rồi RANGE-request từng entry, 8 kết nối song song, fsspec đệm theo block
+  # 8 MB. Nghe như nó chỉ tải phần cần — nhưng KHÔNG, ở đúng tỉ lệ của thí
+  # nghiệm này:
+  #
+  #     cần  = n_train 6400 + n_val 2000 + n_test 3000 = 11 400 ảnh
+  #     zip  = 157 917 entry / 17,7 GB  ->  ~112 KB/ảnh, ~71 entry mỗi block 8 MB
+  #     tỉ lệ cần = 7,2%, và split là mẫu NGẪU NHIÊN nên chúng RẢI RÁC
+  #     => P(một block 8 MB chứa ít nhất một ảnh cần) = 1 − (1−0,072)^71 ≈ 99,5%
+  #
+  # Tức stream phải chạm gần như MỌI block, tải gần đủ 17,7 GB ấy — nhưng qua
+  # 8 kết nối HTTPS với một lượt đi-về mỗi block, thay vì một lượt tải trọn file
+  # đa kết nối (hf_transfer / hf_xet, `scripts/_env.sh` bật). Và `auto` cũng
+  # không cứu được: nó chỉ bỏ stream khi tốc độ dưới `data.zip_stream_min_rate`
+  # = 1 ảnh/s — ở mức ấy 11 400 ảnh là hơn 3 GIỜ mà vẫn "đủ nhanh" để không
+  # fallback.
+  #
+  # `download` đổi cả hai chỗ: tải trọn zip đa kết nối (và `hf_hub_download`
+  # CACHE nó, nên lần chạy sau — kể cả sau `--retrain-all` — là 0 byte mạng),
+  # rồi giải nén bằng `io.workers` = 20 luồng trên NVMe thay vì 8 luồng bị
+  # chặn ở mạng. Giá: ~17,7 GB đĩa cho zip (cộng ~1 GB cache ảnh đã resize,
+  # ~8,6 GB Gemma, ~1,05 GB InternImage-L, ~1,4 GB roberta-large) — trên 1600 GB
+  # là không đáng kể. Đây CHÍNH là lý do rtx3060 cũng khai `download`; khác biệt
+  # duy nhất là ở đó đĩa 100 GB nên con số phải cân, còn ở đây thì không.
+  io.zip_mode: download
