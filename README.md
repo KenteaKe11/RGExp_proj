@@ -700,6 +700,7 @@ python scripts/selftest_vextractor.py             # ~30 kiểm tra, vài giây, 
 bash scripts/run_vextractor.sh train --dry-run    # 8 ảnh, 16 mẫu, Stage 0/1 ≤2 bước, main 4 bước
 
 bash scripts/run_vextractor.sh train --detach     # 1. kéo A -> Stage 0 -> Stage 1 -> main B -> sinh -> chấm
+bash scripts/run_vextractor.sh train --gpu rtx5060ti --detach   # ... trên RTX 5060 Ti 16 GB (Blackwell)
 bash scripts/run_vextractor.sh stats              # 2. bootstrap + permutation -> REPORT.md (GHI ĐÈ)
 bash scripts/run_vextractor.sh lens               # 3. mổ khối Q trên 1 ảnh -> Lens/Lens_Explain.md
 bash scripts/run_vextractor.sh push               # 4. -> current/$2.2_V-Extractor_Test/
@@ -775,7 +776,7 @@ history, nên so hash là vứt mọi checkpoint đẩy lên trước lần sử
 # 7. Cấu trúc
 
 ```
-configs/vextractor.yaml · configs/gpu/rtx3060.yaml (stage0/stage1 micro_batch + probe_sizes)
+configs/vextractor.yaml · configs/gpu/{rtx3060,rtx5060ti}.yaml (stage0/stage1 micro_batch + probe_sizes)
 scripts/run_vextractor.sh · selftest_vextractor.py · setup.sh · _env.sh
 src/run_vextractor.py    train (kéo A → Stage 0 → Stage 1 → main B → sinh → chấm) · stats · lens · push
 src/schedule.py          LỊCH DÙNG CHUNG: warmup_flat (dốc 1 epoch rồi GIỮ lr_max) ·

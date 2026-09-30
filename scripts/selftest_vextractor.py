@@ -132,6 +132,68 @@ def _():
     assert int(b["train"]["effective_batch"]) == 32 and int(b["train"]["n_epochs"]) == 1
 
 
+@check("1b. MỌI config GPU: đủ GPU_KEYS, không khoá lạ, và `train.per_device_batch_size` "
+       "GIỐNG NHAU ở mọi card (nó là khoá của $1, không phải khoá của VRAM)")
+def _():
+    """Thêm một card là chỗ dễ nhất để một khoá THÍ NGHIỆM trốn vào config GPU.
+
+    Ba thứ hỏng im lặng, và cả ba được kiểm ở đây:
+
+      1. **thiếu một khoá GPU** -> `apply_gpu_config` đã DỪNG, nhưng chỉ khi có
+         ai chạy đúng card ấy. Bài này chạy cả BỐN cạnh: mọi file trong
+         `configs/gpu/` phải nạp được, không chỉ `DEFAULT_GPU`;
+      2. **`train.per_device_batch_size` khác nhau giữa hai card.** Đây KHÔNG
+         phải khoá của VRAM: batch LOGIC mỗi lượt là một phần lịch học của
+         candidate A ($1) — với grad_accum, loss mỗi micro-batch được lấy
+         trung bình theo token TRONG micro-batch ấy rồi mới chia cho accum, nên
+         đổi nó là đổi gradient. Card to hơn được phép chạy mảnh VẬT LÝ to hơn
+         (CE ghép lại theo token, gradient không đổi), KHÔNG được đổi số này;
+      3. **grad_accum lệch `effective_batch`** -> số bước một epoch đổi, và cả
+         đường lr one-cycle đổi theo.
+    """
+    import yaml
+
+    from src import config as C
+    from src.config import load_config
+
+    gdir = ROOT / "configs/gpu"
+    files = sorted(gdir.glob("*.yaml"))
+    assert files, f"không thấy config GPU nào trong {gdir}"
+    assert (gdir / f"{C.DEFAULT_GPU}.yaml").exists(), C.DEFAULT_GPU
+    eff = int(load_config(ROOT / "configs/vextractor.yaml",
+                          gpu=C.DEFAULT_GPU)["train"]["effective_batch"])
+    seen = {}
+    for p in files:
+        g = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        sets = dict(g.get("set") or {})
+        assert sorted(sets) == sorted(C.GPU_KEYS), (
+            p.name, sorted(set(sets) ^ set(C.GPU_KEYS)))
+        # `name` phải trùng tên file: `--gpu <stem>` là cách chọn nó, và hai
+        # tên lệch nhau thì manifest ghi một card khác card đã chạy.
+        assert str(g.get("name")) == p.stem, (p.name, g.get("name"))
+        assert g.get("gpu_name_contains"), p.name
+        req = dict(g.get("requires") or {})
+        assert req.get("cuda_arch") and req.get("min_vram_gb"), p.name
+        # `cuda_arch` phải là dạng `sm_XX` — `check_gpu_device` so nó THẲNG với
+        # `torch.cuda.get_arch_list()`, nên một chuỗi khác dạng là một cổng
+        # kiểm luôn im lặng.
+        assert str(req["cuda_arch"]).startswith("sm_"), (p.name, req)
+        for k in ("stage0.probe_sizes", "stage1.probe_sizes",
+                  "autobatch.probe_sizes", "autobatch.infer_probe_sizes"):
+            v = [int(x) for x in sets[k]]
+            assert v and v == sorted(v) and v[0] >= 1, (p.name, k, v)
+        cfg = load_config(ROOT / "configs/vextractor.yaml", gpu=p.stem)
+        bs = int(cfg["train"]["per_device_batch_size"])
+        assert bs >= 1 and eff % bs == 0, (p.name, bs, eff)
+        assert int(cfg["train"]["grad_accum"]) * bs == eff, p.name
+        assert int(cfg["gpu_config"]["set"]["stage0.micro_batch"]) >= 1
+        seen[p.stem] = bs
+    assert len(set(seen.values())) == 1, (
+        f"train.per_device_batch_size lệch giữa các card: {seen}. Nó là khoá "
+        f"LOGIC của $1 (xem `train_vextractor.train`), không phải khoá của "
+        f"VRAM — card to hơn nâng mảnh VẬT LÝ, không nâng số này.")
+
+
 @check("2. Extractor (cắt stage) -> Compressor (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn) -> Aligner (RMSNorm + MHAttn + SwiGLU)")
 def _():
     import math
