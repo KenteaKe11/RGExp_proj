@@ -230,7 +230,8 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
 
       * `n_layers` — giữ `n_layers` block ĐẦU của `.blocks`. Chỉ có nghĩa với họ
         ViT (chồng block PHẲNG, cùng số kênh);
-      * `n_stages` — giữ `n_stages` stage ĐẦU của `.stages`. Đây là lát cắt của
+      * `n_stages` — giữ `n_stages` stage ĐẦU của `.stages` (hoặc `.layers` ở
+        FocalNet timm). Đây là lát cắt của
         họ PHÂN CẤP, nơi "n block đầu" vô nghĩa vì mỗi stage một số kênh khác
         nhau. Với ConvNeXt-Small, `n_stages = 3` dừng ở **stride 16 / 512 kênh**
         thay vì stride 32 / 1024.
@@ -308,12 +309,19 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
         n_use = len(blocks)
 
     # ── n_stages: lát cắt của họ PHÂN CẤP ─────────────────────────────────
-    stages = getattr(net, "stages", None)
+    # ConvNeXt/Swin đặt stage trong `.stages`; FocalNet của timm dùng
+    # `.layers` (mỗi phần tử vẫn là một stage). Chỉ dùng `.layers` khi model có
+    # stem riêng và không có `.blocks`, để không nhầm chồng block phẳng của ViT.
+    stage_attr = "stages" if getattr(net, "stages", None) is not None else None
+    if (stage_attr is None and getattr(net, "layers", None) is not None
+            and getattr(net, "stem", None) is not None and blocks is None):
+        stage_attr = "layers"
+    stages = getattr(net, stage_attr, None) if stage_attr else None
     n_stage_use = None
     if n_stages is not None:
         if stages is None:
             raise VExtractorUnusable(
-                f"khai n_stages = {n_stages} nhưng {arch!r} không có `.stages` "
+                f"khai n_stages = {n_stages} nhưng {arch!r} không có stage "
                 f"(họ ViT là một chồng block PHẲNG — dùng `n_layers`).")
         if n_layers is not None:
             raise VExtractorUnusable(
@@ -337,7 +345,17 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
                     f"phải Identity), nên cắt còn {n_stage_use} stage sẽ đưa "
                     f"lưới {n_stage_use} kênh vào một norm dựng cho stage "
                     f"cuối. Không cắt được backbone này bằng `n_stages`.")
-            net.stages = nn.Sequential(*list(stages)[:n_stage_use])
+            setattr(net, stage_attr,
+                    nn.Sequential(*list(stages)[:n_stage_use]))
+            # FocalNet chuẩn hoá/head theo stage cuối cùng. Khi cắt về stage 3,
+            # output channel đổi từ 1536 sang 768; bỏ norm và head gắn với
+            # stage 4 để forward_features trả đúng map stage đã chọn.
+            if stage_attr == "layers":
+                norm = getattr(net, "norm", None)
+                if norm is not None and not isinstance(norm, nn.Identity):
+                    net.norm = nn.Identity()
+                if getattr(net, "head", None) is not None:
+                    net.head = nn.Identity()
             # `head` của ConvNeXt mang một LayerNorm dựng theo số kênh của stage
             # CUỐI (1024 với ConvNeXt-Small). Cắt còn 3 stage thì nó không bao
             # giờ được gọi nữa — `forward_features` dừng ở `norm_pre` — nhưng
