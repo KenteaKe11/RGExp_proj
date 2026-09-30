@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = FlashInternImage-L (IN-22k, stage 3) + DINO head ─┐
+            ─► student = FocalNet-L (IN-22k, stage 3) + DINO head ─┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,17 +10,11 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-FlashInternImage-L cắt stage 3 (115,64 M) + một DINO head, cộng một bản teacher EMA đầy
+FocalNet-L cắt stage 3 (135,89 M) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
-**Điểm xuất phát: `Load lại trọng số pretrain rồi finetune tiếp`.** Checkpoint
-DINOv3 mà Facebook phát hành chỉ có TRỌNG SỐ — không optimizer, không center,
-không teacher EMA riêng. Nên "load lại training state" ở đây nghĩa là: nạp
-trọng số ấy vào **cả student lẫn teacher**, dựng DINO head / optimizer / center
-mới, rồi chạy tiếp CHÍNH hàm mục tiêu DINO trên miền ảnh CXR. `pretrained:
-false` bị TỪ CHỐI — finetune một backbone ngẫu nhiên trả lời một câu hỏi khác
-hẳn.
+**Điểm xuất phát:** `pretrained: true` tải trọng số FocalNet Large Stage 3; các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
@@ -232,7 +226,7 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # InternImage KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
+        # FocalNet KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
         # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
         "pool": str(d.get("pool", "mean")),
         "student_temp": float(d.get("student_temp", 0.1)),
@@ -338,7 +332,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số InternImage không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số FocalNet không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}
@@ -611,14 +605,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     # nằm trong nó, nên không có con số nào bị đọc từ hai nguồn.
     spec = Z.spec_from_cfg(cfg, text_h)
     if not spec["extractor"]["pretrained"]:
-        # Guard ở ĐÂY chứ không ở `vextractor.backbone_body`: selftest cần dựng
-        # được một backbone nhỏ ngẫu nhiên OFFLINE, còn một lượt finetune THẬT
-        # trên backbone ngẫu nhiên thì trả lời một câu hỏi khác hẳn.
         raise TrainUnusable(
-            "vextractor.extractor.pretrained = false: Stage 0 là DINOv3 "
-            "FINETUNING — nó chạy tiếp từ chính trọng số tự giám sát đã phát "
-            "hành. Finetune một backbone ngẫu nhiên chỉ ra một backbone ngẫu "
-            "nhiên khác — Stage 0 DỪNG.")
+            "vextractor.extractor.pretrained = false: Stage 0 requires "
+            "pretrained FocalNet Large Stage 3 weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 

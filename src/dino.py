@@ -1,6 +1,5 @@
 """DINO self-distillation — hàm mục tiêu tự giám sát của Stage 0 và Stage 1.
 
-**Stage 0** huấn luyện MỘT thứ: Extractor (InternImage-L cắt stage 3, init
 ImageNet-22k), chạy
 tiếp chính hàm mục tiêu nó được sinh ra với, trên ảnh CXR. Không `labels.npz`,
 không Cls Head, không F1/Recall — epoch được chọn theo loss tự giám sát trên một
@@ -9,12 +8,9 @@ tập val CỐ ĐỊNH.
 **Stage 1** (`CompressorTransferTrainer`, cuối file) dùng lại ĐÚNG bộ siêu tham
 số ấy nhưng đổi vai: teacher là một CHECKPOINT đóng băng, student là Compressor.
 
-Hai chỗ họ LƯỚI (InternImage/ConvNeXt) khác ViT và cả hai giai đoạn phải biết:
 
   * **không có cls token.** `pool` bắt buộc `mean`, và `stage0_vextractor` TỪ
     CHỐI `pool: cls` với backbone lưới thay vì lặng lẽ rơi về mean;
-  * **đầu ra là một LƯỚI 4 chiều**, không phải chuỗi. InternImage trả NHWC
-    (B, H, W, C) — DCNv3 làm việc trên bố cục ấy; ConvNeXt, cùng 4 chiều, lại
     trả NCHW. `pool_feature` vì thế
     NHẬN `fmt` chứ không suy từ `f.dim()`: lấy trung bình nhầm trục cho ra một
     vector dài H thay vì dài C, và DINO head vẫn nuốt được nó.
@@ -35,8 +31,6 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
   4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     phải đoán được global" sinh ra tính bất biến theo tỉ lệ. InternImage nuốt
-     cả hai cỡ trên đúng MỘT `state_dict`: DCNv3 lấy mẫu bằng `grid_sample`,
      không pos-embed để nội suy, không cửa sổ để đệm (448² -> 28×28,
      224² -> 14×14, đã probe THẬT lúc dựng).
 

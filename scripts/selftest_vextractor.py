@@ -5,7 +5,6 @@
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
-  2. BA khối: Extractor (InternImage NHWC hoặc timm NCHW/NLC, cắt stage) ->
      Compressor (QFormer, n_query latent, 5 residual mỗi nhóm, d_feat→d_latent
      NGAY TRONG Cross-attn) -> Aligner (RMSNorm + MHAttn + SwiGLU,
      init 1/√fan_in)
@@ -68,9 +67,7 @@ def check(name: str):
 # 3), ảnh 64² -> lưới 4×4 = 16 ô. `pretrained: false` để selftest không tải
 # mạng (một lượt Stage 0 THẬT với nó bị `stage0_vextractor.run` chặn).
 #
-# CỐ Ý KHÁC họ của config thật (InternImage-L, NHWC, nạp qua HF): bài 2 kiểm BỐ
 # CỤC của ba khối, và bố cục ấy không được phụ thuộc việc có mạng. Đường
-# InternImage được kiểm riêng ở bài 2f bằng một model GIẢ; số tham số THẬT của
 # backbone thật thì bài 22 dựng lại từ CONFIG THẬT.
 SMALL_IMG, SMALL_ARCH, SMALL_Q = 64, "convnext_atto", 6
 SMALL_NS = 3          # n_stages: cắt sau stage 3 -> stride 16 -> 16 ô ở 64²
@@ -195,7 +192,7 @@ def _():
 
 
 @check("1c. autobatch: probe nhỏ nhất OOM -> dò XUỐNG (không bao giờ giữ lại một "
-       "mảnh LỚN HƠN); OOM ở mọi bs -> DỪNG và chỉ ra `with_cp`")
+       "mảnh LỚN HƠN); OOM ở mọi bs -> DỪNG và đưa gợi ý giảm micro-batch")
 def _():
     """Bài này chốt một lỗi ĐÃ làm chết một lượt Stage 0, và nó chết muộn.
 
@@ -207,7 +204,7 @@ def _():
         ⚠ autobatch[stage0]: OOM ngay ở bs 4 — giữ 8
 
     ...rồi vòng huấn luyện OOM lại ở bước đầu của epoch 1, sau khi đã nạp xong
-    11 400 ảnh và 115,7 M trọng số. Không exception nào ở chỗ sai; chỗ sai chỉ
+    11 400 ảnh và khoảng 135,89 M trọng số. Không exception nào ở chỗ sai; chỗ sai chỉ
     là một con số bị giữ lại.
 
     GPU được thay bằng `measure_fn` giả nên bài chạy trên CPU.
@@ -250,22 +247,21 @@ def _():
     assert got == 16 and rep["accum"] == 2, rep      # 1 + 0.5·16 = 9 <= 12.8
     assert "probe_oom_at" not in rep, rep
 
-    # ── OOM ở MỌI bs -> DỪNG, và nói ra `with_cp` ────────────────────────
+    # ── OOM ở MỌI bs -> DỪNG, và đưa khuyến nghị micro-batch ────────────────────────
     try:
         autotune(cfg, "stage0", 32, 8, None, cands=divisors(32),
                  measure_fn=cost(0), total_bytes=TOTAL)
     except TrainUnusable as e:
         msg = str(e)
-        assert "with_cp" in msg, msg          # khoá ĐÚNG cho ca DCNv3 PyTorch
-        assert "n_local" in msg and "target_frac" in msg, msg
+        assert "stage0.micro_batch" in msg and "target_frac" in msg, msg
     else:
         raise AssertionError("OOM ở mọi bs phải DỪNG, không giữ số của config")
-    # nhãn khác stage0 thì KHÔNG khuyên `with_cp` của Extractor
+    # nhãn khác stage0 thì KHÔNG khuyên checkpointing của Extractor
     try:
         autotune(cfg, "main", 1, 1, None, cands=[1],
                  measure_fn=cost(0), total_bytes=TOTAL)
     except TrainUnusable as e:
-        assert "with_cp" not in str(e), str(e)
+        assert "stage0.micro_batch" not in str(e), str(e)
     else:
         raise AssertionError("OOM ở bs 1 của main stage phải DỪNG")
 
@@ -595,95 +591,6 @@ def _():
             raise AssertionError(f"vextractor.{blk}.{key} phải bị từ chối")
 
 
-@check("2f. đường InternImage: cắt .model.levels + BỎ downsample cuối, NHWC, "
-       "`with_cp` chỉ có nghĩa với InternImage")
-def _():
-    """Lát cắt của họ InternImage, kiểm bằng một model GIẢ (không cần mạng).
-
-    Ba thứ hỏng IM LẶNG nếu `internimage_body` sai, và cả ba được kiểm ở đây:
-
-      1. **giữ `downsample` của level cuối** -> trả lưới của stage SAU: nửa độ
-         phân giải, gấp đôi kênh. Không exception nào: Compressor dựng theo
-         `d_feat` đo được nên nó khớp với thứ SAI;
-      2. **bỏ không gọi `levels[3]` thay vì xoá nó** -> 95,9 M tham số chết đi
-         vào optimizer của Stage 0 và vào checkpoint;
-      3. **`with_cp: true` với một `arch` của timm** -> một khoá không ai đọc.
-    """
-    import torch
-    import torch.nn as nn
-
-    from src import vextractor as R
-
-    assert R.is_internimage("OpenGVLab/internimage_l_22k_384")
-    assert R.is_internimage("internimage_b_1k_224")
-    assert not R.is_internimage(SMALL_ARCH) and not R.is_internimage(SMALL_VIT)
-
-    class Down(nn.Module):
-        def __init__(self, c):
-            super().__init__()
-            self.conv = nn.Conv2d(c, 2 * c, 3, stride=2, padding=1, bias=False)
-
-        def forward(self, x):                      # NHWC -> NHWC
-            return self.conv(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-
-    class Level(nn.Module):
-        def __init__(self, c, depth, down):
-            super().__init__()
-            self.blocks = nn.ModuleList([nn.Linear(c, c) for _ in range(depth)])
-            self.downsample = Down(c) if down else None
-
-        def forward(self, x):
-            for b in self.blocks:
-                x = b(x)
-            return x if self.downsample is None else self.downsample(x)
-
-    C, NL = 8, 4
-    inner = nn.Module()
-    inner.patch_embed = nn.Conv2d(3, C, 4, stride=4)   # /4, trả NCHW -> permute
-    inner.pos_drop = nn.Identity()
-    inner.levels = nn.ModuleList(
-        [Level(C * 2 ** i, 2, i < NL - 1) for i in range(NL)])
-    inner.num_levels = NL
-    _pe = inner.patch_embed
-    inner.patch_embed = type("PE", (nn.Module,), {
-        "forward": lambda self, x: _pe(x).permute(0, 2, 3, 1)})()
-    inner.patch_embed.conv = _pe
-    net = nn.Module()
-    net.model = inner
-    n_full = sum(p.numel() for p in net.parameters())
-
-    body = R.InternImageBody(net, 3)
-    assert body.output_fmt == "NHWC" and body.n_stages_used == 3
-    # (1) level cuối còn lại KHÔNG được downsample nữa
-    assert len(body.net.model.levels) == 3
-    assert body.net.model.levels[-1].downsample is None
-    # (2) level 4 bị XOÁ khỏi ModuleList, không chỉ bỏ không gọi
-    n_cut = sum(p.numel() for p in body.parameters())
-    assert n_cut < n_full
-    assert "levels.3" not in " ".join(k for k, _ in body.named_parameters())
-    with torch.no_grad():
-        f = body.forward_features(torch.zeros(1, 3, 64, 64))
-    # /4 ở stem, rồi /2 sau level 0 và level 1 -> 64/16 = 4; kênh = C·2² = 32
-    assert tuple(f.shape) == (1, 4, 4, C * 4), tuple(f.shape)
-    # n_stages ngoài khoảng -> DỪNG, không làm tròn
-    for bad_n in (0, 5):
-        try:
-            R.InternImageBody(nn.Module(), bad_n)
-        except R.VExtractorUnusable as e:
-            assert "levels" in str(e) or "stage" in str(e)
-        else:
-            raise AssertionError(f"n_stages = {bad_n} phải bị từ chối")
-    # (3) `with_cp` với một arch của timm bị TỪ CHỐI ồn ào
-    try:
-        R.backbone_body(SMALL_ARCH, False, SMALL_IMG, None, SMALL_NS, True)
-    except R.VExtractorUnusable as e:
-        assert "with_cp" in str(e), e
-    else:
-        raise AssertionError("with_cp: true với arch của timm phải bị từ chối")
-    # ...và nó KHÔNG vào vân tay Stage 0 (đổi chi phí, không đổi tensor nào)
-    assert "with_cp" in R.EXT_CFG_KEYS and "with_cp" not in R.BACKBONE_CFG_KEYS
-
-
 @check("2g. vá giao thức init của transformers: nn.Module THUẦN mang `_init_weights` "
        "được cấp `_initialize_weights` no-op, PreTrainedModel thì KHÔNG bị chạm")
 def _():
@@ -692,13 +599,10 @@ def _():
     `PreTrainedModel.initialize_weights()` đi cây module bằng `smart_apply` và
     ở mỗi con hỏi "đây có phải sub-model mang hàm init RIÊNG không?". Bản
     transformers gần đây trả lời bằng sự CÓ MẶT của `_init_weights` rồi gọi
-    `module.smart_apply(module._initialize_weights)`. `InternImage` của
     OpenGVLab có `_init_weights` nhưng là `nn.Module` thuần, nên lượt nạp chết
-    bằng `AttributeError: 'InternImage' object has no attribute
     '_initialize_weights'` — ở CẢ `from_pretrained` lẫn dựng-từ-config.
 
     Kiểm bằng một module GIẢ nên nó chạy OFFLINE: thứ được kiểm là LUẬT CHỌN
-    lớp để vá, không phải repo InternImage.
     """
     import sys
     import types
@@ -712,7 +616,6 @@ def _():
     mod = types.ModuleType("rgexp_fake_remote_code")
 
     class Inner(nn.Module):
-        """nn.Module THUẦN tự init — đúng hình dạng `InternImage`."""
 
         def _init_weights(self, m):
             return None
@@ -779,128 +682,6 @@ def _():
     finally:
         DMU.get_class_from_dynamic_module = orig
         sys.modules.pop(mod.__name__, None)
-
-
-@check("2h. đường FlashInternImage (DCNv4): nhận diện arch, biến thể phải ĐỌC từ "
-       "config, cắt .levels (chuỗi) + BỎ conv_head, và thiếu toán tử thì DỪNG có chỉ dẫn")
-def _():
-    """Đường backbone THỨ BA, và nó khác hai đường kia ở mọi khâu.
-
-    Bài này chạy OFFLINE và KHÔNG cần toán tử DCNv4 (container/CI không biên
-    dịch được nó). Thứ được kiểm là phần có thể kiểm mà không cần kernel:
-
-      * `arch` chọn đúng đường nào — `flash_intern_image_*` KHÔNG được rơi vào
-        nhánh `is_internimage` và ngược lại;
-      * mean/std: đường này là chỗ DUY NHẤT gõ tay một cặp số (checkpoint là
-        `.pth` TRẦN), nên `arch_normalize` phải trả đúng hằng đã ghi nguồn;
-      * biến thể chưa ĐỌC config thì DỪNG — "suy từ họ InternImage" là cách một
-        con số sai đi vào mà không ai thấy;
-      * lát cắt trên model CHUỖI: `levels` bị cắt, `downsample` cuối bị bỏ, và
-        `conv_head` bị bỏ (FlashInternImage dựng nó DÙ `num_classes=0`);
-      * thiếu toán tử -> `VExtractorUnusable` có LỆNH CÀI, không phải một
-        ImportError trần giữa lúc nạp Stage 0.
-    """
-    import torch
-    import torch.nn as nn
-
-    from src import vextractor as R
-
-    A = "flash_intern_image_l_22k_384"
-    assert R.is_flash_internimage(A)
-    assert R.is_flash_internimage("flash_intern_image_b_1k_224")
-    # HAI predicate phải RỜI NHAU: "flash_intern_image" không chứa "internimage"
-    assert not R.is_internimage(A)
-    assert not R.is_flash_internimage("OpenGVLab/internimage_l_22k_384")
-    assert not R.is_flash_internimage(SMALL_ARCH)
-
-    # mean/std: hằng có nguồn, và `arch_normalize` đi đúng nhánh
-    assert R.arch_normalize(A) == R.FLASH_II_NORMALIZE
-    assert R._flash_internimage_normalize(A) == R.FLASH_II_NORMALIZE
-
-    # biến thể: chỉ `l` đã đọc config thật
-    assert R._flash_ii_variant(A) == (160, [5, 5, 22, 5], [10, 20, 40, 80])
-    for unread in ("flash_intern_image_b_1k_224", "flash_intern_image_t_1k_224",
-                   "flash_intern_image"):
-        try:
-            R._flash_ii_variant(unread)
-        except R.VExtractorUnusable as e:
-            assert "biến thể" in str(e) and "GROUPS" in str(e), e
-        else:
-            raise AssertionError(f"{unread}: biến thể chưa khai phải bị từ chối")
-
-    # ── lát cắt trên một model CHUỖI giả (không cần DCNv4) ────────────────
-    class Level(nn.Module):
-        def __init__(self, c, depth, down):
-            super().__init__()
-            self.blocks = nn.ModuleList([nn.Linear(c, c) for _ in range(depth)])
-            self.downsample = (nn.Linear(c, 2 * c) if down else None)
-
-        def forward(self, x, return_wo_downsample=False, shape=None):
-            for b in self.blocks:
-                x = b(x)
-            x_ = x
-            if self.downsample is not None:
-                n, ll, c = x.shape
-                h, w = shape
-                x = self.downsample(x).view(n, ll, 2 * c)
-                x = x.view(n, h // 2, w // 2, -1).reshape(n, ll // 4, -1) \
-                    if False else x[:, :ll // 4].contiguous()
-                shape = (h // 2, w // 2)
-            return (x, x_, shape) if return_wo_downsample else (x, shape)
-
-    C, NL = 8, 4
-    net = nn.Module()
-    net.patch_embed = (lambda: None)          # thay ngay dưới
-    _pe = nn.Conv2d(3, C, 4, stride=4)
-    net.patch_embed = type("PE", (nn.Module,), {
-        "forward": lambda self, x: _pe(x).permute(0, 2, 3, 1)})()
-    net.patch_embed.conv = _pe
-    net.levels = nn.ModuleList([Level(C * 2 ** i, 2, i < NL - 1)
-                                for i in range(NL)])
-    net.num_levels = NL
-    net.conv_head = nn.Sequential(nn.Conv2d(C * 2 ** (NL - 1), 16, 1))
-    n_full = sum(p.numel() for p in net.parameters())
-
-    body = R.FlashInternImageBody(net, 3)
-    assert body.output_fmt == "NHWC" and body.n_stages_used == 3
-    assert len(body.net.levels) == 3
-    assert body.net.levels[-1].downsample is None          # (1) không hạ nữa
-    keys = " ".join(k for k, _ in body.named_parameters())
-    assert "levels.3" not in keys                           # (2) XOÁ, không bỏ không gọi
-    assert "conv_head" not in keys                          # (3) và conv_head cũng vậy
-    assert sum(p.numel() for p in body.parameters()) < n_full
-    with torch.no_grad():
-        f = body.forward_features(torch.zeros(1, 3, 64, 64))
-    assert f.dim() == 4 and f.shape[-1] == C * 4, tuple(f.shape)
-
-    for n_bad in (0, 5):
-        try:
-            R.FlashInternImageBody(nn.Module(), n_bad)
-        except R.VExtractorUnusable as e:
-            assert "levels" in str(e) or "stage" in str(e)
-        else:
-            raise AssertionError(f"n_stages = {n_bad} phải bị từ chối")
-
-    # ── thiếu toán tử -> DỪNG với LỆNH CÀI ───────────────────────────────
-    try:
-        import DCNv4  # noqa: F401
-    except Exception:
-        try:
-            R.flash_internimage_body(A, False, 448, None, 3, True)
-        except R.VExtractorUnusable as e:
-            msg = str(e)
-            assert "DCNv4" in msg and "no-build-isolation" in msg, msg
-            # và phải chỉ ra ĐƯỜNG LÙI, vì đường DCNv3 vẫn còn trong code
-            assert "internimage_l_22k_384" in msg, msg
-        else:
-            raise AssertionError("thiếu DCNv4 mà vẫn dựng được?!")
-    # `n_layers` bị từ chối TRƯỚC cả khi cần tới toán tử
-    try:
-        R.flash_internimage_body(A, False, 448, 3, 3, False)
-    except R.VExtractorUnusable as e:
-        assert "n_layers" in str(e), e
-    else:
-        raise AssertionError("n_layers phải bị từ chối")
 
 
 @check("3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ")
@@ -1667,9 +1448,9 @@ def _():
     orig = (s0.decoder_width, s0.assert_same_pixels,
             s0.ImageOnlyDataset.__getitem__, R.backbone_body)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
-                       n_stages=None, with_cp=False:
+                       n_stages=None:
                        orig[3](arch, False, image_size, n_layers, n_stages,
-                               with_cp))
+                               ))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.assert_same_pixels = lambda *_a, **_k: None
     s0.ImageOnlyDataset.__getitem__ = _views
@@ -1871,9 +1652,9 @@ def _():
     orig = (s0.decoder_width, s0.assert_same_pixels,
             s0.ImageOnlyDataset.__getitem__, R.backbone_body)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
-                       n_stages=None, with_cp=False:
+                       n_stages=None:
                        orig[3](arch, False, image_size, n_layers, n_stages,
-                               with_cp))
+                               ))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.assert_same_pixels = lambda *_a, **_k: None
     s0.ImageOnlyDataset.__getitem__ = _views
@@ -2371,8 +2152,6 @@ def _():
         raise AssertionError(
             "không dựng được nhánh từ configs/vextractor.yaml, nên bài này "
             "KHÔNG nói được README có khớp code hay không. Extractor "
-            "backbone của config này có thể cần: (a) toán tử DCNv4 đã BIÊN "
-            "DỊCH nếu `arch` là `flash_intern_image_*` — không có đường lùi "
             "PyTorch nào; hoặc (b) mạng ở LẦN ĐẦU nếu `arch` là một repo "
             "`trust_remote_code` (`config.json` + ba file .py, ~60 KB, sau đó "
             "có cache).\n"

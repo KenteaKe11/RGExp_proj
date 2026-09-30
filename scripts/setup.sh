@@ -180,7 +180,7 @@ fi
 # File BẮT BUỘC của §2.2. Config/script của $1 và §2.0/§2.1 KHÔNG có trong
 # danh sách: chúng đã sang _archive/, và đòi chúng ở đây là chặn setup vì một
 # thứ repo đã cố ý bỏ đi.
-for f in requirements.txt requirements-dcnv4.txt configs/vextractor.yaml configs/gpu/rtx3060.yaml \
+for f in requirements.txt configs/vextractor.yaml configs/gpu/rtx3060.yaml \
          src/run_vextractor.py src/train_recomb.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
@@ -264,28 +264,6 @@ echo "→ kiểm tương thích phiên bản..."
     echo "✗ Môi trường chưa chạy được. Sửa theo hướng dẫn ngay trên rồi chạy lại setup."
     exit 1
 }
-
-# ── 8. Toán tử DCNv4 — CHỈ khi config cần, và chỉ khi máy có GPU ───────────
-# `arch: flash_intern_image_*` cần một extension CUDA phải BIÊN DỊCH (vì sao nó
-# không nằm trong requirements.txt: xem đầu requirements-dcnv4.txt). Không gọi
-# vô điều kiện: máy không GPU, hoặc config đang chạy đường DCNv3, thì bước này
-# vô nghĩa — và một lượt dịch hỏng sẽ làm cả setup đỏ vì một thứ không cần.
-if [ "${RGEXP_SKIP_DCNV4:-0}" != "1" ] && [ -f scripts/setup_dcnv4.sh ]; then
-    NEED_DCNV4=$("$PYBIN" -c "import yaml;a=str(((yaml.safe_load(open('configs/vextractor.yaml',encoding='utf-8')) or {}).get('vextractor') or {}).get('extractor',{}).get('arch',''));print('yes' if a.startswith('flash_intern_image') else 'no')" 2>/dev/null || echo no)
-    HAS_GPU=$("$PYBIN" -c "import torch;print('yes' if torch.cuda.is_available() else 'no')" 2>/dev/null || echo no)
-    if [ "$NEED_DCNV4" = "yes" ] && [ "$HAS_GPU" = "yes" ]; then
-        echo "→ config dùng FlashInternImage -> cài toán tử DCNv4..."
-        bash scripts/setup_dcnv4.sh || {
-            echo "⚠ DCNv4 chưa cài được — phần còn lại của setup VẪN xong. Hai lựa chọn:"
-            echo "   · sửa theo chỉ dẫn ngay trên, rồi: bash scripts/setup_dcnv4.sh"
-            echo "   · hoặc đổi configs/vextractor.yaml ->"
-            echo "       arch: OpenGVLab/internimage_l_22k_384"
-            echo "     đường DCNv3 chạy ở MỌI máy, kiến trúc y hệt (V vẫn (784, 640))."
-        }
-    elif [ "$NEED_DCNV4" = "yes" ]; then
-        echo "✓ bỏ qua DCNv4: máy này không có GPU (config đang dùng FlashInternImage)"
-    fi
-fi
 
 echo
 echo "═══ setup xong ═══"

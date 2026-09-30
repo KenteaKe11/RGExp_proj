@@ -33,7 +33,6 @@
 #    trước Blackwell thì lỗi rơi đúng vào "no kernel image is available" ở lượt
 #    forward đầu của decoder, KHÔNG phải lúc import.
 #
-# Card này KHÔNG đổi gì với DCNv3 của Extractor: kernel CUDA của DCNv3 không
 # bao giờ được dùng (xem §1.1 của README — `has_cuda_kernel` luôn False vì một
 # lỗi import trong code của OpenGVLab), nên Stage 0 chạy bản PyTorch ở mọi card.
 # ═════════════════════════════════════════════════════════════════════════════
@@ -70,26 +69,14 @@ set:
   # Đây mới là chỗ 4 GB thừa có nghĩa: hai giai đoạn này KHÔNG có ràng buộc nào
   # từ A, nên mảnh vật lý được phép leo tới tận `batch_size` = 32.
   #
-  # Stage 0 là chỗ nặng nhất của cả thí nghiệm: student 115,7 M + teacher EMA
-  # 115,7 M + DINO head, lưới 784 ô, nhân (2 + n_local) = 8 lượt forward của
-  # multi-crop, và DCNv3 bản PyTorch trải 9 điểm `grid_sample` mỗi vị trí.
-  # Trọng số + moment của Adam đã ăn ~2 GB, nên phần còn lại cho activation là
-  # ~11 GB (so với ~7,5 GB trên 3060 12 GB): đủ để leo, KHÔNG đủ để gấp đôi
-  # khởi điểm. 8 giữ nguyên là khởi điểm ĐÃ ĐO an toàn; điểm dò mới là chỗ nói
-  # "được phép leo": [4, 8, 16] thay vì [2, 4, 8].
-  # Vẫn OOM thì bật `vextractor.extractor.with_cp: true` (gradient checkpointing
-  # trong từng InternImageLayer) — nó KHÔNG vào vân tay Stage 0, nên bật/tắt
-  # không bắt chạy lại một lượt DINO nhiều giờ.
-  # 4, không 8: với `with_cp: true` thì 8 còn có thể vừa, nhưng KHỞI ĐIỂM quá
-  # cao là một lượt OOM trước khi autobatch kịp dò. Và `probe_sizes` phải CÓ
-  # mốc 1: nếu mốc nhỏ nhất của nó OOM thì autobatch dò XUỐNG dưới mốc ấy —
-  # trước đây nó giữ lại `micro_batch` (tức số LỚN HƠN) và chết ở epoch 1.
+  # Stage 0 giữ student và teacher FocalNet (~135,89 M mỗi nhánh) cùng DINO head.
+  # Batch dò tự động theo VRAM; giảm local crop nếu thiết bị không đủ bộ nhớ.
   stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [1, 2, 4]   # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy mới đúng.
   # Stage 1 nhẹ hơn Stage 0 hẳn một bậc: Extractor chạy `no_grad` (không giữ
-  # activation), chỉ Compressor 37,0 M có gradient, và ĐÚNG 2 view thay vì 8.
+  # activation), chỉ Compressor ~37,77 M có gradient, và ĐÚNG 2 view thay vì 8.
   # Trên 16 GB nó thừa sức chạm 32 — nên điểm dò mở tới đó.
   stage1.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
   stage1.probe_sizes: [8, 16, 32]
@@ -154,7 +141,6 @@ set:
   # CACHE nó, nên lần chạy sau — kể cả sau `--retrain-all` — là 0 byte mạng),
   # rồi giải nén bằng `io.workers` = 20 luồng trên NVMe thay vì 8 luồng bị
   # chặn ở mạng. Giá: ~17,7 GB đĩa cho zip (cộng ~1 GB cache ảnh đã resize,
-  # ~8,6 GB Gemma, ~1,05 GB InternImage-L, ~1,4 GB roberta-large) — trên 1600 GB
   # là không đáng kể. Đây CHÍNH là lý do rtx3060 cũng khai `download`; khác biệt
   # duy nhất là ở đó đĩa 100 GB nên con số phải cân, còn ở đây thì không.
   io.zip_mode: download

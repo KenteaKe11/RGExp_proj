@@ -117,7 +117,7 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     ]))
     L.append("")
 
-    L.append("## Stage 0 — backbone InternImage-L (stage 3), TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
+    L.append("## Stage 0 — backbone FocalNet Large (stage 3), TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
              "checkpoint = TEACHER (EMA)\n")
     if s0.get("history"):
         sc0 = s0.get("stage0", {}) or {}

@@ -2,13 +2,12 @@
 # §2.2 V-EXTRACTOR — [Z ‖ T] vs [Z ‖ Q ‖ T] — CONFIG NỘI DUNG
 # ═════════════════════════════════════════════════════════════════════════════
 # Câu hỏi: trên ĐÚNG candidate `qlora_r32_decoder` của $1 (Gemma 3 4B NF4 +
-# QLoRA r32 trên mọi Linear của decoder, 1 epoch = 200 bước, cùng 6400 mẫu train,
 # cùng loader, cùng 3000 ảnh test), NỐI thêm 8 learner vector Q ngay sau 256
 # token ảnh có đổi chất lượng báo cáo không?
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone InternImage-L học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone FocalNet-L học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
@@ -23,7 +22,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (InternImage-L ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (FocalNet-L ăn ảnh 448²) — và chuỗi dài
 # thêm 8.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -59,7 +58,6 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 6400
   val_split_csv: split_ref/val_split.csv
   # HỒ val: 2000 mẫu được tải về và giữ trong cache. Mỗi lần eval bốc RANDOM
   # `train.eval.n_samples` (256) trong hồ này — xem khối `train.eval`.
@@ -313,203 +311,20 @@ labels:
 # NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-#   ảnh 448² ─► 1. EXTRACTOR  FlashInternImage-L (DCNv4, IN-22k), CẮT stage 3
-#                             (B,3,448,448) -> (B,28,28,640) -> V (B,784,640)
-#            ─► 2. COMPRESSOR QFormer, 8 latent @768, N = 4 nhóm khối
-#                             -> V_c (B,8,768)
-#            ─► 3. ALIGNER    MHAttn(768) + SwiGLU 768→2048→2560
-#                             -> Q (B,8,2560)
-#
-#   [Z ‖ Q ‖ T] ─► Gemma decoder (QLoRA r32) ─► CE
-#
-# BA khối, BA giai đoạn, mỗi giai đoạn dạy ĐÚNG MỘT khối:
-#
-#   Stage 0  Extractor   DINO tự giám sát (EMA, multi-crop) từ init CÓ GIÁM SÁT
-#   Stage 1  Compressor  chưng cất từ teacher Stage 0 ĐÓNG BĂNG
-#   main     Aligner + LoRA (từ bước 0), rồi Compressor (sau 20% bước)
-#
-# ── 1. EXTRACTOR ─────────────────────────────────────────────────────────────
-# `flash_intern_image_l_22k_384` cắt ở stage 3 — **115 637 280 tham số ĐO ĐƯỢC**
-# (đặc tả ghi ~115.57M; lệch 0,07 M là phần bias của LayerNorm/conv mà một phép
-# nhẩm hay bỏ). Đường DCNv3 cũ là 115 662 210: hai họ chênh đúng 24 930 tham số,
-# vì DCNv4 gộp offset+mask vào một Linear và bỏ LayerNorm + GELU trong dw_conv.
-#
-# ⚠ InternImage là một CNN, KHÔNG phải transformer: lõi là DCNv3 (deformable
-# conv v3) — mỗi vị trí học group × 9 cặp offset + một mask softmax rồi lấy mẫu
-# bằng `grid_sample`. Trường thu nhận thích nghi như attention, chi phí tuyến
-# tính theo số ô, và KHÔNG có pos-embed / cửa sổ / cls token.
-#
-# ⚠ Backbone này KHÔNG nạp qua timm (timm không có InternImage). Nó đến từ HF
-# bằng `trust_remote_code=True` (`AutoModel` -> `InternImageModel`), tức ba file
-# .py của OpenGVLab được tải và CHẠY. `backbone_body` vì thế có HAI đường —
-# `is_internimage(arch)` chọn đường HF, còn lại đi đường timm cũ.
-#
-# ⚠ Kernel CUDA của DCNv3 KHÔNG bao giờ được dùng: trong `dcnv3_func.py` của
-# OpenGVLab, `pkg_resources` được import SAU khối try đã dùng nó, nên nhánh "có
-# kernel" luôn ném NameError và bị `except:` bắt -> `has_cuda_kernel` luôn
-# False, model luôn chạy `DCNv3_pytorch`. Tin tốt: không phải biên dịch
-# extension nào. Tin xấu: bản PyTorch trải 9 điểm lấy mẫu bằng `grid_sample`,
-# chậm hơn và ngốn activation hơn -> xem `with_cp` bên dưới.
-#
-# ⚠ `_22k_384` là trọng số CÓ GIÁM SÁT trên ImageNet-22k, KHÔNG phải tự giám
-# sát. Nên Stage 0 ở đây KHÔNG còn là "chạy tiếp đúng hàm mục tiêu" như với một
-# checkpoint DINOv3: nó là DINO self-distillation khởi đi từ một init có giám
-# sát. Đó là một đánh đổi thật — được một backbone mạnh, mất tính liên tục của
-# hàm mục tiêu — và đừng đọc đường loss Stage 0 như thể nó tiếp nối một lượt
-# pretrain tự giám sát nào. (HF không có bản `l_1k_224`: họ L chỉ có 22k_384 và
-# 22kto1k_384.)
-#
-# `n_stages: 3` — CẮT SAU stage 3, dừng ở stride 16 / 640 kênh. InternImage-L có
-# channels 160 và depths [5, 5, 22, 5], nên bốn stage chạy ở 160 · 320 · 640 ·
-# 1280 kênh; ở 448² lưới là 28×28 = 784 ô × 640. Lưới MỊN GẤP 4 so với 14×14 của
-# đủ bốn stage, đổi lại bỏ tầng ngữ nghĩa cao nhất — và 22 trong 37 block của
-# backbone nằm đúng ở stage này, nên đây không phải một lát cắt "cho rẻ".
-#
-# Cắt là HAI việc: (1) BỎ `downsample` của level cuối còn lại — giữ nó là trả về
-# lưới của stage SAU; (2) XOÁ `levels[3]` khỏi ModuleList, không chỉ bỏ không
-# gọi — 95,9 M tham số chết vẫn đi vào optimizer của Stage 0 và vào checkpoint.
-#
-# `n_patch` (784) và `d_feat` (640) đến từ MỘT lượt forward THẬT
-# (`_probe_features`, trong eval + no_grad + fork_rng), không từ một công thức
-# stride gõ tay.
-#
-# MỘT state_dict chạy cả 448² (global) lẫn 224² (local crop của Stage 0): DCNv3
-# lấy mẫu bằng `grid_sample` nên không tham số nào gắn với cỡ ảnh — 448² -> 28×28,
-# 224² -> 14×14. Đã probe THẬT ở nửa độ phân giải lúc dựng (`multi_res`). Và nó
-# KHÔNG có cls token -> `stage0.dino.pool` bắt buộc `mean`, `cls` bị TỪ CHỐI ngay
-# lúc dựng backbone.
-#
-# Bố cục trục là NHWC (DCNv3 làm việc trên (N,H,W,C)) và được HỎI từ
-# `output_fmt`, không đoán từ `f.dim()`: NCHW và NHWC cùng 4 chiều, và dùng nhầm
-# nhánh KHÔNG ném lỗi — nó trả (B, W·C, H), `d_feat` đọc ra 28 thay vì 640.
-#
-# Chuẩn hoá ảnh KHÔNG khai ở đây: nó được hỏi từ `preprocessor_config.json` của
-# repo checkpoint (`_internimage_normalize`) và đóng vào spec của mọi checkpoint.
-#
-# ── 2. COMPRESSOR ────────────────────────────────────────────────────────────
-#   kv = RMSNorm(V)                                   640, MỘT lần, ngoài mọi nhóm
-#   q  = 8 latent @768
-#   N × [ khối 1:  q += SelfAttn(N(q))
-#                  q += CrossAttn(N(q), kv)           <- chỗ DUY NHẤT đọc V
-#                  q += SwiGLU(N(q))
-#         khối 2:  q += SelfAttn(N(q))
-#                  q += SwiGLU(N(q))                ]
-#
-# 640 -> 768 xảy ra NGAY TRONG Cross-attn (`k_proj`/`v_proj` nhận 640, trả 768).
-# KHÔNG có `Linear 640→768` đứng trước: một lớp chiếu riêng thêm 0,49 M tham số
-# mà không thêm sức biểu diễn nào (nó chỉ gộp được vào k/v phía sau), và nó buộc
-# cả bốn nhóm dùng chung MỘT bản 768 chiều của lưới.
-#
-# `head_dim` là khoá KHAI, `n_heads` được SUY RA (768 // 128 = 6). Chiều ngược
-# lại — khai n_heads rồi để head_dim rơi ra — là cách head_dim đổi LẶNG LẼ mỗi
-# lần ai đó sửa `d_latent`. Khai cái BẤT BIẾN, suy ra cái phụ thuộc; khai
-# `n_heads` ở đây bị TỪ CHỐI ồn ào như mọi khoá lạ khác. Cùng head_dim ấy được
-# DÙNG LẠI cho MHAttn của Aligner, không khai lại.
-#
-# Khối 2 KHÔNG có Cross-attn, và đó là chủ ý: nó để 8 vector thống nhất lại với
-# nhau sau khi vừa đọc xong ảnh, trước khi nhóm sau lại đi đọc tiếp. Với N = 4
-# thì cả cụm đọc ảnh đúng BỐN lần, xen giữa là ba lượt tự-trộn.
-#
-# Tham số ở 768 / kv 640 / hidden 512 (số ĐO ĐƯỢC):
-#   SelfAttn 4×768² = 2 359 296 · CrossAttn 2×768² + 2×640×768 = 2 162 688
-#   SwiGLU 3×768×512 = 1 179 648 · 5 × RMSNorm(768) = 3 840
-#   => KHỐI 1 (self+cross+ffn) 5 703 936 · KHỐI 2 (self+ffn) 3 540 480
-#   => MỘT nhóm 9 244 416 (đặc tả ~9.24M, khớp); N = 4 -> 36 984 448 kèm
-#      latent (8×768 = 6 144) + RMSNorm(V) (640). Đặc tả ghi ~36.96M = 4 × 9,24
-#      và bỏ đúng hai thứ nằm ngoài mọi nhóm khối ấy.
-#
-# Chi phí nằm ở `d_latent` (theo d²) và `n_blocks` (tuyến tính), KHÔNG ở
-# `n_query`: 8 latent chỉ là 6 144 tham số. Đổi `n_query` đụng tới THỜI GIAN và
-# độ dài chuỗi decoder, không tới bảng tham số.
-#
-# ── 3. ALIGNER ───────────────────────────────────────────────────────────────
-#   x = V_c + MHAttn(RMSNorm(V_c))                    768
-#   Q = down( SiLU(gate(y)) ⊙ up(y) ),  y = RMSNorm(x)   768 -> 2048 -> 2560
-#
-# MHAttn ở đây KHÔNG đọc ảnh — nó là một lượt TỰ-chú ý trên đúng 8 vector của
-# V_c (Cross-attn của Compressor là chỗ duy nhất chạm lưới). Việc của nó là trộn
-# 8 vector MỘT lần nữa ngay tại ranh giới ngữ nghĩa, trước khi `down` đưa chúng
-# sang không gian embedding của decoder.
-#
-# Residual quanh MHAttn, KHÔNG quanh SwiGLU: khối attention giữ nguyên chiều nên
-# dấu + có nghĩa; khối SwiGLU đổi 768 -> 2560 nên không có gì để cộng vào.
-#
-# RMSNorm trước SwiGLU là BẮT BUỘC, không phải trang trí: SwiGLU có CỔNG NHÂN,
-# và một cổng nhân ăn đầu vào nhỏ thì BÌNH PHƯƠNG cái nhỏ ấy. Bỏ nó thì RMS(Q) ở
-# bước 0 rơi xuống ~1e-4, và trên model đồ chơi của selftest nó underflow HẲN về
-# 0 (bản đồ saliency của Lens thành ma trận không). Có nó: RMS(Q) ≈ 0,58. Giá:
-# 768 tham số mỗi norm. Vì cùng lý do, ba ma trận có cổng init `1/√fan_in` và
-# `_init` PHẢI bỏ qua chúng — nhưng VẪN chạm bốn chiếu của MHAttn.
-#
-# `aligner.mlp_hidden` 2048 > `d_latent` 768 — NỞ RA, cùng hướng với FFN của
-# decoder (Gemma 3: 2560 → 10240) và ngược hướng với nút THẮT 512 bên trong
-# Compressor. Hai khối SwiGLU, hai khoá, hai hướng: Compressor NÉN, Aligner DỊCH.
-#
-# Tham số: MHAttn 4×768² = 2 359 296 (đặc tả ~2.36M) + SwiGLU 2×768×2048 +
-# 2048×2560 = 8 388 608 (~8.39M) + 2 × RMSNorm(768) = 1 536 => 10 749 440
-# (~10.75M) — khớp đặc tả tuyệt đối.
-#
-# `d_latent` 768 KHÁC `d_model` 2560: `d_model` đọc từ AutoConfig của decoder,
-# `d_latent` khai ở đây, và `build_aligner` nối chúng — nên đổi base sang một
-# decoder khác chiều sẽ lộ ra chứ không lặng lẽ.
+# FocalNet Stage 3 -> QFormer compressor -> vision-language aligner.
+# Stage 0: DINO self-supervised fine-tuning; Stage 1: compressor transfer.
 vextractor:
-  extractor:                # ảnh (3,448,448) -> V (784, 640)
-    image_size: 448         # stem/4 rồi 2 × /2 trước stage 3 -> stride 16; 448/16 = 28 -> 784 ô
-    # FlashInternImage-L (DCNv4) cắt ở stage 3: 115 637 280 tham số ĐO ĐƯỢC.
-    # `arch` CHÍNH LÀ tên file checkpoint trên `OpenGVLab/DCNv4`
-    # (-> `flash_intern_image_l_22k_384.pth`, ~1,25 GB ở lần chạy đầu), còn code
-    # model là bản VENDOR ghim commit ở `src/vendor/` (xem NOTICE.md ở đó).
-    #
-    # ⚠⚠ KHÁC DCNv3 Ở MỘT ĐIỂM SỐNG CÒN: **không có đường lùi PyTorch.**
-    # `flash_intern_image.py` `import DCNv4` TRẦN và `dcnv4_func.py` lại
-    # `from DCNv4 import ext` ở tầng module, nên thiếu extension CUDA đã biên
-    # dịch thì nó chết ngay lúc IMPORT. PyPI chỉ có sdist (1.0.0.post2,
-    # 01/2024), phải build bằng nvcc:
-    #     TORCH_CUDA_ARCH_LIST=<sm của card> pip install --no-build-isolation DCNv4==1.0.0.post2
-    # (`--no-build-isolation` BẮT BUỘC: setup.py của nó `import torch` lúc build)
-    #
-    # Cái mua được: DCNv4 là kernel FUSED — nó KHÔNG materialize tensor
-    # (N·group, H·W, group_channels, 9) mà bản PyTorch của DCNv3 giữ cho
-    # backward ở MỖI block, tức đúng thứ làm Stage 0 hết 16 GB VRAM.
-    #
-    # Không build được? Trả khoá này về `OpenGVLab/internimage_l_22k_384`:
-    # đường DCNv3 (trust_remote_code) vẫn còn nguyên và chạy ở MỌI máy — kiến
-    # trúc y hệt, V vẫn (784, 640), chỉ chênh 24 930 tham số (0,02%).
-    arch: flash_intern_image_l_22k_384
-    pretrained: true        # false bị TỪ CHỐI ở `stage0.run`: chạy DINO từ trọng
-                            # số ngẫu nhiên chỉ ra một backbone ngẫu nhiên khác.
-                            # (false VẪN dựng được — và dựng CHỈ từ config.json,
-                            # không tải trọng số — để selftest chạy gần offline.)
-    # Lát cắt của họ PHẲNG (ViT `.blocks`). InternImage là họ PHÂN CẤP (4 level,
-    # mỗi level một số kênh) nên khai số ở đây bị TỪ CHỐI — phải là null.
+  extractor:                # FocalNet Stage 3: (B,3,448,448) -> (B,768,28,28)
+    image_size: 448
+    arch: focalnet_large_fl3
+    pretrained: true
     n_layers: null
-    # Lát cắt của họ PHÂN CẤP. 3 = dừng sau stage 3 -> 640 kênh @ 28×28.
-    # null = đủ 4 level -> 1280 kênh @ 14×14 và thêm 95,9 M tham số.
     n_stages: 3
-    # Gradient checkpointing trong TỪNG `InternImageLayer` (khoá `with_cp` của
-    # InternImage). Đổi CHI PHÍ, không đổi một tensor nào — nên nó là khoá DUY
-    # NHẤT của khối này KHÔNG vào vân tay Stage 0: bật/tắt không bắt chạy lại
-    # DINO. Bật khi Stage 0 hết VRAM (multi-crop × 8 view × DCNv3 PyTorch là
-    # chỗ nặng nhất của cả thí nghiệm); giá ~30% thời gian. Khai `true` với một
-    # `arch` của timm bị TỪ CHỐI: model của timm không đọc khoá ấy.
-    #
-    # BẬT, và đây là con số ĐO ĐƯỢC chứ không phải đề phòng. `dcnv3_core_pytorch`
-    # giữ một tensor (N·group, H·W, group_channels, 9) MỖI block để backward; ở
-    # 448² với InternImage-L đó là ~72 MB cho mỗi block của level 0 (112×112,
-    # group 10) — nhân 32 block, rồi nhân (2 global + 6 local) view mà
-    # `dino.loss` giữ SỐNG CÙNG LÚC. Trên card 16 GB, Stage 0 OOM ngay ở mảnh
-    # vật lý 4 khi khoá này tắt. Vì kernel CUDA của DCNv3 KHÔNG BAO GIỜ được
-    # dùng (xem ⚠ ở trên), bản PyTorch là bản duy nhất từng chạy — nên đây
-    # không phải một ca ngoại lệ của một máy, nó là ca THƯỜNG.
-    #
-    # Giá: ~30% thời gian Stage 0. Nó KHÔNG vào vân tay Stage 0 (`with_cp` đổi
-    # CHI PHÍ, không đổi một tensor nào), nên tắt/bật không bắt chạy lại DINO.
-    with_cp: true
-  compressor:               # QFormer: V (784, 640) -> V_c (8, 768)
+  compressor:               # QFormer: V (784, 768) -> V_c (8, 768)
     n_query: 8              # số latent = số token Q nối vào chuỗi decoder
     d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
     head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
-    mlp_hidden: 512         # SwiGLU 768→512→768 (mỗi khối) — một nút THẮT
+    mlp_hidden: 512         # SwiGLU bottleneck
     n_blocks: 4             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
   aligner:                  # V_c (8, 768) -> Q (8, 2560)
@@ -632,24 +447,10 @@ stage1:
   val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
-# KHÔNG nạp Gemma, KHÔNG nhãn, KHÔNG ASL, KHÔNG Cls Head. Thứ DUY NHẤT được
-# huấn luyện là Extractor (InternImage-L cắt stage 3, init ImageNet-22k), bằng hàm mục
-# tiêu nó được sinh ra với.
-#
-#   student(view) ─► DINO head ─┐
-#                                ├─ CE( softmax((t − center)/τ_t) ‖ log_softmax(s/τ_s) )
-#   teacher = EMA(student) ─────┘   teacher CHỈ thấy 2 global; student thấy tất cả
-#
-# "Load lại training state của pretrain rồi finetune tiếp": checkpoint DINOv3
-# công bố chỉ có TRỌNG SỐ — không optimizer, không center, không teacher EMA
-# riêng. Nên ở đây nó nghĩa là nạp trọng số ấy vào CẢ student lẫn teacher, dựng
-# DINO head / optimizer / center mới, rồi chạy tiếp DINO trên miền ảnh CXR.
-#
-# Thứ được LƯU RA base//final/ là **teacher** (EMA), không phải student: teacher
-# mượt hơn, không mang nhiễu của bước Adam cuối, và chính nó là nhánh sinh mục
-# tiêu trong DINO — Stage 1 và main stage vì thế chạy Extractor ở đúng chế độ
-# teacher inference.
-#
+# Chỉ fine-tune FocalNet Large Stage 3 trên ảnh MIMIC-CXR bằng loss tự giám sát.
+# `pretrained: true` nạp trọng số backbone; DINO head, optimizer và center tạo mới.
+# Student xem global + local crops; teacher EMA chỉ xem hai global crops.
+# Checkpoint lưu ra là teacher EMA được chọn theo validation.
 # LỊCH CHUNG (`src/schedule.py`) — HAI chặng, cộng một hệ số nhân:
 #   1. warm-up tuyến tính 1e-8 -> 2e-5   `warmup_epochs` (1) epoch ĐẦU (200 bước)
 #   2. GIỮ 2e-5                          49 EPOCH CÒN LẠI
@@ -729,18 +530,17 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # InternImage nuốt cỡ này trên ĐÚNG một state_dict
+    local_size: 224         # FocalNet nuốt cỡ này trên ĐÚNG một state_dict
                             # (thuần tích chập, không pos-embed để nội suy)
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
-    # Số prototype. KHÔNG phải 65536 của DINO gốc: tập train ở đây 6400 ảnh, và
     # nhiều prototype hơn số ảnh chỉ làm phân phối teacher thưa hơn chứ không
     # mang thêm thông tin nào.
     out_dim: 4096
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. InternImage KHÔNG có cls token -> `mean` (trung bình 784 ô) là
+    # cls | mean. FocalNet KHÔNG có cls token -> `mean` (trung bình 784 ô) là
     # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
     # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
     # không bao giờ tự lộ ra.
@@ -819,7 +619,7 @@ wandb:
   group: "vextractor-q"
   resume_same_run: false
   mode: online
-  tags: [vextractor, internimage-l, qlora, r32, mimic-cxr]
+  tags: [vextractor, focalnet-large, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20

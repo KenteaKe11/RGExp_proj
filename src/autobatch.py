@@ -212,23 +212,10 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
         from .backbone import TrainUnusable
 
         if label == "stage0":
-            tips = (
-                "    Ba chỗ hạ chi phí, theo thứ tự nên thử:\n"
-                "      1. `vextractor.extractor.with_cp: true` — gradient "
-                "checkpointing trong TỪNG `InternImageLayer`. DCNv3 bản PyTorch "
-                "giữ một tensor (N·group, H·W, group_channels, 9) mỗi block để "
-                "backward; checkpointing TÍNH LẠI thay vì giữ. Đây là khoá đúng "
-                "cho ca này, và nó KHÔNG vào vân tay Stage 0 nên không bắt chạy "
-                "lại gì.\n"
-                "      2. `stage0.dino.n_local` — mỗi local crop là MỘT lượt "
-                "forward CÓ gradient nữa, và cả (2 + n_local) view sống cùng lúc "
-                "trong `dino.loss`. Nhưng nó là siêu tham số của HÀM MỤC TIÊU và "
-                "CÓ trong vân tay Stage 0: đổi nó là đổi thí nghiệm.\n"
-                "      3. `autobatch.target_frac` — chỉ nới được vài phần trăm, "
-                "và nới quá thì OOM rơi vào giữa epoch thay vì lúc dò.")
+            tips = ("    Reduce `stage0.micro_batch` or the number of local crops; "
+                    "`autobatch.target_frac` controls the safety margin.")
         else:
-            tips = ("    Hạ `autobatch.target_frac`, tắt tiến trình khác trên "
-                    "card, hoặc bật gradient checkpointing của khối nặng nhất.")
+            tips = "    Lower `autobatch.target_frac` or stop other GPU processes."
         rep.update(error=f"OOM ở MỌI bs, xuống tới {min(cands)}")
         raise TrainUnusable(
             f"autobatch[{label}]: OOM ở MỌI mảnh vật lý, xuống tới bs "

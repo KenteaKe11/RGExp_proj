@@ -39,7 +39,6 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
    ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính n_query High-Q token**:
    `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> Aligner -> Compressor -> Extractor
-   (InternImage-L) -> I` về TẬN PIXEL của ảnh 448².
 
    **Ô 3 lấy TARGET là khối Q, không phải `y`.** Đó là khác biệt với mọi bản
    trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi tự nhiên là *8
@@ -48,7 +47,6 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    được — kể cả khi decoder chưa đọc Q chút nào.
 
    Đường truy ngược chạy qua backbone ở đúng chế độ main stage: **teacher
-   (InternImage-L) inference**. `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ thị
    gradient (trọng số vẫn `requires_grad=False`, `eval()` nên không dropout /
    stochastic depth), rồi trả cờ cũ về nguyên trạng.
 
@@ -1039,7 +1037,6 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "
           "khối Q\" ở mục Kiểm nhanh, hoặc ba hình ở mục 1.\n",
           "**Đường truy ngược chạy ở đúng chế độ main stage: teacher "
-          "(InternImage-L) inference.** `_q_saliency_map` mở cờ đóng băng CHỈ để nối đồ "
           "thị gradient — `requires_grad` của mọi tham số vẫn bị ép về False, "
           "`eval()` giữ nó không dropout / stochastic depth, và cờ cũ được trả "
           "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",

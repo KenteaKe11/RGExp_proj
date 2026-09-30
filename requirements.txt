@@ -48,35 +48,7 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
-# §2.2 — Extractor của nhánh là InternImage-L cắt ở stage 3
-# (OpenGVLab/internimage_l_22k_384, ~1,05 GB trọng số ở lần chạy đầu). Nó
-# KHÔNG có trong timm: nó nạp qua `transformers.AutoModel` +
-# `trust_remote_code=True`, tức ba file .py của OpenGVLab (~60 KB) được tải và
-# CHẠY — `huggingface_hub` là nơi đọc `preprocessor_config.json` để lấy
-# mean/std (mã không hard-code cặp số ấy ở đâu cả).
-#
-# KHÔNG cần biên dịch extension `DCNv3` nào: trong `dcnv3_func.py` của
-# OpenGVLab, `pkg_resources` được import SAU khối try đã dùng nó, nên
-# `has_cuda_kernel` luôn False và model luôn chạy `DCNv3_pytorch`. Chậm hơn và
-# ngốn activation hơn — xem `vextractor.extractor.with_cp`.
-#
-# timm VẪN bắt buộc, vì hai lý do: code InternImage/FlashInternImage của
-# OpenGVLab import `timm.models.layers` (DropPath, trunc_normal_), và
-# `backbone_body` giữ đường dựng timm cho mọi họ backbone khác (selftest dùng nó
-# để kiểm bố cục NCHW/NHWC/NLC mà không cần mạng).
 timm>=1.0.0
-
-# ── DCNv4 — Ở FILE RIÊNG, và đó là CÓ CHỦ Ý ─────────────────────────────────
-# `vextractor.extractor.arch: flash_intern_image_*` cần toán tử DCNv4 — một
-# extension CUDA phải BIÊN DỊCH. Ghim nó ở ĐÂY nghĩa là `pip install -r
-# requirements.txt` cố dịch trên MỌI máy và hỏng trên mọi máy không có nvcc, kể
-# cả máy chỉ chạy `stats`/`lens`/selftest hoặc chạy đường DCNv3.
-#
-#     -> requirements-dcnv4.txt  +  bash scripts/setup_dcnv4.sh
-#
-# `scripts/setup.sh` TỰ gọi script ấy khi config đang dùng `flash_intern_image_*`
-# và máy có GPU (bỏ qua: RGEXP_SKIP_DCNV4=1). Lý do đầy đủ nằm ở đầu
-# requirements-dcnv4.txt; code model thì xem src/vendor/NOTICE.md.
 
 # §2.5 cũ (`_archive/`) dùng ResNet-101/152 của torchvision. Pipeline §2.2 đang
 # chạy KHÔNG còn cần nó. KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản
