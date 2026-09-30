@@ -140,8 +140,8 @@ Main stage học đúng hai thứ: **LoRA của decoder** và **Aligner**. Nhữ
 
 ```bash
 bash scripts/setup.sh
-python scripts/selftest_vextractor.py
-bash scripts/run_vextractor.sh train
+python3 scripts/selftest_vextractor.py
+bash scripts/run_vextractor.sh train --detach
 ```
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
