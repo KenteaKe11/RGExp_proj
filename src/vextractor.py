@@ -1,6 +1,6 @@
 """Twins extractor, QFormer compressor, and vision-language aligner.
 
-Twins PCPVT-S maps 448x448 images to a 14x14 grid of 512-channel tokens
+Twins-SVT-S maps 448x448 images to a 14x14 grid of 512-channel tokens
 (V = 196 x 512). A QFormer compresses V into sixteen latent vectors (V_c, 16 x 768);
 the Aligner (self-attention + SwiGLU + linear projection) maps them to the decoder
 width (2560). Compressor width is 768: cross-attention k/v project 512 -> 768.
@@ -198,10 +198,11 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
         các CNN như FocalNet;
       * `kind = "vit"`, `fmt = "NLC"` — `forward_features` trả **(B, N, C)** gồm
         cả prefix token (cls + register); `n_prefix` ở `Extractor` cắt chúng đi.
-        **Twins PCPVT** cũng đi đường này nhưng KHÔNG có prefix token nào
+        **Twins-SVT** cũng đi đường này nhưng KHÔNG có prefix token nào
         (`n_prefix = 0`): 448² -> stride 32 -> lưới 14×14 = 196 token × 512 kênh,
         và chạy được ở 224² (7×7) trên cùng một `state_dict` (PEG là tích chập,
-        patch-embed không assert cỡ ảnh) nên multi-crop của Stage 0 dùng được.
+        patch-embed không assert cỡ ảnh, lưới mỗi stage chia hết cửa sổ LSA 7×7)
+        nên multi-crop của Stage 0 dùng được.
 
     Hai bố cục 4 chiều là lý do trục kênh được HỎI từ `output_fmt` chứ KHÔNG suy
     từ `f.dim()`. Dùng nhầm nhánh giữa chúng không ném lỗi:
@@ -458,12 +459,12 @@ class Extractor(nn.Module):
     Stage 0. **Backbone không bao giờ mở lại** (trừ Lens, để nối đồ thị
     gradient tới tận pixel; xem `lens_vextractor`).
 
-    Với Twins PCPVT-S (đủ 4 stage, bỏ head) ở 448²:
+    Với Twins-SVT-S (đủ 4 stage, bỏ head) ở 448²:
     `(B, 196, 512)` = V (lưới 14×14 đã là chuỗi token, không prefix token).
     """
 
     def __init__(self, image_size: int = 448,
-                 arch: str = "twins_pcpvt_small",
+                 arch: str = "twins_svt_small",
                  pretrained: bool = True, n_layers: int | None = None,
                  n_stages: int | None = None, normalize: dict | None = None):
         super().__init__()
@@ -565,7 +566,7 @@ class QFormerGroup(nn.Module):
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
 
-    Tham số ở `d_latent` = 768, `d_kv` = 512 (Twins PCPVT-S; k/v chiếu 512→768
+    Tham số ở `d_latent` = 768, `d_kv` = 512 (Twins-SVT-S; k/v chiếu 512→768
     ngay trong Cross-attn), `mlp_hidden` = 1152 (SwiGLU `mult` = 1.5):
 
         SelfAttn  4 × 768²             = 2 359 296   (×2)
@@ -925,7 +926,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 f"vextractor.{blk}: khoá lạ {odd} — không khoá nào trong số ấy "
                 f"được đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
                 f"{list(keys)}.")
-    arch = str(ex.get("arch", "twins_pcpvt_small"))
+    arch = str(ex.get("arch", "twins_svt_small"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -937,7 +938,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                       "n_layers": (None if ex.get("n_layers") is None
                                    else int(ex["n_layers"])),
                       # Lát cắt của họ PHÂN CẤP: giữ `n_stages` stage ĐẦU.
-                      # Twins PCPVT-S: null -> đủ 4 stage (stride 32 / 512 kênh).
+                      # Twins-SVT-S: null -> đủ 4 stage (stride 32 / 512 kênh).
                       "n_stages": (None if ex.get("n_stages") is None
                                    else int(ex["n_stages"])),
 

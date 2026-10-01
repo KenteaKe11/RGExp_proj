@@ -439,7 +439,7 @@ def _():
     assert not torch.allclose(br(x), before)
 
 
-@check("2b'. Twins PCPVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
+@check("2b'. Twins-SVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
        "chạy được ở 224² (multi-crop), không cắt nhầm một ô")
 def _():
     import torch
@@ -447,10 +447,10 @@ def _():
     from src import vextractor as R
 
     net, d_feat, n_patch, n_use, kind, fmt, mres, nst = R.backbone_body(
-        "twins_pcpvt_small", False, 448)
+        "twins_svt_small", False, 448)
     assert (kind, fmt, d_feat, n_patch, nst) == ("vit", "NLC", 512, 196, None)
     assert mres, "Twins phải chạy được ở nửa độ phân giải (local crop 224²)"
-    ex = R.Extractor(448, "twins_pcpvt_small", False, None, None)
+    ex = R.Extractor(448, "twins_svt_small", False, None, None)
     assert ex.n_prefix == 0 and ex.n_patch == 196 and ex.d_feat == 512
     ex.eval()
     with torch.no_grad():
@@ -459,9 +459,9 @@ def _():
         # n_prefix mặc định 1 sẽ cắt lặng lẽ còn 195 ô — phải KHÔNG xảy ra
         assert ex.patches(torch.randn(1, 3, 448, 448)).shape == (1, 196, 512)
         assert ex.patches_raw(torch.randn(1, 3, 224, 224)).shape == (1, 49, 512)
-    # bỏ head: ~23,59 M (24,1 M với head 1000 lớp)
+    # bỏ head: ~23,55 M (24,06 M với head 1000 lớp)
     n = sum(q.numel() for q in ex.parameters())
-    assert 23.5e6 < n < 23.7e6, n
+    assert 23.5e6 < n < 23.6e6, n
 
 
 @check("2c. họ ViT (NLC): bỏ prefix token, cắt n_layers; n_stages trên ViT bị từ chối")

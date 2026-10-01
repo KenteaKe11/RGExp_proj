@@ -4,7 +4,7 @@ Nhánh thị giác bổ sung 16 token ảnh vào đầu vào Gemma 3. Ảnh cũn
 
 ```text
 Ảnh 448×448
-  └─ Extractor: `twins_pcpvt_small` (Twins PCPVT-S) → V (196, 512)
+  └─ Extractor: `twins_svt_small` (Twins-SVT-S) → V (196, 512)
        └─ Compressor: QFormer, 16 latent, 3 nhóm block → V_c (16, 768)
             └─ Aligner: SelfAttn + SwiGLU×2 + Linear Proj 768→2560 → Q (B, 16, 2560)
                  └─ Gemma: [Z ‖ Q ‖ văn bản]
@@ -26,15 +26,15 @@ Mỗi khối học ở **đúng một** giai đoạn và đóng băng hoàn toà
 
 | | |
 |---|---|
-| Main backbone | Twins Transformer — `twins_pcpvt_small` (PCPVT-S) |
+| Main backbone | Twins Transformer — `twins_svt_small` (Twins-SVT-S) |
 | Methodology | `DINOv3` fine-tuning (Stage 0) |
-| Pretrain | PCPVT-S (timm, ImageNet-1k), `n_stages: null` — đủ 4 stage, bỏ head phân loại |
-| Params | **23,59 M** (≈ 24,1 M nếu tính cả head 1000 lớp của bản pretrain) |
+| Pretrain | Twins-SVT-S (timm `twins_svt_small.in1k`, ImageNet-1k), `n_stages: null` — đủ 4 stage, bỏ head phân loại |
+| Params | **23,55 M** (≈ 24,06 M nếu tính cả head 1000 lớp của bản pretrain) |
 | Input | `B, 3, 448, 448` |
 | Output tokens | `B, 196, 512` |
 | Kí hiệu | `V` |
 
-Twins PCPVT-S có stride tổng 32 nên ảnh 448² cho lưới 14×14 = 196 ô, mỗi ô 512 kênh; `forward_features` đã trả sẵn chuỗi token `(B, 196, 512)` và **không có prefix token** (không cls, không register) nên `n_prefix = 0`. Backbone không có pos-embed cố định (PEG là tích chập) nên chạy được ở 224² (lưới 7×7) trên cùng một `state_dict` — điều kiện để multi-crop của Stage 0 dùng được. Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained; checkpoint đem sang các stage sau là bản **teacher EMA** chọn theo validation.
+Twins-SVT-S (xen kẽ LSA — self-attention cục bộ trong cửa sổ 7×7 — và GSA — attention toàn cục trên khoá/giá trị đã lấy mẫu thưa) có stride tổng 32 nên ảnh 448² cho lưới 14×14 = 196 ô, mỗi ô 512 kênh; `forward_features` đã trả sẵn chuỗi token `(B, 196, 512)` và **không có prefix token** (không cls, không register) nên `n_prefix = 0`. Backbone không có pos-embed cố định (PEG là tích chập) và lưới mỗi stage ở 448² (112/56/28/14) lẫn 224² (56/28/14/7) đều chia hết cho cửa sổ 7, nên chạy được ở 224² (lưới 7×7) trên cùng một `state_dict` — điều kiện để multi-crop của Stage 0 dùng được. Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained; checkpoint đem sang các stage sau là bản **teacher EMA** chọn theo validation.
 
 ### 2.2. Compressor — nén đặc trưng vào các token ẩn
 
@@ -80,13 +80,13 @@ Tổng Aligner **7,87 M**: SelfAttn 2,36 M · SwiGLU 3,54 M · Linear 1,97 M · 
 
 | | Tham số | Học ở |
 |---|---|---|
-| Extractor | **23,59 M** | Stage 0 |
+| Extractor | **23,55 M** | Stage 0 |
 | Compressor | **36,00 M** | Stage 1 |
 | Aligner | **7,87 M** | Main stage |
-| **Cả nhánh** | **67,47 M** | |
+| **Cả nhánh** | **67,42 M** | |
 | Học ở main stage | **7,87 M** | chỉ Aligner |
 
-DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,82 M**; student Stage 0 vì thế có **30,42 M**.
+DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,82 M**; student Stage 0 vì thế có **30,37 M**.
 
 **Đầu vào decoder:** nối 16 token đã căn chỉnh sau token ảnh gốc `Z`; các vị trí token mới có nhãn `-100` cho CE, nên số token vào CE không đổi so với baseline.
 

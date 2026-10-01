@@ -26,7 +26,7 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 Main stage học ĐÚNG hai thứ: **LoRA của decoder** và **Aligner**. Mọi module
 khác của nhánh đóng băng hoàn toàn — đó là đặc tả, không phải một tối ưu.
 
-  * **Extractor** (Twins PCPVT-S, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
+  * **Extractor** (Twins-SVT-S, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
     **TEACHER INFERENCE** suốt main stage: `requires_grad=False` + `eval()` +
     forward trong `no_grad`, KHÔNG nằm trong optimizer, KHÔNG có bước mở băng
     nào. Đó đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
@@ -69,7 +69,7 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt Twins PCPVT-S (đủ 4
+mỗi bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt Twins-SVT-S (đủ 4
 stage) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad`,
 và Compressor cũng vậy, nên phần nặng còn lại chỉ là Aligner trên 16 token.
 

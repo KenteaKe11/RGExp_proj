@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = Twins PCPVT-S + DINO head ─────┐
+            ─► student = Twins-SVT-S + DINO head ─────┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,12 +10,12 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor là Twins PCPVT-S đủ 4 stage (bỏ head phân loại): ~23,6 M trọng số
-(~24,1 M tính cả head 1000 lớp của bản pretrain) + một DINO head, cộng một bản teacher EMA đầy
+Extractor là Twins-SVT-S đủ 4 stage (bỏ head phân loại): ~23,55 M trọng số
+(~24,06 M tính cả head 1000 lớp của bản pretrain) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số Twins PCPVT-S (timm `twins_pcpvt_small`); các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
+**Điểm xuất phát:** `pretrained: true` tải trọng số Twins-SVT-S (timm `twins_svt_small`); các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
@@ -227,7 +227,7 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # Twins PCPVT KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
+        # Twins-SVT KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
         # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
         "pool": str(d.get("pool", "mean")),
         "student_temp": float(d.get("student_temp", 0.1)),
@@ -608,7 +608,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not spec["extractor"]["pretrained"]:
         raise TrainUnusable(
             "vextractor.extractor.pretrained = false: Stage 0 requires "
-            "pretrained Twins PCPVT-S weights.")
+            "pretrained Twins-SVT-S weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 
