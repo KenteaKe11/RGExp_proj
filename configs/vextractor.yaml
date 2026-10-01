@@ -7,7 +7,7 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone FocalNet-B học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone Twins PCPVT-S học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
@@ -22,7 +22,7 @@
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (FocalNet-B ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (Twins PCPVT-S ăn ảnh 448²) — và chuỗi dài
 # thêm 16.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -312,24 +312,24 @@ labels:
 # NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# FocalNet Stage 3 -> QFormer compressor -> vision-language aligner.
+# Twins PCPVT-S -> QFormer compressor -> vision-language aligner.
 # Stage 0: DINO self-supervised fine-tuning; Stage 1: compressor transfer.
 vextractor:
-  extractor:                # FocalNet-B LRF Stage 3: (B,3,448,448) -> (B,512,28,28)
+  extractor:                # Twins PCPVT-S: (B,3,448,448) -> V (B,196,512)  (~24,1 M)
     image_size: 448
-    arch: focalnet_base_lrf
+    arch: twins_pcpvt_small
     pretrained: true
     n_layers: null
-    n_stages: 3
-  compressor:               # QFormer: V (784, 512) -> V_c (16, 768)
+    n_stages: null          # đủ 4 stage (stride 32): 448² -> lưới 14×14 = 196 token
+  compressor:               # QFormer: V (196, 512) -> V_c (16, 512)
     n_query: 16             # số latent = số token Q nối vào chuỗi decoder
-    d_latent: 768           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
-    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
-    mlp_hidden: 512         # SwiGLU bottleneck
-    n_blocks: 4             # N: số lần lặp (khối 1 -> khối 2)
+    d_latent: 512           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
+    head_dim: 64            # n_heads SUY RA = d_latent // head_dim = 8
+    mlp_hidden: 768         # SwiGLU mult = 1.5 → 512→768→512
+    n_blocks: 5             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (16, 768) -> Q (16, 2560)
-    mlp_hidden: 2048        # SwiGLU 768→2048→2560 (8 388 608); NỞ RA
+  aligner:                  # V_c (16, 512) -> Q (16, 2560)
+    mlp_hidden: 1024        # SwiGLU mult = 2 → 512→1024→512, rồi Linear 512→2560
     dropout: 0.0
 
   # ── Main stage: MỘT khối học được, HAI nhóm lr (`src/train_vextractor.py`) ─
@@ -343,8 +343,8 @@ vextractor:
   #               thị giác sang không gian ngữ nghĩa, và nó không làm được việc
   #               ấy nếu bị đóng băng lúc LoRA đang định hình. warm-up 10% bước
   #               rồi PHẲNG, HAI nhóm:
-  #                 ffn  (SwiGLU + 2 RMSNorm)  1e-6 -> 1e-4
-  #                 attn (4 chiếu MHAttn)      1e-7 -> 1e-5
+  #                 ffn  (SwiGLU + Linear Proj + 3 RMSNorm)  1e-7 -> 1e-4
+  #                 attn (4 chiếu SelfAttn)                  1e-8 -> 1e-5
   #               Cùng MỘT dốc cho cả hai: chúng nằm trong cùng một khối ngẫu
   #               nhiên và phải đi vào cùng một lúc.
   #
@@ -372,9 +372,9 @@ vextractor:
   #
   # LoRA của decoder vẫn chạy ĐÚNG lịch one-cycle của $1 (khối `train.schedule`).
   main:
-    align_ffn_lr_min: 1.0e-6    # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này)
+    align_ffn_lr_min: 1.0e-7    # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này)
     align_ffn_lr_main: 1.0e-4   # lr PHẲNG sau warm-up
-    align_attn_lr_min: 1.0e-7
+    align_attn_lr_min: 1.0e-8
     align_attn_lr_main: 1.0e-5
     align_warmup_frac: 0.10     # 10% tổng bước (= 20/200), dùng cho CẢ hai nhóm
     align_wd: 0.01
@@ -399,7 +399,7 @@ vextractor:
 #
 # HAI view, và đúng hai: teacher một global 448², student một global 448² KHÁC
 # (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên nên
-# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 784 ô nên
+# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 196 ô nên
 # local crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới thô hơn.
 #
 # MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN của
@@ -408,16 +408,16 @@ vextractor:
 #
 # HAI nhóm lr, cùng lịch chung nhưng hai CẶP số: warm-up tuyến tính trong
 # `warmup_epochs` epoch rồi GIỮ `lr_max` của từng nhóm tới hết. Ma trận attention
-# quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ dễ hỏng nhất khi
+# quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ dễ hỏng nhất khi
 # bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
 # lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
 # `latent` + mọi RMSNorm + DINO head mới đi theo nhóm FFN (xem
 # `vextractor.Compressor.ffn_parameters`).
 stage1:
   attn_lr_min: 1.0e-8
-  attn_lr_max: 3.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
+  attn_lr_max: 2.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
   ffn_lr_min: 1.0e-7
-  ffn_lr_max: 3.0e-4      # MỨC CHẠY của nhóm ffn
+  ffn_lr_max: 2.0e-4      # MỨC CHẠY của nhóm ffn
   warmup_epochs: 1.0      # độ dài dốc warm-up (epoch), rồi GIỮ lr_max tới hết
   max_epochs: 30          # TRẦN, không phải số epoch sẽ chạy — patience quyết
   # CHẶNG 5, giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
@@ -439,7 +439,7 @@ stage1:
   val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
-# Chỉ fine-tune FocalNet-Base LRF Stage 3 trên ảnh MIMIC-CXR bằng loss tự giám sát.
+# Chỉ fine-tune Twins PCPVT-S trên ảnh MIMIC-CXR bằng loss tự giám sát.
 # `pretrained: true` nạp trọng số backbone; DINO head, optimizer và center tạo mới.
 # Student xem global + local crops; teacher EMA chỉ xem hai global crops.
 # Checkpoint lưu ra là teacher EMA được chọn theo validation.
@@ -522,8 +522,8 @@ stage0:
   dino:
     global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # FocalNet nuốt cỡ này trên ĐÚNG một state_dict
-                            # (thuần tích chập, không pos-embed để nội suy)
+    local_size: 224         # Twins nuốt cỡ này trên ĐÚNG một state_dict (lưới 7×7;
+                            # PEG là tích chập, không pos-embed để nội suy)
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
     # nhiều prototype hơn số ảnh chỉ làm phân phối teacher thưa hơn chứ không
@@ -532,7 +532,7 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. FocalNet KHÔNG có cls token -> `mean` (trung bình lưới) là
+    # cls | mean. Twins KHÔNG có cls token -> `mean` (trung bình lưới) là
     # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
     # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
     # không bao giờ tự lộ ra.
@@ -611,7 +611,7 @@ wandb:
   group: "vextractor-q"
   resume_same_run: false
   mode: online
-  tags: [vextractor, focalnet-base-lrf, qlora, r32, mimic-cxr]
+  tags: [vextractor, twins-pcpvt-s, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20

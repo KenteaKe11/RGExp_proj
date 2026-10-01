@@ -27,13 +27,13 @@ Cả hai chạy lịch CHUNG của `src/schedule.py` — warm-up tuyến tính t
 `warmup_epochs` (1) epoch rồi GIỮ `lr_max` tới hết — nhưng trên hai cặp số
 khác nhau:
 
-    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 3e-5
-    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 3e-4
+    Attn  (Self ×2 + Cross ×1 mỗi nhóm khối)   1e-8 -> 2e-5
+    FFN   (SwiGLU + RMSNorm + latent + head)   1e-7 -> 2e-4
 
-Ma trận attention quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 784 ô, và đó là thứ
+Ma trận attention quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ
 dễ hỏng nhất khi bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài
 ô rồi không quay lại. FFN thì chỉ biến đổi thứ đã đọc được, nên nó chịu được
-một mức cao hơn — ở đây cao hơn **10 lần** (3e-4 so với 3e-5).
+một mức cao hơn — ở đây cao hơn **10 lần** (2e-4 so với 2e-5).
 
 **Chặng 5** giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
 chia cho `plateau_gamma` (1,5), sàn là `lr_min` của từng nhóm, và val khá lên thì

@@ -589,7 +589,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
        token, truy ngược `Q → Aligner → Compressor → Extractor → I` về
        tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
-    4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (28×28 ở cấu hình hiện
+    4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (14×14 ở cấu hình hiện
        tại) — backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó.
 
     **BỐN ô, và chỉ hai trong số đó cùng loại đại lượng.** Ô 2 và ô 3 đều là

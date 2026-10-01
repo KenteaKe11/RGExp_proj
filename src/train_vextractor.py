@@ -26,7 +26,7 @@ nhánh không-MoE, không-branch, và chỉ chèn nhánh ở ba chỗ:
 Main stage học ĐÚNG hai thứ: **LoRA của decoder** và **Aligner**. Mọi module
 khác của nhánh đóng băng hoàn toàn — đó là đặc tả, không phải một tối ưu.
 
-  * **Extractor** (FocalNet-Base LRF, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
+  * **Extractor** (Twins PCPVT-S, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
     **TEACHER INFERENCE** suốt main stage: `requires_grad=False` + `eval()` +
     forward trong `no_grad`, KHÔNG nằm trong optimizer, KHÔNG có bước mở băng
     nào. Đó đúng là chế độ teacher đã sinh mục tiêu trong Stage 0 — không
@@ -38,14 +38,14 @@ khác của nhánh đóng băng hoàn toàn — đó là đặc tả, không ph�
     trước vòng lặp, không có `comp_freeze_frac`, không có mốc mở băng, không
     nhóm lr nào. Stage 1 là giai đoạn DUY NHẤT nó học. Vì cả nó và Extractor
     đều đóng băng, `VExtractorBranch.forward` chạy nó trong `no_grad`: không
-    giữ activation của 784 ô × 4 nhóm khối, nên phần backward bắt đầu ĐÚNG ở
+    giữ activation của 196 ô × 5 nhóm khối, nên phần backward bắt đầu ĐÚNG ở
     `Aligner`;
 
   * **Aligner** — khối MỚI, khởi tạo ngẫu nhiên, **khối DUY NHẤT của nhánh học
     ở đây**, và học **CÙNG LoRA ngay từ bước 0**: warm-up tuyến tính trong
     `align_warmup_frac` (10%) tổng số bước rồi PHẲNG tới bước cuối, với HAI
-    nhóm — `align_ffn_lr_min` (1e-6) -> `align_ffn_lr_main` (1e-4) cho SwiGLU +
-    hai RMSNorm, và `align_attn_lr_min` (1e-7) -> `align_attn_lr_main` (1e-5)
+    nhóm — `align_ffn_lr_min` (1e-7) -> `align_ffn_lr_main` (1e-4) cho SwiGLU +
+    Linear Proj + ba RMSNorm, và `align_attn_lr_min` (1e-8) -> `align_attn_lr_main` (1e-5)
     cho bốn chiếu của MHAttn. Mục tiêu của nó là *học cách biến tín hiệu đặc
     trưng thị giác sang không gian ngữ nghĩa*, và nó không làm được việc ấy nếu
     bị đóng băng lúc LoRA đang định hình.
@@ -69,8 +69,8 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian
-mỗi bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt FocalNet-Base LRF (cắt
-ở stage 3, FocalNet Stage 3) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad`,
+mỗi bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt Twins PCPVT-S (đủ 4
+stage) ở 448² cho mỗi ảnh. Lượt ấy chạy trong `no_grad`,
 và Compressor cũng vậy, nên phần nặng còn lại chỉ là Aligner trên 16 token.
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
@@ -151,9 +151,9 @@ MỘT khối học được, HAI nhóm lr (xem docstring đầu file):
             f"`comp_*` cũng vậy: Compressor đóng băng hoàn toàn ở main stage, "
             f"nên nó không còn lr, mốc đóng băng hay weight decay nào ở đây — "
             f"lịch học của nó nằm trọn ở khối `stage1`.)")
-    out = {"align_ffn_lr_min": float(m.get("align_ffn_lr_min", 1e-6)),
+    out = {"align_ffn_lr_min": float(m.get("align_ffn_lr_min", 1e-7)),
            "align_ffn_lr_main": float(m.get("align_ffn_lr_main", 1e-4)),
-           "align_attn_lr_min": float(m.get("align_attn_lr_min", 1e-7)),
+           "align_attn_lr_min": float(m.get("align_attn_lr_min", 1e-8)),
            "align_attn_lr_main": float(m.get("align_attn_lr_main", 1e-5)),
            "align_warmup_frac": float(m.get("align_warmup_frac", 0.10)),
            "align_wd": float(m.get("align_wd", 0.01)),

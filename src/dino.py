@@ -31,8 +31,8 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
   4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     không pos-embed để nội suy, không cửa sổ để đệm (448² -> 28×28,
-     224² -> 14×14, đã probe THẬT lúc dựng).
+     không pos-embed để nội suy (Twins dùng PEG tích chập), không cửa sổ để đệm (448² -> 14×14,
+     224² -> 7×7 với Twins, đã probe THẬT lúc dựng).
 
 **Tăng cường ảnh viết bằng PIL**, không kéo thêm torchvision: cùng đường với
 `vextractor.vext_tensor` (PIL -> uint8 -> tensor -> (x−mean)/std), nên ảnh của
@@ -150,7 +150,7 @@ class DINOHead(nn.Module):
 
     Đọc vector nào của backbone: `cls` (token đầu) — DINO gốc chưng cất trên
     CLS. `mean` (trung bình các patch, đã bỏ prefix) cho họ lưới (ConvNeXt,
-    SwinV2), vốn không có CLS token nào; đó là chế độ của /7.
+    SwinV2) và Twins, vốn không có CLS token nào; đó là chế độ của /7.
     """
 
     def __init__(self, d_feat: int, out_dim: int = 4096, hidden: int = 2048,

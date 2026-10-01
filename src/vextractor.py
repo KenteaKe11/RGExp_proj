@@ -1,7 +1,9 @@
-"""FocalNet extractor, QFormer compressor, and vision-language aligner.
+"""Twins extractor, QFormer compressor, and vision-language aligner.
 
-FocalNet-Base LRF Stage 3 maps 448x448 images to 512 channels at 28x28. The feature
-grid is flattened to 784 tokens before compression to sixteen latent vectors.
+Twins PCPVT-S maps 448x448 images to a 14x14 grid of 512-channel tokens
+(V = 196 x 512). A QFormer compresses V into sixteen latent vectors (V_c, 16 x 512);
+the Aligner (self-attention + SwiGLU + linear projection) maps them to the decoder
+width (2560).
 """
 from __future__ import annotations
 
@@ -70,7 +72,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì Compressor/Aligner KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/16"
+FORMAT = "rgexp.vextractor/17"
 
 
 class VExtractorUnusable(RuntimeError):
@@ -196,6 +198,10 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
         các CNN như FocalNet;
       * `kind = "vit"`, `fmt = "NLC"` — `forward_features` trả **(B, N, C)** gồm
         cả prefix token (cls + register); `n_prefix` ở `Extractor` cắt chúng đi.
+        **Twins PCPVT** cũng đi đường này nhưng KHÔNG có prefix token nào
+        (`n_prefix = 0`): 448² -> stride 32 -> lưới 14×14 = 196 token × 512 kênh,
+        và chạy được ở 224² (7×7) trên cùng một `state_dict` (PEG là tích chập,
+        patch-embed không assert cỡ ảnh) nên multi-crop của Stage 0 dùng được.
 
     Hai bố cục 4 chiều là lý do trục kênh được HỎI từ `output_fmt` chứ KHÔNG suy
     từ `f.dim()`. Dùng nhầm nhánh giữa chúng không ném lỗi:
@@ -390,7 +396,10 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     elif f.dim() == 3:                     # (B, N, C) — họ ViT
         kind, fmt = "vit", "NLC"
         d_feat = int(f.shape[2])
-        n_patch = int(f.shape[1]) - int(getattr(net, "num_prefix_tokens", 1))
+        # Mặc định 0, KHÔNG phải 1: họ không có cls/register token (Twins) cũng
+        # trả (B, N, C) nhưng không khai `num_prefix_tokens`. Mặc định 1 cắt
+        # lặng lẽ một ô thật (196 -> 195) và cả đường ống chạy tiếp trên lưới lệch.
+        n_patch = int(f.shape[1]) - int(getattr(net, "num_prefix_tokens", 0))
     else:
         raise VExtractorUnusable(
             f"{arch!r}: forward_features trả {tuple(f.shape)} — cần (B, C, H, W), "
@@ -449,14 +458,14 @@ class Extractor(nn.Module):
     Stage 0. **Backbone không bao giờ mở lại** (trừ Lens, để nối đồ thị
     gradient tới tận pixel; xem `lens_vextractor`).
 
-    Với FocalNet-Base LRF Stage 3 at 448²:
-    `(B, 512, 28, 28)` -> `V = (B, 784, 512)`.
+    Với Twins PCPVT-S (đủ 4 stage, bỏ head) ở 448²:
+    `(B, 196, 512)` = V (lưới 14×14 đã là chuỗi token, không prefix token).
     """
 
     def __init__(self, image_size: int = 448,
-                 arch: str = "focalnet_base_lrf",
+                 arch: str = "twins_pcpvt_small",
                  pretrained: bool = True, n_layers: int | None = None,
-                 n_stages: int | None = 3, normalize: dict | None = None):
+                 n_stages: int | None = None, normalize: dict | None = None):
         super().__init__()
         self.image_size = int(image_size)
         (self.body, self.d_feat, self.n_patch, self.n_layers, self.kind,
@@ -464,7 +473,7 @@ class Extractor(nn.Module):
             arch, pretrained, self.image_size, n_layers, n_stages)
         self.arch = str(arch)
         self.n_prefix = (0 if self.kind == "conv"
-                         else int(getattr(self.body, "num_prefix_tokens", 1)))
+                         else int(getattr(self.body, "num_prefix_tokens", 0)))
         self.mean, self.std = _check_normalize(self.body, arch, normalize)
         self.frozen = False
 
@@ -556,20 +565,20 @@ class QFormerGroup(nn.Module):
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
 
-    Tham số ở `d_latent` = 768, `d_kv` = 512 (FocalNet-Base), `mlp_hidden` = 512:
+    Tham số ở `d_latent` = 512, `d_kv` = 512 (Twins PCPVT-S), `mlp_hidden` = 768
+    (SwiGLU `mult` = 1.5):
 
-        SelfAttn  4 × 768²             = 2 359 296   (×2)
-        CrossAttn 2 × 768² + 2×512×768 = 1 966 080
-        SwiGLU    3 × 768 × 512        = 1 179 648   (×2)
-        5 × RMSNorm(768)               =     3 840
+        SelfAttn  4 × 512²             = 1 048 576   (×2)
+        CrossAttn 2 × 512² + 2×512×512 = 1 048 576
+        SwiGLU    3 × 512 × 768        = 1 179 648   (×2)
+        5 × RMSNorm(512)               =     2 560
         ───────────────────────────────────────────
-        KHỐI 1 (self + cross + ffn)    = 5 507 328
-        KHỐI 2 (self + ffn)            = 3 540 480
-        MỘT nhóm (khối 1 → khối 2)     = 9 047 808
+        KHỐI 1 (self + cross + ffn)    = 3 276 800
+        KHỐI 2 (self + ffn)            = 2 228 224
+        MỘT nhóm (khối 1 → khối 2)     = 5 507 584   (≈ 5,51 M)
 
-    > Mỗi nhóm có **9 047 808** tham số. Tổng Compressor ở `N = 4` là
-    > **36 204 032** = 4 × 9 047 808, cộng `latent` (16 × 768 = 12 288) và
-    > `RMSNorm(V)` (512) ngoài bốn nhóm khối.
+    > Tổng Compressor ở `N = 5` là **27 546 624** = 5 × 5 507 584, cộng `latent`
+    > (16 × 512 = 8 192) và `RMSNorm(V)` (512) ngoài năm nhóm khối.
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
@@ -611,26 +620,26 @@ class QFormerGroup(nn.Module):
 class Compressor(nn.Module):
     """V (B, n_patch, d_feat) -> V_c (B, n_query, d_latent). QFormer, N nhóm khối.
 
-        kv  = RMSNorm(V)                        768, MỘT lần, ngoài mọi nhóm
-        q   = latent.expand(B)                  (B, 16, 768)
+        kv  = RMSNorm(V)                        512, MỘT lần, ngoài mọi nhóm
+        q   = latent.expand(B)                  (B, 16, 512)
         q   = group_i(q, kv)   với i = 1..N     mỗi nhóm = khối 1 + khối 2
 
-    **16 latent là khoá KHAI** (`n_query`) — lưới của Extractor (784 ô ở 448²)
+    **16 latent là khoá KHAI** (`n_query`) — lưới của Extractor (196 ô ở 448²)
     chỉ là NGUỒN để hỏi, không phải khối Q.
 
     **`RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer.**
-    Không có `Linear 768→768`: phép đổi chiều nằm trong `k_proj`/`v_proj` của
+    Không có `Linear` riêng: phép đổi chiều nằm trong `k_proj`/`v_proj` của
     Cross-attn. Lý do là đếm được — một lớp chiếu riêng thêm 0,49 M tham số mà
     không thêm sức biểu diễn nào (nó chỉ gộp được vào `k`/`v` phía sau).
 
     **Chi phí nằm ở `d_latent`, không ở `n_query`.** 16 latent là 12 288 tham
-    số; mỗi SelfAttn @768 là 2,36 M. Đổi `n_query` gần như không đụng tới bảng
+    số; mỗi SelfAttn @512 là 1,05 M. Đổi `n_query` gần như không đụng tới bảng
     tham số (nó đụng tới THỜI GIAN và tới độ dài chuỗi decoder); đổi `d_latent`
     thì đụng tới tất cả, theo d².
     """
 
-    def __init__(self, d_feat: int, n_query: int = 16, d_latent: int = 768,
-                 head_dim: int = 128, mlp_hidden: int = 512, n_blocks: int = 4,
+    def __init__(self, d_feat: int, n_query: int = 16, d_latent: int = 512,
+                 head_dim: int = 64, mlp_hidden: int = 768, n_blocks: int = 5,
                  dropout: float = 0.0):
         super().__init__()
         self.d_feat = int(d_feat)
@@ -664,7 +673,7 @@ class Compressor(nn.Module):
     def attn_parameters(self):
         """Tham số của MỌI attention (Self ×2 + Cross ×1, mỗi nhóm khối).
 
-        Stage 1 chạy nhóm này ở lr THẤP HƠN nhóm FFN (7e-5 so với 1e-4): ma
+        Stage 1 chạy nhóm này ở lr THẤP HƠN nhóm FFN (2e-5 so với 2e-4): ma
         trận attention quyết định 16 vector ĐỌC Ở ĐÂU trên lưới, và đó là thứ
         dễ hỏng nhất khi bị đẩy nhanh — một bước lớn làm phân phối attention
         sụp về vài ô rồi không quay lại.
@@ -709,48 +718,49 @@ class Compressor(nn.Module):
 
 # ══ 3. ALIGNER ══════════════════════════════════════════════════════════════
 class Aligner(nn.Module):
-    """V_c (d_latent) -> Q (d_model). MHAttn + SwiGLU — HAI khối con.
+    """V_c (d_latent) -> Q (d_model). SelfAttn + SwiGLU (×2) + Linear Proj.
 
-        x = V_c + MHAttn(RMSNorm(V_c))                768  (= d_latent)
-        y = RMSNorm(x)
-        Q = down( SiLU(gate(y)) ⊙ up(y) )    768 -> mlp_hidden (2048) -> 2560
+        x = V_c + SelfAttn(RMSNorm(V_c))              512  (= d_latent)
+        x = x   + SwiGLU(RMSNorm(x))                  512 -> 1024 -> 512   (mult 2)
+        Q = Linear(RMSNorm(x))                        512 -> 2560
 
-    **MHAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt TỰ-chú ý trên đúng 16 vector
-    của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới. Nên nó
-    không thêm một bit thông tin thị giác nào — việc của nó là trộn 16 vector
-    MỘT lần nữa ngay tại ranh giới ngữ nghĩa, sau khi Compressor đã nén xong và
-    trước khi `down` đưa chúng sang không gian embedding của decoder.
+    **SelfAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt TỰ-chú ý trên đúng 16 vector
+    của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới. Việc của nó
+    là trộn 16 vector MỘT lần nữa ngay tại ranh giới ngữ nghĩa.
 
-    **Residual quanh MHAttn, KHÔNG quanh SwiGLU.** Khối attention giữ nguyên
-    chiều nên dấu `+` có nghĩa; khối SwiGLU đổi 768 -> 2560 nên không có gì để
-    cộng vào. Đó cũng là lý do Aligner không phải một block transformer đầy đủ:
-    nửa sau của nó là một phép ĐỔI KHÔNG GIAN, không phải một lượt tinh chỉnh.
+    **Hai dấu `+` (residual), cả hai ở chiều d_latent** — SelfAttn và SwiGLU đều
+    giữ nguyên chiều nên cộng được. Phép ĐỔI KHÔNG GIAN (512 -> 2560) là một
+    `Linear` riêng đứng SAU cả hai residual, nên nó là chỗ DUY NHẤT không có `+`.
+
+    `SwiGLU(x2)` đọc là `mult = 2`: hidden = 2 × d_latent = 1024, cùng quy ước
+    `mult` của Compressor (`mult = 1.5` -> 768). Khoá khai là `mlp_hidden` (số
+    nguyên) để vân tay và checkpoint không phụ thuộc cách làm tròn.
+
+    **Ba RMSNorm, đứng TRƯỚC từng khối con** (attn, SwiGLU, Linear). Norm trước
+    SwiGLU là BẮT BUỘC: cổng NHÂN ăn đầu vào nhỏ thì **bình phương** cái nhỏ ấy
+    (đo được RMS(Q) ~1e-4 ở bước 0 khi bỏ norm, underflow hẳn trên model đồ
+    chơi). Norm trước `Linear` giữ thang của Q độc lập với thang của dòng
+    residual — Q đi thẳng vào embedding của decoder nên thang của nó phải do
+    chính Aligner quyết định, không do V_c.
 
     **`n_heads` suy ra từ `compressor.head_dim`, không phải một khoá thứ hai.**
-    Mọi attention của nhánh chạy ở CÙNG `head_dim` (128 -> 6 head ở 768), và
-    khai lại nó ở đây là mở đường cho hai nửa của nhánh chạy hai `head_dim`
-    khác nhau mà không ai thấy.
+    Mọi attention của nhánh chạy ở CÙNG `head_dim` (64 -> 8 head ở 512).
 
-    **RMSNorm trước SwiGLU là BẮT BUỘC, không phải trang trí.** SwiGLU có CỔNG
-    NHÂN, và một cổng nhân ăn đầu vào nhỏ thì **bình phương** cái nhỏ ấy. Đo
-    trên chính khối này khi BỎ RMSNorm: RMS(Q) ở bước 0 rơi xuống ~1e-4, và
-    trên model đồ chơi của selftest nó underflow HẲN về 0 — bản đồ saliency của
-    Lens thành một ma trận không. Nhân init lên để bù thì chữa *triệu chứng*
-    (con số bù suy từ RMS đo được, và nó trôi ngay khi Compressor đổi); RMSNorm
-    chữa *nguyên nhân*, và nhờ nó init `1/√fan_in` mới có nghĩa. Giá: 768 tham
-    số mỗi norm.
+    Init: SwiGLU và `proj` dùng `1/√fan_in` (`_init` bỏ qua chúng); bốn chiếu của
+    attention theo quy ước normal(0, 0.02) của Compressor.
 
-    Init `1/√fan_in` cho BA ma trận có cổng, nên `_init` (normal(0, 0.02)) bỏ
-    qua chúng — nhưng nó VẪN chạm bốn chiếu của MHAttn: attention không có
-    cổng, và nó đi theo đúng quy ước của Compressor.
+    Ở 512 / hidden 1024 / d_model 2560:
 
-    Ở 768 / hidden 2048 / d_model 2560: MHAttn 4 × 768² = **2 359 296** ·
-    SwiGLU 2 × 768 × 2048 + 2048 × 2560 = **8 388 608** · 2 × RMSNorm(768) =
-    1 536 => **10 749 440** (10,75 M).
+        SelfAttn  4 × 512²             = 1 048 576
+        SwiGLU    3 × 512 × 1024       = 1 572 864
+        Linear    512 × 2560 + 2560    = 1 313 280   (có bias)
+        3 × RMSNorm(512)               =     1 536
+        ─────────────────────────────────────────────
+        ALIGNER                        = 3 936 256   (≈ 3,94 M)
     """
 
-    def __init__(self, d_latent: int, d_model: int, mlp_hidden: int = 2048,
-                 head_dim: int = 128, dropout: float = 0.0):
+    def __init__(self, d_latent: int, d_model: int, mlp_hidden: int = 1024,
+                 head_dim: int = 64, dropout: float = 0.0):
         super().__init__()
         self.d_latent, self.d_model = int(d_latent), int(d_model)
         self.mlp_hidden = int(mlp_hidden)
@@ -760,7 +770,7 @@ class Aligner(nn.Module):
         if self.d_latent % self.head_dim:
             raise ValueError(
                 f"d_latent {self.d_latent} không chia hết head_dim "
-                f"{self.head_dim} — MHAttn của Aligner chạy ở ĐÚNG head_dim "
+                f"{self.head_dim} — SelfAttn của Aligner chạy ở ĐÚNG head_dim "
                 f"của Compressor, nên hai số này phải khớp nhau.")
         self.n_heads = self.d_latent // self.head_dim
         self.drop = nn.Dropout(float(dropout))
@@ -768,59 +778,55 @@ class Aligner(nn.Module):
         self.attn = MultiHeadAttention(self.d_latent, self.n_heads, None,
                                        float(dropout))
         self.n_ffn = RMSNorm(self.d_latent)
-        self.gate = nn.Linear(self.d_latent, self.mlp_hidden, bias=False)
-        self.up = nn.Linear(self.d_latent, self.mlp_hidden, bias=False)
-        self.down = nn.Linear(self.mlp_hidden, self.d_model, bias=False)
+        self.ffn = SwiGLU(self.d_latent, self.mlp_hidden, self.d_latent)
+        self.n_proj = RMSNorm(self.d_latent)
+        self.proj = nn.Linear(self.d_latent, self.d_model, bias=True)
         self.reset_projections()
 
     @torch.no_grad()
     def reset_projections(self) -> None:
-        """`1/√fan_in` cho cả ba — init chuẩn của một khối có cổng."""
-        for lin in (self.gate, self.up, self.down):
-            nn.init.normal_(lin.weight, mean=0.0,
-                            std=1.0 / math.sqrt(lin.in_features))
+        """`1/√fan_in` cho `proj` (SwiGLU tự khởi tạo), bias 0."""
+        nn.init.normal_(self.proj.weight, mean=0.0,
+                        std=1.0 / math.sqrt(self.proj.in_features))
+        nn.init.zeros_(self.proj.bias)
 
     # ── HAI nhóm lr của main stage ────────────────────────────────────────
     def attn_modules(self):
         return (self.attn,)
 
     def ffn_modules(self):
-        return (self.gate, self.up, self.down)
+        return (self.ffn, self.proj)
 
     def norm_modules(self):
-        return (self.n_attn, self.n_ffn)
+        return (self.n_attn, self.n_ffn, self.n_proj)
 
     def attn_parameters(self):
-        """Bốn chiếu của MHAttn — nhóm lr RIÊNG (1e-7 -> 1e-5).
+        """Bốn chiếu của SelfAttn — nhóm lr RIÊNG (1e-8 -> 1e-5).
 
-        Cùng lý do như ở Stage 1 của Compressor, dịch sang chỗ này: ma trận
-        attention quyết định 16 vector TRỘN VỚI NHAU thế nào, và một bước lớn
-        làm phân phối ấy sụp về một vector rồi không quay lại. FFN chỉ biến đổi
-        thứ đã trộn xong, nên nó chịu được mức cao hơn **10 lần**.
+        Ma trận attention quyết định 16 vector TRỘN VỚI NHAU thế nào, và một
+        bước lớn làm phân phối ấy sụp về một vector rồi không quay lại. FFN chỉ
+        biến đổi thứ đã trộn xong, nên nó chịu được mức cao hơn **10 lần**.
         """
         yield from self.attn.parameters()
 
     def ffn_parameters(self):
-        """SwiGLU + HAI RMSNorm — mọi thứ KHÔNG phải attention (1e-6 -> 1e-4).
-
-        Hai norm đi theo nhóm này (lr cao hơn) vì chúng là THANG ĐO của khối,
-        đúng quy ước `Compressor.ffn_parameters`. Đặc tả chỉ khai hai nhóm, nên
-        chỗ để chúng phải nói ra chứ không để ngầm.
+        """SwiGLU + Linear Proj + BA RMSNorm — mọi thứ KHÔNG phải attention
+        (1e-7 -> 1e-4). Hai nhóm là một PHÂN HOẠCH của Aligner.
         """
-        for m in (self.n_attn, self.n_ffn, self.gate, self.up, self.down):
+        for m in (*self.norm_modules(), self.ffn, self.proj):
             yield from m.parameters()
 
     def forward(self, q: torch.Tensor) -> torch.Tensor:
         x = self.drop(q)
         x = x + self.attn(self.n_attn(x))
-        y = self.n_ffn(x)
-        return self.down(F.silu(self.gate(y)) * self.up(y))
+        x = x + self.ffn(self.n_ffn(x))
+        return self.proj(self.n_proj(x))
 
     def describe(self) -> str:
-        return (f"Aligner: RMSNorm({self.d_latent}) + MHAttn({self.d_latent}, "
-                f"{self.n_heads} head × head_dim {self.head_dim}) -> "
-                f"RMSNorm({self.d_latent}) -> SwiGLU {self.d_latent}→"
-                f"{self.mlp_hidden}→{self.d_model}")
+        return (f"Aligner: RMSNorm + SelfAttn({self.d_latent}, {self.n_heads} "
+                f"head × head_dim {self.head_dim}) + res -> RMSNorm + SwiGLU "
+                f"{self.d_latent}→{self.mlp_hidden}→{self.d_latent} + res -> "
+                f"RMSNorm + Linear {self.d_latent}→{self.d_model}")
 
 
 # ══ ảnh vào nhánh ═══════════════════════════════════════════════════════════
@@ -861,8 +867,8 @@ def norm_of(spec: dict) -> tuple[tuple, tuple]:
 def _init(module: nn.Module) -> None:
     """normal(0, 0.02) cho Linear MỚI, bias 0 — quy ước của Gemma 3.
 
-    HAI chỗ bị BỎ QUA: backbone (trọng số pretrain) và mọi ma trận có CỔNG
-    (`SwiGLU`, `Aligner`) — chúng dùng `1/√fan_in`.
+    HAI chỗ bị BỎ QUA: backbone (trọng số pretrain) và mọi ma trận có CỔNG hoặc
+    lớp chiếu cuối (`SwiGLU`, `Aligner.proj`) — chúng dùng `1/√fan_in`.
 
     Backbone bị BỎ QUA hoàn toàn: trọng số của nó là pretrain (và sau Stage 0 là
     pretrain đã tự giám sát trên CXR), khởi tạo đè lên là vứt đi đúng cái thứ
@@ -879,7 +885,7 @@ def _init(module: nn.Module) -> None:
         elif isinstance(m, SwiGLU):
             skip |= {id(m.gate), id(m.up), id(m.down)}
         elif isinstance(m, Aligner):
-            skip |= {id(m.gate), id(m.up), id(m.down)}
+            skip.add(id(m.proj))        # 1/√fan_in, đã tự khởi tạo
     for m in module.modules():
         if isinstance(m, nn.Linear) and id(m) not in skip:
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -894,7 +900,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
     BA khối con, BA danh sách khoá hợp lệ, và khoá LẠ bị TỪ CHỐI ồn ào. Đây là
     chỗ DUY NHẤT dựng spec, nên cũng là chỗ duy nhất biết khoá nào có thật.
 
-    `d_latent` (768) KHÁC `d_model` (2560): thân nhánh chạy ở 1024 và `Aligner`
+    `d_latent` (512) KHÁC `d_model` (2560): thân nhánh chạy ở 512 và `Aligner`
     là chỗ DUY NHẤT đổi chiều. `d_model` đọc từ `AutoConfig` của decoder,
     `d_latent` khai trong config, và `build_aligner` nối chúng — nên đổi base
     sang một decoder khác chiều sẽ lộ ra ở đây chứ không lặng lẽ.
@@ -919,7 +925,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 f"vextractor.{blk}: khoá lạ {odd} — không khoá nào trong số ấy "
                 f"được đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
                 f"{list(keys)}.")
-    arch = str(ex.get("arch", "focalnet_base_lrf"))
+    arch = str(ex.get("arch", "twins_pcpvt_small"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -931,18 +937,18 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                       "n_layers": (None if ex.get("n_layers") is None
                                    else int(ex["n_layers"])),
                       # Lát cắt của họ PHÂN CẤP: giữ `n_stages` stage ĐẦU.
-                      # FocalNet-Base LRF: 3 -> stride 16 / 512 kênh.
+                      # Twins PCPVT-S: null -> đủ 4 stage (stride 32 / 512 kênh).
                       "n_stages": (None if ex.get("n_stages") is None
                                    else int(ex["n_stages"])),
 
                       "normalize": {"mean": list(mean), "std": list(std)}},
-        "compressor": {"n_query": int(cp.get("n_query", 8)),
-                       "d_latent": int(cp.get("d_latent", 768)),
-                       "head_dim": int(cp.get("head_dim", 128)),
-                       "mlp_hidden": int(cp.get("mlp_hidden", 512)),
-                       "n_blocks": int(cp.get("n_blocks", 4)),
+        "compressor": {"n_query": int(cp.get("n_query", 16)),
+                       "d_latent": int(cp.get("d_latent", 512)),
+                       "head_dim": int(cp.get("head_dim", 64)),
+                       "mlp_hidden": int(cp.get("mlp_hidden", 768)),
+                       "n_blocks": int(cp.get("n_blocks", 5)),
                        "dropout": float(cp.get("dropout", 0.0))},
-        "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 2048)),
+        "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 1024)),
                     "dropout": float(al.get("dropout", 0.0))},
     }
 
@@ -1034,7 +1040,7 @@ class VExtractorBranch(nn.Module):
 
     BA phần, và ở main stage chỉ MỘT phần học:
 
-      * `extractor` — FocalNet **TEACHER (EMA)** do Stage 0 tự giám sát dạy.
+      * `extractor` — Twins **TEACHER (EMA)** do Stage 0 tự giám sát dạy.
         `set_frozen(True)` đưa nó về đúng chế độ **teacher inference**:
         requires_grad=False + eval() + chạy trong `no_grad`, nên nó không có
         gradient, không tốn activation, không có bước Adam nào;
@@ -1133,7 +1139,7 @@ class VExtractorBranch(nn.Module):
 
         Compressor chạy trong `no_grad` khi CẢ nó VÀ Extractor đều đóng băng —
         lúc ấy không còn gì bên dưới `Aligner` cần gradient, nên giữ activation
-        của 784 ô × 4 nhóm khối là trả tiền VRAM cho một đồ thị không ai dùng.
+        của 196 ô × 5 nhóm khối là trả tiền VRAM cho một đồ thị không ai dùng.
         Điều kiện phải gồm cả `self.frozen`: Lens mở băng Extractor để truy
         ngược tới pixel, và đồ thị ấy đi XUYÊN QUA Compressor.
         """

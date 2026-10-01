@@ -6,7 +6,7 @@
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
      Compressor (QFormer, n_query latent, 5 residual mỗi nhóm, d_feat→d_latent
-     NGAY TRONG Cross-attn) -> Aligner (RMSNorm + MHAttn + SwiGLU,
+     NGAY TRONG Cross-attn) -> Aligner (RMSNorm + SelfAttn + SwiGLU + Linear Proj,
      init 1/√fan_in)
   3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ
   4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA/center đổi đúng hướng
@@ -272,7 +272,7 @@ def _():
     assert got == 8 and rep["enabled"] is False
 
 
-@check("2. Extractor (cắt stage) -> Compressor (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn) -> Aligner (RMSNorm + MHAttn + SwiGLU)")
+@check("2. Extractor (cắt stage) -> Compressor (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn) -> Aligner (RMSNorm + SelfAttn + SwiGLU + Linear)")
 def _():
     import math
 
@@ -379,34 +379,38 @@ def _():
                 want_std = 1.0 / math.sqrt(lin.in_features)
                 assert abs(float(lin.weight.std()) - want_std) / want_std < 0.3
 
-    # ── 3. ALIGNER: MHAttn (residual) rồi SwiGLU (KHÔNG residual) ─────────
-    # HAI khối con, và sự KHÔNG đối xứng giữa chúng là chủ ý: attention giữ
-    # nguyên chiều nên `+` có nghĩa, SwiGLU đổi d_latent -> d_model nên không.
+    # ── 3. ALIGNER: SelfAttn (+res) -> SwiGLU (+res) -> Linear Proj ───────
+    # Hai residual đều ở chiều d_latent; phép đổi d_latent -> d_model là một
+    # Linear riêng đứng SAU, nên nó là chỗ DUY NHẤT không có `+`.
     assert isinstance(al.attn, R.MultiHeadAttention)
     assert al.attn.d_kv == al.attn.d == SMALL_DL      # TỰ-chú ý, KHÔNG đọc V
     assert al.n_heads == SMALL_DL // al.head_dim == cp.n_heads
-    for nm in (al.n_attn, al.n_ffn):
+    for nm in (al.n_attn, al.n_ffn, al.n_proj):
         assert isinstance(nm, recombiner.RMSNorm)
         assert nm.weight.numel() == SMALL_DL   # d_latent, KHÔNG phải d_model
-    for lin, i, o in ((al.gate, SMALL_DL, 64), (al.up, SMALL_DL, 64),
-                      (al.down, 64, 32)):
+    assert isinstance(al.ffn, R.SwiGLU)
+    for lin, i, o in ((al.ffn.gate, SMALL_DL, 64), (al.ffn.up, SMALL_DL, 64),
+                      (al.ffn.down, 64, SMALL_DL)):
         assert (lin.in_features, lin.out_features) == (i, o)
         assert lin.bias is None                   # quy ước Gemma 3 / LLaMA
+    assert (al.proj.in_features, al.proj.out_features) == (SMALL_DL, 32)
+    assert al.proj.bias is not None
     with torch.no_grad():
-        xa = vc + al.attn(al.n_attn(vc))          # residual quanh MHAttn
-        nq = al.n_ffn(xa)
-        ref = al.down(torch.nn.functional.silu(al.gate(nq)) * al.up(nq))
+        xa = vc + al.attn(al.n_attn(vc))          # residual quanh SelfAttn
+        xb = xa + al.ffn(al.n_ffn(xa))            # residual quanh SwiGLU
+        ref = al.proj(al.n_proj(xb))
         assert torch.allclose(al(vc), ref, atol=1e-6)
         assert torch.allclose(q, al(cp(ex(x))), atol=1e-5)
-        # KHÔNG residual quanh SwiGLU — hai chiều khác nhau thì cộng vào đâu
         assert al(vc).shape[-1] == 32 != SMALL_DL
         # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — với một khối có CỔNG
         # NHÂN đó không phải thẩm mỹ: đầu vào nhỏ thì cổng bình phương nó.
-        assert abs(float(nq.pow(2).mean().sqrt()) - 1.0) < 0.05
-        for lin in (al.gate, al.up, al.down):
+        assert abs(float(al.n_ffn(xa).pow(2).mean().sqrt()) - 1.0) < 0.05
+        assert abs(float(al.n_proj(xb).pow(2).mean().sqrt()) - 1.0) < 0.05
+        for lin in (al.ffn.gate, al.ffn.up, al.ffn.down, al.proj):
             want_std = 1.0 / math.sqrt(lin.in_features)
             assert abs(float(lin.weight.std()) - want_std) / want_std < 0.25
-        # `_init` bỏ qua ma trận CÓ CỔNG nhưng VẪN chạm bốn chiếu của MHAttn
+        assert float(al.proj.bias.abs().max()) == 0.0
+        # `_init` bỏ qua SwiGLU/proj nhưng VẪN chạm bốn chiếu của SelfAttn
         for lin in (al.attn.q, al.attn.k, al.attn.v, al.attn.o):
             assert abs(float(lin.weight.std()) - 0.02) / 0.02 < 0.35
         # và Q ở bước 0 KHÔNG được bé đến mức vô nghĩa
@@ -433,6 +437,31 @@ def _():
     (br(x) - 1.0).pow(2).mean().backward()
     opt.step()
     assert not torch.allclose(br(x), before)
+
+
+@check("2b'. Twins PCPVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
+       "chạy được ở 224² (multi-crop), không cắt nhầm một ô")
+def _():
+    import torch
+
+    from src import vextractor as R
+
+    net, d_feat, n_patch, n_use, kind, fmt, mres, nst = R.backbone_body(
+        "twins_pcpvt_small", False, 448)
+    assert (kind, fmt, d_feat, n_patch, nst) == ("vit", "NLC", 512, 196, None)
+    assert mres, "Twins phải chạy được ở nửa độ phân giải (local crop 224²)"
+    ex = R.Extractor(448, "twins_pcpvt_small", False, None, None)
+    assert ex.n_prefix == 0 and ex.n_patch == 196 and ex.d_feat == 512
+    ex.eval()
+    with torch.no_grad():
+        raw = ex.patches_raw(torch.randn(1, 3, 448, 448))
+        assert raw.shape == (1, 196, 512)
+        # n_prefix mặc định 1 sẽ cắt lặng lẽ còn 195 ô — phải KHÔNG xảy ra
+        assert ex.patches(torch.randn(1, 3, 448, 448)).shape == (1, 196, 512)
+        assert ex.patches_raw(torch.randn(1, 3, 224, 224)).shape == (1, 49, 512)
+    # bỏ head: ~23,59 M (24,1 M với head 1000 lớp)
+    n = sum(q.numel() for q in ex.parameters())
+    assert 23.5e6 < n < 23.7e6, n
 
 
 @check("2c. họ ViT (NLC): bỏ prefix token, cắt n_layers; n_stages trên ViT bị từ chối")
@@ -1189,21 +1218,21 @@ def _():
     assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
     assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
     s1c = s1.s1cfg(cfg)
-    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 3e-5)
-    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 3e-4)
+    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 2e-5)
+    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 2e-4)
     # FFN chịu được dốc CAO HƠN attn: ma trận attention quyết định 16 vector
     # ĐỌC Ở ĐÂU trên lưới, và một bước lớn làm phân phối ấy sụp về vài ô rồi
     # không quay lại. Quan hệ ấy phải còn đúng, không chỉ hai con số rời.
     assert s1c["ffn_lr_max"] > s1c["attn_lr_max"]
-    # Stage 1 đẩy attn CAO HƠN mức chạy của Stage 0: ở đây backbone đứng yên,
-    # nên bước lớn không làm hỏng một encoder đang được dạy.
-    assert s1c["attn_lr_max"] > sc["lr_max"]
+    # Stage 1 chạy attn KHÔNG THẤP HƠN mức chạy của Stage 0 (cùng 2e-5): backbone
+    # đứng yên, nên không có encoder nào đang được dạy để bị bước lớn làm hỏng.
+    assert s1c["attn_lr_max"] >= sc["lr_max"]
     assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 30
     assert s1c["patience"] == sc["patience"] == 4
     zc = zcfg(cfg)
     assert set(zc) == set(MAIN_CFG_KEYS)
-    assert (zc["align_ffn_lr_min"], zc["align_ffn_lr_main"]) == (1e-6, 1e-4)
-    assert (zc["align_attn_lr_min"], zc["align_attn_lr_main"]) == (1e-7, 1e-5)
+    assert (zc["align_ffn_lr_min"], zc["align_ffn_lr_main"]) == (1e-7, 1e-4)
+    assert (zc["align_attn_lr_min"], zc["align_attn_lr_main"]) == (1e-8, 1e-5)
     assert zc["align_warmup_frac"] == 0.10
     # Compressor KHÔNG còn nhóm lr nào ở main stage: nó đóng băng hoàn toàn,
     # nên mọi khoá `comp_*` phải BIẾN MẤT khỏi khối — còn một khoá là còn một
@@ -1635,10 +1664,10 @@ def _():
             assert set(sdc) == set(R.VExtractorBranch(sp).compressor.state_dict())
             # nạp lại: Compressor đổi, Aligner + Extractor KHÔNG bị chạm
             br2 = R.VExtractorBranch(sp)
-            al_before = br2.aligner.gate.weight.clone()
+            al_before = br2.aligner.ffn.gate.weight.clone()
             bb_before = next(iter(br2.extractor.body.parameters())).clone()
             R.load_compressor_into(br2, d1 / s1.CKPT)
-            assert torch.allclose(br2.aligner.gate.weight, al_before)
+            assert torch.allclose(br2.aligner.ffn.gate.weight, al_before)
             assert torch.allclose(next(iter(br2.extractor.body.parameters())),
                                   bb_before)
             assert torch.allclose(br2.compressor.latent, sdc["latent"])
@@ -2097,11 +2126,12 @@ def _():
         (str(sp["extractor"]["arch"]), "arch"),
         (f"({ex.n_patch}, {ex.d_feat})", "V"),
         (f"({cp.n_query}, {cp.d_latent})", "V_c"),
-        (f"SwiGLU {al.d_latent}→{al.mlp_hidden}→{al.d_model}", "Aligner"),
+        (f"SwiGLU {al.d_latent}→{al.mlp_hidden}→{al.d_latent}", "SwiGLU của Aligner"),
+        (f"Linear {al.d_latent}→{al.d_model}", "Linear Proj của Aligner"),
         (f"SwiGLU {cp.d_latent}→{cp.mlp_hidden}→{cp.d_latent}", "FFN của Compressor"),
         (f"`head_dim` = {cp.head_dim}", "head_dim khai"),
         (f"{cp.n_query} latent", "n_query"),
-        (f"`n_stages: {ex.n_stages}`", "lát cắt stage"),
+        (f"`n_stages: {'null' if ex.n_stages is None else ex.n_stages}`", "lát cắt stage"),
         # HAI khối SwiGLU, HAI khoá — README phải nói cả hai.
         ("`vextractor.compressor.mlp_hidden`", "mlp_hidden của Compressor"),
         ("`vextractor.aligner.mlp_hidden`", "mlp_hidden của Aligner"),
@@ -2127,7 +2157,9 @@ def _():
     stale = [f"{k} latent" for k in wrong(cp.n_query)]
     stale += [f"`d_latent` = {k}" for k in wrong(cp.d_latent)]
     stale += [f"SwiGLU {cp.d_latent}→{k}→{cp.d_latent}" for k in wrong(cp.mlp_hidden)]
-    stale += [f"({k}, {ex.d_feat})" for k in wrong(ex.n_patch)]
+    # d_latent == d_feat ở bố cục hiện tại nên V_c = (16, 512) trùng chuỗi "(k, d_feat)"
+    # với k = n_query: bỏ n_query khỏi các k "sai" của lưới V.
+    stale += [f"({k}, {ex.d_feat})" for k in wrong(ex.n_patch) if k != cp.n_query]
     surfaces = {
         "README.md": rd,
         "configs/vextractor.yaml": (ROOT / "configs/vextractor.yaml").read_text(

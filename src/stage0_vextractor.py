@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = FocalNet-B LRF (stage 3) + DINO head ─────┐
+            ─► student = Twins PCPVT-S + DINO head ─────┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -10,12 +10,12 @@ chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu 
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Đặc tả backbone FocalNet-Base LRF khai ~88,1 M; Extractor cắt tại stage 3 còn
-60,25 M trọng số + một DINO head, cộng một bản teacher EMA đầy
+Extractor là Twins PCPVT-S đủ 4 stage (bỏ head phân loại): ~23,6 M trọng số
+(~24,1 M tính cả head 1000 lớp của bản pretrain) + một DINO head, cộng một bản teacher EMA đầy
 đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
 spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số FocalNet-Base LRF; các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
+**Điểm xuất phát:** `pretrained: true` tải trọng số Twins PCPVT-S (timm `twins_pcpvt_small`); các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
@@ -227,7 +227,7 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # FocalNet KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
+        # Twins PCPVT KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
         # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
         "pool": str(d.get("pool", "mean")),
         "student_temp": float(d.get("student_temp", 0.1)),
@@ -333,7 +333,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số FocalNet không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số Twins không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}
@@ -608,7 +608,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not spec["extractor"]["pretrained"]:
         raise TrainUnusable(
             "vextractor.extractor.pretrained = false: Stage 0 requires "
-            "pretrained FocalNet-Base LRF weights.")
+            "pretrained Twins PCPVT-S weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 
@@ -626,13 +626,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     # CHỈ Extractor — không Compressor, không Aligner, không Cls Head.
     (body, d_feat, n_patch, n_use, kind, fmt, multi_res,
      n_stage_use) = Z.build_backbone(spec)
-    n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 1))
+    n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 0))
     # Hai điều kiện của backbone PHẢI hỏi TRƯỚC khi nạp dữ liệu và dựng
     # optimizer, không phải ở lượt forward đầu tiên của epoch 1.
-    if kind == "conv" and dc["pool"] == "cls":
+    if (kind == "conv" or n_prefix == 0) and dc["pool"] == "cls":
         raise TrainUnusable(
             f"stage0.dino.pool = 'cls' nhưng {spec['extractor']['arch']!r} trả "
-            f"một LƯỚI ({fmt}) và KHÔNG có cls token nào. ConvNeXt và SwinV2 "
+            f"một LƯỚI/chuỗi ({fmt}) và KHÔNG có cls token nào. Twins, ConvNeXt, SwinV2 "
             f"đều vậy — đặt `stage0.dino.pool: mean`.\n"
             f"    Không tự rơi về 'mean': config nói một đằng mà chạy một nẻo "
             f"là thứ không bao giờ tự lộ ra.")

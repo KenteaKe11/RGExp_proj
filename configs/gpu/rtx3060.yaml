@@ -35,7 +35,7 @@ set:
   # nâng (nó là một phần lịch học của A). Stage 0 thì không có decoder, không
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
-  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor ~60,25 M tham số VỚI
+  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor ~23,6 M tham số VỚI
   # nhân thêm (2 + n_local) lượt forward của multi-crop, làm
   # activation của Stage 0 nặng rõ — nên 16 chỉ là KHỞI ĐIỂM, autobatch dò lại.
   # Stage 1 nhẹ hơn hẳn (Extractor chạy no_grad, chỉ Compressor có gradient) và
