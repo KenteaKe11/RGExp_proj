@@ -2,7 +2,7 @@
 
 B phải là candidate A (`qlora_r32_decoder` của $1, huấn luyện bởi
 `train_recomb._train_once` với branch = None) CỘNG ĐÚNG MỘT THỨ: `n_query` (16)
-vector V_c = CnA(Extractor(ảnh 384²)) được NỐI vào chuỗi ngay SAU 256 token ảnh
+vector V_c = CnA(Extractor(ảnh 448²)) được NỐI vào chuỗi ngay SAU 256 token ảnh
 Z (gọi tắt Q trong code). Vòng lặp dưới đây vì thế chép lại từng bước của
 `_train_once` ở nhánh không-MoE, không-branch, và chỉ chèn nhánh ở những chỗ:
 
@@ -28,7 +28,7 @@ Main stage học ĐÚNG hai thứ: **LoRA của decoder** và **CnA**. Mọi mod
 của nhánh đóng băng hoàn toàn — đó là đặc tả, không phải một tối ưu. Không còn
 CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
 
-  * **Extractor** (MaxViT-384, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
+  * **Extractor** (MaxViT-T 224, trọng số TEACHER/EMA của Stage 0) — chạy ở chế độ
     **TEACHER INFERENCE** suốt main stage: `requires_grad=False` + `eval()` +
     forward trong `no_grad`, KHÔNG nằm trong optimizer, KHÔNG có bước mở băng
     nào. Lượt forward ấy không giữ activation nào;
@@ -43,14 +43,14 @@ CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
 
     Attention thấp hơn FFN vì ma trận attention quyết định 16 vector ĐỌC Ở ĐÂU /
     TRỘN VỚI NHAU thế nào — một bước lớn làm phân phối ấy sụp rồi không quay lại;
-    FFN chỉ biến đổi thứ đã đọc xong. Cross-attn là chỗ DUY NHẤT chạm lưới 144 ô
+    FFN chỉ biến đổi thứ đã đọc xong. Cross-attn là chỗ DUY NHẤT chạm lưới 196 ô
     và nhận cấp trung gian giữa hai nhóm.
 
 Lịch lr là hàm THUẦN của số bước (`src/schedule.py`), không có scheduler nào giữ
 trạng thái, nên chúng tái lập được và không lệch khi `steps` bị override.
 
 ĐƯỜNG ẢNH THỨ HAI. Nhánh có encoder riêng, nên mỗi batch phải mang THÊM
-`vext_pixels` (B, 3, 384, 384) chuẩn hoá bằng ĐÚNG mean/std của checkpoint
+`vext_pixels` (B, 3, 448, 448) chuẩn hoá bằng ĐÚNG mean/std của checkpoint
 Extractor. `VExtReportDataset` gắn nó vào đúng chỗ `ClsReportDataset` mã hoá mẫu
 (theo chỉ số THẬT), và `collate_vext` xếp chồng. Một batch thiếu trường ấy DỪNG
 ngay ở `forward_ce` thay vì lặng lẽ huấn luyện với Q của ảnh khác.
@@ -61,7 +61,7 @@ grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian mỗi
-bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt MaxViT ở 384² cho mỗi ảnh
+bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt MaxViT ở 448² cho mỗi ảnh
 (chạy trong `no_grad`; phần nặng còn lại là CnA trên 16 token).
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch

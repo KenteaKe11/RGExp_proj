@@ -1,7 +1,7 @@
 """MaxViT extractor và CnA (Compressor & Aligner) — nhánh bổ sung thị giác.
 
-MaxViT-T 384 (đầu ra chuẩn, stride 32) ánh xạ ảnh 384x384 thành lưới 12x12 token
-512 kênh (V = 144 x 512). CnA là MỘT QFormer duy nhất: 16 latent @1024 đọc V qua
+MaxViT-T 224 (`maxvit_tiny_tf_224.in1k`, đầu ra chuẩn stride 32) chạy ở ảnh 448x448
+cho lưới 14x14 token 512 kênh (V = 196 x 512). CnA là MỘT QFormer duy nhất: 16 latent @1024 đọc V qua
 Cross-attn (k/v chiếu 512 -> 1024), rồi một Linear cuối 1024 -> 2560 đưa chúng vào
 không gian của decoder (V_c = 16 x 2560, nối vào chuỗi sau token ảnh Z).
 """
@@ -181,10 +181,13 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     """Backbone của timm, CẮT head -> (body, d_feat, n_patch, n_used, kind, fmt,
     multi_res, n_stages_used).
 
-    **MaxViT-T 384**: backbone phân cấp (MBConv có BatchNorm + attention cửa sổ/
-    lưới 12×12), trả (B, C, H, W) NCHW; đầu ra chuẩn stride 32: 384² -> lưới
-    12×12 = 144 ô × 512 kênh. Cửa sổ cố định 12 nên nó CHỈ chạy ở cỡ ảnh là bội
-    của 384 (192² cho lưới cuối 6×6 và chết) — `multi_res` ra False.
+    **MaxViT-T 224** (`maxvit_tiny_tf_224.in1k`): backbone phân cấp (MBConv có
+    BatchNorm + attention cửa sổ/lưới 7×7), trả (B, C, H, W) NCHW; đầu ra chuẩn
+    stride 32: 448² -> lưới 14×14 = 196 ô × 512 kênh. Dựng ở cấu hình GỐC (nấc
+    `plain`, cửa sổ 7) rồi chạy ở 448²: KHÔNG truyền `img_size=448`, vì timm suy
+    cửa sổ từ `img_size/32` -> cửa sổ 14 và bảng bias vị trí đổi shape (trọng số
+    pretrain không nạp được). Cửa sổ 7 chia hết mọi lưới ở 448² (112/56/28/14)
+    lẫn 224² (56/28/14/7) nên `multi_res` = True.
 
     Nhận BA bố cục đầu ra, vì cái giá của việc giả định một bố cục là một tensor
     sai trục đi hết đường ống mà không có exception nào:
@@ -257,8 +260,11 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     ladder = (({"dynamic_img_size": True, "strict_img_size": False}, "dynamic+loose"),
               ({"strict_img_size": False}, "loose"),
               ({"dynamic_img_size": True}, "dynamic"),
-              ({"img_size": int(image_size)}, "img_size"),
-              ({}, "plain"))
+              # `plain` TRƯỚC `img_size`: với MaxViT, `img_size` đổi luôn cửa sổ
+              # attention (img_size/32) và shape bảng bias vị trí — cấu hình
+              # gốc chạy được ở cỡ ảnh mới thì phải giữ nó.
+              ({}, "plain"),
+              ({"img_size": int(image_size)}, "img_size"))
     net, how, why = None, None, []
     for extra, tag in ladder:
         try:
@@ -458,12 +464,12 @@ class Extractor(nn.Module):
     Stage 0. **Backbone không bao giờ mở lại** (trừ Lens, để nối đồ thị
     gradient tới tận pixel; xem `lens_vextractor`).
 
-    Với MaxViT-Tiny-384 (đủ 4 stage, đầu ra chuẩn stride 32, bỏ head) ở 384²:
-    `(B, 144, 512)` = V (lưới 12×12 làm phẳng thành chuỗi token, không prefix).
+    Với MaxViT-T 224 (đủ 4 stage, đầu ra chuẩn stride 32, bỏ head) ở 448²:
+    `(B, 196, 512)` = V (lưới 14×14 làm phẳng thành chuỗi token, không prefix).
     """
 
-    def __init__(self, image_size: int = 384,
-                 arch: str = "maxvit_tiny_tf_384.in1k",
+    def __init__(self, image_size: int = 448,
+                 arch: str = "maxvit_tiny_tf_224.in1k",
                  pretrained: bool = True, n_layers: int | None = None,
                  n_stages: int | None = None, normalize: dict | None = None):
         super().__init__()
@@ -621,7 +627,7 @@ class CnA(nn.Module):
         h   = group_i(h, kv)   với i = 1..N      (khối 1 → khối 2), N = n_blocks
         V_c = Linear(RMSNorm(h))                 1024 -> 2560 (Linear project cuối)
 
-    MỘT QFormer làm cả hai việc: **nén** lưới 144 ô vào 16 latent (Cross-attn của
+    MỘT QFormer làm cả hai việc: **nén** lưới 196 ô vào 16 latent (Cross-attn của
     khối 1) và **căn chỉnh** chúng vào không gian ngữ nghĩa của decoder (Linear
     cuối). Không còn Aligner riêng.
 
@@ -834,11 +840,11 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 f"vextractor.{blk}: khoá lạ {odd} — không khoá nào trong số ấy "
                 f"được đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
                 f"{list(keys)}.")
-    arch = str(ex.get("arch", "maxvit_tiny_tf_384.in1k"))
+    arch = str(ex.get("arch", "maxvit_tiny_tf_224.in1k"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
-        "extractor": {"image_size": int(ex.get("image_size", 384)),
+        "extractor": {"image_size": int(ex.get("image_size", 448)),
                       "arch": arch,
                       "pretrained": bool(ex.get("pretrained", True)),
                       "n_layers": (None if ex.get("n_layers") is None

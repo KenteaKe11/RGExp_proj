@@ -69,7 +69,7 @@ set:
   # Đây mới là chỗ 4 GB thừa có nghĩa: hai giai đoạn này KHÔNG có ràng buộc nào
   # từ A, nên mảnh vật lý được phép leo tới tận `batch_size` = 32.
   #
-  # Stage 0 giữ student và teacher Extractor MaxViT-T 384 (~30,5 M mỗi nhánh)
+  # Stage 0 giữ student và teacher Extractor MaxViT-T 224 (~30,4 M mỗi nhánh)
   # cùng DINO head (2,63 M mỗi nhánh).
   # Batch dò tự động theo VRAM; giảm local crop nếu thiết bị không đủ bộ nhớ.
   stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
@@ -110,7 +110,7 @@ set:
   # GIL nên nó scale thật trên 20 luồng logic.
   io.workers: 20
   # 4, không 3: 28 GB RAM và `train.per_device_batch_size` = 1, nên mỗi
-  # micro-batch dựng sẵn chỉ là một ảnh (384² cho nhánh + 896² cho processor của
+  # micro-batch dựng sẵn chỉ là một ảnh (448² cho nhánh + 896² cho processor của
   # Gemma) — thêm một bậc queue gần như miễn phí và che được độ trễ đọc đĩa.
   io.prefetch_depth: 4            # số micro-batch dựng sẵn trước GPU
   io.pin_memory: true             # CPU->GPU không chặn (pinned + non_blocking)

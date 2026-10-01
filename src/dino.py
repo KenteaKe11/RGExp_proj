@@ -6,8 +6,8 @@ không Cls Head, không F1/Recall — epoch được chọn theo loss tự giám
 tập val CỐ ĐỊNH.
 
 **BatchNorm (MaxViT).** MaxViT chuẩn hoá MBConv bằng BatchNorm. Với micro-batch
-nhỏ và multi-crop (global và local crop — vùng nhỏ phóng lên 384² — đi qua CÙNG
-một BN ở các lượt khác nhau), thống kê chạy sẽ bị local crop kéo lệch rồi được teacher chép lại — và
+nhỏ và multi-crop (global 448² + local 224² đi qua CÙNG một BN ở các lượt khác
+nhau), thống kê chạy sẽ bị local crop kéo lệch rồi được teacher chép lại — và
 main stage chạy teacher ở `eval()`, tức là ĐỌC đúng thống kê lệch ấy. Nên
 `freeze_bn: true` (mặc định) giữ MỌI lớp BN của student lẫn teacher ở chế độ
 eval suốt Stage 0: thống kê chạy giữ nguyên của pretrain, γ/β vẫn học.
@@ -32,12 +32,11 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
      softmax. Nó chặn kiểu sụp "mọi ảnh ra cùng một prototype";
   3. **sharpening**: τ_t (0.04) NHỎ HƠN τ_s (0.1). Kết hợp với centering, hai
      lực này đẩy ngược nhau — bỏ một cái là sụp theo kiểu của cái còn lại;
-  4. **multi-crop**: 2 global crop (384²) + `n_local` local crop (vùng nhỏ, resize 384²).
+  4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     MaxViT-T 384 dùng cửa sổ/lưới attention CỐ ĐỊNH 12×12 nên chỉ chạy ở cỡ
-     ảnh là bội của 384 — local crop vì thế cắt vùng nhỏ (scale 0.05–0.4) rồi
-     resize lên 384²: vẫn là "nhìn một phần", chỉ không rẻ hơn về tính toán.
+     MaxViT-T 224 dùng cửa sổ/lưới attention 7×7: 448² -> lưới 14×14, 224² ->
+     7×7, mọi stage chia hết cửa sổ, cùng MỘT state_dict — đã probe THẬT lúc dựng.
 
 **Tăng cường ảnh viết bằng PIL**, không kéo thêm torchvision: cùng đường với
 `vextractor.vext_tensor` (PIL -> uint8 -> tensor -> (x−mean)/std), nên ảnh của
@@ -190,7 +189,7 @@ def pool_feature(f: torch.Tensor, n_prefix: int, mode: str,
     """Lưới đặc trưng của backbone -> MỘT vector mỗi ảnh, cho DINO head.
 
     `fmt` KHÔNG có mặc định an toàn nào: NCHW và NHWC cùng 4 chiều, nên lấy
-    trung bình nhầm trục không ném lỗi — ở 384² nó trả một vector dài 14 thay vì
+    trung bình nhầm trục không ném lỗi — ở 448² nó trả một vector dài 14 thay vì
     dài 768, `DINOHead` nuốt được (Linear của nó nhận d_feat,
     và d_feat cũng đã đọc sai từ cùng một chỗ), và Stage 0 chạy hết 51 epoch để
     chưng cất một thứ vô nghĩa. Giá trị thật đến từ `output_fmt` của model, đo

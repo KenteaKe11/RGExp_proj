@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
-    ảnh CXR ─► multi-crop (2 global 384² + n local 384²)
-            ─► student = MaxViT-T 384 + DINO head ────┐
+    ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
+            ─► student = MaxViT-T 224 + DINO head ────┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -9,12 +9,12 @@
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor là MaxViT-T 384 (`maxvit_tiny_tf_384.in1k`) đủ 4 stage, đầu ra chuẩn
-stride 32 (144 token ở 384²), bỏ head phân loại: ~30,46 M trọng số (~30,98 M tính cả head 1000 lớp)
+Extractor là MaxViT-T 224 (`maxvit_tiny_tf_224.in1k`) đủ 4 stage, đầu ra chuẩn
+stride 32, chạy ở 448² (196 token), bỏ head phân loại: ~30,40 M trọng số (~30,92 M tính cả head 1000 lớp)
 + một DINO head, cộng một bản teacher EMA đầy đủ nữa trong VRAM. Thứ duy nhất còn
 cần từ decoder là `d_model` (2560) để ghi vào spec, đọc từ `AutoConfig`.
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số MaxViT-T 384 (ImageNet-1k); các
+**Điểm xuất phát:** `pretrained: true` tải trọng số MaxViT-T 224 (ImageNet-1k); các
 trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi
 tạo mới. MaxViT dùng BatchNorm: `stage0.dino.freeze_bn` (mặc định true) giữ thống
 kê chạy của BN cố định suốt Stage 0 (xem `src/dino.py`).
@@ -216,8 +216,8 @@ def dino_cfg(s: dict) -> dict:
     d = dict(s.get("dino") or {})
     a = dict(d.get("aug") or {})
     out = {
-        "global_size": int(d.get("global_size", 384)),
-        "local_size": int(d.get("local_size", 384)),
+        "global_size": int(d.get("global_size", 448)),
+        "local_size": int(d.get("local_size", 224)),
         "n_local": int(d.get("n_local", 6)),
         "global_scale": [float(x) for x in (d.get("global_scale") or [0.4, 1.0])],
         "local_scale": [float(x) for x in (d.get("local_scale") or [0.05, 0.4])],
@@ -469,7 +469,7 @@ def finished(cfg: Cfg) -> dict | None:
 class ImageOnlyDataset:
     """[image_path] -> multi-crop của DINO. KHÔNG nhãn.
 
-    `pixels(i)` vẫn dựng ảnh 384² KHÔNG tăng cường bằng `Z.vext_tensor` — đó là
+    `pixels(i)` vẫn dựng ảnh 448² KHÔNG tăng cường bằng `Z.vext_tensor` — đó là
     thứ `assert_same_pixels` so với main stage, và là chỗ duy nhất phép chuẩn
     hoá của các giai đoạn gặp nhau.
 
@@ -499,7 +499,7 @@ class ImageOnlyDataset:
         self.epoch = int(ep)
 
     def pixels(self, i: int):
-        """Ảnh 384² KHÔNG tăng cường — chỉ để `assert_same_pixels` đối chiếu."""
+        """Ảnh 448² KHÔNG tăng cường — chỉ để `assert_same_pixels` đối chiếu."""
         return Z.vext_tensor(self.df.iloc[i]["image_path"], self.image_size,
                              self.mean, self.std)
 
@@ -637,8 +637,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
             f"    Không tự rơi về 'mean': config nói một đằng mà chạy một nẻo "
             f"là thứ không bao giờ tự lộ ra.")
     # Local crop chạy ĐÚNG cỡ `local_size`. Cùng cỡ với ảnh nhánh thì không cần
-    # gì thêm; khác cỡ thì phải probe THẬT ở cỡ ấy — MaxViT-T 384 (cửa sổ 12×12)
-    # chết ở mọi cỡ không phải bội của 384, nên `multi_res` (nửa độ phân giải)
+    # gì thêm; khác cỡ thì phải probe THẬT ở cỡ ấy — backbone cửa sổ cố định
+    # (MaxViT) chết ở cỡ không chia hết cửa sổ, nên `multi_res` (nửa độ phân giải)
     # không trả lời được câu hỏi cho một cỡ bất kỳ.
     local_ok = dc["local_size"] == img_size
     if dc["n_local"] > 0 and not local_ok:

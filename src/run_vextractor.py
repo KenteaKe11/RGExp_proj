@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
                      "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = "
-                                 "CnA(Extractor(ảnh 384²)) (B)"})
+                                 "CnA(Extractor(ảnh 448²)) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 

@@ -5,7 +5,7 @@
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
-  2. Extractor (MaxViT-T 384, đầu ra chuẩn stride 32 -> 144 ô × 512) -> CnA (QFormer,
+  2. Extractor (MaxViT-T 224 ở 448², đầu ra chuẩn stride 32 -> 196 ô × 512) -> CnA (QFormer,
      n_query latent, 5 residual mỗi nhóm, d_feat→d_latent NGAY TRONG Cross-attn,
      RMSNorm + Linear cuối -> d_model); ba nhóm lr self/cross/ffn phủ kín CnA
   3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ
@@ -415,9 +415,10 @@ def _():
     assert not torch.allclose(br(x), before)
 
 
-@check("2a. MaxViT-T 384: đầu ra CHUẨN stride 32 -> 12×12 = 144 ô × 512, ~30,46 M; "
-       "chỉ chạy ở bội của 384 nên Stage 0 cần local_size = 384")
+@check("2a. MaxViT-T 224 ở 448²: đầu ra CHUẨN stride 32 -> 14×14 = 196 ô × 512, ~30,40 M; "
+       "giữ cửa sổ 7 (KHÔNG dựng với img_size=448), nạp state_dict gốc strict; chạy được ở 224² (multi-crop)")
 def _():
+    import timm
     import torch
 
     from src import vextractor as R
@@ -425,19 +426,24 @@ def _():
     from src.stage0_vextractor import dino_cfg
 
     net, d_feat, n_patch, _nl, kind, fmt, multi_res, n_st = R.backbone_body(
-        "maxvit_tiny_tf_384.in1k", False, 384)
-    assert (kind, fmt, d_feat, n_patch, n_st) == ("conv", "NCHW", 512, 144, 4)
+        "maxvit_tiny_tf_224.in1k", False, 448)
+    assert (kind, fmt, d_feat, n_patch, n_st) == ("conv", "NCHW", 512, 196, 4)
     assert 30.0e6 < sum(p.numel() for p in net.parameters()) < 31.0e6
-    assert multi_res is False                       # 192² -> lưới cuối 6×6, chết
+    assert multi_res is True
+    # cửa sổ GỐC 7 — `img_size=448` sẽ đổi nó thành 14 và đổi shape bias vị trí
+    assert tuple(net.stages[0].blocks[0].attn_block.partition_size) == (7, 7)
+    ref = timm.create_model("maxvit_tiny_tf_224.in1k", pretrained=False,
+                            num_classes=0, global_pool="")
+    net.load_state_dict(ref.state_dict(), strict=True)
     net.eval()
     with torch.no_grad():
-        assert tuple(net.forward_features(torch.zeros(1, 3, 384, 384)).shape) == (1, 512, 12, 12)
-    # config thật: ảnh nhánh 384², local crop CÙNG cỡ (vùng nhỏ resize lên)
+        assert tuple(net.forward_features(torch.zeros(1, 3, 448, 448)).shape) == (1, 512, 14, 14)
+        assert tuple(net.forward_features(torch.zeros(1, 3, 224, 224)).shape) == (1, 512, 7, 7)
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    assert cfg["vextractor"]["extractor"]["image_size"] == 384
+    assert cfg["vextractor"]["extractor"]["image_size"] == 448
+    assert cfg["vextractor"]["extractor"]["arch"] == "maxvit_tiny_tf_224.in1k"
     dc = dino_cfg(cfg["stage0"])
-    assert dc["global_size"] == dc["local_size"] == 384 and dc["n_local"] == 6
-    assert dc["local_scale"][1] < dc["global_scale"][0] + 1e-9 or dc["local_scale"][1] <= 0.4
+    assert (dc["global_size"], dc["local_size"], dc["n_local"]) == (448, 224, 6)
 
 
 @check("2b'. Twins-SVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
@@ -1175,7 +1181,7 @@ def _():
     assert (sc["lr_min"], sc["lr_max"]) == (1e-7, 1e-5)
     assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
     assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
-    assert sc["dino"]["global_size"] == 384 and sc["dino"]["local_size"] == 384
+    assert sc["dino"]["global_size"] == 448 and sc["dino"]["local_size"] == 224
     assert sc["dino"]["freeze_bn"] is True
     spe = 200
     assert s0.warmup_steps(sc, spe) == spe
@@ -1791,7 +1797,7 @@ def _():
                      "sal_vext_act_64", "sal_vext_pre"):
             assert gone not in r, gone
     # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh,
-    # SMALL_IMG=64 thay cho 384² của cấu hình thật)
+    # SMALL_IMG=64 thay cho 448² của cấu hình thật)
     assert ra["sal_z"].shape == (8, 8)
     # Ô 3 CHỈ có ở lượt CÓ nhánh: nó là bản đồ của chính khối Q
     assert ra.get("sal_q") is None and rb["sal_q"] is not None
@@ -1881,7 +1887,7 @@ def _():
                      "KHÔNG dính decoder", "teacher",
                      f"{cfg['vextractor']['cna']['n_query']} High-Q token",
                      "Q → CnA → Extractor → I",
-                     "`Q[0]`", "384²"):
+                     "`Q[0]`", "448²"):
             assert need in doc, need
         assert "`sal_z`" in doc and "`sal_q`" in doc
         assert json.dumps(out, default=str)
@@ -2010,7 +2016,7 @@ def _():
         (f"`head_dim` = {cp.head_dim}", "head_dim khai"),
         (f"{cp.n_query} latent", "n_query"),
         (f"`n_stages: {'null' if sp['extractor']['n_stages'] is None else sp['extractor']['n_stages']}`", "lát cắt stage"),
-        ("`local_size: 384`", "local crop resize lên cỡ ảnh nhánh"),
+        ("`local_size: 224`", "local crop 224² của Stage 0"),
         ("`vextractor.cna.mlp_hidden`", "mlp_hidden của CnA"),
         (f"{ex.n_patch} ô", "lưới"),
         (m(n(ex)), "tham số Extractor"),

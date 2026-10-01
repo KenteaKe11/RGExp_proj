@@ -3,8 +3,8 @@
 Nhánh thị giác bổ sung 16 token ảnh vào đầu vào Gemma 3. Ảnh cũng tiếp tục đi qua nhánh vision gốc của Gemma; nhánh này chỉ thêm tín hiệu thị giác chất lượng cao.
 
 ```text
-Ảnh 384×384
-  └─ Extractor: MaxViT-T 384 (`maxvit_tiny_tf_384.in1k`, đầu ra chuẩn) → V (144, 512)
+Ảnh 448×448
+  └─ Extractor: MaxViT-T 224 (`maxvit_tiny_tf_224.in1k`, đầu ra chuẩn) → V (196, 512)
        └─ CnA (Compressor & Aligner): QFormer, 16 latent @1024 → RMSNorm + Linear 1024→2560 → V_c (16, 2560)
             └─ Gemma: [Z ‖ V_c ‖ văn bản]   (huấn luyện: che ngẫu nhiên 25% token Z mỗi weight update)
 ```
@@ -26,15 +26,15 @@ Mỗi khối học ở **đúng một** giai đoạn. Không còn Stage 1: bản
 
 | | |
 |---|---|
-| Main backbone | MaxViT-T — `maxvit_tiny_tf_384.in1k` |
+| Main backbone | MaxViT-T — `maxvit_tiny_tf_224.in1k` |
 | Methodology | `DINOv3` fine-tuning (Stage 0) |
-| Pretrain | MaxViT-T 384 (timm, ImageNet-1k), `n_stages: null` (đủ 4 stage, đầu ra chuẩn stride 32), bỏ head phân loại |
-| Params | **30,46 M** (≈ 30,98 M nếu tính cả head 1000 lớp của bản pretrain) |
-| Input | `B, 3, 384, 384` |
-| Output tokens | `B, 144, 512` |
+| Pretrain | MaxViT-T 224 (timm, ImageNet-1k), `n_stages: null` (đủ 4 stage, đầu ra chuẩn stride 32), bỏ head phân loại |
+| Params | **30,40 M** (≈ 30,92 M nếu tính cả head 1000 lớp của bản pretrain) |
+| Input | `B, 3, 448, 448` |
+| Output tokens | `B, 196, 512` |
 | Kí hiệu | `V` |
 
-MaxViT-T dùng đầu ra chuẩn: stride tổng 32 nên ảnh 384² cho lưới 12×12 = 144 ô, mỗi ô 512 kênh (`forward_features` trả NCHW, được làm phẳng thành chuỗi token, không có prefix token). Attention cửa sổ/lưới của MaxViT-384 cố định 12×12, nên backbone chỉ chạy ở cỡ ảnh là bội của 384 (192² cho lưới cuối 6×6 và lỗi). Vì vậy local crop của Stage 0 vẫn cắt vùng nhỏ như DINO (scale 0.05–0.4) nhưng resize lên 384² thay vì 192²; mỗi ảnh tốn 8 lượt forward 384² cho student, autobatch tự hạ micro-batch theo VRAM. Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained; checkpoint đem sang main stage là bản **teacher EMA** chọn theo validation.
+Dùng bản MaxViT-T 224 với đầu ra chuẩn, chạy ở ảnh 448²: stride tổng 32 nên lưới cuối 14×14 = 196 ô, mỗi ô 512 kênh (`forward_features` trả NCHW, được làm phẳng thành chuỗi token, không có prefix token). Model được dựng ở cấu hình gốc (cửa sổ/lưới attention 7×7) chứ **không** truyền `img_size=448`: timm suy cửa sổ từ `img_size/32`, nên `img_size=448` đổi cửa sổ thành 14×14 và đổi shape bảng bias vị trí, khiến trọng số pretrain không nạp được. Với cửa sổ 7, lưới mỗi stage ở 448² (112/56/28/14) lẫn 224² (56/28/14/7) đều chia hết, nên multi-crop của Stage 0 (local crop 224²) chạy trên cùng một `state_dict`. Chuẩn hoá pixel theo `pretrained_cfg` của checkpoint (mean/std ImageNet). Stage 0 fine-tune tự giám sát bằng DINOv3 từ trọng số pretrained; checkpoint đem sang main stage là bản **teacher EMA** chọn theo validation.
 
 MaxViT dùng BatchNorm trong các khối MBConv. `stage0.dino.freeze_bn: true` giữ mọi lớp BN (student và teacher) ở chế độ eval suốt Stage 0: thống kê chạy giữ nguyên của pretrain thay vì bị local crop và micro-batch nhỏ kéo lệch, còn γ/β vẫn học. Main stage chạy teacher ở `eval()` nên đọc đúng bộ thống kê ấy.
 
@@ -74,12 +74,12 @@ Bảng tham số của CnA: SelfAttn 4 × 1024² × 2 = 8,39 M · CrossAttn 2 ×
 
 | | Tham số | Học ở |
 |---|---|---|
-| Extractor | **30,46 M** | Stage 0 |
+| Extractor | **30,40 M** | Stage 0 |
 | CnA | **26,76 M** | Main stage |
-| **Cả nhánh** | **57,23 M** | |
+| **Cả nhánh** | **57,17 M** | |
 | Học ở main stage | **26,76 M** | chỉ CnA (+ LoRA của decoder) |
 
-DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,82 M**; student Stage 0 vì thế có **37,29 M**.
+DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,82 M**; student Stage 0 vì thế có **37,23 M**.
 
 **Đầu vào decoder:** nối 16 token `V_c` ngay sau token ảnh gốc `Z`; các vị trí token mới có nhãn `-100` cho CE, nên số token vào CE không đổi so với baseline.
 
@@ -102,7 +102,7 @@ Khi `patience` = 4 epoch liên tiếp không cải thiện, phần theo lịch d
 | Lr | `lr_min=1e-7`, `lr_max=1e-5` |
 | Epoch | `50` (trần của lịch) |
 | Patience | `4` (hết patience thì cosine về `lr_min` thêm 1 epoch rồi mới lấy best val) |
-| Multi-crop | 2 global 384² + 6 local (vùng scale 0.05–0.4, resize lên 384²; `local_size: 384`) |
+| Multi-crop | 2 global 448² + 6 local 224² (`local_size: 224`) |
 | Target | Nạp lại pretrain rồi fine-tune theo framework DINOv3 (tự giám sát, không nhãn) |
 
 ### 3.2. Main stage — Decoder finetuning
@@ -132,4 +132,4 @@ bash scripts/run_vextractor.sh train --detach
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
 
-> Checkpoint của kiến trúc cũ **không nạp được**: `FORMAT` đã nâng lên `rgexp.vextractor/18` và backbone đổi sang MaxViT-T, nên cả Stage 0 lẫn main stage phải chạy lại (`--restage0`). Cờ `--restage1` đã bị bỏ.
+> Checkpoint của kiến trúc cũ **không nạp được**: `FORMAT` đã nâng lên `rgexp.vextractor/18` và backbone đổi sang MaxViT-T 224 @448, nên cả Stage 0 lẫn main stage phải chạy lại (`--restage0`). Cờ `--restage1` đã bị bỏ.

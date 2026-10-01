@@ -53,7 +53,7 @@ gradient — lấy đúng một lượt backward. Jacobian đầy đủ của m�
    Hệ quả phải nhớ: **ô 2 và ô 3 KHÔNG cùng đại lượng** — ô 2 là nhu cầu của
    decoder trên đường CŨ, ô 3 là cấu tạo của khối Q. Tương quan giữa chúng trả
    lời "Q được dựng từ đúng vùng decoder vốn đã đòi qua Z không", chứ không so
-   được độ lớn. Ô 3 mịn hơn hẳn ô 2 (384² so với 64²); để so số nó được gộp về
+   được độ lớn. Ô 3 mịn hơn hẳn ô 2 (448² so với 64²); để so số nó được gộp về
    lưới 64×64 (`sal_q_64`), và mọi tương quan / IoU ở mục "Kiểm nhanh" tính
    trên lưới chung ấy.
 """
@@ -161,12 +161,12 @@ def load_arm(cfg: Cfg, adapter_dir: Path):
     return model, processor, gemma, branch, stats
 
 
-def encode(cfg: Cfg, processor, item: dict, image_size: int = 384,
+def encode(cfg: Cfg, processor, item: dict, image_size: int = 448,
            normalize=None):
     """Một mẫu: input_ids / labels / pixel_values / vext_pixels.
 
     Đúng đường của khâu train, CẢ HAI đường ảnh: `pixel_values` 896 cho Z và
-    `vext_pixels` 384² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh.
+    `vext_pixels` 448² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh.
     `normalize` = `branch.normalize`, tức mean/std ĐÚNG của checkpoint backbone.
     """
     if normalize is None:
@@ -189,7 +189,7 @@ def encode(cfg: Cfg, processor, item: dict, image_size: int = 384,
 def pool_to(a, n: int):
     """Gộp TRUNG BÌNH một bản đồ (S, S) về lưới (n, n) — S chia hết n.
 
-    Để so `sal_q` (384², gradient tới tận pixel) với `sal_z` (64², gradient
+    Để so `sal_q` (448², gradient tới tận pixel) với `sal_z` (64², gradient
     dừng ở patch SigLIP) thì phải đưa về CÙNG một lưới trước. Gộp trung bình
     chứ không lấy mẫu thưa: lấy mẫu thưa vứt đi phần lớn số điểm và biến một vùng
     nhạy mảnh thành ngẫu nhiên có hay không.
@@ -215,7 +215,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
       * `sal_z` = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64 (dính decoder);
       * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính n_query High-Q token, truy ngược
-        qua CnA -> Extractor về TẬN PIXEL của ảnh 384²,
+        qua CnA -> Extractor về TẬN PIXEL của ảnh 448²,
         chuẩn trên 3 kênh. KHÔNG dính decoder. Xem `_q_saliency_map`.
 
     `sal_q_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
@@ -346,7 +346,7 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
 
 
 def _q_saliency_map(branch, px, dev):
-    """Bản đồ của n_query High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 384².
+    """Bản đồ của n_query High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
 
     TARGET là khối Q — đầu ra của cả nhánh (Extractor (teacher) -> CnA) — chứ KHÔNG phải `y` của decoder. Vô hướng được đạo hàm là
     `s = Σ Q²`, nên bản đồ trả lời *16 vector §2.2 thêm vào được dựng từ vùng
@@ -587,7 +587,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
        ĐẦU RA encoder, lưới 64².
     3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
        token, truy ngược `Q → CnA → Extractor → I` về
-       tận pixel của ảnh 384². KHÔNG dính decoder, không dính LoRA.
+       tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
     4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (14×14 ở cấu hình hiện
        tại) — backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó.
 
@@ -601,7 +601,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     không lấy*. Cặp **ô 2 so ô 3** trả lời câu khác: "Q được dựng từ đúng vùng
     decoder vốn đã đòi qua Z không".
 
-    Bốn ô khác nhau cả ĐỘ PHÂN GIẢI lẫn ĐIỂM DỪNG (64² ở đầu ra encoder · 384²
+    Bốn ô khác nhau cả ĐỘ PHÂN GIẢI lẫn ĐIỂM DỪNG (64² ở đầu ra encoder · 448²
     tới tận pixel · 28² ở lưới teacher) — nên MỖI ô tự chuẩn hoá [0,1] và chỉ so
     HÌNH DẠNG. Số để so định lượng nằm ở mục "Kiểm nhanh" (tương quan / IoU
     trên lưới chung 64²), không đọc bằng mắt.
@@ -625,7 +625,7 @@ def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
     panels = [("Z · GRADIENT\ny → Z → adapter → vision encoder (X)\n"
                "lưới 64², DỪNG ở đầu ra encoder", res.get("sal_z")),
               ("khối Q · GRADIENT\n‖∂‖Q‖²/∂I‖ · Q → CnA\n"
-               "→ Extractor (teacher) → ảnh 384²", res.get("sal_q")),
+               "→ Extractor (teacher) → ảnh 448²", res.get("sal_q")),
               ("đầu ra Extractor · ĐỘ LỚN\n‖feature‖₂ lưới teacher — KHÔNG phải gradient\n"
                "backbone mã hoá gì, trước khi bị hỏi",
                res.get("teacher_feature_norm"))]
@@ -771,7 +771,7 @@ def diagnostics(res: dict) -> dict:
     i, j = np.unravel_index(int(np.argmax(S)), S.shape)
     out["peak"] = {"layer": int(i + 1), "pos": int(j), "value": float(S[i, j]),
                    "where": _where(int(j), res)}
-    # So trên LƯỚI CHUNG 64²: `sal_q` gốc là 384², `sal_z` là 64².
+    # So trên LƯỚI CHUNG 64²: `sal_q` gốc là 448², `sal_z` là 64².
     m1, m2 = res.get("sal_q_64"), res.get("sal_z")
     if m1 is not None and m2 is not None:
         x, y = np.asarray(m1).ravel(), np.asarray(m2).ravel()
@@ -1014,7 +1014,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
           "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
           f"| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính {nq} High-Q token**, truy ngược "
-          "`Q → CnA → Extractor → I` · lưới 384² | "
+          "`Q → CnA → Extractor → I` · lưới 448² | "
           f"{nq} vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
           "| 4 | **ĐỘ LỚN** `‖feature‖₂` của lưới teacher · lưới 28² | "
           "backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó |",
@@ -1041,7 +1041,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",
           "**Ô 2 và ô 3 KHÔNG cùng đại lượng** (nhu cầu của decoder vs cấu tạo "
           "của khối Q), và khác cả **độ phân giải** lẫn **điểm dừng** (64² ở "
-          "đầu ra encoder, so với 384² tới tận pixel). Nên mỗi ô **tự chuẩn hoá "
+          "đầu ra encoder, so với 448² tới tận pixel). Nên mỗi ô **tự chuẩn hoá "
           "[0,1]**: chỉ so **hình dạng**, tuyệt đối không so độ sáng. So định "
           "lượng thì đọc mấy dòng tương quan / IoU ở mục Kiểm nhanh, vốn đã gộp "
           "ô 3 về lưới chung 64² trước khi so.\n",
@@ -1064,7 +1064,7 @@ def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
           "5. Lưới 64×64 của ô 2 là **thô**: một ô ≈ 14 px của ảnh 896. Đừng "
           "đọc chi tiết nhỏ hơn một ô — ô 3 mịn hơn nhưng vẫn không phải đường "
           "viền.\n",
-          "Số thô: `lens_maps.npz` (`layer_sens`, `sal_z`, `sal_q` 384², "
+          "Số thô: `lens_maps.npz` (`layer_sens`, `sal_z`, `sal_q` 448², "
           "`sal_q_64`), `lens.json`, `logit_lens.csv`.\n",
           "## Giới hạn\n",
           "- Một ảnh, chọn vì nhiều `pos`/`uncertain` — MINH HOẠ, không phải bằng chứng "
