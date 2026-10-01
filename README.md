@@ -5,8 +5,8 @@ Nhánh thị giác bổ sung 16 token ảnh vào đầu vào Gemma 3. Ảnh cũn
 ```text
 Ảnh 448×448
   └─ Extractor: `twins_pcpvt_small` (Twins PCPVT-S) → V (196, 512)
-       └─ Compressor: QFormer, 16 latent, 5 nhóm block → V_c (16, 512)
-            └─ Aligner: SelfAttn + SwiGLU×2 + Linear Proj 512→2560 → Q (B, 16, 2560)
+       └─ Compressor: QFormer, 16 latent, 3 nhóm block → V_c (16, 768)
+            └─ Aligner: SelfAttn + SwiGLU×2 + Linear Proj 768→2560 → Q (B, 16, 2560)
                  └─ Gemma: [Z ‖ Q ‖ văn bản]
 ```
 
@@ -41,49 +41,50 @@ Twins PCPVT-S có stride tổng 32 nên ảnh 448² cho lưới 14×14 = 196 ô,
 | | |
 |---|---|
 | Methodology | `QFormer` |
-| Latent learnable vectors | `16, 512` |
+| Input dim | `512` → `W_k, W_v` (trong Cross-attn) → `768` |
+| Latent learnable vectors | `16, 768` |
 | Norm | `RMSNorm` |
 | 1st block | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁` |
 | 2nd block | `Q₁ → SelfAttn(Q₁) → FFN → Q_final` |
-| FFN | `SwiGLU 512→768→512` (mult = 1.5, hidden = 768) |
+| FFN | `SwiGLU 768→1152→768` (mult = 1.5, hidden = 1152) |
 | All_Block | `(1st → 2nd)` × N |
-| N (blocks) | `5` |
-| Params | **5,51 M** mỗi nhóm → **27,55 M** cả khối |
-| Kí hiệu | `V_c` → `V_c (16, 512)` |
+| N (blocks) | `3` |
+| Params | **12,00 M** mỗi nhóm → **36,00 M** cả khối |
+| Kí hiệu | `V_c` → `V_c (16, 768)` |
 
-16 latent vector học được với kích thước 512, `head_dim` = 64 (suy ra 8 head). `RMSNorm(512)` trên `V` là khối duy nhất đứng giữa Extractor và QFormer; vì `d_feat = d_latent = 512` nên `k_proj`/`v_proj` của Cross-attn là `512→512`, không có lớp chiếu riêng. Khối 2 **không** có Cross-attn: nó để 16 vector thống nhất lại với nhau sau khi vừa đọc xong ảnh. Cấu hình FFN là `vextractor.compressor.mlp_hidden`.
+16 latent vector học được với kích thước 768, `head_dim` = 128 (suy ra 6 head). `RMSNorm(512)` trên `V` là khối duy nhất đứng giữa Extractor và QFormer; phép đổi chiều 512→768 nằm trong `k_proj`/`v_proj` của Cross-attn, không có lớp chiếu riêng. Khối 2 **không** có Cross-attn: nó để 16 vector thống nhất lại với nhau sau khi vừa đọc xong ảnh. Cấu hình FFN là `vextractor.compressor.mlp_hidden`.
 
-> Chi phí nằm ở `d_latent`, không ở `n_query`: 16 latent là 8 192 tham số, còn mỗi SelfAttn @512 là 1,05 M. Đổi số latent đụng tới THỜI GIAN và độ dài chuỗi decoder, gần như không đụng tới bảng tham số.
+> Chi phí nằm ở `d_latent`, không ở `n_query`: 16 latent là 12 288 tham số, còn mỗi SelfAttn @768 là 2,36 M. Đổi số latent đụng tới THỜI GIAN và độ dài chuỗi decoder, gần như không đụng tới bảng tham số.
 
 ### 2.3. Aligner — căn chỉnh Vision-Language
 
 | | |
 |---|---|
 | Methodology | `V_c → Self-Attn → +res → SwiGLU(x2) → +res → Linear Proj(2560)` |
-| Inp / dim | `V_c` / `512` |
+| Inp / dim | `V_c` / `768` |
 | Out dim | `2560` |
 | Norm | `RMSNorm` (trước SelfAttn, trước SwiGLU, trước Linear) |
-| SwiGLU | `SwiGLU 512→1024→512` (mult = 2, hidden = 1024) |
-| Projection | `Linear 512→2560` (có bias) |
-| Params | **3,94 M** |
+| SwiGLU | `SwiGLU 768→1536→768` (mult = 2, hidden = 1536) |
+| Projection | `Linear 768→2560` (có bias) |
+| Params | **7,87 M** |
 
 ```text
-x = V_c + SelfAttn(RMSNorm(V_c))          # 512
-x = x   + SwiGLU(RMSNorm(x))              # 512 → 1024 → 512
-Q = Linear(RMSNorm(x))                    # 512 → 2560
+x = V_c + SelfAttn(RMSNorm(V_c))          # 768
+x = x   + SwiGLU(RMSNorm(x))              # 768 → 1536 → 768
+Q = Linear(RMSNorm(x))                    # 768 → 2560
 ```
 
-Tổng Aligner **3,94 M**: SelfAttn 1,05 M · SwiGLU 1,57 M · Linear 1,31 M · 3 RMSNorm. SelfAttn ở đây **không** đọc ảnh — nó là một lượt tự-chú ý trên đúng 16 vector của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới 196 ô. Cấu hình FFN là `vextractor.aligner.mlp_hidden`.
+Tổng Aligner **7,87 M**: SelfAttn 2,36 M · SwiGLU 3,54 M · Linear 1,97 M · 3 RMSNorm. SelfAttn ở đây **không** đọc ảnh — nó là một lượt tự-chú ý trên đúng 16 vector của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới 196 ô. Cấu hình FFN là `vextractor.aligner.mlp_hidden`.
 
 ### 2.4. Bảng tham số
 
 | | Tham số | Học ở |
 |---|---|---|
 | Extractor | **23,59 M** | Stage 0 |
-| Compressor | **27,55 M** | Stage 1 |
-| Aligner | **3,94 M** | Main stage |
-| **Cả nhánh** | **55,08 M** | |
-| Học ở main stage | **3,94 M** | chỉ Aligner |
+| Compressor | **36,00 M** | Stage 1 |
+| Aligner | **7,87 M** | Main stage |
+| **Cả nhánh** | **67,47 M** | |
+| Học ở main stage | **7,87 M** | chỉ Aligner |
 
 DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,82 M**; student Stage 0 vì thế có **30,42 M**.
 
@@ -145,4 +146,4 @@ bash scripts/run_vextractor.sh train --detach
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
 
-> Checkpoint của kiến trúc cũ (FocalNet, QFormer 768) **không nạp được**: `FORMAT` đã nâng lên `rgexp.vextractor/17` và `backbone_spec` đổi `arch`, nên Stage 0, Stage 1 và nhánh main stage đều phải chạy lại (`--restage0` / `--restage1`).
+> Checkpoint của kiến trúc cũ **không nạp được**: `FORMAT` đã nâng lên `rgexp.vextractor/17`, nên Stage 1 và nhánh main stage phải chạy lại (`--restage1`). Checkpoint Stage 0 của Twins vẫn dùng được nếu `backbone_spec` không đổi.

@@ -1,9 +1,9 @@
 """Twins extractor, QFormer compressor, and vision-language aligner.
 
 Twins PCPVT-S maps 448x448 images to a 14x14 grid of 512-channel tokens
-(V = 196 x 512). A QFormer compresses V into sixteen latent vectors (V_c, 16 x 512);
+(V = 196 x 512). A QFormer compresses V into sixteen latent vectors (V_c, 16 x 768);
 the Aligner (self-attention + SwiGLU + linear projection) maps them to the decoder
-width (2560).
+width (2560). Compressor width is 768: cross-attention k/v project 512 -> 768.
 """
 from __future__ import annotations
 
@@ -565,20 +565,20 @@ class QFormerGroup(nn.Module):
     Một Cross-attn thứ hai liền kề chỉ là đọc lại cùng một lưới bằng cùng một
     bộ câu hỏi vừa được cập nhật nửa vời.
 
-    Tham số ở `d_latent` = 512, `d_kv` = 512 (Twins PCPVT-S), `mlp_hidden` = 768
-    (SwiGLU `mult` = 1.5):
+    Tham số ở `d_latent` = 768, `d_kv` = 512 (Twins PCPVT-S; k/v chiếu 512→768
+    ngay trong Cross-attn), `mlp_hidden` = 1152 (SwiGLU `mult` = 1.5):
 
-        SelfAttn  4 × 512²             = 1 048 576   (×2)
-        CrossAttn 2 × 512² + 2×512×512 = 1 048 576
-        SwiGLU    3 × 512 × 768        = 1 179 648   (×2)
-        5 × RMSNorm(512)               =     2 560
+        SelfAttn  4 × 768²             = 2 359 296   (×2)
+        CrossAttn 2 × 768² + 2×512×768 = 1 966 080
+        SwiGLU    3 × 768 × 1152       = 2 654 208   (×2)
+        5 × RMSNorm(768)               =     3 840
         ───────────────────────────────────────────
-        KHỐI 1 (self + cross + ffn)    = 3 276 800
-        KHỐI 2 (self + ffn)            = 2 228 224
-        MỘT nhóm (khối 1 → khối 2)     = 5 507 584   (≈ 5,51 M)
+        KHỐI 1 (self + cross + ffn)    = 6 979 584
+        KHỐI 2 (self + ffn)            = 5 013 504
+        MỘT nhóm (khối 1 → khối 2)     = 11 996 928   (≈ 12,0 M)
 
-    > Tổng Compressor ở `N = 5` là **27 546 624** = 5 × 5 507 584, cộng `latent`
-    > (16 × 512 = 8 192) và `RMSNorm(V)` (512) ngoài năm nhóm khối.
+    > Tổng Compressor ở `N = 3` là **36 003 584** = 3 × 11 996 928, cộng `latent`
+    > (16 × 768 = 12 288) và `RMSNorm(V)` (512) ngoài ba nhóm khối.
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
@@ -621,25 +621,25 @@ class Compressor(nn.Module):
     """V (B, n_patch, d_feat) -> V_c (B, n_query, d_latent). QFormer, N nhóm khối.
 
         kv  = RMSNorm(V)                        512, MỘT lần, ngoài mọi nhóm
-        q   = latent.expand(B)                  (B, 16, 512)
+        q   = latent.expand(B)                  (B, 16, 768)
         q   = group_i(q, kv)   với i = 1..N     mỗi nhóm = khối 1 + khối 2
 
     **16 latent là khoá KHAI** (`n_query`) — lưới của Extractor (196 ô ở 448²)
     chỉ là NGUỒN để hỏi, không phải khối Q.
 
     **`RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer.**
-    Không có `Linear` riêng: phép đổi chiều nằm trong `k_proj`/`v_proj` của
+    Không có `Linear` riêng 512→768: phép đổi chiều nằm trong `k_proj`/`v_proj` của
     Cross-attn. Lý do là đếm được — một lớp chiếu riêng thêm 0,49 M tham số mà
     không thêm sức biểu diễn nào (nó chỉ gộp được vào `k`/`v` phía sau).
 
     **Chi phí nằm ở `d_latent`, không ở `n_query`.** 16 latent là 12 288 tham
-    số; mỗi SelfAttn @512 là 1,05 M. Đổi `n_query` gần như không đụng tới bảng
+    số; mỗi SelfAttn @768 là 2,36 M. Đổi `n_query` gần như không đụng tới bảng
     tham số (nó đụng tới THỜI GIAN và tới độ dài chuỗi decoder); đổi `d_latent`
     thì đụng tới tất cả, theo d².
     """
 
-    def __init__(self, d_feat: int, n_query: int = 16, d_latent: int = 512,
-                 head_dim: int = 64, mlp_hidden: int = 768, n_blocks: int = 5,
+    def __init__(self, d_feat: int, n_query: int = 16, d_latent: int = 768,
+                 head_dim: int = 128, mlp_hidden: int = 1152, n_blocks: int = 3,
                  dropout: float = 0.0):
         super().__init__()
         self.d_feat = int(d_feat)
@@ -720,20 +720,20 @@ class Compressor(nn.Module):
 class Aligner(nn.Module):
     """V_c (d_latent) -> Q (d_model). SelfAttn + SwiGLU (×2) + Linear Proj.
 
-        x = V_c + SelfAttn(RMSNorm(V_c))              512  (= d_latent)
-        x = x   + SwiGLU(RMSNorm(x))                  512 -> 1024 -> 512   (mult 2)
-        Q = Linear(RMSNorm(x))                        512 -> 2560
+        x = V_c + SelfAttn(RMSNorm(V_c))              768  (= d_latent)
+        x = x   + SwiGLU(RMSNorm(x))                  768 -> 1536 -> 768   (mult 2)
+        Q = Linear(RMSNorm(x))                        768 -> 2560
 
     **SelfAttn ở đây KHÔNG đọc ảnh.** Nó là một lượt TỰ-chú ý trên đúng 16 vector
     của `V_c`; Cross-attn của Compressor là chỗ duy nhất chạm lưới. Việc của nó
     là trộn 16 vector MỘT lần nữa ngay tại ranh giới ngữ nghĩa.
 
     **Hai dấu `+` (residual), cả hai ở chiều d_latent** — SelfAttn và SwiGLU đều
-    giữ nguyên chiều nên cộng được. Phép ĐỔI KHÔNG GIAN (512 -> 2560) là một
+    giữ nguyên chiều nên cộng được. Phép ĐỔI KHÔNG GIAN (768 -> 2560) là một
     `Linear` riêng đứng SAU cả hai residual, nên nó là chỗ DUY NHẤT không có `+`.
 
-    `SwiGLU(x2)` đọc là `mult = 2`: hidden = 2 × d_latent = 1024, cùng quy ước
-    `mult` của Compressor (`mult = 1.5` -> 768). Khoá khai là `mlp_hidden` (số
+    `SwiGLU(x2)` đọc là `mult = 2`: hidden = 2 × d_latent = 1536, cùng quy ước
+    `mult` của Compressor (`mult = 1.5` -> 1152). Khoá khai là `mlp_hidden` (số
     nguyên) để vân tay và checkpoint không phụ thuộc cách làm tròn.
 
     **Ba RMSNorm, đứng TRƯỚC từng khối con** (attn, SwiGLU, Linear). Norm trước
@@ -744,23 +744,23 @@ class Aligner(nn.Module):
     chính Aligner quyết định, không do V_c.
 
     **`n_heads` suy ra từ `compressor.head_dim`, không phải một khoá thứ hai.**
-    Mọi attention của nhánh chạy ở CÙNG `head_dim` (64 -> 8 head ở 512).
+    Mọi attention của nhánh chạy ở CÙNG `head_dim` (128 -> 6 head ở 768).
 
     Init: SwiGLU và `proj` dùng `1/√fan_in` (`_init` bỏ qua chúng); bốn chiếu của
     attention theo quy ước normal(0, 0.02) của Compressor.
 
-    Ở 512 / hidden 1024 / d_model 2560:
+    Ở 768 / hidden 1536 / d_model 2560:
 
-        SelfAttn  4 × 512²             = 1 048 576
-        SwiGLU    3 × 512 × 1024       = 1 572 864
-        Linear    512 × 2560 + 2560    = 1 313 280   (có bias)
-        3 × RMSNorm(512)               =     1 536
+        SelfAttn  4 × 768²             = 2 359 296
+        SwiGLU    3 × 768 × 1536       = 3 538 944
+        Linear    768 × 2560           = 1 966 080   (+ 2 560 bias)
+        3 × RMSNorm(768)               =     2 304
         ─────────────────────────────────────────────
-        ALIGNER                        = 3 936 256   (≈ 3,94 M)
+        ALIGNER                        = 7 869 184   (≈ 7,86 M)
     """
 
-    def __init__(self, d_latent: int, d_model: int, mlp_hidden: int = 1024,
-                 head_dim: int = 64, dropout: float = 0.0):
+    def __init__(self, d_latent: int, d_model: int, mlp_hidden: int = 1536,
+                 head_dim: int = 128, dropout: float = 0.0):
         super().__init__()
         self.d_latent, self.d_model = int(d_latent), int(d_model)
         self.mlp_hidden = int(mlp_hidden)
@@ -900,7 +900,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
     BA khối con, BA danh sách khoá hợp lệ, và khoá LẠ bị TỪ CHỐI ồn ào. Đây là
     chỗ DUY NHẤT dựng spec, nên cũng là chỗ duy nhất biết khoá nào có thật.
 
-    `d_latent` (512) KHÁC `d_model` (2560): thân nhánh chạy ở 512 và `Aligner`
+    `d_latent` (768) KHÁC `d_model` (2560): thân nhánh chạy ở 768 và `Aligner`
     là chỗ DUY NHẤT đổi chiều. `d_model` đọc từ `AutoConfig` của decoder,
     `d_latent` khai trong config, và `build_aligner` nối chúng — nên đổi base
     sang một decoder khác chiều sẽ lộ ra ở đây chứ không lặng lẽ.
@@ -943,12 +943,12 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
 
                       "normalize": {"mean": list(mean), "std": list(std)}},
         "compressor": {"n_query": int(cp.get("n_query", 16)),
-                       "d_latent": int(cp.get("d_latent", 512)),
-                       "head_dim": int(cp.get("head_dim", 64)),
-                       "mlp_hidden": int(cp.get("mlp_hidden", 768)),
-                       "n_blocks": int(cp.get("n_blocks", 5)),
+                       "d_latent": int(cp.get("d_latent", 768)),
+                       "head_dim": int(cp.get("head_dim", 128)),
+                       "mlp_hidden": int(cp.get("mlp_hidden", 1152)),
+                       "n_blocks": int(cp.get("n_blocks", 3)),
                        "dropout": float(cp.get("dropout", 0.0))},
-        "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 1024)),
+        "aligner": {"mlp_hidden": int(al.get("mlp_hidden", 1536)),
                     "dropout": float(al.get("dropout", 0.0))},
     }
 
@@ -1139,7 +1139,7 @@ class VExtractorBranch(nn.Module):
 
         Compressor chạy trong `no_grad` khi CẢ nó VÀ Extractor đều đóng băng —
         lúc ấy không còn gì bên dưới `Aligner` cần gradient, nên giữ activation
-        của 196 ô × 5 nhóm khối là trả tiền VRAM cho một đồ thị không ai dùng.
+        của 196 ô × 3 nhóm khối là trả tiền VRAM cho một đồ thị không ai dùng.
         Điều kiện phải gồm cả `self.frozen`: Lens mở băng Extractor để truy
         ngược tới pixel, và đồ thị ấy đi XUYÊN QUA Compressor.
         """

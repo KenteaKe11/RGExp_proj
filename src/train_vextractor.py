@@ -766,6 +766,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         for grp in opt_b.param_groups:
             grp["lr"] = lrs[grp["name"]]
         alr = _a["ffn"]
+        alr_attn = _a["attn"]
         # KHÔNG có bước mở băng nào ở đây — Extractor và Compressor đóng băng
         # trước vòng lặp và ở đó tới hết main stage.
         opt.zero_grad(set_to_none=True)
@@ -796,13 +797,15 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         if (step + 1) % log_every == 0 or step == steps - 1:
             lr_now = opt.param_groups[0]["lr"]
             print(f"    [{aid}] bước {step + 1}/{steps} · ce {step_ce:.4f} · "
-                  f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} nhánh "
-                  f"{gn_br or 0:.3f} (nhánh) · lr {lr_now:.2e} · lr_aligner "
-                  f"{alr:.2e}", flush=True)
+                  f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} · "
+                  f"Aligner {gn_br or 0:.3f} · lr LoRA {lr_now:.2e} · lr Aligner "
+                  f"ffn {alr:.2e} attn {alr_attn:.2e}", flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
                              f"train/{aid}/lr": lr_now,
                              f"train/{aid}/lr_aligner": alr,
+                             f"train/{aid}/lr_aligner_ffn": alr,
+                             f"train/{aid}/lr_aligner_attn": alr_attn,
                              f"train/{aid}/step": step + 1,
                              f"train/{aid}/q_rms_rel": rel_last,
                              f"train/{aid}/grad_norm_lora": gn_lora,

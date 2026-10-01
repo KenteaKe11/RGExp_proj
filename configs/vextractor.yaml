@@ -321,15 +321,15 @@ vextractor:
     pretrained: true
     n_layers: null
     n_stages: null          # đủ 4 stage (stride 32): 448² -> lưới 14×14 = 196 token
-  compressor:               # QFormer: V (196, 512) -> V_c (16, 512)
+  compressor:               # QFormer: V (196, 512) -W_k,v-> 768 -> V_c (16, 768)
     n_query: 16             # số latent = số token Q nối vào chuỗi decoder
-    d_latent: 512           # KHÁC d_model (2560): Aligner mới là chỗ đổi chiều
-    head_dim: 64            # n_heads SUY RA = d_latent // head_dim = 8
-    mlp_hidden: 768         # SwiGLU mult = 1.5 → 512→768→512
-    n_blocks: 5             # N: số lần lặp (khối 1 -> khối 2)
+    d_latent: 768           # KHÁC d_model (2560) và d_feat (512): k/v của Cross-attn chiếu 512→768
+    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
+    mlp_hidden: 1152        # SwiGLU mult = 1.5 → 768→1152→768
+    n_blocks: 3             # N: số lần lặp (khối 1 -> khối 2)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (16, 512) -> Q (16, 2560)
-    mlp_hidden: 1024        # SwiGLU mult = 2 → 512→1024→512, rồi Linear 512→2560
+  aligner:                  # V_c (16, 768) -> Q (16, 2560)
+    mlp_hidden: 1536        # SwiGLU mult = 2 → 768→1536→768, rồi Linear 768→2560
     dropout: 0.0
 
   # ── Main stage: MỘT khối học được, HAI nhóm lr (`src/train_vextractor.py`) ─
