@@ -16,7 +16,7 @@
 #
 # ⚠ ĐỔI CARD KHÔNG ĐƯỢC ĐỔI KẾT QUẢ. File này chỉ nói "chạy thế nào", nên thứ
 # duy nhất nó được phép đụng tới là TỐC ĐỘ và VRAM. Cụ thể: 4 GB thừa so với
-# RTX 3060 đi vào Stage 0 / Stage 1 / sinh — KHÔNG đi vào `train.
+# RTX 3060 đi vào Stage 0 / sinh — KHÔNG đi vào `train.
 # per_device_batch_size` (xem ngay dưới).
 #
 # ── Blackwell: HAI thứ phải đúng trước khi chạy ──────────────────────────────
@@ -57,7 +57,7 @@ set:
   # `fixture.set_lock("train_batch")` giữ số đã khoá, bỏ qua số mới.
   #
   # VRAM thừa của card này vì thế đi vào chỗ khác: mảnh VẬT LÝ của main stage
-  # (CE ghép lại theo token nên gradient KHÔNG đổi), Stage 0, Stage 1 và sinh.
+  # (CE ghép lại theo token nên gradient KHÔNG đổi), Stage 0 và sinh.
   train.per_device_batch_size: 1
   # Giữ true. Nó không đụng tới phép toán (chỉ đổi thời gian ↔ activation), nên
   # `false` là một khoá TỐC ĐỘ hợp lệ trên 16 GB — nhưng chỉ sau khi đã thấy
@@ -65,22 +65,17 @@ set:
   train.gradient_checkpointing: true
   train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
 
-  # ── Stage 0 + Stage 1 (KHÔNG nạp Gemma) ────────────────────────────────
+  # ── Stage 0 (KHÔNG nạp Gemma) ────────────────────────────────
   # Đây mới là chỗ 4 GB thừa có nghĩa: hai giai đoạn này KHÔNG có ràng buộc nào
   # từ A, nên mảnh vật lý được phép leo tới tận `batch_size` = 32.
   #
-  # Stage 0 giữ student và teacher Extractor Twins-SVT-S (~23,55 M mỗi nhánh)
+  # Stage 0 giữ student và teacher Extractor MaxViT-T 384 (~30,5 M mỗi nhánh)
   # cùng DINO head (2,63 M mỗi nhánh).
   # Batch dò tự động theo VRAM; giảm local crop nếu thiết bị không đủ bộ nhớ.
   stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
   stage0.probe_sizes: [1, 2, 4]   # điểm ĐO riêng của Stage 0 (main stage dùng
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy mới đúng.
-  # Stage 1 nhẹ hơn Stage 0 hẳn một bậc: Extractor chạy `no_grad` (không giữ
-  # activation), chỉ Compressor ~36,0 M có gradient, và ĐÚNG 2 view thay vì 8.
-  # Trên 16 GB nó thừa sức chạm 32 — nên điểm dò mở tới đó.
-  stage1.micro_batch: 16          # khởi điểm; autobatch dò lại (ước của 32)
-  stage1.probe_sizes: [8, 16, 32]
 
   # ── Sinh + chấm ─────────────────────────────────────────────────────────
   # 4 thay vì 2: sinh không có gradient, không có optimizer state, và beam 3
@@ -115,7 +110,7 @@ set:
   # GIL nên nó scale thật trên 20 luồng logic.
   io.workers: 20
   # 4, không 3: 28 GB RAM và `train.per_device_batch_size` = 1, nên mỗi
-  # micro-batch dựng sẵn chỉ là một ảnh (448² cho nhánh + 896² cho processor của
+  # micro-batch dựng sẵn chỉ là một ảnh (384² cho nhánh + 896² cho processor của
   # Gemma) — thêm một bậc queue gần như miễn phí và che được độ trễ đọc đĩa.
   io.prefetch_depth: 4            # số micro-batch dựng sẵn trước GPU
   io.pin_memory: true             # CPU->GPU không chặn (pinned + non_blocking)

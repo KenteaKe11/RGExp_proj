@@ -2,15 +2,14 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # run_vextractor.sh — §2.2 V-Extractor: [Z ‖ T] vs [Z ‖ Q ‖ T]. BA lệnh:
 #
-#     bash scripts/run_vextractor.sh train [--detach] # kéo A ($1) -> Stage 0 -> Stage 1 -> main B -> sinh -> chấm
+#     bash scripts/run_vextractor.sh train [--detach] # kéo A ($1) -> Stage 0 -> main B -> sinh -> chấm
 #     bash scripts/run_vextractor.sh stats            # bootstrap ghép cặp + permutation -> REPORT.md
 #     bash scripts/run_vextractor.sh lens             # mổ 1 ảnh -> Lens/Lens_Explain.md
 #     bash scripts/run_vextractor.sh push             # -> Hub current/$2.2_V-Extractor_Test/
 #     bash scripts/run_vextractor.sh all [--detach]   # train -> stats -> push
 #
 #     bash scripts/run_vextractor.sh train --dry-run  # thử đường ống + VRAM đỉnh
-#     bash scripts/run_vextractor.sh train --restage0 # chạy lại Stage 0 (+ Stage 1 + main)
-#     bash scripts/run_vextractor.sh train --restage1 # chạy lại Stage 1 (+ main)
+#     bash scripts/run_vextractor.sh train --restage0 # chạy lại Stage 0 (+ main)
 #     bash scripts/run_vextractor.sh train --retrain  # chạy lại main stage của B
 #     bash scripts/run_vextractor.sh push --plan
 #

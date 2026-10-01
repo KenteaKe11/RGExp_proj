@@ -7,22 +7,22 @@
 #
 #   A  qlora_r32_decoder           — LẤY TỪ $1 (weight + predictions + điểm có
 #                                    tem khớp), KHÔNG huấn luyện lại.
-#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone Twins-SVT-S học TỰ GIÁM SÁT
+#   B  qlora_r32_decoder_vextractor  — Stage 0 (backbone MaxViT-T 384 học TỰ GIÁM SÁT
 #                                    bằng DINO, KHÔNG nhãn; checkpoint đem đi là
 #                                    bản TEACHER/EMA) -> main stage y hệt A +
 #                                    nhánh V-Extractor (backbone teacher infer).
 #
 # Biến DUY NHẤT giữa A và B là chuỗi vào decoder: [Z ‖ text] vs [Z ‖ Q ‖ text],
-# với Q = Aligner(Compressor(Extractor(ảnh 448²))) — 16 vector MỚI; Z (256 token
+# với Q = V_c = CnA(Extractor(ảnh 384²)) — 16 vector MỚI; Z (256 token
 # ảnh) KHÔNG bị đụng vào. 16 vị trí thêm có nhãn −100 nên số token vào CE không đổi. KHÔNG có lớp khởi
-# tạo 0. Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn Extractor
-# và Aligner là của main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
+# tạo 0. Stage 0 chỉ dạy ENCODER (tự giám sát, không nhãn), còn CnA là của
+# main stage — nên Q ở bước 0 là ngẫu nhiên, và thứ mang sẵn
 # thông tin là các đặc trưng thị giác nó đọc. Kiểm định: bootstrap ghép cặp (BCa) + permutation đảo dấu,
 # Holm trên các metric (`src/stats_ab.py`).
 #
 # KHÁC §2.0 (`_archive/zrecomb/`, Recombiner Test): ở đó có khối Recomb chiếu X
 # lên 2560 rồi Z bị THAY bằng Z' = Z + Retriever(Z, R), chuỗi không dài thêm. Ở
-# đây nhánh có encoder RIÊNG (Twins-SVT-S ăn ảnh 448²) — và chuỗi dài
+# đây nhánh có encoder RIÊNG (MaxViT-T ăn ảnh 384²) — và chuỗi dài
 # thêm 16.
 #
 # Mọi khoá quyết định KẾT QUẢ của A (seed, data, image_policy, base, prompt,
@@ -309,144 +309,67 @@ labels:
   max_missing_frac: 0.20
 
 # ═════════════════════════════════════════════════════════════════════════════
-# NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — BA KHỐI (`src/vextractor.py`)
+# NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — HAI KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# Twins-SVT-S -> QFormer compressor -> vision-language aligner.
-# Stage 0: DINO self-supervised fine-tuning; Stage 1: compressor transfer.
+#   ảnh 384² ─► Extractor MaxViT-T 384 ─► V (144, 512) ─► CnA (QFormer) ─► V_c (16, 2560)
+#
+# Stage 0: DINOv3 fine-tuning của Extractor. Main stage: CnA + LoRA học cùng nhau.
+# (Không còn Stage 1 — bản Stage 1 cũ nằm ở `_archive/stage1_compressor/`.)
 vextractor:
-  extractor:                # Twins-SVT-S: (B,3,448,448) -> V (B,196,512)  (~24,06 M)
-    image_size: 448
-    arch: twins_svt_small
+  extractor:                # MaxViT-T 384: (B,3,384,384) -> V (B,144,512)  (~30,46 M)
+    image_size: 384
+    arch: maxvit_tiny_tf_384.in1k
     pretrained: true
     n_layers: null
-    n_stages: null          # đủ 4 stage (stride 32): 448² -> lưới 14×14 = 196 token
-  compressor:               # QFormer: V (196, 512) -W_k,v-> 768 -> V_c (16, 768)
-    n_query: 16             # số latent = số token Q nối vào chuỗi decoder
-    d_latent: 768           # KHÁC d_model (2560) và d_feat (512): k/v của Cross-attn chiếu 512→768
-    head_dim: 128           # n_heads SUY RA = d_latent // head_dim = 6
-    mlp_hidden: 1152        # SwiGLU mult = 1.5 → 768→1152→768
-    n_blocks: 3             # N: số lần lặp (khối 1 -> khối 2)
+    n_stages: null          # đủ 4 stage, đầu ra CHUẨN stride 32: 384² -> 12×12 = 144 token
+  cna:                      # Compressor & Aligner — QFormer: V (144, 512) -W_k,v-> 1024 -> V_c (16, 2560)
+    n_query: 16             # số latent = số token nối vào chuỗi decoder
+    d_latent: 1024          # k/v của Cross-attn chiếu 512→1024
+    head_dim: 128           # n_heads SUY RA = 1024 // 128 = 8
+    mlp_hidden: 2048        # SwiGLU mult = 2 → 1024→2048→1024
+    n_blocks: 1             # All_Block = (1st → 2nd) một lần
+    final_proj: true        # RMSNorm + Linear 1024 -> 2560 (d_model của Gemma 3 4B)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
-  aligner:                  # V_c (16, 768) -> Q (16, 2560)
-    mlp_hidden: 1536        # SwiGLU mult = 2 → 768→1536→768, rồi Linear 768→2560
-    dropout: 0.0
 
-  # ── Main stage: MỘT khối học được, HAI nhóm lr (`src/train_vextractor.py`) ─
-  # Mốc khai theo TỈ LỆ tổng số bước, không theo số bước tuyệt đối: main stage
-  # khoá 1 epoch = 200 bước theo $1, nhưng `--dry-run` và mọi lần đổi
-  # `train_batch` đổi con số ấy. Khai "20 bước" thì với một lần chạy 4 bước,
-  # warm-up đã xong trước khi Aligner kịp đi bước nào ở lr đầy đủ.
+  # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
+  # CnA khởi tạo ngẫu nhiên và HỌC CÙNG LoRA NGAY TỪ BƯỚC 0. Warm-up tuyến tính
+  # `cna_warmup_frac` (10%) tổng bước rồi PHẲNG; cùng MỘT dốc cho cả ba nhóm:
+  #     ffn   (SwiGLU + Linear cuối + RMSNorm + latent)  1e-7 -> 1e-4
+  #     self  (4 chiếu của mọi SelfAttn)                 1e-8 -> 1e-5
+  #     cross (4 chiếu của Cross-attn)                   4e-8 -> 4e-5
+  # Ba nhóm là một PHÂN HOẠCH của CnA; `train` DỪNG nếu không.
   #
-  #   Aligner     KHỐI DUY NHẤT học ở main stage, và nó HỌC CÙNG LoRA NGAY TỪ
-  #               BƯỚC 0 — mục tiêu của nó là học cách biến tín hiệu đặc trưng
-  #               thị giác sang không gian ngữ nghĩa, và nó không làm được việc
-  #               ấy nếu bị đóng băng lúc LoRA đang định hình. warm-up 10% bước
-  #               rồi PHẲNG, HAI nhóm:
-  #                 ffn  (SwiGLU + Linear Proj + 3 RMSNorm)  1e-7 -> 1e-4
-  #                 attn (4 chiếu SelfAttn)                  1e-8 -> 1e-5
-  #               Cùng MỘT dốc cho cả hai: chúng nằm trong cùng một khối ngẫu
-  #               nhiên và phải đi vào cùng một lúc.
+  # Extractor nạp TEACHER (EMA) của Stage 0 và chạy TEACHER INFERENCE
+  # (requires_grad=False + eval + no_grad + KHÔNG nằm trong optimizer).
+  # Những module khác freeze hoàn toàn. LoRA chạy ĐÚNG lịch one-cycle của $1.
   #
-  #   Compressor  KHÔNG BAO GIỜ mở. Nó nạp checkpoint Stage 1 rồi chạy ở chế độ
-  #               INFERENCE (requires_grad=False + eval + no_grad + KHÔNG nằm
-  #               trong optimizer) suốt main stage. Stage 1 là chỗ DUY NHẤT nó
-  #               học; ở đây nó là một hàm cố định biến V thành V_c, nên 16
-  #               vector Q chỉ đổi qua Aligner.
-  #
-  #   Extractor   KHÔNG BAO GIỜ mở. Nó nạp trọng số TEACHER (EMA) của Stage 0 và
-  #               chạy ở chế độ TEACHER INFERENCE (requires_grad=False + eval +
-  #               no_grad + KHÔNG nằm trong optimizer) suốt main stage.
-  #
-  # Nói cách khác: main stage học ĐÚNG hai thứ — LoRA của decoder và Aligner.
-  # Mọi module khác của nhánh đóng băng hoàn toàn.
-  #
-  # Attn thấp hơn FFN đúng 10 lần, cùng một lý do đã tách hai nhóm ở Stage 1:
-  # ma trận attention quyết định 16 vector TRỘN VỚI NHAU thế nào, còn FFN chỉ
-  # biến đổi thứ đã trộn xong. `zcfg` TỪ CHỐI cấu hình đảo dấu.
-  #
-  # HAI nhóm PHỦ KÍN Aligner (`attn_parameters` + `ffn_parameters` là một PHÂN
-  # HOẠCH), và `train` DỪNG nếu không: một tham số học được nằm ngoài optimizer
-  # là một tensor đứng yên suốt 200 bước mà không có gì báo. Optimizer đặt lr
-  # theo TÊN nhóm, không theo chỉ số.
-  #
-  # LoRA của decoder vẫn chạy ĐÚNG lịch one-cycle của $1 (khối `train.schedule`).
+  # MASK REGULARIZATION: mỗi lần cập nhật trọng số (mỗi optimizer step) che
+  # ngẫu nhiên `z_mask_frac` token Z (attention_mask = 0 tại đó) để ép Q phải
+  # tham gia sâu vào quá trình sinh text. MỘT mặt nạ cho cả step (mọi micro-batch
+  # trong grad_accum dùng chung), tái lập từ (seed, step). Chỉ ở train — val CE,
+  # sinh và Lens thấy đủ Z. 0 = tắt.
   main:
-    align_ffn_lr_min: 1.0e-7    # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này)
-    align_ffn_lr_main: 1.0e-4   # lr PHẲNG sau warm-up
-    align_attn_lr_min: 1.0e-8
-    align_attn_lr_main: 1.0e-5
-    align_warmup_frac: 0.10     # 10% tổng bước (= 20/200), dùng cho CẢ hai nhóm
-    align_wd: 0.01
+    cna_ffn_lr_min: 1.0e-7      # ĐẦU dốc warm-up (bước 0 có ĐÚNG số này)
+    cna_ffn_lr_main: 1.0e-4     # lr PHẲNG sau warm-up
+    cna_self_lr_min: 1.0e-8
+    cna_self_lr_main: 1.0e-5
+    cna_cross_lr_min: 4.0e-8
+    cna_cross_lr_main: 4.0e-5
+    cna_warmup_frac: 0.10       # 10% tổng bước, dùng cho CẢ ba nhóm
+    cna_wd: 0.01
+    z_mask_frac: 0.25           # che 25% token Z mỗi weight update
     separate_clip: true         # clip_grad_norm_ riêng LoRA / nhánh
 
-# ── Stage 1: COMPRESSOR TRANSFER LEARNING — `src/stage1_vextractor.py` ───────
-# Compressor học từ teacher của Stage 0, teacher ĐÓNG BĂNG HOÀN TOÀN và sinh
-# nhãn chuẩn DINOv3:
-#
-#   view_t ─► Extractor(0) ─► pool ─► DINO head(0) ───────────► t_raw   [ĐỨNG YÊN]
-#   view_s ─► Extractor(0) ─► Compressor ─► mean(V_c) ─► head MỚI ─► s_raw
-#   loss = CE( softmax((t_raw − center)/τ_t) ‖ log_softmax(s_raw/τ_s) )
-#
-# Mục tiêu: LÀM GIÀU không gian Compressor TRƯỚC khi đưa vào Aligner. Ở main
-# stage ba khối cùng động; nếu Compressor còn ngẫu nhiên ở bước 0 thì 200 bước
-# của main stage phải vừa học nén ảnh vừa học viết báo cáo.
-#
-# KHÔNG có EMA ở đây. Ở Stage 0 teacher là trung bình trượt của student và cặp
-# EMA + centering giữ DINO khỏi sụp; ở Stage 1 teacher là một CHECKPOINT, nên
-# với một ảnh thì đích KHÔNG ĐỔI suốt giai đoạn và không có gì để sụp. Centering
-# và sharpening vẫn giữ, nhưng để định HÌNH DẠNG của đích.
-#
-# HAI view, và đúng hai: teacher một global 448², student một global 448² KHÁC
-# (augment khác). Multi-crop của Stage 0 vô nghĩa ở đây — teacher đứng yên nên
-# thêm view chỉ là tính lại cùng một đích; và `patches()` đòi đúng 196 ô nên
-# local crop 224² sẽ bị TỪ CHỐI ồn ào chứ không lặng lẽ chạy trên lưới thô hơn.
-#
-# MỌI siêu tham số DINO (τ_s/τ_t, centering, prototype, augment) mượn NGUYÊN của
-# `stage0.dino` — khai lại ở đây là để hai giai đoạn chạy hai công thức khác
-# nhau mà không ai thấy. Khối này chỉ khai LỊCH HỌC.
-#
-# HAI nhóm lr, cùng lịch chung nhưng hai CẶP số: warm-up tuyến tính trong
-# `warmup_epochs` epoch rồi GIỮ `lr_max` của từng nhóm tới hết. Ma trận attention
-# quyết định 16 vector ĐỌC Ở ĐÂU trên lưới 196 ô, và đó là thứ dễ hỏng nhất khi
-# bị đẩy nhanh: một bước lớn làm phân phối attention sụp về vài ô rồi không quay
-# lại. FFN chỉ biến đổi thứ đã đọc được, nên nó chịu được một dốc cao hơn.
-# `latent` + mọi RMSNorm + DINO head mới đi theo nhóm FFN (xem
-# `vextractor.Compressor.ffn_parameters`).
-stage1:
-  attn_lr_min: 1.0e-8
-  attn_lr_max: 2.0e-5     # MỨC CHẠY của nhóm attn (không hạ theo lịch)
-  ffn_lr_min: 1.0e-7
-  ffn_lr_max: 2.0e-4      # MỨC CHẠY của nhóm ffn
-  warmup_epochs: 1.0      # độ dài dốc warm-up (epoch), rồi GIỮ lr_max tới hết
-  max_epochs: 30          # TRẦN, không phải số epoch sẽ chạy — patience quyết
-  # CHẶNG 5, giống hệt Stage 0: mỗi epoch val không cải thiện thì CẢ HAI nhóm
-  # (attn và ffn) chia cho số này, sàn là `lr_min` của từng nhóm. MỘT bộ đếm
-  # chung cho hai nhóm, vì val là MỘT con số — không có cách nào nói nhóm nào
-  # làm nó xấu đi, nên tách hai bộ đếm là bịa ra một tín hiệu không tồn tại.
-  plateau_gamma: 1.5
-  patience: 4             # epoch LIÊN TIẾP val không cải thiện thì dừng phần lịch
-  tail_epochs: 1          # rồi chạy thêm ngần này epoch cosine về lr_min của
-                          # TỪNG nhóm, RỒI MỚI lấy best val
-  min_delta: 0.0
-  weight_decay: 0.03
-  # batch HIỆU DỤNG (của riêng Stage 1). `micro_batch` / `probe_sizes` là khoá
-  # PHẦN CỨNG và nằm ở configs/gpu/<card>.yaml — khai chúng ở đây thì bị config
-  # GPU đè im lặng, nên `load_config` DỪNG.
-  batch_size: 32
-  max_grad_norm: 1.0
-  val_n_samples: 256      # val CỐ ĐỊNH (val_resample: false) -> đường val chỉ
-  val_resample: false     # phụ thuộc trọng số, không phụ thuộc lần bốc mẫu
-
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
-# Chỉ fine-tune Twins-SVT-S trên ảnh MIMIC-CXR bằng loss tự giám sát.
+# Chỉ fine-tune Extractor (MaxViT-T 384) trên ảnh MIMIC-CXR bằng loss tự giám sát.
 # `pretrained: true` nạp trọng số backbone; DINO head, optimizer và center tạo mới.
 # Student xem global + local crops; teacher EMA chỉ xem hai global crops.
 # Checkpoint lưu ra là teacher EMA được chọn theo validation.
 # LỊCH CHUNG (`src/schedule.py`) — HAI chặng, cộng một hệ số nhân:
-#   1. warm-up tuyến tính 1e-8 -> 2e-5   `warmup_epochs` (1) epoch ĐẦU (200 bước)
-#   2. GIỮ 2e-5                          49 EPOCH CÒN LẠI
-#   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (1,5),
+#   1. warm-up tuyến tính 1e-7 -> 1e-5   `warmup_epochs` (1) epoch ĐẦU (200 bước)
+#   2. GIỮ 1e-5                          phần còn lại (trần 50 epoch)
+#   5. mỗi epoch val KHÔNG cải thiện     -> lr hiện tại ÷ `plateau_gamma` (1,25),
 #                                           sàn `lr_min`; val cải thiện thì
 #                                           GIỮ NGUYÊN (không leo lại)
 #
@@ -472,8 +395,8 @@ stage0:
   # hằng số vào giữa một lịch mà người chạy tin là mình đã khai đủ.
   # lr_min là BA thứ cùng lúc, nên đừng đọc nó chỉ như "lr nhỏ nhất": đầu dốc
   # warm-up (bước 0 có ĐÚNG số này), SÀN của chặng 5, và ĐÁY của epoch đuôi.
-  lr_min: 1.0e-8
-  lr_max: 2.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
+  lr_min: 1.0e-7
+  lr_max: 1.0e-5            # MỨC CHẠY sau warm-up (giữ tới hết)
   warmup_epochs: 1.0        # độ dài dốc warm-up (epoch). Xem chú thích trên.
   max_epochs: 50            # TRẦN thật sự của giai đoạn
   # CHẶNG 5 — "Nếu patient tăng 1, decay lr hiện tại. Nếu không thì duy
@@ -486,25 +409,23 @@ stage0:
   # đếm TỔNG số epoch hỏng và không bao giờ reset (nó quyết định LR). Gộp chúng
   # là để lr leo lại mỗi lần val khá lên — đúng thứ "duy trì lr" loại bỏ.
   #
-  # 1,5 là một bước NHỎ, và đó là chủ ý: nó chia quãng đường tới sàn thành
-  # NHIỀU nấc (2e-5 -> 1e-8 là 19 lần chia, thay vì 7 lần ở hệ số 3), nên lr hạ
-  # dần theo đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại,
-  # một chuỗi hỏng ngắn gần như không đụng tới lr — với `patience` = 4 thì tới
-  # lúc dừng lr mới chỉ còn 1/1,5⁴ ≈ 20% mức chạy (hệ số 3 cho 1,2%).
+  # 1,25 là một bước NHỎ, và đó là chủ ý: nó chia quãng đường tới sàn thành
+  # NHIỀU nấc (1e-5 -> 1e-7 là ~21 lần chia), nên lr hạ dần theo đúng nhịp val
+  # xấu đi thay vì rơi hẳn sau vài epoch hỏng. Với `patience` = 4 thì tới lúc
+  # dừng lr còn 1/1,25⁴ ≈ 41% mức chạy, rồi epoch đuôi cosine về `lr_min`.
   #
   # 1.0 = TẮT chặng 5. Đây mới là khoá để tắt nó, KHÔNG phải `patience: 0`
   # (patience chỉ gác việc dừng sớm).
-  plateau_gamma: 1.5
+  plateau_gamma: 1.25
   weight_decay: 0.03
   # ── dừng sớm ───────────────────────────────────────────────────────────
   # Sau MỖI epoch đo val. `patience` epoch LIÊN TIẾP mà `val_score`
   # (= −loss DINO trên val cố định) không vượt kỷ lục quá `min_delta` thì DỪNG
   # phần theo lịch. 0 = tắt (chạy đủ `max_epochs`, không có đuôi).
-  # ĐỒNG BỘ với stage1: cả hai giai đoạn cùng chờ 4 epoch.
   patience: 4
   tail_epochs: 1            # epoch cosine về lr_min sau khi patience hết
   min_delta: 0.0
-  # Checkpoint đem sang Stage 1 = epoch TỐT NHẤT theo val. `patience` +
+  # Checkpoint đem sang main stage = epoch TỐT NHẤT theo val. `patience` +
   # `select: last` bị TỪ CHỐI: dừng vì val hết cải thiện rồi lại lấy đúng epoch
   # cuối của cửa sổ chờ là tự phủ định chính nó.
   select: best
@@ -520,10 +441,10 @@ stage0:
                             # tăng cường ngẫu nhiên của DINO vốn đã ồn.
   # ── Hàm mục tiêu tự giám sát ───────────────────────────────────────────
   dino:
-    global_size: 448        # = image_size của nhánh; teacher CHỈ thấy các view này
+    global_size: 384        # = image_size của nhánh; teacher CHỈ thấy các view này
     global_scale: [0.4, 1.0]
-    local_size: 224         # Twins nuốt cỡ này trên ĐÚNG một state_dict (lưới 7×7;
-                            # PEG là tích chập, lưới chia hết cửa sổ LSA 7×7)
+    local_size: 384         # MaxViT-T 384 (cửa sổ 12×12) CHỈ chạy ở bội của 384:
+                            # local crop cắt vùng nhỏ (local_scale) rồi resize lên 384²
     local_scale: [0.05, 0.4]
     n_local: 6              # số local crop. 0 = tắt multi-crop
     # nhiều prototype hơn số ảnh chỉ làm phân phối teacher thưa hơn chứ không
@@ -532,11 +453,16 @@ stage0:
     hidden: 2048
     bottleneck: 256
     head_layers: 3
-    # cls | mean. Twins KHÔNG có cls token -> `mean` (trung bình lưới) là
+    # cls | mean. MaxViT KHÔNG có cls token -> `mean` (trung bình lưới) là
     # lựa chọn duy nhất chạy được, và `pool: cls` bị TỪ CHỐI ngay lúc dựng
     # backbone chứ không tự rơi về mean: config nói một đằng chạy một nẻo là thứ
     # không bao giờ tự lộ ra.
     pool: mean
+    # MaxViT dùng BatchNorm trong MBConv. true = giữ MỌI BN (student + teacher)
+    # ở eval suốt Stage 0: thống kê chạy giữ của pretrain (không bị local crop
+    # và micro-batch nhỏ kéo lệch), γ/β vẫn học. Main stage chạy teacher ở
+    # eval nên đọc ĐÚNG thống kê này.
+    freeze_bn: true
     # τ_t PHẢI nhỏ hơn τ_s (sharpening) — đảo dấu bị TỪ CHỐI. Cùng với centering
     # đây là hai lực đẩy ngược nhau giữ DINO khỏi sụp.
     student_temp: 0.1
@@ -611,7 +537,7 @@ wandb:
   group: "vextractor-q"
   resume_same_run: false
   mode: online
-  tags: [vextractor, twins-svt-s, qlora, r32, mimic-cxr]
+  tags: [vextractor, maxvit-t-384, cna-qformer, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20

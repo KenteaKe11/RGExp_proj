@@ -203,14 +203,6 @@ def local_plan(cfg: Cfg, run_dir: Path, arms: list[str],
             f = s0 / rel
             if f.is_file():
                 out.append((f"{base}/stage0/{rel}", f, "stage0"))
-    s1 = Path(o["adapter_dir"]) / "_stage1"
-    if s1.exists():
-        from .stage1_vextractor import KEEP as KEEP1
-
-        for rel in KEEP1:
-            f = s1 / rel
-            if f.is_file():
-                out.append((f"{base}/stage1/{rel}", f, "stage0"))
     root = Path(o["adapter_dir"])
     for aid in arms:
         for name in WEIGHT_FILES:

@@ -41,11 +41,11 @@ import pandas as pd
 from .config import Cfg, add_common_args, load_config, resolved_snapshot, seed_everything
 
 COMMANDS = {
-    "train": ["data", "stage0", "stage1", "train", "infer", "score"],
+    "train": ["data", "stage0", "train", "infer", "score"],
     "stats": ["stats", "report"],
     "lens": ["lens"],
     "push": ["push"],
-    "all": ["data", "stage0", "stage1", "train", "infer", "score", "stats", "report", "push"],
+    "all": ["data", "stage0", "train", "infer", "score", "stats", "report", "push"],
 }
 
 
@@ -336,9 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stages", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restage0", action="store_true",
-                    help="chạy lại Stage 0 — DINO tự giám sát (+ --restage1 + --retrain)")
-    ap.add_argument("--restage1", action="store_true",
-                    help="chạy lại Stage 1 — chuyển giao Compressor (+ --retrain)")
+                    help="chạy lại Stage 0 — DINO tự giám sát (+ --retrain)")
     ap.add_argument("--retrain-all", action="store_true",
                     help="huấn luyện lại TOÀN BỘ B: Stage 0 + main + sinh + chấm, bỏ qua "
                          "mọi thứ đã có (= vextractor_exp.retrain_all: true). A ($1) không đổi.")
@@ -359,15 +357,13 @@ def main(argv: list[str] | None = None) -> int:
     if bool(dict(cfg.get("vextractor_exp") or {}).get("retrain_all", False)):
         a.retrain_all = True
     if a.retrain_all:
-        a.restage0 = a.restage1 = a.retrain = a.rescore = True
+        a.restage0 = a.retrain = a.rescore = True
         print("⚙ RETRAIN-ALL: Stage 0 + main stage + sinh + chấm của B chạy lại từ đầu; "
               "không kéo Stage 0 / weight / kết quả B từ Hub. A ($1) giữ nguyên.",
               flush=True)
     if a.restage0:
-        # Đổi Extractor/teacher là đổi NHÃN của Stage 1 — Compressor cũ học
-        # từ một teacher không còn tồn tại, nên Stage 1 phải chạy lại theo.
-        a.restage1 = a.retrain = True
-    if a.restage1:
+        # Đổi Extractor là đổi đầu vào của CnA — CnA học ở main stage từ Extractor
+        # cũ không còn tồn tại, nên main stage phải chạy lại theo.
         a.retrain = True
     try:
         A, B = arms_of(cfg)
@@ -392,8 +388,6 @@ def main(argv: list[str] | None = None) -> int:
         # ĐÚNG 1 epoch: `base_epochs = ceil(warmup_epochs) + max_epochs`.
         cfg["stage0"] = dict(cfg["stage0"], max_epochs=1, warmup_epochs=1.0,
                              patience=0, tail_epochs=0)
-        cfg["stage1"] = dict(cfg.get("stage1") or {}, max_epochs=1,
-                             warmup_epochs=1.0, patience=0, tail_epochs=0)
         cfg["stats"] = dict(cfg["stats"], n_perm=200, n_boot=200)
         cfg["output"] = dict(cfg["output"], push=False, pull=False,
                              subdir=cfg["output"]["subdir"] + "_dryrun",
@@ -402,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg["train"]["_pad_to_max"] = True
         cfg["wandb"]["tags"] = list(cfg["wandb"].get("tags") or []) + ["dry-run"]
         dry_steps = 4
-        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · Stage 0/1 1 epoch ≤ 2 bước · "
+        print("⚙ DRY-RUN: 8 ảnh test · 16 mẫu train · Stage 0 1 epoch ≤ 2 bước · "
               "main 4 bước · không kéo/đẩy Hub · chuỗi đệm tới max_seq_len.", flush=True)
     if a.no_wandb or a.command in ("push", "stats"):
         cfg["wandb"]["enabled"] = False
@@ -421,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
                      "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = "
-                                 "Aligner(Compressor(Extractor(ảnh 448²))) (B)"})
+                                 "CnA(Extractor(ảnh 384²)) (B)"})
     manifest.setdefault("commands", {})[a.command] = datetime.now(
         timezone.utc).isoformat(timespec="seconds")
 
@@ -433,7 +427,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n═══ §2.2 V-Extractor — lệnh `{a.command}` ({', '.join(stages)}) ═══", flush=True)
     print(f"  A {A['id']:<26} {A['source']} (không huấn luyện lại)\n"
           f"  B {B['id']:<26} A + nhánh thị giác (Extractor = teacher EMA của "
-          f"Stage 0 -> Compressor (Stage 1) -> Aligner -> Q; chuỗi [Z ‖ Q ‖ T])",
+          f"Stage 0 -> CnA (QFormer + Linear) -> V_c; chuỗi [Z ‖ V_c ‖ T], "
+          f"che 25% Z khi huấn luyện)",
           flush=True)
     rc = 0
     if set(stages) & set(COMMANDS["train"]):
@@ -457,7 +452,6 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     from . import fixture as fx_mod
     from . import imaging
     from . import stage0_vextractor as s0
-    from . import stage1_vextractor as s1
     from . import train_vextractor as tz
     from .backbone import TrainUnusable
     from .hw import cpu_budget, io_workers, set_torch_threads
@@ -513,9 +507,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
     # data,stage0`), hoặc buộc chạy lại (`--restage0`).
     need_stage0 = "stage0" in stages and (
         need_train or a.restage0 or s0.finished(cfg) is None)
-    need_stage1 = "stage1" in stages and (
-        need_train or a.restage1 or s1.finished(cfg) is None)
-    need_images = need_train or need_infer or need_stage0 or need_stage1
+    need_images = need_train or need_infer or need_stage0
 
     tracker = Tracker(cfg, run_id=manifest["run_id"], config_snapshot=manifest["config"])
     if tracker.url:
@@ -587,33 +579,6 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         if ran_stage0 and not a.dry_run:
             push_stage0(cfg, run_dir, "Stage 0 final")
 
-    # ── Stage 1 — chuyển giao Extractor ─────────────────────────────────
-    s1dir = s1.stage1_dir(cfg)
-    if need_stage1:
-        done = None if a.restage1 else s1.finished(cfg)
-        if done is not None:
-            print(f"  ✓ Stage 1 đã xong: epoch {done.get('best_epoch')} · score "
-                  f"{done.get('best_score')} ({s1dir / s1.CKPT})", flush=True)
-        else:
-            why = s1.diff_inputs(cfg)
-            if not a.restage1 and (s1dir / s1.HISTORY).exists():
-                print(f"  ⚙ Stage 1 chạy lại — chỗ lệch: {', '.join(why)}", flush=True)
-            _hr("Stage 1 — COMPRESSOR: chuyển giao từ teacher Stage 0 (ĐÓNG BĂNG, sinh nhãn)")
-            try:
-                h2 = s1.run(cfg, train_df, val_df, s0dir / s0.CKPT, tracker,
-                            max_steps=2 if a.dry_run else None)
-            except TrainUnusable as e:
-                print(f"\n✗ Stage 1 hỏng: {e}", flush=True)
-                tracker.finish(1)
-                return 3
-            manifest["stage1"] = {k: h2.get(k) for k in
-                                   ("best_epoch", "best_score", "minutes")}
-            save()
-    h1 = s1.HISTORY
-    if (s1dir / h1).exists():
-        (run_dir / "stage1").mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(s1dir / h1, run_dir / "stage1" / h1)
-
     # ── main stage B ──────────────────────────────────────────────────────
     if need_train:
         _hr(f"Main stage — {B['name']}")
@@ -629,8 +594,7 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
         preset = preset_for(c, B)
         try:
             st = tz.train_arm(c, B, preset, train_df, b_dir, s0dir / s0.CKPT, tracker,
-                              max_steps_override=dry_steps, val_df=val_df,
-                              stage1_dir=s1dir / s1.CKPT)
+                              max_steps_override=dry_steps, val_df=val_df)
         except TrainUnusable as e:
             print(f"\n✗ {B['id']} KHÔNG huấn luyện được: {e}", flush=True)
             tracker.finish(1)
@@ -793,7 +757,6 @@ def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
     # Chặn TRƯỚC khi nạp fixture + 3000 ảnh: weight B của một kiến trúc khác thì
     # có nạp xong cũng chỉ để `load_branch` ném format ở tận trong ruột.
     from . import stage0_vextractor as s0
-    from . import stage1_vextractor as s1
     from . import train_vextractor as tz
 
     b_dir = arm_weight_dir(cfg, B, adapter_root)

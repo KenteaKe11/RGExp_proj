@@ -1,33 +1,35 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
-    ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = Twins-SVT-S + DINO head ─────┐
+    ảnh CXR ─► multi-crop (2 global 384² + n local 384²)
+            ─► student = MaxViT-T 384 + DINO head ────┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
-`labels.npz`, không F1/Recall. Compressor và Aligner đều KHÔNG có mặt ở đây —
-chúng là của Stage 1 và main stage. Xem `src/dino.py` cho hàm mục tiêu và
+`labels.npz`, không F1/Recall. CnA KHÔNG có mặt ở đây — nó là của main stage. Xem `src/dino.py` cho hàm mục tiêu và
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor là Twins-SVT-S đủ 4 stage (bỏ head phân loại): ~23,55 M trọng số
-(~24,06 M tính cả head 1000 lớp của bản pretrain) + một DINO head, cộng một bản teacher EMA đầy
-đủ nữa trong VRAM. Thứ duy nhất còn cần từ model là `d_model` (2560) để ghi vào
-spec, và nó được đọc từ `AutoConfig` (một file json, không tải trọng số).
+Extractor là MaxViT-T 384 (`maxvit_tiny_tf_384.in1k`) đủ 4 stage, đầu ra chuẩn
+stride 32 (144 token ở 384²), bỏ head phân loại: ~30,46 M trọng số (~30,98 M tính cả head 1000 lớp)
++ một DINO head, cộng một bản teacher EMA đầy đủ nữa trong VRAM. Thứ duy nhất còn
+cần từ decoder là `d_model` (2560) để ghi vào spec, đọc từ `AutoConfig`.
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số Twins-SVT-S (timm `twins_svt_small`); các trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi tạo mới, sau đó extractor tiếp tục học bằng loss tự giám sát trên MIMIC-CXR.
+**Điểm xuất phát:** `pretrained: true` tải trọng số MaxViT-T 384 (ImageNet-1k); các
+trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi
+tạo mới. MaxViT dùng BatchNorm: `stage0.dino.freeze_bn` (mặc định true) giữ thống
+kê chạy của BN cố định suốt Stage 0 (xem `src/dino.py`).
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
 Lịch CHUNG của `src/schedule.py` — HAI chặng, cộng một hệ số nhân:
 
-    1. warm-up tuyến tính `lr_min` (1e-8) -> `lr_max` (2e-5)   1 epoch ĐẦU
+    1. warm-up tuyến tính `lr_min` (1e-7) -> `lr_max` (1e-5)   1 epoch ĐẦU
     2. GIỮ `lr_max`                                            49 epoch còn lại
-    5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (1,5),
+    5. mỗi epoch val KHÔNG cải thiện -> lr hiện tại ÷ `plateau_gamma` (1,25),
        sàn `lr_min`; val cải thiện thì GIỮ NGUYÊN (không leo lại)
 
-Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-8 lên 2e-5, rồi
-giữ 2e-5 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
+Với 6400 mẫu và batch 32 (200 bước/epoch): dốc 200 bước từ 1e-7 lên 1e-5, rồi
+giữ 1e-5 cho tới lúc dừng. **`lr_max` là mức chạy**, và thứ duy nhất kéo nó
 xuống là chặng 5 — tức là chính đường val, không phải một lịch định trước.
 Không có `lr_main` nào trong lịch chung nữa.
 
@@ -40,7 +42,7 @@ hỏng LIÊN TIẾP và reset mỗi lần val khá lên — nó quyết định 
 Gộp chúng là để lr leo lại mỗi lần val khá lên, đúng thứ "duy trì lr" loại bỏ.
 Muốn tắt chặng 5 thì đặt `plateau_gamma: 1.0`, không phải `patience: 0`.
 
-**Dừng sớm, và cái ĐUÔI của nó.** `patience` = 3 epoch LIÊN TIẾP val không cải
+**Dừng sớm, và cái ĐUÔI của nó.** `patience` = 4 epoch LIÊN TIẾP val không cải
 thiện thì phần theo lịch dừng — nhưng giai đoạn chưa kết thúc: nó chạy THÊM một
 epoch "hạ cánh", cosine từ lr ĐANG chạy (tức đã gồm mọi lần chia của chặng 5)
 về `lr_min`, rồi MỚI lấy checkpoint tốt nhất theo val. Epoch đuôi ấy cho trọng
@@ -58,11 +60,10 @@ dùng RNG tăng cường CỐ ĐỊNH theo (seed, chỉ số mẫu), không theo
 ═══ TRÊN ĐĨA ══════════════════════════════════════════════════════════════════
 
     base/   checkpoint TỐT NHẤT của phần theo lịch — đẩy Hub ngay khi phần ấy xong
-    final/  checkpoint TỐT NHẤT sau cả epoch đuôi — Stage 1 và main stage dùng bản NÀY
+    final/  checkpoint TỐT NHẤT sau cả epoch đuôi — main stage dùng bản NÀY
 
 Không có đuôi thì `final/` trùng `base/` từng bit. Cả hai là trọng số **TEACHER
-(EMA)**, kèm `dino_head.safetensors` của teacher (Stage 1 cần đúng phân phối
-prototype mà Stage 0 đã dạy).
+(EMA)**, kèm `dino_head.safetensors` của teacher (giàn giáo, chỉ để chạy tiếp / tra cứu).
 """
 
 from __future__ import annotations
@@ -86,11 +87,8 @@ DIRNAME = "_stage0"
 HISTORY = "stage0_history.json"
 LOADER = "loader.json"                  # như _fixture/loader.json của $1
 BASE = "base"                           # tốt nhất của phần theo lịch — đẩy Hub ngay
-CKPT = "final"                          # tốt nhất sau epoch đuôi — dùng ở Stage 1 + main
-# `dino_head.safetensors` ĐI CÙNG: Stage 1 chưng cất từ ĐÚNG phân phối prototype
-# mà Stage 0 đã dạy, và phân phối ấy là head(pool(Extractor(x))). Thiếu nó trên
-# một máy khác thì Stage 1 ở đó chạy với một head ngẫu nhiên — vẫn học được,
-# nhưng không còn là cùng một thí nghiệm.
+CKPT = "final"                          # tốt nhất sau epoch đuôi — dùng ở main stage
+# `dino_head.safetensors` ĐI CÙNG để Stage 0 chạy tiếp được trên máy khác.
 KEEP = (f"{BASE}/{Z.STAGE0_FILE}", f"{BASE}/{Z.STAGE0_META}",
         f"{BASE}/{Z.DINO_HEAD_FILE}",
         f"{CKPT}/{Z.STAGE0_FILE}", f"{CKPT}/{Z.STAGE0_META}",
@@ -123,8 +121,8 @@ def s0cfg(cfg: Cfg) -> dict:
     out = {
         # HAI đỉnh của lịch chung (src/schedule.py). `lr_max` là MỨC CHẠY, không
         # phải một đỉnh tạm rồi hạ: thứ duy nhất kéo nó xuống là chặng 5.
-        "lr_min": float(s.get("lr_min", 1e-8)),
-        "lr_max": float(s.get("lr_max", 2e-5)),
+        "lr_min": float(s.get("lr_min", 1e-7)),
+        "lr_max": float(s.get("lr_max", 1e-5)),
         # Độ dài dốc warm-up, tính bằng EPOCH. KHÔNG phải độ dài giai đoạn —
         # đó là `max_epochs`.
         "warmup_epochs": float(s.get("warmup_epochs", 1.0)),
@@ -146,7 +144,7 @@ def s0cfg(cfg: Cfg) -> dict:
         # nhân số lượt forward lên (2 + n_local) lần.
         "probe_sizes": [int(x) for x in (s.get("probe_sizes") or [4, 8, 16])],
         "max_grad_norm": float(s.get("max_grad_norm", 1.0)),
-        # epoch đem sang Stage 1: best (theo val) | last (luôn epoch cuối).
+        # epoch đem sang main stage: best (theo val) | last (luôn epoch cuối).
         "select": str(s.get("select", "best")).lower(),
         "val_n_samples": int(s.get("val_n_samples", 256) or 0),
         "val_resample": bool(s.get("val_resample", False)),
@@ -218,8 +216,8 @@ def dino_cfg(s: dict) -> dict:
     d = dict(s.get("dino") or {})
     a = dict(d.get("aug") or {})
     out = {
-        "global_size": int(d.get("global_size", 448)),
-        "local_size": int(d.get("local_size", 224)),
+        "global_size": int(d.get("global_size", 384)),
+        "local_size": int(d.get("local_size", 384)),
         "n_local": int(d.get("n_local", 6)),
         "global_scale": [float(x) for x in (d.get("global_scale") or [0.4, 1.0])],
         "local_scale": [float(x) for x in (d.get("local_scale") or [0.05, 0.4])],
@@ -227,9 +225,11 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # Twins-SVT KHÔNG có cls token -> `mean` là lựa chọn duy nhất chạy được,
-        # và `cls` bị từ chối ngay lúc dựng backbone chứ không tự rơi về mean.
+        # MaxViT trả LƯỚI (NCHW), KHÔNG có cls token -> `mean` là lựa chọn duy
+        # nhất chạy được, và `cls` bị từ chối ngay lúc dựng backbone.
         "pool": str(d.get("pool", "mean")),
+        # Giữ BatchNorm (MaxViT) ở eval suốt Stage 0 — xem `src/dino.py`.
+        "freeze_bn": bool(d.get("freeze_bn", True)),
         "student_temp": float(d.get("student_temp", 0.1)),
         "teacher_temp": float(d.get("teacher_temp", 0.04)),
         "teacher_temp_start": float(d.get("teacher_temp_start", 0.04)),
@@ -320,7 +320,7 @@ def set_group_lrs(opt, lr: float) -> float:
 def _backbone_cfg(cfg: Cfg) -> dict:
     """Phần của khối `vextractor` mà Stage 0 THẬT SỰ phụ thuộc vào.
 
-    Stage 0 chỉ dựng Extractor + một DINO head; Compressor và Aligner không có
+    Stage 0 chỉ dựng Extractor + một DINO head; CnA không có
     mặt ở đây. Nên `n_query`, `d_latent`, `head_dim`, cả khối `compressor`,
     `aligner` lẫn `main` KHÔNG được vào vân tay: đổi chúng mà bắt chạy lại một
     lượt DINO nhiều giờ là bắt trả tiền cho một thứ không đổi một tensor nào.
@@ -333,7 +333,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số Twins không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số MaxViT không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}
@@ -460,7 +460,7 @@ def finished(cfg: Cfg) -> dict | None:
               f"    Stage 0 phụ thuộc: khối `stage0` (trừ micro_batch / "
               f"probe_sizes), phần BACKBONE của khối `vextractor` "
               f"({', '.join(Z.BACKBONE_CFG_KEYS)}) và `seed`. KHÔNG gồm "
-              f"compressor / aligner / main.", flush=True)
+              f"cna / main.", flush=True)
         return None
     return h
 
@@ -469,7 +469,7 @@ def finished(cfg: Cfg) -> dict | None:
 class ImageOnlyDataset:
     """[image_path] -> multi-crop của DINO. KHÔNG nhãn.
 
-    `pixels(i)` vẫn dựng ảnh 448² KHÔNG tăng cường bằng `Z.vext_tensor` — đó là
+    `pixels(i)` vẫn dựng ảnh 384² KHÔNG tăng cường bằng `Z.vext_tensor` — đó là
     thứ `assert_same_pixels` so với main stage, và là chỗ duy nhất phép chuẩn
     hoá của các giai đoạn gặp nhau.
 
@@ -499,7 +499,7 @@ class ImageOnlyDataset:
         self.epoch = int(ep)
 
     def pixels(self, i: int):
-        """Ảnh 448² KHÔNG tăng cường — chỉ để `assert_same_pixels` đối chiếu."""
+        """Ảnh 384² KHÔNG tăng cường — chỉ để `assert_same_pixels` đối chiếu."""
         return Z.vext_tensor(self.df.iloc[i]["image_path"], self.image_size,
                              self.mean, self.std)
 
@@ -572,7 +572,7 @@ def decoder_width(cfg: Cfg) -> int:
             return int(o)
     raise TrainUnusable(
         f"không đọc được hidden_size của {cfg['base']['hf_id']} từ AutoConfig — "
-        f"nhánh cần biết chiều embedding của decoder để dựng Aligner.")
+        f"nhánh cần biết chiều embedding của decoder để dựng CnA.")
 
 
 # ── chạy ───────────────────────────────────────────────────────────────────
@@ -608,7 +608,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not spec["extractor"]["pretrained"]:
         raise TrainUnusable(
             "vextractor.extractor.pretrained = false: Stage 0 requires "
-            "pretrained Twins-SVT-S weights.")
+            "pretrained MaxViT-T weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 
@@ -623,7 +623,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     bs_eff = sc["batch_size"]
     steps_per_epoch = math.ceil(n / bs_eff)
 
-    # CHỈ Extractor — không Compressor, không Aligner, không Cls Head.
+    # CHỈ Extractor — không CnA, không Cls Head.
     (body, d_feat, n_patch, n_use, kind, fmt, multi_res,
      n_stage_use) = Z.build_backbone(spec)
     n_prefix = 0 if kind == "conv" else int(getattr(body, "num_prefix_tokens", 0))
@@ -632,18 +632,28 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if (kind == "conv" or n_prefix == 0) and dc["pool"] == "cls":
         raise TrainUnusable(
             f"stage0.dino.pool = 'cls' nhưng {spec['extractor']['arch']!r} trả "
-            f"một LƯỚI/chuỗi ({fmt}) và KHÔNG có cls token nào. Twins, ConvNeXt, SwinV2 "
+            f"một LƯỚI/chuỗi ({fmt}) và KHÔNG có cls token nào. MaxViT, ConvNeXt, SwinV2 "
             f"đều vậy — đặt `stage0.dino.pool: mean`.\n"
             f"    Không tự rơi về 'mean': config nói một đằng mà chạy một nẻo "
             f"là thứ không bao giờ tự lộ ra.")
-    if dc["n_local"] > 0 and not multi_res:
+    # Local crop chạy ĐÚNG cỡ `local_size`. Cùng cỡ với ảnh nhánh thì không cần
+    # gì thêm; khác cỡ thì phải probe THẬT ở cỡ ấy — MaxViT-T 384 (cửa sổ 12×12)
+    # chết ở mọi cỡ không phải bội của 384, nên `multi_res` (nửa độ phân giải)
+    # không trả lời được câu hỏi cho một cỡ bất kỳ.
+    local_ok = dc["local_size"] == img_size
+    if dc["n_local"] > 0 and not local_ok:
+        try:
+            Z._probe_features(body, dc["local_size"])
+            local_ok = True
+        except Exception:  # noqa: BLE001
+            local_ok = False
+    if dc["n_local"] > 0 and not local_ok:
         raise TrainUnusable(
             f"{spec['extractor']['arch']!r} KHÔNG chạy được ở "
-            f"{img_size // 2}² (nửa độ phân giải), nên multi-crop với "
-            f"{dc['n_local']} local crop {dc['local_size']}² sẽ chết ở lượt "
-            f"forward đầu tiên.\n"
-            f"    Đặt `stage0.dino.n_local: 0`, hoặc đổi sang backbone chạy "
-            f"được nhiều độ phân giải.")
+            f"{dc['local_size']}², nên multi-crop với {dc['n_local']} local "
+            f"crop sẽ chết ở lượt forward đầu tiên.\n"
+            f"    Đặt `stage0.dino.local_size: {img_size}` (cắt vùng nhỏ rồi "
+            f"resize lên cỡ ảnh nhánh), hoặc `stage0.dino.n_local: 0`.")
     block = D.DinoTrainer(body, d_feat, n_prefix, dc, fmt).to(dev)  # fp32 + autocast
     opt = torch.optim.AdamW(
         block.param_groups(sc["lr_min"], sc["lr_min"]),
@@ -870,8 +880,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
                       {"phase": phase, "best_epoch": ep, "best_score": ev["score"],
                        "val": ev, "best_val_loss": ev["loss"],
                        "weights": "teacher_ema", **extra})
-        # DINO head TEACHER đi CÙNG checkpoint: Stage 1 cần đúng phân phối
-        # prototype mà Stage 0 đã dạy (xem `Z.save_dino_head`).
+        # DINO head TEACHER đi CÙNG checkpoint (giàn giáo; xem `Z.save_dino_head`).
         Z.save_dino_head(block.teacher_head, where)
 
     # ══ phần theo lịch ═════════════════════════════════════════════════════
@@ -1164,17 +1173,18 @@ def write_loader(cfg: Cfg, d: Path, train_df, val_df,
         "spec": spec,
         "vision": {"extractor": spec["extractor"]["arch"],
                    "pretrained": spec["extractor"]["pretrained"],
-                   "norm": "LayerNorm (không BatchNorm, không thống kê chạy)",
+                   "norm": ("BatchNorm (MBConv) ĐÓNG BĂNG thống kê chạy + "
+                            "LayerNorm (attention)" if sc["dino"].get("freeze_bn")
+                            else "BatchNorm (MBConv, thống kê chạy CẬP NHẬT) + "
+                                 "LayerNorm (attention)"),
                    "image_size": spec["extractor"]["image_size"],
                    # ĐÚNG mean/std đi kèm trọng số của checkpoint.
                    "normalize": dict(spec["extractor"]["normalize"]),
                    "n_stages": spec["extractor"].get("n_stages"),
-                   "compressor": dict(spec["compressor"]),
-                   "aligner": dict(spec["aligner"]),
-                   "note": "Stage 0 CHỈ huấn luyện Extractor (DINO tự giám sát, "
-                           "tự giám sát). Compressor là của Stage 1, Aligner là "
-                           "của MAIN STAGE. Stage 0 KHÔNG nạp Gemma; d_model "
-                           "đọc từ AutoConfig",
+                   "cna": dict(spec["cna"]),
+                   "note": "Stage 0 CHỈ huấn luyện Extractor (DINO tự giám sát). "
+                           "CnA là của MAIN STAGE. Stage 0 KHÔNG nạp Gemma; "
+                           "d_model đọc từ AutoConfig",
                    "decoder_hf_id": cfg["base"]["hf_id"],
                    "d_model": int(spec["d_model"])},
         "best": best, "weights": files,

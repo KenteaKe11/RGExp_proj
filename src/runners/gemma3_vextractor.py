@@ -17,7 +17,7 @@ Ba chỗ phải đúng, không chỗ nào tự lộ ra nếu sai:
   2. Candidate B mà thiếu file nhánh thì DỪNG. Nạp adapter đúng mà không có 256
      vector Q là chấm candidate A rồi dán nhãn B lên kết quả.
   2b. Ảnh đi HAI đường: `pixel_values` 896 của processor cho Z, và
-     `vext_pixels` 448² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh
+     `vext_pixels` 384² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh
      (mean/std lấy từ META của nhánh — `branch.normalize`). Đường thứ hai dựng ở
      `prepare_batch` bằng ĐÚNG `vextractor.vext_tensor` mà Stage 0 và main stage
      dùng — hai phép tiền xử lý khác nhau ở hai khâu là cách chắc chắn nhất để
@@ -43,7 +43,7 @@ from .gemma3_adapter import Gemma3AdapterRunner
 class Gemma3VExtractorRunner(Gemma3AdapterRunner):
     name = "gemma3_vextractor"
 
-    branch = None           # §2.2: ảnh 448² -> ViT-B/16 -> Q (src/vextractor.py)
+    branch = None           # §2.2: ảnh 384² -> MaxViT-T -> CnA -> Q (src/vextractor.py)
     _gemma = None
     _img_token_id = None
 
@@ -194,7 +194,7 @@ class Gemma3VExtractorRunner(Gemma3AdapterRunner):
                 if "vext_pixels" not in inputs:
                     raise RunnerUnusable(
                         "batch thiếu `vext_pixels` — nhánh §2.2 có đường ảnh "
-                        "riêng (448², mean/std của checkpoint), không đọc X "
+                        "riêng (384², mean/std của checkpoint), không đọc X "
                         "của SigLIP.")
                 with RCV.autocast(aligned.device):
                     q = self.branch(inputs["vext_pixels"])

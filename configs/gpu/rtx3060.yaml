@@ -29,17 +29,15 @@ set:
   train.gradient_checkpointing: true
   train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
 
-  # ── Stage 0 + Stage 1 (KHÔNG nạp Gemma) ────────────────────────────────
+  # ── Stage 0 (KHÔNG nạp Gemma) ────────────────────────────────
   # KHÔNG dùng chung gì với main stage. Main stage kéo cả decoder 4B nên mảnh
   # vật lý của nó bị kẹt ở ước của `train_batch` đã khoá theo $1 và KHÔNG được
   # nâng (nó là một phần lịch học của A). Stage 0 thì không có decoder, không
   # có ràng buộc nào từ A — batch hiệu dụng của nó (stage0.batch_size = 32 ở
   # configs/vextractor.yaml) chỉ là con số của riêng nó, và mảnh vật lý được
-  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor ~23,55 M tham số VỚI
+  # phép leo tới tận 32 nếu VRAM cho phép. Nhưng Extractor MaxViT-T ~30,5 M tham số VỚI
   # nhân thêm (2 + n_local) lượt forward của multi-crop, làm
   # activation của Stage 0 nặng rõ — nên 16 chỉ là KHỞI ĐIỂM, autobatch dò lại.
-  # Stage 1 nhẹ hơn hẳn (Extractor chạy no_grad, chỉ Compressor có gradient) và
-  # đọc khoá riêng `stage1.micro_batch` ở configs/vextractor.yaml.
   # nhiều activation hơn hẳn. Đây chỉ là KHỞI ĐIỂM — autobatch dò lại — nhưng
   # khởi điểm quá cao là một lượt OOM trước khi nó dò được.
   stage0.micro_batch: 4           # khởi điểm; autobatch dò lại (ước của 32)
@@ -47,8 +45,6 @@ set:
                                   # autobatch.probe_sizes bên dưới). Đo ở vùng
                                   # nó thật sự chạy thì ngoại suy tới 16/32 mới
                                   # đúng; dùng chung [2,4,8] là luôn ra micro thấp.
-  stage1.micro_batch: 16          # Stage 1 nhẹ hơn Stage 0 (Extractor chạy
-  stage1.probe_sizes: [4, 8, 16]  # no_grad, 2 view thay vì 2 + n_local)
 
   # ── Sinh + chấm ─────────────────────────────────────────────────────────
   base.batch_size: 2              # khởi điểm; autobatch sinh dò lại (khoá chung 4 candidate)

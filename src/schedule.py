@@ -5,14 +5,14 @@ giai đoạn tự cài: lịch ở đây là hàm THUẦN của số bước, n�
 không bao giờ ném lỗi khi lệch nhau — chúng chỉ cho hai đường lr khác nhau, và
 không có gì trong loss báo ra điều đó.
 
-═══ Lịch CHUNG (Stage 0, Stage 1) ═════════════════════════════════════════════
+═══ Lịch CHUNG (Stage 0) ═══════════════════════════════════════════════════════
 
 Hai chặng, cộng một hệ số nhân:
 
     1. warm-up tuyến tính `lr_min` -> `lr_max`   trong `warmup_epochs` (1) epoch
     2. GIỮ `lr_max`                              mọi epoch còn lại
     5. mỗi epoch val KHÔNG cải thiện             -> lr hiện tại ÷ `plateau_gamma`
-                                                    (1,5), sàn `lr_min`
+                                                    (1,25), sàn `lr_min`
 
 Chặng 1 + 2 là `warmup_flat`; chặng 5 là `plateau_lr` nhân lên trên nó. Không
 có chặng "cosine về lr_main" nào trong lịch chung: **`lr_max` là mức chạy**, và
@@ -66,18 +66,14 @@ Main stage chỉ có 1 epoch (200 bước, khoá theo $1), nên đơn vị là B
 không phải epoch, và KHÔNG có chặng 5 (không có đường val nào để nó đọc — val
 của main stage chỉ để nhìn, không chạm vào trọng số).
 
-  * `warmup_flat` — Aligner: dốc `lr_min` -> `lr_main` trong `n_warmup` bước
-    (10% tổng) rồi PHẲNG. Aligner khởi tạo ngẫu nhiên và học CÙNG LoRA từ bước
+  * `warmup_flat` — CnA (3 nhóm ffn/self/cross): dốc `lr_min` -> `lr_main` trong
+    `n_warmup` bước (10% tổng) rồi PHẲNG. CnA khởi tạo ngẫu nhiên và học CÙNG LoRA từ bước
     0, nên nó cần dốc;
-  * `frozen_warmup_flat` — Compressor: trả **0** trong `n_freeze` bước đầu
-    (20% tổng), rồi dốc `lr_min` -> `lr_main` trong `n_warmup` bước (10%), rồi
-    PHẲNG. `0` ở đây là tín hiệu để người gọi đặt `requires_grad=False` —
-    Compressor là khối học được đầu tiên sau Extractor nên tắt grad ở đó cắt
-    hẳn phần backward bên dưới Aligner, tiết kiệm thật chứ không chỉ là không
-    cập nhật.
+  * `frozen_warmup_flat` — di sản của kiến trúc cũ (đóng băng một khối N bước
+    rồi mới warm-up); KHÔNG còn ai gọi, giữ lại như một hàm lịch thuần.
 
 `warmup_flat` phục vụ CẢ HAI chỗ: chặng 1+2 của lịch chung (đơn vị epoch, đỉnh
-là `lr_max`) và dốc của Aligner (đơn vị bước, đỉnh là `lr_main`). Cùng một
+là `lr_max`) và dốc của CnA (đơn vị bước, đỉnh là `lr_main`). Cùng một
 công thức, hai cách khai — và đó là lý do nó chỉ nhận SỐ BƯỚC, để người gọi
 phải tự quy đổi và nói ra mình đang dùng đơn vị nào.
 """
@@ -87,14 +83,14 @@ import math
 
 # Chặng 5: chia lr hiện tại cho ngần này mỗi khi bộ đếm patience tăng 1.
 #
-# 1,5 là một bước NHỎ, và đó là chủ ý: nó chia đôi quãng đường tới sàn thành
-# nhiều nấc (1e-5 -> 1e-8 là 18 lần chia thay vì 7 lần ở hệ số 3), nên lr hạ
+# 1,25 là một bước NHỎ, và đó là chủ ý: nó chia quãng đường tới sàn thành
+# nhiều nấc (1e-5 -> 1e-7 là ~21 lần chia thay vì 5 lần ở hệ số 3), nên lr hạ
 # dần theo đúng nhịp val xấu đi thay vì rơi hẳn sau vài epoch hỏng. Đổi lại,
 # một chuỗi hỏng ngắn gần như không đụng tới lr — với `patience` = 3 thì tới
-# lúc dừng lr mới chỉ còn 1/1,5³ ≈ 30% mức chạy, so với 1/3³ ≈ 3,7%.
+# lúc dừng (patience 4) lr mới chỉ còn 1/1,25⁴ ≈ 41% mức chạy, so với 1/3⁴ ≈ 1,2%.
 #
 # `1.0` = TẮT chặng 5 (chia cho 1 là không đổi gì).
-PLATEAU_GAMMA = 1.5
+PLATEAU_GAMMA = 1.25
 
 
 def warmup_flat(step: int, n_warmup: int, lr_min: float, lr_top: float) -> float:
@@ -108,7 +104,7 @@ def warmup_flat(step: int, n_warmup: int, lr_min: float, lr_top: float) -> float
 
     Dùng ở HAI chỗ với hai đơn vị khác nhau, nên nó chỉ nhận SỐ BƯỚC và để
     người gọi quy đổi: lịch chung của Stage 0/1 truyền `warmup_epochs × bước
-    mỗi epoch` (đỉnh là `lr_max`), còn Aligner của main stage truyền `10% tổng
+    mỗi epoch` (đỉnh là `lr_max`), còn CnA của main stage truyền `10% tổng
     bước` (đỉnh là `lr_main`).
     """
     w = int(n_warmup)
@@ -140,8 +136,8 @@ def plateau_lr(lr: float, n_decays: int, lr_min: float,
     """Chặng 5 — `lr / gamma**n_decays`, kẹp sàn ở `lr_min`.
 
         n_decays = 0  ->  lr                (val vừa cải thiện, hoặc chưa hỏng lần nào)
-        n_decays = 1  ->  lr / 1,5
-        n_decays = k  ->  lr / 1,5**k       (không bao giờ dưới lr_min)
+        n_decays = 1  ->  lr / 1,25
+        n_decays = k  ->  lr / 1,25**k       (không bao giờ dưới lr_min)
 
     `n_decays` là **tổng** số epoch val không cải thiện từ đầu giai đoạn —
     KHÁC bộ đếm `patience`, vốn reset mỗi lần val khá lên. Một lần tụt là tụt
@@ -183,8 +179,7 @@ def frozen_warmup_flat(step: int, n_freeze: int, n_warmup: int,
     biết khối còn đóng băng hay không. Một lr 1e-30 vẫn khiến backward chạy đủ
     (và tốn đủ) trong khi không cập nhật gì.
 
-    KHÔNG còn ai gọi hàm này trong đường chạy chính: main stage đóng băng
-    Compressor HOÀN TOÀN nên không có mốc mở băng nào nữa. Giữ lại vì nó là một
+    KHÔNG còn ai gọi hàm này trong đường chạy chính. Giữ lại vì nó là một
     hàm lịch THUẦN và selftest còn kiểm nó như một mảnh của `schedule`.
     """
     f = max(0, int(n_freeze))

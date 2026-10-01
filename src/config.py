@@ -101,7 +101,6 @@ DEFAULT_GPU = "rtx3060"
 GPU_KEYS = frozenset({
     "train.per_device_batch_size", "train.gradient_checkpointing",
     "train.prefetch", "stage0.micro_batch", "stage0.probe_sizes",
-    "stage1.micro_batch", "stage1.probe_sizes",
     "base.batch_size", "metrics.bertscore.batch_size",
     "autobatch.enabled", "autobatch.target_frac", "autobatch.probe_sizes",
     "autobatch.infer_probe_sizes", "autobatch.infer_max_bs",

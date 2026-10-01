@@ -99,23 +99,23 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
         ["lịch LoRA", "1 epoch · one-cycle 1e-4 · wd 0.01", "**giống A**"],
         ["chuỗi vào decoder", "[**Z** ‖ text] (256 token ảnh)",
          f"[**Z** ‖ **Q** ‖ text] (+{_nq(st_b)} "
-         f"token, Q = Aligner(Compressor(Extractor(ảnh 448²))), Z giữ nguyên)"],
+         f"token, Q = V_c = CnA(Extractor(ảnh 384²)), Z giữ nguyên; huấn luyện che {zm.get('z_mask_frac')} token Z mỗi bước)"],
         ["Stage 0", "—", f"backbone TỰ GIÁM SÁT (DINO, KHÔNG nhãn), dùng epoch "
                           f"{s0.get('best_epoch', '?')} ({s0.get('select', 'last')}) "
                           f"— checkpoint là bản TEACHER (EMA)"],
         ["nhánh ở main stage", "—",
          f"backbone = TEACHER (EMA) của Stage 0, chạy TEACHER INFERENCE "
-         f"(eval + no_grad, 0 bước học) · Compressor = checkpoint Stage 1, "
-         f"ĐÓNG BĂNG HOÀN TOÀN (eval + no_grad, 0 bước học) · "
-         f"CHỈ Aligner học, warm-up {zm.get('align_warmup_frac')} tổng bước "
-         f"(ffn {zm.get('align_ffn_lr_min')} -> {zm.get('align_ffn_lr_main')} │ "
-         f"attn {zm.get('align_attn_lr_min')} -> {zm.get('align_attn_lr_main')}) "
-         f"rồi phẳng (wd {zm.get('align_wd')})"],
+         f"(eval + no_grad, 0 bước học) · CHỈ CnA học (khởi tạo ngẫu nhiên, "
+         f"cùng LoRA từ bước 0), warm-up {zm.get('cna_warmup_frac')} tổng bước "
+         f"(ffn {zm.get('cna_ffn_lr_min')} -> {zm.get('cna_ffn_lr_main')} │ "
+         f"self {zm.get('cna_self_lr_min')} -> {zm.get('cna_self_lr_main')} │ "
+         f"cross {zm.get('cna_cross_lr_min')} -> {zm.get('cna_cross_lr_main')}) "
+         f"rồi phẳng (wd {zm.get('cna_wd')})"],
         ["giải mã / chấm", "beam 3 · BLEU/ROUGE/BERTScore từng ảnh", "**giống A**"],
     ]))
     L.append("")
 
-    L.append("## Stage 0 — backbone Twins-SVT-S, TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
+    L.append("## Stage 0 — backbone MaxViT-T 384, TỰ GIÁM SÁT (DINO, KHÔNG nhãn) · "
              "checkpoint = TEACHER (EMA)\n")
     if s0.get("history"):
         sc0 = s0.get("stage0", {}) or {}
@@ -228,23 +228,17 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
              f"một biến rò rỉ, song nó KHÁC với §2.0 (Z' thay chỗ, chuỗi không dài ra).")
     _np = (st_b.get("vextractor") or {}).get("n_params") or {}
     _lm = _np.get("learnable_main")
-    _ls1 = _np.get("learnable_stage1")
-    L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và COMPRESSOR là "
-             f"checkpoint của Stage 1; cả hai chạy ở chế độ INFERENCE suốt main "
-             f"stage: 0 bước cập nhật, không có gradient nào chạm vào chúng. "
-             f"Tham số học được mà A không có nằm TRỌN trong Aligner "
-             f"({_lm:,} tham số"
-             f"{f'; Compressor {_ls1:,} tham số đóng băng' if isinstance(_ls1, int) else ''}"
-             f"): ffn {zm.get('align_ffn_lr_main')} │ "
-             f"attn {zm.get('align_attn_lr_main')} "
-             f"(warm-up {zm.get('align_warmup_frac')} tổng bước) — chênh lệch "
-             f"A/B vì thế là của một ENCODER CỐ ĐỊNH (Extractor + Compressor) "
-             f"cộng một phép căn chỉnh học được, không phải của một encoder "
-             f"được finetune cùng decoder."
+    L.append(f"- BACKBONE là bản TEACHER (EMA) của Stage 0 và chạy ở chế độ "
+             f"INFERENCE suốt main stage: 0 bước cập nhật. Tham số học được mà A "
+             f"không có nằm TRỌN trong CnA ({_lm:,} tham số, khởi tạo ngẫu nhiên): "
+             f"ffn {zm.get('cna_ffn_lr_main')} │ self {zm.get('cna_self_lr_main')} │ "
+             f"cross {zm.get('cna_cross_lr_main')} (warm-up "
+             f"{zm.get('cna_warmup_frac')} tổng bước). Khi huấn luyện, "
+             f"{zm.get('z_mask_frac')} token Z bị che mỗi bước cập nhật để ép Q "
+             f"tham gia sinh văn bản; val/sinh/chấm thấy đủ Z."
              if isinstance(_lm, int) else
-             f"- Extractor và Compressor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; "
-             f"tham số học được của nhánh nằm trọn trong Aligner, lr "
-             f"{zm.get('align_ffn_lr_main')}.")
+             f"- Extractor ĐÓNG BĂNG HOÀN TOÀN suốt main stage; tham số học được "
+             f"của nhánh nằm trọn trong CnA, lr ffn {zm.get('cna_ffn_lr_main')}.")
     L.append("")
     out = run_dir / "REPORT.md"
     out.write_text("\n".join(L), encoding="utf-8")

@@ -5,26 +5,27 @@
 
 Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có một bảng số sai:
   1. vân tay fixture của configs/vextractor.yaml == $1 (_archive/v2/configs/lora.yaml)
-     Compressor (QFormer, n_query latent, 5 residual mỗi nhóm, d_feat→d_latent
-     NGAY TRONG Cross-attn) -> Aligner (RMSNorm + SelfAttn + SwiGLU + Linear Proj,
-     init 1/√fan_in)
+  2. Extractor (MaxViT-T 384, đầu ra chuẩn stride 32 -> 144 ô × 512) -> CnA (QFormer,
+     n_query latent, 5 residual mỗi nhóm, d_feat→d_latent NGAY TRONG Cross-attn,
+     RMSNorm + Linear cuối -> d_model); ba nhóm lr self/cross/ffn phủ kín CnA
   3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ
   4. DINO: teacher no_grad, cặp trùng view bị bỏ, EMA/center đổi đúng hướng
   5. lịch DINO (τ_t, momentum) + multi-crop
   6. CE ghép theo token qua các mảnh == CE trung bình token của cả micro-batch
-  7. đóng băng: ở main stage Extractor VÀ Compressor đều infer, CHỈ Aligner học
+  7. đóng băng: ở main stage Extractor infer, CHỈ CnA học
   8. kiểm định A/B: bootstrap + permutation nhận ra hiệu số thật, không bịa
   9. Hub: A kéo từ current/$1_LoRA_Test, B đẩy vào current/$2.2_V-Extractor_Test
  10. không file nào trong src/ import _archive hay run_lora; runner có đường Q
  11. REPORT.md dựng được
- 12. Stage 0 + Stage 1 + main stage nằm trong plan đẩy Hub; weight B của một
-     KIẾN TRÚC KHÁC bị phát hiện trước khi `train` bỏ qua main stage
+ 12. Stage 0 + main stage nằm trong plan đẩy Hub; weight B của một KIẾN TRÚC
+     KHÁC bị phát hiện trước khi `train` bỏ qua main stage
  13. mã nhãn của labels.npz (0=pos, 1=neg, 2=unc, 3=blank) và mask ô blank
- 14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, + chặng 5) và hai cặp lr
+ 14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. Stage 1 chạy THẬT: HAI nhóm lr (attn | ffn), teacher ĐỨNG YÊN
- 17. main stage: Aligner học từ bước 0, Compressor đóng băng 20% rồi warm-up
+ 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
+     step, kiểm cả trên Gemma 3 THẬT (tí hon)
+ 17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
  19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp,
      MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
@@ -34,7 +35,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  22. ĐẶC TẢ (README + config + docstring) khớp spec SỐNG, không chép tay
  23. vân tay Stage 0 chỉ phụ thuộc EXTRACTOR
  24. Stage 0 cũ vẫn dùng được sau khi sửa phạm vi vân tay (so NỘI DUNG)
- 25. BA giai đoạn, BA khối, và ranh giới giữa chúng
+ 25. HAI giai đoạn, Stage 1 gỡ hẳn; BN của MaxViT đóng băng ở Stage 0
 """
 from __future__ import annotations
 
@@ -80,10 +81,9 @@ SMALL_SWIN = "swinv2_tiny_window8_256"
 # d_latent (16) KHÁC d_model (32), y như cấu hình thật (1024 vs 2560): hai số
 # BẰNG nhau thì mọi lỗi lẫn chiều đều lọt qua vì shape tình cờ khớp.
 SMALL_DL = 16
-SMALL_MLP = 24        # mlp_hidden của Compressor — KHÁC aligner.mlp_hidden (64)
-# N của config thật là 5; selftest giữ 2 cho nhanh — `n_blocks` được kiểm
-# riêng ở check 2 (len(cp.groups) == N) và ở check 22 (số tham số dựng lại từ
-# CONFIG THẬT, nên N = 5 vẫn bị khoá).
+SMALL_MLP = 24        # mlp_hidden của CnA
+# N của config thật là 1; selftest giữ 2 để kiểm vòng lặp nhóm — số tham số của
+# config THẬT được khoá ở check 22.
 SMALL_NB = 2
 
 
@@ -98,10 +98,9 @@ def small_cfg(image_size=SMALL_IMG, n_query=SMALL_Q, d_latent=None,
         "extractor": {"image_size": image_size, "arch": arch,
                       "pretrained": False, "n_layers": n_layers,
                       "n_stages": n_stages},
-        "compressor": {"n_query": n_query, "d_latent": int(d_latent or SMALL_DL),
-                       "head_dim": 4, "mlp_hidden": SMALL_MLP,
-                       "n_blocks": n_blocks},
-        "aligner": {"mlp_hidden": 64}}}
+        "cna": {"n_query": n_query, "d_latent": int(d_latent or SMALL_DL),
+                "head_dim": 4, "mlp_hidden": SMALL_MLP,
+                "n_blocks": n_blocks, "final_proj": True}}}
 
 
 def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_latent=None,
@@ -113,7 +112,7 @@ def small_spec(image_size=SMALL_IMG, d_model=32, n_query=SMALL_Q, d_latent=None,
         d_model)
 
 
-print("═══ selftest — nhánh thị giác (Extractor · Compressor · Aligner) ═══")
+print("═══ selftest — nhánh thị giác (Extractor MaxViT-T · CnA) ═══")
 
 
 @check("1. vân tay fixture vextractor.yaml == $1 lora.yaml")
@@ -175,7 +174,7 @@ def _():
         # `torch.cuda.get_arch_list()`, nên một chuỗi khác dạng là một cổng
         # kiểm luôn im lặng.
         assert str(req["cuda_arch"]).startswith("sm_"), (p.name, req)
-        for k in ("stage0.probe_sizes", "stage1.probe_sizes",
+        for k in ("stage0.probe_sizes",
                   "autobatch.probe_sizes", "autobatch.infer_probe_sizes"):
             v = [int(x) for x in sets[k]]
             assert v and v == sorted(v) and v[0] >= 1, (p.name, k, v)
@@ -272,7 +271,7 @@ def _():
     assert got == 8 and rep["enabled"] is False
 
 
-@check("2. Extractor (cắt stage) -> Compressor (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn) -> Aligner (RMSNorm + SelfAttn + SwiGLU + Linear)")
+@check("2. Extractor (cắt stage) -> CnA (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn, RMSNorm + Linear cuối -> d_model)")
 def _():
     import math
 
@@ -285,7 +284,7 @@ def _():
     sp = small_spec()
     br = R.VExtractorBranch(sp)
     br.set_frozen(False)
-    ex, cp, al = br.extractor, br.compressor, br.aligner
+    ex, cp = br.extractor, br.cna
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     q = br(x)
 
@@ -318,27 +317,26 @@ def _():
     else:
         raise AssertionError("lưới lệch phải bị từ chối")
 
-    # ── 2. COMPRESSOR: n_query latent, N nhóm, Cross-attn CHỈ ở khối 1 ────
+    # ── 2. CnA: n_query latent, N nhóm, Cross-attn CHỈ ở khối 1 ───────────
     assert cp.n_query == R.n_query_of(sp) == SMALL_Q
-    assert cp.n_patch if False else True     # (lưới là của Extractor, không của Compressor)
     assert cp.d_latent == R.d_latent_of(sp) == SMALL_DL != 32
+    assert cp.d_model == 32 and cp.final_proj
     assert cp.n_blocks == SMALL_NB == len(cp.groups)
     assert tuple(cp.latent.shape) == (1, SMALL_Q, SMALL_DL)
     vc = cp(v)
-    assert vc.shape == (2, SMALL_Q, SMALL_DL), vc.shape
+    assert vc.shape == (2, SMALL_Q, 32), vc.shape
     # head_dim là khoá KHAI, n_heads SUY RA
     assert cp.head_dim == 4 and cp.n_heads == SMALL_DL // 4
     for g in cp.groups:
         for a_ in (g.self1, g.self2):
             assert a_.d == a_.d_kv == SMALL_DL and a_.h == cp.n_heads
-        # 512 -> 1024 NGAY TRONG Cross-attn: k/v nhận d_feat, q/o ở d_latent
+        # d_feat -> d_latent NGAY TRONG Cross-attn: k/v nhận d_feat, q/o ở d_latent
         assert g.cross.d == SMALL_DL and g.cross.d_kv == ex.d_feat != SMALL_DL
         assert g.cross.k.in_features == ex.d_feat
         assert g.cross.k.out_features == g.cross.v.out_features == SMALL_DL
         assert g.cross.q.in_features == g.cross.o.out_features == SMALL_DL
-        # KHÔNG có lớp chiếu riêng d_feat -> d_latent ở đâu cả
         assert g.ffn1.d_in == g.ffn1.d_out == SMALL_DL
-        assert g.ffn1.hidden == g.ffn2.hidden == SMALL_MLP != al.mlp_hidden
+        assert g.ffn1.hidden == g.ffn2.hidden == SMALL_MLP
     # chỗ DUY NHẤT chạm V trước QFormer là một RMSNorm(d_feat)
     assert isinstance(cp.kv_norm, recombiner.RMSNorm)
     assert cp.kv_norm.weight.numel() == ex.d_feat
@@ -347,12 +345,21 @@ def _():
                    {g.cross.k for g in cp.groups} | {g.cross.v for g in cp.groups})
     # d_latent không chia hết head_dim -> DỪNG, không làm tròn
     try:
-        R.Compressor(ex.d_feat, SMALL_Q, 18, 4)
+        R.CnA(ex.d_feat, 32, SMALL_Q, 18, 4)
     except ValueError as e:
         assert "head_dim" in str(e)
     else:
         raise AssertionError("d_latent không chia hết head_dim phải bị từ chối")
-    # ── NĂM residual mỗi nhóm, và mỗi cái vòng quanh RIÊNG khối con ───────
+    # final_proj = false chỉ hợp lệ khi d_latent == d_model
+    try:
+        R.CnA(ex.d_feat, 32, SMALL_Q, SMALL_DL, 4, final_proj=False)
+    except ValueError as e:
+        assert "final_proj" in str(e)
+    else:
+        raise AssertionError("final_proj=false với d_latent != d_model phải bị từ chối")
+    assert R.CnA(ex.d_feat, SMALL_DL, SMALL_Q, SMALL_DL, 4,
+                 final_proj=False)(v).shape == (2, SMALL_Q, SMALL_DL)
+    # ── NĂM residual mỗi nhóm, rồi RMSNorm + Linear cuối ───────────────────
     with torch.no_grad():
         kv = cp.kv_norm(v)
         h = cp.latent.expand(2, -1, -1)
@@ -362,74 +369,43 @@ def _():
             h3 = h2 + g.ffn1(g.n_ffn1(h2))
             h4 = h3 + g.self2(g.n_self2(h3))
             h = h4 + g.ffn2(g.n_ffn2(h4))
-            # residual THẬT: bỏ nó đi thì kết quả khác
-            assert not torch.allclose(h1, g.self1(g.n_self1(h1 - g.self1(g.n_self1(
-                h1 - g.self1(g.n_self1(h1)))))), atol=1e-6) or True
             assert not torch.allclose(h2, h1, atol=1e-6)   # cross THẬT SỰ đổi gì đó
             assert not torch.allclose(h3, h2, atol=1e-6)
-        assert torch.allclose(cp(v), h, atol=1e-5)
-    # khối 2 KHÔNG đọc ảnh: đổi V mà giữ nguyên đầu vào khối 2 -> chỉ khối 1 đổi
+        ref = cp.proj(cp.n_proj(h))
+        assert torch.allclose(cp(v), ref, atol=1e-5)
+        assert torch.allclose(q, cp(ex(x)), atol=1e-5)
+        # RMSNorm trước Linear cuối đưa RMS về ≈ 1
+        assert abs(float(cp.n_proj(h).pow(2).mean().sqrt()) - 1.0) < 0.05
+        assert (cp.proj.in_features, cp.proj.out_features) == (SMALL_DL, 32)
+        assert cp.proj.bias is not None and float(cp.proj.bias.abs().max()) == 0.0
+        want_std = 1.0 / math.sqrt(cp.proj.in_features)
+        assert abs(float(cp.proj.weight.std()) - want_std) / want_std < 0.25
+        # `_init` bỏ qua SwiGLU/proj nhưng VẪN chạm bốn chiếu của attention
+        for lin in (cp.groups[0].self1.q, cp.groups[0].cross.k):
+            assert abs(float(lin.weight.std()) - 0.02) / 0.02 < 0.35
+        assert float(cp(v).pow(2).mean().sqrt()) > 1e-3
     for g in cp.groups:
         assert not hasattr(g, "cross2")
-    # SwiGLU: bias=False + init 1/√fan_in (`_init` KHÔNG đè 0.02 lên khối có cổng)
+    # SwiGLU: bias=False + init 1/√fan_in
     for g in cp.groups:
         for f in (g.ffn1, g.ffn2):
             for lin in (f.gate, f.up, f.down):
                 assert lin.bias is None
                 want_std = 1.0 / math.sqrt(lin.in_features)
                 assert abs(float(lin.weight.std()) - want_std) / want_std < 0.3
-
-    # ── 3. ALIGNER: SelfAttn (+res) -> SwiGLU (+res) -> Linear Proj ───────
-    # Hai residual đều ở chiều d_latent; phép đổi d_latent -> d_model là một
-    # Linear riêng đứng SAU, nên nó là chỗ DUY NHẤT không có `+`.
-    assert isinstance(al.attn, R.MultiHeadAttention)
-    assert al.attn.d_kv == al.attn.d == SMALL_DL      # TỰ-chú ý, KHÔNG đọc V
-    assert al.n_heads == SMALL_DL // al.head_dim == cp.n_heads
-    for nm in (al.n_attn, al.n_ffn, al.n_proj):
-        assert isinstance(nm, recombiner.RMSNorm)
-        assert nm.weight.numel() == SMALL_DL   # d_latent, KHÔNG phải d_model
-    assert isinstance(al.ffn, R.SwiGLU)
-    for lin, i, o in ((al.ffn.gate, SMALL_DL, 64), (al.ffn.up, SMALL_DL, 64),
-                      (al.ffn.down, 64, SMALL_DL)):
-        assert (lin.in_features, lin.out_features) == (i, o)
-        assert lin.bias is None                   # quy ước Gemma 3 / LLaMA
-    assert (al.proj.in_features, al.proj.out_features) == (SMALL_DL, 32)
-    assert al.proj.bias is not None
-    with torch.no_grad():
-        xa = vc + al.attn(al.n_attn(vc))          # residual quanh SelfAttn
-        xb = xa + al.ffn(al.n_ffn(xa))            # residual quanh SwiGLU
-        ref = al.proj(al.n_proj(xb))
-        assert torch.allclose(al(vc), ref, atol=1e-6)
-        assert torch.allclose(q, al(cp(ex(x))), atol=1e-5)
-        assert al(vc).shape[-1] == 32 != SMALL_DL
-        # RMSNorm PHẢI thật sự đưa đầu vào về RMS ≈ 1 — với một khối có CỔNG
-        # NHÂN đó không phải thẩm mỹ: đầu vào nhỏ thì cổng bình phương nó.
-        assert abs(float(al.n_ffn(xa).pow(2).mean().sqrt()) - 1.0) < 0.05
-        assert abs(float(al.n_proj(xb).pow(2).mean().sqrt()) - 1.0) < 0.05
-        for lin in (al.ffn.gate, al.ffn.up, al.ffn.down, al.proj):
-            want_std = 1.0 / math.sqrt(lin.in_features)
-            assert abs(float(lin.weight.std()) - want_std) / want_std < 0.25
-        assert float(al.proj.bias.abs().max()) == 0.0
-        # `_init` bỏ qua SwiGLU/proj nhưng VẪN chạm bốn chiếu của SelfAttn
-        for lin in (al.attn.q, al.attn.k, al.attn.v, al.attn.o):
-            assert abs(float(lin.weight.std()) - 0.02) / 0.02 < 0.35
-        # và Q ở bước 0 KHÔNG được bé đến mức vô nghĩa
-        assert float(al(vc).pow(2).mean().sqrt()) > 1e-3
-    # HAI nhóm lr của main stage: RỜI NHAU và PHỦ KÍN Aligner
-    aat = {id(t) for t in al.attn_parameters()}
-    aff = {id(t) for t in al.ffn_parameters()}
-    assert aat and aff and not (aat & aff)
-    assert aat | aff == {id(t) for t in al.parameters()}
-    assert id(al.n_attn.weight) in aff and id(al.attn.q.weight) in aat
     assert q.shape == (2, SMALL_Q, 32), q.shape
     assert torch.isfinite(q).all() and not torch.allclose(q[0], q[1])
 
-    # ── hai nhóm lr của Stage 1: attn | ffn, RỜI NHAU và PHỦ KÍN ──────────
-    at = {id(t) for t in cp.attn_parameters()}
+    # ── BA nhóm lr của main stage: self | cross | ffn, RỜI NHAU và PHỦ KÍN ─
+    se = {id(t) for t in cp.self_parameters()}
+    cr = {id(t) for t in cp.cross_parameters()}
     ff = {id(t) for t in cp.ffn_parameters()}
-    assert at and ff and not (at & ff)
-    assert at | ff == {id(t) for t in cp.parameters()}
+    assert se and cr and ff and not (se & cr) and not (se & ff) and not (cr & ff)
+    assert se | cr | ff == {id(t) for t in cp.parameters()}
     assert id(cp.latent) in ff and id(cp.kv_norm.weight) in ff
+    assert id(cp.proj.weight) in ff and id(cp.n_proj.weight) in ff
+    assert id(cp.groups[0].cross.k.weight) in cr
+    assert id(cp.groups[0].self2.o.weight) in se
 
     # ── học được ──────────────────────────────────────────────────────────
     before = br(x).detach().clone()
@@ -437,6 +413,31 @@ def _():
     (br(x) - 1.0).pow(2).mean().backward()
     opt.step()
     assert not torch.allclose(br(x), before)
+
+
+@check("2a. MaxViT-T 384: đầu ra CHUẨN stride 32 -> 12×12 = 144 ô × 512, ~30,46 M; "
+       "chỉ chạy ở bội của 384 nên Stage 0 cần local_size = 384")
+def _():
+    import torch
+
+    from src import vextractor as R
+    from src.config import load_config
+    from src.stage0_vextractor import dino_cfg
+
+    net, d_feat, n_patch, _nl, kind, fmt, multi_res, n_st = R.backbone_body(
+        "maxvit_tiny_tf_384.in1k", False, 384)
+    assert (kind, fmt, d_feat, n_patch, n_st) == ("conv", "NCHW", 512, 144, 4)
+    assert 30.0e6 < sum(p.numel() for p in net.parameters()) < 31.0e6
+    assert multi_res is False                       # 192² -> lưới cuối 6×6, chết
+    net.eval()
+    with torch.no_grad():
+        assert tuple(net.forward_features(torch.zeros(1, 3, 384, 384)).shape) == (1, 512, 12, 12)
+    # config thật: ảnh nhánh 384², local crop CÙNG cỡ (vùng nhỏ resize lên)
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    assert cfg["vextractor"]["extractor"]["image_size"] == 384
+    dc = dino_cfg(cfg["stage0"])
+    assert dc["global_size"] == dc["local_size"] == 384 and dc["n_local"] == 6
+    assert dc["local_scale"][1] < dc["global_scale"][0] + 1e-9 or dc["local_scale"][1] <= 0.4
 
 
 @check("2b'. Twins-SVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
@@ -604,12 +605,11 @@ def _():
             raise AssertionError("mean/std lệch pretrained_cfg phải DỪNG")
 
 
-@check("2e. khoá LẠ trong ba khối config bị TỪ CHỐI ồn ào")
+@check("2e. khoá LẠ trong hai khối config bị TỪ CHỐI ồn ào; khối compressor/aligner cũ bị từ chối")
 def _():
     from src import vextractor as R
 
-    for blk, key in (("extractor", "d_branch"), ("compressor", "n_heads"),
-                     ("aligner", "n_query")):
+    for blk, key in (("extractor", "d_branch"), ("cna", "n_heads")):
         c = small_cfg()
         c["vextractor"][blk] = dict(c["vextractor"][blk], **{key: 1})
         try:
@@ -618,6 +618,15 @@ def _():
             assert "khoá lạ" in str(e) and key in str(e), (blk, key, e)
         else:
             raise AssertionError(f"vextractor.{blk}.{key} phải bị từ chối")
+    for old in ("compressor", "aligner"):
+        c = small_cfg()
+        c["vextractor"][old] = {"mlp_hidden": 8}
+        try:
+            R.spec_from_cfg(c, 32)
+        except R.VExtractorUnusable as e:
+            assert "cna" in str(e), e
+        else:
+            raise AssertionError(f"khối cũ vextractor.{old} phải bị từ chối")
 
 
 @check("3. Stage 0 -> sau: checkpoint CHỈ Extractor, nạp đúng, từ chối format cũ")
@@ -639,7 +648,7 @@ def _():
 
         sd = load_file(str(Path(t) / "s0" / R.STAGE0_FILE))
         assert set(sd) == set(body.state_dict()), "checkpoint phải là Extractor THUẦN"
-        assert not any(k.startswith(("latent", "groups.", "aligner", "kv_norm"))
+        assert not any(k.startswith(("latent", "groups.", "cna", "proj", "kv_norm"))
                        for k in sd)
         br = R.VExtractorBranch(sp)
         before = {k: v.clone() for k, v in br.extractor.body.state_dict().items()}
@@ -655,7 +664,7 @@ def _():
         with torch.no_grad():
             assert torch.equal(br(x), br2(x))
         assert br2.frozen and br2.n_query == R.n_query_of(sp)
-        # `backbone_spec` KHÔNG gồm compressor/aligner/d_model: đổi chúng thì
+        # `backbone_spec` KHÔNG gồm cna/d_model: đổi chúng thì
         # checkpoint Stage 0 vẫn dùng được (Stage 0 không dựng chúng).
         sp2 = small_spec(d_model=64, n_query=SMALL_Q + 1)
         R.load_stage0_into(R.VExtractorBranch(sp2), Path(t) / "s0")
@@ -882,62 +891,40 @@ def _():
     assert src.count("VExtReportDataset(") >= 2      # train + val
 
 
-@check("7. đóng băng: ở main stage Extractor VÀ Compressor đều infer; CHỈ Aligner học")
+@check("7. đóng băng: ở main stage Extractor infer; CHỈ CnA học")
 def _():
     import torch
 
     from src import vextractor as R
 
     sp = small_spec()
-    sp["compressor"]["dropout"] = 0.5
+    sp["cna"]["dropout"] = 0.5
     br = R.VExtractorBranch(sp)
     br.set_frozen(True)
     br.train()
-    # Extractor eval + không grad; Compressor CHƯA bị đóng băng thì vẫn train
+    # Extractor eval + không grad; CnA train
     assert not br.extractor.body.training
-    assert br.compressor.training and br.aligner.training
+    assert br.cna.training
     assert all(not q.requires_grad for q in br.extractor.parameters())
     assert all(q.requires_grad for q in br.trainable_parameters())
-    # `trainable_parameters` = ĐÚNG Aligner. Compressor học ở Stage 1, không ở
-    # đây, nên nó không được có mặt trong optimizer của main stage.
+    # `trainable_parameters` = ĐÚNG CnA
     assert ([id(q) for q in br.trainable_parameters()]
-            == [id(q) for q in br.aligner.parameters()])
+            == [id(q) for q in br.cna.parameters()])
     npar = br.n_params()
-    assert npar["learnable_main"] == npar["aligner"] > 0
-    assert npar["learnable_stage1"] == npar["compressor"] > 0
+    assert npar["learnable_main"] == npar["cna"] > 0
     assert npar["extractor"] > 0
-    assert npar["compressor"] == npar["compressor_attn"] + npar["compressor_ffn"]
-    assert npar["total"] == (npar["extractor"] + npar["learnable_stage1"]
-                             + npar["learnable_main"])
-    # gradient của CE tới được Compressor + Aligner khi Compressor CÒN mở
+    assert npar["cna"] == npar["cna_self"] + npar["cna_cross"] + npar["cna_ffn"]
+    assert npar["total"] == npar["extractor"] + npar["learnable_main"]
+    assert npar["trainable"] == npar["learnable_main"]
     x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
     br.eval()
     br(x).sum().backward()
-    assert all(q.grad is not None for q in br.trainable_parameters())
-    assert all(q.grad is not None for q in br.compressor.parameters())
+    assert all(q.grad is not None for q in br.cna.parameters())
     assert all(q.grad is None for q in br.extractor.parameters())
     br.zero_grad(set_to_none=True)
-    # ── TRẠNG THÁI CỦA MAIN STAGE: Extractor + Compressor đóng băng ───────
-    br.set_compressor_frozen(True)
-    assert br.compressor_frozen
-    assert all(not q.requires_grad for q in br.compressor.parameters())
-    assert all(q.requires_grad for q in br.aligner.parameters())
-    # `trainable` (đọc requires_grad) nay khớp ĐÚNG `learnable_main`: đó là bất
-    # biến `train_vextractor` kiểm trước khi dựng optimizer.
-    npar = br.n_params()
-    assert npar["trainable"] == npar["learnable_main"] == npar["aligner"]
-    # đóng băng thì cũng phải ở `eval` — và `train()` KHÔNG được kéo nó về train
+    # `train()` KHÔNG được kéo Extractor đóng băng về train
     br.train()
-    assert not br.compressor.training and not br.extractor.body.training
-    assert br.aligner.training
-    br.eval()
-    br(x).sum().backward()
-    assert all(q.grad is None for q in br.compressor.parameters())
-    assert all(q.grad is None for q in br.extractor.parameters())
-    assert all(q.grad is not None for q in br.aligner.parameters())
-    br.zero_grad(set_to_none=True)
-    br.set_compressor_frozen(False)
-    assert all(q.requires_grad for q in br.compressor.parameters())
+    assert not br.extractor.body.training and br.cna.training
     # mở băng Extractor (Lens dùng) -> gradient tới tận pixel
     br.set_frozen(False)
     br.train()
@@ -1029,13 +1016,12 @@ def _():
         assert "‖ **Q** ‖" in s and "bertscore_f1" in s
 
 
-@check("12. lưu như $1: Stage 0 + Stage 1 + main stage vào plan đẩy Hub; weight B lệch format/spec bị phát hiện")
+@check("12. lưu như $1: Stage 0 + main stage vào plan đẩy Hub (KHÔNG còn Stage 1); weight B lệch format/spec bị phát hiện")
 def _():
     import torch
 
     from src import dino as DN
     from src import stage0_vextractor as s0
-    from src import stage1_vextractor as s1
     from src import vextractor as R
     from src.config import load_config
     from src.fixture import WEIGHT_FILES
@@ -1049,17 +1035,12 @@ def _():
         sp = small_spec()
         for sub in (s0.CKPT, s0.BASE):
             R.save_stage0(R.build_backbone(sp)[0], sp, d / sub, {})
-            # DINO head TEACHER đi CÙNG checkpoint — Stage 1 chưng cất từ ĐÚNG
-            # phân phối prototype ấy, nên nó phải lên Hub cùng Extractor.
+            # DINO head TEACHER đi CÙNG checkpoint (giàn giáo, để chạy tiếp).
             R.save_dino_head(DN.DINOHead(4, 8, 8, 4, 2), d / sub)
         for f in (s0.HISTORY, s0.LOADER):
             (d / f).write_text("{}")
         (d / "last").mkdir()
         (d / "last" / "state.pt").write_text("x")
-        # Stage 1: checkpoint Compressor + history, trong plan đẩy Hub
-        s1d = Path(t) / "ad" / s1.DIRNAME
-        R.save_compressor(R.VExtractorBranch(sp), s1d / s1.CKPT, {"best_epoch": 1})
-        (s1d / s1.HISTORY).write_text("{}")
         bdir = Path(t) / "ad" / aid
         R.save_branch(R.VExtractorBranch(sp), bdir, {})
         for f in ("adapter_model.safetensors", "adapter_config.json", "train_stats.json"):
@@ -1068,11 +1049,7 @@ def _():
         base = "current/$2.2_V-Extractor_Test"
         for r in s0.KEEP:
             assert f"{base}/stage0/{r}" in plan, r
-        for r in s1.KEEP:
-            assert f"{base}/stage1/{r}" in plan, r
-        # HAI thư mục RIÊNG: gộp chúng là mất khả năng dùng lại Stage 0 khi chỉ
-        # Stage 1 phải chạy lại.
-        assert not any(p.startswith(f"{base}/stage0/{s1.CKPT}/") for p in plan)
+        assert not any("/stage1/" in p for p in plan)   # không còn Stage 1
         assert not any("state.pt" in p for p in plan)
         for f in ("adapter_model.safetensors", "vextractor_branch.safetensors",
                   "vextractor_branch.json", "train_stats.json"):
@@ -1125,9 +1102,9 @@ def _():
         # khoá LÁ nào lệch (đổi `n_query` KHÔNG đụng Extractor)
         why_b = branch_stale(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) or ""
         assert "config hiện tại" in why_b, why_b
-        assert f"compressor.n_query: {SMALL_Q} -> {SMALL_Q + 1}" in why_b, why_b
+        assert f"cna.n_query: {SMALL_Q} -> {SMALL_Q + 1}" in why_b, why_b
         assert already_trained(bdir, s0ck, small_cfg(n_query=SMALL_Q + 1)) is False
-        # ...nhưng Stage 0 thì KHÔNG bị đụng: đổi Compressor không phải finetune lại
+        # ...nhưng Stage 0 thì KHÔNG bị đụng: đổi CnA không phải finetune lại
         assert branch_stale(bdir, s0ck) is None
         # (c) EXTRACTOR của Stage 0 khác -> stale, và đây mới là việc của Stage 0
         sp2 = R.spec_from_cfg(small_cfg(n_stages=SMALL_NS - 1), 32)
@@ -1166,177 +1143,97 @@ def _():
     assert "asl" not in cfg["stage0"] and "val_classes" not in cfg["stage0"]
 
 
-@check("14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, + chặng 5) và hai cặp lr của đặc tả")
+@check("14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, + chặng 5 ÷1,25) và BA cặp lr của main stage")
 def _():
     from src import schedule as S
     from src import stage0_vextractor as s0
-    from src import stage1_vextractor as s1
     from src.backbone import TrainUnusable
     from src.config import load_config
-    from src.train_vextractor import MAIN_CFG_KEYS, zcfg
+    from src.train_vextractor import MAIN_CFG_KEYS, cna_lr_at, zcfg
 
     # ── hình dạng lịch: dốc rồi GIỮ, KHÔNG có chặng hạ nào ────────────────
     w = 200                                   # 1 epoch = 200 bước
-    lo, hi = 1e-8, 2e-5
+    lo, hi = 1e-7, 1e-5
     f = lambda k: S.warmup_flat(k, w, lo, hi)             # noqa: E731
     assert f(0) == lo                         # bước 0 có ĐÚNG lr_min
     assert f(w) == hi and f(10 * w) == hi     # chạm đỉnh rồi GIỮ, không hạ
     up = [f(k) for k in range(w + 1)]
     assert all(x <= y + 1e-18 for x, y in zip(up, up[1:]))     # ĐƠN ĐIỆU tăng
-    assert abs(f(w // 2) - (lo + hi) / 2) < 1e-9               # TUYẾN TÍNH
+    assert abs(f(w // 2) - (lo + hi) / 2) < 1e-12              # TUYẾN TÍNH
     assert S.warmup_flat(0, 0, lo, hi) == hi                   # w = 0 -> vào thẳng
     assert S.phase_of(0, w) == "warmup" and S.phase_of(w, w) == "hold"
-    assert S.phase_span(0, w - 1, w) == "warmup"
-    assert S.phase_span(w, 2 * w - 1, w) == "hold"
-    assert S.phase_span(w - 1, w, w) == "warmup→hold"          # epoch bắc qua ranh
-    # Lịch cũ đã BIẾN MẤT hẳn: không còn chặng giữ đỉnh + cosine về lr_main.
-    for gone in ("staged_lr", "phase_bounds", "WARMUP_FRAC", "HOLD_FRAC",
-                 "DECAY_FRAC", "phase_name"):
-        assert not hasattr(S, gone), gone
+    assert S.phase_span(w - 1, w, w) == "warmup→hold"
 
     # ── ĐUÔI: cosine từ lr ĐANG chạy về lr_min ────────────────────────────
     assert S.tail_lr(0, 10, 1e-6, lo) == 1e-6
     assert abs(S.tail_lr(10, 10, 1e-6, lo) - lo) < 1e-18
-    t = [S.tail_lr(k, 10, 1e-6, lo) for k in range(11)]
-    assert all(x >= y - 1e-18 for x, y in zip(t, t[1:]))
 
-    # ── main stage: dốc theo BƯỚC, và 0 TUYỆT ĐỐI trong phần đóng băng ────
-    assert S.warmup_flat(0, 20, 1e-6, 1e-4) == 1e-6
-    assert S.warmup_flat(20, 20, 1e-6, 1e-4) == 1e-4 == S.warmup_flat(99, 20, 1e-6, 1e-4)
-    assert S.frozen_warmup_flat(39, 40, 20, 1e-8, 1e-5) == 0.0
-    assert S.frozen_warmup_flat(40, 40, 20, 1e-8, 1e-5) == 1e-8
-    assert S.frozen_warmup_flat(60, 40, 20, 1e-8, 1e-5) == 1e-5
-    assert S.steps_for_frac(200, 0.2) == 40 and S.steps_for_frac(200, 0.1) == 20
-
-    # ── hai CẶP lr, ĐÚNG như đặc tả ───────────────────────────────────────
+    # ── Stage 0, ĐÚNG như đặc tả ──────────────────────────────────────────
     cfg = load_config(ROOT / "configs/vextractor.yaml")
+    assert "stage1" not in cfg, "khối stage1 phải biến mất khỏi config"
     sc = s0.s0cfg(cfg)
-    assert (sc["lr_min"], sc["lr_max"]) == (1e-8, 2e-5)
-    assert "lr_main" not in sc and "sched_epochs" not in sc
+    assert (sc["lr_min"], sc["lr_max"]) == (1e-7, 1e-5)
     assert sc["warmup_epochs"] == 1.0 and sc["max_epochs"] == 50
-    # patience ĐỒNG BỘ: cả hai giai đoạn cùng chờ 4 epoch.
     assert sc["patience"] == 4 and sc["tail_epochs"] == 1 and sc["select"] == "best"
-    assert sc["val_n_samples"] == 256 and sc["val_resample"] is False
-    s1c = s1.s1cfg(cfg)
-    assert (s1c["attn_lr_min"], s1c["attn_lr_max"]) == (1e-8, 2e-5)
-    assert (s1c["ffn_lr_min"], s1c["ffn_lr_max"]) == (1e-7, 2e-4)
-    # FFN chịu được dốc CAO HƠN attn: ma trận attention quyết định 16 vector
-    # ĐỌC Ở ĐÂU trên lưới, và một bước lớn làm phân phối ấy sụp về vài ô rồi
-    # không quay lại. Quan hệ ấy phải còn đúng, không chỉ hai con số rời.
-    assert s1c["ffn_lr_max"] > s1c["attn_lr_max"]
-    # Stage 1 chạy attn KHÔNG THẤP HƠN mức chạy của Stage 0 (cùng 2e-5): backbone
-    # đứng yên, nên không có encoder nào đang được dạy để bị bước lớn làm hỏng.
-    assert s1c["attn_lr_max"] >= sc["lr_max"]
-    assert s1c["warmup_epochs"] == 1.0 and s1c["max_epochs"] == 30
-    assert s1c["patience"] == sc["patience"] == 4
-    zc = zcfg(cfg)
-    assert set(zc) == set(MAIN_CFG_KEYS)
-    assert (zc["align_ffn_lr_min"], zc["align_ffn_lr_main"]) == (1e-7, 1e-4)
-    assert (zc["align_attn_lr_min"], zc["align_attn_lr_main"]) == (1e-8, 1e-5)
-    assert zc["align_warmup_frac"] == 0.10
-    # Compressor KHÔNG còn nhóm lr nào ở main stage: nó đóng băng hoàn toàn,
-    # nên mọi khoá `comp_*` phải BIẾN MẤT khỏi khối — còn một khoá là còn một
-    # con số người khai tin là đang có tác dụng.
-    assert not any(k.startswith("comp_") for k in MAIN_CFG_KEYS)
-    assert not any(k.startswith("comp_") for k in zc)
-    # Attn chậm hơn FFN đúng 10× — `zcfg` từ chối đảo dấu.
-    # so theo TỈ LỆ với sai số: 1e-4 / 10 trong float là 1.0000000000000002e-05
-    assert abs(zc["align_ffn_lr_main"] / zc["align_attn_lr_main"] - 10) < 1e-9
-    assert zc["align_attn_lr_min"] < zc["align_ffn_lr_min"]
-
-    # ── `lr_max` là MỨC CHẠY: mọi epoch sau epoch 1 đều ở đó ──────────────
-    # Bài kiểm này chống đúng cách đọc sai đã xảy ra: hiểu `lr_max` là một đỉnh
-    # tạm rồi hạ về một `lr_main` nào đó. Không có `lr_main` trong lịch chung.
-    spe = 200                                   # 6400 mẫu / batch 32
+    assert sc["dino"]["global_size"] == 384 and sc["dino"]["local_size"] == 384
+    assert sc["dino"]["freeze_bn"] is True
+    spe = 200
     assert s0.warmup_steps(sc, spe) == spe
     for ep in range(2, sc["max_epochs"] + 1):
         for k in ((ep - 1) * spe, ep * spe - 1):
             assert s0.sched_lr_at(k, sc, spe) == sc["lr_max"], (ep, k)
     assert s0.sched_lr_at(0, sc, spe) == sc["lr_min"]
-    for k in (s1c["warmup_epochs"] * spe, 10 * spe):
-        assert s1.lrs_at(int(k), s1c, spe) == {"attn": s1c["attn_lr_max"],
-                                               "ffn": s1c["ffn_lr_max"]}
 
-    # ── CHẶNG 5: ÷gamma mỗi lần patience tăng, sàn lr_min, KHÔNG leo lại ──
-    G = 1.5
-    assert S.PLATEAU_GAMMA == G
-    assert sc["plateau_gamma"] == s1c["plateau_gamma"] == G
+    # ── CHẶNG 5: ÷1,25 mỗi lần patience tăng, sàn lr_min, KHÔNG leo lại ───
+    G = 1.25
+    assert S.PLATEAU_GAMMA == G and sc["plateau_gamma"] == G
     assert S.plateau_lr(hi, 0, lo) == hi
     assert abs(S.plateau_lr(hi, 1, lo) - hi / G) < 1e-20
-    assert abs(S.plateau_lr(hi, 2, lo) - hi / G ** 2) < 1e-20
-    # SÀN ở lr_min: không có sàn thì epoch ĐUÔI (cosine *về* lr_min) thành một
-    # cú TĂNG lr, đúng ngược với ý của nó. Với gamma 1,5 thì 2e-5 -> 1e-8 là
-    # 19 lần chia (log(2000)/log(1,5) ≈ 18,76), so với 7 lần ở gamma 3 — lr hạ
-    # theo NHIỀU nấc nhỏ thay vì rơi hẳn sau vài epoch hỏng.
     import math as _m
     n_floor = _m.ceil(_m.log(hi / lo) / _m.log(G))
-    assert n_floor == 19, n_floor
+    assert n_floor == 21, n_floor
     assert S.plateau_lr(hi, n_floor - 1, lo) > lo
-    assert S.plateau_lr(hi, n_floor, lo) == lo
-    assert S.plateau_lr(hi, 99, lo) == lo
-    # `patience` = 4: tới lúc dừng lr mới chỉ còn ~20% mức chạy, KHÔNG phải
-    # ~1,2% như gamma 3. Đây là cả điểm của việc hạ hệ số xuống.
-    assert 0.19 < S.plateau_lr(hi, sc["patience"], lo) / hi < 0.20
-    ladder = [S.plateau_lr(hi, k, lo) for k in range(22)]
-    assert all(x >= y for x, y in zip(ladder, ladder[1:]))      # ĐƠN ĐIỆU giảm
-    # gamma = 1.0 TẮT hẳn chặng 5 — và đó mới là khoá để tắt, KHÔNG phải
-    # `patience: 0` (patience chỉ gác việc DỪNG).
+    assert S.plateau_lr(hi, n_floor, lo) == lo == S.plateau_lr(hi, 99, lo)
+    assert 0.40 < S.plateau_lr(hi, sc["patience"], lo) / hi < 0.42   # 1/1,25⁴
     assert S.plateau_lr(hi, 5, lo, gamma=1.0) == hi
-    for blk, mod in (("stage0", s0.s0cfg), ("stage1", s1.s1cfg)):
-        c = dict(cfg)
-        c[blk] = dict(cfg[blk], plateau_gamma=0.5)
-        try:
-            mod(c)
-        except TrainUnusable as e:
-            assert "plateau_gamma" in str(e), e
-        else:
-            raise AssertionError(f"{blk}.plateau_gamma < 1 phải bị từ chối")
-    # áp lên CẢ đường lr của hai giai đoạn; hai nhóm của Stage 1 dùng CHUNG một
-    # bộ đếm (val là MỘT con số), nhưng sàn thì RIÊNG của từng nhóm.
+    c = dict(cfg)
+    c["stage0"] = dict(cfg["stage0"], plateau_gamma=0.5)
+    try:
+        s0.s0cfg(c)
+    except TrainUnusable as e:
+        assert "plateau_gamma" in str(e), e
+    else:
+        raise AssertionError("stage0.plateau_gamma < 1 phải bị từ chối")
     flat = 5 * spe
-    assert s0.sched_lr_at(flat, sc, spe, 0) == sc["lr_max"]
     assert abs(s0.sched_lr_at(flat, sc, spe, 1) - sc["lr_max"] / G) < 1e-18
-    l0, l1 = s1.lrs_at(flat, s1c, spe, 0), s1.lrs_at(flat, s1c, spe, 1)
-    assert abs(l1["attn"] - l0["attn"] / G) < 1e-18
-    assert abs(l1["ffn"] - l0["ffn"] / G) < 1e-18
-    deep = s1.lrs_at(flat, s1c, spe, 99)
-    assert deep["attn"] == s1c["attn_lr_min"] and deep["ffn"] == s1c["ffn_lr_min"]
-
-    # ── lr_min <= lr_max, và khoá của bản CŨ bị từ chối ───────────────────
-    for blk, mod, bad in (("stage0", s0.s0cfg, {"lr_min": 1e-3}),
-                          ("stage0", s0.s0cfg, {"lr_min": 0.0}),
-                          ("stage1", s1.s1cfg, {"attn_lr_max": 1e-12}),
-                          ("stage1", s1.s1cfg, {"ffn_lr_min": 0.0})):
+    for bad in ({"lr_min": 1e-3}, {"lr_min": 0.0}):
         c = dict(cfg)
-        c[blk] = dict(cfg[blk], **bad)
+        c["stage0"] = dict(cfg["stage0"], **bad)
         try:
-            mod(c)
+            s0.s0cfg(c)
         except TrainUnusable:
             pass
         else:
-            raise AssertionError(f"{blk} {bad} phải bị từ chối")
-    for blk, mod, stale in (("stage0", s0.s0cfg, "lr_main"),
-                            ("stage0", s0.s0cfg, "sched_epochs"),
-                            ("stage0", s0.s0cfg, "lr"),
-                            ("stage1", s1.s1cfg, "attn_lr_main"),
-                            ("stage1", s1.s1cfg, "sched_epochs")):
-        c = dict(cfg)
-        c[blk] = dict(cfg[blk], **{stale: 1e-5})
-        try:
-            mod(c)
-        except TrainUnusable as e:
-            assert "khoá lạ" in str(e), (blk, stale, e)
-        else:
-            raise AssertionError(f"{blk}.{stale} (khoá cũ) phải bị từ chối")
-    c = dict(cfg)
-    # Cả họ `comp_*` nay là khoá CŨ: Compressor đóng băng hoàn toàn ở main
-    # stage, nên khai lr / mốc đóng băng / wd cho nó là khai một con số không
-    # ai đọc — `zcfg` phải DỪNG chứ không bỏ qua.
-    for _stale in ("align_lr", "align_lr_min", "align_lr_main",
-                   "comp_lr_min", "comp_lr_main",
-                   "comp_ffn_lr_min", "comp_ffn_lr_main",
-                   "comp_attn_lr_min", "comp_attn_lr_main",
-                   "comp_freeze_frac", "comp_warmup_frac", "comp_wd"):
+            raise AssertionError(f"stage0 {bad} phải bị từ chối")
+
+    # ── main stage: BA nhóm của CnA, ĐÚNG như đặc tả ──────────────────────
+    zc = zcfg(cfg)
+    assert set(zc) == set(MAIN_CFG_KEYS)
+    assert (zc["cna_ffn_lr_min"], zc["cna_ffn_lr_main"]) == (1e-7, 1e-4)
+    assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
+    assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
+    # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
+    a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
+    assert a0 == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
+    assert a20 == a199 == {"ffn": 1e-4, "self": 1e-5, "cross": 4e-5}, a20
+    a10 = cna_lr_at(10, zc, 200)
+    assert abs(a10["cross"] - (4e-8 + 4e-5) / 2) < 1e-15
+    # mốc theo TỈ LỆ: dry-run 4 bước -> warm-up round(0.4) = 0 bước -> phẳng
+    assert cna_lr_at(0, zc, 4)["ffn"] == 1e-4
+    # khoá CŨ (align_*, comp_*) bị từ chối
+    for _stale in ("align_ffn_lr_min", "align_attn_lr_main", "align_warmup_frac",
+                   "comp_lr_min", "comp_freeze_frac"):
         c = dict(cfg)
         c["vextractor"] = dict(cfg["vextractor"], main=dict(
             cfg["vextractor"]["main"], **{_stale: 1e-5}))
@@ -1345,33 +1242,23 @@ def _():
         except TrainUnusable as e:
             assert "khoá lạ" in str(e), (_stale, e)
         else:
-            raise AssertionError(
-                f"vextractor.main.{_stale} (khoá cũ, nay tách attn/ffn) phải "
-                f"bị từ chối")
-    # warm-up ngoài [0, 1] -> DỪNG
-    for _bad in (-0.1, 1.5):
+            raise AssertionError(f"vextractor.main.{_stale} (khoá cũ) phải bị từ chối")
+    for key, val, msg in (("cna_warmup_frac", 1.5, "[0, 1]"),
+                          ("z_mask_frac", 1.0, "z_mask_frac"),
+                          ("cna_self_lr_main", 1e-3, "CHẬM"),
+                          ("cna_cross_lr_min", 0.0, "> 0")):
         c = dict(cfg)
         c["vextractor"] = dict(cfg["vextractor"], main=dict(
-            cfg["vextractor"]["main"], align_warmup_frac=_bad))
+            cfg["vextractor"]["main"], **{key: val}))
         try:
             zcfg(c)
         except TrainUnusable as e:
-            assert "[0, 1]" in str(e), e
+            assert msg in str(e), (key, e)
         else:
-            raise AssertionError(f"align_warmup_frac {_bad} phải bị từ chối")
-    # attn NHANH hơn ffn -> đảo đúng lý do tách nhóm -> DỪNG
-    c = dict(cfg)
-    c["vextractor"] = dict(cfg["vextractor"], main=dict(
-        cfg["vextractor"]["main"], align_attn_lr_main=1e-3))
-    try:
-        zcfg(c)
-    except TrainUnusable as e:
-        assert "CHẬM" in str(e), e
-    else:
-        raise AssertionError("align_attn_lr_main > align_ffn_lr_main phải bị từ chối")
+            raise AssertionError(f"{key} = {val} phải bị từ chối")
 
 
-@check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): warm-up 1 epoch rồi GIỮ lr_max, chặng 5 ÷1,5, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min")
+@check("15. Stage 0 chạy THẬT (ConvNeXt nhỏ, KHÔNG Gemma, KHÔNG nhãn): warm-up 1 epoch rồi GIỮ lr_max, chặng 5 ÷1,25, dừng sớm theo patience, epoch ĐUÔI cosine về lr_min")
 def _():
     import json
 
@@ -1415,8 +1302,7 @@ def _():
             s0.ImageOnlyDataset.__getitem__, R.backbone_body)
     R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
                        n_stages=None:
-                       orig[3](arch, False, image_size, n_layers, n_stages,
-                               ))
+                       orig[3](arch, False, image_size, n_layers, n_stages))
     s0.decoder_width = lambda *_a, **_k: D_MOD
     s0.assert_same_pixels = lambda *_a, **_k: None
     s0.ImageOnlyDataset.__getitem__ = _views
@@ -1507,7 +1393,7 @@ def _():
             bas = load_file(str(d / s0.BASE / R.STAGE0_FILE))
             if best_ep == h["base_epoch"]:
                 assert all(torch.equal(fin[k], bas[k]) for k in fin)
-            # DINO head TEACHER đi cùng cả hai checkpoint (Stage 1 cần nó)
+            # DINO head TEACHER đi cùng cả hai checkpoint
             for sub in (s0.BASE, s0.CKPT):
                 assert (d / sub / R.DINO_HEAD_FILE).exists()
             assert s0.finished(cfg) is not None
@@ -1582,159 +1468,153 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. Stage 1 chạy THẬT: HAI nhóm lr (attn | ffn), teacher Stage 0 ĐỨNG YÊN, checkpoint CHỈ Compressor")
+@check("16. MASK REGULARIZATION: che 25% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
-    import json
+    import types
 
-    import pandas as pd
     import torch
 
-    from src import dino as D
-    from src import stage0_vextractor as s0
-    from src import stage1_vextractor as s1
-    from src import vextractor as R
-    from src.config import load_config
+    import src.train_vextractor as TV
+    from src import recombiner as rc
+    from src.backbone import TrainUnusable
 
-    D_MOD = 32
-    cfg = load_config(ROOT / "configs/vextractor.yaml")
-    cfg["vextractor"] = small_cfg()["vextractor"]
-    cfg["vextractor"]["extractor"] = dict(cfg["vextractor"]["extractor"],
-                                          pretrained=True)
-    cfg["stage0"] = dict(cfg["stage0"],
-                         dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
-                                   local_size=SMALL_IMG // 2, n_local=2,
-                                   out_dim=32, hidden=16, bottleneck=8,
-                                   head_layers=2))
-    cfg["stage1"] = dict(cfg["stage1"], warmup_epochs=1.0, max_epochs=2,
-                         patience=0, tail_epochs=0, batch_size=4, micro_batch=2,
-                         val_n_samples=4)
-
-    def _views(self, i):
-        d_ = self.dc
-        gen = torch.Generator().manual_seed(i * 977 + self.epoch)
-        return [torch.randn(3, d_["global_size"], d_["global_size"], generator=gen)
-                for _ in range(2 + int(d_["n_local"]))]
-
-    orig = (s0.decoder_width, s0.assert_same_pixels,
-            s0.ImageOnlyDataset.__getitem__, R.backbone_body)
-    R.backbone_body = (lambda arch, pretrained, image_size, n_layers=None,
-                       n_stages=None:
-                       orig[3](arch, False, image_size, n_layers, n_stages,
-                               ))
-    s0.decoder_width = lambda *_a, **_k: D_MOD
-    s0.assert_same_pixels = lambda *_a, **_k: None
-    s0.ImageOnlyDataset.__getitem__ = _views
+    IMG, NZ = 63, 8
+    ids = torch.tensor([[2, 5] + [IMG] * NZ + [7, 8, 0],
+                        [2, 5] + [IMG] * NZ + [9, 0, 0]])
+    # ── z_mask_positions ──────────────────────────────────────────────────
+    a = TV.z_mask_positions(ids, IMG, 0.25, 42, 3)
+    assert a.numel() == round(0.25 * NZ) == 2
+    assert bool((ids[0, a] == IMG).all()) and a.tolist() == sorted(a.tolist())
+    assert torch.equal(a, TV.z_mask_positions(ids, IMG, 0.25, 42, 3))   # tái lập
+    many = {tuple(TV.z_mask_positions(ids, IMG, 0.25, 42, k).tolist()) for k in range(20)}
+    assert len(many) > 3                                   # rút lại MỖI step
+    assert TV.z_mask_positions(ids, IMG, 0.0, 42, 3) is None
+    st = torch.random.get_rng_state()
+    TV.z_mask_positions(ids, IMG, 0.25, 42, 5)
+    assert torch.equal(st, torch.random.get_rng_state())   # KHÔNG tiêu RNG toàn cục
+    bad = ids.clone()
+    bad[1] = torch.tensor([2, 5, 6] + [IMG] * NZ + [9, 0])
     try:
-        with tempfile.TemporaryDirectory() as t:
-            cfg["output"] = dict(cfg["output"], adapter_dir=str(Path(t) / "ad"))
-            sp = R.spec_from_cfg(cfg, D_MOD)
-            s0d = Path(t) / "s0"
-            body = R.build_backbone(sp)[0]
-            R.save_stage0(body, sp, s0d, {"best_epoch": 1, "weights": "teacher_ema"})
-            dc = s1.s1cfg(cfg)["dino"]
-            R.save_dino_head(D.DINOHead(R.build_extractor(sp).d_feat, dc["out_dim"],
-                                        dc["hidden"], dc["bottleneck"],
-                                        dc["head_layers"]), s0d)
-            before = {k: v.clone() for k, v in body.state_dict().items()}
-            tr = pd.DataFrame({"key": [f"k{i}" for i in range(8)], "ref": "x"})
-            va = pd.DataFrame({"key": [f"v{i}" for i in range(4)], "ref": "x"})
-            h = s1.run(cfg, tr, va, s0d)
-            assert h["best_epoch"] >= 1 and h["history"]
-            assert h["teacher_head"] == "stage0"
-            # lr của HAI nhóm khác nhau ở mọi epoch, và attn < ffn
-            for x in h["history"]:
-                assert x["lr_attn"] < x["lr_ffn"], x
-            # `lr_max` là MỨC CHẠY: sau warm-up cả hai nhóm GIỮ nguyên ở đó
-            s1c_ = s1.s1cfg(cfg)
-            spe1 = h["steps_per_epoch"]
-            after = s1.lrs_at(s1.S0.warmup_steps(s1c_, spe1), s1c_, spe1)
-            assert after == {"attn": s1c_["attn_lr_max"],
-                             "ffn": s1c_["ffn_lr_max"]}, after
-            # Extractor ĐỨNG YÊN: trọng số Stage 0 không đổi một bit
-            d1 = s1.stage1_dir(cfg)
-            assert R.compressor_exists(d1 / s1.CKPT)
-            after = R.build_backbone(sp)[0]
-            from safetensors.torch import load_file
-            sd0 = load_file(str(s0d / R.STAGE0_FILE))
-            assert all(torch.equal(before[k], sd0[k]) for k in before)
-            _ = after
-            # checkpoint CHỈ Compressor: không backbone, không Aligner
-            sdc = load_file(str(d1 / s1.CKPT / R.COMPRESSOR_FILE))
-            assert not any(k.startswith(("body.", "aligner")) for k in sdc)
-            assert set(sdc) == set(R.VExtractorBranch(sp).compressor.state_dict())
-            # nạp lại: Compressor đổi, Aligner + Extractor KHÔNG bị chạm
-            br2 = R.VExtractorBranch(sp)
-            al_before = br2.aligner.ffn.gate.weight.clone()
-            bb_before = next(iter(br2.extractor.body.parameters())).clone()
-            R.load_compressor_into(br2, d1 / s1.CKPT)
-            assert torch.allclose(br2.aligner.ffn.gate.weight, al_before)
-            assert torch.allclose(next(iter(br2.extractor.body.parameters())),
-                                  bb_before)
-            assert torch.allclose(br2.compressor.latent, sdc["latent"])
-            # format lệch -> TỪ CHỐI (ở đây thứ được lưu CHÍNH LÀ Compressor)
-            mp = d1 / s1.CKPT / R.COMPRESSOR_META
-            meta = json.loads(mp.read_text(encoding="utf-8"))
-            mp.write_text(json.dumps(dict(meta, format="rgexp.vextractor/1")),
-                          encoding="utf-8")
-            try:
-                R.load_compressor_into(R.VExtractorBranch(sp), d1 / s1.CKPT)
-            except RuntimeError as e:
-                assert "format" in str(e)
-            else:
-                raise AssertionError("format cũ của Stage 1 phải bị từ chối")
-            mp.write_text(json.dumps(meta), encoding="utf-8")
-            assert s1.finished(cfg) is not None
-            # đổi hình dạng Compressor -> Stage 1 phải chạy lại
-            c2 = dict(cfg)
-            c2["vextractor"] = dict(cfg["vextractor"], compressor=dict(
-                cfg["vextractor"]["compressor"], n_query=SMALL_Q + 1))
-            assert s1.finished(c2) is None
-            assert any("compressor_shape" in x for x in s1.diff_inputs(c2))
-            # đổi Aligner -> KHÔNG phải chạy lại (Aligner không có ở Stage 1)
-            c3 = dict(cfg)
-            c3["vextractor"] = dict(cfg["vextractor"], aligner=dict(
-                cfg["vextractor"]["aligner"], mlp_hidden=128))
-            assert s1.finished(c3) is not None
+        TV.z_mask_positions(bad, IMG, 0.25, 42, 0)
+    except TrainUnusable:
+        pass
+    else:
+        raise AssertionError("các hàng lệch chỗ ảnh phải bị từ chối")
+
+    # ── forward_ce: mask đi vào attention_mask, Q và chữ KHÔNG bị che ─────
+    DM, NQ = 4, 3
+    seen = {}
+
+    class _M:
+        def __call__(self, use_cache=False, **kw):
+            seen.update(kw)
+            return types.SimpleNamespace(loss=kw["inputs_embeds"].sum() * 0 + 1.0)
+
+    class _Br:
+        def __call__(self, px):
+            return torch.ones(px.shape[0], NQ, DM)
+
+    orig = (rc.encode_vision, rc.build_inputs_embeds, rc.image_token_id, rc.float_dtype)
+    rc.encode_vision = lambda g, pv: (None, torch.ones(2, NZ, DM))
+    rc.build_inputs_embeds = lambda g, i_, z: torch.zeros(i_.shape[0], i_.shape[1], DM)
+    rc.image_token_id = lambda g: IMG
+    rc.float_dtype = lambda *_a, **_k: torch.float32
+    try:
+        am = (ids != 0).long()
+        am[:, :2 + NZ] = 1
+        batch = {"input_ids": ids, "attention_mask": am, "labels": ids.clone(),
+                 "pixel_values": torch.zeros(2, 3, 4, 4),
+                 "vext_pixels": torch.zeros(2, 3, 4, 4)}
+        TV.forward_ce(_M(), None, _Br(), batch, torch.device("cpu"), z_drop=a)
+        got = seen["attention_mask"]
+        assert got.shape[1] == ids.shape[1] + NQ
+        assert bool((got[:, a] == 0).all())                  # Z bị che
+        keep = [k for k in range(2, 2 + NZ) if k not in a.tolist()]
+        assert bool((got[:, keep] == 1).all())               # Z còn lại
+        assert bool((got[:, 2 + NZ:2 + NZ + NQ] == 1).all()) # Q KHÔNG bị che
+        assert int((got == 0).sum()) == int((am == 0).sum()) + 2 * a.numel()
+        TV.forward_ce(_M(), None, _Br(), batch, torch.device("cpu"))   # val: đủ Z
+        assert int((seen["attention_mask"] == 0).sum()) == int((am == 0).sum())
+        try:                                                   # vị trí sai -> DỪNG
+            TV.forward_ce(_M(), None, _Br(), batch, torch.device("cpu"),
+                          z_drop=torch.tensor([0]))
+        except TrainUnusable:
+            pass
+        else:
+            raise AssertionError("mặt nạ trỏ vào token không phải ảnh phải bị từ chối")
     finally:
-        (s0.decoder_width, s0.assert_same_pixels,
-         s0.ImageOnlyDataset.__getitem__, R.backbone_body) = orig
+        rc.encode_vision, rc.build_inputs_embeds, rc.image_token_id, rc.float_dtype = orig
+
+    # ── Gemma 3 THẬT (tí hon): token bị che KHÔNG ảnh hưởng gì, kể cả với ─
+    # mask hai chiều của khối ảnh (token_type_ids) ─────────────────────────
+    from transformers import Gemma3Config, Gemma3ForConditionalGeneration
+
+    torch.manual_seed(0)
+    tc = dict(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+              num_attention_heads=2, num_key_value_heads=1, head_dim=16,
+              sliding_window=8, max_position_embeddings=128)
+    vc = dict(hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+              num_attention_heads=2, image_size=28, patch_size=14)
+    for impl in ("eager", "sdpa"):
+        gc = Gemma3Config(text_config=tc, vision_config=vc, mm_tokens_per_image=4,
+                          image_token_index=63, boi_token_index=61, eoi_token_index=62)
+        gc._attn_implementation = impl
+        gc.text_config._attn_implementation = impl
+        m = Gemma3ForConditionalGeneration(gc).eval()
+        gi = torch.tensor([[2, 5, 61] + [63] * 4 + [62, 7, 8, 9, 10]])
+        tt = (gi == 63).long()
+        E = m.get_input_embeddings()(gi).detach()
+        drop = TV.z_mask_positions(gi, 63, 0.5, 0, 0)
+        mk = torch.ones_like(gi)
+        mk[:, drop] = 0
+
+        def run(emb):
+            with torch.no_grad():
+                return m(inputs_embeds=emb, attention_mask=mk,
+                         token_type_ids=tt).logits[0]
+
+        base = run(E)
+        E2 = E.clone()
+        E2[0, drop] += 5.0
+        E3 = E.clone()
+        E3[0, [k for k in range(3, 7) if k not in drop.tolist()][0]] += 5.0
+        keep_rows = [k for k in range(gi.shape[1]) if k not in drop.tolist()]
+        assert torch.isfinite(base).all(), impl
+        assert float((run(E2)[keep_rows] - base[keep_rows]).abs().max()) == 0.0, impl
+        assert float((run(E3)[8:] - base[8:]).abs().max()) > 1e-4, impl
 
 
-@check("17. main stage: CHỈ Aligner học (warm-up 10% từ bước 0 rồi phẳng); Compressor KHÔNG có nhóm lr nào; mốc theo TỈ LỆ nên dry-run vẫn đúng")
+@check("17. main stage: CHỈ CnA học (BA nhóm ffn/self/cross, warm-up 10% từ bước 0 rồi phẳng); mốc theo TỈ LỆ nên dry-run vẫn đúng")
 def _():
+    import inspect
+
     import src.train_vextractor as TV
     from src.config import load_config
-    from src.train_vextractor import BRANCH_GROUPS, align_lr_at, zcfg
+    from src.train_vextractor import BRANCH_GROUPS, MAIN_CFG_KEYS, cna_lr_at, zcfg
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     zc = zcfg(cfg)
-    N = 200                                    # 1 epoch = 200 bước (khoá theo $1)
-    # HAI nhóm, MỘT hàm lịch, trả {"ffn", "attn"} ────────────────────────
-    assert set(align_lr_at(0, zc, N)) == {"ffn", "attn"}
-    assert BRANCH_GROUPS == ("aligner_ffn", "aligner_attn")
-    # Compressor không còn lịch: hàm `comp_lr_at` PHẢI biến mất, vì một hàm
-    # lịch còn đó là một hàm ai đó gọi lại được mà không có khoá nào nuôi nó.
-    assert not hasattr(TV, "comp_lr_at")
-    # ── Aligner: dốc từ bước 0, chạm đỉnh ở 10%, rồi PHẲNG ───────────────
-    for grp in ("ffn", "attn"):
-        lo_k, hi_k = f"align_{grp}_lr_min", f"align_{grp}_lr_main"
-        assert align_lr_at(0, zc, N)[grp] == zc[lo_k] > 0
-        assert align_lr_at(20, zc, N)[grp] == zc[hi_k]
-        assert align_lr_at(199, zc, N)[grp] == zc[hi_k]
-        a = [align_lr_at(k, zc, N)[grp] for k in range(21)]
+    N = 200
+    assert set(cna_lr_at(0, zc, N)) == {"ffn", "self", "cross"}
+    assert BRANCH_GROUPS == ("cna_ffn", "cna_self", "cna_cross")
+    assert set(TV._GROUP_KEY) == set(BRANCH_GROUPS)
+    for gone in ("align_lr_at", "comp_lr_at"):
+        assert not hasattr(TV, gone), gone
+    for grp in ("ffn", "self", "cross"):
+        lo_k, hi_k = f"cna_{grp}_lr_min", f"cna_{grp}_lr_main"
+        assert cna_lr_at(0, zc, N)[grp] == zc[lo_k] > 0
+        assert cna_lr_at(20, zc, N)[grp] == zc[hi_k] == cna_lr_at(199, zc, N)[grp]
+        a = [cna_lr_at(k, zc, N)[grp] for k in range(21)]
         assert all(x <= y + 1e-18 for x, y in zip(a, a[1:]))
-    # CÙNG một dốc cho hai nhóm: chúng ở trong cùng một khối ngẫu nhiên
-    assert (align_lr_at(10, zc, N)["ffn"] / zc["align_ffn_lr_main"]
-            - align_lr_at(10, zc, N)["attn"] / zc["align_attn_lr_main"]) < 1e-9
-    # ── mốc theo TỈ LỆ: dry-run vài bước vẫn chạm được lr_main ────────────
+    # CÙNG một dốc cho ba nhóm
+    fr = [cna_lr_at(10, zc, N)[g] / zc[f"cna_{g}_lr_main"] for g in ("ffn", "self", "cross")]
+    assert max(fr) - min(fr) < 0.01
+    assert zc["cna_self_lr_main"] <= zc["cna_cross_lr_main"] <= zc["cna_ffn_lr_main"]
     for n_small in (10, 20, 40):
-        assert (align_lr_at(n_small - 1, zc, n_small)["ffn"]
-                == zc["align_ffn_lr_main"])
-    # Khai theo SỐ BƯỚC tuyệt đối thì ca trên hỏng im lặng — đó là lý do khoá
-    # là `*_frac`, và không có khoá `*_steps` nào trong MAIN_CFG_KEYS.
-    from src.train_vextractor import MAIN_CFG_KEYS
-
+        assert cna_lr_at(n_small - 1, zc, n_small)["ffn"] == zc["cna_ffn_lr_main"]
     assert not any(k.endswith("_steps") for k in MAIN_CFG_KEYS)
+    # `train_arm` KHÔNG còn nhận checkpoint Stage 1
+    assert "stage1_dir" not in inspect.signature(TV.train_arm).parameters
 
 
 @check("18. kéo Stage 0 từ Hub (giả lập): base khớp -> về máy, chạy tiếp epoch đuôi")
@@ -1911,7 +1791,7 @@ def _():
                      "sal_vext_act_64", "sal_vext_pre"):
             assert gone not in r, gone
     # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh,
-    # SMALL_IMG=64 thay cho 448² của cấu hình thật)
+    # SMALL_IMG=64 thay cho 384² của cấu hình thật)
     assert ra["sal_z"].shape == (8, 8)
     # Ô 3 CHỈ có ở lượt CÓ nhánh: nó là bản đồ của chính khối Q
     assert ra.get("sal_q") is None and rb["sal_q"] is not None
@@ -1999,9 +1879,9 @@ def _():
                      "Kiểm nhanh trước khi tin hình", "Đọc ba ô thế nào",
                      "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
                      "KHÔNG dính decoder", "teacher",
-                     f"{cfg['vextractor']['compressor']['n_query']} High-Q token",
-                     "Q → Aligner → Compressor → Extractor → I",
-                     "`Q[0]`", "448²"):
+                     f"{cfg['vextractor']['cna']['n_query']} High-Q token",
+                     "Q → CnA → Extractor → I",
+                     "`Q[0]`", "384²"):
             assert need in doc, need
         assert "`sal_z`" in doc and "`sal_q`" in doc
         assert json.dumps(out, default=str)
@@ -2109,11 +1989,10 @@ def _():
     except R.VExtractorUnusable as e:
         raise AssertionError(
             "không dựng được nhánh từ configs/vextractor.yaml, nên bài này "
-            "KHÔNG nói được README có khớp code hay không. Extractor "
-            "PyTorch nào; hãy cài `timm` và đảm bảo kiến trúc FocalNet có "
-            "thể khởi tạo trong môi trường hiện tại.\n"
+            "KHÔNG nói được README có khớp code hay không. Hãy cài `timm` và "
+            "đảm bảo MaxViT khởi tạo được trong môi trường hiện tại.\n"
             f"    Lý do thật: {e}") from e
-    ex, cp, al = br.extractor, br.compressor, br.aligner
+    ex, cp = br.extractor, br.cna
     dc = cfg["stage0"]["dino"]
     head = DN.DINOHead(ex.d_feat, dc["out_dim"], dc["hidden"], dc["bottleneck"],
                        dc["head_layers"])
@@ -2125,21 +2004,19 @@ def _():
     need = [
         (str(sp["extractor"]["arch"]), "arch"),
         (f"({ex.n_patch}, {ex.d_feat})", "V"),
-        (f"({cp.n_query}, {cp.d_latent})", "V_c"),
-        (f"SwiGLU {al.d_latent}→{al.mlp_hidden}→{al.d_latent}", "SwiGLU của Aligner"),
-        (f"Linear {al.d_latent}→{al.d_model}", "Linear Proj của Aligner"),
-        (f"SwiGLU {cp.d_latent}→{cp.mlp_hidden}→{cp.d_latent}", "FFN của Compressor"),
+        (f"({cp.n_query}, {cp.d_model})", "V_c"),
+        (f"SwiGLU {cp.d_latent}→{cp.mlp_hidden}→{cp.d_latent}", "FFN của CnA"),
+        (f"Linear {cp.d_latent}→{cp.d_model}", "Linear project cuối"),
         (f"`head_dim` = {cp.head_dim}", "head_dim khai"),
         (f"{cp.n_query} latent", "n_query"),
-        (f"`n_stages: {'null' if ex.n_stages is None else ex.n_stages}`", "lát cắt stage"),
-        # HAI khối SwiGLU, HAI khoá — README phải nói cả hai.
-        ("`vextractor.compressor.mlp_hidden`", "mlp_hidden của Compressor"),
-        ("`vextractor.aligner.mlp_hidden`", "mlp_hidden của Aligner"),
+        (f"`n_stages: {'null' if sp['extractor']['n_stages'] is None else sp['extractor']['n_stages']}`", "lát cắt stage"),
+        ("`local_size: 384`", "local crop resize lên cỡ ảnh nhánh"),
+        ("`vextractor.cna.mlp_hidden`", "mlp_hidden của CnA"),
         (f"{ex.n_patch} ô", "lưới"),
         (m(n(ex)), "tham số Extractor"),
         (m(n(cp.groups[0])), "tham số MỘT nhóm khối"),
-        (m(n(cp)), "tham số Compressor"),
-        (m(n(al)), "tham số Aligner"),
+        (m(n(cp.proj) + n(cp.n_proj)), "tham số Linear cuối"),
+        (m(n(cp)), "tham số CnA"),
         (m(n(br)), "tham số nhánh"),
         (m(sum(q.numel() for q in br.trainable_parameters())), "phần học được"),
         (m(n(head)), "DINO head"),
@@ -2175,7 +2052,7 @@ def _():
     assert not left, f"đặc tả còn con số KHÔNG khớp spec sống: {left}"
 
 
-@check("23. vân tay Stage 0 chỉ phụ thuộc EXTRACTOR: đổi Compressor/Aligner KHÔNG "
+@check("23. vân tay Stage 0 chỉ phụ thuộc EXTRACTOR: đổi CnA KHÔNG "
        "bắt finetune lại; checkpoint Stage 0 sống qua một lần bump FORMAT")
 def _():
     """Hai cổng từng bắt chạy lại một lượt DINO nhiều giờ mà KHÔNG có lý do.
@@ -2184,7 +2061,7 @@ def _():
        Extractor có mặt ở Stage 0, nên đổi chúng làm vân tay đổi và người chạy
        bị bảo `--restage0` cho một backbone y hệt.
     2. `load_stage0_into` đòi `format` BẰNG ĐÚNG `FORMAT`. Nhưng `FORMAT` bump
-       mỗi lần Compressor/Aligner đổi bố cục, trong khi Extractor y nguyên, nên
+       mỗi lần CnA đổi bố cục, trong khi Extractor y nguyên, nên
        một checkpoint hoàn toàn dùng được bị vứt.
     """
     import json
@@ -2196,7 +2073,7 @@ def _():
 
     def cfg_of(**over):
         vx = json.loads(json.dumps(small_cfg()["vextractor"]))
-        vx["main"] = {"align_lr_main": 1e-4}
+        vx["main"] = {"cna_ffn_lr_main": 1e-4}
         for blk, patch in over.pop("vx", {}).items():
             vx[blk] = dict(vx.get(blk) or {}, **patch)
         return {"seed": 42,
@@ -2209,19 +2086,19 @@ def _():
 
     # ── đổi phần NGOÀI Extractor -> vân tay KHÔNG được đổi ────────────────
     same = {
-        "d_latent": cfg_of(vx={"compressor": {"d_latent": 32}}),
-        "n_query": cfg_of(vx={"compressor": {"n_query": 3}}),
-        "head_dim": cfg_of(vx={"compressor": {"head_dim": 8}}),
-        "n_blocks": cfg_of(vx={"compressor": {"n_blocks": 3}}),
-        "dropout": cfg_of(vx={"compressor": {"dropout": 0.1}}),
+        "d_latent": cfg_of(vx={"cna": {"d_latent": 32}}),
+        "n_query": cfg_of(vx={"cna": {"n_query": 3}}),
+        "head_dim": cfg_of(vx={"cna": {"head_dim": 8}}),
+        "n_blocks": cfg_of(vx={"cna": {"n_blocks": 3}}),
+        "dropout": cfg_of(vx={"cna": {"dropout": 0.1}}),
+        "mlp_hidden": cfg_of(vx={"cna": {"mlp_hidden": 999}}),
         "image_size": cfg_of(vx={"extractor": {"image_size": SMALL_IMG * 2}}),
-        "aligner": cfg_of(vx={"aligner": {"mlp_hidden": 999}}),
-        "main": cfg_of(vx={"main": {"align_lr_main": 0.5}}),
+        "main": cfg_of(vx={"main": {"cna_ffn_lr_main": 0.5}}),
     }
     drift = [k for k, c in same.items() if s0.config_fingerprint(c) != ref]
     assert not drift, (
         f"đổi {drift} làm vân tay Stage 0 đổi — những khoá ấy tả "
-        f"Compressor/Aligner, Stage 0 không dựng chúng, và bắt finetune lại vì "
+        f"CnA, Stage 0 không dựng nó, và bắt finetune lại vì "
         f"chúng là bắt trả vài giờ GPU cho một Extractor y hệt.")
 
     # ── đổi EXTRACTOR -> vân tay PHẢI đổi (cổng vẫn còn răng) ─────────────
@@ -2314,7 +2191,7 @@ def _():
         for key, val in (("d_latent", 32), ("n_query", 3), ("head_dim", 8),
                          ("n_blocks", 4)):
             c2 = Cfg(json.loads(json.dumps(dict(cfg))))
-            c2["vextractor"]["compressor"][key] = val
+            c2["vextractor"]["cna"][key] = val
             assert s0.finished(c2) is not None, f"đổi {key} không được bắt chạy lại"
 
         # ĐỔI Extractor / stage0 / seed -> PHẢI bắt chạy lại, và nói rõ chỗ lệch
@@ -2343,111 +2220,59 @@ def _():
         assert s0.diff_inputs(d, h2, cfg) != [], "thiếu spec phải rơi về hash"
 
 
-@check("25. BA giai đoạn: Stage 0 dạy Extractor · Stage 1 chưng cất Compressor từ "
-       "teacher ĐÓNG BĂNG · main dạy ĐÚNG Aligner + LoRA")
+@check("25. HAI giai đoạn: Stage 0 dạy Extractor · main dạy ĐÚNG CnA + LoRA; Stage 1 đã bị gỡ HẲN")
 def _():
-    """Mỗi giai đoạn dạy ĐÚNG MỘT khối, và ranh giới phải kiểm được.
+    """Mỗi giai đoạn dạy ĐÚNG MỘT khối, và Stage 1 không còn lối vào nào."""
+    import importlib.util
 
-    Ba chỗ dễ lệch lặng lẽ, và bài này khoá cả ba:
-
-      1. Stage 1 vô tình cập nhật Extractor (teacher phải ĐỨNG YÊN — nó đang
-         sinh nhãn cho chính mình thì phép chưng cất không còn nghĩa gì);
-      2. checkpoint Stage 1 mang theo Extractor hoặc Aligner — hai bản của cùng
-         một tensor, hoặc một Aligner đã học đè lên một Aligner phải ngẫu nhiên;
-      3. main stage vô tình để Compressor học tiếp — Stage 1 là giai đoạn DUY
-         NHẤT của nó, nên một nhóm lr sót lại ở `vextractor.main` là một khối
-         đang đổi trong khi bảng đặc tả nói nó đứng yên (bài 7 và 17 khoá chỗ
-         này từ hai phía: trạng thái của nhánh, và khối config).
-    """
-    import json as _json
-
-    import torch
-
-    from src import dino as D
-    from src import stage1_vextractor as s1
     from src import vextractor as R
-    from src.config import Cfg, load_config
-
-    cfg = load_config(ROOT / "configs/vextractor.yaml")
-
-    # ── config Stage 1 mượn DINO của Stage 0, và ép n_local = 0 ───────────
-    sc = s1.s1cfg(cfg)
-    dc0 = cfg["stage0"]["dino"]
-    assert sc["dino"]["n_local"] == 0 != int(dc0["n_local"])
-    for k in ("teacher_temp", "student_temp", "center_momentum", "out_dim", "pool"):
-        assert sc["dino"][k] == dc0[k], k     # KHÔNG được lệch công thức DINO
-    for bad in ("n_local", "pool", "out_dim", "dino", "lr"):
-        b = Cfg(_json.loads(_json.dumps(dict(cfg))))
-        b["stage1"] = dict(b["stage1"], **{bad: 1})
-        try:
-            s1.s1cfg(b)
-        except Exception as e:  # noqa: BLE001
-            assert "khoá lạ" in str(e), (bad, e)
-        else:
-            raise AssertionError(f"stage1.{bad} phải bị từ chối")
-
-    # ── vân tay Stage 1: Extractor + hình dạng Compressor + Stage 0, KHÔNG Aligner ──
-    ins = s1.cfg_inputs(cfg)
-    assert set(ins) == {"stage1", "backbone", "compressor_shape", "seed", "stage0"}
-    assert set(ins["compressor_shape"]) == {"n_query", "d_latent", "head_dim",
-                                            "mlp_hidden", "n_blocks"}
-    f0 = s1.config_fingerprint(cfg)
-    # Giá trị "khác" phải SUY RA từ cấu hình sống, không gõ tay: một hằng số
-    # gõ tay có ngày TRÙNG với cấu hình thật, và lúc ấy phép thử thành no-op —
-    # bài kiểm vẫn xanh trong khi nó không còn thử gì. Đã xảy ra: `n_query=8`
-    # từng là "khác", rồi `n_query` thật đổi thành 8.
-    _al = cfg["vextractor"]["aligner"]["mlp_hidden"]
-    _nq = cfg["vextractor"]["compressor"]["n_query"]
-    _lr = cfg["stage0"]["lr_max"]
-    c2 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c2["vextractor"]["aligner"] = dict(c2["vextractor"]["aligner"], mlp_hidden=_al * 2)
-    assert s1.config_fingerprint(c2) == f0, "đổi Aligner KHÔNG được bắt chạy lại Stage 1"
-    c3 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c3["vextractor"]["compressor"] = dict(c3["vextractor"]["compressor"], n_query=_nq + 1)
-    assert s1.config_fingerprint(c3) != f0, "đổi Compressor PHẢI bắt chạy lại Stage 1"
-    c4 = Cfg(_json.loads(_json.dumps(dict(cfg))))
-    c4["stage0"] = dict(c4["stage0"], lr_max=_lr * 10)
-    assert s1.config_fingerprint(c4) != f0, "đổi Stage 0 PHẢI bắt chạy lại Stage 1"
-
-    # ── CompressorTransferTrainer: teacher ĐỨNG YÊN, grad CHỈ tới Compressor ──
-    torch.manual_seed(0)
-    sp = small_spec()
-    br = R.VExtractorBranch(sp)
-    ex, cp = br.extractor, br.compressor
-    dc = dict(sc["dino"], out_dim=32, hidden=16, bottleneck=8, head_layers=2)
-    th = D.DINOHead(ex.d_feat, 32, 16, 8, 2)
-    tr = D.CompressorTransferTrainer(ex, cp, th, dc, cp.d_latent)
-    assert not any(p.requires_grad for p in tr.teacher_head.parameters())
-    assert not any(p.requires_grad for p in ex.body.parameters())
-    assert ex.frozen
-    x = torch.randn(2, 3, SMALL_IMG, SMALL_IMG)
-    tr.loss([x, torch.randn_like(x)], dc["teacher_temp"]).backward()
-    assert all(p.grad is None for p in ex.body.parameters()), "Extractor KHÔNG được có grad"
-    assert all(p.grad is None for p in tr.teacher_head.parameters())
-    assert any(p.grad is not None for p in cp.parameters())
-    assert all(p.grad is None for p in br.aligner.parameters()), "Aligner không có ở Stage 1"
-    # KHÔNG có EMA ở Stage 1: teacher là checkpoint, không phải trung bình trượt
-    assert not hasattr(tr, "ema_update") and not hasattr(tr, "teacher_body")
-    # BA nhóm optimizer, và `head` đi cùng lr của `ffn`
-    gp = tr.param_groups(1e-8, 1e-7)
-    assert [g["name"] for g in gp] == ["attn", "ffn", "head"]
-    assert gp[0]["lr"] == 1e-8 and gp[1]["lr"] == gp[2]["lr"] == 1e-7
-    ids = {id(q) for g in gp for q in g["params"]}
-    assert not (ids & {id(q) for q in tr.teacher_head.parameters()})
-
-    # ── pipeline: Stage 1 nằm GIỮA Stage 0 và main, và cờ kéo theo nhau ───
+    from src.config import load_config
     from src.run_vextractor import COMMANDS
 
-    st = COMMANDS["train"]
-    assert st.index("stage0") < st.index("stage1") < st.index("train")
+    # ── pipeline: Stage 0 rồi main, KHÔNG còn stage1 ──────────────────────
+    for cmd in ("train", "all"):
+        st = COMMANDS[cmd]
+        assert "stage1" not in st, (cmd, st)
+        assert st.index("stage0") < st.index("train")
+    assert importlib.util.find_spec("src.stage1_vextractor") is None
     rsrc = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
-    assert '"--restage1"' in rsrc
-    assert "a.restage1 = a.retrain = True" in rsrc    # --restage0 kéo theo Stage 1
-    assert "stage1_dir=s1dir / s1.CKPT" in rsrc
-    # cờ của bản cũ đã biến mất hẳn
-    for gone in ("--restage02", "--refinal", "stage02", "final_anneal"):
+    for gone in ("--restage1", "stage1_dir", "stage1_vextractor", "--restage02",
+                 "--refinal", "final_anneal"):
         assert gone not in rsrc, gone
+    assert "a.retrain = True" in rsrc                  # --restage0 kéo theo main
+    from src import dino as D
+    assert not hasattr(D, "CompressorTransferTrainer")
+    for gone in ("save_compressor", "load_compressor_into", "compressor_exists",
+                 "Compressor", "Aligner", "build_aligner"):
+        assert not hasattr(R, gone), gone
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    assert "stage1" not in cfg
+    assert set(cfg["vextractor"]) == {"extractor", "cna", "main"}
+    from src import config as C
+    assert not any(k.startswith("stage1.") for k in C.GPU_KEYS)
+    sh = (ROOT / "scripts/run_vextractor.sh").read_text(encoding="utf-8")
+    assert "restage1" not in sh and "Stage 1" not in sh
+    # Lưu trữ bản cũ để tra cứu, nhưng src/ không import nó
+    assert (ROOT / "_archive/stage1_compressor/stage1_vextractor.py").exists()
 
+    # ── BN của MaxViT: DINO giữ BN ở eval khi freeze_bn ────────────────────
+    import torch.nn as nn
+
+    body = nn.Sequential(nn.Conv2d(3, 4, 3), nn.BatchNorm2d(4))
+    body.forward_features = body.forward
+    dc = {"out_dim": 8, "hidden": 8, "bottleneck": 4, "head_layers": 2,
+          "center_momentum": 0.9, "student_temp": 0.1, "pool": "mean",
+          "freeze_bn": True}
+    tr = D.DinoTrainer(body, 4, 0, dc, "NCHW")
+    tr.train()
+    assert all(not m.training for m in tr.bn_modules())
+    assert tr.student_head.training                       # phần khác vẫn train
+    assert all(p.requires_grad for m in tr.student_body.modules()
+               if isinstance(m, nn.BatchNorm2d) for p in m.parameters())
+    tr2 = D.DinoTrainer(nn.Sequential(nn.Conv2d(3, 4, 3), nn.BatchNorm2d(4)), 4, 0,
+                        dict(dc, freeze_bn=False), "NCHW")
+    tr2.train()
+    assert all(m.training for m in tr2.bn_modules())
 
 print()
 if FAILS:
