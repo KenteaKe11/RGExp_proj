@@ -47,17 +47,10 @@ requires:
   min_vram_gb: 15
 
 set:
-  # ── Huấn luyện adapter — KHOÁ của $1, KHÔNG phải khoá của card ──────────
-  # 1, y hệt rtx3060, và đây là chỗ DUY NHẤT của file này không được chỉnh theo
-  # VRAM. Batch LOGIC mỗi lượt là một phần LỊCH HỌC của candidate A: với
-  # grad_accum, loss của mỗi micro-batch được lấy trung bình theo token TRONG
-  # micro-batch ấy rồi mới chia cho accum, nên đổi 1 -> 2 là đổi cách lấy
-  # trung bình, tức đổi gradient — và B không còn đứng cùng bảng với A.
-  # `train_vextractor.train` nói thẳng điều đó khi OOM, và
-  # `fixture.set_lock("train_batch")` giữ số đã khoá, bỏ qua số mới.
-  #
-  # VRAM thừa của card này vì thế đi vào chỗ khác: mảnh VẬT LÝ của main stage
-  # (CE ghép lại theo token nên gradient KHÔNG đổi), Stage 0 và sinh.
+  # ── Huấn luyện adapter ─────────────────────────────────────────────────
+  # Chỉ batch HIỆU DỤNG (`effective_batch` = 32) phải bằng A. Batch mỗi lượt
+  # là KHỞI ĐIỂM: autobatch dò VRAM và chọn ước lớn nhất của 32 vừa ngân sách,
+  # grad_accum = 32 / batch.
   train.per_device_batch_size: 1
   # Giữ true. Nó không đụng tới phép toán (chỉ đổi thời gian ↔ activation), nên
   # `false` là một khoá TỐC ĐỘ hợp lệ trên 16 GB — nhưng chỉ sau khi đã thấy
@@ -66,8 +59,8 @@ set:
   train.prefetch: true            # dựng micro-batch kế tiếp trong 1 luồng nền
 
   # ── Stage 0 (KHÔNG nạp Gemma) ────────────────────────────────
-  # Đây mới là chỗ 4 GB thừa có nghĩa: hai giai đoạn này KHÔNG có ràng buộc nào
-  # từ A, nên mảnh vật lý được phép leo tới tận `batch_size` = 32.
+  # Không có ràng buộc nào từ A: mảnh vật lý được phép leo tới tận
+  # `batch_size` = 32.
   #
   # Stage 0 giữ student và teacher Extractor DINOv3 ViT-S/16 (~21,6 M mỗi nhánh)
   # cùng DINO head (2,63 M mỗi nhánh).

@@ -56,8 +56,8 @@ Extractor. `VExtReportDataset` gắn nó vào đúng chỗ `ClsReportDataset` m�
 ngay ở `forward_ce` thay vì lặng lẽ huấn luyện với Q của ảnh khác.
 
 Giữ nguyên so với A (đọc từ fixture $1 / config chung): 6400 mẫu train, thứ tự
-torch.randperm(Generator(seed)), batch mỗi lượt đã khoá (`train_batch`),
-grad_accum, 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear của
+torch.randperm(Generator(seed)), batch HIỆU DỤNG 32 (batch mỗi lượt do
+autobatch chọn theo VRAM, grad_accum = 32 / batch), 1 epoch = 200 bước, max_seq_len, LoRA r32 α64 trên mọi Linear của
 decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước.
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian mỗi
@@ -116,7 +116,7 @@ def zcfg(cfg: Cfg) -> dict:
     (tỉ lệ token Z bị che mỗi optimizer step; 0 = tắt).
 
     Mốc khai theo **TỈ LỆ** chứ không theo số bước: main stage khoá 1 epoch =
-    200 bước theo $1, nhưng `--dry-run` và mọi lần đổi `train_batch` đổi con số
+    200 bước theo $1, nhưng `--dry-run` và mọi lần đổi `effective_batch` đổi con số
     ấy.
     """
     m = dict(dict(cfg.get("vextractor") or {}).get("main") or {})
@@ -427,7 +427,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     zc = zcfg(cfg)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    bs = int(tcfg.get("per_device_batch_size", 1))      # = khoá `train_batch` của $1
+    bs = int(tcfg.get("per_device_batch_size", 1))      # điểm xuất phát; autobatch chọn lại
     accum = int(tcfg.get("grad_accum", 32))
     try:
         return _train_once(cfg, arm, preset, train_df, out_dir, Path(stage0_best),
@@ -440,10 +440,10 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
         if not oom:
             raise
         raise TrainUnusable(
-            f"{aid} HẾT VRAM ({note}). Batch logic {bs} × accum {accum} là khoá "
-            f"của $1 và KHÔNG được đổi (nó là một phần lịch học của A). Mảnh vật "
-            f"lý đã tự hạ tới mức nhỏ nhất đo được; còn hết VRAM thì: tắt tiến "
-            f"trình khác trên card, hoặc hạ `autobatch.target_frac`.") from None
+            f"{aid} HẾT VRAM ({note}). Batch hiệu dụng {bs * accum} giữ nguyên; "
+            f"batch mỗi lượt đã được autobatch chọn theo VRAM đo được. Còn hết "
+            f"VRAM thì: tắt tiến trình khác trên card, hoặc hạ "
+            f"`autobatch.target_frac`.") from None
 
 
 def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
@@ -586,7 +586,11 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         print(f"  ⚠ CnA warm-up {n_awarm} >= tổng {steps} bước: nó KHÔNG "
               f"bao giờ chạm lr_main.", flush=True)
 
-    # ── mảnh vật lý của micro-batch logic `bs` ─────────────────────────────
+    # ── batch mỗi lượt: autobatch chọn theo VRAM, batch HIỆU DỤNG giữ nguyên ─
+    # Chỉ `effective_batch` (= bs × accum, khoá trong fixture) quyết định lịch
+    # học: số bước, đường lr, thứ tự dữ liệu (`next_idx` tiêu đúng `eff` mẫu mỗi
+    # optimizer step dù chia thế nào). Batch mỗi lượt là chuyện VRAM: chọn ước
+    # LỚN NHẤT của `eff` vừa ngân sách, accum = eff / bs.
     from . import autobatch
     from .config import Cfg as _C
 
@@ -607,14 +611,16 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         ce.backward()
 
     ab_cfg = _C(dict(cfg, autobatch=dict(cfg.get("autobatch") or {}, enabled=True)))
-    chunk, ab_rep = autobatch.autotune(ab_cfg, f"{aid}/chunk", bs, bs, _probe,
-                                       modules=(model, branch),
-                                       cands=autobatch.divisors(bs))
+    eff = bs * accum
+    bs, ab_rep = autobatch.autotune(ab_cfg, f"{aid}/train", eff, bs, _probe,
+                                    modules=(model, branch),
+                                    cands=autobatch.divisors(eff))
+    accum = eff // bs
+    chunk = bs
     opt.zero_grad(set_to_none=True)
     opt_b.zero_grad(set_to_none=True)
     print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs * accum} · "
-          f"{steps} bước ({steps_per_epoch}/epoch) · mảnh vật lý {chunk}"
-          f"{' (= batch, không chia)' if chunk == bs else ' (CE ghép theo token)'}",
+          f"{steps} bước ({steps_per_epoch}/epoch) · batch mỗi lượt do autobatch chọn",
           flush=True)
 
     # ── thứ tự dữ liệu: y như A ─────────────────────────────────────────────
