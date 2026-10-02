@@ -18,11 +18,11 @@ báo cáo dùng CHUNG 5 ảnh ấy theo cùng thứ tự (cột 1..5).
 ═══ 1. VISION — Grad-CAM (Grad-CAM++ tuỳ chọn) ═════════════════════════════════
 
 Ảnh nền (identity) LUÔN là X — ảnh 448² đi vào Extractor. Bản đồ lấy ở đầu ra
-một stage của backbone (`lens.cam_stage`, mặc định −2 = stage 3 của MaxViT, lưới
-28×28 ở 448²), với hai loại TARGET:
+một khối của backbone (`lens.cam_stage`, mặc định −1 = block cuối của ViT-S/16,
+lưới 28×28 ở 448², bỏ 5 prefix token cls + register), với hai loại TARGET:
 
-    dòng 1 · target = đầu ra Extractor : s = ‖V‖²_F            (V: 196 × 512)
-    dòng 2 · target = đầu ra CnA, Q[i] : s_i = ‖V_c[i]‖²        (V_c: 16 × 2560)
+    dòng 1 · target = đầu ra Extractor : s = ‖V‖²_F            (V: 784 × 384)
+    dòng 2 · target = đầu ra CnA, Q[i] : s_i = ‖V_c[i]‖²        (V_c: n_query × 2560)
 
     Grad-CAM   : w_c = mean_hw ∂s/∂A_c ;  CAM = ReLU(Σ_c w_c A_c)
     Grad-CAM++ : w_c = Σ_hw α_c,hw · ReLU(∂s/∂A_c,hw),
@@ -32,7 +32,7 @@ Mỗi bản đồ chuẩn hoá min–max về [0, 1] của CHÍNH nó (`scale_ca
 suy bilinear lên 448² rồi chồng lên X bằng overlay MẶC ĐỊNH của Grad-CAM
 (`show_cam_on_image`: JET, image_weight 0.5, use_rgb) — so HÌNH DẠNG giữa các ô,
 không so độ sáng. Trang HTML: 5 cột = 5 mẫu; dòng 1 cố
-định, dòng 2 đổi theo thanh Q[i] (0..15, phím ← →).
+định, dòng 2 đổi theo thanh Q[i] (0..n_query−1, phím ← →).
 
 Backbone chạy ở chế độ main stage (teacher inference: `eval()`, tham số
 `requires_grad=False`); đồ thị gradient chỉ được nối từ activation của stage đã
@@ -113,7 +113,7 @@ def lcfg(cfg: Cfg) -> dict:
            else int(cfg.get("seed", 42)),
            "target": str(c.get("target", "ref_logprob")).lower(),
            "cam": str(c.get("cam", "gradcam")).lower(),
-           "cam_stage": int(c.get("cam_stage", -2)),
+           "cam_stage": int(c.get("cam_stage", -1)),
            "cam_image_weight": float(c.get("cam_image_weight", 0.5)),
            "percentile_clip": float(c.get("percentile_clip", 99.0)),
            "reach_frac": float(c.get("reach_frac", 0.10)),
@@ -559,22 +559,45 @@ def _cam(A, G, method: str) -> np.ndarray:
 
 
 def _cam_module(branch, stage: int):
+    """Module lấy CAM: `stages[k]` (họ phân cấp) hoặc `blocks[k]` (họ ViT)."""
     body = branch.extractor.body
-    stages = getattr(body, "stages", None)
-    if stages is None:
-        stages = getattr(body, "layers", None)
-    if stages is None or len(stages) == 0:
+    mods = getattr(body, "stages", None)
+    if mods is None:
+        mods = getattr(body, "layers", None)
+    if mods is None:
+        mods = getattr(body, "blocks", None)
+    if mods is None or len(mods) == 0:
         raise TrainUnusable(
-            f"{branch.extractor.arch!r} không có `.stages` — Grad-CAM cần một bản "
-            f"đồ đặc trưng không gian giữa backbone.")
+            f"{branch.extractor.arch!r} không có `.stages` / `.blocks` — Grad-CAM cần "
+            f"một bản đồ đặc trưng không gian giữa backbone.")
     try:
-        return stages[stage], (stage % len(stages))
+        return mods[stage], (stage % len(mods))
     except IndexError as e:
         raise TrainUnusable(f"lens.cam_stage {stage} ngoài khoảng "
-                            f"[-{len(stages)}, {len(stages) - 1}].") from e
+                            f"[-{len(mods)}, {len(mods) - 1}].") from e
 
 
-def vision_cams(branch, px, dev, stage: int = -2, method: str = "gradcam") -> dict:
+def _to_chw(t, fmt: str, n_prefix: int):
+    """Activation/gradient của một mẫu -> (C, h, w).
+
+    NCHW giữ nguyên; NHWC đổi trục; chuỗi token (N, C) của ViT bỏ `n_prefix` token
+    đầu (cls + register) rồi xếp lại thành lưới vuông — reshape_transform của Grad-CAM
+    cho ViT.
+    """
+    t = t.float()
+    if t.dim() == 2:
+        t = t[int(n_prefix):]
+        n = int(t.shape[0])
+        side = int(round(math.sqrt(n)))
+        if side * side != n:
+            raise TrainUnusable(f"lưới token {n} ô không vuông — không dựng được CAM.")
+        return t.reshape(side, side, -1).permute(2, 0, 1)
+    if fmt == "NHWC":
+        return t.permute(2, 0, 1)
+    return t
+
+
+def vision_cams(branch, px, dev, stage: int = -1, method: str = "gradcam") -> dict:
     """-> {"extractor": (h, w), "q": (n_query, h, w), "grid": (h, w), "stage": k}.
 
     MỘT lượt forward, `1 + n_query` lượt backward (retain_graph) — mọi target
@@ -604,16 +627,12 @@ def vision_cams(branch, px, dev, stage: int = -2, method: str = "gradcam") -> di
         A = hold["a"]
         scores = [v.float().pow(2).sum()]
         scores += [vc[0, i].float().pow(2).sum() for i in range(vc.shape[1])]
-        A0 = A[0].float()
-        if fmt == "NHWC":
-            A0 = A0.permute(2, 0, 1)
+        npre = int(branch.extractor.n_prefix)
+        A0 = _to_chw(A[0], fmt, npre)
         maps = []
         for j, s in enumerate(scores):
             (g,) = torch.autograd.grad(s, A, retain_graph=j < len(scores) - 1)
-            g0 = g[0].float()
-            if fmt == "NHWC":
-                g0 = g0.permute(2, 0, 1)
-            maps.append(_cam(A0, g0, method))
+            maps.append(_cam(A0, _to_chw(g[0], fmt, npre), method))
     finally:
         h.remove()
         branch.train(was_train)
@@ -794,11 +813,11 @@ dòng 1: target = đầu ra Extractor (‖V‖²) · dòng 2: target = đầu ra
 <div class="wrap"><div class="grid" id="grid"></div></div>
 <div id="zoom" onclick="this.classList.remove('on')"><img id="zimg"></div>
 <div class="notes">
-<p><b>Cách đọc.</b> Dòng 1 cố định: vùng ảnh mà toàn bộ đầu ra Extractor (196 token × 512)
+<p><b>Cách đọc.</b> Dòng 1 cố định: vùng ảnh mà toàn bộ đầu ra Extractor V
 nhạy nhất. Dòng 2 đổi theo Q[i]: vùng ảnh mà riêng latent <code>V_c[i]</code> phụ thuộc.
 So dòng 2 với dòng 1: trùng = Q[i] lấy đúng phần backbone nhấn mạnh; lệch = Q[i] chuyên
 về một vùng riêng. Lật qua các Q[i]: nhiều Q cùng một vùng = latent trùng lặp; mỗi Q một
-vùng = 16 latent chia nhau ảnh. Bấm vào ảnh để phóng to (Esc để đóng); phím ← → đổi Q[i].</p>
+vùng = các latent chia nhau ảnh. Bấm vào ảnh để phóng to (Esc để đóng); phím ← → đổi Q[i].</p>
 <p><b>Caption.</b> <code>max/mean</code> ≈ 1 và <code>top10%</code> ≈ 10% = bản đồ phẳng
 (không tập trung). <code>decoder đọc</code> = phần độ nhạy của khối Q mà decoder dồn vào
 Q[i] trên ảnh đó (từ báo cáo Language). <code>bệnh</code> = bệnh có p cao nhất trong

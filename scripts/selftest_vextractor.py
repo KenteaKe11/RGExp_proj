@@ -23,7 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
+ 16. MASK REGULARIZATION: 50% token Z bị che qua attention_mask mỗi optimizer
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
@@ -415,35 +415,44 @@ def _():
     assert not torch.allclose(br(x), before)
 
 
-@check("2a. MaxViT-T 224 ở 448²: đầu ra CHUẨN stride 32 -> 14×14 = 196 ô × 512, ~30,40 M; "
-       "giữ cửa sổ 7 (KHÔNG dựng với img_size=448), nạp state_dict gốc strict; chạy được ở 224² (multi-crop)")
+@check("2a. DINOv3 ViT-S/16 ở 448²: 5 prefix token (cls + 4 register) bị cắt -> 28×28 = 784 ô × 384, ~21,59 M; chạy được ở 224² (multi-crop); Grad-CAM của Lens chạy trên block ViT")
 def _():
-    import timm
+    import numpy as np
     import torch
 
+    from src import lens_vextractor as LZ
     from src import vextractor as R
     from src.config import load_config
     from src.stage0_vextractor import dino_cfg
 
-    net, d_feat, n_patch, _nl, kind, fmt, multi_res, n_st = R.backbone_body(
-        "maxvit_tiny_tf_224.in1k", False, 448)
-    assert (kind, fmt, d_feat, n_patch, n_st) == ("conv", "NCHW", 512, 196, 4)
-    assert 30.0e6 < sum(p.numel() for p in net.parameters()) < 31.0e6
+    net, d_feat, n_patch, n_layers, kind, fmt, multi_res, _ns = R.backbone_body(
+        "vit_small_patch16_dinov3.lvd1689m", False, 448)
+    assert (kind, fmt, d_feat, n_patch, n_layers) == ("vit", "NLC", 384, 784, 12)
+    assert int(getattr(net, "num_prefix_tokens", 0)) == 5
+    assert 21.0e6 < sum(p.numel() for p in net.parameters()) < 22.0e6
     assert multi_res is True
-    # cửa sổ GỐC 7 — `img_size=448` sẽ đổi nó thành 14 và đổi shape bias vị trí
-    assert tuple(net.stages[0].blocks[0].attn_block.partition_size) == (7, 7)
-    ref = timm.create_model("maxvit_tiny_tf_224.in1k", pretrained=False,
-                            num_classes=0, global_pool="")
-    net.load_state_dict(ref.state_dict(), strict=True)
     net.eval()
     with torch.no_grad():
-        assert tuple(net.forward_features(torch.zeros(1, 3, 448, 448)).shape) == (1, 512, 14, 14)
-        assert tuple(net.forward_features(torch.zeros(1, 3, 224, 224)).shape) == (1, 512, 7, 7)
+        assert tuple(net.forward_features(torch.zeros(1, 3, 224, 224)).shape) == (1, 5 + 196, 384)
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    assert cfg["vextractor"]["extractor"]["image_size"] == 448
-    assert cfg["vextractor"]["extractor"]["arch"] == "maxvit_tiny_tf_224.in1k"
+    ex = cfg["vextractor"]["extractor"]
+    assert (ex["arch"], ex["image_size"]) == ("vit_small_patch16_dinov3.lvd1689m", 448)
     dc = dino_cfg(cfg["stage0"])
-    assert (dc["global_size"], dc["local_size"], dc["n_local"]) == (448, 224, 6)
+    assert (dc["global_size"], dc["local_size"], dc["pool"]) == (448, 224, "cls")
+    # Extractor cắt ĐÚNG 5 prefix token: V là 784 patch, không lẫn cls/register
+    sp = R.spec_from_cfg(cfg, 64)
+    sp["extractor"]["pretrained"] = False
+    br = R.VExtractorBranch(sp)
+    br.set_frozen(True)
+    assert br.extractor.n_prefix == 5 and br.n_patch == 784
+    x = torch.randn(1, 3, 448, 448)
+    with torch.no_grad():
+        raw = br.extractor.patches_raw(x)
+        assert torch.equal(br.extractor.patches(x), raw[:, 5:])
+    # Grad-CAM trên block ViT: bỏ prefix, xếp lại thành lưới 28×28
+    cm = LZ.vision_cams(br, x, torch.device("cpu"), -1, "gradcam")
+    assert cm["grid"] == (28, 28) and cm["q"].shape == (br.n_query, 28, 28)
+    assert np.isfinite(cm["extractor"]).all() and cm["extractor"].max() > 0
 
 
 @check("2b'. Twins-SVT-S: NLC KHÔNG prefix token (n_prefix = 0), 448² -> 196 ô x 512, "
@@ -1228,7 +1237,7 @@ def _():
     assert (zc["cna_ffn_lr_min"], zc["cna_ffn_lr_main"]) == (1e-7, 1e-4)
     assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
     assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
-    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.50
     # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
     a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
     assert a0 == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
@@ -1285,6 +1294,7 @@ def _():
                                           pretrained=True)
     cfg["stage0"] = dict(cfg["stage0"],
                          dino=dict(cfg["stage0"]["dino"], global_size=SMALL_IMG,
+                                   pool="mean",            # ConvNeXt: không cls token
                                    local_size=SMALL_IMG // 2, n_local=2,
                                    out_dim=64, hidden=32, bottleneck=16),
                          batch_size=4, micro_batch=2, probe_sizes=[2, 4],
@@ -1474,7 +1484,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. MASK REGULARIZATION: che 25% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
+@check("16. MASK REGULARIZATION: che 50% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
     import types
 

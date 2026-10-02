@@ -1,7 +1,7 @@
 """Stage 0 — DINOv3 FINETUNING của Extractor. TỰ GIÁM SÁT, KHÔNG nhãn.
 
     ảnh CXR ─► multi-crop (2 global 448² + n local 224²)
-            ─► student = MaxViT-T 224 + DINO head ────┐
+            ─► student = DINOv3 ViT-S/16 + DINO head ─┐
             ─► teacher = EMA của student (no_grad)            ┴─► CE(t ‖ s) = loss
 
 **Thứ DUY NHẤT được huấn luyện là Extractor.** Không Cls Head, không ASL, không
@@ -9,15 +9,16 @@
 `src/vextractor.py` cho bố cục.
 
 **Không nạp Gemma.** Nhánh có encoder riêng, nên cả lượt finetune chỉ là
-Extractor là MaxViT-T 224 (`maxvit_tiny_tf_224.in1k`) đủ 4 stage, đầu ra chuẩn
-stride 32, chạy ở 448² (196 token), bỏ head phân loại: ~30,40 M trọng số (~30,92 M tính cả head 1000 lớp)
+Extractor là DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`), 12 block, chạy ở
+448² (784 patch token × 384, + 5 prefix token), không head: ~21,59 M trọng số
 + một DINO head, cộng một bản teacher EMA đầy đủ nữa trong VRAM. Thứ duy nhất còn
 cần từ decoder là `d_model` (2560) để ghi vào spec, đọc từ `AutoConfig`.
 
-**Điểm xuất phát:** `pretrained: true` tải trọng số MaxViT-T 224 (ImageNet-1k); các
+**Điểm xuất phát:** `pretrained: true` tải trọng số DINOv3 ViT-S/16 (LVD-1689M); các
 trọng số đó khởi tạo student và teacher. DINO head, optimizer và center được khởi
-tạo mới. MaxViT dùng BatchNorm: `stage0.dino.freeze_bn` (mặc định true) giữ thống
-kê chạy của BN cố định suốt Stage 0 (xem `src/dino.py`).
+tạo mới — tức là fine-tune DINOv3 bằng chính hàm mục tiêu DINO của nó trên CXR.
+ViT-S/16 chỉ có LayerNorm; `stage0.dino.freeze_bn` vô tác dụng với nó (chỉ giữ
+cho backbone có BatchNorm).
 
 ═══ LỊCH ══════════════════════════════════════════════════════════════════════
 
@@ -225,10 +226,10 @@ def dino_cfg(s: dict) -> dict:
         "hidden": int(d.get("hidden", 2048)),
         "bottleneck": int(d.get("bottleneck", 256)),
         "head_layers": int(d.get("head_layers", 3)),
-        # MaxViT trả LƯỚI (NCHW), KHÔNG có cls token -> `mean` là lựa chọn duy
-        # nhất chạy được, và `cls` bị từ chối ngay lúc dựng backbone.
-        "pool": str(d.get("pool", "mean")),
-        # Giữ BatchNorm (MaxViT) ở eval suốt Stage 0 — xem `src/dino.py`.
+        # DINOv3 ViT có cls token -> `cls` (đúng vector DINO chưng cất). Họ lưới
+        # (ConvNeXt/MaxViT) KHÔNG có cls token -> phải đặt `mean`.
+        "pool": str(d.get("pool", "cls")),
+        # Giữ BatchNorm (nếu backbone có) ở eval suốt Stage 0 — xem `src/dino.py`.
         "freeze_bn": bool(d.get("freeze_bn", True)),
         "student_temp": float(d.get("student_temp", 0.1)),
         "teacher_temp": float(d.get("teacher_temp", 0.04)),
@@ -333,7 +334,7 @@ def _backbone_cfg(cfg: Cfg) -> dict:
     `arch`), nên `arch` đã phủ nó.
 
     `image_size` cũng KHÔNG vào: Stage 0 dựng view từ `stage0.dino.global_size`
-    / `local_size`, và trọng số MaxViT không phụ thuộc độ phân giải.
+    / `local_size`, và trọng số ViT (RoPE) không phụ thuộc độ phân giải.
     """
     ex = dict((dict(cfg.get("vextractor") or {})).get("extractor") or {})
     return {k: ex.get(k) for k in Z.BACKBONE_CFG_KEYS}
@@ -608,7 +609,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame, tracker=None,
     if not spec["extractor"]["pretrained"]:
         raise TrainUnusable(
             "vextractor.extractor.pretrained = false: Stage 0 requires "
-            "pretrained MaxViT-T weights.")
+            "pretrained DINOv3 ViT-S/16 weights.")
     img_size = int(spec["extractor"]["image_size"])
     nz_mean, nz_std = Z.norm_of(spec)
 

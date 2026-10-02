@@ -5,7 +5,7 @@ tiếp chính hàm mục tiêu nó được sinh ra với, trên ảnh CXR. Khô
 không Cls Head, không F1/Recall — epoch được chọn theo loss tự giám sát trên một
 tập val CỐ ĐỊNH.
 
-**BatchNorm (MaxViT).** MaxViT chuẩn hoá MBConv bằng BatchNorm. Với micro-batch
+**BatchNorm (backbone có BN, vd. MaxViT; ViT không có).** MBConv chuẩn hoá bằng BatchNorm. Với micro-batch
 nhỏ và multi-crop (global 448² + local 224² đi qua CÙNG một BN ở các lượt khác
 nhau), thống kê chạy sẽ bị local crop kéo lệch rồi được teacher chép lại — và
 main stage chạy teacher ở `eval()`, tức là ĐỌC đúng thống kê lệch ấy. Nên
@@ -35,8 +35,8 @@ Bốn thứ giữ cho nó không sụp về một điểm (collapse), và cả b
   4. **multi-crop**: 2 global crop (448²) + `n_local` local crop (224²).
      Student thấy TẤT CẢ các view, teacher CHỈ thấy global. Mỗi cặp (view
      teacher, view student KHÁC nó) đóng góp một số hạng — đó là chỗ "local
-     MaxViT-T 224 dùng cửa sổ/lưới attention 7×7: 448² -> lưới 14×14, 224² ->
-     7×7, mọi stage chia hết cửa sổ, cùng MỘT state_dict — đã probe THẬT lúc dựng.
+     DINOv3 ViT-S/16 dùng RoPE: 448² -> 28×28 patch, 224² -> 14×14, cùng MỘT
+     state_dict — đã probe THẬT lúc dựng.
 
 **Tăng cường ảnh viết bằng PIL**, không kéo thêm torchvision: cùng đường với
 `vextractor.vext_tensor` (PIL -> uint8 -> tensor -> (x−mean)/std), nên ảnh của

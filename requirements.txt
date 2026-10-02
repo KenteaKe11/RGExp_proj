@@ -48,7 +48,8 @@ pillow>=10.0.0
 pyyaml>=6.0
 tqdm>=4.66.0
 
-timm>=1.0.0
+# DINOv3 ViT (vit_small_patch16_dinov3) có từ timm 1.0.20
+timm>=1.0.20
 
 # §2.5 cũ (`_archive/`) dùng ResNet-101/152 của torchvision. Pipeline §2.2 đang
 # chạy KHÔNG còn cần nó. KHÔNG ghim bản: torchvision phải khớp CHÍNH XÁC bản

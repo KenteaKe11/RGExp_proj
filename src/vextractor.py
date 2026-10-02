@@ -1,7 +1,7 @@
-"""MaxViT extractor và CnA (Compressor & Aligner) — nhánh bổ sung thị giác.
+"""DINOv3 ViT-S/16 extractor và CnA (Compressor & Aligner) — nhánh bổ sung thị giác.
 
-MaxViT-T 224 (`maxvit_tiny_tf_224.in1k`, đầu ra chuẩn stride 32) chạy ở ảnh 448x448
-cho lưới 14x14 token 512 kênh (V = 196 x 512). CnA là MỘT QFormer duy nhất: 16 latent @1024 đọc V qua
+DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`) chạy ở ảnh 448x448 cho lưới
+28x28 patch token 384 kênh (V = 784 x 384; 5 prefix token cls + register bị cắt). CnA là MỘT QFormer duy nhất: 8 latent @1024 đọc V qua
 Cross-attn (k/v chiếu 512 -> 1024), rồi một Linear cuối 1024 -> 2560 đưa chúng vào
 không gian của decoder (V_c = 16 x 2560, nối vào chuỗi sau token ảnh Z).
 """
@@ -181,7 +181,11 @@ def backbone_body(arch: str, pretrained: bool, image_size: int,
     """Backbone của timm, CẮT head -> (body, d_feat, n_patch, n_used, kind, fmt,
     multi_res, n_stages_used).
 
-    **MaxViT-T 224** (`maxvit_tiny_tf_224.in1k`): backbone phân cấp (MBConv có
+    **DINOv3 ViT-S/16** (`vit_small_patch16_dinov3.lvd1689m`, họ Eva của timm): trả
+    (B, N, C) NLC gồm 1 cls + 4 register token; vị trí bằng RoPE nên chạy mọi cỡ
+    ảnh chia hết 16 (448² -> 28×28 = 784 ô, 224² -> 14×14) trên cùng state_dict.
+
+    (Bản trước) **MaxViT-T 224** (`maxvit_tiny_tf_224.in1k`): backbone phân cấp (MBConv có
     BatchNorm + attention cửa sổ/lưới 7×7), trả (B, C, H, W) NCHW; đầu ra chuẩn
     stride 32: 448² -> lưới 14×14 = 196 ô × 512 kênh. Dựng ở cấu hình GỐC (nấc
     `plain`, cửa sổ 7) rồi chạy ở 448²: KHÔNG truyền `img_size=448`, vì timm suy
@@ -464,12 +468,13 @@ class Extractor(nn.Module):
     Stage 0. **Backbone không bao giờ mở lại** (trừ Lens, để nối đồ thị
     gradient tới tận pixel; xem `lens_vextractor`).
 
-    Với MaxViT-T 224 (đủ 4 stage, đầu ra chuẩn stride 32, bỏ head) ở 448²:
-    `(B, 196, 512)` = V (lưới 14×14 làm phẳng thành chuỗi token, không prefix).
+    Với DINOv3 ViT-S/16 (12 block, bỏ head) ở 448²: `forward_features` trả
+    (B, 5 + 784, 384); cắt 5 prefix token (cls + 4 register) -> `(B, 784, 384)` = V
+    (lưới 28×28 patch).
     """
 
     def __init__(self, image_size: int = 448,
-                 arch: str = "maxvit_tiny_tf_224.in1k",
+                 arch: str = "vit_small_patch16_dinov3.lvd1689m",
                  pretrained: bool = True, n_layers: int | None = None,
                  n_stages: int | None = None, normalize: dict | None = None):
         super().__init__()
@@ -565,7 +570,7 @@ class QFormerGroup(nn.Module):
     Pre-norm + residual quanh TỪNG khối con: `N` là RMSNorm, dấu `+` vòng quanh
     riêng khối con ngay trước nó. Năm dấu `+`, năm RMSNorm.
 
-    Khối 2 **không** có Cross-attn: nó để 16 vector thống nhất lại với nhau sau
+    Khối 2 **không** có Cross-attn: nó để các latent thống nhất lại với nhau sau
     khi vừa đọc xong ảnh.
 
     Tham số ở `d_latent` = 1024, `d_kv` = 512 (k/v chiếu 512→1024 ngay trong
@@ -627,11 +632,11 @@ class CnA(nn.Module):
         h   = group_i(h, kv)   với i = 1..N      (khối 1 → khối 2), N = n_blocks
         V_c = Linear(RMSNorm(h))                 1024 -> 2560 (Linear project cuối)
 
-    MỘT QFormer làm cả hai việc: **nén** lưới 196 ô vào 16 latent (Cross-attn của
+    MỘT QFormer làm cả hai việc: **nén** lưới 784 ô vào `n_query` (8) latent (Cross-attn của
     khối 1) và **căn chỉnh** chúng vào không gian ngữ nghĩa của decoder (Linear
     cuối). Không còn Aligner riêng.
 
-    * 16 latent là khoá KHAI (`n_query`) — lưới của Extractor chỉ là NGUỒN để hỏi.
+    * Số latent là khoá KHAI (`n_query`, 8) — lưới của Extractor chỉ là NGUỒN để hỏi.
     * `RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer;
       phép đổi chiều 512 → 1024 nằm trong `k_proj`/`v_proj` của Cross-attn.
     * `RMSNorm` trước Linear cuối giữ thang của V_c độc lập với thang của dòng
@@ -645,7 +650,7 @@ class CnA(nn.Module):
 
     def __init__(self, d_feat: int, d_model: int, n_query: int = 16,
                  d_latent: int = 1024, head_dim: int = 128, mlp_hidden: int = 2048,
-                 n_blocks: int = 1, final_proj: bool = True, dropout: float = 0.0):
+                 n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0):
         super().__init__()
         self.d_feat, self.d_model = int(d_feat), int(d_model)
         self.n_query = int(n_query)
@@ -710,7 +715,7 @@ class CnA(nn.Module):
         mọi RMSNorm và `latent`.
 
         `latent` và RMSNorm đi cùng nhóm này vì chúng là phần "nội dung" của
-        khối (16 câu hỏi và thang đo), không phải ma trận quyết định ĐỌC Ở ĐÂU.
+        khối (các câu hỏi và thang đo), không phải ma trận quyết định ĐỌC Ở ĐÂU.
         """
         yield self.latent
         yield from self.kv_norm.parameters()
@@ -840,7 +845,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 f"vextractor.{blk}: khoá lạ {odd} — không khoá nào trong số ấy "
                 f"được đọc, nên khai chúng KHÔNG đổi gì. Khoá hợp lệ: "
                 f"{list(keys)}.")
-    arch = str(ex.get("arch", "maxvit_tiny_tf_224.in1k"))
+    arch = str(ex.get("arch", "vit_small_patch16_dinov3.lvd1689m"))
     mean, std = arch_normalize(arch)
     return {
         "format": FORMAT, "d_model": int(d_model),
@@ -852,11 +857,11 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                       "n_stages": (None if ex.get("n_stages") is None
                                    else int(ex["n_stages"])),
                       "normalize": {"mean": list(mean), "std": list(std)}},
-        "cna": {"n_query": int(cn.get("n_query", 16)),
+        "cna": {"n_query": int(cn.get("n_query", 8)),
                 "d_latent": int(cn.get("d_latent", 1024)),
                 "head_dim": int(cn.get("head_dim", 128)),
                 "mlp_hidden": int(cn.get("mlp_hidden", 2048)),
-                "n_blocks": int(cn.get("n_blocks", 1)),
+                "n_blocks": int(cn.get("n_blocks", 2)),
                 "final_proj": bool(cn.get("final_proj", True)),
                 "dropout": float(cn.get("dropout", 0.0))},
     }

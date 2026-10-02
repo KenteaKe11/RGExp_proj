@@ -428,7 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  A {A['id']:<26} {A['source']} (không huấn luyện lại)\n"
           f"  B {B['id']:<26} A + nhánh thị giác (Extractor = teacher EMA của "
           f"Stage 0 -> CnA (QFormer + Linear) -> V_c; chuỗi [Z ‖ V_c ‖ T], "
-          f"che 25% Z khi huấn luyện)",
+          f"che {float(((cfg.get('vextractor') or {}).get('main') or {}).get('z_mask_frac', 0.5)):.0%} "
+          f"Z khi huấn luyện)",
           flush=True)
     rc = 0
     if set(stages) & set(COMMANDS["train"]):
