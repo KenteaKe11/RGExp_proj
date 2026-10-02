@@ -2,8 +2,8 @@
 
     python -m src.run_vextractor train   # kéo A ($1) -> Stage 0 -> main B -> sinh -> chấm
     python -m src.run_vextractor stats   # bootstrap ghép cặp + permutation -> REPORT.md (GHI ĐÈ)
-    python -m src.run_vextractor lens    # mổ khối Q trên MỘT ảnh: Jacobian 1/4 lớp cuối,
-                                       # logit lens, chain rule về ảnh -> Lens/Lens_Explain.md
+    python -m src.run_vextractor lens    # mổ khối Q trên 5 ảnh (seed cố định) -> Lens/
+                                       # Lens_Vision.html (Grad-CAM) + Lens_Language.md
     python -m src.run_vextractor push    # -> <hub_repo>/current/$2.2_V-Extractor_Test/
     python -m src.run_vextractor all     # train -> stats -> push
 
@@ -744,7 +744,7 @@ def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
     if not lens.lcfg(cfg)["enabled"]:
         print("⊘ lens.enabled = false — bỏ qua", flush=True)
         return 0
-    _hr("Lens — mổ khối Q trên một ảnh (token×lớp · logit lens · 3 ô về pixel)")
+    _hr("Lens — mổ khối Q trên 5 ảnh (Vision: Grad-CAM · Language: Jacobian + Q↔bệnh lý)")
     n_test = int(cfg["data"].get("n_test") or 0)
     pull = bool(cfg["output"].get("pull", True)) and not a.no_pull
     if not fx_mod.exists(fx):
@@ -783,7 +783,7 @@ def _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
         print(f"\n✗ Lens hỏng: {e!r}", flush=True)
         tracker.finish(1)
         return 7
-    manifest["lens"] = {k: out.get(k) for k in ("sample", "minutes", "target")}
+    manifest["lens"] = {k: out.get(k) for k in ("samples", "minutes", "docs")}
     save()
     tracker.finish(0)
     return 0

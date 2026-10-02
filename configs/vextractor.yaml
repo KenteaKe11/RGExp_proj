@@ -511,22 +511,29 @@ report:
     gamma_spread: 0.18
 
 # ── Lens (`src/lens_vextractor.py`, lệnh `lens`) — MỔ KHỐI Q, minh hoạ ─────────
-# Mọi bản đồ là đạo hàm của MỘT số y (log-prob báo cáo tham chiếu), nên chỉ tốn
-# một lượt backward. CHỈ chạy candidate B: Z của B giống A từng bit, nên chênh
-# lệch A/B nằm trọn trong khối Q — Q chính là "B − A", không phải chạy A để trừ.
-# Ghi ra runs/<subdir>/Lens/Lens_Explain.md.
+# CHỈ chạy candidate B (Z của B giống A từng bit -> Q chính là B − A). HAI báo cáo
+# trên CÙNG `n_samples` ảnh test bốc ngẫu nhiên theo `seed` (null = seed chung):
+#   runs/<subdir>/Lens/Lens_Vision.html    Grad-CAM, nền luôn là X (ảnh 448² vào
+#        Extractor). 5 cột = 5 mẫu; dòng 1 target = đầu ra Extractor (‖V‖²), dòng 2
+#        target = V_c[i] (‖V_c[i]‖²), chuyển Q[i] bằng thanh pager.
+#   runs/<subdir>/Lens/Lens_Language.md    Jacobian ‖∂y/∂h‖ token × lớp, lưới 3 dòng
+#        (Z · Q · T) × 5 cột, thang màu CHUNG Z ∪ Q ∪ T trong mỗi cột + đường đứt ở
+#        lớp sâu nhất có token chạm ngưỡng; ma trận attention Q[i] ↔ token bệnh lý
+#        (embedding decoder) kèm top-p.
 lens:
   enabled: true
-  sample: auto              # auto = ảnh test nhiều pos + uncertain nhất; hoặc key cụ thể
-  target: ref_logprob       # ref_logprob | next_token
-  top_k: 8                  # logit lens: số token mỗi lớp
-  layer_frac: 0.25          # CHỈ cho bảng top-k của logit lens (1/4 lớp cuối).
-                            # Heatmap token × lớp vẽ ĐỦ mọi lớp.
-  layer_marks: 6            # số lớp mốc in trong bảng (đầy đủ ở logit_lens.csv)
-  overlay_alpha: 0.70       # độ mờ của heatmap chồng lên ảnh gốc (alpha = 0.70 × giá trị
-                            # điểm, nên chỗ yếu vẫn gần trong suốt)
-  percentile_clip: 99.0     # cắt đuôi trước khi chuẩn hoá màu
-  cmap: inferno
+  n_samples: 5
+  seed: null                # null = `seed` chung của config
+  target: ref_logprob       # ref_logprob | next_token  (y của báo cáo Language)
+  cam: gradcam              # gradcam | gradcam++
+  cam_stage: -2             # stage của backbone lấy CAM: -2 = stage 3 MaxViT (28×28 ở 448²)
+  cam_image_weight: 0.5     # overlay MẶC ĐỊNH của Grad-CAM (show_cam_on_image): JET,
+                            # cam = 0.5·heatmap + 0.5·X, rồi chia max
+  percentile_clip: 99.0     # vmax chung của mỗi cột Jacobian = phân vị này của bể Z ∪ Q ∪ T
+  reach_frac: 0.10          # đường đứt: lớp sâu nhất có token đạt 0.10 × vmax
+  attn_top_p: 0.90          # top-p bệnh mỗi Q[i]
+  attn_temp: 1.0            # τ trong softmax(τ · q̂·ê / √d)
+  cmap: inferno             # CHỈ cho heatmap của báo cáo Language (CAM luôn dùng JET)
   dir: Lens
 
 wandb:

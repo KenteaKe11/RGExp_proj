@@ -1,64 +1,69 @@
-"""Lens — mổ xẻ MỘT ảnh tiêu biểu trên candidate B `[Z ‖ Q ‖ T]`: chính khối Q.
+"""Lens — mổ khối Q của candidate B `[Z ‖ Q ‖ T]` trên 5 ảnh test, HAI báo cáo.
 
-Chạy: `bash scripts/run_vextractor.sh lens` -> `runs/<subdir>/Lens/Lens_Explain.md`
-(+ figures/ + CSV). Không đụng bảng kiểm định — đây là phần MINH HOẠ, mỗi lần
-chạy ghi đè.
+Chạy: `bash scripts/run_vextractor.sh lens` -> `runs/<subdir>/Lens/`:
 
-CHỈ CHẠY B. §2.0 mổ cả A lẫn B rồi trừ nhau, vì ở đó Z bị thay bằng Z' và chênh
-lệch nằm rải trên 256 token ảnh. Ở §2.2, Z của B giống A TỪNG BIT (nhánh không
-đụng vào token ảnh, và nó thậm chí không đọc X của SigLIP) và chuỗi chỉ dài
-thêm khối Q — nên **Q chính là phần B − A**.
-Nạp thêm A chỉ để trừ ra một dải gần như trắng là tốn một lần tải model 4B và
-một lượt backward, và đẻ ra một cột số dễ bị đọc thành kết luận A/B (kết luận ấy
-nằm ở `REPORT.md`, trên 3000 ảnh, có kiểm định).
+    Lens_Vision.html      báo cáo THỊ GIÁC — trang HTML tương tác (pager Q[i])
+    Lens_Language.md      báo cáo NGÔN NGỮ — Jacobian token × lớp + ma trận Q ↔ bệnh lý
+    figures/              hình của báo cáo ngôn ngữ
+    lens_maps.npz         số thô (độ nhạy, CAM, ma trận attention) — mọi mẫu
+    lens.json · q_disease.csv
 
-Ảnh dùng: một ảnh test có NHIỀU nhãn `pos` + `uncertain` nhất (`lens.sample:
-auto`), hoặc key khai tay. Cùng một ảnh cho cả ba phần dưới.
+CHỈ CHẠY B: Z của B giống A từng bit và chuỗi chỉ dài thêm khối Q, nên Q chính
+là phần B − A. Kết luận A/B nằm ở `REPORT.md` (3000 ảnh, có kiểm định).
 
-Đại lượng gốc (mọi phần đều đạo hàm từ nó):
+**5 mẫu, ngẫu nhiên với seed cố định** (`lens.n_samples`, `lens.seed`): bốc từ
+tập test đã sắp theo key, nên cùng seed -> cùng 5 ảnh ở mọi lần chạy, và cả hai
+báo cáo dùng CHUNG 5 ảnh ấy theo cùng thứ tự (cột 1..5).
 
-    y = Σ_t log p(ref_t | ref_<t, ảnh)        (`lens.target: ref_logprob`)
-      hoặc logit của token được chọn ở vị trí cuối (`next_token`)
+═══ 1. VISION — Grad-CAM (Grad-CAM++ tuỳ chọn) ═════════════════════════════════
 
-`y` là một SỐ, nên mọi "Jacobian" dưới đây là một hàng của Jacobian — tức
-gradient — lấy đúng một lượt backward. Jacobian đầy đủ của một lớp 2560 chiều
-× 500 vị trí là 10⁹ số; một hàng đã trả lời được câu "đổi ở đâu thì y đổi".
+Ảnh nền (identity) LUÔN là X — ảnh 448² đi vào Extractor. Bản đồ lấy ở đầu ra
+một stage của backbone (`lens.cam_stage`, mặc định −2 = stage 3 của MaxViT, lưới
+28×28 ở 448²), với hai loại TARGET:
 
-1. [Language] Độ nhạy theo TOKEN × LỚP: S[ℓ, t] = ‖∂y / ∂h_{ℓ,t}‖₂ — h là hidden
-   state ra khỏi lớp decoder ℓ. MỘT heatmap: trục Y là VỊ TRÍ TOKEN (đọc từ trên
-   xuống đúng thứ tự trong chuỗi), trục X là LỚP với chỉ số THẬT, trên ĐỦ MỌI
-   LỚP. Ba vùng token được chia bằng đường kẻ mờ + thanh màu có nhãn ngoài
-   heatmap: Z (xanh, 256 token ảnh), Q (vàng, 16 latent), rồi phần văn bản.
-   So khối Q với khối Z là câu "decoder có thật sự đọc 16 vector mới không".
-   Vẽ đủ lớp vì câu hỏi ở đây cần cả lớp thấp để có mức nền mà so.
-2. [Language] Logit lens: ŷ_ℓ = W_U · RMSNorm(h_{ℓ,last}) -> top-k token, kèm 14
-   nhãn bệnh lý của ảnh đó. ĐÂY là chỗ DUY NHẤT còn dùng `lens.layer_frac` (1/4
-   lớp cuối): phép đọc tuyến tính bỏ qua mọi lớp sau ℓ nên ở lớp thấp nó ra
-   token vô nghĩa.
-3. [Visual] BA ô trên cùng một ảnh:
-   (1) ảnh gốc; (2) `‖∂y/∂X‖` qua `y -> Z -> adapter -> vision encoder`, dừng ở
-   ĐẦU RA encoder (lưới 64²); (3) **bản đồ của chính n_query High-Q token**:
-   `s = ‖Q‖²` rồi `‖∂s/∂I‖`, truy ngược `Q -> CnA -> Extractor
+    dòng 1 · target = đầu ra Extractor : s = ‖V‖²_F            (V: 196 × 512)
+    dòng 2 · target = đầu ra CnA, Q[i] : s_i = ‖V_c[i]‖²        (V_c: 16 × 2560)
 
-   **Ô 3 lấy TARGET là khối Q, không phải `y`.** Đó là khác biệt với mọi bản
-   trước, và nó cố ý: khối Q là thứ §2.2 thêm vào, nên câu hỏi tự nhiên là *8
-   vector ấy được dựng từ vùng nào của ảnh*, chứ không phải *decoder đòi ảnh ở
-   đâu*. Bản đồ này vì thế KHÔNG dính decoder, KHÔNG dính LoRA, và luôn dựng
-   được — kể cả khi decoder chưa đọc Q chút nào.
+    Grad-CAM   : w_c = mean_hw ∂s/∂A_c ;  CAM = ReLU(Σ_c w_c A_c)
+    Grad-CAM++ : w_c = Σ_hw α_c,hw · ReLU(∂s/∂A_c,hw),
+                 α = g² / (2g² + Σ_hw A · g³)
 
-   Đường truy ngược chạy qua backbone ở đúng chế độ main stage: **teacher
-   gradient (trọng số vẫn `requires_grad=False`, `eval()` nên không dropout /
-   stochastic depth), rồi trả cờ cũ về nguyên trạng.
+Mỗi bản đồ chuẩn hoá min–max về [0, 1] của CHÍNH nó (`scale_cam_image`), nội
+suy bilinear lên 448² rồi chồng lên X bằng overlay MẶC ĐỊNH của Grad-CAM
+(`show_cam_on_image`: JET, image_weight 0.5, use_rgb) — so HÌNH DẠNG giữa các ô,
+không so độ sáng. Trang HTML: 5 cột = 5 mẫu; dòng 1 cố
+định, dòng 2 đổi theo thanh Q[i] (0..15, phím ← →).
 
-   Hệ quả phải nhớ: **ô 2 và ô 3 KHÔNG cùng đại lượng** — ô 2 là nhu cầu của
-   decoder trên đường CŨ, ô 3 là cấu tạo của khối Q. Tương quan giữa chúng trả
-   lời "Q được dựng từ đúng vùng decoder vốn đã đòi qua Z không", chứ không so
-   được độ lớn. Ô 3 mịn hơn hẳn ô 2 (448² so với 64²); để so số nó được gộp về
-   lưới 64×64 (`sal_q_64`), và mọi tương quan / IoU ở mục "Kiểm nhanh" tính
-   trên lưới chung ấy.
+Backbone chạy ở chế độ main stage (teacher inference: `eval()`, tham số
+`requires_grad=False`); đồ thị gradient chỉ được nối từ activation của stage đã
+chọn trở đi, rồi cờ cũ được trả lại.
+
+═══ 2. LANGUAGE — Jacobian token × lớp, và Q ↔ bệnh lý ═════════════════════════
+
+Đại lượng gốc `y = Σ_t log p(ref_t | ref_<t, ảnh)` (`lens.target: ref_logprob`)
+hoặc logit của token được chọn ở vị trí cuối (`next_token`).
+
+    S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂        (một hàng Jacobian — một lượt backward)
+
+Hình: lưới 3 dòng (Z · Q · T) × 5 cột (5 mẫu). Trong MỖI cột, ba ô dùng CHUNG
+một thang màu — mẫu số là bể token Z ∪ Q ∪ T của mẫu ấy (phân vị
+`percentile_clip`) — nên độ sáng giữa Z, Q, T so được trực tiếp. Mỗi ô có một
+đường đứt dọc tại lớp SÂU NHẤT mà ít nhất một token của vùng ấy còn chạm ngưỡng
+`reach_frac × vmax` của cột.
+
+Ma trận Q ↔ bệnh lý (thay cho bảng logit lens top-k): mỗi tên bệnh trong 14 nhãn
+được token hoá rồi đi qua lớp embedding của decoder (chính không gian mà Q được
+CHÈN vào thay cho embedding token), lấy trung bình các subword -> e_j. Với mỗi
+latent Q[i]:
+
+    a_ij = softmax_j( τ · q̂_i · ê_j / √d )      q̂, ê: chuẩn hoá RMS (như RMSNorm)
+
+rồi in top-p bệnh của mỗi Q[i] (cộng dồn tới `attn_top_p`) kèm p.
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
 import math
 import time
@@ -75,59 +80,110 @@ from .backbone import ReportDataset, TrainUnusable, free_vram, quant_config
 from .config import Cfg, hf_token
 
 DIRNAME = "Lens"
-DOC = "Lens_Explain.md"
+DOC_VISION = "Lens_Vision.html"
+DOC_LANGUAGE = "Lens_Language.md"
+
+# 14 nhãn CheXpert — DỰ PHÒNG khi `labels.npz` không đọc được tên.
+CHEXPERT_14 = ("No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly",
+               "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
+               "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion",
+               "Pleural Other", "Fracture", "Support Devices")
+
+LENS_KEYS = ("enabled", "n_samples", "seed", "target", "cam", "cam_stage",
+             "cam_image_weight", "percentile_clip", "reach_frac", "attn_top_p",
+             "attn_temp", "cmap", "dir")
+_OLD_KEYS = ("sample", "top_k", "layer_frac", "layer_marks", "overlay_alpha")
 
 
 def lcfg(cfg: Cfg) -> dict:
+    """Khối `lens` đã giải quyết. Khoá LẠ (kể cả khoá của bản cũ) bị TỪ CHỐI."""
     c = dict(cfg.get("lens") or {})
-    return {"enabled": bool(c.get("enabled", True)),
-            "sample": c.get("sample", "auto"),
-            "target": str(c.get("target", "ref_logprob")).lower(),
-            "top_k": int(c.get("top_k", 8)),
-            "layer_marks": int(c.get("layer_marks", 6)),
-            # CHỈ áp cho bảng top-k của logit lens (mục 2). Hình 1 vẽ đủ lớp.
-            "layer_frac": float(c.get("layer_frac", 0.25)),
-            "overlay_alpha": float(c.get("overlay_alpha", 0.45)),
-            "percentile_clip": float(c.get("percentile_clip", 99.0)),
-            "cmap": str(c.get("cmap", "inferno")),
-            "dir": str(c.get("dir", DIRNAME))}
+    odd = sorted(set(c) - set(LENS_KEYS))
+    if odd:
+        old = sorted(set(odd) & set(_OLD_KEYS))
+        raise TrainUnusable(
+            f"lens: khoá lạ {odd} — không khoá nào trong số ấy được đọc. Khoá hợp "
+            f"lệ: {list(LENS_KEYS)}."
+            + (f"\n    ({old} là của Lens cũ: một ảnh + logit lens top-k. Lens "
+               f"mới bốc `n_samples` ảnh theo `seed` và thay logit lens bằng ma "
+               f"trận Q ↔ bệnh lý.)" if old else ""))
+    out = {"enabled": bool(c.get("enabled", True)),
+           "n_samples": int(c.get("n_samples", 5)),
+           "seed": int(c["seed"]) if c.get("seed") is not None
+           else int(cfg.get("seed", 42)),
+           "target": str(c.get("target", "ref_logprob")).lower(),
+           "cam": str(c.get("cam", "gradcam")).lower(),
+           "cam_stage": int(c.get("cam_stage", -2)),
+           "cam_image_weight": float(c.get("cam_image_weight", 0.5)),
+           "percentile_clip": float(c.get("percentile_clip", 99.0)),
+           "reach_frac": float(c.get("reach_frac", 0.10)),
+           "attn_top_p": float(c.get("attn_top_p", 0.9)),
+           "attn_temp": float(c.get("attn_temp", 1.0)),
+           "cmap": str(c.get("cmap", "inferno")),
+           "dir": str(c.get("dir", DIRNAME))}
+    if out["n_samples"] < 1:
+        raise TrainUnusable(f"lens.n_samples {out['n_samples']} phải >= 1.")
+    if out["target"] not in ("ref_logprob", "next_token"):
+        raise TrainUnusable(f"lens.target {out['target']!r}: ref_logprob | next_token.")
+    if out["cam"] not in ("gradcam", "gradcam++"):
+        raise TrainUnusable(f"lens.cam {out['cam']!r}: gradcam | gradcam++.")
+    if not 0.0 < out["attn_top_p"] <= 1.0:
+        raise TrainUnusable(f"lens.attn_top_p {out['attn_top_p']} phải trong (0, 1].")
+    if not 0.0 < out["reach_frac"] < 1.0:
+        raise TrainUnusable(f"lens.reach_frac {out['reach_frac']} phải trong (0, 1).")
+    return out
 
 
 def lens_dir(cfg: Cfg, run_dir: Path) -> Path:
     return Path(run_dir) / lcfg(cfg)["dir"]
 
 
-# ── chọn ảnh tiêu biểu ─────────────────────────────────────────────────────
-def pick_sample(cfg: Cfg, test_df: pd.DataFrame) -> dict:
-    """Ảnh test có nhiều `pos` + `uncertain` nhất (ưu tiên nhiều `uncertain`)."""
-    lut, info = labels_cls.load_map(cfg, verbose=False)
-    n_labels = int(dict(cfg.get("vextractor") or {}).get("n_labels") or info["n_labels"])
-    names = info.get("label_names") or [f"label_{i}" for i in range(n_labels)]
-    i_pos, i_unc = labels_cls.CLASS_ORDER.index("pos"), labels_cls.CLASS_ORDER.index("uncertain")
-    want = str(lcfg(cfg)["sample"])
-    best, best_key = None, None
-    for k in test_df["key"].astype(str):
+# ── chọn 5 ảnh ─────────────────────────────────────────────────────────────
+def label_names(cfg: Cfg) -> tuple[list[str], dict, dict]:
+    """(tên 14 nhãn, bảng key -> nhãn | {}, info). Hỏng -> tên CheXpert, bảng rỗng."""
+    try:
+        lut, info = labels_cls.load_map(cfg, verbose=False)
+        names = list(info.get("label_names") or [])
+        return (names or list(CHEXPERT_14)), lut, info
+    except Exception as e:  # noqa: BLE001 — nhãn CHỈ để minh hoạ
+        print(f"  ⚠ Lens: không đọc được labels.npz ({type(e).__name__}) — dùng tên "
+              f"14 nhãn CheXpert, bỏ cột nhãn của từng ảnh.", flush=True)
+        return list(CHEXPERT_14), {}, {}
+
+
+def pick_samples(cfg: Cfg, test_df: pd.DataFrame, lut: dict | None = None,
+                 names: list[str] | None = None) -> list[dict]:
+    """`n_samples` ảnh test, ngẫu nhiên với seed CỐ ĐỊNH (`lens.seed`).
+
+    Sắp theo key TRƯỚC khi bốc: thứ tự dòng của `test_df` không được quyết định
+    ảnh nào được chọn.
+    """
+    lc = lcfg(cfg)
+    df = test_df.assign(_k=test_df["key"].astype(str)).sort_values("_k")
+    df = df.reset_index(drop=True)
+    n = min(lc["n_samples"], len(df))
+    if n < 1:
+        raise TrainUnusable("tập test rỗng — Lens không có ảnh nào để mổ.")
+    idx = np.random.default_rng(lc["seed"]).choice(len(df), size=n, replace=False)
+    lut = lut or {}
+    names = names or list(CHEXPERT_14)
+    out = []
+    for i in idx.tolist():
+        row = df.iloc[int(i)]
+        k = str(row["_k"])
         y = lut.get(k)
-        if y is None:
-            continue
-        n_p, n_u = int(y[:, i_pos].sum()), int(y[:, i_unc].sum())
-        if want not in ("auto", "", "none") and k != want:
-            continue
-        sc = (n_p + n_u, n_u)
-        if best is None or sc > best:
-            best, best_key = sc, k
-    if best_key is None:
-        raise TrainUnusable(f"không tìm được ảnh cho Lens (lens.sample = {want!r}).")
-    y = lut[best_key]
-    row = test_df[test_df["key"].astype(str) == best_key].iloc[0]
-    findings = [{"label": names[i], "class": labels_cls.CLASS_ORDER[int(y[i].argmax())]}
-                for i in range(n_labels) if float(y[i].sum()) > 0]
-    return {"key": best_key, "ref": str(row["ref"]), "image_path": str(row["image_path"]),
-            "n_pos": best[0] - best[1], "n_unc": best[1], "findings": findings,
-            "n_labelled": len(findings)}
+        found = []
+        if y is not None:
+            for j in range(min(len(names), y.shape[0])):
+                if float(y[j].sum()) > 0:
+                    found.append({"label": names[j],
+                                  "class": labels_cls.CLASS_ORDER[int(y[j].argmax())]})
+        out.append({"key": k, "ref": str(row["ref"]),
+                    "image_path": str(row["image_path"]), "findings": found})
+    return out
 
 
-# ── nạp một candidate ──────────────────────────────────────────────────────
+# ── nạp candidate ──────────────────────────────────────────────────────────
 def load_arm(cfg: Cfg, adapter_dir: Path):
     """(model, processor, gemma, branch|None, stats) — cùng đường với khâu sinh."""
     import torch
@@ -163,12 +219,7 @@ def load_arm(cfg: Cfg, adapter_dir: Path):
 
 def encode(cfg: Cfg, processor, item: dict, image_size: int = 448,
            normalize=None):
-    """Một mẫu: input_ids / labels / pixel_values / vext_pixels.
-
-    Đúng đường của khâu train, CẢ HAI đường ảnh: `pixel_values` 896 cho Z và
-    `vext_pixels` 448² chuẩn hoá theo `pretrained_cfg` của backbone cho nhánh.
-    `normalize` = `branch.normalize`, tức mean/std ĐÚNG của checkpoint backbone.
-    """
+    """Một mẫu: input_ids / labels / pixel_values / vext_pixels (đúng đường train)."""
     if normalize is None:
         raise TrainUnusable("Lens cần `normalize=(mean, std)` của backbone — "
                             "truyền `branch.normalize`.")
@@ -186,41 +237,18 @@ def encode(cfg: Cfg, processor, item: dict, image_size: int = 448,
     return out
 
 
-def pool_to(a, n: int):
-    """Gộp TRUNG BÌNH một bản đồ (S, S) về lưới (n, n) — S chia hết n.
-
-    Để so `sal_q` (448², gradient tới tận pixel) với `sal_z` (64², gradient
-    dừng ở patch SigLIP) thì phải đưa về CÙNG một lưới trước. Gộp trung bình
-    chứ không lấy mẫu thưa: lấy mẫu thưa vứt đi phần lớn số điểm và biến một vùng
-    nhạy mảnh thành ngẫu nhiên có hay không.
-    """
-    if a is None:
-        return None
-    a = np.asarray(a, dtype=float)
-    s0 = a.shape[0]
-    if s0 == n:
-        return a
-    if s0 % n:
-        return None
-    k = s0 // n
-    return a.reshape(n, k, n, k).mean(axis=(1, 3))
+def _image_span(ids, tok_id: int) -> list[int]:
+    m = (ids[0] == int(tok_id)).nonzero().flatten().tolist()
+    return [int(m[0]), int(m[-1])] if m else [0, 0]
 
 
-# ── một lượt forward + backward, giữ gradient ở mọi chỗ cần ────────────────
-def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
-    """-> {layer_sens (L, T), hidden (L, d) ở vị trí cuối, sal_z, sal_q, y}.
+# ══ LANGUAGE: một lượt forward + backward qua decoder ══════════════════════
+def analyze_language(model, gemma, branch, batch: dict, target: str) -> dict:
+    """-> {layer_sens (L, T), q (n_query, d), y, image_span, insert_span, n_tokens}.
 
-    HAI đường, HAI đầu vào khác hẳn nhau — khác §2.1, ở đây không cần mẹo "hai
-    lá của cùng một X" nữa vì hai nhánh vốn đã không chung node nào:
-
-      * `sal_z` = ‖∂y/∂X‖ trên 4096 patch SigLIP -> lưới 64×64 (dính decoder);
-      * `sal_q` = `‖∂‖Q‖²/∂I‖` — bản đồ của chính n_query High-Q token, truy ngược
-        qua CnA -> Extractor về TẬN PIXEL của ảnh 448²,
-        chuẩn trên 3 kênh. KHÔNG dính decoder. Xem `_q_saliency_map`.
-
-    `sal_q_64` là bản gộp trung bình về 64×64 để so được với `sal_z` — mọi
-    tương quan / IoU đều tính trên lưới chung ấy, không phải trên hai lưới khác
-    độ phân giải.
+    Chuỗi `[Z ‖ Q ‖ T]` dựng ĐÚNG như lúc train (không che Z: Lens đo model như
+    lúc sinh). Q được tính trong `no_grad` — đồ thị gradient chỉ cần đi qua
+    decoder, còn bản đồ ảnh của Q là việc của báo cáo Vision (Grad-CAM riêng).
     """
     import torch
 
@@ -229,42 +257,20 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
     ids, labels = batch["input_ids"], batch["labels"]
     vdt = recombiner.float_dtype(gemma, torch.float32)
     with torch.no_grad():
-        vis, _ = recombiner.encode_vision(gemma, batch["pixel_values"].to(dtype=vdt))
-    leaf_z = vis.detach().clone().requires_grad_(True)      # đường Z (projector)
-    n_img = int(round(float(np.sqrt(vis.shape[1]))))
-    proj = recombiner._find_module(gemma, ("multi_modal_projector",))
-    aligned = proj(leaf_z)
+        _vis, aligned = recombiner.encode_vision(gemma, batch["pixel_values"].to(dtype=vdt))
     img_tok = recombiner.image_token_id(gemma)
     span = _image_span(ids, img_tok)
-    q, ins = None, None
-    if branch is not None:
-        # Nhánh bị đóng băng lúc nạp lại (forward trong no_grad). Ở Lens ta cần đồ
-        # thị để chain rule đi qua nó, nên mở cờ frozen rồi khoá lại requires_grad
-        # của tham số — trọng số vẫn không đổi, chỉ có đường gradient được nối.
-        if "vext_pixels" not in batch:
-            raise TrainUnusable(
-                "batch Lens thiếu `vext_pixels` — nhánh §2.2 có đường ảnh riêng.")
-        was_frozen = branch.frozen
-        branch.set_frozen(False)
-        for p in branch.parameters():
-            p.requires_grad_(False)
-        # Nhánh KHÔNG cần gradient ở lượt này: bản đồ của khối Q được dựng
-        # bằng một lượt forward/backward RIÊNG (`_q_saliency_map`), lấy target
-        # là chính Q chứ không phải `y`. Chạy nó trong `no_grad` ở đây giữ
-        # nguyên đồ thị decoder mà không tốn activation của backbone.
-        with torch.no_grad(), RCV.autocast(dev):
-            q = branch(batch["vext_pixels"].to(dev))
-        q = q.to(aligned.dtype)
-        branch.set_frozen(was_frozen)
-        for p in branch.parameters():
-            p.requires_grad_(False)
     embeds = recombiner.build_inputs_embeds(gemma, ids, aligned)
     kw = {"inputs_embeds": embeds, "attention_mask": batch.get("attention_mask"),
           "token_type_ids": batch.get("token_type_ids")}
-    if q is not None:
-        # Nối Q ngay SAU khối ảnh -> [Z ‖ Q ‖ T], đúng như lúc train. `labels`
-        # phải được nới theo (nếu không, y sẽ được tính lệch n_query vị trí), nhưng
-        # KHÔNG đưa vào forward: y ở đây tính tay từ logits.
+    q_np, ins = None, None
+    if branch is not None:
+        if "vext_pixels" not in batch:
+            raise TrainUnusable("batch Lens thiếu `vext_pixels` — nhánh có đường ảnh riêng.")
+        with torch.no_grad(), RCV.autocast(dev):
+            q = branch(batch["vext_pixels"].to(dev))
+        q = q.to(embeds.dtype)
+        q_np = q[0].float().detach().cpu().numpy()
         at = recombiner.last_image_index(ids, img_tok) + 1
         w = recombiner.inject_tokens(
             embeds, q, at, attention_mask=batch.get("attention_mask"),
@@ -272,14 +278,11 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
             token_type_value=0)
         labels = w.pop("labels")
         kw.update(w)
-        n_new = int(q.shape[1])
-        ins = [int(at), int(at) + n_new]
-        # Q nằm SAU khối ảnh nên vị trí của token ảnh KHÔNG đổi; chỉ phần văn
-        # bản phía sau bị đẩy sang phải.
+        ins = [int(at), int(at) + int(q.shape[1])]
     kw.update({"output_hidden_states": True, "use_cache": False})
     kw = {k: v for k, v in kw.items() if v is not None}
     out = model(**kw)
-    hs = [h for h in out.hidden_states]                     # (L+1) × (1, T, d)
+    hs = list(out.hidden_states)                            # (L+1) × (1, T, d)
     for h in hs:
         h.retain_grad()
     logits = out.logits.float()
@@ -287,179 +290,28 @@ def analyze(cfg: Cfg, model, gemma, branch, batch: dict, target: str) -> dict:
         pos = int(labels.shape[1] - 1)
         tid = int(logits[0, pos].argmax())
         y = logits[0, pos, tid]
-        tgt_info = {"kind": "next_token", "pos": pos, "token_id": tid}
+        tgt = {"kind": "next_token", "pos": pos, "token_id": tid}
     else:
         sl, sb = logits[:, :-1], labels[:, 1:]
         keep = sb != -100
         lp = torch.log_softmax(sl, dim=-1)
         y = lp[0][keep[0]].gather(-1, sb[0][keep[0]].unsqueeze(-1)).sum()
-        tgt_info = {"kind": "ref_logprob", "n_tokens": int(keep.sum())}
+        tgt = {"kind": "ref_logprob", "n_tokens": int(keep.sum())}
     model.zero_grad(set_to_none=True)
     y.backward()
-
     sens = np.stack([(h.grad[0].float().norm(dim=-1).detach().cpu().numpy()
                       if h.grad is not None else np.zeros(h.shape[1]))
                      for h in hs[1:]])                      # (L, T)
-    n = n_img
+    return {"layer_sens": sens, "q": q_np, "y": float(y.detach()), "target": tgt,
+            "n_tokens": int(kw["inputs_embeds"].shape[1]),
+            "image_span": span, "insert_span": ins}
 
-    def grid(leaf):
-        """Lá (1, P, d) -> lưới n×n của chuẩn gradient theo vị trí."""
-        if leaf is None or leaf.grad is None:
-            return None
-        g = leaf.grad[0].float().norm(dim=-1).detach().cpu().numpy()
-        return g[: n * n].reshape(n, n)
-
-    sal_q = (_q_saliency_map(branch, batch["vext_pixels"], dev)
-             if branch is not None else None)
-    # Lưu đầu ra không gian của backbone teacher ở đúng lượt Lens:
-    # (B, N, C) -> chuẩn L2 mỗi vị trí -> lưới H×W. Backbone frozen nên
-    # patches() chạy trong no_grad, đúng chế độ teacher inference.
-    #
-    # `branch is None` là ca THẬT, không phải phòng xa: `analyze` được gọi cho
-    # cả arm KHÔNG có nhánh (để đối chiếu `layer_sens` và `sal_z`), và ở đó
-    # không có backbone nào để hỏi. Gọi thẳng `branch.vextractor` thì nó chết
-    # bằng AttributeError ở giữa một lượt backward đã chạy xong.
-    teacher_norm = None
-    if branch is not None:
-        with RCV.autocast(dev):
-            teacher_tokens = branch.extractor.patches(
-                batch["vext_pixels"].to(dev))
-        teacher_norm = teacher_tokens.float().norm(dim=-1)[0].detach().cpu().numpy()
-        gh = gw = int(round(math.sqrt(teacher_norm.size)))
-        if gh * gw != teacher_norm.size:
-            raise TrainUnusable(
-                f"lưới teacher không vuông: {teacher_norm.size} token")
-        teacher_norm = teacher_norm.reshape(gh, gw)
-
-    out_d = {"layer_sens": sens, "sal_z": grid(leaf_z),
-             "hidden_last": np.stack([h[0, -1].float().detach().cpu().numpy()
-                                      for h in hs[1:]]),
-             "y": float(y.detach()), "target": tgt_info,
-             "n_tokens": int(kw["inputs_embeds"].shape[1]), "grid": n,
-             "image_span": span, "insert_span": ins}
-    if teacher_norm is not None:
-        out_d["teacher_feature_norm"] = teacher_norm
-    if sal_q is not None:
-        out_d["sal_q"] = sal_q
-        out_d["sal_q_64"] = pool_to(sal_q, n)
-    return out_d
-
-
-def _q_saliency_map(branch, px, dev):
-    """Bản đồ của n_query High-Q token: ‖∂‖Q‖²/∂I‖ trên chính ảnh 448².
-
-    TARGET là khối Q — đầu ra của cả nhánh (Extractor (teacher) -> CnA) — chứ KHÔNG phải `y` của decoder. Vô hướng được đạo hàm là
-    `s = Σ Q²`, nên bản đồ trả lời *16 vector §2.2 thêm vào được dựng từ vùng
-    nào của ảnh*, không phải *decoder đòi ảnh ở đâu*. Không dính decoder, không
-    dính LoRA, dựng được kể cả khi decoder chưa đọc Q chút nào.
-
-    Gradient về tới TẬN PIXEL: `patch_embed` của ViT là một conv stride 16, nên
-    đường về pixel không bị chặn ở đâu cả.
-
-    **Backbone chạy ở đúng chế độ main stage: teacher inference.** Cờ `frozen`
-    được mở CHỈ để nối đồ thị gradient (nếu không, `patches()` chạy trong
-    `no_grad` và đường về pixel đứt), còn `requires_grad` của MỌI tham số vẫn
-    bị ép về False và cờ cũ được trả lại ở `finally` — trọng số không đổi, và
-    không có bước Adam nào. `eval()` giữ nó không dropout / stochastic depth,
-    đúng như teacher lúc sinh mục tiêu ở Stage 0.
-
-    Chạy một lượt forward/backward RIÊNG qua nhánh, nên nó không đụng gì tới đồ
-    thị của decoder 4B.
-    """
-    import torch
-
-    was, was_train = branch.frozen, branch.training
-    branch.set_frozen(False)
-    branch.eval()
-    for prm in branch.parameters():
-        prm.requires_grad_(False)
-    try:
-        leaf = px.detach().clone().float().requires_grad_(True)
-        with RCV.autocast(dev):
-            q = branch(leaf)
-        q.float().pow(2).sum().backward()
-        g = (leaf.grad[0].float().norm(dim=0).detach().cpu().numpy()
-             if leaf.grad is not None else None)
-    finally:
-        branch.train(was_train)
-        branch.set_frozen(was)
-        for prm in branch.parameters():
-            prm.requires_grad_(False)
-    return g
-
-def last_layers(n_layers: int, frac: float) -> list[int]:
-    """Chỉ số (1-based) của `frac` lớp CUỐI — mặc định 1/4.
-
-    Lớp thấp của decoder gần như chỉ nói về hình thái token; phần quyết định
-    "sẽ viết chữ gì" nằm ở đuôi. Vẽ cả 34 lớp làm dải cao và bẹp, đọc không ra
-    lớp nào là lớp nào — nên chỉ vẽ đuôi, và ghi CHỈ SỐ THẬT lên trục y.
-    """
-    # LÀM TRÒN LÊN: 34 lớp × 1/4 = 8.5, và `round` của Python làm tròn về số
-    # chẵn (8) — "1/4 lớp cuối" mà ra ít hơn một phần tư thì đọc tên là sai.
-    k = max(1, math.ceil(int(n_layers) * float(frac)))
-    return list(range(int(n_layers) - k + 1, int(n_layers) + 1))
-
-
-def _image_span(ids, tok_id: int) -> list[int]:
-    m = (ids[0] == int(tok_id)).nonzero().flatten().tolist()
-    return [int(m[0]), int(m[-1])] if m else [0, 0]
-
-
-# ── logit lens ─────────────────────────────────────────────────────────────
-def logit_lens(model, gemma, hidden_last: np.ndarray, k: int) -> list[dict]:
-    """h_{ℓ,last} -> RMSNorm cuối -> lm_head -> top-k token (xấp xỉ tuyến tính)."""
-    import torch
-
-    lm = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
-    if lm is None:
-        lm = gemma.get_output_embeddings()
-    norm = recombiner._find_module(gemma, ("norm", "final_layernorm"))
-    tokz = getattr(gemma, "_lens_tok", None)
-    dev = next(p for p in lm.parameters()).device
-    dt = next(p for p in lm.parameters()).dtype
-    out = []
-    last = len(hidden_last) - 1
-    with torch.no_grad():
-        for i, h in enumerate(hidden_last):
-            v = torch.tensor(h, device=dev, dtype=dt).view(1, 1, -1)
-            # HF đã chạy RMSNorm cuối TRƯỚC khi gắn hidden_state của lớp chót
-            # vào output, nên chuẩn hoá lần nữa là nhân trọng số hai lần và
-            # hàng cuối cùng sẽ lệch so với logits thật.
-            lg = lm(v if i == last else norm(v)).float()[0, 0]
-            p = torch.softmax(lg, dim=-1)
-            top = torch.topk(p, k)
-            out.append({"layer": i + 1,
-                        "ids": [int(x) for x in top.indices],
-                        "probs": [float(x) for x in top.values]})
-    del tokz
-    return out
-
-
-def decode_top(processor, rows: list[dict]) -> list[dict]:
-    tk = processor.tokenizer
-    for r in rows:
-        r["tokens"] = [tk.decode([i]).replace("\n", "\n") for i in r["ids"]]
-    return rows
-
-
-# ── vẽ ─────────────────────────────────────────────────────────────────────
-def _norm01(a: np.ndarray, pct: float) -> np.ndarray:
-    a = np.asarray(a, dtype=float)
-    hi = float(np.percentile(a, pct)) if a.size else 1.0
-    lo = float(a.min())
-    return np.clip((a - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
 
 def _regions(res: dict, n_tok: int) -> list[dict]:
-    """Chuỗi -> BA vùng token rời nhau: Z (ảnh), Q (latent), T (văn bản).
+    """Chuỗi -> BA vùng token rời nhau: Z (ảnh), Q (latent), T (văn bản, PHẦN BÙ).
 
-    T là PHẦN BÙ, không phải "đuôi": trong chuỗi của Gemma 3 có văn bản ở CẢ
-    HAI phía — BOS + system prompt nằm TRƯỚC 256 token ảnh, câu hỏi + báo cáo
-    nằm SAU khối Q. Lấy T = `[ins[1]:]` bỏ mất mảnh đầu, và mảnh đầu ấy chính
-    là chỗ `‖∂y/∂h‖` hay dựng đỉnh nhất.
-
-    Mỗi vùng mang `rows` (chỉ số token THẬT, tăng dần) và `cuts` (vị trí chỗ
-    nối trong `rows`, để vẽ đường đứt) — vì T ghép từ hai mảnh không liền nhau
-    và hình phải nói ra điều đó chứ không giả vờ chúng liền.
+    T ghép từ hai mảnh không liền nhau (BOS + system prompt TRƯỚC khối ảnh, câu
+    hỏi + báo cáo SAU khối Q); `cuts` là chỗ nối để vẽ đường đứt ngang.
     """
     sp = res.get("image_span") or [0, 0]
     ins = res.get("insert_span")
@@ -477,603 +329,703 @@ def _regions(res: dict, n_tok: int) -> list[dict]:
                 "rows": t, "cuts": cuts, "base": None})
     return [r for r in out if r["rows"]]
 
-def plot_layers(res: dict, path: Path, cfg_l: dict) -> dict:
-    """‖∂y/∂h‖ — MỘT hình, BA ô cạnh nhau (Z · Q · T), mỗi ô một thang màu riêng.
 
-    Trả `{"layers": path}`.
+def shared_vmax(S: np.ndarray, pct: float) -> float:
+    """Mẫu số CHUNG cho Z, Q, T của một mẫu: phân vị `pct` của cả bể token."""
+    v = float(np.nanpercentile(np.asarray(S, dtype=float), pct)) if np.size(S) else 0.0
+    if not np.isfinite(v) or v <= 0:
+        v = float(np.nanmax(S)) if np.size(S) else 0.0
+    return v if v > 0 else 1.0
 
-    **Vì sao ba ô, và vì sao ba thang màu.** Bản đầu vẽ cả chuỗi lên một
-    heatmap với MỘT `vmax` lấy ở phân vị 99 của toàn ma trận. Phần văn bản nhạy
-    hơn phần thị giác hàng bậc nên nó định `vmax`, và dải latent nằm ở đáy
-    thang ấy → ra **đen tuyền**. Đọc hình đó, kết luận tự nhiên là *"decoder
-    không đọc Q"* — trong khi cái thật sự xảy ra chỉ là một phép chuẩn hoá màu.
-    Tức là hình trả lời SAI đúng câu hỏi nó sinh ra để trả lời.
 
-    **Vì sao một FILE chứ không ba.** Tách thang màu là thứ chữa được cái sụp
-    ấy; tách FILE thì không thêm gì — nó chỉ bắt người đọc mở ba ảnh và tự ghép
-    lại trong đầu. Ba ô trên một dải ngang giữ nguyên phần chữa (mỗi ô tự chuẩn
-    hoá) và trả lại phần so sánh (nhìn một lần thấy cả ba), giống hệt cách dải
-    bốn ô của `plot_visual` hoạt động.
+def reach_layer(A: np.ndarray, thr: float) -> int | None:
+    """Lớp SÂU NHẤT (1-based) mà ít nhất một token của vùng có S >= thr. A: (n_tok, L)."""
+    A = np.asarray(A, dtype=float)
+    if A.size == 0:
+        return None
+    hit = np.nonzero((A >= thr).any(axis=0))[0]
+    return int(hit[-1]) + 1 if hit.size else None
 
-    Cái giá KHÔNG đổi: **không so được độ sáng giữa ba ô**. `vmax` tuyệt đối của
-    từng ô in ngay dưới nó, và câu *"Q mạnh yếu thế nào so với Z"* trả lời bằng
-    SỐ (bảng ở mục 1, dòng "phần độ nhạy nằm trên khối Q" ở Kiểm nhanh), không
-    bằng mắt.
 
-    Trong mỗi ô: trục Y là token với **chỉ số THẬT trong chuỗi** (đọc từ trên
-    xuống, `origin="upper"`), trục X là lớp decoder với chỉ số THẬT, vẽ ĐỦ mọi
-    lớp — câu hỏi cần cả lớp thấp để có mức nền mà so. Ô Q đánh dấu TỪNG `Q[k]`.
-    """
+def region_stats(res: dict) -> dict:
+    """Phần độ nhạy của Z / Q / T và mức đóng góp của từng Q[i]."""
+    S = np.asarray(res["layer_sens"])
+    tot = float(S.sum()) or 1.0
+    out = {}
+    for r in _regions(res, S.shape[1]):
+        out[r["key"]] = float(S[:, r["rows"]].sum()) / tot
+    ins = res.get("insert_span")
+    if ins:
+        per = S[:, ins[0]:ins[1]].sum(axis=0)
+        out["q_vec"] = (per / max(float(per.sum()), 1e-12)).tolist()
+    return out
+
+
+def plot_language(results: list[dict], items: list[dict], path: Path,
+                  cfg_l: dict) -> Path:
+    """Lưới 3 dòng (Z · Q · T) × N cột (N mẫu). Thang màu CHUNG trong mỗi cột."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    S = np.asarray(res["layer_sens"])                     # (L, T)
-    n_layers, n_tok = int(S.shape[0]), int(S.shape[1])
-    M = S.T                                               # (T, L): y = token, x = lớp
-    pct = float(cfg_l["percentile_clip"])
-    step = 1 if n_layers <= 24 else max(1, n_layers // 9)
-    ticks = [k for k in range(n_layers) if (k + 1) % step == 0 or k == 0]
-
-    regs = _regions(res, n_tok)
-    fig, axes = plt.subplots(1, len(regs), dpi=150,
-                             figsize=(4.6 * len(regs), 7.6))
-    axes = np.atleast_1d(np.asarray(axes)).ravel()
-
-    for ax, reg in zip(axes, regs):
-        rows = reg["rows"]
-        A = M[rows, :]
-        n = len(rows)
-        v = float(np.nanpercentile(A, pct))
-        if not np.isfinite(v) or v <= 0:
-            v = float(np.nanmax(A)) or 1.0
-        im = ax.imshow(A, aspect="auto", cmap=cfg_l["cmap"], origin="upper",
-                       vmin=0.0, vmax=v, interpolation="nearest")
-        ax.set_xticks(ticks)
-        ax.set_xticklabels([str(k + 1) for k in ticks], fontsize=7)
-        ax.set_xlabel("lớp decoder (chỉ số thật)", fontsize=8)
-
-        # Nhãn Y = chỉ số token THẬT. Vùng nhỏ (Q) đánh dấu TỪNG token và ghi
-        # kèm Q[k] — mỗi latent là một thứ đáng đọc từng cái một.
-        if n <= 48:
-            yt = list(range(n))
-            ylab = [(f"{rows[k]} · Q[{rows[k] - reg['base']}]" if reg["base"] is not None
-                     else str(rows[k])) for k in yt]
-            fs = 6.5
-        else:
-            ys = max(1, int(round(n / 14)))
-            yt = list(range(0, n, ys))
-            ylab = [str(rows[k]) for k in yt]
-            fs = 7.0
-        ax.set_yticks(yt)
-        ax.set_yticklabels(ylab, fontsize=fs)
-        ax.set_ylabel("vị trí token trong chuỗi", fontsize=8)
-
-        # Chỗ nối của vùng T: hai mảnh văn bản KHÔNG liền nhau trong chuỗi.
-        for c in reg["cuts"]:
-            ax.axhline(c - 0.5, color="#ffffff", lw=1.0, ls="--", alpha=0.75,
-                       zorder=4)
-            ax.text(0.5, c - 0.5, f" ↕ nhảy {rows[c-1]}→{rows[c]}", ha="left",
-                    va="bottom", fontsize=6.5, color="#ffffff", zorder=6)
-
-        ax.set_title(f"{reg['label']} — {n} token", loc="left", fontsize=9.5,
-                     color=reg["color"], fontweight="bold")
-        cb = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
-        cb.ax.tick_params(labelsize=6.5)
-        # Thang màu RIÊNG của ô này, và con số để biết riêng tới mức nào.
-        ax.text(0.0, -0.085, f"thang RIÊNG ô này: 0 → {v:.3g}",
-                transform=ax.transAxes, fontsize=7, color="#555555",
-                ha="left", va="top")
-        for sp in ax.spines.values():
-            sp.set_color(reg["color"])
-            sp.set_linewidth(1.6)
-
-    fig.suptitle(f"‖∂y/∂h‖ theo token × lớp — đủ {n_layers} lớp · "
-                 f"BA ô, BA thang màu riêng (không so độ sáng giữa các ô)",
-                 fontsize=10)
-    fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.97))
+    keys = ("z", "q", "t")
+    labels_ = {"z": "Z · token ảnh", "q": "Q · latent", "t": "T · văn bản"}
+    colors = {"z": "#2a78d6", "q": "#e8a317", "t": "#7a7a7a"}
+    n = len(results)
+    fig, axes = plt.subplots(3, n, dpi=150, figsize=(4.4 * n, 14.0),
+                             gridspec_kw={"height_ratios": [1.25, 0.75, 1.25]},
+                             squeeze=False, layout="constrained")
+    pct, frac = float(cfg_l["percentile_clip"]), float(cfg_l["reach_frac"])
+    for c, (res, it) in enumerate(zip(results, items)):
+        S = np.asarray(res["layer_sens"])
+        M = S.T                                           # (T, L)
+        n_layers = S.shape[0]
+        vmax = shared_vmax(S, pct)
+        thr = frac * vmax
+        step = 1 if n_layers <= 24 else max(1, n_layers // 8)
+        ticks = [k for k in range(n_layers) if (k + 1) % step == 0 or k == 0]
+        regs = {r["key"]: r for r in _regions(res, S.shape[1])}
+        im = None
+        for r_i, key in enumerate(keys):
+            ax = axes[r_i, c]
+            reg = regs.get(key)
+            if reg is None:
+                ax.axis("off")
+                continue
+            rows = reg["rows"]
+            A = M[rows, :]
+            im = ax.imshow(A, aspect="auto", cmap=cfg_l["cmap"], origin="upper",
+                           vmin=0.0, vmax=vmax, interpolation="nearest")
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([str(k + 1) for k in ticks], fontsize=7)
+            if len(rows) <= 32:
+                yt = list(range(len(rows)))
+                ylab = [(f"Q[{rows[k] - reg['base']}]" if reg["base"] is not None
+                         else str(rows[k])) for k in yt]
+                ax.set_yticks(yt[::2] if len(rows) > 16 else yt)
+                ax.set_yticklabels(ylab[::2] if len(rows) > 16 else ylab, fontsize=6)
+            else:
+                ys = max(1, int(round(len(rows) / 10)))
+                yt = list(range(0, len(rows), ys))
+                ax.set_yticks(yt)
+                ax.set_yticklabels([str(rows[k]) for k in yt], fontsize=6.5)
+            for cut in reg["cuts"]:
+                ax.axhline(cut - 0.5, color="#ffffff", lw=0.8, ls=":", alpha=0.7)
+            rl = reach_layer(A, thr)
+            if rl is not None:
+                ax.axvline(rl - 1, color="#00e5ff", lw=1.4, ls="--", zorder=5)
+                ax.text(rl - 1, -0.6, f" ℓ={rl}", color="#00a8bf", fontsize=7.5,
+                        ha="left", va="bottom", fontweight="bold",
+                        transform=ax.transData, clip_on=False)
+            for sp in ax.spines.values():
+                sp.set_color(colors[key])
+                sp.set_linewidth(1.5)
+            if c == 0:
+                ax.set_ylabel(f"{labels_[key]}\nvị trí token", fontsize=8.5,
+                              color=colors[key], fontweight="bold")
+            if r_i == 2:
+                ax.set_xlabel("lớp decoder (chỉ số thật)", fontsize=8)
+            if r_i == 0:
+                ax.set_title(f"mẫu {c + 1} · {Path(it['key']).name[:28]}\n"
+                             f"y = {res['y']:.1f} · vmax chung {vmax:.3g}",
+                             fontsize=8.5)
+        if im is not None:
+            cb = fig.colorbar(im, ax=list(axes[:, c]), orientation="horizontal",
+                              fraction=0.025, pad=0.01, aspect=30)
+            cb.ax.tick_params(labelsize=6.5)
+            cb.set_label("‖∂y/∂h‖ — thang chung Z ∪ Q ∪ T", fontsize=7)
+    fig.suptitle(
+        "‖∂y/∂h‖ theo token × lớp — 3 dòng (Z · Q · T) × "
+        f"{n} mẫu · thang màu CHUNG cho Z ∪ Q ∪ T trong mỗi cột · "
+        f"đường đứt = lớp sâu nhất có token chạm {frac:g} × vmax",
+        fontsize=11)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path)
     plt.close(fig)
-    return {"layers": path}
+    return path
 
 
-def plot_visual(item: dict, res: dict, path: Path, cfg_l: dict) -> Path:
-    """BỐN ô trên MỘT dải ngang — ảnh gốc · Z · khối Q · đầu ra Extractor.
+# ══ Q ↔ bệnh lý ═════════════════════════════════════════════════════════════
+def disease_embeddings(model, tokenizer, names: list[str]) -> np.ndarray:
+    """(n_bệnh, d): trung bình embedding (lớp embedding của decoder) các subword
+    của tên bệnh — đúng không gian mà Q được chèn vào thay cho embedding token."""
+    import torch
 
-    1. **ảnh gốc** — mốc để đọc ba ô còn lại.
-    2. **Z**: ‖∂y/∂X‖ theo đường `y → Z → adapter → vision encoder` — đường CŨ,
-       đo xem decoder (đã finetune LoRA) rút được gì qua 256 token ảnh. Dừng ở
-       ĐẦU RA encoder, lưới 64².
-    3. **Khối Q**: `‖∂‖Q‖²/∂I‖` (`_q_saliency_map`) — TARGET là chính các High-Q
-       token, truy ngược `Q → CnA → Extractor → I` về
-       tận pixel của ảnh 448². KHÔNG dính decoder, không dính LoRA.
-    4. **Đầu ra DINOv3**: `‖feature‖₂` của lưới teacher (14×14 ở cấu hình hiện
-       tại) — backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó.
+    emb = model.get_input_embeddings()
+    dev = next(p for p in emb.parameters()).device
+    rows = []
+    with torch.no_grad():
+        for nm in names:
+            ids = tokenizer(nm, add_special_tokens=False)["input_ids"]
+            if not ids:
+                raise TrainUnusable(f"tên bệnh {nm!r} token hoá ra rỗng.")
+            t = torch.tensor([ids], device=dev)
+            rows.append(emb(t)[0].float().mean(dim=0).cpu().numpy())
+    return np.stack(rows)
 
-    **BỐN ô, và chỉ hai trong số đó cùng loại đại lượng.** Ô 2 và ô 3 đều là
-    **gradient** (độ nhạy); ô 4 là **độ lớn đặc trưng**, không phải đạo hàm của
-    bất cứ thứ gì. Một vùng sáng ở ô 4 nghĩa là backbone đặt nhiều "năng lượng"
-    ở đó, KHÔNG nghĩa là đổi vùng ấy thì Q đổi theo. Đừng đọc ô 4 như ô 3.
 
-    Cặp đáng đọc nhất là **ô 4 so ô 3**: backbone mã hoá cả ảnh, còn Extractor
-    chỉ hỏi một phần — chênh lệch giữa hai ô là *phần backbone có mà latent
-    không lấy*. Cặp **ô 2 so ô 3** trả lời câu khác: "Q được dựng từ đúng vùng
-    decoder vốn đã đòi qua Z không".
+def q_disease_attention(q: np.ndarray, e: np.ndarray, temp: float = 1.0) -> np.ndarray:
+    """a_ij = softmax_j( τ · q̂_i · ê_j / √d ), q̂/ê chuẩn hoá RMS. -> (n_query, n_bệnh)."""
+    q = np.asarray(q, dtype=np.float64)
+    e = np.asarray(e, dtype=np.float64)
+    d = q.shape[-1]
+    qh = q / np.sqrt((q ** 2).mean(axis=-1, keepdims=True) + 1e-6)
+    eh = e / np.sqrt((e ** 2).mean(axis=-1, keepdims=True) + 1e-6)
+    logits = float(temp) * (qh @ eh.T) / math.sqrt(d)
+    logits -= logits.max(axis=-1, keepdims=True)
+    p = np.exp(logits)
+    return p / p.sum(axis=-1, keepdims=True)
 
-    Bốn ô khác nhau cả ĐỘ PHÂN GIẢI lẫn ĐIỂM DỪNG (64² ở đầu ra encoder · 448²
-    tới tận pixel · 28² ở lưới teacher) — nên MỖI ô tự chuẩn hoá [0,1] và chỉ so
-    HÌNH DẠNG. Số để so định lượng nằm ở mục "Kiểm nhanh" (tương quan / IoU
-    trên lưới chung 64²), không đọc bằng mắt.
 
-    Cả ba bản đồ được nội suy lên cỡ ảnh gốc và chồng lên nó, để bốn ô đặt cạnh
-    nhau là so được ngay bằng mắt — đó là cả lý do gộp ô 4 vào đây thay vì để nó
-    thành một hình riêng cạnh một bản sao khác của ảnh gốc.
+def top_p(row: np.ndarray, names: list[str], p_cut: float) -> list[tuple[str, float]]:
+    """Bệnh theo p giảm dần cho tới khi tổng chạm `p_cut` (gồm cả bệnh vượt ngưỡng)."""
+    order = np.argsort(-np.asarray(row))
+    out, acc = [], 0.0
+    for j in order:
+        out.append((names[int(j)], float(row[int(j)])))
+        acc += float(row[int(j)])
+        if acc >= p_cut - 1e-12:
+            break
+    return out
 
-    Độ mờ theo TỪNG ĐIỂM: alpha = `overlay_alpha` × m, nên chỗ yếu gần như
-    trong suốt và ảnh gốc vẫn đọc được, chỗ mạnh mới ăn màu.
-    """
+
+def plot_q_disease(mats: list[np.ndarray], items: list[dict], names: list[str],
+                   path: Path, cfg_l: dict) -> Path:
+    """N heatmap (Q[i] × bệnh) cạnh nhau, CÙNG thang [0, 1] — so ngang được."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from PIL import Image
 
-    with Image.open(item["image_path"]) as im:
-        img = np.asarray(im.convert("L"), dtype=float) / 255.0
-    H, W = img.shape
-    cmap = plt.get_cmap(cfg_l["cmap"])
-    panels = [("Z · GRADIENT\ny → Z → adapter → vision encoder (X)\n"
-               "lưới 64², DỪNG ở đầu ra encoder", res.get("sal_z")),
-              ("khối Q · GRADIENT\n‖∂‖Q‖²/∂I‖ · Q → CnA\n"
-               "→ Extractor (teacher) → ảnh 448²", res.get("sal_q")),
-              ("đầu ra Extractor · ĐỘ LỚN\n‖feature‖₂ lưới teacher — KHÔNG phải gradient\n"
-               "backbone mã hoá gì, trước khi bị hỏi",
-               res.get("teacher_feature_norm"))]
-    panels = [(t, m) for t, m in panels if m is not None]
-    fig, axes = plt.subplots(1, 1 + len(panels), dpi=150,
-                             figsize=(3.7 * (1 + len(panels)), 4.4))
-    axes = np.atleast_1d(np.asarray(axes)).ravel()
-    axes[0].imshow(img, cmap="gray", vmin=0, vmax=1)
-    axes[0].set_title("1. ảnh gốc", fontsize=9)
-    axes[0].axis("off")
-    for k, (title, mp) in enumerate(panels, start=1):
-        m = _norm01(np.asarray(mp), cfg_l["percentile_clip"])
-        big = np.asarray(Image.fromarray((m * 255).astype("uint8")).resize(
-            (W, H), Image.BILINEAR), dtype=float) / 255.0
-        rgba = cmap(big)
-        rgba[..., 3] = np.clip(big, 0.0, 1.0) * float(cfg_l["overlay_alpha"])
-        axes[k].imshow(img, cmap="gray", vmin=0, vmax=1)
-        axes[k].imshow(rgba, interpolation="bilinear")
-        axes[k].set_title(f"{k + 1}. {title}", fontsize=7.8)
-        axes[k].axis("off")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
-    cb = fig.colorbar(sm, ax=list(axes), fraction=0.02, pad=0.01)
-    cb.set_label("chuẩn hoá [0,1] theo TỪNG ô", fontsize=7.5)
-    fig.suptitle(f"Lens · {item['key']} · {item['n_pos']} pos · {item['n_unc']} unc",
-                 fontsize=10)
+    n = len(mats)
+    nq = mats[0].shape[0]
+    fig, axes = plt.subplots(1, n, dpi=150, figsize=(4.0 * n, 0.32 * nq + 3.4),
+                             squeeze=False, layout="constrained")
+    im = None
+    for c, (A, it) in enumerate(zip(mats, items)):
+        ax = axes[0, c]
+        im = ax.imshow(A, aspect="auto", cmap=cfg_l["cmap"], vmin=0.0, vmax=1.0,
+                       interpolation="nearest")
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=65, ha="right", fontsize=6.5)
+        ax.set_yticks(range(nq))
+        ax.set_yticklabels([f"Q[{i}]" for i in range(nq)] if c == 0 else [],
+                           fontsize=6.5)
+        pos = {f["label"] for f in it.get("findings", []) if f["class"] == "pos"}
+        for j, nm in enumerate(names):
+            if nm in pos:
+                ax.get_xticklabels()[j].set_color("#d62728")
+                ax.get_xticklabels()[j].set_fontweight("bold")
+        ax.set_title(f"mẫu {c + 1} · {Path(it['key']).name[:24]}", fontsize=8)
+    fig.colorbar(im, ax=list(axes[0]), fraction=0.02, pad=0.01).set_label(
+        "p (softmax trên 14 bệnh)", fontsize=7.5)
+    fig.suptitle("Attention Q[i] → token bệnh lý (embedding decoder) · "
+                 "nhãn đỏ = bệnh `pos` của ảnh", fontsize=10)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
-# ── chạy ───────────────────────────────────────────────────────────────────
+# ══ VISION: Grad-CAM ═════════════════════════════════════════════════════════
+def _cam(A, G, method: str) -> np.ndarray:
+    """A, G: (C, h, w) activation và gradient -> CAM (h, w) chuẩn hoá [0, 1]."""
+    import torch
+
+    if method == "gradcam++":
+        g2, g3 = G.pow(2), G.pow(3)
+        denom = 2.0 * g2 + A.sum(dim=(1, 2), keepdim=True) * g3
+        alpha = torch.where(denom.abs() > 1e-12, g2 / denom, torch.zeros_like(g2))
+        w = (alpha * torch.relu(G)).sum(dim=(1, 2))
+    else:
+        w = G.mean(dim=(1, 2))
+    cam = torch.relu((w[:, None, None] * A).sum(dim=0))
+    # chuẩn hoá như `scale_cam_image` của Grad-CAM: (cam − min) / (max + 1e-7)
+    cam = cam - cam.min()
+    cam = cam / (cam.max() + 1e-7)
+    return cam.detach().cpu().numpy()
+
+
+def _cam_module(branch, stage: int):
+    body = branch.extractor.body
+    stages = getattr(body, "stages", None)
+    if stages is None:
+        stages = getattr(body, "layers", None)
+    if stages is None or len(stages) == 0:
+        raise TrainUnusable(
+            f"{branch.extractor.arch!r} không có `.stages` — Grad-CAM cần một bản "
+            f"đồ đặc trưng không gian giữa backbone.")
+    try:
+        return stages[stage], (stage % len(stages))
+    except IndexError as e:
+        raise TrainUnusable(f"lens.cam_stage {stage} ngoài khoảng "
+                            f"[-{len(stages)}, {len(stages) - 1}].") from e
+
+
+def vision_cams(branch, px, dev, stage: int = -2, method: str = "gradcam") -> dict:
+    """-> {"extractor": (h, w), "q": (n_query, h, w), "grid": (h, w), "stage": k}.
+
+    MỘT lượt forward, `1 + n_query` lượt backward (retain_graph) — mọi target
+    dùng chung activation của stage đã chọn.
+    """
+    import torch
+
+    mod, k = _cam_module(branch, stage)
+    hold = {}
+
+    def hook(_m, _i, o):
+        a = o.detach().requires_grad_(True)
+        hold["a"] = a
+        return a
+
+    fmt = branch.extractor.fmt
+    h = mod.register_forward_hook(hook)
+    was, was_train = branch.frozen, branch.training
+    branch.set_frozen(False)
+    branch.eval()
+    for prm in branch.parameters():
+        prm.requires_grad_(False)
+    try:
+        with torch.enable_grad(), RCV.autocast(dev):
+            v = branch.extractor(px.to(dev))
+            vc = branch.cna(v)
+        A = hold["a"]
+        scores = [v.float().pow(2).sum()]
+        scores += [vc[0, i].float().pow(2).sum() for i in range(vc.shape[1])]
+        A0 = A[0].float()
+        if fmt == "NHWC":
+            A0 = A0.permute(2, 0, 1)
+        maps = []
+        for j, s in enumerate(scores):
+            (g,) = torch.autograd.grad(s, A, retain_graph=j < len(scores) - 1)
+            g0 = g[0].float()
+            if fmt == "NHWC":
+                g0 = g0.permute(2, 0, 1)
+            maps.append(_cam(A0, g0, method))
+    finally:
+        h.remove()
+        branch.train(was_train)
+        branch.set_frozen(was)
+        for prm in branch.parameters():
+            prm.requires_grad_(False)
+    return {"extractor": maps[0], "q": np.stack(maps[1:]),
+            "grid": tuple(maps[0].shape), "stage": int(k)}
+
+
+# Bảng `cv2.COLORMAP_JET` (RGB, 256 mức) — đúng heatmap của `show_cam_on_image`,
+# nhúng sẵn để không kéo thêm OpenCV.
+_JET_RGB_HEX = (
+    "00008000008400008800008c00009000009400009800009c0000a00000a40000a80000ac"
+    "0000b00000b40000b80000bc0000c00000c40000c80000cc0000d00000d40000d80000dc"
+    "0000e00000e40000e80000ec0000f00000f40000f80000fc0000ff0004ff0008ff000cff"
+    "0010ff0014ff0018ff001cff0020ff0024ff0028ff002cff0030ff0034ff0038ff003cff"
+    "0040ff0044ff0048ff004cff0050ff0054ff0058ff005cff0060ff0064ff0068ff006cff"
+    "0070ff0074ff0078ff007cff0080ff0084ff0088ff008cff0090ff0094ff0098ff009cff"
+    "00a0ff00a4ff00a8ff00acff00b0ff00b4ff00b8ff00bcff00c0ff00c4ff00c8ff00ccff"
+    "00d0ff00d4ff00d8ff00dcff00e0ff00e4ff00e8ff00ecff00f0ff00f4ff00f8ff00fcff"
+    "02fffe06fffa0afff60efff212ffee16ffea1affe61effe222ffde26ffda2affd62effd2"
+    "32ffce36ffca3affc63effc242ffbe46ffba4affb64effb252ffae56ffaa5affa65effa2"
+    "62ff9e66ff9a6aff966eff9272ff8e76ff8a7aff867eff8282ff7e86ff7a8aff768eff72"
+    "92ff6e96ff6a9aff669eff62a2ff5ea6ff5aaaff56aeff52b2ff4eb6ff4abaff46beff42"
+    "c2ff3ec6ff3acaff36ceff32d2ff2ed6ff2adaff26deff22e2ff1ee6ff1aeaff16eeff12"
+    "f2ff0ef6ff0afaff06feff01fffc00fff800fff400fff000ffec00ffe800ffe400ffe000"
+    "ffdc00ffd800ffd400ffd000ffcc00ffc800ffc400ffc000ffbc00ffb800ffb400ffb000"
+    "ffac00ffa800ffa400ffa000ff9c00ff9800ff9400ff9000ff8c00ff8800ff8400ff8000"
+    "ff7c00ff7800ff7400ff7000ff6c00ff6800ff6400ff6000ff5c00ff5800ff5400ff5000"
+    "ff4c00ff4800ff4400ff4000ff3c00ff3800ff3400ff3000ff2c00ff2800ff2400ff2000"
+    "ff1c00ff1800ff1400ff1000ff0c00ff0800ff0400ff0000fc0000f80000f40000f00000"
+    "ec0000e80000e40000e00000dc0000d80000d40000d00000cc0000c80000c40000c00000"
+    "bc0000b80000b40000b00000ac0000a80000a40000a000009c0000980000940000900000"
+    "8c0000880000840000800000"
+)
+
+
+def show_cam_on_image(img: np.ndarray, mask: np.ndarray,
+                      image_weight: float = 0.5) -> np.ndarray:
+    """Overlay MẶC ĐỊNH của Grad-CAM (`pytorch_grad_cam.utils.image.show_cam_on_image`).
+
+        heatmap = JET(uint8(255 · mask)) / 255                 (use_rgb=True)
+        cam     = (1 − image_weight) · heatmap + image_weight · img
+        cam     = cam / max(cam)
+
+    Tô màu TOÀN ảnh (không alpha theo điểm), colormap JET, image_weight 0.5. JET là
+    ĐÚNG bảng `cv2.COLORMAP_JET` (nhúng sẵn ở `_JET_RGB_HEX`), không cần OpenCV. img: (H, W, 3) [0, 1]; mask: (H, W) [0, 1].
+    """
+    if not 0.0 <= float(image_weight) <= 1.0:
+        raise ValueError(f"image_weight {image_weight} phải trong [0, 1].")
+    lut = np.frombuffer(bytes.fromhex(_JET_RGB_HEX), dtype=np.uint8).reshape(256, 3)
+    m8 = np.uint8(255 * np.clip(mask, 0.0, 1.0))
+    heat = lut[m8].astype(float) / 255.0
+    cam = (1.0 - float(image_weight)) * heat + float(image_weight) * img
+    return cam / max(float(cam.max()), 1e-12)
+
+
+def _overlay_jpeg(img: np.ndarray, cam: np.ndarray | None,
+                  image_weight: float = 0.5, size: int = 448) -> str:
+    """Ảnh X xám (H, W) [0,1] + CAM -> JPEG base64 (overlay mặc định Grad-CAM).
+
+    CAM được nội suy BILINEAR lên cỡ ảnh như `scale_cam_image` của Grad-CAM.
+    cam None -> chỉ X.
+    """
+    from PIL import Image
+
+    base = Image.fromarray((np.clip(img, 0, 1) * 255).astype("uint8")).resize(
+        (size, size), Image.BILINEAR)
+    g = np.asarray(base, dtype=float) / 255.0
+    rgb = np.repeat(g[..., None], 3, axis=-1)
+    if cam is not None:
+        m = Image.fromarray(np.asarray(cam, dtype=np.float32)).resize(
+            (size, size), Image.BILINEAR)
+        rgb = show_cam_on_image(rgb, np.asarray(m, dtype=float), image_weight)
+    buf = io.BytesIO()
+    Image.fromarray((np.clip(rgb, 0, 1) * 255).astype("uint8")).save(
+        buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _load_gray(path: str) -> np.ndarray:
+    from PIL import Image
+
+    with Image.open(path) as im:
+        return np.asarray(im.convert("L"), dtype=float) / 255.0
+
+
+def _cam_stats(m: np.ndarray) -> dict:
+    u = np.asarray(m, dtype=float).ravel()
+    srt = np.sort(u)[::-1]
+    k10 = max(1, int(round(0.1 * u.size)))
+    return {"max_over_mean": float(srt[0] / max(float(u.mean()), 1e-12)),
+            "top10_share": float(srt[:k10].sum() / max(float(u.sum()), 1e-12))}
+
+
+def write_vision_html(cfg_l: dict, d: Path, items: list[dict], cams: list[dict],
+                      extra: list[dict], meta: dict) -> Path:
+    """Trang HTML tự chứa: 5 cột mẫu; dòng 1 = CAM(Extractor), dòng 2 = CAM(Q[i])."""
+    nq = int(cams[0]["q"].shape[0])
+    data = []
+    for it, cm, ex in zip(items, cams, extra):
+        img = _load_gray(it["image_path"])
+        data.append({
+            "key": it["key"],
+            "pos": [f["label"] for f in it.get("findings", []) if f["class"] == "pos"],
+            "x": _overlay_jpeg(img, None),
+            "ext": _overlay_jpeg(img, cm["extractor"], cfg_l["cam_image_weight"]),
+            "ext_stat": _cam_stats(cm["extractor"]),
+            "q": [_overlay_jpeg(img, cm["q"][i], cfg_l["cam_image_weight"])
+                  for i in range(nq)],
+            "q_stat": [_cam_stats(cm["q"][i]) for i in range(nq)],
+            "q_share": ex.get("q_vec"),
+            "q_top": ex.get("q_top"),
+        })
+    payload = json.dumps({"nq": nq, "samples": data, "meta": meta},
+                         ensure_ascii=False)
+    method = "Grad-CAM++" if cfg_l["cam"] == "gradcam++" else "Grad-CAM"
+    html = _VISION_TEMPLATE.replace("__PAYLOAD__", payload).replace(
+        "__METHOD__", method).replace("__N__", str(len(items))).replace(
+        "__NQ__", str(nq))
+    p = d / DOC_VISION
+    p.write_text(html, encoding="utf-8")
+    return p
+
+
+_VISION_TEMPLATE = r"""<!doctype html>
+<html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lens Vision</title>
+<style>
+:root{--bg:#f7f7f5;--fg:#1c1c1c;--muted:#6b6b6b;--card:#ffffff;--line:#e2e2de;
+--acc:#e8a317;--acc2:#2a78d6;}
+@media (prefers-color-scheme: dark){:root{--bg:#141414;--fg:#ececec;--muted:#9a9a9a;
+--card:#1e1e1e;--line:#333;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:20px 24px 8px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px}
+.wrap{padding:8px 24px 32px;overflow-x:auto}
+.grid{display:grid;grid-template-columns:110px repeat(__N__,minmax(260px,1fr));gap:12px;
+min-width:1440px}
+.rowlab{display:flex;flex-direction:column;justify-content:center;font-weight:600;
+font-size:13px;padding-right:6px}
+.rowlab small{font-weight:400;color:var(--muted)}
+.cell{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px}
+.cell img{width:100%;display:block;border-radius:4px;cursor:zoom-in}
+#zoom{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;
+justify-content:center;z-index:9;cursor:zoom-out}#zoom img{width:min(88vw,88vh);height:auto;image-rendering:auto}
+#zoom.on{display:flex}
+.cap{font-size:11.5px;color:var(--muted);margin-top:4px;min-height:2.6em}
+.head{font-size:12px;font-weight:600;word-break:break-all}
+.head .pos{color:#d62728;font-weight:500}
+.ext{border-top:3px solid var(--acc2)}.qq{border-top:3px solid var(--acc)}
+.pager{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 24px;
+border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.pager button{border:1px solid var(--line);background:var(--card);color:var(--fg);
+border-radius:6px;min-width:44px;height:32px;cursor:pointer;font:inherit}
+.pager button.on{background:var(--acc);border-color:var(--acc);color:#111;font-weight:700}
+.pager .lab{font-weight:600;margin-right:6px}
+.pager label{margin-left:auto;color:var(--muted);font-size:13px}
+.legend{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);
+padding:4px 24px}
+.bar{width:180px;height:10px;border-radius:3px;
+background:linear-gradient(90deg,#00007f,#0000ff,#007fff,#00ffff,#7fff7f,#ffff00,#ff7f00,#ff0000,#7f0000)}
+.notes{padding:0 24px 32px;max-width:1100px;color:var(--fg);font-size:13.5px}
+.notes code{background:var(--card);border:1px solid var(--line);padding:0 4px;border-radius:4px}
+@media (max-width:700px){header,.wrap,.pager,.notes{padding-left:16px;padding-right:16px}}
+</style></head><body>
+<header><h1>Lens · Vision — __METHOD__</h1>
+<div class="sub">Nền (identity) luôn là X — ảnh 448² vào Extractor ·
+dòng 1: target = đầu ra Extractor (‖V‖²) · dòng 2: target = đầu ra CnA (‖V_c[i]‖²) ·
+<span id="stageinfo"></span></div></header>
+<div class="pager" id="pager"><span class="lab">Q[i]</span></div>
+<div class="legend"><span>0</span><div class="bar"></div><span>1 · Grad-CAM overlay mặc định (JET, image_weight 0.5) · mỗi bản đồ chuẩn hoá min–max của chính nó (so HÌNH DẠNG, không so độ sáng giữa ô)</span></div>
+<div class="wrap"><div class="grid" id="grid"></div></div>
+<div id="zoom" onclick="this.classList.remove('on')"><img id="zimg"></div>
+<div class="notes">
+<p><b>Cách đọc.</b> Dòng 1 cố định: vùng ảnh mà toàn bộ đầu ra Extractor (196 token × 512)
+nhạy nhất. Dòng 2 đổi theo Q[i]: vùng ảnh mà riêng latent <code>V_c[i]</code> phụ thuộc.
+So dòng 2 với dòng 1: trùng = Q[i] lấy đúng phần backbone nhấn mạnh; lệch = Q[i] chuyên
+về một vùng riêng. Lật qua các Q[i]: nhiều Q cùng một vùng = latent trùng lặp; mỗi Q một
+vùng = 16 latent chia nhau ảnh. Bấm vào ảnh để phóng to (Esc để đóng); phím ← → đổi Q[i].</p>
+<p><b>Caption.</b> <code>max/mean</code> ≈ 1 và <code>top10%</code> ≈ 10% = bản đồ phẳng
+(không tập trung). <code>decoder đọc</code> = phần độ nhạy của khối Q mà decoder dồn vào
+Q[i] trên ảnh đó (từ báo cáo Language). <code>bệnh</code> = bệnh có p cao nhất trong
+ma trận attention Q[i] ↔ token bệnh lý.</p>
+<p><b>Giới hạn.</b> Grad-CAM là độ nhạy cục bộ, không phải phân đoạn tổn thương và không
+phải nhân quả. 5 ảnh bốc ngẫu nhiên (seed cố định) để minh hoạ, không phải thống kê.</p>
+</div>
+<script>
+const D = __PAYLOAD__;
+let cur = 0, raw = false;
+const pager = document.getElementById('pager'), grid = document.getElementById('grid');
+document.getElementById('stageinfo').textContent =
+  'lớp CAM: stage ' + D.meta.stage + ' · lưới ' + D.meta.grid.join('×') + ' · seed ' + D.meta.seed;
+const pct = v => (100*v).toFixed(0) + '%';
+function stat(s){return 'max/mean ' + s.max_over_mean.toFixed(1) + ' · top10% ' + pct(s.top10_share);}
+function build(){
+  const prev = document.createElement('button'); prev.textContent='◀'; prev.onclick=()=>go(cur-1);
+  pager.appendChild(prev);
+  for(let i=0;i<D.nq;i++){const b=document.createElement('button');b.textContent=i;
+    b.onclick=()=>go(i);b.id='p'+i;pager.appendChild(b);}
+  const nxt = document.createElement('button'); nxt.textContent='▶'; nxt.onclick=()=>go(cur+1);
+  pager.appendChild(nxt);
+  const lb=document.createElement('label');
+  lb.innerHTML='<input type="checkbox" id="raw"> chỉ ảnh X';
+  pager.appendChild(lb);
+  document.getElementById('raw').onchange=e=>{raw=e.target.checked;render();};
+  grid.appendChild(div('rowlab',''));
+  D.samples.forEach((s,k)=>{const h=div('head','');
+    h.innerHTML='mẫu '+(k+1)+' · '+s.key+(s.pos.length?'<br><span class="pos">pos: '+s.pos.join(', ')+'</span>':'');
+    grid.appendChild(h);});
+  grid.appendChild(div('rowlab','Dòng 1<br><small>target = đầu ra Extractor</small>'));
+  D.samples.forEach((s,k)=>{const c=div('cell ext','');
+    c.innerHTML='<img id="e'+k+'"><div class="cap">'+stat(s.ext_stat)+'</div>';grid.appendChild(c);});
+  grid.appendChild(div('rowlab','Dòng 2<br><small id="qlab"></small>'));
+  D.samples.forEach((s,k)=>{const c=div('cell qq','');
+    c.innerHTML='<img id="q'+k+'"><div class="cap" id="qc'+k+'"></div>';grid.appendChild(c);});
+  document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')go(cur+1);
+    if(e.key==='ArrowLeft')go(cur-1);if(e.key==='Escape')document.getElementById('zoom').classList.remove('on');});
+  grid.addEventListener('click',e=>{if(e.target.tagName==='IMG'){
+    document.getElementById('zimg').src=e.target.src;document.getElementById('zoom').classList.add('on');}});
+}
+function div(c,h){const d=document.createElement('div');d.className=c;d.innerHTML=h;return d;}
+function go(i){cur=(i+D.nq)%D.nq;render();}
+function render(){
+  for(let i=0;i<D.nq;i++)document.getElementById('p'+i).classList.toggle('on',i===cur);
+  document.getElementById('qlab').textContent='target = V_c['+cur+']';
+  D.samples.forEach((s,k)=>{
+    document.getElementById('e'+k).src='data:image/jpeg;base64,'+(raw?s.x:s.ext);
+    document.getElementById('q'+k).src='data:image/jpeg;base64,'+(raw?s.x:s.q[cur]);
+    let cap=stat(s.q_stat[cur]);
+    if(s.q_share)cap+='<br>decoder đọc '+pct(s.q_share[cur])+' khối Q';
+    if(s.q_top&&s.q_top[cur])cap+=' · bệnh: '+s.q_top[cur];
+    document.getElementById('qc'+k).innerHTML=cap;});
+}
+build();render();
+</script></body></html>
+"""
+
+
+# ══ chạy ═════════════════════════════════════════════════════════════════════
 def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
         test_df: pd.DataFrame, tracker=None) -> dict:
-    """Mổ MỘT ảnh trên MỘT candidate: B. `A` chỉ dùng để ghi tên vào tài liệu.
-
-    §2.0 chạy cả hai rồi trừ nhau vì ở đó Z bị thay bằng Z' — chênh lệch nằm
-    rải trên 256 token ảnh và chỉ hiện ra ở dải B − A. Ở §2.2, Z của B giống A
-    TỪNG BIT và chuỗi chỉ dài thêm khối Q, nên "B − A" chính là Q. Không nạp A
-    nữa: bớt một lần tải 4B + một lượt backward, và bớt một cột số dễ đọc nhầm
-    thành kết luận A/B (kết luận ấy nằm ở REPORT.md).
-    """
+    """Mổ `n_samples` ảnh trên candidate B -> Lens_Vision.html + Lens_Language.md."""
     import torch
 
     lc = lcfg(cfg)
     d = lens_dir(cfg, run_dir)
     (d / "figures").mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    # Kiểm weight TRƯỚC `pick_sample`: chọn ảnh phải nạp bảng nhãn (có thể tải
-    # từ Hub) và quét cả tập test — không đáng tốn khi nhánh còn chưa dùng được.
     bid = B["id"]
     adir = Path(adapter_root) / bid
     if not (adir / "adapter_model.safetensors").exists():
         raise TrainUnusable(
             f"Lens cần weight của {bid} trên máy này ({adir}). Chạy `train` trước, "
             f"hoặc bật `output.pull` + HF_TOKEN để kéo về.")
-    # Weight có đó nhưng là của một KIẾN TRÚC KHÁC thì dừng NGAY, với câu nói rõ
-    # phải làm gì — đừng để `load_branch` ném một RuntimeError format ở tận
-    # trong ruột sau khi đã nạp xong model 4B.
     from .train_vextractor import branch_stale
 
     why = branch_stale(adir, stage0_dir(cfg) / STAGE0_CKPT, cfg)
     if why:
         raise TrainUnusable(
             f"weight của {bid} ở {adir} KHÔNG dùng được với code hiện tại: {why}.\n"
-            f"    Lens mổ chính khối Q, nên nó cần nhánh của ĐÚNG kiến trúc đang "
-            f"chạy. Huấn luyện lại main stage trước:\n"
+            f"    Huấn luyện lại main stage trước:\n"
             f"        bash scripts/run_vextractor.sh train --retrain --detach")
-    item = pick_sample(cfg, test_df)
-    print(f"  ⚙ Lens dùng ảnh {item['key']} · {item['n_pos']} pos · {item['n_unc']} "
-          f"uncertain · {item['n_labelled']}/14 nhãn có mặt (nhãn CHỈ dùng để CHỌN "
-          f"ảnh — không vào loss, không vào bản đồ nào)", flush=True)
+    names, lut, _info = label_names(cfg)
+    items = pick_samples(cfg, test_df, lut, names)
+    print(f"  ⚙ Lens: {len(items)} ảnh (seed {lc['seed']}): "
+          + ", ".join(it["key"] for it in items), flush=True)
 
-    print(f"  ── {bid} ──", flush=True)
     model, processor, gemma, branch, st = load_arm(cfg, adir)
     if branch is None:
-        raise TrainUnusable(
-            f"{bid} không có nhánh V-Extractor (train_stats.uses_vextractor = false) — "
-            f"Lens của §2.2 mổ chính Q, không có Q thì không có gì để mổ.")
-    batch = encode(cfg, processor, item, image_size=branch.image_size,
-                   normalize=branch.normalize)
-    res = analyze(cfg, model, gemma, branch, batch, lc["target"])
-    tops = decode_top(processor, logit_lens(model, gemma, res["hidden_last"],
-                                            lc["top_k"]))
-    stats = {bid: {k: st.get(k) for k in ("rank", "alpha", "uses_vextractor", "steps")}}
+        raise TrainUnusable(f"{bid} không có nhánh V-Extractor — không có Q để mổ.")
+    dev = next(p for p in model.parameters() if p.device.type != "meta").device
+    E = disease_embeddings(model, processor.tokenizer, names)
+    lang, cams, mats = [], [], []
+    for k, it in enumerate(items, start=1):
+        batch = encode(cfg, processor, it, image_size=branch.image_size,
+                       normalize=branch.normalize)
+        res = analyze_language(model, gemma, branch, batch, lc["target"])
+        lang.append(res)
+        mats.append(q_disease_attention(res["q"], E, lc["attn_temp"]))
+        cams.append(vision_cams(branch, batch["vext_pixels"], dev,
+                                lc["cam_stage"], lc["cam"]))
+        print(f"    [{k}/{len(items)}] {it['key']} · y {res['y']:.2f}", flush=True)
+    stats = {k: st.get(k) for k in ("rank", "alpha", "uses_vextractor", "steps")}
     model = gemma = branch = processor = None
     free_vram()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    return write_reports(cfg, d, A, B, items, lang, cams, mats, names,
+                         {"train_stats": stats, "t0": t0})
 
+
+def write_reports(cfg: Cfg, d: Path, A: dict, B: dict, items, lang, cams, mats,
+                  names, extra: dict) -> dict:
+    """Ghi MỌI đầu ra từ kết quả đã tính — tách khỏi `run` để test được không cần model."""
+    lc = lcfg(cfg)
+    d = Path(d)
+    (d / "figures").mkdir(parents=True, exist_ok=True)
+    rs = [region_stats(r) for r in lang]
+    tops = [[top_p(M[i], names, lc["attn_top_p"]) for i in range(M.shape[0])]
+            for M in mats]
     figs = {}
     try:
-        figs.update(plot_layers(res, d / "figures" / "lens_layers.png", lc))
-        figs["visual"] = plot_visual(item, res,
-                                     d / "figures" / "lens_visual.png", lc)
+        figs["language"] = plot_language(lang, items,
+                                         d / "figures" / "lens_language_jacobian.png", lc)
+        figs["q_disease"] = plot_q_disease(mats, items, names,
+                                           d / "figures" / "lens_q_disease.png", lc)
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ vẽ hình hỏng: {e!r}", flush=True)
+    vx_extra = [{"q_vec": r.get("q_vec"),
+                 "q_top": [f"{t[0][0]} {t[0][1]:.2f}" for t in tp]}
+                for r, tp in zip(rs, tops)]
+    meta = {"stage": cams[0]["stage"], "grid": list(cams[0]["grid"]),
+            "seed": lc["seed"], "cam": lc["cam"]}
+    vis = write_vision_html(lc, d, items, cams, vx_extra, meta)
 
-    # ── số liệu thô ────────────────────────────────────────────────────────
-    raw = {"layer_sens": res["layer_sens"]}
-    for k in ("sal_q", "sal_q_64", "sal_z", "teacher_feature_norm"):
-        if res.get(k) is not None:
-            raw[k] = res[k]
-    np.savez_compressed(d / "lens_maps.npz", **raw)
-    pd.DataFrame([{"arm": bid, "layer": r["layer"],
-                   "tokens": " | ".join(r["tokens"]),
-                   "probs": " | ".join(f"{p:.3f}" for p in r["probs"])}
-                  for r in tops]).to_csv(d / "logit_lens.csv", index=False)
-
-    diag = diagnostics(res)
-    out = {"diagnostics": diag, "sample": item, "target": res["target"], "lens": lc,
-           "arm": {"id": bid, "y": res["y"], "n_tokens": res["n_tokens"],
-                   "image_span": res["image_span"], "insert_span": res["insert_span"],
-                   "layers": int(res["layer_sens"].shape[0])},
-           "reference_arm": A["id"], "train_stats": stats,
-           "minutes": round((time.time() - t0) / 60, 2)}
+    np.savez_compressed(
+        d / "lens_maps.npz",
+        **{f"layer_sens_{k}": r["layer_sens"] for k, r in enumerate(lang)},
+        **{f"cam_extractor_{k}": c["extractor"] for k, c in enumerate(cams)},
+        **{f"cam_q_{k}": c["q"] for k, c in enumerate(cams)},
+        **{f"q_disease_{k}": M for k, M in enumerate(mats)})
+    pd.DataFrame([{"sample": k + 1, "key": it["key"], "q": i, "disease": nm,
+                   "p": float(mats[k][i, j])}
+                  for k, it in enumerate(items) for i in range(mats[k].shape[0])
+                  for j, nm in enumerate(names)]).to_csv(d / "q_disease.csv", index=False)
+    reach = []
+    for r in lang:
+        S = np.asarray(r["layer_sens"])
+        vmax = shared_vmax(S, lc["percentile_clip"])
+        reach.append({g["key"]: reach_layer(S.T[g["rows"], :], lc["reach_frac"] * vmax)
+                      for g in _regions(r, S.shape[1])})
+    out = {"lens": lc, "samples": items,
+           "language": [{"y": r["y"], "target": r["target"], "n_tokens": r["n_tokens"],
+                         "image_span": r["image_span"], "insert_span": r["insert_span"],
+                         "layers": int(np.asarray(r["layer_sens"]).shape[0]),
+                         "share": s, "reach_layer": rc}
+                        for r, s, rc in zip(lang, rs, reach)],
+           "q_disease_top_p": [[[(n, round(p, 4)) for n, p in tp] for tp in tps]
+                               for tps in tops],
+           "disease_names": names, "reference_arm": A["id"], "arm": B["id"],
+           "train_stats": extra.get("train_stats"),
+           "minutes": round((time.time() - float(extra.get("t0", time.time()))) / 60, 2)}
     (d / "lens.json").write_text(json.dumps(out, indent=2, ensure_ascii=False,
                                             default=str), encoding="utf-8")
-    write_doc(cfg, d, A, B, item, res, tops, figs, out)
-    print(f"  ✓ Lens xong sau {out['minutes']} phút · layers 3 ô (Z · Q · T) · "
-          f"visual 4 ô (gốc · Z · khối Q · đầu ra Extractor) "
-          f"-> {d / DOC}", flush=True)
+    lang_doc = write_language_doc(cfg, d, A, B, items, lang, rs, reach, tops, figs, out)
+    print(f"  ✓ Lens xong · {len(items)} ảnh -> {vis.name} + {lang_doc.name} "
+          f"({d})", flush=True)
+    out["docs"] = {"vision": str(vis), "language": str(lang_doc)}
     return out
 
 
-def diagnostics(res: dict) -> dict:
-    """Vài con số để phần "cách đọc" nói được điều gì CỤ THỂ về lần chạy này."""
-    S = np.asarray(res["layer_sens"])
-    tot = float(S.sum()) or 1.0
-    lo, hi = res["image_span"]
-    ins = res.get("insert_span")
-    out = {"image_token_share": float(S[:, lo:hi + 1].sum()) / tot}
-    if ins:
-        out["q_token_share"] = float(S[:, ins[0]:ins[1]].sum()) / tot
-        q = S[:, ins[0]:ins[1]]
-        per = q.sum(axis=0)
-        out["q_vector_share"] = {
-            "n": int(q.shape[1]),
-            "n_active_50pct": int(np.searchsorted(
-                np.cumsum(np.sort(per)[::-1]) / max(float(per.sum()), 1e-12), 0.5) + 1),
-            "max_over_mean": float(per.max() / max(float(per.mean()), 1e-12)),
-        }
-    i, j = np.unravel_index(int(np.argmax(S)), S.shape)
-    out["peak"] = {"layer": int(i + 1), "pos": int(j), "value": float(S[i, j]),
-                   "where": _where(int(j), res)}
-    # So trên LƯỚI CHUNG 64²: `sal_q` gốc là 448², `sal_z` là 64².
-    m1, m2 = res.get("sal_q_64"), res.get("sal_z")
-    if m1 is not None and m2 is not None:
-        x, y = np.asarray(m1).ravel(), np.asarray(m2).ravel()
-        out["saliency_corr"] = float(np.corrcoef(x, y)[0, 1]) if x.std() and y.std() else None
-        t1, t2 = np.percentile(x, 90), np.percentile(y, 90)
-        s1, s2 = x >= t1, y >= t2
-        out["top10_iou"] = float((s1 & s2).sum() / max(int((s1 | s2).sum()), 1))
-        out["vext_energy_ratio"] = float(
-            np.linalg.norm(x) / max(np.linalg.norm(y), 1e-12))
-    # "Bản đồ Q có còn cấu trúc trên ảnh này không": phẳng lì -> max/mean ≈ 1 và
-    # 10% vùng nóng nhất chỉ gánh ≈ 10%. Phẳng thì mọi phép so hình dạng ở trên
-    # là so hai bản nhiễu.
-    if m1 is not None:
-        u = np.asarray(m1).ravel()
-        srt = np.sort(u)[::-1]
-        k10 = max(1, int(round(0.1 * u.size)))
-        out["q_map"] = {
-            "max_over_mean": float(srt[0] / max(float(u.mean()), 1e-12)),
-            "top10_share": float(srt[:k10].sum() / max(float(u.sum()), 1e-12))}
-    return out
-
-
-def _where(pos: int, res: dict) -> str:
-    lo, hi = res["image_span"]
-    ins = res.get("insert_span")
-    if ins and ins[0] <= pos < ins[1]:
-        return f"Q[{pos - ins[0]}]"
-    if lo <= pos <= hi:
-        return f"Z[{pos - lo}]"
-    return "text"
-
-
-# ── Lens_Explain.md ────────────────────────────────────────────────────────
-def reading_guide(out: dict, res: dict) -> list[str]:
-    """Mục "Cách đọc" đặt NGAY sau định nghĩa y: đọc theo thứ tự nào, kết luận
-    nào được phép rút ra, và mấy con số phải liếc trước khi tin mấy cái hình."""
-    dg = dict(out.get("diagnostics") or {})
-    pk = dict(dg.get("peak") or {})
-    qv = dict(dg.get("q_vector_share") or {})
-    L = ["## Cách đọc\n",
-         "**Thứ tự đọc**: (0) kiểm nhanh bên dưới → (1) heatmap đủ lớp để biết "
-         "decoder đọc khối **Q** ở lớp nào, mạnh bằng bao nhiêu so với token ảnh → "
-         "(2) bảng logit lens ở đúng những lớp ấy để xem nó đang nghiêng về TỪ gì → "
-         "(3) ba ô trên ảnh: ảnh gốc → bản đồ của Z (nhu cầu decoder qua đường "
-         "cũ) → bản đồ của chính khối Q (nó được dựng từ đâu). Ba tầng trả lời "
-         "ba câu khác nhau: *decoder có đọc Q không*, *Q đẩy vào chữ gì*, *Q "
-         "được dựng từ vùng nào và đường cũ đòi ở vùng nào*.\n",
-         "**Chỉ có candidate B ở đây.** Z của B giống A từng bit (nhánh không đụng "
-         "vào 256 token ảnh) và chuỗi chỉ dài thêm khối Q — nên **Q chính là phần "
-         "B − A**, không cần chạy A rồi trừ. Con số A/B nằm ở `REPORT.md`.\n",
-         "**Ba câu KHÔNG được rút ra từ file này**: (a) \"B tốt hơn A\" — kết luận đó "
-         "nằm ở `REPORT.md`, trên 3000 ảnh, có kiểm định; (b) \"model nhìn vào tổn "
-         "thương\" — gradient là độ nhạy cục bộ, không phải nhân quả; (c) bất cứ điều gì "
-         "về lâm sàng — đây là một ảnh, chọn vì nhiều nhãn, để minh hoạ.\n",
-         "**Kiểm nhanh trước khi tin hình** (số của chính lần chạy này):\n"]
-    rows = [["`y` (log-prob báo cáo tham chiếu)", f"{res['y']:.2f}",
-             "cao hơn = báo cáo tham chiếu hợp lý hơn dưới model này"],
-            ["phần độ nhạy nằm trên 256 token ảnh (Z)",
-             f"{100 * dg.get('image_token_share', float('nan')):.1f}%",
-             "quá thấp (≈0) thì heatmap chỉ đang nói về phần văn bản"]]
-    if dg.get("q_token_share") is not None:
-        rows.append(["phần độ nhạy nằm trên khối Q",
-                     f"{100 * dg['q_token_share']:.1f}%",
-                     "≈0 = decoder bỏ qua khối latent (nhánh chưa nói gì); "
-                     "cao = nó đang đọc Q thật"])
-    if qv:
-        rows.append([f"số vector Q gánh 50% độ nhạy (trên {qv.get('n')})",
-                     str(qv.get("n_active_50pct")),
-                     "nhỏ = chỉ vài latent vector làm việc (cực đoan: một "
-                     "mình `Q[0]` gánh hết), phần còn lại gần như chết; "
-                     "≈ một nửa = tải trải đều"])
-    qm = dict(dg.get("q_map") or {})
-    if qm.get("max_over_mean") is not None:
-        rows.append(["bản đồ Q — max/mean",
-                     f"{qm['max_over_mean']:.1f}",
-                     "≈1 = bản đồ phẳng lì, khối Q không được dựng từ vùng nào "
-                     "cụ thể trên ảnh này — ô 3 vô nghĩa, và mọi dòng so hình "
-                     "dạng dưới đây là so hai bản nhiễu"])
-    if qm.get("top10_share") is not None:
-        rows.append(["bản đồ Q — 10% vùng nóng nhất gánh",
-                     f"{100 * qm['top10_share']:.0f}%",
-                     "≈10% = phẳng; càng cao càng tập trung vào một vùng hẹp"])
-    if dg.get("vext_energy_ratio") is not None:
-        rows.append(["‖bản đồ Q‖ / ‖bản đồ Z‖", f"{dg['vext_energy_ratio']:.2f}",
-                     "hai đại lượng KHÁC NHAU (Q: cấu tạo khối Q · Z: nhu cầu "
-                     "decoder), nên con số này chỉ để phát hiện một bên ≈ 0, "
-                     "không đọc thành 'Q mạnh hơn Z mấy lần'"])
-    if dg.get("saliency_corr") is not None:
-        rows.append(["tương quan bản đồ Q với bản đồ Z",
-                     f"{dg['saliency_corr']:+.2f}",
-                     "gần 1 = Q được dựng từ đúng vùng decoder vốn đã đòi qua "
-                     "đường cũ (khuếch đại); gần 0 = Q lấy từ vùng đường cũ bỏ "
-                     "sót — đúng việc §2.2 sinh ra để hỏi"])
-    if dg.get("top10_iou") is not None:
-        rows.append(["IoU 10% vùng nóng nhất (Q vs Z)", f"{dg['top10_iou']:.2f}",
-                     "đo cùng chuyện nhưng chỉ trên vùng nóng"])
-    L.append("| đại lượng | giá trị | đọc thế nào |\n|---|---|---|")
-    L += ["| " + " | ".join(r) + " |" for r in rows]
-    if pk:
-        L.append(f"\nÔ nhạy nhất trên toàn bộ lớp: **lớp {pk.get('layer')}**, vị trí "
-                 f"{pk.get('pos')} (`{pk.get('where')}`, {pk.get('value', 0):.3g}).\n")
-    return L
-
-
-def write_doc(cfg, d: Path, A, B, item, res, tops, figs, out) -> Path:
+def write_language_doc(cfg, d: Path, A, B, items, lang, rs, reach, tops, figs,
+                       out) -> Path:
     lc = out["lens"]
-    b = B["id"]
-    n_layers = out["arm"]["layers"]
-    marks_src = last_layers(n_layers, lc["layer_frac"])   # chỉ cho bảng top-k (mục 2)
-    ins = out["arm"].get("insert_span")
-    L = [f"# Lens — {b} `[Z ‖ Q ‖ T]`\n",
-         f"_Một ảnh tiêu biểu, ghi đè mỗi lần chạy `lens`. Ảnh: `{item['key']}` — "
-         f"{item['n_pos']} nhãn `pos`, {item['n_unc']} nhãn `uncertain`. Tham chiếu "
-         f"(A) `{A['id']}` KHÔNG được chạy ở đây: xem \"Cách đọc\"._\n",
-         "## 0. Đại lượng gốc\n",
-         "Mọi bản đồ dưới đây là đạo hàm của **một số** `y`:\n",
-         ("```\ny = Σ_t log p(ref_t | ref_<t, ảnh)   (teacher forcing trên báo cáo tham chiếu)\n```\n"
-          if lc["target"] == "ref_logprob" else
-          "```\ny = logit của token được chọn ở vị trí cuối\n```\n"),
-         f"`y` = {res['y']:.2f}. `y` là số vô hướng, nên ∂y/∂· là MỘT HÀNG của "
-         "Jacobian — lấy đúng một lượt backward, không phải Jacobian đầy đủ "
-         "(2560 × số vị trí, không dựng nổi).\n"]
-    L += reading_guide(out, res)
-
-    L += ["## 1. [Language] Độ nhạy theo lớp decoder — BA ô, ĐỦ mọi lớp\n"]
-    if figs.get("layers"):
-        L.append(f"![lens layers](figures/{Path(figs['layers']).name})\n")
-    L += [f"`S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂` — h là hidden state ra khỏi lớp ℓ. Trục **Y "
-          f"là vị trí token** (chỉ số THẬT trong chuỗi {out['arm']['n_tokens']} token, "
-          f"đọc từ trên xuống), trục **X là lớp** với chỉ số THẬT, vẽ **đủ "
-          f"{n_layers} lớp**.\n",
-          f"**Ba ô trên MỘT dải ngang**: **Z** (256 token ảnh, token "
-          f"{out['arm']['image_span'][0]}–{out['arm']['image_span'][1]})"
-          + (f" · **Q** ({ins[1] - ins[0]} latent, token {ins[0]}–{ins[1] - 1}, "
-             f"đánh dấu từng `Q[k]`)" if ins else " · **Q**")
-          + " · **T** (phần văn bản — đây là PHẦN BÙ, ghép từ HAI mảnh không liền "
-            "nhau: BOS + system prompt TRƯỚC khối ảnh, câu hỏi + báo cáo SAU khối Q; "
-            "chỗ nối có đường đứt và nhãn `↕ nhảy`).\n",
-          "**Mỗi ô MỘT thang màu riêng.** Bản đầu vẽ cả chuỗi lên một heatmap với một "
-          "`vmax` chung: phần văn bản nhạy hơn phần thị giác hàng bậc nên nó định "
-          "`vmax`, và dải latent ra **đen tuyền**. Đọc hình đó thì kết luận tự nhiên "
-          "là \"decoder không đọc Q\" — trong khi cái thật sự xảy ra chỉ là một phép "
-          "chuẩn hoá màu, tức là hình trả lời SAI đúng câu hỏi nó sinh ra để trả lời.\n",
-          "Tách **thang màu** là thứ chữa được cái sụp ấy; tách **file** thì không "
-          "thêm gì — nó chỉ bắt người đọc mở ba ảnh rồi tự ghép lại trong đầu. Nên ba "
-          "ô nằm trên một dải, giống dải bốn ô ở mục 3.\n",
-          "Cái giá không đổi: **KHÔNG so được độ sáng giữa ba ô**. Một điểm sáng ở ô Q "
-          "và một điểm sáng ở ô T không cùng một giá trị — `vmax` tuyệt đối của từng ô "
-          "in ngay dưới nó. Câu \"Q mạnh yếu thế nào so với Z\" trả lời bằng **số** "
-          "(bảng ngay dưới, và dòng \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm "
-          "nhanh), không bằng mắt.\n",
-          f"Vẽ đủ lớp chứ không cắt đuôi: câu hỏi của ba ô này là *gradient dồn vào "
-          f"vùng nào của chuỗi, ở tầng nào của mạng*, và nó cần cả lớp thấp để có mức "
-          f"nền mà so. `lens.layer_frac` ({lc['layer_frac']:g}) chỉ còn áp cho **bảng "
-          f"top-k ở mục 2**, nơi lớp thấp thật sự vô nghĩa.\n"]
-    S = np.asarray(res["layer_sens"])
-    fl = np.argsort(-S.ravel())[:5]
-    L.append("Năm ô nhạy nhất trên toàn bộ lớp:\n")
-    L.append("| lớp | vị trí | ở đâu | ‖∂y/∂h‖ |\n|---|---|---|---|")
-    for f in fl:
-        i, j = np.unravel_index(int(f), S.shape)
-        L.append(f"| {i + 1} | {j} | `{_where(int(j), res)}` | {S[i, j]:.3g} |")
-    L.append("")
-    if ins:
-        q = S[:, ins[0]:ins[1]].sum(axis=0)
-        top = np.argsort(-q)[:8]
-        L.append("Tám latent vector được đọc nhiều nhất (tổng trên MỌI lớp):\n")
-        L.append("| Q[k] | " + " | ".join(f"`Q[{int(k)}]`" for k in top) + " |")
-        L.append("|---|" + "---|" * len(top))
-        L.append("| độ nhạy | " + " | ".join(f"{q[int(k)]:.3g}" for k in top) + " |")
-        L.append("")
-    L += ["**Đọc ba ô thế nào.**\n",
-          "0. **So Q với Z bằng BẢNG ở trên, không bằng mắt.** Ba ô có ba thang màu "
-          "khác nhau — đó là cái giá đã trả để dải Q không còn bị dìm thành đen. Con số "
-          "`vmax` dưới mỗi hình nói thang ấy tới đâu; muốn một câu trả lời định lượng "
-          "thì đọc năm ô nhạy nhất ở bảng trên và dòng \"phần độ nhạy nằm trên khối Q\" "
-          "ở mục Kiểm nhanh.\n",
-          "1. **Ô Q có cấu trúc không.** Vài hàng sáng rõ trên nền tối = một nhúm "
-          "latent làm việc, phần còn lại ngồi không (đối chiếu dòng \"số vector Q gánh "
-          "50%\" ở Kiểm nhanh). Sáng đều = 16 vector chia nhau tải. **Phẳng lì và tối "
-          "ĐỀU ngay trong thang riêng của nó** — tức là ngay cả khi đã tự chuẩn hoá mà "
-          "vẫn không có hàng nào nổi lên — mới là dấu hiệu thật của việc nhánh bị bỏ "
-          "qua; đó chính là thứ hình gộp cũ không phân biệt được.\n",
-          "3. **Cột (lớp)**: lớp thấp ≈ đặc trưng cục bộ của token, lớp cao ≈ quyết "
-          "định từ sẽ sinh. Dải Q sáng ở 1/4 lớp CUỐI (bên phải) = nó đang đổi kết "
-          "luận; chỉ sáng ở lớp thấp = nhánh mới đổi biểu diễn, chưa chạm tới chữ.\n",
-          "4. Màu cắt ở phân vị "
-          f"{lc['percentile_clip']:g} của chính ô này, nên **không** đọc độ sáng như "
-          "số tuyệt đối; con số tuyệt đối ở bảng ngay trên.\n",
-          "5. Chuẩn gradient **tăng dần theo độ sâu** là chuyện bình thường của kiến trúc "
-          "residual, không phải \"lớp cao quan trọng hơn\".\n"]
-
-    L.append(f"## 2. [Language] Logit lens — top-k, {len(marks_src)}/{n_layers} "
-             f"lớp cuối\n")
-    L.append("`ŷ_ℓ = W_U · RMSNorm(h_(ℓ,last))` rồi softmax → k token nhiều xác suất "
-             "nhất. Đây là xấp xỉ TUYẾN TÍNH: đọc hidden state giữa chừng bằng đúng "
-             "cái đầu ra của model, không qua các lớp còn lại.\n")
-    L.append("**14 nhãn bệnh lý của ảnh này** (từ `labels.npz`):\n")
-    L.append("| bệnh lý | lớp |\n|---|---|")
-    for f in item["findings"]:
-        L.append(f"| {f['label']} | {f['class']} |")
-    L.append("")
-    # CHỈ bảng top-k này lấy từ 1/4 lớp cuối: phép đọc tuyến tính bỏ qua mọi lớp
-    # sau ℓ, nên ở lớp thấp nó ra token vô nghĩa — đọc cũng không rút được gì.
-    step = max(1, len(marks_src) // max(1, lc["layer_marks"]))
-    marks = sorted(set(marks_src[::step] + [marks_src[-1]]))
-    L.append(f"| lớp | top-{lc['top_k']} |\n|---|---|")
-    for m in marks:
-        r = next((x for x in tops if x["layer"] == m), None)
-        txt = " · ".join(f"`{t}` {p:.2f}" for t, p in zip(r["tokens"], r["probs"])) \
-            if r else "—"
-        L.append(f"| {m} | {txt} |")
-    L.append("\nĐầy đủ mọi lớp ở `logit_lens.csv`.\n")
-    L += ["**Đọc bảng 2 thế nào.**\n",
-          f"0. Bảng này CHỈ lấy **lớp {marks_src[0]}–{marks_src[-1]}** "
-          f"(`lens.layer_frac` = {lc['layer_frac']:g}), khác ba hình ở mục 1 vốn vẽ đủ lớp.\n",
-          "1. Điều đáng đọc là **lớp nào bắt đầu ra từ lâm sàng** (effusion, opacity, "
-          "cardiomegaly…) — sớm hơn = thông tin đã sẵn sàng sớm hơn.\n",
-          "2. Đối chiếu với bảng 14 nhãn ở trên: từ khớp nhãn `pos` là tín hiệu tốt; "
-          "từ khớp nhãn `uncertain` xuất hiện sớm mà báo cáo tham chiếu lại nói không "
-          "chắc thì đọc kỹ trước khi kết luận.\n",
-          "3. Xác suất ở đây là **của phép đọc tuyến tính**, không phải xác suất model "
-          "thật sự sinh ra token đó.\n",
-          "4. Bảng này KHÔNG tách được phần nào do Q: nó đọc hidden state ở vị trí "
-          "cuối, nơi mọi đường đã trộn vào nhau. Câu \"Q có được đọc không\" trả lời ở "
-          "ba hình ở mục 1, không phải ở đây.\n"]
-
-    # Số latent đọc TỪ config, không gõ tay: nó đã đổi 32 -> 16 -> 32 qua
-    # ba bố cục, và mỗi lần một con số chép tay ở đây lại tả sai hình.
-    nq = int(cfg["vextractor"]["cna"]["n_query"])
-    L.append("## 3. [Visual] Bốn ô — ảnh gốc · Z · khối Q · đầu ra Extractor\n")
-    if figs.get("visual"):
-        L.append(f"![lens visual](figures/{Path(figs['visual']).name})\n")
-    L += [f"Cả ba bản đồ chồng lên ảnh gốc (alpha {lc['overlay_alpha']}, cắt đuôi "
-          f"ở phân vị {lc['percentile_clip']}), nội suy lên cỡ ảnh gốc để bốn ô "
-          f"đặt cạnh nhau là so được ngay bằng mắt.\n",
-          "| ô | đại lượng | hỏi gì |\n|---|---|---|",
-          "| 1 | ảnh gốc | mốc để đọc ba ô còn lại |",
-          "| 2 | **gradient** `‖∂y/∂X‖` qua `y → Z → adapter → vision encoder` · lưới 64² | "
-          "đường CŨ: decoder (LoRA đã finetune) rút được gì qua 256 token ảnh. "
-          "Dừng ở ĐẦU RA vision encoder, không đi tiếp về pixel |",
-          f"| 3 | **gradient** `‖∂‖Q‖²/∂I‖` — target là **chính {nq} High-Q token**, truy ngược "
-          "`Q → CnA → Extractor → I` · lưới 448² | "
-          f"{nq} vector §2.2 thêm vào được **dựng từ vùng nào** của ảnh |",
-          "| 4 | **ĐỘ LỚN** `‖feature‖₂` của lưới teacher · lưới 28² | "
-          "backbone ĐANG MÃ HOÁ GÌ, trước khi Extractor hỏi nó |",
-          "",
-          "**Ô 4 KHÔNG phải gradient.** Nó là độ lớn đặc trưng, nên một vùng "
-          "sáng ở đó nghĩa là backbone đặt nhiều năng lượng ở vùng ấy — KHÔNG "
-          "nghĩa là đổi vùng ấy thì Q đổi theo. Đọc ô 4 như ô 3 là đọc sai loại "
-          "đại lượng.\n",
-          "**Cặp đáng đọc nhất là ô 4 so ô 3.** Backbone mã hoá cả ảnh, còn "
-          "Extractor chỉ hỏi một phần: chênh lệch giữa hai ô chính là *phần "
-          f"backbone có mà {nq} latent không lấy*. Sáng ở ô 4 mà tối ở ô 3 = có "
-          "thông tin bị bỏ lại; trùng khít = Extractor lấy gần hết những gì "
-          "backbone nhấn mạnh.\n",
-          "**Ô 3 lấy target là khối Q, KHÔNG phải `y`**, và đó là chủ ý: "
-          "khối Q là thứ §2.2 thêm vào, nên câu hỏi "
-          f"tự nhiên là *{nq} vector ấy được dựng từ đâu*, chứ không phải *decoder "
-          "đòi ảnh ở đâu*. Bản đồ này vì thế **KHÔNG dính decoder, KHÔNG dính "
-          "LoRA**, và dựng được kể cả khi decoder chưa đọc Q chút nào — muốn "
-          "biết decoder có đọc Q không thì xem dòng \"phần độ nhạy nằm trên "
-          "khối Q\" ở mục Kiểm nhanh, hoặc ba hình ở mục 1.\n",
-          "**Đường truy ngược chạy ở đúng chế độ main stage: teacher "
-          "thị gradient — `requires_grad` của mọi tham số vẫn bị ép về False, "
-          "`eval()` giữ nó không dropout / stochastic depth, và cờ cũ được trả "
-          "lại ngay sau đó. Trọng số không đổi, không có bước Adam nào.\n",
-          "**Ô 2 và ô 3 KHÔNG cùng đại lượng** (nhu cầu của decoder vs cấu tạo "
-          "của khối Q), và khác cả **độ phân giải** lẫn **điểm dừng** (64² ở "
-          "đầu ra encoder, so với 448² tới tận pixel). Nên mỗi ô **tự chuẩn hoá "
-          "[0,1]**: chỉ so **hình dạng**, tuyệt đối không so độ sáng. So định "
-          "lượng thì đọc mấy dòng tương quan / IoU ở mục Kiểm nhanh, vốn đã gộp "
-          "ô 3 về lưới chung 64² trước khi so.\n",
-          "**Đọc hình 3 thế nào.**\n",
-          "1. **Ô 3 trước tiên.** Phẳng lì (max/mean ≈ 1, 10% vùng nóng nhất "
-          "gánh ≈10%) = khối Q không được dựng từ vùng nào cụ thể; khi đó mọi "
-          "dòng so hình dạng bên dưới là so hai bản nhiễu, và phần hỏng nằm ở "
-          "Stage 0 hoặc ở Extractor chứ không ở decoder.\n",
-          "2. **Ô 3 so ô 2**: Q được dựng từ đúng vùng đường cũ đã đòi, hay từ "
-          "vùng đường cũ bỏ sót. Trùng khít = nhánh đang khuếch đại thứ decoder "
-          "đã có (không hẳn vô dụng, nhưng không mang vào cái gì MỚI). Lệch đi = "
-          "nhánh rút được vùng khác — **đúng việc §2.2 sinh ra để hỏi**.\n",
-          "3. Nếu \"phần độ nhạy nằm trên khối Q\" ở mục Kiểm nhanh ≈ 0 thì ô 3 "
-          "vẫn dựng được và vẫn có nghĩa (nó không dính decoder), nhưng nó đang "
-          "tả một khối token mà decoder **chưa đọc** — hai chuyện khác nhau, "
-          "đừng gộp.\n",
-          "4. Sáng ở ô 2 = `y` **nhạy** với chỗ đó; sáng ở ô 3 = khối Q **phụ "
-          "thuộc** chỗ đó. Cả hai đều KHÔNG phải \"model nhìn vào đây\" theo "
-          "nghĩa nhân quả, và không phải phân đoạn tổn thương.\n",
-          "5. Lưới 64×64 của ô 2 là **thô**: một ô ≈ 14 px của ảnh 896. Đừng "
-          "đọc chi tiết nhỏ hơn một ô — ô 3 mịn hơn nhưng vẫn không phải đường "
-          "viền.\n",
-          "Số thô: `lens_maps.npz` (`layer_sens`, `sal_z`, `sal_q` 448², "
-          "`sal_q_64`), `lens.json`, `logit_lens.csv`.\n",
+    n = len(items)
+    L = [f"# Lens · Language — {B['id']} `[Z ‖ Q ‖ T]`\n",
+         f"_{n} ảnh test bốc ngẫu nhiên với seed {lc['seed']} (cùng 5 ảnh, cùng thứ "
+         f"tự với `{DOC_VISION}`). Tham chiếu A `{A['id']}` không chạy ở đây: Z của B "
+         f"giống A từng bit nên Q chính là B − A; kết luận A/B ở `REPORT.md`._\n",
+         "## Các mẫu\n",
+         "| mẫu | key | y | bệnh `pos` | phần độ nhạy Z · Q · T |",
+         "|---|---|---|---|---|"]
+    for k, (it, r, s) in enumerate(zip(items, lang, rs), start=1):
+        pos = ", ".join(f["label"] for f in it.get("findings", [])
+                        if f["class"] == "pos") or "—"
+        share = " · ".join(f"{100 * s.get(x, 0.0):.1f}%" for x in ("z", "q", "t"))
+        L.append(f"| {k} | `{it['key']}` | {r['y']:.2f} | {pos} | {share} |")
+    L += ["",
+          "## 1. Jacobian token × lớp — 3 dòng (Z · Q · T) × 5 cột (5 mẫu)\n",
+          ("```\ny = Σ_t log p(ref_t | ref_<t, ảnh)        S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂\n```\n"
+           if lc["target"] == "ref_logprob" else
+           "```\ny = logit token được chọn ở vị trí cuối    S[ℓ, t] = ‖∂y / ∂h_(ℓ,t)‖₂\n```\n")]
+    if figs.get("language"):
+        L.append(f"![jacobian](figures/{Path(figs['language']).name})\n")
+    L += [f"**Thang màu CHUNG trong mỗi cột**: mẫu số là bể token Z ∪ Q ∪ T của mẫu đó "
+          f"(phân vị {lc['percentile_clip']:g}), nên độ sáng giữa ba dòng của CÙNG một "
+          f"cột so được trực tiếp — một dòng tối hơn nghĩa là vùng ấy đóng góp ít hơn "
+          f"vào `y`. Giữa các CỘT thì không (mỗi mẫu một `vmax`, in trên đầu cột).\n",
+          f"**Đường đứt dọc** ở mỗi ô = lớp SÂU NHẤT mà ít nhất một token của vùng ấy "
+          f"còn đạt `{lc['reach_frac']:g} × vmax` của cột. Lưu ý: ở lớp cuối, hidden "
+          f"state của token Z/Q chỉ đi vào logit của chính vị trí ấy (nhãn −100), nên "
+          f"độ nhạy của chúng ở lớp chót luôn ≈ 0 — đường của Z/Q vì thế không bao giờ "
+          f"chạm lớp cuối.\n",
+          "| mẫu | lớp sâu nhất Z | Q | T |", "|---|---|---|---|"]
+    for k, rc in enumerate(reach, start=1):
+        L.append(f"| {k} | {rc.get('z') or '—'} | {rc.get('q') or '—'} | "
+                 f"{rc.get('t') or '—'} |")
+    L += ["",
+          "## 2. Attention Q[i] ↔ token bệnh lý\n",
+          "Mỗi tên bệnh (14 nhãn) được token hoá rồi đi qua **lớp embedding của decoder** "
+          "— đúng không gian mà Q được chèn vào thay cho embedding token — lấy trung bình "
+          "các subword thành `e_j`. Với mỗi latent:\n",
+          "```\na_ij = softmax_j( τ · q̂_i · ê_j / √d )     q̂, ê: chuẩn hoá RMS"
+          f",  τ = {lc['attn_temp']:g}\n```\n"]
+    if figs.get("q_disease"):
+        L.append(f"![q-disease](figures/{Path(figs['q_disease']).name})\n")
+    L.append(f"Top-p bệnh của mỗi Q[i] (cộng dồn tới p = {lc['attn_top_p']:g}), "
+             f"cột = mẫu:\n")
+    nq = len(tops[0]) if tops else 0
+    L.append("| Q[i] | " + " | ".join(f"mẫu {k}" for k in range(1, n + 1)) + " |")
+    L.append("|---|" + "---|" * n)
+    for i in range(nq):
+        cells = []
+        for tps in tops:
+            cells.append(" · ".join(f"{nm} {p:.2f}" for nm, p in tps[i]))
+        L.append(f"| `Q[{i}]` | " + " | ".join(cells) + " |")
+    L += ["",
+          "Số đầy đủ: `q_disease.csv` (mọi cặp Q[i] × bệnh × mẫu).\n",
+          "**Đọc thế nào.** Ma trận đo Q[i] **giống** embedding của tên bệnh nào nhất, "
+          "trong không gian đầu vào của decoder — không phải decoder thật sự chú ý gì "
+          "ở lớp sâu. Một Q[i] luôn chỉ về cùng một bệnh ở cả 5 mẫu = latent ấy mang "
+          "một khái niệm cố định; đổi theo ảnh và trùng bệnh `pos` (nhãn đỏ trên hình) "
+          "= latent mang thông tin của ảnh. Phân phối gần đều (top-p cần nhiều bệnh) = "
+          "Q[i] không nằm gần tên bệnh nào.\n",
           "## Giới hạn\n",
-          "- Một ảnh, chọn vì nhiều `pos`/`uncertain` — MINH HOẠ, không phải bằng chứng "
-          "thống kê. Kết luận A/B vẫn nằm ở `REPORT.md`.\n",
-          "- Gradient là độ nhạy CỤC BỘ quanh ảnh này, không phải \"đóng góp\" theo "
-          "nghĩa nhân quả. \"Q gánh 30% độ nhạy\" KHÔNG đọc thành \"bỏ Q đi thì điểm "
-          "tụt 30%\".\n",
-          "- Logit lens bỏ qua mọi lớp sau ℓ, nên token ở lớp thấp thường vô nghĩa; "
-          "đó là tính chất của phép đọc, không phải lỗi.\n"]
-    p = d / DOC
+          "- 5 ảnh minh hoạ, không phải bằng chứng thống kê.\n",
+          "- Gradient là độ nhạy cục bộ, không phải đóng góp nhân quả.\n",
+          "- Ma trận Q ↔ bệnh là phép so trong không gian embedding đầu vào; tên bệnh "
+          "nhiều subword bị lấy trung bình nên kém sắc hơn tên một token.\n"]
+    p = Path(d) / DOC_LANGUAGE
     p.write_text("\n".join(L), encoding="utf-8")
     return p

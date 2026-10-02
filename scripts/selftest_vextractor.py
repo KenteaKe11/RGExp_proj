@@ -27,8 +27,8 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
- 19. Lens trên mô hình giả: CHỈ candidate B (Q = B − A), heatmap ĐỦ mọi lớp,
-     MỘT bản đồ ảnh đi qua Q, và Lens_Explain.md dựng được
+ 19. Lens trên mô hình giả: 5 mẫu seed cố định; Vision Grad-CAM -> HTML (pager
+     Q[i]); Language lưới 3×5 thang chung + ma trận Q ↔ bệnh lý
  20. lệnh `lens` nối vào CLI + script + config
  21. THỨ TỰ CHUỖI [Z ‖ Q ‖ T]: Q nằm ngay SAU khối token ảnh, nhãn của nó là
      −100, mask = 1, token_type = 0, và số token vào CE KHÔNG đổi
@@ -1688,26 +1688,27 @@ def _():
         _ = RV
 
 
-@check("19. Lens chạy thật (mô hình giả): CHỈ B, heatmap token×lớp ĐỦ lớp (top-k mới lấy 1/4 cuối), mục 1 ra MỘT dải 3 ô (Z/Q/T, thang màu riêng từng ô), mục 3 ra MỘT dải 4 ô (gốc / Z / khối Q truy ngược qua teacher ConvNeXt về pixel / đầu ra Extractor), Lens_Explain.md")
+@check("19. Lens chạy thật (mô hình giả): 5 mẫu seed cố định; Vision = Grad-CAM (dòng 1 Extractor, dòng 2 V_c[i], pager) ra HTML; Language = lưới 3×5 thang màu chung + đường đứt lớp sâu nhất + ma trận Q ↔ bệnh lý top-p")
 def _():
     import json
     import types
 
     import numpy as np
+    import pandas as pd
     import torch
     import torch.nn as nn
     from PIL import Image
 
     from src import lens_vextractor as LZ
-    from src import recombiner
     from src import vextractor as R
+    from src.backbone import TrainUnusable
     from src.config import load_config
 
-    NV, DV, DM, NZ, V, L = 64, 8, 32, 4, 11, 3     # patch, d_vis, d_model, |Z|, vocab, lớp
-    NQ = SMALL_Q                                    # số latent Q (khoá khai, không suy ra)
+    NV, DV, DM, NZ, V, L = 64, 8, 32, 4, 11, 3
+    NQ = SMALL_Q
     IMG_TOK = V - 1
 
-    class _Proj(nn.Module):                        # (1, NV, DV) -> (1, NZ, DM)
+    class _Proj(nn.Module):
         def __init__(self):
             super().__init__()
             self.fc = nn.Linear(DV, DM)
@@ -1721,8 +1722,6 @@ def _():
                 last_hidden_state=pixel_values.reshape(1, NV, DV).float())
 
     class _Text(nn.Module):
-        """Khối chữ nằm ở NHÁNH riêng, đúng như Gemma3: .model.language_model."""
-
         def __init__(self):
             super().__init__()
             self.norm = nn.LayerNorm(DM)
@@ -1758,139 +1757,152 @@ def _():
             for lay in txt.layers:
                 h = torch.tanh(lay(h)) + h
                 hs.append(h)
-            h = txt.norm(h)              # HF chuẩn hoá TRƯỚC khi ghi hidden cuối
+            h = txt.norm(h)
             hs[-1] = h
             return types.SimpleNamespace(logits=self.lm_head(h),
                                          hidden_states=tuple(hs), loss=None)
 
+    class _Tok:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1 + (ord(ch) % (V - 2)) for ch in text[:3]]}
+
+    torch.manual_seed(0)
     fake = Fake()
-    # Cây module không phải một dây thẳng — đây chính là chỗ `lens` từng nổ.
-    assert recombiner._find_module(fake, ("norm", "final_layernorm")) is \
-        fake.model.language_model.norm
-    assert recombiner._find_module(fake, ("vision_tower",)) is fake.model.vision_tower
     cfg = load_config(ROOT / "configs/vextractor.yaml")
+    lc = LZ.lcfg(cfg)
+    assert (lc["n_samples"], lc["cam"], lc["target"]) == (5, "gradcam", "ref_logprob")
+    # khoá của Lens CŨ bị từ chối ồn ào
+    for old in ("top_k", "layer_frac", "sample", "overlay_alpha"):
+        c = dict(cfg)
+        c["lens"] = dict(cfg["lens"], **{old: 1})
+        try:
+            LZ.lcfg(c)
+        except TrainUnusable as e:
+            assert "khoá lạ" in str(e), e
+        else:
+            raise AssertionError(f"lens.{old} phải bị từ chối")
+
     sp = small_spec(d_model=DM)
     branch = R.VExtractorBranch(sp)
     branch.set_frozen(True)
-    ids = torch.tensor([[0, 1] + [IMG_TOK] * NZ + [2, 3, 4]])
-    labels = ids.clone()
-    labels[:, : 2 + NZ] = -100
-    batch = {"input_ids": ids, "labels": labels,
-             "attention_mask": torch.ones_like(ids),
-             "pixel_values": torch.randn(1, NV * DV),
-             # đường ảnh THỨ HAI của nhánh (§2.2), độc lập với pixel_values
-             "vext_pixels": torch.randn(1, 3, SMALL_IMG, SMALL_IMG)}
-
-    ra = LZ.analyze(cfg, fake, fake, None, batch, "ref_logprob")   # không nhánh
-    # Arm KHÔNG có nhánh: không backbone nào để hỏi, nên không có bản đồ
-    # teacher — và `analyze` phải TRẢ VỀ chứ không chết giữa chừng bằng
-    # AttributeError sau khi đã chạy xong cả một lượt backward.
-    assert ra.get("teacher_feature_norm") is None
-    assert ra.get("sal_q") is None and ra["sal_z"] is not None
-    rb = LZ.analyze(cfg, fake, fake, branch, batch, "ref_logprob")
-    T = int(ids.shape[1])
-    assert ra["layer_sens"].shape == (L, T)                 # A: chuỗi gốc
-    assert rb["layer_sens"].shape == (L, T + NQ)            # B: dài thêm đúng NQ
-    # CHỈ CÒN BA Ô: gốc / Z / khối Q. Mọi bản đồ cũ đã bỏ hẳn.
-    for r in (ra, rb):
-        for gone in ("act_siglip", "sal_vext", "sal_vext_64", "sal_vext_act",
-                     "sal_vext_act_64", "sal_vext_pre"):
-            assert gone not in r, gone
-    # HAI lưới khác nhau: Z ở 8×8 (patch SigLIP), Q ở 64×64 (PIXEL của ảnh nhánh,
-    # SMALL_IMG=64 thay cho 448² của cấu hình thật)
-    assert ra["sal_z"].shape == (8, 8)
-    # Ô 3 CHỈ có ở lượt CÓ nhánh: nó là bản đồ của chính khối Q
-    assert ra.get("sal_q") is None and rb["sal_q"] is not None
-    assert rb["sal_q"].shape == (SMALL_IMG, SMALL_IMG), rb["sal_q"].shape
-    assert np.isfinite(rb["sal_q"]).all() and rb["sal_q"].sum() > 0
-    # bản gộp về lưới chung để so số
-    assert rb["sal_q_64"].shape == (8, 8)
-    assert np.isclose(rb["sal_q_64"].mean(), rb["sal_q"].mean(), rtol=1e-5)
-    assert LZ.pool_to(np.ones((8, 8)), 8).shape == (8, 8)
-    assert LZ.pool_to(np.ones((9, 9)), 8) is None            # không chia hết -> None
-    # Ô 3 KHÔNG dính decoder: nó dựng được cả khi `y` không tồn tại. Kiểm bằng
-    # cách gọi thẳng `_q_saliency_map` — cùng kết quả, không cần model nào.
-    direct = LZ._q_saliency_map(branch, batch["vext_pixels"], torch.device("cpu"))
-    assert np.allclose(direct, rb["sal_q"], atol=1e-5)
-    # Lens KHÔNG được để lại dấu vết trên nhánh: trọng số đóng băng, cờ như cũ,
-    # và backbone vẫn ở chế độ teacher inference (eval)
-    assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
-    assert not branch.extractor.body.training
-    # Q nằm SAU khối ảnh -> vị trí của token ảnh KHÔNG đổi
-    assert ra["image_span"] == rb["image_span"] == [2, 1 + NZ]
-    assert rb["insert_span"] == [2 + NZ, 2 + NZ + NQ], rb["insert_span"]
-    assert ra["insert_span"] is None
-    # 1/4 lớp cuối, chỉ số THẬT (1-based), và ô nào thuộc Z / Q / text
-    assert LZ.last_layers(34, 0.25) == list(range(26, 35))
-    assert LZ.last_layers(L, 0.25) == [L]
-    assert LZ._where(2, rb) == "Z[0]" and LZ._where(2 + NZ, rb) == "Q[0]"
-    assert LZ._where(T + NQ - 1, rb) == "text"
-    top = LZ.logit_lens(fake, fake, rb["hidden_last"], 3)
-    assert len(top) == L and all(len(t["ids"]) == 3 for t in top)
-    for t in top:
-        t["tokens"] = [f"t{i}" for i in t["ids"]]
 
     with tempfile.TemporaryDirectory() as t:
         t = Path(t)
-        Image.fromarray((np.random.rand(32, 32) * 255).astype("uint8")).save(t / "x.png")
-        item = {"key": "k0", "ref": "r", "image_path": str(t / "x.png"), "n_pos": 5,
-                "n_unc": 3, "n_labelled": 8,
-                "findings": [{"label": "Edema", "class": "pos"}]}
-        lc = LZ.lcfg(cfg)
-        assert lc["layer_frac"] == 0.25
-        figs = dict(LZ.plot_layers(rb, t / "figures" / "lens_layers.png", lc))
-        figs["visual"] = LZ.plot_visual(item, rb,
-                                        t / "figures" / "lens_visual.png", lc)
-        # BA hình riêng, không phải một — và mỗi hình phải THẬT SỰ ra file.
-        # MỘT file cho dải layers, MỘT file cho dải visual — tách THANG MÀU
-        # chứ không tách file (xem docstring plot_layers).
-        assert set(figs) == {"layers", "visual"}, set(figs)
-        for k in ("layers", "visual"):
-            assert Path(figs[k]).exists() and Path(figs[k]).stat().st_size > 0, k
-        # Ba vùng phải RỜI NHAU và PHỦ KÍN chuỗi: T là phần bù, không phải đuôi.
-        regs = LZ._regions(rb, T + NQ)
-        allrows = sorted(r for g in regs for r in g["rows"])
-        assert allrows == list(range(T + NQ)), (len(allrows), T + NQ)
-        assert [g["key"] for g in regs] == ["z", "q", "t"]
-        A, B = {"id": "a"}, {"id": "b"}
-        dg = LZ.diagnostics(rb)
-        assert 0.0 <= dg["image_token_share"] <= 1.0
-        assert 0.0 <= dg["q_token_share"] <= 1.0
-        assert dg["q_vector_share"]["n"] == NQ
-        assert 1 <= dg["q_vector_share"]["n_active_50pct"] <= NQ
-        assert 1 <= dg["peak"]["layer"] <= L
-        assert 0.0 <= dg["top10_iou"] <= 1.0 and dg["vext_energy_ratio"] > 0
-        # None hợp lệ: bản đồ hằng (std = 0) thì tương quan không định nghĩa
-        assert dg["saliency_corr"] is None or -1.0 <= dg["saliency_corr"] <= 1.0
-        qm = dg["q_map"]
-        assert qm["max_over_mean"] >= 1.0 and 0.0 <= qm["top10_share"] <= 1.0
-        for gone in ("siglip_activity", "siglip_corr", "vext_self",
-                     "aligner_shift"):
-            assert gone not in dg, gone
-        out = {"lens": lc, "diagnostics": dg, "reference_arm": "a",
-               "arm": {"id": "b", "y": rb["y"], "n_tokens": T + NQ, "layers": L,
-                       "image_span": rb["image_span"],
-                       "insert_span": rb["insert_span"]}}
-        p = LZ.write_doc(cfg, t, A, B, item, rb, top, figs, out)
-        doc = p.read_text(encoding="utf-8")
-        assert "ĐỦ mọi lớp" in doc and "lớp cuối" in doc   # mục 1 đủ, bảng 2 cắt
-        assert "Trục **Y là vị trí token**" in doc and "**X là lớp**" in doc
-        # Doc phải nhúng ĐỦ ba hình và phải NÓI RA rằng thang màu khác nhau —
-        # một người đọc so độ sáng giữa hai hình là đọc sai, và chỉ có dòng chữ
-        # ấy chặn được.
-        assert "KHÔNG so được độ sáng giữa ba ô" in doc
-        for need in ("## 1.", "## 2.", "## 3.", "lens_layers.png",
-                     "lens_visual.png",
-                     "Edema", "Giới hạn", "## Cách đọc", "Q chính là phần",
-                     "Kiểm nhanh trước khi tin hình", "Đọc ba ô thế nào",
-                     "Đọc bảng 2 thế nào", "Đọc hình 3 thế nào",
-                     "KHÔNG dính decoder", "teacher",
-                     f"{cfg['vextractor']['cna']['n_query']} High-Q token",
-                     "Q → CnA → Extractor → I",
-                     "`Q[0]`", "448²"):
-            assert need in doc, need
-        assert "`sal_z`" in doc and "`sal_q`" in doc
-        assert json.dumps(out, default=str)
+        rows = []
+        for k in range(12):
+            p = t / f"img{k}.png"
+            Image.fromarray((np.random.rand(40, 40) * 255).astype("uint8")).save(p)
+            rows.append({"key": f"k{k:02d}", "ref": "r", "image_path": str(p)})
+        tdf = pd.DataFrame(rows)
+        # ── 5 mẫu, seed cố định, KHÔNG phụ thuộc thứ tự dòng ──────────────
+        names = list(LZ.CHEXPERT_14)
+        lut = {"k03": np.eye(3)[[1] * 14]}            # k03: mọi nhãn "pos"
+        items = LZ.pick_samples(cfg, tdf, lut, names)
+        assert len(items) == 5 and len({i["key"] for i in items}) == 5
+        again = LZ.pick_samples(cfg, tdf.sample(frac=1.0, random_state=3), lut, names)
+        assert [i["key"] for i in again] == [i["key"] for i in items]
+        c7 = dict(cfg)
+        c7["lens"] = dict(cfg["lens"], seed=7)
+        assert ([i["key"] for i in LZ.pick_samples(c7, tdf, lut, names)]
+                != [i["key"] for i in items])
+
+        # ── Language: một lượt forward/backward mỗi mẫu ─────────────────────
+        lang, cams, mats = [], [], []
+        E = LZ.disease_embeddings(fake, _Tok(), names)
+        assert E.shape == (14, DM)
+        for k, it in enumerate(items):
+            ids = torch.tensor([[0, 1] + [IMG_TOK] * NZ + [2, 3, 4, 5]])
+            labels = ids.clone()
+            labels[:, : 2 + NZ] = -100
+            batch = {"input_ids": ids, "labels": labels,
+                     "attention_mask": torch.ones_like(ids),
+                     "pixel_values": torch.randn(1, NV * DV),
+                     "vext_pixels": torch.randn(1, 3, SMALL_IMG, SMALL_IMG)}
+            r = LZ.analyze_language(fake, fake, branch, batch, "ref_logprob")
+            T = int(ids.shape[1])
+            assert r["layer_sens"].shape == (L, T + NQ)
+            assert r["q"].shape == (NQ, DM)
+            assert r["image_span"] == [2, 1 + NZ]
+            assert r["insert_span"] == [2 + NZ, 2 + NZ + NQ]
+            lang.append(r)
+            M = LZ.q_disease_attention(r["q"], E, 1.0)
+            assert M.shape == (NQ, 14) and np.allclose(M.sum(1), 1.0)
+            mats.append(M)
+            # ── Vision: Grad-CAM, một forward + (1 + NQ) backward ───────────
+            for meth in ("gradcam", "gradcam++"):
+                cm = LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"),
+                                    -2, meth)
+                h_, w_ = cm["grid"]
+                assert cm["extractor"].shape == (h_, w_)
+                assert cm["q"].shape == (NQ, h_, w_)
+                for m_ in (cm["extractor"], *cm["q"]):
+                    assert np.isfinite(m_).all() and m_.min() >= 0 and m_.max() <= 1 + 1e-6
+            cams.append(cm)
+            # Lens KHÔNG để lại dấu vết trên nhánh
+            assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
+            assert not branch.extractor.body.training
+        # Grad-CAM của Q[i] khác nhau (mỗi latent một bản đồ) và khác dòng 1
+        assert not np.allclose(cams[0]["q"][0], cams[0]["q"][1])
+        # Grad-CAM tay: w = mean ∂s/∂A, CAM = ReLU(Σ w A) / max
+        A_ = torch.rand(3, 2, 2)
+        G_ = torch.randn(3, 2, 2)
+        want = torch.relu((G_.mean(dim=(1, 2))[:, None, None] * A_).sum(0))
+        want = (want - want.min()) / (want.max() - want.min() + 1e-7)
+        assert np.allclose(LZ._cam(A_, G_, "gradcam"), want.numpy(), atol=1e-6)
+        # overlay MẶC ĐỊNH của Grad-CAM: JET, 0.5·heatmap + 0.5·img, chia max
+        img_ = np.random.rand(16, 16, 3)
+        msk_ = np.random.rand(16, 16)
+        ov = LZ.show_cam_on_image(img_, msk_)
+        assert ov.shape == (16, 16, 3) and abs(float(ov.max()) - 1.0) < 1e-9
+        try:
+            import cv2
+        except Exception:  # noqa: BLE001 — OpenCV không bắt buộc
+            cv2 = None
+        if cv2 is not None:                     # khớp đúng show_cam_on_image gốc
+            heat = cv2.applyColorMap(np.uint8(255 * msk_), cv2.COLORMAP_JET)
+            heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB).astype(float) / 255
+            ref = 0.5 * heat + 0.5 * img_
+            ref = ref / ref.max()
+            assert np.abs(ov - ref).max() < 1e-9, np.abs(ov - ref).max()
+        try:
+            LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"), 9)
+        except TrainUnusable as e:
+            assert "cam_stage" in str(e)
+        else:
+            raise AssertionError("cam_stage ngoài khoảng phải bị từ chối")
+
+        # ── thang màu chung + lớp sâu nhất ──────────────────────────────────
+        S = np.array([[0.0, 5.0], [1.0, 0.2], [0.05, 0.0]])  # (L, T)
+        assert LZ.reach_layer(S.T[[0], :], 0.5) == 2          # token 0 chạm ở lớp 2
+        assert LZ.reach_layer(S.T[[1], :], 0.5) == 1
+        assert LZ.reach_layer(S.T, 99.0) is None
+        assert LZ.shared_vmax(np.zeros((2, 2)), 99) == 1.0
+        tp = LZ.top_p(np.array([0.5, 0.3, 0.2]), ["a", "b", "c"], 0.75)
+        assert [x[0] for x in tp] == ["a", "b"]
+
+        out = LZ.write_reports(cfg, t / "Lens", {"id": "A"}, {"id": "B"}, items,
+                               lang, cams, mats, names, {"t0": 0})
+        d = t / "Lens"
+        html = (d / LZ.DOC_VISION).read_text(encoding="utf-8")
+        assert html.startswith("<!doctype html>") and "id=\"pager\"" in html
+        payload = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
+        assert payload["nq"] == NQ and len(payload["samples"]) == 5
+        for s_ in payload["samples"]:
+            assert len(s_["q"]) == NQ and s_["ext"] and s_["x"]
+            assert len(s_["q_share"]) == NQ and abs(sum(s_["q_share"]) - 1) < 1e-6
+        assert payload["samples"][[i["key"] for i in items].index("k03")]["pos"] \
+            if "k03" in [i["key"] for i in items] else True
+        md = (d / LZ.DOC_LANGUAGE).read_text(encoding="utf-8")
+        for need in ("## 1.", "## 2.", "lens_language_jacobian.png",
+                     "lens_q_disease.png", "| `Q[0]` |", "mẫu 5"):
+            assert need in md, need
+        for f in ("figures/lens_language_jacobian.png", "figures/lens_q_disease.png",
+                  "lens_maps.npz", "lens.json", "q_disease.csv"):
+            assert (d / f).exists() and (d / f).stat().st_size > 0, f
+        assert "logit lens" not in md.lower() and "top-k" not in md.lower()
+        assert len(out["language"]) == 5
+        for rc in (x["reach_layer"] for x in out["language"]):
+            assert set(rc) == {"z", "q", "t"}
 
 
 @check("20. lệnh `lens` có trong CLI + script, config lens hợp lệ")

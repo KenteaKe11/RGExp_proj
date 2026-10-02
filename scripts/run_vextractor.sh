@@ -4,7 +4,7 @@
 #
 #     bash scripts/run_vextractor.sh train [--detach] # kéo A ($1) -> Stage 0 -> main B -> sinh -> chấm
 #     bash scripts/run_vextractor.sh stats            # bootstrap ghép cặp + permutation -> REPORT.md
-#     bash scripts/run_vextractor.sh lens             # mổ 1 ảnh -> Lens/Lens_Explain.md
+#     bash scripts/run_vextractor.sh lens             # mổ 5 ảnh -> Lens/Lens_Vision.html + Lens_Language.md
 #     bash scripts/run_vextractor.sh push             # -> Hub current/$2.2_V-Extractor_Test/
 #     bash scripts/run_vextractor.sh all [--detach]   # train -> stats -> push
 #
