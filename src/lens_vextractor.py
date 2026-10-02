@@ -281,24 +281,37 @@ def analyze_language(model, gemma, branch, batch: dict, target: str) -> dict:
         ins = [int(at), int(at) + int(q.shape[1])]
     kw.update({"output_hidden_states": True, "use_cache": False})
     kw = {k: v for k, v in kw.items() if v is not None}
-    out = model(**kw)
-    hs = list(out.hidden_states)                            # (L+1) × (1, T, d)
-    for h in hs:
-        h.retain_grad()
-    logits = out.logits.float()
-    if target == "next_token":
-        pos = int(labels.shape[1] - 1)
-        tid = int(logits[0, pos].argmax())
-        y = logits[0, pos, tid]
-        tgt = {"kind": "next_token", "pos": pos, "token_id": tid}
-    else:
-        sl, sb = logits[:, :-1], labels[:, 1:]
-        keep = sb != -100
-        lp = torch.log_softmax(sl, dim=-1)
-        y = lp[0][keep[0]].gather(-1, sb[0][keep[0]].unsqueeze(-1)).sum()
-        tgt = {"kind": "ref_logprob", "n_tokens": int(keep.sum())}
-    model.zero_grad(set_to_none=True)
-    y.backward()
+    # Mọi tham số (decoder, LoRA, nhánh) đều `requires_grad=False` và Z/Q được
+    # tính trong `no_grad`, nên KHÔNG có gì trong đồ thị đòi gradient — hidden
+    # state ra khỏi từng lớp sẽ không có grad_fn và `retain_grad()` ném lỗi. Nối
+    # đồ thị từ chính chuỗi embedding vào: một lá đòi gradient, trọng số vẫn đứng yên.
+    kw["inputs_embeds"] = kw["inputs_embeds"].detach().requires_grad_(True)
+    # `enable_grad` bao TRỌN forward -> y -> backward: gọi từ trong `no_grad`
+    # (hay `inference_mode` của khâu sinh) vẫn ra đúng gradient.
+    with torch.enable_grad():
+        out = model(**kw)
+        hs = list(out.hidden_states)                        # (L+1) × (1, T, d)
+        for h in hs:
+            if h.requires_grad:
+                h.retain_grad()
+        logits = out.logits.float()
+        if target == "next_token":
+            pos = int(labels.shape[1] - 1)
+            tid = int(logits[0, pos].argmax())
+            y = logits[0, pos, tid]
+            tgt = {"kind": "next_token", "pos": pos, "token_id": tid}
+        else:
+            sl, sb = logits[:, :-1], labels[:, 1:]
+            keep = sb != -100
+            lp = torch.log_softmax(sl, dim=-1)
+            y = lp[0][keep[0]].gather(-1, sb[0][keep[0]].unsqueeze(-1)).sum()
+            tgt = {"kind": "ref_logprob", "n_tokens": int(keep.sum())}
+        if not y.requires_grad:
+            raise TrainUnusable(
+                "Lens: y không nối được về chuỗi embedding (không có grad_fn) — "
+                "model có đang chạy trong `torch.inference_mode()` không?")
+        model.zero_grad(set_to_none=True)
+        y.backward()
     sens = np.stack([(h.grad[0].float().norm(dim=-1).detach().cpu().numpy()
                       if h.grad is not None else np.zeros(h.shape[1]))
                      for h in hs[1:]])                      # (L, T)

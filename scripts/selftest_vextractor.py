@@ -1768,6 +1768,11 @@ def _():
 
     torch.manual_seed(0)
     fake = Fake()
+    # Đúng trạng thái của `load_arm`: MỌI tham số đóng băng. Thiếu dòng này thì
+    # đồ thị tự có gradient nhờ tham số và lỗi `retain_grad` của lần chạy thật
+    # (không có gì đòi gradient) không bao giờ lộ ra ở đây.
+    for prm in fake.parameters():
+        prm.requires_grad_(False)
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     lc = LZ.lcfg(cfg)
     assert (lc["n_samples"], lc["cam"], lc["target"]) == (5, "gradcam", "ref_logprob")
@@ -1818,7 +1823,13 @@ def _():
                      "attention_mask": torch.ones_like(ids),
                      "pixel_values": torch.randn(1, NV * DV),
                      "vext_pixels": torch.randn(1, 3, SMALL_IMG, SMALL_IMG)}
-            r = LZ.analyze_language(fake, fake, branch, batch, "ref_logprob")
+            # mẫu đầu gọi TỪ BÊN TRONG `no_grad` — vẫn phải ra gradient
+            if k == 0:
+                with torch.no_grad():
+                    r = LZ.analyze_language(fake, fake, branch, batch, "ref_logprob")
+            else:
+                r = LZ.analyze_language(fake, fake, branch, batch, "ref_logprob")
+            assert np.isfinite(r["layer_sens"]).all() and r["layer_sens"].sum() > 0
             T = int(ids.shape[1])
             assert r["layer_sens"].shape == (L, T + NQ)
             assert r["q"].shape == (NQ, DM)
