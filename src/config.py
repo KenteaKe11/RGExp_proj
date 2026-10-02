@@ -103,7 +103,7 @@ GPU_KEYS = frozenset({
     "train.prefetch", "stage0.micro_batch", "stage0.probe_sizes",
     "base.batch_size", "metrics.bertscore.batch_size",
     "autobatch.enabled", "autobatch.target_frac", "autobatch.probe_sizes",
-    "autobatch.infer_probe_sizes", "autobatch.infer_max_bs",
+    "autobatch.infer_max_bs",
     "io.workers", "io.prefetch_depth", "io.pin_memory", "io.zip_mode",
 })
 _DERIVED = ("train.grad_accum",)

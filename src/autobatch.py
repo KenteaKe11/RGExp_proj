@@ -82,9 +82,7 @@ def ab_cfg(cfg) -> dict:
     return {"enabled": bool(c.get("enabled", False)),
             "target_frac": float(c.get("target_frac", 0.80)),
             "probe_sizes": [int(x) for x in (c.get("probe_sizes") or [1, 2, 4])],
-            "infer_probe_sizes": [int(x) for x in
-                                  (c.get("infer_probe_sizes") or [2, 4])],
-            "infer_max_bs": int(c.get("infer_max_bs", 16) or 16)}
+            "infer_max_bs": int(c.get("infer_max_bs", 64) or 64)}
 
 
 INFER_LADDER = (1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128,
@@ -281,7 +279,7 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
     cands = [c for c in INFER_LADDER
              if c <= max(1, int(max_bs if max_bs is not None else ac["infer_max_bs"]))]
     budget = ac["target_frac"] * float(total_bytes)
-    want = [int(x) for x in (probe_sizes or ac["infer_probe_sizes"])]
+    want = [int(x) for x in (probe_sizes or [2, 4])]
     sizes = sorted({s for s in want if s in cands} or {cands[0]})
     pts, oom_at = [], None
     for s in sizes:
@@ -331,3 +329,60 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
           f"{current} -> {chosen} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
           f"({rep['peak_frac']:.0%})", flush=True)
     return int(chosen), rep
+
+
+def autotune_generate(cfg, label: str, current: int, step_fn,
+                      measure_fn=None, total_bytes: float | None = None,
+                      max_bs: int | None = None) -> tuple[int, dict]:
+    """Batch lúc SINH báo cáo — dò TỪ TRÊN XUỐNG.
+
+    Thử `autobatch.infer_max_bs` (64) trước; OOM hoặc đỉnh VRAM vượt ngân sách
+    (`target_frac` × VRAM) thì xuống nấc kế của `INFER_LADDER` (48, 32, 24, 20,
+    16, …) cho tới nấc ĐẦU TIÊN chạy được trong ngân sách. Không hồi quy, không
+    ngoại suy: batch được chọn là batch đã CHẠY THẬT `step_fn(bs)` (trường hợp xấu
+    nhất — sinh đủ `max_new_tokens`) mà không vượt ngân sách.
+    """
+    ac = ab_cfg(cfg)
+    top = max(1, int(max_bs if max_bs is not None else ac["infer_max_bs"]))
+    rep = {"label": label, "enabled": ac["enabled"], "from": int(current),
+           "chosen": int(current), "kind": "generate_top_down", "max_bs": top}
+    if not ac["enabled"]:
+        return int(current), rep
+    if measure_fn is None:
+        import torch
+
+        if not torch.cuda.is_available():
+            rep["skipped"] = "không có CUDA"
+            return int(current), rep
+        total_bytes = float(torch.cuda.get_device_properties(0).total_memory)
+
+        def measure_fn(bs):
+            return measure(step_fn, bs, ())
+    budget = ac["target_frac"] * float(total_bytes)
+    ladder = sorted({c for c in INFER_LADDER if c <= top} | {top}, reverse=True)
+    gib = 1024 ** 3
+    tried, chosen, peak = [], None, None
+    for c in ladder:
+        pk = measure_fn(c)
+        tried.append([int(c), None if pk is None else round(pk / gib, 3)])
+        if pk is None:
+            print(f"  ⚙ autobatch[{label}]: bs {c} OOM -> xuống", flush=True)
+            continue
+        if pk > budget:
+            print(f"  ⚙ autobatch[{label}]: bs {c} đỉnh {pk / gib:.2f} GiB > ngân "
+                  f"sách {budget / gib:.2f} GiB -> xuống", flush=True)
+            continue
+        chosen, peak = int(c), pk
+        break
+    if chosen is None:
+        rep.update(error="không nấc nào vừa ngân sách — giữ config", tried=tried)
+        print(f"  ⚠ autobatch[{label}]: {rep['error']} (bs {current})", flush=True)
+        return int(current), rep
+    rep.update(chosen=chosen, tried=tried, budget_gib=round(budget / gib, 2),
+               total_gib=round(float(total_bytes) / gib, 2),
+               peak_gib=round(peak / gib, 2),
+               peak_frac=round(peak / float(total_bytes), 3))
+    print(f"  ⚙ autobatch[{label}]: dò từ {top} xuống -> bs {chosen} · đỉnh "
+          f"{rep['peak_gib']} GiB ({rep['peak_frac']:.0%}) · ngân sách "
+          f"{rep['budget_gib']} GiB = {ac['target_frac']:.0%}", flush=True)
+    return chosen, rep

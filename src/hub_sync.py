@@ -22,7 +22,8 @@ Trước `train` và `stats`, `pull` kéo về những gì máy này CÒN THIẾ
   3. predictions + per_sample — CHỈ khi tem hợp lệ với máy này:
        vân tay fixture của tem == vân tay config hiện tại,
        sha256 weight trong tem == sha256 weight cục bộ,
-       batch lúc sinh trong tem == khoá `infer_batch` của fixture,
+       batch lúc sinh trong tem == khoá `infer_batch` của fixture (trừ tem B,
+       vốn dò batch riêng: `infer_batch_source: autobatch`),
        đủ n_test dòng,
      và sau khi tải, sha256 file == sha256 trong tem. Lệch điều nào -> KHÔNG
      dùng, in lý do; candidate ấy được sinh lại như bình thường.
@@ -92,7 +93,9 @@ def write_stamp(cfg, run_dir: Path, fx: Path, arm: dict, adapter_dir: Path,
         "fixture_fingerprint": fx_mod.fingerprint(cfg),
         "weights": {f: fx_mod.sha256_file(Path(adapter_dir) / f)
                     for f in fx_mod.WEIGHT_FILES if (Path(adapter_dir) / f).exists()},
-        "infer_batch": fx_mod.get_lock(fx, "infer_batch"),
+        "infer_batch": _own_batch(pred) or fx_mod.get_lock(fx, "infer_batch"),
+        # "autobatch" = batch do chính lần sinh này dò (B); "lock" = khoá fixture (A).
+        "infer_batch_source": "autobatch" if _own_batch(pred) else "lock",
         "n_test": int(n_test),
         "n_preds": _count_lines(pred),
         "predictions_sha256": fx_mod.sha256_file(pred) if pred.exists() else None,
@@ -113,6 +116,18 @@ def write_stamp(cfg, run_dir: Path, fx: Path, arm: dict, adapter_dir: Path,
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     return st
+
+
+def _own_batch(pred: Path) -> int | None:
+    """Batch sinh THẬT do runner ghi cạnh file dự đoán (`<arm>.infer.json`)."""
+    side = Path(pred).with_name(Path(pred).stem + ".infer.json")
+    if not side.exists():
+        return None
+    try:
+        v = json.loads(side.read_text(encoding="utf-8")).get("infer_batch")
+        return int(v) if v else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def same_stamp(a: dict | None, b: dict | None) -> bool:
@@ -144,7 +159,10 @@ def stamp_matches(stamp: dict, cfg, fx: Path, adapter_dir: Path,
     elif remote_weight_sha != want:
         return False, "weight trên Hub ≠ weight đã sinh ra predictions"
     lock = fx_mod.get_lock(fx, "infer_batch")
-    if lock is not None and stamp.get("infer_batch") not in (None, lock):
+    # B dò batch sinh riêng (64 -> xuống), nên tem của nó KHÔNG bị so với khoá
+    # của A; chỉ tem sinh theo khoá mới phải khớp khoá.
+    if (stamp.get("infer_batch_source") != "autobatch" and lock is not None
+            and stamp.get("infer_batch") not in (None, lock)):
         return False, f"batch lúc sinh {stamp.get('infer_batch')} ≠ khoá {lock}"
     if int(stamp.get("n_preds") or 0) < int(n_test):
         return False, f"tem mới có {stamp.get('n_preds')}/{n_test} dự đoán"
@@ -265,6 +283,7 @@ def pull(cfg, run_dir: Path, adapter_root: Path, fx: Path, arms: list[dict],
             # Fixture chưa khoá batch lúc sinh -> khoá theo tem, để candidate sinh
             # sau trên máy này dùng ĐÚNG batch đã sinh ra kết quả kéo về.
             if (stamp.get("infer_batch") and fx_mod.exists(fx)
+                    and stamp.get("infer_batch_source") != "autobatch"
                     and fx_mod.get_lock(fx, "infer_batch") is None):
                 fx_mod.set_lock(fx, "infer_batch", int(stamp["infer_batch"]),
                                 f"tem {aid} trên Hub")

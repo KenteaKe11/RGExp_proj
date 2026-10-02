@@ -312,24 +312,29 @@ labels:
 # NHÁNH BỔ SUNG THỊ GIÁC CHẤT LƯỢNG CAO — HAI KHỐI (`src/vextractor.py`)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-#   ảnh 448² ─► Extractor DINOv3 ViT-S/16 ─► V (784, 384) ─► CnA (QFormer) ─► V_c (8, 2560)
+#   ảnh 448² ─► Extractor DINOv3 ViT-S/16 ─► V = concat 3 block cuối (784, 1152)
+#            ─► CnA (QFormer @1536) ─► V_c (8, 2560)
 #
 # Stage 0: DINOv3 fine-tuning của Extractor. Main stage: CnA + LoRA học cùng nhau.
 # (Không còn Stage 1 — bản Stage 1 cũ nằm ở `_archive/stage1_compressor/`.)
 vextractor:
-  extractor:                # DINOv3 ViT-S/16: (B,3,448,448) -> V (B,784,384)  (~21,59 M)
+  extractor:                # DINOv3 ViT-S/16: (B,3,448,448) -> V (B,784,1152)  (~21,59 M)
     image_size: 448
     arch: vit_small_patch16_dinov3.lvd1689m   # dinov3-vits16-pretrain (timm >= 1.0.20)
     pretrained: true
     n_layers: null
     n_stages: null          # ViT: cả 12 block, patch 16: 448² -> 28×28 = 784 token (+5 prefix bị cắt)
-  cna:                      # Compressor & Aligner — QFormer: V (784, 384) -W_k,v-> 1024 -> V_c (8, 2560)
-    n_query: 8              # số latent = số token nối vào chuỗi decoder
-    d_latent: 1024          # k/v của Cross-attn chiếu 512→1024
-    head_dim: 128           # n_heads SUY RA = 1024 // 128 = 8
-    mlp_hidden: 2048        # SwiGLU mult = 2 → 1024→2048→1024
-    n_blocks: 2             # N: All_Block = (1st → 2nd) × 2
-    final_proj: true        # RMSNorm + Linear 1024 -> 2560 (d_model của Gemma 3 4B)
+    # V = concat theo KÊNH của 3 block CUỐI (10, 11, 12), mỗi block qua norm cuối
+    # của ViT, bỏ prefix: 384 × 3 = 1152. KHÔNG đổi backbone/Stage 0 — checkpoint
+    # Stage 0 (đã có trên Hub) vẫn dùng được; chỉ cách đọc backbone đổi.
+    out_layers: 3
+  cna:                      # Compressor & Aligner — QFormer: V (784, 1152) -W_k,v-> 1536 -> V_c (8, 2560)
+    n_query: 8              # số latent = số token nối vào chuỗi decoder (8 learner bù 64 token Z bị che)
+    d_latent: 1536          # k/v của Cross-attn chiếu 1152→1536
+    head_dim: 128           # n_heads SUY RA = 1536 // 128 = 12
+    mlp_hidden: 2048        # SwiGLU mult = 2 theo quy ước 2/3 (LLaMA): 2/3 · 2 · 1536 = 2048
+    n_blocks: 1             # All_Block = (1st → 2nd) một lần
+    final_proj: true        # RMSNorm + Linear 1536 -> 2560 (d_model của Gemma 3 4B)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
 
   # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
@@ -358,7 +363,7 @@ vextractor:
     cna_cross_lr_main: 4.0e-5
     cna_warmup_frac: 0.10       # 10% tổng bước, dùng cho CẢ ba nhóm
     cna_wd: 0.01
-    z_mask_frac: 0.50           # che 50% token Z (128/256) mỗi weight update
+    z_mask_frac: 0.25           # che 25% token Z (64/256) mỗi weight update — 8 learner bù
     separate_clip: true         # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
@@ -515,8 +520,8 @@ report:
 # CHỈ chạy candidate B (Z của B giống A từng bit -> Q chính là B − A). HAI báo cáo
 # trên CÙNG `n_samples` ảnh test bốc ngẫu nhiên theo `seed` (null = seed chung):
 #   runs/<subdir>/Lens/Lens_Vision.html    Grad-CAM, nền luôn là X (ảnh 448² vào
-#        Extractor). 5 cột = 5 mẫu; dòng 1 target = đầu ra Extractor (‖V‖²), dòng 2
-#        target = V_c[i] (‖V_c[i]‖²), chuyển Q[i] bằng thanh pager.
+#        Extractor). 5 cột = 5 mẫu; target = ảnh hưởng lên y (log-prob báo cáo) QUA
+#        khối Q: dòng 1 cả khối Q (Σ ⟨∂y/∂Q[i], V_c[i]⟩), dòng 2 riêng Q[i] (pager).
 #   runs/<subdir>/Lens/Lens_Language.md    Jacobian ‖∂y/∂h‖ token × lớp, lưới 3 dòng
 #        (Z · Q · T) × 5 cột, thang màu CHUNG Z ∪ Q ∪ T trong mỗi cột + đường đứt ở
 #        lớp sâu nhất có token chạm ngưỡng; ma trận attention Q[i] ↔ token bệnh lý
@@ -527,7 +532,7 @@ lens:
   seed: null                # null = `seed` chung của config
   target: ref_logprob       # ref_logprob | next_token  (y của báo cáo Language)
   cam: gradcam              # gradcam | gradcam++
-  cam_stage: -1             # block của ViT lấy CAM: -1 = block cuối (28×28 ở 448², bỏ 5 prefix)
+  cam_stage: -3             # block lấy CAM: -3 = block đầu của 3 block V concat (28×28, bỏ 5 prefix)
   cam_image_weight: 0.5     # overlay MẶC ĐỊNH của Grad-CAM (show_cam_on_image): JET,
                             # cam = 0.5·heatmap + 0.5·X, rồi chia max
   percentile_clip: 99.0     # vmax chung của mỗi cột Jacobian = phân vị này của bể Z ∪ Q ∪ T

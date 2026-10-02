@@ -1,7 +1,8 @@
 """DINOv3 ViT-S/16 extractor và CnA (Compressor & Aligner) — nhánh bổ sung thị giác.
 
 DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`) chạy ở ảnh 448x448 cho lưới
-28x28 patch token 384 kênh (V = 784 x 384; 5 prefix token cls + register bị cắt). CnA là MỘT QFormer duy nhất: 8 latent @1024 đọc V qua
+28x28 patch token 384 kênh; V = concat theo kênh của 3 block cuối (mỗi block qua
+norm cuối, bỏ 5 prefix token cls + register) = 784 x 1152. CnA là MỘT QFormer duy nhất: 8 latent @1024 đọc V qua
 Cross-attn (k/v chiếu 512 -> 1024), rồi một Linear cuối 1024 -> 2560 đưa chúng vào
 không gian của decoder (V_c = 16 x 2560, nối vào chuỗi sau token ảnh Z).
 """
@@ -34,7 +35,10 @@ BACKBONE_CFG_KEYS = ("arch", "pretrained", "n_layers", "n_stages")
 # sai) rồi chạy hết cả giai đoạn với giá trị mặc định.
 #
 # `normalize` KHÔNG có ở đây — nó được HỎI từ `pretrained_cfg` của `arch`.
-EXT_CFG_KEYS = (*BACKBONE_CFG_KEYS, "image_size")
+# `out_layers` KHÔNG nằm trong BACKBONE_CFG_KEYS: nó chỉ đổi cách ĐỌC backbone
+# (concat k block cuối), không đổi một tensor nào Stage 0 huấn luyện — nên đổi nó
+# KHÔNG bắt chạy lại Stage 0 (checkpoint Stage 0 trên Hub vẫn dùng được).
+EXT_CFG_KEYS = (*BACKBONE_CFG_KEYS, "image_size", "out_layers")
 CNA_CFG_KEYS = ("n_query", "d_latent", "head_dim", "mlp_hidden", "n_blocks",
                 "final_proj", "dropout")
 
@@ -476,7 +480,8 @@ class Extractor(nn.Module):
     def __init__(self, image_size: int = 448,
                  arch: str = "vit_small_patch16_dinov3.lvd1689m",
                  pretrained: bool = True, n_layers: int | None = None,
-                 n_stages: int | None = None, normalize: dict | None = None):
+                 n_stages: int | None = None, normalize: dict | None = None,
+                 out_layers: int = 1):
         super().__init__()
         self.image_size = int(image_size)
         (self.body, self.d_feat, self.n_patch, self.n_layers, self.kind,
@@ -485,6 +490,24 @@ class Extractor(nn.Module):
         self.arch = str(arch)
         self.n_prefix = (0 if self.kind == "conv"
                          else int(getattr(self.body, "num_prefix_tokens", 0)))
+        # V = concat theo KÊNH của `out_layers` block CUỐI (mỗi block qua norm cuối
+        # của backbone, bỏ prefix token) -> d_feat = d_backbone × out_layers.
+        self.d_backbone = int(self.d_feat)
+        self.out_layers = int(out_layers)
+        if self.out_layers < 1:
+            raise VExtractorUnusable(f"out_layers {out_layers} phải >= 1.")
+        if self.out_layers > 1:
+            blocks = getattr(self.body, "blocks", None)
+            if (self.kind != "vit" or blocks is None
+                    or not hasattr(self.body, "forward_intermediates")):
+                raise VExtractorUnusable(
+                    f"out_layers = {self.out_layers} (concat nhiều block cuối) chỉ hỗ "
+                    f"trợ họ ViT của timm có `forward_intermediates`; {arch!r} là "
+                    f"{self.kind}/{self.fmt}. Đặt `out_layers: 1`.")
+            if self.out_layers > len(blocks):
+                raise VExtractorUnusable(
+                    f"out_layers {self.out_layers} > {len(blocks)} block của {arch!r}.")
+            self.d_feat = self.d_backbone * self.out_layers
         self.mean, self.std = _check_normalize(self.body, arch, normalize)
         self.frozen = False
 
@@ -526,6 +549,18 @@ class Extractor(nn.Module):
         `self.fmt` đến từ `output_fmt` của model, không từ `f.dim()`: NCHW và
         NHWC cùng 4 chiều nên số chiều không phân biệt được chúng.
         """
+        if self.out_layers > 1:
+            ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
+            with ctx:
+                outs = self.body.forward_intermediates(
+                    px, indices=self.out_layers, norm=True, output_fmt="NLC",
+                    intermediates_only=True)
+            f = torch.cat(list(outs), dim=-1)          # (B, N, d_backbone × k)
+            if f.shape[1] != self.n_patch:
+                raise ValueError(
+                    f"lưới {f.shape[1]} ô nhưng Extractor khai n_patch="
+                    f"{self.n_patch}: ảnh vào phải là {self.image_size}².")
+            return f
         f = self.patches_raw(px)
         if f.dim() == 4:
             if self.fmt == "NHWC":
@@ -552,8 +587,10 @@ class Extractor(nn.Module):
         cut = "" if self.n_layers is None else f", {self.n_layers} block"
         if self.n_stages is not None:
             cut += f", {self.n_stages} stage"
+        cat = ("" if self.out_layers == 1 else
+               f", concat {self.out_layers} block cuối × {self.d_backbone}")
         return (f"Extractor: ảnh {self.image_size}² -> {self.arch} "
-                f"({self.kind}/{self.fmt}{cut}, {self.n_prefix} prefix) -> V "
+                f"({self.kind}/{self.fmt}{cut}, {self.n_prefix} prefix{cat}) -> V "
                 f"({self.n_patch}, {self.d_feat})")
 
 
@@ -856,12 +893,14 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                                    else int(ex["n_layers"])),
                       "n_stages": (None if ex.get("n_stages") is None
                                    else int(ex["n_stages"])),
+                      # concat k block CUỐI theo kênh (ViT): V = (N, d × k).
+                      "out_layers": int(ex.get("out_layers", 1)),
                       "normalize": {"mean": list(mean), "std": list(std)}},
         "cna": {"n_query": int(cn.get("n_query", 8)),
-                "d_latent": int(cn.get("d_latent", 1024)),
+                "d_latent": int(cn.get("d_latent", 1536)),
                 "head_dim": int(cn.get("head_dim", 128)),
                 "mlp_hidden": int(cn.get("mlp_hidden", 2048)),
-                "n_blocks": int(cn.get("n_blocks", 2)),
+                "n_blocks": int(cn.get("n_blocks", 1)),
                 "final_proj": bool(cn.get("final_proj", True)),
                 "dropout": float(cn.get("dropout", 0.0))},
     }
@@ -907,7 +946,8 @@ def spec_fingerprint(spec: dict) -> str:
 def build_extractor(spec: dict) -> Extractor:
     e = spec["extractor"]
     return Extractor(e["image_size"], e["arch"], e["pretrained"],
-                     e.get("n_layers"), e.get("n_stages"), e.get("normalize"))
+                     e.get("n_layers"), e.get("n_stages"), e.get("normalize"),
+                     int(e.get("out_layers", 1)))
 
 
 def build_backbone(spec: dict):

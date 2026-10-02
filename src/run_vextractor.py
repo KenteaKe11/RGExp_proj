@@ -618,9 +618,10 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
             print(f"  ✗ {B['id']}: chưa có weight — bỏ qua sinh", flush=True)
         else:
             mc = model_cfg(cfg, B, adapter_root)
-            ilock = fx_mod.get_lock(fx, "infer_batch")
-            if ilock:
-                mc["batch_size_locked"] = ilock      # = batch sinh của A
+            # KHÔNG khoá theo `infer_batch` của A: batch sinh của B do autobatch
+            # dò từ `autobatch.infer_max_bs` (64) xuống, và batch thật được ghi ở
+            # predictions/<B>.infer.json + tem Hub.
+            mc.pop("batch_size_locked", None)
             try:
                 runner = build(arm_cfg(cfg, B), mc, tracker)
                 runner.run(test_df, pred, log_every=tracker.log_every)

@@ -78,12 +78,10 @@ set:
                                   # nó thật sự chạy thì ngoại suy mới đúng.
 
   # ── Sinh + chấm ─────────────────────────────────────────────────────────
-  # 4 thay vì 2: sinh không có gradient, không có optimizer state, và beam 3
-  # nhân số chuỗi lên 3 lần chứ không nhân trọng số. Vẫn chỉ là KHỞI ĐIỂM —
-  # autobatch sinh dò lại và KHOÁ một số dùng chung cho cả 4 candidate
-  # (`fixture.set_lock("infer_batch")`), nên số này không đổi kết quả, chỉ đổi
-  # thời gian. Trần 16 giữ nguyên: ảnh 896² của Gemma 3 làm KV-cache phình
-  # nhanh hơn nhiều so với phần trọng số.
+  # Chỉ là số DỰ PHÒNG khi autobatch tắt / không có CUDA. Batch sinh của B do
+  # autobatch dò TỪ `autobatch.infer_max_bs` (64) XUỐNG tới nấc đầu tiên vừa
+  # ngân sách VRAM — không khoá theo batch sinh của A nữa; batch thật được ghi ở
+  # predictions/<B>.infer.json và tem Hub.
   base.batch_size: 4
   metrics.bertscore.batch_size: auto  # dò như hai pipeline kia (khởi điểm 64)
 
@@ -96,8 +94,7 @@ set:
   autobatch.enabled: true
   autobatch.target_frac: 0.80
   autobatch.probe_sizes: [2, 4, 8]   # điểm đo của MAIN STAGE (xem stage0.probe_sizes)
-  autobatch.infer_probe_sizes: [2, 4]
-  autobatch.infer_max_bs: 16
+  autobatch.infer_max_bs: 64       # sinh: dò TỪ 64 XUỐNG (48, 32, 24, …) tới nấc vừa ngân sách
 
   # ── I/O (src/hw.py, src/data.py, src/prefetch.py) ───────────────────────
   # 20, không `auto`. `auto` = `hw.cpu_budget()`, và trên Windows nó rơi về

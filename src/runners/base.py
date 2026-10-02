@@ -95,7 +95,7 @@ class Runner:
     #   probe_generate(batch) -> sinh ĐỦ max_new_tokens (cho autobatch)
 
     def pick_batch_size(self, todo: list[dict]) -> int:
-        """Batch lúc sinh: khoá chung (nếu có) > autobatch 85% VRAM > config."""
+        """Batch lúc sinh: khoá (nếu có) > autobatch dò TỪ `infer_max_bs` XUỐNG > config."""
         bs = max(1, int(self.mcfg.get("batch_size", 1)))
         locked = self.mcfg.get("batch_size_locked")
         if locked:
@@ -110,7 +110,7 @@ class Runner:
         def step(k: int) -> None:
             probe([todo[j % len(todo)] for j in range(k)])
 
-        chosen, rep = autobatch.autotune_infer(
+        chosen, rep = autobatch.autotune_generate(
             self.cfg, f"{self.mcfg['id']}/infer", bs, step)
         self.autobatch_report = rep
         self._free()
@@ -199,6 +199,20 @@ class Runner:
         self.smoke_test(todo[0])
 
         bs = self.pick_batch_size(todo)
+        self.infer_batch = int(bs)
+        # Batch THẬT của lần sinh này, cạnh file dự đoán — tem Hub đọc nó.
+        try:
+            side = out_path.with_name(out_path.stem + ".infer.json")
+            hist = []
+            if side.exists():
+                hist = list(json.loads(side.read_text(encoding="utf-8")).get("history") or [])
+            hist.append({"infer_batch": int(bs), "n_todo": len(todo),
+                         "autobatch": self.autobatch_report})
+            side.write_text(json.dumps({"infer_batch": int(bs), "history": hist},
+                                       indent=2, ensure_ascii=False, default=str),
+                            encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — sổ ghi, không được giết lần sinh
+            print(f"  ⚠ không ghi được batch sinh: {e!r}", flush=True)
         batches = [todo[i:i + bs] for i in range(0, len(todo), bs)]
         # Batch k+1 (mở ảnh + processor 896 + token hoá) dựng trong luồng nền
         # lúc batch k đang sinh trên GPU.

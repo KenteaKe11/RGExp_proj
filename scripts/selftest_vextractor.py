@@ -23,7 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. MASK REGULARIZATION: 50% token Z bị che qua attention_mask mỗi optimizer
+ 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
@@ -175,7 +175,7 @@ def _():
         # kiểm luôn im lặng.
         assert str(req["cuda_arch"]).startswith("sm_"), (p.name, req)
         for k in ("stage0.probe_sizes",
-                  "autobatch.probe_sizes", "autobatch.infer_probe_sizes"):
+                  "autobatch.probe_sizes"):
             v = [int(x) for x in sets[k]]
             assert v and v == sorted(v) and v[0] >= 1, (p.name, k, v)
         cfg = load_config(ROOT / "configs/vextractor.yaml", gpu=p.stem)
@@ -269,6 +269,55 @@ def _():
     got, rep = autotune(off, "stage0", 32, 8, None, cands=divisors(32),
                         measure_fn=cost(0), total_bytes=TOTAL)
     assert got == 8 and rep["enabled"] is False
+
+
+@check("1d. batch SINH dò TỪ 64 XUỐNG (OOM / vượt ngân sách -> nấc dưới), B không khoá theo infer_batch của A, batch thật vào tem Hub")
+def _():
+    import json as _json
+
+    from src import autobatch as AB
+    from src import hub_sync as HS
+    from src.config import load_config
+
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    assert AB.ab_cfg(cfg)["infer_max_bs"] == 64
+    on = {"autobatch": {"enabled": True, "target_frac": 0.8, "infer_max_bs": 64}}
+    GIB = 1024 ** 3
+    seen = []
+
+    def cost(bs):                 # 64 OOM, 48 vượt ngân sách (> 12.8), 32 vừa
+        seen.append(bs)
+        if bs >= 64:
+            return None
+        return (2.0 + 0.3 * bs) * GIB
+
+    got, rep = AB.autotune_generate(on, "gen", 4, None, measure_fn=cost,
+                                    total_bytes=16 * GIB)
+    assert seen[:3] == [64, 48, 32] and got == 32, (seen, got)
+    assert rep["kind"] == "generate_top_down" and rep["max_bs"] == 64
+    seen.clear()
+    got, rep = AB.autotune_generate(on, "gen", 4, None, measure_fn=lambda b: None,
+                                    total_bytes=16 * GIB)
+    assert got == 4 and "error" in rep                  # không nấc nào vừa -> giữ
+    # run_vextractor KHÔNG còn khoá batch sinh của B theo A
+    src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
+    assert 'mc["batch_size_locked"] = ilock' not in src
+    # tem: B ghi batch THẬT + nguồn autobatch, và KHÔNG bị so với khoá của A
+    with tempfile.TemporaryDirectory() as td:
+        pred = Path(td) / "predictions" / "B.jsonl"
+        pred.parent.mkdir(parents=True)
+        pred.write_text("{}\n", encoding="utf-8")
+        assert HS._own_batch(pred) is None
+        pred.with_name("B.infer.json").write_text(_json.dumps({"infer_batch": 48}),
+                                                  encoding="utf-8")
+        assert HS._own_batch(pred) == 48
+    s_auto = {"infer_batch": 48, "infer_batch_source": "autobatch"}
+    s_lock = {"infer_batch": 48, "infer_batch_source": "lock"}
+    import inspect
+
+    body = inspect.getsource(HS.stamp_matches)
+    assert 'infer_batch_source") != "autobatch"' in body
+    _ = (s_auto, s_lock)
 
 
 @check("2. Extractor (cắt stage) -> CnA (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn, RMSNorm + Linear cuối -> d_model)")
@@ -415,7 +464,7 @@ def _():
     assert not torch.allclose(br(x), before)
 
 
-@check("2a. DINOv3 ViT-S/16 ở 448²: 5 prefix token (cls + 4 register) bị cắt -> 28×28 = 784 ô × 384, ~21,59 M; chạy được ở 224² (multi-crop); Grad-CAM của Lens chạy trên block ViT")
+@check("2a. DINOv3 ViT-S/16 ở 448²: 5 prefix token (cls + 4 register) bị cắt -> 28×28 = 784 ô × 384, concat 3 block cuối -> V 784 × 1152; ~21,59 M; chạy được ở 224² (multi-crop); Grad-CAM của Lens chạy trên block ViT")
 def _():
     import numpy as np
     import torch
@@ -448,9 +497,18 @@ def _():
     x = torch.randn(1, 3, 448, 448)
     with torch.no_grad():
         raw = br.extractor.patches_raw(x)
-        assert torch.equal(br.extractor.patches(x), raw[:, 5:])
+        v = br.extractor.patches(x)
+        assert br.extractor.out_layers == ex["out_layers"] == 3
+        assert tuple(v.shape) == (1, 784, 3 * 384) == (1, br.extractor.n_patch, br.extractor.d_feat)
+        # khối kênh CUỐI = block cuối = forward_features bỏ prefix
+        assert torch.allclose(v[..., -384:], raw[:, 5:], atol=1e-5)
+        mids = br.extractor.body.forward_intermediates(
+            x, indices=3, norm=True, output_fmt="NLC", intermediates_only=True)
+        assert torch.equal(v, torch.cat(list(mids), -1))
+        assert not torch.allclose(v[..., :384], v[..., -384:])   # 3 block KHÁC nhau
     # Grad-CAM trên block ViT: bỏ prefix, xếp lại thành lưới 28×28
-    cm = LZ.vision_cams(br, x, torch.device("cpu"), -1, "gradcam")
+    gq = torch.randn(br.n_query, 64).numpy()
+    cm = LZ.vision_cams(br, x, torch.device("cpu"), gq, -1, "gradcam")
     assert cm["grid"] == (28, 28) and cm["q"].shape == (br.n_query, 28, 28)
     assert np.isfinite(cm["extractor"]).all() and cm["extractor"].max() > 0
 
@@ -1237,7 +1295,7 @@ def _():
     assert (zc["cna_ffn_lr_min"], zc["cna_ffn_lr_main"]) == (1e-7, 1e-4)
     assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
     assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
-    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.50
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
     # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
     a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
     assert a0 == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
@@ -1484,7 +1542,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. MASK REGULARIZATION: che 50% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
+@check("16. MASK REGULARIZATION: che 25% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
     import types
 
@@ -1852,7 +1910,7 @@ def _():
             # ── Vision: Grad-CAM, một forward + (1 + NQ) backward ───────────
             for meth in ("gradcam", "gradcam++"):
                 cm = LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"),
-                                    -2, meth)
+                                    r["gq"], -2, meth)
                 h_, w_ = cm["grid"]
                 assert cm["extractor"].shape == (h_, w_)
                 assert cm["q"].shape == (NQ, h_, w_)
@@ -1862,8 +1920,17 @@ def _():
             # Lens KHÔNG để lại dấu vết trên nhánh
             assert branch.frozen and all(not q.requires_grad for q in branch.parameters())
             assert not branch.extractor.body.training
+        # target là ẢNH HƯỞNG LÊN y qua Q: ∂y/∂Q = 0 -> mọi bản đồ = 0
+        z = LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"),
+                           np.zeros_like(lang[-1]["gq"]), -2, "gradcam")
+        assert float(z["extractor"].max()) == 0.0 and float(z["q"].max()) == 0.0
+        assert lang[-1]["gq"].shape == (NQ, DM) and np.abs(lang[-1]["gq"]).sum() > 0
         # Grad-CAM của Q[i] khác nhau (mỗi latent một bản đồ) và khác dòng 1
-        assert not np.allclose(cams[0]["q"][0], cams[0]["q"][1])
+        # ít nhất hai Q[i] (trên mọi mẫu) cho bản đồ khác nhau — một số có thể
+        # = 0 thật (mọi đóng góp âm lên y), nên không đòi từng cặp phải khác
+        allq = np.concatenate([c_["q"] for c_ in cams])
+        assert any(not np.allclose(allq[0], m_) for m_ in allq[1:])
+        assert any(float(m_.max()) > 0 for m_ in allq)
         # Grad-CAM tay: w = mean ∂s/∂A, CAM = ReLU(Σ w A) / max
         A_ = torch.rand(3, 2, 2)
         G_ = torch.randn(3, 2, 2)
@@ -1886,7 +1953,8 @@ def _():
             ref = ref / ref.max()
             assert np.abs(ov - ref).max() < 1e-9, np.abs(ov - ref).max()
         try:
-            LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"), 9)
+            LZ.vision_cams(branch, batch["vext_pixels"], torch.device("cpu"),
+                           lang[0]["gq"], 9)
         except TrainUnusable as e:
             assert "cam_stage" in str(e)
         else:
@@ -2033,7 +2101,7 @@ def _():
             f"    Lý do thật: {e}") from e
     ex, cp = br.extractor, br.cna
     dc = cfg["stage0"]["dino"]
-    head = DN.DINOHead(ex.d_feat, dc["out_dim"], dc["hidden"], dc["bottleneck"],
+    head = DN.DINOHead(ex.d_backbone, dc["out_dim"], dc["hidden"], dc["bottleneck"],
                        dc["head_layers"])
     n = lambda m: sum(q.numel() for q in m.parameters())    # noqa: E731
     # README viết số thập phân theo kiểu Việt (dấu phẩy) — so đúng dạng ấy.
@@ -2132,6 +2200,7 @@ def _():
         "dropout": cfg_of(vx={"cna": {"dropout": 0.1}}),
         "mlp_hidden": cfg_of(vx={"cna": {"mlp_hidden": 999}}),
         "image_size": cfg_of(vx={"extractor": {"image_size": SMALL_IMG * 2}}),
+        "out_layers": cfg_of(vx={"extractor": {"out_layers": 3}}),
         "main": cfg_of(vx={"main": {"cna_ffn_lr_main": 0.5}}),
     }
     drift = [k for k, c in same.items() if s0.config_fingerprint(c) != ref]

@@ -18,11 +18,16 @@ báo cáo dùng CHUNG 5 ảnh ấy theo cùng thứ tự (cột 1..5).
 ═══ 1. VISION — Grad-CAM (Grad-CAM++ tuỳ chọn) ═════════════════════════════════
 
 Ảnh nền (identity) LUÔN là X — ảnh 448² đi vào Extractor. Bản đồ lấy ở đầu ra
-một khối của backbone (`lens.cam_stage`, mặc định −1 = block cuối của ViT-S/16,
-lưới 28×28 ở 448², bỏ 5 prefix token cls + register), với hai loại TARGET:
+một khối của backbone (`lens.cam_stage`, mặc định −3 = block ĐẦU TIÊN trong 3 block
+cuối mà V concat — gradient từ cả 3 nhánh của V đều đi qua nó; lưới 28×28 ở 448²,
+bỏ 5 prefix token cls + register), với hai loại TARGET:
 
-    dòng 1 · target = đầu ra Extractor : s = ‖V‖²_F            (V: 784 × 384)
-    dòng 2 · target = đầu ra CnA, Q[i] : s_i = ‖V_c[i]‖²        (V_c: n_query × 2560)
+    dòng 1 · target = cả khối Q concat : s   = Σ_i ⟨∂y/∂Q[i], V_c[i]⟩
+    dòng 2 · target = Q[i]             : s_i = ⟨∂y/∂Q[i], V_c[i]⟩
+
+y là mục tiêu SINH của báo cáo Language (log-prob báo cáo), ∂y/∂Q lấy từ chính
+lượt backward của decoder — nên bản đồ là vùng ảnh ảnh hưởng tới quyết định sinh
+token THÔNG QUA khối Q, không phải vùng làm Q "to".
 
     Grad-CAM   : w_c = mean_hw ∂s/∂A_c ;  CAM = ReLU(Σ_c w_c A_c)
     Grad-CAM++ : w_c = Σ_hw α_c,hw · ReLU(∂s/∂A_c,hw),
@@ -113,7 +118,7 @@ def lcfg(cfg: Cfg) -> dict:
            else int(cfg.get("seed", 42)),
            "target": str(c.get("target", "ref_logprob")).lower(),
            "cam": str(c.get("cam", "gradcam")).lower(),
-           "cam_stage": int(c.get("cam_stage", -1)),
+           "cam_stage": int(c.get("cam_stage", -3)),
            "cam_image_weight": float(c.get("cam_image_weight", 0.5)),
            "percentile_clip": float(c.get("percentile_clip", 99.0)),
            "reach_frac": float(c.get("reach_frac", 0.10)),
@@ -315,8 +320,14 @@ def analyze_language(model, gemma, branch, batch: dict, target: str) -> dict:
     sens = np.stack([(h.grad[0].float().norm(dim=-1).detach().cpu().numpy()
                       if h.grad is not None else np.zeros(h.shape[1]))
                      for h in hs[1:]])                      # (L, T)
-    return {"layer_sens": sens, "q": q_np, "y": float(y.detach()), "target": tgt,
-            "n_tokens": int(kw["inputs_embeds"].shape[1]),
+    # ∂y/∂Q[i] — gradient của mục tiêu SINH theo từng vector Q đã chèn. Báo cáo
+    # Vision dùng nó làm hướng chiếu: target của Grad-CAM là ảnh hưởng bậc một
+    # của Q[i] lên y, không phải độ lớn của Q[i].
+    gq = None
+    if ins is not None and kw["inputs_embeds"].grad is not None:
+        gq = kw["inputs_embeds"].grad[0, ins[0]:ins[1]].float().detach().cpu().numpy()
+    return {"layer_sens": sens, "q": q_np, "gq": gq, "y": float(y.detach()),
+            "target": tgt, "n_tokens": int(kw["inputs_embeds"].shape[1]),
             "image_span": span, "insert_span": ins}
 
 
@@ -597,11 +608,26 @@ def _to_chw(t, fmt: str, n_prefix: int):
     return t
 
 
-def vision_cams(branch, px, dev, stage: int = -1, method: str = "gradcam") -> dict:
-    """-> {"extractor": (h, w), "q": (n_query, h, w), "grid": (h, w), "stage": k}.
+def vision_cams(branch, px, dev, gq, stage: int = -3,
+                method: str = "gradcam") -> dict:
+    """Grad-CAM với target là ẢNH HƯỞNG LÊN QUYẾT ĐỊNH SINH qua khối Q.
 
-    MỘT lượt forward, `1 + n_query` lượt backward (retain_graph) — mọi target
-    dùng chung activation của stage đã chọn.
+    -> {"extractor": (h, w), "q": (n_query, h, w), "grid": (h, w), "stage": k}.
+
+    `gq` = ∂y/∂Q (n_query × d) lấy từ lượt backward của decoder (y = mục tiêu
+    sinh, xem `analyze_language`). Target của từng ô:
+
+        dòng 2 · Q[i] : s_i = ⟨∂y/∂Q[i], V_c[i]⟩      (ảnh hưởng bậc một của Q[i] lên y)
+        dòng 1 · cả Q : s   = Σ_i s_i                  (toàn bộ khối Q concat cuối)
+
+    ∂s/∂A (A = activation của block/stage đã chọn) bằng đúng ∂y/∂A theo đường
+    Q -> CnA -> Extractor, với decoder tuyến tính hoá quanh ảnh này — nên vùng sáng
+    là vùng ảnh mà đổi đi thì xác suất sinh báo cáo đổi theo QUA Q.
+    (Bản trước lấy target ‖V‖² / ‖V_c[i]‖², tức độ LỚN của đặc trưng — nó trả lời
+    "Q to ở đâu", không phải "Q quyết định sinh chữ nhờ vùng nào"; với ‖V‖² thì
+    ReLU của Grad-CAM xoá sạch cả bản đồ.)
+
+    MỘT lượt forward, `1 + n_query` lượt backward (retain_graph).
     """
     import torch
 
@@ -625,8 +651,14 @@ def vision_cams(branch, px, dev, stage: int = -1, method: str = "gradcam") -> di
             v = branch.extractor(px.to(dev))
             vc = branch.cna(v)
         A = hold["a"]
-        scores = [v.float().pow(2).sum()]
-        scores += [vc[0, i].float().pow(2).sum() for i in range(vc.shape[1])]
+        if gq is None:
+            raise TrainUnusable("Lens Vision cần ∂y/∂Q (gq) từ lượt backward của "
+                                "decoder — chạy `analyze_language` trước.")
+        g = torch.as_tensor(np.asarray(gq), dtype=torch.float32, device=vc.device)
+        if tuple(g.shape) != tuple(vc.shape[1:]):
+            raise TrainUnusable(f"gq {tuple(g.shape)} không khớp V_c {tuple(vc.shape[1:])}.")
+        per = [(vc[0, i].float() * g[i]).sum() for i in range(vc.shape[1])]
+        scores = [torch.stack(per).sum()] + per
         npre = int(branch.extractor.n_prefix)
         A0 = _to_chw(A[0], fmt, npre)
         maps = []
@@ -806,17 +838,18 @@ background:linear-gradient(90deg,#00007f,#0000ff,#007fff,#00ffff,#7fff7f,#ffff00
 </style></head><body>
 <header><h1>Lens · Vision — __METHOD__</h1>
 <div class="sub">Nền (identity) luôn là X — ảnh 448² vào Extractor ·
-dòng 1: target = đầu ra Extractor (‖V‖²) · dòng 2: target = đầu ra CnA (‖V_c[i]‖²) ·
+dòng 1: target = ảnh hưởng của CẢ khối Q lên y (Σ ⟨∂y/∂Q[i], V_c[i]⟩) · dòng 2: target = ảnh hưởng của riêng Q[i] lên y ·
 <span id="stageinfo"></span></div></header>
 <div class="pager" id="pager"><span class="lab">Q[i]</span></div>
 <div class="legend"><span>0</span><div class="bar"></div><span>1 · Grad-CAM overlay mặc định (JET, image_weight 0.5) · mỗi bản đồ chuẩn hoá min–max của chính nó (so HÌNH DẠNG, không so độ sáng giữa ô)</span></div>
 <div class="wrap"><div class="grid" id="grid"></div></div>
 <div id="zoom" onclick="this.classList.remove('on')"><img id="zimg"></div>
 <div class="notes">
-<p><b>Cách đọc.</b> Dòng 1 cố định: vùng ảnh mà toàn bộ đầu ra Extractor V
-nhạy nhất. Dòng 2 đổi theo Q[i]: vùng ảnh mà riêng latent <code>V_c[i]</code> phụ thuộc.
-So dòng 2 với dòng 1: trùng = Q[i] lấy đúng phần backbone nhấn mạnh; lệch = Q[i] chuyên
-về một vùng riêng. Lật qua các Q[i]: nhiều Q cùng một vùng = latent trùng lặp; mỗi Q một
+<p><b>Cách đọc.</b> y = log-prob báo cáo mà decoder sinh (cùng y với báo cáo Language).
+Dòng 1 cố định: vùng ảnh đẩy y lên mạnh nhất THÔNG QUA cả khối Q concat cuối. Dòng 2 đổi
+theo Q[i]: vùng ảnh đẩy y lên thông qua riêng latent <code>Q[i]</code>
+(⟨∂y/∂Q[i], V_c[i]⟩). Ô ghi <i>CAM = 0</i>: không vùng nào đẩy y lên qua Q đó
+(mọi đóng góp âm, bị ReLU của Grad-CAM xoá) — đọc cùng dòng <code>decoder đọc</code>. Lật qua các Q[i]: nhiều Q cùng một vùng = latent trùng lặp; mỗi Q một
 vùng = các latent chia nhau ảnh. Bấm vào ảnh để phóng to (Esc để đóng); phím ← → đổi Q[i].</p>
 <p><b>Caption.</b> <code>max/mean</code> ≈ 1 và <code>top10%</code> ≈ 10% = bản đồ phẳng
 (không tập trung). <code>decoder đọc</code> = phần độ nhạy của khối Q mà decoder dồn vào
@@ -832,7 +865,8 @@ const pager = document.getElementById('pager'), grid = document.getElementById('
 document.getElementById('stageinfo').textContent =
   'lớp CAM: stage ' + D.meta.stage + ' · lưới ' + D.meta.grid.join('×') + ' · seed ' + D.meta.seed;
 const pct = v => (100*v).toFixed(0) + '%';
-function stat(s){return 'max/mean ' + s.max_over_mean.toFixed(1) + ' · top10% ' + pct(s.top10_share);}
+function stat(s){if(!(s.max_over_mean>0))return '<b>CAM = 0</b> (không vùng nào đẩy y lên)';
+  return 'max/mean ' + s.max_over_mean.toFixed(1) + ' · top10% ' + pct(s.top10_share);}
 function build(){
   const prev = document.createElement('button'); prev.textContent='◀'; prev.onclick=()=>go(cur-1);
   pager.appendChild(prev);
@@ -848,7 +882,7 @@ function build(){
   D.samples.forEach((s,k)=>{const h=div('head','');
     h.innerHTML='mẫu '+(k+1)+' · '+s.key+(s.pos.length?'<br><span class="pos">pos: '+s.pos.join(', ')+'</span>':'');
     grid.appendChild(h);});
-  grid.appendChild(div('rowlab','Dòng 1<br><small>target = đầu ra Extractor</small>'));
+  grid.appendChild(div('rowlab','Dòng 1<br><small>target = cả khối Q → y</small>'));
   D.samples.forEach((s,k)=>{const c=div('cell ext','');
     c.innerHTML='<img id="e'+k+'"><div class="cap">'+stat(s.ext_stat)+'</div>';grid.appendChild(c);});
   grid.appendChild(div('rowlab','Dòng 2<br><small id="qlab"></small>'));
@@ -863,7 +897,7 @@ function div(c,h){const d=document.createElement('div');d.className=c;d.innerHTM
 function go(i){cur=(i+D.nq)%D.nq;render();}
 function render(){
   for(let i=0;i<D.nq;i++)document.getElementById('p'+i).classList.toggle('on',i===cur);
-  document.getElementById('qlab').textContent='target = V_c['+cur+']';
+  document.getElementById('qlab').textContent='target = Q['+cur+'] → y';
   D.samples.forEach((s,k)=>{
     document.getElementById('e'+k).src='data:image/jpeg;base64,'+(raw?s.x:s.ext);
     document.getElementById('q'+k).src='data:image/jpeg;base64,'+(raw?s.x:s.q[cur]);
@@ -918,7 +952,7 @@ def run(cfg: Cfg, A: dict, B: dict, run_dir: Path, adapter_root: Path,
         res = analyze_language(model, gemma, branch, batch, lc["target"])
         lang.append(res)
         mats.append(q_disease_attention(res["q"], E, lc["attn_temp"]))
-        cams.append(vision_cams(branch, batch["vext_pixels"], dev,
+        cams.append(vision_cams(branch, batch["vext_pixels"], dev, res["gq"],
                                 lc["cam_stage"], lc["cam"]))
         print(f"    [{k}/{len(items)}] {it['key']} · y {res['y']:.2f}", flush=True)
     stats = {k: st.get(k) for k in ("rank", "alpha", "uses_vextractor", "steps")}
