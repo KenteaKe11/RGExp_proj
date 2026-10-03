@@ -243,40 +243,13 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
         return False
     if base_only and s0.base_finished(cfg) is not None:
         return False              # đã có base cục bộ
-    src = dict(dict(cfg["output"]).get("stage0_from") or {})
-    # (0) Thí nghiệm con (vd. $2.2.2 SNOP-MHA) dùng LẠI Stage 0 của thí nghiệm
-    #     gốc: Stage 0 chỉ phụ thuộc backbone + khối `stage0` + seed, không phụ
-    #     thuộc CnA. Bản cục bộ của thí nghiệm gốc được thử TRƯỚC Hub.
-    if not base_only and src.get("adapter_dir"):
-        c_src = Cfg(copy.deepcopy(dict(cfg)))
-        c_src["output"] = dict(c_src["output"], adapter_dir=str(src["adapter_dir"]))
-        d_src, d = s0.stage0_dir(c_src), s0.stage0_dir(cfg)
-        if d_src.resolve() != d.resolve() and s0.finished(c_src) is not None:
-            d.mkdir(parents=True, exist_ok=True)
-            for r in s0.KEEP:
-                if (d_src / r).exists():
-                    (d / r).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(d_src / r, d / r)
-            if s0.finished(cfg) is not None:
-                print(f"  ⇐ Stage 0 chép từ bản cục bộ {d_src}", flush=True)
-                return True
     try:
         api, repo_id, repo_type, remote = _api_and_index(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ không đọc được Hub ({e!r}) — Stage 0 sẽ chạy cục bộ", flush=True)
         return False
-    bases = [hub_base(cfg)]
-    if src.get("hub_index") is not None and src.get("hub_title"):
-        c_hub = Cfg(copy.deepcopy(dict(cfg)))
-        c_hub["output"] = dict(c_hub["output"], hub_index=str(src["hub_index"]),
-                               hub_title=str(src["hub_title"]))
-        bases.append(hub_base(c_hub))
-    base, have = bases[0], []
-    for b_ in bases:
-        have = [r for r in s0.KEEP if f"{b_}/stage0/{r}" in remote]
-        if s0.HISTORY in have:
-            base = b_
-            break
+    base = hub_base(cfg)
+    have = [r for r in s0.KEEP if f"{base}/stage0/{r}" in remote]
     if api is None or s0.HISTORY not in have:
         return False
     d = s0.stage0_dir(cfg)
@@ -309,6 +282,127 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
           + (f"final (epoch {h.get('best_epoch')})" if full
              else f"base ({h.get('base_epoch')}) — sẽ chạy epoch đuôi"), flush=True)
     return True
+
+
+ORIGIN_FILE = "origin.json"
+
+
+class OriginStage0Missing(RuntimeError):
+    """Thí nghiệm con bắt buộc Stage 0 của thí nghiệm gốc mà không lấy được."""
+
+
+def origin_of(cfg: Cfg) -> dict | None:
+    """Khối `output.stage0_from` (Stage 0 GỐC — §2.2, CnA MHA), hoặc None."""
+    src = dict(dict(cfg.get("output") or {}).get("stage0_from") or {})
+    return src or None
+
+
+def origin_required(cfg: Cfg) -> bool:
+    src = origin_of(cfg)
+    return bool(src and src.get("required", True))
+
+
+def _origin_cfg(cfg: Cfg, src: dict, **out) -> Cfg:
+    c = Cfg(copy.deepcopy(dict(cfg)))
+    c["output"] = dict(c["output"], **out)
+    return c
+
+
+def ensure_origin_stage0(cfg: Cfg, allow_hub: bool = True) -> dict:
+    """Stage 0 của thí nghiệm con = ĐÚNG checkpoint Stage 0 của thí nghiệm GỐC.
+
+    §2.2.2 (SNOP-MHA) chỉ đổi attention của CnA — thứ Stage 0 không dựng — nên
+    Extractor PHẢI là teacher EMA mà §2.2 (CnA MHA thuần) đã dùng. Chạy lại DINO
+    ở đây (dù cùng seed) là thêm một biến thứ hai vào phép so B(SNOP) với B(MHA).
+
+    Nguồn, theo thứ tự (KHÔNG có nguồn thứ ba, KHÔNG bao giờ tự huấn luyện):
+      1. bản cục bộ của gốc  `<stage0_from.adapter_dir>/_stage0/` (đã xong, khớp vân tay);
+      2. Hub của gốc         `<hub_root>/$<stage0_from.hub_index>_<hub_title>_Test/stage0/`
+                             (chỉ `final/` đã xong — `base/` lẻ thì bị từ chối,
+                             vì chạy epoch đuôi trên máy này là ra một checkpoint khác).
+
+    Bản chép mang `origin.json` (nguồn + sha256 của `final/` checkpoint). Lần
+    sau: sha khớp -> dùng luôn; thư mục Stage 0 có mà không có/khác `origin.json`
+    (vd. ai đó lỡ chạy Stage 0 ở đây) -> GHI ĐÈ bằng bản gốc.
+
+    -> dict nguồn; không lấy được -> `OriginStage0Missing`.
+    """
+    from . import fixture as fx_mod
+    from . import stage0_vextractor as s0
+    from . import vextractor as Z
+
+    src = origin_of(cfg) or {}
+    d = s0.stage0_dir(cfg)
+    ck = d / s0.CKPT / Z.STAGE0_FILE
+
+    def _sha() -> str | None:
+        return fx_mod.sha256_file(ck) if ck.exists() else None
+
+    pv = d / ORIGIN_FILE
+    if s0.finished(cfg) is not None and pv.exists():
+        rec = json.loads(pv.read_text(encoding="utf-8"))
+        if rec.get("sha256_final") and rec["sha256_final"] == _sha():
+            print(f"  ✓ Stage 0 = bản GỐC ({rec.get('source')}) · sha256 "
+                  f"{rec['sha256_final'][:12]}", flush=True)
+            return rec
+
+    tried = []
+    # (1) bản cục bộ của gốc
+    if src.get("adapter_dir"):
+        c_src = _origin_cfg(cfg, src, adapter_dir=str(src["adapter_dir"]))
+        d_src = s0.stage0_dir(c_src)
+        if d_src.resolve() == d.resolve():
+            raise OriginStage0Missing(
+                "output.stage0_from.adapter_dir trùng output.adapter_dir — thí "
+                "nghiệm con phải có thư mục riêng.")
+        if s0.finished(c_src) is not None:
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.copytree(d_src, d, ignore=shutil.ignore_patterns(
+                ORIGIN_FILE, "last", "*.hub"))
+            source = f"local:{d_src}"
+        else:
+            tried.append(f"cục bộ {d_src}: không có / chưa xong / lệch vân tay")
+            source = None
+    else:
+        source = None
+    # (2) Hub của gốc — CHỈ final đã xong
+    if source is None and allow_hub and src.get("hub_index") is not None \
+            and src.get("hub_title"):
+        c_hub = _origin_cfg(cfg, src, hub_index=str(src["hub_index"]),
+                            hub_title=str(src["hub_title"]),
+                            adapter_dir=str(d.parent / (d.parent.name + ".origin_tmp")))
+        tmp_dir = s0.stage0_dir(c_hub)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            ok = pull_stage0(c_hub) and s0.finished(c_hub) is not None
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, repr(e)
+        else:
+            why = "không có final/ đã xong hoặc lệch vân tay"
+        from .push import hub_base
+        if ok:
+            shutil.rmtree(d, ignore_errors=True)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp_dir), str(d))
+            source = f"hub:{hub_base(c_hub)}/stage0"
+        else:
+            tried.append(f"Hub {hub_base(c_hub)}/stage0: {why}")
+        shutil.rmtree(tmp_dir.parent, ignore_errors=True)
+    elif source is None:
+        tried.append("Hub của gốc: bỏ qua (pull tắt)")
+
+    if source is None or s0.finished(cfg) is None:
+        raise OriginStage0Missing(
+            "không lấy được Stage 0 GỐC (CnA MHA) — thí nghiệm con KHÔNG tự chạy "
+            "DINO.\n      · " + "\n      · ".join(tried or ["?"]))
+    h = s0.finished(cfg)
+    rec = {"source": source, "sha256_final": _sha(),
+           "best_epoch": h.get("best_epoch"), "best_score": h.get("best_score"),
+           "copied_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    pv.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  ⇐ Stage 0 = bản GỐC ({source}) · best epoch {rec['best_epoch']} · "
+          f"sha256 {rec['sha256_final'][:12]}", flush=True)
+    return rec
 
 
 def push_stage0(cfg: Cfg, run_dir: Path, tag: str = "Stage 0") -> None:
@@ -382,10 +476,19 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(a.config, a.overrides, getattr(a, "gpu", None))
     cfg["experiment"] = "vextractor"
+    if origin_required(cfg) and a.restage0:
+        print("✗ --restage0 bị TỪ CHỐI: thí nghiệm con dùng ĐÚNG Stage 0 của thí "
+              "nghiệm gốc (`output.stage0_from`, CnA MHA). Muốn DINO lại thì chạy ở "
+              "thí nghiệm gốc.", flush=True)
+        return 2
     if bool(dict(cfg.get("vextractor_exp") or {}).get("retrain_all", False)):
         a.retrain_all = True
     if a.retrain_all:
         a.restage0 = a.retrain = a.rescore = True
+        if origin_required(cfg):
+            a.restage0 = False     # Stage 0 vẫn là bản GỐC; chỉ main + sinh + chấm chạy lại
+            print("⚙ RETRAIN-ALL (thí nghiệm con): Stage 0 GIỮ bản gốc — chỉ main "
+                  "stage + sinh + chấm của B chạy lại.", flush=True)
         print("⚙ RETRAIN-ALL: Stage 0 + main stage + sinh + chấm của B chạy lại từ đầu; "
               "không kéo Stage 0 / weight / kết quả B từ Hub. A ($1) giữ nguyên.",
               flush=True)
@@ -572,7 +675,22 @@ def _cmd_train(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save,
                            "fingerprint": fx_mod.load_loader(fx)["fingerprint"]}
 
     # ── Stage 0 ────────────────────────────────────────────────────────────
-    if need_stage0 and pull and not a.restage0:
+    if origin_required(cfg) and (need_stage0 or need_train):
+        # Thí nghiệm con: Stage 0 = checkpoint GỐC, KHÔNG BAO GIỜ huấn luyện ở đây.
+        try:
+            manifest["stage0_origin"] = ensure_origin_stage0(cfg, allow_hub=pull)
+        except OriginStage0Missing as e:
+            if not a.dry_run:
+                print(f"\n✗ DỪNG — {e}\n    Chạy (hoặc kéo) Stage 0 của thí nghiệm "
+                      f"gốc trước, rồi chạy lại lệnh này.", flush=True)
+                tracker.finish(1)
+                return 3
+            print(f"  ⚠ dry-run: {e}\n    -> dry-run chạy Stage 0 giả 2 bước "
+                  f"(KHÔNG dùng cho lần chạy thật).", flush=True)
+        else:
+            need_stage0 = False
+        save()
+    elif need_stage0 and pull and not a.restage0:
         # Hub có `final/` khớp -> lấy cả; chỉ `base/` khớp -> lấy base rồi chạy
         # tiếp epoch đuôi trên máy này.
         pull_stage0(cfg)

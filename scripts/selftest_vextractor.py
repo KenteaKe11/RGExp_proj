@@ -1756,55 +1756,81 @@ def _():
         _ = RV
 
 
-@check("18b. thí nghiệm con ($2.2.2) dùng LẠI Stage 0 của $2.2: chép bản cục bộ "
-       "`stage0_from.adapter_dir` trước; không có thì kéo Hub `$2.2_…/stage0`")
+@check("18b. thí nghiệm con ($2.2.2) dùng ĐÚNG Stage 0 GỐC ($2.2, CnA MHA): chép bản "
+       "cục bộ của gốc trước, rồi Hub của gốc (chỉ final/); có origin.json + sha256; "
+       "Stage 0 lạ bị ghi đè; không có gốc -> DỪNG; --restage0 bị từ chối")
 def _():
     import json
 
     from src import stage0_vextractor as s0
     from src import vextractor as R
     from src.config import Cfg
-    from src.run_vextractor import pull_stage0
+    from src.run_vextractor import (OriginStage0Missing, ensure_origin_stage0, main,
+                                    origin_required)
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         out = {"adapter_dir": str(td / "new"), "hub_repo": "x/y",
                "hub_repo_type": "dataset", "hub_root": "current",
                "hub_index": "2.2.2", "hub_title": "V-Extractor-SNOP-MHA",
-               "stage0_from": {"adapter_dir": str(td / "old"),
+               "stage0_from": {"required": True, "adapter_dir": str(td / "old"),
                                "hub_index": "2.2", "hub_title": "V-Extractor"}}
         cfg = Cfg(json.loads(json.dumps({
             "seed": 42,
             "stage0": {"lr_min": 1e-7, "lr_max": 1e-4,
                        "warmup_epochs": 1.0, "max_epochs": 3},
             "vextractor": small_cfg()["vextractor"], "output": out})))
+        assert origin_required(cfg)
         sp = R.spec_from_cfg(cfg, 32)
         h = {"finished": True, "base_finished": True, "base_epoch": 2,
              "best_epoch": 2, "stage0": dict(s0.s0cfg(cfg)), "spec": sp, "seed": 42,
              "base_fingerprint": s0.base_fingerprint(cfg),
              "config_fingerprint": s0.config_fingerprint(cfg)}
 
-        def make(root: Path):
+        def make(root: Path, seed: int):
+            import torch
+            torch.manual_seed(seed)
             for sub in (s0.BASE, s0.CKPT):
                 R.save_stage0(R.build_backbone(sp)[0], sp, root / sub, {"best_epoch": 2})
             (root / s0.HISTORY).write_text(json.dumps(h, default=str), encoding="utf-8")
 
-        # (1) bản cục bộ của $2.2 -> chép, KHÔNG hỏi Hub
-        make(td / "old" / s0.DIRNAME)
         import src.hub_sync as HS
+        from src import fixture as F
         o1, o2 = HS._api_and_index, HS._download
+        ck = lambda c: s0.stage0_dir(c) / s0.CKPT / R.STAGE0_FILE  # noqa: E731
 
-        def no_hub(_c):
-            raise AssertionError("không được hỏi Hub khi bản cục bộ dùng được")
-        HS._api_and_index = no_hub
+        # (0) không có gốc ở đâu cả -> DỪNG, không tự chạy DINO
+        HS._api_and_index = lambda _c: (object(), "x/y", "dataset", set())
         try:
-            assert pull_stage0(cfg) is True
-            assert s0.finished(cfg) is not None
+            ensure_origin_stage0(cfg)
+            raise AssertionError("phải DỪNG khi không có Stage 0 gốc")
+        except OriginStage0Missing:
+            pass
         finally:
             HS._api_and_index = o1
-        # (2) không có bản cục bộ -> Hub: $2.2.2 chưa có, rơi về $2.2
+        # (1) bản cục bộ của gốc -> chép, KHÔNG hỏi Hub, ghi origin.json
+        make(td / "old" / s0.DIRNAME, 1)
+
+        def no_hub(_c):
+            raise AssertionError("không được hỏi Hub khi bản cục bộ của gốc dùng được")
+        HS._api_and_index = no_hub
+        try:
+            rec = ensure_origin_stage0(cfg)
+            assert rec["source"].startswith("local:")
+            want = F.sha256_file(td / "old" / s0.DIRNAME / s0.CKPT / R.STAGE0_FILE)
+            assert rec["sha256_final"] == want == F.sha256_file(ck(cfg))
+            assert ensure_origin_stage0(cfg)["sha256_final"] == want   # lần 2: dùng luôn
+            # (2) Stage 0 LẠ (ai đó chạy DINO ở đây) -> bị ghi đè bằng bản gốc
+            (s0.stage0_dir(cfg) / "origin.json").unlink()
+            make(s0.stage0_dir(cfg), 2)
+            assert F.sha256_file(ck(cfg)) != want
+            ensure_origin_stage0(cfg)
+            assert F.sha256_file(ck(cfg)) == want
+        finally:
+            HS._api_and_index = o1
+        # (3) không có bản cục bộ -> Hub của GỐC ($2.2), không phải $2.2.2
         hub = td / "hub"
-        make(hub)
+        make(hub, 3)
         remote = {f"current/$2.2_V-Extractor_Test/stage0/{r}"
                   for r in s0.KEEP if (hub / r).exists()}
         got = []
@@ -1820,11 +1846,20 @@ def _():
         HS._api_and_index = lambda _c: (object(), "x/y", "dataset", remote)
         HS._download = fake_dl
         try:
-            assert pull_stage0(c2) is True
-            assert s0.finished(c2) is not None
+            rec = ensure_origin_stage0(c2)
+            assert rec["source"] == "hub:current/$2.2_V-Extractor_Test/stage0"
             assert got and all(p.startswith("current/$2.2_V-Extractor_Test/") for p in got)
+            assert F.sha256_file(ck(c2)) == F.sha256_file(hub / s0.CKPT / R.STAGE0_FILE)
+            assert not any(p.name.endswith(".origin_tmp") for p in (td / "new2").iterdir())
         finally:
             HS._api_and_index, HS._download = o1, o2
+    # (4) config THẬT: bắt buộc gốc, --restage0 bị từ chối trước khi đụng gì
+    from src.config import load_config
+    real = load_config(ROOT / "configs/vextractor.yaml")
+    assert origin_required(real)
+    assert real["output"]["stage0_from"]["hub_index"] == "2.2"
+    assert main(["train", "--restage0", "--config",
+                 str(ROOT / "configs/vextractor.yaml")]) == 2
 
 
 @check("19. Lens chạy thật (mô hình giả): 5 mẫu seed cố định; Vision = Grad-CAM (dòng 1 Extractor, dòng 2 V_c[i], pager) ra HTML; Language = lưới 3×5 thang màu chung + đường đứt lớp sâu nhất + ma trận Q ↔ bệnh lý top-p")

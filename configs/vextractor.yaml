@@ -586,10 +586,13 @@ output:
   pull: true
   subdir: "vextractor_snop"
   adapter_dir: ./adapters_vextractor_snop
-  # Stage 0 KHÔNG đổi (chỉ phụ thuộc backbone + khối stage0 + seed) -> dùng LẠI
-  # của §2.2: bản cục bộ `<adapter_dir>/_stage0` trước, rồi Hub `$2.2_V-Extractor_Test/stage0`.
-  # Vân tay vẫn được so như cũ; lệch thì Stage 0 chạy lại.
+  # Stage 0 = ĐÚNG checkpoint Stage 0 của §2.2 gốc (CnA MHA) — KHÔNG bao giờ
+  # chạy DINO ở đây (`run_vextractor.ensure_origin_stage0`). Nguồn: bản cục bộ
+  # `<adapter_dir>/_stage0` của gốc trước, rồi Hub `$2.2_V-Extractor_Test/stage0`
+  # (chỉ `final/` đã xong, khớp vân tay). Không lấy được -> DỪNG. `--restage0`
+  # bị từ chối; bản chép mang `_stage0/origin.json` (nguồn + sha256).
   stage0_from:
+    required: true
     adapter_dir: ./adapters_vextractor
     hub_index: "2.2"
     hub_title: V-Extractor
