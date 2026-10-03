@@ -818,7 +818,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} · "
                   f"CnA {gn_br or 0:.3f} · lr LoRA {lr_now:.2e} · lr CnA "
                   f"ffn {alr:.2e} self {alr_self:.2e} cross {alr_cross:.2e} · "
-                  f"Z che {0 if z_drop is None else int(z_drop.numel())}",
+                  f"Z che {0 if z_drop is None else int(z_drop.numel())}"
+                  + ("" if not (_gs := branch.cna.snop_gates()) else
+                     " · SNOP g " + " ".join(f"{v:.4f}" for v in _gs.values())),
                   flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
@@ -833,6 +835,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                              f"train/{aid}/grad_norm_lora": gn_lora,
                              f"train/{aid}/grad_norm_branch": gn_br,
                              f"train/{aid}/pct": 100.0 * (step + 1) / steps,
+                             **{f"train/{aid}/snop_g/{k}": v
+                                for k, v in branch.cna.snop_gates().items()},
                              **vram_mod.device_usage()})
 
     pf.close()
@@ -881,6 +885,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         "val_loss_last": val_curve[-1]["loss"] if val_curve else None,
         "train_loss_first": first_loss, "train_loss": step_ce, "ce_last": step_ce,
         "q_rms_rel_last": rel_last,
+        "snop_gates_last": branch.cna.snop_gates(),   # {} với MHA thuần
         "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2), "seed": seed,
     }
     (out_dir / "train_stats.json").write_text(

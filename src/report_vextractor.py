@@ -80,7 +80,11 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
     pd.DataFrame(rows).to_csv(mdir / "summary.csv", index=False)
 
     L = []
-    L.append("# §2.2 V-Extractor — [Z ‖ T] vs [Z ‖ Q ‖ T]\n")
+    _o = dict(cfg.get("output") or {})
+    _sec = f"§{_o.get('hub_index', '2.2')} {_o.get('hub_title', 'V-Extractor')}"
+    _attn = str(dict(z.get("cna") or {}).get("attn", "mha"))
+    L.append(f"# {_sec} — [Z ‖ T] vs [Z ‖ Q ‖ T]"
+             + (" (CnA: SNOP-MHA)" if _attn == "snop" else "") + "\n")
     L.append(f"_Ghi đè lúc {datetime.now(timezone.utc).isoformat(timespec='seconds')} · "
              f"{manifest.get('n_eval', '?')} ảnh test ghép cặp · tham chiếu (A) = "
              f"`{a}`, Δ = B − A._\n")
@@ -89,7 +93,7 @@ def write_all(cfg, run_dir: Path, adapter_root: Path, scores: dict, tests: pd.Da
 
     L.append("## A và B khác nhau ở đâu\n")
     L.append(_tbl(["", f"A `{a}`", f"B `{b}`"], [
-        ["nguồn", f"{A['source']} (không huấn luyện lại)", "§2.2"],
+        ["nguồn", f"{A['source']} (không huấn luyện lại)", _sec],
         ["base / adapter", "Gemma 3 4B NF4 · QLoRA r32 α64 · mọi Linear decoder",
          "**giống A**"],
         ["dữ liệu / thứ tự / batch", "fixture $1 · randperm(seed) · "

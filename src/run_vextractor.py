@@ -4,7 +4,7 @@
     python -m src.run_vextractor stats   # bootstrap ghép cặp + permutation -> REPORT.md (GHI ĐÈ)
     python -m src.run_vextractor lens    # mổ khối Q trên 5 ảnh (seed cố định) -> Lens/
                                        # Lens_Vision.html (Grad-CAM) + Lens_Language.md
-    python -m src.run_vextractor push    # -> <hub_repo>/current/$2.2_V-Extractor_Test/
+    python -m src.run_vextractor push    # -> <hub_repo>/current/$2.2.2_V-Extractor-SNOP-MHA_Test/
     python -m src.run_vextractor all     # train -> stats -> push
 
     python -m src.run_vextractor train --dry-run     # 8 ảnh, 16 mẫu train, vài bước
@@ -39,6 +39,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import Cfg, add_common_args, load_config, resolved_snapshot, seed_everything
+from .push import hub_dir_name as _hub_dir_name
 
 COMMANDS = {
     "train": ["data", "stage0", "train", "infer", "score"],
@@ -107,7 +108,7 @@ def arms_of(cfg: Cfg) -> tuple[dict, dict]:
          "rank": int(b["rank"]), "target": "decoder",
          "target_modules": list(b["target_modules"]), "vextractor": False, "source": src}
     B = dict(A, id=c["id"], name=c.get("name", c["id"]), vextractor=True,
-             source="$2.2")
+             source=f"${str(dict(cfg.get('output') or {}).get('hub_index', '2.2')).strip()}")
     return A, B
 
 
@@ -242,13 +243,40 @@ def pull_stage0(cfg: Cfg, base_only: bool = False) -> bool:
         return False
     if base_only and s0.base_finished(cfg) is not None:
         return False              # đã có base cục bộ
+    src = dict(dict(cfg["output"]).get("stage0_from") or {})
+    # (0) Thí nghiệm con (vd. $2.2.2 SNOP-MHA) dùng LẠI Stage 0 của thí nghiệm
+    #     gốc: Stage 0 chỉ phụ thuộc backbone + khối `stage0` + seed, không phụ
+    #     thuộc CnA. Bản cục bộ của thí nghiệm gốc được thử TRƯỚC Hub.
+    if not base_only and src.get("adapter_dir"):
+        c_src = Cfg(copy.deepcopy(dict(cfg)))
+        c_src["output"] = dict(c_src["output"], adapter_dir=str(src["adapter_dir"]))
+        d_src, d = s0.stage0_dir(c_src), s0.stage0_dir(cfg)
+        if d_src.resolve() != d.resolve() and s0.finished(c_src) is not None:
+            d.mkdir(parents=True, exist_ok=True)
+            for r in s0.KEEP:
+                if (d_src / r).exists():
+                    (d / r).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(d_src / r, d / r)
+            if s0.finished(cfg) is not None:
+                print(f"  ⇐ Stage 0 chép từ bản cục bộ {d_src}", flush=True)
+                return True
     try:
         api, repo_id, repo_type, remote = _api_and_index(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"  ⚠ không đọc được Hub ({e!r}) — Stage 0 sẽ chạy cục bộ", flush=True)
         return False
-    base = hub_base(cfg)
-    have = [r for r in s0.KEEP if f"{base}/stage0/{r}" in remote]
+    bases = [hub_base(cfg)]
+    if src.get("hub_index") is not None and src.get("hub_title"):
+        c_hub = Cfg(copy.deepcopy(dict(cfg)))
+        c_hub["output"] = dict(c_hub["output"], hub_index=str(src["hub_index"]),
+                               hub_title=str(src["hub_title"]))
+        bases.append(hub_base(c_hub))
+    base, have = bases[0], []
+    for b_ in bases:
+        have = [r for r in s0.KEEP if f"{b_}/stage0/{r}" in remote]
+        if s0.HISTORY in have:
+            base = b_
+            break
     if api is None or s0.HISTORY not in have:
         return False
     d = s0.stage0_dir(cfg)
@@ -411,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
     mpath = run_dir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8")) if mpath.exists() else {}
     manifest.update({"run_id": run_dir.name, "experiment": "vextractor",
-                     "test": "$2.2_V-Extractor_Test",
+                     "test": _hub_dir_name(dict(cfg["output"])),
                      "config": resolved_snapshot(cfg), "env": _env_info(),
                      "arms": [A, B], "reference": A["id"],
                      "variable": "[Z ‖ T] (A) vs [Z ‖ Q ‖ T], Q = "

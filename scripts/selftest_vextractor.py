@@ -1028,14 +1028,14 @@ def _():
     assert t.loc["m_same", "winner"] == "—"
 
 
-@check("9. Hub: A từ current/$1_LoRA_Test, B vào current/$2.2_V-Extractor_Test")
+@check("9. Hub: A từ current/$1_LoRA_Test, B vào current/$2.2.2_V-Extractor-SNOP-MHA_Test")
 def _():
     from src.config import load_config
     from src.push import hub_base
     from src.run_vextractor import arms_of, baseline_cfg
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
-    assert hub_base(cfg) == "current/$2.2_V-Extractor_Test", hub_base(cfg)
+    assert hub_base(cfg) == "current/$2.2.2_V-Extractor-SNOP-MHA_Test", hub_base(cfg)
     assert hub_base(baseline_cfg(cfg)) == "current/$1_LoRA_Test"
     A, B = arms_of(cfg)
     old = load_config(ROOT / "_archive/v2/configs/lora.yaml")
@@ -1043,7 +1043,7 @@ def _():
     assert r32 and int(r32[0]["rank"]) == A["rank"] == B["rank"] == 32
     assert A["target_modules"] == old["lora_exp"]["targets"][r32[0]["target"]]
     assert B["target_modules"] == A["target_modules"]
-    assert B["vextractor"] and not A["vextractor"] and B["source"] == "$2.2"
+    assert B["vextractor"] and not A["vextractor"] and B["source"] == "$2.2.2"
 
 
 @check("10. src/ không import _archive/run_lora; runner sinh bằng Q")
@@ -1119,7 +1119,7 @@ def _():
         for f in ("adapter_model.safetensors", "adapter_config.json", "train_stats.json"):
             (bdir / f).write_text("x")
         plan = {p for p, _f, _k in local_plan(cfg, Path(t) / "run", [aid])}
-        base = "current/$2.2_V-Extractor_Test"
+        base = "current/$2.2.2_V-Extractor-SNOP-MHA_Test"
         for r in s0.KEEP:
             assert f"{base}/stage0/{r}" in plan, r
         assert not any("/stage1/" in p for p in plan)   # không còn Stage 1
@@ -1756,6 +1756,77 @@ def _():
         _ = RV
 
 
+@check("18b. thí nghiệm con ($2.2.2) dùng LẠI Stage 0 của $2.2: chép bản cục bộ "
+       "`stage0_from.adapter_dir` trước; không có thì kéo Hub `$2.2_…/stage0`")
+def _():
+    import json
+
+    from src import stage0_vextractor as s0
+    from src import vextractor as R
+    from src.config import Cfg
+    from src.run_vextractor import pull_stage0
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        out = {"adapter_dir": str(td / "new"), "hub_repo": "x/y",
+               "hub_repo_type": "dataset", "hub_root": "current",
+               "hub_index": "2.2.2", "hub_title": "V-Extractor-SNOP-MHA",
+               "stage0_from": {"adapter_dir": str(td / "old"),
+                               "hub_index": "2.2", "hub_title": "V-Extractor"}}
+        cfg = Cfg(json.loads(json.dumps({
+            "seed": 42,
+            "stage0": {"lr_min": 1e-7, "lr_max": 1e-4,
+                       "warmup_epochs": 1.0, "max_epochs": 3},
+            "vextractor": small_cfg()["vextractor"], "output": out})))
+        sp = R.spec_from_cfg(cfg, 32)
+        h = {"finished": True, "base_finished": True, "base_epoch": 2,
+             "best_epoch": 2, "stage0": dict(s0.s0cfg(cfg)), "spec": sp, "seed": 42,
+             "base_fingerprint": s0.base_fingerprint(cfg),
+             "config_fingerprint": s0.config_fingerprint(cfg)}
+
+        def make(root: Path):
+            for sub in (s0.BASE, s0.CKPT):
+                R.save_stage0(R.build_backbone(sp)[0], sp, root / sub, {"best_epoch": 2})
+            (root / s0.HISTORY).write_text(json.dumps(h, default=str), encoding="utf-8")
+
+        # (1) bản cục bộ của $2.2 -> chép, KHÔNG hỏi Hub
+        make(td / "old" / s0.DIRNAME)
+        import src.hub_sync as HS
+        o1, o2 = HS._api_and_index, HS._download
+
+        def no_hub(_c):
+            raise AssertionError("không được hỏi Hub khi bản cục bộ dùng được")
+        HS._api_and_index = no_hub
+        try:
+            assert pull_stage0(cfg) is True
+            assert s0.finished(cfg) is not None
+        finally:
+            HS._api_and_index = o1
+        # (2) không có bản cục bộ -> Hub: $2.2.2 chưa có, rơi về $2.2
+        hub = td / "hub"
+        make(hub)
+        remote = {f"current/$2.2_V-Extractor_Test/stage0/{r}"
+                  for r in s0.KEEP if (hub / r).exists()}
+        got = []
+
+        def fake_dl(_api, _repo, _typ, path, dest):
+            got.append(path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes((hub / path.split("/stage0/", 1)[1]).read_bytes())
+        c2 = Cfg(json.loads(json.dumps(dict(cfg))))
+        c2["output"] = dict(c2["output"], adapter_dir=str(td / "new2"),
+                            stage0_from=dict(out["stage0_from"],
+                                             adapter_dir=str(td / "none")))
+        HS._api_and_index = lambda _c: (object(), "x/y", "dataset", remote)
+        HS._download = fake_dl
+        try:
+            assert pull_stage0(c2) is True
+            assert s0.finished(c2) is not None
+            assert got and all(p.startswith("current/$2.2_V-Extractor_Test/") for p in got)
+        finally:
+            HS._api_and_index, HS._download = o1, o2
+
+
 @check("19. Lens chạy thật (mô hình giả): 5 mẫu seed cố định; Vision = Grad-CAM (dòng 1 Extractor, dòng 2 V_c[i], pager) ra HTML; Language = lưới 3×5 thang màu chung + đường đứt lớp sâu nhất + ma trận Q ↔ bệnh lý top-p")
 def _():
     import json
@@ -2382,8 +2453,87 @@ def _():
     tr2.train()
     assert all(m.training for m in tr2.bn_modules())
 
+@check("26. SNOP-MHA: Y = [I − σ(w)·(Õ ⊙ M_cross)]·O khớp công thức; g → 0 là MHA thuần; "
+       "token trực giao không bị đụng; gần collapse nhân phần chung 1 − (N−1)g; w_head "
+       "nhận gradient, đi đúng nhóm lr, không tiêu RNG; config thật bật SNOP ở cả 3 attention")
+def _():
+    import torch
+    import torch.nn.functional as F
+
+    from src import vextractor as R
+    from src.config import load_config
+
+    MHA = R.MultiHeadAttention
+    torch.manual_seed(0)
+    # (a) đúng công thức, dựng tay
+    o = torch.randn(2, 8, 16)
+    g = torch.sigmoid(torch.tensor(0.3))
+    u = F.normalize(o, dim=-1)
+    S = (u @ u.transpose(1, 2)).square() * (1 - torch.eye(8))
+    ref = (torch.eye(8) - g * S) @ o
+    assert torch.allclose(MHA.snop_mix(o, g), ref, atol=1e-5)
+    # (b) g -> 0: MHA thuần, và w_head KHÔNG tiêu RNG (chiếu q/k/v/o y hệt)
+    torch.manual_seed(1)
+    a = MHA(16, 4, None)
+    torch.manual_seed(1)
+    b = MHA(16, 4, None, snop=True, w_init=-60.0)
+    for n_ in ("q", "k", "v", "o"):
+        assert torch.equal(getattr(a, n_).weight, getattr(b, n_).weight), n_
+    x = torch.randn(2, 8, 16)
+    assert torch.allclose(a(x), b(x), atol=1e-6)
+    # (c) token trực giao: cos² = 0 -> không trừ gì
+    o = 3 * torch.eye(8).unsqueeze(0)
+    assert torch.equal(MHA.snop_mix(o, torch.tensor(0.9)), o)
+    # (d) collapse hoàn toàn (8 hàng song song): phần chung × (1 − 7g)
+    g = torch.sigmoid(torch.tensor(-3.0))
+    y = MHA.snop_mix(torch.ones(1, 8, 4), g)
+    assert torch.allclose(y, torch.full_like(y, 1 - 7 * float(g)), atol=1e-6)
+    # (e) gradient tới w_head (cổng chưa bão hoà) và cả Õ
+    c = MHA(16, 4, None, snop=True, w_init=0.0)
+    c(torch.randn(2, 8, 16)).square().sum().backward()
+    assert c.w_head.grad is not None and float(c.w_head.grad.abs()) > 0
+    # (f) cross-attn: N = số query, không phải số patch
+    cr = MHA(16, 4, 12, snop=True)
+    assert cr(torch.randn(2, 8, 16), torch.randn(2, 50, 12)).shape == (2, 8, 16)
+    # (g) CnA SNOP: 3 cổng / nhóm, nằm trong self/cross, phân hoạch còn kín
+    spec = R.spec_from_cfg({"vextractor": {
+        **small_cfg()["vextractor"],
+        "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop", snop_w_init=-3.0)}}, 32)
+    br = R.VExtractorBranch(spec)
+    gates = br.cna.snop_gates()
+    assert len(gates) == 3 * SMALL_NB, gates
+    assert all(abs(v - float(torch.sigmoid(torch.tensor(-3.0)))) < 1e-6
+               for v in gates.values())
+    ws = {id(m.w_head) for m in br.cna.modules()
+          if isinstance(m, MHA) and m.w_head is not None}
+    ids = lambda it: {id(p) for p in it}  # noqa: E731
+    assert ws <= ids(br.cna.self_parameters()) | ids(br.cna.cross_parameters())
+    assert not ws & ids(br.cna.ffn_parameters())
+    allp = (list(br.cna.self_parameters()) + list(br.cna.cross_parameters())
+            + list(br.cna.ffn_parameters()))
+    assert len(allp) == len({id(p) for p in allp}) == len(list(br.cna.parameters()))
+    npar = br.n_params()
+    assert npar["cna_snop_gates"] == 3 * SMALL_NB
+    assert br(torch.randn(2, 3, SMALL_IMG, SMALL_IMG)).shape == (2, SMALL_Q, 32)
+    # (h) spec mặc định (khoá vắng) = MHA thuần; khoá sai bị từ chối
+    assert R.spec_from_cfg(small_cfg(), 32)["cna"]["attn"] == "mha"
+    try:
+        R.spec_from_cfg({"vextractor": {**small_cfg()["vextractor"], "cna": dict(
+            small_cfg()["vextractor"]["cna"], attn="softmax")}}, 32)
+        raise AssertionError("attn lạ phải bị từ chối")
+    except R.VExtractorUnusable:
+        pass
+    # (i) config THẬT: SNOP bật, g₀ < 1/(n_query − 1) (không đảo dấu phần chung)
+    cfg = load_config(ROOT / "configs/vextractor.yaml")
+    cn = cfg["vextractor"]["cna"]
+    assert cn["attn"] == "snop"
+    g0 = float(torch.sigmoid(torch.tensor(float(cn["snop_w_init"]))))
+    assert g0 < 1.0 / (int(cn["n_query"]) - 1), g0
+    assert R.FORMAT == "rgexp.vextractor/19"
+
+
 print()
 if FAILS:
     print(f"✗ {len(FAILS)} kiểm tra HỎNG: {FAILS}")
     sys.exit(1)
-print("✓ selftest §2.2 V-Extractor qua hết")
+print("✓ selftest §2.2.2 V-Extractor SNOP-MHA qua hết")

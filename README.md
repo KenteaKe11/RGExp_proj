@@ -1,11 +1,13 @@
 # RGExp — nhánh bổ sung thị giác chất lượng cao
 
+> **§2.2.2 — V-Extractor SNOP-MHA** (thí nghiệm con thứ 2 của §2.2). Giữ nguyên mọi cấu hình của §2.2; chỉ đổi **mọi attention của CnA** (SelfAttn khối 1, CrossAttn, SelfAttn khối 2) từ MHA sang **SNOP-MHA** (§2.2.1). Kết quả đẩy lên `current/$2.2.2_V-Extractor-SNOP-MHA_Test/`; `$2.2_V-Extractor_Test` không bị ghi đè.
+
 Nhánh thị giác bổ sung 8 token ảnh vào đầu vào Gemma 3. Ảnh cũng tiếp tục đi qua nhánh vision gốc của Gemma; nhánh này chỉ thêm tín hiệu thị giác chất lượng cao.
 
 ```text
 Ảnh 448×448
   └─ Extractor: DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`) → concat 3 block cuối → V (784, 1152)
-       └─ CnA (Compressor & Aligner): QFormer, 8 latent @1536 → RMSNorm + Linear 1536→2560 → V_c (8, 2560)
+       └─ CnA (Compressor & Aligner): QFormer (SNOP-MHA), 8 latent @1536 → RMSNorm + Linear 1536→2560 → V_c (8, 2560)
             └─ Gemma: [Z ‖ V_c ‖ văn bản]   (huấn luyện: che ngẫu nhiên 25% token Z mỗi weight update)
 ```
 
@@ -49,26 +51,44 @@ Stage 0 nạp trọng số `dinov3-vits16-pretrain` rồi fine-tune tiếp bằn
 | 1st block | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁` |
 | 2nd block | `Q₁ → SelfAttn(Q₁) → FFN → Q_final` |
 | Linear project cuối | có — `RMSNorm + Linear 1536→2560` (có bias, init `1/√fan_in`) |
+| Attention | **SNOP-MHA** ở cả 3 lớp (`cna.attn: snop`), mỗi lớp một cổng `w_head`, `g₀ = σ(−3) ≈ 0,047` (`cna.snop_w_init`) |
 | Head_dim | `head_dim` = 128 (suy ra 12 head) |
 | FFN | `SwiGLU 1536→2048→1536` (mult = 2 theo quy ước 2/3 của SwiGLU: 2/3 × 2 × 1536 = 2048) |
 | All_Block | `(1st → 2nd)`, **N = 1** (`n_blocks: 1`) |
-| Params | **46,03 M** (QFormer) + **3,94 M** (Linear cuối) = **49,96 M** |
+| Params | **46,03 M** (QFormer, gồm 3 cổng vô hướng `w_head`) + **3,94 M** (Linear cuối) = **49,96 M** |
 | Kí hiệu đầu ra | `V_c` → `V_c (8, 2560)` |
 
 ```text
 kv  = RMSNorm(V)                                   # 1152
 h   = latent                                       # 8 latent × 1536
-h   = h + SelfAttn(N(h))                           # khối 1
-h   = h + CrossAttn(N(h), kv)                      #   (k, v: 1152 → 1536)
+h   = h + SNOP-SelfAttn(N(h))                      # khối 1
+h   = h + SNOP-CrossAttn(N(h), kv)                 #   (k, v: 1152 → 1536)
 h   = h + SwiGLU(N(h))
-h   = h + SelfAttn(N(h))                           # khối 2 (không đọc ảnh)
+h   = h + SNOP-SelfAttn(N(h))                      # khối 2 (không đọc ảnh)
 h   = h + SwiGLU(N(h))
 V_c = Linear(RMSNorm(h))                           # 1536 → 2560
 ```
 
 Bảng tham số của CnA: SelfAttn 2 × 4 × 1536² = 18,87 M · CrossAttn 2 × 1536² + 2 × 1152 × 1536 = 8,26 M · SwiGLU 2 × 3 × 1536 × 2048 = 18,87 M · năm RMSNorm(1536) → nhóm (khối 1 → khối 2) là **46,01 M**; cộng 8 latent (12 288) và `RMSNorm(1152)` trên V thành phần QFormer **46,03 M** (≈ 46,25 M của đặc tả); Linear cuối kèm RMSNorm của nó thêm **3,94 M**, nên CnA là **49,96 M**. Cấu hình FFN là `vextractor.cna.mlp_hidden`.
 
-> Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config).
+> Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config). SNOP thêm đúng 3 tham số (49 963 648 → 49 963 651).
+
+#### 2.2.1. SNOP-MHA — Soft Non-Orthogonality Penalty
+
+Chống trùng lặp token (gần collapse) giữa 8 latent mà **không** thêm Entropy hay Orthogonal Regularization. Chèn giữa phép ghép head và chiếu `W_o`:
+
+```text
+O     = Concat(A_1 V_1, …, A_H V_H)              (N, H·d_v)     N = 8 query
+Õ     = [Norm(O) · Norm(O)ᵀ]^∘2                  (N, N)         cos² giữa hai token
+Y     = [I − σ(w_head) · (Õ ⊙ M_cross)] · O                     M_cross = 1 − I
+out   = W_o · Y
+```
+
+* `w_head ∈ ℝ` — một vô hướng mỗi lớp, cổng `g = σ(w_head)`. `g → 0` là MHA thuần. `w_head` đi cùng nhóm lr của lớp chứa nó (SelfAttn → `self`, CrossAttn → `cross`), nên ba nhóm lr vẫn là một phân hoạch của CnA.
+* `M_cross` bỏ đường chéo: hàng i là `O_i − g · Σ_{j≠i} cos²(O_i, O_j) · O_j`, token giữ nguyên phần riêng, chỉ bị trừ phần giao với token khác. Cos² gần như tắt phép trừ với các token đã khác hướng.
+* Biến đổi **forward**, không phải loss: gradient của task loss đi qua `Y` về `O`, `Õ` và `w_head`. Õ tính ở fp32 (tắt autocast).
+* **Giới hạn.** Khi K hàng gần song song (đúng trạng thái bước 0, vì attention gần đều), thành phần chung bị nhân `1 − (K−1)·g`: với K = 8, `g > 1/7` là **đảo dấu** nó. Vì vậy `w_head` khởi tạo −3 (`1 − 7g ≈ 0,67`). Với ~200 bước ở lr 1e-5…4e-5, Adam chỉ dịch `w_head` cỡ 1e-2, nên `g` thực tế giữ quanh `g₀` suốt main stage — `snop_w_init` là một siêu tham số. Cơ chế không tạo thêm hạng khi các token đã song song hoàn toàn.
+* `g` của từng lớp được in mỗi `logging_steps`, log lên W&B (`train/<arm>/snop_g/*`) và ghi vào `train_stats.json` (`snop_gates_last`).
 
 ### 2.3. Bảng tham số
 
@@ -132,4 +152,4 @@ bash scripts/run_vextractor.sh train --detach
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
 
-> Checkpoint **Stage 0** (Extractor DINOv3 ViT-S/16 @448) giữ nguyên và nạp lại từ HF — cấu hình này chỉ đổi cách đọc backbone (concat 3 block cuối) và CnA. Checkpoint **main stage** cũ (V 384 kênh, CnA @1024 × N = 2) **không nạp được** (khác hình dạng CnA, `FORMAT` = `rgexp.vextractor/18`), nên main stage phải chạy lại; **không** cần `--restage0`.
+> Checkpoint **Stage 0** (Extractor DINOv3 ViT-S/16 @448) **dùng lại của §2.2**, không chạy lại DINO: `output.stage0_from` chép bản cục bộ `./adapters_vextractor/_stage0` nếu có, không thì kéo `current/$2.2_V-Extractor_Test/stage0` (vân tay vẫn được so; lệch thì Stage 0 chạy lại). Checkpoint **main stage** của §2.2 **không nạp được** (`FORMAT` = `rgexp.vextractor/19`, spec có `cna.attn`), nên main stage chạy lại vào `./adapters_vextractor_snop` / `runs/vextractor_snop`; **không** cần `--restage0`.

@@ -283,7 +283,7 @@ vextractor_exp:
   retrain_all: false
   candidate:
     id: qlora_r32_decoder_vextractor
-    name: "QLoRA r=32 · full decoder + V-Extractor (Q)"
+    name: "QLoRA r=32 · full decoder + V-Extractor SNOP-MHA (Q)"
 
 # ── Nhãn bệnh lý — CHỈ CHO LENS (csv_helper/labels.npz, `src/labels_cls.py`) ──
 # Stage 0 là TỰ GIÁM SÁT và KHÔNG đọc nhãn nào. Khối này chỉ còn
@@ -336,6 +336,18 @@ vextractor:
     n_blocks: 1             # All_Block = (1st → 2nd) một lần
     final_proj: true        # RMSNorm + Linear 1536 -> 2560 (d_model của Gemma 3 4B)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
+    # ── §2.2.2 SNOP-MHA (Soft Non-Orthogonality Penalty) ─────────────────────
+    # MỌI attention của CnA (SelfAttn khối 1, CrossAttn, SelfAttn khối 2):
+    #   O = Concat(A_h V_h) (N=8, H·d_v);  Õ = [Norm(O)·Norm(O)ᵀ]^∘2
+    #   Y = [I − σ(w_head)·(Õ ⊙ M_cross)]·O  -> chiếu o.   M_cross = 1 − I.
+    # w_head: MỘT vô hướng mỗi lớp, đi cùng nhóm lr của lớp (self / cross).
+    # `mha` = MHA thuần (§2.2). Không có loss phụ nào (không Entropy/Orthogonal).
+    attn: snop
+    # g₀ = σ(−3) ≈ 0.047. Khi 8 hàng O gần song song (attention gần đều — đúng
+    # trạng thái bước 0) thành phần chung bị nhân 1 − 7g: g > 1/7 là ĐẢO DẤU nó.
+    # Với ~200 bước ở lr 1e-5..4e-5, Adam chỉ dịch w_head cỡ 1e-2 -> g gần như
+    # giữ nguyên g₀ suốt main stage: số này thực chất là siêu tham số.
+    snop_w_init: -3.0
 
   # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
   # CnA khởi tạo ngẫu nhiên và HỌC CÙNG LoRA NGAY TỪ BƯỚC 0. Warm-up tuyến tính
@@ -547,17 +559,18 @@ wandb:
   project: rgexp-vextractor
   entity: null
   run_name: null
-  group: "vextractor-q"
+  group: "vextractor-q-snop"
   resume_same_run: false
   mode: online
-  tags: [vextractor, dinov3-vits16, cna-qformer, qlora, r32, mimic-cxr]
+  tags: [vextractor, dinov3-vits16, cna-qformer, snop-mha, qlora, r32, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20
 
 output:
   dir: ./runs
-  # Repo CŨ, không tạo repo mới -> current/$2.2_V-Extractor_Test/
+  # Repo CŨ, không tạo repo mới -> current/$2.2.2_V-Extractor-SNOP-MHA_Test/
+  # (thí nghiệm con thứ 2 của §2.2: CnA dùng SNOP-MHA; $2.2 KHÔNG bị ghi đè)
   #   Reports/                 REPORT.md, manifest, metrics, predictions, arms/ (tem)
   #   fixture/                 = fixture của $1 (cùng vân tay)
   #   weights/<B>/             adapter + vextractor_branch + vextractor_stage0 + train_stats
@@ -566,10 +579,17 @@ output:
   hub_repo: RGExp123/Research_results
   hub_repo_type: dataset
   hub_root: current
-  hub_index: "2.2"
-  hub_title: V-Extractor
+  hub_index: "2.2.2"
+  hub_title: V-Extractor-SNOP-MHA
   push: true
   push_each_arm: true
   pull: true
-  subdir: "vextractor"
-  adapter_dir: ./adapters_vextractor
+  subdir: "vextractor_snop"
+  adapter_dir: ./adapters_vextractor_snop
+  # Stage 0 KHÔNG đổi (chỉ phụ thuộc backbone + khối stage0 + seed) -> dùng LẠI
+  # của §2.2: bản cục bộ `<adapter_dir>/_stage0` trước, rồi Hub `$2.2_V-Extractor_Test/stage0`.
+  # Vân tay vẫn được so như cũ; lệch thì Stage 0 chạy lại.
+  stage0_from:
+    adapter_dir: ./adapters_vextractor
+    hub_index: "2.2"
+    hub_title: V-Extractor

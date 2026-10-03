@@ -40,7 +40,9 @@ BACKBONE_CFG_KEYS = ("arch", "pretrained", "n_layers", "n_stages")
 # KHÔNG bắt chạy lại Stage 0 (checkpoint Stage 0 trên Hub vẫn dùng được).
 EXT_CFG_KEYS = (*BACKBONE_CFG_KEYS, "image_size", "out_layers")
 CNA_CFG_KEYS = ("n_query", "d_latent", "head_dim", "mlp_hidden", "n_blocks",
-                "final_proj", "dropout")
+                "final_proj", "dropout", "attn", "snop_w_init")
+# `attn` của CnA: `mha` (thuần) hoặc `snop` (SNOP-MHA, xem `MultiHeadAttention`).
+ATTN_KINDS = ("mha", "snop")
 
 # Checkpoint Stage 0 chỉ chứa TRỌNG SỐ BACKBONE. Những thế hệ trước `/5` lưu cả
 # một Cls Head có giám sát vào cùng file, nên tập tensor khác hẳn và KHÔNG nạp
@@ -70,7 +72,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì CnA KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/18"
+FORMAT = "rgexp.vextractor/19"   # /19: SNOP-MHA (w_head trong mọi attention của CnA)
 
 
 class VExtractorUnusable(RuntimeError):
@@ -86,10 +88,32 @@ class MultiHeadAttention(nn.Module):
     (mọi chiếu đều `d_model → d_model`).
 
     Không bias ở cả bốn chiếu, như Q/K/V/O của Gemma 3.
+
+    `snop = True` -> **SNOP-MHA** (Soft Non-Orthogonality Penalty), chèn GIỮA
+    phép ghép head và chiếu `o`:
+
+        O     = Concat(A_1 V_1, …, A_H V_H)                 (B, N, H·d_v)
+        Õ     = [Norm(O) · Norm(O)ᵀ]^∘2                     (B, N, N)  cos² giữa token
+        Y     = [I − σ(w_head) · (Õ ⊙ M_cross)] · O         M_cross = 1 − I
+        out   = o(Y)
+
+    `Norm` = chuẩn hoá L2 theo hàng (cos giữa hai token query). `w_head` là MỘT
+    vô hướng mỗi lớp attention, cổng `g = σ(w_head)`: g → 0 là MHA thuần. Đây là
+    biến đổi FORWARD, không phải loss: gradient của task loss đi qua Y về O, Õ
+    và `w_head`.
+
+    Hàng i của Y: `O_i − g · Σ_{j≠i} cos²(O_i, O_j) · O_j` — đường chéo bị mặt nạ
+    nên token giữ nguyên phần riêng; cos² làm phép trừ gần như tắt với các token
+    đã khác hướng. Khi K hàng gần song song (attention gần đều — chính trạng thái
+    ở bước 0), thành phần chung bị nhân với `1 − g(K−1)`: g > 1/(K−1) là ĐẢO DẤU
+    nó. Vì thế `w_init` mặc định −3 (g ≈ 0.047, với K = 8: 1 − 7g ≈ 0.67).
+
+    `w_head` khởi tạo bằng `torch.full` — KHÔNG tiêu RNG, nên thứ tự khởi tạo
+    của mọi chiếu khác (và của LoRA) giữ nguyên so với MHA thuần.
     """
 
     def __init__(self, d_model: int, n_heads: int, d_kv: int | None = None,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, snop: bool = False, w_init: float = -3.0):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} không chia hết n_heads {n_heads}")
@@ -100,10 +124,35 @@ class MultiHeadAttention(nn.Module):
         self.v = nn.Linear(self.d_kv, self.d, bias=False)
         self.o = nn.Linear(self.d, self.d, bias=False)
         self.p = float(dropout)
+        self.snop = bool(snop)
+        self.w_head = (nn.Parameter(torch.full((), float(w_init)))
+                       if self.snop else None)
 
     def _split(self, t: torch.Tensor) -> torch.Tensor:
         b, n, _ = t.shape
         return t.view(b, n, self.h, self.d // self.h).transpose(1, 2)
+
+    def gate(self) -> torch.Tensor | None:
+        """g = σ(w_head), hoặc None với MHA thuần."""
+        return None if self.w_head is None else torch.sigmoid(self.w_head)
+
+    @staticmethod
+    def snop_mix(o: torch.Tensor, g: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Y = [I − g · (Õ ⊙ M_cross)] · O, với Õ = (Norm(O) Norm(O)ᵀ)^∘2.
+
+        o: (B, N, D). Tính Õ ở fp32 (cos² của bf16 lệch đủ để mặt nạ chéo và
+        ngưỡng "gần collapse" đáng ngờ), trả về đúng dtype của `o`.
+        """
+        # autocast TẮT: trong vùng bf16 autocast, `@` sẽ tự hạ về bf16 dù vào fp32.
+        with torch.autocast(device_type=o.device.type, enabled=False):
+            of = o.float()
+            u = F.normalize(of, dim=-1, eps=eps)
+            sim = (u @ u.transpose(-1, -2)).square()             # Õ (B, N, N)
+            n = sim.shape[-1]
+            sim = sim.masked_fill(
+                torch.eye(n, dtype=torch.bool, device=sim.device), 0.0)  # ⊙ M_cross
+            y = of - g.float() * (sim @ of)
+        return y.to(o.dtype)
 
     def forward(self, x: torch.Tensor, kv: torch.Tensor | None = None) -> torch.Tensor:
         kv = x if kv is None else kv
@@ -111,7 +160,10 @@ class MultiHeadAttention(nn.Module):
         y = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.p if self.training else 0.0)
         b, _, n, _ = y.shape
-        return self.o(y.transpose(1, 2).reshape(b, n, self.d))
+        o = y.transpose(1, 2).reshape(b, n, self.d)              # O = Concat(A_h V_h)
+        if self.snop:
+            o = self.snop_mix(o, self.gate())
+        return self.o(o)
 
 
 class SwiGLU(nn.Module):
@@ -622,19 +674,20 @@ class QFormerGroup(nn.Module):
     """
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, snop: bool = False, w_init: float = -3.0):
         super().__init__()
         d = int(d_latent)
+        att = {"snop": bool(snop), "w_init": float(w_init)}
         # khối 1
         self.n_self1 = RMSNorm(d)
-        self.self1 = MultiHeadAttention(d, n_heads, None, dropout)
+        self.self1 = MultiHeadAttention(d, n_heads, None, dropout, **att)
         self.n_cross = RMSNorm(d)
-        self.cross = MultiHeadAttention(d, n_heads, int(d_kv), dropout)
+        self.cross = MultiHeadAttention(d, n_heads, int(d_kv), dropout, **att)
         self.n_ffn1 = RMSNorm(d)
         self.ffn1 = SwiGLU(d, int(mlp_hidden), d)
         # khối 2
         self.n_self2 = RMSNorm(d)
-        self.self2 = MultiHeadAttention(d, n_heads, None, dropout)
+        self.self2 = MultiHeadAttention(d, n_heads, None, dropout, **att)
         self.n_ffn2 = RMSNorm(d)
         self.ffn2 = SwiGLU(d, int(mlp_hidden), d)
 
@@ -687,9 +740,14 @@ class CnA(nn.Module):
 
     def __init__(self, d_feat: int, d_model: int, n_query: int = 16,
                  d_latent: int = 1024, head_dim: int = 128, mlp_hidden: int = 2048,
-                 n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0):
+                 n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0,
+                 attn: str = "mha", snop_w_init: float = -3.0):
         super().__init__()
         self.d_feat, self.d_model = int(d_feat), int(d_model)
+        self.attn = str(attn)
+        if self.attn not in ATTN_KINDS:
+            raise ValueError(f"cna.attn = {attn!r}, nhận {list(ATTN_KINDS)}")
+        self.snop_w_init = float(snop_w_init)
         self.n_query = int(n_query)
         self.d_latent = int(d_latent)
         self.head_dim = int(head_dim)
@@ -716,7 +774,8 @@ class CnA(nn.Module):
         self.kv_norm = RMSNorm(self.d_feat)
         self.groups = nn.ModuleList([
             QFormerGroup(self.d_latent, self.n_heads, self.d_feat,
-                         self.mlp_hidden, dropout)
+                         self.mlp_hidden, dropout, snop=self.attn == "snop",
+                         w_init=self.snop_w_init)
             for _ in range(self.n_blocks)])
         if self.final_proj:
             self.n_proj = RMSNorm(self.d_latent)
@@ -735,14 +794,25 @@ class CnA(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     # ── BA nhóm lr của main stage: PHÂN HOẠCH mọi tham số ──────────────────
+    def snop_gates(self) -> dict:
+        """{tên lớp: g = σ(w_head)} của mọi SNOP-MHA (rỗng với MHA thuần)."""
+        out = {}
+        for i, g in enumerate(self.groups):
+            for name in ("self1", "cross", "self2"):
+                m = getattr(g, name)
+                if m.w_head is not None:
+                    out[f"g{i}.{name}"] = float(torch.sigmoid(m.w_head.detach()))
+        return out
+
     def self_parameters(self):
-        """Bốn chiếu của MỌI SelfAttn (2 mỗi nhóm) — lr 1e-8 -> 1e-5."""
+        """Bốn chiếu của MỌI SelfAttn (2 mỗi nhóm) — lr 1e-8 -> 1e-5.
+        Với SNOP-MHA, `w_head` của lớp đi CÙNG nhóm lr của lớp ấy."""
         for g in self.groups:
             for m in g.self_modules():
                 yield from m.parameters()
 
     def cross_parameters(self):
-        """Bốn chiếu của Cross-attn (q, k, v, o) — lr 4e-8 -> 4e-5."""
+        """Bốn chiếu của Cross-attn (q, k, v, o) (+ `w_head` nếu SNOP) — lr 4e-8 -> 4e-5."""
         for g in self.groups:
             for m in g.cross_modules():
                 yield from m.parameters()
@@ -777,11 +847,15 @@ class CnA(nn.Module):
     def describe(self) -> str:
         tail = (f" -> RMSNorm + Linear {self.d_latent}→{self.d_model}"
                 if self.final_proj else "")
+        a = ("SNOP-" if self.attn == "snop" else "")
+        gate = (f", SNOP g₀ = σ({self.snop_w_init:g}) = "
+                f"{1 / (1 + math.exp(-self.snop_w_init)):.3f}"
+                if self.attn == "snop" else "")
         return (f"CnA: RMSNorm({self.d_feat}) ‖ {self.n_query} latent "
-                f"@{self.d_latent} -> {self.n_blocks} × [SelfAttn -> "
-                f"CrossAttn(kv {self.d_feat}→{self.d_latent}) -> SwiGLU "
-                f"{self.d_latent}→{self.mlp_hidden}→{self.d_latent} │ SelfAttn "
-                f"-> SwiGLU] ({self.n_heads} head × head_dim {self.head_dim})"
+                f"@{self.d_latent} -> {self.n_blocks} × [{a}SelfAttn -> "
+                f"{a}CrossAttn(kv {self.d_feat}→{self.d_latent}) -> SwiGLU "
+                f"{self.d_latent}→{self.mlp_hidden}→{self.d_latent} │ {a}SelfAttn "
+                f"-> SwiGLU] ({self.n_heads} head × head_dim {self.head_dim}{gate})"
                 f"{tail} -> V_c ({self.n_query}, {self.d_model})")
 
 
@@ -902,8 +976,18 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 "mlp_hidden": int(cn.get("mlp_hidden", 2048)),
                 "n_blocks": int(cn.get("n_blocks", 1)),
                 "final_proj": bool(cn.get("final_proj", True)),
-                "dropout": float(cn.get("dropout", 0.0))},
+                "dropout": float(cn.get("dropout", 0.0)),
+                # khoá vắng = MHA thuần (đúng nghĩa của mọi config trước /19)
+                "attn": _attn_kind(cn.get("attn", "mha")),
+                "snop_w_init": float(cn.get("snop_w_init", -3.0))},
     }
+
+
+def _attn_kind(v) -> str:
+    k = str(v).strip().lower()
+    if k not in ATTN_KINDS:
+        raise VExtractorUnusable(f"vextractor.cna.attn = {v!r} — nhận {list(ATTN_KINDS)}.")
+    return k
 
 
 def n_query_of(spec: dict) -> int:
@@ -964,7 +1048,7 @@ def build_cna(spec: dict, d_feat: int) -> CnA:
     c = spec["cna"]
     return CnA(int(d_feat), spec["d_model"], c["n_query"], c["d_latent"],
                c["head_dim"], c["mlp_hidden"], c["n_blocks"], c["final_proj"],
-               c["dropout"])
+               c["dropout"], c.get("attn", "mha"), c.get("snop_w_init", -3.0))
 
 
 # ══ Nhánh hoàn chỉnh ════════════════════════════════════════════════════════
@@ -1043,6 +1127,9 @@ class VExtractorBranch(nn.Module):
                 "cna_self": sum(p.numel() for p in self.cna.self_parameters()),
                 "cna_cross": sum(p.numel() for p in self.cna.cross_parameters()),
                 "cna_ffn": sum(p.numel() for p in self.cna.ffn_parameters()),
+                "cna_snop_gates": sum(1 for m in self.cna.modules()
+                                      if isinstance(m, MultiHeadAttention)
+                                      and m.w_head is not None),
                 # HỌC ở main stage = ĐÚNG CnA.
                 "learnable_main": cna,
                 "trainable": sum(p.numel() for p in self.parameters()
