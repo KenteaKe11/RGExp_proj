@@ -37,7 +37,7 @@ CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
     đây**, và học **CÙNG LoRA ngay từ bước 0**: warm-up tuyến tính trong
     `cna_warmup_frac` (10%) tổng số bước rồi PHẲNG tới bước cuối, với BA nhóm:
 
-        ffn   (SwiGLU + Linear cuối + RMSNorm + latent + w_head SNOP)  1e-7 -> 1e-4
+        ffn   (SwiGLU + Linear cuối + RMSNorm + latent + α SNOP)  1e-7 -> 1e-4
         self  (bốn chiếu của MỌI SelfAttn)               1e-8 -> 1e-5
         cross (bốn chiếu của Cross-attn)                 4e-8 -> 4e-5
 
@@ -820,7 +820,8 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                   f"ffn {alr:.2e} self {alr_self:.2e} cross {alr_cross:.2e} · "
                   f"Z che {0 if z_drop is None else int(z_drop.numel())}"
                   + ("" if not (_gs := branch.cna.snop_gates()) else
-                     " · SNOP g " + " ".join(f"{v:.4f}" for v in _gs.values())),
+                     " · SNOP c̄ " + " ".join(f"{sum(v) / len(v):.4f}"
+                                             for v in _gs.values())),
                   flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
@@ -835,8 +836,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                              f"train/{aid}/grad_norm_lora": gn_lora,
                              f"train/{aid}/grad_norm_branch": gn_br,
                              f"train/{aid}/pct": 100.0 * (step + 1) / steps,
-                             **{f"train/{aid}/snop_g/{k}": v
-                                for k, v in branch.cna.snop_gates().items()},
+                             **{f"train/{aid}/snop_c/{k}/{st}": f(v)
+                                for k, v in branch.cna.snop_gates().items()
+                                for st, f in (("mean", lambda z: sum(z) / len(z)),
+                                              ("min", min), ("max", max))},
                              **vram_mod.device_usage()})
 
     pf.close()
@@ -885,7 +888,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         "val_loss_last": val_curve[-1]["loss"] if val_curve else None,
         "train_loss_first": first_loss, "train_loss": step_ce, "ce_last": step_ce,
         "q_rms_rel_last": rel_last,
-        "snop_gates_last": branch.cna.snop_gates(),   # {} với MHA thuần
+        "snop_c_last": branch.cna.snop_gates(),   # {lớp: [c_1..c_N]}; {} với MHA thuần
         "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2), "seed": seed,
     }
     (out_dir / "train_stats.json").write_text(

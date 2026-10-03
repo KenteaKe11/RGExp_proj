@@ -51,11 +51,11 @@ Stage 0 nạp trọng số `dinov3-vits16-pretrain` rồi fine-tune tiếp bằn
 | 1st block | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁` |
 | 2nd block | `Q₁ → SelfAttn(Q₁) → FFN → Q_final` |
 | Linear project cuối | có — `RMSNorm + Linear 1536→2560` (có bias, init `1/√fan_in`) |
-| Attention | **SNOP-MHA** ở cả 3 lớp (`cna.attn: snop`), mỗi lớp một cổng `w_head` (nhóm lr FFN), `g₀ = σ(0) = 0,5` (`cna.snop_w_init`) |
+| Attention | **SNOP-MHA** ở cả 3 lớp (`cna.attn: snop`), mỗi lớp một vector `α ∈ ℝ⁸` (nhóm lr FFN), `α₀ = −2` (`cna.snop_alpha_init`), `ε = 0,05` (`cna.snop_eps`) |
 | Head_dim | `head_dim` = 128 (suy ra 12 head) |
 | FFN | `SwiGLU 1536→2048→1536` (mult = 2 theo quy ước 2/3 của SwiGLU: 2/3 × 2 × 1536 = 2048) |
 | All_Block | `(1st → 2nd)`, **N = 1** (`n_blocks: 1`) |
-| Params | **46,03 M** (QFormer, gồm 3 cổng vô hướng `w_head`) + **3,94 M** (Linear cuối) = **49,96 M** |
+| Params | **46,03 M** (QFormer, gồm 3 vector `α ∈ ℝ⁸`) + **3,94 M** (Linear cuối) = **49,96 M** |
 | Kí hiệu đầu ra | `V_c` → `V_c (8, 2560)` |
 
 ```text
@@ -71,24 +71,29 @@ V_c = Linear(RMSNorm(h))                           # 1536 → 2560
 
 Bảng tham số của CnA: SelfAttn 2 × 4 × 1536² = 18,87 M · CrossAttn 2 × 1536² + 2 × 1152 × 1536 = 8,26 M · SwiGLU 2 × 3 × 1536 × 2048 = 18,87 M · năm RMSNorm(1536) → nhóm (khối 1 → khối 2) là **46,01 M**; cộng 8 latent (12 288) và `RMSNorm(1152)` trên V thành phần QFormer **46,03 M** (≈ 46,25 M của đặc tả); Linear cuối kèm RMSNorm của nó thêm **3,94 M**, nên CnA là **49,96 M**. Cấu hình FFN là `vextractor.cna.mlp_hidden`.
 
-> Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config). SNOP thêm đúng 3 tham số (49 963 648 → 49 963 651).
+> Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config). SNOP thêm đúng 3 × 8 = 24 tham số (49 963 648 → 49 963 672).
 
 #### 2.2.1. SNOP-MHA — Soft Non-Orthogonality Penalty
 
-Chống trùng lặp token (gần collapse) giữa 8 latent mà **không** thêm Entropy hay Orthogonal Regularization. Chèn giữa phép ghép head và chiếu `W_o`:
+Chống collapse giữa 8 query learner mà **không** thêm Entropy hay Orthogonal Regularization. Mục tiêu: 8 token mang nhiều thông tin nhất có thể và tận dụng hết `H·d_v` chiều. Chèn giữa phép ghép head và chiếu `W_o`:
 
 ```text
-O     = Concat(A_1 V_1, …, A_H V_H)              (N, H·d_v)     N = 8 query
-Õ     = [Norm(O) · Norm(O)ᵀ]^∘2                  (N, N)         cos² giữa hai token
-Y     = [I − σ(w_head)/(N−1) · (Õ ⊙ M_cross)] · O               M_cross = 1 − I
-out   = W_o · Y
+O       = Concat(A_1 V_1, …, A_H V_H)                      (N, H·d_v)   N = 8 query
+Õ       = stop_grad([Norm(O) · Norm(O)ᵀ]^∘2)               (N, N)       cos² giữa hai token
+c       = ε + (1 − ε) · σ(α)                               (N,)         α ∈ ℝ^N
+O_final = [I − (c · 1ᵀ)/(N + 1) ⊙ (Õ ⊙ M_cross)] · O                  M_cross = 1 − I
+out     = W_o · O_final
 ```
 
-* `w_head ∈ ℝ` — một vô hướng mỗi lớp, cổng `g = σ(w_head)`. `g → 0` là MHA thuần. `w_head` thuộc **nhóm lr FFN** (1e-7 → 1e-4), không thuộc nhóm của lớp attention chứa nó; nhóm SelfAttn/CrossAttn chỉ còn bốn ma trận chiếu, và ba nhóm vẫn là một phân hoạch của CnA.
-* `M_cross` bỏ đường chéo: hàng i là `O_i − g · (1/(N−1)) Σ_{j≠i} cos²(O_i, O_j) · O_j`, token giữ nguyên phần riêng, chỉ bị trừ phần giao với token khác. Cos² gần như tắt phép trừ với các token đã khác hướng.
-* Biến đổi **forward**, không phải loss: gradient của task loss đi qua `Y` về `O`, `Õ` và `w_head`. Õ tính ở fp32 (tắt autocast).
-* **Chuẩn hoá (N−1).** Tổng cos² trên N−1 token khác được chia cho N−1 (lấy trung bình). Khi cả N hàng song song (đúng trạng thái bước 0, vì attention gần đều), thành phần chung bị nhân đúng `1 − g`: không bao giờ đảo dấu với `g ∈ (0, 1)`, và cường độ không phụ thuộc số token. `w_head` khởi tạo 0 (`g₀ = 0,5`, phần chung còn 0,5). Với ~200 bước ở lr ≤ 1e-4, Adam chỉ dịch `w_head` cỡ 2e-2, nên `g` thực tế giữ quanh `g₀` suốt main stage — `snop_w_init` là một siêu tham số. Cơ chế không tạo thêm hạng khi các token đã song song hoàn toàn.
-* `g` của từng lớp được in mỗi `logging_steps`, log lên W&B (`train/<arm>/snop_g/*`) và ghi vào `train_stats.json` (`snop_gates_last`).
+Hàng i: `O_i − c_i/(N + 1) · Σ_{j≠i} cos²(O_i, O_j) · O_j`.
+
+* `α ∈ ℝ^N` — vector tham số mỗi lớp, một logit cho mỗi token i, học lực phạt `c_i` mà token i chịu từ các token khác. Khởi tạo **−2** (`cna.snop_alpha_init`). `α` thuộc **nhóm lr FFN** (1e-7 → 1e-4); nhóm SelfAttn/CrossAttn chỉ còn bốn ma trận chiếu, và ba nhóm vẫn là một phân hoạch của CnA.
+* `ε` — tỉ lệ phạt tối thiểu, mặc định **0,05** (`cna.snop_eps`): `c_i ∈ [ε, 1)`, nên SNOP không bao giờ tắt hẳn.
+* `stop_grad(Õ)` — gradient của task loss không đi qua phép đo độ giống nhau, chỉ đi qua thừa số `O` bên phải và `α`. Õ tính ở fp32 (tắt autocast).
+* `M_cross` bỏ đường chéo: token giữ nguyên phần riêng, chỉ bị trừ phần giao với token khác; cos² gần như tắt phép trừ với các token đã khác hướng.
+* **Chuẩn hoá `N + 1`** (N = 8 → 9). Khi cả N hàng song song (đúng trạng thái bước 0, vì attention gần đều), phần chung của hàng i bị nhân `1 − c_i·(N−1)/(N + 1)` = `1 − 7c_i/9`. Với `c₀ = 0,05 + 0,95·σ(−2) ≈ 0,163` thì còn ≈ 0,873. Vì `c_i < 1` và `(N−1)/(N+1) < 1`, thừa số luôn lớn hơn `2/(N+1)`: phần chung **không bao giờ đảo dấu**, với mọi N. Với ~200 bước ở lr ≤ 1e-4, Adam chỉ dịch `α` cỡ 2e-2, nên thực tế `c` giữ quanh `c₀`.
+* `N` của `α` cố định lúc dựng (= `n_query`); CrossAttn cũng có N = 8 hàng (query). Cơ chế không tạo thêm hạng khi các token đã song song hoàn toàn.
+* `c` của từng lớp được in mỗi `logging_steps` (trung bình), log lên W&B (`train/<arm>/snop_c/<lớp>/{mean,min,max}`) và ghi đủ vector vào `train_stats.json` (`snop_c_last`).
 
 ### 2.3. Bảng tham số
 
@@ -136,7 +141,7 @@ Khi `patience` = 4 epoch liên tiếp không cải thiện, phần theo lịch d
 | Lịch trình | Huấn luyện đồng thời với LoRA ngay từ bước 0 |
 | Mask Regularization | Che ngẫu nhiên 25% token `Z` (8 latent bù cho 64 token bị thiếu) mỗi weight update để ép `V_c` tham gia sâu vào quá trình sinh text |
 
-Nhóm FFN của CnA gồm hai SwiGLU, Linear cuối, mọi RMSNorm, 8 latent và 3 cổng `w_head` của SNOP-MHA; nhóm SelfAttn là bốn ma trận chiếu của cả hai SelfAttn; nhóm CrossAttn là bốn ma trận chiếu của Cross-attn. Ba nhóm là một phân hoạch của CnA (huấn luyện dừng nếu không). LoRA của decoder giữ đúng lịch one-cycle của baseline.
+Nhóm FFN của CnA gồm hai SwiGLU, Linear cuối, mọi RMSNorm, 8 latent và 3 vector `α` của SNOP-MHA; nhóm SelfAttn là bốn ma trận chiếu của cả hai SelfAttn; nhóm CrossAttn là bốn ma trận chiếu của Cross-attn. Ba nhóm là một phân hoạch của CnA (huấn luyện dừng nếu không). LoRA của decoder giữ đúng lịch one-cycle của baseline.
 
 **Mask regularization.** Mỗi optimizer step rút một tập `round(0.25 × 256)` = 64 vị trí trong khối token ảnh `Z` và đặt `attention_mask = 0` tại đó, nên không query nào (kể cả các token ảnh khác trong khối attention hai chiều của Gemma 3) đọc được chúng; embedding, nhãn và số token vào CE không đổi. Cùng một mặt nạ dùng cho mọi micro-batch của step đó (grad accumulation), rút bằng một generator riêng seed theo `(seed, step)` nên tái lập được và không tiêu RNG của LoRA/thứ tự dữ liệu. Chỉ áp ở huấn luyện: val CE, sinh và Lens thấy đủ `Z`. Khoá: `vextractor.main.z_mask_frac` (0 = tắt).
 
@@ -152,4 +157,4 @@ bash scripts/run_vextractor.sh train --detach
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
 
-> **Stage 0 = đúng checkpoint Stage 0 của §2.2 gốc (CnA MHA), không bao giờ chạy DINO ở thí nghiệm này** (`output.stage0_from.required: true`, `run_vextractor.ensure_origin_stage0`). Nguồn theo thứ tự: bản cục bộ `./adapters_vextractor/_stage0` của gốc, rồi Hub `current/$2.2_V-Extractor_Test/stage0` (chỉ `final/` đã xong, khớp vân tay). Bản chép mang `_stage0/origin.json` (nguồn + sha256 của `final/`); thư mục Stage 0 không có hoặc lệch `origin.json` bị ghi đè bằng bản gốc. Không lấy được thì **dừng**; `--restage0` bị từ chối, `--retrain-all` chỉ chạy lại main + sinh + chấm. Checkpoint **main stage** của §2.2 **không nạp được** (`FORMAT` = `rgexp.vextractor/20`, spec có `cna.attn`), nên main stage chạy lại vào `./adapters_vextractor_snop` / `runs/vextractor_snop`.
+> **Stage 0 = đúng checkpoint Stage 0 của §2.2 gốc (CnA MHA), không bao giờ chạy DINO ở thí nghiệm này** (`output.stage0_from.required: true`, `run_vextractor.ensure_origin_stage0`). Nguồn theo thứ tự: bản cục bộ `./adapters_vextractor/_stage0` của gốc, rồi Hub `current/$2.2_V-Extractor_Test/stage0` (chỉ `final/` đã xong, khớp vân tay). Bản chép mang `_stage0/origin.json` (nguồn + sha256 của `final/`); thư mục Stage 0 không có hoặc lệch `origin.json` bị ghi đè bằng bản gốc. Không lấy được thì **dừng**; `--restage0` bị từ chối, `--retrain-all` chỉ chạy lại main + sinh + chấm. Checkpoint **main stage** của §2.2 **không nạp được** (`FORMAT` = `rgexp.vextractor/22`, spec có `cna.attn`), nên main stage chạy lại vào `./adapters_vextractor_snop` / `runs/vextractor_snop`.

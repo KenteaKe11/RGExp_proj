@@ -2488,10 +2488,13 @@ def _():
     tr2.train()
     assert all(m.training for m in tr2.bn_modules())
 
-@check("26. SNOP-MHA: Y = [I − σ(w)·(Õ ⊙ M_cross)]·O khớp công thức; g → 0 là MHA thuần; "
-       "token trực giao không bị đụng; Õ chia (N−1) nên collapse nhân phần chung ĐÚNG 1 − g; "
-       "w_head nhận gradient, thuộc nhóm lr ffn, không tiêu RNG; config thật bật SNOP ở cả 3 attention")
+@check("26. SNOP-MHA: O_final = [I − (c·1ᵀ)/(N + 1) ⊙ (stop_grad(Õ) ⊙ M_cross)]·O, "
+       "c = ε + (1 − ε)σ(α), α ∈ ℝ^N khởi tạo −2, ε = 0.05; khớp công thức dựng tay; "
+       "Õ không nhận gradient, α và O thì có; α thuộc nhóm lr ffn, không tiêu RNG; "
+       "config thật bật SNOP ở cả 3 attention")
 def _():
+    import math
+
     import torch
     import torch.nn.functional as F
 
@@ -2500,61 +2503,85 @@ def _():
 
     MHA = R.MultiHeadAttention
     torch.manual_seed(0)
-    # (a) đúng công thức, dựng tay
-    o = torch.randn(2, 8, 16)
-    g = torch.sigmoid(torch.tensor(0.3))
+    # (a) đúng công thức, dựng tay — c khác nhau theo hàng
+    N = 8
+    o = torch.randn(2, N, 16)
+    alpha = torch.linspace(-3, 1, N)
+    c = 0.05 + 0.95 * torch.sigmoid(alpha)
     u = F.normalize(o, dim=-1)
-    S = (u @ u.transpose(1, 2)).square() * (1 - torch.eye(8))
-    ref = (torch.eye(8) - g / 7 * S) @ o
-    assert torch.allclose(MHA.snop_mix(o, g), ref, atol=1e-5)
-    # (b) g -> 0: MHA thuần, và w_head KHÔNG tiêu RNG (chiếu q/k/v/o y hệt)
+    S = (u @ u.transpose(1, 2)).square() * (1 - torch.eye(N))
+    ref = (torch.eye(N) - (c.view(N, 1) @ torch.ones(1, N)) / (N + 1) * S) @ o
+    m = MHA(16, 4, None, snop=True, n_tok=N, alpha_init=0.0, eps=0.05)
+    with torch.no_grad():
+        m.alpha.copy_(alpha)
+    assert torch.allclose(m.gate(), c, atol=1e-6)
+    assert torch.allclose(MHA.snop_mix(o, m.gate()), ref, atol=1e-5)
+    # (b) mặc định: α₀ = −2, ε = 0.05; c ∈ [ε, 1) kể cả khi α → −∞
+    d = MHA(16, 4, None, snop=True, n_tok=N)
+    assert d.alpha.shape == (N,) and torch.all(d.alpha == -2.0) and d.eps == 0.05
+    with torch.no_grad():
+        d.alpha.fill_(-80.0)
+    assert torch.allclose(d.gate(), torch.full((N,), 0.05))
+    # (c) w/ α KHÔNG tiêu RNG: chiếu q/k/v/o y hệt MHA thuần
     torch.manual_seed(1)
-    a = MHA(16, 4, None)
+    a0 = MHA(16, 4, None)
     torch.manual_seed(1)
-    b = MHA(16, 4, None, snop=True, w_init=-60.0)
+    b0 = MHA(16, 4, None, snop=True, n_tok=N)
     for n_ in ("q", "k", "v", "o"):
-        assert torch.equal(getattr(a, n_).weight, getattr(b, n_).weight), n_
-    x = torch.randn(2, 8, 16)
-    assert torch.allclose(a(x), b(x), atol=1e-6)
-    # (c) token trực giao: cos² = 0 -> không trừ gì
-    o = 3 * torch.eye(8).unsqueeze(0)
-    assert torch.equal(MHA.snop_mix(o, torch.tensor(0.9)), o)
-    # (d) collapse hoàn toàn (N hàng song song): phần chung × ĐÚNG (1 − g), mọi N
-    for n_tok in (2, 8, 16):
-        for gv in (0.1, 0.5, 0.99):
-            y = MHA.snop_mix(torch.ones(1, n_tok, 4), torch.tensor(gv))
-            assert torch.allclose(y, torch.full_like(y, 1 - gv), atol=1e-6), (n_tok, gv)
-    # N = 1: không có token khác -> không trừ gì, không chia 0
-    one = torch.randn(1, 1, 4)
-    assert torch.equal(MHA.snop_mix(one, torch.tensor(0.9)), one)
-    # (e) gradient tới w_head (cổng chưa bão hoà) và cả Õ
-    c = MHA(16, 4, None, snop=True, w_init=0.0)
-    c(torch.randn(2, 8, 16)).square().sum().backward()
-    assert c.w_head.grad is not None and float(c.w_head.grad.abs()) > 0
-    # (f) cross-attn: N = số query, không phải số patch
-    cr = MHA(16, 4, 12, snop=True)
-    assert cr(torch.randn(2, 8, 16), torch.randn(2, 50, 12)).shape == (2, 8, 16)
-    # (g) CnA SNOP: 3 cổng / nhóm, nằm trong nhóm ffn (KHÔNG self/cross), phân hoạch còn kín
+        assert torch.equal(getattr(a0, n_).weight, getattr(b0, n_).weight), n_
+    # (d) token trực giao: cos² = 0 -> không trừ gì
+    oo = 3 * torch.eye(N).unsqueeze(0)
+    assert torch.equal(MHA.snop_mix(oo, torch.full((N,), 0.9)), oo)
+    # (e) collapse hoàn toàn: hàng i × (1 − c_i·(N−1)/(N + 1)) — luôn > 0, mọi N
+    y = MHA.snop_mix(torch.ones(1, N, 4), c)
+    want = (1 - c * (N - 1) / (N + 1)).view(1, N, 1).expand(1, N, 4)
+    assert torch.allclose(y, want, atol=1e-6)
+    for n_tok in (2, 8, 64):
+        yy = MHA.snop_mix(torch.ones(1, n_tok, 4), torch.full((n_tok,), 0.999))
+        assert float(yy.min()) > 0, n_tok
+    # (f) stop_grad(Õ): gradient qua thừa số O + α, KHÔNG qua Õ
+    o1 = torch.randn(1, N, 16, requires_grad=True)
+    cg = c.clone().requires_grad_(True)
+    MHA.snop_mix(o1, cg).sum().backward()
+    with torch.no_grad():
+        u1 = F.normalize(o1, dim=-1)
+        S1 = (u1 @ u1.transpose(1, 2)).square() * (1 - torch.eye(N))
+        A1 = torch.eye(N) - (cg.view(N, 1) / (N + 1)) * S1[0]
+    # Õ là hằng số -> dY/dO = Aᵀ·1 đúng như phép tuyến tính
+    assert torch.allclose(o1.grad[0], A1.t() @ torch.ones(N, 16), atol=1e-5)
+    assert cg.grad is not None and float(cg.grad.abs().sum()) > 0
+    e = MHA(16, 4, None, snop=True, n_tok=N)
+    e(torch.randn(2, N, 16)).square().sum().backward()
+    assert e.alpha.grad is not None and float(e.alpha.grad.abs().sum()) > 0
+    # (g) N lúc chạy khác N của α -> lỗi; cross-attn: N = số query
+    try:
+        e(torch.randn(2, N + 1, 16))
+        raise AssertionError("N lệch phải bị từ chối")
+    except ValueError:
+        pass
+    cr = MHA(16, 4, 12, snop=True, n_tok=N)
+    assert cr(torch.randn(2, N, 16), torch.randn(2, 50, 12)).shape == (2, N, 16)
+    # (h) CnA SNOP: α ∈ ℝ^n_query mỗi lớp, nằm trong nhóm ffn, phân hoạch còn kín
     spec = R.spec_from_cfg({"vextractor": {
         **small_cfg()["vextractor"],
-        "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop", snop_w_init=0.0)}}, 32)
+        "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop")}}, 32)
+    assert spec["cna"]["snop_alpha_init"] == -2.0 and spec["cna"]["snop_eps"] == 0.05
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
-    assert len(gates) == 3 * SMALL_NB, gates
-    assert all(abs(v - 0.5) < 1e-6 for v in gates.values())
-    ws = {id(m.w_head) for m in br.cna.modules()
-          if isinstance(m, MHA) and m.w_head is not None}
+    assert len(gates) == 3 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
+    c0 = 0.05 + 0.95 / (1 + math.exp(2.0))
+    assert all(abs(x - c0) < 1e-6 for v in gates.values() for x in v)
     ids = lambda it: {id(p) for p in it}  # noqa: E731
-    assert ws == ids(br.cna.snop_parameters())
-    assert ws <= ids(br.cna.ffn_parameters())
+    ws = {id(mm.alpha) for mm in br.cna.modules()
+          if isinstance(mm, MHA) and mm.alpha is not None}
+    assert ws == ids(br.cna.snop_parameters()) and ws <= ids(br.cna.ffn_parameters())
     assert not ws & (ids(br.cna.self_parameters()) | ids(br.cna.cross_parameters()))
     allp = (list(br.cna.self_parameters()) + list(br.cna.cross_parameters())
             + list(br.cna.ffn_parameters()))
     assert len(allp) == len({id(p) for p in allp}) == len(list(br.cna.parameters()))
-    npar = br.n_params()
-    assert npar["cna_snop_gates"] == 3 * SMALL_NB
+    assert br.n_params()["cna_snop_alpha"] == 3 * SMALL_NB * SMALL_Q
     assert br(torch.randn(2, 3, SMALL_IMG, SMALL_IMG)).shape == (2, SMALL_Q, 32)
-    # (h) spec mặc định (khoá vắng) = MHA thuần; khoá sai bị từ chối
+    # (i) spec mặc định (khoá vắng) = MHA thuần; khoá sai bị từ chối
     assert R.spec_from_cfg(small_cfg(), 32)["cna"]["attn"] == "mha"
     try:
         R.spec_from_cfg({"vextractor": {**small_cfg()["vextractor"], "cna": dict(
@@ -2562,11 +2589,12 @@ def _():
         raise AssertionError("attn lạ phải bị từ chối")
     except R.VExtractorUnusable:
         pass
-    # (i) config THẬT: SNOP bật, w_head khởi tạo 0 (g₀ = 0.5)
+    # (j) config THẬT
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop" and float(cn["snop_w_init"]) == 0.0
-    assert R.FORMAT == "rgexp.vextractor/20"
+    assert cn["attn"] == "snop"
+    assert float(cn["snop_alpha_init"]) == -2.0 and float(cn["snop_eps"]) == 0.05
+    assert R.FORMAT == "rgexp.vextractor/22"
 
 
 print()
