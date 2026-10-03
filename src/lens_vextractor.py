@@ -2,10 +2,12 @@
 
 Chạy: `bash scripts/run_vextractor.sh lens` -> `runs/<subdir>/Lens/`:
 
-    Lens_Vision.html      báo cáo THỊ GIÁC — trang HTML tương tác (pager Q[i])
+    Lens_Vision.html      báo cáo THỊ GIÁC — trang HTML tương tác (pager Q[i]);
+                          cuối trang: ma trận similarity (cosine) giữa các token Q —
+                          O / O_final của từng attention CnA và V_c
     Lens_Language.md      báo cáo NGÔN NGỮ — Jacobian token × lớp + ma trận Q ↔ bệnh lý
     figures/              hình của báo cáo ngôn ngữ
-    lens_maps.npz         số thô (độ nhạy, CAM, ma trận attention) — mọi mẫu
+    lens_maps.npz         số thô (độ nhạy, CAM, ma trận attention, similarity) — mọi mẫu
     lens.json · q_disease.csv
 
 CHỈ CHẠY B: Z của B giống A từng bit và chuỗi chỉ dài thêm khối Q, nên Q chính
@@ -608,6 +610,32 @@ def _to_chw(t, fmt: str, n_prefix: int):
     return t
 
 
+def _token_sim(x) -> dict:
+    """x (N, D) -> {"cos": (N, N) cosine giữa các token, "erank": hạng hiệu dụng}.
+
+    erank = exp(entropy của phổ kỳ dị chuẩn hoá) ∈ [1, N] — 1 = mọi token cùng
+    một hướng (collapse), N = các token trải đều N chiều.
+    """
+    import torch
+
+    x = torch.as_tensor(x).detach().float().cpu()
+    u = torch.nn.functional.normalize(x, dim=-1, eps=1e-8)
+    cos = (u @ u.t()).clamp(-1, 1).numpy()
+    s = torch.linalg.svdvals(x)
+    p = s / s.sum().clamp_min(1e-12)
+    ent = float(-(p * p.clamp_min(1e-12).log()).sum())
+    return {"cos": cos, "erank": float(np.exp(ent))}
+
+
+def _attn_layers(branch) -> list[tuple[str, object]]:
+    """[(tên, MultiHeadAttention)] của CnA theo thứ tự forward."""
+    out = []
+    for i, g in enumerate(branch.cna.groups):
+        for nm in ("self1", "cross", "self2"):
+            out.append((f"g{i}.{nm}", getattr(g, nm)))
+    return out
+
+
 def vision_cams(branch, px, dev, gq, stage: int = -3,
                 method: str = "gradcam") -> dict:
     """Grad-CAM với target là ẢNH HƯỞNG LÊN QUYẾT ĐỊNH SINH qua khối Q.
@@ -628,11 +656,18 @@ def vision_cams(branch, px, dev, gq, stage: int = -3,
     ReLU của Grad-CAM xoá sạch cả bản đồ.)
 
     MỘT lượt forward, `1 + n_query` lượt backward (retain_graph).
+
+    Cùng lượt forward ấy ghi thêm `sim`: similarity giữa các token Q ở từng chỗ
+    của CnA — O (trước SNOP) và O_final (sau SNOP) của mọi attention, rồi V_c
+    (thứ vào decoder). {tên: {"cos": (N, N), "erank": float}}.
     """
     import torch
 
     mod, k = _cam_module(branch, stage)
     hold = {}
+    layers = _attn_layers(branch)
+    for _nm, m in layers:
+        m.trace = {}
 
     def hook(_m, _i, o):
         a = o.detach().requires_grad_(True)
@@ -651,6 +686,13 @@ def vision_cams(branch, px, dev, gq, stage: int = -3,
             v = branch.extractor(px.to(dev))
             vc = branch.cna(v)
         A = hold["a"]
+        sim = {}
+        for nm, m in layers:
+            for part in ("O", "O_final"):
+                if part in m.trace:
+                    sim[f"{nm} · {part}"] = _token_sim(m.trace[part][0])
+        sim["V_c"] = _token_sim(vc[0])
+        snop = any(getattr(m, "snop", False) for _nm, m in layers)
         if gq is None:
             raise TrainUnusable("Lens Vision cần ∂y/∂Q (gq) từ lượt backward của "
                                 "decoder — chạy `analyze_language` trước.")
@@ -667,12 +709,14 @@ def vision_cams(branch, px, dev, gq, stage: int = -3,
             maps.append(_cam(A0, _to_chw(g[0], fmt, npre), method))
     finally:
         h.remove()
+        for _nm, m in layers:
+            m.trace = None
         branch.train(was_train)
         branch.set_frozen(was)
         for prm in branch.parameters():
             prm.requires_grad_(False)
     return {"extractor": maps[0], "q": np.stack(maps[1:]),
-            "grid": tuple(maps[0].shape), "stage": int(k)}
+            "grid": tuple(maps[0].shape), "stage": int(k), "sim": sim, "snop": snop}
 
 
 # Bảng `cv2.COLORMAP_JET` (RGB, 256 mức) — đúng heatmap của `show_cam_on_image`,
@@ -779,8 +823,13 @@ def write_vision_html(cfg_l: dict, d: Path, items: list[dict], cams: list[dict],
             "q_stat": [_cam_stats(cm["q"][i]) for i in range(nq)],
             "q_share": ex.get("q_vec"),
             "q_top": ex.get("q_top"),
+            "sim": {nm: {"cos": [[round(float(v), 4) for v in row] for row in s["cos"]],
+                         "erank": round(float(s["erank"]), 3)}
+                    for nm, s in (cm.get("sim") or {}).items()},
         })
-    payload = json.dumps({"nq": nq, "samples": data, "meta": meta},
+    sim_keys = list((cams[0].get("sim") or {}).keys())
+    payload = json.dumps({"nq": nq, "samples": data, "meta": meta,
+                          "sim_keys": sim_keys, "snop": bool(cams[0].get("snop"))},
                          ensure_ascii=False)
     method = "Grad-CAM++" if cfg_l["cam"] == "gradcam++" else "Grad-CAM"
     html = _VISION_TEMPLATE.replace("__PAYLOAD__", payload).replace(
@@ -834,7 +883,23 @@ padding:4px 24px}
 background:linear-gradient(90deg,#00007f,#0000ff,#007fff,#00ffff,#7fff7f,#ffff00,#ff7f00,#ff0000,#7f0000)}
 .notes{padding:0 24px 32px;max-width:1100px;color:var(--fg);font-size:13.5px}
 .notes code{background:var(--card);border:1px solid var(--line);padding:0 4px;border-radius:4px}
-@media (max-width:700px){header,.wrap,.pager,.notes{padding-left:16px;padding-right:16px}}
+.simsec{padding:8px 24px 40px;border-top:1px solid var(--line)}
+.simsec h2{font-size:17px;margin:12px 0 4px}
+.simbar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 12px}
+.simbar button{border:1px solid var(--line);background:var(--card);color:var(--fg);
+border-radius:6px;height:30px;padding:0 10px;cursor:pointer;font:inherit;font-size:12.5px}
+.simbar button.on{background:var(--acc2);border-color:var(--acc2);color:#fff;font-weight:600}
+.simgrid{display:grid;grid-template-columns:repeat(__N__,minmax(220px,1fr));gap:12px;
+min-width:1150px}
+.simwrap{overflow-x:auto}
+.mat{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);
+border-radius:4px;overflow:hidden;font-size:10px;font-variant-numeric:tabular-nums}
+.mat div{aspect-ratio:1;display:flex;align-items:center;justify-content:center}
+.mat .ax{background:var(--card);color:var(--muted);font-weight:600}
+.dbar{width:180px;height:10px;border-radius:3px;
+background:linear-gradient(90deg,#2a5fb0,#f2f2f2 50%,#c0392b)}
+@media (prefers-color-scheme: dark){.dbar{background:linear-gradient(90deg,#4a7fd0,#2a2a2a 50%,#e0574a)}}
+@media (max-width:700px){header,.wrap,.pager,.notes,.simsec{padding-left:16px;padding-right:16px}}
 </style></head><body>
 <header><h1>Lens · Vision — __METHOD__</h1>
 <div class="sub">Nền (identity) luôn là X — ảnh 448² vào Extractor ·
@@ -858,6 +923,20 @@ ma trận attention Q[i] ↔ token bệnh lý.</p>
 <p><b>Giới hạn.</b> Grad-CAM là độ nhạy cục bộ, không phải phân đoạn tổn thương và không
 phải nhân quả. 5 ảnh bốc ngẫu nhiên (seed cố định) để minh hoạ, không phải thống kê.</p>
 </div>
+<section class="simsec">
+<h2>Similarity giữa các token Q</h2>
+<div class="sub" id="simsub"></div>
+<div class="simbar" id="simbar"></div>
+<div class="legend" style="padding:0 0 10px"><span>−1</span><div class="dbar"></div><span>+1 · cosine giữa Q[i] và Q[j] (chéo = 1)</span></div>
+<div class="simwrap"><div class="simgrid" id="simgrid"></div></div>
+<div class="notes" style="padding:12px 0 0">
+<p><b>Cách đọc.</b> Mỗi ô (i, j) = cos(Q[i], Q[j]) của biểu diễn đang chọn, trên đúng ảnh của cột đó.
+Ngoài chéo đỏ đậm = hai token gần cùng hướng (trùng lặp, gần collapse); màu nhạt (gần nền) = gần trực giao; xanh = ngược hướng.
+<code>cos̄</code> = trung bình cos ngoài chéo; <code>erank</code> = hạng hiệu dụng (exp entropy của phổ kỳ dị) ∈ [1, N] — 1 là collapse hẳn, N là 8 token trải đều 8 hướng.
+<code>· O</code> = Concat(A_h V_h) trước SNOP; <code>· O_final</code> = sau phép trừ SNOP (chỉ có khi CnA dùng SNOP-MHA) — so cặp này để thấy SNOP tách các token tới đâu.
+<code>V_c</code> = 8 token thật sự vào decoder.</p>
+</div>
+</section>
 <script>
 const D = __PAYLOAD__;
 let cur = 0, raw = false;
@@ -906,7 +985,46 @@ function render(){
     if(s.q_top&&s.q_top[cur])cap+=' · bệnh: '+s.q_top[cur];
     document.getElementById('qc'+k).innerHTML=cap;});
 }
-build();render();
+let simCur = Math.max(0, (D.sim_keys||[]).indexOf('V_c'));
+function simColor(v){
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const mid = dark ? [42,42,42] : [242,242,242];
+  const end = v >= 0 ? (dark ? [224,87,74] : [192,57,43]) : (dark ? [74,127,208] : [42,95,176]);
+  const t = Math.min(1, Math.abs(v));
+  const c = mid.map((m,k)=>Math.round(m + (end[k]-m)*t));
+  return 'rgb('+c.join(',')+')';
+}
+function buildSim(){
+  const keys = D.sim_keys || [];
+  if(!keys.length){document.querySelector('.simsec').style.display='none';return;}
+  document.getElementById('simsub').textContent = D.nq + ' token · ' + keys.length +
+    ' biểu diễn · CnA ' + (D.snop ? 'SNOP-MHA' : 'MHA thuần');
+  const bar = document.getElementById('simbar');
+  keys.forEach((k,i)=>{const b=document.createElement('button');b.textContent=k;b.id='sk'+i;
+    b.onclick=()=>{simCur=i;renderSim();};bar.appendChild(b);});
+}
+function renderSim(){
+  const keys = D.sim_keys || []; if(!keys.length) return;
+  keys.forEach((_,i)=>document.getElementById('sk'+i).classList.toggle('on',i===simCur));
+  const key = keys[simCur], g = document.getElementById('simgrid'); g.innerHTML='';
+  D.samples.forEach((s,k)=>{
+    const m = s.sim[key]; const n = m.cos.length; const c = div('cell','');
+    let off=0, cnt=0;
+    for(let i=0;i<n;i++)for(let j=0;j<n;j++)if(i!==j){off+=m.cos[i][j];cnt++;}
+    let h = '<div class="head">mẫu '+(k+1)+' · '+s.key+'</div>' +
+      '<div class="mat" style="grid-template-columns:repeat('+(n+1)+',1fr);margin-top:6px">' +
+      '<div class="ax"></div>';
+    for(let j=0;j<n;j++) h += '<div class="ax">'+j+'</div>';
+    for(let i=0;i<n;i++){ h += '<div class="ax">'+i+'</div>';
+      for(let j=0;j<n;j++){ const v=m.cos[i][j];
+        const fg = Math.abs(v) > 0.55 ? '#fff' : 'inherit';
+        h += '<div title="cos(Q['+i+'], Q['+j+']) = '+v.toFixed(3)+'" style="background:'+
+          simColor(v)+';color:'+fg+'">'+v.toFixed(2).replace(/^(-?)0\./,'$1.')+'</div>'; } }
+    h += '</div><div class="cap">cos̄ '+(cnt?off/cnt:0).toFixed(3)+' · erank '+
+      m.erank.toFixed(2)+' / '+n+'</div>';
+    c.innerHTML = h; g.appendChild(c);});
+}
+build();render();buildSim();renderSim();
 </script></body></html>
 """
 
@@ -993,6 +1111,8 @@ def write_reports(cfg: Cfg, d: Path, A: dict, B: dict, items, lang, cams, mats,
         **{f"layer_sens_{k}": r["layer_sens"] for k, r in enumerate(lang)},
         **{f"cam_extractor_{k}": c["extractor"] for k, c in enumerate(cams)},
         **{f"cam_q_{k}": c["q"] for k, c in enumerate(cams)},
+        **{f"sim_{k}_{nm.replace(' · ', '_').replace('.', '_')}": s["cos"]
+           for k, c in enumerate(cams) for nm, s in (c.get("sim") or {}).items()},
         **{f"q_disease_{k}": M for k, M in enumerate(mats)})
     pd.DataFrame([{"sample": k + 1, "key": it["key"], "q": i, "disease": nm,
                    "p": float(mats[k][i, j])}

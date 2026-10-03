@@ -51,7 +51,7 @@ Stage 0 nạp trọng số `dinov3-vits16-pretrain` rồi fine-tune tiếp bằn
 | 1st block | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁` |
 | 2nd block | `Q₁ → SelfAttn(Q₁) → FFN → Q_final` |
 | Linear project cuối | có — `RMSNorm + Linear 1536→2560` (có bias, init `1/√fan_in`) |
-| Attention | **SNOP-MHA** ở cả 3 lớp (`cna.attn: snop`), mỗi lớp một vector `α ∈ ℝ⁸` (nhóm lr FFN), `α₀ = −2` (`cna.snop_alpha_init`), `ε = 0,05` (`cna.snop_eps`) |
+| Attention | **SNOP-MHA** ở cả 3 lớp (`cna.attn: snop`), mỗi lớp một vector `α ∈ ℝ⁸` (nhóm lr FFN), `α₀ = −0,5` (`cna.snop_alpha_init`), `ε = 0,15` (`cna.snop_eps`) |
 | Head_dim | `head_dim` = 128 (suy ra 12 head) |
 | FFN | `SwiGLU 1536→2048→1536` (mult = 2 theo quy ước 2/3 của SwiGLU: 2/3 × 2 × 1536 = 2048) |
 | All_Block | `(1st → 2nd)`, **N = 1** (`n_blocks: 1`) |
@@ -87,11 +87,11 @@ out     = W_o · O_final
 
 Hàng i: `O_i − c_i/(N + 1) · Σ_{j≠i} cos²(O_i, O_j) · O_j`.
 
-* `α ∈ ℝ^N` — vector tham số mỗi lớp, một logit cho mỗi token i, học lực phạt `c_i` mà token i chịu từ các token khác. Khởi tạo **−2** (`cna.snop_alpha_init`). `α` thuộc **nhóm lr FFN** (1e-7 → 1e-4); nhóm SelfAttn/CrossAttn chỉ còn bốn ma trận chiếu, và ba nhóm vẫn là một phân hoạch của CnA.
-* `ε` — tỉ lệ phạt tối thiểu, mặc định **0,05** (`cna.snop_eps`): `c_i ∈ [ε, 1)`, nên SNOP không bao giờ tắt hẳn.
+* `α ∈ ℝ^N` — vector tham số mỗi lớp, một logit cho mỗi token i, học lực phạt `c_i` mà token i chịu từ các token khác. Khởi tạo **−0,5** (`cna.snop_alpha_init`). `α` thuộc **nhóm lr FFN** (1e-7 → 1e-4); nhóm SelfAttn/CrossAttn chỉ còn bốn ma trận chiếu, và ba nhóm vẫn là một phân hoạch của CnA.
+* `ε` — tỉ lệ phạt tối thiểu, mặc định **0,15** (`cna.snop_eps`): `c_i ∈ [ε, 1)`, nên SNOP không bao giờ tắt hẳn.
 * `stop_grad(Õ)` — gradient của task loss không đi qua phép đo độ giống nhau, chỉ đi qua thừa số `O` bên phải và `α`. Õ tính ở fp32 (tắt autocast).
 * `M_cross` bỏ đường chéo: token giữ nguyên phần riêng, chỉ bị trừ phần giao với token khác; cos² gần như tắt phép trừ với các token đã khác hướng.
-* **Chuẩn hoá `N + 1`** (N = 8 → 9). Khi cả N hàng song song (đúng trạng thái bước 0, vì attention gần đều), phần chung của hàng i bị nhân `1 − c_i·(N−1)/(N + 1)` = `1 − 7c_i/9`. Với `c₀ = 0,05 + 0,95·σ(−2) ≈ 0,163` thì còn ≈ 0,873. Vì `c_i < 1` và `(N−1)/(N+1) < 1`, thừa số luôn lớn hơn `2/(N+1)`: phần chung **không bao giờ đảo dấu**, với mọi N. Với ~200 bước ở lr ≤ 1e-4, Adam chỉ dịch `α` cỡ 2e-2, nên thực tế `c` giữ quanh `c₀`.
+* **Chuẩn hoá `N + 1`** (N = 8 → 9). Khi cả N hàng song song (đúng trạng thái bước 0, vì attention gần đều), phần chung của hàng i bị nhân `1 − c_i·(N−1)/(N + 1)` = `1 − 7c_i/9`. Với `c₀ = 0,15 + 0,85·σ(−0,5) ≈ 0,471` thì còn ≈ 0,634. Vì `c_i < 1` và `(N−1)/(N+1) < 1`, thừa số luôn lớn hơn `2/(N+1)`: phần chung **không bao giờ đảo dấu**, với mọi N. Với ~200 bước ở lr ≤ 1e-4, Adam chỉ dịch `α` cỡ 2e-2, nên thực tế `c` giữ quanh `c₀`.
 * `N` của `α` cố định lúc dựng (= `n_query`); CrossAttn cũng có N = 8 hàng (query). Cơ chế không tạo thêm hạng khi các token đã song song hoàn toàn.
 * `c` của từng lớp được in mỗi `logging_steps` (trung bình), log lên W&B (`train/<arm>/snop_c/<lớp>/{mean,min,max}`) và ghi đủ vector vào `train_stats.json` (`snop_c_last`).
 

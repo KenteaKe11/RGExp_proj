@@ -102,13 +102,13 @@ class MultiHeadAttention(nn.Module):
     Hàng i: `O_i − c_i/(N + 1) · Σ_{j≠i} cos²(O_i, O_j) · O_j`.
 
     * `α` — VECTOR N tham số (một logit mỗi token query i), khởi tạo `alpha_init`
-      (−2): `c_i` là lực phạt token i chịu từ các token khác. `ε` (0.05) là
+      (−0.5): `c_i` là lực phạt token i chịu từ các token khác. `ε` (0.15) là
       lực phạt TỐI THIỂU: c_i ∈ [ε, 1), nên SNOP không bao giờ tắt hẳn.
     * `Õ` là stop_grad: gradient của task loss KHÔNG đi qua phép đo độ giống
       nhau, chỉ đi qua O (thừa số bên phải) và α.
     * `N + 1` — N = 8 -> 9. Khi cả N hàng song song (attention gần đều, đúng
       trạng thái bước 0) phần chung bị nhân `1 − c·(N−1)/(N + 1)` = `1 − 7c/9`:
-      c₀ = 0.05 + 0.95·σ(−2) ≈ 0.163 -> ≈ 0.873. Vì (N−1)/(N+1) < 1 và c < 1,
+      c₀ = 0.15 + 0.85·σ(−0.5) ≈ 0.471 -> ≈ 0.634. Vì (N−1)/(N+1) < 1 và c < 1,
       thừa số này luôn > 2/(N+1) > 0: phần chung KHÔNG BAO GIỜ đảo dấu, với mọi N.
     * N của α CỐ ĐỊNH lúc dựng (`n_tok` = số query); N lúc chạy khác -> lỗi.
     * Đường chéo bị mặt nạ: token giữ nguyên phần riêng; cos² gần như tắt phép
@@ -122,7 +122,7 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_kv: int | None = None,
                  dropout: float = 0.0, snop: bool = False, n_tok: int | None = None,
-                 alpha_init: float = -2.0, eps: float = 0.05):
+                 alpha_init: float = -0.5, eps: float = 0.15):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} không chia hết n_heads {n_heads}")
@@ -133,6 +133,9 @@ class MultiHeadAttention(nn.Module):
         self.v = nn.Linear(self.d_kv, self.d, bias=False)
         self.o = nn.Linear(self.d, self.d, bias=False)
         self.p = float(dropout)
+        # Lens: dict -> forward ghi O (trước SNOP) và O_final (sau SNOP), detach.
+        # None (mặc định) = không ghi gì, không tốn gì.
+        self.trace: dict | None = None
         self.snop = bool(snop)
         self.eps = float(eps)
         if self.snop:
@@ -191,8 +194,12 @@ class MultiHeadAttention(nn.Module):
             q, k, v, dropout_p=self.p if self.training else 0.0)
         b, _, n, _ = y.shape
         o = y.transpose(1, 2).reshape(b, n, self.d)              # O = Concat(A_h V_h)
+        if self.trace is not None:
+            self.trace["O"] = o.detach()
         if self.snop:
             o = self.snop_mix(o, self.gate())
+            if self.trace is not None:
+                self.trace["O_final"] = o.detach()
         return self.o(o)
 
 
@@ -705,7 +712,7 @@ class QFormerGroup(nn.Module):
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
                  dropout: float = 0.0, snop: bool = False, n_tok: int | None = None,
-                 alpha_init: float = -2.0, eps: float = 0.05):
+                 alpha_init: float = -0.5, eps: float = 0.15):
         super().__init__()
         d = int(d_latent)
         att = {"snop": bool(snop), "n_tok": n_tok, "alpha_init": float(alpha_init),
@@ -773,8 +780,8 @@ class CnA(nn.Module):
     def __init__(self, d_feat: int, d_model: int, n_query: int = 16,
                  d_latent: int = 1024, head_dim: int = 128, mlp_hidden: int = 2048,
                  n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0,
-                 attn: str = "mha", snop_alpha_init: float = -2.0,
-                 snop_eps: float = 0.05):
+                 attn: str = "mha", snop_alpha_init: float = -0.5,
+                 snop_eps: float = 0.15):
         super().__init__()
         self.d_feat, self.d_model = int(d_feat), int(d_model)
         self.attn = str(attn)
@@ -1023,8 +1030,8 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 "dropout": float(cn.get("dropout", 0.0)),
                 # khoá vắng = MHA thuần (đúng nghĩa của mọi config trước /19)
                 "attn": _attn_kind(cn.get("attn", "mha")),
-                "snop_alpha_init": float(cn.get("snop_alpha_init", -2.0)),
-                "snop_eps": float(cn.get("snop_eps", 0.05))},
+                "snop_alpha_init": float(cn.get("snop_alpha_init", -0.5)),
+                "snop_eps": float(cn.get("snop_eps", 0.15))},
     }
 
 
@@ -1093,8 +1100,8 @@ def build_cna(spec: dict, d_feat: int) -> CnA:
     c = spec["cna"]
     return CnA(int(d_feat), spec["d_model"], c["n_query"], c["d_latent"],
                c["head_dim"], c["mlp_hidden"], c["n_blocks"], c["final_proj"],
-               c["dropout"], c.get("attn", "mha"), c.get("snop_alpha_init", -2.0),
-               c.get("snop_eps", 0.05))
+               c["dropout"], c.get("attn", "mha"), c.get("snop_alpha_init", -0.5),
+               c.get("snop_eps", 0.15))
 
 
 # ══ Nhánh hoàn chỉnh ════════════════════════════════════════════════════════

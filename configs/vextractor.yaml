@@ -345,11 +345,11 @@ vextractor:
     # α: mỗi lớp một VECTOR ℝ^8, thuộc nhóm lr `ffn` (1e-7 -> 1e-4).
     # `mha` = MHA thuần (§2.2). Không có loss phụ nào (không Entropy/Orthogonal).
     attn: snop
-    # c₀ = 0.05 + 0.95·σ(−2) ≈ 0.163. Khi 8 hàng O song song (attention gần đều —
-    # đúng trạng thái bước 0) phần chung của hàng i bị nhân 1 − c_i·7/9 ≈ 0.873;
+    # c₀ = 0.15 + 0.85·σ(−0.5) ≈ 0.471. Khi 8 hàng O song song (attention gần đều —
+    # đúng trạng thái bước 0) phần chung của hàng i bị nhân 1 − c_i·7/9 ≈ 0.634;
     # c_i < 1 nên thừa số luôn > 2/9: KHÔNG bao giờ đảo dấu.
-    snop_alpha_init: -2.0
-    snop_eps: 0.05          # lực phạt TỐI THIỂU: c ∈ [ε, 1)
+    snop_alpha_init: -0.5
+    snop_eps: 0.15          # lực phạt TỐI THIỂU: c ∈ [ε, 1)
 
   # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
   # CnA khởi tạo ngẫu nhiên và HỌC CÙNG LoRA NGAY TỪ BƯỚC 0. Warm-up tuyến tính
@@ -536,6 +536,8 @@ report:
 #   runs/<subdir>/Lens/Lens_Vision.html    Grad-CAM, nền luôn là X (ảnh 448² vào
 #        Extractor). 5 cột = 5 mẫu; target = ảnh hưởng lên y (log-prob báo cáo) QUA
 #        khối Q: dòng 1 cả khối Q (Σ ⟨∂y/∂Q[i], V_c[i]⟩), dòng 2 riêng Q[i] (pager).
+#        Cuối trang: ma trận cosine 8×8 giữa các token Q mỗi mẫu — O (trước SNOP),
+#        O_final (sau SNOP) của từng attention của CnA, và V_c — kèm cos̄ + erank.
 #   runs/<subdir>/Lens/Lens_Language.md    Jacobian ‖∂y/∂h‖ token × lớp, lưới 3 dòng
 #        (Z · Q · T) × 5 cột, thang màu CHUNG Z ∪ Q ∪ T trong mỗi cột + đường đứt ở
 #        lớp sâu nhất có token chạm ngưỡng; ma trận attention Q[i] ↔ token bệnh lý

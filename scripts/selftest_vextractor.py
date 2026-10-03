@@ -2082,6 +2082,22 @@ def _():
         assert html.startswith("<!doctype html>") and "id=\"pager\"" in html
         payload = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
         assert payload["nq"] == NQ and len(payload["samples"]) == 5
+        # ma trận similarity giữa các token Q (cuối HTML): O của mọi attention + V_c
+        keys_ = payload["sim_keys"]
+        assert "V_c" in keys_ and keys_[-1] == "V_c" and payload["snop"] is False
+        assert {f"g{i}.{nm} · O" for i in range(SMALL_NB)
+                for nm in ("self1", "cross", "self2")} <= set(keys_)
+        assert not any("O_final" in k_ for k_ in keys_)       # MHA thuần: không có O_final
+        assert 'id="simgrid"' in html and "Similarity giữa các token Q" in html
+        assert html.index('id="simgrid"') > html.index('id="grid"')
+        for s_ in payload["samples"]:
+            for k_ in keys_:
+                M_ = np.array(s_["sim"][k_]["cos"])
+                assert M_.shape == (NQ, NQ) and np.allclose(np.diag(M_), 1, atol=1e-3)
+                assert np.allclose(M_, M_.T, atol=1e-3)
+                assert 1 - 1e-6 <= s_["sim"][k_]["erank"] <= NQ + 1e-6
+        npz_ = np.load(d / "lens_maps.npz")
+        assert "sim_0_V_c" in npz_.files and "sim_0_g0_self1_O" in npz_.files
         for s_ in payload["samples"]:
             assert len(s_["q"]) == NQ and s_["ext"] and s_["x"]
             assert len(s_["q_share"]) == NQ and abs(sum(s_["q_share"]) - 1) < 1e-6
@@ -2489,7 +2505,7 @@ def _():
     assert all(m.training for m in tr2.bn_modules())
 
 @check("26. SNOP-MHA: O_final = [I − (c·1ᵀ)/(N + 1) ⊙ (stop_grad(Õ) ⊙ M_cross)]·O, "
-       "c = ε + (1 − ε)σ(α), α ∈ ℝ^N khởi tạo −2, ε = 0.05; khớp công thức dựng tay; "
+       "c = ε + (1 − ε)σ(α), α ∈ ℝ^N khởi tạo −0.5, ε = 0.15; khớp công thức dựng tay; "
        "Õ không nhận gradient, α và O thì có; α thuộc nhóm lr ffn, không tiêu RNG; "
        "config thật bật SNOP ở cả 3 attention")
 def _():
@@ -2516,12 +2532,12 @@ def _():
         m.alpha.copy_(alpha)
     assert torch.allclose(m.gate(), c, atol=1e-6)
     assert torch.allclose(MHA.snop_mix(o, m.gate()), ref, atol=1e-5)
-    # (b) mặc định: α₀ = −2, ε = 0.05; c ∈ [ε, 1) kể cả khi α → −∞
+    # (b) mặc định: α₀ = −0.5, ε = 0.15; c ∈ [ε, 1) kể cả khi α → −∞
     d = MHA(16, 4, None, snop=True, n_tok=N)
-    assert d.alpha.shape == (N,) and torch.all(d.alpha == -2.0) and d.eps == 0.05
+    assert d.alpha.shape == (N,) and torch.all(d.alpha == -0.5) and d.eps == 0.15
     with torch.no_grad():
         d.alpha.fill_(-80.0)
-    assert torch.allclose(d.gate(), torch.full((N,), 0.05))
+    assert torch.allclose(d.gate(), torch.full((N,), 0.15))
     # (c) w/ α KHÔNG tiêu RNG: chiếu q/k/v/o y hệt MHA thuần
     torch.manual_seed(1)
     a0 = MHA(16, 4, None)
@@ -2565,11 +2581,11 @@ def _():
     spec = R.spec_from_cfg({"vextractor": {
         **small_cfg()["vextractor"],
         "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop")}}, 32)
-    assert spec["cna"]["snop_alpha_init"] == -2.0 and spec["cna"]["snop_eps"] == 0.05
+    assert spec["cna"]["snop_alpha_init"] == -0.5 and spec["cna"]["snop_eps"] == 0.15
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
     assert len(gates) == 3 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
-    c0 = 0.05 + 0.95 / (1 + math.exp(2.0))
+    c0 = 0.15 + 0.85 / (1 + math.exp(0.5))
     assert all(abs(x - c0) < 1e-6 for v in gates.values() for x in v)
     ids = lambda it: {id(p) for p in it}  # noqa: E731
     ws = {id(mm.alpha) for mm in br.cna.modules()
@@ -2593,8 +2609,25 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
     assert cn["attn"] == "snop"
-    assert float(cn["snop_alpha_init"]) == -2.0 and float(cn["snop_eps"]) == 0.05
+    assert float(cn["snop_alpha_init"]) == -0.5 and float(cn["snop_eps"]) == 0.15
     assert R.FORMAT == "rgexp.vextractor/22"
+    # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
+    from src import lens_vextractor as LZ
+    import numpy as np
+    tr = MHA(16, 4, None, snop=True, n_tok=N)
+    tr.trace = {}
+    with torch.no_grad():
+        tr.alpha.fill_(5.0)                                  # c ≈ 1: phạt mạnh
+        xs = torch.randn(1, 1, 16).expand(1, N, 16) + 0.05 * torch.randn(1, N, 16)
+        tr(xs)
+    assert set(tr.trace) == {"O", "O_final"}
+    s0_ = LZ._token_sim(tr.trace["O"][0])
+    s1_ = LZ._token_sim(tr.trace["O_final"][0])
+    off = ~np.eye(N, dtype=bool)
+    assert s1_["cos"][off].mean() <= s0_["cos"][off].mean() + 1e-6
+    assert abs(LZ._token_sim(torch.ones(N, 4))["erank"] - 1.0) < 1e-4
+    assert abs(LZ._token_sim(torch.eye(N))["erank"] - N) < 1e-4
+    tr.trace = None
 
 
 print()
