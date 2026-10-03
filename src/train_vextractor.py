@@ -37,7 +37,7 @@ CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
     đây**, và học **CÙNG LoRA ngay từ bước 0**: warm-up tuyến tính trong
     `cna_warmup_frac` (10%) tổng số bước rồi PHẲNG tới bước cuối, với BA nhóm:
 
-        ffn   (SwiGLU + Linear cuối + RMSNorm + latent + α SNOP)  1e-7 -> 1e-4
+        ffn   (SwiGLU + Linear cuối + RMSNorm + latent)  1e-7 -> 1e-4
         self  (bốn chiếu của MỌI SelfAttn)               1e-8 -> 1e-5
         cross (bốn chiếu của Cross-attn)                 4e-8 -> 4e-5
 
@@ -62,7 +62,7 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian mỗi
 bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt ViT-S/16 ở 448² cho mỗi ảnh
-(chạy trong `no_grad`; phần nặng còn lại là CnA trên `n_query` (8) token).
+(chạy trong `no_grad`; phần nặng còn lại là CnA trên `n_query` (16) token).
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -582,6 +582,9 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
           f"clip {'tách LoRA/nhánh' if zc['separate_clip'] else 'chung'} · "
           f"che {zc['z_mask_frac']:.0%} token Z mỗi optimizer step",
           flush=True)
+    if branch.cna.snop_gates():
+        print(f"  SNOP-MHA: α = {branch.cna.snop_alpha:g} (hằng số, không học) ở "
+              f"{len(branch.cna.snop_gates())} lớp attention của CnA", flush=True)
     if 0 < n_awarm >= steps:
         print(f"  ⚠ CnA warm-up {n_awarm} >= tổng {steps} bước: nó KHÔNG "
               f"bao giờ chạm lr_main.", flush=True)
@@ -818,10 +821,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} · "
                   f"CnA {gn_br or 0:.3f} · lr LoRA {lr_now:.2e} · lr CnA "
                   f"ffn {alr:.2e} self {alr_self:.2e} cross {alr_cross:.2e} · "
-                  f"Z che {0 if z_drop is None else int(z_drop.numel())}"
-                  + ("" if not (_gs := branch.cna.snop_gates()) else
-                     " · SNOP c̄ " + " ".join(f"{sum(v) / len(v):.4f}"
-                                             for v in _gs.values())),
+                  f"Z che {0 if z_drop is None else int(z_drop.numel())}",
                   flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
@@ -836,10 +836,6 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                              f"train/{aid}/grad_norm_lora": gn_lora,
                              f"train/{aid}/grad_norm_branch": gn_br,
                              f"train/{aid}/pct": 100.0 * (step + 1) / steps,
-                             **{f"train/{aid}/snop_c/{k}/{st}": f(v)
-                                for k, v in branch.cna.snop_gates().items()
-                                for st, f in (("mean", lambda z: sum(z) / len(z)),
-                                              ("min", min), ("max", max))},
                              **vram_mod.device_usage()})
 
     pf.close()
@@ -888,7 +884,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         "val_loss_last": val_curve[-1]["loss"] if val_curve else None,
         "train_loss_first": first_loss, "train_loss": step_ce, "ce_last": step_ce,
         "q_rms_rel_last": rel_last,
-        "snop_c_last": branch.cna.snop_gates(),   # {lớp: [c_1..c_N]}; {} với MHA thuần
+        "snop_alpha": branch.cna.snop_gates(),   # {lớp: α hằng số}; {} với MHA thuần
         "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2), "seed": seed,
     }
     (out_dir / "train_stats.json").write_text(

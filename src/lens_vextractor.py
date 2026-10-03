@@ -894,7 +894,8 @@ min-width:1150px}
 .simwrap{overflow-x:auto}
 .mat{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);
 border-radius:4px;overflow:hidden;font-size:10px;font-variant-numeric:tabular-nums}
-.mat div{aspect-ratio:1;display:flex;align-items:center;justify-content:center}
+.mat div{aspect-ratio:1;display:flex;align-items:center;justify-content:center;
+min-width:0;overflow:hidden}
 .mat .ax{background:var(--card);color:var(--muted);font-weight:600}
 .dbar{width:180px;height:10px;border-radius:3px;
 background:linear-gradient(90deg,#2a5fb0,#f2f2f2 50%,#c0392b)}
@@ -932,9 +933,9 @@ phải nhân quả. 5 ảnh bốc ngẫu nhiên (seed cố định) để minh h
 <div class="notes" style="padding:12px 0 0">
 <p><b>Cách đọc.</b> Mỗi ô (i, j) = cos(Q[i], Q[j]) của biểu diễn đang chọn, trên đúng ảnh của cột đó.
 Ngoài chéo đỏ đậm = hai token gần cùng hướng (trùng lặp, gần collapse); màu nhạt (gần nền) = gần trực giao; xanh = ngược hướng.
-<code>cos̄</code> = trung bình cos ngoài chéo; <code>erank</code> = hạng hiệu dụng (exp entropy của phổ kỳ dị) ∈ [1, N] — 1 là collapse hẳn, N là 8 token trải đều 8 hướng.
+<code>cos̄</code> = trung bình cos ngoài chéo; <code>erank</code> = hạng hiệu dụng (exp entropy của phổ kỳ dị) ∈ [1, N] — 1 là collapse hẳn, N là N token trải đều N hướng. Ma trận lớn (N > 10) ẩn số trong ô — rê chuột để xem.
 <code>· O</code> = Concat(A_h V_h) trước SNOP; <code>· O_final</code> = sau phép trừ SNOP (chỉ có khi CnA dùng SNOP-MHA) — so cặp này để thấy SNOP tách các token tới đâu.
-<code>V_c</code> = 8 token thật sự vào decoder.</p>
+<code>V_c</code> = N token thật sự vào decoder.</p>
 </div>
 </section>
 <script>
@@ -1012,14 +1013,16 @@ function renderSim(){
     let off=0, cnt=0;
     for(let i=0;i<n;i++)for(let j=0;j<n;j++)if(i!==j){off+=m.cos[i][j];cnt++;}
     let h = '<div class="head">mẫu '+(k+1)+' · '+s.key+'</div>' +
-      '<div class="mat" style="grid-template-columns:repeat('+(n+1)+',1fr);margin-top:6px">' +
+      '<div class="mat" style="grid-template-columns:repeat('+(n+1)+',minmax(0,1fr));margin-top:6px;'+
+      (n > 10 ? 'font-size:8px;' : '')+'">' +
       '<div class="ax"></div>';
     for(let j=0;j<n;j++) h += '<div class="ax">'+j+'</div>';
     for(let i=0;i<n;i++){ h += '<div class="ax">'+i+'</div>';
       for(let j=0;j<n;j++){ const v=m.cos[i][j];
         const fg = Math.abs(v) > 0.55 ? '#fff' : 'inherit';
+        const txt = n > 10 ? '' : v.toFixed(2).replace(/^(-?)0\./,'$1.');
         h += '<div title="cos(Q['+i+'], Q['+j+']) = '+v.toFixed(3)+'" style="background:'+
-          simColor(v)+';color:'+fg+'">'+v.toFixed(2).replace(/^(-?)0\./,'$1.')+'</div>'; } }
+          simColor(v)+';color:'+fg+'">'+txt+'</div>'; } }
     h += '</div><div class="cap">cos̄ '+(cnt?off/cnt:0).toFixed(3)+' · erank '+
       m.erank.toFixed(2)+' / '+n+'</div>';
     c.innerHTML = h; g.appendChild(c);});
