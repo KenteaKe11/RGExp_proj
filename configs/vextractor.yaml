@@ -339,18 +339,19 @@ vextractor:
     # ── §2.2.2 SNOP-MHA (Soft Non-Orthogonality Penalty) ─────────────────────
     # MỌI attention của CnA (SelfAttn khối 1, CrossAttn, SelfAttn khối 2), N = 8 query:
     #   O       = Concat(A_h V_h)                      (N, H·d_v)
-    #   Õ       = stop_grad([Norm(O)·Norm(O)ᵀ]^∘2)     cos², KHÔNG nhận gradient
+    #   S       = Norm(O)·Norm(O)ᵀ                     cos, Norm = chuẩn hoá L2 theo hàng
+    #   Õ       = stop_grad(sign(S) ⊙ S) = |S|          |cos|, KHÔNG nhận gradient
     #   c       = ε + (1 − ε)·σ(α)                     α ∈ ℝ^N, một logit mỗi token
     #   O_final = [I − (c·1ᵀ)/(2 ln N + 1) ⊙ (Õ ⊙ M_cross)]·O  -> chiếu o.  M_cross = 1 − I
     # α: mỗi lớp một VECTOR ℝ^8, thuộc nhóm lr `ffn` (1e-7 -> 1e-4).
     # `mha` = MHA thuần (§2.2). Không có loss phụ nào (không Entropy/Orthogonal).
     attn: snop
-    # c₀ = 0.25 + 0.75·σ(0) = 0.625. Khi 8 hàng O song song (attention gần đều —
+    # c₀ = 0.15 + 0.85·σ(0) = 0.575. Khi 8 hàng O song song (attention gần đều —
     # đúng trạng thái bước 0) phần chung của hàng i bị nhân
-    # 1 − c_i·7/(2 ln 8 + 1) = 1 − 1.357·c_i ≈ 0.152 (còn dương).
-    # Ngưỡng đảo dấu: c_i > 0.737 (α_i > 0.616). c ∈ [0.25, 1) -> thừa số ∈ (−0.36, 0.66].
+    # 1 − c_i·7/(2 ln 8 + 1) = 1 − 1.357·c_i ≈ 0.220 (còn dương).
+    # Ngưỡng đảo dấu: c_i > 0.737 (α_i > 0.803). c ∈ [0.15, 1) -> thừa số ∈ (−0.36, 0.80].
     snop_alpha_init: 0.0
-    snop_eps: 0.25          # lực phạt TỐI THIỂU: c ∈ [ε, 1)
+    snop_eps: 0.15          # lực phạt TỐI THIỂU: c ∈ [ε, 1)
 
   # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
   # CnA khởi tạo ngẫu nhiên và HỌC CÙNG LoRA NGAY TỪ BƯỚC 0. Warm-up tuyến tính

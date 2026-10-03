@@ -2504,8 +2504,8 @@ def _():
     tr2.train()
     assert all(m.training for m in tr2.bn_modules())
 
-@check("26. SNOP-MHA: O_final = [I − (c·1ᵀ)/(2 ln N + 1) ⊙ (stop_grad(Õ) ⊙ M_cross)]·O, "
-       "c = ε + (1 − ε)σ(α), α ∈ ℝ^N khởi tạo 0, ε = 0.25; khớp công thức dựng tay; "
+@check("26. SNOP-MHA: O_final = [I − (c·1ᵀ)/(2 ln N + 1) ⊙ (Õ ⊙ M_cross)]·O, Õ = stop_grad(sign(S)⊙S), S = L2-cos, "
+       "c = ε + (1 − ε)σ(α), α ∈ ℝ^N khởi tạo 0, ε = 0.15; khớp công thức dựng tay; "
        "Õ không nhận gradient, α và O thì có; α thuộc nhóm lr ffn, không tiêu RNG; "
        "config thật bật SNOP ở cả 3 attention")
 def _():
@@ -2525,19 +2525,20 @@ def _():
     alpha = torch.linspace(-3, 1, N)
     c = 0.05 + 0.95 * torch.sigmoid(alpha)
     u = F.normalize(o, dim=-1)
-    S = (u @ u.transpose(1, 2)).square() * (1 - torch.eye(N))
+    S_ = u @ u.transpose(1, 2)
+    S = (torch.sign(S_) * S_) * (1 - torch.eye(N))           # sign(S) ⊙ S
     ref = (torch.eye(N) - (c.view(N, 1) @ torch.ones(1, N)) / (2 * math.log(N) + 1) * S) @ o
     m = MHA(16, 4, None, snop=True, n_tok=N, alpha_init=0.0, eps=0.05)
     with torch.no_grad():
         m.alpha.copy_(alpha)
     assert torch.allclose(m.gate(), c, atol=1e-6)
     assert torch.allclose(MHA.snop_mix(o, m.gate()), ref, atol=1e-5)
-    # (b) mặc định: α₀ = 0, ε = 0.25; c ∈ [ε, 1) kể cả khi α → −∞
+    # (b) mặc định: α₀ = 0, ε = 0.15; c ∈ [ε, 1) kể cả khi α → −∞
     d = MHA(16, 4, None, snop=True, n_tok=N)
-    assert d.alpha.shape == (N,) and torch.all(d.alpha == 0.0) and d.eps == 0.25
+    assert d.alpha.shape == (N,) and torch.all(d.alpha == 0.0) and d.eps == 0.15
     with torch.no_grad():
         d.alpha.fill_(-80.0)
-    assert torch.allclose(d.gate(), torch.full((N,), 0.25))
+    assert torch.allclose(d.gate(), torch.full((N,), 0.15))
     # (c) w/ α KHÔNG tiêu RNG: chiếu q/k/v/o y hệt MHA thuần
     torch.manual_seed(1)
     a0 = MHA(16, 4, None)
@@ -2545,25 +2546,32 @@ def _():
     b0 = MHA(16, 4, None, snop=True, n_tok=N)
     for n_ in ("q", "k", "v", "o"):
         assert torch.equal(getattr(a0, n_).weight, getattr(b0, n_).weight), n_
-    # (d) token trực giao: cos² = 0 -> không trừ gì
+    # (d') |cos|, không cos²: góc 60° -> Õ = 0.5; ngược hướng -> Õ = 1 (sign(S)⊙S)
+    two = torch.tensor([[[1.0, 0.0], [0.5, math.sqrt(3) / 2]]])
+    y2 = MHA.snop_mix(two, torch.tensor([1.0, 1.0]))
+    assert torch.allclose(y2[0, 0], two[0, 0] - 0.5 / (2 * math.log(2) + 1) * two[0, 1], atol=1e-6)
+    anti = torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]])
+    ya = MHA.snop_mix(anti, torch.tensor([1.0, 1.0]))
+    assert torch.allclose(ya[0, 0], torch.tensor([1 + 1 / (2 * math.log(2) + 1), 0.0]), atol=1e-6)
+    # (d) token trực giao: |cos| = 0 -> không trừ gì
     oo = 3 * torch.eye(N).unsqueeze(0)
     assert torch.equal(MHA.snop_mix(oo, torch.full((N,), 0.9)), oo)
     # (e) collapse hoàn toàn: hàng i × (1 − c_i·(N−1)/(2 ln N + 1))
     y = MHA.snop_mix(torch.ones(1, N, 4), c)
     want = (1 - c * (N - 1) / (2 * math.log(N) + 1)).view(1, N, 1).expand(1, N, 4)
     assert torch.allclose(y, want, atol=1e-6)
-    # mặc định (α = 0, ε = 0.25), N = 8: c₀ = 0.625, thừa số ≈ 0.152 — còn dương
+    # mặc định (α = 0, ε = 0.15), N = 8: c₀ = 0.575, thừa số ≈ 0.220 — còn dương
     c_def = MHA(16, 4, None, snop=True, n_tok=N).gate().detach()
     y0 = MHA.snop_mix(torch.ones(1, N, 4), c_def)
     assert torch.allclose(y0, torch.full_like(y0, 1 - float(c_def[0]) * 7 / (2 * math.log(8) + 1)),
-                          atol=1e-6) and 0.15 < float(y0.min()) < 0.16
+                          atol=1e-6) and 0.21 < float(y0.min()) < 0.23
     # (f) stop_grad(Õ): gradient qua thừa số O + α, KHÔNG qua Õ
     o1 = torch.randn(1, N, 16, requires_grad=True)
     cg = c.clone().requires_grad_(True)
     MHA.snop_mix(o1, cg).sum().backward()
     with torch.no_grad():
         u1 = F.normalize(o1, dim=-1)
-        S1 = (u1 @ u1.transpose(1, 2)).square() * (1 - torch.eye(N))
+        S1 = (u1 @ u1.transpose(1, 2)).abs() * (1 - torch.eye(N))
         A1 = torch.eye(N) - (cg.view(N, 1) / (2 * math.log(N) + 1)) * S1[0]
     # Õ là hằng số -> dY/dO = Aᵀ·1 đúng như phép tuyến tính
     assert torch.allclose(o1.grad[0], A1.t() @ torch.ones(N, 16), atol=1e-5)
@@ -2583,11 +2591,11 @@ def _():
     spec = R.spec_from_cfg({"vextractor": {
         **small_cfg()["vextractor"],
         "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop")}}, 32)
-    assert spec["cna"]["snop_alpha_init"] == 0.0 and spec["cna"]["snop_eps"] == 0.25
+    assert spec["cna"]["snop_alpha_init"] == 0.0 and spec["cna"]["snop_eps"] == 0.15
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
     assert len(gates) == 3 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
-    c0 = 0.25 + 0.75 / (1 + math.exp(0.0))
+    c0 = 0.15 + 0.85 / (1 + math.exp(0.0))
     assert all(abs(x - c0) < 1e-6 for v in gates.values() for x in v)
     ids = lambda it: {id(p) for p in it}  # noqa: E731
     ws = {id(mm.alpha) for mm in br.cna.modules()
@@ -2611,8 +2619,8 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
     assert cn["attn"] == "snop"
-    assert float(cn["snop_alpha_init"]) == 0.0 and float(cn["snop_eps"]) == 0.25
-    assert R.FORMAT == "rgexp.vextractor/23"
+    assert float(cn["snop_alpha_init"]) == 0.0 and float(cn["snop_eps"]) == 0.15
+    assert R.FORMAT == "rgexp.vextractor/24"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     from src import lens_vextractor as LZ
     import numpy as np
