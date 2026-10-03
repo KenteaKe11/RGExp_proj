@@ -2489,8 +2489,8 @@ def _():
     assert all(m.training for m in tr2.bn_modules())
 
 @check("26. SNOP-MHA: Y = [I − σ(w)·(Õ ⊙ M_cross)]·O khớp công thức; g → 0 là MHA thuần; "
-       "token trực giao không bị đụng; gần collapse nhân phần chung 1 − (N−1)g; w_head "
-       "nhận gradient, đi đúng nhóm lr, không tiêu RNG; config thật bật SNOP ở cả 3 attention")
+       "token trực giao không bị đụng; Õ chia (N−1) nên collapse nhân phần chung ĐÚNG 1 − g; "
+       "w_head nhận gradient, thuộc nhóm lr ffn, không tiêu RNG; config thật bật SNOP ở cả 3 attention")
 def _():
     import torch
     import torch.nn.functional as F
@@ -2505,7 +2505,7 @@ def _():
     g = torch.sigmoid(torch.tensor(0.3))
     u = F.normalize(o, dim=-1)
     S = (u @ u.transpose(1, 2)).square() * (1 - torch.eye(8))
-    ref = (torch.eye(8) - g * S) @ o
+    ref = (torch.eye(8) - g / 7 * S) @ o
     assert torch.allclose(MHA.snop_mix(o, g), ref, atol=1e-5)
     # (b) g -> 0: MHA thuần, và w_head KHÔNG tiêu RNG (chiếu q/k/v/o y hệt)
     torch.manual_seed(1)
@@ -2519,10 +2519,14 @@ def _():
     # (c) token trực giao: cos² = 0 -> không trừ gì
     o = 3 * torch.eye(8).unsqueeze(0)
     assert torch.equal(MHA.snop_mix(o, torch.tensor(0.9)), o)
-    # (d) collapse hoàn toàn (8 hàng song song): phần chung × (1 − 7g)
-    g = torch.sigmoid(torch.tensor(-3.0))
-    y = MHA.snop_mix(torch.ones(1, 8, 4), g)
-    assert torch.allclose(y, torch.full_like(y, 1 - 7 * float(g)), atol=1e-6)
+    # (d) collapse hoàn toàn (N hàng song song): phần chung × ĐÚNG (1 − g), mọi N
+    for n_tok in (2, 8, 16):
+        for gv in (0.1, 0.5, 0.99):
+            y = MHA.snop_mix(torch.ones(1, n_tok, 4), torch.tensor(gv))
+            assert torch.allclose(y, torch.full_like(y, 1 - gv), atol=1e-6), (n_tok, gv)
+    # N = 1: không có token khác -> không trừ gì, không chia 0
+    one = torch.randn(1, 1, 4)
+    assert torch.equal(MHA.snop_mix(one, torch.tensor(0.9)), one)
     # (e) gradient tới w_head (cổng chưa bão hoà) và cả Õ
     c = MHA(16, 4, None, snop=True, w_init=0.0)
     c(torch.randn(2, 8, 16)).square().sum().backward()
@@ -2530,20 +2534,20 @@ def _():
     # (f) cross-attn: N = số query, không phải số patch
     cr = MHA(16, 4, 12, snop=True)
     assert cr(torch.randn(2, 8, 16), torch.randn(2, 50, 12)).shape == (2, 8, 16)
-    # (g) CnA SNOP: 3 cổng / nhóm, nằm trong self/cross, phân hoạch còn kín
+    # (g) CnA SNOP: 3 cổng / nhóm, nằm trong nhóm ffn (KHÔNG self/cross), phân hoạch còn kín
     spec = R.spec_from_cfg({"vextractor": {
         **small_cfg()["vextractor"],
-        "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop", snop_w_init=-3.0)}}, 32)
+        "cna": dict(small_cfg()["vextractor"]["cna"], attn="snop", snop_w_init=0.0)}}, 32)
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
     assert len(gates) == 3 * SMALL_NB, gates
-    assert all(abs(v - float(torch.sigmoid(torch.tensor(-3.0)))) < 1e-6
-               for v in gates.values())
+    assert all(abs(v - 0.5) < 1e-6 for v in gates.values())
     ws = {id(m.w_head) for m in br.cna.modules()
           if isinstance(m, MHA) and m.w_head is not None}
     ids = lambda it: {id(p) for p in it}  # noqa: E731
-    assert ws <= ids(br.cna.self_parameters()) | ids(br.cna.cross_parameters())
-    assert not ws & ids(br.cna.ffn_parameters())
+    assert ws == ids(br.cna.snop_parameters())
+    assert ws <= ids(br.cna.ffn_parameters())
+    assert not ws & (ids(br.cna.self_parameters()) | ids(br.cna.cross_parameters()))
     allp = (list(br.cna.self_parameters()) + list(br.cna.cross_parameters())
             + list(br.cna.ffn_parameters()))
     assert len(allp) == len({id(p) for p in allp}) == len(list(br.cna.parameters()))
@@ -2558,13 +2562,11 @@ def _():
         raise AssertionError("attn lạ phải bị từ chối")
     except R.VExtractorUnusable:
         pass
-    # (i) config THẬT: SNOP bật, g₀ < 1/(n_query − 1) (không đảo dấu phần chung)
+    # (i) config THẬT: SNOP bật, w_head khởi tạo 0 (g₀ = 0.5)
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop"
-    g0 = float(torch.sigmoid(torch.tensor(float(cn["snop_w_init"]))))
-    assert g0 < 1.0 / (int(cn["n_query"]) - 1), g0
-    assert R.FORMAT == "rgexp.vextractor/19"
+    assert cn["attn"] == "snop" and float(cn["snop_w_init"]) == 0.0
+    assert R.FORMAT == "rgexp.vextractor/20"
 
 
 print()

@@ -339,20 +339,20 @@ vextractor:
     # ── §2.2.2 SNOP-MHA (Soft Non-Orthogonality Penalty) ─────────────────────
     # MỌI attention của CnA (SelfAttn khối 1, CrossAttn, SelfAttn khối 2):
     #   O = Concat(A_h V_h) (N=8, H·d_v);  Õ = [Norm(O)·Norm(O)ᵀ]^∘2
-    #   Y = [I − σ(w_head)·(Õ ⊙ M_cross)]·O  -> chiếu o.   M_cross = 1 − I.
-    # w_head: MỘT vô hướng mỗi lớp, đi cùng nhóm lr của lớp (self / cross).
+    #   Y = [I − σ(w_head)/(N−1)·(Õ ⊙ M_cross)]·O  -> chiếu o.   M_cross = 1 − I.
+    # w_head: MỘT vô hướng mỗi lớp, thuộc nhóm lr `ffn` (1e-7 -> 1e-4).
     # `mha` = MHA thuần (§2.2). Không có loss phụ nào (không Entropy/Orthogonal).
     attn: snop
-    # g₀ = σ(−3) ≈ 0.047. Khi 8 hàng O gần song song (attention gần đều — đúng
-    # trạng thái bước 0) thành phần chung bị nhân 1 − 7g: g > 1/7 là ĐẢO DẤU nó.
-    # Với ~200 bước ở lr 1e-5..4e-5, Adam chỉ dịch w_head cỡ 1e-2 -> g gần như
-    # giữ nguyên g₀ suốt main stage: số này thực chất là siêu tham số.
-    snop_w_init: -3.0
+    # g₀ = σ(0) = 0.5. Chia (N−1): khi cả 8 hàng O song song (attention gần đều —
+    # đúng trạng thái bước 0) phần chung bị nhân ĐÚNG 1 − g = 0.5, không bao giờ
+    # đảo dấu. Ở nhóm ffn (lr ≤ 1e-4, ~200 bước) Adam chỉ dịch w_head cỡ 2e-2 ->
+    # g gần như giữ g₀ suốt main stage: số này thực chất là siêu tham số.
+    snop_w_init: 0.0
 
   # ── Main stage: MỘT khối học được, BA nhóm lr (`src/train_vextractor.py`) ──
   # CnA khởi tạo ngẫu nhiên và HỌC CÙNG LoRA NGAY TỪ BƯỚC 0. Warm-up tuyến tính
   # `cna_warmup_frac` (10%) tổng bước rồi PHẲNG; cùng MỘT dốc cho cả ba nhóm:
-  #     ffn   (SwiGLU + Linear cuối + RMSNorm + latent)  1e-7 -> 1e-4
+  #     ffn   (SwiGLU + Linear cuối + RMSNorm + latent + w_head SNOP)  1e-7 -> 1e-4
   #     self  (4 chiếu của mọi SelfAttn)                 1e-8 -> 1e-5
   #     cross (4 chiếu của Cross-attn)                   4e-8 -> 4e-5
   # Ba nhóm là một PHÂN HOẠCH của CnA; `train` DỪNG nếu không.

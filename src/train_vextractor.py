@@ -37,7 +37,7 @@ CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
     đây**, và học **CÙNG LoRA ngay từ bước 0**: warm-up tuyến tính trong
     `cna_warmup_frac` (10%) tổng số bước rồi PHẲNG tới bước cuối, với BA nhóm:
 
-        ffn   (SwiGLU + Linear cuối + RMSNorm + latent)  1e-7 -> 1e-4
+        ffn   (SwiGLU + Linear cuối + RMSNorm + latent + w_head SNOP)  1e-7 -> 1e-4
         self  (bốn chiếu của MỌI SelfAttn)               1e-8 -> 1e-5
         cross (bốn chiếu của Cross-attn)                 4e-8 -> 4e-5
 
