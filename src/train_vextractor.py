@@ -38,6 +38,7 @@ CnA khởi tạo ngẫu nhiên và học từ đầu ở đây.
     `cna_warmup_frac` (10%) tổng số bước rồi PHẲNG tới bước cuối, với BA nhóm:
 
         ffn   (SwiGLU + Linear cuối + RMSNorm + latent)  1e-7 -> 1e-4
+        snop  (W_α của SNOP-MHA)  = cna_snop_lr_mult (×10) × ffn: 1e-6 -> 1e-3
         self  (bốn chiếu của MỌI SelfAttn)               1e-8 -> 1e-5
         cross (bốn chiếu của Cross-attn)                 4e-8 -> 4e-5
 
@@ -98,14 +99,16 @@ from .train_recomb import ClsReportDataset, collate_cls, eval_cfg, val_indices
 MAIN_CFG_KEYS = ("cna_ffn_lr_min", "cna_ffn_lr_main",
                  "cna_self_lr_min", "cna_self_lr_main",
                  "cna_cross_lr_min", "cna_cross_lr_main",
+                 "cna_snop_lr_mult",
                  "cna_warmup_frac", "cna_wd",
                  "z_mask_frac", "separate_clip")
 
 # BA nhóm tham số của nhánh ở main stage — cả ba đều của CnA, vì Extractor đóng
 # băng hoàn toàn. Tên của chúng là KHÓA: optimizer đặt lr theo tên chứ không
 # theo chỉ số, vì chỉ số đổi im lặng mỗi lần ai đó chèn một nhóm vào giữa.
-BRANCH_GROUPS = ("cna_ffn", "cna_self", "cna_cross")
-_GROUP_KEY = {"cna_ffn": "ffn", "cna_self": "self", "cna_cross": "cross"}
+BRANCH_GROUPS = ("cna_ffn", "cna_self", "cna_cross", "cna_snop")
+_GROUP_KEY = {"cna_ffn": "ffn", "cna_self": "self", "cna_cross": "cross",
+              "cna_snop": "snop"}
 
 
 def zcfg(cfg: Cfg) -> dict:
@@ -134,6 +137,7 @@ def zcfg(cfg: Cfg) -> dict:
            "cna_self_lr_main": float(m.get("cna_self_lr_main", 1e-5)),
            "cna_cross_lr_min": float(m.get("cna_cross_lr_min", 4e-8)),
            "cna_cross_lr_main": float(m.get("cna_cross_lr_main", 4e-5)),
+           "cna_snop_lr_mult": float(m.get("cna_snop_lr_mult", 10.0)),
            "cna_warmup_frac": float(m.get("cna_warmup_frac", 0.10)),
            "cna_wd": float(m.get("cna_wd", 0.01)),
            "z_mask_frac": float(m.get("z_mask_frac", 0.25)),
@@ -154,6 +158,10 @@ def zcfg(cfg: Cfg) -> dict:
             f"vextractor.main: cần self {out['cna_self_lr_main']} <= cross "
             f"{out['cna_cross_lr_main']} <= ffn {out['cna_ffn_lr_main']} — "
             f"attention là nhóm CHẬM hơn FFN; đảo lại là đảo đúng lý do tách nhóm.")
+    if not out["cna_snop_lr_mult"] > 0:
+        raise TrainUnusable(
+            f"vextractor.main.cna_snop_lr_mult {out['cna_snop_lr_mult']} phải > 0 "
+            f"— lr của W_α (SNOP) = hệ số này × lr nhóm ffn.")
     if not 0.0 <= out["cna_warmup_frac"] <= 1.0:
         raise TrainUnusable(
             f"vextractor.main.cna_warmup_frac {out['cna_warmup_frac']} "
@@ -168,8 +176,9 @@ def zcfg(cfg: Cfg) -> dict:
 def cna_lr_at(step: int, zc: dict, total_steps: int) -> dict:
     """lr của CnA tại bước `step` (0-based) — dốc TUYẾN TÍNH rồi PHẲNG.
 
-    Trả `{"ffn": …, "self": …, "cross": …}`: BA nhóm, cùng MỘT dốc (cùng
-    `cna_warmup_frac`), ba cặp số.
+    Trả `{"ffn": …, "self": …, "cross": …, "snop": …}`: BỐN nhóm, cùng MỘT dốc
+    (cùng `cna_warmup_frac`). `snop` (W_α của SNOP-MHA) = `cna_snop_lr_mult` ×
+    `ffn` ở MỌI bước (1e-6 -> 1e-3 với hệ số 10).
 
         w  = round(cna_warmup_frac · total_steps)
         lr = lr_min + (lr_main − lr_min) · min(1, step / w)
@@ -177,9 +186,11 @@ def cna_lr_at(step: int, zc: dict, total_steps: int) -> dict:
     Nội suy trên GIÁ TRỊ lr, nên bước 0 có ĐÚNG `cna_*_lr_min`.
     """
     w = SCH.steps_for_frac(total_steps, zc["cna_warmup_frac"])
-    return {g: SCH.warmup_flat(step, w, zc[f"cna_{g}_lr_min"],
-                               zc[f"cna_{g}_lr_main"])
-            for g in ("ffn", "self", "cross")}
+    out = {g: SCH.warmup_flat(step, w, zc[f"cna_{g}_lr_min"],
+                              zc[f"cna_{g}_lr_main"])
+           for g in ("ffn", "self", "cross")}
+    out["snop"] = zc["cna_snop_lr_mult"] * out["ffn"]
+    return out
 
 
 def z_mask_positions(ids, image_token_id: int, frac: float, seed: int, step: int):
@@ -538,20 +549,22 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     # CHỈ CnA. Extractor KHÔNG có mặt ở đây: một tham số bị đóng băng nằm trong
     # optimizer vẫn bị weight decay ăn mòn mỗi bước dù grad là None.
-    # BA danh sách, và chúng PHỦ KÍN CnA: `self_parameters` + `cross_parameters`
-    # + `ffn_parameters` là một PHÂN HOẠCH (selftest kiểm bằng `id()`), nên không
+    # BỐN danh sách, và chúng PHỦ KÍN CnA: `self_parameters` + `cross_parameters`
+    # + `ffn_parameters` + `snop_parameters` là một PHÂN HOẠCH (selftest kiểm bằng
+    # `id()`; `snop` rỗng với MHA thuần), nên không
     # tham số nào bị bỏ ngoài optimizer — một tham số học được nằm ngoài
     # optimizer là một tensor đứng yên suốt 200 bước mà không có gì báo.
     pg = {"cna_ffn": list(branch.cna.ffn_parameters()),
           "cna_self": list(branch.cna.self_parameters()),
-          "cna_cross": list(branch.cna.cross_parameters())}
+          "cna_cross": list(branch.cna.cross_parameters()),
+          "cna_snop": list(branch.cna.snop_parameters())}
     cna_p = [q for g in BRANCH_GROUPS for q in pg[g]]
     n_cover = len(cna_p)
     n_have = len(list(branch.cna.parameters()))
     if (n_cover != n_have or len({id(q) for q in cna_p}) != n_cover
             or {id(q) for q in cna_p} != {id(q) for q in branch.cna.parameters()}):
         raise TrainUnusable(
-            f"ba nhóm lr phủ {n_cover} tensor nhưng CnA có {n_have} (hoặc có "
+            f"các nhóm lr phủ {n_cover} tensor nhưng CnA có {n_have} (hoặc có "
             f"tensor nằm trong hai nhóm) — một tensor học được nằm ngoài "
             f"optimizer là một tensor đứng yên suốt {steps} bước mà không có gì "
             f"báo.")
@@ -565,7 +578,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
     _a0 = cna_lr_at(0, zc, steps)
     opt_b = torch.optim.AdamW(
         [{"params": pg[g], "lr": _a0[_GROUP_KEY[g]], "weight_decay": zc["cna_wd"],
-          "name": g} for g in BRANCH_GROUPS],
+          "name": g} for g in BRANCH_GROUPS if pg[g]],      # snop rỗng với MHA thuần
         betas=(0.9, 0.999), eps=1e-8)
     branch_p = cna_p
     s_, _pk = cycle_endpoints(main_lr, float(tcfg["schedule"].get("div_factor", 25.0)),
@@ -583,8 +596,11 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
           f"che {zc['z_mask_frac']:.0%} token Z mỗi optimizer step",
           flush=True)
     if branch.cna.snop_gates():
-        print(f"  SNOP-MHA: α = {branch.cna.snop_alpha:g} (hằng số, không học) ở "
-              f"{len(branch.cna.snop_gates())} lớp attention của CnA", flush=True)
+        print(f"  SNOP-MHA thích ứng: ε = {branch.cna.snop_eps:g}, W_α₀ = "
+              f"{branch.cna.snop_w_init:g} ∈ ℝ^{branch.cna.n_query} ở "
+              f"{len(branch.cna.snop_gates())} lớp attention · lr W_α = "
+              f"×{zc['cna_snop_lr_mult']:g} ffn ({zc['cna_snop_lr_mult'] * zc['cna_ffn_lr_min']:g}"
+              f" -> {zc['cna_snop_lr_mult'] * zc['cna_ffn_lr_main']:g})", flush=True)
     if 0 < n_awarm >= steps:
         print(f"  ⚠ CnA warm-up {n_awarm} >= tổng {steps} bước: nó KHÔNG "
               f"bao giờ chạm lr_main.", flush=True)
@@ -782,7 +798,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         # im lặng và các nhóm đổi lịch cho nhau mà không có gì báo.
         for grp in opt_b.param_groups:
             grp["lr"] = _a[_GROUP_KEY[grp["name"]]]
-        alr, alr_self, alr_cross = _a["ffn"], _a["self"], _a["cross"]
+        alr, alr_self, alr_cross, alr_snop = _a["ffn"], _a["self"], _a["cross"], _a["snop"]
         # KHÔNG có bước mở băng nào ở đây — Extractor đóng băng trước vòng lặp.
         opt.zero_grad(set_to_none=True)
         opt_b.zero_grad(set_to_none=True)
@@ -821,7 +837,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                   f"RMS(Q)/RMS(Z) {rel_last:.4f} · ‖g‖ LoRA {gn_lora or 0:.3f} · "
                   f"CnA {gn_br or 0:.3f} · lr LoRA {lr_now:.2e} · lr CnA "
                   f"ffn {alr:.2e} self {alr_self:.2e} cross {alr_cross:.2e} · "
-                  f"Z che {0 if z_drop is None else int(z_drop.numel())}",
+                  f"Z che {0 if z_drop is None else int(z_drop.numel())}"
+                  + ("" if not (_gs := branch.cna.snop_gates()) else
+                     " · SNOP c̄ " + " ".join(f"{sum(v) / len(v):.4f}"
+                                             for v in _gs.values())),
                   flush=True)
             if tracker is not None:
                 tracker.log({f"train/{aid}/loss": step_ce, f"train/{aid}/ce": step_ce,
@@ -829,6 +848,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                              f"train/{aid}/lr_cna_ffn": alr,
                              f"train/{aid}/lr_cna_self": alr_self,
                              f"train/{aid}/lr_cna_cross": alr_cross,
+                             f"train/{aid}/lr_cna_snop": alr_snop,
                              f"train/{aid}/z_masked": (0 if z_drop is None
                                                        else int(z_drop.numel())),
                              f"train/{aid}/step": step + 1,
@@ -836,6 +856,10 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                              f"train/{aid}/grad_norm_lora": gn_lora,
                              f"train/{aid}/grad_norm_branch": gn_br,
                              f"train/{aid}/pct": 100.0 * (step + 1) / steps,
+                             **{f"train/{aid}/snop_c/{k}/{st}": f(v)
+                                for k, v in branch.cna.snop_gates().items()
+                                for st, f in (("mean", lambda z: sum(z) / len(z)),
+                                              ("min", min), ("max", max))},
                              **vram_mod.device_usage()})
 
     pf.close()
@@ -884,7 +908,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
         "val_loss_last": val_curve[-1]["loss"] if val_curve else None,
         "train_loss_first": first_loss, "train_loss": step_ce, "ce_last": step_ce,
         "q_rms_rel_last": rel_last,
-        "snop_alpha": branch.cna.snop_gates(),   # {lớp: α hằng số}; {} với MHA thuần
+        "snop_c_last": branch.cna.snop_gates(),   # {lớp: [c_1..c_N]}; {} với MHA thuần
         "minutes": round(mins, 1), "vram_peak_gb": round(peak, 2), "seed": seed,
     }
     (out_dir / "train_stats.json").write_text(
