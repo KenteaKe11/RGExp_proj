@@ -2,8 +2,8 @@
 
 DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`) chạy ở ảnh 448x448 cho lưới
 28x28 patch token 384 kênh; V = concat theo kênh của 3 block cuối (mỗi block qua
-norm cuối, bỏ 5 prefix token cls + register) = 784 x 1152. CnA là MỘT QFormer duy nhất: 12 latent @1280, N = 2 nhóm (Self → Cross → FFN) đọc V qua
-Cross-attn (k/v chiếu 1152 -> 1280), rồi một Linear cuối 1280 -> 2560 đưa chúng vào
+norm cuối, bỏ 5 prefix token cls + register) = 784 x 1152. CnA là MỘT QFormer duy nhất: 12 latent @2048, N = 1 nhóm (Self → Cross → FFN) đọc V qua
+Cross-attn (k/v chiếu 1152 -> 2048), rồi một Linear cuối 2048 -> 2560 đưa chúng vào
 không gian của decoder (V_c = 12 x 2560, nối vào chuỗi sau token ảnh Z).
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì CnA KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/27"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280
+FORMAT = "rgexp.vextractor/28"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280 · /28 N = 1, @2048, SwiGLU 3072
 
 
 class VExtractorUnusable(RuntimeError):
@@ -706,15 +706,15 @@ class QFormerGroup(nn.Module):
     Pre-norm + residual quanh TỪNG khối con: `N` là RMSNorm, dấu `+` vòng quanh
     riêng khối con ngay trước nó (3 dấu `+` / 3 RMSNorm, hoặc 5 với khối 2).
 
-    Tham số ở `d_latent` = 1280, `d_kv` = 1152 (k/v chiếu 1152→1280 ngay trong
-    Cross-attn), `mlp_hidden` = 2048, chỉ khối 1:
+    Tham số ở `d_latent` = 2048, `d_kv` = 1152 (k/v chiếu 1152→2048 ngay trong
+    Cross-attn), `mlp_hidden` = 3072, chỉ khối 1:
 
-        SelfAttn  4 × 1280²                = 6 553 600
-        CrossAttn 2 × 1280² + 2×1152×1280  = 6 225 920
-        SwiGLU    3 × 1280 × 2048          = 7 864 320
-        3 × RMSNorm(1280)                  =     3 840
+        SelfAttn  4 × 2048²                = 16 777 216
+        CrossAttn 2 × 2048² + 2×1152×2048  = 13 107 200
+        SwiGLU    3 × 2048 × 3072          = 18 874 368
+        3 × RMSNorm(2048)                  =      6 144
         ─────────────────────────────────────────────
-        MỘT nhóm (khối 1)                  = 20 647 680   (≈ 20,65 M)
+        MỘT nhóm (khối 1)                  = 48 764 928   (≈ 48,76 M)
         (+ W_α của SNOP: 2 × n_query)
     """
 
@@ -777,9 +777,9 @@ class CnA(nn.Module):
     """Compressor & Aligner: V (B, n_patch, d_feat) -> V_c (B, n_query, d_model).
 
         kv  = RMSNorm(V)                         1152, MỘT lần, ngoài mọi nhóm
-        h   = latent.expand(B)                   (B, 12, 1280)
-        h   = group_i(h, kv)   với i = 1..N      khối 1 (Self → Cross → FFN), N = n_blocks = 2
-        V_c = Linear(RMSNorm(h))                 1280 -> 2560 (Linear project cuối)
+        h   = latent.expand(B)                   (B, 12, 2048)
+        h   = group_i(h, kv)   với i = 1..N      khối 1 (Self → Cross → FFN), N = n_blocks = 1
+        V_c = Linear(RMSNorm(h))                 2048 -> 2560 (Linear project cuối)
 
     MỘT QFormer làm cả hai việc: **nén** lưới 784 ô vào `n_query` (12) latent (Cross-attn
     của MỌI nhóm) và **căn chỉnh** chúng vào không gian ngữ nghĩa của decoder
@@ -787,7 +787,7 @@ class CnA(nn.Module):
 
     * Số latent là khoá KHAI (`n_query`, 12) — lưới của Extractor chỉ là NGUỒN để hỏi.
     * `RMSNorm(d_feat)` trên V là khối DUY NHẤT đứng giữa Extractor và QFormer;
-      phép đổi chiều 1152 → 1280 nằm trong `k_proj`/`v_proj` của Cross-attn.
+      phép đổi chiều 1152 → 2048 nằm trong `k_proj`/`v_proj` của Cross-attn.
     * `RMSNorm` trước Linear cuối giữ thang của V_c độc lập với thang của dòng
       residual: V_c đi thẳng vào embedding của decoder nên thang của nó phải do
       chính CnA quyết định.
@@ -799,7 +799,7 @@ class CnA(nn.Module):
     """
 
     def __init__(self, d_feat: int, d_model: int, n_query: int = 12,
-                 d_latent: int = 1280, head_dim: int = 128, mlp_hidden: int = 2048,
+                 d_latent: int = 2048, head_dim: int = 128, mlp_hidden: int = 3072,
                  n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0,
                  attn: str = "mha", snop_w_init: float = 0.0,
                  snop_eps: float = 0.15, block2: bool = False):
@@ -1046,10 +1046,10 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                       "out_layers": int(ex.get("out_layers", 1)),
                       "normalize": {"mean": list(mean), "std": list(std)}},
         "cna": {"n_query": int(cn.get("n_query", 12)),
-                "d_latent": int(cn.get("d_latent", 1280)),
+                "d_latent": int(cn.get("d_latent", 2048)),
                 "head_dim": int(cn.get("head_dim", 128)),
-                "mlp_hidden": int(cn.get("mlp_hidden", 2048)),
-                "n_blocks": int(cn.get("n_blocks", 2)),
+                "mlp_hidden": int(cn.get("mlp_hidden", 3072)),
+                "n_blocks": int(cn.get("n_blocks", 1)),
                 "final_proj": bool(cn.get("final_proj", True)),
                 "dropout": float(cn.get("dropout", 0.0)),
                 # khoá vắng = MHA thuần (đúng nghĩa của mọi config trước /19)

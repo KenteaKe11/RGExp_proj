@@ -2660,10 +2660,10 @@ def _():
     # (j) config THẬT
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop" and int(cn["n_query"]) == 12 and int(cn["d_latent"]) == 1280
-    assert int(cn["n_blocks"]) == 2 and cn["block2"] is False and int(cn["mlp_hidden"]) == 2048
+    assert cn["attn"] == "snop" and int(cn["n_query"]) == 12 and int(cn["d_latent"]) == 2048
+    assert int(cn["n_blocks"]) == 1 and cn["block2"] is False and int(cn["mlp_hidden"]) == 3072
     assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.15
-    assert R.FORMAT == "rgexp.vextractor/27"
+    assert R.FORMAT == "rgexp.vextractor/28"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)
     tr.trace = {}

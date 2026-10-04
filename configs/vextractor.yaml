@@ -313,7 +313,7 @@ labels:
 # ═════════════════════════════════════════════════════════════════════════════
 #
 #   ảnh 448² ─► Extractor DINOv3 ViT-S/16 ─► V = concat 3 block cuối (784, 1152)
-#            ─► CnA (QFormer @1280, N = 2 × [Self → Cross → FFN]) ─► V_c (12, 2560)
+#            ─► CnA (QFormer @2048, 1 × [Self → Cross → FFN]) ─► V_c (12, 2560)
 #
 # Stage 0: DINOv3 fine-tuning của Extractor. Main stage: CnA + LoRA học cùng nhau.
 # (Không còn Stage 1 — bản Stage 1 cũ nằm ở `_archive/stage1_compressor/`.)
@@ -328,17 +328,17 @@ vextractor:
     # của ViT, bỏ prefix: 384 × 3 = 1152. KHÔNG đổi backbone/Stage 0 — checkpoint
     # Stage 0 (đã có trên Hub) vẫn dùng được; chỉ cách đọc backbone đổi.
     out_layers: 3
-  cna:                      # Compressor & Aligner — QFormer: V (784, 1152) -W_k,v-> 1280 -> V_c (12, 2560)
+  cna:                      # Compressor & Aligner — QFormer: V (784, 1152) -W_k,v-> 2048 -> V_c (12, 2560)
     n_query: 12             # số latent = số token nối vào chuỗi decoder (12 learner bù 64 token Z bị che)
-    d_latent: 1280          # k/v của Cross-attn chiếu 1152→1280
-    head_dim: 128           # n_heads SUY RA = 1280 // 128 = 10
-    mlp_hidden: 2048        # SwiGLU(2048): 1280 → 2048 → 1280
-    n_blocks: 2             # N = 2: lặp khối 1 [SelfAttn → CrossAttn → FFN] hai lần
+    d_latent: 2048          # k/v của Cross-attn chiếu 1152→2048
+    head_dim: 128           # n_heads SUY RA = 2048 // 128 = 16
+    mlp_hidden: 3072        # SwiGLU(3072): 2048 → 3072 → 2048
+    n_blocks: 1             # N = 1: khối 1 [SelfAttn → CrossAttn → FFN] một lần
     block2: false           # BỎ khối 2 (SelfAttn → FFN, không đọc ảnh) của bố cục cũ
-    final_proj: true        # RMSNorm + Linear 1280 -> 2560 (d_model của Gemma 3 4B)
+    final_proj: true        # RMSNorm + Linear 2048 -> 2560 (d_model của Gemma 3 4B)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
     # ── §2.2.2 SNOP-MHA thích ứng (Soft Non-orthogonality Penalty) ───────────
-    # MỌI attention của CnA (SelfAttn + CrossAttn của cả 2 nhóm = 4 lớp), N = 12 query:
+    # MỌI attention của CnA (SelfAttn + CrossAttn = 2 lớp), N = 12 query:
     #   O       = Concat(A_h V_h)                      (N, H·d_v)
     #   S       = Norm(O)·Norm(O)ᵀ                     cos, Norm = chuẩn hoá L2 theo hàng
     #   Õ       = stop_grad(sign(S) ⊙ S) = |S|          |cos|, KHÔNG nhận gradient
