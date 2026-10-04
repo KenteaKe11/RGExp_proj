@@ -454,7 +454,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"{aid} HẾT VRAM ({note}). Batch hiệu dụng {bs * accum} giữ nguyên; "
             f"batch mỗi lượt đã được autobatch chọn theo VRAM đo được. Còn hết "
             f"VRAM thì: tắt tiến trình khác trên card, hoặc hạ "
-            f"`autobatch.target_frac`.") from None
+            f"`autobatch.reserve_gib` / `target_frac`.") from None
 
 
 def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,

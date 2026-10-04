@@ -78,13 +78,14 @@ set:
   base.batch_size: 4
   metrics.bertscore.batch_size: auto  # dò như hai pipeline kia (khởi điểm 64)
 
-  # ── Batch theo hồi quy VRAM (src/autobatch.py) — BẬT, đích 92% ─────────
-  # 0.92 (trước là 0.80). LƯU Ý: card này thường cắm màn hình trên Windows —
-  # WDDM giữ sẵn ~0,5-1 GB cho desktop/trình duyệt, và phần ấy KHÔNG nằm trong
-  # hồi quy của autobatch. Ở 92% biên còn ~1,3 GB (16 GB): OOM giữa chừng thì hạ
-  # lại 0.85 hoặc tắt màn hình/trình duyệt dùng GPU.
+  # ── Batch theo hồi quy VRAM (src/autobatch.py) — BẬT, chừa lại 1 GiB ───
+  # Ngân sách = VRAM − 1 GiB (≈ 93,7% của 16 GiB). LƯU Ý: card này thường cắm
+  # màn hình trên Windows — WDDM giữ sẵn ~0,5-1 GB cho desktop/trình duyệt, và
+  # phần ấy KHÔNG nằm trong hồi quy của autobatch. OOM giữa chừng thì nâng
+  # reserve_gib (vd. 2.0) hoặc tắt màn hình/trình duyệt dùng GPU.
   autobatch.enabled: true
-  autobatch.target_frac: 0.92
+  autobatch.target_frac: 0.92      # BỊ BỎ QUA khi reserve_gib khác null
+  autobatch.reserve_gib: 1.0       # ngân sách = VRAM − 1 GiB (null -> dùng target_frac)
   autobatch.probe_sizes: [2, 4, 8]   # điểm đo của MAIN STAGE (xem stage0.probe_sizes)
   autobatch.infer_max_bs: 64       # sinh: dò TỪ 64 XUỐNG (48, 32, 24, …) tới nấc vừa ngân sách
 

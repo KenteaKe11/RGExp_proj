@@ -12,7 +12,8 @@ suy. Quy trình, `autotune()`:
 
   1. đo peak ở vài bs nhỏ (`autobatch.probe_sizes`, cắt theo batch hiệu dụng);
   2. bình phương tối thiểu -> a, b (in ra cùng R²);
-  3. ngân sách = `target_frac` × VRAM của thiết bị (lát MIG: VRAM của LÁT);
+  3. ngân sách = VRAM − `reserve_gib` (nếu khai), ngược lại `target_frac` × VRAM
+     của thiết bị (lát MIG: VRAM của LÁT);
   4. ứng viên = ước của batch hiệu dụng (grad_accum phải NGUYÊN — batch hiệu
      dụng, số bước và đường lr giữ nguyên); chọn ứng viên LỚN NHẤT có
      a + b·bs <= ngân sách;
@@ -79,10 +80,33 @@ def choose(cands: list[int], a: float, b: float, budget: float) -> list[int]:
 
 def ab_cfg(cfg) -> dict:
     c = dict(cfg.get("autobatch", {}) or {})
+    rg = c.get("reserve_gib")
     return {"enabled": bool(c.get("enabled", False)),
             "target_frac": float(c.get("target_frac", 0.80)),
+            # Khai `reserve_gib` (số) -> ngân sách = VRAM − reserve_gib GiB, BỎ QUA
+            # `target_frac`. null -> ngân sách = target_frac × VRAM như cũ.
+            "reserve_gib": None if rg is None else float(rg),
             "probe_sizes": [int(x) for x in (c.get("probe_sizes") or [1, 2, 4])],
             "infer_max_bs": int(c.get("infer_max_bs", 64) or 64)}
+
+
+def budget_of(ac: dict, total_bytes: float) -> float:
+    """Ngân sách VRAM (byte): `total − reserve_gib` nếu khai, ngược lại `target_frac × total`."""
+    total = float(total_bytes)
+    if ac.get("reserve_gib") is not None:
+        r = float(ac["reserve_gib"])
+        if not 0.0 <= r * 1024 ** 3 < total:
+            raise ValueError(f"autobatch.reserve_gib = {r} GiB phải trong "
+                             f"[0, {total / 1024 ** 3:.2f}) GiB của card")
+        return total - r * 1024 ** 3
+    return float(ac["target_frac"]) * total
+
+
+def budget_label(ac: dict) -> str:
+    """Mô tả ngân sách cho dòng log: `VRAM − 1 GiB` hoặc `92%`."""
+    if ac.get("reserve_gib") is not None:
+        return f"VRAM − {float(ac['reserve_gib']):g} GiB"
+    return f"{float(ac['target_frac']):.0%}"
 
 
 INFER_LADDER = (1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128,
@@ -169,7 +193,7 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
             pk = measure(step_fn, bs, modules)
             return None if pk is None else pk + _extra
     cands = sorted(set(cands or divisors(eff)))
-    budget = ac["target_frac"] * float(total_bytes)
+    budget = budget_of(ac, total_bytes)
     sizes = sorted({s for s in ac["probe_sizes"] if s in cands} or {cands[0]})
     pts = []
     oom_at = None                  # bs nhỏ nhất đã OOM: không thử lại >= nó
@@ -211,9 +235,10 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
 
         if label == "stage0":
             tips = ("    Reduce `stage0.micro_batch` or the number of local crops; "
-                    "`autobatch.target_frac` controls the safety margin.")
+                    "`autobatch.reserve_gib` / `target_frac` controls the safety margin.")
         else:
-            tips = "    Lower `autobatch.target_frac` or stop other GPU processes."
+            tips = ("    Raise `autobatch.reserve_gib` (or lower `target_frac`) or stop "
+                    "other GPU processes.")
         rep.update(error=f"OOM ở MỌI bs, xuống tới {min(cands)}")
         raise TrainUnusable(
             f"autobatch[{label}]: OOM ở MỌI mảnh vật lý, xuống tới bs "
@@ -247,7 +272,7 @@ def autotune(cfg, label: str, eff: int, current: int, step_fn,
                peak_frac=round(verified / float(total_bytes), 3))
     print(f"  ⚙ autobatch[{label}]: VRAM ≈ {rep['a_gib']:.2f} + "
           f"{rep['b_gib']:.3f}·bs GiB (R² {rep['r2']}, đo {rep['points']}) · "
-          f"ngân sách {rep['budget_gib']} GiB = {ac['target_frac']:.0%} của "
+          f"ngân sách {rep['budget_gib']} GiB = {budget_label(ac)} của "
           f"{rep['total_gib']} GiB -> bs {current} -> {chosen} × accum "
           f"{rep['accum']} = {eff} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
           f"({rep['peak_frac']:.0%})", flush=True)
@@ -278,7 +303,7 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
             return measure(step_fn, bs, ())
     cands = [c for c in INFER_LADDER
              if c <= max(1, int(max_bs if max_bs is not None else ac["infer_max_bs"]))]
-    budget = ac["target_frac"] * float(total_bytes)
+    budget = budget_of(ac, total_bytes)
     want = [int(x) for x in (probe_sizes or [2, 4])]
     sizes = sorted({s for s in want if s in cands} or {cands[0]})
     pts, oom_at = [], None
@@ -325,7 +350,7 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
                peak_frac=round(verified / float(total_bytes), 3))
     print(f"  ⚙ autobatch[{label}]: VRAM sinh ≈ {rep['a_gib']:.2f} + "
           f"{rep['b_gib']:.3f}·bs GiB (R² {rep['r2']}, đo {rep['points']}) · "
-          f"ngân sách {rep['budget_gib']} GiB = {ac['target_frac']:.0%} -> bs "
+          f"ngân sách {rep['budget_gib']} GiB = {budget_label(ac)} -> bs "
           f"{current} -> {chosen} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
           f"({rep['peak_frac']:.0%})", flush=True)
     return int(chosen), rep
@@ -358,7 +383,7 @@ def autotune_generate(cfg, label: str, current: int, step_fn,
 
         def measure_fn(bs):
             return measure(step_fn, bs, ())
-    budget = ac["target_frac"] * float(total_bytes)
+    budget = budget_of(ac, total_bytes)
     ladder = sorted({c for c in INFER_LADDER if c <= top} | {top}, reverse=True)
     gib = 1024 ** 3
     tried, chosen, peak = [], None, None
@@ -384,5 +409,5 @@ def autotune_generate(cfg, label: str, current: int, step_fn,
                peak_frac=round(peak / float(total_bytes), 3))
     print(f"  ⚙ autobatch[{label}]: dò từ {top} xuống -> bs {chosen} · đỉnh "
           f"{rep['peak_gib']} GiB ({rep['peak_frac']:.0%}) · ngân sách "
-          f"{rep['budget_gib']} GiB = {ac['target_frac']:.0%}", flush=True)
+          f"{rep['budget_gib']} GiB = {budget_label(ac)}", flush=True)
     return chosen, rep

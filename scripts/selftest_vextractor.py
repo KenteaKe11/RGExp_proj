@@ -246,13 +246,32 @@ def _():
     assert got == 16 and rep["accum"] == 2, rep      # 1 + 0.5·16 = 9 <= 12.8
     assert "probe_oom_at" not in rep, rep
 
+    # ── reserve_gib: ngân sách = VRAM − reserve (BỎ QUA target_frac) ─────────
+    from src.autobatch import ab_cfg, budget_of
+    steep = lambda bs: (1.0 + 0.85 * bs) * GIB             # noqa: E731
+    by_frac, _ = autotune(ok, "stage0", 32, 4, None, cands=divisors(32),
+                          measure_fn=steep, total_bytes=TOTAL)
+    assert by_frac == 8                                    # 16 -> 14.6 > 12.8
+    rsv = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80, "reserve_gib": 1.0,
+                             "probe_sizes": [1, 2, 4]}})
+    got, rep = autotune(rsv, "stage0", 32, 4, None, cands=divisors(32),
+                        measure_fn=steep, total_bytes=TOTAL)
+    assert got == 16 and rep["budget_gib"] == 15.0, rep  # 14.6 <= 16 − 1
+    assert budget_of(ab_cfg(ok), TOTAL) == 0.8 * TOTAL
+    for bad in (-1.0, 16.0):
+        try:
+            budget_of(ab_cfg(Cfg({"autobatch": {"reserve_gib": bad}})), TOTAL)
+            raise AssertionError(f"reserve_gib {bad} phải bị từ chối")
+        except ValueError:
+            pass
+
     # ── OOM ở MỌI bs -> DỪNG, và đưa khuyến nghị micro-batch ────────────────────────
     try:
         autotune(cfg, "stage0", 32, 8, None, cands=divisors(32),
                  measure_fn=cost(0), total_bytes=TOTAL)
     except TrainUnusable as e:
         msg = str(e)
-        assert "stage0.micro_batch" in msg and "target_frac" in msg, msg
+        assert "stage0.micro_batch" in msg and "reserve_gib" in msg, msg
     else:
         raise AssertionError("OOM ở mọi bs phải DỪNG, không giữ số của config")
     # nhãn khác stage0 thì KHÔNG khuyên checkpointing của Extractor
