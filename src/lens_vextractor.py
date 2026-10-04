@@ -631,8 +631,8 @@ def _attn_layers(branch) -> list[tuple[str, object]]:
     """[(tên, MultiHeadAttention)] của CnA theo thứ tự forward."""
     out = []
     for i, g in enumerate(branch.cna.groups):
-        for nm in ("self1", "cross", "self2"):
-            out.append((f"g{i}.{nm}", getattr(g, nm)))
+        for nm, m in g.attn_layers():
+            out.append((f"g{i}.{nm}", m))
     return out
 
 

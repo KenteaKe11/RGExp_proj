@@ -16,7 +16,7 @@ Z (gọi tắt Q trong code). Vòng lặp dưới đây vì thế chép lại t�
                  RIÊNG với BA nhóm (ffn / self / cross của CnA), MỘT dốc warm-up;
   3. clip:       clip_grad_norm_ TÁCH RIÊNG cho LoRA và cho nhánh;
   4. **MASK REGULARIZATION:** mỗi lần cập nhật trọng số (mỗi optimizer step) che
-     ngẫu nhiên `z_mask_frac` (50%) token Z — qua `attention_mask` = 0 tại các vị
+     ngẫu nhiên `z_mask_frac` (25%) token Z — qua `attention_mask` = 0 tại các vị
      trí ấy, nên không query nào đọc được chúng — để ép Q phải tham gia sâu vào
      quá trình sinh text thay vì để decoder sống bằng Z. MỘT mặt nạ cho cả
      optimizer step (mọi micro-batch của step đó dùng chung), tái lập được từ
@@ -63,7 +63,7 @@ decoder, dropout LoRA, gradient checkpointing, val CE 256 mẫu mỗi 25 bước
 
 Chuỗi vào decoder DÀI THÊM `n_query` (16) token, nên B tốn VRAM và thời gian mỗi
 bước nhiều hơn A ở mức 16/(độ dài chuỗi) CỘNG một lượt ViT-S/16 ở 448² cho mỗi ảnh
-(chạy trong `no_grad`; phần nặng còn lại là CnA trên `n_query` (16) token).
+(chạy trong `no_grad`; phần nặng còn lại là CnA trên `n_query` (12) token).
 
 Batch mỗi lượt đã khoá = L. Nếu B không vừa VRAM ở L mẫu một lượt, micro-batch
 logic L được chạy thành các mảnh c | L và CE được ghép lại theo TOKEN:
@@ -140,7 +140,7 @@ def zcfg(cfg: Cfg) -> dict:
            "cna_snop_lr_mult": float(m.get("cna_snop_lr_mult", 10.0)),
            "cna_warmup_frac": float(m.get("cna_warmup_frac", 0.10)),
            "cna_wd": float(m.get("cna_wd", 0.01)),
-           "z_mask_frac": float(m.get("z_mask_frac", 0.5)),
+           "z_mask_frac": float(m.get("z_mask_frac", 0.25)),
            "separate_clip": bool(m.get("separate_clip", True))}
     for who in ("cna_ffn", "cna_self", "cna_cross"):
         lo, hi = out[f"{who}_lr_min"], out[f"{who}_lr_main"]

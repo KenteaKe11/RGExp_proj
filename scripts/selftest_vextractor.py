@@ -23,7 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. MASK REGULARIZATION: 50% token Z bị che qua attention_mask mỗi optimizer
+ 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
@@ -339,7 +339,7 @@ def _():
     _ = (s_auto, s_lock)
 
 
-@check("2. Extractor (cắt stage) -> CnA (QFormer: 5 residual/nhóm, d_feat→d_latent trong Cross-attn, RMSNorm + Linear cuối -> d_model)")
+@check("2. Extractor (cắt stage) -> CnA (QFormer: 3 residual/nhóm [Self → Cross → FFN] × N, block2 = false, d_feat→d_latent trong Cross-attn, RMSNorm + Linear cuối -> d_model)")
 def _():
     import math
 
@@ -396,7 +396,9 @@ def _():
     # head_dim là khoá KHAI, n_heads SUY RA
     assert cp.head_dim == 4 and cp.n_heads == SMALL_DL // 4
     for g in cp.groups:
-        for a_ in (g.self1, g.self2):
+        assert not g.block2 and not hasattr(g, "self2") and not hasattr(g, "ffn2")
+        assert [n_ for n_, _ in g.attn_layers()] == ["self1", "cross"]
+        for a_ in (g.self1,):
             assert a_.d == a_.d_kv == SMALL_DL and a_.h == cp.n_heads
         # d_feat -> d_latent NGAY TRONG Cross-attn: k/v nhận d_feat, q/o ở d_latent
         assert g.cross.d == SMALL_DL and g.cross.d_kv == ex.d_feat != SMALL_DL
@@ -404,7 +406,7 @@ def _():
         assert g.cross.k.out_features == g.cross.v.out_features == SMALL_DL
         assert g.cross.q.in_features == g.cross.o.out_features == SMALL_DL
         assert g.ffn1.d_in == g.ffn1.d_out == SMALL_DL
-        assert g.ffn1.hidden == g.ffn2.hidden == SMALL_MLP
+        assert g.ffn1.hidden == SMALL_MLP
     # chỗ DUY NHẤT chạm V trước QFormer là một RMSNorm(d_feat)
     assert isinstance(cp.kv_norm, recombiner.RMSNorm)
     assert cp.kv_norm.weight.numel() == ex.d_feat
@@ -427,7 +429,7 @@ def _():
         raise AssertionError("final_proj=false với d_latent != d_model phải bị từ chối")
     assert R.CnA(ex.d_feat, SMALL_DL, SMALL_Q, SMALL_DL, 4,
                  final_proj=False)(v).shape == (2, SMALL_Q, SMALL_DL)
-    # ── NĂM residual mỗi nhóm, rồi RMSNorm + Linear cuối ───────────────────
+    # ── BA residual mỗi nhóm (mọi nhóm đọc V), rồi RMSNorm + Linear cuối ──
     with torch.no_grad():
         kv = cp.kv_norm(v)
         h = cp.latent.expand(2, -1, -1)
@@ -435,8 +437,7 @@ def _():
             h1 = h + g.self1(g.n_self1(h))
             h2 = h1 + g.cross(g.n_cross(h1), kv)
             h3 = h2 + g.ffn1(g.n_ffn1(h2))
-            h4 = h3 + g.self2(g.n_self2(h3))
-            h = h4 + g.ffn2(g.n_ffn2(h4))
+            h = h3
             assert not torch.allclose(h2, h1, atol=1e-6)   # cross THẬT SỰ đổi gì đó
             assert not torch.allclose(h3, h2, atol=1e-6)
         ref = cp.proj(cp.n_proj(h))
@@ -456,7 +457,7 @@ def _():
         assert not hasattr(g, "cross2")
     # SwiGLU: bias=False + init 1/√fan_in
     for g in cp.groups:
-        for f in (g.ffn1, g.ffn2):
+        for f in g.ffn_modules():
             for lin in (f.gate, f.up, f.down):
                 assert lin.bias is None
                 want_std = 1.0 / math.sqrt(lin.in_features)
@@ -474,7 +475,12 @@ def _():
     assert id(cp.latent) in ff and id(cp.kv_norm.weight) in ff
     assert id(cp.proj.weight) in ff and id(cp.n_proj.weight) in ff
     assert id(cp.groups[0].cross.k.weight) in cr
-    assert id(cp.groups[0].self2.o.weight) in se
+    assert id(cp.groups[0].self1.o.weight) in se and id(cp.groups[1].self1.o.weight) in se
+    # bố cục cũ (block2 = true) vẫn dựng được: 5 residual, thêm self2/ffn2
+    old = R.CnA(ex.d_feat, 32, SMALL_Q, SMALL_DL, 4, SMALL_MLP, 1, block2=True)
+    assert old.groups[0].block2 and [n_ for n_, _ in old.groups[0].attn_layers()] == \
+        ["self1", "cross", "self2"]
+    assert old(v).shape == (2, SMALL_Q, 32)
 
     # ── học được ──────────────────────────────────────────────────────────
     before = br(x).detach().clone()
@@ -1316,7 +1322,7 @@ def _():
     assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
     assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
     assert zc["cna_snop_lr_mult"] == 10.0
-    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.5
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
     # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
     a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
     assert {k: a0[k] for k in ("ffn", "self", "cross")} == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
@@ -1569,7 +1575,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. MASK REGULARIZATION: che `z_mask_frac` (50%) token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
+@check("16. MASK REGULARIZATION: che `z_mask_frac` (25%) token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
     import types
 
@@ -2113,7 +2119,7 @@ def _():
         keys_ = payload["sim_keys"]
         assert "V_c" in keys_ and keys_[-1] == "V_c" and payload["snop"] is False
         assert {f"g{i}.{nm} · O" for i in range(SMALL_NB)
-                for nm in ("self1", "cross", "self2")} <= set(keys_)
+                for nm in ("self1", "cross")} <= set(keys_)
         assert not any("O_final" in k_ for k_ in keys_)       # MHA thuần: không có O_final
         assert 'id="simgrid"' in html and "Similarity giữa các token Q" in html
         assert html.index('id="simgrid"') > html.index('id="grid"')
@@ -2627,7 +2633,7 @@ def _():
     assert spec["cna"]["snop_w_init"] == 0.0 and spec["cna"]["snop_eps"] == 0.15
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
-    assert len(gates) == 3 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
+    assert len(gates) == 2 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
     c0 = 0.15 + 0.85 / (1 + math.exp(0.0))
     assert all(abs(x - c0) < 1e-6 for v in gates.values() for x in v)
     ids = lambda it: {id(p) for p in it}  # noqa: E731
@@ -2639,7 +2645,7 @@ def _():
     allp = (list(br.cna.self_parameters()) + list(br.cna.cross_parameters())
             + list(br.cna.ffn_parameters()) + list(br.cna.snop_parameters()))
     assert len(allp) == len({id(p) for p in allp}) == len(list(br.cna.parameters()))
-    assert br.n_params()["cna_snop_w"] == 3 * SMALL_NB * SMALL_Q
+    assert br.n_params()["cna_snop_w"] == 2 * SMALL_NB * SMALL_Q
     assert br(torch.randn(2, 3, SMALL_IMG, SMALL_IMG)).shape == (2, SMALL_Q, 32)
     # (i) spec mặc định = MHA thuần; khoá sai / khoá cũ bị từ chối
     assert R.spec_from_cfg(small_cfg(), 32)["cna"]["attn"] == "mha"
@@ -2654,9 +2660,10 @@ def _():
     # (j) config THẬT
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop" and int(cn["n_query"]) == 16
+    assert cn["attn"] == "snop" and int(cn["n_query"]) == 12 and int(cn["d_latent"]) == 1280
+    assert int(cn["n_blocks"]) == 2 and cn["block2"] is False and int(cn["mlp_hidden"]) == 2048
     assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.15
-    assert R.FORMAT == "rgexp.vextractor/26"
+    assert R.FORMAT == "rgexp.vextractor/27"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)
     tr.trace = {}
