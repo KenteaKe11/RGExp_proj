@@ -23,7 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
+ 16. MASK REGULARIZATION: 50% token Z bị che qua attention_mask mỗi optimizer
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
@@ -1297,7 +1297,7 @@ def _():
     assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
     assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
     assert zc["cna_snop_lr_mult"] == 10.0
-    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.5
     # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
     a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
     assert {k: a0[k] for k in ("ffn", "self", "cross")} == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
@@ -1550,7 +1550,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. MASK REGULARIZATION: che 25% token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
+@check("16. MASK REGULARIZATION: che `z_mask_frac` (50%) token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
     import types
 
@@ -2513,7 +2513,7 @@ def _():
     assert all(m.training for m in tr2.bn_modules())
 
 @check("26. SNOP-MHA thích ứng: O_final = [I − (c·1ᵀ)/(N + 1) ⊙ (Õ ⊙ M_cross)]·O, "
-       "c = ε + (1 − ε)σ(W_α), W_α ∈ ℝ^N học (khởi tạo −0.5), ε = 0.15; "
+       "c = ε + (1 − ε)σ(W_α), W_α ∈ ℝ^N học (khởi tạo 0), ε = 0.15; "
        "Õ = stop_grad(sign(S)⊙S), S = L2-cos; khớp công thức dựng tay; Õ không nhận "
        "gradient, W_α và O thì có; W_α nhóm lr riêng (×10 ffn), không tiêu RNG; không đảo dấu")
 def _():
@@ -2543,9 +2543,9 @@ def _():
         m.w_alpha.copy_(w)
     assert torch.allclose(m.gate(), c, atol=1e-6)
     assert torch.allclose(MHA.snop_mix(o, m.gate()), ref, atol=1e-5)
-    # (b) mặc định W_α = −0.5, ε = 0.15; c ∈ [ε, 1); ε ngoài [0, 1] bị từ chối
+    # (b) mặc định W_α = 0, ε = 0.15; c ∈ [ε, 1); ε ngoài [0, 1] bị từ chối
     d = MHA(16, 4, None, snop=True, n_tok=N)
-    assert d.w_alpha.shape == (N,) and torch.all(d.w_alpha == -0.5) and d.eps == 0.15
+    assert d.w_alpha.shape == (N,) and torch.all(d.w_alpha == 0.0) and d.eps == 0.15
     with torch.no_grad():
         d.w_alpha.fill_(-80.0)
     assert torch.allclose(d.gate(), torch.full((N,), 0.15))
@@ -2576,7 +2576,7 @@ def _():
     assert torch.allclose(y, want, atol=1e-6)
     c_def = MHA(16, 4, None, snop=True, n_tok=N).gate().detach()
     y0 = MHA.snop_mix(torch.ones(1, N, 4), c_def)
-    assert 0.58 < float(y0.min()) < 0.59                       # c₀ ≈ 0.471 -> ≈ 0.584
+    assert 0.49 < float(y0.min()) < 0.50                       # c₀ = 0.575 -> ≈ 0.493
     for n_tok in (2, 8, 16, 64):
         yy = MHA.snop_mix(torch.ones(1, n_tok, 4), torch.full((n_tok,), 0.9999))
         assert float(yy.min()) > 0, n_tok
@@ -2605,11 +2605,11 @@ def _():
     cna_ = dict(small_cfg()["vextractor"]["cna"])
     spec = R.spec_from_cfg({"vextractor": {**small_cfg()["vextractor"],
                                            "cna": dict(cna_, attn="snop")}}, 32)
-    assert spec["cna"]["snop_w_init"] == -0.5 and spec["cna"]["snop_eps"] == 0.15
+    assert spec["cna"]["snop_w_init"] == 0.0 and spec["cna"]["snop_eps"] == 0.15
     br = R.VExtractorBranch(spec)
     gates = br.cna.snop_gates()
     assert len(gates) == 3 * SMALL_NB and all(len(v) == SMALL_Q for v in gates.values())
-    c0 = 0.15 + 0.85 / (1 + math.exp(0.5))
+    c0 = 0.15 + 0.85 / (1 + math.exp(0.0))
     assert all(abs(x - c0) < 1e-6 for v in gates.values() for x in v)
     ids = lambda it: {id(p) for p in it}  # noqa: E731
     ws = {id(mm.w_alpha) for mm in br.cna.modules()
@@ -2636,7 +2636,7 @@ def _():
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
     assert cn["attn"] == "snop" and int(cn["n_query"]) == 16
-    assert float(cn["snop_w_init"]) == -0.5 and float(cn["snop_eps"]) == 0.15
+    assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.15
     assert R.FORMAT == "rgexp.vextractor/26"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)

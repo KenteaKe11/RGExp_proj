@@ -105,14 +105,14 @@ class MultiHeadAttention(nn.Module):
     * `ε` — HẰNG SỐ lực phạt tối thiểu ∈ [0, 1] (mặc định 0.15): c_i ∈ [ε, 1),
       nên SNOP không bao giờ tắt hẳn. ε = 1 -> c ≡ 1 (W_α không còn tác dụng).
     * `W_α` — VECTOR logit HỌC ĐƯỢC, một phần tử mỗi token query i (mỗi lớp
-      một vector), khởi tạo `w_init` (−0.5): điều chỉnh lực phạt c_i theo token.
-      c₀ = 0.15 + 0.85·σ(−0.5) ≈ 0.471. Có nhóm lr RIÊNG `snop`
+      một vector), khởi tạo `w_init` (0): điều chỉnh lực phạt c_i theo token.
+      c₀ = 0.15 + 0.85·σ(0) = 0.575. Có nhóm lr RIÊNG `snop`
       (`CnA.snop_parameters`) = `cna_snop_lr_mult` (×10) × lr của nhóm `ffn`.
     * `Õ` là stop_grad: gradient của task loss KHÔNG đi qua phép đo độ giống
       nhau, chỉ đi qua O (thừa số bên phải) và W_α.
     * `N + 1` — N = 16 -> 17. Khi cả N hàng song song (attention gần đều, đúng
       trạng thái bước 0) phần chung của hàng i bị nhân `1 − c_i·(N−1)/(N + 1)`
-      = `1 − 15c_i/17`: c₀ ≈ 0.471 -> ≈ 0.584. Vì c < 1 và (N−1)/(N+1) < 1,
+      = `1 − 15c_i/17`: c₀ = 0.575 -> ≈ 0.493. Vì c < 1 và (N−1)/(N+1) < 1,
       thừa số luôn > 2/(N+1) > 0: phần chung KHÔNG BAO GIỜ đảo dấu, với mọi N.
     * N của W_α CỐ ĐỊNH lúc dựng (`n_tok` = số query); N lúc chạy khác -> lỗi.
     * Đường chéo bị mặt nạ: token giữ nguyên phần riêng. |cos| giảm TUYẾN TÍNH
@@ -126,7 +126,7 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_kv: int | None = None,
                  dropout: float = 0.0, snop: bool = False, n_tok: int | None = None,
-                 w_init: float = -0.5, eps: float = 0.15):
+                 w_init: float = 0.0, eps: float = 0.15):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} không chia hết n_heads {n_heads}")
@@ -717,7 +717,7 @@ class QFormerGroup(nn.Module):
 
     def __init__(self, d_latent: int, n_heads: int, d_kv: int, mlp_hidden: int,
                  dropout: float = 0.0, snop: bool = False, n_tok: int | None = None,
-                 w_init: float = -0.5, eps: float = 0.15):
+                 w_init: float = 0.0, eps: float = 0.15):
         super().__init__()
         d = int(d_latent)
         att = {"snop": bool(snop), "n_tok": n_tok, "w_init": float(w_init),
@@ -786,7 +786,7 @@ class CnA(nn.Module):
     def __init__(self, d_feat: int, d_model: int, n_query: int = 16,
                  d_latent: int = 1024, head_dim: int = 128, mlp_hidden: int = 2048,
                  n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0,
-                 attn: str = "mha", snop_w_init: float = -0.5,
+                 attn: str = "mha", snop_w_init: float = 0.0,
                  snop_eps: float = 0.15):
         super().__init__()
         self.d_feat, self.d_model = int(d_feat), int(d_model)
@@ -1038,7 +1038,7 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 "dropout": float(cn.get("dropout", 0.0)),
                 # khoá vắng = MHA thuần (đúng nghĩa của mọi config trước /19)
                 "attn": _attn_kind(cn.get("attn", "mha")),
-                "snop_w_init": float(cn.get("snop_w_init", -0.5)),
+                "snop_w_init": float(cn.get("snop_w_init", 0.0)),
                 "snop_eps": float(cn.get("snop_eps", 0.15))},
     }
 
@@ -1108,7 +1108,7 @@ def build_cna(spec: dict, d_feat: int) -> CnA:
     c = spec["cna"]
     return CnA(int(d_feat), spec["d_model"], c["n_query"], c["d_latent"],
                c["head_dim"], c["mlp_hidden"], c["n_blocks"], c["final_proj"],
-               c["dropout"], c.get("attn", "mha"), c.get("snop_w_init", -0.5),
+               c["dropout"], c.get("attn", "mha"), c.get("snop_w_init", 0.0),
                c.get("snop_eps", 0.15))
 
 

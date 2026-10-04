@@ -329,7 +329,7 @@ vextractor:
     # Stage 0 (đã có trên Hub) vẫn dùng được; chỉ cách đọc backbone đổi.
     out_layers: 3
   cna:                      # Compressor & Aligner — QFormer: V (784, 1152) -W_k,v-> 1536 -> V_c (16, 2560)
-    n_query: 16             # số latent = số token nối vào chuỗi decoder (16 learner bù 64 token Z bị che)
+    n_query: 16             # số latent = số token nối vào chuỗi decoder (16 learner bù 128 token Z bị che)
     d_latent: 1536          # k/v của Cross-attn chiếu 1152→1536
     head_dim: 128           # n_heads SUY RA = 1536 // 128 = 12
     mlp_hidden: 2048        # SwiGLU mult = 2 theo quy ước 2/3 (LLaMA): 2/3 · 2 · 1536 = 2048
@@ -347,10 +347,10 @@ vextractor:
     #      khoá `main.cna_snop_lr_mult`).
     # `mha` = MHA thuần (§2.2). Không có loss phụ nào (không Entropy/Orthogonal).
     attn: snop
-    # c₀ = 0.15 + 0.85·σ(−0.5) ≈ 0.471. Khi 16 hàng O song song (attention gần đều —
-    # đúng trạng thái bước 0) phần chung của hàng i bị nhân 1 − 15·c_i/17 ≈ 0.584;
+    # c₀ = 0.15 + 0.85·σ(0) = 0.575. Khi 16 hàng O song song (attention gần đều —
+    # đúng trạng thái bước 0) phần chung của hàng i bị nhân 1 − 15·c_i/17 ≈ 0.493;
     # c < 1 nên thừa số luôn > 2/17: KHÔNG bao giờ đảo dấu.
-    snop_w_init: -0.5       # W_α khởi tạo (logit)
+    snop_w_init: 0.0        # W_α khởi tạo (logit)
     snop_eps: 0.15          # ε: lực phạt TỐI THIỂU ∈ [0, 1] -> c ∈ [ε, 1)
 
   # ── Main stage: MỘT khối học được, BỐN nhóm lr (`src/train_vextractor.py`) ──
@@ -381,7 +381,7 @@ vextractor:
     cna_snop_lr_mult: 10.0      # lr của W_α (SNOP) = 10 × lr nhóm ffn ở MỌI bước
     cna_warmup_frac: 0.10       # 10% tổng bước, dùng cho CẢ bốn nhóm
     cna_wd: 0.01
-    z_mask_frac: 0.25           # che 25% token Z (64/256) mỗi weight update — 16 learner bù
+    z_mask_frac: 0.50           # che 50% token Z (128/256) mỗi weight update — 16 learner bù
     separate_clip: true         # clip_grad_norm_ riêng LoRA / nhánh
 
 # ── Stage 0: DINOv3 FINETUNING — `src/stage0_vextractor.py`, `src/dino.py` ──
