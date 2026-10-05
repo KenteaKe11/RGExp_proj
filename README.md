@@ -155,6 +155,18 @@ Những module khác freeze hoàn toàn — Extractor chạy chế độ teacher
 bash scripts/setup.sh
 python3 scripts/selftest_vextractor.py
 bash scripts/run_vextractor.sh train --detach
+
+# Pull HF output
+huggingface-cli download RGExp123/Research_results \
+  --repo-type dataset \
+  --include 'current/$2.2_V-Extractor_Test/stage0/final/*' \
+  --local-dir ./hub_dl
+
+# Skip selftest
+RGEXP_SKIP_SELFTEST=1
+
+# Skip setup
+RGEXP_SKIP_SETUP=1
 ```
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
