@@ -48,7 +48,7 @@ Stage 0 nạp trọng số `dinov3-vits16-pretrain` rồi fine-tune tiếp bằn
 | Input dim | `V` (concat 3 block cuối) → `384 × 3 = 1152` → `W_k, W_v` (trong Cross-attn) → `2048` |
 | Latent learnable vectors | `12, 2048` |
 | Norm | `RMSNorm` (pre-norm trước mọi khối con, trên `V`, và trước Linear cuối) |
-| Pipeline (1 nhóm) | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁` (bỏ khối 2 chỉ-Self của bố cục cũ, `block2: false`) |
+| Pipeline (1 nhóm) | `Q₀ → SelfAttn(Q₀) → CrossAttn(Q₀, V) → FFN → Q₁ + γ·Q₀ → Proj` (γ ∈ ℝ¹² học được, một hệ số mỗi token, khởi tạo 1, **thuộc nhóm lr FFN**; `cna.q0_skip`, `cna.gamma_init`; bỏ khối 2 chỉ-Self của bố cục cũ, `block2: false`) |
 | N | **1** (`n_blocks: 1`) |
 | Linear project cuối | có — `RMSNorm + Linear 2048→2560` (có bias, init `1/√fan_in`) |
 | Attention | **AdaSNoP-MHA** ở **mọi** lớp (SelfAttn + CrossAttn, `cna.attn: snop`): mỗi lớp một vector logit `W_α ∈ ℝ¹²` học được (nhóm lr riêng ×10 FFN, khởi tạo 0, `cna.snop_w_init`), lực phạt tối thiểu `ε = 0,15` (`cna.snop_eps`) |
@@ -66,7 +66,7 @@ h   = h + SwiGLU(N(h))                             # 2048 → 3072 → 2048
 V_c = Linear(RMSNorm(h))                           # 2048 → 2560
 ```
 
-Bảng tham số của CnA (N = 1): SelfAttn 4 × 2048² = 16,78 M · CrossAttn 2 × 2048² + 2 × 1152 × 2048 = 13,11 M · SwiGLU 3 × 2048 × 3072 = 18,87 M · ba RMSNorm(2048) · 2 vector `W_α ∈ ℝ¹²` → nhóm khối là **48,76 M**; cộng 12 latent (24 576) và `RMSNorm(1152)` trên V thành phần QFormer **48,79 M**; Linear cuối kèm RMSNorm của nó thêm **5,25 M**, nên CnA là **54,04 M**. Cấu hình FFN là `vextractor.cna.mlp_hidden`.
+Bảng tham số của CnA (N = 1): SelfAttn 4 × 2048² = 16,78 M · CrossAttn 2 × 2048² + 2 × 1152 × 2048 = 13,11 M · SwiGLU 3 × 2048 × 3072 = 18,87 M · ba RMSNorm(2048) · 2 vector `W_α ∈ ℝ¹²` → nhóm khối là **48,76 M**; cộng 12 latent (24 576) và `RMSNorm(1152)` trên V thành phần QFormer **48,79 M**; Linear cuối kèm RMSNorm của nó thêm **5,25 M**, nên CnA là **54,04 M** (cộng γ ∈ ℝ¹²: 12 tham số). Cấu hình FFN là `vextractor.cna.mlp_hidden`.
 
 > Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config). CnA có 54 038 168 tham số; AdaSNoP chiếm đúng 2 × 12 = 24 trong số đó (`W_α`).
 

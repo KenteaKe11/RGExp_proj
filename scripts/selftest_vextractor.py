@@ -214,7 +214,7 @@ def _():
 
     GIB = 1024 ** 3
     TOTAL = 16.0 * GIB
-    cfg = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80,
+    cfg = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80, "reserve_gib": None,
                              "probe_sizes": [4, 8, 16]}})
     assert divisors(32) == [1, 2, 4, 8, 16, 32], divisors(32)
 
@@ -239,7 +239,7 @@ def _():
         assert rep["chosen"] * rep["accum"] == 32, rep
 
     # ── ca thường: probe [1,2,4] đo được, chọn ước LỚN NHẤT vừa ngân sách ─
-    ok = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80,
+    ok = Cfg({"autobatch": {"enabled": True, "target_frac": 0.80, "reserve_gib": None,
                             "probe_sizes": [1, 2, 4]}})
     got, rep = autotune(ok, "stage0", 32, 4, None, cands=divisors(32),
                         measure_fn=cost(64), total_bytes=TOTAL)
@@ -258,6 +258,9 @@ def _():
                         measure_fn=steep, total_bytes=TOTAL)
     assert got == 16 and rep["budget_gib"] == 15.0, rep  # 14.6 <= 16 − 1
     assert budget_of(ab_cfg(ok), TOTAL) == 0.8 * TOTAL
+    # khoá `reserve_gib` VẮNG => MẶC ĐỊNH chừa 1 GiB cho mọi pipeline (train/sinh/chấm)
+    assert budget_of(ab_cfg(Cfg({"autobatch": {"enabled": True}})), TOTAL) == TOTAL - 1024 ** 3
+    assert budget_of(ab_cfg(Cfg({})), TOTAL) == TOTAL - 1024 ** 3
     for bad in (-1.0, 16.0):
         try:
             budget_of(ab_cfg(Cfg({"autobatch": {"reserve_gib": bad}})), TOTAL)
@@ -300,7 +303,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     assert AB.ab_cfg(cfg)["infer_max_bs"] == 64
-    on = {"autobatch": {"enabled": True, "target_frac": 0.8, "infer_max_bs": 64}}
+    on = {"autobatch": {"enabled": True, "target_frac": 0.8, "reserve_gib": None, "infer_max_bs": 64}}
     GIB = 1024 ** 3
     seen = []
 
@@ -2663,7 +2666,7 @@ def _():
     assert cn["attn"] == "snop" and int(cn["n_query"]) == 12 and int(cn["d_latent"]) == 2048
     assert int(cn["n_blocks"]) == 1 and cn["block2"] is False and int(cn["mlp_hidden"]) == 3072
     assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.15
-    assert R.FORMAT == "rgexp.vextractor/28"
+    assert R.FORMAT == "rgexp.vextractor/29"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)
     tr.trace = {}

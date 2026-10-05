@@ -40,7 +40,8 @@ BACKBONE_CFG_KEYS = ("arch", "pretrained", "n_layers", "n_stages")
 # KHÔNG bắt chạy lại Stage 0 (checkpoint Stage 0 trên Hub vẫn dùng được).
 EXT_CFG_KEYS = (*BACKBONE_CFG_KEYS, "image_size", "out_layers")
 CNA_CFG_KEYS = ("n_query", "d_latent", "head_dim", "mlp_hidden", "n_blocks",
-                "final_proj", "dropout", "attn", "snop_w_init", "snop_eps", "block2")
+                "final_proj", "dropout", "attn", "snop_w_init", "snop_eps", "block2",
+                "q0_skip", "gamma_init")
 # `attn` của CnA: `mha` (thuần) hoặc `snop` (SNOP-MHA, xem `MultiHeadAttention`).
 ATTN_KINDS = ("mha", "snop")
 
@@ -72,7 +73,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì CnA KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/28"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280 · /28 N = 1, @2048, SwiGLU 3072
+FORMAT = "rgexp.vextractor/29"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280 · /28 N = 1, @2048, SwiGLU 3072 · /29 Q1 + γ·Q0
 
 
 class VExtractorUnusable(RuntimeError):
@@ -802,7 +803,8 @@ class CnA(nn.Module):
                  d_latent: int = 2048, head_dim: int = 128, mlp_hidden: int = 3072,
                  n_blocks: int = 2, final_proj: bool = True, dropout: float = 0.0,
                  attn: str = "mha", snop_w_init: float = 0.0,
-                 snop_eps: float = 0.15, block2: bool = False):
+                 snop_eps: float = 0.15, block2: bool = False,
+                 q0_skip: bool = False, gamma_init: float = 1.0):
         super().__init__()
         self.d_feat, self.d_model = int(d_feat), int(d_model)
         self.attn = str(attn)
@@ -811,6 +813,8 @@ class CnA(nn.Module):
         self.snop_w_init = float(snop_w_init)
         self.snop_eps = float(snop_eps)
         self.block2 = bool(block2)
+        self.q0_skip = bool(q0_skip)
+        self.gamma_init = float(gamma_init)
         if not 0.0 <= self.snop_eps <= 1.0:
             raise ValueError(f"cna.snop_eps = {snop_eps} phải thuộc [0, 1]")
         self.n_query = int(n_query)
@@ -836,6 +840,10 @@ class CnA(nn.Module):
                 f"{self.d_model}: không có lớp nào đổi chiều sang decoder.")
         self.n_heads = self.d_latent // self.head_dim
         self.latent = nn.Parameter(torch.randn(1, self.n_query, self.d_latent) * 0.02)
+        # γ ∈ ℝ^n_query: skip học được từ Q0 tới đầu ra QFormer, MỘT hệ số mỗi token
+        # (kích thước CỐ ĐỊNH = n_query, không phụ thuộc d_latent). Q1 + γ ⊙ Q0.
+        self.gamma = (nn.Parameter(torch.full((self.n_query,), self.gamma_init))
+                      if self.q0_skip else None)
         self.kv_norm = RMSNorm(self.d_feat)
         self.groups = nn.ModuleList([
             QFormerGroup(self.d_latent, self.n_heads, self.d_feat,
@@ -898,6 +906,8 @@ class CnA(nn.Module):
         khối (các câu hỏi và thang đo), không phải ma trận quyết định ĐỌC Ở ĐÂU.
         """
         yield self.latent
+        if self.gamma is not None:
+            yield self.gamma
         yield from self.kv_norm.parameters()
         for g in self.groups:
             for m in (*g.ffn_modules(), *g.norm_modules()):
@@ -913,8 +923,11 @@ class CnA(nn.Module):
                 f"d_feat={self.d_feat} — Extractor và CnA không cùng một spec.")
         kv = self.kv_norm(v)
         h = self.latent.expand(v.shape[0], -1, -1).to(kv.dtype)
+        q0 = h
         for g in self.groups:
             h = g(h, kv)
+        if self.gamma is not None:           # Q1 + γ·Q0
+            h = h + self.gamma.to(h.dtype).view(1, -1, 1) * q0
         return self.proj(self.n_proj(h)) if self.final_proj else h
 
     def describe(self) -> str:
@@ -930,7 +943,10 @@ class CnA(nn.Module):
                 f"{a}CrossAttn(kv {self.d_feat}→{self.d_latent}) -> SwiGLU "
                 f"{self.d_latent}→{self.mlp_hidden}→{self.d_latent}"
                 + (f" │ {a}SelfAttn -> SwiGLU" if self.block2 else "")
-                + f"] ({self.n_heads} head × head_dim {self.head_dim}{gate})"
+                + f"]"
+                + (f" -> Q1 + γ·Q0 (γ ∈ ℝ^{self.n_query}, γ₀ = {self.gamma_init:g})"
+                   if self.q0_skip else "")
+                + f" ({self.n_heads} head × head_dim {self.head_dim}{gate})"
                 f"{tail} -> V_c ({self.n_query}, {self.d_model})")
 
 
@@ -1057,7 +1073,10 @@ def spec_from_cfg(cfg, d_model: int) -> dict:
                 "snop_w_init": float(cn.get("snop_w_init", 0.0)),
                 "snop_eps": float(cn.get("snop_eps", 0.15)),
                 # khối 2 (SelfAttn → FFN, không đọc ảnh) của bố cục cũ; false = chỉ khối 1
-                "block2": bool(cn.get("block2", False))},
+                "block2": bool(cn.get("block2", False)),
+                # skip học được Q1 + γ·Q0, γ ∈ ℝ^n_query (kích thước cố định)
+                "q0_skip": bool(cn.get("q0_skip", False)),
+                "gamma_init": float(cn.get("gamma_init", 1.0))},
     }
 
 
@@ -1127,7 +1146,8 @@ def build_cna(spec: dict, d_feat: int) -> CnA:
     return CnA(int(d_feat), spec["d_model"], c["n_query"], c["d_latent"],
                c["head_dim"], c["mlp_hidden"], c["n_blocks"], c["final_proj"],
                c["dropout"], c.get("attn", "mha"), c.get("snop_w_init", 0.0),
-               c.get("snop_eps", 0.15), bool(c.get("block2", False)))
+               c.get("snop_eps", 0.15), bool(c.get("block2", False)),
+               bool(c.get("q0_skip", False)), float(c.get("gamma_init", 1.0)))
 
 
 # ══ Nhánh hoàn chỉnh ════════════════════════════════════════════════════════

@@ -335,6 +335,8 @@ vextractor:
     mlp_hidden: 3072        # SwiGLU(3072): 2048 → 3072 → 2048
     n_blocks: 1             # N = 1: khối 1 [SelfAttn → CrossAttn → FFN] một lần
     block2: false           # BỎ khối 2 (SelfAttn → FFN, không đọc ảnh) của bố cục cũ
+    q0_skip: true           # Q0 → Self → Cross → FFN → Q1 + γ·Q0 → Proj
+    gamma_init: 1.0         # γ ∈ ℝ^12 học được (một hệ số mỗi token, nhóm lr ffn)
     final_proj: true        # RMSNorm + Linear 2048 -> 2560 (d_model của Gemma 3 4B)
     dropout: 0.0            # 0: không tiêu RNG của dropout LoRA
     # ── §2.2.2 SNOP-MHA thích ứng (Soft Non-orthogonality Penalty) ───────────

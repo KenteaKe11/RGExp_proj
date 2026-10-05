@@ -78,9 +78,12 @@ def choose(cands: list[int], a: float, b: float, budget: float) -> list[int]:
     return ok or [min(cands)]
 
 
+DEFAULT_RESERVE_GIB = 1.0   # mặc định cho MỌI pipeline (train / sinh / chấm): ngân sách = VRAM − 1 GiB
+
+
 def ab_cfg(cfg) -> dict:
     c = dict(cfg.get("autobatch", {}) or {})
-    rg = c.get("reserve_gib")
+    rg = c.get("reserve_gib", DEFAULT_RESERVE_GIB)   # khoá VẮNG = chừa 1 GiB; null tường minh = dùng target_frac
     return {"enabled": bool(c.get("enabled", False)),
             "target_frac": float(c.get("target_frac", 0.80)),
             # Khai `reserve_gib` (số) -> ngân sách = VRAM − reserve_gib GiB, BỎ QUA
