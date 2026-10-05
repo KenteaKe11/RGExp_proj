@@ -78,37 +78,52 @@ def choose(cands: list[int], a: float, b: float, budget: float) -> list[int]:
     return ok or [min(cands)]
 
 
+DEFAULT_INFER_RESERVE_GIB = 0.3   # RIÊNG lúc infer/sinh (không có optimizer/gradient): chừa 0.3 GiB
 DEFAULT_RESERVE_GIB = 1.0   # mặc định cho MỌI pipeline (train / sinh / chấm): ngân sách = VRAM − 1 GiB
 
 
 def ab_cfg(cfg) -> dict:
     c = dict(cfg.get("autobatch", {}) or {})
+    irg = c.get("infer_reserve_gib", DEFAULT_INFER_RESERVE_GIB)
     rg = c.get("reserve_gib", DEFAULT_RESERVE_GIB)   # khoá VẮNG = chừa 1 GiB; null tường minh = dùng target_frac
     return {"enabled": bool(c.get("enabled", False)),
             "target_frac": float(c.get("target_frac", 0.80)),
             # Khai `reserve_gib` (số) -> ngân sách = VRAM − reserve_gib GiB, BỎ QUA
             # `target_frac`. null -> ngân sách = target_frac × VRAM như cũ.
             "reserve_gib": None if rg is None else float(rg),
+            # CHỈ cho infer/sinh (`autotune_infer`, `autotune_generate`): ngân sách =
+            # VRAM − infer_reserve_gib. null -> dùng cùng quy tắc với train.
+            "infer_reserve_gib": None if irg is None else float(irg),
             "probe_sizes": [int(x) for x in (c.get("probe_sizes") or [1, 2, 4])],
             "infer_max_bs": int(c.get("infer_max_bs", 64) or 64)}
 
 
-def budget_of(ac: dict, total_bytes: float) -> float:
-    """Ngân sách VRAM (byte): `total − reserve_gib` nếu khai, ngược lại `target_frac × total`."""
-    total = float(total_bytes)
+def _reserve_of(ac: dict, infer: bool):
+    if infer and ac.get("infer_reserve_gib") is not None:
+        return float(ac["infer_reserve_gib"]), "infer_reserve_gib"
     if ac.get("reserve_gib") is not None:
-        r = float(ac["reserve_gib"])
+        return float(ac["reserve_gib"]), "reserve_gib"
+    return None, None
+
+
+def budget_of(ac: dict, total_bytes: float, infer: bool = False) -> float:
+    """Ngân sách VRAM (byte): `total − reserve` nếu khai, ngược lại `target_frac × total`.
+    `infer=True` (sinh/infer) dùng `infer_reserve_gib` (0.3) thay cho `reserve_gib` (1.0)."""
+    total = float(total_bytes)
+    r, key = _reserve_of(ac, infer)
+    if r is not None:
         if not 0.0 <= r * 1024 ** 3 < total:
-            raise ValueError(f"autobatch.reserve_gib = {r} GiB phải trong "
+            raise ValueError(f"autobatch.{key} = {r} GiB phải trong "
                              f"[0, {total / 1024 ** 3:.2f}) GiB của card")
         return total - r * 1024 ** 3
     return float(ac["target_frac"]) * total
 
 
-def budget_label(ac: dict) -> str:
+def budget_label(ac: dict, infer: bool = False) -> str:
     """Mô tả ngân sách cho dòng log: `VRAM − 1 GiB` hoặc `92%`."""
-    if ac.get("reserve_gib") is not None:
-        return f"VRAM − {float(ac['reserve_gib']):g} GiB"
+    r, _ = _reserve_of(ac, infer)
+    if r is not None:
+        return f"VRAM − {r:g} GiB"
     return f"{float(ac['target_frac']):.0%}"
 
 
@@ -306,7 +321,7 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
             return measure(step_fn, bs, ())
     cands = [c for c in INFER_LADDER
              if c <= max(1, int(max_bs if max_bs is not None else ac["infer_max_bs"]))]
-    budget = budget_of(ac, total_bytes)
+    budget = budget_of(ac, total_bytes, infer=True)
     want = [int(x) for x in (probe_sizes or [2, 4])]
     sizes = sorted({s for s in want if s in cands} or {cands[0]})
     pts, oom_at = [], None
@@ -353,7 +368,7 @@ def autotune_infer(cfg, label: str, current: int, step_fn,
                peak_frac=round(verified / float(total_bytes), 3))
     print(f"  ⚙ autobatch[{label}]: VRAM sinh ≈ {rep['a_gib']:.2f} + "
           f"{rep['b_gib']:.3f}·bs GiB (R² {rep['r2']}, đo {rep['points']}) · "
-          f"ngân sách {rep['budget_gib']} GiB = {budget_label(ac)} -> bs "
+          f"ngân sách {rep['budget_gib']} GiB = {budget_label(ac, infer=True)} -> bs "
           f"{current} -> {chosen} · đỉnh đã chạy thử {rep['peak_gib']} GiB "
           f"({rep['peak_frac']:.0%})", flush=True)
     return int(chosen), rep
@@ -386,7 +401,7 @@ def autotune_generate(cfg, label: str, current: int, step_fn,
 
         def measure_fn(bs):
             return measure(step_fn, bs, ())
-    budget = budget_of(ac, total_bytes)
+    budget = budget_of(ac, total_bytes, infer=True)
     ladder = sorted({c for c in INFER_LADDER if c <= top} | {top}, reverse=True)
     gib = 1024 ** 3
     tried, chosen, peak = [], None, None
@@ -412,5 +427,5 @@ def autotune_generate(cfg, label: str, current: int, step_fn,
                peak_frac=round(peak / float(total_bytes), 3))
     print(f"  ⚙ autobatch[{label}]: dò từ {top} xuống -> bs {chosen} · đỉnh "
           f"{rep['peak_gib']} GiB ({rep['peak_frac']:.0%}) · ngân sách "
-          f"{rep['budget_gib']} GiB = {budget_label(ac)}", flush=True)
+          f"{rep['budget_gib']} GiB = {budget_label(ac, infer=True)}", flush=True)
     return chosen, rep

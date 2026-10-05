@@ -261,6 +261,15 @@ def _():
     # khoá `reserve_gib` VẮNG => MẶC ĐỊNH chừa 1 GiB cho mọi pipeline (train/sinh/chấm)
     assert budget_of(ab_cfg(Cfg({"autobatch": {"enabled": True}})), TOTAL) == TOTAL - 1024 ** 3
     assert budget_of(ab_cfg(Cfg({})), TOTAL) == TOTAL - 1024 ** 3
+    # RIÊNG infer/sinh: mặc định chừa 0.3 GiB (train vẫn 1 GiB); null -> theo reserve_gib
+    g3 = 0.3 * 1024 ** 3
+    assert budget_of(ab_cfg(Cfg({})), TOTAL, infer=True) == TOTAL - g3
+    assert budget_of(ab_cfg(Cfg({})), TOTAL) == TOTAL - 1024 ** 3
+    assert budget_of(ab_cfg(Cfg({"autobatch": {"infer_reserve_gib": None}})), TOTAL, infer=True) \
+        == TOTAL - 1024 ** 3
+    _inf = Cfg({"autobatch": {"enabled": True, "infer_max_bs": 64}})
+    _pk = lambda bs: (TOTAL - g3 + 1) if bs > 8 else 1.0  # noqa: E731  đỉnh vượt 0.3 GiB-ngân sách từ bs 12
+    assert __import__("src.autobatch", fromlist=["x"]).autotune_generate(_inf, "g", 4, None, measure_fn=_pk, total_bytes=TOTAL)[0] == 8
     for bad in (-1.0, 16.0):
         try:
             budget_of(ab_cfg(Cfg({"autobatch": {"reserve_gib": bad}})), TOTAL)
@@ -303,7 +312,7 @@ def _():
 
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     assert AB.ab_cfg(cfg)["infer_max_bs"] == 64
-    on = {"autobatch": {"enabled": True, "target_frac": 0.8, "reserve_gib": None, "infer_max_bs": 64}}
+    on = {"autobatch": {"enabled": True, "target_frac": 0.8, "reserve_gib": None, "infer_reserve_gib": None, "infer_max_bs": 64}}
     GIB = 1024 ** 3
     seen = []
 

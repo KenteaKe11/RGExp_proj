@@ -86,6 +86,7 @@ set:
   autobatch.enabled: true
   autobatch.target_frac: 0.92      # BỊ BỎ QUA khi reserve_gib khác null
   autobatch.reserve_gib: 1.0       # ngân sách = VRAM − 1 GiB (null -> dùng target_frac)
+  autobatch.infer_reserve_gib: 0.3 # RIÊNG infer/sinh: VRAM − 0.3 GiB (null -> dùng reserve_gib)
   autobatch.probe_sizes: [2, 4, 8]   # điểm đo của MAIN STAGE (xem stage0.probe_sizes)
   autobatch.infer_max_bs: 64       # sinh: dò TỪ 64 XUỐNG (48, 32, 24, …) tới nấc vừa ngân sách
 
