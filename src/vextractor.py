@@ -72,7 +72,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # Format KHÔNG chạm tới checkpoint Stage 0: nó chỉ chứa trọng số EXTRACTOR, và
 # điều kiện nạp nó là `backbone_spec` khớp (xem `load_stage0_into`), nên bump
 # format vì CnA KHÔNG bắt chạy lại một lượt DINO nhiều giờ.
-FORMAT = "rgexp.vextractor/32"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280 · /28 N = 1, @2048, SwiGLU 3072 · /29 Q1 + γ·Q0 · /30 AdaSNoP v2: α = α_mean + ε·tanh(W_α), ÷√(N²+1) · /31 gỡ γ·Q0 · /32 8 latent @1536, block2, SwiGLU 2048
+FORMAT = "rgexp.vextractor/33"   # /19 SNOP-MHA · /20 ÷(N−1) · /21 α ∈ ℝ^N, ε, stop_grad(Õ), ÷(ln N + 1) · /22 ÷(N + 1) · /23 ÷(2 ln N + 1) · /24 Õ = |cos| (L2) · /25 α hằng số ∈ [0, 1], ÷(N + 1) · /26 c = ε + (1−ε)σ(W_α), W_α ∈ ℝ^N học · /27 bỏ khối 2, N = 2 × khối 1, 12 latent @1280 · /28 N = 1, @2048, SwiGLU 3072 · /29 Q1 + γ·Q0 · /30 AdaSNoP v2: α = α_mean + ε·tanh(W_α), ÷√(N²+1) · /31 gỡ γ·Q0 · /32 8 latent @1536, block2, SwiGLU 2048 · /33 16 latent
 
 
 class VExtractorUnusable(RuntimeError):

@@ -2681,11 +2681,11 @@ def _():
     # (j) config THẬT
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop" and int(cn["n_query"]) == 8 and int(cn["d_latent"]) == 1536
+    assert cn["attn"] == "snop" and int(cn["n_query"]) == 16 and int(cn["d_latent"]) == 1536
     assert int(cn["n_blocks"]) == 1 and cn["block2"] is True and int(cn["mlp_hidden"]) == 2048
     assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.1
     assert float(cn["snop_alpha_mean"]) == 0.8
-    assert R.FORMAT == "rgexp.vextractor/32"
+    assert R.FORMAT == "rgexp.vextractor/33"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)
     tr.trace = {}
