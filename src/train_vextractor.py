@@ -596,7 +596,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
           f"che {zc['z_mask_frac']:.0%} token Z mỗi optimizer step",
           flush=True)
     if branch.cna.snop_gates():
-        print(f"  SNOP-MHA thích ứng: ε = {branch.cna.snop_eps:g}, W_α₀ = "
+        print(f"  AdaSNoP v2: α = {branch.cna.snop_alpha_mean:g} ± {branch.cna.snop_eps:g}, W_α₀ = "
               f"{branch.cna.snop_w_init:g} ∈ ℝ^{branch.cna.n_query} ở "
               f"{len(branch.cna.snop_gates())} lớp attention · lr W_α = "
               f"×{zc['cna_snop_lr_mult']:g} ffn ({zc['cna_snop_lr_mult'] * zc['cna_ffn_lr_min']:g}"
@@ -839,7 +839,7 @@ def _train_once(cfg, arm, preset, train_df, out_dir, stage0_best, tracker,
                   f"ffn {alr:.2e} self {alr_self:.2e} cross {alr_cross:.2e} · "
                   f"Z che {0 if z_drop is None else int(z_drop.numel())}"
                   + ("" if not (_gs := branch.cna.snop_gates()) else
-                     " · SNOP c̄ " + " ".join(f"{sum(v) / len(v):.4f}"
+                     " · SNOP ᾱ " + " ".join(f"{sum(v) / len(v):.4f}"
                                              for v in _gs.values())),
                   flush=True)
             if tracker is not None:
