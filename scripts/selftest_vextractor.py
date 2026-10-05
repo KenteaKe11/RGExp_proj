@@ -23,7 +23,7 @@ Kiểm những thứ mà nếu sai thì KHÔNG có exception nào, chỉ có m�
  14. LỊCH CHUNG (warm-up 1 epoch -> GIỮ lr_max, chặng 5 ÷1,25) + ba cặp lr main
  15. Stage 0 chạy THẬT trên mô hình giả: warm-up rồi GIỮ, dừng sớm theo patience,
      epoch ĐUÔI cosine về lr_min, rồi mới lấy best val
- 16. MASK REGULARIZATION: 25% token Z bị che qua attention_mask mỗi optimizer
+ 16. MASK REGULARIZATION: 50% token Z bị che qua attention_mask mỗi optimizer
      step, kiểm cả trên Gemma 3 THẬT (tí hon)
  17. main stage: CnA học từ bước 0, ba nhóm cùng một dốc warm-up 10%
  18. kéo Stage 0 từ Hub giả lập (base khớp -> chạy tiếp epoch đuôi)
@@ -1334,7 +1334,7 @@ def _():
     assert (zc["cna_self_lr_min"], zc["cna_self_lr_main"]) == (1e-8, 1e-5)
     assert (zc["cna_cross_lr_min"], zc["cna_cross_lr_main"]) == (4e-8, 4e-5)
     assert zc["cna_snop_lr_mult"] == 10.0
-    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.25
+    assert zc["cna_warmup_frac"] == 0.10 and zc["z_mask_frac"] == 0.5
     # dốc 10% tổng bước, bước 0 có ĐÚNG lr_min, rồi PHẲNG
     a0, a20, a199 = cna_lr_at(0, zc, 200), cna_lr_at(20, zc, 200), cna_lr_at(199, zc, 200)
     assert {k: a0[k] for k in ("ffn", "self", "cross")} == {"ffn": 1e-7, "self": 1e-8, "cross": 4e-8}, a0
@@ -1587,7 +1587,7 @@ def _():
             assert not m.group(1).strip(), f"{f.name}: hf_token({m.group(1)})"
 
 
-@check("16. MASK REGULARIZATION: che `z_mask_frac` (25%) token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
+@check("16. MASK REGULARIZATION: che `z_mask_frac` (50%) token Z mỗi optimizer step qua attention_mask; tái lập theo (seed, step); Gemma 3 THẬT (tí hon) không đọc được token bị che; val không che")
 def _():
     import types
 
@@ -2681,11 +2681,11 @@ def _():
     # (j) config THẬT
     cfg = load_config(ROOT / "configs/vextractor.yaml")
     cn = cfg["vextractor"]["cna"]
-    assert cn["attn"] == "snop" and int(cn["n_query"]) == 16 and int(cn["d_latent"]) == 1536
+    assert cn["attn"] == "snop" and int(cn["n_query"]) == 8 and int(cn["d_latent"]) == 1536
     assert int(cn["n_blocks"]) == 1 and cn["block2"] is True and int(cn["mlp_hidden"]) == 2048
     assert float(cn["snop_w_init"]) == 0.0 and float(cn["snop_eps"]) == 0.1
     assert float(cn["snop_alpha_mean"]) == 0.8
-    assert R.FORMAT == "rgexp.vextractor/33"
+    assert R.FORMAT == "rgexp.vextractor/32"
     # (k) Lens: trace ghi O và O_final; similarity sau SNOP ít giống nhau hơn
     tr = MHA(16, 4, None, snop=True, n_tok=N)
     tr.trace = {}
