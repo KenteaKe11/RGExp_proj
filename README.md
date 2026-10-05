@@ -155,20 +155,10 @@ Những module khác freeze hoàn toàn — Extractor chạy chế độ teacher
 bash scripts/setup.sh
 python3 scripts/selftest_vextractor.py
 bash scripts/run_vextractor.sh train --detach
-
-# Pull HF output
-huggingface-cli download RGExp123/Research_results \
-  --repo-type dataset \
-  --include 'current/$2.2_V-Extractor_Test/stage0/final/*' \
-  --local-dir ./hub_dl
-
-# Skip selftest
-RGEXP_SKIP_SELFTEST=1
-
-# Skip setup
-RGEXP_SKIP_SETUP=1
 ```
 
 Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
+
+> **Kéo từ Hub:** `bash scripts/run_vextractor.sh pull` chỉ kéo Stage 0 gốc (như `huggingface-cli download RGExp123/Research_results --repo-type dataset --include 'current/$2.2_V-Extractor_Test/stage0/final/*'`, nhưng có kiểm vân tay + `origin.json`); thêm `--weights` để kéo cả weight của B cho `lens`/`stats`. Cần `HF_TOKEN`; không train, không đẩy gì lên.
 
 > **Stage 0 = đúng checkpoint Stage 0 của §2.2 gốc (CnA MHA), không bao giờ chạy DINO ở thí nghiệm này** (`output.stage0_from.required: true`, `run_vextractor.ensure_origin_stage0`). Nguồn theo thứ tự: bản cục bộ `./adapters_vextractor/_stage0` của gốc, rồi Hub `current/$2.2_V-Extractor_Test/stage0` (chỉ `final/` đã xong, khớp vân tay). Bản chép mang `_stage0/origin.json` (nguồn + sha256 của `final/`); thư mục Stage 0 không có hoặc lệch `origin.json` bị ghi đè bằng bản gốc. Không lấy được thì **dừng**; `--restage0` bị từ chối, `--retrain-all` chỉ chạy lại main + sinh + chấm. Checkpoint **main stage** của §2.2 **không nạp được** (`FORMAT` = `rgexp.vextractor/26`, spec có `cna.attn`), nên main stage chạy lại vào `./adapters_vextractor_snop` / `runs/vextractor_snop`.

@@ -2168,14 +2168,18 @@ def _():
     from src.run_vextractor import COMMANDS
 
     assert COMMANDS["lens"] == ["lens"]
+    assert COMMANDS["pull"] == ["pull"]            # kéo Stage 0 gốc (+ weight B) từ Hub, không train/đẩy
+    assert "pull" in (ROOT / "scripts/run_vextractor.sh").read_text(encoding="utf-8")
     c = lcfg(load_config(ROOT / "configs/vextractor.yaml"))
     assert c["enabled"] and c["target"] == "ref_logprob" and c["dir"] == "Lens"
     sh = (ROOT / "scripts/run_vextractor.sh").read_text(encoding="utf-8")
-    assert "train|push|stats|lens|all)" in sh
+    assert "train|push|pull|stats|lens|all)" in sh
     src = (ROOT / "src/run_vextractor.py").read_text(encoding="utf-8")
     # Lens §2.1 CHỈ cần weight của B — không kéo weight của A về nữa
     assert "_cmd_lens" in src and "arm_weight_dir(cfg, B, adapter_root).parent" in src
-    assert "want_weights=True" not in src
+    lens_src = src[src.index("def _cmd_lens"):src.index("def _cmd_push")]
+    assert "want_weights=True" not in lens_src      # `pull --weights` thì có, `lens` thì không
+    assert "want_weights=True" in src[src.index("def _cmd_pull"):src.index("def _cmd_train")]
 
 
 

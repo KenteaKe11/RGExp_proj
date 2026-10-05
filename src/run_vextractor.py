@@ -46,6 +46,7 @@ COMMANDS = {
     "stats": ["stats", "report"],
     "lens": ["lens"],
     "push": ["push"],
+    "pull": ["pull"],
     "all": ["data", "stage0", "train", "infer", "score", "stats", "report", "push"],
 }
 
@@ -468,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--no-pull", action="store_true")
+    ap.add_argument("--weights", action="store_true",
+                    help="`pull`: kéo thêm weight của B (adapter + CnA) về — cho `lens`/`stats`")
     a = ap.parse_args(argv)
     if not a.command:
         ap.print_usage()
@@ -570,12 +573,62 @@ def main(argv: list[str] | None = None) -> int:
         rc = _cmd_stats(a, cfg, A, B, stages, run_dir, adapter_root, fx, manifest, save)
     if not rc and "lens" in stages:
         rc = _cmd_lens(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save)
+    if not rc and "pull" in stages:
+        rc = _cmd_pull(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save)
     if not rc and "push" in stages:
         rc = _cmd_push(a, cfg, A, B, run_dir, adapter_root, manifest, save)
     save()
     if not rc:
         print(f"\n✓ `{a.command}` xong sau {(time.time() - t0) / 60:.1f} phút", flush=True)
     return rc
+
+
+# ── pull ────────────────────────────────────────────────────────────────────
+def _cmd_pull(a, cfg, A, B, run_dir, adapter_root, fx, manifest, save) -> int:
+    """Kéo từ Hub về máy — KHÔNG train, KHÔNG sinh, KHÔNG đẩy gì lên.
+
+    1. Stage 0 GỐC ($2.2, `output.stage0_from`): `<hub_root>/$2.2_V-Extractor_Test/stage0/`
+       (chỉ `final/` đã xong, khớp vân tay) -> `<stage0_from.adapter_dir>`->`_stage0/`
+       của thí nghiệm này, kèm `origin.json` + sha256. Tương đương
+       `huggingface-cli download <repo> --repo-type dataset --include
+       'current/$2.2_V-Extractor_Test/stage0/final/*'`, nhưng có kiểm vân tay.
+    2. `--weights`: kéo thêm weight của B ($2.2.2) để chạy `lens` / `stats`.
+    """
+    from . import fixture as fx_mod
+    from . import hub_sync
+    from . import stage0_vextractor as s0
+
+    if a.no_pull or not bool(cfg["output"].get("pull", True)):
+        print("✗ `pull` mâu thuẫn với --no-pull / output.pull: false", flush=True)
+        return 2
+    _hr("Pull từ Hub")
+    if origin_required(cfg):
+        try:
+            manifest["stage0_origin"] = ensure_origin_stage0(cfg, allow_hub=True)
+        except OriginStage0Missing as e:
+            print(f"\n✗ không kéo được Stage 0 GỐC:\n      {e}", flush=True)
+            return 3
+    else:
+        ok = pull_stage0(cfg)
+        if s0.finished(cfg) is None:
+            print("✗ Hub không có Stage 0 `final/` khớp vân tay — phải chạy "
+                  "`train` ở máy này.", flush=True)
+            return 3
+        print(f"  ✓ Stage 0 {'vừa kéo' if ok else 'đã có sẵn'}", flush=True)
+    save()
+    if a.weights:
+        n_test = int(cfg["data"].get("n_test") or 0)
+        if not fx_mod.exists(fx):
+            bring_baseline(cfg, A, run_dir, adapter_root, fx, n_test, True)
+        got = hub_sync.pull(cfg, run_dir, adapter_root, fx, [B], n_test,
+                            want_weights=True)
+        w = arm_weight_dir(cfg, B, adapter_root)
+        if not (w / "adapter_model.safetensors").exists():
+            print(f"✗ Hub chưa có weight của {B['id']} khớp tem (hoặc chưa push): "
+                  f"cần `train`. ({got})", flush=True)
+            return 1
+        print(f"  ✓ weight của {B['id']} -> {w}", flush=True)
+    return 0
 
 
 # ── train ───────────────────────────────────────────────────────────────────
