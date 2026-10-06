@@ -311,31 +311,19 @@ class WandbLog:
                         "(đồng bộ sau: wandb sync <thư mục wandb>)")
             d = out / "wandb"
             d.mkdir(parents=True, exist_ok=True)
-            # id được nhớ trong <out>/wandb_run_id.txt: chạy lại / đi tiếp từ ckpt dùng lại đúng
-            # run này. W&B KHÔNG bao giờ cho dùng lại id của run đã xoá -> nếu bị từ chối thì
-            # sinh id mới (hậu tố ngẫu nhiên) và ghi đè file.
-            idf = out / "wandb_run_id.txt"
-            base = f"{extra.get('experiment', 'lora')}-{c['id']}"
-            rid = idf.read_text().strip() if idf.exists() else ""
-            for attempt in range(2):
-                if not rid or attempt:
-                    import secrets
-                    rid = f"{base}-{secrets.token_hex(3)}"
-                try:
-                    self.run = wandb.init(
-                        project=cfg.get("project", "rgexp-lora-medgemma"), entity=cfg.get("entity"),
-                        group=cfg.get("group"), tags=list(cfg.get("tags") or []),
-                        name=c["id"], id=rid, resume="allow", dir=str(d), mode=mode,
-                        config={"candidate": c, "train": tc, **extra},
-                        settings=wandb.Settings(console="off", silent=True),
-                    )
-                    break
-                except Exception as e:  # noqa: BLE001
-                    if attempt == 0 and "deleted" in str(e).lower():
-                        log(f"  W&B: id {rid} đã bị xoá trên W&B -> dùng id mới")
-                        continue
-                    raise
-            idf.write_text(rid)
+            # Mỗi lần worker khởi động = MỘT run MỚI với id luôn khác nhau (thời gian + hậu tố
+            # ngẫu nhiên): không bao giờ đụng id của run đã xoá, không ghi chồng lên run cũ.
+            # Chạy đi tiếp từ ckpt/last cũng tạo run mới (bắt đầu từ bước đã khôi phục).
+            import secrets
+            rid = f"{extra.get('experiment', 'lora')}-{c['id']}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+            self.run = wandb.init(
+                project=cfg.get("project", "rgexp-lora-medgemma"), entity=cfg.get("entity"),
+                group=cfg.get("group"), tags=list(cfg.get("tags") or []),
+                name=f"{c['id']} {time.strftime('%m-%d %H:%M')}", id=rid, resume="never",
+                dir=str(d), mode=mode,
+                config={"candidate": c, "train": tc, **extra},
+                settings=wandb.Settings(console="wrap", silent=True),
+            )
             self.run.define_metric("step")
             self.run.define_metric("*", step_metric="step")
             log(f"  W&B: {mode} · run {self.run.name} · {getattr(self.run, 'url', None) or d}")
@@ -538,6 +526,7 @@ def run_train(spec, torch) -> int:
         "n_train": len(rows), "n_val": len(vrows), "seed": seed, "dtype": spec["dtype"],
         "quant": spec["quant"], "lora": spec["lora"], "hw": hk, **pstats})
     wb_every = max(1, int((spec.get("wandb") or {}).get("log_every", 1)))
+    console_every = max(1, int((spec.get("wandb") or {}).get("console_every", 20)))
     ckpt_every = int(tc.get("ckpt_every_steps", 100))
     pad_id = enc.tok.pad_token_id
     n_done_run = 0
@@ -594,18 +583,18 @@ def run_train(spec, torch) -> int:
                     if (g + 1) % wb_every == 0 or g == 0:
                         wb.log({"step": g + 1, "lr": rec["lr"], "ce_loss": rec["loss"],
                                 "grad_norm": gn})
-                        # In ĐÚNG những gì gửi lên W&B vào log của run (mỗi dòng = một điểm trên W&B).
-                        log(f"  [{c['id']}] step {g + 1}/{total} · lr {rec['lr']:.6e} · "
-                            f"ce_loss {rec['loss']:.6f} · grad_norm {gn:.6f}")
+
                     if not probe["tuned"]:
                         probe["tuned"] = True
                         dump(probe_p, probe)
-                    if (g + 1) % 50 == 0 or g == 0:
+                    if (g + 1) % console_every == 0 or g == 0 or g + 1 == total:
+                        # Dòng này vào log của run VÀ tab Logs của W&B (W&B bắt stdout, console="wrap").
                         el = time.time() - t0
                         eta = el / n_done_run * (total - g - 1)
                         vram = (f" · VRAM đỉnh {torch.cuda.max_memory_allocated() / GIB:.1f} GiB"
                                 if torch.cuda.is_available() else "")
-                        log(f"  [{c['id']}] tiến độ {g + 1}/{total} · mb {micro} · "
+                        log(f"  [{c['id']}] step {g + 1}/{total} · lr {rec['lr']:.6e} · "
+                            f"ce_loss {rec['loss']:.6f} · grad_norm {gn:.6f} · mb {micro} · "
                             f"còn ~{eta / 60:.0f} phút{vram}")
                     end_of_epoch = (g + 1) % spe == 0
                     if end_of_epoch and tc.get("eval_every_epoch", True) and vrows:

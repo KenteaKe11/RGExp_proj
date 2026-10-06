@@ -55,7 +55,7 @@ def render(cfg, cs, summary, fr, ph, nem, sel, trains, metas, srep, tm, n_test) 
       f"loss chuẩn hoá theo token của cả bước) · AdamW (weight decay {tc['weight_decay']}) · lr 0 → {tc['lr_max']:g} "
       f"(warmup {tc['warmup_frac']:.0%}) → cosine → {tc['lr_min']:g} · "
       f"grad clip {tc['max_grad_norm']} · loss chỉ trên báo cáo |")
-    w(f"| Chọn checkpoint | `{tc.get('select_checkpoint')}` (cùng quy tắc mọi rank; val-loss cuối epoch chỉ để ghi nhận khi `last`) |")
+    w(f"| Chọn checkpoint | adapter cuối epoch (không có tập val) |")
     g = policy(cfg)
     w(f"| Sinh | `{', '.join(f'{k}={v}' for k, v in g.items())}` |")
     w(f"| Ảnh | 512² (repo) → `AutoProcessor` gốc của MedGemma (896², 256 token/ảnh) |")
@@ -65,18 +65,16 @@ def render(cfg, cs, summary, fr, ph, nem, sel, trains, metas, srep, tm, n_test) 
       f"(chỉ metric qua cổng) Nemenyi CD + Wilcoxon (Pratt) Holm `{st.get('posthoc_holm')}`, rank-biserial |\n")
 
     w("### 1.1. Huấn luyện từng rank\n")
-    w("| Candidate | r | α | tham số học | module | epoch chọn | val-loss theo epoch | loss train (50 bước cuối) | "
+    w("| Candidate | r | α | tham số học | module | epoch chọn | loss train (50 bước cuối) | "
       "micro-batch | VRAM đỉnh | phút |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|")
+    w("|---|---|---|---|---|---|---|---|---|---|")
     for c in cs:
         if c["reference"]:
             continue
         t = trains.get(c["id"]) or {}
-        ev = t.get("epoch_eval") or {}
-        evs = " · ".join(f"e{k}: {_f(v.get('val_loss'))}" for k, v in sorted(ev.items()))
         tp = t.get("trainable_params")
         w(f"| {c['name']} | {c['rank']} | {c['alpha']:g} | {f'{tp:,}' if tp else '—'} | "
-          f"{t.get('n_target_modules', '—')} | {t.get('selected_epoch', '—')} | {evs or '—'} | "
+          f"{t.get('n_target_modules', '—')} | {t.get('selected_epoch', '—')} | "
           f"{_f(t.get('final_train_loss_mean_last50'))} | {t.get('micro_batch_final', '—')} | "
           f"{t.get('peak_vram_gib', '—')} | {t.get('minutes_this_run', '—')} |")
     w("")
@@ -85,8 +83,8 @@ def render(cfg, cs, summary, fr, ph, nem, sel, trains, metas, srep, tm, n_test) 
     w("## 2. Dữ liệu\n")
     if srep.get("positives"):
         w(f"Hồ {srep.get('pool_images')} ảnh / {srep.get('pool_patients')} bệnh nhân → "
-          f"**{srep.get('n_train')} train / {srep.get('n_val', 0)} val / {srep.get('n_test')} test**, "
-          f"mỗi bệnh nhân đúng một ảnh trên cả ba tập (trùng bệnh nhân: {srep.get('patients_overlap')}), "
+          f"**{srep.get('n_train')} train / {srep.get('n_test')} test**, "
+          f"mỗi bệnh nhân đúng một ảnh trên cả hai tập (trùng bệnh nhân: {srep.get('patients_overlap')}), "
           f"seed {srep.get('seed')}.\n")
         lo = srep.get("label_orientation") or {}
         if lo:

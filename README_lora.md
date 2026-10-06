@@ -106,9 +106,10 @@ candidate (×6), huấn luyện vài giờ / rank — tổng cỡ 1–1,5 ngày,
 ### 2.1. Log W&B
 
 Project `rgexp-lora-medgemma` (đổi ở `wandb.project` / `wandb.entity` trong `configs/lora.yaml`),
-group `lora_rank`, **mỗi rank một run** tên `qlora_r<r>`, id cố định `lora_rank-qlora_r<r>` nên chạy
-lại / đi tiếp từ `ckpt/last` vẫn ghi vào cùng một run. Mỗi bước: `step`, `lr`, `ce_loss`
-(CE trung bình theo token đích của cả bước) và `grad_norm` — chỉ bốn đại lượng này. Config của run gồm toàn
+group `lora_rank`, mỗi lần worker train khởi động là **một run mới với id luôn khác nhau**
+(`lora_rank-qlora_r<r>-<ngày-giờ>-<hex>`, tên hiển thị `qlora_r<r> <mm-dd HH:MM>`); chạy đi tiếp từ
+`ckpt/last` cũng tạo run mới, bắt đầu từ bước đã khôi phục. Gom theo `group: lora_rank`. Mỗi bước: `step`, `lr`, `ce_loss`
+(CE trung bình theo token đích của cả bước) và `grad_norm` — chỉ bốn đại lượng này (biểu đồ). Cứ 20 bước (`wandb.console_every`) có một dòng log `step · lr · ce_loss · grad_norm · …` vừa vào log của run vừa hiện ở tab **Logs** của W&B (W&B bắt stdout của worker). Config của run gồm toàn
 bộ lịch huấn luyện, quant, LoRA, phần cứng. W&B lỗi/không có key **không** làm hỏng huấn luyện:
 không có key -> chạy offline (log ở `cands/<id>/wandb/`, đẩy sau bằng `wandb sync`); thư mục này
 không đẩy lên Hub. Tắt: `wandb.enabled: false` hoặc `RGEXP_NO_WANDB=1`. Chỉ log huấn luyện

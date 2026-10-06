@@ -156,8 +156,8 @@ autotune:
 # ── Weights & Biases: đồng bộ log huấn luyện (chỉ: step, lr, ce_loss, grad_norm) ────────────────────────────────
 # Cần `WANDB_API_KEY` (hoặc đã `wandb login`). Không có -> tự chạy offline (log nằm trong
 # <cands>/<id>/wandb, đẩy sau bằng `wandb sync`). W&B hỏng KHÔNG làm hỏng huấn luyện.
-# Tắt hẳn: enabled: false hoặc RGEXP_NO_WANDB=1. Mỗi rank = 1 run, id cố định
-# `<experiment>-<cand>` nên chạy lại / đi tiếp từ ckpt vẫn ghi vào cùng một run.
+# Tắt hẳn: enabled: false hoặc RGEXP_NO_WANDB=1. Mỗi lần worker train khởi động =
+# 1 run MỚI, id luôn khác nhau (`<experiment>-<cand>-<ngày-giờ>-<hex>`), kể cả khi đi tiếp từ ckpt.
 wandb:
   enabled: true
   project: rgexp-lora-medgemma
@@ -165,6 +165,7 @@ wandb:
   group: lora_rank
   tags: [medgemma-4b, qlora, exp2]
   log_every: 1                   # mỗi N bước tối ưu hoá (ghi: step, lr, ce_loss, grad_norm)
+  console_every: 20              # in 1 dòng log mỗi N bước (vào log của run + tab Logs của W&B)
 
 # ── Metrics (y hệt Thí nghiệm 1) ────────────────────────────────────────────
 metrics:

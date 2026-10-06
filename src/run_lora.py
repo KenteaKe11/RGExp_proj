@@ -145,7 +145,8 @@ def common_spec(cfg: Cfg) -> dict:
     return {"base": dict(cfg["base"]), "quant": dict(cfg["quant"]), "lora": dict(cfg["lora"]),
             "dtype": str(cfg.get("dtype", "bfloat16")), "seed": int(cfg.get("seed", 42)),
             "user_prompt": str(cfg["prompt"]["user"]).strip(),
-            "autotune": dict(cfg.get("autotune") or {})}
+            "autotune": dict(cfg.get("autotune") or {}),
+            "experiment": str(cfg.get("experiment", "lora")), "wandb": dict(cfg.get("wandb") or {})}
 
 
 def _check_dtype(cfg: Cfg) -> None:
@@ -362,7 +363,7 @@ def cmd_stats(cfg: Cfg, a) -> None:
 
 
 # ── push ────────────────────────────────────────────────────────────────────
-PUSH_IGNORE = [".hub_cache/**", "**/ckpt/**", "**/dryrun/**", "**/tasks.jsonl", "tasks/**", ".lock", "**/*.tmp",
+PUSH_IGNORE = ["**/wandb/**", ".hub_cache/**", "**/ckpt/**", "**/dryrun/**", "**/tasks.jsonl", "tasks/**", ".lock", "**/*.tmp",
                "**/train_spec.json", "**/infer_spec.json"]
 
 
@@ -452,7 +453,8 @@ def _same_setup(cfg: Cfg, hub_stats: dict | None, c: dict) -> bool:
     if not hub_stats:
         return False
     hc = hub_stats.get("candidate") or {}
-    keys = ("epochs", "effective_batch", "lr", "warmup_frac", "max_seq_len", "select_checkpoint")
+    keys = ("epochs", "effective_batch", "lr_max", "lr_min", "warmup_frac", "weight_decay",
+            "max_seq_len", "select_checkpoint")
     same_train = all((hub_stats.get("train") or {}).get(k) == cfg["train"].get(k) for k in keys)
     return int(hc.get("rank", -1)) == c["rank"] and float(hc.get("alpha", -1)) == c["alpha"] \
         and same_train and hub_stats.get("dtype") == str(cfg.get("dtype"))

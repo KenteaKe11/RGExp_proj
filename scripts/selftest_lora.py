@@ -57,7 +57,7 @@ def t01_config():
                                                   "gate_proj", "up_proj", "down_proj"}
     assert {"vision_tower", "multi_modal_projector", "lm_head"} <= set(cfg["quant"]["skip_modules"])
     s = cfg["sampling"]
-    assert (s["n_train"], s["n_test"]) == (6400, 3000) and s["n_val"] > 0
+    assert (s["n_train"], s["n_test"]) == (6400, 3000) and not s.get("n_val")
     assert cfg["stats"]["method"] == "friedman"
     assert cfg["output"]["fixture_dir"] != bb["output"]["fixture_dir"], "phải lấy mẫu MỚI"
     bad = load_config(CFG, ["quant.compute_dtype=float16"])
