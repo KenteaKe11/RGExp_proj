@@ -311,14 +311,31 @@ class WandbLog:
                         "(đồng bộ sau: wandb sync <thư mục wandb>)")
             d = out / "wandb"
             d.mkdir(parents=True, exist_ok=True)
-            self.run = wandb.init(
-                project=cfg.get("project", "rgexp-lora-medgemma"), entity=cfg.get("entity"),
-                group=cfg.get("group"), tags=list(cfg.get("tags") or []),
-                name=c["id"], id=f"{extra.get('experiment', 'lora')}-{c['id']}", resume="allow",
-                dir=str(d), mode=mode,
-                config={"candidate": c, "train": tc, **extra},
-                settings=wandb.Settings(console="off", silent=True),
-            )
+            # id được nhớ trong <out>/wandb_run_id.txt: chạy lại / đi tiếp từ ckpt dùng lại đúng
+            # run này. W&B KHÔNG bao giờ cho dùng lại id của run đã xoá -> nếu bị từ chối thì
+            # sinh id mới (hậu tố ngẫu nhiên) và ghi đè file.
+            idf = out / "wandb_run_id.txt"
+            base = f"{extra.get('experiment', 'lora')}-{c['id']}"
+            rid = idf.read_text().strip() if idf.exists() else ""
+            for attempt in range(2):
+                if not rid or attempt:
+                    import secrets
+                    rid = f"{base}-{secrets.token_hex(3)}"
+                try:
+                    self.run = wandb.init(
+                        project=cfg.get("project", "rgexp-lora-medgemma"), entity=cfg.get("entity"),
+                        group=cfg.get("group"), tags=list(cfg.get("tags") or []),
+                        name=c["id"], id=rid, resume="allow", dir=str(d), mode=mode,
+                        config={"candidate": c, "train": tc, **extra},
+                        settings=wandb.Settings(console="off", silent=True),
+                    )
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 0 and "deleted" in str(e).lower():
+                        log(f"  W&B: id {rid} đã bị xoá trên W&B -> dùng id mới")
+                        continue
+                    raise
+            idf.write_text(rid)
             self.run.define_metric("step")
             self.run.define_metric("*", step_metric="step")
             log(f"  W&B: {mode} · run {self.run.name} · {getattr(self.run, 'url', None) or d}")

@@ -39,10 +39,10 @@ tái lập được như cũ.
 | **Base** | `google/medgemma-4b-it`, NF4 4-bit + double quant, compute bf16. Vision tower, projector, lm_head **không** lượng tử, đóng băng |
 | **Adapter** | q/k/v/o/gate/up/down × 34 lớp của khối ngôn ngữ (= 238 module, kiểm cứng; dừng nếu có module vision) · α = 2r (α/r cố định → cột rank chỉ đo số chiều) · dropout 0.05 |
 | **dtype** | `bfloat16` cho cả 5 candidate (trọng số không lượng tử, pixel_values, compute NF4); adapter fp32 (master weights, như nhau ở mọi rank). Không dùng `prepare_model_for_kbit_training` vì nó ép cả vision tower lên fp32 |
-| **Dữ liệu** | **6400 train / 500 val / 3000 test**, lấy mẫu mới; mỗi bệnh nhân đúng một ảnh trên cả ba tập |
-| **Sàng lọc** | (a) mọi nhãn có ca dương ở mọi tập (≥ 60 train / 5 val / 30 test; hồ thiếu → ưu tiên ca dương, nhãn hiếm trước, ảnh phủ nhiều nhãn còn thiếu → đa dạng nhãn); (b) tham lam cân bằng để các nhãn **ít lệch nhất**, chia phân tầng lặp; (c) không trùng bệnh nhân giữa train/val/test |
+| **Dữ liệu** | **6400 train / 3000 test** (không có tập val), lấy mẫu mới; mỗi bệnh nhân đúng một ảnh trên cả hai tập |
+| **Sàng lọc** | (a) mọi nhãn có ca dương ở mọi tập (≥ 60 train / 30 test; hồ thiếu → ưu tiên ca dương, nhãn hiếm trước, ảnh phủ nhiều nhãn còn thiếu → đa dạng nhãn); (b) tham lam cân bằng để các nhãn **ít lệch nhất**, chia phân tầng lặp; (c) không trùng bệnh nhân giữa train và test |
 | **Ảnh** | repo 512² → `AutoProcessor.from_pretrained("google/medgemma-4b-it")` (896², 256 token/ảnh), cả train lẫn sinh |
-| **Huấn luyện** | **1 epoch** đi qua 6400 mẫu (400 bước × batch hiệu dụng 16) · AdamW, **weight decay 0.01** · lr **0 → 3e-4** (warmup tuyến tính 10% = 40 bước) **→ cosine → 1e-5** (đúng 1e-5 ở bước cuối) · clip 1.0 · loss **chỉ** trên báo cáo + `<end_of_turn>` · cùng thứ tự dữ liệu (seed) ở mọi rank · lấy adapter cuối epoch (val-loss chỉ ghi nhận) · log đồng bộ lên **W&B** |
+| **Huấn luyện** | **1 epoch** đi qua 6400 mẫu (400 bước × batch hiệu dụng 16) · AdamW, **weight decay 0.01** · lr **0 → 3e-4** (warmup tuyến tính 10% = 40 bước) **→ cosine → 1e-5** (đúng 1e-5 ở bước cuối) · clip 1.0 · loss **chỉ** trên báo cáo + `<end_of_turn>` · cùng thứ tự dữ liệu (seed) ở mọi rank · lấy adapter cuối epoch (không val) · log đồng bộ lên **W&B** |
 | **Sinh** | y hệt Thí nghiệm 1: beam 4, `max_new_tokens=200`, `repetition_penalty=1.08`, `length_penalty=0.8`, cùng prompt |
 | **Tiền xử lý metric** | chữ thường → bỏ `Findings:`/`Impression(s):` → gộp `\n`/`\t`/khoảng trắng → bỏ khoảng trắng trước dấu câu → strip |
 | **Thống kê** | **Friedman** (hiệu chỉnh ties) + Iman-Davenport F, Kendall W, Holm trên 9 metric; hậu kiểm chỉ cho metric qua cổng: Nemenyi CD + Wilcoxon signed-rank (Pratt) Holm, rank-biserial |
@@ -88,7 +88,7 @@ push toàn bộ. Mỗi candidate train hoặc infer xong là `cands/<id>/` của
 
 | lệnh | làm gì |
 |---|---|
-| `data` | dựng `data/fixture_lora/` nếu chưa có (`--resample` dựng lại), tải ảnh train/val/test |
+| `data` | dựng `data/fixture_lora/` nếu chưa có (`--resample` dựng lại), tải ảnh train/test |
 | `train` | lần lượt từng rank → `cands/<id>/adapter/` + `train_stats.json`. Đứt → chạy lại đi tiếp từ checkpoint `last` (mỗi 100 bước, khôi phục cả optimizer + RNG). Đã xong thì bỏ qua |
 | `infer` | 5 rank + tham chiếu → `predictions.jsonl` |
 | `score` | `metrics/per_sample_<id>.csv` (giống Thí nghiệm 1) |
@@ -107,9 +107,8 @@ candidate (×6), huấn luyện vài giờ / rank — tổng cỡ 1–1,5 ngày,
 
 Project `rgexp-lora-medgemma` (đổi ở `wandb.project` / `wandb.entity` trong `configs/lora.yaml`),
 group `lora_rank`, **mỗi rank một run** tên `qlora_r<r>`, id cố định `lora_rank-qlora_r<r>` nên chạy
-lại / đi tiếp từ `ckpt/last` vẫn ghi vào cùng một run. Mỗi bước: `train/loss`, `train/lr`,
-`train/grad_norm`, `train/target_tokens`, `train/micro_batch`, `train/samples_seen`,
-`sys/vram_peak_gib`; cuối epoch: `val/loss`; cuối run: `final/*` (summary). Config của run gồm toàn
+lại / đi tiếp từ `ckpt/last` vẫn ghi vào cùng một run. Mỗi bước: `step`, `lr`, `ce_loss`
+(CE trung bình theo token đích của cả bước) và `grad_norm` — chỉ bốn đại lượng này. Config của run gồm toàn
 bộ lịch huấn luyện, quant, LoRA, phần cứng. W&B lỗi/không có key **không** làm hỏng huấn luyện:
 không có key -> chạy offline (log ở `cands/<id>/wandb/`, đẩy sau bằng `wandb sync`); thư mục này
 không đẩy lên Hub. Tắt: `wandb.enabled: false` hoặc `RGEXP_NO_WANDB=1`. Chỉ log huấn luyện

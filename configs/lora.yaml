@@ -52,13 +52,12 @@ labels:
 sampling:
   n_train: 6400
   n_test: 3000
-  # Tập VAL tách riêng (ngoài 6400): chỉ dùng chọn checkpoint theo val-loss, cùng
-  # một quy tắc cho cả 5 rank. Không đụng tới tập test trước bước infer.
-  n_val: 500
+  # KHÔNG dùng tập val (1 epoch, lấy adapter cuối; không chọn checkpoint) -> chỉ train/test.
+  n_val: 0
   # Mỗi bệnh nhân ĐÚNG một ảnh trên train ∪ val ∪ test (không trùng bệnh nhân giữa các tập).
   patient_regex: "/p(\\d{8})/"
   # "Mẫu thử phải có mặt tất cả các nhãn bệnh": tối thiểu từng ấy ca DƯƠNG mỗi nhãn.
-  min_pos_per_label: {test: 30, train: 60, val: 5}
+  min_pos_per_label: {test: 30, train: 60}
   # Hồ thiếu ca dương -> ƯU TIÊN CA DƯƠNG (nhãn hiếm trước, ảnh phủ nhiều nhãn còn
   # thiếu -> đa dạng hoá nhãn), mỗi nhãn vẫn phải có mặt ở mọi tập; ghi phần thiếu.
   on_shortfall: prioritize
@@ -118,8 +117,8 @@ train:
   max_seq_len: 1024              # prompt (≈ 256 token ảnh + lời nhắc) + báo cáo; cắt ĐUÔI
   gradient_checkpointing: true
   # Loss CHỈ trên báo cáo + <end_of_turn> (prompt bị che -100).
-  eval_every_epoch: true         # val-loss cuối mỗi epoch (1 epoch -> chỉ để ghi nhận, không để chọn)
-  select_checkpoint: last        # last (cuối epoch) | val_loss (epoch có val-loss thấp nhất)
+  eval_every_epoch: false        # không có tập val
+  select_checkpoint: last        # adapter cuối epoch
   ckpt_every_steps: 100          # checkpoint "last" để chạy lại đi tiếp
   max_micro_batch: 16            # trần thử micro-batch đầu tiên (OOM -> chia đôi, làm lại CHÍNH bước đó)
   num_workers: auto              # luồng nạp ảnh
@@ -154,7 +153,7 @@ autotune:
 
 # Alignment AUC-ROC: KHÔNG đo ở thí nghiệm này.
 
-# ── Weights & Biases: đồng bộ log huấn luyện ────────────────────────────────
+# ── Weights & Biases: đồng bộ log huấn luyện (chỉ: step, lr, ce_loss, grad_norm) ────────────────────────────────
 # Cần `WANDB_API_KEY` (hoặc đã `wandb login`). Không có -> tự chạy offline (log nằm trong
 # <cands>/<id>/wandb, đẩy sau bằng `wandb sync`). W&B hỏng KHÔNG làm hỏng huấn luyện.
 # Tắt hẳn: enabled: false hoặc RGEXP_NO_WANDB=1. Mỗi rank = 1 run, id cố định
@@ -165,7 +164,7 @@ wandb:
   entity: null                   # null = tài khoản mặc định của API key
   group: lora_rank
   tags: [medgemma-4b, qlora, exp2]
-  log_every: 1                   # mỗi N bước tối ưu hoá
+  log_every: 1                   # mỗi N bước tối ưu hoá (ghi: step, lr, ce_loss, grad_norm)
 
 # ── Metrics (y hệt Thí nghiệm 1) ────────────────────────────────────────────
 metrics:
