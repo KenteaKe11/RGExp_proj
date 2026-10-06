@@ -1,15 +1,20 @@
-"""BLEU / ROUGE / BERTScore — tính Ở MỨC TỪNG MẪU.
+"""BLEU / ROUGE / BERTScore / RadGraph F1 — tính Ở MỨC TỪNG MẪU.
 
-Vì sao từng mẫu chứ không phải corpus-level: Friedman ở src/stats_friedman.py
-xếp hạng tám arm TRONG TỪNG ẢNH, và hậu kiểm Wilcoxon là kiểm định ghép cặp —
-cả hai đều cần một vector điểm theo ảnh. Một con số corpus BLEU duy nhất không
-cho biết gì về phương sai, nên không kiểm định được.
+Từng mẫu chứ không phải corpus-level: Friedman (src/stats_friedman.py) xếp hạng
+ba candidate TRONG TỪNG ẢNH, và hậu kiểm Wilcoxon là kiểm định ghép cặp — cả
+hai cần một vector điểm theo ảnh. Corpus BLEU vẫn được tính để đối chiếu với
+bài báo khác, không dùng cho kết luận.
 
-Corpus BLEU vẫn được tính thêm và ghi vào báo cáo, nhưng chỉ để đối chiếu với
-các bài báo khác — mọi kết luận thống kê dựa trên trung bình của điểm theo mẫu.
+Tiền xử lý (§1.3.6.2), áp cho CẢ dự đoán lẫn tham chiếu, đúng thứ tự:
+    1. chữ thường
+    2. bỏ nhãn tiêu đề `findings:` / `impression(s):`
+    3. gộp \\n, \\t và nhiều khoảng trắng liên tiếp thành một khoảng trắng
+    4. bỏ khoảng trắng trước dấu câu  ("effusion ." -> "effusion.")
+    5. xoá khoảng trắng đầu/cuối
 """
 from __future__ import annotations
 
+import inspect
 import re
 from typing import Iterable
 
@@ -19,35 +24,36 @@ import pandas as pd
 from .config import Cfg
 
 _WS = re.compile(r"\s+")
-_HEADER = re.compile(r"^\s*(findings|impression)\s*:\s*", re.IGNORECASE | re.MULTILINE)
+_HEADER = re.compile(r"\b(findings|impressions?)\s*:", re.IGNORECASE)
+_SP_PUNCT = re.compile(r"\s+([.,;:!?)\]])")
 
 
 def normalize(text: str, ncfg: dict) -> str:
     t = str(text or "")
-    if ncfg.get("strip_section_headers", False):
-        t = _HEADER.sub(" ", t)
     if ncfg.get("lowercase", True):
         t = t.lower()
+    if ncfg.get("strip_section_headers", True):
+        t = _HEADER.sub(" ", t)
     if ncfg.get("collapse_whitespace", True):
         t = _WS.sub(" ", t)
-    return t.strip()
+    if ncfg.get("fix_space_before_punct", True):
+        t = _SP_PUNCT.sub(r"\1", t)
+    if ncfg.get("strip", True):
+        t = t.strip()
+    return t
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── BLEU / ROUGE ────────────────────────────────────────────────────────────
 def _bleu_per_sample(hyps: list[str], refs: list[str], orders: Iterable[int]) -> dict:
-    """BLEU-n theo mẫu, dùng sacrebleu (tokenizer 13a, chuẩn WMT)."""
     from sacrebleu.metrics import BLEU
 
     out = {}
     for n in orders:
-        # effective_order=True là BẮT BUỘC ở mức câu: một báo cáo ngắn có thể
-        # không có n-gram bậc 4 nào trùng, và BLEU chuẩn khi đó trả 0 cho MỌI
-        # câu như vậy — biến metric thành gần như nhị phân và làm hỏng cả phép
-        # kiểm định. effective_order chỉ tính trung bình hình học trên các bậc
-        # thực sự tồn tại.
-        scorer = BLEU(max_ngram_order=int(n), effective_order=True)
+        # effective_order=True bắt buộc ở mức câu: báo cáo ngắn có thể không có
+        # 4-gram trùng nào, và BLEU chuẩn khi đó trả 0 cho mọi câu như vậy.
+        sc = BLEU(max_ngram_order=int(n), effective_order=True)
         out[f"bleu{n}"] = np.array(
-            [scorer.sentence_score(h, [r]).score / 100.0 for h, r in zip(hyps, refs)],
+            [sc.sentence_score(h, [r]).score / 100.0 for h, r in zip(hyps, refs)],
             dtype=np.float64)
     return out
 
@@ -55,100 +61,109 @@ def _bleu_per_sample(hyps: list[str], refs: list[str], orders: Iterable[int]) ->
 def _corpus_bleu(hyps: list[str], refs: list[str], orders: Iterable[int]) -> dict:
     from sacrebleu.metrics import BLEU
 
-    out = {}
-    for n in orders:
-        out[f"corpus_bleu{n}"] = BLEU(max_ngram_order=int(n)).corpus_score(
-            hyps, [refs]).score / 100.0
-    return out
+    return {f"corpus_bleu{n}": BLEU(max_ngram_order=int(n)).corpus_score(hyps, [refs]).score / 100.0
+            for n in orders}
 
 
 def _rouge_per_sample(hyps: list[str], refs: list[str], types: list[str]) -> dict:
     from rouge_score import rouge_scorer
 
-    # use_stemmer=True: "opacities" vs "opacity" là cùng một quan sát lâm sàng
-    # và không nên bị chấm như hai từ khác nhau.
     sc = rouge_scorer.RougeScorer(list(types), use_stemmer=True)
     cols = {t: [] for t in types}
     for h, r in zip(hyps, refs):
-        s = sc.score(r, h)  # (target, prediction) — ĐÚNG THỨ TỰ, đảo là đo lệch
+        s = sc.score(r, h)            # (target, prediction)
         for t in types:
             cols[t].append(s[t].fmeasure)
-    # Giữ NGUYÊN tên loại ("rougeL", không hạ thành "rougel"): tên cột này đi
-    # thẳng vào bảng báo cáo và vào cột `metric` của pairwise_tests.csv.
     return {t: np.array(v, dtype=np.float64) for t, v in cols.items()}
 
 
-def _bert_batch(scorer, hyps: list[str], refs: list[str], bcfg: dict,
-                cfg=None, default: int = 64) -> int:
-    """`metrics.bertscore.batch_size: auto` -> dò như mọi pipeline khác: đích
-    85% VRAM thiết bị, đo trên những cặp DÀI NHẤT (bert_score xếp theo độ dài,
-    nên batch nặng nhất là batch của các cặp dài nhất)."""
-    want = bcfg.get("batch_size", 32)
-    if str(want).lower() != "auto":
-        return max(1, int(want))
-    try:
-        import torch
-
-        if not torch.cuda.is_available() or not hasattr(scorer, "_batch_size"):
-            return default
-    except ImportError:
-        return default
-    from .autobatch import autotune_infer
-
-    order = sorted(range(len(hyps)),
-                   key=lambda i: -(len(hyps[i]) + len(refs[i])))
-
-    # Cặp PHẢI khác nhau: `bert_cos_score_idf` gộp câu trùng trước khi chia
-    # batch, nên dò bằng cùng một câu lặp k lần là đo bộ nhớ của MỘT câu — rồi
-    # chọn một batch quá lớn và OOM ở lần chấm thật.
-    def step(k: int) -> None:
-        idx = order[:k]
-        scorer._batch_size = int(k)
-        scorer.score([hyps[i] for i in idx], [refs[i] for i in idx], verbose=False)
-
-    cap = min(256, len(order))
-    if cap < 4:
-        return min(default, max(1, cap))
-    bs, _rep = autotune_infer(cfg or {}, "bertscore", min(default, cap), step,
-                              max_bs=cap, probe_sizes=[16, 32])
-    return max(1, int(bs))
+# ── tự chọn batch (không cấu hình hạ tầng): thử lớn, OOM thì chia đôi ───────
+def _is_oom(e: BaseException) -> bool:
+    m = str(e).lower()
+    return isinstance(e, MemoryError) or "out of memory" in m or "cuda error: out of memory" in m
 
 
-def _bertscore(hyps: list[str], refs: list[str], bcfg: dict, cfg=None) -> dict:
+def _auto_run(fn, start: int, floor: int = 1):
+    """fn(bs) -> kết quả; OOM thì bs //= 2 và làm lại. Trả (kết quả, bs đã dùng)."""
+    bs = max(floor, int(start))
+    while True:
+        try:
+            return fn(bs), bs
+        except Exception as e:  # noqa: BLE001
+            if not _is_oom(e) or bs <= floor:
+                raise
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+            bs = max(floor, bs // 2)
+            print(f"  OOM -> thử lại batch {bs}", flush=True)
+
+
+# ── BERTScore ───────────────────────────────────────────────────────────────
+def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
     from bert_score import BERTScorer
 
-    scorer = BERTScorer(
-        model_type=str(bcfg.get("model_type", "roberta-large")),
-        num_layers=int(bcfg.get("num_layers", 17)),
-        lang="en", idf=False,
-        rescale_with_baseline=bool(bcfg.get("rescale_with_baseline", False)),
-        batch_size=64,      # thay bằng số đã dò ngay bên dưới
-    )
-    # Chuỗi rỗng làm BERTScore ra NaN (không có token nào để khớp). Model sinh
-    # ra rỗng là một KẾT QUẢ, không phải dữ liệu thiếu, nên thay bằng "." để nó
-    # nhận điểm rất thấp thay vì biến mất khỏi phép tính.
+    scorer = BERTScorer(model_type=str(bcfg.get("model_type", "roberta-large")),
+                        num_layers=int(bcfg.get("num_layers", 17)), lang="en",
+                        idf=False, batch_size=256,
+                        rescale_with_baseline=bool(bcfg.get("rescale_with_baseline", False)))
+    # Chuỗi rỗng làm BERTScore ra NaN; model sinh rỗng là một KẾT QUẢ -> "."
     safe = [h if h.strip() else "." for h in hyps]
-    bs = _bert_batch(scorer, safe, refs, bcfg, cfg)
-    try:
-        scorer._batch_size = int(bs)
-    except Exception:
-        pass
-    print(f"  chấm BERTScore: batch {bs}", flush=True)
-    P, R, F = scorer.score(safe, refs, verbose=False)
-    allv = {"p": P.numpy().astype(np.float64),
-            "r": R.numpy().astype(np.float64),
-            "f1": F.numpy().astype(np.float64)}
-    # Mặc định CHỈ F1. P và R gần như trùng thông tin với F1, mà mỗi cột thêm
-    # vào là thêm 3 kiểm định nữa vào họ hiệu chỉnh Holm — làm khó chính những
-    # so sánh mình quan tâm để đổi lấy hai cột hầu như không ai đọc.
+
+    def run(bs):                 # batch tự chọn: bắt đầu lớn, OOM thì chia đôi
+        scorer.batch_size = bs
+        return scorer.score(safe, refs, verbose=False)
+    (P, R, F), _ = _auto_run(run, 256)
+    allv = {"p": P.numpy(), "r": R.numpy(), "f1": F.numpy()}
     keep = [str(k).lower() for k in bcfg.get("keep", ["f1"])]
-    return {f"bertscore_{k}": allv[k] for k in keep if k in allv}
+    return {f"bertscore_{k}": allv[k].astype(np.float64) for k in keep if k in allv}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── RadGraph F1 ─────────────────────────────────────────────────────────────
+def _radgraph(hyps: list[str], refs: list[str], rcfg: dict) -> dict:
+    """radgraph_simple / radgraph_f1 (= partial) / radgraph_complete theo mẫu.
+
+    Gói `radgraph` (Delbrouck et al.) — `F1RadGraph(reward_level="all")` trả
+    (mean, per-sample, ...) với per-sample là bộ ba (simple, partial, complete).
+    Mức `partial` (thực thể + quan hệ khớp một phần) là "RadGraph F1" thường
+    được báo cáo trong các bài RRG.
+    """
+    from radgraph import F1RadGraph
+
+    kw = {"reward_level": str(rcfg.get("reward_level", "all"))}
+    sig = inspect.signature(F1RadGraph.__init__).parameters
+    if "model_type" in sig and rcfg.get("model_type"):
+        kw["model_type"] = str(rcfg["model_type"])
+    f1 = F1RadGraph(**kw)
+    safe = [h if h.strip() else "." for h in hyps]
+
+    lvl = kw["reward_level"]
+
+    def norm(per, n):            # -> mảng (n, 3) nếu level "all", (n,) nếu không
+        if lvl == "all":
+            if isinstance(per, (list, tuple)) and len(per) == 3 and len(per[0]) == n:
+                return np.stack([np.asarray(x, dtype=np.float64) for x in per], axis=1)
+            return np.asarray(per, dtype=np.float64).reshape(n, 3)
+        return np.asarray(per, dtype=np.float64).reshape(n)
+
+    def run(chunk):              # OOM -> chia nhỏ số mẫu mỗi lượt gọi
+        parts = []
+        for i in range(0, len(safe), chunk):
+            h, r = safe[i:i + chunk], refs[i:i + chunk]
+            parts.append(norm(f1(hyps=h, refs=r)[1], len(h)))
+        return np.concatenate(parts, axis=0)
+    arr, _ = _auto_run(run, max(1, len(safe)))
+    if lvl == "all":
+        return {"radgraph_simple": arr[:, 0], "radgraph_f1": arr[:, 1],
+                "radgraph_complete": arr[:, 2]}
+    return {"radgraph_f1": arr}
+
+
+# ── điểm vào ────────────────────────────────────────────────────────────────
 def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
                 refs_raw: list[str], label: str = "") -> tuple[pd.DataFrame, dict]:
-    """Trả (bảng điểm theo mẫu, các số corpus-level)."""
     mcfg = cfg["metrics"]
     ncfg = dict(mcfg.get("normalize", {}))
     hyps = [normalize(h, ncfg) for h in hyps_raw]
@@ -158,29 +173,28 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
     print(f"  [{label}] BLEU ...", flush=True)
     cols.update(_bleu_per_sample(hyps, refs, mcfg.get("bleu_orders", [1, 2, 3, 4])))
     print(f"  [{label}] ROUGE ...", flush=True)
-    cols.update(_rouge_per_sample(hyps, refs,
-                                  list(mcfg.get("rouge_types", ["rouge1", "rouge2", "rougeL"]))))
-
+    cols.update(_rouge_per_sample(hyps, refs, list(mcfg.get("rouge_types",
+                                                             ["rouge1", "rouge2", "rougeL"]))))
     bcfg = dict(mcfg.get("bertscore", {}))
     if bcfg.get("enabled", True):
-        print(f"  [{label}] BERTScore ({bcfg.get('model_type', 'roberta-large')}) ...",
-              flush=True)
-        cols.update(_bertscore(hyps, refs, bcfg, cfg))
+        print(f"  [{label}] BERTScore ({bcfg.get('model_type', 'roberta-large')}) ...", flush=True)
+        cols.update(_bertscore(hyps, refs, bcfg))
+    rcfg = dict(mcfg.get("radgraph", {}))
+    if rcfg.get("enabled", True):
+        print(f"  [{label}] RadGraph F1 ({rcfg.get('model_type', 'radgraph-xl')}) ...", flush=True)
+        cols.update(_radgraph(hyps, refs, rcfg))
 
     df = pd.DataFrame({"key": keys, **cols})
     df["n_words_pred"] = [len(h.split()) for h in hyps]
     df["n_words_ref"] = [len(r.split()) for r in refs]
     df["empty"] = [not h.strip() for h in hyps_raw]
-
     corpus = _corpus_bleu(hyps, refs, mcfg.get("bleu_orders", [1, 2, 3, 4]))
-    corpus["n"] = len(df)
-    corpus["n_empty"] = int(df["empty"].sum())
-    corpus["mean_words_pred"] = float(np.mean(df["n_words_pred"]))
-    corpus["mean_words_ref"] = float(np.mean(df["n_words_ref"]))
+    corpus.update({"n": len(df), "n_empty": int(df["empty"].sum()),
+                   "mean_words_pred": float(np.mean(df["n_words_pred"])),
+                   "mean_words_ref": float(np.mean(df["n_words_ref"]))})
     return df, corpus
 
 
 def metric_columns(df: pd.DataFrame) -> list[str]:
-    """Các cột thật sự là metric (bỏ key và các cột mô tả)."""
     skip = {"key", "n_words_pred", "n_words_ref", "empty"}
     return [c for c in df.columns if c not in skip]

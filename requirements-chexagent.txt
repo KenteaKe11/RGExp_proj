@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# venv CÔ LẬP cho StanfordAIMI/CheXagent-2-3b (.venv-chexagent)
+#
+# Remote code của CheXagent (modeling_chexagent.py, modeling_visual.py) có
+#     assert transformers.__version__ == "4.40.0"
+# nên KHÔNG chạy chung được với MedGemma (>= 4.50). Danh sách theo README của
+# model. torch dùng lại của môi trường nền (--system-site-packages) hoặc
+# scripts/setup.sh cài theo CUDA.
+# ─────────────────────────────────────────────────────────────────────────────
+transformers==4.40.0
+tokenizers>=0.19,<0.20
+accelerate>=0.30,<1.0
+huggingface_hub>=0.23.0,<0.26
+safetensors>=0.4.3
+sentencepiece
+protobuf
+pillow>=10.0.0
+numpy>=1.24.0,<2.0
+opencv-python-headless
+albumentations
+matplotlib
+einops
+pyarrow
+regex
+requests

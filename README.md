@@ -1,168 +1,155 @@
-# RGExp — nhánh bổ sung thị giác chất lượng cao
+# RGExp — §3 Chọn backbone baseline cho MIMIC-CXR (thí nghiệm sạch)
 
-> **§2.2.2 — V-Extractor SNOP-MHA** (thí nghiệm con thứ 2 của §2.2). Giữ nguyên mọi cấu hình của §2.2; CnA là biến thể mới: **8 latent @1536**, **khối 1 (Self → Cross → FFN) + khối 2 (Self → FFN), N = 1**, SwiGLU(2048), mọi attention (3 lớp) là **AdaSNoP-MHA** (§2.2.1); log lên project W&B `SNoP (v2)`; che 50% token Z. Kết quả đẩy lên `current/$2.2.2_V-Extractor-SNOP-MHA_Test/`; `$2.2_V-Extractor_Test` không bị ghi đè.
+> Mọi thí nghiệm trước đã sang `_archive/`. Thí nghiệm vừa đóng lại là §2.2.x
+> V-Extractor (Gemma 3 + DINOv3 + CnA/SNOP-MHA): toàn bộ code, config, script,
+> README và `Claude outputs/` của nó nằm nguyên vẹn ở `_archive/v3_vextractor/`.
 
-Nhánh thị giác bổ sung 8 token ảnh vào đầu vào Gemma 3. Ảnh cũng tiếp tục đi qua nhánh vision gốc của Gemma; nhánh này chỉ thêm tín hiệu thị giác chất lượng cao.
+## 1. Bối cảnh
 
-```text
-Ảnh 448×448
-  └─ Extractor: DINOv3 ViT-S/16 (`vit_small_patch16_dinov3.lvd1689m`) → concat 3 block cuối → V (784, 1152)
-       └─ CnA (Compressor & Aligner): QFormer (AdaSNoP-MHA), 8 latent @1536, 1 × [Self → Cross → FFN │ Self → FFN] → RMSNorm + Linear 1536→2560 → V_c (8, 2560)
-            └─ Gemma: [Z ‖ V_c ‖ văn bản]   (huấn luyện: che ngẫu nhiên 50% token Z mỗi weight update)
-```
+Thí nghiệm trước chạy ba backbone nhóm **G3** (pretrain ImageNet: Qwen2.5-VL-7B,
+Gemma-3-4B, LLaVA-1.5-7B). Gemma tốt nhất, nhưng nhánh vision của nó sau adapter
+**không bảo toàn** đặc trưng thị giác quan trọng với ảnh X-quang. §3 tìm backbone
+mà nhánh vision giữ được đặc trưng bệnh lý TRƯỚC khi vào decoder, và đầu ra pretrain
+hướng về sinh báo cáo. Nếu tìm được, phần thiết kế Vision Extractor / Recomb có thể
+cắt giảm.
 
-## 1. Kiến trúc của nhánh
+| Candidate | Nhóm | HF id | Môi trường |
+|---|---|---|---|
+| CheXagent-2 3B | G1 — pretrain X-quang | `StanfordAIMI/CheXagent-2-3b` | `.venv-chexagent` (transformers **4.40.0**) |
+| MedGemma 4B-it | G1 — pretrain X-quang | `google/medgemma-4b-it` | chính (transformers 4.51/4.52) |
+| LLaVA-Med v1.5 7B | G2 — pretrain y khoa | `microsoft/llava-med-v1.5-mistral-7b` (checkpoint gốc) | `.venv-llavamed` (transformers **4.37.2** + package `llava`) |
 
-Gồm hai khối:
+> **LLaVA-Med:** dùng checkpoint gốc `microsoft/llava-med-v1.5-mistral-7b` (kiến trúc
+> `llava_mistral`, nạp bằng package `llava` của microsoft/LLaVA-Med trong venv riêng).
+> Ảnh đi qua `process_images` của CLIP processor gốc (pad vuông + resize 336), prompt dựng
+> theo conversation template `mistral_instruct` của repo gốc. Worker này xử lý **từng ảnh một**
+> (batch 1) vì pipeline gốc không hỗ trợ batch ổn định; builder gốc ép fp16, ghi lại ở
+> `worker_meta.json` (`dtype_actual`).
 
-| Khối | Việc của nó | Giai đoạn nó HỌC |
+> **CheXagent-2** không có `AutoProcessor`: ảnh đi qua transform gốc nằm trong model
+> (`Resize 512 bicubic` + chuẩn hoá SigLIP), đường dẫn ảnh được nhúng vào prompt theo
+> định dạng của nhà sản xuất (`tokenizer.from_list_format`). Remote code `assert`
+> `transformers == 4.40.0` → venv riêng, giao tiếp qua file.
+
+## 2. Thiết kế
+
+| | |
+|---|---|
+| **Câu hỏi** | Backbone nào (1) bảo toàn đặc trưng bệnh lý ở vision token, (2) sinh báo cáo tốt nhất ở trạng thái gốc [Origin]? |
+| **Dữ liệu** | 6400 train / 3000 test từ `RGExp123/MIMIC_CXR_cleaned`, lấy mẫu mới (§3) |
+| **Sàng lọc** | (a) mọi nhãn có ca dương trong mỗi tập (≥ 30 test, ≥ 60 train); (b) số ca dương các nhãn **ít lệch nhất**; (c) **không có 2 ảnh cùng một bệnh nhân** trên cả train ∪ test |
+| **Ảnh** | repo đã đồng bộ 512² vuông; resize về cỡ của từng model do **processor gốc** của nhà sản xuất |
+| **dtype** | `bfloat16` cho cả ba (trọng số + pixel_values); nếu builder gốc ép khác thì ghi ở `dtype_actual` |
+| **Prompt** | MỘT prompt gốc (§1.4), đóng gói theo chat template riêng của từng model |
+| **Giải mã** | `do_sample=False, num_beams=4, max_new_tokens=200, repetition_penalty=1.08, length_penalty=0.8, early_stopping=True, no_repeat_ngram_size=0` |
+| **Metric** | Alignment AUC-ROC (vision token ↔ nhãn) · BLEU-1..4 · ROUGE-1/2/L · BERTScore-F1 · RadGraph-F1 |
+| **Thống kê** | Friedman (ties Conover, F Iman-Davenport, Holm trên các metric) + hậu kiểm Wilcoxon signed-rank ghép cặp (Pratt), **Holm** trong từng metric |
+
+### 2.1. Lấy mẫu (`src/sampling.py`)
+
+Hồ = mọi key có nhãn (`csv_helper/labels.npz`) và có `text_gt`, bỏ ảnh không dương
+tính nhãn nào. Dương tính = lớp `pos` (uncertain không tính).
+
+1. **Tham lam cân bằng** trên toàn hồ, 9400 bước: mỗi bước lấy ảnh có
+   `s_i = Σ_j y_ij · w_j` lớn nhất, `w_j = (c̄ + 1)/(c_j + 1) − 1` (`c_j` = số ca
+   dương đã chọn của nhãn j). Nhãn thiếu kéo điểm lên, nhãn thừa kéo xuống. Chọn một
+   ảnh là loại mọi ảnh khác của bệnh nhân đó.
+2. **Chia 3000/6400 phân tầng lặp** (iterative stratification) để hai tập cùng hồ sơ nhãn.
+3. **Kiểm**: đủ cỡ, mỗi bệnh nhân một ảnh, mỗi nhãn ≥ ngưỡng ca dương — sai là DỪNG.
+
+Kết quả khoá cứng ở `data/fixture_backbone/` (`testset.jsonl`, `trainset.jsonl`,
+`labels.json`, `sampling_report.json` — gồm độ lệch nhãn so với lấy ngẫu nhiên một
+ảnh/bệnh nhân). Có fixture thì `data` không lấy mẫu lại (trừ `--resample`).
+Thứ tự test = thứ tự key = thứ tự khối của Friedman.
+
+> Lưu ý: nhãn rất hiếm (vd *Pleural Other*, *Fracture*) có thể cạn trong hồ trước khi
+> các nhãn khác đạt cùng mức — khi đó "ít lệch nhất" nghĩa là các nhãn còn lại dừng ở
+> mức gần nhau nhất có thể. `sampling_report.json` ghi đúng số đạt được.
+
+### 2.2. Alignment AUC-ROC (`src/worker/infer_worker.py`, `src/alignment.py`)
+
+Vision token = đúng tensor được chèn vào chuỗi embedding của decoder (sau projector /
+resampler):
+
+| Candidate | Lấy ở | n × d |
 |---|---|---|
-| Extractor | trích xuất đặc trưng chất lượng cao | Stage 0 (DINOv3 fine-tuning) |
-| CnA | nén đặc trưng vào 8 token ẩn và căn chỉnh sang không gian của decoder | Main stage (cùng LoRA) |
+| CheXagent-2 | `model.model.visual.encode(...)` | 1024 × 2560 |
+| MedGemma | `get_image_features(pixel_values)` | 256 × 2560 |
+| LLaVA-Med (gốc) | `model.encode_images(images)` (sau mm_projector) | 576 × 4096 |
 
-Mỗi khối học ở **đúng một** giai đoạn. Không còn Stage 1: bản chuyển giao Compressor cũ được lưu ở `_archive/stage1_compressor/` và không còn được import.
+Embedding nhãn = trung bình các hàng của **bảng input-embedding của decoder** ứng với
+subword của tên nhãn → cùng không gian với vision token. Điểm (ảnh, nhãn) = **trung bình
+top-5% cosine** giữa nhãn và các vision token (Top-5% Mean Pooling); `mean`/`max` được
+ghi kèm để đối chiếu. Với mỗi nhãn: AUC = P(s₊ > s₋) — dương = `pos`, âm = `neg` + `nan`
+(không nhắc tới), `uncertain` bị loại. Báo cáo macro-AUC + CI95 bootstrap theo ảnh,
+hiệu số ghép cặp, và Friedman/Wilcoxon/Holm với khối = nhãn.
 
-## 2. Chi tiết kiến trúc
+> Đã xác nhận: "Top-5% Mean Pooling" dùng cho **AUC** (gộp điểm token → điểm ảnh); RadGraph F1
+> không có bước pooling token. Đổi ở `alignment.topk_frac`.
 
-### 2.1. Extractor — trích xuất đặc trưng cấp cao
+### 2.3. Metric văn bản (`src/metrics.py`)
 
-| | |
-|---|---|
-| Main backbone | ViT — DINOv3 ViT-S/16, timm `vit_small_patch16_dinov3.lvd1689m` |
-| Methodology | `DINOv3` fine-tuning (Stage 0) |
-| Pretrain | `dinov3-vits16-pretrain` (LVD-1689M), `n_stages: null` (đủ 12 block), không head |
-| Params | **21,59 M** |
-| Input | `B, 3, 448, 448` |
-| Output tokens | `B, 784, 1152` (concat đầu ra 3 block cuối, mỗi block `384`; `out_layers: 3`) |
-| Kí hiệu | `V` |
+Tiền xử lý cho CẢ dự đoán lẫn tham chiếu, đúng thứ tự: chữ thường → bỏ
+`findings:` / `impression(s):` → gộp `\n`, `\t`, nhiều khoảng trắng → bỏ khoảng trắng
+trước dấu câu → strip. BLEU theo câu (sacrebleu, `effective_order`), ROUGE-1/2/L
+(stemmer), BERTScore-F1 (roberta-large, lớp 17), RadGraph (`radgraph`, `radgraph-xl`):
+`radgraph_f1` = mức *partial*, kèm *simple* / *complete*.
 
-DINOv3 ViT-S/16 (patch 16, 12 block, 384 kênh, vị trí bằng RoPE) chạy ở ảnh 448²: lưới 28×28 = 784 ô (patch token). Extractor lấy đầu ra của **3 block cuối** (block 10, 11, 12) qua `forward_intermediates(..., norm=True)` — mỗi block đã qua LayerNorm cuối của backbone, bỏ 5 prefix token (1 cls + 4 register) — rồi nối theo kênh: V = 784 patch token × (3 × 384) = **1152** kênh. Block cuối trùng với `forward_features[:, 5:]`. Khoá `vextractor.extractor.out_layers` chỉ đổi cách *đọc* backbone, không thuộc fingerprint của Stage 0, nên checkpoint Stage 0 đã có trên HF vẫn nạp được nguyên vẹn. Vì RoPE không gắn với cỡ ảnh, cùng một `state_dict` chạy được ở 448² lẫn 224² (14×14), nên multi-crop của Stage 0 dùng local crop 224². Chuẩn hoá pixel theo `pretrained_cfg` của checkpoint (mean/std ImageNet). Cần `timm >= 1.0.20`.
+## 3. Chạy
 
-Stage 0 nạp trọng số `dinov3-vits16-pretrain` rồi fine-tune tiếp bằng chính hàm mục tiêu DINO, chưng cất trên **cls token** (`stage0.dino.pool: cls`); checkpoint đem sang main stage là bản **teacher EMA** chọn theo validation. ViT-S/16 chỉ có LayerNorm nên khoá `freeze_bn` không tác dụng với nó.
+**Tuần tự, một tiến trình mỗi lúc.** Các candidate chạy lần lượt (worker con xong mới
+sang cái sau); khoá file `runs/backbone/.lock` chặn mở lệnh thứ hai song song.
 
-### 2.2. CnA — nén & căn chỉnh đặc trưng (Compressor & Aligner)
-
-| | |
-|---|---|
-| Methodology | `QFormer` |
-| Input dim | `V` (concat 3 block cuối) → `384 × 3 = 1152` → `W_k, W_v` (trong Cross-attn) → `1536` |
-| Latent learnable vectors | `8, 1536` |
-| Norm | `RMSNorm` (pre-norm trước mọi khối con, trên `V`, và trước Linear cuối) |
-| 1st Block | `Q₀ → SelfAttn → CrossAttn(·, V) → FFN → Q₁` |
-| 2nd Block | `Q₁ → SelfAttn → FFN → Q₂` (không đọc ảnh, `block2: true`) |
-| N | **1** (`n_blocks: 1`) |
-| Linear project cuối | có — `RMSNorm + Linear 1536→2560` (có bias, init `1/√fan_in`) |
-| Attention | **AdaSNoP-MHA** ở **mọi** lớp (Self1 + Cross + Self2 = 3 lớp, `cna.attn: snop`): phiên bản 2: `α = α_mean + ε·tanh(W_α)` với `α_mean = 0,8`, `ε = 0,1` (siêu tham số, `cna.snop_alpha_mean` / `cna.snop_eps`), mỗi lớp một vector `W_α ∈ ℝ⁸` học được (nhóm lr riêng ×10 FFN, khởi tạo 0, `cna.snop_w_init`) → lực phạt 80% ± 10%, chuẩn hoá `√(N²+1)` |
-| Head_dim | `head_dim` = 128 (suy ra 12 head = 1536 / 128) |
-| FFN | `SwiGLU 1536→2048→1536` |
-| Params | **46,03 M** (QFormer, gồm 3 vector `W_α ∈ ℝ⁸`) + **3,94 M** (Linear cuối) = **49,96 M** |
-| Kí hiệu đầu ra | `V_c` → `V_c (8, 2560)` |
-
-```text
-kv  = RMSNorm(V)                                   # 1152
-h   = latent                                       # 8 latent × 1536     (Q₀)
-h   = h + AdaSNoP-SelfAttn(N(h))
-h   = h + AdaSNoP-CrossAttn(N(h), kv)              # (k, v: 1152 → 1536)
-h   = h + SwiGLU(N(h))                             # 1536 → 2048 → 1536  (Q₁)
-h   = h + AdaSNoP-SelfAttn(N(h))                   # khối 2, không đọc ảnh
-h   = h + SwiGLU(N(h))                             # 1536 → 2048 → 1536  (Q₂)
-V_c = Linear(RMSNorm(h))                           # 1536 → 2560
-```
-
-Bảng tham số của CnA (N = 1): SelfAttn 4 × 1536² = 9,44 M (×2 vì có khối 2) · CrossAttn 2 × 1536² + 2 × 1152 × 1536 = 8,26 M · SwiGLU 3 × 1536 × 2048 = 9,44 M (×2) · năm RMSNorm(1536) · 3 vector `W_α ∈ ℝ⁸` → nhóm khối là **46,01 M**; cộng 8 latent (12 288) và `RMSNorm(1152)` trên V thành phần QFormer **46,03 M**; Linear cuối kèm RMSNorm của nó thêm **3,94 M**, nên CnA là **49,96 M**. Cấu hình FFN là `vextractor.cna.mlp_hidden`.
-
-> Con số trong README là số đếm từ code (selftest bài 22 dựng lại từ config). CnA có 49 963 672 tham số; AdaSNoP chiếm đúng 3 × 8 = 24 trong số đó (`W_α`).
-
-#### 2.2.1. SNOP-MHA — Soft Non-orthogonality Penalty
-
-Chống collapse giữa 8 query learner mà **không** thêm Entropy hay Orthogonal Regularization. Mục tiêu: 8 token mang nhiều thông tin nhất có thể và tận dụng hết `H·d_v` chiều. Chèn giữa phép ghép head và chiếu `W_o`:
-
-```text
-O       = Concat(A_1 V_1, …, A_H V_H)                      (N, H·d_v)   N = 8 query
-S       = Norm(O) · Norm(O)ᵀ                               (N, N)       cos, Norm = chuẩn hoá L2
-Õ       = stop_grad(sign(S) ⊙ S) = stop_grad(|S|)          (N, N)       |cos| giữa hai token
-α       = α_mean · 1 + ε ⊙ tanh(W_α)                       (N,)         W_α ∈ ℝ^N học được
-O_final = [I − (α · 1ᵀ)/√(N² + 1) ⊙ (Õ ⊙ M_cross)] · O                   M_cross = 1 − I
-out     = W_o · O_final
-```
-
-Hàng i: `O_i − α_i/√(N² + 1) · Σ_{j≠i} |cos(O_i, O_j)| · O_j`.
-
-* `α_mean ∈ (0, 1)` — siêu tham số, mặc định **0,8** (`cna.snop_alpha_mean`): phần chung bị phạt giữa hai token. `ε ∈ (0, 1)` — siêu tham số, mặc định **0,1** (`cna.snop_eps`): biên độ điều chỉnh quanh `α_mean`. Lực phạt = **80% ± 10%**, yêu cầu `α_mean + ε ≤ 1`.
-* `W_α ∈ ℝ^N` — vector **học được**, mỗi lớp một vector, mỗi token query một phần tử, khởi tạo **0** (`cna.snop_w_init`) → `α₀ = α_mean = 0,8` đúng. `tanh` đối xứng quanh 0 nên tăng/giảm như nhau. `W_α` có **nhóm lr riêng `snop` = 10 × lr nhóm FFN** ở mọi bước (1e-6 → 1e-3, `main.cna_snop_lr_mult: 10.0`); nhóm SelfAttn/CrossAttn chỉ có bốn ma trận chiếu, và bốn nhóm là một phân hoạch của CnA.
-* `stop_grad(Õ)` — gradient của task loss không đi qua phép đo độ giống nhau, chỉ đi qua thừa số `O` bên phải và `W_α`. Õ tính ở fp32 (tắt autocast).
-* `M_cross` bỏ đường chéo: token giữ nguyên phần riêng, chỉ bị trừ phần giao với token khác. `|cos|` giảm tuyến tính theo góc: hai token lệch 60° vẫn chịu một nửa lực phạt. Token ngược hướng (`cos < 0`) cũng bị trừ theo `|cos|`, nên bị đẩy ra xa nhau hơn chứ không về trực giao.
-* **Chuẩn hoá `√(N² + 1)`** (N = 8 → ≈ 8,06; hội tụ về N khi N lớn, nên nhiều token thì phạt mạnh hơn `N + 1`). Khi cả N hàng song song (đúng trạng thái bước 0, vì attention gần đều), phần chung của hàng i bị nhân `1 − α_i·(N−1)/√(N² + 1)`. Với `α₀ = 0,8` thì còn ≈ 0,305 (tối thiểu ≈ 0,219 khi `α = 0,9`). Vì `α ≤ 1` và `N − 1 < √(N² + 1)`, thừa số luôn dương: phần chung **không bao giờ đảo dấu**, với mọi N.
-* `N` của `W_α` cố định lúc dựng (= `n_query`); CrossAttn cũng có N = 8 hàng (query). Cơ chế không tạo thêm hạng khi các token đã song song hoàn toàn.
-* `α` của từng lớp được in mỗi `logging_steps` (trung bình), log lên W&B (`train/<arm>/snop_c/<lớp>/{mean,min,max}`) và ghi đủ vector vào `train_stats.json` (`snop_c_last`). Lens (`Lens_Vision.html`) có ma trận cosine giữa các token trước/sau SNOP ở từng lớp.
-
-### 2.3. Bảng tham số
-
-| | Tham số | Học ở |
-|---|---|---|
-| Extractor | **21,59 M** | Stage 0 |
-| CnA | **49,96 M** | Main stage |
-| **Cả nhánh** | **71,55 M** | |
-| Học ở main stage | **49,96 M** | chỉ CnA (+ LoRA của decoder) |
-
-DINO head (giàn giáo của Stage 0, bị bỏ sau đó) có **6,56 M**; student Stage 0 vì thế có **28,15 M**.
-
-**Đầu vào decoder:** nối 8 token `V_c` ngay sau token ảnh gốc `Z`; các vị trí token mới có nhãn `-100` cho CE, nên số token vào CE không đổi so với baseline.
-
-## 3. Lịch trình huấn luyện
-
-Lịch trình chung (trừ main stage):
-
-1. warm-up tuyến tính `lr_min` → `lr_max` trong 1 epoch;
-2. giữ `lr_max` cho phần còn lại;
-3. mỗi epoch validation không cải thiện (patience tăng 1) thì chia learning rate hiện tại cho **1,25** (sàn `lr_min`); validation cải thiện thì giữ nguyên mức đã tụt.
-
-Khi `patience` = 4 epoch liên tiếp không cải thiện, phần theo lịch dừng, chạy thêm 1 epoch cosine decay về `lr_min`, rồi mới lấy checkpoint validation tốt nhất.
-
-### 3.1. Stage 0 — DINOv3 fine-tuning
-
-| | |
-|---|---|
-| Mô tả | Chỉ huấn luyện Extractor, trên dữ liệu MIMIC-CXR hiện tại |
-| Mục tiêu | Biến Extractor thành module học đặc trưng chất lượng cao |
-| Lr | `lr_min=1e-7`, `lr_max=1e-5` |
-| Epoch | `50` (trần của lịch) |
-| Patience | `4` (hết patience thì cosine về `lr_min` thêm 1 epoch rồi mới lấy best val) |
-| Multi-crop | 2 global 448² + 6 local 224² (`local_size: 224`) |
-| Target | Nạp lại pretrain rồi fine-tune theo framework DINOv3 (tự giám sát, không nhãn) |
-
-### 3.2. Main stage — Decoder finetuning
-
-| | |
-|---|---|
-| Mục tiêu | Học cách biến tín hiệu đặc trưng thị giác sang không gian ngữ nghĩa |
-| Lr (FFN) | `lr_min=1e-7`, `lr_main=1e-4` (warm-up 10% tổng step rồi phẳng) |
-| Lr (SelfAttn) | `lr_min=1e-8`, `lr_main=1e-5` (warm-up 10% tổng step rồi phẳng) |
-| Lr (CrossAttn) | `lr_min=4e-8`, `lr_main=4e-5` (warm-up 10% tổng step rồi phẳng) |
-| Lr (`W_α` SNOP) | `10 × Lr (FFN)`: `1e-6 → 1e-3` (`cna_snop_lr_mult: 10.0`, cùng dốc) |
-| Lịch trình | Huấn luyện đồng thời với LoRA ngay từ bước 0 |
-| Mask Regularization | Che ngẫu nhiên 50% token `Z` (8 latent bù cho 128 token bị thiếu) mỗi weight update để ép `V_c` tham gia sâu vào quá trình sinh text |
-
-Nhóm FFN của CnA gồm SwiGLU, Linear cuối, mọi RMSNorm và 8 latent; nhóm SelfAttn là bốn ma trận chiếu của mỗi SelfAttn (2 lớp); nhóm CrossAttn là bốn ma trận chiếu của CrossAttn; nhóm `snop` là 3 vector `W_α` của AdaSNoP-MHA. Bốn nhóm là một phân hoạch của CnA (huấn luyện dừng nếu không). LoRA của decoder giữ đúng lịch one-cycle của baseline.
-
-**Mask regularization.** Mỗi optimizer step rút một tập `round(0.5 × 256)` = 128 vị trí trong khối token ảnh `Z` và đặt `attention_mask = 0` tại đó, nên không query nào (kể cả các token ảnh khác trong khối attention hai chiều của Gemma 3) đọc được chúng; embedding, nhãn và số token vào CE không đổi. Cùng một mặt nạ dùng cho mọi micro-batch của step đó (grad accumulation), rút bằng một generator riêng seed theo `(seed, step)` nên tái lập được và không tiêu RNG của LoRA/thứ tự dữ liệu. Chỉ áp ở huấn luyện: val CE, sinh và Lens thấy đủ `Z`. Khoá: `vextractor.main.z_mask_frac` (0 = tắt).
-
-Những module khác freeze hoàn toàn — Extractor chạy chế độ teacher inference (`requires_grad=False` + `eval` + `no_grad`) và đứng ngoài optimizer: một tham số đóng băng nằm trong optimizer vẫn bị weight decay ăn mòn mỗi bước dù grad là `None`.
-
-## 4. Chạy
+**Không có cấu hình hạ tầng.** Không còn profile GPU / batch / attention tuỳ máy. Lần đầu
+mỗi candidate, worker **dò** VRAM từng GPU + RAM (có tính giới hạn cgroup), đặt
+`max_memory` = toàn bộ phần rảnh trừ một khoản dự phòng nhỏ (`autotune.*`), để
+`device_map="auto"` dùng hết VRAM rồi tràn sang RAM nếu cần, và bắt đầu từ batch lớn nhất
+(`autotune.max_batch`) → OOM thì **chia đôi batch và làm lại chính lô đó**. Kết quả ghi ở
+`cands/<id>/probe.json`; lần sau, nếu định danh máy (`hw_key`: tên + dung lượng GPU, RAM)
+khớp thì **dùng lại** batch đã dò, không dò lại. BERTScore / RadGraph cũng tự chọn batch theo
+cách này. Khoá hạ tầng cũ (`infer.batch_size`, `gpu_config`, ...) bị từ chối khi nạp config.
 
 ```bash
-bash scripts/setup.sh
-python3 scripts/selftest_vextractor.py
-bash scripts/run_vextractor.sh train --detach
+export HF_TOKEN=hf_xxxxxxxx                    # repo dữ liệu private + medgemma gated
 
-# Skip cmd
-RGEXP_SKIP_SETUP=1 
-RGEXP_SKIP_SELFTEST=1
+bash scripts/setup.sh                          # môi trường chính + .venv-chexagent + .venv-llavamed (một lần)
+python scripts/selftest_backbone.py            # vài giây, không cần GPU
+
+bash scripts/run_backbone.sh data              # lấy mẫu 6400/3000 + tải 3000 ảnh test
+bash scripts/run_backbone.sh infer --limit 8   # thử lần lượt 3 candidate trên 8 ảnh
+bash scripts/run_backbone.sh all --detach      # data -> infer ×3 -> score -> stats (nền)
+bash scripts/run_backbone.sh push              # -> dataset RGExp123/Research_v2, thư mục baseline/
 ```
 
-Cấu hình chính ở `configs/vextractor.yaml`; profile phần cứng ở `configs/gpu/`.
+| lệnh | làm gì |
+|---|---|
+| `data` | **Lần đầu dò mẫu, lần sau dùng lại manifest**: dựng fixture (nếu chưa có) rồi chỉ đọc lại `data/fixture_backbone/`; tải ảnh test. `--resample` dựng lại; `--with-train` tải cả 6400 ảnh train |
+| `infer` | lần lượt từng candidate (đúng python của nó) → `predictions.jsonl` + `align.jsonl` + `probe.json`. Đứt giữa chừng → chạy lại là đi tiếp. `--cands a,b`, `--limit N` |
+| `score` | điểm theo mẫu → `metrics/per_sample_<id>.csv`. `--rescore` |
+| `stats` | AUC + Friedman/Holm → `REPORT.md` (ghi đè), `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `auc_*.csv`, `manifest.json` (gồm cả `probes`) |
+| `push` | tạo dataset repo `RGExp123/Research_v2` (private) nếu chưa có, đẩy `runs/backbone/` → `baseline/Reports/` và fixture → `baseline/fixture/`. `--plan` chỉ in |
 
-> **Kéo từ Hub:** `bash scripts/run_vextractor.sh pull` chỉ kéo Stage 0 gốc (như `huggingface-cli download RGExp123/Research_results --repo-type dataset --include 'current/$2.2_V-Extractor_Test/stage0/final/*'`, nhưng có kiểm vân tay + `origin.json`); thêm `--weights` để kéo cả weight của B cho `lens`/`stats`. Cần `HF_TOKEN`; không train, không đẩy gì lên.
+> Hub không cho tên repo có khoảng trắng nên "Research v2" → `Research_v2`. Đổi ở
+> `output.hub_repo` / `output.hub_folder`.
 
-> **Stage 0 = đúng checkpoint Stage 0 của §2.2 gốc (CnA MHA), không bao giờ chạy DINO ở thí nghiệm này** (`output.stage0_from.required: true`, `run_vextractor.ensure_origin_stage0`). Nguồn theo thứ tự: bản cục bộ `./adapters_vextractor/_stage0` của gốc, rồi Hub `current/$2.2_V-Extractor_Test/stage0` (chỉ `final/` đã xong, khớp vân tay). Bản chép mang `_stage0/origin.json` (nguồn + sha256 của `final/`); thư mục Stage 0 không có hoặc lệch `origin.json` bị ghi đè bằng bản gốc. Không lấy được thì **dừng**; `--restage0` bị từ chối, `--retrain-all` chỉ chạy lại main + sinh + chấm. Checkpoint **main stage** của §2.2 **không nạp được** (`FORMAT` = `rgexp.vextractor/26`, spec có `cna.attn`), nên main stage chạy lại vào `./adapters_vextractor_snop` / `runs/vextractor_snop`.
+> **Tái lập:** sinh là beam search tất định. Batch thực dùng của từng candidate nằm ở
+> `cands/<id>/worker_meta.json` và `probe.json`; batch khác có thể đổi vài token do padding
+> trái ở bf16. Giữ nguyên `probe.json` khi chạy lại để có cùng batch.
+
+## 4. Cấu trúc
+
+```
+configs/backbone.yaml        nội dung thí nghiệm (dữ liệu, candidate, prompt, policy, metric, thống kê)
+scripts/setup.sh · run_backbone.sh · selftest_backbone.py · _env.sh
+src/run_backbone.py          điểm vào: data · infer · score · stats · push · all
+src/sampling.py              sàng lọc + lấy mẫu + fixture
+src/worker/infer_worker.py   worker ĐỘC LẬP (transformers 4.37 / 4.40 / 4.52): dò phần cứng, tự chọn batch, sinh + vision token
+src/alignment.py             AUC-ROC theo nhãn, macro, bootstrap
+src/metrics.py               tiền xử lý + BLEU / ROUGE / BERTScore / RadGraph
+src/stats_friedman.py        Friedman + Wilcoxon + Holm
+src/report.py                REPORT.md
+src/decoding.py              policy giải mã (kiểm chặt)
+src/data.py · labels_cls.py · imaging.py · hw.py · config.py   dùng lại từ các mục trước
+requirements.txt · requirements-chexagent.txt · requirements-llavamed.txt
+_archive/                    mọi thí nghiệm trước (§2.0–§2.5, $1 LoRA, §2.2.x V-Extractor)
+```

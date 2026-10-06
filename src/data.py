@@ -1,4 +1,12 @@
-"""TestSet 3k: lấy key + tham chiếu + ảnh từ repo HF RGExp123/MIMIC_CXR_cleaned.
+"""Ảnh của tập con: trích ĐÚNG những ảnh cần từ img_dir.zip (repo HF
+RGExp123/MIMIC_CXR_cleaned) vào cache cục bộ.
+
+§3: danh sách key KHÔNG lấy từ `split_ref/*.csv` nữa — nó do `src/sampling.py`
+dựng (đủ nhãn, ít lệch nhãn nhất, mỗi bệnh nhân một ảnh). File này chỉ còn
+đường ẢNH: `ensure_images(cfg, df)` (stream range-request / tải trọn zip, song
+song, cưỡng chế trần cạnh dài). Phần dưới là docstring gốc của §2.1.
+
+TestSet 3k: lấy key + tham chiếu + ảnh từ repo HF RGExp123/MIMIC_CXR_cleaned.
 
 Tập test KHÔNG được lấy mẫu lại ở đây. `split_ref/test_split.csv` trong repo đã
 chốt 3000 key (seed 42, n_source_rows=157917) và mọi thí nghiệm sau của luận văn
@@ -26,54 +34,6 @@ from PIL import Image
 from .config import Cfg, hf_token
 
 Image.MAX_IMAGE_PIXELS = None  # ảnh CXR gốc có thể > giới hạn cảnh báo bom nén
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Bảng key + tham chiếu
-# ─────────────────────────────────────────────────────────────────────────────
-def load_index(cfg: Cfg) -> pd.DataFrame:
-    """Trả DataFrame [key, ref] theo ĐÚNG thứ tự của test_split.csv."""
-    from huggingface_hub import hf_hub_download
-
-    d = cfg.data
-    tok = hf_token()
-    kw = dict(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"), token=tok)
-
-    split_path = hf_hub_download(filename=d["split_csv"], **kw)
-    meta_path = hf_hub_download(filename=d["meta_csv"], **kw)
-
-    key_col, ref_col = d["key_column"], d["ref_column"]
-    keys = pd.read_csv(split_path)[key_col].astype(str).tolist()
-    n = int(d.get("n_test", 0) or 0)
-    if n and n < len(keys):
-        # Cắt từ ĐẦU danh sách, không lấy ngẫu nhiên: thứ tự trong file là cố
-        # định, nên "3000 ảnh đầu" là một tập tái lập được, còn "3000 ảnh ngẫu
-        # nhiên" thì phải mang theo seed mới đọc lại được.
-        keys = keys[:n]
-    print(f"  split : {len(keys)} key từ {d['split_csv']}", flush=True)
-
-    # clean_dataset.csv ~164 MB. Chỉ đọc 2 cột cần — đọc đủ 8 cột thì text_gt +
-    # aug_gt ngốn vài GB RAM mà aug_gt không dùng tới trong §2.1.
-    meta = pd.read_csv(meta_path, usecols=[key_col, ref_col])
-    ref_map = dict(zip(meta[key_col].astype(str), meta[ref_col].astype(str)))
-    del meta
-
-    rows, missing = [], []
-    for k in keys:
-        ref = ref_map.get(k)
-        if ref is None or not str(ref).strip() or str(ref) == "nan":
-            missing.append(k)
-            continue
-        rows.append({"key": k, "ref": str(ref)})
-    if missing:
-        # Không im lặng bỏ qua: một key trong split mà không có text_gt nghĩa là
-        # split và meta lệch nhau, và đó là lỗi dữ liệu cần biết chứ không phải
-        # một vài dòng thiếu vô hại.
-        print(f"  ⚠ {len(missing)} key không có {ref_col} — bị loại. Ví dụ: {missing[:3]}",
-              flush=True)
-    df = pd.DataFrame(rows)
-    print(f"  tham chiếu: {len(df)} mẫu có {ref_col}", flush=True)
-    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -453,41 +413,3 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
         imaging.enforce_max_side(df["image_path"].tolist(), max_side,
                                  label=f"{len(df)} ảnh", workers=io_workers(cfg))
     return df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-def prepare(cfg: Cfg, tracker=None) -> pd.DataFrame:
-    """Điểm vào: trả bảng [key, ref, image_path] và ghi manifest ra đĩa."""
-    cache_root = Path(cfg.data.get("cache_dir", "./data")).expanduser()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    manifest = cache_root / "testset.jsonl"
-
-    print("═══ Dữ liệu ═══", flush=True)
-    df = load_index(cfg)
-    df = ensure_images(cfg, df, tracker)
-
-    with open(manifest, "w", encoding="utf-8") as f:
-        for r in df.itertuples(index=False):
-            f.write(json.dumps({"key": r.key, "ref": r.ref, "image_path": r.image_path},
-                               ensure_ascii=False) + "\n")
-    print(f"✓ TestSet sẵn sàng: {len(df)} mẫu -> {manifest}", flush=True)
-    return df
-
-
-def load_manifest(cfg: Cfg) -> pd.DataFrame:
-    """Đọc lại manifest đã chuẩn bị (dùng khi chạy riêng một stage)."""
-    path = Path(cfg.data.get("cache_dir", "./data")) / "testset.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"Chưa có {path} — chạy stage `data` trước.")
-    return pd.DataFrame([json.loads(l) for l in open(path, encoding="utf-8") if l.strip()])
-
-
-if __name__ == "__main__":
-    from .config import add_common_args, load_config
-    import argparse
-
-    ap = argparse.ArgumentParser(description="Chuẩn bị TestSet 3k rồi thoát.")
-    add_common_args(ap)
-    a = ap.parse_args()
-    prepare(load_config(a.config, a.overrides, getattr(a, "gpu", None)))
-    sys.exit(0)

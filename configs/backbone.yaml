@@ -1,0 +1,195 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §3 — CHỌN BACKBONE BASELINE CHO MIMIC-CXR (thí nghiệm sạch) — CONFIG NỘI DUNG
+# ═════════════════════════════════════════════════════════════════════════════
+# Câu hỏi: trong ba VLM đã pretrain trên dữ liệu y khoa, backbone nào
+#   (1) BẢO TOÀN đặc trưng thị giác bệnh lý ở vision token TRƯỚC khi vào decoder
+#       (Alignment AUC-ROC giữa vision token và nhãn, cùng không gian embedding), và
+#   (2) sinh báo cáo tốt nhất ở trạng thái gốc [Origin] (zero-shot, KHÔNG fine-tune)
+#       theo BLEU / ROUGE / BERTScore / RadGraph F1?
+#
+#   G1  StanfordAIMI/CheXagent-2-3b      pretrain X-quang   (transformers==4.40.0, venv riêng)
+#   G1  google/medgemma-4b-it            pretrain X-quang   (môi trường chính)
+#   G2  microsoft/llava-med-v1.5-mistral-7b  pretrain y khoa (.venv-llavamed, package `llava`, transformers 4.37.2)
+#
+# Kiểm định: Friedman (ties Conover, p theo F Iman-Davenport) + hậu kiểm
+# Wilcoxon signed-rank ghép cặp, hiệu chỉnh Holm.
+#
+#   bash scripts/run_backbone.sh all       # data -> infer ×3 -> score -> stats
+#   bash scripts/run_backbone.sh push      # -> RGExp123/Research_v2 (dataset) · baseline/
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+experiment: "backbone"
+
+# ── Dữ liệu ─────────────────────────────────────────────────────────────────
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel            # files/pXX/pNNNNNNNN/sNNNNNNNN/<uuid>.jpg
+  ref_column: text_gt
+  cache_dir: ./data
+  # Ảnh của repo đã đồng bộ 512² vuông. Trần 512 ở đây chỉ là chốt an toàn (không
+  # resize thêm ảnh 512). Resize về cỡ của từng model do PROCESSOR GỐC của nhà
+  # sản xuất làm (AutoProcessor / transform của CheXagent) — không có bước chung.
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+
+labels:
+  npz: csv_helper/labels.npz
+  key_array: null                # null = tự dò (src/labels_cls.py)
+  label_array: null
+  # NaN (bệnh không được nhắc tới trong báo cáo) -> không gán lớp nào (ô rỗng).
+  # Ở alignment, ô rỗng được tính là ÂM nếu `alignment.nan_as_negative`.
+  encoding: {neg: [0], pos: [1], uncertain: [-1, 2], nan_to: ignore}
+
+# ── Sàng lọc & lấy mẫu (src/sampling.py) ────────────────────────────────────
+sampling:
+  n_train: 6400
+  n_test: 3000
+  # Mỗi bệnh nhân ĐÚNG một ảnh trên CẢ train ∪ test (train ∩ test = ∅ theo bệnh nhân).
+  patient_regex: "/p(\\d{8})/"
+  # "Mẫu thử phải có mặt tất cả các nhãn bệnh": mỗi nhãn có ít nhất từng ấy
+  # ca DƯƠNG TÍNH trong mỗi tập. Không đạt -> DỪNG (không nới ngầm).
+  min_pos_per_label: {test: 30, train: 60}
+  # "Các nhãn phải ít lệch nhất": chọn tham lam, mỗi bước lấy ảnh làm số ca
+  # dương của các nhãn đang THIẾU tăng nhiều nhất và nhãn đang THỪA tăng ít nhất
+  # (w_j = (c̄ + 1)/(c_j + 1) − 1). Sau đó chia 3000/6400 phân tầng lặp
+  # (iterative stratification) để hai tập cùng phân phối nhãn.
+  method: greedy_balance
+  # Ca "không dương tính nhãn nào" (thường là ảnh chỉ có uncertain): bỏ khỏi hồ.
+  drop_no_positive: true
+  # Nhãn uncertain KHÔNG tính là dương tính khi cân bằng.
+  tie_noise: 1.0e-6
+
+# ── Candidate ───────────────────────────────────────────────────────────────
+candidates:
+  - id: chexagent2_3b
+    name: "CheXagent-2 3B"
+    group: G1
+    family: chexagent
+    hf_id: StanfordAIMI/CheXagent-2-3b
+    env: chexagent               # chạy bằng .venv-chexagent (transformers==4.40.0)
+    # Định dạng tham chiếu của nhà sản xuất (README): system "You are a helpful assistant."
+    system: "You are a helpful assistant."
+  - id: medgemma_4b
+    name: "MedGemma 4B-it"
+    group: G1
+    family: gemma3
+    hf_id: google/medgemma-4b-it
+    env: main
+    system: null
+  - id: llavamed15_7b
+    name: "LLaVA-Med v1.5 7B"
+    group: G2
+    family: llava_orig
+    # Checkpoint GỐC của Microsoft: model_type=llava_mistral, transformers KHÔNG nạp
+    # được -> cần package `llava` của repo microsoft/LLaVA-Med (transformers 4.37.2)
+    # trong .venv-llavamed (scripts/setup.sh dựng). Chạy từng ảnh một (builder +
+    # prepare_inputs_labels_for_multimodal của nó không an toàn với batch padding).
+    hf_id: microsoft/llava-med-v1.5-mistral-7b
+    env: llavamed
+    conv_mode: mistral_instruct
+    system: null
+
+# ── Policy (§1.4) ───────────────────────────────────────────────────────────
+# MỘT prompt gốc; mỗi candidate chỉ khác ở cách ĐÓNG GÓI (chat template /
+# định dạng hội thoại của chính nó) — src/worker/infer_worker.py.
+prompt:
+  user: |-
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  do_sample: false               # tái lập 100%
+  num_beams: 4
+  num_return_sequences: 1
+  max_new_tokens: 200
+  no_repeat_ngram_size: 0
+  repetition_penalty: 1.08
+  length_penalty: 0.8
+  early_stopping: true
+
+# Đồng bộ kiểu dữ liệu torch cho cả ba candidate (trọng số + pixel_values).
+dtype: bfloat16
+
+# ── Tài nguyên: TỰ DÒ, không có config hạ tầng riêng ────────────────────────
+# Chạy ĐƠN TIẾN TRÌNH, TUẦN TỰ (từng candidate, từng lô): mỗi worker lần lượt
+# chiếm toàn bộ VRAM + RAM rảnh của máy rồi thoát trước khi worker sau bắt đầu.
+# Lần đầu: dò phần cứng (VRAM từng GPU, RAM rảnh) -> max_memory cho device_map=auto
+# (GPU lấy hết trừ phần dành cho activation, phần dư của model tràn sang RAM) ->
+# dò batch lớn nhất không OOM (bắt đầu từ `max_batch`, OOM thì chia đôi và làm lại
+# CHÍNH lô đó). Kết quả ghi vào `cands/<id>/probe.json`; lần sau cùng một máy
+# (cùng tên GPU, VRAM, RAM) thì dùng lại, khác máy thì dò lại.
+autotune:
+  max_batch: 64                  # trần thử đầu tiên (llava_orig luôn 1)
+  vram_reserve_gib: 1.5          # phần mỗi GPU để dành cho activation/cuda context
+  vram_reserve_frac: 0.06        # ... hoặc phần trăm VRAM, lấy số LỚN hơn
+  ram_reserve_gib: 4.0           # RAM để lại cho hệ điều hành
+
+# ── Alignment: vision token ↔ nhãn (cùng không gian embedding của decoder) ──
+# Vision token = đầu ra của nhánh vision SAU projector/resampler, đúng tensor
+# được chèn vào chuỗi embedding của decoder:
+#   CheXagent  model.visual(...)            (1024 token × 2560)
+#   MedGemma   get_image_features(...)      ( 256 token × 2560)
+#   LLaVA-Med  get_image_features(...)      ( 576 token × 4096)
+# Embedding nhãn = trung bình các hàng của bảng input-embedding của decoder ứng
+# với subword của tên nhãn. Điểm của (ảnh, nhãn) = TRUNG BÌNH top-5% cosine
+# giữa nhãn và các vision token của ảnh (Top-5% Mean Pooling).
+alignment:
+  label_template: "{name}"
+  topk_frac: 0.05
+  nan_as_negative: true          # ô NaN (không nhắc tới) = âm; uncertain luôn bị loại
+  primary_pool: top5             # AUC chính = Top-5% Mean Pooling (mean/max chỉ để đối chiếu)
+  n_boot: 2000                   # CI95 bootstrap theo ảnh cho AUC
+
+# ── Metrics ─────────────────────────────────────────────────────────────────
+metrics:
+  normalize:                     # áp cho CẢ dự đoán lẫn tham chiếu, đúng thứ tự
+    lowercase: true
+    strip_section_headers: true  # bỏ "findings:" / "impression(s):"
+    collapse_whitespace: true    # \n, \t, nhiều khoảng trắng -> một khoảng trắng
+    fix_space_before_punct: true # "effusion ." -> "effusion."
+    strip: true
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    rescale_with_baseline: false
+    keep: [f1]
+  radgraph:
+    enabled: true
+    model_type: radgraph-xl
+    reward_level: all            # simple / partial / complete; radgraph_f1 = partial
+  primary: radgraph_f1
+
+stats:
+  alpha: 0.05
+  zero_method: pratt
+  posthoc_scope: permetric       # Holm trên 3 cặp trong từng metric | global
+  posthoc_permutation: false
+  n_perm: 10000
+  kendall_w_floor: 0.05
+  rrb_floor: 0.10
+  # Họ kiểm định (Holm trên các metric của Friedman).
+  text_metrics: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1, radgraph_f1]
+
+output:
+  dir: ./runs
+  subdir: backbone
+  fixture_dir: ./data/fixture_backbone
+  # Repo MỚI (type dataset). "Research v2" -> tên repo Hub không có khoảng trắng nên
+  # là `Research_v2`; chủ sở hữu giữ như repo cũ. Tạo (private) nếu chưa có.
+  #   baseline/Reports/    REPORT.md, manifest, metrics/, cands/<id>/{predictions,align,probe}
+  #   baseline/fixture/    tập lấy mẫu khoá cứng + sampling_report.json
+  hub_repo: RGExp123/Research_v2
+  hub_repo_type: dataset
+  hub_folder: baseline
+  hub_private: true

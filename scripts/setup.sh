@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# setup.sh — dựng môi trường cho §2.2 V-Extractor. Chạy MỘT LẦN.
+# setup.sh — dựng môi trường cho §3 chọn backbone y khoa. Chạy MỘT LẦN.
 #
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
 #     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
 #
-# MỘT môi trường duy nhất: transformers 4.51/4.52 cho Gemma 3, cộng
-# peft + bitsandbytes cho adapter (requirements-adapters.txt —
-# scripts/run_vextractor.sh tự cài phần đó nếu thiếu).
-#
-# Repo này chỉ còn §2.2 V-Extractor. §2.0/§2.1 và $1 nằm trong _archive/.
-# Chúng cần transformers 4.36/4.37 trong một venv cô lập, và giữ lại phần dựng
-# venv đó ở đây nghĩa là mỗi lần setup phải trả ~10 phút cho một thứ không lần
-# chạy nào dùng tới.
+# BA môi trường python, vì hai ràng buộc loại trừ nhau:
+#   chính            transformers 4.51/4.52 — MedGemma (Gemma 3)
+#                    và mọi khâu data / chấm điểm / thống kê
+#   .venv-chexagent  transformers==4.40.0 — remote code của CheXagent-2 `assert`
+#                    đúng phiên bản này. Dựng bằng --system-site-packages (khi
+#                    môi trường chính là python hệ thống) để dùng lại torch đã
+#                    khớp CUDA, chỉ đè transformers/tokenizers.
+#   .venv-llavamed   transformers==4.37.2 + package `llava` của microsoft/LLaVA-Med
+#                    (checkpoint gốc microsoft/llava-med-v1.5-mistral-7b, kiến trúc llava_mistral)
+#     RGEXP_SKIP_CHEXAGENT_VENV=1 / RGEXP_SKIP_LLAVAMED_VENV=1   bỏ qua venv tương ứng
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -23,7 +25,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.2 V-Extractor (DINOv3 ViT-B/16) — setup ═══"
+echo "═══ §3 Backbone y khoa (CheXagent-2 · MedGemma · LLaVA-Med) — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -176,114 +178,125 @@ else
     pipi torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
 fi
 
-# ── 5. requirements ─────────────────────────────────────────────────────────
-# File BẮT BUỘC của §2.2. Config/script của $1 và §2.0/§2.1 KHÔNG có trong
-# danh sách: chúng đã sang _archive/, và đòi chúng ở đây là chặn setup vì một
-# thứ repo đã cố ý bỏ đi.
-for f in requirements.txt configs/vextractor.yaml configs/gpu/rtx3060.yaml \
-         src/run_vextractor.py src/train_recomb.py src/backbone.py; do
+# ── 5. requirements (môi trường chính) ──────────────────────────────────────
+for f in requirements.txt requirements-chexagent.txt requirements-llavamed.txt configs/backbone.yaml \
+         src/run_backbone.py src/worker/infer_worker.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
-echo "→ cài requirements.txt..."
+echo "→ cài requirements.txt (môi trường chính)..."
 pipi -r requirements.txt
 
-# ── 5b. torch cũ: KHÔNG nâng torch, đã ghim transformers ────────────────────
-# requirements.txt ghim transformers < 4.53 CHÍNH VÌ chỗ này: từ 4.53 mask ảnh
-# của Gemma 3 đi qua `or_mask_function`, đòi torch >= 2.6, và ảnh pytorch/* hay
-# đứng ở 2.5.x. Ghim (vài chục MB) rẻ hơn nâng torch (~2.5 GB) và giữ nguyên
-# bản torch vốn đã khớp CUDA của máy. Ai cần transformers mới thì khai báo rõ.
 TV=$("$PYBIN" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || echo "0")
 if "$PYBIN" -c "import sys; v=tuple(int(x) for x in '$TV'.split('.')[:2]); sys.exit(0 if v<(2,6) else 1)" 2>/dev/null; then
     if [ "${RGEXP_UPGRADE_TORCH:-0}" = "1" ]; then
         echo "→ RGEXP_UPGRADE_TORCH=1: nâng torch $TV -> bản $CUDA_TAG (~2.5 GB)"
         pipi --upgrade torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
-        echo "✓ torch: $("$PYBIN" -c 'import torch; print(torch.__version__)')"
     else
-        echo "✓ torch $TV < 2.6 — không sao: transformers đã ghim < 4.53 (xem"
-        echo "  requirements.txt). Muốn nâng torch: RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh"
+        echo "✓ torch $TV < 2.6 — transformers đã ghim < 4.53 (requirements.txt)."
     fi
 fi
 
-# ── 7. Nạp trước model chấm BERTScore ───────────────────────────────────────
-# roberta-large ~1.4 GB. Tải ở đây để khâu chấm điểm (chạy SAU nhiều giờ infer)
-# không chết vì mạng.
+# ── 6. venv CheXagent (transformers==4.40.0) ────────────────────────────────
+CX_VENV="$RGEXP_ROOT/.venv-chexagent"
+if [ "${RGEXP_SKIP_CHEXAGENT_VENV:-0}" = "1" ]; then
+    echo "⊘ RGEXP_SKIP_CHEXAGENT_VENV=1 — bỏ qua venv CheXagent"
+else
+    if [ ! -x "$CX_VENV/bin/python" ]; then
+        # Dùng lại torch của môi trường chính: venv con thấy site-packages của
+        # python nền (cờ --system-site-packages), các gói cài vào venv con thì ĐÈ lên.
+        BASE_PY="$PYBIN"
+        if [ "$USE_VENV" = "1" ]; then
+            BASE_PY="$("$PYBIN" -c 'import sys; print(sys.base_prefix)')/bin/python3"
+            [ -x "$BASE_PY" ] || BASE_PY="$PY"
+        fi
+        "$BASE_PY" -m venv --system-site-packages "$CX_VENV"
+        echo "✓ tạo $CX_VENV"
+    else
+        echo "✓ $CX_VENV đã có, dùng lại"
+    fi
+    CXPY="$CX_VENV/bin/python"
+    if ! "$CXPY" -c "import torch" 2>/dev/null; then
+        echo "→ venv CheXagent chưa thấy torch — cài torch ($CUDA_TAG)..."
+        "$CXPY" -m pip install -q torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+    fi
+    echo "→ cài requirements-chexagent.txt vào $CX_VENV ..."
+    "$CXPY" -m pip install -q -r requirements-chexagent.txt
+    "$CXPY" -c "import transformers, torch, albumentations, cv2, einops; assert transformers.__version__ == '4.40.0', transformers.__version__; print('✓ venv CheXagent: transformers', transformers.__version__, '· torch', torch.__version__)" \
+        || { echo "✗ venv CheXagent chưa dùng được — đọc lỗi pip ở trên."; exit 1; }
+fi
+
+# ── 6b. venv LLaVA-Med gốc (transformers==4.37.2 + package llava) ─────────────
+LM_VENV="$RGEXP_ROOT/.venv-llavamed"
+if [ "${RGEXP_SKIP_LLAVAMED_VENV:-0}" = "1" ]; then
+    echo "⊘ RGEXP_SKIP_LLAVAMED_VENV=1 — bỏ qua venv LLaVA-Med"
+else
+    if [ ! -x "$LM_VENV/bin/python" ]; then
+        BASE_PY="$PYBIN"
+        if [ "$USE_VENV" = "1" ]; then
+            BASE_PY="$("$PYBIN" -c 'import sys; print(sys.base_prefix)')/bin/python3"
+            [ -x "$BASE_PY" ] || BASE_PY="$PY"
+        fi
+        "$BASE_PY" -m venv --system-site-packages "$LM_VENV"
+        echo "✓ tạo $LM_VENV"
+    else
+        echo "✓ $LM_VENV đã có, dùng lại"
+    fi
+    LMPY="$LM_VENV/bin/python"
+    if ! "$LMPY" -c "import torch" 2>/dev/null; then
+        "$LMPY" -m pip install -q torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+    fi
+    echo "→ cài requirements-llavamed.txt vào $LM_VENV ..."
+    "$LMPY" -m pip install -q -r requirements-llavamed.txt
+    # --no-deps: package llava ghim cả torch/transformers; ta đã có bản đúng ở trên
+    "$LMPY" -m pip install -q --no-deps "git+https://github.com/microsoft/LLaVA-Med.git"
+    "$LMPY" -c "import transformers, llava; from llava.model import LlavaMistralForCausalLM; assert transformers.__version__ == '4.37.2', transformers.__version__; print('✓ venv LLaVA-Med: transformers', transformers.__version__)" \
+        || { echo "✗ venv LLaVA-Med chưa dùng được — đọc lỗi pip ở trên."; exit 1; }
+fi
+
+# ── 7. Nạp trước model chấm (BERTScore + RadGraph) ──────────────────────────
 "$PYBIN" - <<'PYEOF' || echo "⚠ chưa tải được roberta-large — khâu chấm điểm sẽ tự tải lại"
 from transformers import AutoModel, AutoTokenizer
 AutoTokenizer.from_pretrained("roberta-large")
 AutoModel.from_pretrained("roberta-large")
 print("✓ roberta-large (BERTScore) đã nằm trong cache")
 PYEOF
+"$PYBIN" - <<'PYEOF' || echo "⚠ chưa nạp được RadGraph — khâu chấm điểm sẽ tự tải lại"
+from radgraph import F1RadGraph
+F1RadGraph(reward_level="all", model_type="radgraph-xl")
+print("✓ RadGraph (radgraph-xl) đã nằm trong cache")
+PYEOF
 
-# ── 8. Xác nhận GPU + deps + TƯƠNG THÍCH ────────────────────────────────────
+# ── 8. Xác nhận GPU + deps ──────────────────────────────────────────────────
 "$PYBIN" - <<'PYEOF'
 import sys
 import torch
 missing = []
-for mod in ("numpy", "pandas", "yaml", "transformers", "huggingface_hub",
-            "sacrebleu", "rouge_score", "bert_score", "PIL"):
+for mod in ("numpy", "pandas", "scipy", "yaml", "transformers", "huggingface_hub",
+            "sacrebleu", "rouge_score", "bert_score", "radgraph", "PIL"):
     try:
         __import__(mod)
     except ImportError:
         missing.append(mod)
 if missing:
-    print(f"✗ Thiếu module: {', '.join(missing)}")
-    print(f"  python đang dùng: {sys.executable}")
-    print("  requirements.txt chưa cài xong — đọc lỗi pip ở bước 5.")
+    print(f"✗ Thiếu module: {', '.join(missing)} (python: {sys.executable})")
     raise SystemExit(1)
-print("✓ deps: numpy pandas yaml transformers huggingface_hub sacrebleu rouge_score bert_score pillow")
+import transformers
+print(f"✓ deps OK · transformers {transformers.__version__}")
 if not torch.cuda.is_available():
     print("✗ torch KHÔNG thấy GPU. Kiểm tra driver / bản CUDA của torch.")
     raise SystemExit(1)
 p = torch.cuda.get_device_properties(0)
-sm = torch.cuda.get_device_capability(0)
-print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
-if p.total_memory / 1024**3 < 16:
-    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — main stage KHÔNG dò batch. "
-          "Hết VRAM thì hạ, theo thứ tự,")
-    print("  train.max_seq_len (configs/vextractor.yaml) hoặc "
-          "train.per_device_batch_size (configs/gpu/<card>.yaml)")
-    print("  (grad_accum tự suy ra = effective_batch / per_device_batch_size).")
+gb = p.total_memory / 1024**3
+print(f"✓ GPU: {p.name} | {gb:.0f} GB")
+print("  (batch / device_map / max_memory do worker tự dò khi chạy — không cần cấu hình phần cứng)")
 PYEOF
-
-# DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn
-# chạy rồi trả exit 1 — đã gặp thật.
-"$PYBIN" -c "
-import sys
-sys.path.insert(0, '.')
-from src.preflight import c_compiler_works
-ok, why = c_compiler_works()
-print('✓ dịch thử mã C OK (' + why + ') — torch.compile dùng được' if ok
-      else '⚠ Không dịch được mã C (' + why + ') — torch.compile sẽ bị TẮT, chạy eager.\n'
-           '  Muốn giữ compile:  apt-get install -y build-essential python3-dev')
-" 2>/dev/null || echo "⚠ không kiểm được trình biên dịch C"
-
-# Kiểm tương thích phiên bản bằng CHÍNH bộ luật mà lần chạy sẽ dùng — không
-# chép lại logic ở đây để rồi hai chỗ trôi khỏi nhau.
-echo "→ kiểm tương thích phiên bản..."
-"$PYBIN" -m src.preflight || {
-    echo "✗ Môi trường chưa chạy được. Sửa theo hướng dẫn ngay trên rồi chạy lại setup."
-    exit 1
-}
 
 echo
 echo "═══ setup xong ═══"
 echo
-echo "  1. Token:"
-echo "       export HF_TOKEN=hf_xxxxxxxx        # BẮT BUỘC (gemma-3 gated + repo private)"
-echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https://wandb.ai/authorize)"
-echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
-echo
-echo "  2. Tự kiểm chứng (vài giây, không cần GPU):"
-echo "       python scripts/selftest_vextractor.py   # phải qua HẾT"
-echo
-echo "  3. Thử đường ống + VRAM đỉnh (config: configs/vextractor.yaml + configs/gpu/):"
-echo "       bash scripts/run_vextractor.sh train --dry-run"
-echo
-echo "  4. CHẠY THẬT:"
-if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run_vextractor.sh train --detach"
-    echo "       # chạy nền, trả lại shell ngay, in link W&B."
-else
-    echo "       bash scripts/run_vextractor.sh train"
-fi
+echo "  export HF_TOKEN=hf_xxxxxxxx      # BẮT BUỘC (repo dữ liệu private + medgemma gated)"
+echo "  python scripts/selftest_backbone.py         # vài giây, không cần GPU"
+echo "  bash scripts/run_backbone.sh data           # lấy mẫu 6400/3000 + tải ảnh test"
+echo "  bash scripts/run_backbone.sh infer --limit 8  # thử lần lượt 3 candidate trên 8 ảnh"
+echo "  bash scripts/run_backbone.sh all --detach   # chạy thật (nền)"
 echo
