@@ -55,6 +55,10 @@ sampling:
   # "Mẫu thử phải có mặt tất cả các nhãn bệnh": mỗi nhãn có ít nhất từng ấy
   # ca DƯƠNG TÍNH trong mỗi tập. Không đạt -> DỪNG (không nới ngầm).
   min_pos_per_label: {test: 30, train: 60}
+  # Hồ không đủ ca dương cho ngưỡng trên: `prioritize` = chuyển mục tiêu sang ƯU TIÊN CA DƯƠNG
+  # (nhãn hiếm lấy trước, ưu tiên ảnh phủ nhiều nhãn còn thiếu -> đa dạng nhãn), vẫn buộc
+  # mỗi nhãn có >= 1 ca ở cả hai tập và ghi phần thiếu vào sampling_report; `fail` = dừng.
+  on_shortfall: prioritize
   # "Các nhãn phải ít lệch nhất": chọn tham lam, mỗi bước lấy ảnh làm số ca
   # dương của các nhãn đang THIẾU tăng nhiều nhất và nhãn đang THỪA tăng ít nhất
   # (w_j = (c̄ + 1)/(c_j + 1) − 1). Sau đó chia 3000/6400 phân tầng lặp

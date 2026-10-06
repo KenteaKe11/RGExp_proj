@@ -121,6 +121,36 @@ def t03_sampling():
 
 
 @case
+def t03b_priority_when_pool_short():
+    from src import sampling as S
+
+    rng = np.random.default_rng(7)
+    N, L = 12000, 6
+    prev = np.array([.4, .0, .1, .3, .004, .2])          # nhãn 1: không có; nhãn 4: ~48 ảnh
+    Y = (rng.random((N, L)) < prev).astype(np.int8)
+    Y[rng.choice(N, 3, replace=False), 2] = 1
+    Y = Y[Y.sum(1) > 0]
+    pid = np.array([f"{i:08d}" for i in range(len(Y))], dtype=object)
+    n, nt = 3000, 900
+    init = S.select_coverage(Y, pid, 90, np.random.default_rng(1))
+    assert len(set(init.tolist())) == len(init)
+    assert Y[init][:, 4].sum() == Y[:, 4].sum(), "nhãn hiếm phải được lấy hết"
+    pick = S.select_balanced(Y, pid, n, np.random.default_rng(1), init=init)
+    assert len(set(pick.tolist())) == n and set(init.tolist()) <= set(pick.tolist())
+    Ys = Y[pick]
+    te = S.stratified_split(Ys, nt, np.random.default_rng(2))
+    T = Ys.sum(0)
+    eff = {"test": [0 if t == 0 else min(30, max(1, round(t * nt / n))) for t in T],
+           "train": [0 if t == 0 else max(1, min(60, int(t) - min(30, max(1, round(t * nt / n))))) for t in T]}
+    te2 = S.repair_floor(Ys, te, eff, np.random.default_rng(3))
+    assert int(te2.sum()) == nt
+    ct, cr = Ys[te2].sum(0), Ys[~te2].sum(0)
+    for j in range(L):
+        assert ct[j] >= eff["test"][j] and cr[j] >= eff["train"][j], (j, ct[j], cr[j], eff)
+    assert ct[4] >= 1 and cr[4] >= 1
+
+
+@case
 def t04_auc():
     from src.alignment import auc, evaluate, targets
 

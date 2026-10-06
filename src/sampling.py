@@ -74,9 +74,42 @@ def balance_weights(c: np.ndarray) -> np.ndarray:
     return (c.mean() + 1.0) / (c + 1.0) - 1.0
 
 
+def select_coverage(Y: np.ndarray, patients: np.ndarray, quota: int,
+                    rng: np.random.Generator, tie_noise: float = 1e-6) -> np.ndarray:
+    """Pha ƯU TIÊN CA DƯƠNG (khi hồ không đủ cho ngưỡng): nhãn hiếm nhất trước, mỗi
+    nhãn lấy tới `quota` ca dương (hoặc cạn hồ); mỗi lần chọn ảnh phủ NHIỀU nhãn còn
+    thiếu nhất -> đa dạng hoá các thể loại nhãn. Mỗi bệnh nhân tối đa một ảnh."""
+    Y = np.asarray(Y, dtype=np.float32)
+    N, L = Y.shape
+    codes, inv = np.unique(patients.astype(str), return_inverse=True)
+    order = np.argsort(inv, kind="stable")
+    starts = np.searchsorted(inv[order], np.arange(len(codes)))
+    ends = np.append(starts[1:], N)
+    avail = np.ones(N, dtype=bool)
+    noise = rng.random(N) * float(tie_noise)
+    c = np.zeros(L)
+    picked = []
+    for j in np.argsort(Y.sum(0), kind="stable"):          # hiếm -> phổ biến
+        if Y[:, j].sum() == 0:
+            continue
+        while c[j] < quota:
+            cand = avail & (Y[:, j] > 0)
+            if not cand.any():
+                break
+            needy = (c < quota).astype(np.float32)
+            sc_ = (Y @ needy).astype(np.float64) + noise
+            sc_[~cand] = -np.inf
+            i = int(np.argmax(sc_))
+            picked.append(i)
+            pp = inv[i]
+            avail[order[starts[pp]:ends[pp]]] = False
+            c += Y[i]
+    return np.asarray(picked, dtype=np.int64)
+
+
 def select_balanced(Y: np.ndarray, patients: np.ndarray, n: int,
-                    rng: np.random.Generator, tie_noise: float = 1e-6
-                    ) -> np.ndarray:
+                    rng: np.random.Generator, tie_noise: float = 1e-6,
+                    init: np.ndarray | None = None) -> np.ndarray:
     """Chọn `n` chỉ số, mỗi bệnh nhân tối đa một, cân bằng số ca dương các nhãn.
 
     Y: (N, L) {0,1}. Trả mảng chỉ số theo THỨ TỰ được chọn.
@@ -93,7 +126,15 @@ def select_balanced(Y: np.ndarray, patients: np.ndarray, n: int,
     noise = rng.random(N).astype(np.float64) * float(tie_noise)
     c = np.zeros(L, dtype=np.float64)
     picked = np.empty(n, dtype=np.int64)
-    for t in range(n):
+    t0 = 0
+    if init is not None and len(init):
+        for i in init[:n]:
+            picked[t0] = i
+            p = inv[i]
+            avail[order[starts[p]:ends[p]]] = False
+            c += Y[i]
+            t0 += 1
+    for t in range(t0, n):
         s = Y @ balance_weights(c).astype(np.float32)
         s = s.astype(np.float64) + noise
         s[~avail] = -np.inf
@@ -154,6 +195,44 @@ def stratified_split(Y: np.ndarray, n_test: int, rng: np.random.Generator
     is_test = assign == 0
     assert int(is_test.sum()) == n_test, (int(is_test.sum()), n_test)
     return is_test
+
+
+def repair_floor(Y: np.ndarray, is_test: np.ndarray, eff: dict, rng) -> np.ndarray:
+    """Hoán đổi ảnh giữa train/test để mỗi nhãn đạt ngưỡng hiệu dụng `eff[split][j]`
+    mà không làm nhãn nào khác tụt dưới ngưỡng. Kích thước hai tập giữ nguyên."""
+    Y = np.asarray(Y, dtype=np.int64)
+    t = is_test.copy()
+    L = Y.shape[1]
+    need = {"test": np.asarray(eff["test"]), "train": np.asarray(eff["train"])}
+    for _ in range(5000):
+        ct, cr = Y[t].sum(0), Y[~t].sum(0)
+        bad = [("test", j) for j in range(L) if ct[j] < need["test"][j]] + \
+              [("train", j) for j in range(L) if cr[j] < need["train"][j]]
+        if not bad:
+            break
+        sp, j = bad[0]
+        src_is_test = sp == "train"                       # lấy ảnh có nhãn j từ tập kia
+        a_pool = np.flatnonzero((t == src_is_test) & (Y[:, j] > 0))
+        b_pool = np.flatnonzero((t != src_is_test))
+        cnt_src = ct if src_is_test else cr               # đếm tập nguồn (mất a)
+        cnt_dst = cr if src_is_test else ct               # đếm tập đích (mất b)
+        n_src = need["test"] if src_is_test else need["train"]
+        n_dst = need["train"] if src_is_test else need["test"]
+        done = False
+        for a in rng.permutation(a_pool)[:400]:
+            if ((cnt_src - Y[a]) < n_src).any() and (Y[a] * (cnt_src - Y[a] < n_src)).any():
+                continue
+            ok_b = [b for b in rng.permutation(b_pool)[:400]
+                    if not ((cnt_dst - Y[b] + Y[a]) < n_dst).any()
+                    and not ((cnt_src - Y[a] + Y[b]) < n_src).any()]
+            if ok_b:
+                b = ok_b[0]
+                t[a], t[b] = (not src_is_test), src_is_test
+                done = True
+                break
+        if not done:
+            break
+    return t
 
 
 def imbalance(counts: np.ndarray) -> dict:
@@ -232,9 +311,44 @@ def build(cfg: Cfg) -> dict:
     print(f"  ứng viên: {len(keys)} ảnh · {n_pat} bệnh nhân", flush=True)
 
     n = n_tr + n_te
-    pick = select_balanced(Y, pid, n, rng, float(sc.get("tie_noise", 1e-6)))
+    mins = dict(sc.get("min_pos_per_label") or {})
+    mode = str(sc.get("on_shortfall", "prioritize"))        # prioritize | fail
+    fl_te, fl_tr = int(mins.get("test", 1)), int(mins.get("train", 1))
+    pool_pos = Y.sum(0)
+    pool_pat = np.array([len(set(pid[Y[:, j] > 0].tolist())) for j in range(L)])
+    print("  ca dương trong hồ (ảnh / bệnh nhân): " +
+          ", ".join(f"{names[j]} {int(pool_pos[j])}/{int(pool_pat[j])}" for j in range(L)),
+          flush=True)
+    init = None
+    if mode == "prioritize":
+        infeasible = [names[j] for j in range(L) if pool_pat[j] < fl_te + fl_tr]
+        if infeasible:
+            print(f"  ⚠ hồ không đủ ngưỡng (test {fl_te} + train {fl_tr}) cho: {infeasible} "
+                  f"-> chuyển sang ƯU TIÊN CA DƯƠNG: lấy hết ca của các nhãn hiếm trước, "
+                  f"đa dạng hoá thể loại nhãn", flush=True)
+        init = select_coverage(Y, pid, fl_te + fl_tr, rng,
+                               float(sc.get("tie_noise", 1e-6)))
+        print(f"  pha ưu tiên: {len(init)} ảnh", flush=True)
+    pick = select_balanced(Y, pid, n, rng, float(sc.get("tie_noise", 1e-6)), init=init)
     Ys = Y[pick]
     is_test = stratified_split(Ys, n_te, rng)
+    tot = Ys.sum(0)
+    if mode == "prioritize":
+        # ngưỡng hiệu dụng: không vượt quá những gì đã chọn được; nhãn có >=2 ca thì
+        # BẮT BUỘC có mặt ở cả hai tập
+        eff = {"test": [], "train": []}
+        for j in range(L):
+            T = int(tot[j])
+            if T == 0:
+                eff["test"].append(0); eff["train"].append(0)
+            elif T == 1:
+                eff["test"].append(0); eff["train"].append(1)
+            else:
+                et = min(fl_te, max(1, int(round(T * n_te / n))))
+                er = min(fl_tr, T - et)
+                eff["test"].append(et); eff["train"].append(max(1, er))
+        is_test = repair_floor(Ys, is_test, eff, rng)
+        assert int(is_test.sum()) == n_te
 
     sel_keys = [keys[i] for i in pick]
     sel_pid = pid[pick]
@@ -247,16 +361,27 @@ def build(cfg: Cfg) -> dict:
         first.setdefault(pid[i], int(i))
     rnd = rng.choice(np.array(list(first.values())), size=n, replace=False)
 
-    mins = dict(sc.get("min_pos_per_label") or {})
     split_counts = {}
-    errs = []
+    errs, shortfall = [], {}
     for nm_split, mask in (("test", is_test), ("train", ~is_test)):
         cnt = Ys[mask].sum(0)
         split_counts[nm_split] = cnt
         floor = int(mins.get(nm_split, 1))
-        low = [(names[j], int(cnt[j])) for j in range(L) if cnt[j] < floor]
+        if mode == "prioritize":
+            req = np.asarray(eff[nm_split])
+            low = [(names[j], int(cnt[j])) for j in range(L) if cnt[j] < req[j]]
+            sf = {names[j]: [int(cnt[j]), floor] for j in range(L) if cnt[j] < floor}
+            if sf:
+                shortfall[nm_split] = sf
+                print(f"  ⚠ {nm_split}: dưới ngưỡng {floor} (hồ không đủ) — {sf}", flush=True)
+        else:
+            low = [(names[j], int(cnt[j])) for j in range(L) if cnt[j] < floor]
         if low:
-            errs.append(f"{nm_split}: {low} < {floor}")
+            errs.append(f"{nm_split}: {low} < ngưỡng")
+    absent = [names[j] for j in range(L) if tot[j] == 0]
+    if absent:
+        print(f"  ⚠ nhãn KHÔNG có ca dương nào trong hồ: {absent} "
+              f"(kiểm lại mã hoá nhãn trong labels.npz)", flush=True)
     if errs:
         raise SamplingFailed("thiếu ca dương: " + "; ".join(errs))
 
@@ -284,7 +409,9 @@ def build(cfg: Cfg) -> dict:
         "imbalance": {s: imbalance(c) for s, c in split_counts.items()},
         "imbalance_random_baseline": imbalance(Y[rnd].sum(0)),
         "imbalance_pool": imbalance(Y.sum(0)),
-        "min_pos_per_label": mins,
+        "min_pos_per_label": mins, "on_shortfall": mode,
+        "shortfall": shortfall, "absent_labels": absent,
+        "pool_positives": {names[j]: int(pool_pos[j]) for j in range(L)},
         "unique_patients": True,
         "patients_overlap_train_test": 0,
         "sha256": {f"{s}set.jsonl": hashlib.sha256((fx / f"{s}set.jsonl").read_bytes()).hexdigest()
