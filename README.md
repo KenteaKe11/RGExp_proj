@@ -1,5 +1,9 @@
 # RGExp — §3 Chọn backbone baseline cho MIMIC-CXR (thí nghiệm sạch, 2 candidate)
 
+> **Thí nghiệm 2 — chọn rank LoRA decoder cho MedGemma: xem [`README_lora.md`](README_lora.md)**
+> (`bash scripts/run_lora.sh all`). README_lora §0 có cảnh báo về chiều nhãn của `labels.npz`,
+> ảnh hưởng tới Alignment AUC và tập lấy mẫu của thí nghiệm dưới đây.
+
 > Mọi thí nghiệm trước đã sang `_archive/`. Thí nghiệm vừa đóng lại là §2.2.x
 > V-Extractor (Gemma 3 + DINOv3 + CnA/SNOP-MHA): toàn bộ code, config, script,
 > README và `Claude outputs/` của nó nằm nguyên vẹn ở `_archive/v3_vextractor/`.

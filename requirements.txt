@@ -9,6 +9,11 @@ transformers>=4.51,<4.53
 accelerate>=0.34.0
 safetensors>=0.4.5
 sentencepiece>=0.2.0
+
+# Thí nghiệm 2 (QLoRA): adapter + lượng tử 4-bit NF4.
+# bitsandbytes >= 0.46 có bản build cho Blackwell (sm_120, RTX 50xx) / CUDA 12.8.
+peft>=0.15,<0.18
+bitsandbytes>=0.46
 protobuf>=4.25.0
 
 huggingface_hub>=0.26.0

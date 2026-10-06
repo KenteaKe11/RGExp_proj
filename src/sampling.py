@@ -20,6 +20,13 @@ một lời hứa:
 Dương tính = lớp `pos` của labels.npz (uncertain KHÔNG tính). Mã bệnh nhân lấy
 từ `img_rel` (files/pXX/p<8 số>/s<8 số>/<uuid>.jpg) bằng `sampling.patient_regex`.
 
+Thí nghiệm 2 (configs/lora.yaml) thêm hai thứ, đều tắt ở configs/backbone.yaml để
+Thí nghiệm 1 tái lập y như cũ:
+  * `sampling.n_val` > 0 -> chia thêm tập VAL từ phần còn lại sau test (phân tầng lặp +
+    ngưỡng `min_pos_per_label.val`), cùng ràng buộc một ảnh / bệnh nhân trên cả ba tập;
+  * `labels.orientation: auto` -> đo chiều pos/neg của labels.npz bằng văn bản báo cáo
+    (src/label_orientation.py), đảo nếu cần, dừng nếu mơ hồ.
+
 Kết quả là FIXTURE khoá cứng ở `output.fixture_dir`:
     testset.jsonl · trainset.jsonl   {key, ref, patient, labels{tên: pos|neg|unc|nan}}
     labels.json                      tên nhãn theo đúng thứ tự cột
@@ -300,6 +307,17 @@ def build(cfg: Cfg) -> dict:
     print(f"  hồ: {len(lut)} key có nhãn · {len(refs)} key có {cfg.data['ref_column']} "
           f"· giao {len(keys)}", flush=True)
     H = np.stack([lut[k] for k in keys])                     # (N, L, 3)
+    orient = None
+    o_mode = str((cfg.get("labels") or {}).get("orientation", "as_is"))
+    if o_mode != "as_is" or (cfg.get("labels") or {}).get("orientation_check", False):
+        from . import label_orientation as LO
+        orient = LO.decide(LO.states_from_onehot(H), [refs[k] for k in keys], names, o_mode)
+        print(f"  chiều nhãn: {orient['decision']} · phiếu {orient['votes']}", flush=True)
+        if orient.get("dissent"):
+            print(f"  ⚠ nhãn bất đồng với chiều chung (có thể sai TÊN cột): "
+                  f"{orient['dissent']}", flush=True)
+        if orient["swap"]:
+            H = LO.swap_onehot(H)
     Y = (H[:, :, 1] > 0.5).astype(np.int8)
     pid = patient_ids(keys, str(sc.get("patient_regex", r"/p(\d{8})/")))
     if bool(sc.get("drop_no_positive", True)):
@@ -310,10 +328,12 @@ def build(cfg: Cfg) -> dict:
     n_pat = len(set(pid.tolist()))
     print(f"  ứng viên: {len(keys)} ảnh · {n_pat} bệnh nhân", flush=True)
 
-    n = n_tr + n_te
+    n_va = int(sc.get("n_val", 0) or 0)
+    n = n_tr + n_te + n_va
     mins = dict(sc.get("min_pos_per_label") or {})
     mode = str(sc.get("on_shortfall", "prioritize"))        # prioritize | fail
     fl_te, fl_tr = int(mins.get("test", 1)), int(mins.get("train", 1))
+    fl_va = int(mins.get("val", 1)) if n_va else 0
     pool_pos = Y.sum(0)
     pool_pat = np.array([len(set(pid[Y[:, j] > 0].tolist())) for j in range(L)])
     print("  ca dương trong hồ (ảnh / bệnh nhân): " +
@@ -321,34 +341,54 @@ def build(cfg: Cfg) -> dict:
           flush=True)
     init = None
     if mode == "prioritize":
-        infeasible = [names[j] for j in range(L) if pool_pat[j] < fl_te + fl_tr]
+        infeasible = [names[j] for j in range(L) if pool_pat[j] < fl_te + fl_tr + fl_va]
         if infeasible:
-            print(f"  ⚠ hồ không đủ ngưỡng (test {fl_te} + train {fl_tr}) cho: {infeasible} "
-                  f"-> chuyển sang ƯU TIÊN CA DƯƠNG: lấy hết ca của các nhãn hiếm trước, "
-                  f"đa dạng hoá thể loại nhãn", flush=True)
-        init = select_coverage(Y, pid, fl_te + fl_tr, rng,
+            print(f"  ⚠ hồ không đủ ngưỡng (test {fl_te} + train {fl_tr} + val {fl_va}) cho: "
+                  f"{infeasible} -> chuyển sang ƯU TIÊN CA DƯƠNG: lấy hết ca của các nhãn "
+                  f"hiếm trước, đa dạng hoá thể loại nhãn", flush=True)
+        init = select_coverage(Y, pid, fl_te + fl_tr + fl_va, rng,
                                float(sc.get("tie_noise", 1e-6)))
         print(f"  pha ưu tiên: {len(init)} ảnh", flush=True)
     pick = select_balanced(Y, pid, n, rng, float(sc.get("tie_noise", 1e-6)), init=init)
     Ys = Y[pick]
-    is_test = stratified_split(Ys, n_te, rng)
     tot = Ys.sum(0)
-    if mode == "prioritize":
-        # ngưỡng hiệu dụng: không vượt quá những gì đã chọn được; nhãn có >=2 ca thì
-        # BẮT BUỘC có mặt ở cả hai tập
-        eff = {"test": [], "train": []}
-        for j in range(L):
-            T = int(tot[j])
+
+    def _eff(T_all, n_a, n_all, fa, fb):
+        """Ngưỡng hiệu dụng (a, b): không vượt quá cái đã chọn; nhãn >= 2 ca thì
+        BẮT BUỘC có mặt ở cả hai phía."""
+        ea, eb = [], []
+        for T in (int(t) for t in T_all):
             if T == 0:
-                eff["test"].append(0); eff["train"].append(0)
+                ea.append(0); eb.append(0)
             elif T == 1:
-                eff["test"].append(0); eff["train"].append(1)
+                ea.append(0); eb.append(1)
             else:
-                et = min(fl_te, max(1, int(round(T * n_te / n))))
-                er = min(fl_tr, T - et)
-                eff["test"].append(et); eff["train"].append(max(1, er))
-        is_test = repair_floor(Ys, is_test, eff, rng)
+                a_ = min(fa, max(1, int(round(T * n_a / n_all))))
+                ea.append(a_); eb.append(max(1, min(fb, T - a_)))
+        return ea, eb
+
+    # (1) test | phần còn lại (train ∪ val)
+    is_test = stratified_split(Ys, n_te, rng)
+    eff = {"test": [], "train": [], "val": []}
+    if mode == "prioritize":
+        et, er = _eff(tot, n_te, n, fl_te, fl_tr + fl_va)
+        is_test = repair_floor(Ys, is_test, {"test": et, "train": er}, rng)
         assert int(is_test.sum()) == n_te
+        eff["test"], eff["train"] = et, er
+    split_of = np.where(is_test, "test", "train").astype(object)
+    # (2) val | train trong phần còn lại — chỉ khi có val (n_val = 0: y hệt Thí nghiệm 1)
+    if n_va:
+        rest = np.flatnonzero(~is_test)
+        Yr = Ys[rest]
+        is_val = stratified_split(Yr, n_va, rng)
+        if mode == "prioritize":
+            ev, etr = _eff(Yr.sum(0), n_va, len(rest), fl_va, fl_tr)
+            is_val = repair_floor(Yr, is_val, {"test": ev, "train": etr}, rng)
+            assert int(is_val.sum()) == n_va
+            eff["val"], eff["train"] = ev, etr
+        split_of[rest[is_val]] = "val"
+    splits = ["test", "train"] + (["val"] if n_va else [])
+    masks = {s: split_of == s for s in splits}
 
     sel_keys = [keys[i] for i in pick]
     sel_pid = pid[pick]
@@ -363,8 +403,8 @@ def build(cfg: Cfg) -> dict:
 
     split_counts = {}
     errs, shortfall = [], {}
-    for nm_split, mask in (("test", is_test), ("train", ~is_test)):
-        cnt = Ys[mask].sum(0)
+    for nm_split in splits:
+        cnt = Ys[masks[nm_split]].sum(0)
         split_counts[nm_split] = cnt
         floor = int(mins.get(nm_split, 1))
         if mode == "prioritize":
@@ -387,11 +427,15 @@ def build(cfg: Cfg) -> dict:
 
     fx = fixture_dir(cfg)
     fx.mkdir(parents=True, exist_ok=True)
-    rows = {"test": [], "train": []}
+    rows = {s: [] for s in splits}
     for i, (k, p) in enumerate(zip(sel_keys, sel_pid)):
-        rows["test" if is_test[i] else "train"].append(
+        rows[str(split_of[i])].append(
             {"key": k, "ref": refs[k], "patient": str(p),
              "labels": label_state(H[pick[i]], names)})
+    pats = {s: {r["patient"] for r in rows[s]} for s in rows}
+    overlap = {f"{a}|{b}": len(pats[a] & pats[b]) for a in pats for b in pats if a < b}
+    if any(overlap.values()):
+        raise SamplingFailed(f"bệnh nhân trùng giữa các tập: {overlap}")
     for s in rows:
         rows[s].sort(key=lambda r: r["key"])        # thứ tự khối ghép cặp = thứ tự key
         with open(fx / f"{s}set.jsonl", "w", encoding="utf-8") as f:
@@ -401,7 +445,7 @@ def build(cfg: Cfg) -> dict:
                                     encoding="utf-8")
 
     rep = {
-        "seed": seed, "n_train": n_tr, "n_test": n_te,
+        "seed": seed, "n_train": n_tr, "n_test": n_te, "n_val": n_va,
         "pool_images": len(keys), "pool_patients": n_pat,
         "labels": names,
         "positives": {s: {names[j]: int(c[j]) for j in range(L)}
@@ -412,14 +456,16 @@ def build(cfg: Cfg) -> dict:
         "min_pos_per_label": mins, "on_shortfall": mode,
         "shortfall": shortfall, "absent_labels": absent,
         "pool_positives": {names[j]: int(pool_pos[j]) for j in range(L)},
+        "label_orientation": orient,
         "unique_patients": True,
-        "patients_overlap_train_test": 0,
+        "patients_overlap": overlap,
+        "patients_overlap_train_test": overlap.get("test|train", 0),
         "sha256": {f"{s}set.jsonl": hashlib.sha256((fx / f"{s}set.jsonl").read_bytes()).hexdigest()
                    for s in rows},
         "method": sc.get("method", "greedy_balance"),
     }
-    (fx / "sampling_report.json").write_text(json.dumps(rep, indent=2, ensure_ascii=False),
-                                             encoding="utf-8")
+    (fx / "sampling_report.json").write_text(json.dumps(rep, indent=2, ensure_ascii=False,
+                                                        default=str), encoding="utf-8")
     im, ib = rep["imbalance"]["test"], rep["imbalance_random_baseline"]
     print(f"  ✓ test: max/min ca dương = {im['max_over_min']:.2f} (CV {im['cv']:.3f}) "
           f"· lấy ngẫu nhiên: {ib['max_over_min']:.2f} (CV {ib['cv']:.3f})", flush=True)
