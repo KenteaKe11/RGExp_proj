@@ -15,6 +15,7 @@ sentencepiece>=0.2.0
 peft>=0.15,<0.18
 bitsandbytes>=0.46
 protobuf>=4.25.0
+wandb>=0.17                      # log huấn luyện (WANDB_API_KEY; không có thì chạy offline)
 
 huggingface_hub>=0.26.0
 hf_transfer>=0.1.6

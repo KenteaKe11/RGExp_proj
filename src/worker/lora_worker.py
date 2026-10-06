@@ -270,12 +270,85 @@ def micro_loss(model, batch: dict, n_prompt: int, denom: float, torch):
     return ce / denom, float(ce.detach())
 
 
-def lr_mult(step: int, total: int, warmup_frac: float, min_ratio: float) -> float:
+def lr_at(step: int, total: int, warmup_frac: float, lr_max: float, lr_min: float) -> float:
+    """lr dùng cho bước tối ưu hoá thứ `step` (0-based): 0 -> lr_max tuyến tính trong
+    `warm` bước đầu (bước 0 có lr = 0, bước `warm` đạt lr_max), rồi cosine lr_max -> lr_min,
+    chạm đúng lr_min ở bước cuối (total - 1)."""
     warm = max(1, int(round(warmup_frac * total)))
     if step < warm:
-        return (step + 1) / warm
-    t = min(1.0, (step - warm) / max(1, total - warm))
-    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
+        return lr_max * step / warm
+    t = min(1.0, (step - warm) / max(1, total - 1 - warm))
+    return lr_min + (lr_max - lr_min) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+class WandbLog:
+    """Bọc W&B: mọi lỗi chỉ là cảnh báo, không bao giờ làm hỏng huấn luyện."""
+
+    def __init__(self, cfg: dict | None, out: Path, c: dict, tc: dict, extra: dict):
+        self.run = None
+        cfg = dict(cfg or {})
+        if not cfg.get("enabled", True) or os.environ.get("RGEXP_NO_WANDB") == "1":
+            log("  W&B: tắt")
+            return
+        try:
+            import wandb
+        except ImportError:
+            log("  ⚠ W&B: chưa cài `wandb` (pip install -r requirements.txt) — bỏ qua log W&B")
+            return
+        try:
+            mode = os.environ.get("WANDB_MODE")
+            if not mode:
+                has_key = bool(os.environ.get("WANDB_API_KEY"))
+                if not has_key:
+                    try:
+                        import netrc
+                        has_key = netrc.netrc().authenticators("api.wandb.ai") is not None
+                    except Exception:  # noqa: BLE001
+                        has_key = False
+                mode = "online" if has_key else "offline"
+                if not has_key:
+                    log("  ⚠ W&B: không thấy WANDB_API_KEY / `wandb login` -> chạy OFFLINE "
+                        "(đồng bộ sau: wandb sync <thư mục wandb>)")
+            d = out / "wandb"
+            d.mkdir(parents=True, exist_ok=True)
+            self.run = wandb.init(
+                project=cfg.get("project", "rgexp-lora-medgemma"), entity=cfg.get("entity"),
+                group=cfg.get("group"), tags=list(cfg.get("tags") or []),
+                name=c["id"], id=f"{extra.get('experiment', 'lora')}-{c['id']}", resume="allow",
+                dir=str(d), mode=mode,
+                config={"candidate": c, "train": tc, **extra},
+                settings=wandb.Settings(console="off", silent=True),
+            )
+            self.run.define_metric("step")
+            self.run.define_metric("*", step_metric="step")
+            log(f"  W&B: {mode} · run {self.run.name} · {getattr(self.run, 'url', None) or d}")
+        except Exception as e:  # noqa: BLE001
+            self.run = None
+            log(f"  ⚠ W&B không khởi tạo được ({type(e).__name__}: {str(e)[:120]}) — bỏ qua log W&B")
+
+    def log(self, data: dict) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.log(data)
+        except Exception as e:  # noqa: BLE001
+            log(f"  ⚠ W&B log lỗi ({type(e).__name__}) — tắt log W&B")
+            self.run = None
+
+    def summary(self, data: dict) -> None:
+        if self.run is not None:
+            try:
+                self.run.summary.update(data)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def finish(self) -> None:
+        if self.run is not None:
+            try:
+                self.run.finish()
+            except Exception:  # noqa: BLE001
+                pass
+            self.run = None
 
 
 def epoch_order(n: int, seed: int, epoch: int):
@@ -398,7 +471,9 @@ def run_train(spec, torch) -> int:
     spe = math.ceil(len(rows) / eff)
     total = spe * epochs
     params = [p for p in model.parameters() if p.requires_grad]
-    opt_kw = dict(lr=float(tc["lr"]), betas=tuple(float(x) for x in tc.get("adam_betas", [0.9, 0.999])),
+    lr_max, lr_min = float(tc["lr_max"]), float(tc["lr_min"])
+    wf = float(tc.get("warmup_frac", 0.10))
+    opt_kw = dict(lr=lr_max, betas=tuple(float(x) for x in tc.get("adam_betas", [0.9, 0.999])),
                   weight_decay=float(tc.get("weight_decay", 0.0)))
     try:
         opt = torch.optim.AdamW(params, fused=dev.type == "cuda", **opt_kw)
@@ -441,7 +516,11 @@ def run_train(spec, torch) -> int:
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-    lr0, wf, mr = float(tc["lr"]), float(tc.get("warmup_frac", 0.03)), float(tc.get("lr_min_ratio", 0.0))
+    wb = WandbLog(spec.get("wandb"), out, c, tc, {
+        "experiment": spec.get("experiment", "lora"), "steps": total, "steps_per_epoch": spe,
+        "n_train": len(rows), "n_val": len(vrows), "seed": seed, "dtype": spec["dtype"],
+        "quant": spec["quant"], "lora": spec["lora"], "hw": hk, **pstats})
+    wb_every = max(1, int((spec.get("wandb") or {}).get("log_every", 1)))
     ckpt_every = int(tc.get("ckpt_every_steps", 100))
     pad_id = enc.tok.pad_token_id
     n_done_run = 0
@@ -460,7 +539,7 @@ def run_train(spec, torch) -> int:
             del b, loss
         gn = float(torch.nn.utils.clip_grad_norm_(params, float(tc.get("max_grad_norm", 1.0))))
         for pg in opt.param_groups:
-            pg["lr"] = lr0 * lr_mult(g, total, wf, mr)
+            pg["lr"] = lr_at(g, total, wf, lr_max, lr_min)
         opt.step()
         return tot, gn
     try:
@@ -495,6 +574,13 @@ def run_train(spec, torch) -> int:
                            "tokens": int(denom), "grad_norm": gn,
                            "lr": opt.param_groups[0]["lr"], "micro": micro}
                     state["history"].append(rec)
+                    if (g + 1) % wb_every == 0 or g == 0:
+                        wb.log({"step": g + 1, "epoch": (g + 1) / spe, "train/loss": rec["loss"],
+                                "train/lr": rec["lr"], "train/grad_norm": gn,
+                                "train/target_tokens": rec["tokens"], "train/micro_batch": micro,
+                                "train/samples_seen": (g + 1) * eff,
+                                "sys/vram_peak_gib": (torch.cuda.max_memory_allocated() / GIB
+                                                      if torch.cuda.is_available() else 0.0)})
                     if not probe["tuned"]:
                         probe["tuned"] = True
                         dump(probe_p, probe)
@@ -511,6 +597,8 @@ def run_train(spec, torch) -> int:
                         state["epoch_eval"][str(ep)] = {**ev, "step": g + 1}
                         save_adapter(model, out / "ckpt" / f"epoch{ep}")
                         log(f"  ✓ epoch {ep}: val_loss {ev['val_loss']:.4f} ({ev['val_tokens']} token)")
+                        wb.log({"step": g + 1, "val/loss": ev["val_loss"], "val/tokens": ev["val_tokens"],
+                                "val/epoch": ep + 1})
                     elif end_of_epoch:
                         save_adapter(model, out / "ckpt" / f"epoch{ep}")
                         state["epoch_eval"][str(ep)] = {"val_loss": float("nan"), "step": g + 1}
@@ -522,6 +610,7 @@ def run_train(spec, torch) -> int:
         import traceback
         traceback.print_exc()
         log(f"✗ huấn luyện hỏng ở bước {state['global_step']}: {type(e).__name__}: {e}")
+        wb.finish()
         return 7
 
     # ── chọn checkpoint ────────────────────────────────────────────────────
@@ -553,6 +642,12 @@ def run_train(spec, torch) -> int:
     dump(out / "train_history.json", state["history"])
     dump(stats_p, st)
     log(f"✓ {c['id']}: chọn epoch {best} · adapter -> {dst}")
+    wb.summary({"final/train_loss_mean_last50": st["final_train_loss_mean_last50"],
+                "final/val_loss": (evs.get(best) or {}).get("val_loss"),
+                "final/minutes_this_run": st["minutes_this_run"],
+                "final/peak_vram_gib": st["peak_vram_gib"], "final/selected_epoch": best,
+                "final/trainable_params": pstats["trainable_params"]})
+    wb.finish()
     return 0
 
 

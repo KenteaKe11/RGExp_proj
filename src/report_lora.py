@@ -52,9 +52,10 @@ def render(cfg, cs, summary, fr, ph, nem, sel, trains, metas, srep, tm, n_test) 
     w(f"| Adapter | `{', '.join(lc['target_modules'])}` của khối ngôn ngữ · α = {lc.get('alpha_ratio')}·r "
       f"(α/r cố định) · dropout {lc.get('dropout')} |")
     w(f"| Huấn luyện | {tc['epochs']} epoch · batch hiệu dụng {tc['effective_batch']} (micro-batch tự dò, "
-      f"loss chuẩn hoá theo token của cả bước) · AdamW lr {tc['lr']} · warmup {tc['warmup_frac']} + cosine · "
+      f"loss chuẩn hoá theo token của cả bước) · AdamW (weight decay {tc['weight_decay']}) · lr 0 → {tc['lr_max']:g} "
+      f"(warmup {tc['warmup_frac']:.0%}) → cosine → {tc['lr_min']:g} · "
       f"grad clip {tc['max_grad_norm']} · loss chỉ trên báo cáo |")
-    w(f"| Chọn checkpoint | `{tc.get('select_checkpoint')}` trên tập val (cùng quy tắc mọi rank) |")
+    w(f"| Chọn checkpoint | `{tc.get('select_checkpoint')}` (cùng quy tắc mọi rank; val-loss cuối epoch chỉ để ghi nhận khi `last`) |")
     g = policy(cfg)
     w(f"| Sinh | `{', '.join(f'{k}={v}' for k, v in g.items())}` |")
     w(f"| Ảnh | 512² (repo) → `AutoProcessor` gốc của MedGemma (896², 256 token/ảnh) |")

@@ -198,9 +198,12 @@ def t05_worker():
         import lora_worker as W
     except ImportError:
         return
-    tot = 800
-    m = [W.lr_mult(s, tot, 0.03, 0.0) for s in range(tot)]
-    assert abs(m[23] - 1.0) < 1e-12 and m[0] < 0.05 and m[-1] < 1e-4 and max(m) <= 1.0 + 1e-12
+    tot = 400
+    lrs = [W.lr_at(s, tot, 0.10, 3e-4, 1e-5) for s in range(tot)]
+    assert lrs[0] == 0.0 and abs(lrs[40] - 3e-4) < 1e-15 and max(lrs) <= 3e-4 + 1e-15
+    assert abs(lrs[-1] - 1e-5) < 1e-12, lrs[-1]
+    assert all(a <= b for a, b in zip(lrs[:40], lrs[1:41])), "warmup phải tăng đơn điệu"
+    assert all(a >= b for a, b in zip(lrs[40:], lrs[41:])), "cosine phải giảm đơn điệu"
     assert (W.epoch_order(100, 42, 1) == W.epoch_order(100, 42, 1)).all()
     assert not (W.epoch_order(100, 42, 0) == W.epoch_order(100, 42, 1)).all()
     try:

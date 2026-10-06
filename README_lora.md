@@ -42,7 +42,7 @@ tái lập được như cũ.
 | **Dữ liệu** | **6400 train / 500 val / 3000 test**, lấy mẫu mới; mỗi bệnh nhân đúng một ảnh trên cả ba tập |
 | **Sàng lọc** | (a) mọi nhãn có ca dương ở mọi tập (≥ 60 train / 5 val / 30 test; hồ thiếu → ưu tiên ca dương, nhãn hiếm trước, ảnh phủ nhiều nhãn còn thiếu → đa dạng nhãn); (b) tham lam cân bằng để các nhãn **ít lệch nhất**, chia phân tầng lặp; (c) không trùng bệnh nhân giữa train/val/test |
 | **Ảnh** | repo 512² → `AutoProcessor.from_pretrained("google/medgemma-4b-it")` (896², 256 token/ảnh), cả train lẫn sinh |
-| **Huấn luyện** | 2 epoch · batch hiệu dụng 16 (400 bước/epoch) · AdamW lr 2e-4, warmup 3% + cosine · clip 1.0 · loss **chỉ** trên báo cáo + `<end_of_turn>` · cùng thứ tự dữ liệu (seed, epoch) ở mọi rank · chọn epoch có **val-loss** thấp nhất |
+| **Huấn luyện** | **1 epoch** đi qua 6400 mẫu (400 bước × batch hiệu dụng 16) · AdamW, **weight decay 0.01** · lr **0 → 3e-4** (warmup tuyến tính 10% = 40 bước) **→ cosine → 1e-5** (đúng 1e-5 ở bước cuối) · clip 1.0 · loss **chỉ** trên báo cáo + `<end_of_turn>` · cùng thứ tự dữ liệu (seed) ở mọi rank · lấy adapter cuối epoch (val-loss chỉ ghi nhận) · log đồng bộ lên **W&B** |
 | **Sinh** | y hệt Thí nghiệm 1: beam 4, `max_new_tokens=200`, `repetition_penalty=1.08`, `length_penalty=0.8`, cùng prompt |
 | **Tiền xử lý metric** | chữ thường → bỏ `Findings:`/`Impression(s):` → gộp `\n`/`\t`/khoảng trắng → bỏ khoảng trắng trước dấu câu → strip |
 | **Thống kê** | **Friedman** (hiệu chỉnh ties) + Iman-Davenport F, Kendall W, Holm trên 9 metric; hậu kiểm chỉ cho metric qua cổng: Nemenyi CD + Wilcoxon signed-rank (Pratt) Holm, rank-biserial |
@@ -61,6 +61,7 @@ tái lập được như cũ.
 
 ```bash
 export HF_TOKEN=hf_xxxxxxxx
+export WANDB_API_KEY=xxxxxxxx            # hoặc `wandb login`; không có -> W&B chạy offline
 bash scripts/setup.sh                    # cài thêm peft + bitsandbytes (requirements.txt)
 python scripts/selftest_lora.py          # vài giây, không GPU
 
@@ -101,6 +102,22 @@ tương đối ~1e-7). Kết quả dò lưu ở `train_probe.json` / `infer_prob
 
 Ước lượng thời gian trên RTX 5060 Ti 16 GB (máy của Thí nghiệm 1): sinh 3000 ảnh ≈ 2–3 giờ /
 candidate (×6), huấn luyện vài giờ / rank — tổng cỡ 1–1,5 ngày, chạy tuần tự.
+
+### 2.1. Log W&B
+
+Project `rgexp-lora-medgemma` (đổi ở `wandb.project` / `wandb.entity` trong `configs/lora.yaml`),
+group `lora_rank`, **mỗi rank một run** tên `qlora_r<r>`, id cố định `lora_rank-qlora_r<r>` nên chạy
+lại / đi tiếp từ `ckpt/last` vẫn ghi vào cùng một run. Mỗi bước: `train/loss`, `train/lr`,
+`train/grad_norm`, `train/target_tokens`, `train/micro_batch`, `train/samples_seen`,
+`sys/vram_peak_gib`; cuối epoch: `val/loss`; cuối run: `final/*` (summary). Config của run gồm toàn
+bộ lịch huấn luyện, quant, LoRA, phần cứng. W&B lỗi/không có key **không** làm hỏng huấn luyện:
+không có key -> chạy offline (log ở `cands/<id>/wandb/`, đẩy sau bằng `wandb sync`); thư mục này
+không đẩy lên Hub. Tắt: `wandb.enabled: false` hoặc `RGEXP_NO_WANDB=1`. Chỉ log huấn luyện
+(infer/stats không log lên W&B).
+
+Đổi lịch huấn luyện so với bản trước (2 epoch, lr 2e-4) làm adapter cũ trên Hub bị **từ chối** khi
+resume (`_same_setup` so cả `lr_max`, `lr_min`, `weight_decay`, `epochs`...) — rank nào train xong
+bằng lịch cũ sẽ được train lại.
 
 ## 3. Đã kiểm trước khi giao (CPU, model Gemma 3 tí hon khởi tạo ngẫu nhiên)
 

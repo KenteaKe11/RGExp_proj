@@ -105,19 +105,21 @@ lora:
 
 # ── Huấn luyện: MỘT lịch cho cả 5 rank ──────────────────────────────────────
 train:
-  epochs: 2
+  epochs: 1                      # MỘT epoch đi qua toàn bộ 6400 mẫu (400 bước × batch 16)
   effective_batch: 16            # BẤT BIẾN: micro-batch tự dò, loss chuẩn hoá theo token của cả bước
-  lr: 2.0e-4
-  warmup_frac: 0.03
-  lr_min_ratio: 0.0              # cosine về 0
-  weight_decay: 0.0
+  # Lịch lr: 0 -> lr_max (tuyến tính, warmup_frac = 10% tổng số bước) -> cosine xuống lr_min
+  # (đúng lr_min ở bước cuối).
+  lr_max: 3.0e-4
+  lr_min: 1.0e-5
+  warmup_frac: 0.10
+  weight_decay: 0.01             # AdamW (tách rời, decoupled)
   adam_betas: [0.9, 0.999]
   max_grad_norm: 1.0
   max_seq_len: 1024              # prompt (≈ 256 token ảnh + lời nhắc) + báo cáo; cắt ĐUÔI
   gradient_checkpointing: true
   # Loss CHỈ trên báo cáo + <end_of_turn> (prompt bị che -100).
-  eval_every_epoch: true         # val-loss cuối mỗi epoch
-  select_checkpoint: val_loss    # val_loss (epoch có val-loss thấp nhất) | last
+  eval_every_epoch: true         # val-loss cuối mỗi epoch (1 epoch -> chỉ để ghi nhận, không để chọn)
+  select_checkpoint: last        # last (cuối epoch) | val_loss (epoch có val-loss thấp nhất)
   ckpt_every_steps: 100          # checkpoint "last" để chạy lại đi tiếp
   max_micro_batch: 16            # trần thử micro-batch đầu tiên (OOM -> chia đôi, làm lại CHÍNH bước đó)
   num_workers: auto              # luồng nạp ảnh
@@ -151,6 +153,19 @@ autotune:
   ram_reserve_gib: 4.0
 
 # Alignment AUC-ROC: KHÔNG đo ở thí nghiệm này.
+
+# ── Weights & Biases: đồng bộ log huấn luyện ────────────────────────────────
+# Cần `WANDB_API_KEY` (hoặc đã `wandb login`). Không có -> tự chạy offline (log nằm trong
+# <cands>/<id>/wandb, đẩy sau bằng `wandb sync`). W&B hỏng KHÔNG làm hỏng huấn luyện.
+# Tắt hẳn: enabled: false hoặc RGEXP_NO_WANDB=1. Mỗi rank = 1 run, id cố định
+# `<experiment>-<cand>` nên chạy lại / đi tiếp từ ckpt vẫn ghi vào cùng một run.
+wandb:
+  enabled: true
+  project: rgexp-lora-medgemma
+  entity: null                   # null = tài khoản mặc định của API key
+  group: lora_rank
+  tags: [medgemma-4b, qlora, exp2]
+  log_every: 1                   # mỗi N bước tối ưu hoá
 
 # ── Metrics (y hệt Thí nghiệm 1) ────────────────────────────────────────────
 metrics:
