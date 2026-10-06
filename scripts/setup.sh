@@ -78,8 +78,14 @@ echo "✓ Python $PYVER"
 # `import torch` vẫn chạy, `torch.cuda.is_available()` vẫn True, rồi vỡ ở lần
 # matmul đầu bằng "no kernel image is available" — lỗi tốn nhiều giờ để lần ra.
 CUDA_TAG="cu121"; MIN_TAG=""
-GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
-GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
+# Mọi lệnh thay thế ở đây PHẢI có `|| true`: không có nvidia-smi thì pipeline trả
+# non-zero và `set -e` giết script ngay sau dòng "✓ Python", không một dòng lỗi.
+GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
+GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.' || true)
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "⚠ Không thấy nvidia-smi — driver NVIDIA chưa cài / chưa vào PATH. Vẫn dựng môi trường,"
+    echo "  nhưng bước kiểm GPU cuối cùng sẽ báo lỗi cho tới khi driver chạy (kiểm: nvidia-smi)."
+fi
 case "$GPU_SM" in
     12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;  # Blackwell (5090/B200)
     90)          CUDA_TAG="cu124"; MIN_TAG="cu124" ;;  # Hopper (H100)
@@ -112,7 +118,12 @@ fi
 # ── 3. Môi trường python ────────────────────────────────────────────────────
 if [ "$USE_VENV" = "1" ]; then
     if [ -d "$VENV" ]; then echo "✓ venv đã có, dùng lại (xoá $VENV nếu muốn dựng mới)"
-    else "$PY" -m venv "$VENV"; echo "✓ tạo venv"; fi
+    else
+        "$PY" -m venv "$VENV" || {
+            echo "✗ Không tạo được venv. Trên Ubuntu/Debian: sudo apt install -y python3-venv python3-dev"
+            rm -rf "$VENV"; exit 1; }
+        echo "✓ tạo venv"
+    fi
 else
     echo "⊘ bỏ qua venv — dùng thẳng python của image"
 fi
@@ -265,8 +276,13 @@ echo
 echo "═══ setup xong ═══"
 echo
 echo "  export HF_TOKEN=hf_xxxxxxxx      # BẮT BUỘC (repo dữ liệu private + medgemma gated)"
+echo "  source .venv/bin/activate"
 echo "  python scripts/selftest_backbone.py         # vài giây, không cần GPU"
 echo "  bash scripts/run_backbone.sh data           # lấy mẫu 6400/3000 + tải ảnh test"
 echo "  bash scripts/run_backbone.sh infer --limit 8  # thử lần lượt 2 candidate trên 8 ảnh"
 echo "  bash scripts/run_backbone.sh all --detach   # chạy thật (nền)"
+echo "  # Thí nghiệm 2 (LoRA MedGemma — peft + bitsandbytes đã nằm trong requirements.txt):"
+echo "  python scripts/selftest_lora.py"
+echo "  bash scripts/run_lora.sh train --cands qlora_r2 --limit 32"
+echo "  bash scripts/run_lora.sh all --detach"
 echo
