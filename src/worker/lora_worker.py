@@ -575,12 +575,8 @@ def run_train(spec, torch) -> int:
                            "lr": opt.param_groups[0]["lr"], "micro": micro}
                     state["history"].append(rec)
                     if (g + 1) % wb_every == 0 or g == 0:
-                        wb.log({"step": g + 1, "epoch": (g + 1) / spe, "train/loss": rec["loss"],
-                                "train/lr": rec["lr"], "train/grad_norm": gn,
-                                "train/target_tokens": rec["tokens"], "train/micro_batch": micro,
-                                "train/samples_seen": (g + 1) * eff,
-                                "sys/vram_peak_gib": (torch.cuda.max_memory_allocated() / GIB
-                                                      if torch.cuda.is_available() else 0.0)})
+                        wb.log({"step": g + 1, "lr": rec["lr"], "ce_loss": rec["loss"],
+                                "grad_norm": gn})
                     if not probe["tuned"]:
                         probe["tuned"] = True
                         dump(probe_p, probe)
@@ -597,8 +593,6 @@ def run_train(spec, torch) -> int:
                         state["epoch_eval"][str(ep)] = {**ev, "step": g + 1}
                         save_adapter(model, out / "ckpt" / f"epoch{ep}")
                         log(f"  ✓ epoch {ep}: val_loss {ev['val_loss']:.4f} ({ev['val_tokens']} token)")
-                        wb.log({"step": g + 1, "val/loss": ev["val_loss"], "val/tokens": ev["val_tokens"],
-                                "val/epoch": ep + 1})
                     elif end_of_epoch:
                         save_adapter(model, out / "ckpt" / f"epoch{ep}")
                         state["epoch_eval"][str(ep)] = {"val_loss": float("nan"), "step": g + 1}
@@ -642,11 +636,6 @@ def run_train(spec, torch) -> int:
     dump(out / "train_history.json", state["history"])
     dump(stats_p, st)
     log(f"✓ {c['id']}: chọn epoch {best} · adapter -> {dst}")
-    wb.summary({"final/train_loss_mean_last50": st["final_train_loss_mean_last50"],
-                "final/val_loss": (evs.get(best) or {}).get("val_loss"),
-                "final/minutes_this_run": st["minutes_this_run"],
-                "final/peak_vram_gib": st["peak_vram_gib"], "final/selected_epoch": best,
-                "final/trainable_params": pstats["trainable_params"]})
     wb.finish()
     return 0
 
