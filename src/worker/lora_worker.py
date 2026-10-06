@@ -577,16 +577,19 @@ def run_train(spec, torch) -> int:
                     if (g + 1) % wb_every == 0 or g == 0:
                         wb.log({"step": g + 1, "lr": rec["lr"], "ce_loss": rec["loss"],
                                 "grad_norm": gn})
+                        # In ĐÚNG những gì gửi lên W&B vào log của run (mỗi dòng = một điểm trên W&B).
+                        log(f"  [{c['id']}] step {g + 1}/{total} · lr {rec['lr']:.6e} · "
+                            f"ce_loss {rec['loss']:.6f} · grad_norm {gn:.6f}")
                     if not probe["tuned"]:
                         probe["tuned"] = True
                         dump(probe_p, probe)
-                    if (g + 1) % 10 == 0 or g == 0:
+                    if (g + 1) % 50 == 0 or g == 0:
                         el = time.time() - t0
                         eta = el / n_done_run * (total - g - 1)
                         vram = (f" · VRAM đỉnh {torch.cuda.max_memory_allocated() / GIB:.1f} GiB"
                                 if torch.cuda.is_available() else "")
-                        log(f"  [{c['id']}] bước {g + 1}/{total} · ep {ep} · loss {rec['loss']:.4f} "
-                            f"· lr {rec['lr']:.2e} · gn {gn:.2f} · mb {micro} · còn ~{eta / 60:.0f} phút{vram}")
+                        log(f"  [{c['id']}] tiến độ {g + 1}/{total} · mb {micro} · "
+                            f"còn ~{eta / 60:.0f} phút{vram}")
                     end_of_epoch = (g + 1) % spe == 0
                     if end_of_epoch and tc.get("eval_every_epoch", True) and vrows:
                         ev = evaluate_loss(model, enc, vrows, max(1, micro * 2), workers, torch, dev)
