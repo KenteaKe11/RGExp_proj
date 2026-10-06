@@ -377,6 +377,67 @@ def t09_scan_and_resume_from_hub():
 
 
 @case
+def t10_same_data_everywhere():
+    """Mọi candidate dùng CÙNG mẫu dữ liệu: dấu vân tay ổn định, đổi khi mẫu đổi; kết quả từ mẫu
+    khác bị từ chối (Hub, train, stats, --resample)."""
+    from types import SimpleNamespace as NS
+
+    from src import run_lora as R
+    from src.config import load_config
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        cfg = load_config(CFG, [f"output.dir={d}/runs", f"output.fixture_dir={d}/fx",
+                                f"data.cache_dir={d}/data"])
+        fx = d / "fx"
+        fx.mkdir()
+        (d / "data" / "images").mkdir(parents=True)
+        for k in ("a", "b", "c", "t1", "t2"):
+            (d / "data" / "images" / k).write_bytes(b"x")
+
+        def put(tr, te):
+            for sp, ks in (("train", tr), ("test", te)):
+                (fx / f"{sp}set.jsonl").write_text(
+                    "\n".join(json.dumps({"key": k, "ref": "x"}) for k in ks) + "\n")
+        put(["a", "b", "c"], ["t1", "t2"])
+        f1 = R.data_fingerprint(cfg)
+        assert f1 and f1 == R.data_fingerprint(cfg), "phải ổn định"
+        put(["a", "b", "c"], ["t2", "t1"])
+        assert R.data_fingerprint(cfg) != f1, "đổi thứ tự test phải đổi dấu vân tay"
+        put(["a", "b", "c"], ["t1", "t2"])
+        assert R.data_fingerprint(cfg) == f1
+        assert R._fp_status(None, f1, "x") == "unknown" and R._fp_status("zz", f1, "x") == "mismatch" \
+            and R._fp_status(f1, f1, "x") == "ok"
+
+        c = {"id": "qlora_r2", "rank": 2, "alpha": 4.0}
+        base = {"candidate": {"rank": 2, "alpha": 4.0}, "train": dict(cfg["train"]), "dtype": "bfloat16"}
+        assert R._same_setup(cfg, {**base, "data_fingerprint": f1}, c)
+        assert R._same_setup(cfg, dict(base), c), "kết quả cũ (không dấu vân tay) vẫn dùng, kèm cảnh báo"
+        assert not R._same_setup(cfg, {**base, "data_fingerprint": "deadbeef"}, c), \
+            "Hub từ mẫu khác phải bị từ chối"
+
+        cd = d / "runs" / "lora_rank" / "cands" / "qlora_r2"
+        (cd / "adapter").mkdir(parents=True)
+        (cd / "adapter" / "adapter_config.json").write_text("{}")
+        (cd / "train_stats.json").write_text(json.dumps({"data_fingerprint": "deadbeef"}))
+        try:
+            R.cmd_train(cfg, NS(cands=None, limit=0, no_push=True))
+            raise AssertionError("train phải từ chối adapter từ mẫu khác")
+        except R.RunFailed as e:
+            assert "MẪU DỮ LIỆU KHÁC" in str(e)
+        try:
+            R.cmd_stats(cfg, None)
+            raise AssertionError("stats phải từ chối khi các candidate khác mẫu")
+        except R.RunFailed as e:
+            assert "KHÔNG cùng mẫu" in str(e), str(e)
+        try:
+            R.cmd_data(cfg, NS(resample=True))
+            raise AssertionError("--resample phải bị chặn khi đã có kết quả")
+        except R.RunFailed as e:
+            assert "--resample" in str(e)
+
+
+@case
 def t07_no_archive_imports():
     for p in (ROOT / "src").rglob("*.py"):
         t = p.read_text(encoding="utf-8")

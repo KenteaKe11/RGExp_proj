@@ -47,6 +47,27 @@ tái lập được như cũ.
 | **Tiền xử lý metric** | chữ thường → bỏ `Findings:`/`Impression(s):` → gộp `\n`/`\t`/khoảng trắng → bỏ khoảng trắng trước dấu câu → strip |
 | **Thống kê** | **Friedman** (hiệu chỉnh ties) + Iman-Davenport F, Kendall W, Holm trên 9 metric; hậu kiểm chỉ cho metric qua cổng: Nemenyi CD + Wilcoxon signed-rank (Pratt) Holm, rank-biserial |
 
+### 1.0. Trọng số bổ sung so với base0
+
+`base0` = `qbase_r0` (MedGemma 4B-it lượng tử 4-bit, không adapter, r = 0): ≈ **4,30 tỉ** tham số logic
+(decoder 3,880 tỉ gồm embedding 0,671 tỉ + 34 lớp; SigLIP vision ≈ 0,417 tỉ; projector ≈ 3 triệu),
+**đóng băng hoàn toàn** ở mọi candidate. Mỗi module tuyến tính `in → out` được gắn thêm
+`r·(in + out)` tham số; cả 7 module của một lớp cộng lại `Σ(in + out) = 54 784`, nhân 34 lớp =
+**1 862 656 · r** (r = 2 khớp số đo trong log: 3 725 312 tham số học, 238 module).
+
+| Candidate | r | tham số bổ sung | % so với base0 (≈ 4,30 tỉ) | % so với decoder (3,88 tỉ) | % so với 238 ma trận đích (3,21 tỉ) | file adapter fp32 |
+|---|---|---|---|---|---|---|
+| `qlora_r2` | 2 | 3 725 312 | 0,087 % | 0,096 % | 0,116 % | ≈ 15 MB |
+| `qlora_r4` | 4 | 7 450 624 | 0,173 % | 0,192 % | 0,232 % | ≈ 30 MB |
+| `qlora_r8` | 8 | 14 901 248 | 0,347 % | 0,384 % | 0,464 % | ≈ 60 MB |
+| `qlora_r16` | 16 | 29 802 496 | 0,693 % | 0,768 % | 0,929 % | ≈ 119 MB |
+| `qlora_r32` | 32 | 59 604 992 | 1,386 % | 1,536 % | 1,858 % | ≈ 238 MB |
+
+Phần trăm tuyến tính theo r (nhân đôi rank = nhân đôi tham số bổ sung). Mẫu số ≈ 4,30 tỉ tính từ kiến
+trúc, không phải số đếm lúc chạy (đếm trực tiếp trên model 4-bit bị lệch vì trọng số nén gói), nên
+cột đầu là xấp xỉ; số tham số bổ sung là chính xác và được ghi lại trong `train_stats.json`
+(`trainable_params`) và bảng 1.1 của `REPORT.md`.
+
 ### 1.1. Quy tắc chọn
 
 1. Rank có **TB RadGraph-F1** cao nhất = *best*.
@@ -102,6 +123,16 @@ tương đối ~1e-7). Kết quả dò lưu ở `train_probe.json` / `infer_prob
 
 Ước lượng thời gian trên RTX 5060 Ti 16 GB (máy của Thí nghiệm 1): sinh 3000 ảnh ≈ 2–3 giờ /
 candidate (×6), huấn luyện vài giờ / rank — tổng cỡ 1–1,5 ngày, chạy tuần tự.
+
+### 2.0. Nhất quán mẫu dữ liệu
+
+Một fixture duy nhất (`data/fixture_lora/`) cho cả 5 rank + tham chiếu: cùng 6400 ảnh train (cùng
+thứ tự xáo theo `seed`), cùng 3000 ảnh test, sinh cùng policy. Để không ai vô tình trộn kết quả từ
+hai lần lấy mẫu khác nhau, mỗi lần `train`/`infer` tính **dấu vân tay dữ liệu** (sha256 danh sách
+key train/test, theo thứ tự), in ra log, và ghi vào `train_stats.json` / `infer_fingerprint.txt`:
+adapter hoặc predictions từ mẫu khác bị từ chối (resume từ Hub, `train`, `infer`, `stats`);
+`data --resample` bị chặn khi đã có kết quả trong `cands/`; `stats` in
+`✓ mọi candidate cùng mẫu dữ liệu`. Kết quả cũ không có dấu vân tay được chấp nhận kèm cảnh báo.
 
 ### 2.1. Log W&B
 

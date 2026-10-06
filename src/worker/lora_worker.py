@@ -636,6 +636,7 @@ def run_train(spec, torch) -> int:
           "epochs": epochs, "selected_epoch": best, "select_rule": rule,
           "epoch_eval": state["epoch_eval"], "n_truncated": enc.n_trunc,
           "n_prompt_tokens": enc.n_prompt, "micro_batch_final": micro,
+          "data_fingerprint": spec.get("data_fingerprint"),
           "minutes_this_run": round((time.time() - t0) / 60, 1),
           "peak_vram_gib": round(peak, 2) if peak else None,
           "final_train_loss_mean_last50": float(np.mean([h["loss"] for h in state["history"][-50:]]))

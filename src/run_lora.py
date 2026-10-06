@@ -101,6 +101,14 @@ def cmd_data(cfg: Cfg, a) -> None:
     from . import sampling
 
     fx = sampling.fixture_dir(cfg)
+    if a.resample and (fx / "testset.jsonl").exists():
+        old = sorted(p.parent.parent.name + "/" + p.parent.name for p in
+                     (run_dir(cfg) / "cands").glob("*/train_stats.json")) if (run_dir(cfg) / "cands").exists() else []
+        old += sorted(p.parent.name for p in (run_dir(cfg) / "cands").glob("*/predictions.jsonl")
+                      if p.parent.name not in old) if (run_dir(cfg) / "cands").exists() else []
+        if old:
+            raise RunFailed(f"--resample sẽ làm các kết quả đã có ({', '.join(old)}) KHÔNG còn cùng mẫu dữ "
+                            f"liệu với fixture mới. Xoá {run_dir(cfg) / 'cands'} (và metrics/) rồi chạy lại.")
     if a.resample or not (fx / "testset.jsonl").exists():
         sampling.build(cfg)
     else:
@@ -141,6 +149,32 @@ def write_tasks(cfg: Cfg, split: str, with_ref: bool) -> Path:
     return p
 
 
+def data_fingerprint(cfg: Cfg) -> str | None:
+    """Dấu vân tay của MẪU DỮ LIỆU: sha256 của danh sách key (đúng thứ tự) của train và test
+    (và val nếu có). Mọi candidate phải train/infer trên cùng một dấu vân tay."""
+    import hashlib
+
+    from . import sampling
+
+    fx = sampling.fixture_dir(cfg)
+    h = hashlib.sha256()
+    for sp in _splits(cfg):
+        f = fx / f"{sp}set.jsonl"
+        if not f.exists():
+            return None
+        keys = [json.loads(l)["key"] for l in open(f, encoding="utf-8") if l.strip()]
+        h.update(f"{sp}:{len(keys)}\n".encode())
+        h.update("\n".join(keys).encode())
+    return h.hexdigest()[:16]
+
+
+def _fp_status(have: str | None, want: str | None, who: str) -> str:
+    """'ok' | 'unknown' (kết quả cũ không ghi dấu vân tay) | 'mismatch'."""
+    if not have:
+        return "unknown"
+    return "ok" if have == want else "mismatch"
+
+
 def common_spec(cfg: Cfg) -> dict:
     return {"base": dict(cfg["base"]), "quant": dict(cfg["quant"]), "lora": dict(cfg["lora"]),
             "dtype": str(cfg.get("dtype", "bfloat16")), "seed": int(cfg.get("seed", 42)),
@@ -173,15 +207,23 @@ def cmd_train(cfg: Cfg, a) -> None:
     _check_dtype(cfg)
     tr = write_tasks(cfg, "train", True)
     va = write_tasks(cfg, "val", True) if "val" in _splits(cfg) else None
+    fp = data_fingerprint(cfg)
+    print(f"  dấu vân tay dữ liệu: {fp}", flush=True)
     for c in candidates(cfg, a.cands, with_ref=False):
         d = cand_dir(cfg, c["id"])
         if a.limit:                       # chạy thử: thư mục riêng, không lẫn với lần chạy thật
             d = d / "dryrun"
             d.mkdir(parents=True, exist_ok=True)
         if (d / "train_stats.json").exists() and (d / "adapter" / "adapter_config.json").exists():
-            print(f"  {c['id']}: đã huấn luyện — bỏ qua (xoá cands/{c['id']}/ để train lại)", flush=True)
+            stt = _fp_status((_jload(d / "train_stats.json") or {}).get("data_fingerprint"), fp, c["id"])
+            if stt == "mismatch":
+                raise RunFailed(f"{c['id']}: adapter đã train trên MẪU DỮ LIỆU KHÁC fixture hiện tại "
+                                f"— xoá cands/{c['id']}/ để train lại, hoặc khôi phục đúng fixture.")
+            print(f"  {c['id']}: đã huấn luyện — bỏ qua (xoá cands/{c['id']}/ để train lại)"
+                  + (" · ⚠ không có dấu vân tay dữ liệu (kết quả cũ)" if stt == "unknown" else ""), flush=True)
             continue
         spec = {**common_spec(cfg), "mode": "train", "candidate": c, "train": dict(cfg["train"]),
+                "data_fingerprint": fp,
                 "train_tasks": str(tr.resolve()), "val_tasks": str(va.resolve()) if va else None,
                 "out_dir": str(d.resolve())}
         p = d / "train_spec.json"
@@ -197,6 +239,8 @@ def cmd_infer(cfg: Cfg, a) -> None:
 
     _check_dtype(cfg)
     te = write_tasks(cfg, "test", False)
+    fp = data_fingerprint(cfg)
+    print(f"  dấu vân tay dữ liệu: {fp}", flush=True)
     for c in candidates(cfg, a.cands):
         d = cand_dir(cfg, c["id"])
         if a.limit:                       # chạy thử: dùng adapter chạy thử, ghi vào dryrun/
@@ -208,6 +252,16 @@ def cmd_infer(cfg: Cfg, a) -> None:
             if not (adapter / "adapter_config.json").exists():
                 raise RunFailed(f"{c['id']}: chưa có adapter — chạy `train` trước"
                                 + (" (chạy thử: `train --limit N` trước)." if a.limit else "."))
+            stt = _fp_status((_jload(cand_dir(cfg, c["id"]) / "train_stats.json") or {}).get("data_fingerprint")
+                             if not a.limit else fp, fp, c["id"])
+            if stt == "mismatch":
+                raise RunFailed(f"{c['id']}: adapter train trên mẫu dữ liệu khác fixture hiện tại — "
+                                f"không infer (sẽ lệch tập test/train).")
+        ifp = d / "infer_fingerprint.txt"
+        if (d / "predictions.jsonl").exists() and ifp.exists() and ifp.read_text().strip() != fp:
+            raise RunFailed(f"{c['id']}: predictions.jsonl có từ MẪU TEST KHÁC fixture hiện tại — "
+                            f"xoá {d / 'predictions.jsonl'} (và metrics/per_sample_{c['id']}.csv) rồi infer lại.")
+        ifp.write_text(str(fp), encoding="utf-8")
         spec = {**common_spec(cfg), "mode": "infer", "candidate": c,
                 "adapter_dir": str(adapter.resolve()) if adapter else None,
                 "generate": policy(cfg),
@@ -306,6 +360,20 @@ def cmd_stats(cfg: Cfg, a) -> None:
     seed = int(cfg.get("seed", 42))
     test = sampling.load(cfg, "test")
     keys = test["key"].tolist()
+
+    fp = data_fingerprint(cfg)
+    bad = []
+    for c in cs:
+        d = cand_dir(cfg, c["id"])
+        if not c["reference"]:
+            if _fp_status((_jload(d / "train_stats.json") or {}).get("data_fingerprint"), fp, c["id"]) == "mismatch":
+                bad.append(f"{c['id']}: train")
+        f = d / "infer_fingerprint.txt"
+        if f.exists() and f.read_text().strip() != fp:
+            bad.append(f"{c['id']}: infer")
+    if bad:
+        raise RunFailed("các candidate KHÔNG cùng mẫu dữ liệu: " + "; ".join(bad))
+    print(f"  ✓ mọi candidate cùng mẫu dữ liệu (dấu vân tay {fp})", flush=True)
 
     scores = {}
     for cid in all_ids:
@@ -449,9 +517,15 @@ def scan(cfg: Cfg, quiet: bool = False) -> dict:
 
 
 def _same_setup(cfg: Cfg, hub_stats: dict | None, c: dict) -> bool:
-    """Kết quả trên Hub chỉ được dùng lại nếu cùng rank/α và cùng lịch huấn luyện."""
+    """Kết quả trên Hub chỉ được dùng lại nếu cùng rank/α, cùng lịch huấn luyện và cùng MẪU
+    DỮ LIỆU (dấu vân tay; kết quả cũ không có dấu vân tay thì chấp nhận kèm cảnh báo)."""
     if not hub_stats:
         return False
+    stt = _fp_status(hub_stats.get("data_fingerprint"), data_fingerprint(cfg), c["id"])
+    if stt == "mismatch":
+        return False
+    if stt == "unknown":
+        print(f"  ⚠ {c['id']}: kết quả trên Hub không có dấu vân tay dữ liệu — dùng vì cùng cấu hình", flush=True)
     hc = hub_stats.get("candidate") or {}
     keys = ("epochs", "effective_batch", "lr_max", "lr_min", "warmup_frac", "weight_decay",
             "max_seq_len", "select_checkpoint")
@@ -509,8 +583,11 @@ def sync_from_hub(cfg: Cfg) -> None:
             else:
                 print(f"  ⚠ {c['id']}: adapter trên Hub khác cấu hình hiện tại — không dùng lại", flush=True)
         hp, lp = hd / "predictions.jsonl", d / "predictions.jsonl"
-        if hp.exists() and len(_nlines_keys(hp)) > len(_nlines_keys(lp)):
-            for f in ("predictions.jsonl", "worker_meta.json", "infer_probe.json"):
+        hfp = (hd / "infer_fingerprint.txt").read_text().strip() if (hd / "infer_fingerprint.txt").exists() else None
+        if hp.exists() and _fp_status(hfp, data_fingerprint(cfg), c["id"]) == "mismatch":
+            print(f"  ⚠ {c['id']}: predictions trên Hub từ mẫu test khác — không dùng lại", flush=True)
+        elif hp.exists() and len(_nlines_keys(hp)) > len(_nlines_keys(lp)):
+            for f in ("predictions.jsonl", "worker_meta.json", "infer_probe.json", "infer_fingerprint.txt"):
                 if (hd / f).exists():
                     shutil.copy2(hd / f, d / f)
             got.append(f"{c['id']}:infer")
