@@ -23,3 +23,4 @@ einops
 pyarrow
 regex
 requests
+hf_transfer
