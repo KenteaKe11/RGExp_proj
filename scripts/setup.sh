@@ -6,16 +6,14 @@
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
 #     RGEXP_UPGRADE_TORCH=1 bash scripts/setup.sh   # nâng torch thay vì ghim transformers
 #
-# BA môi trường python, vì hai ràng buộc loại trừ nhau:
+# HAI môi trường python, vì hai ràng buộc loại trừ nhau:
 #   chính            transformers 4.51/4.52 — MedGemma (Gemma 3)
 #                    và mọi khâu data / chấm điểm / thống kê
 #   .venv-chexagent  transformers==4.40.0 — remote code của CheXagent-2 `assert`
 #                    đúng phiên bản này. Dựng bằng --system-site-packages (khi
 #                    môi trường chính là python hệ thống) để dùng lại torch đã
 #                    khớp CUDA, chỉ đè transformers/tokenizers.
-#   .venv-llavamed   transformers==4.37.2 + package `llava` của microsoft/LLaVA-Med
-#                    (checkpoint gốc microsoft/llava-med-v1.5-mistral-7b, kiến trúc llava_mistral)
-#     RGEXP_SKIP_CHEXAGENT_VENV=1 / RGEXP_SKIP_LLAVAMED_VENV=1   bỏ qua venv tương ứng
+#     RGEXP_SKIP_CHEXAGENT_VENV=1   bỏ qua bước dựng venv CheXagent
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -25,7 +23,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §3 Backbone y khoa (CheXagent-2 · MedGemma · LLaVA-Med) — setup ═══"
+echo "═══ §3 Backbone y khoa (CheXagent-2 · MedGemma) — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -179,7 +177,7 @@ else
 fi
 
 # ── 5. requirements (môi trường chính) ──────────────────────────────────────
-for f in requirements.txt requirements-chexagent.txt requirements-llavamed.txt configs/backbone.yaml \
+for f in requirements.txt requirements-chexagent.txt configs/backbone.yaml \
          src/run_backbone.py src/worker/infer_worker.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
@@ -223,34 +221,6 @@ else
     "$CXPY" -m pip install -q -r requirements-chexagent.txt
     "$CXPY" -c "import transformers, torch, albumentations, cv2, einops; assert transformers.__version__ == '4.40.0', transformers.__version__; print('✓ venv CheXagent: transformers', transformers.__version__, '· torch', torch.__version__)" \
         || { echo "✗ venv CheXagent chưa dùng được — đọc lỗi pip ở trên."; exit 1; }
-fi
-
-# ── 6b. venv LLaVA-Med gốc (transformers==4.37.2 + package llava) ─────────────
-LM_VENV="$RGEXP_ROOT/.venv-llavamed"
-if [ "${RGEXP_SKIP_LLAVAMED_VENV:-0}" = "1" ]; then
-    echo "⊘ RGEXP_SKIP_LLAVAMED_VENV=1 — bỏ qua venv LLaVA-Med"
-else
-    if [ ! -x "$LM_VENV/bin/python" ]; then
-        BASE_PY="$PYBIN"
-        if [ "$USE_VENV" = "1" ]; then
-            BASE_PY="$("$PYBIN" -c 'import sys; print(sys.base_prefix)')/bin/python3"
-            [ -x "$BASE_PY" ] || BASE_PY="$PY"
-        fi
-        "$BASE_PY" -m venv --system-site-packages "$LM_VENV"
-        echo "✓ tạo $LM_VENV"
-    else
-        echo "✓ $LM_VENV đã có, dùng lại"
-    fi
-    LMPY="$LM_VENV/bin/python"
-    if ! "$LMPY" -c "import torch" 2>/dev/null; then
-        "$LMPY" -m pip install -q torch torchvision --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
-    fi
-    echo "→ cài requirements-llavamed.txt vào $LM_VENV ..."
-    "$LMPY" -m pip install -q -r requirements-llavamed.txt
-    # --no-deps: package llava ghim cả torch/transformers; ta đã có bản đúng ở trên
-    "$LMPY" -m pip install -q --no-deps "git+https://github.com/microsoft/LLaVA-Med.git"
-    "$LMPY" -c "import transformers, llava; from llava.model import LlavaMistralForCausalLM; assert transformers.__version__ == '4.37.2', transformers.__version__; print('✓ venv LLaVA-Med: transformers', transformers.__version__)" \
-        || { echo "✗ venv LLaVA-Med chưa dùng được — đọc lỗi pip ở trên."; exit 1; }
 fi
 
 # ── 7. Nạp trước model chấm (BERTScore + RadGraph) ──────────────────────────
@@ -297,6 +267,6 @@ echo
 echo "  export HF_TOKEN=hf_xxxxxxxx      # BẮT BUỘC (repo dữ liệu private + medgemma gated)"
 echo "  python scripts/selftest_backbone.py         # vài giây, không cần GPU"
 echo "  bash scripts/run_backbone.sh data           # lấy mẫu 6400/3000 + tải ảnh test"
-echo "  bash scripts/run_backbone.sh infer --limit 8  # thử lần lượt 3 candidate trên 8 ảnh"
+echo "  bash scripts/run_backbone.sh infer --limit 8  # thử lần lượt 2 candidate trên 8 ảnh"
 echo "  bash scripts/run_backbone.sh all --detach   # chạy thật (nền)"
 echo

@@ -86,7 +86,7 @@ def per_label(S: np.ndarray, y: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 
 def evaluate(scores: dict[str, np.ndarray], y: np.ndarray, v: np.ndarray,
-             names: list[str], n_boot: int, seed: int) -> dict:
+             names: list[str], n_boot: int, seed: int, n_perm: int = 0) -> dict:
     """scores: {cand: (N, L)}. Trả bảng per-label, macro + CI, hiệu số cặp + CI."""
     cands = list(scores)
     N = y.shape[0]
@@ -119,6 +119,23 @@ def evaluate(scores: dict[str, np.ndarray], y: np.ndarray, v: np.ndarray,
             pairs.append({"a": a, "b": b,
                           "diff": macro[a]["macro_auc"] - macro[b]["macro_auc"],
                           "ci95": [float(lo), float(hi)],
-                          "p_boot_two_sided": float(min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean()))),
+                          "p_boot_two_sided": float(min(1.0, 2 * min(((d <= 0).sum() + 1) / (n_boot + 1), ((d >= 0).sum() + 1) / (n_boot + 1)))),
                           "n_boot": int(n_boot)})
+            if n_perm > 0:
+                # Permutation ghép cặp: hoán đổi điểm của A và B trong TỪNG ảnh (H0: hai
+                # candidate hoán đổi được), tính lại hiệu macro-AUC.
+                obs = abs(pairs[-1]["diff"])
+                cnt = 0
+                for _ in range(n_perm):
+                    sw = rng.random(N) < 0.5
+                    Sa = np.where(sw[:, None], scores[b], scores[a])
+                    Sb = np.where(sw[:, None], scores[a], scores[b])
+                    dd = np.nanmean(per_label(Sa, y, v)) - np.nanmean(per_label(Sb, y, v))
+                    cnt += abs(dd) >= obs - 1e-15
+                pairs[-1]["p_perm"] = float((cnt + 1) / (n_perm + 1))
+                pairs[-1]["n_perm"] = int(n_perm)
+    if n_perm > 0 and pairs:
+        from .stats_resample import holm
+        for pr, ph_ in zip(pairs, holm(np.array([q["p_perm"] for q in pairs]))):
+            pr["p_perm_holm"] = float(ph_)
     return {"per_label": table, "macro": macro, "pairs": pairs}

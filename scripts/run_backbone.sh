@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# run_backbone.sh — §3 chọn backbone baseline (CheXagent-2 · MedGemma · LLaVA-Med)
+# run_backbone.sh — §3 chọn backbone baseline (CheXagent-2 · MedGemma)
 #
 #     bash scripts/run_backbone.sh data  [--resample] [--with-train]   # lấy mẫu + ảnh test
 #     bash scripts/run_backbone.sh infer [--cands a,b] [--limit 8]     # sinh + vision token
 #     bash scripts/run_backbone.sh score [--cands a,b] [--rescore]     # BLEU/ROUGE/BERTScore/RadGraph
-#     bash scripts/run_backbone.sh stats                               # AUC + Friedman/Holm -> REPORT.md
+#     bash scripts/run_backbone.sh stats                               # AUC + bootstrap/permutation -> REPORT.md
 #     bash scripts/run_backbone.sh push  [--plan]                      # -> Hub dataset RGExp123/Research_v2:baseline/
 #     bash scripts/run_backbone.sh all   [--detach]                    # data -> infer -> score -> stats
 #

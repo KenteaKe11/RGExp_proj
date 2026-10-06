@@ -1,4 +1,4 @@
-# RGExp — §3 Chọn backbone baseline cho MIMIC-CXR (thí nghiệm sạch)
+# RGExp — §3 Chọn backbone baseline cho MIMIC-CXR (thí nghiệm sạch, 2 candidate)
 
 > Mọi thí nghiệm trước đã sang `_archive/`. Thí nghiệm vừa đóng lại là §2.2.x
 > V-Extractor (Gemma 3 + DINOv3 + CnA/SNOP-MHA): toàn bộ code, config, script,
@@ -17,14 +17,6 @@ cắt giảm.
 |---|---|---|---|
 | CheXagent-2 3B | G1 — pretrain X-quang | `StanfordAIMI/CheXagent-2-3b` | `.venv-chexagent` (transformers **4.40.0**) |
 | MedGemma 4B-it | G1 — pretrain X-quang | `google/medgemma-4b-it` | chính (transformers 4.51/4.52) |
-| LLaVA-Med v1.5 7B | G2 — pretrain y khoa | `microsoft/llava-med-v1.5-mistral-7b` (checkpoint gốc) | `.venv-llavamed` (transformers **4.37.2** + package `llava`) |
-
-> **LLaVA-Med:** dùng checkpoint gốc `microsoft/llava-med-v1.5-mistral-7b` (kiến trúc
-> `llava_mistral`, nạp bằng package `llava` của microsoft/LLaVA-Med trong venv riêng).
-> Ảnh đi qua `process_images` của CLIP processor gốc (pad vuông + resize 336), prompt dựng
-> theo conversation template `mistral_instruct` của repo gốc. Worker này xử lý **từng ảnh một**
-> (batch 1) vì pipeline gốc không hỗ trợ batch ổn định; builder gốc ép fp16, ghi lại ở
-> `worker_meta.json` (`dtype_actual`).
 
 > **CheXagent-2** không có `AutoProcessor`: ảnh đi qua transform gốc nằm trong model
 > (`Resize 512 bicubic` + chuẩn hoá SigLIP), đường dẫn ảnh được nhúng vào prompt theo
@@ -39,11 +31,11 @@ cắt giảm.
 | **Dữ liệu** | 6400 train / 3000 test từ `RGExp123/MIMIC_CXR_cleaned`, lấy mẫu mới (§3) |
 | **Sàng lọc** | (a) mọi nhãn có ca dương trong mỗi tập (≥ 30 test, ≥ 60 train); (b) số ca dương các nhãn **ít lệch nhất**; (c) **không có 2 ảnh cùng một bệnh nhân** trên cả train ∪ test |
 | **Ảnh** | repo đã đồng bộ 512² vuông; resize về cỡ của từng model do **processor gốc** của nhà sản xuất |
-| **dtype** | `bfloat16` cho cả ba (trọng số + pixel_values); nếu builder gốc ép khác thì ghi ở `dtype_actual` |
+| **dtype** | `bfloat16` cho cả hai (trọng số + pixel_values) |
 | **Prompt** | MỘT prompt gốc (§1.4), đóng gói theo chat template riêng của từng model |
 | **Giải mã** | `do_sample=False, num_beams=4, max_new_tokens=200, repetition_penalty=1.08, length_penalty=0.8, early_stopping=True, no_repeat_ngram_size=0` |
 | **Metric** | Alignment AUC-ROC (vision token ↔ nhãn) · BLEU-1..4 · ROUGE-1/2/L · BERTScore-F1 · RadGraph-F1 |
-| **Thống kê** | Friedman (ties Conover, F Iman-Davenport, Holm trên các metric) + hậu kiểm Wilcoxon signed-rank ghép cặp (Pratt), **Holm** trong từng metric |
+| **Thống kê** | **Bootstrap + Permutation** ghép cặp theo ảnh (CI95 percentile, sign-flip p = (k+1)/(B+1)), Holm trên các metric của từng cặp, effect size Cohen's dz |
 
 ### 2.1. Lấy mẫu (`src/sampling.py`)
 
@@ -60,7 +52,7 @@ tính nhãn nào. Dương tính = lớp `pos` (uncertain không tính).
 Kết quả khoá cứng ở `data/fixture_backbone/` (`testset.jsonl`, `trainset.jsonl`,
 `labels.json`, `sampling_report.json` — gồm độ lệch nhãn so với lấy ngẫu nhiên một
 ảnh/bệnh nhân). Có fixture thì `data` không lấy mẫu lại (trừ `--resample`).
-Thứ tự test = thứ tự key = thứ tự khối của Friedman.
+Thứ tự test = thứ tự key = thứ tự khối ghép cặp.
 
 > Lưu ý: nhãn rất hiếm (vd *Pleural Other*, *Fracture*) có thể cạn trong hồ trước khi
 > các nhãn khác đạt cùng mức — khi đó "ít lệch nhất" nghĩa là các nhãn còn lại dừng ở
@@ -75,14 +67,13 @@ resampler):
 |---|---|---|
 | CheXagent-2 | `model.model.visual.encode(...)` | 1024 × 2560 |
 | MedGemma | `get_image_features(pixel_values)` | 256 × 2560 |
-| LLaVA-Med (gốc) | `model.encode_images(images)` (sau mm_projector) | 576 × 4096 |
 
 Embedding nhãn = trung bình các hàng của **bảng input-embedding của decoder** ứng với
 subword của tên nhãn → cùng không gian với vision token. Điểm (ảnh, nhãn) = **trung bình
 top-5% cosine** giữa nhãn và các vision token (Top-5% Mean Pooling); `mean`/`max` được
 ghi kèm để đối chiếu. Với mỗi nhãn: AUC = P(s₊ > s₋) — dương = `pos`, âm = `neg` + `nan`
 (không nhắc tới), `uncertain` bị loại. Báo cáo macro-AUC + CI95 bootstrap theo ảnh,
-hiệu số ghép cặp, và Friedman/Wilcoxon/Holm với khối = nhãn.
+hiệu số ghép cặp (bootstrap CI + permutation hoán đổi điểm A/B trong từng ảnh, Holm).
 
 > Đã xác nhận: "Top-5% Mean Pooling" dùng cho **AUC** (gộp điểm token → điểm ảnh); RadGraph F1
 > không có bước pooling token. Đổi ở `alignment.topk_frac`.
@@ -112,11 +103,11 @@ cách này. Khoá hạ tầng cũ (`infer.batch_size`, `gpu_config`, ...) bị t
 ```bash
 export HF_TOKEN=hf_xxxxxxxx                    # repo dữ liệu private + medgemma gated
 
-bash scripts/setup.sh                          # môi trường chính + .venv-chexagent + .venv-llavamed (một lần)
+bash scripts/setup.sh                          # môi trường chính + .venv-chexagent (một lần)
 python scripts/selftest_backbone.py            # vài giây, không cần GPU
 
 bash scripts/run_backbone.sh data              # lấy mẫu 6400/3000 + tải 3000 ảnh test
-bash scripts/run_backbone.sh infer --limit 8   # thử lần lượt 3 candidate trên 8 ảnh
+bash scripts/run_backbone.sh infer --limit 8   # thử lần lượt 2 candidate trên 8 ảnh
 bash scripts/run_backbone.sh all --detach      # data -> infer ×3 -> score -> stats (nền)
 bash scripts/run_backbone.sh push              # -> dataset RGExp123/Research_v2, thư mục baseline/
 ```
@@ -126,7 +117,7 @@ bash scripts/run_backbone.sh push              # -> dataset RGExp123/Research_v2
 | `data` | **Lần đầu dò mẫu, lần sau dùng lại manifest**: dựng fixture (nếu chưa có) rồi chỉ đọc lại `data/fixture_backbone/`; tải ảnh test. `--resample` dựng lại; `--with-train` tải cả 6400 ảnh train |
 | `infer` | lần lượt từng candidate (đúng python của nó) → `predictions.jsonl` + `align.jsonl` + `probe.json`. Đứt giữa chừng → chạy lại là đi tiếp. `--cands a,b`, `--limit N` |
 | `score` | điểm theo mẫu → `metrics/per_sample_<id>.csv`. `--rescore` |
-| `stats` | AUC + Friedman/Holm → `REPORT.md` (ghi đè), `summary.csv`, `friedman_tests.csv`, `posthoc_tests.csv`, `auc_*.csv`, `manifest.json` (gồm cả `probes`) |
+| `stats` | AUC + bootstrap/permutation → `REPORT.md` (ghi đè), `summary.csv`, `paired_tests.csv`, `auc_paired_tests.csv`, `auc_per_label_*.csv`, `manifest.json` (gồm cả `probes`) |
 | `push` | tạo dataset repo `RGExp123/Research_v2` (private) nếu chưa có, đẩy `runs/backbone/` → `baseline/Reports/` và fixture → `baseline/fixture/`. `--plan` chỉ in |
 
 > Hub không cho tên repo có khoảng trắng nên "Research v2" → `Research_v2`. Đổi ở
@@ -143,13 +134,13 @@ configs/backbone.yaml        nội dung thí nghiệm (dữ liệu, candidate, p
 scripts/setup.sh · run_backbone.sh · selftest_backbone.py · _env.sh
 src/run_backbone.py          điểm vào: data · infer · score · stats · push · all
 src/sampling.py              sàng lọc + lấy mẫu + fixture
-src/worker/infer_worker.py   worker ĐỘC LẬP (transformers 4.37 / 4.40 / 4.52): dò phần cứng, tự chọn batch, sinh + vision token
+src/worker/infer_worker.py   worker ĐỘC LẬP (transformers 4.40 / 4.52): dò phần cứng, tự chọn batch, sinh + vision token
 src/alignment.py             AUC-ROC theo nhãn, macro, bootstrap
 src/metrics.py               tiền xử lý + BLEU / ROUGE / BERTScore / RadGraph
-src/stats_friedman.py        Friedman + Wilcoxon + Holm
+src/stats_resample.py        bootstrap + permutation ghép cặp + Holm
 src/report.py                REPORT.md
 src/decoding.py              policy giải mã (kiểm chặt)
 src/data.py · labels_cls.py · imaging.py · hw.py · config.py   dùng lại từ các mục trước
-requirements.txt · requirements-chexagent.txt · requirements-llavamed.txt
+requirements.txt · requirements-chexagent.txt
 _archive/                    mọi thí nghiệm trước (§2.0–§2.5, $1 LoRA, §2.2.x V-Extractor)
 ```

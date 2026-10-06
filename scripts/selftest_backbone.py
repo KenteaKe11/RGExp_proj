@@ -6,7 +6,7 @@ Kiểm những chỗ hỏng ÂM THẦM (ra số mà sai), không kiểm model:
   2. tiền xử lý metric đúng 5 bước, đúng thứ tự
   3. lấy mẫu: mỗi bệnh nhân một ảnh, cân bằng hơn hẳn ngẫu nhiên, chia đúng cỡ
   4. AUC = định nghĩa cặp (P(s+ > s−) + ½ ties)
-  5. Friedman không ties = công thức cổ điển (và = scipy nếu có)
+  5. bootstrap + permutation ghép cặp: p/CI đúng trên dữ liệu có/không có hiệu ứng; Holm
   6. worker độc lập với package `src`; top-k cosine đúng; dò phần cứng / max_memory / OOM
   7. REPORT dựng được từ dữ liệu giả
   8. không file nào trong src/ import sang _archive/
@@ -62,9 +62,7 @@ def t01_config_and_policy():
             "repetition_penalty": 1.08, "length_penalty": 0.8, "early_stopping": True}
     assert p == want, p
     ids = [c["id"] for c in cfg["candidates"]]
-    assert ids == ["chexagent2_3b", "medgemma_4b", "llavamed15_7b"], ids
-    lm = [c for c in cfg["candidates"] if c["id"] == "llavamed15_7b"][0]
-    assert lm["hf_id"] == "microsoft/llava-med-v1.5-mistral-7b" and lm["family"] == "llava_orig"
+    assert ids == ["chexagent2_3b", "medgemma_4b"], ids
     assert str(cfg["dtype"]) == "bfloat16"
     u = cfg["prompt"]["user"].strip().splitlines()
     assert u == ["Write the radiology report for this chest X-ray.",
@@ -180,22 +178,26 @@ def t04_auc():
 
 
 @case
-def t05_friedman():
-    from src import stats_friedman as sf
+def t05_resample_stats():
+    from src import stats_resample as sr
 
     rng = np.random.default_rng(4)
-    X = rng.random((50, 3)) + np.array([0, .1, .2])
-    r = sf.friedman(X)
-    R = sf.rank_within_blocks(X).sum(0)
-    n, k = X.shape
-    chi = 12 / (n * k * (k + 1)) * (R ** 2).sum() - 3 * n * (k + 1)
-    assert abs(r["chi2"] - chi) < 1e-9, (r["chi2"], chi)
-    try:
-        from scipy.stats import friedmanchisquare
-        assert abs(friedmanchisquare(*X.T).statistic - chi) < 1e-9
-    except ImportError:
-        pass
-    assert abs(sf.holm(np.array([0.01, 0.04, 0.03]))[0] - 0.03) < 1e-12
+    d1 = rng.normal(0.3, 1.0, 400)                      # có hiệu ứng
+    r1 = sr.paired_resample(d1, 2000, 2000, np.random.default_rng(1))
+    assert r1["p_perm"] < 0.01 and r1["p_boot"] < 0.01, r1
+    assert r1["ci_lo"] < d1.mean() < r1["ci_hi"] and r1["ci_lo"] > 0, r1
+    d0 = rng.normal(0.0, 1.0, 400)                      # H0 đúng
+    ps = [sr.paired_resample(rng.normal(0, 1, 200), 200, 400, np.random.default_rng(i))["p_perm"]
+          for i in range(60)]
+    assert 0.3 < float(np.mean(ps)) < 0.7 and float(np.mean(np.array(ps) < 0.05)) < 0.2, np.mean(ps)
+    assert sr.paired_resample(np.zeros(50), 200, 200, np.random.default_rng(0))["p_perm"] == 1.0
+    assert abs(sr.holm(np.array([0.01, 0.04, 0.03]))[0] - 0.03) < 1e-12
+    scores = {c: pd.DataFrame({"key": [f"k{i}" for i in range(200)],
+                               "m1": rng.random(200) + 0.3 * j, "m2": rng.random(200)})
+              for j, c in enumerate(("a", "b"))}
+    cmp = sr.compare_all(scores, ["m1", "m2"], {"n_boot": 500, "n_perm": 500}, 0)
+    assert len(cmp) == 2 and cmp.set_index("metric").loc["m1", "winner"] == "b"
+    assert cmp.set_index("metric").loc["m2", "winner"] == "—"
 
 
 @case
@@ -207,7 +209,7 @@ def t06_worker_standalone():
             raise AssertionError(f"worker import {node.module!r} — phải độc lập với src/")
     sys.path.insert(0, str(ROOT / "src" / "worker"))
     import infer_worker as W
-    assert set(W.ADAPTERS) == {"gemma3", "llava_orig", "chexagent"}
+    assert set(W.ADAPTERS) == {"gemma3", "chexagent"}
     try:
         import torch
     except ImportError:
@@ -244,31 +246,26 @@ def t07_report():
     summary = pd.DataFrame([{"candidate": c, **{m: 0.1 * (i + 1) for m in tm},
                              "mean_words_pred": 40, "mean_words_ref": 50, "n_empty": 0}
                             for i, c in enumerate(ids)])
-    from src import stats_friedman as sf
+    from src import stats_resample as sr
     rng = np.random.default_rng(5)
     scores = {c: pd.DataFrame({"key": [f"k{i}" for i in range(60)],
                                **{m: rng.random(60) + 0.05 * j for m in tm}})
               for j, c in enumerate(ids)}
-    fr = sf.friedman_all(scores, tm, cfg["stats"])
-    ph = sf.posthoc_all(scores, tm, cfg["stats"], gate=None)
-    from src.run_backbone import _apply_scope
-    ph = _apply_scope(ph, dict(cfg["stats"]))
+    cmp = sr.compare_all(scores, tm, {"n_boot": 200, "n_perm": 200}, 0)
     names = ["A", "B"]
     tab = pd.DataFrame([{"label": n, "n_pos": 5, "n_neg": 9, **{c: .6 for c in ids}} for n in names])
     res = {p: {"per_label": tab, "macro": {c: {"macro_auc": .6, "ci95": [.5, .7]} for c in ids},
                "pairs": [{"a": ids[0], "b": ids[1], "diff": 0, "ci95": [-.1, .1],
-                          "p_boot_two_sided": 1.0}]} for p in ("top5", "mean", "max")}
-    afs = {c: pd.DataFrame({"key": names, "auc_top5": [.6, .7 + .01 * j]}) for j, c in enumerate(ids)}
-    afr = sf.friedman_all(afs, ["auc_top5"], cfg["stats"])
-    aph = _apply_scope(sf.posthoc_all(afs, ["auc_top5"], cfg["stats"], gate=None), dict(cfg["stats"]))
+                          "p_boot_two_sided": 1.0, "p_perm": 1.0, "p_perm_holm": 1.0}]}
+           for p in ("top5", "mean", "max")}
     srep = {"pool_images": 10, "pool_patients": 9, "n_train": 6400, "n_test": 3000, "seed": 42,
             "labels": names,
             "positives": {"test": {"A": 1, "B": 2}, "train": {"A": 3, "B": 4}},
             "imbalance": {s: {"max_over_min": 1.0, "cv": 0.0, "norm_entropy": 1.0}
                           for s in ("test", "train")},
             "imbalance_random_baseline": {"max_over_min": 9.0, "cv": 0.8, "norm_entropy": .8}}
-    md = report.render(cfg, cs, summary, fr, ph, res, "top5", afr, aph, srep, {}, tm, None)
-    assert "Alignment AUC-ROC" in md and "Friedman" in md and "RadGraph" in md
+    md = report.render(cfg, cs, summary, cmp, res, "top5", srep, {}, tm, None)
+    assert "Alignment AUC-ROC" in md and "permutation" in md and "RadGraph" in md
 
 
 @case

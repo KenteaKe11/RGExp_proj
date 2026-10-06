@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Môi trường CHÍNH của §3: MedGemma + LLaVA-Med (HF) + data / chấm / thống kê.
+# Môi trường CHÍNH của §3: MedGemma + data / chấm / thống kê.
 # torch do scripts/setup.sh cài theo CUDA của máy, không ghim ở đây.
 # CheXagent-2 chạy ở venv riêng — requirements-chexagent.txt.
 # ─────────────────────────────────────────────────────────────────────────────

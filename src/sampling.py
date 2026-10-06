@@ -393,7 +393,7 @@ def build(cfg: Cfg) -> dict:
             {"key": k, "ref": refs[k], "patient": str(p),
              "labels": label_state(H[pick[i]], names)})
     for s in rows:
-        rows[s].sort(key=lambda r: r["key"])        # thứ tự khối Friedman = thứ tự key
+        rows[s].sort(key=lambda r: r["key"])        # thứ tự khối ghép cặp = thứ tự key
         with open(fx / f"{s}set.jsonl", "w", encoding="utf-8") as f:
             for r in rows[s]:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")

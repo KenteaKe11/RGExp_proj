@@ -2,13 +2,11 @@
 """Worker sinh báo cáo + đo vision token — MỘT file, chạy ĐỘC LẬP với package `src`.
 
 Vì sao độc lập: CheXagent-2 ghim `transformers==4.40.0` (remote code `assert` đúng
-phiên bản), LLaVA-Med gốc (`llava_mistral`) cần package `llava` + transformers
-4.37.2, còn MedGemma đòi >= 4.50. Ba ràng buộc loại trừ nhau -> ba môi trường
-python. Worker chỉ dùng stdlib + numpy + torch + PIL + transformers (+ `llava` cho
-LLaVA-Med), nên cùng một file chạy được ở cả ba:
+phiên bản), còn MedGemma đòi >= 4.50. Hai ràng buộc loại trừ nhau -> hai môi
+trường python. Worker chỉ dùng stdlib + numpy + torch + PIL + transformers, nên
+cùng một file chạy được ở cả hai:
 
     .venv-chexagent/bin/python src/worker/infer_worker.py --spec spec.json   (CheXagent, tf 4.40.0)
-    .venv-llavamed/bin/python  src/worker/infer_worker.py --spec spec.json   (LLaVA-Med gốc, tf 4.37.2)
     python                     src/worker/infer_worker.py --spec spec.json   (MedGemma)
 
 Hợp đồng với bên ngoài chỉ là file:
@@ -32,7 +30,6 @@ Vision token ở đây là đúng tensor được chèn vào chuỗi embedding c
 trên CÙNG pixel_values mà processor đưa cho generate:
     chexagent  model.model.visual.encode([path])     (1024 × 2560)
     gemma3     model.get_image_features(pixel_values)  (256 × 2560)
-    llava      model.get_image_features(pixel_values, layer, strategy) (576 × 4096)
 Embedding nhãn = trung bình các hàng `get_input_embeddings()` của subword tên
 nhãn (Gemma: kèm hệ số scale của chính lớp embedding — cosine không đổi).
 Điểm (ảnh, nhãn) = trung bình top-k cosine, k = ceil(topk_frac · n_vis).
@@ -313,135 +310,6 @@ class Gemma3Adapter:
         return self.tok.pad_token_id
 
 
-class LlavaOrigAdapter:
-    """LLaVA-Med v1.5 7B GỐC (microsoft/llava-med-v1.5-mistral-7b, llava_mistral).
-
-    Dùng package `llava` của microsoft/LLaVA-Med: tokenizer, image processor
-    (`process_images`, image_aspect_ratio=pad), conversation `mistral_instruct`
-    đều là của nhà sản xuất. Chạy TỪNG ẢNH MỘT: `prepare_inputs_labels_for_multimodal`
-    của nó gộp/đệm lại chuỗi theo kiểu riêng, không an toàn với batch padding."""
-
-    batch_cap = 1
-
-    def __init__(self, spec, dtype):
-        import inspect
-
-        import torch
-        from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-        from llava.conversation import conv_templates
-        from llava.mm_utils import (get_model_name_from_path, process_images,
-                                    tokenizer_image_token)
-        from llava.model.builder import load_pretrained_model
-        from transformers import PreTrainedModel
-
-        c = spec["candidate"]
-        self.torch, self.dtype = torch, dtype
-        self.DEFAULT_IMAGE_TOKEN, self.IMAGE_TOKEN_INDEX = DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-        self.process_images, self.tokenizer_image_token = process_images, tokenizer_image_token
-        mode = c.get("conv_mode") or "mistral_instruct"
-        if mode not in conv_templates:
-            mode = "mistral_instruct" if "mistral_instruct" in conv_templates else next(iter(conv_templates))
-        self.conv_t = conv_templates[mode]
-        self.system, self.user = c.get("system"), spec["user_prompt"]
-
-        # Chữ ký `load_pretrained_model` khác nhau giữa các bản LLaVA -> chỉ truyền
-        # những gì nó nhận. KHÔNG lượng tử hoá (đổi đúng thứ đang đo).
-        accepted = set(inspect.signature(load_pretrained_model).parameters)
-        kw = {k: v for k, v in (("device_map", "auto"), ("load_8bit", False),
-                                ("load_4bit", False), ("use_flash_attn", False))
-              if k in accepted}
-        # Builder không nhận max_memory -> chèn vào mọi from_pretrained có device_map.
-        mm = spec["max_memory"]
-        orig = PreTrainedModel.from_pretrained.__func__
-
-        def patched(cls, *a, **k):
-            if "device_map" in k and "max_memory" not in k:
-                k["max_memory"] = mm
-            return orig(cls, *a, **k)
-
-        PreTrainedModel.from_pretrained = classmethod(patched)
-        try:
-            self.tok, self.model, self.image_processor, _ = load_pretrained_model(
-                model_path=c["hf_id"], model_base=None,
-                model_name=get_model_name_from_path(c["hf_id"]), **kw)
-        finally:
-            PreTrainedModel.from_pretrained = classmethod(orig)
-        self.model.eval()
-        # Builder ÉP float16. Đồng bộ về dtype chung khi toàn model nằm trên GPU;
-        # nếu có lớp bị đẩy sang CPU/đĩa thì accelerate không cho đổi dtype -> giữ
-        # nguyên và GHI RÕ (`dtype_actual` trong worker_meta.json).
-        dm = getattr(self.model, "hf_device_map", None) or {}
-        offloaded = any(str(v) in ("cpu", "disk") for v in dm.values())
-        if not offloaded:
-            try:
-                self.model = self.model.to(dtype)
-            except Exception as e:  # noqa: BLE001
-                log(f"  ⚠ không đổi được dtype -> {dtype}: {e}")
-        self.dtype_actual = next(self.model.parameters()).dtype
-        if self.dtype_actual != dtype:
-            log(f"  ⚠ LLaVA-Med chạy {self.dtype_actual}, không phải {dtype} "
-                f"({'có lớp offload' if offloaded else 'builder ép kiểu'})")
-        self.device = next(self.model.parameters()).device
-        if self.tok.pad_token_id is None:
-            self.tok.pad_token = self.tok.unk_token or self.tok.eos_token
-
-    def _conv(self):
-        conv = self.conv_t.copy()
-        if self.system and hasattr(conv, "system"):
-            conv.system = self.system
-        conv.append_message(conv.roles[0], self.DEFAULT_IMAGE_TOKEN + "\n" + self.user)
-        conv.append_message(conv.roles[1], None)
-        return conv
-
-    def prompt_preview(self):
-        return self._conv().get_prompt()
-
-    def pad_id(self):
-        return self.tok.pad_token_id
-
-    def prepare(self, batch):
-        from PIL import Image
-
-        assert len(batch) == 1, "LLaVA-Med gốc chạy từng ảnh một"
-        img = Image.open(batch[0]["image_path"]).convert("RGB")
-        ids = self.tokenizer_image_token(self._conv().get_prompt(), self.tok,
-                                         self.IMAGE_TOKEN_INDEX, return_tensors="pt")
-        t = self.process_images([img], self.image_processor, self.model.config)
-        if isinstance(t, list):
-            t = t[0].unsqueeze(0) if t[0].dim() == 3 else t[0]
-        return {"input_ids": ids.unsqueeze(0).to(self.device),
-                "images": t.to(device=self.device, dtype=self.dtype_actual),
-                "image_sizes": [img.size]}
-
-    def vision(self, inputs, batch):
-        with self.torch.no_grad():
-            f = self.model.encode_images(inputs["images"])      # sau mm_projector
-        return [f[i] for i in range(f.shape[0])]
-
-    def generate(self, inputs, gc):
-        ids = inputs["input_ids"]
-        with self.torch.no_grad():
-            try:
-                out = self.model.generate(ids, images=inputs["images"],
-                                          image_sizes=inputs["image_sizes"],
-                                          generation_config=gc, use_cache=True)
-            except TypeError:
-                out = self.model.generate(ids, images=inputs["images"],
-                                          generation_config=gc, use_cache=True)
-        L = ids.shape[1]
-        if out.shape[1] > L and self.torch.equal(out[:, :L].cpu(), ids.cpu()):
-            out = out[:, L:]                       # bản trả cả prompt -> cắt
-        return [o for o in out]
-
-    def decode(self, ids):
-        text = self.tok.decode(ids, skip_special_tokens=True).strip()
-        conv = self.conv_t
-        for stop in (getattr(conv, "sep", None), getattr(conv, "sep2", None)):
-            if stop and isinstance(stop, str) and text.endswith(stop):
-                text = text[: -len(stop)].strip()
-        return text
-
-
 class CheXagentAdapter:
     """CheXagent-2 3B (remote code, transformers==4.40.0). Ảnh đi qua transform
     gốc của model (Resize 512 bicubic + chuẩn hoá SigLIP) — nằm trong
@@ -530,8 +398,7 @@ class CheXagentAdapter:
         return self.tok.decode(ids, skip_special_tokens=True)
 
 
-ADAPTERS = {"gemma3": Gemma3Adapter, "llava_orig": LlavaOrigAdapter,
-            "chexagent": CheXagentAdapter}
+ADAPTERS = {"gemma3": Gemma3Adapter, "chexagent": CheXagentAdapter}
 
 
 # ── vòng chính ──────────────────────────────────────────────────────────────
@@ -553,6 +420,14 @@ def main() -> int:
     except ImportError as e:
         log(f"✗ thiếu thư viện trong môi trường này: {e}")
         return 2
+
+    # Tải nhanh bằng hf_transfer chỉ dùng được nếu venv NÀY có gói đó (venv con thường không có).
+    if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes", "on"):
+        try:
+            import hf_transfer  # noqa: F401
+        except ImportError:
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+            log("  (venv này không có hf_transfer -> tải thường)")
 
     c = spec["candidate"]
     at = dict(spec.get("autotune") or {})

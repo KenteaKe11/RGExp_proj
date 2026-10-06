@@ -14,8 +14,8 @@ bỏ qua candidate đã có `per_sample_<id>.csv` (trừ --rescore).
     cands/<id>/        spec.json, tasks.jsonl, predictions.jsonl, align.jsonl, worker_meta.json,
                        probe.json (dò phần cứng lần đầu, lần sau dùng lại nếu cùng phần cứng)
     metrics/           per_sample_<id>.csv, corpus_<id>.json, auc_per_label_<pool>.csv
-    REPORT.md · summary.csv · friedman_tests.csv · posthoc_tests.csv
-    auc_friedman.csv · auc_posthoc.csv · manifest.json
+    REPORT.md · summary.csv · paired_tests.csv (bootstrap + permutation)
+    auc_paired_tests.csv · manifest.json
 """
 from __future__ import annotations
 
@@ -253,20 +253,8 @@ def cmd_score(cfg: Cfg, a) -> None:
 
 
 # ── stats ───────────────────────────────────────────────────────────────────
-def _apply_scope(ph: pd.DataFrame, scfg: dict) -> pd.DataFrame:
-    if ph.empty:
-        return ph
-    scope = str(scfg.get("posthoc_scope", "permetric"))
-    col = "p_wil_holm_permetric" if scope == "permetric" else "p_wil_holm_global"
-    ph["p_holm"] = ph[col]
-    ph["holm_scope"] = scope
-    ph["significant"] = ph["p_holm"] < float(scfg.get("alpha", 0.05))
-    ph["significant_and_material"] = ph["significant"] & ~ph["negligible"]
-    return ph
-
-
 def cmd_stats(cfg: Cfg, a) -> None:
-    from . import alignment, report, sampling, stats_friedman as sf
+    from . import alignment, report, sampling, stats_resample as sr
 
     rd = run_dir(cfg)
     mdir = rd / "metrics"
@@ -277,20 +265,18 @@ def cmd_stats(cfg: Cfg, a) -> None:
     test = sampling.load(cfg, "test")
     names = sampling.label_names(cfg)
 
-    # ── văn bản: Friedman theo ảnh ─────────────────────────────────────────
+    # ── văn bản: bootstrap + permutation ghép cặp theo ảnh ─────────────────────────────────────────
     scores = {}
     for cid in ids:
         p = mdir / f"per_sample_{cid}.csv"
         if not p.exists():
             raise RunFailed(f"thiếu {p} — chạy score.")
         scores[cid] = pd.read_csv(p)
-    scores, binfo = sf.align_blocks(scores, order_hint=test["key"].tolist())
+    scores, binfo = sr.align_blocks(scores, order_hint=test["key"].tolist())
     if binfo["n_common"] != len(test):
         raise RunFailed(f"khối không đầy đủ: {binfo}")
     tm = [m for m in scfg.get("text_metrics", []) if m in scores[ids[0]].columns]
-    fr = sf.friedman_all(scores, tm, scfg)
-    gate = dict(zip(fr["metric"], fr["reject_h0"]))
-    ph = _apply_scope(sf.posthoc_all(scores, tm, scfg, gate=gate, seed=seed), scfg)
+    cmp = sr.compare_all(scores, tm, scfg, seed=seed)
 
     summ = []
     for cid in ids:
@@ -311,21 +297,14 @@ def cmd_stats(cfg: Cfg, a) -> None:
     for pool in alignment.POOLS:
         S = {cid: alignment.load_align(rd / "cands" / cid / "align.jsonl",
                                        test["key"].tolist(), pool) for cid in ids}
-        n_boot = int(al.get("n_boot", 2000)) if pool == al.get("primary_pool", "top5") else 0
-        auc_res[pool] = alignment.evaluate(S, y, v, names, max(1, n_boot), seed)
+        prim_pool = pool == al.get("primary_pool", "top5")
+        n_boot = int(al.get("n_boot", 2000)) if prim_pool else 0
+        n_perm = int(al.get("n_perm", 2000)) if prim_pool else 0
+        auc_res[pool] = alignment.evaluate(S, y, v, names, max(1, n_boot), seed, n_perm)
         auc_res[pool]["per_label"].to_csv(mdir / f"auc_per_label_{pool}.csv", index=False)
     prim = str(al.get("primary_pool", "top5"))
-    tab = auc_res[prim]["per_label"].dropna(subset=ids)
-    auc_scores = {cid: pd.DataFrame({"key": tab["label"], f"auc_{prim}": tab[cid]})
-                  for cid in ids}
-    afr = sf.friedman_all(auc_scores, [f"auc_{prim}"], scfg)
-    aph = _apply_scope(sf.posthoc_all(auc_scores, [f"auc_{prim}"], scfg,
-                                      gate=None, seed=seed), scfg)
-
-    fr.to_csv(rd / "friedman_tests.csv", index=False)
-    ph.to_csv(rd / "posthoc_tests.csv", index=False)
-    afr.to_csv(rd / "auc_friedman.csv", index=False)
-    aph.to_csv(rd / "auc_posthoc.csv", index=False)
+    cmp.to_csv(rd / "paired_tests.csv", index=False)
+    pd.DataFrame(auc_res[prim]["pairs"]).to_csv(rd / "auc_paired_tests.csv", index=False)
     summary.to_csv(rd / "summary.csv", index=False)
 
     metas = {}
@@ -347,8 +326,7 @@ def cmd_stats(cfg: Cfg, a) -> None:
                 "auc_pairs": {p: auc_res[p]["pairs"] for p in auc_res}}
     (rd / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False,
                                                  default=str), encoding="utf-8")
-    md = report.render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas,
-                       tm, test)
+    md = report.render(cfg, cs, summary, cmp, auc_res, prim, srep, metas, tm, test)
     (rd / "REPORT.md").write_text(md, encoding="utf-8")
     print(f"✓ REPORT -> {rd / 'REPORT.md'}", flush=True)
 
@@ -387,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["data", "infer", "score", "stats", "push", "all"])
     add_common_args(ap)
-    ap.add_argument("--cands", default=None, help="tập con candidate, vd medgemma_4b,llavamed15_7b")
+    ap.add_argument("--cands", default=None, help="tập con candidate, vd chexagent2_3b,medgemma_4b")
     ap.add_argument("--limit", type=int, default=0, help="infer: chỉ N mẫu đầu (thử)")
     ap.add_argument("--resample", action="store_true", help="data: dựng lại fixture")
     ap.add_argument("--with-train", action="store_true", help="data: tải cả 6400 ảnh train")

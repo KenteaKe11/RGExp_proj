@@ -1,4 +1,4 @@
-"""Policy giải mã (§1.4) — MỘT đặc tả cho cả ba candidate, kiểm chặt.
+"""Policy giải mã (§1.4) — MỘT đặc tả cho cả hai candidate, kiểm chặt.
 
     do_sample            false   tái lập 100%
     num_beams            4       ngưỡng ngọt giữa BLEU/ROUGE và thời gian chạy

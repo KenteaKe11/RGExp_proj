@@ -1,8 +1,7 @@
 """BLEU / ROUGE / BERTScore / RadGraph F1 — tính Ở MỨC TỪNG MẪU.
 
-Từng mẫu chứ không phải corpus-level: Friedman (src/stats_friedman.py) xếp hạng
-ba candidate TRONG TỪNG ẢNH, và hậu kiểm Wilcoxon là kiểm định ghép cặp — cả
-hai cần một vector điểm theo ảnh. Corpus BLEU vẫn được tính để đối chiếu với
+Từng mẫu chứ không phải corpus-level: bootstrap + permutation ghép cặp
+(src/stats_resample.py) cần một vector điểm theo ảnh cho mỗi candidate. Corpus BLEU vẫn được tính để đối chiếu với
 bài báo khác, không dùng cho kết luận.
 
 Tiền xử lý (§1.3.6.2), áp cho CẢ dự đoán lẫn tham chiếu, đúng thứ tự:

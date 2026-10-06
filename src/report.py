@@ -18,12 +18,7 @@ def _p(x: float) -> str:
     return "<1e-300" if x == 0 else (f"{x:.2e}" if x < 1e-3 else f"{x:.4f}")
 
 
-def _ladder(row: pd.Series, ids: list[str]) -> str:
-    pairs = sorted(((c, float(row[f"meanrank_{c}"])) for c in ids), key=lambda t: t[1])
-    return " < ".join(f"`{c}` ({r:.3f})" for c, r in pairs)
-
-
-def render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas, tm, test) -> str:
+def render(cfg, cs, summary, cmp, auc_res, prim, srep, metas, tm, test) -> str:
     ids = [c["id"] for c in cs]
     name = {c["id"]: c["name"] for c in cs}
     L = []
@@ -51,8 +46,10 @@ def render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas, tm, t
       f"{str(cfg['prompt']['user']).strip().replace(chr(10), ' ⏎ ')} |")
     w(f"| Tiền xử lý metric | lowercase → bỏ `findings:`/`impression:` → gộp khoảng trắng → "
       f"bỏ khoảng trắng trước dấu câu → strip |")
-    w(f"| Kiểm định | Friedman (ties Conover, p theo F Iman-Davenport, Holm trên các metric) "
-      f"→ hậu kiểm Wilcoxon signed-rank (Pratt), Holm `{cfg['stats'].get('posthoc_scope')}` |\n")
+    st = cfg["stats"]
+    w(f"| Kiểm định | ghép cặp theo ảnh: **bootstrap** (CI95 percentile, {st.get('n_boot')} lần) + "
+      f"**permutation** sign-flip ({st.get('n_perm')} lần, p = (k+1)/(B+1)); Holm `{st.get('holm_scope')}`; "
+      f"effect size Cohen's dz |\n")
 
     w("## 2. Dữ liệu\n")
     im, ib = srep["imbalance"], srep["imbalance_random_baseline"]
@@ -84,11 +81,11 @@ def render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas, tm, t
           f"{auc_res['mean']['macro'][cid]['macro_auc']:.4f} | "
           f"{auc_res['max']['macro'][cid]['macro_auc']:.4f} |")
     w("\nHiệu số macro-AUC ghép cặp (bootstrap theo ảnh):\n")
-    w("| A − B | Δ | CI95 | p (bootstrap) |\n|---|---|---|---|")
+    w("| A − B | Δ | CI95 (bootstrap) | p bootstrap | p permutation | p Holm |\n|---|---|---|---|---|---|")
     for pr in auc_res[prim]["pairs"]:
         w(f"| `{pr['a']}` − `{pr['b']}` | {pr['diff']:+.4f} | "
-          f"[{pr['ci95'][0]:+.4f}, {pr['ci95'][1]:+.4f}] | "
-          f"{_p(pr['p_boot_two_sided']) if pr['p_boot_two_sided'] > 0 else '< ' + format(1 / max(1, pr.get('n_boot', 1)), '.0e')} |")
+          f"[{pr['ci95'][0]:+.4f}, {pr['ci95'][1]:+.4f}] | {_p(pr['p_boot_two_sided'])} | "
+          f"{_p(pr.get('p_perm', float('nan')))} | {_p(pr.get('p_perm_holm', float('nan')))} |")
     tab = auc_res[prim]["per_label"]
     w("\nAUC theo nhãn (top-5%):\n")
     w("| Nhãn | n+ | n− | " + " | ".join(ids) + " |")
@@ -100,18 +97,6 @@ def render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas, tm, t
         cells = [(f"**{v:.3f}**" if i == best else f"{v:.3f}") if np.isfinite(v) else "—"
                  for i, v in enumerate(vals)]
         w(f"| {rr['label']} | {rr['n_pos']} | {rr['n_neg']} | " + " | ".join(cells) + " |")
-    if not afr.empty:
-        r = afr.iloc[0]
-        w(f"\nFriedman trên AUC theo nhãn (khối = {int(r['n_blocks'])} nhãn): "
-          f"F = {r['F_iman_davenport']:.3f}, p = {_p(r['p_F'])}, Kendall W = {r['kendall_w']:.3f}; "
-          f"hạng TB: {_ladder(r, ids)}.")
-        if not aph.empty:
-            w("\n| A vs B | ΔAUC TB | p Wilcoxon | p Holm | r_rb |\n|---|---|---|---|---|")
-            for q in aph.itertuples(index=False):
-                w(f"| `{q.arm_a}` vs `{q.arm_b}` | {q.diff:+.4f} | {_p(q.p_wilcoxon)} | "
-                  f"{_p(q.p_holm)} | {q.r_rb:+.3f} |")
-        w("\n> Khối = nhãn nên n nhỏ (≤ số nhãn): Friedman/Wilcoxon ở đây có công suất thấp; "
-          "đọc kèm CI bootstrap của macro-AUC ở trên.\n")
 
     w("## 4. Chất lượng báo cáo [Origin]\n")
     cols = [m for m in tm] + [c for c in ("radgraph_simple", "radgraph_complete")
@@ -124,44 +109,34 @@ def render(cfg, cs, summary, fr, ph, auc_res, prim, afr, aph, srep, metas, tm, t
         w(f"| {name[r['candidate']]} | " + " | ".join(cells) +
           f" | {r.get('mean_words_pred', float('nan')):.1f} | {int(r.get('n_empty', 0))} |")
     w(f"\nTừ TB của tham chiếu: {summary['mean_words_ref'].iloc[0]:.1f}." if "mean_words_ref" in summary else "")
-    w("\n### Friedman (khối = ảnh)\n")
-    w("| Metric | F | p (Holm) | Kendall W | hạng TB (1 = tốt nhất) | bác H0 |")
-    w("|---|---|---|---|---|---|")
-    for r in fr.itertuples(index=False):
-        rr = pd.Series(r._asdict())
-        w(f"| {NICE.get(rr['metric'], rr['metric'])} | {rr['F_iman_davenport']:.2f} | "
-          f"{_p(rr['p_F_holm'])} | {rr['kendall_w']:.4f} | {_ladder(rr, ids)} | "
-          f"{'✓' if rr['reject_h0'] else '—'} |")
-    warns = [x for x in fr.get("w_warning", []) if x]
-    for x in warns:
-        w(f"\n> ⚠ {x}")
-    w("\n### Hậu kiểm (chỉ metric bác H0)\n")
-    if ph.empty:
-        w("Không metric nào bác H0.")
+    w("\n### So sánh ghép cặp (bootstrap + permutation, khối = ảnh)\n")
+    if cmp.empty:
+        w("Chỉ có một candidate — không có cặp để so sánh.")
     else:
-        w("| Metric | A vs B | TB A | TB B | Δ | p Holm | r_rb | thắng |")
-        w("|---|---|---|---|---|---|---|---|")
-        for q in ph.itertuples(index=False):
-            win = (q.arm_a if q.diff > 0 else q.arm_b) if q.significant_and_material else "—"
+        w("| Metric | A vs B | TB A | TB B | Δ (A−B) | CI95 bootstrap | p perm | p Holm | dz | A > B | thắng |")
+        w("|---|---|---|---|---|---|---|---|---|---|---|")
+        for q in cmp.itertuples(index=False):
             w(f"| {NICE.get(q.metric, q.metric)} | `{q.arm_a}` vs `{q.arm_b}` | {q.mean_a:.4f} | "
-              f"{q.mean_b:.4f} | {q.diff:+.4f} | {_p(q.p_holm)} | {q.r_rb:+.3f} | {win} |")
-        w("\n\"Thắng\" = Holm bác H0 **và** |rank-biserial| ≥ "
-          f"{cfg['stats'].get('rrb_floor', 0.10)}.")
+              f"{q.mean_b:.4f} | {q.diff:+.4f} | [{q.ci_lo:+.4f}, {q.ci_hi:+.4f}] | {_p(q.p_perm)} | "
+              f"{_p(q.p_holm)} | {q.dz:+.3f} | {100 * q.win_rate_a:.1f}% | {q.winner} |")
+        w(f"\n\"Thắng\" = Holm bác H0 **và** |dz| ≥ {cfg['stats'].get('dz_floor', 0.05)} "
+          f"(p nhỏ với n lớn chưa chắc có ý nghĩa thực chất).")
 
     w("\n## 5. Tổng hợp\n")
     wins = {c: 0 for c in ids}
-    for q in ph.itertuples(index=False) if not ph.empty else []:
-        if q.significant_and_material:
-            wins[q.arm_a if q.diff > 0 else q.arm_b] += 1
-    best_rank = {c: 0 for c in ids}
-    for r in fr.itertuples(index=False):
-        best_rank[r.best_by_meanrank] += 1
+    best_mean = {c: 0 for c in ids}
+    for q in cmp.itertuples(index=False):
+        if q.winner in wins:
+            wins[q.winner] += 1
+    for m in tm:
+        if m in summary:
+            best_mean[summary.loc[summary[m].idxmax(), "candidate"]] += 1
     auc_best = max(ids, key=lambda c: auc_res[prim]["macro"][c]["macro_auc"])
-    w("| Candidate | macro-AUC top-5% | số metric văn bản hạng 1 | số cặp thắng |")
+    w("| Candidate | macro-AUC top-5% | số metric văn bản có TB cao nhất | số phép so sánh thắng |")
     w("|---|---|---|---|")
     for c in ids:
         w(f"| {name[c]} | {auc_res[prim]['macro'][c]['macro_auc']:.4f} | "
-          f"{best_rank[c]}/{len(fr)} | {wins[c]} |")
+          f"{best_mean[c]}/{len(tm)} | {wins[c]} |")
     w(f"\nAlignment cao nhất: **{name[auc_best]}**. Bảng này chỉ tổng hợp số liệu; "
       f"kết luận chọn baseline cần đối chiếu cả hai tiêu chí (§1.3.2).\n")
     return "\n".join(L) + "\n"
