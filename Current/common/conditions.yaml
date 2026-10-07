@@ -195,6 +195,7 @@ metrics:
     enabled: true
     model_type: radgraph-xl
     reward_level: all
+    batch_size: 32              # lô chấm; hiện pbar theo lô và tránh một lô 2400 mẫu quá lâu
   primary: radgraph_f1
   # e1.3 Baseline: CKA (linear) giữa đặc trưng TRƯỚC và SAU Aligner/Adapter của từng mô hình,
   # trên toàn bộ ảnh test (mỗi ảnh = trung bình theo token). Một số / mô hình, CI bootstrap.

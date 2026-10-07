@@ -155,7 +155,10 @@ def _radgraph(hyps: list[str], refs: list[str], rcfg: dict) -> dict:
             h, r = safe[i:i + chunk], refs[i:i + chunk]
             parts.append(norm(f1(hyps=h, refs=r)[1], len(h)))
         return np.concatenate(parts, axis=0)
-    arr, _ = _auto_run(run, max(1, len(safe)))
+    # Không gửi toàn bộ testset trong một request: một lô đầu quá lớn có thể chờ
+    # nhiều phút mà pbar vẫn 0/1, hoặc OOM trước khi tự giảm batch.
+    start = max(1, min(int(rcfg.get("batch_size", 32)), len(safe)))
+    arr, _ = _auto_run(run, start)
     if lvl == "all":
         return {"radgraph_simple": arr[:, 0], "radgraph_f1": arr[:, 1],
                 "radgraph_complete": arr[:, 2]}
