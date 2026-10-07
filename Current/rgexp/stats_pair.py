@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .progress import bar
 from .stats_friedman import cohen_dz, holm, permutation_paired
 
 
@@ -33,7 +34,7 @@ def compare_two(scores: dict[str, pd.DataFrame], metrics: list[str], st: dict, s
     alpha = float(st.get("alpha", 0.05))
     rng = np.random.default_rng(seed)
     rows = []
-    for m in metrics:
+    for m in bar(metrics, desc="  Pair tests", unit="metric"):
         xa, xb = scores[a][m].to_numpy(float), scores[b][m].to_numpy(float)
         d = xa - xb
         pp = permutation_paired(d, int(st.get("n_perm", 10000)), rng)

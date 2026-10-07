@@ -18,6 +18,8 @@ import itertools
 
 import numpy as np
 
+from .progress import bar
+
 
 def gram(X: np.ndarray) -> np.ndarray:
     X = np.asarray(X, dtype=np.float64)
@@ -43,12 +45,17 @@ def boot_indices(n: int, n_boot: int, seed: int) -> np.ndarray:
     return np.random.default_rng(seed).integers(0, n, size=(n_boot, n))
 
 
-def bootstrap(K: np.ndarray, L: np.ndarray, idx: np.ndarray) -> np.ndarray:
-    return np.array([cka_from_grams(K[np.ix_(b, b)], L[np.ix_(b, b)]) for b in idx])
+def bootstrap(K: np.ndarray, L: np.ndarray, idx: np.ndarray, pbar=None) -> np.ndarray:
+    out = []
+    for b in idx:
+        out.append(cka_from_grams(K[np.ix_(b, b)], L[np.ix_(b, b)]))
+        if pbar is not None:
+            pbar.update(1)
+    return np.array(out)
 
 
 def summarize(feats: dict[str, tuple[np.ndarray, np.ndarray]], n_boot: int = 1000, seed: int = 42,
-              alpha: float = 0.05) -> dict:
+              alpha: float = 0.05, progress: bool = False) -> dict:
     """feats: {mô hình: (X, Y)} cùng thứ tự ảnh. Trả {"per_model": {...}, "pairs": [...]}."""
     from .stats_friedman import holm
 
@@ -60,7 +67,12 @@ def summarize(feats: dict[str, tuple[np.ndarray, np.ndarray]], n_boot: int = 100
     idx = boot_indices(n, n_boot, seed)
     grams = {m: (gram(feats[m][0]), gram(feats[m][1])) for m in names}
     point = {m: cka_from_grams(*grams[m]) for m in names}
-    boots = {m: bootstrap(*grams[m], idx) for m in names}
+    pbar = bar(total=len(names) * n_boot, desc="  CKA bootstrap", unit="lần") if progress else None
+    try:
+        boots = {m: bootstrap(*grams[m], idx, pbar=pbar) for m in names}
+    finally:
+        if pbar is not None:
+            pbar.close()
     per = {m: {"cka": point[m], "ci_low": float(np.nanpercentile(boots[m], 100 * alpha / 2)),
                "ci_high": float(np.nanpercentile(boots[m], 100 * (1 - alpha / 2))),
                "d_before": int(feats[m][0].shape[1]), "d_after": int(feats[m][1].shape[1]), "n": n}

@@ -49,6 +49,8 @@ import math
 import numpy as np
 import pandas as pd
 
+from .progress import bar
+
 
 # ── Bốn hàm dùng chung, nội tuyến tại đây ───────────────────────────────────
 # Nguyên văn, không sửa — selftest đối chiếu Friedman với scipy.
@@ -511,7 +513,7 @@ def friedman_all(scores: dict[str, pd.DataFrame], metrics: list[str],
     alpha = float(cfg_stats.get("alpha", 0.05))
     w_floor = float(cfg_stats.get("kendall_w_floor", 0.05))
     rows = []
-    for m in metrics:
+    for m in bar(metrics, desc="  Friedman", unit="metric"):
         X = matrix(scores, m, arms)
         r = friedman(X, labels=arms)
         row = {"metric": m, "n_blocks": r["n"], "k": r["k"],
@@ -568,29 +570,28 @@ def posthoc_all(scores: dict[str, pd.DataFrame], metrics: list[str],
     n_perm = int(cfg_stats.get("n_perm", 10000))
     rng = np.random.default_rng(seed)
 
+    jobs = [(m, a_id, b_id) for m in metrics if gate is None or gate.get(m, False)
+            for a_id, b_id in itertools.combinations(arms, 2)]
     rows = []
-    for m in metrics:
-        if gate is not None and not gate.get(m, False):
-            continue
-        for a_id, b_id in itertools.combinations(arms, 2):
-            a = scores[a_id][m].to_numpy(dtype=np.float64)
-            b = scores[b_id][m].to_numpy(dtype=np.float64)
-            d = a - b
-            w = wilcoxon_signed_rank(d, zero_method=zero_method)
-            row = {"metric": m, "arm_a": a_id, "arm_b": b_id,
-                   "mean_a": float(a.mean()), "mean_b": float(b.mean()),
-                   "diff": float(d.mean()),
-                   "median_diff": float(np.median(d)),
-                   "n": int(d.size), "n_zero": w["n_zero"],
-                   "n_pos": w["n_pos"], "n_neg": w["n_neg"],
-                   "W_plus": w["W_plus"], "W_minus": w["W_minus"],
-                   "z": w["z"], "p_wilcoxon": w["p"], "r_rb": w["r_rb"],
-                   "zero_method": zero_method,
-                   "cohen_dz": cohen_dz(d)}
-            if do_perm:
-                row["p_perm"] = permutation_paired(d, n_perm, rng)["p_perm"]
-            row["negligible"] = rrb_negligible(w["r_rb"], rrb_floor)
-            rows.append(row)
+    for m, a_id, b_id in bar(jobs, desc="  Hậu kiểm", unit="cặp"):
+        a = scores[a_id][m].to_numpy(dtype=np.float64)
+        b = scores[b_id][m].to_numpy(dtype=np.float64)
+        d = a - b
+        w = wilcoxon_signed_rank(d, zero_method=zero_method)
+        row = {"metric": m, "arm_a": a_id, "arm_b": b_id,
+               "mean_a": float(a.mean()), "mean_b": float(b.mean()),
+               "diff": float(d.mean()),
+               "median_diff": float(np.median(d)),
+               "n": int(d.size), "n_zero": w["n_zero"],
+               "n_pos": w["n_pos"], "n_neg": w["n_neg"],
+               "W_plus": w["W_plus"], "W_minus": w["W_minus"],
+               "z": w["z"], "p_wilcoxon": w["p"], "r_rb": w["r_rb"],
+               "zero_method": zero_method,
+               "cohen_dz": cohen_dz(d)}
+        if do_perm:
+            row["p_perm"] = permutation_paired(d, n_perm, rng)["p_perm"]
+        row["negligible"] = rrb_negligible(w["r_rb"], rrb_floor)
+        rows.append(row)
     df = pd.DataFrame(rows)
     if df.empty:
         return df

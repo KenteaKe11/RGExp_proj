@@ -732,7 +732,8 @@ def cmd_stats(cfg: Cfg, ctx: Ctx) -> None:
                     raise RunFailed(f"cka_{v['id']}.npz không theo đúng thứ tự ảnh test — `score --force`.")
                 feats[v["id"]] = (z["before"], z["after"])
             say(f"  CKA: bootstrap {int(ck_cfg.get('n_boot', 1000))} lần trên {len(keys)} ảnh ...")
-            ckres = CK.summarize(feats, int(ck_cfg.get("n_boot", 1000)), seed, float(st.get("alpha", 0.05)))
+            ckres = CK.summarize(feats, int(ck_cfg.get("n_boot", 1000)), seed,
+                                 float(st.get("alpha", 0.05)), progress=True)
             (rd / "cka.json").write_text(json.dumps(ckres, indent=2), encoding="utf-8")
             for i, r in ckres["per_model"].items():
                 g["summary"].loc[g["summary"]["candidate"] == i, "cka"] = r["cka"]
