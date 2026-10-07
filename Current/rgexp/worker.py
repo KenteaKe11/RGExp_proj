@@ -329,7 +329,14 @@ class Phi3V(Base):
         self.proc = AutoProcessor.from_pretrained(self.m["hf_id"], trust_remote_code=True, **pk)
         self.tok = self.proc.tokenizer
         kw = self.load_kw()
-        self.model = AutoModelForCausalLM.from_pretrained(self.m["hf_id"], **kw).eval()
+        # config.json gốc ghi CỨNG "_attn_implementation": "flash_attention_2"; ở transformers 4.44 khoá này
+        # đè lên kwarg attn_implementation -> đòi flash_attn. Nạp config trước, ép attn (cả vision CLIP) rồi truyền vào.
+        from transformers import AutoConfig
+        attn = kw.pop("attn_implementation")
+        mcfg = AutoConfig.from_pretrained(self.m["hf_id"], trust_remote_code=True)
+        mcfg._attn_implementation = attn
+        self.model = AutoModelForCausalLM.from_pretrained(self.m["hf_id"], config=mcfg, attn_implementation=attn,
+                                                          **kw).eval()
         self.base_gc = self.model.generation_config
         msgs = ([{"role": "system", "content": self.system}] if self.system else []) + \
             [{"role": "user", "content": "<|image_1|>\n" + self.user}]
