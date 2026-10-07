@@ -922,7 +922,7 @@ def run(cfg: Cfg, a) -> int:
             cmd_push(cfg, ctx)
             return 0
         with SingleInstance(run_dir(cfg) / ".lock"):
-            if not a.no_hub_resume and not a.limit:
+            if a.op != "status" and not a.no_hub_resume and not a.limit:
                 data_sync_from_hub(cfg)
                 sync_from_hub(cfg)
             scan(cfg)
