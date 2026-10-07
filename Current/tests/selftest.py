@@ -397,6 +397,23 @@ def t06_cka():
         raise AssertionError("tổng lệch phải lỗi")
     except W.SpecError:
         pass
+    # Phi-3.5-vision: id âm (chỗ giữ ảnh) không được làm hỏng repetition penalty; id hợp lệ khớp bản HF
+    try:
+        import torch
+        from transformers import RepetitionPenaltyLogitsProcessor
+    except ImportError:
+        return
+    g = torch.Generator().manual_seed(0)
+    ids = torch.randint(0, 50, (3, 10), generator=g)
+    sc = torch.randn(3, 50, generator=g)
+    assert torch.allclose(W.SafeRepetitionPenalty(1.08)(ids, sc.clone()),
+                          RepetitionPenaltyLogitsProcessor(1.08)(ids, sc.clone()))
+    neg = ids.clone()
+    neg[:, 1:4] = -1
+    alt = ids.clone()
+    alt[:, 1:4] = ids[:, -1:]
+    assert torch.allclose(W.SafeRepetitionPenalty(1.08)(neg, sc.clone()),
+                          RepetitionPenaltyLogitsProcessor(1.08)(alt, sc.clone()))
 
 
 

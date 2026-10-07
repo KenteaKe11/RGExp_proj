@@ -318,6 +318,22 @@ class HFNative(Base):
             return split_counts(_np(cap["x"]), n), split_counts(_np(cap["y"]), [k // msz for k in n])
 
 
+class SafeRepetitionPenalty:
+    """= transformers.RepetitionPenaltyLogitsProcessor nhưng bỏ qua id âm (chỗ giữ ảnh của Phi-3.5-vision).
+    Id âm được thay bằng token cuối của chính hàng đó (luôn hợp lệ, vốn đã bị phạt) -> kết quả trên các id
+    hợp lệ TRÙNG KHỚP bản gốc của HF, không phạt thêm token nào."""
+
+    def __init__(self, penalty: float):
+        self.penalty = float(penalty)
+
+    def __call__(self, input_ids, scores):
+        import torch
+        ids = torch.where(input_ids >= 0, input_ids, input_ids[:, -1:].expand_as(input_ids))
+        sc = torch.gather(scores, 1, ids)
+        sc = torch.where(sc < 0, sc * self.penalty, sc / self.penalty)
+        return scores.scatter(1, ids, sc)
+
+
 class Phi3V(Base):
     """Phi-3.5-vision-instruct (remote code). Processor xử lý từng mẫu một -> tự đệm trái."""
     remote = True
@@ -359,8 +375,19 @@ class Phi3V(Base):
         return self.cast({"input_ids": ids, "attention_mask": am, "pixel_values": pv, "image_sizes": sz})
 
     def generate(self, inputs, gc):
+        # input_ids của Phi-3.5-vision chứa id ÂM (chỗ giữ ảnh <|image_1|> -> -1). RepetitionPenalty của HF làm
+        # gather(scores, input_ids) -> chỉ số âm -> "device-side assert". Thay bằng bản bỏ qua id âm, CÙNG hệ số.
+        import copy
+
+        from transformers import LogitsProcessorList
+        lp = LogitsProcessorList()
+        rp = float(getattr(gc, "repetition_penalty", 1.0) or 1.0)
+        if rp != 1.0:
+            gc = copy.deepcopy(gc)
+            gc.repetition_penalty = 1.0
+            lp.append(SafeRepetitionPenalty(rp))
         with self.torch.no_grad():
-            gen = self.model.generate(**inputs, generation_config=gc, eos_token_id=self.eos)
+            gen = self.model.generate(**inputs, generation_config=gc, logits_processor=lp, eos_token_id=self.eos)
         L = inputs["input_ids"].shape[1]
         return [o[L:] for o in gen]
 
