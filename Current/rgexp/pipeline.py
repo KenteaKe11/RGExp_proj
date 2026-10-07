@@ -266,8 +266,10 @@ def data_sync_from_hub(cfg: Cfg) -> None:
 
         o = cfg["output"]
         stage = data_dir(cfg) / ".hub_cache"
+        say("  ↓ tải fixture còn thiếu từ Hub")
         snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
-                          token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)])
+                          token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)],
+                          etag_timeout=10)
     except Exception as e:  # noqa: BLE001
         say(f"  (không kéo được fixture từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return
@@ -799,12 +801,13 @@ def cmd_push(cfg: Cfg, ctx: Ctx) -> None:
     say(f"✓ đã đẩy lên {repo}:{hub_path(cfg, dn)}/")
 
 
-def sync_from_hub(cfg: Cfg) -> None:
+def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
     """Kéo về phần máy này CÒN THIẾU: predictions dài hơn (+ đặc trưng CKA), per_sample / cka, id W&B.
     Không bao giờ ghi đè cái cục bộ đầy đủ hơn."""
     if not cfg["output"].get("resume_from_hub", True):
         return
     dn = cfg["exp"]["dirname"]
+    selected = selected or variants(cfg)
     try:
         from huggingface_hub import snapshot_download
 
@@ -812,12 +815,18 @@ def sync_from_hub(cfg: Cfg) -> None:
 
         o = cfg["output"]
         stage = run_dir(cfg) / ".hub_cache"
+        # Score chỉ cần predictions, fingerprint và các shard CKA.  Không tải cả
+        # cands/** vì nó bao gồm dữ liệu debug và làm lần resume chậm không cần thiết.
+        patterns = [hub_path(cfg, dn, WB_IDS)]
+        for v in selected:
+            base = hub_path(cfg, dn, "cands", v["path"])
+            patterns += [f"{base}/predictions.jsonl", f"{base}/infer_fingerprint.txt",
+                         f"{base}/cka/*.npz"]
+            patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
+                         for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
+        say(f"  ↓ tải resume của {len(selected)} variant từ Hub")
         snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
-                          token=hf_token(), allow_patterns=[hub_path(cfg, dn, "cands/**"),
-                                                            hub_path(cfg, dn, "metrics/per_sample_*"),
-                                                            hub_path(cfg, dn, "metrics/corpus_*"),
-                                                            hub_path(cfg, dn, "metrics/cka_*"),
-                                                            hub_path(cfg, dn, WB_IDS)])
+                          token=hf_token(), allow_patterns=patterns, etag_timeout=10)
     except Exception as e:  # noqa: BLE001
         say(f"  (bỏ qua resume từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return
@@ -826,7 +835,7 @@ def sync_from_hub(cfg: Cfg) -> None:
     if (base / WB_IDS).exists():
         _merge_ids(base / WB_IDS, ids_file(cfg))
     fp = data_fingerprint(cfg)
-    for v in variants(cfg):
+    for v in selected:
         hd = base / "cands" / v["path"]
         if not hd.exists():
             continue
@@ -925,7 +934,7 @@ def run(cfg: Cfg, a) -> int:
             if a.op in ("infer", "score", "all") and not a.no_hub_resume and not a.limit:
                 say("  ↓ kiểm tra resume từ Hub trước khi chạy (thêm --no-hub-resume để bỏ qua)")
                 data_sync_from_hub(cfg)
-                sync_from_hub(cfg)
+                sync_from_hub(cfg, _vs(cfg, ctx))
             scan(cfg)
             if a.op == "status":
                 return 0
