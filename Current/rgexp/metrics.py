@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .config import Cfg
+from .progress import bar, wait_bar
 
 _WS = re.compile(r"\s+")
 _HEADER = re.compile(r"\b(findings|impressions?)\s*:", re.IGNORECASE)
@@ -114,7 +115,8 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
     def run(bs):                 # batch tự chọn: bắt đầu lớn, OOM thì chia đôi
         scorer.batch_size = bs
         return scorer.score(safe, refs, verbose=False)
-    (P, R, F), _ = _auto_run(run, 256)
+    with wait_bar("    BERTScore"):
+        (P, R, F), _ = _auto_run(run, 256)
     allv = {"p": P.numpy(), "r": R.numpy(), "f1": F.numpy()}
     keep = [str(k).lower() for k in bcfg.get("keep", ["f1"])]
     return {f"bertscore_{k}": allv[k].astype(np.float64) for k in keep if k in allv}
@@ -149,7 +151,7 @@ def _radgraph(hyps: list[str], refs: list[str], rcfg: dict) -> dict:
 
     def run(chunk):              # OOM -> chia nhỏ số mẫu mỗi lượt gọi
         parts = []
-        for i in range(0, len(safe), chunk):
+        for i in bar(range(0, len(safe), chunk), desc="    RadGraph", unit="lô"):
             h, r = safe[i:i + chunk], refs[i:i + chunk]
             parts.append(norm(f1(hyps=h, refs=r)[1], len(h)))
         return np.concatenate(parts, axis=0)

@@ -30,6 +30,7 @@ import pandas as pd
 
 from . import tracking
 from .config import ROOT, Cfg, ConfigError, load, seed_everything, snapshot
+from .progress import HubBar, wait_bar
 
 OPS = {"data": ("status", "build", "push"),
        "baseline": ("status", "infer", "score", "stats", "push", "all")}
@@ -267,9 +268,10 @@ def data_sync_from_hub(cfg: Cfg) -> None:
         o = cfg["output"]
         stage = data_dir(cfg) / ".hub_cache"
         say("  ↓ tải fixture còn thiếu từ Hub")
-        snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
-                          token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)],
-                          etag_timeout=10)
+        with wait_bar("  Hub: chuẩn bị fixture"):
+            snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
+                              token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)],
+                              etag_timeout=10, tqdm_class=HubBar)
     except Exception as e:  # noqa: BLE001
         say(f"  (không kéo được fixture từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return
@@ -368,16 +370,19 @@ def data_push(cfg: Cfg, ctx: Ctx, quiet: bool = False) -> None:
     dd = _data_dirname(cfg)
     try:
         api, repo, rtype = _api(cfg)
-        api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(fixture_dir(cfg)),
-                          path_in_repo=hub_path(cfg, dd, "fixture"), commit_message=f"{dd}: fixture")
+        with wait_bar("  Hub: đẩy fixture"):
+            api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(fixture_dir(cfg)),
+                              path_in_repo=hub_path(cfg, dd, "fixture"), commit_message=f"{dd}: fixture")
         from . import sampling
         if sampling.has_splits(cfg):
-            api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(sampling.splits_dir(cfg)),
-                              path_in_repo=hub_path(cfg, dd, "splits"), commit_message=f"{dd}: splits")
+            with wait_bar("  Hub: đẩy splits"):
+                api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(sampling.splits_dir(cfg)),
+                                  path_in_repo=hub_path(cfg, dd, "splits"), commit_message=f"{dd}: splits")
         idp = data_dir(cfg) / WB_IDS
         if idp.exists():
-            api.upload_file(path_or_fileobj=str(idp), path_in_repo=hub_path(cfg, dd, WB_IDS), repo_id=repo,
-                            repo_type=rtype, commit_message=f"{dd}: wandb ids")
+            with wait_bar("  Hub: đẩy W&B IDs"):
+                api.upload_file(path_or_fileobj=str(idp), path_in_repo=hub_path(cfg, dd, WB_IDS), repo_id=repo,
+                                repo_type=rtype, commit_message=f"{dd}: wandb ids")
         say(f"  ⇪ fixture -> {repo}:{hub_path(cfg, dd, 'fixture')}")
     except Exception as e:  # noqa: BLE001
         if not quiet:
@@ -775,15 +780,17 @@ def push_variant(cfg: Cfg, ctx: Ctx, v: dict, stage: str) -> None:
     dn = cfg["exp"]["dirname"]
     try:
         api, repo, rtype = _api(cfg)
-        api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(vdir(cfg, v)),
-                          path_in_repo=hub_path(cfg, dn, "cands", v["path"]), ignore_patterns=_ignore(cfg),
-                          commit_message=f"{dn}: {stage} {v['id']}")
+        with wait_bar(f"  Hub: đẩy {v['id']} ({stage})"):
+            api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(vdir(cfg, v)),
+                              path_in_repo=hub_path(cfg, dn, "cands", v["path"]), ignore_patterns=_ignore(cfg),
+                              commit_message=f"{dn}: {stage} {v['id']}")
         files = [f for f in (mdir(cfg) / f"per_sample_{v['id']}.csv", mdir(cfg) / f"corpus_{v['id']}.json",
                              mdir(cfg) / f"cka_{v['id']}.npz") if f.exists()] + ([ids_file(cfg)] if ids_file(cfg).exists() else [])
         for f in files:
             rel = "metrics/" + f.name if f.parent == mdir(cfg) else f.name
-            api.upload_file(path_or_fileobj=str(f), path_in_repo=hub_path(cfg, dn, rel), repo_id=repo,
-                            repo_type=rtype, commit_message=f"{dn}: {stage} {v['id']}")
+            with wait_bar(f"  Hub: đẩy {f.name}"):
+                api.upload_file(path_or_fileobj=str(f), path_in_repo=hub_path(cfg, dn, rel), repo_id=repo,
+                                repo_type=rtype, commit_message=f"{dn}: {stage} {v['id']}")
         say(f"  ⇪ {v['id']} ({stage}) -> {repo}:{hub_path(cfg, dn, 'cands', v['path'])}")
     except Exception as e:  # noqa: BLE001
         say(f"  ⚠ push {v['id']} ({stage}) hỏng: {type(e).__name__}: {str(e)[:120]} — chạy tiếp; lần push cuối đẩy lại.")
@@ -796,8 +803,9 @@ def cmd_push(cfg: Cfg, ctx: Ctx) -> None:
     if ctx.a.plan:
         return
     api, repo, rtype = _api(cfg)
-    api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(rd), path_in_repo=hub_path(cfg, dn),
-                      ignore_patterns=_ignore(cfg), commit_message=f"{dn}: push")
+    with wait_bar("  Hub: đẩy toàn bộ"):
+        api.upload_folder(repo_id=repo, repo_type=rtype, folder_path=str(rd), path_in_repo=hub_path(cfg, dn),
+                          ignore_patterns=_ignore(cfg), commit_message=f"{dn}: push")
     say(f"✓ đã đẩy lên {repo}:{hub_path(cfg, dn)}/")
 
 
@@ -825,8 +833,9 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
             patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
                          for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
         say(f"  ↓ tải resume của {len(selected)} variant từ Hub")
-        snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
-                          token=hf_token(), allow_patterns=patterns, etag_timeout=10)
+        with wait_bar("  Hub: đồng bộ kết quả"):
+            snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
+                              token=hf_token(), allow_patterns=patterns, etag_timeout=10, tqdm_class=HubBar)
     except Exception as e:  # noqa: BLE001
         say(f"  (bỏ qua resume từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return

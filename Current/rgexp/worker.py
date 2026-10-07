@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rgexp import tracking  # noqa: E402
 from rgexp.imaging import conform  # noqa: E402
+from rgexp.progress import bar, wait_bar  # noqa: E402
 
 GIB = 1024 ** 3
 
@@ -433,9 +434,10 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
     hk = hw_key(hw)
     log(f"▶ infer {c['id']} · {spec['model']['hf_id']} · env {spec['model'].get('env', 'main')} · {hk}")
     try:
-        ad = adapter or make_adapter(spec, torch)
-        if adapter is None:
-            ad.load()
+        with wait_bar(f"  [{c['id']}] nạp model"):
+            ad = adapter or make_adapter(spec, torch)
+            if adapter is None:
+                ad.load()
     except SpecError as e:
         log(f"✗ {e}")
         return 6
@@ -477,6 +479,7 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
     fails, i, n_done, n_batches, t0 = 0, 0, 0, 0, time.time()
     n_prev = len(tasks) - len(todo)
     examples = []
+    pbar = bar(total=len(todo), desc=f"  [{c['id']}] infer", unit="ảnh")
     while i < len(todo):
         batch = todo[i:i + bs]
         tb = time.time()
@@ -488,6 +491,7 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
             preds = ad.decode(outs)
         except SpecError as e:
             log(f"✗ {e}")
+            pbar.close()
             wb.finish(1)
             return 6
         except Exception as e:  # noqa: BLE001
@@ -508,9 +512,11 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
             fails += 1
             log(f"  ✗ lô tại {i} hỏng: {msg}")
             if i == 0:
+                pbar.close()
                 wb.finish(1)
                 return 4
             if fails >= 3:
+                pbar.close()
                 wb.finish(1)
                 return 5
             i += len(batch)
@@ -526,6 +532,7 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
         i += len(batch)
         n_done += len(batch)
         n_batches += 1
+        pbar.update(len(batch))
         if len(examples) < 20:
             examples += [[b["key"], p] for b, p in zip(batch, preds)][: 20 - len(examples)]
         if not probe["tuned"]:
@@ -539,6 +546,7 @@ def run_infer(spec, torch, limit: int = 0, adapter: Base | None = None) -> int:
         if n_batches == 1 or i >= len(todo) or n_batches % 10 == 0:
             log(f"  [{c['id']}] {n_prev + n_done}/{len(tasks)} · bs {bs} · {rate:.2f} ảnh/s · còn ~{eta:.1f} phút"
                 f" · vd: {preds[0][:70]!r}")
+    pbar.close()
     probe["peak_vram_gib"] = round(torch.cuda.max_memory_allocated() / GIB, 2) if torch.cuda.is_available() else None
     dump(probe_p, probe)
     if examples and wb.run is not None:

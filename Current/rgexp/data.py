@@ -19,6 +19,7 @@ import pandas as pd
 from PIL import Image
 
 from .config import Cfg, hf_token
+from .progress import bar
 
 Image.MAX_IMAGE_PIXELS = None  # ảnh CXR gốc có thể > giới hạn cảnh báo bom nén
 
@@ -229,6 +230,7 @@ def _extract(opener: _ZipOpener, mapping: dict[str, str], need: list[str],
     t0 = time.time()
     last = 0
     probed = False
+    pbar = bar(total=len(ordered), desc=f"  [{label}] trích", unit="ảnh")
     with ThreadPoolExecutor(max_workers=max(1, len(chunks)),
                             thread_name_prefix="unzip") as pool:
         futs = [pool.submit(work, c) for c in chunks]
@@ -236,6 +238,7 @@ def _extract(opener: _ZipOpener, mapping: dict[str, str], need: list[str],
             fin = all(f.done() for f in futs)
             i = done[0]
             if i - last >= 200 or (fin and i != last):
+                pbar.update(i - last)
                 last = i
                 rate = i / max(1e-9, time.time() - t0)
                 eta = (len(ordered) - i) / max(1e-9, rate)
@@ -261,6 +264,7 @@ def _extract(opener: _ZipOpener, mapping: dict[str, str], need: list[str],
                     f.result()
                 break
             time.sleep(0.5)
+    pbar.close()
     if failed:
         print(f"  ⚠ {len(failed)} ảnh không lấy được. Ví dụ: {failed[:3]}", flush=True)
     return [k for k, _ in failed]
