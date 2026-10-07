@@ -709,7 +709,10 @@ def t10_resume_and_fingerprint():
             saved = huggingface_hub.snapshot_download
             huggingface_hub.snapshot_download = fake_snapshot
             try:
-                assert P.main(["baseline", "status"]) == 0
+                # Resume là tiền điều kiện của infer/score/all; status chỉ đọc dữ liệu cục bộ.
+                P.data_sync_from_hub(cfg)
+                P.sync_from_hub(cfg)
+                assert P.main(["baseline", "status", "--no-hub-resume"]) == 0
             finally:
                 huggingface_hub.snapshot_download = saved
             st = P.scan(cfg)

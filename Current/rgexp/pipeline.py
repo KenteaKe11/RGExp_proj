@@ -922,8 +922,8 @@ def run(cfg: Cfg, a) -> int:
             cmd_push(cfg, ctx)
             return 0
         with SingleInstance(run_dir(cfg) / ".lock"):
-            if not a.no_hub_resume and not a.limit:
-                say("  ↓ kiểm tra resume từ Hub (thêm --no-hub-resume để bỏ qua)")
+            if a.op in ("infer", "score", "all") and not a.no_hub_resume and not a.limit:
+                say("  ↓ kiểm tra resume từ Hub trước khi chạy (thêm --no-hub-resume để bỏ qua)")
                 data_sync_from_hub(cfg)
                 sync_from_hub(cfg)
             scan(cfg)
