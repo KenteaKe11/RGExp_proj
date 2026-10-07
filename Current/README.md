@@ -34,7 +34,7 @@ Gemma-3 (it, pt) và PaliGemma 2 đều là **gated**: token HF phải được 
 bash Current/setup.sh                    # torch theo CUDA + env main + .venv-legacy + kiểm GPU
 export HF_TOKEN=hf_xxxxxxxx              # BẮT BUỘC: dữ liệu private · gemma-3 / paligemma2 gated · quyền WRITE Research_results
 export WANDB_API_KEY=xxxxxxxx            # BẮT BUỘC khi --detach (hoặc: wandb login)
-python Current/tests/selftest.py         # vài giây, không cần GPU / mạng
+python3 Current/tests/selftest.py         # vài giây, không cần GPU / mạng
 ```
 
 | env | ở đâu | transformers | dùng cho |

@@ -444,8 +444,18 @@ def _run_worker(spec_p: Path, limit: int, label: str, env: str = "main") -> None
     cmd = [env_python(env), "-m", "rgexp.worker", "--spec", str(spec_p)]
     if limit:
         cmd += ["--limit", str(limit)]
+    # hf_transfer được env.sh bật theo python CHÍNH; env khác (vd .venv-legacy) có thể thiếu gói
+    # -> huggingface_hub ném ValueError khi tải. Kiểm tra trên đúng python của worker, thiếu thì tắt.
+    wenv = dict(os.environ)
+    if wenv.get("HF_HUB_ENABLE_HF_TRANSFER", "") not in ("", "0"):
+        ok = subprocess.call([cmd[0], "-c", "import hf_transfer"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL) == 0
+        if not ok:
+            wenv.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+            say(f"  ⚠ {label}: env {env} thiếu hf_transfer — tải trọng số bằng đường thường "
+                f"(cài: {cmd[0]} -m pip install hf_transfer)")
     t0 = time.time()
-    rc = subprocess.call(cmd, cwd=str(ROOT))
+    rc = subprocess.call(cmd, cwd=str(ROOT), env=wenv)
     say(f"  ↳ {label}: mã thoát {rc} sau {(time.time() - t0) / 60:.1f} phút")
     if rc != 0:
         raise RunFailed(f"worker {label} thoát mã {rc} (2 thiếu thư viện · 3 nạp model · 4 lô đầu · "

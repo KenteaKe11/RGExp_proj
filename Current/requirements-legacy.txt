@@ -16,3 +16,4 @@ pyyaml>=6.0
 psutil>=5.9
 wandb>=0.17
 huggingface_hub>=0.24,<1.0
+hf_transfer>=0.1.6
