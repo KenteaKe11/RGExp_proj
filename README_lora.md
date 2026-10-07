@@ -89,6 +89,13 @@ python scripts/selftest_lora.py          # vài giây, không GPU
 bash scripts/run_lora.sh data            # lấy mẫu mới (kiểm chiều nhãn) + tải 9900 ảnh
 bash scripts/run_lora.sh train --cands qlora_r2 --limit 32   # chạy thử -> cands/<id>/dryrun/
 bash scripts/run_lora.sh all --detach    # data -> train ×5 -> infer ×6 -> score -> stats -> push (nền)
+
+# theo dõi trạng thái (k ảnh hưởng luồng chạy)
+bash scripts/run_lora.sh status
+# xem 40 dòng cuối của log mới nhất (không bám theo)
+tail -n 40 "$(ls -t logs/lora_all_*.log | head -1)"
+# theo dõi trực tiếp log mới nhất
+tail -f "$(ls -t logs/lora_all_*.log | head -1)"
 ```
 
 **Mặc định quét + resume.** Mọi lệnh (trừ `push`) trước hết kéo về từ Hub phần máy này còn thiếu
