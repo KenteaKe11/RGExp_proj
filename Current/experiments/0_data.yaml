@@ -1,0 +1,11 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# KEY THÍ NGHIỆM 0 — Data (quy chuẩn mới): 12800 train / 800 val / 2400 test.
+#   1. Frontal (PA, AP)  2. 1 ảnh / bệnh nhân (pos nhiều nhất -> nhãn rõ ràng nhiều nhất)
+#   3. MultilabelStratifiedGroupKFold  4. danh sách CỐ ĐỊNH cho repo: Current/data/splits/*.csv|json
+# DÙNG CHUNG cho mọi thí nghiệm, BẮT BUỘC chạy trước:   bash Current/run.sh data build
+# Điều kiện: common/conditions.yaml (data, labels, sampling, image).
+# ═════════════════════════════════════════════════════════════════════════════
+id: 0
+key: data
+title: Data                      # -> outputs/0_Data · Hub Current/0_Data
+kind: data

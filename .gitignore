@@ -1,18 +1,15 @@
+# môi trường
 .venv/
-.venv-linux/
-.venv-llavamed/
+.venv-*/
+Current/.venv/
+Current/.venv-legacy/
 __pycache__/
 *.pyc
-runs/
-data/
-logs/
 .DS_Store
-# 8 adapter đã huấn luyện, 20-80 MB mỗi cái — thuộc repo model, không phải repo code
-adapters/
-adapters_dryrun/
+# kết quả + log + cache (thuộc Hub / W&B, không thuộc repo code)
+Current/outputs/
+Current/logs/
 wandb/
-# adapter / checkpoint của mọi thí nghiệm — thuộc repo model trên Hub, không phải repo code
-adapters_*/
 *.safetensors
 *.pt
-.venv-chexagent/
+# Current/data/splits/ (danh sách cố định) VÀO git — không ignore
