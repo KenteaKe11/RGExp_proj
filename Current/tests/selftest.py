@@ -16,7 +16,7 @@
   t09 stats end-to-end: k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
   t10 resume từ Hub Current/1_Baseline (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
   t11 data: thiếu data -> lệnh baseline báo chạy `data build`
-  Chỉ t01–t03 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
+  Chỉ t01–t04 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 # Selftest được cố ý giới hạn ở smoke test, kể cả khi gọi không có --quick.
 QUICK = True
-QUICK_CASES = {"t01_config", "t02_lora_target_mask", "t03_lora_minibatch"}
+QUICK_CASES = {"t01_config", "t02_lora_target_mask", "t03_lora_minibatch", "t04_lora_model_summary"}
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -214,6 +214,46 @@ def t03_lora_minibatch():
     assert mini == 13
     mini, caps = _initial_mini_batch(64, 4, 3 * gib, None, None, 4.0, 1.5, 0.06)
     assert caps == {"configured": 64, "cpu": 4, "ram": 1} and mini == 1
+
+
+@case
+def t04_lora_model_summary():
+    """Chỉ projector full-ft và tensor LoRA decoder mới được phép train."""
+    import torch
+
+    from rgexp.lora_worker import _model_summary
+
+    class ToyPhi(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_embed_tokens = torch.nn.Module()
+            self.vision_embed_tokens.img_projection = torch.nn.Linear(2, 3)
+            self.vision_embed_tokens.img_processor = torch.nn.Linear(2, 2)
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].qkv_proj = torch.nn.Linear(2, 2)
+            self.model.layers[0].qkv_proj.lora_A = torch.nn.Parameter(torch.ones(2, 1))
+            self.model.layers[0].qkv_proj.lora_B = torch.nn.Parameter(torch.ones(1, 2))
+            self.lm_head = torch.nn.Linear(2, 2)
+
+    model = ToyPhi()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in model.vision_embed_tokens.img_projection.parameters():
+        p.requires_grad_(True)
+    model.model.layers[0].qkv_proj.lora_A.requires_grad_(True)
+    model.model.layers[0].qkv_proj.lora_B.requires_grad_(True)
+    summary = _model_summary(model, model.vision_embed_tokens.img_projection, ["qkv_proj"])
+    assert summary["target_module_hits"] == {"qkv_proj": 1}
+    assert summary["groups"]["projector_full_ft"]["trainable"] == 9
+    assert summary["groups"]["decoder_qlora"]["trainable"] == 4
+    assert summary["trainable_params"] == 13
+    model.lm_head.weight.requires_grad_(True)
+    try:
+        _model_summary(model, model.vision_embed_tokens.img_projection, ["qkv_proj"])
+        raise AssertionError("tham số trainable ngoài QLoRA/projector phải dừng")
+    except RuntimeError:
+        pass
 
 
 def _synthetic_pool(N=6000, seed=0):

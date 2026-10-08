@@ -106,6 +106,66 @@ def _grad_norm(parameters, torch) -> float:
     return float(torch.stack(norms).norm(2).item()) if norms else 0.0
 
 
+def _model_summary(model, projector, target_modules: list[str]) -> dict:
+    """Kiểm và tóm tắt phần nào của Phi được lượng tử/freeze/full-ft/QLoRA."""
+    projector_ids = {id(p) for p in projector.parameters()}
+    groups = {name: {"params": 0, "trainable": 0, "tensors": 0} for name in
+              ("projector_full_ft", "decoder_qlora", "vision_frozen", "decoder_frozen", "other_frozen")}
+    unexpected = []
+    for name, param in model.named_parameters():
+        if id(param) in projector_ids:
+            group = "projector_full_ft"
+        elif "lora_" in name:
+            group = "decoder_qlora"
+        elif "vision_embed_tokens" in name:
+            group = "vision_frozen"
+        elif any(token in name for token in ("model.layers", "lm_head", "embed_tokens")):
+            group = "decoder_frozen"
+        else:
+            group = "other_frozen"
+        item = groups[group]
+        item["params"] += param.numel()
+        item["trainable"] += param.numel() if param.requires_grad else 0
+        item["tensors"] += 1
+        if param.requires_grad and group not in ("projector_full_ft", "decoder_qlora"):
+            unexpected.append(name)
+    if unexpected:
+        raise RuntimeError("Có tham số trainable ngoài projector/QLoRA: " + ", ".join(unexpected[:8]))
+    target_hits = {target: 0 for target in target_modules}
+    quantized_linear = 0
+    for name, module in model.named_modules():
+        for target in target_hits:
+            if name.endswith(target):
+                target_hits[target] += 1
+        quantized_linear += int(type(module).__name__ == "Linear4bit")
+    total = sum(x["params"] for x in groups.values())
+    trainable = sum(x["trainable"] for x in groups.values())
+    return {"total_params": total, "trainable_params": trainable,
+            "trainable_pct": (100.0 * trainable / total) if total else 0.0,
+            "quantized_linear_modules": quantized_linear, "target_module_hits": target_hits,
+            "groups": groups}
+
+
+def _log_model_summary(summary: dict, model_cfg: dict, lcfg: dict, train_cfg: dict,
+                       rank: int, alpha: int) -> None:
+    print("═══ Phi-3.5 Vision QLoRA model summary ═══", flush=True)
+    print(f"  model={model_cfg['hf_id']} · revision={model_cfg.get('revision') or 'main'} · "
+          f"attention={model_cfg.get('attn_implementation', 'eager')}", flush=True)
+    print(f"  quant=NF4 4-bit · double_quant={bool(lcfg.get('double_quant', True))} · "
+          f"compute_dtype={lcfg.get('compute_dtype', 'bfloat16')}", flush=True)
+    print(f"  QLoRA: rank={rank} · alpha={alpha} · dropout={lcfg.get('dropout', 0.05)} · "
+          f"targets={summary['target_module_hits']}", flush=True)
+    print(f"  train: global_batch={train_cfg['global_batch']} · AdamW wd={train_cfg['weight_decay']} · "
+          f"cosine warmup={train_cfg['warmup_frac']:.0%} · lr={train_cfg['lr_max']}→{train_cfg['lr_min']}", flush=True)
+    for name, item in summary["groups"].items():
+        policy = {"projector_full_ft": "full-ft", "decoder_qlora": "QLoRA", "vision_frozen": "frozen",
+                  "decoder_frozen": "frozen", "other_frozen": "frozen"}[name]
+        print(f"  {name}: {item['params']:,} params · {item['tensors']} tensors · {policy}"
+              + (f" ({item['trainable']:,} trainable)" if item["trainable"] else ""), flush=True)
+    print(f"  total={summary['total_params']:,} · trainable={summary['trainable_params']:,} "
+          f"({summary['trainable_pct']:.4f}%) · Linear4bit={summary['quantized_linear_modules']}", flush=True)
+
+
 def _make_train_batch(rows, processor, tokenizer, prompt: str, eos: int | None,
                       image_size: int, device, dtype, torch):
     """Processor Phi theo từng ảnh, sau đó right-pad token/label để train mini-batch."""
@@ -200,6 +260,17 @@ def train(spec_path: Path) -> None:
                        run_info.get("group", ""), "train", {"candidate": spec["candidate"],
                        "train": train_cfg, "lora_candidate": lc}, Path(spec["wandb_dir"]),
                        step_metric="train_step")
+    summary = _model_summary(model, projector, target)
+    _log_model_summary(summary, model_cfg, lcfg, train_cfg, rank, lora_alpha)
+    run.summary({"model/total_params": summary["total_params"],
+                 "model/trainable_params": summary["trainable_params"],
+                 "model/trainable_pct": summary["trainable_pct"],
+                 "model/linear4bit_modules": summary["quantized_linear_modules"],
+                 "model/projector_full_ft_params": summary["groups"]["projector_full_ft"]["params"],
+                 "model/qlora_params": summary["groups"]["decoder_qlora"]["params"],
+                 "model/target_module_hits": summary["target_module_hits"],
+                 "qlora/rank": rank, "qlora/alpha": lora_alpha,
+                 "qlora/revision": model_cfg.get("revision") or "main"})
     global_batch = int(train_cfg["global_batch"])
     steps = math.ceil(len(rows) / global_batch)
     warmup = max(1, math.ceil(steps * float(train_cfg["warmup_frac"])))

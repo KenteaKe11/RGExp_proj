@@ -174,6 +174,8 @@ Key 2 lượng tử decoder NF4 4-bit; mọi candidate fine-tune đều gắn PE
 và fine-tune toàn phần. Global batch 64 được thực hiện bằng gradient accumulation với mini-batch tự dò từ
 CPU/RAM/VRAM; gặp OOM thì mini-batch giảm một nửa và global batch đó được chạy lại. Mỗi optimizer step log
 loss, `grad_norm`, learning rate và mini-batch thực tế lên stdout/W&B.
+Khi bắt đầu mỗi candidate, log cũng in model summary: revision Phi, NF4, target QLoRA, số tham số từng phần,
+trạng thái frozen/QLoRA/full-ft và tổng tỷ lệ tham số trainable.
 
 ### d. Infer policy
 
