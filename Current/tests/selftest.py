@@ -141,7 +141,7 @@ def t01_config():
                           "no_repeat_ngram_size": 0, "repetition_penalty": 1.08, "length_penalty": 0.8,
                           "early_stopping": True}
     sc = bl["sampling"]
-    assert (sc["n_train"], sc["n_val"], sc["n_test"]) == (12800, 800, 2400) and str(bl["dtype"]) == "bfloat16"
+    assert (sc["n_train"], sc["n_val"], sc["n_test"], sc["n_test_metadata"]) == (5600, 1200, 2400, 1200) and str(bl["dtype"]) == "bfloat16"
     assert sc["frontal_views"] == ["PA", "AP"] and sc["method"] == "multilabel_stratified_group_kfold"
     assert bl["metrics"]["cka"]["enabled"] and bl["metrics"]["primary"] == "radgraph_f1"
     n = bl["metrics"]["normalize"]

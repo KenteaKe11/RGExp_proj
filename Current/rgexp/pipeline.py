@@ -223,6 +223,10 @@ def data_fingerprint(cfg) -> str | None:
         keys = [json.loads(line)["key"] for line in open(f, encoding="utf-8") if line.strip()]
         h.update(f"{sp}:{len(keys)}\n".encode())
         h.update("\n".join(keys).encode())
+    metadata = fx / "test_metadata.json"
+    if not metadata.exists():
+        return None
+    h.update(metadata.read_bytes())
     return h.hexdigest()[:16]
 
 
@@ -240,7 +244,7 @@ def data_state(cfg: Cfg) -> dict:
     from . import sampling
 
     fx = fixture_dir(cfg)
-    st = {"fixture": all((fx / f"{sp}set.jsonl").exists() for sp in SPLITS), "images": {},
+    st = {"fixture": all((fx / f"{sp}set.jsonl").exists() for sp in SPLITS) and (fx / "test_metadata.json").exists(), "images": {},
           "splits_in_repo": sampling.has_splits(cfg)}
     if st["fixture"]:
         for sp in image_splits(cfg):
@@ -276,7 +280,8 @@ def _data_dirname(cfg: Cfg) -> str:
 
 def data_sync_from_hub(cfg: Cfg) -> None:
     """Kéo fixture (+ id run W&B của data) từ Hub nếu máy này chưa có."""
-    fixture_ready = all((fixture_dir(cfg) / f"{sp}set.jsonl").exists() for sp in SPLITS)
+    fixture_ready = all((fixture_dir(cfg) / f"{sp}set.jsonl").exists() for sp in SPLITS) and \
+                    (fixture_dir(cfg) / "test_metadata.json").exists()
     if not cfg["output"].get("resume_from_hub", True) or fixture_ready:
         return
     dd = _data_dirname(cfg)
@@ -297,7 +302,7 @@ def data_sync_from_hub(cfg: Cfg) -> None:
         say(f"  (không kéo được fixture từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return
     hf = stage / hub_path(cfg, dd, "fixture")
-    if (hf / "testset.jsonl").exists():
+    if (hf / "testset.jsonl").exists() and (hf / "test_metadata.json").exists():
         fixture_dir(cfg).mkdir(parents=True, exist_ok=True)
         for f in hf.iterdir():
             shutil.copy2(f, fixture_dir(cfg) / f.name)
@@ -627,7 +632,7 @@ def collect_cka(cfg: Cfg, v: dict, keys: list[str]) -> Path | None:
 def cmd_score(cfg: Cfg, ctx: Ctx) -> None:
     from . import metrics, sampling
 
-    test = sampling.load(cfg, "test")
+    test = sampling.load_test_metadata(cfg)
     mdir(cfg).mkdir(parents=True, exist_ok=True)
     for v in _vs(cfg, ctx):
         out = mdir(cfg) / f"per_sample_{v['id']}.csv"
@@ -770,7 +775,7 @@ def cmd_stats(cfg: Cfg, ctx: Ctx) -> None:
         return
     st = dict(cfg.get("stats") or {})
     seed = int(cfg.get("seed", 42))
-    test = sampling.load(cfg, "test")
+    test = sampling.load_test_metadata(cfg)
     keys = test["key"].tolist()
     fp = data_fingerprint(cfg)
     vs = variants(cfg)

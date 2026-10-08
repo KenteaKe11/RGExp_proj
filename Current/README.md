@@ -11,7 +11,7 @@ Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key 
 
 | # | type_test | Nội dung | Variant | Cục bộ · Hub |
 |---|---|---|---|---|
-| **0** | `data` | Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold → **12800 train / 800 val / 2400 test** + ảnh. **Chạy trước** | — | `outputs/0_Data` + `data/splits` · `Current/0_Data` |
+| **0** | `data` | Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold → **5600 train / 1200 val / 2400 infer test**; metadata cố định **1200 test** để chấm điểm. **Chạy trước** | — | `outputs/0_Data` + `data/splits` · `Current/0_Data` |
 | 1 | `baseline` | 5 mô hình ở trạng thái gốc | mô hình | `outputs/1_Baseline` · `Current/1_Baseline` |
 | 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
@@ -59,7 +59,7 @@ python3 Current/tests/selftest.py         # smoke test ngắn, offline, không g
 Repo Hub `RGExp123/Research_results` phải tồn tại sẵn và token cần quyền ghi.
 
 Lần chạy `lora train` tự kéo fixture từ `Current/0_Data/fixture` trên Hub. Nếu cache ảnh train chưa có,
-nó chỉ tải 12.800 ảnh train từ repo dữ liệu; không tải cache val/test.
+nó chỉ tải 5.600 ảnh train từ repo dữ liệu; không tải cache val/test.
 
 ---
 
@@ -76,8 +76,8 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 | `data` | `status` | danh sách cố định có chưa, fixture, số ảnh train/val/test đã có, dấu vân tay |
 | `data` | `build` | `data/splits/*.csv` **có sẵn** → dựng fixture từ đúng danh sách đó; **chưa có** (hoặc `--force`) → sàng lọc + chia mới và ghi danh sách. Sau đó tải ảnh còn thiếu và đẩy fixture + splits lên Hub |
 | `data` | `push` | đẩy `0_Data/fixture` + `0_Data/splits` (+ id run W&B) lên Hub |
-| `baseline` | `status` | trạng thái từng mô hình: env · infer n/2400 · số lô đặc trưng CKA · score |
-| `baseline` | `infer` | từng mô hình: sinh 2400 báo cáo → `predictions.jsonl` + đặc trưng trước/sau aligner → `cka/*.npz` (đứt thì chạy lại sẽ đi tiếp) |
+| `baseline` | `status` | trạng thái từng mô hình: env · infer n/2400 · số lô đặc trưng CKA · score trên metadata 1200 |
+| `baseline` | `infer` | từng mô hình: sinh 2400 báo cáo → `predictions.jsonl` + đặc trưng trước/sau aligner → `cka/*.npz`; score/stats chỉ dùng metadata test cố định 1200 ảnh |
 | `baseline` | `score` | BLEU-1..4, ROUGE-1/2/L, BERTScore-F1, RadGraph-F1 theo ảnh → `metrics/per_sample_<m>.csv`; gom đặc trưng → `metrics/cka_<m>.npz` |
 | `baseline` | `stats` | kiểm định (theo k) + CKA → `REPORT.md`, `summary.csv`, `cka.json`, ... |
 | `baseline` | `push` | đẩy cả thư mục lên `Current/1_Baseline/` |
@@ -108,7 +108,7 @@ chạy offline và không tải hay ghi model/dataset cache.
 
 ```bash
 bash Current/run.sh data build                     # lần đầu: lọc + chia + ghi Current/data/splits -> commit vào git
-git add Current/data/splits && git commit -m "data: splits 12800/800/2400"
+git add Current/data/splits && git commit -m "data: splits 5600/1200/2400-metadata1200"
 bash Current/run.sh data status
 
 for m in gemma_it gemma_pt pali qwen phi; do       # chạy thử từng mô hình
@@ -135,7 +135,7 @@ Mã thoát: `0` xong · `1` lỗi · `2` sai cú pháp / config · `3` xong như
 
 | | |
 |---|---|
-| Cỡ | **12800 train · 800 val · 2400 test** |
+| Cỡ | **5600 train · 1200 val · 2400 test để infer**; `test_metadata.json` trích cố định **1200** ảnh cho score, stats và CKA |
 | 1. Hard filter góc chụp | chỉ giữ **Frontal** (`view` ∈ {PA, AP}) |
 | 2. Hard filter theo bệnh nhân | nhiều Frontal / bệnh nhân → giữ **1 ảnh**, ưu tiên lần lượt: (a) nhiều **pos** nhất, (b) nhiều nhãn **rõ ràng** nhất (pos/neg, khác uncertain và blank), (c) hoà → băm `sha256(seed, image_id)` (cố định) |
 | 3. Chia tập | **MultilabelStratifiedGroupKFold** (`rgexp/stratify.py`): iterative stratification ở mức nhóm = bệnh nhân, nhãn = pos. Chia hồ thành train / val / test / phần dư với đúng số lượng; không trùng bệnh nhân giữa các tập |
@@ -194,7 +194,7 @@ khoá sampling nào vào.
 |---|---|
 | Chuẩn LLMs | **BLEU**-1..4 · **ROUGE**-1/2/L · **BERTScore**-F1 (roberta-large L17), theo từng ảnh |
 | Med-Report | **F1-RadGraph** (radgraph-xl, partial; metric chính) |
-| Baseline | **CKA** trước ↔ sau Aligner/Adapter: linear CKA giữa đặc trưng encoder thị giác (vào aligner) và đầu ra aligner (vào LLM); mỗi ảnh = trung bình theo token; tính trên 2400 ảnh test |
+| Baseline | **CKA** trước ↔ sau Aligner/Adapter: linear CKA giữa đặc trưng encoder thị giác (vào aligner) và đầu ra aligner (vào LLM); mỗi ảnh = trung bình theo token; tính trên 1200 ảnh test |
 
 **e2. Tiền xử lý** (cho cả dự đoán lẫn tham chiếu, đúng thứ tự)
 1. Lowercasing
@@ -276,7 +276,7 @@ sang RAM.
 Batch sinh bắt đầu từ 64; gặp OOM thì chia đôi và làm lại chính lô đó. Mỗi mô hình chạy trong một
 tiến trình riêng.
 
-`data build` tải **16000 ảnh** (train cho QLoRA về sau). Muốn chỉ tải ảnh test thì dùng
+`data build` tải **9200 ảnh** (train cho QLoRA về sau). Muốn chỉ tải ảnh test thì dùng
 `--set "data.image_splits=[test]"`.
 
 ## 7. Đã kiểm trước khi giao

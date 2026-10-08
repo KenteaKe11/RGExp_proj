@@ -2,7 +2,7 @@
 # ĐIỀU KIỆN THÍ NGHIỆM CHUNG (quy chuẩn mới — tập dữ liệu lớn) — cho MỌI key thí nghiệm
 # ═════════════════════════════════════════════════════════════════════════════
 #   key           type_test   thư mục        nội dung
-#   0  data       data        0_Data         Frontal · 1 ảnh/bệnh nhân · MSGKF 12800/800/2400 + ảnh
+#   0  data       data        0_Data         Frontal · 1 ảnh/bệnh nhân · MSGKF 5600/1200/2400 + metadata test 1200
 #   1  baseline   baseline    1_Baseline     5 mô hình ở trạng thái gốc (variant = mô hình)
 #   2  lora       lora        2_LoRA         Phi QLoRA (variant = base + nhóm/rank)
 #
@@ -47,9 +47,10 @@ labels:
   orientation: auto              # auto | as_is | swap
 
 sampling:
-  n_train: 12800
-  n_val: 800
+  n_train: 5600
+  n_val: 1200
   n_test: 2400
+  n_test_metadata: 1200    # tập cố định dùng để score/stats/CKA, được trích từ 2.400 ảnh infer
   # Sàng lọc THEO THỨ TỰ, áp cho MỌI tập:
   #  1. Hard filter góc chụp: chỉ giữ Frontal (cột `view` ∈ frontal_views).
   frontal_views: [PA, AP]
@@ -197,7 +198,7 @@ metrics:
     enabled: true
     model_type: radgraph-xl
     reward_level: all
-    batch_size: 32              # lô chấm; hiện pbar theo lô và tránh một lô 2400 mẫu quá lâu
+    batch_size: 32              # lô chấm; hiện pbar theo lô và tránh một lô 1200 mẫu quá lâu
   primary: radgraph_f1
   # e1.3 Baseline: CKA (linear) giữa đặc trưng TRƯỚC và SAU Aligner/Adapter của từng mô hình,
   # trên toàn bộ ảnh test (mỗi ảnh = trung bình theo token). Một số / mô hình, CI bootstrap.

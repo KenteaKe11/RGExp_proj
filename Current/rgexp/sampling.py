@@ -1,4 +1,4 @@
-"""Key data — sàng lọc + chia tập theo quy chuẩn mới: 12800 train / 800 val / 2400 test.
+"""Key data — sàng lọc + chia tập theo quy chuẩn mới: 5600 train / 1200 val / 2400 test.
 
 Thứ tự sàng lọc (áp cho MỌI tập):
   1. Hard filter góc chụp: chỉ giữ Frontal (`view` ∈ sampling.frontal_views, mặc định PA, AP).
@@ -15,9 +15,10 @@ rgexp/label_orientation.py) — đảo nếu cần, DỪNG nếu mơ hồ.
   * DANH SÁCH CỐ ĐỊNH CHO REPO (vào git) — Current/data/splits/:
         {train,val,test}.csv / .json   [image_id, subject_id, study_id, filepath, view, <14 nhãn>]
         nhãn: 1 = pos · 0 = neg · -1 = uncertain · trống = blank
+        test_metadata.json            1.200 key cố định, trích phân tầng từ 2.400 test để score/stats/CKA
         split_report.json             số lượng từng bước lọc, số ca dương từng nhãn × tập, chiều nhãn
     Có sẵn -> `data build` dựng lại fixture từ đúng danh sách này (không lấy mẫu lại).
-  * FIXTURE làm việc — outputs/0_Data/fixture/{train,val,test}set.jsonl
+  * FIXTURE làm việc — outputs/0_Data/fixture/{train,val,test}set.jsonl + test_metadata.json
         {key, ref, patient, image_id, study_id, view, labels{tên: pos|neg|unc|nan}}  (+ labels.json)
     Báo cáo (text_gt) chỉ nằm ở fixture (ngoài git), không vào repo.
 """
@@ -40,6 +41,7 @@ CHEXPERT_14 = ("No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly",
                "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion",
                "Pleural Other", "Fracture", "Support Devices")
 SPLITS = ("train", "val", "test")
+TEST_METADATA = "test_metadata.json"
 ID_COLS = ["image_id", "subject_id", "study_id", "filepath", "view"]
 
 
@@ -57,7 +59,7 @@ def splits_dir(cfg: Cfg) -> Path:
 
 
 def has_splits(cfg: Cfg) -> bool:
-    return all((splits_dir(cfg) / f"{s}.csv").exists() for s in SPLITS)
+    return all((splits_dir(cfg) / f"{s}.csv").exists() for s in SPLITS) and (splits_dir(cfg) / TEST_METADATA).exists()
 
 
 def load(cfg: Cfg, split: str = "test") -> pd.DataFrame:
@@ -65,6 +67,19 @@ def load(cfg: Cfg, split: str = "test") -> pd.DataFrame:
     if not p.exists():
         raise FileNotFoundError(f"Chưa có {p} — chạy `bash Current/run.sh data build`.")
     return pd.DataFrame([json.loads(line) for line in open(p, encoding="utf-8") if line.strip()])
+
+
+def load_test_metadata(cfg: Cfg) -> pd.DataFrame:
+    """Trả đúng tập test cố định được dùng cho score, stats và CKA."""
+    p = fixture_dir(cfg) / TEST_METADATA
+    if not p.exists():
+        raise FileNotFoundError(f"Chưa có {p} — chạy `bash Current/run.sh data build --force`.")
+    keys = (json.loads(p.read_text(encoding="utf-8")) or {}).get("keys") or []
+    test = load(cfg, "test").set_index("key", drop=False)
+    missing = [k for k in keys if k not in test.index]
+    if missing:
+        raise SamplingFailed(f"metadata test chứa {len(missing)} key ngoài testset.")
+    return test.loc[keys].reset_index(drop=True)
 
 
 def label_names(cfg: Cfg) -> list[str]:
@@ -126,7 +141,7 @@ def _meta(cfg: Cfg) -> pd.DataFrame:
                              d.get("view_column", "view"): "view"})
 
 
-def _write_fixture(cfg: Cfg, rows: dict[str, list[dict]], names: list[str], report: dict) -> None:
+def _write_fixture(cfg: Cfg, rows: dict[str, list[dict]], names: list[str], report: dict, test_metadata: dict) -> None:
     fx = fixture_dir(cfg)
     fx.mkdir(parents=True, exist_ok=True)
     for s, rs in rows.items():
@@ -134,11 +149,12 @@ def _write_fixture(cfg: Cfg, rows: dict[str, list[dict]], names: list[str], repo
             for r in sorted(rs, key=lambda r: r["key"]):       # thứ tự khối ghép cặp = thứ tự key
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     (fx / "labels.json").write_text(json.dumps(names, ensure_ascii=False, indent=1), encoding="utf-8")
+    (fx / TEST_METADATA).write_text(json.dumps(test_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     (fx / "sampling_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str),
                                              encoding="utf-8")
 
 
-def _write_splits(cfg: Cfg, tables: dict[str, pd.DataFrame], report: dict) -> None:
+def _write_splits(cfg: Cfg, tables: dict[str, pd.DataFrame], report: dict, test_metadata: dict) -> None:
     sd = splits_dir(cfg)
     sd.mkdir(parents=True, exist_ok=True)
     for s, t in tables.items():
@@ -149,7 +165,9 @@ def _write_splits(cfg: Cfg, tables: dict[str, pd.DataFrame], report: dict) -> No
             recs.append({**{c: r[c] for c in ID_COLS},
                          "labels": {nm: r[nm] for nm in report["labels"]}})
         (sd / f"{s}.json").write_text(json.dumps(recs, ensure_ascii=False, indent=1), encoding="utf-8")
+    (sd / TEST_METADATA).write_text(json.dumps(test_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     report["sha256"] = {f"{s}.csv": hashlib.sha256((sd / f"{s}.csv").read_bytes()).hexdigest() for s in tables}
+    report["sha256"][TEST_METADATA] = hashlib.sha256((sd / TEST_METADATA).read_bytes()).hexdigest()
     (sd / "split_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str),
                                           encoding="utf-8")
 
@@ -163,6 +181,9 @@ def build(cfg: Cfg, meta: pd.DataFrame | None = None) -> dict:
     sc = dict(cfg.get("sampling") or {})
     seed = int(cfg.get("seed", 42))
     n = {s: int(sc[f"n_{s}"]) for s in SPLITS}
+    n_test_metadata = int(sc.get("n_test_metadata", n["test"]))
+    if not 0 < n_test_metadata <= n["test"]:
+        raise SamplingFailed("sampling.n_test_metadata phải trong khoảng 1..n_test.")
     print("═══ Lấy mẫu (rgexp/sampling.py) — Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold ═══",
           flush=True)
     lut, info = labels_cls.load_map(cfg)
@@ -229,19 +250,25 @@ def build(cfg: Cfg, meta: pd.DataFrame | None = None) -> dict:
                     "image_id": r["image_id"], "study_id": r["study_id"], "view": r["view"], "labels": lab}
                    for i, r, lab in zip(idx, t.to_dict("records"), st)]
         pos[s] = Y[idx].sum(0)
+    test_idx = np.flatnonzero(assign == SPLITS.index("test"))
+    chosen = split_by_sizes(Y[test_idx], m.iloc[test_idx]["subject_id"].to_numpy(),
+                            [n_test_metadata, n["test"] - n_test_metadata], seed)
+    test_metadata = {"seed": seed, "source_split": "test", "n": n_test_metadata,
+                     "keys": sorted(m.iloc[test_idx[chosen == 0]]["filepath"].tolist())}
     pats = {s: set(t["subject_id"]) for s, t in tables.items()}
     overlap = {f"{a}|{b}": len(pats[a] & pats[b]) for a in pats for b in pats if a < b}
     if any(overlap.values()):
         raise SamplingFailed(f"bệnh nhân trùng giữa các tập: {overlap}")
-    report = {"seed": seed, "n_train": n["train"], "n_val": n["val"], "n_test": n["test"], "steps": steps,
+    report = {"seed": seed, "n_train": n["train"], "n_val": n["val"], "n_test": n["test"],
+              "n_test_metadata": n_test_metadata, "steps": steps,
               "frontal_views": sc.get("frontal_views"), "labels": names, "label_orientation": orient,
               "positives": {s: {names[j]: int(pos[s][j]) for j in range(len(names))} for s in SPLITS},
               "positives_pool": {names[j]: int(Y[:, j].sum()) for j in range(len(names))},
               "imbalance": {s: imbalance(pos[s]) for s in SPLITS}, "patients_overlap": overlap,
               "pool_images": steps["one_per_patient"], "pool_patients": steps["one_per_patient"],
               "method": "multilabel_stratified_group_kfold", "source": "build"}
-    _write_splits(cfg, tables, report)
-    _write_fixture(cfg, rows, names, report)
+    _write_splits(cfg, tables, report, test_metadata)
+    _write_fixture(cfg, rows, names, report, test_metadata)
     print(f"  ✓ danh sách cố định -> {splits_dir(cfg)} (vào git) · fixture -> {fixture_dir(cfg)}", flush=True)
     return report
 
@@ -252,6 +279,10 @@ def from_splits(cfg: Cfg, meta: pd.DataFrame | None = None) -> dict:
     sd = splits_dir(cfg)
     rep = json.loads((sd / "split_report.json").read_text(encoding="utf-8")) if (sd / "split_report.json").exists() else {}
     tables = {s: pd.read_csv(sd / f"{s}.csv", dtype=str, keep_default_na=False) for s in SPLITS}
+    metadata_path = sd / TEST_METADATA
+    if not metadata_path.exists():
+        raise SamplingFailed(f"thiếu metadata test cố định: {metadata_path}")
+    test_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     names = [c for c in tables["train"].columns if c not in ID_COLS]
     meta = _meta(cfg) if meta is None else meta
     ref = dict(zip(meta["filepath"], meta["ref"]))
@@ -272,5 +303,5 @@ def from_splits(cfg: Cfg, meta: pd.DataFrame | None = None) -> dict:
     print(f"═══ Dữ liệu: dựng fixture từ danh sách cố định {sd} — {got}", flush=True)
     report = {**rep, "source": "splits", "labels": names,
               **{f"n_{s}": got[s] for s in SPLITS}}
-    _write_fixture(cfg, rows, names, report)
+    _write_fixture(cfg, rows, names, report, test_metadata)
     return report

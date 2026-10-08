@@ -1,6 +1,6 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # KEY THÍ NGHIỆM 1 — Baseline: 5 mô hình ở trạng thái GỐC (không adapter, không fine-tune,
-# KHÔNG lượng tử), cùng dữ liệu (2400 ảnh test), cùng prompt system + user (định dạng theo chuẩn
+# KHÔNG lượng tử), infer trên 2400 ảnh test; score/stats trên metadata cố định 1200 ảnh, cùng prompt system + user (định dạng theo chuẩn
 # đầu vào của từng mô hình), cùng ảnh 3×512×512 -> AutoProcessor gốc, cùng infer policy.
 #   Variant = mô hình.
 #   Metric: BLEU-1..4 · ROUGE-1/2/L · BERTScore-F1 (chuẩn LLM) · RadGraph-F1 (Med-Report)

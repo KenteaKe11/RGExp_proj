@@ -3,7 +3,7 @@
 # run.sh — điểm vào DUY NHẤT:   bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 #
 #   type_test   = key thí nghiệm (experiments/<N>_<key>.yaml), không phân biệt hoa thường:
-#               data     (0)  Frontal · 1 ảnh/bệnh nhân · MSGKF 12800/800/2400 + ảnh — BẮT BUỘC chạy trước
+#               data     (0)  Frontal · 1 ảnh/bệnh nhân · MSGKF 5600/1200/2400 + metadata test 1200 — BẮT BUỘC chạy trước
 #               baseline (1)  5 mô hình ở trạng thái gốc (variant = mô hình)
 #               lora     (2)  Phi-3.5-vision QLoRA: base + attention/all-linear (rank 2/4/8)
 #
