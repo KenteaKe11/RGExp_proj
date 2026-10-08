@@ -80,7 +80,10 @@ def _initial_mini_batch(max_batch: int, cpu_slots: int, ram_avail_bytes: int,
         reserve = max(reserve_vram_gib * gib, reserve_vram_frac * gpu_total_bytes)
         gpu_cap = max(1, int(max(0, gpu_free_bytes - reserve) // (512 * 1024 ** 2)))
         caps["vram"] = gpu_cap
-    return min(caps.values()), caps
+    raw = min(caps.values())
+    # Micro-batch luôn là 2^k để việc giảm OOM bằng một nửa giữ đúng cùng lưới.
+    mini_batch = 1 << (int(raw).bit_length() - 1)
+    return mini_batch, caps
 
 
 def _training_minibatch(torch, autotune: dict) -> tuple[int, dict[str, int]]:
@@ -289,6 +292,7 @@ def train(spec_path: Path) -> None:
     print("  mini-batch tự dò: " + " · ".join(f"{k}={v}" for k, v in batch_caps.items()) +
           f" -> bắt đầu {mini_batch}", flush=True)
     params = [p for p in model.parameters() if p.requires_grad]
+    confirmed_mini_batch = None
     for step, start in enumerate(range(0, len(rows), global_batch), start=1):
         group = rows[start:start + global_batch]
         while True:
@@ -314,6 +318,12 @@ def train(spec_path: Path) -> None:
                     torch.cuda.empty_cache()
                 print(f"  ⚠ OOM ở step {step} -> mini_batch={mini_batch}, làm lại global batch", flush=True)
         grad_norm = _grad_norm(params, torch)
+        if confirmed_mini_batch != mini_batch:
+            print(f"  ✓ mini_batch chốt={mini_batch} (2^{mini_batch.bit_length() - 1}) tại optimizer step {step}/{steps}",
+                  flush=True)
+            run.log({"train_step": step, "train/mini_batch_finalized": mini_batch,
+                     "train/mini_batch_finalized_step": step})
+            confirmed_mini_batch = mini_batch
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)

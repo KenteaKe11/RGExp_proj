@@ -211,7 +211,7 @@ def t03_lora_minibatch():
     gib = 1024 ** 3
     mini, caps = _initial_mini_batch(64, 16, 20 * gib, 8 * gib, 12 * gib, 4.0, 1.5, 0.06)
     assert caps == {"configured": 64, "cpu": 16, "ram": 64, "vram": 13}
-    assert mini == 13
+    assert mini == 8
     mini, caps = _initial_mini_batch(64, 4, 3 * gib, None, None, 4.0, 1.5, 0.06)
     assert caps == {"configured": 64, "cpu": 4, "ram": 1} and mini == 1
 
