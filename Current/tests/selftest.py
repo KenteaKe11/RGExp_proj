@@ -11,7 +11,7 @@
   t06 CKA: bất biến phép quay/co giãn, = 1 khi Y = XR; bootstrap + paired bootstrap; tách token theo
       ảnh của Phi-3.5-vision (HD transform)
   t07 W&B: trùng -> bỏ qua; --force -> xoá + ghi đè; dở -> đi tiếp đúng run; chạy thử -> ghi đè
-  t08 pipeline: all = infer MỌI mô hình (3) -> score -> stats -> push; lưu Hub sau MỖI mô hình; env legacy
+  t08 pipeline: all = infer MỌI mô hình (3) -> score -> stats -> push; lưu recovery sau MỖI variant; env legacy
       cho Phi; bỏ qua phần đã xong; --force; trùng W&B -> mã 3; repo Hub không bao giờ tạo
   t09 stats end-to-end: k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
   t10 resume từ Hub Current/1_Baseline (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
@@ -679,8 +679,9 @@ def t08_pipeline_flow():
             assert steps == [f"infer {i}" for i in vids] + [f"score {i}" for i in vids] + ["stats"], steps
             assert envs == {"gemma3_4b_it": "main", "gemma3_4b_pt": "main", "paligemma2_3b": "main", "qwen25vl_3b": "main",
                             "phi35_vision": "legacy"}, envs
-            i = ev.index("infer phi35_vision")
-            assert ev[i + 1] == "push:Current/1_Baseline/cands/phi35_vision" and ev[i + 2] == "file:Current/1_Baseline/wandb_ids.json"
+            for vid in vids:
+                i = ev.index(f"infer {vid}")
+                assert ev[i + 1] == f"push:Current/1_Baseline/cands/{vid}" and ev[i + 2] == "file:Current/1_Baseline/wandb_ids.json"
             j = ev.index("score phi35_vision")
             assert "file:Current/1_Baseline/metrics/cka_phi35_vision.npz" in ev[j:j + 5], ev[j:j + 5]
             assert ev[-1] == "push:Current/1_Baseline"

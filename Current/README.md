@@ -84,10 +84,11 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 | `baseline` | `all` | **infer MỌI mô hình** → **score** → **stats** → **push** |
 | `lora` | `train` | 8 adapter Phi: projector full-ft + decoder QLoRA, 1 epoch · base candidate bỏ qua |
 | `lora` | `infer` / `score` / `stats` / `push` | tương tự baseline trên 9 candidate |
-| `lora` | `all` | **train** → **infer** → **score** → **stats** → **push** |
+| `lora` | `all` | **train MỌI QLoRA variant** → **infer MỌI candidate** → **score** → **stats** → **push** |
 
-**Lưu sau mỗi mô hình.** Mỗi khi infer hoặc score xong một mô hình bất kì, chương trình đẩy ngay
-kết quả của mô hình đó lên Hub (tắt bằng `--no-push`).
+**Lưu recovery sau mỗi variant.** Mỗi khi train, infer hoặc score xong một variant, chương trình đẩy ngay
+kết quả đã có của variant đó lên Hub (tắt bằng `--no-push`). Với `all`, stage kế tiếp chỉ bắt đầu sau
+khi toàn bộ variant của stage hiện tại đã xử lý xong.
 
 `run.sh` tự gọi `tests/selftest.py --quick` trước các lệnh chạy. Chế độ này chỉ smoke-test cấu hình,
 chạy offline và không tải hay ghi model/dataset cache.

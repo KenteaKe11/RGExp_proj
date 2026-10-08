@@ -5,8 +5,10 @@ operation theo kind:
     data      status | build | push
     baseline  status | infer | score | stats | push | all
     lora      status | train | infer | score | stats | push | all
-all = infer MỌI variant -> score MỌI variant -> stats -> push.
-Xong MỘT variant bất kì (infer / score) là LƯU ngay lên Hub (output.push_each_variant).
+all (baseline) = infer MỌI variant -> score MỌI variant -> stats -> push.
+all (lora) = train MỌI QLoRA variant -> infer MỌI variant -> score MỌI variant -> stats -> push.
+Xong MỘT variant ở train / infer / score là LƯU ngay lên Hub (output.push_each_variant),
+để có thể resume sau khi bị gián đoạn.
 
 Variant của baseline = mô hình (gemma3_4b, qwen25vl_3b, phi35_vision). Lọc: --models.
 Mỗi mô hình chạy bằng python của môi trường của nó (models.<m>.env: main | legacy).
@@ -844,7 +846,7 @@ def _ignore(cfg: Cfg) -> list[str]:
 
 
 def push_variant(cfg: Cfg, ctx: Ctx, v: dict, stage: str) -> None:
-    """LƯU ngay khi một variant xong infer / score: cands/<variant>/ + metric của nó + id W&B."""
+    """Lưu recovery ngay sau train/infer/score: candidate, metric liên quan và W&B IDs."""
     a = ctx.a
     if a.no_push or a.limit or not cfg["output"].get("push_each_variant", True):
         return
