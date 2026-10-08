@@ -4,6 +4,7 @@ type_test = key thí nghiệm (experiments/<N>_<key>.yaml):  data (0) · baselin
 operation theo kind:
     data      status | build | push
     baseline  status | infer | score | stats | push | all
+    lora      status | train | infer | score | stats | push | all
 all = infer MỌI variant -> score MỌI variant -> stats -> push.
 Xong MỘT variant bất kì (infer / score) là LƯU ngay lên Hub (output.push_each_variant).
 
@@ -33,9 +34,11 @@ from .config import ROOT, Cfg, ConfigError, load, seed_everything, snapshot
 from .progress import HubBar, wait_bar
 
 OPS = {"data": ("status", "build", "push"),
-       "baseline": ("status", "infer", "score", "stats", "push", "all")}
+       "baseline": ("status", "infer", "score", "stats", "push", "all"),
+       "lora": ("status", "train", "infer", "score", "stats", "push", "all")}
 WB_IDS = "wandb_ids.json"
-PUSH_IGNORE = ["**/wandb/**", ".hub_cache/**", "**/dryrun/**", "tasks/**", ".lock", "**/*.tmp", "**/infer_spec.json"]
+PUSH_IGNORE = ["**/wandb/**", ".hub_cache/**", "**/dryrun/**", "tasks/**", ".lock", "**/*.tmp",
+               "**/infer_spec.json", "**/train_spec.json"]
 INFER_FILES = ["predictions.jsonl", "infer_probe.json", "infer_fingerprint.txt", "worker_meta.json", "infer_spec.json",
                "cka"]
 SPLITS = ("train", "val", "test")
@@ -146,11 +149,25 @@ def _model_filter(cfg: Cfg, models: str | None) -> list[str]:
 def variants(cfg: Cfg, models: str | None = None) -> list[dict]:
     """Danh sách variant của key, theo thứ tự trong file key."""
     out = []
-    if cfg["exp"]["kind"] == "baseline":
+    if cfg["exp"]["kind"] in ("baseline", "lora"):
         for mk in _model_filter(cfg, models):
             m = cfg["models"][mk]
-            out.append({"id": mk, "path": mk, "group": "models", "model_key": mk, "model": dict(m),
-                        "name": m.get("name", mk), "order": list(cfg["models"]).index(mk)})
+            if cfg["exp"]["kind"] == "baseline":
+                out.append({"id": mk, "path": mk, "group": "models", "model_key": mk, "model": dict(m),
+                            "name": m.get("name", mk), "order": list(cfg["models"]).index(mk)})
+                continue
+            specs = ([{"id": "base", "name": "Base quantized", "mode": "base"}]
+                     if cfg["lora"].get("base_candidate", True) else [])
+            for group, targets in cfg["lora"]["decoder_targets"].items():
+                for rank in cfg["lora"]["ranks"]:
+                    specs.append({"id": f"{group}_r{rank}", "name": f"{group} QLoRA r={rank}",
+                                  "mode": "lora", "group": group, "rank": int(rank),
+                                  "target_modules": list(targets)})
+            for i, spec in enumerate(specs):
+                out.append({"id": f"{mk}_{spec['id']}", "path": f"{mk}/{spec['id']}",
+                            "group": spec.get("group", "base"), "model_key": mk, "model": dict(m),
+                            "lora_spec": {**spec, "config": dict(cfg["lora"])},
+                            "name": f"{m.get('name', mk)} · {spec['name']}", "order": i})
     return out
 
 
@@ -269,7 +286,7 @@ def data_sync_from_hub(cfg: Cfg) -> None:
         stage = data_dir(cfg) / ".hub_cache"
         say("  ↓ tải fixture còn thiếu từ Hub")
         with wait_bar("  Hub: chuẩn bị fixture"):
-            snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
+            snapshot_download(repo_id=o.get("data_hub_repo", o["hub_repo"]), repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
                               token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)],
                               etag_timeout=10, tqdm_class=HubBar)
     except Exception as e:  # noqa: BLE001
@@ -349,7 +366,7 @@ def data_build(cfg: Cfg, ctx: Ctx) -> None:
 
 
 def _api(cfg: Cfg):
-    """HfApi tới repo CŨ. Không bao giờ tạo repo: không có / không có quyền -> RunFailed."""
+    """HfApi tới repo dataset kết quả chung của mọi key."""
     from huggingface_hub import HfApi
 
     from .config import hf_token
@@ -430,7 +447,8 @@ def common_spec(cfg: Cfg, v: dict) -> dict:
             "image_size": int((cfg.get("image") or {}).get("size", 512)), "autotune": dict(cfg.get("autotune") or {}),
             "wandb": dict(cfg.get("wandb") or {}), "experiment": cfg["exp"]["dirname"],
             "cka": bool((cfg["metrics"].get("cka") or {}).get("enabled", True)),
-            "candidate": {"id": v["id"], "name": v["name"], "model_key": v["model_key"]}}
+            "candidate": {"id": v["id"], "name": v["name"], "model_key": v["model_key"]},
+            **({"lora_candidate": v["lora_spec"]} if v.get("lora_spec") else {})}
 
 
 def env_python(env: str) -> str:
@@ -521,12 +539,45 @@ def cmd_infer(cfg: Cfg, ctx: Ctx) -> None:
             continue
         ifp.write_text(str(fp), encoding="utf-8")
         spec = {**common_spec(cfg, v), "mode": "infer", "data_fingerprint": fp, "generate": policy(cfg),
-                "tasks": str(te.resolve()), "out_dir": str(d.resolve()), "wandb_run": pl}
+                "tasks": str(te.resolve()), "out_dir": str(d.resolve()), "adapter_dir": str(vdir(cfg, v).resolve()),
+                "wandb_run": pl}
         p = d / "infer_spec.json"
         p.write_text(json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8")
         say(f"═══ infer {v['id']} · {v['model']['hf_id']} · env {v['model']['env']} ═══")
         _run_worker(p, a.limit, f"infer {v['id']}", v["model"]["env"])
         push_variant(cfg, ctx, v, "infer")
+
+
+def cmd_train(cfg: Cfg, ctx: Ctx) -> None:
+    require_data(cfg, ("train",))
+    tasks = write_tasks(cfg, "train", True)
+    for v in _vs(cfg, ctx):
+        if v["lora_spec"]["mode"] == "base":
+            say(f"  ✓ {v['id']}: candidate nền, không train")
+            continue
+        d = vdir(cfg, v)
+        done = all((d / name).exists() for name in ("adapter_config.json", "adapter_model.safetensors",
+                                                     "projector_state.pt"))
+        if done and not ctx.force:
+            say(f"  ✓ {v['id']}: đã có adapter cuối — bỏ qua (--force để train lại)")
+            continue
+        if ctx.force:
+            _wipe(d, ["adapter_config.json", "adapter_model.safetensors", "projector_state.pt", "trainer_state.json"])
+        pl = wb_plan(cfg, ctx, rname(cfg, "train", v), partial=any(d.glob("checkpoint-*")))
+        if pl is None:
+            continue
+        spec = {**common_spec(cfg, v), "mode": "train", "tasks": str(tasks.resolve()),
+                "out_dir": str(d.resolve()), "train": dict(cfg["train"]),
+                "lora": dict(cfg["lora"]), "wandb": dict(cfg["wandb"]), "wandb_run": pl,
+                "wandb_dir": str((d / "wandb").resolve()), "experiment": cfg["exp"]["dirname"]}
+        spec_path = d / "train_spec.json"
+        spec_path.write_text(json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8")
+        cmd = [env_python(v["model"]["env"]), "-m", "rgexp.lora_worker", "--spec", str(spec_path)]
+        say(f"═══ train {v['id']} · {v['name']} ═══")
+        rc = subprocess.call(cmd, cwd=str(ROOT), env=dict(os.environ))
+        if rc:
+            raise RunFailed(f"QLoRA trainer {v['id']} thoát mã {rc}.")
+        push_variant(cfg, ctx, v, "train")
 
 
 def collect_cka(cfg: Cfg, v: dict, keys: list[str]) -> Path | None:
@@ -810,7 +861,8 @@ def cmd_push(cfg: Cfg, ctx: Ctx) -> None:
     say(f"✓ đã đẩy lên {repo}:{hub_path(cfg, dn)}/")
 
 
-def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
+def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None, needs: tuple[str, ...] =
+                  ("infer", "metrics", "adapters")) -> None:
     """Kéo về phần máy này CÒN THIẾU: predictions dài hơn (+ đặc trưng CKA), per_sample / cka, id W&B.
     Không bao giờ ghi đè cái cục bộ đầy đủ hơn."""
     if not cfg["output"].get("resume_from_hub", True):
@@ -829,10 +881,14 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
         patterns = [hub_path(cfg, dn, WB_IDS)]
         for v in selected:
             base = hub_path(cfg, dn, "cands", v["path"])
-            patterns += [f"{base}/predictions.jsonl", f"{base}/infer_fingerprint.txt",
-                         f"{base}/cka/*.npz"]
-            patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
-                         for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
+            if "infer" in needs:
+                patterns += [f"{base}/predictions.jsonl", f"{base}/infer_fingerprint.txt", f"{base}/cka/*.npz"]
+            if "adapters" in needs:
+                patterns += [f"{base}/adapter_config.json", f"{base}/adapter_model.safetensors",
+                             f"{base}/projector_state.pt", f"{base}/trainer_state.json"]
+            if "metrics" in needs:
+                patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
+                             for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
         say(f"  ↓ tải resume của {len(selected)} variant từ Hub")
         with wait_bar("  Hub: đồng bộ kết quả"):
             snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
@@ -850,6 +906,12 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
         if not hd.exists():
             continue
         d = vdir(cfg, v)
+        for artifact in ("adapter_config.json", "adapter_model.safetensors", "projector_state.pt",
+                         "trainer_state.json"):
+            src, dst = hd / artifact, d / artifact
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+                got.append(f"{v['id']}:{artifact}")
         hp, lp = hd / "predictions.jsonl", d / "predictions.jsonl"
         hfp = (hd / "infer_fingerprint.txt").read_text().strip() if (hd / "infer_fingerprint.txt").exists() else None
         if hp.exists() and _fp_status(hfp, fp) != "ok":
@@ -863,7 +925,7 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None) -> None:
             got.append(f"{v['id']}:infer")
         for f in (f"per_sample_{v['id']}.csv", f"corpus_{v['id']}.json", f"cka_{v['id']}.npz"):
             src, dst = base / "metrics" / f, mdir(cfg) / f
-            if src.exists() and not dst.exists() and len(read_preds(d / "predictions.jsonl")):
+            if src.exists() and not dst.exists():
                 mdir(cfg).mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 got.append(f"metrics:{f}")
@@ -937,17 +999,23 @@ def run(cfg: Cfg, a) -> int:
         with SingleInstance(data_dir(cfg) / ".lock"):
             {"status": data_status, "build": lambda c: data_build(c, ctx), "push": lambda c: data_push(c, ctx)}[a.op](cfg)
     else:
-        if a.op == "push":
-            cmd_push(cfg, ctx)
-            return 0
         with SingleInstance(run_dir(cfg) / ".lock"):
-            if a.op in ("infer", "score", "all") and not a.no_hub_resume and not a.limit:
-                say("  ↓ kiểm tra resume từ Hub trước khi chạy (thêm --no-hub-resume để bỏ qua)")
+            if a.op != "status" and not a.no_hub_resume:
+                say("  ↓ đồng bộ file tối thiểu từ Hub trước khi chạy (thêm --no-hub-resume để bỏ qua)")
                 data_sync_from_hub(cfg)
-                sync_from_hub(cfg, _vs(cfg, ctx))
+                needs = {"train": ("adapters",), "infer": ("infer", "adapters"),
+                         "score": ("infer", "metrics"), "all": ("infer", "metrics", "adapters"),
+                         "stats": ("metrics",), "push": ("infer", "metrics", "adapters")}.get(a.op, ())
+                if needs and not a.limit:
+                    sync_from_hub(cfg, _vs(cfg, ctx), needs)
             scan(cfg)
             if a.op == "status":
                 return 0
+            if a.op == "push":
+                cmd_push(cfg, ctx)
+                return 0
+            if a.op in ("train", "all") and kind == "lora":
+                cmd_train(cfg, ctx)
             if a.op in ("infer", "all"):                  # all: infer MỌI variant trước
                 cmd_infer(cfg, ctx)
             if a.op in ("score", "all") and not a.limit:  # rồi score

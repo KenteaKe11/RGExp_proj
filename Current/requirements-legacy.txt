@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Môi trường LEGACY (env legacy, .venv-legacy) — chỉ để SINH + lấy đặc trưng CKA cho:
-#   microsoft/Phi-3.5-vision-instruct   remote code dùng DynamicCache.seen_tokens / get_max_length /
+#   microsoft/Phi-3.5-vision-instruct   inference + QLoRA; remote code dùng DynamicCache.seen_tokens / get_max_length /
 #                                       get_usable_length (bị xoá từ transformers 4.49) -> cần bản cũ
 # Dựng bằng `python -m venv --system-site-packages` từ python chính (setup.sh): dùng lại torch /
 # torchvision khớp CUDA, chỉ ĐÈ transformers + vài gói. Chấm điểm / thống kê vẫn ở env main.
@@ -17,3 +17,5 @@ psutil>=5.9
 wandb>=0.17
 huggingface_hub>=0.24,<1.0
 hf_transfer>=0.1.6
+peft>=0.13,<0.16
+bitsandbytes>=0.43.3

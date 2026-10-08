@@ -1,4 +1,4 @@
-"""REPORT.md của key baseline (ghi đè mỗi lần `stats`)."""
+"""REPORT.md của baseline và QLoRA (ghi đè mỗi lần `stats`)."""
 from __future__ import annotations
 
 import math
@@ -40,11 +40,21 @@ def render(cfg, g, ckres, srep, n_test) -> str:
     L = []
     w = L.append
     w(f"# Thí nghiệm {ex['id']} — {ex['title']}\n")
-    w(f"{len(ids)} mô hình ở **trạng thái gốc** (không adapter, không fine-tune, **không lượng tử**, dtype "
-      f"`{cfg.get('dtype')}`), cùng prompt system + user (định dạng theo chuẩn đầu vào từng mô hình), ảnh "
-      f"3×{(cfg.get('image') or {}).get('size', 512)}² → AutoProcessor gốc, cùng infer policy. Chấm trên **{n_test} ảnh test** (fixture chung "
-      f"`0_Data`). Kiểm định: " + ("**Permutation + Paired Bootstrap** (k = 2)." if g["method"] != "friedman"
-                                   else f"**Friedman** (k = {len(ids)} > 2, khối = ảnh) + hậu kiểm.") + "\n")
+    if ex["kind"] == "lora":
+        lora = cfg["lora"]
+        w(f"{len(ids)} candidate của `{cfg['models'][g['variants'][0]['model_key']]['hf_id']}`: base 4-bit và "
+          f"decoder QLoRA ({', '.join(map(str, lora['ranks']))}) + projector full-ft, 1 epoch, global batch "
+          f"{cfg['train']['global_batch']}. Prompt system + user theo chat template Phi, ảnh "
+          f"3×{(cfg.get('image') or {}).get('size', 512)}² → AutoProcessor gốc, cùng infer policy. Chấm trên "
+          f"**{n_test} ảnh test** (fixture chung `0_Data`). Kiểm định: " +
+          ("**Permutation + Paired Bootstrap** (k = 2)." if g["method"] != "friedman"
+           else f"**Friedman** (k = {len(ids)} > 2, khối = ảnh) + hậu kiểm.") + "\n")
+    else:
+        w(f"{len(ids)} mô hình ở **trạng thái gốc** (không adapter, không fine-tune, **không lượng tử**, dtype "
+          f"`{cfg.get('dtype')}`), cùng prompt system + user (định dạng theo chuẩn đầu vào từng mô hình), ảnh "
+          f"3×{(cfg.get('image') or {}).get('size', 512)}² → AutoProcessor gốc, cùng infer policy. Chấm trên **{n_test} ảnh test** (fixture chung "
+          f"`0_Data`). Kiểm định: " + ("**Permutation + Paired Bootstrap** (k = 2)." if g["method"] != "friedman"
+                                       else f"**Friedman** (k = {len(ids)} > 2, khối = ảnh) + hậu kiểm.") + "\n")
 
     w("## 0. Kết luận\n")
     w(f"- Metric chính **{NICE.get(prim, prim)}**: TB cao nhất **{name[sel['best_by_primary_mean']]}**.")
@@ -64,7 +74,7 @@ def render(cfg, g, ckres, srep, n_test) -> str:
     w("")
 
     w("## 1. Điều kiện (common/conditions.yaml)\n")
-    w("| Mô hình | HF id | env | prompt | Aligner/Adapter |\n|---|---|---|---|---|")
+    w("| Candidate / model | HF id | env | prompt | Aligner/Adapter |\n|---|---|---|---|---|")
     for v in g["variants"]:
         m = v["model"]
         w(f"| {v['name']} | `{m['hf_id']}` | {m.get('env')} | {m.get('prompt_format', 'chat')} | {m.get('notes', '')} |")

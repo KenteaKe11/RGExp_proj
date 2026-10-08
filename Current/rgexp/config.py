@@ -29,9 +29,9 @@ ROOT = Path(__file__).resolve().parent.parent          # = Current/
 COMMON = ROOT / "common" / "conditions.yaml"
 EXP_DIR = ROOT / "experiments"
 
-KINDS = ("data", "baseline")
+KINDS = ("data", "baseline", "lora")
 META_KEYS = {"id", "key", "title", "kind", "models", "aliases", "description"}
-KIND_BLOCKS: dict[str, set] = {"data": set(), "baseline": set()}
+KIND_BLOCKS: dict[str, set] = {"data": set(), "baseline": set(), "lora": {"lora"}}
 MODEL_KEYS = {"name", "aliases", "hf_id", "family", "env", "prompt_format", "attn_implementation",
               "processor_kwargs", "notes"}
 PROMPT_FORMATS = ("chat", "plain")
@@ -133,6 +133,8 @@ def experiments() -> list[dict]:
             raise ConfigError(f"{p.name}: id/key trong file ({e.get('id')}/{e.get('key')}) ≠ tên file.")
         if (kind == "data") != (int(e["id"]) == 0):
             raise ConfigError(f"{p.name}: số 0 dành riêng cho kind data.")
+        if kind == "lora" and not isinstance(e.get("lora"), dict):
+            raise ConfigError(f"{p.name}: kind lora cần khối `lora`.")
         if kind != "data":
             ms = e.get("models") or []
             unknown = [x for x in ms if x not in (com.get("models") or {})]

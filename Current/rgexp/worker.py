@@ -346,6 +346,16 @@ class Phi3V(Base):
         self.proc = AutoProcessor.from_pretrained(self.m["hf_id"], trust_remote_code=True, **pk)
         self.tok = self.proc.tokenizer
         kw = self.load_kw()
+        lc = self.spec.get("lora_candidate")
+        if lc:
+            from transformers import BitsAndBytesConfig
+
+            q = lc["config"]
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type=str(q.get("quantization", "nf4")),
+                bnb_4bit_use_double_quant=bool(q.get("double_quant", True)),
+                bnb_4bit_compute_dtype=getattr(self.torch, str(q.get("compute_dtype", "bfloat16"))),
+                llm_int8_skip_modules=list(q.get("quantization_skip_modules", [q["projector_module"]])))
         # config.json gốc ghi CỨNG "_attn_implementation": "flash_attention_2"; ở transformers 4.44 khoá này
         # đè lên kwarg attn_implementation -> đòi flash_attn. Nạp config trước, ép attn (cả vision CLIP) rồi truyền vào.
         from transformers import AutoConfig
@@ -353,7 +363,17 @@ class Phi3V(Base):
         mcfg = AutoConfig.from_pretrained(self.m["hf_id"], trust_remote_code=True)
         mcfg._attn_implementation = attn
         self.model = AutoModelForCausalLM.from_pretrained(self.m["hf_id"], config=mcfg, attn_implementation=attn,
-                                                          **kw).eval()
+                                                          **kw)
+        if lc and lc["mode"] == "lora":
+            from peft import PeftModel
+
+            adapter_dir = Path(self.spec["adapter_dir"])
+            projector = adapter_dir / "projector_state.pt"
+            if projector.exists():
+                state = self.torch.load(projector, map_location="cpu", weights_only=True)
+                find_module(self.model, "img_projection").load_state_dict(state)
+            self.model = PeftModel.from_pretrained(self.model, str(adapter_dir), is_trainable=False)
+        self.model.eval()
         self.base_gc = self.model.generation_config
         msgs = ([{"role": "system", "content": self.system}] if self.system else []) + \
             [{"role": "user", "content": "<|image_1|>\n" + self.user}]

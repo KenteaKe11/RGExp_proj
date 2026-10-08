@@ -1,17 +1,19 @@
-# RGExp — Current: Data → Baseline (quy chuẩn mới, tập dữ liệu lớn)
+# RGExp — Current: Data → Baseline → QLoRA (quy chuẩn mới, tập dữ liệu lớn)
 
 Toàn bộ thí nghiệm nằm trong thư mục `Current/` ở gốc repo. Thư mục gồm:
 - **điều kiện chung**: `common/conditions.yaml`;
 - **key thí nghiệm** đánh số: `experiments/<N>_<key>.yaml`;
 - **danh sách dữ liệu cố định** (vào git): `data/splits/`.
 
-Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Kết quả được đẩy lên repo Hub **cũ**
-`RGExp123/Research_results`, vào `Current/` (cùng cấp với `SoICT Archivements/`).
+Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key cùng dùng dataset repo
+`RGExp123/Research_results`, trong các thư mục song song
+`Current/0_Data`, `Current/1_Baseline`, và `Current/2_LoRA`.
 
 | # | type_test | Nội dung | Variant | Cục bộ · Hub |
 |---|---|---|---|---|
 | **0** | `data` | Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold → **12800 train / 800 val / 2400 test** + ảnh. **Chạy trước** | — | `outputs/0_Data` + `data/splits` · `Current/0_Data` |
 | 1 | `baseline` | 5 mô hình ở trạng thái gốc | mô hình | `outputs/1_Baseline` · `Current/1_Baseline` |
+| 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8/16 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
 ### Candidate (`common/conditions.yaml → models`)
 
@@ -51,7 +53,7 @@ python3 Current/tests/selftest.py         # vài giây, không cần GPU / mạn
 | `RGEXP_LEGACY_PY=/path/python` | python của env legacy |
 | `RGEXP_SKIP_LEGACY_VENV=1` · `RGEXP_SKIP_SELFTEST=1` | bỏ dựng `.venv-legacy` · bỏ selftest trước mỗi lệnh |
 
-Repo Hub **không bao giờ được tạo mới**. Nếu repo không có hoặc token không có quyền thì chương trình dừng.
+Repo Hub `RGExp123/Research_results` phải tồn tại sẵn và token cần quyền ghi.
 
 ---
 
@@ -74,6 +76,9 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 | `baseline` | `stats` | kiểm định (theo k) + CKA → `REPORT.md`, `summary.csv`, `cka.json`, ... |
 | `baseline` | `push` | đẩy cả thư mục lên `Current/1_Baseline/` |
 | `baseline` | `all` | **infer MỌI mô hình** → **score** → **stats** → **push** |
+| `lora` | `train` | 8 adapter Phi: projector full-ft + decoder QLoRA, 1 epoch · base candidate bỏ qua |
+| `lora` | `infer` / `score` / `stats` / `push` | tương tự baseline trên 9 candidate |
+| `lora` | `all` | **train** → **infer** → **score** → **stats** → **push** |
 
 **Lưu sau mỗi mô hình.** Mỗi khi infer hoặc score xong một mô hình bất kì, chương trình đẩy ngay
 kết quả của mô hình đó lên Hub (tắt bằng `--no-push`).
@@ -99,6 +104,9 @@ bash Current/run.sh data status
 for m in gemma_it gemma_pt pali qwen phi; do       # chạy thử từng mô hình
   bash Current/run.sh baseline infer --models $m --limit 8
 done
+bash Current/run.sh lora train                    # mặc định chỉ model PHI
+bash Current/run.sh lora all --detach              # train + đánh giá 9 candidate
+bash Current/run.sh lora status                   # không tải dữ liệu / checkpoint
 bash Current/run.sh baseline all --detach          # chạy thật (nền)
 bash Current/run.sh baseline status
 tail -f "$(ls -t Current/logs/*.log | head -1)"
@@ -147,10 +155,14 @@ User:   Write the radiology report for this chest X-ray.
 Sau đó ảnh đi qua **`AutoProcessor.from_pretrained()` gốc** của từng baseline (Gemma 3: 896², PaliGemma: 448²,
 Qwen2.5-VL: 504², Phi: HD crop 336).
 
-### c. Training (quy chuẩn cho key LoRA-finetuning về sau; baseline không train)
+### c. Training (key QLoRA; baseline không train)
 
 Global batch **64** · AdamW, weight decay **0.01** · Cosine Warmup 10% đầu: `0 → 2e-4 → 1e-5` ·
 **1 epoch** · không val, lấy **ckpt cuối** · **Target Token Masking**. Ghi ở khối `train:`.
+
+Key 2 lượng tử decoder NF4 4-bit; mọi candidate fine-tune đều gắn PEFT QLoRA (alpha = **2 × rank**) lên `qkv_proj`/`o_proj` (attention) hoặc thêm
+`gate_up_proj`/`down_proj` (all-linear). `model.vision_embed_tokens.img_projection` được bỏ khỏi lượng tử hóa
+và fine-tune toàn phần. Global batch 64 được thực hiện bằng gradient accumulation từng ảnh.
 
 ### d. Infer policy
 
@@ -249,7 +261,7 @@ sang RAM.
 Batch sinh bắt đầu từ 64; gặp OOM thì chia đôi và làm lại chính lô đó. Mỗi mô hình chạy trong một
 tiến trình riêng.
 
-`data build` tải **16000 ảnh** (train cho LoRA về sau). Muốn chỉ tải ảnh test thì dùng
+`data build` tải **16000 ảnh** (train cho QLoRA về sau). Muốn chỉ tải ảnh test thì dùng
 `--set "data.image_splits=[test]"`.
 
 ## 7. Đã kiểm trước khi giao

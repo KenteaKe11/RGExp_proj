@@ -83,7 +83,8 @@ def t01_config():
     from rgexp.decoding import policy
 
     ex = C.experiments()
-    assert [(e["id"], e["key"], e["kind"]) for e in ex] == [(0, "data", "data"), (1, "baseline", "baseline")], ex
+    assert [(e["id"], e["key"], e["kind"]) for e in ex] == [
+        (0, "data", "data"), (1, "baseline", "baseline"), (2, "lora", "lora")], ex
     bl = C.load("Baseline")
     assert C.load("0")["exp"]["dirname"] == "0_Data" and bl["exp"]["dirname"] == "1_Baseline"
     hf = {mk: m["hf_id"] for mk, m in bl["models"].items()}

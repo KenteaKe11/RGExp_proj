@@ -4,6 +4,7 @@
 #   key           type_test   thư mục        nội dung
 #   0  data       data        0_Data         Frontal · 1 ảnh/bệnh nhân · MSGKF 12800/800/2400 + ảnh
 #   1  baseline   baseline    1_Baseline     5 mô hình ở trạng thái gốc (variant = mô hình)
+#   2  lora       lora        2_LoRA         Phi QLoRA (variant = base + nhóm/rank)
 #
 # Mô hình (khối `models`):
 #   gemma3_4b_it    google/gemma-3-4b-it            (đã qua SFT)    env main
@@ -34,7 +35,7 @@ data:
   view_column: view
   zip_mode: auto                 # auto | stream | download (khoá tốc độ, ảnh ra như nhau)
   zip_stream_min_rate: 1.0
-  image_splits: [train, val, test]   # tải ảnh của các tập này (train cho LoRA về sau)
+  image_splits: [train, val, test]   # tải ảnh của các tập này (train cho QLoRA về sau)
 
 labels:
   npz: csv_helper/labels.npz
@@ -86,7 +87,7 @@ image:
   channels: 3
   resample: bicubic
 
-# ── c. Training (cho key LoRA-finetuning về sau; baseline KHÔNG train) ──────
+# ── c. Training (baseline KHÔNG train) ──────────────────────────────────────
 train:
   global_batch: 64
   optimizer: adamw
@@ -233,7 +234,7 @@ wandb:
   infer_log_every: 1
 
 # ── Đầu ra + Hub ────────────────────────────────────────────────────────────
-# Repo CŨ, KHÔNG tạo repo mới. Cùng cấp với `SoICT Archivements/`: Current/0_Data · Current/1_Baseline
+# Mọi key dùng chung repo kết quả đã có; mỗi key nằm trong một thư mục Current/<N>_<Title>.
 output:
   root: outputs                  # Current/outputs/<N>_<Title>/
   hub_repo: RGExp123/Research_results
