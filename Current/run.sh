@@ -82,7 +82,7 @@ if [ "$DETACH" = "1" ] && [ "${RGEXP_DETACHED:-0}" != "1" ]; then
 fi
 
 if [ "$OP" != "push" ] && [ "$OP" != "status" ] && [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
-    echo "⚙ Tự kiểm chứng ..."
+    echo "⚙ Tự kiểm chứng nhanh (offline, không cache) ..."
     "$PYBIN" "$CUR/tests/selftest.py" --quick || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU. (bỏ qua: RGEXP_SKIP_SELFTEST=1)"
         exit 1

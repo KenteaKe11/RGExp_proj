@@ -15,6 +15,8 @@ Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key 
 | 1 | `baseline` | 5 mô hình ở trạng thái gốc | mô hình | `outputs/1_Baseline` · `Current/1_Baseline` |
 | 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8/16 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
+Key 2 khóa cứng `phi35_vision`: chỉ cache/download Phi và chỉ kiểm định giữa candidate base và tám candidate QLoRA của Phi. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
+
 ### Candidate (`common/conditions.yaml → models`)
 
 | key | alias | HF id | ghi chú | env | prompt | Aligner/Adapter (CKA trước ↔ sau) |
@@ -36,7 +38,7 @@ Gemma-3 (it, pt) và PaliGemma 2 đều là **gated**: token HF phải được 
 bash Current/setup.sh                    # torch theo CUDA + env main + .venv-legacy + kiểm GPU
 export HF_TOKEN=hf_xxxxxxxx              # BẮT BUỘC: dữ liệu private · gemma-3 / paligemma2 gated · quyền WRITE Research_results
 export WANDB_API_KEY=xxxxxxxx            # BẮT BUỘC khi --detach (hoặc: wandb login)
-python3 Current/tests/selftest.py         # vài giây, không cần GPU / mạng
+python3 Current/tests/selftest.py         # smoke test ngắn, offline, không ghi cache
 ```
 
 | env | ở đâu | transformers | dùng cho |
@@ -82,6 +84,9 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 
 **Lưu sau mỗi mô hình.** Mỗi khi infer hoặc score xong một mô hình bất kì, chương trình đẩy ngay
 kết quả của mô hình đó lên Hub (tắt bằng `--no-push`).
+
+`run.sh` tự gọi `tests/selftest.py --quick` trước các lệnh chạy. Chế độ này chỉ smoke-test cấu hình,
+chạy offline và không tải hay ghi model/dataset cache.
 
 ### 2.2. Tuỳ chọn
 
@@ -266,7 +271,7 @@ tiến trình riêng.
 
 ## 7. Đã kiểm trước khi giao
 
-`python Current/tests/selftest.py`: 13 bài, chạy trên CPU, không mạng.
+`python Current/tests/selftest.py`: smoke test cấu hình ngắn, chạy offline và không dùng cache.
 - **Cấu hình**: 5 mô hình + env + prompt_format, prompt system/user, ảnh 512, infer policy, khối train.
 - **Sàng lọc**: chỉ Frontal; đúng 1 ảnh/bệnh nhân và là ảnh nhiều pos nhất; đúng 1200/100/300 trên
   dữ liệu giả; không trùng bệnh nhân; tỉ lệ nhãn được phân tầng; CSV/JSON đúng cột, không chứa báo

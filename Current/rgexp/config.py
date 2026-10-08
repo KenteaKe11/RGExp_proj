@@ -135,6 +135,8 @@ def experiments() -> list[dict]:
             raise ConfigError(f"{p.name}: số 0 dành riêng cho kind data.")
         if kind == "lora" and not isinstance(e.get("lora"), dict):
             raise ConfigError(f"{p.name}: kind lora cần khối `lora`.")
+        if kind == "lora" and list(e.get("models") or []) != ["phi35_vision"]:
+            raise ConfigError(f"{p.name}: key QLoRA chỉ hỗ trợ models: [phi35_vision].")
         if kind != "data":
             ms = e.get("models") or []
             unknown = [x for x in ms if x not in (com.get("models") or {})]

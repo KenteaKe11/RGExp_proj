@@ -31,7 +31,7 @@ import pandas as pd
 
 from . import tracking
 from .config import ROOT, Cfg, ConfigError, load, seed_everything, snapshot
-from .progress import HubBar, wait_bar
+from .progress import HubBar, bar, wait_bar
 
 OPS = {"data": ("status", "build", "push"),
        "baseline": ("status", "infer", "score", "stats", "push", "all"),
@@ -284,11 +284,12 @@ def data_sync_from_hub(cfg: Cfg) -> None:
 
         o = cfg["output"]
         stage = data_dir(cfg) / ".hub_cache"
-        say("  ↓ tải fixture còn thiếu từ Hub")
-        with wait_bar("  Hub: chuẩn bị fixture"):
+        say("  ↓ tải fixture còn thiếu từ Hub (1 bước)")
+        with bar(total=1, desc="  Hub fixture", unit="phần") as progress:
             snapshot_download(repo_id=o.get("data_hub_repo", o["hub_repo"]), repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
                               token=hf_token(), allow_patterns=[hub_path(cfg, dd, "fixture/*"), hub_path(cfg, dd, WB_IDS)],
                               etag_timeout=10, tqdm_class=HubBar)
+            progress.update(1)
     except Exception as e:  # noqa: BLE001
         say(f"  (không kéo được fixture từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return
@@ -878,9 +879,11 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None, needs: tuple[str
         stage = run_dir(cfg) / ".hub_cache"
         # Score chỉ cần predictions, fingerprint và các shard CKA.  Không tải cả
         # cands/** vì nó bao gồm dữ liệu debug và làm lần resume chậm không cần thiết.
-        patterns = [hub_path(cfg, dn, WB_IDS)]
+        common = [hub_path(cfg, dn, WB_IDS)]
+        per_variant: list[tuple[dict, list[str]]] = []
         for v in selected:
             base = hub_path(cfg, dn, "cands", v["path"])
+            patterns = list(common)
             if "infer" in needs:
                 patterns += [f"{base}/predictions.jsonl", f"{base}/infer_fingerprint.txt", f"{base}/cka/*.npz"]
             if "adapters" in needs:
@@ -889,10 +892,14 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None, needs: tuple[str
             if "metrics" in needs:
                 patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
                              for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
-        say(f"  ↓ tải resume của {len(selected)} variant từ Hub")
-        with wait_bar("  Hub: đồng bộ kết quả"):
-            snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
-                              token=hf_token(), allow_patterns=patterns, etag_timeout=10, tqdm_class=HubBar)
+            per_variant.append((v, patterns))
+        say(f"  ↓ tải resume của {len(selected)} variant từ Hub, từng bước nhỏ")
+        with bar(total=len(per_variant), desc="  Hub resume", unit="variant") as progress:
+            for v, patterns in per_variant:
+                progress.set_postfix_str(v["id"], refresh=False)
+                snapshot_download(repo_id=o["hub_repo"], repo_type=o.get("hub_repo_type", "dataset"), local_dir=str(stage),
+                                  token=hf_token(), allow_patterns=patterns, etag_timeout=10, tqdm_class=HubBar)
+                progress.update(1)
     except Exception as e:  # noqa: BLE001
         say(f"  (bỏ qua resume từ Hub: {type(e).__name__}: {str(e)[:120]})")
         return

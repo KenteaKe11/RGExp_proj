@@ -3,6 +3,7 @@ id: 2
 key: lora
 title: LoRA
 kind: lora
+# Khóa cứng Phi: chỉ cache/download và so sánh 9 candidate của Phi-3.5 Vision.
 models: [phi35_vision]
 lora:
   quantization: nf4

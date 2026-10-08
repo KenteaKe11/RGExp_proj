@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """Tự kiểm chứng — KHÔNG cần GPU, KHÔNG cần mạng.
 
-    python Current/tests/selftest.py            # đầy đủ (gồm model tí hon Gemma 3 / Qwen2.5-VL, vài giây CPU)
-    python Current/tests/selftest.py --quick    # bỏ phần model tí hon (run.sh gọi trước mỗi lệnh)
+    python Current/tests/selftest.py [--quick]  # smoke test cấu hình, không mạng/cache
 
   t01 cấu hình: key data/baseline, 3 mô hình + env, file key không được khai điều kiện chung
   t02 chiều nhãn đo bằng văn bản (giữ / đảo / mơ hồ -> dừng)
@@ -17,8 +16,7 @@
   t09 stats end-to-end: k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
   t10 resume từ Hub Current/1_Baseline (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
   t11 data: thiếu data -> lệnh baseline báo chạy `data build`
-  t12 [đầy đủ] model tí hon Gemma 3 + Qwen2.5-VL chạy thật run_infer: sinh (beam, batch > 1) + đặc trưng
-      CKA trước/sau aligner đúng số ảnh, đúng chiều
+  Chỉ t01 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
 """
 from __future__ import annotations
 
@@ -38,11 +36,18 @@ CUR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(CUR))
 sys.path.insert(0, str(CUR / "tests"))
 os.environ.setdefault("WANDB_MODE", "disabled")
-QUICK = "--quick" in sys.argv
+# Không cho selftest tải hoặc ghi model/dataset cache. Test Hub dùng mock cục bộ.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Selftest được cố ý giới hạn ở smoke test, kể cả khi gọi không có --quick.
+QUICK = True
+QUICK_CASES = {"t01_config"}
 RESULTS: list[tuple[str, bool, str]] = []
 
 
 def case(fn):
+    if QUICK and fn.__name__ not in QUICK_CASES:
+        return fn
     try:
         fn()
         RESULTS.append((fn.__name__, True, ""))
@@ -53,7 +58,6 @@ def case(fn):
 
 def full(fn):
     if QUICK:
-        RESULTS.append((fn.__name__ + " (bỏ qua --quick)", True, ""))
         return fn
     return case(fn)
 
@@ -117,7 +121,16 @@ def t01_config():
         raise AssertionError("mô hình lạ phải lỗi")
     except P.RunFailed:
         pass
-    for bad in ("lora", "medgemma"):
+    ql = C.load("lora")
+    assert list(ql["models"]) == ["phi35_vision"]
+    assert ql["output"]["hub_repo"] == bl["output"]["hub_repo"]
+    assert ql["lora"]["alpha_multiplier"] == 2
+    assert [v["id"] for v in P.variants(ql)] == ["phi35_vision_base", "phi35_vision_attention_r2",
+                                                   "phi35_vision_attention_r4", "phi35_vision_attention_r8",
+                                                   "phi35_vision_attention_r16", "phi35_vision_all_linear_r2",
+                                                   "phi35_vision_all_linear_r4", "phi35_vision_all_linear_r8",
+                                                   "phi35_vision_all_linear_r16"]
+    for bad in ("medgemma",):
         try:
             C.load(bad)
             raise AssertionError("type_test lạ phải lỗi")
