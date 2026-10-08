@@ -5,7 +5,7 @@
 #   type_test   = key thí nghiệm (experiments/<N>_<key>.yaml), không phân biệt hoa thường:
 #               data     (0)  Frontal · 1 ảnh/bệnh nhân · MSGKF 12800/800/2400 + ảnh — BẮT BUỘC chạy trước
 #               baseline (1)  5 mô hình ở trạng thái gốc (variant = mô hình)
-#               lora     (2)  Phi-3.5-vision QLoRA: base + attention/all-linear (rank 2/4/8/16)
+#               lora     (2)  Phi-3.5-vision QLoRA: base + attention/all-linear (rank 2/4/8)
 #
 #   operation   data:      status | build | push
 #               baseline:  status | infer | score | stats | push | all

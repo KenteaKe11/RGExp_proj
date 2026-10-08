@@ -13,9 +13,9 @@ Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key 
 |---|---|---|---|---|
 | **0** | `data` | Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold → **12800 train / 800 val / 2400 test** + ảnh. **Chạy trước** | — | `outputs/0_Data` + `data/splits` · `Current/0_Data` |
 | 1 | `baseline` | 5 mô hình ở trạng thái gốc | mô hình | `outputs/1_Baseline` · `Current/1_Baseline` |
-| 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8/16 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
+| 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
-Key 2 khóa cứng `phi35_vision`: chỉ cache/download Phi và chỉ kiểm định giữa candidate base và tám candidate QLoRA của Phi. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
+Key 2 khóa cứng `phi35_vision`: chỉ cache/download Phi và chỉ kiểm định giữa candidate base và sáu candidate QLoRA của Phi. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
 Phi được pin ở revision `12b77fb40b63a2c73c68243d3f767aab688a1b2a` để remote code và weights không tự đổi giữa các lần chạy.
 
 ### Candidate (`common/conditions.yaml → models`)
@@ -82,8 +82,8 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 | `baseline` | `stats` | kiểm định (theo k) + CKA → `REPORT.md`, `summary.csv`, `cka.json`, ... |
 | `baseline` | `push` | đẩy cả thư mục lên `Current/1_Baseline/` |
 | `baseline` | `all` | **infer MỌI mô hình** → **score** → **stats** → **push** |
-| `lora` | `train` | 8 adapter Phi: projector full-ft + decoder QLoRA, 1 epoch · base candidate bỏ qua |
-| `lora` | `infer` / `score` / `stats` / `push` | tương tự baseline trên 9 candidate |
+| `lora` | `train` | 6 adapter Phi: projector full-ft + decoder QLoRA, 1 epoch · base candidate bỏ qua |
+| `lora` | `infer` / `score` / `stats` / `push` | tương tự baseline trên 7 candidate |
 | `lora` | `all` | **train MỌI QLoRA variant** → **infer MỌI candidate** → **score** → **stats** → **push** |
 
 **Lưu recovery sau mỗi variant.** Mỗi khi train, infer hoặc score xong một variant, chương trình đẩy ngay
@@ -115,7 +115,7 @@ for m in gemma_it gemma_pt pali qwen phi; do       # chạy thử từng mô hì
   bash Current/run.sh baseline infer --models $m --limit 8
 done
 bash Current/run.sh lora train                    # mặc định chỉ model PHI
-bash Current/run.sh lora all --detach              # train + đánh giá 9 candidate
+bash Current/run.sh lora all --detach              # train + đánh giá 7 candidate
 bash Current/run.sh lora status                   # không tải dữ liệu / checkpoint
 bash Current/run.sh baseline all --detach          # chạy thật (nền)
 bash Current/run.sh baseline status

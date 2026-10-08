@@ -3,7 +3,7 @@ id: 2
 key: lora
 title: LoRA
 kind: lora
-# Khóa cứng Phi: chỉ cache/download và so sánh 9 candidate của Phi-3.5 Vision.
+# Khóa cứng Phi: chỉ cache/download và so sánh 7 candidate của Phi-3.5 Vision.
 models: [phi35_vision]
 lora:
   quantization: nf4
@@ -16,7 +16,7 @@ lora:
   decoder_targets:
     attention: [qkv_proj, o_proj]
     all_linear: [qkv_proj, o_proj, gate_up_proj, down_proj]
-  ranks: [2, 4, 8, 16]
+  ranks: [2, 4, 8]
   alpha_multiplier: 2           # alpha = 2 × rank
   dropout: 0.05
   base_candidate: true
