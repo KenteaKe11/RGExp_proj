@@ -49,7 +49,7 @@ labels:
 sampling:
   n_train: 5600
   n_val: 1200
-  n_test: 2400
+  n_test: 1200
   n_test_metadata: 1200    # tập cố định dùng để score/stats/CKA, được trích từ 2.400 ảnh infer
   # Sàng lọc THEO THỨ TỰ, áp cho MỌI tập:
   #  1. Hard filter góc chụp: chỉ giữ Frontal (cột `view` ∈ frontal_views).
