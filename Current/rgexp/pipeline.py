@@ -274,7 +274,8 @@ def _data_dirname(cfg: Cfg) -> str:
 
 def data_sync_from_hub(cfg: Cfg) -> None:
     """Kéo fixture (+ id run W&B của data) từ Hub nếu máy này chưa có."""
-    if not cfg["output"].get("resume_from_hub", True) or (fixture_dir(cfg) / "testset.jsonl").exists():
+    fixture_ready = all((fixture_dir(cfg) / f"{sp}set.jsonl").exists() for sp in SPLITS)
+    if not cfg["output"].get("resume_from_hub", True) or fixture_ready:
         return
     dd = _data_dirname(cfg)
     try:
@@ -302,6 +303,8 @@ def data_sync_from_hub(cfg: Cfg) -> None:
         if hid.exists():
             _merge_ids(hid, data_dir(cfg) / WB_IDS)
         say(f"  ↓ fixture kéo từ Hub ({hub_path(cfg, dd, 'fixture')})")
+    else:
+        say(f"  ⚠ Hub không có fixture tại {hub_path(cfg, dd, 'fixture')} — chạy `data build` để dựng/push fixture.")
 
 
 def experiments_with_results(cfg: Cfg) -> list[str]:
@@ -550,6 +553,21 @@ def cmd_infer(cfg: Cfg, ctx: Ctx) -> None:
 
 
 def cmd_train(cfg: Cfg, ctx: Ctx) -> None:
+    """QLoRA chỉ cần fixture và cache ảnh train, không tải ảnh val/test."""
+    from . import data as data_mod
+    from . import sampling
+
+    if not (fixture_dir(cfg) / "trainset.jsonl").exists() and not ctx.a.no_hub_resume:
+        data_sync_from_hub(cfg)
+    if not (fixture_dir(cfg) / "trainset.jsonl").exists():
+        raise RunFailed("QLoRA chưa có train fixture sau khi đồng bộ Hub — chạy `bash Current/run.sh data build` một lần.")
+    train_df = sampling.load(cfg, "train")
+    have = sum(image_path(cfg, key).exists() for key in train_df["key"])
+    if have != len(train_df):
+        say(f"  ↓ QLoRA: tải cache train {have}/{len(train_df)} ảnh từ repo dữ liệu (chỉ train, không val/test)")
+        got = data_mod.ensure_images(cfg, train_df[["key"]].copy())
+        if len(got) != len(train_df):
+            raise RunFailed(f"QLoRA thiếu {len(train_df) - len(got)} ảnh train sau khi tải.")
     require_data(cfg, ("train",))
     tasks = write_tasks(cfg, "train", True)
     for v in _vs(cfg, ctx):

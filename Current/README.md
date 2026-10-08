@@ -57,6 +57,9 @@ python3 Current/tests/selftest.py         # smoke test ngắn, offline, không g
 
 Repo Hub `RGExp123/Research_results` phải tồn tại sẵn và token cần quyền ghi.
 
+Lần chạy `lora train` tự kéo fixture từ `Current/0_Data/fixture` trên Hub. Nếu cache ảnh train chưa có,
+nó chỉ tải 12.800 ảnh train từ repo dữ liệu; không tải cache val/test.
+
 ---
 
 ## 2. Cú pháp

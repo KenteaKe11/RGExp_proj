@@ -225,7 +225,7 @@ else
     fi
     echo "→ cài requirements-legacy.txt vào $LG_VENV ..."
     "$LGPY" -m pip install -q -r requirements-legacy.txt
-    "$LGPY" -c "import transformers, torch, torchvision; assert transformers.__version__ == '4.44.2', transformers.__version__; print('✓ .venv-legacy: transformers', transformers.__version__, '· torch', torch.__version__)" \
+    "$LGPY" -c "import transformers, torch, torchvision, pandas, einops, peft, bitsandbytes; assert transformers.__version__ == '4.44.2', transformers.__version__; print('✓ .venv-legacy: Phi QLoRA deps OK · transformers', transformers.__version__, '· torch', torch.__version__)" \
         || { echo "✗ .venv-legacy chưa dùng được — đọc lỗi pip ở trên."; exit 1; }
 fi
 
