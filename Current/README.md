@@ -171,7 +171,9 @@ Global batch **64** · AdamW, weight decay **0.01** · Cosine Warmup 10% đầu:
 
 Key 2 lượng tử decoder NF4 4-bit; mọi candidate fine-tune đều gắn PEFT QLoRA (alpha = **2 × rank**) lên `qkv_proj`/`o_proj` (attention) hoặc thêm
 `gate_up_proj`/`down_proj` (all-linear). `model.vision_embed_tokens.img_projection` được bỏ khỏi lượng tử hóa
-và fine-tune toàn phần. Global batch 64 được thực hiện bằng gradient accumulation từng ảnh.
+và fine-tune toàn phần. Global batch 64 được thực hiện bằng gradient accumulation với mini-batch tự dò từ
+CPU/RAM/VRAM; gặp OOM thì mini-batch giảm một nửa và global batch đó được chạy lại. Mỗi optimizer step log
+loss, `grad_norm`, learning rate và mini-batch thực tế lên stdout/W&B.
 
 ### d. Infer policy
 

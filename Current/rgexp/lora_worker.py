@@ -57,10 +57,91 @@ def _enable_input_gradients(model) -> None:
     embedding.register_forward_hook(make_output_require_grad)
 
 
-def train(spec_path: Path) -> None:
-    import torch
+def _is_oom(error: BaseException) -> bool:
+    text = f"{type(error).__name__} {error}".lower()
+    return "out of memory" in text or "outofmemory" in text or "cublas_status_alloc_failed" in text
+
+
+def _initial_mini_batch(max_batch: int, cpu_slots: int, ram_avail_bytes: int,
+                        gpu_free_bytes: int | None, gpu_total_bytes: int | None,
+                        reserve_ram_gib: float, reserve_vram_gib: float,
+                        reserve_vram_frac: float) -> tuple[int, dict[str, int]]:
+    """Chọn mini-batch khởi đầu từ ngân sách CPU/RAM/VRAM rồi OOM sẽ giảm dần.
+
+    Mỗi ảnh Phi HD được cấp phát dự phòng 512 MiB VRAM và 256 MiB RAM. Đây chỉ là
+    cận khởi đầu an toàn; vòng train vẫn giảm một nửa khi phép đo thực tế báo OOM.
+    """
+    gib = 1024 ** 3
+    cap = max(1, int(max_batch))
+    cpu_cap = max(1, int(cpu_slots))
+    ram_cap = max(1, int(max(0, ram_avail_bytes - reserve_ram_gib * gib) // (256 * 1024 ** 2)))
+    caps = {"configured": cap, "cpu": cpu_cap, "ram": ram_cap}
+    if gpu_free_bytes is not None and gpu_total_bytes is not None:
+        reserve = max(reserve_vram_gib * gib, reserve_vram_frac * gpu_total_bytes)
+        gpu_cap = max(1, int(max(0, gpu_free_bytes - reserve) // (512 * 1024 ** 2)))
+        caps["vram"] = gpu_cap
+    return min(caps.values()), caps
+
+
+def _training_minibatch(torch, autotune: dict) -> tuple[int, dict[str, int]]:
+    from rgexp.hw import cpu_budget
+
+    try:
+        import psutil
+
+        ram_avail = int(psutil.virtual_memory().available)
+    except Exception:  # noqa: BLE001
+        ram_avail = 8 * 1024 ** 3
+    free = total = None
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+    return _initial_mini_batch(int(autotune.get("max_batch", 64)), cpu_budget(), ram_avail, free, total,
+                               float(autotune.get("ram_reserve_gib", 4.0)),
+                               float(autotune.get("vram_reserve_gib", 1.5)),
+                               float(autotune.get("vram_reserve_frac", 0.06)))
+
+
+def _grad_norm(parameters, torch) -> float:
+    norms = [p.grad.detach().float().norm(2) for p in parameters if p.grad is not None]
+    return float(torch.stack(norms).norm(2).item()) if norms else 0.0
+
+
+def _make_train_batch(rows, processor, tokenizer, prompt: str, eos: int | None,
+                      image_size: int, device, dtype, torch):
+    """Processor Phi theo từng ảnh, sau đó right-pad token/label để train mini-batch."""
     from PIL import Image
     from rgexp.imaging import conform
+
+    parts = []
+    for row in rows:
+        with Image.open(row["image_path"]) as source:
+            image = conform(source, image_size)
+        enc = processor(prompt, [image], return_tensors="pt")
+        ids = enc["input_ids"].to(device)
+        target_ids = tokenizer.encode(str(row["ref"]).strip(), add_special_tokens=False)
+        if eos is not None and eos >= 0:
+            target_ids.append(int(eos))
+        target = torch.tensor([target_ids], dtype=torch.long, device=device)
+        moved = {k: v.to(device) for k, v in enc.items() if hasattr(v, "to")}
+        parts.append((*_append_target_tokens(moved, target, torch), moved))
+    width = max(ids.shape[1] for ids, _mask, _labels, _enc in parts)
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad is None:
+        pad = 0
+    batch_ids = torch.full((len(parts), width), int(pad), dtype=torch.long, device=device)
+    batch_mask = torch.zeros((len(parts), width), dtype=parts[0][1].dtype, device=device)
+    batch_labels = torch.full((len(parts), width), -100, dtype=torch.long, device=device)
+    for i, (ids, mask, labels, _enc) in enumerate(parts):
+        length = ids.shape[1]
+        batch_ids[i, :length], batch_mask[i, :length], batch_labels[i, :length] = ids[0], mask[0], labels[0]
+    pixels = torch.cat([enc["pixel_values"] for _ids, _mask, _labels, enc in parts], 0).to(dtype)
+    sizes = torch.cat([torch.as_tensor(enc["image_sizes"]).reshape(-1, 2) for _ids, _mask, _labels, enc in parts], 0)
+    return {"input_ids": batch_ids, "attention_mask": batch_mask, "labels": batch_labels,
+            "pixel_values": pixels, "image_sizes": sizes}
+
+
+def train(spec_path: Path) -> None:
+    import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
 
@@ -110,6 +191,8 @@ def train(spec_path: Path) -> None:
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     eos = tokenizer.convert_tokens_to_ids("<|end|>")
     rows = _read_jsonl(Path(spec["tasks"]))
+    if not rows:
+        raise RuntimeError("QLoRA train tasks rỗng.")
     from rgexp import tracking
 
     run_info = dict(spec.get("wandb_run") or {})
@@ -131,37 +214,43 @@ def train(spec_path: Path) -> None:
         return (lr_min / lr_max) + (1 - lr_min / lr_max) * (1 + math.cos(math.pi * progress)) / 2
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
-    optimizer.zero_grad(set_to_none=True)
-    running = 0.0
-    for i, row in enumerate(rows):
-        with Image.open(row["image_path"]) as source:
-            image = conform(source, int(spec["image_size"]))
-        enc = processor(prompt, [image], return_tensors="pt")
-        ids = enc["input_ids"].to(model.device)
-        target_ids = tokenizer.encode(str(row["ref"]).strip(), add_special_tokens=False)
-        if eos is not None and eos >= 0:
-            target_ids.append(int(eos))
-        target_tensor = torch.tensor([target_ids], dtype=torch.long, device=ids.device)
-        inputs = {k: v.to(model.device) for k, v in enc.items() if hasattr(v, "to")}
-        full_ids, full_mask, labels = _append_target_tokens(inputs, target_tensor, torch)
-        inputs["input_ids"], inputs["attention_mask"], inputs["labels"] = full_ids, full_mask, labels
-        for key, value in inputs.items():
-            if key == "pixel_values" and value.is_floating_point():
-                inputs[key] = value.to(dtype)
-        group_size = min(global_batch, len(rows) - (i // global_batch) * global_batch)
-        loss = model(**inputs).loss
-        (loss / group_size).backward()
-        running += float(loss.detach())
-        if (i + 1) % global_batch == 0 or i + 1 == len(rows):
-            optimizer.step()
-            scheduler.step()
+    mini_batch, batch_caps = _training_minibatch(torch, dict(spec.get("autotune") or {}))
+    print("  mini-batch tự dò: " + " · ".join(f"{k}={v}" for k, v in batch_caps.items()) +
+          f" -> bắt đầu {mini_batch}", flush=True)
+    params = [p for p in model.parameters() if p.requires_grad]
+    for step, start in enumerate(range(0, len(rows), global_batch), start=1):
+        group = rows[start:start + global_batch]
+        while True:
             optimizer.zero_grad(set_to_none=True)
-            step = math.ceil((i + 1) / global_batch)
-            print(f"step {step}/{steps} · loss={running / min(global_batch, i + 1):.4f} · "
-                  f"lr={scheduler.get_last_lr()[0]:.3g}", flush=True)
-            run.log({"train_step": step, "train/loss": running / min(global_batch, i + 1),
-                     "train/lr": scheduler.get_last_lr()[0]})
-            running = 0.0
+            weighted_loss, offset = 0.0, 0
+            try:
+                while offset < len(group):
+                    micro = group[offset:offset + mini_batch]
+                    inputs = _make_train_batch(micro, processor, tokenizer, prompt, eos, int(spec["image_size"]),
+                                               model.device, dtype, torch)
+                    loss = model(**inputs).loss
+                    (loss * (len(micro) / len(group))).backward()
+                    weighted_loss += float(loss.detach()) * len(micro)
+                    offset += len(micro)
+                break
+            except RuntimeError as error:
+                optimizer.zero_grad(set_to_none=True)
+                if not _is_oom(error) or mini_batch == 1:
+                    run.finish(1)
+                    raise
+                mini_batch = max(1, mini_batch // 2)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"  ⚠ OOM ở step {step} -> mini_batch={mini_batch}, làm lại global batch", flush=True)
+        grad_norm = _grad_norm(params, torch)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        mean_loss = weighted_loss / len(group)
+        print(f"step {step}/{steps} · loss={mean_loss:.4f} · grad_norm={grad_norm:.4g} · "
+              f"mini_batch={mini_batch} · lr={scheduler.get_last_lr()[0]:.3g}", flush=True)
+        run.log({"train_step": step, "train/loss": mean_loss, "train/grad_norm": grad_norm,
+                 "train/mini_batch": mini_batch, "train/lr": scheduler.get_last_lr()[0]})
     model.save_pretrained(out, safe_serialization=True)
     torch.save({k: v.detach().cpu() for k, v in projector.state_dict().items()}, out / "projector_state.pt")
     (out / "trainer_state.json").write_text(json.dumps({
@@ -169,7 +258,8 @@ def train(spec_path: Path) -> None:
         "scheduler": "cosine_with_warmup", "warmup_steps": warmup,
         "lr_max": lr_max, "lr_min": lr_min, "samples": len(rows),
         "target_token_masking": True, "projector": lcfg["projector_module"],
-        "lora_rank": rank, "lora_alpha": lora_alpha
+        "lora_rank": rank, "lora_alpha": lora_alpha, "mini_batch_final": mini_batch,
+        "mini_batch_caps": batch_caps
     }, indent=2), encoding="utf-8")
     run.summary({"optimizer_steps": steps, "train/samples": len(rows)})
     run.finish(0)
