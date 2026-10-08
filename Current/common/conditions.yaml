@@ -155,6 +155,7 @@ models:
     name: "Phi-3.5-vision-instruct"
     aliases: [phi, phi35]
     hf_id: microsoft/Phi-3.5-vision-instruct
+    revision: 12b77fb40b63a2c73c68243d3f767aab688a1b2a  # pin remote code + weights đã kiểm
     family: phi3_v
     env: legacy
     prompt_format: chat

@@ -16,6 +16,7 @@ Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key 
 | 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8/16 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
 Key 2 khóa cứng `phi35_vision`: chỉ cache/download Phi và chỉ kiểm định giữa candidate base và tám candidate QLoRA của Phi. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
+Phi được pin ở revision `12b77fb40b63a2c73c68243d3f767aab688a1b2a` để remote code và weights không tự đổi giữa các lần chạy.
 
 ### Candidate (`common/conditions.yaml → models`)
 

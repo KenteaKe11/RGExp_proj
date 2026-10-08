@@ -16,7 +16,7 @@
   t09 stats end-to-end: k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
   t10 resume từ Hub Current/1_Baseline (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
   t11 data: thiếu data -> lệnh baseline báo chạy `data build`
-  Chỉ t01 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
+  Chỉ t01/t02 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 # Selftest được cố ý giới hạn ở smoke test, kể cả khi gọi không có --quick.
 QUICK = True
-QUICK_CASES = {"t01_config"}
+QUICK_CASES = {"t01_config", "t02_lora_target_mask"}
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -123,6 +123,7 @@ def t01_config():
         pass
     ql = C.load("lora")
     assert list(ql["models"]) == ["phi35_vision"]
+    assert ql["models"]["phi35_vision"]["revision"] == "12b77fb40b63a2c73c68243d3f767aab688a1b2a"
     assert ql["output"]["hub_repo"] == bl["output"]["hub_repo"]
     assert ql["lora"]["alpha_multiplier"] == 2
     assert [v["id"] for v in P.variants(ql)] == ["phi35_vision_base", "phi35_vision_attention_r2",
@@ -174,6 +175,31 @@ def t01_config():
         C.load("baseline", ["infer.batch_size=8"])
         raise AssertionError("khoá hạ tầng phải lỗi")
     except C.ConfigError:
+        pass
+
+
+@case
+def t02_lora_target_mask():
+    """Regression: thêm target cho Phi phải kéo dài attention_mask cùng lúc."""
+    import torch
+
+    from rgexp.lora_worker import _append_target_tokens
+
+    prompt_ids = torch.tensor([[11, -1, -1, 12], [0, 0, 21, -1]])
+    prompt_mask = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+    target = torch.tensor([[31, 32, 33], [41, 42, 43]])
+    ids, mask, labels = _append_target_tokens({"input_ids": prompt_ids, "attention_mask": prompt_mask}, target, torch)
+    assert ids.shape == mask.shape == labels.shape == (2, 7)
+    assert torch.equal(ids[:, :4], prompt_ids) and torch.equal(ids[:, 4:], target)
+    assert torch.equal(mask[:, :4], prompt_mask) and torch.equal(mask[:, 4:], torch.ones((2, 3), dtype=mask.dtype))
+    assert torch.equal(labels[:, :4], torch.full((2, 4), -100, dtype=labels.dtype))
+    assert torch.equal(labels[:, 4:], target)
+    ids2, mask2, _ = _append_target_tokens({"input_ids": prompt_ids}, target, torch)
+    assert torch.equal(mask2[:, :4], torch.ones_like(prompt_ids)) and ids2.shape == mask2.shape
+    try:
+        _append_target_tokens({"input_ids": prompt_ids, "attention_mask": prompt_mask[:, :3]}, target, torch)
+        raise AssertionError("mask lệch chiều phải dừng")
+    except ValueError:
         pass
 
 

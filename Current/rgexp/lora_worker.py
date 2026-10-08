@@ -18,6 +18,45 @@ def _module(model, dotted: str):
     return cur
 
 
+def _append_target_tokens(enc, target_tensor, torch):
+    """Nối report target và giữ attention mask cùng chiều với input_ids.
+
+    Phi HD thay token ảnh bằng chuỗi placeholder nên mask của processor phải được nối
+    theo target; giữ nguyên mask prompt tạo mismatch ở attention 4D.
+    """
+    ids = enc["input_ids"]
+    mask = enc.get("attention_mask")
+    if mask is None:
+        mask = torch.ones_like(ids)
+    if mask.shape != ids.shape:
+        raise ValueError(f"attention_mask {tuple(mask.shape)} không khớp input_ids {tuple(ids.shape)}")
+    if target_tensor.ndim != 2 or target_tensor.shape[0] != ids.shape[0]:
+        raise ValueError("target tokens phải có batch dimension khớp prompt")
+    full_ids = torch.cat((ids, target_tensor), dim=1)
+    target_mask = torch.ones(target_tensor.shape, dtype=mask.dtype, device=mask.device)
+    full_mask = torch.cat((mask, target_mask), dim=1)
+    labels = torch.full_like(full_ids, -100)
+    labels[:, ids.shape[1]:] = target_tensor
+    return full_ids, full_mask, labels
+
+
+def _enable_input_gradients(model) -> None:
+    """Bảo đảm checkpoint có một input require-grad khi decoder 4-bit bị đóng băng."""
+    enable = getattr(model, "enable_input_require_grads", None)
+    if callable(enable):
+        enable()
+        return
+    getter = getattr(model, "get_input_embeddings", None)
+    embedding = getter() if callable(getter) else None
+    if embedding is None:
+        raise RuntimeError("Phi model không hỗ trợ input gradients cho gradient checkpointing.")
+
+    def make_output_require_grad(_module, _inputs, output):
+        output.requires_grad_(True)
+
+    embedding.register_forward_hook(make_output_require_grad)
+
+
 def train(spec_path: Path) -> None:
     import torch
     from PIL import Image
@@ -40,15 +79,17 @@ def train(spec_path: Path) -> None:
                                bnb_4bit_compute_dtype=dtype,
                                llm_int8_skip_modules=list(lcfg.get("quantization_skip_modules",
                                                                    [lcfg["projector_module"]])))
-    processor = AutoProcessor.from_pretrained(model_cfg["hf_id"], trust_remote_code=True,
+    revision = model_cfg.get("revision")
+    processor = AutoProcessor.from_pretrained(model_cfg["hf_id"], revision=revision, trust_remote_code=True,
                                                **dict(model_cfg.get("processor_kwargs") or {}))
-    config = AutoConfig.from_pretrained(model_cfg["hf_id"], trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_cfg["hf_id"], revision=revision, trust_remote_code=True)
     config._attn_implementation = str(model_cfg.get("attn_implementation", "eager"))
     model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["hf_id"], config=config, trust_remote_code=True, quantization_config=quant,
+        model_cfg["hf_id"], revision=revision, config=config, trust_remote_code=True, quantization_config=quant,
         torch_dtype=dtype, device_map="auto", attn_implementation=config._attn_implementation)
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    _enable_input_gradients(model)
     model.gradient_checkpointing_enable()
     target = list(lc["target_modules"])
     rank = int(lc["rank"])
@@ -101,12 +142,9 @@ def train(spec_path: Path) -> None:
         if eos is not None and eos >= 0:
             target_ids.append(int(eos))
         target_tensor = torch.tensor([target_ids], dtype=torch.long, device=ids.device)
-        full_ids = torch.cat((ids, target_tensor), dim=1)
-        labels = torch.full_like(full_ids, -100)
-        labels[:, ids.shape[1]:] = target_tensor
         inputs = {k: v.to(model.device) for k, v in enc.items() if hasattr(v, "to")}
-        inputs["input_ids"] = full_ids
-        inputs["labels"] = labels
+        full_ids, full_mask, labels = _append_target_tokens(inputs, target_tensor, torch)
+        inputs["input_ids"], inputs["attention_mask"], inputs["labels"] = full_ids, full_mask, labels
         for key, value in inputs.items():
             if key == "pixel_values" and value.is_floating_point():
                 inputs[key] = value.to(dtype)

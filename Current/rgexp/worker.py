@@ -343,7 +343,8 @@ class Phi3V(Base):
         from transformers import AutoModelForCausalLM, AutoProcessor
 
         pk = dict(self.m.get("processor_kwargs") or {})
-        self.proc = AutoProcessor.from_pretrained(self.m["hf_id"], trust_remote_code=True, **pk)
+        revision = self.m.get("revision")
+        self.proc = AutoProcessor.from_pretrained(self.m["hf_id"], revision=revision, trust_remote_code=True, **pk)
         self.tok = self.proc.tokenizer
         kw = self.load_kw()
         lc = self.spec.get("lora_candidate")
@@ -360,9 +361,9 @@ class Phi3V(Base):
         # đè lên kwarg attn_implementation -> đòi flash_attn. Nạp config trước, ép attn (cả vision CLIP) rồi truyền vào.
         from transformers import AutoConfig
         attn = kw.pop("attn_implementation")
-        mcfg = AutoConfig.from_pretrained(self.m["hf_id"], trust_remote_code=True)
+        mcfg = AutoConfig.from_pretrained(self.m["hf_id"], revision=revision, trust_remote_code=True)
         mcfg._attn_implementation = attn
-        self.model = AutoModelForCausalLM.from_pretrained(self.m["hf_id"], config=mcfg, attn_implementation=attn,
+        self.model = AutoModelForCausalLM.from_pretrained(self.m["hf_id"], revision=revision, config=mcfg, attn_implementation=attn,
                                                           **kw)
         if lc and lc["mode"] == "lora":
             from peft import PeftModel

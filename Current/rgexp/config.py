@@ -33,7 +33,7 @@ KINDS = ("data", "baseline", "lora")
 META_KEYS = {"id", "key", "title", "kind", "models", "aliases", "description"}
 KIND_BLOCKS: dict[str, set] = {"data": set(), "baseline": set(), "lora": {"lora"}}
 MODEL_KEYS = {"name", "aliases", "hf_id", "family", "env", "prompt_format", "attn_implementation",
-              "processor_kwargs", "notes"}
+              "processor_kwargs", "revision", "notes"}
 PROMPT_FORMATS = ("chat", "plain")
 ENVS = ("main", "legacy")
 FORBIDDEN_KEYS = ("infer.batch_size", "train.micro_batch", "gpu_config", "autotune.batch_size")
