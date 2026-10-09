@@ -3,20 +3,29 @@
 
     python Current/tests/selftest.py [--quick]  # smoke test cấu hình, không mạng/cache
 
-  t01 cấu hình: key data/baseline, 3 mô hình + env, file key không được khai điều kiện chung
-  t02 chiều nhãn đo bằng văn bản (giữ / đảo / mơ hồ -> dừng)
-  t03 lấy mẫu: đủ cỡ, không trùng bệnh nhân, mọi nhãn có mặt, nhãn sau khi đảo đúng
-  t04 Friedman = scipy, Nemenyi CD đúng Demšar
-  t05 k = 2: Permutation + Paired Bootstrap (bác khi khác thật, không bác khi H0 đúng)
-  t06 CKA: bất biến phép quay/co giãn, = 1 khi Y = XR; bootstrap + paired bootstrap; tách token theo
-      ảnh của Phi-3.5-vision (HD transform)
-  t07 W&B: trùng -> bỏ qua; --force -> xoá + ghi đè; dở -> đi tiếp đúng run; chạy thử -> ghi đè
-  t08 pipeline: all = infer MỌI mô hình (3) -> score -> stats -> push; lưu recovery sau MỖI variant; env legacy
-      cho Phi; bỏ qua phần đã xong; --force; trùng W&B -> mã 3; repo Hub không bao giờ tạo
-  t09 stats end-to-end: k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
-  t10 resume từ Hub Current/1_Baseline (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
-  t11 data: thiếu data -> lệnh baseline báo chạy `data build`
-  Chỉ t01–t04 được chạy: đây là preflight ngắn trước train/infer, không phải full integration test.
+  Preflight (luôn chạy; t02/t04 bỏ qua nếu môi trường chưa cài torch):
+    t01_config              cấu hình: key data/baseline/lora, 5 mô hình + env, prompt, sampling,
+                            variants lora = 7 candidate (base + attention r2/4/8 + all_linear r2/4/8),
+                            file key khai điều kiện chung / khoá hạ tầng -> lỗi
+    t02_lora_target_mask    thêm target cho Phi phải kéo dài attention_mask cùng lúc
+    t03_lora_minibatch      autotune bắt đầu theo cận CPU/RAM/VRAM, còn OOM giảm ở trainer
+    t04_lora_model_summary  chỉ projector full-ft và tensor LoRA decoder mới được phép train
+  Full integration (chỉ chạy khi tắt QUICK; cần torch/transformers, t12 cần GPU):
+    t02_orientation         chiều nhãn đo bằng văn bản (giữ / đảo / mơ hồ -> dừng)
+    t03_sampling            lấy mẫu: đủ cỡ, không trùng bệnh nhân, mọi nhãn có mặt, đảo đúng
+    t03b_stratify           MSGKF / split_by_sizes: đúng cỡ, đúng nhóm, tất định theo seed
+    t04_friedman_nemenyi    Friedman = scipy, Nemenyi CD đúng Demšar
+    t05_pair_tests          k = 2: Permutation + Paired Bootstrap (bác khi khác thật, không bác khi H0 đúng)
+    t06_cka                 CKA: bất biến phép quay/co giãn, = 1 khi Y = XR; bootstrap + paired
+                            bootstrap; tách token theo ảnh của Phi-3.5-vision (HD transform)
+    t07_wandb_duplicates    W&B: trùng -> bỏ qua; --force -> xoá + ghi đè; dở -> đi tiếp đúng run
+    t08_pipeline_flow       all = infer MỌI mô hình -> score -> stats -> push; recovery sau MỖI
+                            variant; env legacy cho Phi; bỏ qua phần đã xong; trùng W&B -> mã 3
+    t09_stats_end_to_end    k = 3 -> Friedman + CKA; k = 2 -> Permutation + Paired Bootstrap; REPORT.md
+    t10_resume_and_fingerprint  resume từ Hub (predictions + đặc trưng CKA + wandb_ids) + dấu vân tay
+    t11_requires_data       thiếu data -> lệnh baseline báo chạy `data build`
+    t12_tiny_models         infer end-to-end với model nhỏ (gemma3 / paligemma / qwen2_5_vl)
+  Chỉ preflight được chạy: đây là smoke test ngắn trước train/infer, không phải full integration test.
 """
 from __future__ import annotations
 
