@@ -1,0 +1,246 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# ĐIỀU KIỆN THÍ NGHIỆM CHUNG (quy chuẩn mới — tập dữ liệu lớn) — cho MỌI key thí nghiệm
+# ═════════════════════════════════════════════════════════════════════════════
+#   key           type_test   thư mục        nội dung
+#   0  data       data        0_Data         Frontal · 1 ảnh/bệnh nhân · MSGKF 5600/1200/2400 + metadata test 1200
+#   1  baseline   baseline    1_Baseline     5 mô hình ở trạng thái gốc (variant = mô hình)
+#   2  lora       lora        2_LoRA         Phi QLoRA (variant = base + all-linear rank 1/2/4/8)
+#
+# Mô hình (khối `models`):
+#   gemma3_4b_it    google/gemma-3-4b-it            (đã qua SFT)    env main
+#   gemma3_4b_pt    google/gemma-3-4b-pt            (chỉ pretrain)  env main
+#   paligemma2_3b   google/paligemma2-3b-pt-448                     env main
+#   qwen25vl_3b     Qwen/Qwen2.5-VL-3B-Instruct                     env main
+#   phi35_vision    microsoft/Phi-3.5-vision-instruct               env legacy (remote code)
+#
+# File key chỉ được khai: id, key, title, kind, models, aliases, description. Khai lại một khoá
+# của file này ở file key là LỖI (rgexp/config.py).
+#
+#   bash Current/run.sh <type_test> <operation> [tuỳ chọn]   — xem Current/README.md
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+# ── a. Dataset (key data) ───────────────────────────────────────────────────
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  meta_csv: csv_helper/clean_dataset.csv      # subject_id, study_id, image_id, img_rel, view, text_gt
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  subject_column: subject_id
+  study_column: study_id
+  image_id_column: image_id
+  view_column: view
+  zip_mode: auto                 # auto | stream | download (khoá tốc độ, ảnh ra như nhau)
+  zip_stream_min_rate: 1.0
+  image_splits: [train, val, test]   # tải ảnh của các tập này (train cho QLoRA về sau)
+
+labels:
+  npz: csv_helper/labels.npz
+  key_array: null                # null = tự dò
+  label_array: null
+  encoding: {neg: [0], pos: [1], uncertain: [-1, 2], nan_to: ignore}
+  # Lớp `pos` của labels.npz từng là lớp ÂM của CheXpert. `auto` đo chiều nhãn bằng văn bản
+  # báo cáo, đảo nếu cần, DỪNG nếu mơ hồ (bằng chứng: split_report.json -> label_orientation).
+  orientation: auto              # auto | as_is | swap
+
+sampling:
+  n_train: 5600
+  n_val: 1200
+  n_test: 2400
+  n_test_metadata: 1200    # tập cố định dùng để score/stats/CKA, được trích từ 2.400 ảnh infer
+  # Sàng lọc THEO THỨ TỰ, áp cho MỌI tập:
+  #  1. Hard filter góc chụp: chỉ giữ Frontal (cột `view` ∈ frontal_views).
+  frontal_views: [PA, AP]
+  #  2. Hard filter theo bệnh nhân: nhiều Frontal / bệnh nhân -> giữ ĐÚNG 1 ảnh, ưu tiên lần lượt
+  #     (a) nhiều phát hiện bệnh lý (pos) nhất, (b) nhiều nhãn rõ ràng nhất (pos/neg — khác
+  #     uncertain và blank), (c) hoà -> thứ tự băm (seed, image_id) cố định.
+  per_patient: one
+  #  3. MultilabelStratifiedGroupKFold (iterative stratification ở mức NHÓM = bệnh nhân, nhãn = pos)
+  #     chia hồ thành train / val / test / phần dư với ĐÚNG số lượng trên.
+  method: multilabel_stratified_group_kfold
+  require_report: true           # bỏ ảnh không có text_gt
+  # 4. Danh sách CỐ ĐỊNH cho repo (vào git): Current/data/splits/{train,val,test}.{csv,json}
+  #    [image_id, subject_id, study_id, filepath, view, <14 nhãn: 1 | 0 | -1 | trống>].
+  #    Có sẵn -> `data build` dùng lại đúng danh sách đó; `--force` mới lấy mẫu lại.
+  splits_dir: data/splits
+
+# ── b. Chuẩn input ──────────────────────────────────────────────────────────
+# b1. Prompt — định dạng theo CHUẨN ĐẦU VÀO của từng baseline (models.<m>.prompt_format):
+#     chat  = chat template gốc của processor (system + user, add_generation_prompt)
+#     plain = mô hình chỉ pretrain, không có chat template: system + "\n" + user, token ảnh theo
+#             processor gốc (Gemma 3: <start_of_image> ở đầu; PaliGemma: processor tự chèn + "\n")
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |-
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+# b2. Vision: ảnh RGB 3 × 512 × 512 (cache 512², ép đúng 512×512 trước processor) -> rồi
+#     AutoProcessor.from_pretrained() GỐC của từng baseline (Gemma 3: 896², PaliGemma: 448²,
+#     Qwen2.5-VL: 504², Phi-3.5-vision: HD crop 336).
+image:
+  size: 512
+  channels: 3
+  resample: bicubic
+
+# ── c. Training (baseline KHÔNG train) ──────────────────────────────────────
+train:
+  global_batch: 64
+  optimizer: adamw
+  weight_decay: 0.01
+  scheduler: cosine_warmup       # warmup 10% đầu: 0 -> lr_max -> cosine -> lr_min
+  warmup_frac: 0.10
+  lr_max: 2.0e-4
+  lr_min: 1.0e-5
+  epochs: 1
+  use_val: false                 # không val, lấy ckpt cuối cùng
+  select_checkpoint: last
+  target_token_masking: true     # loss chỉ trên token báo cáo (+ token kết thúc lượt)
+
+# ── d. Infer policy ─────────────────────────────────────────────────────────
+generate:
+  do_sample: false               # tất định, tái lập 100%
+  num_beams: 3                   # ngưỡng ngọt giữa BLEU/ROUGE và thời gian chạy
+  num_return_sequences: 1
+  max_new_tokens: 200            # khung độ dài thực tế cho Findings/Impression
+  no_repeat_ngram_size: 0        # tắt phạt cứng n-gram (tránh méo thuật ngữ y khoa)
+  repetition_penalty: 1.08       # phạt mềm chống kẹt lặp câu
+  length_penalty: 0.8            # đẩy nhẹ câu ngắn gọn
+  early_stopping: true           # dừng khi đủ beam kết thúc bằng EOS
+
+# ── Mô hình (variant của key baseline) ──────────────────────────────────────
+# MÔ TẢ kiến trúc / cách gọi, không phải điều kiện.
+#   env main   = môi trường chính (transformers 4.51–4.52: Gemma 3 >= 4.50, Qwen2.5-VL >= 4.49,
+#                PaliGemma 2 >= 4.47)
+#   env legacy = .venv-legacy (transformers 4.44.2): remote code Phi-3.5-vision dùng API cache cũ
+#                (seen_tokens, get_max_length — bị xoá từ 4.49)
+models:
+  gemma3_4b_it:
+    name: "Gemma-3-4B-it (SFT)"
+    aliases: [gemma, gemma_it, gemma3]
+    hf_id: google/gemma-3-4b-it          # gated
+    family: gemma3
+    env: main
+    prompt_format: chat
+    notes: "SigLIP 896² (4096 patch × 1152) -> multi_modal_projector -> 256 token × 2560"
+  gemma3_4b_pt:
+    name: "Gemma-3-4B-pt (pretrain)"
+    aliases: [gemma_pt]
+    hf_id: google/gemma-3-4b-pt          # gated; không có chat template
+    family: gemma3
+    env: main
+    prompt_format: plain
+    notes: "như Gemma-3-4B-it, trọng số chỉ pretrain"
+  paligemma2_3b:
+    name: "PaliGemma 2 3B-pt-448"
+    aliases: [paligemma, pali]
+    hf_id: google/paligemma2-3b-pt-448   # gated; không có chat template
+    family: paligemma
+    env: main
+    prompt_format: plain
+    notes: "SigLIP 448² (1024 patch × 1152) -> multi_modal_projector (linear) -> 1024 token × 2304"
+  qwen25vl_3b:
+    name: "Qwen2.5-VL-3B-Instruct"
+    aliases: [qwen, qwen25vl]
+    hf_id: Qwen/Qwen2.5-VL-3B-Instruct
+    family: qwen2_5_vl
+    env: main
+    prompt_format: chat
+    notes: "ViT 504² (1296 patch × 1280) -> merger (gộp 2×2) -> 324 token × 2048"
+  phi35_vision:
+    name: "Phi-3.5-vision-instruct"
+    aliases: [phi, phi35]
+    hf_id: microsoft/Phi-3.5-vision-instruct
+    revision: 12b77fb40b63a2c73c68243d3f767aab688a1b2a  # pin remote code + weights đã kiểm
+    family: phi3_v
+    env: legacy
+    prompt_format: chat
+    attn_implementation: eager   # config gốc đòi flash_attention_2; remote code không hỗ trợ sdpa
+    processor_kwargs: {}         # num_crops mặc định của nhà sản xuất (4)
+    notes: "CLIP-L/336 (crop × 576 patch × 1024) -> HD transform 2×2 + img_projection -> token × 3072"
+
+# Đồng bộ kiểu dữ liệu: baseline KHÔNG lượng tử, mọi mô hình ở dtype này (trọng số + pixel_values).
+# Không vừa VRAM -> device_map=auto tràn phần dư sang RAM (chậm hơn, kết quả như nhau).
+dtype: bfloat16
+attn_implementation: sdpa        # mặc định; mô hình nào không hỗ trợ thì khai models.<m>.attn_implementation
+
+autotune:                        # hạ tầng tự dò (không phải điều kiện thí nghiệm)
+  max_batch: 64                  # trần thử batch sinh đầu tiên (OOM -> chia đôi)
+  vram_reserve_gib: 1.5
+  vram_reserve_frac: 0.06
+  ram_reserve_gib: 4.0
+
+# ── e. Metrics ──────────────────────────────────────────────────────────────
+metrics:
+  # e2. Tiền xử lý (cả dự đoán lẫn tham chiếu, đúng thứ tự)
+  normalize:
+    lowercase: true              # 1. Lowercasing
+    strip_section_headers: true  # 2. Strip Headers (findings: / impression:)
+    collapse_whitespace: true    # 3. Whitespace & Newline Collapse
+    fix_space_before_punct: true # 4. Punctuation Formatting
+    strip: true                  # 5. Trimming
+  # e1.1 Chuẩn LLMs
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    rescale_with_baseline: false
+    keep: [f1]
+  # e1.2 Med-Report
+  radgraph:
+    enabled: true
+    model_type: radgraph-xl
+    reward_level: all
+    batch_size: 32              # lô chấm; hiện pbar theo lô và tránh một lô 1200 mẫu quá lâu
+  primary: radgraph_f1
+  # e1.3 Baseline: CKA (linear) giữa đặc trưng TRƯỚC và SAU Aligner/Adapter của từng mô hình,
+  # trên toàn bộ ảnh test (mỗi ảnh = trung bình theo token). Một số / mô hình, CI bootstrap.
+  cka:
+    enabled: true
+    kernel: linear
+    n_boot: 1000
+
+# ── f. Thống kê kiểm định (chọn tự động theo số candidate k) ────────────────
+#   k = 2 -> Permutation test (sign-flip ghép cặp theo ảnh) + Paired Bootstrap (CI95), Cohen's dz, Holm
+#   k > 2 -> Friedman (ties) + Iman-Davenport F, Kendall W, Holm; hậu kiểm (metric qua cổng):
+#            Nemenyi CD + Wilcoxon signed-rank (Pratt) Holm, rank-biserial
+#   CKA (một số / mô hình): CI bootstrap + so cặp paired bootstrap, Holm
+stats:
+  alpha: 0.05
+  text_metrics: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1, radgraph_f1]
+  n_perm: 10000
+  n_boot: 10000
+  kendall_w_floor: 0.05
+  zero_method: pratt
+  rrb_floor: 0.10
+  posthoc_holm: permetric        # permetric | global
+  posthoc_permutation: false
+
+# ── Weights & Biases: MỌI thao tác (data, infer, score, stats) đều log ─────
+# Run tên tất định  <N>.<operation>[.<variant>][.dryrun]  (vd 1.infer.gemma3_4b_pt, 0.data.build),
+# group = thư mục key (0_Data, 1_Baseline). Trùng tên -> CẢNH BÁO và bỏ qua; --force -> ghi đè.
+# Chạy dở (predictions dở) -> đi tiếp ĐÚNG run cũ (id lưu ở wandb_ids.json).
+# --detach BẮT BUỘC W&B online (WANDB_API_KEY hoặc `wandb login`), trừ khi --no-wandb.
+wandb:
+  enabled: true
+  project: rgexp-current
+  entity: null
+  tags: [current, v2-dataset]
+  infer_log_every: 1
+
+# ── Đầu ra + Hub ────────────────────────────────────────────────────────────
+# Mọi key dùng chung repo kết quả đã có; mỗi key nằm trong một thư mục Current/<N>_<Title>.
+output:
+  root: outputs                  # Current/outputs/<N>_<Title>/
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_root: Current
+  push_each_variant: true        # LƯU (đẩy Hub) mỗi khi xong 1 variant bất kì: infer / score
+  resume_from_hub: true

@@ -1,0 +1,26 @@
+# Key 2: Phi-3.5 Vision QLoRA — CHỈ decoder, all-linear, rank 1/2/4/8.
+# Vision (CLIP encoder + img_projection) bị đóng băng hoàn toàn: KHÔNG fine-tune cùng lúc với LoRA.
+id: 2
+key: lora
+title: LoRA
+kind: lora
+# Khóa cứng Phi: chỉ cache/download và so sánh 5 candidate của Phi-3.5 Vision (base + 4 rank).
+models: [phi35_vision]
+lora:
+  quantization: nf4
+  double_quant: true
+  compute_dtype: bfloat16
+  # Vision giữ nguyên bf16, không lượng tử, không train.
+  quantization_skip_modules:
+    - model.vision_embed_tokens.img_processor
+    - model.vision_embed_tokens.img_projection
+  # all-linear của DECODER: gắn bằng regex để không chạm vision tower.
+  decoder_group: all_linear
+  decoder_targets: [qkv_proj, o_proj, gate_up_proj, down_proj]
+  decoder_layer_regex: '.*\.layers\.\d+\.(self_attn|mlp)\.(qkv_proj|o_proj|gate_up_proj|down_proj)'
+  ranks: [1, 2, 4, 8]
+  alpha_multiplier: 2           # alpha = 2 × rank
+  dropout: 0.05
+  base_candidate: true          # baseline của kiểm định = base NF4, không adapter
+  # Vision đóng băng ở MỌI candidate -> CKA trước/sau aligner là hằng số, không còn thông tin: tắt.
+  cka: false

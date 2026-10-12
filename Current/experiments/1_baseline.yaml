@@ -1,0 +1,15 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# KEY THÍ NGHIỆM 1 — Baseline: 5 mô hình ở trạng thái GỐC (không adapter, không fine-tune,
+# KHÔNG lượng tử), infer trên 2400 ảnh test; score/stats trên metadata cố định 1200 ảnh, cùng prompt system + user (định dạng theo chuẩn
+# đầu vào của từng mô hình), cùng ảnh 3×512×512 -> AutoProcessor gốc, cùng infer policy.
+#   Variant = mô hình.
+#   Metric: BLEU-1..4 · ROUGE-1/2/L · BERTScore-F1 (chuẩn LLM) · RadGraph-F1 (Med-Report)
+#           · CKA trước/sau Aligner (mỗi mô hình một số, CI bootstrap).
+#   Thống kê: k = 5 > 2 -> Friedman (khối = ảnh test) + hậu kiểm; nếu chỉ khai 2 mô hình ->
+#           Permutation + Paired Bootstrap.
+# ═════════════════════════════════════════════════════════════════════════════
+id: 1
+key: baseline
+title: Baseline                  # -> outputs/1_Baseline · Hub Current/1_Baseline
+kind: baseline
+models: [gemma3_4b_it, gemma3_4b_pt, paligemma2_3b, qwen25vl_3b, phi35_vision]
