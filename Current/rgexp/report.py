@@ -42,13 +42,14 @@ def render(cfg, g, ckres, srep, n_test) -> str:
     w(f"# Thí nghiệm {ex['id']} — {ex['title']}\n")
     if ex["kind"] == "lora":
         lora = cfg["lora"]
-        w(f"{len(ids)} candidate của `{cfg['models'][g['variants'][0]['model_key']]['hf_id']}`: base 4-bit và "
-          f"decoder QLoRA ({', '.join(map(str, lora['ranks']))}) + projector full-ft, 1 epoch, global batch "
+        w(f"{len(ids)} candidate của `{cfg['models'][g['variants'][0]['model_key']]['hf_id']}`: base 4-bit (baseline) và "
+          f"**decoder-only QLoRA all-linear**, rank {', '.join(map(str, lora['ranks']))}. **Vision encoder + "
+          f"img_projection đóng băng hoàn toàn** (không fine-tune cùng LoRA). 1 epoch, global batch "
           f"{cfg['train']['global_batch']}. Prompt system + user theo chat template Phi, ảnh "
           f"3×{(cfg.get('image') or {}).get('size', 512)}² → AutoProcessor gốc, cùng infer policy. Chấm trên "
-          f"**{n_test} ảnh test** (fixture chung `0_Data`). Kiểm định: " +
-          ("**Permutation + Paired Bootstrap** (k = 2)." if g["method"] != "friedman"
-           else f"**Friedman** (k = {len(ids)} > 2, khối = ảnh) + hậu kiểm.") + "\n")
+          f"**{n_test} ảnh test** (fixture chung `0_Data`). Hai kiểu so sánh: (1) **kiểm định thống kê từng LoRA vs "
+          f"baseline** (Permutation + Paired Bootstrap, Holm trên toàn họ); (2) **Radar chart** các metric của từng "
+          f"biến thể LoRA.\n")
     else:
         w(f"{len(ids)} mô hình ở **trạng thái gốc** (không adapter, không fine-tune, **không lượng tử**, dtype "
           f"`{cfg.get('dtype')}`), cùng prompt system + user (định dạng theo chuẩn đầu vào từng mô hình), ảnh "
@@ -58,7 +59,11 @@ def render(cfg, g, ckres, srep, n_test) -> str:
 
     w("## 0. Kết luận\n")
     w(f"- Metric chính **{NICE.get(prim, prim)}**: TB cao nhất **{name[sel['best_by_primary_mean']]}**.")
-    if g["method"] == "friedman":
+    if g["method"] == "vs_baseline":
+        better = sel["significantly_better_than_baseline"]
+        w(f"- LoRA tốt hơn baseline có ý nghĩa trên metric chính (Holm, α = {alpha}): "
+          + (", ".join(name[c] for c in better) if better else "**không có**") + ".")
+    elif g["method"] == "friedman":
         w(f"- Friedman trên metric chính: {'**bác H0**' if sel['friedman_rejects_primary'] else 'không bác H0'} "
           f"(α = {alpha}); nhóm không khác thực chất với mô hình tốt nhất: "
           f"{', '.join(name[c] for c in sel['equivalent_to_best'])}.")
@@ -66,7 +71,7 @@ def render(cfg, g, ckres, srep, n_test) -> str:
             w(f"- Hạng Friedman TB trên {len(tm)} metric tốt nhất: **{name[sel['best_by_avg_meanrank']]}**.")
     else:
         w(f"- Permutation (Holm) trên metric chính: {'**khác có ý nghĩa**' if sel['significant'] else 'không khác có ý nghĩa'}.")
-    w(f"- **Đề xuất: {name[sel['recommended']] if sel.get('recommended') else '— (không tách được)'}**.")
+    w(f"- **Đề xuất: {name[sel['recommended']] if sel.get('recommended') else '— (không có LoRA vượt baseline có ý nghĩa)' if g['method'] == 'vs_baseline' else '— (không tách được)'}**.")
     if ckres:
         best_ck = max(ckres["per_model"], key=lambda i: ckres["per_model"][i]["cka"])
         w(f"- CKA trước/sau Aligner cao nhất (aligner bảo toàn hình học đặc trưng thị giác tốt nhất): "
@@ -114,7 +119,28 @@ def render(cfg, g, ckres, srep, n_test) -> str:
         w(f"| {name[rr['candidate']]} | " + " | ".join(cells) +
           f" | {rr.get('mean_words_pred', float('nan')):.1f} | {int(rr.get('n_empty', 0) or 0)} |")
     w("")
-    if g["method"] == "friedman":
+    if g["method"] == "vs_baseline":
+        pr = g["pair"]
+        base_id = g["baseline"]
+        w(f"### 3.1. Kiểm định từng LoRA vs baseline (`{base_id}`)\n")
+        w(f"Với mỗi LoRA: d = điểm(LoRA) − điểm(baseline) trên cùng ảnh; **Permutation** (sign-flip), **Paired Bootstrap** "
+          f"CI95, Cohen's dz. **p Holm** hiệu chỉnh trên toàn họ {sel['family_size']} kiểm định "
+          f"({sel['holm_family']}); bác H0 khi p Holm < {alpha}. Δ > 0 = LoRA tốt hơn baseline.\n")
+        for lid in [i for i in ids if i != base_id]:
+            w(f"**{name[lid]}** vs baseline\n")
+            w("| Metric | TB LoRA | TB baseline | Δ | CI95 bootstrap | p permutation | p Holm (họ) | Cohen dz | kết luận |")
+            w("|---|---|---|---|---|---|---|---|---|")
+            for r in pr[pr["arm_a"] == lid].to_dict("records"):
+                verdict = ("✓ tốt hơn" if r["diff"] > 0 else "✓ kém hơn") if r["reject_h0"] else "—"
+                w(f"| {NICE.get(r['metric'], r['metric'])} | {r['mean_a']:.4f} | {r['mean_b']:.4f} | {r['diff']:+.4f} | "
+                  f"[{r['ci_low']:+.4f}, {r['ci_high']:+.4f}] | {_p(r['p_perm'])} | {_p(r['p_perm_holm'])} | "
+                  f"{r['cohen_dz']:+.3f} | {verdict} |")
+            w("")
+        w("### 3.2. Radar chart (mỗi biến thể LoRA, mỗi trục = một metric)\n")
+        w("Giá trị TB thô, chung một thang bán kính; nét đứt = baseline. File: `radar/radar_<candidate>.png`.\n")
+        for lid, path in (g.get("radar") or {}).items():
+            w(f"**{name[lid]}**\n\n![radar {lid}](radar/{path.name})\n")
+    elif g["method"] == "friedman":
         fr, ph, nem = g["fr"], g["ph"], g["nem"]
         w(f"### 3.1. Friedman (k = {len(ids)}, khối = ảnh)\n")
         w("| Metric | χ² | F (Iman-Davenport) | p_F | p_F Holm | Kendall W | khối trùng hoàn toàn | "

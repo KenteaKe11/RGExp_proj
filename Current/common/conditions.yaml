@@ -4,7 +4,7 @@
 #   key           type_test   thư mục        nội dung
 #   0  data       data        0_Data         Frontal · 1 ảnh/bệnh nhân · MSGKF 5600/1200/2400 + metadata test 1200
 #   1  baseline   baseline    1_Baseline     5 mô hình ở trạng thái gốc (variant = mô hình)
-#   2  lora       lora        2_LoRA         Phi QLoRA (variant = base + nhóm/rank)
+#   2  lora       lora        2_LoRA         Phi QLoRA (variant = base + all-linear rank 1/2/4/8)
 #
 # Mô hình (khối `models`):
 #   gemma3_4b_it    google/gemma-3-4b-it            (đã qua SFT)    env main
@@ -47,10 +47,10 @@ labels:
   orientation: auto              # auto | as_is | swap
 
 sampling:
-  n_train: 5600
+  n_train: 6400
   n_val: 1200
-  n_test: 1200
-  n_test_metadata: 1200    # tập cố định dùng để score/stats/CKA, được trích từ 2.400 ảnh infer
+  n_test: 2400
+  n_test_metadata: 2400    # tập cố định dùng để score/stats/CKA, được trích từ 2.400 ảnh infer
   # Sàng lọc THEO THỨ TỰ, áp cho MỌI tập:
   #  1. Hard filter góc chụp: chỉ giữ Frontal (cột `view` ∈ frontal_views).
   frontal_views: [PA, AP]

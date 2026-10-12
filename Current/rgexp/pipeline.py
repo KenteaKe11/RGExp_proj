@@ -160,11 +160,11 @@ def variants(cfg: Cfg, models: str | None = None) -> list[dict]:
                 continue
             specs = ([{"id": "base", "name": "Base quantized", "mode": "base"}]
                      if cfg["lora"].get("base_candidate", True) else [])
-            for group, targets in cfg["lora"]["decoder_targets"].items():
-                for rank in cfg["lora"]["ranks"]:
-                    specs.append({"id": f"{group}_r{rank}", "name": f"{group} QLoRA r={rank}",
-                                  "mode": "lora", "group": group, "rank": int(rank),
-                                  "target_modules": list(targets)})
+            group = str(cfg["lora"].get("decoder_group", "all_linear"))
+            for rank in cfg["lora"]["ranks"]:
+                specs.append({"id": f"{group}_r{rank}", "name": f"{group} QLoRA r={rank}",
+                              "mode": "lora", "group": group, "rank": int(rank),
+                              "target_modules": list(cfg["lora"]["decoder_targets"])})
             for i, spec in enumerate(specs):
                 out.append({"id": f"{mk}_{spec['id']}", "path": f"{mk}/{spec['id']}",
                             "group": spec.get("group", "base"), "model_key": mk, "model": dict(m),
@@ -582,13 +582,12 @@ def cmd_train(cfg: Cfg, ctx: Ctx) -> None:
             say(f"  ✓ {v['id']}: candidate nền, không train")
             continue
         d = vdir(cfg, v)
-        done = all((d / name).exists() for name in ("adapter_config.json", "adapter_model.safetensors",
-                                                     "projector_state.pt"))
+        done = all((d / name).exists() for name in ("adapter_config.json", "adapter_model.safetensors"))
         if done and not ctx.force:
             say(f"  ✓ {v['id']}: đã có adapter cuối — bỏ qua (--force để train lại)")
             continue
         if ctx.force:
-            _wipe(d, ["adapter_config.json", "adapter_model.safetensors", "projector_state.pt", "trainer_state.json"])
+            _wipe(d, ["adapter_config.json", "adapter_model.safetensors", "trainer_state.json"])
         pl = wb_plan(cfg, ctx, rname(cfg, "train", v), partial=any(d.glob("checkpoint-*")))
         if pl is None:
             continue
@@ -763,6 +762,56 @@ def _text_group(cfg: Cfg, gv: list[dict], keys: list[str], st: dict, seed: int) 
     return g
 
 
+def _lora_vs_baseline(cfg: Cfg, gv: list[dict], keys: list[str], st: dict, seed: int) -> dict:
+    """Key 2: so MỖI LoRA với baseline (base NF4) — Permutation + Paired Bootstrap, ghép cặp theo ảnh.
+
+    Holm áp trên TOÀN BỘ họ kiểm định (số LoRA × số metric), nên kết luận chịu được so sánh bội.
+    """
+    from . import stats_friedman as SF
+    from . import stats_pair as SP
+
+    base = next((v for v in gv if v["lora_spec"]["mode"] == "base"), None)
+    if base is None:
+        raise RunFailed("so với baseline cần candidate base (lora.base_candidate: true).")
+    loras = [v for v in gv if v is not base]
+    ids = [v["id"] for v in gv]
+    order = {v["id"]: v["order"] for v in gv}
+    scores = {i: pd.read_csv(mdir(cfg) / f"per_sample_{i}.csv") for i in ids}
+    scores, binfo = SF.align_blocks(scores, order_hint=keys)
+    if binfo["n_common"] != len(keys):
+        raise RunFailed(f"khối không đầy đủ: {binfo}")
+    tm = [m for m in st.get("text_metrics", []) if m in scores[ids[0]].columns]
+    rows = []
+    for i in ids:
+        row = {"candidate": i, "order": order[i]}
+        for m in tm + [c for c in scores[i].columns if c.startswith("radgraph_") and c not in tm]:
+            row[m] = float(scores[i][m].mean())
+        cj = _jload(mdir(cfg) / f"corpus_{i}.json")
+        if cj:
+            row.update(cj)
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    parts = []
+    for v in loras:
+        t = SP.compare_two({v["id"]: scores[v["id"]], base["id"]: scores[base["id"]]}, tm, st, seed=seed)
+        t = t.rename(columns={"p_perm_holm": "p_perm_holm_within_variant"}).drop(columns=["reject_h0"])
+        parts.append(t)
+    pair = pd.concat(parts, ignore_index=True)
+    alpha = float(st.get("alpha", 0.05))
+    pair["p_perm_holm"] = SF.holm(pair["p_perm"].to_numpy())          # họ = mọi LoRA × mọi metric
+    pair["reject_h0"] = pair["p_perm_holm"] < alpha
+    prim = str(cfg["metrics"].get("primary", "radgraph_f1"))
+    pp = pair[pair["metric"] == prim].set_index("arm_a")
+    best = max(ids, key=lambda c: (float(summary.set_index("candidate").loc[c, prim]), -order[c]))
+    better = [i for i in pp.index if bool(pp.loc[i, "reject_h0"]) and float(pp.loc[i, "diff"]) > 0]
+    rec = max(better, key=lambda i: float(pp.loc[i, "mean_a"])) if better else None
+    return {"ids": ids, "variants": gv, "tm": tm, "summary": summary, "k": len(ids), "method": "vs_baseline",
+            "baseline": base["id"], "pair": pair,
+            "sel": {"primary": prim, "best_by_primary_mean": best, "baseline": base["id"],
+                    "significantly_better_than_baseline": better, "recommended": rec,
+                    "family_size": int(len(pair)), "holm_family": "all LoRA x all metrics"}}
+
+
 def cmd_stats(cfg: Cfg, ctx: Ctx) -> None:
     import numpy as np
 
@@ -799,7 +848,8 @@ def cmd_stats(cfg: Cfg, ctx: Ctx) -> None:
         return
     run = wb_run(cfg, pl, "stats", {"stats": st, "variants": [v["id"] for v in vs], "cka": ck_cfg})
     try:
-        g = _text_group(cfg, vs, keys, st, seed)
+        g = (_lora_vs_baseline(cfg, vs, keys, st, seed) if cfg["exp"]["kind"] == "lora"
+             else _text_group(cfg, vs, keys, st, seed))
         ckres = None
         if ck_cfg.get("enabled", True):
             feats = {}
@@ -815,7 +865,12 @@ def cmd_stats(cfg: Cfg, ctx: Ctx) -> None:
             for i, r in ckres["per_model"].items():
                 g["summary"].loc[g["summary"]["candidate"] == i, "cka"] = r["cka"]
         g["summary"].to_csv(rd / "summary.csv", index=False)
-        if g["method"] == "friedman":
+        if g["method"] == "vs_baseline":
+            from . import radar
+
+            g["pair"].to_csv(rd / "pair_tests_vs_baseline.csv", index=False)
+            g["radar"] = radar.radar_all(g["summary"], g["tm"], g["baseline"], g["variants"], rd / "radar")
+        elif g["method"] == "friedman":
             g["fr"].to_csv(rd / "friedman.csv", index=False)
             g["ph"].to_csv(rd / "posthoc_wilcoxon.csv", index=False)
             g["nem"].to_csv(rd / "posthoc_nemenyi.csv", index=False)
@@ -913,7 +968,7 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None, needs: tuple[str
                 patterns += [f"{base}/predictions.jsonl", f"{base}/infer_fingerprint.txt", f"{base}/cka/*.npz"]
             if "adapters" in needs:
                 patterns += [f"{base}/adapter_config.json", f"{base}/adapter_model.safetensors",
-                             f"{base}/projector_state.pt", f"{base}/trainer_state.json"]
+                             f"{base}/trainer_state.json"]
             if "metrics" in needs:
                 patterns += [hub_path(cfg, dn, "metrics", f"{kind}_{v['id']}.{ext}")
                              for kind, ext in (("per_sample", "csv"), ("corpus", "json"), ("cka", "npz"))]
@@ -938,8 +993,7 @@ def sync_from_hub(cfg: Cfg, selected: list[dict] | None = None, needs: tuple[str
         if not hd.exists():
             continue
         d = vdir(cfg, v)
-        for artifact in ("adapter_config.json", "adapter_model.safetensors", "projector_state.pt",
-                         "trainer_state.json"):
+        for artifact in ("adapter_config.json", "adapter_model.safetensors", "trainer_state.json"):
             src, dst = hd / artifact, d / artifact
             if src.exists() and not dst.exists():
                 shutil.copy2(src, dst)

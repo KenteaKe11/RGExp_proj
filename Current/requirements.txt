@@ -33,3 +33,6 @@ nltk>=3.8
 radgraph>=0.1.13
 
 scipy>=1.11.0
+
+# radar chart của key 2 (LoRA)
+matplotlib>=3.7

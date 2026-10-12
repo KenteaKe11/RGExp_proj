@@ -5,11 +5,11 @@
 
   Preflight (luôn chạy; t02/t04 bỏ qua nếu môi trường chưa cài torch):
     t01_config              cấu hình: key data/baseline/lora, 5 mô hình + env, prompt, sampling,
-                            variants lora = 7 candidate (base + attention r2/4/8 + all_linear r2/4/8),
+                            variants lora = 5 candidate (base + all_linear r1/2/4/8, decoder-only, vision đóng băng),
                             file key khai điều kiện chung / khoá hạ tầng -> lỗi
     t02_lora_target_mask    thêm target cho Phi phải kéo dài attention_mask cùng lúc
     t03_lora_minibatch      autotune bắt đầu theo cận CPU/RAM/VRAM, còn OOM giảm ở trainer
-    t04_lora_model_summary  chỉ projector full-ft và tensor LoRA decoder mới được phép train
+    t04_lora_model_summary  chỉ tensor LoRA decoder được train; vision (kể cả projector) phải đóng băng
   Full integration (chỉ chạy khi tắt QUICK; cần torch/transformers, t12 cần GPU):
     t02_orientation         chiều nhãn đo bằng văn bản (giữ / đảo / mơ hồ -> dừng)
     t03_sampling            lấy mẫu: đủ cỡ, không trùng bệnh nhân, mọi nhãn có mặt, đảo đúng
@@ -135,11 +135,19 @@ def t01_config():
     assert ql["models"]["phi35_vision"]["revision"] == "12b77fb40b63a2c73c68243d3f767aab688a1b2a"
     assert ql["output"]["hub_repo"] == bl["output"]["hub_repo"]
     assert ql["lora"]["alpha_multiplier"] == 2
-    assert [v["id"] for v in P.variants(ql)] == ["phi35_vision_base", "phi35_vision_attention_r2",
-                                                   "phi35_vision_attention_r4", "phi35_vision_attention_r8",
-                                                   "phi35_vision_attention_r16", "phi35_vision_all_linear_r2",
-                                                   "phi35_vision_all_linear_r4", "phi35_vision_all_linear_r8",
-                                                   "phi35_vision_all_linear_r16"]
+    assert [v["id"] for v in P.variants(ql)] == ["phi35_vision_base", "phi35_vision_all_linear_r1",
+                                                   "phi35_vision_all_linear_r2", "phi35_vision_all_linear_r4",
+                                                   "phi35_vision_all_linear_r8"]
+    assert ql["lora"]["ranks"] == [1, 2, 4, 8] and "projector_module" not in ql["lora"]
+    assert ql["lora"]["decoder_targets"] == ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    assert not ql["metrics"]["cka"]["enabled"] and bl["metrics"]["cka"]["enabled"], "CKA tắt riêng cho key LoRA"
+    import re as _re
+    rx = _re.compile(ql["lora"]["decoder_layer_regex"])      # regex chỉ khớp decoder, không khớp vision
+    for hit in ("model.layers.0.self_attn.qkv_proj", "model.layers.31.mlp.down_proj", "model.layers.5.mlp.gate_up_proj"):
+        assert rx.fullmatch(hit), hit
+    for miss in ("model.vision_embed_tokens.img_processor.vision_model.encoder.layers.3.self_attn.out_proj",
+                 "model.vision_embed_tokens.img_projection.0", "lm_head"):
+        assert not rx.fullmatch(miss), miss
     for bad in ("medgemma",):
         try:
             C.load(bad)
@@ -227,7 +235,7 @@ def t03_lora_minibatch():
 
 @case
 def t04_lora_model_summary():
-    """Chỉ projector full-ft và tensor LoRA decoder mới được phép train."""
+    """Chỉ tensor LoRA decoder được train; vision (kể cả img_projection) phải đóng băng."""
     import torch
 
     from rgexp.lora_worker import _model_summary
@@ -248,21 +256,22 @@ def t04_lora_model_summary():
     model = ToyPhi()
     for p in model.parameters():
         p.requires_grad_(False)
-    for p in model.vision_embed_tokens.img_projection.parameters():
-        p.requires_grad_(True)
     model.model.layers[0].qkv_proj.lora_A.requires_grad_(True)
     model.model.layers[0].qkv_proj.lora_B.requires_grad_(True)
-    summary = _model_summary(model, model.vision_embed_tokens.img_projection, ["qkv_proj"])
+    summary = _model_summary(model, ["qkv_proj"])
     assert summary["target_module_hits"] == {"qkv_proj": 1}
-    assert summary["groups"]["projector_full_ft"]["trainable"] == 9
+    assert "projector_full_ft" not in summary["groups"]
     assert summary["groups"]["decoder_qlora"]["trainable"] == 4
-    assert summary["trainable_params"] == 13
-    model.lm_head.weight.requires_grad_(True)
-    try:
-        _model_summary(model, model.vision_embed_tokens.img_projection, ["qkv_proj"])
-        raise AssertionError("tham số trainable ngoài QLoRA/projector phải dừng")
-    except RuntimeError:
-        pass
+    assert summary["groups"]["vision_frozen"]["trainable"] == 0
+    assert summary["trainable_params"] == 4
+    for frozen in (model.vision_embed_tokens.img_projection, model.lm_head):   # vision / lm_head mở -> phải dừng
+        frozen.weight.requires_grad_(True)
+        try:
+            _model_summary(model, ["qkv_proj"])
+            raise AssertionError("tham số trainable ngoài LoRA decoder phải dừng")
+        except RuntimeError:
+            pass
+        frozen.weight.requires_grad_(False)
 
 
 def _synthetic_pool(N=6000, seed=0):

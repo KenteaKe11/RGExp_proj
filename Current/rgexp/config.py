@@ -188,6 +188,8 @@ def load(type_test: str = "data", overrides: list[str] | None = None) -> Cfg:
     for blk in KIND_BLOCKS[e["kind"]]:
         if blk in e:
             raw[blk] = copy.deepcopy(e[blk])
+    if e["kind"] == "lora" and not bool(raw["lora"].get("cka", False)):
+        raw.setdefault("metrics", {}).setdefault("cka", {})["enabled"] = False   # vision đóng băng -> CKA hằng số
     all_models = raw.pop("models", {}) or {}
     raw["models"] = {mk: copy.deepcopy(all_models[mk]) for mk in (e.get("models") or [])}
     for item in overrides or []:

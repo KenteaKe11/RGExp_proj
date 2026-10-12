@@ -1,4 +1,4 @@
-# RGExp — Current: Data → Baseline → QLoRA (quy chuẩn mới, tập dữ liệu lớn)
+# RGExp — Current: Data → Baseline → LoRA (quy chuẩn mới, tập dữ liệu lớn)
 
 Toàn bộ thí nghiệm nằm trong thư mục `Current/` ở gốc repo. Thư mục gồm:
 - **điều kiện chung**: `common/conditions.yaml`;
@@ -13,9 +13,9 @@ Mỗi key lưu kết quả riêng ở `Current/outputs/<N>_<Title>/`. Mọi key 
 |---|---|---|---|---|
 | **0** | `data` | Frontal · 1 ảnh/bệnh nhân · MultilabelStratifiedGroupKFold → **5600 train / 1200 val / 2400 infer test**; metadata cố định **1200 test** để chấm điểm. **Chạy trước** | — | `outputs/0_Data` + `data/splits` · `Current/0_Data` |
 | 1 | `baseline` | 5 mô hình ở trạng thái gốc | mô hình | `outputs/1_Baseline` · `Current/1_Baseline` |
-| 2 | `lora` | Phi-3.5-vision QLoRA · base + attention/all-linear, rank 2/4/8 | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
+| 2 | `lora` | Phi-3.5-vision QLoRA · **decoder-only all-linear**, rank 1/2/4/8, vision đóng băng | candidate | `outputs/2_LoRA` · `Current/2_LoRA` |
 
-Key 2 khóa cứng `phi35_vision`: chỉ cache/download Phi và chỉ kiểm định giữa candidate base và sáu candidate QLoRA của Phi. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
+Key 2 khóa cứng `phi35_vision`: 5 candidate = **base (baseline)** + **all-linear r = 1, 2, 4, 8**. Khi resume từ Hub, mỗi candidate là một bước progress riêng.
 Phi được pin ở revision `12b77fb40b63a2c73c68243d3f767aab688a1b2a` để remote code và weights không tự đổi giữa các lần chạy.
 
 ### Candidate (`common/conditions.yaml → models`)
@@ -82,8 +82,9 @@ bash Current/run.sh <type_test> <operation> [tuỳ chọn]
 | `baseline` | `stats` | kiểm định (theo k) + CKA → `REPORT.md`, `summary.csv`, `cka.json`, ... |
 | `baseline` | `push` | đẩy cả thư mục lên `Current/1_Baseline/` |
 | `baseline` | `all` | **infer MỌI mô hình** → **score** → **stats** → **push** |
-| `lora` | `train` | 6 adapter Phi: projector full-ft + decoder QLoRA, 1 epoch · base candidate bỏ qua |
-| `lora` | `infer` / `score` / `stats` / `push` | tương tự baseline trên 7 candidate |
+| `lora` | `train` | 4 adapter Phi: chỉ decoder QLoRA all-linear (r = 1/2/4/8), vision đóng băng, 1 epoch · base candidate bỏ qua |
+| `lora` | `infer` / `score` / `push` | tương tự baseline trên 5 candidate |
+| `lora` | `stats` | **(1)** kiểm định từng LoRA vs baseline + **(2)** radar chart từng biến thể → `REPORT.md`, `pair_tests_vs_baseline.csv`, `radar/*.png` |
 | `lora` | `all` | **train MỌI QLoRA variant** → **infer MỌI candidate** → **score** → **stats** → **push** |
 
 **Lưu recovery sau mỗi variant.** Mỗi khi train, infer hoặc score xong một variant, chương trình đẩy ngay
@@ -115,7 +116,7 @@ for m in gemma_it gemma_pt pali qwen phi; do       # chạy thử từng mô hì
   bash Current/run.sh baseline infer --models $m --limit 8
 done
 bash Current/run.sh lora train                    # mặc định chỉ model PHI
-bash Current/run.sh lora all --detach              # train + đánh giá 7 candidate
+bash Current/run.sh lora all --detach              # train + đánh giá 5 candidate
 bash Current/run.sh lora status                   # không tải dữ liệu / checkpoint
 bash Current/run.sh baseline all --detach          # chạy thật (nền)
 bash Current/run.sh baseline status
@@ -170,14 +171,17 @@ Qwen2.5-VL: 504², Phi: HD crop 336).
 Global batch **64** · AdamW, weight decay **0.01** · Cosine Warmup 10% đầu: `0 → 2e-4 → 1e-5` ·
 **1 epoch** · không val, lấy **ckpt cuối** · **Target Token Masking**. Ghi ở khối `train:`.
 
-Key 2 lượng tử decoder NF4 4-bit; mọi candidate fine-tune đều gắn PEFT QLoRA (alpha = **2 × rank**) lên `qkv_proj`/`o_proj` (attention) hoặc thêm
-`gate_up_proj`/`down_proj` (all-linear). `model.vision_embed_tokens.img_projection` được bỏ khỏi lượng tử hóa
-và fine-tune toàn phần. Global batch 64 được thực hiện bằng gradient accumulation với mini-batch tự dò từ
+Key 2 lượng tử decoder NF4 4-bit và gắn PEFT QLoRA (alpha = **2 × rank**) lên **mọi linear của decoder**
+(`qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj` ở từng lớp `model.layers.N`; chọn bằng regex
+`lora.decoder_layer_regex` nên **không bao giờ chạm vision**). **Vision encoder (CLIP) và `img_projection` đóng băng hoàn toàn**,
+không fine-tune cùng lúc với LoRA; trainer dừng nếu có tham số trainable nào ngoài tensor LoRA của decoder.
+`lm_head` và embedding cũng đóng băng (đúng nghĩa all-linear của PEFT: không gồm lớp output).
+Global batch 64 được thực hiện bằng gradient accumulation với mini-batch tự dò từ
 CPU/RAM/VRAM; gặp OOM thì mini-batch giảm một nửa và global batch đó được chạy lại. Mỗi optimizer step log
 loss, `grad_norm`, learning rate và mini-batch thực tế lên stdout/W&B.
 Mini-batch luôn là lũy thừa của 2; log in `mini_batch chốt` ngay optimizer step đầu tiên dùng được giá trị đó.
 Khi bắt đầu mỗi candidate, log cũng in model summary: revision Phi, NF4, target QLoRA, số tham số từng phần,
-trạng thái frozen/QLoRA/full-ft và tổng tỷ lệ tham số trainable.
+trạng thái frozen/QLoRA và tổng tỷ lệ tham số trainable.
 
 ### d. Infer policy
 
@@ -213,7 +217,19 @@ khoá sampling nào vào.
 Với 5 baseline thì dùng **Friedman**. **CKA** chỉ có một số cho mỗi mô hình, nên không áp được hai
 kiểm định trên; báo cáo dùng CI95 bootstrap theo ảnh và so từng cặp bằng **paired bootstrap** + Holm.
 
-**Đề xuất:** mô hình có TB RadGraph-F1 cao nhất. REPORT kèm nhóm mô hình không khác thực chất, hạng
+**Key 2 (LoRA) dùng hai kiểu so sánh riêng**, thay cho Friedman:
+
+1. **Thống kê từng LoRA vs baseline** (baseline = candidate `base` NF4, không adapter): với mỗi LoRA và mỗi metric,
+   **Permutation test** (sign-flip ghép cặp theo ảnh) + **Paired Bootstrap** CI95 + Cohen's dz trên d = LoRA − baseline.
+   **Holm** áp trên toàn họ (4 LoRA × 9 metric = 36 kiểm định). Đề xuất = LoRA có RadGraph-F1 TB cao nhất trong
+   các LoRA **tốt hơn baseline có ý nghĩa** (không có thì "không có LoRA vượt baseline").
+2. **Radar chart thông thường**, mỗi biến thể LoRA một biểu đồ, mỗi trục = một metric (BLEU-1..4, ROUGE-1/2/L,
+   BERTScore-F1, RadGraph-F1), giá trị TB thô, **chung một thang bán kính**; nét đứt = baseline để đối chiếu.
+   Ảnh ở `outputs/2_LoRA/radar/radar_<candidate>.png`, nhúng trong `REPORT.md`.
+
+CKA bị **tắt** ở key 2 (`lora.cka: false`): vision đóng băng nên đặc trưng trước/sau aligner giống hệt ở mọi candidate.
+
+**Đề xuất (key 1):** mô hình có TB RadGraph-F1 cao nhất. REPORT kèm nhóm mô hình không khác thực chất, hạng
 Friedman trung bình và mô hình có CKA cao nhất.
 
 ---
@@ -249,7 +265,7 @@ Current/
   experiments/                0_data.yaml · 1_baseline.yaml
   data/splits/                (VÀO GIT) train|val|test .csv/.json + split_report.json
   rgexp/
-    pipeline.py   worker.py   stratify.py   sampling.py   cka.py   stats_pair.py   stats_friedman.py
+    pipeline.py   worker.py   lora_worker.py   stratify.py   sampling.py   cka.py   stats_pair.py   stats_friedman.py   radar.py
     metrics.py   tracking.py   config.py   label_orientation.py   labels_cls.py   data.py   imaging.py
     report.py   decoding.py   hw.py
   tests/selftest.py  tests/tiny.py

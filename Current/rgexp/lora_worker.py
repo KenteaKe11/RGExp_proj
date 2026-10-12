@@ -1,4 +1,7 @@
-"""Single-process Phi-3.5-vision QLoRA trainer for experiment key 2."""
+"""Single-process Phi-3.5-vision QLoRA trainer for experiment key 2.
+
+Chỉ decoder được fine-tune (LoRA all-linear). Vision encoder + img_projection đóng băng hoàn toàn.
+"""
 from __future__ import annotations
 
 import argparse
@@ -109,16 +112,13 @@ def _grad_norm(parameters, torch) -> float:
     return float(torch.stack(norms).norm(2).item()) if norms else 0.0
 
 
-def _model_summary(model, projector, target_modules: list[str]) -> dict:
-    """Kiểm và tóm tắt phần nào của Phi được lượng tử/freeze/full-ft/QLoRA."""
-    projector_ids = {id(p) for p in projector.parameters()}
+def _model_summary(model, target_modules: list[str]) -> dict:
+    """Kiểm và tóm tắt phần nào của Phi được lượng tử/freeze/QLoRA. Vision phải đóng băng 100%."""
     groups = {name: {"params": 0, "trainable": 0, "tensors": 0} for name in
-              ("projector_full_ft", "decoder_qlora", "vision_frozen", "decoder_frozen", "other_frozen")}
+              ("decoder_qlora", "vision_frozen", "decoder_frozen", "other_frozen")}
     unexpected = []
     for name, param in model.named_parameters():
-        if id(param) in projector_ids:
-            group = "projector_full_ft"
-        elif "lora_" in name:
+        if "lora_" in name and "vision_embed_tokens" not in name:
             group = "decoder_qlora"
         elif "vision_embed_tokens" in name:
             group = "vision_frozen"
@@ -130,13 +130,16 @@ def _model_summary(model, projector, target_modules: list[str]) -> dict:
         item["params"] += param.numel()
         item["trainable"] += param.numel() if param.requires_grad else 0
         item["tensors"] += 1
-        if param.requires_grad and group not in ("projector_full_ft", "decoder_qlora"):
+        if param.requires_grad and group != "decoder_qlora":
             unexpected.append(name)
     if unexpected:
-        raise RuntimeError("Có tham số trainable ngoài projector/QLoRA: " + ", ".join(unexpected[:8]))
+        raise RuntimeError("Có tham số trainable ngoài LoRA decoder (vision phải đóng băng): "
+                           + ", ".join(unexpected[:8]))
     target_hits = {target: 0 for target in target_modules}
     quantized_linear = 0
     for name, module in model.named_modules():
+        if "vision_embed_tokens" in name:
+            continue
         for target in target_hits:
             if name.endswith(target):
                 target_hits[target] += 1
@@ -156,12 +159,12 @@ def _log_model_summary(summary: dict, model_cfg: dict, lcfg: dict, train_cfg: di
           f"attention={model_cfg.get('attn_implementation', 'eager')}", flush=True)
     print(f"  quant=NF4 4-bit · double_quant={bool(lcfg.get('double_quant', True))} · "
           f"compute_dtype={lcfg.get('compute_dtype', 'bfloat16')}", flush=True)
-    print(f"  QLoRA: rank={rank} · alpha={alpha} · dropout={lcfg.get('dropout', 0.05)} · "
-          f"targets={summary['target_module_hits']}", flush=True)
+    print(f"  QLoRA (decoder only, vision đóng băng): rank={rank} · alpha={alpha} · "
+          f"dropout={lcfg.get('dropout', 0.05)} · targets={summary['target_module_hits']}", flush=True)
     print(f"  train: global_batch={train_cfg['global_batch']} · AdamW wd={train_cfg['weight_decay']} · "
           f"cosine warmup={train_cfg['warmup_frac']:.0%} · lr={train_cfg['lr_max']}→{train_cfg['lr_min']}", flush=True)
     for name, item in summary["groups"].items():
-        policy = {"projector_full_ft": "full-ft", "decoder_qlora": "QLoRA", "vision_frozen": "frozen",
+        policy = {"decoder_qlora": "QLoRA", "vision_frozen": "frozen",
                   "decoder_frozen": "frozen", "other_frozen": "frozen"}[name]
         print(f"  {name}: {item['params']:,} params · {item['tensors']} tensors · {policy}"
               + (f" ({item['trainable']:,} trainable)" if item["trainable"] else ""), flush=True)
@@ -221,8 +224,7 @@ def train(spec_path: Path) -> None:
     quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type=str(lcfg.get("quantization", "nf4")),
                                bnb_4bit_use_double_quant=bool(lcfg.get("double_quant", True)),
                                bnb_4bit_compute_dtype=dtype,
-                               llm_int8_skip_modules=list(lcfg.get("quantization_skip_modules",
-                                                                   [lcfg["projector_module"]])))
+                               llm_int8_skip_modules=list(lcfg.get("quantization_skip_modules") or []))
     revision = model_cfg.get("revision")
     processor = AutoProcessor.from_pretrained(model_cfg["hf_id"], revision=revision, trust_remote_code=True,
                                                **dict(model_cfg.get("processor_kwargs") or {}))
@@ -238,13 +240,14 @@ def train(spec_path: Path) -> None:
     target = list(lc["target_modules"])
     rank = int(lc["rank"])
     lora_alpha = rank * int(lcfg.get("alpha_multiplier", 2))
+    # Regex chỉ khớp linear của các lớp decoder (model.layers.N.{self_attn,mlp}.*) -> không bao giờ chạm vision.
+    layer_regex = str(lcfg.get("decoder_layer_regex") or "")
     model = get_peft_model(model, LoraConfig(
         r=rank, lora_alpha=lora_alpha,
-        lora_dropout=float(lcfg.get("dropout", 0.05)), target_modules=target,
+        lora_dropout=float(lcfg.get("dropout", 0.05)), target_modules=layer_regex or target,
         bias="none", task_type="CAUSAL_LM"))
-    projector = _module(model.get_base_model(), str(lcfg["projector_module"]))
-    for p in projector.parameters():
-        p.requires_grad_(True)
+    for name, p in model.named_parameters():       # chỉ tensor LoRA của decoder được train
+        p.requires_grad_("lora_" in name and "vision_embed_tokens" not in name)
     model.train()
 
     tokenizer = processor.tokenizer
@@ -263,13 +266,13 @@ def train(spec_path: Path) -> None:
                        run_info.get("group", ""), "train", {"candidate": spec["candidate"],
                        "train": train_cfg, "lora_candidate": lc}, Path(spec["wandb_dir"]),
                        step_metric="train_step")
-    summary = _model_summary(model, projector, target)
+    summary = _model_summary(model, target)
     _log_model_summary(summary, model_cfg, lcfg, train_cfg, rank, lora_alpha)
     run.summary({"model/total_params": summary["total_params"],
                  "model/trainable_params": summary["trainable_params"],
                  "model/trainable_pct": summary["trainable_pct"],
                  "model/linear4bit_modules": summary["quantized_linear_modules"],
-                 "model/projector_full_ft_params": summary["groups"]["projector_full_ft"]["params"],
+                 "model/vision_frozen_params": summary["groups"]["vision_frozen"]["params"],
                  "model/qlora_params": summary["groups"]["decoder_qlora"]["params"],
                  "model/target_module_hits": summary["target_module_hits"],
                  "qlora/rank": rank, "qlora/alpha": lora_alpha,
@@ -333,12 +336,11 @@ def train(spec_path: Path) -> None:
         run.log({"train_step": step, "train/loss": mean_loss, "train/grad_norm": grad_norm,
                  "train/mini_batch": mini_batch, "train/lr": scheduler.get_last_lr()[0]})
     model.save_pretrained(out, safe_serialization=True)
-    torch.save({k: v.detach().cpu() for k, v in projector.state_dict().items()}, out / "projector_state.pt")
     (out / "trainer_state.json").write_text(json.dumps({
         "epochs": 1, "global_batch": global_batch, "optimizer_steps": steps,
         "scheduler": "cosine_with_warmup", "warmup_steps": warmup,
         "lr_max": lr_max, "lr_min": lr_min, "samples": len(rows),
-        "target_token_masking": True, "projector": lcfg["projector_module"],
+        "target_token_masking": True, "vision_frozen": True, "decoder_targets": target,
         "lora_rank": rank, "lora_alpha": lora_alpha, "mini_batch_final": mini_batch,
         "mini_batch_caps": batch_caps
     }, indent=2), encoding="utf-8")
