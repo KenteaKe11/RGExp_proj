@@ -169,7 +169,7 @@ def t_stats_3_pairs():
 
     arm_ids = [a["id"] for a in CFG.get("arms", [])]
     pairs = pair_list(arm_ids, mode="all")
-    assert len(pairs) == 4, f"4 arm phải sinh ra đúng 4 cặp so sánh, nhận {len(pairs)}: {pairs}"
+    assert len(pairs) == 6, f"4 arm phải sinh ra đúng 6 cặp so sánh, nhận {len(pairs)}: {pairs}"
 
 
 def t_hub_output_dest():
@@ -202,7 +202,7 @@ def main():
     check("Quy chuẩn giải mã beam_size=3, max_new_tokens=256", t_decoding_spec)
 
     hr("4. Kiểm định Thống kê & Lưu trữ")
-    check("Tạo đủ 4 cặp đối chứng cho 3 arm", t_stats_3_pairs)
+    check("Tạo đủ 4 cặp đối chứng cho 4 arm", t_stats_3_pairs)
     check("Lưu trữ cùng Hub repo với subdir mới 2.6_vision_lora", t_hub_output_dest)
 
     hr("TỔNG KẾT")
