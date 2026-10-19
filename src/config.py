@@ -28,7 +28,7 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "configs" / "section25.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "vision_lora.yaml"
 
 
 class Cfg(dict):

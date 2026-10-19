@@ -1,0 +1,220 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.6 — LORA CHO VISION ENCODER (SigLIP) TRÊN GEMMA 3 4B-IT
+# ═════════════════════════════════════════════════════════════════════════════
+# Thí nghiệm kiểm chứng năng lực biểu diễn thị giác (Vision Encoder capacity)
+# với MỘT BIẾN SỐ DUY NHẤT: LoRA rank trên Vision Encoder.
+#
+# ĐIỀU KIỆN ĐÓNG BĂNG (FREEZE ALL):
+#   - Language Model (decoder): ĐÓNG BĂNG HOÀN TOÀN (requires_grad = False,
+#     KHÔNG gắn adapter vào decoder).
+#   - Multi-modal Projector: ĐÓNG BĂNG HOÀN TOÀN (requires_grad = False).
+#   - Vision Encoder base (SigLIP): ĐÓNG BĂNG HOÀN TOÀN.
+#   - DUY NHẤT các trọng số LoRA (lora_A, lora_B) gắn vào Vision Encoder
+#     được cập nhật gradient.
+#
+# BA CẤU HÌNH (3 ARMS):
+#   1. vision_lora_r2: rank 2, alpha 4  (alpha/r = 2.0)
+#   2. vision_lora_r4: rank 4, alpha 8  (alpha/r = 2.0)
+#   3. vision_lora_r8: rank 8, alpha 16 (alpha/r = 2.0)
+#
+# HỆ THỐNG LƯU TRỮ:
+#   - CÙNG một Hugging Face Hub repo: RGExp123/Research_results
+#   - Thư mục (subdir) mới: 2.6_vision_lora
+#   - Thư mục adapter mới: ./adapters_vision_lora
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+experiment: "2.6"
+
+mode: adapter
+
+# ── Dữ liệu chuẩn hoá của toàn bộ dự án RGExp ─────────────────────────────────
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 512
+  assert_no_leak: true
+
+# ── Chính sách tiền xử lý ảnh chung ───────────────────────────────────────────
+image_policy:
+  unified: true
+  resize_to: 512
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  per_model_normalize_only: true
+
+# ── BA CẤU HÌNH SO SÁNH (3 ARMS) ─────────────────────────────────────────────
+arms:
+  - id: vision_lora_r2
+    name: "Vision LoRA (SigLIP) · rank 2"
+    method: qlora
+    rank: 2
+    enabled: true
+
+  - id: vision_lora_r4
+    name: "Vision LoRA (SigLIP) · rank 4"
+    method: qlora
+    rank: 4
+    enabled: true
+
+  - id: vision_lora_r8
+    name: "Vision LoRA (SigLIP) · rank 8"
+    method: qlora
+    rank: 8
+    enabled: true
+
+  - id: vision_lora_r16
+    name: "Vision LoRA (SigLIP) · rank 16"
+    method: qlora
+    rank: 16
+    enabled: true
+
+# ── Base Model: Gemma 3 4B-it ────────────────────────────────────────────────
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_adapter
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 4
+  device_map_train: single
+  device_map_infer: auto
+  merge_adapter: false
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 3
+  length_penalty: 1.0
+  early_stopping: false
+  no_repeat_ngram_size: 0
+  repetition_penalty: 1.0
+  num_return_sequences: 1
+
+# ── Huấn luyện: Gắn LoRA CHỈ vào Vision Encoder (SigLIP) ─────────────────────
+train:
+  n_epochs: 2
+  per_device_batch_size: 2
+  grad_accum: 16
+  max_seq_len: 1024
+  gradient_checkpointing: true
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  logging_steps: 10
+  schedule:
+    impl: lambda
+    max_lr: 2.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+
+  # CHỈ GẮN VÀO CÁC MA TRẬN PHÉP CHIẾU ATTENTION CỦA VISION ENCODER (SigLIP)
+  target_modules: [q_proj, k_proj, v_proj, out_proj]
+  include_prefixes: [vision_tower, model.vision_tower, vision_model]
+  exclude_prefixes: [language_model, model.language_model, multi_modal_projector]
+  task_type: null
+
+  lora_dropout: 0.05
+  bias: none
+  # alpha = alpha_ratio * rank -> giữ nguyên hệ số khuếch đại (alpha/r = 2.0)
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+  batch_probe:
+    effective_batch: 32
+    min_batch_size: 1
+
+# ── Đánh giá & Chấm điểm từng mẫu ───────────────────────────────────────────
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# ── Kiểm định thống kê ghép cặp giữa 3 cấu hình (r2, r4, r8) ────────────────
+stats:
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci: 0.95
+  ci_method: bca
+  dz_floor: 0.10
+  primary_test: perm
+  pairs: all
+  reference: vision_lora_r4
+  adjust: holm
+  adjust_scope: pairs
+
+# ── W&B Tracker ─────────────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  project: rgexp-vision-lora
+  entity: null
+  run_name: null
+  group: "section2.6"
+  resume_same_run: false
+  mode: online
+  tags: [section2.6, vision_lora, siglip, gemma3, freeze_all, rank2_4_8, mimic-cxr]
+  notes: "Thí nghiệm so sánh Vision LoRA rank 2 vs 4 vs 8 (freeze decoder & projector) trên Gemma 3 4B-it"
+  log_every: 20
+  log_samples: 20
+
+# ── Lưu trữ: CÙNG repo Hub, thư mục mới ─────────────────────────────────────
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.6_vision_lora"
+  adapter_dir: ./adapters_vision_lora
+  ft_suffix: "_ft"

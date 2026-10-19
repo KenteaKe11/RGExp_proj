@@ -223,9 +223,9 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
     if bad:
         # Không thể xảy ra với vòng lọc ở trên, nhưng nếu một bản peft/transformers
         # nào đó đổi cấu trúc thì đây là cái lưới cuối.
-        raise TrainUnusable(f"module vision lọt vào danh sách adapter: {bad[:3]}")
+        raise TrainUnusable(f"module thuộc exclude_prefixes lọt vào danh sách adapter: {bad[:3]}")
 
-    print(f"  adapter gắn vào {len(hits)} module ngôn ngữ "
+    print(f"  adapter gắn vào {len(hits)} module mục tiêu "
           f"(bỏ {len(rejected_vision)} module ngoài phạm vi)", flush=True)
     print(f"    vd: {hits[0]}", flush=True)
     return hits
@@ -653,13 +653,15 @@ def attach_adapter(model, arm: dict, tcfg: dict):
             model, use_gradient_checkpointing=bool(tcfg.get("gradient_checkpointing", True)))
 
     targets = find_target_modules(model, tcfg)
+    task_type = tcfg.get("task_type", None)
     lcfg_kw = dict(
         r=rank, lora_alpha=alpha,
         lora_dropout=float(tcfg.get("lora_dropout", 0.05)),
         bias=str(tcfg.get("bias", "none")),
         target_modules=targets,
-        task_type="CAUSAL_LM",
     )
+    if task_type:
+        lcfg_kw["task_type"] = task_type
     if uses_dora(method):
         # DoRA tách cập nhật thành hướng (LoRA) và độ lớn (vector m học được).
         # Nó CHẬM hơn LoRA rõ rệt (~1.3-2×) vì phải chuẩn hoá cột trọng số mỗi
@@ -677,6 +679,13 @@ def attach_adapter(model, arm: dict, tcfg: dict):
             "là LoRA mang tên khác — tệ hơn nhiều so với thiếu hẳn.")
     lcfg_kw = {k: v for k, v in lcfg_kw.items() if k in sig or k == "target_modules"}
     peft_model = get_peft_model(model, LoraConfig(**lcfg_kw))
+
+    # ĐÓNG BĂNG MỌI THỨ NGOẠI TRỪ CÁC THAM SỐ LORA ĐƯỢC CHỈ ĐỊNH (FREEZE ALL)
+    for name, param in peft_model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     n_train = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in peft_model.parameters())
