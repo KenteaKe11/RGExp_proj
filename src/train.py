@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from transformers import TrainerCallback
+
 from . import imaging
 from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
                        build_scheduler, collate, free_vram, is_oom,
@@ -133,10 +135,11 @@ def write_probe(cfg: Cfg, bs: int, accum: int, per_arm: dict) -> Path:
     return p
 
 
-class _TrackCallback:
+class _TrackCallback(TrainerCallback):
     """Đẩy loss và lr từng bước sang Tracker (W&B)."""
 
     def __init__(self, tracker, arm_id: str):
+        super().__init__()
         self.tracker = tracker
         self.aid = arm_id
 

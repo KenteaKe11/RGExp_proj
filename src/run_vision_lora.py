@@ -2,10 +2,10 @@
 
 Thực hiện 7 stages:
     1. data: Chuẩn bị split test (3000 mẫu) và train (6400 mẫu) từ MIMIC-CXR.
-    2. train: Huấn luyện 3 cấu hình rank (2, 4, 8) — Freeze all ngoại trừ Vision LoRA.
+    2. train: Huấn luyện 4 cấu hình rank (2, 4, 8, 16) — Freeze all ngoại trừ Vision LoRA.
     3. infer: Sinh báo cáo X-quang với Gemma3AdapterRunner (beam search num_beams=3).
     4. score: Chấm điểm từng mẫu (BLEU-1..4, ROUGE-1/2/L, BertScore F1).
-    5. stats: Kiểm định ghép cặp (Paired Bootstrap BCa + Permutation) + hiệu chỉnh Holm trên 3 cặp.
+    5. stats: Kiểm định ghép cặp (Paired Bootstrap BCa + Permutation) + hiệu chỉnh Holm trên 6 cặp.
     6. report: Tổng hợp REPORT.md và summary.json.
     7. push: Đẩy kết quả và adapter lên Hugging Face Hub (CÙNG repo RGExp123/Research_results, subdir mới).
 
@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages:
-        _hr("Huấn luyện 3 cấu hình Vision LoRA (rank 2, 4, 8) — Freeze All")
+        _hr("Huấn luyện 4 cấu hình Vision LoRA (rank 2, 4, 8, 16) — Freeze All")
         from .train import (already_trained, preflight_adapters, read_probe,
                             resolve_batch, train_arm, write_probe)
 
@@ -357,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         from .stats_multi import compare_pairs
 
         cols = metric_columns(next(iter(scores.values())))
-        print(f"  Chạy kiểm định trên {len(cols)} metric × 3 cặp so sánh...", flush=True)
+        print(f"  Chạy kiểm định trên {len(cols)} metric × {len(scores)*(len(scores)-1)//2} cặp so sánh (pairs=all)...", flush=True)
         paired_df = compare_pairs(scores, cols, dict(cfg["stats"]))
         paired_df.to_csv(pw_path, index=False)
         manifest["n_paired_tests"] = len(paired_df)

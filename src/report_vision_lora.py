@@ -1,7 +1,7 @@
 """Báo cáo kết quả §2.6 — LoRA cho Vision Encoder (SigLIP) trên Gemma 3 4B-it.
 
-So sánh 3 cấu hình rank (2, 4, 8) với kiểm định ghép cặp (Paired Bootstrap + Permutation Test)
-kết hợp hiệu chỉnh Holm trên 3 cặp đối chứng.
+So sánh 4 cấu hình rank (2, 4, 8, 16) với kiểm định ghép cặp (Paired Bootstrap + Permutation Test)
+kết hợp hiệu chỉnh Holm trên mọi cặp so sánh.
 """
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     lines.append("Hai kiểm định ghép cặp không tham số được thực hiện trên từng mẫu:")
     lines.append("- **Paired Permutation Test** (10,000 lần hoán vị dấu) -> $p_{\\text{perm}}$")
     lines.append("- **Paired Bootstrap BCa** (10,000 lần lấy mẫu lại) -> Khoảng tin cậy 95% BCa và $p_{\\text{boot}}$")
-    lines.append("- **Hiệu chỉnh Holm:** kiểm soát tỷ lệ lỗi loại I trên 3 cặp đối chứng.")
+    lines.append("- **Hiệu chỉnh Holm:** kiểm soát tỷ lệ lỗi loại I trên mọi cặp so sánh.")
     lines.append("")
 
     if not paired_df.empty:
