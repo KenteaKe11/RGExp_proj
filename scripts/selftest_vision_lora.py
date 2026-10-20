@@ -64,9 +64,9 @@ def t_default_config():
 
 def t_arms_count_and_ranks():
     arms = CFG.get("arms", [])
-    assert len(arms) == 3, f"Số lượng arm phải là 4, nhận: {len(arms)}"
+    assert len(arms) == 4, f"Số lượng arm phải là 4, nhận: {len(arms)}"
     ranks = [a.get("rank") for a in arms]
-    assert ranks == [2, 4, 8], f"Các rank phải là [2, 4, 8, 16], nhận: {ranks}"
+    assert ranks == [2, 4, 8, 16], f"Các rank phải là [2, 4, 8, 16], nhận: {ranks}"
     methods = [a.get("method") for a in arms]
     assert all(m in ("qlora", "lora") for m in methods)
 
@@ -169,7 +169,7 @@ def t_stats_3_pairs():
 
     arm_ids = [a["id"] for a in CFG.get("arms", [])]
     pairs = pair_list(arm_ids, mode="all")
-    assert len(pairs) == 3, f"3 arm phải sinh ra đúng 3 cặp so sánh, nhận {len(pairs)}: {pairs}"
+    assert len(pairs) == 6, f"4 arm phải sinh ra đúng 6 cặp so sánh, nhận {len(pairs)}: {pairs}"
 
 
 
@@ -197,7 +197,7 @@ def t_decoding_spec():
 def main():
     hr("1. Cấu hình & Điểm vào mặc định")
     check("DEFAULT_CONFIG là vision_lora.yaml", t_default_config)
-    check("Đúng 3 arm với rank [2, 4, 8]", t_arms_count_and_ranks)
+    check("Đúng 4 arm với rank [2, 4, 8, 16]", t_arms_count_and_ranks)
     check("Tỷ lệ alpha/r = 2.0 tỉ lệ thuận cho mọi rank", t_alpha_scaling)
 
     hr("2. Cô lập Vision Encoder & Freeze All")
@@ -210,7 +210,7 @@ def main():
     check("Quy chuẩn giải mã beam_size=3, max_new_tokens=256", t_decoding_spec)
 
     hr("4. Kiểm định Thống kê & Lưu trữ")
-    check("Tạo đủ 3 cặp đối chứng cho 3 arm", t_stats_3_pairs)
+    check("Tạo đủ 6 cặp đối chứng cho 4 arm", t_stats_3_pairs)
     check("Cấu hình đa luồng CPU và đa luồng stream Range", t_cpu_and_streaming_config)
     check("Lưu trữ cùng Hub repo với subdir mới 2.6_vision_lora", t_hub_output_dest)
 
