@@ -97,7 +97,7 @@ arms:
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 16"
     method: qdora
     rank: 16
-    enabled: false
+    enabled: true
 
 # ── Base Model: Gemma 3 4B-it ────────────────────────────────────────────────
 base:
