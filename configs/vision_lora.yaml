@@ -80,13 +80,13 @@ arms:
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 2"
     method: qdora
     rank: 2
-    enabled: true
+    enabled: false
 
   - id: vision_lora_r4
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 4"
     method: qdora
     rank: 4
-    enabled: true
+    enabled: false
 
   - id: vision_lora_r8
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 8"
