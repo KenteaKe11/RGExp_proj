@@ -129,11 +129,13 @@ generate:
 # ── Huấn luyện: Gắn LoRA CHỈ vào Vision Encoder (SigLIP) ─────────────────────
 train:
   n_epochs: 1
-  per_device_batch_size: 4
-  grad_accum: 8
+  per_device_batch_size: 2
+  grad_accum: 16
   max_seq_len: 1024
   gradient_checkpointing: true
   weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
   max_grad_norm: 1.0
   logging_steps: 10
   schedule:
