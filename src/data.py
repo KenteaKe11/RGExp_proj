@@ -484,11 +484,24 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def manifest_root(cfg: Cfg) -> Path:
+    """Thư mục chứa các file manifest (testset/trainset/valset .jsonl).
+
+    Mặc định trùng `data.cache_dir`. `data.manifest_dir` cho phép TÁCH manifest
+    khỏi cache ảnh: dry-run (8 ảnh test, 16 mẫu train) dùng nó để không ghi đè
+    manifest của lần chạy chính thức — ảnh vẫn dùng chung cache vì cùng key thì
+    cùng một file ảnh đã resize. Không tách thì sau một lần `--dry-run`, chạy
+    `--stages train,infer` sẽ lặng lẽ huấn luyện/chấm điểm trên 8-16 mẫu.
+    """
+    d = cfg.data
+    return Path(d.get("manifest_dir") or d.get("cache_dir", "./data")).expanduser()
+
+
 def prepare(cfg: Cfg, tracker=None) -> pd.DataFrame:
     """Điểm vào: trả bảng [key, ref, image_path] và ghi manifest ra đĩa."""
-    cache_root = Path(cfg.data.get("cache_dir", "./data")).expanduser()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    manifest = cache_root / "testset.jsonl"
+    mroot = manifest_root(cfg)
+    mroot.mkdir(parents=True, exist_ok=True)
+    manifest = mroot / "testset.jsonl"
 
     print("═══ Dữ liệu ═══", flush=True)
     df = load_index(cfg)
@@ -504,7 +517,7 @@ def prepare(cfg: Cfg, tracker=None) -> pd.DataFrame:
 
 def load_manifest(cfg: Cfg) -> pd.DataFrame:
     """Đọc lại manifest đã chuẩn bị (dùng khi chạy riêng một stage)."""
-    path = Path(cfg.data.get("cache_dir", "./data")) / "testset.jsonl"
+    path = manifest_root(cfg) / "testset.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"Chưa có {path} — chạy stage `data` trước.")
     return pd.DataFrame([json.loads(l) for l in open(path, encoding="utf-8") if l.strip()])

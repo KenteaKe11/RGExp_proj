@@ -1,21 +1,22 @@
 # ═════════════════════════════════════════════════════════════════════════════
-# §2.6 — LORA CHO VISION ENCODER (SigLIP) TRÊN GEMMA 3 4B-IT
+# §2.6 — VISION QDoRA (SigLIP nửa sau + PROJECTOR) TRÊN GEMMA 3 4B-IT
 # ═════════════════════════════════════════════════════════════════════════════
-# Thí nghiệm kiểm chứng năng lực biểu diễn thị giác (Vision Encoder capacity)
-# với MỘT BIẾN SỐ DUY NHẤT: LoRA rank trên Vision Encoder.
+# Thí nghiệm kiểm chứng năng lực biểu diễn thị giác (Vision capacity) với MỘT
+# BIẾN SỐ DUY NHẤT: RANK của adapter phía thị giác, r ∈ {2, 4, 8} (CHÍNH THỨC).
 #
-# ĐIỀU KIỆN ĐÓNG BĂNG (FREEZE ALL):
-#   - Language Model (decoder): ĐÓNG BĂNG HOÀN TOÀN (requires_grad = False,
-#     KHÔNG gắn adapter vào decoder).
-#   - Multi-modal Projector: ĐÓNG BĂNG HOÀN TOÀN (requires_grad = False).
-#   - Vision Encoder base (SigLIP): ĐÓNG BĂNG HOÀN TOÀN.
-#   - DUY NHẤT các trọng số LoRA (lora_A, lora_B) gắn vào Vision Encoder
-#     được cập nhật gradient.
+# ĐIỀU KIỆN ĐÓNG BĂNG (FREEZE ALL, trừ adapter):
+#   - Language Model (decoder): ĐÓNG BĂNG HOÀN TOÀN, KHÔNG gắn adapter.
+#   - Trọng số nền SigLIP và multi-modal projector: ĐÓNG BĂNG.
+#   - CHỈ các tham số adapter được cập nhật gradient:
+#       · LoRA/DoRA (lora_A, lora_B, magnitude) trên q/k/v/out_proj của NỬA SAU SigLIP;
+#       · adapter DoRA cho multi-modal projector (src/proj_adapter.py, gắn bằng hook).
 #
-# BA CẤU HÌNH (3 ARMS):
+# BA CẤU HÌNH (3 ARMS) + 1 BASELINE:
+#   0. gemma3_baseline: Gemma 3 4B-it zero-shot, không adapter (đối chứng DUY NHẤT)
 #   1. vision_lora_r2: rank 2, alpha 4  (alpha/r = 2.0)
 #   2. vision_lora_r4: rank 4, alpha 8  (alpha/r = 2.0)
 #   3. vision_lora_r8: rank 8, alpha 16 (alpha/r = 2.0)
+#   -> 3 cặp kiểm định: mỗi candidate vs baseline (các candidate KHÔNG so với nhau).
 #
 # HỆ THỐNG LƯU TRỮ:
 #   - CÙNG một Hugging Face Hub repo: RGExp123/Research_results
@@ -73,7 +74,7 @@ baseline:
   id: gemma3_baseline
   name: "Gemma 3 4B-it (baseline gốc)"
 
-# ── CÁC CANDIDATE (QDoRA; mỗi cái chỉ so với baseline) ───────────────────────
+# ── 3 CANDIDATE CHÍNH THỨC: rank 2 / 4 / 8 (QDoRA; mỗi cái chỉ so với baseline) ──
 arms:
   - id: vision_lora_r2
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 2"
@@ -91,12 +92,6 @@ arms:
     name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 8"
     method: qdora
     rank: 8
-    enabled: true
-
-  - id: vision_lora_r16
-    name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 16"
-    method: qdora
-    rank: 16
     enabled: true
 
 # ── Base Model: Gemma 3 4B-it ────────────────────────────────────────────────

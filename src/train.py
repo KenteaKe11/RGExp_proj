@@ -1,9 +1,10 @@
 """Huấn luyện adapter trên base Gemma 3 4B-it.
 
-Dùng cho thí nghiệm §2.6 (Vision LoRA):
-    - Đóng băng toàn bộ Language Model và Projector
-    - Huấn luyện duy nhất các tham số LoRA gắn trên Vision Encoder (SigLIP)
-    - 3 cấu hình rank: 2, 4, 8
+Dùng cho thí nghiệm §2.6 (Vision QDoRA):
+    - Đóng băng toàn bộ Language Model và trọng số nền của SigLIP / Projector
+    - Huấn luyện duy nhất tham số adapter: LoRA/DoRA trên NỬA SAU SigLIP và
+      adapter DoRA cho multi-modal projector (src/proj_adapter.py)
+    - 3 cấu hình rank CHÍNH THỨC: 2, 4, 8 (alpha/r = 2.0)
 
 Các hàm được xây dựng nhằm đảm bảo:
     1. Cùng tập dữ liệu 6400 mẫu, cùng seed, cùng số bước tối ưu hoá.
@@ -208,7 +209,7 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
 
     bs, accum = int(bs), int(accum)
     steps = max_steps_override or total_steps(
-        len(train_df), bs, accum, int(tcfg.get("n_epochs", 2)))
+        len(train_df), bs, accum, int(tcfg.get("n_epochs", 1)))
 
     print(f"\n── {arm.get('name', aid)} ── {len(train_df)} mẫu · batch {bs}×{accum} "
           f"· {steps} bước", flush=True)

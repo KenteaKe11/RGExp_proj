@@ -104,7 +104,7 @@ def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None, *,
     khi đó không so được với lần chạy trước — mà không có dòng log nào nói vậy.
     """
     d = cfg.data
-    cache_root = Path(d.get("cache_dir", "./data")).expanduser()
+    cache_root = data_mod.manifest_root(cfg)     # manifest; ảnh vẫn ở data.cache_dir
     cache_root.mkdir(parents=True, exist_ok=True)
 
     n_train = int(d.get("n_train", 0) or 0) if n_train is None else int(n_train)
@@ -158,7 +158,7 @@ def prepare_train(cfg: Cfg, test_df: pd.DataFrame, tracker=None, *,
 def load_train_manifest(cfg: Cfg, name: str = "trainset",
                         val_name: str = "valset"
                         ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    root = Path(cfg.data.get("cache_dir", "./data"))
+    root = data_mod.manifest_root(cfg)
     out = []
     for i, fname in enumerate((name, val_name)):
         p = root / f"{fname}.jsonl"

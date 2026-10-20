@@ -1,48 +1,55 @@
-# RGExp — §2.6: LoRA cho Vision Encoder (SigLIP) trên Gemma 3 4B-it
+# RGExp — §2.6: Vision QDoRA (SigLIP + Projector) trên Gemma 3 4B-it
 
 Repo này chạy **một** thí nghiệm tại một thời điểm. Thí nghiệm đang mở là
 **§2.6** — Độc lập hoá năng lực biểu diễn thị giác với một biến số duy nhất:
-**LoRA rank trên Vision Encoder (SigLIP)**, trong khi đóng băng toàn bộ phần còn lại (Freeze All).
+**rank của adapter phía thị giác**, r ∈ {2, 4, 8} (ba cấu hình chính thức),
+trong khi đóng băng Language Model và toàn bộ trọng số nền.
 
 ```bash
+python scripts/selftest_vision_lora.py           # Kiểm tra + mô phỏng logic (không cần GPU)
 bash scripts/run_vision_lora.sh --dry-run        # Thử nhanh đường ống (8 ảnh, 4 bước)
 bash scripts/run_vision_lora.sh --detach         # Chạy nền toàn bộ 7 stages
 ```
 
 ```
-A  vision_lora_r2   Gemma 3 4B-it NF4 + SigLIP LoRA rank 2 (alpha 4,  alpha/r = 2.0)
-B  vision_lora_r4   Gemma 3 4B-it NF4 + SigLIP LoRA rank 4 (alpha 8,  alpha/r = 2.0)
-C  vision_lora_r8   Gemma 3 4B-it NF4 + SigLIP LoRA rank 8 (alpha 16, alpha/r = 2.0)
+0  gemma3_baseline  Gemma 3 4B-it zero-shot, không adapter (đối chứng DUY NHẤT)
+A  vision_lora_r2   Gemma 3 4B-it NF4 + Vision QDoRA rank 2 (alpha 4,  alpha/r = 2.0)
+B  vision_lora_r4   Gemma 3 4B-it NF4 + Vision QDoRA rank 4 (alpha 8,  alpha/r = 2.0)
+C  vision_lora_r8   Gemma 3 4B-it NF4 + Vision QDoRA rank 8 (alpha 16, alpha/r = 2.0)
 ```
 
 **Câu hỏi thực nghiệm:**  
 Trên **cùng** 6,400 mẫu huấn luyện và **cùng** 3,000 ảnh đánh giá của tập MIMIC-CXR,
-khi **cố định hoàn toàn Language Model và Projector**, việc tăng dung lượng thích nghi
-của bộ mã hoá thị giác qua LoRA ($r \in \{2, 4, 8\}$) tác động như thế nào đến độ chính xác
-và chất lượng sinh báo cáo X-quang? Mức rank nào đạt điểm cân bằng giữa chất lượng và chi phí?
+khi **cố định hoàn toàn Language Model** và chỉ huấn luyện adapter phía thị giác,
+việc tăng rank $r \in \{2, 4, 8\}$ tác động như thế nào đến chất lượng sinh báo cáo
+X-quang so với baseline gốc? Mức rank nào đạt điểm cân bằng giữa chất lượng và chi phí?
 
 ---
 
-## 1. Kiến trúc & Phân định Đóng băng (Freeze-All)
+## 1. Kiến trúc & Phân định Đóng băng (Freeze-All trừ adapter)
 
-Trong thí nghiệm này, chỉ có duy nhất các ma trận chiếu attention của Vision Encoder (SigLIP)
-được tích hợp LoRA và có gradient. Tất cả các thành phần khác đều bị đóng băng hoàn toàn.
+Chỉ có các tham số **adapter** có gradient: LoRA/DoRA trên các ma trận chiếu attention của
+**nửa sau** Vision Encoder (SigLIP, lớp 14..26 trong 27 lớp) và adapter DoRA cho
+multi-modal projector. Mọi trọng số nền và toàn bộ Language Model bị đóng băng.
 
 ```text
-Ảnh X-quang (512x512)
+Ảnh X-quang (512x512 -> processor 896)
        │
        ▼
 ┌────────────────────────────────────────────────────────┐
-│  Vision Encoder (SigLIP)                               │
-│  - Trọng số nền base SigLIP: ĐÓNG BĂNG (requires_grad=F)│
-│  - LoRA Adapter (q_proj, k_proj, v_proj, out_proj)     │
-│    -> DUY NHẤT CÓ GRADIENT (r = 2, 4, 8)               │
+│  Vision Encoder (SigLIP, 27 lớp)                       │
+│  - Trọng số nền: ĐÓNG BĂNG, base NF4 4-bit             │
+│  - Lớp 0..13: không adapter                            │
+│  - Lớp 14..26: QDoRA (q_proj, k_proj, v_proj, out_proj)│
+│    -> CÓ GRADIENT (r = 2, 4, 8)                        │
 └────────────────────────────────────────────────────────┘
        │
        ▼ (4096 tokens, dim 1152)
 ┌────────────────────────────────────────────────────────┐
 │  Multi-modal Projector                                 │
-│  - ĐÓNG BĂNG HOÀN TOÀN (requires_grad = False)         │
+│  - Trọng số nền mm_input_projection_weight: ĐÓNG BĂNG  │
+│  - Adapter DoRA gắn bằng forward-hook (proj_adapter)   │
+│    cùng rank/alpha với arm -> CÓ GRADIENT              │
 └────────────────────────────────────────────────────────┘
        │
        ▼ (256 visual tokens, dim 2560)
@@ -63,15 +70,17 @@ Prompt Tokens ──────────────────────
 
 ### Chi tiết các khối:
 * **Vision Encoder (`vision_tower`):** SigLIP 896² (patch 14x14 = 64x64 = 4096 tokens, embedding dim 1152).
-  Các ma trận Linear được gắn adapter: `q_proj`, `k_proj`, `v_proj`, `out_proj`.
-* **Multi-modal Projector:** Linear / MLP chuyển đổi 4096 token -> 256 token không gian ngôn ngữ (dim 2560).
-  **Đóng băng 100%.**
-* **Language Model:** Decoder Transformer 4B lượng tử hoá 4-bit (NF4).
-  **Đóng băng 100%.**
-* **Alpha Scaling:** Thiết lập `alpha_mode: proportional` với `alpha_ratio: 2.0`, do đó tỷ lệ
-  $\frac{\alpha}{r} = 2.0$ là hằng số cho cả 3 rank (alpha = 4 cho r=2, alpha = 8 cho r=4, alpha = 16 cho r=8).
-  Điều này bảo đảm sự khác biệt quan sát được thuần tuý phản ánh **số chiều/dung lượng biểu diễn (rank capacity)**,
-  không bị nhiễu bởi biên độ cập nhật.
+  Adapter gắn vào `q_proj`, `k_proj`, `v_proj`, `out_proj` của **nửa sau** (`vision_layers.from: second_half`).
+  Decoder có cùng tên `q_proj/k_proj/v_proj` nhưng bị loại bởi `exclude_prefixes`.
+* **Multi-modal Projector:** Gemma 3 không có `nn.Linear` trong projector (phép chiếu là một `nn.Parameter` trần)
+  nên peft không bám vào được; `src/proj_adapter.py` gắn adapter DoRA bằng hook, khởi tạo $B=0$,
+  $m=\lVert W\rVert_{cột}$ nên lúc đầu mô hình **chính xác bằng** mô hình gốc.
+* **Language Model:** Decoder Transformer 4B lượng tử hoá 4-bit (NF4). **Đóng băng 100%.**
+* **QDoRA:** base 4-bit NF4 + DoRA (`method: qdora`) cho cả ba arm.
+* **Alpha Scaling:** `alpha_mode: proportional`, `alpha_ratio: 2.0`, do đó $\frac{\alpha}{r} = 2.0$ là hằng số
+  (alpha = 4 cho r=2, alpha = 8 cho r=4, alpha = 16 cho r=8). Sự khác biệt quan sát được
+  thuần tuý phản ánh **dung lượng biểu diễn (rank capacity)**, không bị nhiễu bởi biên độ cập nhật.
+* **Huấn luyện:** 1 epoch, 6,400 mẫu, batch hiệu dụng 32 (2 × 16) → 200 bước tối ưu cho mọi arm.
 
 ---
 
@@ -88,33 +97,44 @@ Theo yêu cầu lưu tiếp và tạo thư mục mới trên cùng hệ sinh th�
 
 ## 3. Quy chuẩn Đánh giá & Kiểm định Thống kê
 
-Ba cấu hình tạo thành đúng 3 cặp đối chứng:
-1. `(vision_lora_r2, vision_lora_r4)` — Tác động khi tăng gấp đôi rank từ 2 lên 4.
-2. `(vision_lora_r4, vision_lora_r8)` — Tác động khi tiếp tục tăng từ 4 lên 8 (kiểm tra bão hoà).
-3. `(vision_lora_r2, vision_lora_r8)` — Biên độ cải thiện cực đại giữa rank nhỏ nhất và lớn nhất.
+Baseline gốc là đối chứng **duy nhất**; ba cặp là mỗi candidate so với baseline
+(các candidate **không** được so với nhau):
+1. `(gemma3_baseline, vision_lora_r2)`
+2. `(gemma3_baseline, vision_lora_r4)`
+3. `(gemma3_baseline, vision_lora_r8)`
+
+Hiệu số đọc là $\Delta$ = candidate − baseline (dương = candidate hơn).
 
 * **Metric:** BLEU-1, BLEU-2, BLEU-3, BLEU-4, ROUGE-1, ROUGE-2, ROUGE-L, BertScore F1 (RoBERTa-large).
 * **Kiểm định ghép cặp:**
   - **Paired Permutation Test:** 10,000 lần hoán vị dấu ngẫu nhiên, cho $p_{\text{perm}}$.
-  - **Paired Bootstrap BCa:** 10,000 lần lấy mẫu lại có hoàn lại, ước lượng khoảng tin cậy 95% cho hiệu số $\Delta$.
-  - **Cohen's $d_z$:** Độ lớn hiệu ứng ghép cặp trên từng mẫu.
-  - **Hiệu chỉnh Holm:** Áp dụng trên 3 cặp trong từng metric để kiểm soát nghiêm ngặt Family-Wise Error Rate (FWER) ở mức $\alpha = 0.05$.
+  - **Paired Bootstrap BCa:** 10,000 lần lấy mẫu lại có hoàn lại, khoảng tin cậy 95% cho $\Delta$.
+  - **Cohen's $d_z$:** độ lớn hiệu ứng ghép cặp; `significant` cần cả hai kiểm định bác H0 và $|d_z| \ge 0.10$ để tính là có ý nghĩa thực chất.
+  - **Hiệu chỉnh Holm:** trên 3 cặp trong từng metric (`adjust_scope: pairs`), $\alpha = 0.05$.
+* **Lưu ý:** baseline chạy bf16 không lượng tử, candidate chạy trên base NF4; một phần chênh lệch có thể do lượng tử.
 
 ---
 
 ## 4. Hướng dẫn Chạy
 
 ### Kiểm tra tính toàn vẹn (Selftest)
-Không cần GPU, chạy trong 2 giây để xác nhận toàn bộ quy tắc đóng băng và cấu hình:
+Không cần GPU và không tải Gemma. Xác nhận cấu hình 3 arm rank 2/4/8, quy tắc đóng băng, và
+**mô phỏng** logic trên model giả lập (adapter = identity lúc khởi tạo, gradient chảy tới mọi
+tham số adapter, lưu/nạp projector adapter, stats → report trọn gói trên điểm tổng hợp):
 ```bash
 python scripts/selftest_vision_lora.py
 ```
 
-### Chạy thử nghiệm nhanh (Dry-run)
+### Chạy thử nhanh (Dry-run)
 Chạy 8 ảnh test, 16 mẫu train và 4 bước cập nhật:
 ```bash
 bash scripts/run_vision_lora.sh --dry-run
 ```
+
+### Quy trình cố định
+1. **train** cả 3 arm (QDoRA, **1 epoch**, bị chặn nếu `train.n_epochs != 1`) — xong arm nào **push adapter arm đó lên Hub ngay**.
+2. **infer** (baseline gốc rồi 3 arm) — xong candidate nào **push predictions candidate đó ngay**.
+3. **score** → **stats** (luôn chạy CẢ Permutation lẫn Paired Bootstrap, mỗi candidate chỉ so với baseline) → **report** → push kết quả tổng.
 
 ### Chạy chính thức toàn bộ 7 stages
 ```bash

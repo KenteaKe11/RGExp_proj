@@ -10,3 +10,6 @@ logs/
 adapters/
 adapters_dryrun/
 wandb/
+# §2.6: adapter QDoRA rank 2/4/8 (thuộc repo model, không phải repo code)
+adapters_vision_lora/
+adapters_vision_lora_dryrun/

@@ -23,8 +23,8 @@ trả lời cùng một câu hỏi trên cùng dữ liệu).
 
 ── DẤU CỦA HIỆU SỐ ─────────────────────────────────────────────────────────
 Mọi hiệu số đọc là `B − A` với (A, B) là cặp đã sắp. `stats.reference` đẩy
-candidate tham chiếu về phía A, nên với `reference: my_gemma` thì cột
-`mean_diff` dương nghĩa là **baseline hơn** My Gemma. Đó là một quy ước, và nó
+candidate tham chiếu về phía A. Ở §2.6 tham chiếu là baseline gốc, nên cột
+`mean_diff` dương nghĩa là **candidate hơn baseline** (B − A, A = baseline). Đó là một quy ước, và nó
 được in thẳng vào REPORT.md để không ai phải đoán chiều.
 """
 from __future__ import annotations

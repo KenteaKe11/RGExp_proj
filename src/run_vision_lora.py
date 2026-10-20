@@ -1,11 +1,14 @@
-"""§2.6 — Điểm vào điều phối trọn gói: LoRA cho Vision Encoder trên Gemma 3 4B-it.
+"""§2.6 — Điểm vào điều phối trọn gói: Vision QDoRA (SigLIP nửa sau + projector) trên Gemma 3 4B-it.
 
 Thực hiện 7 stages:
     1. data: Chuẩn bị split test (3000 mẫu) và train (6400 mẫu) từ MIMIC-CXR.
-    2. train: Huấn luyện 4 cấu hình rank (2, 4, 8, 16) — Freeze all ngoại trừ Vision LoRA.
-    3. infer: Sinh báo cáo X-quang với Gemma3AdapterRunner (beam search num_beams=3).
+    2. train: Huấn luyện 3 cấu hình rank CHÍNH THỨC (2, 4, 8), CHỈ 1 EPOCH — Freeze all ngoại trừ
+       adapter (QDoRA nửa sau SigLIP + adapter projector). Xong arm nào push adapter arm đó ngay.
+    3. infer: Chỉ chạy SAU KHI train xong cả 3 arm. Sinh báo cáo cho baseline gốc (gemma3) và 3 arm
+       (gemma3_adapter), beam search num_beams=3; xong candidate nào push predictions candidate đó ngay.
     4. score: Chấm điểm từng mẫu (BLEU-1..4, ROUGE-1/2/L, BertScore F1).
-    5. stats: Kiểm định ghép cặp (Paired Bootstrap BCa + Permutation) + hiệu chỉnh Holm trên 6 cặp.
+    5. stats: Kiểm định ghép cặp (Paired Bootstrap BCa + Permutation) + hiệu chỉnh Holm trên 3 cặp
+       (mỗi candidate vs baseline gốc; các candidate không so với nhau).
     6. report: Tổng hợp REPORT.md và summary.json.
     7. push: Đẩy kết quả và adapter lên Hugging Face Hub (CÙNG repo RGExp123/Research_results, subdir mới).
 
@@ -123,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"]["n_test"] = 8
         cfg["data"]["n_train"] = 16
         cfg["data"]["n_val"] = 0
+        # Manifest của dry-run ra thư mục RIÊNG (ảnh vẫn dùng chung cache): nếu không,
+        # dry-run ghi đè testset/trainset.jsonl chính thức bằng 8/16 mẫu.
+        cfg["data"]["manifest_dir"] = str(
+            Path(cfg["data"].get("cache_dir", "./data")) / "_dryrun")
         cfg["stats"]["n_perm"] = 200
         cfg["output"]["push"] = False
         cfg["output"]["subdir"] = str(cfg["output"].get("subdir", "2.6_vision_lora")) + "_dryrun"
@@ -136,6 +143,14 @@ def main(argv: list[str] | None = None) -> int:
         cfg["output"]["push"] = False
     if a.no_wandb:
         cfg.setdefault("wandb", {})["enabled"] = False
+
+    # §2.6 CHỈ huấn luyện 1 epoch (200 bước, eff_bs 32 trên 6400 mẫu). Chặn cứng:
+    # một `--set train.n_epochs=2` lặng lẽ làm các arm không còn so được với báo cáo.
+    n_ep = int(cfg.get("train", {}).get("n_epochs", 1))
+    if n_ep != 1:
+        print(f"✗ §2.6 chỉ chạy 1 epoch (train.n_epochs={n_ep}). Sửa configs/vision_lora.yaml "
+              f"nếu thật sự muốn đổi thiết kế.", flush=True)
+        return 2
 
     seed_everything(int(cfg.get("seed", 42)))
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
