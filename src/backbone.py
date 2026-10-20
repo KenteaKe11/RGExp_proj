@@ -214,6 +214,21 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
             continue
         hits.append(name)
 
+    # Chỉ giữ NỬA SAU của vision encoder (vd SigLIP 27 lớp -> lớp 14..26).
+    vl = tcfg.get("vision_layers") or {}
+    if vl.get("from") is not None:
+        pat = re.compile(r"\.layers\.(\d+)\.")
+        idx = {h: int(m.group(1)) for h in hits
+               if "vision" in h and (m := pat.search(h))}
+        if idx:
+            n_layers = max(idx.values()) + 1
+            frm = str(vl["from"]).lower()
+            start = -(-n_layers // 2) if frm == "second_half" else int(frm)
+            kept = [h for h in hits if h not in idx or idx[h] >= start]
+            rejected_vision += [h for h in hits if h not in kept]
+            hits = kept
+            print(f"  vision: giữ lớp {start}..{n_layers - 1} / {n_layers} lớp", flush=True)
+
     if not hits:
         raise TrainUnusable(
             "không module nào khớp target_modules dưới include_prefixes "
@@ -681,9 +696,21 @@ def attach_adapter(model, arm: dict, tcfg: dict):
     lcfg_kw = {k: v for k, v in lcfg_kw.items() if k in sig or k == "target_modules"}
     peft_model = get_peft_model(model, LoraConfig(**lcfg_kw))
 
+    # Adapter cho multi-modal projector (không có nn.Linear -> tự gắn bằng hook).
+    pa_cfg = dict(tcfg.get("projector_adapter") or {})
+    pa_meta = None
+    if pa_cfg.get("enabled", False):
+        from . import proj_adapter
+
+        _, pa_meta = proj_adapter.attach(
+            peft_model, rank, alpha, float(tcfg.get("lora_dropout", 0.05)),
+            bool(pa_cfg.get("dora", uses_dora(method))))
+        print(f"  projector adapter: r={rank} dora={pa_meta['dora']} "
+              f"({pa_meta['n_params']:,} tham số)", flush=True)
+
     # ĐÓNG BĂNG MỌI THỨ NGOẠI TRỪ CÁC THAM SỐ LORA ĐƯỢC CHỈ ĐỊNH (FREEZE ALL)
     for name, param in peft_model.named_parameters():
-        if "lora_" in name:
+        if "lora_" in name or "proj_adapter" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -695,7 +722,8 @@ def attach_adapter(model, arm: dict, tcfg: dict):
           f"dora={uses_dora(method)} 4bit={is_quantized(method)}", flush=True)
     return peft_model, {"trainable_params": n_train, "all_params": n_all,
                         "alpha": alpha, "rank": rank, "method": method,
-                        "n_target_modules": len(targets)}
+                        "n_target_modules": len(targets),
+                        "projector_adapter": pa_meta}
 
 
 # ── Một arm ─────────────────────────────────────────────────────────────────

@@ -226,7 +226,8 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     # Khẳng định kiểm tra: CHỈ có tham số LoRA của Vision Tower là trainable
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     bad_trainables = [n for n in trainable_names if not any(
-        p in n for p in tcfg.get("include_prefixes", ["vision_tower", "vision_model"]))]
+        p in n for p in tcfg.get("include_prefixes", ["vision_tower", "vision_model"]))
+        and "proj_adapter" not in n]
     if bad_trainables:
         raise TrainUnusable(
             f"Phát hiện tham số ngoài Vision Encoder được bật gradient: {bad_trainables[:3]}. "
@@ -291,6 +292,10 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     peak = (torch.cuda.max_memory_allocated() / 1024 ** 3) if torch.cuda.is_available() else 0.0
 
     model.save_pretrained(str(out_dir), safe_serialization=True)
+    if pstats.get("projector_adapter"):
+        from . import proj_adapter
+
+        proj_adapter.save(model, out_dir, pstats["projector_adapter"])
     processor.save_pretrained(str(out_dir))
 
     stats = {

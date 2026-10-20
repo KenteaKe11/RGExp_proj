@@ -156,6 +156,16 @@ def main(argv: list[str] | None = None) -> int:
     adapter_root = Path(str(cfg["output"].get("adapter_dir", "./adapters_vision_lora")))
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
 
+    # Baseline gốc: Gemma 3 4B-it zero-shot, không adapter. Là đối chứng DUY NHẤT
+    # của mọi candidate (các candidate không được so với nhau).
+    bl = dict(cfg.get("baseline", {}) or {})
+    baseline_id = str(bl.get("id", "gemma3_baseline")) if bl.get("enabled", True) else None
+    if baseline_id:
+        names = {baseline_id: bl.get("name", "Gemma 3 4B-it (baseline gốc)"), **names}
+        cfg["stats"]["reference"] = baseline_id
+        cfg["stats"]["pairs"] = "vs_reference"
+    score_ids = ([baseline_id] if baseline_id else []) + [x["id"] for x in arms]
+
     manifest = {
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -205,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages:
-        _hr("Huấn luyện 4 cấu hình Vision LoRA (rank 2, 4, 8, 16) — Freeze All")
+        _hr("Huấn luyện Vision QDoRA (nửa sau SigLIP + projector) — Freeze All, 1 epoch")
         from .train import (already_trained, preflight_adapters, read_probe,
                             resolve_batch, train_arm, write_probe)
 
@@ -254,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
                 probe_hits[arm["id"]] = int(st["batch_size"])
                 manifest["arm_status"][arm["id"]] = {
                     "trained": True, "minutes": st["minutes"], "batch_size": st["batch_size"]}
+                from .push import push_artifact
+
+                push_artifact(cfg, odir, f"adapters/{arm['id']}",
+                              f"§2.6 adapter {arm['id']} (train xong)")
                 tracker.summary({
                     f"train/{arm['id']}/minutes": st["minutes"],
                     f"train/{arm['id']}/loss": st["train_loss"],
@@ -279,14 +293,18 @@ def main(argv: list[str] | None = None) -> int:
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
 
     # ── infer ───────────────────────────────────────────────────────────────
-    pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
+    pred_paths = {i: run_dir / "predictions" / f"{i}.jsonl" for i in score_ids}
     if "infer" in stages:
         _hr("Sinh báo cáo X-quang (Inference)")
         from .runners import build
         from .runners.base import RunnerUnusable
 
-        for arm in arms:
+        infer_list = ([{"id": baseline_id, "name": names[baseline_id], "_baseline": True}]
+                      if baseline_id else []) + arms
+        for arm in infer_list:
             mcfg = arm_model_cfg(cfg, arm, adapter_root)
+            if arm.get("_baseline"):
+                mcfg["runner"] = "gemma3"      # không adapter, không lượng tử
             print(f"\n── {arm.get('name', arm['id'])} ──", flush=True)
             t0 = time.time()
             try:
@@ -294,6 +312,11 @@ def main(argv: list[str] | None = None) -> int:
                                               log_every=tracker.log_every)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                     "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
+                from .push import push_artifact
+
+                push_artifact(cfg, pred_paths[arm["id"]],
+                              f"predictions/{arm['id']}.jsonl",
+                              f"§2.6 predictions {arm['id']} (infer xong)")
             except RunnerUnusable as e:
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
@@ -311,8 +334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "score" in stages:
         _hr("Chấm điểm từng mẫu (Scoring)")
-        for arm in arms:
-            aid = arm["id"]
+        for aid in score_ids:
             csv_path = mdir / f"per_sample_{aid}.csv"
             if csv_path.exists() and not a.rescore:
                 scores[aid] = pd.read_csv(csv_path)
@@ -330,10 +352,10 @@ def main(argv: list[str] | None = None) -> int:
             tracker.summary({f"score/{aid}/{k}": float(sdf[k].mean())
                              for k in metric_columns(sdf)})
     else:
-        for arm in arms:
-            p = mdir / f"per_sample_{arm['id']}.csv"
+        for aid in score_ids:
+            p = mdir / f"per_sample_{aid}.csv"
             if p.exists():
-                scores[arm["id"]] = pd.read_csv(p)
+                scores[aid] = pd.read_csv(p)
 
     if len(scores) < 2:
         print(f"✗ chỉ có {len(scores)} arm chấm được điểm — cần ít nhất 2 để so sánh thống kê.", flush=True)
@@ -356,13 +378,21 @@ def main(argv: list[str] | None = None) -> int:
         _hr("Kiểm định thống kê ghép cặp (Paired Bootstrap & Permutation Test)")
         from .stats_multi import compare_pairs
 
+        if not baseline_id or baseline_id not in scores:
+            print(f"✗ thiếu điểm của baseline gốc ({baseline_id}) — không có đối chứng "
+                  f"để so sánh.", flush=True)
+            tracker.finish(1)
+            return 1
         cols = metric_columns(next(iter(scores.values())))
-        print(f"  Chạy kiểm định trên {len(cols)} metric × {len(scores)*(len(scores)-1)//2} cặp so sánh (pairs=all)...", flush=True)
-        paired_df = compare_pairs(scores, cols, dict(cfg["stats"]))
+        n_pairs = len(scores) - 1
+        print(f"  {len(cols)} metric × {n_pairs} cặp (mỗi candidate vs baseline gốc), "
+              f"mỗi cặp chạy CẢ Permutation lẫn Paired Bootstrap...", flush=True)
+        paired_df = compare_pairs(scores, cols, dict(cfg["stats"]), list(scores))
         paired_df.to_csv(pw_path, index=False)
         manifest["n_paired_tests"] = len(paired_df)
-        n_rej = int(paired_df["reject_h0"].sum()) if "reject_h0" in paired_df else 0
-        print(f"  -> {n_rej}/{len(paired_df)} phép kiểm bác H0 ở mức ý nghĩa α={cfg['stats'].get('alpha', 0.05)}", flush=True)
+        n_rej = int(paired_df["significant"].sum()) if "significant" in paired_df else 0
+        print(f"  -> {n_rej}/{len(paired_df)} phép kiểm có ý nghĩa (cả perm lẫn boot, sau Holm) "
+              f"ở α={cfg['stats'].get('alpha', 0.05)}", flush=True)
     elif pw_path.exists():
         paired_df = pd.read_csv(pw_path)
 
@@ -377,13 +407,13 @@ def main(argv: list[str] | None = None) -> int:
     # ── push ────────────────────────────────────────────────────────────────
     if "push" in stages and cfg.get("output", {}).get("push", False):
         _hr("Đẩy kết quả lên Hugging Face Hub (CÙNG repo, subdir mới)")
-        from .push import push_run
+        from .push import push_results
 
         hub_repo = cfg["output"].get("hub_repo")
         hub_subdir = cfg["output"].get("subdir", "2.6_vision_lora")
         print(f"  Đẩy lên repo `{hub_repo}`, subdir `{hub_subdir}`...", flush=True)
         try:
-            push_run(cfg, run_dir, tracker=tracker)
+            push_results(cfg, run_dir)
             manifest["pushed"] = True
             print("  ✓ Đẩy thành công!", flush=True)
         except Exception as e:

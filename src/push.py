@@ -163,3 +163,46 @@ def push_results(cfg: Cfg, run_dir: Path) -> str | None:
     url = f"https://huggingface.co/{'datasets/' if repo_type == 'dataset' else ''}{repo_id}"
     print(f"✓ đã đẩy: {url}  (thư mục `{subdir or '.'}`)", flush=True)
     return url
+
+
+def push_artifact(cfg: Cfg, local: Path, path_in_repo: str, message: str) -> bool:
+    """Đẩy MỘT thư mục/tệp lên repo kết quả ngay khi một candidate xong.
+
+    Dùng cho: adapter (có cả safetensors + projector_adapter.pt) sau khi train
+    và predictions sau khi infer. Không bao giờ ném lỗi — hỏng mạng giữa chừng
+    không được làm mất một lần huấn luyện 2 giờ; kết quả vẫn nằm ở đĩa và bước
+    push cuối (hoặc --stages push) đẩy bù được. Trả True nếu đã đẩy.
+    """
+    o = cfg["output"]
+    repo_id = str(o.get("hub_repo", "")).strip()
+    local = Path(local)
+    if not o.get("push", False) or not repo_id or not local.exists():
+        return False
+    tok = hf_token()
+    if not tok:
+        print("  ⚠ không có HF_TOKEN — chưa đẩy được " + path_in_repo, flush=True)
+        return False
+    subdir = str(o.get("subdir", "")).strip("/")
+    dest = f"{subdir}/{path_in_repo}".strip("/")
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=tok)
+        repo_type = str(o.get("hub_repo_type", "dataset"))
+        api.create_repo(repo_id=repo_id, repo_type=repo_type,
+                        private=bool(o.get("hub_private", True)), exist_ok=True)
+        if local.is_dir():
+            api.upload_folder(folder_path=str(local), repo_id=repo_id,
+                              repo_type=repo_type, path_in_repo=dest,
+                              commit_message=message,
+                              ignore_patterns=["*.part", "checkpoint-*/**",
+                                               "__pycache__/*"])
+        else:
+            api.upload_file(path_or_fileobj=str(local), repo_id=repo_id,
+                            repo_type=repo_type, path_in_repo=dest,
+                            commit_message=message)
+        print(f"  ✓ đã đẩy {dest} -> {repo_id}", flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"  ⚠ đẩy {dest} thất bại ({e!r}) — kết quả vẫn ở {local}", flush=True)
+        return False

@@ -105,6 +105,11 @@ class Gemma3AdapterRunner(Gemma3Runner):
         from peft import PeftModel
 
         self.model = PeftModel.from_pretrained(base, str(adapter_dir)).eval()
+        if stats.get("projector_adapter"):
+            from .. import proj_adapter
+
+            proj_adapter.load(self.model, adapter_dir)
+            print("  ✓ đã nạp projector adapter", flush=True)
 
         # Hợp nhất adapter vào trọng số nền cho nhanh — CHỈ khi base không lượng
         # tử. merge_and_unload trên base 4-bit phải giải lượng tử toàn bộ trọng

@@ -66,31 +66,38 @@ image_policy:
   allow_native_match: false
   per_model_normalize_only: true
 
-# ── BA CẤU HÌNH SO SÁNH (3 ARMS) ─────────────────────────────────────────────
+# ── BASELINE GỐC: Gemma 3 4B-it zero-shot, không adapter ─────────────────────
+# Đối chứng DUY NHẤT. Các candidate KHÔNG được so sánh với nhau.
+baseline:
+  enabled: true
+  id: gemma3_baseline
+  name: "Gemma 3 4B-it (baseline gốc)"
+
+# ── CÁC CANDIDATE (QDoRA; mỗi cái chỉ so với baseline) ───────────────────────
 arms:
   - id: vision_lora_r2
-    name: "Vision LoRA (SigLIP) · rank 2"
-    method: qlora
+    name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 2"
+    method: qdora
     rank: 2
     enabled: true
 
   - id: vision_lora_r4
-    name: "Vision LoRA (SigLIP) · rank 4"
-    method: qlora
+    name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 4"
+    method: qdora
     rank: 4
     enabled: true
 
   - id: vision_lora_r8
-    name: "Vision LoRA (SigLIP) · rank 8"
-    method: qlora
+    name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 8"
+    method: qdora
     rank: 8
     enabled: true
 
   - id: vision_lora_r16
-    name: "Vision LoRA (SigLIP) · rank 16"
-    method: qlora
+    name: "Vision QDoRA (SigLIP nửa sau + projector) · rank 16"
+    method: qdora
     rank: 16
-    enabled: true
+    enabled: false
 
 # ── Base Model: Gemma 3 4B-it ────────────────────────────────────────────────
 base:
@@ -151,6 +158,14 @@ train:
   target_modules: [q_proj, k_proj, v_proj, out_proj]
   include_prefixes: [vision_tower, model.vision_tower, vision_model]
   exclude_prefixes: [language_model, model.language_model, multi_modal_projector]
+  # Chỉ NỬA SAU của SigLIP (27 lớp -> lớp 14..26).
+  vision_layers:
+    from: second_half
+  # Adapter cho multi-modal projector (tự gắn bằng hook; projector không có
+  # nn.Linear nên peft không với tới). Cùng rank/alpha với arm, dùng DoRA.
+  projector_adapter:
+    enabled: true
+    dora: true
   task_type: null
 
   lora_dropout: 0.05
@@ -187,7 +202,7 @@ metrics:
     keep: [f1]
   primary: bertscore_f1
 
-# ── Kiểm định thống kê ghép cặp giữa 3 cấu hình (r2, r4, r8) ────────────────
+# ── Kiểm định: MỖI candidate vs baseline gốc, luôn cả Permutation + Paired Bootstrap ─
 stats:
   alpha: 0.05
   n_boot: 10000
@@ -195,9 +210,8 @@ stats:
   ci: 0.95
   ci_method: bca
   dz_floor: 0.10
-  primary_test: perm
-  pairs: all
-  reference: vision_lora_r4
+  pairs: vs_reference
+  reference: gemma3_baseline
   adjust: holm
   adjust_scope: pairs
 
@@ -221,7 +235,7 @@ output:
   hub_repo: RGExp123/Research_results
   hub_repo_type: dataset
   hub_private: true
-  push: true
+  push: true            # đẩy adapter sau mỗi lần train, predictions sau mỗi lần infer
   subdir: "2.6_vision_lora"
   adapter_dir: ./adapters_vision_lora
   ft_suffix: "_ft"
