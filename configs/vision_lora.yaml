@@ -44,6 +44,11 @@ data:
   image_max_side_enforce: true
   zip_mode: auto
   zip_stream_min_rate: 1.0
+  # Khai thác triệt để hiệu năng CPU:
+  # 0 = tự động nhận diện và sử dụng 100% nhân CPU khả dụng (os.cpu_count())
+  cpu_workers: 0
+  # Số kết nối stream HTTP Range song song đồng thời từ remote zip
+  stream_connections: 4
   train_split_csv: split_ref/train_split.csv
   n_train: 6400
   val_split_csv: split_ref/val_split.csv

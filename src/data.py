@@ -9,13 +9,24 @@ Vấn đề nặng nhất ở đây là ẢNH: img_dir.zip là 17.7 GB nhưng ta
 (~2%). Chế độ `stream` đọc central directory của zip rồi RANGE-request đúng
 những entry cần — tốn ~200 MB mạng thay vì 17.7 GB, và không cần 18 GB đĩa
 trống trên máy thuê.
+
+Tối ưu hoá hiệu năng CPU:
+  - Khai thác triệt để toàn bộ nhân CPU qua ThreadPoolExecutor cho khâu giải mã,
+    letterbox/bicubic resize và nén JPEG.
+  - Tách rời luồng I/O đọc zip và luồng CPU xử lý ảnh (Producer - Consumer)
+    để không bao giờ để I/O chờ CPU hay ngược lại.
+  - Hỗ trợ đa luồng stream Range request song song (Multi-connection Streaming)
+    giúp bão hoà băng thông mạng khi stream từ xa.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
+import math
 import os
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -26,6 +37,26 @@ from PIL import Image
 from .config import Cfg, hf_token
 
 Image.MAX_IMAGE_PIXELS = None  # ảnh CXR gốc có thể > giới hạn cảnh báo bom nén
+
+
+def get_cpu_workers(cfg: Cfg) -> int:
+    """Số worker CPU: đọc từ data.cpu_workers hoặc tự động lấy 100% nhân CPU."""
+    d = getattr(cfg, "data", {}) if hasattr(cfg, "data") else (
+        cfg.get("data", {}) if isinstance(cfg, dict) else {})
+    configured = int(d.get("cpu_workers", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(2, os.cpu_count() or 4)
+
+
+def get_stream_connections(cfg: Cfg) -> int:
+    """Số kết nối stream HTTP Range đồng thời tới Hugging Face."""
+    d = getattr(cfg, "data", {}) if hasattr(cfg, "data") else (
+        cfg.get("data", {}) if isinstance(cfg, dict) else {})
+    configured = int(d.get("stream_connections", 0) or 0)
+    if configured > 0:
+        return configured
+    return min(8, max(2, (os.cpu_count() or 4) // 2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,14 +77,9 @@ def load_index(cfg: Cfg) -> pd.DataFrame:
     keys = pd.read_csv(split_path)[key_col].astype(str).tolist()
     n = int(d.get("n_test", 0) or 0)
     if n and n < len(keys):
-        # Cắt từ ĐẦU danh sách, không lấy ngẫu nhiên: thứ tự trong file là cố
-        # định, nên "3000 ảnh đầu" là một tập tái lập được, còn "3000 ảnh ngẫu
-        # nhiên" thì phải mang theo seed mới đọc lại được.
         keys = keys[:n]
     print(f"  split : {len(keys)} key từ {d['split_csv']}", flush=True)
 
-    # clean_dataset.csv ~164 MB. Chỉ đọc 2 cột cần — đọc đủ 8 cột thì text_gt +
-    # aug_gt ngốn vài GB RAM mà aug_gt không dùng tới trong §2.1.
     meta = pd.read_csv(meta_path, usecols=[key_col, ref_col])
     ref_map = dict(zip(meta[key_col].astype(str), meta[ref_col].astype(str)))
     del meta
@@ -66,9 +92,6 @@ def load_index(cfg: Cfg) -> pd.DataFrame:
             continue
         rows.append({"key": k, "ref": str(ref)})
     if missing:
-        # Không im lặng bỏ qua: một key trong split mà không có text_gt nghĩa là
-        # split và meta lệch nhau, và đó là lỗi dữ liệu cần biết chứ không phải
-        # một vài dòng thiếu vô hại.
         print(f"  ⚠ {len(missing)} key không có {ref_col} — bị loại. Ví dụ: {missing[:3]}",
               flush=True)
     df = pd.DataFrame(rows)
@@ -84,16 +107,7 @@ def _cache_path(cache_root: Path, key: str) -> Path:
 
 
 def _save_resized(raw: bytes, dest: Path, max_side: int) -> None:
-    """Giải mã, thu nhỏ cạnh dài về max_side, ghi JPEG.
-
-    Thu nhỏ ở ĐÂY chứ không ở lúc infer: cùng một ảnh được đọc lại nhiều lần,
-    và ảnh CXR gốc 2500² giải nén tốn ~19 MB RAM mỗi lần.
-
-    §2.2 chốt trần ở 512 (data.image_max_side). Con số đó KHÔNG đổi VRAM —
-    processor của Gemma 3 vẫn resize lên 896² và vẫn phát ra đúng 256 token mỗi
-    ảnh — nó chỉ quyết định lượng CHI TIẾT thật sự đi vào model, và vì thế phải
-    giống hệt nhau ở khâu huấn luyện lẫn khâu chấm. Xem src/imaging.py.
-    """
+    """Giải mã, thu nhỏ cạnh dài về max_side, ghi JPEG (CPU intensive)."""
     img = Image.open(io.BytesIO(raw))
     img = img.convert("RGB")
     w, h = img.size
@@ -102,10 +116,9 @@ def _save_resized(raw: bytes, dest: Path, max_side: int) -> None:
         img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
                          Image.BICUBIC)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
+    # File tạm riêng biệt theo pid và thread id để an toàn tuyệt đối khi chạy đa luồng
+    tmp = dest.with_suffix(f"{dest.suffix}.part_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}")
     img.save(tmp, "JPEG", quality=92)
-    # Ghi qua file tạm rồi đổi tên: lần chạy bị Ctrl-C giữa chừng không để lại
-    # ảnh JPEG cụt mà lần sau lại tưởng là đã có (cache theo sự tồn tại của file).
     os.replace(tmp, dest)
 
 
@@ -113,26 +126,7 @@ IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 
 def build_name_map(files: list[str], keys: list[str]) -> tuple[dict[str, str], list[str], str]:
-    """Ghép mỗi `img_rel` với entry thật trong zip.
-
-    CSV ghi `files/p13/p13326174/s55828003/<uuid>.jpg`, nhưng cây thư mục BÊN
-    TRONG zip không nhất thiết giống thế: người tạo zip có thể đứng ở một thư
-    mục khác khi nén (thêm lớp bọc), bỏ bớt tầng `files/pXX`, hay nén phẳng
-    hết vào một chỗ. Đoán một cách cố định là hỏng ngay khi zip được đóng lại
-    theo cách khác — mà triệu chứng lại là "3000 ảnh đều thiếu", rất dễ tưởng
-    nhầm là hỏng mạng hay sai token.
-
-    Nên: dò bằng chính nội dung zip, theo hai bậc.
-      1. Khớp NGUYÊN img_rel (có thể kèm một lớp bọc chung). Giữ được ngữ
-         nghĩa thư mục, và xác nhận được trên TOÀN BỘ key chứ không chỉ một key
-         mẫu.
-      2. Không xong thì khớp theo ĐUÔI đường dẫn: tên file trước, trùng tên thì
-         so tiếp các đoạn thư mục đi ngược lên. Tên ảnh MIMIC là uuid nên bậc
-         này gần như luôn cho một ứng viên duy nhất, và nó đúng với mọi cách
-         sắp lại thư mục kể cả zip phẳng.
-
-    Trả (map key -> tên entry, danh sách key không tìm thấy, mô tả layout).
-    """
+    """Ghép mỗi `img_rel` với entry thật trong zip."""
     nameset = set(files)
 
     # ── bậc 1: nguyên img_rel, có thể kèm lớp bọc ───────────────────────────
@@ -149,8 +143,6 @@ def build_name_map(files: list[str], keys: list[str]) -> tuple[dict[str, str], l
     if prefix is not None:
         cand = {k: prefix + k for k in keys}
         miss = [k for k, v in cand.items() if v not in nameset]
-        # Chấp nhận bậc 1 chỉ khi nó phủ gần hết. Phủ một phần nghĩa là zip
-        # trộn nhiều layout — lúc đó bậc 2 tổng quát hơn và nên thắng.
         if len(miss) <= 0.01 * len(keys):
             desc = f"nguyên img_rel{f' dưới lớp bọc {prefix!r}' if prefix else ''}"
             return {k: v for k, v in cand.items() if v in nameset}, miss, desc
@@ -172,7 +164,6 @@ def build_name_map(files: list[str], keys: list[str]) -> tuple[dict[str, str], l
         if len(cands) == 1:
             mapping[k] = cands[0]
             continue
-        # Trùng tên file: chọn ứng viên chung ĐUÔI dài nhất với img_rel.
         n_ambiguous += 1
         kp = k.split("/")
         best, best_score = cands[0], -1
@@ -205,13 +196,10 @@ class StreamTooSlow(RuntimeError):
 def _extract(zf: zipfile.ZipFile, mapping: dict[str, str], need: list[str],
              cache_root: Path, max_side: int, label: str,
              min_rate: float = 0.0, probe_after: int = 60,
-             tracker=None) -> list[str]:
-    """Trích các entry cần. `min_rate` > 0 -> bỏ cuộc sớm nếu quá chậm."""
-    # Sắp theo VỊ TRÍ TRONG FILE ZIP, không theo thứ tự split. Đây là khác biệt
-    # lớn nhất về tốc độ của chế độ stream: fsspec đệm theo block 8 MB, nên đọc
-    # tuần tự từ đầu file tới cuối thì nhiều ảnh liền kề rơi vào cùng một block
-    # đã tải; đọc theo thứ tự ngẫu nhiên thì gần như mỗi ảnh là một request mới
-    # và block vừa tải bị vứt đi.
+             tracker=None, cpu_workers: int = 0) -> list[str]:
+    """Trích các entry cần, tối ưu hoá tối đa CPU bằng ThreadPoolExecutor."""
+    workers = cpu_workers or max(2, os.cpu_count() or 4)
+
     ordered = []
     failed = [(k, "không có entry tương ứng trong zip") for k in need if k not in mapping]
     for key in need:
@@ -224,30 +212,146 @@ def _extract(zf: zipfile.ZipFile, mapping: dict[str, str], need: list[str],
             failed.append((key, f"KeyError {nm}"))
     ordered.sort()
 
+    total = len(ordered)
+    if total == 0:
+        return [k for k, _ in failed]
+
+    # Giới hạn số ảnh pending trong RAM để tránh tràn bộ nhớ
+    sem = threading.Semaphore(workers * 4)
+    failed_lock = threading.Lock()
+    progress_lock = threading.Lock()
+    done_count = 0
     t0 = time.time()
-    for i, (_off, key, nm) in enumerate(ordered, 1):
-        dest = _cache_path(cache_root, key)
+    stream_too_slow_err: StreamTooSlow | None = None
+
+    def _save_task(raw_bytes: bytes, dest_path: Path, item_key: str):
+        nonlocal stream_too_slow_err, done_count
         try:
-            _save_resized(zf.read(nm), dest, max_side)
-        except Exception as e:  # entry hỏng / ảnh không giải mã được
-            failed.append((key, repr(e)))
-        if i % 100 == 0 or i == len(ordered):
-            rate = i / max(1e-9, time.time() - t0)
-            eta = (len(ordered) - i) / max(1e-9, rate)
-            print(f"  [{label}] {i}/{len(ordered)} ảnh | {rate:.1f} ảnh/s "
-                  f"| còn ~{eta/60:.1f} phút", flush=True)
-            if tracker is not None:
-                tracker.log({"data/images_done": i, "data/images_total": len(ordered),
-                             "data/rate_img_s": rate, "data/eta_min": eta / 60})
-        if min_rate > 0 and i == probe_after:
-            rate = i / max(1e-9, time.time() - t0)
-            if rate < min_rate:
-                # Proxy của chỗ thuê máy có thể "hỗ trợ" Range bằng cách tải lại
-                # cả file mỗi request. Khi đó stream vẫn CHẠY ĐÚNG, chỉ là mất
-                # hàng chục giờ — và trên máy tính tiền theo giờ thì đó là ca
-                # hỏng tệ hơn cả crash, vì không có gì báo động.
-                raise StreamTooSlow(
-                    f"{rate:.2f} ảnh/s sau {i} ảnh (< {min_rate} ảnh/s)")
+            _save_resized(raw_bytes, dest_path, max_side)
+        except Exception as exc:
+            with failed_lock:
+                failed.append((item_key, repr(exc)))
+        finally:
+            sem.release()
+            with progress_lock:
+                done_count += 1
+                curr = done_count
+
+            if curr % 100 == 0 or curr == total:
+                rate = curr / max(1e-9, time.time() - t0)
+                eta = (total - curr) / max(1e-9, rate)
+                print(f"  [{label}] {curr}/{total} ảnh | {rate:.1f} ảnh/s "
+                      f"| còn ~{eta/60:.1f} phút | {workers} CPU workers", flush=True)
+                if tracker is not None:
+                    tracker.log({"data/images_done": curr, "data/images_total": total,
+                                 "data/rate_img_s": rate, "data/eta_min": eta / 60})
+
+            if min_rate > 0 and curr == probe_after:
+                rate = curr / max(1e-9, time.time() - t0)
+                if rate < min_rate:
+                    stream_too_slow_err = StreamTooSlow(
+                        f"{rate:.2f} ảnh/s sau {curr} ảnh (< {min_rate} ảnh/s)")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="img_proc") as pool:
+        for _off, key, nm in ordered:
+            if stream_too_slow_err:
+                break
+            dest = _cache_path(cache_root, key)
+            try:
+                raw = zf.read(nm)
+            except Exception as e:
+                with failed_lock:
+                    failed.append((key, repr(e)))
+                continue
+
+            sem.acquire()
+            pool.submit(_save_task, raw, dest, key)
+
+    if stream_too_slow_err:
+        raise stream_too_slow_err
+
+    if failed:
+        print(f"  ⚠ {len(failed)} ảnh không lấy được. Ví dụ: {failed[:3]}", flush=True)
+    return [k for k, _ in failed]
+
+
+def _multi_stream_extract(fs, uri: str, ordered: list[tuple[int, str, str]],
+                          cache_root: Path, max_side: int, cfg: Cfg,
+                          stream_conns: int, cpu_workers: int,
+                          min_rate: float, probe_after: int, tracker=None) -> list[str]:
+    """Tải và giải nén đa luồng: song song nhiều luồng HTTP Range + khai thác triệt để CPU."""
+    total = len(ordered)
+    chunk_size = math.ceil(total / stream_conns)
+    chunks = [ordered[i : i + chunk_size] for i in range(0, total, chunk_size)]
+    actual_conns = len(chunks)
+
+    print(f"  ⚡ Song song hóa: {actual_conns} kết nối stream Range + {cpu_workers} CPU workers", flush=True)
+
+    failed = []
+    failed_lock = threading.Lock()
+    progress_lock = threading.Lock()
+    done_count = 0
+    t0 = time.time()
+    stream_too_slow_err: StreamTooSlow | None = None
+
+    sem = threading.Semaphore(cpu_workers * 4)
+
+    def _save_task(raw_bytes: bytes, dest_path: Path, item_key: str):
+        nonlocal stream_too_slow_err, done_count
+        try:
+            _save_resized(raw_bytes, dest_path, max_side)
+        except Exception as exc:
+            with failed_lock:
+                failed.append((item_key, repr(exc)))
+        finally:
+            sem.release()
+            with progress_lock:
+                done_count += 1
+                curr = done_count
+
+            if curr % 100 == 0 or curr == total:
+                rate = curr / max(1e-9, time.time() - t0)
+                eta = (total - curr) / max(1e-9, rate)
+                print(f"  [stream] {curr}/{total} ảnh | {rate:.1f} ảnh/s "
+                      f"| còn ~{eta/60:.1f} phút | {cpu_workers} CPU workers ({actual_conns} streams)", flush=True)
+                if tracker is not None:
+                    tracker.log({"data/images_done": curr, "data/images_total": total,
+                                 "data/rate_img_s": rate, "data/eta_min": eta / 60})
+
+            if min_rate > 0 and curr == probe_after:
+                rate = curr / max(1e-9, time.time() - t0)
+                if rate < min_rate:
+                    stream_too_slow_err = StreamTooSlow(
+                        f"{rate:.2f} ảnh/s sau {curr} ảnh (< {min_rate} ảnh/s)")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_workers, thread_name_prefix="img_proc") as cpu_pool:
+        def _read_chunk(chunk_items):
+            try:
+                fh = fs.open(uri, "rb", block_size=8 * 1024 * 1024)
+                with zipfile.ZipFile(fh) as zf_worker:
+                    for _off, key, nm in chunk_items:
+                        if stream_too_slow_err:
+                            break
+                        dest = _cache_path(cache_root, key)
+                        try:
+                            raw = zf_worker.read(nm)
+                        except Exception as e:
+                            with failed_lock:
+                                failed.append((key, repr(e)))
+                            continue
+                        sem.acquire()
+                        cpu_pool.submit(_save_task, raw, dest, key)
+            except Exception as e:
+                with failed_lock:
+                    for _off, key, nm in chunk_items:
+                        failed.append((key, repr(e)))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_conns, thread_name_prefix="stream_reader") as stream_pool:
+            list(stream_pool.map(_read_chunk, chunks))
+
+    if stream_too_slow_err:
+        raise stream_too_slow_err
+
     if failed:
         print(f"  ⚠ {len(failed)} ảnh không lấy được. Ví dụ: {failed[:3]}", flush=True)
     return [k for k, _ in failed]
@@ -262,33 +366,68 @@ def _open_and_extract(zf: zipfile.ZipFile, need: list[str], cache_root: Path,
     if missing:
         print(f"  ⚠ {len(missing)} key không tìm thấy trong zip. Ví dụ: {missing[:3]}",
               flush=True)
+    cpu_workers = get_cpu_workers(cfg)
     return _extract(zf, mapping, need, cache_root,
                     int(cfg.data.get("image_max_side", 768)), label,
-                    min_rate=min_rate, tracker=tracker)
+                    min_rate=min_rate, tracker=tracker, cpu_workers=cpu_workers)
 
 
 def _stream_extract(cfg: Cfg, need: list[str], cache_root: Path,
                     tracker=None) -> list[str]:
-    """Đọc zip TỪ XA bằng HTTP range request, chỉ tải các entry cần."""
+    """Đọc zip TỪ XA bằng HTTP range request, khai thác tối đa CPU & đa luồng mạng."""
     from huggingface_hub import HfFileSystem
 
     d = cfg.data
     uri = f"datasets/{d['repo']}/{d['image_zip']}" if d.get("repo_type", "dataset") == "dataset" \
         else f"{d['repo']}/{d['image_zip']}"
     fs = HfFileSystem(token=hf_token())
-    # block_size lớn: mỗi ảnh CXR nén ~150-300 KB, và một range request 8 MB rẻ
-    # hơn nhiều so với ba mươi request 256 KB liên tiếp cho các ảnh cạnh nhau
-    # trong zip (chúng nằm cạnh nhau vì zip giữ nguyên thứ tự thư mục).
+
+    # Đọc central directory 1 lần để lấy sơ đồ zip
     fh = fs.open(uri, "rb", block_size=8 * 1024 * 1024)
     with zipfile.ZipFile(fh) as zf:
-        return _open_and_extract(zf, need, cache_root, cfg, "stream",
-                                 min_rate=float(cfg.data.get("zip_stream_min_rate", 1.0)),
-                                 tracker=tracker)
+        files = _list_files(zf)
+        mapping, missing, desc = build_name_map(files, need)
+        print(f"  zip: {len(files)} entry — layout: {desc}", flush=True)
+        if missing:
+            print(f"  ⚠ {len(missing)} key không tìm thấy trong zip. Ví dụ: {missing[:3]}",
+                  flush=True)
+
+        ordered = []
+        for key in need:
+            nm = mapping.get(key)
+            if nm is None:
+                continue
+            try:
+                ordered.append((zf.getinfo(nm).header_offset, key, nm))
+            except KeyError:
+                pass
+        ordered.sort()
+
+    cpu_workers = get_cpu_workers(cfg)
+    stream_conns = get_stream_connections(cfg)
+    max_side = int(cfg.data.get("image_max_side", 768))
+    min_rate = float(cfg.data.get("zip_stream_min_rate", 1.0))
+
+    if stream_conns > 1 and len(ordered) >= 40:
+        try:
+            return _multi_stream_extract(fs, uri, ordered, cache_root, max_side, cfg,
+                                         stream_conns=stream_conns, cpu_workers=cpu_workers,
+                                         min_rate=min_rate, probe_after=60, tracker=tracker)
+        except StreamTooSlow:
+            raise
+        except Exception as e:
+            print(f"  ⚠ đa luồng stream gặp sự cố ({e!r}) -> quay về luồng đơn", flush=True)
+
+    # Chạy luồng đơn stream nếu ít ảnh hoặc đa luồng lỗi
+    fh = fs.open(uri, "rb", block_size=8 * 1024 * 1024)
+    with zipfile.ZipFile(fh) as zf:
+        return _extract(zf, mapping, need, cache_root, max_side, "stream",
+                        min_rate=min_rate, tracker=tracker, cpu_workers=cpu_workers)
 
 
 def _download_extract(cfg: Cfg, need: list[str], cache_root: Path,
                       tracker=None) -> list[str]:
-    """Tải trọn zip rồi giải nén. Chắc ăn, tốn ~18 GB đĩa."""
+    """Tải trọn zip rồi giải nén đa luồng khai thác triệt để CPU."""
     from huggingface_hub import hf_hub_download
 
     d = cfg.data
@@ -324,9 +463,6 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
         except Exception as e:
             if mode == "stream":
                 raise
-            # Range request có thể hỏng vì proxy của chỗ thuê máy bỏ header
-            # Range, hoặc vì fsspec không seek được. Rơi về tải trọn zip thay vì
-            # chết — nhưng IN RA nguyên nhân, đừng để nó im lặng tốn 17.7 GB.
             print(f"  ⚠ stream hỏng ({e!r}) -> rơi về tải trọn zip", flush=True)
             bad = _download_extract(cfg, need, cache_root, tracker)
     else:
@@ -337,16 +473,13 @@ def ensure_images(cfg: Cfg, df: pd.DataFrame, tracker=None) -> pd.DataFrame:
         df = df[~df["key"].isin(set(bad))].reset_index(drop=True)
         print(f"  ⚠ loại {before - len(df)} mẫu vì thiếu ảnh -> còn {len(df)}", flush=True)
 
-    # ── Cưỡng chế trần cạnh dài lên TOÀN BỘ cache, kể cả ảnh đã có sẵn ───────
-    # Cache theo SỰ TỒN TẠI của file: ảnh do §2.1 tải về (trần 768) được dùng
-    # lại y nguyên và `_save_resized` không bao giờ chạm tới. Không có bước này
-    # thì tám adapter huấn luyện trên ảnh 768 trong khi config nói 512, và triệu
-    # chứng duy nhất là... không có triệu chứng nào.
+    # ── Cưỡng chế trần cạnh dài lên TOÀN BỘ cache đa luồng CPU ───────────────
     if bool(cfg.data.get("image_max_side_enforce", True)):
         from . import imaging
 
         imaging.enforce_max_side(df["image_path"].tolist(), max_side,
-                                 label=f"{len(df)} ảnh")
+                                 label=f"{len(df)} ảnh",
+                                 num_workers=get_cpu_workers(cfg))
     return df
 
 

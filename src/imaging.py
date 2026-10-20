@@ -168,43 +168,56 @@ def shrink_to(path: Path, max_side: int) -> bool:
     return True
 
 
-def enforce_max_side(paths, max_side: int, label: str = "cache") -> dict:
-    """Duyệt cache, thu nhỏ mọi ảnh vượt trần. Trả thống kê.
+def enforce_max_side(paths, max_side: int, label: str = "cache",
+                     num_workers: int = 0) -> dict:
+    """Duyệt cache đa luồng, thu nhỏ mọi ảnh vượt trần song song trên toàn bộ CPU.
 
     Mở bằng PIL nhưng chỉ đọc HEADER để lấy kích thước (Image.open lười giải
-    mã), nên 9400 file mất vài giây chứ không phải vài phút — rẻ hơn nhiều so
-    với việc phát hiện muộn rằng adapter đã học trên ảnh 768.
+    mã). Chạy song song qua ThreadPoolExecutor khai thác triệt để đa nhân CPU.
     """
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+
+    workers = num_workers or max(2, os.cpu_count() or 4)
     checked = fixed = bad = 0
     biggest = 0
-    for p in paths:
-        p = Path(p)
+
+    def _inspect_and_shrink(p_str):
+        p = Path(p_str)
         side = _long_side(p)
         if side is None:
-            bad += 1
-            continue
-        checked += 1
-        biggest = max(biggest, side)
+            return (0, 0, 1, 0)
+        was_fixed = 0
         if side > max_side:
             try:
                 if shrink_to(p, max_side):
-                    fixed += 1
+                    was_fixed = 1
             except Exception:
-                bad += 1
+                return (1, 0, 1, side)
+        return (1, was_fixed, 0, side)
+
+    paths_list = list(paths)
+    if paths_list:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for c, f, b, s in ex.map(_inspect_and_shrink, paths_list):
+                checked += c
+                fixed += f
+                bad += b
+                biggest = max(biggest, s)
+
     stats = {"checked": checked, "resized": fixed, "unreadable": bad,
              "max_side_before": biggest, "max_side": int(max_side)}
     if fixed:
         print(f"  ⚙ [{label}] {fixed}/{checked} ảnh vượt trần {max_side}px "
-              f"(lớn nhất {biggest}px) — đã thu nhỏ TẠI CHỖ. Cache này dùng "
+              f"(lớn nhất {biggest}px) — đã thu nhỏ TẠI CHỖ ({workers} CPU workers). Cache này dùng "
               f"chung với §2.1: đừng ngạc nhiên nếu §2.1 chạy lại thấy ảnh nhỏ "
               f"hơn trước.", flush=True)
     else:
         print(f"  ✓ [{label}] {checked} ảnh đều <= {max_side}px "
-              f"(cạnh dài lớn nhất: {biggest}px)", flush=True)
+              f"(cạnh dài lớn nhất: {biggest}px) [{workers} CPU workers]", flush=True)
     if bad:
         print(f"  ⚠ [{label}] {bad} file không đọc được", flush=True)
     return stats
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # ĐIỀU KIỆN 4 CỦA §2.5 — MỘT phép biến đổi hình học cho BA candidate
