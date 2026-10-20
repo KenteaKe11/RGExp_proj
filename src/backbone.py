@@ -650,7 +650,8 @@ def attach_adapter(model, arm: dict, tcfg: dict):
 
     if is_quantized(method):
         model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=bool(tcfg.get("gradient_checkpointing", True)))
+            model, use_gradient_checkpointing=bool(tcfg.get("gradient_checkpointing", True)),
+            gradient_checkpointing_kwargs={"use_reentrant": False})
 
     targets = find_target_modules(model, tcfg)
     task_type = tcfg.get("task_type", None)

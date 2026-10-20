@@ -152,7 +152,8 @@ class _TrackCallback(TrainerCallback):
         if "learning_rate" in logs:
             payload[f"train/{self.aid}/lr"] = float(logs["learning_rate"])
         if payload:
-            self.tracker.log(payload, step=state.global_step)
+            payload["train/global_step"] = int(state.global_step)
+            self.tracker.log(payload)
 
 
 def train_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
@@ -260,6 +261,7 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         per_device_train_batch_size=bs,
         gradient_accumulation_steps=accum,
         gradient_checkpointing=bool(tcfg.get("gradient_checkpointing", True)),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=int(tcfg.get("logging_steps", 10)),
         max_grad_norm=float(tcfg.get("max_grad_norm", 1.0)),
         save_strategy="no",
