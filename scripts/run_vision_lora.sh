@@ -8,6 +8,7 @@
 #     bash scripts/run_vision_lora.sh --stages stats,report # chỉ chạy thống kê & báo cáo
 #     bash scripts/run_vision_lora.sh --arms vision_lora_r4 # chỉ chạy rank 4
 #     bash scripts/run_vision_lora.sh --retrain        # huấn luyện lại dù đã có adapter
+#     bash scripts/run_vision_lora.sh --no-scan        # không quét Hub để resume (mặc định luôn quét)
 #
 # Mọi tham số chuyển thẳng cho `python -m src.run_vision_lora`.
 # ═════════════════════════════════════════════════════════════════════════════

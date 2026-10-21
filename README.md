@@ -136,6 +136,46 @@ bash scripts/run_vision_lora.sh --dry-run
 2. **infer** (baseline gốc rồi 3 arm) — xong candidate nào **push predictions candidate đó ngay**.
 3. **score** → **stats** (luôn chạy CẢ Permutation lẫn Paired Bootstrap, mỗi candidate chỉ so với baseline) → **report** → push kết quả tổng.
 
+### Resume: luôn quét Hub trước, không tự huấn luyện lại
+Máy thuê bị shutdown rồi khởi động lại thì đĩa trống — trước đây `already_trained()` thấy
+thiếu adapter nên **train lại từ đầu**, và infer sinh lại từ ảnh 0. Giờ trước mọi stage
+`train`/`infer`, `src/resume.py` luôn **quét `RGExp123/Research_results/2.6_vision_lora`**:
+
+1. Arm nào đã có adapter đầy đủ trên Hub (`adapter_model.safetensors` + `train_stats.json`
+   + `projector_adapter.pt`) → **kéo về** `adapters_vision_lora/<arm>/`, không train lại.
+2. Predictions trên Hub (kể cả bản dở do checkpoint) được **gộp theo key** vào file cục bộ
+   (cục bộ thắng khi trùng) → `Runner` resume đúng chỗ dừng. Predictions của một arm **chỉ**
+   được kéo về khi adapter của arm đó còn nguyên — không trộn hai model vào một cột điểm.
+3. Lưu **metadata cố định** `runs/2.6_vision_lora/infer_scan_meta.json`: với mỗi model, tập
+   key mẫu infer đã quét thấy xong + SHA-256 của tập đó và của tập test. Metadata *đơn
+   điệu* (tập đã xong chỉ lớn lên, kể cả hợp với bản trên Hub), ghi *nguyên tử*
+   (tmp + fsync + replace), key có trong metadata mà predictions mất thì báo `lost` và sinh
+   lại đúng những mẫu đó. Được đẩy lên Hub cùng predictions.
+
+Trong lúc infer, sau mỗi batch Runner gọi checkpoint: ghi lại metadata mỗi `resume.meta_every`
+mẫu (100) và đẩy predictions dở + metadata lên Hub mỗi `resume.push_every` mẫu (500;
+`0` = chỉ khi xong model), nên shutdown giữa lúc sinh chỉ mất tối đa vài trăm mẫu.
+
+Nếu **quét lỗi** (mạng/quyền) mà có arm thiếu adapter cục bộ, pipeline **dừng với mã 3** thay
+vì lặng lẽ train lại. Hub trống thật (chưa có repo/thư mục) là chạy mới, train bình thường.
+`--no-scan` bỏ qua quét (chỉ dùng dữ liệu cục bộ); `--retrain` ép train lại và không kéo
+adapter/predictions cũ của arm đó. Không có `HF_TOKEN` hoặc `output.push=false` thì không quét
+được Hub, chỉ lập metadata từ dữ liệu cục bộ.
+
+### Một report = MỘT tập mẫu infer chung
+Mọi mô hình (baseline + 3 arm) trong cùng một `REPORT.md` luôn được chấm và so sánh trên
+**đúng một tập key chung**: những mẫu mà *mọi* model đều đã infer xong. Tập này được chốt vào
+`runs/2.6_vision_lora/eval_set.json` (n, SHA-256, danh sách key, số mẫu từng model) và ghi ở
+mục "Thiết kế" của `REPORT.md`.
+
+* **Mặc định nghiêm:** nếu một model chưa phủ đủ tập test (infer dở), stage `score` dừng với
+  **mã 5** và nêu số mẫu từng model — không âm thầm co report về vài trăm ảnh.
+  `--allow-partial-eval` cho phép báo cáo trên tập giao nhỏ hơn; khi đó report ghi rõ `n/N` và
+  cảnh báo tập không đủ.
+* `per_sample_*.csv` cũ không phủ đủ tập chung thì model đó được chấm lại; chạy riêng
+  `--stages stats,report` trên các CSV lệch n cũng dừng (mã 5) thay vì lặng lẽ lấy giao.
+* `write_all` từ chối ghi report nếu các bảng điểm không cùng danh sách key, cùng thứ tự.
+
 ### Chạy chính thức toàn bộ 7 stages
 ```bash
 bash scripts/run_vision_lora.sh --detach

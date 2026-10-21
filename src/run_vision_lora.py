@@ -12,6 +12,11 @@ Thực hiện 7 stages:
     6. report: Tổng hợp REPORT.md và summary.json.
     7. push: Đẩy kết quả và adapter lên Hugging Face Hub (CÙNG repo RGExp123/Research_results, subdir mới).
 
+RESUME: trước stage train/infer luôn QUÉT repo Hub (src/resume.py): kéo adapter đã có về
+thay vì huấn luyện lại, gộp predictions đã có vào file cục bộ để infer tiếp từ chỗ dừng, và
+lưu metadata cố định `infer_scan_meta.json` (các mẫu infer đã quét) để máy bị shutdown rồi
+khởi động lại không mất dấu. `--no-scan` tắt bước này.
+
 Sử dụng:
     python -m src.run_vision_lora                      # Chạy trọn gói cả 7 stages
     python -m src.run_vision_lora --dry-run            # Chạy thử nhanh (8 ảnh test, 16 train, 4 bước)
@@ -116,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="8 ảnh test, 16 mẫu train, 4 bước huấn luyện")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại dù đã có adapter")
+    ap.add_argument("--no-scan", action="store_true",
+                    help="không quét Hub trước khi train/infer (chỉ dùng dữ liệu cục bộ)")
+    ap.add_argument("--allow-partial-eval", action="store_true",
+                    help="cho phép report trên tập giao nhỏ hơn tập test khi các model chưa "
+                         "cùng infer đủ (mặc định: dừng)")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -227,6 +237,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚙ dùng lại manifest test: {len(test_df)} mẫu", flush=True)
     tracker.summary({"data/n_test": len(test_df)})
 
+    # ── quét Hub để RESUME (trước train/infer) ───────────────────────────────
+    pred_paths = {i: run_dir / "predictions" / f"{i}.jsonl" for i in score_ids}
+    if not a.no_scan and ("train" in stages or "infer" in stages):
+        _hr("Quét repo Hub để resume (adapter, predictions, metadata mẫu infer)")
+        from . import resume as resume_mod
+
+        try:
+            manifest["resume"] = resume_mod.scan_and_restore(
+                cfg, arms, adapter_root, pred_paths, baseline_id, test_df, run_dir,
+                retrain=a.retrain, need_train="train" in stages)
+        except resume_mod.ScanError as e:
+            print(f"\n✗ DỪNG — {e}", flush=True)
+            manifest["resume"] = {"status": f"scan_failed: {e}"}
+            tracker.alert("§2.6 dừng: quét Hub lỗi", str(e), "ERROR")
+            tracker.finish(1)
+            (run_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            return 3
+        resume_mod.push_meta(cfg, run_dir)   # máy mới/sau shutdown đọc được ngay
+    elif a.no_scan:
+        print("⚙ --no-scan: bỏ qua quét Hub — chỉ dùng dữ liệu cục bộ", flush=True)
+
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages:
@@ -308,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
 
     # ── infer ───────────────────────────────────────────────────────────────
-    pred_paths = {i: run_dir / "predictions" / f"{i}.jsonl" for i in score_ids}
     if "infer" in stages:
         _hr("Sinh báo cáo X-quang (Inference)")
         from .runners import build
@@ -323,15 +354,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n── {arm.get('name', arm['id'])} ──", flush=True)
             t0 = time.time()
             try:
-                build(cfg, mcfg, tracker).run(test_df, pred_paths[arm["id"]],
-                                              log_every=tracker.log_every)
+                runner = build(cfg, mcfg, tracker)
+                if not a.no_scan:
+                    from . import resume as resume_mod
+
+                    runner.checkpoint = resume_mod.make_checkpoint(
+                        cfg, test_df, pred_paths, run_dir, arm["id"])
+                runner.run(test_df, pred_paths[arm["id"]], log_every=tracker.log_every)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                     "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
+                if not a.no_scan:
+                    resume_mod.finalize_meta(cfg, test_df, pred_paths, run_dir)
                 from .push import push_artifact
 
                 push_artifact(cfg, pred_paths[arm["id"]],
                               f"predictions/{arm['id']}.jsonl",
                               f"§2.6 predictions {arm['id']} (infer xong)")
+                if not a.no_scan:
+                    resume_mod.push_meta(cfg, run_dir)
             except RunnerUnusable as e:
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
@@ -349,14 +389,35 @@ def main(argv: list[str] | None = None) -> int:
 
     if "score" in stages:
         _hr("Chấm điểm từng mẫu (Scoring)")
+        # MỘT tập mẫu chung cho cả report: chỉ chấm đúng những key mà MỌI model đã infer.
+        from . import resume as resume_mod
+
+        try:
+            eval_keys, eval_info = resume_mod.resolve_eval_set(
+                test_df, pred_paths, score_ids, allow_partial=a.allow_partial_eval)
+        except resume_mod.EvalSetError as e:
+            print(f"\n✗ DỪNG — {e}", flush=True)
+            manifest["eval_set_error"] = str(e)
+            tracker.alert("§2.6 dừng: không có tập đánh giá chung", str(e), "ERROR")
+            tracker.finish(1)
+            (run_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            return 5
+        eval_set = set(eval_keys)
+        print(f"  tập đánh giá chung: {len(eval_keys)}/{len(test_df)} mẫu "
+              f"(mọi model: {', '.join(score_ids)})", flush=True)
         for aid in score_ids:
             csv_path = mdir / f"per_sample_{aid}.csv"
             if csv_path.exists() and not a.rescore:
-                scores[aid] = pd.read_csv(csv_path)
-                print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)", flush=True)
-                continue
+                cached = pd.read_csv(csv_path)
+                if eval_set <= set(cached["key"]):
+                    scores[aid] = cached[cached["key"].isin(eval_set)].reset_index(drop=True)
+                    print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)", flush=True)
+                    continue
+                print(f"  [{aid}] {csv_path.name} không phủ đủ tập chung "
+                      f"({len(eval_set - set(cached['key']))} mẫu thiếu) — chấm lại", flush=True)
             preds = _read_preds(pred_paths[aid])
-            keys = [k for k in test_df["key"] if k in preds]
+            keys = [k for k in eval_keys if k in preds]
             if not keys:
                 print(f"  ⚠ [{aid}] không có dự đoán nào — bỏ qua", flush=True)
                 continue
@@ -385,6 +446,30 @@ def main(argv: list[str] | None = None) -> int:
     manifest["n_eval"] = align_info["n_common"]
     manifest["align"] = align_info
     print(f"⚙ Khối chung được đánh giá: {align_info['n_common']} ảnh", flush=True)
+
+    # Cùng MỘT tập mẫu cho mọi model trong report: không để `align_blocks` âm thầm co tập
+    # (CSV điểm cũ, arm infer dở khi chỉ chạy stats,report).
+    from . import resume as resume_mod
+
+    dropped = {m: n for m, n in align_info["n_dropped"].items() if n}
+    if dropped and not a.allow_partial_eval:
+        msg = (f"các model không cùng một tập mẫu (n mỗi model: {align_info['n_per_arm']}, "
+               f"tập chung {align_info['n_common']}). Chạy lại `--stages infer,score` cho đủ "
+               f"(thêm `--rescore` nếu CSV điểm cũ), hoặc `--allow-partial-eval`.")
+        print(f"\n✗ DỪNG — {msg}", flush=True)
+        manifest["eval_set_error"] = msg
+        tracker.alert("§2.6 dừng: tập mẫu không chung", msg, "ERROR")
+        tracker.finish(1)
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        return 5
+    _eval_keys = scores[next(iter(scores))]["key"].astype(str).tolist()
+    eval_info = {"n_test": len(test_df), "n_eval": len(_eval_keys),
+                 "per_model": align_info["n_per_arm"],
+                 "partial": len(_eval_keys) < len(test_df)}
+    resume_mod.write_eval_set(run_dir, _eval_keys, eval_info)
+    eval_meta = {**resume_mod.eval_fingerprint(_eval_keys), **eval_info}
+    manifest["eval_set"] = eval_meta
 
     # ── stats ───────────────────────────────────────────────────────────────
     paired_df = pd.DataFrame()
@@ -416,7 +501,8 @@ def main(argv: list[str] | None = None) -> int:
         _hr("Tạo Báo cáo Thực nghiệm (REPORT.md)")
         from . import report_vision_lora
 
-        report_path = report_vision_lora.write_all(cfg, run_dir, scores, names, paired_df, train_stats)
+        report_path = report_vision_lora.write_all(cfg, run_dir, scores, names, paired_df, train_stats,
+                                                 eval_info=eval_meta)
         manifest["report_file"] = str(report_path)
 
     # ── push ────────────────────────────────────────────────────────────────

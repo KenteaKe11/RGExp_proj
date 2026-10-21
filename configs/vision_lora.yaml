@@ -234,3 +234,11 @@ output:
   subdir: "2.6_vision_lora"
   adapter_dir: ./adapters_vision_lora
   ft_suffix: "_ft"
+
+# Resume: trước train/infer luôn quét repo Hub (output.hub_repo / output.subdir) để kéo adapter
+# và predictions đã có về thay vì huấn luyện/sinh lại, và lưu metadata cố định các mẫu infer
+# đã quét (infer_scan_meta.json). Tắt bằng `--no-scan`. Xem src/resume.py.
+resume:
+  meta_name: infer_scan_meta.json
+  meta_every: 100        # ghi lại metadata cục bộ mỗi N mẫu infer
+  push_every: 500        # đẩy predictions dở + metadata lên Hub mỗi N mẫu (0 = chỉ khi xong model)

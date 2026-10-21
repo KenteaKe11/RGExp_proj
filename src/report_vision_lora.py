@@ -28,10 +28,40 @@ def _f(v: Any, prec: int = 4) -> str:
     return str(v)
 
 
+def _eval_lines(info: dict | None, ref_keys: list[str] | None, ids: list[str],
+                names: dict[str, str]) -> list[str]:
+    n = (info or {}).get("n_eval", len(ref_keys or []))
+    n_test = (info or {}).get("n_test")
+    sha = (info or {}).get("keys_sha256")
+    tail = f" (SHA-256 `{sha[:16]}…`)" if sha else ""
+    whole = f" trên tổng {n_test} ảnh test" if n_test else ""
+    line = (f"- **Tập đánh giá chung:** {n} ảnh{whole}{tail} — **cùng một tập** cho mọi mô hình "
+            f"({', '.join(names.get(i, i) for i in ids)}); mọi điểm trung bình và kiểm định "
+            f"bên dưới tính trên đúng tập này.")
+    out = [line]
+    if (info or {}).get("partial"):
+        out.append(f"- ⚠ **Tập giao nhỏ hơn tập test** ({n}/{n_test}): một số model chưa infer "
+                   f"đủ và report được chủ động chạy với `--allow-partial-eval`.")
+    return out
+
+
 def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
               names: dict[str, str], paired_df: pd.DataFrame,
-              train_stats: list[dict] | None = None) -> Path:
+              train_stats: list[dict] | None = None,
+              eval_info: dict | None = None) -> Path:
     run_dir = Path(run_dir)
+    # Một report = MỘT tập mẫu: mọi bảng điểm phải cùng danh sách key, cùng thứ tự. Nếu lệch
+    # thì mọi số trung bình/kiểm định bên dưới so táo với cam — dừng thay vì ghi report.
+    ref_keys = None
+    for aid, df in scores.items():
+        if "key" not in df.columns:
+            continue
+        ks = df["key"].astype(str).tolist()
+        if ref_keys is None:
+            ref_keys = ks
+        elif ks != ref_keys:
+            raise ValueError(f"`{aid}` không cùng tập mẫu/thứ tự với các model khác "
+                             f"({len(ks)} vs {len(ref_keys)} mẫu) — không thể đặt chung một report.")
     md_path, json_path = run_dir / "REPORT.md", run_dir / "summary.json"
     st = dict(cfg.get("stats", {}) or {})
     base_id = str(st.get("reference", "gemma3_baseline"))
@@ -51,6 +81,7 @@ def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
           f"({st.get('n_perm')} lần) và Paired Bootstrap {str(st.get('ci_method', 'bca')).upper()} "
           f"({st.get('n_boot')} lần); Holm theo candidate trong từng metric; "
           f"`significant` = cả hai cùng bác H0; ngưỡng |dz| ≥ {st.get('dz_floor')}.",
+          *_eval_lines(eval_info, ref_keys, list(scores), names),
           "- **Lưu ý baseline:** baseline chạy bf16 không lượng tử, candidate chạy trên "
           "base NF4 4-bit; chênh lệch có thể gồm một phần do lượng tử.", ""]
 
@@ -58,7 +89,8 @@ def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
           "| Candidate | Rank | Alpha | Tham số train | Phút | VRAM (GB) | Train loss |",
           "|:--|:-:|:-:|--:|--:|--:|--:|"]
     sm = {s["arm_id"]: s for s in (train_stats or []) if "arm_id" in s}
-    summary: dict[str, Any] = {"arms": {}, "metrics_mean": {}, "paired_tests": []}
+    summary: dict[str, Any] = {"arms": {}, "metrics_mean": {}, "paired_tests": [],
+                               "eval_set": eval_info or {"n_eval": len(ref_keys or [])}}
     for aid, nm in names.items():
         if aid == base_id:
             continue

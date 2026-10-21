@@ -631,6 +631,7 @@ def t_pipeline_order_and_push_per_candidate():
     from src import data as data_mod
     from src import data_train as dt_mod
     from src import push as push_mod
+    from src import resume as resume_mod
     from src import run_vision_lora
     from src import train as train_mod
     from src import metrics as metrics_mod
@@ -692,6 +693,8 @@ def t_pipeline_order_and_push_per_candidate():
                               lambda cfg, local, dest, msg: calls.append(f"push:{dest}") or True),
             mock.patch.object(push_mod, "push_results",
                               lambda cfg, rd: calls.append("push:ALL")),
+            # Quét Hub: không chạm mạng; Hub "trống" -> chạy mới, train bình thường.
+            mock.patch.object(resume_mod, "list_hub_files", lambda cfg: {}),
             mock.patch.object(metrics_mod, "score_model", fake_score),
             mock.patch.object(sm, "compare_pairs", spy_compare),
             mock.patch.object(rep, "write_all", spy_write),
@@ -710,11 +713,13 @@ def t_pipeline_order_and_push_per_candidate():
             for p in reversed(pa):
                 p.stop()
     assert rc == 0, f"main trả {rc}; lịch: {calls}"
+    meta = "push:infer_scan_meta.json"
     want = (
-        [x for r in ARM_IDS for x in (f"train:{r}", f"push:adapters/{r}")]
-        + [f"infer:{BASELINE_ID}:gemma3", f"push:predictions/{BASELINE_ID}.jsonl"]
+        [meta]                                    # quét Hub xong -> đẩy metadata cố định
+        + [x for r in ARM_IDS for x in (f"train:{r}", f"push:adapters/{r}")]
+        + [f"infer:{BASELINE_ID}:gemma3", f"push:predictions/{BASELINE_ID}.jsonl", meta]
         + [x for r in ARM_IDS for x in (f"infer:{r}:gemma3_adapter",
-                                         f"push:predictions/{r}.jsonl")]
+                                         f"push:predictions/{r}.jsonl", meta)]
         + [f"score:{i}" for i in [BASELINE_ID] + ARM_IDS]
         + ["stats", "report", "push:ALL"])
     assert calls == want, "thứ tự/lịch push sai:\n  có:  %s\n  cần: %s" % (calls, want)
@@ -822,6 +827,425 @@ def t_docs_consistent():
             f"{f} còn nhắc rank 16"
 
 
+# ── 8. Resume: quét Hub thay vì train/sinh lại, metadata cố định ────────────
+def _train_stub():
+    """`src.train` import `transformers` ở đầu file; máy chỉ chạy selftest không có nó. Chỉ
+    cần `already_trained` (logic file đĩa thuần) — dùng bản thật nếu import được."""
+    import types
+    try:
+        from src import train as t
+        return t
+    except ImportError:
+        m = types.ModuleType("src.train")
+
+        def already_trained(out_dir):
+            if not (out_dir / "adapter_model.safetensors").exists() and not (
+                    out_dir / "adapter_model.bin").exists():
+                return False
+            return (out_dir / "train_stats.json").exists()
+        m.already_trained = already_trained
+        sys.modules["src.train"] = m
+        return m
+
+
+def _write_preds(path: Path, keys, pred="p", cut_tail: bool = False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for k in keys:
+            f.write(json.dumps({"key": k, "pred": f"{pred}-{k}"}) + "\n")
+        if cut_tail:
+            f.write('{"key": "cut", "pred": "dở')
+
+
+def _resume_cfg(td: Path, push: bool = True):
+    from src.config import Cfg, load_config
+    cfg = load_config(None, [f"output.dir={td}/runs", f"output.adapter_dir={td}/ad",
+                             f"output.push={'true' if push else 'false'}"])
+    return Cfg(cfg)
+
+
+def t_resume_config_default():
+    from src.config import load_config
+    r = load_config()["resume"]
+    assert r["meta_name"] == "infer_scan_meta.json"
+    assert int(r["meta_every"]) > 0 and int(r["push_every"]) >= 0
+
+
+def t_resume_merge_predictions():
+    from src import resume
+    from src.runners.base import repair_tail  # noqa: F401
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        loc, hub = td / "loc.jsonl", td / "hub.jsonl"
+        _write_preds(loc, ["k1", "k2"], pred="LOCAL", cut_tail=True)   # shutdown giữa lúc ghi
+        _write_preds(hub, ["k2", "k3", "k4"], pred="HUB")
+        had, added = resume.merge_predictions(loc, hub)
+        assert (had, added) == (2, 2), (had, added)
+        rows = {json.loads(l)["key"]: json.loads(l)["pred"]
+                for l in open(loc, encoding="utf-8") if l.strip()}
+        assert set(rows) == {"k1", "k2", "k3", "k4"}, rows
+        assert rows["k2"] == "LOCAL-k2", "trùng key: bản cục bộ phải thắng"
+        assert open(loc, "rb").read().endswith(b"\n"), "file phải kết thúc bằng newline"
+        assert "cut" not in rows
+        # Không có key mới -> không đụng file
+        mt = loc.stat().st_mtime_ns
+        assert resume.merge_predictions(loc, hub) == (4, 0)
+        assert loc.stat().st_mtime_ns == mt
+
+
+def t_resume_meta_monotonic_and_lost():
+    """Metadata đơn điệu: file predictions bị cắt thì key mất được báo `lost`, KHÔNG biến
+    mất khỏi tập đã quét; tập test khác thì bỏ bản cũ."""
+    from src import resume
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = _resume_cfg(td)
+        keys = [f"k{i}" for i in range(10)]
+        pp = {"m": td / "m.jsonl"}
+        _write_preds(pp["m"], keys[:6])
+        m1 = resume.build_meta(cfg, keys, pp, None, bump=True)
+        mpath = resume.write_meta(td / "meta.json", m1)
+        assert not list(td.glob("*.tmp")), "ghi nguyên tử không để file tạm"
+        assert m1["models"]["m"]["n_done"] == 6 and m1["scan_count"] == 1
+        _write_preds(pp["m"], keys[:4])                      # file bị cắt: mất k4,k5
+        m2 = resume.build_meta(cfg, keys, pp, resume.load_meta(mpath), bump=True)
+        mm = m2["models"]["m"]
+        assert mm["n_done"] == 6 and mm["n_in_file"] == 4, mm
+        assert mm["lost_keys"] == ["k4", "k5"], mm["lost_keys"]
+        assert m2["scan_count"] == 2 and m2["first_scan_at"] == m1["first_scan_at"]
+        _write_preds(pp["m"], keys[:8])                      # sinh lại: lost về rỗng
+        m3 = resume.build_meta(cfg, keys, pp, m2)
+        assert m3["models"]["m"]["lost_keys"] == [] and m3["models"]["m"]["n_done"] == 8
+        assert m3["scan_count"] == 2, "checkpoint không được tăng scan_count"
+        other = resume.build_meta(cfg, keys[:5], pp, m3)     # tập test khác
+        assert other["scan_count"] == 0 and other["models"]["m"]["n_done"] == 5
+        assert resume.load_meta(td / "nonexistent.json") is None
+
+
+def _fake_hub(td: Path, cfg, files: dict[str, bytes]):
+    """Dựng Hub giả: list_hub_files + _download đọc từ dict thay vì mạng."""
+    from src import resume
+
+    def lst(c):
+        return {k: len(v) for k, v in files.items()}
+
+    def dl(c, rel, dest_root):
+        sub = str(c["output"]["subdir"]).strip("/")
+        p = Path(dest_root) / sub / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(files[rel])
+        return p
+    return lst, dl
+
+
+def t_resume_restores_instead_of_retrain():
+    """[MÔ PHỎNG] Máy mới (đĩa trống): adapter đầy đủ trên Hub được KÉO VỀ nên arm không
+    train lại; adapter dở (thiếu train_stats.json) thì không; predictions của arm không có
+    adapter nguyên vẹn KHÔNG được trộn; predictions baseline được gộp; metadata ghi ra."""
+    from unittest import mock
+    import pandas as pd
+    from src import resume
+    _train_stub()
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = _resume_cfg(td)
+        keys = [f"k{i}" for i in range(20)]
+        test_df = pd.DataFrame({"key": keys, "ref": ["r"] * 20, "image_path": ["x"] * 20})
+        arms = [{"id": a} for a in ARM_IDS]
+        r2, r4, r8 = ARM_IDS
+
+        def preds_bytes(ks, tag):
+            return "".join(json.dumps({"key": k, "pred": tag}) + "\n" for k in ks).encode()
+        stats = json.dumps({"projector_adapter": {"rank": 2}}).encode()
+        files = {
+            f"adapters/{r2}/adapter_model.safetensors": b"W",
+            f"adapters/{r2}/train_stats.json": stats,
+            f"adapters/{r2}/projector_adapter.pt": b"P",
+            f"adapters/{r4}/adapter_model.safetensors": b"W",          # thiếu train_stats
+            f"adapters/{r8}/adapter_model.safetensors": b"W",
+            f"adapters/{r8}/train_stats.json": stats,                  # thiếu projector .pt
+            f"predictions/{BASELINE_ID}.jsonl": preds_bytes(keys[:12], "B"),
+            f"predictions/{r2}.jsonl": preds_bytes(keys[:7], "A"),
+            f"predictions/{r4}.jsonl": preds_bytes(keys[:9], "X"),
+        }
+        lst, dl = _fake_hub(td, cfg, files)
+        run_dir = td / "runs" / "x"
+        pred_paths = {i: run_dir / "predictions" / f"{i}.jsonl"
+                      for i in [BASELINE_ID] + ARM_IDS}
+        with mock.patch.object(resume, "list_hub_files", lst), \
+                mock.patch.object(resume, "_download", dl), \
+                mock.patch.object(resume, "hf_token", lambda: "hf_x"):
+            info = resume.scan_and_restore(cfg, arms, td / "ad", pred_paths, BASELINE_ID,
+                                           test_df, run_dir)
+        tr = _train_stub()
+        assert tr.already_trained(td / "ad" / r2), "r2 phải được kéo về, không train lại"
+        assert info["adapters"][r2] == "restored_from_hub"
+        assert not tr.already_trained(td / "ad" / r4) and "missing" in info["adapters"][r4]
+        assert not tr.already_trained(td / "ad" / r8) and info["adapters"][r8] == "hub_incomplete"
+        assert not (td / "ad" / f".restore_{r2}").exists(), "thư mục tạm phải được dọn"
+        assert len(resume.read_pred_rows(pred_paths[BASELINE_ID])) == 12
+        assert len(resume.read_pred_rows(pred_paths[r2])) == 7
+        assert not pred_paths[r4].exists(), "adapter r4 sẽ train lại -> không trộn predictions cũ"
+        meta = resume.load_meta(run_dir / resume.META_NAME)
+        assert meta and meta["models"][BASELINE_ID]["n_done"] == 12
+        assert meta["models"][r2]["n_done"] == 7 and meta["models"][r4]["n_done"] == 0
+        assert info["done"][BASELINE_ID] == 12
+
+
+def t_resume_scan_failure_no_silent_retrain():
+    """Quét lỗi mà có arm phải train vì thiếu adapter -> DỪNG (không tự train lại).
+    Có đủ adapter cục bộ, hoặc người chạy chủ động --retrain -> đi tiếp."""
+    from unittest import mock
+    import pandas as pd
+    from src import resume
+    _train_stub()
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = _resume_cfg(td)
+        test_df = pd.DataFrame({"key": ["a", "b"], "ref": ["r"] * 2, "image_path": ["x"] * 2})
+        arms = [{"id": a} for a in ARM_IDS]
+        run_dir = td / "runs" / "x"
+        pp = {i: run_dir / "predictions" / f"{i}.jsonl" for i in [BASELINE_ID] + ARM_IDS}
+
+        def boom(c):
+            raise resume.ScanError("mạng đứt")
+        with mock.patch.object(resume, "list_hub_files", boom), \
+                mock.patch.object(resume, "hf_token", lambda: "hf_x"):
+            try:
+                resume.scan_and_restore(cfg, arms, td / "ad", pp, BASELINE_ID, test_df, run_dir)
+            except resume.ScanError as e:
+                assert "--no-scan" in str(e) and "--retrain" in str(e)
+            else:
+                raise AssertionError("phải dừng khi quét lỗi mà thiếu adapter")
+            info = resume.scan_and_restore(cfg, arms, td / "ad", pp, BASELINE_ID, test_df,
+                                           run_dir, retrain=True)
+            assert info["status"].startswith("scan_failed")
+            info = resume.scan_and_restore(cfg, arms, td / "ad", pp, BASELINE_ID, test_df,
+                                           run_dir, need_train=False)   # chỉ infer/score
+            assert info["status"].startswith("scan_failed")
+            for a in ARM_IDS:                                           # đủ adapter cục bộ
+                d = td / "ad" / a
+                d.mkdir(parents=True)
+                (d / "adapter_model.safetensors").write_bytes(b"W")
+                (d / "train_stats.json").write_text("{}")
+            info = resume.scan_and_restore(cfg, arms, td / "ad", pp, BASELINE_ID, test_df, run_dir)
+            assert info["status"].startswith("scan_failed")
+        # push=false / không token: bỏ qua quét, vẫn ghi metadata cục bộ
+        cfg2 = _resume_cfg(td, push=False)
+        info = resume.scan_and_restore(cfg2, arms, td / "ad", pp, BASELINE_ID, test_df, run_dir)
+        assert info["status"].startswith("skipped")
+        assert (run_dir / resume.META_NAME).exists()
+
+
+def t_resume_checkpoint_hook():
+    """Runner gọi checkpoint SAU MỖI BATCH với tổng tuyệt đối (cả mẫu đã resume); metadata
+    cục bộ cập nhật mỗi meta_every, đẩy Hub mỗi push_every; lần gọi đầu chỉ lấy mốc."""
+    from unittest import mock
+    import pandas as pd
+    from src import push as push_mod
+    from src import resume
+    from src.config import Cfg
+    from src.runners.base import Runner
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = _resume_cfg(td)
+        cfg["resume"] = {"meta_every": 4, "push_every": 8}
+        cfg["wandb"] = {"log_samples": 0}
+        keys = [f"k{i:02d}" for i in range(20)]
+        df = pd.DataFrame({"key": keys, "ref": ["r"] * 20, "image_path": ["x"] * 20})
+        run_dir = td / "runs" / "x"
+        out = run_dir / "predictions" / "m.jsonl"
+        _write_preds(out, keys[:6], cut_tail=True)          # resume giữa chừng, đuôi cụt
+
+        class R(Runner):
+            name = "fake"
+
+            def load(self):
+                pass
+
+            def generate_batch(self, batch):
+                return [f"p-{b['key']}" for b in batch]
+
+        seen: list[int] = []
+        pushes: list[str] = []
+        r = R(cfg, Cfg({"id": "m", "batch_size": 2, "disable_compile": "false"}))
+        cp = resume.make_checkpoint(cfg, df, {"m": out}, run_dir, "m")
+        r.checkpoint = lambda n: (seen.append(n), cp(n))
+        with mock.patch.object(push_mod, "push_artifact",
+                               lambda c, local, dest, msg: pushes.append(dest) or True):
+            r.run(df, out)
+        assert seen == list(range(8, 22, 2)), seen          # 6 đã có + từng batch 2 mẫu
+        # mốc ở 8; metadata ở 12/16/20; đẩy Hub khi cách mốc >= 8 -> đúng MỘT lần (ở 16)
+        assert pushes == ["predictions/m.jsonl", resume.META_NAME], pushes
+        meta = resume.load_meta(run_dir / resume.META_NAME)
+        assert meta and meta["models"]["m"]["n_done"] == 20, meta["models"]["m"]["n_done"]
+        assert len(resume.read_pred_rows(out)) == 20
+
+
+def t_resume_wired_in_orchestrator():
+    """--no-scan tồn tại; scan chạy trước train; Runner nhận checkpoint; stage ở docstring."""
+    src = (ROOT / "src" / "run_vision_lora.py").read_text(encoding="utf-8")
+    assert '"--no-scan"' in src
+    assert src.index("scan_and_restore") < src.index("pf_err, pf_warn = preflight_adapters")
+    assert "runner.checkpoint" in src and "finalize_meta" in src
+    assert "return 3" in src, "quét lỗi mà phải train lại -> dừng với mã 3"
+
+
+# ── 9. Một report = MỘT tập mẫu infer chung ─────────────────────────────────
+def t_eval_set_resolve():
+    import pandas as pd
+    from src import resume
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        keys = [f"k{i}" for i in range(10)]
+        df = pd.DataFrame({"key": keys})
+        ids = ["a", "b", "c"]
+        pp = {i: td / f"{i}.jsonl" for i in ids}
+        for i in ids:
+            _write_preds(pp[i], keys)
+        ek, info = resume.resolve_eval_set(df, pp, ids)
+        assert ek == keys and not info["partial"] and info["n_eval"] == 10
+        _write_preds(pp["b"], keys[3:8])                       # b chỉ phủ k3..k7
+        try:
+            resume.resolve_eval_set(df, pp, ids)
+        except resume.EvalSetError as e:
+            assert "--allow-partial-eval" in str(e) and "5/10" in str(e), str(e)
+        else:
+            raise AssertionError("mặc định phải dừng khi các model không cùng phủ đủ")
+        ek, info = resume.resolve_eval_set(df, pp, ids, allow_partial=True)
+        assert ek == keys[3:8] and info["partial"] and info["per_model"]["b"] == 5
+        pp["c"].unlink()                                       # c chưa infer gì
+        for allow in (False, True):
+            try:
+                resume.resolve_eval_set(df, pp, ids, allow_partial=allow)
+            except resume.EvalSetError:
+                pass
+            else:
+                raise AssertionError("model không có mẫu nào thì không có tập chung")
+        fp1 = resume.eval_fingerprint(keys)
+        assert fp1 == resume.eval_fingerprint(list(reversed(keys))), "băm không phụ thuộc thứ tự"
+
+
+def t_report_same_set_enforced():
+    import pandas as pd
+    from src import report_vision_lora as rep
+    from src.config import load_config
+    scores, cols, keys = _synthetic_scores(n=30, seed=3)
+    names = {i: i for i in scores}
+    cfg = load_config()
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        md = rep.write_all(cfg, td, scores, names, pd.DataFrame(),
+                           eval_info={"n_test": 30, "n_eval": 30, "keys_sha256": "ab" * 32,
+                                      "partial": False})
+        txt = md.read_text(encoding="utf-8")
+        assert "Tập đánh giá chung" in txt and "30 ảnh" in txt and "cùng một tập" in txt
+        assert "Tập giao nhỏ hơn" not in txt
+        bad = dict(scores)
+        bad[ARM_IDS[0]] = scores[ARM_IDS[0]].iloc[:25]
+        try:
+            rep.write_all(cfg, td, bad, names, pd.DataFrame())
+        except ValueError as e:
+            assert ARM_IDS[0] in str(e)
+        else:
+            raise AssertionError("report phải từ chối khi các bảng điểm lệch tập key")
+        small = {i: d.iloc[:20] for i, d in scores.items()}
+        txt = rep.write_all(cfg, td, small, names, pd.DataFrame(),
+                            eval_info={"n_test": 30, "n_eval": 20, "partial": True}
+                            ).read_text(encoding="utf-8")
+        assert "20/30" in txt and "--allow-partial-eval" in txt
+
+
+def _run_score_stages(td: Path, preds_n: dict[str, int], extra=None, pre=None):
+    """Chạy main() chỉ các stage score,stats,report với predictions có sẵn; trả (rc, nhật ký
+    score_model, run_dir)."""
+    from unittest import mock
+    import pandas as pd
+    from src import data as data_mod
+    from src import metrics as metrics_mod
+    from src import run_vision_lora
+    scores, cols, keys = _synthetic_scores(n=60, seed=5)
+    test_df = pd.DataFrame({"key": keys, "ref": ["r"] * 60, "image_path": ["x"] * 60})
+    run_dir = td / "runs" / "ev"
+    for mid, n in preds_n.items():
+        _write_preds(run_dir / "predictions" / f"{mid}.jsonl", keys[:n])
+    if pre:
+        pre(run_dir, scores, keys)
+    seen: dict[str, int] = {}
+
+    def fake_score(cfg, ks, preds, refs, label=""):
+        seen[label] = len(ks)
+        return scores[label].set_index("key").loc[ks].reset_index(), {}
+    with mock.patch.object(data_mod, "load_manifest", lambda cfg: test_df), \
+            mock.patch.object(metrics_mod, "score_model", fake_score):
+        rc = run_vision_lora.main([
+            "--run-id", "ev", "--no-wandb", "--no-scan", "--stages", "score,stats,report",
+            "--set", f"output.dir={td}/runs", "--set", f"output.adapter_dir={td}/ad",
+            "--set", "output.push=false", "--set", "stats.n_boot=50", "--set",
+            "stats.n_perm=50", *(extra or [])])
+    return rc, seen, run_dir
+
+
+def t_pipeline_common_eval_set():
+    """[MÔ PHỎNG] Arm infer dở -> DỪNG (mã 5), không có REPORT.md; `--allow-partial-eval` ->
+    chỉ chấm đúng tập giao, ghi eval_set.json + REPORT.md nói rõ n."""
+    full = {i: 60 for i in [BASELINE_ID] + ARM_IDS}
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        rc, seen, rd = _run_score_stages(td, {**full, ARM_IDS[1]: 40})
+        assert rc == 5, rc
+        assert not (rd / "REPORT.md").exists() and not seen, "không chấm khi tập không chung"
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        rc, seen, rd = _run_score_stages(td, {**full, ARM_IDS[1]: 40},
+                                         extra=["--allow-partial-eval"])
+        assert rc == 0, rc
+        assert set(seen.values()) == {40}, f"mọi model phải chấm cùng 40 mẫu: {seen}"
+        es = json.loads((rd / "eval_set.json").read_text(encoding="utf-8"))
+        assert es["n"] == 40 and es["partial"] and len(es["keys"]) == 40
+        txt = (rd / "REPORT.md").read_text(encoding="utf-8")
+        assert "40 ảnh" in txt and "40/60" in txt
+        assert json.loads((rd / "manifest.json").read_text(encoding="utf-8"))["eval_set"]["n"] == 40
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        rc, seen, rd = _run_score_stages(td, full)
+        assert rc == 0 and set(seen.values()) == {60}
+        es = json.loads((rd / "eval_set.json").read_text(encoding="utf-8"))
+        assert es["n"] == 60 and not es["partial"]
+        assert "60 ảnh" in (rd / "REPORT.md").read_text(encoding="utf-8")
+
+
+def t_stale_score_csv_rescored_or_blocked():
+    """CSV điểm cũ chỉ phủ 30/60 mẫu: stage score chấm lại model đó; chạy riêng stats,report
+    trên các CSV lệch n thì DỪNG thay vì âm thầm co về 30."""
+    import pandas as pd
+    full = {i: 60 for i in [BASELINE_ID] + ARM_IDS}
+
+    def stale(run_dir, scores, keys):
+        m = run_dir / "metrics"
+        m.mkdir(parents=True, exist_ok=True)
+        for i, d in scores.items():
+            (d if i != ARM_IDS[0] else d.iloc[:30]).to_csv(m / f"per_sample_{i}.csv", index=False)
+    with tempfile.TemporaryDirectory() as td:
+        rc, seen, rd = _run_score_stages(Path(td), full, pre=stale)
+        assert rc == 0 and seen == {ARM_IDS[0]: 60}, seen   # chỉ model có CSV thiếu bị chấm lại
+        assert len(pd.read_csv(rd / "metrics" / f"per_sample_{ARM_IDS[0]}.csv")) == 60
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        from unittest import mock
+        from src import data as data_mod
+        from src import run_vision_lora
+        scores, cols, keys = _synthetic_scores(n=60, seed=5)
+        test_df = pd.DataFrame({"key": keys, "ref": ["r"] * 60, "image_path": ["x"] * 60})
+        rd = td / "runs" / "ev"
+        stale(rd, scores, keys)
+        with mock.patch.object(data_mod, "load_manifest", lambda cfg: test_df):
+            rc = run_vision_lora.main([
+                "--run-id", "ev", "--no-wandb", "--no-scan", "--stages", "stats,report",
+                "--set", f"output.dir={td}/runs", "--set", "output.push=false"])
+        assert rc == 5 and not (rd / "REPORT.md").exists(), rc
+
+
 def main():
     hr("1. Cấu hình CHÍNH THỨC: 3 arm rank 2 / 4 / 8")
     check("DEFAULT_CONFIG là vision_lora.yaml", t_default_config)
@@ -871,6 +1295,21 @@ def main():
 
     hr("7. Tài liệu khớp cấu hình")
     check("README / docstring / script không còn rank 16", t_docs_consistent)
+
+    hr("8. Resume: quét Hub thay vì train/sinh lại, metadata cố định")
+    check("Cấu hình `resume:` mặc định", t_resume_config_default)
+    check("Gộp predictions Hub vào cục bộ: cục bộ thắng, dọn dòng cụt, ghi nguyên tử", t_resume_merge_predictions)
+    check("Metadata đơn điệu, báo mẫu `lost`, bỏ bản của tập test khác", t_resume_meta_monotonic_and_lost)
+    check("[MÔ PHỎNG] đĩa trống: kéo adapter từ Hub, không trộn predictions cũ", t_resume_restores_instead_of_retrain)
+    check("Quét lỗi + thiếu adapter -> dừng, không tự train lại", t_resume_scan_failure_no_silent_retrain)
+    check("[MÔ PHỎNG] Runner checkpoint: metadata + đẩy Hub giữa lúc sinh", t_resume_checkpoint_hook)
+    check("Dây nối: --no-scan, quét trước train, runner.checkpoint", t_resume_wired_in_orchestrator)
+
+    hr("9. Một report = MỘT tập mẫu infer chung")
+    check("resolve_eval_set: nghiêm theo mặc định, giao khi chủ động, model rỗng thì dừng", t_eval_set_resolve)
+    check("REPORT.md ghi n + băm tập chung; từ chối bảng điểm lệch key", t_report_same_set_enforced)
+    check("[MÔ PHỎNG] arm infer dở -> dừng (5); --allow-partial-eval -> chấm đúng tập giao", t_pipeline_common_eval_set)
+    check("[MÔ PHỎNG] CSV điểm cũ thiếu mẫu: chấm lại / chặn khi chỉ chạy stats,report", t_stale_score_csv_rescored_or_blocked)
 
     hr("TỔNG KẾT")
     print(f"PASS: {PASS}  |  FAIL: {FAIL}  |  SKIP: {SKIP}")

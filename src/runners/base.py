@@ -72,6 +72,11 @@ class Runner:
         self.model = None
         self.processor = None
         self.tracker = tracker or NullTracker()
+        # Móc checkpoint (tuỳ chọn): `checkpoint(tổng_số_mẫu_đã_xong)` được gọi SAU MỖI
+        # BATCH, khi file predictions đã flush. src/resume.py dùng nó để cập nhật metadata
+        # cố định và đẩy predictions dở lên Hub, nên shutdown giữa lúc sinh chỉ mất vài
+        # trăm mẫu. Lỗi trong móc này không bao giờ làm hỏng lần sinh.
+        self.checkpoint = None
 
     # ── giao diện con lớp phải cài ──────────────────────────────────────────
     def load(self) -> None:
@@ -232,6 +237,11 @@ class Runner:
                     }, ensure_ascii=False) + "\n")
                 f.flush()
                 n_done += len(batch)
+                if self.checkpoint is not None:
+                    try:
+                        self.checkpoint(len(done) + n_done)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  ⚠ checkpoint lỗi ({e!r}) — bỏ qua", flush=True)
                 if (i // bs) % log_every == 0 or n_done >= len(todo):
                     rate = n_done / max(1e-9, time.time() - t0)
                     eta = (len(todo) - n_done) / max(1e-9, rate)
