@@ -185,7 +185,7 @@ train:
 
   # Checkpoint để sống sót qua shutdown máy thuê (adapter+optimizer+scheduler+vị trí dữ liệu)
   checkpoint:
-    save_steps: 200
+    save_steps: 100
     keep_last: 1
     push: true
 
