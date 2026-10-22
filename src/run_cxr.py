@@ -17,6 +17,12 @@ vì infer lại — cùng 3000 ảnh test, cùng prompt/decode (config này sao 
     python -m src.run_cxr                       # chạy chính thức
     python -m src.run_cxr --stages stats,report
     python -m src.run_cxr --retrain             # bỏ checkpoint + adapter, train lại từ đầu
+
+Train KHÔNG bị ràng buộc: `--set train.phase=p2 --set train.schedule.steps=1500 ...` chạy một
+One-cycle MỚI (lr mới, số bước khai rõ) xuất phát từ trọng số cũ. Xem `src/cxr_phase.py`.
+
+    python -m src.run_cxr --force-infer         # infer→score→stats→report, KHÔNG xét train
+    python -m src.run_cxr --force-infer all     # cưỡng bức cả baseline gốc
 """
 from __future__ import annotations
 
@@ -32,6 +38,7 @@ import pandas as pd
 
 from .config import (Cfg, add_common_args, hf_token, load_config, resolved_snapshot,
                      seed_everything)
+from . import cxr_phase as ph
 from .run_vision_lora import _env_info, _hr, _read_preds, arm_model_cfg, enabled_arms
 from .tracking import Tracker
 
@@ -117,6 +124,40 @@ def seed_reused_predictions(cfg: Cfg, pred_paths: dict[str, Path], test_df: pd.D
     return info
 
 
+def _reset_preds(cfg: Cfg, cand: str, tag: str, odir: Path, pred_paths: dict, run_dir: Path,
+                 hub_files: dict[str, int]) -> None:
+    """Gạt dự đoán của candidate sau khi trọng số đổi. Idempotent nhờ dấu `.preds_reset`."""
+    mark = Path(odir) / ".preds_reset"
+    if mark.exists() and mark.read_text(encoding="utf-8").strip() == tag:
+        return
+    pp = Path(pred_paths[cand])
+    has_local = pp.exists() and pp.stat().st_size > 0
+    has_hub = f"predictions/{cand}.jsonl" in (hub_files or {})
+    if has_local or has_hub:
+        n = ph.purge_predictions(cfg, pp, run_dir, cand, push=bool(cfg["output"].get("push")))
+        print(f"  ⟳ trọng số mới: gạt {n} dự đoán cũ của {cand} (infer sẽ sinh lại)", flush=True)
+    mark.write_text(tag, encoding="utf-8")
+
+
+def _find_old_weights(cfg: Cfg, cand: str, phase: str, odir: Path, adapter_root: Path,
+                      hub_files: dict[str, int]) -> str:
+    """Bảo đảm `odir` có trọng số: cục bộ → adapter Hub → checkpoint (pha hiện tại, rồi gốc)."""
+    from .cxr_train import ckpt_root, pull_checkpoint
+
+    need_proj = bool((dict(cfg["train"]).get("projector_adapter", {}) or {}).get("enabled", False))
+    last: Exception | None = None
+    for k in dict.fromkeys([ph.ckpt_key(cand, phase), cand]):
+        root = ckpt_root(adapter_root, k)
+        try:
+            return ph.ensure_infer_weights(
+                cfg, cand, odir, root, hub_files, need_proj,
+                ckpt_pull=(lambda k=k, root=root: pull_checkpoint(cfg, k, root, hub_files))
+                if hub_files else None)
+        except ph.PhaseError as e:
+            last = e
+    raise last or ph.PhaseError("không tìm thấy trọng số cũ")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§2.7 CXR Specialization — trọn gói.")
     add_common_args(ap)
@@ -127,6 +168,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true",
                     help="bỏ adapter + checkpoint, train lại từ đầu")
+    ap.add_argument("--force-infer", nargs="?", const="cand", default=None, metavar="cand|all|ID,..",
+                    help="CƯỠNG BỨC infer→score→stats→report, bỏ qua mọi điều kiện của train "
+                         "(không train, không đòi train_stats/adapter 'train xong', ghi đè dự đoán "
+                         "cũ). Điều kiện duy nhất: có bộ trọng số cũ. 'cand' (mặc định) chỉ infer "
+                         "lại candidate; 'all' thêm baseline gốc.")
     ap.add_argument("--no-scan", action="store_true")
     ap.add_argument("--no-reuse", action="store_true", help="không kéo dự đoán cũ từ Hub")
     ap.add_argument("--allow-partial-eval", action="store_true")
@@ -154,9 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg["output"]["push"] = False
     if a.no_wandb:
         cfg.setdefault("wandb", {})["enabled"] = False
-    if int(cfg["train"].get("n_epochs", 1)) != 1:
-        print("✗ §2.7 chỉ chạy 1 epoch (bốc không hoàn lại trên toàn tập).", flush=True)
-        return 2
+    # Train KHÔNG bị ràng buộc (epoch, rank, phương pháp, lr đều tự do) — xem cxr_phase.py.
 
     seed_everything(int(cfg.get("seed", 42)))
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
@@ -164,6 +208,14 @@ def main(argv: list[str] | None = None) -> int:
         if s not in STAGES:
             print(f"✗ stage không biết: {s!r} (hợp lệ: {', '.join(STAGES)})")
             return 2
+    force = a.force_infer is not None
+    if force:
+        # Cưỡng bức: luôn infer→score→stats→report (+data cho manifest; push nếu đang bật).
+        # Không bao giờ có stage train, dù --stages khai gì.
+        stages = ["data", "infer", "score", "stats", "report"] + (["push"] if "push" in stages
+                                                                    or a.stages == ",".join(STAGES)
+                                                                    else [])
+        a.rescore = True
 
     arms = enabled_arms(cfg)
     if len(arms) != 1:
@@ -171,9 +223,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     arm = arms[0]
     cand = arm["id"]
-    if int(arm["rank"]) != 4 or str(arm["method"]).lower() != "qdora":
-        print(f"✗ candidate phải là QDoRA rank 4 (nhận {arm['method']} r={arm['rank']})", flush=True)
-        return 2
 
     run_id = a.run_id or str(cfg["output"]["subdir"])
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
@@ -188,10 +237,28 @@ def main(argv: list[str] | None = None) -> int:
              cand: arm.get("name", cand)}
     cfg["stats"]["reference"], cfg["stats"]["pairs"] = base_id, "vs_reference"
     pred_paths = {i: run_dir / "predictions" / f"{i}.jsonl" for i in [base_id, *extras, cand]}
+    phase = ph.phase_of(dict(cfg["train"]))
+    forced_ids: set[str] = set()
+    if force:
+        spec = str(a.force_infer).strip().lower()
+        if spec in ("", "cand"):
+            forced_ids = {cand}
+        elif spec == "all":
+            forced_ids = {base_id, cand}
+        else:
+            forced_ids = {x.strip() for x in str(a.force_infer).split(",") if x.strip()}
+            bad = forced_ids - {base_id, cand}
+            if bad:
+                print(f"✗ --force-infer chỉ nhận {base_id}, {cand} (baseline bổ sung không infer): "
+                      f"{sorted(bad)}", flush=True)
+                return 2
+        print(f"⚙ FORCE-INFER: {sorted(forced_ids)} · stages {stages} · không điều kiện train",
+              flush=True)
 
     manifest = {"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config": resolved_snapshot(cfg), "env": _env_info(), "stages_run": stages,
-                "candidate": cand, "baselines": [base_id, *extras], "arm_status": {}}
+                "candidate": cand, "baselines": [base_id, *extras], "arm_status": {},
+                "phase": phase, "force_infer": sorted(forced_ids)}
     t_start = time.time()
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
@@ -220,11 +287,23 @@ def main(argv: list[str] | None = None) -> int:
         if not a.no_reuse and not a.dry_run and ("infer" in stages or "score" in stages):
             _hr("Kéo dự đoán baseline cũ từ Hub §2.6 (không infer lại)")
             try:
-                manifest["reuse"] = seed_reused_predictions(cfg, pred_paths, test_df, run_dir)
+                manifest["reuse"] = seed_reused_predictions(
+                    cfg, {k: v for k, v in pred_paths.items() if k not in forced_ids},
+                    test_df, run_dir)
             except Exception as e:  # noqa: BLE001
                 print(f"  ⚠ kéo dự đoán cũ lỗi ({e!r}) — baseline gốc sẽ infer lại", flush=True)
                 manifest["reuse"] = {"error": repr(e)}
-        if not a.no_scan:
+        if force:
+            # Cưỡng bức: KHÔNG scan_and_restore (nó gắn với train/resume dự đoán). Chỉ liệt kê
+            # Hub để tìm trọng số cũ nếu cục bộ không có.
+            if cfg["output"].get("push") and hf_token():
+                from . import resume as resume_mod
+
+                try:
+                    hub_files = resume_mod.list_hub_files(cfg)
+                except resume_mod.ScanError as e:
+                    print(f"  ⚠ không liệt kê được Hub ({e}) — chỉ dùng dữ liệu cục bộ", flush=True)
+        elif not a.no_scan:
             _hr("Quét repo Hub để resume (adapter, checkpoint, predictions)")
             from . import resume as resume_mod
 
@@ -248,10 +327,11 @@ def main(argv: list[str] | None = None) -> int:
     train_stats: list[dict] = []
     odir = adapter_root / cand
     if "train" in stages:
-        _hr("Huấn luyện CXR Specialist — QDoRA r4, One-cycle, streaming")
+        _hr("Huấn luyện CXR Specialist — One-cycle, streaming"
+            + (f" · pha `{phase}` (resume trọng số cũ)" if phase else ""))
         from . import data_train as dt_mod
         from .backbone import preflight_adapters
-        from .train import already_trained, read_probe, resolve_batch
+        from .train import read_probe, resolve_batch
 
         errs, warns = preflight_adapters(arms)
         for w in warns:
@@ -263,11 +343,24 @@ def main(argv: list[str] | None = None) -> int:
             tracker.finish(1)
             _write_manifest()
             return 2
-        if already_trained(odir) and not a.retrain:
-            print(f"  ✓ {cand}: đã có adapter ở {odir} — bỏ qua", flush=True)
+        if ph.trained_in_phase(odir, phase) and not a.retrain:
+            print(f"  ✓ {cand}: đã có adapter{' của pha `'+phase+'`' if phase else ''} ở {odir} "
+                  f"— bỏ qua", flush=True)
             train_stats.append(json.loads((odir / "train_stats.json").read_text(encoding="utf-8")))
             manifest["arm_status"][cand] = {"trained": "cached"}
+            if phase:   # chốt dự đoán cũ đã gạt (phòng chết giữa train và dọn dự đoán)
+                _reset_preds(cfg, cand, phase, odir, pred_paths, run_dir, hub_files)
         else:
+            if phase and not ph.weights_ok(odir, False) and not ph.prev_dir(
+                    adapter_root, cand, phase).exists():
+                # Điều kiện duy nhất: có trọng số cũ. Cục bộ không có -> thử Hub.
+                if not (hub_files and ph.restore_weights_hub(cfg, cand, hub_files, odir)):
+                    print(f"\n✗ DỪNG — không có trọng số cũ để resume: {odir} trống và Hub không "
+                          f"có adapters/{cand}.", flush=True)
+                    manifest["arm_status"][cand] = {"trained": False, "error": "no_old_weights"}
+                    tracker.finish(1)
+                    _write_manifest()
+                    return 6
             from .cxr_train import prepare_stream, train_stream_arm
             from .push import push_artifact
 
@@ -299,7 +392,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise
             train_stats.append(st)
             manifest["arm_status"][cand] = {"trained": True, "minutes": st["minutes"],
-                                            "resumed_from_step": st["resumed_from_step"]}
+                                            "resumed_from_step": st["resumed_from_step"],
+                                            "phase": phase, "steps": st.get("steps")}
+            # Trọng số đổi ⇒ dự đoán cũ của candidate hết giá trị (kẻo infer thấy "đã đủ").
+            _reset_preds(cfg, cand, phase or "train", odir, pred_paths, run_dir, hub_files)
             push_artifact(cfg, odir, f"adapters/{cand}", f"§2.7 adapter {cand} (train xong)")
             tracker.summary({f"train/{cand}/loss": st["train_loss"],
                              f"train/{cand}/minutes": st["minutes"],
@@ -318,11 +414,34 @@ def main(argv: list[str] | None = None) -> int:
         todo = [{"id": base_id, "name": names[base_id], "_baseline": True}, arm]
         for item in todo:
             mid = item["id"]
+            if force and mid not in forced_ids:
+                print(f"\n── {names[mid]}: không nằm trong --force-infer — giữ dự đoán hiện có",
+                      flush=True)
+                continue
+            if mid in forced_ids:
+                if mid == cand:
+                    # Điều kiện DUY NHẤT: có bộ trọng số cũ. Không xét train_stats/train xong.
+                    try:
+                        src = _find_old_weights(cfg, cand, phase, odir, adapter_root, hub_files)
+                    except ph.PhaseError as e:
+                        print(f"\n✗ DỪNG — {e}", flush=True)
+                        manifest["arm_status"].setdefault(mid, {})["infer"] = {
+                            "ok": False, "no_old_weights": str(e)}
+                        tracker.finish(1)
+                        _write_manifest()
+                        return 6
+                    print(f"  ✓ trọng số cũ: {src} -> {odir}", flush=True)
+                n_old = ph.purge_predictions(cfg, pred_paths[mid], run_dir, mid,
+                                             push=bool(cfg["output"].get("push")))
+                print(f"  ⟳ cưỡng bức: gạt {n_old} dự đoán cũ của {mid} (lưu ở predictions/_stale)",
+                      flush=True)
             have = len(set(_read_preds(pred_paths[mid])) & set(map(str, test_df["key"])))
             if have >= len(test_df):
                 print(f"\n── {names[mid]}: đã đủ {have}/{len(test_df)} dự đoán — bỏ qua infer", flush=True)
                 continue
             mcfg = arm_model_cfg(cfg, item, adapter_root)
+            if force:
+                mcfg["weights_only"] = True
             if item.get("_baseline"):
                 mcfg["runner"] = "gemma3"
             print(f"\n── {names[mid]} ── ({have}/{len(test_df)} đã có)", flush=True)
@@ -382,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  tập đánh giá chung: {len(eval_keys)}/{len(test_df)} mẫu", flush=True)
         for aid in score_ids:
             csvp = mdir / f"per_sample_{aid}.csv"
-            if csvp.exists() and not a.rescore:
+            if csvp.exists() and not (a.rescore and (not force or aid in forced_ids)):
                 cached = pd.read_csv(csvp)
                 if eval_set <= set(cached["key"]):
                     scores[aid] = cached[cached["key"].isin(eval_set)].reset_index(drop=True)

@@ -21,12 +21,12 @@ from pathlib import Path
 
 import pandas as pd
 
+from . import cxr_phase as ph
 from . import data_train as dt_mod
 from . import imaging
 from . import stream_data as sd
 from .backbone import (TrainUnusable, attach_adapter, build_scheduler, collate,
-                       free_vram, is_oom, is_quantized, load_base, total_steps,
-                       uses_dora)
+                       free_vram, is_oom, is_quantized, load_base, uses_dora)
 from .config import Cfg, seed_everything
 
 EXPECT_TRAINABLE_TAGS = ("lora_", "proj_adapter")
@@ -54,7 +54,7 @@ def ckpt_step(p: Path | None) -> int:
 HUB_CKPT = "checkpoints/{arm}/last"
 CKPT_FILES = ("trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth",
               "adapter_model.safetensors", "adapter_config.json", "projector_adapter.pt",
-              "projector_adapter.json", "training_args.bin")
+              "projector_adapter.json", "training_args.bin", ph.PLAN_NAME)
 
 
 def pull_checkpoint(cfg: Cfg, arm_id: str, root: Path, hub_files: dict[str, int]) -> Path | None:
@@ -103,7 +103,7 @@ def push_checkpoint(cfg: Cfg, arm_id: str, ckpt_dir: Path) -> bool:
 
 # ── Callback ─────────────────────────────────────────────────────────────────
 def _callbacks(tracker, cfg: Cfg, arm_id: str, fail_log: Path, n_samples: int,
-               eff_bs: int, pa_meta: dict | None, push: bool):
+               eff_bs: int, pa_meta: dict | None, push: bool, plan: dict | None = None):
     from transformers import TrainerCallback
 
     from .train import _TrackCallback
@@ -122,6 +122,9 @@ def _callbacks(tracker, cfg: Cfg, arm_id: str, fail_log: Path, n_samples: int,
                 from . import proj_adapter
 
                 proj_adapter.save(self.model, d, pa_meta)
+            if plan and d.exists():   # để resume trên máy mới biết cửa sổ dữ liệu + số bước
+                (d / ph.PLAN_NAME).write_text(json.dumps(plan, indent=2, ensure_ascii=False),
+                                              encoding="utf-8")
             if push and d.exists():
                 push_checkpoint(cfg, arm_id, d)
 
@@ -189,6 +192,43 @@ def _preflight_stream(ds, k: int = 3) -> None:
     print(f"  ✓ {min(k, len(ds))} ảnh trong {time.time() - t0:.1f}s", flush=True)
 
 
+# ── Nạp trọng số cũ (điểm xuất phát của pha mới) ────────────────────────────
+def _load_old_weights(model, src: Path, pstats: dict) -> None:
+    """Nạp adapter (+ projector adapter) cũ vào model ĐÃ gắn adapter. Chỉ nạp TRỌNG SỐ —
+    optimizer/scheduler/lr là của pha mới. Lệch rank/nhóm module ⇒ dừng, nêu rõ."""
+    import torch
+    from peft import set_peft_model_state_dict
+
+    src = Path(src)
+    f = src / "adapter_model.safetensors"
+    if f.exists():
+        from safetensors.torch import load_file
+
+        sd = load_file(str(f))
+    else:
+        sd = torch.load(src / "adapter_model.bin", map_location="cpu")
+    try:
+        res = set_peft_model_state_dict(model, sd)
+    except Exception as e:  # noqa: BLE001
+        raise TrainUnusable(
+            f"không nạp được trọng số cũ từ {src}: {e!r}\n  Điều kiện duy nhất để resume trọng "
+            f"số: cùng rank và cùng nhóm module với adapter cũ.") from e
+    bad = list(getattr(res, "unexpected_keys", []) or [])
+    if bad:
+        raise TrainUnusable(f"{len(bad)} khoá trong adapter cũ không khớp model mới "
+                            f"(vd {bad[:2]}) — rank/nhóm module đã đổi so với adapter cũ.")
+    print(f"  ✓ nạp trọng số cũ từ {src} ({len(sd)} tensor)", flush=True)
+    if pstats.get("projector_adapter"):
+        pp = src / "projector_adapter.pt"
+        if not pp.exists():
+            raise TrainUnusable(f"{src} thiếu projector_adapter.pt")
+        from . import proj_adapter
+
+        proj_adapter.find_projector(model).proj_adapter.load_state_dict(
+            torch.load(pp, map_location="cpu"))
+        print("  ✓ nạp projector adapter cũ", flush=True)
+
+
 # ── Huấn luyện ───────────────────────────────────────────────────────────────
 def train_stream_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict,
                      data_info: dict, out_dir: Path, run_dir: Path, adapter_root: Path,
@@ -240,19 +280,45 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict, data_i
     out_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(int(cfg.get("seed", 42)))
 
-    steps = max_steps_override or total_steps(len(train_df), bs, accum, int(tcfg.get("n_epochs", 1)))
+    phase = ph.phase_of(tcfg)
+    key = ph.ckpt_key(aid, phase)
+    sch = dict(tcfg["schedule"])
     ck_cfg = dict(tcfg.get("checkpoint", {}) or {})
-    croot = ckpt_root(adapter_root, aid)
+    croot = ckpt_root(adapter_root, key)
     croot.mkdir(parents=True, exist_ok=True)
     resume_from = None
     if not fresh:
-        resume_from = pull_checkpoint(cfg, aid, croot, hub_files) if hub_files else \
+        resume_from = pull_checkpoint(cfg, key, croot, hub_files) if hub_files else \
             latest_checkpoint(croot)
     elif croot.exists():
         shutil.rmtree(croot, ignore_errors=True)
         croot.mkdir(parents=True, exist_ok=True)
 
+    # ── Pha: trọng số cũ + số bước + cửa sổ dữ liệu ──────────────────────────
+    need_proj = bool((tcfg.get("projector_adapter", {}) or {}).get("enabled", False))
+    init_dir, init_info, plan = None, None, None
+    saved = ph._read_json(resume_from / ph.PLAN_NAME) if resume_from else None
+    if saved and phase and saved.get("phase") == phase:
+        plan = saved                      # resume: GIỮ NGUYÊN kế hoạch đã chốt lúc bắt đầu pha
+        print(f"  ✓ dùng lại kế hoạch pha `{phase}` từ checkpoint: {plan['steps']} bước, "
+              f"cửa sổ dữ liệu {plan['window']}", flush=True)
+    else:
+        if phase:
+            init_dir, init_info = ph.freeze_init(adapter_root, aid, phase, out_dir, tcfg, need_proj)
+        offset = ph.resolve_offset(tcfg, init_info) if phase else 0
+        plan = ph.plan_steps(len(train_df), bs * accum, sch, phase=phase, offset=offset,
+                             n_epochs=int(tcfg.get("n_epochs", 1)),
+                             max_steps_override=max_steps_override)
+        plan["init_from"] = str(init_dir) if init_dir else None
+        plan["old_phase"] = (init_info or {}).get("old_phase")
+    steps, offset = int(plan["steps"]), int(plan["offset"])
+    if phase or sch.get("steps"):
+        lo, hi = plan["window"]
+        train_df = train_df.iloc[lo:hi].reset_index(drop=True) if not max_steps_override \
+            else train_df
+    print(ph.describe_plan(plan, sch), flush=True)
     print(f"\n── {arm.get('name', aid)} ── {len(train_df)} mẫu · batch {bs}×{accum} · {steps} bước"
+          + (f" · pha `{phase}`" if phase else "")
           + (f" · RESUME từ bước {ckpt_step(resume_from)}" if resume_from else ""), flush=True)
     t0 = time.time()
     if torch.cuda.is_available():
@@ -279,8 +345,11 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict, data_i
                else "decoder" if "language_model" in n else "other")
         area[key] += p.numel()
     print(f"  tham số huấn luyện theo vùng: {area}", flush=True)
+    if not any(area.values()):
+        raise TrainUnusable(f"không có tham số huấn luyện nào: {area}")
     if not (area["vision"] and area["decoder"] and area["projector"]):
-        raise TrainUnusable(f"thiếu adapter ở một vùng (vision/decoder/projector): {area}")
+        print(f"  ⚠ không đủ ba vùng adapter (vision/decoder/projector): {area} — "
+              f"train không ràng buộc nên vẫn chạy", flush=True)
 
     if bool(tcfg.get("gradient_checkpointing", True)):
         model.enable_input_require_grads()
@@ -305,11 +374,13 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict, data_i
         ad.load_state_dict(torch.load(pp, map_location="cpu"))
         print("  ✓ nạp projector adapter từ checkpoint", flush=True)
 
+    if init_dir is not None and not resume_from:
+        _load_old_weights(model, init_dir, pstats)
+
     decay, no_decay = [], []
     for _n, p in model.named_parameters():
         if p.requires_grad:
             (no_decay if p.ndim <= 1 else decay).append(p)
-    sch = dict(tcfg["schedule"])
     wd = float(tcfg.get("weight_decay", 0.03))
     opt = torch.optim.AdamW(
         [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}],
@@ -345,8 +416,9 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict, data_i
     trainer = _SeqTrainer(model=model, args=args, train_dataset=ds,
                           data_collator=lambda b: collate(b, pad_id, None),
                           optimizers=(opt, sched))
-    cbs, ck = _callbacks(tracker, cfg, aid, fail_log, len(ds), bs * accum,
-                         pstats.get("projector_adapter"), bool(ck_cfg.get("push", True)))
+    cbs, ck = _callbacks(tracker, cfg, key, fail_log, len(ds), bs * accum,
+                         pstats.get("projector_adapter"), bool(ck_cfg.get("push", True)),
+                         plan if phase else None)
     ck.model = model
     for cb in cbs:
         trainer.add_callback(cb)
@@ -366,6 +438,8 @@ def _train_once(cfg: Cfg, arm: dict, train_df: pd.DataFrame, index: dict, data_i
     stats = {
         "arm_id": aid, "name": arm.get("name", aid), **pstats,
         "n_train": len(train_df), "n_stream_failed": n_fail, **data_info,
+        "phase": phase, "data_offset": offset, "plan": plan,
+        "warm_start_from": plan.get("init_from"),
         "streaming": True, "sampling": "random_without_replacement",
         "trainable_by_area": area, "steps": steps, "batch_size": bs, "grad_accum": accum,
         "effective_batch": bs * accum,

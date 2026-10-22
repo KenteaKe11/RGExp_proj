@@ -85,6 +85,35 @@ def draw_radar(raw: pd.DataFrame, names: dict[str, str], highlight: str, out_png
     return out_png
 
 
+def _data_lines(ts: dict) -> list[str]:
+    ph = ts.get("phase") or ""
+    plan = ts.get("plan") or {}
+    if ph and plan:
+        lo, hi = plan.get("window", ["?", "?"])
+        return [f"- **Dữ liệu (pha `{ph}`):** {plan.get('n_samples', '?')} mẫu = mẫu [{lo}, {hi}) của "
+                f"hoán vị cố định (SHA-256 `{str(ts.get('order_sha256', '—'))[:16]}…`), STREAMING, "
+                f"không hoàn lại; ảnh lỗi: {ts.get('n_stream_failed', '—')}."]
+    return [f"- **Dữ liệu:** split train ({ts.get('n_train', '?')} mẫu), STREAMING từ Hub, bốc "
+            f"ngẫu nhiên không hoàn lại (hoán vị cố định, SHA-256 "
+            f"`{str(ts.get('order_sha256', '—'))[:16]}…`); ảnh lỗi: {ts.get('n_stream_failed', '—')}."]
+
+
+def _schedule_lines(ts: dict, sch: dict) -> list[str]:
+    plan = ts.get("plan") or {}
+    sch = dict(ts.get("schedule") or sch or {})
+    out = [f"- **Lịch lr (One-cycle):** {sch.get('lr_init')} → {sch.get('max_lr')} → "
+           f"{sch.get('lr_min')} (warm-up tuyến tính {sch.get('pct_start')} số bước, rồi "
+           f"{sch.get('anneal')})."]
+    if plan:
+        out.append(f"- **Số bước One-cycle:** {plan.get('steps')} (warm-up {plan.get('warmup_steps')}, "
+                   f"đỉnh tại bước {plan.get('peak_step')}, anneal {plan.get('anneal_steps')} bước).")
+    if ts.get("phase"):
+        out.append(f"- **Resume trọng số cũ:** pha `{ts['phase']}` xuất phát từ "
+                   f"`{ts.get('warm_start_from')}` (pha cũ `{plan.get('old_phase') or '—'}`); "
+                   f"optimizer/scheduler mới.")
+    return out
+
+
 def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame], names: dict[str, str],
               paired_df: pd.DataFrame, train_stats: list[dict] | None, candidate: str,
               baselines: list[str], eval_info: dict | None = None) -> Path:
@@ -110,16 +139,12 @@ def write_all(cfg: Cfg, run_dir: Path, scores: dict[str, pd.DataFrame], names: d
         f"(alpha {ts.get('alpha', '—')}) ở ba vùng: nửa sau SigLIP, multi-modal projector, "
         "decoder (all linear). Mọi trọng số nền đóng băng, base NF4 4-bit.",
         f"- **Baseline cũ (đối chứng):** {', '.join('`'+names.get(b, b)+'`' for b in baselines)}.",
-        f"- **Dữ liệu:** toàn bộ split train ({ts.get('n_train', '?')} mẫu), 1 epoch, STREAMING từ "
-        f"Hub, bốc ngẫu nhiên không hoàn lại (hoán vị cố định, SHA-256 "
-        f"`{str(ts.get('order_sha256', '—'))[:16]}…`); ảnh lỗi: {ts.get('n_stream_failed', '—')}.",
+        *_data_lines(ts),
         f"- **Tối ưu:** AdamW wd={ts.get('weight_decay', tcfg.get('weight_decay'))}, "
         f"betas={ts.get('betas', [tcfg.get('adam_beta1'), tcfg.get('adam_beta2')])}, "
         f"micro×accum = {ts.get('batch_size', '?')}×{ts.get('grad_accum', '?')} = "
         f"{ts.get('effective_batch', '?')}, {ts.get('steps', '?')} bước.",
-        f"- **Lịch lr (One-cycle):** {sch.get('lr_init')} → {sch.get('max_lr')} → "
-        f"{sch.get('lr_min')} (warm-up tuyến tính {sch.get('pct_start')} số bước, rồi "
-        f"{sch.get('anneal')}).",
+        *_schedule_lines(ts, sch),
         "- **Kiểm định:** mỗi cặp (candidate vs baseline cũ) chạy CẢ Permutation Test "
         f"({st.get('n_perm')} lần) lẫn Paired Bootstrap {str(st.get('ci_method', 'bca')).upper()} "
         f"({st.get('n_boot')} lần); Holm trên các baseline trong từng metric; `significant` = cả "

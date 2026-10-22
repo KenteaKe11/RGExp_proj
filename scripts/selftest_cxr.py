@@ -520,6 +520,157 @@ def t_wiring():
     assert STAGES == ["data", "train", "infer", "score", "stats", "report", "push"]
 
 
+# ── Pha mới (lr mới, resume trọng số cũ) + infer cưỡng bức ───────────────────
+def _fake_adapter(d: Path, proj: bool = True, stats: dict | None = None):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "adapter_model.safetensors").write_bytes(b"w")
+    (d / "adapter_config.json").write_text("{}")
+    if proj:
+        (d / "projector_adapter.pt").write_bytes(b"p")
+        (d / "projector_adapter.json").write_text("{}")
+    if stats is not None:
+        (d / "train_stats.json").write_text(json.dumps(stats))
+
+
+def t_phase_plan():
+    from src import cxr_phase as ph
+
+    sch = {"lr_init": 0.0, "max_lr": 1e-4, "lr_min": 5e-6, "pct_start": 0.1, "anneal": "cos",
+           "steps": 1500}
+    pl = ph.plan_steps(100000, 32, sch, phase="p2", offset=20000)
+    assert pl["steps"] == 1500 and pl["n_samples"] == 48000 and pl["window"] == [20000, 68000]
+    assert pl["warmup_steps"] == 150 and pl["peak_step"] == 150 and pl["anneal_steps"] == 1350
+    assert pl["remaining_after"] == 32000 and not pl["wraps"]
+    txt = ph.describe_plan(pl, sch)
+    assert "1500 bước" in txt and "warm-up 150" in txt and "[20000, 68000)" in txt
+    # khớp công thức lịch lr thật: đỉnh đúng ở bước warm-up
+    from src.cxr_backbone import explicit_lr
+
+    assert abs(explicit_lr(pl["peak_step"], 1500, 0.0, 1e-4, 5e-6, 0.1) - 1e-4) < 1e-15
+    # pha mới mà không khai steps -> dừng, nêu rõ tối đa bao nhiêu bước
+    try:
+        ph.plan_steps(100000, 32, {**sch, "steps": 0}, phase="p2", offset=20000)
+        raise AssertionError("pha không steps phải bị chặn")
+    except ph.PhaseError as e:
+        assert "schedule.steps" in str(e) and "2500" in str(e), str(e)
+    # tràn dữ liệu -> dừng (sẽ lặp mẫu)
+    try:
+        ph.plan_steps(100000, 32, {**sch, "steps": 3000}, phase="p2", offset=20000)
+        raise AssertionError("tràn phải bị chặn")
+    except ph.PhaseError as e:
+        assert "lặp mẫu" in str(e) and "2500" in str(e), str(e)
+    # dry-run (max_steps_override) cho phép lặp
+    assert ph.plan_steps(16, 32, sch, phase="p2", max_steps_override=4)["wraps"]
+    # không pha, steps=0 -> suy từ dữ liệu như cũ
+    old = ph.plan_steps(6400, 32, {**sch, "steps": 0}, phase="")
+    assert old["steps"] == 200 and old["offset"] == 0
+    # offset
+    assert ph.resolve_offset({"warm_start": {"data_offset": "auto"}}, {"old_samples_seen": 6400}) == 6400
+    assert ph.resolve_offset({"warm_start": {"data_offset": 0}}, {"old_samples_seen": 6400}) == 0
+    assert ph.resolve_offset({}, None) == 0
+
+
+def t_phase_weights():
+    from src import cxr_phase as ph
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        odir = root / "cxr_specialist"
+        T0 = {"batch_probe": {"effective_batch": 32}}
+        # thiếu trọng số cũ -> điều kiện duy nhất không thoả -> dừng
+        try:
+            ph.freeze_init(root, "cxr_specialist", "p2", odir, T0)
+            raise AssertionError("không có trọng số cũ phải dừng")
+        except ph.PhaseError as e:
+            assert "trọng số cũ" in str(e)
+        _fake_adapter(odir, stats={"steps": 200, "effective_batch": 32})
+        assert ph.trained_in_phase(odir, "") and not ph.trained_in_phase(odir, "p2")
+        pd_, info = ph.freeze_init(root, "cxr_specialist", "p2", odir, T0)
+        assert ph.weights_ok(pd_) and info["old_samples_seen"] == 6400 and info["old_phase"] == ""
+        # pha mới ghi đè odir; freeze_init lần sau vẫn trả bản cũ (resume không mất điểm xuất phát)
+        (odir / "adapter_model.safetensors").write_bytes(b"NEW")
+        (odir / "train_stats.json").write_text(json.dumps({"phase": "p2", "steps": 1500}))
+        pd2, info2 = ph.freeze_init(root, "cxr_specialist", "p2", odir, T0)
+        assert pd2 == pd_ and (pd2 / "adapter_model.safetensors").read_bytes() == b"w"
+        assert info2["old_samples_seen"] == 6400
+        assert ph.trained_in_phase(odir, "p2") and not ph.trained_in_phase(odir, "p3")
+        # pha 3 xuất phát từ kết quả pha 2 và cộng dồn số mẫu đã thấy
+        _, i3 = ph.freeze_init(root, "cxr_specialist", "p3", odir, T0)
+        assert i3["old_phase"] == "p2"
+        assert ph.ckpt_key("a", "p2") == "a__p2" and ph.ckpt_key("a", "") == "a"
+
+
+def t_force_infer_weights_and_purge():
+    from src import cxr_phase as ph
+    from src import resume as resume_mod
+    from src.config import load_config
+    from src.run_cxr import DEFAULT_CONFIG
+
+    cfg = load_config(str(DEFAULT_CONFIG), [])
+    cfg["output"]["push"] = False
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        odir, croot = root / "ad" / "cxr_specialist", root / "ad" / "_ckpt" / "cxr_specialist"
+        # 1) không có gì -> PhaseError nêu nơi đã tìm
+        try:
+            ph.ensure_infer_weights(cfg, "cxr_specialist", odir, croot, {}, True)
+            raise AssertionError("phải dừng")
+        except ph.PhaseError as e:
+            assert "trọng số cũ" in str(e) and "checkpoint" in str(e)
+        # 2) chỉ có checkpoint dở (không train_stats, không train xong) -> vẫn infer được
+        ck = croot / "checkpoint-400"
+        _fake_adapter(ck, stats=None)
+        (ck / "trainer_state.json").write_text("{}")
+        (ck / "optimizer.pt").write_bytes(b"o")
+        src = ph.ensure_infer_weights(cfg, "cxr_specialist", odir, croot, {}, True)
+        assert src == "checkpoint:checkpoint-400" and ph.weights_ok(odir)
+        assert not (odir / "train_stats.json").exists(), "không được giả train_stats"
+        # 3) adapter cục bộ có sẵn -> dùng thẳng, không đụng gì
+        assert ph.ensure_infer_weights(cfg, "cxr_specialist", odir, croot, {}, True) == "local"
+        # 4) purge: gạt dự đoán cũ + xoá dấu 'đã xong' trong metadata
+        run = root / "run"
+        pp = run / "predictions" / "cxr_specialist.jsonl"
+        pp.parent.mkdir(parents=True)
+        pp.write_text("".join(json.dumps({"key": f"k{i}", "pred": "x"}) + "\n" for i in range(5)))
+        mp = run / resume_mod.meta_name(cfg)
+        resume_mod.write_meta(mp, {"version": resume_mod.META_VERSION, "models": {
+            "cxr_specialist": {"done_keys": ["k0"]}, "gemma3_baseline": {"done_keys": ["k1"]}}})
+        assert ph.purge_predictions(cfg, pp, run, "cxr_specialist", push=False) == 5
+        assert pp.exists() and pp.read_text() == ""
+        assert len(list((run / "predictions" / "_stale").glob("cxr_specialist.*.jsonl"))) == 1
+        m = resume_mod.load_meta(mp)
+        assert "cxr_specialist" not in m["models"] and "gemma3_baseline" in m["models"]
+        assert resume_mod.read_pred_rows(pp) == {}
+
+
+def t_force_infer_wiring():
+    import ast
+
+    rc = (ROOT / "src" / "run_cxr.py").read_text(encoding="utf-8")
+    ast.parse(rc)
+    assert '"--force-infer"' in rc
+    # stage cưỡng bức: có infer/score/stats/report, KHÔNG có train
+    seg = rc[rc.index("if force:\n        # Cưỡng bức"):]
+    seg = seg[:seg.index("a.rescore = True")]
+    for st in ("infer", "score", "stats", "report"):
+        assert f'"{st}"' in seg, st
+    assert '"train"' not in seg
+    # train không còn bị ràng buộc cứng
+    assert "chỉ chạy 1 epoch" not in rc and "candidate phải là QDoRA rank 4" not in rc
+    # runner: infer chỉ cần trọng số
+    rn = (ROOT / "src" / "runners" / "gemma3_adapter.py").read_text(encoding="utf-8")
+    assert 'self.mcfg.get("weights_only")' in rn
+    # train theo pha: checkpoint riêng + kế hoạch + nạp trọng số cũ
+    ct = (ROOT / "src" / "cxr_train.py").read_text(encoding="utf-8")
+    assert "_load_old_weights" in ct and "plan_steps" in ct and "ckpt_key" in ct
+    # config mặc định: không pha -> hành vi cũ nguyên vẹn
+    assert T.get("phase", "") == "" and int(T["schedule"].get("steps", 0)) == 0
+    from src import cxr_phase as ph
+
+    assert ph.phase_of(T) == ""
+    from src.run_cxr import main as _m  # noqa: F401  (import không lỗi)
+
+
 def main() -> int:
     hr("1. Cấu hình")
     check("Config đúng yêu cầu (r4, lr, wd, betas, 32, toàn tập, stream, K/E)", t_config)
@@ -547,6 +698,12 @@ def main() -> int:
     check("Tương thích dự đoán cũ (prompt/decode/n_test)", t_reuse_compat)
     hr("8. Dây nối")
     check("Hook backbone, SequentialSampler, checkpoint ngoài adapter, stages", t_wiring)
+
+    hr("9. Pha mới + infer cưỡng bức")
+    check("Kế hoạch One-cycle: số bước tường minh, cửa sổ dữ liệu, chặn thiếu steps/tràn mẫu", t_phase_plan)
+    check("Trọng số cũ: chốt điểm xuất phát, idempotent, chặn khi không có", t_phase_weights)
+    check("Cưỡng bức: chỉ cần trọng số (adapter/Hub/checkpoint), gạt dự đoán cũ + metadata", t_force_infer_weights_and_purge)
+    check("Dây nối: --force-infer bỏ train, train hết ràng buộc cứng, config mặc định giữ nguyên", t_force_infer_wiring)
 
     hr("TỔNG KẾT")
     print(f"PASS: {PASS}  |  FAIL: {FAIL}")

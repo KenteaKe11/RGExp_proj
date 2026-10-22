@@ -46,14 +46,23 @@ class Gemma3AdapterRunner(Gemma3Runner):
                 f"không thấy adapter ở {adapter_dir}. Chạy stage `train` trước, "
                 f"hoặc `--stages train,infer,...`.")
         stats_path = adapter_dir / "train_stats.json"
-        if not stats_path.exists():
+        if not stats_path.exists() and self.mcfg.get("weights_only"):
+            # Infer cưỡng bức: chỉ cần TRỌNG SỐ. Suy các tham số nạp từ config + file adapter,
+            # không đòi train_stats.json (không phụ thuộc train xong hay chưa).
+            tq = (self.cfg.get("train", {}) or {}).get("quant", {}) or {}
+            stats = {"quantized": bool(tq.get("load_in_4bit", True)),
+                     "projector_adapter": (adapter_dir / "projector_adapter.json").exists()}
+            print(f"  ⚠ {adapter_dir.name}: không có train_stats.json — infer cưỡng bức "
+                  f"dùng trọng số + config hiện tại (quantized={stats['quantized']})", flush=True)
+        elif not stats_path.exists():
             # Không có file này nghĩa là lần huấn luyện trước chết giữa lúc ghi.
             # Adapter cụt nạp được nhưng sinh ra rác, và rác đó sẽ thành một cột
             # số trông như kết quả thật trong bảng tám arm.
             raise RunnerUnusable(
                 f"{adapter_dir} thiếu train_stats.json — adapter ghi dở. Xoá thư "
                 f"mục đó rồi chạy lại stage `train`.")
-        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        else:
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
 
         # NGUỒN SỰ THẬT là file thống kê của lần huấn luyện, không phải config
         # hiện tại: config có thể đã bị --set sửa từ lần train tới lần infer.

@@ -63,6 +63,44 @@ BERTScore (~0.85) khác thang. Radar cho thấy **hình dạng** và thứ hạn
 phải độ lớn tuyệt đối — số thô nằm trong REPORT.md và `radar_data.csv`. `*` trên nhãn trục =
 khác biệt có ý nghĩa (Perm ∧ Boot, Holm) và đủ lớn (|dz| ≥ ngưỡng).
 
+## Pha mới (lr mới) và infer cưỡng bức
+
+**Train không bị ràng buộc.** Muốn đổi lr mà vẫn One-cycle, đặt `train.phase` và **khai rõ số
+bước** `train.schedule.steps` (bắt buộc khi có `phase`; thiếu ⇒ dừng, báo tối đa bao nhiêu bước
+không lặp mẫu). Pha mới nạp **trọng số cũ** (adapter + projector) rồi chạy One-cycle mới với
+optimizer/scheduler mới — không lấy lại optimizer/scheduler/lr của checkpoint cũ.
+
+```bash
+bash scripts/run_cxr.sh --detach \
+  --set train.phase=p2 --set train.schedule.steps=1500 \
+  --set train.schedule.max_lr=1e-4 --set train.schedule.lr_min=5e-6
+```
+
+* Trước khi chạy in ra: số bước, warm-up (`round(pct_start × steps)`), bước đỉnh, số bước anneal,
+  cửa sổ dữ liệu `[offset, offset + steps × 32)` của hoán vị cố định, số mẫu còn lại.
+* `warm_start.data_offset: auto` ⇒ đi tiếp trên mẫu **chưa thấy** (offset = bước × 32 của pha cũ).
+  Cửa sổ tràn tập train ⇒ dừng (sẽ lặp mẫu).
+* Trọng số cũ được chốt vào `adapters_cxr_special/_prev/<arm>__<phase>/` (đẩy lên Hub nếu push bật);
+  checkpoint của pha ở `_ckpt/<arm>__<phase>/` và `checkpoints/<arm>__<phase>/last` trên Hub —
+  shutdown giữa chừng: chạy lại cùng lệnh, kế hoạch (số bước, cửa sổ dữ liệu) lấy từ checkpoint.
+* Xong train, dự đoán cũ của candidate bị gạt (`predictions/_stale/`, Hub nhận file rỗng) để infer
+  không tưởng "đã đủ".
+* Ràng buộc còn lại duy nhất của pha: **cùng rank và cùng nhóm module** với adapter cũ (khác shape
+  thì không nạp được trọng số; khoá lạ ⇒ dừng, nêu rõ).
+
+**Infer cưỡng bức** — `--force-infer [cand|all|ID,..]`:
+
+```bash
+bash scripts/run_cxr.sh --force-infer          # chỉ candidate
+bash scripts/run_cxr.sh --force-infer all      # thêm baseline gốc
+```
+
+Luôn chạy **infer → score → stats → report** (+ push nếu bật), **không** có stage train, **không**
+`scan_and_restore`, **không** đòi `train_stats.json`/"train xong", ghi đè dự đoán cũ của model bị ép
+(bản cũ vào `predictions/_stale/`), chấm lại điểm model bị ép. **Điều kiện duy nhất** là có bộ
+trọng số cũ, tìm theo thứ tự: adapter cục bộ → `adapters/<arm>` trên Hub → checkpoint gần nhất
+(cục bộ, rồi Hub). Không thấy ⇒ dừng (mã 6) và liệt kê nơi đã tìm.
+
 ## Giả định cần bạn xác nhận
 
 1. `pct_start = 0.1` (warm-up 10% số bước): yêu cầu chỉ nêu lr_init/peak/min, mức này giữ từ §2.6.
