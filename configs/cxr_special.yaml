@@ -146,13 +146,13 @@ train:
   schedule:
     impl: explicit
     lr_init: 0.0
-    max_lr: 1.0e-4
+    max_lr: 2.0e-4
     lr_min: 1.0e-5
     pct_start: 0.1
     anneal: cos
     # Số bước One-cycle tường minh. 0 = suy từ dữ liệu (1 epoch trên toàn tập, như cũ).
     # BẮT BUỘC > 0 khi đặt `phase`: pha mới phải nêu rõ cần bao nhiêu bước.
-    steps: 100
+    steps: 0
 
   # ── PHA MỚI: lr mới + resume từ trọng số cũ (train không ràng buộc) ─────────────
   # phase: ""   -> chạy như cũ (1 One-cycle từ đầu, resume checkpoint nếu có).
@@ -162,7 +162,7 @@ train:
   #               trọng số cũ được sao vào `adapters_cxr_special/_prev/<arm>__<phase>/`.
   #   Ví dụ:  --set train.phase=p2 --set train.schedule.max_lr=1e-4 \
   #           --set train.schedule.lr_min=5e-6 --set train.schedule.steps=1500
-  phase: p2
+  phase: ""
   warm_start:
     # 'auto' = đi tiếp trên mẫu CHƯA THẤY của hoán vị cố định (offset = số mẫu pha cũ đã
     # đi qua); hoặc một số nguyên (số mẫu bỏ qua đầu hoán vị). Cửa sổ dữ liệu của pha là
@@ -203,7 +203,7 @@ train:
 
   # Checkpoint để sống sót qua shutdown máy thuê (adapter+optimizer+scheduler+vị trí dữ liệu)
   checkpoint:
-    save_steps: 100
+    save_steps: 200
     keep_last: 1
     push: true
 
