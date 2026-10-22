@@ -267,4 +267,4 @@ output:
 resume:
   meta_name: infer_scan_meta.json
   meta_every: 100
-  push_every: 500
+  push_every: 100
