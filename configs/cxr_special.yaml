@@ -131,8 +131,8 @@ generate:
 
 train:
   n_epochs: 1
-  per_device_batch_size: 8     # micro_batch
-  grad_accum: 4               # micro × accum = 32
+  per_device_batch_size: 2     # micro_batch
+  grad_accum: 16               # micro × accum = 32
   max_seq_len: 1024
   gradient_checkpointing: true
   weight_decay: 0.03
@@ -146,9 +146,9 @@ train:
   schedule:
     impl: explicit
     lr_init: 0.0
-    max_lr: 1.0e-4
-    lr_min: 3.0e-6
-    pct_start: 0.05
+    max_lr: 2.0e-4
+    lr_min: 1.0e-5
+    pct_start: 0.1
     anneal: cos
 
   # Nhiều nhóm module (thay cho target_modules đơn của §2.6)
@@ -185,7 +185,7 @@ train:
 
   # Checkpoint để sống sót qua shutdown máy thuê (adapter+optimizer+scheduler+vị trí dữ liệu)
   checkpoint:
-    save_steps: 100
+    save_steps: 200
     keep_last: 1
     push: true
 
