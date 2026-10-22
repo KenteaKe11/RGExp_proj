@@ -450,7 +450,7 @@ def t_report_and_radar():
     pdf = compare_new_vs_baselines(sc, COLS, st, "cxr_specialist", ["gemma3_baseline", "vision_lora_r4"])
     with tempfile.TemporaryDirectory() as td:
         ts = [{"arm_id": "cxr_specialist", "rank": 4, "alpha": 8, "n_train": 150000, "steps": 4688,
-               "batch_size": 2, "grad_accum": 16, "effective_batch": 32, "weight_decay": 0.03,
+               "batch_size": 4, "grad_accum": 8, "effective_batch": 32, "weight_decay": 0.03,
                "betas": [0.9, 0.95], "order_sha256": "ab" * 32, "n_stream_failed": 0,
                "schedule": T["schedule"]}]
         md = report_cxr.write_all(CFG, Path(td), sc, names, pdf, ts, "cxr_specialist",
