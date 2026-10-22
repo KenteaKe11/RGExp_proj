@@ -90,3 +90,10 @@ accelerate>=0.34.0
 
 # Tuỳ chọn: đọc dataset nhanh hơn nếu về sau đổi sang datasets.Dataset.
 # datasets>=2.20.0
+# ─────────────────────────────────────────────────────────────────────────────
+# §2.7 — CXR Specialization
+# requests: stream ảnh train bằng HTTP Range từ img_dir.zip trên Hub (src/stream_data.py)
+# matplotlib: biểu đồ mạng nhện (radar) trong REPORT.md
+# ─────────────────────────────────────────────────────────────────────────────
+requests>=2.31.0
+matplotlib>=3.7.0

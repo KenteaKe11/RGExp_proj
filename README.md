@@ -1,3 +1,86 @@
+# RGExp — §2.7: CXR Specialization (General → CXR) trên Gemma 3 4B-it
+
+Biến Gemma 3 4B-it (miền general/ImageNet) thành **CXR Specialist**, dùng làm checkpoint
+chất lượng cao cho MoE (baseline mới). Kế thừa kết luận §2.6: QDoRA rank 4. Hai tham số
+MoE **K=6, E=10** chỉ được ghi nhận trong config (`downstream_moe`), §2.7 không dùng chúng.
+
+```bash
+python scripts/selftest_cxr.py          # không GPU, không Gemma (stream HTTP Range thật trên server giả)
+bash scripts/run_cxr.sh --dry-run       # 8 ảnh test · 16 mẫu train (stream) · 4 bước
+bash scripts/run_cxr.sh --detach        # chạy chính thức, nền
+```
+
+| Hạng mục | Cài đặt (`configs/cxr_special.yaml`) |
+|:--|:--|
+| Adapter | QDoRA **r=4** (alpha 8, alpha/r = 2.0), base NF4 |
+| Vùng gắn | **SigLIP nửa sau** (lớp 14..26: q/k/v/out_proj, 52 module) · **projector** (DoRA bằng forward-hook) · **decoder only, all linear** (q/k/v/o/gate/up/down × 34 lớp = 238 module; không đụng `lm_head`) |
+| Dữ liệu | **toàn bộ** split train (`n_train: 0`), 1 epoch, **streaming** |
+| Bốc mẫu | hoán vị cố định theo seed ⇒ **ngẫu nhiên, không hoàn lại** (mỗi mẫu đúng một lần) |
+| LR | One-cycle: `lr_init=0` → `peak=2e-4` → `min=1e-5` (warm-up tuyến tính, rồi cosine) |
+| Tối ưu | AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`, micro × accum = **32** (2×16, tự tụt nấc khi OOM nhưng luôn giữ 32) |
+| Kiểm định | **Permutation** + **Paired Bootstrap (BCa)**, candidate vs baseline cũ, Holm trên các baseline trong từng metric, `significant` = cả hai cùng bác H0 và \|dz\| ≥ 0.10 |
+| Báo cáo | `REPORT.md`, `radar.png` (mạng nhện 8 metric), `radar_data.csv`, `summary.json` |
+
+## Streaming nghĩa là gì ở đây
+
+Ảnh train **không** được tải về và **không** ghi đĩa. `src/stream_data.py` đọc central
+directory của `img_dir.zip` một lần (chỉ mục lưu ở `data/_stream_index.json`), rồi mỗi ảnh
+là **một HTTP Range request** tới `…/resolve/main/img_dir.zip` (tự parse local header, giải
+nén stored/deflate trong RAM). Ảnh được resize + JPEG q92 **giống hệt** ảnh test đã cache để
+hai miền không lệch nhau. DataLoader dùng `stream.num_workers` tiến trình (mỗi tiến trình một
+phiên HTTP). Chỉ **ảnh test** (3000) được tải về cache, vì cần cho infer.
+
+* Thứ tự = hoán vị cố định, lưu ở `runs/2.7_cxr_special/stream_order.json` kèm SHA-256 tập
+  key; Trainer dùng `SequentialSampler` nên **không xáo lại**. Đổi tập key/seed mà giữ file
+  cũ ⇒ dừng (resume trên hoán vị khác là lặp/bỏ mẫu).
+* Rò rỉ train ∩ test ≠ ∅ ⇒ dừng (mã 4), trước khi đọc một byte ảnh.
+* >2% ảnh lỗi (`stream.max_failed_frac`) hoặc 16 mẫu liên tiếp lỗi ⇒ dừng, không huấn luyện
+  lặng lẽ trên phần còn lại. Ảnh lỗi ghi ở `stream_failures.jsonl`.
+* Cần Linux (DataLoader fork). Máy cần mạng ổn định tới Hub trong **suốt** lúc train; thiếu
+  mạng thì chạy lại — checkpoint cho phép đi tiếp.
+
+## Checkpoint & resume (một epoch trên cả tập train = hàng nghìn bước)
+
+Mỗi `train.checkpoint.save_steps` (200) bước: adapter + optimizer + scheduler + RNG + projector
+adapter, lưu ở `adapters_cxr_special/_ckpt/cxr_specialist/` (ngoài thư mục adapter) và đẩy lên
+`2.7_cxr_special/checkpoints/cxr_specialist/last`. Chạy lại cùng lệnh sau shutdown ⇒ kéo
+checkpoint mới nhất, đi tiếp đúng bước; vị trí dữ liệu suy ra từ số bước × 32 mẫu nên **không**
+đọc lại ảnh đã qua. `--retrain` bỏ adapter + checkpoint, train lại từ đầu.
+
+## So với baseline cũ
+
+Candidate được so với **mỗi** baseline cũ: `gemma3_baseline` (Gemma 3 zero-shot, đối chứng
+chính, quyết định dấu của `*` trên radar) và `vision_lora_r4` (§2.6). Dự đoán của chúng được
+**kéo từ Hub** `2.6_vision_lora/predictions/` (cùng 3000 ảnh test), không infer lại — nhưng
+chỉ khi `config.resolved.yaml` của §2.6 trên Hub khớp `prompt`, `generate`, `image_policy`,
+`image_max_side`, `n_test` của config này; lệch ⇒ không dùng lại. Baseline bổ sung nào không
+phủ đủ tập test thì bị bỏ khỏi so sánh kèm cảnh báo. Δ = candidate − baseline (dương = candidate hơn).
+
+## Radar đọc thế nào
+
+Mỗi trục chuẩn hoá theo mô hình tốt nhất trên trục đó (best = 1.0), vì BLEU-4 (~0.03) và
+BERTScore (~0.85) khác thang. Radar cho thấy **hình dạng** và thứ hạng tương đối, **không**
+phải độ lớn tuyệt đối — số thô nằm trong REPORT.md và `radar_data.csv`. `*` trên nhãn trục =
+khác biệt có ý nghĩa (Perm ∧ Boot, Holm) và đủ lớn (|dz| ≥ ngưỡng).
+
+## Giả định cần bạn xác nhận
+
+1. `pct_start = 0.1` (warm-up 10% số bước): yêu cầu chỉ nêu lr_init/peak/min, mức này giữ từ §2.6.
+2. `alpha/r = 2.0` (alpha 8) như §2.6.
+3. "Baseline cũ" = Gemma 3 zero-shot **và** QDoRA r4 của §2.6 (nếu chỉ muốn một, xoá mục `extra`
+   trong `reuse_predictions`).
+4. Weight decay 0.03 áp cho ma trận A/B; vector magnitude của DoRA và bias không decay (như §2.6).
+5. Không có tập val trong lúc train (`n_val: 0`): loss train là tín hiệu duy nhất; đánh giá nằm ở 3000 ảnh test.
+
+**Chưa được chạy thật:** môi trường viết code không có GPU, torch, Gemma hay mạng tới Hub.
+Selftest kiểm được streaming (zip giả + HTTP Range server thật), hoán vị, lịch lr, chọn module,
+thống kê, radar/report. Phần cần GPU (peft DoRA 4-bit trên decoder, resume của Trainer) chỉ được
+kiểm bằng `--dry-run` trên máy thuê — hãy chạy nó trước.
+
+---
+
+# (Tài liệu §2.6 — thí nghiệm trước, giữ nguyên bên dưới)
+
 # RGExp — §2.6: Vision QDoRA (SigLIP + Projector) trên Gemma 3 4B-it
 
 Repo này chạy **một** thí nghiệm tại một thời điểm. Thí nghiệm đang mở là

@@ -189,6 +189,11 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
     Nên: duyệt named_modules() thật, giữ những module vừa khớp hậu tố vừa nằm
     dưới một tiền tố ngôn ngữ, và loại thẳng những gì nằm dưới tiền tố vision.
     """
+    if tcfg.get("target_groups"):                      # §2.7: nhiều vùng, luật riêng từng vùng
+        from .cxr_backbone import find_target_groups
+
+        return find_target_groups(model, tcfg)
+
     import torch.nn as nn
 
     suffixes = tuple(str(s) for s in tcfg.get("target_modules", []))
@@ -327,6 +332,10 @@ def build_scheduler(optimizer, total_steps: int, scfg: dict):
     3.33e-6 -> 1e-4 -> 3.33e-7. Mỗi nhóm khi đó có hệ số riêng (một LambdaLR
     với danh sách hàm).
     """
+    if str(scfg.get("impl", "lambda")).lower() == "explicit":   # §2.7: lr_init/peak/min tuyệt đối
+        from .cxr_backbone import build_explicit_scheduler
+
+        return build_explicit_scheduler(optimizer, total_steps, scfg)
     impl = str(scfg.get("impl", "lambda")).lower()
     pct = float(scfg.get("pct_start", 0.1))
     dv = float(scfg.get("div_factor", 25.0))
@@ -451,12 +460,18 @@ class ReportDataset:
             f"{self.max_len}: phần prompt (gồm token ảnh) đã dài hơn thế. "
             f"Tăng train.max_seq_len rồi chạy lại.")
 
+    def _load_image(self, row):
+        """Ảnh PIL RGB của một dòng. Lớp con (stream) ghi đè để đọc thẳng từ Hub."""
+        from PIL import Image
+
+        return Image.open(row["image_path"]).convert("RGB")
+
     def _encode(self, i: int) -> dict | None:
         import torch
         from PIL import Image
 
         row = self.df.iloc[i]
-        img = Image.open(row["image_path"]).convert("RGB")
+        img = self._load_image(row)
 
         prompt_only = self.proc.apply_chat_template(
             self._messages(img, None), add_generation_prompt=True, tokenize=True,

@@ -1,0 +1,252 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.7 — CXR SPECIALIZATION: General Model (Gemma 3 4B-it) -> CXR Model
+# ═════════════════════════════════════════════════════════════════════════════
+# Mục tiêu: finetune Gemma 3 4B-it từ miền ImageNet/general sang miền CXR, dùng
+# làm CHECKPOINT CHẤT LƯỢNG CAO cho MoE (baseline mới). Kế thừa kết luận §2.6:
+#   [1] Gemma3-4b-it   [2][3] QDoRA rank 4   [4] MoE: K=6, E=10 (chỉ ghi nhận ở
+#   đây — bước MoE nằm SAU checkpoint này, config này không dùng K/E để huấn luyện).
+#
+# Thiết kế:
+#   - QDoRA r=4 (alpha/r = 2.0) gắn vào:
+#       · NỬA SAU Vision Encoder (SigLIP lớp 14..26): q/k/v/out_proj
+#       · Multi-modal projector: adapter DoRA gắn bằng forward-hook
+#       · DECODER ONLY: ALL LINEAR (q,k,v,o,gate,up,down) mọi lớp; không đụng lm_head
+#   - One-cycle LR: lr_init=0 -> peak 2e-4 -> min 1e-5 (điểm tuyệt đối, không div_factor)
+#   - AdamW: wd=0.03, betas=(0.9, 0.95), micro_batch × accum = 32
+#   - TOÀN BỘ tập train, 1 epoch, STREAMING: bốc ngẫu nhiên KHÔNG HOÀN LẠI,
+#     đọc ảnh trực tiếp từ img_dir.zip trên Hub (HTTP Range), KHÔNG tải về đĩa.
+#   - Kiểm định: Permutation + Paired Bootstrap vs baseline cũ; radar chart.
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+experiment: "2.7"
+mode: adapter
+
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  cache_dir: ./data            # chỉ chứa ảnh TEST + manifest; ảnh train KHÔNG vào đây
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  cpu_workers: 0
+  stream_connections: 4
+  train_split_csv: split_ref/train_split.csv
+  n_train: 0                   # 0 = TOÀN BỘ split train
+  n_val: 0
+  assert_no_leak: true
+
+# ── Streaming tập train (src/stream_data.py) ──────────────────────────────────
+stream:
+  enabled: true
+  num_workers: 8               # tiến trình DataLoader, mỗi tiến trình một phiên HTTP
+  prefetch_factor: 4
+  timeout_s: 60
+  retries: 5
+  index_cache: ./data/_stream_index.json   # {key: [offset, comp_size, method, name]}
+  order_file: stream_order.json            # hoán vị cố định (tái lập + resume)
+  max_failed_frac: 0.02        # >2% ảnh lỗi -> dừng, không train lặng lẽ trên phần còn lại
+
+image_policy:
+  unified: true
+  resize_to: 512
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  per_model_normalize_only: true
+
+# ── Baseline cũ (đối chứng) ─────────────────────────────────────────────────
+baseline:
+  enabled: true
+  id: gemma3_baseline
+  name: "Gemma 3 4B-it (general, baseline cũ)"
+
+# Dự đoán đã có sẵn của các mô hình cũ trên Hub (cùng 3000 ảnh test, cùng prompt/decode):
+# kéo về thay vì infer lại. Mô hình nào thiếu trên Hub thì baseline gốc sẽ infer lại,
+# còn `extra` bị bỏ kèm cảnh báo.
+reuse_predictions:
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  subdir: "2.6_vision_lora"
+  models:
+    gemma3_baseline: "Gemma 3 4B-it (general, baseline cũ)"
+  extra:                                   # baseline cũ bổ sung (chỉ so sánh, không infer)
+    vision_lora_r4: "Vision QDoRA r4 (§2.6)"
+
+# ── Candidate MỚI ────────────────────────────────────────────────────────────
+arms:
+  - id: cxr_specialist
+    name: "CXR Specialist (QDoRA r4: ViT nửa sau + projector + decoder all-linear)"
+    method: qdora
+    rank: 4
+    enabled: true
+
+# Ghi nhận cho bước sau (KHÔNG dùng ở §2.7)
+downstream_moe:
+  K: 6
+  E: 10
+
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_adapter
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 4
+  device_map_train: single
+  device_map_infer: auto
+  merge_adapter: false
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+# GIỮ NGUYÊN prompt + decode của §2.6 để dự đoán cũ so được trực tiếp.
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 3
+  length_penalty: 1.0
+  early_stopping: false
+  no_repeat_ngram_size: 0
+  repetition_penalty: 1.0
+  num_return_sequences: 1
+
+train:
+  n_epochs: 1
+  per_device_batch_size: 2     # micro_batch
+  grad_accum: 16               # micro × accum = 32
+  max_seq_len: 1024
+  gradient_checkpointing: true
+  weight_decay: 0.03
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  logging_steps: 10
+
+  # One-cycle với ĐIỂM TUYỆT ĐỐI. pct_start không được chỉ định trong yêu cầu:
+  # giữ 0.1 như §2.6 (warm-up tuyến tính 10% số bước, rồi cosine xuống lr_min).
+  schedule:
+    impl: explicit
+    lr_init: 0.0
+    max_lr: 2.0e-4
+    lr_min: 1.0e-5
+    pct_start: 0.1
+    anneal: cos
+
+  # Nhiều nhóm module (thay cho target_modules đơn của §2.6)
+  target_groups:
+    - name: vision_second_half
+      include_prefixes: [vision_tower]
+      target_modules: [q_proj, k_proj, v_proj, out_proj]
+      layers_from: second_half
+    - name: decoder_all_linear
+      include_prefixes: [language_model]
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+      layers_from: all
+  exclude_prefixes: [multi_modal_projector, lm_head]
+  projector_adapter:
+    enabled: true
+    dora: true
+  task_type: null
+
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+  batch_probe:
+    effective_batch: 32
+    min_batch_size: 1
+
+  # Checkpoint để sống sót qua shutdown máy thuê (adapter+optimizer+scheduler+vị trí dữ liệu)
+  checkpoint:
+    save_steps: 200
+    keep_last: 1
+    push: true
+
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  primary: bertscore_f1
+
+# Candidate mới vs MỖI baseline cũ: Permutation + Paired Bootstrap (BCa), Holm trên
+# các baseline trong từng metric.
+stats:
+  alpha: 0.05
+  n_boot: 10000
+  n_perm: 10000
+  ci: 0.95
+  ci_method: bca
+  dz_floor: 0.10
+  pairs: vs_reference
+  reference: gemma3_baseline
+  adjust: holm
+  adjust_scope: pairs
+
+radar:
+  enabled: true
+  metrics: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1]
+
+wandb:
+  enabled: true
+  project: rgexp-cxr-special
+  entity: null
+  run_name: null
+  group: "section2.7"
+  resume_same_run: true
+  mode: online
+  tags: [section2.7, cxr_specialization, qdora_r4, gemma3, streaming, mimic-cxr]
+  notes: "General -> CXR specialization, QDoRA r4 (ViT 2nd half + projector + decoder all-linear)"
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  subdir: "2.7_cxr_special"
+  adapter_dir: ./adapters_cxr_special
+  ft_suffix: "_ft"
+
+resume:
+  meta_name: infer_scan_meta.json
+  meta_every: 100
+  push_every: 500
