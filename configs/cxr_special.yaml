@@ -131,8 +131,8 @@ generate:
 
 train:
   n_epochs: 1
-  per_device_batch_size: 2     # micro_batch
-  grad_accum: 16               # micro × accum = 32
+  per_device_batch_size: 8     # micro_batch
+  grad_accum: 4               # micro × accum = 32
   max_seq_len: 1024
   gradient_checkpointing: true
   weight_decay: 0.03
