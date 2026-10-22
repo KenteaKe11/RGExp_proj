@@ -261,7 +261,7 @@ output:
   hub_private: true
   push: true
   subdir: "2.7_cxr_special"
-  adapter_dir: ./adapters_cxr_special
+  adapter_dir: ./2.7_cxr_special/checkpoints/cxr_specialist
   ft_suffix: "_ft"
 
 resume:
