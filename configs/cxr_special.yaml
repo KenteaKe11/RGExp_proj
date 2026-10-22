@@ -102,7 +102,7 @@ base:
   attn_implementation_train: eager
   attn_implementation_infer: sdpa
   disable_compile: auto
-  batch_size: 12
+  batch_size: 10
   device_map_train: single
   device_map_infer: auto
   merge_adapter: false
