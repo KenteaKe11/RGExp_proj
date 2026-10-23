@@ -24,7 +24,7 @@ data:
   key_column: img_rel
   ref_column: text_gt
   n_test: 3000
-  n_train: 0                 # bài báo: 6.400 study. 0 = toàn bộ split train
+  n_train: 32000                 # bài báo: 6.400 study. 0 = toàn bộ split train
   n_val: 512                    # bài báo: 512 study chỉ để chọn checkpoint
   cache_dir: ./data
   image_max_side: 512
