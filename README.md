@@ -1,8 +1,8 @@
 # RGExp — §2.7: CXR Specialization (General → CXR) trên Gemma 3 4B-it
 
-Biến Gemma 3 4B-it (miền general/ImageNet) thành **CXR Specialist**, cung cấp các checkpoint chuyên biệt chất lượng cao làm tiền đề cho MoE. **Toàn bộ huấn luyện diễn ra trước khi đụng tới MoE.**
+Biến Gemma 3 4B-it (miền general/ImageNet) thành **CXR Specialist**, cung cấp các checkpoint chuyên biệt chất lượng cao làm tiền đề cho MoE. Kế thừa kết luận từ §2.6 (QDoRA rank 4). **Toàn bộ huấn luyện diễn ra trước khi đụng tới MoE.**
 
-> **Lưu ý cấu trúc:** Thử nghiệm §2.8 (Recombinator + ASL Loss) đã được gộp trực tiếp vào §2.7 dưới dạng **Candidate C**. Dùng chung 1 pipeline và setup huấn luyện thống nhất. Đánh giá đối sánh chỉ so với **1 baseline duy nhất** (`gemma3_baseline`).
+> **Lưu ý cấu trúc:** Thử nghiệm §2.8 (Recombinator + ASL Loss) đã được gộp trực tiếp vào §2.7 dưới dạng **Candidate C**. File `README_2.8.md` đã bị xóa để tránh phân tán logic, dùng chung 1 pipeline và setup huấn luyện thống nhất.
 
 ---
 
@@ -21,7 +21,7 @@ Quá trình này sinh ra **3 Candidate** trên cùng 1 tập huấn luyện 6,40
    - QDoRA rank 4 cho toàn bộ 34 lớp Decoder.
 
 3. **Candidate C (`cand_c_recombinator` / Vision + decoder + Recombinator):**
-   - Kết hợp Candidate B + Recombinator module (Candidate C của §2.7).
+   - Kết hợp Candidate B + Recombinator module (gộp §2.7 và §2.8).
    - Tích hợp 64 visual token Recombinator đọc trực tiếp patch feature từ SigLIP trước khi qua backbone adapter.
    - Sử dụng Dual-head summary + Pathology Classification Head với 14 nhãn CheXpert.
    - **Hàm tổn thất kết hợp:** $\mathcal{L} = \mathcal{L}_{\text{CE}} + 0.5 \times \mathcal{L}_{\text{ASL}}$ (Cross-Entropy cho sinh báo cáo + 0.5 × Asymmetric Loss cho phân loại tổn thương).
@@ -40,7 +40,6 @@ Tất cả 3 candidate dùng chung 1 cấu hình huấn luyện chuẩn hóa:
 | **Tốc độ học (LR)** | One-cycle: `lr_init=0` $\rightarrow$ `peak=2e-4` $\rightarrow$ `min=1e-5` (10% warm-up, cosine decay) |
 | **Tối ưu hóa** | AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`, effective batch size = **32** (2 × 16) |
 | **Loss Cand C** | $\mathcal{L} = \mathcal{L}_{\text{CE}} + 0.5 \times \mathcal{L}_{\text{ASL}}$ ($\gamma_+=0, \gamma_-=4/3/0, m=0.05$) |
-| **Baseline Duy Nhất** | **Gemma 3 Zero-Shot** (`gemma3_baseline`) |
 | **Đánh giá & Test** | 3,000 ảnh test MIMIC-CXR (held-out) |
 | **Kiểm định** | **Permutation Test** (10,000) + **Paired Bootstrap BCa** (10,000), Holm correction, significant khi $|d_z| \ge 0.10$ |
 | **Báo cáo** | `REPORT.md`, `radar.png`, `radar_data.csv`, `summary.json` |
@@ -52,7 +51,7 @@ Tất cả 3 candidate dùng chung 1 cấu hình huấn luyện chuẩn hóa:
 ### 1. Kiểm tra không cần GPU (Selftest)
 Giả lập logic pipeline, kiểm tra dữ liệu streaming, tính toán hàm loss kết hợp ($\mathcal{L}_{\text{CE}} + 0.5 \mathcal{L}_{\text{ASL}}$) và xuất báo cáo thử nghiệm:
 ```bash
-python scripts/selftest_cxr.py
+python3 scripts/selftest_cxr.py
 ```
 
 ### 2. Chạy thử nhanh (Dry-run)
@@ -70,17 +69,11 @@ Theo dõi tiến trình qua log:
 tail -f logs/cxr_special_*.log
 ```
 
-### 4. Bắt buộc Infer / Đánh giá lại (Force Infer)
-```bash
-bash scripts/run_cxr.sh --force-infer          # Chỉ các candidate
-bash scripts/run_cxr.sh --force-infer all      # Bao gồm baseline duy nhất (Gemma 3 Zero-Shot)
-```
-
 ---
 
 ## 📊 Báo Cáo & So Sánh Baseline
 
-Kết quả của 3 candidate được đánh giá đối sánh trực tiếp so với **1 baseline duy nhất** trên cùng 3,000 ảnh test:
+Kết quả của 3 candidate sẽ được đánh giá đối sánh trực tiếp với **1 baseline duy nhất** trên cùng 3,000 ảnh test:
 - **Baseline duy nhất:** `gemma3_baseline` (Gemma 3 4B-it zero-shot).
 
-8 chỉ số đánh giá tiêu chuẩn: **BLEU-1, BLEU-2, BLEU-3, BLEU-4, ROUGE-1, ROUGE-2, ROUGE-L, BERTScore F1** (roberta-large). Báo cáo khoa học và biểu đồ mạng nhện tự động xuất tại `runs/2.7_cxr_special/REPORT.md` và `radar.png`.
+8 chỉ số đánh giá tiêu chuẩn: **BLEU-1, BLEU-2, BLEU-3, BLEU-4, ROUGE-1, ROUGE-2, ROUGE-L, BERTScore F1** (roberta-large). Báo cáo khoa học tự động xuất tại `runs/2.7_cxr_special/REPORT.md`.

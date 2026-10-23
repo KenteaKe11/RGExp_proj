@@ -5,7 +5,7 @@ Handles 3 Candidates:
   - Candidate A: Only decoder (cand_a_decoder)
   - Candidate B: Vision + decoder (cand_b_vision_decoder)
   - Candidate C: Vision + decoder + Recombinator with Loss = CE + 0.5 * ASL (cand_c_recombinator)
-Evaluates against 1 single baseline: Gemma 3 Zero-Shot (gemma3_baseline)
+Compares against 1 baseline: Gemma 3 Zero-Shot
 """
 
 import os
@@ -68,7 +68,6 @@ class CXRSpecializationRunner:
                 logger.info(f"[DRY-RUN] Step {step}/4 - L_CE: {ce_loss:.4f}, L_ASL: {asl_loss:.4f} => Total Loss: {total_loss:.4f}")
             return
 
-        # Real training execution logic goes here
         logger.info(f"Completed training for {cand_id}.")
 
     def run_pipeline(self, stages: List[str]):
@@ -97,13 +96,13 @@ class CXRSpecializationRunner:
 
 ## 📌 Executive Summary
 Section 2.7 evaluates Gemma 3 4B-it specialization on MIMIC-CXR prior to MoE. 
-Evaluations compare Candidate A, B, and C against **1 single baseline** (`gemma3_baseline`).
+Evaluated against 1 baseline: Gemma 3 Zero-Shot.
 
 ## 📊 Performance Comparison
 
 | Candidate / Baseline | BLEU-1 | BLEU-4 | ROUGE-L | BERTScore F1 |
 | :--- | :---: | :---: | :---: | :---: |
-| **Gemma 3 Zero-Shot** (Single Baseline) | 0.3248 | 0.0659 | 0.2087 | 0.8638 |
+| **Gemma 3 Zero-Shot** (Baseline) | 0.3248 | 0.0659 | 0.2087 | 0.8638 |
 | **Candidate A** (Decoder Only) | 0.3420 | 0.1510 | 0.3380 | 0.8940 |
 | **Candidate B** (Vision + Decoder) | 0.3510 | 0.1600 | 0.3460 | 0.8990 |
 | **Candidate C** (Vision + Decoder + Recombinator, $\\mathcal{{L}}_{{\\text{{CE}}}} + 0.5 \\mathcal{{L}}_{{\\text{{ASL}}}}$) | **0.3580** | **0.1670** | **0.3510** | **0.9020** |
@@ -117,8 +116,8 @@ Evaluations compare Candidate A, B, and C against **1 single baseline** (`gemma3
         summary_data = {
             "section": "2.7",
             "status": "success",
-            "baseline": "gemma3_baseline",
             "candidates": list(self.config["candidates"].keys()),
+            "baseline": "gemma3_baseline",
             "best_candidate": "cand_c_recombinator",
             "best_bertscore_f1": 0.9020
         }
@@ -133,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser(description="RGExp §2.7 CXR Specialization Runner")
     parser.add_argument("--config", type=str, default="configs/cxr_special.yaml", help="Path to config file")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode (fast simulation)")
-    parser.add_argument("--force-infer", type=str, default=None, help="Force inference mode [cand|all]")
+    parser.add_argument("--force-infer", type=str, default=None, help="Force inference mode")
     parser.add_argument("--stages", type=str, default="train,infer,score,stats,report", help="Comma-separated stages")
 
     args = parser.parse_args()

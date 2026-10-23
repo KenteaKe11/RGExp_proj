@@ -52,15 +52,14 @@ def test_config_and_candidates():
     assert cand_c["loss_weights"]["asl"] == 0.5, "Candidate C loss weight for ASL must be 0.5"
     print("  [OK] Candidate C (Vision + Decoder + Recombinator, Loss = CE + 0.5*ASL) verified.")
 
-    # Verify Baseline setup
+    # Verify Single Baseline
     baselines = cfg["evaluation"]["baselines"]
     assert len(baselines) == 1, f"Expected exactly 1 baseline, found {len(baselines)}"
-    assert baselines[0]["id"] == "gemma3_baseline", "Baseline must be gemma3_baseline"
+    assert baselines[0]["id"] == "gemma3_baseline"
     print("  [OK] Single Baseline (gemma3_baseline) verified.")
 
 def test_loss_computation_simulation():
     print("\n--- 2. Simulating Candidate C Loss Calculation (CE + 0.5*ASL) ---")
-    # Simulate cross-entropy report loss and asymmetric loss
     l_ce = 1.854
     l_asl = 0.420
     asl_weight = 0.5
@@ -80,7 +79,6 @@ def test_schedule_and_permutation():
     
     print(f"  Total steps for 1 epoch over {total_samples} samples: {total_steps} steps")
     
-    # Generate fixed seed permutation
     seed = 42
     random.seed(seed)
     indices = list(range(total_samples))
@@ -95,7 +93,6 @@ def test_mock_statistical_evaluation():
     random.seed(123)
     n_test = 3000
     
-    # Mock scores for Candidate C vs Single Baseline
     baseline_scores = [random.gauss(0.86, 0.02) for _ in range(n_test)]
     cand_c_scores = [b + random.gauss(0.015, 0.01) for b in baseline_scores]
     
@@ -103,7 +100,7 @@ def test_mock_statistical_evaluation():
     mean_diff = sum(diffs) / n_test
     
     print(f"  Mock BERTScore F1 Delta (Candidate C - Gemma 3 Baseline): +{mean_diff:.4f}")
-    assert mean_diff > 0, "Candidate C should show positive gain over single baseline"
+    assert mean_diff > 0, "Candidate C should show positive gain"
     print("  [OK] Statistical comparison logic verified.")
 
 if __name__ == "__main__":
