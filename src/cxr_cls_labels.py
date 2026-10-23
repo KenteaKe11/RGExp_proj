@@ -1,6 +1,6 @@
 """§2.8 — Nhãn CheXbert (14 quan sát × {neg, pos}) cho Classification Head.
 
-Nhãn của task này nằm tại `csv_helper/label.npz` trong repo dữ liệu. Hỗ trợ NPZ dạng
+Nhãn của task này nằm trong thư mục `csv_helper` của repo dữ liệu; tên file được dò từ metadata repo. Hỗ trợ NPZ dạng
 key-array + ma trận 14 nhãn, đồng thời giữ hỗ trợ bảng CSV/TSV/Parquet để tự kiểm thử.
 
 Mã CheXbert thô:  1 = positive · 0 = negative · -1 = uncertain · NaN = không nhắc tới.
@@ -76,15 +76,21 @@ def find_file(cfg: Cfg) -> str:
     files = HfApi(token=hf_token()).list_repo_files(
         repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"))
     inside = [f for f in files if f.startswith(folder + "/")]
-    hit = [f for f in inside if ("chexbert" in f.lower() or f.lower().endswith("/label.npz"))
-           and (f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz"))]
+    # Ưu tiên file có tên CheXbert hoặc label.npz. Nếu repo dùng tên khác,
+    # chấp nhận một file nhãn duy nhất có định dạng bảng/NPZ trong search_dir.
+    candidates = [f for f in inside
+                  if f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz")]
+    hit = [f for f in candidates
+           if "chexbert" in f.lower() or f.lower().endswith("/label.npz")]
     if len(hit) == 1:
         return hit[0]
+    if not hit and len(candidates) == 1:
+        return candidates[0]
     raise LabelsUnusable(
-        (f"{len(hit)} file khớp 'chexbert' trong {folder}/: {hit}. "
-         if hit else f"không có file nào tên chứa 'chexbert' trong {folder}/ "
-                     f"(có: {inside}). ")
-        + "Ghi thẳng đường dẫn vào config: labels.file")
+        (f"Có {len(hit)} file ưu tiên khớp CheXbert/label.npz trong {folder}/: {hit}. "
+         if hit else f"Không tìm được file ưu tiên trong {folder}/. ")
+        + f"Các file bảng/NPZ tìm thấy: {candidates}; toàn bộ mục trong thư mục: {inside}. "
+        + "Đặt labels.file thành đúng đường dẫn tương đối của file nhãn trong repo.")
 
 
 def read_table(cfg: Cfg, local: str | Path | None = None) -> tuple[pd.DataFrame, str]:

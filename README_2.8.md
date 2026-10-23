@@ -1,7 +1,7 @@
 # §2.8 — Recombinator + Classification Head trên CXR Specialist (đóng băng)
 
 ```bash
-python -m src.cxr_cls_labels            # đọc csv_helper/label.npz + tỉ lệ lớp (không GPU)
+python -m src.cxr_cls_labels            # tự dò file nhãn trong csv_helper + tỉ lệ lớp (không GPU)
 python scripts/selftest_cxr_cls.py      # selftest không GPU
 bash scripts/run_cxr_cls.sh --dry-run   # 32 train · 16 val · 1 epoch · 4 steps
 bash scripts/run_cxr_cls.sh --detach    # chạy chính thức (nền)

@@ -76,7 +76,7 @@ specialist:
 
 # ── Nhãn CheXbert (trong split_ref/) ─────────────────────────────────────────
 labels:
-  file: csv_helper/label.npz    # nguồn nhãn task này; không dùng CSV CheXbert dò tự động
+  file: null                    # tự dò file nhãn thực tế trong csv_helper; tránh hard-code tên sai
   search_dir: csv_helper
   key_column: null               # null = tự dò (img_rel, path, dicom_id, ...)
   observations: null             # null = 14 quan sát chuẩn CheXpert/CheXbert, khớp theo tên cột
