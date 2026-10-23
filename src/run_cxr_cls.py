@@ -459,8 +459,6 @@ def run(cfg: Cfg, run_dir: Path, resume: bool = True) -> dict:
     amult = recombiner.attn_lr_mult(rcfg)
     per_epoch_steps = math.ceil(math.ceil(len(tr) / bs) / accum)
     declared_steps = int(sch.get("steps", 0) or 0)
-    if n_epochs != 1:
-        raise TrainUnusable(f"task §2.8 mặc định/cố định 1 epoch; nhận cls_train.n_epochs={n_epochs}")
     if declared_steps <= 0:
         raise TrainUnusable("Cần chỉ định rõ cls_train.schedule.steps cho lượt train này (như §2.7).")
     if declared_steps != per_epoch_steps:
