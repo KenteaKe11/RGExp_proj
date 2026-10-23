@@ -1,50 +1,43 @@
 #!/usr/bin/env bash
-# ═════════════════════════════════════════════════════════════════════════════
-# run_cxr.sh — §2.7: General Model -> CXR Specialist (QDoRA r4, streaming). MỘT LỆNH.
-#
-#     bash scripts/run_cxr.sh --dry-run          # 8 ảnh test, 16 mẫu train (stream), 4 bước
-#     bash scripts/run_cxr.sh --detach           # chạy NỀN
-#     bash scripts/run_cxr.sh --stages stats,report
-#     bash scripts/run_cxr.sh --retrain          # bỏ adapter + checkpoint, train lại từ đầu
-#
-# Shutdown giữa chừng: chạy lại CÙNG lệnh — checkpoint trên Hub được kéo về và
-# huấn luyện đi tiếp đúng bước đã dừng (không tải lại, không train lại từ đầu).
-# ═════════════════════════════════════════════════════════════════════════════
+# RGExp — §2.7: CXR Specialization Pipeline Runner Script
+# Handles execution of Candidate A (Decoder), Candidate B (Vision+Decoder), Candidate C (Vision+Decoder+Recombinator with Loss=CE+0.5ASL)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export RGEXP_ROOT="$ROOT"
-# shellcheck source=scripts/_env.sh
-source "$ROOT/scripts/_env.sh"
-rgexp_activate_py "allow-missing"
-mkdir -p "$ROOT/logs" "$ROOT/runs"
+CONFIG="configs/cxr_special.yaml"
+LOG_DIR="logs"
+mkdir -p "$LOG_DIR"
 
-DETACH=0
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="$LOG_DIR/cxr_special_$TIMESTAMP.log"
+
+echo "========================================================"
+echo "  RGExp — §2.7 CXR Specialization Pipeline (3 Candidates)"
+echo "  Config: $CONFIG"
+echo "  Log File: $LOG_FILE"
+echo "========================================================"
+
+DETACH=false
 ARGS=()
-for a in "$@"; do
-    case "$a" in
-        --detach) DETACH=1 ;;
-        *)        ARGS+=("$a") ;;
-    esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --detach)
+      DETACH=true
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
 done
 
-if [ "$DETACH" = "1" ]; then
-    LOG="${RGEXP_LOG:-$ROOT/logs/cxr_$(date +%Y%m%d_%H%M%S).log}"
-    echo "⚙ Chạy nền (§2.7 CXR Specialist) -> $LOG"
-    nohup bash "$ROOT/scripts/run_cxr.sh" "${ARGS[@]+"${ARGS[@]}"}" > "$LOG" 2>&1 &
-    echo "  PID: $!"
-    echo "  Theo dõi:  tail -f $LOG"
-    exit 0
+if [ "$DETACH" = true ]; then
+  echo "[INFO] Running pipeline in background (--detach)..."
+  nohup python3 -m src.run_cxr --config "$CONFIG" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
+  PID=$!
+  echo "[INFO] Started process with PID: $PID"
+  echo "[INFO] Follow progress with: tail -f $LOG_FILE"
+else
+  python3 -m src.run_cxr --config "$CONFIG" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 fi
-
-rgexp_banner "§2.7 — CXR Specialization (Gemma 3 4B-it, QDoRA r4, streaming)"
-
-if [ -x "$PYBIN" ]; then
-    echo "── Selftest (không GPU) ──"
-    "$PYBIN" "$ROOT/scripts/selftest_cxr.py" || {
-        echo "✗ Selftest thất bại — dừng trước khi dùng GPU."
-        exit 2
-    }
-fi
-
-exec "$PYBIN" -m src.run_cxr "${ARGS[@]+"${ARGS[@]}"}"
