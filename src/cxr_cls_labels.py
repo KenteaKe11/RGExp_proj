@@ -4,7 +4,9 @@ Nhãn của task này nằm trong thư mục `csv_helper` của repo dữ liệu
 `y_gt`, `y_aug`, `img_rel`, `study_id`, `disease_labels`, `class_names`, đồng thời
 giữ hỗ trợ bảng CSV/TSV/Parquet để tự kiểm thử.
 
-Mã CheXbert thô:  1 = positive · 0 = negative · -1 = uncertain · NaN = không nhắc tới.
+Mã CheXbert chuẩn hoá: 1 = positive · 0 = negative · -1 = uncertain · NaN = không nhắc tới.
+NPZ `labels.npz` của repo mã hoá class ID theo `class_names`:
+0=positive, 1=negative, 2=uncertain, 3=blank; được giải mã rõ ràng trước khi encode.
 
 Bài toán ở đây là 2 kênh (neg, pos) × 14 quan sát, mỗi ô là MỘT sigmoid độc lập
 (đúng dạng ASL multi-label). Cách ánh xạ — mỗi lựa chọn đều ghi ở config và in ra log:
@@ -160,6 +162,37 @@ def read_table(cfg: Cfg, local: str | Path | None = None) -> tuple[pd.DataFrame,
             if order_source is not None:
                 positions = {_norm(name): i for i, name in enumerate(order_source)}
                 arr = arr[:, [positions[_norm(name)] for name in OBSERVATIONS]]
+
+            # This repository's labels.npz uses categorical integer IDs, NOT the
+            # conventional CheXbert numeric codes:
+            # class_names = [positive, negative, uncertain, blank]
+            # therefore 0->positive(1), 1->negative(0), 2->uncertain(-1),
+            # 3->blank(NaN). y_aug may additionally use -1 as an unassigned sentinel.
+            # Decode only when the archive explicitly declares this exact class order;
+            # do not reinterpret ordinary numeric CSV/NPZ labels.
+            class_names_key = key_aliases.get(_norm("class_names"))
+            if class_names_key is not None:
+                declared_classes = _name_list(arrays[class_names_key])
+                if [_norm(x) for x in declared_classes] == [
+                    "positive", "negative", "uncertain", "blank"
+                ]:
+                    encoded = np.asarray(arr, dtype=np.float64)
+                    decoded = np.full(encoded.shape, np.nan, dtype=np.float64)
+                    decoded[encoded == 0] = 1.0
+                    decoded[encoded == 1] = 0.0
+                    decoded[encoded == 2] = -1.0
+                    decoded[encoded == 3] = np.nan
+                    known = np.isin(encoded, (0.0, 1.0, 2.0, 3.0))
+                    # -1 occurs in y_aug as a special unassigned value; treat it as
+                    # unmentioned rather than inventing a positive/negative target.
+                    known |= np.isnan(encoded) | (encoded == -1.0)
+                    if not known.all():
+                        bad_codes = sorted(set(encoded[~known].tolist()))[:10]
+                        raise LabelsUnusable(
+                            f"NPZ có mã phân loại ngoài class_names {declared_classes}: {bad_codes}"
+                        )
+                    arr = decoded
+
             if key_vec is None:
                 raise LabelsUnusable(f"NPZ có ma trận nhãn nhưng thiếu vector key (vd img_rel/path); keys={list(arrays)}")
             if len(key_vec) != len(arr):
