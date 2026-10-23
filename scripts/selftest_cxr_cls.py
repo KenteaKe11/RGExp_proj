@@ -115,7 +115,9 @@ check(m3[1].sum() == 0 and m3[0].sum() == 14, "key không có nhãn -> mask 0 to
 print("3. Config")
 check(cfg["classifier"]["n_classes"] == 2, "classifier.n_classes = 2")
 check(cfg["cls_train"]["n_epochs"] == 1, "mặc định đúng 1 epoch")
-check(cfg["labels"].get("file") is None and cfg["labels"]["search_dir"] == "csv_helper", "tự dò file nhãn trong csv_helper")
+label_file = str(cfg["labels"].get("file") or "").replace("\\", "/").strip("./")
+check(label_file == "csv_helper/labels.npz" and cfg["labels"]["search_dir"] == "csv_helper",
+      "đường dẫn nhãn labels.npz được ghim trong csv_helper; search_dir đúng")
 check(cfg["cls_train"]["schedule"]["steps"] == 200, "steps mặc định khai rõ cho 6.400 mẫu / batch 32")
 src = (ROOT / "src" / "recombiner.py").read_text(encoding="utf-8")
 m_ = re.search(r"def __init__\(self, gamma_neg=([\d.]+), gamma_pos: float = ([\d.]+),\s*clip: float = ([\d.]+)", src)
