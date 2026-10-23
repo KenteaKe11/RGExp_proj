@@ -1,0 +1,144 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# §2.8 — RECOMBINATOR + CLASSIFICATION HEAD trên nền CXR SPECIALIST (§2.7)
+# ═════════════════════════════════════════════════════════════════════════════
+#   Nền  : Gemma 3 4B-it NF4 + adapter QDoRA của §2.7 (SigLIP nửa sau + projector + decoder).
+#          TOÀN BỘ đóng băng; decoder không chạy.
+#   Học  : CHỈ `recombinator` + `cls_head`.
+#   Loss : ASL mặc định (AsymmetricLoss) trên 14 quan sát CheXbert × {neg, pos}.
+#   Nhãn : file CheXbert nằm cạnh split trong `split_ref/` của repo dữ liệu.
+#   Công thức huấn luyện lấy từ giai đoạn 1 của bài báo (5 epoch, AdamW wd 0.05, cosine khởi động
+#   lại mỗi epoch, đỉnh 1.6e-4, Attn của Global Extractor ×3, chọn ckpt theo F1 lớp positive trên val).
+# ═════════════════════════════════════════════════════════════════════════════
+
+seed: 42
+experiment: "2.8"
+
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv           # chỉ để kiểm rò rỉ — KHÔNG đọc ảnh test
+  train_split_csv: split_ref/train_split.csv
+  val_split_csv: split_ref/val_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  n_train: 6400                 # bài báo: 6.400 study. 0 = toàn bộ split train
+  n_val: 512                    # bài báo: 512 study chỉ để chọn checkpoint
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  assert_no_leak: true
+
+stream:
+  index_cache: ./data/_stream_index_cls.json    # RIÊNG với §2.7: khác tập key ⇒ khác cache
+  timeout_s: 60
+  retries: 5
+  max_failed_frac: 0.02
+
+image_policy:                    # GIỮ NGUYÊN §2.7 — đặc trưng SigLIP phải cùng phân phối
+  unified: true
+  resize_to: 512
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  per_model_normalize_only: true
+
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_adapter
+  dtype: bfloat16
+  attn_implementation_infer: sdpa
+  device_map_infer: "cuda:0"     # ghim một GPU: 'auto' có thể đẩy lớp sang meta
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+train:                           # chỉ để load_base dựng ĐÚNG cấu hình NF4 của §2.7
+  max_seq_len: 1024
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+# ── Nền CXR Specialist (đầu ra của §2.7) ─────────────────────────────────────
+specialist:
+  arm_id: cxr_specialist
+  method: qdora
+  local_dir: ./adapters_cxr_special/cxr_specialist     # có sẵn ⇒ dùng; không ⇒ kéo từ Hub
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_subdir: 2.7_cxr_special
+
+# ── Nhãn CheXbert (trong split_ref/) ─────────────────────────────────────────
+labels:
+  file: csv_helper/label.npz    # nguồn nhãn task này; không dùng CSV CheXbert dò tự động
+  search_dir: csv_helper
+  key_column: null               # null = tự dò (img_rel, path, dicom_id, ...)
+  observations: null             # null = 14 quan sát chuẩn CheXpert/CheXbert, khớp theo tên cột
+  uncertain: ignore              # ignore = loại quan sát khỏi ASL | zeros = [0,0] và vẫn học
+  unmentioned: zeros             # zeros = [neg=0, pos=0] và vẫn học | ignore = loại
+  max_missing_frac: 0.05
+
+# ── Nhánh: cùng khối với §2.3/§2.5 ───────────────────────────────────────────
+recombiner:
+  n_vis: 4096
+  n_tokens: 256
+  local: {n_blocks: 2, hidden: 2048, pool_factor: 4}
+  head_dim: 64
+  dropout: 0.05
+  attn_lr_mult: 3.0
+  pool_stages: 4
+  route_head: {hidden: 1024, dropout: 0.05}
+  n_experts: 10                  # route_head chỉ để nhánh có đủ hình dạng; KHÔNG chạy, KHÔNG học
+  n_dec_hidden: 128
+  n_dec_tokens: 64
+  token_type: text
+  dtype: null
+
+classifier:
+  enabled: true
+  n_classes: 2                   # neg, pos  (§2.3/§2.5 dùng 3)
+  hidden: 1024
+  dropout: 0.1
+  asl:                           # MẶC ĐỊNH của recombiner.AsymmetricLoss
+    gamma_neg: 2.0
+    gamma_pos: 0.0
+    clip: 0.05
+    eps: 1.0e-8
+
+cls_train:
+  n_epochs: 1
+  per_device_batch_size: 16
+  grad_accum: 2                  # hiệu dụng 32
+  num_workers: 4
+  prefetch_factor: 4
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  logging_steps: 10
+  branch_dtype: float32          # trọng số nhánh fp32 + autocast bf16 (bf16 thuần làm bước nhỏ bị nuốt)
+  autocast: bfloat16
+  schedule:
+    max_lr: 1.6e-4
+    steps: 200                  # phải khớp ceil(n_train / batch hiệu dụng); override theo lượt chạy
+    lr_init: 4.8e-6              # = max_lr / 33.33 (div_factor của sup_pretrain)
+    lr_min: 4.8e-7
+    pct_start: 0.1
+    anneal: cos
+    lr_decay: 1.0                # 1 epoch mặc định; giữ LR tuyệt đối đã chỉ định
+  select_metric: micro_f1_pos
+  keep_last_ckpt: 2
+
+hub:
+  push: false                    # bật: --set hub.push=true (cần HF_TOKEN có quyền ghi)
+  repo: RGExp123/RGExp_cxr_recomb_cls
+  private: true
+  subdir: best
+
+output:
+  dir: ./runs
+  run_id: "2.8_cxr_recomb_cls"
