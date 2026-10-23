@@ -470,8 +470,8 @@ def run(cfg: Cfg, run_dir: Path, resume: bool = True) -> dict:
             0.0 <= float(sch["lr_min"]) <= float(sch["max_lr"])):
         raise TrainUnusable("Lịch LR cần 0 ≤ lr_init, lr_min ≤ max_lr.")
     print(f"  Kế hoạch One-cycle rõ ràng: steps={declared_steps} · "
-          f"lr_init={sch['lr_init']:.3g} → max_lr={sch['max_lr']:.3g} → "
-          f"lr_min={sch['lr_min']:.3g} · warm-up={sch.get('pct_start', 0.1):.0%} · "
+          f"lr_init={sch['lr_init']:.3f} → max_lr={sch['max_lr']:.3f} → "
+          f"lr_min={sch['lr_min']:.3f} · warm-up={sch.get('pct_start', 0.1):.0%} · "
           f"anneal={sch.get('anneal', 'cos')}", flush=True)
     _hr(f"Huấn luyện · {len(tr)} mẫu · {n_epochs} epoch · {declared_steps} optimizer steps · batch {bs}×{accum}")
     branch.train()
