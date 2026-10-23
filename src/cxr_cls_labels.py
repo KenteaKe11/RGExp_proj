@@ -65,29 +65,37 @@ def _norm(s: str) -> str:
 
 # ── Tìm và đọc file ──────────────────────────────────────────────────────────
 def find_file(cfg: Cfg) -> str:
-    """Đường dẫn file CheXbert TRONG repo. Config thắng; không thì dò `split_ref/`."""
+    """Đường dẫn file CheXbert trong repo. Config thắng; mặc định tự dò `csv_helper/`."""
     lcfg = dict(cfg.get("labels", {}) or {})
     if lcfg.get("file"):
         return str(lcfg["file"])
     from huggingface_hub import HfApi
 
     d = cfg["data"]
-    folder = str(lcfg.get("search_dir", "split_ref")).strip("/")
+    folder = str(lcfg.get("search_dir", "csv_helper")).strip("/")
     files = HfApi(token=hf_token()).list_repo_files(
         repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"))
     inside = [f for f in files if f.startswith(folder + "/")]
-    # Ưu tiên file có tên CheXbert hoặc label.npz. Nếu repo dùng tên khác,
-    # chấp nhận một file nhãn duy nhất có định dạng bảng/NPZ trong search_dir.
-    candidates = [f for f in inside
-                  if f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz")]
-    hit = [f for f in candidates
-           if "chexbert" in f.lower() or f.lower().endswith("/label.npz")]
+    # Chỉ dò trong csv_helper/ mặc định. Ưu tiên tên file nhãn đã biết:
+    # labels.npz (repo hiện tại), label.npz, hoặc tên có chexbert.
+    # clean_dataset.csv là dữ liệu/bảng phụ, không được ưu tiên hơn labels.npz.
+    candidates = [
+        f for f in inside
+        if f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz")
+    ]
+    hit = [
+        f for f in candidates
+        if (
+            Path(f).name.lower() in {"labels.npz", "label.npz"}
+            or "chexbert" in Path(f).name.lower()
+        )
+    ]
     if len(hit) == 1:
         return hit[0]
     if not hit and len(candidates) == 1:
         return candidates[0]
     raise LabelsUnusable(
-        (f"Có {len(hit)} file ưu tiên khớp CheXbert/label.npz trong {folder}/: {hit}. "
+        (f"Có {len(hit)} file ưu tiên khớp CheXbert/labels.npz/label.npz trong {folder}/: {hit}. "
          if hit else f"Không tìm được file ưu tiên trong {folder}/. ")
         + f"Các file bảng/NPZ tìm thấy: {candidates}; toàn bộ mục trong thư mục: {inside}. "
         + "Đặt labels.file thành đúng đường dẫn tương đối của file nhãn trong repo.")
