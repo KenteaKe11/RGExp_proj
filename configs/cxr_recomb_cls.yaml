@@ -74,9 +74,9 @@ specialist:
   hub_repo_type: dataset
   hub_subdir: 2.7_cxr_special
 
-# ── Nhãn CheXbert (trong split_ref/) ─────────────────────────────────────────
+# ── Nhãn CheXbert ────────────────────────────────────────────────────────────
 labels:
-  file: "csv_helper/labels.npz"                    # tự dò file nhãn thực tế trong csv_helper; tránh hard-code tên sai
+  file: csv_helper/labels.npz   # file nhãn thực tế trong repo dữ liệu
   search_dir: csv_helper
   key_column: null               # null = tự dò (img_rel, path, dicom_id, ...)
   observations: null             # null = 14 quan sát chuẩn CheXpert/CheXbert, khớp theo tên cột

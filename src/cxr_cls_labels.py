@@ -1,7 +1,8 @@
 """§2.8 — Nhãn CheXbert (14 quan sát × {neg, pos}) cho Classification Head.
 
-Nhãn của task này nằm trong thư mục `csv_helper` của repo dữ liệu; tên file được dò từ metadata repo. Hỗ trợ NPZ dạng
-key-array + ma trận 14 nhãn, đồng thời giữ hỗ trợ bảng CSV/TSV/Parquet để tự kiểm thử.
+Nhãn của task này nằm trong thư mục `csv_helper` của repo dữ liệu; tên file được dò từ metadata repo. Hỗ trợ NPZ dạng key-array + ma trận 14 nhãn. Tương thích schema thực tế
+`y_gt`, `y_aug`, `img_rel`, `study_id`, `disease_labels`, `class_names`, đồng thời
+giữ hỗ trợ bảng CSV/TSV/Parquet để tự kiểm thử.
 
 Mã CheXbert thô:  1 = positive · 0 = negative · -1 = uncertain · NaN = không nhắc tới.
 
@@ -65,37 +66,29 @@ def _norm(s: str) -> str:
 
 # ── Tìm và đọc file ──────────────────────────────────────────────────────────
 def find_file(cfg: Cfg) -> str:
-    """Đường dẫn file CheXbert trong repo. Config thắng; mặc định tự dò `csv_helper/`."""
+    """Đường dẫn file CheXbert TRONG repo. Config thắng; không thì dò `split_ref/`."""
     lcfg = dict(cfg.get("labels", {}) or {})
     if lcfg.get("file"):
         return str(lcfg["file"])
     from huggingface_hub import HfApi
 
     d = cfg["data"]
-    folder = str(lcfg.get("search_dir", "csv_helper")).strip("/")
+    folder = str(lcfg.get("search_dir", "split_ref")).strip("/")
     files = HfApi(token=hf_token()).list_repo_files(
         repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"))
     inside = [f for f in files if f.startswith(folder + "/")]
-    # Chỉ dò trong csv_helper/ mặc định. Ưu tiên tên file nhãn đã biết:
-    # labels.npz (repo hiện tại), label.npz, hoặc tên có chexbert.
-    # clean_dataset.csv là dữ liệu/bảng phụ, không được ưu tiên hơn labels.npz.
-    candidates = [
-        f for f in inside
-        if f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz")
-    ]
-    hit = [
-        f for f in candidates
-        if (
-            Path(f).name.lower() in {"labels.npz", "label.npz"}
-            or "chexbert" in Path(f).name.lower()
-        )
-    ]
+    # Ưu tiên file có tên CheXbert hoặc label.npz. Nếu repo dùng tên khác,
+    # chấp nhận một file nhãn duy nhất có định dạng bảng/NPZ trong search_dir.
+    candidates = [f for f in inside
+                  if f.lower().endswith(_TABLE_EXT) or f.lower().endswith(".npz")]
+    hit = [f for f in candidates
+           if "chexbert" in f.lower() or f.lower().endswith("/label.npz")]
     if len(hit) == 1:
         return hit[0]
     if not hit and len(candidates) == 1:
         return candidates[0]
     raise LabelsUnusable(
-        (f"Có {len(hit)} file ưu tiên khớp CheXbert/labels.npz/label.npz trong {folder}/: {hit}. "
+        (f"Có {len(hit)} file ưu tiên khớp CheXbert/label.npz trong {folder}/: {hit}. "
          if hit else f"Không tìm được file ưu tiên trong {folder}/. ")
         + f"Các file bảng/NPZ tìm thấy: {candidates}; toàn bộ mục trong thư mục: {inside}. "
         + "Đặt labels.file thành đúng đường dẫn tương đối của file nhãn trong repo.")
@@ -128,9 +121,13 @@ def read_table(cfg: Cfg, local: str | Path | None = None) -> tuple[pd.DataFrame,
                          if _norm(k) in key_aliases), None)
         key_vec = arrays[key_name] if key_name is not None else None
         obs_aliases = {_norm(k): k for k in arrays}
-        obs_array = next((arrays[k] for k in arrays
-                          if _norm(k) in {"labels", "label", "targets", "y", "chexbert"}
-                          and np.asarray(arrays[k]).ndim in (2, 3)), None)
+        # Dataset schema: y_gt is the ground-truth target; y_aug is a derived/augmented
+        # variant and is only a fallback. Prefer y_gt whenever both exist.
+        matrix_aliases = ("y_gt", "labels", "label", "targets", "y", "chexbert", "y_aug")
+        obs_key = next((key_aliases[_norm(k)] for k in matrix_aliases
+                        if _norm(k) in key_aliases
+                        and np.asarray(arrays[key_aliases[_norm(k)]]).ndim in (2, 3)), None)
+        obs_array = arrays[obs_key] if obs_key is not None else None
         if obs_array is not None:
             arr = np.asarray(obs_array)
             if arr.ndim == 3 and arr.shape[-1] == 2:
@@ -142,6 +139,27 @@ def read_table(cfg: Cfg, local: str | Path | None = None) -> tuple[pd.DataFrame,
                 arr = raw
             if arr.ndim != 2 or arr.shape[1] != len(OBSERVATIONS):
                 raise LabelsUnusable(f"NPZ nhãn cần shape (N,14) hoặc (N,14,2), nhận {arr.shape}; keys={list(arrays)}")
+            # If the NPZ publishes the disease order, align columns to the canonical
+            # CheXbert observation order rather than silently assuming its order.
+            def _name_list(value):
+                a = np.asarray(value, dtype=object).reshape(-1)
+                out = []
+                for item in a:
+                    if isinstance(item, bytes):
+                        item = item.decode("utf-8", errors="replace")
+                    out.append(str(item))
+                return out
+            order_source = None
+            for meta_key in ("disease_labels", "class_names"):
+                actual = key_aliases.get(_norm(meta_key))
+                if actual is not None:
+                    names = _name_list(arrays[actual])
+                    if len(names) == len(OBSERVATIONS) and {_norm(x) for x in names} == {_norm(x) for x in OBSERVATIONS}:
+                        order_source = names
+                        break
+            if order_source is not None:
+                positions = {_norm(name): i for i, name in enumerate(order_source)}
+                arr = arr[:, [positions[_norm(name)] for name in OBSERVATIONS]]
             if key_vec is None:
                 raise LabelsUnusable(f"NPZ có ma trận nhãn nhưng thiếu vector key (vd img_rel/path); keys={list(arrays)}")
             if len(key_vec) != len(arr):
