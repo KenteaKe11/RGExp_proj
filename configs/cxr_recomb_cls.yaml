@@ -134,7 +134,7 @@ cls_train:
   keep_last_ckpt: 2
 
 hub:
-  push: false                    # bật: --set hub.push=true (cần HF_TOKEN có quyền ghi)
+  push: true                    # bật: --set hub.push=true (cần HF_TOKEN có quyền ghi)
   repo: RGExp123/RGExp_cxr_recomb_cls
   private: true
   subdir: best
