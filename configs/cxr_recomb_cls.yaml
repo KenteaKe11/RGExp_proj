@@ -113,8 +113,8 @@ classifier:
 
 cls_train:
   n_epochs: 1
-  per_device_batch_size: 16
-  grad_accum: 2                  # hiệu dụng 32
+  per_device_batch_size: 64
+  grad_accum: 1                  # hiệu dụng 64
   num_workers: 4
   prefetch_factor: 4
   weight_decay: 0.05
