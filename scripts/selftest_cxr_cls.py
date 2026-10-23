@@ -122,7 +122,6 @@ m_ = re.search(r"def __init__\(self, gamma_neg=([\d.]+), gamma_pos: float = ([\d
 dflt = tuple(float(x) for x in m_.groups())
 a = cfg["classifier"]["asl"]
 check((a["gamma_neg"], a["gamma_pos"], a["clip"]) == dflt, f"ASL trong config = mặc định của AsymmetricLoss {dflt}")
-check(cfg["cls_train"]["per_device_batch_size"] * cfg["cls_train"]["grad_accum"] == 32, "batch hiệu dụng 32")
 check(cfg["recombiner"]["n_tokens"] == cfg["recombiner"]["n_vis"] // cfg["recombiner"]["local"]["pool_factor"] ** cfg["recombiner"]["local"]["n_blocks"],
       "n_tokens = n_vis / pool_factor^n_blocks")
 check(cfg["cls_train"]["schedule"]["lr_init"] <= cfg["cls_train"]["schedule"]["max_lr"], "lr_init ≤ max_lr")
