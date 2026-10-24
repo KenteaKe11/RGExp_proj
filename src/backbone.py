@@ -737,11 +737,15 @@ def attach_adapter(model, arm: dict, tcfg: dict):
         vision_name = str(vision_cfg.get("adapter_name", "vision_qdora"))
         peft_model.add_adapter(vision_name, LoraConfig(**vision_kw))
         try:
-            peft_model.set_adapter(["default", vision_name])
-        except (TypeError, ValueError) as e:
+            # PeftModel.set_adapter accepts one name and treats a list as a
+            # dict key. Multi-adapter activation belongs to the underlying
+            # tuner (LoraModel), which accepts a sequence of adapter names.
+            peft_model.base_model.set_adapter(["default", vision_name])
+        except (AttributeError, TypeError, ValueError) as e:
             raise TrainUnusable(
                 "peft phiên bản hiện tại không hỗ trợ kích hoạt đồng thời adapter "
-                f"decoder và vision: {e}. Cần peft có multi-adapter support.") from e
+                f"decoder và vision qua base_model.set_adapter: {e}. Cần peft có "
+                "multi-adapter support.") from e
         vision_meta = {"name": vision_name, "method": vision_method,
                        "rank": vision_rank, "alpha": vision_alpha,
                        "n_target_modules": len(vision_targets)}

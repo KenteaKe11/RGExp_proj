@@ -134,11 +134,13 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                         "huấn luyện lại candidate này.")
                 self.model.load_adapter(str(vdir), adapter_name=vname)
                 try:
-                    self.model.set_adapter(["default", vname])
-                except (TypeError, ValueError) as e:
+                    # The PeftModel wrapper accepts a single adapter name;
+                    # activate the list on its underlying LoRA tuner.
+                    self.model.base_model.set_adapter(["default", vname])
+                except (AttributeError, TypeError, ValueError) as e:
                     raise RunnerUnusable(
                         "peft không thể kích hoạt đồng thời QLoRA decoder và "
-                        f"QDoRA vision: {e}") from e
+                        f"QDoRA vision qua base_model.set_adapter: {e}") from e
                 print(f"  ✓ adapter phụ {vname}: {vision_adapter.get('method')} "
                       f"r={vision_adapter.get('rank')} · "
                       f"{vision_adapter.get('n_target_modules')} module", flush=True)
