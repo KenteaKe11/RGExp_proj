@@ -162,9 +162,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A(f"Pool test gồm {manifest.get('n_eval', '?')} mẫu. Mỗi metric/candidate dùng cùng "
       f"{ns} bootstrap subset; mỗi subset lấy {bs} mẫu có hoàn lại từ pool. Cùng ma trận "
       "chỉ số được chia sẻ cho ba candidate và các metric; summary lấy trung bình qua "
-      "các subset bootstrap. Chỉ số dựa trên bốn subset có độ phân giải thô.")
+      "các subset bootstrap.")
     A("CheXbert F1 là micro-F1 trên 14 nhãn: mỗi subset cộng TP/FP/FN trên toàn bộ mẫu "
-      "trong subset, tính F1 một lần, rồi lấy trung bình F1 của bốn subset.")
+      "trong subset, tính F1 một lần, rồi lấy trung bình F1 của các subset.")
     A("")
     A("## Candidate scores")
     A("")
