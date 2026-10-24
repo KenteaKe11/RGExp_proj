@@ -1,6 +1,6 @@
 ﻿# §2.3 — Recombinator và đánh giá lâm sàng
 
-Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào toàn bộ vision encoder, giữ projector Gemma 3 đóng băng, rồi fusion nhánh Recombinator theo `adapter_output + Linear(RMSNorm(recombiner_output))`. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 1.0 × ASL`, không warmup hệ số ASL.
+Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào toàn bộ vision encoder, fine-tune projector Gemma 3, rồi fusion nhánh Recombinator theo `adapter_output + Linear(RMSNorm(recombiner_output))`. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 1.0 × ASL`, không warmup hệ số ASL.
 
 Đầu phân loại nhận `(batch, 256, 2560)` từ Recombinator. Một query học được dùng multi-head attention (8 heads) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thẳng thành logits `(batch, 14, 2)`. Không còn bốn tầng pooling hay MLP ẩn trong ClsHead.
 

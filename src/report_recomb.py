@@ -224,8 +224,10 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     train_cfg = cfg.get('train') or {}
     classifier_cfg = cfg.get('classifier') or {}
     asl_cfg = classifier_cfg.get('asl') or {}
+    projector_ft = any(bool(a.get("train_projector", False)) for a in cfg.get("arms", []))
+    projector_state = "fine-tuned" if projector_ft else "frozen"
     A(f"Loss: CE + {classifier_cfg.get('lambda', 0.5)} × ASL; "
-      f"Projector is frozen. AdamW: weight decay {train_cfg.get('weight_decay')} and "
+      f"Projector is {projector_state}. AdamW: weight decay {train_cfg.get('weight_decay')} and "
       f"β₂={(train_cfg.get('adam_betas') or [0.9, 0.95])[1]}. ASL uses "
       f"γ⁻={asl_cfg.get('gamma_neg', 2)}, "
       f"γ⁺={asl_cfg.get('gamma_pos', 0)}, "

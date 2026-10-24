@@ -22,7 +22,7 @@
 # ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
-# 2. Candidate C giữ projector gốc đóng băng; fusion dùng RMSNorm -> Linear -> add.
+# 2. Candidate C fine-tune projector gốc; fusion dùng RMSNorm -> Linear -> add.
 # 3. Ba candidate dùng chung manifest test; 10 bootstrap subset dùng 10 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -457,9 +457,9 @@ arms:
     recomb: false
     enabled: true
   - id: lora_recomb
-    name: "QDoRA vision + frozen projector + QLoRA + Recombinator + classifier"
+    name: "QDoRA full vision + projector FT + QLoRA + Recombinator + classifier"
     recomb: true
-    train_projector: false
+    train_projector: true
     enabled: true
 metrics:
   normalize:
