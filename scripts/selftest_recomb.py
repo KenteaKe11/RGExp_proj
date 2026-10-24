@@ -62,7 +62,9 @@ def main() -> int:
             raise AssertionError("additive merge does not equal adapter + alpha * branch")
         target = torch.zeros_like(logits)
         target[..., 1] = 1
-        loss = branch.sup_loss(logits, target) + merged.square().mean()
+        mask = torch.ones(2, 3)
+        mask[0, 1] = 0
+        loss = branch.sup_loss(logits, target, mask) + merged.square().mean()
         loss.backward()
         if branch.cls_head.head.pool.query.grad is None:
             raise AssertionError("attention pooling query received no gradient")

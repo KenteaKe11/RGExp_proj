@@ -597,15 +597,27 @@ class AsymmetricLoss(nn.Module):
             pt = xs_pos * target + xs_neg * (1.0 - target)
             gamma = self.gamma_pos * target + g_neg * (1.0 - target)
             w = torch.pow(1.0 - pt, gamma)
-        loss = -(w * (loss_pos + loss_neg)).sum(dim=(1, 2))     # (B,)
+        loss_per_label = -(w * (loss_pos + loss_neg)).sum(dim=2)  # (B, L)
 
         if mask is None:
-            return loss.mean()
-        m = mask.float().to(loss.device)
+            return loss_per_label.sum(dim=1).mean()
+        m = mask.float().to(loss_per_label.device)
         if m.ndim == 1:
-            m = m[:, None]
-        denom = m.sum().clamp(min=1.0)
-        return (loss * m).sum() / denom
+            if m.shape[0] != loss_per_label.shape[0]:
+                raise ValueError(
+                    f"ASL sample mask shape {tuple(m.shape)} không khớp batch "
+                    f"{loss_per_label.shape[0]}.")
+            per_sample = loss_per_label.sum(dim=1)
+            return (per_sample * m).sum() / m.sum().clamp(min=1.0)
+        if m.ndim == 2:
+            if m.shape != loss_per_label.shape:
+                raise ValueError(
+                    f"ASL label mask shape {tuple(m.shape)} không khớp logits "
+                    f"{tuple(loss_per_label.shape)}.")
+            per_sample = (loss_per_label * m).sum(dim=1)
+            valid_samples = (m.sum(dim=1) > 0).to(per_sample.dtype)
+            return per_sample.sum() / valid_samples.sum().clamp(min=1.0)
+        raise ValueError(f"ASL mask cần shape (B,) hoặc (B,L), nhận {tuple(m.shape)}.")
 
 
 @torch.no_grad()
