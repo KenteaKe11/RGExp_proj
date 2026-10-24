@@ -56,6 +56,11 @@ def _new_chexbert_labeler(device: str):
 
     cache_dir = Path(os.path.expanduser("~/.cache/chexbert"))
     checkpoint = cache_dir / "chexbert.pth"
+    # f1chexbert's failed download can leave a dangling symlink at the target.
+    # Path.exists()/is_file() both return False for it, while link() reports
+    # EEXIST and copy2 follows it to a nonexistent destination.
+    if checkpoint.is_symlink() and not checkpoint.exists():
+        checkpoint.unlink()
     if not checkpoint.is_file():
         try:
             from huggingface_hub import hf_hub_download
@@ -68,11 +73,20 @@ def _new_chexbert_labeler(device: str):
                 # first: hard-linking the symlink itself can leave a dangling
                 # checkpoint path when that cache link is replaced/cleaned.
                 os.link(cached_source.resolve(strict=True), checkpoint)
+            except FileExistsError:
+                # A concurrent process may have installed it; remove only a
+                # broken symlink left by the package's own downloader.
+                if checkpoint.is_symlink() and not checkpoint.exists():
+                    checkpoint.unlink()
+                    import shutil
+                    shutil.copy2(cached_source.resolve(strict=True), checkpoint)
+                elif not checkpoint.is_file():
+                    raise
             except OSError:
                 import shutil
-                # Recreate the destination directory here as well: some
-                # runtimes mount/replace cache directories during downloads.
                 cache_dir.mkdir(parents=True, exist_ok=True)
+                if checkpoint.is_symlink() and not checkpoint.exists():
+                    checkpoint.unlink()
                 shutil.copy2(cached_source.resolve(strict=True), checkpoint)
             if not checkpoint.is_file():
                 raise FileNotFoundError(checkpoint)
