@@ -11,7 +11,11 @@ các bài báo khác — mọi kết luận thống kê dựa trên trung bình 
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
+import tempfile
 from typing import Iterable
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -103,6 +107,52 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
     return {f"bertscore_{k}": allv[k] for k in keep if k in allv}
 
 
+def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict) -> np.ndarray:
+    """Per-report positive-label F1 from the official Stanford CheXbert CLI."""
+    import pandas as pd
+
+    code_dir = Path(cfg.get("code_dir", "./tools/CheXbert")).resolve()
+    checkpoint = Path(cfg.get("checkpoint", "./models/chexbert.pth")).resolve()
+    script = code_dir / "src" / "label.py"
+    if not script.is_file():
+        script = code_dir / "label.py"
+    if not script.is_file() or not checkpoint.is_file():
+        raise FileNotFoundError(
+            "CheXbert enabled but its official source/checkpoint is missing. "
+            f"Expected label.py under {code_dir} and checkpoint at {checkpoint}.")
+
+    names = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
+             "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
+             "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
+             "Support Devices", "No Finding"]
+    texts = list(refs) + list(hyps)
+    with tempfile.TemporaryDirectory(prefix="rgexp_chexbert_") as td:
+        root = Path(td)
+        input_csv = root / "reports.csv"
+        output_dir = root / "out"
+        output_dir.mkdir()
+        pd.DataFrame({"Report Impression": texts}).to_csv(input_csv, index=False)
+        subprocess.run([sys.executable, str(script), f"-d={input_csv}",
+                        f"-o={output_dir}", f"-c={checkpoint}"],
+                       cwd=code_dir, check=True)
+        labeled = pd.read_csv(output_dir / "labeled_reports.csv")
+    if len(labeled) != len(texts):
+        raise ValueError("CheXbert output row count does not match the input reports.")
+    missing = [n for n in names if n not in labeled]
+    if missing:
+        raise ValueError(f"CheXbert output is missing label columns: {missing}")
+    vals = labeled[names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    n = len(refs)
+    gold, pred = vals[:n], vals[n:]
+    known = np.isin(gold, (0, 1)) & np.isin(pred, (0, 1))
+    gpos, ppos = (gold == 1) & known, (pred == 1) & known
+    tp = np.sum(gpos & ppos, axis=1)
+    fp = np.sum(~gpos & ppos & known, axis=1)
+    fn = np.sum(gpos & ~ppos & known, axis=1)
+    den = 2 * tp + fp + fn
+    return np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
                 refs_raw: list[str], label: str = "") -> tuple[pd.DataFrame, dict]:
@@ -124,6 +174,11 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
         print(f"  [{label}] BERTScore ({bcfg.get('model_type', 'roberta-large')}) ...",
               flush=True)
         cols.update(_bertscore(hyps, refs, bcfg))
+
+    ccfg = dict(mcfg.get("chexbert", {}))
+    if ccfg.get("enabled", False):
+        print(f"  [{label}] CheXbert clinical F1 ...", flush=True)
+        cols["chexbert_f1"] = _chexbert_f1(hyps, refs, ccfg)
 
     df = pd.DataFrame({"key": keys, **cols})
     df["n_words_pred"] = [len(h.split()) for h in hyps]

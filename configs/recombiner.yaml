@@ -1,0 +1,668 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# §2.3 — Nhánh Recombinator: HAI candidate, HAI kiểm định ghép cặp
+# ═══════════════════════════════════════════════════════════════════════════
+# Câu hỏi của mục này, viết đủ một câu:
+#
+#     Giữ nguyên adapter LoRA đã được §2.2 đo, THÊM một nhánh tái tổ hợp đặc
+#     trưng thị giác có giám sát vào — chất lượng báo cáo sinh ra có đổi không,
+#     và đổi BAO NHIÊU?
+#
+#     A  lora_only     LoRA (preset ở khối `lora`), không thêm gì
+#     B  lora_recomb   A + Recombinator + QFormer(2 vector) + ClsHead (ASL)
+#
+# Cùng base, cùng dữ liệu, cùng seed, cùng lịch, cùng batch. Đúng MỘT thứ khác
+# nhau, và đó là điều kiện để hiệu số quan sát được quy về nhánh mới.
+#
+# ── Đọc file này thế nào ───────────────────────────────────────────────────
+# Khối `recombiner` mô tả HÌNH DẠNG của nhánh (sơ đồ chi tiết trong README).
+# Khối `classifier` mô tả HÀM MẤT MÁT có giám sát (ASL, λ) — hai thứ khác nhau
+# và cố ý không trộn vào nhau.
+#
+# ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
+# 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
+#    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
+# 2. MỘT QFormer, HAI VECTOR. Bản trước có hai QFormer (một cho head, một cho
+#    decoder). Sơ đồ chỉ có một, và 32 token của Recombinator nối THẲNG vào
+#    chuỗi decoder.
+# 3. CANDIDATE B CHẠY TRƯỚC. B là candidate duy nhất có thể hỏng vì lý do kiến
+#    trúc; A gần như chắc chắn chạy. Chạy A trước là trả 90 phút GPU rồi mới
+#    biết B không dựng được — và một cột lẻ không định nghĩa được phép so sánh
+#    ghép cặp.
+# ═══════════════════════════════════════════════════════════════════════════
+
+seed: 42
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HAI THÍ NGHIỆM, MỘT FILE CẤU HÌNH
+# ═══════════════════════════════════════════════════════════════════════════
+#   2.3  Nhánh Recombinator có đáng không?   A (LoRA) vs B (LoRA + nhánh)
+#        k = 2 -> bootstrap ghép cặp (BCa) + permutation.
+#   2.4  Cấu hình MoE nào tốt hơn?           5 cặp (top-k, n_experts)
+#        k = 5 -> Friedman + hậu kiểm Wilcoxon/Holm.
+#
+# Chọn bằng dòng lệnh, KHÔNG bằng cách sửa file:
+#     bash scripts/run_recomb.sh --exp 2.3
+#     bash scripts/run_recomb.sh --exp 2.4
+#
+# ── Vì sao MỘT file chứ không phải hai ─────────────────────────────────────
+# §2.4 "giữ nguyên vẹn mọi điều kiện thí nghiệm tại §2.3". Với hai file, câu đó
+# là một lời hứa: mỗi lần ai đó sửa `data.n_train` ở một bên mà quên bên kia,
+# hai mục thôi so được với nhau và KHÔNG có gì báo. Với một file, nó là một sự
+# thật cơ học — hai mục đọc cùng khối `data`, `base`, `prompt`, `train`,
+# `recombiner`, `classifier`, `metrics`.
+#
+# Cái KHÁC nhau gói gọn trong ba chỗ, và chỉ ba chỗ: `arms` vs `arms_moe`, khối
+# `moe`, và nhánh kiểm định trong `stats`.
+#
+# ── §2.4 LUÔN dùng concat ──────────────────────────────────────────────────
+# Mọi candidate của §2.4 đều CÓ nhánh Recombinator nối vào chuỗi decoder (cái
+# "concat" trong sơ đồ). §2.4 không hỏi lại câu của §2.3 — nó hỏi câu tiếp
+# theo, và nó hỏi trên nền mà §2.3 đã đo. Một candidate §2.4 không có nhánh thì
+# `vec_2` không tồn tại, và khi đó không có gì để định tuyến.
+experiment: "2.3"          # 2.3 | 2.4 — ghi đè bằng --exp
+
+# ── Chế độ huấn luyện: chọn bằng --mode, KHÔNG bằng cách sửa file ───────────
+#   scratch      nhánh khởi tạo ngẫu nhiên — thứ đã sinh ra MỌI bảng §2.3/§2.4
+#                hiện có. Đây là mặc định, và đổi mặc định ở đây là lặng lẽ đổi
+#                nghĩa của những bảng ấy.
+#   sup_pretrain chỉ nhánh học, bằng ASL; decoder KHÔNG chạy (khối `pretrain`).
+#   decoder_ft   nạp checkpoint pretrain rồi chạy §2.3/§2.4 bình thường, với
+#                `train.pretrained_lr_mult` + `classifier.lambda_warmup_pct_pretrained`.
+mode: scratch
+
+# ── Dữ liệu: Y HỆT §2.1 và §2.2, không đổi một dòng ─────────────────────────
+# Tập test khoá cứng là điều kiện để bảng §2.3 so được với bảng §2.2 và mốc nền
+# zero-shot của §2.1. Đổi tập chấm là làm mọi so sánh chéo giữa các mục mất
+# nghĩa — và §2.3 là mục dựa nhiều nhất vào so sánh chéo.
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  manifest_dir: ./data/section23_eval_3000
+  cache_dir: ./data
+  # Trần cạnh dài 512, cưỡng chế thật (xem src/imaging.py). Cache dùng CHUNG
+  # với §2.1/§2.2 nên phải ép lại mỗi lần chạy stage `data`.
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  assert_no_leak: true
+
+# ── Nhãn cho HEAD PHÂN LOẠI ─────────────────────────────────────────────────
+# Nguồn: csv_helper/labels.npz trong cùng repo dữ liệu. File này KHÔNG có schema
+# công bố, nên src/labels_cls.py TỰ DÒ (tên array, hướng ma trận, cách mã hoá)
+# rồi IN RA cái nó đã dò được. Kiểm bằng mắt MỘT lần trước khi tốn GPU:
+#
+#     python -m src.labels_cls
+#
+# Nếu bản dò sai, ghi thẳng tên array vào hai khoá dưới thay vì để nó đoán.
+labels:
+  npz: csv_helper/labels.npz
+  key_array: null        # null = tự dò (img_rel / keys / key / ids / index)
+  label_array: null      # null = tự dò (labels / y / label / onehot / values)
+  names_array: null      # null = tự dò (columns / label_names / names)
+
+  # Mã hoá nguồn -> ba lớp (neg, pos, uncertain). CHỈ dùng khi file lưu dạng
+  # (N, L) chứ không phải (N, L, 3): nếu đã là one-hot 3 chiều thì bảng này
+  # không được dùng tới và src/labels_cls.py nói rõ điều đó trong log.
+  #   CheXpert quy ước:  0 = âm, 1 = dương, -1 = không chắc, NaN = không đề cập
+  # "không đề cập" gộp vào `uncertain` chứ không vào `neg`: gộp vào neg là DẠY
+  # model rằng "không nói tới" nghĩa là "không có", và đó là một mệnh đề lâm
+  # sàng sai mà không phép kiểm nào ở cuối đường ống bắt được.
+  encoding:
+    neg: [0]
+    pos: [1]
+    nan_to: ignore
+  # Mẫu không tìm được nhãn: bỏ khỏi loss phân loại (mask), KHÔNG bỏ khỏi tập
+  # huấn luyện — nó vẫn dạy được decoder viết báo cáo. Số bị mask vào
+  # train_stats.json; vượt ngưỡng này thì DỪNG, vì lúc đó head phân loại gần
+  # như không được giám sát và nhánh Recombinator mất chỗ neo gradient.
+  max_missing_frac: 0.20
+
+# ── Base model: MỘT bản, lượng tử 4-bit, giữ nguyên cho cả hai candidate ────
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_recomb
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 2          # batch lúc SINH — thấp hơn §2.2 (4) vì nhánh
+                         # Recombinator giữ 4096×2560 activation cho mỗi ảnh
+  device_map_train: single
+  device_map_infer: auto
+  image:
+    do_pan_and_scan: false
+    processor_size: 896
+
+# ── Prompt: y hệt §2.1/§2.2, nguyên văn ─────────────────────────────────────
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  repetition_penalty: 1.0
+
+# ── CẤU HÌNH LoRA: CHỌN 1 TRONG 8 BIẾN THỂ CỦA §2.2 ─────────────────────────
+# §2.3 KHÔNG so các biến thể LoRA với nhau nữa — §2.2 làm việc đó. Ở đây LoRA
+# là HẰNG SỐ, và nó phải là một hằng số ĐÃ ĐƯỢC ĐO: chọn đúng một trong tám
+# arm mà §2.2 đã chạy, để hai candidate của §2.3 đứng trên một nền có số liệu
+# kèm theo thay vì trên một cấu hình mới không ai biết nó nằm đâu.
+#
+#     qlora_r4  qlora_r8  qlora_r16  qlora_r32
+#     qdora_r4  qdora_r8  qdora_r16  qdora_r32
+#
+# ĐÃ CHỌN: `qdora_r32` — rank lớn nhất trong tám arm, VÀ nhánh DoRA. Chọn ở đây
+# là CÓ CHỦ Ý và nó là hướng sai an toàn: nếu nối thêm nhánh SigLIP vẫn thắng
+# được một baseline đã ở cấu hình mạnh nhất mà §2.2 có, thì kết luận mạnh hơn
+# nhiều so với thắng một baseline rank 4 vốn đang thiếu sức.
+#
+# Cái giá của `qdora` so với `qlora`: DoRA phải chuẩn hoá cột trọng số mỗi bước,
+# và trên base 4-bit thì peft còn phải giải lượng tử để lấy chuẩn — đây là arm
+# ĐẮT NHẤT trong tám arm của §2.2 (~1.5-2× thời gian của qlora cùng rank). Bảng
+# chi phí ở README_2.3 mục 8 đã tính theo lựa chọn này.
+#
+# Đổi preset:  --set lora.preset=qdora_r16
+# Nếu §2.2 đã chạy xong và muốn lấy arm tốt nhất theo bảng của nó:
+#     --set lora.preset=from_2_2
+# (đọc runs/2.2_adapter_friedman/metrics/summary.csv, lấy dòng đầu — bảng đó đã
+#  được sort theo meanrank của metric chính; không có file thì DỪNG chứ không
+#  âm thầm rơi về mặc định)
+# ── PRESET LoRA: một hằng số cho CẢ HAI candidate ──────────────────────────
+# §2.3 không so các biến thể LoRA nữa — §2.2 làm việc đó. Ở đây LoRA là nền, và
+# nền phải là một giá trị ĐÃ ĐƯỢC ĐO: đúng một arm trong bảng §2.2.
+#
+# Preset đặt ở MỘT chỗ, không lặp trong từng arm. Lặp lại là mở đường cho một
+# lần gõ nhầm biến hai candidate thành hai rank khác nhau — và khi đó hiệu số
+# quan sát được vừa do nhánh vừa do rank, không tách ra được.
+#
+# Đổi preset:  --set lora.preset=qdora_r4
+lora:
+  preset: qlora_r4
+  presets:
+    qlora_r4:  {method: qlora, rank: 4}
+    qlora_r8:  {method: qlora, rank: 8}
+    qlora_r16: {method: qlora, rank: 16}
+    qlora_r32: {method: qlora, rank: 32}
+    qdora_r4:  {method: qdora, rank: 4}
+    qdora_r8:  {method: qdora, rank: 8}
+    qdora_r16: {method: qdora, rank: 16}
+    qdora_r32: {method: qdora, rank: 32}
+
+# ── HUẤN LUYỆN ─────────────────────────────────────────────────────────────
+train:
+  n_epochs: 1
+
+  # Candidate có Recombinator dò theo thứ tự này; batch tìm được sẽ khóa cho QLoRA-only.
+  batch_probe: true
+  batch_probe_sizes: [16, 12, 10, 8, 6, 4, 2, 1]
+  per_device_batch_size: 16
+  effective_batch_size: 32
+  grad_accum: 2                   # gợi ý ban đầu; phần dư vẫn tích đúng 32 mẫu
+
+  max_seq_len: 1024              # KHÔNG tính 32 token chèn thêm: chúng được
+                                 # chèn SAU khi mẫu đã bị cắt, nên candidate B
+                                 # không học trên báo cáo ngắn hơn A đúng 32
+                                 # token.
+  gradient_checkpointing: true
+  weight_decay: 0.03
+  adam_betas: [0.9, 0.95]
+  max_grad_norm: 1.0
+  logging_steps: 10
+
+  schedule:
+    impl: lambda
+    max_lr: 3.0e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+
+  # Nhánh mới là mạng DÀY ĐẶC, khác LoRA — weight decay riêng cho nó.
+  branch_weight_decay: 0.03
+
+  # Residual merge uses a learned scalar alpha; no sigmoid gate or L0 sparsity penalty.
+
+  # ── decoder_ft: NHÁNH ĐÃ PRETRAIN CHẠY LR THẤP HƠN ───────────────────────
+  # Cùng tính chất của AdamW ở trên, đọc theo chiều ngược lại: mỗi bước dịch
+  # tham số đi khoảng `lr` BẤT KỂ nó đã hội tụ hay chưa. Sau sup_pretrain,
+  # Recombinator + QFormer + ClsHead đang nằm ở một cực tiểu của ASL; ở bước 0
+  # của decoder_ft, CE là gradient MỚI và lớn. Với lr đỉnh dùng chung, vài chục
+  # bước đầu đủ để đẩy nhánh ra khỏi đó — mất TOÀN BỘ thứ pretrain vừa mua.
+  # Triệu chứng: cls_f1_pos tụt trong 10% đầu lịch rồi không quay lại, CE giảm
+  # bình thường, không exception, không một dòng log nào gọi tên nó.
+  #
+  # Áp ĐÚNG các khối trong pretrain_io.PRETRAINED_MODULES — cùng hằng số mà
+  # save_pretrain dùng. KHÔNG áp cho `route_gate` (còn tươi ở decoder_ft: hạ lr
+  # nó = router học chậm gấp mười, cho ra bảng định tuyến đầy expert chết vì lý
+  # do không liên quan gì tới MoE) và KHÔNG áp cho `gate`.
+  # Phải nằm trong (0, 1]; ngoài khoảng đó thì DỪNG.
+  pretrained_lr_mult: 0.1
+
+  # true = đóng băng hẳn thay vì hạ lr. Mặc định false: đóng băng biến ASL từ
+  # một LỰC thành một PHÉP ĐO, và nhánh thôi học được từ việc decoder cần gì ở
+  # nó. Đó là một ARM KHÁC trong bảng, không phải tinh chỉnh của arm decoder_ft.
+  freeze_pretrained: false
+
+  # ── CHỖ GẮN ADAPTER ──────────────────────────────────────────────────────
+  # exclude_prefixes quan trọng hơn ở §2.3 so với §2.2: nhánh Recombinator đọc
+  # last_hidden_state của CHÍNH vision tower này. Adapter lọt vào đó thì hai
+  # candidate khác nhau HAI thứ.
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  vision_adapter:
+    enabled: true
+    include_prefixes: [vision_tower, vision_model]
+    layers: second_half
+    method: qdora
+    rank: 4
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional       # alpha = alpha_ratio × rank
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+
+  quant:
+    load_in_4bit: true
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+
+# Candidate C: Recombiner output is added to the original Gemma 3 projector output.
+
+recombiner:
+  siglip_dim: 1152
+  out_dim: null
+  local:
+    n_blocks: 2
+    hidden: 2048
+    pool_factor: 4
+  head_dim: 64
+  dropout: 0.0
+  pool_stages: 4
+  merge_mode: add
+  merge_alpha_init: 1.0
+  dtype: null
+classifier:
+  enabled: true
+
+  # Decoder KHÔNG nhận logit của head. Bật lên là thêm một đường thông tin nữa
+  # vào candidate B, và khi đó hiệu số quan sát được vừa do đặc trưng SigLIP vừa
+  # do nhãn bệnh lý đã được dự đoán sẵn — hai kiểm định ghép cặp không tách
+  # được. Để `false` ở §2.3; nó thuộc mục sau.
+  feed_logits_to_decoder: false
+
+  n_labels: null                 # null = lấy từ labels.npz
+  n_classes: 2                   # neg / pos; uncertain/blank masked
+  attn_pool_heads: 8
+  hidden: 1024
+  dropout: 0.1
+
+  # Đầu vào của head là ĐÚNG MỘT vector (nhóm `sup` có kích thước 1), nên không
+  # có bước pool: pool trên một token là một phép biến đổi vô nghĩa tốn vài chục
+  # triệu tham số.
+
+  asl:
+    # gamma_neg áp cho ô có NHÃN = 0, gamma_pos cho ô có NHÃN = 1 — theo GIÁ TRỊ
+    # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
+    # dương và 2 ô âm; lớp `neg` bật ở phần lớn bệnh lý nên hai ô pos/uncertain
+    # gần như luôn mang nhãn 0 và dễ tới mức áp đảo tổng gradient.
+    gamma_neg: 2.0
+    gamma_pos: 0.0
+    # clip dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
+    # p < clip đóng góp ĐÚNG BẰNG 0, không phải chỉ nhỏ.
+    clip: 0.05
+    eps: 1.0e-8
+
+  # Trọng số của Sup Loss trong tổng: loss = CE + λ(step) · ASL.
+  lambda: 0.2
+
+  # λ warmup tuyến tính trong pct đầu của lịch, cùng nhịp warmup lr. Ở bước 0
+  # ClsHead cũng ngẫu nhiên như Recombinator, nên λ đầy ngay từ đầu là đẩy nhánh
+  # mới theo một gradient chưa mang thông tin gì — và LoRA tiêu những bước quý
+  # nhất của one-cycle để chiều nó.
+  lambda_warmup_pct: 0.1
+
+  # decoder_ft: TẮT. λ-warmup có đúng một lý do — ở bước 0 ClsHead ngẫu nhiên
+  # nên ASL lớn và áp đảo CE. Sau sup_pretrain tiền đề ấy không còn đúng.
+  # Giữ warmup ở đây nghĩa là trong 10% đầu lịch, ĐÚNG LÚC lr leo tới đỉnh và
+  # CE mạnh nhất, gần như không có lực nào giữ nhánh ở lại chỗ nó đã hội tụ —
+  # và đường loss trông hoàn toàn bình thường trong lúc pretrain bị xoá đi.
+  lambda_warmup_pct_pretrained: 0.0
+
+# §2.4 — MoE: Route_Gate hoạt động + Experts (LoRA)
+# ═══════════════════════════════════════════════════════════════════════════
+# Khối này KHÔNG được đọc khi --exp 2.3. Ở §2.3 nó chỉ là tài liệu về phần sẽ
+# được nối vào; ở §2.4 nó là hai mũi tên cuối cùng của sơ đồ tổng:
+#
+#     Route_Gate (vec_2) ─► Aux Loss
+#                  │
+#                  ▼
+#     Decoder [Experts (LoRA)]
+#
+# Mọi điều kiện khác — data, base, prompt, generate, lora.preset (rank/alpha),
+# train (batch, lịch, max_seq_len), recombiner (hình dạng nhánh), classifier
+# (ASL, λ), metrics — lấy nguyên từ các khối ở trên. Đó là nghĩa chính xác của
+# "giữ nguyên vẹn mọi điều kiện thí nghiệm tại MỤC 2.3".
+moe:
+  # Bật/tắt do `--exp` quyết định, không phải khoá này. Để `false` ở đây nghĩa
+  # là: chạy nhầm `python -m src.run_recomb` không có `--exp` thì ra §2.3, chứ
+  # không lặng lẽ ra một §2.4 nửa vời.
+  enabled: false
+
+  # ── Router: nhiễu -> clipping -> softmax -> top-k ────────────────────────
+  # Đúng bốn bước trong đặc tả §2.4.b.i. Lý do cho THỨ TỰ của chúng nằm ở
+  # docstring src/moe.py — tóm tắt: nhiễu phải đứng TRƯỚC top-k mới đổi được
+  # thứ hạng, và clipping phải MƯỢT mới không giết vĩnh viễn một expert.
+  router:
+    # Learnable Gaussian Noise: σ = softplus(noise_proj(vec_2)), CHỈ khi train.
+    # Bật nhiễu lúc sinh là để cùng một ảnh ra hai báo cáo khác nhau ở hai lần
+    # chạy — và cả §2.4 chấm greedy chính vì muốn con số lặp lại được.
+    noise: true
+    # bias khởi tạo của noise_proj -> σ₀ = softplus(-3.0) ≈ 0.049. Để 0 thì
+    # σ₀ ≈ 0.69, lớn hơn cả trần clipping C = 1.2, và top-k ở những bước đầu
+    # gần như là bốc thăm.
+    noise_init: -3.0
+
+    # Soft Logit-Clipping: C·tanh(logit/C). C = 1.2 theo đặc tả.
+    # KHÔNG phải clamp: clamp cho gradient bằng 0 ngoài khoảng, nên expert bị
+    # đẩy ra ngoài chết vĩnh viễn và không có gì trong log nói điều đó.
+    logit_clip_c: 1.2
+
+    # Chuẩn hoá lại trọng số trên k expert đã chọn. Tắt là để ĐỘ LỚN của delta
+    # LoRA đổi theo từng ảnh vì một lý do không liên quan tới ảnh — và tệ hơn,
+    # đổi theo K, đúng cái §2.4 đang so.
+    renormalize_topk: true
+
+  # ── Aux Loss: Experts Exploration ────────────────────────────────────────
+  # Dạng load-balancing của Switch Transformer / GShard:
+  #     aux = E · Σ_i f_i · P_i        f = tỉ lệ lượt định tuyến (không grad)
+  #                                    P = xác suất trung bình   (có grad)
+  # aux = 1.0 khi cân hoàn hảo, = E khi mọi ảnh dồn vào một expert. Con số này
+  # đọc thẳng được và nó vào REPORT.md.
+  #
+  # Nó KHÔNG ép chia đều — nó làm việc dồn vào một expert trở nên đắt, tức là
+  # nhả chỗ cho những expert ít cơ hội hơn. Đó là "Experts Exploration".
+  aux:
+    kind: switch_load_balance
+    # loss = CE + λ(step)·ASL + α(step)·Aux. α nhỏ có chủ ý: CE vẫn là mục tiêu
+    # THẬT của thí nghiệm (báo cáo sinh ra được chấm bằng BLEU/ROUGE/BERTScore).
+    # α ngang CE là để một mục tiêu phụ kéo decoder đi, và khi bảng nói "K=6 kém
+    # hơn" thì không tách được phần nào do định tuyến, phần nào do cân tải.
+    #
+    # Giống `classifier.lambda`: đây là một hằng số ĐƯỢC CHỌN, không được tune.
+    # Tune trên test là rò rỉ; val 256 mẫu chỉ để NHÌN đường loss. §2.4 không
+    # trả lời được "α nào tốt nhất", và báo cáo phải nói thẳng như vậy.
+    alpha: 0.01
+    # Warmup cùng nhịp với λ và lr: ở bước 0 router ngẫu nhiên, nên tải ĐANG
+    # lệch là chuyện đương nhiên chứ không phải triệu chứng.
+    warmup_pct: 0.1
+
+  # ── Experts: E bộ LoRA trên ĐÚNG 4 ma trận Attn của §2.3 ─────────────────
+  # Danh sách module lấy từ `train.target_modules` + include/exclude_prefixes ở
+  # trên — CÙNG hàm `backbone.find_target_modules` mà §2.3 đưa cho peft. Dùng
+  # lại hàm ấy chứ không tự lọc là để "Experts gắn đúng chỗ adapter của §2.3
+  # gắn" kiểm được bằng cách ĐỌC.
+  expert:
+    # null = lấy rank từ `lora.preset` ở trên, tức là MỖI expert có đúng sức
+    # chứa của adapter §2.3. Ghi số ở đây là đưa thêm một biến thứ ba vào bảng
+    # ngoài (K, E).
+    rank: null
+    # alpha cũng theo `train.alpha_mode`/`alpha_ratio` như §2.3 khi để null.
+    alpha: null
+    dropout: 0.05
+
+    # ── VÌ SAO EXPERT LÀ LoRA CHỨ KHÔNG PHẢI DoRA ──────────────────────────
+    # `lora.preset` mặc định là `qdora_r4`, nhưng Experts của §2.4 là LoRA
+    # thuần. DoRA chuẩn hoá cột của (W + BA) ở MỖI bước; với mỗi ảnh một tổ hợp
+    # expert khác nhau thì chuẩn ấy phải tính lại theo từng ảnh, trên một ma
+    # trận nền 4-bit phải giải lượng tử trước — chi phí đó không trả được.
+    #
+    # CẢ NĂM candidate cùng chịu điều này, nên nó KHÔNG vào hiệu số giữa các
+    # (K, E) — thứ §2.4 đang đo. Cái nó chặn là phép so TRỰC TIẾP con số của
+    # §2.4 với cột `qdora_*` của §2.3, và điều đó vào phần Giới hạn.
+    method: lora
+
+  # Số mẫu test dùng để ghi lại quyết định định tuyến (ảnh nào -> expert nào).
+  # 0 = tắt. File này trả lời câu "E expert có thật sự được dùng không", và
+  # không có nó thì một candidate E=10 chỉ dùng 3 expert trông y hệt một
+  # candidate E=10 dùng đủ 10.
+  log_routing_n: 3000
+
+# ── NĂM CANDIDATE CỦA §2.4 ──────────────────────────────────────────────────
+# Đúng năm cặp (top-k, n_experts) trong đề cương. Mọi khoá khác của candidate —
+# preset LoRA, seed, thứ tự dữ liệu, batch, lịch học, chính sách ảnh, hình dạng
+# nhánh, ASL, λ, α — lấy từ các khối chung ở trên và GIỐNG HỆT nhau. Đó là điều
+# kiện để hiệu số theo từng ảnh quy về đúng hai con số (K, E).
+#
+# Vì sao không có cột "dense" (E = 1) ở đây: một candidate E = 1 không có gì để
+# định tuyến, nên Route_Gate, nhiễu, clipping, top-k và Aux Loss đều thoái hoá
+# — nó là một arm KHÁC LOẠI nằm trong một bảng Friedman xếp hạng theo khối, và
+# nó sẽ kéo mọi hạng trung bình theo một cách không ai đọc được. Mốc nền không
+# MoE là bảng §2.3 (candidate B), và nó được trích vào REPORT.md của §2.4 như
+# một hàng THAM CHIẾU, không phải một khối trong kiểm định.
+#
+# THỨ TỰ CHẠY không phải thứ tự ở đây: src/run_recomb.py chạy candidate NẶNG
+# nhất trước (E lớn nhất, rồi K lớn nhất), vì đó là candidate duy nhất có thể
+# hỏng vì VRAM — cùng lý lẽ với "B trước A" ở §2.3. Danh sách này là thứ tự
+# TRÌNH BÀY trong báo cáo.
+arms_moe:
+  - {id: k2_e4,  name: "K=2 · E=4",  top_k: 2, n_experts: 4,  enabled: true}
+  - {id: k4_e6,  name: "K=4 · E=6",  top_k: 4, n_experts: 6,  enabled: true}
+  - {id: k4_e8,  name: "K=4 · E=8",  top_k: 4, n_experts: 8,  enabled: true}
+  - {id: k6_e8,  name: "K=6 · E=8",  top_k: 6, n_experts: 8,  enabled: true}
+  - {id: k6_e10, name: "K=6 · E=10", top_k: 6, n_experts: 10, enabled: true}
+
+# ── HAI CANDIDATE ───────────────────────────────────────────────────────────
+# Chỉ MỘT khoá khác nhau: `recomb`. Mọi thứ còn lại — preset LoRA, seed, thứ tự
+# dữ liệu, batch, lịch học, chính sách ảnh — lấy từ các khối trên và giống hệt
+# nhau. Đó là điều kiện để hiệu số theo từng ảnh quy về đúng một nguyên nhân.
+#
+# `recomb` KHÔNG có giá trị mặc định trong code: quên khai là DỪNG. Một arm
+# lặng lẽ nhận `false` nghĩa là chạy candidate A hai lần, ra hai cột gần trùng
+# nhau, và kết luận "nhánh không có tác dụng" — đọc được, hợp lý, và sai.
+#
+# THỨ TỰ CHẠY không phải thứ tự ở đây: src/run_recomb.py luôn chạy B trước A.
+# Danh sách này là thứ tự TRÌNH BÀY trong báo cáo.
+arms:
+  - id: baseline_infer
+    name: "Baseline inference"
+    recomb: false
+    infer_only: true
+    enabled: true
+  - id: lora_only
+    name: "QLoRA only decoder"
+    recomb: false
+    enabled: true
+  - id: lora_recomb
+    name: "QDoRA vision + projector FT + QLoRA + Recombinator + classifier"
+    recomb: true
+    train_projector: true
+    enabled: true
+metrics:
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    strip_section_headers: false
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore:
+    enabled: true
+    model_type: roberta-large
+    num_layers: 17
+    batch_size: 32
+    rescale_with_baseline: false
+    keep: [f1]
+  chexbert:
+    enabled: true
+    code_dir: ./tools/CheXbert
+    checkpoint: ./models/chexbert.pth
+  primary: chexbert_f1
+
+# ── Kiểm định: HAI candidate -> quay về kiểm định GHÉP CẶP ──────────────────
+# §2.2 dùng Friedman vì k = 8 và "so từng đôi rồi hiệu chỉnh" không còn là cách
+# đúng để mở đầu. Ở đây k = 2: chỉ có MỘT cặp, nên không có tầng tổng thể nào
+# cần thiết và Friedman với k=2 chỉ là một dạng kém hơn của kiểm định dấu.
+#
+# Hai kiểm định trên CÙNG một vector hiệu số d_i = B_i − A_i, trả lời hai câu
+# khác nhau, và báo cáo in cả hai:
+#   paired bootstrap (BCa) — "hiệu số thật nằm trong khoảng nào"
+#   permutation (sign-flip) — "nếu hai candidate như nhau thì hiệu số cỡ này
+#                             hiếm tới đâu"
+# Họ kiểm định là 8 metric (BLEU-1..4, ROUGE-1/2/L, BERTScore-F1), hiệu chỉnh
+# Holm; BH in kèm để đọc đối chiếu.
+stats:
+  alpha: 0.05
+  n_boot: 4
+  bootstrap_sample_size: 1000
+  ci_method: percentile
+  n_perm: 10000
+  ci: 0.95
+  # Sàn effect size, cùng vai với rrb_floor của §2.2: n = 3000 khiến p rất nhỏ
+  # ở những hiệu số không nói được gì về thực hành. Cặp có |d_z| dưới sàn bị
+  # đánh dấu "không đáng kể" và KHÔNG được tính là thắng ở cột kết luận.
+  dz_floor: 0.10
+  # Kết luận chính thức lấy từ permutation + Holm trên 8 metric. Bootstrap CI
+  # là câu trả lời về ĐỘ LỚN, không phải về ý nghĩa.
+  primary_test: perm
+
+  # ── §2.4: k = 5 -> quay LẠI Friedman ──────────────────────────────────────
+  # §2.3 bỏ Friedman vì k = 2: ở đó "kiểm định tổng thể" và "kiểm định cặp" là
+  # CÙNG một câu hỏi, và chèn Friedman vào giữa chỉ thêm một tầng hiệu chỉnh
+  # Holm mà không thêm thông tin nào.
+  #
+  # Ở §2.4 thì k = 5, và "so từng đôi rồi hiệu chỉnh" không còn là cách đúng để
+  # MỞ ĐẦU: 10 cặp × 8 metric = 80 kiểm định, và Holm trên 80 kiểm định thì mọi
+  # hiệu số vừa phải đều chết. Thứ tự đúng là kiểm định TỔNG THỂ trước, rồi CHỈ
+  # hậu kiểm những metric đã qua cổng (thủ tục "được bảo vệ").
+  #
+  # Cơ chế dùng lại NGUYÊN VĂN src/stats_friedman.py của §2.2 — cùng bộ đã có
+  # ~30 phép kiểm trong scripts/selftest_friedman.py và đã cho ra bảng §2.2.
+  # Viết lại một bản thứ hai là mời một lỗi dấu vào giữa hai mục.
+  friedman:
+    # Sàn effect size cho HẬU KIỂM, cùng vai với dz_floor của §2.3: n = 3000
+    # khiến p rất nhỏ ở những hiệu số không nói được gì về thực hành. Cặp có
+    # |r_rb| dưới sàn bị đánh dấu "không đáng kể" và KHÔNG được tính là thắng.
+    rrb_floor: 0.10
+    # Sàn Kendall W cho kiểm định TỔNG THỂ. W < sàn nghĩa là mức đồng thuận về
+    # thứ hạng giữa 3000 khối rất thấp, dù p có nhỏ tới đâu.
+    kendall_w_floor: 0.05
+    # Ô hiệu số bằng ĐÚNG 0 (hai candidate sinh ra y hệt nhau — hay gặp với
+    # BLEU-4). `pratt` xếp hạng cả số 0 rồi bỏ, `wilcox` vứt trước khi xếp hạng.
+    # pratt bảo thủ hơn và không thổi phồng cỡ mẫu hiệu dụng.
+    zero_method: pratt
+    # In kèm permutation cho từng cặp, để bảng §2.4 đối chiếu thẳng được với
+    # bảng §2.3 mà không phải đổi đơn vị.
+    posthoc_permutation: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRETRAIN CÓ GIÁM SÁT — `--mode sup_pretrain`, CHẠY TRƯỚC §2.3/§2.4
+# ═══════════════════════════════════════════════════════════════════════════
+# Chỉ Recombinator + QFormer + ClsHead học, bằng ASL trên vec_1. Decoder KHÔNG
+# chạy và không một tham số nào của base nằm trong optimizer — đó là toàn bộ
+# định nghĩa của chế độ, và selftest kiểm nó bằng nguồn chứ không bằng lời.
+# Mọi điều kiện khác (data, base, recombiner, classifier.asl) lấy từ các khối
+# ở trên: checkpoint chỉ dùng lại được với ĐÚNG base và ĐÚNG chính sách ảnh ấy.
+# Chi tiết: README_pretrain.md.
+pretrain:
+  # 0 = TOÀN BỘ data.train_split_csv. Pretrain thấy nhiều dữ liệu hơn §2.3 là
+  # CÓ CHỦ Ý — và vì thế phải vào phần Giới hạn. Đặt một số cụ thể (vd 6400) để
+  # tách hai tập, và khi đó câu trả lời của §2.3 đổi nghĩa theo.
+  n_train: 0
+  n_epochs: 1
+
+  # eff_bs = 8 × 4 = 32, BẰNG train.per_device_batch_size × train.grad_accum.
+  # Không bắt buộc về toán, nhưng nó làm "một bước" có cùng nghĩa ở cả hai
+  # bảng. Hạ bs thì NHÂN grad_accum lên đúng bấy nhiêu, y như §2.3.
+  per_device_batch_size: 16
+  grad_accum: 2
+
+  # MỘT chu kỳ one-cycle trải trên TOÀN BỘ n_epochs — không phải mỗi epoch một
+  # chu kỳ. Dùng chung build_scheduler với train.schedule. Nối tiếp một ckpt
+  # trên lịch khác là DỪNG, trừ khi gõ --extend-schedule.
+  schedule:
+    impl: lambda
+    max_lr: 2e-4
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 100.0
+    anneal: cos
+    cycle_momentum: false
+  weight_decay: 0.01
+
+  # Phải GIỐNG lora.preset của §2.3: nhánh đọc last_hidden_state của chính
+  # vision tower này, và cách lượng tử hoá base đổi thì phân phối đặc trưng mà
+  # nhánh đã học cũng đổi — trong khi shape vẫn khớp nên không gì khác bắt được.
+  base_method: qlora
+
+  # Chọn epoch best trên VAL. `cls_acc` KHÔNG dùng được: lớp `neg` chiếm đa số
+  # áp đảo nên một head đoán `neg` cho MỌI ô vẫn đạt accuracy rất cao trong khi
+  # chưa học được gì. F1 của lớp `pos` không có chỗ trốn kiểu đó.
+  select_metric: cls_f1_pos
+  keep_last_ckpt: 2          # ckpt/best KHÔNG bao giờ bị dọn
+
+  subdir: sup_pretrain       # runs/sup_pretrain/ — tách khỏi runs/2.3_*, 2.4_*
+
+  # Repo MODEL riêng, KHÔNG dùng output.hub_repo (dataset kết quả). Hai lý do,
+  # cả hai cơ học: (1) push_results có ignore_patterns chặn *.safetensors nên
+  # trọng số đẩy vào đó bị bỏ qua ÂM THẦM; (2) repo kết quả bị ghi đè mỗi lần
+  # chạy lại stage report, còn ckpt pretrain phải sống lâu hơn mọi lần chạy
+  # §2.3/§2.4 dùng nó.
+  hub_repo: RGExp123/RGExp_sup_pretrain
+  hub_repo_type: model
+  hub_private: true
+  hub_subdir: best
+
+wandb:
+  enabled: true
+  project: rgexp-recombiner
+  entity: null
+  run_name: null
+  group: null
+  resume_same_run: false
+  mode: online
+  tags: [recombiner, qformer, siglip, asl, paired-bootstrap, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  # Hai thí nghiệm, hai thư mục — KHÔNG dùng chung. Ghi §2.4 đè lên runs/ của
+  # §2.3 là mất bảng mà §2.4 lấy làm mốc nền, và trộn adapter của hai mục trong
+  # một thư mục là mở đường cho `already_trained()` nhận nhầm một candidate của
+  # mục kia rồi bỏ qua stage train.
+  subdir: "2.3_three_candidate_attn_pool"
+  adapter_dir: ./adapters_2_3_three_candidate_attn_pool
+  subdir_moe: "2.4_moe"
+  adapter_dir_moe: ./adapters_2_4
+
+  # decoder_ft ghi vào thư mục RIÊNG bằng hậu tố này:
+  #   runs/2.3_recombiner_ft/ + adapters_2_3_ft/  (và _ft cho cặp 2.4)
+  # Rỗng = decoder_ft ghi ĐÈ lên lần chạy scratch, và already_trained() sẽ thấy
+  # adapter đã có rồi bỏ qua stage train — bảng "decoder_ft" khi đó là bảng
+  # scratch cũ, chấm lại.
+  ft_suffix: "_ft"

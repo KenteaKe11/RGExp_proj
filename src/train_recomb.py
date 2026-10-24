@@ -35,22 +35,16 @@ bảng §2.2; chỉ hiệu số A↔B bên trong §2.3 là thứ hai kiểm đ�
   2. Cùng THỨ TỰ dữ liệu. `torch.randperm` với một Generator seed cố định, đặt
      lại trước MỖI candidate. Không phải một lần đầu chương trình: làm thế thì
      candidate thứ hai bắt đầu từ trạng thái RNG mà candidate thứ nhất để lại.
-  3. Cùng SỐ BƯỚC và cùng đường cong, vì batch và grad_accum là hằng số đọc
-     thẳng từ config (xem mục dưới).
+  3. Cùng effective batch 32 và cùng số bước. Candidate đầu dò microbatch theo
+     ladder cấu hình; microbatch được chọn khóa cho candidate kế tiếp.
   4. Cùng độ dài NHÃN. Token nhánh được chèn SAU khi mẫu đã bị cắt về max_seq_len,
      nên candidate có nhánh không học trên báo cáo ngắn hơn đúng bấy nhiêu token.
 
-── Vì sao KHÔNG còn dò batch ───────────────────────────────────────────────
-Bản trước có một cái thang: hết VRAM thì chia đôi batch và nhân đôi grad_accum.
-Nó giữ được batch hiệu dụng, nhưng nó giấu một chuyện — nấc thật sự dùng phụ
-thuộc vào việc lúc ấy card còn trống bao nhiêu, tức là vào cái gì chạy trước.
-Với candidate B chạy trước A (thứ tự mặc định của §2.3, xem `src/run_recomb.py`),
-một cái thang còn có thể cho hai candidate hai nấc khác nhau.
-
-Nay: `train.per_device_batch_size` × `train.grad_accum` là hằng số, dùng chung
-cho cả hai candidate, và hết VRAM là DỪNG với thông báo chỉ đúng chỗ phải giảm.
-Một lần chạy dừng ở phút thứ ba rẻ hơn nhiều một bảng kết quả mà không ai nói
-được hai cột có cùng lịch học hay không.
+── Dò batch và giữ effective batch ─────────────────────────────────────────
+Candidate đầu thử `train.batch_probe_sizes` theo thứ tự. Khi gặp OOM, lần chạy
+được khởi động lại từ đầu ở nấc kế. Mỗi optimizer step tích đúng
+`train.effective_batch_size` mẫu, kể cả khi batch cuối của bước là một microbatch
+nhỏ hơn. Candidate kế dùng microbatch đã chọn để giữ lịch học so sánh được.
 """
 from __future__ import annotations
 
@@ -176,6 +170,7 @@ def effective_rcfg(cfg: Cfg, spec: dict | None) -> dict:
     r["n_experts"] = int(spec["n_experts"])
     r["route_enabled"] = True
     r["route_noise_init"] = float(spec["noise_init"])
+    r["merge_mode"] = "concat"
     return r
 
 
@@ -345,7 +340,7 @@ class ClsReportDataset(ReportDataset):
         import torch
 
         item["cls_y"] = torch.from_numpy(self.y[i]).float()
-        item["cls_mask"] = torch.tensor(float(self.m[i]))
+        item["cls_mask"] = torch.from_numpy(np.asarray(self.m[i], dtype=np.float32))
         return item
 
 
@@ -382,7 +377,8 @@ def lambda_at(step: int, total: int, lam: float, warmup_pct: float) -> float:
 FREEZABLE_PARTS: dict = {
     "recombinator": lambda b: [b.recombinator],
     "cls_head": lambda b: [b.cls_head],
-    "cls_head.pooling_stack": lambda b: [b.cls_head.head.pool],
+    "cls_head.attention_pool": lambda b: [b.cls_head.head.pool],
+    "cls_head.pooling_stack": lambda b: [b.cls_head.head.pool],  # legacy alias
     "cls_head.main_head": lambda b: b.cls_head.head.main_head_modules(),
 }
 DEFAULT_FREEZE_AFTER_PRETRAIN: tuple[str, ...] = ()
@@ -499,7 +495,7 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
 def learning_pretrained_parts(branch) -> list[str]:
     """Các phần ĐÃ pretrain còn tham số requires_grad — để log, không để quyết định."""
     out = []
-    for name in ("recombinator", "cls_head.pooling_stack", "cls_head.main_head"):
+    for name in ("recombinator", "cls_head.attention_pool", "cls_head.main_head"):
         if name.startswith("cls_head") and branch.cls_head is None:
             continue
         if any(p.requires_grad for m in FREEZABLE_PARTS[name](branch)
@@ -603,7 +599,8 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
         raise TrainUnusable(
             "không có tham số nào requires_grad. Adapter chưa gắn được, hoặc "
             "prepare_model_for_kbit_training đã đóng băng hết.")
-    opt = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+    betas = tuple(float(x) for x in tcfg.get("adam_betas", (0.9, 0.95)))
+    opt = torch.optim.AdamW(groups, betas=betas, eps=1e-8)
     return opt, {g["name"]: sum(p.numel() for p in g["params"]) for g in groups}
 
 
@@ -643,17 +640,10 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
     vis, aligned = recombiner.encode_vision(
         gemma, batch["pixel_values"].to(
             dtype=recombiner.float_dtype(gemma, torch.float32)))
-    embeds = recombiner.build_inputs_embeds(gemma, ids, aligned)
-
-    kw = {
-        "inputs_embeds": embeds,
-        "attention_mask": batch.get("attention_mask"),
-        "labels": batch.get("labels"),
-        "token_type_ids": batch.get("token_type_ids"),
-    }
     asl = None
     route_out = None
     cls_m: dict = {}
+    tokens = None
     if branch is not None:
         tokens, cls_logits, route = branch(vis.to(next(branch.parameters()).dtype))
         if router is not None:
@@ -663,6 +653,21 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
                     "của nhánh sai — xem train_recomb.effective_rcfg.")
             route_out = router(route[0], route[1])
             route_ctx.set(route_out["weights"])
+        if branch.merge_mode == "add":
+            aligned = branch.merge_adapter(aligned, tokens)
+        if cls_logits is not None and "cls_y" in batch:
+            asl = branch.sup_loss(cls_logits, batch["cls_y"], batch.get("cls_mask"))
+            cls_m = recombiner.cls_metrics(cls_logits.detach(), batch["cls_y"],
+                                           batch.get("cls_mask"))
+
+    embeds = recombiner.build_inputs_embeds(gemma, ids, aligned)
+    kw = {
+        "inputs_embeds": embeds,
+        "attention_mask": batch.get("attention_mask"),
+        "labels": batch.get("labels"),
+        "token_type_ids": batch.get("token_type_ids"),
+    }
+    if branch is not None and branch.merge_mode == "concat":
         at = recombiner.first_image_index(ids, img_token_id)
         kw.update(recombiner.inject_tokens(
             embeds, tokens, at,
@@ -670,10 +675,6 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
             labels=batch.get("labels"),
             token_type_ids=batch.get("token_type_ids"),
             token_type_value=tt_value))
-        if cls_logits is not None and "cls_y" in batch:
-            asl = branch.sup_loss(cls_logits, batch["cls_y"], batch.get("cls_mask"))
-            cls_m = recombiner.cls_metrics(cls_logits.detach(), batch["cls_y"],
-                                           batch.get("cls_mask"))
 
     kw = {k: v for k, v in kw.items() if v is not None}
     out = model(use_cache=False, **kw)
@@ -688,13 +689,7 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
 def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
               cls_pack: dict | None, out_dir: Path, tracker=None,
               max_steps_override: int | None = None) -> dict:
-    """Huấn luyện MỘT candidate. Hết VRAM là DỪNG, không tụt nấc.
-
-    Thông báo khi OOM nêu đúng những khoá LÀM ĐƯỢC gì đó, theo thứ tự sức nặng.
-    Nó không nói "giảm batch đi" chung chung, vì với nhánh Recombinator thì
-    batch thường không phải chỗ tốn nhất: Local Extractor đầu tiên chạy trên đủ
-    4096 patch × hidden, và attention là 256 query × 4096 patch.
-    """
+    """Huấn luyện một candidate, lùi theo batch ladder khi CUDA báo OOM."""
     import torch
 
     aid = arm["id"]
@@ -710,48 +705,50 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
             f"{aid}: §2.4 bật MoE nhưng candidate này không có nhánh. §2.4 LUÔN "
             f"dùng concat — không nhánh thì không có Route Head để định tuyến.")
 
-    bs = int(tcfg.get("per_device_batch_size", 1))
-    accum = int(tcfg.get("grad_accum", 16))
-    if bs < 1 or accum < 1:
+    initial_bs = int(tcfg.get("per_device_batch_size", 1))
+    effective_batch = int(tcfg.get("effective_batch_size",
+                                  initial_bs * int(tcfg.get("grad_accum", 16))))
+    sizes = ([int(x) for x in tcfg.get("batch_probe_sizes", [initial_bs])]
+             if bool(tcfg.get("batch_probe", False)) else [initial_bs])
+    sizes = list(dict.fromkeys(x for x in sizes if x <= initial_bs))
+    if not sizes or any(x < 1 for x in sizes) or effective_batch < 1:
         raise TrainUnusable(
-            f"train.per_device_batch_size={bs}, train.grad_accum={accum} — cả "
-            f"hai phải >= 1. §2.3 không dò batch nữa, hai số này là hằng số.")
+            f"Cấu hình batch không hợp lệ: start={initial_bs}, sizes={sizes}, "
+            f"effective_batch_size={effective_batch}.")
 
-    try:
-        return _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
-                           max_steps_override, bs, accum, tcfg, rcfg, ccfg,
-                           use_branch, aid, spec)
-    except Exception as e:
-        oom = is_oom(e)
-        note = f"{type(e).__name__}: {e}"[:200]
-        del e
-        free_vram()
-        if not oom:
-            raise
-        raise TrainUnusable(
-            f"{aid} HẾT VRAM ở batch {bs} × grad_accum {accum} ({note}).\n"
-            f"    §2.3 không tụt nấc batch: nấc phải giống nhau ở cả hai "
-            f"candidate, nên tự đổi ở đây là làm hỏng đúng thứ thí nghiệm đang "
-            f"đo. Sửa config rồi chạy lại cả hai.\n"
-            f"    Bốn khoá làm được gì đó, theo thứ tự sức nặng:\n"
-            f"      1. recombiner.local.hidden "
-            f"({(rcfg.get('local') or {}).get('hidden', 2048)}) — activation "
-            f"4096 patch × hidden của Local Extractor đầu. ĐỔI NÓ LÀ ĐỔI HÌNH "
-            f"DẠNG CHECKPOINT Stage 0 — phải pretrain lại.\n"
-            f"      2. train.max_seq_len ({tcfg.get('max_seq_len')}) + "
-            f"recombiner.n_dec_tokens ({rcfg.get('n_dec_tokens', 32)}) -> độ "
-            f"dài chuỗi thật mà decoder phải chạy.\n"
-            f"      3. train.per_device_batch_size ({bs}) — nhớ NHÂN grad_accum "
-            f"lên đúng bấy nhiêu lần để batch hiệu dụng {bs * accum} không đổi, "
-            f"nếu không thì số bước và lịch one-cycle đổi theo.\n"
-            f"      4. recombiner.dtype: float32 -> null (bf16) nếu đang ép "
-            f"fp32 — gấp đôi activation của nhánh."
-            + ("" if spec is None else
-               f"\n      5. §2.4: `n_experts` ({spec['n_experts']}) nhân thẳng "
-               f"vào activation LoRA (B×T×E×r) và vào số tham số học được. "
-               f"KHÔNG hạ nó để cứu VRAM — nó là biến đang được so. Nếu "
-               f"candidate E lớn nhất không vừa card thì cả bảng §2.4 phải hạ "
-               f"một khoá KHÁC, ở cả năm candidate."))
+    last_note = ""
+    for attempt, bs in enumerate(sizes, start=1):
+        accum = math.ceil(effective_batch / bs)
+        attempt_cfg = dict(tcfg, per_device_batch_size=bs, grad_accum=accum,
+                           effective_batch_size=effective_batch)
+        print(f"  batch probe {attempt}/{len(sizes)}: microbatch={bs}, "
+              f"microbatches/step={accum}, effective_batch={effective_batch}",
+              flush=True)
+        try:
+            stats = _train_once(cfg, arm, preset, train_df, cls_pack, out_dir,
+                                tracker, max_steps_override, bs, accum,
+                                attempt_cfg, rcfg, ccfg, use_branch, aid, spec)
+            stats["batch_probe_attempts"] = attempt
+            stats["batch_probe_sizes"] = sizes
+            stats["effective_batch"] = effective_batch
+            (out_dir / "train_stats.json").write_text(
+                json.dumps(stats, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8")
+            return stats
+        except Exception as e:
+            if not is_oom(e):
+                raise
+            last_note = f"{type(e).__name__}: {e}"[:200]
+            del e
+            free_vram()
+            if attempt < len(sizes):
+                print(f"  OOM ở microbatch {bs}; thử lại từ đầu với {sizes[attempt]}.",
+                      flush=True)
+                continue
+            raise TrainUnusable(
+                f"{aid} vẫn OOM ở batch nhỏ nhất {bs} (effective_batch="
+                f"{effective_batch}): {last_note}. Giảm activation của nhánh hoặc "
+                "max_seq_len rồi chạy lại cả hai candidate.")
 
 
 def _attach_experts(model, tcfg: dict, spec: dict):
@@ -824,9 +821,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     route_ctx = router = None
     mstats: dict = {}
     if spec is None:
+        adapter_cfg = dict(tcfg)
+        adapter_cfg["train_projector"] = bool(arm.get("train_projector", False))
+        vision_cfg = dict(tcfg.get("vision_adapter", {}) or {})
+        adapter_cfg["vision_adapter"] = (
+            vision_cfg if bool(arm.get("recomb")) else {"enabled": False})
         model, pstats = attach_adapter(
             model, {"method": preset["method"], "rank": preset["rank"], "id": aid},
-            tcfg)
+            adapter_cfg)
     else:
         model, route_ctx, router, mstats = _attach_experts(model, tcfg, spec)
         pstats = {
@@ -906,20 +908,22 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                       "nhánh + adapter.", flush=True)
         bstats = branch.n_params()
         print(f"  nhánh: {branch.describe()}", flush=True)
+        route_desc = (f"{bstats['route_head']:,} (hoạt động)"
+                      if branch.route_head is not None else "không có Route Head")
         print(f"  tham số nhánh: {bstats['total']:,} "
               f"({bstats['trainable']:,} học được) — recombinator "
               f"{bstats['recombinator']:,} (local {bstats['recombinator_local']:,}"
               f" · global {bstats['recombinator_global']:,} · ffn "
               f"{bstats['recombinator_ffn']:,}) · cls_head "
-              f"{bstats['cls_head']:,} · route_head {bstats['route_head']:,} "
-              f"({'HOẠT ĐỘNG' if spec is not None else 'BẤT HOẠT'}) · dec_proj "
+              f"{bstats['cls_head']:,} · {route_desc} · dec_proj "
               f"{bstats['dec_proj']:,}", flush=True)
-        print(f"  vào decoder: Linear/GELU {bstats['n_tokens']} -> "
-              f"{bstats['n_dec_hidden']} -> Linear -> {bstats['n_dec_tokens']} "
-              f"token (trục token, khởi tạo = trung bình 2×2 tách ngang/dọc) -> nối THẲNG vào chuỗi (First), trước 256 token ảnh "
-              f"(Second), không cổng", flush=True)
+        alpha_desc = (f"{float(branch.merge_alpha.detach().cpu()):.5f}"
+                      if branch.merge_alpha is not None else "n/a")
+        print(f"  fusion vào decoder: {branch.merge_mode} · "
+              f"alpha={alpha_desc} "
+              f"(nếu additive thì adapter + alpha × Recombinator)", flush=True)
         if spec is not None:
-            print(f"  Route Head HOẠT ĐỘNG: Recombinator -> PoolingStack -> "
+            print(f"  Route Head HOẠT ĐỘNG: Recombinator -> TaskHead PoolingStack -> "
                   f"{spec['n_experts']} logit (+ nhiễu) -> Aux Loss và -> Top-"
                   f"{spec['top_k']} Gate -> Experts", flush=True)
 
@@ -929,7 +933,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                           cls_pack if use_branch else None, img_kw)
     pad_id = int(processor.tokenizer.pad_token_id or 0)
     n = len(ds)
-    steps = total_steps(n, bs, accum, int(tcfg.get("n_epochs", 1)))
+    effective_batch = int(tcfg.get("effective_batch_size", bs * accum))
+    steps = total_steps(n, effective_batch, 1, int(tcfg.get("n_epochs", 1)))
     if max_steps_override:
         steps = int(max_steps_override)
 
@@ -959,7 +964,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     tt_value = 1 if str(rcfg.get("token_type", "text")).lower() == "image" else 0
     clip = float(tcfg.get("max_grad_norm", 1.0))
 
-    print(f"  {n} mẫu · batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
+    micro_sizes = [min(bs, effective_batch - i)
+                   for i in range(0, effective_batch, bs)]
+    print(f"  {n} mẫu · microbatch {bs} × {len(micro_sizes)} (microbatch cuối "
+          f"{micro_sizes[-1]}) = eff_bs {effective_batch} "
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
 
@@ -990,10 +998,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     order = torch.randperm(n, generator=g).tolist()
     cursor = 0
 
-    def next_micro() -> dict:
+    def next_micro(batch_size: int) -> dict:
         nonlocal cursor, order
         rows = []
-        for _ in range(bs):
+        for _ in range(batch_size):
             if cursor >= len(order):
                 order = torch.randperm(n, generator=g).tolist()
                 cursor = 0
@@ -1018,24 +1026,24 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         aux_now = (moe_mod.aux_alpha_at(step, steps, aux_alpha, aux_warm)
                    if spec else 0.0)
         step_ce = step_asl = step_aux = 0.0
-        for _ in range(accum):
-            batch = next_micro()
+        for micro_size in micro_sizes:
+            batch = next_micro(micro_size)
             ce, asl, route_out, cls_m = _forward_loss(
                 model, gemma, branch, batch, img_tok, tt_value, router, route_ctx)
             loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
             if route_out is not None:
                 loss = loss + aux_now * route_out["aux"].to(ce.dtype)
-                step_aux += float(route_out["aux"].detach()) / accum
+                step_aux += float(route_out["aux"].detach()) * micro_size / effective_batch
                 rstats.update(route_out)
-            (loss / accum).backward()
+            (loss * (micro_size / effective_batch)).backward()
             # SAU backward, không trước: checkpointing không-reentrant tính lại
             # forward trong lúc backward, và lần chạy lại ấy vẫn cần trọng số
             # định tuyến. Xem docstring `_forward_loss`.
             if route_ctx is not None:
                 route_ctx.clear()
-            step_ce += float(ce.detach()) / accum
+            step_ce += float(ce.detach()) * micro_size / effective_batch
             if asl is not None:
-                step_asl += float(asl.detach()) / accum
+                step_asl += float(asl.detach()) * micro_size / effective_batch
             if cls_m:
                 last_cls = cls_m
         grad_norms = recombiner.recombinator_grad_norms(branch)
@@ -1133,7 +1141,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "param_groups": n_by_group,
         "n_train": len(train_df), "n_substituted_too_long": ds.n_skipped,
         "steps": steps, "batch_size": bs, "grad_accum": accum,
-        "effective_batch": bs * accum,
+        "effective_batch": effective_batch,
         "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
         "do_pan_and_scan": bool(imaging.policy(cfg)["do_pan_and_scan"]),
         "processor_size": imaging.PROCESSOR_SIZE,
@@ -1141,6 +1149,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "schedule": dict(tcfg["schedule"]),
         "n_rec_tokens": int(bstats.get("n_tokens", 0)),
         "n_dec_tokens": int(bstats.get("n_dec_tokens", 0)),
+        "merge_alpha_final": (float(branch.merge_alpha.detach().float().cpu())
+                               if branch is not None and branch.merge_alpha is not None
+                               else None),
+        "merge_mode": branch.merge_mode if branch is not None else None,
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,
         "asl": dict(ccfg.get("asl", {}) or {}) if use_branch else None,

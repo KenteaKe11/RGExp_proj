@@ -148,7 +148,8 @@ def _norm_ppf(q: float) -> float:
 # ── Bootstrap ghép cặp ──────────────────────────────────────────────────────
 def paired_bootstrap(d: np.ndarray, n_boot: int, rng: np.random.Generator,
                      alpha: float = 0.05, method: str = "bca",
-                     chunk: int = 1000) -> dict:
+                     chunk: int = 1000,
+                     sample_indices: np.ndarray | None = None) -> dict:
     """Lấy lại mẫu THEO ẢNH. Trả trung bình hiệu số + CI + p bootstrap.
 
     `method`:
@@ -184,12 +185,17 @@ def paired_bootstrap(d: np.ndarray, n_boot: int, rng: np.random.Generator,
     done = 0
     while done < n_boot:
         m = min(chunk, n_boot - done)
-        idx = rng.integers(0, n, size=(m, n))
+        idx = (sample_indices[done:done+m] if sample_indices is not None
+               else rng.integers(0, n, size=(m, n)))
         means[done:done+m] = d[idx].mean(axis=1)
         centred[done:done+m] = dc[idx].mean(axis=1)
         done += m
 
     out["boot_se"] = float(means.std(ddof=1))
+    # When an explicit shared resample matrix is supplied, use the average of
+    # the resampled subset means as the reported point estimate.
+    if sample_indices is not None:
+        out["mean_diff"] = float(means.mean())
     out["p_boot"] = float(min(1.0, (int(np.count_nonzero(
         np.abs(centred) >= abs(obs) - 1e-15)) + 1) / (n_boot + 1)))
 
@@ -304,12 +310,19 @@ def compare_all(scores: dict[str, pd.DataFrame], metrics: list[str],
     dz_floor = float(cfg_stats.get("dz_floor", 0.10))
     rng = np.random.default_rng(seed)
 
+    # One shared set of paired resamples for every metric, so the clinical
+    # primary and text metrics use exactly the same test-case draws.
+    first = next(iter(scores.values()))
+    n_rows = len(first)
+    sample_indices = rng.integers(0, n_rows, size=(n_boot, n_rows))
+
     rows = []
     for m in metrics:
         a = scores[arm_a][m].to_numpy(dtype=np.float64)
         b = scores[arm_b][m].to_numpy(dtype=np.float64)
         d = b - a
-        bs = paired_bootstrap(d, n_boot, rng, alpha=alpha, method=ci_method)
+        bs = paired_bootstrap(d, n_boot, rng, alpha=alpha, method=ci_method,
+                              sample_indices=sample_indices)
         pm = permutation_paired(d, n_perm, rng)
         dz = cohen_dz(d)
         n_tie = int(np.count_nonzero(d == 0.0))

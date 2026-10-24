@@ -51,8 +51,8 @@ Chạy A trước nghĩa là trả 90 phút GPU rồi mới biết B không dự
 thứ ba.
 
 Thứ tự này KHÔNG được phép ảnh hưởng tới kết quả, và đó là điều kiện chứ không
-phải hy vọng: seed và thứ tự dữ liệu được đặt lại ngay trước MỖI candidate, và
-batch là hằng số trong config chứ không phải thứ dò được từ VRAM còn trống (xem
+phải hy vọng: seed và thứ tự dữ liệu được đặt lại ngay trước MỖI candidate; batch
+được dò ở candidate đầu rồi khóa cho candidate tiếp theo (xem
 docstring `src/train_recomb.py`). Nếu đổi thứ tự mà bảng kết quả đổi theo thì có
 một chỗ rò trạng thái, và nó là lỗi.
 """
@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import sys
 import time
@@ -76,7 +77,7 @@ STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
 EXPERIMENTS = ("2.3", "2.4")
 # §2.3/§2.4 đã chốt; `configs/` nay chỉ còn MỘT file (section25.yaml) và file
 # ấy không có `arms`/`arms_moe`/`stats.friedman`. Điểm vào này đọc bản ghi.
-DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "_archive" / "configs"
+DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "configs"
                   / "recombiner.yaml")
 
 
@@ -295,12 +296,13 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
         # và candidate A đơn giản là chạy nó với `branch = None`. Cho A đi
         # `gemma3_adapter` cho "gọn" là để hai cột trong bảng đi qua hai đường
         # sinh khác nhau — tương đương về toán, không giống nhau từng phép tính.
-        "runner": "gemma3_recomb",
+        "runner": "gemma3" if arm.get("infer_only") else "gemma3_recomb",
         "hf_id": b["hf_id"], "dtype": b.get("dtype", "bfloat16"),
         "batch_size": int(b.get("batch_size", 4)),
         "disable_compile": b.get("disable_compile", "auto"),
         "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
-        "adapter_dir": str(adapter_root / arm["id"]),
+        **({} if arm.get("infer_only") else
+           {"adapter_dir": str(adapter_root / arm["id"])}),
         # Không hợp nhất adapter ở candidate nào: hợp nhất ở A mà không hợp nhất
         # ở B là một khác biệt nữa giữa hai cột. (Trên base 4-bit thì hợp nhất
         # vốn đã bị tắt, nhưng đây phải là một quyết định, không phải may mắn.)
@@ -323,8 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--dry-run", action="store_true",
-                    help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy "
-                         "Hub. KHÔNG dò batch — batch là hằng số trong config.")
+        help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy Hub.")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại dù đã có")
     ap.add_argument("--no-push", action="store_true")
@@ -392,7 +393,8 @@ def main(argv: list[str] | None = None) -> int:
         print("✗ không arm nào được bật")
         return 2
     arm_a = None if is_moe else next(
-        (x["id"] for x in arms if not x.get("recomb")), None)
+        (x["id"] for x in arms if not x.get("recomb")
+         and not x.get("infer_only")), None)
     arm_b = None if is_moe else next(
         (x["id"] for x in arms if x.get("recomb")), None)
 
@@ -440,10 +442,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚠ không đọc được trạng thái cache ({e!r}) — coi như chưa có gì",
               flush=True)
     if "train" in stages:
+        trainable_arms = [x for x in arms if not x.get("infer_only")]
         if a.retrain or not cache:
-            arms_to_train = list(arms)
+            arms_to_train = list(trainable_arms)
         else:
-            arms_to_train = [x for x in arms
+            arms_to_train = [x for x in trainable_arms
                              if not cache["arms"].get(x["id"], {}).get("trained")]
         if not arms_to_train:
             print("⚙ mọi candidate đã có adapter + train_stats.json — BỎ QUA "
@@ -556,15 +559,20 @@ def main(argv: list[str] | None = None) -> int:
                                      cls_pack["stats"].get("frac_missing")})
 
         tcfg = dict(cfg["train"])
-        bs = int(tcfg.get("per_device_batch_size", 1))
-        accum = int(tcfg.get("grad_accum", 16))
-        print(f"  batch {bs} × grad_accum {accum} = eff_bs {bs*accum} "
-              f"[config, dùng chung cho cả hai candidate — §2.3 KHÔNG dò batch]",
-              flush=True)
-        manifest["batch"] = {"batch_size": bs, "grad_accum": accum,
-                             "effective_batch": bs * accum, "source": "config"}
+        bs = int(tcfg.get("per_device_batch_size", 16))
+        eff_bs = int(tcfg.get("effective_batch_size", 32))
+        probe_sizes = list(tcfg.get("batch_probe_sizes", [bs]))
+        print(f"  batch probe={bool(tcfg.get('batch_probe', False))} · "
+              f"thứ tự {probe_sizes} · effective_batch={eff_bs}; "
+              "batch được chọn ở candidate đầu sẽ dùng cho cả hai.", flush=True)
+        manifest["batch"] = {"initial_batch_size": bs,
+                             "probe_sizes": probe_sizes,
+                             "effective_batch": eff_bs,
+                             "source": "OOM backoff; shared across trainable candidates"}
 
         for arm in train_order(arms, exp):
+            if arm.get("infer_only"):
+                continue
             aid = arm["id"]
             odir = adapter_root / aid
             is_b = bool(arm.get("recomb"))
@@ -574,6 +582,17 @@ def main(argv: list[str] | None = None) -> int:
                 cached = json.loads((odir / "train_stats.json").read_text(encoding="utf-8"))
                 train_stats.append(cached)
                 manifest["arm_status"][aid] = {"trained": "cached"}
+                if is_b and bool(cfg["train"].get("batch_probe", False)):
+                    selected_bs = int(cached.get("batch_size", bs))
+                    cfg["train"]["per_device_batch_size"] = selected_bs
+                    cfg["train"]["grad_accum"] = math.ceil(eff_bs / selected_bs)
+                    cfg["train"]["batch_probe"] = False
+                    cfg["train"]["batch_probe_sizes"] = [selected_bs]
+                    manifest["batch"].update({
+                        "batch_size": selected_bs,
+                        "microbatches_per_step": math.ceil(eff_bs / selected_bs),
+                        "effective_batch": eff_bs,
+                        "selected_from_cached_candidate": aid})
                 continue
             tag = (f"top-k = {arm['top_k']} · {arm['n_experts']} expert · CÓ nhánh"
                    if is_moe else
@@ -584,6 +603,18 @@ def main(argv: list[str] | None = None) -> int:
                                       cls_pack if is_b else None, odir, tracker,
                                       max_steps_override=dry_steps)
                 train_stats.append(st)
+                if is_b and bool(cfg["train"].get("batch_probe", False)):
+                    selected_bs = int(st["batch_size"])
+                    cfg["train"]["per_device_batch_size"] = selected_bs
+                    cfg["train"]["grad_accum"] = math.ceil(eff_bs / selected_bs)
+                    cfg["train"]["batch_probe"] = False
+                    cfg["train"]["batch_probe_sizes"] = [selected_bs]
+                    manifest["batch"].update({
+                        "batch_size": selected_bs,
+                        "microbatches_per_step": math.ceil(eff_bs / selected_bs),
+                        "effective_batch": eff_bs,
+                        "selected_by_candidate": aid,
+                        "probe_attempts": st.get("batch_probe_attempts")})
                 manifest["arm_status"][aid] = {"trained": True,
                                                "minutes": st["minutes"],
                                                "batch_size": st["batch_size"],
@@ -690,10 +721,9 @@ def main(argv: list[str] | None = None) -> int:
             tracker.alert("§2.4 hỏng", f"run={run_id}: thiếu {missing}", "ERROR")
             tracker.finish(1)
             return 1
-    elif len(scores) != 2 or arm_a not in scores or arm_b not in scores:
-        print(f"✗ cần ĐÚNG hai candidate có điểm (A={arm_a}, B={arm_b}); "
-              f"đang có {sorted(scores)}. Phép so sánh ghép cặp không định "
-              f"nghĩa được với một cột.", flush=True)
+    elif len(scores) != len(want_ids) or missing:
+        print(f"✗ cần điểm của đủ {len(want_ids)} candidate; thiếu {missing}. "
+              f"Đang có {sorted(scores)}.", flush=True)
         tracker.alert("§2.3 hỏng", f"run={run_id}: {sorted(scores)}", "ERROR")
         tracker.finish(1)
         return 1
@@ -794,21 +824,23 @@ def main(argv: list[str] | None = None) -> int:
                 ab = pd.read_csv(ph_path)
     elif "stats" in stages:
         _hr("Bootstrap ghép cặp + Permutation")
-        from .stats_ab import compare_all, resolution_warning, summary_line
+        from .stats_multi import compare_pairs
+        from .stats_ab import resolution_warning
 
         cols = metric_columns(scores[arm_a])
         scfg = dict(cfg["stats"])
-        print(f"  {len(cols)} metric × 2 kiểm định trên {align_info['n_common']} "
-              f"ảnh ghép cặp (n_perm={scfg.get('n_perm')}, "
-              f"n_boot={scfg.get('n_boot')})", flush=True)
+        print(f"  {len(want_ids)} candidate · {len(cols)} metric · "
+              f"{scfg.get('n_boot')} bootstrap subset × "
+              f"{scfg.get('bootstrap_sample_size')} ảnh trên pool "
+              f"{align_info['n_common']} (n_perm={scfg.get('n_perm')})", flush=True)
         w = resolution_warning(int(scfg.get("n_perm", 10000)),
                                float(scfg.get("alpha", 0.05)), len(cols))
         if w:
             print(f"  ⚠ {w}", flush=True)
             manifest["stats_warning"] = w
         t0 = time.time()
-        ab = compare_all(scores, cols, scfg, arm_a=arm_a, arm_b=arm_b,
-                         seed=int(cfg.get("seed", 42)))
+        ab = compare_pairs(scores, cols, scfg, arm_ids=want_ids,
+                           seed=int(cfg.get("seed", 42)))
         ab.to_csv(ab_path, index=False)
         n_sig = int(ab["significant"].sum())
         n_mat = int(ab["significant_and_material"].sum())
@@ -816,7 +848,11 @@ def main(argv: list[str] | None = None) -> int:
               f"α={scfg.get('alpha', 0.05)}); {n_mat} trong đó có |dz| >= "
               f"{scfg.get('dz_floor', 0.1)}", flush=True)
         primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
-        line = summary_line(ab, primary, names.get(arm_a, arm_a), names.get(arm_b, arm_b))
+        pmain = ab[ab["metric"] == primary] if not ab.empty else ab
+        line = ("; ".join(
+            f"{names.get(r.arm_b, r.arm_b)} vs {names.get(r.arm_a, r.arm_a)}: "
+            f"Δ={r.mean_diff:.4f}, p_adj={r.p_perm_holm:.4g}"
+            for r in pmain.itertuples()) if not pmain.empty else "Không có kết quả metric chính")
         manifest["headline"] = line
         print(f"  {line}", flush=True)
         for wmsg in [x for x in ab["dz_warning"].tolist() if x]:

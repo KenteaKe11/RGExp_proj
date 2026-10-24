@@ -93,7 +93,7 @@ import torch.nn.functional as F
 N_VIS_TOKENS = 4096
 BRANCH_FILE = "recomb_branch.safetensors"
 BRANCH_META = "recomb_branch.json"
-BRANCH_FORMAT = "rgexp.recomb_branch/2"
+BRANCH_FORMAT = "rgexp.recomb_branch/4"
 
 # Khoá của những kiến trúc cũ (PDVR, QFormer, cổng Hard-Concrete). Còn sót
 # trong config là DỪNG: im lặng bỏ qua thì người đọc config tưởng chúng vẫn tác
@@ -444,17 +444,56 @@ class TaskHead(nn.Module):
         return [self.norm, self.fc1, self.drop, self.fc2]
 
 
+class AttentionPool(nn.Module):
+    """Learned-query multi-head attention: (B, N, D) -> (B, D)."""
+
+    def __init__(self, d_model: int, n_heads: int = 8):
+        super().__init__()
+        if int(d_model) % int(n_heads):
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}")
+        self.query = nn.Parameter(torch.empty(1, 1, int(d_model)))
+        nn.init.normal_(self.query, mean=0.0, std=0.02)
+        self.norm = RMSNorm(int(d_model))
+        self.pool = nn.MultiheadAttention(int(d_model), int(n_heads), batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.norm(self.query.expand(x.shape[0], -1, -1))
+        kv = self.norm(x)
+        pooled, _ = self.pool(q, kv, kv, need_weights=False)
+        return pooled[:, 0]
+
+
+class AttentionPoolHead(nn.Module):
+    """Attention pool over tokens, followed directly by a linear logit layer."""
+
+    def __init__(self, d_model: int, n_out: int, n_heads: int = 8):
+        super().__init__()
+        self.pool = AttentionPool(d_model, n_heads)
+        self.output_norm = RMSNorm(int(d_model))
+        self.classifier = nn.Linear(int(d_model), int(n_out))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pooled = self.pool(x)
+        return self.classifier(self.output_norm(pooled))
+
+    def main_head_modules(self) -> list[nn.Module]:
+        return [self.output_norm, self.classifier]
+
+
 class ClsHead(nn.Module):
-    """(B, 256, d) -> logit (B, L, C). target = L·C (14 · 3)."""
+    """(B, 256, d) -> learned-query attention pooling -> logits (B, L, C)."""
 
     def __init__(self, n_tokens: int, d_model: int, n_labels: int,
                  n_classes: int = 3, hidden: int = 1024, n_stages: int = 4,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, n_heads: int = 8):
         super().__init__()
         self.n_labels = int(n_labels)
         self.n_classes = int(n_classes)
-        self.head = TaskHead(n_tokens, d_model, self.n_labels * self.n_classes,
-                             hidden, n_stages, dropout)
+        self.n_tokens = int(n_tokens)
+        # `hidden`, `n_stages`, and `dropout` remain accepted so existing config
+        # loading stays stable; classification now uses attention pooling only.
+        self.head = AttentionPoolHead(d_model, self.n_labels * self.n_classes,
+                                      n_heads=n_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(x).view(x.shape[0], self.n_labels, self.n_classes)
@@ -529,7 +568,7 @@ class AsymmetricLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor,
                 mask: torch.Tensor | None = None) -> torch.Tensor:
-        """logits/target: (B, L, C). mask: (B,) — 1 = mẫu CÓ nhãn.
+        """logits/target: (B, L, C). mask: (B,) hoặc (B,L), 1 = nhãn hợp lệ.
 
         Mẫu bị mask vẫn đi qua đây (để shape không đổi giữa các batch) nhưng
         đóng góp 0. Vứt chúng khỏi batch sẽ làm batch của candidate B khác
@@ -563,6 +602,8 @@ class AsymmetricLoss(nn.Module):
         if mask is None:
             return loss.mean()
         m = mask.float().to(loss.device)
+        if m.ndim == 1:
+            m = m[:, None]
         denom = m.sum().clamp(min=1.0)
         return (loss * m).sum() / denom
 
@@ -591,7 +632,9 @@ def cls_metrics(logits: torch.Tensor, target: torch.Tensor,
     pred = logits.argmax(-1)                       # (B, L)
     gold = target.argmax(-1)                       # (B, L)
     if mask is not None:
-        keep = mask.float().view(-1, 1).to(pred.device) > 0.5
+        keep = mask.float().to(pred.device) > 0.5
+        if keep.ndim == 1:
+            keep = keep.view(-1, 1)
     else:
         keep = torch.ones_like(pred, dtype=torch.bool)
     keep = keep.expand_as(pred)
@@ -734,7 +777,8 @@ class RecombinerBranch(nn.Module):
             n_classes=int(c.get("n_classes", 3)),
             hidden=int(c.get("hidden", 1024)),
             n_stages=self.pool_stages,
-            dropout=float(c.get("dropout", 0.0))) if int(n_labels) > 0 else None
+            dropout=float(c.get("dropout", 0.0)),
+            n_heads=int(c.get("attn_pool_heads", 8))) if int(n_labels) > 0 else None
         # `route_enabled` nằm trong `spec` nên `load_branch` dựng lại đúng chế
         # độ đã huấn luyện — không phải chế độ đang ghi trong config lúc sinh.
         self.route_enabled = bool(r.get("route_enabled", False))
@@ -743,23 +787,32 @@ class RecombinerBranch(nn.Module):
             hidden=int(rh.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(rh.get("dropout", 0.0)),
-            noise_init=float(r.get("route_noise_init", -3.0)))
+            noise_init=float(r.get("route_noise_init", -3.0))) if self.route_enabled else None
         self.asl = AsymmetricLoss(
             gamma_neg=a.get("gamma_neg", 2.0),
             gamma_pos=float(a.get("gamma_pos", 0.0)),
             clip=float(a.get("clip", 0.05)),
             eps=float(a.get("eps", 1e-8)))
 
-        self.n_dec_tokens = int(r.get("n_dec_tokens", 64))
+        self.merge_mode = str(r.get("merge_mode", "concat" if self.route_enabled else "add"))
+        if self.merge_mode not in ("add", "concat"):
+            raise ValueError("recombiner.merge_mode must be 'add' or 'concat'")
+        self.n_dec_tokens = (self.n_tokens if self.merge_mode == "add" else
+                             int(r.get("n_dec_tokens", 64)))
         self.n_dec_hidden = int(r.get("n_dec_hidden", self.n_tokens // 2))
-        self.dec_proj = DecoderProjection(self.n_tokens, self.n_dec_tokens,
-                                          self.n_dec_hidden)
+        self.dec_proj = (nn.Identity() if self.merge_mode == "add" else
+                         DecoderProjection(self.n_tokens, self.n_dec_tokens,
+                                           self.n_dec_hidden))
+        self.merge_alpha = (nn.Parameter(torch.tensor(
+            float(r.get("merge_alpha_init", 1.0))))
+            if self.merge_mode == "add" else None)
 
         for m in (self.recombinator, self.cls_head, self.route_head):
             if m is not None:
                 _init(m)
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
-        self.route_head.init_noise()
+        if self.route_head is not None:
+            self.route_head.init_noise()
         # `dec_proj` KHÔNG đi qua `_init`: khởi tạo của nó là trung bình cụm.
 
     # ── forward ────────────────────────────────────────────────────────────
@@ -778,12 +831,30 @@ class RecombinerBranch(nn.Module):
         """
         rec = self.recombinator(vis)                       # (B, 256, d_model)
         logits = self.cls_head(rec) if self.cls_head is not None else None
-        route = self.route_head(rec) if self.route_enabled else None
-        return self.dec_proj(rec), logits, route
+        route = self.route_head(rec) if self.route_head is not None else None
+        tokens = rec if self.merge_mode == "add" else self.dec_proj(rec)
+        return tokens, logits, route
+
+    def merge_adapter(self, aligned: torch.Tensor, recomb_tokens: torch.Tensor) -> torch.Tensor:
+        """Residual fusion for §2.3: original Gemma projector output + α·Recombinator."""
+        if self.merge_mode != "add" or self.merge_alpha is None:
+            raise RuntimeError("merge_adapter is available only for additive fusion")
+        if aligned.shape != recomb_tokens.shape:
+            raise RuntimeError(
+                f"add fusion needs matching adapter/recombiner shapes; got "
+                f"{tuple(aligned.shape)} and {tuple(recomb_tokens.shape)}. "
+                f"Set recombiner.n_dec_tokens to the base projector token count.")
+        return aligned + self.merge_alpha.to(aligned.dtype) * recomb_tokens.to(aligned.dtype)
 
     def dec_stats(self) -> dict:
         """`dec_proj_rel_change` = ‖W − W₀‖ / ‖W₀‖ trên CẢ HAI lớp (nối lại),
         W₀ là khởi tạo trung bình cụm."""
+        if isinstance(self.dec_proj, nn.Identity):
+            return {"kind": "identity_residual_add", "n_in": self.n_tokens,
+                    "n_dec_hidden": self.n_tokens,
+                    "n_dec_tokens": self.n_tokens,
+                    "dec_proj_fro": 0.0, "dec_proj_init_fro": 0.0,
+                    "dec_proj_delta_fro": 0.0, "dec_proj_rel_change": 0.0}
         with torch.no_grad():
             dp = self.dec_proj
             w = torch.cat([dp.proj1.weight.detach().float().cpu().flatten(),
@@ -830,7 +901,11 @@ class RecombinerBranch(nn.Module):
             "n_heads": int(rec.global_extractor.n_heads),
             "pool_stages": self.pool_stages,
             "route_enabled": self.route_enabled,
-            "n_experts": self.route_head.n_experts,
+            "n_experts": self.route_head.n_experts if self.route_head is not None else 0,
+            "merge_mode": self.merge_mode,
+            "merge_alpha": float(self.merge_alpha.detach().cpu()) if self.merge_alpha is not None else None,
+            "cls_attention_heads": (int(self.cls_head.head.pool.pool.num_heads)
+                                     if self.cls_head is not None else 0),
         }
 
     def describe(self) -> str:
@@ -839,16 +914,17 @@ class RecombinerBranch(nn.Module):
         rec = self.recombinator
         loc = rec.local_extractors[0] if len(rec.local_extractors) else None
         hid = loc.up.out_features if loc is not None else 0
+        head_desc = ("ClsHead" + (" + RouteHead" if self.route_head is not None else ""))
+        merge_desc = (f"residual add, α={float(self.merge_alpha.detach().cpu()):.4f}"
+                      if self.merge_alpha is not None else "token concat")
         return (f"Recombinator: LocalExtractor×{n['n_local']} "
                 f"({self.d_vis}→{hid}→{self.d_vis}, {n['n_vis']}→{n['n_tokens']} "
                 f"token) -> Global MHA(Q={n['n_tokens']}, KV={n['n_vis']}, "
                 f"{n['n_heads']} head) -> FFN {self.d_vis}→{self.d_model} "
-                f"= ({n['n_tokens']}, {self.d_model}) · ClsHead/RouteHead: "
-                f"PoolingStack×{n['pool_stages']} -> MainHead "
+                f"= ({n['n_tokens']}, {self.d_model}) · {head_desc}: "
+                f"AttnPool(Q=1, H={n['cls_attention_heads']}) -> logits "
                 f"(target {getattr(self.cls_head, 'n_labels', 0)}×"
-                f"{getattr(self.cls_head, 'n_classes', 0)} / {n['n_experts']}) · "
-                f"dec_proj Linear/GELU {n['n_tokens']}→{n['n_dec_hidden']} -> "
-                f"Linear {n['n_dec_hidden']}→{n['n_dec_tokens']}")
+                f"{getattr(self.cls_head, 'n_classes', 0)}) · merge={merge_desc}")
 
 
 def _init(module: nn.Module) -> None:
@@ -885,7 +961,7 @@ def save_branch(branch: RecombinerBranch, out_dir: Path) -> Path:
         "n_tokens": branch.n_tokens,
         "n_dec_tokens": branch.n_dec_tokens,
         "route_enabled": branch.route_enabled,
-        "n_experts": branch.route_head.n_experts,
+        "n_experts": branch.route_head.n_experts if branch.route_head is not None else 0,
         "n_params": branch.n_params(),
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     return path

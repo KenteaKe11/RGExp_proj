@@ -683,6 +683,13 @@ def attach_adapter(model, arm: dict, tcfg: dict):
             model, use_gradient_checkpointing=bool(tcfg.get("gradient_checkpointing", True)),
             gradient_checkpointing_kwargs={"use_reentrant": False})
 
+    vision_cfg = dict(tcfg.get("vision_adapter") or {})
+    vision_targets = (find_target_modules(model, {
+        "target_modules": tcfg.get("target_modules", []),
+        "include_prefixes": vision_cfg.get("include_prefixes", ["vision_tower"]),
+        "exclude_prefixes": [],
+        "vision_layers": {"from": vision_cfg.get("layers", "second_half")},
+    }) if vision_cfg.get("enabled", False) else [])
     targets = find_target_modules(model, tcfg)
     task_type = tcfg.get("task_type", None)
     lcfg_kw = dict(
@@ -711,6 +718,34 @@ def attach_adapter(model, arm: dict, tcfg: dict):
     lcfg_kw = {k: v for k, v in lcfg_kw.items() if k in sig or k == "target_modules"}
     peft_model = get_peft_model(model, LoraConfig(**lcfg_kw))
 
+    vision_meta = None
+    if vision_targets:
+        vision_method = str(vision_cfg.get("method", "qdora")).lower()
+        vision_rank = int(vision_cfg.get("rank", 4))
+        vision_alpha = resolve_alpha(vision_rank, tcfg)
+        if vision_method not in ("lora", "qlora", "dora", "qdora"):
+            raise TrainUnusable(f"vision_adapter.method không hợp lệ: {vision_method}")
+        if uses_dora(vision_method) and "use_dora" not in sig:
+            raise TrainUnusable("QDoRA vision cần peft hỗ trợ use_dora (peft>=0.11).")
+        vision_kw = dict(r=vision_rank, lora_alpha=vision_alpha,
+                         lora_dropout=float(vision_cfg.get("lora_dropout",
+                                                           tcfg.get("lora_dropout", 0.05))),
+                         bias="none", target_modules=vision_targets)
+        if uses_dora(vision_method):
+            vision_kw["use_dora"] = True
+        vision_kw = {k: v for k, v in vision_kw.items() if k in sig or k == "target_modules"}
+        vision_name = str(vision_cfg.get("adapter_name", "vision_qdora"))
+        peft_model.add_adapter(vision_name, LoraConfig(**vision_kw))
+        try:
+            peft_model.set_adapter(["default", vision_name])
+        except (TypeError, ValueError) as e:
+            raise TrainUnusable(
+                "peft phiên bản hiện tại không hỗ trợ kích hoạt đồng thời adapter "
+                f"decoder và vision: {e}. Cần peft có multi-adapter support.") from e
+        vision_meta = {"name": vision_name, "method": vision_method,
+                       "rank": vision_rank, "alpha": vision_alpha,
+                       "n_target_modules": len(vision_targets)}
+
     # Adapter cho multi-modal projector (không có nn.Linear -> tự gắn bằng hook).
     pa_cfg = dict(tcfg.get("projector_adapter") or {})
     pa_meta = None
@@ -724,9 +759,14 @@ def attach_adapter(model, arm: dict, tcfg: dict):
               f"({pa_meta['n_params']:,} tham số)", flush=True)
 
     # ĐÓNG BĂNG MỌI THỨ NGOẠI TRỪ CÁC THAM SỐ LORA ĐƯỢC CHỈ ĐỊNH (FREEZE ALL)
+    train_projector = bool(tcfg.get("train_projector", False))
+    n_projector = 0
     for name, param in peft_model.named_parameters():
-        if "lora_" in name or "proj_adapter" in name:
+        if ("lora_" in name or "proj_adapter" in name or
+                (train_projector and "multi_modal_projector" in name)):
             param.requires_grad = True
+            if train_projector and "multi_modal_projector" in name:
+                n_projector += param.numel()
         else:
             param.requires_grad = False
 
@@ -734,11 +774,14 @@ def attach_adapter(model, arm: dict, tcfg: dict):
     n_all = sum(p.numel() for p in peft_model.parameters())
     print(f"  tham số huấn luyện: {n_train:,} / {n_all:,} "
           f"({100*n_train/max(1,n_all):.3f}%) · r={rank} alpha={alpha} "
-          f"dora={uses_dora(method)} 4bit={is_quantized(method)}", flush=True)
+          f"dora={uses_dora(method)} 4bit={is_quantized(method)} "
+          f"· projector_ft={n_projector:,}", flush=True)
     return peft_model, {"trainable_params": n_train, "all_params": n_all,
                         "alpha": alpha, "rank": rank, "method": method,
                         "n_target_modules": len(targets),
-                        "projector_adapter": pa_meta}
+                        "projector_adapter": pa_meta,
+                        "projector_trainable_params": n_projector,
+                        "vision_adapter": vision_meta}
 
 
 # ── Một arm ─────────────────────────────────────────────────────────────────

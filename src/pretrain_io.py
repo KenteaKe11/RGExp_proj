@@ -55,15 +55,15 @@ PRETRAINED_MODULES: tuple[str, ...] = ("recombinator", "cls_head")
 # Những khối có trong nhánh nhưng KHÔNG nhận gradient ở pretrain. Khai tường
 # minh (thay vì "phần còn lại") để `save_pretrain` dừng khi nhánh mọc thêm một
 # khối mới mà không ai quyết định nó thuộc nhóm nào.
-UNTRAINED_MODULES: tuple[str, ...] = ("route_head", "dec_proj")
+UNTRAINED_MODULES: tuple[str, ...] = ("route_head", "dec_proj", "merge_alpha")
 
 PRETRAIN_FILE = "sup_pretrain.safetensors"
 PRETRAIN_META = "sup_pretrain.json"
 TRAINER_STATE = "trainer_state.pt"      # chỉ để resume, KHÔNG bao giờ đẩy Hub
-# /2: Recombinator (Local×2 + Global MHA + FFN) + Pooling-Stack heads. Checkpoint
+# /4: adds learned-query attention pooling for the classification head. Checkpoint
 # /1 (PDVR + QFormer) không nạp được — `assert_compatible` dừng ở đây trước khi
 # đối chiếu khoá.
-FORMAT = "rgexp.sup_pretrain/2"
+FORMAT = "rgexp.sup_pretrain/4"
 
 
 class PretrainIncompatible(RuntimeError):
@@ -143,8 +143,9 @@ def save_pretrain(branch, out_dir: Path, extra: dict | None = None) -> Path:
         "d_model": int(branch.d_model),
         "n_labels": int(getattr(branch.cls_head, "n_labels", 0) or 0),
         "n_classes": int(getattr(branch.cls_head, "n_classes", 0) or 0),
+        "cls_pooling": "learned_query_attention",
         "route_enabled": bool(branch.route_enabled),
-        "n_experts": int(branch.route_head.n_experts),
+        "n_experts": int(branch.route_head.n_experts) if branch.route_head is not None else 0,
     }
     meta.update(dict(extra or {}))
     (out_dir / PRETRAIN_META).write_text(
@@ -218,6 +219,7 @@ def assert_compatible(meta: dict, branch, where: str = "") -> None:
         "d_model": int(branch.d_model),
         "n_labels": int(getattr(branch.cls_head, "n_labels", 0) or 0),
         "n_classes": int(getattr(branch.cls_head, "n_classes", 0) or 0),
+        "cls_pooling": "learned_query_attention",
         "n_tokens": int(branch.n_tokens),
         "pool_stages": int(branch.pool_stages),
     }

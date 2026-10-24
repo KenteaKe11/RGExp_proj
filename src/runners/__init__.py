@@ -25,9 +25,13 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3_adapter import Gemma3AdapterRunner
 
         return Gemma3AdapterRunner(cfg, mcfg, tracker)
+    if kind == "gemma3_recomb":
+        from .gemma3_recomb import Gemma3RecombRunner
+
+        return Gemma3RecombRunner(cfg, mcfg, tracker)
     raise ValueError(
-        f"runner không biết: {kind!r}. Hợp lệ ở §2.6: 'gemma3' (baseline), "
-        f"'gemma3_adapter' (ba arm rank 2/4/8).")
+        f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
+        f"'gemma3_recomb'.")
 
 
 __all__ = ["build", "Runner"]

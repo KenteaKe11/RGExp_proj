@@ -39,8 +39,8 @@ NAME_CANDIDATES = ("label_names", "classes", "columns", "cols", "pathologies")
 # của one-hot là "neg", và ASL trong config đánh gamma theo giá trị nhãn chứ
 # không theo tên lớp — nhưng bảng báo cáo thì đọc theo tên, nên đổi thứ tự ở đây
 # mà quên đổi ở report là một bảng đúng số, sai nhãn.
-CLASS_ORDER = ("neg", "pos", "uncertain")
-RAW_ENCODING = {0.0: 0, 1.0: 1, -1.0: 2}
+CLASS_ORDER = ("neg", "pos")
+RAW_ENCODING = {0.0: 0, 1.0: 1}
 
 
 class LabelsUnusable(RuntimeError):
@@ -277,12 +277,12 @@ def load_map(cfg: Cfg, verbose: bool = True) -> tuple[dict[str, np.ndarray], dic
         info["encoding_used"] = {str(k): int(v) for k, v in enc.items()}
         info["nan_to"] = None if nan_to is None else CLASS_ORDER[nan_to]
     elif raw.ndim == 3:
-        if raw.shape[-1] != len(CLASS_ORDER):
+        if raw.shape[-1] not in (2, 3):
             raise LabelsUnusable(
-                f"nhãn one-hot có {raw.shape[-1]} lớp, §2.3 thiết kế cho "
-                f"{len(CLASS_ORDER)} ({'/'.join(CLASS_ORDER)}). Sửa "
-                f"classifier.n_classes VÀ src/recombiner.py nếu thật sự muốn khác.")
-        onehot = raw.astype(np.float32)
+                f"nhãn one-hot có {raw.shape[-1]} lớp; cần [neg,pos] hoặc "
+                "[neg,pos,uncertain].")
+        # Drop the third (uncertain) channel. All-zero cells remain masked below.
+        onehot = raw[..., :2].astype(np.float32)
         info["converted_from"] = "onehot"
     else:
         raise LabelsUnusable(
@@ -307,7 +307,7 @@ def load_map(cfg: Cfg, verbose: bool = True) -> tuple[dict[str, np.ndarray], dic
 
 def attach(cfg: Cfg, keys: list[str], lut: dict[str, np.ndarray], n_labels: int,
            label: str = "train") -> tuple[np.ndarray, np.ndarray, dict]:
-    """[key] -> (nhãn (n, L, 3), mask (n,), thống kê).
+    """[key] -> (nhãn (n, L, 2), mask (n, L), thống kê).
 
     Mẫu thiếu nhãn nhận vector 0 và mask 0: nó VẪN dạy decoder viết báo cáo (CE
     bình thường) nhưng KHÔNG đóng góp vào ASL. Vứt hẳn mẫu là đổi tập huấn luyện
@@ -315,7 +315,7 @@ def attach(cfg: Cfg, keys: list[str], lut: dict[str, np.ndarray], n_labels: int,
     nhánh Recombinator vừa do 6400 mẫu đã thành 6100 — không tách ra được.
     """
     y = np.zeros((len(keys), n_labels, len(CLASS_ORDER)), dtype=np.float32)
-    m = np.zeros((len(keys),), dtype=np.float32)
+    m = np.zeros((len(keys), n_labels), dtype=np.float32)
     missing = []
     for i, k in enumerate(keys):
         v = lut.get(k)
@@ -323,7 +323,8 @@ def attach(cfg: Cfg, keys: list[str], lut: dict[str, np.ndarray], n_labels: int,
             missing.append(k)
             continue
         y[i] = v
-        m[i] = 1.0
+        # Uncertain, blank, and unmentioned observations are not negative labels.
+        m[i] = (np.asarray(v).sum(-1) > 0).astype(np.float32)
     frac = len(missing) / max(1, len(keys))
     st = {"n": len(keys), "n_missing": len(missing), "frac_missing": round(frac, 4)}
     if missing:

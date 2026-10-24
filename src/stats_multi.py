@@ -79,6 +79,7 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
     alpha = float(cfg_stats.get("alpha", 0.05))
     n_perm = int(cfg_stats.get("n_perm", 10000))
     n_boot = int(cfg_stats.get("n_boot", 10000))
+    boot_size = int(cfg_stats.get("bootstrap_sample_size", 0))
     ci_method = str(cfg_stats.get("ci_method", "bca"))
     dz_floor = float(cfg_stats.get("dz_floor", 0.10))
     scope = str(cfg_stats.get("adjust_scope", "pairs")).lower()
@@ -90,6 +91,12 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
     # tương quan với nhau theo một cách không ai khai báo, và Holm giả định
     # ngược lại.
     rng = np.random.default_rng(seed)
+    n_rows = len(next(iter(scores.values())))
+    sample_size = boot_size or n_rows
+    if sample_size < 2:
+        raise ValueError("stats.bootstrap_sample_size must be >= 2")
+    # Identical paired case draws for all candidates, pairs, and metrics.
+    sample_indices = rng.integers(0, n_rows, size=(n_boot, sample_size))
 
     rows = []
     for arm_a, arm_b in pairs:
@@ -97,13 +104,16 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
             a = scores[arm_a][m].to_numpy(dtype=np.float64)
             b = scores[arm_b][m].to_numpy(dtype=np.float64)
             d = b - a
-            bs = paired_bootstrap(d, n_boot, rng, alpha=alpha, method=ci_method)
+            bs = paired_bootstrap(d, n_boot, rng, alpha=alpha, method=ci_method,
+                                  sample_indices=sample_indices)
+            boot_mean_a = float(a[sample_indices].mean())
+            boot_mean_b = float(b[sample_indices].mean())
             pm = permutation_paired(d, n_perm, rng)
             n_tie = int(np.count_nonzero(d == 0.0))
             rows.append({
                 "pair": f"{arm_b}_vs_{arm_a}", "arm_a": arm_a, "arm_b": arm_b,
                 "metric": m, "n": d.size,
-                "mean_a": float(a.mean()), "mean_b": float(b.mean()),
+                "mean_a": boot_mean_a, "mean_b": boot_mean_b,
                 "mean_diff": bs["mean_diff"],
                 "rel_diff_pct": (100.0 * bs["mean_diff"] / abs(a.mean())
                                  if a.mean() else float("nan")),
