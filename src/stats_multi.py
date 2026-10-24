@@ -69,8 +69,16 @@ def _chexbert_permutation_p(a: pd.DataFrame, b: pd.DataFrame,
         chosen = swap[:, sample_indices]  # (m, n_subsets, subset_size)
         aa = np.where(chosen[..., None], bv[None, ...], av[None, ...]).sum(axis=2)
         bb = np.where(chosen[..., None], av[None, ...], bv[None, ...]).sum(axis=2)
-        fa = chexbert_micro_f1(aa[..., 0], aa[..., 1], aa[..., 2], axis=-1)
-        fb = chexbert_micro_f1(bb[..., 0], bb[..., 1], bb[..., 2], axis=-1)
+        # Counts are already summed over the 1,000 sampled images. Preserve
+        # the bootstrap axis here: (permutation chunk, 4 subsets), then average
+        # the four subset-level micro-F1 values for each permutation.
+        def micro_f1(counts):
+            tp, fp, fn = counts[..., 0], counts[..., 1], counts[..., 2]
+            den = 2.0 * tp + fp + fn
+            return np.divide(2.0 * tp, den, out=np.zeros_like(den), where=den > 0)
+
+        fa = micro_f1(aa)
+        fb = micro_f1(bb)
         permuted = (fb - fa).mean(axis=1)
         exceed += int(np.count_nonzero(np.abs(permuted) >= abs(observed) - 1e-15))
         done += m
