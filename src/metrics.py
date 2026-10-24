@@ -117,10 +117,10 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
     tokenizer = getattr(labeler, "tokenizer", None)
     model = getattr(labeler, "model", None)
     cls_logits = getattr(model, "cls_logits", None)
-    if tokenizer is None or cls_logits is None:
+    if tokenizer is None or model is None:
         raise RuntimeError(
-            "This f1chexbert build does not expose tokenizer + model.cls_logits; "
-            "cannot preserve blank/uncertain masks for ASL targets.")
+            "This f1chexbert build does not expose tokenizer + model; "
+            "cannot label reference and generated reports.")
     model.eval()
     dev = getattr(labeler, "device", next(model.parameters()).device)
     chunks: list[np.ndarray] = []
@@ -129,9 +129,30 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
         enc = tokenizer(reports[start:start + size], padding=True, truncation=True,
                         max_length=512, return_tensors="pt")
         ids = enc["input_ids"].to(dev)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dev)
         with torch.no_grad():
-            logits = cls_logits(ids)
-        states = torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
+            if cls_logits is not None:
+                logits = cls_logits(ids)
+            elif attention_mask is not None:
+                # f1chexbert 0.0.2's bert_labeler.forward expects both token
+                # IDs and the attention mask, and returns a list of 14 heads.
+                logits = model(ids, attention_mask)
+            else:
+                raise RuntimeError(
+                    "CheXbert tokenizer supplied no attention_mask and the "
+                    "model has no cls_logits interface.")
+        if isinstance(logits, (tuple, list)):
+            if len(logits) != 14:
+                raise ValueError(f"CheXbert returned {len(logits)} heads; expected 14.")
+            states = torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
+        else:
+            if logits.ndim != 3 or logits.shape[1] != 14:
+                raise ValueError(
+                    "CheXbert logits must be a list of 14 heads or a "
+                    f"(batch, 14, classes) tensor; got {tuple(logits.shape)}.")
+            states = logits.argmax(dim=-1)
         states = states.cpu().numpy().astype(np.int64, copy=False)
         if states.shape[1] != 14:
             raise ValueError(f"CheXbert returned {states.shape[1]} heads; expected 14.")
