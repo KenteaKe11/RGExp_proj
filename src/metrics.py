@@ -11,11 +11,7 @@ các bài báo khác — mọi kết luận thống kê dựa trên trung bình 
 from __future__ import annotations
 
 import re
-import subprocess
-import sys
-import tempfile
 from typing import Iterable
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -24,6 +20,88 @@ from .config import Cfg
 
 _WS = re.compile(r"\s+")
 _HEADER = re.compile(r"^\s*(findings|impression)\s*:\s*", re.IGNORECASE | re.MULTILINE)
+
+CHEXBERT_LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
+                   "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
+                   "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
+                   "Support Devices", "No Finding"]
+CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report/1"
+_CHEXBERT_LABELER = None
+
+
+def chexbert_micro_f1(tp, fp, fn, axis=-1):
+    """Micro-F1 from additive per-report CheXbert confusion counts."""
+    tp = np.asarray(tp, dtype=np.float64).sum(axis=axis)
+    fp = np.asarray(fp, dtype=np.float64).sum(axis=axis)
+    fn = np.asarray(fn, dtype=np.float64).sum(axis=axis)
+    den = 2.0 * tp + fp + fn
+    return np.divide(2.0 * tp, den, out=np.zeros_like(den, dtype=np.float64),
+                     where=den > 0)
+
+
+def _new_chexbert_labeler(device: str):
+    try:
+        from f1chexbert import F1CheXbert
+    except ImportError as e:
+        raise RuntimeError(
+            "CheXbert needs `f1chexbert`; install requirements.txt or run "
+            "`pip install f1chexbert==0.0.2`.") from e
+    return F1CheXbert(device=device)
+
+
+def _get_chexbert_labeler(cfg: dict):
+    global _CHEXBERT_LABELER
+    if _CHEXBERT_LABELER is None:
+        import torch
+        device = str(cfg.get("device", "auto"))
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        _CHEXBERT_LABELER = _new_chexbert_labeler(device)
+    return _CHEXBERT_LABELER
+
+
+def _raw_classes_with_labeler(labeler, reports: list[str],
+                              batch_size: int = 32) -> np.ndarray:
+    import torch
+
+    tokenizer = getattr(labeler, "tokenizer", None)
+    model = getattr(labeler, "model", None)
+    cls_logits = getattr(model, "cls_logits", None)
+    if tokenizer is None or cls_logits is None:
+        raise RuntimeError(
+            "This f1chexbert build does not expose tokenizer + model.cls_logits; "
+            "cannot preserve blank/uncertain masks for ASL targets.")
+    model.eval()
+    dev = getattr(labeler, "device", torch.device(device))
+    chunks: list[np.ndarray] = []
+    size = max(1, int(batch_size))
+    for start in range(0, len(reports), size):
+        enc = tokenizer(reports[start:start + size], padding=True, truncation=True,
+                        max_length=512, return_tensors="pt")
+        ids = enc["input_ids"].to(dev)
+        with torch.no_grad():
+            logits = cls_logits(ids)
+        states = torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
+        states = states.cpu().numpy().astype(np.int64, copy=False)
+        if states.shape[1] != 14:
+            raise ValueError(f"CheXbert returned {states.shape[1]} heads; expected 14.")
+        states[:, 13] = np.where(states[:, 13] == 1, 1, 2)
+        chunks.append(states)
+    return np.concatenate(chunks, axis=0) if chunks else np.empty((0, 14), dtype=np.int64)
+
+
+def chexbert_raw_classes(reports: list[str], batch_size: int = 32,
+                         device: str = "cpu") -> np.ndarray:
+    """Raw classes: blank=0,pos=1,neg=2,uncertain=3 for ASL target masking.
+
+    The final No Finding head is binary, so state 0 is mapped to common
+    negative=2. A local CPU labeler avoids reserving training GPU memory.
+    """
+    labeler = _new_chexbert_labeler(device)
+    states = _raw_classes_with_labeler(labeler, reports, batch_size)
+    if len(states):
+        states[:, 13] = np.where(states[:, 13] == 1, 1, 2)
+    return states
 
 
 def normalize(text: str, ncfg: dict) -> str:
@@ -107,50 +185,34 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
     return {f"bertscore_{k}": allv[k] for k in keep if k in allv}
 
 
-def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict) -> np.ndarray:
-    """Per-report positive-label F1 from the official Stanford CheXbert CLI."""
-    import pandas as pd
+def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.ndarray]:
+    """Per-report confusion counts from CheXbert labels.
 
-    code_dir = Path(cfg.get("code_dir", "./tools/CheXbert")).resolve()
-    checkpoint = Path(cfg.get("checkpoint", "./models/chexbert.pth")).resolve()
-    script = code_dir / "src" / "label.py"
-    if not script.is_file():
-        script = code_dir / "label.py"
-    if not script.is_file() or not checkpoint.is_file():
-        raise FileNotFoundError(
-            "CheXbert enabled but its official source/checkpoint is missing. "
-            f"Expected label.py under {code_dir} and checkpoint at {checkpoint}.")
-
-    names = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
-             "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
-             "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
-             "Support Devices", "No Finding"]
-    texts = list(refs) + list(hyps)
-    with tempfile.TemporaryDirectory(prefix="rgexp_chexbert_") as td:
-        root = Path(td)
-        input_csv = root / "reports.csv"
-        output_dir = root / "out"
-        output_dir.mkdir()
-        pd.DataFrame({"Report Impression": texts}).to_csv(input_csv, index=False)
-        subprocess.run([sys.executable, str(script), f"-d={input_csv}",
-                        f"-o={output_dir}", f"-c={checkpoint}"],
-                       cwd=code_dir, check=True)
-        labeled = pd.read_csv(output_dir / "labeled_reports.csv")
-    if len(labeled) != len(texts):
-        raise ValueError("CheXbert output row count does not match the input reports.")
-    missing = [n for n in names if n not in labeled]
-    if missing:
-        raise ValueError(f"CheXbert output is missing label columns: {missing}")
-    vals = labeled[names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    The original/reference report is the gold source; no dataset label file is
+    read. The package provides labeler/model weights, with no local checkpoint
+    path or checked-out source tree required.
+    """
+    global _CHEXBERT_LABELER
     n = len(refs)
-    gold, pred = vals[:n], vals[n:]
+    labeler = _get_chexbert_labeler(cfg)
+
+    raw = _raw_classes_with_labeler(labeler, list(refs) + list(hyps),
+                                    int(cfg.get("batch_size", 32)))
+    # f1chexbert's RRG binary mapping: Positive and Uncertain -> positive;
+    # Negative and not mentioned -> negative. No Finding has a binary head.
+    labels = np.zeros_like(raw, dtype=np.float64)
+    labels[:, :13] = ((raw[:, :13] == 1) | (raw[:, :13] == 3)).astype(np.float64)
+    labels[:, 13] = (raw[:, 13] == 1).astype(np.float64)
+    gold, pred = labels[:n], labels[n:]
     known = np.isin(gold, (0, 1)) & np.isin(pred, (0, 1))
     gpos, ppos = (gold == 1) & known, (pred == 1) & known
-    tp = np.sum(gpos & ppos, axis=1)
-    fp = np.sum(~gpos & ppos & known, axis=1)
-    fn = np.sum(gpos & ~ppos & known, axis=1)
+    tp = np.sum(gpos & ppos, axis=1).astype(np.float64)
+    fp = np.sum(~gpos & ppos & known, axis=1).astype(np.float64)
+    fn = np.sum(gpos & ~ppos & known, axis=1).astype(np.float64)
     den = 2 * tp + fp + fn
-    return np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
+    per_report = np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
+    return {"chexbert_f1": per_report, "chexbert_tp": tp,
+            "chexbert_fp": fp, "chexbert_fn": fn}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,7 +240,9 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
     ccfg = dict(mcfg.get("chexbert", {}))
     if ccfg.get("enabled", False):
         print(f"  [{label}] CheXbert clinical F1 ...", flush=True)
-        cols["chexbert_f1"] = _chexbert_f1(hyps, refs, ccfg)
+        cols.update(_chexbert_f1(hyps, refs, ccfg))
+        cols["chexbert_gold_source"] = np.full(
+            len(keys), CHEXBERT_GOLD_SOURCE, dtype=object)
 
     df = pd.DataFrame({"key": keys, **cols})
     df["n_words_pred"] = [len(h.split()) for h in hyps]
@@ -195,5 +259,7 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
 
 def metric_columns(df: pd.DataFrame) -> list[str]:
     """Các cột thật sự là metric (bỏ key và các cột mô tả)."""
-    skip = {"key", "n_words_pred", "n_words_ref", "empty"}
+    skip = {"key", "n_words_pred", "n_words_ref", "empty",
+            "chexbert_tp", "chexbert_fp", "chexbert_fn",
+            "chexbert_gold_source"}
     return [c for c in df.columns if c not in skip]

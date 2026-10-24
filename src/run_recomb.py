@@ -62,11 +62,13 @@ import argparse
 import json
 import math
 import platform
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .config import (Cfg, add_common_args, hf_token, load_config,
@@ -83,6 +85,17 @@ DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "configs"
 
 def _hr(t: str) -> None:
     print(f"\n═══ {t} ═══", flush=True)
+
+
+def _archive_stale(path: Path) -> None:
+    """Move an artifact made with an obsolete label source aside for recovery."""
+    if not path.exists():
+        return
+    stale = path.parent / "_stale"
+    stale.mkdir(parents=True, exist_ok=True)
+    target = stale / f"{path.stem}.{time.time_ns()}{path.suffix}"
+    shutil.move(str(path), str(target))
+    print(f"  ↪ artifact cũ -> {target}", flush=True)
 
 
 def _read_preds(path: Path) -> dict[str, str]:
@@ -429,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Trạng thái từ những lần chạy trước ─────────────────────────────────
     # Đọc đĩa TRƯỚC mọi thứ tốn kém. `arms_to_train` quyết định hai việc, và cả
     # hai đều đắt: có phải chuẩn bị (tải + resize) tập train hay không, và có
-    # phải dựng nhãn phân loại hay không. Cũ hơn, hai việc ấy chạy chỉ vì
+    # phải tạo target CheXbert từ report hay không. Cũ hơn, hai việc ấy chạy chỉ vì
     # `"train" in stages` — nghĩa là một lần chạy lại chỉ để in báo cáo vẫn trả
     # tiền cho 6400 ảnh, dù không candidate nào cần huấn luyện lại.
     arms_to_train: list[dict] = []
@@ -466,29 +479,10 @@ def main(argv: list[str] | None = None) -> int:
               "    export HF_TOKEN=hf_xxxxxxxx", flush=True)
 
     # ── Nhãn phân loại ──────────────────────────────────────────────────────
-    # Dựng TRƯỚC mọi thứ tốn kém. Nếu labels.npz có schema khác cái ta đoán thì
-    # phát hiện ra ở giây thứ 30 rẻ hơn nhiều so với ở giờ thứ hai của stage
-    # train — và ca tệ nhất không phải lỗi mà là nhãn lệch âm thầm.
+    # Khi train, prepare_cls dùng CheXbert trên report gốc; khi score, cùng
+    # labeler gán nhãn report gốc và report sinh.
     cls_pack = None
     need_b = any(x.get("recomb") for x in arms_to_train)
-    if need_b and need_train_run:
-        from . import labels_cls
-
-        _hr("Nhãn phân loại (ClsHead)")
-        # Chỉ DÒ SCHEMA ở đây. Nhãn thật phải căn theo thứ tự hàng của train_df,
-        # mà train_df chưa tồn tại — nên nó được dựng ở stage train. Cái đắt cần
-        # chết sớm là "labels.npz có đúng hình dạng ta nghĩ không", và câu đó
-        # trả lời được ngay bây giờ, trước khi tải 3000 ảnh.
-        try:
-            info = labels_cls.probe(cfg)
-            print(f"  labels.npz: {info.get('path')} · nhãn "
-                  f"{info.get('label_array')} · key {info.get('key_array')}",
-                  flush=True)
-        except labels_cls.LabelsUnusable as e:
-            print(f"\n✗ DỪNG — nhãn phân loại không dùng được:\n    {e}", flush=True)
-            tracker.alert(f"§{exp} dừng: nhãn phân loại", str(e), "ERROR")
-            tracker.finish(1)
-            return 5
 
     # ── data ────────────────────────────────────────────────────────────────
     from . import data as data_mod
@@ -570,13 +564,21 @@ def main(argv: list[str] | None = None) -> int:
                              "effective_batch": eff_bs,
                              "source": "OOM backoff; shared across trainable candidates"}
 
+        # Train target lấy trực tiếp từ report gốc qua CheXbert.
+        # Bất kỳ bảng điểm/report cũ nào cũng thuộc mô hình/nhãn cũ; lưu lại để
+        # khôi phục được nhưng không cho lần chạy mới đọc nhầm.
+        for stale_name in ("ab_tests.csv", "summary.csv", "pairwise_tests.csv"):
+            _archive_stale(run_dir / "metrics" / stale_name)
+        _archive_stale(run_dir / "REPORT.md")
+
         for arm in train_order(arms, exp):
             if arm.get("infer_only"):
                 continue
             aid = arm["id"]
             odir = adapter_root / aid
             is_b = bool(arm.get("recomb"))
-            if tr_mod.already_trained(odir, is_b, is_moe) and not a.retrain:
+            is_cached_train = tr_mod.already_trained(odir, is_b, is_moe)
+            if is_cached_train and not a.retrain:
                 print(f"  ✓ {aid}: đã huấn luyện ở {odir} — bỏ qua "
                       f"(--retrain để làm lại)", flush=True)
                 cached = json.loads((odir / "train_stats.json").read_text(encoding="utf-8"))
@@ -594,6 +596,8 @@ def main(argv: list[str] | None = None) -> int:
                         "effective_batch": eff_bs,
                         "selected_from_cached_candidate": aid})
                 continue
+            _archive_stale(run_dir / "predictions" / f"{aid}.jsonl")
+            _archive_stale(run_dir / "metrics" / f"per_sample_{aid}.csv")
             tag = (f"top-k = {arm['top_k']} · {arm['n_experts']} expert · CÓ nhánh"
                    if is_moe else
                    ("candidate B · CÓ nhánh" if is_b else "candidate A · không nhánh"))
@@ -688,10 +692,20 @@ def main(argv: list[str] | None = None) -> int:
             aid = arm["id"]
             csv_path = mdir / f"per_sample_{aid}.csv"
             if csv_path.exists() and not a.rescore:
-                scores[aid] = pd.read_csv(csv_path)
-                print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)",
-                      flush=True)
-                continue
+                cached = pd.read_csv(csv_path)
+                counts_ready = (all(c in cached.columns for c in
+                                    ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
+                                and "chexbert_gold_source" in cached.columns
+                                and cached["chexbert_gold_source"].eq(
+                                    "f1chexbert_reference_report/1").all())
+                if (not cfg.get("metrics", {}).get("chexbert", {}).get("enabled", False)
+                        or counts_ready):
+                    scores[aid] = cached
+                    print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)",
+                          flush=True)
+                    continue
+                print(f"  [{aid}] điểm cũ chưa có TP/FP/FN để bootstrap micro-F1; "
+                      "chấm lại từ predictions ...", flush=True)
             preds = _read_preds(pred_paths[aid])
             keys = [k for k in test_df["key"] if k in preds]
             if not keys:
@@ -701,8 +715,24 @@ def main(argv: list[str] | None = None) -> int:
                                   [ref_map[k] for k in keys], label=aid)
             sdf.to_csv(csv_path, index=False)
             scores[aid] = sdf
-            tracker.summary({f"score/{aid}/{k}": float(sdf[k].mean())
-                             for k in metric_columns(sdf)})
+            score_summary = {f"score/{aid}/{k}": float(sdf[k].mean())
+                             for k in metric_columns(sdf)}
+            if all(c in sdf.columns for c in
+                   ("chexbert_tp", "chexbert_fp", "chexbert_fn")):
+                from .metrics import chexbert_micro_f1
+                n_score = len(sdf)
+                boot_n = int(cfg.get("stats", {}).get("n_boot", 4))
+                boot_size = int(cfg.get("stats", {}).get(
+                    "bootstrap_sample_size", n_score))
+                boot_idx = np.random.default_rng(int(cfg.get("seed", 42))).integers(
+                    0, n_score, size=(boot_n, boot_size))
+                score_summary[f"score/{aid}/chexbert_f1"] = float(
+                    chexbert_micro_f1(
+                        sdf["chexbert_tp"].to_numpy(dtype=float)[boot_idx],
+                        sdf["chexbert_fp"].to_numpy(dtype=float)[boot_idx],
+                        sdf["chexbert_fn"].to_numpy(dtype=float)[boot_idx], axis=1
+                    ).mean())
+            tracker.summary(score_summary)
     else:
         for arm in arms:
             p = mdir / f"per_sample_{arm['id']}.csv"
@@ -711,6 +741,17 @@ def main(argv: list[str] | None = None) -> int:
 
     want_ids = [x["id"] for x in arms]
     missing = [i for i in want_ids if i not in scores]
+    if (str(cfg.get("metrics", {}).get("primary", "")) == "chexbert_f1"
+            and any(not (all(c in df.columns for c in
+                             ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
+                         and "chexbert_gold_source" in df.columns
+                         and df["chexbert_gold_source"].eq(
+                             "f1chexbert_reference_report/1").all())
+                    for df in scores.values())):
+        raise ValueError(
+            "Điểm CheXbert đã lưu theo nguồn gold cũ/schema cũ; cần gán nhãn lại "
+            "report gốc + report sinh bằng f1chexbert. Chạy lại scoring từ predictions: "
+            "python -m src.run_recomb --exp 2.3 --stages score,stats,report --rescore")
     if is_moe:
         if len(scores) < 3 or missing:
             print(f"✗ §2.4 cần điểm của ĐỦ {len(want_ids)} candidate; thiếu "

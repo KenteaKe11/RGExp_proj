@@ -52,6 +52,7 @@ torchvision
 sacrebleu>=2.4.0
 rouge-score>=0.1.2
 bert-score>=0.3.13
+f1chexbert==0.0.2
 nltk>=3.8
 
 # Thống kê: numpy thuần cho bootstrap/permutation; scipy để đối chiếu chéo.

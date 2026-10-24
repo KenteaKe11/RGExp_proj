@@ -22,7 +22,7 @@ bash scripts/run_recomb.sh --exp 2.3 --dry-run --stages data,train --no-wandb --
 bash scripts/run_recomb.sh --exp 2.3 --no-wandb --no-push
 ```
 
-Trước lệnh đầy đủ, đặt mã nguồn CheXbert ở `tools/CheXbert` và checkpoint ở `models/chexbert.pth` (xem [mục CheXbert](#chexbert)). Chạy lại cùng lệnh để tiếp tục từ artifacts đã có. Các lệnh hữu ích khác:
+Trước lệnh đầy đủ, cài dependencies trong `requirements.txt`, gồm `f1chexbert`. Chạy lại cùng lệnh để tiếp tục từ artifacts đã có. Các lệnh hữu ích khác:
 
 ```bash
 # Chỉ tái tạo thống kê và REPORT.md từ các điểm đã lưu
@@ -39,18 +39,18 @@ bash scripts/run_recomb.sh --exp 2.3 --retrain --no-wandb --no-push
 
 ## Thiết lập hiện hành
 
-- **Nhãn phụ trợ:** hai lớp `neg` và `pos`. Nhãn uncertain (`-1`, `2`), NaN/blank và ô không được nhắc đến bị mask khỏi ASL; chúng không bị chuyển thành nhãn âm.
+- **Nhãn phụ trợ:** CheXbert gán nhãn trực tiếp từ report gốc cho train/val. ASL dùng hai lớp `neg` và `pos`; uncertain và blank/unmentioned được mask.
 - **ASL:** dùng các giá trị mặc định của `AsymmetricLoss`: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
 - **Optimizer:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
 - **Batch:** thử microbatch `16, 12, 10, 8, 6, 4, 2, 1` khi gặp OOM; effective batch giữ đúng 32 bằng microbatch cuối nhỏ hơn khi cần. Candidate đầu chọn batch và candidate còn lại dùng cùng giá trị.
-- **Metric chính:** CheXbert per-report positive-label F1. BLEU, ROUGE và BERTScore được giữ làm metric phụ.
+- **Metric chính:** F1CheXbert micro trên 14 nhãn, tính riêng trong từng bootstrap subset 1.000 mẫu rồi lấy trung bình 4 F1. BLEU, ROUGE và BERTScore được giữ làm metric phụ.
 - **Đánh giá:** pool 3.000 ảnh được lấy theo seed từ test split, không chạy phần test còn lại. Tạo 4 bootstrap subset khác nhau; mỗi subset gồm 1.000 lượt lấy mẫu có hoàn lại từ pool này. Cùng bốn tập chỉ số được dùng cho cả ba candidate và mọi metric. Thống kê và report lấy trung bình qua 4 subset.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); entry point là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
 ## CheXbert
 
-Scorer gọi CLI `label.py` từ bản CheXbert chính thức cho cả report tham chiếu và report sinh. Cần đặt mã nguồn tại `tools/CheXbert` và checkpoint tại `models/chexbert.pth` (hoặc sửa `metrics.chexbert.code_dir` và `metrics.chexbert.checkpoint`). Checkpoint được phân phối riêng; xem hướng dẫn tải và điều kiện sử dụng tại [CheXbert của Stanford](https://github.com/stanfordmlgroup/CheXbert).
+Metric gọi CheXbert qua thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để gán nhãn cả report gốc lẫn report sinh. Khi train Candidate C, nhãn ASL cũng được tạo trực tiếp từ report target bằng CheXbert, uncertain và blank/unmentioned được mask. Không cần checkout repo mã nguồn hay đặt checkpoint thủ công; lần đầu khởi tạo thư viện tải checkpoint CheXbert và tokenizer/model BERT vào cache môi trường.
 
 ## Giới hạn thống kê
 

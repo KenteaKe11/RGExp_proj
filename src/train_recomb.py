@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import (imaging, labels_cls, moe as moe_mod, pretrain_io, recombiner)
+from . import (imaging, moe as moe_mod, pretrain_io, recombiner)
 from .backbone import (ReportDataset, TrainUnusable, attach_adapter,
                        build_scheduler, collate, cycle_endpoints,
                        find_target_modules,
@@ -178,7 +178,7 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
     """Kiểm những gì CHỈ §2.3 cần, trước khi nạp base. Trả (lỗi chặn, cảnh báo).
 
     `backbone.preflight_adapters` đã lo peft/bitsandbytes/GPU. Ở đây là ba thứ
-    riêng của nhánh: safetensors để ghi nhánh, labels.npz để có Sup Loss, và
+    riêng của nhánh: safetensors để ghi nhánh, f1chexbert để có Sup Loss, và
     pan&scan phải TẮT (bật lên thì Recombinator nhận khác 4096 token và dừng —
     thà nói trước còn hơn dừng ở giữa bước đầu tiên).
     """
@@ -204,12 +204,10 @@ def preflight_recomb(cfg: Cfg, arms: list[dict]) -> tuple[list[str], list[str]]:
     except TrainUnusable as e:
         errors.append(str(e))
     try:
-        info = labels_cls.probe(cfg)
-        if not info.get("label_array"):
-            errors.append(f"labels.npz ({info.get('path')}) không dò ra mảng nhãn "
-                          f"— candidate B không có Sup Loss để học.")
-    except Exception as e:
-        errors.append(f"nhãn phân loại không dùng được: {e}")
+        from f1chexbert import F1CheXbert  # noqa: F401
+    except ImportError:
+        errors.append("thiếu `f1chexbert` — cần để gán nhãn target từ report gốc; "
+                      "cài bằng `pip install f1chexbert==0.0.2`.")
     if not bool(dict(cfg.get("classifier", {}) or {}).get("enabled", True)):
         warns.append("⚠ classifier.enabled = false: candidate B chỉ còn CE, và "
                      "nhánh chỉ nhận gradient qua `dec_proj` vào decoder. "
@@ -294,23 +292,38 @@ def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
 
 # ══ Nhãn phân loại cho tập train ════════════════════════════════════════════
 def prepare_cls(cfg: Cfg, train_df: pd.DataFrame) -> dict | None:
-    """(y, mask, n_labels, stats) căn theo ĐÚNG thứ tự hàng của `train_df`.
-
-    Căn theo KEY, không theo vị trí trong labels.npz — xem docstring của
-    `src.labels_cls.load_map`. Trả None khi head phân loại tắt.
-    """
+    """Dựng target ASL bằng CheXbert trên report gốc theo đúng thứ tự train_df."""
     ccfg = dict(cfg.get("classifier", {}) or {})
     if not bool(ccfg.get("enabled", True)):
         print("  head phân loại TẮT -> không nạp nhãn", flush=True)
         return None
-    lut, info = labels_cls.load_map(cfg, verbose=True)
-    n_labels = int(ccfg.get("n_labels") or info["n_labels"])
-    y, mask, stats = labels_cls.attach(
-        cfg, train_df["key"].astype(str).tolist(), lut, n_labels, "train")
-    stats = dict(stats)
-    stats["n_labels"] = n_labels
-    stats["class_frac"] = info.get("class_frac")
-    stats["label_names"] = info.get("label_names")
+    from .metrics import CHEXBERT_LABELS, chexbert_raw_classes
+
+    n_labels = int(ccfg.get("n_labels") or len(CHEXBERT_LABELS))
+    if n_labels != len(CHEXBERT_LABELS):
+        raise TrainUnusable(f"classifier.n_labels={n_labels}; f1chexbert cung cấp "
+                            f"đúng {len(CHEXBERT_LABELS)} nhãn.")
+    reports = train_df["ref"].fillna("").astype(str).tolist()
+    raw = chexbert_raw_classes(
+        reports, batch_size=int(cfg.get("metrics", {}).get("chexbert", {}).get(
+            "batch_size", 32)), device="cpu")
+    known = (raw == 1) | (raw == 2)  # mask uncertain (3) và blank/unmentioned (0)
+    y = np.zeros((len(raw), n_labels, 2), dtype=np.float32)
+    y[..., 0] = (raw == 2).astype(np.float32)
+    y[..., 1] = (raw == 1).astype(np.float32)
+    mask = known.astype(np.float32)
+    n_cells = max(1, int(known.size))
+    stats = {
+        "n": len(reports), "n_labels": n_labels,
+        "label_source": "f1chexbert_from_reference_report/1",
+        "n_positive": int((raw == 1).sum()),
+        "n_negative": int((raw == 2).sum()),
+        "n_masked_uncertain_or_blank": int((~known).sum()),
+        "frac_masked": round(float((~known).sum()) / n_cells, 4),
+        "label_names": list(CHEXBERT_LABELS),
+    }
+    print(f"  CheXbert target từ report gốc: {len(reports)} report · {n_labels} nhãn · "
+          f"mask uncertain/blank={stats['frac_masked']:.1%}", flush=True)
     return {"y": y, "mask": mask, "n_labels": n_labels, "stats": stats}
 
 
@@ -1229,4 +1242,11 @@ def already_trained(out_dir: Path, needs_branch: bool,
     ok = ok and (d / "train_stats.json").exists()
     if ok and needs_branch:
         ok = recombiner.branch_exists(d)
+    if ok and needs_branch:
+        try:
+            train_stats = json.loads((d / "train_stats.json").read_text(encoding="utf-8"))
+            label_stats = train_stats.get("cls_label_stats") or {}
+            ok = label_stats.get("label_source") == "f1chexbert_from_reference_report/1"
+        except (OSError, ValueError, TypeError):
+            ok = False
     return bool(ok)

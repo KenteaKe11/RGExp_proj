@@ -37,9 +37,44 @@ import pandas as pd
 from .stats_ab import (align_blocks, cohen_dz, holm, materiality_warning,
                        paired_bootstrap, permutation_paired,
                        resolution_warning)
+from .metrics import chexbert_micro_f1
 
 __all__ = ["align_blocks", "pair_list", "compare_pairs", "summary_lines",
            "resolution_warning"]
+
+
+def _chexbert_bootstrap_scores(df: pd.DataFrame, sample_indices: np.ndarray) -> np.ndarray:
+    return chexbert_micro_f1(
+        df["chexbert_tp"].to_numpy(dtype=np.float64)[sample_indices],
+        df["chexbert_fp"].to_numpy(dtype=np.float64)[sample_indices],
+        df["chexbert_fn"].to_numpy(dtype=np.float64)[sample_indices], axis=1)
+
+
+def _chexbert_permutation_p(a: pd.DataFrame, b: pd.DataFrame,
+                            sample_indices: np.ndarray, observed: float,
+                            n_perm: int, rng: np.random.Generator,
+                            chunk: int = 64) -> float:
+    """Paired randomization test on the mean of the shared subset micro-F1s."""
+    cols = ("chexbert_tp", "chexbert_fp", "chexbert_fn")
+    ac = np.stack([a[c].to_numpy(dtype=np.float64) for c in cols], axis=1)
+    bc = np.stack([b[c].to_numpy(dtype=np.float64) for c in cols], axis=1)
+    # (n_subsets, subset_size, 3), in (TP, FP, FN) order.
+    av, bv = ac[sample_indices], bc[sample_indices]
+    n = ac.shape[0]
+    exceed = 0
+    done = 0
+    while done < n_perm:
+        m = min(chunk, n_perm - done)
+        swap = rng.integers(0, 2, size=(m, n), dtype=np.int8).astype(bool)
+        chosen = swap[:, sample_indices]  # (m, n_subsets, subset_size)
+        aa = np.where(chosen[..., None], bv[None, ...], av[None, ...]).sum(axis=2)
+        bb = np.where(chosen[..., None], av[None, ...], bv[None, ...]).sum(axis=2)
+        fa = chexbert_micro_f1(aa[..., 0], aa[..., 1], aa[..., 2], axis=-1)
+        fb = chexbert_micro_f1(bb[..., 0], bb[..., 1], bb[..., 2], axis=-1)
+        permuted = (fb - fa).mean(axis=1)
+        exceed += int(np.count_nonzero(np.abs(permuted) >= abs(observed) - 1e-15))
+        done += m
+    return float((exceed + 1) / (n_perm + 1))
 
 
 def pair_list(arm_ids: list[str], mode: str = "all",
@@ -104,6 +139,41 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
             a = scores[arm_a][m].to_numpy(dtype=np.float64)
             b = scores[arm_b][m].to_numpy(dtype=np.float64)
             d = b - a
+            has_chexbert_counts = all(
+                c in scores[arm_a].columns and c in scores[arm_b].columns
+                for c in ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
+            if m == "chexbert_f1" and has_chexbert_counts:
+                boot_a = _chexbert_bootstrap_scores(scores[arm_a], sample_indices)
+                boot_b = _chexbert_bootstrap_scores(scores[arm_b], sample_indices)
+                boot_d = boot_b - boot_a
+                observed = float(boot_d.mean())
+                centered = boot_d - observed
+                p_boot = float(min(1.0, (np.count_nonzero(
+                    np.abs(centered) >= abs(observed) - 1e-15) + 1) / (len(boot_d) + 1)))
+                p_perm = _chexbert_permutation_p(
+                    scores[arm_a], scores[arm_b], sample_indices, observed,
+                    n_perm, rng)
+                n_tie = int(np.count_nonzero(d == 0.0))
+                rows.append({
+                    "pair": f"{arm_b}_vs_{arm_a}", "arm_a": arm_a, "arm_b": arm_b,
+                    "metric": m, "n": d.size,
+                    "mean_a": float(boot_a.mean()), "mean_b": float(boot_b.mean()),
+                    "mean_diff": observed,
+                    "rel_diff_pct": (100.0 * observed / abs(float(boot_a.mean()))
+                                     if boot_a.mean() else float("nan")),
+                    "ci_lo": float(np.quantile(boot_d, alpha / 2)),
+                    "ci_hi": float(np.quantile(boot_d, 1 - alpha / 2)),
+                    "ci_method": "percentile over shared bootstrap F1s",
+                    "boot_se": float(boot_d.std(ddof=1)) if len(boot_d) > 1 else float("nan"),
+                    "p_perm": p_perm, "p_boot": p_boot,
+                    "cohen_dz": cohen_dz(d),
+                    "win_rate_b": float(np.mean(boot_d > 0)),
+                    "win_b": int(np.count_nonzero(boot_d > 0)),
+                    "win_a": int(np.count_nonzero(boot_d < 0)),
+                    "tie": int(np.count_nonzero(boot_d == 0.0)),
+                    "n_tied": n_tie, "frac_tied": n_tie / max(1, d.size),
+                })
+                continue
             bs = paired_bootstrap(d, n_boot, rng, alpha=alpha, method=ci_method,
                                   sample_indices=sample_indices)
             boot_mean_a = float(a[sample_indices].mean())

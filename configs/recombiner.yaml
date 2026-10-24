@@ -98,37 +98,6 @@ data:
   n_val: 256
   assert_no_leak: true
 
-# ── Nhãn cho HEAD PHÂN LOẠI ─────────────────────────────────────────────────
-# Nguồn: csv_helper/labels.npz trong cùng repo dữ liệu. File này KHÔNG có schema
-# công bố, nên src/labels_cls.py TỰ DÒ (tên array, hướng ma trận, cách mã hoá)
-# rồi IN RA cái nó đã dò được. Kiểm bằng mắt MỘT lần trước khi tốn GPU:
-#
-#     python -m src.labels_cls
-#
-# Nếu bản dò sai, ghi thẳng tên array vào hai khoá dưới thay vì để nó đoán.
-labels:
-  npz: csv_helper/labels.npz
-  key_array: null        # null = tự dò (img_rel / keys / key / ids / index)
-  label_array: null      # null = tự dò (labels / y / label / onehot / values)
-  names_array: null      # null = tự dò (columns / label_names / names)
-
-  # Mã hoá nguồn -> ba lớp (neg, pos, uncertain). CHỈ dùng khi file lưu dạng
-  # (N, L) chứ không phải (N, L, 3): nếu đã là one-hot 3 chiều thì bảng này
-  # không được dùng tới và src/labels_cls.py nói rõ điều đó trong log.
-  #   CheXpert quy ước:  0 = âm, 1 = dương, -1 = không chắc, NaN = không đề cập
-  # "không đề cập" gộp vào `uncertain` chứ không vào `neg`: gộp vào neg là DẠY
-  # model rằng "không nói tới" nghĩa là "không có", và đó là một mệnh đề lâm
-  # sàng sai mà không phép kiểm nào ở cuối đường ống bắt được.
-  encoding:
-    neg: [0]
-    pos: [1]
-    nan_to: ignore
-  # Mẫu không tìm được nhãn: bỏ khỏi loss phân loại (mask), KHÔNG bỏ khỏi tập
-  # huấn luyện — nó vẫn dạy được decoder viết báo cáo. Số bị mask vào
-  # train_stats.json; vượt ngưỡng này thì DỪNG, vì lúc đó head phân loại gần
-  # như không được giám sát và nhánh Recombinator mất chỗ neo gradient.
-  max_missing_frac: 0.20
-
 # ── Base model: MỘT bản, lượng tử 4-bit, giữ nguyên cho cả hai candidate ────
 base:
   hf_id: google/gemma-3-4b-it
@@ -323,7 +292,7 @@ classifier:
   # được. Để `false` ở §2.3; nó thuộc mục sau.
   feed_logits_to_decoder: false
 
-  n_labels: null                 # null = lấy từ labels.npz
+  n_labels: 14                   # CheXbert 14 labels, derived from reports
   n_classes: 2                   # neg / pos; uncertain/blank masked
   attn_pool_heads: 8
   hidden: 1024
@@ -526,8 +495,7 @@ metrics:
     keep: [f1]
   chexbert:
     enabled: true
-    code_dir: ./tools/CheXbert
-    checkpoint: ./models/chexbert.pth
+    device: auto                 # f1chexbert: CUDA nếu có, nếu không thì CPU
   primary: chexbert_f1
 
 # ── Kiểm định: HAI candidate -> quay về kiểm định GHÉP CẶP ──────────────────

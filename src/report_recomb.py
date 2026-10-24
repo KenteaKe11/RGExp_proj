@@ -98,6 +98,23 @@ def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
     for aid, df in scores.items():
         row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
         for m in metrics:
+            if m == "chexbert_f1" and all(
+                    c in df.columns for c in ("chexbert_tp", "chexbert_fp", "chexbert_fn")):
+                from .metrics import chexbert_micro_f1
+
+                if boot_idx is not None:
+                    subset_f1 = chexbert_micro_f1(
+                        df["chexbert_tp"].to_numpy(dtype=float)[boot_idx],
+                        df["chexbert_fp"].to_numpy(dtype=float)[boot_idx],
+                        df["chexbert_fn"].to_numpy(dtype=float)[boot_idx], axis=1)
+                    row[m] = float(subset_f1.mean())
+                    row[f"{m}_sd"] = (float(subset_f1.std(ddof=1))
+                                      if len(subset_f1) > 1 else float("nan"))
+                else:
+                    row[m] = float(chexbert_micro_f1(
+                        df["chexbert_tp"], df["chexbert_fp"], df["chexbert_fn"]))
+                    row[f"{m}_sd"] = float("nan")
+                continue
             values = df[m].to_numpy(dtype=float)
             if boot_idx is not None:
                 subset_means = values[boot_idx].mean(axis=1)
@@ -145,6 +162,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       f"{ns} bootstrap subset; mỗi subset lấy {bs} mẫu có hoàn lại từ pool. Cùng ma trận "
       "chỉ số được chia sẻ cho ba candidate và các metric; summary lấy trung bình qua "
       "các subset bootstrap. Chỉ số dựa trên bốn subset có độ phân giải thô.")
+    A("CheXbert F1 là micro-F1 trên 14 nhãn: mỗi subset cộng TP/FP/FN trên toàn bộ mẫu "
+      "trong subset, tính F1 một lần, rồi lấy trung bình F1 của bốn subset.")
     A("")
     A("## Candidate scores")
     A("")
