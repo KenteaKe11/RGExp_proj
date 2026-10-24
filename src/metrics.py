@@ -64,10 +64,15 @@ def _new_chexbert_labeler(device: str):
                 repo_id="StanfordAIMI/RRG_scorers", filename="chexbert.pth"))
             cache_dir.mkdir(parents=True, exist_ok=True)
             try:
-                os.link(cached_source, checkpoint)
+                # HF cache entries are often symlinks into ``blobs``. Resolve
+                # first: hard-linking the symlink itself can leave a dangling
+                # checkpoint path when that cache link is replaced/cleaned.
+                os.link(cached_source.resolve(strict=True), checkpoint)
             except OSError:
                 import shutil
                 shutil.copy2(cached_source, checkpoint)
+            if not checkpoint.is_file():
+                raise FileNotFoundError(checkpoint)
         except Exception as e:
             raise RuntimeError(
                 "f1chexbert downloaded CheXbert but its checkpoint is missing "
