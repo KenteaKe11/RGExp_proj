@@ -543,6 +543,8 @@ def apply_freeze(branch, names) -> int:
 def _branch_group(name: str) -> str:
     """Tên tham số của nhánh -> khoá trong `train.ft_lr`."""
     top = name.split(".", 1)[0]
+    if name.startswith(("merge_norm.", "merge_proj.")):
+        return "dec_proj"
     if top == "recombinator":
         for pre, g in RECOMB_LR_PREFIX.items():
             if name.startswith(pre):
@@ -930,11 +932,9 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"{bstats['recombinator_ffn']:,}) · cls_head "
               f"{bstats['cls_head']:,} · {route_desc} · dec_proj "
               f"{bstats['dec_proj']:,}", flush=True)
-        alpha_desc = (f"{float(branch.merge_alpha.detach().cpu()):.5f}"
-                      if branch.merge_alpha is not None else "n/a")
-        print(f"  fusion vào decoder: {branch.merge_mode} · "
-              f"alpha={alpha_desc} "
-              f"(nếu additive thì adapter + alpha × Recombinator)", flush=True)
+        merge_desc = ("RMSNorm -> Linear -> add"
+                      if branch.merge_mode == "add" else "concat")
+        print(f"  fusion vào decoder: {branch.merge_mode} · {merge_desc}", flush=True)
         if spec is not None:
             print(f"  Route Head HOẠT ĐỘNG: Recombinator -> TaskHead PoolingStack -> "
                   f"{spec['n_experts']} logit (+ nhiễu) -> Aux Loss và -> Top-"
@@ -960,19 +960,9 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
     rstats = moe_mod.RouteStats(spec["n_experts"]) if spec else None
-    # λ và warmup thuộc về SUP LOSS, nên chúng nằm dưới `classifier`, cạnh ASL —
-    # không phải dưới `recombiner`, vốn chỉ mô tả hình dạng nhánh.
-    lam = float(ccfg.get("lambda", 0.2)) if use_branch else 0.0
+    lam = float(ccfg.get("lambda", 0.5)) if use_branch else 0.0
     lam_warm = float(ccfg.get("lambda_warmup_pct", 0.1))
     if pre_src:
-        # λ-warmup có ĐÚNG MỘT lý do: ở bước 0 ClsHead là ngẫu nhiên, nên ASL
-        # lớn và gradient của nó áp đảo CE. Sau sup_pretrain, tiền đề ấy KHÔNG
-        # còn đúng — ClsHead đã hội tụ và ASL đã nhỏ.
-        #
-        # Giữ warmup ở đây thì trong 10% đầu lịch (đúng lúc lr leo tới đỉnh và
-        # CE mạnh nhất) gần như KHÔNG có lực nào giữ nhánh ở lại chỗ đã hội tụ.
-        # Đó là chỗ pretrain bị xoá đi, và đường loss trông hoàn toàn bình
-        # thường trong lúc nó xảy ra.
         lam_warm = float(ccfg.get("lambda_warmup_pct_pretrained", 0.0))
     tt_value = 1 if str(rcfg.get("token_type", "text")).lower() == "image" else 0
     clip = float(tcfg.get("max_grad_norm", 1.0))
@@ -1001,8 +991,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               + " · ".join(f"{k} {a:.0e}->{v:.0e}->{b:.0e}"
                            for k, (a, v, b) in curve.items())
               + f" · đóng băng {', '.join(frozen) or '—'}"
-              f" · λ = {lam} warmup {lam_warm:.0%}"
-              + ("" if lam_warm else " (TẮT — ClsHead không còn ngẫu nhiên)"),
+              f" · λ_ASL = {lam} · warmup {lam_warm:.0%}",
               flush=True)
 
     # Thứ tự dữ liệu: Generator RIÊNG, seed cố định — không đụng tới RNG toàn
@@ -1162,9 +1151,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "schedule": dict(tcfg["schedule"]),
         "n_rec_tokens": int(bstats.get("n_tokens", 0)),
         "n_dec_tokens": int(bstats.get("n_dec_tokens", 0)),
-        "merge_alpha_final": (float(branch.merge_alpha.detach().float().cpu())
-                               if branch is not None and branch.merge_alpha is not None
-                               else None),
+        "merge_fusion": "RMSNorm -> Linear -> residual add" if branch is not None else None,
         "merge_mode": branch.merge_mode if branch is not None else None,
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,

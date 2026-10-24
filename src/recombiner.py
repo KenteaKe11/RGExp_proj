@@ -790,7 +790,8 @@ class RecombinerBranch(nn.Module):
             hidden=int(c.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(c.get("dropout", 0.0)),
-            n_heads=int(c.get("attn_pool_heads", 8))) if int(n_labels) > 0 else None
+            n_heads=int(c.get("attn_pool_heads", 8))
+        ) if int(n_labels) > 0 else None
         # `route_enabled` nằm trong `spec` nên `load_branch` dựng lại đúng chế
         # độ đã huấn luyện — không phải chế độ đang ghi trong config lúc sinh.
         self.route_enabled = bool(r.get("route_enabled", False))
@@ -815,11 +816,11 @@ class RecombinerBranch(nn.Module):
         self.dec_proj = (nn.Identity() if self.merge_mode == "add" else
                          DecoderProjection(self.n_tokens, self.n_dec_tokens,
                                            self.n_dec_hidden))
-        self.merge_alpha = (nn.Parameter(torch.tensor(
-            float(r.get("merge_alpha_init", 1.0))))
-            if self.merge_mode == "add" else None)
+        self.merge_norm = RMSNorm(self.d_model) if self.merge_mode == "add" else None
+        self.merge_proj = (nn.Linear(self.d_model, self.d_model)
+                           if self.merge_mode == "add" else None)
 
-        for m in (self.recombinator, self.cls_head, self.route_head):
+        for m in (self.recombinator, self.cls_head, self.route_head, self.merge_proj):
             if m is not None:
                 _init(m)
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
@@ -848,15 +849,16 @@ class RecombinerBranch(nn.Module):
         return tokens, logits, route
 
     def merge_adapter(self, aligned: torch.Tensor, recomb_tokens: torch.Tensor) -> torch.Tensor:
-        """Residual fusion for §2.3: original Gemma projector output + α·Recombinator."""
-        if self.merge_mode != "add" or self.merge_alpha is None:
+        """RMSNorm -> Linear -> residual add to the frozen base projector output."""
+        if self.merge_mode != "add" or self.merge_norm is None or self.merge_proj is None:
             raise RuntimeError("merge_adapter is available only for additive fusion")
         if aligned.shape != recomb_tokens.shape:
             raise RuntimeError(
                 f"add fusion needs matching adapter/recombiner shapes; got "
                 f"{tuple(aligned.shape)} and {tuple(recomb_tokens.shape)}. "
                 f"Set recombiner.n_dec_tokens to the base projector token count.")
-        return aligned + self.merge_alpha.to(aligned.dtype) * recomb_tokens.to(aligned.dtype)
+        residual = self.merge_proj(self.merge_norm(recomb_tokens.to(aligned.dtype)))
+        return aligned + residual.to(aligned.dtype)
 
     def dec_stats(self) -> dict:
         """`dec_proj_rel_change` = ‖W − W₀‖ / ‖W₀‖ trên CẢ HAI lớp (nối lại),
@@ -915,7 +917,10 @@ class RecombinerBranch(nn.Module):
             "route_enabled": self.route_enabled,
             "n_experts": self.route_head.n_experts if self.route_head is not None else 0,
             "merge_mode": self.merge_mode,
-            "merge_alpha": float(self.merge_alpha.detach().cpu()) if self.merge_alpha is not None else None,
+            "merge_projection_params": (sum(p.numel() for p in self.merge_proj.parameters())
+                                         if self.merge_proj is not None else 0),
+            "merge_norm_params": (sum(p.numel() for p in self.merge_norm.parameters())
+                                  if self.merge_norm is not None else 0),
             "cls_attention_heads": (int(self.cls_head.head.pool.pool.num_heads)
                                      if self.cls_head is not None else 0),
         }
@@ -927,8 +932,8 @@ class RecombinerBranch(nn.Module):
         loc = rec.local_extractors[0] if len(rec.local_extractors) else None
         hid = loc.up.out_features if loc is not None else 0
         head_desc = ("ClsHead" + (" + RouteHead" if self.route_head is not None else ""))
-        merge_desc = (f"residual add, α={float(self.merge_alpha.detach().cpu()):.4f}"
-                      if self.merge_alpha is not None else "token concat")
+        merge_desc = ("RMSNorm -> Linear -> residual add"
+                      if self.merge_mode == "add" else "token concat")
         return (f"Recombinator: LocalExtractor×{n['n_local']} "
                 f"({self.d_vis}→{hid}→{self.d_vis}, {n['n_vis']}→{n['n_tokens']} "
                 f"token) -> Global MHA(Q={n['n_tokens']}, KV={n['n_vis']}, "

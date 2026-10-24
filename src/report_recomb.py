@@ -150,9 +150,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Protocol")
     A("")
     A("So sánh ba candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
-      "và QLoRA decoder + QDoRA rank 4 trên nửa cuối vision encoder + projector được "
-      "unfreeze + Recombinator và classification head. Candidate C giữ nguyên đường "
-      "projector Gemma 3: `adapter_output + α × recombiner_output`, với α là một scalar "
+      "và QLoRA decoder + QDoRA rank 4 trên nửa cuối vision encoder + projector "
+      "đóng băng + Recombinator và classification head. Candidate C giữ nguyên đường "
+      "projector Gemma 3: `adapter_output + Linear(RMSNorm(recombiner_output))`. "
       "học được. ClsHead dùng một learned query với attention pooling 8 heads rồi "
       "chiếu tuyến tính trực tiếp ra logits. Candidate C không có Route Head hay MoE.")
     A("")
@@ -211,15 +211,15 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     c_id = next((str(a["id"]) for a in arms if a.get("recomb")), None)
     c_stats = stats_by_arm.get(c_id or "", {})
-    alpha = c_stats.get("merge_alpha_final")
     cls = c_stats.get("cls_metrics_last") or {}
-    A(f"Candidate C learned scalar α = **{_f(alpha)}**. Classification-head positive F1 "
+    A("Candidate C fusion: **RMSNorm → Linear → residual add**. Classification-head positive F1 "
       f"at the end of training: {_f(cls.get('cls_f1_pos'))}.")
     A("")
     train_cfg = cfg.get('train') or {}
     classifier_cfg = cfg.get('classifier') or {}
     asl_cfg = classifier_cfg.get('asl') or {}
-    A(f"AdamW: weight decay {train_cfg.get('weight_decay')} and "
+    A(f"Loss: CE + {classifier_cfg.get('lambda', 0.5)} × ASL; "
+      f"Projector is frozen. AdamW: weight decay {train_cfg.get('weight_decay')} and "
       f"β₂={(train_cfg.get('adam_betas') or [0.9, 0.95])[1]}. ASL uses "
       f"γ⁻={asl_cfg.get('gamma_neg', 2)}, "
       f"γ⁺={asl_cfg.get('gamma_pos', 0)}, "

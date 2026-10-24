@@ -46,7 +46,7 @@ def main() -> int:
             d_vis=16, d_model=16, n_labels=3,
             rcfg={"n_vis": 16, "local": {"n_blocks": 1, "hidden": 32,
                                                 "pool_factor": 2},
-                  "head_dim": 4, "merge_mode": "add", "merge_alpha_init": 1.0},
+                  "head_dim": 4, "merge_mode": "add"},
             ccfg={"n_classes": 2, "attn_pool_heads": 4,
                   "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0}})
         vis = torch.randn(2, 16, 16)
@@ -58,8 +58,9 @@ def main() -> int:
         if route is not None or branch.route_head is not None:
             raise AssertionError("§2.3 candidate must not contain a Route Head")
         merged = branch.merge_adapter(tokens, tokens)
-        if not torch.allclose(merged, 2 * tokens):
-            raise AssertionError("additive merge does not equal adapter + alpha * branch")
+        want = tokens + branch.merge_proj(branch.merge_norm(tokens))
+        if not torch.allclose(merged, want):
+            raise AssertionError("merge does not equal adapter + Linear(RMSNorm(branch))")
         target = torch.zeros_like(logits)
         target[..., 1] = 1
         mask = torch.ones(2, 3)
@@ -68,8 +69,10 @@ def main() -> int:
         loss.backward()
         if branch.cls_head.head.pool.query.grad is None:
             raise AssertionError("attention pooling query received no gradient")
-        if branch.merge_alpha.grad is None:
-            raise AssertionError("learned merge alpha received no gradient")
+        if branch.merge_proj.weight.grad is None:
+            raise AssertionError("merge linear projection received no gradient")
+        if branch.merge_norm.weight.grad is None:
+            raise AssertionError("merge RMSNorm received no gradient")
 
     print("Section 2.3 quick self-check (CPU)")
     check("paired statistics", test_stats)
