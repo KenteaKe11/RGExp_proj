@@ -70,7 +70,10 @@ def _new_chexbert_labeler(device: str):
                 os.link(cached_source.resolve(strict=True), checkpoint)
             except OSError:
                 import shutil
-                shutil.copy2(cached_source, checkpoint)
+                # Recreate the destination directory here as well: some
+                # runtimes mount/replace cache directories during downloads.
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cached_source.resolve(strict=True), checkpoint)
             if not checkpoint.is_file():
                 raise FileNotFoundError(checkpoint)
         except Exception as e:
