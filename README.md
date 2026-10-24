@@ -33,6 +33,9 @@ bash scripts/run_recomb.sh --exp 2.3 --stages score,stats,report --rescore --no-
 
 # Huấn luyện lại các candidate, rồi chạy các stage còn lại
 bash scripts/run_recomb.sh --exp 2.3 --retrain --no-wandb --no-push
+
+# Retrain/infer riêng Candidate C, sau đó đánh giá đủ ba candidate và push ở nền
+bash scripts/retrain_candidate_c_and_push.sh --detach
 ```
 
 Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Các candidate có thể chọn bằng `--arms baseline_infer,lora_only,lora_recomb`; để có so sánh hoàn chỉnh cần chạy đủ cả ba.
