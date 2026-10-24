@@ -23,7 +23,7 @@
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
 # 2. Candidate C giữ projector gốc đóng băng; fusion dùng RMSNorm -> Linear -> add.
-# 3. Ba candidate dùng chung manifest test và mười bootstrap subset.
+# 3. Ba candidate dùng chung manifest test; 10 bootstrap subset dùng 10 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -495,7 +495,8 @@ metrics:
 stats:
   alpha: 0.05
   n_boot: 10
-  bootstrap_sample_size: 1000
+  bootstrap_sample_size: 3000
+  bootstrap_seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
   ci_method: percentile
   n_perm: 10000
   ci: 0.95

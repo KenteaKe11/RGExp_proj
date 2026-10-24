@@ -46,8 +46,8 @@ bash scripts/retrain_candidate_c_and_push.sh --detach
 - **ASL:** dùng các giá trị mặc định của `AsymmetricLoss`: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
 - **Optimizer:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
 - **Batch:** thử microbatch `16, 12, 10, 8, 6, 4, 2, 1` khi gặp OOM; effective batch giữ đúng 32 bằng microbatch cuối nhỏ hơn khi cần. Candidate đầu chọn batch và candidate còn lại dùng cùng giá trị.
-- **Metric chính:** F1CheXbert micro trên 14 nhãn, tính riêng trong từng bootstrap subset 1.000 mẫu rồi lấy trung bình 10 F1. BLEU, ROUGE và BERTScore được giữ làm metric phụ.
-- **Đánh giá:** pool 3.000 ảnh được lấy theo seed từ test split, không chạy phần test còn lại. Tạo 10 bootstrap subset khác nhau; mỗi subset gồm 1.000 lượt lấy mẫu có hoàn lại từ pool này. Cùng mười tập chỉ số được dùng cho cả ba candidate và mọi metric. Thống kê và report lấy trung bình qua 10 subset.
+- **Metric chính:** F1CheXbert micro trên 14 nhãn, tính riêng trong từng bootstrap subset 3.000 lượt lấy mẫu rồi lấy trung bình 10 F1. BLEU, ROUGE và BERTScore được giữ làm metric phụ.
+- **Đánh giá:** pool 3.000 ảnh được lấy theo seed từ test split, không chạy phần test còn lại. Tạo 10 bootstrap subset khác nhau bằng 10 seed riêng (`42`–`51`); mỗi subset gồm 3.000 lượt lấy mẫu có hoàn lại từ pool này. Cùng mười tập chỉ số được dùng cho cả ba candidate và mọi metric. Thống kê và report lấy trung bình qua 10 subset.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); entry point là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
@@ -57,4 +57,4 @@ Metric gọi CheXbert qua thư viện [`f1chexbert`](https://pypi.org/project/f1
 
 ## Giới hạn thống kê
 
-Các ước lượng bootstrap dùng trung bình của 10 subset, mỗi subset có 1.000 lượt lấy mẫu có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba candidate và mọi metric để bảo toàn so sánh ghép cặp. Report ghi số subset và kích thước từng subset.
+Các ước lượng bootstrap dùng trung bình của 10 subset với seed riêng `42`–`51`, mỗi subset có 3.000 lượt lấy mẫu có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba candidate và mọi metric để bảo toàn so sánh ghép cặp. Report ghi số subset và kích thước từng subset.

@@ -138,8 +138,22 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
     sample_size = boot_size or n_rows
     if sample_size < 2:
         raise ValueError("stats.bootstrap_sample_size must be >= 2")
-    # Identical paired case draws for all candidates, pairs, and metrics.
-    sample_indices = rng.integers(0, n_rows, size=(n_boot, sample_size))
+    # One independently seeded draw per bootstrap subset. Reuse each resulting
+    # subset across candidates, pairs, and metrics for paired comparisons.
+    configured_seeds = cfg_stats.get("bootstrap_seeds")
+    if configured_seeds is None:
+        bootstrap_seeds = [int(seed) + i for i in range(n_boot)]
+    else:
+        bootstrap_seeds = [int(s) for s in configured_seeds]
+        if len(bootstrap_seeds) != n_boot:
+            raise ValueError(
+                "stats.bootstrap_seeds must contain exactly stats.n_boot seeds")
+        if len(set(bootstrap_seeds)) != len(bootstrap_seeds):
+            raise ValueError("stats.bootstrap_seeds must all be different")
+    sample_indices = np.stack([
+        np.random.default_rng(boot_seed).integers(0, n_rows, size=sample_size)
+        for boot_seed in bootstrap_seeds
+    ])
 
     rows = []
     for arm_a, arm_b in pairs:

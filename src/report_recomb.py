@@ -158,9 +158,12 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     cfg_stats = cfg.get("stats") or {}
     ns = int(cfg_stats.get("n_boot", 4))
-    bs = int(cfg_stats.get("bootstrap_sample_size", 1000))
+    bs = int(cfg_stats.get("bootstrap_sample_size", 3000))
+    bootstrap_seeds = cfg_stats.get("bootstrap_seeds")
+    seed_text = (f"; seed riêng: {', '.join(map(str, bootstrap_seeds))}"
+                 if bootstrap_seeds else "")
     A(f"Pool test gồm {manifest.get('n_eval', '?')} mẫu. Mỗi metric/candidate dùng cùng "
-      f"{ns} bootstrap subset; mỗi subset lấy {bs} mẫu có hoàn lại từ pool. Cùng ma trận "
+      f"{ns} bootstrap subset{seed_text}; mỗi subset lấy {bs} mẫu có hoàn lại từ pool. Cùng ma trận "
       "chỉ số được chia sẻ cho ba candidate và các metric; summary lấy trung bình qua "
       "các subset bootstrap.")
     A("CheXbert F1 là micro-F1 trên 14 nhãn: mỗi subset cộng TP/FP/FN trên toàn bộ mẫu "
