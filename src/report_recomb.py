@@ -88,7 +88,7 @@ def normalize_pw(pw: pd.DataFrame) -> pd.DataFrame:
 
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
                   metrics: list[str], primary: str, cfg=None) -> pd.DataFrame:
-    cfg_stats = (cfg or {}).get("stats", {})
+    cfg_stats = (cfg or {}).get("stats") or {}
     n_boot = int(cfg_stats.get("n_boot", 0))
     boot_size = int(cfg_stats.get("bootstrap_sample_size", 0))
     n = len(next(iter(scores.values()))) if scores else 0
@@ -156,8 +156,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       "học được. ClsHead dùng một learned query với attention pooling 8 heads rồi "
       "chiếu tuyến tính trực tiếp ra logits. Candidate C không có Route Head hay MoE.")
     A("")
-    ns = int(cfg.get("stats", {}).get("n_boot", 4))
-    bs = int(cfg.get("stats", {}).get("bootstrap_sample_size", 1000))
+    cfg_stats = cfg.get("stats") or {}
+    ns = int(cfg_stats.get("n_boot", 4))
+    bs = int(cfg_stats.get("bootstrap_sample_size", 1000))
     A(f"Pool test gồm {manifest.get('n_eval', '?')} mẫu. Mỗi metric/candidate dùng cùng "
       f"{ns} bootstrap subset; mỗi subset lấy {bs} mẫu có hoàn lại từ pool. Cùng ma trận "
       "chỉ số được chia sẻ cho ba candidate và các metric; summary lấy trung bình qua "
@@ -204,7 +205,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
         train_rows.append([names.get(aid, aid),
                            "inference only" if arm.get("infer_only") else
                            f"trainable params: {st.get('trainable_params', '—')}",
-                           f"vision QDoRA: {st.get('vision_adapter', {}).get('method', 'off')}",
+                           f"vision QDoRA: {(st.get('vision_adapter') or {}).get('method', 'off')}",
                            f"projector trainable: {st.get('projector_trainable_params', 0)}"])
     A(_tbl(["Candidate", "Training", "Vision adapter", "Projector params"], train_rows))
     A("")
@@ -215,11 +216,14 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A(f"Candidate C learned scalar α = **{_f(alpha)}**. Classification-head positive F1 "
       f"at the end of training: {_f(cls.get('cls_f1_pos'))}.")
     A("")
-    A(f"AdamW: weight decay {cfg.get('train', {}).get('weight_decay')} and "
-      f"β₂={(cfg.get('train', {}).get('adam_betas') or [0.9, 0.95])[1]}. ASL uses "
-      f"γ⁻={cfg.get('classifier', {}).get('asl', {}).get('gamma_neg', 2)}, "
-      f"γ⁺={cfg.get('classifier', {}).get('asl', {}).get('gamma_pos', 0)}, "
-      f"clip={cfg.get('classifier', {}).get('asl', {}).get('clip', 0.05)}; blank/uncertain "
+    train_cfg = cfg.get('train') or {}
+    classifier_cfg = cfg.get('classifier') or {}
+    asl_cfg = classifier_cfg.get('asl') or {}
+    A(f"AdamW: weight decay {train_cfg.get('weight_decay')} and "
+      f"β₂={(train_cfg.get('adam_betas') or [0.9, 0.95])[1]}. ASL uses "
+      f"γ⁻={asl_cfg.get('gamma_neg', 2)}, "
+      f"γ⁺={asl_cfg.get('gamma_pos', 0)}, "
+      f"clip={asl_cfg.get('clip', 0.05)}; blank/uncertain "
       "labels are masked.")
     A("")
     return "\n".join(lines)
