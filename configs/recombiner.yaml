@@ -257,6 +257,17 @@ train:
   # Phải nằm trong (0, 1]; ngoài khoảng đó thì DỪNG.
   pretrained_lr_mult: 0.1
 
+  # Per-module peak LR schema required by shared preflight/decoder_ft code.
+  # Scratch training uses schedule.max_lr for all branch groups; these values
+  # are only applied when initializing a Stage-0 checkpoint for decoder_ft.
+  ft_lr:
+    cls_head: 3.0e-5
+    route_head: 6.0e-4
+    dec_proj: 3.0e-4
+    recombinator_local: 3.0e-5
+    recombinator_global: 3.0e-5
+    recombinator_ffn: 3.0e-4
+
   # true = đóng băng hẳn thay vì hạ lr. Mặc định false: đóng băng biến ASL từ
   # một LỰC thành một PHÉP ĐO, và nhánh thôi học được từ việc decoder cần gì ở
   # nó. Đó là một ARM KHÁC trong bảng, không phải tinh chỉnh của arm decoder_ft.
