@@ -228,7 +228,12 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
         if idx:
             n_layers = max(idx.values()) + 1
             frm = str(vl["from"]).lower()
-            start = -(-n_layers // 2) if frm == "second_half" else int(frm)
+            if frm in {"all", "full"}:
+                start = 0
+            elif frm == "second_half":
+                start = -(-n_layers // 2)
+            else:
+                start = int(frm)
             kept = [h for h in hits if h not in idx or idx[h] >= start]
             rejected_vision += [h for h in hits if h not in kept]
             hits = kept

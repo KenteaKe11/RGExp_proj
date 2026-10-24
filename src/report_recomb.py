@@ -149,8 +149,11 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     A("## Protocol")
     A("")
+    vision_cfg = ((cfg.get("train") or {}).get("vision_adapter") or {})
+    vision_layers = str(vision_cfg.get("layers", "second_half"))
+    vision_scope = "toàn bộ" if vision_layers in {"all", "full", "0"} else "nửa cuối"
     A("So sánh ba candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
-      "và QLoRA decoder + QDoRA rank 4 trên nửa cuối vision encoder + projector "
+      f"và QLoRA decoder + QDoRA rank 4 trên {vision_scope} vision encoder + projector "
       "đóng băng + Recombinator và classification head. Candidate C giữ nguyên đường "
       "projector Gemma 3: `adapter_output + Linear(RMSNorm(recombiner_output))`. "
       "học được. ClsHead dùng một learned query với attention pooling 8 heads rồi "
