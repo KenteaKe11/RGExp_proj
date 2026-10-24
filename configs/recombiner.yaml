@@ -229,7 +229,7 @@ train:
 
   schedule:
     impl: lambda
-    max_lr: 3.0e-4
+    max_lr: 8.0e-5
     pct_start: 0.1
     div_factor: 25.0
     final_div_factor: 100.0
@@ -303,6 +303,7 @@ train:
 recombiner:
   siglip_dim: 1152
   out_dim: null
+  attn_lr_mult: 2.5             # 8e-5 × 2.5 = 2e-4 cho Global MHA
   local:
     n_blocks: 2
     hidden: 2048
