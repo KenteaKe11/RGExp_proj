@@ -46,6 +46,34 @@ def _new_chexbert_labeler(device: str):
         raise RuntimeError(
             "CheXbert needs `f1chexbert`; install requirements.txt or run "
             "`pip install f1chexbert==0.0.2`.") from e
+    # f1chexbert 0.0.2 downloads the Stanford checkpoint but, in some
+    # environments, fails to put it in the path it immediately loads from
+    # (~/.cache/chexbert/chexbert.pth). Reuse the Hugging Face cached copy and
+    # place it at that documented runtime cache path before constructing it.
+    # This avoids downloading the 1.3 GB checkpoint a second time.
+    import os
+    from pathlib import Path
+
+    cache_dir = Path(os.path.expanduser("~/.cache/chexbert"))
+    checkpoint = cache_dir / "chexbert.pth"
+    if not checkpoint.is_file():
+        try:
+            from huggingface_hub import hf_hub_download
+
+            cached_source = Path(hf_hub_download(
+                repo_id="StanfordAIMI/RRG_scorers", filename="chexbert.pth"))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(cached_source, checkpoint)
+            except OSError:
+                import shutil
+                shutil.copy2(cached_source, checkpoint)
+        except Exception as e:
+            raise RuntimeError(
+                "f1chexbert downloaded CheXbert but its checkpoint is missing "
+                f"from {checkpoint}. Could not recover the cached official "
+                "StanfordAIMI/RRG_scorers/chexbert.pth checkpoint."
+            ) from e
     return F1CheXbert(device=device)
 
 
@@ -72,7 +100,7 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
             "This f1chexbert build does not expose tokenizer + model.cls_logits; "
             "cannot preserve blank/uncertain masks for ASL targets.")
     model.eval()
-    dev = getattr(labeler, "device", torch.device(device))
+    dev = getattr(labeler, "device", next(model.parameters()).device)
     chunks: list[np.ndarray] = []
     size = max(1, int(batch_size))
     for start in range(0, len(reports), size):
