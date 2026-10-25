@@ -27,6 +27,7 @@ CHEXBERT_LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
                    "Support Devices", "No Finding"]
 CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report/1"
 _CHEXBERT_LABELER = None
+_RADGRAPH_LABELER = None
 
 
 def chexbert_micro_f1(tp, fp, fn, axis=-1):
@@ -108,6 +109,54 @@ def _get_chexbert_labeler(cfg: dict):
             device = "cuda" if torch.cuda.is_available() else "cpu"
         _CHEXBERT_LABELER = _new_chexbert_labeler(device)
     return _CHEXBERT_LABELER
+
+
+def _get_radgraph_labeler(cfg: dict):
+    global _RADGRAPH_LABELER
+    if _RADGRAPH_LABELER is None:
+        try:
+            from radgraph import F1RadGraph
+        except ImportError as e:
+            raise RuntimeError(
+                "RadGraph F1 bật nhưng thiếu package `radgraph==0.1.18`; "
+                "cài lại dependencies từ requirements.txt.") from e
+        model_type = str(cfg.get("model_type", "radgraph-xl"))
+        reward_level = str(cfg.get("reward_level", "all"))
+        if reward_level != "all":
+            raise ValueError("§2.3 yêu cầu reward_level='all' để chấm đủ ba mức RadGraph F1.")
+        import torch
+
+        device = str(cfg.get("device", "auto")).lower()
+        cuda = -1 if device == "cpu" or not torch.cuda.is_available() else 0
+        _RADGRAPH_LABELER = F1RadGraph(
+            reward_level=reward_level, model_type=model_type, cuda=cuda)
+    return _RADGRAPH_LABELER
+
+
+def _radgraph_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.ndarray]:
+    """Official F1RadGraph: per-report entity, partial, and complete rewards."""
+    labeler = _get_radgraph_labeler(cfg)
+    batch_size = max(1, int(cfg.get("batch_size", 16)))
+    chunks: list[np.ndarray] = []
+    for start in range(0, len(refs), batch_size):
+        end = min(len(refs), start + batch_size)
+        _mean, reward_lists, _hyp_annotations, _ref_annotations = labeler(
+            hyps=hyps[start:end], refs=refs[start:end])
+        if not (isinstance(reward_lists, (tuple, list)) and len(reward_lists) == 3):
+            raise RuntimeError("F1RadGraph reward_level='all' không trả đủ ba reward lists.")
+        # Official implementation returns (simple[N], partial[N], complete[N]).
+        part = np.stack([np.asarray(x, dtype=np.float64) for x in reward_lists], axis=1)
+        if part.shape != (end - start, 3):
+            raise RuntimeError(
+                f"F1RadGraph trả reward shape {part.shape}, cần {(end - start, 3)}.")
+        chunks.append(part)
+    values = (np.concatenate(chunks, axis=0) if chunks
+              else np.empty((0, 3), dtype=np.float64))
+    return {
+        "radgraph_f1_entity": values[:, 0],
+        "radgraph_f1_partial": values[:, 1],
+        "radgraph_f1_complete": values[:, 2],
+    }
 
 
 def _raw_classes_with_labeler(labeler, reports: list[str],
@@ -256,7 +305,8 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
     return {f"bertscore_{k}": allv[k] for k in keep if k in allv}
 
 
-def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.ndarray]:
+def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
+                 cls_head_predictions=None) -> dict[str, np.ndarray]:
     """Per-report confusion counts from CheXbert labels.
 
     The original/reference report is the gold source; no dataset label file is
@@ -282,13 +332,32 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.nd
     fn = np.sum(gpos & ~ppos & known, axis=1).astype(np.float64)
     den = 2 * tp + fp + fn
     per_report = np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
-    return {"chexbert_f1": per_report, "chexbert_tp": tp,
-            "chexbert_fp": fp, "chexbert_fn": fn}
+    out = {"chexbert_f1": per_report, "chexbert_tp": tp,
+           "chexbert_fp": fp, "chexbert_fn": fn}
+    if cls_head_predictions is not None:
+        head = np.asarray(cls_head_predictions, dtype=np.int64)
+        if head.shape != (n, len(CHEXBERT_LABELS)):
+            raise ValueError(
+                "cls_head_predictions cần shape "
+                f"({n}, {len(CHEXBERT_LABELS)}), nhận {head.shape}.")
+        if not np.isin(head, (0, 1)).all():
+            raise ValueError("cls_head_predictions chỉ được chứa class 0=neg hoặc 1=pos.")
+        ref_raw = raw[:n]
+        known = (ref_raw == 1) | (ref_raw == 2)
+        gold_pos = (ref_raw == 1) & known
+        head_pos = (head == 1) & known
+        out["cls_head_chexbert_tp"] = np.sum(gold_pos & head_pos, axis=1).astype(float)
+        out["cls_head_chexbert_fp"] = np.sum(~gold_pos & head_pos & known, axis=1).astype(float)
+        out["cls_head_chexbert_fn"] = np.sum(gold_pos & ~head_pos & known, axis=1).astype(float)
+        out["cls_head_report_agree"] = np.sum(head == pred, axis=1).astype(float)
+        out["cls_head_report_n_labels"] = np.full(n, head.shape[1], dtype=float)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
-                refs_raw: list[str], label: str = "") -> tuple[pd.DataFrame, dict]:
+                refs_raw: list[str], label: str = "",
+                cls_head_predictions=None) -> tuple[pd.DataFrame, dict]:
     """Trả (bảng điểm theo mẫu, các số corpus-level)."""
     mcfg = cfg["metrics"]
     ncfg = dict(mcfg.get("normalize", {}))
@@ -311,9 +380,15 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
     ccfg = dict(mcfg.get("chexbert", {}))
     if ccfg.get("enabled", False):
         print(f"  [{label}] CheXbert clinical F1 ...", flush=True)
-        cols.update(_chexbert_f1(hyps, refs, ccfg))
+        cols.update(_chexbert_f1(hyps, refs, ccfg, cls_head_predictions))
         cols["chexbert_gold_source"] = np.full(
             len(keys), CHEXBERT_GOLD_SOURCE, dtype=object)
+
+    rgcfg = dict(mcfg.get("radgraph", {}))
+    if rgcfg.get("enabled", False):
+        print(f"  [{label}] RadGraph F1 ({rgcfg.get('model_type', 'radgraph-xl')}) ...",
+              flush=True)
+        cols.update(_radgraph_f1(hyps, refs, rgcfg))
 
     df = pd.DataFrame({"key": keys, **cols})
     df["n_words_pred"] = [len(h.split()) for h in hyps]
@@ -332,5 +407,8 @@ def metric_columns(df: pd.DataFrame) -> list[str]:
     """Các cột thật sự là metric (bỏ key và các cột mô tả)."""
     skip = {"key", "n_words_pred", "n_words_ref", "empty",
             "chexbert_tp", "chexbert_fp", "chexbert_fn",
+            "cls_head_chexbert_tp", "cls_head_chexbert_fp",
+            "cls_head_chexbert_fn", "cls_head_report_agree",
+            "cls_head_report_n_labels",
             "chexbert_gold_source"}
     return [c for c in df.columns if c not in skip]

@@ -458,8 +458,9 @@ arms:
     recomb: false
     enabled: true
   - id: lora_recomb
-    name: "QDoRA second-half vision + frozen projector + QLoRA + Recombinator + classifier"
+    name: "QDoRA last-quarter vision + frozen projector + QLoRA + Recombinator + classifier"
     recomb: true
+    capture_cls_head: true
     train_projector: false
     enabled: true
 metrics:
@@ -479,6 +480,12 @@ metrics:
   chexbert:
     enabled: true
     device: auto                 # f1chexbert: CUDA nếu có, nếu không thì CPU
+  radgraph:
+    enabled: true
+    model_type: radgraph-xl
+    reward_level: all            # entity / partial entity-relation / complete entity-relation
+    batch_size: 16               # cặp report mỗi lượt gọi; model chính thức xử lý từng report
+    device: auto
   primary: chexbert_f1
 
 # ── Kiểm định: HAI candidate -> quay về kiểm định GHÉP CẶP ──────────────────
@@ -491,7 +498,7 @@ metrics:
 #   paired bootstrap (BCa) — "hiệu số thật nằm trong khoảng nào"
 #   permutation (sign-flip) — "nếu hai candidate như nhau thì hiệu số cỡ này
 #                             hiếm tới đâu"
-# Họ kiểm định là 8 metric (BLEU-1..4, ROUGE-1/2/L, BERTScore-F1), hiệu chỉnh
+# Họ kiểm định là 11 metric (thêm ba mức RadGraph F1), hiệu chỉnh
 # Holm; BH in kèm để đọc đối chiếu.
 stats:
   alpha: 0.05
@@ -505,7 +512,7 @@ stats:
   # ở những hiệu số không nói được gì về thực hành. Cặp có |d_z| dưới sàn bị
   # đánh dấu "không đáng kể" và KHÔNG được tính là thắng ở cột kết luận.
   dz_floor: 0.10
-  # Kết luận chính thức lấy từ permutation + Holm trên 8 metric. Bootstrap CI
+  # Kết luận chính thức lấy từ permutation + Holm trên 11 metric. Bootstrap CI
   # là câu trả lời về ĐỘ LỚN, không phải về ý nghĩa.
   primary_test: perm
 
@@ -515,7 +522,7 @@ stats:
   # Holm mà không thêm thông tin nào.
   #
   # Ở §2.4 thì k = 5, và "so từng đôi rồi hiệu chỉnh" không còn là cách đúng để
-  # MỞ ĐẦU: 10 cặp × 8 metric = 80 kiểm định, và Holm trên 80 kiểm định thì mọi
+  # MỞ ĐẦU: 10 cặp × 11 metric = 110 kiểm định, và Holm trên 110 kiểm định thì mọi
   # hiệu số vừa phải đều chết. Thứ tự đúng là kiểm định TỔNG THỂ trước, rồi CHỈ
   # hậu kiểm những metric đã qua cổng (thủ tục "được bảo vệ").
   #

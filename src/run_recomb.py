@@ -98,8 +98,8 @@ def _archive_stale(path: Path) -> None:
     print(f"  ↪ artifact cũ -> {target}", flush=True)
 
 
-def _read_preds(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _read_preds(path: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {}
     if not path.exists():
         return out
     with open(path, "r", encoding="utf-8") as f:
@@ -111,7 +111,7 @@ def _read_preds(path: Path) -> dict[str, str]:
                 r = json.loads(line)
             except Exception:
                 continue
-            out[r["key"]] = r.get("pred", "")
+            out[str(r["key"])] = r
     return out
 
 
@@ -320,6 +320,7 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
         # ở B là một khác biệt nữa giữa hai cột. (Trên base 4-bit thì hợp nhất
         # vốn đã bị tắt, nhưng đây phải là một quyết định, không phải may mắn.)
         "merge_adapter": False,
+        "capture_cls_head": bool(arm.get("capture_cls_head", False)),
         "optional": False,
     })
 
@@ -698,21 +699,43 @@ def main(argv: list[str] | None = None) -> int:
                                 and "chexbert_gold_source" in cached.columns
                                 and cached["chexbert_gold_source"].eq(
                                     "f1chexbert_reference_report/1").all())
-                if (not cfg.get("metrics", {}).get("chexbert", {}).get("enabled", False)
-                        or counts_ready):
+                cls_counts_ready = (not arm.get("capture_cls_head", False) or all(
+                    c in cached.columns for c in
+                    ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
+                     "cls_head_chexbert_fn", "cls_head_report_agree",
+                     "cls_head_report_n_labels")))
+                radgraph_cols = ("radgraph_f1_entity", "radgraph_f1_partial",
+                                 "radgraph_f1_complete")
+                radgraph_ready = (not cfg.get("metrics", {}).get("radgraph", {}).get(
+                    "enabled", False) or all(c in cached.columns for c in radgraph_cols))
+                chexbert_ready = (not cfg.get("metrics", {}).get("chexbert", {}).get(
+                    "enabled", False) or counts_ready)
+                if chexbert_ready and cls_counts_ready and radgraph_ready:
                     scores[aid] = cached
                     print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)",
                           flush=True)
                     continue
-                print(f"  [{aid}] điểm cũ chưa có TP/FP/FN để bootstrap micro-F1; "
+                print(f"  [{aid}] bảng điểm cũ thiếu metric/counters hiện hành; "
                       "chấm lại từ predictions ...", flush=True)
-            preds = _read_preds(pred_paths[aid])
-            keys = [k for k in test_df["key"] if k in preds]
+            pred_records = _read_preds(pred_paths[aid])
+            keys = [k for k in test_df["key"] if str(k) in pred_records]
             if not keys:
                 print(f"  ⚠ [{aid}] không có dự đoán nào", flush=True)
                 continue
-            sdf, _c = score_model(cfg, keys, [preds[k] for k in keys],
-                                  [ref_map[k] for k in keys], label=aid)
+            cls_predictions = None
+            if arm.get("capture_cls_head", False):
+                missing_cls = [k for k in keys
+                               if "cls_head_pred" not in pred_records[str(k)]]
+                if missing_cls:
+                    raise ValueError(
+                        f"{aid} thiếu cls_head_pred ở {len(missing_cls)} prediction. "
+                        "Chạy lại stage infer để lưu dự đoán của classification head, "
+                        "rồi chạy score,stats,report.")
+                cls_predictions = [pred_records[str(k)]["cls_head_pred"] for k in keys]
+            sdf, _c = score_model(
+                cfg, keys, [pred_records[str(k)].get("pred", "") for k in keys],
+                [ref_map[k] for k in keys], label=aid,
+                cls_head_predictions=cls_predictions)
             sdf.to_csv(csv_path, index=False)
             scores[aid] = sdf
             score_summary = {f"score/{aid}/{k}": float(sdf[k].mean())

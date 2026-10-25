@@ -62,6 +62,10 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
     _router = None
     _route_ctx = None
 
+    @property
+    def required_prediction_fields(self) -> tuple[str, ...]:
+        return ("cls_head_pred",) if self.mcfg.get("capture_cls_head", False) else ()
+
     def load(self) -> None:
         from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 
@@ -247,8 +251,18 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                     dtype=recombiner.float_dtype(self._gemma, torch.float32)))
             tokens = None
             if self.branch is not None:
-                tokens, _logits, route = self.branch(
+                tokens, cls_logits, route = self.branch(
                     vis.to(next(self.branch.parameters()).dtype))
+                if self.mcfg.get("capture_cls_head", False):
+                    if cls_logits is None:
+                        raise RunnerUnusable(
+                            "Candidate C cần logits classification head để đối chiếu "
+                            "với report-target, nhưng branch trả None.")
+                    pred = cls_logits.argmax(dim=-1).detach().cpu().tolist()
+                    self._last_batch_aux = {
+                        str(item["key"]): {"cls_head_pred": row}
+                        for item, row in zip(batch, pred)
+                    }
                 if self._router is not None:
                     if route is None:
                         raise RunnerUnusable(

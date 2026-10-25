@@ -2,6 +2,10 @@
 
 Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào 1/4 layer cuối vision encoder, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và concat token của nhánh với token adapter cùng prompt embeddings. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 0.1 × ASL`, không warmup hệ số ASL.
 
+Report kèm bảng CheXbert F1 của report sinh so với report gốc và của classification head so với nhãn CheXbert từ report gốc trên cùng 10 bootstrap subset; dòng cuối là trung bình cộng của 10 subset. Blank/uncertain được mask cho metric classification head.
+
+Scoring có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức entity, partial entity-relation và complete entity-relation theo từng mẫu; các điểm được bootstrap cùng 10 subset. Primary metric vẫn là CheXbert F1.
+
 ## Kiến trúc abstract tổng quát
 
 ![Sơ đồ abstract tổng quát](docs/figures/fig1_overall_pipeline.png)

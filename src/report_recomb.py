@@ -86,14 +86,31 @@ def normalize_pw(pw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _shared_bootstrap_indices(cfg, n_rows: int) -> np.ndarray | None:
+    scfg = (cfg or {}).get("stats") or {}
+    n_boot = int(scfg.get("n_boot", 0))
+    sample_size = int(scfg.get("bootstrap_sample_size", 0)) or n_rows
+    if n_boot <= 0 or n_rows <= 0:
+        return None
+    seeds = scfg.get("bootstrap_seeds")
+    if seeds is None:
+        seeds = [int((cfg or {}).get("seed", 42)) + i for i in range(n_boot)]
+    else:
+        seeds = [int(s) for s in seeds]
+    if len(seeds) != n_boot or len(set(seeds)) != len(seeds):
+        raise ValueError("stats.bootstrap_seeds must contain n_boot distinct seeds")
+    if sample_size < 1:
+        raise ValueError("stats.bootstrap_sample_size must be >= 1")
+    return np.stack([
+        np.random.default_rng(seed).integers(0, n_rows, size=sample_size)
+        for seed in seeds
+    ])
+
+
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
                   metrics: list[str], primary: str, cfg=None) -> pd.DataFrame:
-    cfg_stats = (cfg or {}).get("stats") or {}
-    n_boot = int(cfg_stats.get("n_boot", 0))
-    boot_size = int(cfg_stats.get("bootstrap_sample_size", 0))
     n = len(next(iter(scores.values()))) if scores else 0
-    boot_idx = (np.random.default_rng(int((cfg or {}).get("seed", 42))).integers(
-        0, n, size=(n_boot, boot_size or n)) if n_boot and n > 0 else None)
+    boot_idx = _shared_bootstrap_indices(cfg, n)
     rows = []
     for aid, df in scores.items():
         row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
@@ -130,9 +147,59 @@ def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
     return out
 
 
+def chexbert_head_report_bootstrap(scores: dict[str, pd.DataFrame], cfg) -> pd.DataFrame:
+    """Compare report CheXbert F1 with the classifier head on shared resamples."""
+    arm = next((a for a in cfg.get("arms", [])
+                if a.get("enabled", True) and a.get("capture_cls_head", False)), None)
+    if arm is None or arm.get("id") not in scores:
+        return pd.DataFrame(columns=["subset", "seed", "report_target_f1",
+                                     "cls_head_target_f1", "head_report_agreement_pct"])
+    df = scores[arm["id"]]
+    report_cols = ("chexbert_tp", "chexbert_fp", "chexbert_fn")
+    head_cols = ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
+                 "cls_head_chexbert_fn")
+    if not all(c in df.columns for c in (*report_cols, *head_cols)):
+        return pd.DataFrame(columns=["subset", "seed", "report_target_f1",
+                                     "cls_head_target_f1", "head_report_agreement_pct"])
+    agreement_cols = ("cls_head_report_agree", "cls_head_report_n_labels")
+    if not all(c in df.columns for c in agreement_cols):
+        return pd.DataFrame(columns=["subset", "seed", "report_target_f1",
+                                     "cls_head_target_f1", "head_report_agreement_pct"])
+
+    scfg = cfg.get("stats") or {}
+    boot_idx = _shared_bootstrap_indices(cfg, len(df))
+    if len(df) == 0 or boot_idx is None:
+        raise ValueError("CheXbert comparison needs non-empty scores and bootstrap samples")
+
+    from .metrics import chexbert_micro_f1
+
+    rows = []
+    seeds = scfg.get("bootstrap_seeds")
+    if seeds is None:
+        seeds = [int(cfg.get("seed", 42)) + i for i in range(len(boot_idx))]
+    for i, (seed, idx) in enumerate(zip(seeds, boot_idx), start=1):
+        report_f1 = float(chexbert_micro_f1(
+            *(df[c].to_numpy(dtype=float)[idx] for c in report_cols), axis=0))
+        head_f1 = float(chexbert_micro_f1(
+            *(df[c].to_numpy(dtype=float)[idx] for c in head_cols), axis=0))
+        agreement = (df[agreement_cols[0]].to_numpy(dtype=float)[idx].sum()
+                     / max(1.0, df[agreement_cols[1]].to_numpy(dtype=float)[idx].sum()))
+        rows.append({"subset": f"bootstrap_{i}", "seed": seed,
+                     "report_target_f1": report_f1,
+                     "cls_head_target_f1": head_f1,
+                     "head_report_agreement_pct": 100.0 * agreement})
+    rows.append({"subset": "mean", "seed": "—",
+                 "report_target_f1": float(np.mean([r["report_target_f1"] for r in rows])),
+                 "cls_head_target_f1": float(np.mean([r["cls_head_target_f1"] for r in rows])),
+                 "head_report_agreement_pct": float(np.mean(
+                     [r["head_report_agreement_pct"] for r in rows]))})
+    return pd.DataFrame(rows)
+
+
 def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                    train_stats: list[dict], names: dict[str, str],
-                   manifest: dict) -> str:
+                   manifest: dict,
+                   chexbert_comparison: pd.DataFrame | None = None) -> str:
     pw = normalize_pw(pw)
     primary = str(cfg.get("metrics", {}).get("primary", "chexbert_f1"))
     if primary not in summary.columns:
@@ -171,7 +238,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       "chiếu tuyến tính trực tiếp ra logits. Candidate C không có Route Head hay MoE.")
     A("")
     cfg_stats = cfg.get("stats") or {}
-    ns = int(cfg_stats.get("n_boot", 4))
+    ns = int(cfg_stats.get("n_boot", 10))
     bs = int(cfg_stats.get("bootstrap_sample_size", 3000))
     bootstrap_seeds = cfg_stats.get("bootstrap_seeds")
     seed_text = (f"; seed riêng: {', '.join(map(str, bootstrap_seeds))}"
@@ -195,6 +262,25 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                            str(row.get("n", "?")),
                            *[_f(row.get(metric)) for metric in metric_cols]])
     A(_tbl(display_cols, table_rows))
+    A("")
+    A("## CheXbert: report-target và classification-head target")
+    A("")
+    if chexbert_comparison is not None and not chexbert_comparison.empty:
+        A("Report-target chấm report sinh so với report gốc theo CheXbert F1; "
+          "cls-head-target chấm classification head với nhãn CheXbert từ report gốc, "
+          "chỉ trên nhãn dương/âm xác định (blank/uncertain được mask). Tỷ lệ agreement "
+          "so sánh trực tiếp nhãn nhị phân của report sinh và classification head trên "
+          "14 nhãn. Cả ba cột dùng cùng các bootstrap subset có hoàn lại.")
+        A("")
+        rows = [[str(r["subset"]), str(r["seed"]),
+                 _f(r["report_target_f1"]), _f(r["cls_head_target_f1"]),
+                 _f(r["head_report_agreement_pct"])]
+                for r in chexbert_comparison.to_dict("records")]
+        A(_tbl(["Subset", "Seed", "Report-target F1", "Cls-head-target F1",
+                "Head/report agreement (%)"], rows))
+    else:
+        A("Chưa có logits classification head để lập bảng. Chạy lại `infer` cho "
+          "Candidate C rồi chạy `score,stats,report`.")
     A("")
     A("## Pairwise statistics on the clinical primary metric")
     A("")
@@ -264,13 +350,16 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     pw = normalize_pw(pw)
     summary = summary_table(scores, names, metrics, primary, cfg)
     summary.to_csv(mdir / "summary.csv", index=False)
+    comparison = chexbert_head_report_bootstrap(scores, cfg)
+    comparison.to_csv(mdir / "chexbert_head_vs_report_bootstrap.csv", index=False)
     if not pw.empty:
         pw.to_csv(mdir / "pairwise_tests.csv", index=False)
     if train_stats:
         pd.json_normalize(train_stats).to_csv(mdir / "train_stats.csv", index=False)
 
     manifest["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    md = build_markdown(cfg, summary, pw, train_stats, names, manifest)
+    md = build_markdown(cfg, summary, pw, train_stats, names, manifest,
+                        chexbert_comparison=comparison)
     path = run_dir / "REPORT.md"
     path.write_text(md, encoding="utf-8")
     (run_dir / "manifest.json").write_text(

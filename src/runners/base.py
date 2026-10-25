@@ -77,6 +77,13 @@ class Runner:
         # cố định và đẩy predictions dở lên Hub, nên shutdown giữa lúc sinh chỉ mất vài
         # trăm mẫu. Lỗi trong móc này không bao giờ làm hỏng lần sinh.
         self.checkpoint = None
+        # Optional per-sample side outputs (e.g. classification-head decisions).
+        self._last_batch_aux: dict[str, dict] = {}
+
+    @property
+    def required_prediction_fields(self) -> tuple[str, ...]:
+        """Extra JSONL fields required for a prediction to count as resumable."""
+        return ()
 
     # ── giao diện con lớp phải cài ──────────────────────────────────────────
     def load(self) -> None:
@@ -140,7 +147,7 @@ class Runner:
             print(f"  ⚠ dọn {cut} byte của dòng cuối bị cắt dở (lần chạy trước bị dừng "
                   f"giữa lúc ghi)", flush=True)
 
-        done: set[str] = set()
+        records: dict[str, dict] = {}
         if out_path.exists():
             # Đọc lại bằng try/except từng dòng: file bị cắt giữa chừng vì
             # Ctrl-C thì chỉ dòng CUỐI hỏng, và vứt cả file vì một dòng cụt là
@@ -151,14 +158,29 @@ class Runner:
                     if not line:
                         continue
                     try:
-                        done.add(json.loads(line)["key"])
+                        record = json.loads(line)
+                        records[str(record["key"])] = record
                     except Exception:
                         continue
+        required = set(self.required_prediction_fields)
+        if required:
+            # Old prediction caches may contain the report but not the newly
+            # requested side output. Keep complete rows, discard stale rows,
+            # then regenerate only those samples and write fresh records.
+            complete = {k: r for k, r in records.items()
+                        if required.issubset(r)}
+            if len(complete) != len(records):
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for record in complete.values():
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                records = complete
+        done = set(records)
+        if records:
             print(f"  resume: đã có {len(done)} mẫu trong {out_path.name}", flush=True)
 
         todo = [r._asdict() if hasattr(r, "_asdict") else dict(r)
                 for r in df.itertuples(index=False)]
-        todo = [r for r in todo if r["key"] not in done]
+        todo = [r for r in todo if str(r["key"]) not in done]
         if not todo:
             print(f"  ✓ {self.name}: đã đủ {len(done)} mẫu, bỏ qua", flush=True)
             return out_path
@@ -181,7 +203,9 @@ class Runner:
                 batch = todo[i:i + bs]
                 t1 = time.time()
                 try:
+                    self._last_batch_aux = {}
                     outs = self.generate_batch(batch)
+                    batch_aux = self._last_batch_aux
                     fail_streak = 0
                 except Exception as e:
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
@@ -192,10 +216,13 @@ class Runner:
                     n_batch_failed += 1
                     self._free()
                     outs = []
+                    batch_aux = {}
                     n_item_fail = 0
                     for item in batch:
                         try:
+                            self._last_batch_aux = {}
                             outs.extend(self.generate_batch([item]))
+                            batch_aux.update(self._last_batch_aux)
                         except Exception as e2:
                             n_item_fail += 1
                             self._report_error(e2, key=item["key"])
@@ -228,13 +255,15 @@ class Runner:
                         # so với biết sau ba giờ.
                         samples.append({"key": item["key"], "ref": item.get("ref", "")[:600],
                                         "pred": text[:600]})
-                    f.write(json.dumps({
+                    record = {
                         "key": item["key"],
                         "pred": text,
                         "model_id": self.mcfg["id"],
                         "latency_s": round(dt / max(1, len(batch)), 3),
                         "empty": not text.strip(),
-                    }, ensure_ascii=False) + "\n")
+                    }
+                    record.update(batch_aux.get(str(item["key"]), {}))
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 n_done += len(batch)
                 if self.checkpoint is not None:
