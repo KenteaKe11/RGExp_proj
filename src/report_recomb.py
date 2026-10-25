@@ -153,10 +153,10 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     vision_layers = str(vision_cfg.get("layers", "second_half"))
     vision_scope = "toàn bộ" if vision_layers in {"all", "full", "0"} else "nửa cuối"
     A("So sánh ba candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
-      f"và QLoRA decoder + QDoRA rank 4 trên {vision_scope} vision encoder + projector "
-      "đóng băng + Recombinator và classification head. Candidate C giữ nguyên đường "
-      "projector Gemma 3: `adapter_output + Linear(RMSNorm(recombiner_output))`. "
-      "học được. ClsHead dùng một learned query với attention pooling 8 heads rồi "
+      f"và Candidate C: QLoRA decoder + QDoRA rank 4 trên {vision_scope} vision encoder, "
+      "fine-tune projector Gemma 3, cùng Recombinator và classification head. "
+      "Candidate C chiếu token/feature Recombinator rồi concat với adapter ảnh và "
+      "prompt embeddings. ClsHead dùng một learned query với attention pooling 8 heads rồi "
       "chiếu tuyến tính trực tiếp ra logits. Candidate C không có Route Head hay MoE.")
     A("")
     cfg_stats = cfg.get("stats") or {}
@@ -218,7 +218,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     c_id = next((str(a["id"]) for a in arms if a.get("recomb")), None)
     c_stats = stats_by_arm.get(c_id or "", {})
     cls = c_stats.get("cls_metrics_last") or {}
-    A("Candidate C fusion: **RMSNorm → Linear → residual add**. Classification-head positive F1 "
+    A("Candidate C fusion: **token projection + feature projection → concat**. Classification-head positive F1 "
       f"at the end of training: {_f(cls.get('cls_f1_pos'))}.")
     A("")
     train_cfg = cfg.get('train') or {}

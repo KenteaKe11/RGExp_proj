@@ -1,8 +1,16 @@
 ﻿# §2.3 — Recombinator và đánh giá lâm sàng
 
-Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào toàn bộ vision encoder, fine-tune projector Gemma 3, rồi fusion nhánh Recombinator theo `adapter_output + Linear(RMSNorm(recombiner_output))`. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 1.0 × ASL`, không warmup hệ số ASL.
+Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào toàn bộ vision encoder, fine-tune projector Gemma 3, rồi chiếu nhánh Recombinator và concat token của nhánh với token adapter cùng prompt embeddings. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 1.0 × ASL`, không warmup hệ số ASL.
 
-Đầu phân loại nhận `(batch, 256, 2560)` từ Recombinator. Một query học được dùng multi-head attention (8 heads) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thẳng thành logits `(batch, 14, 2)`. Không còn bốn tầng pooling hay MLP ẩn trong ClsHead.
+## Kiến trúc abstract tổng quát
+
+![Sơ đồ abstract tổng quát](docs/figures/fig1_overall_pipeline.png)
+
+Sơ đồ thể hiện kiến trúc đầy đủ với Classification Head, Route Head và Experts (LoRA). Trong §2.3, Candidate C chỉ dùng Classification Head; Route Head và Experts không được bật. Fusion của Candidate C chiếu token/feature Recombinator rồi concat với token ảnh adapter và prompt embeddings.
+
+Đầu phân loại nhận `(batch, 256, 1152)` từ Recombinator. Một query học được dùng multi-head attention (8 heads) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thẳng thành logits `(batch, 14, 2)`. Không còn bốn tầng pooling hay MLP ẩn trong ClsHead.
+
+Local Extractor rút chuỗi 4.096 patch còn 256 token. Global Extractor dùng `Q=RMSNorm(local)`, `K/V=RMSNorm(vision gốc)` và trả `local + MHA(Q,K,V)`. FFN giữ chiều vision 1.152: `x + Linear(GELU(Linear(RMSNorm(x))))`, với MLP mở rộng `1.152→4×1.152→1.152`. Đầu ra này cấp cho attention pooling của ClsHead. Nhánh decoder chiếu token `256→128→64`, chiếu feature `1.152→2.560`, rồi concat với adapter ảnh và prompt embeddings.
 
 ## Quick start
 

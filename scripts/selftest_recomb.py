@@ -43,40 +43,37 @@ def main() -> int:
         from src.recombiner import RecombinerBranch
 
         branch = RecombinerBranch(
-            d_vis=16, d_model=16, n_labels=3,
+            d_vis=16, d_model=24, n_labels=3,
             rcfg={"n_vis": 16, "local": {"n_blocks": 1, "hidden": 32,
                                                 "pool_factor": 2},
-                  "head_dim": 4, "merge_mode": "add"},
+                  "head_dim": 4, "merge_mode": "concat",
+                  "n_dec_tokens": 4, "n_dec_hidden": 6},
             ccfg={"n_classes": 2, "attn_pool_heads": 4,
                   "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0}})
         vis = torch.randn(2, 16, 16)
         tokens, logits, route = branch(vis)
-        if tuple(tokens.shape) != (2, 8, 16):
+        if tuple(tokens.shape) != (2, 4, 24):
             raise AssertionError(f"unexpected recombiner output: {tuple(tokens.shape)}")
         if tuple(logits.shape) != (2, 3, 2):
             raise AssertionError(f"unexpected classification logits: {tuple(logits.shape)}")
         if route is not None or branch.route_head is not None:
             raise AssertionError("§2.3 candidate must not contain a Route Head")
-        merged = branch.merge_adapter(tokens, tokens)
-        want = tokens + branch.merge_proj(branch.merge_norm(tokens))
-        if not torch.allclose(merged, want):
-            raise AssertionError("merge does not equal adapter + Linear(RMSNorm(branch))")
         target = torch.zeros_like(logits)
         target[..., 1] = 1
         mask = torch.ones(2, 3)
         mask[0, 1] = 0
-        loss = branch.sup_loss(logits, target, mask) + merged.square().mean()
+        loss = branch.sup_loss(logits, target, mask) + tokens.square().mean()
         loss.backward()
         if branch.cls_head.head.pool.query.grad is None:
             raise AssertionError("attention pooling query received no gradient")
-        if branch.merge_proj.weight.grad is None:
-            raise AssertionError("merge linear projection received no gradient")
-        if branch.merge_norm.weight.grad is None:
-            raise AssertionError("merge RMSNorm received no gradient")
+        if branch.dec_proj.proj1.weight.grad is None:
+            raise AssertionError("token projection received no gradient")
+        if branch.dec_proj.out_proj.weight.grad is None:
+            raise AssertionError("feature projection received no gradient")
 
     print("Section 2.3 quick self-check (CPU)")
     check("paired statistics", test_stats)
-    check("attention ClsHead and additive Candidate C branch", test_branch)
+    check("attention ClsHead and project-then-concat Candidate C branch", test_branch)
     if failures:
         print(f"\n{len(failures)} check(s) failed.")
         return 1

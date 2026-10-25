@@ -933,7 +933,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"{bstats['cls_head']:,} · {route_desc} · dec_proj "
               f"{bstats['dec_proj']:,}", flush=True)
         merge_desc = ("RMSNorm -> Linear -> add"
-                      if branch.merge_mode == "add" else "concat")
+                      if branch.merge_mode == "add" else
+                      "token/feature projection -> concat")
         print(f"  fusion vào decoder: {branch.merge_mode} · {merge_desc}", flush=True)
         if spec is not None:
             print(f"  Route Head HOẠT ĐỘNG: Recombinator -> TaskHead PoolingStack -> "
@@ -1151,7 +1152,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "schedule": dict(tcfg["schedule"]),
         "n_rec_tokens": int(bstats.get("n_tokens", 0)),
         "n_dec_tokens": int(bstats.get("n_dec_tokens", 0)),
-        "merge_fusion": "RMSNorm -> Linear -> residual add" if branch is not None else None,
+        "merge_fusion": ("RMSNorm -> Linear -> residual add"
+                         if branch is not None and branch.merge_mode == "add" else
+                         "token/feature projection -> concat"
+                         if branch is not None else None),
         "merge_mode": branch.merge_mode if branch is not None else None,
         "token_type_value": tt_value if use_branch else None,
         "lambda_sup": lam, "lambda_warmup_pct": lam_warm,

@@ -55,15 +55,16 @@ PRETRAINED_MODULES: tuple[str, ...] = ("recombinator", "cls_head")
 # Những khối có trong nhánh nhưng KHÔNG nhận gradient ở pretrain. Khai tường
 # minh (thay vì "phần còn lại") để `save_pretrain` dừng khi nhánh mọc thêm một
 # khối mới mà không ai quyết định nó thuộc nhóm nào.
-UNTRAINED_MODULES: tuple[str, ...] = ("route_head", "dec_proj", "merge_alpha")
+UNTRAINED_MODULES: tuple[str, ...] = (
+    "route_head", "dec_proj", "merge_norm", "merge_proj", "merge_alpha")
 
 PRETRAIN_FILE = "sup_pretrain.safetensors"
 PRETRAIN_META = "sup_pretrain.json"
 TRAINER_STATE = "trainer_state.pt"      # chỉ để resume, KHÔNG bao giờ đẩy Hub
-# /4: adds learned-query attention pooling for the classification head. Checkpoint
-# /1 (PDVR + QFormer) không nạp được — `assert_compatible` dừng ở đây trước khi
-# đối chiếu khoá.
-FORMAT = "rgexp.sup_pretrain/4"
+# /5: Global Extractor residual giữ local thô; FFN là pre-norm residual MLP
+# trong chiều vision. Checkpoint của kiến trúc trước không nạp được —
+# `assert_compatible` dừng ở đây trước khi đối chiếu khoá.
+FORMAT = "rgexp.sup_pretrain/5"
 
 
 class PretrainIncompatible(RuntimeError):

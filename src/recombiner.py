@@ -3,7 +3,7 @@ trong sơ đồ tổng, trừ Experts (LoRA) nằm trong decoder (`src/moe.py`).
 
 Sơ đồ tổng:
 
-    Image ─► Vision Encoder ─┬─► Recombinator (256, 2560) ─┬─► Classification Head (14·3) ─► Sup Loss
+    Image ─► Vision Encoder ─┬─► Recombinator (256, 1152) ─┬─► Classification Head (14·2) ─► Sup Loss
                              │                             ├─► Route Head (E) ─► Aux Loss
                              │                             │        └─► Top-k Gate ─► Experts (LoRA)
                              │                             └─► Linear/GELU 256→128 ─► Linear 128→64 ┐ (First)
@@ -20,18 +20,17 @@ Bên trong Recombinator (sơ đồ chi tiết):
       │      (4096 ─► 1024 ─► 256 token)
       │                              │
       │                              ▼ Query
-      └─► RMSNorm(1152) ─► W_Key / W_Value ─► 2. Global Extractor: MHA(head_dim=64) ─► ⊕ (residual Query)
-                                                              │
-                                                              ▼
-          3. FFN: Linear 1152→2560 GELU ─► RMSNorm(2560) ─► Linear 2560→2560 GELU ─► ⊕ ─► Y (256, 2560)
-                                                  └──────────── residual ─────────────┘
+      └─► RMSNorm(1152) ─► W_Key / W_Value ─► 2. Global Extractor:
+              Q = Local (256), K/V = vision gốc (4096), MHA(head_dim=64)
+              ─► ⊕ residual Local ─► (256, 1152)
+                                      │
+                                      ▼
+          3. FFN: RMSNorm(1152) ─► MLP/GELU 1152→k·1152→1152 ─► ⊕ residual ─► Y (256, 1152)
+          4. Decoder fusion: project token + feature ─► concat với adapter và prompt
 
 Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`):
 
-    X (256, 2560) ─► Pooling Stack: 4 tầng, mỗi tầng
-                        RMSNorm(2560) ─► Linear/GELU trên TRỤC TOKEN (N → N/2) ─► AvgPool (N/2 → N/4)
-                     (256 ─► 64 ─► 16 ─► 4 ─► 1)
-                  ─► Main Head: RMSNorm(2560) ─► Linear/GELU 2560→1024 ─► Linear 1024→target
+    X (256, 1152) ─► Attention Pool ─► Linear ─► logits (14, 2)
 
 ── Các quyết định trong file này, và hậu quả nếu làm khác ───────────────────
 
@@ -49,9 +48,10 @@ Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`)
    Lưới 16×16 ra khỏi Local Extractor trùng lưới của VL-Adapter, nên 256 token
    của Recombinator và 256 token ảnh nói về cùng những vùng ảnh.
 
-4. RESIDUAL lấy từ ĐẦU RA RMSNorm, đúng như sơ đồ vẽ (mũi tên xuất phát từ
-   khối RMSNorm): Global Extractor cộng `RMSNorm(query)`, FFN cộng
-   `RMSNorm(2560)`. Không có residual trong Local Extractor.
+4. Global Extractor tính `local + MHA(RMSNorm(local), RMSNorm(vision))`.
+   FFN tính `x + MLP(RMSNorm(x))`, giữ chiều 1152. Decoder fusion chiếu token
+   256→128→64 và feature 1152→2560, rồi concat với adapter ảnh và prompt.
+   Không có residual trong Local Extractor.
 
 5. Main Head KHÔNG áp GELU sau lớp cuối (1024 → target). Đầu ra ấy là LOGIT —
    của ASL (sigmoid) ở Classification Head và của softmax/top-k ở Route Head.
@@ -93,7 +93,7 @@ import torch.nn.functional as F
 N_VIS_TOKENS = 4096
 BRANCH_FILE = "recomb_branch.safetensors"
 BRANCH_META = "recomb_branch.json"
-BRANCH_FORMAT = "rgexp.recomb_branch/4"
+BRANCH_FORMAT = "rgexp.recomb_branch/5"
 
 # Khoá của những kiến trúc cũ (PDVR, QFormer, cổng Hard-Concrete). Còn sót
 # trong config là DỪNG: im lặng bỏ qua thì người đọc config tưởng chúng vẫn tác
@@ -257,7 +257,7 @@ class GlobalExtractor(nn.Module):
 
         q   = RMSNorm(local)                 # (B, 256, 1152)
         kv  = RMSNorm(X)                     # (B, 4096, 1152)
-        out = q + MHA(q, kv)                 # residual từ đầu ra RMSNorm (điểm 4)
+        out = local + MHA(q, kv)             # residual skip quanh RMSNorm/attention
     """
 
     def __init__(self, d_vis: int, head_dim: int, dropout: float):
@@ -272,31 +272,37 @@ class GlobalExtractor(nn.Module):
 
     def forward(self, local: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
         q = self.norm_q(local)
-        return q + self.drop(self.attn(q, self.norm_kv(vis)))
+        return local + self.drop(self.attn(q, self.norm_kv(vis)))
 
 
 class RecombFFN(nn.Module):
-    """Linear d→D GELU -> RMSNorm(D) -> Linear D→D GELU -> ⊕ residual(RMSNorm)."""
+    """Pre-norm residual MLP: d -> k*d -> d with GELU."""
 
-    def __init__(self, d_vis: int, d_model: int, dropout: float):
+    def __init__(self, d_vis: int, dropout: float,
+                 expansion: int = 4):
         super().__init__()
-        self.up = nn.Linear(d_vis, d_model)
-        self.norm = RMSNorm(d_model)
-        self.fc = nn.Linear(d_model, d_model)
+        self.expansion = int(expansion)
+        if self.expansion < 1:
+            raise ValueError("recombiner.ffn_expansion must be >= 1")
+        self.norm = RMSNorm(d_vis)
+        self.up = nn.Linear(d_vis, d_vis * self.expansion)
+        self.down = nn.Linear(d_vis * self.expansion, d_vis)
         self.drop = nn.Dropout(float(dropout)) if dropout else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(F.gelu(self.up(x)))
-        return h + self.drop(F.gelu(self.fc(h)))
+        h = self.up(self.norm(x))
+        h = self.down(F.gelu(h))
+        return x + self.drop(h)
 
 
 class Recombinator(nn.Module):
-    """(B, 4096, 1152) -> (B, 256, 2560). Xem sơ đồ ở docstring module."""
+    """(B, 4096, 1152) -> (B, 256, 1152). Xem sơ đồ ở docstring module."""
 
     def __init__(self, d_vis: int = 1152, d_model: int = 2560,
                  n_vis: int = N_VIS_TOKENS, n_local: int = 2,
                  local_hidden: int = 2048, pool_factor: int = 4,
-                 head_dim: int = 64, dropout: float = 0.0):
+                 head_dim: int = 64, dropout: float = 0.0,
+                 ffn_expansion: int = 4):
         super().__init__()
         self.d_vis, self.d_model = int(d_vis), int(d_model)
         self.n_vis = int(n_vis)
@@ -312,7 +318,7 @@ class Recombinator(nn.Module):
             LocalExtractor(self.d_vis, int(local_hidden), int(pool_factor))
             for _ in range(int(n_local)))
         self.global_extractor = GlobalExtractor(self.d_vis, int(head_dim), dropout)
-        self.ffn = RecombFFN(self.d_vis, self.d_model, dropout)
+        self.ffn = RecombFFN(self.d_vis, dropout, ffn_expansion)
 
     def forward(self, vis: torch.Tensor) -> torch.Tensor:
         if vis.shape[1] != self.n_vis or vis.shape[-1] != self.d_vis:
@@ -666,16 +672,20 @@ def cls_metrics(logits: torch.Tensor, target: torch.Tensor,
 class DecoderProjection(nn.Module):
     """Linear/GELU (n_in → n_mid) -> Linear (n_mid → n_out) trên TRỤC TOKEN.
 
-    (B, 256, d) -> (B, 128, d) -> (B, 64, d). Không bias, không norm, không
-    cổng; GELU chỉ ở giữa. Khởi tạo: tích hai ma trận = trung bình 2×2 trên
+    (B, 256, d_in) -> (B, 128, d_in) -> (B, 64, d_in) -> (B, 64, d_out).
+    Phép chiếu token không bias, không norm, không cổng; GELU chỉ ở giữa.
+    Khởi tạo token: tích hai ma trận = trung bình 2×2 trên
     lưới 16×16 -> 8×8 (điểm 7 của docstring module), xem `split_grid_pool`.
     """
 
-    def __init__(self, n_in: int, n_out: int, n_mid: int | None = None):
+    def __init__(self, n_in: int, n_out: int, n_mid: int | None = None,
+                 d_in: int | None = None, d_out: int | None = None):
         super().__init__()
         self.n_in = int(n_in)
         self.n_out = int(n_out)
         self.n_mid = int(n_mid) if n_mid else self.n_in // 2
+        self.d_in = int(d_in) if d_in is not None else None
+        self.d_out = int(d_out) if d_out is not None else self.d_in
         if not 0 < self.n_out <= self.n_mid <= self.n_in:
             raise ValueError(
                 f"dec_proj cần 0 < n_dec_tokens ({self.n_out}) <= n_dec_hidden "
@@ -683,6 +693,9 @@ class DecoderProjection(nn.Module):
                 f"token hơn chỉ nhân bản thông tin và kéo dài chuỗi decoder.")
         self.proj1 = nn.Linear(self.n_in, self.n_mid, bias=False)
         self.proj2 = nn.Linear(self.n_mid, self.n_out, bias=False)
+        self.out_proj = (nn.Linear(self.d_in, self.d_out)
+                         if self.d_in is not None and self.d_out != self.d_in
+                         else nn.Identity())
         self.reset_parameters()
 
     def init_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -700,7 +713,8 @@ class DecoderProjection(nn.Module):
                 f"dec_proj nhận {x.shape[1]} token nhưng được dựng cho "
                 f"{self.n_in} (= số token của Recombinator).")
         h = F.gelu(self.proj1(x.transpose(1, 2)))
-        return self.proj2(h).transpose(1, 2)
+        out = self.proj2(h).transpose(1, 2)
+        return self.out_proj(out) if not isinstance(self.out_proj, nn.Identity) else out
 
 
 def split_grid_pool(n_in: int, n_mid: int, n_out: int
@@ -775,7 +789,8 @@ class RecombinerBranch(nn.Module):
             local_hidden=int(loc.get("hidden", 2048)),
             pool_factor=int(loc.get("pool_factor", 4)),
             head_dim=int(r.get("head_dim", 64)),
-            dropout=float(r.get("dropout", 0.0)))
+            dropout=float(r.get("dropout", 0.0)),
+            ffn_expansion=int(r.get("ffn_expansion", 4)))
         self.n_tokens = int(self.recombinator.n_tokens)
         declared = r.get("n_tokens")
         if declared is not None and int(declared) != self.n_tokens:
@@ -785,7 +800,7 @@ class RecombinerBranch(nn.Module):
         self.pool_stages = int(r.get("pool_stages", 4))
 
         self.cls_head = ClsHead(
-            self.n_tokens, self.d_model, int(n_labels),
+            self.n_tokens, self.d_vis, int(n_labels),
             n_classes=int(c.get("n_classes", 3)),
             hidden=int(c.get("hidden", 1024)),
             n_stages=self.pool_stages,
@@ -796,7 +811,7 @@ class RecombinerBranch(nn.Module):
         # độ đã huấn luyện — không phải chế độ đang ghi trong config lúc sinh.
         self.route_enabled = bool(r.get("route_enabled", False))
         self.route_head = RouteHead(
-            self.n_tokens, self.d_model, int(r.get("n_experts", 4)),
+            self.n_tokens, self.d_vis, int(r.get("n_experts", 4)),
             hidden=int(rh.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(rh.get("dropout", 0.0)),
@@ -810,19 +825,23 @@ class RecombinerBranch(nn.Module):
         self.merge_mode = str(r.get("merge_mode", "concat" if self.route_enabled else "add"))
         if self.merge_mode not in ("add", "concat"):
             raise ValueError("recombiner.merge_mode must be 'add' or 'concat'")
-        self.n_dec_tokens = (self.n_tokens if self.merge_mode == "add" else
+        self.n_dec_tokens = (int(r.get("n_dec_tokens", self.n_tokens))
+                             if self.merge_mode == "add" else
                              int(r.get("n_dec_tokens", 64)))
         self.n_dec_hidden = int(r.get("n_dec_hidden", self.n_tokens // 2))
         self.dec_proj = (nn.Identity() if self.merge_mode == "add" else
                          DecoderProjection(self.n_tokens, self.n_dec_tokens,
-                                           self.n_dec_hidden))
-        self.merge_norm = RMSNorm(self.d_model) if self.merge_mode == "add" else None
-        self.merge_proj = (nn.Linear(self.d_model, self.d_model)
+                                           self.n_dec_hidden, d_in=self.d_vis,
+                                           d_out=self.d_model))
+        self.merge_norm = RMSNorm(self.d_vis) if self.merge_mode == "add" else None
+        self.merge_proj = (nn.Linear(self.d_vis, self.d_model)
                            if self.merge_mode == "add" else None)
 
         for m in (self.recombinator, self.cls_head, self.route_head, self.merge_proj):
             if m is not None:
                 _init(m)
+        if isinstance(self.dec_proj, DecoderProjection):
+            _init(self.dec_proj.out_proj)
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
         if self.route_head is not None:
             self.route_head.init_noise()
@@ -832,9 +851,8 @@ class RecombinerBranch(nn.Module):
     def forward(self, vis: torch.Tensor):
         """(B, 4096, d_vis) -> (token cho decoder, logit phân loại, route).
 
-        Token cho decoder: `(B, n_dec_tokens, d_model)`, đi THẲNG vào chuỗi.
-        Hai head đọc cả `n_tokens` (256) token của Recombinator (trước phép
-        chiếu), nên Sup/Aux Loss không phụ thuộc `dec_proj`.
+        Recombinator và các head đọc `(B, n_tokens, d_vis)`; đường decoder
+        chuẩn hóa/chiếu feature sang `d_model` trước khi cộng hoặc nối.
 
         `route` là `(route_logits, route_log_sigma)` khi định tuyến bật, và
         `None` khi tắt (Stage 0) — khi đó Route Head KHÔNG được gọi, nên nó
@@ -842,19 +860,22 @@ class RecombinerBranch(nn.Module):
         người gọi bỏ qua: một tensor route nằm sẵn ở đầu ra là một lời mời cộng
         nó vào loss.
         """
-        rec = self.recombinator(vis)                       # (B, 256, d_model)
+        rec = self.recombinator(vis)                       # (B, 256, d_vis)
         logits = self.cls_head(rec) if self.cls_head is not None else None
         route = self.route_head(rec) if self.route_head is not None else None
         tokens = rec if self.merge_mode == "add" else self.dec_proj(rec)
         return tokens, logits, route
 
     def merge_adapter(self, aligned: torch.Tensor, recomb_tokens: torch.Tensor) -> torch.Tensor:
-        """RMSNorm -> Linear -> residual add to the frozen base projector output."""
+        """RMSNorm(d_vis) -> Linear(d_vis,d_model) -> add to base projector."""
         if self.merge_mode != "add" or self.merge_norm is None or self.merge_proj is None:
             raise RuntimeError("merge_adapter is available only for additive fusion")
-        if aligned.shape != recomb_tokens.shape:
+        if (aligned.shape[:2] != recomb_tokens.shape[:2]
+                or aligned.shape[-1] != self.d_model
+                or recomb_tokens.shape[-1] != self.d_vis):
             raise RuntimeError(
-                f"add fusion needs matching adapter/recombiner shapes; got "
+                f"add fusion needs equal batch/token axes and adapter/recombiner "
+                f"feature dims {self.d_model}/{self.d_vis}; got "
                 f"{tuple(aligned.shape)} and {tuple(recomb_tokens.shape)}. "
                 f"Set recombiner.n_dec_tokens to the base projector token count.")
         residual = self.merge_proj(self.merge_norm(recomb_tokens.to(aligned.dtype)))
@@ -933,12 +954,15 @@ class RecombinerBranch(nn.Module):
         hid = loc.up.out_features if loc is not None else 0
         head_desc = ("ClsHead" + (" + RouteHead" if self.route_head is not None else ""))
         merge_desc = ("RMSNorm -> Linear -> residual add"
-                      if self.merge_mode == "add" else "token concat")
+                      if self.merge_mode == "add" else
+                      "token/feature projection -> concat")
         return (f"Recombinator: LocalExtractor×{n['n_local']} "
                 f"({self.d_vis}→{hid}→{self.d_vis}, {n['n_vis']}→{n['n_tokens']} "
                 f"token) -> Global MHA(Q={n['n_tokens']}, KV={n['n_vis']}, "
-                f"{n['n_heads']} head) -> FFN {self.d_vis}→{self.d_model} "
-                f"= ({n['n_tokens']}, {self.d_model}) · {head_desc}: "
+                f"{n['n_heads']} head) -> FFN RMSNorm-MLP "
+                f"({self.d_vis}→{rec.ffn.expansion}×{self.d_vis}→{self.d_vis}) + residual "
+                f"= ({n['n_tokens']}, {self.d_vis}) · fusion {merge_desc} "
+                f"({self.d_vis}→{self.d_model}) · {head_desc}: "
                 f"AttnPool(Q=1, H={n['cls_attention_heads']}) -> logits "
                 f"(target {getattr(self.cls_head, 'n_labels', 0)}×"
                 f"{getattr(self.cls_head, 'n_classes', 0)}) · merge={merge_desc}")

@@ -17,12 +17,12 @@
 # ── Đọc file này thế nào ───────────────────────────────────────────────────
 # Khối `recombiner` mô tả HÌNH DẠNG của nhánh (sơ đồ chi tiết trong README).
 # Khối `classifier` mô tả HÀM MẤT MÁT có giám sát (ASL, λ); khối `recombiner`
-# mô tả đường fusion RMSNorm -> Linear -> residual add.
+# mô tả đường fusion chiếu nhánh rồi concat với adapter ảnh/prompt.
 #
 # ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
-# 2. Candidate C fine-tune projector gốc; fusion dùng RMSNorm -> Linear -> add.
+# 2. Candidate C fine-tune projector gốc; fusion chiếu token/feature rồi concat.
 # 3. Ba candidate dùng chung manifest test; 10 bootstrap subset dùng 10 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -263,7 +263,7 @@ train:
     double_quant: true
     compute_dtype: bfloat16
 
-# Candidate C: Recombiner output is added to the original Gemma 3 projector output.
+# Candidate C: project Recombinator tokens/features, then concatenate with adapter tokens.
 
 recombiner:
   siglip_dim: 1152
@@ -275,8 +275,9 @@ recombiner:
     pool_factor: 4
   head_dim: 64
   dropout: 0.0
+  ffn_expansion: 4
   pool_stages: 4
-  merge_mode: add
+  merge_mode: concat
   dtype: null
 classifier:
   enabled: true

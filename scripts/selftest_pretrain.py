@@ -553,8 +553,8 @@ def arch_tests() -> None:
             y = rec.ffn(g)
         eq(shapes, [(1, 1024, 1152), (1, 256, 1152)], "Local Extractor")
         eq(tuple(g.shape), (1, 256, 1152), "Global Extractor")
-        eq(tuple(y.shape), (1, 256, 2560), "FFN -> Y [256, 2560]")
-    check("Recombinator: 4096→1024→256 token, 18 head, Y (256, 2560)",
+        eq(tuple(y.shape), (1, 256, 1152), "FFN -> Y [256, 1152]")
+    check("Recombinator: 4096→1024→256 token, 18 head, Y (256, 1152)",
           t_recombinator_shapes)
 
     def t_heads_shapes():
@@ -598,7 +598,7 @@ def arch_tests() -> None:
           t_logits_not_gelu_bounded)
 
     def t_residuals():
-        """Residual lấy từ đầu ra RMSNorm, đúng như sơ đồ."""
+        """Global residual là local thô; FFN residual là đầu vào FFN."""
         import torch
         import torch.nn as nn
 
@@ -608,15 +608,13 @@ def arch_tests() -> None:
         kv = torch.randn(1, 4096, 1152)
         with torch.no_grad():
             nn.init.zeros_(ge.attn.o_proj.weight)
-            eq_ = torch.allclose(ge(q, kv), ge.norm_q(q), atol=1e-5)
-            true(eq_, "MHA = 0 thì Global Extractor phải trả RMSNorm(query)")
-            nn.init.zeros_(ffn.fc.weight)
-            nn.init.zeros_(ffn.fc.bias)
-            h = ffn.norm(torch.nn.functional.gelu(ffn.up(q)))
-            true(torch.allclose(ffn(q), h + torch.nn.functional.gelu(torch.zeros(())),
-                                atol=1e-5),
-                 "FFN: residual phải là đầu ra RMSNorm(2560)")
-    check("residual của Global Extractor và FFN lấy từ RMSNorm", t_residuals)
+            eq_ = torch.allclose(ge(q, kv), q, atol=1e-5)
+            true(eq_, "MHA = 0 thì Global Extractor phải trả local input")
+            nn.init.zeros_(ffn.down.weight)
+            nn.init.zeros_(ffn.down.bias)
+            true(torch.allclose(ffn(q), q, atol=1e-5),
+                 "FFN: khi nhánh MLP bằng 0 phải trả input")
+    check("Global Extractor skip local thô; FFN có residual pre-norm", t_residuals)
 
     def t_roundtrip_branch():
         import torch
