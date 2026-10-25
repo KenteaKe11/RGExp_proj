@@ -152,9 +152,13 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     vision_cfg = ((cfg.get("train") or {}).get("vision_adapter") or {})
     vision_layers = str(vision_cfg.get("layers", "second_half"))
     vision_scope = "toàn bộ" if vision_layers in {"all", "full", "0"} else "nửa cuối"
+    projector_ft = any(bool(a.get("train_projector", False))
+                       for a in cfg.get("arms", []))
+    projector_phrase = ("fine-tune projector Gemma 3" if projector_ft
+                        else "đóng băng projector Gemma 3")
     A("So sánh ba candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
       f"và Candidate C: QLoRA decoder + QDoRA rank 4 trên {vision_scope} vision encoder, "
-      "fine-tune projector Gemma 3, cùng Recombinator và classification head. "
+      f"{projector_phrase}, cùng Recombinator và classification head. "
       "Candidate C chiếu token/feature Recombinator rồi concat với adapter ảnh và "
       "prompt embeddings. ClsHead dùng một learned query với attention pooling 8 heads rồi "
       "chiếu tuyến tính trực tiếp ra logits. Candidate C không có Route Head hay MoE.")
@@ -224,7 +228,6 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     train_cfg = cfg.get('train') or {}
     classifier_cfg = cfg.get('classifier') or {}
     asl_cfg = classifier_cfg.get('asl') or {}
-    projector_ft = any(bool(a.get("train_projector", False)) for a in cfg.get("arms", []))
     projector_state = "fine-tuned" if projector_ft else "frozen"
     A(f"Loss: CE + {classifier_cfg.get('lambda', 0.5)} × ASL; "
       f"Projector is {projector_state}. AdamW: weight decay {train_cfg.get('weight_decay')} and "

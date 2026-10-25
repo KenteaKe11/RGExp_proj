@@ -22,7 +22,7 @@
 # ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
-# 2. Candidate C fine-tune projector gốc; fusion chiếu token/feature rồi concat.
+# 2. Candidate C chỉ QDoRA nửa cuối vision và đóng băng projector; fusion chiếu rồi concat.
 # 3. Ba candidate dùng chung manifest test; 10 bootstrap subset dùng 10 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -248,7 +248,7 @@ train:
   vision_adapter:
     enabled: true
     include_prefixes: [vision_tower, vision_model]
-    layers: all
+    layers: second_half
     method: qdora
     rank: 4
   lora_dropout: 0.05
@@ -458,9 +458,9 @@ arms:
     recomb: false
     enabled: true
   - id: lora_recomb
-    name: "QDoRA full vision + projector FT + QLoRA + Recombinator + classifier"
+    name: "QDoRA second-half vision + frozen projector + QLoRA + Recombinator + classifier"
     recomb: true
-    train_projector: true
+    train_projector: false
     enabled: true
 metrics:
   normalize:
