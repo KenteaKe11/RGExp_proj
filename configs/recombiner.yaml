@@ -22,7 +22,7 @@
 # ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
-# 2. Candidate C chỉ QDoRA nửa cuối vision và đóng băng projector; fusion chiếu rồi concat.
+# 2. Candidate C chỉ QDoRA 1/4 layer cuối vision và đóng băng projector; fusion chiếu rồi concat.
 # 3. Ba candidate dùng chung manifest test; 10 bootstrap subset dùng 10 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -248,7 +248,7 @@ train:
   vision_adapter:
     enabled: true
     include_prefixes: [vision_tower, vision_model]
-    layers: second_half
+    layers: last_quarter
     method: qdora
     rank: 4
   lora_dropout: 0.05
@@ -311,7 +311,7 @@ classifier:
     eps: 1.0e-8
 
   # Trọng số loss ASL: loss = CE + λ(step) * ASL.
-  lambda: 0.25
+  lambda: 0.1
   lambda_warmup_pct: 0.0
   lambda_warmup_pct_pretrained: 0.0
 

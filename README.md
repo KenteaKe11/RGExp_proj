@@ -1,6 +1,6 @@
 ﻿# §2.3 — Recombinator và đánh giá lâm sàng
 
-Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào nửa cuối vision encoder, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và concat token của nhánh với token adapter cùng prompt embeddings. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 0.25 × ASL`, không warmup hệ số ASL.
+Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào 1/4 layer cuối vision encoder, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và concat token của nhánh với token adapter cùng prompt embeddings. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 0.1 × ASL`, không warmup hệ số ASL.
 
 ## Kiến trúc abstract tổng quát
 

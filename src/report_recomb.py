@@ -151,7 +151,14 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     vision_cfg = ((cfg.get("train") or {}).get("vision_adapter") or {})
     vision_layers = str(vision_cfg.get("layers", "second_half"))
-    vision_scope = "toàn bộ" if vision_layers in {"all", "full", "0"} else "nửa cuối"
+    if vision_layers in {"all", "full", "0"}:
+        vision_scope = "toàn bộ"
+    elif vision_layers in {"last_quarter", "final_quarter", "last_25_percent"}:
+        vision_scope = "1/4 layer cuối"
+    elif vision_layers == "second_half":
+        vision_scope = "nửa cuối"
+    else:
+        vision_scope = f"từ layer {vision_layers}"
     projector_ft = any(bool(a.get("train_projector", False))
                        for a in cfg.get("arms", []))
     projector_phrase = ("fine-tune projector Gemma 3" if projector_ft

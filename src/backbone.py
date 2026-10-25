@@ -232,6 +232,8 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
                 start = 0
             elif frm == "second_half":
                 start = -(-n_layers // 2)
+            elif frm in {"last_quarter", "final_quarter", "last_25_percent"}:
+                start = n_layers - (-(-n_layers // 4))
             else:
                 start = int(frm)
             kept = [h for h in hits if h not in idx or idx[h] >= start]
