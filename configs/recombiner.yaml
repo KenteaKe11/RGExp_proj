@@ -311,7 +311,7 @@ classifier:
     eps: 1.0e-8
 
   # Trọng số loss ASL: loss = CE + λ(step) * ASL.
-  lambda: 1.0
+  lambda: 0.25
   lambda_warmup_pct: 0.0
   lambda_warmup_pct_pretrained: 0.0
 
