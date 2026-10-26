@@ -290,9 +290,15 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                         raise RunnerUnusable(
                             "Candidate C cần logits classification head để đối chiếu "
                             "với report-target, nhưng branch trả None.")
-                    probs = torch.softmax(cls_logits.float(), dim=-1)
-                    pred_t = probs.argmax(dim=-1)
-                    confidence = probs.max(dim=-1).values
+                    if tuple(cls_logits.shape) != (len(batch), 14):
+                        raise RunnerUnusable(
+                            f"ClsHead checkpoint cũ trả shape {tuple(cls_logits.shape)}; "
+                            "kiến trúc hiện hành cần 14 binary logits mỗi ảnh. "
+                            "Hãy train lại Candidate C bằng `--retrain` hoặc "
+                            "Candidate D bằng `--force` trước khi infer.")
+                    probs = torch.sigmoid(cls_logits.float())
+                    pred_t = (probs >= 0.5).to(torch.int64)
+                    confidence = torch.maximum(probs, 1.0 - probs)
                     pred = pred_t.detach().cpu().tolist()
                     conf = confidence.detach().cpu().tolist()
                     self._last_batch_aux = {

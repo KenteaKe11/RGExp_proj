@@ -289,7 +289,7 @@ classifier:
   feed_logits_to_decoder: false
 
   n_labels: 14                   # CheXbert 14 labels, derived from reports
-  n_classes: 2                   # âm / dương; dương = positive hoặc uncertain
+  n_classes: 1                   # một logit/bệnh lý; sigmoid -> P(pos+uncertain)
   attn_pool_heads: 8
   hidden: 1024
   dropout: 0.1
@@ -300,8 +300,8 @@ classifier:
 
   asl:
     # gamma_neg áp cho ô có NHÃN = 0, gamma_pos cho ô có NHÃN = 1 — theo GIÁ TRỊ
-    # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
-    # dương và 2 ô âm. Mọi trạng thái CheXbert uncertain gộp vào dương; negative,
+    # NHÃN, không theo tên lớp. Với nhãn one-hot [neg,pos], mỗi bệnh lý có đúng
+    # một ô dương. Mọi trạng thái CheXbert uncertain gộp vào dương; negative,
     # blank và không nhắc tới gộp vào âm.
     gamma_neg: 2.0
     gamma_pos: 0.0

@@ -3,7 +3,7 @@ trong sơ đồ tổng, trừ Experts (LoRA) nằm trong decoder (`src/moe.py`).
 
 Sơ đồ tổng:
 
-    Image ─► Vision Encoder ─┬─► Recombinator (256, 1152) ─┬─► Classification Head (14·2) ─► Sup Loss
+    Image ─► Vision Encoder ─┬─► Recombinator (256, 1152) ─┬─► Classification Head (14 logits) ─► sigmoid ─► Sup Loss
                              │                             ├─► Route Head (E) ─► Aux Loss
                              │                             │        └─► Top-k Gate ─► Experts (LoRA)
                              │                             └─► Linear/GELU 256→128 ─► Linear 128→64 ┐ (First)
@@ -28,9 +28,10 @@ Bên trong Recombinator (sơ đồ chi tiết):
           3. FFN: RMSNorm(1152) ─► MLP/GELU 1152→k·1152→1152 ─► ⊕ residual ─► Y (256, 1152)
           4. Decoder fusion: project token + feature ─► concat với adapter và prompt
 
-Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`):
+Classification Head và Route Head cùng attention-pool, nhưng đầu ra khác nhau:
 
-    X (256, 1152) ─► Attention Pool ─► Linear ─► logits (14, 2)
+    X (256, 1152) ─► Attention Pool ─► Linear ─► 14 logits ─► sigmoid probabilities
+    X (256, 1152) ─► Attention Pool ─► Linear ─► E route logits + E noise logits
 
 ── Các quyết định trong file này, và hậu quả nếu làm khác ───────────────────
 
@@ -53,10 +54,9 @@ Classification Head và Route Head có CÙNG hình dạng (chỉ khác `target`)
    256→128→64 và feature 1152→2560, rồi concat với adapter ảnh và prompt.
    Không có residual trong Local Extractor.
 
-5. Main Head KHÔNG áp GELU sau lớp cuối (1024 → target). Đầu ra ấy là LOGIT —
-   của ASL (sigmoid) ở Classification Head và của softmax/top-k ở Route Head.
-   GELU chặn logit dưới ở ≈ −0.17, tức sigmoid ≥ 0.46: head không bao giờ nói
-   được "chắc chắn âm", và ASL không bao giờ hội tụ.
+5. Các lớp đầu ra KHÔNG áp GELU. Classification Head xuất 14 binary logits,
+   sigmoid tạo xác suất bệnh dương; Route Head xuất logits thô cho softmax/top-k.
+   GELU chặn logit dưới ở ≈ −0.17, nên classifier không thể đưa xác suất gần 0.
 
 6. Các Linear TRÊN TRỤC TOKEN (Pooling Stack và `dec_proj`) KHỞI TẠO BẰNG
    TRUNG BÌNH CỤM (`avg_pool_matrix`), không bias. Khởi tạo normal(0, 0.02)
@@ -487,22 +487,27 @@ class AttentionPoolHead(nn.Module):
 
 
 class ClsHead(nn.Module):
-    """(B, 256, d) -> learned-query attention pooling -> logits (B, L, C)."""
+    """(B, N, d) -> learned-query attention pool -> L binary logits."""
 
     def __init__(self, n_tokens: int, d_model: int, n_labels: int,
-                 n_classes: int = 3, hidden: int = 1024, n_stages: int = 4,
+                 n_classes: int = 1, hidden: int = 1024, n_stages: int = 4,
                  dropout: float = 0.0, n_heads: int = 8):
         super().__init__()
         self.n_labels = int(n_labels)
         self.n_classes = int(n_classes)
+        if self.n_classes < 1:
+            raise ValueError("ClsHead n_classes phải >= 1.")
         self.n_tokens = int(n_tokens)
         # `hidden`, `n_stages`, and `dropout` remain accepted so existing config
         # loading stays stable; classification now uses attention pooling only.
-        self.head = AttentionPoolHead(d_model, self.n_labels * self.n_classes,
-                                      n_heads=n_heads)
+        n_out = self.n_labels if self.n_classes == 1 else self.n_labels * self.n_classes
+        self.head = AttentionPoolHead(d_model, n_out, n_heads=n_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x).view(x.shape[0], self.n_labels, self.n_classes)
+        out = self.head(x)
+        if self.n_classes == 1:
+            return out  # raw binary logits (B,L); sigmoid is applied by loss/inference
+        return out.view(x.shape[0], self.n_labels, self.n_classes)
 
 
 class RouteHead(nn.Module):
@@ -559,24 +564,20 @@ class RouteHead(nn.Module):
 
 # ══ Hàm mất mát có giám sát ═════════════════════════════════════════════════
 class AsymmetricLoss(nn.Module):
-    """Asymmetric Loss (Ridnik et al.) trên nhãn one-hot 3 chiều, CÓ MASK.
+    """Asymmetric Loss cho binary sigmoid logits (B,L), CÓ MASK.
 
     Ý nghĩa CHÍNH XÁC của hai tham số — chỗ này hay bị đọc nhầm:
 
         gamma_neg  áp cho những ô có NHÃN = 0  ("âm"),
         gamma_pos  áp cho những ô có NHÃN = 1  ("dương").
 
-    Chúng theo GIÁ TRỊ NHÃN của ô, không theo tên lớp. Với one-hot 3 chiều thì
-    mỗi bệnh lý luôn có đúng 1 ô dương và 2 ô âm; cái lệch mà §2.3 muốn xử là:
-    lớp `neg` bật ở phần lớn bệnh lý, nên hai ô `pos`/`uncertain` gần như luôn
-    mang nhãn 0 và chúng dễ đoán tới mức áp đảo tổng gradient. gamma_neg = 2.0
-    nén phần đóng góp của những ô âm ĐÃ ĐOÁN ĐÚNG (p thấp) xuống theo (p)², để
-    gradient còn lại dồn về những ô model đang sai.
+    `target` có thể là (B,L) nhị phân hoặc nhãn hai chiều [neg,pos] (B,L,2);
+    trong trường hợp sau chỉ kênh pos được dùng. `gamma_neg=2` nén đóng góp
+    của các nhãn âm đã đoán đúng, còn uncertain đã được gộp vào dương.
 
     gamma_pos = 0.0 nghĩa là ô dương KHÔNG bị nén gì cả — đúng ý "chỉ nén phía
     âm". Muốn nén theo TÊN LỚP thay vì theo giá trị nhãn thì truyền gamma_neg
-    dạng danh sách 3 số (theo thứ tự lớp trong config), và ghi rõ điều đó vào
-    báo cáo vì nó là một hàm mất mát khác.
+    dạng danh sách theo nhãn, nếu cần trọng số âm khác nhau giữa bệnh lý.
 
     `clip` (m trong bài gốc) dịch xác suất của ô âm xuống trước khi tính log:
     p_m = max(p − m, 0). Ô âm mà model đã cho p < m thì đóng góp ĐÚNG BẰNG 0 —
@@ -594,7 +595,7 @@ class AsymmetricLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor,
                 mask: torch.Tensor | None = None) -> torch.Tensor:
-        """logits/target: (B, L, C). mask: (B,) hoặc (B,L), 1 = nhãn hợp lệ.
+        """logits: (B,L); target: (B,L) hoặc (B,L,2). mask: (B,) hoặc (B,L).
 
         Mẫu bị mask vẫn đi qua đây (để shape không đổi giữa các batch) nhưng
         đóng góp 0. Vứt chúng khỏi batch sẽ làm batch của candidate B khác
@@ -603,6 +604,15 @@ class AsymmetricLoss(nn.Module):
         """
         logits = logits.float()
         target = target.float()
+        binary = logits.ndim == 2
+        if binary and target.ndim == 3:
+            if target.shape[-1] != 2:
+                raise ValueError(
+                    f"Nhãn nhị phân one-hot cần 2 lớp, nhận {tuple(target.shape)}.")
+            target = target[..., 1]
+        if binary and target.shape != logits.shape:
+            raise ValueError(
+                f"ASL target {tuple(target.shape)} không khớp logits {tuple(logits.shape)}.")
         xs_pos = torch.sigmoid(logits)
         xs_neg = 1.0 - xs_pos
         if self.clip > 0:
@@ -615,7 +625,8 @@ class AsymmetricLoss(nn.Module):
         g_neg = self.gamma_neg
         if isinstance(g_neg, (list, tuple)):
             g_neg = torch.tensor(list(g_neg), dtype=torch.float32,
-                                 device=logits.device).view(1, 1, -1)
+                                 device=logits.device)
+            g_neg = g_neg.view(1, -1) if binary else g_neg.view(1, 1, -1)
         # Trọng số focal tính KHÔNG có gradient: đây là bản gốc của ASL, và
         # đúng ở đây quan trọng — để gradient chảy qua trọng số thì nó tự triệt
         # tiêu phần nén và ASL thoái hoá về BCE mà không có dấu hiệu gì.
@@ -623,7 +634,8 @@ class AsymmetricLoss(nn.Module):
             pt = xs_pos * target + xs_neg * (1.0 - target)
             gamma = self.gamma_pos * target + g_neg * (1.0 - target)
             w = torch.pow(1.0 - pt, gamma)
-        loss_per_label = -(w * (loss_pos + loss_neg)).sum(dim=2)  # (B, L)
+        loss = -(w * (loss_pos + loss_neg))
+        loss_per_label = loss if binary else loss.sum(dim=2)
 
         if mask is None:
             return loss_per_label.sum(dim=1).mean()
@@ -667,8 +679,14 @@ def cls_metrics(logits: torch.Tensor, target: torch.Tensor,
     """
     if logits.numel() == 0:
         return {}
-    pred = logits.argmax(-1)                       # (B, L)
-    gold = target.argmax(-1)                       # (B, L)
+    if logits.ndim == 2:
+        prob = torch.sigmoid(logits.float())
+        pred = prob >= 0.5
+        gold = (target[..., 1] >= 0.5 if target.ndim == 3
+                else target >= 0.5)
+    else:  # compatibility for existing callers with categorical heads
+        pred = logits.argmax(-1)
+        gold = target.argmax(-1)
     if mask is not None:
         keep = mask.float().to(pred.device) > 0.5
         if keep.ndim == 1:
@@ -679,7 +697,8 @@ def cls_metrics(logits: torch.Tensor, target: torch.Tensor,
     n = float(keep.sum().clamp(min=1))
 
     acc = float(((pred == gold) & keep).sum() / n)
-    p_pos, g_pos = (pred == pos_index) & keep, (gold == pos_index) & keep
+    p_pos, g_pos = ((pred == 1) if pred.dtype != torch.bool else pred) & keep, \
+                   ((gold == 1) if gold.dtype != torch.bool else gold) & keep
     tp = float((p_pos & g_pos).sum())
     fp = float((p_pos & ~g_pos).sum())
     fn = float((~p_pos & g_pos).sum())
@@ -821,7 +840,7 @@ class RecombinerBranch(nn.Module):
 
         self.cls_head = ClsHead(
             self.n_tokens, self.d_vis, int(n_labels),
-            n_classes=int(c.get("n_classes", 3)),
+            n_classes=int(c.get("n_classes", 1)),
             hidden=int(c.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(c.get("dropout", 0.0)),
@@ -986,8 +1005,8 @@ class RecombinerBranch(nn.Module):
                 f"= ({n['n_tokens']}, {self.d_vis}) · fusion {merge_desc} "
                 f"({self.d_vis}→{self.d_model}) · {head_desc}: "
                 f"AttnPool(Q=1, H={n['cls_attention_heads']}) -> logits "
-                f"(target {getattr(self.cls_head, 'n_labels', 0)}×"
-                f"{getattr(self.cls_head, 'n_classes', 0)}) · merge={merge_desc}")
+                f"({getattr(self.cls_head, 'n_labels', 0)} logits -> sigmoid) · "
+                f"merge={merge_desc}")
 
 
 def _init(module: nn.Module) -> None:

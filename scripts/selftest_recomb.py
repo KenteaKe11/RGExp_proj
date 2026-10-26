@@ -48,18 +48,20 @@ def main() -> int:
                                                 "pool_factor": 2},
                   "head_dim": 4, "merge_mode": "concat",
                   "n_dec_tokens": 4, "n_dec_hidden": 6},
-            ccfg={"n_classes": 2, "attn_pool_heads": 4,
+            ccfg={"n_classes": 1, "attn_pool_heads": 4,
                   "asl": {"gamma_neg": 2.0, "gamma_pos": 0.0}})
         vis = torch.randn(2, 16, 16)
         tokens, logits, route = branch(vis)
         if tuple(tokens.shape) != (2, 4, 24):
             raise AssertionError(f"unexpected recombiner output: {tuple(tokens.shape)}")
-        if tuple(logits.shape) != (2, 3, 2):
+        if tuple(logits.shape) != (2, 3):
             raise AssertionError(f"unexpected classification logits: {tuple(logits.shape)}")
         if route is not None or branch.route_head is not None:
             raise AssertionError("§2.3 candidate must not contain a Route Head")
-        target = torch.zeros_like(logits)
-        target[..., 1] = 1
+        target = torch.zeros(2, 3, 2)
+        target[..., 0] = 1
+        target[:, 0, :] = torch.tensor([0.0, 1.0])
+        target[:, 1, :] = torch.tensor([1.0, 0.0])
         mask = torch.ones(2, 3)
         mask[0, 1] = 0
         loss = branch.sup_loss(logits, target, mask) + tokens.square().mean()

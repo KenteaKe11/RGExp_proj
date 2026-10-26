@@ -759,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 6
 
     # ── score ───────────────────────────────────────────────────────────────
-    from .metrics import metric_columns, score_model
+    from .metrics import CHEXBERT_GOLD_SOURCE, metric_columns, score_model
 
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
@@ -777,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
                                     ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
                                 and "chexbert_gold_source" in cached.columns
                                 and cached["chexbert_gold_source"].eq(
-                                    "f1chexbert_reference_report_u_zero_blank_negative/4").all())
+                                    CHEXBERT_GOLD_SOURCE).all())
                 cls_counts_ready = (not arm.get("capture_cls_head", False) or all(
                     c in cached.columns for c in
                     ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
@@ -854,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
                              ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
                          and "chexbert_gold_source" in df.columns
                          and df["chexbert_gold_source"].eq(
-                             "f1chexbert_reference_report_u_zero_blank_negative/4").all())
+                             CHEXBERT_GOLD_SOURCE).all())
                     for df in scores.values())):
         raise ValueError(
             "Điểm CheXbert đã lưu theo nguồn gold cũ/schema cũ; cần gán nhãn lại "

@@ -1220,6 +1220,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "dec_proj_final": (branch.dec_stats() if branch is not None else None),
         "n_labels": n_labels if use_branch else 0,
         "cls_label_stats": (cls_pack or {}).get("stats") if use_branch else None,
+        "cls_head_format": ("binary_sigmoid_14_logits_v1" if use_branch else None),
         "train_loss_first": first_loss,
         "train_loss": total_loss, "ce_last": step_ce, "asl_last": step_asl,
         "cls_metrics_last": last_cls,
@@ -1281,6 +1282,8 @@ def already_trained(out_dir: Path, needs_branch: bool,
             label_stats = train_stats.get("cls_label_stats") or {}
             ok = label_stats.get("label_source") == (
                 "f1chexbert_from_reference_report_binary_pos_uncertain/2")
+            ok = ok and train_stats.get("cls_head_format") == (
+                "binary_sigmoid_14_logits_v1")
             vision_adapter = train_stats.get("vision_adapter") or {}
             if ok and vision_adapter:
                 name = str(vision_adapter.get("name", "vision_qdora"))

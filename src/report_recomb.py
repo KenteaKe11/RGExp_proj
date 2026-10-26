@@ -287,8 +287,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       f"{ns} tập bootstrap{seed_text}; mỗi tập lấy {bs} mẫu có hoàn lại từ tập kiểm tra. Cùng ma trận "
       "mẫu được dùng chung cho cả bốn candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
       "qua các tập lấy mẫu có hoàn lại.")
-    A("Metric CheXbert theo U-zero: chỉ positive là dương; uncertain, negative và blank "
-      "đều là âm. F1 là vi-F1 trên đủ 14 nhãn.")
+    A("Metric CheXbert gộp xác suất positive + uncertain: nếu tổng xác suất >= 0.5 thì "
+      "nhãn là dương; nếu thấp hơn 0.5 thì nhãn là âm (negative + blank). F1 là vi-F1 "
+      "trên đủ 14 nhãn.")
     A("")
     A("## Bảng 1 — Chỉ số trên báo cáo được sinh")
     A("")
@@ -315,9 +316,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Bảng 2 — Chỉ số riêng của đầu phân loại")
     A("")
     if chexbert_comparison is not None and not chexbert_comparison.empty:
-        A("Các candidate có đầu phân loại được chấm với nhãn CheXbert từ report gốc theo U-zero: chỉ "
-          "positive = dương; uncertain, negative và blank = âm. Mức nhất trí giữa report "
-          "sinh và đầu phân loại dùng cùng quy ước trên đủ 14 nhãn.")
+        A("Các candidate có đầu phân loại được chấm với nhãn report gốc theo cùng ngưỡng: "
+          "P(positive) + P(uncertain) >= 0.5 là dương; ngược lại là âm. Mức nhất trí giữa "
+          "report sinh và đầu phân loại dùng quy ước này trên đủ 14 nhãn.")
         A("")
         rows = [[str(r["candidate"]), str(r["subset"]), str(r["seed"]),
                  _f(r["report_target_f1"]), _f(r["cls_head_target_f1"]),
@@ -339,8 +340,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                          *[_f(r.get(aid)) for aid in scores_order(summary, names)]])
         headers = ["Tập lấy mẫu", "Seed"] + [names.get(aid, aid)
                                              for aid in scores_order(summary, names)]
-        A("Độ tự tin là trung bình xác suất CheXbert dành cho nhãn nhị phân được dự đoán "
-          "trên report sinh theo U-zero; giá trị cao hơn nghĩa là dự đoán tự tin hơn.")
+        A("Độ tự tin là trung bình max(p, 1-p) trên report sinh, với p = "
+          "P(positive) + P(uncertain); giá trị cao hơn nghĩa là dự đoán tự tin hơn.")
         A("")
         A(_tbl(headers, rows))
     else:

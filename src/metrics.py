@@ -25,7 +25,9 @@ CHEXBERT_LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
                    "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
                    "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
                    "Support Devices", "No Finding"]
-CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report_u_zero_blank_negative/4"
+CHEXBERT_POSITIVE_THRESHOLD = 0.5
+CHEXBERT_GOLD_SOURCE = (
+    "f1chexbert_reference_report_pos_uncertain_p_ge_0.5_else_negative/4")
 _CHEXBERT_LABELER = None
 _RADGRAPH_LABELER = None
 
@@ -161,7 +163,7 @@ def _radgraph_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.nd
 
 def _raw_classes_with_labeler(labeler, reports: list[str],
                               batch_size: int = 32,
-                              return_binary_confidence: bool = False):
+                              return_positive_probability: bool = False):
     import torch
 
     tokenizer = getattr(labeler, "tokenizer", None)
@@ -174,7 +176,7 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
     model.eval()
     dev = getattr(labeler, "device", next(model.parameters()).device)
     chunks: list[np.ndarray] = []
-    confidence_chunks: list[np.ndarray] = []
+    probability_chunks: list[np.ndarray] = []
     size = max(1, int(batch_size))
     for start in range(0, len(reports), size):
         enc = tokenizer(reports[start:start + size], padding=True, truncation=True,
@@ -199,20 +201,17 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
                 raise ValueError(f"CheXbert returned {len(logits)} heads; expected 14.")
             head_logits = list(logits)
             states = torch.stack([head.argmax(dim=-1) for head in head_logits], dim=1)
-            if return_binary_confidence:
-                head_confidence = []
+            if return_positive_probability:
+                head_positive_probability = []
                 for j, head in enumerate(head_logits):
                     head_probs = torch.softmax(head.float(), dim=-1)
-                    if j == 13 or head_probs.shape[-1] < 4:
-                        pos_prob = head_probs[:, 1]
-                        predicted_positive = head.argmax(dim=-1) == 1
+                    if j != 13 and head_probs.shape[-1] >= 4:
+                        pos_prob = head_probs[:, 1] + head_probs[:, 3]
                     else:
                         pos_prob = head_probs[:, 1]
-                        state = head.argmax(dim=-1)
-                        predicted_positive = state == 1
-                    head_confidence.append(torch.where(
-                        predicted_positive, pos_prob, 1.0 - pos_prob))
-                conf = torch.stack(head_confidence, dim=1)
+                    head_positive_probability.append(pos_prob)
+                positive_probability = torch.stack(
+                    head_positive_probability, dim=1)
         else:
             if logits.ndim != 3 or logits.shape[1] != 14:
                 raise ValueError(
@@ -220,31 +219,27 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
                     f"(batch, 14, classes) tensor; got {tuple(logits.shape)}.")
             probs = torch.softmax(logits.float(), dim=-1)
             states = logits.argmax(dim=-1)
-            if return_binary_confidence:
-                # U-zero: chỉ positive là dương; uncertain/negative/blank là âm.
-                pos_prob = probs[..., 1].clone()
+            if return_positive_probability:
+                # Binary positive mass = P(pos) + P(uncertain); blank and
+                # negative share the remaining mass. No Finding is binary.
                 if probs.shape[-1] >= 4:
-                    pos_prob[:, 13] = probs[:, 13, 1]
-                    predicted_positive = states == 1
-                    predicted_positive[:, 13] = states[:, 13] == 1
+                    positive_probability = probs[..., 1] + probs[..., 3]
                 else:
-                    predicted_positive = states == 1
-                conf = torch.where(predicted_positive, pos_prob, 1.0 - pos_prob)
+                    positive_probability = probs[..., 1]
         states = states.cpu().numpy().astype(np.int64, copy=False)
         if states.shape[1] != 14:
             raise ValueError(f"CheXbert returned {states.shape[1]} heads; expected 14.")
         states[:, 13] = np.where(states[:, 13] == 1, 1, 2)
         chunks.append(states)
-        if return_binary_confidence:
-            # Confidence của nhãn nhị phân được dự đoán, không phải độ tự tin
-            # vào một trong bốn lớp trạng thái gốc của CheXbert.
-            confidence_chunks.append(conf.cpu().numpy().astype(np.float32, copy=False))
+        if return_positive_probability:
+            probability_chunks.append(positive_probability.cpu().numpy().astype(
+                np.float32, copy=False))
     states_out = (np.concatenate(chunks, axis=0) if chunks
                   else np.empty((0, 14), dtype=np.int64))
-    if return_binary_confidence:
-        confidence_out = (np.concatenate(confidence_chunks, axis=0) if chunks
-                          else np.empty((0, 14), dtype=np.float32))
-        return states_out, confidence_out
+    if return_positive_probability:
+        probability_out = (np.concatenate(probability_chunks, axis=0) if chunks
+                           else np.empty((0, 14), dtype=np.float32))
+        return states_out, probability_out
     return states_out
 
 
@@ -356,13 +351,13 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
     n = len(refs)
     labeler = _get_chexbert_labeler(cfg)
 
-    raw, binary_confidence = _raw_classes_with_labeler(
+    _, positive_probability = _raw_classes_with_labeler(
         labeler, list(refs) + list(hyps), int(cfg.get("batch_size", 32)),
-        return_binary_confidence=True)
-    # U-zero: chỉ positive là dương; uncertain, negative và blank đều là âm.
-    gold_raw, pred_raw = raw[:n], raw[n:]
-    gold_pos = gold_raw == 1
-    pred_pos = pred_raw == 1
+        return_positive_probability=True)
+    # Threshold the combined positive mass: pos + uncertain form class 1;
+    # blank + negative form class 0.
+    gold_pos = positive_probability[:n] >= CHEXBERT_POSITIVE_THRESHOLD
+    pred_pos = positive_probability[n:] >= CHEXBERT_POSITIVE_THRESHOLD
     tp = np.sum(gold_pos & pred_pos, axis=1).astype(np.float64)
     fp = np.sum(~gold_pos & pred_pos, axis=1).astype(np.float64)
     fn = np.sum(gold_pos & ~pred_pos, axis=1).astype(np.float64)
@@ -371,7 +366,9 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
     out = {"chexbert_f1": per_report, "chexbert_tp": tp,
            "chexbert_fp": fp, "chexbert_fn": fn}
     # Blank cũng được xem là dự đoán âm nên confidence bao gồm đủ 14 nhãn.
-    out["chexbert_confidence"] = binary_confidence[n:].mean(axis=1).astype(float)
+    binary_confidence = np.maximum(positive_probability[n:],
+                                   1.0 - positive_probability[n:])
+    out["chexbert_confidence"] = binary_confidence.mean(axis=1).astype(float)
     if cls_head_predictions is not None:
         head = np.asarray(cls_head_predictions, dtype=np.int64)
         if head.shape != (n, len(CHEXBERT_LABELS)):
@@ -380,14 +377,11 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
                 f"({n}, {len(CHEXBERT_LABELS)}), nhận {head.shape}.")
         if not np.isin(head, (0, 1)).all():
             raise ValueError("cls_head_predictions chỉ được chứa class 0=neg hoặc 1=pos.")
-        ref_raw = raw[:n]
-        gold_pos = ref_raw == 1
         head_pos = head == 1
         out["cls_head_chexbert_tp"] = np.sum(gold_pos & head_pos, axis=1).astype(float)
         out["cls_head_chexbert_fp"] = np.sum(~gold_pos & head_pos, axis=1).astype(float)
         out["cls_head_chexbert_fn"] = np.sum(gold_pos & ~head_pos, axis=1).astype(float)
-        report_raw = raw[n:]
-        report_pos = report_raw == 1
+        report_pos = positive_probability[n:] >= CHEXBERT_POSITIVE_THRESHOLD
         out["cls_head_report_agree"] = np.sum(head == report_pos, axis=1).astype(float)
         out["cls_head_report_n_labels"] = np.full(n, head.shape[1], dtype=float)
         if cls_head_confidence is not None:
