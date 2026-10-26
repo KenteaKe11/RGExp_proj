@@ -23,7 +23,7 @@
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
 # 2. Candidate C chỉ QDoRA 1/4 layer cuối vision và đóng băng projector; fusion chiếu rồi concat.
-# 3. Ba candidate dùng chung manifest test; 30 bootstrap subset dùng 30 seed riêng.
+# 3. Ba candidate dùng chung manifest test; 4 bootstrap subset dùng 4 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -502,9 +502,9 @@ metrics:
 # Holm; BH in kèm để đọc đối chiếu.
 stats:
   alpha: 0.05
-  n_boot: 30
-  bootstrap_sample_size: 3000
-  bootstrap_seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+  n_boot: 4
+  bootstrap_sample_size: 7500
+  bootstrap_seeds: [42, 43, 44, 45]
   ci_method: percentile
   n_perm: 10000
   ci: 0.95

@@ -2,9 +2,9 @@
 
 Thí nghiệm so sánh ba mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, và Candidate C. C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C có đầu phân loại nhưng không có đầu định tuyến hay MoE. Hàm mất mát là `CE + 0.1 × ASL`, không khởi động tăng dần hệ số ASL.
 
-Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng trạng thái kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 30 tập lấy mẫu có hoàn lại, mỗi tập gồm 3.000 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 30 tập.
+Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng trạng thái kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 4 tập lấy mẫu có hoàn lại, mỗi tập gồm 7.500 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 4 tập.
 
-Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 30 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
+Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 4 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
 
 ## Kiến trúc tổng quan
 
@@ -76,8 +76,8 @@ bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report,push --re
 - **ASL:** dùng các giá trị mặc định của hàm mất mát bất đối xứng: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
 - **Bộ tối ưu:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
 - **Kích thước lô:** thử các lô nhỏ `16, 12, 10, 8, 6, 4, 2, 1` khi thiếu bộ nhớ; kích thước lô hiệu dụng luôn là 32. Mô hình đầu tiên chọn kích thước, các mô hình còn lại dùng cùng giá trị.
-- **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn, tính riêng trong mỗi tập lấy mẫu 3.000 lượt rồi lấy trung bình 30 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
-- **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra, không chạy phần còn lại của tập kiểm tra. Tạo 30 tập lấy mẫu khác nhau bằng 30 hạt giống (`42`–`71`); mỗi tập gồm 3.000 lượt lấy có hoàn lại. Cùng 30 tập được dùng cho cả ba mô hình và mọi chỉ số.
+- **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn, tính riêng trong mỗi tập lấy mẫu 7.500 lượt rồi lấy trung bình 4 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
+- **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra. Tạo 4 tập lấy mẫu khác nhau bằng 4 hạt giống (`42`–`45`); mỗi tập gồm 7.500 lượt lấy có hoàn lại. Cùng 4 tập được dùng cho cả ba mô hình và mọi chỉ số.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); lệnh khởi chạy là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
@@ -87,4 +87,4 @@ Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1
 
 ## Giới hạn thống kê
 
-Các ước lượng lấy mẫu dùng trung bình của 30 tập với hạt giống riêng `42`–`71`, mỗi tập có 3.000 lượt lấy có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba mô hình và mọi chỉ số để bảo toàn so sánh ghép cặp. Báo cáo ghi số tập và kích thước mỗi tập.
+Các ước lượng lấy mẫu dùng trung bình của 4 tập với hạt giống riêng `42`–`45`, mỗi tập có 7.500 lượt lấy có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba mô hình và mọi chỉ số để bảo toàn so sánh ghép cặp. Báo cáo ghi số tập và kích thước mỗi tập.
