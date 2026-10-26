@@ -2,7 +2,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # run_recomb.sh — MỘT LỆNH, CHỌN MỘT TRONG HAI THÍ NGHIỆM.
 #
-#     bash scripts/run_recomb.sh --exp 2.3        # A (LoRA) vs B (LoRA + nhánh)
+#     bash scripts/run_recomb.sh --exp 2.3        # 4 candidate, bootstrap + permutation
 #     bash scripts/run_recomb.sh --exp 2.4        # 5 cấu hình MoE (top-k, expert)
 #
 #     bash scripts/run_recomb.sh --exp 2.4 --detach      # chạy NỀN, trả lại shell
@@ -28,19 +28,17 @@
 # kia và chạy lại cái nào cũng resume được riêng.
 #
 # ── Thứ tự chạy: candidate dễ hỏng nhất TRƯỚC ───────────────────────────────
-# §2.3: candidate B (có nhánh) trước — nó là candidate duy nhất có thể hỏng vì
+# §2.3: MoE-LoRA chạy trước, rồi candidate có nhánh — đây là các candidate có thể hỏng vì
 # lý do kiến trúc (thiếu nhãn, pan&scan lén bật, nhánh không vừa VRAM).
 # §2.4: candidate NẶNG nhất (E lớn nhất) trước — cùng lý lẽ, và một bảng
 # Friedman thiếu một cột thì không dùng được.
 #
-# ── KHÔNG CÒN DÒ BATCH ──────────────────────────────────────────────────────
-# `train.per_device_batch_size` × `train.grad_accum` trong configs/recombiner.yaml
-# là hằng số, dùng chung cho cả hai candidate. Hết VRAM là DỪNG, kèm thông báo
-# nêu đúng khoá phải giảm. `--dry-run` là phép thử ĐƯỜNG ỐNG (16 mẫu, 4 bước),
-# KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config.
+# ── DÒ BATCH ───────────────────────────────────────────────────────────────
+# Candidate đầu dò theo batch ladder nếu OOM; batch hiệu dụng được giữ ở 32.
+# `--dry-run` là phép thử đường ống (16 mẫu, 4 bước), không thay thế lượt train.
 #
 # Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP:
-#   * candidate đã có adapter (+ recombiner_branch.safetensors) -> bỏ qua train
+#   * candidate đã có adapter/experts, nhánh và train_stats.json -> bỏ qua train
 #   * ảnh đã sinh trong predictions/*.jsonl                     -> chỉ sinh phần thiếu
 #   * điểm đã chấm trong metrics/*.csv                          -> dùng lại
 #
@@ -88,7 +86,7 @@ done
 # và rất dễ bị đọc thành "đang chạy".
 if [ -n "$EXP" ] && [ "$EXP" != "2.3" ] && [ "$EXP" != "2.4" ]; then
     echo "✗ --exp phải là 2.3 hoặc 2.4 (nhận: '$EXP')."
-    echo "    2.3  nhánh Recombinator: A/B, bootstrap ghép cặp + permutation"
+    echo "    2.3  bốn candidate: baseline, QLoRA, Recombinator, MoE-LoRA; bootstrap + permutation"
     echo "    2.4  MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
     exit 2
 fi

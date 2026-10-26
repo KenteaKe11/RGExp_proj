@@ -149,59 +149,59 @@ def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
 
 def chexbert_head_report_bootstrap(scores: dict[str, pd.DataFrame], cfg) -> pd.DataFrame:
     """Đối chiếu F1 report/head và confidence trên cùng bootstrap subset."""
-    columns = ["subset", "seed", "report_target_f1", "cls_head_target_f1",
+    columns = ["candidate", "subset", "seed", "report_target_f1", "cls_head_target_f1",
                "head_report_agreement_pct", "report_confidence", "cls_head_confidence"]
-    arm = next((a for a in cfg.get("arms", [])
-                if a.get("enabled", True) and a.get("capture_cls_head", False)), None)
-    if arm is None or arm.get("id") not in scores:
+    arms = [a for a in cfg.get("arms", [])
+            if a.get("enabled", True) and a.get("capture_cls_head", False)
+            and a.get("id") in scores]
+    if not arms:
         return pd.DataFrame(columns=columns)
-    df = scores[arm["id"]]
     report_cols = ("chexbert_tp", "chexbert_fp", "chexbert_fn")
     head_cols = ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
                  "cls_head_chexbert_fn")
-    if not all(c in df.columns for c in (*report_cols, *head_cols)):
-        return pd.DataFrame(columns=columns)
     agreement_cols = ("cls_head_report_agree", "cls_head_report_n_labels")
-    if not all(c in df.columns for c in agreement_cols):
-        return pd.DataFrame(columns=columns)
 
     scfg = cfg.get("stats") or {}
-    boot_idx = _shared_bootstrap_indices(cfg, len(df))
-    if len(df) == 0 or boot_idx is None:
-        raise ValueError("CheXbert comparison needs non-empty scores and bootstrap samples")
-
-    from .metrics import chexbert_micro_f1
-
     rows = []
     seeds = scfg.get("bootstrap_seeds")
-    if seeds is None:
-        seeds = [int(cfg.get("seed", 42)) + i for i in range(len(boot_idx))]
-    for i, (seed, idx) in enumerate(zip(seeds, boot_idx), start=1):
-        report_f1 = float(chexbert_micro_f1(
-            *(df[c].to_numpy(dtype=float)[idx] for c in report_cols), axis=0))
-        head_f1 = float(chexbert_micro_f1(
-            *(df[c].to_numpy(dtype=float)[idx] for c in head_cols), axis=0))
-        agreement = (df[agreement_cols[0]].to_numpy(dtype=float)[idx].sum()
-                     / max(1.0, df[agreement_cols[1]].to_numpy(dtype=float)[idx].sum()))
-        report_conf = (float(df["chexbert_confidence"].to_numpy(dtype=float)[idx].mean())
-                       if "chexbert_confidence" in df else float("nan"))
-        head_conf = (float(df["cls_head_confidence"].to_numpy(dtype=float)[idx].mean())
-                     if "cls_head_confidence" in df else float("nan"))
-        rows.append({"subset": f"Tập {i}", "seed": seed,
-                     "report_target_f1": report_f1,
-                     "cls_head_target_f1": head_f1,
-                     "head_report_agreement_pct": 100.0 * agreement,
-                     "report_confidence": report_conf,
-                     "cls_head_confidence": head_conf})
-    rows.append({"subset": "Trung bình", "seed": "—",
-                 "report_target_f1": float(np.mean([r["report_target_f1"] for r in rows])),
-                 "cls_head_target_f1": float(np.mean([r["cls_head_target_f1"] for r in rows])),
-                 "head_report_agreement_pct": float(np.mean(
-                     [r["head_report_agreement_pct"] for r in rows])),
-                 "report_confidence": float(np.mean(
-                     [r["report_confidence"] for r in rows])),
-                 "cls_head_confidence": float(np.mean(
-                     [r["cls_head_confidence"] for r in rows]))})
+    from .metrics import chexbert_micro_f1
+
+    for arm in arms:
+        df = scores[arm["id"]]
+        if not all(c in df.columns for c in (*report_cols, *head_cols,
+                                              *agreement_cols)):
+            continue
+        boot_idx = _shared_bootstrap_indices(cfg, len(df))
+        if len(df) == 0 or boot_idx is None:
+            raise ValueError("CheXbert comparison needs non-empty scores and bootstrap samples")
+        arm_rows = []
+        arm_seeds = (seeds if seeds is not None else
+                     [int(cfg.get("seed", 42)) + i for i in range(len(boot_idx))])
+        for i, (seed, idx) in enumerate(zip(arm_seeds, boot_idx), start=1):
+            report_f1 = float(chexbert_micro_f1(
+                *(df[c].to_numpy(dtype=float)[idx] for c in report_cols), axis=0))
+            head_f1 = float(chexbert_micro_f1(
+                *(df[c].to_numpy(dtype=float)[idx] for c in head_cols), axis=0))
+            agreement = (df[agreement_cols[0]].to_numpy(dtype=float)[idx].sum()
+                         / max(1.0, df[agreement_cols[1]].to_numpy(dtype=float)[idx].sum()))
+            report_conf = (float(df["chexbert_confidence"].to_numpy(dtype=float)[idx].mean())
+                           if "chexbert_confidence" in df else float("nan"))
+            head_conf = (float(df["cls_head_confidence"].to_numpy(dtype=float)[idx].mean())
+                         if "cls_head_confidence" in df else float("nan"))
+            arm_rows.append({"candidate": arm.get("name", arm["id"]),
+                             "subset": f"Tập {i}", "seed": seed,
+                             "report_target_f1": report_f1,
+                             "cls_head_target_f1": head_f1,
+                             "head_report_agreement_pct": 100.0 * agreement,
+                             "report_confidence": report_conf,
+                             "cls_head_confidence": head_conf})
+        arm_rows.append({"candidate": arm.get("name", arm["id"]),
+                         "subset": "Trung bình", "seed": "—",
+                         **{col: float(np.mean([r[col] for r in arm_rows]))
+                            for col in ("report_target_f1", "cls_head_target_f1",
+                                        "head_report_agreement_pct", "report_confidence",
+                                        "cls_head_confidence")}})
+        rows.extend(arm_rows)
     return pd.DataFrame(rows)
 
 
@@ -265,13 +265,17 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                        for a in cfg.get("arms", []))
     projector_phrase = ("mở projector Gemma 3 để huấn luyện" if projector_ft
                         else "đóng băng projector Gemma 3")
-    A("So sánh ba candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
+    A("So sánh bốn candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
       f"và Candidate C: QLoRA trên bộ giải mã + QDoRA hạng 4 trên {vision_scope} bộ mã hóa ảnh, "
       f"{projector_phrase}, cùng Recombinator và classification head. "
       "Candidate C chiếu token/đặc trưng Recombinator rồi nối với token ảnh đã qua bộ điều hợp "
       "và vector nhúng lời nhắc. Đầu phân loại dùng một truy vấn học được để gộp bằng chú ý "
       "đa đầu 8 đầu, sau đó chiếu tuyến tính trực tiếp thành logits. Candidate C không có "
-      "đầu định tuyến hay MoE.")
+      "đầu định tuyến hay MoE. Candidate MoE-LoRA giữ nhánh và QDoRA vision của C, thay "
+      "QLoRA decoder bằng Experts LoRA có Route Head. Route Head dùng attention pooling "
+      "ra vector vision 1.152 chiều rồi chiếu thành 10 route logits; top-6 được chọn. "
+      "Experts LoRA (r=4, alpha=8) gắn vào mọi Linear của decoder; vision tower và "
+      "projector không nằm trong nhóm target.")
     A("")
     cfg_stats = cfg.get("stats") or {}
     ns = int(cfg_stats.get("n_boot", 10))
@@ -281,7 +285,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                  if bootstrap_seeds else "")
     A(f"Tập kiểm tra gồm {manifest.get('n_eval', '?')} mẫu. Mỗi chỉ số và candidate dùng cùng "
       f"{ns} tập bootstrap{seed_text}; mỗi tập lấy {bs} mẫu có hoàn lại từ tập kiểm tra. Cùng ma trận "
-      "mẫu được dùng chung cho ba candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
+      "mẫu được dùng chung cho cả bốn candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
       "qua các tập lấy mẫu có hoàn lại.")
     A("Metric CheXbert theo U-zero: chỉ positive là dương; uncertain, negative và blank "
       "đều là âm. F1 là vi-F1 trên đủ 14 nhãn.")
@@ -311,15 +315,15 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Bảng 2 — Chỉ số riêng của đầu phân loại")
     A("")
     if chexbert_comparison is not None and not chexbert_comparison.empty:
-        A("Đầu phân loại được chấm với nhãn CheXbert từ report gốc theo U-zero: chỉ "
+        A("Các candidate có đầu phân loại được chấm với nhãn CheXbert từ report gốc theo U-zero: chỉ "
           "positive = dương; uncertain, negative và blank = âm. Mức nhất trí giữa report "
           "sinh và đầu phân loại dùng cùng quy ước trên đủ 14 nhãn.")
         A("")
-        rows = [[str(r["subset"]), str(r["seed"]),
+        rows = [[str(r["candidate"]), str(r["subset"]), str(r["seed"]),
                  _f(r["report_target_f1"]), _f(r["cls_head_target_f1"]),
                  _f(r["head_report_agreement_pct"])]
                 for r in chexbert_comparison.to_dict("records")]
-        A(_tbl(["Tập lấy mẫu", "Seed", "F1 CheXbert của báo cáo",
+        A(_tbl(["Candidate", "Tập lấy mẫu", "Seed", "F1 CheXbert của báo cáo",
                 "F1 CheXbert của đầu phân loại",
                 "Đầu phân loại nhất trí với báo cáo (%)"], rows))
     else:
@@ -345,11 +349,12 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Bảng 4 — Độ tự tin của đầu phân loại")
     A("")
     if chexbert_comparison is not None and not chexbert_comparison.empty:
-        rows = [[str(r["subset"]), str(r["seed"]), _f(r["cls_head_confidence"])]
+        rows = [[str(r["candidate"]), str(r["subset"]), str(r["seed"]),
+                 _f(r["cls_head_confidence"])]
                 for r in chexbert_comparison.to_dict("records")]
         A("Độ tự tin là trung bình xác suất lớp được dự đoán trên đủ 14 nhãn.")
         A("")
-        A(_tbl(["Tập lấy mẫu", "Seed", "Độ tự tin trung bình"], rows))
+        A(_tbl(["Candidate", "Tập lấy mẫu", "Seed", "Độ tự tin trung bình"], rows))
     else:
         A("Chưa có dữ liệu độ tự tin của đầu phân loại.")
     A("")

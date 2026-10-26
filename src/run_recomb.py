@@ -1,6 +1,6 @@
 """§2.3 và §2.4 — trọn một thí nghiệm trong MỘT lệnh. Chọn bằng `--exp`.
 
-    python -m src.run_recomb --exp 2.3        # A (LoRA) vs B (LoRA + nhánh)
+    python -m src.run_recomb --exp 2.3        # 4 candidate: baseline, QLoRA, Recombinator, MoE-LoRA
     python -m src.run_recomb --exp 2.4        # 5 cấu hình (top-k, n_experts)
     python -m src.run_recomb --exp 2.4 --dry-run
     python -m src.run_recomb --exp 2.4 --stages stats,report
@@ -22,11 +22,11 @@ Hai mã thoát nghĩa là "kết quả còn nguyên, chỉ bước cuối hỏng
 ── HAI THÍ NGHIỆM, MỘT ĐƯỜNG CODE ──────────────────────────────────────────
 Khác nhau đúng ba chỗ, và cả ba đều hiện ra trong file này:
 
-  1. DANH SÁCH CANDIDATE. §2.3 đọc `arms` (2 candidate, cờ `recomb` phân biệt);
+  1. DANH SÁCH CANDIDATE. §2.3 đọc `arms` (4 candidate; `recomb` và `moe` chọn nhánh);
      §2.4 đọc `arms_moe` (5 candidate, (top_k, n_experts) phân biệt) và MỌI
      candidate đều có `recomb = True` — §2.4 luôn dùng concat.
-  2. THỨ TỰ CHẠY. §2.3: B trước A. §2.4: candidate NẶNG nhất trước.
-  3. KIỂM ĐỊNH. k = 2 -> bootstrap ghép cặp (BCa) + permutation. k = 5 ->
+  2. THỨ TỰ CHẠY. §2.3: MoE-LoRA trước, rồi các candidate có nhánh. §2.4: candidate NẶNG nhất trước.
+  3. KIỂM ĐỊNH. §2.3: bootstrap ghép cặp + permutation trên mọi cặp. §2.4 ->
      Friedman tổng thể, rồi hậu kiểm Wilcoxon + Holm trên những metric đã qua
      cổng.
 
@@ -40,8 +40,8 @@ Hai thư mục kết quả tách rời (`output.subdir` vs `output.subdir_moe`,
 mục kia lấy làm mốc nền, và trộn adapter hai mục trong một thư mục là mở đường
 cho `already_trained()` nhận nhầm candidate rồi bỏ qua stage train.
 
-── Vì sao candidate B chạy TRƯỚC candidate A (§2.3) ─────────────────────────
-B là candidate nặng hơn ở cả train lẫn sinh, và nó là candidate DUY NHẤT có thể
+── Vì sao MoE-LoRA chạy TRƯỚC (§2.3) ───────────────────────────────────────
+MoE-LoRA là candidate nặng hơn ở cả train lẫn sinh, và nó là candidate DUY NHẤT có thể
 hỏng vì lý do kiến trúc: thiếu nhãn, pan&scan lén bật, nhánh không vừa VRAM.
 A thì gần như chắc chắn chạy — nó là một arm LoRA bình thường.
 
@@ -138,8 +138,7 @@ def _count_preds(path: Path) -> int:
     return n
 
 
-def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path,
-                is_moe: bool) -> dict:
+def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path) -> dict:
     """Cái gì đã nằm sẵn trên đĩa — đọc TRƯỚC khi tiêu một giây GPU nào.
 
     Mọi stage ở đây vốn đã resume được, nhưng chúng resume LẶNG LẼ và mỗi stage
@@ -157,7 +156,8 @@ def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path,
 
         _trained = tr_mod.already_trained
     except Exception:
-        def _trained(d, needs_branch=False, needs_experts=False) -> bool:
+        def _trained(d, needs_branch=False, needs_experts=False,
+                     expected_moe=None) -> bool:
             return (Path(d) / "train_stats.json").exists()
 
     mdir = run_dir / "metrics"
@@ -169,7 +169,11 @@ def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path,
         aid = arm["id"]
         st["arms"][aid] = {
             "trained": bool(_trained(adapter_root / aid,
-                                     bool(arm.get("recomb")), is_moe)),
+                                     bool(arm.get("recomb")),
+                                     bool(arm.get("moe")),
+                                     {k: arm[k] for k in
+                                      ("route_pooling", "all_linear_targets")
+                                      if k in arm} or None)),
             "n_preds": _count_preds(run_dir / "predictions" / f"{aid}.jsonl"),
             "scored": (mdir / f"per_sample_{aid}.csv").exists(),
         }
@@ -264,6 +268,7 @@ def moe_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
                     f"candidate — mặc định ngầm ở đây là một hàng mang nhãn sai "
                     f"trong bảng Friedman.")
         a["recomb"] = True
+        a["moe"] = True
         arms.append(a)
     if not arms:
         raise ValueError("config không có `arms_moe` nào được bật.")
@@ -279,7 +284,7 @@ def select_arms(cfg: Cfg, exp: str, only: set[str] | None = None) -> list[dict]:
 def train_order(arms: list[dict], exp: str = "2.3") -> list[dict]:
     """Thứ tự CHẠY — không phải thứ tự trình bày.
 
-    §2.3: candidate B trước, A sau (xem docstring module).
+    §2.3: MoE-LoRA trước, rồi các candidate có nhánh, cuối cùng baseline.
 
     §2.4: candidate NẶNG nhất trước — E lớn nhất, rồi K lớn nhất. Cùng lý lẽ,
     một bậc rõ hơn: `n_experts` nhân thẳng vào activation LoRA (B×T×E×r) và vào
@@ -297,7 +302,9 @@ def train_order(arms: list[dict], exp: str = "2.3") -> list[dict]:
         return sorted(arms, key=lambda a: (-int(a.get("n_experts", 0)),
                                            -int(a.get("top_k", 0)),
                                            str(a.get("id"))))
-    return sorted(arms, key=lambda a: 0 if a.get("recomb") else 1)
+    return sorted(arms, key=lambda a: (
+        0 if a.get("moe") else 1,
+        0 if a.get("recomb") else 1))
 
 
 def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
@@ -327,12 +334,12 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="§2.3 (Recombinator A/B) hoặc §2.4 (MoE, 5 cấu hình) — "
+        description="§2.3 (bốn candidate, có MoE-LoRA) hoặc §2.4 (MoE, 5 cấu hình) — "
                     "trọn gói, chọn bằng --exp.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
     ap.add_argument("--exp", default=None, choices=list(EXPERIMENTS),
-                    help="2.3 = nhánh Recombinator (A/B, bootstrap+permutation); "
+                    help="2.3 = bốn candidate (bootstrap+permutation); "
                          "2.4 = MoE (5 cấu hình top-k/expert, Friedman). Mặc "
                          "định lấy từ khoá `experiment` trong config.")
     ap.add_argument("--stages", default=",".join(STAGES))
@@ -342,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy Hub.")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại dù đã có")
+    ap.add_argument("--force", action="store_true",
+                    help="chỉ Candidate D (moe_lora): ghi đè checkpoint và suy luận lại")
     ap.add_argument("--pull", action="store_true",
                     help="chỉ kéo adapter đã huấn luyện và predictions từ Hub về local rồi thoát")
     ap.add_argument("--no-push", action="store_true")
@@ -361,7 +370,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ --exp phải là một trong {EXPERIMENTS}, nhận {exp!r}")
         return 2
     cfg["experiment"] = exp
-    cfg.setdefault("moe", {})["enabled"] = (exp == "2.4")
     is_moe = exp == "2.4"
     if is_moe:
         cfg["output"]["subdir"] = str(cfg["output"].get("subdir_moe", "2.4_moe"))
@@ -395,6 +403,9 @@ def main(argv: list[str] | None = None) -> int:
 
     seed_everything(int(cfg.get("seed", 42)))
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+    if a.force and "train" not in stages:
+        print("✗ --force chỉ có tác dụng cùng stage train; hãy thêm `train` vào --stages")
+        return 2
     for s in stages:
         if s not in STAGES:
             print(f"✗ stage không biết: {s!r} (hợp lệ: {', '.join(STAGES)})")
@@ -408,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
     if not arms:
         print("✗ không arm nào được bật")
         return 2
+    if a.force and not any(x["id"] == "moe_lora" for x in arms):
+        print("✗ --force chỉ áp dụng cho Candidate D `moe_lora`; hãy thêm nó vào --arms")
+        return 2
+    has_moe = is_moe or any(bool(arm.get("moe", False)) for arm in arms)
+    cfg.setdefault("moe", {})["enabled"] = has_moe
     arm_a = None if is_moe else next(
         (x["id"] for x in arms if not x.get("recomb")
          and not x.get("infer_only")), None)
@@ -428,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         "stages_run": stages, "arms_declared": [x["id"] for x in arms],
         "arm_a": arm_a, "arm_b": arm_b, "arm_status": {},
         "moe": ({x["id"]: {"top_k": x["top_k"], "n_experts": x["n_experts"]}
-                 for x in arms} if is_moe else None),
+                 for x in arms if x.get("moe")} if has_moe else None),
     }
     if a.pull:
         from . import resume as resume_mod
@@ -458,7 +474,8 @@ def main(argv: list[str] | None = None) -> int:
     t_start = time.time()
     hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
            if is_moe else
-           "§2.3 — nhánh Recombinator: A/B, bootstrap ghép cặp + permutation")
+           "§2.3 — bốn candidate: baseline, QLoRA, Recombinator và MoE-LoRA; "
+           "bootstrap ghép cặp + permutation")
     print(f"\n═══ {hdr} ═══", flush=True)
     if is_moe:
         print("  candidate: " + " · ".join(
@@ -477,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     arms_to_train: list[dict] = []
     cache: dict = {}
     try:
-        cache = cache_state(arms, adapter_root, run_dir, is_moe)
+        cache = cache_state(arms, adapter_root, run_dir)
         print_cache_state(cache, names, int(cfg["data"].get("n_test") or 0) or None)
         manifest["cache_at_start"] = cache
     except Exception as e:  # đọc cache KHÔNG được phép làm hỏng lần chạy
@@ -485,14 +502,39 @@ def main(argv: list[str] | None = None) -> int:
               flush=True)
     if "train" in stages:
         trainable_arms = [x for x in arms if not x.get("infer_only")]
-        if a.retrain or not cache:
-            arms_to_train = list(trainable_arms)
-        else:
-            arms_to_train = [x for x in trainable_arms
-                             if not cache["arms"].get(x["id"], {}).get("trained")]
+        for arm in trainable_arms:
+            aid = arm["id"]
+            trained = bool(cache.get("arms", {}).get(aid, {}).get("trained"))
+            is_candidate_d = aid == "moe_lora"
+            if is_candidate_d and not trained and not a.force:
+                odir = adapter_root / aid
+                stats_path = odir / "train_stats.json"
+                if stats_path.exists():
+                    from . import moe as moe_mod
+
+                    if moe_mod.experts_exist(odir):
+                        print("✗ Checkpoint Candidate D đã có nhưng không khớp "
+                              "cấu hình Route attention pooling + all-linear mới. "
+                              "Để tránh ghi đè, hãy chủ động xác nhận bằng `--force`.",
+                              flush=True)
+                        return 2
+            # Candidate D is immutable/resumable by default. `--retrain` remains
+            # applicable to A/B/C; only `--force` may replace a valid D checkpoint.
+            if not trained or (a.retrain and not is_candidate_d) or (
+                    is_candidate_d and a.force):
+                arms_to_train.append(arm)
+        if a.retrain and "moe_lora" in [x["id"] for x in trainable_arms] and not a.force:
+            print("⚙ giữ nguyên checkpoint Candidate D: --retrain không ghi đè D; "
+                  "dùng --force nếu muốn huấn luyện lại D.", flush=True)
+        if any(x["id"] == "moe_lora" for x in arms_to_train) and not a.dry_run:
+            if "infer" not in stages:
+                stages.append("infer")
+                manifest["stages_run"] = stages
+            print("⚙ Candidate D sẽ được lưu rồi suy luận lại; prediction cũ của D "
+                  "sẽ được thay bằng kết quả mới.", flush=True)
         if not arms_to_train:
             print("⚙ mọi candidate đã có adapter + train_stats.json — BỎ QUA "
-                  "stage train và cả việc chuẩn bị tập train (--retrain để làm lại)",
+                  "stage train và cả việc chuẩn bị tập train",
                   flush=True)
     need_train_run = bool(arms_to_train)
 
@@ -541,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     if need_train_run:
         _hr(f"Huấn luyện {len(arms_to_train)}/{len(arms)} candidate — "
             + ("candidate NẶNG nhất (E lớn nhất) TRƯỚC" if is_moe
-               else "candidate B TRƯỚC"))
+               else "MoE-LoRA trước, rồi các candidate còn lại"))
         from . import train_recomb as tr_mod
         from .backbone import TrainUnusable, preflight_adapters
 
@@ -609,10 +651,16 @@ def main(argv: list[str] | None = None) -> int:
             aid = arm["id"]
             odir = adapter_root / aid
             is_b = bool(arm.get("recomb"))
-            is_cached_train = tr_mod.already_trained(odir, is_b, is_moe)
-            if is_cached_train and not a.retrain:
+            is_cached_train = tr_mod.already_trained(
+                odir, is_b, bool(arm.get("moe", False)),
+                {k: arm[k] for k in ("route_pooling", "all_linear_targets")
+                 if k in arm} or None)
+            retrain_this = (a.retrain and aid != "moe_lora") or (
+                aid == "moe_lora" and a.force)
+            if is_cached_train and not retrain_this:
                 print(f"  ✓ {aid}: đã huấn luyện ở {odir} — bỏ qua "
-                      f"(--retrain để làm lại)", flush=True)
+                      f"({'--force để làm lại D' if aid == 'moe_lora' else '--retrain để làm lại'})",
+                      flush=True)
                 cached = json.loads((odir / "train_stats.json").read_text(encoding="utf-8"))
                 train_stats.append(cached)
                 manifest["arm_status"][aid] = {"trained": "cached"}
@@ -630,8 +678,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             _archive_stale(run_dir / "predictions" / f"{aid}.jsonl")
             _archive_stale(run_dir / "metrics" / f"per_sample_{aid}.csv")
-            tag = (f"top-k = {arm['top_k']} · {arm['n_experts']} expert · CÓ nhánh"
-                   if is_moe else
+            tag = (f"MoE top-k = {arm['top_k']} · {arm['n_experts']} expert · CÓ nhánh"
+                   if arm.get("moe") else
                    ("candidate B · CÓ nhánh" if is_b else "candidate A · không nhánh"))
             print(f"\n── {arm.get('name', aid)} ({tag}) ──", flush=True)
             try:

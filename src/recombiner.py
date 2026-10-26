@@ -506,11 +506,11 @@ class ClsHead(nn.Module):
 
 
 class RouteHead(nn.Module):
-    """(B, 256, d) -> (logit định tuyến (B, E), log_sigma của nhiễu (B, E)).
+    """Route tokens to experts with attention pooling or the legacy pooling stack.
 
-    `noise_proj` đọc cùng đặc trưng ẩn (1024) với lớp logit. Chính sách áp lên
-    hai tensor này (nhiễu -> soft clip C=1.2 -> softmax -> top-k) là Top-k Gate,
-    nằm ở `src/moe.Router`, vì nó KHÔNG có tham số.
+    Candidate D uses learned-query attention to pool (B, N, D) to (B, D), then
+    directly projects that vector to expert logits and noise parameters. The
+    stack option preserves older §2.4 checkpoints/configurations.
 
     Bias của `noise_proj` khởi tạo `noise_init` (−3.0): σ = softplus(−3) ≈ 0.049
     ở bước 0. Để bias = 0 thì σ ≈ 0.69 — lớn hơn cả trần clip, và top-k những
@@ -519,13 +519,24 @@ class RouteHead(nn.Module):
 
     def __init__(self, n_tokens: int, d_model: int, n_experts: int = 4,
                  hidden: int = 1024, n_stages: int = 4, dropout: float = 0.0,
-                 noise_init: float = -3.0):
+                 noise_init: float = -3.0, pooling: str = "stack",
+                 n_heads: int = 8):
         super().__init__()
         self.n_experts = int(n_experts)
         self.noise_init = float(noise_init)
-        self.head = TaskHead(n_tokens, d_model, self.n_experts, hidden,
-                             n_stages, dropout)
-        self.noise_proj = nn.Linear(int(hidden), self.n_experts, bias=True)
+        self.pooling = str(pooling).lower()
+        if self.pooling == "attention":
+            self.pool = AttentionPool(d_model, n_heads=n_heads)
+            self.output_norm = RMSNorm(int(d_model))
+            self.route_proj = nn.Linear(int(d_model), self.n_experts)
+            self.noise_proj = nn.Linear(int(d_model), self.n_experts, bias=True)
+        elif self.pooling == "stack":
+            self.head = TaskHead(n_tokens, d_model, self.n_experts, hidden,
+                                 n_stages, dropout)
+            self.noise_proj = nn.Linear(int(hidden), self.n_experts, bias=True)
+        else:
+            raise ValueError(
+                f"route_head.pooling phải là attention|stack, nhận {pooling!r}")
 
     def init_noise(self) -> None:
         """Đặt lại bias của `noise_proj`. Gọi SAU `_init`, vì `_init` zero hoá bias."""
@@ -533,6 +544,9 @@ class RouteHead(nn.Module):
             self.noise_proj.bias.fill_(self.noise_init)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.pooling == "attention":
+            h = self.output_norm(self.pool(x))
+            return self.route_proj(h), self.noise_proj(h)
         h = self.head.features(x)
         return self.head.fc2(h), self.noise_proj(h)
 
@@ -815,7 +829,9 @@ class RecombinerBranch(nn.Module):
             hidden=int(rh.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(rh.get("dropout", 0.0)),
-            noise_init=float(r.get("route_noise_init", -3.0))) if self.route_enabled else None
+            noise_init=float(r.get("route_noise_init", -3.0)),
+            pooling=str(rh.get("pooling", "stack")),
+            n_heads=int(rh.get("attn_pool_heads", 8))) if self.route_enabled else None
         self.asl = AsymmetricLoss(
             gamma_neg=a.get("gamma_neg", 2.0),
             gamma_pos=float(a.get("gamma_pos", 0.0)),

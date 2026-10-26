@@ -438,10 +438,9 @@ def attach_experts(model, target_names: list[str], n_experts: int, r: int,
                    ctx: RoutingContext | None = None) -> tuple[RoutingContext, dict]:
     """Thay mỗi module trong `target_names` bằng `MoELoraLinear`. Đóng băng phần còn lại.
 
-    `target_names` đến từ `backbone.find_target_modules`, tức là CÙNG danh sách
-    mà §2.3 đưa cho peft: 4 ma trận Attn của khối ngôn ngữ, đã loại vision tower.
-    Dùng lại hàm ấy chứ không tự lọc là để "Experts gắn đúng chỗ adapter của
-    §2.3 gắn" kiểm được bằng cách đọc, không phải bằng cách tin.
+    `target_names` đến từ `backbone.find_target_modules`: §2.4 dùng các ma trận
+    attention decoder đã khai trong config, Candidate D có thể yêu cầu mọi
+    Linear thuộc decoder. Cả hai trường hợp đều loại vision tower và projector.
     """
     ctx = ctx or RoutingContext()
     ctx.n_experts = int(n_experts)

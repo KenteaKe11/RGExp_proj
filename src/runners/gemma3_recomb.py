@@ -204,11 +204,30 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
             raise RunnerUnusable(
                 f"{adapter_dir}/train_stats.json nói candidate này CÓ MoE nhưng "
                 f"không ghi top_k/n_experts. Huấn luyện lại candidate này.")
-        targets = find_target_modules(base, dict(self.cfg.get("train", {}) or {}))
+        target_cfg = dict(self.cfg.get("train", {}) or {})
+        target_cfg["all_linear"] = bool(m.get("all_linear_targets", False))
+        targets = find_target_modules(base, target_cfg)
         ctx, st = moe.attach_experts(
             base, targets, n_e, int(m["rank"]), float(m["alpha"]),
             0.0)                      # dropout = 0 khi sinh, luôn luôn
         meta = moe.load_experts(base, adapter_dir)
+        vision_adapter = stats.get("vision_adapter") or {}
+        if vision_adapter:
+            from peft import PeftModel
+
+            vision_dir = adapter_dir / str(
+                vision_adapter.get("checkpoint_dir", "vision_adapter"))
+            if not vision_dir.is_dir():
+                raise RunnerUnusable(
+                    f"train_stats.json khai QDoRA vision ở {vision_dir}, nhưng "
+                    "không có adapter. Candidate MoE-LoRA thiếu vision adapter; "
+                    "huấn luyện lại candidate này.")
+            base = PeftModel.from_pretrained(
+                base, str(vision_dir),
+                adapter_name=str(vision_adapter.get("name", "vision_qdora")))
+            print(f"  ✓ adapter thị giác: {vision_adapter.get('method')} "
+                  f"r={vision_adapter.get('rank')} · "
+                  f"{vision_adapter.get('n_target_modules')} module", flush=True)
         router = moe.Router(n_experts=n_e, top_k=k,
                             clip_c=float(m.get("logit_clip_c", 1.2)),
                             noise=bool(m.get("noise", True)),

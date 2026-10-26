@@ -196,7 +196,8 @@ def hub_adapter_files(files: dict[str, int], arm_id: str) -> list[str]:
 def hub_adapter_complete(rels: list[str], arm_id: str) -> bool:
     names = {r.rsplit("/", 1)[-1] for r in rels}
     return ("train_stats.json" in names
-            and ("adapter_model.safetensors" in names or "adapter_model.bin" in names))
+            and ("adapter_model.safetensors" in names or "adapter_model.bin" in names
+                 or "moe_experts.safetensors" in names))
 
 
 def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path,
@@ -229,6 +230,13 @@ def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path,
             from . import moe
             if not moe.experts_exist(got):
                 print(f"  ⚠ {arm_id}: adapter trên Hub thiếu trọng số Experts — bỏ", flush=True)
+                return False
+        vision_adapter = stats.get("vision_adapter") or {}
+        if vision_adapter:
+            vision_dir = got / str(vision_adapter.get("checkpoint_dir", "vision_adapter"))
+            if not (vision_dir / "adapter_model.safetensors").exists() and not (
+                    vision_dir / "adapter_model.bin").exists():
+                print(f"  ⚠ {arm_id}: adapter trên Hub thiếu QDoRA vision — bỏ", flush=True)
                 return False
         if odir.exists():
             shutil.rmtree(odir)       # bản cục bộ dở dang (không có train_stats.json)

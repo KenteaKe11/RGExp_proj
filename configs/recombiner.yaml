@@ -1,29 +1,29 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §2.3 — Baseline, QLoRA decoder và Candidate C có Recombinator
+# §2.3 — Baseline, QLoRA, Recombinator và MoE-LoRA
 # ═══════════════════════════════════════════════════════════════════════════
 # Câu hỏi của mục này, viết đủ một câu:
 #
-#     Giữ nguyên adapter LoRA đã được §2.2 đo, THÊM một nhánh tái tổ hợp đặc
-#     trưng thị giác có giám sát vào — chất lượng báo cáo sinh ra có đổi không,
-#     và đổi BAO NHIÊU?
+#     So sánh baseline, QLoRA decoder, QLoRA + Recombinator và QLoRA experts
+#     định tuyến + Recombinator trên cùng dữ liệu/seed/lịch train.
 #
 #     baseline_infer  Gemma 3 nguyên bản
 #     lora_only       QLoRA chỉ trên decoder
 #     lora_recomb     QLoRA decoder + QDoRA vision + Recombinator + ClsHead
+#     moe_lora        MoE-LoRA decoder + Route + QDoRA vision + Recombinator + ClsHead
 #
-# Cùng base, cùng dữ liệu, cùng seed, cùng lịch, cùng batch. Đúng MỘT thứ khác
-# nhau, và đó là điều kiện để hiệu số quan sát được quy về nhánh mới.
+# Cùng base, dữ liệu, seed, lịch và batch. Các candidate được thêm tuần tự để
+# đo riêng hiệu ứng của nhánh Recombinator và thay decoder LoRA bằng MoE-LoRA.
 #
 # ── Đọc file này thế nào ───────────────────────────────────────────────────
 # Khối `recombiner` mô tả HÌNH DẠNG của nhánh (sơ đồ chi tiết trong README).
 # Khối `classifier` mô tả HÀM MẤT MÁT có giám sát (ASL, λ); khối `recombiner`
 # mô tả đường fusion chiếu nhánh rồi concat với adapter ảnh/prompt.
 #
-# ── Ba thay đổi so với bản trước, và vì sao ────────────────────────────────
+# ── Thiết lập hiện hành ────────────────────────────────────────────────────
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
 # 2. Candidate C chỉ QDoRA 1/4 layer cuối vision và đóng băng projector; fusion chiếu rồi concat.
-# 3. Ba candidate dùng chung manifest test; 4 bootstrap subset dùng 4 seed riêng.
+# 3. Bốn candidate dùng chung manifest test; 4 bootstrap subset dùng 4 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -31,8 +31,8 @@ seed: 42
 # ═══════════════════════════════════════════════════════════════════════════
 # HAI THÍ NGHIỆM, MỘT FILE CẤU HÌNH
 # ═══════════════════════════════════════════════════════════════════════════
-#   2.3  Nhánh Recombinator có đáng không?   A (LoRA) vs B (LoRA + nhánh)
-#        k = 2 -> bootstrap ghép cặp (BCa) + permutation.
+#   2.3  So sánh bốn candidate: baseline, QLoRA, QLoRA + nhánh, MoE-LoRA + nhánh
+#        -> bootstrap ghép cặp + permutation.
 #   2.4  Cấu hình MoE nào tốt hơn?           5 cặp (top-k, n_experts)
 #        k = 5 -> Friedman + hậu kiểm Wilcoxon/Holm.
 #
@@ -381,11 +381,10 @@ moe:
     # lệch là chuyện đương nhiên chứ không phải triệu chứng.
     warmup_pct: 0.1
 
-  # ── Experts: E bộ LoRA trên ĐÚNG 4 ma trận Attn của §2.3 ─────────────────
-  # Danh sách module lấy từ `train.target_modules` + include/exclude_prefixes ở
-  # trên — CÙNG hàm `backbone.find_target_modules` mà §2.3 đưa cho peft. Dùng
-  # lại hàm ấy chứ không tự lọc là để "Experts gắn đúng chỗ adapter của §2.3
-  # gắn" kiểm được bằng cách ĐỌC.
+  # ── Experts: E bộ LoRA trên các linear mục tiêu ──────────────────────────
+  # §2.4 dùng các ma trận trong train.target_modules; Candidate D đặt
+  # all_linear_targets=true để mở rộng ra mọi Linear của decoder. Vision tower
+  # và projector luôn bị loại khỏi Experts; QDoRA vision đi theo adapter riêng.
   expert:
     # null = lấy rank từ `lora.preset` ở trên, tức là MỖI expert có đúng sức
     # chứa của adapter §2.3. Ghi số ở đây là đưa thêm một biến thứ ba vào bảng
@@ -436,16 +435,16 @@ arms_moe:
   - {id: k6_e8,  name: "K=6 · E=8",  top_k: 6, n_experts: 8,  enabled: true}
   - {id: k6_e10, name: "K=6 · E=10", top_k: 6, n_experts: 10, enabled: true}
 
-# ── HAI CANDIDATE ───────────────────────────────────────────────────────────
-# Chỉ MỘT khoá khác nhau: `recomb`. Mọi thứ còn lại — preset LoRA, seed, thứ tự
-# dữ liệu, batch, lịch học, chính sách ảnh — lấy từ các khối trên và giống hệt
-# nhau. Đó là điều kiện để hiệu số theo từng ảnh quy về đúng một nguyên nhân.
+# ── BỐN CANDIDATE ───────────────────────────────────────────────────────────
+# Candidate D giữ Recombinator/ClsHead/QDoRA vision của C, thay QLoRA decoder
+# bằng Experts MoE-LoRA và bật Route Head: attention pooling về vector d=1152,
+# chiếu thành E logits; Experts LoRA gắn vào mọi Linear thuộc decoder.
 #
 # `recomb` KHÔNG có giá trị mặc định trong code: quên khai là DỪNG. Một arm
 # lặng lẽ nhận `false` nghĩa là chạy candidate A hai lần, ra hai cột gần trùng
 # nhau, và kết luận "nhánh không có tác dụng" — đọc được, hợp lý, và sai.
 #
-# THỨ TỰ CHẠY không phải thứ tự ở đây: src/run_recomb.py luôn chạy B trước A.
+# THỨ TỰ CHẠY không phải thứ tự ở đây: MoE-LoRA chạy trước vì tốn VRAM hơn.
 # Danh sách này là thứ tự TRÌNH BÀY trong báo cáo.
 arms:
   - id: baseline_infer
@@ -460,6 +459,17 @@ arms:
   - id: lora_recomb
     name: "QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh + Recombinator + đầu phân loại"
     recomb: true
+    capture_cls_head: true
+    train_projector: false
+    enabled: true
+  - id: moe_lora
+    name: "MoE-LoRA decoder + Route + QDoRA vision + Recombinator + đầu phân loại"
+    recomb: true
+    moe: true
+    top_k: 6
+    n_experts: 10
+    route_pooling: attention
+    all_linear_targets: true
     capture_cls_head: true
     train_projector: false
     enabled: true

@@ -186,8 +186,9 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
     A ở HAI thứ — nhánh mới, và một vision tower đã bị sửa — và hiệu số ghép cặp
     không quy về nhánh được nữa.
 
-    Nên: duyệt named_modules() thật, giữ những module vừa khớp hậu tố vừa nằm
-    dưới một tiền tố ngôn ngữ, và loại thẳng những gì nằm dưới tiền tố vision.
+    Nên: duyệt named_modules() thật, giữ những module khớp hậu tố (hoặc mọi
+    Linear khi `all_linear=True`) dưới tiền tố ngôn ngữ, và loại thẳng những
+    gì nằm dưới tiền tố vision.
     """
     if tcfg.get("target_groups"):                      # §2.7: nhiều vùng, luật riêng từng vùng
         from .cxr_backbone import find_target_groups
@@ -197,9 +198,10 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
     import torch.nn as nn
 
     suffixes = tuple(str(s) for s in tcfg.get("target_modules", []))
+    all_linear = bool(tcfg.get("all_linear", False))
     inc = tuple(str(s) for s in tcfg.get("include_prefixes", []))
     exc = tuple(str(s) for s in tcfg.get("exclude_prefixes", []))
-    if not suffixes:
+    if not suffixes and not all_linear:
         raise TrainUnusable("train.target_modules rỗng")
 
     hits, rejected_vision = [], []
@@ -207,7 +209,7 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
         if not isinstance(mod, nn.Linear) and type(mod).__name__ not in (
                 "Linear4bit", "Linear8bitLt", "Params4bit"):
             continue
-        if not name.split(".")[-1] in suffixes:
+        if not all_linear and name.split(".")[-1] not in suffixes:
             continue
         parts = name.split(".")
         if any(p in exc for p in parts):
@@ -793,6 +795,50 @@ def attach_adapter(model, arm: dict, tcfg: dict):
                         "projector_adapter": pa_meta,
                         "projector_trainable_params": n_projector,
                         "vision_adapter": vision_meta}
+
+
+def attach_vision_adapter_only(model, tcfg: dict):
+    """Attach the configured vision PEFT adapter without a decoder LoRA.
+
+    Used by the §2.3 MoE-LoRA arm: routed experts occupy the decoder's LoRA
+    target matrices, while this adapter preserves Candidate C's vision QDoRA.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    vision_cfg = dict(tcfg.get("vision_adapter") or {})
+    if not vision_cfg.get("enabled", False):
+        return model, None
+    targets = find_target_modules(model, {
+        "target_modules": tcfg.get("target_modules", []),
+        "include_prefixes": vision_cfg.get("include_prefixes", ["vision_tower"]),
+        "exclude_prefixes": [],
+        "vision_layers": {"from": vision_cfg.get("layers", "second_half")},
+    })
+    method = str(vision_cfg.get("method", "qdora")).lower()
+    rank = int(vision_cfg.get("rank", 4))
+    alpha = resolve_alpha(rank, tcfg)
+    if method not in ("lora", "qlora", "dora", "qdora"):
+        raise TrainUnusable(f"vision_adapter.method không hợp lệ: {method}")
+    sig = inspect.signature(LoraConfig.__init__).parameters
+    if uses_dora(method) and "use_dora" not in sig:
+        raise TrainUnusable("QDoRA vision cần peft hỗ trợ use_dora (peft>=0.11).")
+    kw = dict(r=rank, lora_alpha=alpha,
+              lora_dropout=float(vision_cfg.get("lora_dropout",
+                                                tcfg.get("lora_dropout", 0.05))),
+              bias="none", target_modules=targets)
+    if uses_dora(method):
+        kw["use_dora"] = True
+    kw = {k: v for k, v in kw.items() if k in sig or k == "target_modules"}
+    name = str(vision_cfg.get("adapter_name", "vision_qdora"))
+    model = get_peft_model(model, LoraConfig(**kw), adapter_name=name)
+    # get_peft_model freezes its base model. Re-enable both the selected vision
+    # adapter and routed expert matrices; no dense base weights are unfrozen.
+    for param_name, param in model.named_parameters():
+        if "lora_" in param_name:
+            param.requires_grad_(True)
+    return model, {"name": name, "method": method, "rank": rank,
+                   "alpha": alpha, "n_target_modules": len(targets),
+                   "checkpoint_dir": "vision_adapter"}
 
 
 # ── Một arm ─────────────────────────────────────────────────────────────────

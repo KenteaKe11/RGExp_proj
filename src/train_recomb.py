@@ -1,5 +1,8 @@
-"""Huấn luyện HAI candidate của §2.3 trên cùng một base, cùng một lịch, cùng
-một dữ liệu — khác nhau đúng một thứ: có nhánh Recombinator hay không.
+"""Huấn luyện bốn candidate §2.3 trên cùng base, lịch và dữ liệu.
+
+Baseline và QLoRA decoder là mốc; Candidate C thêm QDoRA vision, Recombinator
+và ClsHead; MoE-LoRA giữ nhánh đó, bật Route Head và dùng experts LoRA thay
+QLoRA decoder.
 
 File này dùng lại `src/backbone.py` cho mọi thứ không phải vòng tối ưu hoá
 (nạp base, chọn target module, alpha theo rank, đường cong one-cycle, che nhãn,
@@ -25,9 +28,9 @@ cùng một lần chạy với arm cùng tên trong bảng §2.2 (Trainer xáo d
 RNG riêng của nó). Con số tuyệt đối của §2.3 vì thế không so trực tiếp được với
 bảng §2.2; chỉ hiệu số A↔B bên trong §2.3 là thứ hai kiểm định nói về.
 
-── Bốn chỗ giữ cho "y như nhau" thành thật ─────────────────────────────────
+── Bốn chỗ giữ cho điều kiện chung thành thật ───────────────────────────────
 
-  1. Cùng ĐƯỜNG ĐI. Cả A và B đều đi qua `_forward_loss`, đều tự dựng
+  1. Cùng ĐƯỜNG ĐI. Các candidate huấn luyện đều đi qua `_forward_loss`, đều tự dựng
      `inputs_embeds` bằng `recombiner.build_inputs_embeds`. A không đi đường
      `model(input_ids=..., pixel_values=...)` của transformers cho "gọn": hai
      đường ấy tương đương về toán nhưng khác nhau về thứ tự phép tính, và khi
@@ -97,16 +100,15 @@ def resolve_preset(cfg: Cfg) -> dict:
 def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
     """(top_k, n_experts, rank, alpha, router, aux) đã giải quyết cho một candidate.
 
-    Trả None khi §2.3. Hai con số DUY NHẤT được phép khác nhau giữa các
-    candidate của §2.4 là `top_k` và `n_experts` — mọi thứ còn lại đi ra từ các
-    khối chung, và hàm này là chỗ điều đó kiểm được bằng cách đọc.
+    Trả None cho arm không bật MoE. Với các candidate §2.4, top_k/n_experts
+    phân biệt cấu hình; Candidate MoE-LoRA §2.3 khai tường minh một cặp duy nhất.
 
     Rank/alpha mặc định lấy từ `lora.preset`: mỗi expert có ĐÚNG sức chứa của
     adapter §2.3. Ghi số riêng vào `moe.expert.rank` là đưa một biến thứ ba vào
     một bảng đang so hai biến.
     """
     m = dict(cfg.get("moe", {}) or {})
-    if not bool(m.get("enabled", False)):
+    if not bool(m.get("enabled", False)) or not bool(arm.get("moe", False)):
         return None
     e = dict(m.get("expert", {}) or {})
     k = int(arm.get("top_k", 0))
@@ -138,6 +140,8 @@ def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
     a = dict(m.get("aux", {}) or {})
     return {
         "arm_id": arm.get("id"), "top_k": k, "n_experts": n_e,
+        "route_pooling": str(arm.get("route_pooling", "stack")),
+        "all_linear_targets": bool(arm.get("all_linear_targets", False)),
         "rank": rank, "alpha": alpha, "dropout": float(e.get("dropout", 0.05)),
         "method": method,
         "base_method": preset["method"],
@@ -170,6 +174,9 @@ def effective_rcfg(cfg: Cfg, spec: dict | None) -> dict:
     r["n_experts"] = int(spec["n_experts"])
     r["route_enabled"] = True
     r["route_noise_init"] = float(spec["noise_init"])
+    rh = dict(r.get("route_head") or {})
+    rh["pooling"] = str(spec.get("route_pooling", "stack"))
+    r["route_head"] = rh
     r["merge_mode"] = "concat"
     return r
 
@@ -251,7 +258,7 @@ def stale_recomb_keys(cfg: Cfg) -> list[str]:
 
 
 def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
-    """Những gì CHỈ §2.4 cần, kiểm trước khi nạp base. Trả danh sách lỗi chặn.
+    """Kiểm các arm có MoE trước khi nạp base. Trả danh sách lỗi chặn.
 
     Hai thứ ở đây đều là lỗi im lặng nếu không kiểm:
 
@@ -260,16 +267,17 @@ def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
         ngược vào đồ thị router NHIỀU LẦN. Ca nhẹ là nổ "backward through the
         graph a second time" — ca nặng là router nhận thiếu gradient và bảng
         §2.4 đo một router học sai mà không có gì báo.
-      * mọi candidate của §2.4 phải CÓ nhánh (concat). Không nhánh thì không có
+      * mọi candidate MoE phải CÓ nhánh (concat). Không nhánh thì không có
         Route Head, và không có gì để định tuyến.
     """
     errs: list[str] = []
-    if not bool(dict(cfg.get("moe", {}) or {}).get("enabled", False)):
+    moe_arms = [a for a in arms if bool(a.get("moe", False))]
+    if not moe_arms:
         return errs
-    bad = [a.get("id") for a in arms if not a.get("recomb", True)]
+    bad = [a.get("id") for a in moe_arms if not a.get("recomb", True)]
     if bad:
         errs.append(
-            f"candidate {bad} của §2.4 không bật nhánh Recombinator. §2.4 LUÔN "
+            f"candidate MoE {bad} không bật nhánh Recombinator. MoE luôn "
             f"dùng concat: không có nhánh thì không có Route Head, và Top-k Gate "
             f"không có gì để đọc.")
     if bool(dict(cfg["train"]).get("gradient_checkpointing", True)):
@@ -282,7 +290,7 @@ def _preflight_moe(cfg: Cfg, arms: list[dict]) -> list[str]:
                 errs.append(
                     f"transformers {getattr(transformers, '__version__', '?')} "
                     f"không nhận `gradient_checkpointing_kwargs`, nên không bật "
-                    f"được chế độ KHÔNG-reentrant. §2.4 cần nó — xem docstring "
+                    f"được chế độ KHÔNG-reentrant. MoE cần nó — xem docstring "
                     f"src/moe.py, mục gradient checkpointing. "
                     f"pip install -U 'transformers>=4.35'")
         except ImportError:
@@ -721,7 +729,7 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     out_dir.mkdir(parents=True, exist_ok=True)
     if spec is not None and not use_branch:
         raise TrainUnusable(
-            f"{aid}: §2.4 bật MoE nhưng candidate này không có nhánh. §2.4 LUÔN "
+            f"{aid}: bật MoE nhưng candidate này không có nhánh. MoE luôn "
             f"dùng concat — không nhánh thì không có Route Head để định tuyến.")
 
     initial_bs = int(tcfg.get("per_device_batch_size", 1))
@@ -771,11 +779,11 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
 
 
 def _attach_experts(model, tcfg: dict, spec: dict):
-    """§2.4: thay 4 ma trận Attn bằng `MoELoraLinear`, thay vì gắn adapter peft.
+    """Thay các Linear mục tiêu bằng `MoELoraLinear`, không gắn PEFT decoder.
 
-    Cùng danh sách module mà §2.3 đưa cho peft (`find_target_modules`), vì thế
-    "Experts gắn đúng chỗ adapter của §2.3 gắn" là một câu ĐỌC được, không phải
-    một câu phải tin. Xem docstring src/moe.py cho lý do không dùng peft.
+    Candidate D có thể nhắm mọi Linear trong decoder; §2.4 giữ danh sách target
+    trong config. Cả hai dùng cùng bộ lọc tiền tố để bỏ vision tower/projector.
+    Xem docstring src/moe.py cho lý do không dùng peft.
 
     `prepare_model_for_kbit_training` được gọi với `use_gradient_checkpointing
     =False`: checkpointing bật SAU, ở chế độ KHÔNG-reentrant. Để nó tự bật là
@@ -787,7 +795,9 @@ def _attach_experts(model, tcfg: dict, spec: dict):
     if is_quantized(spec["base_method"]):
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=False)
-    targets = find_target_modules(model, tcfg)
+    target_cfg = dict(tcfg)
+    target_cfg["all_linear"] = bool(spec.get("all_linear_targets", False))
+    targets = find_target_modules(model, target_cfg)
     ctx, st = moe_mod.attach_experts(
         model, targets, spec["n_experts"], spec["rank"], spec["alpha"],
         spec["dropout"])
@@ -850,13 +860,21 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             adapter_cfg)
     else:
         model, route_ctx, router, mstats = _attach_experts(model, tcfg, spec)
+        vision_cfg = dict(tcfg.get("vision_adapter", {}) or {})
+        vision_meta = None
+        if vision_cfg.get("enabled", False):
+            from .backbone import attach_vision_adapter_only
+
+            model, vision_meta = attach_vision_adapter_only(model, tcfg)
         pstats = {
             "trainable_params": sum(p.numel() for p in model.parameters()
                                     if p.requires_grad),
             "all_params": sum(p.numel() for p in model.parameters()),
             "alpha": spec["alpha"], "rank": spec["rank"],
             "method": f"moe_{spec['method']}",
-            "n_target_modules": mstats["n_modules"]}
+            "n_target_modules": mstats["n_modules"],
+            "vision_adapter": vision_meta,
+            "projector_trainable_params": 0}
         print(f"  Experts: {spec['n_experts']} × LoRA(r={spec['rank']}, "
               f"alpha={spec['alpha']:.0f}) trên {mstats['n_modules']} ma trận Attn "
               f"· top-k = {spec['top_k']} · {mstats['expert_params']:,} tham số "
@@ -1115,9 +1133,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if spec is None:
         model.save_pretrained(str(out_dir), safe_serialization=True)
     else:
-        # §2.4 không dùng peft, nên không có `save_pretrained` nào ghi hộ phần
-        # học được. Ghi cả model là 4 GB trọng số nền cho MỖI candidate; không
-        # ghi gì là nạp lại một bộ expert NGẪU NHIÊN ở khâu sinh.
+        # MoE experts lưu riêng. Với arm §2.3 MoE-LoRA, QDoRA vision cũng là
+        # adapter PEFT riêng; QDoRA vision và experts cùng được nạp lúc infer.
+        vision_meta = pstats.get("vision_adapter") or {}
+        if vision_meta:
+            model.save_pretrained(
+                str(out_dir / vision_meta["checkpoint_dir"]),
+                safe_serialization=True)
         moe_mod.save_experts(model, out_dir, {
             "arm_id": aid, "top_k": spec["top_k"], "n_experts": spec["n_experts"],
             "rank": spec["rank"], "alpha": spec["alpha"],
@@ -1216,7 +1238,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
 
 # ══ Resume ══════════════════════════════════════════════════════════════════
 def already_trained(out_dir: Path, needs_branch: bool,
-                    needs_experts: bool = False) -> bool:
+                    needs_experts: bool = False,
+                    expected_moe: dict | None = None) -> bool:
     """Candidate này đã huấn luyện xong và ghi ĐỦ chưa?
 
     Ba (hoặc bốn) điều kiện, không phải một: trọng số học được,
@@ -1243,6 +1266,19 @@ def already_trained(out_dir: Path, needs_branch: bool,
             label_stats = train_stats.get("cls_label_stats") or {}
             ok = label_stats.get("label_source") == (
                 "f1chexbert_from_reference_report_binary_pos_uncertain/2")
+            vision_adapter = train_stats.get("vision_adapter") or {}
+            if ok and vision_adapter:
+                ok = (d / str(vision_adapter.get("checkpoint_dir", "vision_adapter"))
+                      / "adapter_model.safetensors").exists() or (
+                          d / str(vision_adapter.get("checkpoint_dir", "vision_adapter"))
+                          / "adapter_model.bin").exists()
+        except (OSError, ValueError, TypeError):
+            ok = False
+    if ok and needs_experts and expected_moe:
+        try:
+            train_stats = json.loads((d / "train_stats.json").read_text(encoding="utf-8"))
+            saved_moe = train_stats.get("moe") or {}
+            ok = all(saved_moe.get(k) == v for k, v in expected_moe.items())
         except (OSError, ValueError, TypeError):
             ok = False
     return bool(ok)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Retrain/infer §2.3 Candidate C, then evaluate all candidates and push results.
+# Refresh Candidate C and ensure MoE-LoRA exists, then evaluate all candidates.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,11 +48,13 @@ if [[ $# -ne 0 ]]; then
     exit 2
 fi
 
-# Phase 1: only Candidate C is trained and inferred; preserve A/B artifacts.
+# Phase 1: refresh C; train/infer MoE-LoRA if missing, preserving other artifacts.
 bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb \
     --stages train,infer --retrain --no-wandb --no-push
+bash scripts/run_recomb.sh --exp 2.3 --arms moe_lora \
+    --stages train,infer --no-wandb --no-push
 
-# Phase 2: use the new C predictions and existing A/B predictions for the
+# Phase 2: use refreshed/new candidate predictions for the
 # complete paired comparison, then upload the complete result folder.
 bash scripts/run_recomb.sh --exp 2.3 \
     --stages score,stats,report,push --rescore --no-wandb
