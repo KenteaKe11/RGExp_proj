@@ -356,10 +356,10 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     A("## Kiểm định thống kê riêng cho từng nhóm metric")
     A("")
-    A("Trạng thái được xác định riêng cho từng chỉ số và từng cặp mô hình. Chỉ ghi "
-      "‘Bác bỏ H₀’ khi cả p hoán vị và p bootstrap sau hiệu chỉnh Holm đều nhỏ hơn "
-      f"α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)} trong từng chỉ số. Các trường hợp "
-      "còn lại ghi ‘Chưa đủ chứng cứ bác bỏ H₀’; điều này không có nghĩa là chấp nhận H₀.")
+    A("Trạng thái được xác định riêng cho từng chỉ số và từng cặp mô hình. Ghi "
+      "‘Có ý nghĩa’ khi cả p hoán vị và p bootstrap sau hiệu chỉnh Holm đều nhỏ hơn "
+      f"α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)} trong từng chỉ số; "
+      "các trường hợp còn lại ghi ‘Không có ý nghĩa’.")
     A("")
     metric_groups = [
         ("BLEU", lambda m: str(m).lower().startswith("bleu")),
@@ -392,14 +392,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
             for r in group_rows.to_dict("records"):
                 aa = names.get(str(r.get("arm_a", "")), str(r.get("arm_a", "?")))
                 bb = names.get(str(r.get("arm_b", "")), str(r.get("arm_b", "?")))
-                rejected = bool(r.get("significant", False))
-                material = bool(r.get("material", False))
-                if rejected and material:
-                    status = "Bác bỏ H₀; hiệu ứng đạt ngưỡng thực tiễn"
-                elif rejected:
-                    status = "Bác bỏ H₀; hiệu ứng dưới ngưỡng thực tiễn"
-                else:
-                    status = "Chưa đủ chứng cứ bác bỏ H₀"
+                status = ("Có ý nghĩa" if bool(r.get("significant", False))
+                          else "Không có ý nghĩa")
                 table_rows.append([
                     metric_names.get(str(r.get("metric")), str(r.get("metric"))),
                     f"{bb} − {aa}", _sf(r.get("mean_diff", r.get("diff"))),
