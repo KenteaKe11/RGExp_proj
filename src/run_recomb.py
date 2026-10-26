@@ -533,25 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚙ dùng lại manifest test: {len(test_df)} mẫu", flush=True)
     tracker.summary({"data/n_test": len(test_df)})
 
-    # Hub là nguồn resume ưu tiên: đồng bộ adapter/predictions trước khi train,
-    # infer hay score nhìn vào cache cục bộ. Lượt chạy chỉ lập báo cáo thì không
-    # cần tải artifacts.
-    hub_predictions_changed = False
-    if not a.dry_run and any(s in stages for s in ("train", "infer", "score")):
-        from . import resume as resume_mod
-
-        baseline_id = next((x["id"] for x in arms if x.get("infer_only")), None)
-        try:
-            resume_info = resume_mod.scan_and_restore(
-                cfg, arms, adapter_root, pred_paths, baseline_id, test_df, run_dir,
-                retrain=bool(a.retrain), need_train=need_train_run, prefer_hub=True)
-            manifest["hub_resume"] = resume_info
-            hub_predictions_changed = bool(resume_info.get("predictions_imported", 0))
-        except resume_mod.ScanError as e:
-            print(f"✗ Không thể ưu tiên resume từ Hub: {e}", flush=True)
-            tracker.alert("§2.3 dừng khi resume Hub", str(e), "ERROR")
-            tracker.finish(1)
-            return 5
+    # Không tự kết nối hoặc kéo artifacts từ Hub. Chỉ --pull (lệnh riêng ở trên)
+    # mới tải adapter/predictions; các stage thường dùng cache local hiện có.
 
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
@@ -739,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
         for arm in arms:
             aid = arm["id"]
             csv_path = mdir / f"per_sample_{aid}.csv"
-            if csv_path.exists() and not a.rescore and not hub_predictions_changed:
+            if csv_path.exists() and not a.rescore:
                 cached = pd.read_csv(csv_path)
                 counts_ready = (all(c in cached.columns for c in
                                     ("chexbert_tp", "chexbert_fp", "chexbert_fn"))

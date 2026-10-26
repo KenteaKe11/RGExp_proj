@@ -34,7 +34,7 @@ bash scripts/run_recomb.sh --exp 2.3 --dry-run --stages data,train --no-wandb --
 bash scripts/run_recomb.sh --exp 2.3 --no-wandb --no-push
 ```
 
-Trước khi chạy đầy đủ, cài các gói phụ thuộc trong `requirements.txt`, gồm `f1chexbert`. Khi chạy lại, hệ thống ưu tiên khôi phục dữ liệu từ Hub trước, sau đó mới dùng dữ liệu cục bộ. Một số lệnh khác:
+Trước khi chạy đầy đủ, cài các gói phụ thuộc trong `requirements.txt`, gồm `f1chexbert`. Các lần chạy train/infer/score thông thường chỉ dùng dữ liệu cục bộ; chỉ tải artifacts từ Hub khi gọi rõ `--pull`. Một số lệnh khác:
 
 ```bash
 # Kéo adapter đã huấn luyện và predictions của Candidate C từ Hub về local
