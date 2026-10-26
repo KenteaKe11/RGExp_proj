@@ -516,6 +516,35 @@ def expert_targets_from_checkpoint(model, out_dir: Path) -> list[str]:
     """
     d = Path(out_dir)
     meta = json.loads((d / EXPERTS_META).read_text(encoding="utf-8"))
+    module_names = [name for name, _ in model.named_modules() if name]
+    keys = meta.get("keys") or []
+    suffixes = set()
+    for key in keys:
+        if not (key.endswith(".lora_A") or key.endswith(".lora_B")):
+            continue
+        suffixes.add(key.rsplit(".lora_", 1)[0])
+    if suffixes:
+        # The safetensors key set is the authoritative record of what was
+        # actually saved. `target_names` was added later and may be stale in
+        # checkpoints produced by an intermediate build.
+        resolved = []
+        for saved in sorted(suffixes):
+            matches = [name for name in module_names
+                       if saved == name or saved.endswith("." + name)]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Không ánh xạ duy nhất tensor target `{saved}` vào model "
+                    f"hiện tại (matches={matches[:4]}). Candidate D cần được "
+                    "train lại bằng `--force` với cùng kiến trúc.")
+            resolved.append(matches[0])
+
+        saved_targets = meta.get("target_names") or []
+        if saved_targets and set(saved_targets) != set(resolved):
+            print("  ⚠ target_names trong metadata không khớp tensor đã lưu; "
+                  "dùng target suy ra từ keys của moe_experts.safetensors.",
+                  flush=True)
+        return resolved
+
     saved_targets = meta.get("target_names")
     if saved_targets:
         modules = dict(model.named_modules())
@@ -526,30 +555,12 @@ def expert_targets_from_checkpoint(model, out_dir: Path) -> list[str]:
                 f"{absent[:4]}. Checkpoint được train trên kiến trúc/model khác.")
         return list(saved_targets)
 
-    module_names = [name for name, _ in model.named_modules() if name]
-    keys = meta.get("keys") or []
-    suffixes = set()
-    for key in keys:
-        if not (key.endswith(".lora_A") or key.endswith(".lora_B")):
-            continue
-        suffixes.add(key.rsplit(".lora_", 1)[0])
     if not suffixes:
         raise RuntimeError(
             f"{EXPERTS_META} thiếu target_names và keys; không thể dựng lại "
             "chính xác các expert đã train. Hãy train lại Candidate D bằng "
             "`--force`.")
-
-    resolved = []
-    for saved in sorted(suffixes):
-        matches = [name for name in module_names
-                   if saved == name or saved.endswith("." + name)]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"Không ánh xạ duy nhất target checkpoint `{saved}` vào model "
-                f"hiện tại (matches={matches[:4]}). Candidate D cần được train "
-                "lại bằng `--force` với cùng kiến trúc.")
-        resolved.append(matches[0])
-    return resolved
+    return []
 
 
 def load_experts(model, out_dir: Path) -> dict:

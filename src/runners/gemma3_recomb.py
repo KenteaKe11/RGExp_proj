@@ -206,6 +206,8 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         # current config is unsafe: checkpoint keys may come from a PEFT
         # wrapped model (older runs), while this base is intentionally bare.
         targets = moe.expert_targets_from_checkpoint(base, adapter_dir)
+        print(f"  ✓ khôi phục {len(targets)} target từ tensor Experts; "
+              f"ví dụ: {targets[0] if targets else '(trống)'}", flush=True)
         ctx, st = moe.attach_experts(
             base, targets, n_e, int(m["rank"]), float(m["alpha"]),
             0.0)                      # dropout = 0 khi sinh, luôn luôn
