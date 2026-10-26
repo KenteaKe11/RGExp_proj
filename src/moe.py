@@ -574,8 +574,33 @@ def load_experts(model, out_dir: Path) -> dict:
             f"Experts nhưng trọng số chưa được ghi. Sinh tiếp là chấm một bộ "
             f"expert ngẫu nhiên: vẫn ra tiếng Anh đọc được, và cột số vẫn trông "
             f"như kết quả thật. Huấn luyện lại candidate này (`--retrain`).")
-    sd = load_file(str(d / EXPERTS_FILE))
+    raw_sd = load_file(str(d / EXPERTS_FILE))
     own = dict(model.named_parameters())
+    # Checkpoints made while the experts were attached below a PEFT wrapper
+    # carry prefixes such as `base_model.model.model.`. The inference model is
+    # deliberately unwrapped, so canonicalize each saved tensor key by mapping
+    # its unique suffix to an actual parameter name before validating/copying.
+    sd = {}
+    unmapped = []
+    for key, value in raw_sd.items():
+        if key in own:
+            canonical = key
+        else:
+            matches = [name for name in own
+                       if key.endswith("." + name)]
+            if len(matches) != 1:
+                unmapped.append((key, matches[:4]))
+                continue
+            canonical = matches[0]
+        if canonical in sd:
+            raise RuntimeError(
+                f"Hai tensor checkpoint cùng ánh xạ tới `{canonical}`; "
+                "không thể nạp an toàn MoE Experts.")
+        sd[canonical] = value
+    if unmapped:
+        raise RuntimeError(
+            f"Không chuẩn hóa được {len(unmapped)} key trong {EXPERTS_FILE}; "
+            f"ví dụ: {unmapped[:3]}. Checkpoint không khớp cấu trúc model.")
     missing = [k for k in own if (k.endswith("lora_A") or k.endswith("lora_B"))
                and k not in sd]
     unexpected = [k for k in sd if k not in own]
