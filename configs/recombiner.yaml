@@ -344,10 +344,8 @@ moe:
     # Bật nhiễu lúc sinh là để cùng một ảnh ra hai báo cáo khác nhau ở hai lần
     # chạy — và cả §2.4 chấm greedy chính vì muốn con số lặp lại được.
     noise: true
-    # bias khởi tạo của noise_proj -> σ₀ = softplus(-3.0) ≈ 0.049. Để 0 thì
-    # σ₀ ≈ 0.69, lớn hơn cả trần clipping C = 1.2, và top-k ở những bước đầu
-    # gần như là bốc thăm.
-    noise_init: -3.0
+    # W_noise và bias_noise đều khởi tạo bằng 0 theo cấu hình Candidate D.
+    noise_init: 0.0
 
     # Soft Logit-Clipping: C·tanh(logit/C). C = 1.2 theo đặc tả.
     # KHÔNG phải clamp: clamp cho gradient bằng 0 ngoài khoảng, nên expert bị
@@ -381,10 +379,10 @@ moe:
     # lệch là chuyện đương nhiên chứ không phải triệu chứng.
     warmup_pct: 0.1
 
-  # ── Experts: E bộ LoRA trên các linear mục tiêu ──────────────────────────
-  # §2.4 dùng các ma trận trong train.target_modules; Candidate D đặt
-  # all_linear_targets=true để mở rộng ra mọi Linear của decoder. Vision tower
-  # và projector luôn bị loại khỏi Experts; QDoRA vision đi theo adapter riêng.
+  # ── Experts: E bộ LoRA chỉ trên attention decoder ────────────────────────
+  # Candidate D dùng đúng train.target_modules (q/k/v/o projection) trong
+  # phạm vi language_model; không gắn experts lên MLP hay các Linear khác.
+  # Vision tower và projector luôn bị loại; QDoRA vision đi riêng.
   expert:
     # null = lấy rank từ `lora.preset` ở trên, tức là MỖI expert có đúng sức
     # chứa của adapter §2.3. Ghi số ở đây là đưa thêm một biến thứ ba vào bảng
@@ -437,8 +435,8 @@ arms_moe:
 
 # ── BỐN CANDIDATE ───────────────────────────────────────────────────────────
 # Candidate D giữ Recombinator/ClsHead/QDoRA vision của C, thay QLoRA decoder
-# bằng Experts MoE-LoRA và bật Route Head: attention pooling về vector d=1152,
-# chiếu thành E logits; Experts LoRA gắn vào mọi Linear thuộc decoder.
+# bằng Experts MoE-LoRA chỉ trên q/k/v/o của attention decoder và bật Route
+# Head: attention pooling về vector d=1152, chiếu thành E logits.
 #
 # `recomb` KHÔNG có giá trị mặc định trong code: quên khai là DỪNG. Một arm
 # lặng lẽ nhận `false` nghĩa là chạy candidate A hai lần, ra hai cột gần trùng
@@ -469,7 +467,7 @@ arms:
     top_k: 6
     n_experts: 10
     route_pooling: attention
-    all_linear_targets: true
+    all_linear_targets: false
     capture_cls_head: true
     train_projector: false
     enabled: true

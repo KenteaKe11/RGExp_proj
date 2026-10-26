@@ -512,14 +512,13 @@ class RouteHead(nn.Module):
     directly projects that vector to expert logits and noise parameters. The
     stack option preserves older §2.4 checkpoints/configurations.
 
-    Bias của `noise_proj` khởi tạo `noise_init` (−3.0): σ = softplus(−3) ≈ 0.049
-    ở bước 0. Để bias = 0 thì σ ≈ 0.69 — lớn hơn cả trần clip, và top-k những
-    bước đầu gần như là bốc thăm.
+    W_gate dùng truncated normal (std=0.01); W_noise và bias_noise khởi tạo
+    zero theo mặc định.
     """
 
     def __init__(self, n_tokens: int, d_model: int, n_experts: int = 4,
                  hidden: int = 1024, n_stages: int = 4, dropout: float = 0.0,
-                 noise_init: float = -3.0, pooling: str = "stack",
+                 noise_init: float = 0.0, pooling: str = "stack",
                  n_heads: int = 8):
         super().__init__()
         self.n_experts = int(n_experts)
@@ -538,10 +537,17 @@ class RouteHead(nn.Module):
             raise ValueError(
                 f"route_head.pooling phải là attention|stack, nhận {pooling!r}")
 
-    def init_noise(self) -> None:
-        """Đặt lại bias của `noise_proj`. Gọi SAU `_init`, vì `_init` zero hoá bias."""
+    def init_router(self) -> None:
+        """Khởi tạo gate/noise theo đặc tả; gọi sau `_init` của nhánh."""
         with torch.no_grad():
-            self.noise_proj.bias.fill_(self.noise_init)
+            gate = (self.route_proj if self.pooling == "attention"
+                    else self.head.fc2)
+            nn.init.trunc_normal_(gate.weight, std=0.01)
+            if gate.bias is not None:
+                nn.init.zeros_(gate.bias)
+            nn.init.zeros_(self.noise_proj.weight)
+            if self.noise_proj.bias is not None:
+                self.noise_proj.bias.fill_(self.noise_init)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.pooling == "attention":
@@ -829,7 +835,7 @@ class RecombinerBranch(nn.Module):
             hidden=int(rh.get("hidden", 1024)),
             n_stages=self.pool_stages,
             dropout=float(rh.get("dropout", 0.0)),
-            noise_init=float(r.get("route_noise_init", -3.0)),
+            noise_init=float(r.get("route_noise_init", 0.0)),
             pooling=str(rh.get("pooling", "stack")),
             n_heads=int(rh.get("attn_pool_heads", 8))) if self.route_enabled else None
         self.asl = AsymmetricLoss(
@@ -860,7 +866,7 @@ class RecombinerBranch(nn.Module):
             _init(self.dec_proj.out_proj)
         # SAU `_init`, vì `_init` zero hoá mọi bias — kể cả bias mang ý nghĩa.
         if self.route_head is not None:
-            self.route_head.init_noise()
+            self.route_head.init_router()
         # `dec_proj` KHÔNG đi qua `_init`: khởi tạo của nó là trung bình cụm.
 
     # ── forward ────────────────────────────────────────────────────────────

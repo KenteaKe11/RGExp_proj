@@ -138,15 +138,17 @@ def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
             f"trên ma trận nền 4-bit. Xem docstring src/moe.py.")
     r = dict(m.get("router", {}) or {})
     a = dict(m.get("aux", {}) or {})
+    is_candidate_d = str(arm.get("id")) == "moe_lora"
     return {
         "arm_id": arm.get("id"), "top_k": k, "n_experts": n_e,
         "route_pooling": str(arm.get("route_pooling", "stack")),
-        "all_linear_targets": bool(arm.get("all_linear_targets", False)),
+        "all_linear_targets": (False if is_candidate_d else
+                               bool(arm.get("all_linear_targets", False))),
         "rank": rank, "alpha": alpha, "dropout": float(e.get("dropout", 0.05)),
         "method": method,
         "base_method": preset["method"],
         "noise": bool(r.get("noise", True)),
-        "noise_init": float(r.get("noise_init", -3.0)),
+        "noise_init": float(r.get("noise_init", 0.0)),
         "logit_clip_c": float(r.get("logit_clip_c", 1.2)),
         "renormalize_topk": bool(r.get("renormalize_topk", True)),
         "aux_kind": str(a.get("kind", "switch_load_balance")),
@@ -781,9 +783,9 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
 def _attach_experts(model, tcfg: dict, spec: dict):
     """Thay các Linear mục tiêu bằng `MoELoraLinear`, không gắn PEFT decoder.
 
-    Candidate D có thể nhắm mọi Linear trong decoder; §2.4 giữ danh sách target
-    trong config. Cả hai dùng cùng bộ lọc tiền tố để bỏ vision tower/projector.
-    Xem docstring src/moe.py cho lý do không dùng peft.
+    Candidate D và các candidate MoE dùng đúng các target attention decoder
+    trong config; vision tower/projector bị loại khỏi Experts (QDoRA vision
+    được gắn riêng). Xem docstring src/moe.py cho lý do không dùng PEFT.
 
     `prepare_model_for_kbit_training` được gọi với `use_gradient_checkpointing
     =False`: checkpointing bật SAU, ở chế độ KHÔNG-reentrant. Để nó tự bật là
@@ -796,8 +798,20 @@ def _attach_experts(model, tcfg: dict, spec: dict):
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=False)
     target_cfg = dict(tcfg)
-    target_cfg["all_linear"] = bool(spec.get("all_linear_targets", False))
+    is_candidate_d = str(spec.get("arm_id")) == "moe_lora"
+    # Candidate D's experiment contract is attention-only even if a stale
+    # command-line override or checkpoint spec requests all decoder linears.
+    target_cfg["all_linear"] = (False if is_candidate_d else
+                                bool(spec.get("all_linear_targets", False)))
     targets = find_target_modules(model, target_cfg)
+    if is_candidate_d:
+        attn_targets = {"q_proj", "k_proj", "v_proj", "o_proj"}
+        invalid = [name for name in targets
+                   if name.rsplit(".", 1)[-1] not in attn_targets]
+        if invalid:
+            raise TrainUnusable(
+                "Candidate D chỉ gắn MoE vào attention q/k/v/o; target ngoài "
+                f"attention: {invalid[:8]}")
     ctx, st = moe_mod.attach_experts(
         model, targets, spec["n_experts"], spec["rank"], spec["alpha"],
         spec["dropout"])

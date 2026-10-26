@@ -514,7 +514,8 @@ def main(argv: list[str] | None = None) -> int:
 
                     if moe_mod.experts_exist(odir):
                         print("✗ Checkpoint Candidate D đã có nhưng không khớp "
-                              "cấu hình Route attention pooling + all-linear mới. "
+                              "cấu hình Route attention pooling + attention-only "
+                              "Experts mới. "
                               "Để tránh ghi đè, hãy chủ động xác nhận bằng `--force`.",
                               flush=True)
                         return 2
