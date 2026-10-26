@@ -195,8 +195,6 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         `load_experts` báo lệch shape; tệ nhất là chỉ lệch `top_k` (không đổi
         hình dạng tensor nào) và candidate `K=2·E=8` được chấm bằng `K=6`.
         """
-        from ..backbone import find_target_modules
-
         m = dict(stats.get("moe") or {})
         n_e = int(m.get("n_experts") or stats.get("n_experts") or 0)
         k = int(m.get("top_k") or stats.get("top_k") or 0)
@@ -204,9 +202,10 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
             raise RunnerUnusable(
                 f"{adapter_dir}/train_stats.json nói candidate này CÓ MoE nhưng "
                 f"không ghi top_k/n_experts. Huấn luyện lại candidate này.")
-        target_cfg = dict(self.cfg.get("train", {}) or {})
-        target_cfg["all_linear"] = bool(m.get("all_linear_targets", False))
-        targets = find_target_modules(base, target_cfg)
+        # Rebuild the exact target set used by training. Re-scanning the
+        # current config is unsafe: checkpoint keys may come from a PEFT
+        # wrapped model (older runs), while this base is intentionally bare.
+        targets = moe.expert_targets_from_checkpoint(base, adapter_dir)
         ctx, st = moe.attach_experts(
             base, targets, n_e, int(m["rank"]), float(m["alpha"]),
             0.0)                      # dropout = 0 khi sinh, luôn luôn

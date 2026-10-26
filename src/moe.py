@@ -464,7 +464,11 @@ def attach_experts(model, target_names: list[str], n_experts: int, r: int,
     stats = {"n_modules": len(replaced), "n_experts": int(n_experts), "rank": int(r),
              "alpha": float(alpha), "expert_params": int(n_exp),
              "params_per_expert": int(n_exp // max(1, n_experts)),
-             "example_module": replaced[0]}
+             "example_module": replaced[0],
+             # Save the exact target set. Re-running a broad `all_linear` scan
+             # during inference can select a different set after PEFT/model
+             # wrappers or Transformers versions change module names.
+             "target_names": list(replaced)}
     return ctx, stats
 
 
@@ -502,6 +506,52 @@ def experts_exist(out_dir: Path) -> bool:
     return (d / EXPERTS_FILE).exists() and (d / EXPERTS_META).exists()
 
 
+def expert_targets_from_checkpoint(model, out_dir: Path) -> list[str]:
+    """Recover the trained target module paths from checkpoint metadata/keys.
+
+    New checkpoints store canonical `target_names`. Older checkpoints only
+    stored parameter keys, sometimes with PEFT's `base_model.model.` prefix.
+    Map those keys to modules that really exist on the unwrapped inference
+    model; fail on ambiguity rather than silently attaching to another layer.
+    """
+    d = Path(out_dir)
+    meta = json.loads((d / EXPERTS_META).read_text(encoding="utf-8"))
+    saved_targets = meta.get("target_names")
+    if saved_targets:
+        modules = dict(model.named_modules())
+        absent = [name for name in saved_targets if name not in modules]
+        if absent:
+            raise RuntimeError(
+                f"{EXPERTS_META} khai target không có trong model hiện tại: "
+                f"{absent[:4]}. Checkpoint được train trên kiến trúc/model khác.")
+        return list(saved_targets)
+
+    module_names = [name for name, _ in model.named_modules() if name]
+    keys = meta.get("keys") or []
+    suffixes = set()
+    for key in keys:
+        if not (key.endswith(".lora_A") or key.endswith(".lora_B")):
+            continue
+        suffixes.add(key.rsplit(".lora_", 1)[0])
+    if not suffixes:
+        raise RuntimeError(
+            f"{EXPERTS_META} thiếu target_names và keys; không thể dựng lại "
+            "chính xác các expert đã train. Hãy train lại Candidate D bằng "
+            "`--force`.")
+
+    resolved = []
+    for saved in sorted(suffixes):
+        matches = [name for name in module_names
+                   if saved == name or saved.endswith("." + name)]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Không ánh xạ duy nhất target checkpoint `{saved}` vào model "
+                f"hiện tại (matches={matches[:4]}). Candidate D cần được train "
+                "lại bằng `--force` với cùng kiến trúc.")
+        resolved.append(matches[0])
+    return resolved
+
+
 def load_experts(model, out_dir: Path) -> dict:
     """Nạp trọng số expert vào một model ĐÃ được `attach_experts`. Lệch là DỪNG."""
     from safetensors.torch import load_file
@@ -525,8 +575,10 @@ def load_experts(model, out_dir: Path) -> dict:
             f"    thiếu    : {missing[:4]}\n"
             f"    thừa     : {unexpected[:4]}\n"
             f"    lệch shape: {[(k, tuple(sd[k].shape), tuple(own[k].shape)) for k in bad[:3]]}\n"
-            f"    Gần như luôn là n_experts hoặc rank lúc sinh khác lúc train. "
-            f"Nguồn sự thật là train_stats.json, không phải config hiện tại.")
+            f"    Nguồn sự thật là target_names trong checkpoint/train_stats, "
+            f"không phải lần quét target_modules của config hiện tại. Nếu đây "
+            f"là checkpoint cũ không lưu target_names, hãy train lại Candidate "
+            f"D bằng `--force`.")
     with torch.no_grad():
         for k, v in sd.items():
             own[k].copy_(v.to(own[k].dtype).to(own[k].device))

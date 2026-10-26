@@ -1145,7 +1145,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             "rank": spec["rank"], "alpha": spec["alpha"],
             "dropout": spec["dropout"], "method": spec["method"],
             "base_method": spec["base_method"],
-            "target_modules": mstats["n_modules"]})
+            "target_modules": mstats["n_modules"],
+            "target_names": mstats["target_names"]})
     processor.save_pretrained(str(out_dir))
     if branch is not None:
         recombiner.save_branch(branch, out_dir)
