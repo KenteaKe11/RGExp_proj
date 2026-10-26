@@ -216,16 +216,27 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         if vision_adapter:
             from peft import PeftModel
 
-            vision_dir = adapter_dir / str(
-                vision_adapter.get("checkpoint_dir", "vision_adapter"))
-            if not vision_dir.is_dir():
+            checkpoint_dir = Path(str(
+                vision_adapter.get("checkpoint_dir", "vision_adapter")))
+            adapter_name = str(vision_adapter.get("name", "vision_qdora"))
+            # PEFT writes a non-default adapter into
+            # <save_directory>/<adapter_name>. Older D checkpoints called
+            # save_pretrained(<candidate>/vision_adapter), so their actual
+            # config is nested one level below the path in train_stats.json.
+            candidates = [adapter_dir / checkpoint_dir,
+                          adapter_dir / checkpoint_dir / adapter_name,
+                          adapter_dir / adapter_name]
+            vision_dir = next((p for p in candidates
+                               if (p / "adapter_config.json").is_file()), None)
+            if vision_dir is None:
                 raise RunnerUnusable(
-                    f"train_stats.json khai QDoRA vision ở {vision_dir}, nhưng "
-                    "không có adapter. Candidate MoE-LoRA thiếu vision adapter; "
-                    "huấn luyện lại candidate này.")
+                    f"train_stats.json khai QDoRA vision, nhưng không tìm thấy "
+                    f"adapter_config.json tại: {candidates}. Candidate MoE-LoRA "
+                    "thiếu checkpoint vision; cần khôi phục đúng adapter từ "
+                    "Hub/local backup hoặc train lại Candidate D.")
             base = PeftModel.from_pretrained(
                 base, str(vision_dir),
-                adapter_name=str(vision_adapter.get("name", "vision_qdora")))
+                adapter_name=adapter_name)
             print(f"  ✓ adapter thị giác: {vision_adapter.get('method')} "
                   f"r={vision_adapter.get('rank')} · "
                   f"{vision_adapter.get('n_target_modules')} module", flush=True)

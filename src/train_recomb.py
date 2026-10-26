@@ -1269,10 +1269,16 @@ def already_trained(out_dir: Path, needs_branch: bool,
                 "f1chexbert_from_reference_report_binary_pos_uncertain/2")
             vision_adapter = train_stats.get("vision_adapter") or {}
             if ok and vision_adapter:
-                ok = (d / str(vision_adapter.get("checkpoint_dir", "vision_adapter"))
-                      / "adapter_model.safetensors").exists() or (
-                          d / str(vision_adapter.get("checkpoint_dir", "vision_adapter"))
-                          / "adapter_model.bin").exists()
+                name = str(vision_adapter.get("name", "vision_qdora"))
+                checkpoint_dir = Path(str(
+                    vision_adapter.get("checkpoint_dir", "vision_adapter")))
+                candidates = (d / checkpoint_dir,
+                              d / checkpoint_dir / name,
+                              d / name)
+                ok = any((p / filename).exists()
+                         for p in candidates
+                         for filename in ("adapter_model.safetensors",
+                                          "adapter_model.bin"))
         except (OSError, ValueError, TypeError):
             ok = False
     if ok and needs_experts and expected_moe:
