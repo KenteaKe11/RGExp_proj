@@ -2,7 +2,7 @@
 
 Thí nghiệm so sánh ba mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, và Candidate C. C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C có đầu phân loại nhưng không có đầu định tuyến hay MoE. Hàm mất mát là `CE + 0.1 × ASL`, không khởi động tăng dần hệ số ASL.
 
-Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại và hai bảng độ tự tin tương ứng. Mọi bảng dùng chung 10 tập lấy mẫu có hoàn lại, mỗi tập gồm 3.000 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 10 tập.
+Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng trạng thái kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 10 tập lấy mẫu có hoàn lại, mỗi tập gồm 3.000 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 10 tập.
 
 Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 10 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
 

@@ -354,23 +354,60 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     else:
         A("Chưa có dữ liệu độ tự tin của đầu phân loại.")
     A("")
-    A("## Kiểm định thống kê trên chỉ số lâm sàng chính")
+    A("## Kiểm định thống kê riêng cho từng nhóm metric")
     A("")
-    primary_rows = pw[pw["metric"] == primary] if not pw.empty and "metric" in pw else pd.DataFrame()
-    if primary_rows.empty:
-        A("Chưa có kết quả so sánh cặp; chạy bước thống kê.")
+    A("Trạng thái được xác định riêng cho từng chỉ số và từng cặp mô hình. Chỉ ghi "
+      "‘Bác bỏ H₀’ khi cả p hoán vị và p bootstrap sau hiệu chỉnh Holm đều nhỏ hơn "
+      f"α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)} trong từng chỉ số. Các trường hợp "
+      "còn lại ghi ‘Chưa đủ chứng cứ bác bỏ H₀’; điều này không có nghĩa là chấp nhận H₀.")
+    A("")
+    metric_groups = [
+        ("BLEU", lambda m: str(m).lower().startswith("bleu")),
+        ("ROUGE", lambda m: str(m).lower().startswith("rouge")),
+        ("BERTScore", lambda m: str(m).lower().startswith("bertscore")),
+        ("RadGraph", lambda m: str(m).lower().startswith("radgraph")),
+        ("CheXbert", lambda m: str(m).lower() == "chexbert_f1"),
+    ]
+    metric_names = {
+        "bleu1": "BLEU-1", "bleu2": "BLEU-2", "bleu3": "BLEU-3",
+        "bleu4": "BLEU-4", "rouge1": "ROUGE-1", "rouge2": "ROUGE-2",
+        "rougeL": "ROUGE-L", "bertscore_f1": "BERTScore F1",
+        "radgraph_f1_entity": "RadGraph F1 — thực thể",
+        "radgraph_f1_partial": "RadGraph F1 — khớp một phần",
+        "radgraph_f1_complete": "RadGraph F1 — khớp đầy đủ",
+        "chexbert_f1": "CheXbert F1",
+    }
+    if pw.empty or "metric" not in pw:
+        A("Chưa có kết quả kiểm định; hãy chạy bước thống kê.")
     else:
-        pair_rows = []
-        for r in primary_rows.to_dict("records"):
-            aa = names.get(str(r.get("arm_a", "")), str(r.get("arm_a", "?")))
-            bb = names.get(str(r.get("arm_b", "")), str(r.get("arm_b", "?")))
-            pair_rows.append([f"{bb} − {aa}", _sf(r.get("diff")),
-                              f"[{_f(r.get('ci_lo'))}, {_f(r.get('ci_hi'))}]",
-                              _p(r.get("p_perm_holm")), _p(r.get("p_boot_holm")),
-                              "có" if bool(r.get("significant_and_material", False)) else "không"])
-        A(_tbl(["Cặp so sánh (B − A)", "Chênh lệch trung bình", "Khoảng tin cậy 95%",
-                "Giá trị p hoán vị (Holm)", "Giá trị p bootstrap (Holm)",
-                "Có ý nghĩa và đáng kể"], pair_rows))
+        for group_name, belongs in metric_groups:
+            group_rows = pw[pw["metric"].map(belongs)]
+            A(f"### {group_name}")
+            A("")
+            if group_rows.empty:
+                A("Chưa có kết quả cho nhóm metric này.")
+                A("")
+                continue
+            table_rows = []
+            for r in group_rows.to_dict("records"):
+                aa = names.get(str(r.get("arm_a", "")), str(r.get("arm_a", "?")))
+                bb = names.get(str(r.get("arm_b", "")), str(r.get("arm_b", "?")))
+                rejected = bool(r.get("significant", False))
+                material = bool(r.get("material", False))
+                if rejected and material:
+                    status = "Bác bỏ H₀; hiệu ứng đạt ngưỡng thực tiễn"
+                elif rejected:
+                    status = "Bác bỏ H₀; hiệu ứng dưới ngưỡng thực tiễn"
+                else:
+                    status = "Chưa đủ chứng cứ bác bỏ H₀"
+                table_rows.append([
+                    metric_names.get(str(r.get("metric")), str(r.get("metric"))),
+                    f"{bb} − {aa}", _sf(r.get("mean_diff", r.get("diff"))),
+                    f"[{_f(r.get('ci_lo'))}, {_f(r.get('ci_hi'))}]",
+                    _p(r.get("p_perm_holm")), _p(r.get("p_boot_holm")), status])
+            A(_tbl(["Chỉ số", "Cặp so sánh", "Chênh lệch trung bình", "Khoảng tin cậy 95%",
+                    "p hoán vị (Holm)", "p bootstrap (Holm)", "Trạng thái H₀"], table_rows))
+            A("")
     A("")
     A("## Chi tiết huấn luyện và kiến trúc")
     A("")
