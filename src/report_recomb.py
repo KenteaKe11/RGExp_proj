@@ -283,9 +283,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
       f"{ns} tập bootstrap{seed_text}; mỗi tập lấy {bs} mẫu có hoàn lại từ tập kiểm tra. Cùng ma trận "
       "mẫu được dùng chung cho ba candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
       "qua các tập lấy mẫu có hoàn lại.")
-    A("Quy ước nhãn: CheXbert gán nhãn dương và không chắc chắn thành dương; nhãn âm, "
-      "nhãn trống và không được nhắc tới thành âm. Quy ước này áp dụng giống nhau khi "
-      "huấn luyện đầu phân loại và khi chấm báo cáo. F1 CheXbert là vi-F1 trên 14 nhãn.")
+    A("Metric CheXbert theo U-zero: chỉ positive là dương; uncertain, negative và blank "
+      "đều là âm. F1 là vi-F1 trên đủ 14 nhãn.")
     A("")
     A("## Bảng 1 — Chỉ số trên báo cáo được sinh")
     A("")
@@ -312,9 +311,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Bảng 2 — Chỉ số riêng của đầu phân loại")
     A("")
     if chexbert_comparison is not None and not chexbert_comparison.empty:
-        A("Đầu phân loại được chấm với nhãn CheXbert từ report gốc theo cùng quy ước "
-          "positive + uncertain = dương; mọi trạng thái khác = âm. Mức nhất trí so sánh "
-          "nhãn nhị phân của report sinh với đầu phân loại trên 14 nhãn.")
+        A("Đầu phân loại được chấm với nhãn CheXbert từ report gốc theo U-zero: chỉ "
+          "positive = dương; uncertain, negative và blank = âm. Mức nhất trí giữa report "
+          "sinh và đầu phân loại dùng cùng quy ước trên đủ 14 nhãn.")
         A("")
         rows = [[str(r["subset"]), str(r["seed"]),
                  _f(r["report_target_f1"]), _f(r["cls_head_target_f1"]),
@@ -336,8 +335,8 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                          *[_f(r.get(aid)) for aid in scores_order(summary, names)]])
         headers = ["Tập lấy mẫu", "Seed"] + [names.get(aid, aid)
                                              for aid in scores_order(summary, names)]
-        A("Độ tự tin là trung bình xác suất CheXbert dành cho nhãn nhị phân mà "
-          "CheXbert dự đoán trên báo cáo sinh; giá trị cao hơn nghĩa là dự đoán tự tin hơn.")
+        A("Độ tự tin là trung bình xác suất CheXbert dành cho nhãn nhị phân được dự đoán "
+          "trên report sinh theo U-zero; giá trị cao hơn nghĩa là dự đoán tự tin hơn.")
         A("")
         A(_tbl(headers, rows))
     else:
@@ -348,7 +347,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     if chexbert_comparison is not None and not chexbert_comparison.empty:
         rows = [[str(r["subset"]), str(r["seed"]), _f(r["cls_head_confidence"])]
                 for r in chexbert_comparison.to_dict("records")]
-        A("Độ tự tin là trung bình xác suất lớp được dự đoán trên 14 nhãn.")
+        A("Độ tự tin là trung bình xác suất lớp được dự đoán trên đủ 14 nhãn.")
         A("")
         A(_tbl(["Tập lấy mẫu", "Seed", "Độ tự tin trung bình"], rows))
     else:

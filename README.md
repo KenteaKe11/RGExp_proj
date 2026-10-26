@@ -2,7 +2,7 @@
 
 Thí nghiệm so sánh ba mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, và Candidate C. C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C có đầu phân loại nhưng không có đầu định tuyến hay MoE. Hàm mất mát là `CE + 0.1 × ASL`, không khởi động tăng dần hệ số ASL.
 
-Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng trạng thái kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 4 tập lấy mẫu có hoàn lại, mỗi tập gồm 7.500 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 4 tập.
+Khi huấn luyện, nhãn dương và không chắc chắn được gộp thành dương, các trạng thái còn lại thành âm. Metric CheXbert dùng U-zero: chỉ positive là dương; uncertain, negative và blank đều là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 4 tập lấy mẫu có hoàn lại, mỗi tập gồm 7.500 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 4 tập.
 
 Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 4 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
 
@@ -72,18 +72,18 @@ bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report,push --re
 
 ## Thiết lập hiện hành
 
-- **Nhãn phụ trợ:** CheXbert gán nhãn trực tiếp từ báo cáo gốc cho tập huấn luyện và kiểm định. ASL dùng hai lớp âm/dương; nhãn dương và không chắc chắn được tính là dương, các trạng thái còn lại là âm. Không loại bỏ nhãn nào.
+- **Nhãn phụ trợ:** CheXbert gán nhãn trực tiếp từ báo cáo gốc cho tập huấn luyện và kiểm định. ASL dùng hai lớp âm/dương; nhãn dương và không chắc chắn được tính là dương, các trạng thái còn lại là âm.
 - **ASL:** dùng các giá trị mặc định của hàm mất mát bất đối xứng: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
 - **Bộ tối ưu:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
 - **Kích thước lô:** thử các lô nhỏ `16, 12, 10, 8, 6, 4, 2, 1` khi thiếu bộ nhớ; kích thước lô hiệu dụng luôn là 32. Mô hình đầu tiên chọn kích thước, các mô hình còn lại dùng cùng giá trị.
-- **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn, tính riêng trong mỗi tập lấy mẫu 7.500 lượt rồi lấy trung bình 4 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
+- **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn theo U-zero: positive là dương; uncertain, negative và blank là âm. Tính riêng trong mỗi tập lấy mẫu 7.500 lượt rồi lấy trung bình 4 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
 - **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra. Tạo 4 tập lấy mẫu khác nhau bằng 4 hạt giống (`42`–`45`); mỗi tập gồm 7.500 lượt lấy có hoàn lại. Cùng 4 tập được dùng cho cả ba mô hình và mọi chỉ số.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); lệnh khởi chạy là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
 ## CheXbert
 
-Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để gán nhãn cả báo cáo gốc lẫn báo cáo sinh. Khi huấn luyện Candidate C, nhãn ASL cũng được tạo trực tiếp từ báo cáo gốc bằng CheXbert, với quy ước nhãn dương/không chắc chắn là dương và mọi trạng thái khác là âm. Không cần tải mã nguồn hay đặt trọng số thủ công; lần đầu thư viện tự tải trọng số và mô hình BERT vào bộ nhớ đệm môi trường.
+Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để gán nhãn cả báo cáo gốc lẫn báo cáo sinh. Metric nhị phân dùng U-zero: positive là dương; uncertain, negative và blank là âm. Khi huấn luyện Candidate C, nhãn ASL được tạo trực tiếp từ báo cáo gốc bằng CheXbert; positive và uncertain là dương, các trạng thái còn lại là âm. Không cần tải mã nguồn hay đặt trọng số thủ công; lần đầu thư viện tự tải trọng số và mô hình BERT vào bộ nhớ đệm môi trường.
 
 ## Giới hạn thống kê
 

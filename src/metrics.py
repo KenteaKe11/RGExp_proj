@@ -25,7 +25,7 @@ CHEXBERT_LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
                    "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
                    "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
                    "Support Devices", "No Finding"]
-CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report_binary_pos_uncertain/2"
+CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report_u_zero_blank_negative/4"
 _CHEXBERT_LABELER = None
 _RADGRAPH_LABELER = None
 
@@ -207,9 +207,9 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
                         pos_prob = head_probs[:, 1]
                         predicted_positive = head.argmax(dim=-1) == 1
                     else:
-                        pos_prob = head_probs[:, 1] + head_probs[:, 3]
+                        pos_prob = head_probs[:, 1]
                         state = head.argmax(dim=-1)
-                        predicted_positive = (state == 1) | (state == 3)
+                        predicted_positive = state == 1
                     head_confidence.append(torch.where(
                         predicted_positive, pos_prob, 1.0 - pos_prob))
                 conf = torch.stack(head_confidence, dim=1)
@@ -221,12 +221,11 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
             probs = torch.softmax(logits.float(), dim=-1)
             states = logits.argmax(dim=-1)
             if return_binary_confidence:
-                # Quy ước §2.3: positive + uncertain -> dương; negative + blank -> âm.
-                pos_prob = (probs[..., 1] + probs[..., 3] if probs.shape[-1] >= 4
-                            else probs[..., 1]).clone()
+                # U-zero: chỉ positive là dương; uncertain/negative/blank là âm.
+                pos_prob = probs[..., 1].clone()
                 if probs.shape[-1] >= 4:
                     pos_prob[:, 13] = probs[:, 13, 1]
-                    predicted_positive = (states == 1) | (states == 3)
+                    predicted_positive = states == 1
                     predicted_positive[:, 13] = states[:, 13] == 1
                 else:
                     predicted_positive = states == 1
@@ -360,21 +359,18 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
     raw, binary_confidence = _raw_classes_with_labeler(
         labeler, list(refs) + list(hyps), int(cfg.get("batch_size", 32)),
         return_binary_confidence=True)
-    # Quy ước §2.3: positive và uncertain -> dương; negative, blank và không
-    # được nhắc tới -> âm. Đầu No Finding vốn chỉ có hai trạng thái.
-    labels = np.zeros_like(raw, dtype=np.float64)
-    labels[:, :13] = ((raw[:, :13] == 1) | (raw[:, :13] == 3)).astype(np.float64)
-    labels[:, 13] = (raw[:, 13] == 1).astype(np.float64)
-    gold, pred = labels[:n], labels[n:]
-    gpos, ppos = gold == 1, pred == 1
-    tp = np.sum(gpos & ppos, axis=1).astype(np.float64)
-    fp = np.sum(~gpos & ppos, axis=1).astype(np.float64)
-    fn = np.sum(gpos & ~ppos, axis=1).astype(np.float64)
+    # U-zero: chỉ positive là dương; uncertain, negative và blank đều là âm.
+    gold_raw, pred_raw = raw[:n], raw[n:]
+    gold_pos = gold_raw == 1
+    pred_pos = pred_raw == 1
+    tp = np.sum(gold_pos & pred_pos, axis=1).astype(np.float64)
+    fp = np.sum(~gold_pos & pred_pos, axis=1).astype(np.float64)
+    fn = np.sum(gold_pos & ~pred_pos, axis=1).astype(np.float64)
     den = 2 * tp + fp + fn
     per_report = np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
     out = {"chexbert_f1": per_report, "chexbert_tp": tp,
            "chexbert_fp": fp, "chexbert_fn": fn}
-    # Mức tự tin trung bình trên 14 nhãn nhị phân, tính trên report sinh.
+    # Blank cũng được xem là dự đoán âm nên confidence bao gồm đủ 14 nhãn.
     out["chexbert_confidence"] = binary_confidence[n:].mean(axis=1).astype(float)
     if cls_head_predictions is not None:
         head = np.asarray(cls_head_predictions, dtype=np.int64)
@@ -385,12 +381,13 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
         if not np.isin(head, (0, 1)).all():
             raise ValueError("cls_head_predictions chỉ được chứa class 0=neg hoặc 1=pos.")
         ref_raw = raw[:n]
-        gold_pos = (ref_raw == 1) | (ref_raw == 3)
+        gold_pos = ref_raw == 1
         head_pos = head == 1
         out["cls_head_chexbert_tp"] = np.sum(gold_pos & head_pos, axis=1).astype(float)
         out["cls_head_chexbert_fp"] = np.sum(~gold_pos & head_pos, axis=1).astype(float)
         out["cls_head_chexbert_fn"] = np.sum(gold_pos & ~head_pos, axis=1).astype(float)
-        report_pos = (raw[n:] == 1) | (raw[n:] == 3)
+        report_raw = raw[n:]
+        report_pos = report_raw == 1
         out["cls_head_report_agree"] = np.sum(head == report_pos, axis=1).astype(float)
         out["cls_head_report_n_labels"] = np.full(n, head.shape[1], dtype=float)
         if cls_head_confidence is not None:
