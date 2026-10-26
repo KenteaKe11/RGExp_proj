@@ -77,6 +77,7 @@ bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report,push --re
 - **Bộ tối ưu:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
 - **Kích thước lô:** thử các lô nhỏ `16, 12, 10, 8, 6, 4, 2, 1` khi thiếu bộ nhớ; kích thước lô hiệu dụng luôn là 32. Mô hình đầu tiên chọn kích thước, các mô hình còn lại dùng cùng giá trị.
 - **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn theo U-zero: positive là dương; uncertain, negative và blank là âm. Tính riêng trong mỗi tập lấy mẫu 7.500 lượt rồi lấy trung bình 4 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
+- **Ý nghĩa thống kê:** kết luận “Có ý nghĩa” khi p permutation thô < `alpha` và CI bootstrap 95% không chứa 0. p bootstrap và p permutation sau Holm được lưu để tham khảo, không dùng làm cổng kết luận.
 - **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra. Tạo 4 tập lấy mẫu khác nhau bằng 4 hạt giống (`42`–`45`); mỗi tập gồm 7.500 lượt lấy có hoàn lại. Cùng 4 tập được dùng cho cả ba mô hình và mọi chỉ số.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); lệnh khởi chạy là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.

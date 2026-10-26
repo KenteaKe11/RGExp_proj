@@ -493,11 +493,11 @@ metrics:
 # đúng để mở đầu. Ở đây k = 2: chỉ có MỘT cặp, nên không có tầng tổng thể nào
 # cần thiết và Friedman với k=2 chỉ là một dạng kém hơn của kiểm định dấu.
 #
-# Hai kiểm định trên CÙNG một vector hiệu số d_i = B_i − A_i, trả lời hai câu
-# khác nhau, và báo cáo in cả hai:
-#   paired bootstrap (BCa) — "hiệu số thật nằm trong khoảng nào"
-#   permutation (sign-flip) — "nếu hai candidate như nhau thì hiệu số cỡ này
-#                             hiếm tới đâu"
+# Hai phép tính trên cùng hiệu số ghép cặp d_i = B_i − A_i:
+#   paired bootstrap CI — khoảng bất định của hiệu số
+#   permutation (sign-flip) — mức bất thường của hiệu số dưới H0
+# Có ý nghĩa khi p permutation thô < alpha và CI 95% loại 0; p bootstrap không
+# phải cổng kết luận vì §2.3 chỉ có bốn subset bootstrap.
 # Họ kiểm định là 11 metric (thêm ba mức RadGraph F1), hiệu chỉnh
 # Holm; BH in kèm để đọc đối chiếu.
 stats:
@@ -512,8 +512,8 @@ stats:
   # ở những hiệu số không nói được gì về thực hành. Cặp có |d_z| dưới sàn bị
   # đánh dấu "không đáng kể" và KHÔNG được tính là thắng ở cột kết luận.
   dz_floor: 0.10
-  # Kết luận chính thức lấy từ permutation + Holm trên 11 metric. Bootstrap CI
-  # là câu trả lời về ĐỘ LỚN, không phải về ý nghĩa.
+  # Quy tắc §2.3: p permutation thô < alpha VÀ bootstrap CI không chứa 0.
+  # p permutation sau Holm và p bootstrap vẫn được lưu để tham khảo, không gating.
   primary_test: perm
 
   # ── §2.4: k = 5 -> quay LẠI Friedman ──────────────────────────────────────

@@ -944,14 +944,14 @@ def main(argv: list[str] | None = None) -> int:
         ab.to_csv(ab_path, index=False)
         n_sig = int(ab["significant"].sum())
         n_mat = int(ab["significant_and_material"].sum())
-        print(f"  -> {n_sig}/{len(ab)} metric bác H0 ở CẢ HAI kiểm định (Holm, "
-              f"α={scfg.get('alpha', 0.05)}); {n_mat} trong đó có |dz| >= "
+        print(f"  -> {n_sig}/{len(ab)} metric có ý nghĩa theo p permutation + CI "
+              f"(α={scfg.get('alpha', 0.05)}); {n_mat} trong đó có |dz| >= "
               f"{scfg.get('dz_floor', 0.1)}", flush=True)
         primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
         pmain = ab[ab["metric"] == primary] if not ab.empty else ab
         line = ("; ".join(
             f"{names.get(r.arm_b, r.arm_b)} vs {names.get(r.arm_a, r.arm_a)}: "
-            f"Δ={r.mean_diff:.4f}, p_adj={r.p_perm_holm:.4g}"
+            f"Δ={r.mean_diff:.4f}, p_perm={r.p_perm:.4g}"
             for r in pmain.itertuples()) if not pmain.empty else "Không có kết quả metric chính")
         manifest["headline"] = line
         print(f"  {line}", flush=True)

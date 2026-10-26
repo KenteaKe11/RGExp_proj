@@ -33,7 +33,7 @@ def _tbl(headers: list[str], rows: list[list[str]]) -> str:
                      + ["| " + " | ".join(r) + " |" for r in rows])
 
 
-def normalize_pw(pw: pd.DataFrame) -> pd.DataFrame:
+def normalize_pw(pw: pd.DataFrame, alpha: float = 0.05) -> pd.DataFrame:
     """Bảng kiểm định về MỘT schema, bất kể ai đã ghi ra nó.
 
     `stats_ab` gọi hiệu số là `mean_diff` và kết luận là `winner`; `stats_friedman`
@@ -70,19 +70,19 @@ def normalize_pw(pw: pd.DataFrame) -> pd.DataFrame:
     for c in ("win_b", "win_a", "tie"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-    if "ci_excludes_zero" not in df.columns:
-        if {"ci_lo", "ci_hi"} <= set(df.columns):
-            df["ci_excludes_zero"] = (df["ci_lo"] > 0) | (df["ci_hi"] < 0)
-        else:
-            df["ci_excludes_zero"] = False
-    for c, default in (("significant", False), ("material", False),
-                       ("significant_and_material", False)):
-        if c not in df.columns:
-            df[c] = default
     for c in ("ci_lo", "ci_hi", "p_perm", "p_perm_holm", "p_boot", "cohen_dz",
               "mean_a", "mean_b"):
         if c not in df.columns:
             df[c] = np.nan
+        else:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "material" not in df.columns:
+        df["material"] = False
+    # Recompute so report-only runs also adopt the current rule when their
+    # ab_tests.csv was generated under the previous significance criterion.
+    df["ci_excludes_zero"] = (df["ci_lo"] > 0) | (df["ci_hi"] < 0)
+    df["significant"] = (df["p_perm"] < float(alpha)) & df["ci_excludes_zero"]
+    df["significant_and_material"] = df["significant"] & df["material"]
     return df
 
 
@@ -235,7 +235,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                    manifest: dict,
                    chexbert_comparison: pd.DataFrame | None = None,
                    confidence_summary: pd.DataFrame | None = None) -> str:
-    pw = normalize_pw(pw)
+    pw = normalize_pw(pw, float((cfg.get("stats") or {}).get("alpha", 0.05)))
     primary = str(cfg.get("metrics", {}).get("primary", "chexbert_f1"))
     if primary not in summary.columns:
         primary = next((c for c in summary.columns
@@ -356,9 +356,10 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("## Kiểm định thống kê riêng cho từng nhóm metric")
     A("")
     A("Trạng thái được xác định riêng cho từng chỉ số và từng cặp mô hình. Ghi "
-      "‘Có ý nghĩa’ khi cả p hoán vị và p bootstrap sau hiệu chỉnh Holm đều nhỏ hơn "
-      f"α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)} trong từng chỉ số; "
-      "các trường hợp còn lại ghi ‘Không có ý nghĩa’.")
+      "‘Có ý nghĩa’ khi p permutation thô < α và khoảng tin cậy bootstrap 95% không "
+      f"chứa 0 (α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)}). "
+      "p bootstrap và p permutation sau Holm được hiển thị để tham khảo; chúng không "
+      "thay thế quy tắc kết luận này.")
     A("")
     metric_groups = [
         ("BLEU", lambda m: str(m).lower().startswith("bleu")),
@@ -397,9 +398,11 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                     metric_names.get(str(r.get("metric")), str(r.get("metric"))),
                     f"{bb} − {aa}", _sf(r.get("mean_diff", r.get("diff"))),
                     f"[{_f(r.get('ci_lo'))}, {_f(r.get('ci_hi'))}]",
-                    _p(r.get("p_perm_holm")), _p(r.get("p_boot_holm")), status])
+                    _p(r.get("p_perm")), _p(r.get("p_perm_holm")),
+                    _p(r.get("p_boot_holm")), status])
             A(_tbl(["Chỉ số", "Cặp so sánh", "Chênh lệch trung bình", "Khoảng tin cậy 95%",
-                    "p hoán vị (Holm)", "p bootstrap (Holm)", "Trạng thái H₀"], table_rows))
+                    "p hoán vị", "p hoán vị (Holm)", "p bootstrap (Holm)",
+                    "Trạng thái H₀"], table_rows))
             A("")
     A("")
     A("## Chi tiết huấn luyện và kiến trúc")
@@ -456,7 +459,7 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     if primary not in metrics and metrics:
         primary = metrics[0]
 
-    pw = normalize_pw(pw)
+    pw = normalize_pw(pw, float((cfg.get("stats") or {}).get("alpha", 0.05)))
     summary = summary_table(scores, names, metrics, primary, cfg)
     summary.to_csv(mdir / "summary.csv", index=False)
     comparison = chexbert_head_report_bootstrap(scores, cfg)
@@ -465,6 +468,7 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     confidence.to_csv(mdir / "report_confidence_bootstrap.csv", index=False)
     if not pw.empty:
         pw.to_csv(mdir / "pairwise_tests.csv", index=False)
+        pw.to_csv(mdir / "ab_tests.csv", index=False)
     if train_stats:
         pd.json_normalize(train_stats).to_csv(mdir / "train_stats.csv", index=False)
 

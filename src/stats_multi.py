@@ -243,12 +243,16 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
             adj[pos] = holm(df.loc[idx, col].to_numpy())
         df[f"{col}_holm"] = adj
 
-    df["sig_perm"] = df["p_perm_holm"] < alpha
+    # Quy ước §2.3: ý nghĩa = permutation p thô dưới alpha VÀ CI bootstrap
+    # không chứa 0. p bootstrap không phải cổng kết luận; với bốn subset, p_boot
+    # đặc biệt thô và không được dùng để chặn kết quả.
+    df["sig_perm"] = df["p_perm"] < alpha
     df["sig_boot"] = df["p_boot_holm"] < alpha
     df["material"] = df["cohen_dz"].abs() >= dz_floor
-    df["significant"] = df["sig_perm"] & df["sig_boot"]
-    df["significant_and_material"] = df["significant"] & df["material"]
     df["ci_excludes_zero"] = (df["ci_lo"] > 0) | (df["ci_hi"] < 0)
+    df["sig_ci"] = df["ci_excludes_zero"]
+    df["significant"] = df["sig_perm"] & df["sig_ci"]
+    df["significant_and_material"] = df["significant"] & df["material"]
     df["winner"] = np.where(
         ~df["significant_and_material"], "—",
         np.where(df["mean_diff"] > 0, df["arm_b"], df["arm_a"]))
@@ -276,14 +280,14 @@ def summary_lines(df: pd.DataFrame, primary: str, names: dict[str, str]) -> list
         head = (f"`{primary}` · {nb} − {na} = {r.mean_diff:+.4f} "
                 f"(95% CI [{r.ci_lo:+.4f}, {r.ci_hi:+.4f}], dz={r.cohen_dz:.3f})")
         if not bool(r.significant):
-            out.append(f"{head} — KHÔNG bác được H0 (p_perm={r.p_perm_holm:.3g}, "
-                       f"p_boot={r.p_boot_holm:.3g} sau Holm).")
+            out.append(f"{head} — KHÔNG có ý nghĩa theo quy ước §2.3 "
+                       f"(p_perm={r.p_perm:.3g}; CI loại 0={bool(r.ci_excludes_zero)}).")
         elif not bool(r.material):
             out.append(f"{head} — có ý nghĩa thống kê nhưng |dz| dưới sàn: ở "
                        f"n={int(r.n)} đó là điều phải chờ đợi, không phải một "
                        f"phát hiện.")
         else:
             out.append(f"{head} — **{names.get(r.winner, r.winner)} thắng**, cả "
-                       f"permutation lẫn bootstrap đều bác H0 sau Holm "
+                       f"p permutation < α và CI bootstrap loại 0 "
                        f"(thắng {100 * r.win_rate_b:.1f}% số ảnh).")
     return out
