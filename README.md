@@ -37,6 +37,12 @@ bash scripts/run_recomb.sh --exp 2.3 --no-wandb --no-push
 Trước khi chạy đầy đủ, cài các gói phụ thuộc trong `requirements.txt`, gồm `f1chexbert`. Khi chạy lại, hệ thống ưu tiên khôi phục dữ liệu từ Hub trước, sau đó mới dùng dữ liệu cục bộ. Một số lệnh khác:
 
 ```bash
+# Kéo adapter đã huấn luyện và predictions của Candidate C từ Hub về local
+bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --pull --no-push --no-wandb
+
+# Sau khi lệnh pull báo đã có đủ trọng số, chỉ chạy suy luận Candidate C
+bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --stages infer --no-push --no-wandb
+
 # Chỉ tạo lại thống kê và báo cáo từ các điểm đã lưu
 bash scripts/run_recomb.sh --exp 2.3 --stages stats,report --no-wandb --no-push
 
@@ -50,11 +56,16 @@ bash scripts/run_recomb.sh --exp 2.3 --retrain --no-wandb --no-push
 bash scripts/retrain_candidate_c_and_push.sh --detach
 ```
 
+Lệnh `--pull` tải `adapters/<candidate>/` vào thư mục adapter cục bộ và tải
+`predictions/<candidate>.jsonl` vào thư mục kết quả. Nếu Hub chỉ có predictions
+mà chưa có adapter đầy đủ (LoRA, Recombinator và `train_stats.json`), lệnh sẽ
+báo thiếu trọng số; khi đó chưa thể suy luận trên máy mới.
+
 Do quy ước nhãn đã đổi, trọng số Recombinator cũ không còn hợp lệ. Để chỉ huấn luyện lại Candidate C trước:
 
 ```bash
-bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --stages data,train --no-wandb --no-push
-bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report --rescore --no-wandb --no-push
+bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --stages data,train --no-push
+bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report,push --rescore --no-wandb
 ```
 
 Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Có thể chọn mô hình bằng `--arms baseline_infer,lora_only,lora_recomb`; để so sánh đầy đủ cần chạy cả ba.

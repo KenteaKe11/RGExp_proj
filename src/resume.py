@@ -199,7 +199,8 @@ def hub_adapter_complete(rels: list[str], arm_id: str) -> bool:
             and ("adapter_model.safetensors" in names or "adapter_model.bin" in names))
 
 
-def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path) -> bool:
+def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path,
+                    *, needs_branch: bool = False, needs_experts: bool = False) -> bool:
     """Kéo adapter của một arm về `odir`. Dựng ở thư mục tạm, kiểm đủ file rồi mới đổi tên."""
     stage = odir.parent / f".restore_{arm_id}"
     if stage.exists():
@@ -218,6 +219,17 @@ def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path) -> bool:
         if stats.get("projector_adapter") and not (got / "projector_adapter.pt").exists():
             print(f"  ⚠ {arm_id}: adapter trên Hub thiếu projector_adapter.pt — bỏ", flush=True)
             return False
+        if needs_branch:
+            from . import recombiner
+            if not recombiner.branch_exists(got):
+                print(f"  ⚠ {arm_id}: adapter trên Hub thiếu trọng số Recombinator — bỏ",
+                      flush=True)
+                return False
+        if needs_experts:
+            from . import moe
+            if not moe.experts_exist(got):
+                print(f"  ⚠ {arm_id}: adapter trên Hub thiếu trọng số Experts — bỏ", flush=True)
+                return False
         if odir.exists():
             shutil.rmtree(odir)       # bản cục bộ dở dang (không có train_stats.json)
         odir.parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +240,55 @@ def restore_adapter(cfg: Cfg, arm_id: str, rels: list[str], odir: Path) -> bool:
         return False
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+
+
+def pull_artifacts_from_hub(cfg: Cfg, arms: list[dict], adapter_root: Path,
+                            pred_paths: dict[str, Path]) -> dict:
+    """Khôi phục trọng số đã train và predictions từ Hub về workspace hiện tại."""
+    if not hf_token():
+        raise ScanError("thiếu HF_TOKEN/HUGGING_FACE_HUB_TOKEN để đọc artifacts từ Hub.")
+    repo_id, _, subdir = _hub_target(cfg)
+    if not repo_id:
+        raise ScanError("output.hub_repo đang trống; không thể kéo artifacts.")
+    files = list_hub_files(cfg)
+    if not files:
+        raise ScanError(f"không tìm thấy artifacts trong Hub `{repo_id}/{subdir}`.")
+    result = {"repo": repo_id, "subdir": subdir, "adapters": {}, "predictions": {}}
+    adapter_root = Path(adapter_root)
+    for arm in arms:
+        aid = str(arm["id"])
+        odir = adapter_root / aid
+        if arm.get("infer_only"):
+            result["adapters"][aid] = "không cần trọng số huấn luyện"
+        else:
+            rels = hub_adapter_files(files, aid)
+            if not hub_adapter_complete(rels, aid):
+                result["adapters"][aid] = "không có hoặc thiếu file trên Hub"
+            elif restore_adapter(cfg, aid, rels, odir,
+                                 needs_branch=bool(arm.get("recomb")),
+                                 needs_experts=bool(arm.get("moe"))):
+                result["adapters"][aid] = "đã kéo trọng số huấn luyện"
+            else:
+                result["adapters"][aid] = "kéo thất bại hoặc thiếu thành phần"
+
+        rel = f"predictions/{aid}.jsonl"
+        if rel not in files:
+            result["predictions"][aid] = "không có trên Hub"
+            continue
+        stage = Path(pred_paths[aid]).parent / ".restore_preds_manual"
+        try:
+            got = _download(cfg, rel, stage)
+            had, imported = merge_predictions(Path(pred_paths[aid]), got,
+                                              prefer_other=True)
+            result["predictions"][aid] = f"đã đồng bộ; bản cục bộ trước đó có {had} mẫu"
+            print(f"  ↓ {aid}: đã kéo dự đoán từ Hub (cục bộ trước đó có {had} mẫu)",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            result["predictions"][aid] = f"lỗi: {e!r}"
+            print(f"  ⚠ {aid}: kéo dự đoán thất bại ({e!r})", flush=True)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return result
 
 
 # ── metadata cố định ────────────────────────────────────────────────────────
@@ -364,7 +425,9 @@ def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
         rels = hub_adapter_files(files, aid)
         if files and hub_adapter_complete(rels, aid):
             print(f"  ↓ {aid}: kéo adapter từ Hub ({len(rels)} file) thay vì train lại", flush=True)
-            ok = restore_adapter(cfg, aid, rels, odir)
+            ok = restore_adapter(cfg, aid, rels, odir,
+                                 needs_branch=bool(arm.get("recomb")),
+                                 needs_experts=bool(arm.get("moe")))
             avail[aid] = ok and already_trained(odir)
             info["adapters"][aid] = "restored_from_hub" if avail[aid] else "hub_incomplete"
         else:

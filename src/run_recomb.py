@@ -342,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
         help="8 ảnh, 4 bước huấn luyện, 200 lần mô phỏng, KHÔNG đẩy Hub.")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true", help="huấn luyện lại dù đã có")
+    ap.add_argument("--pull", action="store_true",
+                    help="chỉ kéo adapter đã huấn luyện và predictions từ Hub về local rồi thoát")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -416,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
     adapter_root = Path(str(cfg["output"].get("adapter_dir", "./adapters")))
+    pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
 
     manifest = {
@@ -427,6 +430,31 @@ def main(argv: list[str] | None = None) -> int:
         "moe": ({x["id"]: {"top_k": x["top_k"], "n_experts": x["n_experts"]}
                  for x in arms} if is_moe else None),
     }
+    if a.pull:
+        from . import resume as resume_mod
+
+        try:
+            pulled = resume_mod.pull_artifacts_from_hub(
+                cfg, arms, adapter_root, pred_paths)
+        except resume_mod.ScanError as e:
+            print(f"✗ Không kéo được artifacts từ Hub: {e}", flush=True)
+            return 5
+        manifest["hub_pull"] = pulled
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
+        print("\n✓ Đã hoàn tất lệnh kéo Hub.", flush=True)
+        for aid in pred_paths:
+            print(f"  {aid}: trọng số={pulled['adapters'].get(aid, '—')} · "
+                  f"dự đoán={pulled['predictions'].get(aid, '—')}", flush=True)
+        missing_adapters = [aid for aid in pred_paths
+                            if not any(token in str(pulled["adapters"].get(aid, ""))
+                                       for token in ("đã kéo", "không cần trọng số"))]
+        if missing_adapters:
+            print("✗ Chưa thể suy luận các candidate này vì Hub không có đủ adapter: "
+                  + ", ".join(missing_adapters), flush=True)
+            return 6
+        return 0
     t_start = time.time()
     hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
            if is_moe else
@@ -508,7 +536,6 @@ def main(argv: list[str] | None = None) -> int:
     # Hub là nguồn resume ưu tiên: đồng bộ adapter/predictions trước khi train,
     # infer hay score nhìn vào cache cục bộ. Lượt chạy chỉ lập báo cáo thì không
     # cần tải artifacts.
-    pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
     hub_predictions_changed = False
     if not a.dry_run and any(s in stages for s in ("train", "infer", "score")):
         from . import resume as resume_mod

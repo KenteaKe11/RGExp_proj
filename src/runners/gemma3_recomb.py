@@ -74,12 +74,12 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         stats_path = adapter_dir / "train_stats.json"
         if not adapter_dir.exists():
             raise RunnerUnusable(
-                f"không thấy adapter ở {adapter_dir}. Chạy stage `train` trước, "
-                f"hoặc `--stages train,infer,...`.")
+                f"không thấy adapter ở {adapter_dir}. Thử kéo trọng số từ Hub bằng "
+                "`--pull`; nếu Hub chưa có adapter này thì mới cần chạy stage `train`.")
         if not stats_path.exists():
             raise RunnerUnusable(
-                f"{adapter_dir} thiếu train_stats.json — adapter ghi dở. Xoá thư "
-                f"mục đó rồi chạy lại stage `train`.")
+                f"{adapter_dir} thiếu train_stats.json — adapter cục bộ không đầy đủ. "
+                "Thử `--pull` để khôi phục từ Hub; nếu Hub cũng thiếu file thì chạy lại stage `train`.")
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
 
         quantized = bool(stats.get("quantized", False))
