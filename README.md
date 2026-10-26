@@ -1,72 +1,79 @@
 ﻿# §2.3 — Recombinator và đánh giá lâm sàng
 
-Thí nghiệm so sánh ba candidate trên cùng pool 3.000 mẫu test: baseline Gemma 3 nguyên bản, QLoRA chỉ trên decoder, và Candidate C. C dùng QLoRA decoder như Candidate 2, thêm QDoRA rank 4 vào 1/4 layer cuối vision encoder, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và concat token của nhánh với token adapter cùng prompt embeddings. Candidate C có classification head nhưng không có Route Head hay MoE. Loss huấn luyện là `CE + 0.1 × ASL`, không warmup hệ số ASL.
+Thí nghiệm so sánh ba mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, và Candidate C. C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C có đầu phân loại nhưng không có đầu định tuyến hay MoE. Hàm mất mát là `CE + 0.1 × ASL`, không khởi động tăng dần hệ số ASL.
 
-Report kèm bảng CheXbert F1 của report sinh so với report gốc và của classification head so với nhãn CheXbert từ report gốc trên cùng 10 bootstrap subset; dòng cuối là trung bình cộng của 10 subset. Blank/uncertain được mask cho metric classification head.
+Quy ước nhãn dùng thống nhất khi huấn luyện và kiểm tra: nhãn dương và không chắc chắn được tính là dương; nhãn âm, nhãn trống và không được nhắc tới được tính là âm. Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại và hai bảng độ tự tin tương ứng. Mọi bảng dùng chung 10 tập lấy mẫu có hoàn lại, mỗi tập gồm 3.000 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 10 tập.
 
-Scoring có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức entity, partial entity-relation và complete entity-relation theo từng mẫu; các điểm được bootstrap cùng 10 subset. Primary metric vẫn là CheXbert F1.
+Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 10 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
 
-## Kiến trúc abstract tổng quát
+## Kiến trúc tổng quan
 
 ![Sơ đồ abstract tổng quát](docs/figures/fig1_overall_pipeline.png)
 
-Sơ đồ thể hiện kiến trúc đầy đủ với Classification Head, Route Head và Experts (LoRA). Trong §2.3, Candidate C chỉ dùng Classification Head; Route Head và Experts không được bật. Fusion của Candidate C chiếu token/feature Recombinator rồi concat với token ảnh adapter và prompt embeddings.
+Sơ đồ thể hiện kiến trúc tổng quát với đầu phân loại, đầu định tuyến và các chuyên gia LoRA. Trong §2.3, Candidate C chỉ dùng đầu phân loại; đầu định tuyến và các chuyên gia không được bật. Nhánh Candidate C chiếu token/đặc trưng Recombinator rồi nối với token ảnh đã qua bộ điều hợp và vector nhúng lời nhắc.
 
-Đầu phân loại nhận `(batch, 256, 1152)` từ Recombinator. Một query học được dùng multi-head attention (8 heads) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thẳng thành logits `(batch, 14, 2)`. Không còn bốn tầng pooling hay MLP ẩn trong ClsHead.
+Đầu phân loại nhận `(batch, 256, 1152)` từ Recombinator. Một truy vấn học được dùng chú ý đa đầu (8 đầu) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thẳng thành logits `(batch, 14, 2)`. Đầu phân loại không có bốn tầng gộp hay MLP ẩn.
 
-Local Extractor rút chuỗi 4.096 patch còn 256 token. Global Extractor dùng `Q=RMSNorm(local)`, `K/V=RMSNorm(vision gốc)` và trả `local + MHA(Q,K,V)`. FFN giữ chiều vision 1.152: `x + Linear(GELU(Linear(RMSNorm(x))))`, với MLP mở rộng `1.152→4×1.152→1.152`. Đầu ra này cấp cho attention pooling của ClsHead. Nhánh decoder chiếu token `256→128→64`, chiếu feature `1.152→2.560`, rồi concat với adapter ảnh và prompt embeddings.
+Hai bộ trích xuất cục bộ rút chuỗi 4.096 điểm ảnh thành 256 token. Bộ trích xuất toàn cục dùng `Q=RMSNorm(đặc trưng cục bộ)`, `K/V=RMSNorm(đặc trưng ảnh gốc)` và trả `local + MHA(Q,K,V)`. Mạng truyền thẳng giữ chiều ảnh 1.152: `x + Linear(GELU(Linear(RMSNorm(x))))`, với MLP mở rộng `1.152→4×1.152→1.152`. Đầu ra cấp cho phép gộp chú ý của đầu phân loại. Nhánh bộ giải mã chiếu token `256→128→64`, chiếu đặc trưng `1.152→2.560`, rồi nối với token ảnh và vector nhúng lời nhắc.
 
-## Quick start
+## Bắt đầu nhanh
 
-Các lệnh dưới đây chạy trong Bash (Linux, WSL hoặc container) từ thư mục gốc repo.
+Các lệnh dưới đây chạy trong Bash (Linux, WSL hoặc container) từ thư mục gốc dự án.
 
 ```bash
 # 1) Cài môi trường một lần
 bash scripts/setup.sh
 
-# 2) Cấp quyền tải Gemma 3 gated model và dataset
-export HF_TOKEN="<your Hugging Face token>"
+# 2) Cấp quyền tải Gemma 3 và bộ dữ liệu
+export HF_TOKEN="<mã truy cập Hugging Face>"
 
 # 3) Thử đường train nhỏ trước, không chạy infer/metrics
 bash scripts/run_recomb.sh --exp 2.3 --dry-run --stages data,train --no-wandb --no-push
 
-# 4) Chạy toàn bộ thí nghiệm: train, infer, score, stats, report
+# 4) Chạy toàn bộ thí nghiệm: huấn luyện, suy luận, chấm điểm, thống kê, báo cáo
 bash scripts/run_recomb.sh --exp 2.3 --no-wandb --no-push
 ```
 
-Trước lệnh đầy đủ, cài dependencies trong `requirements.txt`, gồm `f1chexbert`. Chạy lại cùng lệnh để tiếp tục từ artifacts đã có. Các lệnh hữu ích khác:
+Trước khi chạy đầy đủ, cài các gói phụ thuộc trong `requirements.txt`, gồm `f1chexbert`. Khi chạy lại, hệ thống ưu tiên khôi phục dữ liệu từ Hub trước, sau đó mới dùng dữ liệu cục bộ. Một số lệnh khác:
 
 ```bash
-# Chỉ tái tạo thống kê và REPORT.md từ các điểm đã lưu
+# Chỉ tạo lại thống kê và báo cáo từ các điểm đã lưu
 bash scripts/run_recomb.sh --exp 2.3 --stages stats,report --no-wandb --no-push
 
-# Chấm lại các prediction hiện có, rồi cập nhật thống kê và report
+# Chấm lại các dự đoán hiện có, rồi cập nhật thống kê và báo cáo
 bash scripts/run_recomb.sh --exp 2.3 --stages score,stats,report --rescore --no-wandb --no-push
 
-# Huấn luyện lại các candidate, rồi chạy các stage còn lại
+# Huấn luyện lại các mô hình, rồi chạy các bước còn lại
 bash scripts/run_recomb.sh --exp 2.3 --retrain --no-wandb --no-push
 
-# Retrain/infer riêng Candidate C, sau đó đánh giá đủ ba candidate và push ở nền
+# Huấn luyện/suy luận lại Candidate C, rồi đánh giá đủ ba mô hình và đẩy kết quả ở nền
 bash scripts/retrain_candidate_c_and_push.sh --detach
 ```
 
-Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Các candidate có thể chọn bằng `--arms baseline_infer,lora_only,lora_recomb`; để có so sánh hoàn chỉnh cần chạy đủ cả ba.
+Do quy ước nhãn đã đổi, trọng số Recombinator cũ không còn hợp lệ. Để chỉ huấn luyện lại Candidate C trước:
+
+```bash
+bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --stages data,train --no-wandb --no-push
+bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report --rescore --no-wandb --no-push
+```
+
+Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Có thể chọn mô hình bằng `--arms baseline_infer,lora_only,lora_recomb`; để so sánh đầy đủ cần chạy cả ba.
 
 ## Thiết lập hiện hành
 
-- **Nhãn phụ trợ:** CheXbert gán nhãn trực tiếp từ report gốc cho train/val. ASL dùng hai lớp `neg` và `pos`; uncertain và blank/unmentioned được mask.
-- **ASL:** dùng các giá trị mặc định của `AsymmetricLoss`: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
-- **Optimizer:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
-- **Batch:** thử microbatch `16, 12, 10, 8, 6, 4, 2, 1` khi gặp OOM; effective batch giữ đúng 32 bằng microbatch cuối nhỏ hơn khi cần. Candidate đầu chọn batch và candidate còn lại dùng cùng giá trị.
-- **Metric chính:** F1CheXbert micro trên 14 nhãn, tính riêng trong từng bootstrap subset 3.000 lượt lấy mẫu rồi lấy trung bình 10 F1. BLEU, ROUGE và BERTScore được giữ làm metric phụ.
-- **Đánh giá:** pool 3.000 ảnh được lấy theo seed từ test split, không chạy phần test còn lại. Tạo 10 bootstrap subset khác nhau bằng 10 seed riêng (`42`–`51`); mỗi subset gồm 3.000 lượt lấy mẫu có hoàn lại từ pool này. Cùng mười tập chỉ số được dùng cho cả ba candidate và mọi metric. Thống kê và report lấy trung bình qua 10 subset.
+- **Nhãn phụ trợ:** CheXbert gán nhãn trực tiếp từ báo cáo gốc cho tập huấn luyện và kiểm định. ASL dùng hai lớp âm/dương; nhãn dương và không chắc chắn được tính là dương, các trạng thái còn lại là âm. Không loại bỏ nhãn nào.
+- **ASL:** dùng các giá trị mặc định của hàm mất mát bất đối xứng: `gamma_neg=2`, `gamma_pos=0`, `clip=0.05`, `eps=1e-8`.
+- **Bộ tối ưu:** AdamW, `weight_decay=0.03`, `betas=(0.9, 0.95)`.
+- **Kích thước lô:** thử các lô nhỏ `16, 12, 10, 8, 6, 4, 2, 1` khi thiếu bộ nhớ; kích thước lô hiệu dụng luôn là 32. Mô hình đầu tiên chọn kích thước, các mô hình còn lại dùng cùng giá trị.
+- **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn, tính riêng trong mỗi tập lấy mẫu 3.000 lượt rồi lấy trung bình 10 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
+- **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra, không chạy phần còn lại của tập kiểm tra. Tạo 10 tập lấy mẫu khác nhau bằng 10 hạt giống (`42`–`51`); mỗi tập gồm 3.000 lượt lấy có hoàn lại. Cùng mười tập được dùng cho cả ba mô hình và mọi chỉ số.
 
-Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); entry point là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
+Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); lệnh khởi chạy là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
 ## CheXbert
 
-Metric gọi CheXbert qua thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để gán nhãn cả report gốc lẫn report sinh. Khi train Candidate C, nhãn ASL cũng được tạo trực tiếp từ report target bằng CheXbert, uncertain và blank/unmentioned được mask. Không cần checkout repo mã nguồn hay đặt checkpoint thủ công; lần đầu khởi tạo thư viện tải checkpoint CheXbert và tokenizer/model BERT vào cache môi trường.
+Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để gán nhãn cả báo cáo gốc lẫn báo cáo sinh. Khi huấn luyện Candidate C, nhãn ASL cũng được tạo trực tiếp từ báo cáo gốc bằng CheXbert, với quy ước nhãn dương/không chắc chắn là dương và mọi trạng thái khác là âm. Không cần tải mã nguồn hay đặt trọng số thủ công; lần đầu thư viện tự tải trọng số và mô hình BERT vào bộ nhớ đệm môi trường.
 
 ## Giới hạn thống kê
 
-Các ước lượng bootstrap dùng trung bình của 10 subset với seed riêng `42`–`51`, mỗi subset có 3.000 lượt lấy mẫu có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba candidate và mọi metric để bảo toàn so sánh ghép cặp. Report ghi số subset và kích thước từng subset.
+Các ước lượng lấy mẫu dùng trung bình của 10 tập với hạt giống riêng `42`–`51`, mỗi tập có 3.000 lượt lấy có hoàn lại. Ma trận chỉ số được chia sẻ giữa ba mô hình và mọi chỉ số để bảo toàn so sánh ghép cặp. Báo cáo ghi số tập và kích thước mỗi tập.

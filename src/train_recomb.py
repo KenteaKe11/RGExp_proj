@@ -307,23 +307,27 @@ def prepare_cls(cfg: Cfg, train_df: pd.DataFrame) -> dict | None:
     raw = chexbert_raw_classes(
         reports, batch_size=int(cfg.get("metrics", {}).get("chexbert", {}).get(
             "batch_size", 32)), device="cpu")
-    known = (raw == 1) | (raw == 2)  # mask uncertain (3) và blank/unmentioned (0)
+    # Quy ước chính thức §2.3: positive + uncertain -> dương; negative + blank
+    # / không được nhắc tới -> âm. Không mask trạng thái nào.
+    positive = (raw == 1) | (raw == 3)
     y = np.zeros((len(raw), n_labels, 2), dtype=np.float32)
-    y[..., 0] = (raw == 2).astype(np.float32)
-    y[..., 1] = (raw == 1).astype(np.float32)
-    mask = known.astype(np.float32)
-    n_cells = max(1, int(known.size))
+    y[..., 0] = (~positive).astype(np.float32)
+    y[..., 1] = positive.astype(np.float32)
+    mask = np.ones_like(raw, dtype=np.float32)
+    n_cells = max(1, int(positive.size))
     stats = {
         "n": len(reports), "n_labels": n_labels,
-        "label_source": "f1chexbert_from_reference_report/1",
-        "n_positive": int((raw == 1).sum()),
-        "n_negative": int((raw == 2).sum()),
-        "n_masked_uncertain_or_blank": int((~known).sum()),
-        "frac_masked": round(float((~known).sum()) / n_cells, 4),
+        "label_source": "f1chexbert_from_reference_report_binary_pos_uncertain/2",
+        "positive_policy": "positive_or_uncertain",
+        "negative_policy": "negative_blank_or_unmentioned",
+        "n_positive": int(positive.sum()),
+        "n_negative": int((~positive).sum()),
+        "n_masked_uncertain_or_blank": 0,
+        "frac_masked": 0.0,
         "label_names": list(CHEXBERT_LABELS),
     }
     print(f"  CheXbert target từ report gốc: {len(reports)} report · {n_labels} nhãn · "
-          f"mask uncertain/blank={stats['frac_masked']:.1%}", flush=True)
+          "pos+uncertain=positive · còn lại=negative · không mask", flush=True)
     return {"y": y, "mask": mask, "n_labels": n_labels, "stats": stats}
 
 
@@ -1237,7 +1241,8 @@ def already_trained(out_dir: Path, needs_branch: bool,
         try:
             train_stats = json.loads((d / "train_stats.json").read_text(encoding="utf-8"))
             label_stats = train_stats.get("cls_label_stats") or {}
-            ok = label_stats.get("label_source") == "f1chexbert_from_reference_report/1"
+            ok = label_stats.get("label_source") == (
+                "f1chexbert_from_reference_report_binary_pos_uncertain/2")
         except (OSError, ValueError, TypeError):
             ok = False
     return bool(ok)

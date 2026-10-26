@@ -289,7 +289,7 @@ classifier:
   feed_logits_to_decoder: false
 
   n_labels: 14                   # CheXbert 14 labels, derived from reports
-  n_classes: 2                   # neg / pos; uncertain/blank masked
+  n_classes: 2                   # âm / dương; dương = positive hoặc uncertain
   attn_pool_heads: 8
   hidden: 1024
   dropout: 0.1
@@ -301,8 +301,8 @@ classifier:
   asl:
     # gamma_neg áp cho ô có NHÃN = 0, gamma_pos cho ô có NHÃN = 1 — theo GIÁ TRỊ
     # NHÃN, không theo tên lớp. Với one-hot 3 chiều, mỗi bệnh lý có đúng 1 ô
-    # dương và 2 ô âm; lớp `neg` bật ở phần lớn bệnh lý nên hai ô pos/uncertain
-    # gần như luôn mang nhãn 0 và dễ tới mức áp đảo tổng gradient.
+    # dương và 2 ô âm. Mọi trạng thái CheXbert uncertain gộp vào dương; negative,
+    # blank và không nhắc tới gộp vào âm.
     gamma_neg: 2.0
     gamma_pos: 0.0
     # clip dịch xác suất ô âm xuống trước khi lấy log: ô âm mà model đã cho
@@ -449,16 +449,16 @@ arms_moe:
 # Danh sách này là thứ tự TRÌNH BÀY trong báo cáo.
 arms:
   - id: baseline_infer
-    name: "Baseline inference"
+    name: "Mô hình Gemma 3 gốc"
     recomb: false
     infer_only: true
     enabled: true
   - id: lora_only
-    name: "QLoRA only decoder"
+    name: "QLoRA chỉ trên bộ giải mã"
     recomb: false
     enabled: true
   - id: lora_recomb
-    name: "QDoRA last-quarter vision + frozen projector + QLoRA + Recombinator + classifier"
+    name: "QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh + Recombinator + đầu phân loại"
     recomb: true
     capture_cls_head: true
     train_projector: false

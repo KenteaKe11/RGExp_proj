@@ -505,6 +505,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚙ dùng lại manifest test: {len(test_df)} mẫu", flush=True)
     tracker.summary({"data/n_test": len(test_df)})
 
+    # Hub là nguồn resume ưu tiên: đồng bộ adapter/predictions trước khi train,
+    # infer hay score nhìn vào cache cục bộ. Lượt chạy chỉ lập báo cáo thì không
+    # cần tải artifacts.
+    pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
+    hub_predictions_changed = False
+    if not a.dry_run and any(s in stages for s in ("train", "infer", "score")):
+        from . import resume as resume_mod
+
+        baseline_id = next((x["id"] for x in arms if x.get("infer_only")), None)
+        try:
+            resume_info = resume_mod.scan_and_restore(
+                cfg, arms, adapter_root, pred_paths, baseline_id, test_df, run_dir,
+                retrain=bool(a.retrain), need_train=need_train_run, prefer_hub=True)
+            manifest["hub_resume"] = resume_info
+            hub_predictions_changed = bool(resume_info.get("predictions_imported", 0))
+        except resume_mod.ScanError as e:
+            print(f"✗ Không thể ưu tiên resume từ Hub: {e}", flush=True)
+            tracker.alert("§2.3 dừng khi resume Hub", str(e), "ERROR")
+            tracker.finish(1)
+            return 5
+
     # ── train ───────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if need_train_run:
@@ -651,7 +672,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
     # ── infer ───────────────────────────────────────────────────────────────
-    pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
     if "infer" in stages:
         _hr("Sinh báo cáo")
         from .runners import build
@@ -692,18 +712,19 @@ def main(argv: list[str] | None = None) -> int:
         for arm in arms:
             aid = arm["id"]
             csv_path = mdir / f"per_sample_{aid}.csv"
-            if csv_path.exists() and not a.rescore:
+            if csv_path.exists() and not a.rescore and not hub_predictions_changed:
                 cached = pd.read_csv(csv_path)
                 counts_ready = (all(c in cached.columns for c in
                                     ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
                                 and "chexbert_gold_source" in cached.columns
                                 and cached["chexbert_gold_source"].eq(
-                                    "f1chexbert_reference_report/1").all())
+                                    "f1chexbert_reference_report_binary_pos_uncertain/2").all())
                 cls_counts_ready = (not arm.get("capture_cls_head", False) or all(
                     c in cached.columns for c in
                     ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
                      "cls_head_chexbert_fn", "cls_head_report_agree",
-                     "cls_head_report_n_labels")))
+                     "cls_head_report_n_labels", "chexbert_confidence",
+                     "cls_head_confidence")))
                 radgraph_cols = ("radgraph_f1_entity", "radgraph_f1_partial",
                                  "radgraph_f1_complete")
                 radgraph_ready = (not cfg.get("metrics", {}).get("radgraph", {}).get(
@@ -723,19 +744,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ⚠ [{aid}] không có dự đoán nào", flush=True)
                 continue
             cls_predictions = None
+            cls_confidence = None
             if arm.get("capture_cls_head", False):
                 missing_cls = [k for k in keys
-                               if "cls_head_pred" not in pred_records[str(k)]]
+                               if "cls_head_pred" not in pred_records[str(k)]
+                               or "cls_head_confidence" not in pred_records[str(k)]]
                 if missing_cls:
                     raise ValueError(
-                        f"{aid} thiếu cls_head_pred ở {len(missing_cls)} prediction. "
+                        f"{aid} thiếu cls_head_pred/cls_head_confidence ở "
+                        f"{len(missing_cls)} prediction. "
                         "Chạy lại stage infer để lưu dự đoán của classification head, "
                         "rồi chạy score,stats,report.")
                 cls_predictions = [pred_records[str(k)]["cls_head_pred"] for k in keys]
+                cls_confidence = [pred_records[str(k)]["cls_head_confidence"] for k in keys]
             sdf, _c = score_model(
                 cfg, keys, [pred_records[str(k)].get("pred", "") for k in keys],
                 [ref_map[k] for k in keys], label=aid,
-                cls_head_predictions=cls_predictions)
+                cls_head_predictions=cls_predictions,
+                cls_head_confidence=cls_confidence)
             sdf.to_csv(csv_path, index=False)
             scores[aid] = sdf
             score_summary = {f"score/{aid}/{k}": float(sdf[k].mean())
@@ -769,7 +795,7 @@ def main(argv: list[str] | None = None) -> int:
                              ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
                          and "chexbert_gold_source" in df.columns
                          and df["chexbert_gold_source"].eq(
-                             "f1chexbert_reference_report/1").all())
+                             "f1chexbert_reference_report_binary_pos_uncertain/2").all())
                     for df in scores.values())):
         raise ValueError(
             "Điểm CheXbert đã lưu theo nguồn gold cũ/schema cũ; cần gán nhãn lại "

@@ -25,7 +25,7 @@ CHEXBERT_LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
                    "Lung Lesion", "Edema", "Consolidation", "Pneumonia", "Atelectasis",
                    "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
                    "Support Devices", "No Finding"]
-CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report/1"
+CHEXBERT_GOLD_SOURCE = "f1chexbert_reference_report_binary_pos_uncertain/2"
 _CHEXBERT_LABELER = None
 _RADGRAPH_LABELER = None
 
@@ -160,7 +160,8 @@ def _radgraph_f1(hyps: list[str], refs: list[str], cfg: dict) -> dict[str, np.nd
 
 
 def _raw_classes_with_labeler(labeler, reports: list[str],
-                              batch_size: int = 32) -> np.ndarray:
+                              batch_size: int = 32,
+                              return_binary_confidence: bool = False):
     import torch
 
     tokenizer = getattr(labeler, "tokenizer", None)
@@ -173,6 +174,7 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
     model.eval()
     dev = getattr(labeler, "device", next(model.parameters()).device)
     chunks: list[np.ndarray] = []
+    confidence_chunks: list[np.ndarray] = []
     size = max(1, int(batch_size))
     for start in range(0, len(reports), size):
         enc = tokenizer(reports[start:start + size], padding=True, truncation=True,
@@ -195,27 +197,64 @@ def _raw_classes_with_labeler(labeler, reports: list[str],
         if isinstance(logits, (tuple, list)):
             if len(logits) != 14:
                 raise ValueError(f"CheXbert returned {len(logits)} heads; expected 14.")
-            states = torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
+            head_logits = list(logits)
+            states = torch.stack([head.argmax(dim=-1) for head in head_logits], dim=1)
+            if return_binary_confidence:
+                head_confidence = []
+                for j, head in enumerate(head_logits):
+                    head_probs = torch.softmax(head.float(), dim=-1)
+                    if j == 13 or head_probs.shape[-1] < 4:
+                        pos_prob = head_probs[:, 1]
+                        predicted_positive = head.argmax(dim=-1) == 1
+                    else:
+                        pos_prob = head_probs[:, 1] + head_probs[:, 3]
+                        state = head.argmax(dim=-1)
+                        predicted_positive = (state == 1) | (state == 3)
+                    head_confidence.append(torch.where(
+                        predicted_positive, pos_prob, 1.0 - pos_prob))
+                conf = torch.stack(head_confidence, dim=1)
         else:
             if logits.ndim != 3 or logits.shape[1] != 14:
                 raise ValueError(
                     "CheXbert logits must be a list of 14 heads or a "
                     f"(batch, 14, classes) tensor; got {tuple(logits.shape)}.")
+            probs = torch.softmax(logits.float(), dim=-1)
             states = logits.argmax(dim=-1)
+            if return_binary_confidence:
+                # Quy ước §2.3: positive + uncertain -> dương; negative + blank -> âm.
+                pos_prob = (probs[..., 1] + probs[..., 3] if probs.shape[-1] >= 4
+                            else probs[..., 1]).clone()
+                if probs.shape[-1] >= 4:
+                    pos_prob[:, 13] = probs[:, 13, 1]
+                    predicted_positive = (states == 1) | (states == 3)
+                    predicted_positive[:, 13] = states[:, 13] == 1
+                else:
+                    predicted_positive = states == 1
+                conf = torch.where(predicted_positive, pos_prob, 1.0 - pos_prob)
         states = states.cpu().numpy().astype(np.int64, copy=False)
         if states.shape[1] != 14:
             raise ValueError(f"CheXbert returned {states.shape[1]} heads; expected 14.")
         states[:, 13] = np.where(states[:, 13] == 1, 1, 2)
         chunks.append(states)
-    return np.concatenate(chunks, axis=0) if chunks else np.empty((0, 14), dtype=np.int64)
+        if return_binary_confidence:
+            # Confidence của nhãn nhị phân được dự đoán, không phải độ tự tin
+            # vào một trong bốn lớp trạng thái gốc của CheXbert.
+            confidence_chunks.append(conf.cpu().numpy().astype(np.float32, copy=False))
+    states_out = (np.concatenate(chunks, axis=0) if chunks
+                  else np.empty((0, 14), dtype=np.int64))
+    if return_binary_confidence:
+        confidence_out = (np.concatenate(confidence_chunks, axis=0) if chunks
+                          else np.empty((0, 14), dtype=np.float32))
+        return states_out, confidence_out
+    return states_out
 
 
 def chexbert_raw_classes(reports: list[str], batch_size: int = 32,
                          device: str = "cpu") -> np.ndarray:
-    """Raw classes: blank=0,pos=1,neg=2,uncertain=3 for ASL target masking.
+    """Trả trạng thái CheXbert gốc: trống=0, dương=1, âm=2, không chắc=3.
 
-    The final No Finding head is binary, so state 0 is mapped to common
-    negative=2. A local CPU labeler avoids reserving training GPU memory.
+    Đầu No Finding cuối cùng vốn nhị phân nên trạng thái 0 được đổi thành âm=2.
+    Bộ gán nhãn chạy trên CPU để không chiếm bộ nhớ GPU khi huấn luyện.
     """
     labeler = _new_chexbert_labeler(device)
     states = _raw_classes_with_labeler(labeler, reports, batch_size)
@@ -306,7 +345,8 @@ def _bertscore(hyps: list[str], refs: list[str], bcfg: dict) -> dict:
 
 
 def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
-                 cls_head_predictions=None) -> dict[str, np.ndarray]:
+                 cls_head_predictions=None,
+                 cls_head_confidence=None) -> dict[str, np.ndarray]:
     """Per-report confusion counts from CheXbert labels.
 
     The original/reference report is the gold source; no dataset label file is
@@ -317,23 +357,25 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
     n = len(refs)
     labeler = _get_chexbert_labeler(cfg)
 
-    raw = _raw_classes_with_labeler(labeler, list(refs) + list(hyps),
-                                    int(cfg.get("batch_size", 32)))
-    # f1chexbert's RRG binary mapping: Positive and Uncertain -> positive;
-    # Negative and not mentioned -> negative. No Finding has a binary head.
+    raw, binary_confidence = _raw_classes_with_labeler(
+        labeler, list(refs) + list(hyps), int(cfg.get("batch_size", 32)),
+        return_binary_confidence=True)
+    # Quy ước §2.3: positive và uncertain -> dương; negative, blank và không
+    # được nhắc tới -> âm. Đầu No Finding vốn chỉ có hai trạng thái.
     labels = np.zeros_like(raw, dtype=np.float64)
     labels[:, :13] = ((raw[:, :13] == 1) | (raw[:, :13] == 3)).astype(np.float64)
     labels[:, 13] = (raw[:, 13] == 1).astype(np.float64)
     gold, pred = labels[:n], labels[n:]
-    known = np.isin(gold, (0, 1)) & np.isin(pred, (0, 1))
-    gpos, ppos = (gold == 1) & known, (pred == 1) & known
+    gpos, ppos = gold == 1, pred == 1
     tp = np.sum(gpos & ppos, axis=1).astype(np.float64)
-    fp = np.sum(~gpos & ppos & known, axis=1).astype(np.float64)
-    fn = np.sum(gpos & ~ppos & known, axis=1).astype(np.float64)
+    fp = np.sum(~gpos & ppos, axis=1).astype(np.float64)
+    fn = np.sum(gpos & ~ppos, axis=1).astype(np.float64)
     den = 2 * tp + fp + fn
     per_report = np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
     out = {"chexbert_f1": per_report, "chexbert_tp": tp,
            "chexbert_fp": fp, "chexbert_fn": fn}
+    # Mức tự tin trung bình trên 14 nhãn nhị phân, tính trên report sinh.
+    out["chexbert_confidence"] = binary_confidence[n:].mean(axis=1).astype(float)
     if cls_head_predictions is not None:
         head = np.asarray(cls_head_predictions, dtype=np.int64)
         if head.shape != (n, len(CHEXBERT_LABELS)):
@@ -343,21 +385,29 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
         if not np.isin(head, (0, 1)).all():
             raise ValueError("cls_head_predictions chỉ được chứa class 0=neg hoặc 1=pos.")
         ref_raw = raw[:n]
-        known = (ref_raw == 1) | (ref_raw == 2)
-        gold_pos = (ref_raw == 1) & known
-        head_pos = (head == 1) & known
+        gold_pos = (ref_raw == 1) | (ref_raw == 3)
+        head_pos = head == 1
         out["cls_head_chexbert_tp"] = np.sum(gold_pos & head_pos, axis=1).astype(float)
-        out["cls_head_chexbert_fp"] = np.sum(~gold_pos & head_pos & known, axis=1).astype(float)
-        out["cls_head_chexbert_fn"] = np.sum(gold_pos & ~head_pos & known, axis=1).astype(float)
-        out["cls_head_report_agree"] = np.sum(head == pred, axis=1).astype(float)
+        out["cls_head_chexbert_fp"] = np.sum(~gold_pos & head_pos, axis=1).astype(float)
+        out["cls_head_chexbert_fn"] = np.sum(gold_pos & ~head_pos, axis=1).astype(float)
+        report_pos = (raw[n:] == 1) | (raw[n:] == 3)
+        out["cls_head_report_agree"] = np.sum(head == report_pos, axis=1).astype(float)
         out["cls_head_report_n_labels"] = np.full(n, head.shape[1], dtype=float)
+        if cls_head_confidence is not None:
+            head_conf = np.asarray(cls_head_confidence, dtype=np.float64)
+            if head_conf.shape != (n, len(CHEXBERT_LABELS)):
+                raise ValueError(f"cls_head_confidence cần shape {(n, len(CHEXBERT_LABELS))}, nhận {head_conf.shape}.")
+            if not np.isfinite(head_conf).all() or (head_conf < 0).any() or (head_conf > 1).any():
+                raise ValueError("cls_head_confidence phải hữu hạn trong [0, 1].")
+            out["cls_head_confidence"] = head_conf.mean(axis=1)
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
                 refs_raw: list[str], label: str = "",
-                cls_head_predictions=None) -> tuple[pd.DataFrame, dict]:
+                cls_head_predictions=None,
+                cls_head_confidence=None) -> tuple[pd.DataFrame, dict]:
     """Trả (bảng điểm theo mẫu, các số corpus-level)."""
     mcfg = cfg["metrics"]
     ncfg = dict(mcfg.get("normalize", {}))
@@ -380,7 +430,8 @@ def score_model(cfg: Cfg, keys: list[str], hyps_raw: list[str],
     ccfg = dict(mcfg.get("chexbert", {}))
     if ccfg.get("enabled", False):
         print(f"  [{label}] CheXbert clinical F1 ...", flush=True)
-        cols.update(_chexbert_f1(hyps, refs, ccfg, cls_head_predictions))
+        cols.update(_chexbert_f1(hyps, refs, ccfg, cls_head_predictions,
+                                 cls_head_confidence))
         cols["chexbert_gold_source"] = np.full(
             len(keys), CHEXBERT_GOLD_SOURCE, dtype=object)
 
@@ -410,5 +461,6 @@ def metric_columns(df: pd.DataFrame) -> list[str]:
             "cls_head_chexbert_tp", "cls_head_chexbert_fp",
             "cls_head_chexbert_fn", "cls_head_report_agree",
             "cls_head_report_n_labels",
+            "chexbert_confidence", "cls_head_confidence",
             "chexbert_gold_source"}
     return [c for c in df.columns if c not in skip]

@@ -122,22 +122,20 @@ def read_pred_rows(path: Path) -> dict[str, str]:
     return out
 
 
-def merge_predictions(local: Path, other: Path) -> tuple[int, int]:
-    """Gộp `other` vào `local` theo key; bản cục bộ thắng khi trùng key.
-
-    Trả (số key cục bộ trước đó, số key mới được thêm). Chỉ ghi lại khi có key mới,
-    và ghi nguyên tử — không bao giờ để file cục bộ ở trạng thái nửa vời.
-    """
+def merge_predictions(local: Path, other: Path, *, prefer_other: bool = False) -> tuple[int, int]:
+    """Gộp `other` vào `local`; có thể ưu tiên dữ liệu Hub khi trùng key."""
     from .runners.base import repair_tail
 
     repair_tail(local)
     mine = read_pred_rows(local)
     theirs = read_pred_rows(other)
     add = {k: v for k, v in theirs.items() if k not in mine}
-    if add:
-        merged = {**mine, **add}
+    replace = {k for k in mine.keys() & theirs.keys()
+               if prefer_other and mine[k] != theirs[k]}
+    if add or replace:
+        merged = ({**mine, **theirs} if prefer_other else {**mine, **add})
         _atomic_write_text(local, "".join(v + "\n" for v in merged.values()))
-    return len(mine), len(add)
+    return len(mine), len(add) + len(replace)
 
 
 # ── quét Hub ────────────────────────────────────────────────────────────────
@@ -313,7 +311,7 @@ def merge_meta(a: dict | None, b: dict | None) -> dict | None:
 def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
                      pred_paths: dict[str, Path], baseline_id: str | None,
                      test_df: pd.DataFrame, run_dir: Path, *, retrain: bool = False,
-                     need_train: bool = True) -> dict:
+                     need_train: bool = True, prefer_hub: bool = False) -> dict:
     """Quét Hub, kéo adapter/predictions còn thiếu, lưu metadata cố định.
 
     Trả dict tóm tắt (đưa vào manifest). Ném ScanError CHỈ khi quét lỗi VÀ có arm phải
@@ -324,10 +322,11 @@ def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
     adapter_root = Path(adapter_root)
     mpath = Path(run_dir) / meta_name(cfg)
     test_keys = [str(k) for k in test_df["key"]]
-    info: dict = {"status": "ok", "adapters": {}, "predictions": {}, "meta": str(mpath)}
+    info: dict = {"status": "ok", "adapters": {}, "predictions": {},
+                  "predictions_imported": 0, "meta": str(mpath)}
     o = cfg.get("output", {})
-    can_hub = bool(o.get("push", False)) and bool(str(o.get("hub_repo", "")).strip()) \
-        and bool(hf_token())
+    can_hub = (bool(prefer_hub) or bool(o.get("push", False))) \
+        and bool(str(o.get("hub_repo", "")).strip()) and bool(hf_token())
 
     files: dict[str, int] = {}
     if can_hub:
@@ -354,7 +353,7 @@ def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
     for arm in arms:
         aid = arm["id"]
         odir = adapter_root / aid
-        if already_trained(odir) and not retrain:
+        if already_trained(odir) and not retrain and not prefer_hub:
             avail[aid] = True
             info["adapters"][aid] = "local"
             continue
@@ -369,8 +368,9 @@ def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
             avail[aid] = ok and already_trained(odir)
             info["adapters"][aid] = "restored_from_hub" if avail[aid] else "hub_incomplete"
         else:
-            avail[aid] = False
-            info["adapters"][aid] = "missing (sẽ train)"
+            avail[aid] = already_trained(odir) and not retrain
+            info["adapters"][aid] = ("local_fallback" if avail[aid]
+                                      else "missing (sẽ train)")
 
     # 2) Predictions: gộp bản Hub vào cục bộ — chỉ cho model có adapter hợp lệ.
     sources: dict[str, str] = {}
@@ -392,10 +392,11 @@ def scan_and_restore(cfg: Cfg, arms: list[dict], adapter_root: Path,
         stage = Path(run_dir) / ".restore_preds"
         try:
             got = _download(cfg, rel, stage)
-            had, added = merge_predictions(pp, got)
+            had, added = merge_predictions(pp, got, prefer_other=prefer_hub)
             sources[mid] = "merged" if (had and added) else ("hub" if added else "local")
             info["predictions"][mid] = f"local={had} +hub={added}"
             if added:
+                info["predictions_imported"] += added
                 print(f"  ↓ {mid}: +{added} mẫu từ Hub (cục bộ đã có {had})", flush=True)
         except Exception as e:  # noqa: BLE001
             info["predictions"][mid] = f"hub_download_failed: {e!r}"
