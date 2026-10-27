@@ -365,6 +365,10 @@ def _chexbert_f1(hyps: list[str], refs: list[str], cfg: dict,
     per_report = np.divide(2 * tp, den, out=np.zeros(n, dtype=np.float64), where=den > 0)
     out = {"chexbert_f1": per_report, "chexbert_tp": tp,
            "chexbert_fp": fp, "chexbert_fn": fn}
+    for j in range(len(CHEXBERT_LABELS)):
+        out[f"chexbert_label_{j:02d}_tp"] = (gold_pos[:, j] & pred_pos[:, j]).astype(float)
+        out[f"chexbert_label_{j:02d}_fp"] = (~gold_pos[:, j] & pred_pos[:, j]).astype(float)
+        out[f"chexbert_label_{j:02d}_fn"] = (gold_pos[:, j] & ~pred_pos[:, j]).astype(float)
     # Blank cũng được xem là dự đoán âm nên confidence bao gồm đủ 14 nhãn.
     binary_confidence = np.maximum(positive_probability[n:],
                                    1.0 - positive_probability[n:])
@@ -454,4 +458,6 @@ def metric_columns(df: pd.DataFrame) -> list[str]:
             "cls_head_report_n_labels",
             "chexbert_confidence", "cls_head_confidence",
             "chexbert_gold_source"}
-    return [c for c in df.columns if c not in skip]
+    return [c for c in df.columns
+            if c not in skip and not c.startswith("chexbert_label_")
+            and c != "route_experts"]

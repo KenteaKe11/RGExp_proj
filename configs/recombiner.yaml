@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §2.3 — Baseline, QLoRA, Recombinator và MoE-LoRA
+# §2.3 — Baseline, QLoRA, Recombinator, MoE-LoRA và shared LoRA
 # ═══════════════════════════════════════════════════════════════════════════
 # Câu hỏi của mục này, viết đủ một câu:
 #
@@ -10,6 +10,7 @@
 #     lora_only       QLoRA chỉ trên decoder
 #     lora_recomb     QLoRA decoder + QDoRA vision + Recombinator + ClsHead
 #     moe_lora        MoE-LoRA decoder + Route + QDoRA vision + Recombinator + ClsHead
+#     moe_shared_lora 20% đầu huấn luyện như C; sau đó shared LoRA + Route/Experts MoE
 #
 # Cùng base, dữ liệu, seed, lịch và batch. Các candidate được thêm tuần tự để
 # đo riêng hiệu ứng của nhánh Recombinator và thay decoder LoRA bằng MoE-LoRA.
@@ -23,7 +24,7 @@
 # 1. DÒ BATCH TỪ 16. Candidate C thử lần lượt 16, 12, 10, 8, 6, 4, 2, 1;
 #    nếu OOM thì khởi động lại candidate đó ở nấc kế. Batch hiệu dụng luôn đúng 32.
 # 2. Candidate C chỉ QDoRA 1/4 layer cuối vision và đóng băng projector; fusion chiếu rồi concat.
-# 3. Bốn candidate dùng chung manifest test; 4 bootstrap subset dùng 4 seed riêng.
+# 3. Các candidate dùng chung manifest test; 4 bootstrap subset dùng 4 seed riêng.
 # ═══════════════════════════════════════════════════════════════════════════
 
 seed: 42
@@ -31,7 +32,7 @@ seed: 42
 # ═══════════════════════════════════════════════════════════════════════════
 # HAI THÍ NGHIỆM, MỘT FILE CẤU HÌNH
 # ═══════════════════════════════════════════════════════════════════════════
-#   2.3  So sánh bốn candidate: baseline, QLoRA, QLoRA + nhánh, MoE-LoRA + nhánh
+#   2.3  So sánh năm candidate: baseline, QLoRA, Recombinator, MoE và MoE + shared LoRA
 #        -> bootstrap ghép cặp + permutation.
 #   2.4  Cấu hình MoE nào tốt hơn?           5 cặp (top-k, n_experts)
 #        k = 5 -> Friedman + hậu kiểm Wilcoxon/Holm.
@@ -433,7 +434,7 @@ arms_moe:
   - {id: k6_e8,  name: "K=6 · E=8",  top_k: 6, n_experts: 8,  enabled: true}
   - {id: k6_e10, name: "K=6 · E=10", top_k: 6, n_experts: 10, enabled: true}
 
-# ── BỐN CANDIDATE ───────────────────────────────────────────────────────────
+# ── NĂM CANDIDATE ──────────────────────────────────────────────────────────
 # Candidate D giữ Recombinator/ClsHead/QDoRA vision của C, thay QLoRA decoder
 # bằng Experts MoE-LoRA chỉ trên q/k/v/o của attention decoder và bật Route
 # Head: attention pooling về vector d=1152, chiếu thành E logits.
@@ -457,7 +458,7 @@ arms:
   - id: lora_recomb
     name: "QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh + Recombinator + đầu phân loại"
     recomb: true
-    capture_cls_head: true
+    capture_cls_head: false
     train_projector: false
     enabled: true
   - id: moe_lora
@@ -468,7 +469,21 @@ arms:
     n_experts: 10
     route_pooling: attention
     all_linear_targets: false
-    capture_cls_head: true
+    capture_cls_head: false
+    train_projector: false
+    enabled: true
+  - id: moe_shared_lora
+    name: "MoE-LoRA + shared LoRA decoder + Route + Recombinator"
+    recomb: true
+    moe: true
+    top_k: 6
+    n_experts: 10
+    route_pooling: attention
+    all_linear_targets: false
+    shared_lora: true
+    shared_warmup_mode: candidate_c
+    shared_warmup_pct: 0.2
+    capture_cls_head: false
     train_projector: false
     enabled: true
 metrics:

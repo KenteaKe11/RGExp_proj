@@ -1,6 +1,6 @@
 """§2.3 và §2.4 — trọn một thí nghiệm trong MỘT lệnh. Chọn bằng `--exp`.
 
-    python -m src.run_recomb --exp 2.3        # 4 candidate: baseline, QLoRA, Recombinator, MoE-LoRA
+    python -m src.run_recomb --exp 2.3        # 5 candidate: baseline, QLoRA, Recombinator, MoE-LoRA và shared LoRA
     python -m src.run_recomb --exp 2.4        # 5 cấu hình (top-k, n_experts)
     python -m src.run_recomb --exp 2.4 --dry-run
     python -m src.run_recomb --exp 2.4 --stages stats,report
@@ -22,7 +22,7 @@ Hai mã thoát nghĩa là "kết quả còn nguyên, chỉ bước cuối hỏng
 ── HAI THÍ NGHIỆM, MỘT ĐƯỜNG CODE ──────────────────────────────────────────
 Khác nhau đúng ba chỗ, và cả ba đều hiện ra trong file này:
 
-  1. DANH SÁCH CANDIDATE. §2.3 đọc `arms` (4 candidate; `recomb` và `moe` chọn nhánh);
+  1. DANH SÁCH CANDIDATE. §2.3 đọc `arms` (5 candidate; `recomb` và `moe` chọn nhánh);
      §2.4 đọc `arms_moe` (5 candidate, (top_k, n_experts) phân biệt) và MỌI
      candidate đều có `recomb = True` — §2.4 luôn dùng concat.
   2. THỨ TỰ CHẠY. §2.3: MoE-LoRA trước, rồi các candidate có nhánh. §2.4: candidate NẶNG nhất trước.
@@ -172,7 +172,10 @@ def cache_state(arms: list[dict], adapter_root: Path, run_dir: Path) -> dict:
                                      bool(arm.get("recomb")),
                                      bool(arm.get("moe")),
                                      {k: arm[k] for k in
-                                      ("route_pooling", "all_linear_targets")
+                                     ("top_k", "n_experts", "route_pooling",
+                                      "all_linear_targets", "shared_lora",
+                                      "shared_rank", "shared_alpha",
+                                      "shared_warmup_mode", "shared_warmup_pct")
                                       if k in arm} or None)),
             "n_preds": _count_preds(run_dir / "predictions" / f"{aid}.jsonl"),
             "scored": (mdir / f"per_sample_{aid}.csv").exists(),
@@ -328,18 +331,19 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
         # vốn đã bị tắt, nhưng đây phải là một quyết định, không phải may mắn.)
         "merge_adapter": False,
         "capture_cls_head": bool(arm.get("capture_cls_head", False)),
+        "moe": bool(arm.get("moe", False)),
         "optional": False,
     })
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="§2.3 (bốn candidate, có MoE-LoRA) hoặc §2.4 (MoE, 5 cấu hình) — "
+        description="§2.3 (năm candidate, có MoE-LoRA và shared LoRA) hoặc §2.4 (MoE, 5 cấu hình) — "
                     "trọn gói, chọn bằng --exp.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
     ap.add_argument("--exp", default=None, choices=list(EXPERIMENTS),
-                    help="2.3 = bốn candidate (bootstrap+permutation); "
+                    help="2.3 = năm candidate (bootstrap+permutation); "
                          "2.4 = MoE (5 cấu hình top-k/expert, Friedman). Mặc "
                          "định lấy từ khoá `experiment` trong config.")
     ap.add_argument("--stages", default=",".join(STAGES))
@@ -474,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     t_start = time.time()
     hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
            if is_moe else
-           "§2.3 — bốn candidate: baseline, QLoRA, Recombinator và MoE-LoRA; "
+           "§2.3 — năm candidate: baseline, QLoRA, Recombinator, MoE-LoRA và MoE + shared LoRA; "
            "bootstrap ghép cặp + permutation")
     print(f"\n═══ {hdr} ═══", flush=True)
     if is_moe:
@@ -527,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.retrain and "moe_lora" in [x["id"] for x in trainable_arms] and not a.force:
             print("⚙ giữ nguyên checkpoint Candidate D: --retrain không ghi đè D; "
                   "dùng --force nếu muốn huấn luyện lại D.", flush=True)
-        if any(x["id"] == "moe_lora" for x in arms_to_train) and not a.dry_run:
+        if any(x.get("moe") for x in arms_to_train) and not a.dry_run:
             if "infer" not in stages:
                 stages.append("infer")
                 manifest["stages_run"] = stages
@@ -654,7 +658,10 @@ def main(argv: list[str] | None = None) -> int:
             is_b = bool(arm.get("recomb"))
             is_cached_train = tr_mod.already_trained(
                 odir, is_b, bool(arm.get("moe", False)),
-                {k: arm[k] for k in ("route_pooling", "all_linear_targets")
+                {k: arm[k] for k in ("top_k", "n_experts", "route_pooling",
+                                     "all_linear_targets", "shared_lora",
+                                     "shared_rank", "shared_alpha",
+                                     "shared_warmup_mode", "shared_warmup_pct")
                  if k in arm} or None)
             retrain_this = (a.retrain and aid != "moe_lora") or (
                 aid == "moe_lora" and a.force)
@@ -759,7 +766,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 6
 
     # ── score ───────────────────────────────────────────────────────────────
-    from .metrics import CHEXBERT_GOLD_SOURCE, metric_columns, score_model
+    from .metrics import (CHEXBERT_GOLD_SOURCE, CHEXBERT_LABELS,
+                          metric_columns, score_model)
 
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
@@ -773,24 +781,22 @@ def main(argv: list[str] | None = None) -> int:
             csv_path = mdir / f"per_sample_{aid}.csv"
             if csv_path.exists() and not a.rescore:
                 cached = pd.read_csv(csv_path)
+                disease_counts = [f"chexbert_label_{j:02d}_{kind}"
+                                  for j in range(14) for kind in ("tp", "fp", "fn")]
                 counts_ready = (all(c in cached.columns for c in
-                                    ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
+                                    ("chexbert_tp", "chexbert_fp", "chexbert_fn",
+                                     *disease_counts))
                                 and "chexbert_gold_source" in cached.columns
                                 and cached["chexbert_gold_source"].eq(
                                     CHEXBERT_GOLD_SOURCE).all())
-                cls_counts_ready = (not arm.get("capture_cls_head", False) or all(
-                    c in cached.columns for c in
-                    ("cls_head_chexbert_tp", "cls_head_chexbert_fp",
-                     "cls_head_chexbert_fn", "cls_head_report_agree",
-                     "cls_head_report_n_labels", "chexbert_confidence",
-                     "cls_head_confidence")))
+                route_ready = not arm.get("moe") or "route_experts" in cached.columns
                 radgraph_cols = ("radgraph_f1_entity", "radgraph_f1_partial",
                                  "radgraph_f1_complete")
                 radgraph_ready = (not cfg.get("metrics", {}).get("radgraph", {}).get(
                     "enabled", False) or all(c in cached.columns for c in radgraph_cols))
                 chexbert_ready = (not cfg.get("metrics", {}).get("chexbert", {}).get(
                     "enabled", False) or counts_ready)
-                if chexbert_ready and cls_counts_ready and radgraph_ready:
+                if chexbert_ready and route_ready and radgraph_ready:
                     scores[aid] = cached
                     print(f"  [{aid}] dùng lại {csv_path.name} ({len(scores[aid])} mẫu)",
                           flush=True)
@@ -802,25 +808,21 @@ def main(argv: list[str] | None = None) -> int:
             if not keys:
                 print(f"  ⚠ [{aid}] không có dự đoán nào", flush=True)
                 continue
-            cls_predictions = None
-            cls_confidence = None
-            if arm.get("capture_cls_head", False):
-                missing_cls = [k for k in keys
-                               if "cls_head_pred" not in pred_records[str(k)]
-                               or "cls_head_confidence" not in pred_records[str(k)]]
-                if missing_cls:
+            route_experts = None
+            if arm.get("moe"):
+                missing_route = [k for k in keys
+                                 if "route_experts" not in pred_records[str(k)]]
+                if missing_route:
                     raise ValueError(
-                        f"{aid} thiếu cls_head_pred/cls_head_confidence ở "
-                        f"{len(missing_cls)} prediction. "
-                        "Chạy lại stage infer để lưu dự đoán của classification head, "
-                        "rồi chạy score,stats,report.")
-                cls_predictions = [pred_records[str(k)]["cls_head_pred"] for k in keys]
-                cls_confidence = [pred_records[str(k)]["cls_head_confidence"] for k in keys]
+                        f"{aid} thiếu route_experts ở {len(missing_route)} prediction. "
+                        "Chạy lại stage infer để lưu expert được chọn trong cùng một "
+                        "lượt sinh, rồi chạy score,stats,report.")
+                route_experts = [pred_records[str(k)]["route_experts"] for k in keys]
             sdf, _c = score_model(
                 cfg, keys, [pred_records[str(k)].get("pred", "") for k in keys],
-                [ref_map[k] for k in keys], label=aid,
-                cls_head_predictions=cls_predictions,
-                cls_head_confidence=cls_confidence)
+                [ref_map[k] for k in keys], label=aid)
+            if route_experts is not None:
+                sdf["route_experts"] = [json.dumps(x) for x in route_experts]
             sdf.to_csv(csv_path, index=False)
             scores[aid] = sdf
             score_summary = {f"score/{aid}/{k}": float(sdf[k].mean())
@@ -849,9 +851,13 @@ def main(argv: list[str] | None = None) -> int:
 
     want_ids = [x["id"] for x in arms]
     missing = [i for i in want_ids if i not in scores]
+    disease_counts = [f"chexbert_label_{j:02d}_{kind}"
+                      for j in range(len(CHEXBERT_LABELS))
+                      for kind in ("tp", "fp", "fn")]
     if (str(cfg.get("metrics", {}).get("primary", "")) == "chexbert_f1"
             and any(not (all(c in df.columns for c in
-                             ("chexbert_tp", "chexbert_fp", "chexbert_fn"))
+                             ("chexbert_tp", "chexbert_fp", "chexbert_fn",
+                              *disease_counts))
                          and "chexbert_gold_source" in df.columns
                          and df["chexbert_gold_source"].eq(
                              CHEXBERT_GOLD_SOURCE).all())
@@ -860,6 +866,12 @@ def main(argv: list[str] | None = None) -> int:
             "Điểm CheXbert đã lưu theo nguồn gold cũ/schema cũ; cần gán nhãn lại "
             "report gốc + report sinh bằng f1chexbert. Chạy lại scoring từ predictions: "
             "python -m src.run_recomb --exp 2.3 --stages score,stats,report --rescore")
+    for arm in arms:
+        aid = arm["id"]
+        if arm.get("moe") and aid in scores and "route_experts" not in scores[aid].columns:
+            raise ValueError(
+                f"Điểm {aid} không có route_experts để lập bảng expert × bệnh. "
+                "Chạy lại infer MoE rồi score,stats,report.")
     if is_moe:
         if len(scores) < 3 or missing:
             print(f"✗ §2.4 cần điểm của ĐỦ {len(want_ids)} candidate; thiếu "

@@ -1,16 +1,16 @@
 ﻿# §2.3 — Recombinator và đánh giá lâm sàng
 
-Thí nghiệm so sánh bốn mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, Candidate C và MoE-LoRA. C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C có đầu phân loại nhưng không có đầu định tuyến hay MoE. MoE-LoRA giữ nhánh Recombinator, đầu phân loại và QDoRA vision của C; Route Head dùng attention pooling ra vector 1.152 chiều rồi chiếu thành 10 logits. Top-6 experts LoRA (r=4, α=8) chỉ gắn vào projection attention `q/k/v/o` của decoder; vision tower và projector không thuộc nhóm này. Hàm mất mát là `CE + 0.1 × ASL` cùng auxiliary load-balancing loss cho MoE-LoRA.
+Thí nghiệm so sánh năm mô hình trên cùng 3.000 mẫu kiểm tra: Gemma 3 gốc, QLoRA chỉ trên bộ giải mã, Candidate C, MoE-LoRA (D) và MoE-LoRA cộng shared LoRA (E). C dùng QLoRA trên bộ giải mã, QDoRA hạng 4 ở 1/4 lớp cuối của bộ mã hóa ảnh, đóng băng projector Gemma 3, rồi chiếu nhánh Recombinator và nối token của nhánh với token ảnh cùng vector nhúng lời nhắc. Candidate C không có đầu định tuyến hay MoE. D giữ nhánh Recombinator và QDoRA vision của C; Route Head dùng attention pooling ra vector 1.152 chiều rồi chiếu thành 10 logits. Top-6 Experts LoRA (r=4, α=8) chỉ gắn vào projection attention `q/k/v/o` của decoder. E thêm một shared LoRA trên cùng các projection, hoạt động độc lập với Route. Trong 20% bước đầu, E huấn luyện như C: shared LoRA, QDoRA vision và Recombinator/ClsHead cùng được fine-tune; Route và Experts LoRA bị tắt. 80% bước sau, E tiếp tục học các nhánh này đồng thời bật Route và Experts LoRA. Hàm mất mát là `CE + 0.1 × ASL` cùng auxiliary load-balancing loss khi Route hoạt động.
 
-Khi huấn luyện, nhãn dương và không chắc chắn được gộp thành dương, các trạng thái còn lại thành âm. Metric CheXbert tính `p = P(positive) + P(uncertain)`; nếu `p >= 0.5` thì là dương, nếu không thì là âm (negative + blank). Báo cáo có bảng chỉ số văn bản sinh, bảng chỉ số riêng của đầu phân loại, hai bảng độ tự tin và năm bảng kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 4 tập lấy mẫu có hoàn lại, mỗi tập gồm 7.500 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 4 tập.
+Khi huấn luyện, nhãn dương và không chắc chắn được gộp thành dương, các trạng thái còn lại thành âm. Metric CheXbert tính `p = P(positive) + P(uncertain)`; nếu `p >= 0.5` thì là dương, nếu không thì là âm (negative + blank). Báo cáo có bảng chỉ số báo cáo sinh, bảng F1 CheXbert theo expert × 14 bệnh cho từng candidate MoE, bảng độ tự tin báo cáo sinh và năm bảng kiểm định riêng cho BLEU, ROUGE, BERTScore, RadGraph, CheXbert. Mọi bảng dùng chung 4 tập lấy mẫu có hoàn lại, mỗi tập gồm 7.500 lượt lấy từ tập kiểm tra; dòng cuối là trung bình cộng của 4 tập.
 
-Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 4 tập lấy mẫu. Chỉ số lâm sàng chính là F1 CheXbert.
+Chấm điểm có thêm F1-RadGraph chính thức với `radgraph-xl`, ghi ba mức thực thể, khớp một phần và khớp đầy đủ theo từng mẫu; các điểm dùng chung 4 tập lấy mẫu.
 
 ## Kiến trúc tổng quan
 
 ![Sơ đồ abstract tổng quát](docs/figures/fig1_overall_pipeline.png)
 
-Sơ đồ thể hiện kiến trúc tổng quát với đầu phân loại, đầu định tuyến và các chuyên gia LoRA. Trong §2.3, Candidate C chỉ dùng đầu phân loại; Candidate MoE-LoRA bổ sung Route Head và Experts LoRA. Nhánh Recombinator của cả hai chiếu token/đặc trưng rồi nối với token ảnh đã qua bộ điều hợp và vector nhúng lời nhắc.
+Sơ đồ thể hiện kiến trúc tổng quát với đầu phân loại, đầu định tuyến và các chuyên gia LoRA. Trong §2.3, Candidate C chỉ dùng đầu phân loại; D bổ sung Route Head và Experts LoRA; E thêm shared LoRA chạy độc lập với Route. Nhánh Recombinator của các candidate này chiếu token/đặc trưng rồi nối với token ảnh đã qua bộ điều hợp và vector nhúng lời nhắc.
 
 Đầu phân loại nhận `(batch, 256, 1152)` từ Recombinator. Một truy vấn học được dùng chú ý đa đầu (8 đầu) để gộp 256 token thành một vector; một lớp tuyến tính chiếu vector này thành 14 logit độc lập `(batch, 14)`. Sigmoid tạo xác suất dương cho từng bệnh. Đầu phân loại không có bốn tầng gộp hay MLP ẩn.
 
@@ -43,6 +43,9 @@ bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --pull --no-push --no-wa
 # Chỉ huấn luyện/suy luận candidate MoE-LoRA mới
 bash scripts/run_recomb.sh --exp 2.3 --arms moe_lora --stages data,train,infer --no-wandb --no-push
 
+# Candidate E: warm-up như C, sau đó shared LoRA + MoE Route/Experts
+bash scripts/run_recomb.sh --exp 2.3 --arms moe_shared_lora --stages data,train,infer --no-wandb --no-push
+
 # Huấn luyện lại riêng Candidate D; sau train sẽ infer và thay predictions D
 bash scripts/run_recomb.sh --exp 2.3 --arms moe_lora --force --stages data,train --no-wandb --no-push
 
@@ -74,9 +77,9 @@ bash scripts/run_recomb.sh --exp 2.3 --arms lora_recomb --stages data,train --no
 bash scripts/run_recomb.sh --exp 2.3 --stages infer,score,stats,report,push --rescore --no-wandb
 ```
 
-Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Có thể chọn mô hình bằng `--arms baseline_infer,lora_only,lora_recomb,moe_lora`; để so sánh đầy đủ cần chạy cả bốn. Candidate MoE-LoRA mặc định dùng cấu hình `top_k=6, n_experts=10` đã chọn trước đó.
+Đổi cấu hình qua `--set`, ví dụ `--set train.n_epochs=2`. Có thể chọn mô hình bằng `--arms baseline_infer,lora_only,lora_recomb,moe_lora,moe_shared_lora`; để so sánh đầy đủ cần chạy cả năm. Hai candidate MoE dùng `top_k=6, n_experts=10`.
 
-Checkpoint Candidate D được giữ lại và train sẽ tự resume khi nó đã đầy đủ. `--retrain` không ghi đè D; chỉ `--force` cùng stage `train` mới huấn luyện lại D. Khi D được train (lần đầu hoặc bằng `--force`), stage `infer` tự chạy và ghi predictions mới vào đúng file của D; bản cũ được lưu trong `_archive`.
+Checkpoint Candidate D được giữ lại và train sẽ tự resume khi nó đã đầy đủ. `--retrain` không ghi đè D; chỉ `--force` cùng stage `train` mới huấn luyện lại D. Khi D được train (lần đầu hoặc bằng `--force`), stage `infer` tự chạy và ghi predictions mới vào đúng file của D; bản cũ được lưu trong `_archive`. Candidate E dùng ID `moe_shared_lora` và có thể huấn luyện lại bằng `--retrain`.
 
 ## Thiết lập hiện hành
 
@@ -87,14 +90,14 @@ Checkpoint Candidate D được giữ lại và train sẽ tự resume khi nó �
 - **Kích thước lô:** thử các lô nhỏ `16, 12, 10, 8, 6, 4, 2, 1` khi thiếu bộ nhớ; kích thước lô hiệu dụng luôn là 32. Mô hình đầu tiên chọn kích thước, các mô hình còn lại dùng cùng giá trị.
 - **Chỉ số chính:** F1 CheXbert micro trên 14 nhãn. Mỗi nhãn tính `p = P(positive) + P(uncertain)`; `p >= 0.5` là dương, thấp hơn là âm (negative + blank). Tính riêng trong mỗi tập lấy mẫu 7.500 lượt rồi lấy trung bình 4 kết quả F1. BLEU, ROUGE, BERTScore và F1 RadGraph là chỉ số bổ sung.
 - **Ý nghĩa thống kê:** kết luận “Có ý nghĩa” khi p permutation thô < `alpha` và CI bootstrap 95% không chứa 0. p bootstrap và p permutation sau Holm được lưu để tham khảo, không dùng làm cổng kết luận.
-- **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra. Tạo 4 tập lấy mẫu khác nhau bằng 4 hạt giống (`42`–`45`); mỗi tập gồm 7.500 lượt lấy có hoàn lại. Cùng 4 tập được dùng cho cả bốn mô hình và mọi chỉ số.
+- **Đánh giá:** dùng một nhóm 3.000 ảnh lấy theo hạt giống từ tập kiểm tra. Tạo 4 tập lấy mẫu khác nhau bằng 4 hạt giống (`42`–`45`); mỗi tập gồm 7.500 lượt lấy có hoàn lại. Cùng 4 tập được dùng cho cả năm mô hình và mọi chỉ số.
 
 Cấu hình chạy chính nằm ở [`configs/recombiner.yaml`](configs/recombiner.yaml); lệnh khởi chạy là `python -m src.run_recomb --exp 2.3` hoặc `bash scripts/run_recomb.sh --exp 2.3`.
 
 ## CheXbert
 
-Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để lấy xác suất cho cả báo cáo gốc lẫn báo cáo sinh. Với mỗi bệnh, `p = P(positive) + P(uncertain)`; `p >= 0.5` được mã hóa thành 1, thấp hơn thành 0 (negative + blank). Khi huấn luyện Candidate C và MoE-LoRA, nhãn ASL được tạo trực tiếp từ báo cáo gốc bằng CheXbert; positive và uncertain là dương, các trạng thái còn lại là âm. Không cần tải mã nguồn hay đặt trọng số thủ công; lần đầu thư viện tự tải trọng số và mô hình BERT vào bộ nhớ đệm môi trường.
+Chỉ số CheXbert dùng thư viện [`f1chexbert`](https://pypi.org/project/f1chexbert/) để lấy xác suất cho cả báo cáo gốc lẫn báo cáo sinh. Với mỗi bệnh, `p = P(positive) + P(uncertain)`; `p >= 0.5` được mã hóa thành 1, thấp hơn thành 0 (negative + blank). Khi huấn luyện Candidate C, D và E, nhãn ASL được tạo trực tiếp từ báo cáo gốc bằng CheXbert; positive và uncertain là dương, các trạng thái còn lại là âm. Không cần tải mã nguồn hay đặt trọng số thủ công; lần đầu thư viện tự tải trọng số và mô hình BERT vào bộ nhớ đệm môi trường.
 
 ## Giới hạn thống kê
 
-Các ước lượng lấy mẫu dùng trung bình của 4 tập với hạt giống riêng `42`–`45`, mỗi tập có 7.500 lượt lấy có hoàn lại. Ma trận chỉ số được chia sẻ giữa bốn mô hình và mọi chỉ số để bảo toàn so sánh ghép cặp. Báo cáo ghi số tập và kích thước mỗi tập.
+Các ước lượng lấy mẫu dùng trung bình của 4 tập với hạt giống riêng `42`–`45`, mỗi tập có 7.500 lượt lấy có hoàn lại. Ma trận chỉ số được chia sẻ giữa năm mô hình và mọi chỉ số để bảo toàn so sánh ghép cặp. Báo cáo ghi số tập và kích thước mỗi tập.

@@ -64,8 +64,12 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
 
     @property
     def required_prediction_fields(self) -> tuple[str, ...]:
-        return (("cls_head_pred", "cls_head_confidence")
-                if self.mcfg.get("capture_cls_head", False) else ())
+        fields = []
+        if self.mcfg.get("capture_cls_head", False):
+            fields.extend(("cls_head_pred", "cls_head_confidence"))
+        if bool(self.mcfg.get("moe", False)):
+            fields.append("route_experts")
+        return tuple(fields)
 
     def load(self) -> None:
         from transformers import AutoProcessor, Gemma3ForConditionalGeneration
@@ -210,7 +214,8 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
               f"ví dụ: {targets[0] if targets else '(trống)'}", flush=True)
         ctx, st = moe.attach_experts(
             base, targets, n_e, int(m["rank"]), float(m["alpha"]),
-            0.0)                      # dropout = 0 khi sinh, luôn luôn
+            0.0, shared_rank=int(m.get("shared_rank", 0) or 0),
+            shared_alpha=float(m.get("shared_alpha", 0.0) or 0.0))
         meta = moe.load_experts(base, adapter_dir)
         vision_adapter = stats.get("vision_adapter") or {}
         if vision_adapter:
@@ -250,7 +255,10 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         self._router, self._route_ctx = router, ctx
         print(f"  ✓ Experts: {n_e} × LoRA(r={m['rank']}) trên "
               f"{st['n_modules']} ma trận Attn · top-k = {k} · "
-              f"{st['expert_params']:,} tham số · nạp {meta.get('n_tensors')} "
+              f"{st['expert_params']:,} tham số" +
+              (f" · shared LoRA {st['shared_params']:,} tham số"
+               if st.get("shared_params") else "") +
+              f" · nạp {meta.get('n_tensors')} "
               f"tensor từ {adapter_dir.name}", flush=True)
         print(f"  ✓ Router: soft clip C={m.get('logit_clip_c', 1.2)} -> softmax "
               f"-> top-{k} · nhiễu TẮT khi sinh (beam search phải lặp lại được)"
@@ -313,9 +321,17 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                             "None — nhánh đã ghi ở chế độ §2.3 (route_enabled = "
                             "false). Huấn luyện lại candidate này.")
                     # generate nhân mỗi ảnh thành num_beams hàng liền nhau.
-                    self._route_ctx.set(
-                        self._router(route[0], route[1])["weights"],
-                        repeat=self._n_beams())
+                    route_out = self._router(route[0], route[1])
+                    route_weights = route_out["weights"]
+                    selected = (route_weights > 0).nonzero(as_tuple=False)
+                    route_ids = [[] for _ in batch]
+                    for row, expert in selected.detach().cpu().tolist():
+                        route_ids[row].append(int(expert))
+                    self._last_batch_aux.update({
+                        str(item["key"]): {"route_experts": experts}
+                        for item, experts in zip(batch, route_ids)
+                    })
+                    self._route_ctx.set(route_weights, repeat=self._n_beams())
                 if self.branch.merge_mode == "add":
                     aligned = self.branch.merge_adapter(aligned, tokens)
             embeds = recombiner.build_inputs_embeds(self._gemma, ids, aligned)

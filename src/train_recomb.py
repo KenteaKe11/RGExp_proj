@@ -1,8 +1,8 @@
-"""Huấn luyện bốn candidate §2.3 trên cùng base, lịch và dữ liệu.
+"""Huấn luyện năm candidate §2.3 trên cùng base, lịch và dữ liệu.
 
 Baseline và QLoRA decoder là mốc; Candidate C thêm QDoRA vision, Recombinator
-và ClsHead; MoE-LoRA giữ nhánh đó, bật Route Head và dùng experts LoRA thay
-QLoRA decoder.
+và ClsHead; Candidate D dùng Experts LoRA có Route; Candidate E bổ sung shared
+LoRA độc lập với Route, warm-up riêng rồi fine-tune đồng thời với Experts.
 
 File này dùng lại `src/backbone.py` cho mọi thứ không phải vòng tối ưu hoá
 (nạp base, chọn target module, alpha theo rank, đường cong one-cycle, che nhãn,
@@ -139,11 +139,31 @@ def moe_spec(cfg: Cfg, arm: dict, preset: dict) -> dict | None:
     r = dict(m.get("router", {}) or {})
     a = dict(m.get("aux", {}) or {})
     is_candidate_d = str(arm.get("id")) == "moe_lora"
+    shared_lora = bool(arm.get("shared_lora", False))
+    shared_rank = int(arm.get("shared_rank") or rank) if shared_lora else 0
+    shared_alpha = float(arm.get("shared_alpha") or alpha) if shared_lora else 0.0
+    shared_warmup_mode = (str(arm.get("shared_warmup_mode", "candidate_c"))
+                          if shared_lora else "off")
+    shared_warmup_pct = float(arm.get("shared_warmup_pct", 0.2)) \
+        if shared_lora else 0.0
+    if shared_lora and shared_warmup_mode != "candidate_c":
+        raise TrainUnusable(
+            f"candidate {arm.get('id')!r}: shared_warmup_mode hiện chỉ hỗ trợ "
+            "'candidate_c'.")
+    if shared_lora and not 0.0 <= shared_warmup_pct < 1.0:
+        raise TrainUnusable(
+            f"candidate {arm.get('id')!r}: shared_warmup_pct phải nằm trong [0, 1).")
     return {
         "arm_id": arm.get("id"), "top_k": k, "n_experts": n_e,
         "route_pooling": str(arm.get("route_pooling", "stack")),
-        "all_linear_targets": (False if is_candidate_d else
+        "all_linear_targets": (False if is_candidate_d or
+                               str(arm.get("id")) == "moe_shared_lora" else
                                bool(arm.get("all_linear_targets", False))),
+        "shared_lora": shared_lora,
+        "shared_rank": shared_rank,
+        "shared_alpha": shared_alpha,
+        "shared_warmup_mode": shared_warmup_mode,
+        "shared_warmup_pct": shared_warmup_pct,
         "rank": rank, "alpha": alpha, "dropout": float(e.get("dropout", 0.05)),
         "method": method,
         "base_method": preset["method"],
@@ -635,7 +655,8 @@ def build_optimizer(peft_model, branch, tcfg: dict, adapter_group: str = "lora",
 
 # ══ Một lượt forward ════════════════════════════════════════════════════════
 def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
-                  tt_value: int, router=None, route_ctx=None):
+                  tt_value: int, router=None, route_ctx=None,
+                  disable_moe_route: bool = False):
     """-> (CE, ASL hoặc None, route_out hoặc None, vài số để log).
 
     MỌI candidate của cả hai mục đi qua đây. Khác biệt là hai cờ và chỉ hai cờ:
@@ -680,8 +701,11 @@ def _forward_loss(model, gemma, branch, batch: dict, img_token_id: int,
                 raise TrainUnusable(
                     "§2.4 bật MoE nhưng nhánh trả route = None. `route_enabled` "
                     "của nhánh sai — xem train_recomb.effective_rcfg.")
-            route_out = router(route[0], route[1])
-            route_ctx.set(route_out["weights"])
+            if disable_moe_route:
+                route_ctx.disable()
+            else:
+                route_out = router(route[0], route[1])
+                route_ctx.set(route_out["weights"])
         if branch.merge_mode == "add":
             aligned = branch.merge_adapter(aligned, tokens)
         if cls_logits is not None and "cls_y" in batch:
@@ -798,13 +822,14 @@ def _attach_experts(model, tcfg: dict, spec: dict):
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=False)
     target_cfg = dict(tcfg)
-    is_candidate_d = str(spec.get("arm_id")) == "moe_lora"
+    is_attention_only = str(spec.get("arm_id")) in {
+        "moe_lora", "moe_shared_lora"}
     # Candidate D's experiment contract is attention-only even if a stale
     # command-line override or checkpoint spec requests all decoder linears.
-    target_cfg["all_linear"] = (False if is_candidate_d else
+    target_cfg["all_linear"] = (False if is_attention_only else
                                 bool(spec.get("all_linear_targets", False)))
     targets = find_target_modules(model, target_cfg)
-    if is_candidate_d:
+    if is_attention_only:
         attn_targets = {"q_proj", "k_proj", "v_proj", "o_proj"}
         invalid = [name for name in targets
                    if name.rsplit(".", 1)[-1] not in attn_targets]
@@ -814,7 +839,8 @@ def _attach_experts(model, tcfg: dict, spec: dict):
                 f"attention: {invalid[:8]}")
     ctx, st = moe_mod.attach_experts(
         model, targets, spec["n_experts"], spec["rank"], spec["alpha"],
-        spec["dropout"])
+        spec["dropout"], shared_rank=spec["shared_rank"],
+        shared_alpha=spec["shared_alpha"])
     router = moe_mod.Router(
         n_experts=spec["n_experts"], top_k=spec["top_k"],
         clip_c=spec["logit_clip_c"], noise=spec["noise"],
@@ -893,6 +919,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"alpha={spec['alpha']:.0f}) trên {mstats['n_modules']} ma trận Attn "
               f"· top-k = {spec['top_k']} · {mstats['expert_params']:,} tham số "
               f"({mstats['params_per_expert']:,}/expert)", flush=True)
+        if spec["shared_lora"]:
+            print(f"  Shared LoRA riêng, không qua Route: r={spec['shared_rank']} · "
+                  f"alpha={spec['shared_alpha']:.0f} · "
+                  f"{mstats['shared_params']:,} tham số", flush=True)
         print(f"  Router: nhiễu Gauss học được (σ₀≈"
               f"{math.log1p(math.exp(spec['noise_init'])):.3f}) -> soft clip "
               f"C={spec['logit_clip_c']} -> softmax -> top-{spec['top_k']} · "
@@ -992,10 +1022,37 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     opt, n_by_group = build_optimizer(
         model, branch, tcfg, adapter_group="experts" if spec else "lora",
         from_pretrain=bool(pre_src), lrs=lrs)
+    candidate_c_warmup_ids: set[int] = set()
+    trainability_snapshot = []
+    if spec and spec["shared_lora"]:
+        vision_meta = pstats.get("vision_adapter") or {}
+        vision_adapter_name = str(vision_meta.get("name", ""))
+        if not vision_adapter_name:
+            raise TrainUnusable(
+                "Candidate E cần QDoRA vision như Candidate C, nhưng không có "
+                "metadata của vision adapter.")
+        for name, p in model.named_parameters():
+            if name.endswith(("shared_lora_A", "shared_lora_B")):
+                candidate_c_warmup_ids.add(id(p))
+            elif vision_adapter_name in name and "lora_" in name:
+                candidate_c_warmup_ids.add(id(p))
+        if not candidate_c_warmup_ids:
+            raise TrainUnusable(
+                "Candidate E không tìm thấy tham số shared LoRA/QDoRA vision "
+                "cho giai đoạn warm-up như Candidate C.")
+        trainability_snapshot = [(p, p.requires_grad)
+                                 for p in model.parameters()]
+        if branch is not None:
+            for name, p in branch.named_parameters():
+                trainability_snapshot.append((p, p.requires_grad))
+                if not name.startswith("route_head."):
+                    candidate_c_warmup_ids.add(id(p))
     lr_by_group = {g["name"]: float(g["lr"]) for g in opt.param_groups}
     sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
+    shared_warmup_steps = (int(math.ceil(steps * float(spec["shared_warmup_pct"])))
+                           if spec and spec["shared_lora"] else 0)
     rstats = moe_mod.RouteStats(spec["n_experts"]) if spec else None
     lam = float(ccfg.get("lambda", 0.5)) if use_branch else 0.0
     lam_warm = float(ccfg.get("lambda_warmup_pct", 0.1))
@@ -1010,6 +1067,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
           f"{micro_sizes[-1]}) = eff_bs {effective_batch} "
           f"· {steps} bước · nhóm tham số "
           f"{ {k: f'{v:,}' for k, v in n_by_group.items()} }", flush=True)
+    if spec and spec["shared_lora"]:
+        print(f"  Shared LoRA warm-up: {shared_warmup_steps}/{steps} bước đầu "
+              f"({100.0 * spec['shared_warmup_pct']:.1f}%) huấn luyện như Candidate C: "
+              "shared LoRA, QDoRA vision và nhánh Recombinator/ClsHead được mở; "
+              "Route và Experts LoRA bị tắt. Sau đó bật lại Route/Experts và "
+              "tiếp tục cùng shared LoRA.",
+              flush=True)
 
     if not pre_src:
         print("  lr đỉnh: " + " · ".join(
@@ -1060,15 +1124,25 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     first_loss = None
     last_cls: dict = {}
     for step in range(steps):
+        candidate_c_warmup = bool(spec and spec["shared_lora"]
+                                  and step < shared_warmup_steps)
+        if spec and spec["shared_lora"]:
+            for p, was_trainable in trainability_snapshot:
+                p.requires_grad_(id(p) in candidate_c_warmup_ids
+                                 if candidate_c_warmup else was_trainable)
         opt.zero_grad(set_to_none=True)
         lam_now = lambda_at(step, steps, lam, lam_warm) if use_branch else 0.0
+        route_active = bool(spec and (
+            not spec["shared_lora"] or step >= shared_warmup_steps))
         aux_now = (moe_mod.aux_alpha_at(step, steps, aux_alpha, aux_warm)
-                   if spec else 0.0)
+                   if route_active else 0.0)
         step_ce = step_asl = step_aux = 0.0
         for micro_size in micro_sizes:
             batch = next_micro(micro_size)
             ce, asl, route_out, cls_m = _forward_loss(
-                model, gemma, branch, batch, img_tok, tt_value, router, route_ctx)
+                model, gemma, branch, batch, img_tok, tt_value, router, route_ctx,
+                disable_moe_route=bool(spec and spec["shared_lora"]
+                                       and step < shared_warmup_steps))
             loss = ce if asl is None else ce + lam_now * asl.to(ce.dtype)
             if route_out is not None:
                 loss = loss + aux_now * route_out["aux"].to(ce.dtype)
@@ -1109,10 +1183,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                   f"(ce {step_ce:.4f}" +
                   (f" · asl {step_asl:.4f} · λ {lam_now:.3f} · Δproj {dproj:.3f}"
                    if use_branch else "") +
+                  (f" · {'C warm-up (no Route/Experts)' if not route_active else 'C + shared LoRA + MoE Route'}"
+                   if spec and spec["shared_lora"] else "") +
                   (f" · aux {step_aux:.3f} · α {aux_now:.4f} · tải "
                    f"[{rsum.get('load_min', 0):.2f}..{rsum.get('load_max', 0):.2f}]"
                    f" · chết {rsum.get('n_dead_experts', 0)}"
-                   if spec else "") +
+                   if route_active else "") +
                   (f" · {recombiner.format_grad_norms(grad_norms)}"
                    if branch is not None else "") +
                   f") · lr {lr_now:.2e}", flush=True)
@@ -1133,7 +1209,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                         f"train/{aid}/route_load_cv": rsum.get("load_cv"),
                         f"train/{aid}/route_entropy": rsum.get("route_entropy_mean"),
                         f"train/{aid}/n_dead_experts": rsum.get("n_dead_experts")}
-                       if spec else {}),
+                       if route_active else {}),
                     **{f"train/{aid}/{k}": v for k, v in last_cls.items()},
                 })
 
@@ -1159,6 +1235,11 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
             "rank": spec["rank"], "alpha": spec["alpha"],
             "dropout": spec["dropout"], "method": spec["method"],
             "base_method": spec["base_method"],
+            "shared_lora": spec["shared_lora"],
+            "shared_rank": spec["shared_rank"],
+            "shared_alpha": spec["shared_alpha"],
+            "shared_warmup_mode": spec["shared_warmup_mode"],
+            "shared_warmup_pct": spec["shared_warmup_pct"],
             "target_modules": mstats["n_modules"],
             "target_names": mstats["target_names"]})
     processor.save_pretrained(str(out_dir))
@@ -1173,6 +1254,8 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         "top_k": (spec or {}).get("top_k"),
         "n_experts": (spec or {}).get("n_experts"),
         "moe": (dict(spec, **mstats) if spec is not None else None),
+        "shared_lora": bool((spec or {}).get("shared_lora", False)),
+        "shared_warmup_steps": shared_warmup_steps if spec and spec["shared_lora"] else None,
         "route_stats": route_summary,
         "aux_alpha": aux_alpha, "aux_warmup_pct": aux_warm,
         "aux_last": step_aux if spec else None,

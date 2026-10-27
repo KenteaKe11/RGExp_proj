@@ -157,6 +157,7 @@ class RoutingContext:
     def __init__(self, strict: bool = True):
         self.weights: torch.Tensor | None = None
         self.strict = bool(strict)
+        self.disabled = False
         self.n_experts = 0
         self.repeat = 1
         self._expanded: torch.Tensor | None = None
@@ -167,6 +168,7 @@ class RoutingContext:
         if repeat < 1:
             raise ValueError(f"repeat = {repeat} — phải >= 1")
         self.weights = w
+        self.disabled = False
         self.repeat = repeat
         self._expanded = (w if repeat == 1
                           else w.repeat_interleave(repeat, dim=0))
@@ -175,8 +177,18 @@ class RoutingContext:
         self.weights = None
         self._expanded = None
         self.repeat = 1
+        self.disabled = False
+
+    def disable(self) -> None:
+        """Bypass routed experts for this forward; shared adapters may remain active."""
+        self.weights = None
+        self._expanded = None
+        self.repeat = 1
+        self.disabled = True
 
     def get(self, batch: int) -> torch.Tensor | None:
+        if self.disabled:
+            return None
         w = self.weights
         if w is None:
             if self.strict:
@@ -320,7 +332,8 @@ class MoELoraLinear(nn.Module):
     """
 
     def __init__(self, base_layer: nn.Module, n_experts: int, r: int,
-                 alpha: float, dropout: float, ctx: RoutingContext):
+                 alpha: float, dropout: float, ctx: RoutingContext,
+                 shared_rank: int = 0, shared_alpha: float = 0.0):
         super().__init__()
         self.base_layer = base_layer
         self.n_experts = int(n_experts)
@@ -355,16 +368,34 @@ class MoELoraLinear(nn.Module):
             torch.zeros(self.n_experts, out_f, self.r,
                         device=a0.device, dtype=a0.dtype))
         self.drop = nn.Dropout(float(dropout)) if dropout else nn.Identity()
+        self.shared_rank = int(shared_rank)
+        if self.shared_rank > 0:
+            sa = torch.empty(self.shared_rank, in_f, device=a0.device, dtype=a0.dtype)
+            nn.init.kaiming_uniform_(sa, a=math.sqrt(5))
+            self.shared_lora_A = nn.Parameter(sa)
+            self.shared_lora_B = nn.Parameter(
+                torch.zeros(out_f, self.shared_rank, device=a0.device, dtype=a0.dtype))
+            self.shared_scaling = float(shared_alpha) / self.shared_rank
+        else:
+            self.register_parameter("shared_lora_A", None)
+            self.register_parameter("shared_lora_B", None)
+            self.shared_scaling = 0.0
 
         for p in self.base_layer.parameters():
             p.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base_layer(x)
+        dt = self.lora_A.dtype
+        if self.shared_lora_A is not None:
+            shared_x = self.drop(x).to(dt)
+            shared_h = torch.einsum("btd,rd->btr", shared_x, self.shared_lora_A)
+            shared_delta = torch.einsum(
+                "btr,or->bto", shared_h, self.shared_lora_B) * self.shared_scaling
+            out = out + shared_delta.to(out.dtype)
         w = self.ctx.get(x.shape[0])
         if w is None:
             return out
-        dt = self.lora_A.dtype
         xd = self.drop(x).to(dt)
         # (B,T,d) x (E,r,d) -> (B,T,E,r)
         h = torch.einsum("btd,erd->bter", xd, self.lora_A)
@@ -435,7 +466,9 @@ def _get_parent(root: nn.Module, dotted: str) -> tuple[nn.Module, str]:
 
 def attach_experts(model, target_names: list[str], n_experts: int, r: int,
                    alpha: float, dropout: float,
-                   ctx: RoutingContext | None = None) -> tuple[RoutingContext, dict]:
+                   ctx: RoutingContext | None = None,
+                   shared_rank: int = 0,
+                   shared_alpha: float = 0.0) -> tuple[RoutingContext, dict]:
     """Thay mỗi module trong `target_names` bằng `MoELoraLinear`. Đóng băng phần còn lại.
 
     `target_names` đến từ `backbone.find_target_modules`: Candidate D dùng các
@@ -454,16 +487,25 @@ def attach_experts(model, target_names: list[str], n_experts: int, r: int,
         if isinstance(base, MoELoraLinear):
             raise RuntimeError(f"{name} đã được gắn expert rồi — gắn hai lần là "
                                f"hai tầng LoRA lồng nhau.")
-        setattr(parent, attr, MoELoraLinear(base, n_experts, r, alpha, dropout, ctx))
+        setattr(parent, attr, MoELoraLinear(
+            base, n_experts, r, alpha, dropout, ctx,
+            shared_rank=shared_rank, shared_alpha=shared_alpha))
         replaced.append(name)
     if not replaced:
         raise RuntimeError("không module nào được gắn expert — danh sách target rỗng.")
 
-    n_exp = sum(p.numel() for n, p in model.named_parameters()
-                if p.requires_grad and ("lora_A" in n or "lora_B" in n))
+    expert_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if p.requires_grad and n.rsplit(".", 1)[-1] in {"lora_A", "lora_B"})
+    shared_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if p.requires_grad and n.rsplit(".", 1)[-1]
+        in {"shared_lora_A", "shared_lora_B"})
+    n_exp = expert_params + shared_params
     stats = {"n_modules": len(replaced), "n_experts": int(n_experts), "rank": int(r),
-             "alpha": float(alpha), "expert_params": int(n_exp),
-             "params_per_expert": int(n_exp // max(1, n_experts)),
+             "alpha": float(alpha), "expert_params": int(expert_params),
+             "shared_params": int(shared_params),
+             "params_per_expert": int(expert_params // max(1, n_experts)),
              "example_module": replaced[0],
              # Save the exact target set. Re-running a broad `all_linear` scan
              # during inference can select a different set after PEFT/model
