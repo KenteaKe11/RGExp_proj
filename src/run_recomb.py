@@ -115,6 +115,16 @@ def _read_preds(path: Path) -> dict[str, dict]:
     return out
 
 
+def _write_preds(path: Path, records: dict[str, dict]) -> None:
+    """Rewrite JSONL atomically after adding side metadata; preserve reports."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for record in records.values():
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+    tmp.replace(path)
+
+
 def _count_preds(path: Path) -> int:
     """Số dòng JSON đọc được trong file dự đoán (0 nếu chưa có).
 
@@ -813,10 +823,46 @@ def main(argv: list[str] | None = None) -> int:
                 missing_route = [k for k in keys
                                  if "route_experts" not in pred_records[str(k)]]
                 if missing_route:
-                    raise ValueError(
-                        f"{aid} thiếu route_experts ở {len(missing_route)} prediction. "
-                        "Chạy lại stage infer để lưu expert được chọn trong cùng một "
-                        "lượt sinh, rồi chạy score,stats,report.")
+                    print(f"  [{aid}] report đã có nhưng thiếu route_experts ở "
+                          f"{len(missing_route)} mẫu; chạy vision + Route Head "
+                          "để bổ sung metadata, không sinh lại report ...", flush=True)
+                    from .runners import build
+
+                    route_runner = build(
+                        cfg, arm_model_cfg(cfg, arm, adapter_root), tracker)
+                    rows_by_key = {
+                        str(row["key"]): row
+                        for row in test_df.to_dict(orient="records")
+                    }
+                    route_rows = [rows_by_key[str(k)] for k in missing_route
+                                  if str(k) in rows_by_key]
+                    if len(route_rows) != len(missing_route):
+                        raise ValueError(
+                            f"Không tìm thấy ảnh của {len(missing_route) - len(route_rows)} "
+                            f"mẫu {aid} để bổ sung route metadata.")
+                    try:
+                        route_runner.load()
+                        bs_route = max(1, int(route_runner.mcfg.get("batch_size", 1)))
+                        for start in range(0, len(route_rows), bs_route):
+                            batch_routes = route_runner.route_experts_batch(
+                                route_rows[start:start + bs_route])
+                            for key, experts in batch_routes.items():
+                                pred_records[key]["route_experts"] = experts
+                            done_route = min(start + bs_route, len(route_rows))
+                            if done_route == len(route_rows) or done_route % 100 < bs_route:
+                                print(f"  [{aid}] route metadata {done_route}/"
+                                      f"{len(route_rows)}", flush=True)
+                        still_missing = [k for k in keys
+                                         if "route_experts" not in pred_records[str(k)]]
+                        if still_missing:
+                            raise ValueError(
+                                f"Route Head không trả metadata cho {len(still_missing)} "
+                                f"mẫu {aid}.")
+                        _write_preds(pred_paths[aid], pred_records)
+                        print(f"  [{aid}] đã gắn route_experts vào predictions; "
+                              "giữ nguyên report đã infer.", flush=True)
+                    finally:
+                        route_runner.unload()
                 route_experts = [pred_records[str(k)]["route_experts"] for k in keys]
             sdf, _c = score_model(
                 cfg, keys, [pred_records[str(k)].get("pred", "") for k in keys],

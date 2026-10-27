@@ -366,6 +366,42 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
         return [t.strip() for t in
                 self.processor.batch_decode(gen, skip_special_tokens=True)]
 
+    def route_experts_batch(self, batch: list[dict]) -> dict[str, list[int]]:
+        """Tính nhãn expert từ ảnh/Route Head mà không sinh lại report.
+
+        Dùng để bổ sung metadata cho prediction JSONL cũ đã có report nhưng
+        được sinh trước khi infer lưu `route_experts`.
+        """
+        import torch
+
+        if self._router is None or self.branch is None:
+            raise RunnerUnusable(
+                "route_experts_batch chỉ dùng được với Candidate MoE có Route Head.")
+        msgs = [chat_messages(self.cfg, Image.open(it["image_path"]).convert("RGB"))
+                for it in batch]
+        inputs = self.processor.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt", padding=True, **self.img_kw,
+        ).to(self.model.device)
+        with torch.inference_mode():
+            vis, _aligned = recombiner.encode_vision(
+                self._gemma,
+                inputs["pixel_values"].to(
+                    dtype=recombiner.float_dtype(self._gemma, torch.float32)))
+            _tokens, _cls_logits, route = self.branch(
+                vis.to(next(self.branch.parameters()).dtype))
+            if route is None:
+                raise RunnerUnusable(
+                    "MoE checkpoint không có đầu Route; không thể bổ sung "
+                    "route_experts cho prediction đã lưu.")
+            weights = self._router(route[0], route[1])["weights"]
+            selected = (weights > 0).nonzero(as_tuple=False).detach().cpu().tolist()
+        ids = [[] for _ in batch]
+        for row, expert in selected:
+            ids[row].append(int(expert))
+        return {str(item["key"]): experts
+                for item, experts in zip(batch, ids)}
+
     def unload(self) -> None:
         self.branch = None
         self._gemma = None
