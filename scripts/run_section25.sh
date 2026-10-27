@@ -1,60 +1,15 @@
 #!/usr/bin/env bash
-# ═════════════════════════════════════════════════════════════════════════════
-# run_section25.sh — §2.5: R2Gen · AdaAtt · My Gemma. MỘT LỆNH, trọn gói.
+# run_section25.sh — §2.5: R2Gen · AdaAtt · Candidate E.
+# Candidate E is loaded from the retained §2.3 checkpoint; it is not pulled or retrained.
+# Pairing, bootstrap and permutation follow the §2.3 statistical protocol.
 #
-#     bash scripts/run_pretrain.sh --detach          # TIÊN QUYẾT — Stage 0 My Gemma
-#     bash scripts/run_section25.sh --dry-run        # thử đường ống (8 ảnh, 16 mẫu)
-#     bash scripts/run_section25.sh --detach         # chạy NỀN, trả lại shell
-#     bash scripts/run_section25.sh --stages stats,report
-#     bash scripts/run_section25.sh --arms my_gemma
-#     bash scripts/run_section25.sh --init-from hub:OWNER/NAME/best
-#     bash scripts/run_section25.sh --init-from none # My Gemma KHÔNG pretrain
-#     bash scripts/run_section25.sh --no-resume      # decoder_ft My Gemma làm LẠI từ đầu
+# Example: --dry-run, --detach, --stages stats,report, --retrain.
+# Batch hiệu dụng của R2Gen/AdaAtt theo cấu hình §2.5. Resume dùng lại
+# checkpoint, predictions và điểm đã có; --retrain chỉ áp dụng cho hai SOTA.
+# Candidate E luôn là checkpoint chỉ đọc.
 #
-# Mọi tham số chuyển thẳng cho `python -m src.run_section25`.
-#
-# ── MỤC NÀY HỎI GÌ ──────────────────────────────────────────────────────────
-# Trên CÙNG 6400 mẫu train và CÙNG 3000 ảnh test của tập này, công thức
-# Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10 có hơn hai kiến
-# trúc sinh báo cáo đã công bố không, và hơn BAO NHIÊU?
-#
-#     A  r2gen      ResNet-101 + Transformer 3 lớp + Relational Memory
-#     B  adaatt     ResNet-152 + LSTM + Adaptive Attention (Visual Sentinel)
-#     C  my_gemma   Gemma 3 4b-it NF4 + nhánh + Experts K=6·E=10, QLoRA r4
-#
-# k = 3 nhưng KHÔNG Friedman: ba cặp đều được quan tâm như nhau, nên mỗi cặp đi
-# permutation + bootstrap BCa, rồi Holm trên BA p-value trong TỪNG metric. Xem
-# README.md, phần kiểm định ghép cặp.
-#
-# ── STAGE 0 LÀ TIÊN QUYẾT, VÀ CHỈ CHO MY GEMMA ─────────────────────────────
-# Điều kiện 5 nói MỌI kiến trúc đi qua một stage pretrain cục bộ với CÙNG một
-# config. Hai baseline tự chạy nó bên trong `train_sota` (CNN đóng băng, phần
-# ngôn ngữ học trước). My Gemma thì NẠP từ `sup_pretrain` — mục ấy có điểm vào
-# riêng vì nó chạy trên TOÀN BỘ train split, và gộp vào đây nghĩa là mỗi lần
-# chạy lại §2.5 để in một bảng cũng kéo theo 5 epoch pretrain.
-#
-# Thiếu checkpoint ấy là DỪNG với mã 9, không phải chạy tiếp với nhánh ngẫu
-# nhiên. Muốn cố ý chạy không pretrain thì phải NÓI RA: `--init-from none`.
-#
-# ── KHÔNG DÒ BATCH ─────────────────────────────────────────────────────────
-# Batch hiệu dụng của mỗi candidate là con số của paper gốc (R2Gen 16, AdaAtt
-# 80) hoặc của §2.3 (My Gemma 1×32). Hết VRAM là DỪNG, và khoá làm được gì đó
-# là `sota_train.micro_batch` — nó chia MỘT batch thành nhiều lượt forward,
-# batch hiệu dụng và số bước KHÔNG đổi.
-#
-# Chạy lại chính lệnh này sau khi bị đứt là ĐI TIẾP:
-#   * candidate đã có checkpoint (model_best.pt / adapter + nhánh) -> bỏ qua train
-#   * ảnh đã sinh trong predictions/*.jsonl                        -> chỉ sinh phần thiếu
-#   * điểm đã chấm trong metrics/*.csv                             -> dùng lại
-#
-# `--no-resume` tắt cả ba điều trên cho decoder_ft của My Gemma: adapter,
-# predictions/my_gemma.jsonl và metrics/per_sample_my_gemma.csv được ĐỔI TÊN sang
-# `*.old_<thời điểm>` (không xoá), rồi train (vẫn nạp Stage 0) -> sinh -> chấm
-# lại. Hai baseline giữ nguyên (làm lại chúng bằng `--retrain`).
-#
-# Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 5 nhãn ·
-#           6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu Stage 0
-# ═════════════════════════════════════════════════════════════════════════════
+# Mã thoát: 0 xong · 2 cấu hình/checkpoint sai · 3 train hỏng · 4 rò rỉ ·
+#           5 nhãn · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng# ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

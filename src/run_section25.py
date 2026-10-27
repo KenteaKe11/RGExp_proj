@@ -1,53 +1,9 @@
-"""§2.5 — đối chứng với SOTA. Trọn một thí nghiệm trong MỘT lệnh.
+"""§2.5 — train the SOTA baselines, reuse Candidate E, then score/stat/report.
 
-    python -m src.run_section25                      # data -> … -> push
-    python -m src.run_section25 --dry-run            # 8 ảnh, 16 mẫu, 4 bước
-    python -m src.run_section25 --stages stats,report
-    python -m src.run_section25 --arms my_gemma
-    python -m src.run_section25 --init-from hub:OWNER/NAME/latest
-    python -m src.run_section25 --init-from none     # My Gemma KHÔNG pretrain
-    python -m src.run_section25 --no-resume          # decoder_ft My Gemma làm LẠI từ đầu
-
-Mã thoát:
-    0  xong
-    2  tham số/cấu hình sai
-    3  một candidate không huấn luyện được
-    4  rò rỉ train/test
-    5  nhãn phân loại không dùng được
-    6  một candidate không sinh được
-    7  stage `report` hỏng   -> chạy lại `--stages report`, kết quả còn nguyên
-    8  bước đẩy Hub hỏng     -> chạy lại `--stages push`
-    9  thiếu checkpoint Stage 0 của My Gemma -> chạy `scripts/run_pretrain.sh`
-
-── BA CANDIDATE, HAI HỌ CODE, MỘT ĐIỀU KIỆN ────────────────────────────────
-`r2gen` và `adaatt` đi qua `src/train_sota.py` + `src/runners/sota.py`;
-`my_gemma` đi qua `src/train_recomb.py` + `src/runners/gemma3_recomb.py`. Hai
-đường huấn luyện khác nhau là BẮT BUỘC — một ResNet+LSTM không huấn luyện được
-bằng vòng lặp LoRA của một VLM 4-bit — nhưng mọi thứ ở NGOÀI mô hình thì không:
-cùng `data`, cùng ảnh đã qua `image_policy`, cùng 3000 ảnh chấm, cùng
-`src/metrics.py` theo từng mẫu, cùng `src/stats_multi.py`.
-
-File này là chỗ ranh giới ấy được giữ, nên nó nói ra ranh giới ấy ở hai chỗ:
-`_deviations()` ghi mọi thứ §2.5 áp lên setup gốc, và stage `stats` DỪNG nếu
-thiếu bất kỳ cột nào (ba cặp đòi đủ ba cột — thiếu một là đổi thiết kế trong
-khi bảng vẫn in ra bình thường).
-
-── `--no-resume` — decoder_ft làm lại từ đầu ────────────────────────────────
-Mặc định mọi stage ĐI TIẾP từ đĩa: adapter đã có -> bỏ qua train, predictions
-đã có -> chỉ sinh phần thiếu, per_sample đã có -> dùng lại. Với decoder_ft của
-My Gemma, `--no-resume` bỏ qua cả ba: checkpoint decoder_ft, predictions và
-điểm của candidate `ours` được ĐỔI TÊN sang `*.old_<thời điểm>` (không xoá),
-rồi train (vẫn nạp Stage 0) -> sinh -> chấm lại từ đầu. `--retrain` thì chỉ
-huấn luyện lại và giữ predictions cũ — sinh tiếp trên file của model CŨ.
-Hai baseline không bị đụng; muốn làm lại chúng thì `--retrain`.
-
-── VÌ SAO STAGE 0 CỦA MY GEMMA KHÔNG CHẠY Ở ĐÂY ────────────────────────────
-`sup_pretrain` có điểm vào riêng (`scripts/run_pretrain.sh`), ghi ra
-`runs/<pretrain.subdir>/ckpt/latest`, và nó chạy trên TOÀN BỘ train split. Gộp nó
-vào đây nghĩa là mỗi lần chạy lại §2.5 để in một bảng cũng kéo theo 5 epoch
-pretrain — và tệ hơn, `--arms my_gemma` sẽ lặng lẽ pretrain LẠI trên một run
-dir khác. §2.5 chỉ NẠP checkpoint ấy và dừng nếu không thấy (mã 9).
+Candidate E is loaded from its configured retained checkpoint and is never
+trained or pulled automatically. The statistical protocol follows §2.3.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,8 +29,9 @@ def _hr(t: str) -> None:
     print(f"\n═══ {t} ═══", flush=True)
 
 
-def _read_preds(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _read_preds(path: Path) -> dict[str, dict]:
+    """Read full prediction records so Candidate E routing metadata survives."""
+    out: dict[str, dict] = {}
     if not path.exists():
         return out
     with open(path, "r", encoding="utf-8") as f:
@@ -86,7 +43,7 @@ def _read_preds(path: Path) -> dict[str, str]:
                 r = json.loads(line)
             except Exception:
                 continue
-            out[r["key"]] = r.get("pred", "")
+            out[r["key"]] = r
     return out
 
 
@@ -130,12 +87,7 @@ def _env_info() -> dict:
 
 # ── candidate ───────────────────────────────────────────────────────────────
 def enabled_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
-    """`arms_s25` đã kiểm — mọi cờ phân biệt candidate đều BẮT BUỘC.
-
-    Không cờ nào có mặc định ngầm, cùng lý lẽ với `recomb` của §2.3: một arm
-    quên khai `kind` mà lặng lẽ nhận "sota" nghĩa là candidate C được huấn
-    luyện bằng đường của baseline, và bảng vẫn có đủ ba cột.
-    """
+    """Kiểm danh sách arm §2.5; các cờ phân biệt candidate phải khai rõ."""
     raw = cfg.get("arms_s25") or []
     if not raw:
         raise ValueError(
@@ -184,7 +136,7 @@ def enabled_arms(cfg: Cfg, only: set[str] | None = None) -> list[dict]:
 def train_order(arms: list[dict]) -> list[dict]:
     """Candidate dễ hỏng nhất TRƯỚC — quy ước 1 của repo.
 
-    `order` khai thẳng trong config (my_gemma = 0). Không có `order` thì `ours`
+    `order` khai thẳng trong config. Không có `order` thì `ours`
     đi trước `sota`, rồi theo id. Thứ tự này KHÔNG được phép ảnh hưởng kết quả:
     seed đặt lại trước MỖI candidate, batch hiệu dụng là hằng số trong config,
     VRAM được dọn giữa hai candidate.
@@ -198,13 +150,15 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path, run_dir: Path) -> Cfg
     b = dict(cfg["base"])
     aid = arm["id"]
     if arm["kind"] == "ours":
+        adapter_dir = arm.get("reuse_adapter_dir") or (adapter_root / aid)
         return Cfg({
             "id": aid, "name": arm.get("name", aid), "runner": "gemma3_recomb",
             "hf_id": b["hf_id"], "dtype": b.get("dtype", "bfloat16"),
             "batch_size": int(b.get("batch_size", 2)),
             "disable_compile": b.get("disable_compile", "auto"),
             "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
-            "adapter_dir": str(adapter_root / aid),
+            "adapter_dir": str(adapter_dir),
+            "moe": bool(arm.get("moe", False)),
             "merge_adapter": False, "optional": False,
         })
     setup = arm["setup"]
@@ -258,27 +212,9 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
                 f"ĐIỀU KIỆN 5 — {a['id']}: paper gốc KHÔNG có stage pretrain "
                 f"cục bộ (`strategy: {ft.get('strategy')}`). Stage 0 thống nhất "
                 f"được thêm vào từ ngoài, rồi main-stage chạy đúng setup gốc.")
-    tc = dict(cfg.get("train") or {})
-    ftl = dict(tc.get("ft_lr") or {})
-    tsch = dict(tc.get("schedule") or {})
-    amult = float((cfg.get("recombiner") or {}).get("attn_lr_mult", 3.0))
-    frozen = tc.get("freeze_after_pretrain") or []
-    if isinstance(frozen, str):
-        frozen = [frozen]
-    if tc.get("freeze_pretrained"):
-        frozen = ["recombinator", "cls_head"]
     out.append(
-        f"ĐIỀU KIỆN 5 — phần đã qua Stage 0 của hai baseline chạy main-stage ở "
-        f"{mult:g}× lr chính thức (`train.pretrained_lr_mult`). My Gemma "
-        f"Stage 0 cho ma trận Attn của Recombinator lr × {amult:g} "
-        f"(`recombiner.attn_lr_mult`). decoder_ft fine-tune TOÀN BỘ, lr đỉnh "
-        f"từng nhóm (`train.ft_lr`): "
-        + ", ".join(f"{k} {float(v):.0e}" for k, v in ftl.items())
-        + f"; adapter (LoRA/Experts) {float(tsch.get('max_lr', 0)):.0e}; MỘT chu "
-        f"kỳ one-cycle cho cả stage, đầu warm-up và đáy làm tròn xuống "
-        f"(`round_down_sig` {tsch.get('round_down_sig', 0)}), đáy nhỏ nhất "
-        f"{float(tsch.get('min_lr', 0)):.0e}; đóng băng: "
-        f"{', '.join(frozen) or 'không'} (`train.freeze_after_pretrain`).")
+        "CANDIDATE E — giữ nguyên checkpoint đã huấn luyện trong §2.3; "
+        "§2.5 không cập nhật trọng số E.")
     st = dict(cfg.get("sota_train", {}) or {})
     out.append(
         f"KỸ THUẬT — batch của paper được chia thành nhiều lượt forward "
@@ -297,7 +233,7 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         + ("; lệch so với paper: " + "; ".join(
             f"{k}: {', '.join(v)}" for k, v in diffs.items() if v)
            if any(diffs.values()) else "")
-        + ". Độ dài tối đa khác nhau theo từ điển: My Gemma "
+        + ". Độ dài tối đa khác nhau theo từ điển: Candidate E "
         f"{decoding_spec.unified(cfg)['max_new_tokens']} subword, hai baseline "
         f"`max_seq_length − 1` từ.")
     out.append(
@@ -311,62 +247,22 @@ def _deviations(cfg: Cfg, arms: list[dict]) -> list[str]:
         "config (max_seq_length 60, min_word_frequency 3).")
     out.append(
         "KHÔNG ĐỔI — ngoài các mục trên, R2Gen và AdaAtt chạy optimizer, lr "
-        "và tiêu chí chọn checkpoint của paper gốc; My Gemma chạy "
-        "lịch của §2.3/§2.4. Đó là một khác biệt THẬT giữa ba cột và nó thuộc "
-        "phần Giới hạn, không phải một lỗi cần sửa.")
+        "và tiêu chí chọn checkpoint của paper gốc. Candidate E là mô hình "
+        "đã huấn luyện trước, không phải arm train mới của §2.5.")
     return out
 
 
-def ft_artifacts(arm: dict, adapter_root: Path, run_dir: Path) -> list[Path]:
-    """Những gì §2.5 ĐỌC LẠI từ đĩa cho một candidate: checkpoint, sinh, điểm."""
-    aid = arm["id"]
-    return [adapter_root / aid,
-            run_dir / "predictions" / f"{aid}.jsonl",
-            run_dir / "metrics" / f"per_sample_{aid}.csv"]
-
-
-def archive_ft(arms: list[dict], adapter_root: Path, run_dir: Path,
-               stamp: str) -> list[tuple[Path, Path]]:
-    """`--no-resume`: ĐỔI TÊN (không xoá) mọi thứ đọc lại được của decoder_ft.
-
-    Chỉ candidate `ours` — hai baseline không có decoder_ft. Đổi tên chứ không
-    xoá: một lần gõ nhầm cờ không được phép vứt hàng giờ GPU. Trả [(cũ, mới)].
-    """
-    moved: list[tuple[Path, Path]] = []
-    for arm in arms:
-        if arm.get("kind") != "ours":
-            continue
-        for src in ft_artifacts(arm, adapter_root, run_dir):
-            if not src.exists():
-                continue
-            dst = src.with_name(f"{src.name}.old_{stamp}")
-            i = 1
-            while dst.exists():
-                dst = src.with_name(f"{src.name}.old_{stamp}_{i}")
-                i += 1
-            src.rename(dst)
-            moved.append((src, dst))
-    return moved
-
-
-# ════════════════════════════════════════════════════════════════════════════
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="§2.5 — R2Gen vs AdaAtt vs My Gemma, trọn gói.")
+        description="§2.5 — R2Gen · AdaAtt · Candidate E, trọn gói.")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None, help="chỉ chạy các arm này (phẩy ngăn cách)")
     ap.add_argument("--run-id", default=None)
-    ap.add_argument("--init-from", default=None,
-                    help="nguồn Stage 0 cho My Gemma: thư mục | hub:OWNER/NAME/latest "
-                         "| none (đối chứng from-scratch, PHẢI nói ra)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true")
-    ap.add_argument("--no-resume", action="store_true",
-                    help="decoder_ft của My Gemma làm LẠI từ đầu: bỏ qua (đổi tên "
-                         "sang *.old_<ts>) checkpoint ft, predictions và điểm cũ")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -385,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"]["n_train"] = 16
         cfg["data"]["n_val"] = 8
         cfg["stats"]["n_perm"] = 200
-        cfg["stats"]["n_boot"] = 200
+        cfg["stats"]["n_boot"] = 4
         cfg["pretrain"]["n_epochs"] = 1
         cfg["output"]["push"] = False
         cfg["output"]["subdir"] = str(cfg["output"].get("subdir", "run")) + "_dryrun"
@@ -419,41 +315,11 @@ def main(argv: list[str] | None = None) -> int:
         print("✗ không arm nào được bật")
         return 2
 
-    ft_arms = [x for x in arms if x["kind"] == "ours"]
-    if a.no_resume:
-        if "train" not in stages:
-            print("✗ --no-resume làm lại decoder_ft từ đầu nên cần stage `train` "
-                  "(đang --stages " + ",".join(stages) + ").\n"
-                  "    Chỉ muốn chấm lại: --rescore. Chỉ muốn sinh lại: xoá "
-                  "predictions/<arm>.jsonl.")
-            return 2
-        if not ft_arms:
-            print("✗ --no-resume chỉ áp cho decoder_ft của My Gemma, nhưng "
-                  "không candidate `ours` nào đang được chọn (--arms). Hai "
-                  "baseline làm lại bằng --retrain.")
-            return 2
-        if str(a.init_from or "").lower() == "none":
-            print("⚠ --no-resume + --init-from none: đây là chạy scratch, "
-                  "không phải decoder_ft — vẫn làm lại từ đầu.", flush=True)
-
     run_id = a.run_id or str(cfg["output"].get("subdir", "2.5_sota"))
     run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
     adapter_root = Path(str(cfg["output"].get("adapter_dir", "./adapters_2_5")))
 
-    no_resume_moved: list[tuple[Path, Path]] = []
-    if a.no_resume:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        no_resume_moved = archive_ft(ft_arms, adapter_root, run_dir, stamp)
-        print(f"⚙ --no-resume: decoder_ft của "
-              f"{', '.join(x['id'] for x in ft_arms)} làm LẠI từ đầu "
-              f"(train -> sinh -> chấm).", flush=True)
-        if no_resume_moved:
-            for old, new in no_resume_moved:
-                print(f"    {old} -> {new.name}", flush=True)
-            print("    (đổi tên, KHÔNG xoá — dọn tay khi chắc chắn)", flush=True)
-        else:
-            print("    không có gì cũ để cất.", flush=True)
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
     declared = [x["id"] for x in arms]
 
@@ -468,18 +334,15 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "run_id": run_id, "experiment": "2.5",
-        "no_resume": ({"arms": [x["id"] for x in ft_arms],
-                       "archived": [[str(o), str(n)] for o, n in no_resume_moved]}
-                      if a.no_resume else None),
-        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": resolved_snapshot(cfg), "env": _env_info(),
         "stages_run": stages, "arms_declared": declared, "arm_status": {},
         "deviations": _deviations(cfg, arms),
         "image_policy": imaging.describe_unified(cfg),
     }
     t_start = time.time()
-    print("\n═══ §2.5 — R2Gen · AdaAtt · My Gemma: ba cặp, bootstrap BCa + "
-          "permutation, Holm trên cặp ═══", flush=True)
+    print("\n═══ §2.5 — R2Gen · AdaAtt · Candidate E: đối chứng ghép cặp theo §2.3 "
+          "(4 bootstrap × 7500, permutation) ═══", flush=True)
     print("  candidate: " + " · ".join(f"{x['id']}[{x['kind']}]" for x in arms),
           flush=True)
     print(f"  ảnh (điều kiện 4): {manifest['image_policy']}", flush=True)
@@ -489,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     from . import train_sota as ts_mod
 
     def _trained(arm: dict) -> bool:
-        d = adapter_root / arm["id"]
+        d = Path(arm.get("reuse_adapter_dir") or (adapter_root / arm["id"]))
         if arm["kind"] == "sota":
             return ts_mod.already_trained(d)
         try:
@@ -514,8 +377,10 @@ def main(argv: list[str] | None = None) -> int:
 
     arms_to_train: list[dict] = []
     if "train" in stages:
-        arms_to_train = (list(arms) if a.retrain
-                         else [x for x in arms if not cache[x["id"]]["trained"]])
+        trainable = [x for x in arms if not x.get("reuse_only")]
+        arms_to_train = (trainable if a.retrain
+                         else [x for x in trainable
+                               if not cache[x["id"]]["trained"]])
         if not arms_to_train:
             print("⚙ mọi candidate đã có checkpoint — BỎ QUA stage train và cả "
                   "việc chuẩn bị tập train (--retrain để làm lại)", flush=True)
@@ -532,58 +397,40 @@ def main(argv: list[str] | None = None) -> int:
         print("⚠ Không thấy HF_TOKEN — google/gemma-3-4b-it là gated repo.\n"
               "    export HF_TOKEN=hf_xxxxxxxx", flush=True)
 
-    # ── Stage 0 của My Gemma: GIẢI QUYẾT MỘT LẦN, ở giây thứ nhất ──────────
-    ours = [x for x in arms if x["kind"] == "ours"]
-    if ours and need_train and any(x in arms_to_train for x in ours):
-        spec = a.init_from
-        if spec is None:
-            p = dict(cfg.get("pretrain", {}) or {})
-            spec = str(Path(cfg["output"].get("dir", "./runs"))
-                       / str(p.get("subdir", "sup_pretrain")) / "ckpt" / "latest")
-        if str(spec).lower() == "none":
-            cfg["pretrain_init"] = None
-            cfg["mode"] = "scratch"
-            manifest["deviations"].append(
-                "ĐỐI CHỨNG — My Gemma chạy `--init-from none`: nhánh KHÔNG qua "
-                "Stage 0, trong khi hai baseline thì có. Cột này không so được "
-                "với một lần chạy có pretrain.")
-            print("⚙ My Gemma: --init-from none -> nhánh khởi tạo NGẪU NHIÊN "
-                  "(đối chứng, đã ghi vào deviations)", flush=True)
-        else:
-            from . import pretrain_io
-
-            try:
-                src = pretrain_io.resolve_source(
-                    spec, cache_dir=cfg["data"].get("cache_dir", "./data"))
-            except Exception as e:
-                print(f"\n✗ DỪNG — không lấy được checkpoint Stage 0 cho My "
-                      f"Gemma:\n    {e}\n"
-                      f"  Điều kiện 5 nói MỌI kiến trúc đi qua Stage 0. Hai "
-                      f"baseline tự chạy nó trong `train_sota`; My Gemma thì "
-                      f"nạp từ `sup_pretrain`, và nó có điểm vào riêng:\n"
-                      f"      bash scripts/run_pretrain.sh --detach\n"
-                      f"  Muốn cố ý chạy không pretrain thì phải NÓI RA:\n"
-                      f"      --init-from none", flush=True)
-                tracker.finish(1)
-                return 9
-            cfg["pretrain_init"] = str(src)
-            cfg["mode"] = "decoder_ft"
-            meta = {}
-            try:
-                meta = pretrain_io.read_meta(src)
-            except Exception:
-                pass
-            manifest["pretrain_init"] = {"source": str(src), "meta": meta}
-            print(f"⚙ My Gemma Stage 0: {src}"
-                  + (f" · {meta.get('n_train')} mẫu · epoch {meta.get('epoch')}"
-                     if meta else ""), flush=True)
-
     # ── data ───────────────────────────────────────────────────────────────
     from . import data as data_mod
     from . import data_train as dt_mod
 
     train_df = val_df = None
-    if "data" in stages:
+    reuse = bool(cfg["data"].get("reuse_manifests", False))
+    if reuse:
+        from .data import manifest_root
+
+        mroot = manifest_root(cfg)
+        need_files = ["testset.jsonl"] + (["trainset.jsonl"] if need_train else [])
+        gone = [f for f in need_files if not (mroot / f).is_file()]
+        if gone:
+            print(f"✗ data.reuse_manifests=true nhưng thiếu {gone} trong {mroot}. "
+                  f"Đặt manifest §2.3 vào đó (hoặc --set data.reuse_manifests=false "
+                  f"để lấy mẫu lại — khi ấy mẫu KHÔNG còn là mẫu của §2.3).")
+            return 2
+    if reuse:
+        test_df = data_mod.load_manifest(cfg)
+        n_test = int(cfg["data"].get("n_test") or 0)
+        if n_test and len(test_df) != n_test and not a.dry_run:
+            print(f"✗ manifest test §2.3 có {len(test_df)} mẫu, config khai {n_test}.")
+            return 2
+        print(f"⚙ dùng lại {len(test_df)} mẫu test của §2.3 ({mroot})", flush=True)
+        if need_train:
+            train_df, val_df = dt_mod.load_train_manifest(cfg)
+            leak = dt_mod.check_leak(train_df["key"].tolist(), test_df["key"].tolist())
+            if leak and bool(cfg["data"].get("assert_no_leak", True)):
+                print(f"\n✗ DỪNG — RÒ RỈ DỮ LIỆU: {len(leak)} key train ∩ test", flush=True)
+                tracker.finish(1)
+                return 4
+            print(f"⚙ dùng lại {len(train_df)} train · {len(val_df)} val của §2.3",
+                  flush=True)
+    elif "data" in stages:
         test_df = data_mod.prepare(cfg, tracker)
         if need_train:
             try:
@@ -678,13 +525,35 @@ def main(argv: list[str] | None = None) -> int:
                 return 3
     else:
         for arm in arms:
-            p = adapter_root / arm["id"] / "train_stats.json"
+            p = Path(arm.get("reuse_adapter_dir") or
+                     (adapter_root / arm["id"])) / "train_stats.json"
+            if p.exists():
+                train_stats.append(json.loads(p.read_text(encoding="utf-8")))
+    if need_train:
+        for arm in arms:
+            if not arm.get("reuse_only"):
+                continue
+            p = Path(arm["reuse_adapter_dir"]) / "train_stats.json"
             if p.exists():
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
 
     # ── infer ──────────────────────────────────────────────────────────────
     pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
     if "infer" in stages:
+        missing_reuse = [x for x in arms if x.get("reuse_only")
+                         and not (Path(x.get("reuse_adapter_dir", "")) /
+                                  "train_stats.json").is_file()]
+        if missing_reuse:
+            paths = [str(x.get("reuse_adapter_dir")) for x in missing_reuse]
+            message = ("Không thấy checkpoint/train_stats của Candidate E tại: "
+                       + ", ".join(paths)
+                       + ". Đặt checkpoint đã giữ từ §2.3 vào đường dẫn khai "
+                         "trong configs/section25.yaml. §2.5 không tự pull và "
+                         "không train đè E.")
+            print(f"✗ {message}", flush=True)
+            tracker.alert("§2.5 thiếu checkpoint Candidate E", message, "ERROR")
+            tracker.finish(1)
+            return 2
         _hr("Sinh báo cáo")
         from .runners import build
         from .runners.base import RunnerUnusable
@@ -700,8 +569,8 @@ def main(argv: list[str] | None = None) -> int:
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                     "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
             except RunnerUnusable as e:
-                # Ba cặp đòi ĐỦ ba cột. Chạy tiếp với 2/3 là lặng lẽ đổi thiết
-                # kế — bảng vẫn in ra, chỉ thiếu một dòng, và không gì nói rằng
+                # Các cặp đòi đủ ba candidate. Chạy thiếu một arm là đổi thiết
+                # kế kiểm định — bảng sẽ thiếu cặp và không còn cùng câu hỏi.
                 # cặp thiếu ấy chính là cặp quan trọng nhất.
                 print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
                 manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
@@ -732,7 +601,8 @@ def main(argv: list[str] | None = None) -> int:
             if not keys:
                 print(f"  ⚠ [{aid}] không có dự đoán nào", flush=True)
                 continue
-            sdf, _c = score_model(cfg, keys, [preds[k] for k in keys],
+            sdf, _c = score_model(cfg, keys,
+                                  [preds[k].get("pred", "") for k in keys],
                                   [ref_map[k] for k in keys], label=aid)
             sdf.to_csv(csv_path, index=False)
             scores[aid] = sdf
@@ -743,6 +613,35 @@ def main(argv: list[str] | None = None) -> int:
             p = mdir / f"per_sample_{arm['id']}.csv"
             if p.exists():
                 scores[arm["id"]] = pd.read_csv(p)
+
+    # Candidate E needs the Route assignment only for its expert × disease
+    # table. It is metadata, not an evaluation metric or a statistical column.
+    for arm in arms:
+        aid = arm["id"]
+        if not arm.get("moe") or aid not in scores:
+            continue
+        preds = _read_preds(pred_paths[aid])
+        score = scores[aid]
+        if "route_experts" in score.columns:
+            routes = score["route_experts"].map(
+                lambda value: json.loads(value) if isinstance(value, str) else value)
+        else:
+            routes = score["key"].astype(str).map(
+                lambda key: preds.get(key, {}).get("route_experts"))
+        missing_routes = int(routes.map(
+            lambda value: not value or not isinstance(value, (list, tuple))).sum())
+        if missing_routes:
+            message = (
+                f"Candidate E thiếu route_experts cho {missing_routes} "
+                "mẫu trong prediction. Chạy stage infer để bổ sung routing "
+                "metadata trước khi lập bảng expert × 14 bệnh.")
+            print(f"✗ {message}", flush=True)
+            tracker.alert("§2.5 thiếu routing metadata", message, "ERROR")
+            tracker.finish(1)
+            return 1
+        score["route_experts"] = routes.map(json.dumps)
+        scores[aid] = score
+        score.to_csv(mdir / f"per_sample_{aid}.csv", index=False)
 
     missing = [i for i in declared if i not in scores]
     if missing:
@@ -771,17 +670,18 @@ def main(argv: list[str] | None = None) -> int:
     pw = pd.DataFrame()
     pw_path = mdir / "pairwise_tests.csv"
     if "stats" in stages:
-        _hr("Bootstrap ghép cặp BCa + Permutation, Holm trên ba cặp")
+        _hr("Bootstrap ghép cặp §2.3 + Permutation")
         from .stats_multi import (compare_pairs, pair_list, resolution_warning,
                                   summary_lines)
 
         cols = metric_columns(scores[declared[0]])
         scfg = dict(cfg["stats"])
         pairs = pair_list(declared, scfg.get("pairs", "all"), scfg.get("reference"))
-        print(f"  {len(pairs)} cặp × {len(cols)} metric × 2 kiểm định trên "
+        print(f"  {len(pairs)} cặp × {len(cols)} metric trên "
               f"{align_info['n_common']} ảnh ghép cặp "
-              f"(n_perm={scfg.get('n_perm')}, n_boot={scfg.get('n_boot')}, "
-              f"Holm theo `{scfg.get('adjust_scope', 'pairs')}`)", flush=True)
+              f"(4 bootstrap subset × {scfg.get('bootstrap_sample_size')} lượt "
+              f"có hoàn lại, n_perm={scfg.get('n_perm')}; ý nghĩa: "
+              f"p_perm thô < α và CI loại 0)", flush=True)
         w = resolution_warning(int(scfg.get("n_perm", 10000)),
                                float(scfg.get("alpha", 0.05)), len(pairs))
         if w:
@@ -793,9 +693,10 @@ def main(argv: list[str] | None = None) -> int:
         pw.to_csv(pw_path, index=False)
         n_sig = int(pw["significant"].sum())
         n_mat = int(pw["significant_and_material"].sum())
-        print(f"  -> {n_sig}/{len(pw)} dòng bác H0 ở CẢ HAI kiểm định (Holm, "
-              f"α={scfg.get('alpha', 0.05)}); {n_mat} trong đó có |dz| >= "
-              f"{scfg.get('dz_floor', 0.1)}", flush=True)
+        print(f"  -> {n_sig}/{len(pw)} dòng có ý nghĩa theo §2.3 "
+              f"(p_perm thô < α và CI loại 0; α={scfg.get('alpha', 0.05)}); "
+              f"{n_mat} còn đạt |dz| >= {scfg.get('dz_floor', 0.1)}",
+              flush=True)
         primary = str(cfg["metrics"].get("primary", "bertscore_f1"))
         lines = summary_lines(pw, primary, names)
         manifest["headline"] = lines

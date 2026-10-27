@@ -1,13 +1,11 @@
-"""Bảng tra runner theo tên trong config của §2.6.
+"""Bảng tra runner theo tên trong config.
 
-§2.6 chỉ cần hai họ runner, cả hai đều là Gemma 3 4B-it:
-
-    gemma3          — base trần (không adapter): baseline gốc, đối chứng duy nhất.
-    gemma3_adapter  — base NF4 + adapter QDoRA đã huấn luyện (nửa sau SigLIP +
-                      projector), một runner cho cả ba rank 2 / 4 / 8.
-
-Các runner của §2.5 (gemma3_recomb, r2gen, adaatt) đã được chuyển vào
-`_archive/` cùng với đường điều phối của chúng.
+    gemma3          — base trần (không adapter), dùng cho §2.6.
+    gemma3_adapter  — base NF4 + adapter QDoRA đã huấn luyện (§2.6).
+    gemma3_recomb   — base + Recombinator/MoE-LoRA; §2.5 dùng nó để infer
+                      Candidate E từ checkpoint §2.3 (chỉ đọc).
+    r2gen, adaatt   — hai baseline SOTA của §2.5, nạp checkpoint do
+                      `src/train_sota.py` ghi ra (không đi qua peft).
 """
 from __future__ import annotations
 
@@ -29,9 +27,17 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3_recomb import Gemma3RecombRunner
 
         return Gemma3RecombRunner(cfg, mcfg, tracker)
+    if kind == "r2gen":
+        from .sota import R2GenRunner
+
+        return R2GenRunner(cfg, mcfg, tracker)
+    if kind == "adaatt":
+        from .sota import AdaAttRunner
+
+        return AdaAttRunner(cfg, mcfg, tracker)
     raise ValueError(
         f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_adapter', "
-        f"'gemma3_recomb'.")
+        f"'gemma3_recomb', 'r2gen', 'adaatt'.")
 
 
 __all__ = ["build", "Runner"]

@@ -77,7 +77,11 @@ def t_arms_valid():
     arms = enabled_arms(CFG)
     assert len(arms) == 3, [a["id"] for a in arms]
     kinds = {a["id"]: a["kind"] for a in arms}
-    assert kinds["my_gemma"] == "ours" and kinds["r2gen"] == "sota"
+    assert kinds["moe_shared_lora"] == "ours" and kinds["r2gen"] == "sota"
+    assert kinds["adaatt"] == "sota"
+    e = next(a for a in arms if a["id"] == "moe_shared_lora")
+    assert e.get("reuse_only") is True and e.get("moe") is True, e
+    assert e.get("reuse_adapter_dir"), "Candidate E phải khai reuse_adapter_dir"
 
 
 def t_arm_flags_are_mandatory():
@@ -102,7 +106,7 @@ def t_arm_flags_are_mandatory():
 
 
 def t_moe_config_matches_24():
-    arm = next(a for a in CFG["arms_s25"] if a["id"] == "my_gemma")
+    arm = next(a for a in CFG["arms_s25"] if a["id"] == "moe_shared_lora")
     assert int(arm["top_k"]) == 6 and int(arm["n_experts"]) == 10
     assert CFG["moe"]["enabled"] is True
     assert int(CFG["recombiner"]["n_experts"]) == 10
@@ -113,40 +117,25 @@ def t_pretrained_lr_mult_is_one_tenth():
     assert abs(float(CFG["train"]["pretrained_lr_mult"]) - 0.1) < 1e-12
 
 
-def t_lr_asl_lambda_config():
-    """Con số của cấu hình hiện tại — đặc tả trong README/config phải khớp."""
-    p, t = CFG["pretrain"], CFG["train"]
-    assert abs(float(p["schedule"]["max_lr"]) - 1.6e-4) < 1e-12
-    assert abs(float(p["weight_decay"]) - 0.2) < 1e-12
-    assert float(CFG["recombiner"]["attn_lr_mult"]) == 3.0
-    assert {k: float(v) for k, v in t["ft_lr"].items()} == {
-        "cls_head": 3e-5, "route_head": 6e-4, "dec_proj": 3e-4,
-        "recombinator_local": 3e-5, "recombinator_global": 3e-5,
-        "recombinator_ffn": 3e-4}
-    s = t["schedule"]
-    assert "cycle_steps" not in s and "lr_decay" not in s, "decoder_ft: một chu kỳ"
-    from src.backbone import cycle_endpoints
-
-    assert float(s["max_lr"]) == 1e-4, "LoRA/Experts 1e-4"
-    assert int(s["round_down_sig"]) == 1
-    ends = [cycle_endpoints(v, s["div_factor"], s["final_div_factor"], 1)
-            for v in list(t["ft_lr"].values()) + [s["max_lr"]]]
-    assert (3e-6, 1e-7) in ends and (2e-5, 6e-7) in ends, ends
-    assert min(e for _, e in ends) == float(s["min_lr"]) == 3e-8
-    assert "pretrained_lr_div" not in t
-    assert list(t["freeze_after_pretrain"] or []) == []
-    assert "pretrained_lr_parts" not in t
-    c = CFG["classifier"]
-    assert [float(x) for x in c["asl"]["gamma_neg"]] == [4.0, 2.0, 0.0]
-    assert float(c["asl"]["clip"]) == 0.08
-    assert float(c["lambda"]) == 0.4
-    assert int(CFG["data"]["n_train"]) == int(p["n_train"]) == 6400
+def t_protocol_numbers_config_and_readme():
+    """Con số của giao thức §2.5 trong config phải khớp README."""
+    st = CFG["stats"]
+    assert float(st["alpha"]) == 0.05
+    assert int(st["n_boot"]) == 4 and int(st["bootstrap_sample_size"]) == 7500
+    seeds = [int(x) for x in st["bootstrap_seeds"]]
+    assert len(seeds) == 4 and len(set(seeds)) == 4, seeds
+    assert int(st["n_perm"]) == 10000
+    assert str(st["ci_method"]) == "percentile"
+    assert str(st["pairs"]) == "vs_reference"
+    assert str(st["reference"]) == "moe_shared_lora"
+    assert int(CFG["data"]["n_test"]) == 3000
+    assert int(CFG["data"]["n_train"]) == int(CFG["pretrain"]["n_train"]) == 6400
+    for m in ("chexbert", "radgraph"):
+        assert CFG["metrics"][m]["enabled"] is True, m
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for s in ("attn_lr_mult", "train.ft_lr", "**3e-8**", "round_down_sig",
-              "weight_decay: 0.2",
-              "gamma_neg: [4.0, 2.0, 0.0]", "classifier.lambda: 0.4",
-              "6400 mẫu train"):
-        assert s in readme, f"README không nhắc `{s}`"
+    for needle in ("7.500", "10.000", "Holm", "reuse_adapter_dir", "f1chexbert",
+                   "Candidate E"):
+        assert needle in readme, f"README không nhắc `{needle}`"
 
 
 def t_stage0_schedule_encodes_min_lr():
@@ -167,7 +156,15 @@ def t_train_order_heaviest_first():
     from src.run_section25 import enabled_arms, train_order
 
     order = [a["id"] for a in train_order(enabled_arms(CFG))]
-    assert order[0] == "my_gemma", order
+    assert order[0] == "moe_shared_lora", order
+
+
+def t_reuse_only_arm_is_never_trained():
+    """E là checkpoint chỉ đọc: `--retrain` cũng không được chạm tới nó."""
+    txt = (ROOT / "src" / "run_section25.py").read_text(encoding="utf-8")
+    assert 'trainable = [x for x in arms if not x.get("reuse_only")]' in txt
+    assert "reuse_only" in txt and "train_recomb.train_arm" not in txt.split(
+        "def main")[0]
 
 
 # ── 2. Điều kiện 4 — chính sách ảnh ────────────────────────────────────────
@@ -230,12 +227,22 @@ def t_stats_multi_reuses_stats_ab():
 def t_pair_list_three_pairs_reference_at_a():
     from src.stats_multi import pair_list
 
-    pairs = pair_list(["r2gen", "adaatt", "my_gemma"], "all", "my_gemma")
+    pairs = pair_list(["r2gen", "adaatt", "moe_shared_lora"], "all",
+                      "moe_shared_lora")
     assert len(pairs) == 3, pairs
     for a, b in pairs:
-        if "my_gemma" in (a, b):
-            assert a == "my_gemma", (a, b)
+        if "moe_shared_lora" in (a, b):
+            assert a == "moe_shared_lora", (a, b)
     assert ("r2gen", "adaatt") in pairs or ("adaatt", "r2gen") in pairs
+
+
+def t_pair_list_vs_reference_is_sota_vs_e():
+    from src.stats_multi import pair_list
+
+    pairs = pair_list(["r2gen", "adaatt", "moe_shared_lora"],
+                      CFG["stats"]["pairs"], CFG["stats"]["reference"])
+    assert sorted(pairs) == [("moe_shared_lora", "adaatt"),
+                             ("moe_shared_lora", "r2gen")], pairs
 
 
 def t_pair_list_rejects_unknown_reference():
@@ -319,7 +326,7 @@ def t_no_friedman_on_25_path():
 def t_config_declares_no_friedman():
     assert "friedman" not in CFG["stats"], (
         "stats.friedman còn sót trong config §2.5")
-    assert str(CFG["stats"].get("adjust_scope")) == "pairs"
+    assert str(CFG["stats"].get("adjust_scope")) == "metrics"
 
 
 # ── 4. Từ điển ─────────────────────────────────────────────────────────────
@@ -786,48 +793,6 @@ def t_deviations_name_conditions_4_and_5():
     assert "micro_batch" in d
 
 
-def t_no_resume_archives_only_ours():
-    """`--no-resume` cất (đổi tên) đúng ba thứ của My Gemma, không đụng baseline."""
-    import tempfile
-
-    from src.run_section25 import archive_ft
-
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        ad, rd = d / "adapters", d / "run"
-        for aid in ("my_gemma", "r2gen"):
-            (ad / aid).mkdir(parents=True)
-            (ad / aid / "train_stats.json").write_text("{}")
-            (rd / "predictions").mkdir(parents=True, exist_ok=True)
-            (rd / "metrics").mkdir(parents=True, exist_ok=True)
-            (rd / "predictions" / f"{aid}.jsonl").write_text("{}\n")
-            (rd / "metrics" / f"per_sample_{aid}.csv").write_text("key\n")
-        arms = [{"id": "my_gemma", "kind": "ours"}, {"id": "r2gen", "kind": "sota"}]
-        moved = archive_ft(arms, ad, rd, "T")
-        assert len(moved) == 3, moved
-        assert not (ad / "my_gemma").exists()
-        assert (ad / "my_gemma.old_T" / "train_stats.json").exists()
-        assert not (rd / "predictions" / "my_gemma.jsonl").exists()
-        assert (rd / "predictions" / "my_gemma.jsonl.old_T").exists()
-        assert (rd / "metrics" / "per_sample_my_gemma.csv.old_T").exists()
-        for pth in (ad / "r2gen", rd / "predictions" / "r2gen.jsonl",
-                    rd / "metrics" / "per_sample_r2gen.csv"):
-            assert pth.exists(), f"baseline bị đụng: {pth}"
-        (ad / "my_gemma").mkdir()
-        moved = archive_ft(arms, ad, rd, "T")
-        assert moved and moved[0][1].name == "my_gemma.old_T_1", moved
-
-
-def t_no_resume_requires_train_stage():
-    from src.run_section25 import main
-
-    rc = main(["--no-resume", "--stages", "stats,report", "--no-wandb",
-               "--no-push"])
-    assert rc == 2, rc
-    rc = main(["--no-resume", "--arms", "r2gen", "--no-wandb", "--no-push"])
-    assert rc == 2, rc
-
-
 def t_beam_size_is_3_everywhere():
     """Ba candidate sinh cùng một độ rộng beam."""
     assert int(CFG["generate"]["num_beams"]) == 3
@@ -889,6 +854,153 @@ def t_recomb_runner_passes_beams_to_routing():
     assert "generate.num_beams != 1" not in src, "chặn beam cũ vẫn còn"
 
 
+# ── 9. Giao thức kiểm định §2.5 và sinh report ─────────────────────────────
+def _fake_scores_with_counts(n=400, shift=0.0, seed=0):
+    df = _fake_scores(n=n, shift=shift, seed=seed)
+    rng = np.random.default_rng(seed + 100)
+    p = np.clip(0.5 + shift, 0.05, 0.95)
+    gold = rng.integers(2, 8, size=n)
+    tp = rng.binomial(gold, p).astype(float)
+    df["chexbert_tp"] = tp
+    df["chexbert_fn"] = gold - tp
+    df["chexbert_fp"] = rng.integers(0, 3, size=n).astype(float)
+    den = 2 * df["chexbert_tp"] + df["chexbert_fp"] + df["chexbert_fn"]
+    df["chexbert_f1"] = 2 * df["chexbert_tp"] / den
+    return df
+
+
+def t_protocol_25_detects_shift_and_null():
+    """E làm A; SOTA (B) kém hơn E thật thì B − A < 0 và E thắng; bản sao của E
+    thì không ý nghĩa. Dùng đúng khối `stats` của config (4 × 7500 · percentile)."""
+    from src.stats_multi import compare_pairs
+
+    scfg = dict(CFG["stats"])
+    scfg["n_perm"] = 1000
+    scores = {"moe_shared_lora": _fake_scores(seed=1),
+              "r2gen": _fake_scores(seed=1, shift=-0.08),
+              "adaatt": _fake_scores(seed=1)}
+    df = compare_pairs(scores, ["bleu4", "bertscore_f1"], scfg,
+                       ["r2gen", "adaatt", "moe_shared_lora"])
+    assert len(df) == 2 * 2, len(df)
+    assert set(df["arm_a"]) == {"moe_shared_lora"}, "E phải luôn ở vị trí A"
+    assert set(df["ci_method"]) == {"percentile"}
+    weak = df[df["arm_b"] == "r2gen"]
+    assert weak["significant_and_material"].all(), weak.to_dict("records")
+    assert (weak["mean_diff"] < 0).all() and (weak["winner"] == "moe_shared_lora").all()
+    same = df[df["arm_b"] == "adaatt"]
+    assert not same["significant"].any(), "bản sao của E mà bác được H0"
+    # Quy tắc kết luận: p_perm thô < alpha VÀ CI loại 0 — không qua Holm.
+    want = (df["p_perm"] < 0.05) & ((df["ci_lo"] > 0) | (df["ci_hi"] < 0))
+    assert (df["significant"] == want).all()
+
+
+def t_protocol_25_bootstrap_seed_guards():
+    from src.stats_multi import compare_pairs
+
+    scores = {"moe_shared_lora": _fake_scores(seed=1), "r2gen": _fake_scores(seed=2)}
+    base = dict(CFG["stats"], n_perm=50)
+    for bad in ([1, 2, 3], [1, 1, 2, 2]):
+        try:
+            compare_pairs(scores, ["bleu4"], dict(base, bootstrap_seeds=bad),
+                          ["r2gen", "moe_shared_lora"])
+        except ValueError:
+            continue
+        raise AssertionError(f"bootstrap_seeds={bad} mà vẫn qua")
+
+
+def t_protocol_25_subsets_shared_across_pairs():
+    """Mọi cặp/metric dùng CHUNG 4 subset: cùng dữ liệu thì cùng kết quả."""
+    from src.stats_multi import compare_pairs
+
+    scfg = dict(CFG["stats"], n_perm=100)
+    a, b = _fake_scores(seed=1), _fake_scores(seed=2)
+    one = compare_pairs({"moe_shared_lora": a, "r2gen": b}, ["bleu4"], scfg,
+                        ["r2gen", "moe_shared_lora"])
+    two = compare_pairs({"moe_shared_lora": a, "r2gen": b, "adaatt": b.copy()},
+                        ["bleu4"], scfg, ["r2gen", "adaatt", "moe_shared_lora"])
+    r1 = one.iloc[0]
+    r2 = two[two["arm_b"] == "r2gen"].iloc[0]
+    assert abs(r1["mean_diff"] - r2["mean_diff"]) < 1e-12
+    assert abs(r1["ci_lo"] - r2["ci_lo"]) < 1e-12 and abs(r1["ci_hi"] - r2["ci_hi"]) < 1e-12
+
+
+def t_protocol_25_chexbert_counts_path():
+    """CheXbert F1 đi đường micro-F1 theo tp/fp/fn, không qua trung bình F1 mẫu."""
+    from src.stats_multi import compare_pairs
+
+    scfg = dict(CFG["stats"], n_perm=300)
+    scores = {"moe_shared_lora": _fake_scores_with_counts(seed=1, shift=0.15),
+              "r2gen": _fake_scores_with_counts(seed=1, shift=-0.15)}
+    df = compare_pairs(scores, ["chexbert_f1"], scfg, ["r2gen", "moe_shared_lora"])
+    r = df.iloc[0]
+    assert r["ci_method"].startswith("percentile"), r["ci_method"]
+    assert r["mean_diff"] < 0 and r["significant"], r.to_dict()
+    assert 0.0 < r["mean_a"] <= 1.0 and 0.0 < r["mean_b"] <= 1.0
+
+
+def _synthetic_report(tmp: Path):
+    """Chạy write_all trên điểm giả: 3 arm, E có route_experts + F1 theo bệnh."""
+    from src.metrics import CHEXBERT_LABELS
+    from src.report_section25 import write_all
+    from src.run_section25 import enabled_arms
+    from src.stats_multi import compare_pairs
+
+    arms = enabled_arms(CFG)
+    ids = [a["id"] for a in arms]
+    names = {a["id"]: a.get("name", a["id"]) for a in arms}
+    n = 300
+    scores = {}
+    for k, (aid, shift) in enumerate(zip(ids, (-0.05, -0.03, 0.0))):
+        df = _fake_scores_with_counts(n=n, shift=shift, seed=10 + k)
+        rng = np.random.default_rng(50 + k)
+        for j in range(len(CHEXBERT_LABELS)):
+            df[f"chexbert_label_{j:02d}_tp"] = rng.integers(0, 2, n).astype(float)
+            df[f"chexbert_label_{j:02d}_fp"] = rng.integers(0, 2, n).astype(float)
+            df[f"chexbert_label_{j:02d}_fn"] = rng.integers(0, 2, n).astype(float)
+        if aid == "moe_shared_lora":
+            import json as _json
+            df["route_experts"] = [_json.dumps(sorted(rng.choice(10, 6, replace=False).tolist()))
+                                   for _ in range(n)]
+        scores[aid] = df
+    metrics = ["bleu4", "bertscore_f1", "chexbert_f1"]
+    scfg = dict(CFG["stats"], n_perm=200)
+    pw = compare_pairs(scores, metrics, scfg, ids)
+    manifest = {"run_id": "selftest", "n_eval": n, "deviations": ["ĐIỀU KIỆN 4: x"]}
+    path = write_all(CFG, tmp, scores, names, pw, [], manifest, arms=arms)
+    return path, pw, names
+
+
+def t_report_has_all_sections_for_each_pair():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path, pw, names = _synthetic_report(Path(d))
+        md = path.read_text(encoding="utf-8")
+        assert "## 3. Điểm trung bình theo từng ảnh" in md
+        assert "## 4. Kiểm định ghép cặp" in md
+        for b in ("r2gen", "adaatt"):
+            assert f"### {names[b]} − {names['moe_shared_lora']}" in md, b
+        assert "r2gen − adaatt" not in md and "adaatt − r2gen" not in md
+        assert "CheXbert F1 theo expert × 14 bệnh" in md
+        assert "**E0**" in md or "**E1**" in md
+        assert "p hoán vị Holm (tham khảo)" in md
+        assert "**" in md.split("## 3.")[1].split("## 4.")[0], "không tô đậm giá trị tốt nhất"
+        for f in ("summary.csv", "pairwise_tests.csv",
+                  "candidate_e_expert_chexbert_f1.csv"):
+            assert (Path(d) / "metrics" / f).exists(), f
+        assert (Path(d) / "manifest.json").exists()
+        assert "bertscore_f1" in md and "chexbert_f1" in md
+
+
+def t_report_skips_expert_table_without_routes():
+    import tempfile
+    from src.report_section25 import _expert_f1
+    from src.run_section25 import enabled_arms
+
+    arms = enabled_arms(CFG)
+    assert _expert_f1({"moe_shared_lora": _fake_scores()}, arms) is None
+
+
 def t_report_never_computes_cider():
     """CIDEr dừng lại ở khâu chọn checkpoint, không lọt vào bảng kết quả.
 
@@ -919,9 +1031,11 @@ if __name__ == "__main__":
     check("MoE E=10·K=6 + QLoRA r4 (§2.2, §2.4 đã chốt)", t_moe_config_matches_24)
     check("pretrained_lr_mult = 1/10", t_pretrained_lr_mult_is_one_tenth)
     check("lịch Stage 0 mã hoá đúng min_lr", t_stage0_schedule_encodes_min_lr)
-    check("lr · one-cycle · wd · Attn · ASL · λ · n_train khớp đặc tả",
-          t_lr_asl_lambda_config)
-    check("candidate nặng nhất chạy trước", t_train_order_heaviest_first)
+    check("giao thức §2.5 (4×7500, 10k perm, vs E) khớp config + README",
+          t_protocol_numbers_config_and_readme)
+    check("E đứng đầu thứ tự", t_train_order_heaviest_first)
+    check("E là reuse_only, không bị --retrain chạm tới",
+          t_reuse_only_arm_is_never_trained)
 
     hr("2. Điều kiện 4 — một phép resize cho ba candidate")
     check("allow_native_match = false", t_image_policy_guard)
@@ -932,11 +1046,20 @@ if __name__ == "__main__":
     hr("3. Điều kiện 3 — ba cặp, hai kiểm định")
     check("stats_multi dùng lại nguyên văn stats_ab", t_stats_multi_reuses_stats_ab)
     check("ba cặp, tham chiếu luôn ở vị trí A", t_pair_list_three_pairs_reference_at_a)
+    check("vs_reference chỉ còn hai cặp SOTA − E", t_pair_list_vs_reference_is_sota_vs_e)
     check("reference lạ là DỪNG", t_pair_list_rejects_unknown_reference)
     check("họ Holm = 3 cặp trong từng metric", t_compare_pairs_holm_family_is_pairs)
     check("bắt được chênh lệch thật, không bắt nhầm cột trùng",
           t_compare_pairs_detects_real_shift)
     check("dấu hiệu số là B − A", t_diff_sign_is_b_minus_a)
+    check("giao thức §2.5: bắt chênh lệch thật, không bắt nhầm bản sao",
+          t_protocol_25_detects_shift_and_null)
+    check("giao thức §2.5: bootstrap_seeds phải đủ và khác nhau",
+          t_protocol_25_bootstrap_seed_guards)
+    check("giao thức §2.5: bốn subset dùng chung giữa các cặp",
+          t_protocol_25_subsets_shared_across_pairs)
+    check("giao thức §2.5: CheXbert F1 đi đường tp/fp/fn",
+          t_protocol_25_chexbert_counts_path)
     check("không đường code nào của §2.5 chạm Friedman", t_no_friedman_on_25_path)
     check("config không còn khối friedman", t_config_declares_no_friedman)
 
@@ -976,15 +1099,15 @@ if __name__ == "__main__":
     check("src/ không import sang _archive/", t_src_does_not_import_archive)
     check("deviations nêu điều kiện 4 và 5", t_deviations_name_conditions_4_and_5)
     check("báo cáo không bao giờ tính CIDEr", t_report_never_computes_cider)
+    check("report: đủ mục, mỗi cặp một bảng, bảng expert × 14 bệnh",
+          t_report_has_all_sections_for_each_pair)
+    check("report: không dựng bảng expert khi thiếu route",
+          t_report_skips_expert_table_without_routes)
     check("beam = 3 cho cả ba candidate", t_beam_size_is_3_everywhere)
     check("MoE: trọng số định tuyến nhân bản theo beam",
           t_routing_weights_follow_beams)
-    check("runner My Gemma khai repeat = num_beams",
+    check("runner Candidate E khai repeat = num_beams",
           t_recomb_runner_passes_beams_to_routing)
-    check("--no-resume chỉ cất checkpoint/sinh/điểm của My Gemma",
-          t_no_resume_archives_only_ours)
-    check("--no-resume cần stage train và một candidate ours",
-          t_no_resume_requires_train_stage)
 
     print(f"\n═══ {PASS} qua · {FAIL} hỏng · {SKIP} bỏ qua ═══")
     if FAILURES:

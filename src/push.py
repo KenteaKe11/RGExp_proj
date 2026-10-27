@@ -9,14 +9,14 @@ không tái lập được:
 
   `config.resolved.yaml` — cấu hình ĐÃ giải quyết (kể cả `--set` từ dòng lệnh),
       không phải file YAML trong repo. Repo còn bị sửa tiếp; bản này thì không.
-  `logs/<tên>.log`       — bản chụp log của đúng lần chạy ấy, lấy từ biến môi
-      trường `RGEXP_LOG` do `scripts/run_recomb.sh` đặt. Log là chỗ DUY NHẤT ghi
+      `logs/<tên>.log`       — bản chụp log của đúng lần chạy ấy, lấy từ biến môi
+      trường `RGEXP_LOG` do script khởi chạy hiện hành đặt. Log là chỗ DUY NHẤT ghi
       lại diễn biến gate, cảnh báo preflight và tốc độ sinh; manifest chỉ có số
       cuối cùng.
 
-Adapter KHÔNG đi lên đây (chúng nằm ngoài run_dir, ở `adapters_2_3/`): repo này
-là repo KẾT QUẢ, và một dataset repo phình vì vài trăm MB trọng số mỗi lần chạy
-là thứ về sau không ai muốn clone.
+Trọng số mô hình KHÔNG đi lên đây (chúng nằm ngoài run_dir: checkpoint SOTA ở
+`adapters_2_5/`, Candidate E ở thư mục §2.3 được giữ lại). Repo Hub này chỉ
+lưu kết quả, tránh phải tải hàng trăm MB trọng số mỗi lần đọc report.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_recomb.sh` đặt `RGEXP_LOG`. Chạy `python -m src.run_recomb`
+    `scripts/run_section25.sh` đặt `RGEXP_LOG`. Chạy module trực tiếp
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -116,7 +116,7 @@ def push_results(cfg: Cfg, run_dir: Path) -> str | None:
         print("⚠ không có HF_TOKEN — bỏ qua bước đẩy. Kết quả vẫn nằm ở "
               f"{run_dir}\n"
               "    export HF_TOKEN=hf_xxxxxxxx  &&  "
-              f"python -m src.run_recomb --exp {cfg.get('experiment', '2.3')} "
+              f"python -m src.run_section25 --exp {cfg.get('experiment', '2.5')} "
               "--stages push", flush=True)
         return None
 

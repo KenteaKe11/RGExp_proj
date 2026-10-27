@@ -1,60 +1,19 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · My Gemma
+# §2.5 — ĐỐI CHỨNG VỚI SOTA: R2Gen · AdaAtt · Candidate E
 # ═══════════════════════════════════════════════════════════════════════════
-# Đây là file cấu hình DUY NHẤT của repo. Mọi điểm vào không truyền `--config`
-# đều đọc file này (`src/config.py::DEFAULT_CONFIG`):
+# Cấu hình chính của §2.5. Hai baseline được huấn luyện theo thiết kế mục này;
+# Candidate E là checkpoint §2.3 được giữ lại, chỉ dùng làm đối chứng.
+# Không tự pull checkpoint và không huấn luyện lại E.
 #
-#     scripts/run_pretrain.sh   -> src.run_pretrain   Stage 0 của My Gemma
-#     scripts/run_section25.sh  -> src.run_section25  §2.5 trọn gói
-#
-# Trước đây Stage 0 đọc `configs/recombiner.yaml` còn §2.5 đọc file này — hai
-# khối `pretrain:` khác lịch lr (div 25/100 so với 30/10) trong khi điều kiện 5
-# đòi MỘT config Stage 0 cho mọi kiến trúc, và nhánh pretrain ra phải có đúng
-# hình dạng mà §2.5 dựng. Nay hai điểm vào đọc cùng một file nên chuyện lệch
-# ấy không còn xảy ra được. Khối riêng của §2.3/§2.4 (`arms`, `arms_moe`,
-# `stats.friedman`, `output.*_moe`) KHÔNG được mang sang: những mục ấy đã chốt,
-# bản ghi của chúng — kèm chú thích lý do cho từng khoá của `train`,
-# `recombiner`, `classifier`, `moe` — nằm ở `_archive/configs/recombiner.yaml`.
-#
-# Câu hỏi của mục này, viết đủ một câu:
-#
-#     Trên CÙNG 6400 mẫu huấn luyện và CÙNG 3000 ảnh chấm điểm của tập này,
-#     công thức Gemma 3 + Recombinator + ClsHead/RouteHead + Experts K=6·E=10
-#     có hơn hai kiến trúc sinh báo cáo đã công bố (R2Gen, AdaAtt) không, và
-#     hơn BAO NHIÊU?
-#
-# Ba candidate, nên ba cặp. k = 3 nhưng KHÔNG Friedman: thiết kế của mục này
-# (xem README.md, phần kiểm định) đòi hai kiểm định GHÉP CẶP — permutation và
-# bootstrap BCa — trên từng cặp, rồi Holm trên ba p-value. Friedman trả lời
-# "có ít nhất một cột khác" — ở k = 3 với ba cặp đều được quan tâm như nhau,
-# câu ấy không thêm thông tin mà lại làm mất sức kiểm định.
-#
-# ── NĂM ĐIỀU KIỆN ĐƯỢC THỐNG NHẤT (không candidate nào được miễn) ──────────
-#  1. SOTA đối chứng chỉ nạp lại trọng số ở ĐÚNG trạng thái setup của paper
-#     gốc — khối `sota:` dưới đây là bản chép nguyên văn, không hiệu chỉnh.
-#  2. Cùng 6400 mẫu train / 3000 ảnh test của tập này (`data:`).
-#  3. Kiểm định bằng Paired Bootstrap + Permutation Test (`stats:`).
-#  4. MỘT phương pháp resize duy nhất cho mọi model — kể cả khi kích thước
-#     đầu vào VÔ TÌNH khớp (`image_policy:`).
-#  5. Có ÍT NHẤT một kiến trúc mang stage pretrain/finetune cục bộ (R2Gen
-#     end-to-end, AdaAtt hai stage) => MỌI kiến trúc chạy Stage 0 với CÙNG
-#     một config pretrain (`pretrain:` — max_lr 1.6e-4, weight_decay 0.05), rồi
-#     vào main-stage. R2Gen/AdaAtt: lr phần đã pretrain = 1/10 lr chính thức
-#     (`train.pretrained_lr_mult: 0.1`).
-#     Riêng My Gemma: Stage 0 cho ma trận Attn của Recombinator chạy lr × 3
-#     (`recombiner.attn_lr_mult`). decoder_ft KHÔNG đóng băng, fine-tune toàn
-#     bộ với lr đỉnh khai tường minh từng nhóm (`train.ft_lr`): Sup Head,
-#     Route Head, Concat Linear 3e-4 · Attn 1e-4 · phần còn lại của
-#     Recombinator 3e-5 — MỘT chu kỳ one-cycle cho cả stage, đáy 1e-7.
+# Pairing/bootstrap/permutation dùng quy ước §2.3: 4 subset ghép cặp, mỗi
+# subset 7500 lượt lấy có hoàn lại từ pool 3000 test; 10000 phép permutation.
+# Có ý nghĩa khi p permutation thô < alpha và khoảng tin cậy bootstrap loại 0.
 # ═══════════════════════════════════════════════════════════════════════════
-
 seed: 42
 
 experiment: "2.5"
 
-# `scratch` | `decoder_ft`. Main-stage của §2.5 LUÔN là `decoder_ft` với
-# My Gemma vì điều kiện 5 bắt nhánh phải đi qua Stage 0 trước. `scratch` giữ
-# lại để chạy đối chứng "không pretrain" khi cần NÓI RA trong phần Giới hạn.
+# Candidate E đã được huấn luyện trước; §2.5 không cập nhật trọng số của E.
 mode: decoder_ft
 
 # ── Dữ liệu — điều kiện 2 ──────────────────────────────────────────────────
@@ -69,6 +28,10 @@ data:
   key_column: img_rel
   ref_column: text_gt
   n_test: 3000
+  # Mẫu test/train/val DÙNG LẠI NGUYÊN VĂN từ §2.3: đọc testset/trainset/valset
+  # .jsonl đã chốt ở manifest_dir, không lấy mẫu lại. Thiếu file thì DỪNG.
+  manifest_dir: ./data/section23_eval_3000
+  reuse_manifests: true
   cache_dir: ./data
   image_max_side: 512
   image_max_side_enforce: true
@@ -77,7 +40,7 @@ data:
   train_split_csv: split_ref/train_split.csv
   n_train: 6400
   val_split_csv: split_ref/val_split.csv
-  n_val: 512
+  n_val: 256            # = §2.3
   assert_no_leak: true
 
 # ── Chính sách ảnh — điều kiện 4 ───────────────────────────────────────────
@@ -117,9 +80,6 @@ labels:
   max_missing_frac: 0.20
 
 # ── BA CANDIDATE ───────────────────────────────────────────────────────────
-# `arms_s25` chứ không phải `arms`: `arms` là khoá của §2.3 và nó đã sang
-# `_archive/configs/recombiner.yaml`. Trùng tên nghĩa là một lần nạp nhầm file
-# vẫn in ra một bảng trông bình thường với những cột sai.
 arms_s25:
   - id: r2gen
     name: "A · R2Gen (ResNet-101 + Relational Memory)"
@@ -137,18 +97,18 @@ arms_s25:
     pretrain_stage0: true
     enabled: true
 
-  # Candidate nặng nhất và dễ hỏng nhất chạy TRƯỚC — quy ước 1 của repo.
-  # `order: 0` là chỗ nói ra điều đó; thứ tự không được phép ảnh hưởng kết
-  # quả (seed và thứ tự dữ liệu đặt lại trước MỖI candidate).
-  - id: my_gemma
-    name: "C · My Gemma · Recombinator · Cls/Route Head · K=6·E=10 · QLoRA r4"
+  # Candidate E §2.3: checkpoint được giữ nguyên, chỉ nạp để suy luận/chấm.
+  # Đường dẫn tương đối tới repo; không tự kéo từ Hub và không train lại.
+  - id: moe_shared_lora
+    name: "C · Candidate E · MoE-LoRA + shared LoRA"
     kind: ours
     runner: gemma3_recomb
     recomb: true
     top_k: 6
     n_experts: 10
-    pretrain_stage0: true
-    order: 0
+    moe: true
+    reuse_only: true
+    reuse_adapter_dir: ./adapters_2_3_three_candidate_attn_pool/moe_shared_lora
     enabled: true
 
 # ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
@@ -327,7 +287,7 @@ prompt:
     Impression: <the overall impression>
 
 # ── Giải mã — MỘT đặc tả cho CẢ BA candidate (`src/decoding_spec.py`) ─────
-# My Gemma đưa khối này cho `transformers.generate`; R2Gen/AdaAtt đưa nó cho
+# Candidate E đưa khối này cho `transformers.generate`; R2Gen/AdaAtt đưa nó cho
 # `src/sota/decoding.beam_search`, vốn cài lại ĐÚNG luật beam search của
 # transformers — kể cả lúc chọn checkpoint trên val. Khối `sota.*.decoding`
 # bên dưới chỉ còn là bản ghi của paper (điều kiện 1) và KHÔNG được đọc; chỗ
@@ -336,7 +296,7 @@ prompt:
 # Mọi khoá phải khai TƯỜNG MINH: generation_config.json của Gemma 3 khai
 # sampling, và một khoá bỏ trống là để nó chen vào.
 #
-# Khác biệt duy nhất: độ dài tối đa. `max_new_tokens` là của My Gemma
+# Khác biệt duy nhất: độ dài tối đa. `max_new_tokens` là của Candidate E
 # (subword); R2Gen/AdaAtt dừng ở `max_seq_length − 1` = 59 từ của từ điển.
 #
 # Với MoE, trọng số định tuyến của mỗi ảnh được nhân bản theo beam
@@ -401,9 +361,9 @@ train:
   branch_weight_decay: 0.01
 
   # ĐIỀU KIỆN 5 — CHỈ cho R2Gen/AdaAtt (`src/train_sota.py`): phần đã pretrain
-  # chạy main-stage ở lr × 0.1. My Gemma KHÔNG đọc khoá này nữa.
+  # chạy main-stage ở lr × 0.1.
   pretrained_lr_mult: 0.1
-  # My Gemma · decoder_ft — lr ĐỈNH từng nhóm của nhánh
+  # Các nhóm tối ưu hoá giữ cho khả năng tái lập cấu hình; Candidate E không train.
   # (`train_recomb.build_optimizer`; adapter/Experts ở `schedule.max_lr`).
   # Phải khai ĐỦ sáu khoá, mỗi tham số nhánh thuộc đúng một nhóm.
   ft_lr:
@@ -543,32 +503,41 @@ metrics:
     batch_size: 32
     rescale_with_baseline: false
     keep: [f1]
-  primary: bertscore_f1
+  chexbert:
+    enabled: true
+    device: auto
+  radgraph:
+    enabled: true
+    model_type: radgraph-xl
+    reward_level: all
+    batch_size: 16
+    device: auto
 
 # ── Kiểm định — điều kiện 3 ────────────────────────────────────────────────
-# Ba candidate => ba cặp. Mỗi cặp đi ĐÚNG đường của §2.3 (`src/stats_ab.py`):
-# permutation đảo dấu trả p, bootstrap BCa trả khoảng tin cậy cho hiệu số.
-# Holm chạy TRÊN BA p-value của ba cặp, trong từng metric.
+# Ba candidate, nhưng câu hỏi đối chứng là mỗi baseline SOTA so với E.
+# Dùng đúng quy tắc §2.3: 4 tập bootstrap ghép cặp, mỗi tập 7.500 lượt lấy
+# có hoàn lại từ 3.000 test; permutation 10.000 lần. Holm trên metric trong
+# từng cặp chỉ là thông tin phụ; kết luận theo p_perm thô < alpha và CI loại 0.
 #
-# `reference: my_gemma` chỉ quyết định DẤU của hiệu số (mọi cặp đọc là
-# "candidate − my_gemma" hay ngược lại), không làm cặp nào bị bỏ.
+# `reference: moe_shared_lora` đặt E phía A; chỉ giữ hai cặp SOTA − E.
 stats:
   alpha: 0.05
-  n_boot: 10000
+  n_boot: 4
+  bootstrap_sample_size: 7500
+  bootstrap_seeds: [42, 43, 44, 45]
   n_perm: 10000
   ci: 0.95
-  ci_method: bca
+  ci_method: percentile
   dz_floor: 0.10
   primary_test: perm
-  pairs: all               # all | vs_reference
-  reference: my_gemma
+  pairs: vs_reference
+  reference: moe_shared_lora
   adjust: holm
-  adjust_scope: pairs      # Holm trong TỪNG metric, trên ba cặp
-  # Friedman CỐ Ý không có mặt. Xem đầu file và README.md.
+  adjust_scope: metrics    # lưu Holm để tham khảo; không dùng làm cổng ý nghĩa
 
 # ── STAGE 0 — pretrain cục bộ, điều kiện 5 ────────────────────────────────
 # Một config DUY NHẤT, áp cho mọi kiến trúc có stage cục bộ: `train_sota` đọc
-# nó cho R2Gen/AdaAtt, `src.run_pretrain` đọc nó cho My Gemma. Lịch: warm-up
+# Nó điều khiển Stage 0 của các baseline trong `train_sota`. Lịch: warm-up
 # cosine từ max_lr tới min_lr, MỘT chu kỳ = MỘT epoch, chạy 5 epoch. Sau mỗi
 # restart, `lr_decay` hạ CẢ hai mốc (tức 5 chu kỳ nối nhau có biên giảm dần).
 #
