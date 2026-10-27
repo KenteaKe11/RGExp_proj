@@ -262,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
+    ap.add_argument("--repull", action="store_true",
+                    help="kéo lại predictions của E từ Hub dù bản cục bộ đã đủ")
     ap.add_argument("--retrain", action="store_true")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
@@ -352,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     from . import train_sota as ts_mod
 
     def _trained(arm: dict) -> bool:
+        if arm.get("predictions_from_hub"):
+            return False
         d = Path(arm.get("reuse_adapter_dir") or (adapter_root / arm["id"]))
         if arm["kind"] == "sota":
             return ts_mod.already_trained(d)
@@ -525,13 +529,15 @@ def main(argv: list[str] | None = None) -> int:
                 return 3
     else:
         for arm in arms:
+            if arm.get("predictions_from_hub"):
+                continue
             p = Path(arm.get("reuse_adapter_dir") or
                      (adapter_root / arm["id"])) / "train_stats.json"
             if p.exists():
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
     if need_train:
         for arm in arms:
-            if not arm.get("reuse_only"):
+            if not arm.get("reuse_only") or not arm.get("reuse_adapter_dir"):
                 continue
             p = Path(arm["reuse_adapter_dir"]) / "train_stats.json"
             if p.exists():
@@ -540,25 +546,31 @@ def main(argv: list[str] | None = None) -> int:
     # ── infer ──────────────────────────────────────────────────────────────
     pred_paths = {x["id"]: run_dir / "predictions" / f"{x['id']}.jsonl" for x in arms}
     if "infer" in stages:
-        missing_reuse = [x for x in arms if x.get("reuse_only")
-                         and not (Path(x.get("reuse_adapter_dir", "")) /
-                                  "train_stats.json").is_file()]
-        if missing_reuse:
-            paths = [str(x.get("reuse_adapter_dir")) for x in missing_reuse]
-            message = ("Không thấy checkpoint/train_stats của Candidate E tại: "
-                       + ", ".join(paths)
-                       + ". Đặt checkpoint đã giữ từ §2.3 vào đường dẫn khai "
-                         "trong configs/section25.yaml. §2.5 không tự pull và "
-                         "không train đè E.")
-            print(f"✗ {message}", flush=True)
-            tracker.alert("§2.5 thiếu checkpoint Candidate E", message, "ERROR")
-            tracker.finish(1)
-            return 2
+        from .hub_reuse import HubReuseError, pull_predictions
+
+        for arm in arms:
+            if not arm.get("predictions_from_hub"):
+                continue
+            _hr(f"Kéo predictions §2.3 của {arm['id']} từ Hub (không infer/train)")
+            try:
+                info = pull_predictions(arm, pred_paths[arm["id"]],
+                                        test_df["key"].astype(str).tolist(),
+                                        force=a.repull)
+            except HubReuseError as e:
+                print(f"✗ {e}", flush=True)
+                tracker.alert("§2.5 không kéo được predictions của E", str(e), "ERROR")
+                tracker.finish(1)
+                return 2
+            print(f"  ✓ {arm['id']}: {info['n']} mẫu từ {info['source']}", flush=True)
+            manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
+                "ok": True, "pulled_from": info["source"]}
         _hr("Sinh báo cáo")
         from .runners import build
         from .runners.base import RunnerUnusable
 
         for arm in arms:
+            if arm.get("predictions_from_hub"):
+                continue
             mcfg = arm_model_cfg(cfg, arm, adapter_root, run_dir)
             print(f"\n── {arm.get('name', arm['id'])} ({mcfg['runner']}) ──",
                   flush=True)

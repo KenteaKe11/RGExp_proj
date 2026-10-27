@@ -179,14 +179,16 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
 
     # ── 2. Candidate E giữ nguyên ──────────────────────────────────────────
     if ours:
-        source = next((a.get("reuse_adapter_dir") for a in (arms or [])
+        source = next((a.get("reuse_adapter_dir") or
+                       (a.get("predictions_from_hub") or {}).get("subdir")
+                       for a in (arms or [])
                        if a.get("id") == ours), None)
         L.append("## 2. Candidate E dùng làm đối chứng\n")
-        L.append(f"Nạp lại checkpoint Candidate E đã giữ từ §2.3"
-                 + (f" ({source})" if source else "")
-                 + "; không huấn luyện lại. Khâu suy luận được chạy trong "
-                   "pipeline §2.5 để ghi prediction cùng định dạng với hai "
-                   "baseline.\n")
+        L.append("Candidate E không được huấn luyện hay infer lại: predictions "
+                 "của §2.3 được kéo thẳng từ Hub"
+                 + (f" (`{source}`)" if source else "")
+                 + " và chấm lại bằng cùng pipeline metric §2.5 như hai "
+                   "baseline, trên đúng 3.000 mẫu test của §2.3.\n")
 
     # ── 3. Bảng điểm ───────────────────────────────────────────────────────
     L.append("## 3. Điểm trung bình theo từng ảnh\n")

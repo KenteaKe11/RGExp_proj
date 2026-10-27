@@ -10,7 +10,7 @@ Repo hiện chạy §2.5. Hai baseline R2Gen và AdaAtt được huấn luyện 
 | `adaatt` | AdaAtt — ResNet-152 + Adaptive Attention | Baseline SOTA |
 | `moe_shared_lora` | Candidate E — MoE-LoRA + shared LoRA | Checkpoint đối chứng đã giữ từ §2.3 |
 
-Ba arm dùng cùng 3.000 ảnh test và cùng metric. E được infer lại bằng pipeline §2.5 để predictions có cùng định dạng và image policy. Dữ liệu nằm trong `configs/section25.yaml`. Mặc định, E được tìm tại `adapters_2_3_three_candidate_attn_pool/moe_shared_lora`; lệnh không tự pull checkpoint. Nếu checkpoint được giữ ở vị trí khác, sửa `reuse_adapter_dir` trong config.
+Ba arm dùng cùng 3.000 ảnh test và cùng metric. E không train và không infer lại: stage `infer` kéo thẳng `predictions/moe_shared_lora.jsonl` (kèm `route_experts`) của §2.3 từ Hub (`predictions_from_hub` trong config, cần `HF_TOKEN`), rồi chấm lại bằng pipeline metric §2.5. Thiếu bất kỳ key test nào thì dừng. Mẫu test/train/val cũng dùng lại manifest §2.3 (`data.manifest_dir`). Dữ liệu nằm trong `configs/section25.yaml`. 
 
 ## Kiểm định và báo cáo
 
@@ -47,11 +47,11 @@ bash scripts/run_section25.sh --stages score,stats,report --rescore
 bash scripts/run_section25.sh --stages stats,report
 ```
 
-`--retrain` huấn luyện lại các arm SOTA được chọn. Cờ này không tác động Candidate E. Để chạy `infer`, phải đặt checkpoint E tại `reuse_adapter_dir`. Nếu chỉ tạo lại thống kê/báo cáo thì cần các file `per_sample_*.csv` tương ứng.
+`--retrain` huấn luyện lại các arm SOTA được chọn. Cờ này không tác động Candidate E. `--repull` kéo lại predictions của E từ Hub; không cần checkpoint E. Nếu chỉ tạo lại thống kê/báo cáo thì cần các file `per_sample_*.csv` tương ứng.
 
 ## Kiến trúc Candidate E
 
-E giữ kiến trúc và trọng số của §2.3: MoE-LoRA trên projection attention của decoder cộng shared LoRA chạy độc lập với Route; Route chọn expert. Recombinator nhận đặc trưng vision và đưa nhánh đã chiếu nối với token adapter ảnh và embedding prompt trước decoder. Ở §2.5 E là checkpoint cố định, không có cập nhật optimizer.
+E giữ kiến trúc và kết quả infer của §2.3: MoE-LoRA trên projection attention của decoder cộng shared LoRA chạy độc lập với Route; Route chọn expert. Recombinator nhận đặc trưng vision và đưa nhánh đã chiếu nối với token adapter ảnh và embedding prompt trước decoder. Ở §2.5 E là checkpoint cố định, không có cập nhật optimizer.
 
 
 ## Cấu hình và đầu ra

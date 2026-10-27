@@ -10,6 +10,7 @@ trình dừng. Chúng chỉ cho ra một bảng đọc được, hợp lý, và 
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def t_arms_valid():
     assert kinds["adaatt"] == "sota"
     e = next(a for a in arms if a["id"] == "moe_shared_lora")
     assert e.get("reuse_only") is True and e.get("moe") is True, e
-    assert e.get("reuse_adapter_dir"), "Candidate E phải khai reuse_adapter_dir"
+    assert e.get("predictions_from_hub", {}).get("subdir"), "E phải khai predictions_from_hub"
 
 
 def t_arm_flags_are_mandatory():
@@ -133,7 +134,7 @@ def t_protocol_numbers_config_and_readme():
     for m in ("chexbert", "radgraph"):
         assert CFG["metrics"][m]["enabled"] is True, m
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for needle in ("7.500", "10.000", "Holm", "reuse_adapter_dir", "f1chexbert",
+    for needle in ("7.500", "10.000", "Holm", "predictions_from_hub", "f1chexbert",
                    "Candidate E"):
         assert needle in readme, f"README không nhắc `{needle}`"
 
@@ -157,6 +158,46 @@ def t_train_order_heaviest_first():
 
     order = [a["id"] for a in train_order(enabled_arms(CFG))]
     assert order[0] == "moe_shared_lora", order
+
+
+def t_hub_reuse_pulls_and_validates_predictions():
+    import tempfile
+    from unittest import mock
+
+    from src import hub_reuse
+
+    keys = [f"k{i}" for i in range(5)]
+    arm = {"id": "e", "moe": True, "predictions_from_hub": {
+        "repo": "o/r", "subdir": "s", "file": "predictions/e.jsonl"}}
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        src = d / "src.jsonl"
+
+        def write(rows):
+            src.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+        def fake(repo, rt, fn, stage):
+            return src
+
+        with mock.patch.object(hub_reuse, "_fetch", fake), \
+                mock.patch.object(hub_reuse, "hf_token", lambda: "t"):
+            write([{"key": k, "pred": "x", "route_experts": [1, 2]} for k in keys[:-1]])
+            try:
+                hub_reuse.pull_predictions(arm, d / "out" / "e.jsonl", keys)
+            except hub_reuse.HubReuseError:
+                pass
+            else:
+                raise AssertionError("thiếu key mà vẫn qua")
+            write([{"key": k, "pred": "x", "route_experts": [1, 2]} for k in keys])
+            info = hub_reuse.pull_predictions(arm, d / "out" / "e.jsonl", keys)
+            assert info["n"] == 5
+            assert hub_reuse.pull_predictions(arm, d / "out" / "e.jsonl", keys)["source"] == "cache"
+            write([{"key": k, "pred": "x"} for k in keys])
+            try:
+                hub_reuse.pull_predictions(arm, d / "o2" / "e.jsonl", keys)
+            except hub_reuse.HubReuseError:
+                return True
+            raise AssertionError("thiếu route_experts mà vẫn qua")
 
 
 def t_reuse_only_arm_is_never_trained():
@@ -1034,6 +1075,8 @@ if __name__ == "__main__":
     check("giao thức §2.5 (4×7500, 10k perm, vs E) khớp config + README",
           t_protocol_numbers_config_and_readme)
     check("E đứng đầu thứ tự", t_train_order_heaviest_first)
+    check("E: kéo predictions từ Hub, kiểm đủ key + route_experts",
+          t_hub_reuse_pulls_and_validates_predictions)
     check("E là reuse_only, không bị --retrain chạm tới",
           t_reuse_only_arm_is_never_trained)
 

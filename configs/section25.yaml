@@ -108,7 +108,13 @@ arms_s25:
     n_experts: 10
     moe: true
     reuse_only: true
-    reuse_adapter_dir: ./adapters_2_3_three_candidate_attn_pool/moe_shared_lora
+    # Không cần checkpoint: kéo thẳng predictions đã infer của §2.3 từ Hub
+    # (kèm route_experts), rồi chấm lại bằng pipeline metric của §2.5.
+    predictions_from_hub:
+      repo: RGExp123/Research_results
+      repo_type: dataset
+      subdir: 2.3_three_candidate_attn_pool
+      file: predictions/moe_shared_lora.jsonl
     enabled: true
 
 # ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
