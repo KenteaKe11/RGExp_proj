@@ -79,6 +79,8 @@ echo "✓ Python $PYVER"
 CUDA_TAG="cu121"; MIN_TAG=""
 GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
 # (set -eo pipefail: thiếu/hỏng nvidia-smi không được giết script ở đây; GPU được kiểm lại ở bước 8)
+# nvidia-smi hỏng in LỜI BÁO LỖI ra stdout — chỉ nhận số dạng 8.6 / 12.0.
+case "$GPU_CAP" in ''|*[!0-9.]*) GPU_CAP="" ;; esac
 GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
 case "$GPU_SM" in
     12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;  # Blackwell (5090/B200)
