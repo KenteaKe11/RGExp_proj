@@ -476,7 +476,7 @@ arms:
     short: "B"
     name: "QLoRA chỉ trên bộ giải mã"
     recomb: false
-    enabled: true
+    enabled: false  # ablation cũ; bật lại nếu muốn chạy đủ sáu arm
   # B* = lora_only + QDoRA vision (cùng cấu hình `train.vision_adapter` với C,
   # D, E), KHÔNG Recombinator. Ở bản cũ mọi arm có QDoRA vision cũng có nhánh,
   # nên hiệu số lora_only -> lora_recomb gộp hai thứ. B* tách chúng:
@@ -494,7 +494,7 @@ arms:
     recomb: true
     capture_cls_head: false
     train_projector: false
-    enabled: true
+    enabled: false  # ablation cũ; bật lại nếu muốn chạy đủ sáu arm
   - id: moe_lora
     short: "D"
     name: "MoE-LoRA decoder + Route + QDoRA vision + Recombinator + đầu phân loại"
@@ -521,7 +521,7 @@ arms:
     shared_warmup_pct: 0.2
     capture_cls_head: false
     train_projector: false
-    enabled: true
+    enabled: false  # ablation cũ; bật lại nếu muốn chạy đủ sáu arm
 metrics:
   normalize:
     lowercase: true

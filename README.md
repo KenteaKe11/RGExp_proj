@@ -18,14 +18,13 @@ bash scripts/setup.sh
 # 1) §2.3 — train → infer → đẩy LẦN LƯỢT từng arm (A, B, C), rồi chấm + thống kê + báo cáo.
 #    Split patient tự động: có cache `data/splits_patient_v2` thì dùng; không thì pull từ Hub;
 #    không có ở đâu thì tạo (seed 42) và đẩy lên Hub.
-bash scripts/run_recomb.sh --exp 2.3 \
-     --arms baseline_infer,lora_qdora_vision,moe_lora --no-wandb --detach
+bash scripts/run_recomb.sh --exp 2.3 --no-wandb --detach     # mặc định chỉ bật A, B, C
 #    Đứt giữa chừng: chạy LẠI đúng lệnh trên, nó đi tiếp (arm đã xong không train lại).
 #    Thử đường ống trước (8 ảnh, 4 bước, không đẩy Hub): thêm --dry-run.
 
 # 2) §2.5 — chỉ SAU KHI §2.3 xong và đã lên Hub (C được kéo từ đó, không train lại).
 #    Train R2Gen + AdaAtt trên cùng 6.400 mẫu, greedy.
-bash scripts/run_section25.sh --arms r2gen,adaatt,moe_lora --no-wandb --detach
+bash scripts/run_section25.sh --no-wandb --detach             # R2Gen, AdaAtt (train) + C (kéo từ Hub)
 
 # 3) Bảng LaTeX cho bài báo (số lấy nguyên từ summary.csv, không gõ tay).
 python -m src.export_paper_tables --run23 runs/2.3_pt6400_three_systems \
@@ -56,7 +55,7 @@ Kết quả: `runs/<thư mục>/REPORT.md`, `metrics/summary.csv`, `metrics/pair
 
 Tác dụng của Recombinator + đầu phân loại được đọc qua F1 CheXbert (`capture_cls_head: true` cho C lưu thêm dự đoán 14 nhãn của chính đầu phân loại). Hiệu số khai trước trong `stats.contrasts`: A→B và B→C (các cặp còn lại của sáu arm ablation cũ chỉ chạy khi bật đủ sáu arm).
 
-Ba arm ablation cũ (`lora_only`, `lora_recomb`, `moe_shared_lora`) vẫn còn trong config nhưng không thuộc §2.3 chính thức.
+Ba arm ablation cũ (`lora_only`, `lora_recomb`, `moe_shared_lora`) còn trong config nhưng để `enabled: false`, nên lệnh mặc định chỉ chạy A, B, C. Muốn chạy lại ablation thì đổi sang `enabled: true`.
 
 ### §2.5 — ba candidate (`configs/section25.yaml`)
 

@@ -82,7 +82,15 @@ def main() -> int:
     def test_arms_include_bstar():
         from src.run_recomb import enabled_arms, train_order
 
-        arms = enabled_arms(_cfg23())
+        cfg0 = _cfg23()
+        # Mặc định chỉ bật ba hệ thống chính A, B, C.
+        ids0 = [a["id"] for a in enabled_arms(cfg0)]
+        if ids0 != ["baseline_infer", "lora_qdora_vision", "moe_lora"]:
+            raise AssertionError(f"mặc định phải là A,B,C, nhận {ids0}")
+        # Bật lại ablation cũ -> đủ sáu arm.
+        for x in cfg0["arms"]:
+            x["enabled"] = True
+        arms = enabled_arms(cfg0)
         ids = [a["id"] for a in arms]
         want = ["baseline_infer", "lora_only", "lora_qdora_vision", "lora_recomb",
                 "moe_lora", "moe_shared_lora"]
@@ -136,6 +144,13 @@ def main() -> int:
         sc = cfg["stats"]
         if sc.get("pairs") != "contrasts" or sc.get("adjust_scope") != "metrics":
             raise AssertionError("§2.3 phải kiểm theo contrasts khai trước, Holm trên metric")
+        ids3 = [a["id"] for a in enabled_arms(cfg)]
+        p3 = pair_list(ids3, "contrasts", None, sc["contrasts"])
+        if p3 != [("baseline_infer", "lora_qdora_vision"),
+                  ("lora_qdora_vision", "moe_lora")]:
+            raise AssertionError(f"A→B và B→C: nhận {p3}")
+        for x in cfg["arms"]:
+            x["enabled"] = True
         ids = [a["id"] for a in enabled_arms(cfg)]
         pairs = pair_list(ids, "contrasts", None, sc["contrasts"])
         if ("lora_only", "lora_qdora_vision") not in pairs or \
@@ -316,7 +331,7 @@ def main() -> int:
     print("Section 2.3 quick self-check (CPU)")
     check("paired statistics", test_stats)
     check("attention ClsHead and project-then-concat Candidate C branch", test_branch)
-    check("six arms with B* = QDoRA vision without Recombinator", test_arms_include_bstar)
+    check("default A,B,C + six arms when ablation enabled", test_arms_include_bstar)
     check("B* wiring: vision flag + resume check without a branch", test_bstar_vision_wiring)
     check("pre-declared contrasts + Holm over metrics", test_contrasts_declared)
     check("greedy decoding is the same spec as §2.5", test_greedy_shared_with_section25)
