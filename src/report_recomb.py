@@ -276,7 +276,10 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
         A("")
         A("Tô đậm = tốt nhất mỗi cột (kể cả hòa); dòng nhỏ ± là độ lệch chuẩn giữa các ảnh.")
     else:
-        MAIN = ["baseline_infer", "lora_only", "moe_shared_lora"]
+        ids_now = {x["id"] for x in arms}
+        MAIN = (["baseline_infer", "lora_qdora_vision", "moe_lora"]
+                if {"lora_qdora_vision", "moe_lora"} <= ids_now
+                else ["baseline_infer", "lora_only", "moe_shared_lora"])
         A(rc.score_table(summary, metric_cols, order=[a["id"] for a in arms], main=MAIN))
         A("")
         A("Tô đậm = tốt nhất trong ba hệ thống chính **A, B, E** (E là mô hình đầy đủ; Recombinator "

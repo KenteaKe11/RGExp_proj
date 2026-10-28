@@ -1,28 +1,62 @@
 # RGExp — sinh báo cáo X-quang ngực: §2.3 và §2.5
 
-Hai thí nghiệm dùng chung **một** dữ liệu (cùng 6.400 mẫu train, 256 val, 3.000 test), **một** prompt, **một** đặc tả giải mã (**greedy**), **một** cách tổng hợp điểm và **một** kiểu báo cáo p-value.
+Hai thí nghiệm dùng chung **một** dữ liệu (split cấp patient: 6.400 train, 256 val, 3.000 test, mỗi patient một ảnh, ba tập không giao nhau), **một** prompt, **một** đặc tả giải mã (**greedy**), **một** cách tổng hợp điểm và **một** kiểu báo cáo p-value.
 
 | Mục | Câu hỏi | Lệnh | Đầu ra |
 |---|---|---|---|
-| **§2.3** | Từng thành phần (fine-tune, QDoRA vision, Recombinator, MoE-LoRA, shared LoRA) đóng góp bao nhiêu? | `scripts/run_recomb.sh --exp 2.3` | `runs/2.3_three_candidate_attn_pool/` |
-| **§2.5** | Candidate E so với hai SOTA (R2Gen, AdaAtt)? | `scripts/run_section25.sh` | `runs/2.5_sota/` |
+| **§2.3** | Mô hình của chúng tôi (C) so với backbone đóng băng (A) và LoRA decoder + vision adapter (B)? | `scripts/run_recomb.sh --exp 2.3` | `runs/2.3_pt6400_three_systems/` |
+| **§2.5** | C so với hai SOTA (R2Gen, AdaAtt)? | `scripts/run_section25.sh` | `runs/2.5_sota/` |
 
-## Candidate
+## Quickstart
 
-### §2.3 — sáu candidate (`configs/recombiner.yaml`)
+```bash
+# 0) Môi trường (một lần). Cần GPU + driver NVIDIA đang chạy (kiểm bằng `nvidia-smi`).
+git clone <repo> RGExp_proj && cd RGExp_proj        # máy cũ: git pull
+export HF_TOKEN="<token HF, QUYỀN GHI>"               # gemma-3 là gated; token còn dùng để đẩy kết quả
+bash scripts/setup.sh
+
+# 1) §2.3 — train → infer → đẩy LẦN LƯỢT từng arm (A, B, C), rồi chấm + thống kê + báo cáo.
+#    Split patient tự động: có cache `data/splits_patient_v2` thì dùng; không thì pull từ Hub;
+#    không có ở đâu thì tạo (seed 42) và đẩy lên Hub.
+bash scripts/run_recomb.sh --exp 2.3 \
+     --arms baseline_infer,lora_qdora_vision,moe_lora --no-wandb --detach
+#    Đứt giữa chừng: chạy LẠI đúng lệnh trên, nó đi tiếp (arm đã xong không train lại).
+#    Thử đường ống trước (8 ảnh, 4 bước, không đẩy Hub): thêm --dry-run.
+
+# 2) §2.5 — chỉ SAU KHI §2.3 xong và đã lên Hub (C được kéo từ đó, không train lại).
+#    Train R2Gen + AdaAtt trên cùng 6.400 mẫu, greedy.
+bash scripts/run_section25.sh --arms r2gen,adaatt,moe_lora --no-wandb --detach
+
+# 3) Bảng LaTeX cho bài báo (số lấy nguyên từ summary.csv, không gõ tay).
+python -m src.export_paper_tables --run23 runs/2.3_pt6400_three_systems \
+    --run25 runs/2.5_sota --out <thư mục paper>/tables
+```
+
+Kết quả: `runs/<thư mục>/REPORT.md`, `metrics/summary.csv`, `metrics/pairwise_tests.csv`. Log theo dõi: `tail -f` file log của `--detach`.
+
+### Điều cần biết trước khi chạy
+
+- **Test mới ⇒ không dùng lại predictions cũ trên Hub** (`--reuse-hub-preds` không áp dụng). A, B, C, R2Gen, AdaAtt đều phải infer lại.
+- **Huấn luyện** (B và C cùng công thức): eff_bs 8, weight decay 0,05, 800 bước = 4 epoch × 200 bước (`train.epoch_split: true`); mỗi epoch là **một phần tư** tập train (1.600 mẫu, không lặp mẫu) và có một chu kỳ one-cycle riêng. Peak lr 8e-5 × 0,875^epoch (8e-5, 7e-5, 6,1e-5, 5,4e-5); đáy nhóm nhỏ nhất ở epoch 1 là 1e-8.
+- **Dò batch**: thang `[8, 6, 4, 2, 1]`; gặp OOM thì dọn VRAM rồi train lại arm đó từ đầu với bậc kế. eff_bs luôn 8 (tích lũy gradient bù).
+- **Đẩy từng arm** (`output.push_per_arm: true`): xong train → infer của MỘT arm là đẩy adapter + predictions + train_stats lên Hub rồi mới sang arm sau. Mất mạng/token không quyền ghi thì chỉ cảnh báo, kết quả vẫn ở đĩa; đẩy bù bằng `--stages push`.
+- **Chạy lại một phần**: `--stages score,stats,report --rescore`; `--retrain` train lại mọi arm trừ C; `--force` train lại C (checkpoint `moe_lora` được bảo vệ). Ép tạo lại split cục bộ: `python scripts/make_patient_split.py --force` (không xoá bản trên Hub).
+- Cảnh báo `Failed to export metrics batch ... timeout` là của thư viện telemetry, không ảnh hưởng kết quả; tắt bằng `export OTEL_SDK_DISABLED=true`.
+- Mã thoát: 0 xong · 2 cấu hình/checkpoint sai · 3 train hỏng · 4 rò rỉ dữ liệu · 5 nhãn · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng.
+
+## Hệ thống
+
+### §2.3 — ba hệ thống (`configs/recombiner.yaml`)
 
 | Ký hiệu | id | Gồm những gì |
 |---|---|---|
 | **A** | `baseline_infer` | Gemma 3 4B-it gốc, không fine-tune |
-| **B** | `lora_only` | A + QLoRA r=4 trên q/k/v/o của decoder |
-| **B\*** | `lora_qdora_vision` | B + **QDoRA r=4 trên 1/4 lớp cuối SigLIP**, *không* Recombinator |
-| **C** | `lora_recomb` | B\* + Recombinator + đầu phân loại (ASL) |
-| **D** | `moe_lora` | C với QLoRA decoder thay bằng top-6/10 Experts LoRA + Route Head |
-| **E** | `moe_shared_lora` | D + một shared LoRA luôn bật; 20% bước đầu huấn luyện như C |
+| **B** | `lora_qdora_vision` | QLoRA r=4 trên q/k/v/o của decoder + adapter DoRA r=4 trên 1/4 lớp cuối SigLIP; không Recombinator |
+| **C** | `moe_lora` | B với QLoRA decoder thay bằng top-6/10 Experts LoRA + Route Head, thêm Recombinator + đầu phân loại (ASL); **không** shared adapter |
 
-**Vì sao có B\*.** Trước đây mọi arm có QDoRA vision cũng có Recombinator, nên hiệu số B → C gộp hai thứ. B\* tách chúng: **B → B\*** là đóng góp của riêng QDoRA vision, **B\* → C** là đóng góp của Recombinator + đầu phân loại. Cờ `vision_qdora: true` của arm bật `train.vision_adapter` mà không cần nhánh (`src/train_recomb.py`).
+Tác dụng của Recombinator + đầu phân loại được đọc qua F1 CheXbert (`capture_cls_head: true` cho C lưu thêm dự đoán 14 nhãn của chính đầu phân loại). Hiệu số khai trước trong `stats.contrasts`: A→B và B→C (các cặp còn lại của sáu arm ablation cũ chỉ chạy khi bật đủ sáu arm).
 
-Hiệu số kiểm định khai trước trong `stats.contrasts` (mỗi cặp một câu hỏi): A→B, B→B\*, B\*→C, C→D, D→E, B\*→E, B→E.
+Ba arm ablation cũ (`lora_only`, `lora_recomb`, `moe_shared_lora`) vẫn còn trong config nhưng không thuộc §2.3 chính thức.
 
 ### §2.5 — ba candidate (`configs/section25.yaml`)
 
@@ -30,79 +64,13 @@ Hiệu số kiểm định khai trước trong `stats.contrasts` (mỗi cặp m�
 |---|---|---|
 | R2Gen | `r2gen` | ResNet-101 + Transformer/Relational Memory, cài lại theo paper |
 | AdaAtt | `adaatt` | ResNet-152 + Adaptive Attention, cài lại theo paper |
-| E | `moe_shared_lora` | Predictions của §2.3 kéo từ Hub, chấm lại bằng cùng pipeline; không train/infer lại |
-
-## §2.3 mới: dữ liệu cấp patient, 3 hệ thống A/B/C
-
-- **Dữ liệu**: mỗi patient đúng một ảnh; train 6 400, val 256, test 3 000 patient, ba tập không giao nhau.
-  Split tự động khi chạy pipeline (cache cục bộ → pull Hub → tạo + đẩy Hub), hoặc chạy tay:
-  `python scripts/make_patient_split.py` (seed `data.split_seed` = 42; `data.split_local_dir`, thiếu file thì DỪNG).
-- **Hệ thống**: A = `baseline_infer`, B = `lora_qdora_vision` (LoRA decoder + QDoRA vision), C = `moe_lora`
-  (MoE-LoRA + Recombinator + cls head, không shared). Test mới ⇒ dự đoán cũ trên Hub KHÔNG dùng lại được
-  (`--reuse-hub-preds` không áp dụng); suy luận lại A, B, C và R2Gen/AdaAtt trên test mới.
-- **Huấn luyện**: eff_bs 8, weight decay 0,05, 800 bước = 4 epoch × 200 bước (`train.epoch_split: true`): mỗi
-  epoch một phần tư tập train (1 600 mẫu, không lặp). Mỗi epoch một chu kỳ one-cycle giống nhau; peak
-  8e-5 × 0,875^epoch (8e-5, 7e-5, 6,1e-5, 5,4e-5); đáy nhóm nhỏ nhất ở epoch 1 = 1e-8 (các epoch sau nhân 0,875^epoch).
-- **Dò batch**: `[8, 6, 4, 2, 1]`, eff_bs luôn 8; OOM thì dọn VRAM rồi train lại từ đầu với bậc kế.
-- **Đẩy từng arm** (`output.push_per_arm: true`): train → infer → đẩy adapter + predictions + train_stats
-  của MỘT arm rồi mới sang arm sau; đứt giữa chừng không mất arm đã xong.
-- Output: `runs/2.3_pt6400_three_systems`, `adapters_2_3_pt6400`. §2.5 đọc C từ đó.
-- Exp 3 cũ không còn cần.
-
-## Exp 3 — hậu kiểm (post-test)
-
-Kiểm trực tiếp giả thuyết của bài: MoE không hơn adapter đơn ở §2.3 vì **thiếu bước huấn luyện** (≈ 200 bước < C(10,6) = 210 tổ hợp expert), và shared LoRA chỉ là cách né điều đó. Exp 3 lấy **biến thể mạnh nhất của mỗi họ** và cho cạnh tranh dưới cùng điều kiện, với ngân sách bước gấp ≈ 4 lần:
-
-| Họ | Đại diện | id |
-|---|---|---|
-| B | B₁: QLoRA decoder + QDoRA vision | `lora_qdora_vision` |
-| C | C₂: MoE-LoRA top-6/10 + Recombinator + QDoRA vision, **không shared** | `moe_lora` |
-
-Khác §2.3 đúng hai con số: `n_epochs` 1 → 2 và `effective_batch_size` 32 → 16 (≈ 800 bước). Mọi thứ khác lấy nguyên từ `recombiner.yaml` qua `extends:` (xem `configs/exp3.yaml`). Hai thư mục riêng (`runs/3_posttest_2ep/`, `adapters_3_posttest/`, Hub `3_posttest_2ep`), nên không đè §2.3.
-
-```bash
-bash scripts/run_recomb.sh --config configs/exp3.yaml --exp 3 --no-wandb
-#   --retrain: train lại B₁ · --force: train lại C₂ (checkpoint moe_lora được bảo vệ)
-```
-
-Kết quả Exp 3 **không ghép vào bảng §2.3** (khác ngân sách huấn luyện). Đọc: C₂ − B₁ có ▲ không, và so C₂ (Exp 3) với E (§2.3) để xem shared LoRA có còn cần khi đủ bước.
+| C | `moe_lora` | Predictions của §2.3 kéo từ Hub, chấm lại bằng cùng pipeline; không train/infer lại |
 
 ## Giải mã greedy (đồng bộ §2.3 và §2.5)
 
 Cả hai config có cùng khối `generate:` với `num_beams: 1` — đo năng lực thuần của mô hình, không đo bộ tìm kiếm chuỗi. Gemma đi `transformers.generate`; R2Gen/AdaAtt đi `src/sota/decoding.py`, vốn chép nhánh greedy (`num_beams = 1`) và nhánh beam của transformers 4.52 (selftest đối chiếu từng token với `transformers.generate`, 30 tổ hợp). Chỉ độ dài tối đa khác nhau: Gemma 256 subword, hai baseline `max_seq_length − 1` từ.
 
 Mỗi dòng `predictions/*.jsonl` mang nhãn `decode` (`greedy` / `beam<k>`). Stage `infer` của §2.5 **từ chối** predictions của E trên Hub nếu nhãn khác `generate:` hiện hành; file cũ chưa có nhãn thì chỉ cảnh báo (vào `manifest.deviations`). Chủ ý so khác bộ giải mã: `predictions_from_hub.allow_decode_mismatch: true`.
-
-## Quy trình train lại
-
-```bash
-export HF_TOKEN="<Hugging Face token>"
-bash scripts/setup.sh                                   # một lần
-
-# 1a) §2.3 — CHỈ THÊM B*: dùng lại predictions A, B, C, D, E đã infer trên Hub,
-#     chỉ train + infer B*, rồi chấm + thống kê + báo cáo cho cả sáu candidate.
-#     (Hub không có predictions của B* nên B* tự được train; adapter của A–E không cần.)
-bash scripts/run_recomb.sh --exp 2.3 --reuse-hub-preds --no-wandb
-#     Dừng nếu predictions trên Hub thiếu ảnh test, thiếu route_experts (D, E) hoặc
-#     nhãn `decode` khác `generate:`; file cũ chưa có nhãn thì chỉ cảnh báo.
-#     Sau lệnh này B* được push lên Hub cùng subdir.
-
-# 1b) §2.3 — train + infer + chấm + thống kê + báo cáo cho cả sáu candidate
-bash scripts/run_recomb.sh --exp 2.3 --retrain --force --no-wandb
-#    --retrain: train lại mọi arm trừ D · --force: train lại D (checkpoint D được bảo vệ)
-#    chỉ B*: bash scripts/run_recomb.sh --exp 2.3 --arms lora_qdora_vision
-
-# 2) §2.5 — train hai baseline, kéo predictions của E (greedy) từ Hub
-bash scripts/run_section25.sh --detach --retrain
-
-# 3) bảng LaTeX cho bài báo (số lấy nguyên từ summary.csv, không gõ tay)
-python -m src.export_paper_tables --run23 runs/2.3_three_candidate_attn_pool \
-    --run25 runs/2.5_sota --run26 runs/2.6_vision_lora --out ../paper/tables
-```
-
-Chạy lại từng stage: `--stages score,stats,report --rescore`, hoặc `--stages stats,report`. `--repull` (§2.5) kéo lại predictions của E.
-
-Thứ tự bắt buộc: §2.3 train/infer **xong và đẩy lên Hub** trước khi chạy §2.5, vì §2.5 lấy predictions của E từ đó.
 
 ## Cách tính điểm
 

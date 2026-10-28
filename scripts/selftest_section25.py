@@ -135,7 +135,7 @@ def t_protocol_numbers_config_and_readme():
         assert CFG["metrics"][m]["enabled"] is True, m
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for needle in ("7.500", "10.000", "Holm", "predictions_from_hub", "f1chexbert",
-                   "Candidate E"):
+                   "moe_lora"):
         assert needle in readme, f"README không nhắc `{needle}`"
 
 

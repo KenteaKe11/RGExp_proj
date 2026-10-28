@@ -582,6 +582,10 @@ stats:
   pairs: contrasts
   adjust_scope: metrics     # Holm trên các metric, trong từng cặp (quy ước §2.3)
   contrasts:
+    # §2.3 chính thức: ba hệ thống A, B, C. Cặp nào thiếu candidate thì bị bỏ qua.
+    - [baseline_infer,     lora_qdora_vision]    # A -> B: fine-tune
+    - [lora_qdora_vision,  moe_lora]             # B -> C: MoE-LoRA + Recombinator
+    # Các cặp dưới đây chỉ chạy khi chạy đủ sáu arm (ablation cũ).
     - [baseline_infer,     lora_only]            # fine-tune decoder
     - [lora_only,          lora_qdora_vision]    # QDoRA vision (B -> B*)
     - [lora_qdora_vision,  lora_recomb]          # Recombinator + đầu phân loại
