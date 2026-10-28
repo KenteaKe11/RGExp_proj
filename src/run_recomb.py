@@ -576,6 +576,10 @@ def main(argv: list[str] | None = None) -> int:
                   "stage train và cả việc chuẩn bị tập train",
                   flush=True)
     need_train_run = bool(arms_to_train)
+    if bool(cfg["output"].get("push_per_arm", False)) and need_train_run \
+            and "infer" not in stages:
+        stages.append("infer")
+        manifest["stages_run"] = stages
 
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
@@ -613,6 +617,56 @@ def main(argv: list[str] | None = None) -> int:
         test_df = data_mod.load_manifest(cfg)
         print(f"⚙ dùng lại manifest test: {len(test_df)} mẫu", flush=True)
     tracker.summary({"data/n_test": len(test_df)})
+
+    # ── train → infer → push TỪNG arm ──────────────────────────────────────
+    # output.push_per_arm: xong train của một arm là suy luận và đẩy NGAY, rồi
+    # mới sang arm kế tiếp — một lần đứt giữa chừng không làm mất arm đã xong.
+    per_arm = bool(cfg["output"].get("push_per_arm", False))
+    inferred_now: set[str] = set()
+
+    def infer_one(arm: dict):
+        """Sinh báo cáo cho MỘT arm. Trả None nếu ổn, mã thoát nếu dừng."""
+        from .runners import build
+        from .runners.base import RunnerUnusable
+
+        if arm["id"] in reused:
+            print(f"\n── {arm.get('name', arm['id'])}: dùng predictions từ Hub, "
+                  f"bỏ qua infer ──", flush=True)
+            return None
+        mcfg = arm_model_cfg(cfg, arm, adapter_root)
+        print(f"\n── {arm.get('name', arm['id'])} ({mcfg['runner']}) ──", flush=True)
+        t0 = time.time()
+        try:
+            build(cfg, mcfg, tracker).run(test_df, pred_paths[arm["id"]],
+                                          log_every=tracker.log_every)
+            manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
+                "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
+            inferred_now.add(arm["id"])
+        except RunnerUnusable as e:
+            # Dừng ngay ở CẢ HAI mục: §2.3 k nhỏ, mất một candidate là mất cả
+            # phép so sánh; §2.4 Friedman đòi thiết kế khối ĐẦY ĐỦ.
+            print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
+            manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
+                "ok": False, "unusable": str(e)}
+            tracker.alert(f"§{exp} dừng: một candidate không sinh được",
+                          f"{arm['id']}: {e}", "ERROR")
+            tracker.finish(1)
+            return 6
+        return None
+
+    def push_arm(arm: dict) -> None:
+        """Đẩy adapter + predictions + train_stats của MỘT arm (không ném lỗi)."""
+        if not per_arm or not cfg["output"].get("push", True):
+            return
+        from .push import push_artifact
+
+        aid = arm["id"]
+        push_artifact(cfg, adapter_root / aid, f"adapters/{aid}",
+                      f"§{exp} adapter {aid}")
+        push_artifact(cfg, pred_paths[aid], f"predictions/{aid}.jsonl",
+                      f"§{exp} predictions {aid}")
+        push_artifact(cfg, adapter_root / aid / "train_stats.json",
+                      f"train_stats/{aid}.json", f"§{exp} train_stats {aid}")
 
     # Không tự kết nối hoặc kéo artifacts từ Hub. Chỉ --pull (lệnh riêng ở trên)
     # mới tải adapter/predictions; các stage thường dùng cache local hiện có.
@@ -750,6 +804,13 @@ def main(argv: list[str] | None = None) -> int:
                                  f"train/{aid}/vram_peak_gb": st["vram_peak_gb"],
                                  f"train/{aid}/trainable_params":
                                      st.get("trainable_params")})
+                if per_arm and "infer" in stages:
+                    from .backbone import free_vram
+                    free_vram()
+                    rc = infer_one(arm)
+                    if rc is not None:
+                        return rc
+                    push_arm(arm)
             except TrainUnusable as e:
                 print(f"\n✗ {aid} KHÔNG huấn luyện được: {e}", flush=True)
                 tracker.alert(f"§{exp} dừng ở train", f"{aid}: {e}", "ERROR")
@@ -806,34 +867,14 @@ def main(argv: list[str] | None = None) -> int:
     # ── infer ───────────────────────────────────────────────────────────────
     if "infer" in stages:
         _hr("Sinh báo cáo")
-        from .runners import build
-        from .runners.base import RunnerUnusable
-
         for arm in arms:
-            if arm["id"] in reused:
-                print(f"\n── {arm.get('name', arm['id'])}: dùng predictions từ Hub, "
-                      f"bỏ qua infer ──", flush=True)
+            if arm["id"] in inferred_now:
                 continue
-            mcfg = arm_model_cfg(cfg, arm, adapter_root)
-            print(f"\n── {arm.get('name', arm['id'])} ({mcfg['runner']}) ──", flush=True)
-            t0 = time.time()
-            try:
-                build(cfg, mcfg, tracker).run(test_df, pred_paths[arm["id"]],
-                                              log_every=tracker.log_every)
-                manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
-                    "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
-            except RunnerUnusable as e:
-                # Dừng ngay ở CẢ HAI mục, dù vì hai lý do khác nhau. §2.3: k = 2,
-                # mất một candidate là mất cả phép so sánh. §2.4: Friedman đòi
-                # thiết kế khối ĐẦY ĐỦ — chạy tiếp với 4/5 cột là lặng lẽ đổi
-                # thí nghiệm, và bảng vẫn in ra bình thường.
-                print(f"\n✗ {arm['id']} không sinh được: {e}", flush=True)
-                manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
-                    "ok": False, "unusable": str(e)}
-                tracker.alert(f"§{exp} dừng: một candidate không sinh được",
-                              f"{arm['id']}: {e}", "ERROR")
-                tracker.finish(1)
-                return 6
+            rc = infer_one(arm)
+            if rc is not None:
+                return rc
+            if arm["id"] not in reused:
+                push_arm(arm)
 
     # ── score ───────────────────────────────────────────────────────────────
     from .metrics import (CHEXBERT_GOLD_SOURCE, CHEXBERT_LABELS,

@@ -34,18 +34,20 @@ Hiệu số kiểm định khai trước trong `stats.contrasts` (mỗi cặp m�
 
 ## §2.3 mới: dữ liệu cấp patient, 3 hệ thống A/B/C
 
-- **Dữ liệu**: mỗi patient đúng một ảnh; train 12 800, val 256, test 3 000 patient, ba tập không giao nhau.
-  Split tự động khi chạy pipeline (cache cục bộ → pull Hub → tạo + đẩy Hub), hoặc chạy tay: `python scripts/make_patient_split.py`
-  (seed `data.split_seed`=42). Config đọc qua
-  `data.split_local_dir` (thiếu file thì DỪNG, không quay về split cũ).
+- **Dữ liệu**: mỗi patient đúng một ảnh; train 6 400, val 256, test 3 000 patient, ba tập không giao nhau.
+  Split tự động khi chạy pipeline (cache cục bộ → pull Hub → tạo + đẩy Hub), hoặc chạy tay:
+  `python scripts/make_patient_split.py` (seed `data.split_seed` = 42; `data.split_local_dir`, thiếu file thì DỪNG).
 - **Hệ thống**: A = `baseline_infer`, B = `lora_qdora_vision` (LoRA decoder + QDoRA vision), C = `moe_lora`
   (MoE-LoRA + Recombinator + cls head, không shared). Test mới ⇒ dự đoán cũ trên Hub KHÔNG dùng lại được
   (`--reuse-hub-preds` không áp dụng); suy luận lại A, B, C và R2Gen/AdaAtt trên test mới.
-- **Huấn luyện**: `train.epoch_split: true`, 2 epoch, mỗi epoch một nửa tập train (6 400 mẫu, không lặp),
-  eff_bs 16 ⇒ 400 bước/epoch, 800 bước. Mỗi epoch một chu kỳ one-cycle giống nhau; peak 8e-5 (epoch 1) → 7e-5
-  (epoch 2, `lr_decay` 0,875); đáy nhóm nhỏ nhất 1e-8 (epoch 2 nhân 0,875 theo cả đường cong).
-- Output mới: `runs/2.3_pt12800_three_systems`, `adapters_2_3_pt12800`. §2.5 đọc C từ đó.
-- Exp 3 cũ (2 epoch, eff_bs 16) nay trùng ngân sách với §2.3 mới ⇒ không còn cần.
+- **Huấn luyện**: eff_bs 8, weight decay 0,05, 800 bước = 4 epoch × 200 bước (`train.epoch_split: true`): mỗi
+  epoch một phần tư tập train (1 600 mẫu, không lặp). Mỗi epoch một chu kỳ one-cycle giống nhau; peak
+  8e-5 × 0,875^epoch (8e-5, 7e-5, 6,1e-5, 5,4e-5); đáy nhóm nhỏ nhất ở epoch 1 = 1e-8 (các epoch sau nhân 0,875^epoch).
+- **Dò batch**: `[8, 6, 4, 2, 1]`, eff_bs luôn 8; OOM thì dọn VRAM rồi train lại từ đầu với bậc kế.
+- **Đẩy từng arm** (`output.push_per_arm: true`): train → infer → đẩy adapter + predictions + train_stats
+  của MỘT arm rồi mới sang arm sau; đứt giữa chừng không mất arm đã xong.
+- Output: `runs/2.3_pt6400_three_systems`, `adapters_2_3_pt6400`. §2.5 đọc C từ đó.
+- Exp 3 cũ không còn cần.
 
 ## Exp 3 — hậu kiểm (post-test)
 

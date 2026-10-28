@@ -130,7 +130,7 @@ def t_protocol_numbers_config_and_readme():
     assert str(st["pairs"]) == "vs_reference"
     assert str(st["reference"]) == "moe_lora"
     assert int(CFG["data"]["n_test"]) == 3000
-    assert int(CFG["data"]["n_train"]) == int(CFG["pretrain"]["n_train"]) == 12800
+    assert int(CFG["data"]["n_train"]) == int(CFG["pretrain"]["n_train"]) == 6400
     for m in ("chexbert", "radgraph"):
         assert CFG["metrics"][m]["enabled"] is True, m
     readme = (ROOT / "README.md").read_text(encoding="utf-8")

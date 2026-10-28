@@ -92,7 +92,7 @@ data:
   zip_stream_min_rate: 1.0
 
   train_split_csv: split_ref/train_split.csv
-  n_train: 12800
+  n_train: 6400
   val_split_csv: split_ref/val_split.csv
   n_val: 256
   assert_no_leak: true
@@ -187,17 +187,18 @@ lora:
 
 # ── HUẤN LUYỆN ─────────────────────────────────────────────────────────────
 train:
-  n_epochs: 2
-  # 12800 mẫu chia cho 2 epoch (mỗi epoch MỘT NỬA = 6400 mẫu, không lặp mẫu), eff_bs 16
-  # => 400 bước/epoch × 2 = 800 bước. Mỗi epoch một chu kỳ one-cycle giống nhau;
-  # peak epoch 2 = peak × lr_decay = 7e-5; đáy nhóm nhỏ nhất (3e-5/(25×120)) = 1e-8.
+  n_epochs: 4
+  # 6400 mẫu, eff_bs 8 => 800 bước = 4 epoch × 200 bước; mỗi epoch MỘT PHẦN TƯ tập
+  # train (1600 mẫu, không lặp mẫu). Mỗi epoch một chu kỳ one-cycle giống nhau;
+  # peak epoch e = peak × lr_decay^e (8e-5, 7e-5, 6.1e-5, 5.4e-5); đáy nhóm nhỏ
+  # nhất ở epoch đầu = 1e-8.
   epoch_split: true
 
   # Candidate có Recombinator dò theo thứ tự này; batch tìm được sẽ khóa cho QLoRA-only.
   batch_probe: true
-  batch_probe_sizes: [16, 12, 10, 8, 6, 4, 2, 1]
-  per_device_batch_size: 16
-  effective_batch_size: 16
+  batch_probe_sizes: [8, 6, 4, 2, 1]
+  per_device_batch_size: 8
+  effective_batch_size: 8
   grad_accum: 1
 
   max_seq_len: 1024              # KHÔNG tính 32 token chèn thêm: chúng được
@@ -205,7 +206,7 @@ train:
                                  # không học trên báo cáo ngắn hơn A đúng 32
                                  # token.
   gradient_checkpointing: true
-  weight_decay: 0.03
+  weight_decay: 0.05
   adam_betas: [0.9, 0.95]
   max_grad_norm: 1.0
   logging_steps: 10
@@ -222,7 +223,7 @@ train:
     cycle_momentum: false
 
   # Nhánh mới là mạng DÀY ĐẶC, khác LoRA — weight decay riêng cho nó.
-  branch_weight_decay: 0.03
+  branch_weight_decay: 0.05
 
   # Residual merge uses a learned scalar alpha; no sigmoid gate or L0 sparsity penalty.
 
@@ -695,14 +696,16 @@ output:
   hub_repo_type: dataset
   hub_private: true
   push: true
+  # Xong train → infer của MỘT arm là đẩy ngay (adapter, predictions, train_stats), rồi mới sang arm sau.
+  push_per_arm: true
   # Hai thí nghiệm, hai thư mục — KHÔNG dùng chung. Ghi §2.4 đè lên runs/ của
   # §2.3 là mất bảng mà §2.4 lấy làm mốc nền, và trộn adapter của hai mục trong
   # một thư mục là mở đường cho `already_trained()` nhận nhầm một candidate của
   # mục kia rồi bỏ qua stage train.
-  subdir: "2.3_pt12800_three_systems"
-  adapter_dir: ./adapters_2_3_pt12800
-  subdir_moe: "2.4_moe_pt12800"
-  adapter_dir_moe: ./adapters_2_4_pt12800
+  subdir: "2.3_pt6400_three_systems"
+  adapter_dir: ./adapters_2_3_pt6400
+  subdir_moe: "2.4_moe_pt6400"
+  adapter_dir_moe: ./adapters_2_4_pt6400
 
   # decoder_ft ghi vào thư mục RIÊNG bằng hậu tố này:
   #   runs/2.3_recombiner_ft/ + adapters_2_3_ft/  (và _ft cho cặp 2.4)

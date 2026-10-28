@@ -39,7 +39,7 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 12800
+  n_train: 6400
   val_split_csv: split_ref/val_split.csv
   n_val: 256            # = §2.3
   assert_no_leak: true
@@ -117,7 +117,7 @@ arms_s25:
     predictions_from_hub:
       repo: RGExp123/Research_results
       repo_type: dataset
-      subdir: 2.3_pt12800_three_systems
+      subdir: 2.3_pt6400_three_systems
       file: predictions/moe_lora.jsonl
     enabled: true
 
@@ -572,7 +572,7 @@ stats:
 # DỪNG nếu lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 12800 # 0 = toàn bộ train split đã khai ở `data`
+  n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 6
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.
