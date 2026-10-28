@@ -139,7 +139,7 @@ class Gemma3RecombRunner(Gemma3AdapterRunner):
                 if not vdir.is_dir():
                     raise RunnerUnusable(
                         f"train_stats.json khai vision adapter {vname!r}, nhưng "
-                        f"không thấy {vdir}. Candidate C thiếu QDoRA vision; "
+                        f"không thấy {vdir}. candidate này thiếu QDoRA vision; "
                         "huấn luyện lại candidate này.")
                 self.model.load_adapter(str(vdir), adapter_name=vname)
                 try:

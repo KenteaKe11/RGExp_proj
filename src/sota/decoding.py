@@ -23,6 +23,13 @@ từng bước, `GenerationMixin._beam_search` của transformers 4.52 (bản
      (hết độ dài), hoặc early_stopping=true và mọi ảnh đã đủ k giả thuyết.
   f. Trả giả thuyết điểm cao nhất của mỗi ảnh.
 
+`num_beams = 1` KHÔNG đi vòng lặp trên. `transformers.generate` với
+`num_beams = 1` và `do_sample=False` đi `_sample` (greedy): lấy argmax của logit
+thô sau bộ xử lý, dừng ở `<eos>`. Vòng beam với k = 1 thì khác — luật hạng của
+(d) khiến `<eos>` (luôn đứng thứ hai) không bao giờ được nhận, chuỗi chạy tới
+hết độ dài. Nên k = 1 đi `_greedy` bên dưới, chép lại đúng nhánh greedy ấy
+(selftest đối chiếu từng token).
+
 Độ dài tối đa là khác biệt DUY NHẤT với My Gemma: `max_new_tokens` = None ->
 `max_seq_length − 1` của từ điển (chuỗi tính cả `<bos>` dài tối đa bằng chuỗi
 huấn luyện). `<pad>`/`<bos>` không bao giờ được sinh — chúng không phải từ.
@@ -77,10 +84,60 @@ def _gather(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _greedy(step, state0, batch_size: int, tok, dcfg: dict, device) -> list[str]:
+    """Greedy = nhánh `_sample` (do_sample=False) của transformers 4.52.
+
+    Bộ xử lý chạy trên logit THÔ (không phải log_softmax như vòng beam):
+    repetition_penalty -> no_repeat_ngram -> cấm <pad>/<bos> -> argmax. Chuỗi
+    đã gặp `<eos>` thì phần sau là <eos> (không ảnh hưởng văn bản giải mã).
+    """
+    rep = float(dcfg.get("repetition_penalty", 1.0))
+    ngram = int(dcfg.get("no_repeat_ngram_size", 0))
+    max_new = dcfg.get("max_new_tokens")
+    max_new = int(max_new) if max_new else int(getattr(tok, "max_seq_length", 60)) - 1
+    max_new = max(1, max_new)
+    B = int(batch_size)
+    max_len = 1 + max_new                       # <bos> + token sinh
+    seqs = torch.full((B, max_len), tok.eos_id, dtype=torch.long, device=device)
+    seqs[:, 0] = tok.bos_id
+    done = torch.zeros(B, dtype=torch.bool, device=device)
+    state = state0
+    vocab = 0
+    cur = 1
+    while cur < max_len:
+        flat = seqs[:, :cur]
+        logits, state = step(state, flat[:, -1])
+        if not vocab:
+            vocab = int(logits.size(-1))
+            if vocab != len(tok):
+                raise ValueError(
+                    f"mô hình sinh ra {vocab} logit nhưng từ điển có "
+                    f"{len(tok)} từ. Checkpoint và `tokenizer.json` không đi "
+                    f"cùng nhau — id của từ do từ điển quyết định, nên giải mã "
+                    f"tiếp sẽ ra tiếng Anh đọc được với nghĩa khác hẳn.")
+        sc = _repetition_penalty(logits.float(), flat, rep)
+        banned = _ngram_banned(flat, ngram, vocab)
+        if banned is not None:
+            sc = sc.masked_fill(banned, float("-inf"))
+        sc[:, tok.pad_id] = float("-inf")
+        sc[:, tok.bos_id] = float("-inf")
+        nxt = sc.argmax(dim=-1)
+        nxt = torch.where(done, torch.full_like(nxt, tok.eos_id), nxt)
+        seqs[:, cur] = nxt
+        done = done | (nxt == tok.eos_id)
+        cur += 1
+        if bool(done.all()):
+            break
+    return [tok.decode(seqs[b].tolist()) for b in range(B)]
+
+
+@torch.no_grad()
 def beam_search(step, reorder, state0, batch_size: int, tok, dcfg: dict,
                 device) -> list[str]:
     """Trả `batch_size` chuỗi văn bản đã giải mã. `dcfg` = `decoding_spec.sota_kwargs`."""
-    k = max(1, int(dcfg.get("num_beams", 3)))
+    k = max(1, int(dcfg.get("num_beams", 1)))
+    if k == 1:
+        return _greedy(step, state0, batch_size, tok, dcfg, device)
     lp = float(dcfg.get("length_penalty", 1.0))
     early = dcfg.get("early_stopping", False)
     rep = float(dcfg.get("repetition_penalty", 1.0))

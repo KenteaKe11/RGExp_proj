@@ -147,6 +147,12 @@ class Runner:
             print(f"  ⚠ dọn {cut} byte của dòng cuối bị cắt dở (lần chạy trước bị dừng "
                   f"giữa lúc ghi)", flush=True)
 
+        try:
+            from ..decoding_spec import tag as _decode_tag
+
+            decode_tag = _decode_tag(self.cfg)
+        except Exception:  # noqa: BLE001 — nhãn chỉ để đối chiếu, không chặn sinh
+            decode_tag = None
         records: dict[str, dict] = {}
         if out_path.exists():
             # Đọc lại bằng try/except từng dòng: file bị cắt giữa chừng vì
@@ -259,6 +265,7 @@ class Runner:
                         "key": item["key"],
                         "pred": text,
                         "model_id": self.mcfg["id"],
+                        "decode": decode_tag,
                         "latency_s": round(dt / max(1, len(batch)), 3),
                         "empty": not text.strip(),
                     }

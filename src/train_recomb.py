@@ -893,8 +893,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         adapter_cfg = dict(tcfg)
         adapter_cfg["train_projector"] = bool(arm.get("train_projector", False))
         vision_cfg = dict(tcfg.get("vision_adapter", {}) or {})
+        # QDoRA vision đi theo nhánh (C) HOẶC theo cờ `vision_qdora` của arm.
+        # B* = A + QDoRA vision, KHÔNG nhánh: nó tách phần đóng góp của riêng
+        # QDoRA vision khỏi Recombinator, vốn trước đây luôn đi cùng nhau.
         adapter_cfg["vision_adapter"] = (
-            vision_cfg if bool(arm.get("recomb")) else {"enabled": False})
+            vision_cfg if (bool(arm.get("recomb")) or bool(arm.get("vision_qdora")))
+            else {"enabled": False})
         model, pstats = attach_adapter(
             model, {"method": preset["method"], "rank": preset["rank"], "id": aid},
             adapter_cfg)
@@ -1359,14 +1363,17 @@ def already_trained(out_dir: Path, needs_branch: bool,
     ok = ok and (d / "train_stats.json").exists()
     if ok and needs_branch:
         ok = recombiner.branch_exists(d)
-    if ok and needs_branch:
+    if ok:
+        # Nhãn/đầu phân loại chỉ có ở arm có nhánh; QDoRA vision thì có thể có
+        # ở cả arm KHÔNG nhánh (B*), nên kiểm riêng, không phụ thuộc nhánh.
         try:
             train_stats = json.loads((d / "train_stats.json").read_text(encoding="utf-8"))
-            label_stats = train_stats.get("cls_label_stats") or {}
-            ok = label_stats.get("label_source") == (
-                "f1chexbert_from_reference_report_binary_pos_uncertain/2")
-            ok = ok and train_stats.get("cls_head_format") == (
-                "binary_sigmoid_14_logits_v1")
+            if needs_branch:
+                label_stats = train_stats.get("cls_label_stats") or {}
+                ok = label_stats.get("label_source") == (
+                    "f1chexbert_from_reference_report_binary_pos_uncertain/2")
+                ok = ok and train_stats.get("cls_head_format") == (
+                    "binary_sigmoid_14_logits_v1")
             vision_adapter = train_stats.get("vision_adapter") or {}
             if ok and vision_adapter:
                 name = str(vision_adapter.get("name", "vision_qdora"))

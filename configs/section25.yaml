@@ -82,6 +82,7 @@ labels:
 # ── BA CANDIDATE ───────────────────────────────────────────────────────────
 arms_s25:
   - id: r2gen
+    short: "R2Gen"
     name: "A · R2Gen (ResNet-101 + Relational Memory)"
     kind: sota
     runner: r2gen
@@ -90,6 +91,7 @@ arms_s25:
     enabled: true
 
   - id: adaatt
+    short: "AdaAtt"
     name: "B · AdaAtt (ResNet-152 + Visual Sentinel)"
     kind: sota
     runner: adaatt
@@ -100,6 +102,7 @@ arms_s25:
   # Candidate E §2.3: checkpoint được giữ nguyên, chỉ nạp để suy luận/chấm.
   # Đường dẫn tương đối tới repo; không tự kéo từ Hub và không train lại.
   - id: moe_shared_lora
+    short: "E"
     name: "C · Candidate E · MoE-LoRA + shared LoRA"
     kind: ours
     runner: gemma3_recomb
@@ -306,14 +309,14 @@ prompt:
 # (subword); R2Gen/AdaAtt dừng ở `max_seq_length − 1` = 59 từ của từ điển.
 #
 # Với MoE, trọng số định tuyến của mỗi ảnh được nhân bản theo beam
-# (`moe.RoutingContext.set(..., repeat=num_beams)`). Beam nhân số chuỗi trong
-# một lượt sinh lên 3 lần: hết VRAM thì hạ `base.batch_size`.
+# (`moe.RoutingContext.set(..., repeat=num_beams)`); greedy thì repeat = 1.
+# Muốn thử beam: đặt num_beams > 1 và hạ `base.batch_size` nếu hết VRAM.
 generate:
   max_new_tokens: 256
   do_sample: false
-  num_beams: 3
-  length_penalty: 1.0          # điểm = tổng log-prob / (số token sinh)^1
-  early_stopping: false        # heuristic dừng của transformers
+  num_beams: 1                 # GREEDY: đo năng lực thuần của mô hình, không đo bộ tìm kiếm
+  length_penalty: 1.0          # (chỉ có nghĩa khi num_beams > 1)
+  early_stopping: false        # heuristic dừng của transformers (beam)
   no_repeat_ngram_size: 0      # không chặn n-gram
   repetition_penalty: 1.0      # không phạt lặp
   num_return_sequences: 1

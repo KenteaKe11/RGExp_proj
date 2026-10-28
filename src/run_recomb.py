@@ -367,6 +367,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="chỉ Candidate D (moe_lora): ghi đè checkpoint và suy luận lại")
     ap.add_argument("--pull", action="store_true",
                     help="chỉ kéo adapter đã huấn luyện và predictions từ Hub về local rồi thoát")
+    ap.add_argument("--reuse-hub-preds", action="store_true",
+                    help="kéo predictions đã infer từ Hub; candidate nào Hub đã có thì "
+                         "KHÔNG train/infer lại (chỉ score/stats/report), candidate "
+                         "chưa có (B*) vẫn train + infer như thường")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
@@ -485,6 +489,23 @@ def main(argv: list[str] | None = None) -> int:
                   + ", ".join(missing_adapters), flush=True)
             return 6
         return 0
+    reused: set[str] = set()
+    if a.reuse_hub_preds:
+        from . import resume as resume_mod
+
+        print("\n⇣ Kéo predictions đã infer từ Hub (không kéo adapter)…", flush=True)
+        try:
+            got = resume_mod.pull_predictions_only(
+                cfg, [x["id"] for x in arms], pred_paths)
+        except resume_mod.ScanError as e:
+            print(f"✗ Không kéo được predictions từ Hub: {e}", flush=True)
+            return 5
+        reused = {aid for aid, msg in got.items() if str(msg).startswith("đã kéo")}
+        manifest["hub_reuse_predictions"] = got
+        for aid in pred_paths:
+            print(f"  {aid}: {got.get(aid, '—')}"
+                  + ("  → dùng lại, không train/infer" if aid in reused
+                     else "  → sẽ train + infer"), flush=True)
     t_start = time.time()
     hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
            if is_moe else
@@ -515,7 +536,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚠ không đọc được trạng thái cache ({e!r}) — coi như chưa có gì",
               flush=True)
     if "train" in stages:
-        trainable_arms = [x for x in arms if not x.get("infer_only")]
+        trainable_arms = [x for x in arms if not x.get("infer_only")
+                          and x["id"] not in reused]
         for arm in trainable_arms:
             aid = arm["id"]
             trained = bool(cache.get("arms", {}).get(aid, {}).get("trained"))
@@ -747,6 +769,38 @@ def main(argv: list[str] | None = None) -> int:
                 train_stats.append(json.loads(p.read_text(encoding="utf-8")))
 
 
+    # ── predictions kéo từ Hub: phải ĐỦ mẫu, đúng bộ giải mã ───────────────
+    if reused:
+        from . import decoding_spec
+        from . import hub_reuse as hr_mod
+
+        keys = [str(k) for k in test_df["key"]]
+        expect = decoding_spec.tag(cfg)
+        warns = {}
+        for arm in arms:
+            aid = arm["id"]
+            if aid not in reused:
+                continue
+            rows = hr_mod._read(pred_paths[aid])
+            miss = [k for k in keys if k not in rows]
+            if miss:
+                print(f"✗ predictions của {aid} trên Hub thiếu {len(miss)}/{len(keys)} "
+                      f"ảnh test (vd {miss[0]}). Không điền bù; chạy lại infer §2.3 "
+                      f"cho {aid} rồi đẩy lên Hub.", flush=True)
+                return 6
+            if arm.get("moe") and not all(rows[k].get("route_experts") for k in keys):
+                print(f"✗ predictions của {aid} thiếu route_experts.", flush=True)
+                return 6
+            try:
+                w = hr_mod.check_decoding(rows, keys, expect, aid)
+            except hr_mod.HubReuseError as e:
+                print(f"✗ {e}", flush=True)
+                return 6
+            if w:
+                warns[aid] = w
+                print(f"  ⚠ {w}", flush=True)
+        manifest["hub_reuse_decode_warnings"] = warns
+
     # ── infer ───────────────────────────────────────────────────────────────
     if "infer" in stages:
         _hr("Sinh báo cáo")
@@ -754,6 +808,10 @@ def main(argv: list[str] | None = None) -> int:
         from .runners.base import RunnerUnusable
 
         for arm in arms:
+            if arm["id"] in reused:
+                print(f"\n── {arm.get('name', arm['id'])}: dùng predictions từ Hub, "
+                      f"bỏ qua infer ──", flush=True)
+                continue
             mcfg = arm_model_cfg(cfg, arm, adapter_root)
             print(f"\n── {arm.get('name', arm['id'])} ({mcfg['runner']}) ──", flush=True)
             t0 = time.time()

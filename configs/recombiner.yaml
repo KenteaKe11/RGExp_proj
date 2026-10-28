@@ -120,11 +120,22 @@ prompt:
     Findings: <the radiological findings>
     Impression: <the overall impression>
 
+# ── Giải mã GREEDY, MỘT đặc tả cho §2.3 và §2.5 ─────────────────────────────
+# Chọn greedy có chủ ý: mục tiêu là đo năng lực THUẦN của mô hình, không phải
+# năng lực của bộ tìm kiếm chuỗi. §2.5 (R2Gen, AdaAtt, Candidate E) đọc CÙNG
+# khối này qua `src/decoding_spec.py`; beam_search của hai baseline với
+# num_beams = 1 suy biến đúng thành greedy (selftest đối chiếu từng token).
+# Khai TƯỜNG MINH mọi khoá: generation_config.json của Gemma 3 khai sampling,
+# và một khoá bỏ trống là để nó chen vào.
 generate:
   max_new_tokens: 256
   do_sample: false
   num_beams: 1
+  length_penalty: 1.0
+  early_stopping: false
+  no_repeat_ngram_size: 0
   repetition_penalty: 1.0
+  num_return_sequences: 1
 
 # ── CẤU HÌNH LoRA: CHỌN 1 TRONG 8 BIẾN THỂ CỦA §2.2 ─────────────────────────
 # §2.3 KHÔNG so các biến thể LoRA với nhau nữa — §2.2 làm việc đó. Ở đây LoRA
@@ -447,21 +458,36 @@ arms_moe:
 # Danh sách này là thứ tự TRÌNH BÀY trong báo cáo.
 arms:
   - id: baseline_infer
+    short: "A"
     name: "Mô hình Gemma 3 gốc"
     recomb: false
     infer_only: true
     enabled: true
   - id: lora_only
+    short: "B"
     name: "QLoRA chỉ trên bộ giải mã"
     recomb: false
     enabled: true
+  # B* = lora_only + QDoRA vision (cùng cấu hình `train.vision_adapter` với C,
+  # D, E), KHÔNG Recombinator. Ở bản cũ mọi arm có QDoRA vision cũng có nhánh,
+  # nên hiệu số lora_only -> lora_recomb gộp hai thứ. B* tách chúng:
+  #   lora_only -> B*          = đóng góp của QDoRA vision
+  #   B* -> lora_recomb        = đóng góp của Recombinator + đầu phân loại
+  - id: lora_qdora_vision
+    short: "B*"
+    name: "B* · QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh (không Recombinator)"
+    recomb: false
+    vision_qdora: true
+    enabled: true
   - id: lora_recomb
+    short: "C"
     name: "QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh + Recombinator + đầu phân loại"
     recomb: true
     capture_cls_head: false
     train_projector: false
     enabled: true
   - id: moe_lora
+    short: "D"
     name: "MoE-LoRA decoder + Route + QDoRA vision + Recombinator + đầu phân loại"
     recomb: true
     moe: true
@@ -473,6 +499,7 @@ arms:
     train_projector: false
     enabled: true
   - id: moe_shared_lora
+    short: "E"
     name: "MoE-LoRA + shared LoRA decoder + Route + Recombinator"
     recomb: true
     moe: true
@@ -538,6 +565,21 @@ stats:
   # Quy tắc §2.3: p permutation thô < alpha VÀ bootstrap CI không chứa 0.
   # p permutation sau Holm và p bootstrap vẫn được lưu để tham khảo, không gating.
   primary_test: perm
+
+  # ── Các cặp cần kiểm của §2.3 ─────────────────────────────────────────────
+  # Khai TRƯỚC thay vì kiểm hết 15 cặp của 6 candidate: mỗi cặp trả lời đúng
+  # MỘT câu hỏi của bài (A − B với A ở vị trí tham chiếu). Holm chạy trên các
+  # metric trong từng cặp.
+  pairs: contrasts
+  adjust_scope: metrics     # Holm trên các metric, trong từng cặp (quy ước §2.3)
+  contrasts:
+    - [baseline_infer,     lora_only]            # fine-tune decoder
+    - [lora_only,          lora_qdora_vision]    # QDoRA vision (B -> B*)
+    - [lora_qdora_vision,  lora_recomb]          # Recombinator + đầu phân loại
+    - [lora_recomb,        moe_lora]             # MoE-LoRA
+    - [moe_lora,           moe_shared_lora]      # shared LoRA
+    - [lora_qdora_vision,  moe_shared_lora]      # toàn bộ so với B*
+    - [lora_only,          moe_shared_lora]      # toàn bộ so với LoRA only
 
   # ── §2.4: k = 5 -> quay LẠI Friedman ──────────────────────────────────────
   # §2.3 bỏ Friedman vì k = 2: ở đó "kiểm định tổng thể" và "kiểm định cặp" là

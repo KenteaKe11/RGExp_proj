@@ -34,18 +34,12 @@ def _tbl(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
-                  metrics: list[str], primary: str) -> pd.DataFrame:
-    rows = []
-    for aid, df in scores.items():
-        row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
-        for m in metrics:
-            row[m] = float(df[m].mean())
-            row[f"{m}_sd"] = float(df[m].std(ddof=1)) if len(df) > 1 else float("nan")
-        rows.append(row)
-    out = pd.DataFrame(rows)
-    if primary in out.columns:
-        out = out.sort_values(primary, ascending=False).reset_index(drop=True)
-    return out
+                  metrics: list[str], primary: str = "", cfg=None) -> pd.DataFrame:
+    """Cùng cách tổng hợp với §2.3 (`report_common.summarise`); giữ thứ tự khai báo."""
+    from .report_common import summarise
+
+    scfg = dict((cfg or {}).get("stats", {}) or {})
+    return summarise(scores, names, metrics, scfg, int((cfg or {}).get("seed", 42)))
 
 
 def _stat(train_stats: list[dict], arm_id: str) -> dict:
@@ -191,53 +185,29 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                    "baseline, trên đúng 3.000 mẫu test của §2.3.\n")
 
     # ── 3. Bảng điểm ───────────────────────────────────────────────────────
-    L.append("## 3. Điểm trung bình theo từng ảnh\n")
-    head = ["Mô hình", "Số mẫu"] + metrics
-    rows = []
-    for r in summary.itertuples(index=False):
-        d = r._asdict()
-        best = {m: summary[m].max() for m in metrics}
-        rows.append([f"**{d['arm']}**", str(int(d["n"]))]
-                    + [f"**{_f(d[m])}** <sub>±{_f(d.get(f'{m}_sd'), 3)}</sub>"
-                       if d[m] == best[m]
-                       else f"{_f(d[m])} <sub>±{_f(d.get(f'{m}_sd'), 3)}</sub>"
-                       for m in metrics])
-    L.append(_tbl(head, rows))
-    L.append("\nMọi metric tính theo từng mẫu — đó là điều kiện để kiểm định "
-             "ghép cặp có nghĩa.\n")
+    from . import report_common as rc
 
-    # ── 4. Ba cặp ──────────────────────────────────────────────────────────
-    L.append("## 4. Kiểm định ghép cặp theo thiết kế §2.3\n")
-    L.append(f"Hiệu số đọc là **B − A**"
-             + (f", với `{ref}` luôn ở vị trí A" if ref else "")
-             + f". α = {alpha}. Bootstrap: {cfg['stats'].get('n_boot')} tập "
-             + f"× {cfg['stats'].get('bootstrap_sample_size')} lượt lấy có "
-             + f"hoàn lại; permutation: {cfg['stats'].get('n_perm')} lượt.\n")
-    L.append("Ý nghĩa thống kê theo quy ước §2.3: p permutation thô < α VÀ "
-             "khoảng tin cậy bootstrap không chứa 0. p đã hiệu chỉnh và dz "
-             "được lưu để tham khảo, không phải điều kiện chặn kết luận.\n")
-    if pw is None or pw.empty:
-        L.append("*(chưa có bảng kiểm định — chạy `--stages stats`)*\n")
-    else:
-        for pair, sub in pw.groupby("pair", sort=False):
-            a0 = str(sub.iloc[0]["arm_a"])
-            b0 = str(sub.iloc[0]["arm_b"])
-            L.append(f"### {names.get(b0, b0)} − {names.get(a0, a0)}\n")
-            rows = []
-            for r in sub.itertuples(index=False):
-                winner = r.arm_b if r.mean_diff > 0 else r.arm_a
-                verdict = ("**" + names.get(winner, winner) + "**"
-                           if bool(r.significant) else "không ý nghĩa")
-                rows.append([
-                    f"`{r.metric}`", _f(r.mean_a), _f(r.mean_b), _sf(r.mean_diff),
-                    f"[{_sf(r.ci_lo)}, {_sf(r.ci_hi)}]", _p(r.p_perm),
-                    _p(r.p_perm_holm), _f(r.cohen_dz, 3),
-                    f"{int(r.win_b)}/{int(r.win_a)}/{int(r.tie)}", verdict])
-            L.append(_tbl(["Chỉ số", "E (A)", "SOTA (B)", "Chênh lệch B−A",
-                           f"KTC {int(100 * float(cfg['stats'].get('ci', 0.95)))}%",
-                           "p hoán vị", "p hoán vị Holm (tham khảo)", "d_z",
-                           "Thắng B/A/hòa", "Kết luận"], rows))
-            L.append("")
+    scfg = dict(cfg["stats"])
+    L.append("## 3. Điểm trung bình\n")
+    L.append(rc.score_table(summary, metrics, order=[a["id"] for a in (arms or [])]))
+    L.append(f"\nTrung bình trên {scfg.get('n_boot')} tập bootstrap × "
+             f"{scfg.get('bootstrap_sample_size')} lượt lấy có hoàn lại từ "
+             f"{manifest.get('n_eval', '—')} ảnh test (CheXbert: micro-F1 gộp trong "
+             f"từng tập rồi lấy trung bình); dòng nhỏ ± là độ lệch chuẩn giữa các "
+             f"ảnh. Tô đậm = tốt nhất mỗi cột, kể cả hòa. Cùng cách tổng hợp với "
+             f"§2.3 nên cùng predictions cho cùng con số.\n")
+
+    # ── 4. Kiểm định ───────────────────────────────────────────────────────
+    L.append("## 4. Kiểm định ghép cặp\n")
+    if ref:
+        L.append(f"Candidate tham chiếu `{names.get(ref, ref)}` luôn đứng ở vế phải "
+                 f"(Y); mỗi cặp là **baseline − E**, nên **▼ nghĩa là baseline kém "
+                 f"hơn Candidate E** và **▲ nghĩa là baseline tốt hơn E**.\n")
+    pwn = rc.prepare_pw(pw, alpha)
+    L.append("Ký hiệu:\n")
+    L.append(rc.key_table(arms or [], names))
+    L.append("")
+    L.append(rc.pairwise_section(pwn, rc.short_names(arms or []), metrics, scfg))
     expert_table = _expert_f1(summary.attrs.get("scores", {}), arms or [])
     if expert_table is not None:
         L.append(_expert_f1_markdown(expert_table))
@@ -288,7 +258,7 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     metrics = metric_columns(next(iter(scores.values())))
     primary = str(cfg["metrics"].get("primary", ""))
 
-    summary = summary_table(scores, names, metrics, primary)
+    summary = summary_table(scores, names, metrics, primary, cfg)
     summary.attrs["scores"] = scores
     summary.to_csv(mdir / "summary.csv", index=False)
     if pw is not None and not pw.empty:

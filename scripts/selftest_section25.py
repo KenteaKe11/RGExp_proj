@@ -562,7 +562,9 @@ def t_beam_search_matches_transformers():
             bos_token_id=tok.bos_id, eos_token_id=tok.eos_id)).eval()
         with torch.no_grad():                     # đẩy <eos> lên cho có chuỗi ngắn
             model.lm_head.weight[tok.eos_id] *= 3.0
-        for spec in ({"num_beams": 3, "length_penalty": 1.0},
+        for spec in ({"num_beams": 1},
+                     {"num_beams": 1, "repetition_penalty": 1.3},
+                     {"num_beams": 3, "length_penalty": 1.0},
                      {"num_beams": 2, "length_penalty": 0.0},
                      {"num_beams": 3, "length_penalty": 1.0,
                       "early_stopping": True}):
@@ -595,24 +597,192 @@ def t_beam_search_matches_transformers():
                               dict(gen, max_new_tokens=max_new), device="cpu")
             assert got == want, (seed, spec, got, want)
             checked += 1
-    assert checked == 18
+    assert checked == 30
+
+
+def t_greedy_stops_at_eos_and_matches_argmax():
+    """num_beams = 1 đi nhánh greedy: dừng ở <eos>, đúng argmax từng bước."""
+    from src.sota.decoding import beam_search
+
+    tok = _ToyTok()
+    # bước 0,1: 'a' (4) trội; bước 2: <eos> (2) trội -> "a a"
+    table = lambda i: {4: 2.0, 2: 1.0} if i < 2 else {2: 3.0, 4: 1.0}
+    out = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                      {"num_beams": 1}, device="cpu")
+    assert out == ["a a"], out
+    # <eos> luôn đứng thứ hai: greedy KHÔNG bao giờ chọn nó -> chạy tới hết độ dài
+    out = beam_search(_toy_step(lambda i: {4: 1.0, 2: 0.9}), lambda s, i: s, None,
+                      1, tok, {"num_beams": 1}, device="cpu")
+    assert out == [" ".join(["a"] * (tok.max_seq_length - 1))], out
+    short = beam_search(_toy_step(lambda i: {4: 1.0, 2: 0.9}), lambda s, i: s, None,
+                        1, tok, {"num_beams": 1, "max_new_tokens": 3},
+                        device="cpu")
+    assert short == ["a a a"], short
+
+
+def t_greedy_repetition_penalty_and_ngram_block():
+    from src.sota.decoding import beam_search
+
+    tok = _ToyTok()
+    table = lambda i: {4: 1.0, 5: 0.99, 2: -5.0}
+    free = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                       {"num_beams": 1, "max_new_tokens": 6}, device="cpu")
+    pen = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                      {"num_beams": 1, "max_new_tokens": 6,
+                       "repetition_penalty": 2.0}, device="cpu")
+    assert free[0].split() == ["a"] * 6, free
+    assert "b" in pen[0].split(), pen            # 'a' bị phạt nên 'b' lọt vào
+    blocked = beam_search(_toy_step(table), lambda s, i: s, None, 1, tok,
+                          {"num_beams": 1, "max_new_tokens": 6,
+                           "no_repeat_ngram_size": 2}, device="cpu")
+    assert "b" in blocked[0].split(), blocked
+
+
+def t_hub_reuse_rejects_wrong_decoding():
+    """Predictions sinh bằng đặc tả khác `generate:` hiện hành bị từ chối."""
+    import tempfile
+    from unittest import mock
+
+    from src import hub_reuse
+
+    keys = [f"k{i}" for i in range(4)]
+    arm = {"id": "e", "moe": True, "predictions_from_hub": {
+        "repo": "o/r", "subdir": "s", "file": "predictions/e.jsonl"}}
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        src = d / "src.jsonl"
+
+        def write(dec):
+            rows = [{"key": k, "pred": "x", "route_experts": [1],
+                     **({"decode": dec} if dec else {})} for k in keys]
+            src.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+        with mock.patch.object(hub_reuse, "_fetch", lambda *a, **k: src), \
+                mock.patch.object(hub_reuse, "hf_token", lambda: "t"):
+            write("beam3")
+            try:
+                hub_reuse.pull_predictions(arm, d / "o1" / "e.jsonl", keys,
+                                           expected_decode="greedy")
+            except hub_reuse.HubReuseError as e:
+                assert "beam3" in str(e)
+            else:
+                raise AssertionError("beam3 mà vẫn qua khi cần greedy")
+            ok = hub_reuse.pull_predictions(arm, d / "o2" / "e.jsonl", keys,
+                                            expected_decode="beam3")
+            assert ok["decode_warning"] is None
+            write("greedy")
+            ok = hub_reuse.pull_predictions(arm, d / "o3" / "e.jsonl", keys,
+                                            expected_decode="greedy")
+            assert ok["decode_warning"] is None
+            write(None)                      # file cũ chưa có nhãn: cảnh báo, không chặn
+            info = hub_reuse.pull_predictions(arm, d / "o4" / "e.jsonl", keys,
+                                              expected_decode="greedy")
+            assert info["decode_warning"] and "chưa có nhãn" in info["decode_warning"]
+            arm2 = dict(arm, predictions_from_hub=dict(
+                arm["predictions_from_hub"], allow_decode_mismatch=True))
+            write("beam3")
+            info = hub_reuse.pull_predictions(arm2, d / "o5" / "e.jsonl", keys,
+                                              expected_decode="greedy")
+            assert "allow_decode_mismatch" in info["decode_warning"]
+
+
+def t_predictions_carry_decode_tag():
+    txt = (ROOT / "src" / "runners" / "base.py").read_text(encoding="utf-8")
+    assert '"decode": decode_tag' in txt and "decoding_spec import tag" in txt
+    run = (ROOT / "src" / "run_section25.py").read_text(encoding="utf-8")
+    assert "expected_decode=decoding_spec.tag(cfg)" in run
+
+
+def t_report_common_formats():
+    import numpy as np
+    import pandas as pd
+
+    from src import report_common as rc
+
+    assert rc.pfmt(0.0123) == "0.012" and rc.pfmt(0.41) == "0.41"
+    assert rc.pfmt(1e-6) == "<0.001" and rc.pfmt(float("nan")) == "—"
+    assert rc.ptxt(1e-6) == "p<0.001" and rc.ptxt(0.0123) == "p=0.012"
+    assert rc.sf(0.01234) == "+0.0123" and rc.sf(-0.5, 2) == "-0.50"
+    assert rc.esc("B* x") == "B\\* x"
+    assert rc.ordered(["rougeL", "bleu1", "chexbert_f1", "bertscore_f1"]) == [
+        "bleu1", "rougeL", "bertscore_f1", "chexbert_f1"]
+    pw = pd.DataFrame([
+        dict(arm_a="a", arm_b="b", metric="bleu1", mean_a=.2, mean_b=.3,
+             mean_diff=.1, ci_lo=.05, ci_hi=.15, p_perm=1e-4, p_perm_holm=1e-3,
+             cohen_dz=.5, win_a=1, win_b=9, tie=0),
+        dict(arm_a="a", arm_b="b", metric="rouge1", mean_a=.2, mean_b=.19,
+             mean_diff=-.01, ci_lo=-.03, ci_hi=.02, p_perm=.4, p_perm_holm=1.0,
+             cohen_dz=-.02, win_a=5, win_b=5, tie=0),
+        dict(arm_a="a", arm_b="b", metric="rougeL", mean_a=.2, mean_b=.1,
+             mean_diff=-.1, ci_lo=-.15, ci_hi=-.05, p_perm=1e-4, p_perm_holm=1e-3,
+             cohen_dz=-.5, win_a=9, win_b=1, tie=0)])
+    pw = rc.prepare_pw(pw, 0.05)
+    assert pw["significant"].tolist() == [True, False, True]
+    md = rc.contrast_matrix(pw, {"a": "A", "b": "B*"}, ["bleu1", "rouge1", "rougeL"])
+    assert "▲ +0.1000" in md and "▼ -0.1000" in md and "· -0.0100" in md, md
+    assert "B\\*" in md, "dấu * của tên phải được escape"
+    # p ngay dưới hiệu số, Holm/d_z KHÔNG có trong ma trận
+    assert "p<0.001" in md and "p=0.40" in md and "Holm" not in md
+    ov = rc.contrast_overview(pw, {"a": "A", "b": "B"}, 0.05)
+    assert "1 (B-1)" in ov and "1 (R-L)" in ov, ov
+    assert "<details>" in rc.details_block(pw, {"a": "A", "b": "B"})
+    # CI chứa 0 nhưng p nhỏ -> KHÔNG kết luận (quy tắc §2.3 cần cả hai)
+    q = rc.prepare_pw(pd.DataFrame([dict(
+        arm_a="a", arm_b="b", metric="bleu1", mean_a=0, mean_b=0, mean_diff=.01,
+        ci_lo=-.01, ci_hi=.03, p_perm=.001, p_perm_holm=.01, cohen_dz=.1,
+        win_a=0, win_b=0, tie=0)]), 0.05)
+    assert q["significant"].tolist() == [False]
+
+
+def t_summarise_one_aggregation_for_both_sections():
+    """§2.3 và §2.5 dùng CÙNG `summarise`: cùng predictions -> cùng số."""
+    import numpy as np
+
+    from src import report_common as rc
+    from src import report_recomb, report_section25
+
+    df = _fake_scores_with_counts(n=200, shift=0.0, seed=3)
+    scfg = dict(CFG["stats"])
+    a = rc.summarise({"x": df}, {"x": "X"}, ["bleu4", "chexbert_f1"], scfg, 42)
+    b = report_recomb.summary_table({"x": df}, {"x": "X"}, ["bleu4", "chexbert_f1"],
+                                    {"stats": scfg, "seed": 42})
+    c = report_section25.summary_table({"x": df}, {"x": "X"}, ["bleu4", "chexbert_f1"],
+                                       "", {"stats": scfg, "seed": 42})
+    for m in ("bleu4", "chexbert_f1"):
+        assert np.isclose(a[m][0], b[m][0]) and np.isclose(a[m][0], c[m][0]), m
+        assert np.isclose(a[f"{m}_sd"][0], float(df[m].std(ddof=1))), \
+            "± phải là độ lệch chuẩn giữa các ảnh"
+    # CheXbert: micro-F1 gộp TRONG tập rồi lấy trung bình, khác trung bình F1 từng ảnh
+    from src.metrics import chexbert_micro_f1
+    idx = rc.bootstrap_indices(scfg, 42, len(df))
+    want = chexbert_micro_f1(df["chexbert_tp"].to_numpy()[idx],
+                             df["chexbert_fp"].to_numpy()[idx],
+                             df["chexbert_fn"].to_numpy()[idx], axis=1).mean()
+    assert np.isclose(a["chexbert_f1"][0], want)
 
 
 def t_decoding_spec_is_shared():
     """Một khối `generate:` cho cả ba; paper chỉ còn là bản ghi."""
     from src import decoding_spec as D
+    from src.config import Cfg
 
     hf, so = D.hf_kwargs(CFG), D.sota_kwargs(CFG)
     for k in D.KEYS:
         assert hf[k] == so[k], (k, hf[k], so[k])
-    assert hf["num_beams"] == 3 and hf["do_sample"] is False
+    assert hf["num_beams"] == 1 and hf["do_sample"] is False, \
+        "§2.5 sinh GREEDY (num_beams = 1) cho cả ba candidate"
+    assert D.tag(CFG) == "greedy" and "greedy" in D.describe(CFG)
     assert hf["length_penalty"] == 1.0 and hf["early_stopping"] is False
     assert hf["no_repeat_ngram_size"] == 0 and hf["repetition_penalty"] == 1.0
     for k in D.KEYS:
         assert k in CFG["generate"], f"generate.{k} phải khai TƯỜNG MINH"
     assert "block_trigrams true -> no_repeat_ngram_size 0" in \
         D.paper_differences(CFG, "r2gen")
-    from src.config import Cfg
+    assert "beam 3 -> 1" in D.paper_differences(CFG, "r2gen"), \
+        "chỗ lệch beam 3 -> greedy của paper phải được khai"
+    beam = Cfg(dict(CFG))
+    beam["generate"] = dict(CFG["generate"], num_beams=3)
+    assert D.tag(beam) == "beam3"
     bad = Cfg(dict(CFG))
     bad["generate"] = dict(CFG["generate"], do_sample=True)
     try:
@@ -834,12 +1004,12 @@ def t_deviations_name_conditions_4_and_5():
     assert "micro_batch" in d
 
 
-def t_beam_size_is_3_everywhere():
-    """Ba candidate sinh cùng một độ rộng beam."""
-    assert int(CFG["generate"]["num_beams"]) == 3
+def t_greedy_everywhere():
+    """Ba candidate sinh cùng MỘT đặc tả greedy (num_beams = 1)."""
+    assert int(CFG["generate"]["num_beams"]) == 1
     assert not CFG["generate"].get("do_sample", False)
-    for k in ("r2gen", "adaatt"):
-        assert int(CFG["sota"][k]["decoding"]["beam_size"]) == 3, k
+    from src.decoding_spec import sota_kwargs
+    assert sota_kwargs(CFG)["num_beams"] == 1
     from src.config import Cfg
     from src.runners.base import Runner
 
@@ -848,7 +1018,7 @@ def t_beam_size_is_3_everywhere():
 
     r = _R.__new__(_R)
     r.cfg = Cfg(dict(CFG))
-    assert r.gen_kwargs()["num_beams"] == 3
+    assert r.gen_kwargs()["num_beams"] == 1
 
 
 def t_routing_weights_follow_beams():
@@ -1017,14 +1187,22 @@ def t_report_has_all_sections_for_each_pair():
     with tempfile.TemporaryDirectory() as d:
         path, pw, names = _synthetic_report(Path(d))
         md = path.read_text(encoding="utf-8")
-        assert "## 3. Điểm trung bình theo từng ảnh" in md
+        assert "## 3. Điểm trung bình" in md
         assert "## 4. Kiểm định ghép cặp" in md
+        # Ma trận GỌN: một bảng cho mọi cặp, p ở dòng nhỏ; Holm/d_z chỉ trong <details>.
+        assert "Ma trận hiệu số" in md and "Tổng quan theo cặp" in md
         for b in ("r2gen", "adaatt"):
-            assert f"### {names[b]} − {names['moe_shared_lora']}" in md, b
-        assert "r2gen − adaatt" not in md and "adaatt − r2gen" not in md
+            short = {"r2gen": "R2Gen", "adaatt": "AdaAtt"}[b]
+            assert short in md.split("Ma trận hiệu số")[1].split("<details>")[0], b
+        assert "Ký hiệu" in md and md.count("| **E** |") == 1, "thiếu bảng ký hiệu"
+        head = md.split("Ma trận hiệu số")[1].split("<details>")[0]
+        assert "<sub>[" in head and "p=" in head, "ô thiếu KTC/p"
+        assert "p Holm" not in head and "d_z" not in head, \
+            "Holm/d_z phải nằm trong phần chi tiết gấp lại"
+        assert "<details>" in md and "p Holm" in md.split("<details>")[1]
+        assert md.count("Ma trận hiệu số") == 1, "mỗi cặp một bảng là kiểu CŨ"
         assert "CheXbert F1 theo expert × 14 bệnh" in md
         assert "**E0**" in md or "**E1**" in md
-        assert "p hoán vị Holm (tham khảo)" in md
         assert "**" in md.split("## 3.")[1].split("## 4.")[0], "không tô đậm giá trị tốt nhất"
         for f in ("summary.csv", "pairwise_tests.csv",
                   "candidate_e_expert_chexbert_f1.csv"):
@@ -1117,6 +1295,12 @@ if __name__ == "__main__":
     check("length_penalty theo công thức transformers",
           t_beam_search_length_penalty_like_hf)
     check("<eos> hạng >= num_beams bị bỏ qua", t_beam_search_eos_rank_rule)
+    check("greedy: dừng ở <eos>, đúng argmax", t_greedy_stops_at_eos_and_matches_argmax)
+    check("greedy: repetition_penalty và chặn n-gram", t_greedy_repetition_penalty_and_ngram_block)
+    check("E: từ chối predictions sinh bằng bộ giải mã khác", t_hub_reuse_rejects_wrong_decoding)
+    check("mỗi dòng predictions mang nhãn decode", t_predictions_carry_decode_tag)
+    check("report_common: p gọn, ma trận ▲▼·, Holm/d_z ở phần gấp", t_report_common_formats)
+    check("một cách tổng hợp cho §2.3 và §2.5", t_summarise_one_aggregation_for_both_sections)
     check("beam search của baseline = transformers.generate từng token",
           t_beam_search_matches_transformers)
     check("một đặc tả giải mã cho cả ba candidate", t_decoding_spec_is_shared)
@@ -1146,7 +1330,7 @@ if __name__ == "__main__":
           t_report_has_all_sections_for_each_pair)
     check("report: không dựng bảng expert khi thiếu route",
           t_report_skips_expert_table_without_routes)
-    check("beam = 3 cho cả ba candidate", t_beam_size_is_3_everywhere)
+    check("greedy cho cả ba candidate", t_greedy_everywhere)
     check("MoE: trọng số định tuyến nhân bản theo beam",
           t_routing_weights_follow_beams)
     check("runner Candidate E khai repeat = num_beams",

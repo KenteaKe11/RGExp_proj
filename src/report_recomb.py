@@ -109,40 +109,12 @@ def _shared_bootstrap_indices(cfg, n_rows: int) -> np.ndarray | None:
 
 def summary_table(scores: dict[str, pd.DataFrame], names: dict[str, str],
                   metrics: list[str], cfg=None) -> pd.DataFrame:
-    n = len(next(iter(scores.values()))) if scores else 0
-    boot_idx = _shared_bootstrap_indices(cfg, n)
-    rows = []
-    for aid, df in scores.items():
-        row = {"arm_id": aid, "arm": names.get(aid, aid), "n": len(df)}
-        for m in metrics:
-            if m == "chexbert_f1" and all(
-                    c in df.columns for c in ("chexbert_tp", "chexbert_fp", "chexbert_fn")):
-                from .metrics import chexbert_micro_f1
+    """Cùng cách tổng hợp với §2.5 (`report_common.summarise`)."""
+    from .report_common import summarise
 
-                if boot_idx is not None:
-                    subset_f1 = chexbert_micro_f1(
-                        df["chexbert_tp"].to_numpy(dtype=float)[boot_idx],
-                        df["chexbert_fp"].to_numpy(dtype=float)[boot_idx],
-                        df["chexbert_fn"].to_numpy(dtype=float)[boot_idx], axis=1)
-                    row[m] = float(subset_f1.mean())
-                    row[f"{m}_sd"] = (float(subset_f1.std(ddof=1))
-                                      if len(subset_f1) > 1 else float("nan"))
-                else:
-                    row[m] = float(chexbert_micro_f1(
-                        df["chexbert_tp"], df["chexbert_fp"], df["chexbert_fn"]))
-                    row[f"{m}_sd"] = float("nan")
-                continue
-            values = df[m].to_numpy(dtype=float)
-            if boot_idx is not None:
-                subset_means = values[boot_idx].mean(axis=1)
-                row[m] = float(subset_means.mean())
-                row[f"{m}_sd"] = float(subset_means.std(ddof=1)) if len(subset_means) > 1 else float("nan")
-            else:
-                row[m] = float(values.mean())
-                row[f"{m}_sd"] = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
-        rows.append(row)
-    out = pd.DataFrame(rows)
-    return out
+    return summarise(scores, names, metrics,
+                     dict((cfg or {}).get("stats") or {}),
+                     int((cfg or {}).get("seed", 42)))
 
 
 def moe_expert_disease_f1(scores: dict[str, pd.DataFrame], cfg,
@@ -221,7 +193,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     stats_by_arm = {str(s.get("arm_id")): s for s in (train_stats or [])}
     lines: list[str] = []
     A = lines.append
-    A("# §2.3 — So sánh mô hình nền, QLoRA và Recombinator")
+    A("# §2.3 — Gemma 3, QLoRA, QDoRA vision, Recombinator và MoE-LoRA")
     A("")
     A(f"Lượt chạy `{manifest.get('run_id', '?')}` · {manifest.get('n_eval', '?')} mẫu kiểm tra chung")
     A("")
@@ -241,20 +213,21 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                        for a in cfg.get("arms", []))
     projector_phrase = ("mở projector Gemma 3 để huấn luyện" if projector_ft
                         else "đóng băng projector Gemma 3")
-    A("So sánh năm candidate: baseline Gemma 3 nguyên bản; QLoRA trên decoder; "
-      f"và Candidate C: QLoRA trên bộ giải mã + QDoRA hạng 4 trên {vision_scope} bộ mã hóa ảnh, "
-      f"{projector_phrase}, cùng Recombinator và classification head. "
-      "Candidate C chiếu token/đặc trưng Recombinator rồi nối với token ảnh đã qua bộ điều hợp "
-      "và vector nhúng lời nhắc. Đầu phân loại dùng một truy vấn học được để gộp bằng chú ý "
-      "đa đầu 8 đầu, sau đó chiếu tuyến tính trực tiếp thành logits. Candidate C không có "
-      "đầu định tuyến hay MoE. Candidate MoE-LoRA giữ nhánh và QDoRA vision của C, thay "
-      "QLoRA decoder bằng Experts LoRA có Route Head. Route Head dùng attention pooling "
-      "ra vector vision 1.152 chiều rồi chiếu thành 10 route logits; top-6 được chọn. "
-      "Experts LoRA (r=4, alpha=8) chỉ gắn vào q/k/v/o projection của attention decoder; "
-      "vision tower, MLP decoder và projector không nằm trong nhóm target. Candidate E "
-      "thêm một shared LoRA trên cùng projection, hoạt động độc lập với Route; 20% bước "
-      "đầu huấn luyện như C (shared LoRA, QDoRA vision và Recombinator/ClsHead; "
-      "Route/Experts tắt), 80% bước sau bật Route và Experts cùng các nhánh này.")
+    A("So sánh sáu candidate trên cùng 3.000 ảnh test, cùng 6.400 mẫu huấn luyện, "
+      "cùng prompt và cùng giải mã **greedy** (đo năng lực thuần của mô hình):")
+    A("")
+    A("* **A · Gemma 3 gốc** — không fine-tune.")
+    A("* **B · QLoRA bộ giải mã** — chỉ QLoRA r=4 trên q/k/v/o của decoder.")
+    A(f"* **B\\* · QLoRA + QDoRA vision** — B cộng QDoRA hạng 4 trên {vision_scope} bộ mã hóa "
+      "ảnh, KHÔNG có Recombinator. Tách đóng góp của riêng QDoRA vision, vốn trước đây "
+      "luôn đi cùng nhánh.")
+    A(f"* **C · B\\* + Recombinator + đầu phân loại** — {projector_phrase}; token Recombinator "
+      "được chiếu rồi nối với token ảnh của bộ điều hợp và embedding lời nhắc; đầu phân loại "
+      "dùng một truy vấn học được gộp bằng chú ý 8 đầu rồi chiếu tuyến tính ra 14 logit.")
+    A("* **D · MoE-LoRA** — giữ nhánh và QDoRA vision của C, thay QLoRA decoder bằng top-6/10 "
+      "Experts LoRA (r=4, α=8) trên q/k/v/o, chọn bởi Route Head (attention pooling).")
+    A("* **E · MoE-LoRA + shared LoRA** — thêm một shared LoRA chạy độc lập với Route; 20% bước "
+      "đầu huấn luyện như C (Route/Experts tắt), 80% sau bật cả hai.")
     A("")
     cfg_stats = cfg.get("stats") or {}
     ns = int(cfg_stats.get("n_boot", 10))
@@ -272,34 +245,36 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A("")
     A("## Bảng 1 — Chỉ số trên báo cáo được sinh")
     A("")
+    from . import report_common as rc
+
     metric_cols = [c for c in summary.columns
-                   if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")]
-    display_names = {
-        "candidate": "Mô hình", "n": "Số mẫu", "chexbert_f1": "F1 CheXbert",
-        "radgraph_f1_entity": "F1 RadGraph (thực thể)",
-        "radgraph_f1_partial": "F1 RadGraph (khớp một phần)",
-        "radgraph_f1_complete": "F1 RadGraph (khớp đầy đủ)",
-        "bertscore_f1": "F1 BERTScore", "bleu1": "BLEU-1", "bleu2": "BLEU-2",
-        "bleu3": "BLEU-3", "bleu4": "BLEU-4", "rouge1": "ROUGE-1",
-        "rouge2": "ROUGE-2", "rougeL": "ROUGE-L",
-    }
-    display_cols = [display_names.get(c, c) for c in ["candidate", "n", *metric_cols]]
-    table_rows = []
-    best_values = {m: pd.to_numeric(summary[m], errors="coerce").max()
-                   for m in metric_cols}
-    for row in summary.to_dict("records"):
-        vals = []
-        for metric in metric_cols:
-            value = row.get(metric)
-            rendered = _f(value)
-            best = best_values[metric]
-            if value is not None and np.isfinite(value) and np.isfinite(best) \
-                    and np.isclose(float(value), float(best)):
-                rendered = f"**{rendered}**"
-            vals.append(rendered)
-        table_rows.append([str(row.get("arm", row.get("arm_id", "?"))),
-                           str(row.get("n", "?")), *vals])
-    A(_tbl(display_cols, table_rows))
+                   if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")
+                   and not c.endswith("_sd_subset")]
+    A(rc.score_table(summary, metric_cols, order=[a["id"] for a in arms]))
+    A("")
+    A("Tô đậm = tốt nhất mỗi cột (kể cả hòa); dòng nhỏ ± là độ lệch chuẩn giữa các ảnh.")
+    A("")
+    A("## Bảng QDoRA vision — candidate nào được thích nghi bộ mã hóa ảnh")
+    A("")
+    vrows = []
+    for arm in arms:
+        aid = str(arm["id"])
+        st = stats_by_arm.get(aid, {})
+        va = st.get("vision_adapter") or {}
+        has_vis = bool(va) or (not st and (bool(arm.get("recomb")) or bool(arm.get("vision_qdora"))))
+        vrows.append([
+            names.get(aid, aid),
+            (f"{str(va.get('method', vision_cfg.get('method', 'qdora'))).upper()} "
+             f"r={va.get('rank', vision_cfg.get('rank', '—'))}") if has_vis else "—",
+            vision_scope if has_vis else "—",
+            str(va.get("n_target_modules", "—")) if has_vis else "—",
+            "có" if arm.get("recomb") else "không",
+            "có" if arm.get("moe") else "không"])
+    A(rc.tbl(["Mô hình", "QDoRA vision", "Phạm vi lớp", "Số module", "Recombinator",
+              "MoE-LoRA"], vrows, ["l", "l", "l", "r", "c", "c"]))
+    A("")
+    A("Cặp **B → B\\*** đo riêng đóng góp của QDoRA vision; cặp **B\\* → C** đo đóng góp của "
+      "Recombinator và đầu phân loại khi cả hai đã có QDoRA vision.")
     A("")
     A("## Bảng 2 — F1 CheXbert theo expert và bệnh cho từng candidate MoE")
     A("")
@@ -382,73 +357,23 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     else:
         A("Chưa có dữ liệu độ tự tin của CheXbert.")
     A("")
-    A("## Kiểm định thống kê riêng cho từng nhóm metric")
+    A("## Kiểm định ghép cặp")
     A("")
-    A("Trạng thái được xác định riêng cho từng chỉ số và từng cặp mô hình. Ghi "
-      "‘Có ý nghĩa’ khi p permutation thô < α và khoảng tin cậy bootstrap 95% không "
-      f"chứa 0 (α={_f(float((cfg.get('stats') or {}).get('alpha', 0.05)), 3)}). "
-      "p bootstrap và p permutation sau Holm được hiển thị để tham khảo; chúng không "
-      "thay thế quy tắc kết luận này.")
+    A("Các cặp được khai TRƯỚC (`stats.contrasts`), mỗi cặp trả lời đúng một câu hỏi của bài; "
+      "mỗi cặp viết **X − Y** với Y là candidate đứng trước, X là candidate đứng sau.")
     A("")
-    metric_groups = [
-        ("BLEU", lambda m: str(m).lower().startswith("bleu")),
-        ("ROUGE", lambda m: str(m).lower().startswith("rouge")),
-        ("BERTScore", lambda m: str(m).lower().startswith("bertscore")),
-        ("RadGraph", lambda m: str(m).lower().startswith("radgraph")),
-        ("CheXbert", lambda m: str(m).lower() == "chexbert_f1"),
-    ]
-    metric_names = {
-        "bleu1": "BLEU-1", "bleu2": "BLEU-2", "bleu3": "BLEU-3",
-        "bleu4": "BLEU-4", "rouge1": "ROUGE-1", "rouge2": "ROUGE-2",
-        "rougeL": "ROUGE-L", "bertscore_f1": "BERTScore F1",
-        "radgraph_f1_entity": "RadGraph F1 — thực thể",
-        "radgraph_f1_partial": "RadGraph F1 — khớp một phần",
-        "radgraph_f1_complete": "RadGraph F1 — khớp đầy đủ",
-        "chexbert_f1": "CheXbert F1",
-    }
-    if pw.empty or "metric" not in pw:
-        A("Chưa có kết quả kiểm định; hãy chạy bước thống kê.")
-    else:
-        for group_name, belongs in metric_groups:
-            group_rows = pw[pw["metric"].map(belongs)]
-            A(f"### {group_name}")
-            A("")
-            if group_rows.empty:
-                A("Chưa có kết quả cho nhóm metric này.")
-                A("")
-                continue
-            table_rows = []
-            p_min = pd.to_numeric(group_rows["p_perm"], errors="coerce").min()
-            p_holm_min = pd.to_numeric(group_rows["p_perm_holm"],
-                                        errors="coerce").min()
-            p_boot_holm_min = pd.to_numeric(group_rows["p_boot_holm"],
-                                            errors="coerce").min()
-            for r in group_rows.to_dict("records"):
-                aa = names.get(str(r.get("arm_a", "")), str(r.get("arm_a", "?")))
-                bb = names.get(str(r.get("arm_b", "")), str(r.get("arm_b", "?")))
-                significant = bool(r.get("significant", False))
-                status = "Có ý nghĩa" if significant else "Không có ý nghĩa"
-                if significant:
-                    status = f"**{status}**"
-                p_cells = []
-                for column, best in (("p_perm", p_min),
-                                     ("p_perm_holm", p_holm_min),
-                                     ("p_boot_holm", p_boot_holm_min)):
-                    value = r.get(column, np.nan)
-                    cell = _p(value)
-                    if (np.isfinite(best) and np.isfinite(value)
-                            and np.isclose(float(value), float(best))):
-                        cell = f"**{cell}**"
-                    p_cells.append(cell)
-                table_rows.append([
-                    metric_names.get(str(r.get("metric")), str(r.get("metric"))),
-                    f"{bb} − {aa}", _sf(r.get("mean_diff", r.get("diff"))),
-                    f"[{_f(r.get('ci_lo'))}, {_f(r.get('ci_hi'))}]",
-                    *p_cells, status])
-            A(_tbl(["Chỉ số", "Cặp so sánh", "Chênh lệch trung bình", "Khoảng tin cậy 95%",
-                    "p hoán vị", "p hoán vị (Holm)", "p bootstrap (Holm)",
-                    "Trạng thái H₀"], table_rows))
-            A("")
+    from . import report_common as rc
+
+    pwn = rc.prepare_pw(pw, float((cfg.get("stats") or {}).get("alpha", 0.05)))
+    A("Ký hiệu dùng trong các bảng kiểm định:")
+    A("")
+    A(rc.key_table(arms, names))
+    A("")
+    A(rc.pairwise_section(pwn, rc.short_names(arms),
+                          [c for c in summary.columns
+                           if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")
+                           and not c.endswith("_sd_subset")],
+                          dict(cfg.get("stats") or {})))
     A("")
     A("## Chi tiết huấn luyện và kiến trúc")
     A("")

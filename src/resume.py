@@ -188,6 +188,44 @@ def _download(cfg: Cfg, rel: str, dest_root: Path) -> Path:
     return Path(p)
 
 
+def pull_predictions_only(cfg: Cfg, arm_ids: list[str],
+                          pred_paths: dict[str, Path]) -> dict[str, str]:
+    """Chỉ kéo predictions (không kéo adapter) cho các arm mà Hub đã có.
+
+    Dùng khi một candidate mới (B*) cần được thêm vào bảng mà không phải train
+    hay infer lại các candidate cũ: predictions của chúng là bản đã infer,
+    adapter của chúng không cần cho score/stats/report.
+    Trả {arm_id: mô tả}; arm không có trên Hub nhận "không có trên Hub".
+    """
+    if not hf_token():
+        raise ScanError("thiếu HF_TOKEN/HUGGING_FACE_HUB_TOKEN để đọc predictions từ Hub.")
+    repo_id, _, subdir = _hub_target(cfg)
+    if not repo_id:
+        raise ScanError("output.hub_repo đang trống; không thể kéo predictions.")
+    files = list_hub_files(cfg)
+    if not files:
+        raise ScanError(f"không tìm thấy artifacts trong Hub `{repo_id}/{subdir}`.")
+    out: dict[str, str] = {}
+    for aid in arm_ids:
+        rel = f"predictions/{aid}.jsonl"
+        if rel not in files:
+            out[aid] = "không có trên Hub"
+            continue
+        stage = Path(pred_paths[aid]).parent / ".restore_preds_manual"
+        try:
+            got = _download(cfg, rel, stage)
+            had, _ = merge_predictions(Path(pred_paths[aid]), got, prefer_other=True)
+            out[aid] = f"đã kéo dự đoán; bản cục bộ trước đó có {had} mẫu"
+            print(f"  ↓ {aid}: đã kéo dự đoán từ Hub (cục bộ trước đó có {had} mẫu)",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001
+            out[aid] = f"lỗi: {e!r}"
+            print(f"  ⚠ {aid}: kéo dự đoán thất bại ({e!r})", flush=True)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return out
+
+
 def hub_adapter_files(files: dict[str, int], arm_id: str) -> list[str]:
     pre = f"adapters/{arm_id}/"
     return sorted(f for f in files if f.startswith(pre) and "/checkpoint-" not in f)

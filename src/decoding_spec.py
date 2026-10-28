@@ -1,17 +1,20 @@
-"""MỘT đặc tả giải mã cho cả ba candidate của §2.5 — khối `generate:` trong config.
+"""MỘT đặc tả giải mã cho mọi candidate của §2.3 và §2.5 — khối `generate:`.
 
-Trước đây My Gemma sinh bằng `transformers.generate` (beam 3, không chặn
-n-gram), còn R2Gen/AdaAtt sinh bằng `sota.decoding.beam_search` theo khối
-`sota.*.decoding` của paper (beam 3 nhưng chặn trigram, giữ k beam rồi để chúng
-chết dần, chuẩn hoá độ dài theo cách riêng). Cùng "beam 3" mà khác luật chọn
-chuỗi, nên một phần chênh lệch trong bảng là chênh lệch của hai BỘ GIẢI MÃ chứ
-không phải của ba kiến trúc.
+Mặc định là GREEDY (`num_beams = 1`). Chọn greedy có chủ ý: mục tiêu của cả hai
+mục là đo năng lực thuần của mô hình, không phải năng lực của bộ tìm kiếm chuỗi.
+Beam search cộng thêm một biến số (độ rộng beam, chuẩn hoá độ dài, heuristic
+dừng) mà hai họ mô hình cài khác nhau; greedy không còn biến số nào để cài khác.
 
-Nay cả ba đọc CÙNG khối này, và `sota.decoding.beam_search` chép lại từng bước
-`_beam_search` của transformers 4.52 (xem docstring ở đó; selftest đối chiếu
-từng token với `transformers.generate`):
+Trước đây My Gemma sinh bằng `transformers.generate` còn R2Gen/AdaAtt sinh bằng
+`sota.decoding.beam_search` theo khối `sota.*.decoding` của paper (beam 3, chặn
+trigram, chuẩn hoá độ dài riêng). Cùng "beam 3" mà khác luật chọn chuỗi, nên
+một phần chênh lệch trong bảng là chênh lệch của hai BỘ GIẢI MÃ chứ không phải
+của các kiến trúc. Nay mọi candidate đọc CÙNG khối này, và
+`sota.decoding.beam_search` chép lại từng bước `_beam_search` của transformers
+4.52 (selftest đối chiếu từng token với `transformers.generate`, kể cả
+`num_beams = 1` ≡ greedy):
 
-    num_beams              3      beam
+    num_beams              1      greedy (>1 = beam search)
     length_penalty         1.0    điểm = tổng log-prob / (số token sinh)^lp
     early_stopping         false  heuristic dừng của transformers
     no_repeat_ngram_size   0      không chặn n-gram (0 = tắt)
@@ -19,17 +22,21 @@ từng token với `transformers.generate`):
     num_return_sequences   1      một báo cáo / ảnh
     do_sample              false  tất định
 
-Khác nhau DUY NHẤT là độ dài tối đa, vì hai họ dùng hai từ điển: My Gemma
+Khác nhau DUY NHẤT là độ dài tối đa, vì các họ dùng từ điển khác nhau: Gemma
 `max_new_tokens` (subword), R2Gen/AdaAtt `max_seq_length − 1` của từ điển từ
 (chuỗi huấn luyện bị cắt ở đó nên sinh dài hơn là vô nghĩa). Khối
 `sota.*.decoding` vẫn được giữ nguyên văn (điều kiện 1) nhưng KHÔNG được đọc
 khi sinh; chỗ lệch được ghi vào `manifest.deviations`.
+
+Mỗi dòng predictions mang nhãn `decode` (`tag()`): `greedy` hoặc `beam<k>`.
+§2.5 dùng nhãn này để từ chối predictions của Candidate E kéo từ Hub nếu chúng
+được sinh bằng đặc tả khác với `generate:` hiện hành.
 """
 from __future__ import annotations
 
 KEYS = ("num_beams", "length_penalty", "early_stopping", "no_repeat_ngram_size",
         "repetition_penalty", "num_return_sequences")
-DEFAULTS = {"num_beams": 3, "length_penalty": 1.0, "early_stopping": False,
+DEFAULTS = {"num_beams": 1, "length_penalty": 1.0, "early_stopping": False,
             "no_repeat_ngram_size": 0, "repetition_penalty": 1.0,
             "num_return_sequences": 1}
 
@@ -43,9 +50,9 @@ def unified(cfg) -> dict:
     g = dict((cfg.get("generate", {}) or {}))
     if bool(g.get("do_sample", False)):
         raise DecodingSpecError(
-            "generate.do_sample = true — §2.5 sinh TẤT ĐỊNH bằng beam search cho "
-            "cả ba candidate. Lấy mẫu thì bộ giải mã của R2Gen/AdaAtt không "
-            "cùng hình thức được với My Gemma.")
+            "generate.do_sample = true — §2.3 và §2.5 sinh TẤT ĐỊNH (greedy hoặc "
+            "beam) cho mọi candidate. Lấy mẫu thì bộ giải mã của R2Gen/AdaAtt "
+            "không cùng hình thức được với Gemma.")
     s = {k: g.get(k, DEFAULTS[k]) for k in KEYS}
     s["num_beams"] = int(s["num_beams"])
     s["length_penalty"] = float(s["length_penalty"])
@@ -85,8 +92,17 @@ def sota_kwargs(cfg) -> dict:
     return {**{k: s[k] for k in KEYS}, "max_new_tokens": None}
 
 
+def tag(cfg) -> str:
+    """Nhãn ngắn của đặc tả: `greedy` hoặc `beam<k>`. Ghi vào từng dòng predictions."""
+    k = unified(cfg)["num_beams"]
+    return "greedy" if k == 1 else f"beam{k}"
+
+
 def describe(cfg) -> str:
     s = unified(cfg)
+    if s["num_beams"] == 1:
+        return ("greedy (num_beams = 1) · repetition_penalty "
+                f"{s['repetition_penalty']:g} · không chặn n-gram · không lấy mẫu")
     return (f"beam {s['num_beams']} · length_penalty {s['length_penalty']:g} · "
             f"early_stopping {s['early_stopping']} · no_repeat_ngram "
             f"{s['no_repeat_ngram_size']} · repetition_penalty "

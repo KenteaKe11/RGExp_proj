@@ -53,15 +53,47 @@ def _fetch(repo: str, repo_type: str, filename: str, stage: Path) -> Path:
                                 local_dir=str(stage)))
 
 
+def check_decoding(rows: dict[str, dict], keys: list[str], expected: str | None,
+                   aid: str) -> str | None:
+    """Predictions kéo về phải sinh bằng ĐÚNG đặc tả giải mã hiện hành.
+
+    Trả `None` nếu khớp; trả một câu cảnh báo nếu file cũ chưa có nhãn `decode`
+    (không kiểm được); ném `HubReuseError` nếu nhãn có mặt mà khác — so một
+    Candidate E beam với hai baseline greedy là so hai bộ giải mã chứ không so
+    ba kiến trúc.
+    """
+    if not expected:
+        return None
+    seen = {str(rows[k].get("decode")) for k in keys if rows[k].get("decode")}
+    if not seen:
+        return (f"predictions của {aid} chưa có nhãn `decode` (sinh trước khi có "
+                f"nhãn) — không kiểm được chúng có phải {expected} không.")
+    if seen != {expected}:
+        raise HubReuseError(
+            f"predictions của {aid} sinh bằng {sorted(seen)} nhưng `generate:` "
+            f"hiện hành là {expected!r}. Chạy lại infer §2.3 (greedy) rồi đẩy "
+            f"lên Hub, hoặc đặt predictions_from_hub.allow_decode_mismatch: true "
+            f"nếu CHỦ Ý so khác bộ giải mã (sẽ bị ghi vào báo cáo).")
+    return None
+
+
 def pull_predictions(arm: dict, dest: Path, test_keys: list[str],
-                     force: bool = False) -> dict:
+                     force: bool = False, expected_decode: str | None = None) -> dict:
     src = dict(arm["predictions_from_hub"])
     aid = str(arm["id"])
     need_route = bool(arm.get("moe"))
     dest = Path(dest)
     keys = [str(k) for k in test_keys]
+    allow = bool(src.get("allow_decode_mismatch", False))
     if not force and _complete(dest, keys, need_route):
-        return {"source": "cache", "n": len(keys)}
+        try:
+            warn = check_decoding(_read(dest), keys, expected_decode, aid)
+        except HubReuseError:
+            if not allow:
+                raise
+            warn = (f"{aid}: bộ giải mã khác `generate:` "
+                    f"(cho phép bằng allow_decode_mismatch)")
+        return {"source": "cache", "n": len(keys), "decode_warning": warn}
     if not hf_token():
         raise HubReuseError("thiếu HF_TOKEN để kéo predictions của Candidate E.")
     repo = str(src["repo"])
@@ -94,6 +126,13 @@ def pull_predictions(arm: dict, dest: Path, test_keys: list[str],
             raise HubReuseError(
                 f"predictions §2.3 của {aid} thiếu {len(miss)}/{len(keys)} key của "
                 f"tập test (ví dụ {miss[:3]}). Mẫu test phải trùng §2.3.")
+        try:
+            decode_warning = check_decoding(rows, keys, expected_decode, aid)
+        except HubReuseError:
+            if not allow:
+                raise
+            decode_warning = (f"{aid}: bộ giải mã khác `generate:` (cho phép bằng "
+                              f"allow_decode_mismatch)")
         if need_route and any(not rows[k].get("route_experts") for k in keys):
             import pandas as pd
 
@@ -120,6 +159,7 @@ def pull_predictions(arm: dict, dest: Path, test_keys: list[str],
             for k in keys:
                 f.write(json.dumps(rows[k], ensure_ascii=False) + "\n")
         tmp.replace(dest)
-        return {"source": f"{repo}/{fn}", "n": len(keys)}
+        return {"source": f"{repo}/{fn}", "n": len(keys),
+                "decode_warning": decode_warning}
     finally:
         shutil.rmtree(stage, ignore_errors=True)

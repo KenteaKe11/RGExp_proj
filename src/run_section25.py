@@ -553,17 +553,24 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             _hr(f"Kéo predictions §2.3 của {arm['id']} từ Hub (không infer/train)")
             try:
+                from . import decoding_spec
+
                 info = pull_predictions(arm, pred_paths[arm["id"]],
                                         test_df["key"].astype(str).tolist(),
-                                        force=a.repull)
+                                        force=a.repull,
+                                        expected_decode=decoding_spec.tag(cfg))
             except HubReuseError as e:
                 print(f"✗ {e}", flush=True)
                 tracker.alert("§2.5 không kéo được predictions của E", str(e), "ERROR")
                 tracker.finish(1)
                 return 2
             print(f"  ✓ {arm['id']}: {info['n']} mẫu từ {info['source']}", flush=True)
+            if info.get("decode_warning"):
+                print(f"  ⚠ {info['decode_warning']}", flush=True)
+                manifest.setdefault("deviations", []).append(info["decode_warning"])
             manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
-                "ok": True, "pulled_from": info["source"]}
+                "ok": True, "pulled_from": info["source"],
+                "decode_warning": info.get("decode_warning")}
         _hr("Sinh báo cáo")
         from .runners import build
         from .runners.base import RunnerUnusable

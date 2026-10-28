@@ -86,20 +86,36 @@ def _chexbert_permutation_p(a: pd.DataFrame, b: pd.DataFrame,
 
 
 def pair_list(arm_ids: list[str], mode: str = "all",
-              reference: str | None = None) -> list[tuple[str, str]]:
+              reference: str | None = None,
+              contrasts: list | None = None) -> list[tuple[str, str]]:
     """Các cặp cần kiểm, đã sắp sao cho `reference` luôn đứng ở vị trí A.
 
-    `mode = vs_reference` bỏ cặp không chứa tham chiếu. Đó là một thiết kế hợp
-    lệ (hai câu hỏi thay vì ba) nhưng nó KHÔNG phải mặc định của §2.5: cặp
-    R2Gen–AdaAtt là mốc để biết hai baseline có tách nhau trên tập này không,
-    và thiếu nó thì một bảng "My Gemma hơn cả hai" không nói được là hơn nhiều
-    hay chỉ hơn đúng cái khoảng cách vốn có giữa hai baseline.
+    `mode = vs_reference` bỏ cặp không chứa tham chiếu. `mode = contrasts` chỉ
+    kiểm các cặp KHAI TRƯỚC trong `stats.contrasts` (mỗi cặp một câu hỏi của
+    bài; phần tử đầu là A, phần tử sau là B, hiệu số B − A). Cặp có candidate
+    không chạy lần này (vd. `--arms` lọc bớt) bị bỏ qua; không còn cặp nào thì
+    DỪNG, vì một bảng kiểm định rỗng đọc như "không có khác biệt".
     """
     ids = list(arm_ids)
     mode = str(mode or "all").lower()
-    if mode not in ("all", "vs_reference"):
+    if mode not in ("all", "vs_reference", "contrasts"):
         raise ValueError(
-            f"stats.pairs = {mode!r}; hợp lệ: 'all' | 'vs_reference'.")
+            f"stats.pairs = {mode!r}; hợp lệ: 'all' | 'vs_reference' | "
+            f"'contrasts'.")
+    if mode == "contrasts":
+        out = []
+        for item in contrasts or []:
+            if len(item) != 2 or item[0] == item[1]:
+                raise ValueError(f"stats.contrasts: cặp sai: {item!r}")
+            a, b = str(item[0]), str(item[1])
+            if a in ids and b in ids and (a, b) not in out:
+                out.append((a, b))
+        if not out:
+            raise ValueError(
+                "stats.pairs = contrasts nhưng không cặp nào trong "
+                "stats.contrasts có đủ cả hai candidate đã chấm điểm "
+                f"({ids}).")
+        return out
     if reference is not None and reference not in ids:
         raise ValueError(
             f"stats.reference = {reference!r} không nằm trong các candidate có "
@@ -127,7 +143,7 @@ def compare_pairs(scores: dict[str, pd.DataFrame], metrics: list[str],
     dz_floor = float(cfg_stats.get("dz_floor", 0.10))
     scope = str(cfg_stats.get("adjust_scope", "pairs")).lower()
     pairs = pair_list(arm_ids, cfg_stats.get("pairs", "all"),
-                      cfg_stats.get("reference"))
+                      cfg_stats.get("reference"), cfg_stats.get("contrasts"))
 
     # MỘT generator cho cả bảng, tiêu tuần tự theo (cặp, metric). Một generator
     # mới cho mỗi cặp nghĩa là ba cặp dùng CÙNG dãy hoán vị — các p-value khi ấy
