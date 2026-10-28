@@ -77,7 +77,8 @@ echo "✓ Python $PYVER"
 # `import torch` vẫn chạy, `torch.cuda.is_available()` vẫn True, rồi vỡ ở lần
 # matmul đầu bằng "no kernel image is available" — lỗi tốn nhiều giờ để lần ra.
 CUDA_TAG="cu121"; MIN_TAG=""
-GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
+# (set -eo pipefail: thiếu/hỏng nvidia-smi không được giết script ở đây; GPU được kiểm lại ở bước 8)
 GPU_SM=$(printf '%s' "$GPU_CAP" | tr -d '.')
 case "$GPU_SM" in
     12*|11*|10*) CUDA_TAG="cu128"; MIN_TAG="cu128" ;;  # Blackwell (5090/B200)
