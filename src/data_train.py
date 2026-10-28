@@ -30,11 +30,10 @@ class DataLeak(RuntimeError):
 
 
 def _read_split(cfg: Cfg, filename: str, n: int, label: str) -> list[str]:
-    from huggingface_hub import hf_hub_download
+    from .splits import resolve_split_file
 
     d = cfg.data
-    path = hf_hub_download(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"),
-                           filename=filename, token=hf_token())
+    path = resolve_split_file(cfg, filename)
     keys = pd.read_csv(path)[d["key_column"]].astype(str).tolist()
     if n and n < len(keys):
         # Cắt từ ĐẦU, y hệt §2.1: thứ tự trong file là cố định nên "6400 mẫu

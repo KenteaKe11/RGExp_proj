@@ -76,7 +76,7 @@ from .config import (Cfg, add_common_args, hf_token, load_config,
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
-EXPERIMENTS = ("2.3", "2.4")
+EXPERIMENTS = ("2.3", "2.4", "3")
 # §2.3/§2.4 đã chốt; `configs/` nay chỉ còn MỘT file (section25.yaml) và file
 # ấy không có `arms`/`arms_moe`/`stats.friedman`. Điểm vào này đọc bản ghi.
 DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "configs"
@@ -509,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
     t_start = time.time()
     hdr = ("§2.4 — MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
            if is_moe else
+           "Exp 3 — hậu kiểm: biến thể mạnh nhất của họ B và họ C, 2 epoch, batch hiệu dụng 16"
+           if exp == "3" else
            "§2.3 — năm candidate: baseline, QLoRA, Recombinator, MoE-LoRA và MoE + shared LoRA; "
            "bootstrap ghép cặp + permutation")
     print(f"\n═══ {hdr} ═══", flush=True)

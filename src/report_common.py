@@ -134,8 +134,12 @@ def _is_best(v: float, col: pd.Series) -> bool:
 
 
 def score_table(summary: pd.DataFrame, metrics: list[str], order: list[str] | None = None,
-                show_sd: bool = True, nd: int = 4) -> str:
-    """Bảng điểm: tô đậm giá trị tốt nhất mỗi cột (kể cả hòa); ± SD giữa các ảnh."""
+                show_sd: bool = True, nd: int = 4, main: list[str] | None = None) -> str:
+    """Bảng điểm: tô đậm giá trị tốt nhất mỗi cột (kể cả hòa); ± SD giữa các ảnh.
+
+    `main`: chỉ các arm này cạnh tranh để được in đậm; arm còn lại là bước trung gian,
+    in nghiêng và không bao giờ đậm (không xếp hạng cùng các hệ thống chính).
+    """
     metrics = ordered(metrics)
     s = summary.set_index("arm_id", drop=False)
     ids = [a for a in (order or list(s.index)) if a in s.index]
@@ -146,8 +150,14 @@ def score_table(summary: pd.DataFrame, metrics: list[str], order: list[str] | No
         for m in metrics:
             v = float(r[m])
             txt = f(v, nd)
-            if _is_best(v, s[m]):
-                txt = f"**{txt}**"
+            if main is None:
+                if _is_best(v, s[m]):
+                    txt = f"**{txt}**"
+            elif aid in main:
+                if _is_best(v, s.loc[[x for x in main if x in s.index], m]):
+                    txt = f"**{txt}**"
+            else:
+                txt = f"*{txt}*"
             if show_sd:
                 txt += f"<br><sub>±{f(float(r.get(f'{m}_sd', np.nan)), 3)}</sub>"
             cells.append(txt)

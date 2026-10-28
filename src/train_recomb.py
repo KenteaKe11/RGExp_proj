@@ -496,6 +496,13 @@ def ft_lrs(cfg: Cfg, rcfg: dict | None = None) -> dict:
     sch = dict(tcfg.get("schedule", {}) or {})
     main = float(sch.get("max_lr", 2e-4))
     for k in ("cycle_steps", "lr_decay"):
+        if bool(tcfg.get("epoch_split", False)) and k == "lr_decay":
+            continue
+        if (bool(tcfg.get("epoch_split", False)) and k == "cycle_steps"
+                and sch.get(k) not in (None, 0)):
+            raise TrainUnusable(
+                "train.epoch_split tự tính cycle_steps = số bước mỗi epoch; "
+                "xoá train.schedule.cycle_steps.")
         if k in sch and sch[k] not in (None, 0, 1, 1.0):
             raise TrainUnusable(
                 f"train.schedule.{k} = {sch[k]} — decoder_ft chạy MỘT chu kỳ "
@@ -1018,7 +1025,12 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     pad_id = int(processor.tokenizer.pad_token_id or 0)
     n = len(ds)
     effective_batch = int(tcfg.get("effective_batch_size", bs * accum))
-    steps = total_steps(n, effective_batch, 1, int(tcfg.get("n_epochs", 1)))
+    # epoch_split: n_epochs lần CHIA tập train (mỗi epoch một nửa/phần, không
+    # lặp mẫu); mỗi epoch một chu kỳ one-cycle, peak epoch e = peak × lr_decay^e.
+    epoch_split = bool(tcfg.get("epoch_split", False))
+    n_epochs_cfg = max(1, int(tcfg.get("n_epochs", 1)))
+    steps = total_steps(n, effective_batch, 1, 1 if epoch_split else n_epochs_cfg)
+    cycle_steps = (math.ceil(steps / n_epochs_cfg) if epoch_split else 0)
     if max_steps_override:
         steps = int(max_steps_override)
 
@@ -1052,7 +1064,10 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
                 if not name.startswith("route_head."):
                     candidate_c_warmup_ids.add(id(p))
     lr_by_group = {g["name"]: float(g["lr"]) for g in opt.param_groups}
-    sched = build_scheduler(opt, steps, dict(tcfg["schedule"]))
+    _scfg0 = dict(tcfg["schedule"])
+    if epoch_split:
+        _scfg0["cycle_steps"] = cycle_steps
+    sched = build_scheduler(opt, steps, _scfg0)
     aux_alpha = float(spec["aux_alpha"]) if spec else 0.0
     aux_warm = float(spec["aux_warmup_pct"]) if spec else 0.0
     shared_warmup_steps = (int(math.ceil(steps * float(spec["shared_warmup_pct"])))
@@ -1083,7 +1098,14 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
         print("  lr đỉnh: " + " · ".join(
             f"{k} {v:.2e}" for k, v in lr_by_group.items())
             + f" (Attn × {lrs['attn_mult']:g})", flush=True)
-    _sch = dict(tcfg["schedule"])
+    _sch = dict(_scfg0)
+    if epoch_split:
+        _d = float(_sch.get("lr_decay", 1.0))
+        print(f"  epoch_split: {n_epochs_cfg} epoch × {cycle_steps} bước, mỗi epoch "
+              f"một nửa tập train ({n // n_epochs_cfg} mẫu), không lặp mẫu · "
+              f"lr_decay {_d:g}: peak " + " -> ".join(
+                  f"{float(_sch.get('max_lr', 0)) * _d ** e:.2e}"
+                  for e in range(n_epochs_cfg)), flush=True)
     curve = {}
     for k, v in lr_by_group.items():
         a, b = cycle_endpoints(v, float(_sch.get("div_factor", 25.0)),

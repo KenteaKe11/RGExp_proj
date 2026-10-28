@@ -222,6 +222,67 @@ def main() -> int:
                 raise AssertionError("thiếu summary.csv")
 
 
+    def test_exp3_config_and_report():
+        import tempfile
+
+        import pandas as pd
+
+        from src import report_recomb
+        from src.config import load_config
+        from src.run_recomb import EXPERIMENTS, enabled_arms
+        from src.stats_multi import compare_pairs
+
+        base = load_config("configs/recombiner.yaml")
+        cfg = load_config("configs/exp3.yaml")
+        if "3" not in EXPERIMENTS:
+            raise AssertionError("EXPERIMENTS thiếu '3'")
+        arms = enabled_arms(cfg)
+        ids = [a["id"] for a in arms]
+        if ids != ["lora_qdora_vision", "moe_lora"]:
+            raise AssertionError(f"Exp 3 phải có đúng B₁ và C₂, nhận {ids}")
+        if any(a.get("shared_lora") for a in arms):
+            raise AssertionError("Exp 3 KHÔNG có shared LoRA")
+        t = cfg["train"]
+        if (t["n_epochs"], t["effective_batch_size"], t["grad_accum"]) != (2, 16, 1):
+            raise AssertionError(f"train sai: {t}")
+        # extends: mọi thứ khác lấy nguyên từ §2.3
+        for k in ("data", "generate", "lora", "recombiner", "classifier"):
+            if cfg.get(k) != base.get(k):
+                raise AssertionError(f"khối {k} phải giống §2.3")
+        if cfg["generate"]["num_beams"] != 1:
+            raise AssertionError("Exp 3 phải greedy")
+        if cfg["output"]["subdir"] == base["output"]["subdir"] or \
+                cfg["output"]["adapter_dir"] == base["output"]["adapter_dir"]:
+            raise AssertionError("Exp 3 không được ghi đè thư mục §2.3")
+        if cfg["stats"]["contrasts"] != [["lora_qdora_vision", "moe_lora"]]:
+            raise AssertionError("contrast Exp 3 sai")
+        n = 200
+        scores = {}
+        for k, aid in enumerate(ids):
+            rng = np.random.default_rng(k)
+            tp = rng.integers(0, 4, n).astype(float)
+            fp = rng.integers(0, 3, n).astype(float)
+            fn = rng.integers(0, 3, n).astype(float)
+            den = 2 * tp + fp + fn
+            scores[aid] = pd.DataFrame({
+                "key": [f"k{i}" for i in range(n)],
+                "bleu4": rng.random(n) * 0.2 + 0.02 * k,
+                "chexbert_f1": np.divide(2 * tp, den, out=np.zeros(n), where=den > 0),
+                "chexbert_tp": tp, "chexbert_fp": fp, "chexbert_fn": fn})
+        sc = dict(cfg["stats"], n_perm=200)
+        pw = compare_pairs(scores, ["bleu4", "chexbert_f1"], sc, ids)
+        with tempfile.TemporaryDirectory() as d:
+            path = report_recomb.write_all(
+                cfg, Path(d), scores, {a["id"]: a["name"] for a in arms}, pw, [],
+                {"run_id": "t", "n_eval": n})
+            md = path.read_text(encoding="utf-8")
+            for need in ("Exp 3", "2 epoch", "batch hiệu dụng 16", "Ma trận hiệu số"):
+                if need not in md:
+                    raise AssertionError(f"report Exp 3 thiếu {need!r}")
+            if "sáu candidate" in md or "E · MoE-LoRA + shared" in md:
+                raise AssertionError("report Exp 3 còn chữ của §2.3")
+
+
     def test_reuse_hub_preds():
         import json, tempfile
         from pathlib import Path
@@ -260,6 +321,7 @@ def main() -> int:
     check("pre-declared contrasts + Holm over metrics", test_contrasts_declared)
     check("greedy decoding is the same spec as §2.5", test_greedy_shared_with_section25)
     check("§2.3 report: B*, QDoRA table, compact p-value matrix", test_report_23_end_to_end)
+    check("Exp 3: extends §2.3, B₁ và C₂ không shared, 2 epoch / batch 16, report riêng", test_exp3_config_and_report)
     check("--reuse-hub-preds: kéo chỉ predictions, B* không có thì để train", test_reuse_hub_preds)
     if failures:
         print(f"\n{len(failures)} check(s) failed.")

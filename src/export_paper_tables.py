@@ -22,17 +22,18 @@ import pandas as pd
 from .report_common import METRIC_SHORT, ordered
 
 LABELS_23 = {
-    "baseline_infer": "Frozen backbone",
-    "lora_only": "QLoRA only",
-    "lora_qdora_vision": "QLoRA + QDoRA vision",
-    "lora_recomb": "Recombiner + QLoRA",
-    "moe_lora": "Recombiner + MoE-LoRA",
-    "moe_shared_lora": "\\quad + 1 shared adapter",
+    "baseline_infer": "A\\quad Frozen backbone",
+    "lora_qdora_vision": "B\\quad LoRA decoder + vision adapter",
+    "moe_lora": "C\\quad Ours (MoE-LoRA + recombinator)",
 }
+# Chỉ ba hệ thống A, B, C; không có biến thể con và không có shared adapter.
+FAMILIES_23 = {"baseline_infer": ["baseline_infer"],
+               "lora_qdora_vision": ["lora_qdora_vision"],
+               "moe_lora": ["moe_lora"]}
 LABELS_25 = {
     "r2gen": "R2Gen~\\cite{ref_r2gen}",
     "adaatt": "AdaAtt~\\cite{ref_adaatt}",
-    "moe_shared_lora": "Ours",
+    "moe_lora": "Ours",
 }
 LABELS_26 = {
     "gemma3_baseline": "Frozen backbone",
@@ -46,17 +47,23 @@ def _best(col: pd.Series) -> float:
     return float(pd.to_numeric(col, errors="coerce").max())
 
 
-def _cell(v: float, best: float, nd: int, sd: float | None = None) -> str:
+def _cell(v: float, best: float | None, nd: int, sd: float | None = None,
+          italic: bool = False) -> str:
     txt = f"{v:.{nd}f}".lstrip("0") if abs(v) < 1 else f"{v:.{nd}f}"
-    if np.isclose(v, best):
+    if best is not None and np.isclose(v, best):
         txt = f"\\textbf{{{txt}}}"
+    if italic:
+        txt = f"\\textit{{{txt}}}"
     if sd is not None and np.isfinite(sd):
         txt += f" $\\pm$ {sd:.{nd - 1}f}".replace("0.", ".")
     return txt
 
 
 def _rows(df: pd.DataFrame, ids: list[str], labels: dict[str, str],
-          metrics: list[str], nd: int, with_sd: bool) -> list[str]:
+          metrics: list[str], nd: int, with_sd: bool,
+          main: dict[str, list[str]] | None = None) -> list[str]:
+    """`main`: chỉ các arm này cạnh tranh để in đậm; arm còn lại in nghiêng, không đậm
+    (bước trung gian không được xếp hạng cùng các hệ thống chính)."""
     d = df.set_index("arm_id", drop=False)
     out = []
     for aid in ids:
@@ -66,7 +73,16 @@ def _rows(df: pd.DataFrame, ids: list[str], labels: dict[str, str],
         cells = [labels.get(aid, aid)]
         for m in metrics:
             sd = float(r.get(f"{m}_sd", np.nan)) if with_sd else None
-            cells.append(_cell(float(r[m]), _best(d[m]), nd, sd))
+            if main is None:
+                cells.append(_cell(float(r[m]), _best(d[m]), nd, sd))
+            else:
+                child = aid not in main  # biến thể con -> in nghiêng
+                rep_vals = [max(round(float(d.loc[x, m]), nd) for x in xs if x in d.index)
+                            for xs in main.values()]
+                best = max(rep_vals)
+                v = float(r[m])
+                cells.append(_cell(v, best if np.isclose(round(v, nd), best) else None,
+                                   nd, sd, italic=child))
         out.append(" & ".join(cells) + " \\\\")
     return out
 
@@ -75,9 +91,9 @@ def variants(df: pd.DataFrame, nd: int = 4) -> str:
     metrics = ordered([m for m in METRIC_SHORT if m in df.columns])
     ids = [a for a in LABELS_23 if a in set(df["arm_id"])]
     head = "Variant & " + " & ".join(METRIC_SHORT[m] for m in metrics) + " \\\\"
-    rows = _rows(df, ids, LABELS_23, metrics, nd, False)
-    # vạch ngăn: trước nhóm có Recombinator
-    sep_before = {"lora_recomb", "moe_lora"}
+    rows = _rows(df, ids, LABELS_23, metrics, nd, False, main=FAMILIES_23)
+    # In đậm chỉ giữa ba hệ thống chính A, B, E; B*, C, D là bước trung gian (nghiêng).
+    sep_before = set()
     body, k = [], 0
     for aid in ids:
         if aid in sep_before:

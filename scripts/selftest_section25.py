@@ -78,9 +78,9 @@ def t_arms_valid():
     arms = enabled_arms(CFG)
     assert len(arms) == 3, [a["id"] for a in arms]
     kinds = {a["id"]: a["kind"] for a in arms}
-    assert kinds["moe_shared_lora"] == "ours" and kinds["r2gen"] == "sota"
+    assert kinds["moe_lora"] == "ours" and kinds["r2gen"] == "sota"
     assert kinds["adaatt"] == "sota"
-    e = next(a for a in arms if a["id"] == "moe_shared_lora")
+    e = next(a for a in arms if a["id"] == "moe_lora")
     assert e.get("reuse_only") is True and e.get("moe") is True, e
     assert e.get("predictions_from_hub", {}).get("subdir"), "E phải khai predictions_from_hub"
 
@@ -107,7 +107,7 @@ def t_arm_flags_are_mandatory():
 
 
 def t_moe_config_matches_24():
-    arm = next(a for a in CFG["arms_s25"] if a["id"] == "moe_shared_lora")
+    arm = next(a for a in CFG["arms_s25"] if a["id"] == "moe_lora")
     assert int(arm["top_k"]) == 6 and int(arm["n_experts"]) == 10
     assert CFG["moe"]["enabled"] is True
     assert int(CFG["recombiner"]["n_experts"]) == 10
@@ -128,9 +128,9 @@ def t_protocol_numbers_config_and_readme():
     assert int(st["n_perm"]) == 10000
     assert str(st["ci_method"]) == "percentile"
     assert str(st["pairs"]) == "vs_reference"
-    assert str(st["reference"]) == "moe_shared_lora"
+    assert str(st["reference"]) == "moe_lora"
     assert int(CFG["data"]["n_test"]) == 3000
-    assert int(CFG["data"]["n_train"]) == int(CFG["pretrain"]["n_train"]) == 6400
+    assert int(CFG["data"]["n_train"]) == int(CFG["pretrain"]["n_train"]) == 12800
     for m in ("chexbert", "radgraph"):
         assert CFG["metrics"][m]["enabled"] is True, m
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -157,7 +157,7 @@ def t_train_order_heaviest_first():
     from src.run_section25 import enabled_arms, train_order
 
     order = [a["id"] for a in train_order(enabled_arms(CFG))]
-    assert order[0] == "moe_shared_lora", order
+    assert order[0] == "moe_lora", order
 
 
 def t_hub_reuse_pulls_and_validates_predictions():
@@ -268,22 +268,22 @@ def t_stats_multi_reuses_stats_ab():
 def t_pair_list_three_pairs_reference_at_a():
     from src.stats_multi import pair_list
 
-    pairs = pair_list(["r2gen", "adaatt", "moe_shared_lora"], "all",
-                      "moe_shared_lora")
+    pairs = pair_list(["r2gen", "adaatt", "moe_lora"], "all",
+                      "moe_lora")
     assert len(pairs) == 3, pairs
     for a, b in pairs:
-        if "moe_shared_lora" in (a, b):
-            assert a == "moe_shared_lora", (a, b)
+        if "moe_lora" in (a, b):
+            assert a == "moe_lora", (a, b)
     assert ("r2gen", "adaatt") in pairs or ("adaatt", "r2gen") in pairs
 
 
 def t_pair_list_vs_reference_is_sota_vs_e():
     from src.stats_multi import pair_list
 
-    pairs = pair_list(["r2gen", "adaatt", "moe_shared_lora"],
+    pairs = pair_list(["r2gen", "adaatt", "moe_lora"],
                       CFG["stats"]["pairs"], CFG["stats"]["reference"])
-    assert sorted(pairs) == [("moe_shared_lora", "adaatt"),
-                             ("moe_shared_lora", "r2gen")], pairs
+    assert sorted(pairs) == [("moe_lora", "adaatt"),
+                             ("moe_lora", "r2gen")], pairs
 
 
 def t_pair_list_rejects_unknown_reference():
@@ -1087,17 +1087,17 @@ def t_protocol_25_detects_shift_and_null():
 
     scfg = dict(CFG["stats"])
     scfg["n_perm"] = 1000
-    scores = {"moe_shared_lora": _fake_scores(seed=1),
+    scores = {"moe_lora": _fake_scores(seed=1),
               "r2gen": _fake_scores(seed=1, shift=-0.08),
               "adaatt": _fake_scores(seed=1)}
     df = compare_pairs(scores, ["bleu4", "bertscore_f1"], scfg,
-                       ["r2gen", "adaatt", "moe_shared_lora"])
+                       ["r2gen", "adaatt", "moe_lora"])
     assert len(df) == 2 * 2, len(df)
-    assert set(df["arm_a"]) == {"moe_shared_lora"}, "E phải luôn ở vị trí A"
+    assert set(df["arm_a"]) == {"moe_lora"}, "E phải luôn ở vị trí A"
     assert set(df["ci_method"]) == {"percentile"}
     weak = df[df["arm_b"] == "r2gen"]
     assert weak["significant_and_material"].all(), weak.to_dict("records")
-    assert (weak["mean_diff"] < 0).all() and (weak["winner"] == "moe_shared_lora").all()
+    assert (weak["mean_diff"] < 0).all() and (weak["winner"] == "moe_lora").all()
     same = df[df["arm_b"] == "adaatt"]
     assert not same["significant"].any(), "bản sao của E mà bác được H0"
     # Quy tắc kết luận: p_perm thô < alpha VÀ CI loại 0 — không qua Holm.
@@ -1108,12 +1108,12 @@ def t_protocol_25_detects_shift_and_null():
 def t_protocol_25_bootstrap_seed_guards():
     from src.stats_multi import compare_pairs
 
-    scores = {"moe_shared_lora": _fake_scores(seed=1), "r2gen": _fake_scores(seed=2)}
+    scores = {"moe_lora": _fake_scores(seed=1), "r2gen": _fake_scores(seed=2)}
     base = dict(CFG["stats"], n_perm=50)
     for bad in ([1, 2, 3], [1, 1, 2, 2]):
         try:
             compare_pairs(scores, ["bleu4"], dict(base, bootstrap_seeds=bad),
-                          ["r2gen", "moe_shared_lora"])
+                          ["r2gen", "moe_lora"])
         except ValueError:
             continue
         raise AssertionError(f"bootstrap_seeds={bad} mà vẫn qua")
@@ -1125,10 +1125,10 @@ def t_protocol_25_subsets_shared_across_pairs():
 
     scfg = dict(CFG["stats"], n_perm=100)
     a, b = _fake_scores(seed=1), _fake_scores(seed=2)
-    one = compare_pairs({"moe_shared_lora": a, "r2gen": b}, ["bleu4"], scfg,
-                        ["r2gen", "moe_shared_lora"])
-    two = compare_pairs({"moe_shared_lora": a, "r2gen": b, "adaatt": b.copy()},
-                        ["bleu4"], scfg, ["r2gen", "adaatt", "moe_shared_lora"])
+    one = compare_pairs({"moe_lora": a, "r2gen": b}, ["bleu4"], scfg,
+                        ["r2gen", "moe_lora"])
+    two = compare_pairs({"moe_lora": a, "r2gen": b, "adaatt": b.copy()},
+                        ["bleu4"], scfg, ["r2gen", "adaatt", "moe_lora"])
     r1 = one.iloc[0]
     r2 = two[two["arm_b"] == "r2gen"].iloc[0]
     assert abs(r1["mean_diff"] - r2["mean_diff"]) < 1e-12
@@ -1140,9 +1140,9 @@ def t_protocol_25_chexbert_counts_path():
     from src.stats_multi import compare_pairs
 
     scfg = dict(CFG["stats"], n_perm=300)
-    scores = {"moe_shared_lora": _fake_scores_with_counts(seed=1, shift=0.15),
+    scores = {"moe_lora": _fake_scores_with_counts(seed=1, shift=0.15),
               "r2gen": _fake_scores_with_counts(seed=1, shift=-0.15)}
-    df = compare_pairs(scores, ["chexbert_f1"], scfg, ["r2gen", "moe_shared_lora"])
+    df = compare_pairs(scores, ["chexbert_f1"], scfg, ["r2gen", "moe_lora"])
     r = df.iloc[0]
     assert r["ci_method"].startswith("percentile"), r["ci_method"]
     assert r["mean_diff"] < 0 and r["significant"], r.to_dict()
@@ -1168,7 +1168,7 @@ def _synthetic_report(tmp: Path):
             df[f"chexbert_label_{j:02d}_tp"] = rng.integers(0, 2, n).astype(float)
             df[f"chexbert_label_{j:02d}_fp"] = rng.integers(0, 2, n).astype(float)
             df[f"chexbert_label_{j:02d}_fn"] = rng.integers(0, 2, n).astype(float)
-        if aid == "moe_shared_lora":
+        if aid == "moe_lora":
             import json as _json
             df["route_experts"] = [_json.dumps(sorted(rng.choice(10, 6, replace=False).tolist()))
                                    for _ in range(n)]
@@ -1194,7 +1194,7 @@ def t_report_has_all_sections_for_each_pair():
         for b in ("r2gen", "adaatt"):
             short = {"r2gen": "R2Gen", "adaatt": "AdaAtt"}[b]
             assert short in md.split("Ma trận hiệu số")[1].split("<details>")[0], b
-        assert "Ký hiệu" in md and md.count("| **E** |") == 1, "thiếu bảng ký hiệu"
+        assert "Ký hiệu" in md and md.count("| **C** |") == 1, "thiếu bảng ký hiệu"
         head = md.split("Ma trận hiệu số")[1].split("<details>")[0]
         assert "<sub>[" in head and "p=" in head, "ô thiếu KTC/p"
         assert "p Holm" not in head and "d_z" not in head, \
@@ -1217,7 +1217,7 @@ def t_report_skips_expert_table_without_routes():
     from src.run_section25 import enabled_arms
 
     arms = enabled_arms(CFG)
-    assert _expert_f1({"moe_shared_lora": _fake_scores()}, arms) is None
+    assert _expert_f1({"moe_lora": _fake_scores()}, arms) is None
 
 
 def t_report_never_computes_cider():

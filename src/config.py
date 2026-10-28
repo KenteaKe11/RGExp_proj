@@ -69,12 +69,40 @@ def _set_path(d: dict, dotted: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Gộp `over` vào `base`: dict gộp đệ quy, mọi kiểu khác (kể cả list) bị THAY."""
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _load_with_extends(path: Path, _seen: tuple = ()) -> dict:
+    """Đọc YAML; khoá `extends: <file>` (cùng thư mục) nạp file nền trước rồi gộp đè.
+
+    Dùng cho thí nghiệm hậu kiểm (Exp 3): chỉ khai phần KHÁC §2.3, mọi thứ còn lại
+    (dữ liệu, prompt, giải mã, thống kê) lấy nguyên từ file nền nên không thể trôi.
+    """
+    path = Path(path)
+    if path.resolve() in _seen:
+        raise ValueError(f"`extends` vòng tròn tại {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    parent = raw.pop("extends", None)
+    if parent:
+        base = _load_with_extends(path.parent / str(parent), _seen + (path.resolve(),))
+        raw = _deep_merge(base, raw)
+    return raw
+
+
 def load_config(path: str | Path | None = None, overrides: list[str] | None = None) -> Cfg:
     path = Path(path) if path else DEFAULT_CONFIG
     if not path.exists():
         raise FileNotFoundError(f"Không thấy config: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+    raw = _load_with_extends(path)
     for item in overrides or []:
         if "=" not in item:
             raise ValueError(f"--set cần dạng khoa.con=gia_tri, nhận: {item!r}")

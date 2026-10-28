@@ -1,0 +1,67 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Exp 3 — HẬU KIỂM (post-test): biến thể mạnh nhất của họ B và họ C
+# ═════════════════════════════════════════════════════════════════════════════
+# Câu hỏi: §2.3 cho thấy MoE không hơn một adapter đơn khi huấn luyện chỉ ~200 bước
+# (6.400 mẫu / batch 32, 1 epoch) mà số tổ hợp expert là C(10,6) = 210. Giả thuyết:
+# MoE bị thiếu bước huấn luyện, và shared LoRA chỉ là cách né điều đó. Exp 3 kiểm
+# trực tiếp: tăng ngân sách bước lên ~4 lần và để hai họ cạnh tranh dưới CÙNG điều kiện.
+#
+# Hai đại diện, mỗi họ MỘT biến thể mạnh nhất của §2.3:
+#   họ B  ->  lora_qdora_vision (B₁)  QLoRA decoder + QDoRA vision, không Recombinator
+#   họ C  ->  moe_lora          (C₂)  MoE-LoRA top-6/10 + Recombinator + QDoRA vision
+#
+# KHÔNG có shared LoRA: với ngân sách bước đủ lớn nó không còn mục đích tồn tại, và
+# việc nó có cần hay không chính là điều Exp 3 kiểm (so C₂ ở Exp 3 với E ở §2.3).
+#
+# Thay đổi DUY NHẤT so với §2.3 (mọi thứ khác — dữ liệu, seed, prompt, greedy, lịch
+# học tương đối, kiến trúc, thống kê — lấy nguyên từ recombiner.yaml qua `extends`):
+#   train.n_epochs            1  -> 2
+#   train.effective_batch_size 32 -> 16     => 400 bước/epoch × 2 = 800 bước
+#
+# Coi như post-test: các số của Exp 3 KHÔNG được ghép vào bảng §2.3 (khác ngân sách
+# huấn luyện); báo cáo Exp 3 là một thí nghiệm riêng.
+#
+#   bash scripts/run_recomb.sh --config configs/exp3.yaml --exp 3 --no-wandb
+# ═════════════════════════════════════════════════════════════════════════════
+extends: recombiner.yaml
+
+experiment: "3"
+
+train:
+  n_epochs: 2
+  per_device_batch_size: 16
+  effective_batch_size: 16
+  grad_accum: 1
+
+arms:
+  - id: lora_qdora_vision
+    short: "B₁"
+    name: "B₁ · QLoRA bộ giải mã + QDoRA 1/4 bộ mã hóa ảnh (không Recombinator)"
+    recomb: false
+    vision_qdora: true
+    enabled: true
+  - id: moe_lora
+    short: "C₂"
+    name: "C₂ · MoE-LoRA decoder + Route + QDoRA vision + Recombinator + đầu phân loại (không shared)"
+    recomb: true
+    moe: true
+    top_k: 6
+    n_experts: 10
+    route_pooling: attention
+    all_linear_targets: false
+    capture_cls_head: false
+    train_projector: false
+    enabled: true
+
+stats:
+  pairs: contrasts
+  adjust_scope: metrics
+  contrasts:
+    - [lora_qdora_vision, moe_lora]     # C₂ − B₁: MoE có hơn adapter đơn khi đủ bước?
+
+wandb:
+  tags: [exp3, posttest, moe, no-shared, 2-epoch, bs16, mimic-cxr]
+
+output:
+  subdir: "3_posttest_2ep"
+  adapter_dir: ./adapters_3_posttest

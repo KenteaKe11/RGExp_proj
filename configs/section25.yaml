@@ -30,7 +30,8 @@ data:
   n_test: 3000
   # Mẫu test/train/val DÙNG LẠI NGUYÊN VĂN từ §2.3: đọc testset/trainset/valset
   # .jsonl đã chốt ở manifest_dir, không lấy mẫu lại. Thiếu file thì DỪNG.
-  manifest_dir: ./data/section23_eval_3000
+  manifest_dir: ./data/section23_eval_3000_pt
+  split_local_dir: ./data/splits_patient_v2
   reuse_manifests: true
   cache_dir: ./data
   image_max_side: 512
@@ -38,7 +39,7 @@ data:
   zip_mode: auto
   zip_stream_min_rate: 1.0
   train_split_csv: split_ref/train_split.csv
-  n_train: 6400
+  n_train: 12800
   val_split_csv: split_ref/val_split.csv
   n_val: 256            # = §2.3
   assert_no_leak: true
@@ -101,9 +102,9 @@ arms_s25:
 
   # Candidate E §2.3: checkpoint được giữ nguyên, chỉ nạp để suy luận/chấm.
   # Đường dẫn tương đối tới repo; không tự kéo từ Hub và không train lại.
-  - id: moe_shared_lora
-    short: "E"
-    name: "C · Candidate E · MoE-LoRA + shared LoRA"
+  - id: moe_lora
+    short: "C"
+    name: "C · MoE-LoRA + Recombinator (không shared)"
     kind: ours
     runner: gemma3_recomb
     recomb: true
@@ -116,8 +117,8 @@ arms_s25:
     predictions_from_hub:
       repo: RGExp123/Research_results
       repo_type: dataset
-      subdir: 2.3_three_candidate_attn_pool
-      file: predictions/moe_shared_lora.jsonl
+      subdir: 2.3_pt12800_three_systems
+      file: predictions/moe_lora.jsonl
     enabled: true
 
 # ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
@@ -528,7 +529,7 @@ metrics:
 # có hoàn lại từ 3.000 test; permutation 10.000 lần. Holm trên metric trong
 # từng cặp chỉ là thông tin phụ; kết luận theo p_perm thô < alpha và CI loại 0.
 #
-# `reference: moe_shared_lora` đặt E phía A; chỉ giữ hai cặp SOTA − E.
+# `reference: moe_lora` đặt C phía A; chỉ giữ hai cặp SOTA − C.
 stats:
   alpha: 0.05
   n_boot: 4
@@ -540,7 +541,7 @@ stats:
   dz_floor: 0.10
   primary_test: perm
   pairs: vs_reference
-  reference: moe_shared_lora
+  reference: moe_lora
   adjust: holm
   adjust_scope: metrics    # lưu Holm để tham khảo; không dùng làm cổng ý nghĩa
 
@@ -571,7 +572,7 @@ stats:
 # DỪNG nếu lệch. Sửa `max_lr` mà quên hai hệ số là đổi min_lr trong im lặng — và một
 # đường cong lr sai không ném exception nào.
 pretrain:
-  n_train: 6400 # 0 = toàn bộ train split đã khai ở `data`
+  n_train: 12800 # 0 = toàn bộ train split đã khai ở `data`
   n_epochs: 6
   cycle_per_epoch: true
   # train_bs hiệu dụng của riêng Stage 0 = 32; main-stage không đổi.

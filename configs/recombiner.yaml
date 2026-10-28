@@ -80,7 +80,9 @@ data:
   key_column: img_rel
   ref_column: text_gt
   n_test: 3000
-  manifest_dir: ./data/section23_eval_3000
+  manifest_dir: ./data/section23_eval_3000_pt
+  # Split cấp patient (1 ảnh/patient), tạo bằng scripts/make_patient_split.py
+  split_local_dir: ./data/splits_patient_v2
   cache_dir: ./data
   # Trần cạnh dài 512, cưỡng chế thật (xem src/imaging.py). Cache dùng CHUNG
   # với §2.1/§2.2 nên phải ép lại mỗi lần chạy stage `data`.
@@ -90,7 +92,7 @@ data:
   zip_stream_min_rate: 1.0
 
   train_split_csv: split_ref/train_split.csv
-  n_train: 6400
+  n_train: 12800
   val_split_csv: split_ref/val_split.csv
   n_val: 256
   assert_no_leak: true
@@ -185,14 +187,18 @@ lora:
 
 # ── HUẤN LUYỆN ─────────────────────────────────────────────────────────────
 train:
-  n_epochs: 1
+  n_epochs: 2
+  # 12800 mẫu chia cho 2 epoch (mỗi epoch MỘT NỬA = 6400 mẫu, không lặp mẫu), eff_bs 16
+  # => 400 bước/epoch × 2 = 800 bước. Mỗi epoch một chu kỳ one-cycle giống nhau;
+  # peak epoch 2 = peak × lr_decay = 7e-5; đáy nhóm nhỏ nhất (3e-5/(25×120)) = 1e-8.
+  epoch_split: true
 
   # Candidate có Recombinator dò theo thứ tự này; batch tìm được sẽ khóa cho QLoRA-only.
   batch_probe: true
   batch_probe_sizes: [16, 12, 10, 8, 6, 4, 2, 1]
   per_device_batch_size: 16
-  effective_batch_size: 32
-  grad_accum: 2                   # gợi ý ban đầu; phần dư vẫn tích đúng 32 mẫu
+  effective_batch_size: 16
+  grad_accum: 1
 
   max_seq_len: 1024              # KHÔNG tính 32 token chèn thêm: chúng được
                                  # chèn SAU khi mẫu đã bị cắt, nên candidate B
@@ -209,7 +215,9 @@ train:
     max_lr: 8.0e-5
     pct_start: 0.1
     div_factor: 25.0
-    final_div_factor: 100.0
+    final_div_factor: 120.0
+    min_lr: 1.0e-8
+    lr_decay: 0.875
     anneal: cos
     cycle_momentum: false
 
@@ -495,7 +503,7 @@ arms:
     n_experts: 10
     route_pooling: attention
     all_linear_targets: false
-    capture_cls_head: false
+    capture_cls_head: true
     train_projector: false
     enabled: true
   - id: moe_shared_lora
@@ -691,10 +699,10 @@ output:
   # §2.3 là mất bảng mà §2.4 lấy làm mốc nền, và trộn adapter của hai mục trong
   # một thư mục là mở đường cho `already_trained()` nhận nhầm một candidate của
   # mục kia rồi bỏ qua stage train.
-  subdir: "2.3_three_candidate_attn_pool"
-  adapter_dir: ./adapters_2_3_three_candidate_attn_pool
-  subdir_moe: "2.4_moe"
-  adapter_dir_moe: ./adapters_2_4
+  subdir: "2.3_pt12800_three_systems"
+  adapter_dir: ./adapters_2_3_pt12800
+  subdir_moe: "2.4_moe_pt12800"
+  adapter_dir_moe: ./adapters_2_4_pt12800
 
   # decoder_ft ghi vào thư mục RIÊNG bằng hậu tố này:
   #   runs/2.3_recombiner_ft/ + adapters_2_3_ft/  (và _ft cho cặp 2.4)

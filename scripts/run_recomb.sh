@@ -84,10 +84,11 @@ done
 # `--exp` được kiểm Ở ĐÂY, trước khi tách tiến trình nền: với `--detach`, một
 # giá trị sai chỉ hiện ra trong log vài giây sau khi shell đã trả lại dấu nhắc,
 # và rất dễ bị đọc thành "đang chạy".
-if [ -n "$EXP" ] && [ "$EXP" != "2.3" ] && [ "$EXP" != "2.4" ]; then
-    echo "✗ --exp phải là 2.3 hoặc 2.4 (nhận: '$EXP')."
+if [ -n "$EXP" ] && [ "$EXP" != "2.3" ] && [ "$EXP" != "2.4" ] && [ "$EXP" != "3" ]; then
+    echo "✗ --exp phải là 2.3, 2.4 hoặc 3 (nhận: '$EXP')."
     echo "    2.3  bốn candidate: baseline, QLoRA, Recombinator, MoE-LoRA; bootstrap + permutation"
     echo "    2.4  MoE: 5 cấu hình (top-k, expert), Friedman + Wilcoxon/Holm"
+    echo "    3    hậu kiểm: B₁ vs C₂, 2 epoch, batch 16 (dùng --config configs/exp3.yaml)"
     exit 2
 fi
 if [ -z "$EXP" ]; then

@@ -32,6 +32,39 @@ Hiệu số kiểm định khai trước trong `stats.contrasts` (mỗi cặp m�
 | AdaAtt | `adaatt` | ResNet-152 + Adaptive Attention, cài lại theo paper |
 | E | `moe_shared_lora` | Predictions của §2.3 kéo từ Hub, chấm lại bằng cùng pipeline; không train/infer lại |
 
+## §2.3 mới: dữ liệu cấp patient, 3 hệ thống A/B/C
+
+- **Dữ liệu**: mỗi patient đúng một ảnh; train 12 800, val 256, test 3 000 patient, ba tập không giao nhau.
+  Split tự động khi chạy pipeline (cache cục bộ → pull Hub → tạo + đẩy Hub), hoặc chạy tay: `python scripts/make_patient_split.py`
+  (seed `data.split_seed`=42). Config đọc qua
+  `data.split_local_dir` (thiếu file thì DỪNG, không quay về split cũ).
+- **Hệ thống**: A = `baseline_infer`, B = `lora_qdora_vision` (LoRA decoder + QDoRA vision), C = `moe_lora`
+  (MoE-LoRA + Recombinator + cls head, không shared). Test mới ⇒ dự đoán cũ trên Hub KHÔNG dùng lại được
+  (`--reuse-hub-preds` không áp dụng); suy luận lại A, B, C và R2Gen/AdaAtt trên test mới.
+- **Huấn luyện**: `train.epoch_split: true`, 2 epoch, mỗi epoch một nửa tập train (6 400 mẫu, không lặp),
+  eff_bs 16 ⇒ 400 bước/epoch, 800 bước. Mỗi epoch một chu kỳ one-cycle giống nhau; peak 8e-5 (epoch 1) → 7e-5
+  (epoch 2, `lr_decay` 0,875); đáy nhóm nhỏ nhất 1e-8 (epoch 2 nhân 0,875 theo cả đường cong).
+- Output mới: `runs/2.3_pt12800_three_systems`, `adapters_2_3_pt12800`. §2.5 đọc C từ đó.
+- Exp 3 cũ (2 epoch, eff_bs 16) nay trùng ngân sách với §2.3 mới ⇒ không còn cần.
+
+## Exp 3 — hậu kiểm (post-test)
+
+Kiểm trực tiếp giả thuyết của bài: MoE không hơn adapter đơn ở §2.3 vì **thiếu bước huấn luyện** (≈ 200 bước < C(10,6) = 210 tổ hợp expert), và shared LoRA chỉ là cách né điều đó. Exp 3 lấy **biến thể mạnh nhất của mỗi họ** và cho cạnh tranh dưới cùng điều kiện, với ngân sách bước gấp ≈ 4 lần:
+
+| Họ | Đại diện | id |
+|---|---|---|
+| B | B₁: QLoRA decoder + QDoRA vision | `lora_qdora_vision` |
+| C | C₂: MoE-LoRA top-6/10 + Recombinator + QDoRA vision, **không shared** | `moe_lora` |
+
+Khác §2.3 đúng hai con số: `n_epochs` 1 → 2 và `effective_batch_size` 32 → 16 (≈ 800 bước). Mọi thứ khác lấy nguyên từ `recombiner.yaml` qua `extends:` (xem `configs/exp3.yaml`). Hai thư mục riêng (`runs/3_posttest_2ep/`, `adapters_3_posttest/`, Hub `3_posttest_2ep`), nên không đè §2.3.
+
+```bash
+bash scripts/run_recomb.sh --config configs/exp3.yaml --exp 3 --no-wandb
+#   --retrain: train lại B₁ · --force: train lại C₂ (checkpoint moe_lora được bảo vệ)
+```
+
+Kết quả Exp 3 **không ghép vào bảng §2.3** (khác ngân sách huấn luyện). Đọc: C₂ − B₁ có ▲ không, và so C₂ (Exp 3) với E (§2.3) để xem shared LoRA có còn cần khi đủ bước.
+
 ## Giải mã greedy (đồng bộ §2.3 và §2.5)
 
 Cả hai config có cùng khối `generate:` với `num_beams: 1` — đo năng lực thuần của mô hình, không đo bộ tìm kiếm chuỗi. Gemma đi `transformers.generate`; R2Gen/AdaAtt đi `src/sota/decoding.py`, vốn chép nhánh greedy (`num_beams = 1`) và nhánh beam của transformers 4.52 (selftest đối chiếu từng token với `transformers.generate`, 30 tổ hợp). Chỉ độ dài tối đa khác nhau: Gemma 256 subword, hai baseline `max_seq_length − 1` từ.

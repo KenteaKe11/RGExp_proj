@@ -70,7 +70,8 @@ def load_index(cfg: Cfg) -> pd.DataFrame:
     tok = hf_token()
     kw = dict(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"), token=tok)
 
-    split_path = hf_hub_download(filename=d["split_csv"], **kw)
+    from .splits import resolve_split_file
+    split_path = resolve_split_file(cfg, d["split_csv"])
     meta_path = hf_hub_download(filename=d["meta_csv"], **kw)
 
     key_col, ref_col = d["key_column"], d["ref_column"]

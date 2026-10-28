@@ -193,7 +193,11 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     stats_by_arm = {str(s.get("arm_id")): s for s in (train_stats or [])}
     lines: list[str] = []
     A = lines.append
-    A("# §2.3 — Gemma 3, QLoRA, QDoRA vision, Recombinator và MoE-LoRA")
+    is_post = str(cfg.get("experiment", "")) == "3"
+    if is_post:
+        A("# Exp 3 — Hậu kiểm: biến thể mạnh nhất của họ B và họ C")
+    else:
+        A("# §2.3 — Gemma 3, QLoRA, QDoRA vision, Recombinator và MoE-LoRA")
     A("")
     A(f"Lượt chạy `{manifest.get('run_id', '?')}` · {manifest.get('n_eval', '?')} mẫu kiểm tra chung")
     A("")
@@ -213,22 +217,39 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                        for a in cfg.get("arms", []))
     projector_phrase = ("mở projector Gemma 3 để huấn luyện" if projector_ft
                         else "đóng băng projector Gemma 3")
-    A("So sánh sáu candidate trên cùng 3.000 ảnh test, cùng 6.400 mẫu huấn luyện, "
-      "cùng prompt và cùng giải mã **greedy** (đo năng lực thuần của mô hình):")
-    A("")
-    A("* **A · Gemma 3 gốc** — không fine-tune.")
-    A("* **B · QLoRA bộ giải mã** — chỉ QLoRA r=4 trên q/k/v/o của decoder.")
-    A(f"* **B\\* · QLoRA + QDoRA vision** — B cộng QDoRA hạng 4 trên {vision_scope} bộ mã hóa "
-      "ảnh, KHÔNG có Recombinator. Tách đóng góp của riêng QDoRA vision, vốn trước đây "
-      "luôn đi cùng nhánh.")
-    A(f"* **C · B\\* + Recombinator + đầu phân loại** — {projector_phrase}; token Recombinator "
-      "được chiếu rồi nối với token ảnh của bộ điều hợp và embedding lời nhắc; đầu phân loại "
-      "dùng một truy vấn học được gộp bằng chú ý 8 đầu rồi chiếu tuyến tính ra 14 logit.")
-    A("* **D · MoE-LoRA** — giữ nhánh và QDoRA vision của C, thay QLoRA decoder bằng top-6/10 "
-      "Experts LoRA (r=4, α=8) trên q/k/v/o, chọn bởi Route Head (attention pooling).")
-    A("* **E · MoE-LoRA + shared LoRA** — thêm một shared LoRA chạy độc lập với Route; 20% bước "
-      "đầu huấn luyện như C (Route/Experts tắt), 80% sau bật cả hai.")
-    A("")
+    if is_post:
+        tr = cfg.get("train") or {}
+        n_ep = int(tr.get("n_epochs", 1)); eff = int(tr.get("effective_batch_size", 32))
+        n_tr = int((cfg.get("data") or {}).get("n_train") or 6400)
+        steps = -(-n_tr // eff) * n_ep
+        A(f"Thí nghiệm hậu kiểm: hai đại diện mạnh nhất của hai họ trong §2.3, cùng dữ liệu, "
+          f"prompt và giải mã **greedy**, nhưng huấn luyện **{n_ep} epoch với batch hiệu dụng {eff}** "
+          f"(≈ {steps} bước, so với ≈ 200 bước ở §2.3). Không có shared LoRA. Kết quả KHÔNG ghép "
+          "vào bảng §2.3 vì ngân sách huấn luyện khác nhau.")
+        A("")
+        for arm in arms:
+            A(f"* **{arm.get('name', arm['id'])}**")
+        A("")
+        A("Câu hỏi: với ngân sách bước đủ lớn so với số tổ hợp expert C(10,6) = 210, MoE-LoRA có "
+          "hơn một adapter đơn hay không, và shared LoRA có còn cần thiết hay không.")
+        A("")
+    else:
+        A("So sánh sáu candidate trên cùng 3.000 ảnh test, cùng 6.400 mẫu huấn luyện, "
+          "cùng prompt và cùng giải mã **greedy** (đo năng lực thuần của mô hình):")
+        A("")
+        A("* **A · Gemma 3 gốc** — không fine-tune.")
+        A("* **B · QLoRA bộ giải mã** — chỉ QLoRA r=4 trên q/k/v/o của decoder.")
+        A(f"* **B\\* · QLoRA + QDoRA vision** — B cộng QDoRA hạng 4 trên {vision_scope} bộ mã hóa "
+          "ảnh, KHÔNG có Recombinator. Tách đóng góp của riêng QDoRA vision, vốn trước đây "
+          "luôn đi cùng nhánh.")
+        A(f"* **C · B\\* + Recombinator + đầu phân loại** — {projector_phrase}; token Recombinator "
+          "được chiếu rồi nối với token ảnh của bộ điều hợp và embedding lời nhắc; đầu phân loại "
+          "dùng một truy vấn học được gộp bằng chú ý 8 đầu rồi chiếu tuyến tính ra 14 logit.")
+        A("* **D · MoE-LoRA** — giữ nhánh và QDoRA vision của C, thay QLoRA decoder bằng top-6/10 "
+          "Experts LoRA (r=4, α=8) trên q/k/v/o, chọn bởi Route Head (attention pooling).")
+        A("* **E · MoE-LoRA + shared LoRA** — thêm một shared LoRA chạy độc lập với Route; 20% bước "
+          "đầu huấn luyện như C (Route/Experts tắt), 80% sau bật cả hai.")
+        A("")
     cfg_stats = cfg.get("stats") or {}
     ns = int(cfg_stats.get("n_boot", 10))
     bs = int(cfg_stats.get("bootstrap_sample_size", 3000))
@@ -237,7 +258,7 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                  if bootstrap_seeds else "")
     A(f"Tập kiểm tra gồm {manifest.get('n_eval', '?')} mẫu. Mỗi chỉ số và candidate dùng cùng "
       f"{ns} tập bootstrap{seed_text}; mỗi tập lấy {bs} mẫu có hoàn lại từ tập kiểm tra. Cùng ma trận "
-      "mẫu được dùng chung cho cả năm candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
+      "mẫu được dùng chung cho mọi candidate và mọi chỉ số; kết quả tổng hợp là trung bình "
       "qua các tập lấy mẫu có hoàn lại.")
     A("Metric CheXbert gộp xác suất positive + uncertain: nếu tổng xác suất >= 0.5 thì "
       "nhãn là dương; nếu thấp hơn 0.5 thì nhãn là âm (negative + blank). F1 là vi-F1 "
@@ -250,9 +271,17 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     metric_cols = [c for c in summary.columns
                    if c not in ("arm_id", "arm", "n") and not c.endswith("_sd")
                    and not c.endswith("_sd_subset")]
-    A(rc.score_table(summary, metric_cols, order=[a["id"] for a in arms]))
-    A("")
-    A("Tô đậm = tốt nhất mỗi cột (kể cả hòa); dòng nhỏ ± là độ lệch chuẩn giữa các ảnh.")
+    if is_post:
+        A(rc.score_table(summary, metric_cols, order=[a["id"] for a in arms]))
+        A("")
+        A("Tô đậm = tốt nhất mỗi cột (kể cả hòa); dòng nhỏ ± là độ lệch chuẩn giữa các ảnh.")
+    else:
+        MAIN = ["baseline_infer", "lora_only", "moe_shared_lora"]
+        A(rc.score_table(summary, metric_cols, order=[a["id"] for a in arms], main=MAIN))
+        A("")
+        A("Tô đậm = tốt nhất trong ba hệ thống chính **A, B, E** (E là mô hình đầy đủ; Recombinator "
+          "bắt buộc phải có với MoE). *Nghiêng* = bước trung gian B\\*, C, D giữa B và E, "
+          "không xếp hạng cùng ba hệ thống chính; dòng nhỏ ± là độ lệch chuẩn giữa các ảnh.")
     A("")
     A("## Bảng QDoRA vision — candidate nào được thích nghi bộ mã hóa ảnh")
     A("")
@@ -273,8 +302,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
     A(rc.tbl(["Mô hình", "QDoRA vision", "Phạm vi lớp", "Số module", "Recombinator",
               "MoE-LoRA"], vrows, ["l", "l", "l", "r", "c", "c"]))
     A("")
-    A("Cặp **B → B\\*** đo riêng đóng góp của QDoRA vision; cặp **B\\* → C** đo đóng góp của "
-      "Recombinator và đầu phân loại khi cả hai đã có QDoRA vision.")
+    if not is_post:
+        A("Cặp **B → B\\*** đo riêng đóng góp của QDoRA vision; cặp **B\\* → C** đo đóng góp của "
+          "Recombinator và đầu phân loại khi cả hai đã có QDoRA vision.")
     A("")
     A("## Bảng 2 — F1 CheXbert theo expert và bệnh cho từng candidate MoE")
     A("")
