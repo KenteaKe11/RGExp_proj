@@ -170,6 +170,47 @@ def main() -> int:
         if sub != [("baseline_infer", "lora_only")]:
             raise AssertionError(sub)
 
+    def test_expert_label_coverage_and_table():
+        import pandas as pd
+        from src import label_coverage as lc
+        from src.report_recomb import expert_cell, moe_expert_disease_f1
+
+        rng = np.random.default_rng(0)
+        names = [f"L{i}" for i in range(14)]
+        p = np.array([.3, .2, .1, .01, .05, .04, .03, .08, .02, .15, .005, .002, .2, .4])
+        pool = rng.random((20000, 14)) < p
+        train = rng.random((6400, 14)) < p
+        train[:, 10] = False
+        test = rng.random((3000, 14)) < p
+        test[:, 3] = False
+        tab = lc.coverage_table(train, test, names, 30, pool)
+        if "L3" not in lc.fails(tab):
+            raise AssertionError("nhãn có trong train nhưng 0 ca trong test phải THIẾU")
+        idx, _ = lc.select_expert_test(pool, 3000, 30, train, 42)
+        tab2 = lc.coverage_table(train, pool[idx], names, 30, pool)
+        if lc.fails(tab2) or len(set(idx.tolist())) != 3000:
+            raise AssertionError(f"test riêng vẫn lỗi: {lc.fails(tab2)}")
+        if int(tab2.loc[tab2.label == "L10", "test_pos"].iloc[0]) < 30:
+            raise AssertionError("nhãn ngoại vi train phải có mặt trong test riêng")
+        # bảng: tp + fn = 0 -> n/a (không phải 0.00), có fp -> n/a†
+        cols = {}
+        n = 4
+        for j in range(14):
+            for k in ("tp", "fp", "fn"):
+                cols[f"chexbert_label_{j:02d}_{k}"] = np.zeros(n)
+        cols["chexbert_label_00_tp"] = np.array([1., 0, 0, 0])
+        cols["chexbert_label_01_fp"] = np.array([1., 0, 0, 0])
+        cols["chexbert_label_02_fn"] = np.array([1., 0, 0, 0])
+        df = pd.DataFrame(cols)
+        df["route_experts"] = ["[0]", "[0]", "[0]", "[0]"]
+        cfg = {"arms": [{"id": "m", "moe": True, "n_experts": 1, "top_k": 1}]}
+        t = moe_expert_disease_f1({"m": df}, cfg, "m")
+        c = t.attrs["counts"]
+        from src.metrics import CHEXBERT_LABELS as CL
+        got = [expert_cell(c, 0, CL[j], t.iloc[0][CL[j]])[0] for j in range(4)]
+        if got != ["1.0000", "n/a†", "0.0000", "n/a"]:
+            raise AssertionError(got)
+
     def test_greedy_shared_with_section25():
         from src import decoding_spec
         from src.config import load_config
@@ -334,6 +375,7 @@ def main() -> int:
     check("default A,B,C + six arms when ablation enabled", test_arms_include_bstar)
     check("B* wiring: vision flag + resume check without a branch", test_bstar_vision_wiring)
     check("pre-declared contrasts + Holm over metrics", test_contrasts_declared)
+    check("độ phủ nhãn + test riêng cho Expert + ô n/a thay vì 0.00", test_expert_label_coverage_and_table)
     check("greedy decoding is the same spec as §2.5", test_greedy_shared_with_section25)
     check("§2.3 report: B*, QDoRA table, compact p-value matrix", test_report_23_end_to_end)
     check("Exp 3: extends §2.3, B₁ và C₂ không shared, 2 epoch / batch 16, report riêng", test_exp3_config_and_report)

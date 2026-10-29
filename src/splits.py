@@ -23,6 +23,33 @@ def _files(d: Path) -> list[Path]:
     return [d / f"{n}_split.csv" for n in NAMES]
 
 
+def load_meta_pid(cfg, patient_col: str | None = None):
+    """clean_dataset.csv -> DataFrame [key, ref, pid] (bỏ dòng thiếu report)."""
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+    from .config import hf_token
+
+    d = cfg.data
+    kc, rc = d["key_column"], d["ref_column"]
+    patient_col = patient_col or str(d.get("split_patient_col", "subject_id"))
+    meta_path = hf_hub_download(repo_id=d["repo"], repo_type=d.get("repo_type", "dataset"),
+                                filename=d["meta_csv"], token=hf_token())
+    head = pd.read_csv(meta_path, nrows=0).columns
+    meta = pd.read_csv(meta_path, usecols=[kc, rc] + ([patient_col] if patient_col in head else []))
+    meta[kc] = meta[kc].astype(str)
+    meta = meta[meta[rc].notna() & meta[rc].astype(str).str.strip().ne("")]
+    if patient_col in meta.columns:
+        pid = meta[patient_col].astype(str)
+    else:
+        pid = meta[kc].map(lambda k: (m.group(1) if (m := _PAT.search(k.replace("\\", "/"))) else None))
+    if pid.isna().any():
+        raise RuntimeError(f"Không suy ra được patient cho {int(pid.isna().sum())} key; "
+                           f"đặt data.split_patient_col cho đúng cột.")
+    out = pd.DataFrame({"key": meta[kc].to_numpy(), "ref": meta[rc].astype(str).to_numpy(),
+                        "pid": pid.to_numpy()})
+    return out
+
+
 def build_patient_split(cfg, out: Path, *, seed: int = 42, patient_col: str = "subject_id",
                         exclude_test_csv: str | None = None) -> dict:
     import numpy as np
@@ -108,7 +135,9 @@ def ensure_splits(cfg) -> Path:
 def resolve_split_file(cfg, filename: str) -> str:
     d = cfg.data
     if d.get("split_local_dir"):
-        p = ensure_splits(cfg) / Path(filename).name
+        p = Path(d["split_local_dir"]).expanduser() / Path(filename).name
+        if not p.exists():
+            p = ensure_splits(cfg) / Path(filename).name
         if not p.exists():
             raise FileNotFoundError(f"thiếu {p}")
         return str(p)

@@ -523,6 +523,19 @@ arms:
     capture_cls_head: false
     train_projector: false
     enabled: false  # ablation cũ; bật lại nếu muốn chạy đủ sáu arm
+# ── Bảng Expert: độ phủ nhãn và test riêng ───────────────────────────────────
+# Stage `expert` đếm ca dương CheXbert của từng nhãn ở train và test. Test chính
+# phải có >= min_pos_per_label ca dương cho mọi nhãn có trong train, và có cả nhãn
+# ngoại vi train nếu chúng tồn tại. Không đạt -> bốc lại test RIÊNG cho bảng Expert
+# từ patient chưa thuộc train/val (1 ảnh/patient), có quota ca dương mỗi nhãn.
+expert_eval:
+  enabled: true
+  min_pos_per_label: 30
+  n: 3000
+  pool_size: 20000
+  seed: 42
+  cache_dir: ./data/expert_eval
+
 metrics:
   normalize:
     lowercase: true

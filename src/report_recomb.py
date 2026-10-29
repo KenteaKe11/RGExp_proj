@@ -144,7 +144,7 @@ def moe_expert_disease_f1(scores: dict[str, pd.DataFrame], cfg,
             raw = json.loads(raw)
         assignments.append({int(e) for e in raw})
 
-    rows = []
+    rows, counts = [], {}
     for expert in range(n_experts):
         idx = np.asarray([expert in chosen for chosen in assignments], dtype=bool)
         row = {"expert": f"Expert {expert + 1}", "n_routed": int(idx.sum())}
@@ -153,9 +153,27 @@ def moe_expert_disease_f1(scores: dict[str, pd.DataFrame], cfg,
             fp = float(df.loc[idx, f"chexbert_label_{j:02d}_fp"].sum())
             fn = float(df.loc[idx, f"chexbert_label_{j:02d}_fn"].sum())
             den = 2 * tp + fp + fn
-            row[disease] = 2 * tp / den if den else float("nan")
+            counts[(expert, disease)] = (tp, fp, fn)
+            # Không có ca dương nào trong report gốc của các ảnh được chọn
+            # (tp + fn = 0): F1 KHÔNG xác định, không phải 0. Để NaN, ghi chú ở bảng.
+            row[disease] = 2 * tp / den if (den and (tp + fn) > 0) else float("nan")
         rows.append(row)
-    return pd.DataFrame(rows, columns=["expert", "n_routed", *CHEXBERT_LABELS])
+    out = pd.DataFrame(rows, columns=["expert", "n_routed", *CHEXBERT_LABELS])
+    out.attrs["counts"] = counts
+    return out
+
+
+def expert_cell(counts: dict, expert: int, disease: str, value) -> tuple[str, str]:
+    """(chuỗi hiển thị, mã chú thích) cho một ô expert × bệnh.
+
+    - có F1                               -> số, không chú thích
+    - tp + fn = 0, fp = 0                 -> "n/a"  (không ghi nhận: không ca dương, không dự đoán)
+    - tp + fn = 0, fp > 0                 -> "n/a†" (không có ca dương trong report gốc nhưng model đoán dương)
+    """
+    if value is not None and not (isinstance(value, float) and not np.isfinite(value)):
+        return _f(value), ""
+    tp, fp, fn = counts.get((expert, disease), (0.0, 0.0, 0.0))
+    return ("n/a†", "†") if fp > 0 else ("n/a", "n/a")
 
 
 def confidence_bootstrap(scores: dict[str, pd.DataFrame], cfg) -> pd.DataFrame:
@@ -187,7 +205,9 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                    train_stats: list[dict], names: dict[str, str],
                    manifest: dict,
                    confidence_summary: pd.DataFrame | None = None,
-                   moe_f1: dict[str, pd.DataFrame] | None = None) -> str:
+                   moe_f1: dict[str, pd.DataFrame] | None = None,
+                   expert_info: dict | None = None,
+                   coverage: dict[str, pd.DataFrame] | None = None) -> str:
     pw = normalize_pw(pw, float((cfg.get("stats") or {}).get("alpha", 0.05)))
     arms = [dict(a) for a in cfg.get("arms", []) if a.get("enabled", True)]
     stats_by_arm = {str(s.get("arm_id")): s for s in (train_stats or [])}
@@ -345,23 +365,70 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
             best_by_disease = {d: pd.to_numeric(moe_table[d], errors="coerce").max()
                                for d in CHEXBERT_LABELS}
             rows = []
-            for r in moe_table.to_dict("records"):
+            counts = moe_table.attrs.get("counts", {})
+            used_notes = set()
+            for ei, r in enumerate(moe_table.to_dict("records")):
                 vals = []
                 for disease in CHEXBERT_LABELS:
                     value = r[disease]
-                    rendered = _f(value)
+                    rendered, note = expert_cell(counts, ei, disease, value)
+                    if note:
+                        used_notes.add(note)
                     best = best_by_disease[disease]
-                    if value is not None and np.isfinite(value) and np.isfinite(best) \
-                            and np.isclose(float(value), float(best)):
+                    if not note and value is not None and np.isfinite(value) \
+                            and np.isfinite(best) and np.isclose(float(value), float(best)):
                         rendered = f"**{rendered}**"
                     vals.append(rendered)
                 rows.append([str(r["expert"]), str(r["n_routed"]), *vals])
+            # Dòng support: số ca dương trong report GỐC của toàn bộ ảnh dùng cho bảng.
+            sup = []
+            for disease in CHEXBERT_LABELS:
+                tot = sum(c[0] + c[2] for (ei, dz), c in counts.items() if dz == disease)
+                # mỗi ảnh được tính cho k expert -> chia k để ra số ca dương duy nhất
+                k = max(1, int(arm.get("top_k", 1)))
+                sup.append(int(round(tot / k)))
+            rows.append(["**Support (ca dương)**", "—", *[str(x) for x in sup]])
             A(_tbl(headers, rows))
+            A("")
+            A("Chú thích: **n/a** = nhãn *không được ghi nhận* ở các ảnh của expert này "
+              "(không có ca dương trong report gốc và model cũng không đoán dương), nên F1 "
+              "không xác định — không phải F1 = 0. **n/a†** = report gốc không có ca dương nhưng "
+              "model vẫn đoán dương (dương tính giả). `0.0000` chỉ dành cho nhãn CÓ ca dương "
+              "mà model bỏ sót hoàn toàn. Dòng Support là số ca dương (report gốc) duy nhất "
+              "của toàn bộ tập dùng cho bảng.")
             A("")
     else:
         A("Chưa có bảng expert × bệnh. Chạy lại infer MoE một lượt để lưu route_experts, "
           "rồi chạy score, stats và report.")
     A("")
+    if expert_info:
+        A("### Độ phủ nhãn và nguồn dữ liệu của bảng Expert")
+        A("")
+        A(f"- Nhãn **không có trong train** ({expert_info.get('n_train', '?')} mẫu): "
+          f"{', '.join(expert_info.get('not_in_train') or []) or 'không có'}.")
+        A(f"- Nhãn **không có trong test chính** ({expert_info.get('n_test', '?')} mẫu): "
+          f"{', '.join(expert_info.get('not_in_test') or []) or 'không có'}.")
+        A(f"- Yêu cầu: mỗi nhãn có trong train phải có ≥ {expert_info.get('min_pos_per_label')} ca "
+          "dương trong test, và nhãn ngoại vi train cũng phải xuất hiện nếu tồn tại. "
+          + ("Test chính **đạt** -> bảng Expert dùng test chính." if expert_info.get("source") == "test"
+             else "Test chính **không đạt** ("
+                  + ", ".join(expert_info.get("failing_labels") or []) + ") -> bảng Expert dùng "
+                  f"một tập test **bốc lại riêng** ({expert_info.get('expert_n')} ảnh / "
+                  f"{expert_info.get('expert_patients')} patient, không trùng patient train/val); "
+                  "mọi bảng khác vẫn dùng test chính."))
+        if expert_info.get("pool_short"):
+            A("- Pool không đủ quota cho: " + ", ".join(
+                f"{k} ({v[0]}/{v[1]})" for k, v in expert_info["pool_short"].items()) + ".")
+        A("")
+        for key, title in (("test", "Test chính"), ("expert", "Test riêng cho Expert")):
+            cov = (coverage or {}).get(key)
+            if cov is not None and not cov.empty:
+                A(f"**{title}**")
+                A("")
+                A(_tbl(["Nhãn", "Train (+)", "Test (+)", "Tình trạng"],
+                       [[r["label"], str(r["train_pos"]), str(r["test_pos"]), r["status"]]
+                        for r in cov.to_dict("records")]))
+                A("")
     A("## Bảng 3 — Độ tự tin của báo cáo sinh")
     A("")
     if confidence_summary is not None and not confidence_summary.empty:
@@ -455,8 +522,21 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
     pw = normalize_pw(pw, float((cfg.get("stats") or {}).get("alpha", 0.05)))
     summary = summary_table(scores, names, metrics, cfg)
     summary.to_csv(mdir / "summary.csv", index=False)
+    expert_info, coverage, expert_scores = None, {}, {}
+    ei_path = mdir / "expert_eval.json"
+    if ei_path.exists():
+        expert_info = json.loads(ei_path.read_text(encoding="utf-8"))
+        for key, fn in (("test", "label_coverage_test.csv"),
+                        ("expert", "label_coverage_expert.csv")):
+            if (mdir / fn).exists():
+                coverage[key] = pd.read_csv(mdir / fn)
+        if expert_info.get("source") == "redrawn":
+            for arm in (cfg.get("arms") or []):
+                f = mdir / f"per_sample_expert_{arm.get('id')}.csv"
+                if arm.get("moe") and f.exists():
+                    expert_scores[arm["id"]] = pd.read_csv(f)
     moe_f1 = {
-        arm["id"]: moe_expert_disease_f1(scores, cfg, arm["id"])
+        arm["id"]: moe_expert_disease_f1(expert_scores or scores, cfg, arm["id"])
         for arm in (cfg.get("arms") or []) if arm.get("moe")
     }
     moe_f1_files = set()
@@ -483,7 +563,8 @@ def write_all(cfg, run_dir: Path, scores: dict[str, pd.DataFrame],
 
     manifest["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     md = build_markdown(cfg, summary, pw, train_stats, names, manifest,
-                        confidence_summary=confidence, moe_f1=moe_f1)
+                        confidence_summary=confidence, moe_f1=moe_f1,
+                        expert_info=expert_info, coverage=coverage)
     path = run_dir / "REPORT.md"
     path.write_text(md, encoding="utf-8")
     (run_dir / "manifest.json").write_text(

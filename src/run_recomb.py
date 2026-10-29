@@ -75,7 +75,7 @@ from .config import (Cfg, add_common_args, hf_token, load_config,
                      resolved_snapshot, seed_everything)
 from .tracking import Tracker
 
-STAGES = ["data", "train", "infer", "score", "stats", "report", "push"]
+STAGES = ["data", "train", "infer", "score", "expert", "stats", "report", "push"]
 EXPERIMENTS = ("2.3", "2.4", "3")
 # §2.3/§2.4 đã chốt; `configs/` nay chỉ còn MỘT file (section25.yaml) và file
 # ấy không có `arms`/`arms_moe`/`stats.friedman`. Điểm vào này đọc bản ghi.
@@ -997,6 +997,23 @@ def main(argv: list[str] | None = None) -> int:
             p = mdir / f"per_sample_{arm['id']}.csv"
             if p.exists():
                 scores[arm["id"]] = pd.read_csv(p)
+
+    # ── expert: độ phủ nhãn train/test + test riêng cho bảng Expert ────────────
+    expert_info = None
+    if "expert" in stages and scores and any(x.get("moe") for x in arms):
+        _hr("Độ phủ nhãn + test riêng cho Expert")
+        from . import expert_eval
+
+        try:
+            expert_info = expert_eval.run(cfg, run_dir, arms, adapter_root, tracker,
+                                          scores, arm_model_cfg)
+            manifest["expert_eval"] = expert_info
+        except Exception as e:  # noqa: BLE001 — bảng phụ, không được giết cả lần chạy
+            import traceback
+
+            print(f"  ⚠ stage expert lỗi ({e!r}); bảng Expert dùng test chính.\n"
+                  + traceback.format_exc()[-1200:], flush=True)
+            manifest["expert_eval_error"] = repr(e)
 
     want_ids = [x["id"] for x in arms]
     missing = [i for i in want_ids if i not in scores]
