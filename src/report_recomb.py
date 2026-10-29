@@ -163,6 +163,23 @@ def moe_expert_disease_f1(scores: dict[str, pd.DataFrame], cfg,
     return out
 
 
+NO_LABEL = "∅"      # cột toàn 0/n/a và KHÔNG có ca dương nào trong report gốc
+NOT_RECOGNISED = "✗"  # cột toàn 0/n/a nhưng CÓ ca dương và model không nhận ra ca nào
+
+
+def expert_column_state(values, support: int) -> str:
+    """Trạng thái của một CỘT bệnh trong bảng Expert: '' | '∅' | '✗'.
+
+    Cột mà mọi expert đều 0 (hoặc không xác định) chỉ có HAI trạng thái: không có
+    nhãn (support = 0) hoặc không được nhận (support > 0, model không bắt được ca nào).
+    Số 0.00 lẻ loi trong cột có giá trị khác vẫn là 0.00 thật và được in nguyên.
+    """
+    v = np.asarray([np.nan if x is None else float(x) for x in values], dtype=float)
+    if np.all(~np.isfinite(v) | (v == 0)):
+        return NO_LABEL if int(support) == 0 else NOT_RECOGNISED
+    return ""
+
+
 def expert_cell(counts: dict, expert: int, disease: str, value) -> tuple[str, str]:
     """(chuỗi hiển thị, mã chú thích) cho một ô expert × bệnh.
 
@@ -367,28 +384,37 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
             rows = []
             counts = moe_table.attrs.get("counts", {})
             used_notes = set()
+            k_top = max(1, int(arm.get("top_k", 1)))
+            sup_by = {}
+            for disease in CHEXBERT_LABELS:
+                tot = sum(c[0] + c[2] for (ei_, dz), c in counts.items() if dz == disease)
+                sup_by[disease] = int(round(tot / k_top))
+            col_state = {d: expert_column_state(moe_table[d].tolist(), sup_by[d])
+                         for d in CHEXBERT_LABELS}
             for ei, r in enumerate(moe_table.to_dict("records")):
                 vals = []
                 for disease in CHEXBERT_LABELS:
+                    if col_state[disease]:
+                        vals.append(col_state[disease])
+                        continue
                     value = r[disease]
                     rendered, note = expert_cell(counts, ei, disease, value)
                     if note:
                         used_notes.add(note)
                     best = best_by_disease[disease]
-                    if not note and value is not None and np.isfinite(value) \
+                    # KHÔNG BAO GIỜ in đậm 0.00: chỉ tô khi giá trị tốt nhất > 0.
+                    if not note and value is not None and np.isfinite(value) and value > 0 \
                             and np.isfinite(best) and np.isclose(float(value), float(best)):
                         rendered = f"**{rendered}**"
                     vals.append(rendered)
                 rows.append([str(r["expert"]), str(r["n_routed"]), *vals])
-            # Dòng support: số ca dương trong report GỐC của toàn bộ ảnh dùng cho bảng.
-            sup = []
-            for disease in CHEXBERT_LABELS:
-                tot = sum(c[0] + c[2] for (ei, dz), c in counts.items() if dz == disease)
-                # mỗi ảnh được tính cho k expert -> chia k để ra số ca dương duy nhất
-                k = max(1, int(arm.get("top_k", 1)))
-                sup.append(int(round(tot / k)))
-            rows.append(["**Support (ca dương)**", "—", *[str(x) for x in sup]])
+            rows.append(["**Support (ca dương)**", "—",
+                         *[str(sup_by[d]) for d in CHEXBERT_LABELS]])
             A(_tbl(headers, rows))
+            A("")
+            A(f"Cột toàn 0 chỉ có hai trạng thái: **{NO_LABEL}** = không có nhãn (report gốc "
+              f"không có ca dương nào) và **{NOT_RECOGNISED}** = không được nhận (có ca dương "
+              "nhưng không expert nào bắt được). Giá trị 0.0000 không bao giờ được in đậm.")
             A("")
             A("Chú thích: **n/a** = nhãn *không được ghi nhận* ở các ảnh của expert này "
               "(không có ca dương trong report gốc và model cũng không đoán dương), nên F1 "

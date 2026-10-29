@@ -30,6 +30,7 @@ liệu vì thế giống hệt như chạy nguyên batch.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import time
@@ -99,6 +100,95 @@ def _loader(ds, batch_size: int, shuffle: bool, cfg: Cfg, seed: int = 42):
 
 
 # ── siêu tham số của main-stage, đọc từ setup gốc ──────────────────────────
+def divisor_ladder(eff: int, top: int = 64) -> list[int]:
+    """Micro-batch hợp lệ cho một batch hiệu dụng `eff`, giảm dần từ <= `top`.
+
+    Chỉ lấy ước của `eff`: micro × accum phải BẰNG `eff` — micro không chia hết thì
+    batch hiệu dụng bị đổi lặng lẽ (vd 80 chia 64 -> 2×64 = 128), mà §2.5 cấm đổi.
+    """
+    eff = max(1, int(eff))
+    return sorted((d for d in range(1, min(eff, int(top)) + 1) if eff % d == 0),
+                  reverse=True)
+
+
+class MicroProbe:
+    """Bậc micro-batch hiện tại của MỘT stage; `down()` hạ một bậc khi OOM."""
+
+    def __init__(self, eff: int, top: int = 64, enabled: bool = True,
+                 fixed: int | None = None):
+        self.eff = max(1, int(eff))
+        self.ladder = (divisor_ladder(self.eff, top) if enabled
+                       else [max(1, min(int(fixed or 1), self.eff))])
+        self.i = 0
+
+    @property
+    def micro(self) -> int:
+        return self.ladder[self.i]
+
+    @property
+    def accum(self) -> int:
+        return max(1, math.ceil(self.eff / self.micro))
+
+    def down(self) -> bool:
+        if self.i + 1 >= len(self.ladder):
+            return False
+        self.i += 1
+        return True
+
+
+def _to_cpu(obj):
+    import torch
+
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu(v) for v in obj)
+    return copy.deepcopy(obj)
+
+
+def _train_epoch_probe(model, ds, optim, sched, cfg: Cfg, device, probe: MicroProbe,
+                       tag: str, seed: int, **kw) -> dict:
+    """Một epoch với dò micro-batch: OOM -> dọn VRAM, khôi phục model + optimizer về
+    đầu epoch, hạ một bậc micro-batch (accum tăng bù, batch hiệu dụng KHÔNG đổi) rồi
+    chạy lại epoch."""
+    snap = (_to_cpu(model.state_dict()), _to_cpu(optim.state_dict()))
+    while True:
+        loader = _loader(ds, probe.micro, True, cfg, seed=seed)
+        try:
+            return _train_epoch(model, loader, optim, sched, cfg, device,
+                                probe.accum, tag=tag, **kw)
+        except Exception as e:
+            if not is_oom(e) or not probe.down():
+                raise
+            del e
+            optim.zero_grad(set_to_none=True)
+            free_vram()
+            model.load_state_dict(snap[0])
+            optim.load_state_dict(snap[1])
+            print(f"    OOM ở micro-batch {probe.ladder[probe.i - 1]} ({tag}); "
+                  f"hạ xuống {probe.micro} × accum {probe.accum} "
+                  f"(batch hiệu dụng {probe.eff} giữ nguyên) và chạy lại epoch.",
+                  flush=True)
+
+
+def _evaluate_probe(state: dict, model, tok, val_df, cfg: Cfg, device, dcfg: dict,
+                    monitor: str):
+    """`_evaluate` với dò batch sinh 64 -> 1; bậc đã hạ được giữ qua các epoch."""
+    sizes = state.setdefault("sizes", [64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1])
+    while True:
+        try:
+            return _evaluate(model, tok, val_df, cfg, device, dcfg, monitor, sizes[0])
+        except Exception as e:
+            if not is_oom(e) or len(sizes) < 2:
+                raise
+            del e
+            free_vram()
+            print(f"    OOM ở batch sinh val {sizes[0]}; hạ xuống {sizes[1]}.", flush=True)
+            sizes.pop(0)
+
+
 def main_stage_spec(name: str, mcfg: dict) -> dict:
     """Chép ra đúng những con số main-stage cần, từ `sota.<name>.fine_tuning`.
 
@@ -288,6 +378,11 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
                    "tokenizer": tok.stats(), **count_params(model)}
 
     micro = max(1, int(stcfg.get("micro_batch", 8)))
+    # Dò micro-batch tự động cho TỪNG stage: bắt đầu từ ước lớn nhất của batch hiệu
+    # dụng không vượt `micro_batch_max` (64), OOM thì hạ dần tới 1; batch hiệu dụng
+    # không đổi (accum bù lại). Tắt bằng `sota_train.micro_batch_probe: false`.
+    probe_on = bool(stcfg.get("micro_batch_probe", True))
+    probe_top = int(stcfg.get("micro_batch_max", 64))
     eval_every = max(1, int(stcfg.get("eval_every", 1)))
     has_val = val_df is not None and len(val_df) > 0
     t0 = time.time()
@@ -298,12 +393,11 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         p_bs = int(pcfg.get("per_device_batch_size", 16))
         p_accum = int(pcfg.get("grad_accum", 2))
         eff = p_bs * p_accum
-        micro0 = min(micro, p_bs)
-        accum0 = max(1, math.ceil(eff / micro0))
+        probe0 = MicroProbe(eff, top=probe_top, enabled=probe_on, fixed=min(micro, p_bs))
+        micro0, accum0 = probe0.micro, probe0.accum
         p_sched = dict(pcfg.get("schedule", {}) or {})
         n_ep0 = int(pcfg.get("n_epochs", 8))
         ds_tr = SotaDataset(train_df, tok, cfg)
-        loader0 = _loader(ds_tr, micro0, True, cfg, seed=int(cfg.get("seed", 42)))
         steps_per_epoch = max(1, math.ceil(len(ds_tr) / eff))
         opt0 = _optimizer(model, 0.0, float(p_sched.get("max_lr", 3e-4)),
                           {"betas": (0.9, 0.999),
@@ -331,10 +425,10 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         gstep = 0
         s0_losses = []
         for ep in range(n_ep0):
-            r = _train_epoch(model, loader0, opt0, None, cfg, device, accum0,
-                             lr_fn=lr_fn0, global_step=gstep, tracker=tracker,
-                             tag=f"{aid}/stage0",
-                             max_steps=max_steps_override)
+            r = _train_epoch_probe(model, ds_tr, opt0, None, cfg, device, probe0,
+                                   f"{aid}/stage0", int(cfg.get("seed", 42)),
+                                   lr_fn=lr_fn0, global_step=gstep, tracker=tracker,
+                                   max_steps=max_steps_override)
             gstep += r["steps"]
             s0_losses.append(r["loss"])
             print(f"    stage0 epoch {ep + 1}/{n_ep0} · loss {r['loss']:.4f}",
@@ -342,7 +436,8 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
             if max_steps_override is not None:
                 break
         stats["stage0"] = {"epochs": len(s0_losses), "loss": s0_losses,
-                           "effective_batch": eff, "micro_batch": micro0,
+                           "effective_batch": eff, "micro_batch": probe0.micro,
+                           "micro_batch_ladder": probe0.ladder,
                            "max_lr": max_lr0,
                            "weight_decay": float(pcfg.get("weight_decay", 0.05))}
         torch.save({"model": model.state_dict(), "stage": 0},
@@ -351,9 +446,10 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         # ── MAIN-STAGE — điều kiện 1, setup gốc ────────────────────────────
         info = model.set_stage(2)
         mult = float((cfg.get("train", {}) or {}).get("pretrained_lr_mult", 0.1))
-        micro1 = min(micro, spec["batch_size"])
-        accum1 = max(1, math.ceil(spec["batch_size"] / micro1))
-        loader1 = _loader(ds_tr, micro1, True, cfg, seed=int(cfg.get("seed", 42)))
+        probe1 = MicroProbe(spec["batch_size"], top=probe_top, enabled=probe_on,
+                            fixed=min(micro, spec["batch_size"]))
+        micro1, accum1 = probe1.micro, probe1.accum
+        eval_state: dict = {}
         opt1 = _optimizer(model, spec["lr_visual"], spec["lr_rest"], spec, mult)
         sch = spec.get("scheduler") or {}
         sched1 = None
@@ -373,17 +469,17 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         bad = 0
         history = []
         for ep in range(n_ep1):
-            r = _train_epoch(model, loader1, opt1, None, cfg, device, accum1,
-                             tracker=tracker, tag=f"{aid}/main",
-                             max_steps=max_steps_override)
+            r = _train_epoch_probe(model, ds_tr, opt1, None, cfg, device, probe1,
+                                   f"{aid}/main", int(cfg.get("seed", 42)),
+                                   tracker=tracker, max_steps=max_steps_override)
             if sched1 is not None:
                 sched1.step()          # StepLR của R2Gen đếm theo EPOCH
             row = {"epoch": ep + 1, "loss": r["loss"],
                    **{k: v for k, v in r.items() if k not in ("loss", "steps")}}
             score = None
             if has_val and ((ep + 1) % eval_every == 0 or ep == n_ep1 - 1):
-                score, _ = _evaluate(model, tok, val_df, cfg, device, dcfg,
-                                     spec["monitor"], micro1)
+                score, _ = _evaluate_probe(eval_state, model, tok, val_df, cfg, device,
+                                           dcfg, spec["monitor"])
                 row[spec["monitor"]] = score
             history.append(row)
             msg = f"    main epoch {ep + 1}/{n_ep1} · loss {r['loss']:.4f}"
@@ -424,7 +520,8 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
         stats.update({
             "main_stage": {"epochs_run": len(history),
                            "effective_batch": spec["batch_size"],
-                           "micro_batch": micro1,
+                           "micro_batch": probe1.micro,
+                           "micro_batch_ladder": probe1.ladder,
                            "lr_visual": spec["lr_visual"],
                            "lr_rest_paper": spec["lr_rest"],
                            "pretrained_lr_mult": mult,

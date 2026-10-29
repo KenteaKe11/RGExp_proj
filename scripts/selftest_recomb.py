@@ -210,6 +210,13 @@ def main() -> int:
         got = [expert_cell(c, 0, CL[j], t.iloc[0][CL[j]])[0] for j in range(4)]
         if got != ["1.0000", "n/a†", "0.0000", "n/a"]:
             raise AssertionError(got)
+        from src.report_recomb import expert_column_state
+        if expert_column_state([0.0, float("nan"), 0.0], 0) != "∅":
+            raise AssertionError("cột toàn 0, không ca dương -> không có nhãn")
+        if expert_column_state([0.0, 0.0, float("nan")], 12) != "✗":
+            raise AssertionError("cột toàn 0, có ca dương -> không được nhận")
+        if expert_column_state([0.0, 0.3], 12) != "":
+            raise AssertionError("0.00 lẻ trong cột có giá trị khác không phải cột toàn 0")
 
     def test_greedy_shared_with_section25():
         from src import decoding_spec

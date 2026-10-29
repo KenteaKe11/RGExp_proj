@@ -171,6 +171,9 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path, run_dir: Path) -> Cfg
         # (khối `generate:` chung). Batch của khâu SINH: beam nhân số chuỗi lên
         # `num_beams` lần, nên con số an toàn ở đây nhỏ hơn micro_batch.
         "batch_size": max(1, int(st.get("infer_batch", st.get("micro_batch", 8)))),
+        "batch_probe": True,
+        "batch_probe_sizes": [x for x in (64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1)
+                              if x <= max(1, int(st.get("infer_batch", 64)))],
         "disable_compile": True, "optional": False,
     })
 

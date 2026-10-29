@@ -623,8 +623,10 @@ pretrain:
 # Hạ `batch_size` trong khối `sota:` thì mới là đổi thí nghiệm — và khối ấy
 # không được chạm vào.
 sota_train:
-  micro_batch: 8
-  infer_batch: 4          # beam nhân số chuỗi lên beam_size lần
+  micro_batch: 8          # chỉ dùng khi micro_batch_probe: false
+  micro_batch_probe: true # dò tự động từng stage: micro-batch lớn nhất <= micro_batch_max (là ước của batch hiệu dụng), OOM -> hạ dần tới 1
+  micro_batch_max: 64
+  infer_batch: 64         # điểm bắt đầu dò batch sinh (infer + val): 64 -> 1 khi OOM
   eval_every: 1           # chấm val sau mỗi epoch (dừng sớm đọc con số này)
   amp: true               # bf16 nếu card có; không có thì fp32, KHÔNG fp16
   num_workers: 4
