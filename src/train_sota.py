@@ -93,10 +93,37 @@ def _loader(ds, batch_size: int, shuffle: bool, cfg: Cfg, seed: int = 42):
     g = torch.Generator()
     g.manual_seed(int(seed))
     nw = int((cfg.get("sota_train", {}) or {}).get("num_workers", 2))
+    _raise_fd_limit()
+    # persistent_workers=False: loader được tạo lại mỗi epoch/lần đánh giá/lần dò batch;
+    # worker "persistent" không được giải phóng kịp -> rò file descriptor ("Too many open files").
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=nw, collate_fn=collate_sota, generator=g,
                       drop_last=False, pin_memory=True,
-                      persistent_workers=bool(nw))
+                      persistent_workers=False)
+
+
+_FD_DONE = False
+
+
+def _raise_fd_limit() -> None:
+    """Nâng giới hạn file descriptor mềm lên mức cứng và dùng chia sẻ tensor qua file_system."""
+    global _FD_DONE
+    if _FD_DONE:
+        return
+    _FD_DONE = True
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard != resource.RLIM_INFINITY else 65536
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except Exception:
+        pass
+    try:
+        import torch.multiprocessing as tmp
+        tmp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
 
 
 # ── siêu tham số của main-stage, đọc từ setup gốc ──────────────────────────
@@ -164,6 +191,7 @@ def _train_epoch_probe(model, ds, optim, sched, cfg: Cfg, device, probe: MicroPr
                 raise
             del e
             optim.zero_grad(set_to_none=True)
+            loader = None  # nhả iterator + worker của loader bỏ dở trước khi dọn
             free_vram()
             model.load_state_dict(snap[0])
             optim.load_state_dict(snap[1])
