@@ -164,19 +164,23 @@ def moe_expert_disease_f1(scores: dict[str, pd.DataFrame], cfg,
 
 
 NO_LABEL = "∅"      # cột toàn 0/n/a và KHÔNG có ca dương nào trong report gốc
-NOT_RECOGNISED = "✗"  # cột toàn 0/n/a nhưng CÓ ca dương và model không nhận ra ca nào
+NO_TRAIN = "⊘"      # cột toàn 0/n/a, có ca dương ở test nhưng tập train KHÔNG có nhãn này
+NOT_RECOGNISED = "✗"  # cột toàn 0/n/a, train có nhãn, test có ca dương, model không nhận ra ca nào
 
 
-def expert_column_state(values, support: int) -> str:
-    """Trạng thái của một CỘT bệnh trong bảng Expert: '' | '∅' | '✗'.
+def expert_column_state(values, support: int, train_pos: int | None = None) -> str:
+    """Trạng thái của một CỘT bệnh trong bảng Expert: '' | '∅' | '⊘' | '✗'.
 
-    Cột mà mọi expert đều 0 (hoặc không xác định) chỉ có HAI trạng thái: không có
-    nhãn (support = 0) hoặc không được nhận (support > 0, model không bắt được ca nào).
+    Cột mà mọi expert đều 0 (hoặc không xác định) chỉ có BA trạng thái:
+    ∅ không có nhãn (support = 0); ⊘ không được nhận vì train không có nhãn
+    (support > 0, train_pos = 0); ✗ không được nhận dù train có (model bỏ sót hết).
     Số 0.00 lẻ loi trong cột có giá trị khác vẫn là 0.00 thật và được in nguyên.
     """
     v = np.asarray([np.nan if x is None else float(x) for x in values], dtype=float)
     if np.all(~np.isfinite(v) | (v == 0)):
-        return NO_LABEL if int(support) == 0 else NOT_RECOGNISED
+        if int(support) == 0:
+            return NO_LABEL
+        return NO_TRAIN if (train_pos is not None and int(train_pos) == 0) else NOT_RECOGNISED
     return ""
 
 
@@ -389,8 +393,21 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
             for disease in CHEXBERT_LABELS:
                 tot = sum(c[0] + c[2] for (ei_, dz), c in counts.items() if dz == disease)
                 sup_by[disease] = int(round(tot / k_top))
-            col_state = {d: expert_column_state(moe_table[d].tolist(), sup_by[d])
+            _cv = (coverage or {}).get("expert")
+            if _cv is None:
+                _cv = (coverage or {}).get("test")
+            train_by = ({str(r_["label"]): int(r_["train_pos"]) for r_ in _cv.to_dict("records")}
+                        if _cv is not None and "train_pos" in _cv else {})
+            col_state = {d: expert_column_state(moe_table[d].tolist(), sup_by[d], train_by.get(d))
                          for d in CHEXBERT_LABELS}
+            second_by = {}
+            for d_ in CHEXBERT_LABELS:
+                col = pd.to_numeric(moe_table[d_], errors="coerce").to_numpy(dtype=float)
+                top = best_by_disease[d_]
+                rest = col[np.isfinite(col) & (col > 0) & ~np.isclose(col, top if np.isfinite(top) else -1.0)]
+                # 4 ô ngay sau top 1 (hạng 2-5); hòa ở biên thì cùng được gạch chân.
+                rest = np.sort(rest)[::-1]
+                second_by[d_] = float(rest[min(3, rest.size - 1)]) if rest.size else float("nan")
             for ei, r in enumerate(moe_table.to_dict("records")):
                 vals = []
                 for disease in CHEXBERT_LABELS:
@@ -406,15 +423,23 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
                     if not note and value is not None and np.isfinite(value) and value > 0 \
                             and np.isfinite(best) and np.isclose(float(value), float(best)):
                         rendered = f"**{rendered}**"
+                    elif not note and value is not None and np.isfinite(value) and value > 0 \
+                            and np.isfinite(second_by[disease]) \
+                            and (float(value) >= second_by[disease]
+                                 or np.isclose(float(value), second_by[disease])):
+                        rendered = f"<u>{rendered}</u>"   # hạng 2 của bệnh (sau top 1)
                     vals.append(rendered)
                 rows.append([str(r["expert"]), str(r["n_routed"]), *vals])
             rows.append(["**Support (ca dương)**", "—",
                          *[str(sup_by[d]) for d in CHEXBERT_LABELS]])
             A(_tbl(headers, rows))
             A("")
-            A(f"Cột toàn 0 chỉ có hai trạng thái: **{NO_LABEL}** = không có nhãn (report gốc "
-              f"không có ca dương nào) và **{NOT_RECOGNISED}** = không được nhận (có ca dương "
-              "nhưng không expert nào bắt được). Giá trị 0.0000 không bao giờ được in đậm.")
+            A(f"Cột toàn 0 chỉ có ba trạng thái: **{NO_LABEL}** = không có nhãn (report gốc "
+              f"không có ca dương nào); **{NO_TRAIN}** = không được nhận vì tập train không có "
+              f"nhãn này (test có ca dương); **{NOT_RECOGNISED}** = không được nhận dù train có "
+              "nhãn (test có ca dương nhưng không expert nào bắt được). "
+              "Giá trị 0.0000 không bao giờ được in đậm. **Đậm** = top 1 mỗi bệnh; "
+              "<u>gạch chân</u> = 4 ô theo sau top 1 của bệnh đó (hạng 2–5, chỉ tính giá trị > 0).")
             A("")
             A("Chú thích: **n/a** = nhãn *không được ghi nhận* ở các ảnh của expert này "
               "(không có ca dương trong report gốc và model cũng không đoán dương), nên F1 "
