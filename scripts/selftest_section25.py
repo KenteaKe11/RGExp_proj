@@ -81,8 +81,13 @@ def t_arms_valid():
     assert kinds["moe_lora"] == "ours" and kinds["r2gen"] == "sota"
     assert kinds["adaatt"] == "sota"
     e = next(a for a in arms if a["id"] == "moe_lora")
-    assert e.get("reuse_only") is True and e.get("moe") is True, e
-    assert e.get("predictions_from_hub", {}).get("subdir"), "E phải khai predictions_from_hub"
+    assert e.get("moe") is True and not e.get("reuse_only"), "C được train lại trong §2.5"
+    assert not e.get("predictions_from_hub"), "C không kéo predictions từ §2.3 nữa"
+    tr = CFG["train"]
+    assert int(tr["effective_batch_size"]) == 32 and int(tr["n_epochs"]) == 4
+    assert int(tr["steps_per_epoch"]) == 100 and tr["epoch_split"] is True
+    assert int(CFG["pretrain"]["n_epochs"]) == 6 and int(CFG["pretrain"]["n_train"]) == 6400
+    assert CFG["train"]["vision_adapter"]["enabled"] is True
 
 
 def t_arm_flags_are_mandatory():

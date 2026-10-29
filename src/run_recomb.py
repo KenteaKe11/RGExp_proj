@@ -58,7 +58,7 @@ một chỗ rò trạng thái, và nó là lỗi.
 """
 from __future__ import annotations
 
-from .batch_ladder import resolve_ladder
+from .batch_ladder import clear_vram, resolve_ladder
 import argparse
 import json
 import math
@@ -379,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
 
+    clear_vram("khởi động pipeline (dọn pipeline cũ)")
     cfg = load_config(a.config, a.overrides)
 
     # ── Chọn thí nghiệm ────────────────────────────────────────────────────
@@ -637,6 +638,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n── {arm.get('name', arm['id'])}: dùng predictions từ Hub, "
                   f"bỏ qua infer ──", flush=True)
             return None
+        clear_vram("pipeline trước đã xong -> dọn trước infer")
         mcfg = arm_model_cfg(cfg, arm, adapter_root)
         print(f"\n── {arm.get('name', arm['id'])} ({mcfg['runner']}) ──", flush=True)
         t0 = time.time()

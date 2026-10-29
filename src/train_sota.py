@@ -207,6 +207,18 @@ def _evaluate_probe(state: dict, model, tok, val_df, cfg: Cfg, device, dcfg: dic
     from .batch_ladder import auto_ladder
     sizes = state.setdefault("sizes", auto_ladder(int((cfg.get("sota_train") or {})
                                                         .get("infer_batch", 512))))
+    if not state.get("planned"):
+        state["planned"] = True
+        try:
+            from .batch_ladder import VramPlanner, trim_ladder
+            pl = VramPlanner()
+            if pl.begin("trước val/infer") and len(val_df) > 0:
+                n_cal = min(4, len(val_df))
+                _evaluate(model, tok, val_df.iloc[:n_cal], cfg, device, dcfg, monitor, n_cal)
+                sizes[:] = trim_ladder(sizes, pl.cap(n_cal))
+        except Exception as e:  # hiệu chỉnh chỉ để tối ưu; lỗi/OOM thì dùng thang cũ
+            free_vram()
+            print(f"    (bỏ qua hiệu chỉnh VRAM: {type(e).__name__})", flush=True)
     while True:
         try:
             return _evaluate(model, tok, val_df, cfg, device, dcfg, monitor, sizes[0])

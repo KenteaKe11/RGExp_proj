@@ -6,7 +6,7 @@ trained or pulled automatically. The statistical protocol follows §2.3.
 
 from __future__ import annotations
 
-from .batch_ladder import auto_ladder
+from .batch_ladder import auto_ladder, clear_vram
 import argparse
 import json
 import platform
@@ -146,6 +146,75 @@ def train_order(arms: list[dict]) -> list[dict]:
                                        str(a["id"])))
 
 
+def resolve_c_pretrain(cfg: Cfg, config_path: str, dry: bool = False,
+                       no_wandb: bool = False, no_push: bool = False) -> str | None:
+    """Nhánh đã pretrain cho Candidate C -> đường dẫn ckpt, hoặc None (không pretrain).
+
+    `train.pretrain_source`:
+      none | off        -> không pretrain (decoder_ft từ khởi tạo ngẫu nhiên)
+      auto (mặc định)   -> ckpt cục bộ ĐỦ `pretrain.n_epochs` epoch
+                           -> bản trên Hub (`pretrain.hub_repo`) ĐỦ epoch
+                           -> tự chạy `python -m src.run_pretrain` (6 epoch) rồi dùng bản đó
+      <đường dẫn> | hub:OWNER/NAME[/SUBDIR][@rev] -> dùng đúng nguồn đó
+    """
+    import subprocess
+
+    from . import pretrain_io
+
+    src = str((cfg.get("train") or {}).get("pretrain_source", "auto")).strip()
+    if src.lower() in ("", "none", "off", "false"):
+        print("⚙ Candidate C: KHÔNG pretrain (train.pretrain_source = none).", flush=True)
+        return None
+    if dry:
+        print("⚙ DRY-RUN: bỏ qua pretrain của Candidate C.", flush=True)
+        return None
+    p = dict(cfg.get("pretrain") or {})
+    want = int(p.get("n_epochs", 6))
+    if src.lower() != "auto":
+        d = pretrain_io.resolve_source(src)
+        print(f"⚙ Candidate C: nhánh pretrain từ {d}", flush=True)
+        return str(d)
+
+    def _done(meta: dict) -> bool:
+        return int(meta.get("epoch") or 0) >= want
+
+    local = (Path(cfg["output"].get("dir", "./runs")) / str(p.get("subdir", "sup_pretrain"))
+             / "ckpt" / "latest")
+    if pretrain_io.pretrain_exists(local):
+        meta = pretrain_io.read_meta(local)
+        if _done(meta):
+            print(f"⚙ Candidate C: dùng pretrain cục bộ {local} (epoch {meta.get('epoch')}/{want})",
+                  flush=True)
+            return str(local)
+        print(f"⚙ pretrain cục bộ mới tới epoch {meta.get('epoch')}/{want} — chạy tiếp.", flush=True)
+    else:
+        try:
+            d, meta, sub = pretrain_io.latest_on_hub(cfg)
+            if _done(meta):
+                print(f"⚙ Candidate C: dùng pretrain từ Hub ({sub or '.'}, epoch "
+                      f"{meta.get('epoch')}/{want})", flush=True)
+                return str(d)
+            print(f"⚙ pretrain trên Hub mới tới epoch {meta.get('epoch')}/{want} — chạy lại.",
+                  flush=True)
+        except Exception as e:
+            print(f"⚙ chưa có pretrain trên Hub ({type(e).__name__}) — tự chạy pretrain "
+                  f"{want} epoch.", flush=True)
+    cmd = [sys.executable, "-m", "src.run_pretrain", "--config", str(config_path)]
+    if no_wandb:
+        cmd.append("--no-wandb")
+    if no_push:
+        cmd.append("--no-push")
+    print("⚙ chạy pretrain: " + " ".join(cmd), flush=True)
+    clear_vram("trước pretrain")
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise RuntimeError(f"run_pretrain thoát với mã {rc}; Candidate C không có nhánh pretrain.")
+    if not pretrain_io.pretrain_exists(local):
+        raise RuntimeError(f"pretrain chạy xong nhưng không thấy ckpt ở {local}")
+    clear_vram("sau pretrain")
+    return str(local)
+
+
 def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path, run_dir: Path) -> Cfg:
     """Cấu hình kiểu `models[]` để dùng lại `Runner.run()` (resume, ngắt mạch)."""
     b = dict(cfg["base"])
@@ -272,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-wandb", action="store_true")
     a = ap.parse_args(argv)
 
+    clear_vram("khởi động §2.5 (dọn pipeline cũ)")
     cfg = load_config(a.config, a.overrides)
     if str(cfg.get("experiment", "")) != "2.5":
         print(f"✗ config khai `experiment: {cfg.get('experiment')!r}`, chờ đợi "
@@ -497,10 +567,23 @@ def main(argv: list[str] | None = None) -> int:
             if cls_pack:
                 manifest["labels"] = cls_pack["stats"]
 
+        if any(x["kind"] == "ours" for x in arms_to_train):
+            try:
+                pre = resolve_c_pretrain(cfg, a.config, dry=dry_steps is not None,
+                                         no_wandb=a.no_wandb, no_push=a.no_push)
+            except Exception as e:
+                print(f"\n✗ DỪNG — pretrain của Candidate C: {e}", flush=True)
+                tracker.alert("§2.5 dừng ở pretrain", str(e), "ERROR")
+                tracker.finish(1)
+                return 4
+            cfg["pretrain_init"] = pre
+            manifest["c_pretrain"] = pre
+
         for arm in train_order(arms_to_train):
             aid = arm["id"]
             odir = adapter_root / aid
             print(f"\n── {arm.get('name', aid)} ({arm['kind']}) ──", flush=True)
+            clear_vram("trước khi train arm")
             try:
                 if arm["kind"] == "sota":
                     st = ts_mod.train_sota_arm(cfg, arm, train_df, val_df, odir,

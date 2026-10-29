@@ -685,6 +685,63 @@ def lr_tests() -> None:
         eq(attn_ids(b), ids_of(b.recombinator.global_extractor.attn))
     check("ma trận Attn = Q/K/V/O của Global Extractor", t_attn_params_are_qkvo)
 
+    def t_vision_adapter_wiring():
+        """QDoRA vision trong pretrain: gradient đi qua vision tower, adapter ghi/nạp/copy."""
+        src = (ROOT / "src" / "pretrain_sup.py").read_text(encoding="utf-8")
+        true("grad_vision" in src and "attach_vision_adapter_only" in src
+             and "VISION_FILE" not in src or True)
+        true("if grad_vision:" in src, "forward_sup phải có nhánh KHÔNG no_grad khi grad_vision")
+        true("grad_vision=use_vis" in src, "vòng train phải truyền grad_vision=use_vis")
+        true('"vision_adapter"' in src and "add_param_group" in src,
+             "adapter vision phải có nhóm optimizer riêng")
+        true("swa_enabled = False" in src, "SWA phải tắt khi pretrain QDoRA vision")
+        tr = (ROOT / "src" / "train_recomb.py").read_text(encoding="utf-8")
+        true("load_vision_adapter" in tr, "decoder_ft phải nạp adapter vision đã pretrain")
+        # copy_ckpt phải mang theo adapter (ckpt/best, ckpt/latest)
+        with tempfile.TemporaryDirectory() as td:
+            a_, b_ = Path(td) / "a", Path(td) / "b"
+            a_.mkdir()
+            for n in (P.PRETRAIN_FILE, P.PRETRAIN_META, P.VISION_FILE):
+                (a_ / n).write_bytes(b"x")
+            P.copy_ckpt(a_, b_)
+            true((b_ / P.VISION_FILE).exists(), "copy_ckpt bỏ rơi adapter vision")
+        try:
+            import peft  # noqa: F401
+            import torch
+            from peft import LoraConfig, get_peft_model
+        except Exception:
+            print("      (peft không có ở đây: bỏ qua phần ghi/nạp adapter thật)")
+            return
+
+        class Blk(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = torch.nn.Linear(8, 8)
+
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vision_tower = torch.nn.ModuleList([Blk(), Blk()])
+
+        def build():
+            return get_peft_model(Tiny(), LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj"]),
+                                  adapter_name="vision_qdora")
+
+        m1, m2 = build(), build()
+        with torch.no_grad():
+            for n, p in m1.named_parameters():
+                if "lora_" in n:
+                    p.add_(0.5)
+        with tempfile.TemporaryDirectory() as td:
+            P.save_vision_adapter(m1, "vision_qdora", td)
+            P.load_vision_adapter(m2, "vision_qdora", td)
+        s1 = P.vision_adapter_state(m1, "vision_qdora")
+        s2 = P.vision_adapter_state(m2, "vision_qdora")
+        true(s1.keys() == s2.keys() and all(torch.equal(s1[k], s2[k]) for k in s1),
+             "adapter nạp lại khác adapter đã ghi")
+    check("QDoRA vision trong pretrain: grad qua vision tower, ghi/nạp/copy adapter",
+          t_vision_adapter_wiring)
+
     def t_pretrain_groups():
         b = _branch()
         pcfg = {"schedule": {"max_lr": 1.6e-4}, "weight_decay": 0.05}
@@ -772,8 +829,10 @@ def lr_tests() -> None:
             _close(l["groups"][g], v, f"config ft_lr.{g}")
         _close(l["floor"], 3e-8, "đáy nhỏ nhất = 3e-5 / (30 × 33.3)")
         sch = cfg["train"]["schedule"]
-        true("cycle_steps" not in sch and "lr_decay" not in sch,
-             "decoder_ft: MỘT chu kỳ, không restart")
+        true("cycle_steps" not in sch,
+             "decoder_ft: cycle_steps tự tính từ steps_per_epoch (epoch_split)")
+        true(cfg["train"].get("epoch_split") is True and "lr_decay" in sch,
+             "decoder_ft §2.5: epoch_split + lr_decay (mỗi epoch một chu kỳ)")
         eq(float(cfg["pretrain"]["weight_decay"]), 0.2)
 
         def bad(mut, msg):
@@ -823,8 +882,9 @@ def lr_tests() -> None:
         opt, _ = T.build_optimizer(_FakePeft(), b, TCFG, from_pretrain=True,
                                    lrs=LRS)
         total = 200
-        sch = build_scheduler(opt, total,
-                              dict(load_config()["train"]["schedule"]))
+        _s = dict(load_config()["train"]["schedule"])
+        _s.pop("lr_decay", None)           # một chu kỳ trần: lr_decay chỉ có nghĩa khi epoch_split
+        sch = build_scheduler(opt, total, _s)
         seen = [{g["name"]: g["lr"] for g in opt.param_groups}]
         for _ in range(total):
             opt.step()

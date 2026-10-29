@@ -100,25 +100,25 @@ arms_s25:
     pretrain_stage0: true
     enabled: true
 
-  # Candidate E §2.3: checkpoint được giữ nguyên, chỉ nạp để suy luận/chấm.
-  # Đường dẫn tương đối tới repo; không tự kéo từ Hub và không train lại.
+  # Candidate C — mô hình của ta, TRAIN LẠI RIÊNG trong §2.5 (không lấy kết quả §2.3):
+  #   1) pretrain 6 epoch có giám sát (Recombinator + đầu phân loại, ASL) trên 6400 mẫu
+  #      train, batch 32 — cùng khối `pretrain:` mà Stage 0 của R2Gen/AdaAtt đọc;
+  #   2) decoder_ft: 4 epoch × 100 lượt forward, batch hiệu dụng 32 (khối `train:`).
+  # Checkpoint pretrain: ưu tiên bản cục bộ, rồi Hub, rồi tự chạy `run_pretrain`
+  # (xem `train.pretrain_source`).
   - id: moe_lora
     short: "C"
-    name: "C · MoE-LoRA + Recombinator (không shared)"
+    name: "C · MoE-LoRA + Recombinator (pretrain 6 epoch, không shared)"
     kind: ours
     runner: gemma3_recomb
     recomb: true
     top_k: 6
     n_experts: 10
     moe: true
-    reuse_only: true
-    # Không cần checkpoint: kéo thẳng predictions đã infer của §2.3 từ Hub
-    # (kèm route_experts), rồi chấm lại bằng pipeline metric của §2.5.
-    predictions_from_hub:
-      repo: RGExp123/Research_results
-      repo_type: dataset
-      subdir: 2.3_pt6400_three_systems
-      file: predictions/moe_lora.jsonl
+    route_pooling: attention
+    all_linear_targets: false
+    capture_cls_head: true
+    train_projector: false
     enabled: true
 
 # ── Setup của hai SOTA — điều kiện 1, chép nguyên văn từ paper gốc ─────────
@@ -336,17 +336,36 @@ lora:
     qdora_r32: {method: qdora, rank: 32}
 
 train:
-  n_epochs: 2
-  per_device_batch_size: 1
-  grad_accum: 32
+  # decoder_ft của Candidate C (R2Gen/AdaAtt không đọc khối này).
+  # 6400 mẫu / batch hiệu dụng 32 = 200 lượt forward = 1 vòng dữ liệu. Chia thành
+  # 4 epoch × 100 lượt (= 400 bước): mỗi epoch 3200 mẫu KHÔNG lặp trong epoch
+  # (hai epoch đầu là hai nửa của cùng một hoán vị; epoch 3-4 hoán vị mới). Mỗi epoch
+  # một chu kỳ one-cycle giống nhau, peak epoch e = peak × lr_decay^e.
+  n_epochs: 4
+  epoch_split: true
+  steps_per_epoch: 100
+  effective_batch_size: 32
+  per_device_batch_size: 8
+  grad_accum: 4
+  batch_probe: true
+  batch_probe_sizes: auto     # 8,7,...,1; OOM -> train lại arm từ đầu với bậc kế, eff_bs giữ 32
+  # Nguồn nhánh đã pretrain (Recombinator + ClsHead): auto = ckpt cục bộ
+  # runs/<pretrain.subdir>/ckpt/latest -> Hub (pretrain.hub_repo) -> tự chạy
+  # `python -m src.run_pretrain` (6 epoch). Hoặc: một thư mục / hub:OWNER/NAME/SUBDIR / none.
+  pretrain_source: auto
+  vision_adapter:
+    enabled: true
+    include_prefixes: [vision_tower, vision_model]
+    layers: last_quarter
+    method: qdora
+    rank: 4
   max_seq_len: 1024
   gradient_checkpointing: true
   weight_decay: 0.01
   max_grad_norm: 1.0
   logging_steps: 10
-  # MỘT chu kỳ one-cycle cho TOÀN BỘ main-stage (mọi epoch, không restart —
-  # KHÔNG khai `cycle_steps`/`lr_decay` ở đây), để mọi nhóm cùng hạ về đáy ở
-  # bước cuối. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
+  # Mỗi epoch MỘT chu kỳ one-cycle (epoch_split; KHÔNG khai `cycle_steps` — tự tính
+  # = steps_per_epoch), `lr_decay` hạ peak từng epoch. Mọi nhóm dùng cùng div 30 · final_div 33.3 (đỉnh/đáy ≈ 1000),
   # rồi đầu warm-up và đáy được LÀM TRÒN XUỐNG còn 1 chữ số có nghĩa
   # (`round_down_sig: 1`):
   #
@@ -362,6 +381,7 @@ train:
     impl: lambda
     max_lr: 1.0e-4          # adapter / Experts (LoRA)
     min_lr: 3.0e-8          # = đáy (đã làm tròn) của nhóm nhỏ nhất
+    lr_decay: 0.875         # epoch e: peak × 0.875^e (epoch_split)
     round_down_sig: 1       # làm tròn XUỐNG đầu warm-up + đáy; 0 = tắt
     pct_start: 0.1
     div_factor: 30.0
@@ -597,6 +617,15 @@ pretrain:
   weight_decay: 0.2
   weight_decay_range: [0.03, 1.0]
   base_method: qlora
+  # QDoRA vision (1/4 lớp cuối vision tower, cùng `train.vision_adapter`) được fine-tune
+  # TRONG pretrain cùng Recombinator + ClsHead: ASL backward qua vision tower tới adapter.
+  # lr adapter = max_lr × lr_mult. Adapter ghi cạnh nhánh (vision_adapter.safetensors),
+  # nạp lại vào QDoRA vision lúc decoder_ft. SWA tự tắt khi bật mục này. Chỉ Candidate C
+  # dùng; R2Gen/AdaAtt (Stage 0 riêng) bỏ qua khoá này.
+  vision_adapter:
+    enabled: true
+    lr_mult: 0.5
+    weight_decay: 0.0
   select_metric: cls_f1_pos
   keep_last_ckpt: 2
   # Đẩy ngay từng epoch; Hub không bao giờ nhận trainer_state.pt.

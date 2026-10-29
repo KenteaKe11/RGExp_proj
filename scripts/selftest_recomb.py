@@ -170,6 +170,15 @@ def main() -> int:
         if sub != [("baseline_infer", "lora_only")]:
             raise AssertionError(sub)
 
+    def test_batch_ladder_and_planner():
+        from src.batch_ladder import VramPlanner, auto_ladder, trim_ladder
+        lad = auto_ladder(512)
+        assert lad[0] == 512 and lad[-1] == 1 and lad == sorted(set(lad), reverse=True)
+        assert 37 in lad and 24 in lad and len(lad) > 20, "bậc bất kỳ, không chỉ luỹ thừa 2"
+        assert trim_ladder(lad, 300)[0] == 300 and trim_ladder(lad, 900) == lad
+        assert trim_ladder(lad, None) == lad
+        assert VramPlanner().begin() in (True, False)  # không CUDA -> False, không lỗi
+
     def test_expert_label_coverage_and_table():
         import pandas as pd
         from src import label_coverage as lc
@@ -388,6 +397,7 @@ def main() -> int:
     check("default A,B,C + six arms when ablation enabled", test_arms_include_bstar)
     check("B* wiring: vision flag + resume check without a branch", test_bstar_vision_wiring)
     check("pre-declared contrasts + Holm over metrics", test_contrasts_declared)
+    check("thang batch bậc bất kỳ + VramPlanner", test_batch_ladder_and_planner)
     check("độ phủ nhãn + test riêng cho Expert + ô n/a thay vì 0.00", test_expert_label_coverage_and_table)
     check("greedy decoding is the same spec as §2.5", test_greedy_shared_with_section25)
     check("§2.3 report: B*, QDoRA table, compact p-value matrix", test_report_23_end_to_end)

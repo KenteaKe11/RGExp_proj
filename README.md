@@ -22,9 +22,13 @@ bash scripts/run_recomb.sh --exp 2.3 --no-wandb --detach     # mặc định ch�
 #    Đứt giữa chừng: chạy LẠI đúng lệnh trên, nó đi tiếp (arm đã xong không train lại).
 #    Thử đường ống trước (8 ảnh, 4 bước, không đẩy Hub): thêm --dry-run.
 
-# 2) §2.5 — chỉ SAU KHI §2.3 xong và đã lên Hub (C được kéo từ đó, không train lại).
-#    Train R2Gen + AdaAtt trên cùng 6.400 mẫu, greedy.
-bash scripts/run_section25.sh --no-wandb --detach             # R2Gen, AdaAtt (train) + C (kéo từ Hub)
+# 2) §2.5 — độc lập với §2.3: C được TRAIN LẠI riêng ở đây (không kéo predictions §2.3).
+#    C: pretrain 6 epoch (Recombinator + ClsHead, 6.400 mẫu, batch 32) rồi decoder_ft
+#    4 epoch × 100 lượt (batch hiệu dụng 32). R2Gen, AdaAtt cùng 6.400 mẫu, greedy.
+#    Pretrain tự tìm: ckpt cục bộ -> Hub -> tự chạy `python -m src.run_pretrain`.
+#    Pretrain fine-tune cả QDoRA vision (1/4 lớp cuối) cùng Recombinator + ClsHead
+#    (`pretrain.vision_adapter.enabled`; adapter ghi ở `vision_adapter.safetensors`, nạp lại lúc decoder_ft).
+bash scripts/run_section25.sh --no-wandb --detach             # R2Gen, AdaAtt, C (pretrain + train + infer)
 
 # 3) Bảng LaTeX cho bài báo (số lấy nguyên từ summary.csv, không gõ tay).
 python -m src.export_paper_tables --run23 runs/2.3_pt6400_three_systems \
@@ -38,6 +42,7 @@ Kết quả: `runs/<thư mục>/REPORT.md`, `metrics/summary.csv`, `metrics/pair
 - **Test mới ⇒ không dùng lại predictions cũ trên Hub** (`--reuse-hub-preds` không áp dụng). A, B, C, R2Gen, AdaAtt đều phải infer lại.
 - **Huấn luyện** (B và C cùng công thức): eff_bs 8, weight decay 0,05, 800 bước = 4 epoch × 200 bước (`train.epoch_split: true`); mỗi epoch là **một phần tư** tập train (1.600 mẫu, không lặp mẫu) và có một chu kỳ one-cycle riêng. Peak lr 8e-5 × 0,875^epoch (8e-5, 7e-5, 6,1e-5, 5,4e-5); đáy nhóm nhỏ nhất ở epoch 1 là 1e-8.
 - **Dò batch**: thang tự sinh `8, 7, 6, …, 1` (mọi số nguyên); gặp OOM thì dọn VRAM rồi train lại arm đó từ đầu với bậc kế. eff_bs luôn 8 (tích lũy gradient bù).
+- **Dọn + chốt batch theo VRAM thực tế (mọi pipeline)**: khởi động pipeline và trước mỗi arm đều gọi dọn VRAM (pipeline cũ đã xong thì nhả hết), in VRAM trống; khi sinh (infer/val) chạy trước một lượt nhỏ (4 mẫu) để đo byte/mẫu, chốt `batch tối đa = 0.85 × VRAM trống / byte-mỗi-mẫu` rồi dò xuống từ đó khi OOM. Train §2.3 trần là batch hiệu dụng (8); train SOTA dò xuống từ ước lớn nhất của batch hiệu dụng.
 - **Dò batch khi sinh (infer)**: bắt đầu ở 512 rồi hạ ~12%/bậc (bậc bất kỳ, không cần luỹ thừa 2) tới khi vừa VRAM trống; gặp OOM thì dọn VRAM, hạ bậc và thử lại đúng batch đó, bậc đã hạ được giữ cho phần còn lại (`base.infer_batch_probe_sizes`).
 - **Bảng Expert và độ phủ nhãn** (stage `expert`, cấu hình `expert_eval`): đếm ca dương CheXbert của từng nhãn ở train và test, liệt kê nhãn không có trong train/test (`metrics/label_coverage_test.csv`). Test chính phải có ≥ `min_pos_per_label` (30) ca dương cho mọi nhãn có trong train và cả nhãn ngoại vi train nếu tồn tại; không đạt thì **tự bốc lại một test riêng cho Expert** (1 ảnh/patient, không trùng train/val, có quota ca dương mỗi nhãn), suy luận lại C trên đó (`predictions_expert/`, `per_sample_expert_*.csv`) và bảng Expert dùng tập này; mọi bảng khác vẫn dùng test chính. Trong bảng, nhãn không được ghi nhận ghi **n/a** (không phải 0.00; **n/a†** nếu model đoán dương mà report gốc không có), kèm dòng Support. Chạy riêng: `--stages expert,report`.
 - **Dò batch của SOTA (R2Gen, AdaAtt)**: tự động cho từng stage — Stage 0, main-stage, val và infer. Train: micro-batch lớn nhất ≤ 512 mà là ước của batch hiệu dụng; OOM thì khôi phục model + optimizer về đầu epoch, hạ bậc, accum tăng bù và chạy lại epoch, nên **batch hiệu dụng của paper không đổi**. Val/infer: 512 → 1 (hạ ~12%/bậc). Tắt: `sota_train.micro_batch_probe: false`.
@@ -66,7 +71,7 @@ Ba arm ablation cũ (`lora_only`, `lora_recomb`, `moe_shared_lora`) còn trong c
 |---|---|---|
 | R2Gen | `r2gen` | ResNet-101 + Transformer/Relational Memory, cài lại theo paper |
 | AdaAtt | `adaatt` | ResNet-152 + Adaptive Attention, cài lại theo paper |
-| C | `moe_lora` | Predictions của §2.3 kéo từ Hub, chấm lại bằng cùng pipeline; không train/infer lại |
+| C | `moe_lora` | **Train lại trong §2.5**: pretrain 6 epoch (Recombinator + ClsHead) → decoder_ft 4 epoch × 100 lượt, eff_bs 32 (`epoch_split`, `steps_per_epoch: 100`, `lr_decay 0.875`); nguồn pretrain `train.pretrain_source` (auto: cục bộ → Hub → tự chạy) |
 
 ## Giải mã greedy (đồng bộ §2.3 và §2.5)
 

@@ -60,6 +60,8 @@ UNTRAINED_MODULES: tuple[str, ...] = (
 
 PRETRAIN_FILE = "sup_pretrain.safetensors"
 PRETRAIN_META = "sup_pretrain.json"
+# QDoRA vision (tuỳ chọn): chỉ tham số adapter PEFT của vision tower, ghi cạnh hai file trên.
+VISION_FILE = "vision_adapter.safetensors"
 TRAINER_STATE = "trainer_state.pt"      # chỉ để resume, KHÔNG bao giờ đẩy Hub
 # /5: Global Extractor residual giữ local thô; FFN là pre-norm residual MLP
 # trong chiều vision. Checkpoint của kiến trúc trước không nạp được —
@@ -160,6 +162,52 @@ def pretrain_exists(d: Path) -> bool:
     return (d / PRETRAIN_FILE).exists() and (d / PRETRAIN_META).exists()
 
 
+def vision_adapter_state(model, name: str) -> dict:
+    """Tham số học được của adapter vision `name` (PEFT) -> {khoá: tensor CPU}."""
+    from peft import get_peft_model_state_dict
+
+    sd = get_peft_model_state_dict(model, adapter_name=name)
+    return {k: v.detach().to("cpu").contiguous() for k, v in sd.items()}
+
+
+def save_vision_adapter(model, name: str, out_dir: Path) -> Path:
+    from safetensors.torch import save_file
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sd = vision_adapter_state(model, name)
+    if not sd:
+        raise PretrainIncompatible(f"adapter vision {name!r} không có tham số nào để ghi.")
+    path = out_dir / VISION_FILE
+    save_file(sd, str(path))
+    return path
+
+
+def load_vision_adapter(model, name: str, src_dir: Path) -> dict:
+    """Nạp adapter vision đã pretrain vào adapter `name` đang gắn trên `model`.
+
+    Dừng (PretrainIncompatible) nếu khoá không khớp: nạp một nửa sẽ để phần còn lại là
+    khởi tạo ngẫu nhiên trong khi log báo "đã nạp".
+    """
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    path = Path(src_dir) / VISION_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"{src_dir} không có {VISION_FILE}")
+    sd = load_file(str(path))
+    own = set(get_peft_model_state_dict(model, adapter_name=name))
+    if own != set(sd):
+        miss, extra = sorted(own - set(sd)), sorted(set(sd) - own)
+        raise PretrainIncompatible(
+            f"adapter vision trong {path} không khớp adapter {name!r} đang dựng "
+            f"(thiếu {miss[:3]}, thừa {extra[:3]}). Cùng `train.vision_adapter` "
+            f"(layers/rank/method) ở pretrain và decoder_ft.")
+    set_peft_model_state_dict(model, sd, adapter_name=name)
+    return {"path": str(path), "n_tensors": len(sd),
+            "n_params": int(sum(v.numel() for v in sd.values()))}
+
+
 def read_meta(d: Path) -> dict:
     d = Path(d)
     if not pretrain_exists(d):
@@ -178,7 +226,7 @@ def copy_ckpt(src: Path, dst: Path, with_trainer_state: bool = False) -> Path:
     """
     src, dst = Path(src), Path(dst)
     dst.mkdir(parents=True, exist_ok=True)
-    names = [PRETRAIN_FILE, PRETRAIN_META]
+    names = [PRETRAIN_FILE, PRETRAIN_META, VISION_FILE]
     if with_trainer_state:
         names.append(TRAINER_STATE)
     for n in names:
@@ -361,6 +409,7 @@ def resolve_source(spec: str, cache_dir: str | Path | None = None) -> Path:
         cache_dir=str(cache_dir) if cache_dir else None,
         allow_patterns=[f"{subdir}/{PRETRAIN_FILE}" if subdir else PRETRAIN_FILE,
                         f"{subdir}/{PRETRAIN_META}" if subdir else PRETRAIN_META,
+                        f"{subdir}/{VISION_FILE}" if subdir else VISION_FILE,
                         pat.replace("*", "README.md")])
     d = Path(local) / subdir if subdir else Path(local)
     if not pretrain_exists(d):

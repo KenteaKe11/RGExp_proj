@@ -203,9 +203,14 @@ class Runner:
         ladder = ([int(x) for x in (self.mcfg.get("batch_probe_sizes") or [])]
                   if bool(self.mcfg.get("batch_probe", False)) else [])
         ladder = sorted({x for x in ladder if x >= 1}, reverse=True)
+        planner = None
         if ladder:
+            from ..batch_ladder import VramPlanner
+            planner = VramPlanner()
+            planner.begin("trước infer")
             bs = ladder[0]
-            print(f"  dò batch sinh: {ladder} (bắt đầu {bs})", flush=True)
+            print(f"  dò batch sinh: bắt đầu {bs} (hiệu chỉnh theo VRAM trống ở batch đầu)",
+                  flush=True)
         t0 = time.time()
         n_done = 0
         n_empty = 0
@@ -217,13 +222,19 @@ class Runner:
             i = 0
             n_batches = 0
             while i < len(todo):
-                batch = todo[i:i + bs]
+                cal = planner is not None and planner.pending
+                batch = todo[i:i + (min(4, bs) if cal else bs)]
                 t1 = time.time()
                 try:
                     self._last_batch_aux = {}
                     outs = self.generate_batch(batch)
                     batch_aux = self._last_batch_aux
                     fail_streak = 0
+                    if cal:
+                        from ..batch_ladder import trim_ladder
+                        cap_b = planner.cap(len(batch))
+                        ladder = trim_ladder(ladder, cap_b)
+                        bs = min(bs, ladder[0])
                 except Exception as e:
                     if ladder:
                         from ..backbone import is_oom
@@ -235,6 +246,8 @@ class Runner:
                             del e
                             self._free()
                             bs = smaller[0]
+                            if planner is not None:
+                                planner.pending = False
                             continue
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
                     # giết cả lần chạy. Thử lại từng ảnh một — phần lớn ca OOM

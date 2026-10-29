@@ -255,7 +255,8 @@ def build_optimizer(branch, pcfg: dict, rcfg: dict | None = None):
 
 
 # ══ Một lượt forward ════════════════════════════════════════════════════════
-def forward_sup(gemma, branch, batch: dict, vis_dtype, branch_dtype):
+def forward_sup(gemma, branch, batch: dict, vis_dtype, branch_dtype,
+                grad_vision: bool = False):
     """-> (ASL, logits phân loại). Vision chạy trong `no_grad`.
 
     Vision tower ĐÓNG BĂNG ở mọi mục của repo này, nên `no_grad` không đổi kết
@@ -265,9 +266,16 @@ def forward_sup(gemma, branch, batch: dict, vis_dtype, branch_dtype):
     """
     import torch
 
-    with torch.no_grad():
+    if grad_vision:
+        # QDoRA vision đang được fine-tune: gradient của ASL đi ngược qua vision tower
+        # tới adapter, nên KHÔNG được bọc no_grad. Chỉ 1/4 lớp cuối có tham số học nên
+        # autograd chỉ giữ activation của ngần ấy lớp.
         vis, _ = recombiner.encode_vision(
             gemma, batch["pixel_values"].to(dtype=vis_dtype))
+    else:
+        with torch.no_grad():
+            vis, _ = recombiner.encode_vision(
+                gemma, batch["pixel_values"].to(dtype=vis_dtype))
     _tokens, logits, _route = branch(vis.to(branch_dtype))
     if logits is None:
         raise TrainUnusable(
@@ -332,7 +340,8 @@ def _ckpt_root(run_dir: Path) -> Path:
 
 
 def write_ckpt(branch, opt, sched, run_dir: Path, epoch: int, state: dict,
-               meta_extra: dict, keep_last: int = 2, swa_model=None) -> Path:
+               meta_extra: dict, keep_last: int = 2, swa_model=None,
+               vision=None) -> Path:
     """Ghi ckpt của một epoch + cập nhật `last.json`. Trả thư mục epoch.
 
     Hai file có ý nghĩa khác nhau và không được lẫn:
@@ -347,7 +356,12 @@ def write_ckpt(branch, opt, sched, run_dir: Path, epoch: int, state: dict,
     d = root / f"epoch_{epoch:03d}"
     d.mkdir(parents=True, exist_ok=True)
     pretrain_io.save_pretrain(branch, d, dict(meta_extra, epoch=int(epoch)))
+    vis_state = None
+    if vision is not None:                       # (model, tên adapter)
+        pretrain_io.save_vision_adapter(vision[0], vision[1], d)
+        vis_state = pretrain_io.vision_adapter_state(vision[0], vision[1])
     torch.save({
+        "vision_adapter": vis_state,
         "epoch": int(epoch),
         # Đường cong one-cycle mà ckpt này nằm trên. `LambdaLR.state_dict()`
         # KHÔNG mang theo `total_steps`, nên không có hai con số này thì lần
@@ -463,10 +477,34 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     # backward nào đi qua vision tower, nên hai lựa chọn tương đương về toán;
     # `sdpa` nhanh hơn `eager` rõ rệt trên lượt forward duy nhất mà ta cần.
     method = str(pcfg.get("base_method", "qlora"))
-    model, processor = load_base(cfg, method, for_training=False)
+    # QDoRA vision (tuỳ chọn): `pretrain.vision_adapter.enabled`. Khi bật, backward đi qua
+    # 1/4 lớp cuối của vision tower tới adapter, nên nạp base theo kiểu HUẤN LUYỆN.
+    vcfg = dict(pcfg.get("vision_adapter", {}) or {})
+    use_vis = bool(vcfg.get("enabled", False))
+    model, processor = load_base(cfg, method, for_training=use_vis)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    vis_meta, vis_params = None, []
+    if use_vis:
+        from .backbone import attach_vision_adapter_only
+
+        tcfg_v = dict(cfg.get("train", {}) or {})
+        tcfg_v["vision_adapter"] = {**dict(tcfg_v.get("vision_adapter", {}) or {}),
+                                    **{k: v for k, v in vcfg.items()
+                                       if k not in ("lr_mult",)}, "enabled": True}
+        model, vis_meta = attach_vision_adapter_only(model, tcfg_v)
+        vis_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        bad = [n for n, _ in vis_params
+               if "vision" not in n or vis_meta["name"] not in n]
+        if not vis_params or bad:
+            raise TrainUnusable(
+                f"QDoRA vision trong pretrain: tham số học được phải là adapter của vision "
+                f"tower, nhận {len(vis_params)} tham số, lạ: {bad[:3]}.")
+        model.eval()   # không dropout: pretrain và decoder_ft thấy cùng đặc trưng tất định
+        print(f"  QDoRA vision (pretrain): {sum(p.numel() for _, p in vis_params):,} tham số học "
+              f"· adapter {vis_meta['name']} r={vis_meta['rank']} "
+              f"({vis_meta['n_target_modules']} module)", flush=True)
     processor.tokenizer.padding_side = "right"
     img_kw = imaging.configure_processor(processor, cfg)
     print(f"  ảnh: {imaging.describe(cfg)}", flush=True)
@@ -519,6 +557,13 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         per_epoch = max(1, steps // max(1, n_epochs))
 
     opt, n_by_group = build_optimizer(branch, pcfg, rcfg)
+    if use_vis:
+        lr_v = float(dict(pcfg.get("schedule", {}) or {}).get("max_lr", 3e-4)) * \
+            float(vcfg.get("lr_mult", 1.0))
+        opt.add_param_group({"params": [p for _, p in vis_params], "lr": lr_v,
+                             "weight_decay": float(vcfg.get("weight_decay", 0.0)),
+                             "name": "vision_adapter"})
+        n_by_group["vision_adapter"] = sum(p.numel() for _, p in vis_params)
     print("  optimizer: " + " · ".join(
         f"{g['name']} {sum(p.numel() for p in g['params']):,} tham số "
         f"@ max_lr {g['lr']:.2e} wd {g['weight_decay']:g}"
@@ -536,6 +581,10 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     sel_mode = str(pcfg.get("select_mode", "max")).lower()
     swa_cfg = dict(pcfg.get("swa", {}) or {})
     swa_enabled = bool(swa_cfg.get("enabled", False))
+    if swa_enabled and use_vis:
+        print("  ⚠ SWA TẮT khi QDoRA vision được pretrain: SWA chỉ trung bình nhánh, còn adapter "
+              "vision là bản epoch cuối — hai nửa không cùng một điểm.", flush=True)
+        swa_enabled = False
     swa_start_cfg = float(swa_cfg.get("start_epoch", 0.5))
     if not 0.0 <= swa_start_cfg <= 1.0:
         raise TrainUnusable("pretrain.swa.start_epoch phải nằm trong [0, 1].")
@@ -605,6 +654,17 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 f"      --run-id sup_pretrain_recomb")
         branch.load_state_dict({k: v.to(device=dev, dtype=bdtype)
                                 for k, v in st["branch"].items()})
+        if use_vis:
+            if not st.get("vision_adapter"):
+                raise TrainUnusable(
+                    f"ckpt ở {last['dir']} không có adapter vision nhưng lần chạy này bật "
+                    f"pretrain.vision_adapter. Chạy mới: --no-resume (hoặc --run-id khác).")
+            from peft import set_peft_model_state_dict
+            set_peft_model_state_dict(model, st["vision_adapter"], adapter_name=vis_meta["name"])
+        elif st.get("vision_adapter"):
+            raise TrainUnusable(
+                f"ckpt ở {last['dir']} có adapter vision nhưng pretrain.vision_adapter đang tắt: "
+                f"nối tiếp sẽ bỏ rơi adapter. Bật lại, hoặc --no-resume.")
         n_old = len((st.get("opt") or {}).get("param_groups") or [])
         if n_old != len(opt.param_groups):
             raise TrainUnusable(
@@ -677,6 +737,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         },
         "base_hf_id": str(cfg["base"]["hf_id"]),
         "base_method": method,
+        "vision_adapter": ({**vis_meta, "lr_mult": float(vcfg.get("lr_mult", 1.0)),
+                            "n_params": int(sum(p.numel() for _, p in vis_params))}
+                           if use_vis else None),
         "label_stats": cls_train.get("stats"),
         "branch_params": bstats,
         "param_groups": n_by_group,
@@ -705,36 +768,58 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
             ep_asl = ep_w = 0.0
             ep_tp = ep_fp = ep_fn = 0.0
             for step in range(per_epoch):
-                opt.zero_grad(set_to_none=True)
-                st_asl = 0.0
-                for _ in range(accum):
-                    rows = []
-                    for _ in range(bs):
-                        if cursor >= len(order):
-                            break
-                        rows.append(ds[order[cursor]])
-                        cursor += 1
-                    if not rows:
+                # Snapshot đầu bước: OOM (chỉ khi pretrain QDoRA vision, vì backward đi qua vision
+                # tower) -> hạ micro-batch xuống ước kế của eff_bs, tăng accum bù, chạy lại BƯỚC này.
+                while True:
+                    snap = (cursor, ep_asl, ep_w, ep_tp, ep_fp, ep_fn, seen)
+                    try:
+                        opt.zero_grad(set_to_none=True)
+                        st_asl = 0.0
+                        for _ in range(accum):
+                            rows = []
+                            for _ in range(bs):
+                                if cursor >= len(order):
+                                    break
+                                rows.append(ds[order[cursor]])
+                                cursor += 1
+                            if not rows:
+                                break
+                            b = collate_vision(rows)
+                            b = {k: (v.to(dev) if hasattr(v, "to") else v)
+                                 for k, v in b.items()}
+                            loss, logits = forward_sup(gemma, branch, b, vis_dtype, bdtype,
+                                                       grad_vision=use_vis)
+                            (loss / accum).backward()
+                            st_asl += float(loss.detach()) / accum
+                            w = float(b["cls_mask"].sum())
+                            ep_asl += float(loss.detach()) * w
+                            ep_w += w
+                            seen += len(rows)
+                            with torch.no_grad():
+                                pred = logits.argmax(-1)
+                                gold = b["cls_y"].argmax(-1)
+                                keep = (b["cls_mask"].float().view(-1, 1) > 0.5
+                                        ).expand_as(pred)
+                                pp, gp = (pred == 1) & keep, (gold == 1) & keep
+                                ep_tp += float((pp & gp).sum())
+                                ep_fp += float((pp & ~gp).sum())
+                                ep_fn += float((~pp & gp).sum())
                         break
-                    b = collate_vision(rows)
-                    b = {k: (v.to(dev) if hasattr(v, "to") else v)
-                         for k, v in b.items()}
-                    loss, logits = forward_sup(gemma, branch, b, vis_dtype, bdtype)
-                    (loss / accum).backward()
-                    st_asl += float(loss.detach()) / accum
-                    w = float(b["cls_mask"].sum())
-                    ep_asl += float(loss.detach()) * w
-                    ep_w += w
-                    seen += len(rows)
-                    with torch.no_grad():
-                        pred = logits.argmax(-1)
-                        gold = b["cls_y"].argmax(-1)
-                        keep = (b["cls_mask"].float().view(-1, 1) > 0.5
-                                ).expand_as(pred)
-                        pp, gp = (pred == 1) & keep, (gold == 1) & keep
-                        ep_tp += float((pp & gp).sum())
-                        ep_fp += float((pp & ~gp).sum())
-                        ep_fn += float((~pp & gp).sum())
+                    except Exception as e_oom:
+                        if not (use_vis and is_oom(e_oom)):
+                            raise
+                        smaller = [d for d in range(bs - 1, 0, -1) if (bs * accum) % d == 0]
+                        if not smaller:
+                            raise
+                        del e_oom
+                        opt.zero_grad(set_to_none=True)
+                        cursor, ep_asl, ep_w, ep_tp, ep_fp, ep_fn, seen = snap
+                        free_vram()
+                        eff_b = bs * accum
+                        print(f"    OOM ở micro-batch {bs}; hạ xuống {smaller[0]} × accum "
+                              f"{eff_b // smaller[0]} (eff_bs {eff_b} giữ nguyên), chạy lại bước.",
+                              flush=True)
+                        bs, accum = smaller[0], eff_b // smaller[0]
                 if clip > 0:
                     grad_norms = recombiner.recombinator_grad_norms(branch)
                     torch.nn.utils.clip_grad_norm_(
@@ -799,7 +884,8 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
                 # epoch boundary resumes with the same SWA accumulator.
                 swa_model.update_parameters(branch)
             d = write_ckpt(branch, opt, sched, run_dir, epoch + 1, state, meta,
-                           keep_last, swa_model=swa_model)
+                           keep_last, swa_model=swa_model,
+                           vision=((model, vis_meta["name"]) if use_vis else None))
             if is_best:
                 best = {"metric": sel_metric, "epoch": epoch + 1, "value": cur}
                 pretrain_io.copy_ckpt(d, _ckpt_root(run_dir) / "best")
@@ -893,6 +979,9 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
         "batch_size": bs, "grad_accum": accum, "effective_batch": bs * accum,
         "pretrained_modules": list(pretrain_io.PRETRAINED_MODULES),
         "untrained_modules": list(pretrain_io.UNTRAINED_MODULES),
+        "vision_adapter": ({"name": vis_meta["name"], "rank": vis_meta["rank"],
+                            "n_params": int(sum(p.numel() for _, p in vis_params))}
+                           if use_vis else None),
         "n_params_pretrained": int(n_sup),
         "branch_params": bstats,
         "param_groups": n_by_group,
@@ -913,7 +1002,7 @@ def run(cfg: Cfg, train_df: pd.DataFrame, val_df: pd.DataFrame,
     (run_dir / "pretrain_stats.json").write_text(
         json.dumps(stats, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8")
-    del opt, sched, swa_model, branch, model, gemma
+    del opt, sched, swa_model, branch, model, gemma, vis_params
     free_vram()
     print(f"  ✓ sup_pretrain: {mins:.1f} phút · {len(epoch_rows)} epoch · "
           f"best {best.get('metric')} = {best.get('value')} @ epoch "

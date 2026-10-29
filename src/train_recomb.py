@@ -750,6 +750,8 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
               cls_pack: dict | None, out_dir: Path, tracker=None,
               max_steps_override: int | None = None) -> dict:
     """Huấn luyện một candidate, lùi theo batch ladder khi CUDA báo OOM."""
+    from .batch_ladder import clear_vram
+    clear_vram(f"trước khi train {arm.get('id', '?')}")
     import torch
 
     aid = arm["id"]
@@ -939,6 +941,23 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
               f"{math.log1p(math.exp(spec['noise_init'])):.3f}) -> soft clip "
               f"C={spec['logit_clip_c']} -> softmax -> top-{spec['top_k']} · "
               f"Aux {spec['aux_kind']} α={spec['aux_alpha']}", flush=True)
+    # ── QDoRA vision đã pretrain: nạp vào adapter vừa gắn ────────────────────────
+    _vm = (pstats or {}).get("vision_adapter") or {}
+    if pre_src and _vm:
+        _vf = Path(str(pre_src)) / pretrain_io.VISION_FILE
+        _pm = pretrain_io.read_meta(Path(str(pre_src)))
+        if _vf.exists():
+            _r = pretrain_io.load_vision_adapter(model, str(_vm["name"]), Path(str(pre_src)))
+            print(f"  ⚙ QDoRA vision: nạp adapter đã pretrain ({_r['n_params']:,} tham số) "
+                  f"từ {_r['path']}", flush=True)
+        elif _pm.get("vision_adapter"):
+            raise TrainUnusable(
+                f"ckpt pretrain {pre_src} khai vision_adapter trong META nhưng thiếu "
+                f"{pretrain_io.VISION_FILE} (đẩy/tải Hub thiếu file?). Dừng thay vì train "
+                f"QDoRA vision từ khởi tạo ngẫu nhiên trong khi báo là đã pretrain.")
+    elif pre_src and not _vm and pretrain_io.read_meta(Path(str(pre_src))).get("vision_adapter"):
+        print("  ⚠ ckpt pretrain có QDoRA vision nhưng candidate này không gắn QDoRA vision "
+              "-> bỏ qua adapter đó.", flush=True)
     if bool(tcfg.get("gradient_checkpointing", True)):
         if spec is None:
             model.enable_input_require_grads()
@@ -1032,6 +1051,13 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     n_epochs_cfg = max(1, int(tcfg.get("n_epochs", 1)))
     steps = total_steps(n, effective_batch, 1, 1 if epoch_split else n_epochs_cfg)
     cycle_steps = (math.ceil(steps / n_epochs_cfg) if epoch_split else 0)
+    # `steps_per_epoch`: số bước (= lượt forward ở eff_bs) mỗi epoch, đặt thẳng thay vì
+    # suy ra từ n / n_epochs. Vd 6400 mẫu, eff 32, 100 bước/epoch × 4 epoch = 400 bước:
+    # mỗi epoch 3200 mẫu KHÔNG lặp trong epoch (nửa tập), epoch 3 lấy hoán vị mới.
+    spe = int(tcfg.get("steps_per_epoch") or 0)
+    if epoch_split and spe > 0:
+        cycle_steps = spe
+        steps = spe * n_epochs_cfg
     if max_steps_override:
         steps = int(max_steps_override)
 
@@ -1103,7 +1129,7 @@ def _train_once(cfg, arm, preset, train_df, cls_pack, out_dir, tracker,
     if epoch_split:
         _d = float(_sch.get("lr_decay", 1.0))
         print(f"  epoch_split: {n_epochs_cfg} epoch × {cycle_steps} bước, mỗi epoch "
-              f"một nửa tập train ({n // n_epochs_cfg} mẫu), không lặp mẫu · "
+              f"{cycle_steps * effective_batch} mẫu (không lặp trong epoch; tập train {n}) · "
               f"lr_decay {_d:g}: peak " + " -> ".join(
                   f"{float(_sch.get('max_lr', 0)) * _d ** e:.2e}"
                   for e in range(n_epochs_cfg)), flush=True)
