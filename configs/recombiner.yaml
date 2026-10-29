@@ -105,9 +105,9 @@ base:
   attn_implementation_train: eager
   attn_implementation_infer: sdpa
   disable_compile: auto
-  batch_size: 32         # batch lúc SINH: điểm bắt đầu của phép dò (xem infer_batch_probe_sizes)
+  batch_size: 128        # batch lúc SINH: điểm bắt đầu của phép dò (xem infer_batch_probe_sizes)
   infer_batch_probe: true
-  infer_batch_probe_sizes: [32, 24, 16, 12, 8, 6, 4, 2, 1]   # OOM -> hạ bậc, giữ bậc đó
+  infer_batch_probe_sizes: [128, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1]   # OOM -> hạ bậc, giữ bậc đó
   device_map_train: single
   device_map_infer: auto
   image:
