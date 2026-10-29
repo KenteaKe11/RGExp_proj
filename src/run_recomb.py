@@ -58,6 +58,7 @@ một chỗ rò trạng thái, và nó là lỗi.
 """
 from __future__ import annotations
 
+from .batch_ladder import resolve_ladder
 import argparse
 import json
 import math
@@ -333,7 +334,8 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
         "hf_id": b["hf_id"], "dtype": b.get("dtype", "bfloat16"),
         "batch_size": int(b.get("batch_size", 4)),
         "batch_probe": bool(b.get("infer_batch_probe", False)),
-        "batch_probe_sizes": list(b.get("infer_batch_probe_sizes", []) or []),
+        "batch_probe_sizes": resolve_ladder(b.get("infer_batch_probe_sizes", "auto"),
+                                            int(b.get("batch_size", 128))),
         "disable_compile": b.get("disable_compile", "auto"),
         "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
         **({} if arm.get("infer_only") else
@@ -724,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
         tcfg = dict(cfg["train"])
         bs = int(tcfg.get("per_device_batch_size", 16))
         eff_bs = int(tcfg.get("effective_batch_size", 32))
-        probe_sizes = list(tcfg.get("batch_probe_sizes", [bs]))
+        probe_sizes = resolve_ladder(tcfg.get("batch_probe_sizes", "auto"), bs)
         print(f"  batch probe={bool(tcfg.get('batch_probe', False))} · "
               f"thứ tự {probe_sizes} · effective_batch={eff_bs}; "
               "batch được chọn ở candidate đầu sẽ dùng cho cả hai.", flush=True)

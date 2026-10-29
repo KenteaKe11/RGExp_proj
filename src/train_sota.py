@@ -204,7 +204,9 @@ def _train_epoch_probe(model, ds, optim, sched, cfg: Cfg, device, probe: MicroPr
 def _evaluate_probe(state: dict, model, tok, val_df, cfg: Cfg, device, dcfg: dict,
                     monitor: str):
     """`_evaluate` với dò batch sinh 64 -> 1; bậc đã hạ được giữ qua các epoch."""
-    sizes = state.setdefault("sizes", [64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1])
+    from .batch_ladder import auto_ladder
+    sizes = state.setdefault("sizes", auto_ladder(int((cfg.get("sota_train") or {})
+                                                        .get("infer_batch", 512))))
     while True:
         try:
             return _evaluate(model, tok, val_df, cfg, device, dcfg, monitor, sizes[0])
@@ -410,7 +412,7 @@ def train_sota_arm(cfg: Cfg, arm: dict, train_df: pd.DataFrame,
     # dụng không vượt `micro_batch_max` (64), OOM thì hạ dần tới 1; batch hiệu dụng
     # không đổi (accum bù lại). Tắt bằng `sota_train.micro_batch_probe: false`.
     probe_on = bool(stcfg.get("micro_batch_probe", True))
-    probe_top = int(stcfg.get("micro_batch_max", 64))
+    probe_top = int(stcfg.get("micro_batch_max", 512))
     eval_every = max(1, int(stcfg.get("eval_every", 1)))
     has_val = val_df is not None and len(val_df) > 0
     t0 = time.time()

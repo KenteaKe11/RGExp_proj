@@ -768,7 +768,8 @@ def train_arm(cfg: Cfg, arm: dict, preset: dict, train_df: pd.DataFrame,
     initial_bs = int(tcfg.get("per_device_batch_size", 1))
     effective_batch = int(tcfg.get("effective_batch_size",
                                   initial_bs * int(tcfg.get("grad_accum", 16))))
-    sizes = ([int(x) for x in tcfg.get("batch_probe_sizes", [initial_bs])]
+    from .batch_ladder import resolve_ladder
+    sizes = (resolve_ladder(tcfg.get("batch_probe_sizes", "auto"), initial_bs)
              if bool(tcfg.get("batch_probe", False)) else [initial_bs])
     sizes = list(dict.fromkeys(x for x in sizes if x <= initial_bs))
     if not sizes or any(x < 1 for x in sizes) or effective_batch < 1:

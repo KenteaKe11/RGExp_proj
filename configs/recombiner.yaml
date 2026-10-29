@@ -105,9 +105,9 @@ base:
   attn_implementation_train: eager
   attn_implementation_infer: sdpa
   disable_compile: auto
-  batch_size: 128        # batch lúc SINH: điểm bắt đầu của phép dò (xem infer_batch_probe_sizes)
+  batch_size: 512        # batch lúc SINH: điểm bắt đầu dò (hạ ~12%/bậc tới khi vừa VRAM trống, bậc bất kỳ)
   infer_batch_probe: true
-  infer_batch_probe_sizes: [128, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1]   # OOM -> hạ bậc, giữ bậc đó
+  infer_batch_probe_sizes: auto   # thang tự sinh từ batch_size; OOM -> hạ bậc kế, giữ bậc đó
   device_map_train: single
   device_map_infer: auto
   image:
@@ -197,7 +197,7 @@ train:
 
   # Candidate có Recombinator dò theo thứ tự này; batch tìm được sẽ khóa cho QLoRA-only.
   batch_probe: true
-  batch_probe_sizes: [8, 6, 4, 2, 1]
+  batch_probe_sizes: auto   # 8,7,6,...,1 (mọi số nguyên); OOM -> hạ bậc kế
   per_device_batch_size: 8
   effective_batch_size: 8
   grad_accum: 1
