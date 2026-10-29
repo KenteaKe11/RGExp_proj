@@ -197,6 +197,15 @@ class Runner:
         self.smoke_test(todo[0])
 
         bs = max(1, int(self.mcfg.get("batch_size", 1)))
+        # Dò batch khi sinh: bắt đầu ở bậc lớn nhất của `batch_probe_sizes`, gặp
+        # OOM thì dọn VRAM, hạ xuống bậc kế và thử lại CHÍNH batch đó; bậc đã hạ
+        # được giữ cho phần còn lại (không dò lại mỗi batch).
+        ladder = ([int(x) for x in (self.mcfg.get("batch_probe_sizes") or [])]
+                  if bool(self.mcfg.get("batch_probe", False)) else [])
+        ladder = sorted({x for x in ladder if x >= 1}, reverse=True)
+        if ladder:
+            bs = ladder[0]
+            print(f"  dò batch sinh: {ladder} (bắt đầu {bs})", flush=True)
         t0 = time.time()
         n_done = 0
         n_empty = 0
@@ -205,7 +214,9 @@ class Runner:
         limit = max(1, int(self.mcfg.get("consecutive_fail_limit", 3)))
         samples: list[dict] = []
         with open(out_path, "a", encoding="utf-8") as f:
-            for i in range(0, len(todo), bs):
+            i = 0
+            n_batches = 0
+            while i < len(todo):
                 batch = todo[i:i + bs]
                 t1 = time.time()
                 try:
@@ -214,6 +225,17 @@ class Runner:
                     batch_aux = self._last_batch_aux
                     fail_streak = 0
                 except Exception as e:
+                    if ladder:
+                        from ..backbone import is_oom
+
+                        smaller = [x for x in ladder if x < bs]
+                        if is_oom(e) and smaller:
+                            print(f"  OOM ở batch sinh {bs}; dọn VRAM, hạ xuống "
+                                  f"{smaller[0]} và thử lại batch này.", flush=True)
+                            del e
+                            self._free()
+                            bs = smaller[0]
+                            continue
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
                     # giết cả lần chạy. Thử lại từng ảnh một — phần lớn ca OOM
                     # là do batch, không do ảnh — rồi ghi chuỗi rỗng cho ảnh
@@ -273,12 +295,14 @@ class Runner:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 n_done += len(batch)
+                i += len(batch)
+                n_batches += 1
                 if self.checkpoint is not None:
                     try:
                         self.checkpoint(len(done) + n_done)
                     except Exception as e:  # noqa: BLE001
                         print(f"  ⚠ checkpoint lỗi ({e!r}) — bỏ qua", flush=True)
-                if (i // bs) % log_every == 0 or n_done >= len(todo):
+                if n_batches % log_every == 0 or n_done >= len(todo):
                     rate = n_done / max(1e-9, time.time() - t0)
                     eta = (len(todo) - n_done) / max(1e-9, rate)
                     print(f"  [{self.name}] {n_done}/{len(todo)} | {rate:.2f} ảnh/s "

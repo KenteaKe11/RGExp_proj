@@ -332,6 +332,8 @@ def arm_model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
         "runner": "gemma3" if arm.get("infer_only") else "gemma3_recomb",
         "hf_id": b["hf_id"], "dtype": b.get("dtype", "bfloat16"),
         "batch_size": int(b.get("batch_size", 4)),
+        "batch_probe": bool(b.get("infer_batch_probe", False)),
+        "batch_probe_sizes": list(b.get("infer_batch_probe_sizes", []) or []),
         "disable_compile": b.get("disable_compile", "auto"),
         "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
         **({} if arm.get("infer_only") else
@@ -943,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"mẫu {aid} để bổ sung route metadata.")
                     try:
                         route_runner.load()
-                        bs_route = max(1, int(route_runner.mcfg.get("batch_size", 1)))
+                        bs_route = max(1, min(8, int(route_runner.mcfg.get("batch_size", 1))))
                         for start in range(0, len(route_rows), bs_route):
                             batch_routes = route_runner.route_experts_batch(
                                 route_rows[start:start + bs_route])
