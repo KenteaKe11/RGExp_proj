@@ -89,6 +89,12 @@ arms_s25:
     runner: r2gen
     setup: r2gen
     pretrain_stage0: true
+    # Đã có kết quả §2.5 trên Hub thì kéo về (bỏ train + infer); không có thì train như thường.
+    predictions_from_hub:
+      repo: RGExp123/Research_results
+      repo_type: dataset
+      subdir: 2.5_sota
+      file: predictions/r2gen.jsonl
     enabled: true
 
   - id: adaatt
@@ -98,6 +104,12 @@ arms_s25:
     runner: adaatt
     setup: adaatt
     pretrain_stage0: true
+    # Đã có kết quả §2.5 trên Hub thì kéo về (bỏ train + infer); không có thì train như thường.
+    predictions_from_hub:
+      repo: RGExp123/Research_results
+      repo_type: dataset
+      subdir: 2.5_sota
+      file: predictions/adaatt.jsonl
     enabled: true
 
   # Candidate C — mô hình của ta, TRAIN LẠI RIÊNG trong §2.5 (không lấy kết quả §2.3):

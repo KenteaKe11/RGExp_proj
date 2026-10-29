@@ -439,6 +439,40 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             return (d / "train_stats.json").exists()
 
+    # ── SoTA đã có kết quả trên Hub -> dùng lại, không train/infer ─────────────────────
+    # Arm sota khai `predictions_from_hub`: nếu predictions cục bộ chưa đủ, hỏi Hub xem file
+    # có không. Có -> đánh dấu reuse_only (bỏ train + infer, kéo ở stage infer). Không có
+    # (hoặc không hỏi được Hub) -> bỏ khai báo, train + infer bình thường.
+    for x in arms:
+        h = x.get("predictions_from_hub")
+        if not h or x["kind"] != "sota" or x.get("reuse_only"):
+            continue
+        n_need = int(cfg["data"].get("n_test") or 0)
+        if n_need and _count_preds(run_dir / "predictions" / f"{x['id']}.jsonl") >= n_need:
+            x["reuse_only"] = True
+            print(f"⚙ {x['id']}: predictions cục bộ đã đủ {n_need} -> không train/infer lại.",
+                  flush=True)
+            continue
+        fn = (str(h.get("subdir", "")).strip("/") + "/"
+              + str(h.get("file") or f"predictions/{x['id']}.jsonl")).strip("/")
+        try:
+            from huggingface_hub import HfApi
+
+            ok = HfApi(token=hf_token()).file_exists(
+                repo_id=str(h["repo"]), filename=fn,
+                repo_type=str(h.get("repo_type", "dataset")))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            print(f"⚠ {x['id']}: không hỏi được Hub ({type(e).__name__}).", flush=True)
+        if ok:
+            x["reuse_only"] = True
+            print(f"⚙ {x['id']}: có {h['repo']}/{fn} trên Hub -> kéo về, KHÔNG train/infer lại.",
+                  flush=True)
+        else:
+            x.pop("predictions_from_hub", None)
+            print(f"⚙ {x['id']}: không thấy {fn} trên Hub -> train + infer như thường.",
+                  flush=True)
+
     mdir = run_dir / "metrics"
     cache = {x["id"]: {
         "trained": _trained(x),
@@ -480,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
 
     train_df = val_df = None
     reuse = bool(cfg["data"].get("reuse_manifests", False))
+    force_prepare = False
     if reuse:
         from .data import manifest_root
 
@@ -487,10 +522,13 @@ def main(argv: list[str] | None = None) -> int:
         need_files = ["testset.jsonl"] + (["trainset.jsonl"] if need_train else [])
         gone = [f for f in need_files if not (mroot / f).is_file()]
         if gone:
-            print(f"✗ data.reuse_manifests=true nhưng thiếu {gone} trong {mroot}. "
-                  f"Đặt manifest §2.3 vào đó (hoặc --set data.reuse_manifests=false "
-                  f"để lấy mẫu lại — khi ấy mẫu KHÔNG còn là mẫu của §2.3).")
-            return 2
+            # §2.5 KHÔNG phụ thuộc §2.3 phải chạy trước trên máy này: thiếu manifest thì dựng
+            # lại bằng ĐÚNG code và seed của §2.3 (split patient 1 ảnh/patient lấy từ cache/Hub,
+            # seed 42) nên test 3000 / train 6400 / val 256 vẫn là cùng một mẫu.
+            print(f"⚙ chưa có {gone} trong {mroot} -> tự dựng manifest bằng split patient "
+                  f"dùng chung với §2.3 (cùng seed, cùng mẫu); không cần chạy §2.3 trước.",
+                  flush=True)
+            reuse, force_prepare = False, True
     if reuse:
         test_df = data_mod.load_manifest(cfg)
         n_test = int(cfg["data"].get("n_test") or 0)
@@ -507,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 4
             print(f"⚙ dùng lại {len(train_df)} train · {len(val_df)} val của §2.3",
                   flush=True)
-    elif "data" in stages:
+    elif "data" in stages or force_prepare:
         test_df = data_mod.prepare(cfg, tracker)
         if need_train:
             try:

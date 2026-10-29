@@ -173,16 +173,21 @@ def build_markdown(cfg, summary: pd.DataFrame, pw: pd.DataFrame,
 
     # ── 2. Candidate E giữ nguyên ──────────────────────────────────────────
     if ours:
-        source = next((a.get("reuse_adapter_dir") or
-                       (a.get("predictions_from_hub") or {}).get("subdir")
-                       for a in (arms or [])
-                       if a.get("id") == ours), None)
-        L.append("## 2. Candidate E dùng làm đối chứng\n")
-        L.append("Candidate E không được huấn luyện hay infer lại: predictions "
-                 "của §2.3 được kéo thẳng từ Hub"
-                 + (f" (`{source}`)" if source else "")
-                 + " và chấm lại bằng cùng pipeline metric §2.5 như hai "
-                   "baseline, trên đúng 3.000 mẫu test của §2.3.\n")
+        _oa = next((a for a in (arms or []) if a.get("id") == ours), {}) or {}
+        L.append("## 2. Candidate C (mô hình của ta)\n")
+        if _oa.get("predictions_from_hub") or _oa.get("reuse_adapter_dir"):
+            source = (_oa.get("reuse_adapter_dir")
+                      or (_oa.get("predictions_from_hub") or {}).get("subdir"))
+            L.append("Candidate C không được huấn luyện hay infer lại trong §2.5: predictions "
+                     "được kéo từ Hub"
+                     + (f" (`{source}`)" if source else "")
+                     + " và chấm lại bằng cùng pipeline metric §2.5 như hai baseline, "
+                       "trên đúng 3.000 mẫu test.\n")
+        else:
+            L.append("Candidate C được huấn luyện RIÊNG trong §2.5 (không lấy kết quả §2.3): "
+                     "pretrain có giám sát (Recombinator + đầu phân loại + QDoRA vision) rồi "
+                     "decoder_ft với MoE-LoRA, trên cùng 6.400 mẫu train, cùng 3.000 mẫu test "
+                     "và cùng giải mã greedy với hai baseline.\n")
 
     # ── 3. Bảng điểm ───────────────────────────────────────────────────────
     from . import report_common as rc

@@ -71,6 +71,8 @@ Ba arm ablation cũ (`lora_only`, `lora_recomb`, `moe_shared_lora`) còn trong c
 |---|---|---|
 | R2Gen | `r2gen` | ResNet-101 + Transformer/Relational Memory, cài lại theo paper |
 | AdaAtt | `adaatt` | ResNet-152 + Adaptive Attention, cài lại theo paper |
+
+**SoTA đã có kết quả trên Hub** (`RGExp123/Research_results`, `2.5_sota/predictions/<id>.jsonl`): `run_section25` tự kéo về và bỏ train + infer cho R2Gen/AdaAtt; không thấy file thì train + infer như thường. Predictions cục bộ đủ 3.000 mẫu cũng được dùng ngay.
 | C | `moe_lora` | **Train lại trong §2.5**: pretrain 6 epoch (Recombinator + ClsHead) → decoder_ft 4 epoch × 100 lượt, eff_bs 32 (`epoch_split`, `steps_per_epoch: 100`, `lr_decay 0.875`); nguồn pretrain `train.pretrain_source` (auto: cục bộ → Hub → tự chạy) |
 
 ## Giải mã greedy (đồng bộ §2.3 và §2.5)
