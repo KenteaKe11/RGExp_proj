@@ -236,6 +236,9 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
                 start = -(-n_layers // 2)
             elif frm in {"last_quarter", "final_quarter", "last_25_percent"}:
                 start = n_layers - (-(-n_layers // 4))
+            elif frm.startswith("last_") and frm[5:].isdigit():
+                # last_2 = 2 lớp cuối (SigLIP 27 lớp -> lớp 25..26)
+                start = max(0, n_layers - int(frm[5:]))
             else:
                 start = int(frm)
             kept = [h for h in hits if h not in idx or idx[h] >= start]

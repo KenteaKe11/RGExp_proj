@@ -1,0 +1,208 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# §3 — Mentor · Cls head · Router (Expert Choice) · MoE-DoRA
+# ═══════════════════════════════════════════════════════════════════════════
+#   3.1  Dense MoE-DoRA, k = 2→5 (E = k, mọi expert hoạt động)  -> k tốt nhất
+#   3.2  k bạn chọn (chỉ để đặt E = k+1 → k+4); top-k = None (dense trên E)
+#   3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
+#
+# Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.1|3.2|3.3
+#
+# Quy ước: (1) pretrain  ảnh→vision encoder→Mentor→Cls head (CE cls);
+#          (2) đóng băng hoàn toàn Mentor→Cls head, finetune phần còn lại;
+#          (3) infer luôn GREEDY. Mọi PEFT = QDoRA rank 4.
+# Loss chỉ còn 2 loại: CE cls (4 lớp CheXbert) và CE text.
+# Epoch / split / lr / scheduler / save / report tái sử dụng từ §2.3.
+seed: 42
+experiment: "3.1"
+
+data:
+  repo: RGExp123/MIMIC_CXR_cleaned
+  repo_type: dataset
+  split_csv: split_ref/test_split.csv
+  meta_csv: csv_helper/clean_dataset.csv
+  image_zip: img_dir.zip
+  key_column: img_rel
+  ref_column: text_gt
+  n_test: 3000
+  manifest_dir: ./data/section23_eval_3000_pt
+  split_local_dir: ./data/splits_patient_v2
+  reuse_manifests: true
+  cache_dir: ./data
+  image_max_side: 512
+  image_max_side_enforce: true
+  zip_mode: auto
+  zip_stream_min_rate: 1.0
+  train_split_csv: split_ref/train_split.csv
+  n_train: 6400
+  val_split_csv: split_ref/val_split.csv
+  n_val: 256
+  assert_no_leak: true
+
+image_policy:
+  unified: true
+  resize_to: 512
+  interpolation: bicubic
+  keep_aspect: true
+  pad_to_square: true
+  pad_fill: 0
+  allow_native_match: false
+  per_model_normalize_only: true
+
+base:
+  hf_id: google/gemma-3-4b-it
+  runner: gemma3_mentor
+  dtype: bfloat16
+  attn_implementation_train: eager
+  attn_implementation_infer: sdpa
+  disable_compile: auto
+  batch_size: 512
+  infer_batch_probe: true
+  infer_batch_probe_sizes: auto
+  device_map_train: single
+  device_map_infer: auto
+  image: {do_pan_and_scan: false, processor_size: 896}
+
+prompt:
+  system: "You are an experienced radiologist reading a chest X-ray."
+  user: |
+    Write the radiology report for this chest X-ray.
+    Answer in exactly this format, with no preamble and no extra sections:
+    Findings: <the radiological findings>
+    Impression: <the overall impression>
+
+# GREEDY — hằng số của họ §3 (runner từ chối beam/sampling).
+generate:
+  max_new_tokens: 256
+  do_sample: false
+  num_beams: 1
+  length_penalty: 1.0
+  early_stopping: false
+  no_repeat_ngram_size: 0
+  repetition_penalty: 1.0
+  num_return_sequences: 1
+
+lora: {rank: 4}                # QDoRA rank 4 cho MỌI PEFT
+
+mentor: {n_heads: 8, n_classes: 4}
+classifier: {lambda: 0.5}      # CE_text + λ·CE_cls (finetune)
+labels:                        # nhãn sinh LAZY từ CheXbert; KHÔNG đọc labels.npz
+  cache_dir: ./data
+  batch_size: 32
+  device: auto
+
+train:
+  # 6400 mẫu · eff_bs 16 · 800 bước = 4 epoch × 200 bước (2 lượt qua 6400 mẫu); mỗi epoch một chu kỳ
+  # cosine annealing độc lập (peak epoch e = peak × lr_decay^e).
+  n_epochs: 4
+  steps_per_epoch: 200
+  epoch_split: true
+  batch_probe: true
+  batch_probe_sizes: auto
+  per_device_batch_size: 8
+  effective_batch_size: 16
+  grad_accum: 1
+  max_seq_len: 1024
+  gradient_checkpointing: true
+  weight_decay: 0.001          # đồng nhất cho mọi module học được
+  adam_betas: [0.9, 0.95]
+  max_grad_norm: 1.0
+  logging_steps: 10
+  # MỘT lịch lr cho mọi pipeline. Chu kỳ đầu: 0 → 1e-4 → 8e-7 (warm-up tuyến tính pct_start, rồi cosine);
+  # chu kỳ epoch e nhân cả đường cong với lr_decay**e.
+  schedule:
+    max_lr: 1.0e-4
+    lr_init: 0.0
+    lr_min: 8.0e-7
+    pct_start: 0.1
+    anneal: cos
+    lr_decay: 0.875
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  include_prefixes: [language_model, model.language_model]
+  exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
+  vision_adapter:
+    enabled: true
+    include_prefixes: [vision_tower, vision_model]
+    layers: last_2             # LoRA trên 2 lớp cuối của vision encoder
+    method: qdora
+    rank: 4
+  lora_dropout: 0.05
+  bias: none
+  alpha_mode: proportional
+  alpha_ratio: 2.0
+  alpha_fixed: 16
+  quant: {load_in_4bit: true, quant_type: nf4, double_quant: true, compute_dtype: bfloat16}
+
+pretrain:                      # image → vision encoder → Mentor → Cls head (cùng lịch với finetune)
+  n_epochs: 4
+  steps_per_epoch: 200
+  epoch_split: true
+  effective_batch_size: 16
+  per_device_batch_size: 8
+  dir: ./adapters_3_pretrain   # safetensors lưu lại, dùng chung 3.1/3.2/3.3; --force để pretrain lại
+  hub_path: pretrain_mentor    # thư mục trên repo kết quả (quét Hub trước khi pretrain)
+  # lịch lr và weight decay: dùng train.schedule / train.weight_decay
+
+# Mọi pipeline (pretrain và finetune) chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
+# và nạp lại tham số của lần val tốt nhất.
+validation:
+  every_steps: 100
+  patience: 3
+
+# ── lưới thí nghiệm ────────────────────────────────────────────────────────
+exp31: {ks: [2, 3, 4, 5]}                 # dense: E = k
+exp32: {k: null, extra: [1, 2, 3, 4]}     # BẠN chọn k; E = k + extra; top-k = None (dense)
+exp33: {k: null, E: null}                 # BẠN chọn k, E (best.json chỉ là gợi ý)
+
+analysis:
+  collapse_threshold: 0.9      # cos ΔW trung bình ngoài đường chéo ≥ ngưỡng ⇒ sụp đổ về 1 DoRA
+  static_cv: 0.05              # CV của trọng số route qua ảnh < ngưỡng ⇒ route tĩnh ⇒ sụp đổ
+
+metrics:
+  normalize: {lowercase: true, collapse_whitespace: true, strip_section_headers: false}
+  bleu_orders: [1, 2, 3, 4]
+  rouge_types: [rouge1, rouge2, rougeL]
+  bertscore: {enabled: true, model_type: roberta-large, num_layers: 17, batch_size: 32,
+              rescale_with_baseline: false, keep: [f1]}
+  chexbert: {enabled: true, device: auto}
+  radgraph: {enabled: true, model_type: radgraph-xl, reward_level: all, batch_size: 16, device: auto}
+  primary: chexbert_f1
+
+stats:
+  alpha: 0.05
+  n_boot: 4
+  bootstrap_sample_size: 7500
+  bootstrap_seeds: [42, 43, 44, 45]
+  ci_method: percentile
+  n_perm: 10000
+  ci: 0.95
+  dz_floor: 0.10
+  primary_test: perm
+  pairs: all                   # 3.1/3.2: mọi cặp; 3.3 tự chuyển sang `contrasts`
+  adjust_scope: metrics
+  contrasts:
+    - [baseline_infer, dora_decoder]     # A -> B': fine-tune DoRA decoder (+ Mentor, vision, projector)
+    - [dora_decoder, moe_dora]           # B' -> C : MoE-DoRA + Router
+    - [baseline_infer, moe_dora]         # A -> C
+
+wandb:
+  enabled: true
+  project: rgexp-section3
+  entity: null
+  run_name: null
+  group: null
+  resume_same_run: false
+  mode: online
+  tags: [mentor, moe-dora, expert-choice, mimic-cxr]
+  notes: ""
+  log_every: 20
+  log_samples: 20
+
+output:
+  dir: ./runs
+  hub_repo: RGExp123/Research_results
+  hub_repo_type: dataset
+  hub_private: true
+  push: true
+  push_per_arm: true
+  subdir: "3.1_dense_k"
+  adapter_dir: ./adapters_3_1
