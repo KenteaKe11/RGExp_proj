@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .batch_ladder import auto_ladder, clear_vram
+from .batch_ladder import clear_vram
 from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapshot, seed_everything
 from .tracking import Tracker
 
@@ -121,13 +121,23 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
     return arms, inh
 
 
+def pow2_ladder(cap: int) -> list[int]:
+    """Thang batch infer theo bội 2: 512 → 256 → … → 1."""
+    top = 1 << (max(1, int(cap)).bit_length() - 1)
+    out = []
+    while top >= 1:
+        out.append(top)
+        top //= 2
+    return out
+
+
 def model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
     b = dict(cfg["base"])
     cap = int(b.get("batch_size", 8))
     common = {"id": arm["id"], "name": arm.get("name", arm["id"]), "hf_id": b["hf_id"],
               "dtype": b.get("dtype", "bfloat16"), "batch_size": cap,
               "batch_probe": bool(b.get("infer_batch_probe", True)),
-              "batch_probe_sizes": auto_ladder(max(1, cap)),
+              "batch_probe_sizes": pow2_ladder(cap),
               "disable_compile": b.get("disable_compile", "auto"),
               "attn_implementation": b.get("attn_implementation_infer", "sdpa"),
               "merge_adapter": False, "optional": False}

@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 from src import s3_analysis as an            # noqa: E402
 from src import s3_labels as lab             # noqa: E402
 from src.config import Cfg, load_config      # noqa: E402
-from src.run_section3 import build_arms, model_cfg   # noqa: E402
+from src.run_section3 import build_arms, model_cfg, pow2_ladder   # noqa: E402
 
 OK = []
 
@@ -60,6 +60,12 @@ def main() -> int:
         check("model_cfg: runner gemma3_mentor + adapter_dir", mc["runner"] == "gemma3_mentor"
               and str(mc["adapter_dir"]).endswith("moe_dora"))
         check("model_cfg: baseline dùng runner gemma3", model_cfg(cfg, a3[0], Path("ad"))["runner"] == "gemma3")
+
+        check("thang batch infer theo bội 2", pow2_ladder(512)[:3] == [512, 256, 128] and pow2_ladder(512)[-1] == 1 and pow2_ladder(6) == [4, 2, 1])
+
+        from src.s3_train import divisors_desc
+        check("micro-batch dò theo ước của eff_bs", divisors_desc(16, 8) == [8, 4, 2, 1]
+              and divisors_desc(12, 8) == [6, 4, 3, 2, 1] and divisors_desc(16) == [16, 8, 4, 2, 1])
 
         # ── lịch: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước ──
         from src.s3_train import _plan

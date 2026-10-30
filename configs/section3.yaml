@@ -57,7 +57,7 @@ base:
   disable_compile: auto
   batch_size: 512
   infer_batch_probe: true
-  infer_batch_probe_sizes: auto
+  infer_batch_probe_sizes: pow2   # thang infer: 512 → 256 → … → 1
   device_map_train: single
   device_map_infer: auto
   image: {do_pan_and_scan: false, processor_size: 896}
@@ -97,7 +97,7 @@ train:
   steps_per_epoch: 200
   epoch_split: true
   batch_probe: true
-  batch_probe_sizes: auto
+  batch_probe_sizes: divisors  # micro-batch hạ theo ƯỚC của effective_batch_size khi OOM (16: 8 → 4 → 2 → 1)
   per_device_batch_size: 8
   effective_batch_size: 16
   grad_accum: 1

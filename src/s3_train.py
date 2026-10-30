@@ -72,6 +72,12 @@ def build_sched(opt, steps: int, scfg: dict, cycle: int = 0):
     return LambdaLR(opt, f)
 
 
+def divisors_desc(n: int, cap: int | None = None) -> list[int]:
+    """Ước của n, giảm dần (≤ cap). Micro-batch chỉ nhận các giá trị này nên eff_bs luôn chia đều."""
+    ds = [d for d in range(1, int(n) + 1) if n % d == 0 and (cap is None or d <= cap)]
+    return sorted(ds, reverse=True) or [1]
+
+
 def _plan(sec: dict, n: int) -> tuple:
     """(eff_bs, n_epochs, epoch_split, steps, cycle). epoch_split + steps_per_epoch: mỗi 'epoch' là
     một chu kỳ lr độc lập gồm `steps_per_epoch` bước (vd 4 × 200 = 800 bước, eff_bs 16 = 2 lượt qua 6400 mẫu)."""
@@ -116,7 +122,8 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
         return _to_dev(collate_cls(rows, pad_id), b.device)
 
     params = _trainable(b, opt)
-    micro = max(1, min(int(micro_top), eff_bs))
+    ladder = divisors_desc(eff_bs, int(micro_top))   # dò theo ƯỚC của eff_bs (16: 16, 8, 4, 2, 1)
+    micro = ladder[0]
     val_every = max(1, min(int(val_every), steps))
     hist, vhist = [], []
     best = {"loss": float("inf"), "step": 0, "state": None}
@@ -146,13 +153,13 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                             parts[kk] = parts.get(kk, 0.0) + float(v) * k
                 break
             except Exception as e:      # noqa: BLE001
-                if not is_oom(e) or m == 1:
+                if not is_oom(e) or m == ladder[-1]:
                     raise
                 del e
                 if route_ctx is not None:
                     route_ctx.clear()
                 free_vram()
-                m -= 1
+                m = next(d for d in ladder if d < m)
         if to_train:
             to_train()
         return tot / max(cnt, 1), {k: v / max(cnt, 1) for k, v in parts.items()}
@@ -174,13 +181,13 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                         comps[k] = comps.get(k, 0.0) + float(v) * sz / eff_bs
                 break
             except Exception as e:          # noqa: BLE001
-                if not is_oom(e) or micro == 1:
+                if not is_oom(e) or micro == ladder[-1]:
                     raise
                 del e
                 if route_ctx is not None:
                     route_ctx.clear()
                 free_vram()
-                micro -= 1
+                micro = next(d for d in ladder if d < micro)   # ước kế tiếp của eff_bs
                 print(f"  OOM: hạ micro-batch xuống {micro} (eff_bs {eff_bs} giữ nguyên "
                       f"nhờ tích luỹ) và làm lại bước {step + 1}", flush=True)
         if clip > 0:
