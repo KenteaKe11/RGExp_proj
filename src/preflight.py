@@ -134,10 +134,8 @@ _RULES: list[tuple[str, str]] = [
      "      4-bit (~4 GB); không vừa nổi thế thì hạ batch cũng vô ích — kiểm\n"
      "      nvidia-smi xem có tiến trình cũ còn giữ VRAM không."),
     (r"out of memory|CUDA out of memory",
-     "hết VRAM. Batch KHÔNG được dò tự động: hạ, theo thứ tự,\n"
-     "     recombiner.local.hidden / train.max_seq_len /\n"
-     "     train.per_device_batch_size trong configs/section25.yaml\n"
-     "(hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần)."),
+     "hết VRAM. Micro-batch tự hạ theo ước của effective_batch_size; nếu vẫn hết, hạ\n"
+     "     train.max_seq_len / train.per_device_batch_size trong configs/section3.yaml."),
     (r"trust_remote_code",
      "model dùng kiến trúc ngoài transformers; runner phải truyền "
      "trust_remote_code=True."),

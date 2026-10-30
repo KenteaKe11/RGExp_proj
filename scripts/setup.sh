@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════════════
-# setup.sh — dựng môi trường cho §2.5. Chạy MỘT LẦN.
+# setup.sh — dựng môi trường cho §3 (Mentor · Router · MoE-DoRA). Chạy MỘT LẦN.
 #
 #     bash scripts/setup.sh                    # tự dò container / cục bộ
 #     RGEXP_REMOTE=1 bash scripts/setup.sh     # ép chế độ container
@@ -8,11 +8,9 @@
 #
 # MỘT môi trường duy nhất: transformers 4.51/4.52 cho Gemma 3, cộng
 # peft + bitsandbytes cho adapter (requirements-adapters.txt —
-# run_section25.sh sử dụng chung các adapter dependencies khi được cài thêm).
+# run_section3.sh sử dụng chung các adapter dependencies khi được cài thêm).
 #
-# §2.5 so sánh R2Gen, AdaAtt và checkpoint Candidate E đã giữ từ §2.3.
-# Các entrypoint riêng của §2.3 đã được archive; shared adapter/MoE code còn
-# được dùng để nạp Candidate E. Checkpoint E phải được đặt sẵn theo config.
+# Thí nghiệm cũ (§2.x) nằm trong _archive/section2_full/.
 # ═════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -22,7 +20,7 @@ cd "$ROOT"
 source "$ROOT/scripts/_env.sh"
 PY="${PYTHON_BIN:-python3}"
 
-echo "═══ §2.5 SOTA + Candidate E — setup ═══"
+echo "═══ §3 Mentor · Router · MoE-DoRA — setup ═══"
 echo "Thư mục dự án : $ROOT"
 rgexp_banner
 
@@ -179,20 +177,9 @@ else
 fi
 
 # ── 5. requirements ─────────────────────────────────────────────────────────
-# File BẮT BUỘC của §2.5. `configs/adapters.yaml` và `src/run_adapters.py`
-# KHÔNG còn trong danh sách: chúng thuộc §2.2 và đã sang _archive/ (xem
-# scripts/archive_2.2.sh). Đòi chúng ở đây là chặn setup vì một thứ repo đã cố
-# ý bỏ đi.
-for f in requirements.txt configs/section25.yaml src/run_section25.py \
-         src/run_pretrain.py src/recombiner.py src/train_recomb.py \
-         src/backbone.py; do
+for f in requirements.txt configs/section3.yaml src/run_section3.py src/backbone.py; do
     [ -f "$f" ] || { echo "✗ Repo thiếu file: $f — clone/kéo lại bản đủ."; exit 1; }
 done
-# Nếu §2.2 vẫn còn ở src/, nhắc — nhưng KHÔNG chặn: setup không phải chỗ ép
-# người ta dọn repo.
-if [ -f "src/train.py" ] || [ -f "configs/adapters.yaml" ]; then
-    echo "⚙ Một số entrypoint §2.2 cũ vẫn còn trong repo; setup §2.5 không dùng chúng."
-fi
 echo "→ cài requirements.txt..."
 pipi -r requirements.txt
 
@@ -246,13 +233,6 @@ if not torch.cuda.is_available():
 p = torch.cuda.get_device_properties(0)
 sm = torch.cuda.get_device_capability(0)
 print(f"✓ GPU: {p.name} | {p.total_memory/1024**3:.0f} GB | sm{sm[0]}{sm[1]}")
-if p.total_memory / 1024**3 < 16:
-    print(f"⚠ {p.total_memory/1024**3:.0f} GB VRAM — §2.5 KHÔNG dò batch. "
-          "Hết VRAM thì hạ, theo thứ tự,")
-    print("  recombiner.local.hidden / train.max_seq_len / "
-          "train.per_device_batch_size trong configs/section25.yaml")
-    print("  (hạ batch thì NHÂN grad_accum lên đúng bấy nhiêu lần, nếu không "
-          "số bước và lịch one-cycle đổi theo).")
 PYEOF
 
 # DỊCH THỬ chứ không chỉ `which gcc`: máy có gcc mà thiếu Python.h thì gcc vẫn
@@ -284,19 +264,19 @@ echo "       export WANDB_API_KEY=xxxxxxxx      # theo dõi tiến độ (https:
 echo "                                          # thiếu -> W&B tự ghi offline vào ./wandb"
 echo
 echo "  2. Tự kiểm chứng (vài giây, không cần GPU):"
-echo "       python scripts/selftest_pretrain.py   # phải qua HẾT"
-echo "       python scripts/selftest_section25.py  # phải qua HẾT"
+echo "       python scripts/selftest_mentor.py    # phải qua HẾT"
+echo "       python scripts/selftest_section3.py  # phải qua HẾT"
 echo
-echo "  4. Thử đường ống (config duy nhất: configs/section25.yaml):"
-echo "       bash scripts/run_section25.sh --dry-run"
+echo "  4. Thử đường ống (config duy nhất: configs/section3.yaml):"
+echo "       bash scripts/run_section3.sh --exp 3.1 --dry-run"
 echo "       # KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config."
 echo
-echo "  5. CHẠY THẬT — trọn §2.5 (Candidate E cần có checkpoint đã giữ):"
+echo "  5. CHẠY THẬT — §3 (3.1 → 3.2 → 3.3):"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
-    echo "       bash scripts/run_section25.sh --detach"
+    echo "       bash scripts/run_section3.sh --exp 3.1 --detach"
     echo "       # chạy nền, trả lại shell ngay, in link W&B. ssh đứt không giết nó,"
     echo "       # và không cần tmux — tiến độ xem trên W&B."
 else
-    echo "       bash scripts/run_section25.sh"
+    echo "       bash scripts/run_section3.sh --exp 3.1"
 fi
 echo

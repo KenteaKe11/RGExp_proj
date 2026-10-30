@@ -60,7 +60,7 @@ def _write_config_snapshot(cfg: Cfg, run_dir: Path) -> Path | None:
 def _copy_log(run_dir: Path) -> Path | None:
     """Chụp lại log của lần chạy này vào `run_dir/logs/`.
 
-    `scripts/run_section25.sh` đặt `RGEXP_LOG`. Chạy module trực tiếp
+    `scripts/run_section3.sh` đặt `RGEXP_LOG`. Chạy module trực tiếp
     thẳng tay thì không có biến ấy — và đó không phải lỗi, chỉ là không có log
     file để chụp.
     """
@@ -116,7 +116,7 @@ def push_results(cfg: Cfg, run_dir: Path) -> str | None:
         print("⚠ không có HF_TOKEN — bỏ qua bước đẩy. Kết quả vẫn nằm ở "
               f"{run_dir}\n"
               "    export HF_TOKEN=hf_xxxxxxxx  &&  "
-              f"python -m src.run_section25 --exp {cfg.get('experiment', '2.5')} "
+              f"python -m src.run_section3 --exp {cfg.get('experiment', '3.1')} "
               "--stages push", flush=True)
         return None
 
