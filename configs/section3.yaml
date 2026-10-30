@@ -116,13 +116,15 @@ train:
     pct_start: 0.1
     anneal: cos
     lr_decay: 0.875
+  all_linear: true             # DoRA trên MỌI Linear của decoder (q,k,v,o,gate,up,down); target_modules chỉ còn là dự phòng
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   include_prefixes: [language_model, model.language_model]
   exclude_prefixes: [vision_tower, multi_modal_projector, vision_model]
   vision_adapter:
     enabled: true
     include_prefixes: [vision_tower, vision_model]
-    layers: last_2             # LoRA trên 2 lớp cuối của vision encoder
+    layers: last_2             # QDoRA trên 2 lớp cuối của vision encoder
+    all_linear: true           # mọi Linear trong 2 lớp đó (q,k,v,out_proj,fc1,fc2)
     method: qdora
     rank: 4
   lora_dropout: 0.05

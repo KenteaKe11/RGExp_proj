@@ -65,7 +65,7 @@ def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
         from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
         if decoder == "moe":
-            targets = find_target_modules(model, {**tcfg, "all_linear": False})
+            targets = find_target_modules(model, tcfg)       # all_linear: q/k/v/o/gate/up/down của MỌI lớp decoder
             ctx, mstats = attach_dora_experts(model, targets, n_experts, rank, alpha, drop)
         model, vmeta = attach_vision_adapter_only(model, tcfg)
         pstats = {"vision_adapter": vmeta}

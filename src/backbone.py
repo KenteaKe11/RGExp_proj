@@ -698,6 +698,7 @@ def attach_adapter(model, arm: dict, tcfg: dict):
     vision_cfg = dict(tcfg.get("vision_adapter") or {})
     vision_targets = (find_target_modules(model, {
         "target_modules": tcfg.get("target_modules", []),
+        "all_linear": bool(vision_cfg.get("all_linear", False)),
         "include_prefixes": vision_cfg.get("include_prefixes", ["vision_tower"]),
         "exclude_prefixes": [],
         "vision_layers": {"from": vision_cfg.get("layers", "second_half")},
@@ -813,6 +814,7 @@ def attach_vision_adapter_only(model, tcfg: dict):
         return model, None
     targets = find_target_modules(model, {
         "target_modules": tcfg.get("target_modules", []),
+        "all_linear": bool(vision_cfg.get("all_linear", False)),
         "include_prefixes": vision_cfg.get("include_prefixes", ["vision_tower"]),
         "exclude_prefixes": [],
         "vision_layers": {"from": vision_cfg.get("layers", "second_half")},
