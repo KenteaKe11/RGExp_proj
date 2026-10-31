@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run_section3.sh — họ §3: Mentor · Cls head · Router · MoE-DoRA.
 #   bash scripts/run_section3.sh --exp 3.1            # dense k = 2→4
+#   bash scripts/run_section3.sh --exp 3.1-1          # Router mới cho K=4 (cần kết quả 3.1 K=4)
 #   bash scripts/run_section3.sh --exp 3.2            # E = k+1→k+4 (k do bạn chọn: --set exp32.k=3)
 #   bash scripts/run_section3.sh --exp 3.3            # baseline · DoRA decoder · MoE-DoRA
 # Tùy chọn: --dry-run · --detach · --stages a,b · --retrain · --repretrain · --no-push · --no-wandb

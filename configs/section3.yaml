@@ -2,6 +2,7 @@
 # §3 — Mentor · Cls head · Router (Expert Choice) · MoE-DoRA
 # ═══════════════════════════════════════════════════════════════════════════
 #   3.1  Dense MoE-DoRA, k = 2→4 (E = k, mọi expert hoạt động)  -> k tốt nhất
+#   3.1-1 Router mới (penalty) cho K=4; đối chứng K=4 (3.1) và baseline; lưu thư mục Hub riêng
 #   3.2  k bạn chọn (chỉ để đặt E = k+1 → k+4); top-k = None (dense trên E)
 #   3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
 #
@@ -152,6 +153,7 @@ validation:
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
 exp31: {ks: [2, 3, 4]}                 # dense: E = k
+exp311: {k: 4}                            # 3.1-1: Router mới, CHỈ cho biến thể K=4 của 3.1
 exp32: {k: null, extra: [1, 2, 3, 4]}     # BẠN chọn k; E = k + extra; top-k = None (dense)
 exp33: {k: null, E: null}                 # BẠN chọn k, E (best.json chỉ là gợi ý)
 
@@ -168,6 +170,12 @@ metrics:
   chexbert: {enabled: true, device: auto}
   radgraph: {enabled: true, model_type: radgraph-xl, reward_level: all, batch_size: 16, device: auto}
   primary: chexbert_f1
+
+# Chọn k / E / arm tốt nhất: mọi metric lâm sàng là metric chính (hạng TB tốt nhất); hoà ⇒ metric sinh văn bản.
+selection:
+  clinical: [chexbert_f1, radgraph_f1_entity, radgraph_f1_partial, radgraph_f1_complete]
+  text: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1]
+  tie_tol: 0.0                  # hạng lâm sàng chênh ≤ tie_tol coi là ngang nhau
 
 stats:
   alpha: 0.05

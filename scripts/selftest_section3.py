@@ -34,6 +34,13 @@ def main() -> int:
         check("3.1: dense k=2..4, E=k, top_k=None, pretrain",
               [(x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
               [(k, None, True) for k in (2, 3, 4)])
+        a11, _ = build_arms(cfg, "3.1-1")
+        d = {x["id"]: x for x in a11}
+        check("3.1-1: chỉ K=4 cũ (reuse 3.1) ↔ K=4 Router mới (v2)",
+              list(d) == ["dense_k4", "dense_k4_router2"]
+              and d["dense_k4"]["reuse"]["exp"] == "3.1" and d["dense_k4"].get("router") == "v1"
+              and d["dense_k4_router2"]["router"] == "v2" and d["dense_k4_router2"]["E"] == 4
+              and d["dense_k4_router2"]["top_k"] is None and d["dense_k4_router2"]["pretrain"])
         try:
             build_arms(cfg, "3.2")
             check("3.2 thiếu k phải DỪNG (k do người dùng chọn)", False)
@@ -66,6 +73,22 @@ def main() -> int:
         from src.s3_train import divisors_desc
         check("micro-batch dò theo ước của eff_bs", divisors_desc(16, 8) == [8, 4, 2, 1]
               and divisors_desc(12, 8) == [6, 4, 3, 2, 1] and divisors_desc(16) == [16, 8, 4, 2, 1])
+
+        import pandas as pd
+        from src.s3_select import rank_arms
+        sm_ = pd.DataFrame({"arm_id": ["a", "b", "c"],
+                            "chexbert_f1": [.50, .50, .40], "radgraph_f1_entity": [.30, .30, .20],
+                            "radgraph_f1_partial": [.25, .25, .20], "radgraph_f1_complete": [.2, .2, .1],
+                            "bleu1": [.10, .20, .90], "rouge1": [.10, .20, .90], "bertscore_f1": [.5, .6, .9]})
+        rk = rank_arms(sm_)
+        check("xếp hạng: lâm sàng ngang nhau (a,b) ⇒ văn bản tốt hơn (b) đứng trên; c lâm sàng kém không lên dù văn bản cao",
+              rk["arm_id"].tolist() == ["b", "a", "c"] and bool(rk.loc[0, "tied_on_clinical"]))
+        sm2 = sm_.copy(); sm2.loc[1, "chexbert_f1"] = .49
+        check("xếp hạng: chexbert hơn nhau nhưng 3 metric RadGraph ngang ⇒ hạng lâm sàng TB quyết định",
+              rank_arms(sm2)["arm_id"].tolist()[0] == "a")
+        check("xếp hạng: đúng một arm mạnh nhất mọi metric lâm sàng thắng dù văn bản kém",
+              rank_arms(pd.DataFrame({"arm_id": ["x", "y"], "chexbert_f1": [.6, .5], "radgraph_f1_entity": [.4, .3],
+                                      "bleu1": [.1, .9]}))["arm_id"].tolist() == ["x", "y"])
 
         # ── lịch: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước ──
         from src.s3_train import _plan

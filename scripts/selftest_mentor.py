@@ -110,4 +110,43 @@ with tempfile.TemporaryDirectory() as d:
     br.eval()
     check("lưu/nạp nhánh giữ nguyên đầu ra",
           torch.allclose(br(vis)[1], b2(vis)[1], atol=1e-6))
+# ── Router (New): penalty + self-MHA giữa các expert ──
+import torch.nn.functional as F
+r2 = M.ExpertChoiceRouterV2(32, 5, 14, None, n_heads=4)
+mm = torch.randn(3, 14, 32)
+o2 = r2(mm)
+check("Router v2: w [B,E], Σw = 1, dense", o2["weights"].shape == (3, 5)
+      and torch.allclose(o2["weights"].sum(-1), torch.ones(3), atol=1e-5) and (o2["weights"] > 0).all())
+check("Router v2: penalty ≥ 0 (softplus) [B,E]", o2["penalty"].shape == (3, 5) and (o2["penalty"] > 0).all())
+o2["weights"].pow(2).sum().backward()
+need = ["tok_mix", "pen_mix", "q_proj.weight", "pen_proj.weight", "k_proj.weight",
+        "mha_qk.weight", "mha_v.weight", "mha_o.weight", "score.weight"]
+gp = dict(r2.named_parameters())
+check("Router v2: gradient tới mọi khối (kể cả Penalty và self-MHA)",
+      all(gp[n].grad is not None and gp[n].grad.abs().sum() > 0 for n in need),
+      [n for n in need if gp[n].grad is None or gp[n].grad.abs().sum() == 0])
+# phạt đường chéo thật sự giảm tự-chú ý: P lớn ⇒ trọng số tự-chú ý → 0
+with torch.no_grad():
+    r2.pen_proj.bias.fill_(30.0)
+    pen = F.softplus(r2.pen_proj(torch.einsum("ej,bjd->bed", r2.pen_mix, r2.norm(mm))))
+    e = r2.norm_e(r2.q_proj(torch.einsum("ej,bjd->bed", r2.tok_mix, r2.norm(mm))))
+    qh = r2.mha_qk(e).view(3, 5, 4, 8).transpose(1, 2)
+    sc = torch.einsum("bhed,bhfd->bhef", qh, qh) / 8 ** 0.5 - torch.diag_embed(pen.squeeze(-1))[:, None]
+    a = torch.softmax(sc, -1)
+    check("Router v2: P lớn ⇒ tự-chú ý trên đường chéo ≈ 0",
+          torch.diagonal(a, dim1=-2, dim2=-1).max() < 1e-6)
+r2k = M.ExpertChoiceRouterV2(32, 5, 14, 2, n_heads=4)
+ok2 = r2k(mm)
+check("Router v2 top-2: đúng 2 expert > 0, Σw = 1", ((ok2["weights"] > 0).sum(-1) == 2).all()
+      and torch.allclose(ok2["weights"].sum(-1), torch.ones(3), atol=1e-5))
+b2 = M.MentorBranch(32, 14, 4, n_experts=4, n_heads=4, route_enabled=True, router_type="v2")
+with tempfile.TemporaryDirectory() as d:
+    M.save_branch(b2, d)
+    b3 = M.load_branch(d)
+    b2.eval()
+    check("lưu/nạp nhánh Router v2 giữ router_type và đầu ra", b3.spec["router_type"] == "v2"
+          and isinstance(b3.router, M.ExpertChoiceRouterV2)
+          and torch.allclose(b2(torch.randn(2, 20, 32).manual_seed(0) if False else vis[:2, :, :32] if False else torch.zeros(2, 20, 32))[2]["weights"],
+                             b3(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
+check("nhánh cũ (không router_type) vẫn là v1", M.MentorBranch(32, 14, 4, 4, 4, True).spec["router_type"] == "v1")
 print(f"\n{ok} kiểm tra đạt")

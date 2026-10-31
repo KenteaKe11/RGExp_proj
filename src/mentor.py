@@ -122,6 +122,83 @@ class ExpertChoiceRouter(nn.Module):
                 "attn_score": s.detach()}
 
 
+class ExpertChoiceRouterV2(nn.Module):
+    """Router (New): thêm tương tác GIỮA các expert có phạt đường chéo.
+
+        x   = RMSNorm(m)                                   [B,14,D]
+        E0  = Bilinear(x)  = A_tok · x · W_q               [B,E,D]   ("Expert")
+        P   = Softplus(Bilinear(x))  = softplus(A_p·x·w_p) [B,E,1]   ("Penalty" ≥ 0)
+        K   = Linear(x)                                    [B,14,D]
+        e   = RMSNorm(E0)
+        Self-MHA trên trục expert, Q = K = V từ e:  S_h = Q_h Q_hᵀ/√d_h − diag(P)   (phạt tự-chú ý)
+        z   = E0 + W_o·softmax(S)·V                        [B,E,D]   (Add: residual với Expert)
+        S2  = softmax_E(z·Kᵀ/√D) ; s = mean_14(S2)          ("Attn Softmax" → Log)
+        logit = Linear(z) + log(s)  → softmax (dense) hoặc top-k, Σw = 1.
+    """
+
+    def __init__(self, d: int, n_experts: int, n_tokens: int = N_LABELS,
+                 top_k: int | None = None, n_heads: int = 8):
+        super().__init__()
+        if d % n_heads:
+            raise ValueError(f"d={d} không chia hết n_heads={n_heads}")
+        self.d, self.n_experts, self.n_tokens, self.n_heads = int(d), int(n_experts), int(n_tokens), int(n_heads)
+        if top_k is not None and not (1 <= int(top_k) <= self.n_experts):
+            raise ValueError(f"top_k={top_k} phải trong [1, E={self.n_experts}]")
+        self.top_k = (None if top_k is None or int(top_k) >= self.n_experts else int(top_k))
+        self.norm = RMSNorm(d)
+        self.tok_mix = nn.Parameter(torch.randn(n_experts, n_tokens) / math.sqrt(n_tokens))
+        self.pen_mix = nn.Parameter(torch.randn(n_experts, n_tokens) / math.sqrt(n_tokens))
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.pen_proj = nn.Linear(d, 1)
+        self.k_proj = nn.Linear(d, d, bias=False)
+        self.norm_e = RMSNorm(d)
+        self.mha_qk = nn.Linear(d, d, bias=False)       # Q = K của self-MHA
+        self.mha_v = nn.Linear(d, d, bias=False)
+        self.mha_o = nn.Linear(d, d, bias=False)
+        self.score = nn.Linear(d, 1)
+        for lin in (self.q_proj, self.k_proj, self.mha_qk, self.mha_v):
+            nn.init.normal_(lin.weight, std=0.02)
+        nn.init.normal_(self.mha_o.weight, std=0.02)    # z ≈ E0 lúc đầu
+        nn.init.normal_(self.pen_proj.weight, std=0.01)
+        nn.init.zeros_(self.pen_proj.bias)
+        nn.init.normal_(self.score.weight, std=0.01)
+        nn.init.zeros_(self.score.bias)
+
+    def forward(self, m: torch.Tensor) -> dict:
+        if m.dim() != 3 or m.shape[1] != self.n_tokens:
+            raise RuntimeError(f"Router cần [B,{self.n_tokens},D], nhận {tuple(m.shape)}")
+        x = self.norm(m).float()
+        B, E, H = x.shape[0], self.n_experts, self.n_heads
+        e0 = self.q_proj(torch.einsum("ej,bjd->bed", self.tok_mix.float(), x))            # [B,E,D]
+        pen = F.softplus(self.pen_proj(torch.einsum("ej,bjd->bed", self.pen_mix.float(), x)))  # [B,E,1]
+        k = self.k_proj(x)                                                                # [B,14,D]
+        e = self.norm_e(e0).float()
+        dh = self.d // H
+        qh = self.mha_qk(e).view(B, E, H, dh).transpose(1, 2)                            # [B,H,E,dh]
+        vh = self.mha_v(e).view(B, E, H, dh).transpose(1, 2)
+        sc = torch.einsum("bhed,bhfd->bhef", qh, qh) / math.sqrt(dh)                      # [B,H,E,E]
+        diag = torch.diag_embed(pen.squeeze(-1))[:, None]                                  # [B,1,E,E]
+        sc = sc - diag                                                                     # − diag(P)
+        mix = torch.einsum("bhef,bhfd->bhed", torch.softmax(sc, dim=-1), vh)
+        z = e0 + self.mha_o(mix.transpose(1, 2).reshape(B, E, self.d))                    # [B,E,D]
+        att = torch.softmax(torch.einsum("bed,bjd->bej", z, k) / math.sqrt(self.d), dim=1)
+        s = att.mean(-1)
+        logit = self.score(z).squeeze(-1) + torch.log(s.clamp(min=1e-9))
+        top_idx = None
+        if self.top_k is not None:
+            top_idx = torch.topk(logit, self.top_k, dim=-1).indices
+            keep = torch.zeros_like(logit, dtype=torch.bool).scatter(-1, top_idx, True)
+            logit = logit.masked_fill(~keep, float("-inf"))
+        w = torch.softmax(logit, dim=-1)
+        with torch.no_grad():
+            ent = -(w.clamp(min=1e-9).log() * w).sum(-1).mean()
+        return {"weights": w, "entropy": ent, "top_idx": top_idx, "attn_score": s.detach(),
+                "penalty": pen.detach().squeeze(-1)}
+
+
+ROUTERS = {"v1": ExpertChoiceRouter, "v2": ExpertChoiceRouterV2}
+
+
 class MentorBranch(nn.Module):
     """Mentor + Cls head (+ Router). Khối tên `mentor`, `cls_head` được pretrain;
     `router` chỉ học ở decoder_ft. Không có token đưa vào decoder (fusion = none)."""
@@ -130,18 +207,24 @@ class MentorBranch(nn.Module):
 
     def __init__(self, d_vis: int, n_labels: int = N_LABELS, n_classes: int = 4,
                  n_experts: int = 10, n_heads: int = 8, route_enabled: bool = True,
-                 top_k: int | None = None):
+                 top_k: int | None = None, router_type: str = "v1"):
         super().__init__()
+        if router_type not in ROUTERS:
+            raise ValueError(f"router_type={router_type!r}; hợp lệ: {sorted(ROUTERS)}")
         self.spec = {"d_vis": int(d_vis), "n_labels": int(n_labels),
                      "n_classes": int(n_classes), "n_experts": int(n_experts),
                      "n_heads": int(n_heads), "route_enabled": bool(route_enabled),
-                     "top_k": top_k}
+                     "top_k": top_k, "router_type": router_type}
         self.n_classes = int(n_classes)
         self.mentor = Mentor(d_vis, n_labels, n_heads)
         self.cls_head = MentorClsHead(d_vis, n_classes)
         self.route_enabled = bool(route_enabled)
-        self.router = (ExpertChoiceRouter(d_vis, n_experts, n_labels, top_k)
-                       if route_enabled else None)
+        if not route_enabled:
+            self.router = None
+        elif router_type == "v2":
+            self.router = ExpertChoiceRouterV2(d_vis, n_experts, n_labels, top_k, n_heads)
+        else:
+            self.router = ExpertChoiceRouter(d_vis, n_experts, n_labels, top_k)
 
     def forward(self, vis: torch.Tensor):
         m = self.mentor(vis)
@@ -161,7 +244,7 @@ class MentorBranch(nn.Module):
     def describe(self) -> str:
         n = self.n_params()
         return (f"Mentor(RMSNorm→AttnPool 14q, D={self.spec['d_vis']}) · "
-                f"ClsHead(→[B,14,{self.n_classes}]) · Router "
+                f"ClsHead(→[B,14,{self.n_classes}]) · Router-{self.spec.get('router_type', 'v1')} "
                 f"(E={self.spec['n_experts']}, "
                 f"{'dense' if self.router is None or self.router.top_k is None else 'top-' + str(self.router.top_k)}"
                 f") · {n['total']:,} tham số")

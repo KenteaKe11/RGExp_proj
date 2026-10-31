@@ -28,8 +28,9 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
 from .tracking import Tracker
 
 STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_dense_k", "3.2": "3.2_e_sweep", "3.3": "3.3_ablation"}
-ADAPTER = {"3.1": "./adapters_3_1", "3.2": "./adapters_3_2", "3.3": "./adapters_3_3"}
+SUBDIR = {"3.1": "3.1_dense_k", "3.1-1": "3.1-1_router_penalty", "3.2": "3.2_e_sweep",
+          "3.3": "3.3_ablation"}
+ADAPTER = {"3.1": "./adapters_3_1", "3.1-1": "./adapters_3_1_1", "3.2": "./adapters_3_2", "3.3": "./adapters_3_3"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -101,6 +102,20 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
             k = int(k)
             arms.append({"id": f"dense_k{k}", "name": f"Dense MoE-DoRA · k=E={k}", "kind": "ft",
                          "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True})
+    elif exp == "3.1-1":
+        k = int((cfg.get("exp311") or {}).get("k", 4))
+        if k != 4:
+            raise ValueError("3.1-1 chỉ áp dụng cho biến thể exp 3.1 có K=4 (exp311.k = 4)")
+        arms = [
+            {"id": "baseline_infer", "name": "A · Gemma 3 gốc", "kind": "infer", "runner": "gemma3",
+             "reuse": {"exp": "3.1", "id": "baseline_infer", "required": False,
+                       "fallback_exp": "3.3"}},
+            {"id": f"dense_k{k}", "name": f"K={k} · Router cũ (exp 3.1)", "kind": "ft", "decoder": "moe",
+             "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v1",
+             "reuse": {"exp": "3.1", "id": f"dense_k{k}", "required": True}},
+            {"id": f"dense_k{k}_router2", "name": f"K={k} · Router mới (penalty)", "kind": "ft",
+             "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v2"},
+        ]
     elif exp == "3.2":
         k = inh["k"]
         for x in (cfg.get("exp32") or {}).get("extra", [1, 2, 3, 4]):
@@ -149,25 +164,29 @@ def model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
 
 # ── chọn tốt nhất ───────────────────────────────────────────────────────────
 def pick_best(cfg: Cfg, scores: dict[str, pd.DataFrame], arms: list[dict], names: dict) -> dict:
+    """Mọi metric lâm sàng là metric chính ⇒ hạng lâm sàng TB tốt nhất; hoà thì metric sinh văn bản."""
     from .metrics import metric_columns
     from .report_common import summarise
+    from .s3_select import rank_arms
 
-    primary = str(cfg["metrics"].get("primary", "chexbert_f1"))
+    sel = dict(cfg.get("selection", {}) or {})
     cols = metric_columns(next(iter(scores.values())))
     summ = summarise(scores, names, cols, dict(cfg["stats"]), int(cfg.get("seed", 42)))
-    s = summ.set_index("arm_id")[primary]
-    best_id = str(s.idxmax())
+    tab = rank_arms(summ, sel.get("clinical"), sel.get("text"), float(sel.get("tie_tol", 0.0)))
+    best_id = str(tab.loc[0, "arm_id"])
     arm = next(a for a in arms if a["id"] == best_id)
-    return {"arm": best_id, "metric": primary, "value": float(s.loc[best_id]),
+    keep = ["arm_id", "clinical_rank", "text_rank", "final_rank", "tied_on_clinical"]
+    return {"arm": best_id, "rule": "hạng lâm sàng TB; hoà ⇒ hạng văn bản TB",
+            "clinical_rank": float(tab.loc[0, "clinical_rank"]), "text_rank": float(tab.loc[0, "text_rank"]),
             "k": int(arm.get("k") or arm.get("top_k") or arm["E"]), "E": int(arm["E"]),
-            "all": {str(i): float(v) for i, v in s.items()}}
+            "table": tab[keep].to_dict("records")}
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Mentor · Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.2 | 3.3")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.1-1 | 3.2 | 3.3")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -248,12 +267,18 @@ def main(argv: list[str] | None = None) -> int:
     from . import s3_train as st_mod
 
     def trained(arm: dict) -> bool:
-        return arm["kind"] == "infer" or sm.already_trained(adapter_root / arm["id"], arm["decoder"])
+        return arm["kind"] == "infer" or sm.already_trained(
+            arm.get("adapter_root", adapter_root) / arm["id"], arm["decoder"])
 
+    if exp == "3.1-1":
+        manifest_note = ("Mentor + Cls head kế thừa nguyên từ pretrain dùng chung với exp 3.1 "
+                         "(đóng băng) — cùng trọng số với arm K=4 của 3.1; chỉ Router thay đổi.")
+    else:
+        manifest_note = None
     manifest = {"run_id": run_id, "experiment": exp,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config": resolved_snapshot(cfg), "stages_run": stages, "arms_declared": declared,
-                "inherited": inherited, "arm_status": {}, "decode": "greedy"}
+                "inherited": inherited, "arm_status": {}, "decode": "greedy", "note": manifest_note}
     t_start = time.time()
     print(f"\n═══ §{exp} — {' · '.join(declared)} ═══\n  kế thừa: {inherited or '—'}", flush=True)
 
@@ -266,12 +291,46 @@ def main(argv: list[str] | None = None) -> int:
         for arm in arms:
             for f in (run_dir / "predictions" / f"{arm['id']}.jsonl", mdir / f"per_sample_{arm['id']}.csv"):
                 f.unlink(missing_ok=True)
+    import shutil
+    for arm in arms:                    # kết quả dùng lại từ mục khác (đối chứng của 3.1-1)
+        ru = arm.get("reuse")
+        if not ru:
+            continue
+        sid = ru.get("id", arm["id"])
+        for src_exp in [ru["exp"]] + ([ru["fallback_exp"]] if ru.get("fallback_exp") else []):
+            ssub = SUBDIR[src_exp] + ("_dryrun" if dry else "")
+            sdir = Path(cfg["output"].get("dir", "./runs")) / ssub
+            arm["hub_sub"] = ssub
+            arm["adapter_root"] = Path(ADAPTER[src_exp] + ("_dryrun" if dry else ""))
+            for rel, dst in ((f"predictions/{sid}.jsonl", run_dir / "predictions" / f"{arm['id']}.jsonl"),
+                             (f"metrics/per_sample_{sid}.csv", mdir / f"per_sample_{arm['id']}.csv")):
+                if rel.startswith("predictions") and count_preds(dst) >= n_need:
+                    continue
+                if rel.startswith("metrics") and dst.exists():
+                    continue
+                if (sdir / rel).exists():
+                    shutil.copyfile(sdir / rel, dst)
+                    print(f"  ⤓ dùng lại {sdir / rel} → {dst}", flush=True)
+                else:
+                    hub.pull_file(f"{ssub}/{rel}", dst)
+            if count_preds(run_dir / "predictions" / f"{arm['id']}.jsonl") >= n_need:
+                break
+        ok = count_preds(run_dir / "predictions" / f"{arm['id']}.jsonl") >= n_need
+        if not ok and ru.get("required", True):
+            print(f"✗ {arm['id']}: đối chứng bắt buộc cần kết quả §{ru['exp']} ({sid}) — không thấy ở "
+                  f"{sdir} lẫn Hub. Chạy `--exp {ru['exp']}` trước.", flush=True)
+            return 2
+        if not ok:                       # tuỳ chọn (baseline): tự infer ở đây
+            arm.pop("reuse"); arm.pop("hub_sub"); arm.pop("adapter_root")
+            print(f"  ⚙ {arm['id']}: chưa có kết quả §{ru['exp']} — sẽ tự infer trong §{exp}.", flush=True)
     for arm in arms:
         aid = arm["id"]
         pp = run_dir / "predictions" / f"{aid}.jsonl"
         if not a.retrain and count_preds(pp) < n_need:
             hub.pull_file(f"{sub}/predictions/{aid}.jsonl", pp)
         arm["preds_done"] = (not a.retrain) and count_preds(pp) >= n_need
+        if arm.get("reuse"):
+            arm["preds_done"] = True
         if arm["kind"] != "ft":
             continue
         if arm["preds_done"]:
@@ -396,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             if cfg["output"].get("push_per_arm", True):
                 push_artifact(cfg, adapter_root / aid, f"adapters/{aid}", f"§{exp} adapter {aid}")
     for arm in ft_arms:
-        p = adapter_root / arm["id"] / "train_stats.json"
+        p = arm.get("adapter_root", adapter_root) / arm["id"] / "train_stats.json"
         if p.exists():
             train_stats.append(json.loads(p.read_text(encoding="utf-8")))
 
@@ -468,11 +527,11 @@ def main(argv: list[str] | None = None) -> int:
     if exp in ("3.1", "3.2"):
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
-        best["note"] = "GỢI Ý theo trung bình metric chính — k/E do người dùng quyết định"
+        best["note"] = "GỢI Ý — k/E do người dùng quyết định"
         (run_dir / "best.json").write_text(json.dumps(best, indent=2, ensure_ascii=False), encoding="utf-8")
         manifest["best"] = best
-        print(f"⚙ gợi ý theo {best['metric']}: {best['arm']} = {best['value']:.4f} "
-              f"→ k={best['k']}, E={best['E']} (best.json; bạn chọn)", flush=True)
+        print(f"⚙ gợi ý: {best['arm']} (hạng lâm sàng TB {best['clinical_rank']:.2f}, văn bản "
+              f"{best['text_rank']:.2f}) → k={best['k']}, E={best['E']} (best.json; bạn chọn)", flush=True)
 
     # ── stats ──────────────────────────────────────────────────────────────
     pw = pd.DataFrame()
@@ -500,11 +559,11 @@ def main(argv: list[str] | None = None) -> int:
             states = lab.get_states(cfg, tkeys, test_df["ref"].astype(str).tolist(), "test")
             pos = lab.positives(states)
             for arm in moe_arms:
-                ad = adapter_root / arm["id"]
+                ad = arm.get("adapter_root", adapter_root) / arm["id"]
                 if not (ad / sm.EXPERTS_FILE).exists():     # cần tham số expert cho cosine ΔW
-                    hub.pull_dir(f"{sub}/adapters/{arm['id']}", ad,
+                    hub.pull_dir(f"{arm.get('hub_sub', sub)}/adapters/{arm['id']}", ad,
                                  [sm.EXPERTS_FILE, sm.EXPERTS_META])
-                res = an.analyse(arm["id"], adapter_root / arm["id"], read_preds(pred_paths[arm["id"]]),
+                res = an.analyse(arm["id"], ad, read_preds(pred_paths[arm["id"]]),
                                  tkeys, pos, tkeys, mdir / "analysis",
                                  float(cfg.get("analysis", {}).get("collapse_threshold", 0.9)),
                                  float(cfg.get("analysis", {}).get("static_cv", 0.05)))

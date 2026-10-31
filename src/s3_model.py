@@ -37,7 +37,7 @@ def lora_rank(cfg) -> int:
 
 
 def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
-          projector: bool = True) -> SimpleNamespace:
+          projector: bool = True, router_type: str = "v1") -> SimpleNamespace:
     """Nạp base NF4, gắn PEFT theo `decoder`, dựng nhánh Mentor. Chưa đặt requires_grad."""
     if decoder not in ("none", "dora", "moe"):
         raise ValueError(f"decoder={decoder!r}")
@@ -83,7 +83,7 @@ def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
     branch = MentorBranch(
         vis_h, 14, int((cfg.get("mentor", {}) or {}).get("n_classes", 4)),
         n_experts=max(1, n_experts), n_heads=int((cfg.get("mentor", {}) or {}).get("n_heads", 8)),
-        route_enabled=(decoder == "moe"), top_k=top_k).to(device=dev, dtype=torch.float32)
+        route_enabled=(decoder == "moe"), top_k=top_k, router_type=router_type).to(device=dev, dtype=torch.float32)
     return SimpleNamespace(model=model, processor=processor, gemma=gemma, branch=branch,
                            route_ctx=ctx, img_kw=img_kw, device=dev, decoder=decoder,
                            n_experts=n_experts, top_k=top_k, text_h=text_h, vis_h=vis_h,

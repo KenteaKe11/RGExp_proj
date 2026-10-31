@@ -321,7 +321,8 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     seed_everything(seed)
     decoder = arm["decoder"]
     b = sm.build(cfg, decoder=decoder, n_experts=int(arm.get("E", 0)),
-                 top_k=arm.get("top_k"), projector=True)
+                 top_k=arm.get("top_k"), projector=True,
+                 router_type=str(arm.get("router", "v1")))
     pre_rep = None
     if pretrain_dir is not None:
         pre_rep = load_pretrained(b, pretrain_dir)
@@ -394,6 +395,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
               patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode)
     meta = {"phase": "finetune", "arm_id": arm["id"], "name": arm.get("name", arm["id"]),
             "decoder": decoder, "n_experts": int(arm.get("E", 0)), "top_k": arm.get("top_k"),
+            "router_type": str(arm.get("router", "v1")),
             "rank": b.rank, "alpha": b.alpha, "method": "qdora", "quantized": True,
             "loss": "ce_text + lambda*ce_cls", "lambda_cls": lam, "steps": steps,
             "eff_bs": eff, "n_train": len(ds), "epoch_split": epoch_split,

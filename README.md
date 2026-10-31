@@ -18,11 +18,35 @@ prompt cố định ─► tokenizer ─► embedding ────────�
 - **Lịch (mọi pipeline)**: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước (cosine mỗi epoch). lr chu kỳ đầu 0 → 1e-4 → 8e-7, weight decay 0.001 cho mọi module học được. Val mỗi 100 bước, patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất.
 - **Quy trình**: pretrain (image→vision→Mentor→Cls head) → đóng băng Mentor+Cls head → finetune phần còn lại.
 
+### Router (New) — dùng ở exp 3.1-1
+
+```
+x  = RMSNorm(m)                       m: [B,14,D]
+E0 = Bilinear(x)        [B,E,D]       (Expert)
+P  = Softplus(Bilinear(x)) [B,E,1]    (Penalty ≥ 0, không qua RMSNorm)
+K  = Linear(x)          [B,14,D]
+e  = RMSNorm(E0);  Q = e·W_qk (cũng là K của MHA),  V = e·W_v     (Linear Proj, H = 8 head, d_h = D/H)
+```
+
+**Orthog-MHA** (self-attention trên trục expert, phạt đường chéo bằng P):
+
+```
+S_h = Q_h Q_hᵀ / √d_h − diag(P)            [B,E,E]   (E×E: expert tự chú ý chính nó bị phạt)
+A_h = softmax_hàng(S_h)
+Orthog-MHA(e, P) = concat_h(A_h V_h) · W_o
+z   = E0 + Orthog-MHA(e, P)                          (Add)
+```
+
+Phần còn lại giống Router (Old): `s = mean_14 softmax_E(z·Kᵀ/√D)`, `logit = Linear(z) + log s`,
+`w = softmax_E(logit)` (dense) hoặc top-k rồi softmax; Σw = 1.
+Tham số của khối: `W_qk`, `W_v`, `W_o` (D×D, không bias).
+
 ## Thí nghiệm
 
 | Mục | Làm gì | Bạn chọn |
 |---|---|---|
 | 3.1 | Dense MoE-DoRA, k = E = 2→4 | — |
+| 3.1-1 | Router mới (Orthog-MHA + penalty) cho K=4; so sánh nhị đối chứng với K=4 (Router cũ) của 3.1; Hub: `3.1-1_router_penalty/` | cần kết quả 3.1 |
 | 3.2 | Dense, E = k+1→k+4 | `exp32.k` |
 | 3.3 | Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp33.k`, `exp33.E` |
 
@@ -36,6 +60,7 @@ bảng **Similarity giữa Expert** + **Expert-Labels** + kết luận sụp đ�
 export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.1
+bash scripts/run_section3.sh --exp 3.1-1
 bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3
 bash scripts/run_section3.sh --exp 3.3 --set exp33.k=3 --set exp33.E=5
 ```

@@ -14,6 +14,8 @@ from .report_common import pairwise_section, score_table, summarise
 QUESTIONS = {
     "3.1": "k nào tốt nhất khi MoE-DoRA **dense** (E = k, mọi expert hoạt động, k = 2→4)? "
            "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.1-1": "Router mới (Self-MHA giữa các expert có phạt đường chéo P) có tốt hơn Router cũ ở biến thể "
+             "K=4 của exp 3.1 không (so sánh nhị đối chứng, hai arm)? Mentor + Cls head kế thừa nguyên từ 3.1 (đóng băng).",
     "3.2": "Với k đã chọn từ 3.1, quét E = k+1→k+4 (top-k = None, dense trên E): E nào tốt nhất? "
            "Các expert có chuyên biệt không?",
     "3.3": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
@@ -111,8 +113,9 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
     out = []
     if best:
         what = "k" if exp == "3.1" else "E"
-        out.append(f"- **{what} gợi ý (quyết định là của bạn)** theo `{best['metric']}`: arm `{best['arm']}` "
-                   f"({best['value']:.4f}) → k = {best['k']}, E = {best['E']} (`best.json`).")
+        out.append(f"- **{what} gợi ý (quyết định là của bạn):** arm `{best['arm']}` — hạng lâm sàng TB "
+                   f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f} → "
+                   f"k = {best['k']}, E = {best['E']} (`best.json`).")
     ver = {a["id"]: manifest.get("arm_status", {}).get(a["id"], {}).get("route_verdict") for a in arms}
     ver = {k: v for k, v in ver.items() if v}
     if ver:
@@ -120,6 +123,9 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
         out.append("- **Chuyên biệt hay sụp đổ:** "
                    + (f"SỤP ĐỔ về một DoRA ở {', '.join(col)}." if col else "không arm nào vượt ngưỡng sụp đổ.")
                    + " Chi tiết từng arm ở mục Route.")
+    if exp == "3.1-1":
+        out.append("- **Router mới có đáng giữ không:** xem cặp K=4 (Router cũ) ↔ K=4 (Router mới) ở mục kiểm định; "
+                   "có nghĩa khi p_perm < α và CI loại 0.")
     if exp == "3.3":
         out.append("- **Cần MoE-DoRA / module mới không:** xem hai cặp A→B' (Mentor+Cls+vision+projector+DoRA) "
                    "và B'→C (MoE-DoRA + Router) ở mục kiểm định; một khác biệt chỉ có nghĩa khi "
@@ -151,9 +157,14 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
                   "\n".join(f"| {r.arm} | {r.precision:.4f} | {r.recall:.4f} | {r.micro_F1:.4f} | {r.n} |"
                             for r in cf.itertuples()), ""]
     if best:
-        parts += ["## Chọn cấu hình", "",
-                  "| Arm | " + best["metric"] + " |\n|---|---|\n" +
-                  "\n".join(f"| {names.get(k, k)} | {v:.4f} |" for k, v in best["all"].items()), ""]
+        parts += ["## Xếp hạng cấu hình", "",
+                  "Mọi metric lâm sàng (CheXbert F1, RadGraph) đều là metric chính: xếp theo **hạng lâm sàng "
+                  "trung bình** (nhỏ hơn = tốt hơn); khi hạng lâm sàng ngang nhau thì xét **hạng metric sinh văn bản** "
+                  "(BLEU, ROUGE, BERTScore).", "",
+                  "| Xếp hạng | Arm | Hạng lâm sàng TB | Hạng văn bản TB | Hoà lâm sàng |\n|---|---|---|---|---|\n" +
+                  "\n".join(f"| {r['final_rank']} | {names.get(r['arm_id'], r['arm_id'])} | "
+                            f"{r['clinical_rank']:.2f} | {r['text_rank']:.2f} | {'có' if r['tied_on_clinical'] else '—'} |"
+                            for r in best["table"]), ""]
     parts += ["## Kiểm định ghép cặp", "", pairwise_section(pw, names, cols, dict(cfg["stats"])), ""]
     moe = [a for a in arms if a["kind"] == "ft" and a["decoder"] == "moe"]
     if moe:
@@ -162,7 +173,7 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
                   "*Sụp đổ* = cosine ΔW giữa các expert ≥ ngưỡng, HOẶC route tĩnh (trọng số gần như không đổi theo ảnh).", ""]
         parts += [_route_block(a, adir) for a in moe]
     parts += ["## Giả định cần biết", "",
-              "- k và E do người dùng chọn; `best.json` chỉ là gợi ý theo trung bình metric chính (không qua kiểm định).",
+              "- k và E do người dùng chọn; `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định.",
               "- 3.1/3.2: dense (mọi expert hoạt động, 3.2: top-k = None trên E). 3.3: top-k = k trên logit cuối "
               "(Linear(Query) + log s), softmax trên k expert được chọn (Σw = 1). Không có aux loss.",
               "- Baseline A là Gemma 3 gốc, chạy lại ở 3.3, không huấn luyện.", ""]
