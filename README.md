@@ -22,7 +22,7 @@ prompt cố định ─► tokenizer ─► embedding ────────�
 
 | Mục | Làm gì | Bạn chọn |
 |---|---|---|
-| 3.1 | Dense MoE-DoRA, k = E = 2→5 | — |
+| 3.1 | Dense MoE-DoRA, k = E = 2→4 | — |
 | 3.2 | Dense, E = k+1→k+4 | `exp32.k` |
 | 3.3 | Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp33.k`, `exp33.E` |
 

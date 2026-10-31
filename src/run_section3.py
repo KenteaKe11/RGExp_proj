@@ -1,6 +1,6 @@
 """§3 — Mentor · Cls head · Router · MoE-DoRA.   python -m src.run_section3 --exp 3.1|3.2|3.3
 
-    3.1  Dense MoE-DoRA, k = 2→5 (E = k, mọi expert hoạt động)      -> best.json {k}
+    3.1  Dense MoE-DoRA, k = 2→4 (E = k, mọi expert hoạt động)      -> best.json {k}
     3.2  k do BẠN chọn (chỉ để đặt E = k+1→k+4); top-k = None (dense trên E)
     3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
 
@@ -97,7 +97,7 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
     inh = _inherit(cfg, exp, dry)
     arms: list[dict] = []
     if exp == "3.1":
-        for k in (cfg.get("exp31") or {}).get("ks", [2, 3, 4, 5]):
+        for k in (cfg.get("exp31") or {}).get("ks", [2, 3, 4]):
             k = int(k)
             arms.append({"id": f"dense_k{k}", "name": f"Dense MoE-DoRA · k=E={k}", "kind": "ft",
                          "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True})

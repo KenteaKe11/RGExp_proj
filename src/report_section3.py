@@ -12,7 +12,7 @@ from .metrics import metric_columns
 from .report_common import pairwise_section, score_table, summarise
 
 QUESTIONS = {
-    "3.1": "k nào tốt nhất khi MoE-DoRA **dense** (E = k, mọi expert hoạt động, k = 2→5)? "
+    "3.1": "k nào tốt nhất khi MoE-DoRA **dense** (E = k, mọi expert hoạt động, k = 2→4)? "
            "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
     "3.2": "Với k đã chọn từ 3.1, quét E = k+1→k+4 (top-k = None, dense trên E): E nào tốt nhất? "
            "Các expert có chuyên biệt không?",

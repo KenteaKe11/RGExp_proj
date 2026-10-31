@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # §3 — Mentor · Cls head · Router (Expert Choice) · MoE-DoRA
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.1  Dense MoE-DoRA, k = 2→5 (E = k, mọi expert hoạt động)  -> k tốt nhất
+#   3.1  Dense MoE-DoRA, k = 2→4 (E = k, mọi expert hoạt động)  -> k tốt nhất
 #   3.2  k bạn chọn (chỉ để đặt E = k+1 → k+4); top-k = None (dense trên E)
 #   3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
 #
@@ -151,7 +151,7 @@ validation:
   patience: 3
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
-exp31: {ks: [2, 3, 4, 5]}                 # dense: E = k
+exp31: {ks: [2, 3, 4]}                 # dense: E = k
 exp32: {k: null, extra: [1, 2, 3, 4]}     # BẠN chọn k; E = k + extra; top-k = None (dense)
 exp33: {k: null, E: null}                 # BẠN chọn k, E (best.json chỉ là gợi ý)
 

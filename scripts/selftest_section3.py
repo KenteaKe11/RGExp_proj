@@ -31,7 +31,7 @@ def main() -> int:
         cfg["output"]["dir"] = td
         # 3.1
         a1, _ = build_arms(cfg, "3.1")
-        check("3.1: dense k=2..5, E=k, top_k=None, pretrain",
+        check("3.1: dense k=2..4, E=k, top_k=None, pretrain",
               [(x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
               [(k, None, True) for k in (2, 3, 4, 5)])
         try:
