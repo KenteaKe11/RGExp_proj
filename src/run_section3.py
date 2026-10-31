@@ -107,9 +107,6 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
         if k != 4:
             raise ValueError("3.1-1 chỉ áp dụng cho biến thể exp 3.1 có K=4 (exp311.k = 4)")
         arms = [
-            {"id": "baseline_infer", "name": "A · Gemma 3 gốc", "kind": "infer", "runner": "gemma3",
-             "reuse": {"exp": "3.1", "id": "baseline_infer", "required": False,
-                       "fallback_exp": "3.3"}},
             {"id": f"dense_k{k}", "name": f"K={k} · Router cũ (exp 3.1)", "kind": "ft", "decoder": "moe",
              "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v1",
              "reuse": {"exp": "3.1", "id": f"dense_k{k}", "required": True}},
