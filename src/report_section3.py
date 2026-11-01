@@ -16,6 +16,8 @@ QUESTIONS = {
            "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
     "3.1-1": "Router mới (Self-MHA giữa các expert có phạt đường chéo P) có tốt hơn Router cũ ở biến thể "
              "K=4 của exp 3.1 không (so sánh nhị đối chứng, hai arm)? Mentor + Cls head kế thừa nguyên từ 3.1 (đóng băng).",
+    "3.1-2": "Router đơn giản (chỉ Query × Key → Attn Softmax, không nhánh Linear/log) có tốt hơn Router "
+             "gốc ở biến thể K=4 của exp 3.1 không (so sánh nhị đối chứng, hai arm)? Mentor + Cls head kế thừa từ 3.1.",
     "3.2": "Với k đã chọn từ 3.1, quét E = k+1→k+4 (top-k = None, dense trên E): E nào tốt nhất? "
            "Các expert có chuyên biệt không?",
     "3.3": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
@@ -123,6 +125,9 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
         out.append("- **Chuyên biệt hay sụp đổ:** "
                    + (f"SỤP ĐỔ về một DoRA ở {', '.join(col)}." if col else "không arm nào vượt ngưỡng sụp đổ.")
                    + " Chi tiết từng arm ở mục Route.")
+    if exp == "3.1-2":
+        out.append("- **Router đơn giản có đủ không:** xem cặp K=4 (Router gốc) ↔ K=4 (Router đơn giản) ở mục "
+                   "kiểm định; có nghĩa khi p_perm < α và CI loại 0.")
     if exp == "3.1-1":
         out.append("- **Router mới có đáng giữ không:** xem cặp K=4 (Router cũ) ↔ K=4 (Router mới) ở mục kiểm định; "
                    "có nghĩa khi p_perm < α và CI loại 0.")

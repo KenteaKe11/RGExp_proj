@@ -47,6 +47,7 @@ Tham số của khối: `W_qk`, `W_v`, `W_o` (D×D, không bias).
 |---|---|---|
 | 3.1 | Dense MoE-DoRA, k = E = 2→4 | — |
 | 3.1-1 | Router mới (Orthog-MHA + penalty) cho K=4; so sánh nhị đối chứng với K=4 (Router cũ) của 3.1; Hub: `3.1-1_router_penalty/` | cần kết quả 3.1 |
+| 3.1-2 | Router đơn giản (Query×Key → Attn Softmax → w) cho K=4; so sánh nhị đối chứng với K=4 của 3.1; Hub: `3.1-2_router_simple/` | cần kết quả 3.1 |
 | 3.2 | Dense, E = k+1→k+4 | `exp32.k` |
 | 3.3 | Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp33.k`, `exp33.E` |
 
@@ -61,6 +62,7 @@ export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.1
 bash scripts/run_section3.sh --exp 3.1-1
+bash scripts/run_section3.sh --exp 3.1-2
 bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3
 bash scripts/run_section3.sh --exp 3.3 --set exp33.k=3 --set exp33.E=5
 ```

@@ -149,4 +149,24 @@ with tempfile.TemporaryDirectory() as d:
           and torch.allclose(b2(torch.randn(2, 20, 32).manual_seed(0) if False else vis[:2, :, :32] if False else torch.zeros(2, 20, 32))[2]["weights"],
                              b3(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
 check("nhánh cũ (không router_type) vẫn là v1", M.MentorBranch(32, 14, 4, 4, 4, True).spec["router_type"] == "v1")
+# ── Router (Simple) v3 ──
+r3 = M.ExpertChoiceRouterV3(32, 5, 14, None)
+o3 = r3(mm)
+check("Router v3: w [B,E], Σw = 1, dense, mọi w > 0", o3["weights"].shape == (3, 5)
+      and torch.allclose(o3["weights"].sum(-1), torch.ones(3), atol=1e-5) and (o3["weights"] > 0).all())
+r3k = M.ExpertChoiceRouterV3(32, 5, 14, 2)
+ok3 = r3k(mm)
+check("Router v3 top-2: đúng 2 expert > 0, Σw = 1", ((ok3["weights"] > 0).sum(-1) == 2).all()
+      and torch.allclose(ok3["weights"].sum(-1), torch.ones(3), atol=1e-5))
+o3["weights"].pow(2).sum().backward()
+check("Router v3: gradient tới Query (tok_mix, q_proj) và Key (k_proj)",
+      all(p.grad is not None and p.grad.abs().sum() > 0 for p in (r3.tok_mix, r3.q_proj.weight, r3.k_proj.weight)))
+b4 = M.MentorBranch(32, 14, 4, n_experts=4, n_heads=4, route_enabled=True, router_type="v3")
+with tempfile.TemporaryDirectory() as d:
+    M.save_branch(b4, d)
+    b5 = M.load_branch(d)
+    b4.eval(); b5.eval()
+    check("lưu/nạp nhánh Router v3 giữ router_type và đầu ra", b5.spec["router_type"] == "v3"
+          and isinstance(b5.router, M.ExpertChoiceRouterV3)
+          and torch.allclose(b4(torch.zeros(2, 20, 32))[2]["weights"], b5(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
 print(f"\n{ok} kiểm tra đạt")

@@ -28,9 +28,10 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
 from .tracking import Tracker
 
 STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_dense_k", "3.1-1": "3.1-1_router_penalty", "3.2": "3.2_e_sweep",
+SUBDIR = {"3.1": "3.1_dense_k", "3.1-1": "3.1-1_router_penalty", "3.1-2": "3.1-2_router_simple",
+          "3.2": "3.2_e_sweep",
           "3.3": "3.3_ablation"}
-ADAPTER = {"3.1": "./adapters_3_1", "3.1-1": "./adapters_3_1_1", "3.2": "./adapters_3_2", "3.3": "./adapters_3_3"}
+ADAPTER = {"3.1": "./adapters_3_1", "3.1-1": "./adapters_3_1_1", "3.1-2": "./adapters_3_1_2", "3.2": "./adapters_3_2", "3.3": "./adapters_3_3"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -113,6 +114,17 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
             {"id": f"dense_k{k}_router2", "name": f"K={k} · Router mới (penalty)", "kind": "ft",
              "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v2"},
         ]
+    elif exp == "3.1-2":
+        k = int((cfg.get("exp312") or {}).get("k", 4))
+        if k != 4:
+            raise ValueError("3.1-2 chỉ áp dụng cho biến thể exp 3.1 có K=4 (exp312.k = 4)")
+        arms = [
+            {"id": f"dense_k{k}", "name": f"K={k} · Router gốc (exp 3.1)", "kind": "ft", "decoder": "moe",
+             "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v1",
+             "reuse": {"exp": "3.1", "id": f"dense_k{k}", "required": True}},
+            {"id": f"dense_k{k}_router3", "name": f"K={k} · Router đơn giản (Q×K softmax)", "kind": "ft",
+             "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v3"},
+        ]
     elif exp == "3.2":
         k = inh["k"]
         for x in (cfg.get("exp32") or {}).get("extra", [1, 2, 3, 4]):
@@ -183,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Mentor · Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.1-1 | 3.2 | 3.3")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.1-1 | 3.1-2 | 3.2 | 3.3")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -267,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         return arm["kind"] == "infer" or sm.already_trained(
             arm.get("adapter_root", adapter_root) / arm["id"], arm["decoder"])
 
-    if exp == "3.1-1":
+    if exp in ("3.1-1", "3.1-2"):
         manifest_note = ("Mentor + Cls head kế thừa nguyên từ pretrain dùng chung với exp 3.1 "
                          "(đóng băng) — cùng trọng số với arm K=4 của 3.1; chỉ Router thay đổi.")
     else:
@@ -315,7 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = count_preds(run_dir / "predictions" / f"{arm['id']}.jsonl") >= n_need
         if not ok and ru.get("required", True):
             print(f"✗ {arm['id']}: đối chứng bắt buộc cần kết quả §{ru['exp']} ({sid}) — không thấy ở "
-                  f"{sdir} lẫn Hub. Chạy `--exp {ru['exp']}` trước.", flush=True)
+                  f"{sdir} lẫn Hub. Chạy `--exp {ru['exp']}{' --dry-run' if dry else ''}` trước"
+                  f"{' (dry-run dùng thư mục *_dryrun riêng, không đọc kết quả thật)' if dry else ''}.", flush=True)
             return 2
         if not ok:                       # tuỳ chọn (baseline): tự infer ở đây
             arm.pop("reuse"); arm.pop("hub_sub"); arm.pop("adapter_root")

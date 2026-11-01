@@ -41,6 +41,12 @@ def main() -> int:
               and d["dense_k4"]["reuse"]["exp"] == "3.1" and d["dense_k4"].get("router") == "v1"
               and d["dense_k4_router2"]["router"] == "v2" and d["dense_k4_router2"]["E"] == 4
               and d["dense_k4_router2"]["top_k"] is None and d["dense_k4_router2"]["pretrain"])
+        a12, _ = build_arms(cfg, "3.1-2")
+        d2 = {x["id"]: x for x in a12}
+        check("3.1-2: chỉ K=4 gốc (reuse 3.1) ↔ K=4 Router đơn giản (v3)",
+              list(d2) == ["dense_k4", "dense_k4_router3"] and d2["dense_k4"]["reuse"]["exp"] == "3.1"
+              and d2["dense_k4_router3"]["router"] == "v3" and d2["dense_k4_router3"]["E"] == 4
+              and d2["dense_k4_router3"]["top_k"] is None)
         try:
             build_arms(cfg, "3.2")
             check("3.2 thiếu k phải DỪNG (k do người dùng chọn)", False)
