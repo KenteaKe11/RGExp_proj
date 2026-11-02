@@ -166,6 +166,39 @@ def experts_state(model, targets: list[str]) -> dict:
     return sd
 
 
+def _moe_modules(model) -> list:
+    return [(n, m) for n, m in model.named_modules() if isinstance(m, MoEDoRALinear)]
+
+
+@torch.no_grad()
+def expert_snapshot(model) -> dict | None:
+    """Bản chụp tham số PEFT (lora_A, lora_B, lora_magnitude — E phần cho E expert) của mọi module
+    MoE-DoRA tại lúc khởi tạo, giữ trên CPU. None nếu mô hình không có module MoE-DoRA."""
+    mods = _moe_modules(model)
+    if not mods:
+        return None
+    return {n: tuple(getattr(m, k).detach().float().cpu().clone()
+                     for k in ("lora_A", "lora_B", "lora_magnitude")) for n, m in mods}
+
+
+@torch.no_grad()
+def expert_delta_norms(model, ref: dict | None) -> list[float] | None:
+    """Δwᵢ = ‖θᵢ(t) − θᵢ(0)‖₂ của RIÊNG PEFT expert i so với lúc khởi tạo, θᵢ = (lora_A, lora_B,
+    lora_magnitude) gộp mọi module ⇒ vector E giá trị ứng với E expert."""
+    if not ref:
+        return None
+    tot = None
+    for n, m in _moe_modules(model):
+        if n not in ref:
+            continue
+        sq = None
+        for cur, r0 in zip((m.lora_A, m.lora_B, m.lora_magnitude), ref[n]):
+            d = (cur.detach().float() - r0.to(cur.device)).pow(2).flatten(1).sum(1)    # (E,)
+            sq = d if sq is None else sq + d
+        tot = sq if tot is None else tot + sq.to(tot.device)
+    return None if tot is None else [float(x) for x in tot.sqrt().cpu()]
+
+
 def save_model(b, out_dir: Path, meta: dict) -> None:
     from safetensors.torch import save_file
 

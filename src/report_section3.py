@@ -12,7 +12,7 @@ from .metrics import metric_columns
 from .report_common import pairwise_section, score_table, summarise
 
 QUESTIONS = {
-    "3.1": "Cặp (k, E) nào tốt nhất trong (1,2) (2,3) (2,4) (3,4) (3,5) (3,6) — router nhiễu chọn top-k trên E "
+    "3.1": "Cặp (k, E) nào tốt nhất trong (3,6) (4,8) (5,10) — router nhiễu chọn top-k trên E "
            "expert DoRA? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
     "3.2": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
            "Đối chứng: baseline · mô hình mới với DoRA decoder đơn · mô hình mới với MoE-DoRA.",

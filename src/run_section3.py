@@ -1,6 +1,6 @@
 """§3 — Mentor · Cls head · NoisyRouter · MoE-DoRA.   python -m src.run_section3 --exp 3.1|3.2
 
-    3.1  Khảo sát cặp (k, E) ∈ {(1,2),(2,3),(2,4),(3,4),(3,5),(3,6)}: router chọn top-k trên E expert
+    3.1  Khảo sát cặp (k, E) ∈ {(3,6),(4,8),(5,10)}: router chọn top-k trên E expert
     3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
 
 Stage: data → pretrain → train → infer → score → stats → analysis → report → push.
@@ -27,8 +27,8 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
 from .tracking import Tracker
 
 STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_k_e_pairs", "3.2": "3.2_ablation"}
-ADAPTER = {"3.1": "./adapters_3_1", "3.2": "./adapters_3_2"}
+SUBDIR = {"3.1": "3.1_k_e_pairs_v2", "3.2": "3.2_ablation_v2"}   # v2: router Norm+nhiễu 0.1 (không lẫn kết quả router cũ)
+ADAPTER = {"3.1": "./adapters_3_1_v2", "3.2": "./adapters_3_2_v2"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -89,7 +89,7 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
     inh = _inherit(cfg, exp, dry)
     arms: list[dict] = []
     if exp == "3.1":
-        pairs = (cfg.get("exp31") or {}).get("pairs", [[1, 2], [2, 3], [2, 4], [3, 4], [3, 5], [3, 6]])
+        pairs = (cfg.get("exp31") or {}).get("pairs", [[3, 6], [4, 8], [5, 10]])
         for k, E in pairs:
             k, E = int(k), int(E)
             if not 1 <= k <= E:

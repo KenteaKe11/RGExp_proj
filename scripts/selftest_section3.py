@@ -31,9 +31,9 @@ def main() -> int:
         cfg["output"]["dir"] = td
         # 3.1
         a1, _ = build_arms(cfg, "3.1")
-        check("3.1: 6 cặp (k,E), top_k=k (None khi k=E), có pretrain",
+        check("3.1: 3 cặp (3,6) (4,8) (5,10), top_k=k, có pretrain",
               [(x["k"], x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
-              [(1, 2, 1, True), (2, 3, 2, True), (2, 4, 2, True), (3, 4, 3, True), (3, 5, 3, True), (3, 6, 3, True)])
+              [(3, 6, 3, True), (4, 8, 4, True), (5, 10, 5, True)])
         try:
             build_arms(cfg, "3.2")
             check("3.2 thiếu k,E phải DỪNG", False)
@@ -86,21 +86,22 @@ def main() -> int:
               (eff, n_ep, split, steps, cycle) == (16, 2, True, 400, 200) and steps * eff == 6400)
         pe = _plan({**cfg["train"], **cfg["pretrain"]}, 6400)
         check("lịch pretrain giống finetune", (pe[0], pe[3], pe[4]) == (16, 400, 200))
-        check("val mỗi 20 bước · patience 3",
-              cfg["validation"]["every_steps"] == 20 and cfg["validation"]["patience"] == 3)
+        check("val mỗi 40 bước · patience 3",
+              cfg["validation"]["every_steps"] == 40 and cfg["validation"]["patience"] == 3)
 
-        # ── lr: chu kỳ đầu 0 -> 1e-4 -> 8e-7; wd 0.001 ──
+        # ── lr: OneCycle một chu kỳ 0 -> 1e-4 -> 1e-8 trên 400 bước; wd 0.001 ──
         from src.s3_train import build_sched
         prm = torch.nn.Parameter(torch.zeros(1))
         o = torch.optim.AdamW([{"params": [prm], "lr": cfg["train"]["schedule"]["max_lr"]}])
-        sc = build_sched(o, 800, dict(cfg["train"]["schedule"]), 200)
+        sc = build_sched(o, 400, dict(cfg["train"]["schedule"]), 200)   # cycle=200 bị one_cycle bỏ qua
         lrs = []
         for _ in range(400):
             lrs.append(o.param_groups[0]["lr"]); o.step(); sc.step()
-        check("lr chu kỳ đầu: 0 → 1e-4 → ≈8e-7", lrs[0] == 0.0 and abs(max(lrs[:200]) - 1e-4) < 1e-12
-              and abs(lrs[199] - 8e-7) < 5e-8, f"đáy={lrs[199]:.3e}")
-        check("chu kỳ 2 khởi động lại từ 0, đỉnh = 1e-4·lr_decay", lrs[200] == 0.0
-              and abs(max(lrs[200:]) - 1e-4 * cfg["train"]["schedule"]["lr_decay"]) < 1e-12)
+        check("lr OneCycle: 0 → 1e-4 → ≈1e-8", lrs[0] == 0.0 and abs(max(lrs) - 1e-4) < 1e-12
+              and abs(lrs[-1] - 1e-8) < 5e-9, f"đáy={lrs[-1]:.3e}")
+        check("OneCycle: một chu kỳ duy nhất, không khởi động lại ở bước 200",
+              lrs[200] < lrs[100] and all(lrs[i + 1] <= lrs[i] + 1e-15 for i in range(40, 399)),
+              f"lr[200]={lrs[200]:.3e}")
         check("weight_decay = 0.001 (train)", float(cfg["train"]["weight_decay"]) == 0.001
               and "weight_decay" not in cfg["pretrain"])
 

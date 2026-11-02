@@ -16,14 +16,14 @@ prompt cố định ─► tokenizer ─► embedding ────────�
 - **Router nhiễu**: xem bên dưới. **MoE-DoRA(Ω,k) = Σᵢ wᵢ⊙DoRAᵢ**, wᵢ = Ωᵢ/Σ_{top-k}Ω, DoRAᵢ = mᵢ ⊙ (W₀ + α/r·BᵢᵀAᵢ)/‖·‖₂.
 - **Log train**: ngoài `ce_text`, `ce_cls`, `lr` còn in/ghi `grad_norm` của router và decoder (trước khi clip): `train/<arm>/grad_norm_router`, `grad_norm_decoder`.
 - **Loss**: chỉ CE cls (nhãn CheXbert sinh lazy) và CE text. Mọi PEFT = QDoRA rank 4. Infer luôn greedy.
-- **Lịch (mọi pipeline)**: 6400 mẫu · eff_bs 16 · 2 epoch × 200 bước = 400 bước (cosine mỗi epoch). lr chu kỳ đầu 0 → 1e-4 → 8e-7, weight decay 0.001 cho mọi module học được. Val mỗi 20 bước, patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất.
+- **Lịch (mọi pipeline)**: 6400 mẫu · eff_bs 16 · 2 epoch × 200 bước = 400 bước. lr **OneCycle một chu kỳ trên cả run**: 0 → 1e-4 → 1e-8 (warm-up 10% rồi cosine), weight decay 0.001 cho mọi module học được. Val mỗi 40 bước (cũng là lúc log vector Δw của E expert), patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất.
 - **Quy trình**: pretrain (image→vision→Mentor→Cls head) → đóng băng Mentor+Cls head → finetune phần còn lại.
 
 ### Router
 
 ```
 X = Y_mentor                          [B,14,D]
-h = X·W_D + N(0,1) ⊙ softplus(X·W_noise)      [B,14]   (W_D, W_noise: D→1)
+h = Norm(X·W_D) + 0.1·N(0,1)          [B,14]   (W_D: D→1; Norm = RMSNorm trên 14 token)
 E = W_E · h                           [B,E]    (W_E: E×14)
 P = sqrt( softmax_E(E) ⊙ sigmoid(E) )          [B,E]
 w = P_k / Σ P_k                        (top-k theo P; k = E ⇒ dense)
@@ -35,7 +35,7 @@ Hạng tử nhiễu **chỉ có khi training**; suy luận (`.eval()`, greedy) b
 
 | Mục | Làm gì | Bạn chọn |
 |---|---|---|
-| 3.1 | Khảo sát cặp (k, E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6) | — |
+| 3.1 | Khảo sát cặp (k, E): (3,6) (4,8) (5,10) | — |
 | 3.2 | Có cần MoE-DoRA? Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp32.k`, `exp32.E` |
 | 3.3 | So vị trí leaderboard / SoTA bị vượt (train/val/test trên benchmark) | *chưa cài đặt* |
 

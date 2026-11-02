@@ -3,7 +3,7 @@
     Input [B,N,D] ─► Mentor: RMSNorm ─► Attn pooling (14 query) ─► [B,14,D] ─┬─► Cls head: RMSNorm ─► Linear ─► [B,14,C]
                                                                               └─► NoisyRouter ─► w [B,E]
 
-Router: E = W_E[X·W_D + N(0,1)·softplus(X·W_noise)],  P = sqrt(softmax(E)·sigmoid(E)),
+Router: E = W_E[Norm(X·W_D) + 0.1·N(0,1)],  P = sqrt(softmax(E)·sigmoid(E)),
         top-k theo P rồi chuẩn hoá w = P_k/ΣP_k. Nhiễu chỉ có khi training; suy luận (eval) không nhiễu.
 """
 from __future__ import annotations
@@ -21,8 +21,9 @@ from .gemma_bridge import RMSNorm
 N_LABELS = 14
 MENTOR_FILE = "mentor_branch.safetensors"
 MENTOR_META = "mentor_branch.json"
-MENTOR_FORMAT = "rgexp.mentor_branch/2"
-MENTOR_FORMATS_OK = ("rgexp.mentor_branch/1", MENTOR_FORMAT)   # /1: Router cũ; Mentor + Cls head dùng lại được
+MENTOR_FORMAT = "rgexp.mentor_branch/3"
+# /1, /2: Router cũ (khác kiến trúc) — bị bỏ khi nạp; Mentor + Cls head vẫn dùng lại được
+MENTOR_FORMATS_OK = ("rgexp.mentor_branch/1", "rgexp.mentor_branch/2", MENTOR_FORMAT)
 
 
 class Mentor(nn.Module):
@@ -77,13 +78,15 @@ class NoisyRouter(nn.Module):
     """Router nhiễu (noisy gating) trên đầu ra Mentor.
 
         X = Y_mentor                       [B,14,D]
-        h = X·W_D + N(0,1) ⊙ softplus(X·W_noise)      [B,14]   (W_D, W_noise: D→1; nhiễu CHỈ khi training)
+        h = Norm(X·W_D) + 0.1·N(0,1)      [B,14]   (W_D: D→1; Norm = RMSNorm trên 14 token; nhiễu CHỈ khi training)
         E = W_E · h                        [B,E]        (W_E: E×14)
         P = sqrt(softmax_E(E) ⊙ sigmoid(E))             [B,E]
         top-k theo P rồi w = P_k / Σ P_k   [B,E]        (Σw = 1; k=E ⇒ dày đặc)
 
     Không clamp logit. Không aux loss. Khi suy luận (`.eval()`) hạng tử nhiễu bị bỏ hẳn.
     """
+
+    NOISE_STD = 0.1
 
     def __init__(self, d: int, n_experts: int, n_tokens: int = N_LABELS,
                  top_k: int | None = None):
@@ -94,19 +97,18 @@ class NoisyRouter(nn.Module):
         self.top_k = (None if top_k is None or int(top_k) >= self.n_experts
                       else int(top_k))
         self.W_D = nn.Linear(d, 1, bias=False)
-        self.W_noise = nn.Linear(d, 1, bias=False)
+        self.norm_h = RMSNorm(n_tokens)
         self.W_E = nn.Linear(n_tokens, n_experts, bias=False)
         nn.init.normal_(self.W_D.weight, std=0.02)
-        nn.init.normal_(self.W_noise.weight, std=0.02)
         nn.init.normal_(self.W_E.weight, std=1.0 / math.sqrt(n_tokens))
 
     def forward(self, m: torch.Tensor) -> dict:
         if m.dim() != 3 or m.shape[1] != self.n_tokens:
             raise RuntimeError(f"Router cần [B,{self.n_tokens},D], nhận {tuple(m.shape)}")
         x = m.float()
-        h = self.W_D(x).squeeze(-1)                                              # [B,14]
+        h = self.norm_h(self.W_D(x).squeeze(-1))                                 # [B,14], RMS ≈ 1
         if self.training:
-            h = h + torch.randn_like(h) * F.softplus(self.W_noise(x).squeeze(-1))
+            h = h + self.NOISE_STD * torch.randn_like(h)
         e = self.W_E(h)                                                          # [B,E]
         p = torch.sqrt(torch.softmax(e, dim=-1) * torch.sigmoid(e) + 1e-12)      # [B,E]
         top_idx = None
@@ -194,7 +196,7 @@ def load_branch(d: Path, device=None, dtype=None) -> MentorBranch:
     spec = dict(meta["spec"])
     old = meta.get("format") != MENTOR_FORMAT
     sd = load_file(str(d / MENTOR_FILE))
-    if old:      # bản /1: bỏ Router cũ (kiến trúc khác), giữ Mentor + Cls head; Router mới khởi tạo lại
+    if old:      # bản /1, /2: bỏ Router cũ (kiến trúc khác), giữ Mentor + Cls head; Router mới khởi tạo lại
         spec.pop("router_type", None)
         spec["route_enabled"] = False
         sd = {k: v for k, v in sd.items() if k.split(".", 1)[0] in ("mentor", "cls_head")}

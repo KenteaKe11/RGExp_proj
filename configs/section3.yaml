@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # §3 — Mentor · Cls head · NoisyRouter · MoE-DoRA
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.1  Khảo sát cặp (k, E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6); router chọn top-k trên E expert
+#   3.1  Khảo sát cặp (k, E): (3,6) (4,8) (5,10); router chọn top-k trên E expert
 #   3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
 #   (3.3 — so vị trí leaderboard / SoTA bị vượt: mới là giả thuyết, CHƯA cài đặt)
 #
@@ -91,8 +91,8 @@ labels:                        # nhãn sinh LAZY từ CheXbert; KHÔNG đọc la
   device: auto
 
 train:
-  # 6400 mẫu · eff_bs 16 · 400 bước = 2 epoch × 200 bước (1 lượt qua 6400 mẫu); mỗi epoch một chu kỳ
-  # cosine annealing độc lập (peak epoch e = peak × lr_decay^e).
+  # 6400 mẫu · eff_bs 16 · 400 bước = 2 epoch × 200 bước (1 lượt qua 6400 mẫu); lr: một chu kỳ OneCycle
+  # trên cả 400 bước (xem schedule bên dưới).
   n_epochs: 2
   steps_per_epoch: 200
   epoch_split: true
@@ -107,15 +107,16 @@ train:
   adam_betas: [0.9, 0.95]
   max_grad_norm: 1.0
   logging_steps: 10
-  # MỘT lịch lr cho mọi pipeline. Chu kỳ đầu: 0 → 1e-4 → 8e-7 (warm-up tuyến tính pct_start, rồi cosine);
-  # chu kỳ epoch e nhân cả đường cong với lr_decay**e.
+  # MỘT lịch lr cho mọi pipeline: OneCycle, MỘT chu kỳ trên toàn run (400 bước): 0 → 1e-4 → 1e-8
+  # (warm-up tuyến tính pct_start, rồi cosine). one_cycle=false ⇒ mỗi epoch một chu kỳ, nhân lr_decay**e.
   schedule:
     max_lr: 1.0e-4
     lr_init: 0.0
-    lr_min: 8.0e-7
+    lr_min: 1.0e-8
     pct_start: 0.1
     anneal: cos
-    lr_decay: 0.875
+    lr_decay: 0.875               # chỉ dùng khi one_cycle=false
+    one_cycle: true
   all_linear: true             # DoRA trên MỌI Linear của decoder (q,k,v,o,gate,up,down); target_modules chỉ còn là dự phòng
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   include_prefixes: [language_model, model.language_model]
@@ -147,11 +148,11 @@ pretrain:                      # image → vision encoder → Mentor → Cls hea
 # Mọi pipeline (pretrain và finetune) chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
 # và nạp lại tham số của lần val tốt nhất.
 validation:
-  every_steps: 20
+  every_steps: 40
   patience: 3
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
-exp31: {pairs: [[1, 2], [2, 3], [2, 4], [3, 4], [3, 5], [3, 6]]}   # (k, E): top-k trên E expert
+exp31: {pairs: [[3, 6], [4, 8], [5, 10]]}   # (k, E): top-k trên E expert
 exp32: {k: null, E: null}                 # BẠN chọn k, E (best.json của 3.1 chỉ là gợi ý)
 
 analysis:
@@ -211,5 +212,5 @@ output:
   hub_private: true
   push: true
   push_per_arm: true
-  subdir: "3.1_k_e_pairs"
-  adapter_dir: ./adapters_3_1
+  subdir: "3.1_k_e_pairs_v2"
+  adapter_dir: ./adapters_3_1_v2

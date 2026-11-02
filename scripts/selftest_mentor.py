@@ -57,6 +57,26 @@ for bias in (False, True):
     check(f"Σ wᵢ·DoRAᵢ khớp ma trận đầy đủ (bias={bias})",
           torch.allclose(m(x), ref, atol=1e-4), f"max|Δ|={(m(x)-ref).abs().max():.2e}")
 
+# 2b. vector Δw: ‖θᵢ(t) − θᵢ(0)‖ của riêng PEFT expert i (A, B, magnitude) so với lúc khởi tạo
+from src import s3_model as SM
+_b2, _c2, m2 = build(E=4, r=3, din=16, dout=12)
+seq = nn.Sequential(m2)
+ref2 = SM.expert_snapshot(seq)
+check("Δw bước 0 = vector E số 0", SM.expert_delta_norms(seq, ref2) == [0.0] * 4)
+with torch.no_grad():
+    dA = torch.randn_like(m2.lora_A) * 0.1
+    dB = torch.randn_like(m2.lora_B) * 0.1
+    dM = torch.randn_like(m2.lora_magnitude) * 0.1
+    dA[2] = 0; dB[2] = 0; dM[2] = 0                  # expert 2 đứng yên
+    m2.lora_A.add_(dA); m2.lora_B.add_(dB); m2.lora_magnitude.add_(dM)
+dn = SM.expert_delta_norms(seq, ref2)
+ref_dn = [float((dA[i].pow(2).sum() + dB[i].pow(2).sum() + dM[i].pow(2).sum()).sqrt()) for i in range(4)]
+check("Δw: ‖Δ(A,B,m)‖ từng expert khớp tính tay; expert đứng yên = 0",
+      len(dn) == 4 and max(abs(a - b) for a, b in zip(dn, ref_dn)) < 1e-5 and dn[2] == 0.0,
+      f"max|Δ|={max(abs(a - b) for a, b in zip(dn, ref_dn)):.1e}")
+check("Δw: không MoE ⇒ snapshot None, Δw None", SM.expert_snapshot(nn.Linear(2, 2)) is None
+      and SM.expert_delta_norms(nn.Linear(2, 2), None) is None)
+
 # 3. one-hot w == DoRA đơn
 oh = torch.zeros(5, 3); oh[:, 1] = 1
 ctx.set(oh)
@@ -91,7 +111,7 @@ check("Router top-k=E suy biến thành dense", M.NoisyRouter(32, 5, top_k=5).to
 # công thức P (eval, không nhiễu)
 rt.eval()
 with torch.no_grad():
-    h = rt.W_D(feat).squeeze(-1)
+    h = rt.norm_h(rt.W_D(feat).squeeze(-1))
     e = rt.W_E(h)
     p = torch.sqrt(torch.softmax(e, -1) * torch.sigmoid(e))
     check("Router eval: w = P/ΣP đúng công thức", torch.allclose(rt(feat)["weights"], p / p.sum(-1, keepdim=True), atol=1e-5))
@@ -101,8 +121,20 @@ with torch.no_grad():
     check("Router train: có nhiễu (hai lượt khác nhau)", not torch.equal(rt(feat)["weights"], rt(feat)["weights"]))
 rt.zero_grad()
 (rt(feat)["weights"] * torch.randn(4, 10)).sum().backward()
-check("Router: gradient tới W_D, W_noise, W_E",
-      all(q.grad is not None and q.grad.abs().sum() > 0 for q in (rt.W_D.weight, rt.W_noise.weight, rt.W_E.weight)))
+check("Router: gradient tới W_D, Norm, W_E",
+      all(q.grad is not None and q.grad.abs().sum() > 0 for q in (rt.W_D.weight, rt.norm_h.weight, rt.W_E.weight)))
+check("Router: không còn W_noise (nhiễu cố định 0.1)", not hasattr(rt, "W_noise") and rt.NOISE_STD == 0.1)
+rt.eval()
+with torch.no_grad():
+    h0 = rt.norm_h(rt.W_D(feat).squeeze(-1))
+    check("Norm(X·W_D): RMS ≈ 1 trên 14 token", torch.allclose(h0.pow(2).mean(-1).sqrt(), torch.ones(4), atol=1e-3))
+rt.train()
+torch.manual_seed(0)
+with torch.no_grad():
+    rt.eval(); w_eval = rt(feat)["weights"]
+    rt.train(); w_tr = rt(feat)["weights"]
+    rel = ((w_tr - w_eval).abs().mean() / w_eval.abs().mean()).item()
+    check("nhiễu 0.1 nhỏ: w train lệch w eval có kiểm soát (0 < lệch tương đối < 0.3)", 0 < rel < 0.3, f"[{rel:.3f}]")
 
 # 7. Mentor/Cls head shape + loss + lưu/nạp
 br = M.MentorBranch(32, 14, 4, 10, n_heads=4)

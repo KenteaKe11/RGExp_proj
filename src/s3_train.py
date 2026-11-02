@@ -51,8 +51,9 @@ def _to_dev(batch: dict, dev) -> dict:
 
 
 def build_sched(opt, steps: int, scfg: dict, cycle: int = 0):
-    """Lịch lr tuyệt đối, dùng chung pretrain/finetune: chu kỳ đầu 0 → max_lr → lr_min
-    (warm-up tuyến tính `pct_start` rồi cosine). Có `cycle` ⇒ mỗi epoch là một chu kỳ, chu kỳ e
+    """Lịch lr tuyệt đối, dùng chung pretrain/finetune. `one_cycle: true` (mặc định của §3): MỘT chu kỳ
+    OneCycle trên toàn bộ `steps` bước, 0 → max_lr (warm-up tuyến tính `pct_start`) → lr_min (cosine),
+    không khởi động lại giữa các epoch. Tắt `one_cycle` ⇒ có `cycle`: mỗi epoch là một chu kỳ, chu kỳ e
     nhân cả đường cong với lr_decay**e."""
     from torch.optim.lr_scheduler import LambdaLR
 
@@ -61,6 +62,8 @@ def build_sched(opt, steps: int, scfg: dict, cycle: int = 0):
         raise ValueError(f"schedule: cần 0 ≤ lr_init, lr_min ≤ max_lr (nhận {lo}, {mn}, {peak})")
     pct, anneal = float(scfg.get("pct_start", 0.1)), str(scfg.get("anneal", "cos"))
     decay = float(scfg.get("lr_decay", 1.0))
+    if bool(scfg.get("one_cycle", False)):
+        cycle = 0
     if not 0.0 < decay <= 1.0:
         raise ValueError("schedule.lr_decay phải nằm trong (0, 1]")
 
@@ -112,8 +115,8 @@ def _group_grad_norms(opt) -> dict:
 
 
 def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
-          seed, log_every, tracker, tag, route_ctx=None, val_ds=None, val_every=20,
-          patience=3, to_eval=None, to_train=None):
+          seed, log_every, tracker, tag, route_ctx=None, val_ds=None, val_every=40,
+          patience=3, to_eval=None, to_train=None, log_path=None):
     """Vòng lặp chung. OOM -> hạ micro-batch một bậc và làm lại bước đó.
 
     Mỗi `val_every` bước chạy tập val (cùng `loss_fn`); `patience` lần val liên tiếp không tốt hơn
@@ -139,6 +142,7 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
     micro = ladder[0]
     val_every = max(1, min(int(val_every), steps))
     hist, vhist = [], []
+    ref0 = sm.expert_snapshot(b.model) if log_path else None     # θᵢ(0) của E expert PEFT (để log Δwᵢ)
     best = {"loss": float("inf"), "step": 0, "state": None}
     bad = 0
     stopped = False
@@ -215,10 +219,11 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                   f"ce_cls {comps['ce_cls']:.4f} · lr {lr:.2e} · micro {micro}"
                   + "".join(f" · gn_{k} {v:.3e}" for k, v in gn.items()), flush=True)
             if tracker is not None:
-                tracker.log({f"train/{tag}/ce_text": comps["ce_text"],
-                             f"train/{tag}/ce_cls": comps["ce_cls"],
-                             f"train/{tag}/lr": lr, f"train/{tag}/step": step + 1,
-                             **{f"train/{tag}/grad_norm_{k}": v for k, v in gn.items()}})
+                payload = {f"train/{tag}/ce_text": comps["ce_text"],
+                           f"train/{tag}/ce_cls": comps["ce_cls"],
+                           f"train/{tag}/lr": lr, f"train/{tag}/step": step + 1,
+                           **{f"train/{tag}/grad_norm_{k}": v for k, v in gn.items()}}
+                tracker.log(payload)
         if val_ds is not None and ((step + 1) % val_every == 0 or step == steps - 1):
             vl, vp = validate()
             improved = vl < best["loss"] - 1e-6
@@ -232,9 +237,15 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
             print(f"    [{tag}] VAL bước {step + 1}: loss {vl:.4f} "
                   + " ".join(f"{k} {v:.4f}" for k, v in vp.items())
                   + f" · {'tốt nhất' if improved else f'không cải thiện {bad}/{patience}'}", flush=True)
+            dw = sm.expert_delta_norms(b.model, ref0) if log_path else None   # Δwᵢ = ‖θᵢ(t)−θᵢ(0)‖, E expert
+            if dw:
+                print(f"    [{tag}] Δw bước {step + 1}: [" + " ".join(f"{x:.3g}" for x in dw) + "]", flush=True)
             if tracker is not None:
-                tracker.log({f"val/{tag}/loss": vl, f"val/{tag}/step": step + 1,
-                             **{f"val/{tag}/{k}": v for k, v in vp.items()}})
+                payload = {f"val/{tag}/loss": vl, f"val/{tag}/step": step + 1,
+                           **{f"val/{tag}/{k}": v for k, v in vp.items()}}
+                if dw:      # MỘT log_path cho cả E expert: train/<exp>/<arm>/delta_w.e0 … .e{E-1} (mỗi lần val)
+                    payload[f"{log_path}/delta_w"] = {f"e{i}": v for i, v in enumerate(dw)}
+                tracker.log(payload)
             if bad >= patience:
                 stopped = True
                 print(f"    [{tag}] DỪNG SỚM tại bước {step + 1} (patience {patience}); "
@@ -281,8 +292,8 @@ def run_pretrain(cfg, train_df: pd.DataFrame, val_df, cls_y: dict, out_dir: Path
     val_ds = (ClsReportDataset(val_df, b.processor, cfg, int(tcfg.get("max_seq_len", 1024)),
                                cls_y, b.img_kw) if val_df is not None and len(val_df) else None)
     print(f"  pretrain: {len(ds)} mẫu · {epochs} epoch"
-          + (f" × {cycle} bước (cosine mỗi epoch)" if split else "")
-          + f" · eff_bs {eff} · {steps} bước · lr {lr:.1e} · val mỗi {vcfg.get('every_steps', 20)} bước "
+          + (f" × {cycle} bước" if split else "")
+          + f" · eff_bs {eff} · {steps} bước · lr {lr:.1e} · val mỗi {vcfg.get('every_steps', 40)} bước "
           f"(patience {vcfg.get('patience', 3)}) · nhóm {ng}", flush=True)
     pad = int(b.processor.tokenizer.pad_token_id or 0)
     b.branch.train()
@@ -296,7 +307,7 @@ def run_pretrain(cfg, train_df: pd.DataFrame, val_df, cls_y: dict, out_dir: Path
               micro_top=int(pcfg.get("per_device_batch_size", 16)), opt=opt, sched=sched,
               loss_fn=loss_fn, clip=float(tcfg.get("max_grad_norm", 1.0)), seed=seed,
               log_every=int(tcfg.get("logging_steps", 10)), tracker=tracker, tag="pretrain",
-              val_ds=val_ds, val_every=int(vcfg.get("every_steps", 20)),
+              val_ds=val_ds, val_every=int(vcfg.get("every_steps", 40)),
               patience=int(vcfg.get("patience", 3)), to_eval=b.branch.eval, to_train=b.branch.train)
     out_dir = Path(out_dir)
     meta = {"phase": "pretrain", "decoder": "none", "steps": steps, "eff_bs": eff,
@@ -364,10 +375,11 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     vcfg = dict(cfg.get("validation", {}) or {})
     val_ds = (ClsReportDataset(val_df, b.processor, cfg, int(tcfg.get("max_seq_len", 1024)),
                                cls_y, b.img_kw) if val_df is not None and len(val_df) else None)
-    print(f"  val mỗi {vcfg.get('every_steps', 20)} bước · patience {vcfg.get('patience', 3)} · "
+    print(f"  val mỗi {vcfg.get('every_steps', 40)} bước · patience {vcfg.get('patience', 3)} · "
           f"{0 if val_ds is None else len(val_ds)} mẫu val", flush=True)
     print(f"  {len(ds)} mẫu · eff_bs {eff} · {steps} bước"
-          + (f" = {n_ep} epoch × {cycle} bước (epoch_split, lr_decay {scfg.get('lr_decay', 1)})"
+          + (f" = {n_ep} epoch × {cycle} bước (epoch_split; "
+             + ("OneCycle 1 chu kỳ toàn run" if scfg.get("one_cycle") else f"lr_decay {scfg.get('lr_decay', 1)}") + ")"
              if epoch_split else "") + f" · λ_cls {lam} · nhóm {ng}", flush=True)
 
     pad = int(b.processor.tokenizer.pad_token_id or 0)
@@ -406,8 +418,9 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
               micro_top=int(tcfg.get("per_device_batch_size", 8)), opt=opt, sched=sched,
               loss_fn=loss_fn, clip=float(tcfg.get("max_grad_norm", 1.0)), seed=seed,
               log_every=int(tcfg.get("logging_steps", 10)), tracker=tracker, tag=arm["id"],
-              route_ctx=b.route_ctx, val_ds=val_ds, val_every=int(vcfg.get("every_steps", 20)),
-              patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode)
+              route_ctx=b.route_ctx, val_ds=val_ds, val_every=int(vcfg.get("every_steps", 40)),
+              patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode,
+              log_path=f"train/{cfg.get('experiment', '3.1')}/{arm['id']}")
     meta = {"phase": "finetune", "arm_id": arm["id"], "name": arm.get("name", arm["id"]),
             "decoder": decoder, "n_experts": int(arm.get("E", 0)), "top_k": arm.get("top_k"),
             "rank": b.rank, "alpha": b.alpha, "method": "qdora", "quantized": True,
