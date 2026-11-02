@@ -56,7 +56,7 @@ bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3 --set exp32.E=5
 |---|---|
 | `--dry-run` | thử đường ống (8 ảnh, 4 bước, không đẩy Hub) |
 | `--stages a,b` | chỉ chạy các stage: `data,pretrain,train,infer,score,stats,analysis,report,push` |
-| `--arms id1,id2` | chỉ chạy một số arm |
+| `--arms id1,id2` | chạy RIÊNG một số arm ⇒ chỉ sinh báo cáo con `runs/<mục>/arms/<arm>/REPORT.md` (+ `summary.json`), không có kiểm định/báo cáo cuối |
 | `--force` | pretrain lại (bỏ bản local và Hub) |
 | `--retrain` | train lại arm (xoá predictions/điểm cũ) |
 | `--rescore` | chấm điểm lại |
@@ -64,6 +64,8 @@ bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3 --set exp32.E=5
 | `--no-push` · `--no-wandb` | không đẩy Hub · không ghi W&B |
 | `--detach` | chạy nền, log ở `logs/` |
 | `--set key=value` | ghi đè config, ví dụ `--set train.schedule.max_lr=5e-5` |
+
+**Báo cáo con → báo cáo cuối**: mỗi arm có báo cáo con riêng (`arms/<arm>/`); chạy lần lượt `--arms <id>` cho từng arm (có thể ở nhiều máy, qua Hub). Chạy không kèm `--arms` thì báo cáo cuối **bắt buộc đủ** báo cáo con của mọi arm (thiếu ⇒ dừng, mã 9, liệt kê arm thiếu) và lấy trực tiếp bảng thiết lập/điểm/Cls head/Route từ các báo cáo con; chỉ xếp hạng và kiểm định ghép cặp được tính ở đó.
 
 **Tái sử dụng**: mọi lần chạy quét Hub trước. Có predictions ⇒ bỏ qua train + infer; có adapter ⇒ bỏ qua train;
 có điểm ⇒ bỏ qua chấm. Pretrain lưu safetensors ở `adapters_3_pretrain/` (Hub: `pretrain_mentor/`) và dùng chung cho 3.1–3.2.

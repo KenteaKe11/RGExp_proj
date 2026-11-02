@@ -178,6 +178,51 @@ def main() -> int:
         check("onehot (N,14,4) tổng 1", oh.shape == (3, 14, 4) and np.allclose(oh.sum(-1), 1))
         check("positives = pos|unc", lab.positives(np.array([[0, 1, 2, 3]])).tolist() == [[False, True, False, True]])
 
+        # ── báo cáo con từng arm + báo cáo cuối bắt buộc đủ, lấy trực tiếp từ báo cáo con ──
+        import json as _json
+        import pandas as pd
+        from src import report_section3 as rp
+        rd = Path(td) / "run_rp"
+        (rd / "metrics" / "analysis").mkdir(parents=True)
+        (rd / "predictions").mkdir()
+        rng = np.random.default_rng(0)
+        mk = lambda off: pd.DataFrame({"key": [f"k{i}" for i in range(30)],
+                                       "bleu1": rng.random(30) * 0.1 + off, "rouge1": rng.random(30) * 0.1 + off,
+                                       "chexbert_f1": rng.random(30) * 0.1 + off})
+        arms_t = [{"id": "base", "name": "A", "kind": "infer", "decoder": "none", "E": 0, "top_k": None, "pretrain": False},
+                  {"id": "dora", "name": "B", "kind": "ft", "decoder": "dora", "E": 0, "top_k": None, "pretrain": True},
+                  {"id": "moe", "name": "C", "kind": "ft", "decoder": "moe", "E": 4, "top_k": 2, "k": 2, "pretrain": True}]
+        sc = {x["id"]: mk(0.1 * i) for i, x in enumerate(arms_t)}
+        nm = {x["id"]: x["name"] for x in arms_t}
+        for x in arms_t[:2]:
+            rp.write_arm(cfg, "3.2", rd, x, sc[x["id"]], None, 30)
+        check("báo cáo con: có arms/<id>/REPORT.md + summary.json",
+              all((rd / "arms" / i / f).exists() for i in ("base", "dora") for f in ("REPORT.md", "summary.json")))
+        try:
+            rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], {}, arms_t, None)
+            check("báo cáo cuối thiếu báo cáo con ⇒ DỪNG (ReportIncomplete)", False)
+        except rp.ReportIncomplete as e:
+            check("báo cáo cuối thiếu báo cáo con ⇒ DỪNG (ReportIncomplete)", list(e.missing) == ["moe"], str(e.missing))
+        rp.write_arm(cfg, "3.2", rd, arms_t[2], sc["moe"], None, 30)          # MoE chưa có phân tích route
+        try:
+            rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], {}, arms_t, None)
+            check("arm MoE chưa có route ⇒ báo cáo con CHƯA ĐỦ", False)
+        except rp.ReportIncomplete as e:
+            check("arm MoE chưa có route ⇒ báo cáo con CHƯA ĐỦ", "route" in e.missing.get("moe", ""))
+        (rd / "metrics" / "analysis" / "moe_route_verdict.json").write_text(_json.dumps(
+            {"reading": "có phân hoá giữa các expert", "param_cos_offdiag": 0.01, "threshold": 0.9, "route_cv": 1.0,
+             "cv_floor": 0.05, "n_images": 30, "collapsed": False, "route_corr_offdiag": -0.1}), encoding="utf-8")
+        rp.write_arm(cfg, "3.2", rd, arms_t[2], sc["moe"], None, 30)
+        sj = rd / "arms" / "base" / "summary.json"
+        s_ = _json.loads(sj.read_text(encoding="utf-8"))
+        s_["scores"]["bleu1"] = 0.9991
+        sj.write_text(_json.dumps(s_), encoding="utf-8")                      # sửa tay báo cáo con
+        man = {}
+        pth = rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], man, arms_t, None)
+        txt = pth.read_text(encoding="utf-8")
+        check("báo cáo cuối đủ: lấy TRỰC TIẾP từ báo cáo con (giá trị sửa tay xuất hiện) + liên kết tới arms/<id>",
+              "0.9991" in txt and "arms/moe/REPORT.md" in txt and "có phân hoá" in txt)
+
     bad = OK.count(False)
     print(f"\n{'✓ TẤT CẢ' if not bad else '✗ HỎNG'} {len(OK) - bad}/{len(OK)}")
     return 1 if bad else 0

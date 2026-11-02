@@ -213,12 +213,23 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f"✗ {e}")
         return 2
+    all_ids = [x["id"] for x in arms]
+    partial = False
     if a.arms:
-        want = {x.strip() for x in a.arms.split(",")}
+        want = {x.strip() for x in a.arms.split(",") if x.strip()}
+        unknown = sorted(want - set(all_ids))
+        if unknown:
+            print(f"✗ --arms có arm không tồn tại: {unknown} (hợp lệ: {', '.join(all_ids)})")
+            return 2
         arms = [x for x in arms if x["id"] in want]
+        partial = len(arms) < len(all_ids)
     if not arms:
         print("✗ không arm nào")
         return 2
+    if partial:
+        print(f"⚙ CHẠY RIÊNG {len(arms)}/{len(all_ids)} arm ({', '.join(x['id'] for x in arms)}): chỉ sinh "
+              "báo cáo CON của từng arm; không có kiểm định ghép cặp / xếp hạng / báo cáo cuối "
+              "(chạy lại không kèm --arms khi mọi arm đã có báo cáo con).", flush=True)
 
     from . import imaging
     try:
@@ -237,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     declared = [x["id"] for x in arms]
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
 
+    import shutil
+
+    from . import report_section3 as rp
     from . import s3_model as sm
     from . import s3_train as st_mod
 
@@ -261,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         for arm in arms:
             for f in (run_dir / "predictions" / f"{arm['id']}.jsonl", mdir / f"per_sample_{arm['id']}.csv"):
                 f.unlink(missing_ok=True)
-    import shutil
+            shutil.rmtree(rp.arm_dir(run_dir, arm["id"]), ignore_errors=True)
     for arm in arms:                    # kết quả dùng lại từ mục khác (đối chứng dùng lại, nếu có)
         ru = arm.get("reuse")
         if not ru:
@@ -312,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             if hub.has_dir(f"{sub}/adapters/{aid}", ("train_stats.json", "mentor_branch.safetensors") + must):
                 hub.pull_dir(f"{sub}/adapters/{aid}", adapter_root / aid)
         arm["need_train"] = a.retrain or not trained(arm)
+    for arm in arms:                    # báo cáo con đã có trên Hub ⇒ kéo về (không phải làm lại)
+        ad_ = rp.arm_dir(run_dir, arm["id"])
+        if not a.retrain and not a.rescore and not (ad_ / "summary.json").exists():
+            hub.pull_dir(f"{sub}/arms/{arm['id']}", ad_)
     print("⚙ trạng thái: " + " · ".join(
         f"{x['id']}[{'infer✓' if x['preds_done'] else ('train✓' if not x.get('need_train', True) else 'cần train')}]"
         for x in arms), flush=True)
@@ -418,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                 (run_dir / "manifest.json").write_text(
                     json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
                 return 3
+            arm["fresh"] = True
             manifest["arm_status"][aid] = {"trained": True, "minutes": s.get("minutes"),
                                            "best_step": s.get("best_step"),
                                            "stopped_early": s.get("stopped_early"),
@@ -453,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
                 tracker.alert("§3 dừng: không sinh được", f"{arm['id']}: {e}", "ERROR")
                 tracker.finish(1)
                 return 6
+            arm["fresh"] = True
             manifest["arm_status"].setdefault(arm["id"], {})["infer"] = {
                 "ok": True, "minutes": round((time.time() - t0) / 60, 1)}
             if cfg["output"].get("push_per_arm", True):
@@ -495,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["n_eval"] = align_info["n_common"]
 
     best = None
-    if exp == "3.1":
+    if exp == "3.1" and not partial:
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
         best["note"] = "GỢI Ý — k/E do người dùng quyết định"
@@ -507,7 +527,9 @@ def main(argv: list[str] | None = None) -> int:
     # ── stats ──────────────────────────────────────────────────────────────
     pw = pd.DataFrame()
     pwp = mdir / "pairwise_tests.csv"
-    if "stats" in stages:
+    if partial:
+        pass                                  # chạy riêng arm: không có kiểm định ghép cặp
+    elif "stats" in stages:
         _hr("Bootstrap ghép cặp + Permutation")
         from .stats_multi import compare_pairs, summary_lines
         cols = metric_columns(scores[declared[0]])
@@ -520,51 +542,68 @@ def main(argv: list[str] | None = None) -> int:
     elif pwp.exists():
         pw = pd.read_csv(pwp)
 
+    # arm nào cần (làm lại) báo cáo con: chưa có/chưa đủ, hoặc vừa train/infer/chấm lại trong lần chạy này
+    need_sub = [x for x in arms if a.retrain or a.rescore or x.get("fresh")
+                or rp.arm_problem(rp.load_arm_summary(run_dir, x["id"]), x)]
+
     # ── analysis: Similarity giữa Expert + Expert-Labels ───────────────────
-    if "analysis" in stages:
-        moe_arms = [x for x in ft_arms if x["decoder"] == "moe"]
+    if "analysis" in stages and any(x["kind"] == "ft" for x in need_sub):
+        moe_arms = [x for x in need_sub if x["kind"] == "ft" and x["decoder"] == "moe"]
+        from . import s3_analysis as an
+        tkeys = test_df["key"].astype(str).tolist()
+        states = lab.get_states(cfg, tkeys, test_df["ref"].astype(str).tolist(), "test")
+        pos = lab.positives(states)
+        (mdir / "analysis").mkdir(parents=True, exist_ok=True)
         if moe_arms:
             _hr("Phân tích Route: Similarity giữa Expert · Expert-Labels")
-            from . import s3_analysis as an
-            tkeys = test_df["key"].astype(str).tolist()
-            states = lab.get_states(cfg, tkeys, test_df["ref"].astype(str).tolist(), "test")
-            pos = lab.positives(states)
-            for arm in moe_arms:
-                ad = arm.get("adapter_root", adapter_root) / arm["id"]
-                if not (ad / sm.EXPERTS_FILE).exists():     # cần tham số expert cho cosine ΔW
-                    hub.pull_dir(f"{arm.get('hub_sub', sub)}/adapters/{arm['id']}", ad,
-                                 [sm.EXPERTS_FILE, sm.EXPERTS_META])
-                res = an.analyse(arm["id"], ad, read_preds(pred_paths[arm["id"]]),
-                                 tkeys, pos, tkeys, mdir / "analysis",
-                                 float(cfg.get("analysis", {}).get("collapse_threshold", 0.9)),
-                                 float(cfg.get("analysis", {}).get("static_cv", 0.05)))
-                if res:
-                    v = res["verdict"]
-                    print(f"  [{arm['id']}] route_corr={v['route_corr_offdiag']:.3f} "
-                          f"param_cos={v['param_cos_offdiag']:.3f} -> {v['reading']}", flush=True)
-                    manifest["arm_status"].setdefault(arm["id"], {})["route_verdict"] = v
-            np.save(mdir / "analysis" / "test_pos.npy", pos)
-            (mdir / "analysis" / "test_keys.json").write_text(json.dumps(tkeys), encoding="utf-8")
+        for arm in moe_arms:
+            ad = arm.get("adapter_root", adapter_root) / arm["id"]
+            if not (ad / sm.EXPERTS_FILE).exists():     # cần tham số expert cho cosine ΔW
+                hub.pull_dir(f"{arm.get('hub_sub', sub)}/adapters/{arm['id']}", ad,
+                             [sm.EXPERTS_FILE, sm.EXPERTS_META])
+            res = an.analyse(arm["id"], ad, read_preds(pred_paths[arm["id"]]),
+                             tkeys, pos, tkeys, mdir / "analysis",
+                             float(cfg.get("analysis", {}).get("collapse_threshold", 0.9)),
+                             float(cfg.get("analysis", {}).get("static_cv", 0.05)))
+            if res:
+                v = res["verdict"]
+                print(f"  [{arm['id']}] route_corr={v['route_corr_offdiag']:.3f} "
+                      f"param_cos={v['param_cos_offdiag']:.3f} -> {v['reading']}", flush=True)
+                manifest["arm_status"].setdefault(arm["id"], {})["route_verdict"] = v
+        np.save(mdir / "analysis" / "test_pos.npy", pos)
+        (mdir / "analysis" / "test_keys.json").write_text(json.dumps(tkeys), encoding="utf-8")
 
     # ── report ─────────────────────────────────────────────────────────────
     if "report" in stages:
-        _hr("Báo cáo")
+        _hr("Báo cáo con" if partial else "Báo cáo")
         manifest["minutes_total"] = round((time.time() - t_start) / 60, 1)
+        by_stat = {s.get("arm_id"): s for s in train_stats}
         try:
-            from . import report_section3
-            report_section3.write_all(cfg, exp, run_dir, scores, names, pw, train_stats, manifest,
-                                      arms=arms, best=best, test_df=test_df)
+            for arm in need_sub:                       # báo cáo con của từng arm (đọc lại ở báo cáo cuối)
+                if arm["id"] in scores:
+                    rp.write_arm(cfg, exp, run_dir, arm, scores[arm["id"]], by_stat.get(arm["id"]),
+                                 manifest.get("n_eval"), manifest["arm_status"].get(arm["id"]))
+            if not partial:
+                rp.write_all(cfg, exp, run_dir, scores, names, pw, train_stats, manifest,
+                             arms=arms, best=best, test_df=test_df)
+        except rp.ReportIncomplete as e:
+            print("✗ BÁO CÁO CUỐI cần ĐỦ báo cáo con của mọi arm — còn thiếu:", flush=True)
+            for k, v in e.missing.items():
+                print(f"    · {k}: {v}", flush=True)
+            print("  → chạy riêng từng arm: `--arms <id>` (hoặc `--stages analysis,report` nếu đã có kết quả).",
+                  flush=True)
+            tracker.alert("§3: báo cáo cuối thiếu báo cáo con", str(e)[:1500], "ERROR")
+            tracker.finish(1)
+            return 9
         except Exception as e:
             import traceback
             err = traceback.format_exc()
             print(f"✗ stage `report` hỏng: {e!r}\n{err}\n→ kết quả vẫn còn ở {run_dir}; "
                   f"chạy lại riêng `--stages report`.", flush=True)
             tracker.alert("§3: báo cáo hỏng", err[-1500:], "ERROR")
-            (run_dir / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
             tracker.finish(1)
             return 7
-        if (run_dir / "REPORT.md").exists():
+        if (run_dir / "REPORT.md").exists() and not partial:
             tracker.save_file(run_dir / "REPORT.md")
 
     push_err = None
@@ -580,12 +619,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"✗ đẩy Hub hỏng: {e}\n→ kết quả vẫn ở {run_dir}; chạy lại `--stages push`.", flush=True)
             tracker.alert("§3: đẩy Hub hỏng", push_err[-1500:], "ERROR")
 
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    if partial:      # không ghi đè manifest.json của lần chạy đủ; mỗi arm giữ nhật ký riêng
+        for arm in arms:
+            d_ = rp.arm_dir(run_dir, arm["id"])
+            d_.mkdir(parents=True, exist_ok=True)
+            (d_ / "manifest.json").write_text(json.dumps(
+                {"run_id": run_id, "experiment": exp, "arm": arm["id"], "n_test": manifest.get("n_test"),
+                 "status": manifest["arm_status"].get(arm["id"]), "decode": "greedy",
+                 "minutes_total": manifest.get("minutes_total")}, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8")
+    else:
+        (run_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     mins = (time.time() - t_start) / 60
     tracker.alert("§3 chạy xong", f"{exp} · {manifest.get('n_eval')} ảnh · {mins:.0f} phút")
     tracker.finish(1 if push_err else 0)
-    print(f"\n✓ HOÀN TẤT sau {mins:.1f} phút\n  báo cáo: {run_dir / 'REPORT.md'}", flush=True)
+    print(f"\n✓ HOÀN TẤT sau {mins:.1f} phút\n  báo cáo: "
+          + (", ".join(str(rp.arm_dir(run_dir, x['id']) / 'REPORT.md') for x in arms) if partial
+             else str(run_dir / 'REPORT.md')), flush=True)
     return 8 if push_err else 0
 
 
