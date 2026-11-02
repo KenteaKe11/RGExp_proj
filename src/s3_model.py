@@ -1,15 +1,13 @@
-"""Dựng mô hình của họ §3 (huấn luyện) + lưu/nạp.
+"""Dựng mô hình của họ §3 (huấn luyện) + lưu/nạp. Không còn Mentor/pretrain.
 
-    image ─► Vision Encoder (+QDoRA r4, 2 lớp cuối) ─┬─► Mentor ─► Cls head
-                                                      │      └─► Router ─► w [B,E]
-                                                      └─► Adapter (projector, QDoRA r4) ─► ┐
-    prompt cố định ─► tokenizer ─► embedding ─────────────────────────────────────── concat ─► Decoder
-                                                          [MoE-DoRA E expert | DoRA đơn | không có]
+    image ─► Vision Encoder (đóng băng + QDoRA r4 trên 1/3 lớp cuối) ─► Adapter (projector, QDoRA r4) ─┐
+    prompt cố định ─► tokenizer ─► embedding ──────────────────────────────────────────────── concat ─► tokens
+    tokens ─► EC-Router NHÂN QUẢ (mọi token, token t chỉ thấy ≤ t) ─► w [B,T,E] ─► Decoder (base đóng băng + MoE-DoRA E expert | DoRA đơn)
+    Decoder ─► CE text ;  hidden cuối (mọi vị trí, pooling nhân quả) ─► Cls head ─► [B,14,4] ─► CE cls     (huấn luyện CÙNG LÚC, γ=0.1)
 
 `decoder`:
-    "none" — chỉ vision + Mentor + Cls head (giai đoạn pretrain; decoder không chạy)
-    "dora" — một QDoRA r4 trên attention q/k/v/o của decoder (đối chứng "chỉ DoRA decoder")
-    "moe"  — E expert QDoRA r4 trộn theo w của Router (`moe_dora.MoEDoRALinear`)
+    "dora" — một QDoRA r4 trên mọi Linear của decoder (đối chứng "chỉ DoRA decoder"; vẫn có Cls head)
+    "moe"  — E expert QDoRA r4 trộn theo w của EC-Router (`moe_dora.MoEDoRALinear`)
 Mọi PEFT là QDoRA rank 4 trên base NF4.
 """
 from __future__ import annotations
@@ -24,7 +22,7 @@ from . import gemma_bridge as gb
 from . import imaging, proj_adapter
 from .backbone import (attach_adapter, attach_vision_adapter_only, find_target_modules,
                        load_base, resolve_alpha)
-from .mentor import MentorBranch
+from .ec_heads import Heads
 from .moe_dora import MoEDoRALinear, attach_dora_experts, invalidate_caches
 
 EXPERTS_FILE = "moe_dora.safetensors"
@@ -36,10 +34,10 @@ def lora_rank(cfg) -> int:
     return int((cfg.get("lora", {}) or {}).get("rank", 4))
 
 
-def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
+def build(cfg, *, decoder: str, n_experts: int = 0, capacity: float = 1.0,
           projector: bool = True) -> SimpleNamespace:
-    """Nạp base NF4, gắn PEFT theo `decoder`, dựng nhánh Mentor. Chưa đặt requires_grad."""
-    if decoder not in ("none", "dora", "moe"):
+    """Nạp base NF4, gắn PEFT theo `decoder`, dựng Cls head (+ EC-Router). Chưa đặt requires_grad."""
+    if decoder not in ("dora", "moe"):
         raise ValueError(f"decoder={decoder!r}")
     tcfg = dict(cfg["train"])
     rank = lora_rank(cfg)
@@ -64,15 +62,14 @@ def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
     else:
         from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
-        if decoder == "moe":
-            targets = find_target_modules(model, tcfg)       # all_linear: q/k/v/o/gate/up/down của MỌI lớp decoder
-            ctx, mstats = attach_dora_experts(model, targets, n_experts, rank, alpha, drop)
+        targets = find_target_modules(model, tcfg)       # all_linear: q/k/v/o/gate/up/down của MỌI lớp decoder
+        ctx, mstats = attach_dora_experts(model, targets, n_experts, rank, alpha, drop)
         model, vmeta = attach_vision_adapter_only(model, tcfg)
         pstats = {"vision_adapter": vmeta}
-        if projector and decoder != "none":
+        if projector:
             proj_adapter.attach(model, rank, alpha, drop, True)
 
-    if decoder != "none" and bool(tcfg.get("gradient_checkpointing", True)):
+    if bool(tcfg.get("gradient_checkpointing", True)):
         if decoder == "moe":
             gb.assert_checkpoint_safe(gb.enable_checkpointing_non_reentrant(model), True)
         model.enable_input_require_grads()
@@ -80,28 +77,23 @@ def build(cfg, *, decoder: str, n_experts: int = 0, top_k: int | None = None,
 
     gemma = gb.unwrap_gemma(model)
     dev = next(p for p in model.parameters() if p.device.type != "meta").device
-    branch = MentorBranch(
-        vis_h, 14, int((cfg.get("mentor", {}) or {}).get("n_classes", 4)),
-        n_experts=max(1, n_experts), n_heads=int((cfg.get("mentor", {}) or {}).get("n_heads", 8)),
-        route_enabled=(decoder == "moe"), top_k=top_k).to(device=dev, dtype=torch.float32)
-    return SimpleNamespace(model=model, processor=processor, gemma=gemma, branch=branch,
+    hcfg = cfg.get("heads", {}) or {}
+    heads = Heads(text_h, 14, int(hcfg.get("n_classes", 4)), n_experts=max(1, n_experts),
+                  capacity=float(capacity), d_c=int(hcfg.get("d_c", 256)),
+                  route_enabled=(decoder == "moe")).to(device=dev, dtype=torch.float32)
+    return SimpleNamespace(model=model, processor=processor, gemma=gemma, heads=heads,
                            route_ctx=ctx, img_kw=img_kw, device=dev, decoder=decoder,
-                           n_experts=n_experts, top_k=top_k, text_h=text_h, vis_h=vis_h,
-                           mstats=mstats, pstats=pstats, rank=rank, alpha=alpha,
+                           n_experts=n_experts, capacity=float(capacity), text_h=text_h,
+                           vis_h=vis_h, mstats=mstats, pstats=pstats, rank=rank, alpha=alpha,
                            img_token=gb.image_token_id(gemma))
 
 
-def set_trainable(b, *, mentor: bool, router: bool = True) -> dict:
-    """PEFT (lora_*, proj_adapter) luôn học; Mentor+Cls head theo cờ; Router theo cờ."""
+def set_trainable(b) -> dict:
+    """PEFT (lora_*, proj_adapter), Cls head và Router đều học (không đóng băng gì)."""
     for n, p in b.model.named_parameters():
         p.requires_grad_(("lora_" in n) or ("proj_adapter" in n))
-    for p in b.branch.mentor.parameters():
-        p.requires_grad_(mentor)
-    for p in b.branch.cls_head.parameters():
-        p.requires_grad_(mentor)
-    if b.branch.router is not None:
-        for p in b.branch.router.parameters():
-            p.requires_grad_(router)
+    for p in b.heads.parameters():
+        p.requires_grad_(True)
     return count_params(b)
 
 
@@ -112,9 +104,8 @@ def count_params(b) -> dict:
     return {"vision_peft": n(p for k, p in mp if "lora_" in k and VISION_NAME in k),
             "decoder_peft": n(p for k, p in mp if "lora_" in k and VISION_NAME not in k),
             "projector": n(p for k, p in mp if "proj_adapter" in k),
-            "mentor": n(b.branch.mentor.parameters()),
-            "cls_head": n(b.branch.cls_head.parameters()),
-            "router": n(b.branch.router.parameters()) if b.branch.router is not None else 0}
+            "cls_head": n(b.heads.cls_head.parameters()),
+            "router": n(b.heads.router.parameters()) if b.heads.router is not None else 0}
 
 
 def param_groups(b, wd: float, lr: float) -> list[dict]:
@@ -132,20 +123,31 @@ def param_groups(b, wd: float, lr: float) -> list[dict]:
             add("decoder_peft", p)
         elif "proj_adapter" in n:
             add("projector", p)
-    for n, p in b.branch.named_parameters():
+    for n, p in b.heads.named_parameters():
         add(n.split(".", 1)[0], p)
-    # weight decay ĐỒNG NHẤT cho mọi tham số học được (kể cả 1-D: bias, magnitude, RMSNorm)
-    out = [{"name": name, "params": ps, "lr": lr, "weight_decay": wd} for name, ps in groups.items()]
-    return out
+    return [{"name": name, "params": ps, "lr": lr, "weight_decay": wd} for name, ps in groups.items()]
 
 
 # ── forward dùng chung train/infer ─────────────────────────────────────────
-def encode(b, pixel_values):
-    """vision MỘT lần -> (cls_logits, route dict | None, aligned 256 token)."""
-    vis, aligned = gb.encode_vision(
-        b.gemma, pixel_values.to(dtype=gb.float_dtype(b.gemma, torch.float32)))
-    _, logits, route = b.branch(vis.to(torch.float32))
-    return logits, route, aligned
+def prefix_mask(attention_mask, labels=None):
+    """Token PREFIX = có attention và (khi train) không phải token câu trả lời (labels == -100).
+    CHỈ dùng để thống kê route theo ảnh (route_w); định tuyến và Cls head nhìn TOÀN BỘ token, nhân quả."""
+    m = attention_mask.bool()
+    if labels is not None:
+        m = m & (labels == -100)
+    return m
+
+
+def route(b, embeds, valid, stat_mask=None):
+    """EC-Router nhân quả trên embedding đầu vào decoder -> dict (weights [B,T,E], route_w [B,E], ...)."""
+    if b.heads.router is None:
+        return None
+    return b.heads.router(embeds, valid, stat_mask)
+
+
+def cls_logits(b, last_hidden, valid):
+    """Cls head nhân quả trên hidden state cuối của decoder -> [B,T,14,4]."""
+    return b.heads.cls_head(last_hidden, valid)
 
 
 # ── lưu / nạp ──────────────────────────────────────────────────────────────
@@ -208,16 +210,13 @@ def save_model(b, out_dir: Path, meta: dict) -> None:
         sd = experts_state(b.model, b.mstats["target_names"])
         save_file(sd, str(out_dir / EXPERTS_FILE))
         (out_dir / EXPERTS_META).write_text(json.dumps(
-            {**b.mstats, "top_k": b.top_k, "n_experts": b.n_experts,
+            {**b.mstats, "capacity": b.capacity, "n_experts": b.n_experts,
              "scaling": b.alpha / b.rank, "keys": sorted(sd)}, indent=2), encoding="utf-8")
         b.model.save_pretrained(str(out_dir / "vision_adapter"))
-    elif b.decoder == "dora":
-        b.model.save_pretrained(str(out_dir))
     else:
-        b.model.save_pretrained(str(out_dir / "vision_adapter"))
-    if b.decoder != "none":
-        proj_adapter.save(b.model, out_dir, {"rank": b.rank, "alpha": float(b.alpha),
-                                             "dropout": 0.0, "dora": True})
+        b.model.save_pretrained(str(out_dir))
+    proj_adapter.save(b.model, out_dir, {"rank": b.rank, "alpha": float(b.alpha),
+                                         "dropout": 0.0, "dora": True})
     b.processor.save_pretrained(str(out_dir))
     (out_dir / "train_stats.json").write_text(
         json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -275,11 +274,6 @@ def already_trained(out_dir: Path, decoder: str) -> bool:
     d = Path(out_dir)
     if not (d / "train_stats.json").exists():
         return False
-    if decoder == "moe":
-        ok = (d / EXPERTS_FILE).exists()
-    elif decoder == "dora":
-        ok = (d / "adapter_model.safetensors").exists()
-    else:
-        ok = True
-    from .mentor import branch_exists
-    return bool(ok and branch_exists(d))
+    ok = (d / EXPERTS_FILE).exists() if decoder == "moe" else (d / "adapter_model.safetensors").exists()
+    from .ec_heads import heads_exist
+    return bool(ok and heads_exist(d))

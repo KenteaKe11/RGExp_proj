@@ -1,14 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §3 — Mentor · Cls head · NoisyRouter · MoE-DoRA
+# §3 — Cls head · EC-Router (Expert-Choice) · MoE-DoRA   (không Mentor, không pretrain)
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.1  Khảo sát cặp (k, E): (3,6) (4,8) (5,10); router chọn top-k trên E expert
-#   3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
+#   3.1  Khảo sát (c, E): (1,4) (1,6) (1.5,4) (1.5,6); mỗi expert chọn k = ⌈c·N/E⌉ token
+#   3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only (+Cls head) · MoE-DoRA (c, E do BẠN chọn)
 #   (3.3 — so vị trí leaderboard / SoTA bị vượt: mới là giả thuyết, CHƯA cài đặt)
 #
 # Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.1|3.2
 #
-# Quy ước: (1) pretrain  ảnh→vision encoder→Mentor→Cls head (CE cls);
-#          (2) đóng băng hoàn toàn Mentor→Cls head, finetune phần còn lại;
+# Quy ước: (1) Cls head fine-tune CÙNG LÚC với mọi thứ khác, loss = CE_text + γ·CE_cls (γ = 0.1);
+#          (2) Router và Cls head nhận TOÀN BỘ token (ảnh + prompt + câu trả lời đang stream) nhưng NHÂN QUẢ như decoder;
 #          (3) infer luôn GREEDY. Mọi PEFT = QDoRA rank 4.
 # Loss chỉ còn 2 loại: CE cls (4 lớp CheXbert) và CE text.
 # Epoch / split / lr / scheduler / save / report tái sử dụng từ §2.3.
@@ -50,7 +50,7 @@ image_policy:
 
 base:
   hf_id: google/gemma-3-4b-it
-  runner: gemma3_mentor
+  runner: gemma3_ec
   dtype: bfloat16
   attn_implementation_train: eager
   attn_implementation_infer: sdpa
@@ -83,8 +83,8 @@ generate:
 
 lora: {rank: 4}                # QDoRA rank 4 cho MỌI PEFT
 
-mentor: {n_heads: 8, n_classes: 4}
-classifier: {lambda: 0.5}      # CE_text + λ·CE_cls (finetune)
+heads: {d_c: 256, n_classes: 4}   # Cls head: attention pooling nhân quả N→14 (giá trị d_c chiều), Linear →4
+classifier: {gamma: 0.1}       # loss = CE_text + γ·CE_cls (đồng huấn luyện)
 labels:                        # nhãn sinh LAZY từ CheXbert; KHÔNG đọc labels.npz
   cache_dir: ./data
   batch_size: 32
@@ -124,8 +124,8 @@ train:
   vision_adapter:
     enabled: true
     include_prefixes: [vision_tower, vision_model]
-    layers: last_2             # QDoRA trên 2 lớp cuối của vision encoder
-    all_linear: true           # mọi Linear trong 2 lớp đó (q,k,v,out_proj,fc1,fc2)
+    layers: last_third         # QDoRA trên 1/3 lớp cuối của vision encoder
+    all_linear: true           # mọi Linear trong các lớp đó (q,k,v,out_proj,fc1,fc2)
     method: qdora
     rank: 4
   lora_dropout: 0.05
@@ -135,25 +135,15 @@ train:
   alpha_fixed: 16
   quant: {load_in_4bit: true, quant_type: nf4, double_quant: true, compute_dtype: bfloat16}
 
-pretrain:                      # image → vision encoder → Mentor → Cls head (cùng lịch với finetune)
-  n_epochs: 2
-  steps_per_epoch: 200
-  epoch_split: true
-  effective_batch_size: 16
-  per_device_batch_size: 8
-  dir: ./adapters_3_pretrain   # safetensors lưu lại, dùng chung 3.1/3.2; --force để pretrain lại
-  hub_path: pretrain_mentor    # thư mục trên repo kết quả (quét Hub trước khi pretrain)
-  # lịch lr và weight decay: dùng train.schedule / train.weight_decay
-
-# Mọi pipeline (pretrain và finetune) chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
+# Mọi pipeline chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
 # và nạp lại tham số của lần val tốt nhất.
 validation:
   every_steps: 40
   patience: 3
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
-exp31: {pairs: [[3, 6], [4, 8], [5, 10]]}   # (k, E): top-k trên E expert
-exp32: {k: null, E: null}                 # BẠN chọn k, E (best.json của 3.1 chỉ là gợi ý)
+exp31: {pairs: [[1, 4], [1, 6], [1.5, 4], [1.5, 6]]}   # (c, E): mỗi expert chọn ⌈c·N/E⌉ token
+exp32: {c: null, E: null}                 # BẠN chọn c, E (best.json của 3.1 chỉ là gợi ý)
 
 analysis:
   collapse_threshold: 0.9      # cos ΔW trung bình ngoài đường chéo ≥ ngưỡng ⇒ sụp đổ về 1 DoRA
@@ -169,7 +159,7 @@ metrics:
   radgraph: {enabled: true, model_type: radgraph-xl, reward_level: all, batch_size: 16, device: auto}
   primary: chexbert_f1
 
-# Chọn k / E / arm tốt nhất: mọi metric lâm sàng là metric chính (hạng TB tốt nhất); hoà ⇒ metric sinh văn bản.
+# Chọn c / E / arm tốt nhất: mọi metric lâm sàng là metric chính (hạng TB tốt nhất); hoà ⇒ metric sinh văn bản.
 selection:
   clinical: [chexbert_f1, radgraph_f1_entity, radgraph_f1_partial, radgraph_f1_complete]
   text: [bleu1, bleu2, bleu3, bleu4, rouge1, rouge2, rougeL, bertscore_f1]
@@ -188,8 +178,8 @@ stats:
   pairs: all                   # 3.1: mọi cặp; 3.2 tự chuyển sang `contrasts`
   adjust_scope: metrics
   contrasts:
-    - [baseline_infer, dora_decoder]     # A -> B': fine-tune DoRA decoder (+ Mentor, vision, projector)
-    - [dora_decoder, moe_dora]           # B' -> C : MoE-DoRA + Router
+    - [baseline_infer, dora_decoder]     # A -> B': fine-tune DoRA decoder (+ Cls head, vision, projector)
+    - [dora_decoder, moe_dora]           # B' -> C : MoE-DoRA + EC-Router
     - [baseline_infer, moe_dora]         # A -> C
 
 wandb:
@@ -200,7 +190,7 @@ wandb:
   group: null
   resume_same_run: false
   mode: online
-  tags: [mentor, moe-dora, expert-choice, mimic-cxr]
+  tags: [ec-router, cls-head, moe-dora, mimic-cxr]
   notes: ""
   log_every: 20
   log_samples: 20
@@ -212,5 +202,5 @@ output:
   hub_private: true
   push: true
   push_per_arm: true
-  subdir: "3.1_k_e_pairs_v2"
-  adapter_dir: ./adapters_3_1_v2
+  subdir: "3.1_c_e_grid_v3"
+  adapter_dir: ./adapters_3_1_v3

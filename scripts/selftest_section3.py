@@ -31,29 +31,30 @@ def main() -> int:
         cfg["output"]["dir"] = td
         # 3.1
         a1, _ = build_arms(cfg, "3.1")
-        check("3.1: 3 cặp (3,6) (4,8) (5,10), top_k=k, có pretrain",
-              [(x["k"], x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
-              [(3, 6, 3, True), (4, 8, 4, True), (5, 10, 5, True)])
+        check("3.1: 4 biến thể (c,E) = (1,4) (1,6) (1.5,4) (1.5,6), id không đụng nhau",
+              [(x["c"], x["E"]) for x in a1] == [(1.0, 4), (1.0, 6), (1.5, 4), (1.5, 6)]
+              and len({x["id"] for x in a1}) == 4 and all("pretrain" not in x and "top_k" not in x for x in a1),
+              str([x["id"] for x in a1]))
         try:
             build_arms(cfg, "3.2")
-            check("3.2 thiếu k,E phải DỪNG", False)
+            check("3.2 thiếu c,E phải DỪNG", False)
         except ValueError:
-            check("3.2 thiếu k,E phải DỪNG", True)
+            check("3.2 thiếu c,E phải DỪNG", True)
         for old in ("3.1-1", "3.1-2", "3.3"):
             try:
                 build_arms(cfg, old)
                 check(f"{old} đã bị xoá", False)
             except ValueError:
                 check(f"{old} đã bị xoá", True)
-        cfg["exp32"].update(k=3, E=5)
+        cfg["exp32"].update(c=1.5, E=6)
         a3, inh3 = build_arms(cfg, "3.2")
         ids = [x["id"] for x in a3]
         moe = a3[-1]
-        check("3.2: baseline · dora_decoder · moe_dora (k=3, E=5, top_k=3)",
+        check("3.2: baseline · dora_decoder · moe_dora (c=1.5, E=6)",
               ids == ["baseline_infer", "dora_decoder", "moe_dora"]
-              and (moe["E"], moe["top_k"]) == (5, 3) and a3[1]["decoder"] == "dora")
+              and (moe["E"], moe["c"]) == (6, 1.5) and a3[1]["decoder"] == "dora")
         mc = model_cfg(cfg, a3[2], Path("ad"))
-        check("model_cfg: runner gemma3_mentor + adapter_dir", mc["runner"] == "gemma3_mentor"
+        check("model_cfg: runner gemma3_ec + adapter_dir", mc["runner"] == "gemma3_ec"
               and str(mc["adapter_dir"]).endswith("moe_dora"))
         check("model_cfg: baseline dùng runner gemma3", model_cfg(cfg, a3[0], Path("ad"))["runner"] == "gemma3")
 
@@ -84,8 +85,8 @@ def main() -> int:
         eff, n_ep, split, steps, cycle = _plan(dict(cfg["train"]), 6400)
         check("lịch finetune: eff_bs 16 · 2×200 = 400 bước (1 lượt qua 6400 mẫu)",
               (eff, n_ep, split, steps, cycle) == (16, 2, True, 400, 200) and steps * eff == 6400)
-        pe = _plan({**cfg["train"], **cfg["pretrain"]}, 6400)
-        check("lịch pretrain giống finetune", (pe[0], pe[3], pe[4]) == (16, 400, 200))
+        check("không còn pretrain/Mentor trong config", "pretrain" not in cfg and "mentor" not in cfg
+              and float(cfg["classifier"]["gamma"]) == 0.1 and cfg["train"]["vision_adapter"]["layers"] == "last_third")
         check("val mỗi 40 bước · patience 3",
               cfg["validation"]["every_steps"] == 40 and cfg["validation"]["patience"] == 3)
 
@@ -102,8 +103,7 @@ def main() -> int:
         check("OneCycle: một chu kỳ duy nhất, không khởi động lại ở bước 200",
               lrs[200] < lrs[100] and all(lrs[i + 1] <= lrs[i] + 1e-15 for i in range(40, 399)),
               f"lr[200]={lrs[200]:.3e}")
-        check("weight_decay = 0.001 (train)", float(cfg["train"]["weight_decay"]) == 0.001
-              and "weight_decay" not in cfg["pretrain"])
+        check("weight_decay = 0.001 (train)", float(cfg["train"]["weight_decay"]) == 0.001)
 
         # ── analysis ──
         rng = np.random.default_rng(0)
@@ -189,9 +189,9 @@ def main() -> int:
         mk = lambda off: pd.DataFrame({"key": [f"k{i}" for i in range(30)],
                                        "bleu1": rng.random(30) * 0.1 + off, "rouge1": rng.random(30) * 0.1 + off,
                                        "chexbert_f1": rng.random(30) * 0.1 + off})
-        arms_t = [{"id": "base", "name": "A", "kind": "infer", "decoder": "none", "E": 0, "top_k": None, "pretrain": False},
-                  {"id": "dora", "name": "B", "kind": "ft", "decoder": "dora", "E": 0, "top_k": None, "pretrain": True},
-                  {"id": "moe", "name": "C", "kind": "ft", "decoder": "moe", "E": 4, "top_k": 2, "k": 2, "pretrain": True}]
+        arms_t = [{"id": "base", "name": "A", "kind": "infer", "decoder": "none", "E": 0, "c": None},
+                  {"id": "dora", "name": "B", "kind": "ft", "decoder": "dora", "E": 0, "c": None},
+                  {"id": "moe", "name": "C", "kind": "ft", "decoder": "moe", "E": 4, "c": 1.0}]
         sc = {x["id"]: mk(0.1 * i) for i, x in enumerate(arms_t)}
         nm = {x["id"]: x["name"] for x in arms_t}
         for x in arms_t[:2]:

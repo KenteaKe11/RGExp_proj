@@ -1,4 +1,5 @@
-"""MoE-DoRA: Σ_i w_i · DoRA_i, với Σ_i w_i = 1 (không còn top-k).
+"""MoE-DoRA: Σ_i w_i · DoRA_i theo TỪNG TOKEN (Σ_i w_i = 1 nếu token được expert chọn, = 0 nếu không
+⇒ token đó đi qua W₀ đóng băng: y = (g + 1 − Σw)·W₀x + delta).
 
     W' = Σ_i w_i · m_i ⊙ (W₀ + s·B_i·A_i) / ‖W₀ + s·B_i·A_i‖_row ,   s = α/r
 
@@ -131,19 +132,22 @@ class MoEDoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base_layer(x)
-        w = self.ctx.get(x.shape[0])
+        w = self.ctx.get(x.shape[0], x.shape[1] if x.dim() == 3 else None)
         if w is None:
             return out
         bias = getattr(self.base_layer, "bias", None)
         wx = out if bias is None else out - bias
         coef = self._coef()                                               # (E,out)
-        wf = w.float()
-        g = wf @ coef                                                     # (B,out)
+        if w.dim() == 2:                                                  # trọng số theo ảnh -> theo token
+            w = w[:, None, :].expand(-1, x.shape[1], -1)
+        wf = w.float()                                                    # (B,T,E)
+        g = wf @ coef                                                     # (B,T,out)
+        base_w = (1.0 - wf.sum(-1, keepdim=True))                         # token không expert nào chọn -> nền
         h = torch.einsum("btd,erd->bter", self.drop(x).to(self.lora_A.dtype), self.lora_A)
-        h = h * w.to(h.dtype)[:, None, :, None]
+        h = h * w.to(h.dtype)[..., None]
         b_tilde = coef.unsqueeze(-1).to(self.lora_B.dtype) * self.lora_B   # (E,out,r)
         delta = torch.einsum("bter,eor->bto", h, b_tilde) * self.scaling
-        y = g[:, None, :].to(out.dtype) * wx + delta.to(out.dtype)
+        y = (g + base_w).to(out.dtype) * wx + delta.to(out.dtype)
         return y if bias is None else y + bias
 
     @property

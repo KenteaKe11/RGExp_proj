@@ -66,10 +66,16 @@ class RoutingContext:
         self.repeat = 1
         self.disabled = True
 
-    def get(self, batch: int) -> torch.Tensor | None:
+    def get(self, batch: int, seq: int | None = None) -> torch.Tensor | None:
+        """Trọng số cho lượt forward. `weights` có thể là [B,E] (theo ảnh) hoặc [B,T,E] (theo token,
+        EC-Router). Với [B,T,E]: nếu độ dài chuỗi `seq` khác T (bước giải mã 1 token với KV-cache) thì
+        trả None — token đó dùng đúng trọng số nền (Σw = 0), vì mọi token sinh ra đều là token
+        câu trả lời, không thuộc prefix được định tuyến."""
         if self.disabled:
             return None
         w = self.weights
+        if w is not None and w.dim() == 3 and seq is not None and w.shape[1] != seq:
+            return None
         if w is None:
             if self.strict:
                 raise RuntimeError(

@@ -13,9 +13,9 @@ from .metrics import metric_columns
 from .report_common import pairwise_section, score_table, summarise
 
 QUESTIONS = {
-    "3.1": "Cặp (k, E) nào tốt nhất trong (3,6) (4,8) (5,10) — router nhiễu chọn top-k trên E "
-           "expert DoRA? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
-    "3.2": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
+    "3.1": "Cặp (c, E) nào tốt nhất trong (1,4) (1,6) (1.5,4) (1.5,6) — EC-Router, mỗi expert DoRA chọn "
+           "k = ⌈c·N/E⌉ token? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.2": "MoE-DoRA và các module mới (Cls head · EC-Router) có thật sự cần thiết? "
            "Đối chứng: baseline · mô hình mới với DoRA decoder đơn · mô hình mới với MoE-DoRA.",
 }
 
@@ -134,9 +134,8 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
     row = json.loads(summ.iloc[0].to_json())
     st = train_stat or {}
     prm = st.get("params") or {}
-    setup = {"decoder": arm.get("decoder", "—"), "E": arm.get("E"), "top_k": arm.get("top_k"),
-             "k": arm.get("k"), "pretrain": bool(arm.get("pretrain")), "kind": arm["kind"],
-             "mentor_frozen": bool(st.get("mentor_frozen")),
+    setup = {"decoder": arm.get("decoder", "—"), "E": arm.get("E"), "c": arm.get("c"),
+             "kind": arm["kind"],
              "params": (sum(int(v) for v in prm.values()) if prm else (0 if arm["kind"] == "infer" else None)),
              "minutes": st.get("minutes")}
     cf = _cls_f1(run_dir, [arm])
@@ -179,7 +178,7 @@ def _setup_dict(arm: dict, setup: dict) -> dict:
 
 
 def _setup_table(rows_in: list[dict]) -> str:
-    h = ("| Arm | Decoder | E | top-k | Pretrain Mentor | Mentor+Cls | Tham số học | Phút |\n"
+    h = ("| Arm | Decoder | E | c | k mỗi expert | Cls head | Tham số học | Phút |\n"
          "|---|---|---|---|---|---|---|---|")
     rows = []
     for r in rows_in:
@@ -187,10 +186,10 @@ def _setup_table(rows_in: list[dict]) -> str:
             rows.append(f"| {r['name']} | — | — | — | — | — | 0 | — |")
             continue
         tp = f"{int(r['params']):,}" if r.get("params") else "?"
-        tk = r["top_k"] if r.get("top_k") else ("dense" if r["decoder"] == "moe" else "—")
-        rows.append(f"| {r['name']} | {r['decoder']} | {r.get('E') or '—'} | {tk} | "
-                    f"{'có' if r['pretrain'] else 'không'} | "
-                    f"{'đóng băng' if r.get('mentor_frozen') else 'học chung'} | {tp} | "
+        moe = r["decoder"] == "moe"
+        rows.append(f"| {r['name']} | {r['decoder']} | {r.get('E') or '—'} | "
+                    f"{(format(r['c'], 'g') if r.get('c') else '—') if moe else '—'} | "
+                    f"{'⌈c·N/E⌉' if moe else '—'} | đồng huấn luyện | {tp} | "
                     f"{r.get('minutes') if r.get('minutes') is not None else '?'} |")
     return h + "\n" + "\n".join(rows)
 
@@ -198,10 +197,10 @@ def _setup_table(rows_in: list[dict]) -> str:
 def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> str:
     out = []
     if best:
-        what = "(k, E)"
+        what = "(c, E)"
         out.append(f"- **{what} gợi ý (quyết định là của bạn):** arm `{best['arm']}` — hạng lâm sàng TB "
                    f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f} → "
-                   f"k = {best['k']}, E = {best['E']} (`best.json`).")
+                   f"c = {best['c']:g}, E = {best['E']} (`best.json`).")
     ver = {a["id"]: manifest.get("arm_status", {}).get(a["id"], {}).get("route_verdict") for a in arms}
     ver = {k: v for k, v in ver.items() if v}
     if ver:
@@ -210,8 +209,8 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
                    + (f"SỤP ĐỔ về một DoRA ở {', '.join(col)}." if col else "không arm nào vượt ngưỡng sụp đổ.")
                    + " Chi tiết từng arm ở mục Route.")
     if exp == "3.2":
-        out.append("- **Cần MoE-DoRA / module mới không:** xem hai cặp A→B' (Mentor+Cls+vision+projector+DoRA) "
-                   "và B'→C (MoE-DoRA + Router) ở mục kiểm định; một khác biệt chỉ có nghĩa khi "
+        out.append("- **Cần MoE-DoRA / module mới không:** xem hai cặp A→B' (Cls head+vision+projector+DoRA) "
+                   "và B'→C (MoE-DoRA + EC-Router) ở mục kiểm định; một khác biệt chỉ có nghĩa khi "
                    "p_perm < α và CI loại 0 (ký hiệu trong bảng).")
     return "\n".join(out) or "*(chưa đủ dữ liệu)*"
 
@@ -233,10 +232,10 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
     for a in arms:
         manifest.setdefault("arm_status", {}).setdefault(a["id"], {})["route_verdict"] = (
             (sums[a["id"]].get("route") or {}).get("verdict"))
-    parts = [f"# §{exp} — Mentor · Router · MoE-DoRA", "",
+    parts = [f"# §{exp} — Cls head · EC-Router · MoE-DoRA", "",
              f"**Câu hỏi.** {QUESTIONS[exp]}", "",
-             "> Greedy · mọi PEFT = QDoRA r=4 · loss = CE text + λ·CE cls (λ = "
-             f"{(cfg.get('classifier') or {}).get('lambda', 0.5)}) · nhãn cls sinh lazy từ CheXbert "
+             "> Greedy · mọi PEFT = QDoRA r=4 · loss = CE text + γ·CE cls (γ = "
+             f"{(cfg.get('classifier') or {}).get('gamma', 0.1)}, huấn luyện cùng lúc) · nhãn cls sinh lazy từ CheXbert "
              f"· {n_eval} ảnh test. Các bảng thiết lập, điểm, Cls head và Route lấy trực tiếp từ báo cáo con "
              "của từng arm (`arms/<arm>/REPORT.md`).", "",
              "## Kết luận nhanh", "", _answers(exp, best, manifest, arms), "",
@@ -264,14 +263,17 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
     moe = [a for a in arms if sums[a["id"]].get("route")]
     if moe:
         parts += ["## Route: các Expert có chuyên biệt không?", "",
-                  "Forward tập test sạch (eval, không nhiễu), gom trọng số route w ∈ R^E mỗi ảnh. "
+                  "Forward tập test (eval), route w ∈ R^E mỗi ảnh = tỉ lệ token prefix mà từng expert phụ trách (trung bình trọng số theo token). "
                   "*Sụp đổ* = cosine ΔW giữa các expert ≥ ngưỡng, HOẶC route tĩnh (trọng số gần như không đổi theo ảnh).", ""]
         parts += [_route_md(sums[a["id"]]["name"], sums[a["id"]]["route"], arm_dir(run_dir, a["id"]),
                             f"arms/{a['id']}/e_heatmap.png") for a in moe]
     parts += ["## Giả định cần biết", "",
-              "- k và E do người dùng chọn; `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định.",
-              "- Router nhiễu: h = Norm(X·W_D) + 0.1·N(0,1), P = sqrt(softmax(E)·sigmoid(E)), top-k theo P rồi w = P_k/ΣP_k "
-              "(Σw = 1); nhiễu chỉ có khi train, suy luận greedy và không nhiễu. Không clamp logit, không aux loss.",
+              "- c và E do người dùng chọn; `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định.",
+              "- EC-Router nhân quả (Expert-Choice): RMSNorm → Linear D→E; tại vị trí t mỗi expert chọn token nếu điểm "
+              "thuộc top-k_t của các token ≤ t, k_t = ⌈c·n_t/E⌉; w theo từng token, chuẩn hoá giữa các expert đã chọn; token "
+              "không expert nào chọn dùng trọng số nền đóng băng. Router và Cls head nhận toàn bộ token (ảnh + prompt + câu trả lời) "
+              "nhưng nhân quả như decoder. Không nhiễu, không aux loss.",
+              "- Cls head nhân quả đọc hidden cuối của decoder ở mọi vị trí (suy luận: vị trí cuối báo cáo), huấn luyện cùng lúc (không pretrain, không đóng băng).",
               "- Baseline A là Gemma 3 gốc, chạy lại ở 3.2, không huấn luyện.", ""]
     path = run_dir / "REPORT.md"
     path.write_text("\n".join(parts), encoding="utf-8")

@@ -1,12 +1,12 @@
-"""§3 — Mentor · Cls head · NoisyRouter · MoE-DoRA.   python -m src.run_section3 --exp 3.1|3.2
+"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.1|3.2
 
-    3.1  Khảo sát cặp (k, E) ∈ {(3,6),(4,8),(5,10)}: router chọn top-k trên E expert
-    3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
+    3.1  Khảo sát (c, E) ∈ {(1,4),(1,6),(1.5,4),(1.5,6)}: Expert-Choice, mỗi expert chọn k=⌈c·N/E⌉ token
+    3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only (+Cls head) · MoE-DoRA (c, E do BẠN chọn)
 
-Stage: data → pretrain → train → infer → score → stats → analysis → report → push.
-k, E do người dùng chọn (`exp32.k`, `exp32.E`); best.json chỉ là GỢI Ý.
-Mọi stage quét Hub trước: có predictions ⇒ bỏ qua train+infer; có adapter ⇒ bỏ qua train;
-có pretrain ⇒ kéo về. Pretrain lưu safetensors dùng chung; `--force` để pretrain lại.
+Stage: data → train → infer → score → stats → analysis → report → push.
+Cls head huấn luyện CÙNG LÚC với decoder (loss = CE_text + 0.1·CE_cls). c, E do người dùng chọn
+(`exp32.c`, `exp32.E`); best.json chỉ là GỢI Ý.
+Mọi stage quét Hub trước: có predictions ⇒ bỏ qua train+infer; có adapter ⇒ bỏ qua train.
 Tái sử dụng nguyên văn của §2.x: dữ liệu/split, lịch train, chấm điểm, align_blocks,
 bootstrap ghép cặp + permutation, report_common, push, tracker.
 """
@@ -26,9 +26,9 @@ from .batch_ladder import clear_vram
 from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapshot, seed_everything
 from .tracking import Tracker
 
-STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_k_e_pairs_v2", "3.2": "3.2_ablation_v2"}   # v2: router Norm+nhiễu 0.1 (không lẫn kết quả router cũ)
-ADAPTER = {"3.1": "./adapters_3_1_v2", "3.2": "./adapters_3_2_v2"}
+STAGES = ["data", "train", "infer", "score", "stats", "analysis", "report", "push"]
+SUBDIR = {"3.1": "3.1_c_e_grid_v3", "3.2": "3.2_ablation_v3"}   # v3: EC-Router + Cls head đồng huấn luyện (không lẫn kết quả Mentor cũ)
+ADAPTER = {"3.1": "./adapters_3_1_v3", "3.2": "./adapters_3_2_v3"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -68,42 +68,49 @@ def _suggest(cfg: Cfg, exp: str, dry: bool) -> str:
     p = best_path(cfg, exp, dry)
     if p.exists():
         j = json.loads(p.read_text(encoding="utf-8"))
-        return f" (gợi ý từ {p.name} của {exp}: k={j.get('k')}, E={j.get('E')} — quyết định là của bạn)"
+        return f" (gợi ý từ {p.name} của {exp}: c={j.get('c')}, E={j.get('E')} — quyết định là của bạn)"
     return ""
 
 
+def _cid(c: float) -> str:
+    return str(float(c)).rstrip("0").rstrip(".").replace(".", "p")
+
+
 def _inherit(cfg: Cfg, exp: str, dry: bool) -> dict:
-    """k, E do NGƯỜI DÙNG chọn trong cấu hình; best.json chỉ được in ra như gợi ý."""
+    """(c, E) do NGƯỜI DÙNG chọn trong cấu hình; best.json chỉ được in ra như gợi ý."""
     got: dict = {}
     if exp == "3.2":
         e32 = cfg.get("exp32") or {}
-        if e32.get("k") is None or e32.get("E") is None:
-            raise ValueError("3.2 cần k và E: `--set exp32.k=<k> --set exp32.E=<E>`" + _suggest(cfg, "3.1", dry))
-        got.update(k=int(e32["k"]), E=int(e32["E"]))
-        if got["E"] < got["k"]:
-            raise ValueError(f"E={got['E']} < k={got['k']}")
+        if e32.get("c") is None or e32.get("E") is None:
+            raise ValueError("3.2 cần c và E: `--set exp32.c=<c> --set exp32.E=<E>`" + _suggest(cfg, "3.1", dry))
+        got.update(c=float(e32["c"]), E=int(e32["E"]))
+        if got["E"] < 1 or got["c"] <= 0:
+            raise ValueError(f"(c={got['c']}, E={got['E']}) không hợp lệ")
     return got
+
+
+def _moe_arm(c: float, E: int, aid: str | None = None, label: str = "MoE-DoRA") -> dict:
+    return {"id": aid or f"c{_cid(c)}_e{E}", "name": f"{label} · c={c:g}, E={E} (k=⌈c·N/E⌉)", "kind": "ft",
+            "decoder": "moe", "E": E, "c": c}
 
 
 def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]:
     inh = _inherit(cfg, exp, dry)
     arms: list[dict] = []
     if exp == "3.1":
-        pairs = (cfg.get("exp31") or {}).get("pairs", [[3, 6], [4, 8], [5, 10]])
-        for k, E in pairs:
-            k, E = int(k), int(E)
-            if not 1 <= k <= E:
-                raise ValueError(f"cặp (k={k}, E={E}) không hợp lệ: cần 1 ≤ k ≤ E")
-            arms.append({"id": f"k{k}_e{E}", "name": f"MoE-DoRA · k={k}, E={E}", "kind": "ft",
-                         "decoder": "moe", "E": E, "top_k": k if k < E else None, "k": k, "pretrain": True})
+        pairs = (cfg.get("exp31") or {}).get("pairs", [[1, 4], [1, 6], [1.5, 4], [1.5, 6]])
+        for c, E in pairs:
+            c, E = float(c), int(E)
+            if c <= 0 or E < 1:
+                raise ValueError(f"cặp (c={c}, E={E}) không hợp lệ: cần c > 0, E ≥ 1")
+            arms.append(_moe_arm(c, E))
     elif exp == "3.2":
-        k, E = inh["k"], inh["E"]
+        c, E = inh["c"], inh["E"]
         arms = [
             {"id": "baseline_infer", "name": "A · Gemma 3 gốc", "kind": "infer", "runner": "gemma3"},
-            {"id": "dora_decoder", "name": "B' · DoRA decoder (không MoE)", "kind": "ft",
-             "decoder": "dora", "E": 0, "top_k": None, "pretrain": True},
-            {"id": "moe_dora", "name": f"C · MoE-DoRA (k={k}, E={E})", "kind": "ft",
-             "decoder": "moe", "E": E, "top_k": k if k < E else None, "k": k, "pretrain": True},
+            {"id": "dora_decoder", "name": "B' · DoRA decoder (không MoE, có Cls head)", "kind": "ft",
+             "decoder": "dora", "E": 0, "c": None},
+            _moe_arm(c, E, "moe_dora", "C · MoE-DoRA + EC-Router"),
         ]
     else:
         raise ValueError(f"--exp phải là 3.1|3.2, nhận {exp!r}")
@@ -132,7 +139,7 @@ def model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
               "merge_adapter": False, "optional": False}
     if arm["kind"] == "infer":
         return Cfg({**common, "runner": arm["runner"]})
-    return Cfg({**common, "runner": "gemma3_mentor", "decoder": arm["decoder"],
+    return Cfg({**common, "runner": "gemma3_ec", "decoder": arm["decoder"],
                 "adapter_dir": str(adapter_root / arm["id"])})
 
 
@@ -152,12 +159,12 @@ def pick_best(cfg: Cfg, scores: dict[str, pd.DataFrame], arms: list[dict], names
     keep = ["arm_id", "clinical_rank", "text_rank", "final_rank", "tied_on_clinical"]
     return {"arm": best_id, "rule": "hạng lâm sàng TB; hoà ⇒ hạng văn bản TB",
             "clinical_rank": float(tab.loc[0, "clinical_rank"]), "text_rank": float(tab.loc[0, "text_rank"]),
-            "k": int(arm.get("k") or arm.get("top_k") or arm["E"]), "E": int(arm["E"]),
+            "c": float(arm["c"]), "E": int(arm["E"]),
             "table": tab[keep].to_dict("records")}
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="§3 — Mentor · Router · MoE-DoRA")
+    ap = argparse.ArgumentParser(description="§3 — Cls head · EC-Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
     ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.2")
@@ -167,7 +174,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--retrain", action="store_true")
-    ap.add_argument("--force", action="store_true", help="pretrain lại (bỏ qua bản local và Hub)")
     ap.add_argument("--no-hub", action="store_true", help="không quét/kéo từ Hub")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
@@ -189,8 +195,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg["data"].update(n_test=8, n_train=16, n_val=8, reuse_manifests=False,
                            manifest_dir=str(cfg["data"]["manifest_dir"]) + "_dryrun")
         cfg["stats"].update(n_perm=200, n_boot=4, bootstrap_sample_size=8)
-        cfg["pretrain"]["n_epochs"] = 1
-        cfg["pretrain"]["dir"] = str(cfg["pretrain"]["dir"]) + "_dryrun"
         cfg["output"]["push"] = False
         cfg.setdefault("wandb", {})["tags"] = list(cfg["wandb"].get("tags", []) or []) + ["dry-run"]
         dry_steps = 4
@@ -244,7 +248,6 @@ def main(argv: list[str] | None = None) -> int:
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
     adapter_root = Path(cfg["output"]["adapter_dir"])
-    pre_dir = Path(str(cfg["pretrain"]["dir"]))
     declared = [x["id"] for x in arms]
     names = {x["id"]: x.get("name", x["id"]) for x in arms}
 
@@ -270,7 +273,6 @@ def main(argv: list[str] | None = None) -> int:
     from .s3_hub import Hub
     hub = Hub(cfg, enabled=not dry and not a.no_hub)
     n_need = int(cfg["data"].get("n_test") or 1)
-    hp = str(cfg["pretrain"].get("hub_path", "pretrain_mentor"))
     if a.retrain:      # train lại ⇒ bỏ kết quả cũ của arm (runner sẽ resume nếu giữ predictions)
         for arm in arms:
             for f in (run_dir / "predictions" / f"{arm['id']}.jsonl", mdir / f"per_sample_{arm['id']}.csv"):
@@ -323,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if not a.retrain and not trained(arm):
             must = (sm.EXPERTS_FILE,) if arm["decoder"] == "moe" else ("adapter_model.safetensors",)
-            if hub.has_dir(f"{sub}/adapters/{aid}", ("train_stats.json", "mentor_branch.safetensors") + must):
+            if hub.has_dir(f"{sub}/adapters/{aid}", ("train_stats.json", "ec_heads.safetensors") + must):
                 hub.pull_dir(f"{sub}/adapters/{aid}", adapter_root / aid)
         arm["need_train"] = a.retrain or not trained(arm)
     for arm in arms:                    # báo cáo con đã có trên Hub ⇒ kéo về (không phải làm lại)
@@ -335,12 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         for x in arms), flush=True)
 
     todo_train = [x for x in ft_arms if x.get("need_train")]
-    need_pre = "pretrain" in stages and (
-        (a.force and any(x["pretrain"] for x in ft_arms))
-        or any(x["pretrain"] for x in todo_train))
-    need_train_data = bool(todo_train) and ("train" in stages or need_pre)
-    if a.force and need_pre:
-        print("⚠ --force: pretrain lại ⇒ các arm đã train trên bản pretrain cũ nên được --retrain.", flush=True)
+    need_train_data = bool(todo_train) and "train" in stages
     tracker = Tracker(cfg, run_id=run_id, config_snapshot=manifest["config"])
     if tracker.url:
         manifest["wandb_url"] = tracker.url
@@ -390,26 +387,6 @@ def main(argv: list[str] | None = None) -> int:
         if val_df is not None and len(val_df):
             cls_y = {**cls_y, **lab.pack(cfg, val_df, "val")["y"]}
 
-    # ── pretrain (Mentor + Cls head, dùng chung) ───────────────────────────
-    if need_pre:
-        have_local = sm.already_trained(pre_dir, "none")
-        if not a.force and not have_local and hub.has_dir(
-                hp, ("train_stats.json", "mentor_branch.safetensors", "adapter_model.safetensors")):
-            hub.pull_dir(hp, pre_dir)
-            have_local = sm.already_trained(pre_dir, "none")
-        if a.force or not have_local:
-            _hr("Pretrain: image → vision encoder → Mentor → Cls head")
-            clear_vram("trước pretrain")
-            if train_df is None:
-                train_df, val_df = dt_mod.load_train_manifest(cfg)
-                cls_y = {**lab.pack(cfg, train_df, "train")["y"], **lab.pack(cfg, val_df, "val")["y"]}
-            meta = st_mod.run_pretrain(cfg, train_df, val_df, cls_y, pre_dir, tracker, dry_steps)
-            manifest["pretrain"] = {k: meta.get(k) for k in ("steps", "epochs", "minutes", "last")}
-            hub.push_dir(pre_dir, hp, "§3 pretrain Mentor + Cls head")
-        else:
-            print(f"⚙ pretrain đã có: {pre_dir} (dùng lại; --force để làm lại)", flush=True)
-        manifest["pretrain_dir"] = str(pre_dir)
-
     # ── train ──────────────────────────────────────────────────────────────
     train_stats: list[dict] = []
     if "train" in stages and todo_train:
@@ -420,13 +397,8 @@ def main(argv: list[str] | None = None) -> int:
             aid = arm["id"]
             print(f"\n── {arm['name']} ──", flush=True)
             clear_vram("trước khi train arm")
-            use_pre = pre_dir if arm["pretrain"] else None
-            if use_pre is not None and not sm.already_trained(use_pre, "none"):
-                print(f"✗ {aid} cần pretrain tại {use_pre} nhưng chưa có (chạy stage pretrain).")
-                tracker.finish(1)
-                return 3
             try:
-                s = st_mod.run_finetune(cfg, arm, train_df, val_df, cls_y, adapter_root / aid, use_pre,
+                s = st_mod.run_finetune(cfg, arm, train_df, val_df, cls_y, adapter_root / aid,
                                         tracker, dry_steps)
             except TrainUnusable as e:
                 print(f"✗ {aid} KHÔNG huấn luyện được: {e}", flush=True)
@@ -518,11 +490,11 @@ def main(argv: list[str] | None = None) -> int:
     if exp == "3.1" and not partial:
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
-        best["note"] = "GỢI Ý — k/E do người dùng quyết định"
+        best["note"] = "GỢI Ý — c/E do người dùng quyết định"
         (run_dir / "best.json").write_text(json.dumps(best, indent=2, ensure_ascii=False), encoding="utf-8")
         manifest["best"] = best
         print(f"⚙ gợi ý: {best['arm']} (hạng lâm sàng TB {best['clinical_rank']:.2f}, văn bản "
-              f"{best['text_rank']:.2f}) → k={best['k']}, E={best['E']} (best.json; bạn chọn)", flush=True)
+              f"{best['text_rank']:.2f}) → c={best['c']:g}, E={best['E']} (best.json; bạn chọn)", flush=True)
 
     # ── stats ──────────────────────────────────────────────────────────────
     pw = pd.DataFrame()

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# run_section3.sh — họ §3: Mentor · Cls head · Router · MoE-DoRA.
-#   bash scripts/run_section3.sh --exp 3.1            # cặp (k,E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6)
-#   bash scripts/run_section3.sh --exp 3.2            # baseline · DoRA decoder · MoE-DoRA (k,E do bạn chọn)
-# Tùy chọn: --dry-run · --detach · --stages a,b · --retrain · --repretrain · --no-push · --no-wandb
-#           --set exp32.k=3 --set exp32.E=5  (3.2 bắt buộc)
-# Pretrain dùng lại safetensors (--force để làm lại); Hub được quét trước (--no-hub để tắt).
+# run_section3.sh — họ §3: Cls head · EC-Router · MoE-DoRA.
+#   bash scripts/run_section3.sh --exp 3.1            # (c,E): (1,4) (1,6) (1.5,4) (1.5,6)
+#   bash scripts/run_section3.sh --exp 3.2            # baseline · DoRA decoder · MoE-DoRA (c,E do bạn chọn)
+# Tùy chọn: --dry-run · --detach · --stages a,b · --retrain · --no-push · --no-wandb
+#           --set exp32.c=1.5 --set exp32.E=6  (3.2 bắt buộc)
+# Không còn pretrain; Cls head học cùng lúc. Hub được quét trước (--no-hub để tắt).
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +38,7 @@ PY
 fi
 if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
     echo "⚙ Tự kiểm chứng §3 ..."
-    "$PYBIN" "$ROOT/scripts/selftest_mentor.py" && "$PYBIN" "$ROOT/scripts/selftest_section3.py" || {
+    "$PYBIN" "$ROOT/scripts/selftest_ec.py" && "$PYBIN" "$ROOT/scripts/selftest_section3.py" || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU (bỏ qua: RGEXP_SKIP_SELFTEST=1)"; exit 1; }
 fi
 exec "$PYBIN" -m src.run_section3 "${ARGS[@]+"${ARGS[@]}"}"

@@ -2,7 +2,6 @@
 
 Bố cục trên repo kết quả (cùng `push.push_artifact`):
     <subdir>/predictions/<arm>.jsonl · <subdir>/adapters/<arm>/… · <subdir>/metrics/per_sample_<arm>.csv
-    <pretrain.hub_path>/…            (Mentor + Cls head + QDoRA vision đã pretrain, dùng chung)
 Mọi lỗi mạng/quyền chỉ cảnh báo và coi như "chưa có" — không bao giờ làm hỏng lần chạy.
 """
 from __future__ import annotations

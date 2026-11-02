@@ -1,7 +1,7 @@
 """Bảng tra runner theo tên trong config (họ §3).
 
     gemma3         — Gemma 3 gốc, không adapter (baseline A).
-    gemma3_mentor  — base NF4 + Mentor/Cls head/Router + MoE-DoRA hoặc DoRA decoder (GREEDY).
+    gemma3_ec      — base NF4 + Cls head/EC-Router + MoE-DoRA hoặc DoRA decoder (GREEDY).
 """
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ def build(cfg: Cfg, mcfg: Cfg, tracker=None) -> Runner:
         from .gemma3 import Gemma3Runner
 
         return Gemma3Runner(cfg, mcfg, tracker)
-    if kind == "gemma3_mentor":
-        from .gemma3_mentor import Gemma3MentorRunner
+    if kind == "gemma3_ec":
+        from .gemma3_ec import Gemma3ECRunner
 
-        return Gemma3MentorRunner(cfg, mcfg, tracker)
-    raise ValueError(f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_mentor'.")
+        return Gemma3ECRunner(cfg, mcfg, tracker)
+    raise ValueError(f"runner không biết: {kind!r}. Hợp lệ: 'gemma3', 'gemma3_ec'.")
 
 
 __all__ = ["build", "Runner"]
