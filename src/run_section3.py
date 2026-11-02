@@ -1,11 +1,10 @@
-"""§3 — Mentor · Cls head · Router · MoE-DoRA.   python -m src.run_section3 --exp 3.1|3.2|3.3
+"""§3 — Mentor · Cls head · NoisyRouter · MoE-DoRA.   python -m src.run_section3 --exp 3.1|3.2
 
-    3.1  Dense MoE-DoRA, k = 2→4 (E = k, mọi expert hoạt động)      -> best.json {k}
-    3.2  k do BẠN chọn (chỉ để đặt E = k+1→k+4); top-k = None (dense trên E)
-    3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
+    3.1  Khảo sát cặp (k, E) ∈ {(1,2),(2,3),(2,4),(3,4),(3,5),(3,6)}: router chọn top-k trên E expert
+    3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
 
 Stage: data → pretrain → train → infer → score → stats → analysis → report → push.
-k, E do người dùng chọn (`exp32.k`, `exp33.k`, `exp33.E`); best.json chỉ là GỢI Ý.
+k, E do người dùng chọn (`exp32.k`, `exp32.E`); best.json chỉ là GỢI Ý.
 Mọi stage quét Hub trước: có predictions ⇒ bỏ qua train+infer; có adapter ⇒ bỏ qua train;
 có pretrain ⇒ kéo về. Pretrain lưu safetensors dùng chung; `--force` để pretrain lại.
 Tái sử dụng nguyên văn của §2.x: dữ liệu/split, lịch train, chấm điểm, align_blocks,
@@ -28,10 +27,8 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
 from .tracking import Tracker
 
 STAGES = ["data", "pretrain", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_dense_k", "3.1-1": "3.1-1_router_penalty", "3.1-2": "3.1-2_router_simple",
-          "3.2": "3.2_e_sweep",
-          "3.3": "3.3_ablation"}
-ADAPTER = {"3.1": "./adapters_3_1", "3.1-1": "./adapters_3_1_1", "3.1-2": "./adapters_3_1_2", "3.2": "./adapters_3_2", "3.3": "./adapters_3_3"}
+SUBDIR = {"3.1": "3.1_k_e_pairs", "3.2": "3.2_ablation"}
+ADAPTER = {"3.1": "./adapters_3_1", "3.2": "./adapters_3_2"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -79,17 +76,10 @@ def _inherit(cfg: Cfg, exp: str, dry: bool) -> dict:
     """k, E do NGƯỜI DÙNG chọn trong cấu hình; best.json chỉ được in ra như gợi ý."""
     got: dict = {}
     if exp == "3.2":
-        k = (cfg.get("exp32") or {}).get("k")
-        if k is None:
-            raise ValueError("3.2 cần k: đặt `--set exp32.k=<k>`" + _suggest(cfg, "3.1", dry))
-        got["k"] = int(k)
-    if exp == "3.3":
-        e33 = cfg.get("exp33") or {}
-        if e33.get("k") is None:
-            raise ValueError("3.3 cần k: `--set exp33.k=<k>`" + _suggest(cfg, "3.1", dry))
-        if e33.get("E") is None:
-            raise ValueError("3.3 cần E: `--set exp33.E=<E>`" + _suggest(cfg, "3.2", dry))
-        got.update(k=int(e33["k"]), E=int(e33["E"]))
+        e32 = cfg.get("exp32") or {}
+        if e32.get("k") is None or e32.get("E") is None:
+            raise ValueError("3.2 cần k và E: `--set exp32.k=<k> --set exp32.E=<E>`" + _suggest(cfg, "3.1", dry))
+        got.update(k=int(e32["k"]), E=int(e32["E"]))
         if got["E"] < got["k"]:
             raise ValueError(f"E={got['E']} < k={got['k']}")
     return got
@@ -99,39 +89,14 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
     inh = _inherit(cfg, exp, dry)
     arms: list[dict] = []
     if exp == "3.1":
-        for k in (cfg.get("exp31") or {}).get("ks", [2, 3, 4]):
-            k = int(k)
-            arms.append({"id": f"dense_k{k}", "name": f"Dense MoE-DoRA · k=E={k}", "kind": "ft",
-                         "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True})
-    elif exp == "3.1-1":
-        k = int((cfg.get("exp311") or {}).get("k", 4))
-        if k != 4:
-            raise ValueError("3.1-1 chỉ áp dụng cho biến thể exp 3.1 có K=4 (exp311.k = 4)")
-        arms = [
-            {"id": f"dense_k{k}", "name": f"K={k} · Router cũ (exp 3.1)", "kind": "ft", "decoder": "moe",
-             "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v1",
-             "reuse": {"exp": "3.1", "id": f"dense_k{k}", "required": True}},
-            {"id": f"dense_k{k}_router2", "name": f"K={k} · Router mới (penalty)", "kind": "ft",
-             "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v2"},
-        ]
-    elif exp == "3.1-2":
-        k = int((cfg.get("exp312") or {}).get("k", 4))
-        if k != 4:
-            raise ValueError("3.1-2 chỉ áp dụng cho biến thể exp 3.1 có K=4 (exp312.k = 4)")
-        arms = [
-            {"id": f"dense_k{k}", "name": f"K={k} · Router gốc (exp 3.1)", "kind": "ft", "decoder": "moe",
-             "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v1",
-             "reuse": {"exp": "3.1", "id": f"dense_k{k}", "required": True}},
-            {"id": f"dense_k{k}_router3", "name": f"K={k} · Router đơn giản (Q×K softmax)", "kind": "ft",
-             "decoder": "moe", "E": k, "top_k": None, "k": k, "pretrain": True, "router": "v3"},
-        ]
+        pairs = (cfg.get("exp31") or {}).get("pairs", [[1, 2], [2, 3], [2, 4], [3, 4], [3, 5], [3, 6]])
+        for k, E in pairs:
+            k, E = int(k), int(E)
+            if not 1 <= k <= E:
+                raise ValueError(f"cặp (k={k}, E={E}) không hợp lệ: cần 1 ≤ k ≤ E")
+            arms.append({"id": f"k{k}_e{E}", "name": f"MoE-DoRA · k={k}, E={E}", "kind": "ft",
+                         "decoder": "moe", "E": E, "top_k": k if k < E else None, "k": k, "pretrain": True})
     elif exp == "3.2":
-        k = inh["k"]
-        for x in (cfg.get("exp32") or {}).get("extra", [1, 2, 3, 4]):
-            E = k + int(x)
-            arms.append({"id": f"k{k}_e{E}", "name": f"Dense MoE-DoRA · k={k} → E={E}", "kind": "ft",
-                         "decoder": "moe", "E": E, "top_k": None, "k": k, "pretrain": True})
-    elif exp == "3.3":
         k, E = inh["k"], inh["E"]
         arms = [
             {"id": "baseline_infer", "name": "A · Gemma 3 gốc", "kind": "infer", "runner": "gemma3"},
@@ -141,7 +106,7 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
              "decoder": "moe", "E": E, "top_k": k if k < E else None, "k": k, "pretrain": True},
         ]
     else:
-        raise ValueError(f"--exp phải là 3.1|3.2|3.3, nhận {exp!r}")
+        raise ValueError(f"--exp phải là 3.1|3.2, nhận {exp!r}")
     return arms, inh
 
 
@@ -195,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Mentor · Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.1-1 | 3.1-2 | 3.2 | 3.3")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.2")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -212,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(a.config, a.overrides)
     exp = a.exp or str(cfg.get("experiment", "3.1"))
     if exp not in SUBDIR:
-        print(f"✗ experiment {exp!r} không hợp lệ (3.1|3.2|3.3)")
+        print(f"✗ experiment {exp!r} không hợp lệ (3.1|3.2)")
         return 2
     cfg["experiment"] = exp
     dry = bool(a.dry_run)
@@ -235,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg["output"]["push"] = False
     if a.no_wandb:
         cfg.setdefault("wandb", {})["enabled"] = False
-    cfg["stats"]["pairs"] = "contrasts" if exp == "3.3" else "all"
+    cfg["stats"]["pairs"] = "contrasts" if exp == "3.2" else "all"
 
     seed_everything(int(cfg.get("seed", 42)))
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
@@ -279,11 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         return arm["kind"] == "infer" or sm.already_trained(
             arm.get("adapter_root", adapter_root) / arm["id"], arm["decoder"])
 
-    if exp in ("3.1-1", "3.1-2"):
-        manifest_note = ("Mentor + Cls head kế thừa nguyên từ pretrain dùng chung với exp 3.1 "
-                         "(đóng băng) — cùng trọng số với arm K=4 của 3.1; chỉ Router thay đổi.")
-    else:
-        manifest_note = None
+    manifest_note = None
     manifest = {"run_id": run_id, "experiment": exp,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config": resolved_snapshot(cfg), "stages_run": stages, "arms_declared": declared,
@@ -301,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             for f in (run_dir / "predictions" / f"{arm['id']}.jsonl", mdir / f"per_sample_{arm['id']}.csv"):
                 f.unlink(missing_ok=True)
     import shutil
-    for arm in arms:                    # kết quả dùng lại từ mục khác (đối chứng của 3.1-1)
+    for arm in arms:                    # kết quả dùng lại từ mục khác (đối chứng dùng lại, nếu có)
         ru = arm.get("reuse")
         if not ru:
             continue
@@ -534,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["n_eval"] = align_info["n_common"]
 
     best = None
-    if exp in ("3.1", "3.2"):
+    if exp == "3.1":
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
         best["note"] = "GỢI Ý — k/E do người dùng quyết định"

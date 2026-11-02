@@ -13,43 +13,31 @@ prompt cố định ─► tokenizer ─► embedding ────────�
 ```
 
 - **Mentor**: RMSNorm → attention pooling 14 query → [B,14,D]. **Cls head**: RMSNorm → Linear → [B,14,4].
-- **Router**: Query (Bilinear) × Key (Linear) → softmax trục E → log(điểm) + Linear(Query) → softmax (dense) hoặc top-k.
+- **Router nhiễu**: xem bên dưới. **MoE-DoRA(Ω,k) = Σᵢ wᵢ⊙DoRAᵢ**, wᵢ = Ωᵢ/Σ_{top-k}Ω, DoRAᵢ = mᵢ ⊙ (W₀ + α/r·BᵢᵀAᵢ)/‖·‖₂.
+- **Log train**: ngoài `ce_text`, `ce_cls`, `lr` còn in/ghi `grad_norm` của router và decoder (trước khi clip): `train/<arm>/grad_norm_router`, `grad_norm_decoder`.
 - **Loss**: chỉ CE cls (nhãn CheXbert sinh lazy) và CE text. Mọi PEFT = QDoRA rank 4. Infer luôn greedy.
-- **Lịch (mọi pipeline)**: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước (cosine mỗi epoch). lr chu kỳ đầu 0 → 1e-4 → 8e-7, weight decay 0.001 cho mọi module học được. Val mỗi 100 bước, patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất.
+- **Lịch (mọi pipeline)**: 6400 mẫu · eff_bs 16 · 2 epoch × 200 bước = 400 bước (cosine mỗi epoch). lr chu kỳ đầu 0 → 1e-4 → 8e-7, weight decay 0.001 cho mọi module học được. Val mỗi 20 bước, patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất.
 - **Quy trình**: pretrain (image→vision→Mentor→Cls head) → đóng băng Mentor+Cls head → finetune phần còn lại.
 
-### Router (New) — dùng ở exp 3.1-1
+### Router
 
 ```
-x  = RMSNorm(m)                       m: [B,14,D]
-E0 = Bilinear(x)        [B,E,D]       (Expert)
-P  = Softplus(Bilinear(x)) [B,E,1]    (Penalty ≥ 0, không qua RMSNorm)
-K  = Linear(x)          [B,14,D]
-e  = RMSNorm(E0);  Q = e·W_qk (cũng là K của MHA),  V = e·W_v     (Linear Proj, H = 8 head, d_h = D/H)
+X = Y_mentor                          [B,14,D]
+h = X·W_D + N(0,1) ⊙ softplus(X·W_noise)      [B,14]   (W_D, W_noise: D→1)
+E = W_E · h                           [B,E]    (W_E: E×14)
+P = sqrt( softmax_E(E) ⊙ sigmoid(E) )          [B,E]
+w = P_k / Σ P_k                        (top-k theo P; k = E ⇒ dense)
 ```
 
-**Orthog-MHA** (self-attention trên trục expert, phạt đường chéo bằng P):
-
-```
-S_h = Q_h Q_hᵀ / √d_h − diag(P)            [B,E,E]   (E×E: expert tự chú ý chính nó bị phạt)
-A_h = softmax_hàng(S_h)
-Orthog-MHA(e, P) = concat_h(A_h V_h) · W_o
-z   = E0 + Orthog-MHA(e, P)                          (Add)
-```
-
-Phần còn lại giống Router (Old): `s = mean_14 softmax_E(z·Kᵀ/√D)`, `logit = Linear(z) + log s`,
-`w = softmax_E(logit)` (dense) hoặc top-k rồi softmax; Σw = 1.
-Tham số của khối: `W_qk`, `W_v`, `W_o` (D×D, không bias).
+Hạng tử nhiễu **chỉ có khi training**; suy luận (`.eval()`, greedy) bỏ hẳn. Không clamp logit, không aux loss.
 
 ## Thí nghiệm
 
 | Mục | Làm gì | Bạn chọn |
 |---|---|---|
-| 3.1 | Dense MoE-DoRA, k = E = 2→4 | — |
-| 3.1-1 | Router mới (Orthog-MHA + penalty) cho K=4; so sánh nhị đối chứng với K=4 (Router cũ) của 3.1; Hub: `3.1-1_router_penalty/` | cần kết quả 3.1 |
-| 3.1-2 | Router đơn giản (Query×Key → Attn Softmax → w) cho K=4; so sánh nhị đối chứng với K=4 của 3.1; Hub: `3.1-2_router_simple/` | cần kết quả 3.1 |
-| 3.2 | Dense, E = k+1→k+4 | `exp32.k` |
-| 3.3 | Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp33.k`, `exp33.E` |
+| 3.1 | Khảo sát cặp (k, E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6) | — |
+| 3.2 | Có cần MoE-DoRA? Gemma gốc · DoRA decoder · MoE-DoRA (top-k = k) | `exp32.k`, `exp32.E` |
+| 3.3 | So vị trí leaderboard / SoTA bị vượt (train/val/test trên benchmark) | *chưa cài đặt* |
 
 Mỗi mục ra `runs/<mục>/REPORT.md`: bảng điểm, kiểm định ghép cặp, Cls head, và với arm MoE có thêm
 bảng **Similarity giữa Expert** + **Expert-Labels** + kết luận sụp đổ về một DoRA hay không.
@@ -61,10 +49,7 @@ bảng **Similarity giữa Expert** + **Expert-Labels** + kết luận sụp đ�
 export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.1
-bash scripts/run_section3.sh --exp 3.1-1
-bash scripts/run_section3.sh --exp 3.1-2
-bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3
-bash scripts/run_section3.sh --exp 3.3 --set exp33.k=3 --set exp33.E=5
+bash scripts/run_section3.sh --exp 3.2 --set exp32.k=3 --set exp32.E=5
 ```
 
 | Cờ | Tác dụng |
@@ -81,7 +66,7 @@ bash scripts/run_section3.sh --exp 3.3 --set exp33.k=3 --set exp33.E=5
 | `--set key=value` | ghi đè config, ví dụ `--set train.schedule.max_lr=5e-5` |
 
 **Tái sử dụng**: mọi lần chạy quét Hub trước. Có predictions ⇒ bỏ qua train + infer; có adapter ⇒ bỏ qua train;
-có điểm ⇒ bỏ qua chấm. Pretrain lưu safetensors ở `adapters_3_pretrain/` (Hub: `pretrain_mentor/`) và dùng chung cho 3.1–3.3.
+có điểm ⇒ bỏ qua chấm. Pretrain lưu safetensors ở `adapters_3_pretrain/` (Hub: `pretrain_mentor/`) và dùng chung cho 3.1–3.2.
 
 ## File chính
 
@@ -91,7 +76,7 @@ có điểm ⇒ bỏ qua chấm. Pretrain lưu safetensors ở `adapters_3_pretr
 | `scripts/run_section3.sh` | điểm vào (kiểm môi trường + selftest + chạy) |
 | `scripts/selftest_mentor.py` · `selftest_section3.py` | kiểm thử CPU |
 | `src/run_section3.py` | điều phối các stage |
-| `src/mentor.py` | Mentor · Cls head · Router |
+| `src/mentor.py` | Mentor · Cls head · NoisyRouter |
 | `src/moe_dora.py` | MoE-DoRA |
 | `src/s3_model.py` · `s3_train.py` | dựng mô hình · pretrain/finetune |
 | `src/s3_labels.py` | nhãn CheXbert lazy |

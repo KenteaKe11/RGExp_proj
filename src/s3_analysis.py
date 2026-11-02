@@ -104,6 +104,24 @@ def expert_labels(W: np.ndarray, pos: np.ndarray, labels=CHEXBERT_LABELS) -> dic
             "support": pd.Series(sup, index=labels), "mean_all": pd.Series(mean_all, index=idx)}
 
 
+def expert_clinical_corr(W: np.ndarray, pos: np.ndarray, labels=CHEXBERT_LABELS) -> pd.DataFrame:
+    """E-Clinical: Pearson giữa trọng số route của expert i (qua N ảnh) và nhãn dương j (0/1).
+    W (N,E); pos (N,14). Ô không xác định (bệnh không có ca dương/âm, hoặc w hằng) = 0."""
+    n, e = W.shape
+    Wc = W - W.mean(0, keepdims=True)
+    Pc = pos.astype(np.float64) - pos.astype(np.float64).mean(0, keepdims=True)
+    num = Wc.T @ Pc                                             # (E,14)
+    den = np.sqrt((Wc ** 2).sum(0))[:, None] * np.sqrt((Pc ** 2).sum(0))[None, :]
+    c = np.where(den > 1e-12, num / np.maximum(den, 1e-12), 0.0)
+    return pd.DataFrame(c, index=[f"E{i}" for i in range(e)], columns=labels)
+
+
+def expert_expert_corr(C: pd.DataFrame) -> pd.DataFrame:
+    """E-E = E-Clinical × E-Clinicalᵀ  (E×14 · 14×E): hai expert giống nhau khi cùng tương quan với cùng bệnh."""
+    m = C.to_numpy(dtype=np.float64)
+    return pd.DataFrame(m @ m.T, index=C.index, columns=C.index)
+
+
 def route_cv(W: np.ndarray) -> float:
     """Hệ số biến thiên TB của trọng số mỗi expert qua các ảnh (std/mean). ≈0 ⇒ router tĩnh."""
     mu = W.mean(0)
@@ -150,6 +168,13 @@ def analyse(arm_id: str, adapter_dir: Path, preds: dict[str, dict], keys: list[s
         if m is not None:
             pd.DataFrame(m, index=names, columns=names).to_csv(
                 out_dir / f"{arm_id}_sim_{nm}.csv")
+    ec = expert_clinical_corr(W, P)
+    ec.to_csv(out_dir / f"{arm_id}_e_clinical_corr.csv")
+    expert_expert_corr(ec).to_csv(out_dir / f"{arm_id}_e_e_corr.csv")
+    try:
+        plot_heatmaps(ec, expert_expert_corr(ec), out_dir / f"{arm_id}_e_heatmap.png", arm_id)
+    except Exception as ex:           # không có matplotlib ⇒ báo cáo rơi về bảng
+        print(f"  ⚠ không vẽ được heatmap {arm_id}: {ex}", flush=True)
     el = expert_labels(W, P)
     el["mean_pos"].to_csv(out_dir / f"{arm_id}_expert_labels_mean.csv")
     el["lift"].to_csv(out_dir / f"{arm_id}_expert_labels_lift.csv")
@@ -189,3 +214,49 @@ def md_expert_labels(df: pd.DataFrame, support: pd.Series, nd: int = 3) -> str:
         rows.append(f"| **{e}** | " + " | ".join(cells) + " |")
     rows.append("| *support* | " + " | ".join(str(int(support[c])) for c in cols) + " |")
     return head + "\n" + "\n".join(rows)
+
+
+def md_side_by_side(left: pd.DataFrame, right: pd.DataFrame, left_title: str, right_title: str,
+                    nd: int = 2) -> str:
+    """Hai bảng cạnh nhau (HTML lồng trong Markdown): E-Clinical | E-E."""
+    def tbl(df):
+        h = "<tr><th></th>" + "".join(f"<th>{c}</th>" for c in df.columns) + "</tr>"
+        r = "".join("<tr><th>%s</th>%s</tr>" % (i, "".join(f"<td>{v:.{nd}f}</td>" for v in row))
+                    for i, row in zip(df.index, df.to_numpy()))
+        return f"<table>{h}{r}</table>"
+    return ("<table><tr>"
+            f"<td valign=\"top\"><b>{left_title}</b><br>{tbl(left)}</td>"
+            f"<td valign=\"top\"><b>{right_title}</b><br>{tbl(right)}</td>"
+            "</tr></table>")
+
+
+def plot_heatmaps(ec: pd.DataFrame, ee: pd.DataFrame, path: Path, title: str = "") -> Path:
+    """Hai heatmap cạnh nhau: E-Clinical (E×14) | E-E (E×E). Thang đối xứng quanh 0, số trong ô."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    e = len(ec.index)
+    fig, axs = plt.subplots(1, 2, figsize=(max(9.0, 0.72 * ec.shape[1]) + max(3.5, 0.9 * e) + 1.5,
+                                           max(3.0, 0.7 * e + 2.8)),
+                            gridspec_kw={"width_ratios": [ec.shape[1], max(e, 2) * 1.2]})
+    for ax, df, name in ((axs[0], ec, "E-Clinical (Pearson: trọng số route × nhãn dương)"),
+                         (axs[1], ee, "E-E = E-Clinical × E-Clinicalᵀ")):
+        m = df.to_numpy(dtype=float)
+        v = max(float(np.abs(m).max()), 1e-6)
+        im = ax.imshow(m, cmap="RdBu_r", vmin=-v, vmax=v, aspect="auto")
+        ax.set_xticks(range(m.shape[1]), df.columns, rotation=60, ha="right", fontsize=8)
+        ax.set_yticks(range(m.shape[0]), df.index, fontsize=9)
+        for i in range(m.shape[0]):
+            for j in range(m.shape[1]):
+                ax.text(j, i, f"{m[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                        color="white" if abs(m[i, j]) > 0.6 * v else "black")
+        ax.set_title(name, fontsize=10)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    path = Path(path)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path

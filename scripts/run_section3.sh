@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # run_section3.sh — họ §3: Mentor · Cls head · Router · MoE-DoRA.
-#   bash scripts/run_section3.sh --exp 3.1            # dense k = 2→4
-#   bash scripts/run_section3.sh --exp 3.1-1          # Router mới cho K=4 (cần kết quả 3.1 K=4)
-#   bash scripts/run_section3.sh --exp 3.1-2          # Router đơn giản cho K=4 (cần kết quả 3.1 K=4)
-#   bash scripts/run_section3.sh --exp 3.2            # E = k+1→k+4 (k do bạn chọn: --set exp32.k=3)
-#   bash scripts/run_section3.sh --exp 3.3            # baseline · DoRA decoder · MoE-DoRA
+#   bash scripts/run_section3.sh --exp 3.1            # cặp (k,E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6)
+#   bash scripts/run_section3.sh --exp 3.2            # baseline · DoRA decoder · MoE-DoRA (k,E do bạn chọn)
 # Tùy chọn: --dry-run · --detach · --stages a,b · --retrain · --repretrain · --no-push · --no-wandb
-#           --set exp32.k=3  (3.2 bắt buộc)  ·  --set exp33.k=3 --set exp33.E=5  (3.3 bắt buộc)
+#           --set exp32.k=3 --set exp32.E=5  (3.2 bắt buộc)
 # Pretrain dùng lại safetensors (--force để làm lại); Hub được quét trước (--no-hub để tắt).
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng
 set -euo pipefail

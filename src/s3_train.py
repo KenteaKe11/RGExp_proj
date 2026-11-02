@@ -98,8 +98,21 @@ def _trainable(b, opt) -> list:
     return [p for gp in opt.param_groups for p in gp["params"]]
 
 
+def _group_grad_norms(opt) -> dict:
+    """L2-norm gradient của nhóm `router` và `decoder_peft` (chỉ nhóm nào đang học)."""
+    out = {}
+    for g in opt.param_groups:
+        key = {"router": "router", "decoder_peft": "decoder"}.get(g.get("name"))
+        if key is None:
+            continue
+        sq = sum(float(p.grad.detach().float().pow(2).sum()) for p in g["params"]
+                 if p.grad is not None)
+        out[key] = sq ** 0.5
+    return out
+
+
 def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
-          seed, log_every, tracker, tag, route_ctx=None, val_ds=None, val_every=100,
+          seed, log_every, tracker, tag, route_ctx=None, val_ds=None, val_every=20,
           patience=3, to_eval=None, to_train=None):
     """Vòng lặp chung. OOM -> hạ micro-batch một bậc và làm lại bước đó.
 
@@ -190,6 +203,7 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                 micro = next(d for d in ladder if d < micro)   # ước kế tiếp của eff_bs
                 print(f"  OOM: hạ micro-batch xuống {micro} (eff_bs {eff_bs} giữ nguyên "
                       f"nhờ tích luỹ) và làm lại bước {step + 1}", flush=True)
+        gn = _group_grad_norms(opt)          # trước khi clip: chuẩn gradient router / decoder
         if clip > 0:
             torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
@@ -198,11 +212,13 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
         if (step + 1) % log_every == 0 or step == steps - 1:
             lr = opt.param_groups[0]["lr"]
             print(f"    [{tag}] bước {step + 1}/{steps} · ce_text {comps['ce_text']:.4f} · "
-                  f"ce_cls {comps['ce_cls']:.4f} · lr {lr:.2e} · micro {micro}", flush=True)
+                  f"ce_cls {comps['ce_cls']:.4f} · lr {lr:.2e} · micro {micro}"
+                  + "".join(f" · gn_{k} {v:.3e}" for k, v in gn.items()), flush=True)
             if tracker is not None:
                 tracker.log({f"train/{tag}/ce_text": comps["ce_text"],
                              f"train/{tag}/ce_cls": comps["ce_cls"],
-                             f"train/{tag}/lr": lr, f"train/{tag}/step": step + 1})
+                             f"train/{tag}/lr": lr, f"train/{tag}/step": step + 1,
+                             **{f"train/{tag}/grad_norm_{k}": v for k, v in gn.items()}})
         if val_ds is not None and ((step + 1) % val_every == 0 or step == steps - 1):
             vl, vp = validate()
             improved = vl < best["loss"] - 1e-6
@@ -266,7 +282,7 @@ def run_pretrain(cfg, train_df: pd.DataFrame, val_df, cls_y: dict, out_dir: Path
                                cls_y, b.img_kw) if val_df is not None and len(val_df) else None)
     print(f"  pretrain: {len(ds)} mẫu · {epochs} epoch"
           + (f" × {cycle} bước (cosine mỗi epoch)" if split else "")
-          + f" · eff_bs {eff} · {steps} bước · lr {lr:.1e} · val mỗi {vcfg.get('every_steps', 100)} bước "
+          + f" · eff_bs {eff} · {steps} bước · lr {lr:.1e} · val mỗi {vcfg.get('every_steps', 20)} bước "
           f"(patience {vcfg.get('patience', 3)}) · nhóm {ng}", flush=True)
     pad = int(b.processor.tokenizer.pad_token_id or 0)
     b.branch.train()
@@ -280,7 +296,7 @@ def run_pretrain(cfg, train_df: pd.DataFrame, val_df, cls_y: dict, out_dir: Path
               micro_top=int(pcfg.get("per_device_batch_size", 16)), opt=opt, sched=sched,
               loss_fn=loss_fn, clip=float(tcfg.get("max_grad_norm", 1.0)), seed=seed,
               log_every=int(tcfg.get("logging_steps", 10)), tracker=tracker, tag="pretrain",
-              val_ds=val_ds, val_every=int(vcfg.get("every_steps", 100)),
+              val_ds=val_ds, val_every=int(vcfg.get("every_steps", 20)),
               patience=int(vcfg.get("patience", 3)), to_eval=b.branch.eval, to_train=b.branch.train)
     out_dir = Path(out_dir)
     meta = {"phase": "pretrain", "decoder": "none", "steps": steps, "eff_bs": eff,
@@ -321,8 +337,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     seed_everything(seed)
     decoder = arm["decoder"]
     b = sm.build(cfg, decoder=decoder, n_experts=int(arm.get("E", 0)),
-                 top_k=arm.get("top_k"), projector=True,
-                 router_type=str(arm.get("router", "v1")))
+                 top_k=arm.get("top_k"), projector=True)
     pre_rep = None
     if pretrain_dir is not None:
         pre_rep = load_pretrained(b, pretrain_dir)
@@ -349,7 +364,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     vcfg = dict(cfg.get("validation", {}) or {})
     val_ds = (ClsReportDataset(val_df, b.processor, cfg, int(tcfg.get("max_seq_len", 1024)),
                                cls_y, b.img_kw) if val_df is not None and len(val_df) else None)
-    print(f"  val mỗi {vcfg.get('every_steps', 100)} bước · patience {vcfg.get('patience', 3)} · "
+    print(f"  val mỗi {vcfg.get('every_steps', 20)} bước · patience {vcfg.get('patience', 3)} · "
           f"{0 if val_ds is None else len(val_ds)} mẫu val", flush=True)
     print(f"  {len(ds)} mẫu · eff_bs {eff} · {steps} bước"
           + (f" = {n_ep} epoch × {cycle} bước (epoch_split, lr_decay {scfg.get('lr_decay', 1)})"
@@ -391,11 +406,10 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
               micro_top=int(tcfg.get("per_device_batch_size", 8)), opt=opt, sched=sched,
               loss_fn=loss_fn, clip=float(tcfg.get("max_grad_norm", 1.0)), seed=seed,
               log_every=int(tcfg.get("logging_steps", 10)), tracker=tracker, tag=arm["id"],
-              route_ctx=b.route_ctx, val_ds=val_ds, val_every=int(vcfg.get("every_steps", 100)),
+              route_ctx=b.route_ctx, val_ds=val_ds, val_every=int(vcfg.get("every_steps", 20)),
               patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode)
     meta = {"phase": "finetune", "arm_id": arm["id"], "name": arm.get("name", arm["id"]),
             "decoder": decoder, "n_experts": int(arm.get("E", 0)), "top_k": arm.get("top_k"),
-            "router_type": str(arm.get("router", "v1")),
             "rank": b.rank, "alpha": b.alpha, "method": "qdora", "quantized": True,
             "loss": "ce_text + lambda*ce_cls", "lambda_cls": lam, "steps": steps,
             "eff_bs": eff, "n_train": len(ds), "epoch_split": epoch_split,

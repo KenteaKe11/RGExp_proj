@@ -31,42 +31,25 @@ def main() -> int:
         cfg["output"]["dir"] = td
         # 3.1
         a1, _ = build_arms(cfg, "3.1")
-        check("3.1: dense k=2..4, E=k, top_k=None, pretrain",
-              [(x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
-              [(k, None, True) for k in (2, 3, 4)])
-        a11, _ = build_arms(cfg, "3.1-1")
-        d = {x["id"]: x for x in a11}
-        check("3.1-1: chỉ K=4 cũ (reuse 3.1) ↔ K=4 Router mới (v2)",
-              list(d) == ["dense_k4", "dense_k4_router2"]
-              and d["dense_k4"]["reuse"]["exp"] == "3.1" and d["dense_k4"].get("router") == "v1"
-              and d["dense_k4_router2"]["router"] == "v2" and d["dense_k4_router2"]["E"] == 4
-              and d["dense_k4_router2"]["top_k"] is None and d["dense_k4_router2"]["pretrain"])
-        a12, _ = build_arms(cfg, "3.1-2")
-        d2 = {x["id"]: x for x in a12}
-        check("3.1-2: chỉ K=4 gốc (reuse 3.1) ↔ K=4 Router đơn giản (v3)",
-              list(d2) == ["dense_k4", "dense_k4_router3"] and d2["dense_k4"]["reuse"]["exp"] == "3.1"
-              and d2["dense_k4_router3"]["router"] == "v3" and d2["dense_k4_router3"]["E"] == 4
-              and d2["dense_k4_router3"]["top_k"] is None)
+        check("3.1: 6 cặp (k,E), top_k=k (None khi k=E), có pretrain",
+              [(x["k"], x["E"], x["top_k"], x["pretrain"]) for x in a1] ==
+              [(1, 2, 1, True), (2, 3, 2, True), (2, 4, 2, True), (3, 4, 3, True), (3, 5, 3, True), (3, 6, 3, True)])
         try:
             build_arms(cfg, "3.2")
-            check("3.2 thiếu k phải DỪNG (k do người dùng chọn)", False)
-        except ValueError as e:
-            check("3.2 thiếu k phải DỪNG (k do người dùng chọn)", "exp32.k" in str(e))
-        cfg["exp32"]["k"] = 3
-        a2, inh = build_arms(cfg, "3.2")
-        check("3.2: k=3, E=4..7, dense (top_k=None), có pretrain",
-              inh["k"] == 3 and [x["E"] for x in a2] == [4, 5, 6, 7]
-              and all(x["top_k"] is None and x["pretrain"] for x in a2))
-        try:
-            build_arms(cfg, "3.3")
-            check("3.3 thiếu k,E phải DỪNG", False)
+            check("3.2 thiếu k,E phải DỪNG", False)
         except ValueError:
-            check("3.3 thiếu k,E phải DỪNG", True)
-        cfg["exp33"].update(k=3, E=5)
-        a3, inh3 = build_arms(cfg, "3.3")
+            check("3.2 thiếu k,E phải DỪNG", True)
+        for old in ("3.1-1", "3.1-2", "3.3"):
+            try:
+                build_arms(cfg, old)
+                check(f"{old} đã bị xoá", False)
+            except ValueError:
+                check(f"{old} đã bị xoá", True)
+        cfg["exp32"].update(k=3, E=5)
+        a3, inh3 = build_arms(cfg, "3.2")
         ids = [x["id"] for x in a3]
         moe = a3[-1]
-        check("3.3: baseline · dora_decoder · moe_dora (k=3, E=5, top_k=3)",
+        check("3.2: baseline · dora_decoder · moe_dora (k=3, E=5, top_k=3)",
               ids == ["baseline_infer", "dora_decoder", "moe_dora"]
               and (moe["E"], moe["top_k"]) == (5, 3) and a3[1]["decoder"] == "dora")
         mc = model_cfg(cfg, a3[2], Path("ad"))
@@ -99,12 +82,12 @@ def main() -> int:
         # ── lịch: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước ──
         from src.s3_train import _plan
         eff, n_ep, split, steps, cycle = _plan(dict(cfg["train"]), 6400)
-        check("lịch finetune: eff_bs 16 · 4×200 = 800 bước (2 lượt qua 6400 mẫu)",
-              (eff, n_ep, split, steps, cycle) == (16, 4, True, 800, 200) and steps * eff == 2 * 6400)
+        check("lịch finetune: eff_bs 16 · 2×200 = 400 bước (1 lượt qua 6400 mẫu)",
+              (eff, n_ep, split, steps, cycle) == (16, 2, True, 400, 200) and steps * eff == 6400)
         pe = _plan({**cfg["train"], **cfg["pretrain"]}, 6400)
-        check("lịch pretrain giống finetune", (pe[0], pe[3], pe[4]) == (16, 800, 200))
-        check("val mỗi 100 bước · patience 3",
-              cfg["validation"]["every_steps"] == 100 and cfg["validation"]["patience"] == 3)
+        check("lịch pretrain giống finetune", (pe[0], pe[3], pe[4]) == (16, 400, 200))
+        check("val mỗi 20 bước · patience 3",
+              cfg["validation"]["every_steps"] == 20 and cfg["validation"]["patience"] == 3)
 
         # ── lr: chu kỳ đầu 0 -> 1e-4 -> 8e-7; wd 0.001 ──
         from src.s3_train import build_sched
@@ -167,6 +150,15 @@ def main() -> int:
               el["mean_pos"]["Cardiomegaly"].idxmax() == "E0"
               and el["mean_pos"]["Pleural Effusion"].idxmax() == "E1")
         check("expert_labels: bệnh không có ca dương -> NaN", np.isnan(el["mean_pos"]["Edema"]).all())
+        ec = an.expert_clinical_corr(W, pos)
+        check("E-Clinical: E0 tương quan dương với Cardiomegaly, E1 với Pleural Effusion",
+              ec.loc["E0", "Cardiomegaly"] > 0.5 and ec.loc["E1", "Pleural Effusion"] > 0.5 and ec.shape == (W.shape[1], 14))
+        ee = an.expert_expert_corr(ec)
+        check("E-E = C·Cᵀ: đối xứng, đúng công thức", np.allclose(ee.to_numpy(), ee.to_numpy().T)
+              and np.allclose(ee.to_numpy(), ec.to_numpy() @ ec.to_numpy().T))
+        check("md_side_by_side: 2 bảng cạnh nhau", an.md_side_by_side(ec, ee, "a", "b").count("<table><tr><th>") == 2)
+        hp = an.plot_heatmaps(ec, ee, Path(td) / "hm.png", "t")
+        check("heatmap E-Clinical | E-E: ghi PNG", hp.exists() and hp.stat().st_size > 2000)
         md = an.md_expert_labels(el["mean_pos"], el["support"])
         check("md_expert_labels: n/a + in đậm", "n/a" in md and "**" in md)
 

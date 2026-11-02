@@ -75,23 +75,34 @@ m.eval()
 a = m(x); b = m(x)
 check("eval: cache chuẩn, kết quả lặp lại", torch.equal(a, b))
 
-# 6. Router: Σw=1, dày, gradient tới Key/Bilinear
-rt = M.ExpertChoiceRouter(32, 10)
-feat = torch.randn(4, 14, 32, requires_grad=True)
+# 6. NoisyRouter: P = sqrt(softmax·sigmoid), top-k chuẩn hoá, nhiễu chỉ khi train
+rt = M.NoisyRouter(32, 10)
+feat = torch.randn(4, 14, 32)
 out = rt(feat)
 wt = out["weights"]
 check("Router: shape [B,E]", tuple(wt.shape) == (4, 10))
 check("Router: Σ_e w = 1", torch.allclose(wt.sum(-1), torch.ones(4), atol=1e-5))
 check("Router dense: mọi w > 0", bool((wt > 0).all()))
-rk = M.ExpertChoiceRouter(32, 10, top_k=3)
+rk = M.NoisyRouter(32, 10, top_k=3)
 wk = rk(torch.randn(4, 14, 32))["weights"]
 check("Router top-3: đúng 3 expert > 0, Σw = 1",
       bool(((wk > 0).sum(-1) == 3).all()) and torch.allclose(wk.sum(-1), torch.ones(4), atol=1e-5))
-check("Router top-k=E suy biến thành dense", M.ExpertChoiceRouter(32, 5, top_k=5).top_k is None)
-(wt * torch.randn_like(wt)).sum().backward()
-check("Router: gradient tới Key/Bilinear/Query-score",
-      all(p.grad is not None and p.grad.abs().sum() > 0
-          for p in (rt.k_proj.weight, rt.tok_mix, rt.q_proj.weight, rt.score.weight)))
+check("Router top-k=E suy biến thành dense", M.NoisyRouter(32, 5, top_k=5).top_k is None)
+# công thức P (eval, không nhiễu)
+rt.eval()
+with torch.no_grad():
+    h = rt.W_D(feat).squeeze(-1)
+    e = rt.W_E(h)
+    p = torch.sqrt(torch.softmax(e, -1) * torch.sigmoid(e))
+    check("Router eval: w = P/ΣP đúng công thức", torch.allclose(rt(feat)["weights"], p / p.sum(-1, keepdim=True), atol=1e-5))
+    check("Router eval: tất định (không nhiễu)", torch.equal(rt(feat)["weights"], rt(feat)["weights"]))
+rt.train()
+with torch.no_grad():
+    check("Router train: có nhiễu (hai lượt khác nhau)", not torch.equal(rt(feat)["weights"], rt(feat)["weights"]))
+rt.zero_grad()
+(rt(feat)["weights"] * torch.randn(4, 10)).sum().backward()
+check("Router: gradient tới W_D, W_noise, W_E",
+      all(q.grad is not None and q.grad.abs().sum() > 0 for q in (rt.W_D.weight, rt.W_noise.weight, rt.W_E.weight)))
 
 # 7. Mentor/Cls head shape + loss + lưu/nạp
 br = M.MentorBranch(32, 14, 4, 10, n_heads=4)
@@ -110,63 +121,12 @@ with tempfile.TemporaryDirectory() as d:
     br.eval()
     check("lưu/nạp nhánh giữ nguyên đầu ra",
           torch.allclose(br(vis)[1], b2(vis)[1], atol=1e-6))
-# ── Router (New): penalty + self-MHA giữa các expert ──
-import torch.nn.functional as F
-r2 = M.ExpertChoiceRouterV2(32, 5, 14, None, n_heads=4)
-mm = torch.randn(3, 14, 32)
-o2 = r2(mm)
-check("Router v2: w [B,E], Σw = 1, dense", o2["weights"].shape == (3, 5)
-      and torch.allclose(o2["weights"].sum(-1), torch.ones(3), atol=1e-5) and (o2["weights"] > 0).all())
-check("Router v2: penalty ≥ 0 (softplus) [B,E]", o2["penalty"].shape == (3, 5) and (o2["penalty"] > 0).all())
-o2["weights"].pow(2).sum().backward()
-need = ["tok_mix", "pen_mix", "q_proj.weight", "pen_proj.weight", "k_proj.weight",
-        "mha_qk.weight", "mha_v.weight", "mha_o.weight", "score.weight"]
-gp = dict(r2.named_parameters())
-check("Router v2: gradient tới mọi khối (kể cả Penalty và self-MHA)",
-      all(gp[n].grad is not None and gp[n].grad.abs().sum() > 0 for n in need),
-      [n for n in need if gp[n].grad is None or gp[n].grad.abs().sum() == 0])
-# phạt đường chéo thật sự giảm tự-chú ý: P lớn ⇒ trọng số tự-chú ý → 0
-with torch.no_grad():
-    r2.pen_proj.bias.fill_(30.0)
-    pen = F.softplus(r2.pen_proj(torch.einsum("ej,bjd->bed", r2.pen_mix, r2.norm(mm))))
-    e = r2.norm_e(r2.q_proj(torch.einsum("ej,bjd->bed", r2.tok_mix, r2.norm(mm))))
-    qh = r2.mha_qk(e).view(3, 5, 4, 8).transpose(1, 2)
-    sc = torch.einsum("bhed,bhfd->bhef", qh, qh) / 8 ** 0.5 - torch.diag_embed(pen.squeeze(-1))[:, None]
-    a = torch.softmax(sc, -1)
-    check("Router v2: P lớn ⇒ tự-chú ý trên đường chéo ≈ 0",
-          torch.diagonal(a, dim1=-2, dim2=-1).max() < 1e-6)
-r2k = M.ExpertChoiceRouterV2(32, 5, 14, 2, n_heads=4)
-ok2 = r2k(mm)
-check("Router v2 top-2: đúng 2 expert > 0, Σw = 1", ((ok2["weights"] > 0).sum(-1) == 2).all()
-      and torch.allclose(ok2["weights"].sum(-1), torch.ones(3), atol=1e-5))
-b2 = M.MentorBranch(32, 14, 4, n_experts=4, n_heads=4, route_enabled=True, router_type="v2")
+b2 = M.MentorBranch(32, 14, 4, n_experts=4, n_heads=4, route_enabled=True, top_k=2)
 with tempfile.TemporaryDirectory() as d:
     M.save_branch(b2, d)
     b3 = M.load_branch(d)
     b2.eval()
-    check("lưu/nạp nhánh Router v2 giữ router_type và đầu ra", b3.spec["router_type"] == "v2"
-          and isinstance(b3.router, M.ExpertChoiceRouterV2)
-          and torch.allclose(b2(torch.randn(2, 20, 32).manual_seed(0) if False else vis[:2, :, :32] if False else torch.zeros(2, 20, 32))[2]["weights"],
-                             b3(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
-check("nhánh cũ (không router_type) vẫn là v1", M.MentorBranch(32, 14, 4, 4, 4, True).spec["router_type"] == "v1")
-# ── Router (Simple) v3 ──
-r3 = M.ExpertChoiceRouterV3(32, 5, 14, None)
-o3 = r3(mm)
-check("Router v3: w [B,E], Σw = 1, dense, mọi w > 0", o3["weights"].shape == (3, 5)
-      and torch.allclose(o3["weights"].sum(-1), torch.ones(3), atol=1e-5) and (o3["weights"] > 0).all())
-r3k = M.ExpertChoiceRouterV3(32, 5, 14, 2)
-ok3 = r3k(mm)
-check("Router v3 top-2: đúng 2 expert > 0, Σw = 1", ((ok3["weights"] > 0).sum(-1) == 2).all()
-      and torch.allclose(ok3["weights"].sum(-1), torch.ones(3), atol=1e-5))
-o3["weights"].pow(2).sum().backward()
-check("Router v3: gradient tới Query (tok_mix, q_proj) và Key (k_proj)",
-      all(p.grad is not None and p.grad.abs().sum() > 0 for p in (r3.tok_mix, r3.q_proj.weight, r3.k_proj.weight)))
-b4 = M.MentorBranch(32, 14, 4, n_experts=4, n_heads=4, route_enabled=True, router_type="v3")
-with tempfile.TemporaryDirectory() as d:
-    M.save_branch(b4, d)
-    b5 = M.load_branch(d)
-    b4.eval(); b5.eval()
-    check("lưu/nạp nhánh Router v3 giữ router_type và đầu ra", b5.spec["router_type"] == "v3"
-          and isinstance(b5.router, M.ExpertChoiceRouterV3)
-          and torch.allclose(b4(torch.zeros(2, 20, 32))[2]["weights"], b5(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
+    check("lưu/nạp nhánh có NoisyRouter giữ top_k và đầu ra", isinstance(b3.router, M.NoisyRouter)
+          and b3.router.top_k == 2
+          and torch.allclose(b2(torch.zeros(2, 20, 32))[2]["weights"], b3(torch.zeros(2, 20, 32))[2]["weights"], atol=1e-6))
 print(f"\n{ok} kiểm tra đạt")

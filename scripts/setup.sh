@@ -271,7 +271,7 @@ echo "  4. Thử đường ống (config duy nhất: configs/section3.yaml):"
 echo "       bash scripts/run_section3.sh --exp 3.1 --dry-run"
 echo "       # KHÔNG phải phép dò VRAM — nó chạy với đúng batch trong config."
 echo
-echo "  5. CHẠY THẬT — §3 (3.1 → 3.2 → 3.3):"
+echo "  5. CHẠY THẬT — §3 (3.1 → 3.2):"
 if [ "$RGEXP_REMOTE_ACTIVE" = "1" ]; then
     echo "       bash scripts/run_section3.sh --exp 3.1 --detach"
     echo "       # chạy nền, trả lại shell ngay, in link W&B. ssh đứt không giết nó,"

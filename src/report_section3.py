@@ -1,4 +1,4 @@
-"""REPORT.md của họ §3 (3.1 · 3.2 · 3.3). Dựng từ đĩa: scores, pairwise, route analysis CSV."""
+"""REPORT.md của họ §3 (3.1 · 3.2). Dựng từ đĩa: scores, pairwise, route analysis CSV."""
 from __future__ import annotations
 
 import json
@@ -12,15 +12,9 @@ from .metrics import metric_columns
 from .report_common import pairwise_section, score_table, summarise
 
 QUESTIONS = {
-    "3.1": "k nào tốt nhất khi MoE-DoRA **dense** (E = k, mọi expert hoạt động, k = 2→4)? "
-           "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
-    "3.1-1": "Router mới (Self-MHA giữa các expert có phạt đường chéo P) có tốt hơn Router cũ ở biến thể "
-             "K=4 của exp 3.1 không (so sánh nhị đối chứng, hai arm)? Mentor + Cls head kế thừa nguyên từ 3.1 (đóng băng).",
-    "3.1-2": "Router đơn giản (chỉ Query × Key → Attn Softmax, không nhánh Linear/log) có tốt hơn Router "
-             "gốc ở biến thể K=4 của exp 3.1 không (so sánh nhị đối chứng, hai arm)? Mentor + Cls head kế thừa từ 3.1.",
-    "3.2": "Với k đã chọn từ 3.1, quét E = k+1→k+4 (top-k = None, dense trên E): E nào tốt nhất? "
-           "Các expert có chuyên biệt không?",
-    "3.3": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
+    "3.1": "Cặp (k, E) nào tốt nhất trong (1,2) (2,3) (2,4) (3,4) (3,5) (3,6) — router nhiễu chọn top-k trên E "
+           "expert DoRA? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.2": "MoE-DoRA và các module mới (Mentor · Cls head · Router) có thật sự cần thiết? "
            "Đối chứng: baseline · mô hình mới với DoRA decoder đơn · mô hình mới với MoE-DoRA.",
 }
 
@@ -80,41 +74,22 @@ def _route_block(arm: dict, adir: Path) -> str:
     out = [f"### {arm['name']}", "",
            f"**Kết luận:** {v['reading']} — cosine tham số ΔW (TB ngoài đường chéo) "
            f"**{v['param_cos_offdiag']:.3f}** (ngưỡng {v['threshold']}); hệ số biến thiên của route "
-           f"qua ảnh **{v['route_cv']:.3f}** (tĩnh nếu < {v['cv_floor']}); tương quan route TB "
-           f"{v['route_corr_offdiag']:.3f}; {v['n_images']} ảnh test.", ""]
-    share = v.get("top1_share", {})
-    mw = v.get("mean_weight", {})
-    out += ["| Expert | trọng số TB | tỉ lệ top-1 |", "|---|---|---|"]
-    out += [f"| {e} | {mw[e]:.3f} | {share.get(e, float('nan')):.3f} |" for e in mw]
-    out.append("")
-    names = list(mw)
-    for nm, title in (("param_cos", "Similarity giữa các Expert — cosine tham số ΔW"),
-                      ("route_corr", "Similarity giữa các Expert — tương quan Pearson của trọng số route"),
-                      ("route_cos", "Similarity giữa các Expert — cosine của trọng số route")):
-        p = adir / f"{aid}_sim_{nm}.csv"
-        if p.exists():
-            m = pd.read_csv(p, index_col=0).to_numpy()
-            out += [f"**{title}**", "", an.md_matrix(m, names), ""]
-    mp = adir / f"{aid}_expert_labels_mean.csv"
-    lp = adir / f"{aid}_expert_labels_lift.csv"
-    if mp.exists():
-        df = pd.read_csv(mp, index_col=0)
-        pos = np.load(adir / "test_pos.npy") if (adir / "test_pos.npy").exists() else None
-        sup = pd.Series(pos.sum(0).astype(int), index=df.columns) if pos is not None else \
-            pd.Series([0] * len(df.columns), index=df.columns)
-        out += ["**Expert-Labels** — trọng số route trung bình của expert trên ảnh có nhãn dương "
-                "(CheXbert của báo cáo gốc; in đậm = expert cao nhất mỗi bệnh)", "",
-                an.md_expert_labels(df, sup), ""]
-    if lp.exists():
-        out += ["**Expert-Labels (lift = trọng số TB trên ca dương / trọng số TB toàn bộ)**", "",
-                an.md_expert_labels(pd.read_csv(lp, index_col=0), sup, 2), ""]
+           f"qua ảnh **{v['route_cv']:.3f}** (tĩnh nếu < {v['cv_floor']}); {v['n_images']} ảnh test.", ""]
+    cp, ep = adir / f"{aid}_e_clinical_corr.csv", adir / f"{aid}_e_e_corr.csv"
+    hm = adir / f"{aid}_e_heatmap.png"
+    if hm.exists():
+        out += [f"![E-Clinical | E-E — {arm['name']}](metrics/analysis/{hm.name})", ""]
+    elif cp.exists() and ep.exists():
+        out += [an.md_side_by_side(pd.read_csv(cp, index_col=0), pd.read_csv(ep, index_col=0),
+                                   "E-Clinical (Pearson: trọng số route × nhãn dương)",
+                                   "E-E = E-Clinical × E-Clinicalᵀ"), ""]
     return "\n".join(out)
 
 
 def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> str:
     out = []
     if best:
-        what = "k" if exp == "3.1" else "E"
+        what = "(k, E)"
         out.append(f"- **{what} gợi ý (quyết định là của bạn):** arm `{best['arm']}` — hạng lâm sàng TB "
                    f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f} → "
                    f"k = {best['k']}, E = {best['E']} (`best.json`).")
@@ -125,13 +100,7 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
         out.append("- **Chuyên biệt hay sụp đổ:** "
                    + (f"SỤP ĐỔ về một DoRA ở {', '.join(col)}." if col else "không arm nào vượt ngưỡng sụp đổ.")
                    + " Chi tiết từng arm ở mục Route.")
-    if exp == "3.1-2":
-        out.append("- **Router đơn giản có đủ không:** xem cặp K=4 (Router gốc) ↔ K=4 (Router đơn giản) ở mục "
-                   "kiểm định; có nghĩa khi p_perm < α và CI loại 0.")
-    if exp == "3.1-1":
-        out.append("- **Router mới có đáng giữ không:** xem cặp K=4 (Router cũ) ↔ K=4 (Router mới) ở mục kiểm định; "
-                   "có nghĩa khi p_perm < α và CI loại 0.")
-    if exp == "3.3":
+    if exp == "3.2":
         out.append("- **Cần MoE-DoRA / module mới không:** xem hai cặp A→B' (Mentor+Cls+vision+projector+DoRA) "
                    "và B'→C (MoE-DoRA + Router) ở mục kiểm định; một khác biệt chỉ có nghĩa khi "
                    "p_perm < α và CI loại 0 (ký hiệu trong bảng).")
@@ -179,9 +148,9 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
         parts += [_route_block(a, adir) for a in moe]
     parts += ["## Giả định cần biết", "",
               "- k và E do người dùng chọn; `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định.",
-              "- 3.1/3.2: dense (mọi expert hoạt động, 3.2: top-k = None trên E). 3.3: top-k = k trên logit cuối "
-              "(Linear(Query) + log s), softmax trên k expert được chọn (Σw = 1). Không có aux loss.",
-              "- Baseline A là Gemma 3 gốc, chạy lại ở 3.3, không huấn luyện.", ""]
+              "- Router nhiễu: P = sqrt(softmax(E)·sigmoid(E)), top-k theo P rồi w = P_k/ΣP_k (Σw = 1); "
+              "nhiễu chỉ có khi train, suy luận greedy và không nhiễu. Không clamp logit, không aux loss.",
+              "- Baseline A là Gemma 3 gốc, chạy lại ở 3.2, không huấn luyện.", ""]
     path = run_dir / "REPORT.md"
     path.write_text("\n".join(parts), encoding="utf-8")
     print(f"  ✓ {path}", flush=True)

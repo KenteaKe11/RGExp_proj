@@ -1,13 +1,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# §3 — Mentor · Cls head · Router (Expert Choice) · MoE-DoRA
+# §3 — Mentor · Cls head · NoisyRouter · MoE-DoRA
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.1  Dense MoE-DoRA, k = 2→4 (E = k, mọi expert hoạt động)  -> k tốt nhất
-#   3.1-1 Router mới (penalty) cho K=4; so sánh nhị đối chứng với K=4 (3.1); lưu thư mục Hub riêng
-#   3.1-2 Router đơn giản (Query×Key→Attn Softmax) cho K=4; so sánh với K=4 (3.1); Hub riêng
-#   3.2  k bạn chọn (chỉ để đặt E = k+1 → k+4); top-k = None (dense trên E)
-#   3.3  baseline · DoRA-decoder-only · MoE-DoRA (k, E kế thừa)
+#   3.1  Khảo sát cặp (k, E): (1,2) (2,3) (2,4) (3,4) (3,5) (3,6); router chọn top-k trên E expert
+#   3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only · MoE-DoRA (k, E do BẠN chọn)
+#   (3.3 — so vị trí leaderboard / SoTA bị vượt: mới là giả thuyết, CHƯA cài đặt)
 #
-# Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.1|3.2|3.3
+# Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.1|3.2
 #
 # Quy ước: (1) pretrain  ảnh→vision encoder→Mentor→Cls head (CE cls);
 #          (2) đóng băng hoàn toàn Mentor→Cls head, finetune phần còn lại;
@@ -93,9 +91,9 @@ labels:                        # nhãn sinh LAZY từ CheXbert; KHÔNG đọc la
   device: auto
 
 train:
-  # 6400 mẫu · eff_bs 16 · 800 bước = 4 epoch × 200 bước (2 lượt qua 6400 mẫu); mỗi epoch một chu kỳ
+  # 6400 mẫu · eff_bs 16 · 400 bước = 2 epoch × 200 bước (1 lượt qua 6400 mẫu); mỗi epoch một chu kỳ
   # cosine annealing độc lập (peak epoch e = peak × lr_decay^e).
-  n_epochs: 4
+  n_epochs: 2
   steps_per_epoch: 200
   epoch_split: true
   batch_probe: true
@@ -137,27 +135,24 @@ train:
   quant: {load_in_4bit: true, quant_type: nf4, double_quant: true, compute_dtype: bfloat16}
 
 pretrain:                      # image → vision encoder → Mentor → Cls head (cùng lịch với finetune)
-  n_epochs: 4
+  n_epochs: 2
   steps_per_epoch: 200
   epoch_split: true
   effective_batch_size: 16
   per_device_batch_size: 8
-  dir: ./adapters_3_pretrain   # safetensors lưu lại, dùng chung 3.1/3.2/3.3; --force để pretrain lại
+  dir: ./adapters_3_pretrain   # safetensors lưu lại, dùng chung 3.1/3.2; --force để pretrain lại
   hub_path: pretrain_mentor    # thư mục trên repo kết quả (quét Hub trước khi pretrain)
   # lịch lr và weight decay: dùng train.schedule / train.weight_decay
 
 # Mọi pipeline (pretrain và finetune) chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
 # và nạp lại tham số của lần val tốt nhất.
 validation:
-  every_steps: 100
+  every_steps: 20
   patience: 3
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
-exp31: {ks: [2, 3, 4]}                 # dense: E = k
-exp312: {k: 4}                            # 3.1-2: Router đơn giản (Q×K softmax), CHỈ K=4 của 3.1
-exp311: {k: 4}                            # 3.1-1: Router mới, CHỈ cho biến thể K=4 của 3.1
-exp32: {k: null, extra: [1, 2, 3, 4]}     # BẠN chọn k; E = k + extra; top-k = None (dense)
-exp33: {k: null, E: null}                 # BẠN chọn k, E (best.json chỉ là gợi ý)
+exp31: {pairs: [[1, 2], [2, 3], [2, 4], [3, 4], [3, 5], [3, 6]]}   # (k, E): top-k trên E expert
+exp32: {k: null, E: null}                 # BẠN chọn k, E (best.json của 3.1 chỉ là gợi ý)
 
 analysis:
   collapse_threshold: 0.9      # cos ΔW trung bình ngoài đường chéo ≥ ngưỡng ⇒ sụp đổ về 1 DoRA
@@ -189,7 +184,7 @@ stats:
   ci: 0.95
   dz_floor: 0.10
   primary_test: perm
-  pairs: all                   # 3.1/3.2: mọi cặp; 3.3 tự chuyển sang `contrasts`
+  pairs: all                   # 3.1: mọi cặp; 3.2 tự chuyển sang `contrasts`
   adjust_scope: metrics
   contrasts:
     - [baseline_infer, dora_decoder]     # A -> B': fine-tune DoRA decoder (+ Mentor, vision, projector)
@@ -216,5 +211,5 @@ output:
   hub_private: true
   push: true
   push_per_arm: true
-  subdir: "3.1_dense_k"
+  subdir: "3.1_k_e_pairs"
   adapter_dir: ./adapters_3_1
