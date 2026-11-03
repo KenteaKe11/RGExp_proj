@@ -212,4 +212,54 @@ with tempfile.TemporaryDirectory() as d:
           and torch.allclose(hd.cls_head(hx, valid), h3.cls_head(hx, valid), atol=1e-6)
           and torch.allclose(hd.router(xr, valid)["weights"], h3.router(xr, valid)["weights"], atol=1e-6))
 check("Heads không route ⇒ không Router", H.Heads(32, route_enabled=False, d_c=16).router is None)
+
+# 9. Adaptive Capacity: k_ti = ⌈max(c·n_t/E, exp H_i)⌉, H_i = entropy softmax nhân quả của z_·i trên token ≤ t
+torch.manual_seed(3)
+Tn = 40
+ra = H.ECRouter(D, E, 1.0, adaptive=True)
+rf = H.ECRouter(D, E, 1.0)
+rf.load_state_dict(ra.state_dict())
+xa = torch.randn(2, Tn, D)
+va = torch.ones(2, Tn, dtype=torch.bool)
+oa, of = ra(xa, va), rf(xa, va)
+check("adaptive: k_ti ≥ sàn c·n_t/E (= k của c=1) ở mọi (t, expert)", bool((oa["k"] >= of["k"]).all()))
+z = ra.scores(xa)
+refk = torch.zeros_like(oa["k"])
+for b_ in range(2):
+    for t_ in range(Tn):
+        for e_ in range(E):
+            p_ = torch.softmax(z[b_, :t_ + 1, e_], 0)
+            Hh = -(p_ * p_.clamp(min=1e-30).log()).sum()
+            refk[b_, e_, t_] = min(math.ceil(max((t_ + 1) / E, math.exp(float(Hh))) - 1e-6), t_ + 1)
+check("adaptive: k khớp tính tay ⌈max(n/E, exp H)⌉ (clamp ≤ n)", torch.equal(oa["k"], refk.long()))
+zu = torch.zeros(1, Tn, E)                                         # điểm đồng đều ⇒ H = log n ⇒ k = n (lấy hết)
+ou = ra.weights_from_scores(zu, torch.ones(1, Tn, dtype=torch.bool))
+check("expert đồng đều (chưa chuyên biệt, N̂ = n) ⇒ k = n", bool((ou["k"][..., -1] == Tn).all()))
+zp = torch.full((1, Tn, E), -20.0); zp[:, 0] = 20.0               # nhọn ở token đầu ⇒ H ≈ 0 ⇒ về sàn n/E
+op = ra.weights_from_scores(zp, torch.ones(1, Tn, dtype=torch.bool))
+check("expert nhọn (đã chuyên biệt, N̂ ≈ 1) ⇒ k về sàn ⌈n/E⌉", bool((op["k"][..., -1] == math.ceil(Tn / E)).all()))
+w_a = oa["weights"]
+x2a = xa.clone(); x2a[:, 25:] = torch.randn(2, Tn - 25, D)
+check("adaptive nhân quả: đổi tương lai không đổi route quá khứ",
+      torch.allclose(w_a[:, :25], ra(x2a, va)["weights"][:, :25]))
+check("adaptive: Σ_e w ∈ {0,1}", bool((((w_a.sum(-1) - 1).abs() < 1e-5) | (w_a.sum(-1).abs() < 1e-7)).all()))
+check("c_eff [B,E]; c cố định ≈ c, adaptive ≥ c cố định",
+      tuple(oa["c_eff"].shape) == (2, E) and bool((oa["c_eff"] >= of["c_eff"] - 1e-6).all())
+      and bool((of["c_eff"] >= 1.0 - 1e-6).all()) and bool((of["c_eff"] < 1.2).all()),
+      str([round(v, 3) for v in oa["c_eff"][0].tolist()]))
+class _Emb2(nn.Module):
+    def forward(self, ids): return xa[:, ids[0, 0]:ids[0, 0] + 1]
+P2 = 15
+e2 = _Emb2(); cx = RoutingContext()
+st2 = H.RouterStream(ra, cx, e2, ra.scores(xa[:, :P2]), torch.ones(2, P2, dtype=torch.bool))
+okk = True
+for t_ in range(P2, Tn):
+    e2(torch.tensor([[t_]]))
+    okk &= torch.allclose(cx.weights[:, 0], w_a[:, t_], atol=1e-5)
+st2.close()
+check("adaptive: RouterStream (từng token) == teacher-forced", okk)
+with tempfile.TemporaryDirectory() as d:
+    hh = H.Heads(32, 14, 4, n_experts=4, capacity=1.0, d_c=16, adaptive=True)
+    H.save_heads(hh, d)
+    check("lưu/nạp Heads giữ adaptive", H.load_heads(d).router.adaptive is True)
 print(f"\n{ok} kiểm tra đạt")

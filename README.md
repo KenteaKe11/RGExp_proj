@@ -14,6 +14,7 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 - **Nhân quả**: Router và Cls head nhận **toàn bộ token streaming** (ảnh + prompt + câu trả lời), và vị trí t chỉ phụ thuộc token ≤ t như decoder ⇒ train (teacher-forced) và sinh từng token (KV-cache) cho cùng kết quả, không rò tương lai.
 - **Causal Cls head**: RMSNorm → attention pooling nhân quả (14 query, N→14; vị trí t gộp token ≤ t) → Linear →4 ⇒ [B,T,14,4]. Fine-tune **cùng lúc**: `loss = CE_text + γ·CE_cls`, γ = 0.1; nhãn ChexBERT của báo cáo áp cho mọi vị trí hợp lệ (trung bình). Suy luận lấy vị trí cuối của báo cáo đã sinh.
 - **Causal EC-Router (Expert-Choice)**: RMSNorm → Linear D→E → Z. Tại vị trí t (n_t token hợp lệ ≤ t) expert e chọn token t nếu z_te thuộc top-k_t của {z_se, s≤t}, **k_t = ⌈c·n_t/E⌉** (tại cuối chuỗi N cho k=⌈cN/E⌉). Cổng = softmax nhân quả theo thời gian; w theo từng token chuẩn hoá giữa các expert đã chọn (Σw = 1); token không expert nào chọn dùng trọng số nền (Σw = 0). Khi sinh, `RouterStream` định tuyến từng token mới từ lịch sử. Không nhiễu, không aux loss.
+- **Adaptive Capacity** (mục 3.4): thay k cố định bằng k theo từng expert và từng thời điểm: P = softmax nhân quả của z theo token (≤ t), H_i = −Σ P·log P, N̂_i = e^{H_i} (số token expert i "phân vân"), **k_i = ⌈max(N/E, N̂_i)⌉**. Expert đã chuyên biệt (H thấp) về sàn N/E, expert chưa chuyên biệt lấy N̂_i token. Siêu tham số còn lại duy nhất: E. k chỉ là số đếm (không gradient). Mỗi lần val in/ghi vector c hiệu dụng `c_i = k_i·E/N` ở token cuối: `train/<mục>/<arm>/c_vec.e0…`.
 - **MoE-DoRA**: `y = (Σᵢ wᵢ·mᵢ/nᵢ + 1 − Σw)⊙W₀x + s·Σᵢ wᵢ (mᵢ/nᵢ)⊙BᵢAᵢx`, DoRAᵢ = mᵢ ⊙ (W₀ + s·BᵢAᵢ)/‖·‖row, s = α/r. DoRA trên mọi Linear của decoder.
 - **Log train**: `ce_text`, `ce_cls`, `lr`, `grad_norm` router/decoder (trước clip); mỗi lần val log vector Δw của E expert: `train/<mục>/<arm>/delta_w.e0…`.
 - **Loss**: chỉ CE cls (nhãn CheXbert sinh lazy) và CE text. Mọi PEFT = QDoRA rank 4. Infer luôn greedy.
@@ -25,6 +26,7 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 |---|---|---|
 | 3.1 | Khảo sát (c, E): (1,4) (1,6) (1.5,4) (1.5,6) | — |
 | 3.2 | Có cần MoE-DoRA? Gemma gốc · DoRA decoder (+Cls head) · MoE-DoRA + EC-Router | `exp32.c`, `exp32.E` |
+| 3.4 | Adaptive Capacity, E=4 (arm `ac_e4`) đối đầu `c1_e4` của 3.1 (kế thừa kết quả 3.1, cần chạy 3.1 arm `c1_e4` trước) | `exp34.E` |
 | 3.3 | So vị trí leaderboard / SoTA bị vượt (train/val/test trên benchmark) | *chưa cài đặt* |
 
 Mỗi mục ra `runs/<mục>/REPORT.md`: bảng điểm, kiểm định ghép cặp, Cls head, và với arm MoE có thêm
@@ -37,6 +39,7 @@ bảng **Similarity giữa Expert** + **Expert-Labels** + kết luận sụp đ�
 export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.1
+bash scripts/run_section3.sh --exp 3.4 --arms ac_e4   # Adaptive Capacity vs c1_e4 của 3.1
 bash scripts/run_section3.sh --exp 3.2 --set exp32.c=1.5 --set exp32.E=6
 ```
 

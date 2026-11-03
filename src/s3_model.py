@@ -35,7 +35,7 @@ def lora_rank(cfg) -> int:
 
 
 def build(cfg, *, decoder: str, n_experts: int = 0, capacity: float = 1.0,
-          projector: bool = True) -> SimpleNamespace:
+          projector: bool = True, adaptive: bool = False) -> SimpleNamespace:
     """Nạp base NF4, gắn PEFT theo `decoder`, dựng Cls head (+ EC-Router). Chưa đặt requires_grad."""
     if decoder not in ("dora", "moe"):
         raise ValueError(f"decoder={decoder!r}")
@@ -79,11 +79,11 @@ def build(cfg, *, decoder: str, n_experts: int = 0, capacity: float = 1.0,
     dev = next(p for p in model.parameters() if p.device.type != "meta").device
     hcfg = cfg.get("heads", {}) or {}
     heads = Heads(text_h, 14, int(hcfg.get("n_classes", 4)), n_experts=max(1, n_experts),
-                  capacity=float(capacity), d_c=int(hcfg.get("d_c", 256)),
+                  capacity=float(capacity), d_c=int(hcfg.get("d_c", 256)), adaptive=bool(adaptive),
                   route_enabled=(decoder == "moe")).to(device=dev, dtype=torch.float32)
     return SimpleNamespace(model=model, processor=processor, gemma=gemma, heads=heads,
                            route_ctx=ctx, img_kw=img_kw, device=dev, decoder=decoder,
-                           n_experts=n_experts, capacity=float(capacity), text_h=text_h,
+                           n_experts=n_experts, capacity=float(capacity), adaptive=bool(adaptive), text_h=text_h,
                            vis_h=vis_h, mstats=mstats, pstats=pstats, rank=rank, alpha=alpha,
                            img_token=gb.image_token_id(gemma))
 
@@ -210,7 +210,7 @@ def save_model(b, out_dir: Path, meta: dict) -> None:
         sd = experts_state(b.model, b.mstats["target_names"])
         save_file(sd, str(out_dir / EXPERTS_FILE))
         (out_dir / EXPERTS_META).write_text(json.dumps(
-            {**b.mstats, "capacity": b.capacity, "n_experts": b.n_experts,
+            {**b.mstats, "capacity": b.capacity, "adaptive": b.adaptive, "n_experts": b.n_experts,
              "scaling": b.alpha / b.rank, "keys": sorted(sd)}, indent=2), encoding="utf-8")
         b.model.save_pretrained(str(out_dir / "vision_adapter"))
     else:

@@ -15,6 +15,11 @@ EC-Router nhân quả (đọc embedding đầu vào decoder, MỌI vị trí):
     cổng g_te = softmax nhân quả theo thời gian: exp(z_te)/Σ_{s≤t} exp(z_se)
     w_te = g_te·sel_te / Σ_e' g_te'·sel_te'     (Σ_e w = 1 nếu token được chọn, = 0 nếu không ⇒ dùng base)
 Không nhiễu, không aux loss.
+
+Adaptive Capacity (`adaptive=True`, mục 2.3): k KHÔNG còn cố định theo c mà theo TỪNG expert i và từng thời điểm t:
+    P_i = softmax nhân quả của z_·i trên các token ≤ t ;   H_i = −Σ_s P_si·log P_si ;   N̂_i = exp(H_i)
+    (số token trung bình mà expert i "phân vân"),   k_ti = ⌈max(c·n_t/E, N̂_i)⌉   (c = 1 ⇒ sàn n_t/E)
+Expert đã chuyên biệt (H thấp) nhận sàn n_t/E; expert chưa chuyên biệt bốc đúng N̂ token. k chỉ là số đếm (không gradient).
 """
 from __future__ import annotations
 
@@ -90,11 +95,12 @@ def expert_k(n_tokens: torch.Tensor | int, c: float, n_experts: int):
 class ECRouter(nn.Module):
     """Expert-Choice router NHÂN QUẢ. forward(x [B,T,D], valid [B,T] bool, stat_mask=None) → dict."""
 
-    def __init__(self, d: int, n_experts: int, capacity: float = 1.0):
+    def __init__(self, d: int, n_experts: int, capacity: float = 1.0, adaptive: bool = False):
         super().__init__()
         if n_experts < 1 or capacity <= 0:
             raise ValueError(f"E={n_experts}, c={capacity} không hợp lệ")
         self.d, self.n_experts, self.capacity = int(d), int(n_experts), float(capacity)
+        self.adaptive = bool(adaptive)
         self.norm = RMSNorm(d)
         self.linear = nn.Linear(d, n_experts, bias=False)
         nn.init.normal_(self.linear.weight, std=0.02)
@@ -107,7 +113,6 @@ class ECRouter(nn.Module):
         valid = valid.bool()
         B, T, E = z.shape
         n_t = valid.long().cumsum(1)                                            # [B,T]
-        k_t = torch.clamp(torch.ceil(self.capacity * n_t.float() / E - 1e-6), min=1).long()
         zt = z.transpose(1, 2)                                                  # [B,E,T]
         idx = torch.arange(T, device=z.device)
         past = idx[None, :] <= idx[:, None]                                     # [t,s]: s ≤ t
@@ -117,14 +122,26 @@ class ECRouter(nn.Module):
             zs, zq = zt[:, :, None, :], zt[:, :, :, None]                       # s | t
             better = ((zs > zq) | ((zs == zq) & strict)) & past & vs            # [B,E,t,s]
             n_better = better.sum(-1)                                           # [B,E,t]
-            sel = (n_better < k_t[:, None, :]) & valid[:, None, :]              # [B,E,T]
+            nf = n_t.clamp(min=1).float()[:, None, :]                           # [B,1,T]
+            floor = self.capacity * nf / E                                      # sàn c·n_t/E
+            if self.adaptive:                                                   # N̂_i = exp(H_i) trên token ≤ t
+                lg = zs.expand(-1, -1, T, -1).masked_fill(~(past & vs), float("-inf"))
+                P = torch.nan_to_num(torch.softmax(lg, dim=-1), nan=0.0)        # [B,E,t,s]
+                H = torch.special.entr(P).sum(-1)                               # [B,E,t]
+                del lg, P
+                k_te = torch.maximum(floor.expand_as(H), torch.exp(H))
+            else:
+                k_te = floor.expand(-1, E, -1)
+            k_te = torch.clamp(torch.ceil(k_te - 1e-6), min=1)
+            k_te = torch.minimum(k_te, nf).long()                               # [B,E,T] số token expert e lấy tại t
+            sel = (n_better < k_te) & valid[:, None, :]                         # [B,E,T]
         zm = z.masked_fill(~valid.unsqueeze(-1), float("-inf"))
         logg = z - torch.logcumsumexp(zm, dim=1)                                # softmax nhân quả theo thời gian
         g = torch.exp(logg.masked_fill(~valid.unsqueeze(-1), float("-inf")))    # [B,T,E]
         s = g * sel.transpose(1, 2)
         tot = s.sum(-1, keepdim=True)
         w = (s / tot.clamp(min=1e-20)) * (tot > 0)                              # Σ_e = 1 hoặc 0
-        return {"weights": w, "sel": sel.transpose(1, 2), "k": k_t, "n": n_t}
+        return {"weights": w, "sel": sel.transpose(1, 2), "k": k_te, "n": n_t}
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor, stat_mask: torch.Tensor | None = None) -> dict:
         if x.dim() != 3 or valid.shape != x.shape[:2]:
@@ -137,7 +154,11 @@ class ECRouter(nn.Module):
             load = (w * sm_).sum(1) / cnt                                       # [B,E] tỉ lệ token mỗi expert phụ trách
             cover = ((w.sum(-1) > 0).float() * sm_[..., 0]).sum(1) / cnt[:, 0]
             ent = -(load.clamp(min=1e-9).log() * load).sum(-1).mean()
-        out.update(route_w=load, coverage=cover, entropy=ent,
+            # c hiệu dụng của từng expert ở token CUỐI của chuỗi: c_i = k_i·E/N  (c cố định ⇒ ≈ c)
+            last = (valid.long() * torch.arange(valid.shape[1], device=valid.device)).argmax(1)
+            k_last = out["k"][torch.arange(valid.shape[0], device=valid.device), :, last].float()   # [B,E]
+            c_eff = k_last * self.n_experts / out["n"].max(1).values.clamp(min=1).float().unsqueeze(-1)
+        out.update(route_w=load, coverage=cover, entropy=ent, c_eff=c_eff,
                    n_selected=out["sel"].float().sum(1))
         return out
 
@@ -169,15 +190,17 @@ class Heads(nn.Module):
     """Cls head (+ EC-Router khi decoder = moe)."""
 
     def __init__(self, d: int, n_labels: int = N_LABELS, n_classes: int = 4, n_experts: int = 4,
-                 capacity: float = 1.0, d_c: int = 256, route_enabled: bool = True):
+                 capacity: float = 1.0, d_c: int = 256, route_enabled: bool = True,
+                 adaptive: bool = False):
         super().__init__()
         self.spec = {"d": int(d), "n_labels": int(n_labels), "n_classes": int(n_classes),
                      "n_experts": int(n_experts), "capacity": float(capacity),
-                     "d_c": int(d_c), "route_enabled": bool(route_enabled)}
+                     "d_c": int(d_c), "route_enabled": bool(route_enabled),
+                     "adaptive": bool(adaptive)}
         self.n_classes = int(n_classes)
         self.cls_head = ClsHead(d, n_labels, n_classes, d_c)
         self.route_enabled = bool(route_enabled)
-        self.router = ECRouter(d, n_experts, capacity) if route_enabled else None
+        self.router = ECRouter(d, n_experts, capacity, adaptive) if route_enabled else None
 
     def n_params(self) -> dict:
         c = lambda m: 0 if m is None else sum(p.numel() for p in m.parameters())
@@ -186,7 +209,9 @@ class Heads(nn.Module):
     def describe(self) -> str:
         n = self.n_params()
         rt = ("không Router" if self.router is None else
-              f"EC-Router(E={self.spec['n_experts']}, c={self.spec['capacity']})")
+              f"EC-Router(E={self.spec['n_experts']}, "
+              + (f"adaptive k=max({self.spec['capacity']:g}·N/E, e^H))" if self.spec.get("adaptive")
+                 else f"c={self.spec['capacity']})"))
         return f"ClsHead(causal attn-pool 14q, D={self.spec['d']}) · {rt} · {n['total']:,} tham số"
 
 

@@ -35,6 +35,13 @@ def main() -> int:
               [(x["c"], x["E"]) for x in a1] == [(1.0, 4), (1.0, 6), (1.5, 4), (1.5, 6)]
               and len({x["id"] for x in a1}) == 4 and all("pretrain" not in x and "top_k" not in x for x in a1),
               str([x["id"] for x in a1]))
+        a4, _ = build_arms(cfg, "3.4")
+        check("3.4: c1_e4 (kế thừa 3.1) vs ac_e4 (adaptive, E=4)",
+              [x["id"] for x in a4] == ["c1_e4", "ac_e4"] and a4[0]["reuse"]["exp"] == "3.1"
+              and a4[0]["reuse"]["id"] == a1[0]["id"] and a4[1].get("adaptive") is True and a4[1]["E"] == 4
+              and not a4[0].get("adaptive"))
+        check("3.4: thư mục kết quả/adapter riêng (không đè 3.1)",
+              __import__("src.run_section3", fromlist=["x"]).SUBDIR["3.4"] != __import__("src.run_section3", fromlist=["x"]).SUBDIR["3.1"])
         try:
             build_arms(cfg, "3.2")
             check("3.2 thiếu c,E phải DỪNG", False)

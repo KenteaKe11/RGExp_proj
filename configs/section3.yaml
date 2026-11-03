@@ -143,6 +143,7 @@ validation:
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
 exp31: {pairs: [[1, 4], [1, 6], [1.5, 4], [1.5, 6]]}   # (c, E): mỗi expert chọn ⌈c·N/E⌉ token
+exp34: {E: 4, c_ref: 1}                   # Adaptive Capacity (1 arm, E=4) đối đầu arm c_ref-E của 3.1 (kế thừa kết quả 3.1)
 exp32: {c: null, E: null}                 # BẠN chọn c, E (best.json của 3.1 chỉ là gợi ý)
 
 analysis:

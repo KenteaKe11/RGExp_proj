@@ -236,11 +236,16 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                   + " ".join(f"{k} {v:.4f}" for k, v in vp.items())
                   + f" · {'tốt nhất' if improved else f'không cải thiện {bad}/{patience}'}", flush=True)
             dw = sm.expert_delta_norms(b.model, ref0) if log_path else None   # Δwᵢ = ‖θᵢ(t)−θᵢ(0)‖, E expert
+            cv = [vp[f"c_e{i}"] for i in range(64) if f"c_e{i}" in vp]        # vector c của E expert (val)
+            if cv:
+                print(f"    [{tag}] c bước {step + 1}: [" + " ".join(f"{x:.3f}" for x in cv) + "]", flush=True)
             if dw:
                 print(f"    [{tag}] Δw bước {step + 1}: [" + " ".join(f"{x:.3g}" for x in dw) + "]", flush=True)
             if tracker is not None:
                 payload = {f"val/{tag}/loss": vl, f"val/{tag}/step": step + 1,
                            **{f"val/{tag}/{k}": v for k, v in vp.items()}}
+                if cv:      # train/<exp>/<arm>/c_vec.e0 … .e{E-1} mỗi lần val
+                    payload[f"{log_path}/c_vec"] = {f"e{i}": v for i, v in enumerate(cv)}
                 if dw:      # MỘT log_path cho cả E expert: train/<exp>/<arm>/delta_w.e0 … .e{E-1} (mỗi lần val)
                     payload[f"{log_path}/delta_w"] = {f"e{i}": v for i, v in enumerate(dw)}
                 tracker.log(payload)
@@ -274,7 +279,9 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     seed_everything(seed)
     decoder = arm["decoder"]
     cap = float(arm.get("c") or 1.0)
-    b = sm.build(cfg, decoder=decoder, n_experts=int(arm.get("E", 0)), capacity=cap, projector=True)
+    adaptive = bool(arm.get("adaptive"))
+    b = sm.build(cfg, decoder=decoder, n_experts=int(arm.get("E", 0)), capacity=cap, projector=True,
+                 adaptive=adaptive)
     counts = sm.set_trainable(b)
     print(f"  {arm['id']}: {b.heads.describe()}\n  tham số học: {counts}", flush=True)
 
@@ -327,7 +334,11 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
         logits = sm.cls_logits(b, out.hidden_states[-1], valid)
         ce_c = cls_loss(logits, batch["cls_y"], valid)
         loss = out.loss + gamma * ce_c.to(out.loss.dtype)
-        return loss, {"ce_text": out.loss.detach(), "ce_cls": ce_c.detach()}
+        parts = {"ce_text": out.loss.detach(), "ce_cls": ce_c.detach()}
+        if rt is not None:           # c hiệu dụng mỗi expert (k_i·E/N ở token cuối), trung bình theo batch
+            for i in range(rt["c_eff"].shape[1]):
+                parts[f"c_e{i}"] = rt["c_eff"][:, i].mean().detach()
+        return loss, parts
 
     r = _loop(b, ds=ds, pad_id=pad, steps=steps, eff_bs=eff,
               micro_top=int(tcfg.get("per_device_batch_size", 8)), opt=opt, sched=sched,
@@ -337,7 +348,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
               patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode,
               log_path=f"train/{cfg.get('experiment', '3.1')}/{arm['id']}")
     meta = {"phase": "finetune", "arm_id": arm["id"], "name": arm.get("name", arm["id"]),
-            "decoder": decoder, "n_experts": int(arm.get("E", 0)), "capacity": cap,
+            "decoder": decoder, "n_experts": int(arm.get("E", 0)), "capacity": cap, "adaptive": adaptive,
             "rank": b.rank, "alpha": b.alpha, "method": "qdora", "quantized": True,
             "loss": "ce_text + gamma*ce_cls", "gamma_cls": gamma, "steps": steps,
             "eff_bs": eff, "n_train": len(ds), "epoch_split": epoch_split,
@@ -350,7 +361,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
             "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
             "n_classes": b.heads.n_classes, "text_hidden": b.text_h,
             "vision_adapter": (b.pstats or {}).get("vision_adapter"),
-            "moe": ({**b.mstats, "capacity": cap} if decoder == "moe" else None)}
+            "moe": ({**b.mstats, "capacity": cap, "adaptive": adaptive} if decoder == "moe" else None)}
     sm.save_model(b, Path(out_dir), meta)
     save_heads(b.heads, Path(out_dir))
     print(f"  ✓ {arm['id']}: {r['minutes']:.1f} phút -> {out_dir}", flush=True)

@@ -15,6 +15,8 @@ from .report_common import pairwise_section, score_table, summarise
 QUESTIONS = {
     "3.1": "Cặp (c, E) nào tốt nhất trong (1,4) (1,6) (1.5,4) (1.5,6) — EC-Router, mỗi expert DoRA chọn "
            "k = ⌈c·N/E⌉ token? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.4": "Adaptive Capacity (k_i = ⌈max(N/E, exp H_i)⌉ theo từng expert, E=4) có tốt hơn capacity cố định c=1 (arm c1-E4 của 3.1) không? "
+           "Vector c hiệu dụng của từng expert thay đổi thế nào qua các lần val?",
     "3.2": "MoE-DoRA và các module mới (Cls head · EC-Router) có thật sự cần thiết? "
            "Đối chứng: baseline · mô hình mới với DoRA decoder đơn · mô hình mới với MoE-DoRA.",
 }
@@ -134,7 +136,7 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
     row = json.loads(summ.iloc[0].to_json())
     st = train_stat or {}
     prm = st.get("params") or {}
-    setup = {"decoder": arm.get("decoder", "—"), "E": arm.get("E"), "c": arm.get("c"),
+    setup = {"decoder": arm.get("decoder", "—"), "E": arm.get("E"), "c": arm.get("c"), "adaptive": bool(arm.get("adaptive")),
              "kind": arm["kind"],
              "params": (sum(int(v) for v in prm.values()) if prm else (0 if arm["kind"] == "infer" else None)),
              "minutes": st.get("minutes")}
@@ -168,6 +170,18 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
         parts += ["## Route", "", _route_md(name, route, ad, "e_heatmap.png")]
     elif arm["kind"] == "ft" and arm["decoder"] == "moe":
         parts += ["## Route", "", "*(chưa có phân tích route — chạy `--stages analysis,report`)*", ""]
+    cvec = [{"step": h["step"], **{k: v for k, v in h.items() if k.startswith("c_e")}}
+            for h in (st.get("val_history") or []) if any(k.startswith("c_e") for k in h)]
+    if cvec and arm["kind"] == "ft" and arm["decoder"] == "moe":
+        ncol = sum(1 for k in cvec[0] if k.startswith("c_e"))
+        parts += ["## Vector c hiệu dụng theo expert (val)", "",
+                  "c_i = k_i·E/N tại token cuối chuỗi (k_i = số token expert i lấy); trung bình trên tập val. "
+                  "c cố định ⇒ ≈ c; Adaptive Capacity ⇒ c_i tự thay đổi theo độ chuyên biệt (H_i thấp ⇒ về sàn 1).", "",
+                  "| Bước val | " + " | ".join(f"c_E{i}" for i in range(ncol)) + " |",
+                  "|---|" + "---|" * ncol,
+                  *[f"| {r['step']} | " + " | ".join(f"{r[f'c_e{i}']:.3f}" for i in range(ncol)) + " |" for r in cvec], ""]
+        summary["c_vec_val"] = cvec
+        (ad / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     (ad / "REPORT.md").write_text("\n".join(parts), encoding="utf-8")
     print(f"  ✓ báo cáo con {ad / 'REPORT.md'}", flush=True)
     return summary
@@ -188,8 +202,8 @@ def _setup_table(rows_in: list[dict]) -> str:
         tp = f"{int(r['params']):,}" if r.get("params") else "?"
         moe = r["decoder"] == "moe"
         rows.append(f"| {r['name']} | {r['decoder']} | {r.get('E') or '—'} | "
-                    f"{(format(r['c'], 'g') if r.get('c') else '—') if moe else '—'} | "
-                    f"{'⌈c·N/E⌉' if moe else '—'} | đồng huấn luyện | {tp} | "
+                    f"{('adaptive' if r.get('adaptive') else (format(r['c'], 'g') if r.get('c') else '—')) if moe else '—'} | "
+                    f"{('⌈max(N/E, e^H_i)⌉' if r.get('adaptive') else '⌈c·N/E⌉') if moe else '—'} | đồng huấn luyện | {tp} | "
                     f"{r.get('minutes') if r.get('minutes') is not None else '?'} |")
     return h + "\n" + "\n".join(rows)
 

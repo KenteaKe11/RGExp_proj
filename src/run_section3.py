@@ -1,6 +1,7 @@
-"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.1|3.2
+"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.1|3.2|3.4
 
     3.1  Khảo sát (c, E) ∈ {(1,4),(1,6),(1.5,4),(1.5,6)}: Expert-Choice, mỗi expert chọn k=⌈c·N/E⌉ token
+    3.4  Adaptive Capacity (E=4): k_i = ⌈max(N/E, e^{H_i})⌉ theo từng expert, đối đầu c1-E4 của 3.1
     3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only (+Cls head) · MoE-DoRA (c, E do BẠN chọn)
 
 Stage: data → train → infer → score → stats → analysis → report → push.
@@ -27,8 +28,8 @@ from .config import Cfg, add_common_args, hf_token, load_config, resolved_snapsh
 from .tracking import Tracker
 
 STAGES = ["data", "train", "infer", "score", "stats", "analysis", "report", "push"]
-SUBDIR = {"3.1": "3.1_c_e_grid_v3", "3.2": "3.2_ablation_v3"}   # v3: EC-Router + Cls head đồng huấn luyện (không lẫn kết quả Mentor cũ)
-ADAPTER = {"3.1": "./adapters_3_1_v3", "3.2": "./adapters_3_2_v3"}
+SUBDIR = {"3.1": "3.1_c_e_grid_v3", "3.2": "3.2_ablation_v3", "3.4": "3.4_adaptive_capacity_v3"}   # v3: EC-Router + Cls head đồng huấn luyện (không lẫn kết quả Mentor cũ)
+ADAPTER = {"3.1": "./adapters_3_1_v3", "3.2": "./adapters_3_2_v3", "3.4": "./adapters_3_4_v3"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -104,6 +105,14 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
             if c <= 0 or E < 1:
                 raise ValueError(f"cặp (c={c}, E={E}) không hợp lệ: cần c > 0, E ≥ 1")
             arms.append(_moe_arm(c, E))
+    elif exp == "3.4":
+        e34 = cfg.get("exp34") or {}
+        E, c0 = int(e34.get("E", 4)), float(e34.get("c_ref", 1.0))
+        ref = _moe_arm(c0, E)                                 # đối chứng: c cố định, KẾ THỪA kết quả 3.1 (bắt buộc có)
+        ref["reuse"] = {"exp": "3.1", "id": ref["id"], "required": True}
+        ac = {"id": f"ac_e{E}", "name": f"MoE-DoRA · Adaptive Capacity, E={E} (k_i=⌈max(N/E, e^H_i)⌉)",
+              "kind": "ft", "decoder": "moe", "E": E, "c": 1.0, "adaptive": True}
+        arms = [ref, ac]
     elif exp == "3.2":
         c, E = inh["c"], inh["E"]
         arms = [
@@ -113,7 +122,7 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
             _moe_arm(c, E, "moe_dora", "C · MoE-DoRA + EC-Router"),
         ]
     else:
-        raise ValueError(f"--exp phải là 3.1|3.2, nhận {exp!r}")
+        raise ValueError(f"--exp phải là 3.1|3.2|3.4, nhận {exp!r}")
     return arms, inh
 
 
@@ -167,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Cls head · EC-Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.2")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.1 | 3.2 | 3.4")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -183,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(a.config, a.overrides)
     exp = a.exp or str(cfg.get("experiment", "3.1"))
     if exp not in SUBDIR:
-        print(f"✗ experiment {exp!r} không hợp lệ (3.1|3.2)")
+        print(f"✗ experiment {exp!r} không hợp lệ (3.1|3.2|3.4)")
         return 2
     cfg["experiment"] = exp
     dry = bool(a.dry_run)
