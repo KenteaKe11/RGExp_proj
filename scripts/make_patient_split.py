@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Tạo/pull split patient thủ công (pipeline cũng tự gọi `ensure_splits`).
+"""Tạo/pull split patient CÂN BẰNG NHÃN thủ công (exp 3.0 cũng tự gọi `ensure_splits`).
 
-    python scripts/make_patient_split.py [--config configs/recombiner.yaml] [--force]
+    python scripts/make_patient_split.py [--config configs/section3.yaml] [--force]
 
-Có cache cục bộ -> dùng; có trên Hub -> pull; không có -> tạo rồi đẩy lên Hub.
+Có cache cục bộ -> dùng; có trên Hub -> pull; không có -> tạo (cần CheXbert để gán nhãn pool) rồi đẩy lên Hub.
 --force xoá bản cục bộ trước (KHÔNG xoá bản trên Hub).
 """
 import argparse
@@ -15,7 +15,7 @@ from src.config import load_config  # noqa: E402
 from src.splits import ensure_splits  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--config", default="configs/recombiner.yaml")
+ap.add_argument("--config", default="configs/section3.yaml")
 ap.add_argument("--force", action="store_true")
 a = ap.parse_args()
 cfg = load_config(a.config)

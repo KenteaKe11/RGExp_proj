@@ -1,4 +1,4 @@
-"""REPORT.md của họ §3 (3.1 · 3.2). Dựng từ đĩa: scores, pairwise, route analysis CSV."""
+"""REPORT.md của họ §3 (hiện chỉ 3.1). Dựng từ đĩa: scores, Friedman + hậu kiểm, route analysis CSV."""
 from __future__ import annotations
 
 import json
@@ -10,15 +10,15 @@ import pandas as pd
 
 from . import s3_analysis as an
 from .metrics import metric_columns
-from .report_common import pairwise_section, score_table, summarise
+from .report_common import f as _f
+from .report_common import pfmt as _p
+from .report_common import score_table, summarise
+from .report_common import tbl as _tbl
 
 QUESTIONS = {
-    "3.1": "Cặp (c, E) nào tốt nhất trong (1,4) (1,6) (1.5,4) (1.5,6) — EC-Router, mỗi expert DoRA chọn "
-           "k = ⌈c·N/E⌉ token? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
-    "3.4": "Adaptive Capacity (k_i = ⌈max(N/E, exp H_i)⌉ theo từng expert, E=4) có tốt hơn capacity cố định c=1 (arm c1-E4 của 3.1) không? "
-           "Vector c hiệu dụng của từng expert thay đổi thế nào qua các lần val?",
-    "3.2": "MoE-DoRA và các module mới (Cls head · EC-Router) có thật sự cần thiết? "
-           "Đối chứng: baseline · mô hình mới với DoRA decoder đơn · mô hình mới với MoE-DoRA.",
+    "3.1": "Trong các cặp (c, E) ∈ {(1,4) (2,4) (1,6) (2,6) (a,4) (a,6)} — Expert-Choice, mỗi expert DoRA chọn "
+           "k = ⌈c·N/E⌉ token (c = a: Adaptive Capacity) — cặp nào tốt nhất so với nhau và so với Baseline (Gemma 3 gốc), "
+           "xét theo text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
 }
 
 
@@ -211,34 +211,127 @@ def _setup_table(rows_in: list[dict]) -> str:
 def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> str:
     out = []
     if best:
-        what = "(c, E)"
-        out.append(f"- **{what} gợi ý (quyết định là của bạn):** arm `{best['arm']}` — hạng lâm sàng TB "
-                   f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f} → "
-                   f"c = {best['c']:g}, E = {best['E']} (`best.json`).")
+        c = best.get("c")
+        cfgtxt = "" if best.get("E") is None else \
+            f" → c = {('a' if c == 'a' else format(float(c), 'g'))}, E = {best['E']}"
+        out.append(f"- **Xếp hạng #1 theo hạng trung bình (gợi ý, chưa qua kiểm định):** arm `{best['arm']}` — hạng lâm sàng TB "
+                   f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f}{cfgtxt} (`best.json`).")
     ver = {a["id"]: manifest.get("arm_status", {}).get(a["id"], {}).get("route_verdict") for a in arms}
     ver = {k: v for k, v in ver.items() if v}
     if ver:
         col = [k for k, v in ver.items() if v["collapsed"]]
         out.append("- **Chuyên biệt hay sụp đổ:** "
                    + (f"SỤP ĐỔ về một DoRA ở {', '.join(col)}." if col else "không arm nào vượt ngưỡng sụp đổ.")
-                   + " Chi tiết từng arm ở mục Route.")
-    if exp == "3.2":
-        out.append("- **Cần MoE-DoRA / module mới không:** xem hai cặp A→B' (Cls head+vision+projector+DoRA) "
-                   "và B'→C (MoE-DoRA + EC-Router) ở mục kiểm định; một khác biệt chỉ có nghĩa khi "
-                   "p_perm < α và CI loại 0 (ký hiệu trong bảng).")
-    return "\n".join(out) or "*(chưa đủ dữ liệu)*"
+                   + " Chi tiết từng arm ở mục E-Clinical.")
+    out.append("- Một khác biệt chỉ có nghĩa khi p_perm < α và CI bootstrap loại 0 (xem mục Friedman và hậu kiểm).")
+    return "\n".join(out)
 
 
-def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.DataFrame,
+def _details(summary: str, body: str, open_: bool = False) -> str:
+    """Khối thu gọn/mở rộng (HTML <details> trong Markdown; GitHub, VS Code, Obsidian đều hiển thị)."""
+    return f"<details{' open' if open_ else ''}>\n<summary>{summary}</summary>\n\n{body}\n\n</details>"
+
+
+def friedman_section(fr: pd.DataFrame, ph: pd.DataFrame, names: dict, cfg, n_eval: int, k: int) -> str:
+    """Kiểm định Friedman + hậu kiểm gói trong MỘT bảng tóm tắt; mọi bảng chi tiết nằm trong khối thu gọn.
+
+    Bảng tóm tắt: mỗi dòng một metric; mỗi ô arm = hạng trung bình (đậm = tốt nhất) + ▲w ▼l, trong đó w = số arm
+    mà arm này thắng, l = số arm thắng nó (chỉ tính cặp có ý nghĩa VÀ đáng kể ở hậu kiểm)."""
+    st = dict(cfg["stats"])
+    w_floor, rrb = float(st.get("kendall_w_floor", 0.05)), st.get("rrb_floor", 0.10)
+    primary = str((cfg.get("metrics") or {}).get("primary", "chexbert_f1"))
+    A: list[str] = ["## Kiểm định Friedman + hậu kiểm", "",
+                    f"H0: **{k} arm có cùng phân phối hạng trong mỗi khối** (khối = {n_eval} ảnh test). Friedman chạy cho **mọi metric**; "
+                    f"hậu kiểm Wilcoxon + Holm chỉ chạy trên metric đã bác H0 (kết luận cần |rank-biserial| ≥ {rrb}). "
+                    "Mọi bảng chi tiết nằm trong các khối **▸ bấm để mở/thu gọn** bên dưới.", ""]
+    if fr is None or fr.empty:
+        return "\n".join(A + ["*(chưa có kết quả Friedman — chạy `--stages stats`)*"])
+    arms_ = [c[len("meanrank_"):] for c in fr.columns if c.startswith("meanrank_")]
+    ph = ph if ph is not None else pd.DataFrame()
+    wins = {m: {a: 0 for a in arms_} for m in fr["metric"]}
+    loss = {m: {a: 0 for a in arms_} for m in fr["metric"]}
+    if not ph.empty:
+        for r in ph[ph["significant_and_material"]].itertuples(index=False):
+            win, lose = (r.arm_a, r.arm_b) if r.diff > 0 else (r.arm_b, r.arm_a)
+            wins[r.metric][win] += 1
+            loss[r.metric][lose] += 1
+    rows = []
+    for _, r in fr.iterrows():
+        m = r["metric"]
+        best = r["best_by_meanrank"]
+        if bool(r["reject_h0"]):
+            weak = " (W thấp)" if float(r["kendall_w"]) < w_floor else ""
+            status = f"✓ bác H0{weak}"
+            nb = wins[m][best]
+            concl = f"{names.get(best, best)} — thắng {nb}/{k - 1} arm" if nb else f"{names.get(best, best)} hạng TB tốt nhất, chưa thắng rõ arm nào"
+        else:
+            status, concl = "— không bác H0", "không phân biệt được các arm"
+        cells = []
+        for a in arms_:
+            t = _f(r[f"meanrank_{a}"], 2)
+            t = f"**{t}**" if a == best else t
+            if bool(r["reject_h0"]):
+                t += f" ▲{wins[m][a]} ▼{loss[m][a]}"
+            cells.append(t)
+        rows.append([f"`{m}`", status, _f(r["kendall_w"], 3)] + cells + [concl])
+    A += ["### Bảng tóm tắt", "",
+          _tbl(["Metric", "Friedman", "Kendall W"] + [names.get(a, a) for a in arms_] + ["Kết luận"], rows), "",
+          "*Ô arm = hạng trung bình (1 = tốt nhất, đậm = tốt nhất). ▲w ▼l = số arm mà arm này thắng / số arm thắng nó, tính ở hậu kiểm "
+          "(chỉ hiện ở metric đã bác H0). Hạng TB là mô tả; kết luận hơn–thua chỉ đến từ ▲▼.*", ""]
+    w_notes = [w for w in fr.get("w_warning", pd.Series(dtype=str)).tolist() if w]
+    # ── khối thu gọn 1: Friedman chi tiết ──
+    frows = []
+    for r in fr.itertuples(index=False):
+        d = r._asdict()
+        frows.append([f"`{d['metric']}`", _f(d["chi2"], 1), f"{_f(d['F_iman_davenport'], 1)} ({d['df1']},{d['df2']})", _p(d["p_F"]),
+                      _p(d["p_F_holm"]), _f(d["kendall_w"], 4), f"{d['n_blocks_all_tied']} ({100 * d['frac_blocks_all_tied']:.0f}%)",
+                      "✓" if d["reject_h0"] else "—"])
+    body = _tbl(["Metric", "χ²", "F (Iman-Davenport)", "p", "p Holm", "Kendall W", "khối trùng hoàn toàn", "bác H0?"], frows)
+    body += ("\n\nKendall W là effect size của kiểm định tổng thể (0 = các ảnh xếp hạng không nhất quán, 1 = mọi ảnh xếp hạng y hệt nhau); "
+             f"với n = {n_eval}, p nhỏ không nói lên nhiều — đọc W trước. *Khối trùng hoàn toàn* = ảnh mà mọi arm được đúng cùng một điểm "
+             "(hay gặp ở BLEU-4).")
+    body += "".join(f"\n\n> ⚠ {w}" for w in w_notes)
+    A += [_details("Friedman chi tiết (χ², F Iman-Davenport, p, p Holm, Kendall W)", body), ""]
+    # ── khối thu gọn 2..: hậu kiểm từng metric ──
+    if ph.empty:
+        A += ["*Không metric nào bác được H0 ở tầng Friedman ⇒ không chạy hậu kiểm* (thủ tục được bảo vệ: đi tìm cặp khác nhau ở nơi "
+              "kiểm định tổng thể đã nói không có gì chỉ làm tăng dương tính giả).", ""]
+        return "\n".join(A)
+    gated = [m for m in fr["metric"] if m in set(ph["metric"])]
+    n_sig, n_mat = int(ph["significant"].sum()), int(ph["significant_and_material"].sum())
+    A += [f"Hậu kiểm: {len(ph)} cặp×metric ({k * (k - 1) // 2} cặp mỗi metric đã bác H0), Wilcoxon ghép cặp "
+          f"(`zero_method={st.get('zero_method', 'pratt')}`), Holm toàn cục; hiệu số **Δ = A − B**. "
+          f"**{n_sig}** đạt ý nghĩa thống kê, **{n_mat}** trong số đó đáng kể.", ""]
+    for m in sorted(gated, key=lambda x: (x != primary, gated.index(x))):
+        sub = ph[ph["metric"] == m].sort_values("p_wil_holm_global")
+        prow = []
+        for r in sub.itertuples(index=False):
+            d = r._asdict()
+            verdict = ("✓ " + names.get(d["arm_a"] if d["diff"] > 0 else d["arm_b"], "") + " hơn"
+                       if d["significant_and_material"] else
+                       ("≈ có ý nghĩa nhưng KHÔNG đáng kể" if d["significant"] else "—"))
+            prow.append([f"{names.get(d['arm_a'], d['arm_a'])} vs {names.get(d['arm_b'], d['arm_b'])}", _f(d["diff"], 4),
+                         f"{d['n_pos']}/{d['n_zero']}/{d['n_neg']}", _f(d["z"], 1), _p(d["p_wilcoxon"]),
+                         _p(d["p_wil_holm_global"]), _f(d["r_rb"], 3), verdict])
+        nm_ = int(sub["significant_and_material"].sum())
+        A += [_details(f"Hậu kiểm `{m}` — {len(sub)} cặp, {nm_} khác biệt đáng kể",
+                       _tbl(["Cặp (A vs B)", "Δ = A − B", "A thắng/hoà/thua", "z", "p Wilcoxon", "p Holm", "r_rb", "kết luận"], prow)), ""]
+    A += ["Toàn bộ số liệu: `metrics/friedman_tests.csv`, `metrics/posthoc_tests.csv`.", ""]
+    return "\n".join(A)
+
+
+def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, fr: pd.DataFrame, ph: pd.DataFrame,
               train_stats: list[dict], manifest: dict, arms: list[dict], best: dict | None,
               test_df=None) -> Path:
     """BÁO CÁO CUỐI: điều kiện cần là ĐỦ báo cáo con (`arms/<id>/summary.json`) của MỌI arm — thiếu thì
     `ReportIncomplete`. Bảng thiết lập, điểm, Cls head, Route lấy TRỰC TIẾP từ báo cáo con; chỉ xếp hạng
-    và kiểm định ghép cặp (cần nhiều arm cùng lúc) là tính ở đây từ per_sample."""
+    và kiểm định Friedman + hậu kiểm (cần nhiều arm cùng lúc) là tính ở đây từ per_sample."""
     run_dir = Path(run_dir)
     mdir = run_dir / "metrics"
     sums = load_arm_summaries(run_dir, arms)                       # raise ReportIncomplete nếu thiếu
     cols = [c for c in sums[arms[0]["id"]]["metrics"]]
+    clin_cols = set((cfg.get("selection") or {}).get("clinical") or
+                    ["chexbert_f1", "radgraph_f1_entity", "radgraph_f1_partial", "radgraph_f1_complete"])
     summ = _num_frame([sums[a["id"]]["scores"] for a in arms])
     summ.to_csv(mdir / "summary.csv", index=False)
     n_eval = next(iter(sums.values()))["n_eval"]
@@ -257,7 +350,11 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
              "\n".join(f"- [{sums[a['id']]['name']}](arms/{a['id']}/REPORT.md)" for a in arms), "",
              "## Thiết lập các arm", "",
              _setup_table([{"name": sums[a["id"]]["name"], **sums[a["id"]]["setup"]} for a in arms]), "",
-             "## Điểm", "", score_table(summ, cols, order=[a["id"] for a in arms]), ""]
+             "## Điểm", "",
+             "### Clinical metric", "", score_table(summ, [c for c in cols if c in clin_cols] or cols,
+                                                    order=[a["id"] for a in arms]), "",
+             "### Text metric", "", score_table(summ, [c for c in cols if c not in clin_cols] or cols,
+                                                order=[a["id"] for a in arms]), ""]
     cl = [(sums[a["id"]]["name"], sums[a["id"]]["cls_head"]) for a in arms if sums[a["id"]].get("cls_head")]
     if cl:
         parts += ["## Cls head (nhãn CheXbert dương = positive|uncertain)", "",
@@ -273,22 +370,27 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, pw: pd.Da
                   "\n".join(f"| {r['final_rank']} | {names.get(r['arm_id'], r['arm_id'])} | "
                             f"{r['clinical_rank']:.2f} | {r['text_rank']:.2f} | {'có' if r['tied_on_clinical'] else '—'} |"
                             for r in best["table"]), ""]
-    parts += ["## Kiểm định ghép cặp", "", pairwise_section(pw, names, cols, dict(cfg["stats"])), ""]
+    parts += [friedman_section(fr, ph, names, cfg, n_eval, len(arms)), ""]
     moe = [a for a in arms if sums[a["id"]].get("route")]
     if moe:
-        parts += ["## Route: các Expert có chuyên biệt không?", "",
+        parts += ["## E-Clinical: Pearson (S) và S·Sᵀ — các Expert có chuyên biệt không?", "",
                   "Forward tập test (eval), route w ∈ R^E mỗi ảnh = tỉ lệ token prefix mà từng expert phụ trách (trung bình trọng số theo token). "
+                  "**S** (E×14) = Pearson giữa trọng số route của expert i qua các ảnh và nhãn dương CheXbert j; "
+                  "**S·Sᵀ** (E×E) = hai expert giống nhau khi cùng tương quan với cùng bệnh. "
                   "*Sụp đổ* = cosine ΔW giữa các expert ≥ ngưỡng, HOẶC route tĩnh (trọng số gần như không đổi theo ảnh).", ""]
         parts += [_route_md(sums[a["id"]]["name"], sums[a["id"]]["route"], arm_dir(run_dir, a["id"]),
                             f"arms/{a['id']}/e_heatmap.png") for a in moe]
     parts += ["## Giả định cần biết", "",
-              "- c và E do người dùng chọn; `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định.",
+              "- `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định; quyết định chọn cấu hình là của người dùng.",
               "- EC-Router nhân quả (Expert-Choice): RMSNorm → Linear D→E; tại vị trí t mỗi expert chọn token nếu điểm "
               "thuộc top-k_t của các token ≤ t, k_t = ⌈c·n_t/E⌉; w theo từng token, chuẩn hoá giữa các expert đã chọn; token "
               "không expert nào chọn dùng trọng số nền đóng băng. Router và Cls head nhận toàn bộ token (ảnh + prompt + câu trả lời) "
               "nhưng nhân quả như decoder. Không nhiễu, không aux loss.",
               "- Cls head nhân quả đọc hidden cuối của decoder ở mọi vị trí (suy luận: vị trí cuối báo cáo), huấn luyện cùng lúc (không pretrain, không đóng băng).",
-              "- Baseline A là Gemma 3 gốc, chạy lại ở 3.2, không huấn luyện.", ""]
+              "- Baseline là Gemma 3 gốc (không huấn luyện, greedy, cùng prompt/ảnh/tập test).",
+              "- c = a (Adaptive Capacity): k_i = ⌈max(N/E, e^{H_i})⌉ với H_i là entropy của softmax nhân quả theo token của expert i; E là siêu tham số duy nhất.",
+              "- Data (exp 3.0): train 12800 · val 1280 · test 6400, 1 bệnh nhân – 1 mẫu, nhãn dương cân bằng giữa ba tập (xem `3.0_data_v4/DATA_REPORT.md`). "
+              "Train 400 bước × batch 32, val mỗi 40 bước, patience 3; 4 tập bootstrap × 6400 mẫu.", ""]
     path = run_dir / "REPORT.md"
     path.write_text("\n".join(parts), encoding="utf-8")
     print(f"  ✓ {path}", flush=True)

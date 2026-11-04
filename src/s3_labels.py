@@ -51,6 +51,15 @@ def _device(cfg) -> str:
         return "cpu"
 
 
+def seed_cache(cfg, tag: str, keys: list[str], states: np.ndarray) -> None:
+    """Gieo cache nhãn `tag` từ trạng thái đã có (vd split cân bằng đã gán nhãn pool) ⇒ khỏi gán lại."""
+    path = _cache_file(cfg, tag)
+    table = _load(path)
+    for k, row in zip(keys, np.asarray(states)):
+        table[str(k)] = row.astype(np.int8)
+    _save(path, table)
+
+
 def get_states(cfg, keys: list[str], refs: list[str], tag: str,
                labeler=None) -> np.ndarray:
     """(N,14) int64 trạng thái CheXbert của báo cáo gốc, theo thứ tự `keys`."""

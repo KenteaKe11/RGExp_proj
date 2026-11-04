@@ -1,42 +1,59 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # §3 — Cls head · EC-Router (Expert-Choice) · MoE-DoRA   (không Mentor, không pretrain)
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.1  Khảo sát (c, E): (1,4) (1,6) (1.5,4) (1.5,6); mỗi expert chọn k = ⌈c·N/E⌉ token
-#   3.2  Có cần MoE-DoRA không? baseline · DoRA-decoder-only (+Cls head) · MoE-DoRA (c, E do BẠN chọn)
-#   (3.3 — so vị trí leaderboard / SoTA bị vượt: mới là giả thuyết, CHƯA cài đặt)
+#   3.0  Data: split MỚI cân bằng nhãn, 1 bệnh nhân – 1 mẫu (train 12800 · val 1280 · test 6400)
+#   3.1  So sánh các cặp (c, E): (1,4) (2,4) (1,6) (2,6) (a,4) (a,6) + Baseline
+#          c = số: mỗi expert chọn k = ⌈c·N/E⌉ token · a = Adaptive Capacity k_i = ⌈max(N/E, e^H_i)⌉
+#          tiêu chí: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ
+#   (các exp sau 3.1: CHƯA thiết lập. Các exp 3.1/3.2/3.4 cũ nằm ở _archive/section3_v3/)
 #
-# Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.1|3.2
+# Chọn bằng dòng lệnh:  bash scripts/run_section3.sh --exp 3.0|3.1
+#
+# CHÍNH SÁCH THÍ NGHIỆM
+#   1. Infer luôn GREEDY.
+#   2. Train 12800 mẫu = 400 bước × batch 32 (1 lượt qua tập train). Val mỗi 40 bước, patience 3.
+#   3. Train / val / test: (i) tỉ lệ nhãn dương xấp xỉ nhau, (ii) hình dạng phân phối nhãn tương tự nhau,
+#      (iii) 1 bệnh nhân – 1 mẫu (không patient nào xuất hiện hai lần, kể cả giữa các tập).
+#   4. Test 6400 mẫu, 4 tập bootstrap, mỗi tập 6400 mẫu (lấy có hoàn lại).
 #
 # Quy ước: (1) Cls head fine-tune CÙNG LÚC với mọi thứ khác, loss = CE_text + γ·CE_cls (γ = 0.1);
 #          (2) Router và Cls head nhận TOÀN BỘ token (ảnh + prompt + câu trả lời đang stream) nhưng NHÂN QUẢ như decoder;
 #          (3) infer luôn GREEDY. Mọi PEFT = QDoRA rank 4.
 # Loss chỉ còn 2 loại: CE cls (4 lớp CheXbert) và CE text.
-# Epoch / split / lr / scheduler / save / report tái sử dụng từ §2.3.
 seed: 42
 experiment: "3.1"
 
 data:
   repo: RGExp123/MIMIC_CXR_cleaned
   repo_type: dataset
-  split_csv: split_ref/test_split.csv
+  split_csv: test_split.csv            # tên file trong split_local_dir (split MỚI, không phải split_ref/ cũ)
   meta_csv: csv_helper/clean_dataset.csv
   image_zip: img_dir.zip
   key_column: img_rel
   ref_column: text_gt
-  n_test: 3000
-  manifest_dir: ./data/section23_eval_3000_pt
-  split_local_dir: ./data/splits_patient_v2
+  n_test: 6400
+  manifest_dir: ./data/exp30_v4
+  split_local_dir: ./data/splits_exp30_v4
+  split_hub_dir: split_ref_exp30_v4    # nơi split được cache trên repo data (tạo ở exp 3.0)
+  split_seed: 42
+  split_patient_col: subject_id
   reuse_manifests: true
   cache_dir: ./data
   image_max_side: 512
   image_max_side_enforce: true
   zip_mode: auto
   zip_stream_min_rate: 1.0
-  train_split_csv: split_ref/train_split.csv
-  n_train: 6400
-  val_split_csv: split_ref/val_split.csv
-  n_val: 256
+  train_split_csv: train_split.csv
+  n_train: 12800
+  val_split_csv: val_split.csv
+  n_val: 1280                          # 10% train; đủ để vài bệnh hiếm còn ≥ ~20 ca dương
   assert_no_leak: true
+
+# Cân bằng nhãn giữa train/val/test (đo trên nhãn CheXbert dương = positive|uncertain, 14 bệnh).
+split_balance:
+  max_abs_rate_diff: 0.002             # |Δ tỉ lệ dương| lớn nhất của mọi bệnh giữa hai tập bất kỳ
+  max_js: 0.0001                       # JS-divergence (bit) của hồ sơ prevalence và của phân phối cardinality
+  enforce: true                        # không đạt ⇒ DỪNG (không âm thầm dùng split lệch)
 
 image_policy:
   unified: true
@@ -91,15 +108,14 @@ labels:                        # nhãn sinh LAZY từ CheXbert; KHÔNG đọc la
   device: auto
 
 train:
-  # 6400 mẫu · eff_bs 16 · 400 bước = 2 epoch × 200 bước (1 lượt qua 6400 mẫu); lr: một chu kỳ OneCycle
-  # trên cả 400 bước (xem schedule bên dưới).
-  n_epochs: 2
-  steps_per_epoch: 200
-  epoch_split: true
+  # 12800 mẫu · eff_bs 32 · 400 bước = 1 epoch (1 lượt qua tập train); lr: một chu kỳ OneCycle trên cả 400 bước.
+  n_epochs: 1
+  steps_per_epoch: 400
+  epoch_split: false
   batch_probe: true
-  batch_probe_sizes: divisors  # micro-batch hạ theo ƯỚC của effective_batch_size khi OOM (16: 8 → 4 → 2 → 1)
+  batch_probe_sizes: divisors  # micro-batch hạ theo ƯỚC của effective_batch_size khi OOM (32: 8 → 4 → 2 → 1)
   per_device_batch_size: 8
-  effective_batch_size: 16
+  effective_batch_size: 32
   grad_accum: 1
   max_seq_len: 1024
   gradient_checkpointing: true
@@ -142,9 +158,10 @@ validation:
   patience: 3
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
-exp31: {pairs: [[1, 4], [1, 6], [1.5, 4], [1.5, 6]]}   # (c, E): mỗi expert chọn ⌈c·N/E⌉ token
-exp34: {E: 4, c_ref: 1}                   # Adaptive Capacity (1 arm, E=4) đối đầu arm c_ref-E của 3.1 (kế thừa kết quả 3.1)
-exp32: {c: null, E: null}                 # BẠN chọn c, E (best.json của 3.1 chỉ là gợi ý)
+# 3.1: các cặp (c, E) theo thứ tự khai báo; c là số (k = ⌈c·N/E⌉) hoặc "a" (Adaptive Capacity) + Baseline.
+exp31:
+  pairs: [[1, 4], [2, 4], [1, 6], [2, 6], [a, 4], [a, 6]]
+  baseline: true                        # Baseline = Gemma 3 gốc (không huấn luyện), greedy
 
 analysis:
   collapse_threshold: 0.9      # cos ΔW trung bình ngoài đường chéo ≥ ngưỡng ⇒ sụp đổ về 1 DoRA
@@ -167,21 +184,20 @@ selection:
   tie_tol: 0.0                  # hạng lâm sàng chênh ≤ tie_tol coi là ngang nhau
 
 stats:
+  # Kiểm định = FRIEDMAN. (1) Tổng thể: với MỖI metric, 7 arm được xếp hạng trong từng ảnh test (khối = 6400 ảnh,
+  # hiệu chỉnh ties, xấp xỉ F Iman-Davenport, Holm trên các metric). (2) Hậu kiểm (protected): chỉ trên metric đã
+  # bác H0, mọi cặp arm bằng Wilcoxon ghép cặp + Holm toàn cục; kết luận cần thêm effect size (rank-biserial) vượt sàn.
   alpha: 0.05
+  # 4 tập bootstrap × 6400 mẫu (lấy có hoàn lại) chỉ dùng cho BẢNG ĐIỂM (trung bình trên các tập bootstrap).
   n_boot: 4
-  bootstrap_sample_size: 7500
+  bootstrap_sample_size: 6400   # = cỡ tập test
   bootstrap_seeds: [42, 43, 44, 45]
   ci_method: percentile
-  n_perm: 10000
   ci: 0.95
-  dz_floor: 0.10
-  primary_test: perm
-  pairs: all                   # 3.1: mọi cặp; 3.2 tự chuyển sang `contrasts`
-  adjust_scope: metrics
-  contrasts:
-    - [baseline_infer, dora_decoder]     # A -> B': fine-tune DoRA decoder (+ Cls head, vision, projector)
-    - [dora_decoder, moe_dora]           # B' -> C : MoE-DoRA + EC-Router
-    - [baseline_infer, moe_dora]         # A -> C
+  zero_method: pratt            # Wilcoxon: GIỮ cặp hiệu số 0 khi xếp hạng (hai arm sinh cùng văn bản vẫn là bằng chứng cho H0)
+  posthoc_permutation: false    # tắt permutation ở hậu kiểm (252 kiểm định × 6400 khối quá tốn); Wilcoxon cùng họ hạng với Friedman
+  kendall_w_floor: 0.05         # Kendall W dưới mức này ⇒ cảnh báo "n lớn, p không còn là tiêu chí"
+  rrb_floor: 0.10               # |rank-biserial| dưới mức này ⇒ cặp bị coi là không đáng kể dù p nhỏ
 
 wandb:
   enabled: true
@@ -203,5 +219,5 @@ output:
   hub_private: true
   push: true
   push_per_arm: true
-  subdir: "3.1_c_e_grid_v3"
-  adapter_dir: ./adapters_3_1_v3
+  subdir: "3.1_c_e_vs_baseline_v4"
+  adapter_dir: ./adapters_3_1_v4

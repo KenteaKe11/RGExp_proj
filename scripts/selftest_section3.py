@@ -1,4 +1,4 @@
-"""Selftest họ §3 — CPU, không mạng, không GPU."""
+"""Selftest họ §3 (exp 3.0/3.1) — CPU, không mạng, không GPU. Friedman: scripts/selftest_friedman.py."""
 from __future__ import annotations
 
 import json
@@ -31,44 +31,51 @@ def main() -> int:
         cfg["output"]["dir"] = td
         # 3.1
         a1, _ = build_arms(cfg, "3.1")
-        check("3.1: 4 biến thể (c,E) = (1,4) (1,6) (1.5,4) (1.5,6), id không đụng nhau",
-              [(x["c"], x["E"]) for x in a1] == [(1.0, 4), (1.0, 6), (1.5, 4), (1.5, 6)]
-              and len({x["id"] for x in a1}) == 4 and all("pretrain" not in x and "top_k" not in x for x in a1),
-              str([x["id"] for x in a1]))
-        a4, _ = build_arms(cfg, "3.4")
-        check("3.4: c1_e4 (kế thừa 3.1) vs ac_e4 (adaptive, E=4)",
-              [x["id"] for x in a4] == ["c1_e4", "ac_e4"] and a4[0]["reuse"]["exp"] == "3.1"
-              and a4[0]["reuse"]["id"] == a1[0]["id"] and a4[1].get("adaptive") is True and a4[1]["E"] == 4
-              and not a4[0].get("adaptive"))
-        check("3.4: thư mục kết quả/adapter riêng (không đè 3.1)",
-              __import__("src.run_section3", fromlist=["x"]).SUBDIR["3.4"] != __import__("src.run_section3", fromlist=["x"]).SUBDIR["3.1"])
-        try:
-            build_arms(cfg, "3.2")
-            check("3.2 thiếu c,E phải DỪNG", False)
-        except ValueError:
-            check("3.2 thiếu c,E phải DỪNG", True)
-        for old in ("3.1-1", "3.1-2", "3.3"):
+        ids = [x["id"] for x in a1]
+        check("3.1: 7 arm theo thứ tự (1,4) (2,4) (1,6) (2,6) (a,4) (a,6) + Baseline",
+              ids == ["c1_e4", "c2_e4", "c1_e6", "c2_e6", "ac_e4", "ac_e6", "baseline_infer"], str(ids))
+        fixed = [x for x in a1 if x["kind"] == "ft" and not x.get("adaptive")]
+        ada = [x for x in a1 if x.get("adaptive")]
+        check("3.1: c số ⇒ capacity cố định k=⌈c·N/E⌉ (c=1,2); c=a ⇒ Adaptive Capacity (E=4,6)",
+              [(x["c"], x["E"]) for x in fixed] == [(1.0, 4), (2.0, 4), (1.0, 6), (2.0, 6)]
+              and [(x["E"], x["decoder"]) for x in ada] == [(4, "moe"), (6, "moe")]
+              and all("pretrain" not in x and "top_k" not in x for x in a1))
+        check("3.1: Baseline = Gemma gốc, kind=infer (không train)",
+              a1[-1]["kind"] == "infer" and a1[-1]["runner"] == "gemma3")
+        for old in ("3.2", "3.3", "3.4", "3.1-1", "3.1-2"):
             try:
                 build_arms(cfg, old)
-                check(f"{old} đã bị xoá", False)
+                check(f"{old} đã bị gỡ (chưa thiết lập)", False)
             except ValueError:
-                check(f"{old} đã bị xoá", True)
-        cfg["exp32"].update(c=1.5, E=6)
-        a3, inh3 = build_arms(cfg, "3.2")
-        ids = [x["id"] for x in a3]
-        moe = a3[-1]
-        check("3.2: baseline · dora_decoder · moe_dora (c=1.5, E=6)",
-              ids == ["baseline_infer", "dora_decoder", "moe_dora"]
-              and (moe["E"], moe["c"]) == (6, 1.5) and a3[1]["decoder"] == "dora")
-        mc = model_cfg(cfg, a3[2], Path("ad"))
+                check(f"{old} đã bị gỡ (chưa thiết lập)", True)
+        from src import run_section3 as rs
+        check("thư mục kết quả/adapter v4 (Hub không tái dùng kết quả v3 chạy trên data khác)",
+              rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_e_vs_baseline_v4"}
+              and rs.ADAPTER == {"3.1": "./adapters_3_1_v4"})
+
+        # ── chính sách thí nghiệm ──
+        d_, st_ = cfg["data"], cfg["stats"]
+        check("data: train 12800 · val 1280 · test 6400, split MỚI (không split_ref/ cũ)",
+              (d_["n_train"], d_["n_val"], d_["n_test"]) == (12800, 1280, 6400)
+              and "split_ref/" not in str(d_["train_split_csv"]) and "split_ref/" not in str(d_["split_csv"])
+              and str(d_["split_hub_dir"]).endswith("v4"))
+        check("bootstrap: 4 tập × 6400 mẫu (lấy có hoàn lại) cho bảng điểm, 4 seed khác nhau",
+              st_["n_boot"] == 4 and st_["bootstrap_sample_size"] == 6400 and len(set(st_["bootstrap_seeds"])) == 4)
+        check("kiểm định = Friedman + hậu kiểm Wilcoxon (pratt, không permutation); không còn cấu hình ghép cặp cũ",
+              st_["zero_method"] == "pratt" and st_["posthoc_permutation"] is False and st_["kendall_w_floor"] == 0.05
+              and st_["rrb_floor"] == 0.10 and "pairs" not in st_ and "contrasts" not in st_)
+        check("infer greedy", cfg["generate"]["do_sample"] is False and cfg["generate"]["num_beams"] == 1)
+        check("cân bằng nhãn bắt buộc (enforce) trong cấu hình split",
+              bool(cfg["split_balance"]["enforce"]) and cfg["split_balance"]["max_abs_rate_diff"] <= 0.005)
+        mc = model_cfg(cfg, a1[4], Path("ad"))
         check("model_cfg: runner gemma3_ec + adapter_dir", mc["runner"] == "gemma3_ec"
-              and str(mc["adapter_dir"]).endswith("moe_dora"))
-        check("model_cfg: baseline dùng runner gemma3", model_cfg(cfg, a3[0], Path("ad"))["runner"] == "gemma3")
+              and str(mc["adapter_dir"]).endswith("ac_e4"))
+        check("model_cfg: baseline dùng runner gemma3", model_cfg(cfg, a1[-1], Path("ad"))["runner"] == "gemma3")
 
         check("thang batch infer theo bội 2", pow2_ladder(512)[:3] == [512, 256, 128] and pow2_ladder(512)[-1] == 1 and pow2_ladder(6) == [4, 2, 1])
 
         from src.s3_train import divisors_desc
-        check("micro-batch dò theo ước của eff_bs", divisors_desc(16, 8) == [8, 4, 2, 1]
+        check("micro-batch dò theo ước của eff_bs", divisors_desc(32, 8) == [8, 4, 2, 1] and divisors_desc(16, 8) == [8, 4, 2, 1]
               and divisors_desc(12, 8) == [6, 4, 3, 2, 1] and divisors_desc(16) == [16, 8, 4, 2, 1])
 
         import pandas as pd
@@ -87,11 +94,12 @@ def main() -> int:
               rank_arms(pd.DataFrame({"arm_id": ["x", "y"], "chexbert_f1": [.6, .5], "radgraph_f1_entity": [.4, .3],
                                       "bleu1": [.1, .9]}))["arm_id"].tolist() == ["x", "y"])
 
-        # ── lịch: 6400 mẫu · eff_bs 16 · 4 epoch × 200 bước ──
+        # ── lịch: 12800 mẫu · batch 32 · 400 bước ──
         from src.s3_train import _plan
-        eff, n_ep, split, steps, cycle = _plan(dict(cfg["train"]), 6400)
-        check("lịch finetune: eff_bs 16 · 2×200 = 400 bước (1 lượt qua 6400 mẫu)",
-              (eff, n_ep, split, steps, cycle) == (16, 2, True, 400, 200) and steps * eff == 6400)
+        eff, n_ep, split, steps, cycle = _plan(dict(cfg["train"]), 12800)
+        check("lịch finetune: batch 32 · 400 bước (1 lượt qua 12800 mẫu)",
+              (eff, n_ep, split, steps, cycle) == (32, 1, False, 400, 0) and steps * eff == 12800,
+              str((eff, n_ep, split, steps, cycle)))
         check("không còn pretrain/Mentor trong config", "pretrain" not in cfg and "mentor" not in cfg
               and float(cfg["classifier"]["gamma"]) == 0.1 and cfg["train"]["vision_adapter"]["layers"] == "last_third")
         check("val mỗi 40 bước · patience 3",
@@ -202,30 +210,30 @@ def main() -> int:
         sc = {x["id"]: mk(0.1 * i) for i, x in enumerate(arms_t)}
         nm = {x["id"]: x["name"] for x in arms_t}
         for x in arms_t[:2]:
-            rp.write_arm(cfg, "3.2", rd, x, sc[x["id"]], None, 30)
+            rp.write_arm(cfg, "3.1", rd, x, sc[x["id"]], None, 30)
         check("báo cáo con: có arms/<id>/REPORT.md + summary.json",
               all((rd / "arms" / i / f).exists() for i in ("base", "dora") for f in ("REPORT.md", "summary.json")))
         try:
-            rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], {}, arms_t, None)
+            rp.write_all(cfg, "3.1", rd, sc, nm, pd.DataFrame(), pd.DataFrame(), [], {}, arms_t, None)
             check("báo cáo cuối thiếu báo cáo con ⇒ DỪNG (ReportIncomplete)", False)
         except rp.ReportIncomplete as e:
             check("báo cáo cuối thiếu báo cáo con ⇒ DỪNG (ReportIncomplete)", list(e.missing) == ["moe"], str(e.missing))
-        rp.write_arm(cfg, "3.2", rd, arms_t[2], sc["moe"], None, 30)          # MoE chưa có phân tích route
+        rp.write_arm(cfg, "3.1", rd, arms_t[2], sc["moe"], None, 30)          # MoE chưa có phân tích route
         try:
-            rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], {}, arms_t, None)
+            rp.write_all(cfg, "3.1", rd, sc, nm, pd.DataFrame(), pd.DataFrame(), [], {}, arms_t, None)
             check("arm MoE chưa có route ⇒ báo cáo con CHƯA ĐỦ", False)
         except rp.ReportIncomplete as e:
             check("arm MoE chưa có route ⇒ báo cáo con CHƯA ĐỦ", "route" in e.missing.get("moe", ""))
         (rd / "metrics" / "analysis" / "moe_route_verdict.json").write_text(_json.dumps(
             {"reading": "có phân hoá giữa các expert", "param_cos_offdiag": 0.01, "threshold": 0.9, "route_cv": 1.0,
              "cv_floor": 0.05, "n_images": 30, "collapsed": False, "route_corr_offdiag": -0.1}), encoding="utf-8")
-        rp.write_arm(cfg, "3.2", rd, arms_t[2], sc["moe"], None, 30)
+        rp.write_arm(cfg, "3.1", rd, arms_t[2], sc["moe"], None, 30)
         sj = rd / "arms" / "base" / "summary.json"
         s_ = _json.loads(sj.read_text(encoding="utf-8"))
         s_["scores"]["bleu1"] = 0.9991
         sj.write_text(_json.dumps(s_), encoding="utf-8")                      # sửa tay báo cáo con
         man = {}
-        pth = rp.write_all(cfg, "3.2", rd, sc, nm, pd.DataFrame(), [], man, arms_t, None)
+        pth = rp.write_all(cfg, "3.1", rd, sc, nm, pd.DataFrame(), pd.DataFrame(), [], man, arms_t, None)
         txt = pth.read_text(encoding="utf-8")
         check("báo cáo cuối đủ: lấy TRỰC TIẾP từ báo cáo con (giá trị sửa tay xuất hiện) + liên kết tới arms/<id>",
               "0.9991" in txt and "arms/moe/REPORT.md" in txt and "có phân hoá" in txt)
