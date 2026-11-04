@@ -114,11 +114,15 @@ def _group_grad_norms(opt) -> dict:
 
 def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
           seed, log_every, tracker, tag, route_ctx=None, val_ds=None, val_every=40,
-          patience=3, to_eval=None, to_train=None, log_path=None):
+          patience=3, min_delta=0.0, to_eval=None, to_train=None, log_path=None):
     """Vòng lặp chung. OOM -> hạ micro-batch một bậc và làm lại bước đó.
 
     Mỗi `val_every` bước chạy tập val (cùng `loss_fn`); `patience` lần val liên tiếp không tốt hơn
-    thì DỪNG SỚM; cuối cùng nạp lại tham số học của lần val tốt nhất."""
+    thì DỪNG SỚM; cuối cùng nạp lại tham số học của lần val tốt nhất.
+
+    `min_delta` (tuyệt đối, đơn vị loss): một lần val chỉ tính là CẢI THIỆN (reset bộ đếm patience) khi loss thấp hơn
+    mốc `ref` ít nhất `min_delta`; `ref` là loss tại lần cải thiện có ý nghĩa gần nhất. Trọng số được nạp lại
+    vẫn là của lần val có loss THẤP NHẤT thực sự (kể cả khi chỉ giảm nhẹ hơn min_delta)."""
     n = len(ds)
     g = torch.Generator().manual_seed(seed)
     order = torch.randperm(n, generator=g).tolist()
@@ -143,6 +147,7 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
     ref0 = sm.expert_snapshot(b.model) if log_path else None     # θᵢ(0) của E expert PEFT (để log Δwᵢ)
     best = {"loss": float("inf"), "step": 0, "state": None}
     bad = 0
+    ref = float("inf")        # mốc để so với min_delta (chỉ nhích khi cải thiện có ý nghĩa)
     stopped = False
 
     def validate():
@@ -224,17 +229,19 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                 tracker.log(payload)
         if val_ds is not None and ((step + 1) % val_every == 0 or step == steps - 1):
             vl, vp = validate()
-            improved = vl < best["loss"] - 1e-6
-            vhist.append({"step": step + 1, "val_loss": vl, **vp})
-            if improved:
+            improved = vl < ref - max(float(min_delta), 1e-6)
+            if vl < best["loss"]:        # giữ trọng số của lần val thấp nhất thực sự
                 best.update(loss=vl, step=step + 1,
                             state=[p.detach().to("cpu", copy=True) for p in params])
+            vhist.append({"step": step + 1, "val_loss": vl, **vp})
+            if improved:
+                ref = vl
                 bad = 0
             else:
                 bad += 1
             print(f"    [{tag}] VAL bước {step + 1}: loss {vl:.4f} "
                   + " ".join(f"{k} {v:.4f}" for k, v in vp.items())
-                  + f" · {'tốt nhất' if improved else f'không cải thiện {bad}/{patience}'}", flush=True)
+                  + f" · {'tốt nhất' if improved else f'không cải thiện ≥ {min_delta:g} ({bad}/{patience})'}", flush=True)
             dw = sm.expert_delta_norms(b.model, ref0) if log_path else None   # Δwᵢ = ‖θᵢ(t)−θᵢ(0)‖, E expert
             cv = [vp[f"c_e{i}"] for i in range(64) if f"c_e{i}" in vp]        # vector c của E expert (val)
             if cv:
@@ -251,7 +258,7 @@ def _loop(b, *, ds, pad_id, steps, eff_bs, micro_top, opt, sched, loss_fn, clip,
                 tracker.log(payload)
             if bad >= patience:
                 stopped = True
-                print(f"    [{tag}] DỪNG SỚM tại bước {step + 1} (patience {patience}); "
+                print(f"    [{tag}] DỪNG SỚM tại bước {step + 1} (patience {patience}, min_delta {min_delta:g}); "
                       f"nạp lại bước {best['step']}", flush=True)
                 break
     if best["state"] is not None:
@@ -298,7 +305,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     vcfg = dict(cfg.get("validation", {}) or {})
     val_ds = (ClsReportDataset(val_df, b.processor, cfg, int(tcfg.get("max_seq_len", 1024)),
                                cls_y, b.img_kw) if val_df is not None and len(val_df) else None)
-    print(f"  val mỗi {vcfg.get('every_steps', 40)} bước · patience {vcfg.get('patience', 3)} · "
+    print(f"  val mỗi {vcfg.get('every_steps', 40)} bước · patience {vcfg.get('patience', 3)} · min_delta {vcfg.get('min_delta', 0.0)} · "
           f"{0 if val_ds is None else len(val_ds)} mẫu val", flush=True)
     print(f"  {len(ds)} mẫu · eff_bs {eff} · {steps} bước"
           + (f" = {n_ep} epoch × {cycle} bước (epoch_split; "
@@ -345,7 +352,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
               loss_fn=loss_fn, clip=float(tcfg.get("max_grad_norm", 1.0)), seed=seed,
               log_every=int(tcfg.get("logging_steps", 10)), tracker=tracker, tag=arm["id"],
               route_ctx=b.route_ctx, val_ds=val_ds, val_every=int(vcfg.get("every_steps", 40)),
-              patience=int(vcfg.get("patience", 3)), to_eval=_eval_mode, to_train=_train_mode,
+              patience=int(vcfg.get("patience", 3)), min_delta=float(vcfg.get("min_delta", 0.0)), to_eval=_eval_mode, to_train=_train_mode,
               log_path=f"train/{cfg.get('experiment', '3.1')}/{arm['id']}")
     meta = {"phase": "finetune", "arm_id": arm["id"], "name": arm.get("name", arm["id"]),
             "decoder": decoder, "n_experts": int(arm.get("E", 0)), "capacity": cap, "adaptive": adaptive,
@@ -356,7 +363,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
             "minutes": round(r["minutes"], 1),
             "micro_final": r["micro_final"], "seed": seed,
             "val_history": r["val_history"], "best_step": r["best_step"],
-            "best_val_loss": r["best_val_loss"], "stopped_early": r["stopped_early"],
+            "best_val_loss": r["best_val_loss"], "min_delta": float(vcfg.get("min_delta", 0.0)), "stopped_early": r["stopped_early"],
             "steps_run": r["steps_run"], "cycle_steps": cycle,
             "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
             "n_classes": b.heads.n_classes, "text_hidden": b.text_h,

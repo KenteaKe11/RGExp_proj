@@ -153,10 +153,11 @@ train:
   quant: {load_in_4bit: true, quant_type: nf4, double_quant: true, compute_dtype: bfloat16}
 
 # Mọi pipeline chạy tập val định kỳ; patience lần liền không cải thiện ⇒ dừng sớm
-# và nạp lại tham số của lần val tốt nhất.
+# và nạp lại tham số của lần val có loss thấp nhất.
 validation:
   every_steps: 40
   patience: 3
+  min_delta: 0.005       # val loss phải giảm ≥ 0.005 (tuyệt đối) so với mốc cải thiện gần nhất mới reset patience
 
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
 # 3.1: các cặp (c, E) theo thứ tự khai báo; c là số (k = ⌈c·N/E⌉) hoặc "a" (Adaptive Capacity) + Baseline.

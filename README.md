@@ -20,7 +20,7 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 - **MoE-DoRA**: `y = (Σᵢ wᵢ·mᵢ/nᵢ + 1 − Σw)⊙W₀x + s·Σᵢ wᵢ (mᵢ/nᵢ)⊙BᵢAᵢx`, DoRAᵢ = mᵢ ⊙ (W₀ + s·BᵢAᵢ)/‖·‖row, s = α/r. DoRA trên mọi Linear của decoder.
 - **Log train**: `ce_text`, `ce_cls`, `lr`, `grad_norm` router/decoder (trước clip); mỗi lần val log vector Δw của E expert: `train/<mục>/<arm>/delta_w.e0…`.
 - **Loss**: chỉ CE cls (nhãn CheXbert sinh lazy) và CE text. Mọi PEFT = QDoRA rank 4. Infer luôn greedy.
-- **Lịch (mọi pipeline)**: train **12800 mẫu = 400 bước × batch 32** (1 lượt qua tập train) · lr **OneCycle một chu kỳ trên cả run**: 0 → 1e-4 → 1e-8, weight decay 0.001 · val mỗi 40 bước, patience 3 ⇒ dừng sớm và nạp lại bước tốt nhất · infer luôn **greedy**.
+- **Lịch (mọi pipeline)**: train **12800 mẫu = 400 bước × batch 32** (1 lượt qua tập train) · lr **OneCycle một chu kỳ trên cả run**: 0 → 1e-4 → 1e-8, weight decay 0.001 · val mỗi 40 bước, patience 3, `min_delta` 0.005 (val loss phải giảm ≥ 0.005 so với mốc cải thiện gần nhất mới reset patience) ⇒ dừng sớm và nạp lại bước có val loss thấp nhất · infer luôn **greedy**.
 
 ## Chính sách thí nghiệm
 

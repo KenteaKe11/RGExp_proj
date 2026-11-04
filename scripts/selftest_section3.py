@@ -143,7 +143,8 @@ def main() -> int:
         check("không còn pretrain/Mentor trong config", "pretrain" not in cfg and "mentor" not in cfg
               and float(cfg["classifier"]["gamma"]) == 0.1 and cfg["train"]["vision_adapter"]["layers"] == "last_third")
         check("val mỗi 40 bước · patience 3",
-              cfg["validation"]["every_steps"] == 40 and cfg["validation"]["patience"] == 3)
+              cfg["validation"]["every_steps"] == 40 and cfg["validation"]["patience"] == 3
+              and float(cfg["validation"]["min_delta"]) > 0)
 
         # ── lr: OneCycle một chu kỳ 0 -> 1e-4 -> 1e-8 trên 400 bước; wd 0.001 ──
         from src.s3_train import build_sched
