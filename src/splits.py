@@ -24,6 +24,25 @@ def _files(d: Path) -> list[Path]:
     return [d / f"{n}_split.csv" for n in NAMES]
 
 
+def _want_sizes(cfg) -> dict[str, int]:
+    d = cfg.data
+    return {"train": int(d.get("n_train", 0) or 0), "val": int(d.get("n_val", 0) or 0),
+            "test": int(d.get("n_test", 0) or 0)}
+
+
+def _stale_reason(cfg, local: Path) -> str | None:
+    """None nếu ba file có đúng cỡ cấu hình; ngược lại mô tả lệch. Split cũ sai cỡ KHÔNG được dùng: `_read_split`
+    cắt n key ĐẦU của file, nên val 1280 cũ cắt còn 128 sẽ không còn cân bằng nhãn."""
+    want = _want_sizes(cfg)
+    bad = []
+    for n, p in zip(NAMES, _files(local)):
+        with open(p, encoding="utf-8") as fh:
+            got = max(sum(1 for _ in fh) - 1, 0)
+        if want[n] and got != want[n]:
+            bad.append(f"{n}: file {got} ≠ cấu hình {want[n]}")
+    return "; ".join(bad) or None
+
+
 def load_meta_pid(cfg, patient_col: str | None = None):
     """clean_dataset.csv -> DataFrame [key, ref, pid] (bỏ dòng thiếu report)."""
     import pandas as pd
@@ -58,7 +77,12 @@ def ensure_splits(cfg) -> Path:
     d = cfg.data
     local = Path(d["split_local_dir"]).expanduser()
     if all(p.exists() for p in _files(local)):
-        return local
+        why = _stale_reason(cfg, local)
+        if why is None:
+            return local
+        print(f"  ⚠ split cục bộ CŨ lệch cỡ ({why}) ⇒ bỏ, lấy/tạo lại.", flush=True)
+        for p in _files(local):
+            p.unlink(missing_ok=True)
     from huggingface_hub import HfApi, hf_hub_download
     from .config import hf_token
     from .s3_split import build_balanced_split
@@ -78,10 +102,14 @@ def ensure_splits(cfg) -> Path:
                                                     filename=f"{hub_dir}/{nm}", token=hf_token()), local / nm)
                 except Exception:  # noqa: BLE001
                     pass
+            why = _stale_reason(cfg, local)
+            if why is not None:
+                raise ValueError(f"split trên Hub CŨ lệch cỡ ({why})")
             print(f"  ✓ split patient: đã pull từ Hub ({hub_dir}/) -> {local}", flush=True)
             return local
         except Exception as e:  # noqa: BLE001 — chưa có trên Hub là trường hợp bình thường
-            print(f"  split patient chưa có trên Hub ({type(e).__name__}); tạo mới (cân bằng nhãn).", flush=True)
+            print(f"  split patient chưa có/không dùng được trên Hub ({type(e).__name__}: {str(e)[:120]}); "
+                  f"tạo mới (cân bằng nhãn) và ghi đè lên Hub.", flush=True)
             for p in _files(local):
                 p.unlink(missing_ok=True)
     build_balanced_split(cfg, local, seed=int(d.get("split_seed", 42)),
@@ -103,9 +131,7 @@ def ensure_splits(cfg) -> Path:
 def resolve_split_file(cfg, filename: str) -> str:
     d = cfg.data
     if d.get("split_local_dir"):
-        p = Path(d["split_local_dir"]).expanduser() / Path(filename).name
-        if not p.exists():
-            p = ensure_splits(cfg) / Path(filename).name
+        p = ensure_splits(cfg) / Path(filename).name       # luôn kiểm cỡ: chặn split cũ sai cỡ lọt vào
         if not p.exists():
             raise FileNotFoundError(f"thiếu {p}")
         return str(p)

@@ -1,6 +1,8 @@
 """Selftest exp 3.0 (data cân bằng nhãn · 1 bệnh nhân – 1 mẫu) — CPU, không mạng, không torch."""
 from __future__ import annotations
 
+import pathlib
+import tempfile
 import sys
 import tempfile
 from pathlib import Path
@@ -137,6 +139,17 @@ def main() -> int:
             check("split lệch + enforce ⇒ DỪNG", "KHÔNG đạt" in str(e))
         finally:
             sp.stratified_split = _orig_s
+
+    # ── split cũ sai cỡ (vd val 1280 từ lần chạy trước) phải bị phát hiện, không được cắt-đầu rồi dùng ──
+    from src import splits as spl
+    with tempfile.TemporaryDirectory() as td2:
+        for nm, n in (("train", 12800), ("val", 1280), ("test", 6400)):
+            pathlib.Path(td2, f"{nm}_split.csv").write_text("img_rel\n" + "\n".join(str(i) for i in range(n)) + "\n")
+        c2 = Cfg({"data": {"n_train": 12800, "n_val": 128, "n_test": 6400}})
+        why = spl._stale_reason(c2, pathlib.Path(td2))
+        check("split cũ val 1280 vs cấu hình 128 ⇒ bị đánh dấu CŨ", why is not None and "val" in why, str(why))
+        c3 = Cfg({"data": {"n_train": 12800, "n_val": 1280, "n_test": 6400}})
+        check("split đúng cỡ ⇒ không bị đánh dấu cũ", spl._stale_reason(c3, pathlib.Path(td2)) is None)
 
     badn = OK.count(False)
     print(f"\n{'✓ TẤT CẢ' if not badn else '✗ HỎNG'} {len(OK) - badn}/{len(OK)}")
