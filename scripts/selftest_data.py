@@ -35,38 +35,39 @@ def fake_states(n, seed):
 
 def main() -> int:
     cfg0 = load_config(str(ROOT / "configs" / "section3.yaml"), [])
-    check("config: 12800/1280/6400, 1 patient–1 mẫu enforce, split hub v4",
-          (cfg0["data"]["n_train"], cfg0["data"]["n_val"], cfg0["data"]["n_test"]) == (12800, 1280, 6400)
+    check("config: 12800/128/6400, 1 patient–1 mẫu enforce, split hub v4",
+          (cfg0["data"]["n_train"], cfg0["data"]["n_val"], cfg0["data"]["n_test"]) == (12800, 128, 6400)
           and cfg0["split_balance"]["enforce"] is True)
 
     # ── iterative stratification + hoán đổi: đúng cỡ, cân bằng, tốt hơn chia ngẫu nhiên ──
-    N, sizes = 20480, [6400, 1280, 12800]
-    worst, worst_rand = [], []
+    N, sizes = 19328, [6400, 128, 12800]
+    worst, worst_rand, ok_pairs = [], [], []
     for seed in range(8):
         st = fake_states(N, seed)
         pos = (st == 1) | (st == 3)
         a = sp.stratified_split(sp.strat_matrix(pos), sizes, seed)
         r = sp.balance_report(st, a, ["test", "val", "train"])
         worst.append(max(p["max_abs_rate_diff"] for p in r["pairs"].values()))
+        ok_pairs.append(r["ok"] and r["pairs"]["test~train"]["max_abs_rate_diff"] <= 0.002)
         rnd = np.random.default_rng(seed).permutation(N)
         ar = np.empty(N, int)
-        ar[rnd[:6400]], ar[rnd[6400:7680]], ar[rnd[7680:]] = 0, 1, 2
+        ar[rnd[:6400]], ar[rnd[6400:6528]], ar[rnd[6528:]] = 0, 1, 2
         worst_rand.append(max(p["max_abs_rate_diff"] for p in
                               sp.balance_report(st, ar, ["test", "val", "train"])["pairs"].values()))
         if seed == 0:
-            check("đúng cỡ 6400/1280/12800", np.bincount(a).tolist() == sizes)
-    check("cân bằng nhãn: max|Δ tỉ lệ dương| ≤ 0.002 ở cả 8 seed (cỡ thật)", max(worst) <= 0.002,
+            check("đúng cỡ 6400/128/12800", np.bincount(a).tolist() == sizes)
+    check("cân bằng nhãn: train~test ≤ 0.002 · cặp có val (128 mẫu) ≤ 1/128 ở cả 8 seed (cỡ thật)", max(worst) <= 1 / 128 and all(ok_pairs),
           f"tệ nhất {max(worst):.4f}")
     check("tốt hơn chia ngẫu nhiên ≥ 5 lần", np.mean(worst_rand) / max(np.mean(worst), 1e-9) >= 5,
           f"ngẫu nhiên TB {np.mean(worst_rand):.4f} vs {np.mean(worst):.4f}")
-    check("hình dạng phân phối: JS hồ sơ nhãn & cardinality ≤ 1e-4",
-          max(max(p["js_label_profile"], p["js_cardinality"]) for p in r["pairs"].values()) <= 1e-4)
-    check("hồ sơ prevalence: Pearson ≥ 0.9999 giữa mọi cặp tập",
-          min(p["pearson_label_profile"] for p in r["pairs"].values()) >= 0.9999)
+    check("hình dạng phân phối: JS hồ sơ nhãn & cardinality ≤ ngưỡng theo cặp (val: 0.06/128)",
+          all(max(p["js_label_profile"], p["js_cardinality"]) <= p["tol_js"] for p in r["pairs"].values()))
+    check("hồ sơ prevalence: Pearson ≥ 0.999 giữa mọi cặp tập",
+          min(p["pearson_label_profile"] for p in r["pairs"].values()) >= 0.999)
     st0 = fake_states(N, 0)
     order = np.argsort(-(st0[:, 13] == 1).astype(int), kind="stable")      # cố tình lệch: dồn "No Finding" vào tập 1
     ab = np.full(N, 2)
-    ab[order[:6400]], ab[order[6400:7680]] = 1, 0
+    ab[order[:6400]], ab[order[6400:6528]] = 1, 0
     check("balance_report phát hiện split lệch", not sp.balance_report(st0, ab, ["a", "b", "c"])["ok"])
 
     # ── audit 1 bệnh nhân – 1 mẫu ──
@@ -120,13 +121,22 @@ def main() -> int:
             check("thiếu patient (cần 2500 > 1500) ⇒ DỪNG", False)
         except RuntimeError as e:
             check("thiếu patient (cần 2500 > 1500) ⇒ DỪNG", "patient" in str(e))
+        # ép split lệch (dồn mẫu có nhãn dương nhiều vào test) ⇒ kiểm tra enforce thật sự DỪNG
+        _orig_s, _orig_r = sp.stratified_split, sp.refine_swaps
+        def _skew(M, sizes, seed):
+            order = np.argsort(-np.asarray(M)[:, :14].sum(1), kind="stable")
+            a_ = np.full(len(M), 2); a_[order[:sizes[0]]] = 0; a_[order[sizes[0]:sizes[0] + sizes[1]]] = 1
+            return a_
+        sp.stratified_split = _skew
         try:
             sp.build_balanced_split(Cfg({"data": {"n_train": 800, "n_val": 100, "n_test": 400, "key_column": "img_rel",
-                                                  "cache_dir": td}, "split_balance": {"max_abs_rate_diff": 1e-9, "enforce": True}}),
+                                                  "cache_dir": td}, "split_balance": {"max_abs_rate_diff": 0.002, "enforce": True}}),
                                     Path(td) / "s4", seed=7, meta=meta, labeler=labeler)
-            check("ngưỡng cân bằng không đạt + enforce ⇒ DỪNG", False)
+            check("split lệch + enforce ⇒ DỪNG", False)
         except RuntimeError as e:
-            check("ngưỡng cân bằng không đạt + enforce ⇒ DỪNG", "KHÔNG đạt" in str(e))
+            check("split lệch + enforce ⇒ DỪNG", "KHÔNG đạt" in str(e))
+        finally:
+            sp.stratified_split = _orig_s
 
     badn = OK.count(False)
     print(f"\n{'✓ TẤT CẢ' if not badn else '✗ HỎNG'} {len(OK) - badn}/{len(OK)}")

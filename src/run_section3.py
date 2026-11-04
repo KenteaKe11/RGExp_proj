@@ -1,10 +1,12 @@
 """§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.0|3.1
 
-    3.0  Data: split MỚI cân bằng nhãn · 1 bệnh nhân – 1 mẫu (train 12800 · val 1280 · test 6400), manifest + ảnh,
+    3.0  Data: split MỚI cân bằng nhãn · 1 bệnh nhân – 1 mẫu (train 12800 · val 128 · test 6400), manifest + ảnh,
          báo cáo cân bằng (BALANCE.md). Không train, không infer.
-    3.1  So sánh các cặp (c, E) ∈ {(1,4),(2,4),(1,6),(2,6),(a,4),(a,6)} + Baseline (Gemma 3 gốc).
+    3.1  4 candidate + Baseline: 3 arm E=4 — (c,E) ∈ {(1,4),(2,4),(a,4)} — rồi arm cuối là E=6 của cấu hình TỐT NHẤT
+         trong 3 arm E4 (hạng lâm sàng TB, hoà ⇒ hạng văn bản; hoặc `exp31.followup.from` do bạn chỉ định).
          c là số ⇒ Expert-Choice, mỗi expert chọn k=⌈c·N/E⌉ token; a ⇒ Adaptive Capacity k_i=⌈max(N/E, e^{H_i})⌉.
-         Tiêu chí: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ.
+         Hai giai đoạn trong MỘT lệnh: (1) E4 + Baseline; (2) chọn tốt nhất ⇒ thêm arm E6 ⇒ báo cáo cuối.
+         Tiêu chí: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ · Friedman + hậu kiểm.
     (các exp sau 3.1: chưa thiết lập; exp 3.1/3.2/3.4 cũ ở _archive/section3_v3/)
 
 Stage (3.1): data → train → infer → score → stats → analysis → report → push.
@@ -81,10 +83,12 @@ def _adaptive_arm(E: int) -> dict:
 
 
 def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]:
+    """Arm KHAI TRƯỚC: các arm E4 + Baseline. Arm E6 (theo cấu hình tốt nhất của E4) chỉ biết sau khi E4 có điểm
+    ⇒ `info["followup"]` là đặc tả để `resolve_followup` dựng sau."""
     if exp != "3.1":
         raise ValueError(f"--exp phải là 3.0|3.1, nhận {exp!r} (các exp sau 3.1 chưa được thiết lập)")
     e31 = cfg.get("exp31") or {}
-    pairs = e31.get("pairs") or [[1, 4], [2, 4], [1, 6], [2, 6], ["a", 4], ["a", 6]]
+    pairs = e31.get("pairs") or [[1, 4], [2, 4], ["a", 4]]
     arms: list[dict] = []
     for c, E in pairs:
         E = int(E)
@@ -100,9 +104,51 @@ def build_arms(cfg: Cfg, exp: str, dry: bool = False) -> tuple[list[dict], dict]
     if bool(e31.get("baseline", True)):
         arms.append({"id": "baseline_infer", "name": "Baseline · Gemma 3 gốc", "kind": "infer",
                      "runner": "gemma3"})
+    spec = None
+    fu = e31.get("followup")
+    if fu:
+        spec = {"E": int(fu.get("E", 6)), "from": fu.get("from")}
+        if any(x.get("E") == spec["E"] for x in arms if x["kind"] == "ft"):
+            raise ValueError(f"followup.E={spec['E']} trùng E của một arm E4 trong exp31.pairs")
+        if spec["from"] and spec["from"] not in {x["id"] for x in arms}:
+            raise ValueError(f"exp31.followup.from={spec['from']!r} không phải arm nào trong {[x['id'] for x in arms]}")
     if len({x["id"] for x in arms}) != len(arms):
         raise ValueError("exp31.pairs có arm trùng id")
-    return arms, {}
+    return arms, {"followup": spec}
+
+
+def followup_arm(src: dict, E: int) -> dict:
+    """Arm E mới cùng loại capacity với `src` (cùng c hoặc cùng adaptive)."""
+    arm = _adaptive_arm(E) if src.get("adaptive") else _moe_arm(float(src["c"]), E)
+    arm["followup_of"] = src["id"]
+    return arm
+
+
+def resolve_followup(cfg: Cfg, arms: list[dict], spec: dict, run_dir: Path, hub, sub: str) -> tuple[dict | None, dict | None]:
+    """Chọn cấu hình tốt nhất trong các arm E4 rồi dựng arm E6 tương ứng.
+
+    `spec['from']` (người dùng chỉ định) thắng quy tắc tự động. Ngược lại cần điểm per-sample của MỌI arm E4 (cục bộ hoặc
+    Hub); thiếu một arm ⇒ (None, None) = chưa quyết định được. Quy tắc: `pick_best` (hạng lâm sàng TB, hoà ⇒ hạng văn bản)."""
+    cands = [x for x in arms if x["kind"] == "ft"]
+    if spec.get("from"):
+        src = next(x for x in cands if x["id"] == spec["from"])
+        return followup_arm(src, spec["E"]), {"from": src["id"], "rule": "người dùng chỉ định (exp31.followup.from)",
+                                              "table": []}
+    scores: dict[str, pd.DataFrame] = {}
+    for x in cands:
+        csv = run_dir / "metrics" / f"per_sample_{x['id']}.csv"
+        if not csv.exists():
+            hub.pull_file(f"{sub}/metrics/per_sample_{x['id']}.csv", csv)
+        if csv.exists():
+            scores[x["id"]] = pd.read_csv(csv)
+    if len(scores) < len(cands):
+        return None, None
+    from .stats_multi import align_blocks
+    scores, _ = align_blocks(scores, key_col="key")
+    best = pick_best(cfg, scores, cands, {x["id"]: x["name"] for x in cands})
+    src = next(x for x in cands if x["id"] == best["arm"])
+    return followup_arm(src, spec["E"]), {"from": src["id"], "rule": best["rule"], "table": best["table"],
+                                          "clinical_rank": best["clinical_rank"], "text_rank": best["text_rank"]}
 
 
 def pow2_ladder(cap: int) -> list[int]:
@@ -166,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-hub", action="store_true", help="không quét/kéo từ Hub")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--no-phase1", action="store_true", help=argparse.SUPPRESS)   # nội bộ: giai đoạn 2 không được lặp lại giai đoạn 1
+    argv_in = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(argv)
 
     clear_vram("khởi động §3")
@@ -208,26 +256,54 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ stage không biết: {bad} (hợp lệ: {', '.join(STAGES)})")
         return 2
     try:
-        arms, _ = build_arms(cfg, exp, dry)
+        arms, binfo = build_arms(cfg, exp, dry)
     except ValueError as e:
         print(f"✗ {e}")
         return 2
+    spec = binfo.get("followup")
+    run_id = a.run_id or sub
+    run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
+    from .s3_hub import Hub
+    hub = Hub(cfg, enabled=not dry and not a.no_hub)
+    e6_info, pending = None, False
+    if spec:
+        e6, e6_info = resolve_followup(cfg, arms, spec, run_dir, hub, sub)
+        if e6 is None:
+            pending = True
+        else:
+            at = next((i for i, x in enumerate(arms) if x["kind"] == "infer"), len(arms))
+            arms.insert(at, e6)                 # E4 ... E6, rồi Baseline
+            print(f"⚙ arm E{spec['E']}: {e6['id']} = E{spec['E']} của cấu hình tốt nhất trong các arm E4 "
+                  f"→ `{e6_info['from']}` ({e6_info['rule']})", flush=True)
+    if pending and not a.arms and not a.no_phase1 and any(x in stages for x in ("train", "infer", "score")):
+        ids = [x["id"] for x in arms]
+        print(f"⚙ GIAI ĐOẠN 1/2: {', '.join(ids)} (chưa biết cấu hình E4 tốt nhất ⇒ chưa dựng arm E{spec['E']}).", flush=True)
+        rc = main(argv_in + ["--arms", ",".join(ids)])
+        if rc != 0:
+            return rc
+        print(f"⚙ GIAI ĐOẠN 2/2: chọn cấu hình E4 tốt nhất ⇒ arm E{spec['E']} ⇒ báo cáo cuối.", flush=True)
+        argv2 = [x for x in argv_in if x not in ("--retrain", "--rescore")] + ["--no-phase1"]
+        return main(argv2)
     all_ids = [x["id"] for x in arms]
     partial = False
     if a.arms:
         want = {x.strip() for x in a.arms.split(",") if x.strip()}
         unknown = sorted(want - set(all_ids))
         if unknown:
-            print(f"✗ --arms có arm không tồn tại: {unknown} (hợp lệ: {', '.join(all_ids)})")
+            print(f"✗ --arms có arm không tồn tại: {unknown} (hợp lệ: {', '.join(all_ids)}"
+                  + (f"; arm E{spec['E']} chỉ có sau khi các arm E4 có điểm" if pending else "") + ")")
             return 2
         arms = [x for x in arms if x["id"] in want]
-        partial = len(arms) < len(all_ids)
+    partial = bool(a.arms) and (len(arms) < len(all_ids) or pending)
+    if pending and not a.arms:
+        partial = True
+        print(f"⚠ arm E{spec['E']} chưa dựng được (các arm E4 chưa đủ điểm) ⇒ không có báo cáo cuối lần này.", flush=True)
     if not arms:
         print("✗ không arm nào")
         return 2
     if partial:
         print(f"⚙ CHẠY RIÊNG {len(arms)}/{len(all_ids)} arm ({', '.join(x['id'] for x in arms)}): chỉ sinh "
-              "báo cáo CON của từng arm; không có kiểm định ghép cặp / xếp hạng / báo cáo cuối "
+              "báo cáo CON của từng arm; không có kiểm định Friedman / xếp hạng / báo cáo cuối "
               "(chạy lại không kèm --arms khi mọi arm đã có báo cáo con).", flush=True)
 
     from . import imaging
@@ -237,9 +313,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ DỪNG — chính sách ảnh:\n    {e}")
         return 2
 
-    run_id = a.run_id or sub
-    run_dir = Path(cfg["output"].get("dir", "./runs")) / run_id
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    if e6_info:                          # ghi lại QUYẾT ĐỊNH chọn cấu hình cho arm E6 (kiểm lại được, không phải ngầm)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "e6_choice.json").write_text(json.dumps(e6_info, indent=2, ensure_ascii=False), encoding="utf-8")
     mdir = run_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
     adapter_root = Path(cfg["output"]["adapter_dir"])
@@ -260,13 +337,11 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {"run_id": run_id, "experiment": exp,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config": resolved_snapshot(cfg), "stages_run": stages, "arms_declared": declared,
-                "arm_status": {}, "decode": "greedy", "note": manifest_note}
+                "arm_status": {}, "decode": "greedy", "note": manifest_note, "followup": e6_info}
     t_start = time.time()
     print(f"\n═══ §{exp} — {' · '.join(declared)} ═══", flush=True)
 
     ft_arms = [x for x in arms if x["kind"] == "ft"]
-    from .s3_hub import Hub
-    hub = Hub(cfg, enabled=not dry and not a.no_hub)
     n_need = int(cfg["data"].get("n_test") or 1)
     if a.retrain:      # train lại ⇒ bỏ kết quả cũ của arm (runner sẽ resume nếu giữ predictions)
         for arm in arms:

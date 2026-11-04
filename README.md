@@ -24,16 +24,16 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 
 ## Chính sách thí nghiệm
 
-- Train / val / test = **12800 / 1280 / 6400** mẫu. Cả ba tập: (1) tỉ lệ nhãn dương xấp xỉ nhau, (2) hình dạng phân phối nhãn tương tự nhau, (3) **1 bệnh nhân – 1 mẫu** (không patient nào lặp, kể cả giữa các tập). Cách chia và kiểm: `src/s3_split.py` (iterative stratification + hoán đổi), báo cáo ở `runs/3.0_data_v4/DATA_REPORT.md`.
+- Train / val / test = **12800 / 128 / 6400** mẫu. Cả ba tập: (1) tỉ lệ nhãn dương xấp xỉ nhau, (2) hình dạng phân phối nhãn tương tự nhau, (3) **1 bệnh nhân – 1 mẫu** (không patient nào lặp, kể cả giữa các tập). Cách chia và kiểm: `src/s3_split.py` (iterative stratification + hoán đổi), báo cáo ở `runs/3.0_data_v4/DATA_REPORT.md`.
 - Test 6400 mẫu, **4 tập bootstrap × 6400 mẫu** (lấy có hoàn lại) cho bảng điểm.
-- **Kiểm định = Friedman**: với mỗi metric (text + clinical), xếp hạng 7 arm trong từng ảnh test (khối = 6400 ảnh), hiệu chỉnh ties, xấp xỉ F Iman-Davenport, Holm trên các metric; **hậu kiểm có cổng** chỉ trên metric đã bác H0: mọi cặp arm bằng Wilcoxon ghép cặp + Holm toàn cục, kết luận cần thêm effect size (rank-biserial ≥ 0.10). Báo thêm Kendall W (effect size tổng thể).
+- **Kiểm định = Friedman**: với mỗi metric (text + clinical), xếp hạng các arm (4 candidate + Baseline) trong từng ảnh test (khối = 6400 ảnh), hiệu chỉnh ties, xấp xỉ F Iman-Davenport, Holm trên các metric; **hậu kiểm có cổng** chỉ trên metric đã bác H0: mọi cặp arm bằng Wilcoxon ghép cặp + Holm toàn cục, kết luận cần thêm effect size (rank-biserial ≥ 0.10). Báo thêm Kendall W (effect size tổng thể).
 
 ## Thí nghiệm
 
 | Mục | Làm gì |
 |---|---|
 | 3.0 | **Data**: split mới cân bằng nhãn, 1 bệnh nhân – 1 mẫu; tải ảnh, manifest, kiểm độc lập, báo cáo cân bằng. Không train. |
-| 3.1 | So sánh (c, E): **(1,4) (2,4) (1,6) (2,6) (a,4) (a,6)** + **Baseline** (Gemma 3 gốc). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉ (E là siêu tham số duy nhất). |
+| 3.1 | 4 candidate + **Baseline** (Gemma 3 gốc): 3 arm **E=4** — **(1,4) (2,4) (a,4)** — rồi arm cuối là **E=6 của cấu hình tốt nhất trong 3 arm E4** (hạng lâm sàng TB, hoà ⇒ hạng văn bản; muốn tự chỉ định: `--set exp31.followup.from=<id>`). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉. Một lệnh chạy hai giai đoạn: (1) E4 + Baseline; (2) chọn tốt nhất ⇒ thêm arm E6 ⇒ báo cáo cuối (quyết định lưu ở `e6_choice.json`). |
 
 Tiêu chí 3.1: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
 
@@ -45,8 +45,8 @@ Tiêu chí 3.1: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** 
 export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.0                 # data mới (chạy trước)
-bash scripts/run_section3.sh --exp 3.1                 # 6 candidate + Baseline
-bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id: c1_e4 c2_e4 c1_e6 c2_e6 ac_e4 ac_e6 baseline_infer)
+bash scripts/run_section3.sh --exp 3.1                 # E4 ×3 + Baseline → chọn tốt nhất → arm E6 → báo cáo cuối
+bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id: c1_e4 c2_e4 ac_e4 baseline_infer, arm E6 là `<tốt nhất>_e6`: c1_e6 | c2_e6 | ac_e6)
 ```
 
 | Cờ | Tác dụng |

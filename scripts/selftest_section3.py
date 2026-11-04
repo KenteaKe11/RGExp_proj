@@ -30,33 +30,73 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         cfg["output"]["dir"] = td
         # 3.1
-        a1, _ = build_arms(cfg, "3.1")
+        a1, binfo = build_arms(cfg, "3.1")
         ids = [x["id"] for x in a1]
-        check("3.1: 7 arm theo thứ tự (1,4) (2,4) (1,6) (2,6) (a,4) (a,6) + Baseline",
-              ids == ["c1_e4", "c2_e4", "c1_e6", "c2_e6", "ac_e4", "ac_e6", "baseline_infer"], str(ids))
+        check("3.1: arm khai trước = 3 arm E4 (1,4) (2,4) (a,4) + Baseline; arm E6 để sau",
+              ids == ["c1_e4", "c2_e4", "ac_e4", "baseline_infer"] and binfo["followup"] == {"E": 6, "from": None}, str(ids))
         fixed = [x for x in a1 if x["kind"] == "ft" and not x.get("adaptive")]
         ada = [x for x in a1 if x.get("adaptive")]
-        check("3.1: c số ⇒ capacity cố định k=⌈c·N/E⌉ (c=1,2); c=a ⇒ Adaptive Capacity (E=4,6)",
-              [(x["c"], x["E"]) for x in fixed] == [(1.0, 4), (2.0, 4), (1.0, 6), (2.0, 6)]
-              and [(x["E"], x["decoder"]) for x in ada] == [(4, "moe"), (6, "moe")]
+        check("3.1: c số ⇒ capacity cố định k=⌈c·N/E⌉ (c=1,2) E=4; c=a ⇒ Adaptive Capacity E=4",
+              [(x["c"], x["E"]) for x in fixed] == [(1.0, 4), (2.0, 4)]
+              and [(x["E"], x["decoder"]) for x in ada] == [(4, "moe")]
               and all("pretrain" not in x and "top_k" not in x for x in a1))
         check("3.1: Baseline = Gemma gốc, kind=infer (không train)",
               a1[-1]["kind"] == "infer" and a1[-1]["runner"] == "gemma3")
+
+        # ── arm E6 = E6 của cấu hình tốt nhất trong 3 arm E4 ──
+        from src import run_section3 as rs
+        rng_ = np.random.default_rng(3)
+
+        def put(run_dir, id_, off):
+            (run_dir / "metrics").mkdir(parents=True, exist_ok=True)
+            n_ = 60
+            pd_ = __import__("pandas")
+            pd_.DataFrame({"key": [f"k{i}" for i in range(n_)], "chexbert_f1": rng_.random(n_) * 0.05 + off,
+                           "radgraph_f1_entity": rng_.random(n_) * 0.05 + off, "bleu1": rng_.random(n_) * 0.05 + off}
+                          ).to_csv(run_dir / "metrics" / f"per_sample_{id_}.csv", index=False)
+
+        class NoHub:
+            def pull_file(self, *a_, **k_):
+                return False
+
+        spec = binfo["followup"]
+        for winner, want_id, want_c, want_ad in (("ac_e4", "ac_e6", 1.0, True), ("c2_e4", "c2_e6", 2.0, False),
+                                                 ("c1_e4", "c1_e6", 1.0, False)):
+            rd_ = Path(td) / f"fu_{winner}"
+            for x in a1[:3]:
+                put(rd_, x["id"], 0.30 if x["id"] == winner else 0.10)
+            e6, info = rs.resolve_followup(cfg, a1, spec, rd_, NoHub(), "sub")
+            check(f"arm E6: E4 tốt nhất = {winner} ⇒ {want_id} (E=6, cùng capacity)",
+                  e6 is not None and e6["id"] == want_id and e6["E"] == 6 and e6["c"] == want_c
+                  and bool(e6.get("adaptive")) == want_ad and info["from"] == winner and e6["followup_of"] == winner,
+                  str(e6 and e6["id"]))
+        rd_ = Path(td) / "fu_missing"
+        for x in a1[:2]:
+            put(rd_, x["id"], 0.2)
+        check("arm E6: thiếu điểm của một arm E4 ⇒ chưa quyết định (None)",
+              rs.resolve_followup(cfg, a1, spec, rd_, NoHub(), "sub") == (None, None))
+        e6, info = rs.resolve_followup(cfg, a1, {"E": 6, "from": "c2_e4"}, Path(td) / "fu_none", NoHub(), "sub")
+        check("arm E6: người dùng chỉ định followup.from thắng quy tắc tự động (không cần điểm)",
+              e6["id"] == "c2_e6" and "chỉ định" in info["rule"])
+        try:
+            build_arms(Cfg({**dict(cfg), "exp31": {"pairs": [[1, 4], [2, 6]], "followup": {"E": 6}}}), "3.1")
+            check("followup.E trùng E của arm E4 ⇒ DỪNG", False)
+        except ValueError:
+            check("followup.E trùng E của arm E4 ⇒ DỪNG", True)
         for old in ("3.2", "3.3", "3.4", "3.1-1", "3.1-2"):
             try:
                 build_arms(cfg, old)
                 check(f"{old} đã bị gỡ (chưa thiết lập)", False)
             except ValueError:
                 check(f"{old} đã bị gỡ (chưa thiết lập)", True)
-        from src import run_section3 as rs
         check("thư mục kết quả/adapter v4 (Hub không tái dùng kết quả v3 chạy trên data khác)",
               rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_e_vs_baseline_v4"}
               and rs.ADAPTER == {"3.1": "./adapters_3_1_v4"})
 
         # ── chính sách thí nghiệm ──
         d_, st_ = cfg["data"], cfg["stats"]
-        check("data: train 12800 · val 1280 · test 6400, split MỚI (không split_ref/ cũ)",
-              (d_["n_train"], d_["n_val"], d_["n_test"]) == (12800, 1280, 6400)
+        check("data: train 12800 · val 128 · test 6400, split MỚI (không split_ref/ cũ)",
+              (d_["n_train"], d_["n_val"], d_["n_test"]) == (12800, 128, 6400)
               and "split_ref/" not in str(d_["train_split_csv"]) and "split_ref/" not in str(d_["split_csv"])
               and str(d_["split_hub_dir"]).endswith("v4"))
         check("bootstrap: 4 tập × 6400 mẫu (lấy có hoàn lại) cho bảng điểm, 4 seed khác nhau",
@@ -67,7 +107,7 @@ def main() -> int:
         check("infer greedy", cfg["generate"]["do_sample"] is False and cfg["generate"]["num_beams"] == 1)
         check("cân bằng nhãn bắt buộc (enforce) trong cấu hình split",
               bool(cfg["split_balance"]["enforce"]) and cfg["split_balance"]["max_abs_rate_diff"] <= 0.005)
-        mc = model_cfg(cfg, a1[4], Path("ad"))
+        mc = model_cfg(cfg, a1[2], Path("ad"))
         check("model_cfg: runner gemma3_ec + adapter_dir", mc["runner"] == "gemma3_ec"
               and str(mc["adapter_dir"]).endswith("ac_e4"))
         check("model_cfg: baseline dùng runner gemma3", model_cfg(cfg, a1[-1], Path("ad"))["runner"] == "gemma3")

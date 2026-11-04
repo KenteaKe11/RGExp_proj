@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # §3 — Cls head · EC-Router (Expert-Choice) · MoE-DoRA   (không Mentor, không pretrain)
 # ═══════════════════════════════════════════════════════════════════════════
-#   3.0  Data: split MỚI cân bằng nhãn, 1 bệnh nhân – 1 mẫu (train 12800 · val 1280 · test 6400)
-#   3.1  So sánh các cặp (c, E): (1,4) (2,4) (1,6) (2,6) (a,4) (a,6) + Baseline
+#   3.0  Data: split MỚI cân bằng nhãn, 1 bệnh nhân – 1 mẫu (train 12800 · val 128 · test 6400)
+#   3.1  4 candidate + Baseline: (1,4) (2,4) (a,4), rồi E=6 của cấu hình tốt nhất trong 3 arm E4
 #          c = số: mỗi expert chọn k = ⌈c·N/E⌉ token · a = Adaptive Capacity k_i = ⌈max(N/E, e^H_i)⌉
 #          tiêu chí: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ
 #   (các exp sau 3.1: CHƯA thiết lập. Các exp 3.1/3.2/3.4 cũ nằm ở _archive/section3_v3/)
@@ -46,13 +46,14 @@ data:
   train_split_csv: train_split.csv
   n_train: 12800
   val_split_csv: val_split.csv
-  n_val: 1280                          # 10% train; đủ để vài bệnh hiếm còn ≥ ~20 ca dương
+  n_val: 128                           # nhỏ để mỗi lần val (greedy generate) rẻ: 128 mẫu ≈ 4 batch
   assert_no_leak: true
 
 # Cân bằng nhãn giữa train/val/test (đo trên nhãn CheXbert dương = positive|uncertain, 14 bệnh).
 split_balance:
   max_abs_rate_diff: 0.002             # |Δ tỉ lệ dương| lớn nhất của mọi bệnh giữa hai tập bất kỳ
   max_js: 0.0001                       # JS-divergence (bit) của hồ sơ prevalence và của phân phối cardinality
+  # (cặp có tập val 128 mẫu bị chặn bởi bước 1/128 ⇒ ngưỡng của cặp đó tự nới lên max(ngưỡng, 1/n) và max(ngưỡng JS, 0.06/n); train~test giữ nguyên)
   enforce: true                        # không đạt ⇒ DỪNG (không âm thầm dùng split lệch)
 
 image_policy:
@@ -160,7 +161,8 @@ validation:
 # ── lưới thí nghiệm ────────────────────────────────────────────────────────
 # 3.1: các cặp (c, E) theo thứ tự khai báo; c là số (k = ⌈c·N/E⌉) hoặc "a" (Adaptive Capacity) + Baseline.
 exp31:
-  pairs: [[1, 4], [2, 4], [1, 6], [2, 6], [a, 4], [a, 6]]
+  pairs: [[1, 4], [2, 4], [a, 4]]       # 3 arm E4: c=1, c=2, a (Adaptive Capacity)
+  followup: {E: 6, from: null}          # arm cuối: E6 của cấu hình TỐT NHẤT trong 3 arm E4 (from: <id arm> để tự chỉ định)
   baseline: true                        # Baseline = Gemma 3 gốc (không huấn luyện), greedy
 
 analysis:
@@ -184,7 +186,7 @@ selection:
   tie_tol: 0.0                  # hạng lâm sàng chênh ≤ tie_tol coi là ngang nhau
 
 stats:
-  # Kiểm định = FRIEDMAN. (1) Tổng thể: với MỖI metric, 7 arm được xếp hạng trong từng ảnh test (khối = 6400 ảnh,
+  # Kiểm định = FRIEDMAN. (1) Tổng thể: với MỖI metric, các arm (3 E4 + E6 + Baseline) được xếp hạng trong từng ảnh test (khối = 6400 ảnh,
   # hiệu chỉnh ties, xấp xỉ F Iman-Davenport, Holm trên các metric). (2) Hậu kiểm (protected): chỉ trên metric đã
   # bác H0, mọi cặp arm bằng Wilcoxon ghép cặp + Holm toàn cục; kết luận cần thêm effect size (rank-biserial) vượt sàn.
   alpha: 0.05

@@ -2,7 +2,7 @@
 
 Việc làm (không train, không infer):
   1. `ensure_splits`: dùng split cục bộ → pull từ Hub (`data.split_hub_dir`) → hoặc TẠO MỚI cân bằng nhãn
-     (`s3_split.build_balanced_split`) rồi đẩy lên Hub. Train 12800 · val 1280 · test 6400, 1 bệnh nhân – 1 mẫu.
+     (`s3_split.build_balanced_split`) rồi đẩy lên Hub. Train 12800 · val 128 · test 6400, 1 bệnh nhân – 1 mẫu.
   2. Tải + resize ảnh, ghi manifest testset/trainset/valset.jsonl, kiểm rò rỉ train ∩ test.
   3. KIỂM LẠI độc lập trên chính các manifest vừa ghi (không tin báo cáo lúc chia):
        · mỗi patient đúng một ảnh trong TOÀN BỘ ba tập, ba tập không giao patient;
@@ -117,7 +117,7 @@ def run_data(cfg, *, dry: bool = False, no_hub: bool = False, no_push: bool = Fa
     verdict = size_ok and one["ok"] and rep["ok"]
     md = [f"# Exp 3.0 — Data mới cho §3{' (DRY-RUN)' if dry else ''}", "",
           "## Chính sách", "",
-          "- Train 12800 · val 1280 · test 6400 mẫu (test dùng cho 4 tập bootstrap × 6400 mẫu lấy có hoàn lại).",
+          "- Train 12800 · val 128 · test 6400 mẫu (test dùng cho 4 tập bootstrap × 6400 mẫu lấy có hoàn lại).",
           "- Cả ba tập: (1) tỉ lệ nhãn dương xấp xỉ nhau; (2) hình dạng phân phối nhãn tương tự nhau; "
           "(3) 1 bệnh nhân – 1 mẫu.",
           "- Cách chia: mỗi patient bốc ngẫu nhiên 1 ảnh → bốc ngẫu nhiên đủ patient → gán nhãn CheXbert cho pool → "

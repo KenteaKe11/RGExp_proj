@@ -16,9 +16,9 @@ from .report_common import score_table, summarise
 from .report_common import tbl as _tbl
 
 QUESTIONS = {
-    "3.1": "Trong các cặp (c, E) ∈ {(1,4) (2,4) (1,6) (2,6) (a,4) (a,6)} — Expert-Choice, mỗi expert DoRA chọn "
-           "k = ⌈c·N/E⌉ token (c = a: Adaptive Capacity) — cặp nào tốt nhất so với nhau và so với Baseline (Gemma 3 gốc), "
-           "xét theo text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.1": "Trong ba cấu hình E=4 — (c=1), (c=2), (c=a: Adaptive Capacity) — cấu hình nào tốt nhất; E=6 có cải thiện cấu hình tốt nhất đó "
+           "không; và tất cả so với Baseline (Gemma 3 gốc) thế nào, xét theo text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? "
+           "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
 }
 
 
@@ -216,6 +216,11 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
             f" → c = {('a' if c == 'a' else format(float(c), 'g'))}, E = {best['E']}"
         out.append(f"- **Xếp hạng #1 theo hạng trung bình (gợi ý, chưa qua kiểm định):** arm `{best['arm']}` — hạng lâm sàng TB "
                    f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f}{cfgtxt} (`best.json`).")
+    fu = manifest.get("followup")
+    if fu:
+        e6 = next((a for a in arms if a.get("followup_of")), None)
+        out.append(f"- **Arm E6:** `{e6['id'] if e6 else '?'}` = E6 của cấu hình tốt nhất trong các arm E4 → `{fu['from']}` "
+                   f"(quy tắc: {fu['rule']}; chi tiết `e6_choice.json`).")
     ver = {a["id"]: manifest.get("arm_status", {}).get(a["id"], {}).get("route_verdict") for a in arms}
     ver = {k: v for k, v in ver.items() if v}
     if ver:
@@ -299,7 +304,7 @@ def friedman_section(fr: pd.DataFrame, ph: pd.DataFrame, names: dict, cfg, n_eva
         return "\n".join(A)
     gated = [m for m in fr["metric"] if m in set(ph["metric"])]
     n_sig, n_mat = int(ph["significant"].sum()), int(ph["significant_and_material"].sum())
-    A += [f"Hậu kiểm: {len(ph)} cặp×metric ({k * (k - 1) // 2} cặp mỗi metric đã bác H0), Wilcoxon ghép cặp "
+    A += [f"Hậu kiểm: {len(ph)} kiểm định = {k * (k - 1) // 2} cặp × {len(gated)} metric đã bác H0, Wilcoxon ghép cặp "
           f"(`zero_method={st.get('zero_method', 'pratt')}`), Holm toàn cục; hiệu số **Δ = A − B**. "
           f"**{n_sig}** đạt ý nghĩa thống kê, **{n_mat}** trong số đó đáng kể.", ""]
     for m in sorted(gated, key=lambda x: (x != primary, gated.index(x))):
@@ -389,7 +394,9 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, fr: pd.Da
               "- Cls head nhân quả đọc hidden cuối của decoder ở mọi vị trí (suy luận: vị trí cuối báo cáo), huấn luyện cùng lúc (không pretrain, không đóng băng).",
               "- Baseline là Gemma 3 gốc (không huấn luyện, greedy, cùng prompt/ảnh/tập test).",
               "- c = a (Adaptive Capacity): k_i = ⌈max(N/E, e^{H_i})⌉ với H_i là entropy của softmax nhân quả theo token của expert i; E là siêu tham số duy nhất.",
-              "- Data (exp 3.0): train 12800 · val 1280 · test 6400, 1 bệnh nhân – 1 mẫu, nhãn dương cân bằng giữa ba tập (xem `3.0_data_v4/DATA_REPORT.md`). "
+              "- Arm cuối (E6) được chọn SAU khi ba arm E4 có điểm: lấy cấu hình (c hoặc adaptive) có hạng lâm sàng TB tốt nhất, hoà ⇒ hạng văn bản; "
+              "Friedman + hậu kiểm bao gồm cả arm này nên lựa chọn đó dựa trên cùng tập test (một nguồn lạc quan nhẹ cho arm được chọn).",
+              "- Data (exp 3.0): train 12800 · val 128 · test 6400, 1 bệnh nhân – 1 mẫu, nhãn dương cân bằng giữa ba tập (xem `3.0_data_v4/DATA_REPORT.md`). "
               "Train 400 bước × batch 32, val mỗi 40 bước, patience 3; 4 tập bootstrap × 6400 mẫu.", ""]
     path = run_dir / "REPORT.md"
     path.write_text("\n".join(parts), encoding="utf-8")

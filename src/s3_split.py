@@ -183,8 +183,13 @@ def balance_report(states: np.ndarray, assign: np.ndarray, names: list[str] = SP
                  "js_cardinality": _js(ca, cb),
                  "pearson_label_profile": float(np.corrcoef(ra, rb)[0, 1]),
                  "spearman_label_profile": float(np.corrcoef(rk_a, rk_b)[0, 1])}
-            d["ok"] = bool(d["max_abs_rate_diff"] <= tol_rate and d["js_label_profile"] <= tol_js
-                           and d["js_cardinality"] <= tol_js)
+            # tập nhỏ (val 128 mẫu) bị chặn bởi bước lượng tử 1/n: sai lệch ≤ 1 ca là giới hạn vật lý ⇒ nới ngưỡng
+            # cho cặp có tập nhỏ theo n (cặp train~test vẫn giữ ngưỡng gốc).
+            nmin = min(per[names[a]]["n"], per[names[b]]["n"])
+            tr_pair, tj_pair = max(tol_rate, 1.0 / max(nmin, 1)), max(tol_js, 0.06 / max(nmin, 1))
+            d["tol_rate"], d["tol_js"] = tr_pair, tj_pair
+            d["ok"] = bool(d["max_abs_rate_diff"] <= tr_pair and d["js_label_profile"] <= tj_pair
+                           and d["js_cardinality"] <= tj_pair)
             ok &= d["ok"]
             pairs[f"{names[a]}~{names[b]}"] = d
     return {"splits": per, "pairs": pairs, "ok": bool(ok),
@@ -228,7 +233,7 @@ def build_balanced_split(cfg, out: Path, *, seed: int = 42, patient_col: str = "
     from .splits import load_meta_pid
 
     d = cfg.data
-    n_tr, n_va, n_te = int(d["n_train"]), int(d.get("n_val", 1280)), int(d["n_test"])
+    n_tr, n_va, n_te = int(d["n_train"]), int(d.get("n_val", 128)), int(d["n_test"])
     meta = load_meta_pid(cfg, patient_col) if meta is None else meta
     meta = meta.sample(frac=1.0, random_state=seed)
     one = meta.drop_duplicates("pid", keep="first").reset_index(drop=True)      # 1 patient – 1 mẫu (ngẫu nhiên)

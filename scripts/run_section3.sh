@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_section3.sh — họ §3: Cls head · EC-Router · MoE-DoRA.
 #   bash scripts/run_section3.sh --exp 3.0            # DATA mới: split cân bằng nhãn, 1 bệnh nhân – 1 mẫu (chạy trước)
-#   bash scripts/run_section3.sh --exp 3.1            # (c,E): (1,4) (2,4) (1,6) (2,6) (a,4) (a,6) + Baseline
+#   bash scripts/run_section3.sh --exp 3.1            # E4: (1,4) (2,4) (a,4) + Baseline → chọn tốt nhất → arm E6
 # Tùy chọn: --dry-run · --detach · --stages a,b · --arms id1,id2 · --retrain · --no-push · --no-wandb
 # Không còn pretrain; Cls head học cùng lúc. Hub được quét trước (--no-hub để tắt).
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ/trùng bệnh nhân · 5 data lệch cỡ/cân bằng · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu báo cáo con
