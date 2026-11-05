@@ -206,7 +206,7 @@ class Runner:
         planner = None
         if ladder:
             from ..batch_ladder import VramPlanner
-            planner = VramPlanner()
+            planner = VramPlanner(frac=float(self.mcfg.get("batch_probe_frac", 0.6)))
             planner.begin("trước infer")
             bs = ladder[0]
             print(f"  dò batch sinh: bắt đầu {bs} (hiệu chỉnh theo VRAM trống ở batch đầu)",
@@ -245,10 +245,17 @@ class Runner:
                                   f"{smaller[0]} và thử lại batch này.", flush=True)
                             del e
                             self._free()
+                            self._reset_compile_state()      # OOM giữa chừng làm hỏng đồ thị compile/CUDA graph
                             bs = smaller[0]
                             if planner is not None:
                                 planner.pending = False
                             continue
+                    # Lỗi KHÔNG phải OOM (vd AssertionError rỗng của torch.compile / CUDA graph sau một lần
+                    # OOM): thử MỘT lần chuyển sang eager rồi chạy lại đúng batch này, trước khi coi là hỏng.
+                    from ..backbone import is_oom as _is_oom
+                    if not _is_oom(e) and self._fallback_eager(e):
+                        del e
+                        continue
                     # Một batch hỏng (OOM, ảnh lỗi, prompt quá dài) KHÔNG được
                     # giết cả lần chạy. Thử lại từng ảnh một — phần lớn ca OOM
                     # là do batch, không do ảnh — rồi ghi chuỗi rỗng cho ảnh
@@ -429,6 +436,35 @@ class Runner:
                 "được gì — kiểm prompt/placeholder ảnh và chỗ cắt token đầu ra.")
         preview = out[0].strip().replace("\n", " ")[:160]
         print(f"  ✓ sinh thử OK: {preview}...", flush=True)
+
+    def _reset_compile_state(self) -> None:
+        """Xoá trạng thái torch.compile / CUDA graph (sau OOM chúng hay hỏng, lỗi sau đó là AssertionError rỗng)."""
+        try:
+            import torch._dynamo
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        try:
+            from torch._inductor import cudagraph_trees
+            cudagraph_trees.reset_cudagraph_trees()
+        except Exception:
+            pass
+
+    def _fallback_eager(self, exc: BaseException) -> bool:
+        """Tắt torch.compile (một lần) và báo True để thử lại batch; đã tắt rồi thì False."""
+        if getattr(self, "_compile_off", False):
+            return False
+        self._compile_off = True
+        print(f"  ⚙ {type(exc).__name__} khi sinh: tắt torch.compile → chạy eager và thử lại batch này "
+              f"(lỗi gốc: {str(exc)[:120] or 'không có thông điệp'})", flush=True)
+        self._reset_compile_state()
+        try:
+            if self.model is not None and getattr(self.model, "generation_config", None):
+                self.model.generation_config.disable_compile = True
+        except Exception:
+            pass
+        self._free()
+        return True
 
     def _report_error(self, exc: BaseException, key: str | None = None) -> None:
         """In lỗi MỘT lần cho mỗi loại, kèm cách sửa nếu nhận ra.
