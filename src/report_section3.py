@@ -16,9 +16,11 @@ from .report_common import score_table, summarise
 from .report_common import tbl as _tbl
 
 QUESTIONS = {
-    "3.1": "Trong ba cấu hình E=4 — (c=1), (c=2), (c=a: Adaptive Capacity) — cấu hình nào tốt nhất; E=6 có cải thiện cấu hình tốt nhất đó "
-           "không; và tất cả so với Baseline (Gemma 3 gốc) thế nào, xét theo text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? "
+    "3.1": "Ở E cố định, giá trị capacity c nào tốt nhất — (c=1), (c=2) hay (c=a: Adaptive Capacity) — và tất cả so với Baseline "
+           "(Gemma 3 gốc) thế nào, xét theo text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? "
            "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
+    "3.2": "Với c tốt nhất của 3.1, số expert E nào tốt nhất trong E ∈ {2, 4, 6}, và so với Baseline (Gemma 3 gốc) thế nào, xét theo "
+           "text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? Tăng E có làm các expert chuyên biệt hơn hay sụp đổ về một DoRA?",
 }
 
 
@@ -216,11 +218,11 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
             f" → c = {('a' if c == 'a' else format(float(c), 'g'))}, E = {best['E']}"
         out.append(f"- **Xếp hạng #1 theo hạng trung bình (gợi ý, chưa qua kiểm định):** arm `{best['arm']}` — hạng lâm sàng TB "
                    f"{best['clinical_rank']:.2f}, hạng văn bản TB {best['text_rank']:.2f}{cfgtxt} (`best.json`).")
-    fu = manifest.get("followup")
-    if fu:
-        e6 = next((a for a in arms if a.get("followup_of")), None)
-        out.append(f"- **Arm E6:** `{e6['id'] if e6 else '?'}` = E6 của cấu hình tốt nhất trong các arm E4 → `{fu['from']}` "
-                   f"(quy tắc: {fu['rule']}; chi tiết `e6_choice.json`).")
+    cc = manifest.get("c_choice")
+    if cc:
+        cl = "a (Adaptive)" if cc.get("c") == "a" else format(float(cc["c"]), "g")
+        out.append(f"- **c cố định của 3.2:** c = {cl}" + (f" ← arm `{cc['from']}` của 3.1" if cc.get("from") else "")
+                   + f" (quy tắc: {cc['rule']}; chi tiết `c_choice.json`). Arm E đã có ở 3.1 và Baseline được kế thừa nguyên từ 3.1.")
     ver = {a["id"]: manifest.get("arm_status", {}).get(a["id"], {}).get("route_verdict") for a in arms}
     ver = {k: v for k, v in ver.items() if v}
     if ver:
@@ -394,10 +396,10 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, fr: pd.Da
               "- Cls head nhân quả đọc hidden cuối của decoder ở mọi vị trí (suy luận: vị trí cuối báo cáo), huấn luyện cùng lúc (không pretrain, không đóng băng).",
               "- Baseline là Gemma 3 gốc (không huấn luyện, greedy, cùng prompt/ảnh/tập test).",
               "- c = a (Adaptive Capacity): k_i = ⌈max(N/E, e^{H_i})⌉ với H_i là entropy của softmax nhân quả theo token của expert i; E là siêu tham số duy nhất.",
-              "- Arm cuối (E6) được chọn SAU khi ba arm E4 có điểm: lấy cấu hình (c hoặc adaptive) có hạng lâm sàng TB tốt nhất, hoà ⇒ hạng văn bản; "
-              "Friedman + hậu kiểm bao gồm cả arm này nên lựa chọn đó dựa trên cùng tập test (một nguồn lạc quan nhẹ cho arm được chọn).",
+              "- 3.2 chọn c từ điểm của 3.1 trên CÙNG tập test (hạng lâm sàng TB, hoà ⇒ hạng văn bản), rồi dò E: lựa chọn c đó là một nguồn "
+              "lạc quan nhẹ cho các arm của 3.2. Arm E của 3.1 và Baseline được dùng lại nguyên (cùng predictions, cùng điểm).",
               "- Data (exp 3.0): train 12800 · val 128 · test 6400, 1 bệnh nhân – 1 mẫu, nhãn dương cân bằng giữa ba tập (xem `3.0_data_v4/DATA_REPORT.md`). "
-              "Train 400 bước × batch 32, val mỗi 40 bước, patience 3; 4 tập bootstrap × 6400 mẫu.", ""]
+              "Train 400 bước × batch 32, val mỗi 40 bước, patience 3, min_delta (xem config); 4 tập bootstrap × 6400 mẫu.", ""]
     path = run_dir / "REPORT.md"
     path.write_text("\n".join(parts), encoding="utf-8")
     print(f"  ✓ {path}", flush=True)

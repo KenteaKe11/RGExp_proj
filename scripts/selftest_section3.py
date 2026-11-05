@@ -29,22 +29,22 @@ def main() -> int:
     cfg = load_config(str(ROOT / "configs" / "section3.yaml"), [])
     with tempfile.TemporaryDirectory() as td:
         cfg["output"]["dir"] = td
-        # 3.1
-        a1, binfo = build_arms(cfg, "3.1")
+        # 3.1 = dò c
+        from src import run_section3 as rs
+        a1 = build_arms(cfg, "3.1")
         ids = [x["id"] for x in a1]
-        check("3.1: arm khai trước = 3 arm E4 (1,4) (2,4) (a,4) + Baseline; arm E6 để sau",
-              ids == ["c1_e4", "c2_e4", "ac_e4", "baseline_infer"] and binfo["followup"] == {"E": 6, "from": None}, str(ids))
+        check("3.1: dò c ở E=4 cố định ⇒ c1_e4, c2_e4, ac_e4 + Baseline",
+              ids == ["c1_e4", "c2_e4", "ac_e4", "baseline_infer"], str(ids))
         fixed = [x for x in a1 if x["kind"] == "ft" and not x.get("adaptive")]
         ada = [x for x in a1 if x.get("adaptive")]
         check("3.1: c số ⇒ capacity cố định k=⌈c·N/E⌉ (c=1,2) E=4; c=a ⇒ Adaptive Capacity E=4",
               [(x["c"], x["E"]) for x in fixed] == [(1.0, 4), (2.0, 4)]
               and [(x["E"], x["decoder"]) for x in ada] == [(4, "moe")]
-              and all("pretrain" not in x and "top_k" not in x for x in a1))
+              and all("pretrain" not in x and "top_k" not in x and "inherit_from" not in x for x in a1))
         check("3.1: Baseline = Gemma gốc, kind=infer (không train)",
               a1[-1]["kind"] == "infer" and a1[-1]["runner"] == "gemma3")
 
-        # ── arm E6 = E6 của cấu hình tốt nhất trong 3 arm E4 ──
-        from src import run_section3 as rs
+        # 3.2 = dò E với c tốt nhất của 3.1
         rng_ = np.random.default_rng(3)
 
         def put(run_dir, id_, off):
@@ -59,39 +59,61 @@ def main() -> int:
             def pull_file(self, *a_, **k_):
                 return False
 
-        spec = binfo["followup"]
-        for winner, want_id, want_c, want_ad in (("ac_e4", "ac_e6", 1.0, True), ("c2_e4", "c2_e6", 2.0, False),
-                                                 ("c1_e4", "c1_e6", 1.0, False)):
-            rd_ = Path(td) / f"fu_{winner}"
+            def pull_dir(self, *a_, **k_):
+                return False
+
+        for winner, want_c in (("ac_e4", "a"), ("c2_e4", 2.0), ("c1_e4", 1.0)):
+            rd_ = Path(td) / f"s31_{winner}"
             for x in a1[:3]:
                 put(rd_, x["id"], 0.30 if x["id"] == winner else 0.10)
-            e6, info = rs.resolve_followup(cfg, a1, spec, rd_, NoHub(), "sub")
-            check(f"arm E6: E4 tốt nhất = {winner} ⇒ {want_id} (E=6, cùng capacity)",
-                  e6 is not None and e6["id"] == want_id and e6["E"] == 6 and e6["c"] == want_c
-                  and bool(e6.get("adaptive")) == want_ad and info["from"] == winner and e6["followup_of"] == winner,
-                  str(e6 and e6["id"]))
-        rd_ = Path(td) / "fu_missing"
+            cc = rs.resolve_best_c(cfg, rd_, NoHub(), "sub")
+            check(f"3.2: c tốt nhất của 3.1 = {winner} ⇒ c = {want_c}",
+                  cc is not None and cc["c"] == want_c and cc["from"] == winner, str(cc and cc["c"]))
+        rd_ = Path(td) / "s31_missing"
         for x in a1[:2]:
             put(rd_, x["id"], 0.2)
-        check("arm E6: thiếu điểm của một arm E4 ⇒ chưa quyết định (None)",
-              rs.resolve_followup(cfg, a1, spec, rd_, NoHub(), "sub") == (None, None))
-        e6, info = rs.resolve_followup(cfg, a1, {"E": 6, "from": "c2_e4"}, Path(td) / "fu_none", NoHub(), "sub")
-        check("arm E6: người dùng chỉ định followup.from thắng quy tắc tự động (không cần điểm)",
-              e6["id"] == "c2_e6" and "chỉ định" in info["rule"])
+        check("3.2: thiếu điểm của một arm c ở 3.1 ⇒ chưa chọn được (None)",
+              rs.resolve_best_c(cfg, rd_, NoHub(), "sub") is None)
+        cc = rs.resolve_best_c(Cfg({**dict(cfg), "exp32": {**dict(cfg["exp32"]), "c": "a"}}), Path(td) / "none", NoHub(), "sub")
+        check("3.2: người dùng ép exp32.c thắng quy tắc tự động (không cần điểm 3.1)",
+              cc["c"] == "a" and "chỉ định" in cc["rule"])
+        a2 = build_arms(cfg, "3.2", {"c": "a"})
+        check("3.2: dò E ∈ {2,4,6} ở c=a ⇒ ac_e2, ac_e4, ac_e6 + Baseline; E4 và Baseline kế thừa từ 3.1",
+              [x["id"] for x in a2] == ["ac_e2", "ac_e4", "ac_e6", "baseline_infer"]
+              and [x["id"] for x in a2 if x.get("inherit_from") == "3.1"] == ["ac_e4", "baseline_infer"]
+              and all(x.get("adaptive") for x in a2[:3]))
+        a2n = build_arms(cfg, "3.2", {"c": 2.0})
+        check("3.2: c=2 ⇒ c2_e2, c2_e4, c2_e6", [x["id"] for x in a2n[:3]] == ["c2_e2", "c2_e4", "c2_e6"]
+              and [(x["c"], x["E"]) for x in a2n[:3]] == [(2.0, 2), (2.0, 4), (2.0, 6)])
         try:
-            build_arms(Cfg({**dict(cfg), "exp31": {"pairs": [[1, 4], [2, 6]], "followup": {"E": 6}}}), "3.1")
-            check("followup.E trùng E của arm E4 ⇒ DỪNG", False)
+            build_arms(cfg, "3.2")
+            check("3.2 không có c ⇒ DỪNG", False)
         except ValueError:
-            check("followup.E trùng E của arm E4 ⇒ DỪNG", True)
-        for old in ("3.2", "3.3", "3.4", "3.1-1", "3.1-2"):
+            check("3.2 không có c ⇒ DỪNG", True)
+        # kế thừa: copy predictions + điểm + báo cáo con từ thư mục 3.1 sang 3.2
+        from src import report_section3 as rp_
+        r31, r32 = Path(td) / "inh31", Path(td) / "inh32"
+        (r31 / "predictions").mkdir(parents=True)
+        (r31 / "predictions" / "ac_e4.jsonl").write_text('{"key": "k0", "pred": "x"}\n')
+        put(r31, "ac_e4", 0.2)
+        sd_ = rp_.arm_dir(r31, "ac_e4")
+        sd_.mkdir(parents=True)
+        (sd_ / "summary.json").write_text("{}")
+        arm_ = dict(a2[1])
+        ok_ = rs.inherit_arm(arm_, r32, r31, NoHub(), "sub31", Path(td) / "ad31", rp_)
+        check("3.2: inherit_arm kéo predictions + điểm + báo cáo con từ 3.1 và trỏ adapter 3.1",
+              ok_ and (r32 / "predictions" / "ac_e4.jsonl").exists() and (r32 / "metrics" / "per_sample_ac_e4.csv").exists()
+              and (rp_.arm_dir(r32, "ac_e4") / "summary.json").exists() and arm_["adapter_root"] == Path(td) / "ad31"
+              and arm_["hub_sub"] == "sub31")
+        for old in ("3.3", "3.4", "3.1-1"):
             try:
                 build_arms(cfg, old)
-                check(f"{old} đã bị gỡ (chưa thiết lập)", False)
+                check(f"{old} chưa thiết lập", False)
             except ValueError:
-                check(f"{old} đã bị gỡ (chưa thiết lập)", True)
+                check(f"{old} chưa thiết lập", True)
         check("thư mục kết quả/adapter v4 (Hub không tái dùng kết quả v3 chạy trên data khác)",
-              rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_e_vs_baseline_v4"}
-              and rs.ADAPTER == {"3.1": "./adapters_3_1_v4"})
+              rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4"}
+              and rs.ADAPTER == {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4"})
 
         # ── chính sách thí nghiệm ──
         d_, st_ = cfg["data"], cfg["stats"]

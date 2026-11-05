@@ -1,6 +1,6 @@
 # RGExp §3 — Cls head · EC-Router · MoE-DoRA
 
-Thí nghiệm hiện có: **3.0 (data mới)** và **3.1 (so sánh các cặp (c, E) + Baseline)**. Các exp 3.1/3.2/3.4 cũ (và README/config cũ) đã lưu ở `_archive/section3_v3/`; các exp sau 3.1 chưa thiết lập.
+Thí nghiệm hiện có: **3.0 (data mới)**, **3.1 (dò c)** và **3.2 (dò E)**. Các exp 3.1/3.2/3.4 cũ (và README/config cũ) đã lưu ở `_archive/section3_v3/`; các exp sau 3.2 chưa thiết lập.
 
 Sinh báo cáo X-quang ngực với Gemma-3-4b-it (NF4). Thí nghiệm §2.x cũ nằm trong `_archive/section2_full/`.
 
@@ -33,11 +33,12 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 | Mục | Làm gì |
 |---|---|
 | 3.0 | **Data**: split mới cân bằng nhãn, 1 bệnh nhân – 1 mẫu; tải ảnh, manifest, kiểm độc lập, báo cáo cân bằng. Không train. |
-| 3.1 | 4 candidate + **Baseline** (Gemma 3 gốc): 3 arm **E=4** — **(1,4) (2,4) (a,4)** — rồi arm cuối là **E=6 của cấu hình tốt nhất trong 3 arm E4** (hạng lâm sàng TB, hoà ⇒ hạng văn bản; muốn tự chỉ định: `--set exp31.followup.from=<id>`). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉. Một lệnh chạy hai giai đoạn: (1) E4 + Baseline; (2) chọn tốt nhất ⇒ thêm arm E6 ⇒ báo cáo cuối (quyết định lưu ở `e6_choice.json`). |
+| 3.1 | **Dò c** (E cố định = 4): **c ∈ {1, 2, a}** + **Baseline** (Gemma 3 gốc). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉. |
+| 3.2 | **Dò E** ∈ {2, 4, 6} với **c tốt nhất của 3.1** (hạng lâm sàng TB, hoà ⇒ hạng văn bản; tự chỉ định: `--set exp32.c=<1\|2\|a\|số>`; quyết định lưu ở `c_choice.json`) + Baseline. Arm E=4 và Baseline **kế thừa nguyên từ 3.1** (adapter, predictions, điểm, báo cáo con) ⇒ không train/infer lại; chỉ train E=2 và E=6. Cần chạy 3.1 xong trước. |
 
-Tiêu chí 3.1: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
+Tiêu chí 3.1 và 3.2: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
 
-3.1 ra `runs/3.1_c_e_vs_baseline_v4/REPORT.md` (điểm, Friedman + hậu kiểm, Cls head, E-Clinical) và báo cáo con mỗi arm ở `arms/<arm>/`. `best.json` chỉ là gợi ý theo hạng trung bình.
+3.1 ra `runs/3.1_c_vs_baseline_v4/REPORT.md`, 3.2 ra `runs/3.2_e_vs_baseline_v4/REPORT.md` (điểm, Friedman + hậu kiểm, Cls head, E-Clinical) và báo cáo con mỗi arm ở `arms/<arm>/`. `best.json` chỉ là gợi ý theo hạng trung bình.
 
 ## Lệnh
 
@@ -45,8 +46,10 @@ Tiêu chí 3.1: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** 
 export HF_TOKEN=hf_xxx
 
 bash scripts/run_section3.sh --exp 3.0                 # data mới (chạy trước)
-bash scripts/run_section3.sh --exp 3.1                 # E4 ×3 + Baseline → chọn tốt nhất → arm E6 → báo cáo cuối
-bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id: c1_e4 c2_e4 ac_e4 baseline_infer, arm E6 là `<tốt nhất>_e6`: c1_e6 | c2_e6 | ac_e6)
+bash scripts/run_section3.sh --exp 3.1                 # dò c: c1_e4, c2_e4, ac_e4 + Baseline
+bash scripts/run_section3.sh --exp 3.2                 # dò E: <c tốt nhất>_e2, _e4 (kế thừa 3.1), _e6 + Baseline (kế thừa 3.1)
+bash scripts/run_section3.sh --exp 3.2 --set exp32.c=a # ép c cho 3.2
+bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id 3.1: c1_e4 c2_e4 ac_e4 baseline_infer; id 3.2: ví dụ ac_e2 ac_e4 ac_e6 baseline_infer)
 ```
 
 | Cờ | Tác dụng |
@@ -69,5 +72,5 @@ Split được cache trên Hub (`split_ref_exp30_v4/`), nên máy khác kéo v�
 
 ## Script chính
 
-`scripts/run_section3.sh` (chạy) · `src/run_section3.py` (điều phối, arm 3.1) · `src/s3_data.py` + `src/s3_split.py` (3.0) ·
+`scripts/run_section3.sh` (chạy) · `src/run_section3.py` (điều phối, arm 3.1/3.2) · `src/s3_data.py` + `src/s3_split.py` (3.0) ·
 `src/s3_train.py` · `src/s3_analysis.py` (E-Clinical) · `src/report_section3.py` · `src/stats_friedman.py` · `scripts/selftest_data.py`, `scripts/selftest_friedman.py`, `scripts/selftest_section3.py` (chạy tự động trước mỗi lần chạy).
