@@ -236,6 +236,9 @@ def find_target_modules(model, tcfg: dict) -> list[str]:
                 start = -(-n_layers // 2)
             elif frm in {"last_quarter", "final_quarter", "last_25_percent"}:
                 start = n_layers - (-(-n_layers // 4))
+            elif frm in {"last_two_thirds", "last_2/3", "two_thirds"}:
+                # 2/3 lớp cuối (SigLIP 27 lớp -> lớp 9..26)
+                start = n_layers - (-(-2 * n_layers // 3))
             elif frm in {"last_third", "final_third", "last_1/3"}:
                 # 1/3 lớp cuối (SigLIP 27 lớp -> lớp 18..26)
                 start = n_layers - (-(-n_layers // 3))
@@ -670,7 +673,12 @@ def load_base(cfg: Cfg, method: str, for_training: bool = True):
 
     attn = str(b.get("attn_implementation_train" if for_training
                      else "attn_implementation_infer", "sdpa"))
-    kw = dict(token=tok, torch_dtype=dt, attn_implementation=attn)
+    # Vision tower (SigLIP, 4096 token) chạy SDPA dù decoder dùng eager: eager dựng ma trận attention 4096² mỗi lớp ⇒ chậm + tốn VRAM.
+    vattn = str(b.get("attn_implementation_train_vision" if for_training
+                      else "attn_implementation_infer_vision", "") or "").strip()
+    split_attn = bool(vattn) and vattn != attn
+    kw = dict(token=tok, torch_dtype=dt,
+              attn_implementation=({"text_config": attn, "vision_config": vattn} if split_attn else attn))
     if is_quantized(method):
         # BẮT BUỘC dùng cùng cấu hình lượng tử ở train và ở infer. Huấn luyện
         # QLoRA rồi đem adapter gắn lên base bf16 để sinh là đánh giá một model
@@ -680,7 +688,23 @@ def load_base(cfg: Cfg, method: str, for_training: bool = True):
     kw["device_map"] = device_map_for(cfg, for_training)
 
     processor = AutoProcessor.from_pretrained(b["hf_id"], token=tok)
-    model = Gemma3ForConditionalGeneration.from_pretrained(b["hf_id"], **kw)
+    try:
+        model = Gemma3ForConditionalGeneration.from_pretrained(b["hf_id"], **kw)
+    except (TypeError, ValueError, KeyError) as e:
+        if not split_attn:
+            raise
+        # transformers này không nhận dict attn theo nhánh ⇒ nạp đồng nhất rồi đổi riêng cấu hình vision (module đọc config lúc forward)
+        print(f"  ⚠ attn_implementation theo nhánh không được hỗ trợ ({type(e).__name__}) ⇒ nạp '{attn}' rồi đổi vision → '{vattn}'", flush=True)
+        kw["attn_implementation"] = attn
+        model = Gemma3ForConditionalGeneration.from_pretrained(b["hf_id"], **kw)
+        vc = getattr(model.config, "vision_config", None)
+        if vc is not None:
+            vc._attn_implementation = vattn
+    if split_attn:
+        eff = {n: getattr(getattr(model.config, n, None), "_attn_implementation", "?") for n in ("text_config", "vision_config")}
+        print(f"  attention hiệu dụng: decoder={eff['text_config']} · vision={eff['vision_config']}", flush=True)
+        if eff["vision_config"] != vattn:
+            print(f"  ⚠ vision KHÔNG chạy '{vattn}' (đang {eff['vision_config']}) — kiểm tra phiên bản transformers", flush=True)
     if for_training:
         assert_materialized(model, kw["device_map"])
     return model, processor

@@ -35,7 +35,7 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 | 3.0 | **Data**: split mới cân bằng nhãn, 1 bệnh nhân – 1 mẫu; tải ảnh, manifest, kiểm độc lập, báo cáo cân bằng. Không train. |
 | 3.1 | **Dò c** (E cố định = 4): **c ∈ {1, 2, a}** + **Baseline** (Gemma 3 gốc). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉. |
 | 3.2 | **Dò E** ∈ {2, 4, 6} với **c tốt nhất của 3.1** (hạng lâm sàng TB, hoà ⇒ hạng văn bản; tự chỉ định: `--set exp32.c=<1\|2\|a\|số>`; quyết định lưu ở `c_choice.json`) + Baseline. Arm E=4 và Baseline **kế thừa nguyên từ 3.1** (adapter, predictions, điểm, báo cáo con) ⇒ không train/infer lại; chỉ train E=2 và E=6. Cần chạy 3.1 xong trước. |
-| 3.3 | **Nhánh vision**, decoder/router cố định = **AC-E4** (`exp33.E/c`): finetune DoRA **1/3 lớp cuối** vs **Full DoRA** (mọi lớp) của vision encoder + Baseline. Arm 1/3 cuối chính là AC-E4 của 3.1 và Baseline **kế thừa nguyên từ 3.1**; chỉ train `ac_e4_vfull`. Biến thể chọn bằng `exp33.variants` (`last_third`, `all`, `second_half`, `last_<n>`). Cần chạy 3.1 xong trước. |
+| 3.3 | **Nhánh vision**, decoder/router cố định = **AC-E4** (`exp33.E/c`): finetune DoRA **1/3 lớp cuối** vs **2/3 lớp cuối** vs **Full DoRA** (mọi lớp) của vision encoder + Baseline. Arm 1/3 cuối chính là AC-E4 của 3.1 và Baseline **kế thừa nguyên từ 3.1**; chỉ train `ac_e4_v23` (chạy trước) rồi `ac_e4_vfull`. Vision tower chạy SDPA (`attn_implementation_train_vision`), decoder vẫn eager. Biến thể chọn bằng `exp33.variants` (`last_third`, `last_two_thirds`, `all`, `second_half`, `last_<n>`). Cần chạy 3.1 xong trước. |
 | 3.4 | **Vị trí Cls head**, decoder/router cố định = **AC-E4**, vision = **phạm vi tốt nhất của 3.3** (hoặc `--set exp34.vision=…`; lưu ở `v_choice.json`): Cls head ở **đầu ra decoder** (nhân quả; arm cùng vision **kế thừa từ 3.3**) vs ngay **đầu ra vision, trước projector** (attention pooling 14 query trên token vision; train mới, id `ac_e4_chvis`) + Baseline (kế thừa 3.1). Cấu hình `exp34` (`variants`, `vision`). Cần chạy 3.3 xong trước. |
 
 Tiêu chí 3.1–3.4: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
@@ -55,7 +55,7 @@ bash scripts/run_section3.sh --exp 3.0                 # data mới (chạy trư
 bash scripts/run_section3.sh --exp 3.1                 # dò c: c1_e4, c2_e4, ac_e4 + Baseline
 bash scripts/run_section3.sh --exp 3.2                 # dò E: <c tốt nhất>_e2, _e4 (kế thừa 3.1), _e6 + Baseline (kế thừa 3.1)
 bash scripts/run_section3.sh --exp 3.2 --set exp32.c=a # ép c cho 3.2
-bash scripts/run_section3.sh --exp 3.3                 # vision: ac_e4 (1/3 cuối, kế thừa 3.1) + ac_e4_vfull (Full DoRA, train mới) + Baseline (kế thừa 3.1)
+bash scripts/run_section3.sh --exp 3.3                 # vision: ac_e4 (1/3 cuối, kế thừa 3.1) + ac_e4_v23 (2/3 cuối) + ac_e4_vfull (Full DoRA) + Baseline (kế thừa 3.1)
 bash scripts/run_section3.sh --exp 3.4                 # Cls head: arm decoder (kế thừa 3.3) + arm chvis (đầu ra vision, train mới) + Baseline (kế thừa 3.1)
 bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id 3.1: c1_e4 c2_e4 ac_e4 baseline_infer; id 3.2: ví dụ ac_e2 ac_e4 ac_e6 baseline_infer)
 ```

@@ -90,13 +90,13 @@ def main() -> int:
             check("3.2 không có c ⇒ DỪNG", False)
         except ValueError:
             check("3.2 không có c ⇒ DỪNG", True)
-        a3 = build_arms(Cfg({**dict(cfg), "exp33": {"E": 4, "c": "a", "variants": ["last_third", "all"], "baseline": True},
+        a3 = build_arms(Cfg({**dict(cfg), "exp33": {"E": 4, "c": "a", "variants": ["last_third", "last_two_thirds", "all"], "baseline": True},
                              "train": {"vision_adapter": {"layers": "last_third"}}}), "3.3")
-        check("3.3: ac_e4 (vision 1/3 cuối, kế thừa 3.1) + ac_e4_vfull (Full DoRA, train mới) + Baseline kế thừa",
-              [x["id"] for x in a3] == ["ac_e4", "ac_e4_vfull", "baseline_infer"]
-              and [x.get("inherit_from") for x in a3] == ["3.1", None, "3.1"]
-              and [x.get("vision_layers") for x in a3[:2]] == ["last_third", "all"]
-              and all(x.get("adaptive") and x["E"] == 4 for x in a3[:2]))
+        check("3.3: ac_e4 (1/3 cuối, kế thừa 3.1) → ac_e4_v23 (2/3 cuối, train trước) → ac_e4_vfull (Full) + Baseline kế thừa",
+              [x["id"] for x in a3] == ["ac_e4", "ac_e4_v23", "ac_e4_vfull", "baseline_infer"]
+              and [x.get("inherit_from") for x in a3] == ["3.1", None, None, "3.1"]
+              and [x.get("vision_layers") for x in a3[:3]] == ["last_third", "last_two_thirds", "all"]
+              and all(x.get("adaptive") and x["E"] == 4 for x in a3[:3]))
         c34 = Cfg({**dict(cfg), "exp33": {"E": 4, "c": "a", "variants": ["last_third", "all"], "baseline": True},
                    "exp34": {"E": 4, "c": "a", "variants": ["decoder", "vision"], "baseline": True},
                    "train": {"vision_adapter": {"layers": "last_third"}}})
@@ -109,7 +109,7 @@ def main() -> int:
         check("3.4: vision tốt nhất = last_third ⇒ ac_e4 (kế thừa 3.3) + ac_e4_chvis",
               [x["id"] for x in a4b[:2]] == ["ac_e4", "ac_e4_chvis"] and [x.get("inherit_from") for x in a4b[:2]] == ["3.3", None])
         from src.run_section3 import arm_cfg
-        c_full = arm_cfg(Cfg({"train": {"vision_adapter": {"layers": "last_third", "rank": 4}}}), a3[1])
+        c_full = arm_cfg(Cfg({"train": {"vision_adapter": {"layers": "last_third", "rank": 4}}}), a3[2])
         c_base = Cfg({"train": {"vision_adapter": {"layers": "last_third", "rank": 4}}})
         check("3.3: arm_cfg chỉ ghi đè layers cho arm Full (không đụng cfg gốc, giữ rank)",
               c_full["train"]["vision_adapter"] == {"layers": "all", "rank": 4}

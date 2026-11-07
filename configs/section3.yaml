@@ -72,6 +72,7 @@ base:
   runner: gemma3_ec
   dtype: bfloat16
   attn_implementation_train: eager
+  attn_implementation_train_vision: sdpa   # vision tower (4096 token) dùng SDPA, decoder vẫn eager; "" = giống decoder
   attn_implementation_infer: sdpa
   disable_compile: auto
   batch_size: 512
@@ -175,11 +176,11 @@ exp32:
 
 # 3.3: NHÁNH VISION. Decoder/router cố định = AC-E4 (E, c bên dưới; mặc định Adaptive Capacity E=4 — cấu hình mạnh nhất của 3.1/3.2).
 # `variants` = phạm vi lớp vision encoder được finetune DoRA: last_third (1/3 lớp cuối = mặc định train.vision_adapter.layers) | all (Full DoRA)
-# | second_half | last_<n>. Biến thể trùng mặc định train.vision_adapter.layers ⇒ chính là AC-E4 của 3.1 ⇒ KẾ THỪA, không train lại.
+# | last_two_thirds (2/3 cuối) | second_half | last_<n>. Biến thể trùng mặc định train.vision_adapter.layers ⇒ chính là AC-E4 của 3.1 ⇒ KẾ THỪA, không train lại.
 exp33:
   E: 4
   c: a
-  variants: [last_third, all]
+  variants: [last_third, last_two_thirds, all]   # thứ tự = thứ tự train: 2/3 cuối chạy TRƯỚC Full (Full đắt nhất)
   baseline: true                        # Baseline = Gemma 3 gốc, kế thừa từ 3.1
 
 # 3.4: VỊ TRÍ CLS HEAD. Decoder/router cố định = AC-E4; vision = phạm vi TỐT NHẤT của 3.3 (hạng lâm sàng TB, hoà ⇒ hạng văn bản; ghi ở v_choice.json).

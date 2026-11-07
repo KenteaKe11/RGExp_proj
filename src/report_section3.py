@@ -206,7 +206,7 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
 
 
 _CLS = {"decoder": "đầu ra decoder", "vision": "đầu ra vision (trước proj)"}
-_VIS = {"last_third": "1/3 lớp cuối", "all": "Full (mọi lớp)", "second_half": "nửa sau"}
+_VIS = {"last_third": "1/3 lớp cuối", "last_two_thirds": "2/3 lớp cuối", "all": "Full (mọi lớp)", "second_half": "nửa sau"}
 
 
 def _setup_dict(arm: dict, setup: dict) -> dict:

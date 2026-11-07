@@ -7,8 +7,8 @@
     3.2  DÒ E (c cố định = c TỐT NHẤT của 3.1): E ∈ {2, 4, 6} + Baseline. Arm E=`exp31.E` và Baseline được KẾ THỪA
          nguyên từ 3.1 (adapter, predictions, điểm, báo cáo con) ⇒ không train/infer lại. c tốt nhất chọn theo hạng
          lâm sàng TB (hoà ⇒ hạng văn bản) trên điểm 3.1, hoặc `--set exp32.c=<1|2|a|số>` do bạn chỉ định; ghi ở `c_choice.json`.
-    3.3  NHÁNH VISION (decoder/router cố định = AC-E4, `exp33.c/E`): finetune DoRA 1/3 lớp CUỐI vs FULL DoRA (mọi lớp) của vision
-         encoder + Baseline. Arm "1/3 cuối" chính là AC-E4 của 3.1 (cùng cấu hình) ⇒ KẾ THỪA nguyên từ 3.1, chỉ train arm Full DoRA.
+    3.3  NHÁNH VISION (decoder/router cố định = AC-E4, `exp33.c/E`): finetune DoRA 1/3 lớp CUỐI vs 2/3 lớp CUỐI vs FULL DoRA (mọi lớp) của vision
+         encoder + Baseline (train theo thứ tự 2/3 → Full). Arm "1/3 cuối" chính là AC-E4 của 3.1 (cùng cấu hình) ⇒ KẾ THỪA nguyên từ 3.1, chỉ train arm 2/3 và Full DoRA.
     3.4  CLS HEAD (decoder/router cố định = AC-E4; vision = phạm vi TỐT NHẤT của 3.3, hoặc `--set exp34.vision=…`): đặt Cls head ở đầu ra DECODER (nhân quả, = AC-E4 của 3.1) vs ngay ĐẦU RA VISION
          (attention pooling 14 query trên token vision, TRƯỚC projector) + Baseline. Arm decoder và Baseline KẾ THỪA từ 3.1; chỉ train
          arm Cls-head-vision (`ac_e4_chvis`). Loss vẫn CE_text + γ·CE_cls, huấn luyện cùng lúc.
@@ -114,9 +114,9 @@ def _baseline_arm() -> dict:
     return {"id": "baseline_infer", "name": "Baseline · Gemma 3 gốc", "kind": "infer", "runner": "gemma3"}
 
 
-VISION_LABEL = {"last_third": "1/3 cuối (DoRA)", "all": "Full DoRA"}
+VISION_LABEL = {"last_third": "1/3 cuối (DoRA)", "last_two_thirds": "2/3 cuối (DoRA)", "all": "Full DoRA"}
 CLS_LABEL = {"decoder": "ở đầu ra decoder (nhân quả)", "vision": "ở đầu ra vision (trước proj)"}
-VISION_TAG = {"last_third": "last3", "all": "full"}
+VISION_TAG = {"last_third": "last3", "last_two_thirds": "23", "all": "full"}
 
 
 def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
