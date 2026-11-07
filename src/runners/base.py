@@ -169,12 +169,13 @@ class Runner:
                     except Exception:
                         continue
         required = set(self.required_prediction_fields)
-        if required:
+        stale = getattr(self, "stale_record", None)      # hook: dòng đủ cột nhưng vẫn cần làm lại (vd thiếu route_viz của mẫu cố định)
+        if required or stale:
             # Old prediction caches may contain the report but not the newly
             # requested side output. Keep complete rows, discard stale rows,
             # then regenerate only those samples and write fresh records.
             complete = {k: r for k, r in records.items()
-                        if required.issubset(r)}
+                        if required.issubset(r) and not (stale and stale(r))}
             if len(complete) != len(records):
                 with open(out_path, "w", encoding="utf-8") as f:
                     for record in complete.values():

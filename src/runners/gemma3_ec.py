@@ -45,6 +45,15 @@ class Gemma3ECRunner(Gemma3Runner):
                 f += ["token", "proportion"]  # top-k token PREFIX mỗi expert chọn + tỉ lệ p (bảng định tính)
         return tuple(f)
 
+    def stale_record(self, r: dict) -> bool:
+        """Mẫu cố định (`route_tokens.viz_keys`) mà dòng cũ chưa có `route_viz` ⇒ sinh lại riêng mẫu đó để vẽ ảnh."""
+        if not (self._decoder == "moe" or str(self.mcfg.get("decoder")) == "moe"):
+            return False
+        if not bool(self.cfg.get_path("route_tokens.enabled", True)):
+            return False
+        vk = {str(k) for k in (self.cfg.get_path("route_tokens.viz_keys", []) or [])}
+        return str(r.get("key")) in vk and not r.get("route_viz")
+
     def load(self) -> None:
         from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 

@@ -518,6 +518,24 @@ def main(argv: list[str] | None = None) -> int:
     _tk = set(test_df["key"].astype(str))
     _vk = [k for k in _vk if k in _tk] or test_df["key"].astype(str).tolist()[:int(_rt.get("viz_n", 2))]
     _rt["viz_keys"] = _vk
+    # predictions đã đủ (kể cả cột token) nhưng thiếu `route_viz` của mẫu cố định ⇒ chỉ sinh lại các mẫu đó (cần adapter: tìm, không train)
+    if _rt.get("enabled", True) and not a.retrain:
+        for arm in arms:
+            if arm["kind"] != "ft" or arm["decoder"] != "moe" or not arm.get("preds_done"):
+                continue
+            pr = read_preds(run_dir / "predictions" / f"{arm['id']}.jsonl")
+            miss = [k for k in _vk if not (pr.get(k) or {}).get("route_viz")]
+            if not miss:
+                continue
+            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31],
+                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm,
+                                 expect_n=int(cfg["data"].get("n_train") or 0))
+            if loc is None:
+                print(f"⚠ {arm['id']}: thiếu route_viz của {miss} nhưng không tìm thấy adapter ⇒ bỏ qua ảnh định tính arm này.", flush=True)
+                continue
+            arm["adapter_root"], arm["preds_done"] = loc, False
+            print(f"⚙ {arm['id']}: thiếu route_viz của {len(miss)} mẫu cố định ⇒ infer lại RIÊNG các mẫu đó (adapter {loc / arm['id']}).",
+                  flush=True)
     if train_df is not None:
         manifest["n_train"] = len(train_df)
 
@@ -675,7 +693,13 @@ def main(argv: list[str] | None = None) -> int:
             ph = pd.read_csv(php)
 
     # arm nào cần (làm lại) báo cáo con: chưa có/chưa đủ, hoặc vừa train/infer/chấm lại trong lần chạy này
-    need_sub = [x for x in arms if a.retrain or a.rescore or x.get("fresh")
+    def _viz_stale(x: dict) -> bool:        # báo cáo con MoE cũ chưa có bảng token / ảnh định tính ⇒ dựng lại
+        if x["kind"] != "ft" or x["decoder"] != "moe" or not (cfg.get("route_tokens", {}) or {}).get("enabled", True):
+            return False
+        d = rp.arm_dir(run_dir, x["id"])
+        return not (d / "route_tokens.md").exists() or not (d / "route_viz.json").exists()
+
+    need_sub = [x for x in arms if a.retrain or a.rescore or x.get("fresh") or _viz_stale(x)
                 or rp.arm_problem(rp.load_arm_summary(run_dir, x["id"]), x)]
 
     # ── analysis: Similarity giữa Expert + Expert-Labels ───────────────────
