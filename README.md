@@ -40,6 +40,10 @@ Tiêu chí 3.1 và 3.2: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical m
 
 3.1 ra `runs/3.1_c_vs_baseline_v4/REPORT.md`, 3.2 ra `runs/3.2_e_vs_baseline_v4/REPORT.md` (điểm, Friedman + hậu kiểm, Cls head, E-Clinical) và báo cáo con mỗi arm ở `arms/<arm>/`. `best.json` chỉ là gợi ý theo hạng trung bình.
 
+**Top-k token mỗi expert chọn trong prefix** (định tính hành vi): lúc infer, mỗi dòng của `predictions/<arm>.jsonl` (arm MoE) có thêm hai cột **`token`** và **`proportion`** — mỗi cột là E danh sách (một cho mỗi expert): top-k token prefix (ảnh + prompt) theo p của expert đó trong ảnh này, và `proportion` = p của token / Σp của expert trên mọi token prefix của ảnh (token văn bản gộp theo id, token ảnh gộp theo vị trí patch `IMG[r,c]`). Stage `analysis` tổng hợp 6400 ảnh từ hai cột đó (mean_proportion, freq) thành `arms/<arm>/route_tokens.md` (nhúng, thu gọn, vào báo cáo con) và `route_tokens.csv`. Cấu hình: khối `route_tokens` (`sample_top_k` mỗi dòng, `top_k` bảng tổng hợp). Predictions cũ thiếu hai cột này bị coi là chưa xong ⇒ arm MoE được infer lại.
+
+**Ảnh định tính 2 mẫu cố định**: `route_tokens.viz_keys` (mặc định 2 key đầu của test, `viz_n`) — runner lưu route dày đặc của 2 mẫu này; stage `analysis` vẽ, mỗi mẫu 2 ảnh `arms/<arm>/route_viz_<i>_img.png` (ảnh gốc | patch 16×16 tô màu theo expert có p lớn nhất, độ đậm ∝ p) và `route_viz_<i>_text.png` (câu dự đoán đầy đủ, mỗi token tô màu expert chọn nó, kèm `y_gt` gốc); nhúng vào báo cáo con mục "Ví dụ định tính".
+
 ## Lệnh
 
 ```bash

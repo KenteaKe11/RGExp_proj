@@ -38,7 +38,7 @@ PY
 fi
 if [ "${RGEXP_SKIP_SELFTEST:-0}" != "1" ]; then
     echo "⚙ Tự kiểm chứng §3 ..."
-    "$PYBIN" "$ROOT/scripts/selftest_data.py" && "$PYBIN" "$ROOT/scripts/selftest_friedman.py" && "$PYBIN" "$ROOT/scripts/selftest_ec.py" && "$PYBIN" "$ROOT/scripts/selftest_section3.py" || {
+    "$PYBIN" "$ROOT/scripts/selftest_data.py" && "$PYBIN" "$ROOT/scripts/selftest_friedman.py" && "$PYBIN" "$ROOT/scripts/selftest_route_tokens.py" && "$PYBIN" "$ROOT/scripts/selftest_ec.py" && "$PYBIN" "$ROOT/scripts/selftest_section3.py" || {
         echo "✗ selftest HỎNG — dừng trước khi tốn GPU (bỏ qua: RGEXP_SKIP_SELFTEST=1)"; exit 1; }
 fi
 exec "$PYBIN" -m src.run_section3 "${ARGS[@]+"${ARGS[@]}"}"

@@ -59,7 +59,8 @@ class ReportIncomplete(RuntimeError):
 
 
 _ROUTE_FILES = {"route_verdict.json": "route_verdict.json", "e_heatmap.png": "e_heatmap.png",
-                "e_clinical_corr.csv": "e_clinical_corr.csv", "e_e_corr.csv": "e_e_corr.csv"}
+                "e_clinical_corr.csv": "e_clinical_corr.csv", "e_e_corr.csv": "e_e_corr.csv",
+                "route_tokens.md": "route_tokens.md", "route_tokens.csv": "route_tokens.csv"}
 
 
 def arm_dir(run_dir: Path, aid: str) -> Path:
@@ -151,6 +152,8 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
             f = adir / f"{aid}_{src}"
             if f.exists():
                 shutil.copyfile(f, ad / dst)
+        for f in adir.glob(f"{aid}_route_viz*"):
+            shutil.copyfile(f, ad / f.name[len(aid) + 1:])
         if (ad / "route_verdict.json").exists():
             route = {"verdict": json.loads((ad / "route_verdict.json").read_text(encoding="utf-8")),
                      "heatmap": "e_heatmap.png" if (ad / "e_heatmap.png").exists() else None}
@@ -170,6 +173,21 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
                   f"micro-F1 {cls['micro_F1']:.4f} · n = {cls['n']}", ""]
     if route:
         parts += ["## Route", "", _route_md(name, route, ad, "e_heatmap.png")]
+        if (ad / "route_tokens.md").exists():
+            parts += ["### Token prefix mỗi Expert chọn (top-k theo p, tổng hợp trên ảnh test)", "",
+                      _details("Bảng top-k token mỗi expert — mean_proportion và freq (đủ cột ở `route_tokens.csv`)",
+                               (ad / "route_tokens.md").read_text(encoding="utf-8")), ""]
+        vz = ad / "route_viz.json"
+        if vz.exists():
+            smp = json.loads(vz.read_text(encoding="utf-8")).get("samples", [])
+            parts += ["### Ví dụ định tính (2 mẫu cố định)", "",
+                      "Màu = expert có p lớn nhất tại token (xám/không tô = không expert nào chọn); độ đậm ∝ p. "
+                      "Ảnh trái-phải: ảnh gốc | patch tô màu theo expert. Ảnh dưới: câu dự đoán tô màu theo expert của từng token, kèm `y_gt` gốc.", ""]
+            for x in smp:
+                parts += [f"**Mẫu {x['idx']}** — `{x['key']}`", ""]
+                for suf in ("img", "text"):
+                    if (ad / f"route_viz_{x['idx']}_{suf}.png").exists():
+                        parts += [f"![mẫu {x['idx']} {suf}](route_viz_{x['idx']}_{suf}.png)", ""]
     elif arm["kind"] == "ft" and arm["decoder"] == "moe":
         parts += ["## Route", "", "*(chưa có phân tích route — chạy `--stages analysis,report`)*", ""]
     cvec = [{"step": h["step"], **{k: v for k, v in h.items() if k.startswith("c_e")}}

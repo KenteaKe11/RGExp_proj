@@ -41,6 +41,8 @@ class Gemma3ECRunner(Gemma3Runner):
         f = ["cls_head_pred", "cls_head_confidence", "cls_states"]
         if self._decoder == "moe" or str(self.mcfg.get("decoder")) == "moe":
             f.append("route_w")
+            if bool(self.cfg.get_path("route_tokens.enabled", True)):
+                f += ["token", "proportion"]  # top-k token PREFIX mỗi expert chọn + tỉ lệ p (bảng định tính)
         return tuple(f)
 
     def load(self) -> None:
@@ -89,7 +91,7 @@ class Gemma3ECRunner(Gemma3Runner):
         self.heads = load_heads(d, device=dev, dtype=torch.float32)
         print(f"  ✓ {self.mcfg['id']}: {self.heads.describe()}", flush=True)
 
-    def _aux(self, batch, logits, route):
+    def _aux(self, batch, logits, route, route_cols=None, route_viz=None):
         pr = torch.softmax(logits.float(), -1)                       # (B,14,4)
         pos = pr[..., 1] + pr[..., 3]
         aux = {}
@@ -101,6 +103,10 @@ class Gemma3ECRunner(Gemma3Runner):
                  "cls_states": states[i]}
             if route is not None:
                 a["route_w"] = [round(float(x), 6) for x in route["route_w"][i].tolist()]
+            if route_cols is not None:
+                a.update(route_cols[i])          # hai cột `token` và `proportion` (E danh sách mỗi cột)
+            if route_viz and str(it["key"]) in route_viz:
+                a["route_viz"] = route_viz[str(it["key"])]   # chỉ 2 mẫu cố định: route dày đặc để vẽ ảnh highlight
             aux[str(it["key"])] = a
         self._last_batch_aux = aux
 
@@ -117,15 +123,28 @@ class Gemma3ECRunner(Gemma3Runner):
                     dtype=gb.float_dtype(self._gemma, torch.float32)))
             embeds = gb.build_inputs_embeds(self._gemma, ids, aligned)
             attn = inputs["attention_mask"].bool()
-            route, stream = None, None
+            route, stream, route_cols, route_viz = None, None, None, None
+            viz_keys = {str(k) for k in (self.cfg.get_path("route_tokens.viz_keys", []) or [])}
+            need_trace = bool(viz_keys & {str(it["key"]) for it in batch})
             if self._ctx is not None:
                 if self.heads.router is None:
                     raise RunnerUnusable("MoE nhưng nhánh không có Router")
                 rt_ = self.heads.router
                 route = rt_(embeds, attn, sm.prefix_mask(attn))          # route_w: thống kê trên prefix
                 self._ctx.set(route["weights"], repeat=1)               # prefill: [B,P,E], nhân quả
+                if bool(self.cfg.get_path("route_tokens.enabled", True)):
+                    # top-k token PREFIX mà từng expert chọn, theo p: cột `token` + cột `proportion` (p / Σp của expert trong ảnh)
+                    import numpy as np
+                    from .. import s3_route_tokens as rtk
+                    wf, am, idc = route["weights"].float().cpu().numpy(), attn.cpu().numpy(), ids.cpu().numpy()
+                    img_id = gb.image_token_id(self._gemma)
+                    dec = rtk.tokenizer_decoder(self.processor.tokenizer, int(((idc == img_id) & am).sum(1).max()))
+                    k = int(self.cfg.get_path("route_tokens.sample_top_k", 32))
+                    route_cols = [rtk.sample_columns(np.where(idc[i] == img_id, rtk.IMG, idc[i])[am[i]], wf[i][am[i]], dec, k)
+                                  for i in range(idc.shape[0])]
                 stream = RouterStream(rt_, self._ctx, self._gemma.get_input_embeddings(),
-                                      rt_.scores(embeds), attn)         # mỗi token sinh ra được định tuyến nhân quả
+                                      rt_.scores(embeds), attn,         # mỗi token sinh ra được định tuyến nhân quả
+                                      trace=need_trace)
             kw = {"inputs_embeds": embeds, "attention_mask": inputs.get("attention_mask"),
                   "token_type_ids": inputs.get("token_type_ids")}
             kw = {k: v for k, v in kw.items() if v is not None}
@@ -149,7 +168,25 @@ class Gemma3ECRunner(Gemma3Runner):
             last = (in_len + glen - 2).clamp(min=in_len - 1, max=hid.shape[1] - 1)
             full = self.heads.cls_head(hid, None)                           # [B,T,14,4] nhân quả
             logits = full[torch.arange(hid.shape[0], device=hid.device), last]   # vị trí cuối của báo cáo đã sinh
-            self._aux(batch, logits, route)
+            if route is not None and need_trace:
+                # 2 mẫu cố định: p của từng patch ảnh (‰) và của từng token sinh ra (token + ‰) ⇒ ảnh highlight ở báo cáo
+                img_id = gb.image_token_id(self._gemma)
+                wfull = route["weights"].float()
+                Wt = (torch.round(torch.stack(stream.trace, 0).float() * 1000).to(torch.int16).cpu()
+                      if stream is not None and stream.trace else None)
+                route_viz = {}
+                for i, it in enumerate(batch):
+                    if str(it["key"]) not in viz_keys:
+                        continue
+                    pos = ((ids[i] == img_id) & attn[i]).nonzero().flatten()
+                    rec = {"img": torch.round(wfull[i, pos] * 1000).to(torch.int16).cpu().tolist(),
+                           "gen_tok": [], "gen_w": []}
+                    if Wt is not None:
+                        n_i = max(0, min(int(glen[i]) - 1, Wt.shape[0]))
+                        rec["gen_tok"] = self.processor.tokenizer.convert_ids_to_tokens(gen_[i, :n_i].tolist())
+                        rec["gen_w"] = Wt[:n_i, i, :].tolist()
+                    route_viz[str(it["key"])] = rec
+            self._aux(batch, logits, route, route_cols, route_viz)
         gen = out[:, in_len:] if out.shape[1] > in_len else out
         return [t.strip() for t in self.processor.batch_decode(gen, skip_special_tokens=True)]
 

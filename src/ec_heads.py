@@ -168,8 +168,12 @@ class RouterStream:
     mỗi token mới -> thêm z vào lịch sử -> trọng số của riêng token đó (so với mọi token trước) -> ctx.set.
     Hook chỉ chạy khi forward có đúng 1 token (bước giải mã), nên không đụng tới huấn luyện/prefill."""
 
-    def __init__(self, router: ECRouter, ctx, emb_layer: nn.Module, z0: torch.Tensor, valid0: torch.Tensor):
+    def __init__(self, router: ECRouter, ctx, emb_layer: nn.Module, z0: torch.Tensor, valid0: torch.Tensor,
+                 trace: bool = False):
         self.router, self.ctx = router, ctx
+        # trace=True: lưu trọng số p [B,E] của TỪNG token sinh ra theo thứ tự (trace[k] ↔ token sinh thứ k; token cuối
+        # cùng không bao giờ được nạp lại nên không có phần tử) — dùng cho ảnh highlight câu dự đoán ở báo cáo.
+        self.trace = [] if trace else None
         self.z, self.valid = z0, valid0.bool()
         self.handle = emb_layer.register_forward_hook(self._hook)
 
@@ -180,6 +184,8 @@ class RouterStream:
         v = torch.cat([self.valid, torch.ones_like(self.valid[:, :1])], dim=1)
         self.z, self.valid = z, v
         w = self.router.weights_from_scores(z, v)["weights"][:, -1:]
+        if self.trace is not None:
+            self.trace.append(w[:, 0, :].detach())
         self.ctx.set(w, repeat=1)
 
     def close(self):

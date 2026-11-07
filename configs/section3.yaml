@@ -173,6 +173,16 @@ exp32:
   c: null                               # null = tự chọn từ 3.1; hoặc ép: 1 | 2 | a | số (vd --set exp32.c=a)
   baseline: true
 
+# Bảng TOP-K TOKEN MỖI EXPERT CHỌN TRONG PREFIX (định tính hành vi): lúc infer, arm MoE ghi vào MỖI dòng `predictions/<arm>.jsonl`
+# hai cột `token` và `proportion` (E danh sách mỗi cột: top-k token prefix theo p của từng expert, và p / Σp của expert trong ảnh);
+# stage analysis tổng hợp 6400 ảnh từ hai cột đó ⇒ `arms/<arm>/route_tokens.{md,csv}`.
+# Token văn bản gộp theo id; token ảnh gộp theo vị trí patch IMG[r,c]. Predictions cũ thiếu hai cột này bị coi là chưa xong ⇒ infer lại arm đó.
+route_tokens:
+  enabled: true
+  top_k: 20                # số token mỗi expert trong bảng tổng hợp
+  sample_top_k: 32         # số token mỗi expert lưu trong từng dòng prediction (cột token/proportion)
+  viz_n: 2                 # số mẫu cố định vẽ ảnh highlight route (mặc định: 2 key đầu của test); hoặc đặt viz_keys: [key1, key2]
+
 analysis:
   collapse_threshold: 0.9      # cos ΔW trung bình ngoài đường chéo ≥ ngưỡng ⇒ sụp đổ về 1 DoRA
   static_cv: 0.05              # CV của trọng số route qua ảnh < ngưỡng ⇒ route tĩnh ⇒ sụp đổ

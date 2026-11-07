@@ -63,8 +63,18 @@ def read_preds(path: Path) -> dict[str, dict]:
     return out
 
 
-def count_preds(path: Path) -> int:
-    return len(read_preds(path))
+def count_preds(path: Path, field: str | None = None) -> int:
+    """Số mẫu đã có; `field` ⇒ chỉ đếm dòng CÓ trường đó (vd `token` — dòng cũ thiếu nó coi như chưa xong)."""
+    rows = read_preds(path).values()
+    return sum(1 for r in rows if field is None or r.get(field)) if field else len(read_preds(path))
+
+
+def need_field(cfg: Cfg, arm: dict) -> str | None:
+    """Trường bắt buộc trong predictions của arm: MoE cần cột `token` (+ `proportion`; bảng top-k token mỗi expert) khi bật."""
+    if arm.get("kind") == "ft" and arm.get("decoder") == "moe" and \
+            bool((cfg.get("route_tokens", {}) or {}).get("enabled", True)):
+        return "token"
+    return None
 
 
 # ── lưới arm ────────────────────────────────────────────────────────────────
@@ -382,9 +392,13 @@ def main(argv: list[str] | None = None) -> int:
     for arm in arms:
         aid = arm["id"]
         pp = run_dir / "predictions" / f"{aid}.jsonl"
-        if not a.retrain and count_preds(pp) < n_need:
+        nf = need_field(cfg, arm)
+        if not a.retrain and count_preds(pp, nf) < n_need:
             hub.pull_file(f"{sub}/predictions/{aid}.jsonl", pp)
-        arm["preds_done"] = (not a.retrain) and count_preds(pp) >= n_need
+        arm["preds_done"] = (not a.retrain) and count_preds(pp, nf) >= n_need
+        if not a.retrain and nf and not arm["preds_done"] and count_preds(pp) >= n_need:
+            print(f"⚙ {aid}: predictions cũ THIẾU `{nf}` (cột token/proportion) ⇒ infer lại arm này để dựng bảng top-k token mỗi expert chọn.",
+                  flush=True)
         if arm["kind"] != "ft":
             continue
         if arm["preds_done"]:
@@ -441,6 +455,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         test_df = data_mod.load_manifest(cfg)
     manifest["n_test"] = len(test_df)
+    # 2 mẫu cố định (mặc định: 2 key đầu của test) để vẽ ảnh highlight route theo expert — chọn trước infer để runner lưu route dày đặc
+    _rt = cfg.setdefault("route_tokens", {})
+    _vk = [str(k) for k in (_rt.get("viz_keys") or [])]
+    _tk = set(test_df["key"].astype(str))
+    _vk = [k for k in _vk if k in _tk] or test_df["key"].astype(str).tolist()[:int(_rt.get("viz_n", 2))]
+    _rt["viz_keys"] = _vk
     if train_df is not None:
         manifest["n_train"] = len(train_df)
 
@@ -499,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             if arm.get("preds_done"):
                 print(f"⚙ {arm['id']}: đã có predictions đủ — bỏ qua infer.", flush=True)
                 continue
-            mcfg = model_cfg(cfg, arm, adapter_root)
+            mcfg = model_cfg(cfg, arm, arm.get("adapter_root", adapter_root))
             print(f"\n── {arm['name']} ({mcfg['runner']}) ──", flush=True)
             clear_vram("trước infer")
             t0 = time.time()
@@ -620,6 +640,14 @@ def main(argv: list[str] | None = None) -> int:
                              tkeys, pos, tkeys, mdir / "analysis",
                              float(cfg.get("analysis", {}).get("collapse_threshold", 0.9)),
                              float(cfg.get("analysis", {}).get("static_cv", 0.05)))
+            try:
+                from . import s3_route_tokens as rtk
+                rtk.write(cfg, arm["id"], read_preds(pred_paths[arm["id"]]), int(arm["E"]), mdir / "analysis")
+                from . import s3_route_viz as rtv
+                rtv.write(cfg, arm["id"], read_preds(pred_paths[arm["id"]]), test_df, int(arm["E"]), mdir / "analysis",
+                          cfg["route_tokens"]["viz_keys"])
+            except Exception as e:  # noqa: BLE001 — bảng định tính không được giết cả lần chạy
+                print(f"  ⚠ [{arm['id']}] không dựng được bảng token theo expert: {e!r}", flush=True)
             if res:
                 v = res["verdict"]
                 print(f"  [{arm['id']}] route_corr={v['route_corr_offdiag']:.3f} "
