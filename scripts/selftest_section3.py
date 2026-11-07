@@ -129,15 +129,17 @@ def main() -> int:
               ok_ and (r32 / "predictions" / "ac_e4.jsonl").exists() and (r32 / "metrics" / "per_sample_ac_e4.csv").exists()
               and (rp_.arm_dir(r32, "ac_e4") / "summary.json").exists() and arm_["adapter_root"] == Path(td) / "ad31"
               and arm_["hub_sub"] == "sub31")
-        for old in ("3.3", "3.4", "3.1-1"):
+        for old in ("3.5", "3.1-1"):
             try:
                 build_arms(cfg, old)
                 check(f"{old} chưa thiết lập", False)
             except ValueError:
                 check(f"{old} chưa thiết lập", True)
         check("thư mục kết quả/adapter v4 (Hub không tái dùng kết quả v3 chạy trên data khác)",
-              rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4"}
-              and rs.ADAPTER == {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4"})
+              rs.SUBDIR == {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4",
+                                "3.3": "3.3_vision_v4", "3.4": "3.4_cls_head_v4"}
+              and rs.ADAPTER == {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4", "3.3": "./adapters_3_3_v4",
+                                 "3.4": "./adapters_3_4_v4"})
 
         # ── chính sách thí nghiệm ──
         d_, st_ = cfg["data"], cfg["stats"]

@@ -122,8 +122,8 @@ VISION_TAG = {"last_third": "last3", "all": "full"}
 def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
     """cfg riêng của arm khi arm ghi đè phạm vi lớp vision được finetune (`vision_layers`: last_third | all | second_half | …)."""
     vl = arm.get("vision_layers")
-    if not vl:
-        return cfg
+    if not vl or str(vl) == str(((cfg.get("train") or {}).get("vision_adapter") or {}).get("layers", "")):
+        return cfg                                        # không đổi gì ⇒ dùng nguyên cfg gốc
     import copy
     c = copy.deepcopy(cfg)
     c["train"]["vision_adapter"] = {**dict((c["train"].get("vision_adapter") or {})), "layers": str(vl)}
