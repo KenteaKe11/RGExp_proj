@@ -697,7 +697,12 @@ def main(argv: list[str] | None = None) -> int:
         if x["kind"] != "ft" or x["decoder"] != "moe" or not (cfg.get("route_tokens", {}) or {}).get("enabled", True):
             return False
         d = rp.arm_dir(run_dir, x["id"])
-        return not (d / "route_tokens.md").exists() or not (d / "route_viz.json").exists()
+        try:
+            from .s3_route_viz import STYLE
+            cur = json.loads((d / "route_viz.json").read_text(encoding="utf-8")).get("style")
+        except Exception:  # noqa: BLE001
+            return True
+        return not (d / "route_tokens.md").exists() or cur != STYLE
 
     need_sub = [x for x in arms if a.retrain or a.rescore or x.get("fresh") or _viz_stale(x)
                 or rp.arm_problem(rp.load_arm_summary(run_dir, x["id"]), x)]

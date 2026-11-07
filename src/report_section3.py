@@ -177,18 +177,7 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
             parts += ["### Token prefix mỗi Expert chọn (top-k theo p, tổng hợp trên ảnh test)", "",
                       _details("Bảng top-k token mỗi expert — mean_proportion và freq (đủ cột ở `route_tokens.csv`)",
                                (ad / "route_tokens.md").read_text(encoding="utf-8")), ""]
-        vz = ad / "route_viz.json"
-        if vz.exists():
-            smp = json.loads(vz.read_text(encoding="utf-8")).get("samples", [])
-            parts += ["### Ví dụ định tính (2 mẫu cố định)", "",
-                      "Mỗi expert một hình riêng (không gộp/che lấp nhau); opacity của màu expert giảm dần theo p của chính nó "
-                      "(đậm nhất = p_max của expert trong mẫu, p nhỏ ⇒ mờ, không chọn ⇒ không tô). "
-                      "Ảnh: ảnh gốc + E ảnh phủ màu từng expert. Câu: E khối câu dự đoán (mỗi khối một expert), kèm `y_gt` gốc.", ""]
-            for x in smp:
-                parts += [f"**Mẫu {x['idx']}** — `{x['key']}`", ""]
-                for suf in ("img", "text"):
-                    if (ad / f"route_viz_{x['idx']}_{suf}.png").exists():
-                        parts += [f"![mẫu {x['idx']} {suf}](route_viz_{x['idx']}_{suf}.png)", ""]
+        parts += _viz_md(ad)
     elif arm["kind"] == "ft" and arm["decoder"] == "moe":
         parts += ["## Route", "", "*(chưa có phân tích route — chạy `--stages analysis,report`)*", ""]
     cvec = [{"step": h["step"], **{k: v for k, v in h.items() if k.startswith("c_e")}}
@@ -251,6 +240,24 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
                    + " Chi tiết từng arm ở mục E-Clinical.")
     out.append("- Một khác biệt chỉ có nghĩa khi p_perm < α và CI bootstrap loại 0 (xem mục Friedman và hậu kiểm).")
     return "\n".join(out)
+
+
+def _viz_md(ad: Path, rel: str = "") -> list[str]:
+    """Khối 'Ví dụ định tính' (2 mẫu cố định, ảnh theo từng expert). `rel` = tiền tố đường dẫn tương đối tới thư mục arm."""
+    vz = ad / "route_viz.json"
+    if not vz.exists():
+        return []
+    smp = json.loads(vz.read_text(encoding="utf-8")).get("samples", [])
+    out = ["### Ví dụ định tính (2 mẫu cố định)", "",
+           "Mỗi expert một hình riêng (không gộp/che lấp nhau); opacity của màu expert giảm dần theo p của chính nó "
+           "(đậm nhất = p_max của expert trong mẫu, p nhỏ ⇒ mờ, không chọn ⇒ không tô). "
+           "Ảnh: ảnh gốc + E ảnh phủ màu từng expert. Câu: E khối câu dự đoán (mỗi khối một expert), kèm `y_gt` gốc.", ""]
+    for x in smp:
+        out += [f"**Mẫu {x['idx']}** — `{x['key']}`", ""]
+        for suf in ("img", "text"):
+            if (ad / f"route_viz_{x['idx']}_{suf}.png").exists():
+                out += [f"![mẫu {x['idx']} {suf}]({rel}route_viz_{x['idx']}_{suf}.png)", ""]
+    return out
 
 
 def _details(summary: str, body: str, open_: bool = False) -> str:
@@ -406,6 +413,16 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, fr: pd.Da
                   "*Sụp đổ* = cosine ΔW giữa các expert ≥ ngưỡng, HOẶC route tĩnh (trọng số gần như không đổi theo ảnh).", ""]
         parts += [_route_md(sums[a["id"]]["name"], sums[a["id"]]["route"], arm_dir(run_dir, a["id"]),
                             f"arms/{a['id']}/e_heatmap.png") for a in moe]
+        for a_ in moe:        # bảng token + ảnh định tính từng expert ngay trong báo cáo cuối (không chỉ ở báo cáo con)
+            ad_ = arm_dir(run_dir, a_["id"])
+            ex = []
+            if (ad_ / "route_tokens.md").exists():
+                ex += ["### Token prefix mỗi Expert chọn (top-k theo p)", "",
+                       _details("Bảng top-k token mỗi expert — mean_proportion và freq",
+                                (ad_ / "route_tokens.md").read_text(encoding="utf-8")), ""]
+            ex += _viz_md(ad_, f"arms/{a_['id']}/")
+            if ex:
+                parts += [f"## Định tính route — {sums[a_['id']]['name']}", ""] + ex
     parts += ["## Giả định cần biết", "",
               "- `best.json` chỉ là gợi ý theo hạng lâm sàng TB (hoà ⇒ hạng văn bản TB), không qua kiểm định; quyết định chọn cấu hình là của người dùng.",
               "- EC-Router nhân quả (Expert-Choice): RMSNorm → Linear D→E; tại vị trí t mỗi expert chọn token nếu điểm "

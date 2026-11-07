@@ -18,6 +18,7 @@ PALETTE = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 1
            (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
 
 # opacity tối đa của highlight (tại p = p_max của expert trong mẫu); p nhỏ hơn ⇒ mờ dần tuyến tính về 0
+STYLE = "per_expert_v2"      # đổi khi kiểu vẽ đổi ⇒ báo cáo con cũ tự bị dựng lại
 IMG_ALPHA_MAX = 0.65
 TXT_ALPHA_MAX = 0.60
 
@@ -187,6 +188,6 @@ def write(cfg, arm_id: str, preds: dict[str, dict], test_df, n_experts: int, out
         ok_t = route_text(rv.get("gen_tok") or [], rv.get("gen_w") or [], str(row.ref), out_dir / f"{arm_id}_route_viz_{i}_text.png",
                           n_experts)
         saved.append({"idx": i, "key": key, "img": ok_i, "text": ok_t})
-    (out_dir / f"{arm_id}_route_viz.json").write_text(json.dumps({"samples": saved}, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / f"{arm_id}_route_viz.json").write_text(json.dumps({"style": STYLE, "samples": saved}, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"  [{arm_id}] ảnh định tính route: {len(saved)}/{len(viz_keys)} mẫu cố định", flush=True)
     return saved
