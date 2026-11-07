@@ -204,6 +204,24 @@ def pow2_ladder(cap: int) -> list[int]:
     return out
 
 
+def locate_adapter(arm: dict, roots: list, hubs: list, pull_root: Path, hub, sm) -> Path | None:
+    """Tìm adapter đã train (đủ safetensors expert/LoRA + ec_heads): thư mục local trước, rồi Hub. Trả về root chứa `<arm id>/` hoặc None.
+    Không đòi `train_stats.json` (chỉ phục vụ báo cáo) ⇒ có trọng số là đủ để infer."""
+    from .ec_heads import heads_exist
+    aid = arm["id"]
+    w = sm.EXPERTS_FILE if arm["decoder"] == "moe" else "adapter_model.safetensors"
+    ok = lambda r: (Path(r) / aid / w).exists() and heads_exist(Path(r) / aid)  # noqa: E731
+    for r in dict.fromkeys(map(Path, roots)):
+        if ok(r):
+            return r
+    for hs in dict.fromkeys(hubs):
+        if hub.has_dir(f"{hs}/adapters/{aid}", (w, "ec_heads.safetensors")):
+            hub.pull_dir(f"{hs}/adapters/{aid}", Path(pull_root) / aid)
+            if ok(pull_root):
+                return Path(pull_root)
+    return None
+
+
 def model_cfg(cfg: Cfg, arm: dict, adapter_root: Path) -> Cfg:
     b = dict(cfg["base"])
     cap = int(b.get("batch_size", 8))
@@ -404,11 +422,15 @@ def main(argv: list[str] | None = None) -> int:
         if arm["preds_done"]:
             arm["need_train"] = False          # có kết quả infer ⇒ bỏ qua train ngay
             continue
-        if not a.retrain and not trained(arm):
-            must = (sm.EXPERTS_FILE,) if arm["decoder"] == "moe" else ("adapter_model.safetensors",)
-            if hub.has_dir(f"{sub}/adapters/{aid}", ("train_stats.json", "ec_heads.safetensors") + must):
-                hub.pull_dir(f"{sub}/adapters/{aid}", adapter_root / aid)
-        arm["need_train"] = a.retrain or not trained(arm)
+        # cần infer ⇒ TÌM safetensors đã train trước (local → Hub, cả thư mục của 3.1), chỉ train khi không đâu có
+        loc = None
+        if not a.retrain:
+            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31],
+                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm)
+            if loc is not None:
+                arm["adapter_root"] = loc
+                print(f"⚙ {aid}: tìm thấy safetensors đã train ở {loc / aid} ⇒ KHÔNG train lại, chỉ infer.", flush=True)
+        arm["need_train"] = a.retrain or loc is None
     for arm in arms:                    # báo cáo con đã có trên Hub ⇒ kéo về (không phải làm lại)
         ad_ = rp.arm_dir(run_dir, arm["id"])
         if not a.retrain and not a.rescore and not (ad_ / "summary.json").exists():
