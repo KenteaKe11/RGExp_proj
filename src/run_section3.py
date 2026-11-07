@@ -204,7 +204,7 @@ def pow2_ladder(cap: int) -> list[int]:
     return out
 
 
-def locate_adapter(arm: dict, roots: list, hubs: list, pull_root: Path, hub, sm) -> Path | None:
+def locate_adapter(arm: dict, roots: list, hubs: list, pull_root: Path, hub, sm, tag: str = "v4", expect_n: int = 0) -> Path | None:
     """Tìm adapter đã train (đủ safetensors expert/LoRA + ec_heads): thư mục local trước, rồi Hub. Trả về root chứa `<arm id>/` hoặc None.
     Không đòi `train_stats.json` (chỉ phục vụ báo cáo) ⇒ có trọng số là đủ để infer."""
     from .ec_heads import heads_exist
@@ -219,6 +219,40 @@ def locate_adapter(arm: dict, roots: list, hubs: list, pull_root: Path, hub, sm)
             hub.pull_dir(f"{hs}/adapters/{aid}", Path(pull_root) / aid)
             if ok(pull_root):
                 return Path(pull_root)
+    # Không có ở chỗ dự kiến. Theo source: `push_artifact` đẩy adapter lên `<hub_repo>/<output.subdir>/adapters/<arm id>/…`
+    # ⇒ liệt kê MỌI `<subdir>/adapters/<arm id>/<safetensors>` đã có trên Hub (mọi subdir từng dùng) và dùng lại.
+    # Ưu tiên subdir cùng thế hệ `tag` (v4) rồi cùng exp; subdir khác thế hệ chỉ nhận khi train_stats.json khớp n_train
+    # (tránh dùng adapter train trên split khác ⇒ rò rỉ test).
+    def _skip(path: str) -> bool:
+        low = path.lower()
+        return "dryrun" in low or "_archive" in low
+    lay = [f for f in hub.files() if f.endswith(f"/adapters/{aid}/{w}") and not _skip(f)]
+    pre_of = lambda f: f[:-len(w) - 1]  # noqa: E731
+    rank = lambda f: (tag not in f.lower(), not f.startswith(str(arm.get("exp", "3.")) [:2]), f)  # noqa: E731
+    hub_c = [pre_of(f) for f in sorted(lay, key=rank)]
+    print(f"  ↳ {aid}: các subdir đã push adapter trên {getattr(hub, 'repo', 'Hub')}: {hub_c[:8]}", flush=True)
+    for pre in hub_c:
+        if hub.has_dir(pre, (w, "ec_heads.safetensors")):
+            tmp = Path(pull_root) / aid
+            hub.pull_dir(pre, tmp)
+            if not ok(pull_root):
+                continue
+            if tag not in pre.lower() and expect_n:
+                try:
+                    n = int(json.loads((tmp / "train_stats.json").read_text(encoding="utf-8")).get("n_train", -1))
+                except Exception:  # noqa: BLE001
+                    n = -1
+                if n != expect_n:
+                    print(f"  ↳ {aid}: bỏ {pre} (khác thế hệ '{tag}', n_train={n} ≠ {expect_n})", flush=True)
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    continue
+            print(f"  ↳ {aid}: dùng lại adapter đã push ở Hub:{pre}", flush=True)
+            return Path(pull_root)
+    cands = [p for p in Path(".").glob(f"**/{aid}/{w}") if tag in p.as_posix().lower() and not _skip(p.as_posix())]
+    for p in sorted(cands, key=lambda q: -q.stat().st_mtime):
+        if heads_exist(p.parent):
+            print(f"  ↳ {aid}: thấy adapter ở thư mục local khác: {p.parent}", flush=True)
+            return p.parent.parent
     return None
 
 
@@ -426,7 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         loc = None
         if not a.retrain:
             loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31],
-                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm)
+                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm,
+                                 expect_n=int(cfg["data"].get("n_train") or 0))
             if loc is not None:
                 arm["adapter_root"] = loc
                 print(f"⚙ {aid}: tìm thấy safetensors đã train ở {loc / aid} ⇒ KHÔNG train lại, chỉ infer.", flush=True)
