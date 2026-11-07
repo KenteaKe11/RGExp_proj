@@ -181,8 +181,9 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
         if vz.exists():
             smp = json.loads(vz.read_text(encoding="utf-8")).get("samples", [])
             parts += ["### Ví dụ định tính (2 mẫu cố định)", "",
-                      "Màu = expert có p lớn nhất tại token (xám/không tô = không expert nào chọn); độ đậm ∝ p. "
-                      "Ảnh trái-phải: ảnh gốc | patch tô màu theo expert. Ảnh dưới: câu dự đoán tô màu theo expert của từng token, kèm `y_gt` gốc.", ""]
+                      "Mỗi expert một hình riêng (không gộp/che lấp nhau); opacity của màu expert giảm dần theo p của chính nó "
+                      "(đậm nhất = p_max của expert trong mẫu, p nhỏ ⇒ mờ, không chọn ⇒ không tô). "
+                      "Ảnh: ảnh gốc + E ảnh phủ màu từng expert. Câu: E khối câu dự đoán (mỗi khối một expert), kèm `y_gt` gốc.", ""]
             for x in smp:
                 parts += [f"**Mẫu {x['idx']}** — `{x['key']}`", ""]
                 for suf in ("img", "text"):
