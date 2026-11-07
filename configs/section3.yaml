@@ -173,6 +173,15 @@ exp32:
   c: null                               # null = tự chọn từ 3.1; hoặc ép: 1 | 2 | a | số (vd --set exp32.c=a)
   baseline: true
 
+# 3.3: NHÁNH VISION. Decoder/router cố định = AC-E4 (E, c bên dưới; mặc định Adaptive Capacity E=4 — cấu hình mạnh nhất của 3.1/3.2).
+# `variants` = phạm vi lớp vision encoder được finetune DoRA: last_third (1/3 lớp cuối = mặc định train.vision_adapter.layers) | all (Full DoRA)
+# | second_half | last_<n>. Biến thể trùng mặc định train.vision_adapter.layers ⇒ chính là AC-E4 của 3.1 ⇒ KẾ THỪA, không train lại.
+exp33:
+  E: 4
+  c: a
+  variants: [last_third, all]
+  baseline: true                        # Baseline = Gemma 3 gốc, kế thừa từ 3.1
+
 # Bảng TOP-K TOKEN MỖI EXPERT CHỌN TRONG PREFIX (định tính hành vi): lúc infer, arm MoE ghi vào MỖI dòng `predictions/<arm>.jsonl`
 # hai cột `token` và `proportion` (E danh sách mỗi cột: top-k token prefix theo p của từng expert, và p / Σp của expert trong ảnh);
 # stage analysis tổng hợp 6400 ảnh từ hai cột đó ⇒ `arms/<arm>/route_tokens.{md,csv}`.

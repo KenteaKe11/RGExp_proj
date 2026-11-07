@@ -3,6 +3,7 @@
 #   bash scripts/run_section3.sh --exp 3.0            # DATA mới: split cân bằng nhãn, 1 bệnh nhân – 1 mẫu (chạy trước)
 #   bash scripts/run_section3.sh --exp 3.1            # dò c (E=4): c ∈ {1, 2, a} + Baseline
 #   bash scripts/run_section3.sh --exp 3.2            # dò E ∈ {2, 4, 6} với c tốt nhất của 3.1 (arm E4 + Baseline kế thừa từ 3.1)
+#   bash scripts/run_section3.sh --exp 3.3            # vision: DoRA 1/3 lớp cuối (kế thừa AC-E4 của 3.1) vs Full DoRA + Baseline (kế thừa)
 # Tùy chọn: --dry-run · --detach · --stages a,b · --arms id1,id2 · --retrain · --no-push · --no-wandb
 # Không còn pretrain; Cls head học cùng lúc. Hub được quét trước (--no-hub để tắt).
 # Mã thoát: 0 xong · 2 cấu hình sai · 3 train hỏng · 4 rò rỉ/trùng bệnh nhân · 5 data lệch cỡ/cân bằng · 6 sinh hỏng · 7 báo cáo hỏng · 8 đẩy Hub hỏng · 9 thiếu báo cáo con

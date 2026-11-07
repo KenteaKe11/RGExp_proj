@@ -1,4 +1,4 @@
-"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.0|3.1|3.2
+"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.0|3.1|3.2|3.3
 
     3.0  Data: split MỚI cân bằng nhãn · 1 bệnh nhân – 1 mẫu (train 12800 · val 128 · test 6400), manifest + ảnh,
          báo cáo cân bằng (BALANCE.md). Không train, không infer.
@@ -7,10 +7,12 @@
     3.2  DÒ E (c cố định = c TỐT NHẤT của 3.1): E ∈ {2, 4, 6} + Baseline. Arm E=`exp31.E` và Baseline được KẾ THỪA
          nguyên từ 3.1 (adapter, predictions, điểm, báo cáo con) ⇒ không train/infer lại. c tốt nhất chọn theo hạng
          lâm sàng TB (hoà ⇒ hạng văn bản) trên điểm 3.1, hoặc `--set exp32.c=<1|2|a|số>` do bạn chỉ định; ghi ở `c_choice.json`.
+    3.3  NHÁNH VISION (decoder/router cố định = AC-E4, `exp33.c/E`): finetune DoRA 1/3 lớp CUỐI vs FULL DoRA (mọi lớp) của vision
+         encoder + Baseline. Arm "1/3 cuối" chính là AC-E4 của 3.1 (cùng cấu hình) ⇒ KẾ THỪA nguyên từ 3.1, chỉ train arm Full DoRA.
     Tiêu chí mỗi exp: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ · Friedman + hậu kiểm.
-    (các exp sau 3.2: chưa thiết lập; exp 3.1/3.2/3.4 cũ ở _archive/section3_v3/)
+    (các exp sau 3.3: chưa thiết lập; exp 3.1/3.2/3.4 cũ ở _archive/section3_v3/)
 
-Stage (3.1, 3.2): data → train → infer → score → stats → analysis → report → push.
+Stage (3.1–3.3): data → train → infer → score → stats → analysis → report → push.
 Chính sách: infer GREEDY · train 12800 mẫu = 400 bước × batch 32 · val mỗi 40 bước, patience 3 (+ min_delta) ·
 test 6400 mẫu, 4 tập bootstrap × 6400 mẫu (bảng điểm); kiểm định bằng Friedman + hậu kiểm. Cls head huấn luyện CÙNG LÚC với decoder (loss = CE_text + 0.1·CE_cls).
 Mọi stage quét Hub trước: có predictions ⇒ bỏ qua train+infer; có adapter ⇒ bỏ qua train.
@@ -36,8 +38,8 @@ from .tracking import Tracker
 STAGES = ["data", "train", "infer", "score", "stats", "analysis", "report", "push"]
 # v4: chính sách thí nghiệm mới (data cân bằng nhãn 12800/1280/6400, 400 bước × batch 32). Thư mục RIÊNG để quét Hub
 # không bao giờ tái dùng predictions/adapter của các lần chạy v3 (huấn luyện/đánh giá trên data khác).
-SUBDIR = {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4"}
-ADAPTER = {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4"}
+SUBDIR = {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4", "3.3": "3.3_vision_v4"}
+ADAPTER = {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4", "3.3": "./adapters_3_3_v4"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -109,6 +111,21 @@ def _baseline_arm() -> dict:
     return {"id": "baseline_infer", "name": "Baseline · Gemma 3 gốc", "kind": "infer", "runner": "gemma3"}
 
 
+VISION_LABEL = {"last_third": "1/3 cuối (DoRA)", "all": "Full DoRA"}
+VISION_TAG = {"last_third": "last3", "all": "full"}
+
+
+def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
+    """cfg riêng của arm khi arm ghi đè phạm vi lớp vision được finetune (`vision_layers`: last_third | all | second_half | …)."""
+    vl = arm.get("vision_layers")
+    if not vl:
+        return cfg
+    import copy
+    c = copy.deepcopy(cfg)
+    c["train"]["vision_adapter"] = {**dict((c["train"].get("vision_adapter") or {})), "layers": str(vl)}
+    return c
+
+
 def build_arms(cfg: Cfg, exp: str, c_choice: dict | None = None) -> list[dict]:
     """3.1: dò c ở E cố định. 3.2: dò E ở c = `c_choice['c']` (c tốt nhất của 3.1); arm E = exp31.E và Baseline
     mang `inherit_from` = '3.1' (kế thừa nguyên từ 3.1)."""
@@ -126,11 +143,27 @@ def build_arms(cfg: Cfg, exp: str, c_choice: dict | None = None) -> list[dict]:
             if int(x["E"]) == E0:
                 x["inherit_from"] = "3.1"
         base = bool(e32.get("baseline", True))
+    elif exp == "3.3":
+        e33 = cfg.get("exp33") or {}
+        E = int(e33.get("E", E0))
+        c = e33.get("c", "a")
+        default_v = str(((cfg.get("train") or {}).get("vision_adapter") or {}).get("layers", "last_third"))
+        arms = []
+        for v in (e33.get("variants") or ["last_third", "all"]):
+            x = dict(_arm_for(c, E))
+            x["vision_layers"] = str(v)
+            if str(v) == default_v:          # cấu hình đúng bằng arm đã train ở 3.1 (vision 1/3 cuối) ⇒ kế thừa, không train lại
+                x["inherit_from"] = "3.1"
+            else:
+                x["id"] += "_v" + VISION_TAG.get(str(v), str(v))
+            x["name"] = f"{x['name']} · vision {VISION_LABEL.get(str(v), str(v))}"
+            arms.append(x)
+        base = bool(e33.get("baseline", True))
     else:
-        raise ValueError(f"--exp phải là 3.0|3.1|3.2, nhận {exp!r} (các exp sau 3.2 chưa được thiết lập)")
+        raise ValueError(f"--exp phải là 3.0|3.1|3.2|3.3, nhận {exp!r} (các exp sau 3.3 chưa được thiết lập)")
     if base:
         b = _baseline_arm()
-        if exp == "3.2":
+        if exp in ("3.2", "3.3"):
             b["inherit_from"] = "3.1"
         arms.append(b)
     if len({x["id"] for x in arms}) != len(arms):
@@ -182,6 +215,14 @@ def inherit_arm(arm: dict, run_dir: Path, run_dir31: Path, hub, sub31: str, adap
             hub.pull_dir(f"{sub31}/arms/{aid}", sd)
         if sd.exists():
             shutil.copytree(sd, dd, dirs_exist_ok=True)
+            if arm.get("name"):            # arm kế thừa mang tên của exp hiện tại (vd 3.3: "… · vision 1/3 cuối")
+                try:
+                    sj = dd / "summary.json"
+                    sv = json.loads(sj.read_text(encoding="utf-8"))
+                    sv["name"] = arm["name"]
+                    sj.write_text(json.dumps(sv, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+                except Exception:  # noqa: BLE001
+                    pass
     ok = (run_dir / "predictions" / f"{aid}.jsonl").exists() and (run_dir / "metrics" / f"per_sample_{aid}.csv").exists()
     if ok:                               # chỉ trỏ sang adapter 3.1 khi kế thừa đủ; thiếu ⇒ arm chạy lại bình thường ở 3.2
         arm["hub_sub"] = sub31
@@ -297,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Cls head · EC-Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.0 (data) | 3.1 (dò c) | 3.2 (dò E)")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.0 (data) | 3.1 (dò c) | 3.2 (dò E) | 3.3 (vision)")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -313,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(a.config, a.overrides)
     exp = a.exp or str(cfg.get("experiment", "3.1"))
     if exp not in SUBDIR:
-        print(f"✗ experiment {exp!r} không hợp lệ (3.0|3.1|3.2)")
+        print(f"✗ experiment {exp!r} không hợp lệ (3.0|3.1|3.2|3.3)")
         return 2
     cfg["experiment"] = exp
     dry = bool(a.dry_run)
@@ -560,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n── {arm['name']} ──", flush=True)
             clear_vram("trước khi train arm")
             try:
-                s = st_mod.run_finetune(cfg, arm, train_df, val_df, cls_y, adapter_root / aid,
+                s = st_mod.run_finetune(arm_cfg(cfg, arm), arm, train_df, val_df, cls_y, adapter_root / aid,
                                         tracker, dry_steps)
             except TrainUnusable as e:
                 print(f"✗ {aid} KHÔNG huấn luyện được: {e}", flush=True)
@@ -649,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["n_eval"] = align_info["n_common"]
 
     best = None
-    if exp in ("3.1", "3.2") and not partial:
+    if exp in ("3.1", "3.2", "3.3") and not partial:
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
         best["note"] = "GỢI Ý theo hạng trung bình — không qua kiểm định; người dùng quyết định"
