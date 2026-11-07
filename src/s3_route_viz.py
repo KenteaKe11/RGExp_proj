@@ -18,6 +18,11 @@ PALETTE = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 1
            (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
 
 
+# độ trong suốt highlight (mờ): alpha patch ảnh = IMG_A0 + IMG_A1·p (0–255); độ phủ nền token = TXT_A0 + TXT_A1·p (0–1)
+IMG_A0, IMG_A1 = 35, 75
+TXT_A0, TXT_A1 = 0.15, 0.30
+
+
 def colors(E: int) -> list[tuple[int, int, int]]:
     return [PALETTE[e % len(PALETTE)] for e in range(E)]
 
@@ -68,7 +73,7 @@ def route_image(image_path: str, w_img, out: Path, E: int, title: str = "") -> b
             e = int(W[r, c].argmax())
             cnt[e] += 1
             d.rectangle([c * cell, r * cell, (c + 1) * cell - 1, (r + 1) * cell - 1],
-                        fill=colors(E)[e] + (int(70 + 150 * min(1.0, W[r, c, e])),))
+                        fill=colors(E)[e] + (int(IMG_A0 + IMG_A1 * min(1.0, W[r, c, e])),))
     mixed = Image.alpha_composite(base.convert("RGBA"), ov).convert("RGB")
     font, fs = _font(15), _font(13)
     H = S + 96
@@ -138,7 +143,7 @@ def route_text(tokens: list[str], w_gen, gt: str, out: Path, E: int, width: int 
             cnt[e] += 1
             wd = d.textlength(piece, font=font)
             d.rectangle([x0, y0 - 2, x0 + wd, y0 + lh - 8],
-                        fill=tuple(int(255 - (255 - c) * (0.35 + 0.5 * min(1.0, pm))) for c in colors(E)[e]))
+                        fill=tuple(int(255 - (255 - c) * (TXT_A0 + TXT_A1 * min(1.0, pm))) for c in colors(E)[e]))
         d.text((x0, y0), piece, fill=(0, 0, 0), font=font)
     labels = [f"E{e} {cnt[e]} token" for e in range(E)]
     _legend(d, m, 38, E, labels, fb)
