@@ -1,6 +1,6 @@
 # RGExp §3 — Cls head · EC-Router · MoE-DoRA
 
-Thí nghiệm hiện có: **3.0 (data mới)**, **3.1 (dò c)**, **3.2 (dò E)** và **3.3 (nhánh vision)**. Các exp 3.1/3.2/3.4 cũ (và README/config cũ) đã lưu ở `_archive/section3_v3/`; các exp sau 3.3 chưa thiết lập.
+Thí nghiệm hiện có: **3.0 (data mới)**, **3.1 (dò c)**, **3.2 (dò E)**, **3.3 (nhánh vision)** và **3.4 (vị trí Cls head)**. Các exp 3.1/3.2/3.4 cũ (và README/config cũ) đã lưu ở `_archive/section3_v3/`; các exp sau 3.4 chưa thiết lập.
 
 Sinh báo cáo X-quang ngực với Gemma-3-4b-it (NF4). Thí nghiệm §2.x cũ nằm trong `_archive/section2_full/`.
 
@@ -36,10 +36,11 @@ tokens ─► Causal EC-Router ─► w [B,T,E] ─► Decoder (base đóng băn
 | 3.1 | **Dò c** (E cố định = 4): **c ∈ {1, 2, a}** + **Baseline** (Gemma 3 gốc). c số ⇒ mỗi expert chọn k=⌈c·N/E⌉ token; **a** = Adaptive Capacity, k_i=⌈max(N/E, e^{H_i})⌉. |
 | 3.2 | **Dò E** ∈ {2, 4, 6} với **c tốt nhất của 3.1** (hạng lâm sàng TB, hoà ⇒ hạng văn bản; tự chỉ định: `--set exp32.c=<1\|2\|a\|số>`; quyết định lưu ở `c_choice.json`) + Baseline. Arm E=4 và Baseline **kế thừa nguyên từ 3.1** (adapter, predictions, điểm, báo cáo con) ⇒ không train/infer lại; chỉ train E=2 và E=6. Cần chạy 3.1 xong trước. |
 | 3.3 | **Nhánh vision**, decoder/router cố định = **AC-E4** (`exp33.E/c`): finetune DoRA **1/3 lớp cuối** vs **Full DoRA** (mọi lớp) của vision encoder + Baseline. Arm 1/3 cuối chính là AC-E4 của 3.1 và Baseline **kế thừa nguyên từ 3.1**; chỉ train `ac_e4_vfull`. Biến thể chọn bằng `exp33.variants` (`last_third`, `all`, `second_half`, `last_<n>`). Cần chạy 3.1 xong trước. |
+| 3.4 | **Vị trí Cls head**, decoder/router cố định = **AC-E4**, vision = **phạm vi tốt nhất của 3.3** (hoặc `--set exp34.vision=…`; lưu ở `v_choice.json`): Cls head ở **đầu ra decoder** (nhân quả; arm cùng vision **kế thừa từ 3.3**) vs ngay **đầu ra vision, trước projector** (attention pooling 14 query trên token vision; train mới, id `ac_e4_chvis`) + Baseline (kế thừa 3.1). Cấu hình `exp34` (`variants`, `vision`). Cần chạy 3.3 xong trước. |
 
-Tiêu chí 3.1–3.3: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
+Tiêu chí 3.1–3.4: **Text metric** (BLEU, ROUGE, BERTScore) · **Clinical metric** (CheXbert F1, RadGraph) · **E-Clinical**: Pearson **S** (E×14, trọng số route × nhãn dương) và **S·Sᵀ** (E×E), hiển thị dạng heatmap.
 
-3.1 ra `runs/3.1_c_vs_baseline_v4/REPORT.md`, 3.2 ra `runs/3.2_e_vs_baseline_v4/REPORT.md`, 3.3 ra `runs/3.3_vision_v4/REPORT.md` (điểm, Friedman + hậu kiểm, Cls head, E-Clinical) và báo cáo con mỗi arm ở `arms/<arm>/`. `best.json` chỉ là gợi ý theo hạng trung bình.
+3.1 ra `runs/3.1_c_vs_baseline_v4/REPORT.md`, 3.2 ra `runs/3.2_e_vs_baseline_v4/REPORT.md`, 3.3 ra `runs/3.3_vision_v4/REPORT.md`, 3.4 ra `runs/3.4_cls_head_v4/REPORT.md` (điểm, Friedman + hậu kiểm, Cls head, E-Clinical) và báo cáo con mỗi arm ở `arms/<arm>/`. `best.json` chỉ là gợi ý theo hạng trung bình.
 
 **Top-k token mỗi expert chọn trong prefix** (định tính hành vi): lúc infer, mỗi dòng của `predictions/<arm>.jsonl` (arm MoE) có thêm hai cột **`token`** và **`proportion`** — mỗi cột là E danh sách (một cho mỗi expert): top-k token prefix (ảnh + prompt) theo p của expert đó trong ảnh này, và `proportion` = p của token / Σp của expert trên mọi token prefix của ảnh (token văn bản gộp theo id, token ảnh gộp theo vị trí patch `IMG[r,c]`). Stage `analysis` tổng hợp 6400 ảnh từ hai cột đó (mean_proportion, freq) thành `arms/<arm>/route_tokens.md` (nhúng, thu gọn, vào báo cáo con) và `route_tokens.csv`. Cấu hình: khối `route_tokens` (`sample_top_k` mỗi dòng, `top_k` bảng tổng hợp). Predictions cũ thiếu hai cột này bị coi là chưa xong ⇒ arm MoE được infer lại.
 
@@ -55,6 +56,7 @@ bash scripts/run_section3.sh --exp 3.1                 # dò c: c1_e4, c2_e4, ac
 bash scripts/run_section3.sh --exp 3.2                 # dò E: <c tốt nhất>_e2, _e4 (kế thừa 3.1), _e6 + Baseline (kế thừa 3.1)
 bash scripts/run_section3.sh --exp 3.2 --set exp32.c=a # ép c cho 3.2
 bash scripts/run_section3.sh --exp 3.3                 # vision: ac_e4 (1/3 cuối, kế thừa 3.1) + ac_e4_vfull (Full DoRA, train mới) + Baseline (kế thừa 3.1)
+bash scripts/run_section3.sh --exp 3.4                 # Cls head: arm decoder (kế thừa 3.3) + arm chvis (đầu ra vision, train mới) + Baseline (kế thừa 3.1)
 bash scripts/run_section3.sh --exp 3.1 --arms c1_e4    # chạy riêng một arm (id 3.1: c1_e4 c2_e4 ac_e4 baseline_infer; id 3.2: ví dụ ac_e2 ac_e4 ac_e6 baseline_infer)
 ```
 

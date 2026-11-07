@@ -21,6 +21,9 @@ QUESTIONS = {
            "Các expert có chuyên biệt hay sụp đổ về một DoRA?",
     "3.2": "Với c tốt nhất của 3.1, số expert E nào tốt nhất trong E ∈ {2, 4, 6}, và so với Baseline (Gemma 3 gốc) thế nào, xét theo "
            "text metric, clinical metric và E-Clinical (Pearson S, S·Sᵀ)? Tăng E có làm các expert chuyên biệt hơn hay sụp đổ về một DoRA?",
+    "3.4": "Với decoder, router và vision cố định theo AC-E4, Cls head nên gắn ở đầu ra DECODER (nhân quả, đọc hidden cuối) hay ngay ĐẦU RA "
+           "VISION (trước projector), và cả hai so với Baseline (Gemma 3 gốc) thế nào, xét theo text metric, clinical metric và E-Clinical "
+           "(Pearson S, S·Sᵀ)? Gắn Cls head sớm (vision) có kéo tín hiệu nhãn bệnh về encoder và đổi mức chuyên biệt của expert không?",
     "3.3": "Với decoder + router cố định theo AC-E4 (cấu hình mạnh nhất của 3.1/3.2), finetune vision encoder bằng DoRA ở 1/3 lớp CUỐI hay "
            "FULL DoRA (mọi lớp) thì tốt hơn, và cả hai so với Baseline (Gemma 3 gốc) thế nào, xét theo text metric, clinical metric và "
            "E-Clinical (Pearson S, S·Sᵀ)? Mở rộng DoRA ra toàn bộ vision có đổi mức chuyên biệt của các expert không?",
@@ -144,6 +147,7 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
     prm = st.get("params") or {}
     setup = {"decoder": arm.get("decoder", "—"), "E": arm.get("E"), "c": arm.get("c"), "adaptive": bool(arm.get("adaptive")),
              "kind": arm["kind"],
+             "cls_source": arm.get("cls_source", "decoder"),
              "vision": arm.get("vision_layers") or ((cfg.get("train") or {}).get("vision_adapter") or {}).get("layers", "last_third"),
              "params": (sum(int(v) for v in prm.values()) if prm else (0 if arm["kind"] == "infer" else None)),
              "minutes": st.get("minutes")}
@@ -201,6 +205,7 @@ def write_arm(cfg, exp: str, run_dir: Path, arm: dict, scores_df: pd.DataFrame, 
     return summary
 
 
+_CLS = {"decoder": "đầu ra decoder", "vision": "đầu ra vision (trước proj)"}
 _VIS = {"last_third": "1/3 lớp cuối", "all": "Full (mọi lớp)", "second_half": "nửa sau"}
 
 
@@ -221,7 +226,7 @@ def _setup_table(rows_in: list[dict]) -> str:
         rows.append(f"| {r['name']} | {r['decoder']} | {r.get('E') or '—'} | "
                     f"{('adaptive' if r.get('adaptive') else (format(r['c'], 'g') if r.get('c') else '—')) if moe else '—'} | "
                     f"{('⌈max(N/E, e^H_i)⌉' if r.get('adaptive') else '⌈c·N/E⌉') if moe else '—'} | "
-                    f"{_VIS.get(str(r.get('vision') or 'last_third'), r.get('vision'))} | đồng huấn luyện | {tp} | "
+                    f"{_VIS.get(str(r.get('vision') or 'last_third'), r.get('vision'))} | {_CLS.get(str(r.get('cls_source') or 'decoder'), r.get('cls_source'))} (đồng huấn luyện) | {tp} | "
                     f"{r.get('minutes') if r.get('minutes') is not None else '?'} |")
     return h + "\n" + "\n".join(rows)
 
@@ -239,6 +244,14 @@ def _answers(exp: str, best: dict | None, manifest: dict, arms: list[dict]) -> s
         cl = "a (Adaptive)" if cc.get("c") == "a" else format(float(cc["c"]), "g")
         out.append(f"- **c cố định của 3.2:** c = {cl}" + (f" ← arm `{cc['from']}` của 3.1" if cc.get("from") else "")
                    + f" (quy tắc: {cc['rule']}; chi tiết `c_choice.json`). Arm E đã có ở 3.1 và Baseline được kế thừa nguyên từ 3.1.")
+    vc = manifest.get("v_choice")
+    if vc:
+        out.append(f"- **Vision cố định của 3.4:** `{vc['vision']}`" + (f" ← arm `{vc['from']}` của 3.3" if vc.get("from") else "")
+                   + f" (quy tắc: {vc['rule']}; chi tiết `v_choice.json`). Arm Cls-head-decoder được kế thừa nguyên từ 3.3, Baseline từ 3.1.")
+    if exp == "3.4":
+        out.append("- **Vị trí Cls head (decoder/router/vision cố định = AC-E4):** " + " · ".join(
+            f"`{a['id']}` = {'đầu ra vision (trước proj)' if a.get('cls_source') == 'vision' else 'đầu ra decoder (nhân quả)'}"
+            for a in arms if a.get("kind") == "ft") + ". Arm decoder kế thừa từ 3.3, Baseline từ 3.1.")
     if exp == "3.3":
         vis = {a["id"]: a.get("vision_layers") for a in arms if a.get("vision_layers")}
         out.append("- **Biến thể vision (decoder/router cố định = AC-E4):** " + " · ".join(
@@ -450,6 +463,10 @@ def write_all(cfg, exp: str, run_dir: Path, scores: dict, names: dict, fr: pd.Da
               "- 3.3 chỉ đổi phạm vi DoRA ở vision encoder (1/3 lớp cuối vs Full); decoder, router, Cls head, data, lịch train giữ nguyên "
               "theo AC-E4. Arm 1/3 cuối và Baseline được dùng lại nguyên từ 3.1 (cùng predictions, cùng điểm); Full DoRA tăng số tham số vision học "
               "và (giữ nguyên 400 bước) có thể cần nhiều VRAM/thời gian hơn.",
+              "- 3.4 chỉ đổi VỊ TRÍ Cls head: `decoder` = attention pooling nhân quả trên hidden cuối của decoder (như 3.1–3.3); `vision` = attention "
+              "pooling (14 query, không nhân quả) trên đầu ra vision encoder TRƯỚC projector, nên gradient của loss cls đi thẳng vào DoRA vision và "
+              "Cls head không còn thấy prompt hay câu đã sinh. Decoder, router, data, lịch train giữ nguyên; vision = phạm vi tốt nhất của 3.3 "
+              "(chọn trên CÙNG tập test, hạng lâm sàng TB ⇒ một nguồn lạc quan nhẹ cho 3.4). Arm decoder dùng lại nguyên từ 3.3, Baseline từ 3.1.",
               "- Data (exp 3.0): train 12800 · val 128 · test 6400, 1 bệnh nhân – 1 mẫu, nhãn dương cân bằng giữa ba tập (xem `3.0_data_v4/DATA_REPORT.md`). "
               "Train 400 bước × batch 32, val mỗi 40 bước, patience 3, min_delta (xem config); 4 tập bootstrap × 6400 mẫu.", ""]
     path = run_dir / "REPORT.md"

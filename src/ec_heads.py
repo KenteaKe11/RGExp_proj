@@ -64,6 +64,18 @@ class ClsHead(nn.Module):
         den = torch.cumsum(a, dim=1).clamp(min=1e-20).unsqueeze(-1)
         return self.linear(num / den)                                                # [B,T,Q,C]
 
+    def pool(self, x: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        """Attention pooling KHÔNG nhân quả trên TOÀN BỘ token (dùng cho Cls head gắn ở đầu ra vision, nơi không có chiều thời gian):
+        [B,N,D] → [B,14,C]. Cùng tham số/công thức như `forward` tại vị trí cuối, nhưng không dựng tensor [B,T,Q,dc] (N có thể là 4096)."""
+        h = self.norm(x.float())
+        s = self.SCORE_CAP * torch.tanh(self.score(h) / self.SCORE_CAP)            # [B,N,Q]
+        a = torch.exp(s)
+        if valid is not None:
+            a = a * valid.to(a.dtype).unsqueeze(-1)
+        num = torch.einsum("bnq,bnd->bqd", a, self.value(h))                         # [B,Q,dc]
+        den = a.sum(1).clamp(min=1e-20).unsqueeze(-1)
+        return self.linear(num / den)                                                # [B,Q,C]
+
 
 def cls_loss(logits: torch.Tensor, target: torch.Tensor,
              valid: torch.Tensor | None = None) -> torch.Tensor:
@@ -197,14 +209,17 @@ class Heads(nn.Module):
 
     def __init__(self, d: int, n_labels: int = N_LABELS, n_classes: int = 4, n_experts: int = 4,
                  capacity: float = 1.0, d_c: int = 256, route_enabled: bool = True,
-                 adaptive: bool = False):
+                 adaptive: bool = False, cls_source: str = "decoder", cls_d: int | None = None):
         super().__init__()
-        self.spec = {"d": int(d), "n_labels": int(n_labels), "n_classes": int(n_classes),
+        if cls_source not in ("decoder", "vision"):
+            raise ValueError(f"cls_source={cls_source!r} (decoder | vision)")
+        self.cls_source = cls_source
+        self.spec = {"cls_source": cls_source, "cls_d": int(cls_d) if cls_d else None, "d": int(d), "n_labels": int(n_labels), "n_classes": int(n_classes),
                      "n_experts": int(n_experts), "capacity": float(capacity),
                      "d_c": int(d_c), "route_enabled": bool(route_enabled),
                      "adaptive": bool(adaptive)}
         self.n_classes = int(n_classes)
-        self.cls_head = ClsHead(d, n_labels, n_classes, d_c)
+        self.cls_head = ClsHead(int(cls_d) if (cls_source == "vision" and cls_d) else d, n_labels, n_classes, d_c)
         self.route_enabled = bool(route_enabled)
         self.router = ECRouter(d, n_experts, capacity, adaptive) if route_enabled else None
 
@@ -218,7 +233,9 @@ class Heads(nn.Module):
               f"EC-Router(E={self.spec['n_experts']}, "
               + (f"adaptive k=max({self.spec['capacity']:g}·N/E, e^H))" if self.spec.get("adaptive")
                  else f"c={self.spec['capacity']})"))
-        return f"ClsHead(causal attn-pool 14q, D={self.spec['d']}) · {rt} · {n['total']:,} tham số"
+        ch = (f"ClsHead(attn-pool 14q ở ĐẦU RA VISION trước proj, D={self.spec.get('cls_d')})" if self.cls_source == "vision"
+              else f"ClsHead(causal attn-pool 14q ở đầu ra decoder, D={self.spec['d']})")
+        return f"{ch} · {rt} · {n['total']:,} tham số"
 
 
 def save_heads(h: Heads, out_dir: Path) -> Path:

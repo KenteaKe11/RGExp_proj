@@ -1,4 +1,4 @@
-"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.0|3.1|3.2|3.3
+"""§3 — Cls head · EC-Router · MoE-DoRA (không Mentor, không pretrain).   python -m src.run_section3 --exp 3.0|3.1|3.2|3.3|3.4
 
     3.0  Data: split MỚI cân bằng nhãn · 1 bệnh nhân – 1 mẫu (train 12800 · val 128 · test 6400), manifest + ảnh,
          báo cáo cân bằng (BALANCE.md). Không train, không infer.
@@ -9,10 +9,13 @@
          lâm sàng TB (hoà ⇒ hạng văn bản) trên điểm 3.1, hoặc `--set exp32.c=<1|2|a|số>` do bạn chỉ định; ghi ở `c_choice.json`.
     3.3  NHÁNH VISION (decoder/router cố định = AC-E4, `exp33.c/E`): finetune DoRA 1/3 lớp CUỐI vs FULL DoRA (mọi lớp) của vision
          encoder + Baseline. Arm "1/3 cuối" chính là AC-E4 của 3.1 (cùng cấu hình) ⇒ KẾ THỪA nguyên từ 3.1, chỉ train arm Full DoRA.
+    3.4  CLS HEAD (decoder/router cố định = AC-E4; vision = phạm vi TỐT NHẤT của 3.3, hoặc `--set exp34.vision=…`): đặt Cls head ở đầu ra DECODER (nhân quả, = AC-E4 của 3.1) vs ngay ĐẦU RA VISION
+         (attention pooling 14 query trên token vision, TRƯỚC projector) + Baseline. Arm decoder và Baseline KẾ THỪA từ 3.1; chỉ train
+         arm Cls-head-vision (`ac_e4_chvis`). Loss vẫn CE_text + γ·CE_cls, huấn luyện cùng lúc.
     Tiêu chí mỗi exp: text metric · clinical metric · E-Clinical Pearson (S) và S·Sᵀ · Friedman + hậu kiểm.
-    (các exp sau 3.3: chưa thiết lập; exp 3.1/3.2/3.4 cũ ở _archive/section3_v3/)
+    (các exp sau 3.4: chưa thiết lập; exp 3.1/3.2/3.4 cũ ở _archive/section3_v3/)
 
-Stage (3.1–3.3): data → train → infer → score → stats → analysis → report → push.
+Stage (3.1–3.4): data → train → infer → score → stats → analysis → report → push.
 Chính sách: infer GREEDY · train 12800 mẫu = 400 bước × batch 32 · val mỗi 40 bước, patience 3 (+ min_delta) ·
 test 6400 mẫu, 4 tập bootstrap × 6400 mẫu (bảng điểm); kiểm định bằng Friedman + hậu kiểm. Cls head huấn luyện CÙNG LÚC với decoder (loss = CE_text + 0.1·CE_cls).
 Mọi stage quét Hub trước: có predictions ⇒ bỏ qua train+infer; có adapter ⇒ bỏ qua train.
@@ -38,8 +41,8 @@ from .tracking import Tracker
 STAGES = ["data", "train", "infer", "score", "stats", "analysis", "report", "push"]
 # v4: chính sách thí nghiệm mới (data cân bằng nhãn 12800/1280/6400, 400 bước × batch 32). Thư mục RIÊNG để quét Hub
 # không bao giờ tái dùng predictions/adapter của các lần chạy v3 (huấn luyện/đánh giá trên data khác).
-SUBDIR = {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4", "3.3": "3.3_vision_v4"}
-ADAPTER = {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4", "3.3": "./adapters_3_3_v4"}
+SUBDIR = {"3.0": "3.0_data_v4", "3.1": "3.1_c_vs_baseline_v4", "3.2": "3.2_e_vs_baseline_v4", "3.3": "3.3_vision_v4", "3.4": "3.4_cls_head_v4"}
+ADAPTER = {"3.1": "./adapters_3_1_v4", "3.2": "./adapters_3_2_v4", "3.3": "./adapters_3_3_v4", "3.4": "./adapters_3_4_v4"}
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "section3.yaml"
 
 
@@ -112,6 +115,7 @@ def _baseline_arm() -> dict:
 
 
 VISION_LABEL = {"last_third": "1/3 cuối (DoRA)", "all": "Full DoRA"}
+CLS_LABEL = {"decoder": "ở đầu ra decoder (nhân quả)", "vision": "ở đầu ra vision (trước proj)"}
 VISION_TAG = {"last_third": "last3", "all": "full"}
 
 
@@ -126,7 +130,7 @@ def arm_cfg(cfg: Cfg, arm: dict) -> Cfg:
     return c
 
 
-def build_arms(cfg: Cfg, exp: str, c_choice: dict | None = None) -> list[dict]:
+def build_arms(cfg: Cfg, exp: str, c_choice: dict | None = None, v_choice: dict | None = None) -> list[dict]:
     """3.1: dò c ở E cố định. 3.2: dò E ở c = `c_choice['c']` (c tốt nhất của 3.1); arm E = exp31.E và Baseline
     mang `inherit_from` = '3.1' (kế thừa nguyên từ 3.1)."""
     e31 = cfg.get("exp31") or {}
@@ -159,11 +163,39 @@ def build_arms(cfg: Cfg, exp: str, c_choice: dict | None = None) -> list[dict]:
             x["name"] = f"{x['name']} · vision {VISION_LABEL.get(str(v), str(v))}"
             arms.append(x)
         base = bool(e33.get("baseline", True))
+    elif exp == "3.4":
+        e34 = cfg.get("exp34") or {}
+        E = int(e34.get("E", E0))
+        c = e34.get("c", "a")
+        default_v = str(((cfg.get("train") or {}).get("vision_adapter") or {}).get("layers", "last_third"))
+        vis = str((v_choice or {}).get("vision") or e34.get("vision") or default_v)     # vision tốt nhất của 3.3 (hoặc ép exp34.vision)
+        a33 = {str(x.get("vision_layers")): x for x in build_arms(cfg, "3.3") if x["kind"] == "ft"}
+        e33 = cfg.get("exp33") or {}
+        same33 = (int(e33.get("E", E0)) == E and str(e33.get("c", "a")) == str(c))
+        arms = []
+        for src in (e34.get("variants") or ["decoder", "vision"]):
+            if str(src) == "decoder" and same33 and vis in a33:
+                x = dict(a33[vis])                       # arm này ĐÃ train/đánh giá ở 3.3 (cùng decoder, router, vision) ⇒ kế thừa từ 3.3
+                x["inherit_from"] = "3.3"
+                x["name"] = x["name"].split(" · vision")[0]
+            else:
+                x = dict(_arm_for(c, E))
+                if vis != default_v:
+                    x["id"] += "_v" + VISION_TAG.get(vis, vis)
+            x["cls_source"] = str(src)
+            x["vision_layers"] = vis
+            if str(src) == "vision":
+                x["id"] += "_chvis"
+                x.pop("inherit_from", None)
+            x["name"] = f"{x['name']} · Cls head {CLS_LABEL.get(str(src), str(src))}" + (
+                f" · vision {VISION_LABEL.get(vis, vis)}" if vis != default_v else "")
+            arms.append(x)
+        base = bool(e34.get("baseline", True))
     else:
-        raise ValueError(f"--exp phải là 3.0|3.1|3.2|3.3, nhận {exp!r} (các exp sau 3.3 chưa được thiết lập)")
+        raise ValueError(f"--exp phải là 3.0|3.1|3.2|3.3|3.4, nhận {exp!r} (các exp sau 3.4 chưa được thiết lập)")
     if base:
         b = _baseline_arm()
-        if exp in ("3.2", "3.3"):
+        if exp in ("3.2", "3.3", "3.4"):
             b["inherit_from"] = "3.1"
         arms.append(b)
     if len({x["id"] for x in arms}) != len(arms):
@@ -193,6 +225,30 @@ def resolve_best_c(cfg: Cfg, run_dir31: Path, hub, sub31: str) -> dict | None:
     scores, _ = align_blocks(scores, key_col="key")
     best = pick_best(cfg, scores, cands, {x["id"]: x["name"] for x in cands})
     return {"c": best["c"], "from": best["arm"], "rule": best["rule"], "table": best["table"],
+            "clinical_rank": best["clinical_rank"], "text_rank": best["text_rank"]}
+
+
+def resolve_best_vision(cfg: Cfg, run_dir33: Path, hub, sub33: str) -> dict | None:
+    """Phạm vi vision tốt nhất của 3.3 cho 3.4. `exp34.vision` (người dùng chỉ định) thắng; ngược lại cần điểm per-sample của MỌI arm
+    finetune của 3.3 (cục bộ hoặc Hub), thiếu ⇒ None. Quy tắc: `pick_best` (hạng lâm sàng TB, hoà ⇒ hạng văn bản)."""
+    forced = (cfg.get("exp34") or {}).get("vision")
+    if forced not in (None, ""):
+        return {"vision": str(forced), "from": None, "rule": "người dùng chỉ định (exp34.vision)", "table": []}
+    cands = [x for x in build_arms(cfg, "3.3") if x["kind"] == "ft"]
+    scores: dict[str, pd.DataFrame] = {}
+    for x in cands:
+        csv = run_dir33 / "metrics" / f"per_sample_{x['id']}.csv"
+        if not csv.exists():
+            hub.pull_file(f"{sub33}/metrics/per_sample_{x['id']}.csv", csv)
+        if csv.exists():
+            scores[x["id"]] = pd.read_csv(csv)
+    if len(scores) < len(cands):
+        return None
+    from .stats_multi import align_blocks
+    scores, _ = align_blocks(scores, key_col="key")
+    best = pick_best(cfg, scores, cands, {x["id"]: x["name"] for x in cands})
+    arm = next(x for x in cands if x["id"] == best["arm"])
+    return {"vision": str(arm.get("vision_layers")), "from": best["arm"], "rule": best["rule"], "table": best["table"],
             "clinical_rank": best["clinical_rank"], "text_rank": best["text_rank"]}
 
 
@@ -338,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="§3 — Cls head · EC-Router · MoE-DoRA")
     add_common_args(ap)
     ap.set_defaults(config=str(DEFAULT_CONFIG))
-    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.0 (data) | 3.1 (dò c) | 3.2 (dò E) | 3.3 (vision)")
+    ap.add_argument("--exp", default=None, choices=sorted(SUBDIR), help="3.0 (data) | 3.1 (dò c) | 3.2 (dò E) | 3.3 (vision) | 3.4 (Cls head)")
     ap.add_argument("--stages", default=",".join(STAGES))
     ap.add_argument("--arms", default=None)
     ap.add_argument("--run-id", default=None)
@@ -354,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(a.config, a.overrides)
     exp = a.exp or str(cfg.get("experiment", "3.1"))
     if exp not in SUBDIR:
-        print(f"✗ experiment {exp!r} không hợp lệ (3.0|3.1|3.2|3.3)")
+        print(f"✗ experiment {exp!r} không hợp lệ (3.0|3.1|3.2|3.3|3.4)")
         return 2
     cfg["experiment"] = exp
     dry = bool(a.dry_run)
@@ -396,6 +452,20 @@ def main(argv: list[str] | None = None) -> int:
     sub31 = SUBDIR["3.1"] + ("_dryrun" if dry else "")
     run_dir31 = Path(cfg["output"].get("dir", "./runs")) / sub31
     adapter_root31 = Path(ADAPTER["3.1"] + ("_dryrun" if dry else ""))
+    sub33 = SUBDIR["3.3"] + ("_dryrun" if dry else "")
+    run_dir33 = Path(cfg["output"].get("dir", "./runs")) / sub33
+    adapter_root33 = Path(ADAPTER["3.3"] + ("_dryrun" if dry else ""))
+    v_choice = None
+    if exp == "3.4":
+        v_choice = resolve_best_vision(cfg, run_dir33, hub, sub33)
+        if v_choice is None and dry:
+            v_choice = {"vision": "last_third", "from": None, "rule": "dry-run: chưa có điểm 3.3, lấy vision mặc định", "table": []}
+        if v_choice is None:
+            print(f"✗ chưa có điểm đủ các arm của 3.3 ({run_dir33}/metrics hoặc Hub {sub33}/) ⇒ chưa chọn được vision cho 3.4.\n"
+                  "  → chạy `--exp 3.3` trước, hoặc chỉ định: `--set exp34.vision=last_third` (last_third | all | second_half | last_<n>).")
+            return 2
+        print(f"⚙ vision cho 3.4: {v_choice['vision']} ({v_choice['rule']}" + (f" → `{v_choice['from']}`" if v_choice.get("from") else "") + ")",
+              flush=True)
     c_choice = None
     if exp == "3.2":
         try:
@@ -415,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚙ c cho 3.2: {cl} ({c_choice['rule']}" + (f" → `{c_choice['from']}`" if c_choice.get("from") else "") + ")",
               flush=True)
     try:
-        arms = build_arms(cfg, exp, c_choice)
+        arms = build_arms(cfg, exp, c_choice, v_choice)
     except ValueError as e:
         print(f"✗ {e}")
         return 2
@@ -444,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     (run_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    if v_choice:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "v_choice.json").write_text(json.dumps(v_choice, indent=2, ensure_ascii=False), encoding="utf-8")
     if c_choice:                         # ghi lại QUYẾT ĐỊNH chọn c cho 3.2 (kiểm lại được, không phải ngầm)
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "c_choice.json").write_text(json.dumps(c_choice, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -467,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {"run_id": run_id, "experiment": exp,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config": resolved_snapshot(cfg), "stages_run": stages, "arms_declared": declared,
-                "arm_status": {}, "decode": "greedy", "note": manifest_note, "c_choice": c_choice}
+                "arm_status": {}, "decode": "greedy", "note": manifest_note, "c_choice": c_choice, "v_choice": v_choice}
     t_start = time.time()
     print(f"\n═══ §{exp} — {' · '.join(declared)} ═══", flush=True)
 
@@ -482,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
         for arm in arms:
             if arm.get("inherit_from") == "3.1":
                 inherit_arm(arm, run_dir, run_dir31, hub, sub31, adapter_root31, rp)
+            elif arm.get("inherit_from") == "3.3":
+                inherit_arm(arm, run_dir, run_dir33, hub, sub33, adapter_root33, rp)
     for arm in arms:
         aid = arm["id"]
         pp = run_dir / "predictions" / f"{aid}.jsonl"
@@ -500,8 +575,8 @@ def main(argv: list[str] | None = None) -> int:
         # cần infer ⇒ TÌM safetensors đã train trước (local → Hub, cả thư mục của 3.1), chỉ train khi không đâu có
         loc = None
         if not a.retrain:
-            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31],
-                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm,
+            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31, adapter_root33],
+                                 [arm.get("hub_sub", sub), sub, sub31, sub33], adapter_root, hub, sm,
                                  expect_n=int(cfg["data"].get("n_train") or 0))
             if loc is not None:
                 arm["adapter_root"] = loc
@@ -568,8 +643,8 @@ def main(argv: list[str] | None = None) -> int:
             miss = [k for k in _vk if not (pr.get(k) or {}).get("route_viz")]
             if not miss:
                 continue
-            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31],
-                                 [arm.get("hub_sub", sub), sub, sub31], adapter_root, hub, sm,
+            loc = locate_adapter(arm, [arm.get("adapter_root", adapter_root), adapter_root, adapter_root31, adapter_root33],
+                                 [arm.get("hub_sub", sub), sub, sub31, sub33], adapter_root, hub, sm,
                                  expect_n=int(cfg["data"].get("n_train") or 0))
             if loc is None:
                 print(f"⚠ {arm['id']}: thiếu route_viz của {miss} nhưng không tìm thấy adapter ⇒ bỏ qua ảnh định tính arm này.", flush=True)
@@ -690,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["n_eval"] = align_info["n_common"]
 
     best = None
-    if exp in ("3.1", "3.2", "3.3") and not partial:
+    if exp in ("3.1", "3.2", "3.3", "3.4") and not partial:
         best = pick_best(cfg, scores, arms, names)
         best["experiment"] = exp
         best["note"] = "GỢI Ý theo hạng trung bình — không qua kiểm định; người dùng quyết định"

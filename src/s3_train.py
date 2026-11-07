@@ -288,7 +288,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
     cap = float(arm.get("c") or 1.0)
     adaptive = bool(arm.get("adaptive"))
     b = sm.build(cfg, decoder=decoder, n_experts=int(arm.get("E", 0)), capacity=cap, projector=True,
-                 adaptive=adaptive)
+                 adaptive=adaptive, cls_source=str(arm.get("cls_source", "decoder")))
     counts = sm.set_trainable(b)
     print(f"  {arm['id']}: {b.heads.describe()}\n  tham số học: {counts}", flush=True)
 
@@ -338,8 +338,8 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
                       **{k: v for k, v in kw.items() if v is not None})
         if out.loss is None:
             raise RuntimeError("decoder trả loss=None — labels không tới forward")
-        logits = sm.cls_logits(b, out.hidden_states[-1], valid)
-        ce_c = cls_loss(logits, batch["cls_y"], valid)
+        logits = sm.cls_logits(b, out.hidden_states[-1], valid, vis)
+        ce_c = cls_loss(logits, batch["cls_y"], valid if logits.dim() == 4 else None)
         loss = out.loss + gamma * ce_c.to(out.loss.dtype)
         parts = {"ce_text": out.loss.detach(), "ce_cls": ce_c.detach()}
         if rt is not None:           # c hiệu dụng mỗi expert (k_i·E/N ở token cuối), trung bình theo batch
@@ -366,7 +366,7 @@ def run_finetune(cfg, arm: dict, train_df: pd.DataFrame, val_df, cls_y: dict, ou
             "best_val_loss": r["best_val_loss"], "min_delta": float(vcfg.get("min_delta", 0.0)), "stopped_early": r["stopped_early"],
             "steps_run": r["steps_run"], "cycle_steps": cycle,
             "image_max_side": int((cfg.get("data", {}) or {}).get("image_max_side", 512)),
-            "n_classes": b.heads.n_classes, "text_hidden": b.text_h,
+            "n_classes": b.heads.n_classes, "text_hidden": b.text_h, "cls_source": b.heads.cls_source,
             "vision_adapter": (b.pstats or {}).get("vision_adapter"),
             "moe": ({**b.mstats, "capacity": cap, "adaptive": adaptive} if decoder == "moe" else None)}
     sm.save_model(b, Path(out_dir), meta)

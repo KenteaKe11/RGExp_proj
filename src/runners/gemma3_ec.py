@@ -175,8 +175,11 @@ class Gemma3ECRunner(Gemma3Runner):
             pad_id = int(self.processor.tokenizer.pad_token_id or 0)
             glen = (gen_ != pad_id).sum(1).clamp(min=1)                     # số token sinh ra (gồm EOS)
             last = (in_len + glen - 2).clamp(min=in_len - 1, max=hid.shape[1] - 1)
-            full = self.heads.cls_head(hid, None)                           # [B,T,14,4] nhân quả
-            logits = full[torch.arange(hid.shape[0], device=hid.device), last]   # vị trí cuối của báo cáo đã sinh
+            if getattr(self.heads, "cls_source", "decoder") == "vision":
+                logits = self.heads.cls_head.pool(vis)                      # [B,14,4] pooling trên đầu ra vision (trước proj)
+            else:
+                full = self.heads.cls_head(hid, None)                       # [B,T,14,4] nhân quả
+                logits = full[torch.arange(hid.shape[0], device=hid.device), last]   # vị trí cuối của báo cáo đã sinh
             if route is not None and need_trace:
                 # 2 mẫu cố định: p của từng patch ảnh (‰) và của từng token sinh ra (token + ‰) ⇒ ảnh highlight ở báo cáo
                 img_id = gb.image_token_id(self._gemma)

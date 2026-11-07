@@ -97,6 +97,17 @@ def main() -> int:
               and [x.get("inherit_from") for x in a3] == ["3.1", None, "3.1"]
               and [x.get("vision_layers") for x in a3[:2]] == ["last_third", "all"]
               and all(x.get("adaptive") and x["E"] == 4 for x in a3[:2]))
+        c34 = Cfg({**dict(cfg), "exp33": {"E": 4, "c": "a", "variants": ["last_third", "all"], "baseline": True},
+                   "exp34": {"E": 4, "c": "a", "variants": ["decoder", "vision"], "baseline": True},
+                   "train": {"vision_adapter": {"layers": "last_third"}}})
+        a4 = build_arms(c34, "3.4", None, {"vision": "all"})
+        check("3.4: vision tốt nhất = all ⇒ ac_e4_vfull (Cls head decoder, kế thừa 3.3) + ac_e4_vfull_chvis (train mới) + Baseline kế thừa 3.1",
+              [x["id"] for x in a4] == ["ac_e4_vfull", "ac_e4_vfull_chvis", "baseline_infer"]
+              and [x.get("inherit_from") for x in a4] == ["3.3", None, "3.1"]
+              and [x.get("cls_source") for x in a4[:2]] == ["decoder", "vision"] and all(x.get("vision_layers") == "all" for x in a4[:2]))
+        a4b = build_arms(c34, "3.4", None, {"vision": "last_third"})
+        check("3.4: vision tốt nhất = last_third ⇒ ac_e4 (kế thừa 3.3) + ac_e4_chvis",
+              [x["id"] for x in a4b[:2]] == ["ac_e4", "ac_e4_chvis"] and [x.get("inherit_from") for x in a4b[:2]] == ["3.3", None])
         from src.run_section3 import arm_cfg
         c_full = arm_cfg(Cfg({"train": {"vision_adapter": {"layers": "last_third", "rank": 4}}}), a3[1])
         c_base = Cfg({"train": {"vision_adapter": {"layers": "last_third", "rank": 4}}})
